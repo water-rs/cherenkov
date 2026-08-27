@@ -1,3 +1,8 @@
+// The GPU runtime's async setup nests deeply enough that clippy's `Send`
+// analysis overflows the default limit and abandons the check — which then
+// leaves the `future_not_send` expectations below it unfulfilled. Raise it so
+// the lint actually runs.
+#![recursion_limit = "256"]
 #![cfg_attr(
     test,
     allow(

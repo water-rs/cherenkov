@@ -321,7 +321,7 @@ impl<F: Filter> FilterAdapter<F> {
         };
     }
 
-    #[expect(
+    #[allow(
         clippy::too_many_lines,
         clippy::future_not_send,
         reason = "filter pass compilation keeps one ordered device-bound resource graph on the GPU host thread"
@@ -585,7 +585,7 @@ impl<F: Filter> FilterAdapter<F> {
         self.blit_source_scratch_slot = None;
     }
 
-    #[expect(
+    #[allow(
         clippy::future_not_send,
         reason = "filter pipeline compilation awaits device validation on the GPU host thread"
     )]
@@ -629,7 +629,7 @@ impl<F: Filter> Effect for FilterAdapter<F> {
         self.install_redraw_callback(callback);
     }
 
-    #[expect(
+    #[allow(
         clippy::future_not_send,
         reason = "filter setup owns device-bound pipelines and runs on the GPU host thread"
     )]

@@ -1,0 +1,21 @@
+[workspace]
+pr_draft = false
+pr_labels = ["release"]
+publish = true
+release_always = true
+git_tag_enable = true
+git_release_enable = true
+changelog_update = true
+
+[[package]]
+name = "filtrate"
+git_tag_name = "v{{ version }}"
+git_release_name = "v{{ version }}"
+
+[[package]]
+name = "filtrate-core"
+git_tag_name = "core-v{{ version }}"
+
+[[package]]
+name = "filtrate-derive"
+git_tag_name = "derive-v{{ version }}"

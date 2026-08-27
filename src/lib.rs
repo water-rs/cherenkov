@@ -1,128 +1,62 @@
-//! GPU texture filters using wgpu.
+// The GPU runtime's async setup nests deeply enough that clippy's `Send`
+// analysis overflows the default limit and abandons the check — which then
+// leaves the `future_not_send` expectations below it unfulfilled. Raise it so
+// the lint actually runs.
+#![recursion_limit = "256"]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::float_cmp,
+        reason = "tests assert exact filter parameter values"
+    )
+)]
+//! GPU filter library built on top of `filtrate-core` abstractions.
 //!
-//! `filtrate` provides GPU-accelerated image filters that work with any wgpu texture.
-//! It's designed to be standalone and usable outside of WaterUI - for images, video frames,
-//! render targets, or any GPU texture.
+//! `filtrate` hosts the built-in filter implementations and their WGSL
+//! shaders, and (in upcoming phases) the GPU runtime that compiles a
+//! [`Filter`] graph into a wgpu pipeline. It is designed to be usable
+//! outside of `WaterUI` for any wgpu-based image, video, or render-target
+//! workflow.
 //!
-//! # Features
+//! # Layout
 //!
-//! - **Blur**: Gaussian blur with configurable radius
-//! - **Brightness**: Adjust image brightness
-//! - **Saturation**: Control color saturation
-//! - **Contrast**: Adjust image contrast
-//! - **Grayscale**: Convert to grayscale
-//! - **Hue Rotation**: Rotate colors around the color wheel
-//! - **Invert**: Invert all colors
-//! - **Sepia**: Apply sepia tone effect
-//! - **Vignette**: Add vignette effect
-//! - **Sharpen**: Sharpen image details
+//! - [`filters`]: built-in filter structs (`Brightness`, `Blur`, ...).
+//!   Each filter implements [`Filter`] from `filtrate-core` and references
+//!   one or more WGSL shader files under `src/shaders/`.
+//! - `shaders/` (not a Rust module): WGSL fragments and full-shader files
+//!   compiled into the binary via `include_str!` from individual filter
+//!   modules.
 //!
 //! # Example
 //!
-//! ```ignore
-//! use filtrate::{FilterPipeline, Filter};
+//! ```rust
+//! use filtrate::filters::{Blur, Brightness};
+//! use filtrate::{Filter, FilterExt};
 //!
-//! // Create pipeline with existing wgpu device/queue
-//! let pipeline = FilterPipeline::new(&device, &queue);
-//!
-//! // Apply filters to any texture
-//! pipeline.apply(
-//!     &input_texture,
-//!     &output_texture,
-//!     &[
-//!         Filter::Blur { radius: 5.0 },
-//!         Filter::Brightness { amount: 0.1 },
-//!         Filter::Saturation { amount: 1.2 },
-//!     ],
-//! );
+//! let chain = Blur(5.0_f32).then(Brightness(0.1_f32));
+//! # // A chain's params nest, one array per link, in application order.
+//! # assert_eq!(chain.params(), ([5.0, 5.0], [0.1]));
 //! ```
 
-mod pipeline;
-mod uniform;
+mod compiled_shaders;
+pub mod effect;
+pub mod filters;
+pub mod multi_input;
+pub mod runtime;
 
-pub use pipeline::FilterPipeline;
+pub use effect::{
+    Effect, EffectContext, EffectFrameClock, EffectFrameTiming, EffectInput, EffectOutput,
+    EffectRedrawCallback, EffectRenderError, EffectRenderResult, EffectSetupError,
+    EffectSetupResult,
+};
+pub use filtrate_core::{
+    AnimatedCallback, AnimatedTarget, AnimationTrack, Chain, Filter, FilterExt, FilterParam,
+    Interpolator, MAX_FILTER_PARAM_VEC4S, MAX_FILTER_PARAMS, ParamArray, SignalVisitor,
+    StageCollector, WatchGuard,
+};
+pub use runtime::{FilterAdapter, HdrPolicy};
+pub use shaderloom::WgslModuleCache;
 
-/// GPU filter to apply to a texture.
-///
-/// Each filter variant represents a different image processing effect
-/// that runs entirely on the GPU via wgpu compute/render shaders.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Filter {
-    /// Gaussian blur effect.
-    Blur {
-        /// Blur radius in pixels (0.0 = no blur, higher = more blur)
-        radius: f32,
-    },
-
-    /// Adjust brightness.
-    Brightness {
-        /// Brightness adjustment (-1.0 = black, 0.0 = unchanged, 1.0 = white)
-        amount: f32,
-    },
-
-    /// Adjust color saturation.
-    Saturation {
-        /// Saturation multiplier (0.0 = grayscale, 1.0 = unchanged, >1.0 = more saturated)
-        amount: f32,
-    },
-
-    /// Adjust contrast.
-    Contrast {
-        /// Contrast multiplier (0.0 = gray, 1.0 = unchanged, >1.0 = more contrast)
-        amount: f32,
-    },
-
-    /// Convert to grayscale.
-    Grayscale {
-        /// Mix factor (0.0 = original, 1.0 = full grayscale)
-        intensity: f32,
-    },
-
-    /// Rotate hue around the color wheel.
-    HueRotation {
-        /// Rotation angle in degrees (0-360)
-        angle: f32,
-    },
-
-    /// Invert all colors.
-    Invert,
-
-    /// Apply sepia tone effect.
-    Sepia {
-        /// Sepia intensity (0.0 = original, 1.0 = full sepia)
-        intensity: f32,
-    },
-
-    /// Add vignette effect (darkened corners).
-    Vignette {
-        /// Inner radius where vignette starts (0.0-1.0)
-        radius: f32,
-        /// How soft the vignette edge is (0.0-1.0)
-        softness: f32,
-    },
-
-    /// Sharpen image details.
-    Sharpen {
-        /// Sharpening strength (0.0 = unchanged, 1.0 = normal, >1.0 = more sharp)
-        amount: f32,
-    },
-}
-
-impl Filter {
-    /// Returns the filter type ID used internally for shader selection.
-    #[allow(dead_code)]
-    pub(crate) const fn type_id(&self) -> u32 {
-        match self {
-            Self::Blur { .. } => 0,
-            Self::Brightness { .. } => 1,
-            Self::Saturation { .. } => 2,
-            Self::Contrast { .. } => 3,
-            Self::Grayscale { .. } => 4,
-            Self::HueRotation { .. } => 5,
-            Self::Invert => 6,
-            Self::Sepia { .. } => 7,
-            Self::Vignette { .. } => 8,
-            Self::Sharpen { .. } => 9,
-        }
-    }
-}
+/// Procedural derive that generates a [`Filter`] implementation for a tuple
+/// struct. See `filtrate-derive` for the supported `#[filter(...)]` shapes.
+pub use filtrate_derive::Filter;

@@ -1,16 +1,66 @@
+[workspace]
+members = ["core", "derive"]
+resolver = "3"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+correctness = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "warn"
+multiple_crate_versions = "allow"
+
 [package]
 name = "filtrate"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-rust-version = "1.87"
-description = "GPU texture filters using wgpu - blur, brightness, saturation, and more"
+rust-version = "1.95"
+authors = ["Lexo Liu"]
+readme = "README.md"
+repository = "https://github.com/water-rs/filtrate"
+description = "GPU texture filter library: built-in filters (blur, brightness, color matrix, ...) and runtime, built on filtrate-core."
 keywords = ["gpu", "filter", "wgpu", "image", "video"]
 categories = ["graphics", "multimedia::images", "rendering"]
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0 OR MIT"
 
 [lints]
 workspace = true
 
 [dependencies]
-wgpu.workspace = true
+filtrate-core = { version = "0.2.0", path = "core" }
+filtrate-derive = { version = "0.1.0", path = "derive" }
+wgpu = "29.0.4"
+shaderloom = "0.1.0"
 bytemuck = { version = "1", features = ["derive"] }
+num-traits = { version = "0.2", default-features = false }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+thiserror = "2.0.19"
+tracing = "0.1.44"
+
+[build-dependencies]
+shaderloom = { version = "0.1.0", features = ["build"] }
+
+[dev-dependencies]
+divan = "0.1"
+pollster = "1.0"
+
+[[bench]]
+name = "filter_trait"
+harness = false
+
+[[bench]]
+name = "gpu_runtime"
+harness = false
+
+# `shaderloom` is used directly by build.rs; cargo-machete 0.9 does not scan build.rs.
+[package.metadata.cargo-machete]
+ignored = ["shaderloom"]

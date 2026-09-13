@@ -41,7 +41,10 @@ jobs:
         if: runner.os == 'Windows'
         uses: tracel-ai/github-actions/install-dxc@295f2fdbae5271f4f8ad56d634e4ff6a95daafc8
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --all-features
+      # `webgl` is the only non-default feature and intentionally fails to
+      # compile off wasm, so `--all-features` cannot be used here; the wasm
+      # job exercises it.
+      - run: cargo test --workspace
 
   lint:
     name: Lint
@@ -57,7 +60,18 @@ jobs:
           sudo apt-get install -y libegl-dev libgbm-dev libwayland-dev libxkbcommon-dev
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  wasm:
+    name: Check / wasm32
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check -p filtrate --target wasm32-unknown-unknown --all-features
 
   msrv:
     name: MSRV
@@ -70,4 +84,4 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libegl-dev libgbm-dev libwayland-dev libxkbcommon-dev
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace --all-features
+      - run: cargo check --workspace

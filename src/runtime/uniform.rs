@@ -87,10 +87,14 @@ pub(super) fn build_spatial_uniform_data(
     data
 }
 
-pub(super) const fn spatial_source_layout_entry() -> wgpu::BindGroupLayoutEntry {
+/// Binding 0 — the spatial stage's input texture. `visibility` differs
+/// between the compute and fragment executions of the same stage.
+pub(super) const fn spatial_source_layout_entry(
+    visibility: wgpu::ShaderStages,
+) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding: 0,
-        visibility: wgpu::ShaderStages::COMPUTE,
+        visibility,
         ty: wgpu::BindingType::Texture {
             sample_type: wgpu::TextureSampleType::Float { filterable: false },
             view_dimension: wgpu::TextureViewDimension::D2,
@@ -115,14 +119,34 @@ pub(super) const fn spatial_target_layout_entry(
     }
 }
 
-pub(super) const fn spatial_uniform_layout_entry() -> wgpu::BindGroupLayoutEntry {
+/// Binding 2 — the shared uniform block.
+pub(super) const fn spatial_uniform_layout_entry(
+    visibility: wgpu::ShaderStages,
+) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding: 2,
-        visibility: wgpu::ShaderStages::COMPUTE,
+        visibility,
         ty: wgpu::BindingType::Buffer {
             ty: wgpu::BufferBindingType::Uniform,
             has_dynamic_offset: false,
             min_binding_size: None,
+        },
+        count: None,
+    }
+}
+
+/// Binding 3 — the retained original input for
+/// `spatial_shader_with_original` stages.
+pub(super) const fn spatial_original_layout_entry(
+    visibility: wgpu::ShaderStages,
+) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding: 3,
+        visibility,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
         },
         count: None,
     }

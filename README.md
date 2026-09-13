@@ -43,6 +43,34 @@ static values.
   where the policy allows (`FilterAdapter::require_hdr` /
   `FilterAdapter::force_ldr`).
 
+## WebGL (wasm)
+
+The optional `webgl` feature turns on wgpu's WebGL2 backend. It only
+exists for `wasm32-unknown-unknown`; enabling it on a native target is a
+`compile_error!`.
+
+WebGL2 has no compute shaders or storage textures, so spatial stages run
+through a **fragment translation** of the same WGSL body: every spatial
+shader writes only its own output texel, which the runtime rewrites into a
+fullscreen draw. Color stages are unchanged — they already run as fragment
+passes. Selection is automatic from device limits
+(`SpatialExecution::Auto`); `ForceFragment` exercises the WebGL2 path on
+native GPUs for tests and benchmarks.
+
+Honest caveats:
+
+- **Precision**: compute can round the final stage through an
+  `Rgba16Float` scratch + blit while the fragment path writes the output
+  attachment directly, so outputs may differ by a ±1 u8 step per channel.
+- **Performance**: on an Apple-Silicon Metal adapter (`cargo bench
+  --bench gpu_runtime`), the fragment path is parity-or-faster because it
+  skips the final blit — e.g. a 2048² separable blur measures 2.54 ms
+  fragment vs 2.57 ms compute+blit (medians). These numbers exercise the
+  same shader path WebGL runs, but cannot model browser/WebGL context
+  overhead.
+- A spatial body that breaks the one-store-per-own-texel contract fails
+  loudly at specialization rather than silently mis-rendering.
+
 ## License
 
 MIT OR Apache-2.0, at your option.

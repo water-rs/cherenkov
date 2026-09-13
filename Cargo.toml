@@ -35,6 +35,15 @@ license = "Apache-2.0 OR MIT"
 [lints]
 workspace = true
 
+[features]
+default = []
+# WebGL2 backend support for wasm targets: turns on wgpu's `webgl` backend and
+# routes spatial filters through a fragment pipeline, because WebGL2 has no
+# compute shaders or storage textures. Enabling this feature for a non-wasm
+# target is a compile error — native and WebGPU devices run the same code
+# without it.
+webgl = ["wgpu/webgl"]
+
 [dependencies]
 filtrate-core = { version = "0.2.0", path = "core" }
 filtrate-derive = { version = "0.1.0", path = "derive" }
@@ -45,6 +54,11 @@ num-traits = { version = "0.2", default-features = false }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 thiserror = "2.0.19"
 tracing = "0.1.44"
+
+# `std::time::Instant::now` panics on wasm32-unknown-unknown; web-time backs it
+# with `performance.now()` there and delegates to std everywhere else.
+[target.'cfg(target_family = "wasm")'.dependencies]
+web-time = "1"
 
 [build-dependencies]
 shaderloom = { version = "0.1.0", features = ["build"] }

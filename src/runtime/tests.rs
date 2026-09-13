@@ -5,7 +5,7 @@ use super::shader::{
 use super::uniform::FILTER_UNIFORM_WORDS;
 use super::*;
 use core::time::Duration;
-use filtrate_core::{MAX_FILTER_PARAM_VEC4S, ParamArray, StageCollector};
+use filtrate_core::{FilterExt, MAX_FILTER_PARAM_VEC4S, ParamArray, StageCollector};
 use image::RgbaImage;
 use shaderloom::WgslModuleCache;
 use std::fs;
@@ -418,15 +418,15 @@ fn runtime_binding_plan_tracks_scratch_ping_pong_and_blit_source() {
     let stages = collect_filter_stages(&filter);
     let passes = fuse_stages(&stages).expect("fuse should succeed");
 
-    let (plans, blit_source) =
-        plan_runtime_bindings(&passes).expect("runtime binding planning should succeed");
+    let (plans, blit_source) = plan_runtime_bindings(&passes, SpatialBackend::Compute)
+        .expect("runtime binding planning should succeed");
 
     assert_eq!(plans.len(), 4);
     assert_eq!(
         plans[0],
         PassBindingPlan::Spatial {
             source: PassTextureSource::Input,
-            target_scratch: 0,
+            target: PassTarget::Scratch(0),
             original: None
         }
     );
@@ -434,7 +434,7 @@ fn runtime_binding_plan_tracks_scratch_ping_pong_and_blit_source() {
         plans[1],
         PassBindingPlan::Spatial {
             source: PassTextureSource::Scratch(0),
-            target_scratch: 1,
+            target: PassTarget::Scratch(1),
             original: None
         }
     );
@@ -442,18 +442,306 @@ fn runtime_binding_plan_tracks_scratch_ping_pong_and_blit_source() {
         plans[2],
         PassBindingPlan::Color {
             source: PassTextureSource::Scratch(1),
-            target: ColorTarget::Scratch(0)
+            target: PassTarget::Scratch(0)
         }
     );
     assert_eq!(
         plans[3],
         PassBindingPlan::Spatial {
             source: PassTextureSource::Scratch(0),
-            target_scratch: 1,
+            target: PassTarget::Scratch(1),
             original: None
         }
     );
     assert_eq!(blit_source, Some(1));
+}
+
+#[test]
+fn runtime_binding_plan_fragment_mode_draws_last_spatial_to_output() {
+    let filter = Chain {
+        first: crate::filters::Blur(2.0f32),
+        second: Chain {
+            first: crate::filters::Brightness(0.2f32),
+            second: crate::filters::Sharpen(0.8f32),
+        },
+    };
+
+    let stages = collect_filter_stages(&filter);
+    let passes = fuse_stages(&stages).expect("fuse should succeed");
+
+    let (plans, blit_source) = plan_runtime_bindings(&passes, SpatialBackend::Fragment)
+        .expect("runtime binding planning should succeed");
+
+    assert_eq!(plans.len(), 4);
+    // Intermediate spatial passes still ping-pong through scratch, but the
+    // final one renders into the output attachment — and no blit follows.
+    assert_eq!(
+        plans[0],
+        PassBindingPlan::Spatial {
+            source: PassTextureSource::Input,
+            target: PassTarget::Scratch(0),
+            original: None
+        }
+    );
+    assert_eq!(
+        plans[3],
+        PassBindingPlan::Spatial {
+            source: PassTextureSource::Scratch(0),
+            target: PassTarget::Output,
+            original: None
+        }
+    );
+    assert_eq!(blit_source, None);
+}
+
+#[test]
+fn spatial_backend_resolves_from_device_limits() {
+    let webgl2_limits = wgpu::Limits {
+        max_compute_workgroups_per_dimension: 0,
+        max_storage_textures_per_shader_stage: 0,
+        ..Default::default()
+    };
+
+    assert_eq!(
+        SpatialBackend::resolve(SpatialExecution::Auto, &webgl2_limits),
+        SpatialBackend::Fragment
+    );
+    assert_eq!(
+        SpatialBackend::resolve(SpatialExecution::Auto, &wgpu::Limits::default()),
+        SpatialBackend::Compute
+    );
+    assert_eq!(
+        SpatialBackend::resolve(SpatialExecution::ForceFragment, &wgpu::Limits::default()),
+        SpatialBackend::Fragment
+    );
+    assert!(
+        SpatialBackend::Compute
+            .scratch_texture_usage()
+            .contains(wgpu::TextureUsages::STORAGE_BINDING)
+    );
+    assert!(
+        !SpatialBackend::Fragment
+            .scratch_texture_usage()
+            .contains(wgpu::TextureUsages::STORAGE_BINDING)
+    );
+}
+
+#[test]
+fn specialize_spatial_fragment_shader_rewrites_entry_and_stores() {
+    let blur = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/shaders/image/blur/blur_horizontal.wgsl"
+    ));
+    let shader = specialize_spatial_fragment_shader(blur);
+
+    assert!(!shader.contains("@compute"));
+    assert!(!shader.contains("global_invocation_id"));
+    assert!(!shader.contains("textureStore("));
+    assert!(!shader.contains("texture_storage_2d"));
+    assert!(shader.contains("fn store_output("));
+    assert!(shader.contains("store_output(vec2<i32>(gid.xy)"));
+    assert!(shader.contains("fn main(gid: vec3<u32>)"));
+    assert!(shader.contains("fn vs_main("));
+    assert!(shader.contains("fn fs_main("));
+
+    // CRLF checkouts/sources must produce the identical translation.
+    let crlf = specialize_spatial_fragment_shader(&blur.replace('\n', "\r\n"));
+    assert_eq!(crlf, shader);
+}
+
+#[test]
+#[should_panic(expected = "textureStore on something other than `output_texture`")]
+fn specialize_spatial_fragment_shader_rejects_foreign_store_target() {
+    let body = "@compute @workgroup_size(WORKGROUP_X, WORKGROUP_Y)\nfn main(@builtin(global_invocation_id) gid: vec3<u32>) { textureStore(other_texture, vec2<i32>(gid.xy), vec4<f32>(0.0)); }";
+    let _ = specialize_spatial_fragment_shader(body);
+}
+
+/// Every spatial body in the shader tree must survive the fragment
+/// translation and validate as WGSL with vertex/fragment entry points — this
+/// is what keeps "WebGL support" honest as the shader set grows.
+#[test]
+fn gpu_all_spatial_bodies_compile_as_fragment_shaders() {
+    let gpu = create_test_device();
+    let shader_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/shaders");
+    let mut sources = Vec::new();
+    let mut stack = alloc::vec![shader_dir];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).expect("shader directory should be readable") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "wgsl") {
+                let source = fs::read_to_string(&path).expect("shader source should be utf-8");
+                if source.contains("@compute") {
+                    sources.push((path, source));
+                }
+            }
+        }
+    }
+    assert!(
+        !sources.is_empty(),
+        "expected to find spatial shader bodies"
+    );
+
+    for (path, source) in sources {
+        let translated = specialize_spatial_fragment_shader(&source);
+        let error_scope = gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let _module = gpu
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("spatial fragment translation test"),
+                source: wgpu::ShaderSource::Wgsl(translated.into()),
+            });
+        if let Some(err) = pollster::block_on(error_scope.pop()) {
+            panic!(
+                "fragment translation of {} failed validation: {err}",
+                path.display()
+            );
+        }
+    }
+}
+
+/// Uploads the shared test pattern to a sampled texture for parity/gallery runs.
+fn upload_test_input(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    width: u32,
+    height: u32,
+) -> wgpu::Texture {
+    let input_rgba = create_test_input_rgba(width, height);
+    let input_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("test input"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &input_texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &input_rgba,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(width * 4),
+            rows_per_image: Some(height),
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    input_texture
+}
+
+/// Asserts the compute and fragment paths agree within one u8 step per
+/// channel. The paths run the same body on the same data, but the compute
+/// path rounds the final stage through the f16 scratch + blit while the
+/// fragment path writes the output attachment directly — so parity is exact
+/// modulo a single step of intermediate-storage rounding. On violation both
+/// images are dumped to /tmp for visual inspection.
+fn assert_spatial_parity(name: &str, width: u32, height: u32, compute: &[u8], fragment: &[u8]) {
+    let worst = compute
+        .iter()
+        .zip(fragment)
+        .map(|(a, b)| i32::from(*a) - i32::from(*b))
+        .map(i32::abs)
+        .max()
+        .unwrap_or(0);
+    if worst <= 1 {
+        return;
+    }
+    write_png(
+        &PathBuf::from("/tmp").join(alloc::format!("parity_{name}_compute.png")),
+        width,
+        height,
+        compute,
+    );
+    write_png(
+        &PathBuf::from("/tmp").join(alloc::format!("parity_{name}_fragment.png")),
+        width,
+        height,
+        fragment,
+    );
+    let first = (0..(width * height) as usize)
+        .find(|&i| compute[i * 4..i * 4 + 4] != fragment[i * 4..i * 4 + 4])
+        .expect("a differing pixel exists when worst exceeds the bound");
+    panic!(
+        "{name}: fragment (WebGL2) output diverged from compute output; worst channel diff {worst} at ({}, {}): compute={:?} fragment={:?}",
+        first % width as usize,
+        first / width as usize,
+        &compute[first * 4..first * 4 + 4],
+        &fragment[first * 4..first * 4 + 4],
+    );
+}
+
+#[test]
+fn gpu_spatial_fragment_path_matches_compute_output() {
+    let gpu = create_test_device();
+    let device = &gpu.device;
+    let queue = &gpu.queue;
+
+    let width = 32;
+    let height = 24;
+    let input_texture = upload_test_input(device, queue, width, height);
+    let size = FilterReadbackSize {
+        input: (width, height),
+        output: (width, height),
+    };
+
+    // Representative coverage: separable multi-pass spatial (Blur), a
+    // with-original pair (Bloom), a single-pass kernel (Sharpen), an edge
+    // detector (Sobel), a spatial->color boundary chain, and the
+    // radial/homography helpers (Vignette, Crystallize).
+    macro_rules! parity {
+        ($name:literal, $filter:expr) => {{
+            let compute = run_filter_and_readback(
+                device,
+                queue,
+                &input_texture,
+                size,
+                FilterAdapter::new($filter),
+            );
+            let fragment = run_filter_and_readback(
+                device,
+                queue,
+                &input_texture,
+                size,
+                FilterAdapter::new($filter).spatial_execution(SpatialExecution::ForceFragment),
+            );
+            assert_spatial_parity($name, width, height, &compute, &fragment);
+        }};
+    }
+
+    parity!("blur", crate::filters::Blur(3.0f32));
+    parity!(
+        "bloom",
+        crate::filters::Bloom {
+            radius: 6.0f32,
+            intensity: 1.2,
+            threshold: 0.5,
+        }
+    );
+    parity!("sharpen", crate::filters::Sharpen(1.2f32));
+    parity!("sobel", crate::filters::Sobel);
+    parity!("morphology_max", crate::filters::MorphologyMax);
+    parity!(
+        "chain_blur_brightness",
+        crate::filters::Blur(2.0f32).then(crate::filters::Brightness(0.15f32))
+    );
+    parity!("vignette", crate::filters::Vignette(0.55f32, 0.35f32));
+    parity!("crystallize", crate::filters::Crystallize(8.0f32));
 }
 
 #[test]
@@ -468,14 +756,14 @@ fn runtime_binding_plan_for_fused_color_chain_uses_direct_output() {
 
     let stages = collect_filter_stages(&filter);
     let passes = fuse_stages(&stages).expect("fuse should succeed");
-    let (plans, blit_source) =
-        plan_runtime_bindings(&passes).expect("runtime binding planning should succeed");
+    let (plans, blit_source) = plan_runtime_bindings(&passes, SpatialBackend::Compute)
+        .expect("runtime binding planning should succeed");
 
     assert_eq!(
         plans,
         vec![PassBindingPlan::Color {
             source: PassTextureSource::Input,
-            target: ColorTarget::Output
+            target: PassTarget::Output
         }]
     );
     assert_eq!(blit_source, None);
@@ -1188,7 +1476,9 @@ fn gpu_export_filter_gallery_images() {
     let input_width = 256;
     let input_height = 256;
     let output_dir = PathBuf::from("/tmp/waterui_filter_gallery");
+    let fragment_dir = PathBuf::from("/tmp/waterui_filter_gallery_fragment");
     fs::create_dir_all(&output_dir).expect("failed to create output directory");
+    fs::create_dir_all(&fragment_dir).expect("failed to create fragment output directory");
 
     let input_rgba = create_test_input_rgba(input_width, input_height);
     write_png(
@@ -1233,19 +1523,26 @@ fn gpu_export_filter_gallery_images() {
         },
     );
 
+    // Every case is exported twice: once through the default (compute)
+    // backend and once through the fragment (WebGL2) backend, so both can be
+    // eyeballed or diffed. Small per-pixel differences between GPU execution
+    // paths are expected and tolerable — see AGENTS.md.
     macro_rules! export_filter {
         ($name:literal, $ow:expr, $oh:expr, $filter:expr) => {{
-            let result = run_filter_and_readback(
+            let size = FilterReadbackSize {
+                input: (input_width, input_height),
+                output: ($ow, $oh),
+            };
+            let result = run_filter_and_readback(device, queue, &input_texture, size, $filter);
+            write_png(&output_dir.join($name), $ow, $oh, &result);
+            let fragment_result = run_filter_and_readback(
                 device,
                 queue,
                 &input_texture,
-                FilterReadbackSize {
-                    input: (input_width, input_height),
-                    output: ($ow, $oh),
-                },
-                $filter,
+                size,
+                ($filter).spatial_execution(SpatialExecution::ForceFragment),
             );
-            write_png(&output_dir.join($name), $ow, $oh, &result);
+            write_png(&fragment_dir.join($name), $ow, $oh, &fragment_result);
         }};
     }
 

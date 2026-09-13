@@ -37,6 +37,25 @@
 //! # // A chain's params nest, one array per link, in application order.
 //! # assert_eq!(chain.params(), ([5.0, 5.0], [0.1]));
 //! ```
+//!
+//! # WebGL support
+//!
+//! The optional `webgl` feature enables wgpu's WebGL2 backend for wasm
+//! targets (`wasm32-unknown-unknown`). WebGL2 has no compute shaders or
+//! storage textures, so spatial filter stages compile to a fragment
+//! translation of the same shader body there, selected automatically from
+//! the device limits — see [`runtime::SpatialExecution`]. The feature is a
+//! compile error on non-wasm targets.
+
+// The `webgl` feature only makes sense where a WebGL2 context exists. On any
+// other target it is inert (wgpu gates its WebGL backend to wasm), so turning
+// it on natively is a build-graph mistake — fail fast instead of silently
+// shipping an unused dependency set.
+#[cfg(all(feature = "webgl", not(target_family = "wasm")))]
+compile_error!(
+    "filtrate's `webgl` feature is only supported on wasm targets \
+     (wasm32-unknown-unknown); remove it from this build"
+);
 
 mod compiled_shaders;
 pub mod effect;

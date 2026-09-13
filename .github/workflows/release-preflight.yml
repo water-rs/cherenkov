@@ -40,3 +40,9 @@ jobs:
           fi
       - if: steps.baseline.outputs.exists == 'true'
         uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          # The action's default heuristic enables every non-"unstable"
+          # feature — including `webgl`, which is an intentional
+          # compile_error off wasm. The feature adds no cfg-gated API, so
+          # default features cover the full public surface.
+          feature-group: default-features

@@ -40,6 +40,61 @@ pub enum HdrPolicy {
     ForceLdr,
 }
 
+/// Policy controlling how spatial (`Filter::COLOR_ONLY == false`) stages are
+/// executed. Chosen per adapter via
+/// [`super::FilterAdapter::spatial_execution`].
+///
+/// WebGL2 devices expose no compute shaders or storage textures
+/// (`max_compute_workgroups_per_dimension == 0`), so
+/// [`SpatialExecution::Auto`] resolves to the fragment path there: each
+/// spatial body is recompiled as a fragment shader that writes its own pixel
+/// through a render attachment instead of `textureStore`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SpatialExecution {
+    /// Use compute passes when the device supports them, fragment passes
+    /// otherwise (WebGL2).
+    #[default]
+    Auto,
+    /// Always compile spatial stages as fragment passes, even on
+    /// compute-capable devices. Used to validate and benchmark the WebGL path
+    /// on native adapters.
+    ForceFragment,
+}
+
+/// Resolved execution strategy for spatial passes on this device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SpatialBackend {
+    /// One `@compute` dispatch per stage writing a storage texture.
+    Compute,
+    /// One fullscreen fragment pass per stage writing a render attachment.
+    Fragment,
+}
+
+impl SpatialBackend {
+    /// Resolve `policy` against the device's actual limits. WebGL2 devices
+    /// report zero compute/storage capacity, which is what `Auto` keys on.
+    pub(super) const fn resolve(policy: SpatialExecution, limits: &wgpu::Limits) -> Self {
+        let compute_supported = limits.max_compute_workgroups_per_dimension > 0
+            && limits.max_storage_textures_per_shader_stage > 0;
+        match (policy, compute_supported) {
+            (SpatialExecution::ForceFragment, _) | (SpatialExecution::Auto, false) => {
+                Self::Fragment
+            }
+            (SpatialExecution::Auto, true) => Self::Compute,
+        }
+    }
+
+    /// Usages every scratch texture must carry under this backend.
+    pub(super) fn scratch_texture_usage(self) -> wgpu::TextureUsages {
+        let mut usage =
+            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT;
+        if matches!(self, Self::Compute) {
+            usage |= wgpu::TextureUsages::STORAGE_BINDING;
+        }
+        usage
+    }
+}
+
 pub(super) const fn is_hdr_texture_format(format: wgpu::TextureFormat) -> bool {
     matches!(
         format,
@@ -56,12 +111,6 @@ pub(super) const fn preferred_scratch_format(
     } else {
         wgpu::TextureFormat::Rgba8Unorm
     }
-}
-
-pub(super) fn scratch_texture_usage() -> wgpu::TextureUsages {
-    wgpu::TextureUsages::TEXTURE_BINDING
-        | wgpu::TextureUsages::STORAGE_BINDING
-        | wgpu::TextureUsages::RENDER_ATTACHMENT
 }
 
 pub(super) const fn storage_format_to_wgsl(
@@ -82,26 +131,113 @@ pub(super) const fn is_filterable_texture_format(format: wgpu::TextureFormat) ->
     !matches!(format, wgpu::TextureFormat::Rgba32Float)
 }
 
-pub(super) const SPATIAL_PREAMBLE: &str = include_str!(concat!(
+const SPATIAL_BINDINGS: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/src/shaders/shared/spatial_preamble.wgsl"
+    "/src/shaders/shared/spatial_bindings.wgsl"
+));
+const SPATIAL_OUTPUT_COMPUTE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/shaders/shared/spatial_output_compute.wgsl"
+));
+const SPATIAL_OUTPUT_FRAGMENT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/shaders/shared/spatial_output_fragment.wgsl"
+));
+const SPATIAL_HELPERS: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/shaders/shared/spatial_helpers.wgsl"
+));
+const SPATIAL_FRAGMENT_POSTAMBLE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/shaders/shared/spatial_fragment_postamble.wgsl"
 ));
 
+fn compose_spatial_shader(parts: &[&str]) -> alloc::string::String {
+    let mut combined =
+        alloc::string::String::with_capacity(parts.iter().map(|part| part.len() + 1).sum());
+    for (index, part) in parts.iter().enumerate() {
+        if index > 0 {
+            combined.push('\n');
+        }
+        combined.push_str(part);
+    }
+    combined.replace(PARAM_VEC4S_TOKEN, &MAX_FILTER_PARAM_VEC4S.to_string())
+}
+
+/// Assembles the compute variant of a spatial stage (bindings + storage
+/// output + helpers + body) and substitutes its token contract.
 pub(super) fn specialize_spatial_shader(
     shader_source: &str,
     storage_format: wgpu::TextureFormat,
 ) -> Result<alloc::string::String, &'static str> {
     let storage_ty = storage_format_to_wgsl(storage_format)?;
-    let mut combined =
-        alloc::string::String::with_capacity(SPATIAL_PREAMBLE.len() + shader_source.len() + 1);
-    combined.push_str(SPATIAL_PREAMBLE);
-    combined.push('\n');
-    combined.push_str(shader_source);
-    Ok(combined
-        .replace(SPATIAL_OUTPUT_FORMAT_TOKEN, storage_ty)
-        .replace(SPATIAL_WORKGROUP_X_TOKEN, &SPATIAL_WORKGROUP_X.to_string())
-        .replace(SPATIAL_WORKGROUP_Y_TOKEN, &SPATIAL_WORKGROUP_Y.to_string())
-        .replace(PARAM_VEC4S_TOKEN, &MAX_FILTER_PARAM_VEC4S.to_string()))
+    Ok(compose_spatial_shader(&[
+        SPATIAL_BINDINGS,
+        SPATIAL_OUTPUT_COMPUTE,
+        SPATIAL_HELPERS,
+        shader_source,
+    ])
+    .replace(SPATIAL_OUTPUT_FORMAT_TOKEN, storage_ty)
+    .replace(SPATIAL_WORKGROUP_X_TOKEN, &SPATIAL_WORKGROUP_X.to_string())
+    .replace(SPATIAL_WORKGROUP_Y_TOKEN, &SPATIAL_WORKGROUP_Y.to_string()))
+}
+
+/// The exact compute entry declaration every spatial body starts with.
+const SPATIAL_COMPUTE_ENTRY: &str = "@compute @workgroup_size(WORKGROUP_X, WORKGROUP_Y)\nfn main(@builtin(global_invocation_id) gid: vec3<u32>)";
+const SPATIAL_FRAGMENT_ENTRY: &str = "fn main(gid: vec3<u32>)";
+
+/// Rewrites a spatial body for fragment execution: drops the `@compute`
+/// entry attributes so `fs_main` can call `main(gid)` as a plain function,
+/// and translates `textureStore(output_texture, coord, value)` calls —
+/// including ones wrapped across lines — into `store_output(coord, value)`.
+/// Fails fast on any body that doesn't match the contract.
+fn spatial_body_for_fragment(body: &str) -> alloc::string::String {
+    const STORE: &str = "textureStore";
+    // Shader sources arrive via include_str! or the public API; a CRLF
+    // checkout or a CRLF-authored body would otherwise miss the `\n` in the
+    // entry signature. Normalize once — WGSL accepts LF throughout.
+    let body = body.replace("\r\n", "\n");
+    let mut out = body.replace(SPATIAL_COMPUTE_ENTRY, SPATIAL_FRAGMENT_ENTRY);
+    assert!(
+        !out.contains("@compute") && !out.contains("global_invocation_id"),
+        "spatial shader body does not match the expected compute entry declaration"
+    );
+    // Translate textureStore(output_texture, …) → store_output(…). The first
+    // argument is always the `output_texture` sentinel; consume it strictly so
+    // a store to anything else is a loud failure, not silent corruption.
+    let mut rewritten = alloc::string::String::with_capacity(out.len());
+    while let Some(start) = out.find(STORE) {
+        rewritten.push_str(&out[..start]);
+        let rest = &out[start + STORE.len()..];
+        let rest = rest
+            .trim_start()
+            .strip_prefix('(')
+            .and_then(|s| s.trim_start().strip_prefix("output_texture"))
+            .and_then(|s| s.trim_start().strip_prefix(','))
+            .map(str::trim_start)
+            .expect(
+                "spatial shader body calls textureStore on something other than `output_texture`",
+            );
+        rewritten.push_str("store_output(");
+        out = rest.to_string();
+    }
+    rewritten.push_str(&out);
+    rewritten
+}
+
+/// Assembles the fragment variant of a spatial stage: same bindings and
+/// helpers as the compute variant, but the output binding is the
+/// `store_output` sentinel and the module ends with fullscreen-triangle
+/// vertex/fragment entry points.
+pub(super) fn specialize_spatial_fragment_shader(shader_source: &str) -> alloc::string::String {
+    let body = spatial_body_for_fragment(shader_source);
+    compose_spatial_shader(&[
+        SPATIAL_BINDINGS,
+        SPATIAL_OUTPUT_FRAGMENT,
+        SPATIAL_HELPERS,
+        &body,
+        SPATIAL_FRAGMENT_POSTAMBLE,
+    ])
 }
 
 /// Assembles the fused color shader (preamble + fragments + postamble) and

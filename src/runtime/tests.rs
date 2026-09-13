@@ -543,6 +543,10 @@ fn specialize_spatial_fragment_shader_rewrites_entry_and_stores() {
     assert!(shader.contains("fn main(gid: vec3<u32>)"));
     assert!(shader.contains("fn vs_main("));
     assert!(shader.contains("fn fs_main("));
+
+    // CRLF checkouts/sources must produce the identical translation.
+    let crlf = specialize_spatial_fragment_shader(&blur.replace('\n', "\r\n"));
+    assert_eq!(crlf, shader);
 }
 
 #[test]

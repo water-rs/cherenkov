@@ -193,6 +193,10 @@ const SPATIAL_FRAGMENT_ENTRY: &str = "fn main(gid: vec3<u32>)";
 /// Fails fast on any body that doesn't match the contract.
 fn spatial_body_for_fragment(body: &str) -> alloc::string::String {
     const STORE: &str = "textureStore";
+    // Shader sources arrive via include_str! or the public API; a CRLF
+    // checkout or a CRLF-authored body would otherwise miss the `\n` in the
+    // entry signature. Normalize once — WGSL accepts LF throughout.
+    let body = body.replace("\r\n", "\n");
     let mut out = body.replace(SPATIAL_COMPUTE_ENTRY, SPATIAL_FRAGMENT_ENTRY);
     assert!(
         !out.contains("@compute") && !out.contains("global_invocation_id"),

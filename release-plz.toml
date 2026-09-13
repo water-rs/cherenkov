@@ -9,6 +9,10 @@ changelog_update = true
 
 [[package]]
 name = "filtrate"
+# cargo-semver-checks' feature heuristic enables `webgl`, which is
+# intentionally a compile_error! off-wasm; PR semver coverage stays in
+# release-preflight.yml (default-features).
+semver_check = false
 git_tag_name = "v{{ version }}"
 git_release_name = "v{{ version }}"
 

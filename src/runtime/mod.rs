@@ -16,7 +16,7 @@ mod uniform;
 #[cfg(test)]
 mod tests;
 
-pub use shader::HdrPolicy;
+pub use shader::{HdrPolicy, SpatialExecution};
 
 use alloc::{boxed::Box, vec::Vec};
 use core::fmt;
@@ -32,7 +32,7 @@ use crate::effect::{
 
 use animation::ParamAnimator;
 use pass::{
-    ColorTarget, CompiledPass, CompiledPassKind, PassBindingPlan, PassTextureSource,
+    CompiledPass, CompiledPassKind, PassBindingPlan, PassTarget, PassTextureSource,
     SCRATCH_SLOT_COUNT, find_or_insert_dynamic_bind_group, get_or_create_static_bind_group,
 };
 use plan::{
@@ -40,14 +40,14 @@ use plan::{
     final_direct_output_pass_index, fuse_stages, plan_runtime_bindings,
 };
 use shader::{
-    SPATIAL_WORKGROUP_X, SPATIAL_WORKGROUP_Y, is_filterable_texture_format, is_hdr_texture_format,
-    preferred_scratch_format, scratch_texture_usage, specialize_color_shader,
-    specialize_spatial_shader,
+    SPATIAL_WORKGROUP_X, SPATIAL_WORKGROUP_Y, SpatialBackend, is_filterable_texture_format,
+    is_hdr_texture_format, preferred_scratch_format, specialize_color_shader,
+    specialize_spatial_fragment_shader, specialize_spatial_shader,
 };
 use uniform::{
     build_color_uniform_data, build_spatial_uniform_data, create_pass_uniform_buffer,
-    spatial_source_layout_entry, spatial_target_layout_entry, spatial_uniform_layout_entry,
-    upload_uniform_if_changed,
+    spatial_original_layout_entry, spatial_source_layout_entry, spatial_target_layout_entry,
+    spatial_uniform_layout_entry, upload_uniform_if_changed,
 };
 
 // ============================================================================
@@ -65,7 +65,10 @@ use uniform::{
 /// ## Pipeline Selection
 ///
 /// - **Color-only filters** (`F::COLOR_ONLY = true`): Use fragment shaders for native HDR support.
-/// - **Spatial filters** (`F::COLOR_ONLY = false`): Use compute shaders with intermediate texture for HDR.
+/// - **Spatial filters** (`F::COLOR_ONLY = false`): Use compute shaders with
+///   intermediate storage textures on capable devices, or a fragment
+///   translation of the same shader body on compute-less devices (WebGL2),
+///   selected at setup from the device's limits — see [`SpatialExecution`].
 pub struct FilterAdapter<F: Filter> {
     filter: F,
     /// Reactive-parameter driver: watchers, event channel, per-parameter tracks.
@@ -75,6 +78,10 @@ pub struct FilterAdapter<F: Filter> {
     requires_scratch: bool,
     /// HDR/LDR behavior policy for intermediate passes.
     hdr_policy: HdrPolicy,
+    /// Requested spatial execution strategy (see [`SpatialExecution`]).
+    spatial_execution: SpatialExecution,
+    /// Resolved spatial execution strategy for the current device.
+    spatial_backend: SpatialBackend,
     /// Scratch texture format for intermediate passes (SDR/HDR).
     scratch_format: wgpu::TextureFormat,
     /// Texture formats the pipeline was compiled against; render validates
@@ -120,6 +127,8 @@ impl<F: Filter> FilterAdapter<F> {
             passes: Vec::new(),
             requires_scratch: false,
             hdr_policy: HdrPolicy::default(),
+            spatial_execution: SpatialExecution::default(),
+            spatial_backend: SpatialBackend::Compute,
             scratch_format: wgpu::TextureFormat::Rgba8Unorm,
             setup_formats: None,
             setup_error: None,
@@ -154,6 +163,7 @@ impl<F: Filter> FilterAdapter<F> {
             second: filter,
         });
         next.hdr_policy = self.hdr_policy;
+        next.spatial_execution = self.spatial_execution;
         if let Some(redraw_callback) = redraw_callback {
             next.install_redraw_callback(redraw_callback);
         }
@@ -183,6 +193,20 @@ impl<F: Filter> FilterAdapter<F> {
     #[must_use]
     pub const fn force_ldr(self) -> Self {
         self.hdr_policy(HdrPolicy::ForceLdr)
+    }
+
+    /// Set how spatial stages execute on this adapter.
+    ///
+    /// The default, [`SpatialExecution::Auto`], uses compute passes where the
+    /// device supports them and falls back to a fragment translation on
+    /// WebGL2-class devices (which expose neither compute shaders nor storage
+    /// textures). [`SpatialExecution::ForceFragment`] exercises the fragment
+    /// path on any device — it exists so the WebGL path can be validated and
+    /// benchmarked on native adapters.
+    #[must_use]
+    pub const fn spatial_execution(mut self, execution: SpatialExecution) -> Self {
+        self.spatial_execution = execution;
+        self
     }
 
     fn install_redraw_callback(&self, callback: EffectRedrawCallback) {
@@ -227,13 +251,13 @@ impl<F: Filter> FilterAdapter<F> {
                     if let PassTextureSource::Scratch(slot) = source {
                         required[slot] = true;
                     }
-                    if let ColorTarget::Scratch(slot) = target {
+                    if let PassTarget::Scratch(slot) = target {
                         required[slot] = true;
                     }
                 }
                 PassBindingPlan::Spatial {
                     source,
-                    target_scratch,
+                    target,
                     original,
                 } => {
                     if let PassTextureSource::Scratch(slot) = source {
@@ -242,8 +266,10 @@ impl<F: Filter> FilterAdapter<F> {
                     if let Some(PassTextureSource::Scratch(slot)) = original {
                         required[slot] = true;
                     }
-                    if direct_output_pass_index != Some(pass_index) {
-                        required[target_scratch] = true;
+                    if let PassTarget::Scratch(slot) = target
+                        && direct_output_pass_index != Some(pass_index)
+                    {
+                        required[slot] = true;
                     }
                 }
             }
@@ -296,7 +322,7 @@ impl<F: Filter> FilterAdapter<F> {
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
                     format: self.scratch_format,
-                    usage: scratch_texture_usage(),
+                    usage: self.spatial_backend.scratch_texture_usage(),
                     view_formats: &[],
                 });
                 let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -334,9 +360,14 @@ impl<F: Filter> FilterAdapter<F> {
     ) -> Result<(), EffectSetupError> {
         self.passes.clear();
         self.blit_bind_group = None;
-        let (binding_plans, blit_source_scratch_slot) = plan_runtime_bindings(planned)?;
+        let (binding_plans, blit_source_scratch_slot) =
+            plan_runtime_bindings(planned, self.spatial_backend)?;
         self.blit_source_scratch_slot = blit_source_scratch_slot;
-        let final_direct_output_pass = final_direct_output_pass_index(planned, ctx.output_format);
+        // Direct-output specialization only exists on the compute path —
+        // fragment spatial passes already render straight to the output.
+        let final_direct_output_pass = (self.spatial_backend == SpatialBackend::Compute)
+            .then(|| final_direct_output_pass_index(planned, ctx.output_format))
+            .flatten();
 
         if self.requires_scratch {
             let error_scope = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
@@ -351,7 +382,7 @@ impl<F: Filter> FilterAdapter<F> {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: scratch_format,
-                usage: scratch_texture_usage(),
+                usage: self.spatial_backend.scratch_texture_usage(),
                 view_formats: &[],
             });
             let _ = probe.create_view(&wgpu::TextureViewDescriptor::default());
@@ -367,11 +398,11 @@ impl<F: Filter> FilterAdapter<F> {
                 PlannedPassKind::Color { fragments } => {
                     let target_format = match binding_plan {
                         PassBindingPlan::Color {
-                            target: ColorTarget::Output,
+                            target: PassTarget::Output,
                             ..
                         } => ctx.output_format,
                         PassBindingPlan::Color {
-                            target: ColorTarget::Scratch(_),
+                            target: PassTarget::Scratch(_),
                             ..
                         } => scratch_format,
                         PassBindingPlan::Spatial { .. } => {
@@ -412,53 +443,102 @@ impl<F: Filter> FilterAdapter<F> {
                     shader,
                     original_input,
                 } => {
-                    if !matches!(binding_plan, PassBindingPlan::Spatial { .. }) {
+                    let PassBindingPlan::Spatial { target, .. } = binding_plan else {
                         return Err(EffectSetupError::PlannerInvariant(
                             "runtime planner produced invalid spatial binding plan",
                         ));
-                    }
-                    let error_scope = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
-                    let (pipeline, bind_group_layout) =
-                        Self::create_spatial_pipeline(ctx, shader, scratch_format, *original_input)
+                    };
+                    let kind = match self.spatial_backend {
+                        SpatialBackend::Compute => {
+                            let error_scope =
+                                ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
+                            let (pipeline, bind_group_layout) = Self::create_spatial_pipeline(
+                                ctx,
+                                shader,
+                                scratch_format,
+                                *original_input,
+                            )
                             .map_err(EffectSetupError::PlannerInvariant)?;
-                    if let Some(err) = error_scope.pop().await {
-                        let message = alloc::format!("{err}");
-                        tracing::error!("[Filter] spatial pipeline validation error: {message}");
-                        return Err(EffectSetupError::PipelineValidation {
-                            stage: "spatial",
-                            message,
-                        });
-                    }
+                            if let Some(err) = error_scope.pop().await {
+                                let message = alloc::format!("{err}");
+                                tracing::error!(
+                                    "[Filter] spatial pipeline validation error: {message}"
+                                );
+                                return Err(EffectSetupError::PipelineValidation {
+                                    stage: "spatial",
+                                    message,
+                                });
+                            }
 
-                    // The final spatial pass additionally compiles a
-                    // direct-output specialization when the output format
-                    // supports storage binding, so render can skip the blit.
-                    let direct_output = if final_direct_output_pass == Some(pass_index) {
-                        let error_scope =
-                            ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
-                        let compiled =
-                            Self::create_spatial_pipeline(ctx, shader, ctx.output_format, false);
-                        let validation_error = error_scope.pop().await;
-                        if let (Ok(pair), None) = (compiled, validation_error) {
-                            Some(pair)
-                        } else {
-                            tracing::debug!(
-                                "[Filter] final spatial direct-output path unavailable for output format {:?}",
-                                ctx.output_format
-                            );
-                            None
+                            // The final spatial pass additionally compiles a
+                            // direct-output specialization when the output format
+                            // supports storage binding, so render can skip the blit.
+                            let direct_output = if final_direct_output_pass == Some(pass_index) {
+                                let error_scope =
+                                    ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
+                                let compiled = Self::create_spatial_pipeline(
+                                    ctx,
+                                    shader,
+                                    ctx.output_format,
+                                    false,
+                                );
+                                let validation_error = error_scope.pop().await;
+                                if let (Ok(pair), None) = (compiled, validation_error) {
+                                    Some(pair)
+                                } else {
+                                    tracing::debug!(
+                                        "[Filter] final spatial direct-output path unavailable for output format {:?}",
+                                        ctx.output_format
+                                    );
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+
+                            CompiledPassKind::Spatial {
+                                pipeline,
+                                bind_group_layout,
+                                original_input: *original_input,
+                                direct_output,
+                            }
                         }
-                    } else {
-                        None
+                        SpatialBackend::Fragment => {
+                            // The last spatial pass draws into the output
+                            // attachment; earlier ones target scratch.
+                            let target_format = match target {
+                                PassTarget::Output => ctx.output_format,
+                                PassTarget::Scratch(_) => scratch_format,
+                            };
+                            let error_scope =
+                                ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
+                            let (pipeline, bind_group_layout) =
+                                Self::create_spatial_fragment_pipeline(
+                                    ctx,
+                                    shader,
+                                    target_format,
+                                    *original_input,
+                                );
+                            if let Some(err) = error_scope.pop().await {
+                                let message = alloc::format!("{err}");
+                                tracing::error!(
+                                    "[Filter] spatial fragment pipeline validation error: {message}"
+                                );
+                                return Err(EffectSetupError::PipelineValidation {
+                                    stage: "spatial-fragment",
+                                    message,
+                                });
+                            }
+                            CompiledPassKind::SpatialFragment {
+                                pipeline,
+                                bind_group_layout,
+                                original_input: *original_input,
+                            }
+                        }
                     };
 
                     self.passes.push(CompiledPass {
-                        kind: CompiledPassKind::Spatial {
-                            pipeline,
-                            bind_group_layout,
-                            original_input: *original_input,
-                            direct_output,
-                        },
+                        kind,
                         param_offset: pass.param_offset,
                         param_count: pass.param_count,
                         binding_plan,
@@ -530,12 +610,29 @@ impl<F: Filter> FilterAdapter<F> {
             ..Default::default()
         }));
 
+        // Resolve spatial execution from the device's limits: WebGL2 devices
+        // report zero compute/storage capacity and take the fragment path.
+        self.spatial_backend =
+            SpatialBackend::resolve(self.spatial_execution, &ctx.device.limits());
         let planned = fuse_stages(&collect_filter_stages(&self.filter))?;
-        self.requires_scratch = planned.len() > 1
-            || matches!(
-                planned.last().map(|pass| &pass.kind),
-                Some(PlannedPassKind::Spatial { .. })
+        let ends_on_spatial = matches!(
+            planned.last().map(|pass| &pass.kind),
+            Some(PlannedPassKind::Spatial { .. })
+        );
+        if ends_on_spatial
+            && self.spatial_backend == SpatialBackend::Fragment
+            && self.spatial_execution == SpatialExecution::Auto
+        {
+            tracing::info!(
+                "[Filter] device exposes no compute/storage-texture capability \
+                 (WebGL2-class); spatial stages run as fragment passes"
             );
+        }
+        // A single-pass spatial filter needs scratch only when the compute
+        // path must detour through a storage texture; a fragment spatial pass
+        // renders straight to the output attachment.
+        self.requires_scratch = planned.len() > 1
+            || (ends_on_spatial && self.spatial_backend == SpatialBackend::Compute);
         let needs_original_input_scratch = planned.iter().any(|pass| {
             matches!(
                 pass.kind,
@@ -767,8 +864,8 @@ impl<F: Filter> Effect for FilterAdapter<F> {
                         }
                     };
                     let target_view: &wgpu::TextureView = match target {
-                        ColorTarget::Output => &output.view,
-                        ColorTarget::Scratch(slot) => {
+                        PassTarget::Output => &output.view,
+                        PassTarget::Scratch(slot) => {
                             let Some(view) = self.scratch_views[slot].as_ref() else {
                                 return Err(EffectRenderError::MissingResource(
                                     "color pass target scratch view missing",
@@ -847,7 +944,7 @@ impl<F: Filter> Effect for FilterAdapter<F> {
                         render_pass.draw(0..6, 0..1);
                     }
 
-                    if matches!(target, ColorTarget::Scratch(_)) {
+                    if matches!(target, PassTarget::Scratch(_)) {
                         source_width = output.width;
                         source_height = output.height;
                     }
@@ -861,43 +958,18 @@ impl<F: Filter> Effect for FilterAdapter<F> {
                     },
                     PassBindingPlan::Spatial {
                         source,
-                        target_scratch,
+                        target,
                         original,
                     },
                 ) => {
-                    let source_view: &wgpu::TextureView = match source {
-                        PassTextureSource::Input => &input.view,
-                        PassTextureSource::Scratch(slot) => {
-                            let Some(view) = self.scratch_views[slot].as_ref() else {
-                                return Err(EffectRenderError::MissingResource(
-                                    "spatial pass source scratch view missing",
-                                ));
-                            };
-                            view
-                        }
-                    };
+                    let source_view = spatial_source_view(source, input, &self.scratch_views)?;
                     debug_assert_eq!(
                         original.is_some(),
                         *original_input,
                         "binding plan original must mirror the compiled pass layout"
                     );
-                    // The original is the texture that fed this filter's
-                    // first stage (planned per-pass); scratch originals are
-                    // output-sized.
-                    let (original_view, original_width, original_height) = match original {
-                        Some(PassTextureSource::Input) => {
-                            (Some(&input.view), input.width, input.height)
-                        }
-                        Some(PassTextureSource::Scratch(slot)) => {
-                            let Some(view) = self.scratch_views[slot].as_ref() else {
-                                return Err(EffectRenderError::MissingResource(
-                                    "spatial pass original scratch view missing",
-                                ));
-                            };
-                            (Some(view), output.width, output.height)
-                        }
-                        None => (None, 0, 0),
-                    };
+                    let (original_view, original_width, original_height) =
+                        spatial_original_view(original, input, &self.scratch_views, output)?;
 
                     let mut writes_output_directly = false;
                     let (target_view, dispatch_pipeline, dispatch_bind_group_layout): (
@@ -910,7 +982,12 @@ impl<F: Filter> Effect for FilterAdapter<F> {
                         writes_output_directly = true;
                         (&output.view, direct_pipeline, direct_layout)
                     } else {
-                        let Some(target_view) = self.scratch_views[target_scratch].as_ref() else {
+                        let PassTarget::Scratch(slot) = target else {
+                            return Err(EffectRenderError::MissingResource(
+                                "compute spatial pass cannot target the output without a direct-output pipeline",
+                            ));
+                        };
+                        let Some(target_view) = self.scratch_views[slot].as_ref() else {
                             return Err(EffectRenderError::MissingResource(
                                 "spatial pass target scratch view missing",
                             ));
@@ -997,6 +1074,128 @@ impl<F: Filter> Effect for FilterAdapter<F> {
 
                     source_width = target_width;
                     source_height = target_height;
+                }
+                (
+                    CompiledPassKind::SpatialFragment {
+                        pipeline,
+                        bind_group_layout,
+                        original_input,
+                    },
+                    PassBindingPlan::Spatial {
+                        source,
+                        target,
+                        original,
+                    },
+                ) => {
+                    let source_view = spatial_source_view(source, input, &self.scratch_views)?;
+                    debug_assert_eq!(
+                        original.is_some(),
+                        *original_input,
+                        "binding plan original must mirror the compiled pass layout"
+                    );
+                    let (original_view, original_width, original_height) =
+                        spatial_original_view(original, input, &self.scratch_views, output)?;
+
+                    // Fragment spatial passes draw into a render attachment:
+                    // scratch for intermediate stages, the output view for the
+                    // final stage — no storage texture or blit is involved.
+                    let target_view: &wgpu::TextureView = match target {
+                        PassTarget::Output => &output.view,
+                        PassTarget::Scratch(slot) => {
+                            let Some(view) = self.scratch_views[slot].as_ref() else {
+                                return Err(EffectRenderError::MissingResource(
+                                    "spatial fragment pass target scratch view missing",
+                                ));
+                            };
+                            view
+                        }
+                    };
+
+                    let uniform_data = build_spatial_uniform_data(
+                        output.width,
+                        output.height,
+                        source_width,
+                        source_height,
+                        original_width,
+                        original_height,
+                        params,
+                    );
+                    upload_uniform_if_changed(
+                        input.queue,
+                        &pass.uniform_buffer,
+                        &mut pass.last_uniform_data,
+                        &uniform_data,
+                    );
+
+                    // The fragment layout has no binding 1 — the output is the
+                    // render attachment, not a bound texture.
+                    let mut entries = alloc::vec![
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(source_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: pass.uniform_buffer.as_entire_binding(),
+                        },
+                    ];
+                    if let Some(original_view) = original_view {
+                        entries.push(wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::TextureView(original_view),
+                        });
+                    }
+                    let binds_rotating_view = matches!(target, PassTarget::Output)
+                        || matches!(source, PassTextureSource::Input)
+                        || matches!(original, Some(PassTextureSource::Input));
+                    let bind_group = if binds_rotating_view {
+                        find_or_insert_dynamic_bind_group(
+                            &mut pass.dynamic_bind_groups,
+                            input.device,
+                            bind_group_layout,
+                            "filter spatial fragment dynamic bind group",
+                            (source_view, Some(target_view), original_view),
+                            &entries,
+                        )
+                    } else {
+                        get_or_create_static_bind_group(
+                            &mut pass.cached_bind_group,
+                            input.device,
+                            bind_group_layout,
+                            "filter spatial fragment static bind group",
+                            &entries,
+                        )
+                    };
+
+                    {
+                        let mut render_pass =
+                            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                label: Some("filter spatial fragment pass"),
+                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                    view: target_view,
+                                    depth_slice: None,
+                                    resolve_target: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                        store: wgpu::StoreOp::Store,
+                                    },
+                                })],
+                                depth_stencil_attachment: None,
+                                timestamp_writes: None,
+                                occlusion_query_set: None,
+                                multiview_mask: None,
+                            });
+                        render_pass.set_pipeline(pipeline);
+                        render_pass.set_bind_group(0, bind_group, &[]);
+                        render_pass.draw(0..6, 0..1);
+                    }
+
+                    if matches!(target, PassTarget::Output) {
+                        used_direct_spatial_output = true;
+                    }
+
+                    source_width = output.width;
+                    source_height = output.height;
                 }
                 _ => {
                     return Err(EffectRenderError::MissingResource(
@@ -1186,33 +1385,24 @@ impl<F: Filter> FilterAdapter<F> {
         storage_format: wgpu::TextureFormat,
         original_input: bool,
     ) -> Result<(wgpu::ComputePipeline, wgpu::BindGroupLayout), &'static str> {
+        const COMPUTE: wgpu::ShaderStages = wgpu::ShaderStages::COMPUTE;
         let shader_source = specialize_spatial_shader(shader_source, storage_format)?;
         let shader =
             ctx.shader_cache
                 .module(ctx.device, Some("filter spatial shader"), &shader_source);
 
-        let original_entry = wgpu::BindGroupLayoutEntry {
-            binding: 3,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Texture {
-                sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                view_dimension: wgpu::TextureViewDimension::D2,
-                multisampled: false,
-            },
-            count: None,
-        };
         let entries = if original_input {
             alloc::vec![
-                spatial_source_layout_entry(),
+                spatial_source_layout_entry(COMPUTE),
                 spatial_target_layout_entry(storage_format),
-                spatial_uniform_layout_entry(),
-                original_entry,
+                spatial_uniform_layout_entry(COMPUTE),
+                spatial_original_layout_entry(COMPUTE),
             ]
         } else {
             alloc::vec![
-                spatial_source_layout_entry(),
+                spatial_source_layout_entry(COMPUTE),
                 spatial_target_layout_entry(storage_format),
-                spatial_uniform_layout_entry(),
+                spatial_uniform_layout_entry(COMPUTE),
             ]
         };
 
@@ -1243,6 +1433,86 @@ impl<F: Filter> FilterAdapter<F> {
             });
 
         Ok((pipeline, bind_group_layout))
+    }
+
+    /// Compiles a spatial stage as a render pipeline for the fragment
+    /// execution path (WebGL2): the rewritten body runs inside `fs_main` and
+    /// writes its own texel through the `target_format` attachment, so the
+    /// bind group carries only the sampled bindings (0, 2, 3) — no storage
+    /// output at binding 1.
+    fn create_spatial_fragment_pipeline(
+        ctx: &EffectContext,
+        shader_source: &str,
+        target_format: wgpu::TextureFormat,
+        original_input: bool,
+    ) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout) {
+        const FRAGMENT: wgpu::ShaderStages = wgpu::ShaderStages::FRAGMENT;
+        let shader_source = specialize_spatial_fragment_shader(shader_source);
+        let shader = ctx.shader_cache.module(
+            ctx.device,
+            Some("filter spatial fragment shader"),
+            &shader_source,
+        );
+
+        let entries = if original_input {
+            alloc::vec![
+                spatial_source_layout_entry(FRAGMENT),
+                spatial_uniform_layout_entry(FRAGMENT),
+                spatial_original_layout_entry(FRAGMENT),
+            ]
+        } else {
+            alloc::vec![
+                spatial_source_layout_entry(FRAGMENT),
+                spatial_uniform_layout_entry(FRAGMENT),
+            ]
+        };
+        let bind_group_layout =
+            ctx.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("filter spatial fragment bind group layout"),
+                    entries: &entries,
+                });
+
+        let pipeline_layout = ctx
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("filter spatial fragment pipeline layout"),
+                bind_group_layouts: &[Some(&bind_group_layout)],
+                immediate_size: 0,
+            });
+
+        let pipeline = ctx
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("filter spatial fragment pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: target_format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+
+        (pipeline, bind_group_layout)
     }
 
     fn create_blit_pipeline(ctx: &EffectContext) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout) {
@@ -1321,5 +1591,49 @@ impl<F: Filter> FilterAdapter<F> {
             });
 
         (pipeline, bind_group_layout)
+    }
+}
+
+/// Resolves the texture view a spatial stage samples as its input — the
+/// pipeline input or a scratch slot. Shared by the compute and fragment
+/// executions of a spatial pass.
+fn spatial_source_view<'a>(
+    source: PassTextureSource,
+    input: &'a EffectInput<'_>,
+    scratch_views: &'a [Option<wgpu::TextureView>; SCRATCH_SLOT_COUNT],
+) -> Result<&'a wgpu::TextureView, EffectRenderError> {
+    match source {
+        PassTextureSource::Input => Ok(&input.view),
+        PassTextureSource::Scratch(slot) => {
+            scratch_views[slot]
+                .as_ref()
+                .ok_or(EffectRenderError::MissingResource(
+                    "spatial pass source scratch view missing",
+                ))
+        }
+    }
+}
+
+/// Resolves the retained original texture for `spatial_shader_with_original`
+/// stages: its view plus the dimensions the shader must see (the pipeline
+/// input's size, or the output size for output-sized scratch originals).
+/// Shared by the compute and fragment executions of a spatial pass.
+fn spatial_original_view<'a>(
+    original: Option<PassTextureSource>,
+    input: &'a EffectInput<'_>,
+    scratch_views: &'a [Option<wgpu::TextureView>; SCRATCH_SLOT_COUNT],
+    output: &EffectOutput<'_>,
+) -> Result<(Option<&'a wgpu::TextureView>, u32, u32), EffectRenderError> {
+    match original {
+        Some(PassTextureSource::Input) => Ok((Some(&input.view), input.width, input.height)),
+        Some(PassTextureSource::Scratch(slot)) => {
+            let view = scratch_views[slot]
+                .as_ref()
+                .ok_or(EffectRenderError::MissingResource(
+                    "spatial pass original scratch view missing",
+                ))?;
+            Ok((Some(view), output.width, output.height))
+        }
+        None => Ok((None, 0, 0)),
     }
 }

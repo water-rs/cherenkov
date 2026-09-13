@@ -33,7 +33,12 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use core::fmt;
 use core::future::Future;
+// `std::time::Instant::now` panics on wasm32-unknown-unknown; web-time is a
+// drop-in backed by `performance.now()` there and by std everywhere else.
+#[cfg(not(target_family = "wasm"))]
 use std::time::{Duration, Instant};
+#[cfg(target_family = "wasm")]
+use web_time::{Duration, Instant};
 
 /// Error produced while compiling an effect's GPU pipeline during setup.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

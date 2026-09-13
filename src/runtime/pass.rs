@@ -26,6 +26,17 @@ pub(super) enum CompiledPassKind {
         /// writes the output texture directly, skipping the final blit.
         direct_output: Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
     },
+    /// Fragment execution of a spatial stage — the WebGL2 path, selected
+    /// when the device has no compute/storage-texture capability (or when
+    /// `SpatialExecution::ForceFragment` is set). The stage body runs once
+    /// per output texel inside `fs_main` and writes through the render
+    /// attachment, so the final spatial pass targets the output directly and
+    /// no blit is ever needed.
+    SpatialFragment {
+        pipeline: wgpu::RenderPipeline,
+        bind_group_layout: wgpu::BindGroupLayout,
+        original_input: bool,
+    },
 }
 
 /// Number of scratch ping-pong slots. Two suffice for plain chains; a
@@ -39,9 +50,13 @@ pub(super) enum PassTextureSource {
     Scratch(usize),
 }
 
+/// Where a pass writes its result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ColorTarget {
+pub(super) enum PassTarget {
+    /// The host's output texture — a render attachment in fragment
+    /// execution, a storage texture for compute direct-output.
     Output,
+    /// A ping-pong intermediate at the given slot.
     Scratch(usize),
 }
 
@@ -49,11 +64,11 @@ pub(super) enum ColorTarget {
 pub(super) enum PassBindingPlan {
     Color {
         source: PassTextureSource,
-        target: ColorTarget,
+        target: PassTarget,
     },
     Spatial {
         source: PassTextureSource,
-        target_scratch: usize,
+        target: PassTarget,
         /// For `spatial_shader_with_original` passes: the texture that fed
         /// this filter's first stage (the source of the preceding pass, or
         /// the pipeline input when there is no preceding pass).

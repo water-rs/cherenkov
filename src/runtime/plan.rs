@@ -9,8 +9,8 @@ use filtrate_core::{Filter, StageCollector};
 
 use crate::effect::EffectSetupError;
 
-use super::pass::{ColorTarget, PassBindingPlan, PassTextureSource, SCRATCH_SLOT_COUNT};
-use super::shader::storage_format_to_wgsl;
+use super::pass::{PassBindingPlan, PassTarget, PassTextureSource, SCRATCH_SLOT_COUNT};
+use super::shader::{SpatialBackend, storage_format_to_wgsl};
 
 #[derive(Debug, Clone, Copy)]
 pub(super) enum AtomicStageKind {
@@ -144,6 +144,7 @@ pub(super) fn final_direct_output_pass_index(
 
 pub(super) fn plan_runtime_bindings(
     planned: &[PlannedPass],
+    spatial_backend: SpatialBackend,
 ) -> Result<(Vec<PassBindingPlan>, Option<usize>), EffectSetupError> {
     if planned.is_empty() {
         return Err(EffectSetupError::EmptyGraph);
@@ -162,11 +163,11 @@ pub(super) fn plan_runtime_bindings(
             PlannedPassKind::Color { .. } => {
                 let pass_source = source;
                 let target = if is_last {
-                    ColorTarget::Output
+                    PassTarget::Output
                 } else {
                     let slot = pick_scratch_slot(&[pass_source])?;
                     source = PassTextureSource::Scratch(slot);
-                    ColorTarget::Scratch(slot)
+                    PassTarget::Scratch(slot)
                 };
                 plans.push(PassBindingPlan::Color {
                     source: pass_source,
@@ -175,28 +176,43 @@ pub(super) fn plan_runtime_bindings(
                 previous_source = Some(pass_source);
             }
             PlannedPassKind::Spatial { original_input, .. } => {
+                let pass_source = source;
                 let original =
                     original_input.then(|| previous_source.unwrap_or(PassTextureSource::Input));
-                // The write target must alias neither the sampled source
-                // nor the retained original.
-                let mut forbidden = alloc::vec![source];
-                if let Some(original) = original {
-                    forbidden.push(original);
-                }
-                let target_scratch = pick_scratch_slot(&forbidden)?;
+                // In fragment execution the last spatial pass renders into
+                // the output attachment directly — render targets need no
+                // storage capability and no blit follows. Compute targets a
+                // scratch storage texture (with an optional render-time
+                // direct-output specialization compiled separately).
+                let target = if is_last && spatial_backend == SpatialBackend::Fragment {
+                    PassTarget::Output
+                } else {
+                    // The write target must alias neither the sampled source
+                    // nor the retained original.
+                    let mut forbidden = alloc::vec![pass_source];
+                    if let Some(original) = original {
+                        forbidden.push(original);
+                    }
+                    let slot = pick_scratch_slot(&forbidden)?;
+                    source = PassTextureSource::Scratch(slot);
+                    PassTarget::Scratch(slot)
+                };
                 plans.push(PassBindingPlan::Spatial {
-                    source,
-                    target_scratch,
+                    source: pass_source,
+                    target,
                     original,
                 });
-                previous_source = Some(source);
-                source = PassTextureSource::Scratch(target_scratch);
+                previous_source = Some(pass_source);
             }
         }
     }
 
-    let blit_source_scratch = match planned.last().map(|pass| &pass.kind) {
-        Some(PlannedPassKind::Spatial { .. }) => match source {
+    // Only the compute path needs a blit: its spatial stages write storage
+    // textures, so a final spatial result left in scratch is copied to the
+    // output unless the direct-output specialization handles it. Fragment
+    // spatial passes are render passes — the last one draws to the output.
+    let blit_source_scratch = match (spatial_backend, planned.last().map(|pass| &pass.kind)) {
+        (SpatialBackend::Compute, Some(PlannedPassKind::Spatial { .. })) => match source {
             PassTextureSource::Scratch(slot) => Some(slot),
             PassTextureSource::Input => {
                 return Err(EffectSetupError::PlannerInvariant(
@@ -204,7 +220,7 @@ pub(super) fn plan_runtime_bindings(
                 ));
             }
         },
-        Some(PlannedPassKind::Color { .. }) | None => None,
+        _ => None,
     };
 
     Ok((plans, blit_source_scratch))

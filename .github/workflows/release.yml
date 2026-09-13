@@ -2,7 +2,8 @@ name: Release
 
 on:
   push:
-    branches: [main]
+    # main: publish + tag. dev: keep the release-plz bump PR fresh.
+    branches: [main, dev]
 
 permissions:
   contents: write
@@ -38,9 +39,10 @@ jobs:
       group: release-plz-${{ github.ref_name }}
       cancel-in-progress: false
     steps:
+      # No ref: checks out the default branch (dev) so the version-bump PR
+      # targets dev; the bump reaches main via the normal dev->main release PR.
       - uses: actions/checkout@v4
         with:
-          ref: main
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: MarcoIeni/release-plz-action@v0.5

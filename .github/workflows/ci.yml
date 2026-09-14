@@ -41,10 +41,12 @@ jobs:
         if: runner.os == 'Windows'
         uses: tracel-ai/github-actions/install-dxc@295f2fdbae5271f4f8ad56d634e4ff6a95daafc8
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
       # `webgl` is the only non-default feature and intentionally fails to
       # compile off wasm, so `--all-features` cannot be used here; the wasm
       # job exercises it.
-      - run: cargo test --workspace
+      - run: cargo nextest run --workspace
+      - run: cargo test --workspace --doc
 
   lint:
     name: Lint

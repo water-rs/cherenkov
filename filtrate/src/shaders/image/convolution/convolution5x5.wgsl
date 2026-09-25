@@ -1,26 +1,59 @@
-// 5x5 convolution with a user-supplied kernel.
-//
-// Parameters: 25 floats stored row-major (top-left to bottom-right).
-// Caller is responsible for kernel normalisation. All four channels are
-// convolved together, which is the correct linear operation on
-// premultiplied-alpha data; a kernel summing to zero therefore also
-// zeroes coverage.
+// 5x5 convolution with a caller-supplied kernel, row-major from the
+// top-left. The kernel is not normalised. All four channels are convolved
+// together, which is the correct linear operation on premultiplied colour; a
+// kernel summing to zero therefore also zeroes coverage.
 
-@compute @workgroup_size(WORKGROUP_X, WORKGROUP_Y)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let dims = vec2<u32>(uniforms.output_dimensions);
-    if gid.x >= dims.x || gid.y >= dims.y {
-        return;
-    }
-    let center = map_to_input(gid.xy);
+struct Params {
+    k0: f32,
+    k1: f32,
+    k2: f32,
+    k3: f32,
+    k4: f32,
+    k5: f32,
+    k6: f32,
+    k7: f32,
+    k8: f32,
+    k9: f32,
+    k10: f32,
+    k11: f32,
+    k12: f32,
+    k13: f32,
+    k14: f32,
+    k15: f32,
+    k16: f32,
+    k17: f32,
+    k18: f32,
+    k19: f32,
+    k20: f32,
+    k21: f32,
+    k22: f32,
+    k23: f32,
+    k24: f32,
+}
+
+fn load(input: texture_2d<f32>, input_point_sampler: sampler, size: vec2<f32>, pixel: vec2<f32>) -> vec4<f32> {
+    return textureSampleLevel(input, input_point_sampler, (pixel + 0.5) / size, 0.0);
+}
+
+fn apply(input: texture_2d<f32>, input_point_sampler: sampler, uv: vec2<f32>, params: Params) -> vec4<f32> {
+    let size = vec2<f32>(textureDimensions(input));
+    let pixel = floor(uv * size);
+    var kernel = array<f32, 25>(
+        params.k0, params.k1, params.k2, params.k3, params.k4,
+        params.k5, params.k6, params.k7, params.k8, params.k9,
+        params.k10, params.k11, params.k12, params.k13, params.k14,
+        params.k15, params.k16, params.k17, params.k18, params.k19,
+        params.k20, params.k21, params.k22, params.k23, params.k24,
+    );
 
     var acc = vec4<f32>(0.0);
     var idx: u32 = 0u;
     for (var dy: i32 = -2; dy <= 2; dy = dy + 1) {
         for (var dx: i32 = -2; dx <= 2; dx = dx + 1) {
-            acc += load_input(center + vec2<i32>(dx, dy)) * param(idx);
+            let offset = vec2<f32>(f32(dx), f32(dy));
+            acc += load(input, input_point_sampler, size, pixel + offset) * kernel[idx];
             idx = idx + 1u;
         }
     }
-    textureStore(output_texture, vec2<i32>(gid.xy), acc);
+    return acc;
 }

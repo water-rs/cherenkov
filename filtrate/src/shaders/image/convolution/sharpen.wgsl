@@ -1,26 +1,25 @@
-// Sharpen: standalone laplacian-detail pass (spatial filter, cannot fuse).
-//
-// Untiled by design: the five overlapping laplacian taps hit the GPU
-// texture cache, which benchmarks as fast as workgroup shared-memory
-// tiling without the barriers and threadgroup-memory occupancy cost.
+// Sharpen: adds the laplacian detail of the four direct neighbours, scaled
+// by `amount`. Alpha keeps the centre's coverage.
 
-@compute @workgroup_size(WORKGROUP_X, WORKGROUP_Y)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let dims = vec2<u32>(uniforms.output_dimensions);
-    if gid.x >= dims.x || gid.y >= dims.y {
-        return;
-    }
-    let amount = param(0u);
-    let center_coord = map_to_input(gid.xy);
+struct Params {
+    amount: f32,
+}
 
-    let center = load_input(center_coord);
-    let top = load_input(center_coord + vec2<i32>(0, -1));
-    let bottom = load_input(center_coord + vec2<i32>(0, 1));
-    let left = load_input(center_coord + vec2<i32>(-1, 0));
-    let right = load_input(center_coord + vec2<i32>(1, 0));
+fn load(input: texture_2d<f32>, input_point_sampler: sampler, size: vec2<f32>, pixel: vec2<f32>) -> vec4<f32> {
+    return textureSampleLevel(input, input_point_sampler, (pixel + 0.5) / size, 0.0);
+}
 
-    // Laplacian kernel; alpha keeps the centre's coverage.
+fn apply(input: texture_2d<f32>, input_point_sampler: sampler, uv: vec2<f32>, params: Params) -> vec4<f32> {
+    let size = vec2<f32>(textureDimensions(input));
+    let pixel = floor(uv * size);
+
+    let center = load(input, input_point_sampler, size, pixel);
+    let top = load(input, input_point_sampler, size, pixel + vec2<f32>(0.0, -1.0));
+    let bottom = load(input, input_point_sampler, size, pixel + vec2<f32>(0.0, 1.0));
+    let left = load(input, input_point_sampler, size, pixel + vec2<f32>(-1.0, 0.0));
+    let right = load(input, input_point_sampler, size, pixel + vec2<f32>(1.0, 0.0));
+
     let laplacian = center * 4.0 - top - bottom - left - right;
-    let result = center + laplacian * amount;
-    textureStore(output_texture, vec2<i32>(gid.xy), vec4<f32>(result.rgb, center.a));
+    let result = center + laplacian * params.amount;
+    return vec4<f32>(result.rgb, center.a);
 }

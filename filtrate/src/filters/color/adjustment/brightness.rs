@@ -4,7 +4,10 @@ use crate::Filter;
 
 /// Adjusts the brightness of an image.
 ///
-/// Adds the specified amount to each RGB channel.
+/// Adds the specified amount to each straight-alpha RGB channel. On
+/// premultiplied colour that is `rgb + amount * a`, a linear map, so the
+/// filter is [`LINEAR`](crate::ColorFilter::LINEAR). It carries a SIMD CPU
+/// kernel.
 ///
 /// # Parameters
 ///
@@ -21,7 +24,12 @@ use crate::Filter;
 /// # assert_eq!(bright.params(), [0.2]);
 /// ```
 #[derive(Debug, Clone, Copy, Filter)]
-#[filter(color_only, shader = "color/adjustment/brightness.wgsl")]
+#[filter(
+    color,
+    shader = "color/adjustment/brightness.wgsl",
+    linear = true,
+    cpu = crate::cpu::brightness
+)]
 pub struct Brightness<T>(pub T);
 
 #[cfg(test)]
@@ -36,7 +44,7 @@ mod tests {
     }
 
     #[test]
-    fn test_brightness_color_only() {
-        const { assert!(Brightness::<f32>::COLOR_ONLY) };
+    fn brightness_is_a_linear_colour_filter() {
+        const { assert!(<Brightness<f32> as crate::ColorFilter>::LINEAR) };
     }
 }

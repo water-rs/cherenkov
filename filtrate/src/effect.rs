@@ -7,25 +7,21 @@
 //! reads input textures, and writes output textures.
 //!
 //! Most callers do not implement `Effect` directly; they implement [`Filter`](crate::Filter)
-//! and use [`FilterAdapter`](crate::FilterAdapter).
+//! and run it with the reference [`Executor`](crate::Executor).
 //! `Effect` is the seam used by GPU host code to dispatch a runtime-typed
 //! filter without knowing its concrete shape.
 //!
 //! # Color and alpha contract
 //!
 //! - **Premultiplied alpha, end to end.** Input textures, intermediates,
-//!   and outputs carry premultiplied alpha. Linear spatial operations
-//!   (blurs, convolutions, resampling) run directly on premultiplied data;
-//!   fused color passes unpremultiply once in the shared preamble, apply
-//!   every fragment on straight-alpha color, and re-premultiply in the
-//!   postamble. Opaque content (alpha = 1) is unaffected either way.
-//! - **Encoding-agnostic values.** Filters operate on texel values exactly
-//!   as sampled — no implicit sRGB decode/encode is inserted, matching the
-//!   behavior of non-linear filter stacks like Core Image's default. Hosts
-//!   that want linear-light filtering pass linear(-view) textures in and
-//!   out; scratch intermediates preserve whichever convention the input
-//!   uses (LDR scratch is non-sRGB `Rgba8Unorm`, so sampled values round-
-//!   trip unchanged).
+//!   and outputs carry premultiplied alpha, and every stage receives and
+//!   returns premultiplied colour.
+//! - **Working-space values.** Texel values are premultiplied colours in the
+//!   linear working space (linear Display P3), exactly as sampled: no
+//!   implicit transfer function is applied. Stages that operate in sRGB are
+//!   converted around by the executor.
+//! - **f16 materialization.** Intermediates are `Rgba16Float`, so values
+//!   round to f16 at every materialization point and extended values survive.
 
 extern crate alloc;
 
@@ -43,41 +39,55 @@ use web_time::{Duration, Instant};
 /// Error produced while compiling an effect's GPU pipeline during setup.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum EffectSetupError {
-    /// The filter chain declares more parameters than the uniform budget.
-    #[error("filter chain declares {declared} params, exceeding the {limit}-param uniform budget")]
-    TooManyParams {
-        /// Parameters declared by the chain.
-        declared: usize,
-        /// The uniform budget ([`filtrate_core::MAX_FILTER_PARAMS`]).
-        limit: usize,
-    },
-    /// The filter graph produced no stages or passes.
-    #[error("filter graph produced no executable passes")]
+    /// The filter reported no stages.
+    #[error("the filter reported no stages")]
     EmptyGraph,
-    /// Pipeline creation hit a wgpu validation error. The message carries
-    /// the full naga/wgpu diagnostic (shader line/column included).
-    #[error("{stage} pipeline validation failed: {message}")]
-    PipelineValidation {
-        /// Which pipeline failed ("color", "spatial", "blit", …).
+    /// A stage's declaration disagrees with its snippet or with the filter.
+    #[error("stage `{stage}`: {reason}")]
+    StageMismatch {
+        /// The stage's snippet name.
         stage: &'static str,
+        /// What disagrees.
+        reason: String,
+    },
+    /// A stage's snippet breaks the composer's snippet contract.
+    #[error("{0}")]
+    Snippet(String),
+    /// The composer could not compose the chain.
+    #[error("{0}")]
+    Compose(String),
+    /// A pass's module failed validation after its entry point was added.
+    #[error("pass {pass} failed validation: {message}")]
+    PassValidation {
+        /// The pass index.
+        pass: usize,
+        /// The validator's diagnostic.
+        message: String,
+    },
+    /// Pipeline creation hit a wgpu validation error. The message carries
+    /// the full wgpu diagnostic.
+    #[error("pass {pass} pipeline validation failed: {message}")]
+    PipelineValidation {
+        /// The pass index.
+        pass: usize,
         /// The full wgpu validation diagnostic.
         message: String,
     },
-    /// The selected scratch texture format is unsupported on this device.
-    #[error("scratch texture format {format:?} is unsupported on this device")]
-    ScratchFormatUnsupported {
-        /// The rejected format.
+    /// The device cannot render to the `Rgba16Float` intermediates.
+    #[error("the device cannot render to Rgba16Float intermediates: {message}")]
+    IntermediateFormatUnsupported {
+        /// The wgpu diagnostic.
+        message: String,
+    },
+    /// The first pass samples the input through a filtering sampler, but the
+    /// input format is not filterable.
+    #[error(
+        "input format {format:?} is not filterable, but the first stage samples it with filtering"
+    )]
+    InputNotFilterable {
+        /// The input format.
         format: wgpu::TextureFormat,
     },
-    /// HDR intermediates are required by policy but unavailable.
-    #[error("HDR intermediates required by policy but unavailable: {0}")]
-    HdrRequiredUnavailable(#[source] alloc::boxed::Box<Self>),
-    /// An internal planner invariant was violated.
-    #[error("filter planner invariant violated: {0}")]
-    PlannerInvariant(&'static str),
-    /// Effect-specific setup failure outside the planner/pipeline paths.
-    #[error("{0}")]
-    Other(&'static str),
 }
 
 /// Error produced while encoding one effect frame.
@@ -86,6 +96,9 @@ pub enum EffectRenderError {
     /// Setup failed earlier; the error is sticky and rendering fails fast.
     #[error("effect setup failed: {0}")]
     SetupFailed(#[from] EffectSetupError),
+    /// Render ran before a successful setup.
+    #[error("the effect was not set up")]
+    NotSetUp,
     /// The input or output texture format differs from the formats the
     /// pipeline was compiled against during setup.
     #[error(
@@ -102,9 +115,19 @@ pub enum EffectRenderError {
         /// Output format the pipeline was compiled for.
         setup_output: wgpu::TextureFormat,
     },
-    /// A GPU resource that setup should have produced is missing.
-    #[error("{0}")]
-    MissingResource(&'static str),
+    /// The input and output textures differ in size.
+    #[error(
+        "input is {input:?} but output is {output:?}; the executor maps a texture to a texture of the same size"
+    )]
+    SizeMismatch {
+        /// The input's width and height.
+        input: (u32, u32),
+        /// The output's width and height.
+        output: (u32, u32),
+    },
+    /// A stage reads the clip shape, but the input carries no texture for it.
+    #[error("a stage reads the clip shape's {0:?}, but the input provides none")]
+    MissingShape(filtrate_core::ShapeInput),
 }
 
 /// Result returned by filter setup.
@@ -221,12 +244,6 @@ pub struct EffectContext<'a> {
     pub device: &'a wgpu::Device,
     /// The wgpu queue for submitting commands.
     pub queue: &'a wgpu::Queue,
-    /// Module cache for the shaders an effect assembles at runtime.
-    ///
-    /// The cache belongs to `device`: hosts create one per device and hand
-    /// the same reference to every effect they set up on it, so two effects
-    /// producing byte-identical WGSL compile it once.
-    pub shader_cache: &'a shaderloom::WgslModuleCache,
     /// The texture format of the input (captured view).
     pub input_format: wgpu::TextureFormat,
     /// The texture format of the output.
@@ -240,6 +257,17 @@ impl fmt::Debug for EffectContext<'_> {
             .field("output_format", &self.output_format)
             .finish_non_exhaustive()
     }
+}
+
+/// The clip shape of the content being filtered, for stages that declare a
+/// [`ShapeInput`](filtrate_core::ShapeInput). Both textures have the input's
+/// size.
+#[derive(Debug, Clone, Default)]
+pub struct ShapeTextures {
+    /// The clip shape's signed distance field, in pixels, negative inside.
+    pub sdf: Option<wgpu::TextureView>,
+    /// The clip shape's coverage mask, in the red channel.
+    pub mask: Option<wgpu::TextureView>,
 }
 
 /// Input texture provided during effect rendering.
@@ -260,6 +288,8 @@ pub struct EffectInput<'a> {
     pub height: u32,
     /// Deterministic host-selected timing for this frame.
     pub timing: EffectFrameTiming,
+    /// The clip shape, for filters that read it.
+    pub shape: ShapeTextures,
 }
 
 impl fmt::Debug for EffectInput<'_> {
@@ -305,7 +335,7 @@ impl fmt::Debug for EffectOutput<'_> {
 ///
 /// Implement this trait to create custom GPU filters that process captured
 /// view textures. The effect receives input and output textures with their
-/// dimensions, allowing for effects that change output size.
+/// dimensions.
 ///
 /// # Async Setup
 ///
@@ -339,8 +369,7 @@ pub trait Effect: 'static {
     /// Encodes one frame of effect work into the provided command encoder.
     ///
     /// Read from `input.texture`/`input.view` and write to
-    /// `output.texture`/`output.view`. Input and output may have different
-    /// dimensions.
+    /// `output.texture`/`output.view`.
     ///
     /// Returns `Ok(true)` if another frame is needed (animation in progress).
     ///
@@ -374,12 +403,6 @@ pub trait Effect: 'static {
         let result = self.encode_render(input, output, &mut encoder);
         input.queue.submit([encoder.finish()]);
         result
-    }
-
-    /// Resolves the output dimensions from the current effect state.
-    #[must_use]
-    fn output_size(&self, input_width: u32, input_height: u32) -> (u32, u32) {
-        (input_width, input_height)
     }
 
     /// Whether the effect has pending state that requires another render

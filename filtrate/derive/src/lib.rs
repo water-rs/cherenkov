@@ -1,55 +1,62 @@
 //! Procedural macros for `filtrate`.
 //!
 //! This crate exposes `#[derive(Filter)]`, which generates a complete
-//! `filtrate_core::Filter` implementation from a struct attributed with
-//! `#[filter(...)]`. The macro covers the regular filter patterns used by
-//! the built-in filter library; bespoke filters (separable blurs, custom
-//! signal traversal, ...) can still be hand-written.
+//! single-stage filter from a struct attributed with `#[filter(...)]`: the
+//! `filtrate_core::Filter` implementation, the kind trait (`ColorFilter` or
+//! `SpatialFilter`), and, when declared, the `CpuKernel`. Filters with several
+//! stages (separable blurs, for example) or with non-parameter fields are
+//! written by hand.
 //!
 //! # Attributes
 //!
-//! `#[filter(...)]` takes exactly one kind marker and one shader path:
+//! `#[filter(...)]` takes a kind marker, the stage's shader, and the kind's
+//! properties:
 //!
-//! - `color_only, shader = "<path>"` — emits a single color-only fragment
-//!   pass. The path is resolved relative to the consumer crate's
-//!   `src/shaders/` directory.
-//! - `spatial, shader = "<path>"` — emits a single spatial compute pass.
+//! - `color, shader = "<path>", linear = <bool>` declares a colour filter.
+//!   `linear` is required: it is the filter's `ColorFilter::LINEAR`
+//!   classification, which executors trust when pushing a filter down.
+//!   `cpu = <path>` names a CPU kernel,
+//!   `fn(&[f32; N], &WorkingSpace, &mut [[f32; 4]])`, and implements
+//!   `CpuKernel` with it.
+//! - `spatial, shader = "<path>"` declares a spatial filter, with either
+//!   `footprint = <expr>` (a constant `f32`) or `footprint_fn = <path>`
+//!   (`fn(&[f32; N]) -> f32`), and optionally `shape = sdf` or
+//!   `shape = mask` when the snippet reads the clip shape.
 //!
-//! Repeating a marker, combining `color_only` with `spatial`, or repeating
-//! `shader` is a compile error.
+//! Both kinds accept `space = srgb` for a stage that operates in sRGB (the
+//! default is the linear working space), and `constants = [<f32>, …]`.
 //!
-//! # Field shapes
+//! The shader path is resolved relative to the declaring crate's
+//! `src/shaders/` directory and included with `include_str!`; nothing runs
+//! at build time.
+//!
+//! # Parameters
 //!
 //! Tuple structs and named-field structs are both supported. Each field is
 //! typed `T` or `[T; N]`, where `T` is a generic parameter bound to
-//! `FilterParam` (or a concrete type implementing it). Fields flatten into
-//! the parameter array in declaration order.
+//! `FilterParam` (or a concrete type implementing it). Fields flatten into the
+//! parameter array in declaration order, and the snippet's `Params` struct
+//! declares one `f32` member per flattened field, in the same order, followed
+//! by one `f32` member per entry of `constants`, which the composer
+//! specializes into the shader.
 //!
 //! # Example
 //!
-//! The example is `ignore`d because it cannot compile here: the generated
-//! `collect_stages` expands to
-//! `include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/shaders/", <path>))`,
-//! so the shader must live in the crate that writes the `#[derive]`, and a
-//! proc-macro crate has no `src/shaders/`. The compiled version of this
-//! example lives in `filtrate::filters`, next to the shaders it names.
+//! The example is `ignore`d because it cannot compile here: the shader must
+//! live in the crate that writes the `#[derive]`, and a proc-macro crate has
+//! no `src/shaders/`. The compiled version of this example lives in
+//! `filtrate::filters`, next to the shaders it names.
 //!
 //! ```ignore
-//! use filtrate_core::FilterParam;
-//! use filtrate_derive::Filter;
+//! use filtrate::Filter;
 //!
 //! #[derive(Filter)]
-//! #[filter(color_only, shader = "color/brightness.wgsl")]
+//! #[filter(color, shader = "color/adjustment/brightness.wgsl", linear = true)]
 //! pub struct Brightness<T>(pub T);
 //!
 //! #[derive(Filter)]
-//! #[filter(spatial, shader = "distortion/twirl_distortion.wgsl")]
-//! pub struct TwirlDistortion<T> {
-//!     pub center_x: T,
-//!     pub center_y: T,
-//!     pub radius: T,
-//!     pub angle: T,
-//! }
+//! #[filter(spatial, shader = "image/convolution/gradient.wgsl", footprint = 1.0, constants = [1.0, 1.0, 2.0])]
+//! pub struct Sobel;
 //! ```
 
 extern crate proc_macro;
@@ -58,12 +65,10 @@ use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 use syn::{
-    Attribute, Data, DataStruct, DeriveInput, Expr, ExprLit, GenericParam, Ident, Lit, Member,
-    Type, TypeArray, TypePath, parse_macro_input, parse_quote,
+    Attribute, Data, DataStruct, DeriveInput, Expr, ExprArray, ExprLit, GenericParam, Ident, Lit,
+    Member, Path, Type, TypeArray, TypePath, meta::ParseNestedMeta, parse_macro_input, parse_quote,
 };
 
-/// Generate a `filtrate_core::Filter` implementation for the annotated
-/// struct. See module-level docs for accepted attribute shapes.
 /// Resolves the path of the crate providing the `Filter` machinery.
 ///
 /// The derive is re-exported by `filtrate`, so a consumer may depend on
@@ -87,7 +92,7 @@ fn core_path() -> syn::Result<TokenStream2> {
     ))
 }
 
-/// Derives a complete `Filter` implementation from a `#[filter(...)]`
+/// Derives a complete single-stage filter from a `#[filter(...)]`
 /// attribute; see the crate docs for the supported shapes.
 #[proc_macro_derive(Filter, attributes(filter))]
 pub fn derive_filter(input: TokenStream) -> TokenStream {
@@ -98,16 +103,31 @@ pub fn derive_filter(input: TokenStream) -> TokenStream {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FilterKind {
-    ColorOnly,
-    Spatial,
+/// How a spatial filter reports its footprint.
+enum Footprint {
+    /// A constant expression.
+    Constant(Expr),
+    /// A function of the parameters.
+    Function(Path),
 }
 
-#[derive(Debug)]
+/// The kind-specific part of the attribute.
+enum KindAttrs {
+    Color {
+        linear: bool,
+        cpu: Option<Path>,
+    },
+    Spatial {
+        footprint: Footprint,
+        shape: Option<Ident>,
+    },
+}
+
 struct FilterAttrs {
-    kind: FilterKind,
+    kind: KindAttrs,
     shader_path: String,
+    srgb: bool,
+    constants: Vec<Expr>,
 }
 
 fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
@@ -137,45 +157,115 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
     let ident = &input.ident;
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
 
-    let extra_where: Vec<TokenStream2> = layout
-        .bound_idents
-        .iter()
-        .map(|ident| quote! { #ident: #core::FilterParam })
-        .collect();
-    let where_clause = if extra_where.is_empty() {
-        where_clause.cloned()
-    } else {
-        let mut wc = where_clause.cloned().unwrap_or_else(|| parse_quote!(where));
-        for predicate in extra_where {
-            let predicate: syn::WherePredicate = syn::parse2(predicate)?;
-            wc.predicates.push(predicate);
-        }
-        Some(wc)
-    };
+    let mut where_clause = where_clause.cloned().unwrap_or_else(|| parse_quote!(where));
+    for bound in &layout.bound_idents {
+        where_clause
+            .predicates
+            .push(parse_quote!(#bound: #core::FilterParam));
+    }
 
     let total_params = layout.total_params;
     let params_array = layout.build_params_array_tokens(&core);
     let visit_calls = layout.build_visit_signals_tokens();
 
-    let shader_path = attrs.shader_path;
-    let shader_include = quote! {
+    let shader_path = &attrs.shader_path;
+    let source = quote! {
         ::core::include_str!(::core::concat!(
             ::core::env!("CARGO_MANIFEST_DIR"),
             "/src/shaders/",
             #shader_path
         ))
     };
-
-    let color_only = attrs.kind == FilterKind::ColorOnly;
-    let stage_call = if color_only {
-        quote! { collector.color_fragment(#shader_include, #total_params); }
+    let name = ident.to_string();
+    let bindings = (0..total_params)
+        .map(|index| quote! { #core::ParamSource::Param(#index) })
+        .chain(
+            attrs
+                .constants
+                .iter()
+                .map(|value| quote! { #core::ParamSource::Constant(&[#value]) }),
+        );
+    let space = if attrs.srgb {
+        quote! { #core::OperatingSpace::Srgb }
     } else {
-        quote! { collector.spatial_shader(#shader_include, #total_params); }
+        quote! { #core::OperatingSpace::Working }
+    };
+
+    let (kind, stage, kind_impls) = match &attrs.kind {
+        KindAttrs::Color { linear, cpu } => {
+            let stage = quote! {
+                const STAGE: #core::ColorStage = #core::ColorStage {
+                    name: #name,
+                    source: #source,
+                    params: &[#(#bindings),*],
+                    space: #space,
+                };
+                collector.color(#core::Placed::new(&STAGE));
+            };
+            let kernel = cpu.as_ref().map(|path| {
+                quote! {
+                    impl #impl_generics #core::CpuKernel for #ident #ty_generics #where_clause {
+                        fn apply_cpu(
+                            params: &[f32; #total_params],
+                            space: &#core::WorkingSpace,
+                            pixels: &mut [[f32; 4]],
+                        ) {
+                            #path(params, space, pixels);
+                        }
+                    }
+                }
+            });
+            let impls = quote! {
+                impl #impl_generics #core::ColorFilter for #ident #ty_generics #where_clause {
+                    const LINEAR: bool = #linear;
+                }
+                #kernel
+            };
+            (quote! { #core::kind::Color }, stage, impls)
+        }
+        KindAttrs::Spatial { footprint, shape } => {
+            let shape = match shape {
+                None => quote! { ::core::option::Option::None },
+                Some(shape) if shape == "sdf" => {
+                    quote! { ::core::option::Option::Some(#core::ShapeInput::Sdf) }
+                }
+                Some(_) => quote! { ::core::option::Option::Some(#core::ShapeInput::Mask) },
+            };
+            let stage = quote! {
+                const STAGE: #core::SpatialStage = #core::SpatialStage {
+                    name: #name,
+                    source: #source,
+                    params: &[#(#bindings),*],
+                    space: #space,
+                    shape: #shape,
+                    aux: &[],
+                };
+                collector.spatial(#core::Placed::new(&STAGE));
+            };
+            let footprint = match footprint {
+                Footprint::Constant(value) => quote! {
+                    fn footprint_of(_params: &[f32; #total_params]) -> f32 {
+                        #value
+                    }
+                },
+                Footprint::Function(path) => quote! {
+                    fn footprint_of(params: &[f32; #total_params]) -> f32 {
+                        #path(params)
+                    }
+                },
+            };
+            let impls = quote! {
+                impl #impl_generics #core::SpatialFilter for #ident #ty_generics #where_clause {
+                    #footprint
+                }
+            };
+            (quote! { #core::kind::Spatial }, stage, impls)
+        }
     };
 
     Ok(quote! {
         impl #impl_generics #core::Filter for #ident #ty_generics #where_clause {
-            const COLOR_ONLY: bool = #color_only;
+            type Kind = #kind;
             type Params = [f32; #total_params];
 
             #[inline]
@@ -184,14 +274,178 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
             }
 
             fn collect_stages<__C: #core::StageCollector>(&self, collector: &mut __C) {
-                #stage_call
+                #stage
             }
 
             fn visit_signals<__V: #core::SignalVisitor>(&self, visitor: &mut __V) {
                 #visit_calls
             }
         }
+
+        #kind_impls
     })
+}
+
+/// The attribute's arguments as they are parsed, before the kind decides
+/// which ones are required.
+#[derive(Default)]
+struct RawAttrs {
+    kind: Option<(Path, bool)>,
+    shader: Option<String>,
+    linear: Option<bool>,
+    cpu: Option<Path>,
+    footprint: Option<Footprint>,
+    shape: Option<Ident>,
+    srgb: Option<bool>,
+    constants: Option<Vec<Expr>>,
+}
+
+impl RawAttrs {
+    fn parse(&mut self, meta: &ParseNestedMeta<'_>) -> syn::Result<()> {
+        let key = meta
+            .path
+            .get_ident()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        match key.as_str() {
+            "color" | "spatial" => {
+                let spatial = key == "spatial";
+                if let Some((_, existing)) = &self.kind {
+                    return Err(meta.error(if *existing == spatial {
+                        "duplicate filter kind marker"
+                    } else {
+                        "conflicting filter kind markers; declare exactly one of `color` or `spatial`"
+                    }));
+                }
+                self.kind = Some((meta.path.clone(), spatial));
+            }
+            "shader" => {
+                let value = string_literal(meta)?;
+                set_once(meta, &mut self.shader, value)?;
+            }
+            "linear" => {
+                let value: syn::LitBool = meta.value()?.parse()?;
+                set_once(meta, &mut self.linear, value.value)?;
+            }
+            "cpu" => {
+                let value: Path = meta.value()?.parse()?;
+                set_once(meta, &mut self.cpu, value)?;
+            }
+            "footprint" => {
+                let value: Expr = meta.value()?.parse()?;
+                set_once(meta, &mut self.footprint, Footprint::Constant(value))?;
+            }
+            "footprint_fn" => {
+                let value: Path = meta.value()?.parse()?;
+                set_once(meta, &mut self.footprint, Footprint::Function(value))?;
+            }
+            "shape" => {
+                let value: Ident = meta.value()?.parse()?;
+                if value != "sdf" && value != "mask" {
+                    return Err(syn::Error::new_spanned(
+                        value,
+                        "expected `shape = sdf` or `shape = mask`",
+                    ));
+                }
+                set_once(meta, &mut self.shape, value)?;
+            }
+            "space" => {
+                let value: Ident = meta.value()?.parse()?;
+                let srgb = if value == "srgb" {
+                    true
+                } else if value == "working" {
+                    false
+                } else {
+                    return Err(syn::Error::new_spanned(
+                        value,
+                        "expected `space = working` or `space = srgb`",
+                    ));
+                };
+                set_once(meta, &mut self.srgb, srgb)?;
+            }
+            "constants" => {
+                let value: ExprArray = meta.value()?.parse()?;
+                set_once(meta, &mut self.constants, value.elems.into_iter().collect())?;
+            }
+            _ => {
+                return Err(meta.error(
+                    "unknown #[filter(...)] argument; expected `color`, `spatial`, `shader`, `linear`, `cpu`, `footprint`, `footprint_fn`, `shape`, `space` or `constants`",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self, attr: &Attribute) -> syn::Result<FilterAttrs> {
+        let (marker, spatial) = self.kind.ok_or_else(|| {
+            syn::Error::new_spanned(
+                attr,
+                "missing #[filter(color)] or #[filter(spatial)] marker",
+            )
+        })?;
+        let shader_path = self.shader.ok_or_else(|| {
+            syn::Error::new_spanned(attr, "missing #[filter(shader = \"...\")] path")
+        })?;
+        let misplaced = |name: &str, kind: &str| {
+            syn::Error::new_spanned(&marker, format!("`{name}` only applies to {kind} filters"))
+        };
+        let kind = if spatial {
+            if self.linear.is_some() {
+                return Err(misplaced("linear", "colour"));
+            }
+            if self.cpu.is_some() {
+                return Err(misplaced("cpu", "colour"));
+            }
+            KindAttrs::Spatial {
+                footprint: self.footprint.ok_or_else(|| {
+                    syn::Error::new_spanned(
+                        attr,
+                        "spatial filters declare `footprint = <f32>` or `footprint_fn = <path>`",
+                    )
+                })?,
+                shape: self.shape,
+            }
+        } else {
+            if self.footprint.is_some() {
+                return Err(misplaced("footprint", "spatial"));
+            }
+            if self.shape.is_some() {
+                return Err(misplaced("shape", "spatial"));
+            }
+            KindAttrs::Color {
+                linear: self.linear.ok_or_else(|| {
+                    syn::Error::new_spanned(
+                        attr,
+                        "colour filters declare `linear = true` or `linear = false`",
+                    )
+                })?,
+                cpu: self.cpu,
+            }
+        };
+        Ok(FilterAttrs {
+            kind,
+            shader_path,
+            srgb: self.srgb.unwrap_or(false),
+            constants: self.constants.unwrap_or_default(),
+        })
+    }
+}
+
+fn string_literal(meta: &ParseNestedMeta<'_>) -> syn::Result<String> {
+    match meta.value()?.parse()? {
+        Expr::Lit(ExprLit {
+            lit: Lit::Str(value),
+            ..
+        }) => Ok(value.value()),
+        _ => Err(meta.error("expected a string literal path")),
+    }
+}
+
+fn set_once<T>(meta: &ParseNestedMeta<'_>, slot: &mut Option<T>, value: T) -> syn::Result<()> {
+    if slot.replace(value).is_some() {
+        return Err(meta.error("duplicate #[filter(...)] argument"));
+    }
+    Ok(())
 }
 
 fn parse_filter_attr(input: &DeriveInput) -> syn::Result<FilterAttrs> {
@@ -205,61 +459,13 @@ fn parse_filter_attr(input: &DeriveInput) -> syn::Result<FilterAttrs> {
     if let Some(duplicate) = filter_attrs.next() {
         return Err(syn::Error::new_spanned(
             duplicate,
-            "duplicate #[filter(...)] attribute; declare kind and shader in one attribute",
+            "duplicate #[filter(...)] attribute; declare the whole filter in one attribute",
         ));
     }
 
-    let mut kind: Option<FilterKind> = None;
-    let mut shader_path: Option<String> = None;
-
-    attr.parse_nested_meta(|meta| {
-        if meta.path.is_ident("color_only") || meta.path.is_ident("spatial") {
-            let parsed = if meta.path.is_ident("color_only") {
-                FilterKind::ColorOnly
-            } else {
-                FilterKind::Spatial
-            };
-            if let Some(existing) = kind {
-                return Err(meta.error(if existing == parsed {
-                    "duplicate filter kind marker"
-                } else {
-                    "conflicting filter kind markers; declare exactly one of `color_only` or `spatial`"
-                }));
-            }
-            kind = Some(parsed);
-            Ok(())
-        } else if meta.path.is_ident("shader") {
-            if shader_path.is_some() {
-                return Err(meta.error("duplicate `shader` argument"));
-            }
-            let value: Expr = meta.value()?.parse()?;
-            let lit = match value {
-                Expr::Lit(ExprLit {
-                    lit: Lit::Str(s), ..
-                }) => s.value(),
-                _ => {
-                    return Err(meta.error("expected a string literal path"));
-                }
-            };
-            shader_path = Some(lit);
-            Ok(())
-        } else {
-            Err(meta.error(
-                "unknown #[filter(...)] argument; expected `color_only`, `spatial`, or `shader`",
-            ))
-        }
-    })?;
-
-    let kind = kind.ok_or_else(|| {
-        syn::Error::new_spanned(
-            attr,
-            "missing #[filter(color_only)] or #[filter(spatial)] marker",
-        )
-    })?;
-    let shader_path = shader_path
-        .ok_or_else(|| syn::Error::new_spanned(attr, "missing #[filter(shader = \"...\")] path"))?;
-
-    Ok(FilterAttrs { kind, shader_path })
+    let mut raw = RawAttrs::default();
+    attr.parse_nested_meta(|meta| raw.parse(&meta))?;
+    raw.finish(attr)
 }
 
 struct FieldLayout {
@@ -272,6 +478,18 @@ struct FieldLayout {
 enum FieldEntry {
     Scalar { member: Member },
     Array { member: Member, len: usize },
+}
+
+fn element_ident(ty: &Type, message: &str) -> syn::Result<Ident> {
+    match ty {
+        Type::Path(TypePath {
+            qself: None, path, ..
+        }) => path
+            .get_ident()
+            .cloned()
+            .ok_or_else(|| syn::Error::new_spanned(ty, message)),
+        _ => Err(syn::Error::new_spanned(ty, message)),
+    }
 }
 
 fn analyze_fields(
@@ -299,36 +517,11 @@ fn analyze_fields(
             Member::Named,
         );
         match &field.ty {
-            Type::Path(TypePath {
-                qself: None, path, ..
-            }) => {
-                let ident = path.get_ident().cloned().ok_or_else(|| {
-                    syn::Error::new_spanned(
-                        &field.ty,
-                        "Filter derive expects each scalar field to be a single type ident (e.g. `T`)",
-                    )
-                })?;
-                record_element(&mut layout, &ident);
-                layout.fields.push(FieldEntry::Scalar { member });
-                layout.total_params += 1;
-            }
             Type::Array(TypeArray { elem, len, .. }) => {
-                let ident = match &**elem {
-                    Type::Path(TypePath {
-                        qself: None, path, ..
-                    }) => path.get_ident().cloned().ok_or_else(|| {
-                        syn::Error::new_spanned(
-                            elem,
-                            "Filter derive expects each array element type to be a single type ident",
-                        )
-                    })?,
-                    _ => {
-                        return Err(syn::Error::new_spanned(
-                            elem,
-                            "Filter derive expects each array element type to be a single type ident",
-                        ));
-                    }
-                };
+                let ident = element_ident(
+                    elem,
+                    "Filter derive expects each array element type to be a single type ident",
+                )?;
                 let len_value = match len {
                     Expr::Lit(ExprLit {
                         lit: Lit::Int(int), ..
@@ -348,10 +541,13 @@ fn analyze_fields(
                 layout.total_params += len_value;
             }
             other => {
-                return Err(syn::Error::new_spanned(
+                let ident = element_ident(
                     other,
                     "Filter derive supports only fields of type `T` or `[T; N]`",
-                ));
+                )?;
+                record_element(&mut layout, &ident);
+                layout.fields.push(FieldEntry::Scalar { member });
+                layout.total_params += 1;
             }
         }
     }

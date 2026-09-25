@@ -1,4 +1,4 @@
-//! GPU runtime benchmarks for filter effects.
+//! GPU benchmarks for the reference executor.
 //!
 //! These benches exercise real wgpu render submission and wait for GPU
 //! completion.
@@ -10,10 +10,10 @@
 //! ```
 
 use divan::Bencher;
-use filtrate::multi_input::{BlendMode, FilterImage, blend_with_image_filter};
+use filtrate::filters::{BlendMode, BlendWithImage, Bloom, Blur, Brightness, Saturation};
 use filtrate::{
-    Effect, EffectContext, EffectInput, EffectOutput, WgslModuleCache,
-    runtime::{FilterAdapter, SpatialExecution},
+    Effect, EffectContext, EffectInput, EffectOutput, Executor, FilterExt, FilterImage,
+    ShapeTextures,
 };
 
 fn main() {
@@ -33,14 +33,7 @@ struct GpuBench {
 }
 
 impl GpuBench {
-    fn new() -> Self {
-        Self::with_size(64, 64, wgpu::TextureUsages::RENDER_ATTACHMENT)
-    }
-
-    /// `output_usage` lets a bench give the output texture `STORAGE_BINDING` so
-    /// the compute path can exercise its direct-output specialization — the
-    /// configuration WebGL cannot provide.
-    fn with_size(width: u32, height: u32, output_usage: wgpu::TextureUsages) -> Self {
+    fn new(width: u32, height: u32) -> Self {
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -49,11 +42,9 @@ impl GpuBench {
             force_fallback_adapter: false,
         }))
         .expect("filtrate benchmark requires a high-performance GPU adapter");
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            required_features: shaderloom::required_features(adapter.features()),
-            ..Default::default()
-        }))
-        .expect("filtrate benchmark requires a working GPU device");
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+                .expect("filtrate benchmark requires a working GPU device");
 
         let input_texture = create_texture(
             &device,
@@ -69,7 +60,7 @@ impl GpuBench {
             width,
             height,
             format,
-            output_usage,
+            wgpu::TextureUsages::RENDER_ATTACHMENT,
         );
         let input_rgba = solid_rgba(width, height, [96, 128, 192, 255]);
         queue.write_texture(
@@ -106,11 +97,9 @@ impl GpuBench {
     }
 
     fn setup_filter<F: Effect>(&self, filter: &mut F) {
-        let shader_cache = WgslModuleCache::new();
         let ctx = EffectContext {
             device: &self.device,
             queue: &self.queue,
-            shader_cache: &shader_cache,
             input_format: self.format,
             output_format: self.format,
         };
@@ -131,6 +120,7 @@ impl GpuBench {
                 std::time::Duration::ZERO,
                 0,
             ),
+            shape: ShapeTextures::default(),
         };
         let output = EffectOutput {
             device: &self.device,
@@ -151,76 +141,46 @@ impl GpuBench {
 
 #[divan::bench]
 fn blend_with_image_render_64x64(b: Bencher) {
-    let gpu = GpuBench::new();
-    let aux = FilterImage::from_rgba8(2, 2, solid_rgba(2, 2, [32, 16, 8, 255]));
-    let mut filter = blend_with_image_filter(aux, 0.35, BlendMode::Overlay);
-    gpu.setup_filter(&mut filter);
-    b.bench_local(|| gpu.render_filter(&mut filter));
-}
-
-// ----------------------------------------------------------------------------
-// Spatial backend comparison — compute (native) vs fragment (WebGL2 path).
-//
-// `blur` is two separable spatial passes; `bloom` adds a
-// `spatial_shader_with_original` composite. The output texture carries only
-// RENDER_ATTACHMENT — the WebGL2-equivalent configuration — so the compute
-// path additionally pays the final scratch→output blit. A storage-capable
-// output variant isolates that blit cost by letting compute write the output
-// directly.
-// ----------------------------------------------------------------------------
-
-use filtrate::filters::{Bloom, Blur};
-
-#[divan::bench(args = [256, 1024, 2048])]
-fn blur_spatial_compute(b: Bencher, size: u32) {
-    let gpu = GpuBench::with_size(size, size, wgpu::TextureUsages::RENDER_ATTACHMENT);
-    let mut filter = FilterAdapter::new(Blur(4.0_f32));
-    gpu.setup_filter(&mut filter);
-    b.bench_local(|| gpu.render_filter(&mut filter));
-}
-
-#[divan::bench(args = [256, 1024, 2048])]
-fn blur_spatial_fragment(b: Bencher, size: u32) {
-    let gpu = GpuBench::with_size(size, size, wgpu::TextureUsages::RENDER_ATTACHMENT);
-    let mut filter =
-        FilterAdapter::new(Blur(4.0_f32)).spatial_execution(SpatialExecution::ForceFragment);
-    gpu.setup_filter(&mut filter);
-    b.bench_local(|| gpu.render_filter(&mut filter));
-}
-
-#[divan::bench(args = [1024])]
-fn bloom_spatial_compute(b: Bencher, size: u32) {
-    let gpu = GpuBench::with_size(size, size, wgpu::TextureUsages::RENDER_ATTACHMENT);
-    let mut filter = FilterAdapter::new(Bloom {
-        radius: 8.0_f32,
-        intensity: 1.2,
-        threshold: 0.6,
+    let gpu = GpuBench::new(64, 64);
+    let mut filter = Executor::new(BlendWithImage {
+        image: FilterImage::from_rgba8(2, 2, solid_rgba(2, 2, [32, 16, 8, 255])),
+        amount: 0.35_f32,
+        mode: BlendMode::Overlay,
     });
     gpu.setup_filter(&mut filter);
     b.bench_local(|| gpu.render_filter(&mut filter));
 }
 
-#[divan::bench(args = [1024])]
-fn bloom_spatial_fragment(b: Bencher, size: u32) {
-    let gpu = GpuBench::with_size(size, size, wgpu::TextureUsages::RENDER_ATTACHMENT);
-    let mut filter = FilterAdapter::new(Bloom {
-        radius: 8.0_f32,
-        intensity: 1.2,
-        threshold: 0.6,
-    })
-    .spatial_execution(SpatialExecution::ForceFragment);
+// ----------------------------------------------------------------------------
+// Pass structure: a colour segment is one pass; a separable blur is two
+// materialized passes; bloom adds a composite that reads its first pass's
+// input.
+// ----------------------------------------------------------------------------
+
+#[divan::bench(args = [256, 1024, 2048])]
+fn colour_chain(b: Bencher, size: u32) {
+    let gpu = GpuBench::new(size, size);
+    let mut filter = Executor::new(Saturation(1.3_f32).then(Brightness(0.05_f32)));
     gpu.setup_filter(&mut filter);
     b.bench_local(|| gpu.render_filter(&mut filter));
 }
 
-#[divan::bench(args = [1024, 2048])]
-fn blur_spatial_compute_storage_output(b: Bencher, size: u32) {
-    let gpu = GpuBench::with_size(
-        size,
-        size,
-        wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::STORAGE_BINDING,
-    );
-    let mut filter = FilterAdapter::new(Blur(4.0_f32));
+#[divan::bench(args = [256, 1024, 2048])]
+fn blur(b: Bencher, size: u32) {
+    let gpu = GpuBench::new(size, size);
+    let mut filter = Executor::new(Blur(4.0_f32));
+    gpu.setup_filter(&mut filter);
+    b.bench_local(|| gpu.render_filter(&mut filter));
+}
+
+#[divan::bench(args = [1024])]
+fn bloom(b: Bencher, size: u32) {
+    let gpu = GpuBench::new(size, size);
+    let mut filter = Executor::new(Bloom {
+        radius: 8.0_f32,
+        intensity: 1.2,
+        threshold: 0.6,
+    });
     gpu.setup_filter(&mut filter);
     b.bench_local(|| gpu.render_filter(&mut filter));
 }

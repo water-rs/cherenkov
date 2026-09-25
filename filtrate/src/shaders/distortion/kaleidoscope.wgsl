@@ -1,30 +1,32 @@
 // Kaleidoscope: folds the image into `segments` mirrored angular slices
-// around a center point.
+// around a centre point.
 //
-// Parameters: segments, rotation (degrees), center.x, center.y (uv space).
-// Angles are computed in isotropic space so slices keep equal angular width
-// on non-square targets.
+// Parameters: segments, rotation (degrees), centre (uv). Angles are measured
+// in isotropic space so slices keep equal angular width on non-square
+// images.
+
+struct Params {
+    segments: f32,
+    rotation: f32,
+    center_x: f32,
+    center_y: f32,
+}
 
 const TAU: f32 = 6.283185307179586;
+const DEGREES_TO_RADIANS: f32 = 0.017453292519943295;
 
-@compute @workgroup_size(WORKGROUP_X, WORKGROUP_Y)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let dims = vec2<u32>(uniforms.output_dimensions);
-    if gid.x >= dims.x || gid.y >= dims.y {
-        return;
-    }
-    let uv = output_uv(gid.xy);
-    let segments = max(param(0u), 2.0);
-    let rotation = param(1u) * DEGREES_TO_RADIANS;
-    let center = vec2<f32>(param(2u), param(3u));
+fn apply(input: texture_2d<f32>, input_sampler: sampler, uv: vec2<f32>, params: Params) -> vec4<f32> {
+    let size = vec2<f32>(textureDimensions(input));
+    let isotropic = size / min(size.x, size.y);
+    let segments = max(params.segments, 2.0);
+    let rotation = params.rotation * DEGREES_TO_RADIANS;
 
-    let center_iso = to_isotropic(center);
-    let delta = to_isotropic(uv) - center_iso;
+    let center = vec2<f32>(params.center_x, params.center_y) * isotropic;
+    let delta = uv * isotropic - center;
     let r = length(delta);
     var angle = atan2(delta.y, delta.x) - rotation;
     let slice = TAU / segments;
     angle = abs(fract(angle / slice) - 0.5) * slice;
     let folded = vec2<f32>(cos(angle + rotation), sin(angle + rotation)) * r;
-    let sample_uv = from_isotropic(center_iso + folded);
-    textureStore(output_texture, vec2<i32>(gid.xy), sample_input_bilinear(sample_uv));
+    return textureSampleLevel(input, input_sampler, (center + folded) / isotropic, 0.0);
 }

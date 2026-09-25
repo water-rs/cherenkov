@@ -1,15 +1,36 @@
 //! Gloom filter implementation.
 
-use crate::{Filter, FilterParam, SignalVisitor, StageCollector};
+use crate::{
+    AuxSource, Filter, FilterParam, OperatingSpace, ParamSource, Placed, SignalVisitor,
+    SpatialFilter, SpatialStage, StageCollector, filters::footprint, kind,
+};
+
+/// The second pass: finishes the box blur vertically and subtracts the glow
+/// from the first pass's input.
+const COMPOSITE: SpatialStage = SpatialStage {
+    name: "gloom_composite",
+    source: include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/shaders/stylize/lighting/glow_composite.wgsl"
+    )),
+    params: &[
+        ParamSource::Param(0),
+        ParamSource::Param(1),
+        ParamSource::Constant(&[-1.0]),
+    ],
+    space: OperatingSpace::Working,
+    shape: None,
+    aux: &[AuxSource::PreviousStageInput],
+};
 
 /// Dulls highlights by subtracting a blurred copy of the bright regions.
 ///
 /// Runs as two separable passes: a horizontal pass extracts thresholded
-/// highlight energy, and a vertical pass finishes the blur and subtracts
-/// it from the original input.
+/// highlight energy, and a vertical pass finishes the blur and subtracts the
+/// glow from the input. The footprint is the radius.
 #[derive(Debug, Clone)]
 pub struct Gloom<T> {
-    /// Blur radius of the darkening halo, in pixels.
+    /// Blur radius of the darkening halo, in pixels (at least one).
     pub radius: T,
     /// Strength of the subtractive darkening (0.0 = none).
     pub intensity: T,
@@ -17,45 +38,32 @@ pub struct Gloom<T> {
     pub threshold: T,
 }
 
-impl<T: FilterParam> Gloom<T> {
-    /// Uniform slot layout across both passes: the horizontal pass consumes
-    /// `[radius, threshold]`, the vertical pass `[radius, intensity]`. Both
-    /// `params` and `visit_signals` derive from this single list, so the
-    /// orderings cannot drift apart.
-    const fn param_slots(&self) -> [&T; 4] {
-        [&self.radius, &self.threshold, &self.radius, &self.intensity]
-    }
-}
-
 impl<T: FilterParam> Filter for Gloom<T> {
-    const COLOR_ONLY: bool = false;
-
-    type Params = [f32; 4];
+    type Kind = kind::Spatial;
+    type Params = [f32; 3];
 
     fn params(&self) -> Self::Params {
-        self.param_slots().map(FilterParam::snapshot)
+        [
+            self.radius.snapshot(),
+            self.intensity.snapshot(),
+            self.threshold.snapshot(),
+        ]
     }
 
     fn collect_stages<C: StageCollector>(&self, c: &mut C) {
-        c.spatial_shader(
-            include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/shaders/stylize/lighting/gloom_horizontal.wgsl"
-            )),
-            2,
-        );
-        c.spatial_shader_with_original(
-            include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/shaders/stylize/lighting/gloom_vertical.wgsl"
-            )),
-            2,
-        );
+        c.spatial(Placed::new(&super::bloom::EXTRACT));
+        c.spatial(Placed::new(&COMPOSITE));
     }
 
     fn visit_signals<V: SignalVisitor>(&self, v: &mut V) {
-        for (index, param) in self.param_slots().into_iter().enumerate() {
-            v.visit(index, param);
-        }
+        v.visit(0, &self.radius);
+        v.visit(1, &self.intensity);
+        v.visit(2, &self.threshold);
+    }
+}
+
+impl<T: FilterParam> SpatialFilter for Gloom<T> {
+    fn footprint_of(params: &[f32; 3]) -> f32 {
+        footprint::rounded_at_least_one(params[0])
     }
 }

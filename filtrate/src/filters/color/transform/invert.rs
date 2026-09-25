@@ -4,7 +4,9 @@ use crate::Filter;
 
 /// Inverts all colors in an image.
 ///
-/// Applies `1.0 - color` to each RGB channel, preserving alpha.
+/// Applies `1.0 - color` to each straight-alpha RGB channel, preserving
+/// alpha. On premultiplied colour that is `a - rgb`, a linear map, so the
+/// filter is [`LINEAR`](crate::ColorFilter::LINEAR).
 ///
 /// # Example
 ///
@@ -16,7 +18,7 @@ use crate::Filter;
 /// # assert_eq!(inverted.params().len(), 0);
 /// ```
 #[derive(Debug, Clone, Copy, Default, Filter)]
-#[filter(color_only, shader = "color/transform/invert.wgsl")]
+#[filter(color, shader = "color/transform/invert.wgsl", linear = true)]
 pub struct Invert;
 
 #[cfg(test)]
@@ -31,7 +33,7 @@ mod tests {
     }
 
     #[test]
-    fn test_invert_color_only() {
-        const { assert!(Invert::COLOR_ONLY) };
+    fn invert_is_a_linear_colour_filter() {
+        const { assert!(<Invert as crate::ColorFilter>::LINEAR) };
     }
 }

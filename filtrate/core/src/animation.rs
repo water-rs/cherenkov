@@ -1,6 +1,6 @@
 //! `f32`-only animation track driven by an external [`Interpolator`].
 //!
-//! `AnimationTrack` is an internal helper used by the GPU runtime to smooth
+//! `AnimationTrack` is the helper executors use to smooth
 //! parameter transitions between two values when animation metadata is
 //! provided by a reactive watcher. It deliberately knows nothing about
 //! easing curves, springs, or specific reactive systems — those are the
@@ -92,6 +92,24 @@ impl AnimationTrack {
     #[must_use]
     pub const fn is_active(&self) -> bool {
         self.active.is_some()
+    }
+
+    /// The largest magnitude the track's value takes until its active
+    /// segment completes: `|value|` when idle, and otherwise the larger
+    /// magnitude of the segment's [`Interpolator::bounds`].
+    ///
+    /// Executors evaluate [`SpatialFilter::footprint_of`](crate::SpatialFilter::footprint_of)
+    /// at every parameter's bound to size intermediates for a whole
+    /// animation.
+    #[must_use]
+    pub fn magnitude_bound(&self) -> f32 {
+        self.active.as_ref().map_or_else(
+            || self.current.abs(),
+            |active| {
+                let (low, high) = active.interpolator.bounds(active.from, active.to);
+                low.abs().max(high.abs())
+            },
+        )
     }
 }
 

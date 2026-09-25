@@ -1,18 +1,17 @@
 //! Composition against the sequential application of the same snippets, and
 //! emission for every back end.
 
-mod support;
-
 use std::collections::HashMap;
 
 use cherenkov_shader::{
     ComposeError, ComposeOptions, Composition, FoldBlocker, Piece, Precision, SampleCount,
     SamplerFilter, Segment, SegmentArg, Snippet, SnippetError, SnippetKind, SnippetSource, Stage,
-    Variant, compose, msl,
+    Variant, compose,
+    eval::{Eval, Texture, Value, assert_close},
+    msl,
     naga::{self, valid::Capabilities},
     spirv, validate, wgsl,
 };
-use support::{Eval, Texture, Value, assert_close};
 
 const BRIGHTNESS: &str = include_str!("snippets/brightness.wgsl");
 const BRIGHTNESS_F16: &str = include_str!("snippets/brightness_f16.wgsl");

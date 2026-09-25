@@ -2,7 +2,7 @@
 //!
 //! `FilterParam` lets a filter accept either static `f32` values or richer
 //! reactive sources (signals from a UI framework, video pipeline timecodes,
-//! etc.) without knowing about any specific reactive system. The runtime
+//! etc.) without knowing about any specific reactive system. The executor
 //! subscribes first, takes one initial [`FilterParam::snapshot`], then receives
 //! every subsequent target through [`FilterParam::watch_animated`].
 //!
@@ -11,7 +11,7 @@
 //! - The filter library itself is reactive-system agnostic.
 //! - Reactive frontends provide [`FilterParam`] implementations for their
 //!   own signal types (or wrappers around them).
-//! - The runtime in `filtrate` consumes the initial snapshot plus subscribed
+//! - The executor in `filtrate` consumes the initial snapshot plus subscribed
 //!   targets and animation interpolators to produce smooth GPU updates.
 
 extern crate alloc;
@@ -56,11 +56,11 @@ impl FilterParam for f32 {
 pub type AnimatedCallback = Box<dyn Fn(AnimatedTarget) + Send + Sync>;
 
 /// Carries a new target value plus optional animation interpolator from a
-/// watcher callback into the runtime.
+/// watcher callback into the executor.
 pub struct AnimatedTarget {
     /// The new target parameter value.
     pub value: f32,
-    /// Optional interpolator. If `Some`, the runtime smooths from the
+    /// Optional interpolator. If `Some`, the executor smooths from the
     /// previous value to `value` along this curve. If `None`, the value
     /// snaps immediately on the next render.
     pub interpolator: Option<Box<dyn Interpolator>>,
@@ -79,7 +79,7 @@ impl core::fmt::Debug for AnimatedTarget {
 /// time.
 ///
 /// Reactive frontends (e.g. `WaterUI`) wrap their own animation primitives in
-/// this trait to feed `filtrate`'s runtime without coupling either side.
+/// this trait to feed `filtrate`'s executor without coupling either side.
 pub trait Interpolator: Send + 'static {
     /// Total duration of the animation.
     fn duration(&self) -> Duration;
@@ -91,6 +91,17 @@ pub trait Interpolator: Send + 'static {
     /// Whether the animation is finished at `elapsed` time.
     fn is_complete(&self, elapsed: Duration) -> bool {
         elapsed >= self.duration()
+    }
+
+    /// The smallest and largest values [`Interpolator::interpolate`] returns
+    /// for any `elapsed`, given `from` and `to`.
+    ///
+    /// The default is the span of the two endpoints, which holds for every
+    /// curve that does not overshoot. An interpolator that overshoots (a
+    /// spring, for example) must override it, because executors bound a
+    /// spatial filter's footprint over an animation with it.
+    fn bounds(&self, from: f32, to: f32) -> (f32, f32) {
+        (from.min(to), from.max(to))
     }
 }
 
@@ -105,7 +116,7 @@ pub struct WatchGuard {
 }
 
 impl WatchGuard {
-    /// Wrap any owned value as a watch guard. The runtime drops this when
+    /// Wrap any owned value as a watch guard. The executor drops this when
     /// it tears down the filter, which transitively drops the subscription.
     #[must_use]
     pub fn new<T: Any + 'static>(inner: T) -> Self {

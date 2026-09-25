@@ -68,12 +68,25 @@
 //! together. Every platform shader compiler inlines small functions and then
 //! folds the specialized constants; naga-level inlining would add nothing
 //! but work.
+//!
+//! An executor wraps a segment into an entry point on the IR too:
+//! [`FunctionBuilder`] builds the entry point's function, with bound
+//! arguments and a bound result, and [`validate`] checks the module it adds
+//! it to.
+//!
+//! # Features
+//!
+//! - `eval`: [`eval`], a reference interpreter that runs snippets and
+//!   composed segments on the CPU, for tests and for cross-checking CPU
+//!   implementations against their shaders.
 
 mod abi;
 mod builder;
 mod chain;
 mod emit;
 mod errors;
+#[cfg(feature = "eval")]
+pub mod eval;
 mod import;
 mod parse;
 mod rewrite;
@@ -82,6 +95,7 @@ pub use abi::{
     FoldBlocker, Param, ParamType, ParamValue, Precision, SamplerFilter, SnippetKind,
     WORKING_SPACE_WGSL,
 };
+pub use builder::FunctionBuilder;
 pub use chain::{
     ComposeOptions, Composition, FoldCost, Folded, Piece, Segment, SegmentArg, Stage,
     UniformLayout, UniformMember, compose,

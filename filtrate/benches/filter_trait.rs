@@ -1,10 +1,10 @@
 //! CPU-only Filter trait benchmarks.
 //!
 //! These benches exercise the public surface of `filtrate-core::Filter`
-//! (params snapshot, stage collection, signal visitation) on representative
-//! built-in filters and chains. They intentionally do not touch wgpu, so
-//! they run in any CI environment and serve as a regression baseline for
-//! trait-shape changes.
+//! (params snapshot, stage collection, signal visitation) and the CPU
+//! kernels on representative built-in filters and chains. They intentionally
+//! do not touch wgpu, so they run in any CI environment and serve as a
+//! regression baseline for trait-shape changes.
 //!
 //! Run with:
 //!
@@ -18,7 +18,10 @@ use filtrate::filters::{
     MorphologyGradient, MorphologyMax, MorphologyMin, PhotoEffectChrome, PhotoEffectMono,
     PhotoEffectNoir, Prewitt, Saturation, Sepia, Sobel,
 };
-use filtrate::{Filter, FilterExt, ParamArray, SignalVisitor, StageCollector};
+use filtrate::{
+    ColorStage, CpuKernel, Filter, FilterExt, ParamArray, Placed, SignalVisitor, SpatialStage,
+    StageCollector, WorkingSpace,
+};
 
 fn main() {
     divan::main();
@@ -27,17 +30,11 @@ fn main() {
 /// No-op stage collector — measures pure dispatch cost.
 struct NoopStages;
 impl StageCollector for NoopStages {
-    fn color_fragment(&mut self, source: &'static str, param_count: usize) {
-        divan::black_box(source);
-        divan::black_box(param_count);
+    fn color(&mut self, stage: Placed<ColorStage>) {
+        divan::black_box(stage);
     }
-    fn spatial_shader(&mut self, source: &'static str, param_count: usize) {
-        divan::black_box(source);
-        divan::black_box(param_count);
-    }
-    fn spatial_shader_with_original(&mut self, source: &'static str, param_count: usize) {
-        divan::black_box(source);
-        divan::black_box(param_count);
+    fn spatial(&mut self, stage: Placed<SpatialStage>) {
+        divan::black_box(stage);
     }
 }
 
@@ -170,11 +167,11 @@ fn param_array_len_const_lookup(b: Bencher) {
 }
 
 // ----------------------------------------------------------------------------
-// P9 spatial filters (Sobel/Prewitt/Median/Morphology/Convolution/Bloom)
+// Spatial filters (Sobel/Prewitt/Median/Morphology/Convolution/Bloom)
 // ----------------------------------------------------------------------------
 
 #[divan::bench(types = [Sobel, Prewitt, Median3x3, MorphologyMin, MorphologyMax, MorphologyGradient])]
-fn p9_spatial_zero_param_collect_stages<F: Filter + Default>(b: Bencher) {
+fn spatial_zero_param_collect_stages<F: Filter + Default>(b: Bencher) {
     let f = F::default();
     b.bench_local(|| {
         let mut sink = NoopStages;
@@ -184,7 +181,7 @@ fn p9_spatial_zero_param_collect_stages<F: Filter + Default>(b: Bencher) {
 }
 
 #[divan::bench(types = [Sobel, Prewitt, Median3x3, MorphologyMin, MorphologyMax, MorphologyGradient])]
-fn p9_spatial_zero_param_visit_signals<F: Filter + Default>(b: Bencher) {
+fn spatial_zero_param_visit_signals<F: Filter + Default>(b: Bencher) {
     let f = F::default();
     b.bench_local(|| {
         let mut v = NoopVisitor;
@@ -218,7 +215,7 @@ fn bloom_params(b: Bencher) {
 }
 
 // ----------------------------------------------------------------------------
-// P9 photo presets (zero-param color)
+// Photo presets (zero-param colour)
 // ----------------------------------------------------------------------------
 
 #[divan::bench(types = [PhotoEffectMono, PhotoEffectNoir, PhotoEffectChrome])]
@@ -232,7 +229,7 @@ fn photo_preset_collect_stages<F: Filter + Default>(b: Bencher) {
 }
 
 // ----------------------------------------------------------------------------
-// Cross-category chain: photo preset + tunable color filters (fusion path)
+// Cross-category chain: photo preset + tunable colour filters
 // ----------------------------------------------------------------------------
 
 #[divan::bench]
@@ -252,5 +249,21 @@ fn photo_chain_collect_stages(b: Bencher) {
         let mut sink = NoopStages;
         chain.collect_stages(&mut sink);
         divan::black_box(&sink);
+    });
+}
+
+// ----------------------------------------------------------------------------
+// CPU kernels: a chain of linear colour filters over a 256x256 image
+// ----------------------------------------------------------------------------
+
+#[divan::bench]
+fn cpu_kernel_chain_256x256(b: Bencher) {
+    let chain = Saturation(1.3_f32).then(Brightness(0.05_f32));
+    let params = chain.params();
+    let pixels = vec![[0.4_f32, 0.3, 0.2, 1.0]; 256 * 256];
+    b.bench_local(|| {
+        let mut pixels = pixels.clone();
+        CpuKernel::apply_cpu(&params, &WorkingSpace::LINEAR_DISPLAY_P3, &mut pixels);
+        divan::black_box(pixels);
     });
 }

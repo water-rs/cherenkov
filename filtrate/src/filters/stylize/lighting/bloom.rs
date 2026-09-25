@@ -1,15 +1,50 @@
 //! Bloom filter implementation.
 
-use crate::{Filter, FilterParam, SignalVisitor, StageCollector};
+use crate::{
+    AuxSource, Filter, FilterParam, OperatingSpace, ParamSource, Placed, SignalVisitor,
+    SpatialFilter, SpatialStage, StageCollector, filters::footprint, kind,
+};
+
+/// The first pass, shared by bloom and gloom: thresholded highlight energy,
+/// box-accumulated horizontally. Parameters: radius, threshold.
+pub(super) const EXTRACT: SpatialStage = SpatialStage {
+    name: "glow_extract",
+    source: include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/shaders/stylize/lighting/glow_extract.wgsl"
+    )),
+    params: &[ParamSource::Param(0), ParamSource::Param(2)],
+    space: OperatingSpace::Working,
+    shape: None,
+    aux: &[],
+};
+
+/// The second pass: finishes the box blur vertically and adds the glow
+/// onto the first pass's input.
+const COMPOSITE: SpatialStage = SpatialStage {
+    name: "bloom_composite",
+    source: include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/shaders/stylize/lighting/glow_composite.wgsl"
+    )),
+    params: &[
+        ParamSource::Param(0),
+        ParamSource::Param(1),
+        ParamSource::Constant(&[1.0]),
+    ],
+    space: OperatingSpace::Working,
+    shape: None,
+    aux: &[AuxSource::PreviousStageInput],
+};
 
 /// Adds a bright glow around high-luminance regions.
 ///
 /// Runs as two separable passes: a horizontal pass extracts thresholded
-/// highlight energy, and a vertical pass finishes the blur and composites
-/// the glow onto the original input additively.
+/// highlight energy, and a vertical pass finishes the blur and adds the
+/// glow onto the input. The footprint is the radius.
 #[derive(Debug, Clone)]
 pub struct Bloom<T> {
-    /// Blur radius of the glow, in pixels.
+    /// Blur radius of the glow, in pixels (at least one).
     pub radius: T,
     /// Strength of the additive glow (0.0 = none).
     pub intensity: T,
@@ -17,45 +52,32 @@ pub struct Bloom<T> {
     pub threshold: T,
 }
 
-impl<T: FilterParam> Bloom<T> {
-    /// Uniform slot layout across both passes: the horizontal pass consumes
-    /// `[radius, threshold]`, the vertical pass `[radius, intensity]`. Both
-    /// `params` and `visit_signals` derive from this single list, so the
-    /// orderings cannot drift apart.
-    const fn param_slots(&self) -> [&T; 4] {
-        [&self.radius, &self.threshold, &self.radius, &self.intensity]
-    }
-}
-
 impl<T: FilterParam> Filter for Bloom<T> {
-    const COLOR_ONLY: bool = false;
-
-    type Params = [f32; 4];
+    type Kind = kind::Spatial;
+    type Params = [f32; 3];
 
     fn params(&self) -> Self::Params {
-        self.param_slots().map(FilterParam::snapshot)
+        [
+            self.radius.snapshot(),
+            self.intensity.snapshot(),
+            self.threshold.snapshot(),
+        ]
     }
 
     fn collect_stages<C: StageCollector>(&self, c: &mut C) {
-        c.spatial_shader(
-            include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/shaders/stylize/lighting/bloom_horizontal.wgsl"
-            )),
-            2,
-        );
-        c.spatial_shader_with_original(
-            include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/shaders/stylize/lighting/bloom_vertical.wgsl"
-            )),
-            2,
-        );
+        c.spatial(Placed::new(&EXTRACT));
+        c.spatial(Placed::new(&COMPOSITE));
     }
 
     fn visit_signals<V: SignalVisitor>(&self, v: &mut V) {
-        for (index, param) in self.param_slots().into_iter().enumerate() {
-            v.visit(index, param);
-        }
+        v.visit(0, &self.radius);
+        v.visit(1, &self.intensity);
+        v.visit(2, &self.threshold);
+    }
+}
+
+impl<T: FilterParam> SpatialFilter for Bloom<T> {
+    fn footprint_of(params: &[f32; 3]) -> f32 {
+        footprint::rounded_at_least_one(params[0])
     }
 }

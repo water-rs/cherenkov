@@ -1,11 +1,13 @@
-    // White point filter: normalize by a source white point triplet
-    {
-        let wp_r = max(param(param_idx), 0.0001);
-        param_idx += 1u;
-        let wp_g = max(param(param_idx), 0.0001);
-        param_idx += 1u;
-        let wp_b = max(param(param_idx), 0.0001);
-        param_idx += 1u;
-        let white_point = vec3<f32>(wp_r, wp_g, wp_b);
-        color = vec4<f32>(color.rgb / white_point, color.a);
-    }
+// White point: normalizes colour by a source white point, a per-channel
+// scale.
+
+struct Params {
+    red: f32,
+    green: f32,
+    blue: f32,
+}
+
+fn apply(color: vec4<f32>, params: Params) -> vec4<f32> {
+    let white_point = max(vec3<f32>(params.red, params.green, params.blue), vec3<f32>(0.0001));
+    return vec4<f32>(color.rgb / white_point, color.a);
+}

@@ -2,24 +2,33 @@
 //! bookkeeping naga requires.
 
 use naga::{
-    Expression, Function, FunctionArgument, FunctionResult, Handle, Literal, Range, ScalarKind,
-    Statement, Type,
+    Binding, Expression, Function, FunctionArgument, FunctionResult, Handle, Literal, Range,
+    ScalarKind, Statement, Type,
 };
 
 use crate::{abi::Precision, import::GENERATED};
 
-/// Builds one function. Expressions that need emitting are grouped into
+/// Builds one naga function. Expressions that need emitting are grouped into
 /// `Emit` statements automatically.
+///
+/// The composer builds its segment functions with it, and executors use it to
+/// wrap a [`Segment`](crate::Segment) into an entry point: bound arguments
+/// ([`FunctionBuilder::bound_argument`]) and a bound result
+/// ([`FunctionBuilder::finish_bound`]) make the function an entry point's
+/// body.
+#[derive(Debug)]
 pub struct FunctionBuilder {
     function: Function,
     pending: Option<(Handle<Expression>, Handle<Expression>)>,
 }
 
 impl FunctionBuilder {
-    pub(crate) fn new(name: String) -> Self {
+    /// Starts a function named `name`.
+    #[must_use]
+    pub fn new(name: impl Into<String>) -> Self {
         Self {
             function: Function {
-                name: Some(name),
+                name: Some(name.into()),
                 ..Function::default()
             },
             pending: None,
@@ -27,19 +36,39 @@ impl FunctionBuilder {
     }
 
     /// Adds an argument and returns the expression that reads it.
-    pub(crate) fn argument(&mut self, name: &str, ty: Handle<Type>) -> Handle<Expression> {
+    pub fn argument(&mut self, name: &str, ty: Handle<Type>) -> Handle<Expression> {
+        self.push_argument(name, ty, None)
+    }
+
+    /// Adds an argument with an entry-point binding (a built-in or a
+    /// location) and returns the expression that reads it.
+    pub fn bound_argument(
+        &mut self,
+        name: &str,
+        ty: Handle<Type>,
+        binding: Binding,
+    ) -> Handle<Expression> {
+        self.push_argument(name, ty, Some(binding))
+    }
+
+    fn push_argument(
+        &mut self,
+        name: &str,
+        ty: Handle<Type>,
+        binding: Option<Binding>,
+    ) -> Handle<Expression> {
         let index =
             u32::try_from(self.function.arguments.len()).expect("argument count fits in u32");
         self.function.arguments.push(FunctionArgument {
             name: Some(name.to_owned()),
             ty,
-            binding: None,
+            binding,
         });
         self.expression(Expression::FunctionArgument(index))
     }
 
     /// Appends an expression, emitting it when naga requires that.
-    pub(crate) fn expression(&mut self, expression: Expression) -> Handle<Expression> {
+    pub fn expression(&mut self, expression: Expression) -> Handle<Expression> {
         if expression.needs_pre_emit() {
             self.flush();
             return self.function.expressions.append(expression, GENERATED);
@@ -75,7 +104,7 @@ impl FunctionBuilder {
     }
 
     /// Calls `function` and returns its result.
-    pub(crate) fn call(
+    pub fn call(
         &mut self,
         function: Handle<Function>,
         arguments: Vec<Handle<Expression>>,
@@ -96,15 +125,37 @@ impl FunctionBuilder {
         result
     }
 
-    /// Returns `value` and finishes the function.
-    pub(crate) fn finish(mut self, value: Handle<Expression>, result: Handle<Type>) -> Function {
+    /// Returns `value` of type `result` and finishes the function.
+    #[must_use]
+    pub fn finish(self, value: Handle<Expression>, result: Handle<Type>) -> Function {
+        self.finish_with(value, result, None)
+    }
+
+    /// Returns `value` of type `result` through an entry-point binding and
+    /// finishes the function.
+    #[must_use]
+    pub fn finish_bound(
+        self,
+        value: Handle<Expression>,
+        result: Handle<Type>,
+        binding: Binding,
+    ) -> Function {
+        self.finish_with(value, result, Some(binding))
+    }
+
+    fn finish_with(
+        mut self,
+        value: Handle<Expression>,
+        result: Handle<Type>,
+        binding: Option<Binding>,
+    ) -> Function {
         self.flush();
         self.function
             .body
             .push(Statement::Return { value: Some(value) }, GENERATED);
         self.function.result = Some(FunctionResult {
             ty: result,
-            binding: None,
+            binding,
         });
         self.function
     }

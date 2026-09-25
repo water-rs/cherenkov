@@ -4,7 +4,9 @@ use crate::Filter;
 
 /// Rotates the hue of all colors around the color wheel.
 ///
-/// Converts to HSL, rotates hue, and converts back to RGB.
+/// Converts straight-alpha colour to HSL, rotates hue, and converts back to
+/// RGB. The HSL round trip is piecewise, so the filter is not
+/// [`LINEAR`](crate::ColorFilter::LINEAR).
 ///
 /// # Parameters
 ///
@@ -21,7 +23,7 @@ use crate::Filter;
 /// # assert_eq!(complement.params(), [180.0]);
 /// ```
 #[derive(Debug, Clone, Copy, Filter)]
-#[filter(color_only, shader = "color/transform/hue_rotation.wgsl")]
+#[filter(color, shader = "color/transform/hue_rotation.wgsl", linear = false)]
 pub struct HueRotation<T>(pub T);
 
 #[cfg(test)]

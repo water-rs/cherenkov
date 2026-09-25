@@ -6,4 +6,5 @@ mod zoom_blur;
 pub use gaussian_blur::GaussianBlur;
 pub use motion_blur::MotionBlur;
 pub use uniform::Blur;
+pub(super) use uniform::HORIZONTAL;
 pub use zoom_blur::ZoomBlur;

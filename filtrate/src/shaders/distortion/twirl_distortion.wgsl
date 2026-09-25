@@ -1,30 +1,38 @@
-// Twirl distortion: rotates the image around a center point, strongest at
-// the center and fading to zero at the radius.
+// Twirl distortion: rotates the image around a centre point, strongest at
+// the centre and fading to zero at the radius.
 //
-// Parameters: center.x, center.y (uv space), radius (isotropic units,
-// 1.0 = shorter output edge), angle (degrees). Distances are measured in
-// isotropic space so the twirl stays circular on non-square targets. The
-// rotation is applied as a 2x2 matrix — no atan2 polar round-trip, which is
-// both cheaper and well-conditioned at the center.
+// Parameters: centre (uv), radius (isotropic units, 1.0 = the shorter edge),
+// angle (degrees). The rotation is a 2x2 matrix — no atan2 round trip, which
+// is cheaper and well-conditioned at the centre.
 
-@compute @workgroup_size(WORKGROUP_X, WORKGROUP_Y)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let dims = vec2<u32>(uniforms.output_dimensions);
-    if gid.x >= dims.x || gid.y >= dims.y {
-        return;
-    }
-    let uv = output_uv(gid.xy);
-    let center = vec2<f32>(param(0u), param(1u));
-    let radius = max(param(2u), 0.001);
-    let angle = param(3u) * DEGREES_TO_RADIANS;
+struct Params {
+    center_x: f32,
+    center_y: f32,
+    radius: f32,
+    angle: f32,
+}
 
-    let center_iso = to_isotropic(center);
-    let delta = to_isotropic(uv) - center_iso;
+const DEGREES_TO_RADIANS: f32 = 0.017453292519943295;
+
+fn rotate2(v: vec2<f32>, angle: f32) -> vec2<f32> {
+    let s = sin(angle);
+    let c = cos(angle);
+    return vec2<f32>(c * v.x - s * v.y, s * v.x + c * v.y);
+}
+
+fn apply(input: texture_2d<f32>, input_sampler: sampler, uv: vec2<f32>, params: Params) -> vec4<f32> {
+    let size = vec2<f32>(textureDimensions(input));
+    let isotropic = size / min(size.x, size.y);
+    let radius = max(params.radius, 0.001);
+    let angle = params.angle * DEGREES_TO_RADIANS;
+
+    let center = vec2<f32>(params.center_x, params.center_y) * isotropic;
+    let delta = uv * isotropic - center;
     let dist = length(delta);
     var sample_uv = uv;
     if dist < radius {
         let t = 1.0 - dist / radius;
-        sample_uv = from_isotropic(center_iso + rotate2(delta, angle * t));
+        sample_uv = (center + rotate2(delta, angle * t)) / isotropic;
     }
-    textureStore(output_texture, vec2<i32>(gid.xy), sample_input_bilinear(sample_uv));
+    return textureSampleLevel(input, input_sampler, sample_uv, 0.0);
 }

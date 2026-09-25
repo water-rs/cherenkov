@@ -1,7 +1,7 @@
 //! Parameter array trait for zero-allocation filter params.
 //!
-//! Filters store their parameters as associated types implementing `ParamArray`.
-//! This enables compile-time fusion of consecutive filter params without heap allocation.
+//! Filters store their parameters as associated types implementing `ParamArray`,
+//! so a chain's parameters nest without heap allocation.
 
 /// Trait for parameter arrays that can write their values to a buffer.
 ///
@@ -33,6 +33,14 @@ pub trait ParamArray {
     ///
     /// The buffer must have at least `Self::LEN` elements.
     fn write_to(&self, buf: &mut [f32]);
+
+    /// Reads the parameter values back from a flattened buffer, the inverse
+    /// of [`ParamArray::write_to`].
+    ///
+    /// # Panics
+    ///
+    /// Panics when `buf` has fewer than `Self::LEN` elements.
+    fn read_from(buf: &[f32]) -> Self;
 }
 
 impl<const N: usize> ParamArray for [f32; N] {
@@ -41,6 +49,13 @@ impl<const N: usize> ParamArray for [f32; N] {
     #[inline]
     fn write_to(&self, buf: &mut [f32]) {
         buf[..N].copy_from_slice(self);
+    }
+
+    #[inline]
+    fn read_from(buf: &[f32]) -> Self {
+        let mut values = [0.0; N];
+        values.copy_from_slice(&buf[..N]);
+        values
     }
 }
 
@@ -53,6 +68,11 @@ impl<A: ParamArray, B: ParamArray> ParamArray for (A, B) {
     fn write_to(&self, buf: &mut [f32]) {
         self.0.write_to(&mut buf[..A::LEN]);
         self.1.write_to(&mut buf[A::LEN..]);
+    }
+
+    #[inline]
+    fn read_from(buf: &[f32]) -> Self {
+        (A::read_from(&buf[..A::LEN]), B::read_from(&buf[A::LEN..]))
     }
 }
 
@@ -88,6 +108,14 @@ mod tests {
         assert_eq!(buf[0], 1.0);
         assert_eq!(buf[1], 2.0);
         assert_eq!(buf[2], 3.0);
+    }
+
+    #[test]
+    fn read_from_inverts_write_to() {
+        let params: ([f32; 1], [f32; 2]) = ([1.0], [2.0, 3.0]);
+        let mut buf = [0.0f32; 3];
+        params.write_to(&mut buf);
+        assert_eq!(<([f32; 1], [f32; 2])>::read_from(&buf), params);
     }
 
     #[test]

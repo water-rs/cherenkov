@@ -1,47 +1,75 @@
 //! Gaussian blur filter implementation.
 
-use crate::{Filter, FilterParam, SignalVisitor, StageCollector};
+use crate::{
+    Filter, FilterParam, OperatingSpace, ParamSource, Placed, SignalVisitor, SpatialFilter,
+    SpatialStage, StageCollector, kind,
+};
 
-/// Applies separable gaussian blur.
+/// The separable gaussian blur's stage: one axis, specialized per pass.
+const GAUSSIAN_BLUR: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/shaders/image/blur/gaussian_blur.wgsl"
+));
+
+const HORIZONTAL: SpatialStage = SpatialStage {
+    name: "gaussian_blur_horizontal",
+    source: GAUSSIAN_BLUR,
+    params: &[ParamSource::Param(0), ParamSource::Constant(&[1.0, 0.0])],
+    space: OperatingSpace::Working,
+    shape: None,
+    aux: &[],
+};
+
+const VERTICAL: SpatialStage = SpatialStage {
+    name: "gaussian_blur_vertical",
+    source: GAUSSIAN_BLUR,
+    params: &[ParamSource::Param(0), ParamSource::Constant(&[0.0, 1.0])],
+    space: OperatingSpace::Working,
+    shape: None,
+    aux: &[],
+};
+
+/// Applies a separable gaussian blur: a horizontal then a vertical pass.
 ///
 /// # Parameters
 ///
-/// - `sigma`: Gaussian standard deviation in pixels; the kernel radius is
-///   `ceil(3 * sigma)`.
+/// - `sigma`: Gaussian standard deviation in pixels; the kernel radius, and
+///   the footprint, is `ceil(3 * sigma)`.
 #[derive(Debug, Clone, Copy)]
 pub struct GaussianBlur<T>(pub T);
 
 impl<T: FilterParam> Filter for GaussianBlur<T> {
-    const COLOR_ONLY: bool = false;
-
-    type Params = [f32; 2];
+    type Kind = kind::Spatial;
+    type Params = [f32; 1];
 
     #[inline]
-    fn params(&self) -> [f32; 2] {
-        let sigma = self.0.snapshot();
-        [sigma, sigma]
+    fn params(&self) -> [f32; 1] {
+        [self.0.snapshot()]
     }
 
     fn collect_stages<C: StageCollector>(&self, c: &mut C) {
-        c.spatial_shader(
-            include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/shaders/image/blur/gaussian_blur_horizontal.wgsl"
-            )),
-            1,
-        );
-        c.spatial_shader(
-            include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/shaders/image/blur/gaussian_blur_vertical.wgsl"
-            )),
-            1,
-        );
+        c.spatial(Placed::new(&HORIZONTAL));
+        c.spatial(Placed::new(&VERTICAL));
     }
 
     fn visit_signals<V: SignalVisitor>(&self, v: &mut V) {
-        // Sigma drives both separable passes; broadcast to indices 0 and 1.
         v.visit(0, &self.0);
-        v.visit(1, &self.0);
+    }
+}
+
+impl<T: FilterParam> SpatialFilter for GaussianBlur<T> {
+    fn footprint_of(params: &[f32; 1]) -> f32 {
+        (params[0].max(0.001) * 3.0).ceil()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gaussian_footprint_is_three_sigma() {
+        assert_eq!(GaussianBlur(2.0f32).footprint(), 6.0);
+        assert_eq!(GaussianBlur(0.4f32).footprint(), 2.0);
     }
 }

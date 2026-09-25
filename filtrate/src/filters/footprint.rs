@@ -56,6 +56,6 @@ pub fn zoom_blur(params: [f32; 3]) -> f32 {
 }
 
 /// [`EdgeWork`](super::EdgeWork): the gradient taps at `radius`, at least one.
-pub fn edge_work(params: [f32; 2]) -> f32 {
+pub const fn edge_work(params: [f32; 2]) -> f32 {
     rounded_at_least_one(params[0])
 }

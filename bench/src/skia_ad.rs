@@ -1,8 +1,9 @@
 // Copyright 2026 the Cherenkov Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Skia adapter: `skia-cpu` (raster surface) and `skia-vulkan` (Ganesh on
-//! Vulkan, Linux and Android only).
+//! Skia adapter: `skia-cpu` (raster surface), `skia-vulkan` (Ganesh on
+//! Vulkan, Linux and Android only) and `skia-metal` (Graphite on Metal,
+//! Apple platforms only).
 //!
 //! Colour: `skia-safe` renders into premultiplied `RGBAF16` surfaces whose
 //! colour space is linear Display P3 (CICP primaries 12 / transfer 8) —
@@ -23,6 +24,12 @@
 //! after a full `vkDeviceWaitIdle` drain, a standalone command buffer
 //! writes a timestamp on the same `VkQueue` Skia uses, then Skia's
 //! flush+submit runs, then a second timestamp submission and readback.
+//! `skia-metal` instead brackets Graphite's insert+submit with empty
+//! `MTLCommandBuffer` markers on the same serial queue, each preceded by
+//! a full drain (`commit` + `waitUntilCompleted`) — Graphite exposes no
+//! GPU timestamp source through `skia-safe` (`GpuStats` is Ganesh-only),
+//! and command buffers on one Metal queue may overlap in execution on
+//! Apple GPUs, so an undrained marker could bracket an empty interval.
 //! This serializes CPU and GPU for the measured frame — a synchronous
 //! probe, not a pipelined frame rate.
 //!
@@ -1293,3 +1300,303 @@ impl Engine for SkiaVk {
         }
     }
 }
+
+/// `skia-metal`: Skia Graphite on Metal, Apple platforms only.
+#[cfg(all(feature = "skia-metal", target_vendor = "apple"))]
+mod graphite_metal {
+    // `MTLCreateSystemDefaultDevice` resolves the default device through
+    // CoreGraphics; objc2-metal documents linking the framework directly
+    // when `objc2-core-graphics` is not a dependency.
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {}
+
+    use std::collections::BTreeSet;
+    use std::ffi::c_void;
+
+    use objc2::rc::Retained;
+    use objc2::runtime::ProtocolObject;
+    use objc2_metal::{MTLCommandBuffer, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice};
+    use skia_safe::gpu::graphite::{self, mtl as gmtl};
+    use skia_safe::gpu::{Mipmapped, graphite::surfaces};
+    use skia_safe::{AlphaType, ColorType, ImageInfo};
+
+    use cherenkov_oracle::F32Image;
+    use cherenkov_scene::Feature;
+
+    use super::{SkiaPrepared, build_cmds, p3_cs, replay, skia_features, skia_missing_api};
+    use crate::convert;
+    use crate::{BenchError, Counters, DeviceInfo, EncodeInput, Engine, EngineInfo, Submit};
+
+    /// Skia Graphite on Metal: an offscreen `RGBAF16` linear-P3 render
+    /// target on the system device, timed by command-buffer markers.
+    pub struct SkiaMtl {
+        info: EngineInfo,
+        device: Retained<ProtocolObject<dyn MTLDevice>>,
+        /// The queue Graphite submits on — the markers run on it too.
+        queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+        _bctx: gmtl::BackendContext,
+        ctx: graphite::Context,
+        recorder: graphite::Recorder,
+        /// Prepared scene state: the render target and the resolved
+        /// `Cmd` list.
+        prepared: Option<SkiaPrepared>,
+        /// The `Recording` `encode` snapped; `submit` inserts it.
+        recording: Option<graphite::Recording>,
+        size: (u32, u32),
+        counters: Counters,
+    }
+
+    impl SkiaMtl {
+        /// Adapter key.
+        pub const NAME: &'static str = "skia-metal";
+
+        /// Creates the adapter: the system default Metal device, its
+        /// command queue, and a Graphite context + recorder on them.
+        ///
+        /// # Errors
+        /// [`BenchError::Gpu`] on any Metal or Skia failure.
+        pub fn new() -> Result<Self, BenchError> {
+            fn gerr(msg: &str) -> BenchError {
+                BenchError::Gpu(format!("skia-metal: {msg}"))
+            }
+            let device = MTLCreateSystemDefaultDevice()
+                .ok_or_else(|| gerr("MTLCreateSystemDefaultDevice returned nil"))?;
+            let queue = device
+                .newCommandQueue()
+                .ok_or_else(|| gerr("newCommandQueue returned nil"))?;
+            // SAFETY: `device` and `queue` are live objects retained by
+            // `self`, which outlives the context.
+            let bctx = unsafe {
+                gmtl::BackendContext::new(
+                    Retained::as_ptr(&device).cast::<c_void>().cast_mut(),
+                    Retained::as_ptr(&queue).cast::<c_void>().cast_mut(),
+                )
+            };
+            let mut ctx = gmtl::context_factory::make_metal(&bctx, None)
+                .ok_or_else(|| gerr("make_metal returned None"))?;
+            let recorder = ctx
+                .make_recorder(None)
+                .ok_or_else(|| gerr("make_recorder returned None"))?;
+            Ok(Self {
+                info: EngineInfo {
+                    name: Self::NAME,
+                    engine_crate: "skia-safe",
+                    crate_version: env!("DEP_SKIA_SAFE_VERSION"),
+                    source_rev: option_env!("DEP_SKIA_SAFE_SOURCE_REV").map(String::from),
+                    output_format: "Graphite Metal render target, RGBAF16 premultiplied \
+                                    (linear Display P3)"
+                        .into(),
+                    precision: "Skia blends in f32 premultiplied; output is f16 (≈11-bit mantissa)",
+                    route: "metal (graphite)",
+                    color_note: "scene colours converted working-space→linear-P3 f32 unclamped; \
+                                 readback f16→f32",
+                    encode_scope: "records the pre-resolved `Canvas` draw calls into the \
+                                   Graphite `Recorder` and `snap()`s them into a `Recording` \
+                                   — `submit` inserts it on the shared Metal queue",
+                },
+                device,
+                queue,
+                _bctx: bctx,
+                ctx,
+                recorder,
+                prepared: None,
+                recording: None,
+                size: (0, 0),
+                counters: Counters::default(),
+            })
+        }
+
+        /// Commits an empty command buffer and waits for it, which on a
+        /// serial `MTLCommandQueue` means every buffer committed before it
+        /// — including Graphite's — has completed.
+        ///
+        /// # Errors
+        /// [`BenchError::Gpu`] when the queue returns no command buffer.
+        fn drain(&self) -> Result<(), BenchError> {
+            let cb = self
+                .queue
+                .commandBuffer()
+                .ok_or_else(|| BenchError::Gpu("metal drain: no command buffer".into()))?;
+            cb.commit();
+            cb.waitUntilCompleted();
+            Ok(())
+        }
+
+        /// Reads the render target as premultiplied `f16` linear-P3
+        /// pixels and decodes to the suite `f32` working image.
+        ///
+        /// # Errors
+        /// [`BenchError::Gpu`] when the synchronous Graphite readback
+        /// fails.
+        #[expect(clippy::cast_possible_wrap, reason = "render target dims fit i32")]
+        fn read_target(&mut self) -> Result<F32Image, BenchError> {
+            let (w, h) = self.size;
+            let info = ImageInfo::new(
+                (w as i32, h as i32),
+                ColorType::RGBAF16,
+                AlphaType::Premul,
+                p3_cs(Self::NAME)?,
+            );
+            let mut buf = vec![0u8; w as usize * h as usize * 8];
+            if !self.ctx.read_pixels(
+                &mut self
+                    .prepared
+                    .as_mut()
+                    .expect("submit checked prepared")
+                    .surface,
+                &info,
+                &mut buf,
+                w as usize * 8,
+                (0, 0),
+            ) {
+                return Err(BenchError::Gpu("skia-metal: read_pixels failed".into()));
+            }
+            let pixels = buf
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|q| {
+                    [
+                        convert::f16_to_f32(u16::from_le_bytes([q[0], q[1]])),
+                        convert::f16_to_f32(u16::from_le_bytes([q[2], q[3]])),
+                        convert::f16_to_f32(u16::from_le_bytes([q[4], q[5]])),
+                        convert::f16_to_f32(u16::from_le_bytes([q[6], q[7]])),
+                    ]
+                })
+                .collect();
+            Ok(F32Image {
+                width: w,
+                height: h,
+                pixels,
+            })
+        }
+    }
+
+    impl Engine for SkiaMtl {
+        fn info(&self) -> &EngineInfo {
+            &self.info
+        }
+
+        fn supported(&self) -> BTreeSet<Feature> {
+            skia_features().into_iter().collect()
+        }
+
+        #[expect(clippy::cast_possible_wrap, reason = "render target dims fit i32")]
+        fn prepare(&mut self, input: &EncodeInput<'_>) -> Result<(), BenchError> {
+            convert::check_features(Self::NAME, input.scene, &skia_features(), skia_missing_api)?;
+            self.counters = Counters::default();
+            let (w, h) = (input.scene.width, input.scene.height);
+            let info = ImageInfo::new(
+                (w as i32, h as i32),
+                ColorType::RGBAF16,
+                AlphaType::Premul,
+                p3_cs(Self::NAME)?,
+            );
+            let surface = surfaces::render_target(
+                &mut self.recorder,
+                &info,
+                Mipmapped::No,
+                None,
+                Some("cherenkov-bench"),
+            )
+            .ok_or_else(|| BenchError::Gpu("skia-metal render target".into()))?;
+            self.size = (w, h);
+            self.prepared = Some(SkiaPrepared {
+                surface,
+                cmds: build_cmds(input.scene, input.blobs, Self::NAME, &mut self.counters)?,
+            });
+            Ok(())
+        }
+
+        /// Records the frame: the `Canvas` draw calls accumulate in the
+        /// `Recorder` and `snap()` finalizes them into a `Recording` —
+        /// Graphite's own recording API, and nothing else.
+        fn encode(&mut self, _input: &EncodeInput<'_>) -> Result<(), BenchError> {
+            let prepared = self
+                .prepared
+                .as_mut()
+                .ok_or_else(|| BenchError::Engine("skia-metal: encode before prepare".into()))?;
+            replay(prepared.surface.canvas(), &prepared.cmds);
+            self.recording = Some(
+                self.recorder
+                    .snap()
+                    .ok_or_else(|| BenchError::Gpu("skia-metal: snap returned None".into()))?,
+            );
+            Ok(())
+        }
+
+        fn submit(&mut self, readback: bool) -> Result<Submit, BenchError> {
+            if self.prepared.is_none() {
+                return Err(BenchError::Engine(
+                    "skia-metal: submit before prepare".into(),
+                ));
+            }
+            let mut recording = self
+                .recording
+                .take()
+                .ok_or_else(|| BenchError::Engine("skia-metal: submit before encode".into()))?;
+            // GPU time: bracket Graphite's insert+submit with empty marker
+            // command buffers on the same serial queue, each preceded by
+            // a full drain so a marker cannot overlap the render in
+            // execution (command buffers on one Metal queue may run
+            // concurrently on Apple GPUs and would otherwise bracket an
+            // empty interval). This serializes CPU and GPU for the
+            // measured frame — a synchronous probe, not a pipelined
+            // frame rate.
+            self.drain()?;
+            let start = self
+                .queue
+                .commandBuffer()
+                .ok_or_else(|| BenchError::Gpu("metal marker: no command buffer".into()))?;
+            start.commit();
+            if !matches!(
+                self.ctx
+                    .insert_recording(&graphite::InsertRecordingInfo::new(&mut recording)),
+                graphite::InsertStatus::Success
+            ) {
+                return Err(BenchError::Gpu(
+                    "skia-metal: insert_recording failed".into(),
+                ));
+            }
+            if !self.ctx.submit(None) {
+                return Err(BenchError::Gpu("skia-metal: submit failed".into()));
+            }
+            self.drain()?;
+            let end = self
+                .queue
+                .commandBuffer()
+                .ok_or_else(|| BenchError::Gpu("metal marker: no command buffer".into()))?;
+            end.commit();
+            end.waitUntilCompleted();
+            // The drained start marker finished before Graphite's work
+            // began; the drained end marker began after it finished, so
+            // [start.GPUEndTime, end.GPUStartTime] brackets it exactly.
+            let (s, e) = (start.GPUEndTime(), end.GPUStartTime());
+            let gpu_seconds = (s > 0.0 && e > s).then_some(e - s);
+            let image = if readback {
+                Some(self.read_target()?)
+            } else {
+                None
+            };
+            Ok(Submit { image, gpu_seconds })
+        }
+
+        fn counters(&self) -> Counters {
+            self.counters.clone()
+        }
+
+        fn device(&self) -> DeviceInfo {
+            DeviceInfo {
+                adapter: Some(self.device.name().to_string()),
+                backend: Some("metal".into()),
+                target_format: Some("RGBA16Float".into()),
+                cpu: crate::cpu_model(),
+                thermal_celsius: crate::thermal_celsius(),
+                ..DeviceInfo::default()
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "skia-metal", target_vendor = "apple"))]
+pub use graphite_metal::SkiaMtl;

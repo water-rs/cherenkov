@@ -17,14 +17,18 @@
 //! | `vello-hybrid` | `vello_hybrid` | CPU strips + wgpu colour pass | `Rgba8Unorm`/`Bgra8Unorm` texture, picked from queried capabilities |
 //! | `skia-cpu` | `skia-safe` | CPU raster (`SkRasterPipeline`) | `RGBAF16` premul surface, linear-P3 colours |
 //! | `skia-vulkan` | `skia-safe` | Ganesh/Vulkan | `RGBAF16` premul surface, linear-P3 colours |
+//! | `skia-metal` | `skia-safe` | Graphite/Metal | `RGBAF16` premul render target, linear-P3 colours |
 //!
 //! GPU time is reported only where a real GPU timestamp source exists.
 //! The wgpu adapters and skia-vulkan bracket the engine submission with
 //! timestamps written in standalone submissions after a full queue drain
-//! (see [`wgpu_ctx::drain_and_stamp`]); this **serializes CPU and GPU** for
-//! the measured frame — a synchronous probe, not a pipelined frame rate.
-//! Where no timestamp source exists the field is `null` — it is never
-//! estimated.
+//! (see [`wgpu_ctx::drain_and_stamp`]); skia-metal brackets Graphite's
+//! submission with empty `MTLCommandBuffer` markers on the same serial
+//! queue, each preceded by a drain (`commit` + `waitUntilCompleted`),
+//! and reads their `GPUStartTime`/`GPUEndTime`. This **serializes CPU
+//! and GPU** for the measured frame — a synchronous probe, not a
+//! pipelined frame rate. Where no timestamp source exists the field is
+//! `null` — it is never estimated.
 
 pub mod affinity;
 pub mod convert;
@@ -38,7 +42,7 @@ pub mod vello_like;
 #[cfg(any(feature = "vello-classic", feature = "vello-hybrid"))]
 pub mod wgpu_ctx;
 
-#[cfg(feature = "skia")]
+#[cfg(any(feature = "skia", feature = "skia-metal"))]
 pub mod skia_ad;
 #[cfg(feature = "vello-classic")]
 pub mod vello_classic_ad;
@@ -233,6 +237,8 @@ pub fn engine_names() -> Vec<&'static str> {
         skia_ad::SkiaCpu::NAME,
         #[cfg(all(feature = "skia", any(target_os = "linux", target_os = "android")))]
         skia_ad::SkiaVk::NAME,
+        #[cfg(all(feature = "skia-metal", target_vendor = "apple"))]
+        skia_ad::SkiaMtl::NAME,
     ]
 }
 
@@ -257,6 +263,8 @@ pub fn create_engine(name: &str) -> Result<Box<dyn Engine>, BenchError> {
         skia_ad::SkiaCpu::NAME => Ok(Box::new(skia_ad::SkiaCpu::new())),
         #[cfg(all(feature = "skia", any(target_os = "linux", target_os = "android")))]
         skia_ad::SkiaVk::NAME => skia_ad::SkiaVk::new().map(|e| Box::new(e) as Box<dyn Engine>),
+        #[cfg(all(feature = "skia-metal", target_vendor = "apple"))]
+        skia_ad::SkiaMtl::NAME => skia_ad::SkiaMtl::new().map(|e| Box::new(e) as Box<dyn Engine>),
         _ => Err(BenchError::Engine(format!(
             "unknown or uncompiled engine {name:?}; available: {:?}",
             engine_names()

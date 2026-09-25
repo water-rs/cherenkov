@@ -316,6 +316,8 @@ dependencies = [
  "glifo",
  "kurbo",
  "libc",
+ "objc2",
+ "objc2-metal",
  "peniko",
  "png",
  "pollster 0.4.0",
@@ -1727,6 +1729,7 @@ dependencies = [
  "bitflags",
  "block2",
  "objc2",
+ "objc2-core-foundation",
  "objc2-foundation",
 ]
 

@@ -18,8 +18,7 @@ struct WorkingSpace {
 
 const DEGREES_TO_RADIANS: f32 = 0.017453292519943295;
 
-fn apply(input: texture_2d<f32>, input_point_sampler: sampler, uv: vec2<f32>, params: Params, space: WorkingSpace) -> vec4<f32> {
-    let size = vec2<f32>(textureDimensions(input));
+fn apply(input: texture_2d<f32>, input_point_sampler: sampler, uv: vec2<f32>, size: vec2<f32>, params: Params, space: WorkingSpace) -> vec4<f32> {
     let scale = max(params.scale, 2.0);
     let angle = params.angle * DEGREES_TO_RADIANS;
     let base = textureSampleLevel(input, input_point_sampler, (floor(uv * size) + 0.5) / size, 0.0);

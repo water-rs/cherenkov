@@ -19,8 +19,10 @@
 //!   `fn([f32; N], &WorkingSpace, &mut [[f32; 4]])`, and implements
 //!   `CpuKernel` with it.
 //! - `spatial, shader = "<path>"` declares a spatial filter, with either
-//!   `footprint = <expr>` (a constant `f32`) or `footprint_fn = <path>`
-//!   (`fn([f32; N]) -> f32`), and optionally `shape = sdf` or
+//!   `footprint = <expr>` and/or `footprint_extent = <expr>` (the constant
+//!   pixel and extent components of a [`Footprint`](filtrate_core::Footprint);
+//!   an omitted component is zero) or `footprint_fn = <path>`
+//!   (`fn([f32; N]) -> Footprint`), and optionally `shape = sdf` or
 //!   `shape = mask` when the snippet reads the clip shape.
 //!
 //! Both kinds accept `space = srgb` for a stage that operates in sRGB (the
@@ -105,10 +107,18 @@ pub fn derive_filter(input: TokenStream) -> TokenStream {
 
 /// How a spatial filter reports its footprint.
 enum Footprint {
-    /// A constant expression.
-    Constant(Expr),
-    /// A function of the parameters.
+    /// Constant pixel and extent components; an omitted component is zero.
+    Constant(Box<ConstantFootprint>),
+    /// A function of the parameters returning a [`Footprint`].
     Function(Path),
+}
+
+/// The constant components of a spatial footprint.
+struct ConstantFootprint {
+    /// The `footprint = <expr>` component.
+    pixels: Option<Expr>,
+    /// The `footprint_extent = <expr>` component.
+    extent: Option<Expr>,
 }
 
 /// The kind-specific part of the attribute.
@@ -326,13 +336,23 @@ impl StageTokens<'_> {
             collector.spatial(#core::Placed::new(&STAGE));
         };
         let footprint = match footprint {
-            Footprint::Constant(value) => quote! {
-                fn footprint_of(_params: &[f32; #total_params]) -> f32 {
-                    #value
+            Footprint::Constant(constant) => {
+                let pixels = constant
+                    .pixels
+                    .as_ref()
+                    .map_or_else(|| quote! { 0.0 }, |value| quote! { #value });
+                let extent = constant
+                    .extent
+                    .as_ref()
+                    .map_or_else(|| quote! { 0.0 }, |value| quote! { #value });
+                quote! {
+                    fn footprint_of(_params: &[f32; #total_params]) -> #core::Footprint {
+                        #core::Footprint::new(#pixels, #extent)
+                    }
                 }
-            },
+            }
             Footprint::Function(path) => quote! {
-                fn footprint_of(params: &[f32; #total_params]) -> f32 {
+                fn footprint_of(params: &[f32; #total_params]) -> #core::Footprint {
                     #path(*params)
                 }
             },
@@ -355,7 +375,9 @@ struct RawAttrs {
     shader: Option<String>,
     linear: Option<bool>,
     cpu: Option<Path>,
-    footprint: Option<Footprint>,
+    footprint: Option<Expr>,
+    footprint_extent: Option<Expr>,
+    footprint_fn: Option<Path>,
     shape: Option<Ident>,
     srgb: Option<bool>,
     constants: Option<Vec<Expr>>,
@@ -394,11 +416,15 @@ impl RawAttrs {
             }
             "footprint" => {
                 let value: Expr = meta.value()?.parse()?;
-                set_once(meta, &mut self.footprint, Footprint::Constant(value))?;
+                set_once(meta, &mut self.footprint, value)?;
+            }
+            "footprint_extent" => {
+                let value: Expr = meta.value()?.parse()?;
+                set_once(meta, &mut self.footprint_extent, value)?;
             }
             "footprint_fn" => {
                 let value: Path = meta.value()?.parse()?;
-                set_once(meta, &mut self.footprint, Footprint::Function(value))?;
+                set_once(meta, &mut self.footprint_fn, value)?;
             }
             "shape" => {
                 let value: Ident = meta.value()?.parse()?;
@@ -430,7 +456,7 @@ impl RawAttrs {
             }
             _ => {
                 return Err(meta.error(
-                    "unknown #[filter(...)] argument; expected `color`, `spatial`, `shader`, `linear`, `cpu`, `footprint`, `footprint_fn`, `shape`, `space` or `constants`",
+                    "unknown #[filter(...)] argument; expected `color`, `spatial`, `shader`, `linear`, `cpu`, `footprint`, `footprint_extent`, `footprint_fn`, `shape`, `space` or `constants`",
                 ));
             }
         }
@@ -457,17 +483,34 @@ impl RawAttrs {
             if self.cpu.is_some() {
                 return Err(misplaced("cpu", "colour"));
             }
-            KindAttrs::Spatial {
-                footprint: self.footprint.ok_or_else(|| {
-                    syn::Error::new_spanned(
+            let footprint = if let Some(path) = self.footprint_fn {
+                if self.footprint.is_some() || self.footprint_extent.is_some() {
+                    return Err(syn::Error::new_spanned(
                         attr,
-                        "spatial filters declare `footprint = <f32>` or `footprint_fn = <path>`",
-                    )
-                })?,
+                        "`footprint_fn` does not combine with `footprint` or `footprint_extent`",
+                    ));
+                }
+                Footprint::Function(path)
+            } else if self.footprint.is_some() || self.footprint_extent.is_some() {
+                Footprint::Constant(Box::new(ConstantFootprint {
+                    pixels: self.footprint,
+                    extent: self.footprint_extent,
+                }))
+            } else {
+                return Err(syn::Error::new_spanned(
+                    attr,
+                    "spatial filters declare `footprint = <f32>` and/or `footprint_extent = <f32>`, or `footprint_fn = <path>`",
+                ));
+            };
+            KindAttrs::Spatial {
+                footprint,
                 shape: self.shape,
             }
         } else {
-            if self.footprint.is_some() {
+            if self.footprint.is_some()
+                || self.footprint_extent.is_some()
+                || self.footprint_fn.is_some()
+            {
                 return Err(misplaced("footprint", "spatial"));
             }
             if self.shape.is_some() {

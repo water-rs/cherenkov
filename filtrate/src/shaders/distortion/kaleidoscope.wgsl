@@ -15,8 +15,7 @@ struct Params {
 const TAU: f32 = 6.283185307179586;
 const DEGREES_TO_RADIANS: f32 = 0.017453292519943295;
 
-fn apply(input: texture_2d<f32>, input_sampler: sampler, uv: vec2<f32>, params: Params) -> vec4<f32> {
-    let size = vec2<f32>(textureDimensions(input));
+fn apply(input: texture_2d<f32>, input_sampler: sampler, uv: vec2<f32>, size: vec2<f32>, params: Params) -> vec4<f32> {
     let isotropic = size / min(size.x, size.y);
     let segments = max(params.segments, 2.0);
     let rotation = params.rotation * DEGREES_TO_RADIANS;

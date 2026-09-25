@@ -33,7 +33,10 @@ mod tests {
 
     #[test]
     fn sobel_is_spatial_with_zero_params() {
-        assert_eq!(crate::SpatialFilter::footprint(&Sobel), 1.0);
+        assert_eq!(
+            crate::SpatialFilter::footprint(&Sobel),
+            crate::Footprint::pixels(1.0)
+        );
         assert_eq!(Sobel.params().len(), 0);
     }
 }

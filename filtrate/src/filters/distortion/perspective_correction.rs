@@ -8,12 +8,12 @@ use crate::Filter;
 /// corners, x then y, in uv. It shares its stage with
 /// [`PerspectiveTransform`](crate::filters::PerspectiveTransform), which
 /// specializes the other direction. Any pixel can read any other, so the
-/// footprint is unbounded.
+/// footprint spans the whole image extent.
 #[derive(Debug, Clone, Filter)]
 #[filter(
     spatial,
     shader = "distortion/perspective.wgsl",
-    footprint = f32::INFINITY,
+    footprint_extent = 1.0,
     constants = [0.0]
 )]
 pub struct PerspectiveCorrection<T>(pub [T; 8]);

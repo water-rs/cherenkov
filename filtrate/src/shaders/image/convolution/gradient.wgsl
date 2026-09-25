@@ -12,17 +12,11 @@ struct Params {
 struct WorkingSpace {
     luma: vec3<f32>,
 }
-
-fn load(input: texture_2d<f32>, input_point_sampler: sampler, size: vec2<f32>, pixel: vec2<f32>) -> vec4<f32> {
-    return textureSampleLevel(input, input_point_sampler, (pixel + 0.5) / size, 0.0);
-}
-
 fn luma_at(input: texture_2d<f32>, input_point_sampler: sampler, size: vec2<f32>, pixel: vec2<f32>, luma: vec3<f32>) -> f32 {
     return dot(load(input, input_point_sampler, size, pixel).rgb, luma);
 }
 
-fn apply(input: texture_2d<f32>, input_point_sampler: sampler, uv: vec2<f32>, params: Params, space: WorkingSpace) -> vec4<f32> {
-    let size = vec2<f32>(textureDimensions(input));
+fn apply(input: texture_2d<f32>, input_point_sampler: sampler, uv: vec2<f32>, size: vec2<f32>, params: Params, space: WorkingSpace) -> vec4<f32> {
     let pixel = floor(uv * size);
     let r = f32(max(i32(round(params.radius)), 1));
     let amount = max(params.amount, 0.0);

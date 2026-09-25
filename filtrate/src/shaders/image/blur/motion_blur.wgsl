@@ -9,8 +9,7 @@ struct Params {
 
 const DEGREES_TO_RADIANS: f32 = 0.017453292519943295;
 
-fn apply(input: texture_2d<f32>, input_sampler: sampler, uv: vec2<f32>, params: Params) -> vec4<f32> {
-    let size = vec2<f32>(textureDimensions(input));
+fn apply(input: texture_2d<f32>, input_sampler: sampler, uv: vec2<f32>, size: vec2<f32>, params: Params) -> vec4<f32> {
     let radius = max(i32(round(params.radius)), 0);
     if radius == 0 {
         return textureSampleLevel(input, input_sampler, (floor(uv * size) + 0.5) / size, 0.0);

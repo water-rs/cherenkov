@@ -1,7 +1,7 @@
 //! Unsharp mask filter implementation.
 
 use crate::{
-    AuxSource, Filter, FilterParam, OperatingSpace, ParamSource, Placed, SignalVisitor,
+    AuxSource, Filter, FilterParam, Footprint, OperatingSpace, ParamSource, Placed, SignalVisitor,
     SpatialFilter, SpatialStage, StageCollector,
     filters::{footprint, image::blur::HORIZONTAL},
     kind,
@@ -56,7 +56,7 @@ impl<T: FilterParam> Filter for UnsharpMask<T> {
 }
 
 impl<T: FilterParam> SpatialFilter for UnsharpMask<T> {
-    fn footprint_of(params: &[f32; 2]) -> f32 {
-        footprint::rounded(params[0])
+    fn footprint_of(params: &[f32; 2]) -> Footprint {
+        Footprint::pixels(footprint::rounded(params[0]))
     }
 }

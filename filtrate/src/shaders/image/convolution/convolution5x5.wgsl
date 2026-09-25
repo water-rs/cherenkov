@@ -30,13 +30,7 @@ struct Params {
     k23: f32,
     k24: f32,
 }
-
-fn load(input: texture_2d<f32>, input_point_sampler: sampler, size: vec2<f32>, pixel: vec2<f32>) -> vec4<f32> {
-    return textureSampleLevel(input, input_point_sampler, (pixel + 0.5) / size, 0.0);
-}
-
-fn apply(input: texture_2d<f32>, input_point_sampler: sampler, uv: vec2<f32>, params: Params) -> vec4<f32> {
-    let size = vec2<f32>(textureDimensions(input));
+fn apply(input: texture_2d<f32>, input_point_sampler: sampler, uv: vec2<f32>, size: vec2<f32>, params: Params) -> vec4<f32> {
     let pixel = floor(uv * size);
     var kernel = array<f32, 25>(
         params.k0, params.k1, params.k2, params.k3, params.k4,

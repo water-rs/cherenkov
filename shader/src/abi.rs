@@ -49,11 +49,6 @@ pub enum FoldBlocker {
     Gather,
     /// A sample of `input` compares a depth reference.
     DepthComparison,
-    /// The stage queries `input`'s extent (`textureDimensions` and friends):
-    /// the materialized prefix can have a different extent than `input`.
-    ImageQuery,
-    /// `input` escapes `apply` into a helper function.
-    HelperCall,
     /// `input` is used in a way the folder cannot classify.
     UnknownUse,
 }

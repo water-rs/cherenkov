@@ -26,6 +26,6 @@ mod tests {
         let filter = MotionBlur(8.0f32, 45.0f32);
         assert_eq!(filter.params(), [8.0, 45.0]);
         // Eight taps each way, plus the bilinear neighbour.
-        assert_eq!(filter.footprint(), 9.0);
+        assert_eq!(filter.footprint(), crate::Footprint::pixels(9.0));
     }
 }

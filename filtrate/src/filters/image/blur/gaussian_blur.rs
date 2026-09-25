@@ -1,8 +1,8 @@
 //! Gaussian blur filter implementation.
 
 use crate::{
-    Filter, FilterParam, OperatingSpace, ParamSource, Placed, SignalVisitor, SpatialFilter,
-    SpatialStage, StageCollector, kind,
+    Filter, FilterParam, Footprint, OperatingSpace, ParamSource, Placed, SignalVisitor,
+    SpatialFilter, SpatialStage, StageCollector, kind,
 };
 
 /// The separable gaussian blur's stage: one axis, specialized per pass.
@@ -58,8 +58,8 @@ impl<T: FilterParam> Filter for GaussianBlur<T> {
 }
 
 impl<T: FilterParam> SpatialFilter for GaussianBlur<T> {
-    fn footprint_of(params: &[f32; 1]) -> f32 {
-        (params[0].max(0.001) * 3.0).ceil()
+    fn footprint_of(params: &[f32; 1]) -> Footprint {
+        Footprint::pixels((params[0].max(0.001) * 3.0).ceil())
     }
 }
 
@@ -69,7 +69,7 @@ mod tests {
 
     #[test]
     fn gaussian_footprint_is_three_sigma() {
-        assert_eq!(GaussianBlur(2.0f32).footprint(), 6.0);
-        assert_eq!(GaussianBlur(0.4f32).footprint(), 2.0);
+        assert_eq!(GaussianBlur(2.0f32).footprint(), Footprint::pixels(6.0));
+        assert_eq!(GaussianBlur(0.4f32).footprint(), Footprint::pixels(2.0));
     }
 }

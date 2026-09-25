@@ -32,13 +32,13 @@
 //!
 //! ```rust
 //! use filtrate::filters::{Blur, Brightness};
-//! use filtrate::{Executor, Filter, FilterExt, SpatialFilter};
+//! use filtrate::{Executor, Filter, FilterExt, Footprint, SpatialFilter};
 //!
 //! let chain = Blur(5.0_f32).then(Brightness(0.1_f32));
 //! // A chain's params nest, one array per link, in application order.
 //! assert_eq!(chain.params(), ([5.0], [0.1]));
 //! // A blur makes the chain spatial; it reads five pixels each way.
-//! assert_eq!(chain.footprint(), 5.0);
+//! assert_eq!(chain.footprint(), Footprint::pixels(5.0));
 //! let executor = Executor::new(chain);
 //! # drop(executor);
 //! ```
@@ -75,9 +75,9 @@ pub use effect::{
 pub use executor::Executor;
 pub use filtrate_core::{
     AnimatedCallback, AnimatedTarget, AnimationTrack, AuxData, AuxFormat, AuxImage, AuxSource,
-    Chain, ColorFilter, ColorStage, CpuKernel, Filter, FilterExt, FilterParam, ImageVisitor,
-    Interpolator, OperatingSpace, ParamArray, ParamSource, Placed, ShapeInput, SignalVisitor,
-    SpatialFilter, SpatialStage, StageCollector, WatchGuard, WorkingSpace, kind,
+    Chain, ColorFilter, ColorStage, CpuKernel, Filter, FilterExt, FilterParam, Footprint,
+    ImageVisitor, Interpolator, OperatingSpace, ParamArray, ParamSource, Placed, ShapeInput,
+    SignalVisitor, SpatialFilter, SpatialStage, StageCollector, WatchGuard, WorkingSpace, kind,
 };
 
 /// Procedural derive that generates a single-stage filter: the [`Filter`]

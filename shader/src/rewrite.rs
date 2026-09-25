@@ -6,10 +6,10 @@ use std::collections::{HashMap, HashSet};
 
 use naga::{
     Block, CooperativeData, Expression, Function, FunctionArgument, GatherMode, Handle, ImageQuery,
-    Literal, Module, Range, SampleLevel, Statement, SwitchCase,
+    Literal, Module, Range, SampleLevel, Statement, SwitchCase, Type,
 };
 
-use crate::{import::GENERATED, parse};
+use crate::{abi::ParamType, import::GENERATED, parse};
 
 /// Rebuilds `expression` with every expression operand passed through `map`.
 /// Handles into other arenas (types, constants, functions) are kept.
@@ -204,74 +204,298 @@ pub fn map_expression(
 }
 
 /// Builds a copy of the spatial function `spatial` in which every sample of
-/// argument `input` is passed through `prefix` before use.
+/// argument `input` is passed through `prefix` before use — including samples
+/// `input` reaches through helpers it is passed to.
 ///
-/// The copy gains `extra` as trailing arguments; they are passed to `prefix`
-/// after the sampled colour, in order.
+/// The fold is transitive: a callee that receives `input` is cloned once per
+/// combination of argument positions `input` binds to, with its own samples
+/// folded the same way, and the call is retargeted. A folded callee gains
+/// `extra` as trailing arguments when it calls `prefix`, directly or through
+/// a folded callee of its own; `spatial`'s copy always gains `extra`, which
+/// are passed to `prefix` after the sampled colour, in order.
+///
+/// `prefix` is a function `fn(color, extra...) -> color` — the colour piece
+/// of the chain as a function of one sample.
+///
+/// # Panics
+///
+/// Panics when a sample of `input` cannot be folded — parse analysis gates
+/// the fold, so a failure is a composer defect.
 pub fn fold_prefix(
-    spatial: &Function,
+    module: &mut Module,
+    spatial: Handle<Function>,
     input: u32,
     prefix: Handle<Function>,
     extra: &[FunctionArgument],
     name: String,
 ) -> Function {
-    let mut folded = Function {
-        name: Some(name),
-        arguments: spatial.arguments.clone(),
-        result: spatial.result.clone(),
-        local_variables: spatial.local_variables.clone(),
-        diagnostic_filter_leaf: spatial.diagnostic_filter_leaf,
-        ..Function::default()
-    };
-    let first_extra = u32::try_from(folded.arguments.len()).expect("argument count fits in u32");
-    folded.arguments.extend_from_slice(extra);
-
-    let input = parse::argument_expression(spatial, input);
-    let mut rebuild = Rebuild {
-        map: Vec::with_capacity(spatial.expressions.len()),
-        replaced: HashMap::new(),
-    };
-    for (handle, expression) in spatial.expressions.iter() {
-        let copy = map_expression(expression, |operand| rebuild.operand(operand));
-        let span = spatial.expressions.get_span(handle);
-        let new = folded.expressions.append(copy, span);
-        rebuild.map.push(new);
-        if input.is_some_and(|input| parse::samples_input(expression, input)) {
-            let call = folded
-                .expressions
-                .append(Expression::CallResult(prefix), GENERATED);
-            rebuild.replaced.insert(handle, call);
-        }
-    }
-    let extra_arguments: Vec<_> = (0..extra.len())
-        .map(|offset| {
-            let index = first_extra + u32::try_from(offset).expect("argument count fits in u32");
-            folded
-                .expressions
-                .append(Expression::FunctionArgument(index), GENERATED)
-        })
+    let names: HashSet<String> = module
+        .functions
+        .iter()
+        .filter_map(|(_, function)| function.name.clone())
         .collect();
+    let mut fold = Fold {
+        module,
+        prefix,
+        extra,
+        functions: HashMap::new(),
+        in_progress: HashSet::new(),
+        names,
+    };
+    let source = fold.module.functions[spatial].clone();
+    let inputs =
+        vec![parse::argument_expression(&source, input).expect("a spatial stage declares `input`")];
+    let (replaced, call_fns, call_results) = fold
+        .calls(&source, &inputs)
+        .expect("folding analysis passed");
+    fold.rebuild(
+        &source,
+        &inputs,
+        &replaced,
+        &call_fns,
+        &call_results,
+        true,
+        Some(name),
+    )
+}
 
-    for (_, local) in folded.local_variables.iter_mut() {
-        local.init = local.init.map(|init| rebuild.operand(init));
-    }
-    for (old, name) in &spatial.named_expressions {
+/// Folded callees: `(callee, bound input positions)` to the folded clone and
+/// whether it takes the trailing `extra` arguments.
+type FoldFns = HashMap<Key, (Handle<Function>, bool)>;
+
+/// A fold in progress: clones are memoized per callee and bound argument
+/// positions.
+struct Fold<'a> {
+    /// The module new functions are appended to.
+    module: &'a mut Module,
+    /// The prefix applied after every sample.
+    prefix: Handle<Function>,
+    /// The arguments a folded clone gains as trailing arguments when it
+    /// reaches a sample — `prefix` takes them after the sampled colour.
+    extra: &'a [FunctionArgument],
+    /// `(function, bound input positions)` to the folded clone and whether
+    /// it takes `extra`, or `None` when it cannot be folded.
+    functions: HashMap<Key, Option<(Handle<Function>, bool)>>,
+    /// Keys currently being folded — a call cycle cannot be folded.
+    in_progress: HashSet<Key>,
+    /// Function names already taken, for the clones' unique names.
+    names: HashSet<String>,
+}
+
+impl Fold<'_> {
+    /// The fold of `function` when `inputs`' argument positions bind to the
+    /// caller's `input` — `(function, false)` when nothing changes, or `None`
+    /// when it cannot be folded.
+    ///
+    /// The flag in the result tells whether the clone takes the trailing
+    /// `extra` arguments, which every bound call then supplies from its own.
+    fn fold(
+        &mut self,
+        function: Handle<Function>,
+        inputs: &[u32],
+    ) -> Option<(Handle<Function>, bool)> {
+        let mut positions = inputs.to_vec();
+        positions.sort_unstable();
+        let key = (function, positions);
+        if let Some(&folded) = self.functions.get(&key) {
+            return folded;
+        }
+        // WGSL admits no recursion; bail rather than looping on a cycle.
+        if !self.in_progress.insert(key.clone()) {
+            return None;
+        }
+        let folded = self.try_fold(function, &key.1);
+        self.in_progress.remove(&key);
+        self.functions.insert(key, folded);
         folded
-            .named_expressions
-            .insert(rebuild.map[old.index()], name.clone());
     }
-    folded.body = rebuild.block(&spatial.body, prefix, &extra_arguments);
-    folded
+
+    fn try_fold(
+        &mut self,
+        function: Handle<Function>,
+        inputs: &[u32],
+    ) -> Option<(Handle<Function>, bool)> {
+        let source = self.module.functions[function].clone();
+        let inputs: Vec<Handle<Expression>> = inputs
+            .iter()
+            .map(|&arg| parse::argument_expression(&source, arg))
+            .collect::<Option<_>>()?;
+
+        let (replaced, call_fns, call_results) = self.calls(&source, &inputs)?;
+        // A clone that folds samples, or retargets a call into a clone that
+        // takes `extra`, takes `extra` itself.
+        let needs_extra =
+            !replaced.is_empty() || call_fns.values().any(|&(_, needs_extra)| needs_extra);
+        if replaced.is_empty()
+            && call_fns
+                .iter()
+                .all(|(&(callee, _), &(call, _))| callee == call)
+        {
+            // Nothing samples `input` and no call needed retargeting.
+            return Some((function, false));
+        }
+        let rebuilt = self.rebuild(
+            &source,
+            &inputs,
+            &replaced,
+            &call_fns,
+            &call_results,
+            needs_extra,
+            None,
+        );
+        Some((
+            self.module.functions.append(rebuilt, GENERATED),
+            needs_extra,
+        ))
+    }
+
+    /// The samples `function`'s copies fold and the calls `input` flows
+    /// into, folded: the replaced sample expressions, the `(callee, bound)`
+    /// retargeting map, and `CallResult` expressions to folded callees.
+    fn calls(&mut self, source: &Function, inputs: &[Handle<Expression>]) -> Option<FoldSites> {
+        let replaced: Vec<Handle<Expression>> = source
+            .expressions
+            .iter()
+            .filter(|(_, expression)| {
+                inputs
+                    .iter()
+                    .any(|&input| parse::samples_input(expression, input))
+            })
+            .map(|(handle, _)| handle)
+            .collect();
+        let mut call_fns: FoldFns = HashMap::new();
+        let mut call_results: HashMap<Handle<Expression>, Handle<Function>> = HashMap::new();
+        for call in bound_calls(source, inputs)? {
+            let folded = self.fold(call.function, &call.bound)?;
+            call_fns.insert((call.function, call.bound), folded);
+            if let Some(result) = call.result {
+                call_results.insert(result, folded.0);
+            }
+        }
+        Some((replaced, call_fns, call_results))
+    }
+
+    /// Clones `source`: every replaced sample is passed through `prefix`,
+    /// every bound call is retargeted to its folded callee. When
+    /// `append_extra` the clone gains `extra` as trailing arguments — always
+    /// for `spatial`'s copy, when needed for a callee — and passes them to
+    /// `prefix` and to folded callees that take them.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the rebuild needs every analysis result; bundling them would only rename the list"
+    )]
+    fn rebuild(
+        &mut self,
+        source: &Function,
+        inputs: &[Handle<Expression>],
+        replaced: &[Handle<Expression>],
+        call_fns: &FoldFns,
+        call_results: &HashMap<Handle<Expression>, Handle<Function>>,
+        append_extra: bool,
+        name: Option<String>,
+    ) -> Function {
+        let replaced: HashSet<Handle<Expression>> = replaced.iter().copied().collect();
+        let mut rebuilt = Function {
+            name: Some(name.unwrap_or_else(|| self.name_for(source))),
+            arguments: source.arguments.clone(),
+            result: source.result.clone(),
+            local_variables: source.local_variables.clone(),
+            diagnostic_filter_leaf: source.diagnostic_filter_leaf,
+            ..Function::default()
+        };
+
+        let mut copier = FoldRebuild {
+            map: Vec::with_capacity(source.expressions.len()),
+            replaced: HashMap::new(),
+            prefix: self.prefix,
+            inputs,
+            extra: Vec::new(),
+            call_fns,
+        };
+        for (handle, expression) in source.expressions.iter() {
+            let copy = match *expression {
+                Expression::CallResult(_) => call_results.get(&handle).map_or_else(
+                    || expression.clone(),
+                    |&target| Expression::CallResult(target),
+                ),
+                _ => map_expression(expression, |operand| copier.operand(operand)),
+            };
+            let new = rebuilt
+                .expressions
+                .append(copy, source.expressions.get_span(handle));
+            copier.map.push(new);
+            if replaced.contains(&handle) {
+                // The sample itself is copied and emitted; the `prefix`
+                // call's `CallResult` takes its place for every use.
+                let call = rebuilt
+                    .expressions
+                    .append(Expression::CallResult(self.prefix), GENERATED);
+                copier.replaced.insert(handle, call);
+            }
+        }
+        if append_extra {
+            let first_extra =
+                u32::try_from(rebuilt.arguments.len()).expect("argument count fits in u32");
+            rebuilt.arguments.extend_from_slice(self.extra);
+            copier.extra = (0..self.extra.len())
+                .map(|offset| {
+                    let index =
+                        first_extra + u32::try_from(offset).expect("argument count fits in u32");
+                    rebuilt
+                        .expressions
+                        .append(Expression::FunctionArgument(index), GENERATED)
+                })
+                .collect();
+        }
+
+        for (_, local) in rebuilt.local_variables.iter_mut() {
+            local.init = local.init.map(|init| copier.operand(init));
+        }
+        for (old, name) in &source.named_expressions {
+            rebuilt
+                .named_expressions
+                .insert(copier.map[old.index()], name.clone());
+        }
+        rebuilt.body = copier.block(&source.body);
+        rebuilt
+    }
+
+    /// A unique name for `source`'s clone.
+    fn name_for(&mut self, source: &Function) -> String {
+        let base = format!("{}_folded", source.name.as_deref().unwrap_or("function"));
+        let mut name = base.clone();
+        let mut suffix = 0;
+        while self.names.contains(&name) {
+            suffix += 1;
+            name = format!("{base}_{suffix}");
+        }
+        self.names.insert(name.clone());
+        name
+    }
 }
 
-struct Rebuild {
-    /// Old expression index to its copy.
+/// Statement rebuilding for the fold: a folded sample keeps its place in the
+/// emit range, followed by the `prefix` call whose `CallResult` every use of
+/// the sample remaps to, and calls `input` flows through are retargeted to
+/// folded callees.
+struct FoldRebuild<'a> {
+    /// Every source expression to its copy.
     map: Vec<Handle<Expression>>,
-    /// Old sample expression to the result of the prefix applied to it.
+    /// Source sample expression to the `prefix` call's `CallResult`.
     replaced: HashMap<Handle<Expression>, Handle<Expression>>,
+    /// The prefix applied after every sample.
+    prefix: Handle<Function>,
+    /// The clone's own `input` argument expressions, for call retargeting.
+    inputs: &'a [Handle<Expression>],
+    /// The clone's own `extra` argument expressions, passed to `prefix` and
+    /// to folded callees that take them — empty when the clone gains none.
+    extra: Vec<Handle<Expression>>,
+    /// `(callee, bound input positions)` to the folded callee and whether it
+    /// takes `extra`.
+    call_fns: &'a FoldFns,
 }
 
-impl Rebuild {
+impl FoldRebuild<'_> {
     /// Where a use of `old` points after the rewrite.
     fn operand(&self, old: Handle<Expression>) -> Handle<Expression> {
         self.replaced
@@ -285,17 +509,12 @@ impl Rebuild {
         self.map[old.index()]
     }
 
-    fn block(
-        &self,
-        block: &Block,
-        prefix: Handle<Function>,
-        extra: &[Handle<Expression>],
-    ) -> Block {
+    fn block(&self, block: &Block) -> Block {
         let mut out = Block::with_capacity(block.len());
         for (statement, span) in block.span_iter() {
             match statement {
-                Statement::Emit(range) => self.emit(range, &mut out, *span, prefix, extra),
-                other => out.push(self.statement(other, prefix, extra), *span),
+                Statement::Emit(range) => self.emit(range, &mut out, *span),
+                other => out.push(self.statement(other), *span),
             }
         }
         out
@@ -303,14 +522,7 @@ impl Rebuild {
 
     /// Re-emits `range`, splitting it after every folded sample to call the
     /// prefix on that sample.
-    fn emit(
-        &self,
-        range: &Range<Expression>,
-        out: &mut Block,
-        span: naga::Span,
-        prefix: Handle<Function>,
-        extra: &[Handle<Expression>],
-    ) {
+    fn emit(&self, range: &Range<Expression>, out: &mut Block, span: naga::Span) {
         let mut run: Option<(Handle<Expression>, Handle<Expression>)> = None;
         for old in range.clone() {
             let new = self.defined(old);
@@ -318,12 +530,12 @@ impl Rebuild {
             if let Some(&call) = self.replaced.get(&old) {
                 let (first, last) = run.take().expect("the run holds the sample");
                 out.push(Statement::Emit(Range::new_from_bounds(first, last)), span);
-                let mut arguments = Vec::with_capacity(1 + extra.len());
+                let mut arguments = Vec::with_capacity(1 + self.extra.len());
                 arguments.push(new);
-                arguments.extend_from_slice(extra);
+                arguments.extend_from_slice(&self.extra);
                 out.push(
                     Statement::Call {
-                        function: prefix,
+                        function: self.prefix,
                         arguments,
                         result: Some(call),
                     },
@@ -336,16 +548,15 @@ impl Rebuild {
         }
     }
 
-    fn statement(
-        &self,
-        statement: &Statement,
-        prefix: Handle<Function>,
-        extra: &[Handle<Expression>],
-    ) -> Statement {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one arm per naga statement variant; the match stays exhaustive so a new variant fails to compile"
+    )]
+    fn statement(&self, statement: &Statement) -> Statement {
         let op = |handle: Handle<Expression>| self.operand(handle);
-        let block = |block: &Block| self.block(block, prefix, extra);
+        let block = |block: &Block| self.block(block);
         match *statement {
-            Statement::Emit(_) => unreachable!("emits are rebuilt by `Rebuild::emit`"),
+            Statement::Emit(_) => unreachable!("emits are rebuilt by `FoldRebuild::emit`"),
             Statement::Block(ref inner) => Statement::Block(block(inner)),
             Statement::If {
                 condition,
@@ -392,11 +603,35 @@ impl Rebuild {
                 function,
                 ref arguments,
                 result,
-            } => Statement::Call {
-                function,
-                arguments: arguments.iter().map(|&argument| op(argument)).collect(),
-                result: result.map(|result| self.defined(result)),
-            },
+            } => {
+                let mut bound: Vec<u32> = arguments
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, argument)| self.inputs.contains(argument))
+                    .map(|(index, _)| u32::try_from(index).expect("argument index fits in u32"))
+                    .collect();
+                let mut arguments: Vec<Handle<Expression>> =
+                    arguments.iter().map(|&argument| op(argument)).collect();
+                let function = if bound.is_empty() {
+                    function
+                } else {
+                    bound.sort_unstable();
+                    let &(target, needs_extra) = self
+                        .call_fns
+                        .get(&(function, bound))
+                        .expect("every bound call was folded");
+                    if needs_extra {
+                        // The clone took `extra` for exactly this.
+                        arguments.extend_from_slice(&self.extra);
+                    }
+                    target
+                };
+                Statement::Call {
+                    function,
+                    arguments,
+                    result: result.map(|result| self.defined(result)),
+                }
+            }
             Statement::SubgroupBallot { result, predicate } => Statement::SubgroupBallot {
                 result: self.defined(result),
                 predicate: predicate.map(op),
@@ -460,14 +695,17 @@ fn gather_mode(
 
 /// Replaces `function`'s filtered samples of `input` by calls to `manual`.
 ///
-/// `input` is the index of the texture argument samples are taken of, and
+/// `input` is the index of the texture argument samples are taken of,
 /// `sampler` — when `Some` — the index of the sampler argument those samples
-/// must go through. `manual` is a function `fn(texture_2d<f32>, vec2<f32>) ->
-/// vec4<f32>` implementing a filtered sample out of texel loads.
+/// must go through, and `size` the index of the argument carrying `input`'s
+/// extent in pixels. `manual` is a function `fn(texture_2d<f32>, vec2<f32>,
+/// vec2<f32>) -> vec4<f32>` implementing a filtered sample out of texel
+/// loads; its third argument is the extent.
 ///
 /// The substitution is transitive: a callee that receives `input` is cloned
 /// once per combination of argument positions `input` binds to, with its own
-/// samples replaced, and the call is retargeted.
+/// samples replaced, and the call is retargeted. A substituted callee gains
+/// a trailing `size` argument its callers supply from their own `size`.
 ///
 /// Returns the function to call instead of `function` — `function` itself
 /// when nothing needed substituting — or `None` when a use of `input` has no
@@ -480,6 +718,7 @@ pub fn substitute_samples(
     function: Handle<Function>,
     input: u32,
     sampler: Option<u32>,
+    size: u32,
     manual: Handle<Function>,
 ) -> Option<Handle<Function>> {
     let names: HashSet<String> = module
@@ -494,12 +733,18 @@ pub fn substitute_samples(
         in_progress: HashSet::new(),
         names,
     };
-    substitution.substitute(function, &[input], sampler)
+    substitution
+        .substitute(function, &[input], sampler, Some(size))
+        .map(|(function, _)| function)
 }
 
 /// A substitution key: a callee and the sorted argument positions the
 /// caller's `input` binds to.
 type Key = (Handle<Function>, Vec<u32>);
+
+/// Substituted callees: `(callee, bound positions)` to the substitute and
+/// whether it takes a trailing `size` argument.
+type CallFns = HashMap<Key, (Handle<Function>, bool)>;
 
 /// One call `input` flows into, found while scanning a function's body.
 struct BoundCall {
@@ -519,13 +764,22 @@ struct Substitution<'a> {
     /// The manual sample implementation calls are retargeted to.
     manual: Handle<Function>,
     /// `(function, argument positions `input` binds to)` to the function to
-    /// call instead, or `None` when it cannot be substituted.
-    functions: HashMap<Key, Option<Handle<Function>>>,
+    /// call instead — and whether it takes a trailing `size` argument —
+    /// or `None` when it cannot be substituted.
+    functions: HashMap<Key, Option<(Handle<Function>, bool)>>,
     /// Keys currently being substituted — a cycle is not substitutable.
     in_progress: HashSet<Key>,
     /// Function names already taken, for the clones' unique names.
     names: HashSet<String>,
 }
+
+/// `(replaced samples, callee retargets, CallResult remaps)` — the sites
+/// one function's fold rewrites.
+type FoldSites = (
+    Vec<Handle<Expression>>,
+    FoldFns,
+    HashMap<Handle<Expression>, Handle<Function>>,
+);
 
 /// What one replaced sample expression becomes: the manual call's
 /// `CallResult`, and the source operands the call takes.
@@ -541,14 +795,20 @@ struct SubstitutedSample {
 
 impl Substitution<'_> {
     /// The substitute of `function` when `inputs`' argument positions bind to
-    /// the caller's `input` — `function` itself when nothing changes, or
+    /// the caller's `input` — `(function, false)` when nothing changes, or
     /// `None` when it cannot be substituted.
+    ///
+    /// `size` is the index of the argument carrying `input`'s extent when
+    /// `function` already declares one (`apply`); for a callee the extent
+    /// arrives as a trailing argument appended to the clone when it needs
+    /// one — the returned flag — and supplied by every bound call.
     fn substitute(
         &mut self,
         function: Handle<Function>,
         inputs: &[u32],
         sampler: Option<u32>,
-    ) -> Option<Handle<Function>> {
+        size: Option<u32>,
+    ) -> Option<(Handle<Function>, bool)> {
         let mut positions = inputs.to_vec();
         positions.sort_unstable();
         let key = (function, positions);
@@ -559,7 +819,7 @@ impl Substitution<'_> {
         if !self.in_progress.insert(key.clone()) {
             return None;
         }
-        let substituted = self.try_substitute(function, &key.1, sampler);
+        let substituted = self.try_substitute(function, &key.1, sampler, size);
         self.in_progress.remove(&key);
         self.functions.insert(key, substituted);
         substituted
@@ -568,12 +828,17 @@ impl Substitution<'_> {
     /// Clones `function` with its substitutable samples of `inputs` replaced;
     /// `sampler` is the declared sampler argument a sample must use (`None`
     /// for a callee, whose sampler arguments all derive from the caller's).
+    ///
+    /// The flag in the result tells whether the clone takes a trailing
+    /// `size` argument — `Some` in `size` means the argument already exists
+    /// and no clone gains one.
     fn try_substitute(
         &mut self,
         function: Handle<Function>,
         inputs: &[u32],
         sampler: Option<u32>,
-    ) -> Option<Handle<Function>> {
+        size: Option<u32>,
+    ) -> Option<(Handle<Function>, bool)> {
         let source = self.module.functions[function].clone();
         let inputs: Vec<Handle<Expression>> = inputs
             .iter()
@@ -583,38 +848,60 @@ impl Substitution<'_> {
             Some(arg) => Some(parse::argument_expression(&source, arg)?),
             None => None,
         };
+        let size = match size {
+            Some(arg) => Some(parse::argument_expression(&source, arg)?),
+            None => None,
+        };
 
         let replaced = substitutable_samples(&source, &inputs, sampler)?;
         let calls = bound_calls(&source, &inputs)?;
 
         // `(callee, bound positions)` to the substituted callee.
-        let mut call_fns: HashMap<Key, Handle<Function>> = HashMap::new();
+        let mut call_fns: CallFns = HashMap::new();
         // A call's `CallResult` expression to its substituted callee.
         let mut call_results: HashMap<Handle<Expression>, Handle<Function>> = HashMap::new();
         for call in calls {
-            let substituted = self.substitute(call.function, &call.bound, None)?;
+            let substituted = self.substitute(call.function, &call.bound, None, None)?;
             call_fns.insert((call.function, call.bound), substituted);
             if let Some(result) = call.result {
-                call_results.insert(result, substituted);
+                call_results.insert(result, substituted.0);
             }
         }
-        if replaced.is_empty() && call_fns.iter().all(|(&(callee, _), &call)| callee == call) {
+        // A clone that replaces samples, or retargets a call into a clone
+        // that gained a `size` argument, passes its own `size` along.
+        let needs_size =
+            !replaced.is_empty() || call_fns.values().any(|&(_, needs_size)| needs_size);
+        if replaced.is_empty()
+            && call_fns
+                .iter()
+                .all(|(&(callee, _), &(call, _))| callee == call)
+        {
             // Nothing samples `input` and no call needed retargeting.
-            return Some(function);
+            return Some((function, false));
         }
-        Some(self.rebuild(&source, &inputs, replaced, &call_fns, &call_results))
+        Some((
+            self.rebuild(&source, &inputs, replaced, &call_fns, &call_results, size),
+            needs_size && size.is_none(),
+        ))
     }
 
     /// Clones `source` into the module: every replaced sample becomes a call
     /// to `manual`, every bound call is retargeted to its substituted callee.
+    /// `size` is the source expression reading `input`'s extent; when the
+    /// clone needs one and has none, it is appended as a trailing argument.
     fn rebuild(
         &mut self,
         source: &Function,
         inputs: &[Handle<Expression>],
         replaced: Vec<(Handle<Expression>, Handle<Expression>)>,
-        call_fns: &HashMap<Key, Handle<Function>>,
+        call_fns: &CallFns,
         call_results: &HashMap<Handle<Expression>, Handle<Function>>,
+        size: Option<Handle<Expression>>,
     ) -> Handle<Function> {
+        // As the caller decided: a clone that replaces samples, or retargets
+        // a call into a clone that gained a `size` argument, gets one too.
+        let appended = size.is_none()
+            && (!replaced.is_empty() || call_fns.values().any(|&(_, needs_size)| needs_size));
         let replaced: HashMap<Handle<Expression>, Handle<Expression>> =
             replaced.into_iter().collect();
         let mut rebuilt = Function {
@@ -634,6 +921,7 @@ impl Substitution<'_> {
             substituted: HashMap::new(),
             manual: self.manual,
             inputs,
+            size: None,
             call_fns,
         };
         for (handle, expression) in source.expressions.iter() {
@@ -669,6 +957,24 @@ impl Substitution<'_> {
                 .append(copy, source.expressions.get_span(handle));
             substitute.map.push(new);
         }
+
+        substitute.size = if let Some(size) = size {
+            Some(substitute.defined(size))
+        } else if appended {
+            let index = u32::try_from(rebuilt.arguments.len()).expect("argument count fits in u32");
+            rebuilt.arguments.push(FunctionArgument {
+                name: Some("size".to_owned()),
+                ty: vec2f_type(self.module),
+                binding: None,
+            });
+            Some(
+                rebuilt
+                    .expressions
+                    .append(Expression::FunctionArgument(index), GENERATED),
+            )
+        } else {
+            None
+        };
 
         for (_, local) in rebuilt.local_variables.iter_mut() {
             local.init = local.init.map(|init| substitute.operand(init));
@@ -711,8 +1017,12 @@ struct Substitute<'a> {
     manual: Handle<Function>,
     /// The clone's own `input` argument expressions, for call retargeting.
     inputs: &'a [Handle<Expression>],
-    /// `(callee, bound argument positions)` to the substituted callee.
-    call_fns: &'a HashMap<(Handle<Function>, Vec<u32>), Handle<Function>>,
+    /// The clone's own `size` expression — `input`'s extent — that manual
+    /// calls and retargeted callees take, in the clone's own arena.
+    size: Option<Handle<Expression>>,
+    /// `(callee, bound argument positions)` to the substituted callee and
+    /// whether the callee takes a trailing `size` argument.
+    call_fns: &'a CallFns,
 }
 
 impl Substitute<'_> {
@@ -754,6 +1064,7 @@ impl Substitute<'_> {
                         arguments: vec![
                             self.operand(substituted.image),
                             self.operand(substituted.coordinate),
+                            self.size.expect("a substituted stage reads `size`"),
                         ],
                         result: Some(substituted.result),
                     },
@@ -831,15 +1142,21 @@ impl Substitute<'_> {
                     .filter(|&(_, argument)| self.inputs.contains(argument))
                     .map(|(index, _)| u32::try_from(index).expect("argument index fits in u32"))
                     .collect();
+                let mut arguments: Vec<Handle<Expression>> =
+                    arguments.iter().map(|&argument| op(argument)).collect();
                 let function = if bound.is_empty() {
                     function
                 } else {
                     bound.sort_unstable();
-                    self.call_fns[&(function, bound)]
+                    let (target, needs_size) = self.call_fns[&(function, bound)];
+                    if needs_size {
+                        arguments.push(self.size.expect("a substituted stage reads `size`"));
+                    }
+                    target
                 };
                 Statement::Call {
                     function,
-                    arguments: arguments.iter().map(|&argument| op(argument)).collect(),
+                    arguments,
                     result: result.map(|result| self.defined(result)),
                 }
             }
@@ -998,8 +1315,26 @@ fn zero_level(function: &Function, value: Handle<Expression>) -> bool {
     }
 }
 
+/// The module's `vec2<f32>` type handle, inserting it if absent.
+fn vec2f_type(module: &mut Module) -> Handle<Type> {
+    let existing = module
+        .types
+        .iter()
+        .find(|(_, ty)| ty.inner == ParamType::Vec2.inner())
+        .map(|(handle, _)| handle);
+    existing.unwrap_or_else(|| {
+        module.types.insert(
+            Type {
+                name: None,
+                inner: ParamType::Vec2.inner(),
+            },
+            GENERATED,
+        )
+    })
+}
+
 /// Walks every statement of `block` and its nested blocks.
-fn read_block(block: &Block, each: &mut impl FnMut(&Statement)) {
+pub fn read_block(block: &Block, each: &mut impl FnMut(&Statement)) {
     for statement in block {
         each(statement);
         match statement {

@@ -26,11 +26,16 @@ pub struct Importer<'s> {
 }
 
 impl<'s> Importer<'s> {
-    /// An importer from `src`. Imported functions are renamed `{prefix}_{name}`.
+    /// An importer from `src`. Imported functions are renamed
+    /// `{prefix}_{name}`; an empty prefix keeps the names as they are.
     pub(crate) fn new(src: &'s Module, prefix: &str) -> Self {
         Self {
             src,
-            prefix: identifier(prefix),
+            prefix: if prefix.is_empty() {
+                String::new()
+            } else {
+                identifier(prefix)
+            },
             types: HashMap::new(),
             constants: HashMap::new(),
             global_expressions: HashMap::new(),
@@ -44,6 +49,23 @@ impl<'s> Importer<'s> {
     /// block, whose snippet-side name is free.
     pub(crate) fn alias_type(&mut self, source: Handle<Type>, mapped: Handle<Type>) {
         self.types.insert(source, mapped);
+    }
+
+    /// Maps `source` onto an existing `dst` function instead of copying it.
+    /// Used for a library function whose canonical copy the composer
+    /// already imported — every stage's copy of it is that one function.
+    pub(crate) fn alias_function(&mut self, source: Handle<Function>, mapped: Handle<Function>) {
+        self.functions.insert(source, mapped);
+    }
+
+    /// The source-to-destination function handles imported so far —
+    /// every callee a function reached counts as imported too.
+    pub(crate) fn imported_functions(
+        &self,
+    ) -> impl Iterator<Item = (Handle<Function>, Handle<Function>)> + '_ {
+        self.functions
+            .iter()
+            .map(|(&source, &mapped)| (source, mapped))
     }
 
     pub(crate) fn ty(&mut self, dst: &mut Module, handle: Handle<Type>) -> Handle<Type> {
@@ -247,6 +269,9 @@ impl<'s> Importer<'s> {
     }
 
     fn renamed(&self, name: &str) -> String {
+        if self.prefix.is_empty() {
+            return name.to_owned();
+        }
         format!("{}_{name}", self.prefix)
     }
 }

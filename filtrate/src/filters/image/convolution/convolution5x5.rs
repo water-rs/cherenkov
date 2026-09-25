@@ -28,6 +28,9 @@ mod tests {
         k[12] = 1.0;
         let identity = Convolution5x5(k);
         assert_eq!(identity.params().len(), 25);
-        assert_eq!(crate::SpatialFilter::footprint(&identity), 2.0);
+        assert_eq!(
+            crate::SpatialFilter::footprint(&identity),
+            crate::Footprint::pixels(2.0)
+        );
     }
 }

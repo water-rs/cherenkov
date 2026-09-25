@@ -7,8 +7,7 @@ struct Params {
     center_y: f32,
 }
 
-fn apply(input: texture_2d<f32>, input_sampler: sampler, uv: vec2<f32>, params: Params) -> vec4<f32> {
-    let size = vec2<f32>(textureDimensions(input));
+fn apply(input: texture_2d<f32>, input_sampler: sampler, uv: vec2<f32>, size: vec2<f32>, params: Params) -> vec4<f32> {
     let amount = max(params.amount, 0.0);
     if amount <= 0.0001 {
         return textureSampleLevel(input, input_sampler, (floor(uv * size) + 0.5) / size, 0.0);

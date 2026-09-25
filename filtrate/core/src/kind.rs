@@ -61,7 +61,7 @@ pub enum FilterKind {
 /// what the first already spread.
 pub trait ChainFootprint<A: Filter, B: Filter> {
     /// The chain's footprint for the halves' parameters.
-    fn footprint(first: &A::Params, second: &B::Params) -> f32;
+    fn footprint(first: &A::Params, second: &B::Params) -> crate::Footprint;
 }
 
 impl<A, B> ChainFootprint<A, B> for (Color, Spatial)
@@ -69,7 +69,7 @@ where
     A: Filter<Kind = Color>,
     B: SpatialFilter,
 {
-    fn footprint(_first: &A::Params, second: &B::Params) -> f32 {
+    fn footprint(_first: &A::Params, second: &B::Params) -> crate::Footprint {
         B::footprint_of(second)
     }
 }
@@ -79,7 +79,7 @@ where
     A: SpatialFilter,
     B: Filter<Kind = Color>,
 {
-    fn footprint(first: &A::Params, _second: &B::Params) -> f32 {
+    fn footprint(first: &A::Params, _second: &B::Params) -> crate::Footprint {
         A::footprint_of(first)
     }
 }
@@ -89,7 +89,7 @@ where
     A: SpatialFilter,
     B: SpatialFilter,
 {
-    fn footprint(first: &A::Params, second: &B::Params) -> f32 {
+    fn footprint(first: &A::Params, second: &B::Params) -> crate::Footprint {
         A::footprint_of(first) + B::footprint_of(second)
     }
 }

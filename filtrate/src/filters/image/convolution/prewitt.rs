@@ -34,7 +34,10 @@ mod tests {
 
     #[test]
     fn prewitt_is_spatial_with_zero_params() {
-        assert_eq!(crate::SpatialFilter::footprint(&Prewitt), 1.0);
+        assert_eq!(
+            crate::SpatialFilter::footprint(&Prewitt),
+            crate::Footprint::pixels(1.0)
+        );
         assert_eq!(Prewitt.params().len(), 0);
     }
 }

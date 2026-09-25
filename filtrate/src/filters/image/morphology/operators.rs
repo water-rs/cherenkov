@@ -41,9 +41,18 @@ mod tests {
 
     #[test]
     fn morphology_filters_are_spatial_zero_param() {
-        assert_eq!(crate::SpatialFilter::footprint(&MorphologyMin), 1.0);
-        assert_eq!(crate::SpatialFilter::footprint(&MorphologyMax), 1.0);
-        assert_eq!(crate::SpatialFilter::footprint(&MorphologyGradient), 1.0);
+        assert_eq!(
+            crate::SpatialFilter::footprint(&MorphologyMin),
+            crate::Footprint::pixels(1.0)
+        );
+        assert_eq!(
+            crate::SpatialFilter::footprint(&MorphologyMax),
+            crate::Footprint::pixels(1.0)
+        );
+        assert_eq!(
+            crate::SpatialFilter::footprint(&MorphologyGradient),
+            crate::Footprint::pixels(1.0)
+        );
         assert_eq!(MorphologyMin.params().len(), 0);
         assert_eq!(MorphologyMax.params().len(), 0);
         assert_eq!(MorphologyGradient.params().len(), 0);

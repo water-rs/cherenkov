@@ -8,8 +8,7 @@ struct Params {
     softness: f32,
 }
 
-fn apply(input: texture_2d<f32>, input_point_sampler: sampler, uv: vec2<f32>, params: Params) -> vec4<f32> {
-    let size = vec2<f32>(textureDimensions(input));
+fn apply(input: texture_2d<f32>, input_point_sampler: sampler, uv: vec2<f32>, size: vec2<f32>, params: Params) -> vec4<f32> {
     let isotropic = size / min(size.x, size.y);
     let color = textureSampleLevel(input, input_point_sampler, uv, 0.0);
     let dist = distance(uv * isotropic, vec2<f32>(0.5) * isotropic);

@@ -13,7 +13,7 @@ fn mirror_repeat(v: f32) -> f32 {
     return select(tiled, 1.0 - tiled, odd_tile);
 }
 
-fn apply(input: texture_2d<f32>, input_sampler: sampler, uv: vec2<f32>, params: Params) -> vec4<f32> {
+fn apply(input: texture_2d<f32>, input_sampler: sampler, uv: vec2<f32>, size: vec2<f32>, params: Params) -> vec4<f32> {
     let tiled_uv = vec2<f32>(
         mirror_repeat(uv.x * max(params.repeat_x, 1.0)),
         mirror_repeat(uv.y * max(params.repeat_y, 1.0)),

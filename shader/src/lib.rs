@@ -24,8 +24,12 @@
 //!
 //! ```wgsl
 //! struct Params { radius: f32 }
-//! fn apply(input: texture_2d<f32>, input_sampler: sampler, uv: vec2<f32>, params: Params) -> vec4<f32> { /* … */ }
+//! fn apply(input: texture_2d<f32>, input_sampler: sampler, uv: vec2<f32>, size: vec2<f32>, params: Params) -> vec4<f32> { /* … */ }
 //! ```
+//!
+//! `size` is the extent of `input` in pixels, supplied by the executor —
+//! a spatial snippet must not call `textureDimensions` on `input` itself
+//! (auxiliary images and `shape` keep their own queries).
 //!
 //! The sampler argument declares its filter mode by name: `input_sampler`
 //! allows the executor to bind a filtering sampler, while
@@ -53,6 +57,15 @@
 //! result) are `vec4<f16>`, and subgroup variants that use subgroup
 //! operations. [`compose`] uses a declared variant wherever it matches the
 //! requested [`ComposeOptions`] and reports the variant each stage used.
+//!
+//! # Libraries
+//!
+//! A [`LibrarySource`] is a WGSL source of plain helper functions — not a
+//! stage — registered with a [`SnippetSource`]. The snippet calls the
+//! library's functions by name; the composer imports each referenced helper
+//! exactly once per composed module, deduplicated by library identity, and
+//! rejects name collisions between libraries and between a library and a
+//! snippet. A snippet's `f16` variant requires the library's `f16` source.
 //!
 //! # What the composer decides, and what it leaves to the executor
 //!
@@ -104,4 +117,4 @@ pub use emit::{msl, spirv, validate, wgsl};
 pub use errors::{ComposeError, EmitError, SnippetError};
 /// The naga version modules are built with; the same one wgpu 29 links.
 pub use naga;
-pub use parse::{SampleCount, Snippet, SnippetSource, Variant};
+pub use parse::{LibrarySource, SampleCount, Snippet, SnippetSource, Variant};

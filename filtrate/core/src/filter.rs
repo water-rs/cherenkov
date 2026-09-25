@@ -1,5 +1,7 @@
 //! The [`Filter`] trait, its kinds, and [`Chain`].
 
+use core::ops::Add;
+
 use crate::{
     ImageVisitor, ParamArray, SignalVisitor, StageCollector,
     kind::{self, ChainFootprint, Kind},
@@ -56,12 +58,67 @@ pub trait ColorFilter: Filter<Kind = kind::Color> {
     const LINEAR: bool;
 }
 
+/// A spatial filter's reach: an absolute component in pixels plus a
+/// component proportional to the input image's extent.
+///
+/// Filters whose reach scales with the image — warps expressed in
+/// normalized coordinates — carry it in `extent` instead of reporting an
+/// unbounded footprint; executors resolve the value against the actual
+/// input size with [`Footprint::resolve`]. Chains add both components: the
+/// second stage samples what the first already spread.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Footprint {
+    /// The reach in pixels, independent of the image size.
+    pub pixels: f32,
+    /// The reach as a fraction of the input's larger dimension.
+    pub extent: f32,
+}
+
+impl Footprint {
+    /// No reach: the stage reads only its own texel.
+    pub const ZERO: Self = Self::new(0.0, 0.0);
+
+    /// A footprint with both components.
+    #[must_use]
+    pub const fn new(pixels: f32, extent: f32) -> Self {
+        Self { pixels, extent }
+    }
+
+    /// A reach of `pixels` pixels, independent of the image size.
+    #[must_use]
+    pub const fn pixels(pixels: f32) -> Self {
+        Self::new(pixels, 0.0)
+    }
+
+    /// A reach of `extent` times the input's larger dimension.
+    #[must_use]
+    pub const fn extent(extent: f32) -> Self {
+        Self::new(0.0, extent)
+    }
+
+    /// The reach in pixels against an input of `(width, height)` pixels.
+    /// The `extent` component applies to the larger dimension — the bound
+    /// is axis-independent, and `extent` is measured against the image as a
+    /// whole.
+    #[must_use]
+    pub fn resolve(&self, (width, height): (f32, f32)) -> f32 {
+        self.extent * width.max(height) + self.pixels
+    }
+}
+
+impl Add for Footprint {
+    type Output = Self;
+
+    fn add(self, rhs: Self) -> Self {
+        Self::new(self.pixels + rhs.pixels, self.extent + rhs.extent)
+    }
+}
+
 /// A filter that samples its input around each pixel.
 pub trait SpatialFilter: Filter<Kind = kind::Spatial> {
-    /// The largest distance, in pixels along either axis, between an output
-    /// pixel and any input texel it reads, for the given parameters.
-    /// `f32::INFINITY` when the reach is unbounded or scales with the image
-    /// size (warps expressed in normalized coordinates, for example).
+    /// The filter's [`Footprint`] for the given parameters: the largest
+    /// distance between an output pixel and any input texel it reads, in
+    /// pixels plus a fraction of the image extent.
     ///
     /// Executors bound an animating filter by evaluating this at every
     /// parameter's largest magnitude over its animation track (see
@@ -69,10 +126,10 @@ pub trait SpatialFilter: Filter<Kind = kind::Spatial> {
     /// That bound is sound because implementations satisfy, for every
     /// parameter `p`: the footprint at `p` is at most the footprint at `|p|`,
     /// and the footprint does not decrease as a non-negative parameter grows.
-    fn footprint_of(params: &Self::Params) -> f32;
+    fn footprint_of(params: &Self::Params) -> Footprint;
 
     /// The footprint for the current parameters.
-    fn footprint(&self) -> f32 {
+    fn footprint(&self) -> Footprint {
         Self::footprint_of(&self.params())
     }
 }
@@ -133,7 +190,7 @@ where
     A::Kind: Kind<Then<B::Kind> = kind::Spatial>,
     (A::Kind, B::Kind): ChainFootprint<A, B>,
 {
-    fn footprint_of(params: &Self::Params) -> f32 {
+    fn footprint_of(params: &Self::Params) -> Footprint {
         <(A::Kind, B::Kind) as ChainFootprint<A, B>>::footprint(&params.0, &params.1)
     }
 }
@@ -218,8 +275,8 @@ mod tests {
         }
     }
     impl SpatialFilter for Spread {
-        fn footprint_of(params: &[f32; 2]) -> f32 {
-            params[0]
+        fn footprint_of(params: &[f32; 2]) -> Footprint {
+            Footprint::new(params[0], params[1] / 4.0)
         }
     }
 
@@ -236,9 +293,14 @@ mod tests {
 
     #[test]
     fn a_chain_with_a_spatial_half_is_spatial_and_adds_footprints() {
-        assert_eq!(Tint.then(Spread).footprint(), 2.0);
-        assert_eq!(Spread.then(Tint).footprint(), 2.0);
-        assert_eq!(Spread.then(Tint).then(Spread).footprint(), 4.0);
+        assert_eq!(Tint.then(Spread).footprint(), Footprint::new(2.0, 0.75));
+        assert_eq!(Spread.then(Tint).footprint(), Footprint::new(2.0, 0.75));
+        assert_eq!(
+            Spread.then(Tint).then(Spread).footprint(),
+            Footprint::new(4.0, 1.5)
+        );
+        // Resolving adds the extent fraction of the larger dimension.
+        assert_eq!(Spread.footprint().resolve((100.0, 200.0)), 152.0);
     }
 
     #[test]

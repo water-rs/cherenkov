@@ -9,8 +9,8 @@
 use std::collections::HashMap;
 
 use naga::{
-    ArraySize, Block, DiagnosticFilterNode, Expression, Function, Handle, Module, Span, Statement,
-    Type, TypeInner,
+    ArraySize, Block, Expression, Function, Handle, Module, Span, Statement, Type, TypeInner,
+    diagnostic_filter::DiagnosticFilterNode,
 };
 
 /// Imports items from one source module into a destination module,

@@ -724,12 +724,13 @@ impl Composer {
             });
         }
         let spatial_apply = self.stages[spatial].apply;
+        let folded_name = self.name("folded_apply");
         let folded_apply = rewrite::fold_prefix(
             &self.module.functions[spatial_apply],
             0,
             prefix_function,
             &extra,
-            self.name("folded_apply"),
+            folded_name,
         );
         let folded_apply = self.module.functions.append(folded_apply, GENERATED);
 

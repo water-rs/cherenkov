@@ -227,9 +227,9 @@ pub fn fold_prefix(
         replaced: HashMap::new(),
     };
     for (handle, expression) in spatial.expressions.iter() {
-        let rebuilt = map_expression(expression, |operand| rebuild.operand(operand));
+        let copy = map_expression(expression, |operand| rebuild.operand(operand));
         let span = spatial.expressions.get_span(handle);
-        let new = folded.expressions.append(rebuilt, span);
+        let new = folded.expressions.append(copy, span);
         rebuild.map.push(new);
         if input.is_some_and(|input| parse::samples_input(expression, input)) {
             let call = folded

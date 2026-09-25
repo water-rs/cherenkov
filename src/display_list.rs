@@ -216,8 +216,91 @@ impl Dirty {
 
 /// Recorded content: an ordered list of commands.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "DisplayListData")]
 pub struct DisplayList {
     commands: Vec<Command>,
+}
+
+/// A display list's commands before their scopes are validated: the form it
+/// deserializes from, so that captured scenes cannot bypass the invariants.
+#[derive(Deserialize)]
+struct DisplayListData {
+    commands: Vec<Command>,
+}
+
+/// Why a display list's scope structure is malformed.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ScopeError {
+    /// The list holds more commands than a `u32` index can address.
+    #[error("a display list holds at most u32::MAX commands, got {len}")]
+    TooLong {
+        /// Number of commands.
+        len: usize,
+    },
+    /// An `End` closes no open scope.
+    #[error("command {index} ends a scope that was never opened")]
+    UnmatchedEnd {
+        /// Index of the `End`.
+        index: usize,
+    },
+    /// A `Begin*` records the wrong index for its `End`.
+    #[error("the scope opened at {begin} records its end at {recorded}, but it ends at {actual}")]
+    WrongEnd {
+        /// Index of the `Begin*`.
+        begin: usize,
+        /// The end index the command records.
+        recorded: u32,
+        /// Where its `End` actually is.
+        actual: usize,
+    },
+    /// A scope is never closed.
+    #[error("the scope opened at {begin} is never closed")]
+    Unclosed {
+        /// Index of the `Begin*`.
+        begin: usize,
+    },
+}
+
+impl TryFrom<DisplayListData> for DisplayList {
+    type Error = ScopeError;
+
+    fn try_from(data: DisplayListData) -> Result<Self, Self::Error> {
+        let commands = data.commands;
+        if u32::try_from(commands.len()).is_err() {
+            return Err(ScopeError::TooLong {
+                len: commands.len(),
+            });
+        }
+        let mut open: Vec<(usize, u32)> = Vec::new();
+        for (index, command) in commands.iter().enumerate() {
+            match command {
+                Command::BeginClip { end, .. }
+                | Command::BeginTransform { end, .. }
+                | Command::BeginGroup { end, .. } => open.push((index, *end)),
+                Command::End => {
+                    let (begin, recorded) =
+                        open.pop().ok_or(ScopeError::UnmatchedEnd { index })?;
+                    if recorded as usize != index {
+                        return Err(ScopeError::WrongEnd {
+                            begin,
+                            recorded,
+                            actual: index,
+                        });
+                    }
+                }
+                Command::Fill { .. }
+                | Command::Stroke { .. }
+                | Command::Shadow { .. }
+                | Command::Glyphs { .. }
+                | Command::Image { .. }
+                | Command::Picture { .. } => {}
+            }
+        }
+        match open.pop() {
+            Some((begin, _)) => Err(ScopeError::Unclosed { begin }),
+            None => Ok(Self { commands }),
+        }
+    }
 }
 
 impl DisplayList {
@@ -347,5 +430,39 @@ impl Picture {
     #[must_use]
     pub fn display_list(&self) -> &DisplayList {
         &self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{DisplayList, ScopeError};
+
+    fn scopes(commands: serde_json::Value) -> Result<DisplayList, String> {
+        serde_json::from_value(json!({ "commands": commands })).map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn deserialization_rejects_a_scope_whose_recorded_end_is_wrong() {
+        let group = json!({ "opacity": 1.0, "blend": "Normal", "blend_space": "Linear", "filter": null });
+        let error = scopes(json!([
+            { "BeginGroup": { "group": group, "end": 0 } },
+            "End"
+        ]))
+        .expect_err("the recorded end points at the Begin itself");
+        assert!(
+            error.contains(&ScopeError::WrongEnd { begin: 0, recorded: 0, actual: 1 }.to_string()),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn deserialization_rejects_unbalanced_scopes() {
+        let unmatched = scopes(json!(["End"])).expect_err("an End with no scope");
+        assert!(
+            unmatched.contains(&ScopeError::UnmatchedEnd { index: 0 }.to_string()),
+            "{unmatched}"
+        );
     }
 }

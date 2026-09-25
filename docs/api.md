@@ -207,8 +207,8 @@ pub enum Semantic<'a> {
 
 impl<T: kurbo::Shape + 'static> Shape for T { /* … */ }
 impl Shape for ContinuousRect { /* Semantic::Continuous */ }
-impl Shape for Oval { /* Semantic::Ellipse. kurbo's Shape has no ellipse downcast, so
-                         kurbo::Ellipse still draws, but as a path */ }
+// kurbo's Shape has no ellipse downcast, so the blanket impl recognises
+// kurbo::Ellipse by type and gives it Semantic::Ellipse; no separate oval type.
 ```
 
 - **Custom shapes are open.** `waterui-shape` merges here, and Lyon is removed.
@@ -219,7 +219,7 @@ impl Shape for Oval { /* Semantic::Ellipse. kurbo's Shape has no ellipse downcas
 
 ```rust
 pub enum Paint {
-    Solid(DynColor),
+    Solid(WorkingColor),             // colours convert to the working space when recorded
     Linear(LinearGradient), Radial(RadialGradient), Sweep(SweepGradient),
     Mesh(MeshGradient),              // Hydrolysis panics on this today
     Image(ImagePaint),               // pattern: image, transform, extend modes, sampling
@@ -252,10 +252,10 @@ Shaping stays outside the engine: parley, which covers complex scripts (Arabic, 
 ```rust
 c.text(&layout, origin);          // parley adapter: TextLayout wraps parley::Layout<Paint>
 c.glyphs(&GlyphRun {
-    font: &font, size: 17.0, coords: &variation_coords,
-    glyphs: &glyphs,              // id, position, and an optional per-glyph transform (vertical CJK)
-    paint: paint.into(), style: GlyphStyle::Fill,
-});
+    font, size: 17.0, coords: variation_coords,
+    glyphs,                       // id, position, and an optional per-glyph transform (vertical CJK)
+    style: GlyphStyle::Fill,
+}, paint);                        // paint is a separate parameter, so it can be bound to a signal
 ```
 
 - **Large scripts.** CJK text can touch thousands of distinct glyphs per screen.

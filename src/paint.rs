@@ -203,9 +203,71 @@ gradient_builders!(LinearGradient, Linear);
 gradient_builders!(RadialGradient, Radial);
 gradient_builders!(SweepGradient, Sweep);
 
+/// A mesh gradient's fields before its grid is validated: the form it
+/// deserializes from, so that captured scenes cannot bypass the invariants.
+#[derive(Deserialize)]
+struct MeshGradientData {
+    columns: u32,
+    rows: u32,
+    points: Vec<Point>,
+    colors: Vec<WorkingColor>,
+}
+
+/// Why a mesh gradient's grid is malformed.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum MeshGradientError {
+    /// The grid has no patch.
+    #[error("a mesh gradient needs at least one patch, got {columns} x {rows}")]
+    Empty {
+        /// Patches per row.
+        columns: u32,
+        /// Patches per column.
+        rows: u32,
+    },
+    /// A per-vertex list does not hold one entry per grid vertex.
+    #[error("a mesh gradient needs one {list} per grid vertex: {vertices} vertices, {len} entries")]
+    VertexCount {
+        /// Which list: points or colours.
+        list: &'static str,
+        /// Vertices in the grid.
+        vertices: usize,
+        /// Entries in the list.
+        len: usize,
+    },
+}
+
+impl TryFrom<MeshGradientData> for MeshGradient {
+    type Error = MeshGradientError;
+
+    fn try_from(data: MeshGradientData) -> Result<Self, Self::Error> {
+        let MeshGradientData {
+            columns,
+            rows,
+            points,
+            colors,
+        } = data;
+        if columns == 0 || rows == 0 {
+            return Err(MeshGradientError::Empty { columns, rows });
+        }
+        let vertices = (columns as usize + 1) * (rows as usize + 1);
+        for (list, len) in [("point", points.len()), ("colour", colors.len())] {
+            if len != vertices {
+                return Err(MeshGradientError::VertexCount { list, vertices, len });
+            }
+        }
+        Ok(Self {
+            columns,
+            rows,
+            points,
+            colors,
+        })
+    }
+}
+
 /// A mesh gradient: a grid of `columns` × `rows` patches whose corner points
 /// carry colours, interpolated across each patch.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "MeshGradientData")]
 pub struct MeshGradient {
     columns: u32,
     rows: u32,
@@ -223,19 +285,13 @@ impl MeshGradient {
     /// entry per vertex.
     #[must_use]
     pub fn new(columns: u32, rows: u32, points: Vec<Point>, colors: Vec<WorkingColor>) -> Self {
-        assert!(
-            columns > 0 && rows > 0,
-            "a mesh gradient needs at least one patch"
-        );
-        let vertices = (columns as usize + 1) * (rows as usize + 1);
-        assert_eq!(points.len(), vertices, "one point per grid vertex");
-        assert_eq!(colors.len(), vertices, "one colour per grid vertex");
-        Self {
+        Self::try_from(MeshGradientData {
             columns,
             rows,
             points,
             colors,
-        }
+        })
+        .unwrap_or_else(|error| panic!("{error}"))
     }
 
     /// Patches per row.
@@ -271,7 +327,7 @@ impl From<MeshGradient> for Paint {
 
 /// An image registered with the engine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ImageId(pub u64);
+pub struct ImageId(u64);
 
 /// How an image is sampled.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -306,7 +362,7 @@ impl From<ImagePattern> for Paint {
 
 /// A user shader registered with the engine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ShaderId(pub u64);
+pub struct ShaderId(u64);
 
 /// A user shader used as a paint, with its uniform values.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

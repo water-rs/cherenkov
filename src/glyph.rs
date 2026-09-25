@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 /// A font registered with the engine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct FontId(pub u64);
+pub struct FontId(u64);
 
 /// One positioned glyph.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]

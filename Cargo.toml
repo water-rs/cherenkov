@@ -12,6 +12,7 @@ color = { version = "0.3.3", features = ["serde"] }
 kurbo = { version = "0.13.1", features = ["serde"] }
 nami-core = { version = "0.3.3", features = ["kurbo"] }
 serde = { version = "1", features = ["derive", "rc"] }
+thiserror = "2"
 
 [dev-dependencies]
 nami = { version = "0.11.1", default-features = false, features = ["std", "kurbo"] }
@@ -41,5 +42,5 @@ workspace = true
 # water-rs/nami#27. Move this pin to the merge commit on nami's dev, then to a
 # released version.
 [patch.crates-io]
-nami = { git = "https://github.com/water-rs/nami", rev = "5b8f09538818bf74f3cfe8faf6a5332c270b6dd6" }
-nami-core = { git = "https://github.com/water-rs/nami", rev = "5b8f09538818bf74f3cfe8faf6a5332c270b6dd6" }
+nami = { git = "https://github.com/water-rs/nami", rev = "6908aac816de14ee5aff23bfffd7d2b109d08fea" }
+nami-core = { git = "https://github.com/water-rs/nami", rev = "6908aac816de14ee5aff23bfffd7d2b109d08fea" }

@@ -27,11 +27,12 @@ pub use crate::color::{
     WorkingColor,
 };
 pub use crate::display_list::{
-    Command, Dirty, DisplayList, Operand, OperandKind, Picture, Slot, SlotUpdate,
+    Command, Dirty, DisplayList, Operand, OperandKind, Picture, ScopeError, Slot, SlotUpdate,
 };
 pub use crate::glyph::{FontId, Glyph, GlyphRun, GlyphStyle};
 pub use crate::paint::{
-    ColorStop, Extend, ImageId, ImagePattern, Interpolation, LinearGradient, MeshGradient, Paint,
+    ColorStop, Extend, ImageId, ImagePattern, Interpolation, LinearGradient, MeshGradient,
+    MeshGradientError, Paint,
     RadialGradient, Sampling, ShaderId, ShaderPaint, SweepGradient,
 };
 pub use crate::record::{Content, ContentChange, Draw, Fixed, Live, Recorder, StaticRecorder};

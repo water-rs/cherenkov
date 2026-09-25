@@ -96,7 +96,7 @@ pub enum BlendSpace {
 
 /// A filter chain registered with the engine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct FilterId(pub u64);
+pub struct FilterId(u64);
 
 /// The isolation of a group: its opacity, how it blends and its filter.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]

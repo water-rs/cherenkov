@@ -9,7 +9,7 @@ publish = false
 
 [workspace]
 resolver = "3"
-members = ["."]
+members = [".", "shader"]
 
 [workspace.package]
 edition = "2024"

@@ -1,0 +1,418 @@
+//! A small evaluator for the subset of naga IR the tests' snippets use, so a
+//! composed function can be checked against the sequential application of
+//! the snippets it composes.
+
+use std::collections::HashMap;
+
+use cherenkov_shader::naga::{
+    Arena, BinaryOperator, Block, Expression, Function, Handle, Literal, LocalVariable,
+    MathFunction, Module, SampleLevel, ScalarKind, Statement, TypeInner, UnaryOperator,
+};
+
+/// A runtime value.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Value {
+    Float(f32),
+    Vector(Vec<f32>),
+    Int(i64),
+    Bool(bool),
+    Struct(Vec<Value>),
+    Texture(usize),
+    Sampler,
+    Pointer(Handle<LocalVariable>),
+}
+
+impl Value {
+    pub fn vec(components: &[f32]) -> Self {
+        Self::Vector(components.to_vec())
+    }
+
+    pub fn components(&self) -> Vec<f32> {
+        match self {
+            Self::Float(value) => vec![*value],
+            Self::Vector(values) => values.clone(),
+            other => panic!("not numeric: {other:?}"),
+        }
+    }
+}
+
+/// A texture: colour as a function of the sample coordinate.
+pub type Texture<'t> = Box<dyn Fn([f32; 2]) -> [f32; 4] + 't>;
+
+pub struct Eval<'m> {
+    module: &'m Module,
+    textures: Vec<Texture<'m>>,
+}
+
+struct Frame<'f> {
+    function: &'f Function,
+    args: Vec<Value>,
+    values: HashMap<Handle<Expression>, Value>,
+    locals: HashMap<Handle<LocalVariable>, Value>,
+}
+
+impl<'m> Eval<'m> {
+    pub const fn new(module: &'m Module) -> Self {
+        Self {
+            module,
+            textures: Vec::new(),
+        }
+    }
+
+    pub fn texture(&mut self, texture: Texture<'m>) -> Value {
+        self.textures.push(texture);
+        Value::Texture(self.textures.len() - 1)
+    }
+
+    pub fn function(&self, name: &str) -> Handle<Function> {
+        self.module
+            .functions
+            .iter()
+            .find(|(_, function)| function.name.as_deref() == Some(name))
+            .map(|(handle, _)| handle)
+            .unwrap_or_else(|| panic!("no function `{name}`"))
+    }
+
+    pub fn call(&self, function: Handle<Function>, args: Vec<Value>) -> Value {
+        let function = &self.module.functions[function];
+        let mut frame = Frame {
+            function,
+            args,
+            values: HashMap::new(),
+            locals: HashMap::new(),
+        };
+        for (handle, local) in function.local_variables.iter() {
+            let value = local.init.map_or_else(
+                || self.zero(local.ty),
+                |init| self.expression(&function.expressions, init, &mut frame),
+            );
+            frame.locals.insert(handle, value);
+        }
+        self.block(&function.body, &mut frame)
+            .expect("the function returns a value")
+    }
+
+    fn block(&self, block: &Block, frame: &mut Frame<'_>) -> Option<Value> {
+        for statement in block.iter() {
+            match statement {
+                Statement::Emit(range) => {
+                    for handle in range.clone() {
+                        let value = self.expression(&frame.function.expressions, handle, frame);
+                        frame.values.insert(handle, value);
+                    }
+                }
+                Statement::Block(inner) => {
+                    if let Some(value) = self.block(inner, frame) {
+                        return Some(value);
+                    }
+                }
+                Statement::If {
+                    condition,
+                    accept,
+                    reject,
+                } => {
+                    let taken =
+                        match self.expression(&frame.function.expressions, *condition, frame) {
+                            Value::Bool(value) => value,
+                            other => panic!("condition is {other:?}"),
+                        };
+                    let branch = if taken { accept } else { reject };
+                    if let Some(value) = self.block(branch, frame) {
+                        return Some(value);
+                    }
+                }
+                Statement::Store { pointer, value } => {
+                    let Value::Pointer(local) =
+                        self.expression(&frame.function.expressions, *pointer, frame)
+                    else {
+                        panic!("store through a non-local pointer");
+                    };
+                    let value = self.expression(&frame.function.expressions, *value, frame);
+                    frame.locals.insert(local, value);
+                }
+                Statement::Call {
+                    function,
+                    arguments,
+                    result,
+                } => {
+                    let args = arguments
+                        .iter()
+                        .map(|&argument| {
+                            self.expression(&frame.function.expressions, argument, frame)
+                        })
+                        .collect();
+                    let value = self.call(*function, args);
+                    if let Some(result) = result {
+                        frame.values.insert(*result, value);
+                    }
+                }
+                Statement::Return { value } => {
+                    return value
+                        .map(|value| self.expression(&frame.function.expressions, value, frame));
+                }
+                other => panic!("the evaluator does not support {other:?}"),
+            }
+        }
+        None
+    }
+
+    fn global(&self, handle: Handle<Expression>) -> Value {
+        let mut frame = Frame {
+            function: self.module.functions.iter().next().expect("a function").1,
+            args: Vec::new(),
+            values: HashMap::new(),
+            locals: HashMap::new(),
+        };
+        self.expression(&self.module.global_expressions, handle, &mut frame)
+    }
+
+    fn zero(&self, ty: Handle<cherenkov_shader::naga::Type>) -> Value {
+        match &self.module.types[ty].inner {
+            TypeInner::Scalar(scalar) if scalar.kind == ScalarKind::Float => Value::Float(0.0),
+            TypeInner::Scalar(scalar) if scalar.kind == ScalarKind::Bool => Value::Bool(false),
+            TypeInner::Scalar(_) => Value::Int(0),
+            TypeInner::Vector { size, .. } => Value::Vector(vec![0.0; *size as usize]),
+            TypeInner::Struct { members, .. } => {
+                Value::Struct(members.iter().map(|member| self.zero(member.ty)).collect())
+            }
+            other => panic!("no zero value for {other:?}"),
+        }
+    }
+
+    #[allow(clippy::too_many_lines, reason = "one arm per supported expression")]
+    fn expression(
+        &self,
+        arena: &Arena<Expression>,
+        handle: Handle<Expression>,
+        frame: &mut Frame<'_>,
+    ) -> Value {
+        if std::ptr::eq(arena, &frame.function.expressions) {
+            if let Some(value) = frame.values.get(&handle) {
+                return value.clone();
+            }
+        }
+        let sub = |operand: Handle<Expression>, frame: &mut Frame<'_>| {
+            self.expression(arena, operand, frame)
+        };
+        match arena[handle] {
+            Expression::Literal(literal) => match literal {
+                Literal::F32(value) => Value::Float(value),
+                Literal::F16(value) => Value::Float(value.to_f32()),
+                #[allow(clippy::cast_possible_truncation, reason = "test values are small")]
+                Literal::AbstractFloat(value) | Literal::F64(value) => Value::Float(value as f32),
+                Literal::I32(value) => Value::Int(i64::from(value)),
+                Literal::U32(value) => Value::Int(i64::from(value)),
+                Literal::AbstractInt(value) | Literal::I64(value) => Value::Int(value),
+                #[allow(clippy::cast_possible_wrap, reason = "test values are small")]
+                Literal::U64(value) => Value::Int(value as i64),
+                Literal::Bool(value) => Value::Bool(value),
+            },
+            Expression::Constant(constant) => self.global(self.module.constants[constant].init),
+            Expression::ZeroValue(ty) => self.zero(ty),
+            Expression::Compose { ty, ref components } => {
+                let values: Vec<Value> = components
+                    .iter()
+                    .map(|&component| sub(component, frame))
+                    .collect();
+                match self.module.types[ty].inner {
+                    TypeInner::Struct { .. } => Value::Struct(values),
+                    _ => Value::Vector(values.iter().flat_map(Value::components).collect()),
+                }
+            }
+            Expression::AccessIndex { base, index } => match sub(base, frame) {
+                Value::Vector(values) => Value::Float(values[index as usize]),
+                Value::Struct(fields) => fields[index as usize].clone(),
+                other => panic!("cannot index {other:?}"),
+            },
+            Expression::Splat { size, value } => {
+                let Value::Float(value) = sub(value, frame) else {
+                    panic!("splat of a non-scalar");
+                };
+                Value::Vector(vec![value; size as usize])
+            }
+            Expression::Swizzle {
+                size,
+                vector,
+                pattern,
+            } => {
+                let values = sub(vector, frame).components();
+                Value::Vector(
+                    pattern[..size as usize]
+                        .iter()
+                        .map(|&component| values[component as usize])
+                        .collect(),
+                )
+            }
+            Expression::FunctionArgument(index) => frame.args[index as usize].clone(),
+            Expression::LocalVariable(local) => Value::Pointer(local),
+            Expression::Load { pointer } => {
+                let Value::Pointer(local) = sub(pointer, frame) else {
+                    panic!("load through a non-local pointer");
+                };
+                frame.locals[&local].clone()
+            }
+            Expression::ImageSample {
+                image,
+                coordinate,
+                level,
+                ..
+            } => {
+                assert!(
+                    matches!(
+                        level,
+                        SampleLevel::Exact(_) | SampleLevel::Zero | SampleLevel::Auto
+                    ),
+                    "unsupported sample level"
+                );
+                let Value::Texture(texture) = sub(image, frame) else {
+                    panic!("sampling a non-texture");
+                };
+                let uv = sub(coordinate, frame).components();
+                Value::vec(&(self.textures[texture])([uv[0], uv[1]]))
+            }
+            Expression::Unary { op, expr } => match (op, sub(expr, frame)) {
+                (UnaryOperator::Negate, value) => numeric(
+                    &value,
+                    value
+                        .components()
+                        .iter()
+                        .map(|component| -component)
+                        .collect(),
+                ),
+                (UnaryOperator::LogicalNot, Value::Bool(value)) => Value::Bool(!value),
+                (op, value) => panic!("unsupported {op:?} on {value:?}"),
+            },
+            Expression::Binary { op, left, right } => {
+                let left = sub(left, frame);
+                let right = sub(right, frame);
+                binary(op, &left, &right)
+            }
+            Expression::Select {
+                condition,
+                accept,
+                reject,
+            } => match sub(condition, frame) {
+                Value::Bool(true) => sub(accept, frame),
+                Value::Bool(false) => sub(reject, frame),
+                other => panic!("select on {other:?}"),
+            },
+            Expression::Math {
+                fun,
+                arg,
+                arg1,
+                arg2,
+                ..
+            } => {
+                let first = sub(arg, frame);
+                let second = arg1.map(|handle| sub(handle, frame));
+                let third = arg2.map(|handle| sub(handle, frame));
+                math(fun, &first, second.as_ref(), third.as_ref())
+            }
+            Expression::As {
+                expr,
+                kind: ScalarKind::Float,
+                convert,
+            } => {
+                let value = sub(expr, frame);
+                match convert {
+                    Some(2) => numeric(
+                        &value,
+                        value
+                            .components()
+                            .iter()
+                            .map(|&component| half::f16::from_f32(component).to_f32())
+                            .collect(),
+                    ),
+                    _ => value,
+                }
+            }
+            Expression::CallResult(_) => panic!("call result read before its call"),
+            ref other => panic!("the evaluator does not support {other:?}"),
+        }
+    }
+}
+
+/// A value of `like`'s shape holding `components`.
+fn numeric(like: &Value, components: Vec<f32>) -> Value {
+    match like {
+        Value::Float(_) => Value::Float(components[0]),
+        _ => Value::Vector(components),
+    }
+}
+
+fn zip(left: &Value, right: &Value, combine: impl Fn(f32, f32) -> f32) -> Value {
+    let lefts = left.components();
+    let rights = right.components();
+    let count = lefts.len().max(rights.len());
+    let at = |values: &[f32], index: usize| {
+        if values.len() == 1 {
+            values[0]
+        } else {
+            values[index]
+        }
+    };
+    let components: Vec<f32> = (0..count)
+        .map(|index| combine(at(&lefts, index), at(&rights, index)))
+        .collect();
+    if count == 1 {
+        Value::Float(components[0])
+    } else {
+        Value::Vector(components)
+    }
+}
+
+fn binary(op: BinaryOperator, left: &Value, right: &Value) -> Value {
+    match op {
+        BinaryOperator::Add => zip(left, right, |lhs, rhs| lhs + rhs),
+        BinaryOperator::Subtract => zip(left, right, |lhs, rhs| lhs - rhs),
+        BinaryOperator::Multiply => zip(left, right, |lhs, rhs| lhs * rhs),
+        BinaryOperator::Divide => zip(left, right, |lhs, rhs| lhs / rhs),
+        BinaryOperator::Less => Value::Bool(left.components()[0] < right.components()[0]),
+        BinaryOperator::Greater => Value::Bool(left.components()[0] > right.components()[0]),
+        other => panic!("the evaluator does not support {other:?}"),
+    }
+}
+
+fn math(fun: MathFunction, first: &Value, second: Option<&Value>, third: Option<&Value>) -> Value {
+    let unary =
+        |apply: fn(f32) -> f32| numeric(first, first.components().into_iter().map(apply).collect());
+    match fun {
+        MathFunction::Abs => unary(f32::abs),
+        MathFunction::Sqrt => unary(f32::sqrt),
+        MathFunction::Floor => unary(f32::floor),
+        MathFunction::Fract => unary(f32::fract),
+        MathFunction::Saturate => unary(|value| value.clamp(0.0, 1.0)),
+        MathFunction::Min => zip(first, second.expect("min takes two"), f32::min),
+        MathFunction::Max => zip(first, second.expect("max takes two"), f32::max),
+        MathFunction::Pow => zip(first, second.expect("pow takes two"), f32::powf),
+        MathFunction::Clamp => {
+            let low = zip(first, second.expect("clamp takes three"), f32::max);
+            zip(&low, third.expect("clamp takes three"), f32::min)
+        }
+        MathFunction::Mix => {
+            let end = second.expect("mix takes three");
+            let weight = third.expect("mix takes three");
+            let difference = zip(end, first, |to, from| to - from);
+            let scaled = zip(&difference, weight, |delta, amount| delta * amount);
+            zip(first, &scaled, |from, step| from + step)
+        }
+        MathFunction::Dot => {
+            let products = zip(first, second.expect("dot takes two"), |lhs, rhs| lhs * rhs);
+            Value::Float(products.components().iter().sum())
+        }
+        other => panic!("the evaluator does not support {other:?}"),
+    }
+}
+
+/// Asserts two numeric values agree within `tolerance` per component.
+pub fn assert_close(actual: &Value, expected: &Value, tolerance: f32) {
+    let actuals = actual.components();
+    let expecteds = expected.components();
+    assert_eq!(actuals.len(), expecteds.len(), "{actual:?} vs {expected:?}");
+    for (got, want) in actuals.iter().zip(&expecteds) {
+        assert!(
+            (got - want).abs() <= tolerance,
+            "{actual:?} vs {expected:?}"
+        );
+    }
+}

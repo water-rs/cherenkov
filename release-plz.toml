@@ -6,9 +6,15 @@ release_always = true
 git_tag_enable = true
 git_release_enable = true
 changelog_update = true
+# Releases are opt-in: every workspace package defaults to not released, so
+# `cherenkov` and future `cherenkov-*` crates are never picked up
+# accidentally. filtrate's three packages opt in below.
+release = false
 
 [[package]]
 name = "filtrate"
+release = true
+changelog_path = "filtrate/CHANGELOG.md"
 # cargo-semver-checks' feature heuristic enables `webgl`, which is
 # intentionally a compile_error! off-wasm; PR semver coverage stays in
 # release-preflight.yml (default-features).
@@ -18,8 +24,12 @@ git_release_name = "v{{ version }}"
 
 [[package]]
 name = "filtrate-core"
+release = true
+changelog_path = "filtrate/core/CHANGELOG.md"
 git_tag_name = "core-v{{ version }}"
 
 [[package]]
 name = "filtrate-derive"
+release = true
+changelog_path = "filtrate/derive/CHANGELOG.md"
 git_tag_name = "derive-v{{ version }}"

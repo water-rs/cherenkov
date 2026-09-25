@@ -9,7 +9,7 @@ publish = false
 
 [workspace]
 resolver = "3"
-members = ["."]
+members = [".", "filtrate", "filtrate/core", "filtrate/derive"]
 
 [workspace.package]
 edition = "2024"

@@ -10,7 +10,10 @@ Sections marked **Proposal** are not yet agreed; everything else records a decis
 - **Semantic primitives are first-class.** A rounded rectangle, a shadow or a glyph run reaches the engine as itself, so its fast path survives. Nothing is lowered to a path at the API boundary.
 - **Type safety wherever an invariant is static.** Colour spaces, image storage formats, backend capabilities, thread affinity and paired state are types. Facts that change at run time, such as a display's HDR headroom, stay values.
 - **Memory is part of the design.** Shared `Picture`s, typed and compressed image storage, and GPU/CPU budgets with system memory-pressure handling are part of the API.
-- **Invisible optimizations are verified invisible.** Layer caching and damage tracking must produce bit-identical output when disabled. Promotion to system-compositor planes is compared against in-engine composition with a perceptual tolerance.
+- **Invisible optimizations are verified invisible.** Layer caching and damage tracking must produce bit-identical output when disabled. This is exact by construction, not by tolerance:
+  - Canonical f16 rounding and materialization points are part of the semantics, so a cached and an uncached render round at the same places.
+  - Scroll offsets and integer layer translations snap to device pixels as part of the semantics.
+  - Content under a fractional transform is re-rasterized rather than resampled from a cache. Promotion to system-compositor planes is compared against in-engine composition with a perceptual tolerance.
 - **No runtime fallback.** A backend is chosen deliberately, at build time or once at process start by capability. A failure is an error.
 
 ## Crates and backends
@@ -212,7 +215,7 @@ impl Shape for ContinuousRect { /* Semantic::Continuous */ }
 ```
 
 - **Custom shapes are open.** `waterui-shape` merges here, and Lyon is removed.
-- **The semantic vocabulary is closed.** It is the set of fast paths.
+- **The semantic vocabulary is closed.** It is the set of fast paths. Besides the shapes above, it includes `Border` (a stroked rounded or continuous rectangle of a given width) and `InnerShadow`. These are the most common UI elements after the rounded rectangle, and otherwise they would fall to the general path route.
 - **Proposal: native path type.** If profiling shows `BezPath`'s f64 storage is a bottleneck for large paths, add an engine-native f32 path type that also implements `Shape`. `BezPath` stays accepted.
 
 ## Paint and stroke
@@ -231,6 +234,7 @@ pub enum Paint {
 - **Gradients.** Stops are colours in any space. The interpolation space is a gradient property; the default is the working space, and an sRGB-encoded option exists for web compatibility.
 - **Stroke** is `kurbo::Stroke`: width, joins, caps, miter limit, dashes.
 - **Shader paints** replace `ShaderSurface`, `FlowingGradient` and `ViewEffect`. They inherit the shape, clip, antialiasing and on-chip blending, and they receive time and any signal-bound uniforms.
+- **Shader paints follow a portable contract.** Inputs are explicit: coordinates, time, uniforms, declared resources and sampling footprints. Gradients are passed explicitly, and nothing relies on implicit fragment derivatives or on fragment-stage built-ins. This lets the same paint run in a fragment shader, a tile interpreter or a compute shader, so the paint contract never pre-selects the raster architecture.
 
 ## Colour
 
@@ -268,6 +272,7 @@ c.glyphs(&GlyphRun {
 - **Coverage correction.** Blending coverage in linear space makes text, especially thin CJK strokes, look lighter than users expect. Text coverage therefore gets a perceptual contrast and gamma correction, applied only to glyph coverage and never to geometry.
 - **Font data.** Fonts are memory-mapped and never copied, which matters for Noto CJK-sized fallback chains. On `Banded`, glyph subsets are pre-rasterized into flash at build time.
 - **Variable fonts** take normalized coordinates on the run.
+- **Glyph realization is an experimental axis** (coverage atlas, direct curve evaluation, the path route, or distance fields for validated sizes), decided by the device farm. The CPU exact-area glyph rasterizer is both the correctness reference and the CPU backends' route. COLRv1 glyphs are a paint graph: every realization handles their transforms, gradients and compositing, and cached colour glyphs key on palette and foreground.
 - **Test coverage.** The correctness corpus (#3) includes Latin, CJK (horizontal and vertical), Arabic, Hebrew, Devanagari, Thai, emoji ZWJ sequences and COLRv1 glyphs.
 
 ## Effects and filters
@@ -298,6 +303,7 @@ The composer produces a normalized form: segment boundaries plus the possible ma
   - **Backdrops.** A `BackdropGroup` defines one explicit capture point in painter order. Only members that sample the backdrop at that point can share it; an effect at a different paint-order position has a different backdrop. The group resolves its parent once, over the members' bounds plus the footprint, and the capture may be stored sparsely, so two small distant members do not force a capture and blur of the empty space between them. The spatial chain runs once, at reduced resolution where the blur contract permits. Each member samples the shared result with its own effect in its composite shader.
   - **Parameters** are value slots, which may be bound to nami signals. Changing one updates a uniform only; nothing is recompiled or re-recorded.
   - **Compilation** happens when a chain is first registered, and the driver pipeline cache is persisted.
+  - **Apple tile passes.** naga cannot express imageblocks, tile render pipelines or raster order groups. On the GPU backend's Apple route, tile and imageblock passes are therefore thin native MSL scaffolding around function bodies emitted by the shared naga composer. Every shared function still comes from the composer; only the tile-pass declarations are native.
   - **CPU backends** apply pushed-down colour functions per span and run spatial kernels with footprint-wide aprons between bands.
 
 ```rust

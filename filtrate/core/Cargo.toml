@@ -1,0 +1,17 @@
+[package]
+name = "filtrate-core"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.95"
+authors = ["Lexo Liu"]
+readme = "README.md"
+repository = "https://github.com/water-rs/filtrate"
+description = "Stable abstraction layer for GPU filter pipelines: pure-data Filter trait, Chain, and parameter composition primitives."
+keywords = ["gpu", "filter", "pipeline", "trait", "abstraction"]
+categories = ["graphics", "rendering", "no-std"]
+license = "Apache-2.0 OR MIT"
+
+[lints]
+workspace = true
+
+[dependencies]

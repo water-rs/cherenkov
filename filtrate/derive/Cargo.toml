@@ -1,0 +1,26 @@
+[package]
+name = "filtrate-derive"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+authors = ["Lexo Liu"]
+readme = "README.md"
+repository = "https://github.com/water-rs/filtrate"
+description = "Procedural macros for the filtrate GPU filter library."
+keywords = ["gpu", "filter", "derive", "proc-macro"]
+categories = ["graphics", "rendering"]
+license = "Apache-2.0 OR MIT"
+
+[lib]
+proc-macro = true
+
+[lints]
+workspace = true
+
+[dependencies]
+syn = { version = "3", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"
+proc-macro-crate = "3"
+
+[dev-dependencies]

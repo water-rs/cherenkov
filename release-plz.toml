@@ -33,3 +33,9 @@ name = "filtrate-derive"
 release = true
 changelog_path = "filtrate/derive/CHANGELOG.md"
 git_tag_name = "derive-v{{ version }}"
+
+[[package]]
+name = "cherenkov-shader"
+release = true
+changelog_path = "shader/CHANGELOG.md"
+git_tag_name = "shader-v{{ version }}"

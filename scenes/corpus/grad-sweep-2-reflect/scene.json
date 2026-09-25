@@ -1,0 +1,93 @@
+{
+  "width": 128,
+  "height": 128,
+  "working_space": "linear-display-p3",
+  "clear": {
+    "space": "srgb",
+    "components": [
+      0.95,
+      0.95,
+      0.95,
+      1.0
+    ]
+  },
+  "features": [
+    {
+      "feature": "fill"
+    },
+    {
+      "feature": "sweep-gradient"
+    },
+    {
+      "feature": "interpolation-space",
+      "value": "srgb"
+    }
+  ],
+  "root": {
+    "transform": [
+      1.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0
+    ],
+    "opacity": 1.0,
+    "blend": "normal",
+    "items": [
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rect": {
+                "x0": 8.0,
+                "y0": 8.0,
+                "x1": 120.0,
+                "y1": 120.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "sweep": {
+                "center": {
+                  "x": 64.0,
+                  "y": 64.0
+                },
+                "start_angle": 0.0,
+                "end_angle": 5.026548245743669,
+                "stops": [
+                  {
+                    "offset": 0.0,
+                    "color": {
+                      "space": "srgb",
+                      "components": [
+                        1.0,
+                        0.0,
+                        0.0,
+                        1.0
+                      ]
+                    }
+                  },
+                  {
+                    "offset": 1.0,
+                    "color": {
+                      "space": "srgb",
+                      "components": [
+                        0.0,
+                        0.0,
+                        1.0,
+                        1.0
+                      ]
+                    }
+                  }
+                ],
+                "extend": "reflect",
+                "interpolation": "srgb"
+              }
+            }
+          }
+        }
+      }
+    ]
+  }
+}

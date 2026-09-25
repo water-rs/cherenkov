@@ -1,0 +1,71 @@
+{
+  "width": 320,
+  "height": 160,
+  "working_space": "linear-display-p3",
+  "clear": {
+    "space": "srgb",
+    "components": [
+      0.95,
+      0.95,
+      0.95,
+      1.0
+    ]
+  },
+  "features": [
+    {
+      "feature": "glyphs"
+    }
+  ],
+  "root": {
+    "transform": [
+      1.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0
+    ],
+    "opacity": 1.0,
+    "blend": "normal",
+    "items": [
+      {
+        "draw": {
+          "glyphs": {
+            "font": "04dd974b8bf7e440fd8927b6af23764194287cee28d15acda268c5e0a51091f5",
+            "font_index": 0,
+            "size": 64.0,
+            "normalized_coords": [],
+            "glyphs": [
+              {
+                "id": 1,
+                "x": 12.0,
+                "y": 92.832
+              },
+              {
+                "id": 25,
+                "x": 48.032,
+                "y": 92.832
+              },
+              {
+                "id": 61,
+                "x": 84.064,
+                "y": 92.832
+              }
+            ],
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.1,
+                  0.1,
+                  0.12,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      }
+    ]
+  }
+}

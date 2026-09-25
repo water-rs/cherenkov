@@ -107,3 +107,62 @@ jobs:
       - name: Show the toolchain this job builds with
         run: rustc --version && cargo --version
       - run: cargo check --locked --workspace
+
+  bench-corpus:
+    name: Bench / corpus on CPU adapters
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # skia-safe's prebuilt Linux binaries link the system freetype and
+      # fontconfig, which the runner does not ship.
+      - name: Skia link dependencies
+        run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev libfreetype-dev
+      - run: cargo build --locked --release -p cherenkov-bench --features vello-cpu,skia
+      - name: Render the corpus on CPU adapters
+        run: |
+          set -euo pipefail
+          for engine in vello-cpu skia-cpu; do
+            ./target/release/cherenkov-bench render --engine "$engine" \
+              --corpus scenes/corpus --out-dir "out/$engine"
+          done
+          python3 - <<'PY'
+          import glob, json, sys
+          files = glob.glob('out/*/render-*.json')
+          # Every corpus scene produces a report (metrics or unsupported).
+          scenes = {json.load(open(f))['scene'] for f in files}
+          corpus = {p.split('/')[-2] for p in glob.glob('scenes/corpus/*/scene.json')}
+          missing = corpus - scenes
+          assert not missing, f'scenes without a report: {missing}'
+          measured = [f for f in files if 'metrics' in json.load(open(f))]
+          assert measured, 'no metrics JSON produced'
+          for f in files:
+              d = json.load(open(f))
+              assert 'info' in d and d['info']['crate_version'], f'{f} lacks provenance'
+          print(f'{len(files)} reports ({len(measured)} measured) across {len(scenes)} scenes')
+          PY
+
+  bench-android:
+    name: Bench / aarch64-linux-android build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          target: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - name: Install the Android NDK
+        run: |
+          curl -fsSL -o /tmp/ndk.zip https://dl.google.com/android/repository/android-ndk-r27d-linux.zip
+          unzip -q /tmp/ndk.zip -d "$HOME"
+          echo "ANDROID_NDK_HOME=$HOME/android-ndk-r27d" >> "$GITHUB_ENV"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+      - name: Build cherenkov-bench for aarch64-linux-android
+        run: |
+          cargo ndk --target aarch64-linux-android --platform 30 \
+            build --release -p cherenkov-bench \
+            --features vello-classic,vello-hybrid,skia
+          ls -l target/aarch64-linux-android/release/cherenkov-bench

@@ -1,0 +1,192 @@
+// Copyright 2026 the Cherenkov Authors
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+
+use crate::{
+    BlendMode, Color, Draw, FillRule, GlyphRun, Item, Layer, Paint, ResourceHash, Sampling, Scene,
+    Shape, StrokeStyle,
+};
+use kurbo::{Affine, Rect};
+
+/// Author a [`Scene`] in Rust. Obtained from [`Scene::builder`].
+///
+/// Draw methods operate on the scene's root layer; nested layers are built
+/// with [`SceneBuilder::layer`], which passes a [`LayerBuilder`] to a closure.
+///
+/// ```
+/// use cherenkov_scene::{Color, Shape};
+/// let scene = cherenkov_scene::Scene::builder(64, 64)
+///     .clear(Color::srgb(1.0, 1.0, 1.0))
+///     .fill(Shape::rect(4.0, 4.0, 56.0, 56.0), Color::srgb(1.0, 0.0, 0.0).into())
+///     .build();
+/// assert_eq!(scene.root.items.len(), 1);
+/// ```
+pub struct SceneBuilder {
+    scene: Scene,
+}
+
+impl SceneBuilder {
+    /// Start a scene of `width`×`height` pixels.
+    #[must_use]
+    pub fn new(width: u32, height: u32) -> Self {
+        Self {
+            scene: Scene::new(width, height, Color::srgb(0.0, 0.0, 0.0)),
+        }
+    }
+
+    /// Set the clear colour.
+    #[must_use]
+    pub const fn clear(mut self, color: Color) -> Self {
+        self.scene.clear = color;
+        self
+    }
+
+    /// A [`LayerBuilder`] over the root layer.
+    pub const fn root(&mut self) -> LayerBuilder<'_> {
+        LayerBuilder {
+            layer: &mut self.scene.root,
+        }
+    }
+
+    /// Finish the scene, computing its feature set.
+    #[must_use]
+    pub fn build(mut self) -> Scene {
+        self.scene.compute_features();
+        self.scene
+    }
+}
+
+macro_rules! root_forward {
+    ($( fn $name:ident ( $( $arg:ident : $ty:ty ),* ) ;)*) => {$(
+        /// Forward to the same method on the root [`LayerBuilder`].
+        #[must_use]
+        pub fn $name(mut self, $( $arg : $ty ),*) -> Self {
+            self.root().$name($($arg),*);
+            self
+        }
+    )*};
+}
+
+// Some forwarded methods (e.g. `clip`) can't be `const` — they assign
+// values with drop glue through a mutable reference.
+#[allow(clippy::missing_const_for_fn)]
+impl SceneBuilder {
+    root_forward! {
+        fn transform(transform: Affine);
+        fn clip(shape: Shape);
+        fn opacity(opacity: f64);
+        fn blend(blend: BlendMode);
+        fn fill(shape: Shape, paint: Paint);
+        fn fill_rule(shape: Shape, rule: FillRule, paint: Paint);
+        fn stroke(shape: Shape, stroke: StrokeStyle, paint: Paint);
+        fn shadow(shape: Shape, blur_sigma: f64, offset: [f64; 2], color: Color);
+        fn glyphs(run: GlyphRun);
+        fn image(image: ResourceHash, dst: Rect, sampling: Sampling);
+        fn layer(f: impl FnOnce(&mut LayerBuilder));
+    }
+}
+
+/// A builder for a [`Layer`] and its ordered items.
+pub struct LayerBuilder<'a> {
+    layer: &'a mut Layer,
+}
+
+impl LayerBuilder<'_> {
+    /// Set the layer transform.
+    pub const fn transform(&mut self, transform: Affine) -> &mut Self {
+        self.layer.transform = transform;
+        self
+    }
+
+    /// Set the layer clip shape.
+    pub fn clip(&mut self, shape: Shape) -> &mut Self {
+        self.layer.clip = Some(shape);
+        self
+    }
+
+    /// Set the group opacity.
+    pub const fn opacity(&mut self, opacity: f64) -> &mut Self {
+        self.layer.opacity = opacity;
+        self
+    }
+
+    /// Set the blend mode.
+    pub const fn blend(&mut self, blend: BlendMode) -> &mut Self {
+        self.layer.blend = blend;
+        self
+    }
+
+    /// Add a child layer and build it in `f`.
+    pub fn layer(&mut self, f: impl FnOnce(&mut LayerBuilder)) -> &mut Self {
+        let mut layer = Layer::default();
+        f(&mut LayerBuilder { layer: &mut layer });
+        self.layer.items.push(Item::Layer(layer));
+        self
+    }
+
+    /// Push a [`Draw::Fill`] item.
+    pub fn fill(&mut self, shape: Shape, paint: Paint) -> &mut Self {
+        self.push(Draw::Fill {
+            shape,
+            rule: FillRule::NonZero,
+            paint,
+        })
+    }
+
+    /// Push a [`Draw::Fill`] item with an explicit fill rule.
+    pub fn fill_rule(&mut self, shape: Shape, rule: FillRule, paint: Paint) -> &mut Self {
+        self.push(Draw::Fill { shape, rule, paint })
+    }
+
+    /// Push a [`Draw::Stroke`] item.
+    pub fn stroke(&mut self, shape: Shape, stroke: StrokeStyle, paint: Paint) -> &mut Self {
+        self.push(Draw::Stroke {
+            shape,
+            stroke,
+            paint,
+        })
+    }
+
+    /// Push a [`Draw::Shadow`] item.
+    pub fn shadow(
+        &mut self,
+        shape: Shape,
+        blur_sigma: f64,
+        offset: [f64; 2],
+        color: Color,
+    ) -> &mut Self {
+        self.push(Draw::Shadow {
+            shape,
+            blur_sigma,
+            offset,
+            color,
+        })
+    }
+
+    /// Push a [`Draw::Glyphs`] item.
+    pub fn glyphs(&mut self, run: GlyphRun) -> &mut Self {
+        self.push(Draw::Glyphs(run))
+    }
+
+    /// Push a [`Draw::Image`] item.
+    pub fn image(&mut self, image: ResourceHash, dst: Rect, sampling: Sampling) -> &mut Self {
+        self.push(Draw::Image {
+            image,
+            dst,
+            sampling,
+        })
+    }
+
+    /// Push a raw draw command.
+    pub fn push(&mut self, draw: Draw) -> &mut Self {
+        self.layer.items.push(Item::Draw(draw));
+        self
+    }
+}
+
+impl Scene {
+    /// Start building a scene of `width`×`height`.
+    #[must_use]
+    pub fn builder(width: u32, height: u32) -> SceneBuilder {
+        SceneBuilder::new(width, height)
+    }
+}

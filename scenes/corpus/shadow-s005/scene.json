@@ -1,0 +1,106 @@
+{
+  "width": 128,
+  "height": 128,
+  "working_space": "linear-display-p3",
+  "clear": {
+    "space": "srgb",
+    "components": [
+      0.1,
+      0.1,
+      0.12,
+      1.0
+    ]
+  },
+  "features": [
+    {
+      "feature": "fill"
+    },
+    {
+      "feature": "shadow"
+    }
+  ],
+  "root": {
+    "transform": [
+      1.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0
+    ],
+    "opacity": 1.0,
+    "blend": "normal",
+    "items": [
+      {
+        "draw": {
+          "shadow": {
+            "shape": {
+              "rounded-rect": {
+                "rect": {
+                  "x0": 32.0,
+                  "y0": 32.0,
+                  "x1": 96.0,
+                  "y1": 96.0
+                },
+                "radii": {
+                  "top_left": 12.0,
+                  "top_right": 12.0,
+                  "bottom_right": 12.0,
+                  "bottom_left": 12.0
+                }
+              }
+            },
+            "blur_sigma": 5.0,
+            "offset": [
+              0.0,
+              0.0
+            ],
+            "color": {
+              "space": "srgb",
+              "components": [
+                0.0,
+                0.0,
+                0.0,
+                0.8
+              ]
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rounded-rect": {
+                "rect": {
+                  "x0": 32.0,
+                  "y0": 32.0,
+                  "x1": 96.0,
+                  "y1": 96.0
+                },
+                "radii": {
+                  "top_left": 12.0,
+                  "top_right": 12.0,
+                  "bottom_right": 12.0,
+                  "bottom_left": 12.0
+                }
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.95,
+                  0.9,
+                  0.3,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      }
+    ]
+  }
+}

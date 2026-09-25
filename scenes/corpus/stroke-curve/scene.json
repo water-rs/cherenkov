@@ -1,0 +1,75 @@
+{
+  "width": 128,
+  "height": 128,
+  "working_space": "linear-display-p3",
+  "clear": {
+    "space": "srgb",
+    "components": [
+      0.95,
+      0.95,
+      0.95,
+      1.0
+    ]
+  },
+  "features": [
+    {
+      "feature": "stroke"
+    }
+  ],
+  "root": {
+    "transform": [
+      1.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0
+    ],
+    "opacity": 1.0,
+    "blend": "normal",
+    "items": [
+      {
+        "draw": {
+          "stroke": {
+            "shape": {
+              "rounded-rect": {
+                "rect": {
+                  "x0": 16.0,
+                  "y0": 16.0,
+                  "x1": 112.0,
+                  "y1": 112.0
+                },
+                "radii": {
+                  "top_left": 24.0,
+                  "top_right": 24.0,
+                  "bottom_right": 24.0,
+                  "bottom_left": 24.0
+                }
+              }
+            },
+            "stroke": {
+              "width": 5.0,
+              "join": "Miter",
+              "miter_limit": 4.0,
+              "start_cap": "Butt",
+              "end_cap": "Butt",
+              "dash_pattern": [],
+              "dash_offset": 0.0
+            },
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.1,
+                  0.5,
+                  0.3,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      }
+    ]
+  }
+}

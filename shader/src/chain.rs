@@ -179,7 +179,6 @@ impl Composition {
     }
 
     /// The validator capabilities the module needs.
-    #[must_use]
     pub const fn capabilities(&self) -> Capabilities {
         self.capabilities
     }
@@ -202,7 +201,6 @@ impl Composition {
 
     /// The module, its capabilities and the pieces, for an executor that adds
     /// entry points and re-validates.
-    #[must_use]
     pub fn into_parts(self) -> (Module, Capabilities, Vec<Piece>) {
         (self.module, self.capabilities, self.pieces)
     }
@@ -470,28 +468,36 @@ impl Composer {
         inputs: &Inputs,
     ) -> Option<Handle<Expression>> {
         let params_ty = self.stages[stage].params_ty?;
-        let params = self.stages[stage].params.clone();
         let constants = self.stages[stage].constants.clone();
-        let mut components = Vec::with_capacity(params.len());
-        for param in 0..params.len() {
-            let component = match constants[param] {
-                Some(value) => self.constant(builder, value),
-                None => {
-                    let base = inputs
-                        .params
-                        .expect("a dynamic parameter implies a params block");
-                    builder.expression(Expression::AccessIndex {
-                        base,
-                        index: inputs.members[&(stage, param)],
-                    })
-                }
-            };
-            components.push(component);
+        let mut components = Vec::with_capacity(constants.len());
+        for (param, constant) in constants.into_iter().enumerate() {
+            components.push(self.param_component(builder, stage, param, constant, inputs));
         }
         Some(builder.expression(Expression::Compose {
             ty: params_ty,
             components,
         }))
+    }
+
+    /// One member of a stage's `Params`: its constant, or its block member.
+    fn param_component(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        stage: usize,
+        param: usize,
+        constant: Option<ParamValue>,
+        inputs: &Inputs,
+    ) -> Handle<Expression> {
+        if let Some(value) = constant {
+            return self.constant(builder, value);
+        }
+        let base = inputs
+            .params
+            .expect("a dynamic parameter implies a params block");
+        builder.expression(Expression::AccessIndex {
+            base,
+            index: inputs.members[&(stage, param)],
+        })
     }
 
     fn constant(&mut self, builder: &mut FunctionBuilder, value: ParamValue) -> Handle<Expression> {
@@ -565,7 +571,7 @@ impl Composer {
 
     /// Declares the params block and working-space arguments, in that order.
     fn trailing_inputs(
-        &mut self,
+        &self,
         builder: &mut FunctionBuilder,
         args: &mut Vec<SegmentArg>,
         block: &UniformBlock,

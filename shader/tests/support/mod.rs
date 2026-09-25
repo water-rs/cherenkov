@@ -93,7 +93,7 @@ impl<'m> Eval<'m> {
     }
 
     fn block(&self, block: &Block, frame: &mut Frame<'_>) -> Option<Value> {
-        for statement in block.iter() {
+        for statement in block {
             match statement {
                 Statement::Emit(range) => {
                     for handle in range.clone() {

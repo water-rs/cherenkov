@@ -12,6 +12,10 @@ use crate::{import::GENERATED, parse};
 
 /// Rebuilds `expression` with every expression operand passed through `map`.
 /// Handles into other arenas (types, constants, functions) are kept.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one arm per naga expression variant; the match stays exhaustive so a new variant fails to compile"
+)]
 pub fn map_expression(
     expression: &Expression,
     mut map: impl FnMut(Handle<Expression>) -> Handle<Expression>,
@@ -401,16 +405,7 @@ impl Rebuild {
                 argument,
                 result,
             } => Statement::SubgroupGather {
-                mode: match mode {
-                    GatherMode::BroadcastFirst => GatherMode::BroadcastFirst,
-                    GatherMode::Broadcast(index) => GatherMode::Broadcast(op(index)),
-                    GatherMode::Shuffle(index) => GatherMode::Shuffle(op(index)),
-                    GatherMode::ShuffleDown(delta) => GatherMode::ShuffleDown(op(delta)),
-                    GatherMode::ShuffleUp(delta) => GatherMode::ShuffleUp(op(delta)),
-                    GatherMode::ShuffleXor(mask) => GatherMode::ShuffleXor(op(mask)),
-                    GatherMode::QuadBroadcast(index) => GatherMode::QuadBroadcast(op(index)),
-                    GatherMode::QuadSwap(direction) => GatherMode::QuadSwap(direction),
-                },
+                mode: gather_mode(mode, op),
                 argument: op(argument),
                 result: self.defined(result),
             },
@@ -438,5 +433,21 @@ impl Rebuild {
                 unreachable!("snippet parsing rejects {statement:?}")
             }
         }
+    }
+}
+
+fn gather_mode(
+    mode: GatherMode,
+    op: impl Fn(Handle<Expression>) -> Handle<Expression>,
+) -> GatherMode {
+    match mode {
+        GatherMode::BroadcastFirst => GatherMode::BroadcastFirst,
+        GatherMode::Broadcast(index) => GatherMode::Broadcast(op(index)),
+        GatherMode::Shuffle(index) => GatherMode::Shuffle(op(index)),
+        GatherMode::ShuffleDown(delta) => GatherMode::ShuffleDown(op(delta)),
+        GatherMode::ShuffleUp(delta) => GatherMode::ShuffleUp(op(delta)),
+        GatherMode::ShuffleXor(mask) => GatherMode::ShuffleXor(op(mask)),
+        GatherMode::QuadBroadcast(index) => GatherMode::QuadBroadcast(op(index)),
+        GatherMode::QuadSwap(direction) => GatherMode::QuadSwap(direction),
     }
 }

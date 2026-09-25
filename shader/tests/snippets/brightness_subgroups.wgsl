@@ -1,5 +1,3 @@
-enable subgroups;
-
 struct Params {
     amount: f32,
 }

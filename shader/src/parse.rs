@@ -479,7 +479,7 @@ const fn precision_name(precision: Precision) -> &'static str {
     }
 }
 
-pub fn texture_2d() -> TypeInner {
+pub const fn texture_2d() -> TypeInner {
     TypeInner::Image {
         dim: ImageDimension::D2,
         arrayed: false,
@@ -519,7 +519,7 @@ fn check_constructs(function: &Function, subgroups: bool) -> Result<(), &'static
 }
 
 fn check_block(block: &Block, subgroups: bool) -> Result<(), &'static str> {
-    for statement in block.iter() {
+    for statement in block {
         match statement {
             Statement::Block(inner) => check_block(inner, subgroups)?,
             Statement::If { accept, reject, .. } => {
@@ -610,7 +610,7 @@ struct SampleCounter<'f> {
 
 impl SampleCounter<'_> {
     fn block(&mut self, block: &Block) {
-        for statement in block.iter() {
+        for statement in block {
             match statement {
                 Statement::Emit(range) => {
                     for handle in range.clone() {

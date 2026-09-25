@@ -10,7 +10,10 @@ Sections marked **Proposal** are not yet agreed; everything else records a decis
 - **Semantic primitives are first-class.** A rounded rectangle, a shadow or a glyph run reaches the engine as itself, so its fast path survives. Nothing is lowered to a path at the API boundary.
 - **Type safety wherever an invariant is static.** Colour spaces, image storage formats, backend capabilities, thread affinity and paired state are types. Facts that change at run time, such as a display's HDR headroom, stay values.
 - **Memory is part of the design.** Shared `Picture`s, typed and compressed image storage, and GPU/CPU budgets with system memory-pressure handling are part of the API.
-- **Invisible optimizations are verified invisible.** Layer caching and damage tracking must produce bit-identical output when disabled. Promotion to system-compositor planes is compared against in-engine composition with a perceptual tolerance.
+- **Invisible optimizations are verified invisible.** Layer caching and damage tracking must produce bit-identical output when disabled. This is exact by construction, not by tolerance:
+  - Canonical f16 rounding and materialization points are part of the semantics, so a cached and an uncached render round at the same places.
+  - Scroll offsets and integer layer translations snap to device pixels as part of the semantics.
+  - Content under a fractional transform is re-rasterized rather than resampled from a cache. Promotion to system-compositor planes is compared against in-engine composition with a perceptual tolerance.
 - **No runtime fallback.** A backend is chosen deliberately, at build time or once at process start by capability. A failure is an error.
 
 ## Crates and backends
@@ -35,7 +38,7 @@ Capabilities are traits implemented by backend types, so using a missing capabil
 
 Recorded content (`Picture`, `Content`) is backend-independent. Components such as math, chart, svg and map never name a backend. Only the host names one.
 
-On the native Android backend, the host picks `Gpu` or `Raster` once at process start by querying Vulkan capabilities: the floor is `VK_EXT_rasterization_order_attachment_access` or `VK_KHR_dynamic_rendering_local_read`, plus f16. Apple needs no selection, because every iOS 26 and macOS 26 device meets the floor.
+On the native Android backend, the host picks `Gpu` or `Raster` once at process start by querying Vulkan capabilities: the floor is `VK_EXT_rasterization_order_attachment_access` or `VK_KHR_dynamic_rendering_local_read`, plus f16. These two are different synchronization architectures. Ordered attachment access orders overlapping fragments implicitly; local read needs explicit by-region dependencies between overlapping work. They are not interchangeable implementations of the same design. Apple needs no selection: every iOS 26 device and every Apple silicon Mac running macOS 26 meets the floor. macOS 26 also still runs on some Intel Macs, which are outside the floor.
 
 ## Threading
 
@@ -207,19 +210,19 @@ pub enum Semantic<'a> {
 
 impl<T: kurbo::Shape + 'static> Shape for T { /* … */ }
 impl Shape for ContinuousRect { /* Semantic::Continuous */ }
-impl Shape for Oval { /* Semantic::Ellipse. kurbo's Shape has no ellipse downcast, so
-                         kurbo::Ellipse still draws, but as a path */ }
+// kurbo's Shape has no ellipse downcast, so the blanket impl recognises
+// kurbo::Ellipse by type and gives it Semantic::Ellipse; no separate oval type.
 ```
 
 - **Custom shapes are open.** `waterui-shape` merges here, and Lyon is removed.
-- **The semantic vocabulary is closed.** It is the set of fast paths.
+- **The semantic vocabulary is closed.** It is the set of fast paths. Besides the shapes above, it includes `Border` (a stroked rounded or continuous rectangle of a given width) and `InnerShadow`. These are the most common UI elements after the rounded rectangle, and otherwise they would fall to the general path route.
 - **Proposal: native path type.** If profiling shows `BezPath`'s f64 storage is a bottleneck for large paths, add an engine-native f32 path type that also implements `Shape`. `BezPath` stays accepted.
 
 ## Paint and stroke
 
 ```rust
 pub enum Paint {
-    Solid(DynColor),
+    Solid(WorkingColor),             // colours convert to the working space when recorded
     Linear(LinearGradient), Radial(RadialGradient), Sweep(SweepGradient),
     Mesh(MeshGradient),              // Hydrolysis panics on this today
     Image(ImagePaint),               // pattern: image, transform, extend modes, sampling
@@ -231,6 +234,7 @@ pub enum Paint {
 - **Gradients.** Stops are colours in any space. The interpolation space is a gradient property; the default is the working space, and an sRGB-encoded option exists for web compatibility.
 - **Stroke** is `kurbo::Stroke`: width, joins, caps, miter limit, dashes.
 - **Shader paints** replace `ShaderSurface`, `FlowingGradient` and `ViewEffect`. They inherit the shape, clip, antialiasing and on-chip blending, and they receive time and any signal-bound uniforms.
+- **Shader paints follow a portable contract.** Inputs are explicit: coordinates, time, uniforms, declared resources and sampling footprints. Gradients are passed explicitly, and nothing relies on implicit fragment derivatives or on fragment-stage built-ins. This lets the same paint run in a fragment shader, a tile interpreter or a compute shader, so the paint contract never pre-selects the raster architecture.
 
 ## Colour
 
@@ -252,10 +256,10 @@ Shaping stays outside the engine: parley, which covers complex scripts (Arabic, 
 ```rust
 c.text(&layout, origin);          // parley adapter: TextLayout wraps parley::Layout<Paint>
 c.glyphs(&GlyphRun {
-    font: &font, size: 17.0, coords: &variation_coords,
-    glyphs: &glyphs,              // id, position, and an optional per-glyph transform (vertical CJK)
-    paint: paint.into(), style: GlyphStyle::Fill,
-});
+    font, size: 17.0, coords: variation_coords,
+    glyphs,                       // id, position, and an optional per-glyph transform (vertical CJK)
+    style: GlyphStyle::Fill,
+}, paint);                        // paint is a separate parameter, so it can be bound to a signal
 ```
 
 - **Large scripts.** CJK text can touch thousands of distinct glyphs per screen.
@@ -268,6 +272,7 @@ c.glyphs(&GlyphRun {
 - **Coverage correction.** Blending coverage in linear space makes text, especially thin CJK strokes, look lighter than users expect. Text coverage therefore gets a perceptual contrast and gamma correction, applied only to glyph coverage and never to geometry.
 - **Font data.** Fonts are memory-mapped and never copied, which matters for Noto CJK-sized fallback chains. On `Banded`, glyph subsets are pre-rasterized into flash at build time.
 - **Variable fonts** take normalized coordinates on the run.
+- **Glyph realization is an experimental axis** (coverage atlas, direct curve evaluation, the path route, or distance fields for validated sizes), decided by the device farm. The CPU exact-area glyph rasterizer is both the correctness reference and the CPU backends' route. COLRv1 glyphs are a paint graph: every realization handles their transforms, gradients and compositing, and cached colour glyphs key on palette and foreground.
 - **Test coverage.** The correctness corpus (#3) includes Latin, CJK (horizontal and vertical), Arabic, Hebrew, Devanagari, Thai, emoji ZWJ sequences and COLRv1 glyphs.
 
 ## Effects and filters
@@ -281,9 +286,9 @@ A shared **shader composer** crate, `cherenkov-shader` in `shader/`, is built on
 ### Contract
 
 1. **Stages are functions.** A colour stage is `fn(color, params) -> color`. A spatial stage is `fn(sampler, uv, params) -> color`.
-2. **Filter kinds as types.** `ColorFilter` has a `LINEAR` property for filters that commute with src-over and can therefore be pushed down into each primitive's shading. `SpatialFilter` samples neighbours. `Chain<A, B>` is a `ColorFilter` exactly when both halves are.
+2. **Filter kinds as types.** `ColorFilter` has a `LINEAR` property. It is necessary, but not sufficient, for pushing the filter down into each primitive's shading. `LINEAR` means a linear map on premultiplied RGBA with an identity alpha row and zero offset. Only such a map commutes with src-over, \(M(a + (1-\alpha_a)b) = Ma + (1-\alpha_a)Mb\). Saturation, hue rotation, grayscale, sepia and multiplicative brightness qualify. Anything that touches alpha, or that adds an offset (an additive brightness, for example), is not `LINEAR`: pushed down, the offset would be applied once per primitive instead of once per group. Push-down is legal only when the operation is `LINEAR` **and** every composition inside the group is premultiplied source-over, with no intermediate clamping, un-premultiplying or rounding boundary. So eligibility is a property of the operation *and* its composition context, and the engine checks both. The correctness corpus includes overlapping translucent primitives inside filtered groups to catch violations. `SpatialFilter` samples neighbours. `Chain<A, B>` is a `ColorFilter` exactly when both halves are.
 3. **Footprint.** `SpatialFilter::footprint(&self) -> f32` is the maximum sample radius for the current parameters; while a parameter animates, it is the maximum over its animation track. It sizes intermediates, damage expansion, backdrop regions and band or tile aprons.
-4. **Working-space constants.** Luma and saturation coefficients come from the working space (linear P3) as engine-provided constants.
+4. **Working-space constants and operating space.** Luma and saturation coefficients come from the working space (linear P3) as engine-provided constants. A filter also declares the colour space it operates in. For web compatibility, CSS filter functions operate in sRGB, so the engine converts around them. Extended values (negative components, values above 1) stay extended.
 5. **Shape input.** A filter can declare that it needs the clip shape's signed distance field or its mask.
 6. **CPU kernels.** A filter may provide a SIMD CPU kernel, which makes it `Runs<Raster>` and `Runs<Banded<_>>`. The oracle cross-checks every kernel against its shader.
 
@@ -295,9 +300,10 @@ The composer produces a normalized form: segment boundaries plus the possible ma
 - **Cherenkov** chooses by where the filter sits:
   - **Colour filters.** A `LINEAR` filter is pushed down into each primitive's fragment shading before blending, so it needs no group at all. Any other colour filter is applied when its group resolves in tile memory, using on-chip programmable blending, so nothing goes back to memory. Nesting spills to a texture only when it exceeds on-chip capacity.
   - **Spatial filters.** Layer content is rendered to a transient intermediate covering the content bounds plus the footprint, and processed in fragment passes, which keeps lossless framebuffer compression. Large blurs downsample first. The final pass applies the colour suffix and blends into the parent. Keeping small-footprint spatial filters on chip with Apple tile shaders is a farm axis, not a guarantee.
-  - **Backdrops.** A `BackdropGroup` resolves its parent once, when its first member is composited, over the union of member bounds plus the footprint. It runs its spatial chain once at reduced resolution. Each member samples the shared result with its own effect in its composite shader.
+  - **Backdrops.** A `BackdropGroup` defines one explicit capture point in painter order. Only members that sample the backdrop at that point can share it; an effect at a different paint-order position has a different backdrop. The group resolves its parent once, over the members' bounds plus the footprint, and the capture may be stored sparsely, so two small distant members do not force a capture and blur of the empty space between them. The spatial chain runs once, at reduced resolution where the blur contract permits. Each member samples the shared result with its own effect in its composite shader.
   - **Parameters** are value slots, which may be bound to nami signals. Changing one updates a uniform only; nothing is recompiled or re-recorded.
   - **Compilation** happens when a chain is first registered, and the driver pipeline cache is persisted.
+  - **Apple tile passes.** naga cannot express imageblocks, tile render pipelines or raster order groups. On the GPU backend's Apple route, tile and imageblock passes are therefore thin native MSL scaffolding around function bodies emitted by the shared naga composer. Every shared function still comes from the composer; only the tile-pass declarations are native.
   - **CPU backends** apply pushed-down colour functions per span and run spatial kernels with footprint-wide aprons between bands.
 
 ```rust

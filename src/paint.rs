@@ -252,7 +252,11 @@ impl TryFrom<MeshGradientData> for MeshGradient {
         let vertices = (columns as usize + 1) * (rows as usize + 1);
         for (list, len) in [("point", points.len()), ("colour", colors.len())] {
             if len != vertices {
-                return Err(MeshGradientError::VertexCount { list, vertices, len });
+                return Err(MeshGradientError::VertexCount {
+                    list,
+                    vertices,
+                    len,
+                });
             }
         }
         Ok(Self {

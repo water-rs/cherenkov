@@ -32,8 +32,7 @@ pub use crate::display_list::{
 pub use crate::glyph::{FontId, Glyph, GlyphRun, GlyphStyle};
 pub use crate::paint::{
     ColorStop, Extend, ImageId, ImagePattern, Interpolation, LinearGradient, MeshGradient,
-    MeshGradientError, Paint,
-    RadialGradient, Sampling, ShaderId, ShaderPaint, SweepGradient,
+    MeshGradientError, Paint, RadialGradient, Sampling, ShaderId, ShaderPaint, SweepGradient,
 };
 pub use crate::record::{Content, ContentChange, Draw, Fixed, Live, Recorder, StaticRecorder};
 pub use crate::shape::{

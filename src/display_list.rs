@@ -278,8 +278,7 @@ impl TryFrom<DisplayListData> for DisplayList {
                 | Command::BeginTransform { end, .. }
                 | Command::BeginGroup { end, .. } => open.push((index, *end)),
                 Command::End => {
-                    let (begin, recorded) =
-                        open.pop().ok_or(ScopeError::UnmatchedEnd { index })?;
+                    let (begin, recorded) = open.pop().ok_or(ScopeError::UnmatchedEnd { index })?;
                     if recorded as usize != index {
                         return Err(ScopeError::WrongEnd {
                             begin,
@@ -439,27 +438,35 @@ mod tests {
 
     use super::{DisplayList, ScopeError};
 
-    fn scopes(commands: serde_json::Value) -> Result<DisplayList, String> {
+    fn scopes(commands: &serde_json::Value) -> Result<DisplayList, String> {
         serde_json::from_value(json!({ "commands": commands })).map_err(|error| error.to_string())
     }
 
     #[test]
     fn deserialization_rejects_a_scope_whose_recorded_end_is_wrong() {
-        let group = json!({ "opacity": 1.0, "blend": "Normal", "blend_space": "Linear", "filter": null });
-        let error = scopes(json!([
+        let group =
+            json!({ "opacity": 1.0, "blend": "Normal", "blend_space": "Linear", "filter": null });
+        let error = scopes(&json!([
             { "BeginGroup": { "group": group, "end": 0 } },
             "End"
         ]))
         .expect_err("the recorded end points at the Begin itself");
         assert!(
-            error.contains(&ScopeError::WrongEnd { begin: 0, recorded: 0, actual: 1 }.to_string()),
+            error.contains(
+                &ScopeError::WrongEnd {
+                    begin: 0,
+                    recorded: 0,
+                    actual: 1
+                }
+                .to_string()
+            ),
             "{error}"
         );
     }
 
     #[test]
     fn deserialization_rejects_unbalanced_scopes() {
-        let unmatched = scopes(json!(["End"])).expect_err("an End with no scope");
+        let unmatched = scopes(&json!(["End"])).expect_err("an End with no scope");
         assert!(
             unmatched.contains(&ScopeError::UnmatchedEnd { index: 0 }.to_string()),
             "{unmatched}"

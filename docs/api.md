@@ -270,15 +270,33 @@ c.glyphs(&GlyphRun {
 
 ## Effects and filters
 
-Filters are **filtrate** data: the `Filter` trait, parameters, WGSL stages, the derive macro and the built-in filters. Cherenkov executes them: pass scheduling, scratch targets, fragment versus compute, on-chip blending, parameter animation. filtrate's standalone runtime (`FilterAdapter`, `Effect`) retires.
+### Repository and crates
 
-**Changes to filtrate-core:**
+filtrate moves into this repository, with its history, as an independent crate family: `filtrate`, `filtrate-core` and `filtrate-derive` in `filtrate/`. They keep their names, as an independently published brand, and they do not depend on the engine crates.
 
-1. **Filter kinds as types.** `ColorFilter` (per pixel; fused into the layer's composite shader at near-zero cost) and `SpatialFilter` (samples neighbours). `Chain<A, B>` is a `ColorFilter` exactly when both halves are.
-2. **Footprint.** `SpatialFilter::footprint(&self) -> f32` gives the maximum sample radius for the current parameters. While a parameter animates, it is the maximum over the animation track. The engine sizes backdrop regions, damage expansion and tile aprons from it.
-3. **Working-space constants.** Luma and saturation coefficients come from the working space (linear P3) as engine-provided stage constants, not hard-coded Rec. 709 values.
-4. **Shape input.** A filter can declare that it needs the clip shape's signed distance field or its mask. Refraction uses this for normals.
-5. **CPU kernels.** A filter may provide a SIMD CPU kernel, which makes it `Runs<Raster>` and `Runs<Banded<_>>`.
+A shared **shader composer** crate, `cherenkov-shader` in `shader/`, is built on naga IR and used by both filtrate and Cherenkov. Every shader fragment is a naga function: primitive shading, paints, blending, backdrop sampling, YUV conversion and filter stages. Composition, inlining, specialization (constant parameters, f16/f32 and subgroup variants) and dead-code elimination all happen on the IR, so no shader text is built by string splicing. This mirrors Skia Graphite's `ShaderCodeDictionary`, where each snippet is "the ABI of an SkSL module function and its uniform data", but with one composer for the whole repository.
+
+### Contract
+
+1. **Stages are functions.** A colour stage is `fn(color, params) -> color`. A spatial stage is `fn(sampler, uv, params) -> color`.
+2. **Filter kinds as types.** `ColorFilter` has a `LINEAR` property for filters that commute with src-over and can therefore be pushed down into each primitive's shading. `SpatialFilter` samples neighbours. `Chain<A, B>` is a `ColorFilter` exactly when both halves are.
+3. **Footprint.** `SpatialFilter::footprint(&self) -> f32` is the maximum sample radius for the current parameters; while a parameter animates, it is the maximum over its animation track. It sizes intermediates, damage expansion, backdrop regions and band or tile aprons.
+4. **Working-space constants.** Luma and saturation coefficients come from the working space (linear P3) as engine-provided constants.
+5. **Shape input.** A filter can declare that it needs the clip shape's signed distance field or its mask.
+6. **CPU kernels.** A filter may provide a SIMD CPU kernel, which makes it `Runs<Raster>` and `Runs<Banded<_>>`. The oracle cross-checks every kernel against its shader.
+
+### Execution
+
+The composer produces a normalized form: segment boundaries plus the possible materialization points and their cost parameters. The executor chooses among them.
+
+- **filtrate's thin wgpu executor** runs composed programs pass by pass. It serves UI-independent consumers, such as waterkit's export pipeline, and it is the reference for the oracle.
+- **Cherenkov** chooses by where the filter sits:
+  - **Colour filters.** A `LINEAR` filter is pushed down into each primitive's fragment shading before blending, so it needs no group at all. Any other colour filter is applied when its group resolves in tile memory, using on-chip programmable blending, so nothing goes back to memory. Nesting spills to a texture only when it exceeds on-chip capacity.
+  - **Spatial filters.** Layer content is rendered to a transient intermediate covering the content bounds plus the footprint, and processed in fragment passes, which keeps lossless framebuffer compression. Large blurs downsample first. The final pass applies the colour suffix and blends into the parent. Keeping small-footprint spatial filters on chip with Apple tile shaders is a farm axis, not a guarantee.
+  - **Backdrops.** A `BackdropGroup` resolves its parent once, when its first member is composited, over the union of member bounds plus the footprint. It runs its spatial chain once at reduced resolution. Each member samples the shared result with its own effect in its composite shader.
+  - **Parameters** are value slots, which may be bound to nami signals. Changing one updates a uniform only; nothing is recompiled or re-recorded.
+  - **Compilation** happens when a chain is first registered, and the driver pipeline cache is persisted.
+  - **CPU backends** apply pushed-down colour functions per span and run spatial kernels with footprint-wide aprons between bands.
 
 ```rust
 tx[&card].filter(Saturation(1.2).then(Brightness(0.9)));  // ColorFilter: fused, no extra pass

@@ -562,6 +562,8 @@ fn math(fun: MathFunction, first: &Value, second: Option<&Value>, third: Option<
         MathFunction::Floor => unary(f32::floor),
         MathFunction::Fract => unary(f32::fract),
         MathFunction::Saturate => unary(|value| value.clamp(0.0, 1.0)),
+        MathFunction::Cos => unary(f32::cos),
+        MathFunction::Sin => unary(f32::sin),
         MathFunction::Min => zip(first, second.expect("min takes two"), f32::min),
         MathFunction::Max => zip(first, second.expect("max takes two"), f32::max),
         MathFunction::Pow => zip(first, second.expect("pow takes two"), f32::powf),

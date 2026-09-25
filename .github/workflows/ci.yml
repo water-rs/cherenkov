@@ -119,6 +119,19 @@ jobs:
       # fontconfig, which the runner does not ship.
       - name: Skia link dependencies
         run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev libfreetype-dev
+      # The bench adapters are all feature-gated, so the default-feature
+      # clippy in `check` never compiles them — lint them here, on the
+      # dependency graph this job already warms.
+      - name: Clippy / all adapter features together
+        run: |
+          cargo clippy --locked -p cherenkov-bench --all-targets \
+            --features vello-classic,vello-hybrid,vello-cpu,skia -- -D warnings
+      - uses: taiki-e/install-action@cargo-hack
+      # `skia-metal` is Apple-only; every other adapter must lint alone.
+      - name: Clippy / each adapter feature alone
+        run: |
+          cargo hack clippy --locked -p cherenkov-bench --each-feature \
+            --exclude-features skia-metal --all-targets -- -D warnings
       - run: cargo build --locked --release -p cherenkov-bench --features vello-cpu,skia
       - name: Render the corpus on CPU adapters
         run: |
@@ -129,6 +142,43 @@ jobs:
           done
           python3 - <<'PY'
           import glob, json, sys
+          files = glob.glob('out/*/render-*.json')
+          # Every corpus scene produces a report (metrics or unsupported).
+          scenes = {json.load(open(f))['scene'] for f in files}
+          corpus = {p.split('/')[-2] for p in glob.glob('scenes/corpus/*/scene.json')}
+          missing = corpus - scenes
+          assert not missing, f'scenes without a report: {missing}'
+          measured = [f for f in files if 'metrics' in json.load(open(f))]
+          assert measured, 'no metrics JSON produced'
+          for f in files:
+              d = json.load(open(f))
+              assert 'info' in d and d['info']['crate_version'], f'{f} lacks provenance'
+          print(f'{len(files)} reports ({len(measured)} measured) across {len(scenes)} scenes')
+          PY
+
+  bench-macos-metal:
+    name: Bench / corpus on Metal adapters
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy / Metal adapter features
+        run: |
+          cargo clippy --locked -p cherenkov-bench --all-targets \
+            --features skia-metal,vello-classic,vello-hybrid -- -D warnings
+      - run: cargo build --locked --release -p cherenkov-bench --features skia-metal,vello-classic,vello-hybrid
+      - name: Render the corpus on Metal adapters
+        run: |
+          set -euo pipefail
+          for engine in skia-metal vello-classic vello-hybrid; do
+            ./target/release/cherenkov-bench render --engine "$engine" \
+              --corpus scenes/corpus --out-dir "out/$engine"
+          done
+          python3 - <<'PY'
+          import glob, json
           files = glob.glob('out/*/render-*.json')
           # Every corpus scene produces a report (metrics or unsupported).
           scenes = {json.load(open(f))['scene'] for f in files}

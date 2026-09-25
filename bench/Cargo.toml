@@ -15,10 +15,15 @@ default = []
 vello-classic = ["dep:vello", "dep:vello_common", "dep:wgpu", "dep:pollster"]
 vello-hybrid = ["dep:vello_hybrid", "dep:vello_common", "dep:wgpu", "dep:pollster", "dep:glifo"]
 vello-cpu = ["dep:vello_cpu", "dep:vello_common"]
-# `skia-bindings/no-compile` turns the build script's silent ~1h Skia
-# source-build fallback into a panic, so a missing prebuilt archive fails
-# the build immediately instead.
-skia = ["dep:skia-safe", "dep:ash", "dep:skia-bindings"]
+# `skia-safe` backend features stay in the feature lists, not on the
+# dependency: `skia-bindings` downloads a prebuilt Skia keyed on the whole
+# enabled set, and only the published combos (e.g. `metal,graphite`) have
+# binaries — an ad-hoc `vulkan,ganesh,metal,graphite` set falls back to a
+# full Skia source build. `skia-bindings/no-compile` turns that fallback
+# into a panic so every bench build linking Skia must use the prebuilt
+# binaries.
+skia = ["dep:skia-safe", "dep:ash", "dep:skia-bindings", "skia-safe/vulkan", "skia-safe/ganesh"]
+skia-metal = ["dep:skia-safe", "dep:objc2", "dep:objc2-metal", "dep:skia-bindings", "skia-safe/metal", "skia-safe/graphite"]
 
 [dependencies]
 cherenkov-scene = { path = "../scene" }
@@ -36,10 +41,16 @@ vello = { version = "0.9", optional = true, features = ["wgpu-profiler"] }
 vello_hybrid = { version = "0.2", optional = true }
 vello_cpu = { version = "0.2", optional = true, features = ["f32_pipeline"] }
 vello_common = { version = "0.2", optional = true }
-skia-safe = { version = "0.153", optional = true, features = ["vulkan", "ganesh"] }
+skia-safe = { version = "0.153", optional = true }
 # `no-compile` unifies onto skia-safe's transitive skia-bindings.
 skia-bindings = { version = "0.153", optional = true, default-features = false, features = ["no-compile"] }
 ash = { version = "0.38", optional = true }
+objc2 = { version = "0.6.3", optional = true, default-features = false }
+objc2-metal = { version = "0.3.2", optional = true, default-features = false, features = [
+    "MTLDevice", "MTLCommandQueue", "MTLCommandBuffer",
+    # `CFTimeInterval` for `MTLCommandBuffer::GPUStartTime`/`GPUEndTime`.
+    "objc2-core-foundation",
+] }
 wgpu = { version = "29", optional = true }
 pollster = { version = "0.4", optional = true }
 peniko = "0.6"

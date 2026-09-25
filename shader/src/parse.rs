@@ -678,7 +678,7 @@ fn access_blocker(
 }
 
 /// Whether `expression` reads `operand`, in any operand position.
-fn reads(expression: &Expression, operand: Handle<Expression>) -> bool {
+pub fn reads(expression: &Expression, operand: Handle<Expression>) -> bool {
     let mut found = false;
     let _ = map_expression(expression, |handle| {
         found |= handle == operand;

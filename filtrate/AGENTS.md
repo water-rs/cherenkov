@@ -1,9 +1,8 @@
 # AGENTS.md — filtrate
 
-GPU filter runtime for WaterUI: typed `Filter` graphs compile into wgpu
-pipelines (fused fragment passes for color stages, compute passes for
-spatial stages, fragment translations of the same spatial bodies on
-compute-less devices such as WebGL2).
+Filter library: typed `Filter` chains whose stages are WGSL functions for
+the shared composer (`cherenkov-shader`), and a reference wgpu executor
+that runs one fragment pass per composed piece.
 
 ## Commands
 
@@ -18,26 +17,19 @@ compute-less devices such as WebGL2).
 
 ## Testing guidance
 
-- **Pixel-level divergence between GPU execution paths is tolerable.** The
-  same shader body can run as a compute dispatch or a fragment draw; the
-  paths round intermediates differently (storage-texture + blit vs direct
-  attachment writes), so a few-LSB per-pixel differences are expected. Assert
-  with a small per-channel tolerance, not byte equality.
-- **Prefer visual tests.** `gpu_export_filter_gallery_images` renders every
-  built-in filter through *both* spatial backends into
-  `/tmp/waterui_filter_gallery/` (compute) and
-  `/tmp/waterui_filter_gallery_fragment/` (WebGL2 path) — run it and eyeball
-  or diff the outputs when touching shaders or the pass planner.
-- **Backend parity is contractual.** `SpatialExecution::ForceFragment`
-  forces the WebGL2 path on any adapter, which is how the fragment path is
-  exercised without a browser. A spatial body that fails the fragment
-  translation contract (one `textureStore(output_texture, …)` per own-pixel)
-  fails loudly at specialization, not silently at runtime.
+- **Prefer visual tests.** `gpu_export_filter_gallery_images` renders the
+  built-in filters into `/tmp/waterui_filter_gallery/` — run it and read the
+  outputs when touching stages or the executor.
+- **Stages are checked on the CPU too.** Every built-in is composed and its
+  passes validated without a GPU, `LINEAR` filters are checked to be linear
+  maps, and CPU kernels are cross-checked against their shaders with the
+  composer's evaluator (`cherenkov-shader`'s `eval` feature).
 
 ## Structure
 
-- `core/` — `filtrate-core`: the `Filter` trait, params, chains (no GPU).
+- `core/` — `filtrate-core`: the `Filter` trait and its kinds, stage
+  declarations, params, chains (no GPU).
 - `derive/` — `filtrate-derive`: the `#[derive(Filter)]` proc macro.
-- `src/shaders/` — WGSL sources, `include_str!`'d by the runtime;
-  `shared/` holds the preamble pieces composed by `src/runtime/shader.rs`.
-- `src/runtime/` — stage fusion, pass planning, pipelines, command encoding.
+- `src/shaders/` — the stages' WGSL snippets, `include_str!`'d by the filters.
+- `src/executor/` — composition, entry points, pipelines, command encoding.
+- `src/cpu.rs` — the SIMD CPU kernels.

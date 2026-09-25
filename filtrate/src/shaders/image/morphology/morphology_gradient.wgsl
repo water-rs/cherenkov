@@ -1,27 +1,25 @@
-// 3x3 morphological gradient: per-channel (max - min) over the
-// neighbourhood. Highlights region boundaries.
-//
-// Both accumulators are seeded from the centre texel, so the operator is
-// range-agnostic — HDR values above 1.0 and negative scene-referred values
-// produce correct gradients. Alpha keeps the centre's coverage.
+// 3x3 morphological gradient: the per-channel `max - min` of the
+// neighbourhood's colour. Both accumulators are seeded from the centre
+// texel, so extended values produce correct gradients. Alpha keeps the
+// centre's coverage.
 
-@compute @workgroup_size(WORKGROUP_X, WORKGROUP_Y)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let dims = vec2<u32>(uniforms.output_dimensions);
-    if gid.x >= dims.x || gid.y >= dims.y {
-        return;
-    }
-    let center = map_to_input(gid.xy);
+fn load(input: texture_2d<f32>, input_point_sampler: sampler, size: vec2<f32>, pixel: vec2<f32>) -> vec4<f32> {
+    return textureSampleLevel(input, input_point_sampler, (pixel + 0.5) / size, 0.0);
+}
 
-    let centre_texel = load_input(center);
-    var lo = centre_texel.rgb;
-    var hi = centre_texel.rgb;
+fn apply(input: texture_2d<f32>, input_point_sampler: sampler, uv: vec2<f32>) -> vec4<f32> {
+    let size = vec2<f32>(textureDimensions(input));
+    let pixel = floor(uv * size);
+
+    let centre = load(input, input_point_sampler, size, pixel);
+    var lo = centre.rgb;
+    var hi = centre.rgb;
     for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
         for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
-            let texel = load_input(center + vec2<i32>(dx, dy)).rgb;
+            let texel = load(input, input_point_sampler, size, pixel + vec2<f32>(f32(dx), f32(dy))).rgb;
             lo = min(lo, texel);
             hi = max(hi, texel);
         }
     }
-    textureStore(output_texture, vec2<i32>(gid.xy), vec4<f32>(hi - lo, centre_texel.a));
+    return vec4<f32>(hi - lo, centre.a);
 }

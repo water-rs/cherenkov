@@ -1,10 +1,10 @@
-    // Photo effect: process — cool cast with crushed highlights.
-    {
-        let cooled = color.rgb * vec3<f32>(0.90, 0.95, 1.10);
-        let crushed = vec3<f32>(
-            min(cooled.r, 0.92),
-            min(cooled.g, 0.94),
-            min(cooled.b, 0.96),
-        );
-        color = vec4<f32>(clamp(crushed, vec3<f32>(0.0), vec3<f32>(COLOR_CLAMP_MAX)), color.a);
-    }
+// Photo effect: process — a cool cast with crushed highlights on
+// straight-alpha colour, clamped to [0, f16 max].
+
+const F16_MAX: f32 = 65504.0;
+
+fn apply(color: vec4<f32>) -> vec4<f32> {
+    let cooled = color.rgb / max(color.a, 1e-6) * vec3<f32>(0.90, 0.95, 1.10);
+    let crushed = min(cooled, vec3<f32>(0.92, 0.94, 0.96));
+    return vec4<f32>(clamp(crushed, vec3<f32>(0.0), vec3<f32>(F16_MAX)) * color.a, color.a);
+}

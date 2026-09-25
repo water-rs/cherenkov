@@ -8,12 +8,13 @@ use crate::Filter;
 /// Counterpart to [`Convolution3x3`](crate::filters::Convolution3x3) when a
 /// wider support is needed (gaussian approximations, larger emboss, custom
 /// blurs).
-///
-/// Note: 25 floats consume nearly half of the 64-float pipeline parameter
-/// budget — chaining a `Convolution5x5` with another large filter may
-/// exceed the limit and fail setup at runtime.
+
 #[derive(Debug, Clone, Filter)]
-#[filter(spatial, shader = "image/convolution/convolution5x5.wgsl")]
+#[filter(
+    spatial,
+    shader = "image/convolution/convolution5x5.wgsl",
+    footprint = 2.0
+)]
 pub struct Convolution5x5<T>(pub [T; 25]);
 
 #[cfg(test)]
@@ -27,6 +28,6 @@ mod tests {
         k[12] = 1.0;
         let identity = Convolution5x5(k);
         assert_eq!(identity.params().len(), 25);
-        const { assert!(!Convolution5x5::<f32>::COLOR_ONLY) };
+        assert_eq!(crate::SpatialFilter::footprint(&identity), 2.0);
     }
 }

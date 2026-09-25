@@ -6,45 +6,53 @@
         reason = "tests assert exact filter parameter values"
     )
 )]
-//! Long-term stable abstractions for GPU filter pipelines.
+//! Long-term stable abstractions for filter pipelines.
 //!
-//! `filtrate-core` provides the foundational trait surface for declaring GPU
-//! filters as pure data: a [`Filter`] knows its shader fragments, parameter
-//! layout, and whether it can be fused with adjacent color-only filters. The
-//! actual GPU runtime lives in the `filtrate` crate; built-in filter
-//! implementations and their WGSL shaders live there as well.
+//! `filtrate-core` describes filters as pure data. A [`Filter`] is a sequence
+//! of stages, each a shader function (a snippet for the shared composer,
+//! `cherenkov-shader`), plus the parameters that feed them. Executors — the
+//! reference wgpu executor in `filtrate`, or the Cherenkov engine — compose
+//! the stages and decide how to run them.
 //!
-//! This crate aims for a stable 1.0 surface and intentionally has no `wgpu`
-//! or reactive-system (e.g. `nami`) dependencies. Reactive frontends
-//! provide their own [`FilterParam`] implementations on top of these
-//! abstractions.
+//! This crate has no dependencies: no GPU, no shader compiler and no reactive
+//! system. Reactive frontends provide their own [`FilterParam`]
+//! implementations on top of these abstractions.
 //!
-//! # Key abstractions
+//! # Filter kinds
 //!
-//! - [`Filter`]: pure-data description of a GPU filter recipe.
-//! - [`Chain<A, B>`]: type-level composition that preserves fusion potential.
-//! - [`FilterExt::then`]: ergonomic chain construction.
-//! - [`ParamArray`]: zero-allocation parameter layout for nested tuples and
-//!   fixed-size arrays.
-//! - [`FilterParam`] / [`Interpolator`]: reactive-system-agnostic parameter
-//!   abstraction with mandatory change observation.
-//! - [`StageCollector`] / [`SignalVisitor`]: visitors used by the runtime
-//!   to walk a filter's GPU stages and reactive parameters.
+//! Every filter has a kind, and the kind is a type:
+//!
+//! - A [`ColorFilter`] maps each pixel's colour to a colour, independently of
+//!   its neighbours. Its [`ColorFilter::LINEAR`] property says whether it is a
+//!   linear map on premultiplied RGBA with an identity alpha row —
+//!   offsets proportional to alpha (Brightness's `+amount·a`, for example)
+//!   are matrix coefficients and commute with src-over, so they qualify;
+//!   only constant, non-alpha-scaled offsets disqualify. It is the property
+//!   an executor needs before pushing a filter down into the shading of
+//!   each primitive.
+//! - A [`SpatialFilter`] samples its input around each pixel. Its
+//!   [`SpatialFilter::footprint`] is the largest distance, in pixels, of any
+//!   sample it takes.
+//!
+//! [`Chain<A, B>`] is a colour filter exactly when both halves are, and a
+//! spatial filter otherwise.
 //!
 //! # Example
 //!
-//! A filter is pure data: a parameter layout plus the GPU stages those
-//! parameters feed. The built-in filters in `filtrate` are written exactly
-//! this way (through `#[derive(Filter)]`), and a hand-written one composes
-//! with them:
+//! A hand-written colour filter: one stage, the WGSL function that applies
+//! it, and the parameter that feeds it. The built-in filters in `filtrate` are
+//! written with `#[derive(Filter)]`, which generates exactly this.
 //!
 //! ```rust
-//! use filtrate_core::{Chain, Filter, FilterExt, StageCollector};
+//! use filtrate_core::{
+//!     ColorFilter, ColorStage, Filter, FilterExt, OperatingSpace, ParamSource, Placed,
+//!     StageCollector, kind,
+//! };
 //!
 //! struct Brightness(f32);
 //!
 //! impl Filter for Brightness {
-//!     const COLOR_ONLY: bool = true;
+//!     type Kind = kind::Color;
 //!     type Params = [f32; 1];
 //!
 //!     fn params(&self) -> [f32; 1] {
@@ -52,41 +60,48 @@
 //!     }
 //!
 //!     fn collect_stages<C: StageCollector>(&self, collector: &mut C) {
-//!         // Real filters hand over a WGSL file through `include_str!`.
-//!         collector.color_fragment("// WGSL: rgb += params[0];", 1);
+//!         const STAGE: ColorStage = ColorStage {
+//!             name: "brightness",
+//!             source: "struct Params { amount: f32 }
+//! fn apply(color: vec4<f32>, params: Params) -> vec4<f32> {
+//!     return vec4<f32>(color.rgb + params.amount * color.a, color.a);
+//! }",
+//!             params: &[ParamSource::Param(0)],
+//!             space: OperatingSpace::Working,
+//!         };
+//!         collector.color(Placed::new(&STAGE));
 //!     }
 //! }
 //!
-//! let chain = Brightness(0.2).then(Brightness(-0.1));
+//! impl ColorFilter for Brightness {
+//!     // `rgb + amount * a` is linear in premultiplied RGBA.
+//!     const LINEAR: bool = true;
+//! }
 //!
-//! // Both links are color-only, so the chain stays fusable into one pass,
-//! // and its parameters nest one array per link.
-//! assert!(<Chain<Brightness, Brightness>>::COLOR_ONLY);
+//! let chain = Brightness(0.2).then(Brightness(-0.1));
 //! assert_eq!(chain.params(), ([0.2], [-0.1]));
+//! const { assert!(<filtrate_core::Chain<Brightness, Brightness> as ColorFilter>::LINEAR) };
 //! ```
 
 mod animation;
 mod filter;
+mod image;
+mod kernel;
+pub mod kind;
 mod param;
 mod params;
+mod space;
 mod stage;
 mod visitor;
 
 pub use animation::AnimationTrack;
-pub use filter::{Chain, Filter, FilterExt};
+pub use filter::{Chain, ColorFilter, Filter, FilterExt, SpatialFilter};
+pub use image::{AuxData, AuxFormat, AuxImage, ImageVisitor};
+pub use kernel::CpuKernel;
 pub use param::{AnimatedCallback, AnimatedTarget, FilterParam, Interpolator, WatchGuard};
 pub use params::ParamArray;
-pub use stage::StageCollector;
+pub use space::{OperatingSpace, WorkingSpace};
+pub use stage::{
+    AuxSource, ColorStage, ParamSource, Placed, ShapeInput, SpatialStage, StageCollector,
+};
 pub use visitor::SignalVisitor;
-
-/// Maximum number of `f32` parameters a single fused filter pipeline can carry.
-///
-/// This budget is shared between Rust-side uniform packing and WGSL shaders;
-/// the runtime emits an `array<vec4<f32>, MAX_FILTER_PARAM_VEC4S>` slot, so
-/// chain length is bounded by [`MAX_FILTER_PARAMS`] across all fused filters.
-pub const MAX_FILTER_PARAMS: usize = 64;
-
-/// Number of `vec4<f32>` slots required to hold [`MAX_FILTER_PARAMS`] floats.
-pub const MAX_FILTER_PARAM_VEC4S: usize = MAX_FILTER_PARAMS / 4;
-
-const _: () = assert!(MAX_FILTER_PARAMS == MAX_FILTER_PARAM_VEC4S * 4);

@@ -1,9 +1,5 @@
-// 3x3 median filter.
-//
-// Per-channel median of the 3x3 neighbourhood (all four channels, so the
-// result stays consistent on premultiplied-alpha data). Useful for
-// salt-and-pepper noise removal while preserving edges better than a box
-// blur.
+// 3x3 median: the per-channel median of the neighbourhood (all four
+// channels, so the result stays consistent on premultiplied colour).
 
 fn compare_swap(values: ptr<function, array<vec4<f32>, 9>>, a: u32, b: u32) {
     let va = (*values)[a];
@@ -36,21 +32,21 @@ fn median9(values: array<vec4<f32>, 9>) -> vec4<f32> {
     return v[4u];
 }
 
-@compute @workgroup_size(WORKGROUP_X, WORKGROUP_Y)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let dims = vec2<u32>(uniforms.output_dimensions);
-    if gid.x >= dims.x || gid.y >= dims.y {
-        return;
-    }
-    let center = map_to_input(gid.xy);
+fn load(input: texture_2d<f32>, input_point_sampler: sampler, size: vec2<f32>, pixel: vec2<f32>) -> vec4<f32> {
+    return textureSampleLevel(input, input_point_sampler, (pixel + 0.5) / size, 0.0);
+}
+
+fn apply(input: texture_2d<f32>, input_point_sampler: sampler, uv: vec2<f32>) -> vec4<f32> {
+    let size = vec2<f32>(textureDimensions(input));
+    let pixel = floor(uv * size);
 
     var samples: array<vec4<f32>, 9>;
     var idx: u32 = 0u;
     for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
         for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
-            samples[idx] = load_input(center + vec2<i32>(dx, dy));
+            samples[idx] = load(input, input_point_sampler, size, pixel + vec2<f32>(f32(dx), f32(dy)));
             idx = idx + 1u;
         }
     }
-    textureStore(output_texture, vec2<i32>(gid.xy), median9(samples));
+    return median9(samples);
 }

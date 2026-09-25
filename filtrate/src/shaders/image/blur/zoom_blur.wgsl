@@ -1,33 +1,28 @@
-// Zoom blur: radial streak toward a focal point.
-//
-// Parameters: amount, center.x, center.y (uv space). Taps interpolate
-// bilinearly so small amounts produce a smooth streak instead of a handful
-// of duplicated nearest texels.
+// Zoom blur: a radial streak toward a focal point, in twelve bilinearly
+// filtered taps weighted toward the pixel itself.
 
-@compute @workgroup_size(WORKGROUP_X, WORKGROUP_Y)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let dims = vec2<u32>(uniforms.output_dimensions);
-    if gid.x >= dims.x || gid.y >= dims.y {
-        return;
-    }
-    let uv = output_uv(gid.xy);
-    let amount = max(param(0u), 0.0);
-    let center = vec2<f32>(param(1u), param(2u));
+struct Params {
+    amount: f32,
+    center_x: f32,
+    center_y: f32,
+}
+
+fn apply(input: texture_2d<f32>, input_sampler: sampler, uv: vec2<f32>, params: Params) -> vec4<f32> {
+    let size = vec2<f32>(textureDimensions(input));
+    let amount = max(params.amount, 0.0);
     if amount <= 0.0001 {
-        textureStore(output_texture, vec2<i32>(gid.xy), load_input(map_to_input(gid.xy)));
-        return;
+        return textureSampleLevel(input, input_sampler, (floor(uv * size) + 0.5) / size, 0.0);
     }
 
-    let direction = center - uv;
+    let direction = vec2<f32>(params.center_x, params.center_y) - uv;
     let samples: i32 = 12;
     var sum = vec4<f32>(0.0);
     var total_weight = 0.0;
     for (var i = 0; i < samples; i++) {
         let t = f32(i) / f32(samples - 1);
-        let sample_uv = uv + direction * amount * t;
         let weight = 1.0 - t * 0.65;
-        sum += sample_input_bilinear(sample_uv) * weight;
+        sum += textureSampleLevel(input, input_sampler, uv + direction * amount * t, 0.0) * weight;
         total_weight += weight;
     }
-    textureStore(output_texture, vec2<i32>(gid.xy), sum / total_weight);
+    return sum / total_weight;
 }

@@ -1,34 +1,32 @@
-// Motion blur: directional blur along an angle.
-//
-// Parameters: radius (pixels), angle (degrees). Taps interpolate
-// bilinearly so off-axis directions produce a smooth streak instead of
-// duplicated nearest texels.
+// Motion blur: a directional blur along `angle` (degrees), `radius` pixels
+// each way, with a triangular weight. Taps filter bilinearly, so off-axis
+// directions produce a smooth streak instead of duplicated nearest texels.
 
-@compute @workgroup_size(WORKGROUP_X, WORKGROUP_Y)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let dims = vec2<u32>(uniforms.output_dimensions);
-    if gid.x >= dims.x || gid.y >= dims.y {
-        return;
-    }
-    let mapped = (vec2<f32>(gid.xy) + vec2<f32>(0.5)) * uniforms.input_dimensions
-        / uniforms.output_dimensions;
+struct Params {
+    radius: f32,
+    angle: f32,
+}
 
-    let radius = max(i32(round(param(0u))), 0);
+const DEGREES_TO_RADIANS: f32 = 0.017453292519943295;
+
+fn apply(input: texture_2d<f32>, input_sampler: sampler, uv: vec2<f32>, params: Params) -> vec4<f32> {
+    let size = vec2<f32>(textureDimensions(input));
+    let radius = max(i32(round(params.radius)), 0);
     if radius == 0 {
-        textureStore(output_texture, vec2<i32>(gid.xy), load_input(map_to_input(gid.xy)));
-        return;
+        return textureSampleLevel(input, input_sampler, (floor(uv * size) + 0.5) / size, 0.0);
     }
 
-    let angle = param(1u) * DEGREES_TO_RADIANS;
+    let mapped = uv * size;
+    let angle = params.angle * DEGREES_TO_RADIANS;
     let direction = vec2<f32>(cos(angle), sin(angle));
 
     var sum = vec4<f32>(0.0);
     var total_weight = 0.0;
     for (var i = -radius; i <= radius; i++) {
-        let sample_uv = (mapped + direction * f32(i)) / uniforms.input_dimensions;
+        let sample_uv = (mapped + direction * f32(i)) / size;
         let weight = 1.0 - abs(f32(i)) / f32(radius + 1);
-        sum += sample_input_bilinear(sample_uv) * weight;
+        sum += textureSampleLevel(input, input_sampler, sample_uv, 0.0) * weight;
         total_weight += weight;
     }
-    textureStore(output_texture, vec2<i32>(gid.xy), sum / total_weight);
+    return sum / total_weight;
 }

@@ -6,7 +6,7 @@ rust-version = "1.95"
 authors = ["Lexo Liu"]
 readme = "README.md"
 repository.workspace = true
-description = "GPU texture filter library: built-in filters (blur, brightness, color matrix, ...) and runtime, built on filtrate-core."
+description = "Filter library: built-in filters (blur, brightness, color matrix, ...) as shader functions for the shared composer, and a reference wgpu executor, built on filtrate-core."
 keywords = ["gpu", "filter", "wgpu", "image", "video"]
 categories = ["graphics", "multimedia::images", "rendering"]
 license = "Apache-2.0 OR MIT"
@@ -35,33 +35,37 @@ multiple_crate_versions = "allow"
 
 [features]
 default = []
-# WebGL2 backend support for wasm targets: turns on wgpu's `webgl` backend and
-# routes spatial filters through a fragment pipeline, because WebGL2 has no
-# compute shaders or storage textures. Enabling this feature for a non-wasm
+# WebGL2 backend support for wasm targets: turns on wgpu's `webgl` backend.
+# Every executor pass is a fragment pass, so WebGL2's lack of compute shaders
+# and storage textures does not matter. Enabling this feature for a non-wasm
 # target is a compile error — native and WebGPU devices run the same code
 # without it.
 webgl = ["wgpu/webgl"]
 
 [dependencies]
+bytemuck = "1"
+cherenkov-shader = { version = "0.0.0", path = "../shader" }
 filtrate-core = { version = "0.2.0", path = "core" }
+# f16 aux images; no_std-capable, already in the tree through naga.
+half = { version = "2.5", default-features = false }
 filtrate-derive = { version = "0.1.0", path = "derive" }
-wgpu = "29.0.4"
-shaderloom = "0.1.0"
-bytemuck = { version = "1", features = ["derive"] }
-num-traits = { version = "0.2", default-features = false }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 thiserror = "2.0.19"
 tracing = "0.1.44"
+# Portable SIMD for the CPU kernels.
+wide = "1.7"
+# `naga-ir`: pass modules reach wgpu as composed naga IR, never as text.
+wgpu = { version = "29.0.4", features = ["naga-ir"] }
 
 # `std::time::Instant::now` panics on wasm32-unknown-unknown; web-time backs it
 # with `performance.now()` there and delegates to std everywhere else.
 [target.'cfg(target_family = "wasm")'.dependencies]
 web-time = "1"
 
-[build-dependencies]
-shaderloom = { version = "0.1.0", features = ["build"] }
-
 [dev-dependencies]
+# The evaluator runs snippets on the CPU to cross-check the CPU kernels and
+# the linearity of `LINEAR` filters.
+cherenkov-shader = { version = "0.0.0", path = "../shader", features = ["eval"] }
 divan = "0.1"
 pollster = "1.0"
 
@@ -72,7 +76,3 @@ harness = false
 [[bench]]
 name = "gpu_runtime"
 harness = false
-
-# `shaderloom` is used directly by build.rs; cargo-machete 0.9 does not scan build.rs.
-[package.metadata.cargo-machete]
-ignored = ["shaderloom"]

@@ -4,7 +4,9 @@ use crate::Filter;
 
 /// Converts an image to grayscale.
 ///
-/// Uses luminance-based conversion with configurable intensity.
+/// Mixes toward the working-space luma with configurable intensity, a
+/// linear map, so the filter is [`LINEAR`](crate::ColorFilter::LINEAR). It
+/// carries a SIMD CPU kernel.
 ///
 /// # Parameters
 ///
@@ -22,7 +24,12 @@ use crate::Filter;
 /// # assert_eq!(partial.params(), [0.5]);
 /// ```
 #[derive(Debug, Clone, Copy, Filter)]
-#[filter(color_only, shader = "color/transform/grayscale.wgsl")]
+#[filter(
+    color,
+    shader = "color/transform/grayscale.wgsl",
+    linear = true,
+    cpu = crate::cpu::grayscale
+)]
 pub struct Grayscale<T>(pub T);
 
 #[cfg(test)]

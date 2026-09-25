@@ -23,7 +23,11 @@ use crate::Filter;
 /// # assert_eq!(sharpen.params().len(), 9);
 /// ```
 #[derive(Debug, Clone, Filter)]
-#[filter(spatial, shader = "image/convolution/convolution3x3.wgsl")]
+#[filter(
+    spatial,
+    shader = "image/convolution/convolution3x3.wgsl",
+    footprint = 1.0
+)]
 pub struct Convolution3x3<T>(pub [T; 9]);
 
 #[cfg(test)]
@@ -35,6 +39,6 @@ mod tests {
     fn convolution3x3_param_count() {
         let identity = Convolution3x3([0.0_f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]);
         assert_eq!(identity.params().len(), 9);
-        const { assert!(!Convolution3x3::<f32>::COLOR_ONLY) };
+        assert_eq!(crate::SpatialFilter::footprint(&identity), 1.0);
     }
 }

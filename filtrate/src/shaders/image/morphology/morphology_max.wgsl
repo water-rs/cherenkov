@@ -1,23 +1,20 @@
-// 3x3 morphological dilation: per-channel maximum over the neighbourhood.
-//
-// The accumulator is seeded from the centre texel, so the operator is
-// range-agnostic — HDR values above 1.0 and negative scene-referred values
-// survive. All four channels dilate together (premultiplied-alpha
-// consistent).
+// 3x3 dilation: the per-channel maximum of the neighbourhood. Seeded from
+// the centre texel, so extended values survive. All four channels dilate
+// together, consistent with premultiplied colour.
 
-@compute @workgroup_size(WORKGROUP_X, WORKGROUP_Y)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let dims = vec2<u32>(uniforms.output_dimensions);
-    if gid.x >= dims.x || gid.y >= dims.y {
-        return;
-    }
-    let center = map_to_input(gid.xy);
+fn load(input: texture_2d<f32>, input_point_sampler: sampler, size: vec2<f32>, pixel: vec2<f32>) -> vec4<f32> {
+    return textureSampleLevel(input, input_point_sampler, (pixel + 0.5) / size, 0.0);
+}
 
-    var acc = load_input(center);
+fn apply(input: texture_2d<f32>, input_point_sampler: sampler, uv: vec2<f32>) -> vec4<f32> {
+    let size = vec2<f32>(textureDimensions(input));
+    let pixel = floor(uv * size);
+
+    var acc = load(input, input_point_sampler, size, pixel);
     for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
         for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
-            acc = max(acc, load_input(center + vec2<i32>(dx, dy)));
+            acc = max(acc, load(input, input_point_sampler, size, pixel + vec2<f32>(f32(dx), f32(dy))));
         }
     }
-    textureStore(output_texture, vec2<i32>(gid.xy), acc);
+    return acc;
 }

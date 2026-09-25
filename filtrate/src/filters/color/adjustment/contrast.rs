@@ -4,7 +4,9 @@ use crate::Filter;
 
 /// Adjusts the contrast of an image.
 ///
-/// Applies the formula: `(color - 0.5) * amount + 0.5`
+/// Applies `(color - 0.5) * amount + 0.5` to each straight-alpha channel.
+/// On premultiplied colour the pivot scales with alpha, so the filter is a
+/// linear map and [`LINEAR`](crate::ColorFilter::LINEAR).
 ///
 /// # Parameters
 ///
@@ -20,7 +22,7 @@ use crate::Filter;
 /// # assert_eq!(high_contrast.params(), [1.5]);
 /// ```
 #[derive(Debug, Clone, Copy, Filter)]
-#[filter(color_only, shader = "color/adjustment/contrast.wgsl")]
+#[filter(color, shader = "color/adjustment/contrast.wgsl", linear = true)]
 pub struct Contrast<T>(pub T);
 
 #[cfg(test)]

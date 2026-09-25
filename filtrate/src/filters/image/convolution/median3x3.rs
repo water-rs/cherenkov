@@ -15,7 +15,7 @@ use crate::Filter;
 /// # assert_eq!(denoised.params().len(), 0);
 /// ```
 #[derive(Debug, Clone, Copy, Default, Filter)]
-#[filter(spatial, shader = "image/convolution/median3x3.wgsl")]
+#[filter(spatial, shader = "image/convolution/median3x3.wgsl", footprint = 1.0)]
 pub struct Median3x3;
 
 #[cfg(test)]
@@ -25,7 +25,7 @@ mod tests {
 
     #[test]
     fn median_is_spatial_with_zero_params() {
-        const { assert!(!Median3x3::COLOR_ONLY) };
+        assert_eq!(crate::SpatialFilter::footprint(&Median3x3), 1.0);
         assert_eq!(Median3x3.params().len(), 0);
     }
 }

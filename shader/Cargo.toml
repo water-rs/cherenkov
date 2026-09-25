@@ -7,14 +7,20 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[features]
+# The reference interpreter in `eval`.
+eval = ["dep:half"]
+
 [dependencies]
+# naga's `Literal::F16` payload; the evaluator reads it.
+half = { version = "2.5", default-features = false, optional = true }
 # The same naga major version wgpu 29 links, so composed modules reach wgpu without conversion.
 naga = { version = "29.0.4", features = ["wgsl-in", "wgsl-out", "msl-out", "spv-out"] }
 thiserror = "2"
 
 [dev-dependencies]
-# naga's `Literal::F16` payload; the test evaluator reads it.
-half = { version = "2.5", default-features = false }
+# The composition tests check composed functions with the evaluator.
+cherenkov-shader = { path = ".", features = ["eval"] }
 
 [lints]
 workspace = true

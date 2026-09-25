@@ -12,7 +12,7 @@ use crate::Filter;
 /// - `green`: Green channel white-point component
 /// - `blue`: Blue channel white-point component
 #[derive(Debug, Clone, Copy, Filter)]
-#[filter(color_only, shader = "color/adjustment/white_point.wgsl")]
+#[filter(color, shader = "color/adjustment/white_point.wgsl", linear = true)]
 pub struct WhitePoint<R, G, B>(pub R, pub G, pub B);
 
 #[cfg(test)]

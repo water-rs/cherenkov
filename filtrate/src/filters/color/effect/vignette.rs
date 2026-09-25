@@ -4,6 +4,11 @@ use crate::Filter;
 
 /// Adds a vignette effect (darkened corners) to an image.
 ///
+/// It depends on each pixel's position, which a colour stage cannot see, so
+/// it is a spatial filter that reads only its own texel (footprint zero).
+/// Distance is measured in isotropic space, so the vignette stays circular
+/// on non-square images.
+///
 /// # Parameters
 ///
 /// - `radius`: Inner radius where vignette starts (0.0-1.0)
@@ -20,7 +25,7 @@ use crate::Filter;
 /// # assert_eq!(subtle.params(), [0.8, 0.3]);
 /// ```
 #[derive(Debug, Clone, Copy, Filter)]
-#[filter(color_only, shader = "color/effect/vignette.wgsl")]
+#[filter(spatial, shader = "color/effect/vignette.wgsl", footprint = 0.0)]
 pub struct Vignette<R, S>(pub R, pub S);
 
 #[cfg(test)]
@@ -32,5 +37,6 @@ mod tests {
     fn test_vignette_params() {
         let filter = Vignette(0.5f32, 0.2f32);
         assert_eq!(filter.params(), [0.5, 0.2]);
+        assert_eq!(crate::SpatialFilter::footprint(&filter), 0.0);
     }
 }

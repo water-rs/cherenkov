@@ -4,7 +4,9 @@ use crate::Filter;
 
 /// Adjusts the color saturation of an image.
 ///
-/// Mixes between grayscale and the original color.
+/// Mixes between the working-space luma and the original colour, a linear
+/// map, so the filter is [`LINEAR`](crate::ColorFilter::LINEAR). It carries
+/// a SIMD CPU kernel.
 ///
 /// # Parameters
 ///
@@ -22,7 +24,12 @@ use crate::Filter;
 /// # assert_eq!(vibrant.params(), [1.5]);
 /// ```
 #[derive(Debug, Clone, Copy, Filter)]
-#[filter(color_only, shader = "color/transform/saturation.wgsl")]
+#[filter(
+    color,
+    shader = "color/transform/saturation.wgsl",
+    linear = true,
+    cpu = crate::cpu::saturation
+)]
 pub struct Saturation<T>(pub T);
 
 #[cfg(test)]

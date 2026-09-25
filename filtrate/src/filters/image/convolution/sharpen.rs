@@ -4,8 +4,8 @@ use crate::Filter;
 
 /// Sharpens image details using an unsharp mask.
 ///
-/// This is a spatial filter that samples neighboring pixels, so it
-/// cannot be fused with other filters. It requires its own GPU pass.
+/// It adds the laplacian detail of the four direct neighbours, so its
+/// footprint is one pixel.
 ///
 /// # Parameters
 ///
@@ -23,7 +23,7 @@ use crate::Filter;
 /// # assert_eq!(crisp.params(), [1.5]);
 /// ```
 #[derive(Debug, Clone, Copy, Filter)]
-#[filter(spatial, shader = "image/convolution/sharpen.wgsl")]
+#[filter(spatial, shader = "image/convolution/sharpen.wgsl", footprint = 1.0)]
 pub struct Sharpen<T>(pub T);
 
 #[cfg(test)]
@@ -38,7 +38,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sharpen_not_color_only() {
-        const { assert!(!Sharpen::<f32>::COLOR_ONLY) };
+    fn test_sharpen_footprint() {
+        assert_eq!(crate::SpatialFilter::footprint(&Sharpen(1.0f32)), 1.0);
     }
 }

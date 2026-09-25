@@ -624,6 +624,7 @@ fn linear_colour_filters_are_linear_maps() {
         ]),
     );
     assert_linear("grayscale", &Grayscale(0.6_f32));
+    assert_linear("hue_rotation", &HueRotation(120.0_f32));
     assert_linear("invert", &Invert);
     assert_linear("saturation", &Saturation(1.7_f32));
     assert_linear("sepia", &Sepia(0.8_f32));
@@ -650,11 +651,12 @@ fn assert_kernel_matches_shader<F: CpuKernel>(name: &str, filter: &F) {
 
 #[test]
 fn cpu_kernels_match_their_shaders() {
-    use filters::{Brightness, ColorMatrix, Grayscale, Saturation};
+    use filters::{Brightness, ColorMatrix, Grayscale, HueRotation, Saturation};
 
     assert_kernel_matches_shader("brightness", &Brightness(-0.2_f32));
     assert_kernel_matches_shader("saturation", &Saturation(1.6_f32));
     assert_kernel_matches_shader("grayscale", &Grayscale(0.7_f32));
+    assert_kernel_matches_shader("hue_rotation", &HueRotation(120.0_f32));
     assert_kernel_matches_shader(
         "color_matrix",
         &ColorMatrix([
@@ -677,6 +679,74 @@ fn cpu_kernels_match_their_shaders() {
     let mut pixels = COLOURS;
     chain.apply_cpu_now(&WorkingSpace::LINEAR_DISPLAY_P3, &mut pixels);
     assert_eq!(pixels, chained);
+}
+
+#[test]
+fn hue_rotation_matches_the_css_reference_matrices() {
+    use filters::HueRotation;
+
+    // The `feColorMatrix type="hueRotate"` coefficients at the spec's
+    // canonical angles, rows of the (r', g', b') output in input (r, g, b)
+    // order: the identity at 0°, at 90°, and its square at 180°.
+    let matrices: [(f32, [[f32; 3]; 3]); 3] = [
+        (0.0_f32, [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]),
+        (
+            90.0,
+            [
+                [0.000, 0.000, 1.000],
+                [0.356, 0.855, -0.211],
+                [-0.574, 1.430, 0.144],
+            ],
+        ),
+        (
+            180.0,
+            [
+                [-0.574, 1.430, 0.144],
+                [0.426, 0.430, 0.144],
+                [0.426, 1.430, -0.856],
+            ],
+        ),
+    ];
+    let stage = colour_stage(&HueRotation(0.0_f32));
+    for (angle, matrix) in matrices {
+        for colour in COLOURS {
+            let expected: [f32; 3] = core::array::from_fn(|channel| {
+                matrix[channel][0].mul_add(
+                    colour[0],
+                    matrix[channel][1].mul_add(colour[1], matrix[channel][2] * colour[2]),
+                )
+            });
+            assert_close(
+                evaluate(stage, &[angle], colour),
+                [expected[0], expected[1], expected[2], colour[3]],
+                &format!("hue_rotation({angle}) differs from the CSS matrix"),
+            );
+        }
+    }
+}
+
+#[test]
+fn hue_rotation_commutes_with_source_over() {
+    use filters::HueRotation;
+
+    // A linear map on premultiplied colour commutes with src-over:
+    // filtering the composite equals compositing the filtered layers.
+    let filter = HueRotation(150.0_f32);
+    let stage = colour_stage(&filter);
+    let mut params = [0.0];
+    filter.params().write_to(&mut params);
+    let apply = |colour| evaluate(stage, &params, colour);
+    let src_over = |src: [f32; 4], dst: [f32; 4]| -> [f32; 4] {
+        core::array::from_fn(|channel| (1.0 - src[3]).mul_add(dst[channel], src[channel]))
+    };
+    for pair in COLOURS.windows(2) {
+        let (src, dst) = (pair[0], pair[1]);
+        assert_close(
+            apply(src_over(src, dst)),
+            src_over(apply(src), apply(dst)),
+            "hue_rotation does not commute with src-over",
+        );
+    }
 }
 
 // ============================================================================
@@ -1210,6 +1280,7 @@ fn gpu_chains_match_their_cpu_kernels() {
     let rgba = test_pixels(size.0 * size.1);
     let chain = filters::Saturation(1.4_f32)
         .then(filters::Grayscale(0.3_f32))
+        .then(filters::HueRotation(60.0_f32))
         .then(filters::Brightness(-0.1_f32));
     let mut pixels: Vec<[f32; 4]> = rgba
         .chunks(4)
@@ -1222,7 +1293,12 @@ fn gpu_chains_match_their_cpu_kernels() {
         .map(|&value| to_unorm(value))
         .collect();
     let output = run(&gpu, chain, size, &rgba, ShapeTextures::default());
-    assert_rgba8_close(&output, &expected, 1, "saturation, grayscale, brightness");
+    assert_rgba8_close(
+        &output,
+        &expected,
+        1,
+        "saturation, grayscale, hue rotation, brightness",
+    );
 }
 
 #[test]

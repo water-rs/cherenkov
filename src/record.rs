@@ -477,6 +477,8 @@ pub enum ContentChange {
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Range;
+
     use kurbo::{Circle, Rect};
     use nami::{SignalExt, binding};
 
@@ -509,7 +511,7 @@ mod tests {
         assert_eq!(updates.len(), 1);
 
         let dirty = remote.apply(updates);
-        assert_eq!(dirty.ranges(), [1..2]);
+        assert_eq!(dirty.ranges(), [Range { start: 1, end: 2 }]);
         let Command::Fill { shape, .. } = &remote.commands()[1] else {
             panic!("command 1 is the circle fill");
         };
@@ -537,7 +539,7 @@ mod tests {
         };
         let dirty = remote.apply(updates);
         // BeginTransform (1), two fills (2, 3) and End (4).
-        assert_eq!(dirty.ranges(), [1..5]);
+        assert_eq!(dirty.ranges(), [Range { start: 1, end: 5 }]);
         assert!(!dirty.contains(0) && !dirty.contains(5));
     }
 

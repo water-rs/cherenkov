@@ -5,6 +5,9 @@ description = "Shader composer on naga IR, shared by Cherenkov and filtrate"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "README.md"
+keywords = ["shader", "naga", "wgsl", "gpu", "composer"]
+categories = ["graphics", "rendering"]
 
 [features]
 # The reference interpreter in `eval`.

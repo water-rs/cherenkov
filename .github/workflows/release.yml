@@ -13,11 +13,13 @@ permissions:
 jobs:
   release:
     name: Release unpublished packages
+    # Publishing happens only from main; a dev push only refreshes the
+    # release PR below.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: main
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       # Mint a short-lived crates.io token from the GitHub OIDC identity

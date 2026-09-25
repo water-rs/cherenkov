@@ -1,0 +1,170 @@
+{
+  "width": 128,
+  "height": 128,
+  "working_space": "linear-display-p3",
+  "clear": {
+    "space": "srgb",
+    "components": [
+      0.95,
+      0.95,
+      0.95,
+      1.0
+    ]
+  },
+  "features": [
+    {
+      "feature": "fill"
+    },
+    {
+      "feature": "linear-gradient"
+    },
+    {
+      "feature": "extend-none"
+    },
+    {
+      "feature": "interpolation-space",
+      "value": "srgb"
+    }
+  ],
+  "root": {
+    "transform": [
+      1.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0
+    ],
+    "opacity": 1.0,
+    "blend": "normal",
+    "items": [
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rect": {
+                "x0": 8.0,
+                "y0": 8.0,
+                "x1": 120.0,
+                "y1": 120.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "linear": {
+                "start": {
+                  "x": 32.0,
+                  "y": 48.0
+                },
+                "end": {
+                  "x": 96.0,
+                  "y": 80.0
+                },
+                "stops": [
+                  {
+                    "offset": 0.0,
+                    "color": {
+                      "space": "srgb",
+                      "components": [
+                        1.0,
+                        0.0,
+                        0.0,
+                        1.0
+                      ]
+                    }
+                  },
+                  {
+                    "offset": 0.14285715,
+                    "color": {
+                      "space": "srgb",
+                      "components": [
+                        1.0,
+                        0.5,
+                        0.0,
+                        1.0
+                      ]
+                    }
+                  },
+                  {
+                    "offset": 0.2857143,
+                    "color": {
+                      "space": "srgb",
+                      "components": [
+                        1.0,
+                        1.0,
+                        0.0,
+                        1.0
+                      ]
+                    }
+                  },
+                  {
+                    "offset": 0.42857143,
+                    "color": {
+                      "space": "srgb",
+                      "components": [
+                        0.0,
+                        1.0,
+                        0.0,
+                        1.0
+                      ]
+                    }
+                  },
+                  {
+                    "offset": 0.5714286,
+                    "color": {
+                      "space": "srgb",
+                      "components": [
+                        0.0,
+                        1.0,
+                        1.0,
+                        1.0
+                      ]
+                    }
+                  },
+                  {
+                    "offset": 0.71428573,
+                    "color": {
+                      "space": "srgb",
+                      "components": [
+                        0.0,
+                        0.0,
+                        1.0,
+                        1.0
+                      ]
+                    }
+                  },
+                  {
+                    "offset": 0.85714287,
+                    "color": {
+                      "space": "srgb",
+                      "components": [
+                        0.5,
+                        0.0,
+                        1.0,
+                        1.0
+                      ]
+                    }
+                  },
+                  {
+                    "offset": 1.0,
+                    "color": {
+                      "space": "srgb",
+                      "components": [
+                        1.0,
+                        0.0,
+                        0.5,
+                        1.0
+                      ]
+                    }
+                  }
+                ],
+                "extend": "none",
+                "interpolation": "srgb"
+              }
+            }
+          }
+        }
+      }
+    ]
+  }
+}

@@ -1,0 +1,92 @@
+{
+  "width": 128,
+  "height": 128,
+  "working_space": "linear-display-p3",
+  "clear": {
+    "space": "srgb",
+    "components": [
+      0.95,
+      0.95,
+      0.95,
+      1.0
+    ]
+  },
+  "features": [
+    {
+      "feature": "fill"
+    },
+    {
+      "feature": "shadow"
+    }
+  ],
+  "root": {
+    "transform": [
+      1.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0
+    ],
+    "opacity": 1.0,
+    "blend": "normal",
+    "items": [
+      {
+        "draw": {
+          "shadow": {
+            "shape": {
+              "circle": {
+                "center": {
+                  "x": 56.0,
+                  "y": 56.0
+                },
+                "radius": 30.0
+              }
+            },
+            "blur_sigma": 4.0,
+            "offset": [
+              10.0,
+              14.0
+            ],
+            "color": {
+              "space": "srgb",
+              "components": [
+                0.0,
+                0.0,
+                0.2,
+                0.7
+              ]
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "circle": {
+                "center": {
+                  "x": 56.0,
+                  "y": 56.0
+                },
+                "radius": 30.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.2,
+                  0.5,
+                  0.9,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      }
+    ]
+  }
+}

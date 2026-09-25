@@ -1,0 +1,474 @@
+// Copyright 2026 the Cherenkov Authors
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+
+//! `cherenkov-bench`: cross-engine correctness and performance runner.
+//!
+//! - `render --engine E --scene DIR --out FILE` renders one scene against
+//!   the oracle and writes the engine's image, an error heatmap and a
+//!   metrics JSON. `--corpus DIR --out-dir DIR` sweeps a corpus.
+//! - `measure --engine E --scene DIR --frames N --warmup W --out FILE`
+//!   records raw per-frame CPU encode, submit and GPU seconds (real
+//!   timestamps only) plus p50/p90/p99. `--cpu LIST` pins the run to a
+//!   CPU set — required for meaningful numbers on big.LITTLE hosts
+//!   (Linux and Android only); the report records placement either way.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use std::time::Instant;
+
+use cherenkov_bench::convert;
+use cherenkov_bench::report::{
+    CpuUse, FrameSample, MeasureReport, Percentiles, Placement, RenderReport, UnsupportedReport,
+    percentiles,
+};
+use cherenkov_bench::{BenchError, EncodeInput, Engine, affinity, create_engine, engine_names};
+use cherenkov_oracle::{F32Image, Renderer, metrics};
+use cherenkov_scene::Scene;
+use clap::{Parser, Subcommand};
+
+/// Command line.
+#[derive(Parser)]
+#[command(
+    name = "cherenkov-bench",
+    about = "Cross-engine correctness and performance suite"
+)]
+struct Cli {
+    /// Subcommand.
+    #[command(subcommand)]
+    cmd: Sub,
+}
+
+#[derive(Subcommand)]
+enum Sub {
+    /// Render scene(s) and report correctness metrics vs the oracle.
+    Render {
+        /// Adapter key (see `cherenkov-bench engines`).
+        #[arg(long)]
+        engine: String,
+        /// One scene directory (`scene.json` + `resources/`).
+        #[arg(long, conflicts_with = "corpus", required_unless_present = "corpus")]
+        scene: Option<PathBuf>,
+        /// Corpus directory; every child holding a `scene.json` is run.
+        #[arg(long)]
+        corpus: Option<PathBuf>,
+        /// Metrics JSON path (with `--scene`).
+        #[arg(long, conflicts_with = "out_dir", required_unless_present = "out_dir")]
+        out: Option<PathBuf>,
+        /// Output directory (with `--corpus`).
+        #[arg(long)]
+        out_dir: Option<PathBuf>,
+    },
+    /// Measure encode/submit/GPU frame times.
+    Measure {
+        /// Adapter key.
+        #[arg(long)]
+        engine: String,
+        /// One scene directory.
+        #[arg(long, conflicts_with = "corpus", required_unless_present = "corpus")]
+        scene: Option<PathBuf>,
+        /// Corpus directory.
+        #[arg(long)]
+        corpus: Option<PathBuf>,
+        /// Measured frame count (after warmup).
+        #[arg(long, default_value_t = 60)]
+        frames: u32,
+        /// Warmup frames discarded before measuring.
+        #[arg(long, default_value_t = 5)]
+        warmup: u32,
+        /// Report JSON path (with `--scene`).
+        #[arg(long, conflicts_with = "out_dir", required_unless_present = "out_dir")]
+        out: Option<PathBuf>,
+        /// Output directory (with `--corpus`).
+        #[arg(long)]
+        out_dir: Option<PathBuf>,
+        /// Pin the measurement to these CPUs — a list like `7`, `4-6` or
+        /// `1,3,5-7`. Required for meaningful numbers on big.LITTLE
+        /// hardware; Linux and Android only.
+        #[arg(long, value_name = "LIST")]
+        cpu: Option<String>,
+    },
+    /// List compiled-in adapter keys.
+    Engines,
+}
+
+fn main() -> ExitCode {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+    let cli = Cli::parse();
+    match run(cli) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            tracing::error!("{e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run(cli: Cli) -> Result<(), BenchError> {
+    match cli.cmd {
+        Sub::Engines => {
+            for e in engine_names() {
+                tracing::info!(engine = e, "adapter");
+            }
+            Ok(())
+        }
+        Sub::Render {
+            engine,
+            scene,
+            corpus,
+            out,
+            out_dir,
+        } => {
+            let mut engine = create_engine(&engine)?;
+            for dir in scene_dirs(scene.as_deref(), corpus.as_deref())? {
+                let out_path = match (&out, &out_dir) {
+                    (Some(o), None) => o.clone(),
+                    (None, Some(d)) => d.join(format!(
+                        "render-{}-{}.json",
+                        engine.info().name,
+                        dir.file_name().unwrap_or_default().to_string_lossy()
+                    )),
+                    _ => return Err(BenchError::Engine("--out or --out-dir required".into())),
+                };
+                match render_scene(&mut *engine, &dir) {
+                    Ok(rendered) => {
+                        write_render(&rendered, &out_path)?;
+                        tracing::info!(
+                            scene = %dir.display(),
+                            flip_mean = rendered.report.metrics.flip_mean,
+                            flip_max = rendered.report.metrics.flip_max,
+                            max_local_error = rendered.report.metrics.max_local_error,
+                            out = %out_path.display(),
+                            "render"
+                        );
+                    }
+                    Err(BenchError::Unsupported { feature, api, .. }) => {
+                        write_unsupported(&*engine, &dir, feature.clone(), api, &out_path)?;
+                        tracing::warn!(
+                            scene = %dir.display(),
+                            ?feature,
+                            out = %out_path.display(),
+                            "unsupported"
+                        );
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(())
+        }
+        Sub::Measure {
+            engine,
+            scene,
+            corpus,
+            frames,
+            warmup,
+            out,
+            out_dir,
+            cpu,
+        } => measure_cmd(
+            &engine,
+            MeasureOpts {
+                scene: scene.as_deref(),
+                corpus: corpus.as_deref(),
+                frames,
+                warmup,
+                out: out.as_deref(),
+                out_dir: out_dir.as_deref(),
+                cpu: cpu.as_deref(),
+            },
+        ),
+    }
+}
+
+/// The `measure` subcommand's fields, borrowed to avoid cloning paths.
+#[derive(Clone, Copy)]
+struct MeasureOpts<'a> {
+    scene: Option<&'a Path>,
+    corpus: Option<&'a Path>,
+    frames: u32,
+    warmup: u32,
+    out: Option<&'a Path>,
+    out_dir: Option<&'a Path>,
+    cpu: Option<&'a str>,
+}
+
+fn measure_cmd(engine: &str, opts: MeasureOpts<'_>) -> Result<(), BenchError> {
+    let pinned = opts.cpu.map(affinity::parse_cpu_list).transpose()?;
+    if let Some(cpus) = &pinned {
+        // Pin before the adapter is created so every thread it spawns
+        // inherits the mask.
+        affinity::pin_current_thread(cpus)?;
+    }
+    let mut engine = create_engine(engine)?;
+    for dir in scene_dirs(opts.scene, opts.corpus)? {
+        let out_path = match (opts.out, opts.out_dir) {
+            (Some(o), None) => o.to_path_buf(),
+            (None, Some(d)) => d.join(format!(
+                "measure-{}-{}.json",
+                engine.info().name,
+                dir.file_name().unwrap_or_default().to_string_lossy()
+            )),
+            _ => return Err(BenchError::Engine("--out or --out-dir required".into())),
+        };
+        match measure_scene(
+            &mut *engine,
+            &dir,
+            opts.frames,
+            opts.warmup,
+            pinned.as_deref(),
+        ) {
+            Ok(report) => {
+                write_json(&report, &out_path)?;
+                tracing::info!(
+                    scene = %dir.display(),
+                    prepare_s = report.prepare_seconds,
+                    encode_p50 = report.percentiles.encode_seconds[0],
+                    submit_p50 = report.percentiles.submit_seconds[0],
+                    gpu_p50 = ?report.percentiles.gpu_seconds.map(|g| g[0]),
+                    out = %out_path.display(),
+                    "measure"
+                );
+            }
+            Err(BenchError::Unsupported { feature, api, .. }) => {
+                write_unsupported(&*engine, &dir, feature.clone(), api, &out_path)?;
+                tracing::warn!(
+                    scene = %dir.display(),
+                    ?feature,
+                    out = %out_path.display(),
+                    "unsupported"
+                );
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// `--scene` gives one dir; `--corpus` gives every child holding
+/// `scene.json`, sorted by name.
+fn scene_dirs(scene: Option<&Path>, corpus: Option<&Path>) -> Result<Vec<PathBuf>, BenchError> {
+    if let Some(d) = scene {
+        return Ok(vec![d.to_path_buf()]);
+    }
+    let corpus = corpus.ok_or_else(|| BenchError::Engine("no scene or corpus".into()))?;
+    let mut dirs = Vec::new();
+    for entry in std::fs::read_dir(corpus)? {
+        let dir = entry?.path();
+        if dir.is_dir() && dir.join("scene.json").is_file() {
+            dirs.push(dir);
+        }
+    }
+    dirs.sort();
+    if dirs.is_empty() {
+        return Err(BenchError::Engine(format!(
+            "no scenes under {}",
+            corpus.display()
+        )));
+    }
+    Ok(dirs)
+}
+
+/// Rendered image + heatmap, written next to the metrics JSON.
+struct RenderOutput {
+    /// The metrics report.
+    report: RenderReport,
+    /// Engine image.
+    image: F32Image,
+    /// Error heatmap, RGB8.
+    heatmap: Vec<u8>,
+}
+
+fn render_scene(engine: &mut dyn Engine, dir: &Path) -> Result<RenderOutput, BenchError> {
+    let scene = Scene::load(dir)?;
+    let blobs = convert::load_blobs(&scene, dir)?;
+    let reference =
+        Renderer::new(scene.width as usize, scene.height as usize).render(&scene, dir)?;
+    let input = EncodeInput {
+        scene: &scene,
+        blobs: &blobs,
+    };
+    engine.prepare(&input)?;
+    engine.encode(&input)?;
+    let submit = engine.submit(true)?;
+    let test = submit
+        .image
+        .ok_or_else(|| BenchError::Engine("adapter returned no image".into()))?;
+    let (metrics_v, heatmap) = metrics::compare(&reference, &test);
+    Ok(RenderOutput {
+        report: RenderReport {
+            engine: engine.info().name,
+            info: engine.info().clone(),
+            scene: dir
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            width: scene.width,
+            height: scene.height,
+            metrics: metrics_v,
+            counters: engine.counters(),
+            device: engine.device(),
+        },
+        image: test,
+        heatmap,
+    })
+}
+
+fn measure_scene(
+    engine: &mut dyn Engine,
+    dir: &Path,
+    frames: u32,
+    warmup: u32,
+    pinned: Option<&[u32]>,
+) -> Result<MeasureReport, BenchError> {
+    let scene = Scene::load(dir)?;
+    let blobs = convert::load_blobs(&scene, dir)?;
+    let input = EncodeInput {
+        scene: &scene,
+        blobs: &blobs,
+    };
+    let heterogeneous = affinity::cpu_freqs_differ();
+    if pinned.is_none() && heterogeneous {
+        tracing::warn!(
+            "CPUs report differing max frequencies; this run's placement is uncontrolled — \
+             pass --cpu (e.g. --cpu 7) to pin to one cluster"
+        );
+    }
+    let prepare_cpu = affinity::current_cpu();
+    let t_prepare = Instant::now();
+    engine.prepare(&input)?;
+    let prepare_seconds = t_prepare.elapsed().as_secs_f64();
+    let mut samples = Vec::with_capacity(frames as usize);
+    for frame in 0..(warmup + frames) {
+        let cpu_start = affinity::current_cpu();
+        let t0 = Instant::now();
+        engine.encode(&input)?;
+        let t1 = Instant::now();
+        let submit = engine.submit(false)?;
+        let t2 = Instant::now();
+        let cpu_end = affinity::current_cpu();
+        if frame >= warmup {
+            samples.push(FrameSample {
+                encode_seconds: t1.duration_since(t0).as_secs_f64(),
+                submit_seconds: t2.duration_since(t1).as_secs_f64(),
+                gpu_seconds: submit.gpu_seconds,
+                cpu_start,
+                cpu_end,
+                migrated: matches!((cpu_start, cpu_end), (Some(a), Some(b)) if a != b),
+            });
+        }
+    }
+    let mut cpus = BTreeMap::<u32, CpuUse>::new();
+    let mut count_cpu = |cpu: Option<u32>| {
+        if let Some(cpu) = cpu {
+            cpus.entry(cpu)
+                .or_insert_with(|| CpuUse {
+                    count: 0,
+                    max_freq_khz: affinity::cpu_max_freq_khz(cpu),
+                })
+                .count += 1;
+        }
+    };
+    count_cpu(prepare_cpu);
+    let mut migrated = 0u32;
+    for sample in &samples {
+        count_cpu(sample.cpu_start);
+        count_cpu(sample.cpu_end);
+        migrated += u32::from(sample.migrated);
+    }
+    let enc: Vec<f64> = samples.iter().map(|s| s.encode_seconds).collect();
+    let sub: Vec<f64> = samples.iter().map(|s| s.submit_seconds).collect();
+    let gpu: Vec<f64> = samples.iter().filter_map(|s| s.gpu_seconds).collect();
+    Ok(MeasureReport {
+        engine: engine.info().name,
+        info: engine.info().clone(),
+        scene: dir
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
+        width: scene.width,
+        height: scene.height,
+        prepare_seconds,
+        warmup_frames: warmup,
+        samples,
+        placement: Placement {
+            requested: pinned.map(<[u32]>::to_vec),
+            controlled: pinned.is_some(),
+            heterogeneous,
+            prepare_cpu,
+            cpus,
+            migrated,
+        },
+        percentiles: Percentiles {
+            encode_seconds: percentiles(&enc).unwrap_or([0.0; 3]),
+            submit_seconds: percentiles(&sub).unwrap_or([0.0; 3]),
+            gpu_seconds: percentiles(&gpu),
+        },
+        counters: engine.counters(),
+        device: engine.device(),
+    })
+}
+
+/// Record a scene the adapter cannot execute faithfully.
+fn write_unsupported(
+    engine: &dyn Engine,
+    dir: &Path,
+    feature: cherenkov_scene::Feature,
+    api: Option<&'static str>,
+    out: &Path,
+) -> Result<(), BenchError> {
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    write_json(
+        &UnsupportedReport {
+            engine: engine.info().name,
+            info: engine.info().clone(),
+            scene: dir
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            unsupported: feature,
+            missing_api: api,
+        },
+        out,
+    )
+}
+
+fn write_render(rendered: &RenderOutput, out: &Path) -> Result<(), BenchError> {
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let stem = out.parent().map_or_else(
+        || out.with_extension(""),
+        |p| p.join(out.file_stem().unwrap_or_default()),
+    );
+    rendered
+        .image
+        .write_png(&stem.with_extension("engine.png"))?;
+    metrics::write_heatmap(
+        &rendered.heatmap,
+        rendered.image.width,
+        rendered.image.height,
+        &stem.with_extension("heatmap.png"),
+    )?;
+    write_json(&rendered.report, out)
+}
+
+fn write_json<T: serde::Serialize>(v: &T, path: &Path) -> Result<(), BenchError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut text = serde_json::to_string_pretty(v)
+        .map_err(|e| BenchError::Engine(format!("json serialize: {e}")))?;
+    text.push('\n');
+    std::fs::write(path, text)?;
+    Ok(())
+}

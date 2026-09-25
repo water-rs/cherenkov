@@ -156,6 +156,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cherenkov-shader"
+version = "0.0.0"
+dependencies = [
+ "half",
+ "naga",
+ "thiserror",
+]
+
+[[package]]
 name = "clap"
 version = "4.6.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

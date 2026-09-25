@@ -66,6 +66,40 @@ pub fn grayscale(params: [f32; 1], space: &WorkingSpace, pixels: &mut [[f32; 4]]
     Matrix::luma_mix(space, 1.0 - intensity, intensity).apply(pixels);
 }
 
+/// [`HueRotation`](crate::filters::HueRotation): the CSS/SVG `hue-rotate`
+/// matrix (Filter Effects Module Level 1, `feColorMatrix
+/// type="hueRotate"`) on premultiplied RGB, alpha unchanged.
+pub fn hue_rotation(params: [f32; 1], _space: &WorkingSpace, pixels: &mut [[f32; 4]]) {
+    let (sin, cos) = params[0].to_radians().sin_cos();
+    // A spec coefficient: `base + cos·cos_k + sin·sin_k`.
+    let coefficient =
+        |base: f32, cos_k: f32, sin_k: f32| sin.mul_add(sin_k, cos.mul_add(cos_k, base));
+    Matrix([
+        // Columns are the red, green and blue input channels' contributions
+        // to (r', g', b').
+        f32x4::new([
+            coefficient(0.213, 0.787, -0.213),
+            coefficient(0.213, -0.213, 0.143),
+            coefficient(0.213, -0.213, -0.787),
+            0.0,
+        ]),
+        f32x4::new([
+            coefficient(0.715, -0.715, -0.715),
+            coefficient(0.715, 0.285, 0.140),
+            coefficient(0.715, -0.715, 0.715),
+            0.0,
+        ]),
+        f32x4::new([
+            coefficient(0.072, -0.072, 0.928),
+            coefficient(0.072, -0.072, -0.283),
+            coefficient(0.072, 0.928, 0.072),
+            0.0,
+        ]),
+        f32x4::new([0.0, 0.0, 0.0, 1.0]),
+    ])
+    .apply(pixels);
+}
+
 /// [`ColorMatrix`](crate::filters::ColorMatrix): the 3x4 matrix on
 /// straight-alpha RGB, whose bias column scales with alpha on premultiplied
 /// colour.

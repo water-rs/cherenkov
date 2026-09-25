@@ -4,9 +4,10 @@ use crate::Filter;
 
 /// Rotates the hue of all colors around the color wheel.
 ///
-/// Converts straight-alpha colour to HSL, rotates hue, and converts back to
-/// RGB. The HSL round trip is piecewise, so the filter is not
-/// [`LINEAR`](crate::ColorFilter::LINEAR).
+/// Applies the CSS/SVG `hue-rotate` matrix (Filter Effects Module Level 1,
+/// `feColorMatrix type="hueRotate"`) to the premultiplied colour, alpha
+/// unchanged — a linear map, so the filter is
+/// [`LINEAR`](crate::ColorFilter::LINEAR). It carries a SIMD CPU kernel.
 ///
 /// # Parameters
 ///
@@ -23,7 +24,12 @@ use crate::Filter;
 /// # assert_eq!(complement.params(), [180.0]);
 /// ```
 #[derive(Debug, Clone, Copy, Filter)]
-#[filter(color, shader = "color/transform/hue_rotation.wgsl", linear = false)]
+#[filter(
+    color,
+    shader = "color/transform/hue_rotation.wgsl",
+    linear = true,
+    cpu = crate::cpu::hue_rotation
+)]
 pub struct HueRotation<T>(pub T);
 
 #[cfg(test)]

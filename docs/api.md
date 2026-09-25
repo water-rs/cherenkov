@@ -20,6 +20,8 @@ Sections marked **Proposal** are not yet agreed; everything else records a decis
 | `cherenkov` | `src/` | Front end: API types, recording, layer tree, animation, CPU geometry. No GPU dependency. |
 | `cherenkov-gpu` | `gpu/` | GPU backend `Gpu` and the wgpu, Apple, Android, Windows and Wayland interop. |
 | `cherenkov-cpu` | `cpu/` | CPU backends `Raster` (desktop/server: full framebuffer, multi-threaded, SIMD) and `Banded<P>` (microcontroller: banded output, panel pixel formats, flash-resident assets). |
+| `cherenkov-shader` | `shader/` | The shared shader composer on naga IR, used by the engine and by filtrate. |
+| `filtrate`, `filtrate-core`, `filtrate-derive` | `filtrate/` | Independent filter library: definitions, a thin reference executor, and a derive macro. It keeps its own name and does not depend on the engine crates. |
 
 Capabilities are traits implemented by backend types, so using a missing capability is a compile error:
 

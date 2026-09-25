@@ -1,0 +1,123 @@
+{
+  "width": 128,
+  "height": 128,
+  "working_space": "linear-display-p3",
+  "clear": {
+    "space": "srgb",
+    "components": [
+      0.95,
+      0.95,
+      0.95,
+      1.0
+    ]
+  },
+  "features": [
+    {
+      "feature": "fill"
+    },
+    {
+      "feature": "path"
+    }
+  ],
+  "root": {
+    "transform": [
+      1.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0
+    ],
+    "opacity": 1.0,
+    "blend": "normal",
+    "items": [
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "path": {
+                "path": [
+                  {
+                    "MoveTo": {
+                      "x": 16.0,
+                      "y": 96.0
+                    }
+                  },
+                  {
+                    "CurveTo": [
+                      {
+                        "x": 16.0,
+                        "y": 30.0
+                      },
+                      {
+                        "x": 64.0,
+                        "y": 10.0
+                      },
+                      {
+                        "x": 64.0,
+                        "y": 48.0
+                      }
+                    ]
+                  },
+                  {
+                    "QuadTo": [
+                      {
+                        "x": 64.0,
+                        "y": 86.0
+                      },
+                      {
+                        "x": 96.0,
+                        "y": 96.0
+                      }
+                    ]
+                  },
+                  {
+                    "LineTo": {
+                      "x": 112.0,
+                      "y": 96.0
+                    }
+                  },
+                  {
+                    "LineTo": {
+                      "x": 112.0,
+                      "y": 48.0
+                    }
+                  },
+                  {
+                    "CurveTo": [
+                      {
+                        "x": 112.0,
+                        "y": 20.0
+                      },
+                      {
+                        "x": 88.0,
+                        "y": 12.0
+                      },
+                      {
+                        "x": 64.0,
+                        "y": 24.0
+                      }
+                    ]
+                  },
+                  "ClosePath"
+                ]
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.3,
+                  0.2,
+                  0.7,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      }
+    ]
+  }
+}

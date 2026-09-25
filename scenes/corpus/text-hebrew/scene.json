@@ -1,0 +1,162 @@
+{
+  "width": 320,
+  "height": 160,
+  "working_space": "linear-display-p3",
+  "clear": {
+    "space": "srgb",
+    "components": [
+      0.95,
+      0.95,
+      0.95,
+      1.0
+    ]
+  },
+  "features": [
+    {
+      "feature": "glyphs"
+    },
+    {
+      "feature": "font-variations"
+    }
+  ],
+  "root": {
+    "transform": [
+      1.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0
+    ],
+    "opacity": 1.0,
+    "blend": "normal",
+    "items": [
+      {
+        "draw": {
+          "glyphs": {
+            "font": "02e8e4dede142213ffc4cab94e6581478418a7656ae283cded1b05d2a827cfff",
+            "font_index": 0,
+            "size": 34.0,
+            "normalized_coords": [
+              {
+                "tag": "wght",
+                "value": 0.375
+              }
+            ],
+            "glyphs": [
+              {
+                "id": 73,
+                "x": 12.0,
+                "y": 48.312
+              },
+              {
+                "id": 92,
+                "x": 31.584002,
+                "y": 48.312
+              },
+              {
+                "id": 91,
+                "x": 51.168003,
+                "y": 48.312
+              }
+            ],
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.1,
+                  0.1,
+                  0.12,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "glyphs": {
+            "font": "02e8e4dede142213ffc4cab94e6581478418a7656ae283cded1b05d2a827cfff",
+            "font_index": 0,
+            "size": 34.0,
+            "normalized_coords": [
+              {
+                "tag": "wght",
+                "value": 0.375
+              }
+            ],
+            "glyphs": [
+              {
+                "id": 6,
+                "x": 70.75201,
+                "y": 48.312
+              },
+              {
+                "id": 55,
+                "x": 79.93201,
+                "y": 48.312
+              },
+              {
+                "id": 2,
+                "x": 88.364006,
+                "y": 48.312
+              },
+              {
+                "id": 4,
+                "x": 111.62001,
+                "y": 48.312
+              },
+              {
+                "id": 7,
+                "x": 129.36801,
+                "y": 48.312
+              },
+              {
+                "id": 1,
+                "x": 139.60202,
+                "y": 48.312
+              },
+              {
+                "id": 6,
+                "x": 159.764,
+                "y": 48.312
+              },
+              {
+                "id": 2,
+                "x": 168.944,
+                "y": 48.312
+              },
+              {
+                "id": 7,
+                "x": 191.86,
+                "y": 48.312
+              },
+              {
+                "id": 4,
+                "x": 202.094,
+                "y": 48.312
+              },
+              {
+                "id": 5,
+                "x": 219.842,
+                "y": 48.312
+              }
+            ],
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.1,
+                  0.1,
+                  0.12,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      }
+    ]
+  }
+}

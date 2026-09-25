@@ -1,0 +1,94 @@
+{
+  "width": 128,
+  "height": 128,
+  "working_space": "linear-display-p3",
+  "clear": {
+    "space": "srgb",
+    "components": [
+      0.95,
+      0.95,
+      0.95,
+      1.0
+    ]
+  },
+  "features": [
+    {
+      "feature": "fill"
+    },
+    {
+      "feature": "clip"
+    }
+  ],
+  "root": {
+    "transform": [
+      1.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0
+    ],
+    "opacity": 1.0,
+    "blend": "normal",
+    "items": [
+      {
+        "layer": {
+          "transform": [
+            0.9210609940028851,
+            0.3894183423086505,
+            -0.3894183423086505,
+            0.9210609940028851,
+            -14.527036456971196,
+            -16.99897678620186
+          ],
+          "clip": {
+            "rounded-rect": {
+              "rect": {
+                "x0": 16.0,
+                "y0": 16.0,
+                "x1": 112.0,
+                "y1": 112.0
+              },
+              "radii": {
+                "top_left": 12.0,
+                "top_right": 12.0,
+                "bottom_right": 12.0,
+                "bottom_left": 12.0
+              }
+            }
+          },
+          "opacity": 1.0,
+          "blend": "normal",
+          "items": [
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rect": {
+                      "x0": 0.0,
+                      "y0": 0.0,
+                      "x1": 160.0,
+                      "y1": 160.0
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "solid": {
+                      "space": "srgb",
+                      "components": [
+                        0.2,
+                        0.6,
+                        0.4,
+                        1.0
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

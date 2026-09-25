@@ -20,7 +20,16 @@ serde_json = "1"
 
 [workspace]
 resolver = "3"
-members = [".", "filtrate", "filtrate/core", "filtrate/derive", "shader"]
+members = [
+    ".",
+    "filtrate",
+    "filtrate/core",
+    "filtrate/derive",
+    "shader",
+    "scene",
+    "oracle",
+    "bench",
+]
 
 [workspace.package]
 edition = "2024"
@@ -44,3 +53,18 @@ workspace = true
 [patch.crates-io]
 nami = { git = "https://github.com/water-rs/nami", rev = "6908aac816de14ee5aff23bfffd7d2b109d08fea" }
 nami-core = { git = "https://github.com/water-rs/nami", rev = "6908aac816de14ee5aff23bfffd7d2b109d08fea" }
+
+# The suite's vello baseline is the fork WaterUI and Hydrolysis actually ship,
+# not crates.io. `vello` carries our Mali Vulkan device-loss fix
+# (linebender/vello#1817, still open upstream) plus the glifo canonical-location
+# hint-cache fix applied to vello_encoding's GlyphCache (branch
+# `glifo-canonical-location-classic`, on the Mali rev). The sparse-strip
+# crates and glifo sit on the same canonical-location fix at
+# `glifo-canonical-location` — without it, an explicit all-default location
+# (`[0, 0, …]`) never matched a stored hint entry and every glyph run repaid
+# a HintingInstance reconfigure.
+vello = { git = "https://github.com/lexoliu/vello", rev = "7f5e1ca5769a96dc4404b812e7fa0351499cd2c4" }
+vello_hybrid = { git = "https://github.com/lexoliu/vello", rev = "a01e5039c290fa869e0f6f3708e621056740f49b" }
+vello_common = { git = "https://github.com/lexoliu/vello", rev = "a01e5039c290fa869e0f6f3708e621056740f49b" }
+vello_sparse_shaders = { git = "https://github.com/lexoliu/vello", rev = "a01e5039c290fa869e0f6f3708e621056740f49b" }
+glifo = { git = "https://github.com/lexoliu/vello", rev = "a01e5039c290fa869e0f6f3708e621056740f49b" }

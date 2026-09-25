@@ -1,0 +1,171 @@
+{
+  "width": 96,
+  "height": 96,
+  "working_space": "linear-display-p3",
+  "clear": {
+    "space": "srgb",
+    "components": [
+      0.7,
+      0.5,
+      0.2,
+      1.0
+    ]
+  },
+  "features": [
+    {
+      "feature": "fill"
+    },
+    {
+      "feature": "linear-gradient"
+    },
+    {
+      "feature": "blend",
+      "value": "saturation"
+    },
+    {
+      "feature": "interpolation-space",
+      "value": "srgb"
+    }
+  ],
+  "root": {
+    "transform": [
+      1.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0
+    ],
+    "opacity": 1.0,
+    "blend": "normal",
+    "items": [
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rect": {
+                "x0": 0.0,
+                "y0": 0.0,
+                "x1": 96.0,
+                "y1": 96.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "linear": {
+                "start": {
+                  "x": 0.0,
+                  "y": 0.0
+                },
+                "end": {
+                  "x": 96.0,
+                  "y": 96.0
+                },
+                "stops": [
+                  {
+                    "offset": 0.0,
+                    "color": {
+                      "space": "srgb",
+                      "components": [
+                        0.9,
+                        0.5,
+                        0.1,
+                        1.0
+                      ]
+                    }
+                  },
+                  {
+                    "offset": 1.0,
+                    "color": {
+                      "space": "srgb",
+                      "components": [
+                        0.1,
+                        0.3,
+                        0.8,
+                        1.0
+                      ]
+                    }
+                  }
+                ],
+                "extend": "pad",
+                "interpolation": "srgb"
+              }
+            }
+          }
+        }
+      },
+      {
+        "layer": {
+          "transform": [
+            1.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0
+          ],
+          "opacity": 1.0,
+          "blend": "saturation",
+          "items": [
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "circle": {
+                      "center": {
+                        "x": 48.0,
+                        "y": 48.0
+                      },
+                      "radius": 34.0
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 14.0,
+                        "y": 14.0
+                      },
+                      "end": {
+                        "x": 82.0,
+                        "y": 82.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.2,
+                              0.9,
+                              0.4,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.9,
+                              0.2,
+                              0.6,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

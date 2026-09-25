@@ -31,8 +31,8 @@
 //!   an executor needs before pushing a filter down into the shading of
 //!   each primitive.
 //! - A [`SpatialFilter`] samples its input around each pixel. Its
-//!   [`SpatialFilter::footprint`] is the largest distance, in pixels, of any
-//!   sample it takes.
+//!   [`SpatialFilter::footprint`] is the largest distance of any sample it
+//!   takes, in pixels plus a fraction of the image extent.
 //!
 //! [`Chain<A, B>`] is a colour filter exactly when both halves are, and a
 //! spatial filter otherwise.
@@ -95,7 +95,7 @@ mod stage;
 mod visitor;
 
 pub use animation::AnimationTrack;
-pub use filter::{Chain, ColorFilter, Filter, FilterExt, SpatialFilter};
+pub use filter::{Chain, ColorFilter, Filter, FilterExt, Footprint, SpatialFilter};
 pub use image::{AuxData, AuxFormat, AuxImage, ImageVisitor};
 pub use kernel::CpuKernel;
 pub use param::{AnimatedCallback, AnimatedTarget, FilterParam, Interpolator, WatchGuard};

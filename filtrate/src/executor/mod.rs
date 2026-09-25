@@ -99,12 +99,13 @@ impl<F: Filter> Executor<F> {
     /// It evaluates [`SpatialFilter::footprint_of`] at every parameter's
     /// largest magnitude over its animation track (see
     /// [`AnimationTrack::magnitude_bound`](crate::AnimationTrack::magnitude_bound)),
-    /// after applying the parameter changes received so far.
-    pub fn footprint(&mut self) -> f32
+    /// after applying the parameter changes received so far, and resolves
+    /// the result against the input's `(width, height)` in pixels.
+    pub fn footprint(&mut self, size: (f32, f32)) -> f32
     where
         F: SpatialFilter,
     {
-        F::footprint_of(&F::Params::read_from(&self.animator.magnitude_bounds()))
+        F::footprint_of(&F::Params::read_from(&self.animator.magnitude_bounds())).resolve(size)
     }
 
     /// The per-frame sampled parameter values, for test observation.
@@ -124,7 +125,28 @@ impl<F: Filter> Executor<F> {
         &mut self,
         ctx: &EffectContext<'_>,
     ) -> EffectSetupResult {
-        self.attach(Gpu::with_filterability(&self.filter, ctx, false, false).await)
+        self.attach(Gpu::with_options(&self.filter, ctx, false, false, false).await)
+    }
+
+    /// `setup` picking the composer's folded alternative wherever offered —
+    /// tests compare it against the plain program this executor takes.
+    #[cfg(test)]
+    #[expect(
+        clippy::future_not_send,
+        reason = "the executor owns device-bound pipelines and is set up on the GPU host thread"
+    )]
+    pub(crate) async fn setup_folded(&mut self, ctx: &EffectContext<'_>) -> EffectSetupResult {
+        let features = ctx.device.features();
+        self.attach(
+            Gpu::with_options(
+                &self.filter,
+                ctx,
+                gpu::filterable(ctx.input_format, features),
+                gpu::filterable(gpu::INTERMEDIATE_FORMAT, features),
+                true,
+            )
+            .await,
+        )
     }
 
     /// Runs the built pipelines, or sticks the setup error.

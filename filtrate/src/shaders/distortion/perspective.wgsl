@@ -61,7 +61,7 @@ fn inverse3x3(m: mat3x3<f32>) -> mat3x3<f32> {
     return transpose(mat3x3<f32>(c0, c1, c2)) * (1.0 / det);
 }
 
-fn apply(input: texture_2d<f32>, input_sampler: sampler, uv: vec2<f32>, params: Params) -> vec4<f32> {
+fn apply(input: texture_2d<f32>, input_sampler: sampler, uv: vec2<f32>, size: vec2<f32>, params: Params) -> vec4<f32> {
     let h = unit_square_homography(
         vec2<f32>(params.tl_x, params.tl_y),
         vec2<f32>(params.tr_x, params.tr_y),

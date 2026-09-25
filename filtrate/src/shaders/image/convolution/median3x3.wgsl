@@ -31,13 +31,7 @@ fn median9(values: array<vec4<f32>, 9>) -> vec4<f32> {
     compare_swap(&v, 4u, 2u);
     return v[4u];
 }
-
-fn load(input: texture_2d<f32>, input_point_sampler: sampler, size: vec2<f32>, pixel: vec2<f32>) -> vec4<f32> {
-    return textureSampleLevel(input, input_point_sampler, (pixel + 0.5) / size, 0.0);
-}
-
-fn apply(input: texture_2d<f32>, input_point_sampler: sampler, uv: vec2<f32>) -> vec4<f32> {
-    let size = vec2<f32>(textureDimensions(input));
+fn apply(input: texture_2d<f32>, input_point_sampler: sampler, uv: vec2<f32>, size: vec2<f32>) -> vec4<f32> {
     let pixel = floor(uv * size);
 
     var samples: array<vec4<f32>, 9>;

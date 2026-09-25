@@ -1,8 +1,8 @@
 //! Blur filter implementation.
 
 use crate::{
-    Filter, FilterParam, OperatingSpace, ParamSource, Placed, SignalVisitor, SpatialFilter,
-    SpatialStage, StageCollector, filters::footprint, kind,
+    Filter, FilterParam, Footprint, OperatingSpace, ParamSource, Placed, SignalVisitor,
+    SpatialFilter, SpatialStage, StageCollector, filters::footprint, kind,
 };
 
 /// The separable box blur's stage: one axis, specialized per pass.
@@ -43,13 +43,13 @@ const VERTICAL: SpatialStage = SpatialStage {
 /// # Example
 ///
 /// ```rust
-/// # use filtrate::{Filter, SpatialFilter};
+/// # use filtrate::{Filter, Footprint, SpatialFilter};
 /// use filtrate::filters::Blur;
 ///
 /// let soft = Blur(5.0_f32);
 /// let heavy = Blur(20.0_f32);
 /// # assert_eq!(soft.params(), [5.0]);
-/// # assert_eq!(heavy.footprint(), 20.0);
+/// # assert_eq!(heavy.footprint(), Footprint::pixels(20.0));
 /// ```
 #[derive(Debug, Clone, Copy)]
 pub struct Blur<T>(pub T);
@@ -74,8 +74,8 @@ impl<T: FilterParam> Filter for Blur<T> {
 }
 
 impl<T: FilterParam> SpatialFilter for Blur<T> {
-    fn footprint_of(params: &[f32; 1]) -> f32 {
-        footprint::rounded(params[0])
+    fn footprint_of(params: &[f32; 1]) -> Footprint {
+        Footprint::pixels(footprint::rounded(params[0]))
     }
 }
 
@@ -87,6 +87,6 @@ mod tests {
     fn test_blur_params() {
         let filter = Blur(10.0f32);
         assert_eq!(filter.params(), [10.0]);
-        assert_eq!(filter.footprint(), 10.0);
+        assert_eq!(filter.footprint(), Footprint::pixels(10.0));
     }
 }

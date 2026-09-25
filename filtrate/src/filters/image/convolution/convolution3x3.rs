@@ -39,6 +39,9 @@ mod tests {
     fn convolution3x3_param_count() {
         let identity = Convolution3x3([0.0_f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]);
         assert_eq!(identity.params().len(), 9);
-        assert_eq!(crate::SpatialFilter::footprint(&identity), 1.0);
+        assert_eq!(
+            crate::SpatialFilter::footprint(&identity),
+            crate::Footprint::pixels(1.0)
+        );
     }
 }

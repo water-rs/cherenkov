@@ -1,10 +1,13 @@
 //! Composing a chain of snippets into one module.
 
-use std::{collections::HashMap, ops::Range};
+use std::{
+    collections::{HashMap, HashSet, hash_map::Entry},
+    ops::Range,
+};
 
 use naga::{
-    BinaryOperator, Expression, Function, FunctionArgument, Handle, ImageQuery, Literal,
-    MathFunction, Module, Scalar, ScalarKind, StructMember, Type, TypeInner, VectorSize,
+    BinaryOperator, Expression, Function, FunctionArgument, Handle, Literal, MathFunction, Module,
+    Scalar, ScalarKind, StructMember, Type, TypeInner, VectorSize,
     compact::{KeepUnused, compact},
     valid::{Capabilities, ModuleInfo, ValidationFlags, Validator},
 };
@@ -14,7 +17,7 @@ use crate::{
     builder::FunctionBuilder,
     errors::ComposeError,
     import::{GENERATED, Importer, identifier},
-    parse::{self, ArgSlots, SampleCount, Snippet, Variant},
+    parse::{self, ArgSlots, ParsedLibrary, SampleCount, Snippet, Variant},
     rewrite,
 };
 
@@ -100,6 +103,10 @@ pub struct UniformMember {
 /// The uniform block of a segment, laid out by WGSL uniform rules.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UniformLayout {
+    /// Spatial segments only: the byte offset of the `size` member, the
+    /// `vec2<f32>` carrying the segment's input extent in pixels. It is
+    /// the block's first member, always at offset 0.
+    pub input_size: Option<u32>,
     /// The dynamic parameters, in offset order.
     pub members: Vec<UniformMember>,
     /// The block size in bytes; zero when every parameter is constant.
@@ -248,6 +255,7 @@ pub fn compose(stages: &[Stage<'_>], options: ComposeOptions) -> Result<Composit
         .enumerate()
         .map(|(index, stage)| resolve_constants(index, stage))
         .collect::<Result<Vec<_>, _>>()?;
+    check_libraries(stages, options)?;
 
     let mut composer = Composer::new(options);
     for (index, stage) in stages.iter().enumerate() {
@@ -291,6 +299,92 @@ pub fn compose(stages: &[Stage<'_>], options: ComposeOptions) -> Result<Composit
     }
 
     composer.finish(pieces)
+}
+
+/// Rejects function-name collisions between the composition's registered
+/// libraries — and between a library and a snippet — and two libraries
+/// that share a name but are not the same library.
+fn check_libraries(stages: &[Stage<'_>], options: ComposeOptions) -> Result<(), ComposeError> {
+    let mut libraries: HashMap<&str, &ParsedLibrary> = HashMap::new();
+    for stage in stages {
+        for library in stage.snippet.libraries() {
+            match libraries.entry(library.name()) {
+                Entry::Occupied(registered) => {
+                    if !registered.get().same_library(library) {
+                        return Err(ComposeError::DuplicateLibrary {
+                            name: library.name().to_owned(),
+                        });
+                    }
+                }
+                Entry::Vacant(slot) => {
+                    slot.insert(library);
+                }
+            }
+        }
+    }
+    // A library function carries its own name into the composed module, so
+    // the name may come from only one origin — and only the variant each
+    // stage actually imports can collide: an f16-only name never meets an
+    // f32 name at f32.
+    let want = Variant {
+        precision: options.precision,
+        subgroups: options.subgroups,
+    };
+    let mut owners: HashMap<&str, String> = HashMap::new();
+    for stage in stages {
+        let (variant, _) = stage.snippet.select(want);
+        for library in stage.snippet.libraries() {
+            let lib_variant = library
+                .variant(variant.precision)
+                .expect("snippet parsing checked the variant exists");
+            let owner = format!("library `{}`", library.name());
+            for function in &lib_variant.functions {
+                match owners.entry(function.as_str()) {
+                    Entry::Occupied(existing) => {
+                        // Both precisions of one library are one origin.
+                        if existing.get() != &owner {
+                            return Err(ComposeError::LibraryConflict {
+                                name: function.clone(),
+                                first: existing.get().clone(),
+                                second: owner,
+                            });
+                        }
+                    }
+                    Entry::Vacant(slot) => {
+                        slot.insert(owner.clone());
+                    }
+                }
+            }
+        }
+    }
+    for stage in stages {
+        let (variant, parsed) = stage.snippet.select(want);
+        // The parsed module also holds the libraries' sources — exclude
+        // them: a snippet's own function is what is left.
+        let imported: HashSet<&str> = stage
+            .snippet
+            .libraries()
+            .iter()
+            .filter_map(|library| library.variant(variant.precision))
+            .flat_map(|variant| variant.functions.iter().map(String::as_str))
+            .collect();
+        for (_, function) in parsed.module.functions.iter() {
+            let Some(name) = function.name.as_deref() else {
+                continue;
+            };
+            if imported.contains(name) {
+                continue;
+            }
+            if let Some(owner) = owners.get(name) {
+                return Err(ComposeError::LibraryConflict {
+                    name: name.to_owned(),
+                    first: owner.clone(),
+                    second: format!("snippet `{}`", stage.snippet.name()),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn resolve_constants(
@@ -353,12 +447,19 @@ impl Imported {
     }
 }
 
-struct Composer {
+struct Composer<'a> {
     module: Module,
     options: ComposeOptions,
     capabilities: Capabilities,
     stages: Vec<Imported>,
     working_space: Handle<Type>,
+    /// `(library name, precision, function name)` to the canonical import
+    /// of that library function — the one copy every stage shares.
+    library_functions: HashMap<(String, Precision, String), Handle<Function>>,
+    /// `(library name, precision)` to the importer sharing that library's
+    /// copies — one per composed module, so a callee reached through two
+    /// imports lands once.
+    library_importers: HashMap<(String, Precision), Importer<'a>>,
     /// The manual bilinear, built on first use — shared by every manual
     /// segment.
     bilinear: Option<Handle<Function>>,
@@ -380,11 +481,13 @@ struct Inputs {
     working_space: Option<Handle<Expression>>,
     shape: Option<Handle<Expression>>,
     aux: Vec<Handle<Expression>>,
+    /// Spatial functions: `input`'s extent, read from the params block.
+    size: Option<Handle<Expression>>,
     /// Stage and parameter index to the member index in the params block.
     members: HashMap<(usize, usize), u32>,
 }
 
-impl Composer {
+impl<'a> Composer<'a> {
     fn new(options: ComposeOptions) -> Self {
         let mut module = Module::default();
         let working_space = abi::insert_working_space(&mut module);
@@ -394,12 +497,54 @@ impl Composer {
             capabilities: Capabilities::empty(),
             stages: Vec::new(),
             working_space,
+            library_functions: HashMap::new(),
+            library_importers: HashMap::new(),
             bilinear: None,
             next_name: 0,
         }
     }
 
-    fn import(&mut self, index: usize, snippet: &Snippet, constants: Vec<Option<ParamValue>>) {
+    /// The canonical import of `function` from `library` at `precision` —
+    /// imported once, under its own name, however many stages call it. The
+    /// library's importer is shared for the whole module, so every callee
+    /// an import reaches is canonical too, not copied per call site.
+    fn library_function(
+        &mut self,
+        library: &'a ParsedLibrary,
+        precision: Precision,
+        function: &str,
+    ) -> Handle<Function> {
+        let key = (library.name().to_owned(), precision, function.to_owned());
+        if let Some(&handle) = self.library_functions.get(&key) {
+            return handle;
+        }
+        let variant = library
+            .variant(precision)
+            .expect("snippet parsing checked the variant exists");
+        let importer = self
+            .library_importers
+            .entry((library.name().to_owned(), precision))
+            // The empty prefix keeps the functions' own names — they are the
+            // one definition of each name in the module.
+            .or_insert_with(|| Importer::new(&variant.module, ""));
+        let local = variant
+            .module
+            .functions
+            .iter()
+            .find(|(_, candidate)| candidate.name.as_deref() == Some(function))
+            .map(|(handle, _)| handle)
+            .expect("the name came from the library's function list");
+        let handle = importer.function(&mut self.module, local);
+        for (source, mapped) in importer.imported_functions() {
+            if let Some(name) = variant.module.functions[source].name.clone() {
+                self.library_functions
+                    .insert((library.name().to_owned(), precision, name), mapped);
+            }
+        }
+        handle
+    }
+
+    fn import(&mut self, index: usize, snippet: &'a Snippet, constants: Vec<Option<ParamValue>>) {
         let want = Variant {
             precision: self.options.precision,
             subgroups: self.options.subgroups,
@@ -413,6 +558,24 @@ impl Composer {
         if let Some(slot) = parsed.slots.working_space {
             let declared = parsed.module.functions[parsed.apply].arguments[slot].ty;
             importer.alias_type(declared, self.working_space);
+        }
+        // Each library function `apply` reaches maps to the library's one
+        // canonical import — however many stages call it, the composed
+        // module holds exactly one copy.
+        let reachable = parse::reachable_handles(&parsed.module, parsed.apply);
+        for library in snippet.libraries() {
+            let lib_variant = library
+                .variant(variant.precision)
+                .expect("snippet parsing checked the variant exists");
+            for (local, function) in parsed.module.functions.iter() {
+                let Some(name) = function.name.clone() else {
+                    continue;
+                };
+                if reachable.contains(&local) && lib_variant.functions.contains(&name) {
+                    let canonical = self.library_function(library, variant.precision, &name);
+                    importer.alias_function(local, canonical);
+                }
+            }
         }
         let apply = importer.function(&mut self.module, parsed.apply);
         let function = &self.module.functions[apply];
@@ -452,12 +615,25 @@ impl Composer {
             .insert(Type { name: None, inner }, GENERATED)
     }
 
-    /// Lays out the dynamic parameters of `stages` and declares the block type.
-    fn uniform(&mut self, stages: &[usize], name: &str) -> UniformBlock {
+    /// Lays out the dynamic parameters of `stages` and declares the block
+    /// type. `input_size` — for spatial segments — prepends the `size`
+    /// member, the `vec2<f32>` extent of the segment's input in pixels, at
+    /// offset 0.
+    fn uniform(&mut self, stages: &[usize], name: &str, input_size: bool) -> UniformBlock {
         let mut layout = UniformLayout::default();
         let mut members = Vec::new();
         let mut index = HashMap::new();
         let mut offset = 0u32;
+        if input_size {
+            members.push(StructMember {
+                name: Some("size".to_owned()),
+                ty: self.ty(ParamType::Vec2.inner()),
+                binding: None,
+                offset,
+            });
+            layout.input_size = Some(offset);
+            offset += ParamType::Vec2.size();
+        }
         for &stage in stages {
             for (param, (param_name, ty)) in
                 self.stages[stage].params.clone().into_iter().enumerate()
@@ -631,6 +807,13 @@ impl Composer {
         if let Some(ty) = block.ty {
             inputs.params = Some(builder.argument("params", ty));
             args.push(SegmentArg::Params);
+            // `size` is the block's first member when the layout carries one.
+            if block.layout.input_size.is_some() {
+                inputs.size = Some(builder.expression(Expression::AccessIndex {
+                    base: inputs.params.expect("declared above"),
+                    index: 0,
+                }));
+            }
         }
         inputs.members.clone_from(&block.members);
         if working_space {
@@ -642,7 +825,7 @@ impl Composer {
     fn color_segment(&mut self, stages: Range<usize>) -> Segment {
         let name = self.name("segment");
         let indices: Vec<usize> = stages.clone().collect();
-        let block = self.uniform(&indices, &name);
+        let block = self.uniform(&indices, &name, false);
         let precision = self.options.precision;
         let colour_ty = parse::colour_type_handle(&mut self.module, precision);
 
@@ -714,7 +897,7 @@ impl Composer {
     /// `apply`, or its substituted copy for [`Piece::Spatial::manual`].
     fn spatial_segment_with(&mut self, stage: usize, apply: Handle<Function>) -> Segment {
         let name = self.name("segment");
-        let block = self.uniform(&[stage], &name);
+        let block = self.uniform(&[stage], &name, true);
         let precision = self.options.precision;
         let colour_ty = parse::colour_type_handle(&mut self.module, precision);
 
@@ -724,6 +907,8 @@ impl Composer {
         let required = self.spatial_inputs(&mut builder, stage, &mut args, &mut inputs);
         let working_space = self.stages[stage].working_space;
         self.trailing_inputs(&mut builder, &mut args, &block, working_space, &mut inputs);
+        let size = inputs.size.expect("a spatial segment declares `size`");
+        let required = [required[0], required[1], required[2], size];
         let arguments = self.stage_arguments(&mut builder, stage, &required, &inputs);
         let result = builder.call(apply, arguments);
         let result = builder.convert(result, self.stages[stage].precision(), precision);
@@ -752,15 +937,16 @@ impl Composer {
             self.stages[stage].apply,
             0,
             Some(1),
+            3,
             bilinear,
         )?;
         Some(self.spatial_segment_with(stage, apply))
     }
 
     /// The manual bilinear every substituted sample calls:
-    /// `fn(input: texture_2d<f32>, uv: vec2<f32>) -> vec4<f32>` —
-    /// edge-clamped texel loads with the same weights hardware filtering
-    /// uses.
+    /// `fn(input: texture_2d<f32>, uv: vec2<f32>, size: vec2<f32>) ->
+    /// vec4<f32>` — edge-clamped texel loads with the same weights hardware
+    /// filtering uses. `size` is `input`'s extent in pixels.
     fn manual_bilinear(&mut self) -> Handle<Function> {
         if let Some(bilinear) = self.bilinear {
             return bilinear;
@@ -776,19 +962,11 @@ impl Composer {
         let mut builder = FunctionBuilder::new(self.name("manual_bilinear"));
         let input = builder.argument("input", texture);
         let uv = builder.argument("uv", vec2f);
-        let dimensions = builder.expression(Expression::ImageQuery {
-            image: input,
-            query: ImageQuery::Size { level: None },
-        });
-        let extent = builder.expression(Expression::As {
-            expr: dimensions,
-            kind: ScalarKind::Float,
-            convert: Some(4),
-        });
+        let size = builder.argument("size", vec2f);
         let scaled = builder.expression(Expression::Binary {
             op: BinaryOperator::Multiply,
             left: uv,
-            right: extent,
+            right: size,
         });
         let half = builder.f32(0.5);
         let halves = builder.expression(Expression::Compose {
@@ -817,10 +995,11 @@ impl Composer {
             kind: ScalarKind::Sint,
             convert: Some(4),
         });
+        // Pixel extents are whole numbers, so truncation loses nothing.
         let span = builder.expression(Expression::As {
-            expr: dimensions,
+            expr: size,
             kind: ScalarKind::Sint,
-            convert: None,
+            convert: Some(4),
         });
         let zero = builder.expression(Expression::Literal(Literal::I32(0)));
         let lo = builder.expression(Expression::Compose {
@@ -867,7 +1046,7 @@ impl Composer {
         let name = self.name("folded");
         let mut indices: Vec<usize> = prefix.clone().collect();
         indices.push(spatial);
-        let block = self.uniform(&indices, &name);
+        let block = self.uniform(&indices, &name, true);
         let prefix_indices: Vec<usize> = prefix.clone().collect();
         let prefix_space = self.needs_working_space(&prefix_indices);
 
@@ -917,7 +1096,8 @@ impl Composer {
         let spatial_apply = self.stages[spatial].apply;
         let folded_name = self.name("folded_apply");
         let folded_apply = rewrite::fold_prefix(
-            &self.module.functions[spatial_apply],
+            &mut self.module,
+            spatial_apply,
             0,
             prefix_function,
             &extra,
@@ -934,6 +1114,8 @@ impl Composer {
         let required = self.spatial_inputs(&mut builder, spatial, &mut args, &mut inputs);
         let working_space = self.needs_working_space(&indices);
         self.trailing_inputs(&mut builder, &mut args, &block, working_space, &mut inputs);
+        let size = inputs.size.expect("a spatial segment declares `size`");
+        let required = [required[0], required[1], required[2], size];
         let mut arguments = self.stage_arguments(&mut builder, spatial, &required, &inputs);
         if block.ty.is_some() {
             arguments.push(inputs.params.expect("declared above"));

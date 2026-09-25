@@ -39,6 +39,9 @@ mod tests {
 
     #[test]
     fn test_sharpen_footprint() {
-        assert_eq!(crate::SpatialFilter::footprint(&Sharpen(1.0f32)), 1.0);
+        assert_eq!(
+            crate::SpatialFilter::footprint(&Sharpen(1.0f32)),
+            crate::Footprint::pixels(1.0)
+        );
     }
 }

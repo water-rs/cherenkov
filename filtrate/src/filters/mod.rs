@@ -36,7 +36,7 @@
 //! struct Edges;
 //!
 //! const { assert!(<Brighten<f32> as ColorFilter>::LINEAR) };
-//! assert_eq!(Edges.footprint(), 1.0);
+//! assert_eq!(Edges.footprint(), filtrate::Footprint::pixels(1.0));
 //! assert_eq!(Brighten(0.2_f32).params(), [0.2]);
 //! ```
 

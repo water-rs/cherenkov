@@ -51,6 +51,17 @@ pub enum SnippetError {
         /// The mismatching variant.
         variant: String,
     },
+    /// A registered library's source does not parse or breaks the library
+    /// contract.
+    #[error("library `{name}` ({variant}): {reason}")]
+    Library {
+        /// The library name.
+        name: String,
+        /// The variant whose source failed.
+        variant: String,
+        /// What is wrong.
+        reason: String,
+    },
 }
 
 /// A chain cannot be composed.
@@ -92,6 +103,22 @@ pub enum ComposeError {
         snippet: String,
         /// The parameter name.
         param: String,
+    },
+    /// Two declarations a composition imports carry the same function name.
+    #[error("the function `{name}` is defined by both {first} and {second}")]
+    LibraryConflict {
+        /// The colliding function name.
+        name: String,
+        /// One definition site: a library name or a snippet name.
+        first: String,
+        /// The other definition site.
+        second: String,
+    },
+    /// Two registered libraries share a name but are not the same library.
+    #[error("two libraries named `{name}` are registered, and they differ")]
+    DuplicateLibrary {
+        /// The shared library name.
+        name: String,
     },
     /// The composed module does not validate. This is a composer defect.
     #[error("the composed module is not valid: {0}")]

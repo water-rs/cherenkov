@@ -33,7 +33,7 @@ fn sample_lut(lut: texture_2d<f32>, color: vec3<f32>, lut_size: u32) -> vec3<f32
     return mix(mix(c00, c10, f.g), mix(c01, c11, f.g), f.b);
 }
 
-fn apply(input: texture_2d<f32>, input_point_sampler: sampler, uv: vec2<f32>, params: Params, aux0: texture_2d<f32>) -> vec4<f32> {
+fn apply(input: texture_2d<f32>, input_point_sampler: sampler, uv: vec2<f32>, size: vec2<f32>, params: Params, aux0: texture_2d<f32>) -> vec4<f32> {
     let base = textureSampleLevel(input, input_point_sampler, uv, 0.0);
     let lut_size = max(u32(round(params.lut_size)), 2u);
     let intensity = clamp(params.intensity, 0.0, 1.0);

@@ -25,7 +25,10 @@ mod tests {
 
     #[test]
     fn median_is_spatial_with_zero_params() {
-        assert_eq!(crate::SpatialFilter::footprint(&Median3x3), 1.0);
+        assert_eq!(
+            crate::SpatialFilter::footprint(&Median3x3),
+            crate::Footprint::pixels(1.0)
+        );
         assert_eq!(Median3x3.params().len(), 0);
     }
 }

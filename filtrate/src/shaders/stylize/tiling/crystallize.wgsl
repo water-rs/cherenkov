@@ -14,8 +14,7 @@ fn hash22(p: vec2<f32>) -> vec2<f32> {
     return fract(sin(q) * 43758.5453);
 }
 
-fn apply(input: texture_2d<f32>, input_point_sampler: sampler, uv: vec2<f32>, params: Params) -> vec4<f32> {
-    let size = vec2<f32>(textureDimensions(input));
+fn apply(input: texture_2d<f32>, input_point_sampler: sampler, uv: vec2<f32>, size: vec2<f32>, params: Params) -> vec4<f32> {
     let cell = max(params.cell, 1.0);
     let pixel = floor(uv * size) + vec2<f32>(0.5);
     let grid = floor(pixel / cell);

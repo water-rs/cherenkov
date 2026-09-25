@@ -17,8 +17,8 @@ use alloc::{
 use std::collections::HashMap;
 
 use cherenkov_shader::{
-    ComposeOptions, ParamType, ParamValue, Piece, SamplerFilter, Segment, Snippet, SnippetKind,
-    SnippetSource, Stage, compose,
+    ComposeOptions, LibrarySource, ParamType, ParamValue, Piece, SamplerFilter, Segment, Snippet,
+    SnippetKind, SnippetSource, Stage, compose,
     naga::{Module, valid::Capabilities},
 };
 use filtrate_core::{
@@ -45,6 +45,15 @@ const FROM_SRGB: ColorStage = ColorStage {
     params: &[],
     space: OperatingSpace::Working,
 };
+
+/// The shared WGSL helper modules every snippet may call into. A library is
+/// a source of plain functions, not a stage; the composer imports each
+/// referenced function once into the composed module.
+const LIBRARIES: &[LibrarySource<'static>] = &[
+    LibrarySource::new("hsl", include_str!("../shaders/lib/hsl.wgsl")),
+    LibrarySource::new("sampling", include_str!("../shaders/lib/sampling.wgsl")),
+    LibrarySource::new("rotate", include_str!("../shaders/lib/rotate.wgsl")),
+];
 
 /// A stage as the filter reported it.
 enum Declared {
@@ -172,11 +181,13 @@ impl Plan {
     /// `input_filterable` is whether the input's format supports a filtering
     /// sampler, and `intermediate_filterable` whether the intermediate
     /// format does; a filtered sample of an unfilterable input runs the
-    /// manual bilinear instead.
+    /// manual bilinear instead. `fold` takes the folded alternative wherever
+    /// the composer offers one — tests compare it against the plain program.
     pub(super) fn new<F: Filter>(
         filter: &F,
         input_filterable: bool,
         intermediate_filterable: bool,
+        fold: bool,
     ) -> Result<Self, EffectSetupError> {
         let mut collector = Collector(Vec::new());
         filter.collect_stages(&mut collector);
@@ -199,7 +210,11 @@ impl Plan {
         let snippets = expanded
             .iter()
             .map(|stage| {
-                Snippet::parse(&SnippetSource::new(stage.name, stage.kind, stage.source))
+                let mut source = SnippetSource::new(stage.name, stage.kind, stage.source);
+                for library in LIBRARIES {
+                    source = source.library(library.clone());
+                }
+                Snippet::parse(&source)
                     .map_err(|error| EffectSetupError::Snippet(error.to_string()))
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -232,6 +247,7 @@ impl Plan {
                 &dynamic,
                 input_filterable,
                 intermediate_filterable,
+                fold,
             ),
         })
     }
@@ -284,7 +300,8 @@ fn bind_params<'s>(
     Ok(composed)
 }
 
-/// One pass per piece: the plain alternative, or the manual one when the
+/// One pass per piece: the plain alternative — or the folded one, which
+/// absorbs the colour prefix pass before it — and the manual one when the
 /// pass's input format has no hardware filtering.
 fn passes(
     pieces: Vec<Piece>,
@@ -292,43 +309,72 @@ fn passes(
     dynamic: &DynamicParams,
     input_filterable: bool,
     intermediate_filterable: bool,
+    fold: bool,
 ) -> Vec<PassPlan> {
+    // A pass's input is the chain's input exactly when its segment starts
+    // at the first stage.
+    let filterable = |start: usize| {
+        if start == 0 {
+            input_filterable
+        } else {
+            intermediate_filterable
+        }
+    };
+    let mut selected: Vec<(Segment, Option<SamplerFilter>)> = Vec::new();
+    for piece in pieces {
+        match piece {
+            Piece::Color(segment) => selected.push((segment, None)),
+            Piece::Spatial {
+                plain,
+                folded,
+                manual,
+                sampler,
+                ..
+            } => {
+                // A filtered fold needs a filterable input, like any filtered
+                // sample; a point-sampled fold works anywhere.
+                let folded = match (fold, folded) {
+                    (true, Some(folded))
+                        if folded.sampler == SamplerFilter::Point
+                            || filterable(folded.segment.stages.start) =>
+                    {
+                        Some(folded)
+                    }
+                    _ => None,
+                };
+                match (folded, filterable(plain.stages.start), manual) {
+                    // The colour prefix runs inside the stage's samples:
+                    // this pass replaces it.
+                    (Some(folded), _, _) => {
+                        selected.pop();
+                        selected.push((folded.segment, Some(folded.sampler)));
+                    }
+                    // The input has no hardware filtering: texel loads
+                    // implement the sample, bound with a point sampler.
+                    (None, false, Some(manual)) => {
+                        selected.push((*manual, Some(SamplerFilter::Point)));
+                    }
+                    (None, _, _) => selected.push((plain, Some(sampler))),
+                }
+            }
+        }
+    }
+
     let mut pass_of_stage = alloc::vec![0; expanded.len()];
-    for (pass, piece) in pieces.iter().enumerate() {
-        for stage in plain(piece).stages.clone() {
+    for (pass, (segment, _)) in selected.iter().enumerate() {
+        for stage in segment.stages.clone() {
             pass_of_stage[stage] = pass;
         }
     }
-    pieces
+    selected
         .into_iter()
-        .enumerate()
-        .map(|(index, piece)| {
-            let (segment, sampler) = match piece {
-                Piece::Color(segment) => (segment, None),
-                Piece::Spatial {
-                    plain,
-                    manual,
-                    sampler,
-                    ..
-                } => {
-                    let filterable = if index == 0 {
-                        input_filterable
-                    } else {
-                        intermediate_filterable
-                    };
-                    match (filterable, manual) {
-                        // The input has no hardware filtering: texel loads
-                        // implement the sample, bound with a point sampler.
-                        (false, Some(manual)) => (*manual, Some(SamplerFilter::Point)),
-                        _ => (plain, Some(sampler)),
-                    }
-                }
-            };
-            // A spatial piece is one stage; a colour piece has no shape or
-            // auxiliary inputs.
+        .map(|(segment, sampler)| {
+            // A spatial piece is one stage — the last stage of its segment,
+            // since a folded segment starts at its colour prefix; a colour
+            // piece has no shape or auxiliary inputs.
             let (name, shape, aux) = match sampler {
                 Some(_) => {
-                    let stage = &expanded[segment.stages.start];
+                    let stage = &expanded[segment.stages.end - 1];
                     let aux = stage
                         .aux
                         .iter()
@@ -365,13 +411,6 @@ fn passes(
             }
         })
         .collect()
-}
-
-/// The plain segment of a piece.
-const fn plain(piece: &Piece) -> &Segment {
-    match piece {
-        Piece::Color(segment) | Piece::Spatial { plain: segment, .. } => segment,
-    }
 }
 
 /// Inserts the operating-space conversions and resolves auxiliary sources

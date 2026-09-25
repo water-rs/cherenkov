@@ -6,15 +6,7 @@ struct Params {
     scale_x: f32,
     scale_y: f32,
 }
-
-fn texel_at(image: texture_2d<f32>, uv: vec2<f32>) -> vec4<f32> {
-    let size = vec2<i32>(textureDimensions(image));
-    let coord = clamp(vec2<i32>(floor(uv * vec2<f32>(size))), vec2<i32>(0), size - vec2<i32>(1));
-    return textureLoad(image, coord, 0);
-}
-
-fn apply(input: texture_2d<f32>, input_point_sampler: sampler, uv: vec2<f32>, params: Params, aux0: texture_2d<f32>) -> vec4<f32> {
-    let size = vec2<f32>(textureDimensions(input));
+fn apply(input: texture_2d<f32>, input_point_sampler: sampler, uv: vec2<f32>, size: vec2<f32>, params: Params, aux0: texture_2d<f32>) -> vec4<f32> {
     let displacement = texel_at(aux0, uv).rg * 2.0 - vec2<f32>(1.0);
     let warped_uv = uv + displacement * vec2<f32>(params.scale_x, params.scale_y) / size;
     return textureSampleLevel(input, input_point_sampler, warped_uv, 0.0);

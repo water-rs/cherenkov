@@ -5,7 +5,7 @@
 //! directions, LUT sizes) are parameters the filter never animates.
 
 use crate::{
-    AuxSource, Filter, FilterImage, FilterParam, ImageVisitor, LutImage, OperatingSpace,
+    AuxSource, Filter, FilterImage, FilterParam, Footprint, ImageVisitor, LutImage, OperatingSpace,
     ParamSource, Placed, SignalVisitor, SpatialFilter, SpatialStage, StageCollector,
     filters::footprint, kind,
 };
@@ -163,8 +163,8 @@ impl<A: FilterParam> Filter for BlendWithImage<A> {
 }
 
 impl<A: FilterParam> SpatialFilter for BlendWithImage<A> {
-    fn footprint_of(_params: &[f32; 2]) -> f32 {
-        0.0
+    fn footprint_of(_params: &[f32; 2]) -> Footprint {
+        Footprint::ZERO
     }
 }
 
@@ -213,8 +213,8 @@ impl<P: FilterParam> Filter for MaskedBlur<P> {
 }
 
 impl<P: FilterParam> SpatialFilter for MaskedBlur<P> {
-    fn footprint_of(params: &[f32; 2]) -> f32 {
-        footprint::rounded(params[0])
+    fn footprint_of(params: &[f32; 2]) -> Footprint {
+        Footprint::pixels(footprint::rounded(params[0]))
     }
 }
 
@@ -263,8 +263,8 @@ impl<P: FilterParam> Filter for TransitionToImage<P> {
 }
 
 impl<P: FilterParam> SpatialFilter for TransitionToImage<P> {
-    fn footprint_of(_params: &[f32; 2]) -> f32 {
-        0.0
+    fn footprint_of(_params: &[f32; 2]) -> Footprint {
+        Footprint::ZERO
     }
 }
 
@@ -314,8 +314,8 @@ impl<P: FilterParam> Filter for DisplacementWarp<P> {
 }
 
 impl<P: FilterParam> SpatialFilter for DisplacementWarp<P> {
-    fn footprint_of(params: &[f32; 2]) -> f32 {
-        footprint::offset(params[0]).max(footprint::offset(params[1]))
+    fn footprint_of(params: &[f32; 2]) -> Footprint {
+        Footprint::pixels(footprint::offset(params[0]).max(footprint::offset(params[1])))
     }
 }
 
@@ -375,8 +375,8 @@ impl<P: FilterParam> Filter for GuidedSmooth<P> {
 }
 
 impl<P: FilterParam> SpatialFilter for GuidedSmooth<P> {
-    fn footprint_of(params: &[f32; 3]) -> f32 {
-        footprint::rounded(params[0])
+    fn footprint_of(params: &[f32; 3]) -> Footprint {
+        Footprint::pixels(footprint::rounded(params[0]))
     }
 }
 
@@ -437,8 +437,8 @@ impl<P: FilterParam> Filter for DepthAwareBlur<P> {
 }
 
 impl<P: FilterParam> SpatialFilter for DepthAwareBlur<P> {
-    fn footprint_of(params: &[f32; 3]) -> f32 {
-        (params[1].max(0.0) * params[2].max(0.0)).round()
+    fn footprint_of(params: &[f32; 3]) -> Footprint {
+        Footprint::pixels((params[1].max(0.0) * params[2].max(0.0)).round())
     }
 }
 
@@ -488,8 +488,8 @@ impl<P: FilterParam> Filter for TemporalDenoise<P> {
 }
 
 impl<P: FilterParam> SpatialFilter for TemporalDenoise<P> {
-    fn footprint_of(_params: &[f32; 1]) -> f32 {
-        0.0
+    fn footprint_of(_params: &[f32; 1]) -> Footprint {
+        Footprint::ZERO
     }
 }
 
@@ -538,8 +538,8 @@ impl<P: FilterParam> Filter for BackgroundReplace<P> {
 }
 
 impl<P: FilterParam> SpatialFilter for BackgroundReplace<P> {
-    fn footprint_of(_params: &[f32; 1]) -> f32 {
-        0.0
+    fn footprint_of(_params: &[f32; 1]) -> Footprint {
+        Footprint::ZERO
     }
 }
 
@@ -585,8 +585,8 @@ impl<P: FilterParam> Filter for LutColorGrade<P> {
 }
 
 impl<P: FilterParam> SpatialFilter for LutColorGrade<P> {
-    fn footprint_of(_params: &[f32; 2]) -> f32 {
-        0.0
+    fn footprint_of(_params: &[f32; 2]) -> Footprint {
+        Footprint::ZERO
     }
 }
 
@@ -645,8 +645,8 @@ impl<P: FilterParam> Filter for SwipeTransitionToImage<P> {
 }
 
 impl<P: FilterParam> SpatialFilter for SwipeTransitionToImage<P> {
-    fn footprint_of(_params: &[f32; 3]) -> f32 {
-        0.0
+    fn footprint_of(_params: &[f32; 3]) -> Footprint {
+        Footprint::ZERO
     }
 }
 
@@ -711,8 +711,8 @@ impl<P: FilterParam> Filter for RadialTransitionToImage<P> {
 }
 
 impl<P: FilterParam> SpatialFilter for RadialTransitionToImage<P> {
-    fn footprint_of(_params: &[f32; 4]) -> f32 {
-        0.0
+    fn footprint_of(_params: &[f32; 4]) -> Footprint {
+        Footprint::ZERO
     }
 }
 
@@ -733,8 +733,8 @@ const ZOOM_TRANSITION_TO_IMAGE: SpatialStage = stage(
 
 /// Cross-fades to a target image while zooming through a centre point.
 ///
-/// The zoom displaces samples by a fraction of the image size, so the
-/// footprint is unbounded in pixels once `amount` is non-zero.
+/// The zoom displaces samples by `amount` times the image extent, so the
+/// footprint is relative.
 #[derive(Debug, Clone)]
 pub struct ZoomTransitionToImage<P: FilterParam = f32> {
     /// Target image revealed by the transition.
@@ -780,8 +780,8 @@ impl<P: FilterParam> Filter for ZoomTransitionToImage<P> {
 }
 
 impl<P: FilterParam> SpatialFilter for ZoomTransitionToImage<P> {
-    fn footprint_of(params: &[f32; 4]) -> f32 {
-        footprint::relative(params[1])
+    fn footprint_of(params: &[f32; 4]) -> Footprint {
+        Footprint::extent(params[1].max(0.0))
     }
 }
 
@@ -834,8 +834,8 @@ impl<P: FilterParam> Filter for DisplacementTransitionToImage<P> {
 }
 
 impl<P: FilterParam> SpatialFilter for DisplacementTransitionToImage<P> {
-    fn footprint_of(params: &[f32; 2]) -> f32 {
-        footprint::offset(params[1].max(0.0))
+    fn footprint_of(params: &[f32; 2]) -> Footprint {
+        Footprint::pixels(footprint::offset(params[1].max(0.0)))
     }
 }
 
@@ -898,12 +898,12 @@ mod tests {
             mode: BlendMode::Screen,
         };
         assert_eq!(blend.params(), [0.5, 2.0]);
-        assert_eq!(blend.footprint(), 0.0);
+        assert_eq!(blend.footprint(), Footprint::ZERO);
         let warp = DisplacementWarp {
             map: FilterImage::from_rgba8(1, 1, vec![0, 0, 0, 255]),
             scale_x: -3.5_f32,
             scale_y: 2.0,
         };
-        assert_eq!(warp.footprint(), 4.0);
+        assert_eq!(warp.footprint(), Footprint::pixels(4.0));
     }
 }

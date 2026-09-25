@@ -37,6 +37,9 @@ mod tests {
     fn test_vignette_params() {
         let filter = Vignette(0.5f32, 0.2f32);
         assert_eq!(filter.params(), [0.5, 0.2]);
-        assert_eq!(crate::SpatialFilter::footprint(&filter), 0.0);
+        assert_eq!(
+            crate::SpatialFilter::footprint(&filter),
+            crate::Footprint::pixels(0.0)
+        );
     }
 }

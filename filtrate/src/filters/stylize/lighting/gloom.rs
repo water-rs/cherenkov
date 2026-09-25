@@ -1,7 +1,7 @@
 //! Gloom filter implementation.
 
 use crate::{
-    AuxSource, Filter, FilterParam, OperatingSpace, ParamSource, Placed, SignalVisitor,
+    AuxSource, Filter, FilterParam, Footprint, OperatingSpace, ParamSource, Placed, SignalVisitor,
     SpatialFilter, SpatialStage, StageCollector, filters::footprint, kind,
 };
 
@@ -63,7 +63,7 @@ impl<T: FilterParam> Filter for Gloom<T> {
 }
 
 impl<T: FilterParam> SpatialFilter for Gloom<T> {
-    fn footprint_of(params: &[f32; 3]) -> f32 {
-        footprint::rounded_at_least_one(params[0])
+    fn footprint_of(params: &[f32; 3]) -> Footprint {
+        Footprint::pixels(footprint::rounded_at_least_one(params[0]))
     }
 }

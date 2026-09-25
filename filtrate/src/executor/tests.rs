@@ -17,9 +17,9 @@ use super::{
 use crate::{
     AnimatedCallback, AnimatedTarget, AuxSource, ColorFilter, ColorStage, CpuKernel, Effect,
     EffectContext, EffectFrameTiming, EffectInput, EffectOutput, EffectRenderError,
-    EffectSetupError, Filter, FilterExt, FilterParam, ImageVisitor, Interpolator, OperatingSpace,
-    ParamArray, ParamSource, Placed, ShapeInput, ShapeTextures, SpatialFilter, SpatialStage,
-    StageCollector, WatchGuard, WorkingSpace, filters, kind,
+    EffectSetupError, Filter, FilterExt, FilterParam, Footprint, ImageVisitor, Interpolator,
+    OperatingSpace, ParamArray, ParamSource, Placed, ShapeInput, ShapeTextures, SpatialFilter,
+    SpatialStage, StageCollector, WatchGuard, WorkingSpace, filters, kind,
 };
 
 // ============================================================================
@@ -51,8 +51,8 @@ impl Filter for Masked {
 }
 
 impl SpatialFilter for Masked {
-    fn footprint_of(_params: &[f32; 0]) -> f32 {
-        0.0
+    fn footprint_of(_params: &[f32; 0]) -> Footprint {
+        Footprint::ZERO
     }
 }
 
@@ -81,8 +81,8 @@ impl Filter for UndeclaredShape {
 }
 
 impl SpatialFilter for UndeclaredShape {
-    fn footprint_of(_params: &[f32; 0]) -> f32 {
-        1.0
+    fn footprint_of(_params: &[f32; 0]) -> Footprint {
+        Footprint::pixels(1.0)
     }
 }
 
@@ -138,8 +138,8 @@ impl Filter for SampleHalf {
 }
 
 impl SpatialFilter for SampleHalf {
-    fn footprint_of(_params: &[f32; 0]) -> f32 {
-        1.0
+    fn footprint_of(_params: &[f32; 0]) -> Footprint {
+        Footprint::pixels(1.0)
     }
 }
 
@@ -183,8 +183,8 @@ impl Filter for ReadAux {
 }
 
 impl SpatialFilter for ReadAux {
-    fn footprint_of(_params: &[f32; 0]) -> f32 {
-        0.0
+    fn footprint_of(_params: &[f32; 0]) -> Footprint {
+        Footprint::ZERO
     }
 }
 
@@ -212,8 +212,8 @@ impl Filter for ReadAuxTexture {
 }
 
 impl SpatialFilter for ReadAuxTexture {
-    fn footprint_of(_params: &[f32; 0]) -> f32 {
-        0.0
+    fn footprint_of(_params: &[f32; 0]) -> Footprint {
+        Footprint::ZERO
     }
 }
 
@@ -225,7 +225,7 @@ impl SpatialFilter for ReadAuxTexture {
 /// for the hardware-filtered plan and for the manual-bilinear one.
 fn assert_composes<F: Filter>(name: &str, filter: &F) -> Plan {
     for filterable in [true, false] {
-        let plan = Plan::new(filter, filterable, filterable).unwrap_or_else(|error| {
+        let plan = Plan::new(filter, filterable, filterable, false).unwrap_or_else(|error| {
             panic!("{name} does not compose (filterable={filterable}): {error}")
         });
         for (index, pass) in plan.passes.iter().enumerate() {
@@ -233,7 +233,8 @@ fn assert_composes<F: Filter>(name: &str, filter: &F) -> Plan {
                 .unwrap_or_else(|error| panic!("{name} (filterable={filterable}): {error}"));
         }
     }
-    Plan::new(filter, true, true).unwrap_or_else(|error| panic!("{name} does not compose: {error}"))
+    Plan::new(filter, true, true, false)
+        .unwrap_or_else(|error| panic!("{name} does not compose: {error}"))
 }
 
 fn blank_image() -> crate::FilterImage {
@@ -466,7 +467,7 @@ fn the_reference_program_materializes_every_spatial_stage() {
             .then(Invert),
     );
     // Saturation alone, the blur's two passes, and the colour suffix fused
-    // into one segment: the colour prefix is never folded into the blur.
+    // into one segment: the reference program never selects a fold.
     let stages: Vec<_> = plan
         .passes
         .iter()
@@ -514,7 +515,7 @@ fn a_stage_declares_the_shape_input_its_snippet_takes() {
     let plan = assert_composes("masked", &Masked);
     assert_eq!(plan.passes[0].shape, Some(ShapeInput::Mask));
     assert!(matches!(
-        Plan::new(&UndeclaredShape, true, true),
+        Plan::new(&UndeclaredShape, true, true, false),
         Err(EffectSetupError::StageMismatch {
             stage: "median",
             ..
@@ -736,10 +737,11 @@ impl Interpolator for LinearRamp {
 
 #[test]
 fn the_footprint_covers_every_running_animation() {
+    let size = (256.0, 128.0);
     let radius = ScriptedParam::constant(2.0);
     let callback = radius.callback.clone();
     let mut executor = Executor::new(filters::Blur(radius));
-    assert_eq!(executor.footprint(), 2.0);
+    assert_eq!(executor.footprint(size), 2.0);
 
     // Growing: the bound is the target before a single frame ran.
     ScriptedParam::fire(
@@ -749,7 +751,7 @@ fn the_footprint_covers_every_running_animation() {
             interpolator: Some(Box::new(LinearRamp(Duration::from_millis(100)))),
         },
     );
-    assert_eq!(executor.footprint(), 10.0);
+    assert_eq!(executor.footprint(size), 10.0);
     executor.animator.update(Duration::from_millis(200));
 
     // Shrinking: the bound stays at the start until the animation ends.
@@ -760,11 +762,72 @@ fn the_footprint_covers_every_running_animation() {
             interpolator: Some(Box::new(LinearRamp(Duration::from_millis(100)))),
         },
     );
-    assert_eq!(executor.footprint(), 10.0);
+    assert_eq!(executor.footprint(size), 10.0);
     executor.animator.update(Duration::from_millis(50));
-    assert_eq!(executor.footprint(), 10.0);
+    assert_eq!(executor.footprint(size), 10.0);
     executor.animator.update(Duration::from_millis(60));
-    assert_eq!(executor.footprint(), 1.0);
+    assert_eq!(executor.footprint(size), 1.0);
+
+    // A relative footprint resolves against the input's larger dimension,
+    // plus its absolute pixel component.
+    let mut zoom = Executor::new(filters::ZoomBlur(0.2_f32, 0.5, 0.5));
+    assert_eq!(
+        zoom.footprint(size),
+        (0.2_f32 * 1.5_f32.hypot(1.5)).mul_add(256.0, 1.0)
+    );
+}
+
+#[test]
+fn zoom_blur_footprint_covers_the_shader_reach() {
+    // The shader samples at `uv + (center − uv)·amount·t` for `t` in [0, 1],
+    // so the reach is `amount·|center − uv|`, worst at the image corner
+    // farthest from `center` — on-centre, off-centre and out of range.
+    // `footprint_of` sees the centre only as a magnitude `m`, standing for
+    // any centre in `[-m, m]²`: the farthest corner is `m + 1` away per axis.
+    let size = (256.0, 128.0);
+    for (amount, center) in [(0.2_f32, [0.5, 0.5]), (0.2, [1.0, 1.0]), (0.2, [2.0, -1.0])] {
+        let mut zoom = Executor::new(filters::ZoomBlur(amount, center[0], center[1]));
+        let bound = (center[0].abs() + 1.0).hypot(center[1].abs() + 1.0);
+        assert_eq!(
+            zoom.footprint(size),
+            (amount * bound).mul_add(256.0, 1.0),
+            "footprint for amount {amount}, center {center:?}"
+        );
+        // … and the bound does cover the shader's true reach.
+        let true_reach = [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]]
+            .into_iter()
+            .map(|corner| (center[0] - corner[0]).hypot(center[1] - corner[1]))
+            .fold(0.0_f32, f32::max);
+        assert!(
+            zoom.footprint(size) >= amount * true_reach * size.0,
+            "bound below the reach for center {center:?}"
+        );
+    }
+}
+
+#[test]
+fn a_divergent_distortion_scale_spans_the_extent() {
+    // `scale` arrives at `footprint_of` as a magnitude, so a bound past 1
+    // stands for a shader scale below −1, where the displacement diverges
+    // and any texel can be reached — whichever sign the bound came from.
+    let size = (256.0, 128.0);
+    for scale in [2.0_f32, -2.0] {
+        let mut pinch = Executor::new(filters::PinchDistortion([0.5, 0.5, 0.3, scale]));
+        let mut bump = Executor::new(filters::BumpDistortion([0.5, 0.5, 0.3, scale]));
+        assert_eq!(
+            pinch.footprint(size),
+            256.0_f32.mul_add(1.0, 1.0),
+            "pinch scale {scale}"
+        );
+        assert_eq!(
+            bump.footprint(size),
+            256.0_f32.mul_add(1.0, 1.0),
+            "bump scale {scale}"
+        );
+    }
+    // While the magnitude stays within 1, the reach stays two radii.
+    let mut pinch = Executor::new(filters::PinchDistortion([0.5, 0.5, 0.3, -0.5]));
+    assert_eq!(pinch.footprint(size), (2.0_f32 * 0.3).mul_add(256.0, 1.0));
 }
 
 // ============================================================================
@@ -1036,6 +1099,18 @@ fn setup_unfilterable<F: Filter>(
     };
     pollster::block_on(executor.setup_unfilterable(&ctx))
         .expect("test filter setup should succeed");
+}
+
+/// `setup` on the composer's folded program, for comparing it against the
+/// plain program the executor normally runs.
+fn setup_folded<F: Filter>(gpu: &TestGpu, executor: &mut Executor<F>) {
+    let ctx = EffectContext {
+        device: &gpu.device,
+        queue: &gpu.queue,
+        input_format: FORMAT,
+        output_format: FORMAT,
+    };
+    pollster::block_on(executor.setup_folded(&ctx)).expect("test filter setup should succeed");
 }
 
 /// Renders `rgba` through `executor` once and reads the RGBA8 output back.
@@ -1318,6 +1393,76 @@ fn gpu_manual_bilinear_matches_hardware_filtering() {
         &hardware,
         1,
         "manual bilinear vs hardware filtering",
+    );
+}
+
+#[test]
+fn gpu_folded_chain_matches_the_unfolded_chain() {
+    let gpu = create_test_device();
+    let size = (16, 16);
+    let rgba = create_test_input_rgba(size.0, size.1);
+    // A colour prefix followed by a spatial stage: the composer folds the
+    // prefix into the stage's samples — here through the `load` helper box
+    // blur samples with — so the folded program is one pass where the plain
+    // one is two.
+    let unfolded = run(
+        &gpu,
+        filters::Brightness(0.1_f32).then(filters::Blur(1.0_f32)),
+        size,
+        &rgba,
+        ShapeTextures::default(),
+    );
+    let mut executor = Executor::new(filters::Brightness(0.1_f32).then(filters::Blur(1.0_f32)));
+    setup_folded(&gpu, &mut executor);
+    // Box blur is separable (two spatial stages): the colour prefix folds
+    // into the first; the second stays a plain segment.
+    assert_eq!(
+        executor
+            .gpu
+            .as_ref()
+            .expect("setup succeeded")
+            .segment_stages(),
+        [0..2, 2..3],
+        "the colour prefix folded into the blur's samples"
+    );
+    let folded = render_rgba8(&gpu, &mut executor, size, &rgba, ShapeTextures::default());
+    assert_rgba8_close(&folded, &unfolded, 1, "folded chain vs unfolded chain");
+}
+
+#[test]
+fn gpu_folded_segment_reads_the_size_uniform() {
+    let gpu = create_test_device();
+    let size = (16, 16);
+    let rgba = create_test_input_rgba(size.0, size.1);
+    // Vignette is size-dependent: folding brightness into it proves the
+    // `size` uniform flows through the folded segment, not just the plain.
+    let unfolded = run(
+        &gpu,
+        filters::Brightness(0.1_f32).then(filters::Vignette(0.8_f32, 0.3_f32)),
+        size,
+        &rgba,
+        ShapeTextures::default(),
+    );
+    let mut executor =
+        Executor::new(filters::Brightness(0.1_f32).then(filters::Vignette(0.8_f32, 0.3_f32)));
+    setup_folded(&gpu, &mut executor);
+    let folded = executor
+        .gpu
+        .as_ref()
+        .expect("setup succeeded")
+        .segment_stages();
+    assert_eq!(folded.len(), 1);
+    assert_eq!(
+        folded[0],
+        0..2,
+        "the colour prefix folded into the vignette's samples"
+    );
+    let folded = render_rgba8(&gpu, &mut executor, size, &rgba, ShapeTextures::default());
+    assert_rgba8_close(
+        &folded,
+        &unfolded,
+        1,
+        "folded size-dependent chain vs unfolded chain",
     );
 }
 

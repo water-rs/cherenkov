@@ -23,13 +23,19 @@ pub struct ZoomBlur<A, X, Y>(pub A, pub X, pub Y);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Filter, SpatialFilter};
+    use crate::{Filter, Footprint, SpatialFilter};
 
     #[test]
     fn test_zoom_blur_params() {
         let filter = ZoomBlur(0.2f32, 0.5f32, 0.5f32);
         assert_eq!(filter.params(), [0.2, 0.5, 0.5]);
-        assert_eq!(filter.footprint(), f32::INFINITY);
-        assert_eq!(ZoomBlur(0.0f32, 0.5f32, 0.5f32).footprint(), 0.0);
+        assert_eq!(
+            filter.footprint(),
+            Footprint::new(1.0, 0.2 * 1.5f32.hypot(1.5))
+        );
+        assert_eq!(
+            ZoomBlur(0.0f32, 0.5f32, 0.5f32).footprint(),
+            Footprint::ZERO
+        );
     }
 }

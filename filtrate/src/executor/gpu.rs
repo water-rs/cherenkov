@@ -19,7 +19,7 @@ use crate::{
 
 /// The format every intermediate is materialized in: f16, so every
 /// materialization point rounds the same way and extended values survive.
-const INTERMEDIATE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+pub(super) const INTERMEDIATE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
 /// The full-screen triangle every pass draws.
 const VERTEX_SHADER: &str = include_str!("../shaders/fullscreen.wgsl");
@@ -102,28 +102,30 @@ impl Gpu {
         ctx: &EffectContext<'_>,
     ) -> Result<Self, EffectSetupError> {
         let features = ctx.device.features();
-        Self::with_filterability(
+        Self::with_options(
             filter,
             ctx,
             filterable(ctx.input_format, features),
             filterable(INTERMEDIATE_FORMAT, features),
+            false,
         )
         .await
     }
 
-    /// `new` with the filterabilities given rather than queried — tests force
-    /// the manual path through it.
+    /// `new` with the plan options given rather than queried — tests force
+    /// the manual path or pick the folded segments through it.
     #[expect(
         clippy::future_not_send,
         reason = "setup borrows the filter and the device-bound context on the GPU host thread"
     )]
-    pub(super) async fn with_filterability<F: Filter>(
+    pub(super) async fn with_options<F: Filter>(
         filter: &F,
         ctx: &EffectContext<'_>,
         input_filterable: bool,
         intermediate_filterable: bool,
+        fold: bool,
     ) -> Result<Self, EffectSetupError> {
-        let plan = Plan::new(filter, input_filterable, intermediate_filterable)?;
+        let plan = Plan::new(filter, input_filterable, intermediate_filterable, fold)?;
         for (index, pass) in plan.passes.iter().enumerate() {
             let (format, format_filterable) = if index == 0 {
                 (ctx.input_format, input_filterable)
@@ -211,6 +213,16 @@ impl Gpu {
         })
     }
 
+    /// The stage ranges each pass's segment covers — for tests asserting a
+    /// folded segment was selected.
+    #[cfg(test)]
+    pub(super) fn segment_stages(&self) -> Vec<core::ops::Range<usize>> {
+        self.passes
+            .iter()
+            .map(|pass| pass.plan.segment.stages.clone())
+            .collect()
+    }
+
     /// Encodes every pass, reading the parameters from `values`.
     pub(super) fn encode(
         &mut self,
@@ -251,7 +263,7 @@ impl Gpu {
         let slot_of = &self.slot_of;
         let last = self.passes.len() - 1;
         for (index, pass) in self.passes.iter_mut().enumerate() {
-            pass.write_params(input.queue, values);
+            pass.write_params(input.queue, values, size);
 
             let bind_group = pass.bind_group(index, input, &self.shared, slots, slot_of)?;
 
@@ -421,11 +433,22 @@ impl GpuPass {
     }
 
     /// Writes the pass's uniform block from `values` when it changed.
-    fn write_params(&mut self, queue: &wgpu::Queue, values: &[f32]) {
+    /// `size` is the pass input's extent in pixels — the `size` member of a
+    /// spatial segment's block.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "image extents fit f32 exactly (well below 2^24 pixels)"
+    )]
+    fn write_params(&mut self, queue: &wgpu::Queue, values: &[f32], size: (u32, u32)) {
         let Some((buffer, last)) = &mut self.params else {
             return;
         };
         let mut words = alloc::vec![0u32; self.plan.segment.uniform.size as usize / 4];
+        if let Some(offset) = self.plan.segment.uniform.input_size {
+            let first = offset as usize / 4;
+            words[first] = (size.0 as f32).to_bits();
+            words[first + 1] = (size.1 as f32).to_bits();
+        }
         for slot in &self.plan.uniforms {
             let first = slot.offset as usize / 4;
             for component in 0..slot.components {
@@ -621,7 +644,7 @@ fn check_bound_textures(
 }
 
 /// Whether `format` supports a filtering sampler under `features`.
-fn filterable(format: wgpu::TextureFormat, features: wgpu::Features) -> bool {
+pub(super) fn filterable(format: wgpu::TextureFormat, features: wgpu::Features) -> bool {
     format
         .guaranteed_format_features(features)
         .flags

@@ -1,0 +1,47 @@
+{
+  "width": 96,
+  "height": 96,
+  "working_space": "linear-display-p3",
+  "clear": {
+    "space": "srgb",
+    "components": [
+      0.95,
+      0.95,
+      0.95,
+      1.0
+    ]
+  },
+  "features": [
+    {
+      "feature": "image"
+    }
+  ],
+  "root": {
+    "transform": [
+      1.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0
+    ],
+    "opacity": 1.0,
+    "blend": "normal",
+    "items": [
+      {
+        "draw": {
+          "image": {
+            "image": "779cbc6ed901a1227a775289e056aec7f1ba39f5162b0108328dafe2cc4a2dc8",
+            "dst": {
+              "x0": 16.0,
+              "y0": 16.0,
+              "x1": 80.0,
+              "y1": 80.0
+            },
+            "sampling": "nearest"
+          }
+        }
+      }
+    ]
+  }
+}

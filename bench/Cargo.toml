@@ -1,0 +1,71 @@
+[package]
+name = "cherenkov-bench"
+version = "0.0.0"
+description = "Engine adapters and render/measure CLI for the Cherenkov cross-engine suite"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[features]
+default = []
+vello-classic = ["dep:vello", "dep:vello_common", "dep:wgpu", "dep:pollster"]
+vello-hybrid = ["dep:vello_hybrid", "dep:vello_common", "dep:wgpu", "dep:pollster", "dep:glifo"]
+vello-cpu = ["dep:vello_cpu", "dep:vello_common"]
+# `skia-safe` backend features stay in the feature lists, not on the
+# dependency: `skia-bindings` downloads a prebuilt Skia keyed on the whole
+# enabled set, and only the published combos (e.g. `metal,graphite`) have
+# binaries — an ad-hoc `vulkan,ganesh,metal,graphite` set falls back to a
+# full Skia source build. `skia-bindings/no-compile` turns that fallback
+# into a panic so every bench build linking Skia must use the prebuilt
+# binaries.
+skia = ["dep:skia-safe", "dep:ash", "dep:skia-bindings", "skia-safe/vulkan", "skia-safe/ganesh"]
+skia-metal = ["dep:skia-safe", "dep:objc2", "dep:objc2-metal", "dep:skia-bindings", "skia-safe/metal", "skia-safe/graphite"]
+
+[dependencies]
+cherenkov-scene = { path = "../scene" }
+cherenkov-oracle = { path = "../oracle" }
+kurbo = "0.13"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+# The fork pinned in the workspace `[patch.crates-io]` declares 0.9.0 — the
+# requirement Hydrolysis itself uses.
+vello = { version = "0.9", optional = true, features = ["wgpu-profiler"] }
+vello_hybrid = { version = "0.2", optional = true }
+vello_cpu = { version = "0.2", optional = true, features = ["f32_pipeline"] }
+vello_common = { version = "0.2", optional = true }
+skia-safe = { version = "0.153", optional = true }
+# `no-compile` unifies onto skia-safe's transitive skia-bindings.
+skia-bindings = { version = "0.153", optional = true, default-features = false, features = ["no-compile"] }
+ash = { version = "0.38", optional = true }
+objc2 = { version = "0.6.3", optional = true, default-features = false }
+objc2-metal = { version = "0.3.2", optional = true, default-features = false, features = [
+    "MTLDevice", "MTLCommandQueue", "MTLCommandBuffer",
+    # `CFTimeInterval` for `MTLCommandBuffer::GPUStartTime`/`GPUEndTime`.
+    "objc2-core-foundation",
+] }
+wgpu = { version = "29", optional = true }
+pollster = { version = "0.4", optional = true }
+peniko = "0.6"
+skrifa = "0.44"
+read-fonts = "0.41"
+png = "0.18"
+bytemuck = "1"
+glifo = { version = "0.3", optional = true }
+# Minimal surface: CPU list + brand string for `cpu_model`.
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+
+# `sched_setaffinity` / `sched_getcpu` for `measure --cpu`.
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+libc = "0.2"
+
+[[bin]]
+name = "cherenkov-bench"
+path = "src/bin.rs"

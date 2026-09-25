@@ -1,0 +1,147 @@
+{
+  "width": 128,
+  "height": 128,
+  "working_space": "linear-display-p3",
+  "clear": {
+    "space": "srgb",
+    "components": [
+      0.95,
+      0.95,
+      0.95,
+      1.0
+    ]
+  },
+  "features": [
+    {
+      "feature": "stroke"
+    }
+  ],
+  "root": {
+    "transform": [
+      1.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0
+    ],
+    "opacity": 1.0,
+    "blend": "normal",
+    "items": [
+      {
+        "draw": {
+          "stroke": {
+            "shape": {
+              "line": {
+                "p0": {
+                  "x": 12.0,
+                  "y": 24.0
+                },
+                "p1": {
+                  "x": 116.0,
+                  "y": 24.0
+                }
+              }
+            },
+            "stroke": {
+              "width": 1.0,
+              "join": "Miter",
+              "miter_limit": 4.0,
+              "start_cap": "Butt",
+              "end_cap": "Butt",
+              "dash_pattern": [],
+              "dash_offset": 0.0
+            },
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.2,
+                  0.2,
+                  0.2,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "stroke": {
+            "shape": {
+              "line": {
+                "p0": {
+                  "x": 12.0,
+                  "y": 64.0
+                },
+                "p1": {
+                  "x": 116.0,
+                  "y": 64.0
+                }
+              }
+            },
+            "stroke": {
+              "width": 3.0,
+              "join": "Miter",
+              "miter_limit": 4.0,
+              "start_cap": "Butt",
+              "end_cap": "Butt",
+              "dash_pattern": [],
+              "dash_offset": 0.0
+            },
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.2,
+                  0.2,
+                  0.2,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "stroke": {
+            "shape": {
+              "line": {
+                "p0": {
+                  "x": 12.0,
+                  "y": 104.0
+                },
+                "p1": {
+                  "x": 116.0,
+                  "y": 104.0
+                }
+              }
+            },
+            "stroke": {
+              "width": 8.0,
+              "join": "Miter",
+              "miter_limit": 4.0,
+              "start_cap": "Butt",
+              "end_cap": "Butt",
+              "dash_pattern": [],
+              "dash_offset": 0.0
+            },
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.2,
+                  0.2,
+                  0.2,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      }
+    ]
+  }
+}

@@ -1,0 +1,171 @@
+// Copyright 2026 the Cherenkov Authors
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+
+//! CPU-side instance data matching `shader.wgsl` byte for byte.
+
+use bytemuck::{Pod, Zeroable};
+
+/// Fill a shape.
+pub const KIND_FILL: u32 = 0;
+/// Stroke via `coverage(outer) - coverage(inner)`.
+pub const KIND_STROKE_OFFSET: u32 = 1;
+/// Stroke via `coverage(d - hw) - coverage(d + hw)`.
+pub const KIND_STROKE_DIST: u32 = 2;
+/// A Gaussian-blurred rounded box.
+pub const KIND_SHADOW: u32 = 3;
+/// Coverage sampled from the glyph atlas.
+pub const KIND_GLYPH: u32 = 4;
+
+/// A single colour.
+pub const PAINT_SOLID: u32 = 0;
+/// A linear gradient.
+pub const PAINT_LINEAR: u32 = 1;
+/// A two-point radial gradient.
+pub const PAINT_RADIAL: u32 = 2;
+/// A composite: sample the bound scratch texture at the device pixel.
+pub const PAINT_TEXTURE: u32 = 3;
+
+/// Clamp the edge colours.
+pub const EXTEND_PAD: u32 = 0;
+/// Repeat the range.
+pub const EXTEND_REPEAT: u32 = 1;
+/// Repeat the range mirrored.
+pub const EXTEND_REFLECT: u32 = 2;
+
+/// Stops stored in the working space.
+pub const INTERP_WORKING: u32 = 0;
+/// Stops stored sRGB-encoded.
+pub const INTERP_SRGB: u32 = 1;
+
+/// The instance's clip fields are live.
+pub const FLAG_HAS_CLIP: u32 = 1;
+/// The stroke has an inner edge.
+pub const FLAG_HAS_INNER: u32 = 2;
+
+/// A rounded box centred at the origin, mirroring the WGSL `Shape`.
+///
+/// `radii` are the corner radii along x in the order top-left, top-right,
+/// bottom-right, bottom-left; the radius along y is `radius * aspect`.
+/// `exponent` is the Lamé exponent of the corner curve: 2.0 for a circular
+/// or elliptical corner, larger for a continuous corner.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct Shape {
+    /// Half extents of the box.
+    pub half: [f32; 2],
+    /// Corner radius aspect (y radius / x radius).
+    pub aspect: f32,
+    /// Lamé exponent of the corner curve; 0.0 means "none".
+    pub exponent: f32,
+    /// Corner radii along x: top-left, top-right, bottom-right, bottom-left.
+    pub radii: [f32; 4],
+}
+
+impl Shape {
+    /// A sharp box of half extents `half`.
+    pub const fn rect(half: [f32; 2]) -> Self {
+        Self {
+            half,
+            aspect: 1.0,
+            exponent: 2.0,
+            radii: [0.0; 4],
+        }
+    }
+}
+
+/// One instanced quad, mirroring the WGSL `Instance`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct Instance {
+    /// Local-to-device affine: `[a, b, c, d, e, f, 0, 0]`.
+    pub affine: [f32; 8],
+    /// Quad rectangle `(x0, y0, x1, y1)`, local space except `KIND_GLYPH`,
+    /// where it is the device-space atlas cell rectangle.
+    pub bounds: [f32; 4],
+    /// The shape being drawn.
+    pub shape: Shape,
+    /// The inner shape of an offset stroke.
+    pub inner: Shape,
+    /// Device-to-clip-local affine.
+    pub clip_inv: [f32; 8],
+    /// The clip shape.
+    pub clip: Shape,
+    /// Straight-alpha working-space colour.
+    pub color: [f32; 4],
+    /// Linear: start.xy, end.xy. Radial: start centre.xy, end centre.xy.
+    pub grad: [f32; 4],
+    /// Radial: start radius, end radius.
+    pub grad2: [f32; 4],
+    /// Glyph: atlas cell origin in texels.
+    pub uv: [f32; 4],
+    /// x: stroke half width or shadow sigma. y: opacity.
+    pub params: [f32; 4],
+    /// `[kind, paint, first_stop, count | interp<<16 | extend<<20 | flags<<24]`.
+    pub meta: [u32; 4],
+}
+
+impl Instance {
+    /// An instance of `kind` with no paint resources.
+    pub const fn new(kind: u32) -> Self {
+        Self {
+            affine: [0.0; 8],
+            bounds: [0.0; 4],
+            shape: Shape::rect([0.0; 2]),
+            inner: Shape::rect([0.0; 2]),
+            clip_inv: [0.0; 8],
+            clip: Shape::rect([0.0; 2]),
+            color: [0.0; 4],
+            grad: [0.0; 4],
+            grad2: [0.0; 4],
+            uv: [0.0; 4],
+            params: [0.0, 1.0, 0.0, 0.0],
+            meta: [kind, PAINT_SOLID, 0, 0],
+        }
+    }
+}
+
+/// One gradient stop, mirroring the WGSL `Stop`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct Stop {
+    /// Straight-alpha colour in the interpolation space.
+    pub color: [f32; 4],
+    /// Position along the gradient, 0 to 1.
+    pub offset: f32,
+    /// Padding.
+    pub pad: [f32; 3],
+}
+
+/// Per-surface constants, mirroring the WGSL `Globals`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct Globals {
+    /// Target size in pixels.
+    pub size: [f32; 2],
+    /// Padding.
+    pub pad: [f32; 2],
+}
+
+/// Converts a kurbo affine into the shader's `[a, b, c, d, e, f, 0, 0]`.
+#[expect(clippy::cast_possible_truncation, reason = "instance data is f32")]
+pub const fn affine(transform: kurbo::Affine) -> [f32; 8] {
+    let [c0, c1, c2, c3, c4, c5] = transform.as_coeffs();
+    [
+        c0 as f32, c1 as f32, c2 as f32, c3 as f32, c4 as f32, c5 as f32, 0.0, 0.0,
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use std::mem::size_of;
+
+    use super::*;
+
+    #[test]
+    fn layouts_match_the_shader() {
+        assert_eq!(size_of::<Instance>(), 272);
+        assert_eq!(size_of::<Shape>(), 32);
+        assert_eq!(size_of::<Stop>(), 32);
+        assert_eq!(size_of::<Globals>(), 16);
+    }
+}

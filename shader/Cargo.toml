@@ -5,7 +5,6 @@ description = "Shader composer on naga IR, shared by Cherenkov and filtrate"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-publish = false
 
 [features]
 # The reference interpreter in `eval`.

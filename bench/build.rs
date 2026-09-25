@@ -57,6 +57,7 @@ fn main() {
         ("vello_cpu", "DEP_VELLO_CPU"),
         ("skia-safe", "DEP_SKIA_SAFE"),
         ("wgpu", "DEP_WGPU"),
+        ("cherenkov-gpu", "DEP_CHERENKOV_GPU"),
     ] {
         if let Some((_, v, rev)) = packages.iter().find(|(n, _, _)| n == pkg) {
             println!("cargo:rustc-env={env}_VERSION={v}");

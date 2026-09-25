@@ -127,7 +127,7 @@ surface.update_animated(Spring::smooth(), |tx| {
 
 - **Two levels.** A transaction-wide animation applies to every property it changes, and `.animation(...)` overrides it for one property.
 - **From nami.** A bound signal's change carries WaterUI's `Animation` in its `Context` metadata. The engine reads it and interpolates, so WaterUI's `.animation(...)` reaches the engine with no glue.
-- **Proposal: one set of animation types.** `Spring { response, damping }`, `Curve` (cubic Bézier with a duration), and `Decay { velocity, deceleration }` with optional rubber-banding. WaterUI's `Animation` becomes these types, the same way colours were unified.
+- **One set of animation types.** `Spring { response, damping }`, `Curve` (cubic Bézier with a duration), and `Decay { velocity, deceleration }` with optional rubber-banding. WaterUI's `Animation` becomes these types, the same way colours were unified.
 - **Out-of-process handoff.** On promoted layers, `transform` and `opacity` animations are handed to Core Animation (Apple) or DirectComposition (Windows) whenever the curve maps exactly: springs map to `CASpringAnimation`, and Bézier curves map to `CAMediaTimingFunction`. Everything else, and everything on Android, is engine-driven.
 
 ## Scrolling
@@ -177,11 +177,16 @@ pub trait Draw {
 - **Numeric changes.** A signal passed to `Recorder` becomes an engine-side value slot. When it changes, only the commands that reference it are regenerated, and damage is exactly those commands. Structural changes re-record.
 - **Shape signals.** A signal of a shape (`radius.map(|r| Circle::new(c, r))`) is how geometry becomes reactive. nami's `map` and `zip` compose it, and there is no per-field generic.
 - **Paired state is closure scopes only.** There is no ambient mutable state and no push/pop.
-- **Proposal (nami).** nami gains a `kurbo` feature that implements constant `Signal` for kurbo types, so `impl Signal<Output = Affine>` accepts a plain `Affine`. The orphan rule prevents Cherenkov from doing this itself. Cherenkov's own types implement constant `Signal` in Cherenkov.
+- **nami `kurbo` feature.** nami gains a `kurbo` feature that implements constant `Signal` for kurbo types, so `impl Signal<Output = Affine>` accepts a plain `Affine`. The orphan rule prevents Cherenkov from doing this itself. Cherenkov's own types implement constant `Signal` in Cherenkov.
 
 ### Canvas (WaterUI)
 
-**Proposal:** Canvas is a WaterUI view holding a recording closure over `Recorder`. It has no state machine of its own: verbs and naming align with SwiftUI's `GraphicsContext`, and state is set only through closure scopes. Structural changes re-run the closure, and numeric changes flow through bound signals. chart and mermaid do not use Canvas; they record directly.
+Canvas and `Content` are fully unified. Canvas is a WaterUI view holding a recording closure that receives `&mut Recorder`; there is no second drawing API and no adapter.
+
+- `DrawingState`, `save`/`restore`, the `set_*` style setters and `push_*`/`pop_layer` are removed.
+- Styles are explicit parameters (`fill(shape, paint)`, `stroke(shape, style, paint)`). Transform, clip, opacity and blend are closure scopes. Reactive numbers are nami signals. Text goes through parley layouts.
+- Structural changes re-run the closure, and numeric changes flow through bound signals.
+- chart and mermaid do not use Canvas; they record directly.
 
 ## Shapes
 
@@ -267,7 +272,7 @@ c.glyphs(&GlyphRun {
 
 Filters are **filtrate** data: the `Filter` trait, parameters, WGSL stages, the derive macro and the built-in filters. Cherenkov executes them: pass scheduling, scratch targets, fragment versus compute, on-chip blending, parameter animation. filtrate's standalone runtime (`FilterAdapter`, `Effect`) retires.
 
-**Proposal: changes to filtrate-core.**
+**Changes to filtrate-core:**
 
 1. **Filter kinds as types.** `ColorFilter` (per pixel; fused into the layer's composite shader at near-zero cost) and `SpatialFilter` (samples neighbours). `Chain<A, B>` is a `ColorFilter` exactly when both halves are.
 2. **Footprint.** `SpatialFilter::footprint(&self) -> f32` gives the maximum sample radius for the current parameters. While a parameter animates, it is the maximum over the animation track. The engine sizes backdrop regions, damage expansion and tile aprons from it.

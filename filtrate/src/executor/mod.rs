@@ -112,19 +112,24 @@ impl<F: Filter> Executor<F> {
     pub(crate) fn animated_values(&self) -> &[f32] {
         self.animator.current_values()
     }
-}
 
-impl<F: Filter> Effect for Executor<F> {
-    fn set_redraw_callback(&mut self, callback: EffectRedrawCallback) {
-        self.animator.install_redraw_callback(callback);
-    }
-
+    /// `setup` with every input format treated as unfilterable — tests
+    /// exercise the manual-bilinear path on a device that could filter.
+    #[cfg(test)]
     #[expect(
         clippy::future_not_send,
         reason = "the executor owns device-bound pipelines and is set up on the GPU host thread"
     )]
-    async fn setup(&mut self, ctx: &EffectContext<'_>) -> EffectSetupResult {
-        match Gpu::new(&self.filter, ctx).await {
+    pub(crate) async fn setup_unfilterable(
+        &mut self,
+        ctx: &EffectContext<'_>,
+    ) -> EffectSetupResult {
+        self.attach(Gpu::with_filterability(&self.filter, ctx, false, false).await)
+    }
+
+    /// Runs the built pipelines, or sticks the setup error.
+    fn attach(&mut self, result: Result<Gpu, EffectSetupError>) -> EffectSetupResult {
+        match result {
             Ok(gpu) => {
                 self.gpu = Some(gpu);
                 self.setup_error = None;
@@ -139,6 +144,20 @@ impl<F: Filter> Effect for Executor<F> {
                 Err(error)
             }
         }
+    }
+}
+
+impl<F: Filter> Effect for Executor<F> {
+    fn set_redraw_callback(&mut self, callback: EffectRedrawCallback) {
+        self.animator.install_redraw_callback(callback);
+    }
+
+    #[expect(
+        clippy::future_not_send,
+        reason = "the executor owns device-bound pipelines and is set up on the GPU host thread"
+    )]
+    async fn setup(&mut self, ctx: &EffectContext<'_>) -> EffectSetupResult {
+        self.attach(Gpu::new(&self.filter, ctx).await)
     }
 
     fn encode_render(

@@ -24,9 +24,12 @@
 //!
 //! - A [`ColorFilter`] maps each pixel's colour to a colour, independently of
 //!   its neighbours. Its [`ColorFilter::LINEAR`] property says whether it is a
-//!   linear map on premultiplied RGBA with an identity alpha row and no
-//!   offset — the property an executor needs before pushing it down into the
-//!   shading of each primitive.
+//!   linear map on premultiplied RGBA with an identity alpha row —
+//!   offsets proportional to alpha (Brightness's `+amount·a`, for example)
+//!   are matrix coefficients and commute with src-over, so they qualify;
+//!   only constant, non-alpha-scaled offsets disqualify. It is the property
+//!   an executor needs before pushing a filter down into the shading of
+//!   each primitive.
 //! - A [`SpatialFilter`] samples its input around each pixel. Its
 //!   [`SpatialFilter::footprint`] is the largest distance, in pixels, of any
 //!   sample it takes.
@@ -93,7 +96,7 @@ mod visitor;
 
 pub use animation::AnimationTrack;
 pub use filter::{Chain, ColorFilter, Filter, FilterExt, SpatialFilter};
-pub use image::{AuxImage, ImageVisitor};
+pub use image::{AuxData, AuxFormat, AuxImage, ImageVisitor};
 pub use kernel::CpuKernel;
 pub use param::{AnimatedCallback, AnimatedTarget, FilterParam, Interpolator, WatchGuard};
 pub use params::ParamArray;

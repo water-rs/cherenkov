@@ -78,6 +78,9 @@ impl StageCollector for Collector {
 enum StageAux {
     /// Image `n` of the chain's flattened images.
     Image(usize),
+    /// Image `n` of the chain's flattened images, which must be a
+    /// caller-provided GPU texture.
+    Texture(usize),
     /// The input of stage `n` of the expanded chain.
     StageInput(usize),
 }
@@ -113,6 +116,9 @@ impl Expanded {
 pub(super) enum PassAux {
     /// Image `n` of the chain's flattened images.
     Image(usize),
+    /// Image `n` of the chain's flattened images, which must be a
+    /// caller-provided GPU texture.
+    Texture(usize),
     /// The texture pass `n` reads as its input.
     PassInput(usize),
 }
@@ -128,11 +134,13 @@ pub(super) struct UniformSlot {
     pub components: usize,
 }
 
-/// One pass: a plain segment of the composition.
+/// One pass: a segment of the composition.
 #[derive(Debug, Clone)]
 pub(super) struct PassPlan {
     /// The segment the pass's entry point calls.
     pub segment: Segment,
+    /// The stage the segment applies, for diagnostics.
+    pub name: &'static str,
     /// The sampler a spatial pass declares; `None` for a colour pass.
     pub sampler: Option<SamplerFilter>,
     /// The clip-shape representation the pass reads.
@@ -160,7 +168,16 @@ type DynamicParams = HashMap<(usize, String), (usize, usize)>;
 
 impl Plan {
     /// Collects, checks and composes `filter`'s stages.
-    pub(super) fn new<F: Filter>(filter: &F) -> Result<Self, EffectSetupError> {
+    ///
+    /// `input_filterable` is whether the input's format supports a filtering
+    /// sampler, and `intermediate_filterable` whether the intermediate
+    /// format does; a filtered sample of an unfilterable input runs the
+    /// manual bilinear instead.
+    pub(super) fn new<F: Filter>(
+        filter: &F,
+        input_filterable: bool,
+        intermediate_filterable: bool,
+    ) -> Result<Self, EffectSetupError> {
         let mut collector = Collector(Vec::new());
         filter.collect_stages(&mut collector);
         let declared = collector.0;
@@ -209,7 +226,13 @@ impl Plan {
         Ok(Self {
             module,
             capabilities,
-            passes: passes(pieces, &expanded, &dynamic),
+            passes: passes(
+                pieces,
+                &expanded,
+                &dynamic,
+                input_filterable,
+                intermediate_filterable,
+            ),
         })
     }
 }
@@ -261,8 +284,15 @@ fn bind_params<'s>(
     Ok(composed)
 }
 
-/// One pass per piece, each taking the plain alternative.
-fn passes(pieces: Vec<Piece>, expanded: &[Expanded], dynamic: &DynamicParams) -> Vec<PassPlan> {
+/// One pass per piece: the plain alternative, or the manual one when the
+/// pass's input format has no hardware filtering.
+fn passes(
+    pieces: Vec<Piece>,
+    expanded: &[Expanded],
+    dynamic: &DynamicParams,
+    input_filterable: bool,
+    intermediate_filterable: bool,
+) -> Vec<PassPlan> {
     let mut pass_of_stage = alloc::vec![0; expanded.len()];
     for (pass, piece) in pieces.iter().enumerate() {
         for stage in plain(piece).stages.clone() {
@@ -271,14 +301,32 @@ fn passes(pieces: Vec<Piece>, expanded: &[Expanded], dynamic: &DynamicParams) ->
     }
     pieces
         .into_iter()
-        .map(|piece| {
+        .enumerate()
+        .map(|(index, piece)| {
             let (segment, sampler) = match piece {
                 Piece::Color(segment) => (segment, None),
-                Piece::Spatial { plain, sampler, .. } => (plain, Some(sampler)),
+                Piece::Spatial {
+                    plain,
+                    manual,
+                    sampler,
+                    ..
+                } => {
+                    let filterable = if index == 0 {
+                        input_filterable
+                    } else {
+                        intermediate_filterable
+                    };
+                    match (filterable, manual) {
+                        // The input has no hardware filtering: texel loads
+                        // implement the sample, bound with a point sampler.
+                        (false, Some(manual)) => (*manual, Some(SamplerFilter::Point)),
+                        _ => (plain, Some(sampler)),
+                    }
+                }
             };
             // A spatial piece is one stage; a colour piece has no shape or
             // auxiliary inputs.
-            let (shape, aux) = match sampler {
+            let (name, shape, aux) = match sampler {
                 Some(_) => {
                     let stage = &expanded[segment.stages.start];
                     let aux = stage
@@ -286,12 +334,13 @@ fn passes(pieces: Vec<Piece>, expanded: &[Expanded], dynamic: &DynamicParams) ->
                         .iter()
                         .map(|aux| match *aux {
                             StageAux::Image(image) => PassAux::Image(image),
+                            StageAux::Texture(image) => PassAux::Texture(image),
                             StageAux::StageInput(stage) => PassAux::PassInput(pass_of_stage[stage]),
                         })
                         .collect();
-                    (stage.shape, aux)
+                    (stage.name, stage.shape, aux)
                 }
-                None => (None, Vec::new()),
+                None => (expanded[segment.stages.start].name, None, Vec::new()),
             };
             let uniforms = segment
                 .uniform
@@ -308,6 +357,7 @@ fn passes(pieces: Vec<Piece>, expanded: &[Expanded], dynamic: &DynamicParams) ->
                 .collect();
             PassPlan {
                 segment,
+                name,
                 sampler,
                 shape,
                 aux,
@@ -370,7 +420,7 @@ fn resolve_aux<F: Filter>(
     source: AuxSource,
 ) -> Result<StageAux, EffectSetupError> {
     match source {
-        AuxSource::Image(image) => {
+        AuxSource::Image(image) | AuxSource::Texture(image) => {
             let image = placed.image_base + image;
             if image >= F::IMAGES {
                 return Err(mismatch(
@@ -378,7 +428,10 @@ fn resolve_aux<F: Filter>(
                     format!("binds image {image}, but the filter provides {}", F::IMAGES),
                 ));
             }
-            Ok(StageAux::Image(image))
+            Ok(match source {
+                AuxSource::Texture(_) => StageAux::Texture(image),
+                _ => StageAux::Image(image),
+            })
         }
         AuxSource::PreviousStageInput => match index
             .checked_sub(1)

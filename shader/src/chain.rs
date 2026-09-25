@@ -3,7 +3,8 @@
 use std::{collections::HashMap, ops::Range};
 
 use naga::{
-    Expression, Function, FunctionArgument, Handle, Literal, Module, StructMember, Type, TypeInner,
+    BinaryOperator, Expression, Function, FunctionArgument, Handle, ImageQuery, Literal,
+    MathFunction, Module, Scalar, ScalarKind, StructMember, Type, TypeInner, VectorSize,
     compact::{KeepUnused, compact},
     valid::{Capabilities, ModuleInfo, ValidationFlags, Validator},
 };
@@ -158,8 +159,18 @@ pub enum Piece {
         /// alternative that applies that piece to each access of `input`
         /// instead of materializing it.
         folded: Option<Folded>,
+        /// For a stage that samples `input` through a filtering sampler: the
+        /// same stage with those samples implemented by texel loads — the
+        /// executor's alternative when the input's format has no hardware
+        /// filtering. `None` for a point-sampled stage, and when the stage
+        /// uses `input` in ways that cannot be substituted.
+        ///
+        /// Its [`Segment::args`] are identical to `plain`'s; the executor
+        /// binds a non-filtering sampler and an unfilterable-float input to
+        /// it.
+        manual: Option<Box<Segment>>,
         /// The filter mode the snippet declares for `SegmentArg::InputSampler`;
-        /// the executor must honor it for both `plain` and `folded`.
+        /// the executor must honor it for `plain` and `folded`.
         sampler: SamplerFilter,
         /// Why the stage cannot fold a colour prefix; `None` when it can.
         not_foldable: Option<FoldBlocker>,
@@ -256,6 +267,7 @@ pub fn compose(stages: &[Stage<'_>], options: ComposeOptions) -> Result<Composit
             }
             SnippetKind::Spatial => {
                 let plain = composer.spatial_segment(index);
+                let manual = composer.manual_segment(index);
                 let sampler = composer.stages[index]
                     .sampler
                     .expect("a spatial stage declares a sampler");
@@ -269,6 +281,7 @@ pub fn compose(stages: &[Stage<'_>], options: ComposeOptions) -> Result<Composit
                 pieces.push(Piece::Spatial {
                     plain,
                     folded,
+                    manual: manual.map(Box::new),
                     sampler,
                     not_foldable,
                 });
@@ -346,6 +359,9 @@ struct Composer {
     capabilities: Capabilities,
     stages: Vec<Imported>,
     working_space: Handle<Type>,
+    /// The manual bilinear, built on first use — shared by every manual
+    /// segment.
+    bilinear: Option<Handle<Function>>,
     next_name: usize,
 }
 
@@ -378,6 +394,7 @@ impl Composer {
             capabilities: Capabilities::empty(),
             stages: Vec::new(),
             working_space,
+            bilinear: None,
             next_name: 0,
         }
     }
@@ -689,6 +706,13 @@ impl Composer {
     }
 
     fn spatial_segment(&mut self, stage: usize) -> Segment {
+        let apply = self.stages[stage].apply;
+        self.spatial_segment_with(stage, apply)
+    }
+
+    /// The stage's plain segment, wrapping `apply` — which is the stage's own
+    /// `apply`, or its substituted copy for [`Piece::Spatial::manual`].
+    fn spatial_segment_with(&mut self, stage: usize, apply: Handle<Function>) -> Segment {
         let name = self.name("segment");
         let block = self.uniform(&[stage], &name);
         let precision = self.options.precision;
@@ -701,7 +725,7 @@ impl Composer {
         let working_space = self.stages[stage].working_space;
         self.trailing_inputs(&mut builder, &mut args, &block, working_space, &mut inputs);
         let arguments = self.stage_arguments(&mut builder, stage, &required, &inputs);
-        let result = builder.call(self.stages[stage].apply, arguments);
+        let result = builder.call(apply, arguments);
         let result = builder.convert(result, self.stages[stage].precision(), precision);
         let function = builder.finish(result, colour_ty);
         self.module.functions.append(function, GENERATED);
@@ -713,6 +737,130 @@ impl Composer {
             args,
             uniform: block.layout,
         }
+    }
+
+    /// The stage's segment with filtered samples of `input` implemented by
+    /// texel loads — `None` for a point-sampled stage, and when its samples
+    /// cannot be substituted.
+    fn manual_segment(&mut self, stage: usize) -> Option<Segment> {
+        if self.stages[stage].sampler != Some(SamplerFilter::Filtered) {
+            return None;
+        }
+        let bilinear = self.manual_bilinear();
+        let apply = rewrite::substitute_samples(
+            &mut self.module,
+            self.stages[stage].apply,
+            0,
+            Some(1),
+            bilinear,
+        )?;
+        Some(self.spatial_segment_with(stage, apply))
+    }
+
+    /// The manual bilinear every substituted sample calls:
+    /// `fn(input: texture_2d<f32>, uv: vec2<f32>) -> vec4<f32>` —
+    /// edge-clamped texel loads with the same weights hardware filtering
+    /// uses.
+    fn manual_bilinear(&mut self) -> Handle<Function> {
+        if let Some(bilinear) = self.bilinear {
+            return bilinear;
+        }
+        let texture = self.ty(parse::texture_2d());
+        let vec2f = self.ty(ParamType::Vec2.inner());
+        let coord_ty = self.ty(TypeInner::Vector {
+            size: VectorSize::Bi,
+            scalar: Scalar::I32,
+        });
+        let colour = parse::colour_type_handle(&mut self.module, Precision::F32);
+
+        let mut builder = FunctionBuilder::new(self.name("manual_bilinear"));
+        let input = builder.argument("input", texture);
+        let uv = builder.argument("uv", vec2f);
+        let dimensions = builder.expression(Expression::ImageQuery {
+            image: input,
+            query: ImageQuery::Size { level: None },
+        });
+        let extent = builder.expression(Expression::As {
+            expr: dimensions,
+            kind: ScalarKind::Float,
+            convert: Some(4),
+        });
+        let scaled = builder.expression(Expression::Binary {
+            op: BinaryOperator::Multiply,
+            left: uv,
+            right: extent,
+        });
+        let half = builder.f32(0.5);
+        let halves = builder.expression(Expression::Compose {
+            ty: vec2f,
+            components: vec![half, half],
+        });
+        let position = builder.expression(Expression::Binary {
+            op: BinaryOperator::Subtract,
+            left: scaled,
+            right: halves,
+        });
+        let base = builder.expression(Expression::Math {
+            fun: MathFunction::Floor,
+            arg: position,
+            arg1: None,
+            arg2: None,
+            arg3: None,
+        });
+        let t = builder.expression(Expression::Binary {
+            op: BinaryOperator::Subtract,
+            left: position,
+            right: base,
+        });
+        let base_i32 = builder.expression(Expression::As {
+            expr: base,
+            kind: ScalarKind::Sint,
+            convert: Some(4),
+        });
+        let span = builder.expression(Expression::As {
+            expr: dimensions,
+            kind: ScalarKind::Sint,
+            convert: None,
+        });
+        let zero = builder.expression(Expression::Literal(Literal::I32(0)));
+        let lo = builder.expression(Expression::Compose {
+            ty: coord_ty,
+            components: vec![zero, zero],
+        });
+        let one = builder.expression(Expression::Literal(Literal::I32(1)));
+        let ones = builder.expression(Expression::Compose {
+            ty: coord_ty,
+            components: vec![one, one],
+        });
+        let hi = builder.expression(Expression::Binary {
+            op: BinaryOperator::Subtract,
+            left: span,
+            right: ones,
+        });
+        let level = builder.expression(Expression::Literal(Literal::I32(0)));
+        let corners = BilinearCorners {
+            input,
+            base: base_i32,
+            lo,
+            hi,
+            coord_ty,
+            level,
+        };
+        let c00 = bilinear_corner(&mut builder, &corners, [0, 0]);
+        let c10 = bilinear_corner(&mut builder, &corners, [1, 0]);
+        let c01 = bilinear_corner(&mut builder, &corners, [0, 1]);
+        let c11 = bilinear_corner(&mut builder, &corners, [1, 1]);
+        let tx = builder.expression(Expression::AccessIndex { base: t, index: 0 });
+        let ty = builder.expression(Expression::AccessIndex { base: t, index: 1 });
+        let x0 = bilinear_mix(&mut builder, c00, c10, tx);
+        let x1 = bilinear_mix(&mut builder, c01, c11, tx);
+        let result = bilinear_mix(&mut builder, x0, x1, ty);
+        let bilinear = self
+            .module
+            .functions
+            .append(builder.finish(result, colour), GENERATED);
+        self.bilinear = Some(bilinear);
+        bilinear
     }
 
     fn folded_segment(&mut self, prefix: Range<usize>, spatial: usize) -> Folded {
@@ -838,4 +986,78 @@ impl Composer {
             pieces,
         })
     }
+}
+
+/// The shared operands of the four bilinear corner loads.
+struct BilinearCorners {
+    /// The `input` texture.
+    input: Handle<Expression>,
+    /// `floor(position)` as `vec2<i32>`.
+    base: Handle<Expression>,
+    /// `vec2<i32>(0, 0)`.
+    lo: Handle<Expression>,
+    /// `size - 1` as `vec2<i32>`.
+    hi: Handle<Expression>,
+    /// The `vec2<i32>` type.
+    coord_ty: Handle<Type>,
+    /// The mip level literal `0`.
+    level: Handle<Expression>,
+}
+
+/// One bilinear corner:
+/// `textureLoad(input, clamp(base + offset, 0, size - 1), 0)`.
+fn bilinear_corner(
+    builder: &mut FunctionBuilder,
+    corners: &BilinearCorners,
+    [dx, dy]: [i32; 2],
+) -> Handle<Expression> {
+    let BilinearCorners {
+        input,
+        base,
+        lo,
+        hi,
+        coord_ty,
+        level,
+    } = *corners;
+    let dx = builder.expression(Expression::Literal(Literal::I32(dx)));
+    let dy = builder.expression(Expression::Literal(Literal::I32(dy)));
+    let offset = builder.expression(Expression::Compose {
+        ty: coord_ty,
+        components: vec![dx, dy],
+    });
+    let at = builder.expression(Expression::Binary {
+        op: BinaryOperator::Add,
+        left: base,
+        right: offset,
+    });
+    let coordinate = builder.expression(Expression::Math {
+        fun: MathFunction::Clamp,
+        arg: at,
+        arg1: Some(lo),
+        arg2: Some(hi),
+        arg3: None,
+    });
+    builder.expression(Expression::ImageLoad {
+        image: input,
+        coordinate,
+        array_index: None,
+        sample: None,
+        level: Some(level),
+    })
+}
+
+/// `mix(a, b, t)` on colour handles — the bilinear weights.
+fn bilinear_mix(
+    builder: &mut FunctionBuilder,
+    a: Handle<Expression>,
+    b: Handle<Expression>,
+    t: Handle<Expression>,
+) -> Handle<Expression> {
+    builder.expression(Expression::Math {
+        fun: MathFunction::Mix,
+        arg: a,
+        arg1: Some(b),
+        arg2: Some(t),
+        arg3: None,
+    })
 }

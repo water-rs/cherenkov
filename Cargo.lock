@@ -372,6 +372,7 @@ dependencies = [
  "divan",
  "filtrate-core",
  "filtrate-derive",
+ "half",
  "image",
  "pollster",
  "thiserror",

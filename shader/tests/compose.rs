@@ -227,6 +227,7 @@ fn colour_prefix_folds_into_every_sample() {
         Piece::Spatial {
             plain,
             folded,
+            manual: None,
             sampler,
             not_foldable,
         },

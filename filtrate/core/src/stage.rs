@@ -44,8 +44,15 @@ pub enum ShapeInput {
 /// binds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AuxSource {
-    /// Image `n` of the filter's own [`Filter::visit_images`](crate::Filter::visit_images).
+    /// Image `n` of the filter's own [`Filter::visit_images`](crate::Filter::visit_images):
+    /// CPU data uploaded at its native precision, or a GPU texture bound in
+    /// place.
     Image(usize),
+    /// Image `n` of the filter's own [`Filter::visit_images`](crate::Filter::visit_images),
+    /// which must be a caller-provided GPU texture — CPU data does not
+    /// satisfy it. The texture is bound at its native format, which must
+    /// sample as `texture_2d<f32>`.
+    Texture(usize),
     /// The input of the immediately preceding stage, which must be a spatial
     /// stage of the same filter. A two-pass filter uses this to read the
     /// image its first pass started from (bloom compositing its glow onto the
@@ -84,16 +91,18 @@ pub struct SpatialStage {
     pub aux: &'static [AuxSource],
 }
 
-/// A stage reported by a filter, with the offsets that place its
-/// [`ParamSource::Param`] and [`AuxSource::Image`] indices within the
-/// flattened parameters and images of the filter being collected.
+/// A stage reported by a filter, with the offsets that place its indices.
+///
+/// The offsets position the stage's [`ParamSource::Param`] and
+/// [`AuxSource::Image`]/[`AuxSource::Texture`] indices within the flattened
+/// parameters and images of the filter being collected.
 #[derive(Debug)]
 pub struct Placed<S: 'static> {
     /// The stage declaration.
     pub stage: &'static S,
     /// Added to every [`ParamSource::Param`] index.
     pub param_base: usize,
-    /// Added to every [`AuxSource::Image`] index.
+    /// Added to every [`AuxSource::Image`] and [`AuxSource::Texture`] index.
     pub image_base: usize,
 }
 

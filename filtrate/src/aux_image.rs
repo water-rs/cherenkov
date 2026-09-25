@@ -6,16 +6,82 @@ extern crate alloc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use filtrate_core::AuxImage;
+use filtrate_core::{AuxData, AuxFormat, AuxImage};
 
-/// An immutable RGBA8 image, bound to a stage's `aux` argument.
+/// A caller-provided GPU texture, bound to a stage's `aux` argument at its
+/// native format.
 ///
-/// The executor uploads it once, as RGBA8 texels exactly as given.
+/// The executor binds the texture in place — no upload, no conversion — so
+/// its format must sample as `texture_2d<f32>`; setup fails otherwise. A
+/// stage binds one through [`AuxSource::Texture`](filtrate_core::AuxSource::Texture),
+/// which rejects CPU images, or through `AuxSource::Image`, which accepts
+/// either.
 #[derive(Clone, Debug)]
-pub struct FilterImage {
-    width: u32,
-    height: u32,
-    rgba8: Arc<[u8]>,
+pub struct TextureImage {
+    texture: wgpu::Texture,
+}
+
+impl TextureImage {
+    /// Wraps a texture the caller already uploaded.
+    ///
+    /// The texture must be 2D and float-sampleable; setup fails otherwise.
+    /// Binding it needs [`wgpu::TextureUsages::TEXTURE_BINDING`].
+    #[must_use]
+    pub const fn new(texture: wgpu::Texture) -> Self {
+        Self { texture }
+    }
+
+    /// The texture.
+    #[must_use]
+    pub const fn texture(&self) -> &wgpu::Texture {
+        &self.texture
+    }
+}
+
+impl AuxImage for TextureImage {
+    fn width(&self) -> u32 {
+        self.texture.width()
+    }
+
+    fn height(&self) -> u32 {
+        self.texture.height()
+    }
+
+    fn data(&self) -> Option<AuxData<'_>> {
+        None
+    }
+
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        Some(self)
+    }
+}
+
+/// An immutable image bound to a stage's `aux` argument.
+///
+/// CPU images are uploaded once, at their native precision: RGBA8, RGBA16F
+/// or RGBA32F texels exactly as given — a float map keeps its precision
+/// ([`FilterImage::from_rgba16f`], [`FilterImage::from_rgba32f`]). A GPU
+/// texture binds in place, also at its native format
+/// ([`FilterImage::from_texture`]).
+#[derive(Clone, Debug)]
+pub struct FilterImage(Source);
+
+/// What a [`FilterImage`] holds.
+#[derive(Clone, Debug)]
+enum Source {
+    /// CPU texels the executor uploads.
+    Cpu {
+        /// Width in pixels.
+        width: u32,
+        /// Height in pixels.
+        height: u32,
+        /// The texel format of `texels`.
+        format: AuxFormat,
+        /// `width * height * format.texel_size()` bytes, row-major.
+        texels: Arc<[u8]>,
+    },
+    /// A texture bound in place.
+    Texture(TextureImage),
 }
 
 impl FilterImage {
@@ -26,18 +92,72 @@ impl FilterImage {
     /// Panics when `rgba8` does not contain exactly `width * height * 4` bytes.
     #[must_use]
     pub fn from_rgba8(width: u32, height: u32, rgba8: Vec<u8>) -> Self {
-        let expected_len = width as usize * height as usize * 4;
-        assert_eq!(
-            rgba8.len(),
-            expected_len,
-            "FilterImage::from_rgba8: expected {expected_len} bytes for {width}x{height} RGBA8 image, got {}",
-            rgba8.len()
-        );
-        Self {
+        Self::from_data(width, height, AuxFormat::Rgba8, rgba8)
+    }
+
+    /// Creates an image from f16 texels, row-major.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `rgba16f` does not contain exactly `width * height * 4`
+    /// texels.
+    #[must_use]
+    pub fn from_rgba16f(width: u32, height: u32, rgba16f: &[half::f16]) -> Self {
+        Self::from_data(
             width,
             height,
-            rgba8: Arc::from(rgba8),
-        }
+            AuxFormat::Rgba16Float,
+            rgba16f
+                .iter()
+                .flat_map(|texel| texel.to_bits().to_le_bytes())
+                .collect(),
+        )
+    }
+
+    /// Creates an image from f32 texels, row-major.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `rgba32f` does not contain exactly `width * height * 4`
+    /// texels.
+    #[must_use]
+    pub fn from_rgba32f(width: u32, height: u32, rgba32f: &[f32]) -> Self {
+        Self::from_data(
+            width,
+            height,
+            AuxFormat::Rgba32Float,
+            bytemuck::cast_slice(rgba32f).to_vec(),
+        )
+    }
+
+    /// Wraps a texture the caller already uploaded — bound in place at its
+    /// native format.
+    #[must_use]
+    pub const fn from_texture(texture: TextureImage) -> Self {
+        Self(Source::Texture(texture))
+    }
+
+    /// Creates an image from CPU texels.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `texels` is not exactly `width * height *
+    /// format.texel_size()` bytes.
+    #[must_use]
+    fn from_data(width: u32, height: u32, format: AuxFormat, texels: Vec<u8>) -> Self {
+        let expected_len = width as usize * height as usize * format.texel_size();
+        assert_eq!(
+            texels.len(),
+            expected_len,
+            "FilterImage: expected {expected_len} bytes for a {width}x{height} {format:?} image, got {}",
+            texels.len()
+        );
+        Self(Source::Cpu {
+            width,
+            height,
+            format,
+            texels: Arc::from(texels),
+        })
     }
 
     /// Decodes an encoded image and converts it to RGBA8 pixels.
@@ -54,27 +174,40 @@ impl FilterImage {
     #[must_use]
     pub fn from_dynamic_image(image: &image::DynamicImage) -> Self {
         let rgba = image.to_rgba8();
-        let width = rgba.width();
-        let height = rgba.height();
-        Self {
-            width,
-            height,
-            rgba8: Arc::from(rgba.into_raw()),
-        }
+        Self::from_rgba8(rgba.width(), rgba.height(), rgba.into_raw())
     }
 }
 
 impl AuxImage for FilterImage {
     fn width(&self) -> u32 {
-        self.width
+        match &self.0 {
+            Source::Cpu { width, .. } => *width,
+            Source::Texture(texture) => texture.texture.width(),
+        }
     }
 
     fn height(&self) -> u32 {
-        self.height
+        match &self.0 {
+            Source::Cpu { height, .. } => *height,
+            Source::Texture(texture) => texture.texture.height(),
+        }
     }
 
-    fn rgba8(&self) -> &[u8] {
-        &self.rgba8
+    fn data(&self) -> Option<AuxData<'_>> {
+        match &self.0 {
+            Source::Cpu { format, texels, .. } => Some(AuxData {
+                format: *format,
+                bytes: texels.as_ref(),
+            }),
+            Source::Texture(_) => None,
+        }
+    }
+
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        match &self.0 {
+            Source::Cpu { .. } => None,
+            Source::Texture(texture) => Some(texture),
+        }
     }
 }
 
@@ -91,8 +224,8 @@ impl LutImage {
     ///
     /// # Panics
     ///
-    /// Panics when `size < 2` or when `image` is not `size * size` by `size`
-    /// texels.
+    /// Panics when `size < 2`, when `image` is a GPU texture, or when `image`
+    /// is not `size * size` by `size` texels.
     #[must_use]
     pub fn new(image: FilterImage, size: u32) -> Self {
         assert!(
@@ -101,14 +234,16 @@ impl LutImage {
         );
         let expected_width = size * size;
         assert_eq!(
-            image.width, expected_width,
+            image.width(),
+            expected_width,
             "LutImage::new: expected width {expected_width} for size {size}, got {}",
-            image.width
+            image.width()
         );
         assert_eq!(
-            image.height, size,
+            image.height(),
+            size,
             "LutImage::new: expected height {size} for size {size}, got {}",
-            image.height
+            image.height()
         );
         Self { image, size }
     }
@@ -164,7 +299,9 @@ mod tests {
     #[test]
     fn lut_image_rejects_invalid_dimensions() {
         let bad_image = FilterImage::from_rgba8(16, 15, vec![0; 16 * 15 * 4]);
-        let result = std::panic::catch_unwind(|| LutImage::new(bad_image, 4));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = LutImage::new(bad_image, 4);
+        }));
         assert!(result.is_err());
     }
 }

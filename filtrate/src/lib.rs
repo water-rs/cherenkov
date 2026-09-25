@@ -66,7 +66,7 @@ pub mod effect;
 mod executor;
 pub mod filters;
 
-pub use aux_image::{FilterImage, LutImage};
+pub use aux_image::{FilterImage, LutImage, TextureImage};
 pub use effect::{
     Effect, EffectContext, EffectFrameClock, EffectFrameTiming, EffectInput, EffectOutput,
     EffectRedrawCallback, EffectRenderError, EffectRenderResult, EffectSetupError,
@@ -74,10 +74,10 @@ pub use effect::{
 };
 pub use executor::Executor;
 pub use filtrate_core::{
-    AnimatedCallback, AnimatedTarget, AnimationTrack, AuxImage, AuxSource, Chain, ColorFilter,
-    ColorStage, CpuKernel, Filter, FilterExt, FilterParam, ImageVisitor, Interpolator,
-    OperatingSpace, ParamArray, ParamSource, Placed, ShapeInput, SignalVisitor, SpatialFilter,
-    SpatialStage, StageCollector, WatchGuard, WorkingSpace, kind,
+    AnimatedCallback, AnimatedTarget, AnimationTrack, AuxData, AuxFormat, AuxImage, AuxSource,
+    Chain, ColorFilter, ColorStage, CpuKernel, Filter, FilterExt, FilterParam, ImageVisitor,
+    Interpolator, OperatingSpace, ParamArray, ParamSource, Placed, ShapeInput, SignalVisitor,
+    SpatialFilter, SpatialStage, StageCollector, WatchGuard, WorkingSpace, kind,
 };
 
 /// Procedural derive that generates a single-stage filter: the [`Filter`]

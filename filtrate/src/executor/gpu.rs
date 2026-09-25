@@ -6,14 +6,15 @@ extern crate alloc;
 use alloc::{borrow::Cow, string::ToString, vec::Vec};
 
 use cherenkov_shader::{SamplerFilter, SegmentArg, naga::Module};
-use filtrate_core::{AuxImage, Filter, ImageVisitor, ShapeInput, WorkingSpace};
+use filtrate_core::{AuxFormat, AuxImage, Filter, ImageVisitor, ShapeInput, WorkingSpace};
 
 use super::{
     entry::{self, ENTRY_POINT, binding},
     plan::{PassAux, PassPlan, Plan},
 };
-use crate::effect::{
-    EffectContext, EffectInput, EffectOutput, EffectRenderError, EffectSetupError,
+use crate::{
+    aux_image::TextureImage,
+    effect::{EffectContext, EffectInput, EffectOutput, EffectRenderError, EffectSetupError},
 };
 
 /// The format every intermediate is materialized in: f16, so every
@@ -34,11 +35,29 @@ struct GpuPass {
     uses_space: bool,
 }
 
-/// An uploaded auxiliary image.
+/// An auxiliary image's binding: CPU data uploaded at its native
+/// precision, or a caller-provided texture bound in place.
 #[derive(Debug)]
-struct Image {
-    _texture: wgpu::Texture,
-    view: wgpu::TextureView,
+enum Image {
+    /// The executor's own upload.
+    Uploaded {
+        view: wgpu::TextureView,
+        _texture: wgpu::Texture,
+    },
+    /// The caller's texture, at its native format.
+    Bound {
+        texture: wgpu::Texture,
+        view: wgpu::TextureView,
+    },
+}
+
+impl Image {
+    /// The view a pass binds.
+    const fn view(&self) -> &wgpu::TextureView {
+        match self {
+            Self::Uploaded { view, .. } | Self::Bound { view, .. } => view,
+        }
+    }
 }
 
 /// The intermediate slots for one input size.
@@ -82,19 +101,47 @@ impl Gpu {
         filter: &F,
         ctx: &EffectContext<'_>,
     ) -> Result<Self, EffectSetupError> {
-        let plan = Plan::new(filter)?;
-        if plan.passes[0].sampler == Some(SamplerFilter::Filtered)
-            && !ctx
-                .input_format
-                .guaranteed_format_features(ctx.device.features())
-                .flags
-                .contains(wgpu::TextureFormatFeatureFlags::FILTERABLE)
-        {
-            return Err(EffectSetupError::InputNotFilterable {
-                format: ctx.input_format,
-            });
+        let features = ctx.device.features();
+        Self::with_filterability(
+            filter,
+            ctx,
+            filterable(ctx.input_format, features),
+            filterable(INTERMEDIATE_FORMAT, features),
+        )
+        .await
+    }
+
+    /// `new` with the filterabilities given rather than queried — tests force
+    /// the manual path through it.
+    #[expect(
+        clippy::future_not_send,
+        reason = "setup borrows the filter and the device-bound context on the GPU host thread"
+    )]
+    pub(super) async fn with_filterability<F: Filter>(
+        filter: &F,
+        ctx: &EffectContext<'_>,
+        input_filterable: bool,
+        intermediate_filterable: bool,
+    ) -> Result<Self, EffectSetupError> {
+        let plan = Plan::new(filter, input_filterable, intermediate_filterable)?;
+        for (index, pass) in plan.passes.iter().enumerate() {
+            let (format, format_filterable) = if index == 0 {
+                (ctx.input_format, input_filterable)
+            } else {
+                (INTERMEDIATE_FORMAT, intermediate_filterable)
+            };
+            // A filtered sampler bound here means the stage samples `input`
+            // in a way the manual bilinear cannot reproduce.
+            if pass.sampler == Some(SamplerFilter::Filtered) && !format_filterable {
+                return Err(EffectSetupError::InputNotFilterable { format });
+            }
         }
-        probe_intermediate_format(ctx.device).await?;
+        // Slots first: a single-pass chain never materializes an
+        // intermediate and must not probe for one.
+        let (slot_of, slot_count) = assign_slots(&plan.passes);
+        if slot_count > 0 {
+            probe_intermediate_format(ctx.device).await?;
+        }
 
         let vertex = ctx
             .device
@@ -102,7 +149,6 @@ impl Gpu {
                 label: Some("filtrate full-screen triangle"),
                 source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(VERTEX_SHADER)),
             });
-        let (slot_of, slot_count) = assign_slots(&plan.passes);
         let last = plan.passes.len() - 1;
         let mut passes = Vec::with_capacity(plan.passes.len());
         for (index, pass) in plan.passes.into_iter().enumerate() {
@@ -133,7 +179,7 @@ impl Gpu {
             images: (0..F::IMAGES).map(|_| None).collect(),
         };
         filter.visit_images(&mut uploader);
-        let images = uploader
+        let images: Vec<Image> = uploader
             .images
             .into_iter()
             .enumerate()
@@ -146,6 +192,8 @@ impl Gpu {
                 })
             })
             .collect();
+
+        check_bound_textures(&passes, &images, ctx.device)?;
 
         Ok(Self {
             passes,
@@ -357,7 +405,7 @@ impl GpuPass {
         }
         for (n, aux) in (0u32..).zip(&self.plan.aux) {
             let view = match *aux {
-                PassAux::Image(image) => &shared.images[image].view,
+                PassAux::Image(image) | PassAux::Texture(image) => shared.images[image].view(),
                 PassAux::PassInput(pass) => input_view(pass, input, slots, slot_of),
             };
             entries.push(wgpu::BindGroupEntry {
@@ -520,6 +568,66 @@ fn intermediate_texture(device: &wgpu::Device, (width, height): (u32, u32)) -> w
     })
 }
 
+/// Validates the bound textures against their stages' `texture_2d<f32>`
+/// declarations: a `Texture` auxiliary requires one, and every bound
+/// texture must be a float-sampleable 2D texture.
+fn check_bound_textures(
+    passes: &[GpuPass],
+    images: &[Image],
+    device: &wgpu::Device,
+) -> Result<(), EffectSetupError> {
+    for pass in passes {
+        for (n, aux) in (0u32..).zip(&pass.plan.aux) {
+            let (image, requires_texture) = match *aux {
+                PassAux::Image(image) => (image, false),
+                PassAux::Texture(image) => (image, true),
+                PassAux::PassInput(_) => continue,
+            };
+            match &images[image] {
+                Image::Bound { texture, .. } => {
+                    let format = texture.format();
+                    let sample_type =
+                        format.sample_type(Some(wgpu::TextureAspect::All), Some(device.features()));
+                    let float = matches!(
+                        sample_type,
+                        Some(
+                            wgpu::TextureSampleType::Float { .. } | wgpu::TextureSampleType::Depth
+                        )
+                    );
+                    if texture.dimension() != wgpu::TextureDimension::D2 || !float {
+                        return Err(EffectSetupError::StageMismatch {
+                            stage: pass.plan.name,
+                            reason: format!(
+                                "aux{n} is a `texture_2d<f32>`, but image {image} is a \
+                                 {format:?} {:?} texture",
+                                texture.dimension()
+                            ),
+                        });
+                    }
+                }
+                Image::Uploaded { .. } if requires_texture => {
+                    return Err(EffectSetupError::StageMismatch {
+                        stage: pass.plan.name,
+                        reason: format!(
+                            "declares aux{n} a GPU texture, but image {image} is CPU data"
+                        ),
+                    });
+                }
+                Image::Uploaded { .. } => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether `format` supports a filtering sampler under `features`.
+fn filterable(format: wgpu::TextureFormat, features: wgpu::Features) -> bool {
+    format
+        .guaranteed_format_features(features)
+        .flags
+        .contains(wgpu::TextureFormatFeatureFlags::FILTERABLE)
+}
+
 /// Fails setup when the device cannot render to the intermediates.
 async fn probe_intermediate_format(device: &wgpu::Device) -> Result<(), EffectSetupError> {
     let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
@@ -561,6 +669,28 @@ impl ImageVisitor for Uploader<'_, '_> {
             self.images[index].is_none(),
             "the filter visited image {index} twice"
         );
+        // A caller-provided texture binds in place — no upload.
+        if let Some(image) = image
+            .as_any()
+            .and_then(|any| any.downcast_ref::<TextureImage>())
+        {
+            let texture = image.texture();
+            self.images[index] = Some(Image::Bound {
+                view: texture.create_view(&wgpu::TextureViewDescriptor::default()),
+                texture: texture.clone(),
+            });
+            return;
+        }
+
+        let data = image
+            .data()
+            .unwrap_or_else(|| panic!("aux image {index} is neither CPU data nor a GPU texture"));
+        let format = match data.format {
+            AuxFormat::Rgba8 => wgpu::TextureFormat::Rgba8Unorm,
+            AuxFormat::Rgba16Float => wgpu::TextureFormat::Rgba16Float,
+            AuxFormat::Rgba32Float => wgpu::TextureFormat::Rgba32Float,
+        };
+        let texel_size = u32::try_from(data.format.texel_size()).expect("a texel size fits in u32");
         let size = wgpu::Extent3d {
             width: image.width(),
             height: image.height(),
@@ -572,7 +702,7 @@ impl ImageVisitor for Uploader<'_, '_> {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
+            format,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -583,15 +713,15 @@ impl ImageVisitor for Uploader<'_, '_> {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            image.rgba8(),
+            data.bytes,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(image.width() * 4),
+                bytes_per_row: Some(image.width() * texel_size),
                 rows_per_image: Some(image.height()),
             },
             size,
         );
-        self.images[index] = Some(Image {
+        self.images[index] = Some(Image::Uploaded {
             view: texture.create_view(&wgpu::TextureViewDescriptor::default()),
             _texture: texture,
         });
@@ -614,6 +744,7 @@ mod tests {
                 args: Vec::new(),
                 uniform: UniformLayout::default(),
             },
+            name: "stage",
             sampler: None,
             shape: None,
             aux,

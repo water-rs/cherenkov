@@ -15,11 +15,11 @@ use super::{
     plan::{PassAux, Plan},
 };
 use crate::{
-    AnimatedCallback, AnimatedTarget, ColorFilter, ColorStage, CpuKernel, Effect, EffectContext,
-    EffectFrameTiming, EffectInput, EffectOutput, EffectRenderError, EffectSetupError, Filter,
-    FilterExt, FilterParam, Interpolator, OperatingSpace, ParamArray, ParamSource, Placed,
-    ShapeInput, ShapeTextures, SpatialFilter, SpatialStage, StageCollector, WatchGuard,
-    WorkingSpace, filters, kind,
+    AnimatedCallback, AnimatedTarget, AuxSource, ColorFilter, ColorStage, CpuKernel, Effect,
+    EffectContext, EffectFrameTiming, EffectInput, EffectOutput, EffectRenderError,
+    EffectSetupError, Filter, FilterExt, FilterParam, ImageVisitor, Interpolator, OperatingSpace,
+    ParamArray, ParamSource, Placed, ShapeInput, ShapeTextures, SpatialFilter, SpatialStage,
+    StageCollector, WatchGuard, WorkingSpace, filters, kind,
 };
 
 // ============================================================================
@@ -112,18 +112,128 @@ impl ColorFilter for CssInvert {
     const LINEAR: bool = false;
 }
 
+/// One filtered sample at `uv * 0.5` — a pure bilinear read of the input.
+struct SampleHalf;
+
+const SAMPLE_HALF: SpatialStage = SpatialStage {
+    name: "sample_half",
+    source: include_str!("test_snippets/sample_half.wgsl"),
+    params: &[],
+    space: OperatingSpace::Working,
+    shape: None,
+    aux: &[],
+};
+
+impl Filter for SampleHalf {
+    type Kind = kind::Spatial;
+    type Params = [f32; 0];
+
+    fn params(&self) -> [f32; 0] {
+        []
+    }
+
+    fn collect_stages<C: StageCollector>(&self, collector: &mut C) {
+        collector.spatial(Placed::new(&SAMPLE_HALF));
+    }
+}
+
+impl SpatialFilter for SampleHalf {
+    fn footprint_of(_params: &[f32; 0]) -> f32 {
+        1.0
+    }
+}
+
+/// Passes the `aux0` texel at `uv` through — its precision is the output.
+const READ_AUX: SpatialStage = SpatialStage {
+    name: "read_aux",
+    source: include_str!("test_snippets/read_aux.wgsl"),
+    params: &[],
+    space: OperatingSpace::Working,
+    shape: None,
+    aux: &[AuxSource::Image(0)],
+};
+
+/// `read_aux` with the image declared a caller-provided texture.
+const READ_AUX_TEXTURE: SpatialStage = SpatialStage {
+    aux: &[AuxSource::Texture(0)],
+    ..READ_AUX
+};
+
+/// `apply` passes `aux0` through; the filter holds it as image 0.
+struct ReadAux {
+    image: crate::FilterImage,
+}
+
+impl Filter for ReadAux {
+    type Kind = kind::Spatial;
+    type Params = [f32; 0];
+    const IMAGES: usize = 1;
+
+    fn params(&self) -> [f32; 0] {
+        []
+    }
+
+    fn collect_stages<C: StageCollector>(&self, collector: &mut C) {
+        collector.spatial(Placed::new(&READ_AUX));
+    }
+
+    fn visit_images<V: ImageVisitor>(&self, visitor: &mut V) {
+        visitor.visit(0, &self.image);
+    }
+}
+
+impl SpatialFilter for ReadAux {
+    fn footprint_of(_params: &[f32; 0]) -> f32 {
+        0.0
+    }
+}
+
+/// `ReadAux` declaring its image a caller-provided GPU texture.
+struct ReadAuxTexture {
+    image: crate::FilterImage,
+}
+
+impl Filter for ReadAuxTexture {
+    type Kind = kind::Spatial;
+    type Params = [f32; 0];
+    const IMAGES: usize = 1;
+
+    fn params(&self) -> [f32; 0] {
+        []
+    }
+
+    fn collect_stages<C: StageCollector>(&self, collector: &mut C) {
+        collector.spatial(Placed::new(&READ_AUX_TEXTURE));
+    }
+
+    fn visit_images<V: ImageVisitor>(&self, visitor: &mut V) {
+        visitor.visit(0, &self.image);
+    }
+}
+
+impl SpatialFilter for ReadAuxTexture {
+    fn footprint_of(_params: &[f32; 0]) -> f32 {
+        0.0
+    }
+}
+
 // ============================================================================
 // The reference program
 // ============================================================================
 
-/// Composes `filter` and wraps and validates every pass's entry point.
+/// Composes `filter` and wraps and validates every pass's entry point —
+/// for the hardware-filtered plan and for the manual-bilinear one.
 fn assert_composes<F: Filter>(name: &str, filter: &F) -> Plan {
-    let plan = Plan::new(filter).unwrap_or_else(|error| panic!("{name} does not compose: {error}"));
-    for (index, pass) in plan.passes.iter().enumerate() {
-        entry::pass_module(&plan.module, plan.capabilities, index, pass)
-            .unwrap_or_else(|error| panic!("{name}: {error}"));
+    for filterable in [true, false] {
+        let plan = Plan::new(filter, filterable, filterable).unwrap_or_else(|error| {
+            panic!("{name} does not compose (filterable={filterable}): {error}")
+        });
+        for (index, pass) in plan.passes.iter().enumerate() {
+            entry::pass_module(&plan.module, plan.capabilities, index, pass)
+                .unwrap_or_else(|error| panic!("{name} (filterable={filterable}): {error}"));
+        }
     }
-    plan
+    Plan::new(filter, true, true).unwrap_or_else(|error| panic!("{name} does not compose: {error}"))
 }
 
 fn blank_image() -> crate::FilterImage {
@@ -404,7 +514,7 @@ fn a_stage_declares_the_shape_input_its_snippet_takes() {
     let plan = assert_composes("masked", &Masked);
     assert_eq!(plan.passes[0].shape, Some(ShapeInput::Mask));
     assert!(matches!(
-        Plan::new(&UndeclaredShape),
+        Plan::new(&UndeclaredShape, true, true),
         Err(EffectSetupError::StageMismatch {
             stage: "median",
             ..
@@ -684,10 +794,16 @@ fn create_test_device() -> TestGpu {
 
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
-fn texture(
+fn texture(gpu: &TestGpu, size: (u32, u32), usage: wgpu::TextureUsages) -> wgpu::Texture {
+    texture_format(gpu, size, usage, FORMAT)
+}
+
+/// A texture in `format`.
+fn texture_format(
     gpu: &TestGpu,
     (width, height): (u32, u32),
     usage: wgpu::TextureUsages,
+    format: wgpu::TextureFormat,
 ) -> wgpu::Texture {
     gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("filtrate test texture"),
@@ -699,7 +815,7 @@ fn texture(
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: FORMAT,
+        format,
         usage,
         view_formats: &[],
     })
@@ -707,10 +823,22 @@ fn texture(
 
 /// An RGBA8 texture holding `rgba`.
 fn upload(gpu: &TestGpu, size: (u32, u32), rgba: &[u8]) -> wgpu::Texture {
-    let texture = texture(
+    upload_bytes(gpu, size, FORMAT, 4, rgba)
+}
+
+/// A `format` texture holding `data`, `bytes_per_texel` per texel.
+fn upload_bytes(
+    gpu: &TestGpu,
+    size: (u32, u32),
+    format: wgpu::TextureFormat,
+    bytes_per_texel: u32,
+    data: &[u8],
+) -> wgpu::Texture {
+    let texture = texture_format(
         gpu,
         size,
         wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        format,
     );
     gpu.queue.write_texture(
         wgpu::TexelCopyTextureInfo {
@@ -719,10 +847,10 @@ fn upload(gpu: &TestGpu, size: (u32, u32), rgba: &[u8]) -> wgpu::Texture {
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
         },
-        rgba,
+        data,
         wgpu::TexelCopyBufferLayout {
             offset: 0,
-            bytes_per_row: Some(size.0 * 4),
+            bytes_per_row: Some(size.0 * bytes_per_texel),
             rows_per_image: Some(size.1),
         },
         wgpu::Extent3d {
@@ -734,13 +862,28 @@ fn upload(gpu: &TestGpu, size: (u32, u32), rgba: &[u8]) -> wgpu::Texture {
     texture
 }
 
-fn readback_rgba8_image(
+/// An `Rgba32Float` texture holding `texels`.
+fn upload_f32(gpu: &TestGpu, size: (u32, u32), texels: &[[f32; 4]]) -> wgpu::Texture {
+    upload_bytes(
+        gpu,
+        size,
+        wgpu::TextureFormat::Rgba32Float,
+        16,
+        bytemuck::cast_slice(texels),
+    )
+}
+
+fn readback_rgba8_image(gpu: &TestGpu, texture: &wgpu::Texture, size: (u32, u32)) -> Vec<u8> {
+    readback_bytes(gpu, texture, size, 4)
+}
+
+fn readback_bytes(
     gpu: &TestGpu,
     texture: &wgpu::Texture,
     (width, height): (u32, u32),
+    bytes_per_pixel: u32,
 ) -> Vec<u8> {
-    const BYTES_PER_PIXEL: u32 = 4;
-    let unpadded_bpr = width * BYTES_PER_PIXEL;
+    let unpadded_bpr = width * bytes_per_pixel;
     let padded_bpr = unpadded_bpr.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
         * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
     let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
@@ -798,6 +941,10 @@ fn readback_rgba8_image(
     out
 }
 
+fn readback_f32_image(gpu: &TestGpu, texture: &wgpu::Texture, size: (u32, u32)) -> Vec<[f32; 4]> {
+    bytemuck::cast_slice(&readback_bytes(gpu, texture, size, 16)).to_vec()
+}
+
 fn frame_input<'a>(
     gpu: &'a TestGpu,
     texture: &'a wgpu::Texture,
@@ -805,12 +952,23 @@ fn frame_input<'a>(
     delta: Duration,
     shape: ShapeTextures,
 ) -> EffectInput<'a> {
+    frame_input_format(gpu, texture, size, delta, shape, FORMAT)
+}
+
+fn frame_input_format<'a>(
+    gpu: &'a TestGpu,
+    texture: &'a wgpu::Texture,
+    size: (u32, u32),
+    delta: Duration,
+    shape: ShapeTextures,
+    format: wgpu::TextureFormat,
+) -> EffectInput<'a> {
     EffectInput {
         device: &gpu.device,
         queue: &gpu.queue,
         texture,
         view: texture.create_view(&wgpu::TextureViewDescriptor::default()),
-        format: FORMAT,
+        format,
         width: size.0,
         height: size.1,
         timing: EffectFrameTiming::new(Duration::ZERO, delta, 0),
@@ -823,37 +981,71 @@ fn frame_output<'a>(
     texture: &'a wgpu::Texture,
     size: (u32, u32),
 ) -> EffectOutput<'a> {
+    frame_output_format(gpu, texture, size, FORMAT)
+}
+
+fn frame_output_format<'a>(
+    gpu: &'a TestGpu,
+    texture: &'a wgpu::Texture,
+    size: (u32, u32),
+    format: wgpu::TextureFormat,
+) -> EffectOutput<'a> {
     EffectOutput {
         device: &gpu.device,
         queue: &gpu.queue,
         texture,
         view: texture.create_view(&wgpu::TextureViewDescriptor::default()),
-        format: FORMAT,
+        format,
         width: size.0,
         height: size.1,
     }
 }
 
 fn setup<F: Filter>(gpu: &TestGpu, executor: &mut Executor<F>) {
+    setup_format(gpu, executor, FORMAT, FORMAT);
+}
+
+fn setup_format<F: Filter>(
+    gpu: &TestGpu,
+    executor: &mut Executor<F>,
+    input_format: wgpu::TextureFormat,
+    output_format: wgpu::TextureFormat,
+) {
     let ctx = EffectContext {
         device: &gpu.device,
         queue: &gpu.queue,
-        input_format: FORMAT,
-        output_format: FORMAT,
+        input_format,
+        output_format,
     };
     pollster::block_on(executor.setup(&ctx)).expect("test filter setup should succeed");
 }
 
-/// Runs `filter` once on `rgba` and reads the result back.
-fn run<F: Filter>(
+/// `setup_format` forcing every format unfilterable — the manual-bilinear
+/// plan on a device that could filter.
+fn setup_unfilterable<F: Filter>(
     gpu: &TestGpu,
-    filter: F,
+    executor: &mut Executor<F>,
+    input_format: wgpu::TextureFormat,
+    output_format: wgpu::TextureFormat,
+) {
+    let ctx = EffectContext {
+        device: &gpu.device,
+        queue: &gpu.queue,
+        input_format,
+        output_format,
+    };
+    pollster::block_on(executor.setup_unfilterable(&ctx))
+        .expect("test filter setup should succeed");
+}
+
+/// Renders `rgba` through `executor` once and reads the RGBA8 output back.
+fn render_rgba8<F: Filter>(
+    gpu: &TestGpu,
+    executor: &mut Executor<F>,
     size: (u32, u32),
     rgba: &[u8],
     shape: ShapeTextures,
 ) -> Vec<u8> {
-    let mut executor = Executor::new(filter);
-    setup(gpu, &mut executor);
     let input = upload(gpu, size, rgba);
     let output = texture(
         gpu,
@@ -867,6 +1059,19 @@ fn run<F: Filter>(
         )
         .expect("test render should succeed");
     readback_rgba8_image(gpu, &output, size)
+}
+
+/// Runs `filter` once on `rgba` and reads the result back.
+fn run<F: Filter>(
+    gpu: &TestGpu,
+    filter: F,
+    size: (u32, u32),
+    rgba: &[u8],
+    shape: ShapeTextures,
+) -> Vec<u8> {
+    let mut executor = Executor::new(filter);
+    setup(gpu, &mut executor);
+    render_rgba8(gpu, &mut executor, size, rgba, shape)
 }
 
 fn to_unorm(value: f32) -> u8 {
@@ -1041,6 +1246,258 @@ fn gpu_srgb_stages_run_in_srgb() {
         .collect();
     let output = run(&gpu, CssInvert, size, &rgba, ShapeTextures::default());
     assert_rgba8_close(&output, &expected, 2, "invert in sRGB");
+}
+
+/// The executor's manual bilinear, as a CPU reference over f32 texels.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    reason = "test coordinates fit every type they are cast to"
+)]
+fn manual_bilinear(texels: &[[f32; 4]], (width, height): (u32, u32), uv: [f32; 2]) -> [f32; 4] {
+    let position = [
+        uv[0].mul_add(width as f32, -0.5),
+        uv[1].mul_add(height as f32, -0.5),
+    ];
+    let base = [position[0].floor(), position[1].floor()];
+    let t = [position[0] - base[0], position[1] - base[1]];
+    let corner = |offset: [i32; 2]| {
+        let x = (base[0] as i32 + offset[0]).clamp(0, width as i32 - 1);
+        let y = (base[1] as i32 + offset[1]).clamp(0, height as i32 - 1);
+        texels[(y * width as i32 + x) as usize]
+    };
+    let mix = |a: [f32; 4], b: [f32; 4], t: f32| {
+        core::array::from_fn(|i| a[i].mul_add(1.0 - t, b[i] * t))
+    };
+    mix(
+        mix(corner([0, 0]), corner([1, 0]), t[0]),
+        mix(corner([0, 1]), corner([1, 1]), t[0]),
+        t[1],
+    )
+}
+
+/// `uv * 0.5` for output texel `(x, y)` of `size`, the `uv` a stage sees.
+#[expect(clippy::cast_precision_loss, reason = "test coordinates fit in f32")]
+fn stage_uv((width, height): (u32, u32), x: u32, y: u32) -> [f32; 2] {
+    [
+        (x as f32 + 0.5) / width as f32,
+        (y as f32 + 0.5) / height as f32,
+    ]
+}
+
+/// Texels that give every bilinear tap a distinct value, beyond unorm range.
+fn float_test_texels(count: u8) -> Vec<[f32; 4]> {
+    (0..count)
+        .map(|i| {
+            let f = f32::from(i) / f32::from(count - 1);
+            [f * 4.0 - 1.0, 1.0 / (f + 1.0), f * f, 0.5 + f]
+        })
+        .collect()
+}
+
+#[test]
+fn gpu_manual_bilinear_matches_hardware_filtering() {
+    let gpu = create_test_device();
+    let size = (16, 16);
+    let rgba = create_test_input_rgba(size.0, size.1);
+    let params = [0.5_f32, 0.5, 0.4, 180.0];
+    let hardware = run(
+        &gpu,
+        filters::TwirlDistortion(params),
+        size,
+        &rgba,
+        ShapeTextures::default(),
+    );
+    let mut executor = Executor::new(filters::TwirlDistortion(params));
+    setup_unfilterable(&gpu, &mut executor, FORMAT, FORMAT);
+    let manual = render_rgba8(&gpu, &mut executor, size, &rgba, ShapeTextures::default());
+    assert_rgba8_close(
+        &manual,
+        &hardware,
+        1,
+        "manual bilinear vs hardware filtering",
+    );
+}
+
+#[test]
+fn gpu_filtered_samples_work_on_rgba32f_input() {
+    let gpu = create_test_device();
+    let size = (8, 8);
+    let texels = float_test_texels(64);
+    let mut executor = Executor::new(SampleHalf);
+    setup_unfilterable(
+        &gpu,
+        &mut executor,
+        wgpu::TextureFormat::Rgba32Float,
+        wgpu::TextureFormat::Rgba32Float,
+    );
+    let input = upload_f32(&gpu, size, &texels);
+    let output = texture_format(
+        &gpu,
+        size,
+        wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        wgpu::TextureFormat::Rgba32Float,
+    );
+    executor
+        .render(
+            &frame_input_format(
+                &gpu,
+                &input,
+                size,
+                Duration::ZERO,
+                ShapeTextures::default(),
+                wgpu::TextureFormat::Rgba32Float,
+            ),
+            &frame_output_format(&gpu, &output, size, wgpu::TextureFormat::Rgba32Float),
+        )
+        .expect("test render should succeed");
+    let readback = readback_f32_image(&gpu, &output, size);
+    for y in 0..size.1 {
+        for x in 0..size.0 {
+            let uv = stage_uv(size, x, y);
+            let expected = manual_bilinear(&texels, size, [uv[0] * 0.5, uv[1] * 0.5]);
+            let got = readback[usize::try_from(y * size.0 + x).expect("fits usize")];
+            for channel in 0..4 {
+                assert!(
+                    (got[channel] - expected[channel]).abs() < 0.0001,
+                    "pixel ({x}, {y}) channel {channel}: got {}, expected {}",
+                    got[channel],
+                    expected[channel]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn gpu_float_aux_upload_keeps_its_precision() {
+    let gpu = create_test_device();
+    let size = (8, 4);
+    let aux_texels = float_test_texels(32);
+    let filter = ReadAux {
+        image: crate::FilterImage::from_rgba32f(size.0, size.1, bytemuck::cast_slice(&aux_texels)),
+    };
+    let mut executor = Executor::new(filter);
+    setup_format(
+        &gpu,
+        &mut executor,
+        FORMAT,
+        wgpu::TextureFormat::Rgba32Float,
+    );
+    let input = upload(&gpu, size, &[0; 128]);
+    let output = texture_format(
+        &gpu,
+        size,
+        wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        wgpu::TextureFormat::Rgba32Float,
+    );
+    executor
+        .render(
+            &frame_input(&gpu, &input, size, Duration::ZERO, ShapeTextures::default()),
+            &frame_output_format(&gpu, &output, size, wgpu::TextureFormat::Rgba32Float),
+        )
+        .expect("test render should succeed");
+    assert_eq!(
+        readback_f32_image(&gpu, &output, size),
+        aux_texels,
+        "a textureLoad pass-through returns the uploaded f32 texels exactly"
+    );
+}
+
+#[test]
+fn gpu_texture_aux_binds_at_native_format() {
+    let gpu = create_test_device();
+    let size = (8, 4);
+    let aux_texels = float_test_texels(32);
+    let filter = ReadAuxTexture {
+        image: crate::FilterImage::from_texture(crate::TextureImage::new(upload_f32(
+            &gpu,
+            size,
+            &aux_texels,
+        ))),
+    };
+    let mut executor = Executor::new(filter);
+    setup_format(
+        &gpu,
+        &mut executor,
+        FORMAT,
+        wgpu::TextureFormat::Rgba32Float,
+    );
+    let input = upload(&gpu, size, &[0; 128]);
+    let output = texture_format(
+        &gpu,
+        size,
+        wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        wgpu::TextureFormat::Rgba32Float,
+    );
+    executor
+        .render(
+            &frame_input(&gpu, &input, size, Duration::ZERO, ShapeTextures::default()),
+            &frame_output_format(&gpu, &output, size, wgpu::TextureFormat::Rgba32Float),
+        )
+        .expect("test render should succeed");
+    assert_eq!(
+        readback_f32_image(&gpu, &output, size),
+        aux_texels,
+        "a bound texture reads back at its native precision"
+    );
+}
+
+/// `EffectContext` for an RGBA8 input and output.
+fn setup_error<F: Filter>(gpu: &TestGpu, executor: &mut Executor<F>) -> EffectSetupError {
+    let ctx = EffectContext {
+        device: &gpu.device,
+        queue: &gpu.queue,
+        input_format: FORMAT,
+        output_format: FORMAT,
+    };
+    pollster::block_on(executor.setup(&ctx)).expect_err("setup should fail")
+}
+
+#[test]
+fn gpu_texture_aux_rejects_cpu_images() {
+    let gpu = create_test_device();
+    let mut executor = Executor::new(ReadAuxTexture {
+        image: crate::FilterImage::from_rgba8(1, 1, vec![0; 4]),
+    });
+    assert!(
+        matches!(
+            setup_error(&gpu, &mut executor),
+            EffectSetupError::StageMismatch {
+                stage: "read_aux",
+                ..
+            }
+        ),
+        "a CPU image must not satisfy a `Texture` aux"
+    );
+}
+
+#[test]
+fn gpu_bound_aux_rejects_non_float_formats() {
+    let gpu = create_test_device();
+    // An `Image` aux may bind a texture too — the format check applies either
+    // way.
+    let uint = texture_format(
+        &gpu,
+        (1, 1),
+        wgpu::TextureUsages::TEXTURE_BINDING,
+        wgpu::TextureFormat::R8Uint,
+    );
+    let mut executor = Executor::new(ReadAux {
+        image: crate::FilterImage::from_texture(crate::TextureImage::new(uint)),
+    });
+    assert!(
+        matches!(
+            setup_error(&gpu, &mut executor),
+            EffectSetupError::StageMismatch {
+                stage: "read_aux",
+                ..
+            }
+        ),
+        "a uint texture must not bind as `texture_2d<f32>`"
+    );
 }
 
 #[test]

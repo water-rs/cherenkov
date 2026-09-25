@@ -4,9 +4,13 @@
 
 use std::collections::HashMap;
 
-use cherenkov_shader::naga::{
-    Arena, BinaryOperator, Block, Expression, Function, Handle, Literal, LocalVariable,
-    MathFunction, Module, SampleLevel, ScalarKind, Statement, TypeInner, UnaryOperator,
+use cherenkov_shader::{
+    SamplerFilter,
+    naga::{
+        Arena, BinaryOperator, Block, Expression, Function, Handle, ImageQuery, Literal,
+        LocalVariable, MathFunction, Module, SampleLevel, ScalarKind, Statement, TypeInner,
+        UnaryOperator,
+    },
 };
 
 /// A runtime value.
@@ -18,7 +22,7 @@ pub enum Value {
     Bool(bool),
     Struct(Vec<Self>),
     Texture(usize),
-    Sampler,
+    Sampler(SamplerFilter),
     Pointer(Handle<LocalVariable>),
 }
 
@@ -36,8 +40,95 @@ impl Value {
     }
 }
 
-/// A texture: colour as a function of the sample coordinate.
-pub type Texture<'t> = Box<dyn Fn([f32; 2]) -> [f32; 4] + 't>;
+/// A texture: a grid of texels, so the evaluator can model point and
+/// bilinear sampling and gathers.
+pub struct Texture<'t> {
+    width: u32,
+    height: u32,
+    texel: Box<dyn Fn(u32, u32) -> [f32; 4] + 't>,
+}
+
+impl<'t> Texture<'t> {
+    /// A texture of `width` × `height` texels.
+    pub fn texels(width: u32, height: u32, texel: impl Fn(u32, u32) -> [f32; 4] + 't) -> Self {
+        Self {
+            width,
+            height,
+            texel: Box::new(texel),
+        }
+    }
+
+    /// A texture of `width` × `height` texels that reads `source` at each
+    /// texel's centre.
+    pub fn continuous(width: u32, height: u32, source: impl Fn([f32; 2]) -> [f32; 4] + 't) -> Self {
+        Self::texels(width, height, move |x, y| {
+            #[allow(clippy::cast_precision_loss, reason = "test textures are tiny")]
+            let uv = [
+                (x as f32 + 0.5) / width as f32,
+                (y as f32 + 0.5) / height as f32,
+            ];
+            source(uv)
+        })
+    }
+
+    fn texel_at(&self, x: i64, y: i64) -> [f32; 4] {
+        let x = x.clamp(0, i64::from(self.width) - 1);
+        let y = y.clamp(0, i64::from(self.height) - 1);
+        let clamped = |coord: i64| u32::try_from(coord).unwrap_or(0);
+        (self.texel)(clamped(x), clamped(y))
+    }
+
+    /// The texel at normalized `uv` — nearest (point) sampling.
+    fn nearest(&self, uv: [f32; 2]) -> [f32; 4] {
+        let (x, y, ..) = self.footprint(uv);
+        self.texel_at(x, y)
+    }
+
+    /// The bilinear sample at normalized `uv` — linear filtering.
+    fn bilinear(&self, uv: [f32; 2]) -> [f32; 4] {
+        let (x, y, fx, fy) = self.footprint(uv);
+        let blend = |a: [f32; 4], b: [f32; 4], t: f32| -> [f32; 4] {
+            [
+                a[0].mul_add(1.0 - t, b[0] * t),
+                a[1].mul_add(1.0 - t, b[1] * t),
+                a[2].mul_add(1.0 - t, b[2] * t),
+                a[3].mul_add(1.0 - t, b[3] * t),
+            ]
+        };
+        let top = blend(self.texel_at(x, y), self.texel_at(x + 1, y), fx);
+        let bottom = blend(self.texel_at(x, y + 1), self.texel_at(x + 1, y + 1), fx);
+        blend(top, bottom, fy)
+    }
+
+    /// `textureGather`: component `component` of the four footprint texels,
+    /// in WGSL order (top-left, top-right, bottom-right, bottom-left).
+    fn gather(&self, uv: [f32; 2], component: usize) -> [f32; 4] {
+        let (x, y, ..) = self.footprint(uv);
+        [
+            self.texel_at(x, y)[component],
+            self.texel_at(x + 1, y)[component],
+            self.texel_at(x + 1, y + 1)[component],
+            self.texel_at(x, y + 1)[component],
+        ]
+    }
+
+    /// The bilinear footprint at normalized `uv`: the top-left texel and
+    /// the fractional position within it.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        reason = "test textures are tiny"
+    )]
+    fn footprint(&self, uv: [f32; 2]) -> (i64, i64, f32, f32) {
+        let at = |u: f32, dim: u32| {
+            let scaled = u.mul_add(dim as f32, -0.5);
+            (scaled.floor() as i64, scaled.fract())
+        };
+        let (x, fx) = at(uv[0], self.width);
+        let (y, fy) = at(uv[1], self.height);
+        (x, y, fx, fy)
+    }
+}
 
 pub struct Eval<'m> {
     module: &'m Module,
@@ -62,6 +153,14 @@ impl<'m> Eval<'m> {
     pub fn texture(&mut self, texture: Texture<'m>) -> Value {
         self.textures.push(texture);
         Value::Texture(self.textures.len() - 1)
+    }
+
+    /// The texture object a `Value::Texture` refers to.
+    fn texture_at(&self, value: &Value) -> &Texture<'m> {
+        let Value::Texture(index) = value else {
+            panic!("expected a texture, got {value:?}");
+        };
+        &self.textures[*index]
     }
 
     pub fn function(&self, name: &str) -> Handle<Function> {
@@ -252,8 +351,11 @@ impl<'m> Eval<'m> {
             }
             Expression::ImageSample {
                 image,
+                sampler,
+                gather,
                 coordinate,
                 level,
+                depth_ref,
                 ..
             } => {
                 assert!(
@@ -263,11 +365,43 @@ impl<'m> Eval<'m> {
                     ),
                     "unsupported sample level"
                 );
-                let Value::Texture(texture) = sub(image, frame) else {
-                    panic!("sampling a non-texture");
-                };
+                assert!(depth_ref.is_none(), "depth-comparison sampling");
                 let uv = sub(coordinate, frame).components();
-                Value::vec(&(self.textures[texture])([uv[0], uv[1]]))
+                let uv = [uv[0], uv[1]];
+                let texture = self.texture_at(&sub(image, frame));
+                if let Some(component) = gather {
+                    return Value::vec(&texture.gather(uv, component as usize));
+                }
+                let Value::Sampler(filter) = sub(sampler, frame) else {
+                    panic!("sampling through a non-sampler");
+                };
+                Value::vec(&match filter {
+                    SamplerFilter::Point => texture.nearest(uv),
+                    SamplerFilter::Filtered => texture.bilinear(uv),
+                })
+            }
+            Expression::ImageLoad {
+                image, coordinate, ..
+            } => {
+                let at = sub(coordinate, frame).components();
+                let texture = self.texture_at(&sub(image, frame));
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "test loads use small coords"
+                )]
+                let texel = texture.texel_at(at[0] as i64, at[1] as i64);
+                Value::vec(&texel)
+            }
+            Expression::ImageQuery { image, query } => {
+                let texture = self.texture_at(&sub(image, frame));
+                match query {
+                    ImageQuery::Size { .. } =>
+                    {
+                        #[allow(clippy::cast_precision_loss, reason = "test textures are tiny")]
+                        Value::vec(&[texture.width as f32, texture.height as f32])
+                    }
+                    other => panic!("the evaluator does not support {other:?}"),
+                }
             }
             Expression::Unary { op, expr } => match (op, sub(expr, frame)) {
                 (UnaryOperator::Negate, value) => numeric(

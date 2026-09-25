@@ -39,6 +39,13 @@ impl<'s> Importer<'s> {
         }
     }
 
+    /// Maps `source` onto an existing `dst` type instead of copying it. Used
+    /// for declarations the composer owns canonically, like the working-space
+    /// block, whose snippet-side name is free.
+    pub(crate) fn alias_type(&mut self, source: Handle<Type>, mapped: Handle<Type>) {
+        self.types.insert(source, mapped);
+    }
+
     pub(crate) fn ty(&mut self, dst: &mut Module, handle: Handle<Type>) -> Handle<Type> {
         if let Some(&mapped) = self.types.get(&handle) {
             return mapped;

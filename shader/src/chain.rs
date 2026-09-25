@@ -9,7 +9,7 @@ use naga::{
 };
 
 use crate::{
-    abi::{self, ParamType, ParamValue, Precision, SnippetKind},
+    abi::{self, FoldBlocker, ParamType, ParamValue, Precision, SamplerFilter, SnippetKind},
     builder::FunctionBuilder,
     errors::ComposeError,
     import::{GENERATED, Importer, identifier},
@@ -137,6 +137,11 @@ pub struct Folded {
     pub segment: Segment,
     /// What folding costs.
     pub cost: FoldCost,
+    /// The filter mode the snippet declares for `SegmentArg::InputSampler`.
+    /// The executor must honor it when binding the folded program's sampler
+    /// — for a sampled stage it is [`SamplerFilter::Point`], the contract
+    /// that makes folding equivalent.
+    pub sampler: SamplerFilter,
 }
 
 /// One piece of a composed chain. Boundaries between pieces are the possible
@@ -149,10 +154,15 @@ pub enum Piece {
     Spatial {
         /// The spatial stage alone.
         plain: Segment,
-        /// When a colour piece precedes it and every sample is foldable: the
-        /// alternative that applies that piece to each sample instead of
-        /// materializing it.
+        /// When a colour piece precedes it and the stage is foldable: the
+        /// alternative that applies that piece to each access of `input`
+        /// instead of materializing it.
         folded: Option<Folded>,
+        /// The filter mode the snippet declares for `SegmentArg::InputSampler`;
+        /// the executor must honor it for both `plain` and `folded`.
+        sampler: SamplerFilter,
+        /// Why the stage cannot fold a colour prefix; `None` when it can.
+        not_foldable: Option<FoldBlocker>,
     },
 }
 
@@ -213,6 +223,11 @@ impl Composition {
 /// Returns an error when the chain is empty, when a constant names an
 /// unknown parameter, has the wrong type or is given twice, or, as a
 /// composer defect, when the composed module does not validate.
+///
+/// # Panics
+///
+/// Panics when a spatial stage lacks the sampler declaration that
+/// `Snippet::parse` requires — a composer defect.
 pub fn compose(stages: &[Stage<'_>], options: ComposeOptions) -> Result<Composition, ComposeError> {
     if stages.is_empty() {
         return Err(ComposeError::EmptyChain);
@@ -241,13 +256,22 @@ pub fn compose(stages: &[Stage<'_>], options: ComposeOptions) -> Result<Composit
             }
             SnippetKind::Spatial => {
                 let plain = composer.spatial_segment(index);
+                let sampler = composer.stages[index]
+                    .sampler
+                    .expect("a spatial stage declares a sampler");
+                let not_foldable = composer.stages[index].not_foldable;
                 let folded = match pieces.last() {
-                    Some(Piece::Color(prefix)) if composer.stages[index].foldable => {
+                    Some(Piece::Color(prefix)) if not_foldable.is_none() => {
                         Some(composer.folded_segment(prefix.stages.clone(), index))
                     }
                     _ => None,
                 };
-                pieces.push(Piece::Spatial { plain, folded });
+                pieces.push(Piece::Spatial {
+                    plain,
+                    folded,
+                    sampler,
+                    not_foldable,
+                });
                 index += 1;
             }
         }
@@ -305,7 +329,8 @@ struct Imported {
     aux: u32,
     working_space: bool,
     samples: SampleCount,
-    foldable: bool,
+    not_foldable: Option<FoldBlocker>,
+    sampler: Option<SamplerFilter>,
     ops: u32,
 }
 
@@ -365,6 +390,13 @@ impl Composer {
         let (variant, parsed) = snippet.select(want);
         self.capabilities |= variant.capabilities();
         let mut importer = Importer::new(&parsed.module, &format!("s{index}_{}", snippet.name()));
+        // The snippet's working-space block is exactly equivalent to the
+        // composer's canonical one — parsing rejects it otherwise — so it
+        // maps onto the canonical handle whatever name it carries.
+        if let Some(slot) = parsed.slots.working_space {
+            let declared = parsed.module.functions[parsed.apply].arguments[slot].ty;
+            importer.alias_type(declared, self.working_space);
+        }
         let apply = importer.function(&mut self.module, parsed.apply);
         let function = &self.module.functions[apply];
         let params_ty = parsed.slots.params.map(|slot| function.arguments[slot].ty);
@@ -385,7 +417,8 @@ impl Composer {
             aux: abi.aux,
             working_space: abi.working_space,
             samples: parsed.samples,
-            foldable: parsed.foldable,
+            not_foldable: parsed.not_foldable,
+            sampler: abi.sampler,
             ops: parsed.ops,
         });
     }
@@ -632,9 +665,13 @@ impl Composer {
         let texture = self.ty(parse::texture_2d());
         let sampler = self.ty(TypeInner::Sampler { comparison: false });
         let uv = self.ty(ParamType::Vec2.inner());
+        let sampler_name = match self.stages[stage].sampler {
+            Some(SamplerFilter::Point) => "input_point_sampler",
+            _ => "input_sampler",
+        };
         let required = [
             builder.argument("input", texture),
-            builder.argument("input_sampler", sampler),
+            builder.argument(sampler_name, sampler),
             builder.argument("uv", uv),
         ];
         args.extend([SegmentArg::Input, SegmentArg::InputSampler, SegmentArg::Uv]);
@@ -777,6 +814,9 @@ impl Composer {
                 prefix_ops: prefix.map(|stage| self.stages[stage].ops).sum(),
                 samples: self.stages[spatial].samples,
             },
+            sampler: self.stages[spatial]
+                .sampler
+                .expect("a spatial stage declares a sampler"),
         }
     }
 

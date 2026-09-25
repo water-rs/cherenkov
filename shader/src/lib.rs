@@ -27,12 +27,18 @@
 //! fn apply(input: texture_2d<f32>, input_sampler: sampler, uv: vec2<f32>, params: Params) -> vec4<f32> { /* … */ }
 //! ```
 //!
+//! The sampler argument declares its filter mode by name: `input_sampler`
+//! allows the executor to bind a filtering sampler, while
+//! `input_point_sampler` requires a nearest (point) sampler — the contract a
+//! stage needs for its samples to fold a colour prefix (see [`FoldBlocker`]).
+//!
 //! After the required arguments, a snippet may declare, in any order:
 //!
 //! - `params: Params`: a struct whose members are `f32`, `vec2<f32>`,
 //!   `vec3<f32>` or `vec4<f32>`;
-//! - `space: WorkingSpace`: the engine-provided working-space constants,
-//!   declared exactly as [`WORKING_SPACE_WGSL`];
+//! - `space: WorkingSpace`: the engine-provided working-space constants, a
+//!   struct exactly equivalent to [`WORKING_SPACE_WGSL`] (same members,
+//!   offsets and span; the name is free);
 //! - spatial snippets only: `shape: texture_2d<f32>` (the clip shape's signed
 //!   distance field or mask), and `aux0`, `aux1`, … `: texture_2d<f32>`
 //!   (auxiliary images, numbered without gaps).
@@ -72,7 +78,10 @@ mod import;
 mod parse;
 mod rewrite;
 
-pub use abi::{Param, ParamType, ParamValue, Precision, SnippetKind, WORKING_SPACE_WGSL};
+pub use abi::{
+    FoldBlocker, Param, ParamType, ParamValue, Precision, SamplerFilter, SnippetKind,
+    WORKING_SPACE_WGSL,
+};
 pub use chain::{
     ComposeOptions, Composition, FoldCost, Folded, Piece, Segment, SegmentArg, Stage,
     UniformLayout, UniformMember, compose,

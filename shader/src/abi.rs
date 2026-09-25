@@ -18,6 +18,46 @@ pub enum SnippetKind {
     Spatial,
 }
 
+/// The filter mode a spatial snippet declares for its input sampler.
+///
+/// The mode is part of the snippet ABI: the executor must bind a sampler
+/// honoring the declaration. Only a [`SamplerFilter::Point`] declaration makes
+/// a sampled stage foldable, because folding a colour prefix into a filtered
+/// sample computes `prefix(lerp(a, b))` where materializing first computes
+/// `lerp(prefix(a), prefix(b))`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SamplerFilter {
+    /// The executor must bind a nearest (point) sampler: every sample returns
+    /// an exact texel, so a colour prefix commutes with the access.
+    Point,
+    /// The executor may bind a filtering sampler. The stage is not foldable
+    /// through this sampler.
+    Filtered,
+}
+
+/// Why a spatial stage cannot fold a colour prefix into its accesses of
+/// `input`. Folding is only equivalent when every access is an exact texel
+/// read; see [`Snippet::parse`](crate::Snippet::parse).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FoldBlocker {
+    /// A sample of `input` goes through the declared filtering sampler: the
+    /// fold computes `prefix(lerp(a, b))` where materializing first computes
+    /// `lerp(prefix(a), prefix(b))`.
+    FilteringSampler,
+    /// A sample of `input` gathers (`textureGather`): the fold would apply the
+    /// prefix to a gathered component vector.
+    Gather,
+    /// A sample of `input` compares a depth reference.
+    DepthComparison,
+    /// The stage queries `input`'s extent (`textureDimensions` and friends):
+    /// the materialized prefix can have a different extent than `input`.
+    ImageQuery,
+    /// `input` escapes `apply` into a helper function.
+    HelperCall,
+    /// `input` is used in a way the folder cannot classify.
+    UnknownUse,
+}
+
 /// The precision of colour values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Precision {
@@ -210,15 +250,18 @@ pub fn insert_working_space(module: &mut naga::Module) -> naga::Handle<Type> {
         .insert(working_space_type(vec3), Span::UNDEFINED)
 }
 
-/// Whether `ty` in `module` is structurally the canonical working-space block.
+/// Whether `ty` in `module` is exactly the canonical working-space block:
+/// same members, offsets and span, under any struct name.
 pub fn is_working_space(module: &naga::Module, ty: naga::Handle<Type>) -> bool {
-    let TypeInner::Struct { ref members, .. } = module.types[ty].inner else {
+    let TypeInner::Struct { ref members, span } = module.types[ty].inner else {
         return false;
     };
-    matches!(
-        members.as_slice(),
-        [member] if member.name.as_deref() == Some("luma")
-            && member.offset == 0
-            && module.types[member.ty].inner == ParamType::Vec3.inner()
-    )
+    span == 16
+        && matches!(
+            members.as_slice(),
+            [member] if member.name.as_deref() == Some("luma")
+                && member.binding.is_none()
+                && member.offset == 0
+                && module.types[member.ty].inner == ParamType::Vec3.inner()
+        )
 }

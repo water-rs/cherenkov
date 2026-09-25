@@ -176,7 +176,6 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
             #shader_path
         ))
     };
-    let name = ident.to_string();
     let bindings = (0..total_params)
         .map(|index| quote! { #core::ParamSource::Param(#index) })
         .chain(
@@ -191,75 +190,21 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
         quote! { #core::OperatingSpace::Working }
     };
 
+    let stage = StageTokens {
+        core: &core,
+        name: ident.to_string(),
+        source,
+        bindings: bindings.collect(),
+        space,
+        total_params,
+    };
+    let impl_for = |trait_path: TokenStream2| {
+        quote! { impl #impl_generics #trait_path for #ident #ty_generics #where_clause }
+    };
     let (kind, stage, kind_impls) = match &attrs.kind {
-        KindAttrs::Color { linear, cpu } => {
-            let stage = quote! {
-                const STAGE: #core::ColorStage = #core::ColorStage {
-                    name: #name,
-                    source: #source,
-                    params: &[#(#bindings),*],
-                    space: #space,
-                };
-                collector.color(#core::Placed::new(&STAGE));
-            };
-            let kernel = cpu.as_ref().map(|path| {
-                quote! {
-                    impl #impl_generics #core::CpuKernel for #ident #ty_generics #where_clause {
-                        fn apply_cpu(
-                            params: &[f32; #total_params],
-                            space: &#core::WorkingSpace,
-                            pixels: &mut [[f32; 4]],
-                        ) {
-                            #path(params, space, pixels);
-                        }
-                    }
-                }
-            });
-            let impls = quote! {
-                impl #impl_generics #core::ColorFilter for #ident #ty_generics #where_clause {
-                    const LINEAR: bool = #linear;
-                }
-                #kernel
-            };
-            (quote! { #core::kind::Color }, stage, impls)
-        }
+        KindAttrs::Color { linear, cpu } => stage.color(*linear, cpu.as_ref(), &impl_for),
         KindAttrs::Spatial { footprint, shape } => {
-            let shape = match shape {
-                None => quote! { ::core::option::Option::None },
-                Some(shape) if shape == "sdf" => {
-                    quote! { ::core::option::Option::Some(#core::ShapeInput::Sdf) }
-                }
-                Some(_) => quote! { ::core::option::Option::Some(#core::ShapeInput::Mask) },
-            };
-            let stage = quote! {
-                const STAGE: #core::SpatialStage = #core::SpatialStage {
-                    name: #name,
-                    source: #source,
-                    params: &[#(#bindings),*],
-                    space: #space,
-                    shape: #shape,
-                    aux: &[],
-                };
-                collector.spatial(#core::Placed::new(&STAGE));
-            };
-            let footprint = match footprint {
-                Footprint::Constant(value) => quote! {
-                    fn footprint_of(_params: &[f32; #total_params]) -> f32 {
-                        #value
-                    }
-                },
-                Footprint::Function(path) => quote! {
-                    fn footprint_of(params: &[f32; #total_params]) -> f32 {
-                        #path(params)
-                    }
-                },
-            };
-            let impls = quote! {
-                impl #impl_generics #core::SpatialFilter for #ident #ty_generics #where_clause {
-                    #footprint
-                }
-            };
-            (quote! { #core::kind::Spatial }, stage, impls)
+            stage.spatial(footprint, shape.as_ref(), &impl_for)
         }
     };
 
@@ -284,6 +229,122 @@ fn expand(input: &DeriveInput) -> syn::Result<TokenStream2> {
 
         #kind_impls
     })
+}
+
+/// What the kind-specific items are generated from.
+struct StageTokens<'a> {
+    core: &'a TokenStream2,
+    name: String,
+    source: TokenStream2,
+    bindings: Vec<TokenStream2>,
+    space: TokenStream2,
+    total_params: usize,
+}
+
+impl StageTokens<'_> {
+    /// The kind, the `collect_stages` body, and the `ColorFilter` and
+    /// `CpuKernel` implementations of a colour filter.
+    fn color(
+        &self,
+        linear: bool,
+        cpu: Option<&Path>,
+        impl_for: &dyn Fn(TokenStream2) -> TokenStream2,
+    ) -> (TokenStream2, TokenStream2, TokenStream2) {
+        let Self {
+            core,
+            name,
+            source,
+            bindings,
+            space,
+            total_params,
+        } = self;
+        let stage = quote! {
+            const STAGE: #core::ColorStage = #core::ColorStage {
+                name: #name,
+                source: #source,
+                params: &[#(#bindings),*],
+                space: #space,
+            };
+            collector.color(#core::Placed::new(&STAGE));
+        };
+        let kernel = cpu.map(|path| {
+            let header = impl_for(quote! { #core::CpuKernel });
+            quote! {
+                #header {
+                    fn apply_cpu(
+                        params: &[f32; #total_params],
+                        space: &#core::WorkingSpace,
+                        pixels: &mut [[f32; 4]],
+                    ) {
+                        #path(params, space, pixels);
+                    }
+                }
+            }
+        });
+        let header = impl_for(quote! { #core::ColorFilter });
+        let impls = quote! {
+            #header {
+                const LINEAR: bool = #linear;
+            }
+            #kernel
+        };
+        (quote! { #core::kind::Color }, stage, impls)
+    }
+
+    /// The kind, the `collect_stages` body, and the `SpatialFilter`
+    /// implementation of a spatial filter.
+    fn spatial(
+        &self,
+        footprint: &Footprint,
+        shape: Option<&Ident>,
+        impl_for: &dyn Fn(TokenStream2) -> TokenStream2,
+    ) -> (TokenStream2, TokenStream2, TokenStream2) {
+        let Self {
+            core,
+            name,
+            source,
+            bindings,
+            space,
+            total_params,
+        } = self;
+        let shape = match shape {
+            None => quote! { ::core::option::Option::None },
+            Some(shape) if shape == "sdf" => {
+                quote! { ::core::option::Option::Some(#core::ShapeInput::Sdf) }
+            }
+            Some(_) => quote! { ::core::option::Option::Some(#core::ShapeInput::Mask) },
+        };
+        let stage = quote! {
+            const STAGE: #core::SpatialStage = #core::SpatialStage {
+                name: #name,
+                source: #source,
+                params: &[#(#bindings),*],
+                space: #space,
+                shape: #shape,
+                aux: &[],
+            };
+            collector.spatial(#core::Placed::new(&STAGE));
+        };
+        let footprint = match footprint {
+            Footprint::Constant(value) => quote! {
+                fn footprint_of(_params: &[f32; #total_params]) -> f32 {
+                    #value
+                }
+            },
+            Footprint::Function(path) => quote! {
+                fn footprint_of(params: &[f32; #total_params]) -> f32 {
+                    #path(params)
+                }
+            },
+        };
+        let header = impl_for(quote! { #core::SpatialFilter });
+        let impls = quote! {
+            #header {
+                #footprint
+            }
+        };
+        (quote! { #core::kind::Spatial }, stage, impls)
+    }
 }
 
 /// The attribute's arguments as they are parsed, before the kind decides

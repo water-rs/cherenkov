@@ -130,7 +130,7 @@ impl<A: ColorFilter, B: ColorFilter> ColorFilter for Chain<A, B> {
 
 impl<A: Filter, B: Filter> SpatialFilter for Chain<A, B>
 where
-    Self: Filter<Kind = kind::Spatial>,
+    A::Kind: Kind<Then<B::Kind> = kind::Spatial>,
     (A::Kind, B::Kind): ChainFootprint<A, B>,
 {
     fn footprint_of(params: &Self::Params) -> f32 {

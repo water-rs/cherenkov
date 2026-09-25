@@ -138,7 +138,10 @@ impl Group {
     /// Sets the blend space.
     #[must_use]
     pub const fn blend_space(self, blend_space: BlendSpace) -> Self {
-        Self { blend_space, ..self }
+        Self {
+            blend_space,
+            ..self
+        }
     }
 
     /// Sets the filter.

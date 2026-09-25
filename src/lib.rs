@@ -27,7 +27,7 @@ pub use crate::color::{
     WorkingColor,
 };
 pub use crate::display_list::{
-    Command, DisplayList, Dirty, Operand, OperandKind, Picture, Slot, SlotUpdate,
+    Command, Dirty, DisplayList, Operand, OperandKind, Picture, Slot, SlotUpdate,
 };
 pub use crate::glyph::{FontId, Glyph, GlyphRun, GlyphStyle};
 pub use crate::paint::{

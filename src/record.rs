@@ -52,7 +52,11 @@ pub trait Draw {
     );
 
     /// Draws a glyph run.
-    fn glyphs<P: Into<Paint> + 'static>(&mut self, run: &GlyphRun, paint: impl Into<Self::Value<P>>);
+    fn glyphs<P: Into<Paint> + 'static>(
+        &mut self,
+        run: &GlyphRun,
+        paint: impl Into<Self::Value<P>>,
+    );
 
     /// Draws an image into a rectangle.
     fn image(&mut self, image: ImageId, dst: impl Into<Self::Value<Rect>>, sampling: Sampling);
@@ -64,7 +68,11 @@ pub trait Draw {
     fn clip<S: Shape>(&mut self, shape: impl Into<Self::Value<S>>, body: impl FnOnce(&mut Self));
 
     /// Runs `body` under a transform.
-    fn transform(&mut self, transform: impl Into<Self::Value<Affine>>, body: impl FnOnce(&mut Self));
+    fn transform(
+        &mut self,
+        transform: impl Into<Self::Value<Affine>>,
+        body: impl FnOnce(&mut Self),
+    );
 
     /// Runs `body` isolated as a group.
     fn group(&mut self, group: impl Into<Self::Value<Group>>, body: impl FnOnce(&mut Self));
@@ -192,7 +200,9 @@ pub struct Live<T> {
 
 impl<T: std::fmt::Debug> std::fmt::Debug for Live<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Live").field("value", &self.value).finish_non_exhaustive()
+        f.debug_struct("Live")
+            .field("value", &self.value)
+            .finish_non_exhaustive()
     }
 }
 
@@ -242,7 +252,9 @@ pub struct Recorder {
 
 impl std::fmt::Debug for Recorder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Recorder").field("list", &self.list).finish_non_exhaustive()
+        f.debug_struct("Recorder")
+            .field("list", &self.list)
+            .finish_non_exhaustive()
     }
 }
 
@@ -287,7 +299,9 @@ impl Draw for Recorder {
             shape: ShapeData::of(&shape.value),
             paint: paint.value.into(),
         });
-        self.subscribe(shape.subscribe, command, |shape: S| Operand::Shape(ShapeData::of(&shape)));
+        self.subscribe(shape.subscribe, command, |shape: S| {
+            Operand::Shape(ShapeData::of(&shape))
+        });
         self.subscribe(paint.subscribe, command, paint_operand::<P>);
     }
 
@@ -303,7 +317,9 @@ impl Draw for Recorder {
             stroke: stroke.value,
             paint: paint.value.into(),
         });
-        self.subscribe(shape.subscribe, command, |shape: S| Operand::Shape(ShapeData::of(&shape)));
+        self.subscribe(shape.subscribe, command, |shape: S| {
+            Operand::Shape(ShapeData::of(&shape))
+        });
         self.subscribe(stroke.subscribe, command, Operand::Stroke);
         self.subscribe(paint.subscribe, command, paint_operand::<P>);
     }
@@ -314,7 +330,9 @@ impl Draw for Recorder {
             shape: ShapeData::of(&shape.value),
             shadow: shadow.value,
         });
-        self.subscribe(shape.subscribe, command, |shape: S| Operand::Shape(ShapeData::of(&shape)));
+        self.subscribe(shape.subscribe, command, |shape: S| {
+            Operand::Shape(ShapeData::of(&shape))
+        });
         self.subscribe(shadow.subscribe, command, Operand::Shadow);
     }
 
@@ -352,7 +370,9 @@ impl Draw for Recorder {
             shape: ShapeData::of(&shape.value),
             end: 0,
         });
-        self.subscribe(shape.subscribe, begin, |shape: S| Operand::Shape(ShapeData::of(&shape)));
+        self.subscribe(shape.subscribe, begin, |shape: S| {
+            Operand::Shape(ShapeData::of(&shape))
+        });
         body(self);
         self.list.end(begin);
     }
@@ -586,7 +606,9 @@ mod tests {
                     .stop(1., Color::<Srgb>::new([0., 0., 1., 1.])),
             );
         });
-        let change = content.take_change().expect("the first commit sends the list");
+        let change = content
+            .take_change()
+            .expect("the first commit sends the list");
         let json = serde_json::to_string(&change).expect("serializes");
         let back: ContentChange = serde_json::from_str(&json).expect("deserializes");
         assert_eq!(back, change);

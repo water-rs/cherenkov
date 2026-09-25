@@ -134,7 +134,7 @@ impl Shape for ContinuousRect {
 
 /// A shape filled with the even-odd rule. Only paths can self-intersect, so
 /// every other semantic shape is unaffected.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EvenOdd<S>(pub S);
 
 impl<S: Shape> Shape for EvenOdd<S> {
@@ -266,7 +266,8 @@ mod tests {
         path.move_to((0., 0.));
         path.line_to((1., 0.));
         path.close_path();
-        let Semantic::Path(even_odd) = EvenOdd(path).semantic() else {
+        let even_odd = EvenOdd(path);
+        let Semantic::Path(even_odd) = even_odd.semantic() else {
             panic!("still a path");
         };
         assert_eq!(even_odd.rule, FillRule::EvenOdd);

@@ -223,7 +223,10 @@ impl MeshGradient {
     /// entry per vertex.
     #[must_use]
     pub fn new(columns: u32, rows: u32, points: Vec<Point>, colors: Vec<WorkingColor>) -> Self {
-        assert!(columns > 0 && rows > 0, "a mesh gradient needs at least one patch");
+        assert!(
+            columns > 0 && rows > 0,
+            "a mesh gradient needs at least one patch"
+        );
         let vertices = (columns as usize + 1) * (rows as usize + 1);
         assert_eq!(points.len(), vertices, "one point per grid vertex");
         assert_eq!(colors.len(), vertices, "one colour per grid vertex");

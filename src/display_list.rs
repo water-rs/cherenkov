@@ -191,7 +191,7 @@ impl Dirty {
 
     /// Whether nothing needs regenerating.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.ranges.is_empty()
     }
 

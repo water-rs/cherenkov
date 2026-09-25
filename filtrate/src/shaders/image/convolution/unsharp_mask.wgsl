@@ -27,9 +27,9 @@ fn apply(input: texture_2d<f32>, input_point_sampler: sampler, uv: vec2<f32>, pa
 
     var sum = load(input, input_point_sampler, size, pixel);
     for (var offset = 1; offset <= radius; offset++) {
-        let step = vec2<f32>(0.0, f32(offset));
-        sum += load(input, input_point_sampler, size, pixel - step)
-            + load(input, input_point_sampler, size, pixel + step);
+        let delta = vec2<f32>(0.0, f32(offset));
+        sum += load(input, input_point_sampler, size, pixel - delta)
+            + load(input, input_point_sampler, size, pixel + delta);
     }
     let blurred = sum / f32(2 * radius + 1);
 

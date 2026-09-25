@@ -259,11 +259,10 @@ fn photo_chain_collect_stages(b: Bencher) {
 #[divan::bench]
 fn cpu_kernel_chain_256x256(b: Bencher) {
     let chain = Saturation(1.3_f32).then(Brightness(0.05_f32));
-    let params = chain.params();
     let pixels = vec![[0.4_f32, 0.3, 0.2, 1.0]; 256 * 256];
     b.bench_local(|| {
         let mut pixels = pixels.clone();
-        CpuKernel::apply_cpu(&params, &WorkingSpace::LINEAR_DISPLAY_P3, &mut pixels);
+        chain.apply_cpu_now(&WorkingSpace::LINEAR_DISPLAY_P3, &mut pixels);
         divan::black_box(pixels);
     });
 }

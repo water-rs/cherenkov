@@ -97,7 +97,7 @@ pub struct Placed<S: 'static> {
     pub image_base: usize,
 }
 
-impl<S> Placed<S> {
+impl<S: 'static> Placed<S> {
     /// A stage of the filter being collected itself, at offset zero.
     #[must_use]
     pub const fn new(stage: &'static S) -> Self {
@@ -119,13 +119,13 @@ impl<S> Placed<S> {
     }
 }
 
-impl<S> Clone for Placed<S> {
+impl<S: 'static> Clone for Placed<S> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<S> Copy for Placed<S> {}
+impl<S: 'static> Copy for Placed<S> {}
 
 /// Sink for the stages reported by [`Filter::collect_stages`](crate::Filter::collect_stages).
 pub trait StageCollector {

@@ -69,6 +69,7 @@ pub struct Texture<'t> {
 
 impl<'t> Texture<'t> {
     /// A texture of `width` × `height` texels.
+    #[must_use]
     pub fn texels(width: u32, height: u32, texel: impl Fn(u32, u32) -> [f32; 4] + 't) -> Self {
         Self {
             width,
@@ -79,6 +80,7 @@ impl<'t> Texture<'t> {
 
     /// A texture of `width` × `height` texels that reads `source` at each
     /// texel's centre.
+    #[must_use]
     pub fn continuous(width: u32, height: u32, source: impl Fn([f32; 2]) -> [f32; 4] + 't) -> Self {
         Self::texels(width, height, move |x, y| {
             #[allow(clippy::cast_precision_loss, reason = "evaluator textures are tiny")]

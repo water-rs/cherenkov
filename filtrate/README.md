@@ -1,75 +1,79 @@
 # filtrate
 
-GPU texture filter library built on `wgpu`. Filters are declared as pure
-data, fused into as few GPU passes as possible, and executed by a runtime
-that handles parameter animation, HDR intermediates, and scratch-texture
-reuse. `filtrate` powers WaterUI's visual-effect modifiers but has no
-WaterUI dependency — it works on images, video frames, or any `wgpu`
-texture in any Rust application.
+A filter library whose filters are shader functions. Every built-in filter
+(blurs, colour adjustments, convolutions, distortions, blends with an
+auxiliary image, …) is a sequence of stages, and every stage is a WGSL
+function for the shared naga-IR composer, `cherenkov-shader`. The same
+definitions run in the Cherenkov engine, which fuses them into its own
+passes, and in this crate's reference executor, which runs a chain on any
+`wgpu` texture: images, decoded video frames, or render targets.
 
 ## Crates
 
 | Crate | Role |
 | --- | --- |
-| `filtrate` | Built-in filter library, WGSL shaders, and the GPU runtime (`FilterAdapter`). |
-| `filtrate-core` | `no_std` abstraction layer: the pure-data `Filter` trait, `Chain` composition, and parameter/stage visitors. Stable surface with no `wgpu` dependency. |
-| `filtrate-derive` | `#[derive(Filter)]` for the regular single-pass filter shapes. |
+| `filtrate` | The built-in filters, their WGSL stages, SIMD CPU kernels, and the reference wgpu executor (`Executor`). |
+| `filtrate-core` | `no_std`, dependency-free definitions: the `Filter` trait with its `ColorFilter` and `SpatialFilter` kinds, stage declarations, `Chain`, and the parameter and animation primitives. |
+| `filtrate-derive` | `#[derive(Filter)]` for single-stage filters. |
 
 ## Quick start
 
 ```rust
-use filtrate::{FilterAdapter, FilterExt};
 use filtrate::filters::{Blur, Brightness, Grayscale};
+use filtrate::{Executor, FilterExt, SpatialFilter};
 
-// Chain filters; adjacent color-only filters fuse into one GPU pass.
-let chain = Grayscale(1.0).then(Blur(5.0)).then(Brightness(0.2));
-let effect = FilterAdapter::new(chain);
-// Hand `effect` to your render loop: `Effect::setup`, then
+let chain = Grayscale(1.0_f32).then(Blur(5.0_f32)).then(Brightness(0.2_f32));
+// The blur makes the chain spatial: it reads five pixels each way.
+assert_eq!(chain.footprint(), 5.0);
+let executor = Executor::new(chain);
+// Hand `executor` to your render loop: `Effect::setup`, then
 // `Effect::render` once per frame.
 ```
 
 Reactive frontends implement `FilterParam` for their signal types so filter
-parameters animate without rebuilding the pipeline; plain `f32` works for
-static values.
+parameters animate without rebuilding anything; plain `f32` works for static
+values.
 
-## Design notes
+## The contract
 
-- **Fusion**: consecutive `COLOR_ONLY` filters compile into a single
-  fragment shader; spatial filters (blurs, convolutions, distortions) each
-  get a compute pass with automatic scratch ping-pong.
-- **Color contract**: premultiplied alpha end to end; texel values are
-  filtered as sampled, with no implicit sRGB conversion.
-- **HDR**: intermediates prefer `Rgba16Float` and degrade to LDR only
-  where the policy allows (`FilterAdapter::require_hdr` /
-  `FilterAdapter::force_ldr`).
+- **Stages are functions.** A colour stage is
+  `fn apply(color, params…) -> color`; a spatial stage samples `input`
+  through the composer's ABI — `input_point_sampler` when it only fetches
+  exact texels, `input_sampler` when it filters — at a normalized `uv`.
+  Colours are premultiplied, in the stage's operating space.
+- **Kinds are types.** A `ColorFilter` maps each pixel's colour to a colour
+  and says whether it is `LINEAR`: a linear map on premultiplied RGBA with
+  an identity alpha row and no offset, the property that lets an engine push
+  it down into each primitive's shading. A `SpatialFilter` reports its
+  `footprint`, the farthest texel it reads in pixels. `Chain<A, B>` is a
+  colour filter exactly when both halves are.
+- **Working space.** Colours are linear Display P3. Luma coefficients come
+  from the working-space constants every stage can take, and each stage
+  declares its operating space; an executor converts around stages that
+  operate in sRGB.
+- **Shape and auxiliary inputs.** A spatial stage can read the clip shape's
+  signed distance field or mask, and auxiliary images: the filter's own (a
+  blend's second image, a LUT) or the input of its previous stage (bloom's
+  composite reads what its extraction pass started from).
+- **CPU kernels.** A colour filter may carry a SIMD CPU kernel (`CpuKernel`,
+  or `cpu = path` in the derive). `Brightness`, `Saturation`, `Grayscale`
+  and `ColorMatrix` do, and each is cross-checked against its shader.
+
+## The reference executor
+
+`Executor` composes a chain and runs the reference alternative of the
+composition: one full-screen fragment pass per piece, every spatial stage
+materialized, no colour prefix folded into a spatial stage's samples.
+Intermediates are `Rgba16Float`, so every materialization point rounds to
+f16 and extended values survive. The output has the input's size.
 
 ## WebGL (wasm)
 
-The optional `webgl` feature turns on wgpu's WebGL2 backend. It only
-exists for `wasm32-unknown-unknown`; enabling it on a native target is a
-`compile_error!`.
-
-WebGL2 has no compute shaders or storage textures, so spatial stages run
-through a **fragment translation** of the same WGSL body: every spatial
-shader writes only its own output texel, which the runtime rewrites into a
-fullscreen draw. Color stages are unchanged — they already run as fragment
-passes. Selection is automatic from device limits
-(`SpatialExecution::Auto`); `ForceFragment` exercises the WebGL2 path on
-native GPUs for tests and benchmarks.
-
-Honest caveats:
-
-- **Precision**: compute can round the final stage through an
-  `Rgba16Float` scratch + blit while the fragment path writes the output
-  attachment directly, so outputs may differ by a ±1 u8 step per channel.
-- **Performance**: on an Apple-Silicon Metal adapter (`cargo bench
-  --bench gpu_runtime`), the fragment path is parity-or-faster because it
-  skips the final blit — e.g. a 2048² separable blur measures 2.54 ms
-  fragment vs 2.57 ms compute+blit (medians). These numbers exercise the
-  same shader path WebGL runs, but cannot model browser/WebGL context
-  overhead.
-- A spatial body that breaks the one-store-per-own-texel contract fails
-  loudly at specialization rather than silently mis-rendering.
+The optional `webgl` feature turns on wgpu's WebGL2 backend. It only exists
+for `wasm32-unknown-unknown`; enabling it on a native target is a
+`compile_error!`. Every executor pass is a fragment pass, so WebGL2 runs the
+same program as every other backend, provided it can render to
+`Rgba16Float`.
 
 ## License
 

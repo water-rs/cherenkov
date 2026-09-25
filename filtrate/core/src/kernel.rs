@@ -11,6 +11,11 @@ pub trait CpuKernel: ColorFilter {
     /// Applies the filter to `pixels` in place. Pixels are premultiplied
     /// RGBA in the filter's operating space.
     fn apply_cpu(params: &Self::Params, space: &WorkingSpace, pixels: &mut [[f32; 4]]);
+
+    /// Applies the filter with its current parameters.
+    fn apply_cpu_now(&self, space: &WorkingSpace, pixels: &mut [[f32; 4]]) {
+        Self::apply_cpu(&self.params(), space, pixels);
+    }
 }
 
 impl<A: CpuKernel, B: CpuKernel> CpuKernel for Chain<A, B> {

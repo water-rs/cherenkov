@@ -76,7 +76,7 @@
 //!
 //! # Features
 //!
-//! - `eval`: [`eval`], a reference interpreter that runs snippets and
+//! - `eval`: the `eval` module, a reference interpreter that runs snippets and
 //!   composed segments on the CPU, for tests and for cross-checking CPU
 //!   implementations against their shaders.
 

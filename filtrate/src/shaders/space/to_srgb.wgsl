@@ -9,14 +9,14 @@ const P3_TO_SRGB: mat3x3<f32> = mat3x3<f32>(
     vec3<f32>(0.0, 0.0, 1.0982736),
 );
 
-fn encode(linear: vec3<f32>) -> vec3<f32> {
-    let magnitude = abs(linear);
+fn encode(value: vec3<f32>) -> vec3<f32> {
+    let magnitude = abs(value);
     let curve = select(
         magnitude * 12.92,
         1.055 * pow(magnitude, vec3<f32>(1.0 / 2.4)) - 0.055,
         magnitude > vec3<f32>(0.0031308),
     );
-    return sign(linear) * curve;
+    return sign(value) * curve;
 }
 
 fn apply(color: vec4<f32>) -> vec4<f32> {

@@ -432,7 +432,8 @@ impl RawAttrs {
 }
 
 fn string_literal(meta: &ParseNestedMeta<'_>) -> syn::Result<String> {
-    match meta.value()?.parse()? {
+    let value: Expr = meta.value()?.parse()?;
+    match value {
         Expr::Lit(ExprLit {
             lit: Lit::Str(value),
             ..

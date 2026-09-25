@@ -564,11 +564,7 @@ fn cpu_kernels_match_their_shaders() {
         &mut chained,
     );
     let mut pixels = COLOURS;
-    CpuKernel::apply_cpu(
-        &chain.params(),
-        &WorkingSpace::LINEAR_DISPLAY_P3,
-        &mut pixels,
-    );
+    chain.apply_cpu_now(&WorkingSpace::LINEAR_DISPLAY_P3, &mut pixels);
     assert_eq!(pixels, chained);
 }
 
@@ -941,11 +937,7 @@ fn gpu_chains_match_their_cpu_kernels() {
         .chunks(4)
         .map(|texel| core::array::from_fn(|i| from_unorm(texel[i])))
         .collect();
-    CpuKernel::apply_cpu(
-        &chain.params(),
-        &WorkingSpace::LINEAR_DISPLAY_P3,
-        &mut pixels,
-    );
+    chain.apply_cpu_now(&WorkingSpace::LINEAR_DISPLAY_P3, &mut pixels);
     let expected: Vec<u8> = pixels
         .iter()
         .flatten()

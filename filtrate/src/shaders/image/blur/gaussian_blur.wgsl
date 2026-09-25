@@ -33,9 +33,9 @@ fn apply(input: texture_2d<f32>, input_point_sampler: sampler, uv: vec2<f32>, pa
     for (var offset = 1; offset <= radius; offset++) {
         side_weight *= side_ratio;
         side_ratio *= ratio_step;
-        let step = params.axis * f32(offset);
-        sum += (load(input, input_point_sampler, size, pixel - step)
-            + load(input, input_point_sampler, size, pixel + step))
+        let delta = params.axis * f32(offset);
+        sum += (load(input, input_point_sampler, size, pixel - delta)
+            + load(input, input_point_sampler, size, pixel + delta))
             * side_weight;
         weight_total += 2.0 * side_weight;
     }

@@ -580,7 +580,7 @@ impl<P: FilterParam> Filter for LutColorGrade<P> {
     }
 
     fn visit_images<V: ImageVisitor>(&self, v: &mut V) {
-        v.visit(0, &self.lut.image());
+        v.visit(0, self.lut.image());
     }
 }
 

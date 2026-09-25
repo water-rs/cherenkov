@@ -496,7 +496,7 @@ const fn components(ty: ParamType) -> usize {
     }
 }
 
-fn param_value(ty: ParamType, values: &[f32]) -> Option<ParamValue> {
+const fn param_value(ty: ParamType, values: &[f32]) -> Option<ParamValue> {
     Some(match (ty, values) {
         (ParamType::F32, &[x]) => ParamValue::F32(x),
         (ParamType::Vec2, &[x, y]) => ParamValue::Vec2([x, y]),

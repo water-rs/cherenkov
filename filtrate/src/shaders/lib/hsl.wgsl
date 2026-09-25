@@ -1,6 +1,5 @@
-// HSL conversion helpers for the stages that work in HSL — the hue-rotation
-// colour stage and the blend composite's HSL modes. The conversions follow
-// the classic HSL hexcone algorithm.
+// HSL conversion helpers for the blend composite's HSL modes. The
+// conversions follow the classic HSL hexcone algorithm.
 
 fn rgb_to_hsl(rgb: vec3<f32>) -> vec3<f32> {
     let max_c = max(max(rgb.r, rgb.g), rgb.b);

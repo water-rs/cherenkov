@@ -16,7 +16,7 @@ pub enum Value {
     Vector(Vec<f32>),
     Int(i64),
     Bool(bool),
-    Struct(Vec<Value>),
+    Struct(Vec<Self>),
     Texture(usize),
     Sampler,
     Pointer(Handle<LocalVariable>),
@@ -69,8 +69,7 @@ impl<'m> Eval<'m> {
             .functions
             .iter()
             .find(|(_, function)| function.name.as_deref() == Some(name))
-            .map(|(handle, _)| handle)
-            .unwrap_or_else(|| panic!("no function `{name}`"))
+            .map_or_else(|| panic!("no function `{name}`"), |(handle, _)| handle)
     }
 
     pub fn call(&self, function: Handle<Function>, args: Vec<Value>) -> Value {
@@ -186,10 +185,10 @@ impl<'m> Eval<'m> {
         handle: Handle<Expression>,
         frame: &mut Frame<'_>,
     ) -> Value {
-        if std::ptr::eq(arena, &frame.function.expressions) {
-            if let Some(value) = frame.values.get(&handle) {
-                return value.clone();
-            }
+        if std::ptr::eq(arena, &raw const frame.function.expressions)
+            && let Some(value) = frame.values.get(&handle)
+        {
+            return value.clone();
         }
         let sub = |operand: Handle<Expression>, frame: &mut Frame<'_>| {
             self.expression(arena, operand, frame)

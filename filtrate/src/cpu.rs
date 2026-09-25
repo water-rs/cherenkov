@@ -43,7 +43,7 @@ impl Matrix {
 }
 
 /// [`Brightness`](crate::filters::Brightness): `rgb + amount * a`.
-pub fn brightness(params: &[f32; 1], _space: &WorkingSpace, pixels: &mut [[f32; 4]]) {
+pub fn brightness(params: [f32; 1], _space: &WorkingSpace, pixels: &mut [[f32; 4]]) {
     let amount = params[0];
     Matrix([
         f32x4::new([1.0, 0.0, 0.0, 0.0]),
@@ -55,13 +55,13 @@ pub fn brightness(params: &[f32; 1], _space: &WorkingSpace, pixels: &mut [[f32; 
 }
 
 /// [`Saturation`](crate::filters::Saturation): `mix(luma, rgb, amount)`.
-pub fn saturation(params: &[f32; 1], space: &WorkingSpace, pixels: &mut [[f32; 4]]) {
+pub fn saturation(params: [f32; 1], space: &WorkingSpace, pixels: &mut [[f32; 4]]) {
     let amount = params[0];
     Matrix::luma_mix(space, amount, 1.0 - amount).apply(pixels);
 }
 
 /// [`Grayscale`](crate::filters::Grayscale): `mix(rgb, luma, intensity)`.
-pub fn grayscale(params: &[f32; 1], space: &WorkingSpace, pixels: &mut [[f32; 4]]) {
+pub fn grayscale(params: [f32; 1], space: &WorkingSpace, pixels: &mut [[f32; 4]]) {
     let intensity = params[0];
     Matrix::luma_mix(space, 1.0 - intensity, intensity).apply(pixels);
 }
@@ -69,7 +69,7 @@ pub fn grayscale(params: &[f32; 1], space: &WorkingSpace, pixels: &mut [[f32; 4]
 /// [`ColorMatrix`](crate::filters::ColorMatrix): the 3x4 matrix on
 /// straight-alpha RGB, whose bias column scales with alpha on premultiplied
 /// colour.
-pub fn color_matrix(params: &[f32; 12], _space: &WorkingSpace, pixels: &mut [[f32; 4]]) {
+pub fn color_matrix(params: [f32; 12], _space: &WorkingSpace, pixels: &mut [[f32; 4]]) {
     let column = |index: usize, alpha: f32| {
         f32x4::new([params[index], params[4 + index], params[8 + index], alpha])
     };

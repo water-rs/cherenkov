@@ -16,11 +16,11 @@
 //!   `linear` is required: it is the filter's `ColorFilter::LINEAR`
 //!   classification, which executors trust when pushing a filter down.
 //!   `cpu = <path>` names a CPU kernel,
-//!   `fn(&[f32; N], &WorkingSpace, &mut [[f32; 4]])`, and implements
+//!   `fn([f32; N], &WorkingSpace, &mut [[f32; 4]])`, and implements
 //!   `CpuKernel` with it.
 //! - `spatial, shader = "<path>"` declares a spatial filter, with either
 //!   `footprint = <expr>` (a constant `f32`) or `footprint_fn = <path>`
-//!   (`fn(&[f32; N]) -> f32`), and optionally `shape = sdf` or
+//!   (`fn([f32; N]) -> f32`), and optionally `shape = sdf` or
 //!   `shape = mask` when the snippet reads the clip shape.
 //!
 //! Both kinds accept `space = srgb` for a stage that operates in sRGB (the
@@ -276,7 +276,7 @@ impl StageTokens<'_> {
                         space: &#core::WorkingSpace,
                         pixels: &mut [[f32; 4]],
                     ) {
-                        #path(params, space, pixels);
+                        #path(*params, space, pixels);
                     }
                 }
             }
@@ -333,7 +333,7 @@ impl StageTokens<'_> {
             },
             Footprint::Function(path) => quote! {
                 fn footprint_of(params: &[f32; #total_params]) -> f32 {
-                    #path(params)
+                    #path(*params)
                 }
             },
         };

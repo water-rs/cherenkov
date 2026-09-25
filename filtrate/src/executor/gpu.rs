@@ -74,6 +74,10 @@ pub(super) struct Gpu {
 
 impl Gpu {
     /// Composes `filter` and builds its pipelines.
+    #[expect(
+        clippy::future_not_send,
+        reason = "setup borrows the filter and the device-bound context on the GPU host thread"
+    )]
     pub(super) async fn new<F: Filter>(
         filter: &F,
         ctx: &EffectContext<'_>,
@@ -434,10 +438,8 @@ fn input_view<'a>(
     slots: &'a [wgpu::TextureView],
     slot_of: &[usize],
 ) -> &'a wgpu::TextureView {
-    match pass.checked_sub(1) {
-        None => &input.view,
-        Some(previous) => &slots[slot_of[previous]],
-    }
+    pass.checked_sub(1)
+        .map_or(&input.view, |previous| &slots[slot_of[previous]])
 }
 
 fn shape_view<'a>(
@@ -522,12 +524,11 @@ fn intermediate_texture(device: &wgpu::Device, (width, height): (u32, u32)) -> w
 async fn probe_intermediate_format(device: &wgpu::Device) -> Result<(), EffectSetupError> {
     let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
     drop(intermediate_texture(device, (1, 1)));
-    match error_scope.pop().await {
-        Some(error) => Err(EffectSetupError::IntermediateFormatUnsupported {
+    error_scope.pop().await.map_or(Ok(()), |error| {
+        Err(EffectSetupError::IntermediateFormatUnsupported {
             message: error.to_string(),
-        }),
-        None => Ok(()),
-    }
+        })
+    })
 }
 
 fn sampler(device: &wgpu::Device, filter: wgpu::FilterMode) -> wgpu::Sampler {

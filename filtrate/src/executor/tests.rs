@@ -588,13 +588,11 @@ impl ScriptedParam {
 
     /// Fires the installed watcher with a new target.
     fn fire(callback: &Mutex<Option<AnimatedCallback>>, target: AnimatedTarget) {
-        let guard = callback
+        callback
             .lock()
-            .expect("scripted param callback mutex poisoned");
-        let callback = guard
+            .expect("scripted param callback mutex poisoned")
             .as_ref()
-            .expect("the executor installs a watcher on every parameter");
-        callback(target);
+            .expect("the executor installs a watcher on every parameter")(target);
     }
 }
 
@@ -1018,7 +1016,7 @@ fn transform(matrix: [[f32; 3]; 3], rgb: [f32; 3]) -> [f32; 3] {
 #[test]
 fn gpu_srgb_stages_run_in_srgb() {
     const P3_TO_SRGB: [[f32; 3]; 3] = [
-        [1.224_940, -0.224_940, 0.0],
+        [1.224_94, -0.224_94, 0.0],
         [-0.042_057, 1.042_057, 0.0],
         [-0.019_637_6, -0.078_636, 1.098_274],
     ];

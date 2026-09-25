@@ -95,7 +95,7 @@ struct Expanded {
 }
 
 impl Expanded {
-    fn color(placed: Placed<ColorStage>) -> Self {
+    const fn color(placed: Placed<ColorStage>) -> Self {
         Self {
             kind: SnippetKind::Color,
             name: placed.stage.name,
@@ -453,6 +453,6 @@ fn param_value(ty: ParamType, values: &[f32]) -> Option<ParamValue> {
     })
 }
 
-fn mismatch(stage: &'static str, reason: String) -> EffectSetupError {
+const fn mismatch(stage: &'static str, reason: String) -> EffectSetupError {
     EffectSetupError::StageMismatch { stage, reason }
 }

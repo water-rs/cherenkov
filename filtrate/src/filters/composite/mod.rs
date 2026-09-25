@@ -844,7 +844,7 @@ impl<P: FilterParam> SpatialFilter for DisplacementTransitionToImage<P> {
 /// `amount`.
 #[derive(Debug, Clone, crate::Filter)]
 #[filter(color, shader = "composite/tone_curve.wgsl", linear = false)]
-pub struct ToneCurve<P: FilterParam = f32> {
+pub struct ToneCurve<P = f32> {
     /// Shadow adjustment.
     pub shadows: P,
     /// Midtone adjustment.

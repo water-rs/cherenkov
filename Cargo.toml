@@ -27,6 +27,7 @@ members = [
     "filtrate/derive",
     "shader",
     "gpu",
+    "cpu",
     "scene",
     "oracle",
     "bench",

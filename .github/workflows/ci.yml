@@ -125,7 +125,7 @@ jobs:
       - name: Clippy / all adapter features together
         run: |
           cargo clippy --locked -p cherenkov-bench --all-targets \
-            --features vello-classic,vello-hybrid,vello-cpu,skia,cherenkov -- -D warnings
+            --features vello-classic,vello-hybrid,vello-cpu,skia,cherenkov,cherenkov-cpu -- -D warnings
       - uses: taiki-e/install-action@cargo-hack
       # `skia-metal` is Apple-only; every other adapter must lint alone.
       - name: Clippy / each adapter feature alone
@@ -168,7 +168,7 @@ jobs:
       - name: Clippy / Metal adapter features
         run: |
           cargo clippy --locked -p cherenkov-bench --all-targets \
-            --features skia-metal,vello-classic,vello-hybrid,cherenkov -- -D warnings
+            --features skia-metal,vello-classic,vello-hybrid,cherenkov,cherenkov-cpu -- -D warnings
       - run: cargo build --locked --release -p cherenkov-bench --features skia-metal,vello-classic,vello-hybrid
       - name: Render the corpus on Metal adapters
         run: |
@@ -214,5 +214,5 @@ jobs:
         run: |
           cargo ndk --target aarch64-linux-android --platform 30 \
             build --release -p cherenkov-bench \
-            --features vello-classic,vello-hybrid,skia,cherenkov
+            --features vello-classic,vello-hybrid,skia,cherenkov,cherenkov-cpu
           ls -l target/aarch64-linux-android/release/cherenkov-bench

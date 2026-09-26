@@ -187,19 +187,13 @@ fn many_timed_frames_complete_with_whole_frame_gpu_time() -> Result<(), Box<dyn 
 }
 
 /// The Metal-only counterpart: macOS always has a Metal adapter, so this
-/// fails rather than skips when it is missing, and checks that the Apple
-/// stage-boundary sampling is reported as pass-boundary support.
+/// fails rather than skips when it is missing. Apple GPUs sample only at
+/// stage boundaries, which the pass-boundary timestamps rely on.
 #[test]
 #[cfg(target_os = "macos")]
 fn metal_times_many_frames_at_pass_boundaries() -> Result<(), Box<dyn std::error::Error>> {
     let engine = timed_engine(wgpu::Backends::METAL).expect("a Metal adapter");
     assert_eq!(engine.info().backend, "Metal", "{:?}", engine.info());
-    assert_ne!(
-        engine.info().timestamps,
-        cherenkov_gpu::TimestampSupport::Encoders,
-        "Metal samples at stage boundaries only: {:?}",
-        engine.info()
-    );
     many_timed_frames(&engine)
 }
 

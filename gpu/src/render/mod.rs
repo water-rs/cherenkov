@@ -696,14 +696,11 @@ pub fn run(config: GpuConfig, rx: Receiver<Message>, init_tx: Sender<Result<Init
     let init = create_device(&config).and_then(|(adapter, device, queue)| {
         let info = adapter.get_info();
         let supported = adapter.features();
-        let timestamp_support =
-            if supported.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS) {
-                TimestampSupport::Encoders
-            } else if supported.contains(wgpu::Features::TIMESTAMP_QUERY) {
-                TimestampSupport::PassBoundaries
-            } else {
-                TimestampSupport::Unsupported
-            };
+        let timestamp_support = if supported.contains(wgpu::Features::TIMESTAMP_QUERY) {
+            TimestampSupport::PassBoundaries
+        } else {
+            TimestampSupport::Unsupported
+        };
         let (layout0, layout1) = create_layouts(&device);
         let scratch_format = scratch_wgpu(config.scratch_format);
         // Three specialised fragment shaders from one source file: the

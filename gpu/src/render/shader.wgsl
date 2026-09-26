@@ -14,6 +14,7 @@ const KIND_STROKE_OFFSET: u32 = 1u; // coverage(outer shape) - coverage(inner sh
 const KIND_STROKE_DIST: u32 = 2u;   // coverage(d - hw) - coverage(d + hw)
 const KIND_SHADOW: u32 = 3u;        // Gaussian-blurred rounded box
 const KIND_GLYPH: u32 = 4u;         // coverage from the glyph atlas
+const KIND_SPAN: u32 = 5u;          // a full-coverage device-space run
 
 const PAINT_SOLID: u32 = 0u;
 const PAINT_LINEAR: u32 = 1u;
@@ -29,6 +30,7 @@ const INTERP_SRGB: u32 = 1u;
 
 const FLAG_HAS_CLIP: u32 = 1u;
 const FLAG_HAS_INNER: u32 = 2u;
+const FLAG_HAS_MASK: u32 = 4u;      // clip coverage x atlas mask cell
 
 // A rounded box centred at the origin. `radii` are the corner radii along x
 // in the order top-left, top-right, bottom-right, bottom-left; the radius
@@ -45,13 +47,15 @@ struct Instance {
     // local -> device, kurbo coefficient order [a, b, c, d, e, f]:
     // x' = a x + c y + e ; y' = b x + d y + f.
     affine: array<vec4<f32>, 2>,
-    // Quad rectangle (x0, y0, x1, y1). Local space, except KIND_GLYPH where it
-    // is the device-space atlas cell rectangle.
+    // Quad rectangle (x0, y0, x1, y1). Local space, except KIND_GLYPH and
+    // KIND_SPAN where it is the device-space atlas cell rectangle.
     bounds: vec4<f32>,
     shape: Shape,
     inner: Shape,
     // device -> clip-local affine, same coefficient order.
     clip_inv: array<vec4<f32>, 2>,
+    // The clip shape; for a masked clip (always a sharp rect) `aspect` and
+    // `exponent` — unread by its SDF — carry the mask cell size.
     clip: Shape,
     // Straight-alpha working-space colour (solid paint, glyph, shadow).
     color: vec4<f32>,
@@ -59,9 +63,10 @@ struct Instance {
     grad: vec4<f32>,
     // Radial: start radius, end radius.
     grad2: vec4<f32>,
-    // Glyph: atlas cell origin (x, y) in texels.
+    // Glyph/cell: atlas cell origin (x, y) in texels. zw: mask atlas origin.
     uv: vec4<f32>,
     // x: stroke half width (STROKE_DIST) or shadow sigma. y: opacity.
+    // zw: mask device origin.
     params: vec4<f32>,
     // x: kind, y: paint, z: first stop index, w: stops | interp << 16 | extend << 20 | flags << 24
     meta_: vec4<u32>,
@@ -77,7 +82,8 @@ struct Stop {
 
 struct Globals {
     size: vec2<f32>,
-    pad: vec2<f32>,
+    // Device-space origin of this pass's target region.
+    origin: vec2<f32>,
 }
 
 @group(0) @binding(0) var<uniform> globals: Globals;
@@ -120,14 +126,14 @@ fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
     let sy = f32(corner >> 1u);
     let p = vec2<f32>(mix(inst.bounds.x, inst.bounds.z, sx), mix(inst.bounds.y, inst.bounds.w, sy));
     var out: VsOut;
-    if inst.meta_.x == KIND_GLYPH {
+    if inst.meta_.x == KIND_GLYPH || inst.meta_.x == KIND_SPAN {
         out.device = p;
         out.local = apply_inverse(inst.affine, p);
     } else {
         out.local = p;
         out.device = apply(inst.affine, p);
     }
-    let ndc = out.device / globals.size * 2.0 - 1.0;
+    let ndc = (out.device - globals.origin) / globals.size * 2.0 - 1.0;
     out.position = vec4<f32>(ndc.x, -ndc.y, 0.0, 1.0);
     out.instance = ii;
     return out;
@@ -320,24 +326,24 @@ fn eval_stops(first: u32, count: u32, interp: u32, t: f32) -> vec4<f32> {
     return vec4<f32>(rgb * c.a, c.a);
 }
 
-fn linear_t(inst: Instance, p: vec2<f32>) -> f32 {
-    let d = inst.grad.zw - inst.grad.xy;
+fn linear_t(i: u32, p: vec2<f32>) -> f32 {
+    let d = instances[i].grad.zw - instances[i].grad.xy;
     let dd = dot(d, d);
     if dd <= 0.0 {
         return 0.0;
     }
-    return dot(p - inst.grad.xy, d) / dd;
+    return dot(p - instances[i].grad.xy, d) / dd;
 }
 
 // Two-point conical gradient parameter, a literal port of the oracle's
 // radial_t: the larger real root of |p - (c0 + t·dc)| = r0 + t·dr.
 // Degenerate coincident circles use the relative distance from the centre.
 // NaN (no solution) yields a transparent pixel.
-fn radial_t(inst: Instance, p: vec2<f32>) -> f32 {
-    let c0 = inst.grad.xy;
-    let c1 = inst.grad.zw;
-    let r0 = inst.grad2.x;
-    let r1 = inst.grad2.y;
+fn radial_t(i: u32, p: vec2<f32>) -> f32 {
+    let c0 = instances[i].grad.xy;
+    let c1 = instances[i].grad.zw;
+    let r0 = instances[i].grad2.x;
+    let r1 = instances[i].grad2.y;
     let dc = c1 - c0;
     let dr = r1 - r0;
     let pd = p - c0;
@@ -365,20 +371,22 @@ fn radial_t(inst: Instance, p: vec2<f32>) -> f32 {
     return max((-b + sq) / (2.0 * a), (-b - sq) / (2.0 * a));
 }
 
-fn paint(inst: Instance, local: vec2<f32>, device: vec2<f32>) -> vec4<f32> {
-    switch inst.meta_.y {
+fn paint(i: u32, local: vec2<f32>, device: vec2<f32>) -> vec4<f32> {
+    switch instances[i].meta_.y {
         case PAINT_SOLID: {
-            return vec4<f32>(inst.color.rgb * inst.color.a, inst.color.a);
+            let color = instances[i].color;
+            return vec4<f32>(color.rgb * color.a, color.a);
         }
         case PAINT_TEXTURE: {
-            return textureLoad(source, vec2<i32>(floor(device)), 0);
+            // `grad.xy` carries the source region's device-space origin.
+            return textureLoad(source, vec2<i32>(floor(device - instances[i].grad.xy)), 0);
         }
         default: {
             var t: f32;
-            if inst.meta_.y == PAINT_LINEAR {
-                t = linear_t(inst, local);
+            if instances[i].meta_.y == PAINT_LINEAR {
+                t = linear_t(i, local);
             } else {
-                t = radial_t(inst, local);
+                t = radial_t(i, local);
             }
             // NaN (exponent all-ones, nonzero mantissa) → transparent.
             // `t != t` is not reliable under every driver.
@@ -386,56 +394,70 @@ fn paint(inst: Instance, local: vec2<f32>, device: vec2<f32>) -> vec4<f32> {
             if (tbits & 0x7f800000u) == 0x7f800000u && (tbits & 0x007fffffu) != 0u {
                 return vec4<f32>(0.0);
             }
-            let extend = (inst.meta_.w >> 20u) & 0xfu;
-            let interp = (inst.meta_.w >> 16u) & 0xfu;
-            let count = inst.meta_.w & 0xffffu;
-            return eval_stops(inst.meta_.z, count, interp, extend_t(t, extend));
+            let meta_w = instances[i].meta_.w;
+            let extend = (meta_w >> 20u) & 0xfu;
+            let interp = (meta_w >> 16u) & 0xfu;
+            let count = meta_w & 0xffffu;
+            return eval_stops(instances[i].meta_.z, count, interp, extend_t(t, extend));
         }
     }
 }
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    let inst = instances[in.instance];
-    let flags = (inst.meta_.w >> 24u) & 0xffu;
+    // Access instance fields through the storage array: copying the whole
+    // 272-byte struct per fragment is expensive on tilers.
+    let i = in.instance;
+    let flags = (instances[i].meta_.w >> 24u) & 0xffu;
     var cov: f32;
-    switch inst.meta_.x {
+    switch instances[i].meta_.x {
         case KIND_STROKE_OFFSET: {
-            cov = shape_coverage(inst.shape, in.local, inst.affine);
+            cov = shape_coverage(instances[i].shape, in.local, instances[i].affine);
             if (flags & FLAG_HAS_INNER) != 0u {
-                cov -= shape_coverage(inst.inner, in.local, inst.affine);
+                cov -= shape_coverage(instances[i].inner, in.local, instances[i].affine);
             }
         }
         case KIND_STROKE_DIST: {
-            let d = sdf(inst.shape, in.local);
-            let g = device_grad(inst.affine, sdf_grad(inst.shape, in.local));
-            let hw = inst.params.x;
+            let d = sdf(instances[i].shape, in.local);
+            let g = device_grad(instances[i].affine, sdf_grad(instances[i].shape, in.local));
+            let hw = instances[i].params.x;
             cov = coverage(d - hw, g) - coverage(d + hw, g);
         }
         case KIND_SHADOW: {
-            let sigma = inst.params.x;
+            let sigma = instances[i].params.x;
             if sigma < 0.25 {
-                cov = shape_coverage(inst.shape, in.local, inst.affine);
+                cov = shape_coverage(instances[i].shape, in.local, instances[i].affine);
             } else {
-                cov = shadow(inst.shape, in.local, sigma);
+                cov = shadow(instances[i].shape, in.local, sigma);
             }
         }
         case KIND_GLYPH: {
-            let texel = vec2<i32>(floor(in.device - inst.bounds.xy)) + vec2<i32>(inst.uv.xy);
+            let texel = vec2<i32>(floor(in.device - instances[i].bounds.xy)) + vec2<i32>(instances[i].uv.xy);
             cov = textureLoad(atlas, texel, 0).r;
         }
+        case KIND_SPAN: {
+            cov = 1.0;
+        }
         default: {
-            cov = shape_coverage(inst.shape, in.local, inst.affine);
+            cov = shape_coverage(instances[i].shape, in.local, instances[i].affine);
         }
     }
     if (flags & FLAG_HAS_CLIP) != 0u {
         // `clip_inv` maps device to clip-local: J^-T is its transpose.
-        let pc = apply(inst.clip_inv, in.device);
-        let g = sdf_grad(inst.clip, pc);
-        let ci = inst.clip_inv;
+        let pc = apply(instances[i].clip_inv, in.device);
+        let g = sdf_grad(instances[i].clip, pc);
+        let ci = instances[i].clip_inv;
         let dg = vec2<f32>(ci[0].x * g.x + ci[0].y * g.y, ci[0].z * g.x + ci[0].w * g.y);
-        cov *= coverage(sdf(inst.clip, pc), max(length(dg), 1e-6));
+        cov *= coverage(sdf(instances[i].clip, pc), max(length(dg), 1e-6));
     }
-    cov = clamp(cov, 0.0, 1.0) * inst.params.y;
-    return paint(inst, in.local, in.device) * cov;
+    if (flags & FLAG_HAS_MASK) != 0u {
+        // Mask texel for this device pixel; texels outside the cell
+        // contribute zero coverage.
+        let mp = floor(in.device) - instances[i].params.zw;
+        let msize = vec2<f32>(instances[i].clip.aspect, instances[i].clip.exponent);
+        let inside = all(mp >= vec2<f32>(0.0)) && all(mp < msize);
+        cov *= select(0.0, textureLoad(atlas, vec2<i32>(mp) + vec2<i32>(instances[i].uv.zw), 0).r, inside);
+    }
+    cov = clamp(cov, 0.0, 1.0) * instances[i].params.y;
+    return paint(i, in.local, in.device) * cov;
 }

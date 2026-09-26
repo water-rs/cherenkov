@@ -115,6 +115,8 @@ pub enum Unsupported {
     BlendSpace,
     /// A shadow from a shape without a rounded-box form.
     Shadow,
+    /// A path clip whose rasterized mask does not fit the atlas.
+    PathClipTooLarge,
 }
 
 impl std::fmt::Display for Unsupported {
@@ -134,6 +136,7 @@ impl std::fmt::Display for Unsupported {
             Self::ColorFont => "color-font",
             Self::BlendSpace => "blend-space",
             Self::Shadow => "shadow",
+            Self::PathClipTooLarge => "path-clip-too-large",
         })
     }
 }

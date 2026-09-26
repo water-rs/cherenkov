@@ -10,7 +10,7 @@ mod lower;
 mod path;
 mod raster;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{Receiver, Sender};
 
 use cherenkov::ContentChange;
@@ -989,11 +989,29 @@ impl Renderer {
                         }
                     }
                 }
+                LayerOp::Push { parent, child }
+                    if Self::would_cycle(&state.layers, parent, child) =>
+                {
+                    tracing::warn!(
+                        parent,
+                        child,
+                        "layer push rejected: it would create a cycle"
+                    );
+                }
                 LayerOp::Push { parent, child } => {
                     Self::detach(&mut state.layers, child);
                     if let Some(node) = state.layers.get_mut(&parent) {
                         node.children.push(child);
                     }
+                }
+                LayerOp::Insert { parent, child, .. }
+                    if Self::would_cycle(&state.layers, parent, child) =>
+                {
+                    tracing::warn!(
+                        parent,
+                        child,
+                        "layer insert rejected: it would create a cycle"
+                    );
                 }
                 LayerOp::Insert {
                     parent,
@@ -1012,6 +1030,25 @@ impl Renderer {
                 }
             }
         }
+    }
+
+    /// Whether `parent` lies inside `child`'s subtree — `child` itself
+    /// included — so attaching `child` under `parent` would close a cycle
+    /// the lowering recursion could never escape.
+    fn would_cycle(layers: &HashMap<LayerId, LayerNode>, parent: LayerId, child: LayerId) -> bool {
+        let mut seen = HashSet::new();
+        let mut stack = vec![child];
+        while let Some(id) = stack.pop() {
+            if id == parent {
+                return true;
+            }
+            if seen.insert(id)
+                && let Some(node) = layers.get(&id)
+            {
+                stack.extend(node.children.iter().copied());
+            }
+        }
+        false
     }
 
     /// Removes `child` from every child list holding it.
@@ -1748,5 +1785,46 @@ impl Renderer {
             height: h,
             pixels,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tree(edges: &[(LayerId, LayerId)]) -> HashMap<LayerId, LayerNode> {
+        let mut layers = HashMap::new();
+        for id in edges.iter().flat_map(|(a, b)| [*a, *b]) {
+            layers.entry(id).or_insert_with(node);
+        }
+        for (parent, child) in edges {
+            layers.get_mut(parent).unwrap().children.push(*child);
+        }
+        layers
+    }
+
+    #[test]
+    fn attaching_a_layer_under_its_subtree_is_a_cycle() {
+        // 0 -> 1 -> 2, and 3 detached.
+        let mut layers = tree(&[(0, 1), (1, 2)]);
+        layers.insert(3, node());
+        // A self-push, the root under a descendant, and a mid-tree edge
+        // all close a loop.
+        assert!(Renderer::would_cycle(&layers, 3, 3));
+        assert!(Renderer::would_cycle(&layers, 2, 0));
+        assert!(Renderer::would_cycle(&layers, 2, 1));
+        // Reparenting within the tree or attaching a detached layer is
+        // fine.
+        assert!(!Renderer::would_cycle(&layers, 0, 2));
+        assert!(!Renderer::would_cycle(&layers, 0, 3));
+        assert!(!Renderer::would_cycle(&layers, 3, 1));
+    }
+
+    #[test]
+    fn a_cycle_check_terminates_on_a_cyclic_tree() {
+        // Even an already-cyclic map must not hang the check.
+        let layers = tree(&[(0, 1), (1, 0)]);
+        assert!(Renderer::would_cycle(&layers, 0, 1));
+        assert!(!Renderer::would_cycle(&layers, 9, 1));
     }
 }

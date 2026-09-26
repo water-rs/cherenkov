@@ -50,6 +50,9 @@ pub enum ResourceError {
     /// The font data could not be parsed.
     #[error("font: {0}")]
     Font(String),
+    /// The image data is malformed.
+    #[error("image: {0}")]
+    Image(String),
     /// The resource needs a feature this slice does not implement.
     #[error(transparent)]
     Unsupported(#[from] Unsupported),
@@ -79,6 +82,9 @@ pub enum RenderError {
     /// A glyph run references a font that is not registered.
     #[error("font: {0}")]
     Font(String),
+    /// A draw references an image that is not registered.
+    #[error("image: {0}")]
+    Image(u64),
     /// The glyph atlas is full; the caller may grow or clear it and retry.
     #[error("glyph atlas full")]
     AtlasFull,

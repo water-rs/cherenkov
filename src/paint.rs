@@ -43,6 +43,8 @@ pub enum Extend {
     Repeat,
     /// The range repeats, mirrored every other time.
     Reflect,
+    /// Transparent outside the range.
+    None,
 }
 
 /// The space in which gradient stops are interpolated.
@@ -332,6 +334,20 @@ impl From<MeshGradient> for Paint {
 /// An image registered with the engine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ImageId(u64);
+
+impl ImageId {
+    /// Creates an identifier from a backend-assigned raw value.
+    #[must_use]
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// The raw value.
+    #[must_use]
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
 
 /// How an image is sampled.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]

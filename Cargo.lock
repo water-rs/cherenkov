@@ -390,6 +390,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "cherenkov-vello"
+version = "0.0.0"
+dependencies = [
+ "bytemuck",
+ "cherenkov",
+ "filtrate",
+ "kurbo",
+ "pollster 0.4.0",
+ "skrifa 0.44.0",
+ "thiserror",
+ "vello",
+ "wgpu",
+]
+
+[[package]]
 name = "clang-sys"
 version = "1.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

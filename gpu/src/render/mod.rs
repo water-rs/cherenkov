@@ -21,9 +21,10 @@ use crate::config::{GpuConfig, GpuInfo, MemoryUsage, Pressure, ScratchFormat};
 use crate::error::{EngineError, RenderError, SurfaceError};
 use crate::message::{ChangeSet, LayerId, LayerOp, Message, SurfaceId};
 use crate::surface::{FrameStats, Next, PassTiming, Readback};
-use glyph::{Atlas, FontData};
+use glyph::{Atlas, FontData, PendingRaster};
 use lower::{
-    ContentData, Frame, GlyphContext, LayerNode, Lowering, PipelineKind, ShaderVariant, Target,
+    ContentData, Frame, GlyphContext, LayerNode, Lowered, Lowering, PipelineKind, ShaderVariant,
+    Target,
 };
 
 /// The surface target format: premultiplied linear Display P3.
@@ -251,6 +252,16 @@ struct Renderer {
 struct UpdateDropped {
     layer: LayerId,
     content: &'static str,
+}
+
+/// The atlas location a committed [`PendingRaster`] resolved to.
+enum PendingOrigin {
+    /// Cell origins: one for a glyph, one per cell for a path emission.
+    Cells(Vec<(u32, u32)>),
+    /// A clip mask's cell origin.
+    Mask([f32; 2]),
+    /// A COLR cache insert; no instance patch.
+    None,
 }
 
 /// One submitted frame's timestamp queries awaiting GPU completion.
@@ -1220,15 +1231,16 @@ impl Renderer {
         self.bound_instance_size = self.instances.size();
         self.bound_stop_size = self.stops.size();
         self.bound_globals_size = self.globals.size();
+        let atlas = &self.atlas;
         self.bind0 = make_bind0(
             &self.device,
             &self.layout0,
             &self.globals,
             &self.instances,
             &self.stops,
-            &self.atlas,
+            atlas,
         );
-        self.bound_atlas = self.atlas.generation();
+        self.bound_atlas = atlas.generation();
     }
 
     /// Memory usage across buffers, textures and the atlas.
@@ -1275,17 +1287,27 @@ impl Renderer {
         }
         self.frame_pass_count = 0;
         self.pass_meta.clear();
-        // Lower every dirty surface into the shared buffers first: the GPU
-        // timestamp bracket must start after CPU lowering (rasters, uploads)
-        // so it measures GPU work only. Instances, stops and globals are
-        // appended frame-wide at per-surface bases so a later surface's
-        // upload can't clobber an earlier one before it is encoded.
+        // Lower every dirty surface first: the GPU timestamp bracket must
+        // start after CPU lowering (rasters, uploads) so it measures GPU
+        // work only. Instances, stops and globals are appended frame-wide
+        // at per-surface bases so a later surface's upload can't clobber
+        // an earlier one before it is encoded.
+        // Take the states out so the lowering workers own them.
+        let mut pending: Vec<SurfaceState> = dirty
+            .iter()
+            .map(|id| self.surfaces.remove(id).expect("dirty surface must exist"))
+            .collect();
+        let results = self.lower_all(&mut pending);
+        for (id, surf) in dirty.iter().copied().zip(pending) {
+            self.surfaces.insert(id, surf);
+        }
         let mut inst_base = 0u32;
         let mut stop_base = 0u32;
         let mut globals_base = 0u32;
         let mut result = Ok(());
-        for &id in &dirty {
-            result = self.lower_surface(id, &mut stats, inst_base, stop_base, globals_base);
+        for (&id, lowered) in dirty.iter().zip(results) {
+            result =
+                self.lower_surface(id, &mut stats, inst_base, stop_base, globals_base, lowered);
             if result.is_err() {
                 break;
             }
@@ -1308,6 +1330,204 @@ impl Renderer {
         Ok((Next::Idle, stats))
     }
 
+    /// Lowers every surface in `pending` — on scoped worker threads when
+    /// more than one is dirty — then commits each surface's deferred
+    /// rasters serially in list order.
+    ///
+    /// No locks anywhere in the engine: workers read a shared `Atlas`
+    /// (lookups never mutate) and a per-worker snapshot of the fonts;
+    /// every atlas write and COLR cache update comes back as a
+    /// `Lowered::pending` list this method commits in dirty order, so
+    /// the atlas sees exactly the sequence serial lowering produced.
+    /// `AtlasFull` during a commit grows or clears the atlas — which
+    /// empties it either way — and the whole batch is lowered again.
+    fn lower_all(&mut self, pending: &mut [SurfaceState]) -> Vec<Result<Lowered, RenderError>> {
+        let mut cleared = false;
+        'batch: loop {
+            let mut results: Vec<Result<Lowered, RenderError>> = if pending.len() > 1 {
+                let (atlas, images) = (&self.atlas, &self.images);
+                // `FontData`'s COLR cache is a `RefCell` — !Sync — so
+                // each worker moves in its own snapshot built here.
+                let snapshots: Vec<HashMap<u64, FontData>> = pending
+                    .iter()
+                    .map(|_| {
+                        self.fonts
+                            .iter()
+                            .map(|(id, f)| (*id, f.snapshot()))
+                            .collect()
+                    })
+                    .collect();
+                std::thread::scope(|s| {
+                    pending
+                        .iter_mut()
+                        .zip(snapshots)
+                        .map(|(surf, fonts)| {
+                            s.spawn(move || Self::lower_content(surf, atlas, &fonts, images))
+                        })
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+                        .collect()
+                })
+            } else {
+                pending
+                    .iter_mut()
+                    .map(|surf| Self::lower_content(surf, &self.atlas, &self.fonts, &self.images))
+                    .collect()
+            };
+            // Commit every surface's pending rasters serially, in dirty
+            // order.
+            for (surf, result) in pending.iter_mut().zip(results.iter_mut()) {
+                let Ok(lowered) = result else {
+                    continue;
+                };
+                match self.apply_pending(surf, lowered) {
+                    Ok(()) => {}
+                    Err(RenderError::AtlasFull) => {
+                        if self.atlas.size() < self.atlas.cap() {
+                            self.atlas.grow(&self.device);
+                        } else if cleared {
+                            *result = Err(RenderError::AtlasExhausted);
+                            break 'batch results;
+                        } else {
+                            self.atlas.clear();
+                            cleared = true;
+                        }
+                        // Growing or clearing emptied the atlas: every
+                        // hit any lowering took is now a miss, so lower
+                        // the whole batch again.
+                        continue 'batch;
+                    }
+                    Err(e) => {
+                        *result = Err(e);
+                        break 'batch results;
+                    }
+                }
+            }
+            break results;
+        }
+    }
+
+    /// The parallelizable half of lowering one surface: CPU rasterization
+    /// only — no atlas writes, no scratch/backdrop growth, no
+    /// shared-buffer writes. Atlas inserts and COLR cache updates come
+    /// back in `Lowered::pending` for the render thread to commit;
+    /// `lower_surface` runs the serial tail. Runs on a scoped worker
+    /// thread when a frame has more than one dirty surface.
+    fn lower_content(
+        surf: &mut SurfaceState,
+        atlas: &Atlas,
+        fonts: &HashMap<u64, FontData>,
+        images: &HashMap<u64, GpuImage>,
+    ) -> Result<Lowered, RenderError> {
+        surf.frame.reset();
+        // Lowering borrows `layers` immutably while mutating `frame`;
+        // taking the map out keeps the two borrows disjoint.
+        let layers = std::mem::take(&mut surf.layers);
+        let mut lowered = Lowered::default();
+        let result = layers.get(&0).map_or(Ok(()), |root| {
+            let glyphs = GlyphContext {
+                atlas,
+                fonts,
+                images,
+            };
+            let mut lowering = Lowering::new(&mut surf.frame, surf.size);
+            let result = lowering.run(root, &layers, surf.clear, &glyphs);
+            lowered.glyphs = lowering.glyphs_rasterized();
+            lowered.paths = lowering.paths_rasterized();
+            lowered.cell_patches = std::mem::take(&mut lowering.cell_patches);
+            lowered.mask_patches = std::mem::take(&mut lowering.mask_patches);
+            lowered.pending = std::mem::take(&mut lowering.pending);
+            result
+        });
+        surf.layers = layers;
+        result.map(|()| lowered)
+    }
+
+    /// Commits one surface's deferred work on the render thread: every
+    /// atlas cell insert and COLR cache update, in lowering order. Cell
+    /// and mask origins patch the surface's instances. A dedupe check
+    /// per insert makes a key two surfaces raced on land once — the
+    /// same as serial lowering, where the second saw the first's hit.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "atlas coords are well within f32"
+    )]
+    fn apply_pending(
+        &mut self,
+        surf: &mut SurfaceState,
+        lowered: &mut Lowered,
+    ) -> Result<(), RenderError> {
+        let pending = std::mem::take(&mut lowered.pending);
+        let mut origins = Vec::with_capacity(pending.len());
+        for raster in pending {
+            origins.push(self.apply_raster(raster)?);
+        }
+        for (inst, p, c) in lowered.cell_patches.drain(..) {
+            let Some(PendingOrigin::Cells(cells)) = origins.get(p as usize) else {
+                continue;
+            };
+            let Some(&(x, y)) = cells.get(c as usize) else {
+                continue;
+            };
+            surf.frame.instances[inst as usize].uv[0] = x as f32;
+            surf.frame.instances[inst as usize].uv[1] = y as f32;
+        }
+        for (inst, p) in lowered.mask_patches.drain(..) {
+            let Some(PendingOrigin::Mask([x, y])) = origins.get(p as usize) else {
+                continue;
+            };
+            surf.frame.instances[inst as usize].uv[2] = *x;
+            surf.frame.instances[inst as usize].uv[3] = *y;
+        }
+        Ok(())
+    }
+
+    /// Stores one deferred raster into the atlas or font cache.
+    fn apply_raster(&mut self, raster: PendingRaster) -> Result<PendingOrigin, RenderError> {
+        match raster {
+            PendingRaster::Glyph {
+                key,
+                left,
+                top,
+                w,
+                h,
+                texels,
+            } => self
+                .atlas
+                .store_glyph(&self.queue, key, left, top, w, h, &texels)
+                .map(|(x, y)| PendingOrigin::Cells(vec![(x, y)]))
+                .ok_or(RenderError::AtlasFull),
+            PendingRaster::Path { key, emit, cells } => {
+                self.atlas
+                    .store_path(&self.queue, key, emit, &cells)
+                    .ok_or(RenderError::AtlasFull)?;
+                Ok(PendingOrigin::Cells(
+                    self.atlas.path_origins(key).expect("just stored"),
+                ))
+            }
+            PendingRaster::Mask {
+                key,
+                mask,
+                w,
+                h,
+                texels,
+            } => {
+                self.atlas
+                    .store_mask(&self.queue, key, mask, w, h, &texels)
+                    .ok_or(RenderError::AtlasFull)?;
+                Ok(PendingOrigin::Mask(
+                    self.atlas.mask_origin(key).expect("just stored"),
+                ))
+            }
+            PendingRaster::Colr { font, key, picture } => {
+                if let Some(font) = self.fonts.get_mut(&font) {
+                    font.colr.borrow_mut().entry(key).or_insert(picture);
+                }
+                Ok(PendingOrigin::None)
+            }
+        }
+    }
     /// Lowers one surface: CPU raster, scratch/backdrop growth, and the
     /// shared-buffer uploads at `inst_base`/`stop_base`/`globals_base`.
     #[expect(
@@ -1322,54 +1542,11 @@ impl Renderer {
         inst_base: u32,
         stop_base: u32,
         globals_base: u32,
+        lowered: Result<Lowered, RenderError>,
     ) -> Result<(), RenderError> {
-        // Lowering needs `surf.layers` and `surf.frame` plus `atlas`,
-        // `fonts`, `device` and `queue`; take the layer map out of the
-        // surface so the borrows stay disjoint.
-        let lowered = {
-            let Some(surf) = self.surfaces.get_mut(&id) else {
-                return Ok(());
-            };
-            surf.frame.reset();
-            let layers = std::mem::take(&mut surf.layers);
-            // A full atlas is a recoverable signal: grow while the budget
-            // allows, then clear once; a second failure after the clear
-            // means the frame's live set exceeds the maximum atlas.
-            let mut cleared = false;
-            let result = loop {
-                let result = if let Some(root) = layers.get(&0) {
-                    let mut glyphs = GlyphContext {
-                        atlas: &mut self.atlas,
-                        queue: &self.queue,
-                        fonts: &self.fonts,
-                        images: &self.images,
-                    };
-                    let mut lowering = Lowering::new(&mut surf.frame, surf.size);
-                    let result = lowering.run(root, &layers, surf.clear, &mut glyphs);
-                    stats.glyphs_rasterized += lowering.glyphs_rasterized();
-                    stats.paths_rasterized += lowering.paths_rasterized();
-                    result
-                } else {
-                    Ok(())
-                };
-                match result {
-                    Err(RenderError::AtlasFull) if !cleared => {
-                        surf.frame.reset();
-                        if self.atlas.size() < self.atlas.cap() {
-                            self.atlas.grow(&self.device);
-                        } else {
-                            self.atlas.clear();
-                            cleared = true;
-                        }
-                    }
-                    Err(RenderError::AtlasFull) => break Err(RenderError::AtlasExhausted),
-                    other => break other,
-                }
-            };
-            surf.layers = layers;
-            result
-        };
-        lowered?;
+        let Lowered { glyphs, paths, .. } = lowered?;
+        stats.glyphs_rasterized += glyphs;
+        stats.paths_rasterized += paths;
         // Grow the query set lazily when this frame's passes exceed its
         // capacity; never mid-encoder.
         if self.timestamps {
@@ -1530,16 +1707,19 @@ impl Renderer {
             self.queue
                 .write_buffer(&self.stops, stop_offset, stop_bytes);
         }
-        if self.atlas.generation() != self.bound_atlas {
-            self.bind0 = make_bind0(
-                &self.device,
-                &self.layout0,
-                &self.globals,
-                &self.instances,
-                &self.stops,
-                &self.atlas,
-            );
-            self.bound_atlas = self.atlas.generation();
+        {
+            let atlas = &self.atlas;
+            if atlas.generation() != self.bound_atlas {
+                self.bind0 = make_bind0(
+                    &self.device,
+                    &self.layout0,
+                    &self.globals,
+                    &self.instances,
+                    &self.stops,
+                    atlas,
+                );
+                self.bound_atlas = atlas.generation();
+            }
         }
         // One Globals entry per pass at a 256-byte stride, continuing the
         // frame-wide slot sequence across dirty surfaces.
@@ -1575,15 +1755,16 @@ impl Renderer {
             || self.stops.size() > self.bound_stop_size
             || self.globals.size() > self.bound_globals_size
         {
+            let atlas = &self.atlas;
             self.bind0 = make_bind0(
                 &self.device,
                 &self.layout0,
                 &self.globals,
                 &self.instances,
                 &self.stops,
-                &self.atlas,
+                atlas,
             );
-            self.bound_atlas = self.atlas.generation();
+            self.bound_atlas = atlas.generation();
             self.bound_instance_size = self.instances.size();
             self.bound_stop_size = self.stops.size();
             self.bound_globals_size = self.globals.size();
@@ -1608,15 +1789,16 @@ impl Renderer {
             || self.stops.size() > self.bound_stop_size
             || self.globals.size() > self.bound_globals_size
         {
+            let atlas = &self.atlas;
             self.bind0 = make_bind0(
                 &self.device,
                 &self.layout0,
                 &self.globals,
                 &self.instances,
                 &self.stops,
-                &self.atlas,
+                atlas,
             );
-            self.bound_atlas = self.atlas.generation();
+            self.bound_atlas = atlas.generation();
             self.bound_instance_size = self.instances.size();
             self.bound_stop_size = self.stops.size();
             self.bound_globals_size = self.globals.size();

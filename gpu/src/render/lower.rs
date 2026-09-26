@@ -19,7 +19,8 @@ use crate::render::GpuImage;
 use skrifa::MetadataProvider as _;
 use skrifa::raw::TableProvider as _;
 
-use crate::render::glyph::{Atlas, FontData, MaskCell, PathEmit, glyph_key, rasterize};
+use crate::render::colr;
+use crate::render::glyph::{self, Atlas, FontData, MaskCell, PathEmit, PendingRaster, glyph_key};
 use crate::render::instance::{
     EXTEND_NONE, EXTEND_PAD, EXTEND_REFLECT, EXTEND_REPEAT, FLAG_HAS_CLIP, FLAG_HAS_INNER,
     FLAG_HAS_MASK, Globals, INTERP_SRGB, INTERP_WORKING, Instance, KIND_FILL, KIND_GLYPH,
@@ -176,7 +177,36 @@ struct DeviceClip {
     /// The clip's device-space rectangle, when it is one.
     aligned_rect: Option<Rect>,
     /// A rasterized path-coverage mask.
-    mask: Option<MaskCell>,
+    mask: Option<ClipMask>,
+}
+
+/// A path-clip mask: stored in the atlas, or produced by a pending
+/// raster the render thread will store — then `uv.zw` of every instance
+/// emitted under it is patched by `Lowering::mask_patches`.
+#[derive(Clone, Copy, Debug)]
+enum ClipMask {
+    /// Stored: the atlas origin is `cell.atlas`.
+    Cell(MaskCell),
+    /// Pending its raster (index into `GlyphContext::pending`).
+    Pending(MaskCell, u32),
+}
+
+impl ClipMask {
+    /// The mask data: device rect, size, and the pending-or-stored atlas
+    /// origin.
+    const fn cell(self) -> MaskCell {
+        match self {
+            Self::Cell(m) | Self::Pending(m, _) => m,
+        }
+    }
+
+    /// This mask shifted by `(dx, dy)` device pixels.
+    fn translated(self, dx: f64, dy: f64) -> Self {
+        match self {
+            Self::Cell(m) => Self::Cell(m.translated(dx, dy)),
+            Self::Pending(m, i) => Self::Pending(m.translated(dx, dy), i),
+        }
+    }
 }
 
 /// A `ShapeData` expressed as a centred rounded box.
@@ -538,14 +568,32 @@ pub enum ContentData {
 
 /// GPU resources the lowering needs to emit glyph instances.
 pub struct GlyphContext<'a> {
-    /// The atlas.
-    pub atlas: &'a mut Atlas,
-    /// For cell uploads.
-    pub queue: &'a wgpu::Queue,
-    /// Registered fonts.
+    /// The atlas, read-only here: lookups never mutate, misses become
+    /// [`PendingRaster`]s on the `Lowering`, applied serially on the
+    /// render thread.
+    pub atlas: &'a Atlas,
+    /// Registered fonts — a per-worker snapshot, so reads and the COLR
+    /// cache stay lock-free.
     pub fonts: &'a HashMap<u64, FontData>,
     /// Registered images, for dimension lookup during lowering.
     pub images: &'a HashMap<u64, GpuImage>,
+}
+
+/// One surface's lowering output: the raster counts plus every deferred
+/// atlas insert and COLR cache update, in lowering order, for the render
+/// thread to commit before encoding.
+#[derive(Default)]
+pub struct Lowered {
+    /// Glyphs rasterized during the lowering.
+    pub glyphs: u32,
+    /// Path rasters during the lowering (cache misses).
+    pub paths: u32,
+    /// Deferred rasters, in lowering order.
+    pub pending: Vec<PendingRaster>,
+    /// `uv.xy` patches: `(instance, pending index, cell index)`.
+    pub cell_patches: Vec<(u32, u32, u32)>,
+    /// `uv.zw` patches: `(instance, pending index)`.
+    pub mask_patches: Vec<(u32, u32)>,
 }
 
 /// The lowering walk state for one surface frame.
@@ -558,6 +606,14 @@ pub struct Lowering<'a> {
     depth: usize,
     glyphs: u32,
     paths: u32,
+    /// `(instance, pending, cell)` triples whose `uv.xy` are set when the
+    /// render thread stores the pending path's cells.
+    pub(crate) cell_patches: Vec<(u32, u32, u32)>,
+    /// `(instance, pending)` pairs whose `uv.zw` are set when the render
+    /// thread stores the pending clip mask.
+    pub(crate) mask_patches: Vec<(u32, u32)>,
+    /// Atlas writes and cache updates to commit, in lowering order.
+    pub(crate) pending: Vec<PendingRaster>,
 }
 
 impl<'a> Lowering<'a> {
@@ -573,6 +629,9 @@ impl<'a> Lowering<'a> {
             depth: 0,
             glyphs: 0,
             paths: 0,
+            cell_patches: Vec::new(),
+            mask_patches: Vec::new(),
+            pending: Vec::new(),
         }
     }
 
@@ -592,7 +651,7 @@ impl<'a> Lowering<'a> {
         root: &LayerNode,
         layers: &HashMap<u64, LayerNode>,
         clear: WorkingColor,
-        glyphs: &mut GlyphContext<'_>,
+        glyphs: &GlyphContext<'_>,
     ) -> Result<(), RenderError> {
         let [r, g, b, a] = clear.components;
         self.begin_pass(Target::Surface, Some([r * a, g * a, b * a, a]));
@@ -714,10 +773,19 @@ impl<'a> Lowering<'a> {
     }
 
     /// Emits `inst` into the current draw range, segmenting on its
-    /// specialised fragment variant.
+    /// specialised fragment variant. Under a pending clip mask the
+    /// instance's `uv.zw` is patched after the mask is stored.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a surface emits far fewer than u32::MAX instances"
+    )]
     fn push_instance(&mut self, inst: &Instance) {
         self.set_variant(variant_of(inst));
         self.frame.instances.push(*inst);
+        if let Some(ClipMask::Pending(_, pending)) = self.clip.and_then(|c| c.mask) {
+            self.mask_patches
+                .push((self.frame.instances.len() as u32 - 1, pending));
+        }
     }
 
     /// Renders `body` into an isolated scratch texture, composited back at
@@ -739,8 +807,8 @@ impl<'a> Lowering<'a> {
         inner_clip: Option<DeviceClip>,
         opacity: f32,
         blend: cherenkov::BlendMode,
-        mut body: impl FnMut(&mut Self, &mut GlyphContext<'_>) -> Result<(), RenderError>,
-        glyphs: &mut GlyphContext<'_>,
+        mut body: impl FnMut(&mut Self, &GlyphContext<'_>) -> Result<(), RenderError>,
+        glyphs: &GlyphContext<'_>,
     ) -> Result<(), RenderError> {
         if opacity < 1.0
             && blend == cherenkov::BlendMode::Normal
@@ -808,8 +876,8 @@ impl<'a> Lowering<'a> {
     fn try_passthrough(
         &mut self,
         opacity: f32,
-        body: &mut impl FnMut(&mut Self, &mut GlyphContext<'_>) -> Result<(), RenderError>,
-        glyphs: &mut GlyphContext<'_>,
+        body: &mut impl FnMut(&mut Self, &GlyphContext<'_>) -> Result<(), RenderError>,
+        glyphs: &GlyphContext<'_>,
     ) -> Result<bool, RenderError> {
         let snap = self.frame.snapshot();
         let depth = self.depth;
@@ -880,17 +948,20 @@ impl<'a> Lowering<'a> {
             inst.clip_inv = affine(clip.inv);
             inst.clip = clip.shape;
             inst.meta[3] |= FLAG_HAS_CLIP << 24;
-            if let Some(mask) = &clip.mask {
+            if let Some(mask) = clip.mask {
+                let cell = mask.cell();
                 // A masked clip's shape is always a sharp rect, so
                 // `aspect`/`exponent` — never read by its SDF — carry the
                 // mask cell size for the shader's out-of-cell guard.
-                inst.params[2] = mask.device[0];
-                inst.params[3] = mask.device[1];
-                inst.uv[2] = mask.atlas[0];
-                inst.uv[3] = mask.atlas[1];
-                inst.clip.aspect = mask.size[0];
-                inst.clip.exponent = mask.size[1];
+                inst.params[2] = cell.device[0];
+                inst.params[3] = cell.device[1];
+                inst.clip.aspect = cell.size[0];
+                inst.clip.exponent = cell.size[1];
                 inst.meta[3] |= FLAG_HAS_MASK << 24;
+                if let ClipMask::Cell(cell) = mask {
+                    inst.uv[2] = cell.atlas[0];
+                    inst.uv[3] = cell.atlas[1];
+                }
             }
         }
         inst
@@ -944,8 +1015,8 @@ impl<'a> Lowering<'a> {
     fn with_clip(
         &mut self,
         shape: Option<&ShapeData>,
-        mut body: impl FnMut(&mut Self, &mut GlyphContext<'_>) -> Result<(), RenderError>,
-        glyphs: &mut GlyphContext<'_>,
+        mut body: impl FnMut(&mut Self, &GlyphContext<'_>) -> Result<(), RenderError>,
+        glyphs: &GlyphContext<'_>,
     ) -> Result<(), RenderError> {
         let Some(shape_data) = shape else {
             return body(self, glyphs);
@@ -977,11 +1048,11 @@ impl<'a> Lowering<'a> {
     fn run_clipped(
         &mut self,
         clip: DeviceClip,
-        mut body: impl FnMut(&mut Self, &mut GlyphContext<'_>) -> Result<(), RenderError>,
-        glyphs: &mut GlyphContext<'_>,
+        mut body: impl FnMut(&mut Self, &GlyphContext<'_>) -> Result<(), RenderError>,
+        glyphs: &GlyphContext<'_>,
     ) -> Result<(), RenderError> {
         /// The merged axis-aligned rect clip for `cr ∩ dr`.
-        fn merged_rect(cr: Rect, dr: Rect, mask: Option<MaskCell>) -> DeviceClip {
+        fn merged_rect(cr: Rect, dr: Rect, mask: Option<ClipMask>) -> DeviceClip {
             let merged = cr.intersect(dr);
             let size = (merged.width().max(0.0), merged.height().max(0.0));
             let center = merged.center();
@@ -1057,7 +1128,7 @@ impl<'a> Lowering<'a> {
         &mut self,
         id: u64,
         layers: &HashMap<u64, LayerNode>,
-        glyphs: &mut GlyphContext<'_>,
+        glyphs: &GlyphContext<'_>,
     ) -> Result<(), RenderError> {
         let Some(node) = layers.get(&id) else {
             return Ok(());
@@ -1091,7 +1162,7 @@ impl<'a> Lowering<'a> {
         &mut self,
         node: &LayerNode,
         layers: &HashMap<u64, LayerNode>,
-        glyphs: &mut GlyphContext<'_>,
+        glyphs: &GlyphContext<'_>,
     ) -> Result<(), RenderError> {
         match &node.content {
             Some(ContentData::Picture(p) | ContentData::List(p)) => {
@@ -1111,7 +1182,7 @@ impl<'a> Lowering<'a> {
         list: &DisplayList,
         mut i: usize,
         end: usize,
-        glyphs: &mut GlyphContext<'_>,
+        glyphs: &GlyphContext<'_>,
     ) -> Result<(), RenderError> {
         let commands = list.commands();
         while i < end {
@@ -1192,7 +1263,7 @@ impl<'a> Lowering<'a> {
         &mut self,
         shape: &ShapeData,
         paint: &Paint,
-        glyphs: &mut GlyphContext<'_>,
+        glyphs: &GlyphContext<'_>,
     ) -> Result<(), RenderError> {
         if let ShapeData::Path { elements, rule } = shape {
             let content = path::hash_elements(elements, fill_tag(*rule));
@@ -1325,7 +1396,7 @@ impl<'a> Lowering<'a> {
         image: ImageId,
         dst: &Rect,
         sampling: cherenkov::Sampling,
-        glyphs: &mut GlyphContext<'_>,
+        glyphs: &GlyphContext<'_>,
     ) -> Result<(), RenderError> {
         let img = glyphs
             .images
@@ -1355,7 +1426,7 @@ impl<'a> Lowering<'a> {
         shape: &ShapeData,
         stroke: &kurbo::Stroke,
         paint: &Paint,
-        glyphs: &mut GlyphContext<'_>,
+        glyphs: &GlyphContext<'_>,
     ) -> Result<(), RenderError> {
         // Path strokes and dashed strokes rasterize the stroked outline.
         if matches!(shape, ShapeData::Path { .. }) || !stroke.dash_pattern.is_empty() {
@@ -1626,7 +1697,7 @@ impl<'a> Lowering<'a> {
         rule: FillRule,
         make: impl FnOnce() -> BezPath,
         paint: &Paint,
-        glyphs: &mut GlyphContext<'_>,
+        glyphs: &GlyphContext<'_>,
     ) -> Result<(), RenderError> {
         #[expect(
             clippy::cast_possible_truncation,
@@ -1635,42 +1706,67 @@ impl<'a> Lowering<'a> {
         )]
         let surface = (self.width as u32, self.height as u32);
         let pl = path::placement(content, self.transform, surface);
-        let stored = if let Some(emit) = glyphs.atlas.path(pl.key) {
-            emit.clone()
-        } else if let Some(emit) = glyphs.atlas.path(pl.key_exact) {
-            emit.clone()
-        } else {
+        let (stored, pending) = 'stored: {
+            if let Some(emit) = glyphs
+                .atlas
+                .path(pl.key)
+                .or_else(|| glyphs.atlas.path(pl.key_exact))
+            {
+                break 'stored (emit.clone(), None);
+            }
             let device = pl.raster * make();
             let (segments, bbox) = path::flatten_segments(&device, path::FLATTEN);
-            let (emit, clipped) = if let Some(coverage) = path::rasterize(
+            let Some(coverage) = path::rasterize(
                 &segments,
                 bbox,
                 (f64::from(self.width), f64::from(self.height)),
                 rule,
-            ) {
-                self.paths += 1;
-                (
-                    path::emit(&coverage, glyphs.atlas, glyphs.queue)?,
-                    coverage.clipped,
-                )
-            } else {
+            ) else {
                 // Missing the surface at this offset says nothing about
-                // other offsets: cache it only under the exact key.
-                (PathEmit::default(), true)
+                // other offsets: cache the empty emission only under the
+                // exact key.
+                let pending = u32::try_from(self.pending.len()).expect("pending count fits u32");
+                self.pending.push(PendingRaster::Path {
+                    key: pl.key_exact,
+                    emit: PathEmit::default(),
+                    cells: Vec::new(),
+                });
+                break 'stored (PathEmit::default(), Some(pending));
             };
+            self.paths += 1;
+            let (emit, cells) = path::emit(&coverage)?;
+            // Emission rects are relative to the placement offset; the
+            // stored record keeps that frame.
             let stored = emit.translated(-pl.offset.x, -pl.offset.y);
-            let key = if clipped { pl.key_exact } else { pl.key };
-            glyphs.atlas.insert_path(key, stored.clone());
-            stored
+            let key = if coverage.clipped {
+                pl.key_exact
+            } else {
+                pl.key
+            };
+            let pending = u32::try_from(self.pending.len()).expect("pending count fits u32");
+            self.pending.push(PendingRaster::Path {
+                key,
+                emit: stored.clone(),
+                cells,
+            });
+            (stored, Some(pending))
         };
-        self.replay(&stored, pl.offset, paint, glyphs)
+        self.replay(&stored, pending, pl.offset, paint, glyphs)
     }
 
     /// Replays a cached path emission: `KIND_SPAN` runs and `KIND_GLYPH`
     /// cells at `offset` from their stored rects, painted like glyphs.
+    /// `pending` indexes `GlyphContext::pending` when the emission's
+    /// cells still lack atlas origins — each cell's `uv.xy` is patched
+    /// when the render thread stores it.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a surface emits far fewer than u32::MAX instances or cells"
+    )]
     fn replay(
         &mut self,
         emit: &PathEmit,
+        pending: Option<u32>,
         offset: Vec2,
         paint: &Paint,
         glyphs: &GlyphContext<'_>,
@@ -1698,7 +1794,7 @@ impl<'a> Lowering<'a> {
             inst.meta[3] |= paint.packed & 0x00ff_ffff;
             self.push_instance(&inst);
         }
-        for cell in &emit.cells {
+        for (i, cell) in emit.cells.iter().enumerate() {
             let mut inst = self.base(KIND_GLYPH, affine(self.transform));
             inst.bounds = [
                 f32_f64(f64::from(cell.rect[0]) + offset.x),
@@ -1714,6 +1810,10 @@ impl<'a> Lowering<'a> {
             inst.meta[2] = paint.first_stop;
             inst.meta[3] |= paint.packed & 0x00ff_ffff;
             self.push_instance(&inst);
+            if let Some(pending) = pending {
+                self.cell_patches
+                    .push((self.frame.instances.len() as u32 - 1, pending, i as u32));
+            }
         }
         Ok(())
     }
@@ -1728,18 +1828,19 @@ impl<'a> Lowering<'a> {
         &mut self,
         elements: &[PathEl],
         rule: FillRule,
-        body: impl FnMut(&mut Self, &mut GlyphContext<'_>) -> Result<(), RenderError>,
-        glyphs: &mut GlyphContext<'_>,
+        body: impl FnMut(&mut Self, &GlyphContext<'_>) -> Result<(), RenderError>,
+        glyphs: &GlyphContext<'_>,
     ) -> Result<(), RenderError> {
         let surface = (self.width as u32, self.height as u32);
         let pl = path::placement(path::hash_elements(elements, 2), self.transform, surface);
-        let stored = if let Some(mask) = glyphs
-            .atlas
-            .mask(pl.key)
-            .or_else(|| glyphs.atlas.mask(pl.key_exact))
-        {
-            *mask
-        } else {
+        let stored = 'stored: {
+            if let Some(mask) = glyphs
+                .atlas
+                .mask(pl.key)
+                .or_else(|| glyphs.atlas.mask(pl.key_exact))
+            {
+                break 'stored ClipMask::Cell(*mask);
+            }
             let device = pl.raster * BezPath::from_vec(elements.to_vec());
             let (segments, bbox) = path::flatten_segments(&device, path::FLATTEN);
             let Some(coverage) = path::rasterize(
@@ -1755,24 +1856,29 @@ impl<'a> Lowering<'a> {
             let (Ok(w), Ok(h)) = (u32::try_from(coverage.w), u32::try_from(coverage.h)) else {
                 return Err(Unsupported::PathClipTooLarge.into());
             };
-            if !glyphs.atlas.can_ever_fit(w, h) {
-                return Err(Unsupported::PathClipTooLarge.into());
-            }
-            let Some((cx, cy)) = glyphs.atlas.alloc(w, h) else {
-                return Err(RenderError::AtlasFull);
-            };
             let texels: Vec<u8> = coverage
                 .data
                 .iter()
                 .map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8)
                 .collect();
-            glyphs.atlas.write(glyphs.queue, cx, cy, w, h, &texels);
+            let key = if coverage.clipped {
+                pl.key_exact
+            } else {
+                pl.key
+            };
+            if let Some(mask) = glyphs.atlas.mask(key) {
+                break 'stored ClipMask::Cell(*mask);
+            }
+            if !glyphs.atlas.can_ever_fit(w, h) {
+                return Err(Unsupported::PathClipTooLarge.into());
+            }
             let mask = MaskCell {
                 device: [
                     f32_f64(coverage.x - pl.offset.x),
                     f32_f64(coverage.y - pl.offset.y),
                 ],
-                atlas: [cx as f32, cy as f32],
+                // Filled by `Atlas::store_mask` on the render thread.
+                atlas: [0.0, 0.0],
                 size: [w as f32, h as f32],
                 rect: [
                     f32_f64(coverage.x - pl.offset.x),
@@ -1781,18 +1887,19 @@ impl<'a> Lowering<'a> {
                     f32_f64(coverage.y + f64::from(h) - pl.offset.y),
                 ],
             };
-            glyphs.atlas.insert_mask(
-                if coverage.clipped {
-                    pl.key_exact
-                } else {
-                    pl.key
-                },
+            let pending = u32::try_from(self.pending.len()).expect("pending count fits u32");
+            self.pending.push(PendingRaster::Mask {
+                key,
                 mask,
-            );
-            mask
+                w,
+                h,
+                texels,
+            });
+            ClipMask::Pending(mask, pending)
         };
         // Stored mask rects are relative to the placement offset.
-        let mask = stored.translated(pl.offset.x, pl.offset.y);
+        let stored = stored.translated(pl.offset.x, pl.offset.y);
+        let mask = stored.cell();
         let rect = Rect::new(
             f64::from(mask.rect[0]),
             f64::from(mask.rect[1]),
@@ -1804,7 +1911,7 @@ impl<'a> Lowering<'a> {
             inv: Affine::translate(Vec2::new(-center.x, -center.y)),
             shape: Shape::rect([f32_f64(rect.width() / 2.0), f32_f64(rect.height() / 2.0)]),
             aligned_rect: Some(rect),
-            mask: Some(mask),
+            mask: Some(stored),
         };
         self.run_clipped(clip, body, glyphs)
     }
@@ -1815,7 +1922,7 @@ impl<'a> Lowering<'a> {
         &mut self,
         run: &GlyphRun,
         paint: &Paint,
-        glyphs: &mut GlyphContext<'_>,
+        glyphs: &GlyphContext<'_>,
     ) -> Result<(), RenderError> {
         if matches!(run.style, GlyphStyle::Stroke(_)) {
             return Err(Unsupported::GlyphStroke.into());
@@ -1853,8 +1960,14 @@ impl<'a> Lowering<'a> {
                 if *upem <= 0.0 {
                     return Err(RenderError::Font("zero units_per_em".into()));
                 }
-                let picture =
-                    crate::render::colr::glyph_picture(font, glyph.id, &run.coords, paint)?;
+                let picture = colr::glyph_picture(
+                    font,
+                    run.font.raw(),
+                    glyph.id,
+                    &run.coords,
+                    paint,
+                    &mut self.pending,
+                )?;
                 // `translate(x, y) * scale_non_uniform(size/upem, -size/upem)`
                 // places the font-space picture at the glyph's origin.
                 let s = f64::from(run.size) / upem;
@@ -1874,22 +1987,18 @@ impl<'a> Lowering<'a> {
             let fx = ((o.x - ix) * 4.0).floor() / 4.0;
             let fy = ((o.y - iy) * 4.0).floor() / 4.0;
             let key = glyph_key(run, glyph.id, (f32_f64(fx), f32_f64(fy)), self.transform);
-            let entry = if let Some(entry) = glyphs.atlas.get(&key) {
-                entry
-            } else {
-                self.glyphs += 1;
-                rasterize(
-                    glyphs.queue,
-                    glyphs.atlas,
-                    font,
-                    key,
-                    glyph.id,
-                    run.size,
-                    (f32_f64(fx), f32_f64(fy)),
-                    self.transform,
-                    &run.coords,
-                )?
-            };
+            let (entry, pending) = glyph::entry(
+                glyphs.atlas,
+                font,
+                key,
+                glyph.id,
+                run.size,
+                (f32_f64(fx), f32_f64(fy)),
+                self.transform,
+                &run.coords,
+                &mut self.pending,
+            )?;
+            self.glyphs += u32::from(pending.is_some());
             if entry.w == 0 || entry.h == 0 {
                 continue;
             }
@@ -1912,6 +2021,11 @@ impl<'a> Lowering<'a> {
             inst.meta[2] = paint_data.first_stop;
             inst.meta[3] |= paint_data.packed & 0x00ff_ffff;
             self.push_instance(&inst);
+            if let Some(pending) = pending {
+                let inst =
+                    u32::try_from(self.frame.instances.len() - 1).expect("instance count fits u32");
+                self.cell_patches.push((inst, pending, 0));
+            }
         }
         Ok(())
     }
@@ -2070,17 +2184,16 @@ mod tests {
     /// the rim texels.
     #[test]
     fn a_composite_is_a_full_coverage_span() {
-        let Some((device, queue)) = device_and_queue() else {
+        let Some((device, _queue)) = device_and_queue() else {
             return;
         };
-        let mut atlas = Atlas::new(&device, u64::MAX);
+        let atlas = Atlas::new(&device, u64::MAX);
         let fonts = HashMap::new();
         let images = HashMap::new();
         let mut frame = Frame::default();
         let mut lowering = Lowering::new(&mut frame, (64, 64));
-        let mut glyphs = GlyphContext {
-            atlas: &mut atlas,
-            queue: &queue,
+        let glyphs = GlyphContext {
+            atlas: &atlas,
             fonts: &fonts,
             images: &images,
         };
@@ -2103,7 +2216,7 @@ mod tests {
                         g,
                     )
                 },
-                &mut glyphs,
+                &glyphs,
             )
             .expect("isolate");
         let composite = frame

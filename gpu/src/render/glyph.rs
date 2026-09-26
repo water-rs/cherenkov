@@ -30,8 +30,21 @@ pub struct FontData {
     pub index: u32,
     /// Built font-space `COLRv1` pictures, per `(glyph id, coords hash,
     /// paint hash)` — content is size-independent, so it is keyed without
-    /// the placement.
+    /// the placement. Interior mutability, not shared: parallel lowering
+    /// works on a per-thread [`Self::snapshot`].
     pub colr: std::cell::RefCell<HashMap<(u32, u64, u64), cherenkov::Picture>>,
+}
+
+impl FontData {
+    /// A per-thread copy: shares the font bytes, clones the COLR cache.
+    /// Workers each own one so `colr` can stay a plain `RefCell`.
+    pub fn snapshot(&self) -> Self {
+        Self {
+            data: self.data.clone(),
+            index: self.index,
+            colr: std::cell::RefCell::new(self.colr.borrow().clone()),
+        }
+    }
 }
 
 /// A glyph cache key.
@@ -52,7 +65,7 @@ pub struct GlyphKey {
 }
 
 /// An atlas cell.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Entry {
     /// Texel origin.
     pub x: u16,
@@ -345,6 +358,117 @@ impl Atlas {
         w + 2 * PAD <= self.cap && (h + 2 * PAD).div_ceil(8) * 8 <= self.cap
     }
 
+    /// Stores a rasterized glyph cell under `key`, uploading its texels.
+    /// The caller's `x`/`y` patch targets the returned origin. `None`
+    /// when the atlas is full; the caller grows/clears and retries.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the pending raster record's fields, passed through"
+    )]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "atlas cells fit u16: the atlas is at most 64kpx per axis"
+    )]
+    pub fn store_glyph(
+        &mut self,
+        queue: &wgpu::Queue,
+        key: GlyphKey,
+        left: i32,
+        top: i32,
+        w: u32,
+        h: u32,
+        texels: &[u8],
+    ) -> Option<(u32, u32)> {
+        if let Some(entry) = self.get(&key) {
+            return Some((u32::from(entry.x), u32::from(entry.y)));
+        }
+        if w == 0 {
+            self.map.insert(key, Entry::default());
+            return Some((0, 0));
+        }
+        let (cx, cy) = self.alloc(w, h)?;
+        self.write(queue, cx, cy, w, h, texels);
+        self.cpu_bytes += u64::from(w) * u64::from(h);
+        let entry = Entry {
+            x: cx as u16,
+            y: cy as u16,
+            w: w as u16,
+            h: h as u16,
+            left,
+            top,
+        };
+        self.map.insert(key, entry);
+        Some((cx, cy))
+    }
+
+    /// Stores a path emission, allocating each cell and uploading its
+    /// texels in emission order. `None` when the atlas is full; `emit`
+    /// is only inserted once every cell allocated.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "atlas cells fit u16: the atlas is at most 64kpx per axis"
+    )]
+    pub fn store_path(
+        &mut self,
+        queue: &wgpu::Queue,
+        key: u64,
+        emit: PathEmit,
+        cells: &[CellTexels],
+    ) -> Option<()> {
+        if self.paths.contains_key(&key) {
+            return Some(());
+        }
+        let mut emit = emit;
+        for (cell, (w, h, texels)) in emit.cells.iter_mut().zip(cells) {
+            let (cx, cy) = self.alloc(*w, *h)?;
+            self.write(queue, cx, cy, *w, *h, texels);
+            cell.x = cx as u16;
+            cell.y = cy as u16;
+        }
+        self.insert_path(key, emit);
+        Some(())
+    }
+
+    /// Stores a path-clip mask, setting `mask.atlas` to the cell origin.
+    /// `None` when the atlas is full.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "atlas coords are well within f32"
+    )]
+    pub fn store_mask(
+        &mut self,
+        queue: &wgpu::Queue,
+        key: u64,
+        mut mask: MaskCell,
+        w: u32,
+        h: u32,
+        texels: &[u8],
+    ) -> Option<()> {
+        if self.masks.contains_key(&key) {
+            return Some(());
+        }
+        let (cx, cy) = self.alloc(w, h)?;
+        self.write(queue, cx, cy, w, h, texels);
+        mask.atlas = [cx as f32, cy as f32];
+        self.insert_mask(key, mask);
+        Some(())
+    }
+
+    /// Every cell origin of the cached emission for `key`, in order.
+    pub fn path_origins(&self, key: u64) -> Option<Vec<(u32, u32)>> {
+        self.paths.get(&key).map(|e| {
+            e.cells
+                .iter()
+                .map(|c| (u32::from(c.x), u32::from(c.y)))
+                .collect()
+        })
+    }
+
+    /// The atlas origin of the cached mask for `key`.
+    pub fn mask_origin(&self, key: u64) -> Option<[f32; 2]> {
+        self.masks.get(&key).map(|m| m.atlas)
+    }
+
     /// Doubles the atlas up to the cap, dropping every cached entry.
     pub fn grow(&mut self, device: &wgpu::Device) {
         let size = (self.size * 2).min(self.cap);
@@ -418,19 +542,98 @@ impl OutlinePen for PathPen {
     }
 }
 
-/// Rasterizes one glyph into the atlas and returns its entry, uploading the
-/// coverage texels through `queue`.
-///
-/// Returns [`RenderError::AtlasFull`] when the glyph's cell does not fit.
-#[expect(clippy::too_many_arguments)]
-#[expect(clippy::too_many_lines)]
-#[expect(clippy::many_single_char_names)]
-#[expect(clippy::cast_possible_truncation)]
-#[expect(clippy::cast_sign_loss)]
-#[expect(clippy::cast_precision_loss)]
-pub fn rasterize(
-    queue: &wgpu::Queue,
-    atlas: &mut Atlas,
+/// A glyph's coverage texels, not yet in the atlas.
+struct CellRaster {
+    /// Bearing: cell's left edge relative to the glyph's snapped origin.
+    left: i32,
+    /// Bearing: cell's top edge relative to the snapped origin.
+    top: i32,
+    /// Cell width.
+    w: u32,
+    /// Cell height.
+    h: u32,
+    /// `w` × `h` coverage texels.
+    texels: Vec<u8>,
+}
+
+/// One path cell's raster pending its atlas origin: `(w, h, texels)`.
+pub type CellTexels = (u32, u32, Vec<u8>);
+
+/// Work deferred to the render thread by a parallel lowering: every
+/// atlas write and COLR cache update a surface wanted, in lowering
+/// order, with the bitmaps already rasterized from immutable font data.
+/// The render thread applies the batches serially, in dirty-surface
+/// order, so the atlas ends in exactly the state serial lowering would
+/// produce.
+pub enum PendingRaster {
+    /// A glyph coverage cell, keyed by `GlyphKey`. `w`/`h` are `0` for
+    /// glyphs with no outline: they still must be stored so the miss is
+    /// not retried every frame.
+    Glyph {
+        /// The cache key.
+        key: GlyphKey,
+        /// Bearing: the cell's left edge relative to the snapped origin.
+        left: i32,
+        /// Bearing: the cell's top edge relative to the snapped origin.
+        top: i32,
+        /// Cell width.
+        w: u32,
+        /// Cell height.
+        h: u32,
+        /// `w` × `h` coverage texels.
+        texels: Vec<u8>,
+    },
+    /// A path emission whose cells were rasterized cell by cell; each
+    /// entry of `cells` pairs one `(w, h, texels)` with the cell in
+    /// `emit` at the same index.
+    Path {
+        /// The content-hash key.
+        key: u64,
+        /// Spans and cells; each cell's `x`/`y` is set when it is
+        /// stored.
+        emit: PathEmit,
+        /// Per-cell `(width, height, texels)` in emission order.
+        cells: Vec<CellTexels>,
+    },
+    /// A path-clip mask; `mask.atlas` is set when it is stored.
+    Mask {
+        /// The content-hash key.
+        key: u64,
+        /// The mask, pending its atlas origin.
+        mask: MaskCell,
+        /// Cell width.
+        w: u32,
+        /// Cell height.
+        h: u32,
+        /// `w` × `h` coverage texels.
+        texels: Vec<u8>,
+    },
+    /// A built COLR picture for one registered font.
+    Colr {
+        /// `Renderer::fonts` key of the font that produced it.
+        font: u64,
+        /// The `(glyph id, coords hash, paint hash)` cache key.
+        key: (u32, u64, u64),
+        /// The built picture.
+        picture: cherenkov::Picture,
+    },
+}
+
+/// The glyph's atlas cell. On a cache hit the entry is returned with
+/// `None`; on a miss the cell is rasterized and queued in `pending` as
+/// [`PendingRaster::Glyph`], and the returned entry's `x`/`y` stay zero
+/// until the render thread stores the cell — the caller records an
+/// instance patch against the pending index.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors glyph_key's inputs; grouping them would only rename the bundle"
+)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "pending lists are tiny: u32 indexes them fine"
+)]
+pub fn entry(
+    atlas: &Atlas,
     font: &FontData,
     key: GlyphKey,
     glyph_id: u32,
@@ -438,7 +641,57 @@ pub fn rasterize(
     subpixel: (f32, f32),
     transform: Affine,
     coords: &[i16],
-) -> Result<Entry, RenderError> {
+    pending: &mut Vec<PendingRaster>,
+) -> Result<(Entry, Option<u32>), RenderError> {
+    if let Some(entry) = atlas.get(&key) {
+        return Ok((entry, None));
+    }
+    let cell = rasterize_texels(font, glyph_id, size, subpixel, transform, coords)?;
+    let (left, top, w, h, texels) = cell.map_or((0, 0, 0, 0, Vec::new()), |c| {
+        (c.left, c.top, c.w, c.h, c.texels)
+    });
+    let idx = pending.len() as u32;
+    pending.push(PendingRaster::Glyph {
+        key,
+        left,
+        top,
+        w,
+        h,
+        texels,
+    });
+    Ok((
+        Entry {
+            x: 0,
+            y: 0,
+            w: w as u16,
+            h: h as u16,
+            left,
+            top,
+        },
+        Some(idx),
+    ))
+}
+
+/// Rasterizes the glyph's outline into coverage texels — pure CPU work
+/// that touches no atlas state. `None` for glyphs with no outline.
+#[expect(
+    clippy::many_single_char_names,
+    reason = "matrix coefficient names follow the Affine convention"
+)]
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    reason = "coverage math runs in f64; cells, bearings and segments are bounded by the atlas size"
+)]
+fn rasterize_texels(
+    font: &FontData,
+    glyph_id: u32,
+    size: f32,
+    subpixel: (f32, f32),
+    transform: Affine,
+    coords: &[i16],
+) -> Result<Option<CellRaster>, RenderError> {
     let font_ref = skrifa::FontRef::from_index(&font.data, font.index)
         .map_err(|e| RenderError::Font(format!("{e}")))?;
     let upem = font_ref
@@ -447,9 +700,7 @@ pub fn rasterize(
         .units_per_em();
     let outlines = font_ref.outline_glyphs();
     let Some(outline) = outlines.get(skrifa::GlyphId::new(glyph_id)) else {
-        let entry = Entry::default();
-        atlas.map.insert(key, entry);
-        return Ok(entry);
+        return Ok(None);
     };
     let location: Vec<F2Dot14> = coords.iter().map(|c| F2Dot14::from_bits(*c)).collect();
     let mut pen = PathPen {
@@ -460,14 +711,10 @@ pub fn rasterize(
         skrifa::instance::LocationRef::new(&location),
     );
     if outline.draw(settings, &mut pen).is_err() {
-        let entry = Entry::default();
-        atlas.map.insert(key, entry);
-        return Ok(entry);
+        return Ok(None);
     }
     if pen.path.is_empty() {
-        let entry = Entry::default();
-        atlas.map.insert(key, entry);
-        return Ok(entry);
+        return Ok(None);
     }
     // Font units to device pixels: y flips, scale is size per em, then the
     // run's transform's linear part.
@@ -514,9 +761,7 @@ pub fn rasterize(
     });
     line(last, start);
     if segments.is_empty() || bbox.width() <= 0.0 || bbox.height() <= 0.0 {
-        let entry = Entry::default();
-        atlas.map.insert(key, entry);
-        return Ok(entry);
+        return Ok(None);
     }
     let left = bbox.x0.floor() as i32 - 1;
     let top = bbox.y0.floor() as i32 - 1;
@@ -524,9 +769,6 @@ pub fn rasterize(
     let bottom = bbox.y1.ceil() as i32 + 1;
     let w = (right - left) as u32;
     let h = (bottom - top) as u32;
-    let Some((cx, cy)) = atlas.alloc(w, h) else {
-        return Err(RenderError::AtlasFull);
-    };
     // Rasterize in cell space.
     let mut raster = Raster::new(w as usize, h as usize);
     let ox = left as f32;
@@ -539,18 +781,13 @@ pub fn rasterize(
         .iter()
         .map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8)
         .collect();
-    atlas.write(queue, cx, cy, w, h, &texels);
-    atlas.cpu_bytes += u64::from(w) * u64::from(h);
-    let entry = Entry {
-        x: cx as u16,
-        y: cy as u16,
-        w: w as u16,
-        h: h as u16,
+    Ok(Some(CellRaster {
         left,
         top,
-    };
-    atlas.map.insert(key, entry);
-    Ok(entry)
+        w,
+        h,
+        texels,
+    }))
 }
 
 /// The cache key for a glyph at a quantized device position.
@@ -584,5 +821,148 @@ pub fn glyph_key(
 impl Atlas {
     pub fn get(&self, key: &GlyphKey) -> Option<Entry> {
         self.map.get(key).copied()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// An adapter plus device, or `None` where no GPU exists.
+    fn device_and_queue() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::all(),
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let adapter = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()))
+            .into_iter()
+            .next()?;
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()
+    }
+
+    /// Two parallel lowerings that both miss the same glyphs produce the
+    /// same atlas as serial lowering: pending rasters commit in
+    /// dirty-surface order and a duplicated key resolves to the first
+    /// surface's cell.
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the serial reference and the parallel run share the helpers but need both sequences"
+    )]
+    fn pending_apply_matches_serial_atlas() {
+        /// Lower `keys` against `atlas`, collecting the pending rasters.
+        fn lower(atlas: &Atlas, font: &FontData, keys: &[GlyphKey]) -> Vec<PendingRaster> {
+            let mut pending = Vec::new();
+            for &k in keys {
+                entry(
+                    atlas,
+                    font,
+                    k,
+                    k.glyph,
+                    16.0,
+                    (0.0, 0.0),
+                    Affine::IDENTITY,
+                    &[],
+                    &mut pending,
+                )
+                .expect("entry");
+            }
+            pending
+        }
+        /// Commit one pending list, the way `apply_raster` does.
+        fn apply(atlas: &mut Atlas, queue: &wgpu::Queue, pending: Vec<PendingRaster>) {
+            for raster in pending {
+                let PendingRaster::Glyph {
+                    key,
+                    left,
+                    top,
+                    w,
+                    h,
+                    texels,
+                } = raster
+                else {
+                    unreachable!("glyph pending only")
+                };
+                assert!(
+                    atlas
+                        .store_glyph(queue, key, left, top, w, h, &texels)
+                        .is_some()
+                );
+            }
+        }
+        let Some((device, queue)) = device_and_queue() else {
+            return;
+        };
+        let font = FontData {
+            data: include_bytes!("../../../scenes/fonts/NotoSans.ttf")
+                .as_slice()
+                .into(),
+            index: 0,
+            colr: std::cell::RefCell::new(HashMap::new()),
+        };
+        let key = |glyph: u32| GlyphKey {
+            font: 7,
+            glyph,
+            size_bits: (16.0f32 * 64.0).to_bits(),
+            subpixel: 0,
+            matrix: [
+                1.0f32.to_bits(),
+                0.0f32.to_bits(),
+                0.0f32.to_bits(),
+                1.0f32.to_bits(),
+            ],
+            coords_hash: 0,
+        };
+        // Surface A draws glyphs {1, 2, 3}; surface B overlaps on {2, 3, 4}.
+        let surfaces = [[key(1), key(2), key(3)], [key(2), key(3), key(4)]];
+        // Serial reference: each surface's pending commits before the next
+        // lowers, so its lookups hit the earlier surface's cells.
+        let mut serial = Atlas::new(&device, u64::MAX);
+        for keys in &surfaces {
+            let pending = lower(&serial, &font, keys);
+            apply(&mut serial, &queue, pending);
+        }
+        // Parallel: both lowerings read the same empty atlas, so every
+        // miss becomes a pending raster — duplicates included — then the
+        // render thread commits them in dirty-surface order.
+        let mut parallel = Atlas::new(&device, u64::MAX);
+        let batches: Vec<_> = surfaces
+            .iter()
+            .map(|keys| lower(&parallel, &font, keys))
+            .collect();
+        for pending in batches {
+            apply(&mut parallel, &queue, pending);
+        }
+        for keys in &surfaces {
+            for &k in keys {
+                assert_eq!(
+                    serial.get(&k),
+                    parallel.get(&k),
+                    "glyph {}'s cell differs",
+                    k.glyph
+                );
+            }
+        }
+        // A pending mask dedupes the same way.
+        let mask = MaskCell {
+            device: [0.0, 0.0],
+            atlas: [0.0, 0.0],
+            size: [2.0, 2.0],
+            rect: [0.0, 0.0, 2.0, 2.0],
+        };
+        assert!(
+            parallel
+                .store_mask(&queue, 0xdead, mask, 2, 2, &[255u8; 4])
+                .is_some()
+        );
+        let stored = parallel.mask_origin(0xdead).expect("stored");
+        assert!(
+            parallel
+                .store_mask(&queue, 0xdead, mask, 2, 2, &[0u8; 4])
+                .is_some(),
+            "duplicate mask resolves to the stored cell"
+        );
+        assert_eq!(parallel.mask_origin(0xdead), Some(stored));
     }
 }

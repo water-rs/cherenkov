@@ -210,7 +210,14 @@ impl SurfaceState {
                 _ => None,
             })
             .sum();
-        surface_bytes + scratch_bytes + backdrop_bytes + content_bytes
+        let shader_bytes: u64 = self
+            .shader_textures
+            .values()
+            .map(|texture| {
+                u64::from(texture.image.width) * u64::from(texture.image.height) * 8 + 272
+            })
+            .sum();
+        surface_bytes + scratch_bytes + backdrop_bytes + content_bytes + shader_bytes
     }
 }
 

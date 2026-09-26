@@ -1506,12 +1506,22 @@ impl<'a> Lowering<'a> {
         )]
         let surface = (self.width as u32, self.height as u32);
         let pl = path::placement(content, self.transform, surface);
+        // Shader coordinates belong to the complete shape, including the
+        // part outside the viewport. Coverage-cache bounds are clipped.
+        let mut make = Some(make);
+        let shader_path = matches!(paint, Paint::Shader(_))
+            .then(|| make.take().expect("outline factory available")());
+        let paint_bounds = shader_path
+            .as_ref()
+            .map_or(Rect::ZERO, kurbo::Shape::bounding_box);
         let stored = if let Some(emit) = glyphs.atlas.path(pl.key) {
             emit.clone()
         } else if let Some(emit) = glyphs.atlas.path(pl.key_exact) {
             emit.clone()
         } else {
-            let device = pl.raster * make();
+            let outline =
+                shader_path.unwrap_or_else(|| make.take().expect("outline factory available")());
+            let device = pl.raster * outline;
             let (segments, bbox) = path::flatten_segments(&device, path::FLATTEN);
             let (emit, clipped) = if let Some(coverage) = path::rasterize(
                 &segments,
@@ -1534,7 +1544,7 @@ impl<'a> Lowering<'a> {
             glyphs.atlas.insert_path(key, stored.clone());
             stored
         };
-        self.replay(&stored, pl.offset, paint, glyphs)
+        self.replay(&stored, pl.offset, paint, paint_bounds, glyphs)
     }
 
     /// Replays a cached path emission: `KIND_SPAN` runs and `KIND_GLYPH`
@@ -1544,30 +1554,16 @@ impl<'a> Lowering<'a> {
         emit: &PathEmit,
         offset: Vec2,
         paint: &Paint,
+        paint_bounds: Rect,
         glyphs: &GlyphContext<'_>,
     ) -> Result<(), Encode> {
-        let bounds = emit
-            .spans
-            .iter()
-            .copied()
-            .chain(emit.cells.iter().map(|cell| cell.rect))
-            .map(|rect| {
-                Rect::new(
-                    f64::from(rect[0]) + offset.x,
-                    f64::from(rect[1]) + offset.y,
-                    f64::from(rect[2]) + offset.x,
-                    f64::from(rect[3]) + offset.y,
-                )
-            })
-            .reduce(|bounds, rect| bounds.union(rect))
-            .unwrap_or(Rect::ZERO);
         let paint = paint_data(
             paint,
             Affine::IDENTITY,
             &mut self.frame.stops,
             glyphs.images,
             &mut self.frame.shaders,
-            self.transform.inverse().transform_rect_bbox(bounds),
+            paint_bounds,
             self.transform,
         )?;
         self.set_image(paint.image);

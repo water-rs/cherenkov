@@ -125,7 +125,7 @@ jobs:
       - name: Clippy / all adapter features together
         run: |
           cargo clippy --locked -p cherenkov-bench --all-targets \
-            --features vello-classic,vello-hybrid,vello-cpu,skia -- -D warnings
+            --features vello-classic,vello-hybrid,vello-cpu,skia,cherenkov -- -D warnings
       - uses: taiki-e/install-action@cargo-hack
       # `skia-metal` is Apple-only; every other adapter must lint alone.
       - name: Clippy / each adapter feature alone
@@ -168,8 +168,17 @@ jobs:
       - name: Clippy / Metal adapter features
         run: |
           cargo clippy --locked -p cherenkov-bench --all-targets \
-            --features skia-metal,vello-classic,vello-hybrid -- -D warnings
-      - run: cargo build --locked --release -p cherenkov-bench --features skia-metal,vello-classic,vello-hybrid
+            --features skia-metal,vello-classic,vello-hybrid,cherenkov -- -D warnings
+      - run: cargo build --locked --release -p cherenkov-bench --features skia-metal,vello-classic,vello-hybrid,cherenkov
+      # Many timed frames of the map scene on a Metal device: the workload
+      # that used to hang the render thread on Apple GPUs.
+      - name: Measure the map scene on Metal
+        run: |
+          set -euo pipefail
+          mkdir -p out/map-only
+          cp -R scenes/perf/map out/map-only/map
+          RUST_LOG=info,cherenkov_gpu=debug ./target/release/cherenkov-bench measure \
+            --engine cherenkov --corpus out/map-only --frames 20 --warmup 5 --out out/measure-metal
       - name: Render the corpus on Metal adapters
         run: |
           set -euo pipefail
@@ -214,5 +223,5 @@ jobs:
         run: |
           cargo ndk --target aarch64-linux-android --platform 30 \
             build --release -p cherenkov-bench \
-            --features vello-classic,vello-hybrid,skia
+            --features vello-classic,vello-hybrid,skia,cherenkov
           ls -l target/aarch64-linux-android/release/cherenkov-bench

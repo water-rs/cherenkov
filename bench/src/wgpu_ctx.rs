@@ -122,6 +122,9 @@ impl Gpu {
         let (device, queue) = pollster::block_on(adapter.request_device(&DeviceDescriptor {
             label: Some("cherenkov-bench"),
             required_features: required,
+            // Clamp the portable defaults to what the adapter reports:
+            // iOS Metal offers 15 inter-stage varyings (60 components)
+            // where `Limits::default` asks for 16.
             required_limits: wgpu::Limits::default().or_worse_values_from(&adapter.limits()),
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
             memory_hints: MemoryHints::Performance,

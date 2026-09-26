@@ -31,6 +31,8 @@
 //! `null` — it is never estimated.
 
 pub mod affinity;
+#[cfg(feature = "cherenkov")]
+pub mod cherenkov_ad;
 pub mod conditions;
 pub mod convert;
 pub mod energy;
@@ -167,6 +169,30 @@ pub struct DeviceInfo {
     pub thermal_celsius: Option<f64>,
 }
 
+/// One timed render pass of a submitted frame.
+#[derive(Clone, Debug, Serialize)]
+pub struct PassSample {
+    /// The pass's name (`"surface"`, `"scratch{n}"`, ...).
+    pub name: String,
+    /// Target width in pixels.
+    pub width: u32,
+    /// Target height in pixels.
+    pub height: u32,
+    /// Target texture format (`"rgba16float"`, `"rgba8unorm"`, ...).
+    pub format: String,
+    /// GPU seconds the pass took.
+    pub gpu_seconds: f64,
+}
+
+/// One render-thread CPU phase of a submitted frame.
+#[derive(Clone, Debug, Serialize)]
+pub struct PhaseSample {
+    /// The phase's name (`"lower"`, `"encode"`, `"stamp"`, `"wait"`).
+    pub name: String,
+    /// Wall-clock seconds the render thread spent in it.
+    pub seconds: f64,
+}
+
 /// The result of [`Engine::submit`].
 pub struct Submit {
     /// The rendered image in the working space, when readback was
@@ -175,6 +201,12 @@ pub struct Submit {
     /// GPU seconds measured via real GPU timestamps; `None` when the
     /// backend exposes none. Never estimated.
     pub gpu_seconds: Option<f64>,
+    /// Per-pass GPU timings, in submission order; empty when the backend
+    /// exposes none.
+    pub passes: Vec<PassSample>,
+    /// Per-phase render-thread CPU timings, in render order; empty when
+    /// the adapter exposes none.
+    pub phases: Vec<PhaseSample>,
 }
 
 /// Resources an adapter needs to encode one scene.
@@ -243,6 +275,8 @@ pub fn engine_names() -> Vec<&'static str> {
         skia_ad::SkiaVk::NAME,
         #[cfg(all(feature = "skia-metal", target_vendor = "apple"))]
         skia_ad::SkiaMtl::NAME,
+        #[cfg(feature = "cherenkov")]
+        cherenkov_ad::Cherenkov::NAME,
         #[cfg(feature = "cherenkov-vello")]
         cherenkov_vello_ad::CherenkovVello::NAME,
     ]
@@ -271,6 +305,10 @@ pub fn create_engine(name: &str) -> Result<Box<dyn Engine>, BenchError> {
         skia_ad::SkiaVk::NAME => skia_ad::SkiaVk::new().map(|e| Box::new(e) as Box<dyn Engine>),
         #[cfg(all(feature = "skia-metal", target_vendor = "apple"))]
         skia_ad::SkiaMtl::NAME => skia_ad::SkiaMtl::new().map(|e| Box::new(e) as Box<dyn Engine>),
+        #[cfg(feature = "cherenkov")]
+        cherenkov_ad::Cherenkov::NAME => {
+            cherenkov_ad::Cherenkov::new().map(|e| Box::new(e) as Box<dyn Engine>)
+        }
         #[cfg(feature = "cherenkov-vello")]
         cherenkov_vello_ad::CherenkovVello::NAME => {
             cherenkov_vello_ad::CherenkovVello::new().map(|e| Box::new(e) as Box<dyn Engine>)

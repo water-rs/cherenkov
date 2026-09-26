@@ -262,6 +262,8 @@ impl Engine for VelloCpu {
         Ok(Submit {
             image,
             gpu_seconds: None,
+            passes: Vec::new(),
+            phases: Vec::new(),
         })
     }
 

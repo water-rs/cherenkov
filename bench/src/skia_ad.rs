@@ -905,6 +905,8 @@ impl Engine for SkiaCpu {
         Ok(Submit {
             image,
             gpu_seconds: None,
+            passes: Vec::new(),
+            phases: Vec::new(),
         })
     }
 
@@ -1283,7 +1285,12 @@ impl Engine for SkiaVk {
         } else {
             None
         };
-        Ok(Submit { image, gpu_seconds })
+        Ok(Submit {
+            image,
+            gpu_seconds,
+            passes: Vec::new(),
+            phases: Vec::new(),
+        })
     }
 
     fn counters(&self) -> Counters {
@@ -1578,7 +1585,12 @@ mod graphite_metal {
             } else {
                 None
             };
-            Ok(Submit { image, gpu_seconds })
+            Ok(Submit {
+                image,
+                gpu_seconds,
+                passes: Vec::new(),
+                phases: Vec::new(),
+            })
         }
 
         fn counters(&self) -> Counters {

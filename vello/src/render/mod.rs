@@ -55,8 +55,9 @@ pub struct Init {
 
 /// What a layer draws, on the render thread.
 enum ContentData {
-    /// A live display list, patched by `ContentChange::Update`s.
-    List(cherenkov::DisplayList),
+    /// A live display list, shared with its `Content` and patched by
+    /// `ContentChange::Update`s.
+    List(cherenkov::Picture),
     /// A shared immutable picture.
     Picture(cherenkov::Picture),
     /// GPU-produced content.
@@ -802,7 +803,7 @@ impl Renderer {
             };
             match content {
                 ContentData::List(list) => lower::lower(
-                    list,
+                    list.display_list(),
                     &mut scene,
                     cherenkov::kurbo::Affine::IDENTITY,
                     &mut resources,

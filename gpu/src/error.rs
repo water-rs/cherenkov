@@ -1,7 +1,7 @@
 // Copyright 2026 the Cherenkov Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Error types for the Vello backend.
+//! Error types for the GPU backend.
 
 /// Engine initialization or engine-wide failure.
 #[derive(Debug, thiserror::Error)]
@@ -15,9 +15,9 @@ pub enum EngineError {
     /// The render thread failed.
     #[error("render thread: {0}")]
     Thread(String),
-    /// The vello renderer or a shader failed to initialize.
-    #[error("renderer: {0}")]
-    Renderer(String),
+    /// Shader module or pipeline creation failed.
+    #[error("shader: {0}")]
+    Shader(String),
 }
 
 /// Surface creation or surface-level failure.
@@ -36,12 +36,12 @@ pub enum SurfaceError {
         /// Device maximum.
         max: u32,
     },
-    /// The surface needs a feature this slice does not implement.
-    #[error(transparent)]
-    Unsupported(#[from] Unsupported),
     /// The GPU device or surface is lost.
     #[error("the device was lost")]
     Lost,
+    /// A zero-size surface cannot hold a target.
+    #[error("surface size must be non-zero")]
+    ZeroSize,
 }
 
 /// Resource registration failure.
@@ -53,15 +53,15 @@ pub enum ResourceError {
     /// The image data is malformed.
     #[error("image: {0}")]
     Image(String),
-    /// The shader source failed validation or pipeline creation.
-    #[error("shader: {0}")]
-    Shader(String),
     /// The resource needs a feature this slice does not implement.
     #[error(transparent)]
     Unsupported(#[from] Unsupported),
     /// Reading the resource failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    /// The render thread is gone.
+    #[error("the render thread is gone")]
+    Lost,
 }
 
 /// Rendering or readback failure.
@@ -73,88 +73,89 @@ pub enum RenderError {
     /// The GPU device was lost.
     #[error("the device was lost")]
     DeviceLost,
+    /// A GPU wait did not finish within [`GpuConfig::wait_timeout`].
+    ///
+    /// [`GpuConfig::wait_timeout`]: crate::GpuConfig::wait_timeout
+    #[error("the GPU did not finish {what} within {timeout:?}")]
+    Timeout {
+        /// What the render thread was waiting for.
+        what: &'static str,
+        /// The bound that expired.
+        timeout: std::time::Duration,
+    },
     /// The render thread failed or stopped.
     #[error("render thread stopped")]
     Thread,
-    /// The surface's pixels cannot be read back (window surfaces).
-    #[error("the surface is not readable")]
-    NotReadable,
     /// Pixel readback failed.
     #[error("readback: {0}")]
     Readback(String),
-    /// A GPU render pass failed (the vello scene render or a window
-    /// presentation step).
-    #[error("render: {0}")]
-    Render(String),
-    /// A layer filter's effect setup or render pass failed.
-    #[error("filter: {0}")]
-    Filter(String),
     /// A glyph run references a font that is not registered.
     #[error("font: {0}")]
     Font(String),
-    /// A shader paint references a shader that is not registered.
-    #[error("shader: {0}")]
-    Shader(String),
     /// A draw references an image that is not registered.
     #[error("image: {0}")]
-    Image(String),
+    Image(u64),
+    /// The glyph atlas is full; the caller may grow or clear it and retry.
+    #[error("glyph atlas full")]
+    AtlasFull,
+    /// The frame's live atlas set exceeds the maximum atlas size.
+    #[error("glyph atlas exhausted")]
+    AtlasExhausted,
 }
 
 /// A feature the engine vocabulary has but this backend slice does not draw.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, thiserror::Error)]
-#[non_exhaustive]
 pub enum Unsupported {
+    /// A general path.
+    Path,
+    /// A sweep (conic) gradient.
+    Sweep,
     /// A mesh gradient.
-    MeshGradient,
-    /// A gradient interpolation space other than the working space or
-    /// sRGB-encoded.
-    Interpolation,
-    /// A gradient or image pattern with `Extend::None` — `peniko::Extend`
-    /// has no transparent-outside-the-range mode.
-    ExtendNone,
-    /// A user shader paint.
-    Shader,
-    /// A shader paint declaring more than 64 uniform floats.
-    ShaderParams,
-    /// A shader paint applied to a glyph run.
-    ShaderGlyphs,
-    /// A blend space vello cannot honour (it blends in the encoded 8-bit
-    /// target).
-    BlendSpace,
-    /// A filter on a group. Filters are a layer property in this backend.
-    GroupFilter,
-    /// A filter on a layer.
-    Filter,
-    /// A window surface.
-    WindowSurface,
+    Mesh,
     /// An image draw or image paint.
     Image,
-    /// A shadow from a shape the blurred rounded-rect primitive cannot
-    /// express.
-    Shadow,
+    /// A user shader paint.
+    Shader,
+    /// A blend mode other than normal.
+    Blend(cherenkov::BlendMode),
+    /// A filter on a group.
+    Filter,
+    /// A dashed stroke.
+    StrokeDash,
+    /// A stroke join or cap combination with no analytic form.
+    StrokeJoin,
+    /// A stroked glyph run.
+    GlyphStroke,
     /// A per-glyph transform.
     GlyphTransform,
     /// A colour font (COLR, CBDT or sbix).
     ColorFont,
+    /// A blend space other than linear.
+    BlendSpace,
+    /// A shadow from a shape without a rounded-box form.
+    Shadow,
+    /// A path clip whose rasterized mask does not fit the atlas.
+    PathClipTooLarge,
 }
 
 impl std::fmt::Display for Unsupported {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::MeshGradient => "mesh-gradient",
-            Self::Interpolation => "gradient-interpolation",
-            Self::ExtendNone => "extend-none",
-            Self::Shader => "shader-paint",
-            Self::ShaderParams => "shader-params",
-            Self::ShaderGlyphs => "shader-glyphs",
-            Self::BlendSpace => "blend-space",
-            Self::GroupFilter => "group-filter",
-            Self::Filter => "filter",
-            Self::WindowSurface => "window-surface",
+            Self::Path => "path",
+            Self::Sweep => "sweep-gradient",
+            Self::Mesh => "mesh-gradient",
             Self::Image => "image",
-            Self::Shadow => "shadow",
+            Self::Shader => "shader-paint",
+            Self::Blend(_) => "blend-mode",
+            Self::Filter => "filter",
+            Self::StrokeDash => "stroke-dash",
+            Self::StrokeJoin => "stroke-join",
+            Self::GlyphStroke => "glyph-stroke",
             Self::GlyphTransform => "glyph-transform",
             Self::ColorFont => "color-font",
+            Self::BlendSpace => "blend-space",
+            Self::Shadow => "shadow",
+            Self::PathClipTooLarge => "path-clip-too-large",
         })
     }
 }

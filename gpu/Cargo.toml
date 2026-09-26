@@ -1,0 +1,25 @@
+[package]
+name = "cherenkov-gpu"
+version = "0.0.0"
+description = "wgpu backend for the Cherenkov 2D rendering engine"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+cherenkov = { path = ".." }
+wgpu = "29"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+kurbo = "0.13"
+skrifa = "0.44"
+half = "2"
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+naga = { version = "29", features = ["wgsl-in", "spv-out", "msl-out", "hlsl-out"] }
+
+[lints]
+workspace = true

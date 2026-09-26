@@ -1267,10 +1267,10 @@ impl<'a> Lowering<'a> {
 
     /// Pushes `inst` either as one quad or, when the shadow's local
     /// `covered` region hides its interior, as the up-to-eight strips of
-    /// `skew_y \ covered`. The interior behind an opaque card is opaque
+    /// `b \ covered`. The interior behind an opaque card is opaque
     /// shadow: coverage there is already saturated, so skipping it
     /// changes no pixels — the strips' bounds only bound rasterization.
-    /// An opacity below 1 disables the split: scale_x translucent group would
+    /// An opacity below 1 disables the split: a translucent group would
     /// composite each strip separately.
     #[expect(clippy::float_cmp, reason = "the split is exact only at full opacity")]
     fn push_shadow_quads(&mut self, inst: &Instance, b: Rect, covered: Option<Cover>) {

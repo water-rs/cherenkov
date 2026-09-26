@@ -9,20 +9,23 @@
 //! suite's working space end to end, so readback needs no conversion). GPU
 //! time is a real `wgpu` timestamp pair drained inside
 //! [`cherenkov_gpu::Engine::render`] with `GpuConfig::timestamps` set.
+//!
+//! `CHERENKOV_SCRATCH_FORMAT=rgba8` selects `Rgba8Unorm` isolation targets
+//! (default `Rgba16Float`) to compare intermediate precision/bandwidth.
 
 use std::collections::{BTreeSet, HashMap};
 
 use cherenkov::Draw as _;
 use cherenkov_gpu::{
     Engine as GpuEngine, FrameTime, Gpu, GpuConfig, Layer as GpuLayer, Offscreen, OffscreenFormat,
-    RenderError, ResourceError, Surface, Transaction, Unsupported,
+    RenderError, ResourceError, ScratchFormat, Surface, Transaction, Unsupported,
 };
 use cherenkov_oracle::color::to_working;
 use cherenkov_scene::{
     BlendMode, ColorSpace, Draw as SceneDraw, Extend, Feature, GlyphRun as SceneGlyphRun, Item,
     Layer as SceneLayer, Paint as ScenePaint, ResourceHash, Shape,
 };
-use kurbo::{Affine, Circle, Ellipse, Line, Rect, RoundedRect, Vec2};
+use kurbo::{Affine, BezPath, Circle, Ellipse, Line, Rect, RoundedRect, Vec2};
 
 use crate::convert::{self, Blobs};
 use crate::{BenchError, Counters, DeviceInfo, EncodeInput, Engine, EngineInfo, Submit};
@@ -35,6 +38,8 @@ enum ShapeKind {
     Circle(Circle),
     Ellipse(Ellipse),
     Line(Line),
+    /// A general path; the fill rule rides on the op, not the shape.
+    Path(BezPath),
 }
 
 /// One recording step of a content layer, resolved in `prepare`.
@@ -43,6 +48,8 @@ enum Op {
     Fill {
         /// The shape.
         shape: ShapeKind,
+        /// The fill rule.
+        rule: cherenkov_scene::FillRule,
         /// The paint.
         paint: cherenkov::Paint,
     },
@@ -130,6 +137,9 @@ fn cherenkov_features() -> Vec<Feature> {
         Feature::HdrColor,
         Feature::WideGamut,
         Feature::Blend(BlendMode::Normal),
+        Feature::Path,
+        Feature::EvenOdd,
+        Feature::StrokeDash,
         // `sRGB` maps to `SrgbEncoded`; `linear-p3` and `linear-srgb` are
         // both linear interpolation, which is the working space already.
         Feature::InterpolationSpace(ColorSpace::Srgb),
@@ -141,12 +151,9 @@ fn cherenkov_features() -> Vec<Feature> {
 /// The upstream API this slice lacks for a declared scene feature.
 const fn missing_api(f: &Feature) -> Option<&'static str> {
     match f {
-        Feature::Path => Some("general paths are outside the first GPU slice"),
         Feature::SweepGradient => Some("no sweep gradient in the first slice"),
         Feature::Image | Feature::ImagePaint => Some("no images in the first slice"),
         Feature::Blend(_) => Some("only normal blending in the first slice"),
-        Feature::StrokeDash => Some("no dashing"),
-        Feature::EvenOdd => Some("no paths"),
         Feature::ExtendNone => Some("cherenkov::Extend has no None variant"),
         Feature::InterpolationSpace(_) => {
             Some("only srgb / linear interpolation in the first slice")
@@ -184,7 +191,7 @@ const fn scene_blend(m: cherenkov::BlendMode) -> BlendMode {
 /// string names the real construct.
 const fn unsupported_feature(u: Unsupported) -> Feature {
     match u {
-        Unsupported::Path => Feature::Path,
+        Unsupported::Path | Unsupported::PathClipTooLarge => Feature::Path,
         Unsupported::Sweep => Feature::SweepGradient,
         Unsupported::Image => Feature::Image,
         Unsupported::Blend(mode) => Feature::Blend(scene_blend(mode)),
@@ -301,9 +308,9 @@ fn front_paint(paint: &ScenePaint) -> Result<cherenkov::Paint, BenchError> {
     })
 }
 
-/// A scene shape → [`ShapeKind`]; paths are outside this slice.
-fn shape_kind(shape: &Shape) -> Result<ShapeKind, BenchError> {
-    Ok(match shape {
+/// A scene shape → [`ShapeKind`].
+fn shape_kind(shape: &Shape) -> ShapeKind {
+    match shape {
         Shape::Rect(r) => ShapeKind::Rect(*r),
         Shape::RoundedRect(r) => ShapeKind::RoundedRect(*r),
         Shape::Continuous(c) => ShapeKind::Continuous(
@@ -312,14 +319,8 @@ fn shape_kind(shape: &Shape) -> Result<ShapeKind, BenchError> {
         Shape::Circle(c) => ShapeKind::Circle(*c),
         Shape::Ellipse(e) => ShapeKind::Ellipse(*e),
         Shape::Line(l) => ShapeKind::Line(*l),
-        Shape::Path { .. } => {
-            return Err(BenchError::Unsupported {
-                engine: Cherenkov::NAME,
-                feature: Feature::Path,
-                api: missing_api(&Feature::Path),
-            });
-        }
-    })
+        Shape::Path { path } => ShapeKind::Path(path.clone()),
+    }
 }
 
 /// Applies a clip shape to a layer edit.
@@ -331,6 +332,7 @@ fn clip_shape(edit: &mut cherenkov_gpu::LayerEdit, shape: &ShapeKind) {
         ShapeKind::Circle(c) => drop(edit.clip(*c)),
         ShapeKind::Ellipse(e) => drop(edit.clip(*e)),
         ShapeKind::Line(l) => drop(edit.clip(*l)),
+        ShapeKind::Path(p) => drop(edit.clip(p.clone())),
     }
 }
 
@@ -342,8 +344,9 @@ fn op(
     blobs: &Blobs,
 ) -> Result<Op, BenchError> {
     Ok(match draw {
-        SceneDraw::Fill { shape, paint, .. } => Op::Fill {
-            shape: shape_kind(shape)?,
+        SceneDraw::Fill { shape, rule, paint } => Op::Fill {
+            shape: shape_kind(shape),
+            rule: *rule,
             paint: front_paint(paint)?,
         },
         SceneDraw::Stroke {
@@ -351,7 +354,7 @@ fn op(
             stroke,
             paint,
         } => Op::Stroke {
-            shape: shape_kind(shape)?,
+            shape: shape_kind(shape),
             stroke: convert::stroke(stroke),
             paint: front_paint(paint)?,
         },
@@ -361,7 +364,7 @@ fn op(
             offset,
             color,
         } => Op::Shadow {
-            shape: shape_kind(shape)?,
+            shape: shape_kind(shape),
             shadow: cherenkov::Shadow::new(*blur_sigma, working(color))
                 .offset(Vec2::new(offset[0], offset[1])),
         },
@@ -466,7 +469,7 @@ fn prep_layer(
     };
     let mut prep = PrepLayer {
         transform: layer.transform,
-        clip: layer.clip.as_ref().map(shape_kind).transpose()?,
+        clip: layer.clip.as_ref().map(shape_kind),
         opacity: layer.opacity,
         own: Vec::new(),
         items: Vec::new(),
@@ -551,6 +554,10 @@ impl Cherenkov {
     pub fn new() -> Result<Self, BenchError> {
         let engine = GpuEngine::<Gpu>::new(GpuConfig {
             timestamps: true,
+            scratch_format: match std::env::var("CHERENKOV_SCRATCH_FORMAT").as_deref() {
+                Ok("rgba8") => ScratchFormat::Rgba8Unorm,
+                _ => ScratchFormat::LinearF16,
+            },
             ..GpuConfig::default()
         })
         .map_err(|e| BenchError::Gpu(format!("cherenkov engine: {e}")))?;
@@ -647,7 +654,19 @@ impl Engine for Cherenkov {
             .as_ref()
             .ok_or_else(|| BenchError::Engine("cherenkov: submit before prepare".into()))?;
         self.engine.render(FrameTime::now()).map_err(render_error)?;
-        let gpu_seconds = self.engine.stats().gpu_seconds;
+        let stats = self.engine.stats();
+        let gpu_seconds = stats.gpu_seconds;
+        let passes = stats
+            .passes_timed
+            .iter()
+            .map(|p| crate::PassSample {
+                name: p.name.clone(),
+                width: p.width,
+                height: p.height,
+                format: p.format.to_string(),
+                gpu_seconds: p.gpu_seconds,
+            })
+            .collect();
         let image = if readback {
             let rb = surface.readback().map_err(render_error)?;
             Some(cherenkov_oracle::F32Image {
@@ -658,7 +677,11 @@ impl Engine for Cherenkov {
         } else {
             None
         };
-        Ok(Submit { image, gpu_seconds })
+        Ok(Submit {
+            image,
+            gpu_seconds,
+            passes,
+        })
     }
 
     fn counters(&self) -> Counters {
@@ -688,13 +711,19 @@ impl Engine for Cherenkov {
 /// Records one [`Op`] into a recorder — the per-frame engine calls.
 fn record_op(c: &mut cherenkov::Recorder, op: &Op) {
     match op {
-        Op::Fill { shape, paint } => match shape {
+        Op::Fill { shape, rule, paint } => match shape {
             ShapeKind::Rect(s) => c.fill(*s, paint.clone()),
             ShapeKind::RoundedRect(s) => c.fill(*s, paint.clone()),
             ShapeKind::Continuous(s) => c.fill(*s, paint.clone()),
             ShapeKind::Circle(s) => c.fill(*s, paint.clone()),
             ShapeKind::Ellipse(s) => c.fill(*s, paint.clone()),
             ShapeKind::Line(s) => c.fill(*s, paint.clone()),
+            ShapeKind::Path(p) => match rule {
+                cherenkov_scene::FillRule::EvenOdd => {
+                    c.fill(cherenkov::EvenOdd(p.clone()), paint.clone());
+                }
+                cherenkov_scene::FillRule::NonZero => c.fill(p.clone(), paint.clone()),
+            },
         },
         Op::Stroke {
             shape,
@@ -707,6 +736,7 @@ fn record_op(c: &mut cherenkov::Recorder, op: &Op) {
             ShapeKind::Circle(s) => c.stroke(*s, stroke.clone(), paint.clone()),
             ShapeKind::Ellipse(s) => c.stroke(*s, stroke.clone(), paint.clone()),
             ShapeKind::Line(s) => c.stroke(*s, stroke.clone(), paint.clone()),
+            ShapeKind::Path(p) => c.stroke(p.clone(), stroke.clone(), paint.clone()),
         },
         Op::Shadow { shape, shadow } => match shape {
             ShapeKind::Rect(s) => c.shadow(*s, *shadow),
@@ -715,6 +745,7 @@ fn record_op(c: &mut cherenkov::Recorder, op: &Op) {
             ShapeKind::Circle(s) => c.shadow(*s, *shadow),
             ShapeKind::Ellipse(s) => c.shadow(*s, *shadow),
             ShapeKind::Line(s) => c.shadow(*s, *shadow),
+            ShapeKind::Path(p) => c.shadow(p.clone(), *shadow),
         },
         Op::Glyphs { run, paint } => c.glyphs(run, paint.clone()),
     }

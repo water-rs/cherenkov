@@ -48,7 +48,7 @@ fn a_red_rect_renders_and_reads_back() -> Result<(), Box<dyn std::error::Error>>
 }
 
 #[test]
-fn a_path_fill_reports_unsupported() -> Result<(), Box<dyn std::error::Error>> {
+fn a_path_fill_renders() -> Result<(), Box<dyn std::error::Error>> {
     let Some(engine) = engine() else {
         return Ok(());
     };
@@ -60,6 +60,31 @@ fn a_path_fill_reports_unsupported() -> Result<(), Box<dyn std::error::Error>> {
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|c| {
             c.fill(path, WorkingColor::new([1., 0., 0., 1.]));
+        }));
+    });
+    engine.render(cherenkov_gpu::FrameTime::now())?;
+    let readback = surface.readback()?;
+    let [r, ..] = readback.pixels[(30 * readback.width + 30) as usize];
+    assert!(r > 0.5, "interior pixel: {r}");
+    Ok(())
+}
+
+#[test]
+fn a_path_shadow_reports_unsupported() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(engine) = engine() else {
+        return Ok(());
+    };
+    let surface = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
+    let mut path = BezPath::new();
+    path.move_to((4., 4.));
+    path.curve_to((20., 60.), (44., 60.), (60., 4.));
+    path.close_path();
+    surface.update(|tx| {
+        tx[surface.root()].content(surface.record(|c| {
+            c.shadow(
+                path,
+                cherenkov::Shadow::new(4.0, WorkingColor::new([0., 0., 0., 1.])),
+            );
         }));
     });
     let result = engine.render(cherenkov_gpu::FrameTime::now());

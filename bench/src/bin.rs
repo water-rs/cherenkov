@@ -19,8 +19,8 @@ use std::time::Instant;
 
 use cherenkov_bench::convert;
 use cherenkov_bench::report::{
-    CpuUse, FrameSample, MeasureReport, Percentiles, Placement, RenderReport, UnsupportedReport,
-    percentiles,
+    CpuUse, FrameSample, MeasureReport, PassPercentiles, Percentiles, Placement, RenderReport,
+    UnsupportedReport, percentiles,
 };
 use cherenkov_bench::{BenchError, EncodeInput, Engine, affinity, create_engine, engine_names};
 use cherenkov_oracle::{F32Image, Renderer, metrics};
@@ -233,6 +233,16 @@ fn measure_cmd(engine: &str, opts: MeasureOpts<'_>) -> Result<(), BenchError> {
                     out = %out_path.display(),
                     "measure"
                 );
+                for pass in &report.percentiles.passes {
+                    tracing::info!(
+                        scene = %dir.display(),
+                        pass = %pass.name,
+                        size = %format!("{}x{}", pass.width, pass.height),
+                        format = %pass.format,
+                        gpu_p50 = pass.gpu_seconds[0],
+                        "pass"
+                    );
+                }
             }
             Err(BenchError::Unsupported { feature, api, .. }) => {
                 write_unsupported(&*engine, &dir, feature.clone(), api, &out_path)?;
@@ -360,6 +370,7 @@ fn measure_scene(
                 cpu_start,
                 cpu_end,
                 migrated: matches!((cpu_start, cpu_end), (Some(a), Some(b)) if a != b),
+                passes: submit.passes,
             });
         }
     }
@@ -384,6 +395,7 @@ fn measure_scene(
     let enc: Vec<f64> = samples.iter().map(|s| s.encode_seconds).collect();
     let sub: Vec<f64> = samples.iter().map(|s| s.submit_seconds).collect();
     let gpu: Vec<f64> = samples.iter().filter_map(|s| s.gpu_seconds).collect();
+    let passes = pass_percentiles(&samples);
     Ok(MeasureReport {
         engine: engine.info().name,
         info: engine.info().clone(),
@@ -409,10 +421,40 @@ fn measure_scene(
             encode_seconds: percentiles(&enc).unwrap_or([0.0; 3]),
             submit_seconds: percentiles(&sub).unwrap_or([0.0; 3]),
             gpu_seconds: percentiles(&gpu),
+            passes,
         },
         counters: engine.counters(),
         device: engine.device(),
     })
+}
+
+/// Percentiles per pass index, over the frames with the modal pass
+/// count.
+fn pass_percentiles(samples: &[FrameSample]) -> Vec<PassPercentiles> {
+    // The modal pass count; frames with a different count are skipped.
+    let mut counts: BTreeMap<usize, usize> = BTreeMap::new();
+    for s in samples {
+        *counts.entry(s.passes.len()).or_default() += 1;
+    }
+    let Some(mode) = counts.into_iter().max_by_key(|(_, n)| *n).map(|(n, _)| n) else {
+        return Vec::new();
+    };
+    if mode == 0 {
+        return Vec::new();
+    }
+    let frames: Vec<&FrameSample> = samples.iter().filter(|s| s.passes.len() == mode).collect();
+    (0..mode)
+        .map(|i| {
+            let times: Vec<f64> = frames.iter().map(|s| s.passes[i].gpu_seconds).collect();
+            PassPercentiles {
+                name: frames[0].passes[i].name.clone(),
+                width: frames[0].passes[i].width,
+                height: frames[0].passes[i].height,
+                format: frames[0].passes[i].format.clone(),
+                gpu_seconds: percentiles(&times).unwrap_or([0.0; 3]),
+            }
+        })
+        .collect()
 }
 
 /// Record a scene the adapter cannot execute faithfully.

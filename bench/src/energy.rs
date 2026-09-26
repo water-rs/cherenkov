@@ -404,7 +404,7 @@ pub mod odpm {
 /// `sudo` forwards so `powermetrics` flushes and exits) only after a
 /// sample boundary past the window's end has arrived.
 pub mod powermetrics {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, VecDeque};
     use std::io::Read;
     use std::process::{Child, Command, Stdio};
     use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
@@ -626,6 +626,10 @@ pub mod powermetrics {
         interval: Duration,
         /// Complete plist documents as `powermetrics` emits them.
         samples_rx: Receiver<Vec<u8>>,
+        /// Documents taken off the channel before the consumer runs
+        /// — `spawn` receives the first one to prove startup —
+        /// replayed in arrival order ahead of `samples_rx`.
+        pending: VecDeque<Vec<u8>>,
         /// Drains stdout, splitting the NUL-separated stream into
         /// documents.
         out: Option<std::thread::JoinHandle<()>>,
@@ -708,6 +712,13 @@ pub mod powermetrics {
     /// is force-stopped.
     const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
+    /// Startup failure bound in sample intervals: the spawn fails
+    /// when the meter's first document has not arrived after
+    /// `interval * STARTUP_INTERVALS`. A bound on how long startup
+    /// may take, not a guess at when the meter becomes ready —
+    /// readiness is proven by the document itself.
+    const STARTUP_INTERVALS: u32 = 10;
+
     impl Run {
         /// Wraps an already-spawned child: the `powermetrics` spawn and
         /// the stand-ins the tests drive share this path so both get
@@ -726,6 +737,7 @@ pub mod powermetrics {
                 spawned_at,
                 interval,
                 samples_rx,
+                pending: VecDeque::new(),
                 out: Some(out),
                 err: Some(err),
             }
@@ -762,30 +774,53 @@ pub mod powermetrics {
                 Duration::from_millis(u64::try_from(interval_ms).unwrap_or(1000)),
                 spawned_at,
             );
-            // `sudo -n` exits at once when a password would be needed;
-            // give it its chance before the window opens.
-            std::thread::sleep(Duration::from_millis(150));
-            let running = match run.child.as_mut() {
-                Some(child) => child
-                    .try_wait()
-                    .map_err(|e| {
-                        BenchError::Engine(format!("energy: cannot poll powermetrics: {e}"))
-                    })?
-                    .is_none(),
-                None => false,
-            };
-            if !running {
-                let stderr = run
-                    .err
-                    .take()
-                    .and_then(|h| h.join().ok())
-                    .unwrap_or_default();
-                let stderr = String::from_utf8_lossy(&stderr).trim().to_owned();
-                return Err(BenchError::Engine(format!(
-                    "energy: `sudo -n powermetrics` exited before the measured window: {stderr}"
-                )));
+            // Startup is proven by the first document: one arriving
+            // means the meter is sampling, while `sudo -n` refusing
+            // or `powermetrics` dying early ends the stream. `bound`
+            // is the failure bound on how long that may take — not a
+            // readiness guess.
+            let bound = run.interval.saturating_mul(STARTUP_INTERVALS);
+            match run.samples_rx.recv_timeout(bound) {
+                Ok(doc) => run.pending.push_back(doc),
+                Err(RecvTimeoutError::Disconnected) => {
+                    let stderr = run
+                        .err
+                        .take()
+                        .and_then(|h| h.join().ok())
+                        .unwrap_or_default();
+                    let stderr = String::from_utf8_lossy(&stderr).trim().to_owned();
+                    return Err(BenchError::Engine(format!(
+                        "energy: `sudo -n powermetrics` exited before the measured window: {stderr}"
+                    )));
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    // Dropping `run` SIGTERMs the child and reaps it
+                    // within `SHUTDOWN_TIMEOUT`.
+                    return Err(BenchError::Engine(format!(
+                        "energy: powermetrics produced no sample within {bound:?}"
+                    )));
+                }
             }
             Ok(run)
+        }
+
+        /// The next document: `pending` first, in arrival order, then
+        /// the channel — a document `spawn` received while proving
+        /// startup belongs on the timeline exactly as if it had
+        /// arrived now.
+        fn recv_doc(&mut self, timeout: Duration) -> Result<Vec<u8>, RecvTimeoutError> {
+            if let Some(doc) = self.pending.pop_front() {
+                return Ok(doc);
+            }
+            self.samples_rx.recv_timeout(timeout)
+        }
+
+        /// Non-blocking counterpart of [`Run::recv_doc`]; `None` when
+        /// neither `pending` nor the channel holds a document.
+        fn try_recv_doc(&mut self) -> Option<Vec<u8>> {
+            self.pending
+                .pop_front()
+                .or_else(|| self.samples_rx.try_recv().ok())
         }
 
         /// The child pid — the tests use it to prove termination.
@@ -813,7 +848,7 @@ pub mod powermetrics {
         /// `elapsed_ns` is lost and with it the timeline), or no
         /// covering sample arrives within a few intervals of `end`.
         /// Partial coverage is never returned.
-        fn collect_samples(&self, end: Instant) -> Result<Vec<Sample>, BenchError> {
+        fn collect_samples(&mut self, end: Instant) -> Result<Vec<Sample>, BenchError> {
             let mut offset = Duration::ZERO;
             let mut samples = Vec::new();
             // The boundary sample lands within about an interval of
@@ -826,7 +861,7 @@ pub mod powermetrics {
                         "energy: powermetrics produced no sample past the window's end".into(),
                     ));
                 };
-                match self.samples_rx.recv_timeout(timeout) {
+                match self.recv_doc(timeout) {
                     Ok(chunk) => {
                         let Some(sample) = parse_doc(&chunk, offset) else {
                             return Err(BenchError::Engine(format!(
@@ -953,7 +988,7 @@ pub mod powermetrics {
                 let _ = out.join();
             }
             let mut offset = samples.last().map_or(Duration::ZERO, |s| s.end);
-            while let Ok(chunk) = self.samples_rx.try_recv() {
+            while let Some(chunk) = self.try_recv_doc() {
                 if let Some(sample) = parse_doc(&chunk, offset) {
                     offset = sample.end;
                     samples.push(sample);
@@ -1409,15 +1444,43 @@ CH7(T=349894)[S1M_VDD_MIF], 21091363
     #[cfg(unix)]
     fn drop_bounds_shutdown_of_a_term_ignoring_child() {
         // The stand-in ignores SIGTERM; shutdown must still be
-        // bounded and the child must not survive. The sleep lets
-        // bash install the trap before the TERM arrives.
-        let run = stand_in_run(&["-c", "trap '' TERM; exec sleep 60"]);
+        // bounded and the child must not survive. `Run` owns the
+        // child's pipes, so the stand-in proves its trap is
+        // installed through a marker file written only after `trap`
+        // runs — the wait below is on that condition, not a delay.
+        let markers = [
+            std::env::temp_dir().join(format!("energy-term-trap-{}-run", std::process::id())),
+            std::env::temp_dir().join(format!("energy-term-trap-{}-bystander", std::process::id())),
+        ];
+        for marker in &markers {
+            let _ = std::fs::remove_file(marker);
+        }
+        let script = "trap '' TERM; : > \"$0\"; exec sleep 60";
+        let run = stand_in_run(&[
+            "-c",
+            script,
+            markers[0].to_str().expect("marker path is UTF-8"),
+        ]);
         let pid = run.pid();
         // An identical stand-in not parented by this run: only the
         // child of this run's own process may be signalled.
-        let mut bystander = stand_in(&["-c", "trap '' TERM; exec sleep 60"]);
+        let mut bystander = stand_in(&[
+            "-c",
+            script,
+            markers[1].to_str().expect("marker path is UTF-8"),
+        ]);
         let bystander_pid = bystander.id();
-        std::thread::sleep(Duration::from_millis(300));
+        let traps_deadline = Instant::now() + Duration::from_secs(10);
+        for marker in &markers {
+            while !marker.exists() {
+                assert!(
+                    Instant::now() < traps_deadline,
+                    "stand-in did not install its TERM trap within 10 s: {}",
+                    marker.display()
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
         let started = Instant::now();
         drop(run);
         let elapsed = started.elapsed();
@@ -1438,5 +1501,8 @@ CH7(T=349894)[S1M_VDD_MIF], 21091363
         );
         let _ = bystander.kill();
         let _ = bystander.wait();
+        for marker in &markers {
+            let _ = std::fs::remove_file(marker);
+        }
     }
 }

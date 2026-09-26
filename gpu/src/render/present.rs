@@ -178,10 +178,9 @@ impl Presenter {
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: true,
             });
-            buffer
-                .slice(..)
-                .get_mapped_range_mut()
-                .copy_from_slice(&[encode.to_ne_bytes(), alpha.to_ne_bytes(), [0; 4], [0; 4]].concat());
+            buffer.slice(..).get_mapped_range_mut().copy_from_slice(
+                &[encode.to_ne_bytes(), alpha.to_ne_bytes(), [0; 4], [0; 4]].concat(),
+            );
             buffer.unmap();
             buffer
         };

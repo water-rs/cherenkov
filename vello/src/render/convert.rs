@@ -43,7 +43,7 @@ pub fn stop(s: &cherenkov::ColorStop) -> peniko::ColorStop {
 /// The colour-space tag a gradient's interpolation space maps to.
 ///
 /// # Errors
-/// [`RenderError::Unsupported`] for any space that has no equivalent
+/// [`cherenkov::RenderError::Unsupported`] for any space that has no equivalent
 /// `ColorSpaceTag`.
 pub const fn interpolation(i: Interpolation) -> Result<ColorSpaceTag, cherenkov::RenderError> {
     match i {

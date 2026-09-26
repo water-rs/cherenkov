@@ -261,7 +261,7 @@ impl<T> Default for Realization<T> {
 /// One layer's display list, accumulated dirty commands, and retained output.
 pub struct Content<O, E> {
     live: bool,
-    list: DisplayList,
+    list: crate::Picture,
     dirty: Dirty,
     lowered: Option<Lowered<O>>,
     emissions: Vec<Realization<E>>,
@@ -270,7 +270,7 @@ pub struct Content<O, E> {
 impl<O: Operation, E> Content<O, E> {
     /// Start an unprepared layer.
     #[must_use]
-    pub fn new(list: DisplayList) -> Self {
+    pub fn new(list: crate::Picture) -> Self {
         Self {
             live: true,
             list,
@@ -285,7 +285,7 @@ impl<O: Operation, E> Content<O, E> {
     pub fn picture(picture: crate::Picture) -> Self {
         Self {
             live: false,
-            ..Self::new(picture.display_list().clone())
+            ..Self::new(picture)
         }
     }
 
@@ -317,7 +317,7 @@ impl<O: Operation, E> Content<O, E> {
             if self.dirty.is_empty() {
                 return Ok(0);
             }
-            if let Some(patches) = lowered.patch(&self.list, &self.dirty, compiler)? {
+            if let Some(patches) = lowered.patch(self.list.display_list(), &self.dirty, compiler)? {
                 for range in patches {
                     for emission in &mut self.emissions[range] {
                         emission.valid = false;
@@ -328,14 +328,15 @@ impl<O: Operation, E> Content<O, E> {
                 self.emissions.clear();
                 self.emissions
                     .resize_with(lowered.ops.len(), Realization::default);
-                count = u32::try_from(self.list.len()).expect("command count fits u32");
+                count =
+                    u32::try_from(self.list.display_list().len()).expect("command count fits u32");
             }
         } else {
-            let lowered = Lowered::full(&self.list, compiler)?;
+            let lowered = Lowered::full(self.list.display_list(), compiler)?;
             self.emissions
                 .resize_with(lowered.ops.len(), Realization::default);
             self.lowered = Some(lowered);
-            count = u32::try_from(self.list.len()).expect("command count fits u32");
+            count = u32::try_from(self.list.display_list().len()).expect("command count fits u32");
         }
         self.dirty = Dirty::default();
         Ok(count)

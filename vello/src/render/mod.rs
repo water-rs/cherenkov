@@ -63,7 +63,7 @@ pub struct ShaderSpec {
 /// What a layer draws, on the render thread.
 enum ContentData {
     /// A live display list, patched by `ContentOp::Update`s.
-    List(cherenkov::DisplayList),
+    List(cherenkov::Picture),
     /// A shared immutable picture.
     Picture(cherenkov::Picture),
     /// GPU-produced content.
@@ -465,7 +465,7 @@ impl VelloRenderer {
             };
             match content {
                 ContentData::List(list) => lower::lower(
-                    list,
+                    list.display_list(),
                     &mut scene,
                     cherenkov::kurbo::Affine::IDENTITY,
                     &mut resources,
@@ -1160,13 +1160,6 @@ impl Renderer for VelloRenderer {
                 )
             }
         };
-        if size.0 > self.max_texture || size.1 > self.max_texture {
-            return Err(SurfaceError::TooLarge {
-                width: size.0,
-                height: size.1,
-                max: self.max_texture,
-            });
-        }
         self.surfaces.insert(
             id,
             SurfaceState {
@@ -1201,9 +1194,11 @@ impl Renderer for VelloRenderer {
             view: v,
         } = &mut state.target
         {
-            config.width = size.0;
-            config.height = size.1;
-            surface.configure(&self.device, config);
+            config.width = size.0.max(1);
+            config.height = size.1.max(1);
+            if size.0 != 0 && size.1 != 0 {
+                surface.configure(&self.device, config);
+            }
             *t = texture;
             *v = view;
         } else {

@@ -58,7 +58,11 @@ where
         renderer
             .create_surface(id, Offscreen::new(size, OffscreenFormat::LinearF16).into())
             .expect("surface");
-        renderer.set_content(id, layer, Some(ContentOp::Replace(list.clone())));
+        renderer.set_content(
+            id,
+            layer,
+            Some(ContentOp::Replace(crate::Picture::new(list.clone()))),
+        );
         renderer.set_content(id, sibling, Some(ContentOp::Picture(stable.clone())));
     }
     let start = Instant::now();
@@ -85,7 +89,11 @@ where
         }
         let time = start + Duration::from_millis(u64::from(step) * 16);
         let _ = tree.sample(time, Display::default());
-        renderer.set_content(ids[1], layer, Some(ContentOp::Replace(list.clone())));
+        renderer.set_content(
+            ids[1],
+            layer,
+            Some(ContentOp::Replace(crate::Picture::new(list.clone()))),
+        );
         let incremental = render(renderer, ids[0], &tree, size, time);
         let full = render(renderer, ids[1], &tree, size, time);
         if step > 0 {

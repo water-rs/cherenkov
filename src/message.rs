@@ -14,7 +14,7 @@ use crate::WorkingColor;
 use crate::animation::Animation;
 use crate::backend::{Backend, Display, SurfaceInfo};
 use crate::config::{MemoryUsage, Pressure};
-use crate::display_list::{DisplayList, Picture, SlotUpdate};
+use crate::display_list::{Picture, SlotUpdate};
 use crate::error::{RenderError, SurfaceError};
 use crate::frame::{FrameStats, FrameTime, Next, Readback};
 use crate::shape::ShapeData;
@@ -110,7 +110,7 @@ pub struct Prop<T> {
 #[derive(Clone, Debug)]
 pub enum ContentOp {
     /// The whole display list of a live content, sent on first commit.
-    Replace(DisplayList),
+    Replace(Picture),
     /// New values for a live content's bound slots.
     Update(Vec<SlotUpdate>),
     /// A shared immutable picture.

@@ -32,7 +32,7 @@ impl Harness {
         self.renderer.set_content(
             self.surface,
             self.tree.root(),
-            Some(ContentOp::Replace(picture.display_list().clone())),
+            Some(ContentOp::Replace(picture)),
         );
     }
 

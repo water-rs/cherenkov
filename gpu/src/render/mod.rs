@@ -37,16 +37,6 @@ const TARGET_USAGES: wgpu::TextureUsages = wgpu::TextureUsages::from_bits_retain
         | wgpu::TextureUsages::TEXTURE_BINDING.bits(),
 );
 
-/// Decodes one sRGB-encoded byte channel to linear, `u8 → f64`.
-fn srgb_decode_u8(c: u8) -> f64 {
-    let v = f64::from(c) / 255.0;
-    if v <= 0.04045 {
-        v / 12.92
-    } else {
-        ((v + 0.055) / 1.055).powf(2.4)
-    }
-}
-
 /// Linear sRGB (BT.709 primaries, D65) to CIE XYZ — the oracle's
 /// `SRGB_TO_XYZ`.
 const SRGB_TO_XYZ: [[f64; 3]; 3] = [
@@ -242,7 +232,7 @@ pub struct GpuRenderer {
     max_texture: u32,
 }
 
-/// Slot updates addressed to a layer with no live list — without the
+/// Atlas origins produced by one deferred raster.
 enum PendingOrigin {
     /// Cell origins: one for a glyph, one per cell for a path emission.
     Cells(Vec<(u32, u32)>),
@@ -255,7 +245,7 @@ enum PendingOrigin {
 /// One submitted frame's timestamp queries awaiting GPU completion.
 ///
 /// The resolve and the copy into `staging` are submitted with the frame;
-/// the map and read happen on a later [`Renderer::render_frame`] once a
+/// the map and read happen on a later [`Renderer::render`] once a
 /// non-blocking poll reports the copy done, so rendering never stalls on
 /// GPU idle.
 struct PendingTimestamps {
@@ -631,8 +621,10 @@ fn create_target(
     (texture, view)
 }
 
-/// The render-thread entry point: initializes, replies, then loops over
-/// messages until [`Message::Shutdown`].
+/// Creates GPU state on the shared engine render thread.
+///
+/// # Errors
+/// Returns initialization and pipeline validation errors from the backend.
 #[expect(
     clippy::too_many_lines,
     clippy::needless_pass_by_value,
@@ -1087,6 +1079,9 @@ impl Renderer for GpuRenderer {
             font.colr.borrow_mut().clear();
         }
         for surf in self.surfaces.values_mut() {
+            for content in surf.layers.values_mut() {
+                content.trim();
+            }
             surf.frame.instances.shrink_to_fit();
             surf.frame.stops.shrink_to_fit();
             surf.frame.passes.shrink_to_fit();
@@ -1398,6 +1393,10 @@ impl GpuRenderer {
         result.map(|()| lowered)
     }
 
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "atlas coordinates fit exactly in f32"
+    )]
     fn apply_pending(
         &mut self,
         surf: &mut SurfaceState,
@@ -1413,7 +1412,7 @@ impl GpuRenderer {
                 unreachable!("cell patch must reference cell raster");
             };
             let (x, y) = cells[c as usize];
-            [f32::from(x), f32::from(y)]
+            [x as f32, y as f32]
         };
         for (inst, p, c) in lowered.cell_patches.drain(..) {
             let [x, y] = cell_origin(p, c);
@@ -1481,6 +1480,11 @@ impl GpuRenderer {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        clippy::cast_precision_loss,
+        reason = "pixel sizes are well within f32"
+    )]
     fn lower_surface(
         &mut self,
         id: SurfaceId,
@@ -1727,6 +1731,11 @@ impl GpuRenderer {
         Ok(())
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        clippy::cast_precision_loss,
+        reason = "pixel sizes are well within f32"
+    )]
     fn encode_surface(&mut self, id: SurfaceId, stats: &mut FrameStats) {
         let Some(surf) = self.surfaces.get_mut(&id) else {
             return;

@@ -274,7 +274,7 @@ impl ColrPainter<'_> {
     fn extend(&mut self, e: skrifa::color::Extend) -> Extend {
         extend(e).unwrap_or_else(|| {
             self.err
-                .get_or_insert_with(|| RenderError::Unsupported(names::COLOR_FONT));
+                .get_or_insert(RenderError::Unsupported(names::COLOR_FONT));
             Extend::Pad
         })
     }

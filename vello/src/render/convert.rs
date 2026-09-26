@@ -136,7 +136,7 @@ pub fn shape_path(shape: &ShapeData) -> BezPath {
             p.push(PathEl::LineTo(l.p1));
             p
         }
-        ShapeData::Path { elements, .. } => BezPath::from_iter(elements.iter().copied()),
+        ShapeData::Path { elements, .. } => elements.iter().copied().collect(),
     }
 }
 

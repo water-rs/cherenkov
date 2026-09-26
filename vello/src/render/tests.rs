@@ -82,7 +82,7 @@ fn removing_a_shader_invalidates_cached_fragments() {
                 shader: cherenkov::ShaderId::new(7),
                 uniforms: vec![],
             },
-        )
+        );
     });
     h.render().expect("render");
     assert!(h.cache().fragment.is_some());
@@ -115,7 +115,7 @@ fn removing_an_image_invalidates_cached_fragments() {
             cherenkov::ImageId::new(9),
             kurbo::Rect::new(0., 0., 8., 8.),
             cherenkov::Sampling::Nearest,
-        )
+        );
     });
     h.render().expect("render");
     assert!(h.cache().fragment.is_some());

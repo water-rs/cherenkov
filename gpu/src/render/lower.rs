@@ -1178,26 +1178,27 @@ impl<'a> Lowering<'a> {
             return None;
         }
         let relative = local.inverse() * *fill;
-        let [a, b, c, d, x, y] = relative.as_coeffs();
-        if [a, b, c, d] != [1.0, 0.0, 0.0, 1.0] {
+        let [scale_x, skew_y, skew_x, scale_y, offset_x, offset_y] = relative.as_coeffs();
+        if [scale_x, skew_y, skew_x, scale_y] != [1.0, 0.0, 0.0, 1.0] {
             return None;
         }
         let max_r = f64::from(shape.radii.iter().copied().fold(0.0, f32::max));
         let m = aa_margin(self.transform * *ambient) + 1.0;
         Some(Cover {
-            wide: bounds.inset((-m, -(max_r + m))) + Vec2::new(x, y),
-            tall: bounds.inset((-(max_r + m), -m)) + Vec2::new(x, y),
+            wide: bounds.inset((-m, -(max_r + m))) + Vec2::new(offset_x, offset_y),
+            tall: bounds.inset((-(max_r + m), -m)) + Vec2::new(offset_x, offset_y),
         })
     }
 
     /// Split a large aligned fill into its full-coverage interior and antialiased border.
-    #[expect(
-        clippy::float_cmp,
-        reason = "the span split requires exact axis alignment"
-    )]
     fn push_shaped(&mut self, mut inst: Instance, to_device: Affine, bounds: Rect, margin: f64) {
-        let [a, b, c, d, e, f] = to_device.as_coeffs();
-        if inst.meta[0] != KIND_FILL || b != 0.0 || c != 0.0 || a == 0.0 || d == 0.0 {
+        let [scale_x, skew_y, skew_x, scale_y, offset_x, offset_y] = to_device.as_coeffs();
+        if inst.meta[0] != KIND_FILL
+            || skew_y != 0.0
+            || skew_x != 0.0
+            || scale_x == 0.0
+            || scale_y == 0.0
+        {
             self.push_instance(&inst);
             return;
         }
@@ -1227,15 +1228,27 @@ impl<'a> Lowering<'a> {
             f32_f64(span.y1),
         ];
         self.push_instance(&inst);
-        let (x0, x1) = if a >= 0.0 {
-            ((span.x0 - e) / a, (span.x1 - e) / a)
+        let (x0, x1) = if scale_x >= 0.0 {
+            (
+                (span.x0 - offset_x) / scale_x,
+                (span.x1 - offset_x) / scale_x,
+            )
         } else {
-            ((span.x1 - e) / a, (span.x0 - e) / a)
+            (
+                (span.x1 - offset_x) / scale_x,
+                (span.x0 - offset_x) / scale_x,
+            )
         };
-        let (y0, y1) = if d >= 0.0 {
-            ((span.y0 - f) / d, (span.y1 - f) / d)
+        let (y0, y1) = if scale_y >= 0.0 {
+            (
+                (span.y0 - offset_y) / scale_y,
+                (span.y1 - offset_y) / scale_y,
+            )
         } else {
-            ((span.y1 - f) / d, (span.y0 - f) / d)
+            (
+                (span.y1 - offset_y) / scale_y,
+                (span.y0 - offset_y) / scale_y,
+            )
         };
         inst.meta[0] = KIND_FILL;
         for strip in border_strips(bounds.inflate(margin, margin), Rect::new(x0, y0, x1, y1))
@@ -1254,10 +1267,10 @@ impl<'a> Lowering<'a> {
 
     /// Pushes `inst` either as one quad or, when the shadow's local
     /// `covered` region hides its interior, as the up-to-eight strips of
-    /// `b \ covered`. The interior behind an opaque card is opaque
+    /// `skew_y \ covered`. The interior behind an opaque card is opaque
     /// shadow: coverage there is already saturated, so skipping it
     /// changes no pixels — the strips' bounds only bound rasterization.
-    /// An opacity below 1 disables the split: a translucent group would
+    /// An opacity below 1 disables the split: scale_x translucent group would
     /// composite each strip separately.
     #[expect(clippy::float_cmp, reason = "the split is exact only at full opacity")]
     fn push_shadow_quads(&mut self, inst: &Instance, b: Rect, covered: Option<Cover>) {
@@ -1395,8 +1408,11 @@ impl<'a> Lowering<'a> {
             inst.meta[3] |= paint.packed & 0x00ff_ffff;
             self.push_instance(&inst);
             if let Some(pending) = pending {
-                self.cell_patches
-                    .push((self.frame.instances.len() as u32 - 1, pending, i as u32));
+                self.cell_patches.push((
+                    u32::try_from(self.frame.instances.len() - 1).expect("instance index fits u32"),
+                    pending,
+                    u32::try_from(i).expect("cell index fits u32"),
+                ));
             }
         }
     }
@@ -1696,7 +1712,7 @@ mod tests {
 
     fn draw(
         lowering: &mut Lowering<'_>,
-        command: cherenkov::Command,
+        command: &cherenkov::Command,
         glyphs: &GlyphContext<'_>,
     ) -> Result<(), RenderError> {
         use cherenkov::lowering::Compiler as _;
@@ -1707,7 +1723,7 @@ mod tests {
             pending: &mut pending,
         };
         let mut ops = Vec::new();
-        compiler.draw(&command, Affine::IDENTITY, &mut ops)?;
+        compiler.draw(command, Affine::IDENTITY, &mut ops)?;
         for op in ops {
             lowering.realize(&op, None, glyphs)?;
         }
@@ -1742,7 +1758,7 @@ mod tests {
                 |s, g| {
                     draw(
                         s,
-                        cherenkov::Command::Fill {
+                        &cherenkov::Command::Fill {
                             shape: ShapeData::Rect(Rect::new(4.0, 4.0, 20.0, 20.0)),
                             paint: cherenkov::Paint::Solid(WorkingColor::new([1.0, 0.0, 0.0, 1.0])),
                         },
@@ -1750,7 +1766,7 @@ mod tests {
                     )?;
                     draw(
                         s,
-                        cherenkov::Command::Fill {
+                        &cherenkov::Command::Fill {
                             shape: ShapeData::Rect(Rect::new(12.0, 12.0, 28.0, 28.0)),
                             paint: cherenkov::Paint::Solid(WorkingColor::new([0.0, 0.0, 1.0, 1.0])),
                         },
@@ -1791,7 +1807,7 @@ mod tests {
             cherenkov::Shadow::new(2.0, WorkingColor::new([0.0, 0.0, 0.0, 1.0])).spread(-20.0);
         draw(
             &mut lowering,
-            cherenkov::Command::Shadow {
+            &cherenkov::Command::Shadow {
                 shape: bar.clone(),
                 shadow: collapsed,
             },
@@ -1808,7 +1824,7 @@ mod tests {
             cherenkov::Shadow::new(2.0, WorkingColor::new([0.0, 0.0, 0.0, 1.0])).spread(-4.0);
         draw(
             &mut lowering,
-            cherenkov::Command::Shadow {
+            &cherenkov::Command::Shadow {
                 shape: bar,
                 shadow: shrunk,
             },

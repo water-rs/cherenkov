@@ -107,9 +107,6 @@ enum TargetState {
     },
 }
 
-/// Widens the frame's requested next-tick range to cover `rate`: the
-/// envelope over every surface asking for another frame.
-
 impl TargetState {
     /// The view vello renders into.
     const fn view(&self) -> &wgpu::TextureView {

@@ -327,7 +327,7 @@ fn create_device(
                 .allowed_usages
                 .contains(TARGET_USAGES)
         })
-        .ok_or(EngineError::Backend("no adapter".into()))?;
+        .ok_or_else(|| EngineError::Backend("no adapter".into()))?;
     let supported = adapter.features();
     let info = adapter.get_info();
     tracing::info!(

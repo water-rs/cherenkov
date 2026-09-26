@@ -26,6 +26,7 @@
 mod config;
 mod error;
 mod font;
+mod image;
 mod message;
 mod render;
 mod surface;
@@ -39,6 +40,7 @@ use std::sync::mpsc::Sender;
 pub use crate::config::{Budget, Bytes, GpuConfig, GpuInfo, MemoryUsage, Pressure, ScratchFormat};
 pub use crate::error::{EngineError, RenderError, ResourceError, SurfaceError, Unsupported};
 pub use crate::font::{Font, FontSource};
+pub use crate::image::{Image, ImageColorSpace, ImageSource};
 pub use crate::surface::{
     FrameStats, FrameTime, Layer, LayerContent, LayerEdit, Next, Offscreen, OffscreenFormat,
     PassTiming, Readback, RefreshRange, Surface, Transaction,
@@ -77,6 +79,7 @@ pub struct Engine<B: Backend> {
     surfaces: RefCell<HashMap<SurfaceId, Weak<RefCell<SurfaceShared>>>>,
     next_surface: Cell<SurfaceId>,
     next_font: Cell<u64>,
+    next_image: Cell<u64>,
     thread: Option<std::thread::JoinHandle<()>>,
     _backend: PhantomData<B>,
     // `!Send`: the engine lives on the UI thread.
@@ -109,6 +112,7 @@ impl Engine<Gpu> {
             surfaces: RefCell::new(HashMap::new()),
             next_surface: Cell::new(0),
             next_font: Cell::new(1),
+            next_image: Cell::new(1),
             thread: Some(thread),
             _backend: PhantomData,
             _not_send: PhantomData,
@@ -168,6 +172,31 @@ impl Engine<Gpu> {
             })
             .map_err(|_| ResourceError::Lost)?;
         Ok(Font::new(cherenkov::FontId::new(id)))
+    }
+
+    /// Registers an image.
+    ///
+    /// The pixels are validated on the caller thread; the render thread
+    /// converts them to premultiplied linear Display P3 f16 at upload, so
+    /// sampling hits the working space directly.
+    ///
+    /// # Errors
+    /// [`ResourceError::Image`] for a zero dimension or a pixel-length
+    /// mismatch and [`ResourceError::Lost`] when the render thread is gone.
+    pub fn image(&self, source: ImageSource) -> Result<Image, ResourceError> {
+        source.validate()?;
+        let id = self.next_image.get();
+        self.next_image.set(id + 1);
+        self.tx
+            .send(Message::AddImage {
+                id,
+                width: source.width,
+                height: source.height,
+                pixels: source.pixels.into(),
+                color_space: source.color_space,
+            })
+            .map_err(|_| ResourceError::Lost)?;
+        Ok(Image::new(cherenkov::ImageId::new(id), self.tx.clone()))
     }
 
     /// Creates an offscreen surface.

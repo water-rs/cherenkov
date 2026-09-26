@@ -159,41 +159,52 @@ impl Atlas {
         self.cpu_bytes = 0;
     }
 
-    /// Reserves a `w` × `h` cell, flushing the whole atlas on overflow.
-    fn alloc(&mut self, device: &wgpu::Device, w: u32, h: u32) -> Option<(u32, u32)> {
+    /// The atlas edge in texels.
+    pub const fn size(&self) -> u32 {
+        self.size
+    }
+
+    /// The largest atlas edge the budget allows.
+    pub const fn cap(&self) -> u32 {
+        self.cap
+    }
+
+    /// Doubles the atlas up to the cap, dropping every cached entry.
+    pub fn grow(&mut self, device: &wgpu::Device) {
+        let size = (self.size * 2).min(self.cap);
+        if size == self.size {
+            return;
+        }
+        let (texture, view) = Self::allocate(device, size);
+        self.texture = texture;
+        self.view = view;
+        self.size = size;
+        self.generation += 1;
+        self.clear();
+    }
+
+    /// Reserves a `w` × `h` cell, or `None` when it does not fit. Never
+    /// evicts: growth and clearing are the caller's decision.
+    fn alloc(&mut self, w: u32, h: u32) -> Option<(u32, u32)> {
         // Shelf height classes are multiples of 8.
         let class = (h + 2 * PAD).div_ceil(8) * 8;
-        loop {
-            for shelf in &mut self.shelves {
-                if shelf.h == class && shelf.x + w + 2 * PAD <= self.size {
-                    let x = shelf.x + PAD;
-                    shelf.x += w + 2 * PAD;
-                    return Some((x, shelf.y + PAD));
-                }
-            }
-            let top = self.shelves.last().map_or(0, |s| s.y + s.h);
-            if top + class <= self.size {
-                self.shelves.push(Shelf {
-                    y: top,
-                    h: class,
-                    x: w + 2 * PAD,
-                });
-                return Some((PAD, top + PAD));
-            }
-            // Overflow: flush everything, growing the texture up to the cap.
-            self.clear();
-            if self.size < self.cap {
-                let size = (self.size * 2).min(self.cap);
-                let (texture, view) = Self::allocate(device, size);
-                self.texture = texture;
-                self.view = view;
-                self.size = size;
-                self.generation += 1;
-            }
-            if w + 2 * PAD > self.size || h + 2 * PAD > self.size {
-                return None;
+        for shelf in &mut self.shelves {
+            if shelf.h == class && shelf.x + w + 2 * PAD <= self.size {
+                let x = shelf.x + PAD;
+                shelf.x += w + 2 * PAD;
+                return Some((x, shelf.y + PAD));
             }
         }
+        let top = self.shelves.last().map_or(0, |s| s.y + s.h);
+        if top + class <= self.size {
+            self.shelves.push(Shelf {
+                y: top,
+                h: class,
+                x: w + 2 * PAD,
+            });
+            return Some((PAD, top + PAD));
+        }
+        None
     }
 }
 
@@ -234,7 +245,7 @@ impl OutlinePen for PathPen {
 /// Rasterizes one glyph into the atlas and returns its entry, uploading the
 /// coverage texels through `queue`.
 ///
-/// Returns `Ok(None)` when the glyph is too large for the atlas.
+/// Returns [`RenderError::AtlasFull`] when the glyph's cell does not fit.
 #[expect(clippy::too_many_arguments)]
 #[expect(clippy::too_many_lines)]
 #[expect(clippy::many_single_char_names)]
@@ -242,7 +253,6 @@ impl OutlinePen for PathPen {
 #[expect(clippy::cast_sign_loss)]
 #[expect(clippy::cast_precision_loss)]
 pub fn rasterize(
-    device: &wgpu::Device,
     queue: &wgpu::Queue,
     atlas: &mut Atlas,
     font: &FontData,
@@ -304,8 +314,13 @@ pub fn rasterize(
         bbox = bbox.union_pt(a).union_pt(b);
         segments.push((a.x as f32, a.y as f32, b.x as f32, b.y as f32));
     };
+    // Flatten to 0.05 px in device space: `m`'s largest column norm is the
+    // worst-case factor a font-unit error grows by.
+    let [ma, mb, mc, md, ..] = m.as_coeffs();
+    let lmax = ma.hypot(mb).max(mc.hypot(md)).max(1e-9);
+    let tol = 0.05 / lmax;
     // Every subpath is closed: an open contour is closed implicitly.
-    kurbo::flatten(&pen.path, 0.05 / scale.max(1e-6), |el| match el {
+    kurbo::flatten(&pen.path, tol, |el| match el {
         PathEl::MoveTo(p) => {
             line(last, start);
             start = p;
@@ -333,8 +348,8 @@ pub fn rasterize(
     let bottom = bbox.y1.ceil() as i32 + 1;
     let w = (right - left) as u32;
     let h = (bottom - top) as u32;
-    let Some((cx, cy)) = atlas.alloc(device, w, h) else {
-        return Ok(Entry::default());
+    let Some((cx, cy)) = atlas.alloc(w, h) else {
+        return Err(RenderError::AtlasFull);
     };
     // Rasterize in cell space.
     let mut raster = Raster::new(w as usize, h as usize);

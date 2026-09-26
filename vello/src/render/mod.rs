@@ -240,11 +240,15 @@ fn create_target(
     size: (u32, u32),
     usages: wgpu::TextureUsages,
 ) -> (wgpu::Texture, wgpu::TextureView) {
+    // Zero extents (a minimized window, an empty offscreen target) are
+    // legal surface sizes but illegal texture sizes; the texture backs a
+    // scratch layer, so clamp it — rendering is skipped while a
+    // dimension is zero.
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
         size: wgpu::Extent3d {
-            width: size.0,
-            height: size.1,
+            width: size.0.max(1),
+            height: size.1.max(1),
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
@@ -424,15 +428,29 @@ pub fn run(
 impl Renderer {
     /// Creates a surface's target texture and layer tree.
     fn create_surface(&mut self, id: SurfaceId, target: TargetSpec) -> Result<(), SurfaceError> {
-        let (target, size, readable) = match target {
+        // Validate before any wgpu call: `create_texture`/`configure`
+        // panic on out-of-limit dimensions, which would kill the render
+        // thread and turn one bad size into `SurfaceError::Lost` for the
+        // whole engine.
+        let size = match &target {
+            TargetSpec::Offscreen { size } => *size,
+            TargetSpec::Window(window) => (window.config.width, window.config.height),
+        };
+        if size.0 > self.max_texture || size.1 > self.max_texture {
+            return Err(SurfaceError::TooLarge {
+                width: size.0,
+                height: size.1,
+                max: self.max_texture,
+            });
+        }
+        let (target, readable) = match target {
             TargetSpec::Offscreen { size } => {
                 let (texture, view) =
                     create_target(&self.device, "surface target", size, TARGET_USAGES);
-                (TargetState::Offscreen { texture, view }, size, true)
+                (TargetState::Offscreen { texture, view }, true)
             }
             TargetSpec::Window(window) => {
                 let interop::wgpu::Window { surface, config } = *window;
-                let size = (config.width, config.height);
                 surface.configure(&self.device, &config);
                 self.blitters.entry(config.format).or_insert_with(|| {
                     wgpu::util::TextureBlitter::new(&self.device, config.format)
@@ -446,18 +464,10 @@ impl Renderer {
                         texture,
                         view,
                     },
-                    size,
                     false,
                 )
             }
         };
-        if size.0 > self.max_texture || size.1 > self.max_texture {
-            return Err(SurfaceError::TooLarge {
-                width: size.0,
-                height: size.1,
-                max: self.max_texture,
-            });
-        }
         let mut layers = HashMap::new();
         layers.insert(0, node());
         self.surfaces.insert(
@@ -492,9 +502,14 @@ impl Renderer {
             view: v,
         } = &mut state.target
         {
-            config.width = size.0;
-            config.height = size.1;
-            surface.configure(&self.device, config);
+            config.width = size.0.max(1);
+            config.height = size.1.max(1);
+            // `configure` panics on a zero extent — e.g. a minimized
+            // window. Keep the clamped config; the surface is skipped at
+            // render time until a non-zero resize reconfigures it.
+            if size.0 != 0 && size.1 != 0 {
+                surface.configure(&self.device, config);
+            }
             *t = texture;
             *v = view;
         } else {
@@ -1143,6 +1158,14 @@ impl Renderer {
     ) -> Result<(), RenderError> {
         let mut scene = vello::Scene::new();
         let size = surf.size;
+        if size.0 == 0 || size.1 == 0 {
+            // Nothing drawable — e.g. a minimized window. Clear the flags;
+            // a later resize marks the surface dirty again and animation
+            // state is re-derived by the next real compose.
+            surf.dirty = false;
+            surf.wants_next = false;
+            return Ok(());
+        }
         // `wants_next` is per-surface until composed: a frame that asked
         // for a follow-up marks only the surfaces still animating, so one
         // idle surface cannot keep another surface's animation dirty.

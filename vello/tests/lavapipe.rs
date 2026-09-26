@@ -578,3 +578,32 @@ fn animated_content_requests_every_frame() {
     let rendered = renders.load(std::sync::atomic::Ordering::Relaxed);
     assert!(rendered >= 3, "content rendered {rendered} times in 3 frames");
 }
+
+/// An oversized surface must fail fast with `TooLarge` and leave the
+/// engine usable — not panic the render thread and turn every later
+/// `render` into `RenderError::Thread`.
+#[test]
+fn oversized_surface_fails_fast_and_the_engine_survives() {
+    let Some(engine) = engine() else { return };
+    let err = engine.surface(Offscreen::new((u32::MAX, u32::MAX))).err();
+    assert!(
+        matches!(
+            err,
+            Some(cherenkov_vello::SurfaceError::TooLarge { .. })
+        ),
+        "expected TooLarge, got {err:?}"
+    );
+    // The render thread is still alive and healthy surfaces still render.
+    let ok = engine.surface(Offscreen::new((8, 8))).expect("surface");
+    ok.clear_color(WorkingColor::BLACK);
+    let next = engine
+        .render(cherenkov_vello::FrameTime::now())
+        .expect("render after rejected surface");
+    assert_eq!(next, Next::Idle);
+    let readback = ok.readback().expect("readback");
+    assert_pixel(
+        px(&readback, 0, 0),
+        expected_pixel([0., 0., 0., 0.], WorkingColor::BLACK.components.map(f64::from)),
+        "black clear",
+    );
+}

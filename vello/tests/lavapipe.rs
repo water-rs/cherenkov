@@ -397,6 +397,51 @@ fn shader_paint_is_sampled_as_an_image() {
     assert_eq!(next, Next::Idle);
 }
 
+/// A shader paint inside an in-content `transform` must sample the full
+/// ramp across the shape: the texture is mapped onto the shape-local
+/// bbox (vello composes `xf * brush_transform`), not the device-space
+/// one — that would translate the texture a second time.
+#[test]
+fn shader_paint_maps_in_shape_space_under_transform() {
+    let Some(engine) = engine() else { return };
+    // Gray ramp along uv.x.
+    let ramp = engine
+        .shader(cherenkov_vello::ShaderSource::wgsl(
+            "@fragment fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> { return vec4<f32>(uv.x, uv.x, uv.x, 1.0); }",
+        ))
+        .expect("shader");
+    let surface = engine.surface(Offscreen::new((64, 64))).expect("surface");
+    surface.clear_color(WorkingColor::BLACK);
+    surface.update(|tx| {
+        tx[surface.root()].content(surface.record(|c| {
+            c.transform(Affine::translate((16., 16.)), |c| {
+                c.fill(
+                    Rect::new(0., 0., 32., 32.),
+                    cherenkov::ShaderPaint {
+                        shader: ramp.id(),
+                        uniforms: vec![],
+                    },
+                );
+            });
+        }));
+    });
+    let next = engine
+        .render(cherenkov_vello::FrameTime::now())
+        .expect("render");
+    assert_eq!(next, Next::Idle);
+    let readback = surface.readback().expect("readback");
+    let left = px(&readback, 18, 32);
+    let right = px(&readback, 46, 32);
+    assert!(
+        left[0] < 0.05 && left[1] < 0.05 && left[2] < 0.05,
+        "ramp start should be near black: {left:?}"
+    );
+    assert!(
+        right[0] > 0.6 && right[1] > 0.6 && right[2] > 0.6,
+        "ramp end should be near white: {right:?}"
+    );
+}
+
 #[test]
 fn bad_wgsl_returns_resource_error() {
     let Some(engine) = engine() else { return };

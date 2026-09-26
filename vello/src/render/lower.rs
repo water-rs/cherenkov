@@ -308,6 +308,7 @@ fn shader_brush(
     let bbox = (xf * path.clone()).bounding_box();
     let w = (bbox.width().ceil() as u32).clamp(1, resources.max_texture);
     let h = (bbox.height().ceil() as u32).clamp(1, resources.max_texture);
+    let local = path.bounding_box();
     let image = shader::texture_image(w, h, peniko::ImageAlphaType::Alpha);
     let brush = Brush::Image(ImageBrush {
         image: image.clone(),
@@ -318,9 +319,11 @@ fn shader_brush(
             alpha: 1.0,
         },
     });
-    // Map the `w`×`h` texture over the shape's device-space bbox.
-    let brush_transform = Affine::translate((bbox.x0, bbox.y0))
-        * Affine::scale_non_uniform(bbox.width() / f64::from(w), bbox.height() / f64::from(h));
+    // Vello draws the image under `xf * brush_transform`, so the transform
+    // must map the texture onto the *local-space* bbox; using the
+    // device-space `bbox` would apply `xf` twice.
+    let brush_transform = Affine::translate((local.x0, local.y0))
+        * Affine::scale_non_uniform(local.width() / f64::from(w), local.height() / f64::from(h));
     resources.shader_uses.push(ShaderUse {
         shader: id,
         uniforms: paint.uniforms.clone(),

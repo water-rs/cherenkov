@@ -244,6 +244,15 @@ struct Renderer {
     max_texture: u32,
 }
 
+/// Slot updates addressed to a layer with no live list — without the
+/// error the stale picture keeps rendering with no trace.
+#[derive(Debug, thiserror::Error)]
+#[error("slot updates for layer {layer} dropped: its content is {content}")]
+struct UpdateDropped {
+    layer: LayerId,
+    content: &'static str,
+}
+
 /// One submitted frame's timestamp queries awaiting GPU completion.
 ///
 /// The resolve and the copy into `staging` are submitted with the frame;
@@ -1029,8 +1038,8 @@ impl Renderer {
                                 node.content = Some(ContentData::List(picture));
                             }
                             ContentChange::Update(updates) => {
-                                if let Some(ContentData::List(picture)) = &mut node.content {
-                                    let _ = picture.apply(updates);
+                                if let Err(e) = Self::apply_update(id, node, updates) {
+                                    tracing::error!("{e}");
                                 }
                             }
                         }
@@ -1120,6 +1129,32 @@ impl Renderer {
         }
         if let Some(node) = layers.get_mut(&child) {
             node.parent = None;
+        }
+    }
+
+    /// Applies slot updates to a node's live list; errors when the node's
+    /// content can't receive them. `apply` itself panics on a bad update —
+    /// this catches the content-kind mismatch its caller can't express.
+    fn apply_update(
+        id: LayerId,
+        node: &mut LayerNode,
+        updates: Vec<cherenkov::SlotUpdate>,
+    ) -> Result<(), UpdateDropped> {
+        match &mut node.content {
+            Some(ContentData::List(picture)) => {
+                // The regenerated ranges go unused — the layer is dirty
+                // and re-lowered wholesale.
+                let _ = picture.apply(updates);
+                Ok(())
+            }
+            Some(ContentData::Picture(_)) => Err(UpdateDropped {
+                layer: id,
+                content: "a static picture",
+            }),
+            None => Err(UpdateDropped {
+                layer: id,
+                content: "empty",
+            }),
         }
     }
 
@@ -1979,6 +2014,25 @@ mod tests {
         layers.insert(9, node());
         Renderer::detach(&mut layers, 9);
         assert!(layers.values().all(|n| !n.children.contains(&9)));
+    }
+
+    /// Slot updates for a layer with no live list must surface as an
+    /// error — silently dropping them renders stale content.
+    #[test]
+    fn an_update_for_static_content_is_an_error() {
+        let picture = cherenkov::Picture::record(|_| {});
+        let mut static_node = LayerNode {
+            content: Some(ContentData::Picture(picture.clone())),
+            ..node()
+        };
+        assert!(Renderer::apply_update(7, &mut static_node, Vec::new()).is_err());
+        let mut live_node = LayerNode {
+            content: Some(ContentData::List(picture)),
+            ..node()
+        };
+        assert!(Renderer::apply_update(7, &mut live_node, Vec::new()).is_ok());
+        let mut empty = node();
+        assert!(Renderer::apply_update(7, &mut empty, Vec::new()).is_err());
     }
 
     #[test]

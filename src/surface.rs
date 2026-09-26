@@ -698,7 +698,7 @@ impl<B: Backend> Surface<B> {
                         child,
                     })),
                     EditOp::Detach(child) => {
-                        ops.push(Op::Layer(LayerOp::Detach { parent: id, child }))
+                        ops.push(Op::Layer(LayerOp::Detach { parent: id, child }));
                     }
                 }
             }

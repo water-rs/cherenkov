@@ -279,6 +279,7 @@ const fn node() -> LayerNode {
         clip: None,
         content: None,
         children: Vec::new(),
+        parent: None,
     }
 }
 
@@ -975,6 +976,10 @@ impl Renderer {
     }
 
     /// Applies one surface's change set.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one match arm per layer op stays flatter than a helper per op"
+    )]
     fn commit(&mut self, surface: SurfaceId, changes: ChangeSet) {
         let Some(state) = self.surfaces.get_mut(&surface) else {
             return;
@@ -1044,6 +1049,9 @@ impl Renderer {
                     Self::detach(&mut state.layers, child);
                     if let Some(node) = state.layers.get_mut(&parent) {
                         node.children.push(child);
+                        if let Some(child_node) = state.layers.get_mut(&child) {
+                            child_node.parent = Some(parent);
+                        }
                     }
                 }
                 LayerOp::Insert { parent, child, .. }
@@ -1063,11 +1071,19 @@ impl Renderer {
                     Self::detach(&mut state.layers, child);
                     if let Some(node) = state.layers.get_mut(&parent) {
                         node.children.insert(index.min(node.children.len()), child);
+                        if let Some(child_node) = state.layers.get_mut(&child) {
+                            child_node.parent = Some(parent);
+                        }
                     }
                 }
                 LayerOp::Detach { parent, child } => {
                     if let Some(node) = state.layers.get_mut(&parent) {
                         node.children.retain(|c| *c != child);
+                    }
+                    if let Some(node) = state.layers.get_mut(&child)
+                        && node.parent == Some(parent)
+                    {
+                        node.parent = None;
                     }
                 }
             }
@@ -1093,10 +1109,17 @@ impl Renderer {
         false
     }
 
-    /// Removes `child` from every child list holding it.
+    /// Removes `child` from its recorded parent's child list — O(that
+    /// list's length), not O(every node).
     fn detach(layers: &mut HashMap<LayerId, LayerNode>, child: LayerId) {
-        for node in layers.values_mut() {
+        let Some(parent) = layers.get(&child).and_then(|node| node.parent) else {
+            return;
+        };
+        if let Some(node) = layers.get_mut(&parent) {
             node.children.retain(|c| *c != child);
+        }
+        if let Some(node) = layers.get_mut(&child) {
+            node.parent = None;
         }
     }
 
@@ -1913,6 +1936,7 @@ mod tests {
         }
         for (parent, child) in edges {
             layers.get_mut(parent).unwrap().children.push(*child);
+            layers.get_mut(child).unwrap().parent = Some(*parent);
         }
         layers
     }
@@ -1940,5 +1964,32 @@ mod tests {
         let layers = tree(&[(0, 1), (1, 0)]);
         assert!(Renderer::would_cycle(&layers, 0, 1));
         assert!(!Renderer::would_cycle(&layers, 9, 1));
+    }
+
+    /// `detach` follows the child's parent link — one child list, never
+    /// a scan over every node.
+    #[test]
+    fn detach_uses_the_parent_link() {
+        let mut layers = tree(&[(0, 1), (1, 2), (0, 3)]);
+        Renderer::detach(&mut layers, 3);
+        assert!(!layers[&0].children.contains(&3));
+        assert_eq!(layers[&3].parent, None, "the link is cleared");
+        assert_eq!(layers[&1].children, [2], "sibling lists untouched");
+        // A node with no recorded parent leaves every list alone.
+        layers.insert(9, node());
+        Renderer::detach(&mut layers, 9);
+        assert!(layers.values().all(|n| !n.children.contains(&9)));
+    }
+
+    #[test]
+    fn removing_a_subtree_clears_its_links() {
+        // 0 -> 1 -> {2, 3}: removing 1 removes the subtree; each
+        // descendant's parent link dies with it.
+        let mut layers = tree(&[(0, 1), (1, 2), (1, 3)]);
+        Renderer::remove_node(&mut layers, 1);
+        assert!(layers[&0].children.is_empty());
+        assert!(!layers.contains_key(&1));
+        assert!(!layers.contains_key(&2));
+        assert!(!layers.contains_key(&3));
     }
 }

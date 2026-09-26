@@ -523,6 +523,9 @@ pub struct LayerNode {
     pub content: Option<ContentData>,
     /// Child layers, in order.
     pub children: Vec<u64>,
+    /// The layer this node is attached under — lets detach touch one
+    /// child list instead of scanning every node's.
+    pub parent: Option<u64>,
 }
 
 /// A layer's content.

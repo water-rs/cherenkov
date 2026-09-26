@@ -476,6 +476,56 @@ pub fn curve_value(curve: &Curve, t: f64) -> f64 {
     (3.0 * v * v * u).mul_add(y1, (3.0 * v * u * u).mul_add(y2, u * u * u))
 }
 
+/// The slope `de/dt` of [`curve_value`] at normalized `t`: `y′(u)/x′(u)`.
+/// Returns 0 at the endpoints and where the inversion stalls.
+#[must_use]
+pub fn curve_slope(curve: &Curve, t: f64) -> f64 {
+    let t = t.clamp(0.0, 1.0);
+    if t <= 0.0 || t >= 1.0 {
+        return 0.0;
+    }
+    let (x1, y1) = (curve.p1.x, curve.p1.y);
+    let (x2, y2) = (curve.p2.x, curve.p2.y);
+    let bx = |u: f64| -> f64 {
+        let v = 1.0 - u;
+        (3.0 * v * v * u).mul_add(x1, (3.0 * v * u * u).mul_add(x2, u * u * u))
+    };
+    let mut u = t;
+    let mut lo = 0.0;
+    let mut hi = 1.0;
+    for _ in 0..8 {
+        let err = bx(u) - t;
+        if err.abs() < 1e-6 {
+            break;
+        }
+        if err > 0.0 {
+            hi = u;
+        } else {
+            lo = u;
+        }
+        let v = 1.0 - u;
+        let slope = (3.0 * v * v).mul_add(
+            x1,
+            (6.0 * v * u).mul_add(x2 - x1, (3.0 * u * u).mul_add(1.0 - x2, 0.0)),
+        );
+        u = if slope.abs() > 1e-6 {
+            (u - err / slope).clamp(lo, hi)
+        } else {
+            f64::midpoint(lo, hi)
+        };
+    }
+    let v = 1.0 - u;
+    let dy = (3.0 * v * v).mul_add(
+        y1,
+        (6.0 * v * u).mul_add(y2 - y1, (3.0 * u * u).mul_add(1.0 - y2, 0.0)),
+    );
+    let dx = (3.0 * v * v).mul_add(
+        x1,
+        (6.0 * v * u).mul_add(x2 - x1, (3.0 * u * u).mul_add(1.0 - x2, 0.0)),
+    );
+    if dx.abs() < 1e-9 { 0.0 } else { dy / dx }
+}
+
 /// The position and velocity of an exponential decay `dt` seconds in:
 /// `x(t) = x₀ + v·(1 − e^(−k·t)) / k`, `v(t) = v·e^(−k·t)`.
 #[must_use]

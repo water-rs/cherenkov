@@ -152,10 +152,15 @@ impl<T: Animatable> Track<T> {
             Animation::Curve(curve) => {
                 let duration = curve.duration.as_secs_f64();
                 let t01 = if duration <= 0.0 { 1.0 } else { dt / duration };
-                let pos = self
-                    .from
-                    .add_scaled(&target.sub(&self.from), curve_value(curve, t01));
-                (pos, T::Lanes::zero(), t01 >= 1.0)
+                let delta = target.sub(&self.from);
+                let pos = self.from.add_scaled(&delta, curve_value(curve, t01));
+                // v = Δ·e′(t)/duration so a retarget can inherit it.
+                let vel = if duration > 0.0 {
+                    delta.scale(crate::animation::curve_slope(curve, t01) / duration)
+                } else {
+                    T::Lanes::zero()
+                };
+                (pos, vel, t01 >= 1.0)
             }
             Animation::Decay(decay) => {
                 let (pos, vel) = decay_step(self.from, self.velocity, decay.deceleration, dt);

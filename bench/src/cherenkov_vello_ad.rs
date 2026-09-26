@@ -92,7 +92,7 @@ enum PrepItem {
     /// A maximal run of draw items, drawn as one layer's content.
     Content(Vec<Op>),
     /// A child scene layer.
-    Layer(PrepLayer),
+    Layer(Box<PrepLayer>),
 }
 
 /// A scene layer lowered in `prepare`.
@@ -579,9 +579,9 @@ fn prep_layer(
         for item in &layer.items {
             match item {
                 Item::Draw(d) => prep.own.push(op(d, fonts, images, prepared)?),
-                Item::Layer(l) => prep
-                    .items
-                    .push(PrepItem::Layer(prep_layer(l, fonts, images, prepared)?)),
+                Item::Layer(l) => prep.items.push(PrepItem::Layer(Box::new(prep_layer(
+                    l, fonts, images, prepared,
+                )?))),
             }
         }
     } else {
@@ -593,8 +593,9 @@ fn prep_layer(
                     if !run.is_empty() {
                         prep.items.push(PrepItem::Content(std::mem::take(&mut run)));
                     }
-                    prep.items
-                        .push(PrepItem::Layer(prep_layer(l, fonts, images, prepared)?));
+                    prep.items.push(PrepItem::Layer(Box::new(prep_layer(
+                        l, fonts, images, prepared,
+                    )?)));
                 }
             }
         }
@@ -641,7 +642,7 @@ fn build_layer(
                     motion: None,
                 });
             }
-            PrepItem::Layer(p) => build_layer(surface, tx, &layer, p, content_layers),
+            PrepItem::Layer(p) => build_layer(surface, tx, &layer, *p, content_layers),
         }
     }
     content_layers.push(ContentLayer {

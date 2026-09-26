@@ -42,6 +42,7 @@ impl LayerMotion {
     /// Translates a scene `motion`, given the layer's static `transform`.
     /// The static `scroll_offset` is unused: a decay commits its `from`
     /// state and comes to rest at `from + velocity / deceleration`.
+    #[must_use]
     pub fn from_scene(motion: &Motion, transform: Affine) -> Self {
         match motion {
             Motion::Transform { from, animation } => Self::Transform {
@@ -127,6 +128,8 @@ const TICK: Duration = Duration::from_nanos(1_000_000_000 / 120);
 
 impl Clock {
     /// A clock at frame zero, origin now.
+    #[must_use]
+    #[allow(clippy::new_without_default)] // `Instant::now` cannot run in `Default`.
     pub fn new() -> Self {
         Self {
             origin: Instant::now(),
@@ -135,12 +138,13 @@ impl Clock {
     }
 
     /// The current frame time.
+    #[must_use]
     pub fn time(&self) -> FrameTime {
         FrameTime::at(self.origin + TICK * u32::try_from(self.frame).unwrap_or(u32::MAX))
     }
 
     /// Advances the clock one tick.
-    pub fn advance(&mut self) {
+    pub const fn advance(&mut self) {
         self.frame += 1;
     }
 }

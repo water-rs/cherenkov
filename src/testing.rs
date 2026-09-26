@@ -203,15 +203,488 @@ impl Renderer for NullRenderer {
 impl Uploads<Rgba8> for Null {}
 impl Uploads<Rgba16F> for Null {}
 
+/// Expands to one cross-backend behaviour suite.
+///
+/// The suite emits `#[test]` functions exercising the shared front end end
+/// to end, observing only `Offscreen` readback pixels, so it is identical
+/// for every backend.
+///
+/// Invoke once in a backend crate's `tests/behaviour.rs`:
+///
+/// ```ignore
+/// cherenkov::behaviour_suite! {
+///     backend: cherenkov_vello::Vello,
+///     config: || cherenkov_vello::VelloConfig::default(),
+///     uploads: true,
+/// }
+/// ```
+///
+/// `uploads` gates the image-lifetime test on backends implementing
+/// `Uploads<Rgba8>`. GPU backends need the driver environment set by the
+/// caller (on this box, lavapipe via `VK_ICD_FILENAMES`/`WGPU_BACKEND`).
+/// Available with the `testing` feature.
+#[cfg(feature = "testing")]
+#[macro_export]
+macro_rules! behaviour_suite {
+    { backend: $backend:ty, config: $config:expr, uploads: true $(,)? } => {
+        $crate::behaviour_suite! { @impl $backend, $config }
+        /// Image-lifetime checks for backends implementing
+        /// `Uploads<Rgba8>`.
+        mod behaviour_suite_uploads {
+            use std::time::{Duration, Instant};
+
+            use $crate::{Draw as _, Engine, FrameTime, ImageData, Layer, Offscreen, OffscreenFormat, Readback, Rgba8, Surface, WorkingColor};
+            use $crate::kurbo::{Affine, Rect, Vec2};
+
+            /// The backend under test.
+            type B = $backend;
+            const TICK: Duration = Duration::from_nanos(1_000_000_000 / 120);
+            fn engine() -> Option<Engine<B>> {
+                Engine::<B>::new($config()).ok()
+            }
+
+            /// The last `Image` clone's drop queues `remove_image`, which
+            /// the backend frees on the next render.
+            #[test]
+            fn the_last_image_drop_frees_its_memory() {
+                let Some(engine) = engine() else { return };
+                let _surface = engine
+                    .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))
+                    .expect("surface");
+                // A first render settles one-off allocations so the
+                // baseline is stable.
+                engine.render(FrameTime::at(Instant::now())).expect("render");
+                let before = engine.memory().gpu.0 + engine.memory().cpu.0;
+                let data = vec![255u8; 64 * 64 * 4];
+                let image = engine
+                    .image(ImageData::<Rgba8>::new(64, 64, data).expect("image data"))
+                    .expect("image");
+                let clone = image.clone();
+                engine
+                    .render(FrameTime::at(Instant::now() + TICK))
+                    .expect("render");
+                let with_image = engine.memory().gpu.0 + engine.memory().cpu.0;
+                assert!(with_image > before, "memory {with_image} <= {before}");
+                drop(image);
+                drop(clone);
+                engine
+                    .render(FrameTime::at(Instant::now() + TICK * 2))
+                    .expect("render");
+                let after = engine.memory().gpu.0 + engine.memory().cpu.0;
+                assert!(after < with_image, "memory {after} >= {with_image}");
+            }
+        }
+    };
+    { backend: $backend:ty, config: $config:expr, uploads: false $(,)? } => {
+        $crate::behaviour_suite! { @impl $backend, $config }
+    };
+    { @impl $backend:ty, $config:expr } => {
+        mod behaviour_suite {
+            use std::time::{Duration, Instant};
+
+            use ::nami::SignalExt as _;
+            use $crate::kurbo::{Affine, Rect, Vec2};
+            use $crate::{
+                Animation, Curve, Decay, Draw as _, Engine, FrameTime, ImageData, Layer, Next,
+                Offscreen, OffscreenFormat, Readback, Rgba8, Spring, Surface, WorkingColor,
+            };
+
+            /// The backend under test.
+            type B = $backend;
+
+            /// One frame at 120 Hz, the suite's sampling step.
+            const TICK: Duration = Duration::from_nanos(1_000_000_000 / 120);
+            /// An opaque white 16×16 square.
+            const WHITE: WorkingColor = WorkingColor::WHITE;
+
+            /// A new engine, or `None` when the backend cannot init here
+            /// (a GPU backend without an adapter skips its tests).
+            fn engine() -> Option<Engine<B>> {
+                Engine::<B>::new($config()).ok()
+            }
+
+            /// A 256×64 `Offscreen` surface — wide enough that a scrolled
+            /// or translated square stays in view.
+            fn surface(engine: &Engine<B>) -> Surface<B> {
+                engine
+                    .surface(Offscreen::new((256, 64), OffscreenFormat::LinearF16))
+                    .expect("surface")
+            }
+
+            /// A child layer of `parent` holding an opaque square at
+            /// `rect`, in the layer's local space.
+            fn square(surface: &Surface<B>, parent: &Layer, rect: Rect) -> Layer {
+                let layer = surface.layer();
+                let content = surface.record(|c| c.fill(rect, WHITE));
+                surface.update(|tx| {
+                    tx[parent].push(&layer);
+                    tx[&layer].content(content);
+                });
+                layer
+            }
+
+            /// The alpha-weighted centroid of pixels inside `region`
+            /// (pixel centres, alpha above 0.25). `None` when the region
+            /// holds no opaque pixels.
+            fn square_center_in(readback: &Readback, region: Rect) -> Option<(f64, f64)> {
+                let (mut sx, mut sy, mut sw) = (0.0, 0.0, 0.0);
+                for y in region.min_y().max(0.0) as u32..region.max_y() as u32 {
+                    for x in region.min_x().max(0.0) as u32..region.max_x() as u32 {
+                        let a = f64::from(readback.pixels[(y * readback.width + x) as usize][3]);
+                        if a > 0.25 {
+                            sx = a.mul_add(f64::from(x) + 0.5, sx);
+                            sy = a.mul_add(f64::from(y) + 0.5, sy);
+                            sw += a;
+                        }
+                    }
+                }
+                (sw > 0.5).then_some((sx / sw, sy / sw))
+            }
+
+            /// The alpha-weighted centroid of every opaque pixel.
+            fn square_center(readback: &Readback) -> Option<(f64, f64)> {
+                square_center_in(
+                    readback,
+                    Rect::new(0.0, 0.0, readback.width.into(), readback.height.into()),
+                )
+            }
+
+            /// The alpha channel of one pixel.
+            fn alpha_at(readback: &Readback, x: u32, y: u32) -> f64 {
+                f64::from(readback.pixels[(y * readback.width + x) as usize][3])
+            }
+
+            /// Renders at `t` and returns the `Next`.
+            fn render_at(engine: &Engine<B>, t: Instant) -> Next {
+                engine.render(FrameTime::at(t)).expect("render")
+            }
+
+            /// Renders frames at `t`, `t + TICK`, … until `Next::Idle`
+            /// (cap 2000 frames) and returns the last sampled position.
+            fn settle(engine: &Engine<B>, surface: &Surface<B>, t0: Instant) -> (f64, f64) {
+                let mut t = t0;
+                for _ in 0..2000 {
+                    if render_at(engine, t) == Next::Idle {
+                        break;
+                    }
+                    t += TICK;
+                }
+                square_center(&surface.readback().expect("readback")).expect("a drawn square")
+            }
+
+            #[test]
+            fn layer_tree_edits_change_what_is_drawn() {
+                let Some(engine) = engine() else { return };
+                let surface = surface(&engine);
+                let window_a = Rect::new(4.0, 24.0, 20.0, 44.0);
+                let window_b = Rect::new(64.0, 24.0, 80.0, 44.0);
+                let t0 = Instant::now();
+                let mut frame = 0u64;
+                let mut render = |engine: &Engine<B>| {
+                    frame += 1;
+                    render_at(engine, t0 + TICK * frame as u32)
+                };
+
+                let a = square(&surface, &surface.root(), Rect::new(8.0, 28.0, 16.0, 40.0));
+                render(&engine);
+                let rb = surface.readback().expect("readback");
+                assert!(square_center_in(&rb, window_a).is_some(), "a not drawn");
+                assert!(square_center_in(&rb, window_b).is_none(), "b drawn early");
+
+                // `insert` at index 0 puts b first; both are drawn.
+                let b = surface.layer();
+                let content = surface.record(|c| c.fill(Rect::new(68.0, 28.0, 76.0, 40.0), WHITE));
+                surface.update(|tx| {
+                    tx[surface.root()].insert(0, &b);
+                    tx[&b].content(content);
+                });
+                render(&engine);
+                let rb = surface.readback().expect("readback");
+                assert!(square_center_in(&rb, window_a).is_some(), "a missing");
+                assert!(square_center_in(&rb, window_b).is_some(), "b missing");
+
+                // `remove` detaches a from the tree; only b is drawn.
+                surface.update(|tx| {
+                    tx[surface.root()].remove(&a);
+                });
+                render(&engine);
+                let rb = surface.readback().expect("readback");
+                assert!(square_center_in(&rb, window_a).is_none(), "a still drawn");
+                assert!(square_center_in(&rb, window_b).is_some(), "b missing");
+
+                // Re-attach a with `push`, then drop b: only a remains.
+                surface.update(|tx| {
+                    tx[surface.root()].push(&a);
+                });
+                drop(b);
+                render(&engine);
+                let rb = surface.readback().expect("readback");
+                assert!(square_center_in(&rb, window_a).is_some(), "a missing");
+                assert!(square_center_in(&rb, window_b).is_none(), "b still drawn");
+            }
+
+            #[test]
+            fn a_transform_spring_settles_at_its_target() {
+                let Some(engine) = engine() else { return };
+                let surface = surface(&engine);
+                // Square centre starts at (32, 32); the spring targets
+                // translate(16, 0) → (48, 32).
+                let layer = square(&surface, &surface.root(), Rect::new(24.0, 24.0, 40.0, 40.0));
+                surface.update(|tx| {
+                    tx[&layer].transform(Affine::IDENTITY);
+                });
+                surface.update_animated(
+                    Spring {
+                        response: 0.4,
+                        damping: 1.0,
+                    },
+                    |tx| {
+                        tx[&layer].transform(Affine::translate((16.0, 0.0)));
+                    },
+                );
+                let t0 = Instant::now();
+                render_at(&engine, t0);
+                let (x0, y0) =
+                    square_center(&surface.readback().expect("readback")).expect("square");
+                assert!((x0 - 32.0).abs() < 0.5 && (y0 - 32.0).abs() < 0.5, "start {x0},{y0}");
+
+                render_at(&engine, t0 + TICK * 6);
+                let (x1, _) =
+                    square_center(&surface.readback().expect("readback")).expect("square");
+                assert!(x1 > x0 + 0.5 && x1 < 48.0, "mid {x1}");
+
+                let (x2, y2) = settle(&engine, &surface, t0 + TICK * 6);
+                assert!((x2 - 48.0).abs() < 0.5 && (y2 - 32.0).abs() < 0.5, "end {x2},{y2}");
+            }
+
+            #[test]
+            fn a_curve_hits_its_endpoints_exactly() {
+                let Some(engine) = engine() else { return };
+                let surface = surface(&engine);
+                let layer = square(&surface, &surface.root(), Rect::new(24.0, 24.0, 40.0, 40.0));
+                surface.update(|tx| {
+                    tx[&layer].transform(Affine::IDENTITY);
+                });
+                surface.update_animated(
+                    Curve::ease_in_out(Duration::from_millis(160)),
+                    |tx| {
+                        tx[&layer].transform(Affine::translate((16.0, 0.0)));
+                    },
+                );
+                let t0 = Instant::now();
+                render_at(&engine, t0);
+                let (x0, _) =
+                    square_center(&surface.readback().expect("readback")).expect("square");
+                assert!((x0 - 32.0).abs() < 0.5, "start {x0}");
+
+                // At and past the duration the value is exactly the target.
+                let next = render_at(&engine, t0 + Duration::from_millis(200));
+                assert_eq!(next, Next::Idle, "{next:?}");
+                let (x1, _) =
+                    square_center(&surface.readback().expect("readback")).expect("square");
+                assert!((x1 - 48.0).abs() < 0.01, "end {x1}");
+            }
+
+            #[test]
+            fn a_retargeted_spring_keeps_its_velocity() {
+                let Some(engine) = engine() else { return };
+                let surface = surface(&engine);
+                let layer = square(&surface, &surface.root(), Rect::new(8.0, 24.0, 24.0, 40.0));
+                // A linear curve runs at constant velocity — the
+                // pre-retarget samples give v exactly, so the post-retarget
+                // step can be checked against v·dt at 1%. (A spring carrier
+                // drifts several % per frame across the 2-frame sampling
+                // gap, making 1% unreachable through pixel centroids.)
+                surface.update(|tx| {
+                    tx[&layer].transform(Affine::IDENTITY);
+                });
+                surface.update_animated(
+                    Curve::linear(Duration::from_millis(400)),
+                    |tx| {
+                        tx[&layer].transform(Affine::translate((160.0, 0.0)));
+                    },
+                );
+                let t0 = Instant::now();
+                // Mid-flight at t1: measure the incoming velocity from the
+                // two samples just before it.
+                let t1 = t0 + TICK * 8;
+                render_at(&engine, t1 - TICK);
+                let (c0, _) =
+                    square_center(&surface.readback().expect("readback")).expect("square");
+                render_at(&engine, t1);
+                let (c1, _) =
+                    square_center(&surface.readback().expect("readback")).expect("square");
+                let dt = TICK.as_secs_f64();
+                let v = (c1 - c0) / dt;
+                assert!(v > 30.0, "not mid-flight: v={v}");
+
+                // Retarget into a very soft spring (response 4 s): its own
+                // acceleration per frame is ~ω·dt/2 ≈ 0.7%, inside the 1%
+                // bound, so the step measures the inherited velocity.
+                surface.update(|tx| {
+                    tx[&layer]
+                        .transform(Affine::translate((160.0, 16.0)))
+                        .animation(Spring {
+                            response: 4.0,
+                            damping: 1.0,
+                        });
+                });
+                // The commit frame samples the new track at dt = 0; the
+                // step after it must equal the incoming velocity · dt.
+                render_at(&engine, t1 + TICK);
+                let (c2, _) =
+                    square_center(&surface.readback().expect("readback")).expect("square");
+                render_at(&engine, t1 + TICK * 2);
+                let (c3, _) =
+                    square_center(&surface.readback().expect("readback")).expect("square");
+                let expected = v * dt;
+                assert!(
+                    (c3 - c2 - expected).abs() <= expected.abs() * 0.01,
+                    "displacement {} vs velocity·dt {expected}",
+                    c3 - c2
+                );
+            }
+
+            #[test]
+            fn a_scroll_decay_covers_velocity_over_deceleration() {
+                let Some(engine) = engine() else { return };
+                let surface = surface(&engine);
+                // Square centre (200, 32); a (600, 0)/k=4 decay covers
+                // 150 px of scroll, moving the square 150 px left.
+                let layer = square(&surface, &surface.root(), Rect::new(192.0, 24.0, 208.0, 40.0));
+                surface.update(|tx| {
+                    tx[&layer].scroll_offset(Vec2::ZERO);
+                });
+                surface.update(|tx| {
+                    tx[&layer]
+                        .scroll_offset(Vec2::ZERO)
+                        .animation(Decay {
+                            velocity: Vec2::new(600.0, 0.0),
+                            deceleration: 4.0,
+                            rubber_band: None,
+                        });
+                });
+                let t0 = Instant::now();
+                let (x2, y2) = settle(&engine, &surface, t0);
+                // Pixel-snapped: 150 ± 1.
+                assert!((x2 - 50.0).abs() < 1.0 && (y2 - 32.0).abs() < 1.0, "end {x2},{y2}");
+            }
+
+            #[test]
+            fn a_rubber_band_returns_to_the_bound_edge() {
+                let Some(engine) = engine() else { return };
+                let surface = surface(&engine);
+                let layer = square(&surface, &surface.root(), Rect::new(192.0, 24.0, 208.0, 40.0));
+                // Bounds x ∈ [0, 100]: the decay overshoots to 150 and the
+                // rubber band pulls it back to 100.
+                let bounds = Rect::new(-10.0, -10.0, 100.0, 100.0);
+                surface.update(|tx| {
+                    tx[&layer]
+                        .scroll_offset(Vec2::ZERO)
+                        .animation(Decay::new(Vec2::new(600.0, 0.0)).rubber_band(bounds));
+                });
+                let t0 = Instant::now();
+                let (x2, y2) = settle(&engine, &surface, t0);
+                assert!((x2 - 100.0).abs() < 1.0 && (y2 - 32.0).abs() < 1.0, "end {x2},{y2}");
+            }
+
+            #[test]
+            fn a_bound_signal_updates_opacity_without_a_transaction() {
+                let Some(engine) = engine() else { return };
+                let surface = surface(&engine);
+                let layer = square(&surface, &surface.root(), Rect::new(24.0, 24.0, 40.0, 40.0));
+                let opacity = ::nami::binding(1.0f32);
+                surface.update(|tx| {
+                    tx[&layer].opacity(opacity.clone());
+                });
+                let t0 = Instant::now();
+                render_at(&engine, t0);
+                let rb = surface.readback().expect("readback");
+                assert!((alpha_at(&rb, 32, 32) - 1.0).abs() < 0.05);
+
+                // A plain signal change snaps the opacity.
+                opacity.set(0.4f32);
+                let next = render_at(&engine, t0 + TICK);
+                assert_eq!(next, Next::Idle, "{next:?}");
+                let rb = surface.readback().expect("readback");
+                assert!((alpha_at(&rb, 32, 32) - 0.4).abs() < 0.05, "alpha");
+
+                // `with(Animation)` metadata animates the change: a sample
+                // one frame in is strictly between the endpoints.
+                let layer2 = square(&surface, &surface.root(), Rect::new(24.0, 24.0, 40.0, 40.0));
+                surface.update(|tx| {
+                    tx[surface.root()].remove(&layer);
+                    tx[&layer2].opacity(opacity.clone().with(Animation::from(Spring::smooth())));
+                });
+                opacity.set(0.0f32);
+                // The commit frame samples at dt = 0 → still 0.4.
+                render_at(&engine, t0 + TICK * 3);
+                let next = render_at(&engine, t0 + TICK * 8);
+                let rb = surface.readback().expect("readback");
+                let a = alpha_at(&rb, 32, 32);
+                assert!(a > 0.02 && a < 0.39, "interpolated alpha {a}");
+                assert!(matches!(next, Next::At { .. }), "{next:?}");
+            }
+
+            #[test]
+            fn next_schedules_the_frame_rate() {
+                let Some(engine) = engine() else { return };
+                let surface = surface(&engine);
+                let layer = square(&surface, &surface.root(), Rect::new(8.0, 24.0, 24.0, 40.0));
+                surface.update_animated(
+                    Spring {
+                        response: 0.4,
+                        damping: 1.0,
+                    },
+                    |tx| {
+                        tx[&layer].transform(Affine::translate((160.0, 0.0)));
+                    },
+                );
+                let t0 = Instant::now();
+                // A running spring wants the fast class.
+                match render_at(&engine, t0 + TICK) {
+                    Next::At { rate, .. } => {
+                        assert!(*rate.start() <= 60 && *rate.end() >= 120, "rate {rate:?}");
+                    }
+                    next => panic!("expected At while the spring runs, got {next:?}"),
+                }
+
+                // Once only a slow decay remains (under one device pixel
+                // per 60 Hz frame), the rate drops to the slow class.
+                let decay_layer =
+                    square(&surface, &surface.root(), Rect::new(192.0, 24.0, 208.0, 40.0));
+                let _ = layer; // keep the settled spring's layer alive
+                surface.update(|tx| {
+                    tx[&decay_layer]
+                        .scroll_offset(Vec2::ZERO)
+                        .animation(Decay::new(Vec2::new(30.0, 0.0)));
+                });
+                // Wait for the spring to settle; the decay outlives it
+                // only briefly, so check the class on the first sample.
+                let t2 = t0 + TICK * 200;
+                let next = render_at(&engine, t2);
+                match next {
+                    Next::At { rate, .. } => {
+                        assert!(*rate.end() <= 60, "rate {rate:?}");
+                    }
+                    Next::Idle => {}
+                }
+                // Everything comes to rest eventually.
+                let _ = settle(&engine, &surface, t2);
+                assert_eq!(render_at(&engine, t2 + TICK * 400), Next::Idle);
+            }
+
+        }
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
 
-    use nami::{SignalExt, binding};
-
     use super::*;
     use crate::image::ImageData;
-    use crate::{Animation, Curve, Decay, Engine, FrameTime, Next, OffscreenFormat, Spring};
+    use crate::{Decay, Engine, FrameTime, Next, OffscreenFormat, Spring};
 
     fn engine() -> (Engine<Null>, std::sync::mpsc::Receiver<Event>) {
         let (tx, rx) = std::sync::mpsc::channel();
@@ -235,172 +708,6 @@ mod tests {
             .iter()
             .find(|l| l.id == id)
             .expect("layer in record")
-    }
-
-    #[test]
-    fn layer_tree_edits_reach_the_tree() {
-        let (engine, rx) = engine();
-        let surface = engine
-            .surface(Offscreen::new((16, 16), OffscreenFormat::LinearF16))
-            .expect("surface");
-        let child = surface.layer();
-        let grandchild = surface.layer();
-        surface.update(|tx| {
-            tx[surface.root()].push(&child);
-            tx[&child].push(&grandchild);
-            tx[&child]
-                .transform(Affine::translate((3.0, 4.0)))
-                .opacity(0.5f32);
-        });
-        let next = engine.render(FrameTime::now()).expect("render");
-        assert_eq!(next, Next::Idle);
-        let records = frames(&rx);
-        let record = records.last().expect("a frame record");
-        assert_eq!(record.layers.len(), 3);
-        let child_rec = layer(record, child.id());
-        assert_eq!(child_rec.transform, Affine::translate((3.0, 4.0)));
-        assert!((child_rec.opacity - 0.5).abs() < f32::EPSILON);
-        assert_eq!(child_rec.children, vec![grandchild.id()]);
-    }
-
-    #[test]
-    fn spring_settles_to_target_then_idle() {
-        let (engine, rx) = engine();
-        let surface = engine
-            .surface(Offscreen::new((16, 16), OffscreenFormat::LinearF16))
-            .expect("surface");
-        let layer_handle = surface.layer();
-        surface.update(|tx| {
-            tx[surface.root()].push(&layer_handle);
-            tx[&layer_handle]
-                .opacity(0.25f32)
-                .animation(Spring::smooth());
-        });
-        let t0 = Instant::now();
-        let mut next = engine.render(FrameTime::at(t0)).expect("render");
-        assert!(
-            matches!(next, Next::At { ref rate, .. } if *rate == (60..=120)),
-            "animating: {next:?}"
-        );
-        let mut t = t0;
-        loop {
-            t += Duration::from_millis(8);
-            next = engine.render(FrameTime::at(t)).expect("render");
-            if matches!(next, Next::Idle) {
-                break;
-            }
-            assert!(t - t0 < Duration::from_secs(5), "spring never settled");
-        }
-        let record = frames(&rx).pop().expect("records");
-        assert!((layer(&record, layer_handle.id()).opacity - 0.25).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn curve_endpoints() {
-        let (engine, rx) = engine();
-        let surface = engine
-            .surface(Offscreen::new((16, 16), OffscreenFormat::LinearF16))
-            .expect("surface");
-        let layer_handle = surface.layer();
-        surface.update(|tx| {
-            tx[surface.root()].push(&layer_handle);
-            tx[&layer_handle]
-                .opacity(0.7f32)
-                .animation(Curve::linear(Duration::from_millis(200)));
-        });
-        let t0 = Instant::now();
-        engine.render(FrameTime::at(t0)).expect("render");
-        let _ = frames(&rx);
-        // Before the curve ends it is still running.
-        let next = engine
-            .render(FrameTime::at(t0 + Duration::from_millis(100)))
-            .expect("render");
-        assert!(matches!(next, Next::At { .. }), "{next:?}");
-        let record = frames(&rx).pop().expect("mid-frame");
-        let mid = layer(&record, layer_handle.id()).opacity;
-        assert!(mid < 1.0 && mid > 0.7, "mid {mid}");
-        // Past the duration it lands exactly on the target and idles.
-        let next = engine
-            .render(FrameTime::at(t0 + Duration::from_millis(300)))
-            .expect("render");
-        assert_eq!(next, Next::Idle, "{next:?}");
-        let record = frames(&rx).pop().expect("end frame");
-        assert!((layer(&record, layer_handle.id()).opacity - 0.7).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn retargeting_a_spring_is_continuous() {
-        let (engine, rx) = engine();
-        let surface = engine
-            .surface(Offscreen::new((16, 16), OffscreenFormat::LinearF16))
-            .expect("surface");
-        let layer_handle = surface.layer();
-        surface.update(|tx| {
-            tx[surface.root()].push(&layer_handle);
-            tx[&layer_handle]
-                .transform(Affine::translate((10.0, 0.0)))
-                .animation(Spring::snappy());
-        });
-        let t0 = Instant::now();
-        engine.render(FrameTime::at(t0)).expect("render");
-        let t1 = t0 + Duration::from_millis(100);
-        engine.render(FrameTime::at(t1)).expect("render");
-        let _ = frames(&rx);
-        let mid_record = {
-            engine.render(FrameTime::at(t1)).expect("render");
-            frames(&rx).pop().expect("mid")
-        };
-        let pos_mid = layer(&mid_record, layer_handle.id()).transform.as_coeffs()[4];
-        // Retarget mid-flight.
-        surface.update(|tx| {
-            tx[&layer_handle]
-                .transform(Affine::translate((-5.0, 0.0)))
-                .animation(Spring::snappy());
-        });
-        let eps = Duration::from_millis(1);
-        engine.render(FrameTime::at(t1 + eps)).expect("render");
-        let record = frames(&rx).pop().expect("retarget frame");
-        let pos_next = layer(&record, layer_handle.id()).transform.as_coeffs()[4];
-        // Position must be (nearly) the last sampled position — continuity,
-        // not a snap back to the start.
-        assert!((pos_next - pos_mid).abs() < 0.05, "{pos_mid} -> {pos_next}");
-    }
-
-    #[test]
-    fn scroll_decay_and_rubber_band() {
-        let (engine, rx) = engine();
-        let surface = engine
-            .surface(Offscreen::new((16, 16), OffscreenFormat::LinearF16))
-            .expect("surface");
-        let layer_handle = surface.layer();
-        let bounds = kurbo::Rect::new(0.0, 0.0, 100.0, 50.0);
-        surface.update(|tx| {
-            tx[surface.root()].push(&layer_handle);
-            tx[&layer_handle]
-                .scroll_offset(Vec2::new(0.0, 10.0))
-                .animation(Decay::new(Vec2::new(0.0, 300.0)).rubber_band(bounds));
-        });
-        let t0 = Instant::now();
-        let mut t = t0;
-        // The decay flings the offset past the bound; the rubber-band
-        // spring pulls it back and the engine settles to Idle.
-        loop {
-            t += Duration::from_millis(8);
-            let next = engine.render(FrameTime::at(t)).expect("render");
-            if matches!(next, Next::Idle) {
-                break;
-            }
-            assert!(t - t0 < Duration::from_secs(10), "never settled");
-        }
-        let record = frames(&rx).pop().expect("records");
-        let offset = layer(&record, layer_handle.id()).scroll_offset;
-        // The rubber band settles on the bound edge, which `contains`
-        // excludes, so compare inclusively.
-        assert!(
-            (bounds.min_x()..=bounds.max_x()).contains(&offset.x)
-                && (bounds.min_y()..=bounds.max_y()).contains(&offset.y),
-            "offset {offset:?} outside {bounds:?}"
-        );
     }
 
     /// A scroll axis pinned to one value (`x0 == x1` in the bounds) is a
@@ -465,45 +772,6 @@ mod tests {
             (offset.x - 150.0).abs() < 0.5 && offset.y.abs() < 0.5,
             "offset {offset:?}, expected ≈(150, 0)"
         );
-    }
-
-    #[test]
-    fn bound_signal_updates_without_a_transaction() {
-        let (engine, rx) = engine();
-        let surface = engine
-            .surface(Offscreen::new((16, 16), OffscreenFormat::LinearF16))
-            .expect("surface");
-        let layer_handle = surface.layer();
-        let opacity = binding::<f32>(1.0f32);
-        surface.update(|tx| {
-            tx[surface.root()].push(&layer_handle);
-            tx[&layer_handle].opacity(opacity.clone());
-        });
-        let t0 = Instant::now();
-        engine.render(FrameTime::at(t0)).expect("render");
-        let _ = frames(&rx);
-
-        // A plain change snaps.
-        opacity.set(0.5f32);
-        let next = engine
-            .render(FrameTime::at(t0 + Duration::from_millis(16)))
-            .expect("render");
-        assert_eq!(next, Next::Idle);
-        let record = frames(&rx).pop().expect("record");
-        assert!((layer(&record, layer_handle.id()).opacity - 0.5).abs() < f32::EPSILON);
-
-        // A change carrying Animation metadata interpolates.
-        let animated = opacity.with(Animation::from(Spring::smooth()));
-        let surface2 = surface.layer();
-        surface.update(|tx| {
-            tx[surface.root()].push(&surface2);
-            tx[&surface2].opacity(animated);
-        });
-        opacity.set(0.25f32);
-        let next = engine
-            .render(FrameTime::at(t0 + Duration::from_millis(32)))
-            .expect("render");
-        assert!(matches!(next, Next::At { .. }), "{next:?}");
     }
 
     #[test]

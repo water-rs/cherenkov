@@ -60,6 +60,8 @@ pub enum LayerContent {
     Content(Content),
     /// A shared immutable picture.
     Picture(Picture),
+    /// GPU-rendered content.
+    Gpu(crate::GpuContentHandle),
     /// Nothing.
     None,
 }
@@ -73,6 +75,12 @@ impl From<Content> for LayerContent {
 impl From<Picture> for LayerContent {
     fn from(picture: Picture) -> Self {
         Self::Picture(picture)
+    }
+}
+
+impl From<crate::GpuContentHandle> for LayerContent {
+    fn from(handle: crate::GpuContentHandle) -> Self {
+        Self::Gpu(handle)
     }
 }
 
@@ -225,6 +233,8 @@ pub enum EditOp {
     Clip(Option<ShapeData>),
     /// Set the blend mode.
     Blend(BlendMode),
+    /// Set or clear the filter.
+    Filter(Option<cherenkov::FilterId>),
     /// Set or clear the content.
     Content(LayerContent),
     /// Append a child.
@@ -264,6 +274,18 @@ impl LayerEdit {
     /// Sets the blend mode the layer composites onto its parent with.
     pub fn blend(&mut self, blend: BlendMode) -> &mut Self {
         self.ops.push(EditOp::Blend(blend));
+        self
+    }
+
+    /// Sets the filter applied to this layer's subtree.
+    pub fn filter(&mut self, filter: &crate::Filter) -> &mut Self {
+        self.ops.push(EditOp::Filter(Some(filter.id())));
+        self
+    }
+
+    /// Clears the layer's filter.
+    pub fn clear_filter(&mut self) -> &mut Self {
+        self.ops.push(EditOp::Filter(None));
         self
     }
 
@@ -458,6 +480,7 @@ impl Surface {
                         EditOp::Opacity(o) => ops.push(LayerOp::Opacity(id, o)),
                         EditOp::Clip(shape) => ops.push(LayerOp::Clip(id, shape)),
                         EditOp::Blend(blend) => ops.push(LayerOp::Blend(id, blend)),
+                        EditOp::Filter(filter) => ops.push(LayerOp::Filter(id, filter)),
                         EditOp::Content(LayerContent::Content(content)) => {
                             shared.contents.insert(id, content);
                             let stored = shared.contents.get_mut(&id).expect("just inserted");
@@ -471,6 +494,19 @@ impl Surface {
                                 id,
                                 Some(LayerContentMsg::Picture(picture)),
                             ));
+                        }
+                        EditOp::Content(LayerContent::Gpu(mut handle)) => {
+                            shared.contents.remove(&id);
+                            let msg = crate::message::GpuContentMsg {
+                                id: handle.id,
+                                size: handle.size,
+                                dirty: std::sync::Arc::clone(&handle.dirty),
+                                content: handle
+                                    .content
+                                    .take()
+                                    .expect("a GpuContentHandle is consumed once"),
+                            };
+                            ops.push(LayerOp::Content(id, Some(LayerContentMsg::Gpu(msg))));
                         }
                         EditOp::Content(LayerContent::None) => {
                             shared.contents.remove(&id);

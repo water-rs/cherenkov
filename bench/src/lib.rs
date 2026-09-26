@@ -30,6 +30,8 @@
 pub mod affinity;
 #[cfg(feature = "cherenkov")]
 pub mod cherenkov_ad;
+#[cfg(feature = "cherenkov-cpu")]
+pub mod cherenkov_cpu_ad;
 pub mod conditions;
 pub mod convert;
 pub mod energy;
@@ -276,6 +278,8 @@ pub fn engine_names() -> Vec<&'static str> {
         cherenkov_ad::Cherenkov::NAME,
         #[cfg(feature = "cherenkov-vello")]
         cherenkov_vello_ad::CherenkovVello::NAME,
+        #[cfg(feature = "cherenkov-cpu")]
+        cherenkov_cpu_ad::Cherenkov::NAME,
     ]
 }
 
@@ -309,6 +313,10 @@ pub fn create_engine(name: &str) -> Result<Box<dyn Engine>, BenchError> {
         #[cfg(feature = "cherenkov-vello")]
         cherenkov_vello_ad::CherenkovVello::NAME => {
             cherenkov_vello_ad::CherenkovVello::new().map(|e| Box::new(e) as Box<dyn Engine>)
+        }
+        #[cfg(feature = "cherenkov-cpu")]
+        cherenkov_cpu_ad::Cherenkov::NAME => {
+            cherenkov_cpu_ad::Cherenkov::new().map(|e| Box::new(e) as Box<dyn Engine>)
         }
         _ => Err(BenchError::Engine(format!(
             "unknown or uncompiled engine {name:?}; available: {:?}",

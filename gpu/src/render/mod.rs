@@ -667,7 +667,7 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             device,
             queue,
             presenter,
-            filters: filter::Registry::default(),
+            filters: filter::Registry::new(config.redraw.clone()),
             shaders: paint::Registry::default(),
             pipelines,
             scratch_format,

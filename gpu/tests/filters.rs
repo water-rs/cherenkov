@@ -13,8 +13,11 @@ use std::time::{Duration, Instant};
 struct CopyEffect(mpsc::Sender<EffectFrameTiming>);
 
 impl Effect for CopyEffect {
-    async fn setup(&mut self, _: &EffectContext<'_>) -> EffectSetupResult {
-        Ok(())
+    fn setup(
+        &mut self,
+        _: &EffectContext<'_>,
+    ) -> impl std::future::Future<Output = EffectSetupResult> {
+        std::future::ready(Ok(()))
     }
 
     fn encode_render(

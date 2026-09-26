@@ -81,9 +81,13 @@ struct Entry {
 }
 
 #[derive(Default)]
-pub struct Registry(HashMap<u64, Entry>);
+pub struct Registry(HashMap<u64, Entry>, Option<crate::interop::RedrawCallback>);
 
 impl Registry {
+    pub fn new(redraw: Option<crate::interop::RedrawCallback>) -> Self {
+        Self(HashMap::new(), redraw)
+    }
+
     pub fn add(
         &mut self,
         id: u64,
@@ -93,6 +97,16 @@ impl Registry {
         format: wgpu::TextureFormat,
     ) {
         let mut effect = source.build();
+        let dirty = Arc::new(AtomicBool::new(false));
+        let wake = Arc::clone(&dirty);
+        let host = self.1.clone();
+        effect.set_redraw(Arc::new(move || {
+            if !wake.swap(true, Ordering::AcqRel)
+                && let Some(host) = &host
+            {
+                host.wake();
+            }
+        }));
         effect
             .setup(&EffectContext {
                 device,
@@ -101,11 +115,6 @@ impl Registry {
                 output_format: format,
             })
             .unwrap_or_else(|e| panic!("filter {id} registration failed: {e}"));
-        let dirty = Arc::new(AtomicBool::new(false));
-        let wake = dirty.clone();
-        effect.set_redraw(Arc::new(move || {
-            wake.store(true, Ordering::Release);
-        }));
         self.0.insert(
             id,
             Entry {

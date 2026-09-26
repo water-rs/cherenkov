@@ -266,7 +266,8 @@ impl SurfaceTree {
     /// # Panics
     /// Panics on an op naming a layer that is not in the tree: after
     /// `Create` ordering is respected, an unknown layer is an invariant
-    /// violation.
+    /// violation. Attaching the root or closing a cycle also panics before
+    /// mutating the tree.
     pub fn apply(&mut self, op: LayerOp) {
         match op {
             LayerOp::Create(id) => {
@@ -554,6 +555,16 @@ mod hierarchy_tests {
             parent: LayerId::new(1),
             child: LayerId::new(1),
             index: 0,
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "the root layer cannot be attached")]
+    fn attaching_the_root_is_rejected() {
+        let mut tree = tree();
+        tree.apply(LayerOp::Push {
+            parent: LayerId::new(2),
+            child: tree.root(),
         });
     }
 

@@ -58,15 +58,15 @@ fn a_cyclic_layer_tree_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
     let a = surface.layer();
     let b = surface.layer();
     surface.update(|tx| {
-        tx[&a].push(&a);
         tx[surface.root()].push(&a);
         tx[&a].push(&b);
-        tx[&b].push(surface.root());
+        tx[&b].push(&a);
     });
-    // On a cyclic tree this render recurses forever; rejected ops leave a
-    // plain chain that lowers and reads back normally.
-    engine.render(cherenkov::FrameTime::now())?;
-    surface.readback()?;
+    // The shared tree fails before lowering can recurse into the cycle.
+    assert!(matches!(
+        engine.render(cherenkov::FrameTime::now()),
+        Err(RenderError::Thread)
+    ));
     Ok(())
 }
 

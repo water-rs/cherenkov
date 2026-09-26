@@ -31,6 +31,8 @@ cherenkov-oracle = { path = "../oracle" }
 kurbo = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Decodes `powermetrics --format plist` output for `measure --energy`.
+plist = "1.7"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -62,8 +64,9 @@ glifo = { version = "0.3", optional = true }
 # Minimal surface: CPU list + brand string for `cpu_model`.
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 
-# `sched_setaffinity` / `sched_getcpu` for `measure --cpu`.
-[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+# `sched_setaffinity` / `sched_getcpu` for `measure --cpu`; `kill` to
+# stop `powermetrics` for `measure --energy`.
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [[bin]]

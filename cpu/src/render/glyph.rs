@@ -16,8 +16,8 @@ use skrifa::raw::TableProvider;
 use skrifa::raw::types::F2Dot14;
 
 use crate::error::RenderError;
-use crate::render::lower::GlyphReq;
 use crate::render::coverage::{Operand, rasterize};
+use crate::render::lower::GlyphReq;
 use crate::render::raster::Edge;
 
 /// A glyph cache key.
@@ -98,10 +98,7 @@ impl GlyphCache {
     /// When the batch would push the cache over budget, everything is
     /// evicted first.
     pub fn insert_batch(&mut self, masks: Vec<(GlyphKey, Arc<GlyphMask>)>) {
-        let batch: u64 = masks
-            .iter()
-            .map(|(_, m)| mask_bytes(m))
-            .sum();
+        let batch: u64 = masks.iter().map(|(_, m)| mask_bytes(m)).sum();
         if self.bytes + batch > self.budget {
             self.clear();
         }

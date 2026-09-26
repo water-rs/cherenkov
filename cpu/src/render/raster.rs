@@ -42,8 +42,10 @@ fn erf(x: f32) -> f32 {
     let s = x.signum();
     let a = x.abs();
     let t = (0.327_591_1_f32 * a + 1.0).recip();
-    let polynomial = ((((1.061_405_429_f32 * t - 1.453_152_027) * t + 1.421_413_741) * t
-        - 0.284_496_736) * t + 0.254_829_592) * t;
+    let polynomial =
+        ((((1.061_405_429_f32 * t - 1.453_152_027) * t + 1.421_413_741) * t - 0.284_496_736) * t
+            + 0.254_829_592)
+            * t;
     let y = 1.0 - polynomial * (-a * a).exp();
     s * y
 }
@@ -151,7 +153,9 @@ pub fn render_bands(
             };
             for &i in &scratch.items {
                 match &items[i] {
-                    Item::Draw { coverage, paint, .. } => {
+                    Item::Draw {
+                        coverage, paint, ..
+                    } => {
                         band.draw(&mut scratch.stack, coverage, paint);
                     }
                     Item::PushIsolate => {
@@ -263,21 +267,24 @@ pub fn blur_coverage(source: &Coverage, width: usize, height: usize, sigma: f64)
             }
         }
     }
-    Coverage::from_rows(top, (top..bottom).map(|y| {
-        let mut row = vec![0.0_f32; width];
-        for (x, value) in row.iter_mut().enumerate() {
-            let mut sum = 0.0;
-            for (tap, &weight) in kernel.iter().enumerate() {
-                let sample_y =
-                    (y as i64 + tap as i64 - radius as i64).clamp(0, height as i64 - 1) as usize;
-                if (source.top..source.bottom()).contains(&sample_y) {
-                    sum += weight * horizontal[(sample_y - source.top) * width + x];
+    Coverage::from_rows(
+        top,
+        (top..bottom).map(|y| {
+            let mut row = vec![0.0_f32; width];
+            for (x, value) in row.iter_mut().enumerate() {
+                let mut sum = 0.0;
+                for (tap, &weight) in kernel.iter().enumerate() {
+                    let sample_y = (y as i64 + tap as i64 - radius as i64)
+                        .clamp(0, height as i64 - 1) as usize;
+                    if (source.top..source.bottom()).contains(&sample_y) {
+                        sum += weight * horizontal[(sample_y - source.top) * width + x];
+                    }
                 }
+                *value = sum as f32;
             }
-            *value = sum as f32;
-        }
-        row
-    }))
+            row
+        }),
+    )
 }
 
 /// One band's rasterization state.
@@ -529,9 +536,7 @@ impl Band<'_> {
                 if cov <= 0.0 {
                     continue;
                 }
-                let src = paint
-                    .eval(x as f32 + 0.5, py as f32 + 0.5)
-                    .map(|v| v * cov);
+                let src = paint.eval(x as f32 + 0.5, py as f32 + 0.5).map(|v| v * cov);
                 let dst = top(&mut *self.fb, stack);
                 dst[y * self.w + x] = src_over(dst[y * self.w + x], src);
             }
@@ -566,12 +571,22 @@ mod tests {
     //! The sparse coverage compiler checked against the independent oracle.
 
     use super::*;
-    use cherenkov::FillRule;
     use crate::render::coverage::{Operand, rasterize};
+    use cherenkov::FillRule;
 
     fn coverage_mask(edges: &[Edge], rule: FillRule, w: usize, h: usize) -> Vec<f32> {
-        let coverage = rasterize(&[Operand { edges: edges.into(), rule }], w, h);
-        (0..h).flat_map(|y| (0..w).map(move |x| (x, y))).map(|(x, y)| coverage.at(x, y)).collect()
+        let coverage = rasterize(
+            &[Operand {
+                edges: edges.into(),
+                rule,
+            }],
+            w,
+            h,
+        );
+        (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|(x, y)| coverage.at(x, y))
+            .collect()
     }
 
     fn scene_rule(rule: FillRule) -> cherenkov_scene::FillRule {
@@ -663,8 +678,10 @@ mod tests {
 
         // (d) bowtie: an interior crossing, not a shared endpoint.
         let bowtie = poly(&[
-            (4.25, 4.125), (20.75, 20.875),
-            (4.25, 20.875), (20.75, 4.125),
+            (4.25, 4.125),
+            (20.75, 20.875),
+            (4.25, 20.875),
+            (20.75, 4.125),
         ]);
         assert_matches_oracle(&bowtie, "bowtie");
 
@@ -702,7 +719,10 @@ mod tests {
         path.line_to((2.125, 10.375));
         for join in [kurbo::Join::Miter, kurbo::Join::Bevel, kurbo::Join::Round] {
             for cap in [kurbo::Cap::Butt, kurbo::Cap::Square, kurbo::Cap::Round] {
-                let stroke = kurbo::Stroke::new(3.75).with_join(join).with_caps(cap).with_miter_limit(12.0);
+                let stroke = kurbo::Stroke::new(3.75)
+                    .with_join(join)
+                    .with_caps(cap)
+                    .with_miter_limit(12.0);
                 let outline = kurbo::stroke(&path, &stroke, &kurbo::StrokeOpts::default(), 0.02);
                 let edges = crate::render::lower::flatten_edges(outline, 0.02);
                 assert_matches_oracle(&edges, "sharp stroke");
@@ -715,17 +735,37 @@ mod tests {
         let caster = poly(&[(1.25, 1.25), (6.75, 1.25), (6.75, 6.75), (1.25, 6.75)]);
         let clip = poly(&[(0.25, 0.25), (7.75, 1.75), (2.25, 7.75)]);
         let operands = [
-            Operand { edges: caster.clone().into(), rule: FillRule::NonZero },
-            Operand { edges: clip.clone().into(), rule: FillRule::NonZero },
+            Operand {
+                edges: caster.clone().into(),
+                rule: FillRule::NonZero,
+            },
+            Operand {
+                edges: clip.clone().into(),
+                rule: FillRule::NonZero,
+            },
         ];
-        let segments = |edges: &[Edge]| edges.iter().map(|e| (
-            f64::from(e.x0), f64::from(e.y0), f64::from(e.x1), f64::from(e.y1),
-        )).collect::<Vec<_>>();
+        let segments = |edges: &[Edge]| {
+            edges
+                .iter()
+                .map(|e| {
+                    (
+                        f64::from(e.x0),
+                        f64::from(e.y0),
+                        f64::from(e.x1),
+                        f64::from(e.y1),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
         let intersection = cherenkov_oracle::clip::intersect_edges(
-            &segments(&caster), cherenkov_scene::FillRule::NonZero, &segments(&clip),
+            &segments(&caster),
+            cherenkov_scene::FillRule::NonZero,
+            &segments(&clip),
         );
         let mut oracle = cherenkov_oracle::coverage::Coverage::new(8, 8);
-        for (x0, y0, x1, y1) in intersection { oracle.add_line(x0, y0, x1, y1); }
+        for (x0, y0, x1, y1) in intersection {
+            oracle.add_line(x0, y0, x1, y1);
+        }
         let exact = oracle.finish(cherenkov_scene::FillRule::NonZero);
         let source = rasterize(&operands, 8, 8);
         for sigma in [0.0, 1.25] {

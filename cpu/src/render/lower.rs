@@ -372,7 +372,10 @@ fn device_rect(t: Affine, r: Rect) -> Rect {
 }
 
 /// Lossless binary key words; no float hashing or quantization.
-#[expect(clippy::cast_possible_truncation, reason = "split the exact f64 bits into two u32 words")]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "split the exact f64 bits into two u32 words"
+)]
 fn key_float(key: &mut Vec<u32>, value: f64) {
     let bits = value.to_bits();
     key.extend([bits as u32, (bits >> 32) as u32]);
@@ -834,7 +837,10 @@ impl<'a> Lowering<'a> {
     }
 
     /// Retains the scalar shadow field independently of its colour.
-    #[expect(clippy::cast_possible_truncation, reason = "analytic shadow coordinates use f32")]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "analytic shadow coordinates use f32"
+    )]
     fn prepared_shadow(
         &mut self,
         geometry: [f64; 4],
@@ -881,7 +887,12 @@ impl<'a> Lowering<'a> {
                     rule,
                 });
                 let caster = crate::render::coverage::rasterize(&operands, self.width, self.height);
-                crate::render::raster::blur_coverage(&caster, self.width, self.height, f64::from(sigma))
+                crate::render::raster::blur_coverage(
+                    &caster,
+                    self.width,
+                    self.height,
+                    f64::from(sigma),
+                )
             } else {
                 crate::render::raster::shadow_coverage(&rbox, &radii, sigma_eff, bbox, self.width)
             }

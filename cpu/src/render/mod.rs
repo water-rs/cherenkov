@@ -161,7 +161,8 @@ pub fn run(
                 images: HashMap::new(),
                 glyph_cache: glyph::GlyphCache::new(config.budget.cpu.0 / 2),
                 coverage_cache: coverage::CoverageCache::new(
-                    usize::try_from(config.budget.cpu.0 - config.budget.cpu.0 / 2).unwrap_or(usize::MAX),
+                    usize::try_from(config.budget.cpu.0 - config.budget.cpu.0 / 2)
+                        .unwrap_or(usize::MAX),
                 ),
                 colr_cache: HashMap::new(),
             },
@@ -392,8 +393,13 @@ impl Renderer {
             .values()
             .map(|s| {
                 u64::from(s.size.0) * u64::from(s.size.1) * 16
-                    + u64::try_from(s.bands.iter().map(raster::BandScratch::bytes).sum::<usize>())
-                        .expect("band allocation fits u64")
+                    + u64::try_from(
+                        s.bands
+                            .iter()
+                            .map(raster::BandScratch::bytes)
+                            .sum::<usize>(),
+                    )
+                    .expect("band allocation fits u64")
             })
             .sum();
         let images = self
@@ -549,12 +555,11 @@ impl Renderer {
 
     /// A cached glyph mask cannot be multiplied by partial clip coverage:
     /// intersect its retained outline at the exact integer instance origin.
-    #[expect(clippy::cast_precision_loss, reason = "glyph origins fit device coordinate precision")]
-    fn clip_glyphs(
-        items: &mut [Item],
-        cache: &mut coverage::CoverageCache,
-        size: (u32, u32),
-    ) {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "glyph origins fit device coordinate precision"
+    )]
+    fn clip_glyphs(items: &mut [Item], cache: &mut coverage::CoverageCache, size: (u32, u32)) {
         for item in items {
             if let Item::Glyph {
                 slot,
@@ -658,27 +663,61 @@ mod tests {
     #[test]
     fn clipped_glyph_uses_its_outline_at_the_integer_origin() {
         let edges: Arc<[raster::Edge]> = Arc::from([
-            raster::Edge { x0: 0.0, y0: 0.0, x1: 1.0, y1: 0.0 },
-            raster::Edge { x0: 1.0, y0: 0.0, x1: 0.0, y1: 1.0 },
-            raster::Edge { x0: 0.0, y0: 1.0, x1: 0.0, y1: 0.0 },
+            raster::Edge {
+                x0: 0.0,
+                y0: 0.0,
+                x1: 1.0,
+                y1: 0.0,
+            },
+            raster::Edge {
+                x0: 1.0,
+                y0: 0.0,
+                x1: 0.0,
+                y1: 1.0,
+            },
+            raster::Edge {
+                x0: 0.0,
+                y0: 1.0,
+                x1: 0.0,
+                y1: 0.0,
+            },
         ]);
         let mask = Arc::new(glyph::GlyphMask {
-            left: 0, top: 0, w: 1, h: 1, edges: edges.clone(), cov: vec![0.5],
+            left: 0,
+            top: 0,
+            w: 1,
+            h: 1,
+            edges: edges.clone(),
+            cov: vec![0.5],
         });
         let slot = Arc::new(OnceLock::new());
         slot.set(mask).expect("empty slot");
-        let clip_edges = edges.iter().map(|edge| raster::Edge {
-            x0: edge.x0 + 4.0, y0: edge.y0 + 16.0,
-            x1: edge.x1 + 4.0, y1: edge.y1 + 16.0,
-        }).collect();
+        let clip_edges = edges
+            .iter()
+            .map(|edge| raster::Edge {
+                x0: edge.x0 + 4.0,
+                y0: edge.y0 + 16.0,
+                x1: edge.x1 + 4.0,
+                y1: edge.y1 + 16.0,
+            })
+            .collect();
         let clip = Arc::new(lower::ClipGeometry {
-            operands: vec![coverage::Operand { edges: clip_edges, rule: cherenkov::FillRule::NonZero }],
+            operands: vec![coverage::Operand {
+                edges: clip_edges,
+                rule: cherenkov::FillRule::NonZero,
+            }],
         });
         let mut items = [Item::Glyph {
-            slot, x: 4, y: 16, paint: paint::PaintData::Solid([1.0; 4]), clip: Some(clip),
+            slot,
+            x: 4,
+            y: 16,
+            paint: paint::PaintData::Solid([1.0; 4]),
+            clip: Some(clip),
         }];
         Renderer::clip_glyphs(&mut items, &mut coverage::CoverageCache::new(4096), (8, 20));
-        let Item::Draw { coverage, .. } = &items[0] else { panic!("clipped glyph must be prepared"); };
+        let Item::Draw { coverage, .. } = &items[0] else {
+            panic!("clipped glyph must be prepared");
+        };
         let mut oracle = cherenkov_oracle::coverage::Coverage::new(8, 20);
         oracle.add_line(4.0, 16.0, 5.0, 16.0);
         oracle.add_line(5.0, 16.0, 4.0, 17.0);

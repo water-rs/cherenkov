@@ -219,7 +219,7 @@ fn brush_of(
                     start: g.start,
                     end: g.end,
                 }),
-                extend: convert::extend(g.extend),
+                extend: convert::extend(g.extend)?,
                 interpolation_cs: convert::interpolation(g.interpolation)?,
                 stops: stops(&g.stops),
                 ..peniko::Gradient::default()
@@ -234,7 +234,7 @@ fn brush_of(
                     end_center: g.end_center,
                     end_radius: g.end_radius as f32,
                 }),
-                extend: convert::extend(g.extend),
+                extend: convert::extend(g.extend)?,
                 interpolation_cs: convert::interpolation(g.interpolation)?,
                 stops: stops(&g.stops),
                 ..peniko::Gradient::default()
@@ -248,7 +248,7 @@ fn brush_of(
                     start_angle: g.start_angle as f32,
                     end_angle: g.end_angle as f32,
                 }),
-                extend: convert::extend(g.extend),
+                extend: convert::extend(g.extend)?,
                 interpolation_cs: convert::interpolation(g.interpolation)?,
                 stops: stops(&g.stops),
                 ..peniko::Gradient::default()
@@ -267,8 +267,8 @@ fn brush_of(
                 Brush::Image(ImageBrush {
                     image: data.clone(),
                     sampler: ImageSampler {
-                        x_extend: convert::extend(pattern.extend_x),
-                        y_extend: convert::extend(pattern.extend_y),
+                        x_extend: convert::extend(pattern.extend_x)?,
+                        y_extend: convert::extend(pattern.extend_y)?,
                         quality: convert::quality(pattern.sampling),
                         alpha: 1.0,
                     },

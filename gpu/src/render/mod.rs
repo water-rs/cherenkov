@@ -20,7 +20,9 @@ use crate::error::{EngineError, RenderError, SurfaceError};
 use crate::message::{ChangeSet, LayerId, LayerOp, Message, SurfaceId};
 use crate::surface::{FrameStats, Next, PassTiming, Readback};
 use glyph::{Atlas, FontData};
-use lower::{ContentData, Frame, GlyphContext, LayerNode, Lowering, PipelineKind, Target};
+use lower::{
+    ContentData, Frame, GlyphContext, LayerNode, Lowering, PipelineKind, ShaderVariant, Target,
+};
 
 /// The surface target format: premultiplied linear Display P3.
 const TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
@@ -182,9 +184,10 @@ impl SurfaceState {
 struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
-    /// `[format index][pipeline kind]`: 0 = surface format, 1 = scratch
-    /// format; kind 0 = source-over, 1 = replace.
-    pipelines: [[wgpu::RenderPipeline; 2]; 2],
+    /// `[format index][pipeline kind][shader variant]`:
+    /// format 0 = surface, 1 = scratch; kind 0 = source-over, 1 = replace;
+    /// variant 0/1/2 = simple/shadow/full fragment shader.
+    pipelines: [[[wgpu::RenderPipeline; 3]; 2]; 2],
     /// The configured isolation texture format.
     scratch_format: wgpu::TextureFormat,
     layout0: wgpu::BindGroupLayout,
@@ -443,6 +446,16 @@ fn make_bind0(
     })
 }
 
+/// The closed pipeline set: instanced-quad pipelines from `shader.wgsl`,
+/// specialised per fragment variant.
+const fn variant_index(variant: ShaderVariant) -> usize {
+    match variant {
+        ShaderVariant::Simple => 0,
+        ShaderVariant::Shadow => 1,
+        ShaderVariant::Full => 2,
+    }
+}
+
 /// The closed pipeline set: one instanced-quad pipeline from `shader.wgsl`.
 /// When a pipeline cache path is configured and supported, the cache is
 /// loaded beforehand and persisted afterwards, best effort.
@@ -451,14 +464,11 @@ fn create_pipeline(
     config: &GpuConfig,
     layout0: &wgpu::BindGroupLayout,
     layout1: &wgpu::BindGroupLayout,
+    module: &wgpu::ShaderModule,
     format: wgpu::TextureFormat,
     replace: bool,
 ) -> Result<wgpu::RenderPipeline, EngineError> {
     let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
-    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("cherenkov"),
-        source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
-    });
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("cherenkov"),
         bind_group_layouts: &[Some(layout0), Some(layout1)],
@@ -494,13 +504,13 @@ fn create_pipeline(
         label: Some("cherenkov"),
         layout: Some(&layout),
         vertex: wgpu::VertexState {
-            module: &module,
+            module,
             entry_point: Some("vs_main"),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             buffers: &[],
         },
         fragment: Some(wgpu::FragmentState {
-            module: &module,
+            module,
             entry_point: Some("fs_main"),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             targets: &[Some(wgpu::ColorTargetState {
@@ -571,13 +581,62 @@ pub fn run(config: GpuConfig, rx: Receiver<Message>, init_tx: Sender<Result<Init
         let info = adapter.get_info();
         let (layout0, layout1) = create_layouts(&device);
         let scratch_format = scratch_wgpu(config.scratch_format);
-        let pipelines = |format| {
+        // Three specialised fragment shaders from one source file: the
+        // prepended `VARIANT` constant makes fs_main a constant-folded
+        // dispatch to fs_simple/fs_shadow/fs_full.
+        let modules = [0u32, 1, 2].map(|v| {
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("cherenkov"),
+                source: wgpu::ShaderSource::Wgsl(
+                    format!(
+                        "const VARIANT: u32 = {v}u;\n{}",
+                        include_str!("shader.wgsl")
+                    )
+                    .into(),
+                ),
+            })
+        });
+        let pipelines = |format: wgpu::TextureFormat, replace: bool| {
             Ok::<_, EngineError>([
-                create_pipeline(&device, &config, &layout0, &layout1, format, false)?,
-                create_pipeline(&device, &config, &layout0, &layout1, format, true)?,
+                create_pipeline(
+                    &device,
+                    &config,
+                    &layout0,
+                    &layout1,
+                    &modules[0],
+                    format,
+                    replace,
+                )?,
+                create_pipeline(
+                    &device,
+                    &config,
+                    &layout0,
+                    &layout1,
+                    &modules[1],
+                    format,
+                    replace,
+                )?,
+                create_pipeline(
+                    &device,
+                    &config,
+                    &layout0,
+                    &layout1,
+                    &modules[2],
+                    format,
+                    replace,
+                )?,
             ])
         };
-        let pipelines = [pipelines(TARGET_FORMAT)?, pipelines(scratch_format)?];
+        let pipelines = [
+            [
+                pipelines(TARGET_FORMAT, false)?,
+                pipelines(TARGET_FORMAT, true)?,
+            ],
+            [
+                pipelines(scratch_format, false)?,
+                pipelines(scratch_format, true)?,
+            ],
+        ];
         let globals = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("globals"),
             size: 16,
@@ -1471,7 +1530,7 @@ impl Renderer {
                 Target::Surface => 0,
                 Target::Scratch(_) => 1,
             };
-            render_pass.set_pipeline(&self.pipelines[format_i][0]);
+            render_pass.set_pipeline(&self.pipelines[format_i][0][0]);
             // Scratch passes cover only their region; the surface pass the
             // whole target. `in.device` stays in true device space via the
             // per-pass Globals origin.
@@ -1490,13 +1549,16 @@ impl Renderer {
             // stride), which matches `surf.frame.passes` ordering.
             let offset = pass_index * 256;
             render_pass.set_bind_group(0, &self.bind0, &[offset]);
-            let mut pipeline = PipelineKind::SrcOver;
+            let mut pipeline = (PipelineKind::SrcOver, ShaderVariant::Simple);
             for range in &pass.ranges {
                 stats.draws += 1;
-                if range.pipeline != pipeline {
-                    pipeline = range.pipeline;
+                let want = (range.pipeline, range.variant);
+                if want != pipeline {
+                    pipeline = want;
+                    stats.pipeline_switches += 1;
                     render_pass.set_pipeline(
-                        &self.pipelines[format_i][usize::from(pipeline == PipelineKind::Replace)],
+                        &self.pipelines[format_i][usize::from(pipeline.0 == PipelineKind::Replace)]
+                            [variant_index(pipeline.1)],
                     );
                 }
                 let key = (range.source, scratch_backdrop, range.image);

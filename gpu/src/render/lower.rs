@@ -56,6 +56,18 @@ pub enum PipelineKind {
     Replace,
 }
 
+/// The specialised fragment pipeline a range draws with.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ShaderVariant {
+    /// Solid fills, spans, and glyphs: coverage + opacity + solid colour.
+    #[default]
+    Simple,
+    /// The shadow kernel + solid colour.
+    Shadow,
+    /// Everything else: clips, masks, strokes, gradients, composites.
+    Full,
+}
+
 /// One draw call's instance range and bound source texture.
 #[derive(Clone, Debug)]
 pub struct DrawRange {
@@ -65,6 +77,8 @@ pub struct DrawRange {
     pub image: Option<u64>,
     /// The pipeline variant this range draws with.
     pub pipeline: PipelineKind,
+    /// The fragment-shader variant this range draws with.
+    pub variant: ShaderVariant,
     /// Range into the frame's instance buffer.
     pub instances: Range<u32>,
 }
@@ -106,6 +120,7 @@ struct OpenPass {
     source: Option<usize>,
     image: Option<u64>,
     pipeline: PipelineKind,
+    variant: ShaderVariant,
     backdrop_copy: Option<[u32; 4]>,
     ranges: Vec<DrawRange>,
     seg_start: u32,
@@ -296,6 +311,24 @@ fn aa_margin(transform: Affine) -> f64 {
     let [c0, c1, c2, c3, _, _] = transform.as_coeffs();
     let lmin = c0.hypot(c1).min(c2.hypot(c3));
     if lmin <= 1e-9 { 0.0 } else { 2.0 / lmin }
+}
+
+/// The specialised fragment pipeline `inst` requires: the uber-shader
+/// when it reads rare fields (clip, mask, inner, strokes, non-solid
+/// paint), the shadow kernel otherwise for shadows, and the trivial
+/// coverage path for solid fills, spans, and glyphs.
+const fn variant_of(inst: &Instance) -> ShaderVariant {
+    let flags = inst.meta[3] >> 24;
+    if (flags & (FLAG_HAS_CLIP | FLAG_HAS_MASK | FLAG_HAS_INNER)) != 0
+        || inst.meta[1] != PAINT_SOLID
+        || matches!(inst.meta[0], KIND_STROKE_OFFSET | KIND_STROKE_DIST)
+    {
+        return ShaderVariant::Full;
+    }
+    if inst.meta[0] == KIND_SHADOW {
+        return ShaderVariant::Shadow;
+    }
+    ShaderVariant::Simple
 }
 
 /// The up-to-four border strips of `b` minus the covered box `c`:
@@ -580,6 +613,7 @@ impl<'a> Lowering<'a> {
                 source: open.source,
                 image: open.image,
                 pipeline: open.pipeline,
+                variant: open.variant,
                 instances: open.seg_start..end,
             });
             open.seg_start = end;
@@ -594,6 +628,7 @@ impl<'a> Lowering<'a> {
             source: None,
             image: None,
             pipeline: PipelineKind::SrcOver,
+            variant: ShaderVariant::Simple,
             backdrop_copy: None,
             ranges: Vec::new(),
             #[expect(clippy::cast_possible_truncation)]
@@ -658,6 +693,28 @@ impl<'a> Lowering<'a> {
                 open.pipeline = pipeline;
             }
         }
+    }
+
+    /// Starts a new draw range when the shader variant changes.
+    fn set_variant(&mut self, variant: ShaderVariant) {
+        if self
+            .frame
+            .open
+            .as_ref()
+            .is_some_and(|o| o.variant != variant)
+        {
+            self.end_segment();
+            if let Some(open) = &mut self.frame.open {
+                open.variant = variant;
+            }
+        }
+    }
+
+    /// Emits `inst` into the current draw range, segmenting on its
+    /// specialised fragment variant.
+    fn push_instance(&mut self, inst: &Instance) {
+        self.set_variant(variant_of(inst));
+        self.frame.instances.push(*inst);
     }
 
     /// Renders `body` into an isolated scratch texture, composited back at
@@ -808,7 +865,7 @@ impl<'a> Lowering<'a> {
             self.set_pipeline(PipelineKind::Replace);
         }
         self.set_source(Some(scratch));
-        self.frame.instances.push(inst);
+        self.push_instance(&inst);
         self.set_source(None);
         if code != 0 {
             self.set_pipeline(PipelineKind::SrcOver);
@@ -878,7 +935,7 @@ impl<'a> Lowering<'a> {
         inst.meta[2] = paint.first_stop;
         inst.meta[3] |= (paint.packed & 0x00ff_ffff) | (flags << 24);
         self.set_image(paint.image);
-        self.frame.instances.push(inst);
+        self.push_instance(&inst);
         Ok(())
     }
 
@@ -1234,7 +1291,7 @@ impl<'a> Lowering<'a> {
                 f32_f64(span.y1),
             ],
         );
-        self.frame.instances.push(inst);
+        self.push_instance(&inst);
         // The span's device rect back in local space: `to_device` is
         // axis-aligned, so invert each axis independently.
         let [ta, _, _, td, te, tf] = to_device.as_coeffs();
@@ -1259,7 +1316,7 @@ impl<'a> Lowering<'a> {
                 f32_f64(strip.x1),
                 f32_f64(strip.y1),
             ];
-            self.frame.instances.push(inst);
+            self.push_instance(&inst);
         }
         Ok(())
     }
@@ -1539,7 +1596,7 @@ impl<'a> Lowering<'a> {
         match c {
             None => {
                 inst.bounds = [f32_f64(b.x0), f32_f64(b.y0), f32_f64(b.x1), f32_f64(b.y1)];
-                self.frame.instances.push(inst);
+                self.push_instance(&inst);
             }
             Some(c) => {
                 for strip in border_strips(b, c) {
@@ -1549,7 +1606,7 @@ impl<'a> Lowering<'a> {
                         f32_f64(strip.x1),
                         f32_f64(strip.y1),
                     ];
-                    self.frame.instances.push(inst);
+                    self.push_instance(&inst);
                 }
             }
         }
@@ -1637,7 +1694,7 @@ impl<'a> Lowering<'a> {
             inst.meta[1] = paint.kind;
             inst.meta[2] = paint.first_stop;
             inst.meta[3] |= paint.packed & 0x00ff_ffff;
-            self.frame.instances.push(inst);
+            self.push_instance(&inst);
         }
         for cell in &emit.cells {
             let mut inst = self.base(KIND_GLYPH, affine(self.transform));
@@ -1654,7 +1711,7 @@ impl<'a> Lowering<'a> {
             inst.meta[1] = paint.kind;
             inst.meta[2] = paint.first_stop;
             inst.meta[3] |= paint.packed & 0x00ff_ffff;
-            self.frame.instances.push(inst);
+            self.push_instance(&inst);
         }
         Ok(())
     }
@@ -1852,7 +1909,7 @@ impl<'a> Lowering<'a> {
             inst.meta[1] = paint_data.kind;
             inst.meta[2] = paint_data.first_stop;
             inst.meta[3] |= paint_data.packed & 0x00ff_ffff;
-            self.frame.instances.push(inst);
+            self.push_instance(&inst);
         }
         Ok(())
     }

@@ -279,7 +279,7 @@ pub trait Draw {
                         paint: impl Into<Self::Value<Paint>>);
     fn shadow<S: Shape>(&mut self, shape: impl Into<Self::Value<S>>, shadow: impl Into<Self::Value<Shadow>>);
     fn text(&mut self, layout: &TextLayout, origin: Point);
-    fn glyphs(&mut self, run: &GlyphRun<'_>);
+    fn glyphs(&mut self, run: impl Into<Self::Value<GlyphRun>>, paint: impl Into<Self::Value<Paint>>);
     fn image<F: Format>(&mut self, image: &Image<F>, dst: impl Into<Self::Value<Rect>>, sampling: Sampling);
     fn picture(&mut self, picture: &Picture, transform: impl Into<Self::Value<Affine>>);
 
@@ -289,7 +289,7 @@ pub trait Draw {
 }
 ```
 
-- **Numeric changes.** A signal passed to `Recorder` becomes an engine-side value slot. When it changes, only the commands that reference it are regenerated, and damage is exactly those commands. Structural changes re-record.
+- **Numeric changes.** A signal passed to `Recorder` becomes an engine-side value slot. When it changes, only the commands that reference it are regenerated, and damage is exactly those commands. Structural changes re-record. A glyph run is a value slot too, so a reshaped text value is a slot update, not a re-record.
 - **Shape signals.** A signal of a shape (`radius.map(|r| Circle::new(c, r))`) is how geometry becomes reactive. nami's `map` and `zip` compose it, and there is no per-field generic.
 - **Paired state is closure scopes only.** There is no ambient mutable state and no push/pop.
 - **nami `kurbo` feature.** nami gains a `kurbo` feature that implements constant `Signal` for kurbo types, so `impl Signal<Output = Affine>` accepts a plain `Affine`. The orphan rule prevents Cherenkov from doing this itself. Cherenkov's own types implement constant `Signal` in Cherenkov.

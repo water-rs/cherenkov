@@ -295,12 +295,34 @@ fn corner_inset(r: f32, dy: f32) -> f32 {
     return r - sqrt(max(r * r - dd * dd, 0.0));
 }
 
+// One corner-band row of the shadow integrand: the analytic x integral of
+// row `y` (sides inset by the corners of radii `rl`, `rr`) times the
+// Gaussian weight of its distance to `p.y`.
+fn corner_row(s: Shape, p: vec2<f32>, sigma: f32, k: f32, rl: f32, rr: f32, y: f32) -> f32 {
+    let ay = abs(y);
+    let xl = -s.half.x + corner_inset(rl, ay - (s.half.y - rl));
+    let xr = s.half.x - corner_inset(rr, ay - (s.half.y - rr));
+    if xr <= xl {
+        return 0.0;
+    }
+    let row = 0.5 * (erf((xr - p.x) * k) - erf((xl - p.x) * k));
+    return row * gaussian(y - p.y, sigma);
+}
+
+// The symmetric pair of Gauss–Legendre nodes `mid ± hw * x` with weight `w`.
+fn corner_pair(
+    s: Shape, p: vec2<f32>, sigma: f32, k: f32, rl: f32, rr: f32,
+    mid: f32, hw: f32, x: f32, w: f32,
+) -> f32 {
+    return (corner_row(s, p, sigma, k, rl, rr, mid - hw * x)
+        + corner_row(s, p, sigma, k, rl, rr, mid + hw * x)) * w * hw;
+}
+
 // Indicator of the rounded box `s` (circular corners), convolved with an
 // isotropic Gaussian of standard deviation `sigma`, evaluated at `p`. The x
-// integral of each row is analytic (erf); the y integral is a midpoint rule
-// over ±3σ.
+// integral of each row is analytic (erf); the y integral over the corner
+// bands within ±3σ is an 8-point Gauss–Legendre rule.
 fn shadow(s: Shape, p: vec2<f32>, sigma: f32) -> f32 {
-    const N: i32 = 16;
     let k = 1.0 / (sigma * 1.4142135624);
     // Rows within ±3σ of p that intersect the box.
     let lo = max(p.y - 3.0 * sigma, -s.half.y);
@@ -320,30 +342,22 @@ fn shadow(s: Shape, p: vec2<f32>, sigma: f32) -> f32 {
         let row = 0.5 * (erf((s.half.x - p.x) * k) - erf((-s.half.x - p.x) * k));
         acc += row * 0.5 * (erf((yb - p.y) * k) - erf((ya - p.y) * k));
     }
-    // Corner bands: midpoint rule over the rows still inside ±3σ.
+    // Corner bands: Gauss–Legendre over the rows still inside ±3σ.
     for (var side = 0; side < 2; side++) {
-        let ca = select(band, lo, side == 0);
-        let cb = select(hi, -band, side == 0);
-        let a = max(ca, lo);
-        let b = min(cb, hi);
+        let top = side == 0;
+        let a = max(select(band, lo, top), lo);
+        let b = min(select(hi, -band, top), hi);
         if b <= a {
             continue;
         }
-        let step = (b - a) / f32(N);
-        for (var i = 0; i < N; i++) {
-            let y = a + (f32(i) + 0.5) * step;
-            let top = y < 0.0;
-            let rl = select(s.radii.w, s.radii.x, top);
-            let rr = select(s.radii.z, s.radii.y, top);
-            let ay = abs(y);
-            let xl = -s.half.x + corner_inset(rl, ay - (s.half.y - rl));
-            let xr = s.half.x - corner_inset(rr, ay - (s.half.y - rr));
-            if xr <= xl {
-                continue;
-            }
-            let row = 0.5 * (erf((xr - p.x) * k) - erf((xl - p.x) * k));
-            acc += row * gaussian(y - p.y, sigma) * step;
-        }
+        let rl = select(s.radii.w, s.radii.x, top);
+        let rr = select(s.radii.z, s.radii.y, top);
+        let mid = 0.5 * (a + b);
+        let hw = 0.5 * (b - a);
+        acc += corner_pair(s, p, sigma, k, rl, rr, mid, hw, 0.1834346425, 0.3626837834);
+        acc += corner_pair(s, p, sigma, k, rl, rr, mid, hw, 0.5255324099, 0.3137066459);
+        acc += corner_pair(s, p, sigma, k, rl, rr, mid, hw, 0.7966664774, 0.2223810345);
+        acc += corner_pair(s, p, sigma, k, rl, rr, mid, hw, 0.9602898565, 0.1012285363);
     }
     return clamp(acc, 0.0, 1.0);
 }

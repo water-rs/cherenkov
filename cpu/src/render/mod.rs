@@ -516,6 +516,8 @@ impl Renderer {
         reason = "w/h and r/g/b/a are the natural names"
     )]
     fn render_surface(&mut self, id: SurfaceId, stats: &mut FrameStats) -> Result<(), RenderError> {
+        let profile = tracing::enabled!(target: "cherenkov_cpu::profile", tracing::Level::DEBUG);
+        let start = profile.then(std::time::Instant::now);
         let mut items: Vec<Item> = Vec::new();
         let mut glyph_reqs = Vec::new();
         // Lowering borrows the layer map; the surface borrow ends before
@@ -543,10 +545,13 @@ impl Renderer {
             (result, surf.clear)
         };
         lowered?;
+        let lowered_at = start.map(|_| std::time::Instant::now());
         self.resolve_glyphs(&glyph_reqs)?;
+        let resolved_at = start.map(|_| std::time::Instant::now());
         if let Some(surface) = self.surfaces.get(&id) {
             Self::clip_glyphs(&mut items, &mut self.coverage_cache, surface.size);
         }
+        let clipped_at = start.map(|_| std::time::Instant::now());
         let Some(surf) = self.surfaces.get_mut(&id) else {
             return Ok(());
         };
@@ -557,6 +562,16 @@ impl Renderer {
         let fb = &mut surf.fb;
         let (draws, edges) =
             pool.install(|| raster::render_bands(&items, clear, fb, w, h, &mut surf.bands));
+        if let (Some(start), Some(lowered), Some(resolved), Some(clipped)) =
+            (start, lowered_at, resolved_at, clipped_at)
+        {
+            tracing::debug!(target: "cherenkov_cpu::profile",
+                lower_ns = lowered.duration_since(start).as_nanos(),
+                glyph_ns = resolved.duration_since(lowered).as_nanos(),
+                clip_ns = clipped.duration_since(resolved).as_nanos(),
+                shade_ns = clipped.elapsed().as_nanos(),
+                items = items.len(), glyphs = glyph_reqs.len(), "raster phases");
+        }
         stats.draws += draws;
         stats.instances += edges;
         stats.passes += u32::try_from(h.div_ceil(raster::BAND_H)).unwrap_or(u32::MAX);

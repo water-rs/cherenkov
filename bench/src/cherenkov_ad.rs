@@ -118,6 +118,9 @@ struct ContentLayer {
     layer: GpuLayer,
     /// Its recorded ops.
     ops: Vec<Op>,
+    /// Command count of the last recording, re-used as the next one's
+    /// capacity.
+    last_len: usize,
 }
 
 /// `cherenkov-gpu` adapter.
@@ -673,7 +676,11 @@ fn build_layer(
             PrepItem::Content(ops) => {
                 let child = surface.layer();
                 tx[&layer].push(&child);
-                content_layers.push(ContentLayer { layer: child, ops });
+                content_layers.push(ContentLayer {
+                    layer: child,
+                    ops,
+                    last_len: 0,
+                });
             }
             PrepItem::Layer(p) => build_layer(surface, tx, &layer, p, content_layers),
         }
@@ -681,6 +688,7 @@ fn build_layer(
     content_layers.push(ContentLayer {
         layer,
         ops: prep.own,
+        last_len: 0,
     });
 }
 
@@ -782,7 +790,7 @@ impl Engine for Cherenkov {
             .iter()
             .enumerate()
             .map(|(i, cl)| {
-                let content = surface.record(|c| {
+                let content = cherenkov::Content::record_with_capacity(cl.last_len, |c| {
                     for op in &cl.ops {
                         record_op(c, op);
                     }
@@ -792,7 +800,9 @@ impl Engine for Cherenkov {
             .collect();
         surface.update(|tx| {
             for (i, content) in contents {
-                tx[&self.content_layers[i].layer].content(content);
+                let cl = &mut self.content_layers[i];
+                cl.last_len = content.len();
+                tx[&cl.layer].content(content);
             }
         });
         Ok(())

@@ -2,7 +2,7 @@
 //! commit sends to the render thread.
 
 use std::any::Any;
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::mem::{needs_drop, size_of};
 use std::rc::{Rc, Weak};
 
@@ -411,11 +411,6 @@ pub struct Content {
     sent: bool,
 }
 
-thread_local! {
-    /// The last recorded list's length, so the next list reserves its size.
-    static LAST_LIST_LEN: Cell<usize> = const { Cell::new(0) };
-}
-
 impl std::fmt::Debug for Content {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Content")
@@ -429,18 +424,31 @@ impl Content {
     /// Records content.
     #[must_use]
     pub fn record(body: impl FnOnce(&mut Recorder)) -> Self {
+        Self::record_with_capacity(0, body)
+    }
+
+    /// Like [`record`](Self::record), reserving room for `capacity` commands —
+    /// pass the previous recording's [`len`](Self::len) when re-recording the
+    /// same content.
+    #[must_use]
+    pub fn record_with_capacity(capacity: usize, body: impl FnOnce(&mut Recorder)) -> Self {
         let mut recorder = Recorder {
-            list: LAST_LIST_LEN.with(|len| DisplayList::with_capacity(len.get())),
+            list: DisplayList::with_capacity(capacity),
             live: Rc::default(),
         };
         body(&mut recorder);
-        LAST_LIST_LEN.with(|len| len.set(recorder.list.len()));
         recorder.list.trim_spare();
         Self {
             picture: Picture::new(recorder.list),
             live: recorder.live,
             sent: false,
         }
+    }
+
+    /// Commands in the recorded list.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.picture.display_list().len()
     }
 
     /// The change to send at the next commit, if any. The first call sends the
@@ -524,6 +532,22 @@ mod tests {
             panic!("command 1 is the circle fill");
         };
         assert_eq!(*shape, ShapeData::Circle(Circle::new((50., 50.), 16.)));
+    }
+
+    #[test]
+    fn a_capacity_hint_records_the_same_list() {
+        let first = Content::record_with_capacity(0, |c| {
+            for i in 0..4 {
+                c.fill(Rect::new(f64::from(i), 0., 10., 10.), red());
+            }
+        });
+        assert_eq!(first.len(), 4);
+        let second = Content::record_with_capacity(first.len(), |c| {
+            for i in 0..4 {
+                c.fill(Rect::new(f64::from(i), 0., 10., 10.), red());
+            }
+        });
+        assert_eq!(second.len(), first.len());
     }
 
     #[test]

@@ -430,6 +430,29 @@ fn bind_groups_are_reused_across_frames() -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
+/// `render` returns `Next::Idle` until animation scheduling exists —
+/// the contract the `Next::At` variant's docs state.
+#[test]
+fn render_returns_idle() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(engine) = engine(GpuConfig::default()) else {
+        return Ok(());
+    };
+    let surface = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
+    surface.update(|tx| {
+        tx[surface.root()].content(surface.record(|c| {
+            c.fill(
+                Rect::new(0.0, 0.0, 64.0, 64.0),
+                WorkingColor::new([1.0, 0.0, 0.0, 1.0]),
+            );
+        }));
+    });
+    assert_eq!(
+        engine.render(cherenkov_gpu::FrameTime::now())?,
+        cherenkov_gpu::Next::Idle
+    );
+    Ok(())
+}
+
 /// A zero-size surface is rejected synchronously.
 #[test]
 fn a_zero_size_surface_is_an_error() {

@@ -165,6 +165,21 @@ pub struct DeviceInfo {
     pub thermal_celsius: Option<f64>,
 }
 
+/// One timed render pass of a submitted frame.
+#[derive(Clone, Debug, Serialize)]
+pub struct PassSample {
+    /// The pass's name (`"surface"`, `"scratch{n}"`, ...).
+    pub name: String,
+    /// Target width in pixels.
+    pub width: u32,
+    /// Target height in pixels.
+    pub height: u32,
+    /// Target texture format (`"rgba16float"`, `"rgba8unorm"`, ...).
+    pub format: String,
+    /// GPU seconds the pass took.
+    pub gpu_seconds: f64,
+}
+
 /// The result of [`Engine::submit`].
 pub struct Submit {
     /// The rendered image in the working space, when readback was
@@ -173,6 +188,9 @@ pub struct Submit {
     /// GPU seconds measured via real GPU timestamps; `None` when the
     /// backend exposes none. Never estimated.
     pub gpu_seconds: Option<f64>,
+    /// Per-pass GPU timings, in submission order; empty when the backend
+    /// exposes none.
+    pub passes: Vec<PassSample>,
 }
 
 /// Resources an adapter needs to encode one scene.

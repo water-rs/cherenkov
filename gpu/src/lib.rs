@@ -36,12 +36,12 @@ use std::marker::PhantomData;
 use std::rc::{Rc, Weak};
 use std::sync::mpsc::Sender;
 
-pub use crate::config::{Budget, Bytes, GpuConfig, GpuInfo, MemoryUsage, Pressure};
+pub use crate::config::{Budget, Bytes, GpuConfig, GpuInfo, MemoryUsage, Pressure, ScratchFormat};
 pub use crate::error::{EngineError, RenderError, ResourceError, SurfaceError, Unsupported};
 pub use crate::font::{Font, FontSource};
 pub use crate::surface::{
     FrameStats, FrameTime, Layer, LayerContent, LayerEdit, Next, Offscreen, OffscreenFormat,
-    Readback, RefreshRange, Surface, Transaction,
+    PassTiming, Readback, RefreshRange, Surface, Transaction,
 };
 
 use crate::message::{Message, SurfaceId};
@@ -72,7 +72,7 @@ impl Backend for Gpu {
 pub struct Engine<B: Backend> {
     tx: Sender<Message>,
     info: GpuInfo,
-    stats: Cell<FrameStats>,
+    stats: RefCell<FrameStats>,
     /// Weak handles to live surfaces, purged of dead entries on every use.
     surfaces: RefCell<HashMap<SurfaceId, Weak<RefCell<SurfaceShared>>>>,
     next_surface: Cell<SurfaceId>,
@@ -105,7 +105,7 @@ impl Engine<Gpu> {
         Ok(Self {
             tx,
             info: init.info,
-            stats: Cell::new(FrameStats::default()),
+            stats: RefCell::new(FrameStats::default()),
             surfaces: RefCell::new(HashMap::new()),
             next_surface: Cell::new(0),
             next_font: Cell::new(1),
@@ -222,14 +222,14 @@ impl Engine<Gpu> {
             .send(Message::Render { time, reply })
             .map_err(|_| RenderError::Thread)?;
         let (next, stats) = rx.recv().map_err(|_| RenderError::Thread)??;
-        self.stats.set(stats);
+        self.stats.replace(stats);
         Ok(next)
     }
 
     /// Statistics of the last [`Engine::render`].
     #[must_use]
-    pub const fn stats(&self) -> FrameStats {
-        self.stats.get()
+    pub fn stats(&self) -> FrameStats {
+        self.stats.borrow().clone()
     }
 }
 

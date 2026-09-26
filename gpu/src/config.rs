@@ -75,6 +75,21 @@ pub struct GpuInfo {
     pub driver_info: String,
 }
 
+/// The texture format used for intermediate (isolation) render targets.
+///
+/// The surface itself stays `Rgba16Float` regardless; this only picks the
+/// precision of offscreen layers the compositor reads back in the same
+/// frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ScratchFormat {
+    /// `Rgba16Float`: linear, no banding, 8 bytes per texel.
+    #[default]
+    LinearF16,
+    /// `Rgba8Unorm`: half the bandwidth, 8-bit precision; intermediate
+    /// results are clamped to `0..=1`.
+    Rgba8Unorm,
+}
+
 /// Configuration for the GPU engine.
 #[derive(Clone, Debug)]
 pub struct GpuConfig {
@@ -92,6 +107,9 @@ pub struct GpuConfig {
     /// When set and the adapter supports pipeline caches, the closed pipeline
     /// set is persisted at this path, best effort.
     pub pipeline_cache: Option<PathBuf>,
+    /// The isolation (scratch) texture format. Defaults to
+    /// [`ScratchFormat::LinearF16`].
+    pub scratch_format: ScratchFormat,
 }
 
 impl Default for GpuConfig {
@@ -102,6 +120,7 @@ impl Default for GpuConfig {
             timestamps: false,
             budget: Budget::default(),
             pipeline_cache: None,
+            scratch_format: ScratchFormat::default(),
         }
     }
 }

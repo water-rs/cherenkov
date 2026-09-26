@@ -7,21 +7,22 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
-use cherenkov::kurbo::{Affine, Line, Point, Rect, Vec2};
+use cherenkov::kurbo::{Affine, BezPath, Line, PathEl, Point, Rect, Vec2};
 use cherenkov::{
-    BlendMode, BlendSpace, Command, DisplayList, Extend, Interpolation, Paint, ShapeData,
+    BlendMode, BlendSpace, Command, DisplayList, Extend, FillRule, Interpolation, Paint, ShapeData,
     WorkingColor,
 };
 use cherenkov::{GlyphRun, GlyphStyle};
 
 use crate::error::{RenderError, Unsupported};
-use crate::render::glyph::{Atlas, FontData, glyph_key, rasterize};
+use crate::render::glyph::{Atlas, FontData, MaskCell, PathEmit, glyph_key, rasterize};
 use crate::render::instance::{
-    EXTEND_PAD, EXTEND_REFLECT, EXTEND_REPEAT, FLAG_HAS_CLIP, FLAG_HAS_INNER, Globals, INTERP_SRGB,
-    INTERP_WORKING, Instance, KIND_FILL, KIND_GLYPH, KIND_SHADOW, KIND_STROKE_DIST,
-    KIND_STROKE_OFFSET, PAINT_LINEAR, PAINT_RADIAL, PAINT_SOLID, PAINT_TEXTURE, Shape, Stop,
-    affine,
+    EXTEND_PAD, EXTEND_REFLECT, EXTEND_REPEAT, FLAG_HAS_CLIP, FLAG_HAS_INNER, FLAG_HAS_MASK,
+    Globals, INTERP_SRGB, INTERP_WORKING, Instance, KIND_FILL, KIND_GLYPH, KIND_SHADOW, KIND_SPAN,
+    KIND_STROKE_DIST, KIND_STROKE_OFFSET, PAINT_LINEAR, PAINT_RADIAL, PAINT_SOLID, PAINT_TEXTURE,
+    Shape, Stop, affine,
 };
+use crate::render::path;
 
 /// Linear Display P3 to linear sRGB (the inverse of the shader's
 /// `SRGB_TO_P3`), used to store `SrgbEncoded` gradient stops.
@@ -58,6 +59,10 @@ pub struct Pass {
     pub clear: Option<[f32; 4]>,
     /// Draw calls.
     pub ranges: Vec<DrawRange>,
+    /// Device-space `(x, y, w, h)` of the target this pass covers: the
+    /// whole surface for [`Target::Surface`], the tight union bbox of its
+    /// content for [`Target::Scratch`].
+    pub region: [u32; 4],
 }
 
 /// A lowered frame.
@@ -72,12 +77,42 @@ pub struct Frame {
     open: Option<OpenPass>,
 }
 
+#[derive(Clone)]
 struct OpenPass {
     target: Target,
     clear: Option<[f32; 4]>,
     source: Option<usize>,
     ranges: Vec<DrawRange>,
     seg_start: u32,
+}
+
+/// A rollback point for [`Frame::restore`] (used by speculative
+/// pass-through layers).
+struct FrameSnapshot {
+    instances: usize,
+    stops: usize,
+    passes: usize,
+    open: Option<OpenPass>,
+}
+
+impl Frame {
+    /// Captures the frame's emission state.
+    fn snapshot(&self) -> FrameSnapshot {
+        FrameSnapshot {
+            instances: self.instances.len(),
+            stops: self.stops.len(),
+            passes: self.passes.len(),
+            open: self.open.clone(),
+        }
+    }
+
+    /// Reverts every emission since `snap`.
+    fn restore(&mut self, snap: FrameSnapshot) {
+        self.instances.truncate(snap.instances);
+        self.stops.truncate(snap.stops);
+        self.passes.truncate(snap.passes);
+        self.open = snap.open;
+    }
 }
 
 impl Frame {
@@ -100,6 +135,8 @@ struct DeviceClip {
     shape: Shape,
     /// The clip's device-space rectangle, when it is one.
     aligned_rect: Option<Rect>,
+    /// A rasterized path-coverage mask.
+    mask: Option<MaskCell>,
 }
 
 /// A `ShapeData` expressed as a centred rounded box.
@@ -401,6 +438,7 @@ pub struct Lowering<'a> {
     clip: Option<DeviceClip>,
     depth: usize,
     glyphs: u32,
+    paths: u32,
 }
 
 impl<'a> Lowering<'a> {
@@ -415,12 +453,18 @@ impl<'a> Lowering<'a> {
             clip: None,
             depth: 0,
             glyphs: 0,
+            paths: 0,
         }
     }
 
     /// Glyphs rasterized during this lowering.
     pub const fn glyphs_rasterized(&self) -> u32 {
         self.glyphs
+    }
+
+    /// Paths rasterized during this lowering (cache misses).
+    pub const fn paths_rasterized(&self) -> u32 {
+        self.paths
     }
 
     /// Lowers a root layer and its clear colour into the frame.
@@ -469,13 +513,25 @@ impl<'a> Lowering<'a> {
         });
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "surface size is a small positive float"
+    )]
     fn finish_pass(&mut self) {
         self.end_segment();
         if let Some(open) = self.frame.open.take() {
+            let region = match open.target {
+                Target::Surface => [0, 0, self.width as u32, self.height as u32],
+                // Scratch regions are tightened in `isolate` once the
+                // pass's instance bboxes are known.
+                Target::Scratch(_) => [0, 0, 0, 0],
+            };
             self.frame.passes.push(Pass {
                 target: open.target,
                 clear: open.clear,
                 ranges: open.ranges,
+                region,
             });
         }
     }
@@ -492,18 +548,37 @@ impl<'a> Lowering<'a> {
 
     /// Renders `body` into an isolated scratch texture, composited back at
     /// `opacity` under the saved outer clip.
+    ///
+    /// When the isolation exists only for `opacity < 1`, first runs `body`
+    /// non-isolated: if it stays in the current pass and its instances'
+    /// device bboxes are pairwise disjoint, the instances cannot overlap
+    /// and folding `opacity` into each is identical to the isolated
+    /// composite. Otherwise the attempt is rolled back and isolation runs
+    /// as before.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "surface size is a small positive float"
+    )]
     fn isolate(
         &mut self,
         inner_clip: Option<DeviceClip>,
         opacity: f32,
-        body: impl FnOnce(&mut Self, &mut GlyphContext<'_>) -> Result<(), RenderError>,
+        mut body: impl FnMut(&mut Self, &mut GlyphContext<'_>) -> Result<(), RenderError>,
         glyphs: &mut GlyphContext<'_>,
     ) -> Result<(), RenderError> {
+        if opacity < 1.0 && self.try_passthrough(opacity, &mut body, glyphs)? {
+            return Ok(());
+        }
         self.depth += 1;
         let scratch = self.depth - 1;
         let outer_clip = self.clip;
         self.clip = inner_clip;
+        // Nested isolations split this scratch's open pass into segments;
+        // every segment at this depth needs the region.
+        let passes_start = self.frame.passes.len();
         self.begin_pass(Target::Scratch(scratch), Some([0.0; 4]));
+        let inst_start = self.frame.instances.len();
         body(self, glyphs)?;
         self.finish_pass();
         self.depth -= 1;
@@ -513,23 +588,89 @@ impl<'a> Lowering<'a> {
         } else {
             Target::Scratch(self.depth - 1)
         };
+        let region = tight_region(
+            &self.frame.instances[inst_start..],
+            self.width as u32,
+            self.height as u32,
+        );
+        if region[2] == 0 || region[3] == 0 {
+            // Nothing visible in the scratch: drop this depth's segment
+            // passes and the composite entirely.
+            for i in (passes_start..self.frame.passes.len()).rev() {
+                if self.frame.passes[i].target == Target::Scratch(scratch) {
+                    self.frame.passes.remove(i);
+                }
+            }
+            self.begin_pass(outer_target, None);
+            return Ok(());
+        }
+        for pass in &mut self.frame.passes[passes_start..] {
+            if pass.target == Target::Scratch(scratch) {
+                pass.region = region;
+            }
+        }
         self.begin_pass(outer_target, None);
-        // The composite instance: a full-surface quad sampling the scratch.
-        self.emit_composite(scratch, opacity);
+        // The composite instance: a quad over the scratch's region
+        // sampling it with `grad.xy` as the texel origin.
+        self.emit_composite(scratch, opacity, region);
         Ok(())
     }
 
-    /// Emits the composite quad for `scratch` onto the current target.
-    fn emit_composite(&mut self, scratch: usize, opacity: f32) {
-        let half = [self.width / 2.0, self.height / 2.0];
+    /// Speculative pass-through for [`Lowering::isolate`]. Returns `Ok(true)`
+    /// when `body` stayed in the current pass with disjoint device bboxes
+    /// (opacity folded per instance), `Ok(false)` after rolling back so the
+    /// caller can isolate for real.
+    fn try_passthrough(
+        &mut self,
+        opacity: f32,
+        body: &mut impl FnMut(&mut Self, &mut GlyphContext<'_>) -> Result<(), RenderError>,
+        glyphs: &mut GlyphContext<'_>,
+    ) -> Result<bool, RenderError> {
+        let snap = self.frame.snapshot();
+        let depth = self.depth;
+        let clip = self.clip;
+        let transform = self.transform;
+        let result = body(self, glyphs);
+        let new = &self.frame.instances[snap.instances..];
+        if result.is_ok() && self.frame.passes.len() == snap.passes && bboxes_disjoint(new) {
+            for inst in &mut self.frame.instances[snap.instances..] {
+                inst.params[1] *= opacity;
+            }
+            return Ok(true);
+        }
+        self.frame.restore(snap);
+        self.depth = depth;
+        self.clip = clip;
+        self.transform = transform;
+        result?;
+        Ok(false)
+    }
+
+    /// Emits the composite quad for `scratch` onto the current target,
+    /// covering `region` (`x, y, w, h` device pixels).
+    fn emit_composite(&mut self, scratch: usize, opacity: f32, region: [u32; 4]) {
+        #[expect(clippy::cast_precision_loss, reason = "region fits the surface")]
+        let (rx, ry, rw, rh) = (
+            region[0] as f32,
+            region[1] as f32,
+            region[2] as f32,
+            region[3] as f32,
+        );
+        let half = [rw / 2.0, rh / 2.0];
         let mut inst = self.base(
             KIND_FILL,
-            affine(Affine::translate((f64::from(half[0]), f64::from(half[1])))),
+            affine(Affine::translate((
+                f64::from(rx) + f64::from(half[0]),
+                f64::from(ry) + f64::from(half[1]),
+            ))),
         );
         inst.bounds = [-half[0], -half[1], half[0], half[1]];
         inst.shape = Shape::rect(half);
         inst.meta[1] = PAINT_TEXTURE;
         inst.params[1] = opacity;
+        // `grad.xy` carries the scratch region's texel origin.
+        inst.grad[0] = rx;
+        inst.grad[1] = ry;
         self.set_source(Some(scratch));
         self.frame.instances.push(inst);
         self.set_source(None);
@@ -543,6 +684,18 @@ impl<'a> Lowering<'a> {
             inst.clip_inv = affine(clip.inv);
             inst.clip = clip.shape;
             inst.meta[3] |= FLAG_HAS_CLIP << 24;
+            if let Some(mask) = &clip.mask {
+                // A masked clip's shape is always a sharp rect, so
+                // `aspect`/`exponent` — never read by its SDF — carry the
+                // mask cell size for the shader's out-of-cell guard.
+                inst.params[2] = mask.device[0];
+                inst.params[3] = mask.device[1];
+                inst.uv[2] = mask.atlas[0];
+                inst.uv[3] = mask.atlas[1];
+                inst.clip.aspect = mask.size[0];
+                inst.clip.exponent = mask.size[1];
+                inst.meta[3] |= FLAG_HAS_MASK << 24;
+            }
         }
         inst
     }
@@ -588,12 +741,15 @@ impl<'a> Lowering<'a> {
     fn with_clip(
         &mut self,
         shape: Option<&ShapeData>,
-        body: impl FnOnce(&mut Self, &mut GlyphContext<'_>) -> Result<(), RenderError>,
+        mut body: impl FnMut(&mut Self, &mut GlyphContext<'_>) -> Result<(), RenderError>,
         glyphs: &mut GlyphContext<'_>,
     ) -> Result<(), RenderError> {
         let Some(shape_data) = shape else {
             return body(self, glyphs);
         };
+        if let ShapeData::Path { elements, rule } = shape_data {
+            return self.with_path_clip(elements, *rule, body, glyphs);
+        }
         let Some(boxed) = box_shape(shape_data)? else {
             return Ok(());
         };
@@ -608,7 +764,39 @@ impl<'a> Lowering<'a> {
             inv,
             shape: boxed.shape,
             aligned_rect,
+            mask: None,
         };
+        self.run_clipped(clip, body, glyphs)
+    }
+
+    /// Runs `body` under `clip`, merging it with the current clip when the
+    /// combination stays analytic (or singly masked), isolating otherwise.
+    fn run_clipped(
+        &mut self,
+        clip: DeviceClip,
+        mut body: impl FnMut(&mut Self, &mut GlyphContext<'_>) -> Result<(), RenderError>,
+        glyphs: &mut GlyphContext<'_>,
+    ) -> Result<(), RenderError> {
+        /// The merged axis-aligned rect clip for `cr ∩ dr`.
+        fn merged_rect(cr: Rect, dr: Rect, mask: Option<MaskCell>) -> DeviceClip {
+            let merged = cr.intersect(dr);
+            let size = (merged.width().max(0.0), merged.height().max(0.0));
+            let center = merged.center();
+            let half = [
+                f32_f64(size.0 / 2.0).max(0.0),
+                f32_f64(size.1 / 2.0).max(0.0),
+            ];
+            DeviceClip {
+                inv: Affine::translate(Vec2::new(-center.x, -center.y)),
+                shape: Shape::rect(half),
+                aligned_rect: Some(if size.0 <= 0.0 || size.1 <= 0.0 {
+                    Rect::new(center.x, center.y, center.x, center.y)
+                } else {
+                    merged
+                }),
+                mask,
+            }
+        }
         match self.clip {
             None => {
                 self.clip = Some(clip);
@@ -616,25 +804,41 @@ impl<'a> Lowering<'a> {
                 self.clip = None;
                 Ok(())
             }
-            Some(cur) => match (cur.aligned_rect, clip.aligned_rect) {
-                (Some(cr), Some(dr)) => {
-                    let merged = cr.intersect(dr);
-                    let size = (merged.width().max(0.0), merged.height().max(0.0));
-                    let center = merged.center();
-                    let half = [
-                        f32_f64(size.0 / 2.0).max(0.0),
-                        f32_f64(size.1 / 2.0).max(0.0),
-                    ];
-                    let merged_clip = DeviceClip {
-                        inv: Affine::translate(Vec2::new(-center.x, -center.y)),
-                        shape: Shape::rect(half),
-                        aligned_rect: Some(if size.0 <= 0.0 || size.1 <= 0.0 {
-                            Rect::new(center.x, center.y, center.x, center.y)
-                        } else {
-                            merged
-                        }),
-                    };
-                    self.clip = Some(merged_clip);
+            // The current clip is masked: only an aligned rect merges
+            // (keeping the mask); anything else isolates.
+            Some(cur) if cur.mask.is_some() => {
+                if clip.mask.is_none()
+                    && let (Some(cr), Some(dr)) = (cur.aligned_rect, clip.aligned_rect)
+                {
+                    self.clip = Some(merged_rect(cr, dr, cur.mask));
+                    body(self, glyphs)?;
+                    self.clip = Some(cur);
+                    return Ok(());
+                }
+                self.isolate(Some(clip), 1.0, body, glyphs)
+            }
+            Some(cur) => match (clip.mask, cur.aligned_rect, clip.aligned_rect) {
+                // A new masked clip merges with an aligned rect clip (or
+                // attaches to the current clip's analytic shape).
+                (Some(mask), Some(cr), Some(dr)) => {
+                    self.clip = Some(merged_rect(cr, dr, Some(mask)));
+                    body(self, glyphs)?;
+                    self.clip = Some(cur);
+                    Ok(())
+                }
+                (Some(mask), _, _) => {
+                    self.clip = Some(DeviceClip {
+                        inv: cur.inv,
+                        shape: cur.shape,
+                        aligned_rect: cur.aligned_rect,
+                        mask: Some(mask),
+                    });
+                    body(self, glyphs)?;
+                    self.clip = Some(cur);
+                    Ok(())
+                }
+                (None, Some(cr), Some(dr)) => {
+                    self.clip = Some(merged_rect(cr, dr, None));
                     body(self, glyphs)?;
                     self.clip = Some(cur);
                     Ok(())
@@ -711,12 +915,12 @@ impl<'a> Lowering<'a> {
         let commands = list.commands();
         while i < end {
             match &commands[i] {
-                Command::Fill { shape, paint } => self.fill(shape, paint)?,
+                Command::Fill { shape, paint } => self.fill(shape, paint, glyphs)?,
                 Command::Stroke {
                     shape,
                     stroke,
                     paint,
-                } => self.stroke(shape, stroke, paint)?,
+                } => self.stroke(shape, stroke, paint, glyphs)?,
                 Command::Shadow { shape, shadow } => self.shadow(shape, shadow)?,
                 Command::Glyphs { run, paint } => self.glyph_run(run, paint, glyphs)?,
                 Command::Image { .. } => return Err(Unsupported::Image.into()),
@@ -776,8 +980,24 @@ impl<'a> Lowering<'a> {
         Ok(())
     }
 
-    /// `Fill`: a shaped quad inflated by the antialiasing margin.
-    fn fill(&mut self, shape: &ShapeData, paint: &Paint) -> Result<(), RenderError> {
+    /// `Fill`: a shaped quad inflated by the antialiasing margin; a path
+    /// goes through the coverage rasterizer.
+    fn fill(
+        &mut self,
+        shape: &ShapeData,
+        paint: &Paint,
+        glyphs: &mut GlyphContext<'_>,
+    ) -> Result<(), RenderError> {
+        if let ShapeData::Path { elements, rule } = shape {
+            let content = path::hash_elements(elements, fill_tag(*rule));
+            return self.path(
+                content,
+                *rule,
+                || BezPath::from_vec(elements.clone()),
+                paint,
+                glyphs,
+            );
+        }
         let Some(boxed) = box_shape(shape)? else {
             return Ok(());
         };
@@ -792,9 +1012,26 @@ impl<'a> Lowering<'a> {
         shape: &ShapeData,
         stroke: &kurbo::Stroke,
         paint: &Paint,
+        glyphs: &mut GlyphContext<'_>,
     ) -> Result<(), RenderError> {
-        if !stroke.dash_pattern.is_empty() {
-            return Err(Unsupported::StrokeDash.into());
+        // Path strokes and dashed strokes rasterize the stroked outline.
+        if matches!(shape, ShapeData::Path { .. }) || !stroke.dash_pattern.is_empty() {
+            if matches!(shape, ShapeData::Continuous(_)) {
+                return Err(Unsupported::Path.into());
+            }
+            let tol = path::FLATTEN / path::sigma_max(self.transform).max(1e-12);
+            let content = path::hash_stroke(shape, stroke, tol);
+            return self.path(
+                content,
+                FillRule::NonZero,
+                || {
+                    let outline_path = path::shape_path(shape, tol)
+                        .expect("shape_path is Some for non-Continuous shapes");
+                    kurbo::stroke(outline_path, stroke, &kurbo::StrokeOpts::default(), tol)
+                },
+                paint,
+                glyphs,
+            );
         }
         let hw = stroke.width / 2.0;
         if let ShapeData::Line(line) = shape {
@@ -949,6 +1186,189 @@ impl<'a> Lowering<'a> {
         Ok(())
     }
 
+    /// A path or stroked outline: rasterize once per
+    /// (content, matrix, subpixel, surface) and replay spans plus atlas
+    /// cells. `content` hashes the draw's semantics; `make` builds the
+    /// local outline only on a cache miss, so replays cost no `BezPath` or
+    /// stroke work. Coverage clipped by the surface is stored under the
+    /// offset-specific key: it is only valid at that integer offset.
+    fn path(
+        &mut self,
+        content: u64,
+        rule: FillRule,
+        make: impl FnOnce() -> BezPath,
+        paint: &Paint,
+        glyphs: &mut GlyphContext<'_>,
+    ) -> Result<(), RenderError> {
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "surface sizes fit u32"
+        )]
+        let surface = (self.width as u32, self.height as u32);
+        let pl = path::placement(content, self.transform, surface);
+        let stored = if let Some(emit) = glyphs.atlas.path(pl.key) {
+            emit.clone()
+        } else if let Some(emit) = glyphs.atlas.path(pl.key_exact) {
+            emit.clone()
+        } else {
+            let device = pl.raster * make();
+            let (segments, bbox) = path::flatten_segments(&device, path::FLATTEN);
+            let (emit, clipped) = if let Some(coverage) = path::rasterize(
+                &segments,
+                bbox,
+                (f64::from(self.width), f64::from(self.height)),
+                rule,
+            ) {
+                self.paths += 1;
+                (
+                    path::emit(&coverage, glyphs.atlas, glyphs.queue)?,
+                    coverage.clipped,
+                )
+            } else {
+                // Missing the surface at this offset says nothing about
+                // other offsets: cache it only under the exact key.
+                (PathEmit::default(), true)
+            };
+            let stored = emit.translated(-pl.offset.x, -pl.offset.y);
+            let key = if clipped { pl.key_exact } else { pl.key };
+            glyphs.atlas.insert_path(key, stored.clone());
+            stored
+        };
+        self.replay(&stored, pl.offset, paint)
+    }
+
+    /// Replays a cached path emission: `KIND_SPAN` runs and `KIND_GLYPH`
+    /// cells at `offset` from their stored rects, painted like glyphs.
+    fn replay(&mut self, emit: &PathEmit, offset: Vec2, paint: &Paint) -> Result<(), RenderError> {
+        let paint = paint_data(paint, Affine::IDENTITY, &mut self.frame.stops)?;
+        for rect in &emit.spans {
+            let mut inst = self.base(KIND_SPAN, affine(self.transform));
+            inst.bounds = [
+                f32_f64(f64::from(rect[0]) + offset.x),
+                f32_f64(f64::from(rect[1]) + offset.y),
+                f32_f64(f64::from(rect[2]) + offset.x),
+                f32_f64(f64::from(rect[3]) + offset.y),
+            ];
+            inst.color = paint.color;
+            inst.grad = paint.grad;
+            inst.grad2 = paint.grad2;
+            inst.meta[1] = paint.kind;
+            inst.meta[2] = paint.first_stop;
+            inst.meta[3] |= paint.packed & 0x00ff_ffff;
+            self.frame.instances.push(inst);
+        }
+        for cell in &emit.cells {
+            let mut inst = self.base(KIND_GLYPH, affine(self.transform));
+            inst.bounds = [
+                f32_f64(f64::from(cell.rect[0]) + offset.x),
+                f32_f64(f64::from(cell.rect[1]) + offset.y),
+                f32_f64(f64::from(cell.rect[2]) + offset.x),
+                f32_f64(f64::from(cell.rect[3]) + offset.y),
+            ];
+            inst.uv = [f32::from(cell.x), f32::from(cell.y), inst.uv[2], inst.uv[3]];
+            inst.color = paint.color;
+            inst.grad = paint.grad;
+            inst.grad2 = paint.grad2;
+            inst.meta[1] = paint.kind;
+            inst.meta[2] = paint.first_stop;
+            inst.meta[3] |= paint.packed & 0x00ff_ffff;
+            self.frame.instances.push(inst);
+        }
+        Ok(())
+    }
+
+    /// A clip with a `Path` shape: the coverage rasterized into one atlas
+    /// cell multiplies every instance drawn under it. The mask is cached
+    /// like a path draw: replays cost no rasterization or atlas cell.
+    #[expect(clippy::cast_possible_truncation)]
+    #[expect(clippy::cast_sign_loss)]
+    #[expect(clippy::cast_precision_loss)]
+    fn with_path_clip(
+        &mut self,
+        elements: &[PathEl],
+        rule: FillRule,
+        body: impl FnMut(&mut Self, &mut GlyphContext<'_>) -> Result<(), RenderError>,
+        glyphs: &mut GlyphContext<'_>,
+    ) -> Result<(), RenderError> {
+        let surface = (self.width as u32, self.height as u32);
+        let pl = path::placement(path::hash_elements(elements, 2), self.transform, surface);
+        let stored = if let Some(mask) = glyphs
+            .atlas
+            .mask(pl.key)
+            .or_else(|| glyphs.atlas.mask(pl.key_exact))
+        {
+            *mask
+        } else {
+            let device = pl.raster * BezPath::from_vec(elements.to_vec());
+            let (segments, bbox) = path::flatten_segments(&device, path::FLATTEN);
+            let Some(coverage) = path::rasterize(
+                &segments,
+                bbox,
+                (f64::from(self.width), f64::from(self.height)),
+                rule,
+            ) else {
+                // Clipping to nothing at this offset draws nothing.
+                return Ok(());
+            };
+            self.paths += 1;
+            let (Ok(w), Ok(h)) = (u32::try_from(coverage.w), u32::try_from(coverage.h)) else {
+                return Err(Unsupported::PathClipTooLarge.into());
+            };
+            if !glyphs.atlas.can_ever_fit(w, h) {
+                return Err(Unsupported::PathClipTooLarge.into());
+            }
+            let Some((cx, cy)) = glyphs.atlas.alloc(w, h) else {
+                return Err(RenderError::AtlasFull);
+            };
+            let texels: Vec<u8> = coverage
+                .data
+                .iter()
+                .map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8)
+                .collect();
+            glyphs.atlas.write(glyphs.queue, cx, cy, w, h, &texels);
+            let mask = MaskCell {
+                device: [
+                    f32_f64(coverage.x - pl.offset.x),
+                    f32_f64(coverage.y - pl.offset.y),
+                ],
+                atlas: [cx as f32, cy as f32],
+                size: [w as f32, h as f32],
+                rect: [
+                    f32_f64(coverage.x - pl.offset.x),
+                    f32_f64(coverage.y - pl.offset.y),
+                    f32_f64(coverage.x + f64::from(w) - pl.offset.x),
+                    f32_f64(coverage.y + f64::from(h) - pl.offset.y),
+                ],
+            };
+            glyphs.atlas.insert_mask(
+                if coverage.clipped {
+                    pl.key_exact
+                } else {
+                    pl.key
+                },
+                mask,
+            );
+            mask
+        };
+        // Stored mask rects are relative to the placement offset.
+        let mask = stored.translated(pl.offset.x, pl.offset.y);
+        let rect = Rect::new(
+            f64::from(mask.rect[0]),
+            f64::from(mask.rect[1]),
+            f64::from(mask.rect[2]),
+            f64::from(mask.rect[3]),
+        );
+        let center = rect.center();
+        let clip = DeviceClip {
+            inv: Affine::translate(Vec2::new(-center.x, -center.y)),
+            shape: Shape::rect([f32_f64(rect.width() / 2.0), f32_f64(rect.height() / 2.0)]),
+            aligned_rect: Some(rect),
+            mask: Some(mask),
+        };
+        self.run_clipped(clip, body, glyphs)
+    }
+
     /// `Glyphs`: rasterize missing atlas entries and emit one quad per
     /// glyph.
     fn glyph_run(
@@ -1011,6 +1431,14 @@ impl<'a> Lowering<'a> {
     }
 }
 
+/// The path cache tag for a fill rule.
+const fn fill_tag(rule: FillRule) -> u64 {
+    match rule {
+        FillRule::NonZero => 0,
+        FillRule::EvenOdd => 1,
+    }
+}
+
 /// Whether the transform's 2x2 is axis-aligned (`b == c == 0`, or a 90°
 /// rotation with `a == d == 0`).
 fn axis_aligned(transform: Affine) -> bool {
@@ -1030,11 +1458,107 @@ fn device_rect(t: Affine, r: Rect) -> Rect {
     )
 }
 
-/// The globals uniform for a surface.
-#[expect(clippy::cast_precision_loss)]
-pub const fn globals(size: (u32, u32)) -> Globals {
-    Globals {
-        size: [size.0 as f32, size.1 as f32],
-        pad: [0.0; 2],
+/// The globals uniform for one pass: `size` is the target region's pixel
+/// size and `origin` its device-space origin.
+pub const fn globals(size: [f32; 2], origin: [f32; 2]) -> Globals {
+    Globals { size, origin }
+}
+
+/// An instance's device-space bounds: `bounds` transformed by `affine`,
+/// unless the kind is already device space (`KIND_GLYPH`, `KIND_SPAN`).
+#[expect(
+    clippy::many_single_char_names,
+    reason = "a..f are the conventional affine coefficient names"
+)]
+fn device_bbox(inst: &Instance) -> [f32; 4] {
+    if inst.meta[0] == KIND_GLYPH || inst.meta[0] == KIND_SPAN {
+        return inst.bounds;
     }
+    let [a, b, c, d, e, f, _, _] = inst.affine;
+    let mut min = [f32::INFINITY; 2];
+    let mut max = [f32::NEG_INFINITY; 2];
+    for (x, y) in [
+        (inst.bounds[0], inst.bounds[1]),
+        (inst.bounds[2], inst.bounds[1]),
+        (inst.bounds[0], inst.bounds[3]),
+        (inst.bounds[2], inst.bounds[3]),
+    ] {
+        let dx = a.mul_add(x, c.mul_add(y, e));
+        let dy = b.mul_add(x, d.mul_add(y, f));
+        min[0] = min[0].min(dx);
+        min[1] = min[1].min(dy);
+        max[0] = max[0].max(dx);
+        max[1] = max[1].max(dy);
+    }
+    [min[0], min[1], max[0], max[1]]
+}
+
+/// Whether two `[x0, y0, x1, y1]` boxes overlap in area.
+fn boxes_overlap(a: [f32; 4], b: [f32; 4]) -> bool {
+    a[0] < b[2] && a[2] > b[0] && a[1] < b[3] && a[3] > b[1]
+}
+
+/// Whether every instance's device bbox is pairwise non-overlapping —
+/// O(n²) up to 256 instances, a sort-by-x sweep beyond.
+fn bboxes_disjoint(instances: &[Instance]) -> bool {
+    let mut boxes: Vec<[f32; 4]> = instances.iter().map(device_bbox).collect();
+    if boxes.len() <= 256 {
+        for (i, a) in boxes.iter().enumerate() {
+            if boxes[i + 1..].iter().any(|b| boxes_overlap(*a, *b)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    boxes.sort_by(|a, b| a[0].total_cmp(&b[0]));
+    let mut reach = f32::NEG_INFINITY;
+    let mut y0 = f32::INFINITY;
+    let mut y1 = f32::NEG_INFINITY;
+    for b in boxes {
+        if b[0] >= reach {
+            reach = b[2];
+            y0 = b[1];
+            y1 = b[3];
+        } else {
+            // x overlaps the running interval: check its y span.
+            if b[1] < y1 && b[3] > y0 {
+                return false;
+            }
+            reach = reach.max(b[2]);
+            y0 = y0.min(b[1]);
+            y1 = y1.max(b[3]);
+        }
+    }
+    true
+}
+
+/// The union device bbox of `instances` clipped to the surface, inflated
+/// by one pixel and integer-rounded, as `(x, y, w, h)`; `[0, 0, 0, 0]`
+/// when empty.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    reason = "region coordinates are finite, non-negative and below the surface size"
+)]
+fn tight_region(instances: &[Instance], width: u32, height: u32) -> [u32; 4] {
+    let mut min = [f32::INFINITY; 2];
+    let mut max = [f32::NEG_INFINITY; 2];
+    for b in instances.iter().map(device_bbox) {
+        if b.iter().any(|v| !v.is_finite()) {
+            continue;
+        }
+        min[0] = min[0].min(b[0]);
+        min[1] = min[1].min(b[1]);
+        max[0] = max[0].max(b[2]);
+        max[1] = max[1].max(b[3]);
+    }
+    let x0 = (min[0].floor() - 1.0).max(0.0);
+    let y0 = (min[1].floor() - 1.0).max(0.0);
+    let x1 = (max[0].ceil() + 1.0).min(width as f32);
+    let y1 = (max[1].ceil() + 1.0).min(height as f32);
+    if x1 <= x0 || y1 <= y0 {
+        return [0, 0, 0, 0];
+    }
+    [x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32]
 }

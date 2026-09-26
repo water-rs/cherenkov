@@ -906,6 +906,7 @@ impl Lowerer<'_> {
                 let mut lowerer = Lowerer {
                     fonts: self.fonts,
                     images: self.images,
+                    pending: self.pending,
                 };
                 cherenkov::lowering::append(
                     picture.display_list(),

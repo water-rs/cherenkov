@@ -1053,6 +1053,7 @@ impl Engine for Cherenkov {
             image,
             gpu_seconds,
             passes: Vec::new(),
+            phases: Vec::new(),
         })
     }
 

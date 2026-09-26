@@ -62,7 +62,7 @@ fn a_cyclic_layer_tree_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
     });
     // On a cyclic tree this render recurses forever; rejected ops leave a
     // plain chain that lowers and reads back normally.
-    engine.render(cherenkov_gpu::FrameTime::now())?;
+    engine.render(cherenkov::FrameTime::now())?;
     surface.readback()?;
     Ok(())
 }
@@ -151,7 +151,7 @@ fn an_earlier_surfaces_uploads_survive_a_shared_buffer_grow()
             }
         }));
     });
-    let next = engine.render(cherenkov_gpu::FrameTime::now())?;
+    let next = engine.render(cherenkov::FrameTime::now())?;
     assert_eq!(next, Next::Idle);
     let small_rb = small.readback()?;
     let [r, g, b, a] = small_rb.pixels[(32 * small_rb.width + 32) as usize];
@@ -209,14 +209,14 @@ fn timed_engine(backends: wgpu::Backends) -> Option<Engine<Gpu>> {
         ..GpuConfig::default()
     }) {
         Ok(engine) => Some(engine),
-        Err(EngineError::NoAdapter) => None,
+        Err(EngineError::Backend(_)) => None,
         Err(e) => panic!("engine init failed: {e}"),
     }
 }
 
 fn many_timed_frames(engine: &Engine<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
     let timed = engine.info().timestamps != cherenkov_gpu::TimestampSupport::Unsupported;
-    let font = engine.font(cherenkov_gpu::FontSource::bytes(std::fs::read(concat!(
+    let font = engine.font(cherenkov::FontSource::bytes(std::fs::read(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../scenes/fonts/NotoSans.ttf"
     ))?))?;
@@ -249,10 +249,10 @@ fn many_timed_frames(engine: &Engine<Gpu>) -> Result<(), Box<dyn std::error::Err
                         WorkingColor::new([0., 1., 0., 1.]),
                     );
                 }
-                c.glyphs(&run, WorkingColor::WHITE);
+                c.glyphs(run.clone(), WorkingColor::WHITE);
             }));
         });
-        let next = engine.render(cherenkov_gpu::FrameTime::now())?;
+        let next = engine.render(cherenkov::FrameTime::now())?;
         assert_eq!(next, Next::Idle, "frame {frame}");
         let stats = engine.stats();
         assert!(stats.passes > 0, "frame {frame} drew nothing: {stats:?}");
@@ -300,7 +300,7 @@ fn a_shadow_under_an_opaque_fill_loses_only_its_interior() -> Result<(), Box<dyn
     let Some(engine) = engine() else {
         return Ok(());
     };
-    let render_card = |alpha: f32| -> Result<cherenkov_gpu::Readback, Box<dyn std::error::Error>> {
+    let render_card = |alpha: f32| -> Result<cherenkov::Readback, Box<dyn std::error::Error>> {
         let surface = engine.surface(Offscreen::new((128, 128), OffscreenFormat::LinearF16))?;
         surface.update(|tx| {
             tx[surface.root()].content(surface.record(|c| {
@@ -313,7 +313,7 @@ fn a_shadow_under_an_opaque_fill_loses_only_its_interior() -> Result<(), Box<dyn
                 c.fill(card, WorkingColor::new([0.9, 0.3, 0.1, alpha]));
             }));
         });
-        engine.render(cherenkov_gpu::FrameTime::now())?;
+        engine.render(cherenkov::FrameTime::now())?;
         Ok(surface.readback()?)
     };
     let split = render_card(1.0)?;
@@ -361,7 +361,7 @@ fn a_large_fill_spans_its_interior() -> Result<(), Box<dyn std::error::Error>> {
             );
         }));
     });
-    engine.render(cherenkov_gpu::FrameTime::now())?;
+    engine.render(cherenkov::FrameTime::now())?;
     let readback = surface.readback()?;
     let px = |x: u32, y: u32| readback.pixels[(y * readback.width + x) as usize];
     for (px_x, px_y) in [
@@ -404,7 +404,7 @@ fn variants_split_ranges_but_not_pixels() -> Result<(), Box<dyn std::error::Erro
     let Some(engine) = engine() else {
         return Ok(());
     };
-    let font = engine.font(cherenkov_gpu::FontSource::bytes(std::fs::read(concat!(
+    let font = engine.font(cherenkov::FontSource::bytes(std::fs::read(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../scenes/fonts/NotoSans.ttf"
     ))?))?;
@@ -437,10 +437,10 @@ fn variants_split_ranges_but_not_pixels() -> Result<(), Box<dyn std::error::Erro
                         .stop(1.0, WorkingColor::new([0., 0., 1., 1.])),
                 );
             });
-            c.glyphs(&run, WorkingColor::WHITE);
+            c.glyphs(run, WorkingColor::WHITE);
         }));
     });
-    engine.render(cherenkov_gpu::FrameTime::now())?;
+    engine.render(cherenkov::FrameTime::now())?;
     let stats = engine.stats();
     assert!(
         stats.pipeline_switches >= 2 && stats.draws >= 3,

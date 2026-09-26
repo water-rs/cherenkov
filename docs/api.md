@@ -94,6 +94,7 @@ pub trait Renderer: 'static {
 }
 ```
 
+- **Surface limits and cadence.** `SurfaceInfo::max_dimension` lets the UI thread reject an oversized resize before sending it to a backend. Animated backend content returns `Redraw::Wanted { rate }`; the frontend combines its refresh range with active property animations. Vello uses the window's supplied range or `Offscreen::rate` (60 Hz by default).
 - **One copy of the layer tree.** The render loop in `cherenkov` owns a `SurfaceTree` per surface: the layer graph, every layer property, its animation track and the sampled value for the current frame. The backend never receives property ops; it keeps only what it alone can produce (encoded fragments, live display lists, atlases, GPU content objects) keyed by `LayerId`, and it reads the tree through `Frame`:
 
   ```rust
@@ -494,8 +495,9 @@ Device placement changes regenerate the coverage that depends on that
 placement, including fractional transforms; opacity-only changes reuse the
 content instances and assemble the required isolation/composite passes.
 Atlas generations invalidate retained GPU addresses on growth or eviction.
-Critical memory pressure releases retained CPU masks as well as the glyph
-cache.
+Deferred GPU atlas writes patch both the frame instances and retained cache
+addresses before submission. Critical memory pressure releases retained device
+output as well as the glyph caches.
 
 The CPU and GPU `dirty` integration tests run the same deterministic randomized
 slot updates and require exact readback bits against full lowering after every
@@ -506,5 +508,7 @@ properties, resize and cache eviction. Stable two-command updates assert
 `scenes/perf/live-dashboard` is the paired benchmark: one text value and one
 bar height change on every frame of an otherwise static page. `encode` measures
 the UI-thread slot changes; backend lowering runs inside `submit` with render
-composition and execution. GPU submission timing on lavapipe includes the
-software rasterizer, so it does not isolate lowering time.
+composition and submission. The GPU backend also reports render-thread CPU
+phases, including `lower_seconds`, independently of its deferred GPU timestamps.
+Submission time can include driver backpressure; use the lowering phase to
+isolate CPU lowering work.

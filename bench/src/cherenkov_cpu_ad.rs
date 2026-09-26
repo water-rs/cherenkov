@@ -249,12 +249,12 @@ const fn cpu_blend(m: BlendMode) -> cherenkov::BlendMode {
     }
 }
 
-const fn extend(e: Extend) -> Result<cherenkov::Extend, BenchError> {
+const fn extend(e: Extend) -> cherenkov::Extend {
     match e {
-        Extend::Pad => Ok(cherenkov::Extend::Pad),
-        Extend::Repeat => Ok(cherenkov::Extend::Repeat),
-        Extend::Reflect => Ok(cherenkov::Extend::Reflect),
-        Extend::None => Ok(cherenkov::Extend::None),
+        Extend::Pad => cherenkov::Extend::Pad,
+        Extend::Repeat => cherenkov::Extend::Repeat,
+        Extend::Reflect => cherenkov::Extend::Reflect,
+        Extend::None => cherenkov::Extend::None,
     }
 }
 
@@ -291,7 +291,7 @@ fn front_paint(
             start: g.start,
             end: g.end,
             stops: stops(&g.stops),
-            extend: extend(g.extend)?,
+            extend: extend(g.extend),
             interpolation: interpolation(g.interpolation)?,
         }),
         ScenePaint::Radial(g) => cherenkov::Paint::Radial(cherenkov::RadialGradient {
@@ -300,7 +300,7 @@ fn front_paint(
             end_center: g.center1,
             end_radius: g.r1,
             stops: stops(&g.stops),
-            extend: extend(g.extend)?,
+            extend: extend(g.extend),
             interpolation: interpolation(g.interpolation)?,
         }),
         ScenePaint::Sweep(g) => cherenkov::Paint::Sweep(cherenkov::SweepGradient {
@@ -308,7 +308,7 @@ fn front_paint(
             start_angle: g.start_angle,
             end_angle: g.end_angle,
             stops: stops(&g.stops),
-            extend: extend(g.extend)?,
+            extend: extend(g.extend),
             interpolation: interpolation(g.interpolation)?,
         }),
         ScenePaint::Image(p) => cherenkov::Paint::Image(cherenkov::ImagePattern {
@@ -316,8 +316,8 @@ fn front_paint(
                 .get(&p.image)
                 .ok_or(cherenkov_scene::SceneError::MissingResource(p.image))?,
             transform: p.transform,
-            extend_x: extend(p.extend_x)?,
-            extend_y: extend(p.extend_y)?,
+            extend_x: extend(p.extend_x),
+            extend_y: extend(p.extend_y),
             sampling: match p.sampling {
                 cherenkov_scene::Sampling::Nearest => cherenkov::Sampling::Nearest,
                 cherenkov_scene::Sampling::Bilinear => cherenkov::Sampling::Linear,

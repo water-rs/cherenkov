@@ -13,6 +13,9 @@ use cherenkov::{
     Paint, ShapeData, WorkingColor,
 };
 
+use skrifa::MetadataProvider as _;
+use skrifa::raw::TableProvider as _;
+
 use crate::error::{RenderError, Unsupported};
 use crate::render::paint::{PaintData, paint_data};
 use crate::render::raster::{Edge, coverage_mask};
@@ -148,10 +151,6 @@ pub struct GlyphReq {
 
 /// Render-thread resources the lowering reads: registered fonts and
 /// images (and the COLR picture cache).
-#[expect(
-    dead_code,
-    reason = "fonts and colr_cache are read by the COLR lowering"
-)]
 pub struct Resources<'a> {
     /// Registered fonts by engine id.
     pub fonts: &'a HashMap<u64, crate::render::FontData>,
@@ -416,7 +415,11 @@ fn integer_edges(r: Rect) -> Option<IRect> {
 
 impl<'a> Lowering<'a> {
     /// Starts a lowering into `items` for a `w` × `h` surface.
-    pub fn new(items: &'a mut Vec<Item>, res: &'a mut Resources<'a>, size: (u32, u32)) -> Self {
+    pub const fn new(
+        items: &'a mut Vec<Item>,
+        res: &'a mut Resources<'a>,
+        size: (u32, u32),
+    ) -> Self {
         Self {
             items,
             res,
@@ -846,13 +849,67 @@ impl<'a> Lowering<'a> {
         if matches!(run.style, GlyphStyle::Stroke(_)) {
             return Err(Unsupported::GlyphStroke.into());
         }
-        let paint = paint_data(paint, self.transform.inverse(), self.res.images)?;
+        let (font_data, font_index) = {
+            let font =
+                self.res.fonts.get(&run.font.raw()).ok_or_else(|| {
+                    RenderError::Font(format!("unregistered font {:?}", run.font))
+                })?;
+            (font.data.clone(), font.index)
+        };
+        let pdata = paint_data(paint, self.transform.inverse(), self.res.images)?;
         let [a, b, c, d, ..] = self.transform.as_coeffs();
         let matrix = [a as f32, b as f32, c as f32, d as f32];
         let coords: std::sync::Arc<[i16]> = run.coords.clone().into();
+        // `upem`/`color_glyphs` are resolved lazily — plain runs never parse
+        // the font here (the rasterizer does it on cache miss).
+        let mut colr_ctx: Option<(skrifa::FontRef<'_>, f64)> = None;
+        let mut colr_checked = false;
         for glyph in &run.glyphs {
             if glyph.transform.is_some() {
                 return Err(Unsupported::GlyphTransform.into());
+            }
+            if !colr_checked {
+                colr_checked = true;
+                let font_ref = skrifa::FontRef::from_index(&font_data, font_index)
+                    .map_err(|e| RenderError::Font(format!("{e}")))?;
+                if font_ref.colr().is_ok() {
+                    let upem = font_ref
+                        .head()
+                        .map_err(|e| RenderError::Font(format!("head: {e}")))?
+                        .units_per_em();
+                    colr_ctx = Some((font_ref, f64::from(upem)));
+                }
+            }
+            if let Some((font_ref, upem)) = colr_ctx.as_ref()
+                && font_ref
+                    .color_glyphs()
+                    .get(skrifa::GlyphId::new(glyph.id))
+                    .is_some()
+            {
+                if *upem <= 0.0 {
+                    return Err(RenderError::Font("zero units_per_em".into()));
+                }
+                let picture = crate::render::colr::glyph_picture(
+                    run.font.raw(),
+                    &font_data,
+                    font_index,
+                    self.res.colr_cache,
+                    glyph.id,
+                    &run.coords,
+                    paint,
+                )?;
+                // `translate(x, y) * scale_non_uniform(size/upem, -size/upem)`
+                // places the font-space picture at the glyph's origin.
+                let s = f64::from(run.size) / upem;
+                let place = Affine::translate((f64::from(glyph.x), f64::from(glyph.y)))
+                    * Affine::scale_non_uniform(s, -s);
+                let saved = self.transform;
+                self.transform = saved * place;
+                let list = picture.display_list();
+                let result = self.commands(list, 0, list.len());
+                self.transform = saved;
+                result?;
+                continue;
             }
             let o = self.transform * Point::new(f64::from(glyph.x), f64::from(glyph.y));
             let (ix, iy) = (o.x.floor(), o.y.floor());
@@ -878,7 +935,7 @@ impl<'a> Lowering<'a> {
                 slot,
                 x: ix as i32,
                 y: iy as i32,
-                paint: paint.clone(),
+                paint: pdata.clone(),
                 clip: self.clip.clone(),
             });
         }

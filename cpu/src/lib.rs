@@ -152,13 +152,14 @@ impl Engine<Raster> {
     /// Registers a font.
     ///
     /// The data is parsed on the caller thread to reject invalid data and
-    /// colour fonts (`COLR`, `CBDT` or `sbix` tables), then handed to the
-    /// render thread.
+    /// bitmap-only colour fonts (`CBDT`/`sbix` without outlines), then
+    /// handed to the render thread. `COLR` colour fonts render through the
+    /// colour-glyph lowering.
     ///
     /// # Errors
     /// [`ResourceError::Font`] for unparseable data and
-    /// `ResourceError::Unsupported(Unsupported::ColorFont)` for colour
-    /// fonts.
+    /// `ResourceError::Unsupported(Unsupported::ColorFont)` for
+    /// bitmap-only colour fonts.
     pub fn font(&self, source: FontSource) -> Result<Font, ResourceError> {
         font::validate_font(&source.data, source.index)?;
         let id = self.next_font.get();

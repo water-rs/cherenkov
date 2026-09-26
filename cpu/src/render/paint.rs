@@ -95,6 +95,23 @@ pub enum PaintData {
         /// The interpolation space.
         interpolation: Interpolation,
     },
+    /// A sweep (conic) gradient.
+    Sweep {
+        /// Device-to-content transform.
+        inv: [f32; 6],
+        /// The centre in content space.
+        center: [f32; 2],
+        /// Start angle in radians.
+        start: f32,
+        /// Angular span in radians, adjusted to `> 0` like the oracle.
+        span: f32,
+        /// Sorted stops.
+        stops: Box<[Stop]>,
+        /// The continuation mode.
+        extend: Extend,
+        /// The interpolation space.
+        interpolation: Interpolation,
+    },
 }
 
 /// An affine as six f32 coefficients `[a, b, c, d, e, f]`.
@@ -157,7 +174,8 @@ fn stops(stops: &[ColorStop], interpolation: Interpolation) -> Box<[Stop]> {
 /// content space the gradient parameters live in.
 #[expect(
     clippy::many_single_char_names,
-    reason = "r/g/b/a are the channel names"
+    clippy::while_float,
+    reason = "r/g/b/a are the channel names; the sweep span wrap loop is the clearest form"
 )]
 pub fn paint_data(paint: &Paint, inv: Affine) -> Result<PaintData, Unsupported> {
     Ok(match paint {
@@ -190,7 +208,21 @@ pub fn paint_data(paint: &Paint, inv: Affine) -> Result<PaintData, Unsupported> 
             extend: g.extend,
             interpolation: g.interpolation,
         },
-        Paint::Sweep(_) => return Err(Unsupported::Sweep),
+        Paint::Sweep(g) => {
+            let mut span = f32_f64(g.end_angle) - f32_f64(g.start_angle);
+            while span <= 0.0 {
+                span += std::f32::consts::TAU;
+            }
+            PaintData::Sweep {
+                inv: affine_f32(inv),
+                center: [f32_f64(g.center.x), f32_f64(g.center.y)],
+                start: f32_f64(g.start_angle),
+                span,
+                stops: stops(&g.stops, g.interpolation),
+                extend: g.extend,
+                interpolation: g.interpolation,
+            }
+        }
         Paint::Mesh(_) => return Err(Unsupported::Mesh),
         Paint::Image(_) => return Err(Unsupported::Image),
         Paint::Shader(_) => return Err(Unsupported::Shader),
@@ -198,14 +230,15 @@ pub fn paint_data(paint: &Paint, inv: Affine) -> Result<PaintData, Unsupported> 
 }
 
 /// Applies `extend` to `t`.
-fn extend_t(t: f32, extend: Extend) -> f32 {
+fn extend_t(t: f32, extend: Extend) -> Option<f32> {
     match extend {
-        Extend::Pad => t.clamp(0.0, 1.0),
-        Extend::Repeat => t - t.floor(),
+        Extend::Pad => Some(t.clamp(0.0, 1.0)),
+        Extend::Repeat => Some(t - t.floor()),
         Extend::Reflect => {
             let m = (t * 0.5).floor().mul_add(-2.0, t);
-            if m > 1.0 { 2.0 - m } else { m }
+            Some(if m > 1.0 { 2.0 - m } else { m })
         }
+        Extend::None => (0.0..=1.0).contains(&t).then_some(t),
     }
 }
 
@@ -312,7 +345,7 @@ impl PaintData {
                 } else {
                     (py - sy).mul_add(ddy, (px - sx) * ddx) / len2
                 };
-                eval_stops(stops, extend_t(t, *extend), *interpolation)
+                extend_t(t, *extend).map_or([0.0; 4], |t| eval_stops(stops, t, *interpolation))
             }
             Self::Radial {
                 inv,
@@ -325,10 +358,25 @@ impl PaintData {
                 let (px, py) = apply(*inv, dx, dy);
                 let t = radial_t(px, py, *centres, *radii);
                 if t.is_finite() {
-                    eval_stops(stops, extend_t(t, *extend), *interpolation)
+                    extend_t(t, *extend).map_or([0.0; 4], |t| eval_stops(stops, t, *interpolation))
                 } else {
                     [0.0; 4]
                 }
+            }
+            Self::Sweep {
+                inv,
+                center,
+                start,
+                span,
+                stops,
+                extend,
+                interpolation,
+            } => {
+                let (px, py) = apply(*inv, dx, dy);
+                let raw = (py - center[1]).atan2(px - center[0]) - *start;
+                let theta = *start + raw.rem_euclid(std::f32::consts::TAU);
+                let t = (theta - *start) / *span;
+                extend_t(t, *extend).map_or([0.0; 4], |t| eval_stops(stops, t, *interpolation))
             }
         }
     }

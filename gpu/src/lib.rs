@@ -100,12 +100,57 @@ impl Default for GpuConfig {
     }
 }
 
-/// The surface targets [`Gpu`] draws into: only an [`Offscreen`] texture
-/// in this slice.
+/// The surface targets [`Gpu`] draws into: an [`Offscreen`] texture or a
+/// [`WindowTarget`] presented through a wgpu swapchain.
 #[derive(Debug)]
 pub enum GpuTarget {
     /// An offscreen texture.
     Offscreen(Offscreen),
+    /// A window.
+    Window(WindowTarget),
+}
+
+/// A window the engine presents on: a raw window handle and the drawable
+/// size in pixels. The engine renders into its own linear f16 target and
+/// blits it onto the swapchain, so the surface stays readable.
+pub struct WindowTarget {
+    handle: Box<dyn wgpu::WindowHandle>,
+    size: (u32, u32),
+}
+
+impl WindowTarget {
+    /// Wraps `handle` (any `raw-window-handle` window, e.g. an
+    /// `Arc<winit::window::Window>`) at `size` device pixels.
+    pub fn new(handle: impl wgpu::WindowHandle + 'static, size: (u32, u32)) -> Self {
+        Self {
+            handle: Box::new(handle),
+            size,
+        }
+    }
+
+    /// The drawable size the swapchain is configured to.
+    #[must_use]
+    pub const fn size(&self) -> (u32, u32) {
+        self.size
+    }
+
+    pub(crate) fn into_parts(self) -> (Box<dyn wgpu::WindowHandle>, (u32, u32)) {
+        (self.handle, self.size)
+    }
+}
+
+impl core::fmt::Debug for WindowTarget {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("WindowTarget")
+            .field("size", &self.size)
+            .finish_non_exhaustive()
+    }
+}
+
+impl From<WindowTarget> for GpuTarget {
+    fn from(window: WindowTarget) -> Self {
+        Self::Window(window)
+    }
 }
 
 impl From<Offscreen> for GpuTarget {

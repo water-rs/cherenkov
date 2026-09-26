@@ -8,6 +8,7 @@ mod glyph;
 mod instance;
 mod lower;
 mod path;
+mod present;
 mod raster;
 
 use std::collections::HashMap;
@@ -161,6 +162,8 @@ struct SurfaceState {
     layers: HashMap<LayerId, ContentData>,
     /// The reused lowering output (instances, stops, passes).
     frame: LoweredFrame,
+    /// The swapchain the target is presented on, for window surfaces.
+    window: Option<present::WindowSurface>,
 }
 
 impl SurfaceState {
@@ -196,8 +199,11 @@ impl SurfaceState {
 /// All render-thread state: the [`Gpu`](crate::Gpu) backend's
 /// [`Renderer`] implementation.
 pub struct GpuRenderer {
+    instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
+    presenter: present::Presenter,
     /// `[format index][pipeline kind]`: 0 = surface format, 1 = scratch
     /// format; kind 0 = source-over, 1 = replace.
     pipelines: [[wgpu::RenderPipeline; 2]; 2],
@@ -251,7 +257,7 @@ struct PassMeta {
 /// format's required usages.
 fn create_device(
     config: &GpuConfig,
-) -> Result<(wgpu::Adapter, wgpu::Device, wgpu::Queue), EngineError> {
+) -> Result<(wgpu::Instance, wgpu::Adapter, wgpu::Device, wgpu::Queue), EngineError> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: config.backends,
         ..wgpu::InstanceDescriptor::new_without_display_handle()
@@ -285,7 +291,7 @@ fn create_device(
         trace: wgpu::Trace::Off,
     }))
     .map_err(|e| EngineError::Backend(format!("device request failed: {e}")))?;
-    Ok((adapter, device, queue))
+    Ok((instance, adapter, device, queue))
 }
 
 const fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
@@ -544,8 +550,9 @@ fn create_target(
     reason = "the contract moves the config onto the render thread"
 )]
 pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
-    create_device(&config).and_then(|(adapter, device, queue)| {
+    create_device(&config).and_then(|(instance, adapter, device, queue)| {
         let info = adapter.get_info();
+        let presenter = present::Presenter::new(&device);
         let (layout0, layout1) = create_layouts(&device);
         let scratch_format = scratch_wgpu(config.scratch_format);
         let pipelines = |format| {
@@ -613,8 +620,11 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
         let query_capacity = if query_set.is_some() { 2 } else { 0 };
         let renderer = GpuRenderer {
             max_texture: device.limits().max_texture_dimension_2d,
+            instance,
+            adapter,
             device,
             queue,
+            presenter,
             pipelines,
             scratch_format,
             layout0,
@@ -684,13 +694,30 @@ impl Renderer for GpuRenderer {
         id: SurfaceId,
         target: GpuTarget,
     ) -> Result<SurfaceInfo, SurfaceError> {
-        let GpuTarget::Offscreen(offscreen) = target;
-        let size = offscreen.size;
-        // The target is always Rgba16Float and readback decodes f16, so
-        // only the f16 readback format is honest.
-        if offscreen.format != cherenkov::OffscreenFormat::LinearF16 {
-            return Err(SurfaceError::UnsupportedFormat(offscreen.format));
-        }
+        let (size, window) = match target {
+            GpuTarget::Offscreen(offscreen) => {
+                // The target is always Rgba16Float and readback decodes f16,
+                // so only the f16 readback format is honest.
+                if offscreen.format != cherenkov::OffscreenFormat::LinearF16 {
+                    return Err(SurfaceError::UnsupportedFormat(offscreen.format));
+                }
+                (offscreen.size, None)
+            }
+            GpuTarget::Window(window) => {
+                let (handle, size) = window.into_parts();
+                if size.0 == 0 || size.1 == 0 {
+                    return Err(SurfaceError::ZeroSize);
+                }
+                let window = present::WindowSurface::new(
+                    &self.instance,
+                    &self.adapter,
+                    &self.device,
+                    handle,
+                    size,
+                )?;
+                (size, Some(window))
+            }
+        };
         if size.0 == 0 || size.1 == 0 {
             return Err(SurfaceError::ZeroSize);
         }
@@ -719,6 +746,7 @@ impl Renderer for GpuRenderer {
                 backdrop: [None, None],
                 layers: HashMap::new(),
                 frame: LoweredFrame::default(),
+                window,
             },
         );
         Ok(SurfaceInfo {
@@ -743,6 +771,9 @@ impl Renderer for GpuRenderer {
         state.view = view;
         state.scratch.clear();
         state.backdrop = [None, None];
+        if let Some(window) = &mut state.window {
+            window.resize(&self.device, size);
+        }
     }
 
     fn destroy_surface(&mut self, id: SurfaceId) {
@@ -1445,6 +1476,10 @@ impl GpuRenderer {
         self.queue.submit([encoder.finish()]);
         stats.passes += u32::try_from(surf.frame.passes.len()).unwrap_or(u32::MAX);
         stats.instances += u32::try_from(surf.frame.instances.len()).unwrap_or(u32::MAX);
+        if let Some(window) = &surf.window {
+            self.presenter
+                .present(&self.device, &self.queue, window, &surf.view)?;
+        }
         Ok(())
     }
 

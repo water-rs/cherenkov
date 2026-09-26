@@ -9,7 +9,7 @@ use cherenkov::{BlendMode, ContinuousRect, FillRule, Interpolation, ShapeData};
 use vello::peniko;
 use vello::peniko::color::{AlphaColor, ColorSpace, ColorSpaceTag, DynamicColor, LinearSrgb, Srgb};
 
-use crate::error::Unsupported;
+use crate::names;
 
 /// The target rect covering a whole `width` × `height` surface: vello's
 /// `push_layer` requires a clip, so layers without one clip to the target.
@@ -43,9 +43,9 @@ pub fn stop(s: &cherenkov::ColorStop) -> peniko::ColorStop {
 /// The colour-space tag a gradient's interpolation space maps to.
 ///
 /// # Errors
-/// [`Unsupported::Interpolation`] for any space that has no equivalent
+/// [`RenderError::Unsupported`] for any space that has no equivalent
 /// `ColorSpaceTag`.
-pub const fn interpolation(i: Interpolation) -> Result<ColorSpaceTag, Unsupported> {
+pub const fn interpolation(i: Interpolation) -> Result<ColorSpaceTag, cherenkov::RenderError> {
     match i {
         // Linear interpolation commutes with the P3↔sRGB matrix, so
         // declaring LinearSrgb to vello is exact, not a remap.
@@ -55,7 +55,7 @@ pub const fn interpolation(i: Interpolation) -> Result<ColorSpaceTag, Unsupporte
             unreachable_patterns,
             reason = "Interpolation has two variants; a future variant must become a decision"
         )]
-        _ => Err(Unsupported::Interpolation),
+        _ => Err(cherenkov::RenderError::Unsupported(names::INTERPOLATION)),
     }
 }
 
@@ -63,13 +63,13 @@ pub const fn interpolation(i: Interpolation) -> Result<ColorSpaceTag, Unsupporte
 /// the domain) has no `peniko` equivalent.
 ///
 /// # Errors
-/// [`Unsupported::ExtendNone`] for `Extend::None`.
-pub const fn extend(e: cherenkov::Extend) -> Result<peniko::Extend, Unsupported> {
+/// [`cherenkov::RenderError::Unsupported`] for `Extend::None`.
+pub const fn extend(e: cherenkov::Extend) -> Result<peniko::Extend, cherenkov::RenderError> {
     match e {
         cherenkov::Extend::Pad => Ok(peniko::Extend::Pad),
         cherenkov::Extend::Repeat => Ok(peniko::Extend::Repeat),
         cherenkov::Extend::Reflect => Ok(peniko::Extend::Reflect),
-        cherenkov::Extend::None => Err(Unsupported::ExtendNone),
+        cherenkov::Extend::None => Err(cherenkov::RenderError::Unsupported(names::EXTEND)),
     }
 }
 
@@ -363,11 +363,11 @@ mod tests {
     #[test]
     fn interpolation_maps_the_two_spaces() {
         assert_eq!(
-            interpolation(Interpolation::Working),
+            interpolation(Interpolation::Working).map_err(|e| format!("{e}")),
             Ok(ColorSpaceTag::LinearSrgb)
         );
         assert_eq!(
-            interpolation(Interpolation::SrgbEncoded),
+            interpolation(Interpolation::SrgbEncoded).map_err(|e| format!("{e}")),
             Ok(ColorSpaceTag::Srgb)
         );
     }

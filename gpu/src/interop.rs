@@ -184,6 +184,7 @@ pub struct SharedDevice {
 }
 
 /// A surface whose engine-owned linear P3 texture is handed to a native host.
+///
 /// The host receives a new texture only on creation and resize, then samples
 /// the retained texture after `Engine::render` completes. Presentation must
 /// use the same device supplied through `GpuConfig::device`.
@@ -204,6 +205,7 @@ impl TextureTarget {
 }
 
 /// Compiles a producer's WGSL with the engine's color conversion helpers.
+///
 /// `cherenkov_srgb` converts straight-alpha sRGB and
 /// `cherenkov_premultiplied_srgb` converts encoded premultiplied sRGB into
 /// premultiplied linear Display P3, the GPU content attachment convention.

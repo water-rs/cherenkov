@@ -47,6 +47,30 @@ fn a_red_rect_renders_and_reads_back() -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
+/// Pushing a layer under its own subtree — the surface root under a
+/// descendant included — would close a cycle the lowering recursion
+/// cannot escape; the commit must reject the op.
+#[test]
+fn a_cyclic_layer_tree_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(engine) = engine() else {
+        return Ok(());
+    };
+    let surface = engine.surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))?;
+    let a = surface.layer();
+    let b = surface.layer();
+    surface.update(|tx| {
+        tx[&a].push(&a);
+        tx[surface.root()].push(&a);
+        tx[&a].push(&b);
+        tx[&b].push(surface.root());
+    });
+    // On a cyclic tree this render recurses forever; rejected ops leave a
+    // plain chain that lowers and reads back normally.
+    engine.render(cherenkov_gpu::FrameTime::now())?;
+    surface.readback()?;
+    Ok(())
+}
+
 #[test]
 fn a_path_fill_renders() -> Result<(), Box<dyn std::error::Error>> {
     let Some(engine) = engine() else {

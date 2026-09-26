@@ -101,7 +101,7 @@ struct Globals {
 struct VsOut {
     @builtin(position) position: vec4<f32>,
     @location(0) local: vec2<f32>,
-    @location(1) device: vec2<f32>,
+    @location(1) pixel: vec2<f32>,
     @location(2) @interpolate(flat) instance: u32,
 }
 
@@ -133,13 +133,13 @@ fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
     let p = vec2<f32>(mix(inst.bounds.x, inst.bounds.z, sx), mix(inst.bounds.y, inst.bounds.w, sy));
     var out: VsOut;
     if inst.meta_.x == KIND_GLYPH || inst.meta_.x == KIND_SPAN {
-        out.device = p;
+        out.pixel = p;
         out.local = apply_inverse(inst.affine, p);
     } else {
         out.local = p;
-        out.device = apply(inst.affine, p);
+        out.pixel = apply(inst.affine, p);
     }
-    let ndc = (out.device - globals.origin) / globals.size * 2.0 - 1.0;
+    let ndc = (out.pixel - globals.origin) / globals.size * 2.0 - 1.0;
     out.position = vec4<f32>(ndc.x, -ndc.y, 0.0, 1.0);
     out.instance = ii;
     return out;
@@ -449,7 +449,7 @@ fn paint_image(i: u32, local: vec2<f32>) -> vec4<f32> {
     return sample_image_tex(image_tex, u, v, g2.z, g2.w, ((meta_w >> 8u) & 1u) != 0u);
 }
 
-fn paint(i: u32, local: vec2<f32>, device: vec2<f32>) -> vec4<f32> {
+fn paint(i: u32, local: vec2<f32>, pixel: vec2<f32>) -> vec4<f32> {
     switch instances[i].meta_.y {
         case PAINT_SOLID: {
             let color = instances[i].color;
@@ -457,7 +457,7 @@ fn paint(i: u32, local: vec2<f32>, device: vec2<f32>) -> vec4<f32> {
         }
         case PAINT_TEXTURE: {
             // `grad.xy` carries the source region's device-space origin.
-            return textureLoad(source, vec2<i32>(floor(device - instances[i].grad.xy)), 0);
+            return textureLoad(source, vec2<i32>(floor(pixel - instances[i].grad.xy)), 0);
         }
         case PAINT_IMAGE: {
             return paint_image(i, local);
@@ -518,7 +518,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             }
         }
         case KIND_GLYPH: {
-            let texel = vec2<i32>(floor(in.device - instances[i].bounds.xy)) + vec2<i32>(instances[i].uv.xy);
+            let texel = vec2<i32>(floor(in.pixel - instances[i].bounds.xy)) + vec2<i32>(instances[i].uv.xy);
             cov = textureLoad(atlas, texel, 0).r;
         }
         case KIND_SPAN: {
@@ -530,7 +530,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     }
     if (flags & FLAG_HAS_CLIP) != 0u {
         // `clip_inv` maps device to clip-local: J^-T is its transpose.
-        let pc = apply(instances[i].clip_inv, in.device);
+        let pc = apply(instances[i].clip_inv, in.pixel);
         let g = sdf_grad(instances[i].clip, pc);
         let ci = instances[i].clip_inv;
         let dg = vec2<f32>(ci[0].x * g.x + ci[0].y * g.y, ci[0].z * g.x + ci[0].w * g.y);
@@ -539,7 +539,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     if (flags & FLAG_HAS_MASK) != 0u {
         // Mask texel for this device pixel; texels outside the cell
         // contribute zero coverage.
-        let mp = floor(in.device) - instances[i].params.zw;
+        let mp = floor(in.pixel) - instances[i].params.zw;
         let msize = vec2<f32>(instances[i].clip.aspect, instances[i].clip.exponent);
         let inside = all(mp >= vec2<f32>(0.0)) && all(mp < msize);
         cov *= select(0.0, textureLoad(atlas, vec2<i32>(mp) + vec2<i32>(instances[i].uv.zw), 0).r, inside);
@@ -551,13 +551,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     if instances[i].meta_.y == PAINT_TEXTURE {
         let mode = (instances[i].meta_.w >> 16u) & 0xffu;
         if mode != 0u {
-            let coord = vec2<i32>(floor(in.device - instances[i].grad.xy));
+            let coord = vec2<i32>(floor(in.pixel - instances[i].grad.xy));
             let cs = textureLoad(source, coord, 0) * cov;
             let cb = textureLoad(backdrop, coord, 0);
             return blend_color(mode, cb, cs);
         }
     }
-    return paint(i, in.local, in.device) * cov;
+    return paint(i, in.local, in.pixel) * cov;
 }
 
 // W3C Compositing and Blending Level 1, a literal port of

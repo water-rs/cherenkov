@@ -2,7 +2,7 @@
 //! commit sends to the render thread.
 
 use std::any::Any;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::mem::{needs_drop, size_of};
 use std::rc::{Rc, Weak};
 
@@ -406,15 +406,20 @@ impl Draw for Recorder {
 /// `Content` is not `Send`: its signals live on the UI thread. What crosses to
 /// the render thread is the owned [`ContentChange`].
 pub struct Content {
-    list: DisplayList,
+    picture: Picture,
     live: Rc<LiveState>,
     sent: bool,
+}
+
+thread_local! {
+    /// The last recorded list's length, so the next list reserves its size.
+    static LAST_LIST_LEN: Cell<usize> = const { Cell::new(0) };
 }
 
 impl std::fmt::Debug for Content {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Content")
-            .field("list", &self.list)
+            .field("list", self.picture.display_list())
             .field("sent", &self.sent)
             .finish_non_exhaustive()
     }
@@ -425,12 +430,13 @@ impl Content {
     #[must_use]
     pub fn record(body: impl FnOnce(&mut Recorder)) -> Self {
         let mut recorder = Recorder {
-            list: DisplayList::default(),
+            list: LAST_LIST_LEN.with(|len| DisplayList::with_capacity(len.get())),
             live: Rc::default(),
         };
         body(&mut recorder);
+        LAST_LIST_LEN.with(|len| len.set(recorder.list.len()));
         Self {
-            list: recorder.list,
+            picture: Picture::new(recorder.list),
             live: recorder.live,
             sent: false,
         }
@@ -442,11 +448,11 @@ impl Content {
     pub fn take_change(&mut self) -> Option<ContentChange> {
         let updates = self.live.pending.take();
         if !updates.is_empty() {
-            let _ = self.list.apply(updates.iter().cloned());
+            let _ = self.picture.list_mut().apply(updates.iter().cloned());
         }
         if !self.sent {
             self.sent = true;
-            return Some(ContentChange::Replace(self.list.clone()));
+            return Some(ContentChange::Replace(self.picture.clone()));
         }
         (!updates.is_empty()).then_some(ContentChange::Update(updates))
     }
@@ -456,21 +462,22 @@ impl Content {
     pub fn snapshot(&mut self) -> &DisplayList {
         let updates = self.live.pending.take();
         if !updates.is_empty() {
-            let _ = self.list.apply(updates.iter().cloned());
+            let _ = self.picture.list_mut().apply(updates.iter().cloned());
             if self.sent {
                 // Keep the pending updates for the render thread.
                 *self.live.pending.borrow_mut() = updates;
             }
         }
-        &self.list
+        self.picture.display_list()
     }
 }
 
 /// What a commit sends to the render thread for one content.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ContentChange {
-    /// The whole display list, sent when the content is first committed.
-    Replace(DisplayList),
+    /// The whole display list, shared by reference when the content is first
+    /// committed.
+    Replace(Picture),
     /// New values for slots, sent when signals change afterwards.
     Update(Vec<SlotUpdate>),
 }
@@ -501,7 +508,7 @@ mod tests {
         let Some(ContentChange::Replace(mut remote)) = content.take_change() else {
             panic!("the first commit sends the whole list");
         };
-        assert_eq!(remote.len(), 3);
+        assert_eq!(remote.display_list().len(), 3);
         assert_eq!(content.take_change(), None, "nothing changed yet");
 
         radius.set(16.);
@@ -512,7 +519,7 @@ mod tests {
 
         let dirty = remote.apply(updates);
         assert_eq!(dirty.ranges(), [Range { start: 1, end: 2 }]);
-        let Command::Fill { shape, .. } = &remote.commands()[1] else {
+        let Command::Fill { shape, .. } = &remote.display_list().commands()[1] else {
             panic!("command 1 is the circle fill");
         };
         assert_eq!(*shape, ShapeData::Circle(Circle::new((50., 50.), 16.)));

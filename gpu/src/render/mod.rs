@@ -978,12 +978,12 @@ impl Renderer {
                 LayerOp::ContentChange(id, change) => {
                     if let Some(node) = state.layers.get_mut(&id) {
                         match change {
-                            ContentChange::Replace(list) => {
-                                node.content = Some(ContentData::List(list));
+                            ContentChange::Replace(picture) => {
+                                node.content = Some(ContentData::List(picture));
                             }
                             ContentChange::Update(updates) => {
-                                if let Some(ContentData::List(list)) = &mut node.content {
-                                    let _ = list.apply(updates);
+                                if let Some(ContentData::List(picture)) = &mut node.content {
+                                    let _ = picture.apply(updates);
                                 }
                             }
                         }

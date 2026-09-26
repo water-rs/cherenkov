@@ -17,7 +17,9 @@
 //!   macOS `sudo -n powermetrics`) and reports joules per frame.
 
 use std::collections::BTreeMap;
-use std::ffi::{CStr, OsStr, OsString, c_char, c_int};
+use std::ffi::OsString;
+#[cfg(unix)]
+use std::ffi::{CStr, OsStr, c_char, c_int};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -112,7 +114,8 @@ enum Sub {
 }
 
 /// Runs one `cherenkov-bench` invocation — the single code path behind
-/// both the `cherenkov-bench` binary and [`cherenkov_bench_run`].
+/// both the `cherenkov-bench` binary and the C entry point the iOS
+/// host calls (`cherenkov_bench_run`).
 ///
 /// `args` is the full argv, program name first. Returns the
 /// process-style exit code: 0 on success, 1 on a run failure, or the
@@ -154,61 +157,31 @@ pub fn run_args(args: &[OsString]) -> i32 {
 /// C entry point for hosts that cannot spawn a process.
 ///
 /// The iOS bench app links the `cherenkov-bench` static library and
-/// calls this once per argument list. `main` forwards to this too, so
-/// the binary and the embedded library share one code path.
+/// calls this once per argument list; it runs the same [`run_args`] the
+/// binary's `main` does.
 ///
 /// Returns the process-style exit code (0 on success, 101 on panic —
 /// unwinding cannot cross `extern "C"`, so a panicking run would
 /// otherwise abort the host and every queued run with it).
 ///
 /// # Safety
-/// `argv` must point to `argc` entries, each either null or a valid
+/// `argv` must point to `argc` non-null pointers, each to a valid
 /// NUL-terminated C string — the `main(argc, argv)` contract.
-#[allow(clippy::similar_names, reason = "the argc/argv C contract")]
+#[cfg(unix)]
+#[expect(clippy::similar_names, reason = "the argc/argv C contract")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cherenkov_bench_run(argc: c_int, argv: *const *const c_char) -> c_int {
-    // SAFETY: the caller upholds the contract above.
-    let args = unsafe { collect_argv(argc, argv) };
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_args(&args))).unwrap_or(101)
-}
-
-/// Collects C `argv` into [`OsString`]s, preserving bytes on unix.
-///
-/// # Safety
-/// [`cherenkov_bench_run`]'s contract.
-#[allow(clippy::similar_names, reason = "the argc/argv C contract")]
-unsafe fn collect_argv(argc: c_int, argv: *const *const c_char) -> Vec<OsString> {
-    let Ok(argc) = usize::try_from(argc) else {
-        return Vec::new();
-    };
-    if argv.is_null() {
-        return Vec::new();
-    }
-    // SAFETY: `argv` has `argc` readable entries and each non-null
-    // entry is a NUL-terminated C string.
-    unsafe {
-        (0..argc)
-            .map(|i| {
-                let ptr = *argv.add(i);
-                if ptr.is_null() {
-                    return OsString::new();
-                }
-                os_from_c(CStr::from_ptr(ptr))
-            })
-            .collect()
-    }
-}
-
-#[cfg(unix)]
-fn os_from_c(s: &CStr) -> OsString {
     use std::os::unix::ffi::OsStrExt as _;
-    OsStr::from_bytes(s.to_bytes()).to_os_string()
-}
-
-/// Lossy fallback where argv is not raw bytes.
-#[cfg(not(unix))]
-fn os_from_c(s: &CStr) -> OsString {
-    s.to_string_lossy().into_owned().into()
+    let argc = usize::try_from(argc).expect("argc is non-negative");
+    // SAFETY: the caller guarantees `argv` points to `argc` pointers,
+    // each to a NUL-terminated C string that outlives this call.
+    let args: Vec<OsString> = unsafe {
+        std::slice::from_raw_parts(argv, argc)
+            .iter()
+            .map(|&arg| OsStr::from_bytes(CStr::from_ptr(arg).to_bytes()).to_os_string())
+            .collect()
+    };
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_args(&args))).unwrap_or(101)
 }
 
 fn run(cli: Cli) -> Result<(), BenchError> {

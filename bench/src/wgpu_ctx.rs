@@ -4,10 +4,12 @@
 //! Shared `wgpu` device setup, readback and timestamp helpers for the GPU
 //! adapters (`vello-classic`, `vello-hybrid`).
 
+use std::time::{Duration, Instant};
+
 use cherenkov_oracle::F32Image;
 use wgpu::{
     Buffer, BufferDescriptor, BufferUsages, Device, DeviceDescriptor, Extent3d, Instance, MapMode,
-    MemoryHints, PollType, QuerySet, QueryType, Queue, Texture, TextureDescriptor,
+    MemoryHints, PollType, QuerySet, QueryType, Queue, SubmissionIndex, Texture, TextureDescriptor,
     TextureDimension, TextureFormat, TextureUsages, TextureView,
 };
 
@@ -25,6 +27,10 @@ const TARGET_USAGES: TextureUsages = TextureUsages::from_bits_retain(
 /// (readback swaps the channels).
 const TARGET_FORMATS: [TextureFormat; 2] = [TextureFormat::Rgba8Unorm, TextureFormat::Bgra8Unorm];
 
+/// The longest a single GPU wait (drain, timestamp or pixel readback) may
+/// block before it fails with [`BenchError::Gpu`] naming what was awaited.
+const WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// A `wgpu` device + queue + adapter info, requested with timestamp-query
 /// support.
 pub struct Gpu {
@@ -40,13 +46,13 @@ pub struct Gpu {
     pub target_format: TextureFormat,
     /// Whether timestamp queries are available.
     pub timestamps: bool,
-    /// Whether `CommandEncoder::write_timestamp` may be used directly
-    /// (otherwise timestamps must be written inside a compute pass).
-    pub timestamps_inside: bool,
     /// Timestamp query set (`Some` iff `timestamps`).
     pub query_set: Option<QuerySet>,
     /// Buffer receiving resolved query pairs (`Some` iff `timestamps`).
     pub query_buffer: Option<Buffer>,
+    /// A 1×1 attachment cleared by the marker render pass whose boundary
+    /// carries each frame timestamp (`Some` iff `timestamps`).
+    pub marker: Option<TextureView>,
 }
 
 impl Gpu {
@@ -97,24 +103,46 @@ impl Gpu {
         let info = adapter.get_info();
         let supported = adapter.features();
         let timestamps = supported.contains(wgpu::Features::TIMESTAMP_QUERY);
-        let timestamps_inside = supported.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS);
+        tracing::info!(
+            name = %info.name,
+            backend = ?info.backend,
+            timestamp_query = timestamps,
+            timestamps_inside_encoders =
+                supported.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS),
+            "bench adapter"
+        );
+        // Only pass-boundary timestamps are used: Metal on Apple GPUs
+        // advertises `TIMESTAMP_QUERY_INSIDE_ENCODERS` but samples only at
+        // stage boundaries, and wgpu's dummy-blit emulation of an
+        // encoder-level stamp can leave the command buffer unfinished.
         let mut required = wgpu::Features::empty();
         if timestamps {
             required |= wgpu::Features::TIMESTAMP_QUERY;
         }
-        if timestamps_inside {
-            required |= wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
-        }
         let (device, queue) = pollster::block_on(adapter.request_device(&DeviceDescriptor {
             label: Some("cherenkov-bench"),
             required_features: required,
-            required_limits: wgpu::Limits::default(),
+            required_limits: wgpu::Limits::default().or_worse_values_from(&adapter.limits()),
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
             memory_hints: MemoryHints::Performance,
             trace: wgpu::Trace::Off,
         }))
         .map_err(|e| BenchError::Gpu(format!("device request failed: {e}")))?;
-        let (query_set, query_buffer) = if timestamps {
+        let (query_set, query_buffer, marker) = if timestamps {
+            let texture = device.create_texture(&TextureDescriptor {
+                label: Some("timestamp marker"),
+                size: Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format: TextureFormat::Rgba8Unorm,
+                usage: TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
             (
                 Some(device.create_query_set(&wgpu::QuerySetDescriptor {
                     label: Some("frame timestamps"),
@@ -130,9 +158,10 @@ impl Gpu {
                     usage: BufferUsages::QUERY_RESOLVE | BufferUsages::COPY_SRC,
                     mapped_at_creation: false,
                 })),
+                Some(texture.create_view(&wgpu::TextureViewDescriptor::default())),
             )
         } else {
-            (None, None)
+            (None, None, None)
         };
         Ok(Self {
             device,
@@ -140,9 +169,9 @@ impl Gpu {
             info,
             target_format,
             timestamps,
-            timestamps_inside,
             query_set,
             query_buffer,
+            marker,
         })
     }
 
@@ -248,15 +277,10 @@ pub fn readback(gpu: &Gpu, target: &Target) -> Result<F32Image, BenchError> {
             depth_or_array_layers: 1,
         },
     );
-    gpu.queue.submit([encoder.finish()]);
+    let submission = gpu.queue.submit([encoder.finish()]);
+    tracing::trace!(?submission, "readback submitted");
     let slice = buf.slice(..);
-    slice.map_async(MapMode::Read, |_| {});
-    gpu.device
-        .poll(PollType::Wait {
-            submission_index: None,
-            timeout: Some(std::time::Duration::from_mins(1)),
-        })
-        .map_err(|e| BenchError::Gpu(format!("readback poll failed: {e}")))?;
+    map_read(gpu, slice, submission, "the pixel readback")?;
     let data = slice.get_mapped_range();
     let mut rgba8 = Vec::with_capacity((target.width * target.height * 4) as usize);
     for row in 0..target.height {
@@ -278,22 +302,94 @@ pub fn readback(gpu: &Gpu, target: &Target) -> Result<F32Image, BenchError> {
     ))
 }
 
-/// Writes a timestamp query at this point in `encoder`'s command stream.
+/// Blocks until `submission` (or, for `None`, everything submitted so far)
+/// has completed, for at most [`WAIT_TIMEOUT`]; `what` names the work for
+/// the error.
 ///
-/// Uses [`wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS`] when available;
-/// otherwise the timestamp is written inside an otherwise-empty compute
-/// pass, which needs only `TIMESTAMP_QUERY`.
-fn stamp(gpu: &Gpu, encoder: &mut wgpu::CommandEncoder, index: u32) {
-    let Some(qs) = &gpu.query_set else { return };
-    if gpu.timestamps_inside {
-        encoder.write_timestamp(qs, index);
-    } else {
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("timestamp"),
-            timestamp_writes: None,
-        });
-        pass.write_timestamp(qs, index);
+/// # Errors
+/// [`BenchError::Gpu`] when the wait times out or the device is lost.
+pub fn wait(gpu: &Gpu, submission: Option<SubmissionIndex>, what: &str) -> Result<(), BenchError> {
+    let start = Instant::now();
+    let status = gpu.device.poll(PollType::Wait {
+        submission_index: submission,
+        timeout: Some(WAIT_TIMEOUT),
+    });
+    let elapsed = start.elapsed();
+    match status {
+        Ok(status) => {
+            tracing::trace!(
+                what,
+                ?status,
+                wait_ms = elapsed.as_secs_f64() * 1e3,
+                "waited"
+            );
+            Ok(())
+        }
+        Err(wgpu::PollError::Timeout) => {
+            tracing::error!(what, ?elapsed, "GPU wait timed out");
+            Err(BenchError::Gpu(format!(
+                "the GPU did not finish {what} within {WAIT_TIMEOUT:?}"
+            )))
+        }
+        Err(e) => Err(BenchError::Gpu(format!("waiting for {what} failed: {e}"))),
     }
+}
+
+/// Maps `slice` for reading once `submission` has completed, bounded by
+/// [`wait`].
+fn map_read(
+    gpu: &Gpu,
+    slice: wgpu::BufferSlice<'_>,
+    submission: SubmissionIndex,
+    what: &str,
+) -> Result<(), BenchError> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(MapMode::Read, move |result| {
+        let _ = tx.send(result);
+    });
+    wait(gpu, Some(submission), what)?;
+    match rx.try_recv() {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(BenchError::Gpu(format!("{what}: map failed: {e}"))),
+        Err(_) => Err(BenchError::Gpu(format!(
+            "{what}: the map callback did not run after the wait"
+        ))),
+    }
+}
+
+/// Writes timestamp `index` at the boundary of a marker render pass (a
+/// clear of [`Gpu::marker`]) in `encoder`: index 0 at the pass's start,
+/// any other at its end. Pass boundaries are the one timestamp position
+/// every `TIMESTAMP_QUERY` backend supports, Metal on Apple GPUs included.
+fn stamp(gpu: &Gpu, encoder: &mut wgpu::CommandEncoder, index: u32) {
+    let (Some(qs), Some(marker)) = (&gpu.query_set, &gpu.marker) else {
+        return;
+    };
+    let (beginning, end) = if index == 0 {
+        (Some(index), None)
+    } else {
+        (None, Some(index))
+    };
+    encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("timestamp marker"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: marker,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                store: wgpu::StoreOp::Discard,
+            },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: Some(wgpu::RenderPassTimestampWrites {
+            query_set: qs,
+            beginning_of_pass_write_index: beginning,
+            end_of_pass_write_index: end,
+        }),
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
 }
 
 /// Drains the queue completely, then writes timestamp `index` in its own
@@ -302,31 +398,29 @@ fn stamp(gpu: &Gpu, encoder: &mut wgpu::CommandEncoder, index: u32) {
 /// On job-scheduled tiled GPUs (Mali et al.) a standalone timestamp
 /// submission shares no hazard with the engine's work, so a marker submitted
 /// alongside the frame can run *concurrently* and bracket an empty interval.
-/// Draining first ([`Device::poll`] with
-/// [`wgpu::PollType::wait_indefinitely`]) guarantees the marker executes
-/// when the queue is empty, so a `stamp(0)` → engine submit → `stamp(1)`
-/// sequence brackets the engine's real GPU execution. This serializes CPU
-/// and GPU for the measured frame — GPU-timed `measure` is a synchronous
-/// probe, not a pipelined frame rate.
+/// Draining first (a bounded [`wait`] on every prior submission) guarantees
+/// the marker executes when the queue is empty, so a `stamp(0)` → engine
+/// submit → `stamp(1)` sequence brackets the engine's real GPU execution.
+/// This serializes CPU and GPU for the measured frame — GPU-timed `measure`
+/// is a synchronous probe, not a pipelined frame rate.
 ///
 /// No-op when timestamps are unsupported.
 ///
 /// # Errors
-/// [`BenchError::Gpu`] when the device poll fails.
+/// [`BenchError::Gpu`] when the drain times out or the device is lost.
 pub fn drain_and_stamp(gpu: &Gpu, index: u32) -> Result<(), BenchError> {
     if gpu.query_set.is_none() {
         return Ok(());
     }
-    gpu.device
-        .poll(PollType::wait_indefinitely())
-        .map_err(|e| BenchError::Gpu(format!("pre-timestamp drain failed: {e}")))?;
+    wait(gpu, None, "the queue before a frame timestamp")?;
     let mut encoder = gpu
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("timestamp"),
         });
     stamp(gpu, &mut encoder, index);
-    gpu.queue.submit([encoder.finish()]);
+    let submission = gpu.queue.submit([encoder.finish()]);
+    tracing::trace!(index, ?submission, "frame timestamp submitted");
     Ok(())
 }
 
@@ -356,15 +450,10 @@ pub fn resolve_timestamps(gpu: &Gpu) -> Result<Option<f64>, BenchError> {
         });
     encoder.resolve_query_set(qs, 0..2, buf, 0);
     encoder.copy_buffer_to_buffer(buf, 0, &staging, 0, 16);
-    gpu.queue.submit([encoder.finish()]);
+    let submission = gpu.queue.submit([encoder.finish()]);
+    tracing::trace!(?submission, "timestamps resolved");
     let slice = staging.slice(..);
-    slice.map_async(MapMode::Read, |_| {});
-    gpu.device
-        .poll(PollType::Wait {
-            submission_index: None,
-            timeout: Some(std::time::Duration::from_mins(1)),
-        })
-        .map_err(|e| BenchError::Gpu(format!("timestamp poll failed: {e}")))?;
+    map_read(gpu, slice, submission, "the timestamp readback")?;
     let data = slice.get_mapped_range();
     let ticks: &[u64] = bytemuck::cast_slice(&data);
     let seconds = if ticks.len() >= 2 && ticks[1] > ticks[0] {

@@ -515,3 +515,40 @@ fn image_registration_validates_and_samples_texels() {
     let p = at(4, 12);
     assert!(p[2] > 0.9 && p[0] < 0.2, "blue texel {p:?}");
 }
+
+#[test]
+fn a_colr_glyph_run_renders_its_picture() {
+    let engine = engine();
+    let data = std::fs::read("../scenes/fonts/Nabla.ttf").expect("Nabla.ttf");
+    let font = engine
+        .font(cherenkov_cpu::FontSource::bytes(data))
+        .expect("COLR font registers");
+    let run = GlyphRun {
+        font: font.id(),
+        size: 64.0,
+        coords: Vec::new(),
+        glyphs: vec![Glyph {
+            id: 1,
+            x: 12.0,
+            y: 92.8,
+            transform: None,
+        }],
+        style: cherenkov::GlyphStyle::Fill,
+    };
+    let surface = engine
+        .surface(Offscreen::new((160, 120), OffscreenFormat::LinearF32))
+        .expect("surface");
+    surface.update(|tx| {
+        tx[surface.root()].content(surface.record(|c| c.glyphs(&run, RED)));
+    });
+    engine.render(FrameTime::now()).expect("render");
+    let rb = surface.readback().expect("readback");
+    // The COLR picture paints palette colours, not just the run's red:
+    // several pixels must be non-transparent and not pure red.
+    let coloured = rb
+        .pixels
+        .iter()
+        .filter(|p| p[3] > 0.1 && (p[0] < 0.7 || p[1] > 0.1 || p[2] > 0.1))
+        .count();
+    assert!(coloured > 20, "COLR glyph produced {coloured} coloured px");
+}

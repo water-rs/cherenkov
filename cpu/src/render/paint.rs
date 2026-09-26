@@ -402,6 +402,10 @@ fn radial_t(px: f32, py: f32, centres: [f32; 4], radii: [f32; 2]) -> f32 {
 impl PaintData {
     /// Evaluates the paint at device-space pixel centre `(dx, dy)`,
     /// returning premultiplied linear Display P3.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "image dimensions are far below 2^24"
+    )]
     pub fn eval(&self, dx: f32, dy: f32) -> [f32; 4] {
         match self {
             Self::Solid(c) => *c,

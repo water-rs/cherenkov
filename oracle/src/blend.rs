@@ -197,8 +197,9 @@ pub fn src_over(dst: [f64; 4], src: [f64; 4]) -> [f64; 4] {
     ]
 }
 
-/// Composite an isolated group in its selected space. Inputs and output are
-/// premultiplied linear P3. For encoded sRGB, unpremultiply, convert primaries,
+/// Composite an isolated group in its selected space.
+///
+/// Inputs and output are premultiplied linear P3. For encoded sRGB, unpremultiply, convert primaries,
 /// encode with the signed sRGB curve, and premultiply before applying BOTH
 /// the blend function and Porter-Duff operation. Decode the result back to
 /// linear P3 afterward. Alpha is never encoded; extended channels are never

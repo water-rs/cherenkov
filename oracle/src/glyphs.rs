@@ -66,6 +66,7 @@ impl std::error::Error for GlyphError {}
 struct BezPen(BezPath);
 
 /// Reference outline for a frontend glyph, including style and placement.
+///
 /// Font outlines are unhinted and y-up. Scale to the run's y-down units,
 /// expand a stroke in those units, then apply the glyph's local transform,
 /// its origin translation and the enclosing transform, in that order.

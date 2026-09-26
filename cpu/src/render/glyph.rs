@@ -414,9 +414,11 @@ mod tests {
         };
         let coords = Arc::from([]);
         let original = glyph_key(&run, &coords, 36, (0.25, 0.5), Affine::IDENTITY);
+        // Kurbo defaults to round joins and caps; each case must change a field.
         for stroke in [
-            kurbo::Stroke::new(2.0).with_join(kurbo::Join::Round),
-            kurbo::Stroke::new(2.0).with_caps(kurbo::Cap::Round),
+            kurbo::Stroke::new(3.0),
+            kurbo::Stroke::new(2.0).with_join(kurbo::Join::Miter),
+            kurbo::Stroke::new(2.0).with_caps(kurbo::Cap::Butt),
             kurbo::Stroke::new(2.0).with_miter_limit(8.0),
             kurbo::Stroke::new(2.0).with_dashes(0.25, [1.0, 2.0]),
         ] {

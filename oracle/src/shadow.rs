@@ -38,7 +38,9 @@ fn closed_contours(path: &kurbo::BezPath) -> kurbo::BezPath {
     closed
 }
 
-/// Coverage of a spread caster before convolution. Rectangles and rounded
+/// Coverage of a spread caster before convolution.
+///
+/// Rectangles and rounded
 /// rectangles grow their half-extents by `spread`; a positive corner radius
 /// becomes `max(0, radius + spread)`, while a sharp corner stays sharp. A
 /// nonpositive resulting extent is empty. Other shapes offset their closed
@@ -257,7 +259,9 @@ fn integrate(f: &impl Fn(f64) -> f64, low: f64, high: f64, tolerance: f64, depth
 }
 
 /// Convolve a device coverage field with a shape-space Gaussian pushed forward
-/// by `transform`. The six-sigma integrated tap definition is given in the
+/// by `transform`.
+///
+/// The six-sigma integrated tap definition is given in the
 /// module documentation. Nonpositive sigma is the identity. Singular transforms
 /// yield line or point distributions; no inverse transform is required.
 #[must_use]

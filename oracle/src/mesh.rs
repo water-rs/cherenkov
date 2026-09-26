@@ -1,7 +1,9 @@
 // Copyright 2026 the Cherenkov Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Reference mesh paint. Each grid cell is a bilinear patch, in row-major
+//! Reference mesh paint.
+//!
+//! Each grid cell is a bilinear patch, in row-major
 //! order, with corners 00, 10, 01, 11. Geometry and premultiplied linear-P3
 //! colour use the same bilinear weights. Outside all patches is transparent.
 //! Overlapping patches use the last patch; folded patches use the inverse

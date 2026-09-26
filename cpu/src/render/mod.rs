@@ -5,6 +5,7 @@
 
 mod blend;
 mod colr;
+mod coverage;
 mod glyph;
 mod lower;
 mod paint;
@@ -102,6 +103,8 @@ struct SurfaceState {
     layers: HashMap<LayerId, LayerNode>,
     clear: cherenkov::WorkingColor,
     dirty: bool,
+    /// Reused band item bins and isolation buffers.
+    bands: Vec<raster::BandScratch>,
 }
 
 /// All render-thread state.
@@ -113,6 +116,7 @@ struct Renderer {
     images: HashMap<u64, std::sync::Arc<CpuImage>>,
     /// The glyph mask cache, bounded by `Budget::cpu`.
     glyph_cache: glyph::GlyphCache,
+    coverage_cache: coverage::CoverageCache,
     /// COLR glyph picture cache, keyed by font, glyph, coords and paint.
     colr_cache: HashMap<(u64, u32, u64, u64), cherenkov::Picture>,
 }
@@ -155,7 +159,10 @@ pub fn run(
                 surfaces: HashMap::new(),
                 fonts: HashMap::new(),
                 images: HashMap::new(),
-                glyph_cache: glyph::GlyphCache::new(config.budget.cpu.0),
+                glyph_cache: glyph::GlyphCache::new(config.budget.cpu.0 / 2),
+                coverage_cache: coverage::CoverageCache::new(
+                    usize::try_from(config.budget.cpu.0 - config.budget.cpu.0 / 2).unwrap_or(usize::MAX),
+                ),
                 colr_cache: HashMap::new(),
             },
             info,
@@ -216,6 +223,10 @@ pub fn run(
                 if pressure == Pressure::Critical {
                     renderer.fonts.shrink_to_fit();
                     renderer.glyph_cache.clear();
+                    renderer.coverage_cache.clear();
+                    for surface in renderer.surfaces.values_mut() {
+                        surface.bands.clear();
+                    }
                 }
             }
             Message::Shutdown => break,
@@ -269,6 +280,7 @@ impl Renderer {
                 layers,
                 clear: cherenkov::WorkingColor::TRANSPARENT,
                 dirty: true,
+                bands: Vec::new(),
             },
         );
         Ok(())
@@ -281,6 +293,7 @@ impl Renderer {
         };
         if let Some(clear) = changes.clear {
             state.clear = clear;
+            state.dirty = true;
         }
         for op in changes.ops {
             state.dirty = true;
@@ -377,7 +390,11 @@ impl Renderer {
         let framebuffers = self
             .surfaces
             .values()
-            .map(|s| u64::from(s.size.0) * u64::from(s.size.1) * 16)
+            .map(|s| {
+                u64::from(s.size.0) * u64::from(s.size.1) * 16
+                    + u64::try_from(s.bands.iter().map(raster::BandScratch::bytes).sum::<usize>())
+                        .expect("band allocation fits u64")
+            })
             .sum();
         let images = self
             .images
@@ -387,6 +404,9 @@ impl Renderer {
         MemoryUsage {
             framebuffers: Bytes(framebuffers),
             glyph_cache: Bytes(self.glyph_cache.bytes()),
+            coverage_cache: Bytes(
+                u64::try_from(self.coverage_cache.bytes()).expect("coverage allocation fits u64"),
+            ),
             images: Bytes(images),
         }
     }
@@ -493,6 +513,7 @@ impl Renderer {
                     fonts: &self.fonts,
                     images: &self.images,
                     colr_cache: &mut self.colr_cache,
+                    coverage_cache: &mut self.coverage_cache,
                 };
                 let mut lowering = Lowering::new(&mut items, &mut res, surf.size);
                 let result = lowering.run(root, &layers, surf.clear);
@@ -506,21 +527,68 @@ impl Renderer {
         };
         lowered?;
         self.resolve_glyphs(&glyph_reqs)?;
+        if let Some(surface) = self.surfaces.get(&id) {
+            Self::clip_glyphs(&mut items, &mut self.coverage_cache, surface.size);
+        }
         let Some(surf) = self.surfaces.get_mut(&id) else {
             return Ok(());
         };
         let (w, h) = (surf.size.0 as usize, surf.size.1 as usize);
         let [r, g, b, a] = clear_color.components;
         let clear = [r * a, g * a, b * a, a];
-        surf.fb.fill(clear);
         let pool = &self.pool;
         let fb = &mut surf.fb;
-        let (draws, edges) = pool.install(|| raster::render_bands(&items, clear, fb, w, h));
+        let (draws, edges) =
+            pool.install(|| raster::render_bands(&items, clear, fb, w, h, &mut surf.bands));
         stats.draws += draws;
         stats.instances += edges;
         stats.passes += u32::try_from(h.div_ceil(raster::BAND_H)).unwrap_or(u32::MAX);
         surf.dirty = false;
         Ok(())
+    }
+
+    /// A cached glyph mask cannot be multiplied by partial clip coverage:
+    /// intersect its retained outline at the exact integer instance origin.
+    #[expect(clippy::cast_precision_loss, reason = "glyph origins fit device coordinate precision")]
+    fn clip_glyphs(
+        items: &mut [Item],
+        cache: &mut coverage::CoverageCache,
+        size: (u32, u32),
+    ) {
+        for item in items {
+            if let Item::Glyph {
+                slot,
+                x,
+                y,
+                paint,
+                clip: Some(clip),
+            } = item
+            {
+                let mask = slot.get().expect("glyph resolved before clipping");
+                let edges: std::sync::Arc<[raster::Edge]> = mask
+                    .edges
+                    .iter()
+                    .map(|edge| raster::Edge {
+                        x0: edge.x0 + *x as f32,
+                        y0: edge.y0 + *y as f32,
+                        x1: edge.x1 + *x as f32,
+                        y1: edge.y1 + *y as f32,
+                    })
+                    .collect();
+                let edge_count = edges.len();
+                let mut operands = clip.operands.clone();
+                operands.push(coverage::Operand {
+                    edges,
+                    rule: cherenkov::FillRule::NonZero,
+                });
+                let coverage = cache.intersection(&operands, size.0 as usize, size.1 as usize);
+                *item = Item::Draw {
+                    coverage,
+                    edge_count,
+                    paint: paint.clone(),
+                };
+            }
+        }
     }
 
     /// Fills every glyph request's slot: cache hits resolve directly;
@@ -578,5 +646,47 @@ impl Renderer {
             height: state.size.1,
             pixels,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, OnceLock};
+
+    use super::*;
+
+    #[test]
+    fn clipped_glyph_uses_its_outline_at_the_integer_origin() {
+        let edges: Arc<[raster::Edge]> = Arc::from([
+            raster::Edge { x0: 0.0, y0: 0.0, x1: 1.0, y1: 0.0 },
+            raster::Edge { x0: 1.0, y0: 0.0, x1: 0.0, y1: 1.0 },
+            raster::Edge { x0: 0.0, y0: 1.0, x1: 0.0, y1: 0.0 },
+        ]);
+        let mask = Arc::new(glyph::GlyphMask {
+            left: 0, top: 0, w: 1, h: 1, edges: edges.clone(), cov: vec![0.5],
+        });
+        let slot = Arc::new(OnceLock::new());
+        slot.set(mask).expect("empty slot");
+        let clip_edges = edges.iter().map(|edge| raster::Edge {
+            x0: edge.x0 + 4.0, y0: edge.y0 + 16.0,
+            x1: edge.x1 + 4.0, y1: edge.y1 + 16.0,
+        }).collect();
+        let clip = Arc::new(lower::ClipGeometry {
+            operands: vec![coverage::Operand { edges: clip_edges, rule: cherenkov::FillRule::NonZero }],
+        });
+        let mut items = [Item::Glyph {
+            slot, x: 4, y: 16, paint: paint::PaintData::Solid([1.0; 4]), clip: Some(clip),
+        }];
+        Renderer::clip_glyphs(&mut items, &mut coverage::CoverageCache::new(4096), (8, 20));
+        let Item::Draw { coverage, .. } = &items[0] else { panic!("clipped glyph must be prepared"); };
+        let mut oracle = cherenkov_oracle::coverage::Coverage::new(8, 20);
+        oracle.add_line(4.0, 16.0, 5.0, 16.0);
+        oracle.add_line(5.0, 16.0, 4.0, 17.0);
+        oracle.add_line(4.0, 17.0, 4.0, 16.0);
+        let expected = oracle.finish(cherenkov_scene::FillRule::NonZero);
+        for (i, value) in expected.iter().enumerate() {
+            assert!((f64::from(coverage.at(i % 8, i / 8)) - value).abs() < 1e-7);
+        }
+        assert!((coverage.at(4, 16) - 0.5).abs() < 1e-7);
     }
 }

@@ -17,7 +17,8 @@ use skrifa::raw::types::F2Dot14;
 
 use crate::error::RenderError;
 use crate::render::lower::GlyphReq;
-use crate::render::raster::{Accum, Edge};
+use crate::render::coverage::{Operand, rasterize};
+use crate::render::raster::Edge;
 
 /// A glyph cache key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -26,7 +27,7 @@ pub struct GlyphKey {
     font: u64,
     /// The glyph index.
     glyph: u32,
-    /// `(size * 64).round()` — 1/64th-pixel size granularity.
+    /// Exact f32 font size; fractional sizes must not alias in the cache.
     size_bits: u32,
     /// Exact subpixel position: f32 bits of the fractional offset.
     subpixel: [u32; 2],
@@ -48,6 +49,8 @@ pub struct GlyphMask {
     pub w: u32,
     /// Mask height in cells.
     pub h: u32,
+    /// Outline relative to the integer glyph origin, retained for geometric clipping.
+    pub edges: Arc<[Edge]>,
     /// Coverage, `w * h` cells.
     pub cov: Vec<f32>,
 }
@@ -97,23 +100,36 @@ impl GlyphCache {
     pub fn insert_batch(&mut self, masks: Vec<(GlyphKey, Arc<GlyphMask>)>) {
         let batch: u64 = masks
             .iter()
-            .map(|(_, m)| u64::from(m.w) * u64::from(m.h) * 4)
+            .map(|(_, m)| mask_bytes(m))
             .sum();
         if self.bytes + batch > self.budget {
             self.clear();
         }
         for (key, mask) in masks {
-            self.bytes += u64::from(mask.w) * u64::from(mask.h) * 4;
-            self.map.insert(key, mask);
+            let bytes = mask_bytes(&mask);
+            if bytes > self.budget {
+                continue;
+            }
+            if self.bytes + bytes > self.budget {
+                self.clear();
+            }
+            self.bytes += bytes;
+            if let Some(previous) = self.map.insert(key, mask) {
+                self.bytes -= mask_bytes(&previous);
+            }
         }
     }
+}
+
+fn mask_bytes(mask: &GlyphMask) -> u64 {
+    u64::try_from(mask.cov.capacity() * size_of::<f32>() + size_of_val(&*mask.edges))
+        .expect("glyph allocation fits u64")
 }
 
 /// The cache key for a glyph at an exact subpixel position.
 #[expect(
     clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "size and subpixel fractions are small non-negative values"
+    reason = "the stored linear transform uses the same f32 precision as glyph rasterization"
 )]
 pub fn glyph_key(run: &GlyphRun, glyph: u32, subpixel: (f32, f32), transform: Affine) -> GlyphKey {
     let mut hasher = DefaultHasher::new();
@@ -122,7 +138,7 @@ pub fn glyph_key(run: &GlyphRun, glyph: u32, subpixel: (f32, f32), transform: Af
     GlyphKey {
         font: run.font.raw(),
         glyph,
-        size_bits: (run.size * 64.0).round() as u32,
+        size_bits: run.size.to_bits(),
         subpixel: [subpixel.0.to_bits(), subpixel.1.to_bits()],
         matrix: [
             (a as f32).to_bits(),
@@ -169,13 +185,14 @@ impl OutlinePen for PathPen {
 }
 
 /// An empty mask (missing glyph, empty outline).
-const fn empty() -> GlyphMask {
+fn empty() -> GlyphMask {
     GlyphMask {
         left: 0,
         top: 0,
         w: 0,
         h: 0,
         cov: Vec::new(),
+        edges: Arc::from([]),
     }
 }
 
@@ -278,31 +295,38 @@ pub fn rasterize_mask(
     let right = bbox.x1.ceil() as i32 + 1;
     let bottom = bbox.y1.ceil() as i32 + 1;
     let (w, h) = ((right - left) as usize, (bottom - top) as usize);
-    // Rasterize in mask space.
-    let mut acc = Accum::new(w, h);
-    let (ox, oy) = (left as f32, top as f32);
-    crate::render::raster::deposit_exact(
-        &mut acc,
-        edges.iter().map(|e| Edge {
-            x0: e.x0 - ox,
-            y0: e.y0 - oy,
-            x1: e.x1 - ox,
-            y1: e.y1 - oy,
-        }),
-        cherenkov::FillRule::NonZero,
+    // Keep the outline at its original precision for clipped instances.
+    let local: Arc<[Edge]> = edges
+        .iter()
+        .map(|e| Edge {
+            x0: e.x0 - left as f32,
+            y0: e.y0 - top as f32,
+            x1: e.x1 - left as f32,
+            y1: e.y1 - top as f32,
+        })
+        .collect();
+    let coverage = rasterize(
+        &[Operand {
+            edges: local,
+            rule: cherenkov::FillRule::NonZero,
+        }],
+        w,
         h,
     );
     let mut cov = vec![0.0; w * h];
     for y in 0..h {
-        acc.coverage_row(y, 0, w, |x, c| {
-            cov[y * w + x] = c;
-        });
+        for span in coverage.row(y) {
+            for x in span.columns.clone() {
+                cov[y * w + x] = span.at(x);
+            }
+        }
     }
     Ok(GlyphMask {
         left,
         top,
         w: w as u32,
         h: h as u32,
+        edges: edges.into(),
         cov,
     })
 }

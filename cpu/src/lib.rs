@@ -9,17 +9,12 @@
 //! over owned messages. There are no locks: `Engine`, `Surface` and `Layer`
 //! are `!Send` and everything crossing the channel is `Send`.
 //!
-//! Framebuffers are premultiplied linear Display P3, one f32 per channel,
-//! rasterized in horizontal bands of 16 rows by an exact signed-area
-//! coverage accumulator (font-rs / vello-cpu style): every flattened edge
-//! deposits trapezoid areas into a row accumulator and a prefix sum turns
-//! it into winding-weighted coverage. Unlike the oracle's per-pixel
-//! geometric area, the accumulator is exact only for polygons that do not
-//! self-overlap inside a single pixel.
-//!
-//! Measured on the render corpus, materializing readbacks as f16 costs
-//! +0.0013 mean FLIP versus keeping f32 (0.00406 vs 0.00278) — the
-//! framebuffer itself is always f32.
+//! Framebuffers are premultiplied linear Display P3, one f32 per channel.
+//! Geometry is compiled into sparse exact-area coverage runs before
+//! independent horizontal bands shade and composite pixels. Fill rules,
+//! self-intersections, and nested clips are resolved geometrically before
+//! integrating area. Exactness is relative to the flattened device-space
+//! boundaries; readback can round the f32 framebuffer to f16.
 //!
 //! ```no_run
 //! use cherenkov::{Draw, WorkingColor};
@@ -35,6 +30,8 @@
 //! });
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
+
+#![doc = include_str!("../DESIGN-coverage.md")]
 
 mod config;
 mod error;
@@ -133,8 +130,8 @@ impl Engine<Raster> {
         &self.info
     }
 
-    /// Reports system memory pressure. `Critical` clears the glyph mask
-    /// cache; `Moderate` currently does nothing.
+    /// Reports system memory pressure. `Critical` clears glyph and prepared
+    /// coverage caches and retained band scratch; `Moderate` does nothing.
     pub fn trim(&self, pressure: Pressure) {
         let _ = self.tx.send(Message::Trim(pressure));
     }

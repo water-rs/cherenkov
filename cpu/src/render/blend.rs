@@ -189,12 +189,13 @@ pub fn blend(mode: BlendMode, cb: [f32; 4], cs: [f32; 4]) -> [f32; 4] {
 /// Composite premultiplied `src` over premultiplied `dst` (source-over).
 /// `src` is expected already blended for non-normal blends.
 #[must_use]
+#[expect(clippy::suboptimal_flops, reason = "avoid four software fmaf calls per composited pixel on baseline targets")]
 pub fn src_over(dst: [f32; 4], src: [f32; 4]) -> [f32; 4] {
     [
-        dst[0].mul_add(1.0 - src[3], src[0]),
-        dst[1].mul_add(1.0 - src[3], src[1]),
-        dst[2].mul_add(1.0 - src[3], src[2]),
-        dst[3].mul_add(1.0 - src[3], src[3]),
+        dst[0] * (1.0 - src[3]) + src[0],
+        dst[1] * (1.0 - src[3]) + src[1],
+        dst[2] * (1.0 - src[3]) + src[2],
+        dst[3] * (1.0 - src[3]) + src[3],
     ]
 }
 

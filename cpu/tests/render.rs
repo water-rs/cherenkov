@@ -552,3 +552,68 @@ fn a_colr_glyph_run_renders_its_picture() {
         .count();
     assert!(coloured > 20, "COLR glyph produced {coloured} coloured px");
 }
+
+#[test]
+fn nested_fractional_clips_use_geometric_intersection() {
+    let engine = engine();
+    let mut lower = BezPath::new();
+    lower.move_to((0.0, 0.0));
+    lower.line_to((1.0, 0.0));
+    lower.line_to((0.0, 1.0));
+    lower.close_path();
+    let mut upper = BezPath::new();
+    upper.move_to((0.0, 1.0));
+    upper.line_to((1.0, 0.0));
+    upper.line_to((1.0, 1.0));
+    upper.close_path();
+    let pixels = render_f32(&engine, 2, 2, |c| {
+        c.clip(lower.clone(), |c| {
+            c.clip(upper, |c| c.fill(Rect::new(0.0, 0.0, 2.0, 2.0), RED));
+        });
+    });
+    assert!(pixels[0][3].abs() < 1e-7, "disjoint triangles: {:?}", pixels[0]);
+    let pixels = render_f32(&engine, 2, 2, |c| {
+        c.clip(lower.clone(), |c| {
+            c.clip(lower, |c| c.fill(Rect::new(0.0, 0.0, 2.0, 2.0), RED));
+        });
+    });
+    assert!((pixels[0][3] - 0.5).abs() < 1e-7, "identical triangles: {:?}", pixels[0]);
+}
+
+#[test]
+fn cached_geometry_and_band_scratch_preserve_pixels() {
+    fn record(c: &mut cherenkov::Recorder, offset: f64) {
+        let mut path = BezPath::new();
+        path.move_to((1.125, 2.25));
+        path.line_to((37.875, 45.625));
+        path.line_to((2.125, 45.125));
+        path.line_to((38.125, 1.625));
+        path.close_path();
+        c.transform(Affine::translate((offset, 0.0)), |c| {
+            c.clip(kurbo::Circle::new((22.25, 23.75), 20.125), |c| {
+                c.shadow(Rect::new(8.25, 12.125, 28.75, 35.875), Shadow::new(1.25, RED));
+                c.group(Group::new().opacity(0.625), |c| {
+                    c.fill(EvenOdd(path.clone()), RED);
+                    c.stroke(path, Stroke::new(2.375).with_join(kurbo::Join::Round), RED);
+                });
+            });
+        });
+    }
+    let cached = Engine::<Raster>::new(RasterConfig { threads: Some(4), ..RasterConfig::default() }).expect("engine");
+    let uncached = Engine::<Raster>::new(RasterConfig {
+        threads: Some(1),
+        budget: cherenkov_cpu::Budget { cpu: cherenkov_cpu::Bytes(0) },
+    }).expect("engine");
+    // Reuse one surface so isolation buffers survive between frames. Re-record
+    // equivalent content, then change only the fractional transform.
+    let surface = cached.surface(Offscreen::new((48, 48), OffscreenFormat::LinearF32)).expect("surface");
+    for offset in [0.125, 0.125, 0.375, 0.125] {
+        surface.update(|tx| {
+            tx[surface.root()].content(surface.record(|c| record(c, offset)));
+        });
+        cached.render(FrameTime::now()).expect("render");
+        let actual = surface.readback().expect("readback").pixels;
+        let expected = render_f32(&uncached, 48, 48, |c| record(c, offset));
+        assert!(actual.iter().zip(&expected).all(|(a, b)| a.map(f32::to_bits) == b.map(f32::to_bits)));
+    }
+}

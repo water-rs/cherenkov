@@ -18,9 +18,10 @@ use cherenkov_scene::kurbo::{
     Affine, BezPath, Ellipse, Line, Point, Rect, RoundedRect, RoundedRectRadii, Vec2,
 };
 use cherenkov_scene::{
-    BlendMode, Color, ColorSpace, Draw, Extend, FillRule, Glyph, GlyphRun, GradientStop, ImagePaint,
-    LayerBuilder, LinearGradient, Live, Motion, MotionAnimation, NormalizedCoord, Paint,
-    RadialGradient, ResourceHash, Sampling, Scene, SceneError, Shape, StrokeStyle, SweepGradient,
+    BlendMode, Color, ColorSpace, Draw, Extend, FillRule, Glyph, GlyphRun, GradientStop,
+    ImagePaint, LayerBuilder, LinearGradient, Live, Motion, MotionAnimation, NormalizedCoord,
+    Paint, RadialGradient, ResourceHash, Sampling, Scene, SceneError, Shape, StrokeStyle,
+    SweepGradient,
 };
 use fontique::FontWeight;
 use parley::{
@@ -1662,7 +1663,12 @@ fn run() -> Result<(), SceneError> {
                     let x = 56.0 + f64::from(i) * 39.0;
                     let h = 40.0 + f64::from((i * 37) % 200);
                     l.fill(
-                        Shape::Rect(Rect::new(x, chart_top + chart_h - h, x + 28.0, chart_top + chart_h)),
+                        Shape::Rect(Rect::new(
+                            x,
+                            chart_top + chart_h - h,
+                            x + 28.0,
+                            chart_top + chart_h,
+                        )),
                         bar_paint.clone(),
                     );
                 }

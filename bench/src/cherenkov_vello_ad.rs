@@ -157,9 +157,7 @@ fn shape_op(op: &Op) -> Option<LiveShape> {
         Op::Fill {
             shape, even_odd, ..
         } => Some(LiveShape::of(shape, *even_odd)),
-        Op::Stroke { shape, .. } | Op::Shadow { shape, .. } => {
-            Some(LiveShape::of(shape, false))
-        }
+        Op::Stroke { shape, .. } | Op::Shadow { shape, .. } => Some(LiveShape::of(shape, false)),
         Op::Glyphs { .. } | Op::Image { .. } => None,
     }
 }
@@ -167,9 +165,9 @@ fn shape_op(op: &Op) -> Option<LiveShape> {
 /// `op`'s paint operand.
 fn paint_op(op: &Op) -> Option<cherenkov::Paint> {
     match op {
-        Op::Fill { paint, .. }
-        | Op::Stroke { paint, .. }
-        | Op::Glyphs { paint, .. } => Some(paint.clone()),
+        Op::Fill { paint, .. } | Op::Stroke { paint, .. } | Op::Glyphs { paint, .. } => {
+            Some(paint.clone())
+        }
         Op::Shadow { .. } | Op::Image { .. } => None,
     }
 }
@@ -183,7 +181,7 @@ fn stroke_op(op: &Op) -> Option<kurbo::Stroke> {
 }
 
 /// `op`'s shadow operand.
-fn shadow_op(op: &Op) -> Option<cherenkov::Shadow> {
+const fn shadow_op(op: &Op) -> Option<cherenkov::Shadow> {
     match op {
         Op::Shadow { shadow, .. } => Some(*shadow),
         _ => None,
@@ -199,7 +197,7 @@ fn run_op(op: &Op) -> Option<cherenkov::GlyphRun> {
 }
 
 /// `op`'s destination-rect operand.
-fn dst_op(op: &Op) -> Option<Rect> {
+const fn dst_op(op: &Op) -> Option<Rect> {
     match op {
         Op::Image { dst, .. } => Some(*dst),
         _ => None,
@@ -255,32 +253,32 @@ impl LiveBindings {
     /// Sets each bound operand to `op`'s value where it differs from `prev`.
     fn set(&self, op: &Op, prev: Option<&Op>) {
         if let Some(b) = &self.shape
-            && prev.map_or(true, |p| shape_op(p) != shape_op(op))
+            && prev.is_none_or(|p| shape_op(p) != shape_op(op))
         {
             b.set(shape_op(op).expect("bound op has a shape"));
         }
         if let Some(b) = &self.paint
-            && prev.map_or(true, |p| paint_op(p) != paint_op(op))
+            && prev.is_none_or(|p| paint_op(p) != paint_op(op))
         {
             b.set(paint_op(op).expect("bound op has a paint"));
         }
         if let Some(b) = &self.stroke
-            && prev.map_or(true, |p| stroke_op(p) != stroke_op(op))
+            && prev.is_none_or(|p| stroke_op(p) != stroke_op(op))
         {
             b.set(stroke_op(op).expect("bound op has a stroke"));
         }
         if let Some(b) = &self.shadow
-            && prev.map_or(true, |p| shadow_op(p) != shadow_op(op))
+            && prev.is_none_or(|p| shadow_op(p) != shadow_op(op))
         {
             b.set(shadow_op(op).expect("bound op has a shadow"));
         }
         if let Some(b) = &self.run
-            && prev.map_or(true, |p| run_op(p) != run_op(op))
+            && prev.is_none_or(|p| run_op(p) != run_op(op))
         {
             b.set(run_op(op).expect("bound op has a run"));
         }
         if let Some(b) = &self.dst
-            && prev.map_or(true, |p| dst_op(p) != dst_op(op))
+            && prev.is_none_or(|p| dst_op(p) != dst_op(op))
         {
             b.set(dst_op(op).expect("bound op has a dst"));
         }
@@ -301,6 +299,10 @@ struct LiveRun {
 
 impl LiveRun {
     /// Sets the bindings to frame `n`'s values where they differ.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "encode frame counts stay far below usize"
+    )]
     fn advance(&mut self, frame: u64) {
         let n = frame as usize % self.frames.len();
         if self.previous == Some(n) {
@@ -315,13 +317,13 @@ impl LiveRun {
 /// The operand a live op records: the binding when the operand varies
 /// across frames, a constant otherwise.
 fn live_or_const<T: Clone + 'static>(
-    binding: &Option<nami::Binding<T>>,
+    binding: Option<&nami::Binding<T>>,
     value: &T,
 ) -> cherenkov::Live<T> {
-    match binding {
-        Some(b) => b.clone().into(),
-        None => nami::constant(value.clone()).into(),
-    }
+    binding.map_or_else(
+        || nami::constant(value.clone()).into(),
+        |b| b.clone().into(),
+    )
 }
 
 /// Records `op` like [`record_op`], but with slot bindings for the
@@ -333,31 +335,31 @@ fn record_live(c: &mut cherenkov::Recorder, op: &Op, bindings: &LiveBindings) {
             paint,
             even_odd,
         } => c.fill(
-            live_or_const(&bindings.shape, &LiveShape::of(shape, *even_odd)),
-            live_or_const(&bindings.paint, paint),
+            live_or_const(bindings.shape.as_ref(), &LiveShape::of(shape, *even_odd)),
+            live_or_const(bindings.paint.as_ref(), paint),
         ),
         Op::Stroke {
             shape,
             stroke,
             paint,
         } => c.stroke(
-            live_or_const(&bindings.shape, &LiveShape::of(shape, false)),
-            live_or_const(&bindings.stroke, stroke),
-            live_or_const(&bindings.paint, paint),
+            live_or_const(bindings.shape.as_ref(), &LiveShape::of(shape, false)),
+            live_or_const(bindings.stroke.as_ref(), stroke),
+            live_or_const(bindings.paint.as_ref(), paint),
         ),
         Op::Shadow { shape, shadow } => c.shadow(
-            live_or_const(&bindings.shape, &LiveShape::of(shape, false)),
-            live_or_const(&bindings.shadow, shadow),
+            live_or_const(bindings.shape.as_ref(), &LiveShape::of(shape, false)),
+            live_or_const(bindings.shadow.as_ref(), shadow),
         ),
         Op::Glyphs { run, paint } => c.glyphs(
-            live_or_const(&bindings.run, run),
-            live_or_const(&bindings.paint, paint),
+            live_or_const(bindings.run.as_ref(), run),
+            live_or_const(bindings.paint.as_ref(), paint),
         ),
         Op::Image {
             image,
             dst,
             sampling,
-        } => c.image(*image, live_or_const(&bindings.dst, dst), *sampling),
+        } => c.image(*image, live_or_const(bindings.dst.as_ref(), dst), *sampling),
     }
 }
 
@@ -908,14 +910,9 @@ fn prep_layer(
             match item {
                 Item::Draw(d) => {
                     run.ops.push(op(d, fonts, images, prepared)?);
-                    if let Some(live) = live_run(
-                        layer,
-                        index,
-                        run.ops.len() - 1,
-                        fonts,
-                        images,
-                        prepared,
-                    )? {
+                    if let Some(live) =
+                        live_run(layer, index, run.ops.len() - 1, fonts, images, prepared)?
+                    {
                         run.live.push(live);
                     }
                 }

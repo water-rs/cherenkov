@@ -1586,7 +1586,7 @@ fn run() -> Result<(), SceneError> {
         );
         let label = ctx.shape(
             "NotoSans.ttf",
-            "Active users",
+            "Users",
             20.0,
             FontWeight::NORMAL,
             &solid(dark),
@@ -1615,9 +1615,7 @@ fn run() -> Result<(), SceneError> {
                     l.glyphs(offset_run(run, 40.0, 40.0));
                 }
                 for (i, run) in body.iter().enumerate() {
-                    for line in 0..3 {
-                        l.glyphs(offset_run(run, 40.0, 140.0 + 34.0 * (3 * i + line) as f64));
-                    }
+                    l.glyphs(offset_run(run, 40.0, 140.0 + 34.0 * i as f64));
                 }
                 // Card grid: 4 columns x 3 rows of shadowed cards.
                 for row in 0u8..3 {

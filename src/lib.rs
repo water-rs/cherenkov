@@ -44,7 +44,10 @@ pub mod testing;
 
 pub use kurbo;
 
-pub use crate::animation::{Animatable, Animation, Curve, Decay, Lanes, Spring};
+pub use crate::animation::{
+    Animatable, Animation, Curve, Decay, Lanes, Spring, curve_value, decay_step, settled,
+    spring_step,
+};
 pub use crate::backend::{Backend, Display, Frame, Redraw, Renderer, SurfaceFrame, SurfaceInfo};
 pub use crate::capability::{
     Backdrop, Effects, ExternalFrames, Filters, GpuContent, HdrOutput, Planes, Runs,

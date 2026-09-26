@@ -75,3 +75,27 @@ fabricated.
 
 Apple's documentation describes [stage-boundary sampling](https://developer.apple.com/documentation/metal/sampling-gpu-data-into-counter-sample-buffers)
 and [resolving counter buffers after GPU completion](https://developer.apple.com/documentation/metal/converting-a-gpus-counter-data-into-a-readable-format).
+
+## Final verification
+
+Committed code `2e28166`, with range recycling enabled and no diagnostic
+patches, passed the operator's physical-device runs on September 26, 2026:
+
+| Device | Runs | Result, including warmup |
+| --- | --- | --- |
+| iPad Pro M4, iPadOS 26.5 | Map, effects, map at 60 Hz | 195/195 frames reported once, in order, with positive whole-frame timings |
+| Apple M1, macOS | Map, effects, map at 60 Hz | 195/195 frames reported once, in order, with positive whole-frame timings |
+| iPhone 17 simulator, iOS 26.5 | Three-frame map smoke | Done screen, exit 0; no timestamp support |
+| iPhone 16 Pro, A18 Pro | No final device available | Not retested |
+
+Each physical run included 60 measured frames and five warmup frames.
+Both paced runs delivered 63 timings before the tooling wait, with no
+additional query-set allocations. All recorded render-phase wait times
+were zero. The clear-only effects pass had no end sample on either M4 or
+M1; drawn passes and whole-frame timings remained valid.
+
+On the macOS VM, formatting, workspace Clippy with warnings denied, all
+69 GPU crate tests, and one doctest passed. The VM has no timestamp
+queries; physical M1 coverage came from the benchmark runs, not the VM's
+Metal test. Raw device logs and JSON, rather than the preliminary handoff
+summary, established device provenance and these frame counts.

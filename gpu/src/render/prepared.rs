@@ -513,6 +513,7 @@ impl cherenkov::lowering::Operation for Op {
 
 /// Resources needed while resolving content-space operations.
 pub struct Lowerer<'a> {
+    /// COLR cache writes committed after parallel preparation.
     pub pending: &'a mut Vec<super::glyph::PendingRaster>,
     /// Fonts for colour glyph expansion.
     pub fonts: &'a HashMap<u64, FontData>,

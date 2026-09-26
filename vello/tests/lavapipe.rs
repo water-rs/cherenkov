@@ -894,7 +894,7 @@ fn next_at_reports_the_configured_refresh_range() {
 #[test]
 fn oversized_resize_fails_fast() {
     let Some(engine) = engine() else { return };
-    let mut surface = engine
+    let surface = engine
         .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))
         .expect("surface");
     let err = surface.resize((u32::MAX, 16)).err();

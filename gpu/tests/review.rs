@@ -467,7 +467,7 @@ fn trim_releases_cached_memory() -> Result<(), Box<dyn std::error::Error>> {
     });
     engine.render(cherenkov::FrameTime::now())?;
     let before = engine.memory();
-    engine.trim(cherenkov::Pressure::Moderate)?;
+    engine.trim(cherenkov::Pressure::Moderate);
     let moderate = engine.memory();
     assert!(
         moderate.gpu.0 < before.gpu.0,
@@ -480,7 +480,7 @@ fn trim_releases_cached_memory() -> Result<(), Box<dyn std::error::Error>> {
         tx[surface.root()].content(surface.record(|c| scene(c)));
     });
     engine.render(cherenkov::FrameTime::now())?;
-    engine.trim(cherenkov::Pressure::Critical)?;
+    engine.trim(cherenkov::Pressure::Critical);
     let critical = engine.memory();
     assert!(
         critical.gpu.0 <= moderate.gpu.0,

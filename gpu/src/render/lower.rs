@@ -177,7 +177,7 @@ struct DeviceClip {
 enum ClipMask {
     /// Stored: the atlas origin is `cell.atlas`.
     Cell(MaskCell),
-    /// Pending its raster (index into `GlyphContext::pending`).
+    /// Pending its raster (index into `Lowering::pending`).
     Pending(MaskCell, u32),
 }
 
@@ -321,7 +321,9 @@ pub struct GlyphContext<'a> {
 /// thread to commit before encoding.
 #[derive(Default)]
 pub struct Lowered {
+    /// Source commands resolved this frame.
     pub commands: u32,
+    /// Layers with new device realizations.
     pub layers: u32,
     /// Glyphs rasterized during the lowering.
     pub glyphs: u32,

@@ -174,6 +174,10 @@ pub struct FrameStats {
     pub glyphs_rasterized: u32,
     /// Paths rasterized (cache misses) this frame.
     pub paths_rasterized: u32,
+    /// Group-1 bind groups created this frame — zero when the previous
+    /// frame's cached groups still match this surface's textures and the
+    /// image set.
+    pub bind_groups_created: u32,
 }
 
 /// Decoded pixels of a surface readback: premultiplied linear Display P3,

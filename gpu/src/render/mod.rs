@@ -150,6 +150,14 @@ struct SurfaceState {
     /// every dirty surface.
     inst_base: u32,
     globals_base: u32,
+    /// Bumped whenever a scratch or backdrop texture is (re)created — a
+    /// cached group-1 bind group referencing the old view must rebuild.
+    bind_gen: u64,
+    /// Group-1 bind groups keyed by `(source scratch, backdrop, image)`,
+    /// reused across frames while `binds1_stamp` is current.
+    binds1: HashMap<(Option<usize>, bool, Option<u64>), wgpu::BindGroup>,
+    /// The `(bind_gen, images_gen)` pair `binds1` was built under.
+    binds1_stamp: (u64, u64),
 }
 
 impl SurfaceState {
@@ -213,6 +221,9 @@ struct Renderer {
     fonts: HashMap<u64, FontData>,
     /// Registered images.
     images: HashMap<u64, GpuImage>,
+    /// Bumped on every `images` insert/remove — every cached group-1
+    /// bind group samples an image view, so an image change rebuilds them.
+    images_gen: u64,
     timestamps: bool,
     query_set: Option<wgpu::QuerySet>,
     query_buffer: Option<wgpu::Buffer>,
@@ -739,6 +750,7 @@ pub fn run(config: GpuConfig, rx: Receiver<Message>, init_tx: Sender<Result<Init
             surfaces: HashMap::new(),
             fonts: HashMap::new(),
             images: HashMap::new(),
+            images_gen: 0,
             timestamps,
             query_set,
             query_buffer,
@@ -785,9 +797,12 @@ pub fn run(config: GpuConfig, rx: Receiver<Message>, init_tx: Sender<Result<Init
                 color_space,
             } => {
                 renderer.add_image(id, width, height, &pixels, color_space);
+                renderer.images_gen += 1;
             }
             Message::DestroyImage { id } => {
-                renderer.images.remove(&id);
+                if renderer.images.remove(&id).is_some() {
+                    renderer.images_gen += 1;
+                }
             }
             Message::AddFont { id, data, index } => {
                 renderer.fonts.insert(
@@ -865,6 +880,9 @@ impl Renderer {
                 frame: Frame::default(),
                 inst_base: 0,
                 globals_base: 0,
+                bind_gen: 0,
+                binds1: HashMap::new(),
+                binds1_stamp: (u64::MAX, u64::MAX),
             },
         );
         Ok(())
@@ -1292,6 +1310,7 @@ impl Renderer {
             } else {
                 surf.scratch.push(target);
             }
+            surf.bind_gen += 1;
         }
         // Backdrop textures for blend composites, sized like the scratch
         // pool to the largest region copied this frame.
@@ -1338,6 +1357,7 @@ impl Renderer {
                 width: nw,
                 height: nh,
             });
+            surf.bind_gen += 1;
         }
         // Gradient instances index stops absolutely; shift each instance's
         // first-stop index by this surface's stop base. Only gradient
@@ -1486,11 +1506,14 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame"),
             });
-        // Lazily-built group-1 bind groups for this frame, keyed by
-        // (source, backdrop-needed, image). Created up front so scratch
-        // borrows stay immutable inside the encoder loop.
-        let mut range_binds: HashMap<(Option<usize>, bool, Option<u64>), wgpu::BindGroup> =
-            HashMap::new();
+        // Group-1 bind groups persist across frames, keyed by
+        // (source scratch, backdrop-needed, image); the stamp rebuilds
+        // them when a scratch/backdrop texture or the image set changed.
+        let stamp = (surf.bind_gen, self.images_gen);
+        if surf.binds1_stamp != stamp {
+            surf.binds1.clear();
+            surf.binds1_stamp = stamp;
+        }
         for pass in &surf.frame.passes {
             let (view, texture) = match pass.target {
                 Target::Surface => (&surf.view, &surf.target),
@@ -1612,9 +1635,10 @@ impl Renderer {
                     );
                 }
                 let key = (range.source, scratch_backdrop, range.image);
-                let bind = match range_binds.entry(key) {
+                let bind = match surf.binds1.entry(key) {
                     std::collections::hash_map::Entry::Occupied(e) => &*e.into_mut(),
                     std::collections::hash_map::Entry::Vacant(e) => {
+                        stats.bind_groups_created += 1;
                         let backdrop = if scratch_backdrop {
                             let slot = match pass.target {
                                 Target::Surface => 0,

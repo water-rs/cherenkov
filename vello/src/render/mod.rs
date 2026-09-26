@@ -880,10 +880,8 @@ impl Renderer {
 
     /// The filtered path: renders the layer's subtree into a capture
     /// texture, runs the effect, and draws the output as an image at the
-    /// capture bounds.
-    ///
-    /// A filtered layer ignores `opacity`/`blend`: the filter replaces the
-    /// pushed composite layer (the clip bounds still bound the capture).
+    /// capture bounds. The filtered output honours `opacity`/`blend`/`clip`
+    /// through a pushed composite layer, like the unfiltered path.
     #[expect(
         clippy::too_many_arguments,
         clippy::cast_possible_truncation,
@@ -973,6 +971,43 @@ impl Renderer {
             }),
         );
         self.vello.mark_override_image_dirty(&image);
+        Self::filtered_output(layers, id, world, bounds, target_size, scene, stats, image);
+        *wants_next |= again || self.filters.redraw_hint(filter_id.raw());
+        Ok(())
+    }
+
+    /// Draws a filter's output image at `bounds` in `scene`, wrapped in a
+    /// pushed layer when `id` declares opacity, a non-normal blend or a clip.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "shares compose_filtered's parameters"
+    )]
+    fn filtered_output(
+        layers: &HashMap<LayerId, LayerNode>,
+        id: LayerId,
+        world: cherenkov::kurbo::Affine,
+        bounds: kurbo::Rect,
+        target_size: (u32, u32),
+        scene: &mut vello::Scene,
+        stats: &mut FrameStats,
+        image: peniko::ImageData,
+    ) {
+        let node = layers.get(&id).expect("the node exists");
+        let needs_layer =
+            node.opacity < 1.0 || node.blend != cherenkov::BlendMode::Normal || node.clip.is_some();
+        if needs_layer {
+            let clip = node.clip.as_ref().map_or_else(
+                || convert::opaque_clip(target_size.0, target_size.1),
+                convert::shape_path,
+            );
+            scene.push_layer(
+                peniko::Fill::NonZero,
+                convert::blend(node.blend),
+                node.opacity,
+                world,
+                &clip,
+            );
+        }
         scene.draw_image(
             &peniko::ImageBrush {
                 image,
@@ -985,9 +1020,10 @@ impl Renderer {
             },
             cherenkov::kurbo::Affine::translate((bounds.x0, bounds.y0)),
         );
+        if needs_layer {
+            scene.pop_layer();
+        }
         stats.draws += 1;
-        *wants_next |= again || self.filters.redraw_hint(filter_id.raw());
-        Ok(())
     }
 
     /// Marks surfaces dirty for pending `GpuContent`/`Filter` redraw

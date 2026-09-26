@@ -454,7 +454,8 @@ fn filter_runs_over_the_layer_texture() {
             .content(surface.record(|c| {
                 c.fill(Rect::new(0., 0., 64., 64.), fill);
             }))
-            .filter(&filter);
+            .filter(&filter)
+            .opacity(0.5);
         tx[surface.root()].push(&layer);
     });
     let next = engine
@@ -463,7 +464,8 @@ fn filter_runs_over_the_layer_texture() {
     let readback = surface.readback().expect("readback");
     // Invert is `a - rgb` on premultiplied values in the space the
     // executor samples — our encoded texels. So the stored output is
-    // `1 - enc` per channel.
+    // `1 - enc` per channel, then the layer's 0.5 opacity scales the
+    // premultiplied source over black.
     let [r, g, b, a] = fill.components.map(f64::from);
     let lin = mat_vec(&LINEAR_P3_TO_LINEAR_SRGB, [r, g, b]);
     let enc = [
@@ -475,8 +477,11 @@ fn filter_runs_over_the_layer_texture() {
     let inverted = [1.0 - enc[0], 1.0 - enc[1], 1.0 - enc[2], enc[3]];
     assert_pixel(
         px(&readback, 32, 32),
-        expected_stored(inverted, WorkingColor::BLACK.components.map(f64::from)),
-        "inverted pixel",
+        expected_stored(
+            inverted.map(|v| v * 0.5),
+            WorkingColor::BLACK.components.map(f64::from),
+        ),
+        "inverted pixel at 0.5 opacity",
     );
     assert_eq!(next, Next::Idle);
 }

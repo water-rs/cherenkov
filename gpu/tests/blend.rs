@@ -7,7 +7,8 @@
 
 use cherenkov::kurbo::{Point, Rect};
 use cherenkov::{BlendMode, ColorStop, Draw, Extend, Interpolation, Paint, WorkingColor};
-use cherenkov_gpu::{Engine, EngineError, Gpu, GpuConfig, Offscreen, OffscreenFormat};
+use cherenkov::{Engine, EngineError, Offscreen, OffscreenFormat};
+use cherenkov_gpu::{Gpu, GpuConfig};
 
 const RED: WorkingColor = WorkingColor::new([1.0, 0.0, 0.0, 1.0]);
 const BLUE: WorkingColor = WorkingColor::new([0.0, 0.0, 1.0, 1.0]);
@@ -16,7 +17,7 @@ const BLUE: WorkingColor = WorkingColor::new([0.0, 0.0, 1.0, 1.0]);
 fn engine() -> Option<Engine<Gpu>> {
     match Engine::<Gpu>::new(GpuConfig::default()) {
         Ok(engine) => Some(engine),
-        Err(EngineError::NoAdapter) => None,
+        Err(EngineError::Backend(_)) => None,
         Err(e) => panic!("engine init failed: {e}"),
     }
 }
@@ -44,7 +45,7 @@ fn render_blend(
             c.fill(Rect::new(16., 0., 64., 64.), BLUE);
         }));
     });
-    engine.render(cherenkov_gpu::FrameTime::now())?;
+    engine.render(cherenkov::FrameTime::now())?;
     let rb = surface.readback()?;
     Ok((
         rb.pixels[(32 * rb.width + 24) as usize],
@@ -146,7 +147,7 @@ fn extend_none_is_transparent_outside_the_range() -> Result<(), Box<dyn std::err
             );
         }));
     });
-    engine.render(cherenkov_gpu::FrameTime::now())?;
+    engine.render(cherenkov::FrameTime::now())?;
     let rb = surface.readback()?;
     let px = |x: u32, y: u32| rb.pixels[(y * rb.width + x) as usize];
     assert_eq!(px(4, 32), [0.0; 4], "left of range must be clear");
@@ -186,7 +187,7 @@ fn a_sweep_gradient_resolves_angles() -> Result<(), Box<dyn std::error::Error>> 
             );
         }));
     });
-    engine.render(cherenkov_gpu::FrameTime::now())?;
+    engine.render(cherenkov::FrameTime::now())?;
     let rb = surface.readback()?;
     let px = |x: u32, y: u32| rb.pixels[(y * rb.width + x) as usize];
     let right = px(56, 32);

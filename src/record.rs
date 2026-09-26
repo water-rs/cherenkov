@@ -54,7 +54,7 @@ pub trait Draw {
     /// Draws a glyph run.
     fn glyphs<P: Into<Paint> + 'static>(
         &mut self,
-        run: &GlyphRun,
+        run: impl Into<Self::Value<GlyphRun>>,
         paint: impl Into<Self::Value<P>>,
     );
 
@@ -139,9 +139,13 @@ impl Draw for StaticRecorder {
         });
     }
 
-    fn glyphs<P: Into<Paint> + 'static>(&mut self, run: &GlyphRun, paint: impl Into<Fixed<P>>) {
+    fn glyphs<P: Into<Paint> + 'static>(
+        &mut self,
+        run: impl Into<Fixed<GlyphRun>>,
+        paint: impl Into<Fixed<P>>,
+    ) {
         self.list.push(Command::Glyphs {
-            run: run.clone(),
+            run: run.into().0,
             paint: paint.into().0.into(),
         });
     }
@@ -189,32 +193,59 @@ impl Draw for StaticRecorder {
     }
 }
 
-/// Where a signal's later values go: the slot they update and how they
-/// become an operand.
-struct Watch<T> {
-    state: Weak<LiveState>,
-    command: u32,
-    convert: fn(T) -> Operand,
+/// A signal consumer. Recorded slots keep their concrete callback state inline;
+/// property bindings additionally receive animation metadata.
+#[doc(hidden)]
+pub struct Watch<T> {
+    destination: Destination<T>,
+}
+
+enum Destination<T> {
+    Slot {
+        state: Weak<LiveState>,
+        command: u32,
+        convert: fn(T) -> Operand,
+    },
+    Binding(Box<dyn Fn(nami_core::watcher::Context<T>)>),
 }
 
 impl<T> Watch<T> {
-    fn notify(&self, value: T) {
-        if let Some(state) = self.state.upgrade() {
-            state.push(SlotUpdate {
-                command: self.command,
-                value: (self.convert)(value),
-            });
+    pub(crate) fn binding(callback: impl Fn(nami_core::watcher::Context<T>) + 'static) -> Self {
+        Self {
+            destination: Destination::Binding(Box::new(callback)),
+        }
+    }
+
+    fn notify(&self, context: nami_core::watcher::Context<T>) {
+        match &self.destination {
+            Destination::Slot {
+                state,
+                command,
+                convert,
+            } => {
+                if let Some(state) = state.upgrade() {
+                    state.push(SlotUpdate {
+                        command: *command,
+                        value: convert(context.into_value()),
+                    });
+                }
+            }
+            Destination::Binding(callback) => callback(context),
         }
     }
 }
 
-type Subscribe<T> = Box<dyn FnOnce(Watch<T>) -> Option<Box<dyn Any>>>;
+/// A signal's subscription factory and the guard keeping it alive.
+#[doc(hidden)]
+pub type Subscribe<T> = Box<dyn FnOnce(Watch<T>) -> Option<Box<dyn Any>>>;
 
 /// A value accepted by [`Recorder`]: the current value of a nami signal, and
 /// the subscription that reports its later changes.
 pub struct Live<T> {
-    value: T,
-    subscribe: Subscribe<T>,
+    #[doc(hidden)]
+    pub value: T,
+    #[doc(hidden)]
+    pub subscribe: Subscribe<T>,
 }
 
 impl<T: std::fmt::Debug> std::fmt::Debug for Live<T> {
@@ -231,7 +262,7 @@ impl<T: 'static, S: Signal<Output = T>> From<S> for Live<T> {
         Self {
             value,
             subscribe: Box::new(move |watch: Watch<T>| {
-                let guard = signal.watch(move |context| watch.notify(context.into_value()));
+                let guard = signal.watch(move |context| watch.notify(context));
                 // A guard with no size and no drop glue unsubscribes nothing, so
                 // there is nothing to keep alive.
                 if size_of::<S::Guard>() == 0 && !needs_drop::<S::Guard>() {
@@ -287,9 +318,11 @@ impl Recorder {
         convert: fn(T) -> Operand,
     ) {
         let guard = subscribe(Watch {
-            state: Rc::downgrade(&self.live),
-            command,
-            convert,
+            destination: Destination::Slot {
+                state: Rc::downgrade(&self.live),
+                command,
+                convert,
+            },
         });
         if let Some(guard) = guard {
             self.live.guards.borrow_mut().push(guard);
@@ -351,12 +384,18 @@ impl Draw for Recorder {
         self.subscribe(shadow.subscribe, command, Operand::Shadow);
     }
 
-    fn glyphs<P: Into<Paint> + 'static>(&mut self, run: &GlyphRun, paint: impl Into<Live<P>>) {
+    fn glyphs<P: Into<Paint> + 'static>(
+        &mut self,
+        run: impl Into<Live<GlyphRun>>,
+        paint: impl Into<Live<P>>,
+    ) {
+        let run = run.into();
         let paint = paint.into();
         let command = self.list.push(Command::Glyphs {
-            run: run.clone(),
+            run: run.value,
             paint: paint.value.into(),
         });
+        self.subscribe(run.subscribe, command, Operand::Run);
         self.subscribe(paint.subscribe, command, paint_operand::<P>);
     }
 

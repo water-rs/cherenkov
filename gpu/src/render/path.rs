@@ -10,9 +10,9 @@ use std::hash::{Hash, Hasher};
 use cherenkov::{FillRule, ShapeData};
 use kurbo::{Affine, BezPath, PathEl, Point, Rect, Shape as _, Vec2};
 
-use crate::error::RenderError;
 use crate::render::glyph::{CellTexels, PathCell, PathEmit};
 use crate::render::raster::Raster;
+use cherenkov::RenderError;
 
 /// Coverage strip height in device rows.
 pub const STRIP_H: usize = 4;

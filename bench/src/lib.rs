@@ -20,24 +20,39 @@
 //! | `skia-metal` | `skia-safe` | Graphite/Metal | `RGBAF16` premul render target, linear-P3 colours |
 //!
 //! GPU time is reported only where a real GPU timestamp source exists.
-//! The wgpu adapters and skia-vulkan bracket the engine submission with
+//! The external wgpu adapters and skia-vulkan bracket the engine submission with
 //! timestamps written in standalone submissions after a full queue drain
-//! (see [`wgpu_ctx::drain_and_stamp`]); skia-metal brackets Graphite's
+//! (see `wgpu_ctx::drain_and_stamp` when those adapters are enabled); skia-metal brackets Graphite's
 //! submission with empty `MTLCommandBuffer` markers on the same serial
 //! queue, each preceded by a drain (`commit` + `waitUntilCompleted`),
 //! and reads their `GPUStartTime`/`GPUEndTime`. This **serializes CPU
 //! and GPU** for the measured frame — a synchronous probe, not a
 //! pipelined frame rate. Where no timestamp source exists the field is
-//! `null` — it is never estimated.
+//! `null` — it is never estimated. The Cherenkov GPU adapter instead collects
+//! timestamps from completed earlier submissions without draining each frame.
 
 pub mod affinity;
 #[cfg(feature = "cherenkov")]
 pub mod cherenkov_ad;
+#[cfg(feature = "cherenkov-cpu")]
+pub mod cherenkov_cpu_ad;
 pub mod cli;
 pub mod conditions;
 pub mod convert;
 pub mod energy;
+#[cfg(any(
+    feature = "cherenkov",
+    feature = "cherenkov-cpu",
+    feature = "cherenkov-vello"
+))]
+pub mod motion;
 pub mod report;
+#[cfg(any(
+    feature = "cherenkov",
+    feature = "cherenkov-cpu",
+    feature = "cherenkov-vello"
+))]
+pub mod timing;
 #[cfg(any(
     feature = "vello-classic",
     feature = "vello-cpu",
@@ -322,6 +337,8 @@ pub fn engine_names() -> Vec<&'static str> {
         cherenkov_ad::Cherenkov::NAME,
         #[cfg(feature = "cherenkov-vello")]
         cherenkov_vello_ad::CherenkovVello::NAME,
+        #[cfg(feature = "cherenkov-cpu")]
+        cherenkov_cpu_ad::Cherenkov::NAME,
     ]
 }
 
@@ -355,6 +372,10 @@ pub fn create_engine(name: &str) -> Result<Box<dyn Engine>, BenchError> {
         #[cfg(feature = "cherenkov-vello")]
         cherenkov_vello_ad::CherenkovVello::NAME => {
             cherenkov_vello_ad::CherenkovVello::new().map(|e| Box::new(e) as Box<dyn Engine>)
+        }
+        #[cfg(feature = "cherenkov-cpu")]
+        cherenkov_cpu_ad::Cherenkov::NAME => {
+            cherenkov_cpu_ad::Cherenkov::new().map(|e| Box::new(e) as Box<dyn Engine>)
         }
         _ => Err(BenchError::Engine(format!(
             "unknown or uncompiled engine {name:?}; available: {:?}",

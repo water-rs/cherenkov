@@ -4,23 +4,22 @@
 //! `cherenkov` adapter: the `cherenkov-gpu` backend slice on `wgpu`.
 //!
 //! Route: the front-end records a display list per content layer, lowered on
-//! the render thread into analytic f32 quads drawn by a single WGSL pipeline
+//! the render thread into retained analytic f32 quads drawn by specialized WGSL pipelines
 //! into a `Rgba16Float` texture (premultiplied linear Display P3 — the
 //! suite's working space end to end, so readback needs no conversion). GPU
-//! time is a real `wgpu` timestamp pair drained inside
-//! [`cherenkov_gpu::Engine::render`] with `GpuConfig::timestamps` set.
+//! time comes from real `wgpu` timestamps collected from completed earlier
+//! submissions inside [`cherenkov::Engine::render`] with `GpuConfig::timestamps` set.
 //!
 //! `CHERENKOV_SCRATCH_FORMAT=rgba8` selects `Rgba8Unorm` isolation targets
 //! (default `Rgba16Float`) to compare intermediate precision/bandwidth.
 
 use std::collections::{BTreeSet, HashMap};
 
-use cherenkov::Draw as _;
-use cherenkov_gpu::{
-    Engine as GpuEngine, FrameId, FrameTime, FrameTiming, Gpu, GpuConfig, Layer as GpuLayer,
-    Offscreen, OffscreenFormat, RenderError, ResourceError, ScratchFormat, Surface, Transaction,
-    Unsupported,
+use cherenkov::{
+    Draw as _, Engine as GpuEngine, ImageData, Layer as GpuLayer, LayerEdit, Offscreen,
+    OffscreenFormat, RenderError, ResourceError, Rgba8, Surface, Transaction,
 };
+use cherenkov_gpu::{Gpu, GpuConfig, ScratchFormat};
 use cherenkov_oracle::color::to_working;
 use cherenkov_scene::{
     BlendMode, ColorSpace, Draw as SceneDraw, Extend, Feature, GlyphRun as SceneGlyphRun, Item,
@@ -29,6 +28,8 @@ use cherenkov_scene::{
 use kurbo::{Affine, BezPath, Circle, Ellipse, Line, Rect, RoundedRect, Vec2};
 
 use crate::convert::{self, Blobs};
+use crate::motion::{Clock, LayerMotion};
+use crate::timing::Timings;
 use crate::{BenchError, Counters, DeviceInfo, EncodeInput, Engine, EngineInfo, GpuSample, Submit};
 
 /// A scene shape in a form the front-end accepts.
@@ -88,13 +89,307 @@ enum Op {
     },
 }
 
+/// A scene shape as a live operand: the [`ShapeKind`] kinds plus the
+/// fill rule carried on the path variant, so the slot value is
+/// self-contained.
+#[derive(Clone, PartialEq)]
+enum LiveShape {
+    /// `ShapeKind::Rect`.
+    Rect(Rect),
+    /// `ShapeKind::RoundedRect`.
+    RoundedRect(RoundedRect),
+    /// `ShapeKind::Continuous`.
+    Continuous(cherenkov::ContinuousRect),
+    /// `ShapeKind::Circle`.
+    Circle(Circle),
+    /// `ShapeKind::Ellipse`.
+    Ellipse(Ellipse),
+    /// `ShapeKind::Line`.
+    Line(Line),
+    /// A path with the fill rule it was recorded under.
+    Path {
+        /// The path.
+        path: BezPath,
+        /// The fill rule.
+        rule: cherenkov::FillRule,
+    },
+}
+
+impl LiveShape {
+    /// The live operand for `shape` under `rule` (paths only).
+    fn of(shape: &ShapeKind, rule: cherenkov::FillRule) -> Self {
+        match shape {
+            ShapeKind::Rect(s) => Self::Rect(*s),
+            ShapeKind::RoundedRect(s) => Self::RoundedRect(*s),
+            ShapeKind::Continuous(s) => Self::Continuous(*s),
+            ShapeKind::Circle(s) => Self::Circle(*s),
+            ShapeKind::Ellipse(s) => Self::Ellipse(*s),
+            ShapeKind::Line(s) => Self::Line(*s),
+            ShapeKind::Path(path) => Self::Path {
+                path: path.clone(),
+                rule,
+            },
+        }
+    }
+}
+
+impl cherenkov::Shape for LiveShape {
+    fn semantic(&self) -> cherenkov::Semantic<'_> {
+        match self {
+            Self::Rect(s) => cherenkov::Semantic::Rect(*s),
+            Self::RoundedRect(s) => cherenkov::Semantic::RoundedRect(*s),
+            Self::Continuous(s) => cherenkov::Semantic::Continuous(*s),
+            Self::Circle(s) => cherenkov::Semantic::Circle(*s),
+            Self::Ellipse(s) => cherenkov::Semantic::Ellipse(*s),
+            Self::Line(s) => cherenkov::Semantic::Line(*s),
+            Self::Path { path, rule } => cherenkov::Semantic::Path(cherenkov::PathRef {
+                elements: std::borrow::Cow::Borrowed(path.elements()),
+                rule: *rule,
+            }),
+        }
+    }
+}
+
+/// The core fill rule a scene rule lowers to.
+const fn core_rule(rule: cherenkov_scene::FillRule) -> cherenkov::FillRule {
+    match rule {
+        cherenkov_scene::FillRule::EvenOdd => cherenkov::FillRule::EvenOdd,
+        cherenkov_scene::FillRule::NonZero => cherenkov::FillRule::NonZero,
+    }
+}
+
+/// `op`'s shape operand, or `None` when it has none.
+fn shape_op(op: &Op) -> Option<LiveShape> {
+    match op {
+        Op::Fill { shape, rule, .. } => Some(LiveShape::of(shape, core_rule(*rule))),
+        Op::Stroke { shape, .. } | Op::Shadow { shape, .. } => {
+            Some(LiveShape::of(shape, cherenkov::FillRule::NonZero))
+        }
+        Op::Glyphs { .. } | Op::Image { .. } => None,
+    }
+}
+
+/// `op`'s paint operand.
+fn paint_op(op: &Op) -> Option<cherenkov::Paint> {
+    match op {
+        Op::Fill { paint, .. } | Op::Stroke { paint, .. } | Op::Glyphs { paint, .. } => {
+            Some(paint.clone())
+        }
+        Op::Shadow { .. } | Op::Image { .. } => None,
+    }
+}
+
+/// `op`'s stroke-style operand.
+fn stroke_op(op: &Op) -> Option<kurbo::Stroke> {
+    match op {
+        Op::Stroke { stroke, .. } => Some(stroke.clone()),
+        _ => None,
+    }
+}
+
+/// `op`'s shadow operand.
+const fn shadow_op(op: &Op) -> Option<cherenkov::Shadow> {
+    match op {
+        Op::Shadow { shadow, .. } => Some(*shadow),
+        _ => None,
+    }
+}
+
+/// `op`'s glyph-run operand.
+fn run_op(op: &Op) -> Option<cherenkov::GlyphRun> {
+    match op {
+        Op::Glyphs { run, .. } => Some(run.clone()),
+        _ => None,
+    }
+}
+
+/// `op`'s destination-rect operand.
+const fn dst_op(op: &Op) -> Option<Rect> {
+    match op {
+        Op::Image { dst, .. } => Some(*dst),
+        _ => None,
+    }
+}
+
+/// The slot bindings a live op is recorded with: one per operand that
+/// differs between frames.
+#[derive(Default)]
+struct LiveBindings {
+    /// Fill/stroke/shadow shape.
+    shape: Option<nami::Binding<LiveShape>>,
+    /// Fill/stroke/glyph paint.
+    paint: Option<nami::Binding<cherenkov::Paint>>,
+    /// Stroke style.
+    stroke: Option<nami::Binding<kurbo::Stroke>>,
+    /// Shadow spec.
+    shadow: Option<nami::Binding<cherenkov::Shadow>>,
+    /// Glyph run.
+    run: Option<nami::Binding<cherenkov::GlyphRun>>,
+    /// Image destination.
+    dst: Option<nami::Binding<Rect>>,
+}
+
+impl LiveBindings {
+    /// Binds the operands that differ across `frames`.
+    fn for_frames(frames: &[Op]) -> Self {
+        let mut b = Self::default();
+        let Some(base) = frames.first() else {
+            return b;
+        };
+        if frames.iter().any(|f| shape_op(f) != shape_op(base)) {
+            b.shape = shape_op(base).map(nami::binding);
+        }
+        if frames.iter().any(|f| paint_op(f) != paint_op(base)) {
+            b.paint = paint_op(base).map(nami::binding);
+        }
+        if frames.iter().any(|f| stroke_op(f) != stroke_op(base)) {
+            b.stroke = stroke_op(base).map(nami::binding);
+        }
+        if frames.iter().any(|f| shadow_op(f) != shadow_op(base)) {
+            b.shadow = shadow_op(base).map(nami::binding);
+        }
+        if frames.iter().any(|f| run_op(f) != run_op(base)) {
+            b.run = run_op(base).map(nami::binding);
+        }
+        if frames.iter().any(|f| dst_op(f) != dst_op(base)) {
+            b.dst = dst_op(base).map(nami::binding);
+        }
+        b
+    }
+
+    /// Sets each bound operand to `op`'s value where it differs from `prev`.
+    fn set(&self, op: &Op, prev: Option<&Op>) {
+        if let Some(b) = &self.shape
+            && prev.is_none_or(|p| shape_op(p) != shape_op(op))
+        {
+            b.set(shape_op(op).expect("bound op has a shape"));
+        }
+        if let Some(b) = &self.paint
+            && prev.is_none_or(|p| paint_op(p) != paint_op(op))
+        {
+            b.set(paint_op(op).expect("bound op has a paint"));
+        }
+        if let Some(b) = &self.stroke
+            && prev.is_none_or(|p| stroke_op(p) != stroke_op(op))
+        {
+            b.set(stroke_op(op).expect("bound op has a stroke"));
+        }
+        if let Some(b) = &self.shadow
+            && prev.is_none_or(|p| shadow_op(p) != shadow_op(op))
+        {
+            b.set(shadow_op(op).expect("bound op has a shadow"));
+        }
+        if let Some(b) = &self.run
+            && prev.is_none_or(|p| run_op(p) != run_op(op))
+        {
+            b.set(run_op(op).expect("bound op has a run"));
+        }
+        if let Some(b) = &self.dst
+            && prev.is_none_or(|p| dst_op(p) != dst_op(op))
+        {
+            b.set(dst_op(op).expect("bound op has a dst"));
+        }
+    }
+}
+
+/// One live draw item: the op per frame and the bindings it is driven by.
+struct LiveRun {
+    /// Op index inside the owning content run.
+    index: usize,
+    /// The op per frame (`frames[n % len]`).
+    frames: Vec<Op>,
+    /// The bindings the varying operands were recorded with.
+    bindings: LiveBindings,
+    /// The frame index last set; `None` until the first advance.
+    previous: Option<usize>,
+}
+
+impl LiveRun {
+    /// Sets the bindings to frame `n`'s values where they differ.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "encode frame counts stay far below usize"
+    )]
+    fn advance(&mut self, frame: u64) {
+        let n = frame as usize % self.frames.len();
+        if self.previous == Some(n) {
+            return;
+        }
+        let prev = self.previous.map(|p| &self.frames[p]);
+        self.bindings.set(&self.frames[n], prev);
+        self.previous = Some(n);
+    }
+}
+
+/// The operand a live op records: the binding when the operand varies
+/// across frames, a constant otherwise.
+fn live_or_const<T: Clone + 'static>(
+    binding: Option<&nami::Binding<T>>,
+    value: &T,
+) -> cherenkov::Live<T> {
+    binding.map_or_else(
+        || nami::constant(value.clone()).into(),
+        |b| b.clone().into(),
+    )
+}
+
+/// Records `op` like [`record_op`], but with slot bindings for the
+/// operands that vary across its frames.
+fn record_live(c: &mut cherenkov::Recorder, op: &Op, bindings: &LiveBindings) {
+    match op {
+        Op::Fill { shape, rule, paint } => c.fill(
+            live_or_const(
+                bindings.shape.as_ref(),
+                &LiveShape::of(shape, core_rule(*rule)),
+            ),
+            live_or_const(bindings.paint.as_ref(), paint),
+        ),
+        Op::Stroke {
+            shape,
+            stroke,
+            paint,
+        } => c.stroke(
+            live_or_const(
+                bindings.shape.as_ref(),
+                &LiveShape::of(shape, cherenkov::FillRule::NonZero),
+            ),
+            live_or_const(bindings.stroke.as_ref(), stroke),
+            live_or_const(bindings.paint.as_ref(), paint),
+        ),
+        Op::Shadow { shape, shadow } => c.shadow(
+            live_or_const(
+                bindings.shape.as_ref(),
+                &LiveShape::of(shape, cherenkov::FillRule::NonZero),
+            ),
+            live_or_const(bindings.shadow.as_ref(), shadow),
+        ),
+        Op::Glyphs { run, paint } => c.glyphs(
+            live_or_const(bindings.run.as_ref(), run),
+            live_or_const(bindings.paint.as_ref(), paint),
+        ),
+        Op::Image {
+            image,
+            dst,
+            sampling,
+        } => c.image(*image, live_or_const(bindings.dst.as_ref(), dst), *sampling),
+    }
+}
+
+/// A maximal run of draw items, drawn as one layer's content.
+struct ContentRun {
+    /// The recorded ops.
+    ops: Vec<Op>,
+    /// Live items inside the run.
+    live: Vec<LiveRun>,
+}
+
 /// A prepared child item: a draw-item run wrapped in its own layer, or a
 /// real child layer.
 enum PrepItem {
     /// A maximal run of draw items, drawn as one layer's content.
-    Content(Vec<Op>),
+    Content(ContentRun),
     /// A child scene layer.
-    Layer(PrepLayer),
+    Layer(Box<PrepLayer>),
 }
 
 /// A scene layer lowered in `prepare`.
@@ -107,10 +402,14 @@ struct PrepLayer {
     opacity: f64,
     /// Blend onto the parent.
     blend: cherenkov::BlendMode,
+    /// Scroll offset applied to content and children.
+    scroll_offset: Vec2,
     /// The layer's own content — only when every draw precedes every child.
-    own: Vec<Op>,
+    own: ContentRun,
     /// Ordered children.
     items: Vec<PrepItem>,
+    /// The layer's one-time motion.
+    motion: Option<LayerMotion>,
 }
 
 /// An engine layer plus the ops it records each frame.
@@ -122,24 +421,38 @@ struct ContentLayer {
     /// Command count of the last recording, re-used as the next one's
     /// capacity.
     last_len: usize,
+    /// Live items inside `ops`.
+    live: Vec<LiveRun>,
+    /// The layer's one-time motion, committed on the first encode.
+    motion: Option<LayerMotion>,
 }
 
 /// `cherenkov-gpu` adapter.
 pub struct Cherenkov {
     info: EngineInfo,
     engine: GpuEngine<Gpu>,
-    surface: Option<Surface>,
+    surface: Option<Surface<Gpu>>,
     /// Registered fonts per `(blob hash, face index)`.
-    fonts: HashMap<(ResourceHash, u32), cherenkov_gpu::Font>,
+    fonts: HashMap<(ResourceHash, u32), cherenkov::Font>,
     /// Registered images per blob hash (kept alive for the engine).
     images: HashMap<ResourceHash, cherenkov::ImageId>,
     /// The `Image` handles keeping `images` registered.
-    image_handles: Vec<cherenkov_gpu::Image>,
+    image_handles: Vec<cherenkov::Image<cherenkov::Rgba8>>,
     /// Layers holding recorded content, in draw order.
     content_layers: Vec<ContentLayer>,
-    /// The bench frame of every submitted engine frame whose GPU timing
-    /// has not resolved yet.
-    in_flight: HashMap<FrameId, u64>,
+    /// Whether any layer carries a `motion`.
+    has_motion: bool,
+    /// Whether the motion commits have been sent (first encode).
+    motion_committed: bool,
+    /// Whether any content layer carries live items.
+    has_live: bool,
+    /// Encode frames since `prepare` (`frames[n % len]` for live items).
+    frame: u64,
+    /// The fixed frame clock `submit` renders at.
+    clock: Clock,
+    /// Attributes each resolved GPU timing to the bench frame that
+    /// rendered it.
+    timings: Timings,
     counters: Counters,
 }
 
@@ -156,6 +469,8 @@ fn cherenkov_features() -> Vec<Feature> {
         Feature::Shadow,
         Feature::Glyphs,
         Feature::FontVariations,
+        Feature::Scroll,
+        Feature::Animation,
         Feature::HdrColor,
         Feature::WideGamut,
         Feature::Path,
@@ -183,40 +498,6 @@ const fn missing_api(f: &Feature) -> Option<&'static str> {
             Some("only srgb / linear interpolation in the first slice")
         }
         _ => None,
-    }
-}
-
-/// The scene blend mode matching a front-end mode one-for-one by name.
-const fn scene_blend(m: cherenkov::BlendMode) -> BlendMode {
-    match m {
-        cherenkov::BlendMode::Normal => BlendMode::Normal,
-        cherenkov::BlendMode::Multiply => BlendMode::Multiply,
-        cherenkov::BlendMode::Screen => BlendMode::Screen,
-        cherenkov::BlendMode::Overlay => BlendMode::Overlay,
-        cherenkov::BlendMode::Darken => BlendMode::Darken,
-        cherenkov::BlendMode::Lighten => BlendMode::Lighten,
-        cherenkov::BlendMode::ColorDodge => BlendMode::ColorDodge,
-        cherenkov::BlendMode::ColorBurn => BlendMode::ColorBurn,
-        cherenkov::BlendMode::HardLight => BlendMode::HardLight,
-        cherenkov::BlendMode::SoftLight => BlendMode::SoftLight,
-        cherenkov::BlendMode::Difference => BlendMode::Difference,
-        cherenkov::BlendMode::Exclusion => BlendMode::Exclusion,
-        cherenkov::BlendMode::Hue => BlendMode::Hue,
-        cherenkov::BlendMode::Saturation => BlendMode::Saturation,
-        cherenkov::BlendMode::Color => BlendMode::Color,
-        cherenkov::BlendMode::Luminosity => BlendMode::Luminosity,
-        cherenkov::BlendMode::Clear => BlendMode::Clear,
-        cherenkov::BlendMode::Src => BlendMode::Src,
-        cherenkov::BlendMode::Dst => BlendMode::Dst,
-        cherenkov::BlendMode::DestOver => BlendMode::DestOver,
-        cherenkov::BlendMode::SrcIn => BlendMode::SrcIn,
-        cherenkov::BlendMode::DestIn => BlendMode::DestIn,
-        cherenkov::BlendMode::SrcOut => BlendMode::SrcOut,
-        cherenkov::BlendMode::DestOut => BlendMode::DestOut,
-        cherenkov::BlendMode::SrcAtop => BlendMode::SrcAtop,
-        cherenkov::BlendMode::DestAtop => BlendMode::DestAtop,
-        cherenkov::BlendMode::Xor => BlendMode::Xor,
-        cherenkov::BlendMode::PlusLighter => BlendMode::PlusLighter,
     }
 }
 
@@ -254,26 +535,22 @@ const fn gpu_blend(m: BlendMode) -> cherenkov::BlendMode {
     }
 }
 
-/// The scene [`Feature`] a render-time [`Unsupported`] maps back to.
+/// The scene [`Feature`] a render-time unsupported name maps back to.
 ///
-/// `Shader`, `Mesh`, `Filter` and `BlendSpace` have no scene feature of
-/// their own; they report the nearest declared one (`Fill`) while the `api`
-/// string names the real construct.
-const fn unsupported_feature(u: Unsupported) -> Feature {
+/// `shader-paint`, `mesh-gradient`, `filter` and `blend-space` have no
+/// scene feature of their own; they report the nearest declared one
+/// (`Fill`) while the `api` string names the real construct. `blend-mode`
+/// is unreachable — every blend mode is supported.
+fn unsupported_feature(u: &str) -> Feature {
     match u {
-        Unsupported::Path | Unsupported::PathClipTooLarge => Feature::Path,
-        Unsupported::Sweep => Feature::SweepGradient,
-        Unsupported::Image => Feature::Image,
-        Unsupported::Blend(mode) => Feature::Blend(scene_blend(mode)),
-        Unsupported::Mesh | Unsupported::Shader | Unsupported::Filter | Unsupported::BlendSpace => {
-            Feature::Fill
-        }
-        Unsupported::StrokeDash => Feature::StrokeDash,
-        Unsupported::StrokeJoin => Feature::Stroke,
-        Unsupported::GlyphStroke | Unsupported::GlyphTransform | Unsupported::ColorFont => {
-            Feature::Glyphs
-        }
-        Unsupported::Shadow => Feature::Shadow,
+        "path" | "path-clip-too-large" => Feature::Path,
+        "sweep-gradient" => Feature::SweepGradient,
+        "image" => Feature::Image,
+        "stroke-dash" => Feature::StrokeDash,
+        "stroke-join" => Feature::Stroke,
+        "glyph-stroke" | "glyph-transform" | "color-font" => Feature::Glyphs,
+        "shadow" => Feature::Shadow,
+        _ => Feature::Fill,
     }
 }
 
@@ -284,7 +561,7 @@ fn render_error(e: RenderError) -> BenchError {
         RenderError::Unsupported(u) => BenchError::Unsupported {
             engine: Cherenkov::NAME,
             feature: unsupported_feature(u),
-            api: Some(Box::leak(format!("{u}").into_boxed_str())),
+            api: Some(u),
         },
         e => BenchError::Gpu(format!("cherenkov render: {e}")),
     }
@@ -399,7 +676,7 @@ fn shape_kind(shape: &Shape) -> ShapeKind {
 }
 
 /// Applies a clip shape to a layer edit.
-fn clip_shape(edit: &mut cherenkov_gpu::LayerEdit, shape: &ShapeKind) {
+fn clip_shape(edit: &mut LayerEdit<Gpu>, shape: &ShapeKind) {
     match shape {
         ShapeKind::Rect(r) => drop(edit.clip(*r)),
         ShapeKind::RoundedRect(r) => drop(edit.clip(*r)),
@@ -415,7 +692,7 @@ fn clip_shape(edit: &mut cherenkov_gpu::LayerEdit, shape: &ShapeKind) {
 /// rather than silently dropping.
 fn op(
     draw: &SceneDraw,
-    fonts: &HashMap<(ResourceHash, u32), cherenkov_gpu::Font>,
+    fonts: &HashMap<(ResourceHash, u32), cherenkov::Font>,
     images: &HashMap<ResourceHash, cherenkov::ImageId>,
     blobs: &Blobs,
 ) -> Result<Op, BenchError> {
@@ -469,12 +746,12 @@ fn op(
 /// resolved `F2Dot14` coordinates.
 fn glyph_run(
     run: &SceneGlyphRun,
-    fonts: &HashMap<(ResourceHash, u32), cherenkov_gpu::Font>,
+    fonts: &HashMap<(ResourceHash, u32), cherenkov::Font>,
     blobs: &Blobs,
 ) -> Result<cherenkov::GlyphRun, BenchError> {
     let font = fonts
         .get(&(run.font, run.font_index))
-        .map(cherenkov_gpu::Font::id)
+        .map(cherenkov::Font::id)
         .ok_or(cherenkov_scene::SceneError::MissingResource(run.font))?;
     let coords = blobs
         .get(&run.font)
@@ -499,7 +776,7 @@ fn glyph_run(
 
 /// Registers every font a glyph run references, once per `(hash, index)`.
 fn register_fonts(
-    fonts: &mut HashMap<(ResourceHash, u32), cherenkov_gpu::Font>,
+    fonts: &mut HashMap<(ResourceHash, u32), cherenkov::Font>,
     engine: &GpuEngine<Gpu>,
     layer: &SceneLayer,
     blobs: &Blobs,
@@ -515,17 +792,13 @@ fn register_fonts(
                     .get(&run.font)
                     .ok_or(cherenkov_scene::SceneError::MissingResource(run.font))?;
                 let font = engine
-                    .font(cherenkov_gpu::FontSource::bytes(blob.clone()).with_index(run.font_index))
+                    .font(cherenkov::FontSource::bytes(blob.clone()).with_index(run.font_index))
                     .map_err(|e| match e {
-                        ResourceError::Unsupported(Unsupported::ColorFont) => {
-                            BenchError::Unsupported {
-                                engine: Cherenkov::NAME,
-                                feature: Feature::Glyphs,
-                                api: Some(
-                                    "colour fonts (COLR/CBDT/sbix) are outside the first slice",
-                                ),
-                            }
-                        }
+                        ResourceError::Unsupported("color-font") => BenchError::Unsupported {
+                            engine: Cherenkov::NAME,
+                            feature: Feature::Glyphs,
+                            api: Some("colour fonts (COLR/CBDT/sbix) are outside the first slice"),
+                        },
                         e => BenchError::Engine(format!("cherenkov font: {e}")),
                     })?;
                 fonts.insert((run.font, run.font_index), font);
@@ -543,7 +816,7 @@ fn register_fonts(
 /// to the working space at upload.
 fn register_image(
     images: &mut HashMap<ResourceHash, cherenkov::ImageId>,
-    handles: &mut Vec<cherenkov_gpu::Image>,
+    handles: &mut Vec<cherenkov::Image<cherenkov::Rgba8>>,
     engine: &GpuEngine<Gpu>,
     hash: &ResourceHash,
     blobs: &Blobs,
@@ -557,12 +830,11 @@ fn register_image(
     let (width, height, rgba) = cherenkov_oracle::image::decode_png_rgba8(blob)
         .map_err(|e| BenchError::Engine(format!("cherenkov image decode: {e}")))?;
     let image = engine
-        .image(cherenkov_gpu::ImageSource {
-            width,
-            height,
-            pixels: rgba,
-            color_space: cherenkov_gpu::ImageColorSpace::Srgb,
-        })
+        .image(
+            ImageData::<Rgba8>::new(width, height, rgba)
+                .map_err(|e| BenchError::Engine(format!("cherenkov image: {e}")))?
+                .color_space(cherenkov::ImageColorSpace::Srgb),
+        )
         .map_err(|e| BenchError::Engine(format!("cherenkov image: {e}")))?;
     images.insert(*hash, image.id());
     handles.push(image);
@@ -572,7 +844,7 @@ fn register_image(
 /// Registers every image referenced by draws or image paints in `layer`.
 fn register_images(
     images: &mut HashMap<ResourceHash, cherenkov::ImageId>,
-    handles: &mut Vec<cherenkov_gpu::Image>,
+    handles: &mut Vec<cherenkov::Image<cherenkov::Rgba8>>,
     engine: &GpuEngine<Gpu>,
     layer: &SceneLayer,
     blobs: &Blobs,
@@ -602,7 +874,7 @@ fn register_images(
 /// draw run that must interleave with child layers.
 fn prep_layer(
     layer: &SceneLayer,
-    fonts: &HashMap<(ResourceHash, u32), cherenkov_gpu::Font>,
+    fonts: &HashMap<(ResourceHash, u32), cherenkov::Font>,
     images: &HashMap<ResourceHash, cherenkov::ImageId>,
     blobs: &Blobs,
 ) -> Result<PrepLayer, BenchError> {
@@ -616,40 +888,114 @@ fn prep_layer(
     };
     let mut prep = PrepLayer {
         transform: layer.transform,
+        scroll_offset: layer.scroll_offset,
         clip: layer.clip.as_ref().map(shape_kind),
         opacity: layer.opacity,
         blend: gpu_blend(layer.blend),
-        own: Vec::new(),
+        own: ContentRun {
+            ops: Vec::new(),
+            live: Vec::new(),
+        },
         items: Vec::new(),
+        motion: layer
+            .motion
+            .as_ref()
+            .map(|m| LayerMotion::from_scene(m, layer.transform)),
     };
     if own {
-        for item in &layer.items {
+        for (index, item) in layer.items.iter().enumerate() {
             match item {
-                Item::Draw(d) => prep.own.push(op(d, fonts, images, blobs)?),
-                Item::Layer(l) => prep
-                    .items
-                    .push(PrepItem::Layer(prep_layer(l, fonts, images, blobs)?)),
+                Item::Draw(d) => {
+                    prep.own.ops.push(op(d, fonts, images, blobs)?);
+                    if let Some(live) =
+                        live_run(layer, index, prep.own.ops.len() - 1, fonts, images, blobs)?
+                    {
+                        prep.own.live.push(live);
+                    }
+                }
+                Item::Layer(l) => prep.items.push(PrepItem::Layer(Box::new(prep_layer(
+                    l, fonts, images, blobs,
+                )?))),
             }
         }
     } else {
-        let mut run: Vec<Op> = Vec::new();
-        for item in &layer.items {
+        let mut run = ContentRun {
+            ops: Vec::new(),
+            live: Vec::new(),
+        };
+        for (index, item) in layer.items.iter().enumerate() {
             match item {
-                Item::Draw(d) => run.push(op(d, fonts, images, blobs)?),
-                Item::Layer(l) => {
-                    if !run.is_empty() {
-                        prep.items.push(PrepItem::Content(std::mem::take(&mut run)));
+                Item::Draw(d) => {
+                    run.ops.push(op(d, fonts, images, blobs)?);
+                    if let Some(live) =
+                        live_run(layer, index, run.ops.len() - 1, fonts, images, blobs)?
+                    {
+                        run.live.push(live);
                     }
-                    prep.items
-                        .push(PrepItem::Layer(prep_layer(l, fonts, images, blobs)?));
+                }
+                Item::Layer(l) => {
+                    if !run.ops.is_empty() {
+                        prep.items.push(PrepItem::Content(std::mem::replace(
+                            &mut run,
+                            ContentRun {
+                                ops: Vec::new(),
+                                live: Vec::new(),
+                            },
+                        )));
+                    }
+                    prep.items.push(PrepItem::Layer(Box::new(prep_layer(
+                        l, fonts, images, blobs,
+                    )?)));
                 }
             }
         }
-        if !run.is_empty() {
+        if !run.ops.is_empty() {
             prep.items.push(PrepItem::Content(run));
         }
     }
     Ok(prep)
+}
+
+/// Resolves a scene `live` entry targeting item `index` into a [`LiveRun`]
+/// at `position` inside its content run. `None` when no entry targets it.
+/// Errors when the target is not a draw or the frames are not all the
+/// same draw variant as the item.
+fn live_run(
+    layer: &SceneLayer,
+    index: usize,
+    position: usize,
+    fonts: &HashMap<(ResourceHash, u32), cherenkov::Font>,
+    images: &HashMap<ResourceHash, cherenkov::ImageId>,
+    blobs: &Blobs,
+) -> Result<Option<LiveRun>, BenchError> {
+    let Some(entry) = layer.live.iter().find(|live| live.item == index) else {
+        return Ok(None);
+    };
+    if !matches!(layer.items[index], Item::Draw(_)) {
+        return Err(BenchError::Engine(
+            "cherenkov: a live entry does not target a draw item".into(),
+        ));
+    }
+    let kind = std::mem::discriminant(&match &layer.items[index] {
+        Item::Draw(d) => op(d, fonts, images, blobs)?,
+        Item::Layer(_) => unreachable!("checked above"),
+    });
+    let mut frames = Vec::with_capacity(entry.frames.len());
+    for draw in &entry.frames {
+        let op = op(draw, fonts, images, blobs)?;
+        if std::mem::discriminant(&op) != kind {
+            return Err(BenchError::Engine(
+                "cherenkov: a live frame is not the item's draw variant".into(),
+            ));
+        }
+        frames.push(op);
+    }
+    Ok(Some(LiveRun {
+        index: position,
+        bindings: LiveBindings::for_frames(&frames),
+        frames,
+        previous: Some(0),
+    }))
 }
 
 /// Builds one engine layer for `prep` under `parent`, recursing into
@@ -659,8 +1005,8 @@ fn prep_layer(
     reason = "layer opacity is f32 at the engine boundary"
 )]
 fn build_layer(
-    surface: &Surface,
-    tx: &mut Transaction<'_>,
+    surface: &Surface<Gpu>,
+    tx: &mut Transaction<'_, Gpu>,
     parent: &GpuLayer,
     prep: PrepLayer,
     content_layers: &mut Vec<ContentLayer>,
@@ -669,6 +1015,7 @@ fn build_layer(
     {
         let edit = &mut tx[&layer];
         edit.transform(prep.transform);
+        edit.scroll_offset(prep.scroll_offset);
         edit.opacity(prep.opacity as f32);
         edit.blend(prep.blend);
         if let Some(clip) = &prep.clip {
@@ -678,52 +1025,30 @@ fn build_layer(
     tx[parent].push(&layer);
     for item in prep.items {
         match item {
-            PrepItem::Content(ops) => {
+            PrepItem::Content(run) => {
                 let child = surface.layer();
                 tx[&layer].push(&child);
                 content_layers.push(ContentLayer {
                     layer: child,
-                    ops,
+                    ops: run.ops,
+                    live: run.live,
                     last_len: 0,
+                    motion: None,
                 });
             }
-            PrepItem::Layer(p) => build_layer(surface, tx, &layer, p, content_layers),
+            PrepItem::Layer(p) => build_layer(surface, tx, &layer, *p, content_layers),
         }
     }
     content_layers.push(ContentLayer {
         layer,
-        ops: prep.own,
+        ops: prep.own.ops,
+        live: prep.own.live,
         last_len: 0,
+        motion: prep.motion,
     });
 }
 
 impl Cherenkov {
-    /// Tags each resolved engine frame timing with the bench frame that
-    /// submitted it.
-    fn gpu_samples(&mut self, timings: Vec<FrameTiming>) -> Vec<GpuSample> {
-        timings
-            .into_iter()
-            .map(|timing| GpuSample {
-                frame: self
-                    .in_flight
-                    .remove(&timing.frame)
-                    .expect("the engine times only frames this adapter submitted"),
-                gpu_seconds: timing.gpu_seconds,
-                passes: timing
-                    .passes
-                    .into_iter()
-                    .map(|p| crate::PassSample {
-                        name: p.name,
-                        width: p.width,
-                        height: p.height,
-                        format: p.format.to_string(),
-                        gpu_seconds: p.gpu_seconds,
-                    })
-                    .collect(),
-            })
-            .collect()
-    }
-
     /// Adapter key.
     pub const NAME: &'static str = "cherenkov";
 
@@ -756,11 +1081,16 @@ impl Cherenkov {
             },
             engine,
             surface: None,
-            in_flight: HashMap::new(),
+            timings: Timings::default(),
             fonts: HashMap::new(),
             images: HashMap::new(),
             image_handles: Vec::new(),
             content_layers: Vec::new(),
+            has_motion: false,
+            motion_committed: false,
+            has_live: false,
+            frame: 0,
+            clock: Clock::new(),
             counters: Counters::default(),
         })
     }
@@ -805,6 +1135,10 @@ impl Engine for Cherenkov {
             let root = surface.root();
             build_layer(&surface, tx, root, prep, &mut content_layers);
         });
+        self.has_motion = content_layers.iter().any(|c| c.motion.is_some());
+        self.motion_committed = false;
+        self.has_live = content_layers.iter().any(|c| !c.live.is_empty());
+        self.frame = 0;
         self.content_layers = content_layers;
         self.surface = Some(surface);
         Ok(())
@@ -817,26 +1151,51 @@ impl Engine for Cherenkov {
             .surface
             .as_ref()
             .ok_or_else(|| BenchError::Engine("cherenkov: encode before prepare".into()))?;
-        let contents: Vec<(usize, cherenkov::Content)> = self
-            .content_layers
-            .iter()
-            .enumerate()
-            .map(|(i, cl)| {
-                let content = cherenkov::Content::record_with_capacity(cl.last_len, |c| {
-                    for op in &cl.ops {
-                        record_op(c, op);
-                    }
-                });
-                (i, content)
-            })
-            .collect();
-        surface.update(|tx| {
-            for (i, content) in contents {
-                let cl = &mut self.content_layers[i];
-                cl.last_len = content.len();
-                tx[&cl.layer].content(content);
+        let first_frame = self.frame == 0;
+        if self.has_motion && first_frame {
+            for cl in &self.content_layers {
+                if let Some(motion) = &cl.motion {
+                    motion.apply(surface, &cl.layer);
+                }
             }
-        });
+            self.motion_committed = true;
+        }
+        // Motion and live scenes record their content once: later encodes
+        // only set live bindings and advance the clock. Static scenes keep
+        // re-recording each frame so their numbers stay comparable.
+        if first_frame || !(self.has_motion || self.has_live) {
+            let contents: Vec<(usize, cherenkov::Content)> = self
+                .content_layers
+                .iter()
+                .enumerate()
+                .map(|(i, cl)| {
+                    let content = cherenkov::Content::record_with_capacity(cl.last_len, |c| {
+                        for (index, op) in cl.ops.iter().enumerate() {
+                            match cl.live.iter().find(|live| live.index == index) {
+                                Some(live) => record_live(c, op, &live.bindings),
+                                None => record_op(c, op),
+                            }
+                        }
+                    });
+                    (i, content)
+                })
+                .collect();
+            surface.update(|tx| {
+                for (i, content) in contents {
+                    let cl = &mut self.content_layers[i];
+                    cl.last_len = content.len();
+                    tx[&cl.layer].content(content);
+                }
+            });
+        } else {
+            for cl in &mut self.content_layers {
+                for live in &mut cl.live {
+                    live.advance(self.frame);
+                }
+            }
+        }
+        self.frame += 1;
+        self.clock.advance();
         Ok(())
     }
 
@@ -846,15 +1205,14 @@ impl Engine for Cherenkov {
                 "cherenkov: submit before prepare".into(),
             ));
         }
-        self.engine.render(FrameTime::now()).map_err(render_error)?;
-        let stats = self.engine.stats();
-        self.in_flight.insert(
-            stats
-                .frame
-                .expect("the bench updates content every frame, so every render submits"),
+        let gpu = self.timings.render_frame(
+            &self.engine,
+            &mut self.clock,
             frame,
-        );
-        let gpu = self.gpu_samples(stats.timings);
+            readback && self.has_motion,
+            render_error,
+        )?;
+        let stats = self.engine.stats();
         let image = if readback {
             let rb = self
                 .surface
@@ -888,7 +1246,7 @@ impl Engine for Cherenkov {
 
     fn finish_gpu(&mut self) -> Result<Vec<GpuSample>, BenchError> {
         let timings = self.engine.finish_timings().map_err(render_error)?;
-        Ok(self.gpu_samples(timings))
+        Ok(self.timings.samples(timings))
     }
 
     fn counters(&self) -> Counters {
@@ -954,7 +1312,7 @@ fn record_op(c: &mut cherenkov::Recorder, op: &Op) {
             ShapeKind::Line(s) => c.shadow(*s, *shadow),
             ShapeKind::Path(p) => c.shadow(p.clone(), *shadow),
         },
-        Op::Glyphs { run, paint } => c.glyphs(run, paint.clone()),
+        Op::Glyphs { run, paint } => c.glyphs(run.clone(), paint.clone()),
         Op::Image {
             image,
             dst,

@@ -65,3 +65,21 @@ thermal status (`dumpsys thermalservice` severity on Android,
 `/sys/class/thermal` zone temperature, screen state and brightness
 where readable, alongside the `placement` block `--cpu` already
 produces. Screen brightness is not recorded on macOS or Windows.
+## Sparse live updates
+
+`scenes/perf/live-dashboard` changes one two-digit glyph run and one bar height
+per frame. Static page content is recorded once. To compare retained lowering
+against a saved baseline executable on Linux/lavapipe, run both binaries with
+identical affinity and frame counts:
+
+    VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json \
+      cherenkov-bench measure --engine cherenkov \
+      --scene scenes/perf/live-dashboard --warmup 10 --frames 60 \
+      --cpu 0-3 --out gpu-live-dashboard.json
+    cherenkov-bench measure --engine cherenkov-cpu \
+      --scene scenes/perf/live-dashboard --warmup 10 --frames 60 \
+      --cpu 0-3 --out cpu-live-dashboard.json
+
+Use the ICD path and allowed CPU set reported by the measurement host. Alternate
+before/after runs to expose host variation. Compare `encode` and `submit`
+separately: only `submit` contains the render-thread lowering being optimized.

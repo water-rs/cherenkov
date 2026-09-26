@@ -1,0 +1,6751 @@
+{
+  "width": 1024,
+  "height": 2216,
+  "working_space": "linear-display-p3",
+  "clear": {
+    "space": "srgb",
+    "components": [
+      0.96,
+      0.96,
+      0.97,
+      1.0
+    ]
+  },
+  "features": [
+    {
+      "feature": "fill"
+    },
+    {
+      "feature": "stroke"
+    },
+    {
+      "feature": "shadow"
+    },
+    {
+      "feature": "glyphs"
+    },
+    {
+      "feature": "font-variations"
+    }
+  ],
+  "root": {
+    "transform": [
+      1.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0
+    ],
+    "opacity": 1.0,
+    "blend": "normal",
+    "items": [
+      {
+        "draw": {
+          "glyphs": {
+            "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+            "font_index": 0,
+            "size": 40.0,
+            "normalized_coords": [
+              {
+                "tag": "wght",
+                "value": 0.6100464
+              }
+            ],
+            "glyphs": [
+              {
+                "id": 37,
+                "x": 52.0,
+                "y": 94.759995
+              },
+              {
+                "id": 66,
+                "x": 81.28,
+                "y": 94.759995
+              },
+              {
+                "id": 84,
+                "x": 105.24,
+                "y": 94.759995
+              },
+              {
+                "id": 73,
+                "x": 125.32,
+                "y": 94.759995
+              },
+              {
+                "id": 67,
+                "x": 151.32,
+                "y": 94.759995
+              },
+              {
+                "id": 80,
+                "x": 176.6,
+                "y": 94.759995
+              },
+              {
+                "id": 66,
+                "x": 201.6,
+                "y": 94.759995
+              },
+              {
+                "id": 83,
+                "x": 225.56,
+                "y": 94.759995
+              },
+              {
+                "id": 69,
+                "x": 242.64,
+                "y": 94.759995
+              }
+            ],
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.1,
+                  0.1,
+                  0.12,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "glyphs": {
+            "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+            "font_index": 0,
+            "size": 22.0,
+            "normalized_coords": [],
+            "glyphs": [
+              {
+                "id": 51,
+                "x": 52.0,
+                "y": 175.518
+              },
+              {
+                "id": 70,
+                "x": 65.684,
+                "y": 175.518
+              },
+              {
+                "id": 87,
+                "x": 77.652,
+                "y": 175.518
+              },
+              {
+                "id": 70,
+                "x": 88.828,
+                "y": 175.518
+              },
+              {
+                "id": 79,
+                "x": 101.236,
+                "y": 175.518
+              },
+              {
+                "id": 86,
+                "x": 114.832,
+                "y": 175.518
+              },
+              {
+                "id": 70,
+                "x": 128.42801,
+                "y": 175.518
+              },
+              {
+                "id": 13,
+                "x": 140.836,
+                "y": 175.518
+              },
+              {
+                "id": 1,
+                "x": 146.732,
+                "y": 175.518
+              },
+              {
+                "id": 84,
+                "x": 152.452,
+                "y": 175.518
+              },
+              {
+                "id": 74,
+                "x": 162.98999,
+                "y": 175.518
+              },
+              {
+                "id": 72,
+                "x": 168.666,
+                "y": 175.518
+              },
+              {
+                "id": 79,
+                "x": 182.196,
+                "y": 175.518
+              },
+              {
+                "id": 86,
+                "x": 195.79199,
+                "y": 175.518
+              },
+              {
+                "id": 81,
+                "x": 209.38799,
+                "y": 175.518
+              },
+              {
+                "id": 84,
+                "x": 222.91798,
+                "y": 175.518
+              },
+              {
+                "id": 1,
+                "x": 233.45598,
+                "y": 175.518
+              },
+              {
+                "id": 66,
+                "x": 239.17598,
+                "y": 175.518
+              },
+              {
+                "id": 79,
+                "x": 251.51797,
+                "y": 175.518
+              },
+              {
+                "id": 69,
+                "x": 265.11395,
+                "y": 175.518
+              },
+              {
+                "id": 1,
+                "x": 278.64398,
+                "y": 175.518
+              }
+            ],
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.4,
+                  0.42,
+                  0.45,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "glyphs": {
+            "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+            "font_index": 0,
+            "size": 22.0,
+            "normalized_coords": [],
+            "glyphs": [
+              {
+                "id": 77,
+                "x": 52.0,
+                "y": 239.482
+              },
+              {
+                "id": 66,
+                "x": 57.676003,
+                "y": 239.482
+              },
+              {
+                "id": 85,
+                "x": 70.018,
+                "y": 239.482
+              },
+              {
+                "id": 70,
+                "x": 77.96,
+                "y": 239.482
+              },
+              {
+                "id": 79,
+                "x": 90.368,
+                "y": 239.482
+              },
+              {
+                "id": 68,
+                "x": 103.964005,
+                "y": 239.482
+              },
+              {
+                "id": 90,
+                "x": 114.524,
+                "y": 239.482
+              },
+              {
+                "id": 1,
+                "x": 125.744,
+                "y": 239.482
+              },
+              {
+                "id": 66,
+                "x": 131.464,
+                "y": 239.482
+              },
+              {
+                "id": 85,
+                "x": 143.806,
+                "y": 239.482
+              },
+              {
+                "id": 1,
+                "x": 151.74802,
+                "y": 239.482
+              },
+              {
+                "id": 66,
+                "x": 157.46802,
+                "y": 239.482
+              },
+              {
+                "id": 1,
+                "x": 169.81001,
+                "y": 239.482
+              },
+              {
+                "id": 72,
+                "x": 175.53001,
+                "y": 239.482
+              },
+              {
+                "id": 77,
+                "x": 189.06001,
+                "y": 239.482
+              },
+              {
+                "id": 66,
+                "x": 194.73601,
+                "y": 239.482
+              },
+              {
+                "id": 79,
+                "x": 207.078,
+                "y": 239.482
+              },
+              {
+                "id": 68,
+                "x": 220.674,
+                "y": 239.482
+              },
+              {
+                "id": 70,
+                "x": 231.234,
+                "y": 239.482
+              },
+              {
+                "id": 1,
+                "x": 243.642,
+                "y": 239.482
+              },
+              {
+                "id": 71,
+                "x": 249.362,
+                "y": 239.482
+              },
+              {
+                "id": 80,
+                "x": 256.93,
+                "y": 239.482
+              },
+              {
+                "id": 83,
+                "x": 270.24,
+                "y": 239.482
+              },
+              {
+                "id": 1,
+                "x": 279.326,
+                "y": 239.482
+              },
+              {
+                "id": 85,
+                "x": 285.046,
+                "y": 239.482
+              },
+              {
+                "id": 73,
+                "x": 292.98798,
+                "y": 239.482
+              },
+              {
+                "id": 70,
+                "x": 306.58398,
+                "y": 239.482
+              },
+              {
+                "id": 1,
+                "x": 318.99197,
+                "y": 239.482
+              }
+            ],
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.4,
+                  0.42,
+                  0.45,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "glyphs": {
+            "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+            "font_index": 0,
+            "size": 22.0,
+            "normalized_coords": [],
+            "glyphs": [
+              {
+                "id": 77,
+                "x": 52.0,
+                "y": 303.44598
+              },
+              {
+                "id": 66,
+                "x": 57.676003,
+                "y": 303.44598
+              },
+              {
+                "id": 84,
+                "x": 70.018,
+                "y": 303.44598
+              },
+              {
+                "id": 85,
+                "x": 80.556,
+                "y": 303.44598
+              },
+              {
+                "id": 1,
+                "x": 88.498,
+                "y": 303.44598
+              },
+              {
+                "id": 82,
+                "x": 94.218,
+                "y": 303.44598
+              },
+              {
+                "id": 86,
+                "x": 107.748,
+                "y": 303.44598
+              },
+              {
+                "id": 66,
+                "x": 121.344,
+                "y": 303.44598
+              },
+              {
+                "id": 83,
+                "x": 133.686,
+                "y": 303.44598
+              },
+              {
+                "id": 85,
+                "x": 142.772,
+                "y": 303.44598
+              },
+              {
+                "id": 70,
+                "x": 150.714,
+                "y": 303.44598
+              },
+              {
+                "id": 83,
+                "x": 163.12201,
+                "y": 303.44598
+              },
+              {
+                "id": 15,
+                "x": 168.688,
+                "y": 303.44598
+              }
+            ],
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.4,
+                  0.42,
+                  0.45,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "shadow": {
+            "shape": {
+              "rounded-rect": {
+                "rect": {
+                  "x0": 40.0,
+                  "y0": 280.0,
+                  "x1": 266.0,
+                  "y1": 480.0
+                },
+                "radii": {
+                  "top_left": 14.0,
+                  "top_right": 14.0,
+                  "bottom_right": 14.0,
+                  "bottom_left": 14.0
+                }
+              }
+            },
+            "blur_sigma": 4.0,
+            "offset": [
+              0.0,
+              3.0
+            ],
+            "color": {
+              "space": "srgb",
+              "components": [
+                0.0,
+                0.0,
+                0.0,
+                0.22
+              ]
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rounded-rect": {
+                "rect": {
+                  "x0": 40.0,
+                  "y0": 280.0,
+                  "x1": 266.0,
+                  "y1": 480.0
+                },
+                "radii": {
+                  "top_left": 14.0,
+                  "top_right": 14.0,
+                  "bottom_right": 14.0,
+                  "bottom_left": 14.0
+                }
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.95,
+                  0.95,
+                  0.95,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "stroke": {
+            "shape": {
+              "rounded-rect": {
+                "rect": {
+                  "x0": 40.0,
+                  "y0": 280.0,
+                  "x1": 266.0,
+                  "y1": 480.0
+                },
+                "radii": {
+                  "top_left": 14.0,
+                  "top_right": 14.0,
+                  "bottom_right": 14.0,
+                  "bottom_left": 14.0
+                }
+              }
+            },
+            "stroke": {
+              "width": 1.0,
+              "join": "Miter",
+              "miter_limit": 4.0,
+              "start_cap": "Butt",
+              "end_cap": "Butt",
+              "dash_pattern": [],
+              "dash_offset": 0.0
+            },
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.0,
+                  0.0,
+                  0.0,
+                  0.12
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "glyphs": {
+            "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+            "font_index": 0,
+            "size": 20.0,
+            "normalized_coords": [],
+            "glyphs": [
+              {
+                "id": 54,
+                "x": 72.0,
+                "y": 337.38
+              },
+              {
+                "id": 84,
+                "x": 86.619995,
+                "y": 337.38
+              },
+              {
+                "id": 70,
+                "x": 96.2,
+                "y": 337.38
+              },
+              {
+                "id": 83,
+                "x": 107.479996,
+                "y": 337.38
+              },
+              {
+                "id": 84,
+                "x": 115.74,
+                "y": 337.38
+              }
+            ],
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.1,
+                  0.1,
+                  0.12,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "shadow": {
+            "shape": {
+              "rounded-rect": {
+                "rect": {
+                  "x0": 286.0,
+                  "y0": 280.0,
+                  "x1": 512.0,
+                  "y1": 480.0
+                },
+                "radii": {
+                  "top_left": 14.0,
+                  "top_right": 14.0,
+                  "bottom_right": 14.0,
+                  "bottom_left": 14.0
+                }
+              }
+            },
+            "blur_sigma": 4.0,
+            "offset": [
+              0.0,
+              3.0
+            ],
+            "color": {
+              "space": "srgb",
+              "components": [
+                0.0,
+                0.0,
+                0.0,
+                0.22
+              ]
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rounded-rect": {
+                "rect": {
+                  "x0": 286.0,
+                  "y0": 280.0,
+                  "x1": 512.0,
+                  "y1": 480.0
+                },
+                "radii": {
+                  "top_left": 14.0,
+                  "top_right": 14.0,
+                  "bottom_right": 14.0,
+                  "bottom_left": 14.0
+                }
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.95,
+                  0.95,
+                  0.95,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "stroke": {
+            "shape": {
+              "rounded-rect": {
+                "rect": {
+                  "x0": 286.0,
+                  "y0": 280.0,
+                  "x1": 512.0,
+                  "y1": 480.0
+                },
+                "radii": {
+                  "top_left": 14.0,
+                  "top_right": 14.0,
+                  "bottom_right": 14.0,
+                  "bottom_left": 14.0
+                }
+              }
+            },
+            "stroke": {
+              "width": 1.0,
+              "join": "Miter",
+              "miter_limit": 4.0,
+              "start_cap": "Butt",
+              "end_cap": "Butt",
+              "dash_pattern": [],
+              "dash_offset": 0.0
+            },
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.0,
+                  0.0,
+                  0.0,
+                  0.12
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "glyphs": {
+            "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+            "font_index": 0,
+            "size": 20.0,
+            "normalized_coords": [],
+            "glyphs": [
+              {
+                "id": 54,
+                "x": 318.0,
+                "y": 337.38
+              },
+              {
+                "id": 84,
+                "x": 332.62,
+                "y": 337.38
+              },
+              {
+                "id": 70,
+                "x": 342.2,
+                "y": 337.38
+              },
+              {
+                "id": 83,
+                "x": 353.48,
+                "y": 337.38
+              },
+              {
+                "id": 84,
+                "x": 361.74,
+                "y": 337.38
+              }
+            ],
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.1,
+                  0.1,
+                  0.12,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "shadow": {
+            "shape": {
+              "rounded-rect": {
+                "rect": {
+                  "x0": 532.0,
+                  "y0": 280.0,
+                  "x1": 758.0,
+                  "y1": 480.0
+                },
+                "radii": {
+                  "top_left": 14.0,
+                  "top_right": 14.0,
+                  "bottom_right": 14.0,
+                  "bottom_left": 14.0
+                }
+              }
+            },
+            "blur_sigma": 4.0,
+            "offset": [
+              0.0,
+              3.0
+            ],
+            "color": {
+              "space": "srgb",
+              "components": [
+                0.0,
+                0.0,
+                0.0,
+                0.22
+              ]
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rounded-rect": {
+                "rect": {
+                  "x0": 532.0,
+                  "y0": 280.0,
+                  "x1": 758.0,
+                  "y1": 480.0
+                },
+                "radii": {
+                  "top_left": 14.0,
+                  "top_right": 14.0,
+                  "bottom_right": 14.0,
+                  "bottom_left": 14.0
+                }
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.95,
+                  0.95,
+                  0.95,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "stroke": {
+            "shape": {
+              "rounded-rect": {
+                "rect": {
+                  "x0": 532.0,
+                  "y0": 280.0,
+                  "x1": 758.0,
+                  "y1": 480.0
+                },
+                "radii": {
+                  "top_left": 14.0,
+                  "top_right": 14.0,
+                  "bottom_right": 14.0,
+                  "bottom_left": 14.0
+                }
+              }
+            },
+            "stroke": {
+              "width": 1.0,
+              "join": "Miter",
+              "miter_limit": 4.0,
+              "start_cap": "Butt",
+              "end_cap": "Butt",
+              "dash_pattern": [],
+              "dash_offset": 0.0
+            },
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.0,
+                  0.0,
+                  0.0,
+                  0.12
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "glyphs": {
+            "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+            "font_index": 0,
+            "size": 20.0,
+            "normalized_coords": [],
+            "glyphs": [
+              {
+                "id": 54,
+                "x": 564.0,
+                "y": 337.38
+              },
+              {
+                "id": 84,
+                "x": 578.62,
+                "y": 337.38
+              },
+              {
+                "id": 70,
+                "x": 588.2,
+                "y": 337.38
+              },
+              {
+                "id": 83,
+                "x": 599.48,
+                "y": 337.38
+              },
+              {
+                "id": 84,
+                "x": 607.74,
+                "y": 337.38
+              }
+            ],
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.1,
+                  0.1,
+                  0.12,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "shadow": {
+            "shape": {
+              "rounded-rect": {
+                "rect": {
+                  "x0": 778.0,
+                  "y0": 280.0,
+                  "x1": 1004.0,
+                  "y1": 480.0
+                },
+                "radii": {
+                  "top_left": 14.0,
+                  "top_right": 14.0,
+                  "bottom_right": 14.0,
+                  "bottom_left": 14.0
+                }
+              }
+            },
+            "blur_sigma": 4.0,
+            "offset": [
+              0.0,
+              3.0
+            ],
+            "color": {
+              "space": "srgb",
+              "components": [
+                0.0,
+                0.0,
+                0.0,
+                0.22
+              ]
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rounded-rect": {
+                "rect": {
+                  "x0": 778.0,
+                  "y0": 280.0,
+                  "x1": 1004.0,
+                  "y1": 480.0
+                },
+                "radii": {
+                  "top_left": 14.0,
+                  "top_right": 14.0,
+                  "bottom_right": 14.0,
+                  "bottom_left": 14.0
+                }
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.95,
+                  0.95,
+                  0.95,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "stroke": {
+            "shape": {
+              "rounded-rect": {
+                "rect": {
+                  "x0": 778.0,
+                  "y0": 280.0,
+                  "x1": 1004.0,
+                  "y1": 480.0
+                },
+                "radii": {
+                  "top_left": 14.0,
+                  "top_right": 14.0,
+                  "bottom_right": 14.0,
+                  "bottom_left": 14.0
+                }
+              }
+            },
+            "stroke": {
+              "width": 1.0,
+              "join": "Miter",
+              "miter_limit": 4.0,
+              "start_cap": "Butt",
+              "end_cap": "Butt",
+              "dash_pattern": [],
+              "dash_offset": 0.0
+            },
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.0,
+                  0.0,
+                  0.0,
+                  0.12
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "glyphs": {
+            "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+            "font_index": 0,
+            "size": 20.0,
+            "normalized_coords": [],
+            "glyphs": [
+              {
+                "id": 54,
+                "x": 810.0,
+                "y": 337.38
+              },
+              {
+                "id": 84,
+                "x": 824.62,
+                "y": 337.38
+              },
+              {
+                "id": 70,
+                "x": 834.2,
+                "y": 337.38
+              },
+              {
+                "id": 83,
+                "x": 845.48,
+                "y": 337.38
+              },
+              {
+                "id": 84,
+                "x": 853.74,
+                "y": 337.38
+              }
+            ],
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.1,
+                  0.1,
+                  0.12,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "shadow": {
+            "shape": {
+              "rounded-rect": {
+                "rect": {
+                  "x0": 40.0,
+                  "y0": 500.0,
+                  "x1": 266.0,
+                  "y1": 700.0
+                },
+                "radii": {
+                  "top_left": 14.0,
+                  "top_right": 14.0,
+                  "bottom_right": 14.0,
+                  "bottom_left": 14.0
+                }
+              }
+            },
+            "blur_sigma": 4.0,
+            "offset": [
+              0.0,
+              3.0
+            ],
+            "color": {
+              "space": "srgb",
+              "components": [
+                0.0,
+                0.0,
+                0.0,
+                0.22
+              ]
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rounded-rect": {
+                "rect": {
+                  "x0": 40.0,
+                  "y0": 500.0,
+                  "x1": 266.0,
+                  "y1": 700.0
+                },
+                "radii": {
+                  "top_left": 14.0,
+                  "top_right": 14.0,
+                  "bottom_right": 14.0,
+                  "bottom_left": 14.0
+                }
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.95,
+                  0.95,
+                  0.95,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "stroke": {
+            "shape": {
+              "rounded-rect": {
+                "rect": {
+                  "x0": 40.0,
+                  "y0": 500.0,
+                  "x1": 266.0,
+                  "y1": 700.0
+                },
+                "radii": {
+                  "top_left": 14.0,
+                  "top_right": 14.0,
+                  "bottom_right": 14.0,
+                  "bottom_left": 14.0
+                }
+              }
+            },
+            "stroke": {
+              "width": 1.0,
+              "join": "Miter",
+              "miter_limit": 4.0,
+              "start_cap": "Butt",
+              "end_cap": "Butt",
+              "dash_pattern": [],
+              "dash_offset": 0.0
+            },
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.0,
+                  0.0,
+                  0.0,
+                  0.12
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "glyphs": {
+            "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+            "font_index": 0,
+            "size": 20.0,
+            "normalized_coords": [],
+            "glyphs": [
+              {
+                "id": 54,
+                "x": 72.0,
+                "y": 557.38
+              },
+              {
+                "id": 84,
+                "x": 86.619995,
+                "y": 557.38
+              },
+              {
+                "id": 70,
+                "x": 96.2,
+                "y": 557.38
+              },
+              {
+                "id": 83,
+                "x": 107.479996,
+                "y": 557.38
+              },
+              {
+                "id": 84,
+                "x": 115.74,
+                "y": 557.38
+              }
+            ],
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.1,
+                  0.1,
+                  0.12,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "shadow": {
+            "shape": {
+              "rounded-rect": {
+                "rect": {
+                  "x0": 286.0,
+                  "y0": 500.0,
+                  "x1": 512.0,
+                  "y1": 700.0
+                },
+                "radii": {
+                  "top_left": 14.0,
+                  "top_right": 14.0,
+                  "bottom_right": 14.0,
+                  "bottom_left": 14.0
+                }
+              }
+            },
+            "blur_sigma": 4.0,
+            "offset": [
+              0.0,
+              3.0
+            ],
+            "color": {
+              "space": "srgb",
+              "components": [
+                0.0,
+                0.0,
+                0.0,
+                0.22
+              ]
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rounded-rect": {
+                "rect": {
+                  "x0": 286.0,
+                  "y0": 500.0,
+                  "x1": 512.0,
+                  "y1": 700.0
+                },
+                "radii": {
+                  "top_left": 14.0,
+                  "top_right": 14.0,
+                  "bottom_right": 14.0,
+                  "bottom_left": 14.0
+                }
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.95,
+                  0.95,
+                  0.95,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "stroke": {
+            "shape": {
+              "rounded-rect": {
+                "rect": {
+                  "x0": 286.0,
+                  "y0": 500.0,
+                  "x1": 512.0,
+                  "y1": 700.0
+                },
+                "radii": {
+                  "top_left": 14.0,
+                  "top_right": 14.0,
+                  "bottom_right": 14.0,
+                  "bottom_left": 14.0
+                }
+              }
+            },
+            "stroke": {
+              "width": 1.0,
+              "join": "Miter",
+              "miter_limit": 4.0,
+              "start_cap": "Butt",
+              "end_cap": "Butt",
+              "dash_pattern": [],
+              "dash_offset": 0.0
+            },
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.0,
+                  0.0,
+                  0.0,
+                  0.12
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "glyphs": {
+            "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+            "font_index": 0,
+            "size": 20.0,
+            "normalized_coords": [],
+            "glyphs": [
+              {
+                "id": 54,
+                "x": 318.0,
+                "y": 557.38
+              },
+              {
+                "id": 84,
+                "x": 332.62,
+                "y": 557.38
+              },
+              {
+                "id": 70,
+                "x": 342.2,
+                "y": 557.38
+              },
+              {
+                "id": 83,
+                "x": 353.48,
+                "y": 557.38
+              },
+              {
+                "id": 84,
+                "x": 361.74,
+                "y": 557.38
+              }
+            ],
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.1,
+                  0.1,
+                  0.12,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "shadow": {
+            "shape": {
+              "rounded-rect": {
+                "rect": {
+                  "x0": 532.0,
+                  "y0": 500.0,
+                  "x1": 758.0,
+                  "y1": 700.0
+                },
+                "radii": {
+                  "top_left": 14.0,
+                  "top_right": 14.0,
+                  "bottom_right": 14.0,
+                  "bottom_left": 14.0
+                }
+              }
+            },
+            "blur_sigma": 4.0,
+            "offset": [
+              0.0,
+              3.0
+            ],
+            "color": {
+              "space": "srgb",
+              "components": [
+                0.0,
+                0.0,
+                0.0,
+                0.22
+              ]
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rounded-rect": {
+                "rect": {
+                  "x0": 532.0,
+                  "y0": 500.0,
+                  "x1": 758.0,
+                  "y1": 700.0
+                },
+                "radii": {
+                  "top_left": 14.0,
+                  "top_right": 14.0,
+                  "bottom_right": 14.0,
+                  "bottom_left": 14.0
+                }
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.95,
+                  0.95,
+                  0.95,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "stroke": {
+            "shape": {
+              "rounded-rect": {
+                "rect": {
+                  "x0": 532.0,
+                  "y0": 500.0,
+                  "x1": 758.0,
+                  "y1": 700.0
+                },
+                "radii": {
+                  "top_left": 14.0,
+                  "top_right": 14.0,
+                  "bottom_right": 14.0,
+                  "bottom_left": 14.0
+                }
+              }
+            },
+            "stroke": {
+              "width": 1.0,
+              "join": "Miter",
+              "miter_limit": 4.0,
+              "start_cap": "Butt",
+              "end_cap": "Butt",
+              "dash_pattern": [],
+              "dash_offset": 0.0
+            },
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.0,
+                  0.0,
+                  0.0,
+                  0.12
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "glyphs": {
+            "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+            "font_index": 0,
+            "size": 20.0,
+            "normalized_coords": [],
+            "glyphs": [
+              {
+                "id": 54,
+                "x": 564.0,
+                "y": 557.38
+              },
+              {
+                "id": 84,
+                "x": 578.62,
+                "y": 557.38
+              },
+              {
+                "id": 70,
+                "x": 588.2,
+                "y": 557.38
+              },
+              {
+                "id": 83,
+                "x": 599.48,
+                "y": 557.38
+              },
+              {
+                "id": 84,
+                "x": 607.74,
+                "y": 557.38
+              }
+            ],
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.1,
+                  0.1,
+                  0.12,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "shadow": {
+            "shape": {
+              "rounded-rect": {
+                "rect": {
+                  "x0": 778.0,
+                  "y0": 500.0,
+                  "x1": 1004.0,
+                  "y1": 700.0
+                },
+                "radii": {
+                  "top_left": 14.0,
+                  "top_right": 14.0,
+                  "bottom_right": 14.0,
+                  "bottom_left": 14.0
+                }
+              }
+            },
+            "blur_sigma": 4.0,
+            "offset": [
+              0.0,
+              3.0
+            ],
+            "color": {
+              "space": "srgb",
+              "components": [
+                0.0,
+                0.0,
+                0.0,
+                0.22
+              ]
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rounded-rect": {
+                "rect": {
+                  "x0": 778.0,
+                  "y0": 500.0,
+                  "x1": 1004.0,
+                  "y1": 700.0
+                },
+                "radii": {
+                  "top_left": 14.0,
+                  "top_right": 14.0,
+                  "bottom_right": 14.0,
+                  "bottom_left": 14.0
+                }
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.95,
+                  0.95,
+                  0.95,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "stroke": {
+            "shape": {
+              "rounded-rect": {
+                "rect": {
+                  "x0": 778.0,
+                  "y0": 500.0,
+                  "x1": 1004.0,
+                  "y1": 700.0
+                },
+                "radii": {
+                  "top_left": 14.0,
+                  "top_right": 14.0,
+                  "bottom_right": 14.0,
+                  "bottom_left": 14.0
+                }
+              }
+            },
+            "stroke": {
+              "width": 1.0,
+              "join": "Miter",
+              "miter_limit": 4.0,
+              "start_cap": "Butt",
+              "end_cap": "Butt",
+              "dash_pattern": [],
+              "dash_offset": 0.0
+            },
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.0,
+                  0.0,
+                  0.0,
+                  0.12
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "glyphs": {
+            "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+            "font_index": 0,
+            "size": 20.0,
+            "normalized_coords": [],
+            "glyphs": [
+              {
+                "id": 54,
+                "x": 810.0,
+                "y": 557.38
+              },
+              {
+                "id": 84,
+                "x": 824.62,
+                "y": 557.38
+              },
+              {
+                "id": 70,
+                "x": 834.2,
+                "y": 557.38
+              },
+              {
+                "id": 83,
+                "x": 845.48,
+                "y": 557.38
+              },
+              {
+                "id": 84,
+                "x": 853.74,
+                "y": 557.38
+              }
+            ],
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.1,
+                  0.1,
+                  0.12,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "shadow": {
+            "shape": {
+              "rounded-rect": {
+                "rect": {
+                  "x0": 40.0,
+                  "y0": 720.0,
+                  "x1": 266.0,
+                  "y1": 920.0
+                },
+                "radii": {
+                  "top_left": 14.0,
+                  "top_right": 14.0,
+                  "bottom_right": 14.0,
+                  "bottom_left": 14.0
+                }
+              }
+            },
+            "blur_sigma": 4.0,
+            "offset": [
+              0.0,
+              3.0
+            ],
+            "color": {
+              "space": "srgb",
+              "components": [
+                0.0,
+                0.0,
+                0.0,
+                0.22
+              ]
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rounded-rect": {
+                "rect": {
+                  "x0": 40.0,
+                  "y0": 720.0,
+                  "x1": 266.0,
+                  "y1": 920.0
+                },
+                "radii": {
+                  "top_left": 14.0,
+                  "top_right": 14.0,
+                  "bottom_right": 14.0,
+                  "bottom_left": 14.0
+                }
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.95,
+                  0.95,
+                  0.95,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "stroke": {
+            "shape": {
+              "rounded-rect": {
+                "rect": {
+                  "x0": 40.0,
+                  "y0": 720.0,
+                  "x1": 266.0,
+                  "y1": 920.0
+                },
+                "radii": {
+                  "top_left": 14.0,
+                  "top_right": 14.0,
+                  "bottom_right": 14.0,
+                  "bottom_left": 14.0
+                }
+              }
+            },
+            "stroke": {
+              "width": 1.0,
+              "join": "Miter",
+              "miter_limit": 4.0,
+              "start_cap": "Butt",
+              "end_cap": "Butt",
+              "dash_pattern": [],
+              "dash_offset": 0.0
+            },
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.0,
+                  0.0,
+                  0.0,
+                  0.12
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "glyphs": {
+            "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+            "font_index": 0,
+            "size": 20.0,
+            "normalized_coords": [],
+            "glyphs": [
+              {
+                "id": 54,
+                "x": 72.0,
+                "y": 777.38
+              },
+              {
+                "id": 84,
+                "x": 86.619995,
+                "y": 777.38
+              },
+              {
+                "id": 70,
+                "x": 96.2,
+                "y": 777.38
+              },
+              {
+                "id": 83,
+                "x": 107.479996,
+                "y": 777.38
+              },
+              {
+                "id": 84,
+                "x": 115.74,
+                "y": 777.38
+              }
+            ],
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.1,
+                  0.1,
+                  0.12,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "shadow": {
+            "shape": {
+              "rounded-rect": {
+                "rect": {
+                  "x0": 286.0,
+                  "y0": 720.0,
+                  "x1": 512.0,
+                  "y1": 920.0
+                },
+                "radii": {
+                  "top_left": 14.0,
+                  "top_right": 14.0,
+                  "bottom_right": 14.0,
+                  "bottom_left": 14.0
+                }
+              }
+            },
+            "blur_sigma": 4.0,
+            "offset": [
+              0.0,
+              3.0
+            ],
+            "color": {
+              "space": "srgb",
+              "components": [
+                0.0,
+                0.0,
+                0.0,
+                0.22
+              ]
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rounded-rect": {
+                "rect": {
+                  "x0": 286.0,
+                  "y0": 720.0,
+                  "x1": 512.0,
+                  "y1": 920.0
+                },
+                "radii": {
+                  "top_left": 14.0,
+                  "top_right": 14.0,
+                  "bottom_right": 14.0,
+                  "bottom_left": 14.0
+                }
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.95,
+                  0.95,
+                  0.95,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "stroke": {
+            "shape": {
+              "rounded-rect": {
+                "rect": {
+                  "x0": 286.0,
+                  "y0": 720.0,
+                  "x1": 512.0,
+                  "y1": 920.0
+                },
+                "radii": {
+                  "top_left": 14.0,
+                  "top_right": 14.0,
+                  "bottom_right": 14.0,
+                  "bottom_left": 14.0
+                }
+              }
+            },
+            "stroke": {
+              "width": 1.0,
+              "join": "Miter",
+              "miter_limit": 4.0,
+              "start_cap": "Butt",
+              "end_cap": "Butt",
+              "dash_pattern": [],
+              "dash_offset": 0.0
+            },
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.0,
+                  0.0,
+                  0.0,
+                  0.12
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "glyphs": {
+            "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+            "font_index": 0,
+            "size": 20.0,
+            "normalized_coords": [],
+            "glyphs": [
+              {
+                "id": 54,
+                "x": 318.0,
+                "y": 777.38
+              },
+              {
+                "id": 84,
+                "x": 332.62,
+                "y": 777.38
+              },
+              {
+                "id": 70,
+                "x": 342.2,
+                "y": 777.38
+              },
+              {
+                "id": 83,
+                "x": 353.48,
+                "y": 777.38
+              },
+              {
+                "id": 84,
+                "x": 361.74,
+                "y": 777.38
+              }
+            ],
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.1,
+                  0.1,
+                  0.12,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "shadow": {
+            "shape": {
+              "rounded-rect": {
+                "rect": {
+                  "x0": 532.0,
+                  "y0": 720.0,
+                  "x1": 758.0,
+                  "y1": 920.0
+                },
+                "radii": {
+                  "top_left": 14.0,
+                  "top_right": 14.0,
+                  "bottom_right": 14.0,
+                  "bottom_left": 14.0
+                }
+              }
+            },
+            "blur_sigma": 4.0,
+            "offset": [
+              0.0,
+              3.0
+            ],
+            "color": {
+              "space": "srgb",
+              "components": [
+                0.0,
+                0.0,
+                0.0,
+                0.22
+              ]
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rounded-rect": {
+                "rect": {
+                  "x0": 532.0,
+                  "y0": 720.0,
+                  "x1": 758.0,
+                  "y1": 920.0
+                },
+                "radii": {
+                  "top_left": 14.0,
+                  "top_right": 14.0,
+                  "bottom_right": 14.0,
+                  "bottom_left": 14.0
+                }
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.95,
+                  0.95,
+                  0.95,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "stroke": {
+            "shape": {
+              "rounded-rect": {
+                "rect": {
+                  "x0": 532.0,
+                  "y0": 720.0,
+                  "x1": 758.0,
+                  "y1": 920.0
+                },
+                "radii": {
+                  "top_left": 14.0,
+                  "top_right": 14.0,
+                  "bottom_right": 14.0,
+                  "bottom_left": 14.0
+                }
+              }
+            },
+            "stroke": {
+              "width": 1.0,
+              "join": "Miter",
+              "miter_limit": 4.0,
+              "start_cap": "Butt",
+              "end_cap": "Butt",
+              "dash_pattern": [],
+              "dash_offset": 0.0
+            },
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.0,
+                  0.0,
+                  0.0,
+                  0.12
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "glyphs": {
+            "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+            "font_index": 0,
+            "size": 20.0,
+            "normalized_coords": [],
+            "glyphs": [
+              {
+                "id": 54,
+                "x": 564.0,
+                "y": 777.38
+              },
+              {
+                "id": 84,
+                "x": 578.62,
+                "y": 777.38
+              },
+              {
+                "id": 70,
+                "x": 588.2,
+                "y": 777.38
+              },
+              {
+                "id": 83,
+                "x": 599.48,
+                "y": 777.38
+              },
+              {
+                "id": 84,
+                "x": 607.74,
+                "y": 777.38
+              }
+            ],
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.1,
+                  0.1,
+                  0.12,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "shadow": {
+            "shape": {
+              "rounded-rect": {
+                "rect": {
+                  "x0": 778.0,
+                  "y0": 720.0,
+                  "x1": 1004.0,
+                  "y1": 920.0
+                },
+                "radii": {
+                  "top_left": 14.0,
+                  "top_right": 14.0,
+                  "bottom_right": 14.0,
+                  "bottom_left": 14.0
+                }
+              }
+            },
+            "blur_sigma": 4.0,
+            "offset": [
+              0.0,
+              3.0
+            ],
+            "color": {
+              "space": "srgb",
+              "components": [
+                0.0,
+                0.0,
+                0.0,
+                0.22
+              ]
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rounded-rect": {
+                "rect": {
+                  "x0": 778.0,
+                  "y0": 720.0,
+                  "x1": 1004.0,
+                  "y1": 920.0
+                },
+                "radii": {
+                  "top_left": 14.0,
+                  "top_right": 14.0,
+                  "bottom_right": 14.0,
+                  "bottom_left": 14.0
+                }
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.95,
+                  0.95,
+                  0.95,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "stroke": {
+            "shape": {
+              "rounded-rect": {
+                "rect": {
+                  "x0": 778.0,
+                  "y0": 720.0,
+                  "x1": 1004.0,
+                  "y1": 920.0
+                },
+                "radii": {
+                  "top_left": 14.0,
+                  "top_right": 14.0,
+                  "bottom_right": 14.0,
+                  "bottom_left": 14.0
+                }
+              }
+            },
+            "stroke": {
+              "width": 1.0,
+              "join": "Miter",
+              "miter_limit": 4.0,
+              "start_cap": "Butt",
+              "end_cap": "Butt",
+              "dash_pattern": [],
+              "dash_offset": 0.0
+            },
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.0,
+                  0.0,
+                  0.0,
+                  0.12
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "glyphs": {
+            "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+            "font_index": 0,
+            "size": 20.0,
+            "normalized_coords": [],
+            "glyphs": [
+              {
+                "id": 54,
+                "x": 810.0,
+                "y": 777.38
+              },
+              {
+                "id": 84,
+                "x": 824.62,
+                "y": 777.38
+              },
+              {
+                "id": 70,
+                "x": 834.2,
+                "y": 777.38
+              },
+              {
+                "id": 83,
+                "x": 845.48,
+                "y": 777.38
+              },
+              {
+                "id": 84,
+                "x": 853.74,
+                "y": 777.38
+              }
+            ],
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.1,
+                  0.1,
+                  0.12,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "stroke": {
+            "shape": {
+              "rect": {
+                "x0": 40.0,
+                "y0": 1000.0,
+                "x1": 984.0,
+                "y1": 1300.0
+              }
+            },
+            "stroke": {
+              "width": 1.0,
+              "join": "Miter",
+              "miter_limit": 4.0,
+              "start_cap": "Butt",
+              "end_cap": "Butt",
+              "dash_pattern": [],
+              "dash_offset": 0.0
+            },
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.0,
+                  0.0,
+                  0.0,
+                  0.25
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rect": {
+                "x0": 56.0,
+                "y0": 1260.0,
+                "x1": 84.0,
+                "y1": 1300.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.2,
+                  0.5,
+                  0.9,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rect": {
+                "x0": 95.0,
+                "y0": 1223.0,
+                "x1": 123.0,
+                "y1": 1300.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.2,
+                  0.5,
+                  0.9,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rect": {
+                "x0": 134.0,
+                "y0": 1186.0,
+                "x1": 162.0,
+                "y1": 1300.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.2,
+                  0.5,
+                  0.9,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rect": {
+                "x0": 173.0,
+                "y0": 1149.0,
+                "x1": 201.0,
+                "y1": 1300.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.2,
+                  0.5,
+                  0.9,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rect": {
+                "x0": 212.0,
+                "y0": 1112.0,
+                "x1": 240.0,
+                "y1": 1300.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.2,
+                  0.5,
+                  0.9,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rect": {
+                "x0": 251.0,
+                "y0": 1075.0,
+                "x1": 279.0,
+                "y1": 1300.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.2,
+                  0.5,
+                  0.9,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rect": {
+                "x0": 290.0,
+                "y0": 1238.0,
+                "x1": 318.0,
+                "y1": 1300.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.2,
+                  0.5,
+                  0.9,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rect": {
+                "x0": 329.0,
+                "y0": 1257.0,
+                "x1": 357.0,
+                "y1": 1300.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.2,
+                  0.5,
+                  0.9,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rect": {
+                "x0": 368.0,
+                "y0": 1220.0,
+                "x1": 396.0,
+                "y1": 1300.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.2,
+                  0.5,
+                  0.9,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rect": {
+                "x0": 407.0,
+                "y0": 1183.0,
+                "x1": 435.0,
+                "y1": 1300.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.2,
+                  0.5,
+                  0.9,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rect": {
+                "x0": 446.0,
+                "y0": 1146.0,
+                "x1": 474.0,
+                "y1": 1300.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.2,
+                  0.5,
+                  0.9,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rect": {
+                "x0": 485.0,
+                "y0": 1109.0,
+                "x1": 513.0,
+                "y1": 1300.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.2,
+                  0.5,
+                  0.9,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rect": {
+                "x0": 524.0,
+                "y0": 1072.0,
+                "x1": 552.0,
+                "y1": 1300.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.2,
+                  0.5,
+                  0.9,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rect": {
+                "x0": 563.0,
+                "y0": 1235.0,
+                "x1": 591.0,
+                "y1": 1300.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.2,
+                  0.5,
+                  0.9,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rect": {
+                "x0": 602.0,
+                "y0": 1254.0,
+                "x1": 630.0,
+                "y1": 1300.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.2,
+                  0.5,
+                  0.9,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rect": {
+                "x0": 641.0,
+                "y0": 1217.0,
+                "x1": 669.0,
+                "y1": 1300.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.2,
+                  0.5,
+                  0.9,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rect": {
+                "x0": 680.0,
+                "y0": 1180.0,
+                "x1": 708.0,
+                "y1": 1300.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.2,
+                  0.5,
+                  0.9,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rect": {
+                "x0": 719.0,
+                "y0": 1143.0,
+                "x1": 747.0,
+                "y1": 1300.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.2,
+                  0.5,
+                  0.9,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rect": {
+                "x0": 758.0,
+                "y0": 1106.0,
+                "x1": 786.0,
+                "y1": 1300.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.2,
+                  0.5,
+                  0.9,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rect": {
+                "x0": 797.0,
+                "y0": 1069.0,
+                "x1": 825.0,
+                "y1": 1300.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.2,
+                  0.5,
+                  0.9,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rect": {
+                "x0": 836.0,
+                "y0": 1232.0,
+                "x1": 864.0,
+                "y1": 1300.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.2,
+                  0.5,
+                  0.9,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rect": {
+                "x0": 875.0,
+                "y0": 1251.0,
+                "x1": 903.0,
+                "y1": 1300.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.2,
+                  0.5,
+                  0.9,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rect": {
+                "x0": 914.0,
+                "y0": 1214.0,
+                "x1": 942.0,
+                "y1": 1300.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.2,
+                  0.5,
+                  0.9,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rect": {
+                "x0": 953.0,
+                "y0": 1177.0,
+                "x1": 981.0,
+                "y1": 1300.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.2,
+                  0.5,
+                  0.9,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "glyphs": {
+            "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+            "font_index": 0,
+            "size": 48.0,
+            "normalized_coords": [
+              {
+                "tag": "wght",
+                "value": 0.6100464
+              }
+            ],
+            "glyphs": [
+              {
+                "id": 17,
+                "x": 72.0,
+                "y": 303.312
+              },
+              {
+                "id": 17,
+                "x": 99.456,
+                "y": 303.312
+              }
+            ],
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.1,
+                  0.4,
+                  0.9,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rect": {
+                "x0": 992.0,
+                "y0": 1260.0,
+                "x1": 1020.0,
+                "y1": 1300.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.2,
+                  0.5,
+                  0.9,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      }
+    ],
+    "live": [
+      {
+        "item": 77,
+        "frames": [
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 17,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 17,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 17,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 18,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 17,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 19,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 17,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 20,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 17,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 21,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 17,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 22,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 17,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 23,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 17,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 24,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 17,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 25,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 17,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 26,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 18,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 17,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 18,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 18,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 18,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 19,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 18,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 20,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 18,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 21,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 18,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 22,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 18,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 23,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 18,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 24,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 18,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 25,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 18,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 26,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 19,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 17,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 19,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 18,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 19,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 19,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 19,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 20,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 19,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 21,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 19,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 22,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 19,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 23,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 19,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 24,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 19,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 25,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 19,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 26,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 20,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 17,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 20,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 18,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 20,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 19,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 20,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 20,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 20,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 21,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 20,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 22,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 20,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 23,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 20,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 24,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 20,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 25,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 20,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 26,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 21,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 17,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 21,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 18,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 21,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 19,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 21,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 20,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 21,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 21,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 21,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 22,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 21,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 23,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 21,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 24,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 21,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 25,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 21,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 26,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 22,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 17,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 22,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 18,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 22,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 19,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 22,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 20,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 22,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 21,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 22,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 22,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 22,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 23,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 22,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 24,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 22,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 25,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "glyphs": {
+              "font": "d1da604d654af857565462ef4a009d7736dd0786ecf905a1530f8f9b39de3a0a",
+              "font_index": 0,
+              "size": 48.0,
+              "normalized_coords": [
+                {
+                  "tag": "wght",
+                  "value": 0.6100464
+                }
+              ],
+              "glyphs": [
+                {
+                  "id": 22,
+                  "x": 72.0,
+                  "y": 303.312
+                },
+                {
+                  "id": 26,
+                  "x": 99.456,
+                  "y": 303.312
+                }
+              ],
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.1,
+                    0.4,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          }
+        ]
+      },
+      {
+        "item": 78,
+        "frames": [
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1260.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1257.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1254.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1251.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1248.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1245.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1242.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1239.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1236.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1233.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1230.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1227.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1224.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1221.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1218.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1215.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1212.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1209.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1206.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1203.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1200.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1197.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1194.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1191.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1188.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1185.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1182.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1179.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1176.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1173.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1170.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1167.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1164.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1161.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1158.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1155.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1152.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1149.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1146.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1143.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1140.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1137.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1134.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1131.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1128.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1125.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1122.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1119.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1116.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1113.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1110.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1107.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1104.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1101.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1098.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1095.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1092.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1089.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1086.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "fill": {
+              "shape": {
+                "rect": {
+                  "x0": 992.0,
+                  "y0": 1083.0,
+                  "x1": 1020.0,
+                  "y1": 1300.0
+                }
+              },
+              "rule": "non-zero",
+              "paint": {
+                "solid": {
+                  "space": "srgb",
+                  "components": [
+                    0.2,
+                    0.5,
+                    0.9,
+                    1.0
+                  ]
+                }
+              }
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

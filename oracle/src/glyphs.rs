@@ -500,6 +500,9 @@ fn node_to_item(node: Node, place: Affine, scene_rect: Rect) -> Item {
             clip: clip.map(|p| Shape::Path { path: place * p }),
             opacity: 1.0,
             blend,
+            scroll_offset: kurbo::Vec2::ZERO,
+            motion: None,
+            live: Vec::new(),
             items: children
                 .into_iter()
                 .map(|n| node_to_item(n, place, scene_rect))

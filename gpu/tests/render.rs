@@ -173,6 +173,126 @@ fn an_earlier_surfaces_uploads_survive_a_shared_buffer_grow()
     Ok(())
 }
 
+/// Sixty timed frames of a text-and-fill scene that grows the atlas and the
+/// shared buffers: every frame must finish within the wait bound, and when
+/// the adapter samples timestamps the whole-frame GPU time must come back
+/// alongside the per-pass ones (pass-boundary timestamps only).
+#[test]
+fn many_timed_frames_complete_with_whole_frame_gpu_time() -> Result<(), Box<dyn std::error::Error>>
+{
+    let Some(engine) = timed_engine(wgpu::Backends::all()) else {
+        return Ok(());
+    };
+    many_timed_frames(&engine)
+}
+
+/// The Metal-only counterpart: macOS always has a Metal adapter, so this
+/// fails rather than skips when it is missing, and checks that the Apple
+/// stage-boundary sampling is reported as pass-boundary support.
+#[test]
+#[cfg(target_os = "macos")]
+fn metal_times_many_frames_at_pass_boundaries() -> Result<(), Box<dyn std::error::Error>> {
+    let engine = timed_engine(wgpu::Backends::METAL).expect("a Metal adapter");
+    assert_eq!(engine.info().backend, "Metal", "{:?}", engine.info());
+    assert_ne!(
+        engine.info().timestamps,
+        cherenkov_gpu::TimestampSupport::Encoders,
+        "Metal samples at stage boundaries only: {:?}",
+        engine.info()
+    );
+    many_timed_frames(&engine)
+}
+
+/// A timestamping engine on `backends` with a short wait bound, or `None`
+/// when they have no adapter.
+fn timed_engine(backends: wgpu::Backends) -> Option<Engine<Gpu>> {
+    match Engine::new(GpuConfig {
+        backends,
+        timestamps: true,
+        wait_timeout: std::time::Duration::from_secs(20),
+        ..GpuConfig::default()
+    }) {
+        Ok(engine) => Some(engine),
+        Err(EngineError::NoAdapter) => None,
+        Err(e) => panic!("engine init failed: {e}"),
+    }
+}
+
+fn many_timed_frames(engine: &Engine<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
+    let timed = engine.info().timestamps != cherenkov_gpu::TimestampSupport::Unsupported;
+    let font = engine.font(cherenkov_gpu::FontSource::bytes(std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../scenes/fonts/NotoSans.ttf"
+    ))?))?;
+    let surface = engine.surface(Offscreen::new((256, 256), OffscreenFormat::LinearF16))?;
+    let mut any_timed = false;
+    for frame in 0..60u32 {
+        // A different glyph size each frame keeps rasterising new atlas
+        // entries so the atlas grows and eventually clears.
+        let run = cherenkov::GlyphRun {
+            font: font.id(),
+            size: 12.0 + f32::from(u16::try_from(frame)?),
+            coords: Vec::new(),
+            glyphs: (0..40u16)
+                .map(|i| cherenkov::Glyph {
+                    id: 1 + (u32::from(i) + frame) % 60,
+                    x: f32::from(i % 10) * 24.0,
+                    y: 40.0 + f32::from(i / 10) * 50.0,
+                    transform: None,
+                })
+                .collect(),
+            style: cherenkov::GlyphStyle::Fill,
+        };
+        surface.update(|tx| {
+            tx[surface.root()].content(surface.record(|c| {
+                for i in 0..2000u32 {
+                    let x = f64::from(i % 50) * 5.0;
+                    let y = f64::from(i / 50) * 6.0;
+                    c.fill(
+                        Rect::new(x, y, x + 4.0, y + 4.0),
+                        WorkingColor::new([0., 1., 0., 1.]),
+                    );
+                }
+                c.glyphs(&run, WorkingColor::WHITE);
+            }));
+        });
+        let next = engine.render(cherenkov_gpu::FrameTime::now())?;
+        assert_eq!(next, Next::Idle, "frame {frame}");
+        let stats = engine.stats();
+        assert!(stats.passes > 0, "frame {frame} drew nothing: {stats:?}");
+        if timed {
+            // Resolves land a frame or more late: once timing has
+            // arrived the most recent timed frame still spans its
+            // passes, and this scene's pass count is constant.
+            if let Some(gpu) = stats.gpu_seconds {
+                any_timed = true;
+                assert_eq!(
+                    stats.passes_timed.len(),
+                    stats.passes as usize,
+                    "frame {frame}: every pass is timed: {stats:?}"
+                );
+                let passes: f64 = stats.passes_timed.iter().map(|p| p.gpu_seconds).sum();
+                assert!(
+                    gpu > 0.0 && gpu >= passes * 0.99,
+                    "frame {frame}: whole frame {gpu}s must span its passes {passes}s"
+                );
+            }
+        } else {
+            assert!(stats.gpu_seconds.is_none() && stats.passes_timed.is_empty());
+        }
+    }
+    if timed {
+        assert!(
+            any_timed,
+            "60 frames on a timed engine produced no GPU timing"
+        );
+    }
+    let readback = surface.readback()?;
+    let [r, g, ..] = readback.pixels[(2 * readback.width + 2) as usize];
+    assert!(g > 0.5 && r < 0.1, "fills must still render: {r} {g}");
+    Ok(())
+}
+
 /// A `Shadow` immediately followed by an opaque solid fill of the same
 /// shape lowers to up-to-four border quads: the covered interior is
 /// skipped. An opaque card's result must be pixel-identical outside the

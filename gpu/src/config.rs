@@ -4,6 +4,7 @@
 //! Engine configuration and reporting types.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// A byte count.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -73,6 +74,23 @@ pub struct GpuInfo {
     pub driver: String,
     /// Driver version detail.
     pub driver_info: String,
+    /// Where the adapter can sample GPU timestamps.
+    pub timestamps: TimestampSupport,
+}
+
+/// Where an adapter can sample GPU timestamps. The renderer only ever
+/// samples at pass boundaries, which every supporting level offers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimestampSupport {
+    /// No timestamp queries; [`FrameStats::gpu_seconds`] stays `None`.
+    ///
+    /// [`FrameStats::gpu_seconds`]: crate::FrameStats::gpu_seconds
+    Unsupported,
+    /// Only at render and compute pass boundaries (Apple GPUs on Metal
+    /// sample at stage boundaries).
+    PassBoundaries,
+    /// Anywhere inside a command encoder as well as at pass boundaries.
+    Encoders,
 }
 
 /// The texture format used for intermediate (isolation) render targets.
@@ -111,6 +129,13 @@ pub struct GpuConfig {
     /// The isolation (scratch) texture format. Defaults to
     /// [`ScratchFormat::LinearF16`].
     pub scratch_format: ScratchFormat,
+    /// The longest the render thread blocks on the GPU for one submission
+    /// (frame passes, timestamp or pixel readback) before it fails with
+    /// [`RenderError::Timeout`] instead of spinning forever. Defaults to
+    /// 30 seconds.
+    ///
+    /// [`RenderError::Timeout`]: crate::RenderError::Timeout
+    pub wait_timeout: Duration,
 }
 
 impl Default for GpuConfig {
@@ -122,6 +147,7 @@ impl Default for GpuConfig {
             budget: Budget::default(),
             pipeline_cache: None,
             scratch_format: ScratchFormat::default(),
+            wait_timeout: Duration::from_secs(30),
         }
     }
 }

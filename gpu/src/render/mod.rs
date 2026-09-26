@@ -12,13 +12,13 @@ mod raster;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use cherenkov::ContentChange;
 
-use crate::config::{GpuConfig, GpuInfo, MemoryUsage, Pressure, ScratchFormat};
+use crate::config::{GpuConfig, GpuInfo, MemoryUsage, Pressure, ScratchFormat, TimestampSupport};
 use crate::error::{EngineError, RenderError, SurfaceError};
 use crate::message::{ChangeSet, LayerId, LayerOp, Message, SurfaceId};
 use crate::surface::{FrameStats, Next, PassTiming, Readback};
@@ -232,8 +232,11 @@ struct Renderer {
     /// A spare staging buffer recycled between frames; `None` while a
     /// frame's resolve owns one.
     query_staging: Option<wgpu::Buffer>,
-    /// The query set's capacity in queries; indices 0/1 bracket the frame,
-    /// `2 + 2i` each pass.
+    /// The query set's capacity in queries; pass `i` writes `2i` at its
+    /// start and `2i + 1` at its end. The frame's GPU time runs from the
+    /// first pass's start to the last pass's end: pass boundaries are the
+    /// one timestamp position every backend with `TIMESTAMP_QUERY`
+    /// supports (Metal on Apple GPUs samples only at stage boundaries).
     query_capacity: u32,
     /// Frames whose timestamp resolve was submitted but whose staging
     /// buffer is not mapped yet — read on a later call, in order.
@@ -242,7 +245,8 @@ struct Renderer {
     frame_pass_count: u32,
     /// `(name, width, height, format)` of each encoded pass this frame.
     pass_meta: Vec<PassMeta>,
-    timestamps_inside: bool,
+    /// Bound on every GPU wait; see [`GpuConfig::wait_timeout`].
+    wait_timeout: Duration,
     max_texture: u32,
 }
 
@@ -273,14 +277,15 @@ enum PendingOrigin {
 /// GPU idle.
 struct PendingTimestamps {
     staging: wgpu::Buffer,
-    /// Queries resolved: `2 + 2 * passes`.
+    /// Queries resolved: `2 * passes`.
     count: u32,
     /// Pass metadata for the per-pass report.
     meta: Vec<PassMeta>,
     /// Whether `map_async` was requested for `staging`.
     map_requested: bool,
-    /// Set by the map callback once the copy is readable.
-    ready: Arc<AtomicBool>,
+    /// Set by the map callback: 1 once the copy is readable, 2 on a
+    /// failed map.
+    ready: Arc<AtomicU8>,
 }
 
 /// One encoded pass's report metadata.
@@ -330,7 +335,17 @@ fn grow_preserving(
             label: Some("buffer grow"),
         });
         encoder.copy_buffer_to_buffer(old, 0, &new, 0, preserve);
-        queue.submit([encoder.finish()]);
+        let submission = queue.submit([encoder.finish()]);
+        tracing::debug!(
+            label,
+            from = old.size(),
+            to = size,
+            preserve,
+            ?submission,
+            "buffer grown"
+        );
+    } else {
+        tracing::debug!(label, from = old.size(), to = size, "buffer grown");
     }
     new
 }
@@ -354,12 +369,27 @@ fn create_device(
         })
         .ok_or(EngineError::NoAdapter)?;
     let supported = adapter.features();
+    let info = adapter.get_info();
+    tracing::info!(
+        name = %info.name,
+        backend = ?info.backend,
+        device_type = ?info.device_type,
+        driver = %info.driver,
+        driver_info = %info.driver_info,
+        timestamp_query = supported.contains(wgpu::Features::TIMESTAMP_QUERY),
+        timestamps_inside_encoders =
+            supported.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS),
+        timestamps_inside_passes = supported.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES),
+        "adapter"
+    );
+    tracing::debug!(limits = ?adapter.limits(), "adapter limits");
     let mut required = wgpu::Features::empty();
+    // Only pass-boundary timestamps are requested: Metal on Apple GPUs
+    // advertises `TIMESTAMP_QUERY_INSIDE_ENCODERS` but samples only at
+    // stage boundaries, so an encoder-level `write_timestamp` goes through
+    // a dummy blit encoder that wgpu itself documents as unreliable.
     if config.timestamps && supported.contains(wgpu::Features::TIMESTAMP_QUERY) {
         required |= wgpu::Features::TIMESTAMP_QUERY;
-    }
-    if supported.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS) {
-        required |= wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
     }
     if config.pipeline_cache.is_some() && supported.contains(wgpu::Features::PIPELINE_CACHE) {
         required |= wgpu::Features::PIPELINE_CACHE;
@@ -373,6 +403,7 @@ fn create_device(
         trace: wgpu::Trace::Off,
     }))
     .map_err(|e| EngineError::RequestDevice(format!("{e}")))?;
+    tracing::info!(features = ?device.features(), "device");
     Ok((adapter, device, queue))
 }
 
@@ -637,6 +668,15 @@ fn create_target(
 pub fn run(config: GpuConfig, rx: Receiver<Message>, init_tx: Sender<Result<Init, EngineError>>) {
     let init = create_device(&config).and_then(|(adapter, device, queue)| {
         let info = adapter.get_info();
+        let supported = adapter.features();
+        let timestamp_support =
+            if supported.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS) {
+                TimestampSupport::Encoders
+            } else if supported.contains(wgpu::Features::TIMESTAMP_QUERY) {
+                TimestampSupport::PassBoundaries
+            } else {
+                TimestampSupport::Unsupported
+            };
         let (layout0, layout1) = create_layouts(&device);
         let scratch_format = scratch_wgpu(config.scratch_format);
         // Three specialised fragment shaders from one source file: the
@@ -729,9 +769,6 @@ pub fn run(config: GpuConfig, rx: Receiver<Message>, init_tx: Sender<Result<Init
             TARGET_FORMAT,
         );
         let timestamps = device.features().contains(wgpu::Features::TIMESTAMP_QUERY);
-        let timestamps_inside = device
-            .features()
-            .contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS);
         let (query_set, query_buffer) = if timestamps {
             (
                 Some(device.create_query_set(&wgpu::QuerySetDescriptor {
@@ -749,7 +786,7 @@ pub fn run(config: GpuConfig, rx: Receiver<Message>, init_tx: Sender<Result<Init
         } else {
             (None, None)
         };
-        // The initial query set holds the two frame-bracketing queries.
+        // The initial query set holds one pass's two queries.
         let query_capacity = if query_set.is_some() { 2 } else { 0 };
         let renderer = Renderer {
             max_texture: device.limits().max_texture_dimension_2d,
@@ -781,11 +818,11 @@ pub fn run(config: GpuConfig, rx: Receiver<Message>, init_tx: Sender<Result<Init
             pending_timestamps: VecDeque::new(),
             frame_pass_count: 0,
             pass_meta: Vec::new(),
-            timestamps_inside,
+            wait_timeout: config.wait_timeout,
         };
-        Ok((renderer, info))
+        Ok((renderer, info, timestamp_support))
     });
-    let (mut renderer, info) = match init {
+    let (mut renderer, info, timestamp_support) = match init {
         Ok(pair) => pair,
         Err(e) => {
             let _ = init_tx.send(Err(e));
@@ -801,6 +838,7 @@ pub fn run(config: GpuConfig, rx: Receiver<Message>, init_tx: Sender<Result<Init
             device_type: format!("{:?}", info.device_type),
             driver: info.driver,
             driver_info: info.driver_info,
+            timestamps: timestamp_support,
         },
     }));
     while let Ok(message) = rx.recv() {
@@ -1320,18 +1358,21 @@ impl Renderer {
             }
         }
         stats.phases.lower_seconds = t_lower.elapsed().as_secs_f64();
+        tracing::debug!(
+            surfaces = dirty.len(),
+            lower_ms = stats.phases.lower_seconds * 1e3,
+            ok = result.is_ok(),
+            "frame lowered"
+        );
         if result.is_ok() {
-            let mut t = Instant::now();
-            self.stamp(0);
-            stats.phases.stamp_seconds += t.elapsed().as_secs_f64();
-            t = Instant::now();
+            let t = Instant::now();
             for &id in &dirty {
                 self.encode_surface(id, &mut stats);
             }
             stats.phases.encode_seconds = t.elapsed().as_secs_f64();
-            if self.timestamps {
-                t = Instant::now();
-                self.stamp_and_resolve(2 + 2 * self.frame_pass_count);
+            if self.timestamps && self.frame_pass_count > 0 {
+                let t = Instant::now();
+                self.resolve_timestamps(2 * self.frame_pass_count);
                 stats.phases.stamp_seconds += t.elapsed().as_secs_f64();
             }
         }
@@ -1395,12 +1436,18 @@ impl Renderer {
                     Err(RenderError::AtlasFull) => {
                         if self.atlas.size() < self.atlas.cap() {
                             self.atlas.grow(&self.device);
+                            tracing::debug!(
+                                size = self.atlas.size(),
+                                generation = self.atlas.generation(),
+                                "atlas grown"
+                            );
                         } else if cleared {
                             *result = Err(RenderError::AtlasExhausted);
                             break 'batch results;
                         } else {
                             self.atlas.clear();
                             cleared = true;
+                            tracing::debug!(size = self.atlas.size(), "atlas cleared");
                         }
                         // Growing or clearing emptied the atlas: every
                         // hit any lowering took is now a miss, so lower
@@ -1562,7 +1609,7 @@ impl Renderer {
             let passes = self.surfaces.get(&id).map_or(0, |s| {
                 u32::try_from(s.frame.passes.len()).unwrap_or(u32::MAX)
             });
-            self.ensure_query_capacity(2 + 2 * (globals_base + passes));
+            self.ensure_query_capacity(2 * (globals_base + passes));
         }
         // Scratch textures for the frame's deepest isolation level.
         let Some(surf) = self.surfaces.get_mut(&id) else {
@@ -1875,8 +1922,8 @@ impl Renderer {
                     .as_ref()
                     .map(|qs| wgpu::RenderPassTimestampWrites {
                         query_set: qs,
-                        beginning_of_pass_write_index: Some(2 + 2 * pass_index),
-                        end_of_pass_write_index: Some(3 + 2 * pass_index),
+                        beginning_of_pass_write_index: Some(2 * pass_index),
+                        end_of_pass_write_index: Some(2 * pass_index + 1),
                     });
             // Only the timestamp path reads `pass_meta`; skip the
             // allocation when timing is off.
@@ -1979,41 +2026,86 @@ impl Renderer {
                 );
             }
         }
-        self.queue.submit([encoder.finish()]);
+        let submission = self.queue.submit([encoder.finish()]);
+        tracing::trace!(
+            surface = ?id,
+            passes = surf.frame.passes.len(),
+            instances = surf.frame.instances.len(),
+            ?submission,
+            "surface submitted"
+        );
         stats.passes += u32::try_from(surf.frame.passes.len()).unwrap_or(u32::MAX);
         stats.instances += u32::try_from(surf.frame.instances.len()).unwrap_or(u32::MAX);
         surf.dirty = false;
     }
 
-    /// Writes a timestamp query in its own submission, queue-ordered
-    /// after all prior work — never draining.
-    fn stamp(&self, index: u32) {
-        let Some(qs) = &self.query_set else {
-            return;
-        };
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("timestamp"),
-            });
-        if self.timestamps_inside {
-            encoder.write_timestamp(qs, index);
-        } else {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("timestamp"),
-                timestamp_writes: None,
-            });
-            pass.write_timestamp(qs, index);
+    /// Blocks until `submission` has completed, for at most
+    /// [`Renderer::wait_timeout`]; `what` names the work for the error.
+    fn wait(
+        &self,
+        submission: wgpu::SubmissionIndex,
+        what: &'static str,
+    ) -> Result<(), RenderError> {
+        let start = Instant::now();
+        let status = self.device.poll(wgpu::PollType::Wait {
+            submission_index: Some(submission),
+            timeout: Some(self.wait_timeout),
+        });
+        let elapsed = start.elapsed();
+        match status {
+            Ok(status) => {
+                tracing::trace!(
+                    what,
+                    ?status,
+                    wait_ms = elapsed.as_secs_f64() * 1e3,
+                    "waited"
+                );
+                Ok(())
+            }
+            Err(wgpu::PollError::Timeout) => {
+                tracing::error!(what, ?elapsed, "GPU wait timed out");
+                Err(RenderError::Timeout {
+                    what,
+                    timeout: self.wait_timeout,
+                })
+            }
+            Err(e) => {
+                tracing::error!(what, %e, "GPU wait failed");
+                Err(RenderError::DeviceLost)
+            }
         }
-        self.queue.submit([encoder.finish()]);
     }
 
-    /// Writes the frame-end timestamp, resolves this frame's queries into
-    /// a staging buffer and queues the read — all inside one submission
-    /// after the frame's encodes, so the GPU resolves them as soon as the
-    /// passes finish. [`Self::drain_timestamps`] maps the buffer on a
-    /// later call without stalling this frame.
-    fn stamp_and_resolve(&mut self, count: u32) {
+    /// Maps `slice` for reading once `submission` lands and blocks
+    /// (bounded) until the map result arrives; `what` names the readback
+    /// for tracing and errors.
+    fn map_read(
+        &self,
+        slice: wgpu::BufferSlice<'_>,
+        submission: wgpu::SubmissionIndex,
+        what: &'static str,
+    ) -> Result<(), RenderError> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tracing::trace!(what, "map requested");
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        self.wait(submission, what)?;
+        match rx.try_recv() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(RenderError::Readback(format!("{what}: map failed: {e}"))),
+            Err(_) => Err(RenderError::Readback(format!(
+                "{what}: the map callback did not run after the wait"
+            ))),
+        }
+    }
+
+    /// Resolves this frame's timestamp queries into a staging buffer and
+    /// queues the read — all inside one submission after the frame's
+    /// encodes, so the GPU resolves them as soon as the passes finish.
+    /// [`Self::drain_timestamps`] maps the buffer on a later call without
+    /// stalling this frame.
+    fn resolve_timestamps(&mut self, count: u32) {
         if self.query_set.is_none() || self.query_buffer.is_none() {
             self.pass_meta.clear();
             return;
@@ -2028,24 +2120,16 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("timestamp resolve"),
             });
-        if self.timestamps_inside {
-            encoder.write_timestamp(qs, 1);
-        } else {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("timestamp"),
-                timestamp_writes: None,
-            });
-            pass.write_timestamp(qs, 1);
-        }
         encoder.resolve_query_set(qs, 0..count, buf, 0);
         encoder.copy_buffer_to_buffer(buf, 0, &staging, 0, u64::from(count) * 8);
-        self.queue.submit([encoder.finish()]);
+        let submission = self.queue.submit([encoder.finish()]);
+        tracing::trace!(count, ?submission, "timestamps resolved");
         self.pending_timestamps.push_back(PendingTimestamps {
             staging,
             count,
             meta: std::mem::take(&mut self.pass_meta),
             map_requested: false,
-            ready: Arc::new(AtomicBool::new(false)),
+            ready: Arc::new(AtomicU8::new(0)),
         });
     }
 
@@ -2077,14 +2161,25 @@ impl Renderer {
                     .staging
                     .slice(..u64::from(pending.count) * 8)
                     .map_async(wgpu::MapMode::Read, move |result| {
-                        flag.store(result.is_ok(), Ordering::Relaxed);
+                        flag.store(u8::from(result.is_err()) + 1, Ordering::Relaxed);
                     });
                 pending.map_requested = true;
             }
-            if self.device.poll(wgpu::PollType::Poll).is_err()
-                || !pending.ready.load(Ordering::Relaxed)
-            {
+            if self.device.poll(wgpu::PollType::Poll).is_err() {
                 break;
+            }
+            match pending.ready.load(Ordering::Relaxed) {
+                // A failed map drops the frame's timing instead of
+                // blocking every later drain.
+                2 => {
+                    tracing::error!("the timestamp readback map failed");
+                    if let Some(pending) = self.pending_timestamps.pop_front() {
+                        pending.staging.unmap();
+                    }
+                    continue;
+                }
+                1 => {}
+                _ => break,
             }
             let Some(pending) = self.pending_timestamps.pop_front() else {
                 break;
@@ -2103,7 +2198,9 @@ impl Renderer {
                         .filter(|(end, start)| end > start)
                         .map(|(end, start)| period * (end - start) as f64 * 1e-9)
                 };
-                stats.gpu_seconds = delta(0, 1);
+                // The frame's GPU time runs from the first pass's start
+                // to the last pass's end.
+                stats.gpu_seconds = delta(0, pending.count as usize - 1);
                 stats.passes_timed = pending
                     .meta
                     .into_iter()
@@ -2113,10 +2210,15 @@ impl Renderer {
                         width: meta.width,
                         height: meta.height,
                         format: meta.format,
-                        gpu_seconds: delta(2 + 2 * i, 3 + 2 * i).unwrap_or(0.0),
+                        gpu_seconds: delta(2 * i, 2 * i + 1).unwrap_or(0.0),
                     })
                     .collect();
             }
+            tracing::debug!(
+                passes = stats.passes_timed.len(),
+                gpu_ms = stats.gpu_seconds.map(|s| s * 1e3),
+                "frame timed"
+            );
             pending.staging.unmap();
             if pending.staging.size() >= u64::from(self.query_capacity) * 8 {
                 self.query_staging = Some(pending.staging);
@@ -2184,12 +2286,10 @@ impl Renderer {
                 depth_or_array_layers: 1,
             },
         );
-        self.queue.submit([encoder.finish()]);
+        let submission = self.queue.submit([encoder.finish()]);
+        tracing::trace!(?surface, ?submission, "readback submitted");
         let slice = buf.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        self.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(|e| RenderError::Readback(format!("poll: {e}")))?;
+        self.map_read(slice, submission, "the pixel readback")?;
         let data = slice.get_mapped_range();
         let mut pixels = Vec::with_capacity((w * h) as usize);
         for row in 0..h {

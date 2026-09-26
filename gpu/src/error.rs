@@ -73,6 +73,16 @@ pub enum RenderError {
     /// The GPU device was lost.
     #[error("the device was lost")]
     DeviceLost,
+    /// A GPU wait did not finish within [`GpuConfig::wait_timeout`].
+    ///
+    /// [`GpuConfig::wait_timeout`]: crate::GpuConfig::wait_timeout
+    #[error("the GPU did not finish {what} within {timeout:?}")]
+    Timeout {
+        /// What the render thread was waiting for.
+        what: &'static str,
+        /// The bound that expired.
+        timeout: std::time::Duration,
+    },
     /// The render thread failed or stopped.
     #[error("render thread stopped")]
     Thread,

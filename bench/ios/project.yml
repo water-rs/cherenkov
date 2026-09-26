@@ -18,5 +18,7 @@ targets:
         # `libcherenkov_bench.a` comes from cargo — build it first:
         #   cargo build --release --target aarch64-apple-ios -p cherenkov-bench \
         #     --features cherenkov,vello-hybrid,vello-classic,skia-metal
-        LIBRARY_SEARCH_PATHS: $(inherited) $(PROJECT_DIR)/../../target/aarch64-apple-ios/release
+        #   (for a simulator build, target aarch64-apple-ios-sim instead)
+        "LIBRARY_SEARCH_PATHS[sdk=iphoneos*]": $(inherited) $(PROJECT_DIR)/../../target/aarch64-apple-ios/release
+        "LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]": $(inherited) $(PROJECT_DIR)/../../target/aarch64-apple-ios-sim/release
         OTHER_LDFLAGS: $(inherited) -lcherenkov_bench -lc++

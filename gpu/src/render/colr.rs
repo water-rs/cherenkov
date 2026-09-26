@@ -31,7 +31,7 @@ use cherenkov::{
 };
 
 use crate::error::{RenderError, Unsupported};
-use crate::render::glyph::FontData;
+use crate::render::glyph::{FontData, PendingRaster};
 
 /// A canvas-covering rect in font space: `fill` brushes cover whatever clips
 /// enclose them, and the enclosing passes bound them to the surface.
@@ -545,11 +545,17 @@ fn record_node(node: &Node, c: &mut StaticRecorder) {
 /// The font-space [`Picture`] for one COLR glyph, built or fetched from the
 /// font's cache. `foreground` is the run's paint — it is baked into the
 /// picture, so the cache key hashes it together with the coords.
+///
+/// `font` is the worker's snapshot of `Renderer::fonts[font_id]`: cache
+/// hits read it, a built picture is inserted into it and queued in
+/// `pending` so the render thread can commit it to the real font.
 pub fn glyph_picture(
     font: &FontData,
+    font_id: u64,
     glyph_id: u32,
     coords: &[i16],
     foreground: &Paint,
+    pending: &mut Vec<PendingRaster>,
 ) -> Result<Picture, RenderError> {
     let mut hasher = DefaultHasher::new();
     coords.hash(&mut hasher);
@@ -558,8 +564,9 @@ pub fn glyph_picture(
     hash_paint(&mut hasher, foreground);
     let paint_hash = hasher.finish();
     let key = (glyph_id, coords_hash, paint_hash);
-    if let Some(p) = font.colr.borrow().get(&key) {
-        return Ok(p.clone());
+    let cached = font.colr.borrow().get(&key).cloned();
+    if let Some(p) = cached {
+        return Ok(p);
     }
 
     let font_ref = skrifa::FontRef::from_index(&font.data, font.index)
@@ -604,6 +611,11 @@ pub fn glyph_picture(
         }
     });
     font.colr.borrow_mut().insert(key, picture.clone());
+    pending.push(PendingRaster::Colr {
+        font: font_id,
+        key,
+        picture: picture.clone(),
+    });
     Ok(picture)
 }
 

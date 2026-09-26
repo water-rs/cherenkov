@@ -11,7 +11,7 @@ use cherenkov::{FillRule, ShapeData};
 use kurbo::{Affine, BezPath, PathEl, Point, Rect, Shape as _, Vec2};
 
 use crate::error::RenderError;
-use crate::render::glyph::{Atlas, PathCell, PathEmit};
+use crate::render::glyph::{CellTexels, PathCell, PathEmit};
 use crate::render::raster::Raster;
 
 /// Coverage strip height in device rows.
@@ -213,36 +213,35 @@ fn texels(coverage: &[f32]) -> Vec<u8> {
 /// Emits `coverage` as spans and atlas cells: one cell when the grid is
 /// small, otherwise strips of [`STRIP_H`] rows split into full-column span
 /// runs and partial-column cells.
+///
+/// Pure CPU work: the emission and, per cell, its `(w, h, texels)` — the
+/// returned cells' `x`/`y` stay zero until the render thread stores them
+/// with [`Atlas::store_path`]. Cell order in `cells` matches the per-cell
+/// rasters in the second return value index for index.
 #[expect(clippy::cast_possible_truncation)]
 #[expect(clippy::cast_precision_loss)]
 #[expect(
     clippy::float_cmp,
     reason = "a column is 'full' exactly when coverage clamped to 1.0"
 )]
-pub fn emit(
-    coverage: &Coverage,
-    atlas: &mut Atlas,
-    queue: &wgpu::Queue,
-) -> Result<PathEmit, RenderError> {
+pub fn emit(coverage: &Coverage) -> Result<(PathEmit, Vec<CellTexels>), RenderError> {
     let mut out = PathEmit::default();
-    let upload_cell = |atlas: &mut Atlas,
-                       cells: &mut Vec<PathCell>,
-                       x: usize,
-                       y: usize,
-                       w: usize,
-                       h: usize|
+    let mut rasters: Vec<CellTexels> = Vec::new();
+    let make_cell = |cells: &mut Vec<PathCell>,
+                     rasters: &mut Vec<CellTexels>,
+                     x: usize,
+                     y: usize,
+                     w: usize,
+                     h: usize|
      -> Result<(), RenderError> {
         let (Ok(w32), Ok(h32)) = (u32::try_from(w), u32::try_from(h)) else {
-            return Err(RenderError::AtlasFull);
-        };
-        let Some((cx, cy)) = atlas.alloc(w32, h32) else {
             return Err(RenderError::AtlasFull);
         };
         let mut rows = Vec::with_capacity(w * h);
         for row in 0..h {
             rows.extend_from_slice(&coverage.data[(y + row) * coverage.w + x..][..w]);
         }
-        atlas.write(queue, cx, cy, w32, h32, &texels(&rows));
+        rasters.push((w32, h32, texels(&rows)));
         cells.push(PathCell {
             rect: [
                 (coverage.x + x as f64) as f32,
@@ -250,14 +249,14 @@ pub fn emit(
                 (coverage.x + (x + w) as f64) as f32,
                 (coverage.y + (y + h) as f64) as f32,
             ],
-            x: cx as u16,
-            y: cy as u16,
+            x: 0,
+            y: 0,
         });
         Ok(())
     };
     if coverage.w as f64 <= SMALL_BBOX && coverage.h as f64 <= SMALL_BBOX {
-        upload_cell(atlas, &mut out.cells, 0, 0, coverage.w, coverage.h)?;
-        return Ok(out);
+        make_cell(&mut out.cells, &mut rasters, 0, 0, coverage.w, coverage.h)?;
+        return Ok((out, rasters));
     }
     for sy in (0..coverage.h).step_by(STRIP_H) {
         let sh = STRIP_H.min(coverage.h - sy);
@@ -317,11 +316,11 @@ pub fn emit(
                 while x < coverage.w && class[x] != 0 {
                     x += 1;
                 }
-                upload_cell(atlas, &mut out.cells, start, sy, x - start, sh)?;
+                make_cell(&mut out.cells, &mut rasters, start, sy, x - start, sh)?;
             }
         }
     }
-    Ok(out)
+    Ok((out, rasters))
 }
 
 /// A stable hash of a shape's field bits, for strokes of non-path shapes

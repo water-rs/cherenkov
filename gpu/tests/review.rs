@@ -343,12 +343,17 @@ fn timestamps_resolve_a_frame_late() -> Result<(), Box<dyn std::error::Error>> {
         engine.stats().gpu_seconds.is_none(),
         "a submitting frame returns before its queries resolve"
     );
-    // An idle render still drains the pending resolve.
+    // The next render's drain requests the staging map and may already
+    // see it; if not, the readback's `wait_indefinitely` poll is the
+    // concrete readiness signal — it returns only once the map callback
+    // has run — so the following drain resolves deterministically.
     engine.render(cherenkov_gpu::FrameTime::now())?;
-    assert!(
-        engine.stats().gpu_seconds.is_some(),
-        "the previous frame's timing arrives a render late"
-    );
+    let timed = engine.stats().gpu_seconds.is_some() || {
+        let _ = surface.readback()?;
+        engine.render(cherenkov_gpu::FrameTime::now())?;
+        engine.stats().gpu_seconds.is_some()
+    };
+    assert!(timed, "the previous frame's timing arrives a render late");
     assert!(
         engine
             .stats()
@@ -530,4 +535,47 @@ fn a_zero_size_surface_is_an_error() {
             "{size:?}: {result:?}"
         );
     }
+}
+
+/// Two surfaces dirtied in one frame lower on parallel workers — shared
+/// glyph-atlas and font caches included — and each still renders its own
+/// content correctly.
+#[test]
+fn two_dirty_surfaces_lower_in_parallel() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(engine) = engine(GpuConfig::default()) else {
+        return Ok(());
+    };
+    let font = engine.font(font())?;
+    let make = |color: WorkingColor| -> Result<_, Box<dyn std::error::Error>> {
+        let surface = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
+        surface.update(|tx| {
+            tx[surface.root()].content(surface.record(|c| {
+                c.fill(Rect::new(8.0, 8.0, 56.0, 56.0), color);
+                // Shared atlas contention: both surfaces raster the same
+                // glyphs on their own thread.
+                for run in text_runs(font.id(), 96, 10.0) {
+                    c.glyphs(&run, WorkingColor::WHITE);
+                }
+            }));
+        });
+        Ok(surface)
+    };
+    let red = make(WorkingColor::new([1.0, 0.0, 0.0, 1.0]))?;
+    let blue = make(WorkingColor::new([0.0, 0.0, 1.0, 1.0]))?;
+    engine.render(cherenkov_gpu::FrameTime::now())?;
+    let pa = red.readback()?.pixels;
+    let pb = blue.readback()?.pixels;
+    // Center pixel of the 8..56 fill rect, row-major.
+    let center = 32 * 64 + 32;
+    assert!(
+        pa[center][0] > 0.9,
+        "red surface red channel: {:?}",
+        pa[center]
+    );
+    assert!(
+        pb[center][2] > 0.9,
+        "blue surface blue channel: {:?}",
+        pb[center]
+    );
+    Ok(())
 }

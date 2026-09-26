@@ -10,6 +10,7 @@
 use pulp::Simd;
 
 use super::blend::src_over;
+use super::coverage::PositiveCoverage;
 
 #[expect(
     clippy::inline_always,
@@ -88,23 +89,72 @@ fn packed_coverage<S: Simd>(simd: S, coverage: S::f32s) -> [S::f32s; 4] {
     reason = "SIMD operations must inline into pulp's target-feature context"
 )]
 #[inline(always)]
-pub fn solid_span<S: Simd>(simd: S, pixels: &mut [[f32; 4]], coverage: &[f32], color: [f32; 4]) {
+pub fn solid_span<S: Simd>(
+    simd: S,
+    pixels: &mut [[f32; 4]],
+    coverage: PositiveCoverage<'_>,
+    color: [f32; 4],
+) {
+    let coverage = coverage.as_slice();
     let (pixels, tail) = blocks::<S>(pixels);
     let count = pixels.len() * S::F32_LANES;
     let (coverage_vectors, _) = S::as_simd_f32s(&coverage[..count]);
     let colors = simd.interleave_shfl_f32s(color.map(|channel| simd.splat_f32s(channel)));
     let alpha = simd.splat_f32s(color[3]);
     let one = simd.splat_f32s(1.0);
-    let zero = simd.splat_f32s(0.0);
     for (pixel, &coverage) in pixels.iter_mut().zip(coverage_vectors) {
         let coverage = packed_coverage(simd, coverage);
         for ((destination, color), coverage) in pixel.iter_mut().zip(colors).zip(coverage) {
             let source = simd.mul_f32s(color, coverage);
             let inverse = simd.sub_f32s(one, simd.mul_f32s(alpha, coverage));
             let result = simd.add_f32s(simd.mul_f32s(*destination, inverse), source);
-            let active = simd.greater_than_f32s(coverage, zero);
-            *destination = simd.select_f32s(active, result, *destination);
+            *destination = result;
         }
+    }
+    for (pixel, &coverage) in tail.iter_mut().zip(&coverage[count..]) {
+        *pixel = src_over(*pixel, color.map(|channel| channel * coverage));
+    }
+}
+
+/// Put coverage in the same lane order as a four-channel pixel block.
+/// Pulp's shuffle transpose may permute pixels within each channel vector.
+/// Transposing coverage through that same layout keeps each value with its pixel.
+#[expect(
+    clippy::inline_always,
+    reason = "the coverage transpose must inline into the SIMD target-feature context"
+)]
+#[inline(always)]
+fn coverage_lanes<S: Simd>(simd: S, coverage: S::f32s) -> S::f32s {
+    let mut pixels = [simd.splat_f32s(0.0); 4];
+    let values: &[f32] = pulp::bytemuck::cast_slice(std::slice::from_ref(&coverage));
+    let channels: &mut [[f32; 4]] = pulp::bytemuck::cast_slice_mut(&mut pixels);
+    for (pixel, &value) in channels.iter_mut().zip(values) {
+        pixel[0] = value;
+    }
+    simd.deinterleave_shfl_f32s(pixels)[0]
+}
+
+/// Composite a glyph mask, preserving destination pixels at zero coverage.
+/// Coverage and destination have matching lengths by construction.
+#[expect(
+    clippy::inline_always,
+    reason = "SIMD operations must inline into pulp's target-feature context"
+)]
+#[inline(always)]
+pub fn glyph_span<S: Simd>(simd: S, pixels: &mut [[f32; 4]], coverage: &[f32], color: [f32; 4]) {
+    let (pixels, tail) = blocks::<S>(pixels);
+    let count = pixels.len() * S::F32_LANES;
+    let (coverage_vectors, _) = S::as_simd_f32s(&coverage[..count]);
+    let colors = color.map(|channel| simd.splat_f32s(channel));
+    for (pixel, &coverage) in pixels.iter_mut().zip(coverage_vectors) {
+        let coverage = coverage_lanes(simd, coverage);
+        let destination = simd.deinterleave_shfl_f32s(*pixel);
+        let source = colors.map(|channel| simd.mul_f32s(channel, coverage));
+        let active = simd.greater_than_f32s(coverage, simd.splat_f32s(0.0));
+        let result = over(simd, destination, source);
+        *pixel = simd.interleave_shfl_f32s(std::array::from_fn::<_, 4, _>(|channel| {
+            simd.select_f32s(active, result[channel], destination[channel])
+        }));
     }
     for (pixel, &coverage) in tail.iter_mut().zip(&coverage[count..]) {
         if coverage > 0.0 {
@@ -140,6 +190,44 @@ pub fn isolate<S: Simd>(simd: S, pixels: &mut [[f32; 4]], source: &[[f32; 4]], o
         let source = source.map(|channel| channel * opacity);
         if source[3] != 0.0 {
             *pixel = src_over(*pixel, source);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn glyph_mask_lanes_and_zero_pixels_match_scalar() {
+        struct Glyph<'a> {
+            pixels: &'a mut [[f32; 4]],
+            coverage: &'a [f32],
+        }
+        impl pulp::WithSimd for Glyph<'_> {
+            type Output = ();
+            fn with_simd<S: Simd>(self, simd: S) {
+                glyph_span(simd, self.pixels, self.coverage, [-0.1, 0.5, 1.1, 0.75]);
+            }
+        }
+        let coverage: Vec<_> = (0_u16..37)
+            .map(|i| f32::from((i * 17) % 11) / 10.0)
+            .collect();
+        let mut scalar = vec![[-0.0, -0.25, 1.5, 0.625]; coverage.len()];
+        let mut native = scalar.clone();
+        pulp::Arch::Scalar.dispatch(Glyph {
+            pixels: &mut scalar,
+            coverage: &coverage,
+        });
+        pulp::Arch::new().dispatch(Glyph {
+            pixels: &mut native,
+            coverage: &coverage,
+        });
+        for ((scalar, native), coverage) in scalar.into_iter().zip(native).zip(coverage) {
+            assert_eq!(scalar.map(f32::to_bits), native.map(f32::to_bits));
+            if coverage == 0.0 {
+                assert_eq!(native[0].to_bits(), (-0.0_f32).to_bits());
+            }
         }
     }
 }

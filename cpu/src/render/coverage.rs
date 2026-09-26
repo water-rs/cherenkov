@@ -58,10 +58,27 @@ pub struct Span {
     /// Area of the covered part of each pixel.
     pub alpha: f32,
     /// Varying coverage, or empty for a constant run.
-    pub samples: Vec<f32>,
+    samples: Vec<f32>,
+}
+
+/// A borrowed span whose stored samples are strictly positive. Only the
+/// coverage compiler constructs spans; glyph masks do not have this invariant.
+#[derive(Clone, Copy)]
+pub struct PositiveCoverage<'a>(&'a [f32]);
+
+impl<'a> PositiveCoverage<'a> {
+    /// The compiler's samples in device-column order.
+    pub const fn as_slice(self) -> &'a [f32] {
+        self.0
+    }
 }
 
 impl Span {
+    /// Varying positive samples, or empty for a constant run.
+    pub fn samples(&self) -> PositiveCoverage<'_> {
+        PositiveCoverage(&self.samples)
+    }
+
     /// Coverage in this run at a device-space column.
     pub fn at(&self, x: usize) -> f32 {
         if self.samples.is_empty() {

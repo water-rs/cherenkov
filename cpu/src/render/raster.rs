@@ -363,11 +363,11 @@ impl<S: pulp::Simd> Band<'_, S> {
             for span in coverage.row(y) {
                 if let PaintData::Solid(color) = paint {
                     let pixels = &mut dst[row + span.columns.start..row + span.columns.end];
-                    if span.samples.is_empty() {
+                    if span.samples().as_slice().is_empty() {
                         let src = color.map(|value| value * span.alpha);
                         super::composite::constant(self.simd, pixels, src);
                     } else {
-                        super::composite::solid_span(self.simd, pixels, &span.samples, *color);
+                        super::composite::solid_span(self.simd, pixels, span.samples(), *color);
                     }
                 } else {
                     for x in span.columns.clone() {
@@ -432,7 +432,7 @@ impl<S: pulp::Simd> Band<'_, S> {
             let samples = &mask.cov[start..start + x_hi - x_lo];
             let pixels = &mut dst[y * self.w + x_lo..y * self.w + x_hi];
             if let PaintData::Solid(color) = paint {
-                super::composite::solid_span(self.simd, pixels, samples, *color);
+                super::composite::glyph_span(self.simd, pixels, samples, *color);
             } else {
                 for (index, (pixel, &coverage)) in pixels.iter_mut().zip(samples).enumerate() {
                     if coverage > 0.0 {

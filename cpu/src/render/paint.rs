@@ -197,15 +197,16 @@ pub fn paint_data(paint: &Paint, inv: Affine) -> Result<PaintData, Unsupported> 
     })
 }
 
-/// Applies `extend` to `t`.
-fn extend_t(t: f32, extend: Extend) -> f32 {
+/// Applies `extend` to `t`; `None` outside `[0, 1]` is transparent.
+fn extend_t(t: f32, extend: Extend) -> Option<f32> {
     match extend {
-        Extend::Pad => t.clamp(0.0, 1.0),
-        Extend::Repeat => t - t.floor(),
+        Extend::Pad => Some(t.clamp(0.0, 1.0)),
+        Extend::Repeat => Some(t - t.floor()),
         Extend::Reflect => {
             let m = (t * 0.5).floor().mul_add(-2.0, t);
-            if m > 1.0 { 2.0 - m } else { m }
+            Some(if m > 1.0 { 2.0 - m } else { m })
         }
+        Extend::None => (0.0..=1.0).contains(&t).then_some(t),
     }
 }
 
@@ -312,7 +313,7 @@ impl PaintData {
                 } else {
                     (py - sy).mul_add(ddy, (px - sx) * ddx) / len2
                 };
-                eval_stops(stops, extend_t(t, *extend), *interpolation)
+                extend_t(t, *extend).map_or([0.0; 4], |t| eval_stops(stops, t, *interpolation))
             }
             Self::Radial {
                 inv,
@@ -325,7 +326,7 @@ impl PaintData {
                 let (px, py) = apply(*inv, dx, dy);
                 let t = radial_t(px, py, *centres, *radii);
                 if t.is_finite() {
-                    eval_stops(stops, extend_t(t, *extend), *interpolation)
+                    extend_t(t, *extend).map_or([0.0; 4], |t| eval_stops(stops, t, *interpolation))
                 } else {
                     [0.0; 4]
                 }

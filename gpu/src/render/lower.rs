@@ -16,6 +16,9 @@ use cherenkov::{GlyphRun, GlyphStyle};
 
 use crate::error::{RenderError, Unsupported};
 use crate::render::GpuImage;
+use skrifa::MetadataProvider as _;
+use skrifa::raw::TableProvider as _;
+
 use crate::render::glyph::{Atlas, FontData, MaskCell, PathEmit, glyph_key, rasterize};
 use crate::render::instance::{
     EXTEND_NONE, EXTEND_PAD, EXTEND_REFLECT, EXTEND_REPEAT, FLAG_HAS_CLIP, FLAG_HAS_INNER,
@@ -1572,9 +1575,49 @@ impl<'a> Lowering<'a> {
             .fonts
             .get(&run.font.raw())
             .ok_or_else(|| RenderError::Font(format!("unregistered font {:?}", run.font)))?;
+        // `upem`/`color_glyphs` are resolved lazily — plain runs never parse
+        // the font here (the rasterizer does it on cache miss).
+        let mut colr_ctx: Option<(skrifa::FontRef<'_>, f64)> = None;
+        let mut colr_checked = false;
         for glyph in &run.glyphs {
             if glyph.transform.is_some() {
                 return Err(Unsupported::GlyphTransform.into());
+            }
+            if !colr_checked {
+                colr_checked = true;
+                let font_ref = skrifa::FontRef::from_index(&font.data, font.index)
+                    .map_err(|e| RenderError::Font(format!("{e}")))?;
+                if font_ref.colr().is_ok() {
+                    let upem = font_ref
+                        .head()
+                        .map_err(|e| RenderError::Font(format!("head: {e}")))?
+                        .units_per_em();
+                    colr_ctx = Some((font_ref, f64::from(upem)));
+                }
+            }
+            if let Some((font_ref, upem)) = colr_ctx.as_ref()
+                && font_ref
+                    .color_glyphs()
+                    .get(skrifa::GlyphId::new(glyph.id))
+                    .is_some()
+            {
+                if *upem <= 0.0 {
+                    return Err(RenderError::Font("zero units_per_em".into()));
+                }
+                let picture =
+                    crate::render::colr::glyph_picture(font, glyph.id, &run.coords, paint)?;
+                // `translate(x, y) * scale_non_uniform(size/upem, -size/upem)`
+                // places the font-space picture at the glyph's origin.
+                let s = f64::from(run.size) / upem;
+                let place = Affine::translate((f64::from(glyph.x), f64::from(glyph.y)))
+                    * Affine::scale_non_uniform(s, -s);
+                let saved = self.transform;
+                self.transform = saved * place;
+                let list = picture.display_list();
+                let result = self.commands(list, 0, list.len(), glyphs);
+                self.transform = saved;
+                result?;
+                continue;
             }
             let o = self.transform * Point::new(f64::from(glyph.x), f64::from(glyph.y));
             let ix = o.x.floor();

@@ -137,8 +137,9 @@ pub struct CherenkovVello {
 /// The features this slice executes faithfully: the honest Vello set,
 /// minus what the Cherenkov front end cannot express.
 ///
-/// [`Feature::ExtendNone`] is absent: neither `cherenkov::Extend` nor
-/// `peniko::Extend` has a `None` variant. [`Feature::HdrColor`] and
+/// [`Feature::ExtendNone`] is absent: `peniko::Extend` has no `None`
+/// variant for the `cherenkov::Extend::None` the front end can express.
+/// [`Feature::HdrColor`] and
 /// [`Feature::WideGamut`] are absent: the backend renders into an
 /// `rgba8unorm` sRGB target and clamps. Interpolation declares only what
 /// `cherenkov::Interpolation` names (the working space and encoded sRGB),
@@ -187,6 +188,18 @@ fn vello_ad_features() -> Vec<Feature> {
         BlendMode::Saturation,
         BlendMode::Color,
         BlendMode::Luminosity,
+        BlendMode::Clear,
+        BlendMode::Src,
+        BlendMode::Dst,
+        BlendMode::DestOver,
+        BlendMode::SrcIn,
+        BlendMode::DestIn,
+        BlendMode::SrcOut,
+        BlendMode::DestOut,
+        BlendMode::SrcAtop,
+        BlendMode::DestAtop,
+        BlendMode::Xor,
+        BlendMode::PlusLighter,
     ] {
         v.push(Feature::Blend(m));
     }
@@ -203,9 +216,6 @@ const fn missing_api(f: &Feature) -> Option<&'static str> {
         Feature::InterpolationSpace(_) => {
             Some("cherenkov::Interpolation has only Working and SrgbEncoded variants")
         }
-        Feature::Blend(_) => {
-            Some("cherenkov::BlendMode has only the 16 CSS mix modes — no Porter-Duff compositing")
-        }
         _ => None,
     }
 }
@@ -214,6 +224,7 @@ const fn missing_api(f: &Feature) -> Option<&'static str> {
 const fn unsupported_feature(u: Unsupported) -> Feature {
     match u {
         Unsupported::Interpolation => Feature::InterpolationSpace(ColorSpace::Srgb),
+        Unsupported::ExtendNone => Feature::ExtendNone,
         Unsupported::BlendSpace => Feature::Blend(BlendMode::Normal),
         Unsupported::GroupFilter | Unsupported::Filter => Feature::Opacity,
         Unsupported::Image => Feature::Image,
@@ -742,7 +753,12 @@ impl Engine for CherenkovVello {
         } else {
             None
         };
-        Ok(Submit { image, gpu_seconds })
+        Ok(Submit {
+            image,
+            gpu_seconds,
+            passes: Vec::new(),
+            phases: Vec::new(),
+        })
     }
 
     fn counters(&self) -> Counters {

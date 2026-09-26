@@ -59,39 +59,57 @@ pub const fn interpolation(i: Interpolation) -> Result<ColorSpaceTag, Unsupporte
     }
 }
 
-/// `cherenkov::Extend` → `peniko::Extend` (the same three variants).
-#[must_use]
-pub const fn extend(e: cherenkov::Extend) -> peniko::Extend {
+/// `cherenkov::Extend` → `peniko::Extend`. `None` (transparent outside
+/// the domain) has no `peniko` equivalent.
+///
+/// # Errors
+/// [`Unsupported::ExtendNone`] for `Extend::None`.
+pub const fn extend(e: cherenkov::Extend) -> Result<peniko::Extend, Unsupported> {
     match e {
-        cherenkov::Extend::Pad => peniko::Extend::Pad,
-        cherenkov::Extend::Repeat => peniko::Extend::Repeat,
-        cherenkov::Extend::Reflect => peniko::Extend::Reflect,
+        cherenkov::Extend::Pad => Ok(peniko::Extend::Pad),
+        cherenkov::Extend::Repeat => Ok(peniko::Extend::Repeat),
+        cherenkov::Extend::Reflect => Ok(peniko::Extend::Reflect),
+        cherenkov::Extend::None => Err(Unsupported::ExtendNone),
     }
 }
 
-/// `cherenkov::BlendMode` → `peniko::BlendMode`: a `Mix` over `SrcOver`.
+/// `cherenkov::BlendMode` → `peniko::BlendMode`: a `Mix` over `SrcOver`
+/// for the W3C blend modes, `Mix::Normal` over the matching `Compose`
+/// for the Porter-Duff compositing operators and plus-lighter.
 #[must_use]
 pub const fn blend(m: BlendMode) -> peniko::BlendMode {
-    use peniko::Mix;
-    let mix = match m {
-        BlendMode::Normal => Mix::Normal,
-        BlendMode::Multiply => Mix::Multiply,
-        BlendMode::Screen => Mix::Screen,
-        BlendMode::Overlay => Mix::Overlay,
-        BlendMode::Darken => Mix::Darken,
-        BlendMode::Lighten => Mix::Lighten,
-        BlendMode::ColorDodge => Mix::ColorDodge,
-        BlendMode::ColorBurn => Mix::ColorBurn,
-        BlendMode::HardLight => Mix::HardLight,
-        BlendMode::SoftLight => Mix::SoftLight,
-        BlendMode::Difference => Mix::Difference,
-        BlendMode::Exclusion => Mix::Exclusion,
-        BlendMode::Hue => Mix::Hue,
-        BlendMode::Saturation => Mix::Saturation,
-        BlendMode::Color => Mix::Color,
-        BlendMode::Luminosity => Mix::Luminosity,
+    use peniko::{Compose, Mix};
+    let (mix, compose) = match m {
+        BlendMode::Normal => (Mix::Normal, Compose::SrcOver),
+        BlendMode::Multiply => (Mix::Multiply, Compose::SrcOver),
+        BlendMode::Screen => (Mix::Screen, Compose::SrcOver),
+        BlendMode::Overlay => (Mix::Overlay, Compose::SrcOver),
+        BlendMode::Darken => (Mix::Darken, Compose::SrcOver),
+        BlendMode::Lighten => (Mix::Lighten, Compose::SrcOver),
+        BlendMode::ColorDodge => (Mix::ColorDodge, Compose::SrcOver),
+        BlendMode::ColorBurn => (Mix::ColorBurn, Compose::SrcOver),
+        BlendMode::HardLight => (Mix::HardLight, Compose::SrcOver),
+        BlendMode::SoftLight => (Mix::SoftLight, Compose::SrcOver),
+        BlendMode::Difference => (Mix::Difference, Compose::SrcOver),
+        BlendMode::Exclusion => (Mix::Exclusion, Compose::SrcOver),
+        BlendMode::Hue => (Mix::Hue, Compose::SrcOver),
+        BlendMode::Saturation => (Mix::Saturation, Compose::SrcOver),
+        BlendMode::Color => (Mix::Color, Compose::SrcOver),
+        BlendMode::Luminosity => (Mix::Luminosity, Compose::SrcOver),
+        BlendMode::Clear => (Mix::Normal, Compose::Clear),
+        BlendMode::Src => (Mix::Normal, Compose::Copy),
+        BlendMode::Dst => (Mix::Normal, Compose::Dest),
+        BlendMode::DestOver => (Mix::Normal, Compose::DestOver),
+        BlendMode::SrcIn => (Mix::Normal, Compose::SrcIn),
+        BlendMode::DestIn => (Mix::Normal, Compose::DestIn),
+        BlendMode::SrcOut => (Mix::Normal, Compose::SrcOut),
+        BlendMode::DestOut => (Mix::Normal, Compose::DestOut),
+        BlendMode::SrcAtop => (Mix::Normal, Compose::SrcAtop),
+        BlendMode::DestAtop => (Mix::Normal, Compose::DestAtop),
+        BlendMode::Xor => (Mix::Normal, Compose::Xor),
+        BlendMode::PlusLighter => (Mix::Normal, Compose::PlusLighter),
     };
-    peniko::BlendMode::new(mix, peniko::Compose::SrcOver)
+    peniko::BlendMode::new(mix, compose)
 }
 
 /// `cherenkov::FillRule` → `peniko::Fill`.

@@ -109,6 +109,9 @@ pub enum Unsupported {
     /// A gradient interpolation space other than the working space or
     /// sRGB-encoded.
     Interpolation,
+    /// A gradient or image pattern with `Extend::None` — `peniko::Extend`
+    /// has no transparent-outside-the-range mode.
+    ExtendNone,
     /// A user shader paint.
     Shader,
     /// A shader paint declaring more than 64 uniform floats.
@@ -140,6 +143,7 @@ impl std::fmt::Display for Unsupported {
         f.write_str(match self {
             Self::MeshGradient => "mesh-gradient",
             Self::Interpolation => "gradient-interpolation",
+            Self::ExtendNone => "extend-none",
             Self::Shader => "shader-paint",
             Self::ShaderParams => "shader-params",
             Self::ShaderGlyphs => "shader-glyphs",

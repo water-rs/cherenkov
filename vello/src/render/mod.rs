@@ -802,8 +802,11 @@ impl Renderer {
                 || convert::opaque_clip(target_size.0, target_size.1),
                 convert::shape_path,
             );
+            let rule = node.clip.as_ref().map_or(peniko::Fill::NonZero, |clip| {
+                convert::fill(convert::shape_rule(clip))
+            });
             scene.push_layer(
-                peniko::Fill::NonZero,
+                rule,
                 convert::blend(node.blend),
                 node.opacity,
                 world,
@@ -1021,8 +1024,11 @@ impl Renderer {
                 || convert::opaque_clip(target_size.0, target_size.1),
                 convert::shape_path,
             );
+            let rule = node.clip.as_ref().map_or(peniko::Fill::NonZero, |clip| {
+                convert::fill(convert::shape_rule(clip))
+            });
             scene.push_layer(
-                peniko::Fill::NonZero,
+                rule,
                 convert::blend(node.blend),
                 node.opacity,
                 world,

@@ -531,6 +531,57 @@ fn filter_runs_over_the_layer_texture() {
     assert_eq!(next, Next::Idle);
 }
 
+/// A layer `clip` must honour the shape's fill rule: a same-winding
+/// rect-in-rect path under `EvenOdd` punches a hole in the clipped
+/// content, where non-zero winding would leave the centre filled.
+#[test]
+fn even_odd_layer_clip_punches_a_hole() {
+    let Some(engine) = engine() else { return };
+    let surface = engine.surface(Offscreen::new((64, 64))).expect("surface");
+    surface.clear_color(WorkingColor::BLACK);
+    let mut path = cherenkov::kurbo::BezPath::new();
+    path.move_to((0., 0.));
+    path.line_to((64., 0.));
+    path.line_to((64., 64.));
+    path.line_to((0., 64.));
+    path.close_path();
+    path.move_to((16., 16.));
+    path.line_to((48., 16.));
+    path.line_to((48., 48.));
+    path.line_to((16., 48.));
+    path.close_path();
+    let clipped = surface.layer();
+    surface.update(|tx| {
+        tx[&clipped]
+            .clip(cherenkov::EvenOdd(path))
+            .content(surface.record(|c| {
+                c.fill(Rect::new(0., 0., 64., 64.), WorkingColor::WHITE);
+            }));
+        tx[surface.root()].push(&clipped);
+    });
+    let next = engine
+        .render(cherenkov_vello::FrameTime::now())
+        .expect("render");
+    assert_eq!(next, Next::Idle);
+    let readback = surface.readback().expect("readback");
+    assert_pixel(
+        px(&readback, 8, 8),
+        expected_pixel(
+            WorkingColor::WHITE.components.map(f64::from),
+            WorkingColor::BLACK.components.map(f64::from),
+        ),
+        "inside outer ring",
+    );
+    assert_pixel(
+        px(&readback, 32, 32),
+        expected_pixel(
+            WorkingColor::TRANSPARENT.components.map(f64::from),
+            WorkingColor::BLACK.components.map(f64::from),
+        ),
+        "punched hole",
+    );
+}
+
 /// `GpuContent` that counts its renders and always asks for another frame.
 struct LoopingContent(std::sync::Arc<std::sync::atomic::AtomicUsize>);
 

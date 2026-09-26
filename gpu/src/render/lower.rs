@@ -331,18 +331,63 @@ const fn variant_of(inst: &Instance) -> ShaderVariant {
     ShaderVariant::Simple
 }
 
-/// The up-to-four border strips of `b` minus the covered box `c`:
-/// top and bottom run the full width, left and right fit between them.
-/// Empty strips are dropped; `c` need not lie inside `b`.
-fn border_strips(b: Rect, c: Rect) -> impl Iterator<Item = Rect> {
+/// The part of a shadow its following opaque fill hides, in shadow-local
+/// space: the fill's rounded box minus its corner squares, as the union of
+/// `wide` (corner rows excluded) and `tall` (corner columns excluded).
+/// Both are inset by an antialiasing margin so the fill's edge pixels stay.
+#[derive(Clone, Copy)]
+struct Cover {
+    wide: Rect,
+    tall: Rect,
+}
+
+/// The four border strips of `b` minus the covered box `c`: top and
+/// bottom run the full width, left and right fit between them. Strips
+/// may be empty; `c` need not lie inside `b`.
+const fn border_strips(b: Rect, c: Rect) -> [Rect; 4] {
     [
         Rect::new(b.x0, b.y0, b.x1, c.y0),
         Rect::new(b.x0, c.y1, b.x1, b.y1),
         Rect::new(b.x0, c.y0, c.x0, c.y1),
         Rect::new(c.x1, c.y0, b.x1, c.y1),
     ]
-    .into_iter()
-    .filter(|r| r.width() > 0.0 && r.height() > 0.0)
+}
+
+/// The up-to-eight strips of `b` minus the cover `c`: full-width top and
+/// bottom strips above/below `wide`, the four corner blocks beside `wide`
+/// but above/below `tall`, and the two side strips beside `tall`. A cover
+/// box that misses `b` degenerates to the four [`border_strips`] of the
+/// other; empty strips are dropped.
+fn cover_strips(b: Rect, c: Cover) -> impl Iterator<Item = Rect> {
+    let nonempty = |r: Rect| r.width() > 0.0 && r.height() > 0.0;
+    let w = c.wide.intersect(b);
+    let t = c.tall.intersect(b);
+    // The strip layout below needs `w` to span the rows `t` does not;
+    // swap when `t` reaches higher or lower than `w`.
+    let (w, t) = if t.y0 < w.y0 || t.y1 > w.y1 {
+        (t, w)
+    } else {
+        (w, t)
+    };
+    let mut rects = [Rect::ZERO; 8];
+    match (nonempty(w), nonempty(t)) {
+        (true, true) => {
+            rects = [
+                Rect::new(b.x0, b.y0, b.x1, w.y0),
+                Rect::new(b.x0, w.y1, b.x1, b.y1),
+                Rect::new(b.x0, w.y0, w.x0, t.y0),
+                Rect::new(w.x1, w.y0, b.x1, t.y0),
+                Rect::new(b.x0, t.y1, w.x0, w.y1),
+                Rect::new(w.x1, t.y1, b.x1, w.y1),
+                Rect::new(b.x0, t.y0, t.x0, t.y1),
+                Rect::new(t.x1, t.y0, b.x1, t.y1),
+            ];
+        }
+        (true, false) => rects[..4].copy_from_slice(&border_strips(b, w)),
+        (false, true) => rects[..4].copy_from_slice(&border_strips(b, t)),
+        (false, false) => rects[0] = b,
+    }
+    rects.into_iter().filter(move |r| nonempty(*r))
 }
 
 /// The blur sigma the shader integrates against, modelling the oracle's
@@ -1306,7 +1351,10 @@ impl<'a> Lowering<'a> {
         let b = boxed.bounds.inflate(margin, margin);
         let mut inst = self.base(KIND_FILL, affine(to_device));
         apply(&mut inst, [0.0; 4]);
-        for strip in border_strips(b, c) {
+        for strip in border_strips(b, c)
+            .into_iter()
+            .filter(|r| r.width() > 0.0 && r.height() > 0.0)
+        {
             inst.bounds = [
                 f32_f64(strip.x0),
                 f32_f64(strip.y0),
@@ -1499,9 +1547,10 @@ impl<'a> Lowering<'a> {
 
     /// When `commands[i]` is a `Shadow` immediately followed by an
     /// opaque solid fill of the same shape, the fill covers the shadow
-    /// inside the fill's inner box. Returns that box in shadow-local
-    /// space (shadow local = translate(offset) * shape local), or `None`
-    /// when the next command doesn't qualify.
+    /// inside the fill's rounded box minus its corner squares. Returns
+    /// that cover in shadow-local space (shadow local =
+    /// translate(offset) * shape local), or `None` when the next command
+    /// doesn't qualify.
     #[expect(
         clippy::float_cmp,
         reason = "coverage is exact only for a fully opaque fill"
@@ -1511,7 +1560,7 @@ impl<'a> Lowering<'a> {
         next: Option<&Command>,
         shape: &ShapeData,
         shadow: &cherenkov::Shadow,
-    ) -> Option<Rect> {
+    ) -> Option<Cover> {
         let Some(Command::Fill {
             shape: fill_shape,
             paint,
@@ -1529,10 +1578,15 @@ impl<'a> Lowering<'a> {
             return None;
         }
         let fb = box_shape(fill_shape).ok().flatten()?;
-        let max_r = fb.shape.radii.iter().copied().fold(0.0, f32::max);
-        let inner = rect_around_origin(fb.shape.half)
-            .inset(-(f64::from(max_r) + aa_margin(self.transform) + 1.0));
-        Some(inner - shadow.offset)
+        let max_r = f64::from(fb.shape.radii.iter().copied().fold(0.0, f32::max));
+        let m = aa_margin(self.transform) + 1.0;
+        let outer = rect_around_origin(fb.shape.half);
+        // `Rect::inset` takes positive insets as an outset; negative
+        // shrinks, matching the single-box cover below.
+        Some(Cover {
+            wide: outer.inset((-m, -(max_r + m))) - shadow.offset,
+            tall: outer.inset((-(max_r + m), -m)) - shadow.offset,
+        })
     }
 
     /// `Shadow`: a Gaussian-blurred rounded box, offset and spread.
@@ -1540,7 +1594,7 @@ impl<'a> Lowering<'a> {
         &mut self,
         shape: &ShapeData,
         shadow: &cherenkov::Shadow,
-        covered: Option<Rect>,
+        covered: Option<Cover>,
     ) -> Result<(), RenderError> {
         let Some(boxed) = box_shape(shape)? else {
             return Ok(());
@@ -1576,27 +1630,24 @@ impl<'a> Lowering<'a> {
         Ok(())
     }
 
-    /// Pushes `inst` either as one quad or, when the shadow's local box
-    /// `covered` hides its interior, as the up-to-four border strips of
+    /// Pushes `inst` either as one quad or, when the shadow's local
+    /// `covered` region hides its interior, as the up-to-eight strips of
     /// `b \ covered`. The interior behind an opaque card is opaque
     /// shadow: coverage there is already saturated, so skipping it
     /// changes no pixels — the strips' bounds only bound rasterization.
     /// An opacity below 1 disables the split: a translucent group would
     /// composite each strip separately.
     #[expect(clippy::float_cmp, reason = "the split is exact only at full opacity")]
-    fn push_shadow_quads(&mut self, inst: &Instance, b: Rect, covered: Option<Rect>) {
+    fn push_shadow_quads(&mut self, inst: &Instance, b: Rect, covered: Option<Cover>) {
         let mut inst = *inst;
-        let c = covered
-            .map(|c| c.intersect(b))
-            .filter(|c| c.width() > 0.0 && c.height() > 0.0)
-            .filter(|_| inst.params[1] == 1.0);
+        let c = covered.filter(|_| inst.params[1] == 1.0);
         match c {
             None => {
                 inst.bounds = [f32_f64(b.x0), f32_f64(b.y0), f32_f64(b.x1), f32_f64(b.y1)];
                 self.push_instance(&inst);
             }
             Some(c) => {
-                for strip in border_strips(b, c) {
+                for strip in cover_strips(b, c) {
                     inst.bounds = [
                         f32_f64(strip.x0),
                         f32_f64(strip.y0),
@@ -2042,4 +2093,90 @@ fn tight_region(instances: &[Instance], width: u32, height: u32) -> [u32; 4] {
         return [0, 0, 0, 0];
     }
     [x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn area(r: Rect) -> f64 {
+        r.width() * r.height()
+    }
+
+    fn disjoint(strips: &[Rect]) -> bool {
+        strips.iter().enumerate().all(|(i, a)| {
+            strips[i + 1..].iter().all(|b| {
+                let i = a.intersect(*b);
+                !(i.width() > 0.0 && i.height() > 0.0)
+            })
+        })
+    }
+
+    fn inside(strips: &[Rect], b: Rect) -> bool {
+        strips.iter().all(|r| r.intersect(b) == *r)
+    }
+
+    #[expect(
+        clippy::float_cmp,
+        clippy::suboptimal_flops,
+        reason = "integer-valued geometry is exact"
+    )]
+    #[test]
+    fn cover_strips_full_cover() {
+        let b = Rect::new(-20.0, -20.0, 20.0, 20.0);
+        let c = Cover {
+            wide: Rect::new(-15.0, -5.0, 15.0, 5.0),
+            tall: Rect::new(-5.0, -15.0, 5.0, 15.0),
+        };
+        let strips: Vec<Rect> = cover_strips(b, c).collect();
+        assert_eq!(strips.len(), 8);
+        assert!(disjoint(&strips));
+        assert!(inside(&strips, b));
+        let total: f64 = strips.iter().map(|r| area(*r)).sum();
+        assert_eq!(total, 1600.0 - (30.0 * 10.0 + 10.0 * 30.0 - 10.0 * 10.0));
+    }
+
+    #[expect(clippy::float_cmp, reason = "integer-valued geometry is exact")]
+    #[test]
+    fn cover_strips_one_empty_box() {
+        let b = Rect::new(-20.0, -20.0, 20.0, 20.0);
+        let c = Cover {
+            wide: Rect::new(-15.0, -5.0, 15.0, 5.0),
+            tall: Rect::new(-5.0, 0.0, 5.0, 0.0),
+        };
+        let strips: Vec<Rect> = cover_strips(b, c).collect();
+        assert_eq!(strips.len(), 4);
+        assert!(disjoint(&strips));
+        assert!(inside(&strips, b));
+        let total: f64 = strips.iter().map(|r| area(*r)).sum();
+        assert_eq!(total, 1600.0 - 300.0);
+    }
+
+    #[test]
+    fn cover_strips_both_empty() {
+        let b = Rect::new(-20.0, -20.0, 20.0, 20.0);
+        let c = Cover {
+            wide: Rect::ZERO,
+            tall: Rect::new(0.0, -5.0, 0.0, 5.0),
+        };
+        let strips: Vec<Rect> = cover_strips(b, c).collect();
+        assert_eq!(strips, vec![b]);
+    }
+
+    #[expect(clippy::float_cmp, reason = "integer-valued geometry is exact")]
+    #[test]
+    fn cover_strips_clips_to_b() {
+        let b = Rect::new(-20.0, -20.0, 20.0, 20.0);
+        let c = Cover {
+            wide: Rect::new(-15.0, -5.0, 40.0, 5.0),
+            tall: Rect::new(-5.0, -40.0, 5.0, 15.0),
+        };
+        let strips: Vec<Rect> = cover_strips(b, c).collect();
+        assert!(disjoint(&strips));
+        assert!(inside(&strips, b));
+        let covered = area(c.wide.intersect(b)) + area(c.tall.intersect(b))
+            - area(c.wide.intersect(b).intersect(c.tall.intersect(b)));
+        let total: f64 = strips.iter().map(|r| area(*r)).sum();
+        assert_eq!(total, area(b) - covered);
+    }
 }

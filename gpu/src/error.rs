@@ -39,6 +39,9 @@ pub enum SurfaceError {
     /// The GPU device or surface is lost.
     #[error("the device was lost")]
     Lost,
+    /// A zero-size surface cannot hold a target.
+    #[error("surface size must be non-zero")]
+    ZeroSize,
 }
 
 /// Resource registration failure.
@@ -53,6 +56,9 @@ pub enum ResourceError {
     /// Reading the resource failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    /// The render thread is gone.
+    #[error("the render thread is gone")]
+    Lost,
 }
 
 /// Rendering or readback failure.
@@ -73,11 +79,16 @@ pub enum RenderError {
     /// A glyph run references a font that is not registered.
     #[error("font: {0}")]
     Font(String),
+    /// The glyph atlas is full; the caller may grow or clear it and retry.
+    #[error("glyph atlas full")]
+    AtlasFull,
+    /// The frame's live atlas set exceeds the maximum atlas size.
+    #[error("glyph atlas exhausted")]
+    AtlasExhausted,
 }
 
 /// A feature the engine vocabulary has but this backend slice does not draw.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, thiserror::Error)]
-#[non_exhaustive]
 pub enum Unsupported {
     /// A general path.
     Path,
@@ -90,7 +101,7 @@ pub enum Unsupported {
     /// A user shader paint.
     Shader,
     /// A blend mode other than normal.
-    Blend,
+    Blend(cherenkov::BlendMode),
     /// A filter on a group.
     Filter,
     /// A dashed stroke.
@@ -117,7 +128,7 @@ impl std::fmt::Display for Unsupported {
             Self::Mesh => "mesh-gradient",
             Self::Image => "image",
             Self::Shader => "shader-paint",
-            Self::Blend => "blend-mode",
+            Self::Blend(_) => "blend-mode",
             Self::Filter => "filter",
             Self::StrokeDash => "stroke-dash",
             Self::StrokeJoin => "stroke-join",

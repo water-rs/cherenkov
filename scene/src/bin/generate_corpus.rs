@@ -18,9 +18,9 @@ use cherenkov_scene::kurbo::{
     Affine, BezPath, Ellipse, Line, Point, Rect, RoundedRect, RoundedRectRadii, Vec2,
 };
 use cherenkov_scene::{
-    BlendMode, Color, ColorSpace, Extend, FillRule, Glyph, GlyphRun, GradientStop, ImagePaint,
-    LayerBuilder, LinearGradient, Motion, MotionAnimation, NormalizedCoord, Paint, RadialGradient,
-    ResourceHash, Sampling, Scene, SceneError, Shape, StrokeStyle, SweepGradient,
+    BlendMode, Color, ColorSpace, Draw, Extend, FillRule, Glyph, GlyphRun, GradientStop, ImagePaint,
+    LayerBuilder, LinearGradient, Live, Motion, MotionAnimation, NormalizedCoord, Paint,
+    RadialGradient, ResourceHash, Sampling, Scene, SceneError, Shape, StrokeStyle, SweepGradient,
 };
 use fontique::FontWeight;
 use parley::{
@@ -1560,6 +1560,151 @@ fn run() -> Result<(), SceneError> {
                             list.glyphs(offset_run(run, 112.0, y + 72.0));
                         }
                     }
+                });
+            },
+            blobs,
+        );
+    }
+
+    // A text-heavy dashboard whose per-frame values ride engine slot
+    // updates: one glyph run (a two-digit counter) and one bar of the
+    // chart change every frame; everything else is static.
+    {
+        let title = ctx.shape(
+            "NotoSans.ttf",
+            "Dashboard",
+            40.0,
+            FontWeight::BOLD,
+            &solid(dark),
+        );
+        let body = ctx.shape(
+            "NotoSans.ttf",
+            "Revenue, signups and latency at a glance for the last quarter.",
+            22.0,
+            FontWeight::NORMAL,
+            &solid(srgb(0.4, 0.42, 0.45)),
+        );
+        let label = ctx.shape(
+            "NotoSans.ttf",
+            "Active users",
+            20.0,
+            FontWeight::NORMAL,
+            &solid(dark),
+        );
+        // Same glyph count every frame (two digits) so the run stays a
+        // value slot update.
+        let digits: Vec<Vec<GlyphRun>> = (0u8..60)
+            .map(|n| {
+                ctx.shape(
+                    "NotoSans.ttf",
+                    &format!("{n:02}"),
+                    48.0,
+                    FontWeight::BOLD,
+                    &solid(srgb(0.1, 0.4, 0.9)),
+                )
+            })
+            .collect();
+        let blobs = font_blobs(&ctx, &[&title, &body, &label, &digits[0]]);
+        perf.scene_with_blobs(
+            "live-dashboard",
+            pw as u32,
+            ph as u32,
+            srgb(0.96, 0.96, 0.97),
+            |l| {
+                for run in &title {
+                    l.glyphs(offset_run(run, 40.0, 40.0));
+                }
+                for (i, run) in body.iter().enumerate() {
+                    for line in 0..3 {
+                        l.glyphs(offset_run(run, 40.0, 140.0 + 34.0 * (3 * i + line) as f64));
+                    }
+                }
+                // Card grid: 4 columns x 3 rows of shadowed cards.
+                for row in 0u8..3 {
+                    for col in 0u8..4 {
+                        let x = 40.0 + f64::from(col) * 246.0;
+                        let y = 280.0 + f64::from(row) * 220.0;
+                        let card = RoundedRect::from_rect(
+                            Rect::new(x, y, x + 226.0, y + 200.0),
+                            RoundedRectRadii::new(14.0, 14.0, 14.0, 14.0),
+                        );
+                        l.shadow(
+                            Shape::RoundedRect(card),
+                            4.0,
+                            [0.0, 3.0],
+                            srgba(0.0, 0.0, 0.0, 0.22),
+                        );
+                        l.fill(Shape::RoundedRect(card), solid(white));
+                        l.stroke(
+                            Shape::RoundedRect(card),
+                            StrokeStyle {
+                                width: 1.0,
+                                ..StrokeStyle::default()
+                            },
+                            solid(srgba(0.0, 0.0, 0.0, 0.12)),
+                        );
+                        for run in &label {
+                            l.glyphs(offset_run(run, x + 20.0, y + 24.0));
+                        }
+                    }
+                }
+                // Bar chart: 24 bars inside a framed plot.
+                let chart_top = 1000.0;
+                let chart_h = 300.0;
+                l.stroke(
+                    Shape::Rect(Rect::new(40.0, chart_top, 984.0, chart_top + chart_h)),
+                    StrokeStyle {
+                        width: 1.0,
+                        ..StrokeStyle::default()
+                    },
+                    solid(srgba(0.0, 0.0, 0.0, 0.25)),
+                );
+                let bar_paint = solid(srgb(0.2, 0.5, 0.9));
+                for i in 0u8..24 {
+                    let x = 56.0 + f64::from(i) * 39.0;
+                    let h = 40.0 + f64::from((i * 37) % 200);
+                    l.fill(
+                        Shape::Rect(Rect::new(x, chart_top + chart_h - h, x + 28.0, chart_top + chart_h)),
+                        bar_paint.clone(),
+                    );
+                }
+                // Live counter, in the same content layer: the digits of
+                // "active users" ticking 00..59.
+                let counter = l.item_count();
+                for run in &digits[0] {
+                    l.glyphs(offset_run(run, 60.0, 240.0));
+                }
+                l.live(Live {
+                    item: counter,
+                    frames: digits
+                        .iter()
+                        .map(|runs| Draw::Glyphs(offset_run(&runs[0], 60.0, 240.0)))
+                        .collect(),
+                });
+                // Live bar: the last bar pulses every frame.
+                let last = l.item_count();
+                let bx = 56.0 + 23.0 * 39.0;
+                l.fill(
+                    Shape::Rect(Rect::new(bx + 39.0, chart_top + chart_h - 120.0, bx + 39.0 + 28.0, chart_top + chart_h)),
+                    bar_paint.clone(),
+                );
+                l.live(Live {
+                    item: last,
+                    frames: (0u8..60)
+                        .map(|n| {
+                            let h = 40.0 + f64::from(n) * 3.0;
+                            Draw::Fill {
+                                shape: Shape::Rect(Rect::new(
+                                    bx + 39.0,
+                                    chart_top + chart_h - h,
+                                    bx + 39.0 + 28.0,
+                                    chart_top + chart_h,
+                                )),
+                                rule: FillRule::NonZero,
+                                paint: bar_paint.clone(),
+                            }
+                        })
+                        .collect(),
                 });
             },
             blobs,

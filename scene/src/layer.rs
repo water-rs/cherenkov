@@ -54,6 +54,24 @@ pub struct Layer {
     /// Ordered items: child layers and draw commands.
     #[serde(default)]
     pub items: Vec<Item>,
+    /// Draw items whose value changes every frame, indexed into `items`
+    /// (the target must be an `Item::Draw`). Frame `n` uses
+    /// `frames[n % len]`; frame 0 is the static scene the oracle renders.
+    /// Only the cherenkov adapters honour `live` (as engine slot updates);
+    /// others render frame 0.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub live: Vec<Live>,
+}
+
+/// Per-frame values for one draw item: `frames[n % len]` replaces the
+/// item's value on frame `n`. Every entry must be the same `Draw` variant
+/// as `items[item]`; `frames[0]` equals the base item.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Live {
+    /// Index into the owning layer's `items`.
+    pub item: usize,
+    /// The draw's value per frame.
+    pub frames: Vec<crate::Draw>,
 }
 
 /// A layer's one-time motion, applied once when it enters the scene.
@@ -131,6 +149,7 @@ impl Default for Layer {
             scroll_offset: Vec2::ZERO,
             motion: None,
             items: Vec::new(),
+            live: Vec::new(),
         }
     }
 }

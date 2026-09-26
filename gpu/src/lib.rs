@@ -33,7 +33,7 @@ mod surface;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::marker::PhantomData;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::mpsc::Sender;
 
 pub use crate::config::{Budget, Bytes, GpuConfig, GpuInfo, MemoryUsage, Pressure};
@@ -73,7 +73,8 @@ pub struct Engine<B: Backend> {
     tx: Sender<Message>,
     info: GpuInfo,
     stats: Cell<FrameStats>,
-    surfaces: RefCell<HashMap<SurfaceId, Rc<RefCell<SurfaceShared>>>>,
+    /// Weak handles to live surfaces, purged of dead entries on every use.
+    surfaces: RefCell<HashMap<SurfaceId, Weak<RefCell<SurfaceShared>>>>,
     next_surface: Cell<SurfaceId>,
     next_font: Cell<u64>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -122,8 +123,13 @@ impl Engine<Gpu> {
 
     /// Reports system memory pressure. `Critical` clears the glyph atlas;
     /// `Moderate` currently does nothing.
-    pub fn trim(&self, pressure: Pressure) {
-        let _ = self.tx.send(Message::Trim(pressure));
+    ///
+    /// # Errors
+    /// [`EngineError::Thread`] when the render thread is gone.
+    pub fn trim(&self, pressure: Pressure) -> Result<(), EngineError> {
+        self.tx
+            .send(Message::Trim(pressure))
+            .map_err(|_| EngineError::Thread("render thread gone".into()))
     }
 
     /// The engine's current memory usage.
@@ -134,10 +140,10 @@ impl Engine<Gpu> {
     #[must_use]
     pub fn memory(&self) -> MemoryUsage {
         let (reply, rx) = std::sync::mpsc::channel();
-        if self.tx.send(Message::Memory { reply }).is_err() {
-            return MemoryUsage::default();
-        }
-        rx.recv().unwrap_or_default()
+        self.tx
+            .send(Message::Memory { reply })
+            .expect("render thread alive");
+        rx.recv().expect("render thread alive")
     }
 
     /// Registers a font.
@@ -154,27 +160,38 @@ impl Engine<Gpu> {
         font::validate_font(&source.data, source.index)?;
         let id = self.next_font.get();
         self.next_font.set(id + 1);
-        let _ = self.tx.send(Message::AddFont {
-            id,
-            data: source.data,
-            index: source.index,
-        });
+        self.tx
+            .send(Message::AddFont {
+                id,
+                data: source.data,
+                index: source.index,
+            })
+            .map_err(|_| ResourceError::Lost)?;
         Ok(Font::new(cherenkov::FontId::new(id)))
     }
 
     /// Creates an offscreen surface.
     ///
     /// # Errors
+    /// [`SurfaceError::ZeroSize`] when a dimension is zero,
     /// [`SurfaceError::TooLarge`] when the size exceeds the device limit and
     /// [`SurfaceError::Lost`] when the render thread is gone.
     pub fn surface(&self, target: Offscreen) -> Result<Surface, SurfaceError> {
         let id = self.next_surface.get();
         self.next_surface.set(id + 1);
         let surface = Surface::new(id, target.size, self.tx.clone())?;
-        self.surfaces
-            .borrow_mut()
-            .insert(id, Rc::clone(&surface.shared));
+        let mut surfaces = self.surfaces.borrow_mut();
+        surfaces.retain(|_, s| s.strong_count() > 0);
+        surfaces.insert(id, Rc::downgrade(&surface.shared));
         Ok(surface)
+    }
+
+    /// The number of surfaces still alive, for leak testing.
+    #[doc(hidden)]
+    pub fn live_surfaces(&self) -> usize {
+        let mut surfaces = self.surfaces.borrow_mut();
+        surfaces.retain(|_, s| s.strong_count() > 0);
+        surfaces.len()
     }
 
     /// Renders every dirty surface for the frame at `time`, blocking until
@@ -186,12 +203,18 @@ impl Engine<Gpu> {
     /// this slice does not draw, [`RenderError::DeviceLost`] when the device
     /// is lost and [`RenderError::Thread`] when the render thread is gone.
     pub fn render(&self, time: FrameTime) -> Result<Next, RenderError> {
-        for (id, shared) in self.surfaces.borrow().iter() {
-            if let Some(changes) = shared.borrow_mut().take_changes() {
-                let _ = self.tx.send(Message::Commit {
-                    surface: *id,
-                    changes,
-                });
+        {
+            let mut surfaces = self.surfaces.borrow_mut();
+            surfaces.retain(|_, s| s.strong_count() > 0);
+            for (id, shared) in surfaces.iter() {
+                if let Some(shared) = shared.upgrade()
+                    && let Some(changes) = shared.borrow_mut().take_changes()
+                {
+                    let _ = self.tx.send(Message::Commit {
+                        surface: *id,
+                        changes,
+                    });
+                }
             }
         }
         let (reply, rx) = std::sync::mpsc::channel();

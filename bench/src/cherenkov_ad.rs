@@ -155,21 +155,48 @@ const fn missing_api(f: &Feature) -> Option<&'static str> {
     }
 }
 
+/// The scene blend mode matching a front-end mode one-for-one by name.
+const fn scene_blend(m: cherenkov::BlendMode) -> BlendMode {
+    match m {
+        cherenkov::BlendMode::Normal => BlendMode::Normal,
+        cherenkov::BlendMode::Multiply => BlendMode::Multiply,
+        cherenkov::BlendMode::Screen => BlendMode::Screen,
+        cherenkov::BlendMode::Overlay => BlendMode::Overlay,
+        cherenkov::BlendMode::Darken => BlendMode::Darken,
+        cherenkov::BlendMode::Lighten => BlendMode::Lighten,
+        cherenkov::BlendMode::ColorDodge => BlendMode::ColorDodge,
+        cherenkov::BlendMode::ColorBurn => BlendMode::ColorBurn,
+        cherenkov::BlendMode::HardLight => BlendMode::HardLight,
+        cherenkov::BlendMode::SoftLight => BlendMode::SoftLight,
+        cherenkov::BlendMode::Difference => BlendMode::Difference,
+        cherenkov::BlendMode::Exclusion => BlendMode::Exclusion,
+        cherenkov::BlendMode::Hue => BlendMode::Hue,
+        cherenkov::BlendMode::Saturation => BlendMode::Saturation,
+        cherenkov::BlendMode::Color => BlendMode::Color,
+        cherenkov::BlendMode::Luminosity => BlendMode::Luminosity,
+    }
+}
+
 /// The scene [`Feature`] a render-time [`Unsupported`] maps back to.
+///
+/// `Shader`, `Mesh`, `Filter` and `BlendSpace` have no scene feature of
+/// their own; they report the nearest declared one (`Fill`) while the `api`
+/// string names the real construct.
 const fn unsupported_feature(u: Unsupported) -> Feature {
     match u {
         Unsupported::Path => Feature::Path,
         Unsupported::Sweep => Feature::SweepGradient,
-        Unsupported::Image | Unsupported::Shader => Feature::Image,
-        Unsupported::Blend | Unsupported::BlendSpace => Feature::Blend(BlendMode::Normal),
-        Unsupported::Filter => Feature::Opacity,
+        Unsupported::Image => Feature::Image,
+        Unsupported::Blend(mode) => Feature::Blend(scene_blend(mode)),
+        Unsupported::Mesh | Unsupported::Shader | Unsupported::Filter | Unsupported::BlendSpace => {
+            Feature::Fill
+        }
         Unsupported::StrokeDash => Feature::StrokeDash,
         Unsupported::StrokeJoin => Feature::Stroke,
         Unsupported::GlyphStroke | Unsupported::GlyphTransform | Unsupported::ColorFont => {
             Feature::Glyphs
         }
         Unsupported::Shadow => Feature::Shadow,
-        _ => Feature::Fill,
     }
 }
 

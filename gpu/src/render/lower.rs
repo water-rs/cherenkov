@@ -227,20 +227,20 @@ fn clamped_radii(radii: kurbo::RoundedRectRadii, half: [f32; 2]) -> [f32; 4] {
     ]
 }
 
-/// A cheap over-estimate of one device pixel in local space, for antialiasing
-/// margins: `2 * max(1, 1 / min column length of the 2x2)`.
+/// One device pixel in local space, for antialiasing margins: `2 / lmin`
+/// where `lmin` is the smaller column norm of the 2x2. A degenerate
+/// transform (`lmin` ~ 0) draws nothing, so the margin is 0.
 fn aa_margin(transform: Affine) -> f64 {
     let [c0, c1, c2, c3, _, _] = transform.as_coeffs();
-    let l0 = c0.hypot(c1);
-    let l1 = c2.hypot(c3);
-    2.0 * (1.0 / l0.min(l1)).max(1.0)
+    let lmin = c0.hypot(c1).min(c2.hypot(c3));
+    if lmin <= 1e-9 { 0.0 } else { 2.0 / lmin }
 }
 
 /// The blur sigma the shader integrates against, modelling the oracle's
-/// pixel-area sampling: `sqrt(sigma² + 1/6)` for a positive sigma.
+/// pixel-area sampling: `sqrt(sigma² + 1/12)` for a positive sigma.
 fn shadow_sigma(sigma: f64) -> f64 {
     if sigma > 0.0 {
-        sigma.mul_add(sigma, 1.0 / 6.0).sqrt()
+        sigma.mul_add(sigma, 1.0 / 12.0).sqrt()
     } else {
         sigma
     }
@@ -388,8 +388,6 @@ pub struct GlyphContext<'a> {
     pub atlas: &'a mut Atlas,
     /// For cell uploads.
     pub queue: &'a wgpu::Queue,
-    /// For atlas regrowth.
-    pub device: &'a wgpu::Device,
     /// Registered fonts.
     pub fonts: &'a HashMap<u64, FontData>,
 }
@@ -753,7 +751,7 @@ impl<'a> Lowering<'a> {
                         return Err(Unsupported::Filter.into());
                     }
                     if group.blend != BlendMode::Normal {
-                        return Err(Unsupported::Blend.into());
+                        return Err(Unsupported::Blend(group.blend).into());
                     }
                     if group.blend_space != BlendSpace::Linear {
                         return Err(Unsupported::BlendSpace.into());
@@ -981,7 +979,6 @@ impl<'a> Lowering<'a> {
             } else {
                 self.glyphs += 1;
                 rasterize(
-                    glyphs.device,
                     glyphs.queue,
                     glyphs.atlas,
                     font,

@@ -492,6 +492,9 @@ pub fn run(config: GpuConfig, rx: Receiver<Message>, init_tx: Sender<Result<Init
 impl Renderer {
     /// Creates a surface's target texture and layer tree.
     fn create_surface(&mut self, id: SurfaceId, size: (u32, u32)) -> Result<(), SurfaceError> {
+        if size.0 == 0 || size.1 == 0 {
+            return Err(SurfaceError::ZeroSize);
+        }
         if size.0 > self.max_texture || size.1 > self.max_texture {
             return Err(SurfaceError::TooLarge {
                 width: size.0,
@@ -525,6 +528,7 @@ impl Renderer {
         };
         if let Some(clear) = changes.clear {
             state.clear = clear;
+            state.dirty = true;
         }
         for op in changes.ops {
             state.dirty = true;
@@ -671,19 +675,37 @@ impl Renderer {
             };
             surf.frame.reset();
             let layers = std::mem::take(&mut surf.layers);
-            let result = if let Some(root) = layers.get(&0) {
-                let mut glyphs = GlyphContext {
-                    atlas: &mut self.atlas,
-                    queue: &self.queue,
-                    device: &self.device,
-                    fonts: &self.fonts,
+            // A full atlas is a recoverable signal: grow while the budget
+            // allows, then clear once; a second failure after the clear
+            // means the frame's live set exceeds the maximum atlas.
+            let mut cleared = false;
+            let result = loop {
+                let result = if let Some(root) = layers.get(&0) {
+                    let mut glyphs = GlyphContext {
+                        atlas: &mut self.atlas,
+                        queue: &self.queue,
+                        fonts: &self.fonts,
+                    };
+                    let mut lowering = Lowering::new(&mut surf.frame, surf.size);
+                    let result = lowering.run(root, &layers, surf.clear, &mut glyphs);
+                    stats.glyphs_rasterized += lowering.glyphs_rasterized();
+                    result
+                } else {
+                    Ok(())
                 };
-                let mut lowering = Lowering::new(&mut surf.frame, surf.size);
-                let result = lowering.run(root, &layers, surf.clear, &mut glyphs);
-                stats.glyphs_rasterized += lowering.glyphs_rasterized();
-                result
-            } else {
-                Ok(())
+                match result {
+                    Err(RenderError::AtlasFull) if !cleared => {
+                        surf.frame.reset();
+                        if self.atlas.size() < self.atlas.cap() {
+                            self.atlas.grow(&self.device);
+                        } else {
+                            self.atlas.clear();
+                            cleared = true;
+                        }
+                    }
+                    Err(RenderError::AtlasFull) => break Err(RenderError::AtlasExhausted),
+                    other => break other,
+                }
             };
             surf.layers = layers;
             result

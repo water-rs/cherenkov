@@ -323,9 +323,17 @@ impl Surface {
     /// Registers a surface of `size` pixels with the render thread.
     ///
     /// # Errors
+    /// [`SurfaceError::ZeroSize`] when a dimension is zero,
     /// [`SurfaceError::TooLarge`] when a dimension exceeds the device limit
     /// and [`SurfaceError::Lost`] when the render thread is gone.
-    pub fn new(id: SurfaceId, size: (u32, u32), tx: Sender<Message>) -> Result<Self, SurfaceError> {
+    pub(crate) fn new(
+        id: SurfaceId,
+        size: (u32, u32),
+        tx: Sender<Message>,
+    ) -> Result<Self, SurfaceError> {
+        if size.0 == 0 || size.1 == 0 {
+            return Err(SurfaceError::ZeroSize);
+        }
         let shared = Rc::new(RefCell::new(SurfaceShared {
             next_layer: Cell::new(1),
             ..SurfaceShared::default()

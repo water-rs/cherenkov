@@ -90,6 +90,8 @@ struct PrepLayer {
     clip: Option<ShapeKind>,
     /// Group opacity.
     opacity: f64,
+    /// Blend onto the parent.
+    blend: cherenkov::BlendMode,
     /// The layer's own content — only when every draw precedes every child.
     own: Vec<Op>,
     /// Ordered children.
@@ -134,7 +136,6 @@ fn cherenkov_features() -> Vec<Feature> {
         Feature::FontVariations,
         Feature::HdrColor,
         Feature::WideGamut,
-        Feature::Blend(BlendMode::Normal),
         Feature::SweepGradient,
         Feature::ExtendNone,
         // `sRGB` maps to `SrgbEncoded`; `linear-p3` and `linear-srgb` are
@@ -143,13 +144,15 @@ fn cherenkov_features() -> Vec<Feature> {
         Feature::InterpolationSpace(ColorSpace::LinearP3),
         Feature::InterpolationSpace(ColorSpace::LinearSrgb),
     ]
+    .into_iter()
+    .chain(BlendMode::ALL.into_iter().map(Feature::Blend))
+    .collect()
 }
 
 /// The upstream API this slice lacks for a declared scene feature.
 const fn missing_api(f: &Feature) -> Option<&'static str> {
     match f {
         Feature::Image | Feature::ImagePaint => Some("no images in this slice"),
-        Feature::Blend(_) => Some("only normal blending in this slice"),
         Feature::InterpolationSpace(_) => Some("only srgb / linear interpolation in this slice"),
         _ => None,
     }
@@ -159,7 +162,7 @@ const fn missing_api(f: &Feature) -> Option<&'static str> {
 const fn unsupported_feature(u: Unsupported) -> Feature {
     match u {
         Unsupported::Mesh | Unsupported::Image | Unsupported::Shader => Feature::Image,
-        Unsupported::Blend | Unsupported::BlendSpace => Feature::Blend(BlendMode::Normal),
+        Unsupported::BlendSpace => Feature::Blend(BlendMode::Normal),
         Unsupported::Filter => Feature::Opacity,
         Unsupported::GlyphStroke | Unsupported::GlyphTransform | Unsupported::ColorFont => {
             Feature::Glyphs
@@ -196,6 +199,40 @@ fn working(c: &cherenkov_scene::Color) -> cherenkov::WorkingColor {
         (0.0, 0.0, 0.0)
     };
     cherenkov::WorkingColor::new([r as f32, g as f32, b as f32, a as f32])
+}
+
+/// The front-end blend mode matching a scene mode one-for-one by name.
+const fn cpu_blend(m: BlendMode) -> cherenkov::BlendMode {
+    match m {
+        BlendMode::Normal => cherenkov::BlendMode::Normal,
+        BlendMode::Multiply => cherenkov::BlendMode::Multiply,
+        BlendMode::Screen => cherenkov::BlendMode::Screen,
+        BlendMode::Overlay => cherenkov::BlendMode::Overlay,
+        BlendMode::Darken => cherenkov::BlendMode::Darken,
+        BlendMode::Lighten => cherenkov::BlendMode::Lighten,
+        BlendMode::ColorDodge => cherenkov::BlendMode::ColorDodge,
+        BlendMode::ColorBurn => cherenkov::BlendMode::ColorBurn,
+        BlendMode::HardLight => cherenkov::BlendMode::HardLight,
+        BlendMode::SoftLight => cherenkov::BlendMode::SoftLight,
+        BlendMode::Difference => cherenkov::BlendMode::Difference,
+        BlendMode::Exclusion => cherenkov::BlendMode::Exclusion,
+        BlendMode::Hue => cherenkov::BlendMode::Hue,
+        BlendMode::Saturation => cherenkov::BlendMode::Saturation,
+        BlendMode::Color => cherenkov::BlendMode::Color,
+        BlendMode::Luminosity => cherenkov::BlendMode::Luminosity,
+        BlendMode::Clear => cherenkov::BlendMode::Clear,
+        BlendMode::Src => cherenkov::BlendMode::Src,
+        BlendMode::Dst => cherenkov::BlendMode::Dst,
+        BlendMode::DestOver => cherenkov::BlendMode::DestOver,
+        BlendMode::SrcIn => cherenkov::BlendMode::SrcIn,
+        BlendMode::DestIn => cherenkov::BlendMode::DestIn,
+        BlendMode::SrcOut => cherenkov::BlendMode::SrcOut,
+        BlendMode::DestOut => cherenkov::BlendMode::DestOut,
+        BlendMode::SrcAtop => cherenkov::BlendMode::SrcAtop,
+        BlendMode::DestAtop => cherenkov::BlendMode::DestAtop,
+        BlendMode::Xor => cherenkov::BlendMode::Xor,
+        BlendMode::PlusLighter => cherenkov::BlendMode::PlusLighter,
+    }
 }
 
 const fn extend(e: Extend) -> Result<cherenkov::Extend, BenchError> {
@@ -441,6 +478,7 @@ fn prep_layer(
             .as_ref()
             .map(|s| shape_kind(s, cherenkov::FillRule::NonZero)),
         opacity: layer.opacity,
+        blend: cpu_blend(layer.blend),
         own: Vec::new(),
         items: Vec::new(),
     };
@@ -492,6 +530,7 @@ fn build_layer(
         let edit = &mut tx[&layer];
         edit.transform(prep.transform);
         edit.opacity(prep.opacity as f32);
+        edit.blend(prep.blend);
         if let Some(clip) = &prep.clip {
             clip_shape(edit, clip);
         }

@@ -222,6 +222,7 @@ pub struct LayerEdit {
 pub enum EditOp {
     Transform(Affine),
     Opacity(f32),
+    Blend(cherenkov::BlendMode),
     Clip(Option<ShapeData>),
     Content(LayerContent),
     Push(LayerId),
@@ -239,6 +240,12 @@ impl LayerEdit {
     /// Sets the opacity.
     pub fn opacity(&mut self, o: f32) -> &mut Self {
         self.ops.push(EditOp::Opacity(o));
+        self
+    }
+
+    /// Sets the blend mode.
+    pub fn blend(&mut self, blend: cherenkov::BlendMode) -> &mut Self {
+        self.ops.push(EditOp::Blend(blend));
         self
     }
 
@@ -420,6 +427,7 @@ impl Surface {
                     match op {
                         EditOp::Transform(t) => ops.push(LayerOp::Transform(id, t)),
                         EditOp::Opacity(o) => ops.push(LayerOp::Opacity(id, o)),
+                        EditOp::Blend(b) => ops.push(LayerOp::Blend(id, b)),
                         EditOp::Clip(shape) => ops.push(LayerOp::Clip(id, shape)),
                         EditOp::Content(LayerContent::Content(content)) => {
                             shared.contents.insert(id, content);

@@ -66,8 +66,10 @@ use skia_safe::{
     surfaces,
 };
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use crate::GpuSample;
 use crate::convert::{self, Blobs};
-use crate::{BenchError, Counters, DeviceInfo, EncodeInput, Engine, EngineInfo, GpuSample, Submit};
+use crate::{BenchError, Counters, DeviceInfo, EncodeInput, Engine, EngineInfo, Submit};
 
 /// Features the Skia adapter executes faithfully on its `RGBAF16`
 /// linear-P3 route.
@@ -1330,7 +1332,9 @@ mod graphite_metal {
 
     use super::{SkiaPrepared, build_cmds, p3_cs, replay, skia_features, skia_missing_api};
     use crate::convert;
-    use crate::{BenchError, Counters, DeviceInfo, EncodeInput, Engine, EngineInfo, Submit};
+    use crate::{
+        BenchError, Counters, DeviceInfo, EncodeInput, Engine, EngineInfo, GpuSample, Submit,
+    };
 
     /// Skia Graphite on Metal: an offscreen `RGBAF16` linear-P3 render
     /// target on the system device, timed by command-buffer markers.

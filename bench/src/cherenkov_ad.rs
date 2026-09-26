@@ -841,10 +841,11 @@ impl Engine for Cherenkov {
     }
 
     fn submit(&mut self, frame: u64, readback: bool) -> Result<Submit, BenchError> {
-        let surface = self
-            .surface
-            .as_ref()
-            .ok_or_else(|| BenchError::Engine("cherenkov: submit before prepare".into()))?;
+        if self.surface.is_none() {
+            return Err(BenchError::Engine(
+                "cherenkov: submit before prepare".into(),
+            ));
+        }
         self.engine.render(FrameTime::now()).map_err(render_error)?;
         let stats = self.engine.stats();
         self.in_flight.insert(
@@ -855,7 +856,12 @@ impl Engine for Cherenkov {
         );
         let gpu = self.gpu_samples(stats.timings);
         let image = if readback {
-            let rb = surface.readback().map_err(render_error)?;
+            let rb = self
+                .surface
+                .as_ref()
+                .ok_or_else(|| BenchError::Engine("cherenkov: submit before prepare".into()))?
+                .readback()
+                .map_err(render_error)?;
             Some(cherenkov_oracle::F32Image {
                 width: rb.width,
                 height: rb.height,

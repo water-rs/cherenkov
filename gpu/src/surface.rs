@@ -155,7 +155,9 @@ impl FrameId {
 }
 
 /// The GPU time of one submitted frame, read from its timestamp
-/// queries. Queries resolve after the GPU finishes the frame, so the
+/// queries.
+///
+/// Queries resolve after the GPU finishes the frame, so the
 /// timing reaches [`FrameStats::timings`] of a later
 /// [`crate::Engine::render`] or [`crate::Engine::finish_timings`] —
 /// rendering never waits for GPU idle.

@@ -121,8 +121,10 @@ enum Sub {
 pub fn run_args(args: &[OsString]) -> i32 {
     // The iOS host calls `cherenkov_bench_run` once per argument list
     // inside one process, so a later call finds the global subscriber
-    // already installed; `try_init` keeps re-entry clean.
+    // already installed; `try_init` keeps re-entry clean. Diagnostics
+    // go to stderr (the host captures it per run into `run-<n>.log`).
     let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
@@ -155,7 +157,9 @@ pub fn run_args(args: &[OsString]) -> i32 {
 /// calls this once per argument list. `main` forwards to this too, so
 /// the binary and the embedded library share one code path.
 ///
-/// Returns the process-style exit code (0 on success).
+/// Returns the process-style exit code (0 on success, 101 on panic —
+/// unwinding cannot cross `extern "C"`, so a panicking run would
+/// otherwise abort the host and every queued run with it).
 ///
 /// # Safety
 /// `argv` must point to `argc` entries, each either null or a valid
@@ -165,7 +169,7 @@ pub fn run_args(args: &[OsString]) -> i32 {
 pub unsafe extern "C" fn cherenkov_bench_run(argc: c_int, argv: *const *const c_char) -> c_int {
     // SAFETY: the caller upholds the contract above.
     let args = unsafe { collect_argv(argc, argv) };
-    run_args(&args)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_args(&args))).unwrap_or(101)
 }
 
 /// Collects C `argv` into [`OsString`]s, preserving bytes on unix.

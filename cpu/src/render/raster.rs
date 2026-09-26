@@ -168,32 +168,219 @@ impl Accum {
         }
     }
 
-    /// Folds band-local row `y` into per-pixel coverage under `rule`,
-    /// calling `f(x, coverage)` for each pixel `x0..x1`.
+    /// Folds band-local row `y` into per-pixel coverage, calling
+    /// `f(x, coverage)` for each pixel `x0..x1`.
     ///
     /// The prefix sum starts at guard column `x0` and the coverage of
-    /// pixel `x` is the sum through column `x + 1`.
-    pub fn coverage_row(
-        &self,
-        y: usize,
-        rule: FillRule,
-        x0: usize,
-        x1: usize,
-        mut f: impl FnMut(usize, f32),
-    ) {
+    /// pixel `x` is the sum through column `x + 1`. Deposits arrive via
+    /// [`deposit_exact`], which only ever produces winding ±1, so a
+    /// plain `abs().min(1)` fold is the coverage for either fill rule.
+    pub fn coverage_row(&self, y: usize, x0: usize, x1: usize, mut f: impl FnMut(usize, f32)) {
         let row = y * (self.w + 2);
         let mut acc = self.a[row + x0];
         for x in x0..x1.min(self.w) {
             acc += self.a[row + x + 1];
-            let cov = match rule {
-                FillRule::NonZero => acc.abs().min(1.0),
-                FillRule::EvenOdd => {
-                    let m = acc.rem_euclid(2.0);
-                    if m > 1.0 { 2.0 - m } else { m }
-                }
-            };
+            let cov = acc.abs().min(1.0);
             if cov > 0.0 {
                 f(x, cov);
+            }
+        }
+    }
+}
+
+/// A polygon edge swept across a strip: `x(y) = top + dxdy·(y - ylo)`.
+#[derive(Clone, Copy, Debug)]
+struct Swept {
+    /// Top end y.
+    ylo: f32,
+    /// Bottom end y.
+    yhi: f32,
+    /// x at `ylo`.
+    top: f32,
+    /// dx/dy.
+    dxdy: f32,
+    /// Winding contribution when crossed left-to-right: +1 for a
+    /// downward edge, -1 for upward.
+    dir: f32,
+}
+
+impl Swept {
+    fn x_at(&self, y: f32) -> f32 {
+        self.dxdy.mul_add(y - self.ylo, self.top)
+    }
+}
+
+/// The smallest y below `above` at which adjacent crossings `order[k]`
+/// and `order[k+1]` change order, over all k, or `None`. Intersections
+/// at or just below `below` count — a pair can cross exactly on the
+/// strip top and still sort pre-flip by f32 rounding of `x_at`.
+fn next_crossing(lines: &[Swept], order: &[usize], below: f32, above: f32) -> Option<f32> {
+    let mut hit = None;
+    for pair in order.windows(2) {
+        let (a, b) = (lines[pair[0]], lines[pair[1]]);
+        if a.x_at(above) <= b.x_at(above) {
+            continue;
+        }
+        let dm = a.dxdy - b.dxdy;
+        if dm.abs() <= f32::EPSILON {
+            continue;
+        }
+        let y = (b.top - a.top + a.dxdy.mul_add(a.ylo, -b.dxdy * b.ylo)) / dm;
+        if y > below - 1e-5 && y < hit.unwrap_or(above) {
+            hit = Some(y);
+        }
+    }
+    hit
+}
+
+/// Deposits the inside of `edges` (band-local y within `0..bh`) into
+/// `acc` under `rule` as disjoint trapezoids of winding exactly ±1, so
+/// `coverage_row`'s `abs().min(1)` fold is exact even where the path
+/// self-intersects or contours overlap.
+///
+/// Each band row is split into strips at every interior edge endpoint;
+/// within a strip every edge is a straight line, so two adjacent
+/// crossings that swap order do so at one intersection y, which splits
+/// the strip further. Per sub-strip the inside intervals between
+/// consecutive crossings (a left→right walk accumulating winding) are
+/// deposited as a consistently oriented quad: the left edge down and
+/// the right edge up.
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::too_many_lines,
+    clippy::while_float,
+    reason = "row indices are small; y/x names mirror the geometry"
+)]
+pub fn deposit_exact(
+    acc: &mut Accum,
+    edges: impl Iterator<Item = Edge>,
+    rule: FillRule,
+    bh: usize,
+) {
+    const EPS_Y: f32 = 1e-7;
+    let mut lines = Vec::new();
+    let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); bh];
+    for e in edges {
+        if (e.y0 - e.y1).abs() <= f32::EPSILON {
+            continue;
+        }
+        let (ylo, yhi, top) = if e.y0 < e.y1 {
+            (e.y0, e.y1, e.x0)
+        } else {
+            (e.y1, e.y0, e.x1)
+        };
+        lines.push(Swept {
+            ylo,
+            yhi,
+            top,
+            dxdy: (e.x1 - e.x0) / (e.y1 - e.y0),
+            dir: if e.y0 < e.y1 { 1.0 } else { -1.0 },
+        });
+        let r0 = (ylo.floor() as usize).min(bh);
+        let r1 = ((yhi.ceil() as usize).min(bh)).max(r0);
+        for bucket in &mut buckets[r0..r1] {
+            bucket.push(lines.len() - 1);
+        }
+    }
+    let mut order: Vec<usize> = Vec::new();
+    let mut prev: Vec<usize> = Vec::new();
+    let mut bounds: Vec<f32> = Vec::new();
+    for (r, bucket) in buckets.iter().enumerate() {
+        if bucket.is_empty() {
+            continue;
+        }
+        // Strip bounds: the row edges plus every endpoint inside it.
+        bounds.clear();
+        bounds.push(r as f32);
+        bounds.push((r + 1) as f32);
+        for &i in bucket {
+            for y in [lines[i].ylo, lines[i].yhi] {
+                if y > bounds[0] && y < bounds[1] {
+                    bounds.push(y);
+                }
+            }
+        }
+        bounds.sort_by(f32::total_cmp);
+        bounds.dedup_by(|a, b| (*a - *b).abs() <= EPS_Y);
+        for strip in bounds.windows(2) {
+            let (s0, s1) = (strip[0], strip[1]);
+            if s1 - s0 <= EPS_Y {
+                continue;
+            }
+            let mid = s0.midpoint(s1);
+            // Endpoints strictly inside the row are strip bounds, so an
+            // edge covering this strip covers it fully.
+            order.clear();
+            order.extend(
+                bucket
+                    .iter()
+                    .copied()
+                    .filter(|&i| lines[i].ylo < mid && lines[i].yhi > mid),
+            );
+            if order.len() < 2 {
+                // A lone crossing pairs with nothing; it bounds no
+                // inside interval.
+                continue;
+            }
+            prev.clear();
+            let mut c0 = s0;
+            while c0 < s1 - EPS_Y {
+                order.sort_by(|&a, &b| {
+                    let ka = (lines[a].x_at(c0), lines[a].x_at(s1));
+                    let kb = (lines[b].x_at(c0), lines[b].x_at(s1));
+                    ka.partial_cmp(&kb).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let next = next_crossing(&lines, &order, c0, s1);
+                if let Some(y) = next
+                    && y <= c0 + EPS_Y
+                {
+                    // A pair crossed essentially at the strip top
+                    // but sorted pre-flip by rounding: skip the
+                    // hairline sliver so the re-sort sees the
+                    // post-flip order. The step must clear the f32
+                    // ulp of c0 (≈2e-6 at y=20) or it never lands.
+                    c0 = s1.min(c0 + (4.0 * c0 * f32::EPSILON).max(1e-5));
+                    continue;
+                }
+                let c1 = if order == prev {
+                    // A tangency cluster at c0 left the order unchanged:
+                    // close the strip out on the far end's order.
+                    order.sort_by(|&a, &b| {
+                        lines[a]
+                            .x_at(s1)
+                            .partial_cmp(&lines[b].x_at(s1))
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    s1
+                } else {
+                    prev.clear();
+                    prev.extend_from_slice(&order);
+                    next.unwrap_or(s1).min(s1)
+                };
+                // Inside intervals between consecutive crossings.
+                let mut wind = 0.0f32;
+                for i in 1..order.len() {
+                    wind += lines[order[i - 1]].dir;
+                    let inside = match rule {
+                        FillRule::NonZero => wind != 0.0,
+                        FillRule::EvenOdd => (wind.rem_euclid(2.0) - 1.0).abs() < 0.5,
+                    };
+                    if !inside {
+                        continue;
+                    }
+                    // Crossings only sit on sub-strip bounds, so the
+                    // pair's true left/right order is consistent through
+                    // (c0, c1); a tie at an endpoint is broken by the
+                    // other end's geometry.
+                    let (a, b) = (lines[order[i - 1]], lines[order[i]]);
+                    let (l0, r0) = (a.x_at(c0).min(b.x_at(c0)), a.x_at(c0).max(b.x_at(c0)));
+                    let (l1, r1) = (a.x_at(c1).min(b.x_at(c1)), a.x_at(c1).max(b.x_at(c1)));
+                    acc.draw_line(l0, c0, l1, c1);
+                    acc.draw_line(r1, c1, r0, c0);
+                }
+                c0 = c1;
             }
         }
     }
@@ -410,18 +597,25 @@ impl Band<'_> {
         // inside the guard window `x_lo .. x_hi + 1`.
         acc.set_window(x_lo, x_hi);
         acc.clear_range(y_lo, y_hi);
-        for e in edges {
-            // Only edges crossing the band deposit anything.
-            let ey0 = e.y0 - self.y0 as f32;
-            let ey1 = e.y1 - self.y0 as f32;
-            if ey0.max(ey1) < 0.0 || ey0.min(ey1) >= bh as f32 {
-                continue;
-            }
-            acc.draw_line(e.x0, ey0, e.x1, ey1);
-        }
+        deposit_exact(
+            acc,
+            edges.iter().filter_map(|e| {
+                // Only edges crossing the band deposit anything.
+                let ey0 = e.y0 - self.y0 as f32;
+                let ey1 = e.y1 - self.y0 as f32;
+                (ey0.max(ey1) >= 0.0 && ey0.min(ey1) < bh as f32).then_some(Edge {
+                    x0: e.x0,
+                    y0: ey0,
+                    x1: e.x1,
+                    y1: ey1,
+                })
+            }),
+            rule,
+            bh,
+        );
         for y in y_lo..y_hi {
             let py = self.y0 + y;
-            acc.coverage_row(y, rule, x_lo, x_hi, |x, cov| {
+            acc.coverage_row(y, x_lo, x_hi, |x, cov| {
                 let cc = clip_cov(clip, self.w, x, py);
                 if cc <= 0.0 {
                     return;
@@ -717,19 +911,157 @@ pub fn coverage_mask(edges: &[Edge], rule: FillRule, w: usize, h: usize) -> Vec<
             let y0 = band * BAND_H;
             let bh = slice.len() / w;
             let mut acc = Accum::new(w, bh);
-            for e in edges {
-                let ey0 = e.y0 - y0 as f32;
-                let ey1 = e.y1 - y0 as f32;
-                if ey0.max(ey1) < 0.0 || ey0.min(ey1) >= bh as f32 {
-                    continue;
-                }
-                acc.draw_line(e.x0, ey0, e.x1, ey1);
-            }
+            deposit_exact(
+                &mut acc,
+                edges.iter().filter_map(|e| {
+                    let ey0 = e.y0 - y0 as f32;
+                    let ey1 = e.y1 - y0 as f32;
+                    (ey0.max(ey1) >= 0.0 && ey0.min(ey1) < bh as f32).then_some(Edge {
+                        x0: e.x0,
+                        y0: ey0,
+                        x1: e.x1,
+                        y1: ey1,
+                    })
+                }),
+                rule,
+                bh,
+            );
             for y in 0..bh {
-                acc.coverage_row(y, rule, 0, w, |x, cov| {
+                acc.coverage_row(y, 0, w, |x, cov| {
                     slice[y * w + x] = cov;
                 });
             }
         });
     mask
+}
+
+#[cfg(test)]
+mod tests {
+    //! `deposit_exact` checked against the oracle's per-pixel exact-area
+    //! `Coverage`: the two must agree wherever a path's winding exceeds
+    //! ±1 (self-intersections, nested contours, overlapping contours).
+
+    use super::*;
+
+    fn scene_rule(rule: FillRule) -> cherenkov_scene::FillRule {
+        match rule {
+            FillRule::NonZero => cherenkov_scene::FillRule::NonZero,
+            FillRule::EvenOdd => cherenkov_scene::FillRule::EvenOdd,
+        }
+    }
+
+    fn oracle_mask(edges: &[Edge], rule: FillRule, w: usize, h: usize) -> Vec<f64> {
+        let mut cov = cherenkov_oracle::coverage::Coverage::new(w, h);
+        for e in edges {
+            cov.add_line(
+                f64::from(e.x0),
+                f64::from(e.y0),
+                f64::from(e.x1),
+                f64::from(e.y1),
+            );
+        }
+        cov.finish(scene_rule(rule))
+    }
+
+    fn assert_matches_oracle(edges: &[Edge], name: &str) {
+        for rule in [FillRule::NonZero, FillRule::EvenOdd] {
+            let got = coverage_mask(edges, rule, 24, 24);
+            let want = oracle_mask(edges, rule, 24, 24);
+            let max_diff = got
+                .iter()
+                .zip(&want)
+                .map(|(g, w)| (f64::from(*g) - w).abs())
+                .fold(0.0, f64::max);
+            assert!(
+                max_diff < 1e-4,
+                "{name} {rule:?}: max |diff| {max_diff} vs oracle"
+            );
+        }
+    }
+
+    /// A closed polygon's edges.
+    fn poly(points: &[(f32, f32)]) -> Vec<Edge> {
+        points
+            .iter()
+            .enumerate()
+            .map(|(i, &(x0, y0))| {
+                let (x1, y1) = points[(i + 1) % points.len()];
+                Edge { x0, y0, x1, y1 }
+            })
+            .collect()
+    }
+
+    #[test]
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::suboptimal_flops,
+        reason = "test geometry is far below 2^53"
+    )]
+    fn exact_coverage_matches_the_oracle() {
+        // (a) self-intersecting 5-point star.
+        let star: Vec<(f32, f32)> = (0..5i32)
+            .map(|i| {
+                let a = f64::from(i) * std::f64::consts::TAU / 5.0 - std::f64::consts::FRAC_PI_2;
+                (
+                    (10.0 * a.cos() + 12.0) as f32,
+                    (10.0 * a.sin() + 12.0) as f32,
+                )
+            })
+            .collect();
+        // Star polygon order (every other vertex) self-intersects.
+        let star_order = [0, 2, 4, 1, 3].map(|i| star[i]);
+        assert_matches_oracle(&poly(&star_order), "star");
+
+        // (b) two nested same-orientation squares offset by 0.3px.
+        let mut nested = poly(&[(2.3, 2.3), (21.3, 2.3), (21.3, 21.3), (2.3, 21.3)]);
+        nested.extend(poly(&[(6.6, 6.6), (17.6, 6.6), (17.6, 17.6), (6.6, 17.6)]));
+        assert_matches_oracle(&nested, "nested squares");
+
+        // (c) a figure-eight.
+        let eight = poly(&[
+            (4.0, 4.0),
+            (20.0, 12.0),
+            (4.0, 20.0),
+            (12.0, 12.0),
+            (20.0, 4.0),
+            (12.0, 12.0),
+            (4.0, 12.0),
+        ]);
+        assert_matches_oracle(&eight, "figure-eight");
+
+        // (d) bowtie: two triangles sharing a vertex.
+        let bowtie = poly(&[
+            (4.0, 4.0),
+            (20.0, 4.0),
+            (12.0, 12.0),
+            (20.0, 20.0),
+            (4.0, 20.0),
+        ]);
+        assert_matches_oracle(&bowtie, "bowtie");
+
+        // (e) 20 random polygons of 6-12 vertices.
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rng = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 40) as f32 / (1u32 << 24) as f32 * 22.0 + 1.0
+        };
+        for n in 0..20 {
+            let m = 6 + n % 7;
+            let points: Vec<(f32, f32)> = (0..m).map(|_| (rng(), rng())).collect();
+            assert_matches_oracle(&poly(&points), &format!("random {n}"));
+        }
+    }
+
+    #[test]
+    fn a_plain_square_keeps_its_exact_area() {
+        // Regression for the common path: a 10.5x10.5 axis-aligned
+        // square must still accumulate 110.25 of coverage.
+        let edges = poly(&[(4.0, 4.0), (14.5, 4.0), (14.5, 14.5), (4.0, 14.5)]);
+        let mask = coverage_mask(&edges, FillRule::NonZero, 24, 24);
+        let total: f32 = mask.iter().sum();
+        assert!((total - 110.25).abs() < 1e-3, "total coverage {total}");
+    }
 }

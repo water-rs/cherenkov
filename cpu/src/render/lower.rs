@@ -918,11 +918,10 @@ impl<'a> Lowering<'a> {
             }
             let o = self.transform * Point::new(f64::from(glyph.x), f64::from(glyph.y));
             let (ix, iy) = (o.x.floor(), o.y.floor());
-            let (fx, fy) = (
-                ((o.x - ix) * 4.0).floor() / 4.0,
-                ((o.y - iy) * 4.0).floor() / 4.0,
-            );
-            let subpixel = (fx as f32, fy as f32);
+            // The oracle places glyphs at their exact origins: the mask
+            // keeps the subpixel fraction unquantized (a 1/4px quantize
+            // would shift every edge by up to 0.25px).
+            let subpixel = ((o.x - ix) as f32, (o.y - iy) as f32);
             let key = crate::render::glyph::glyph_key(run, glyph.id, subpixel, self.transform);
             let slot: crate::render::glyph::GlyphSlot =
                 std::sync::Arc::new(std::sync::OnceLock::new());

@@ -51,6 +51,25 @@ fn exported_texture_preserves_hdr_and_updates_after_resize()
             "native output {actual} != {expected}"
         );
     }
+    source.clear_color(WorkingColor::new([1.0, 1.0, 1.0, 0.5]));
+    engine.render(FrameTime::now())?;
+    presenter.texture(
+        &device,
+        &queue,
+        &texture.create_view(&wgpu::TextureViewDescriptor::default()),
+        TextureOutput {
+            texture: &output,
+            color: OutputColor::Srgb,
+            alpha: OutputAlpha::Premultiplied,
+        },
+    );
+    let pixel = destination.readback()?.pixels[0];
+    for actual in pixel {
+        assert!(
+            (actual - 0.5).abs() < 0.001,
+            "sRGB premultiplication follows transfer encoding: {actual}"
+        );
+    }
     source.resize((8, 4))?;
     engine.render(FrameTime::now())?;
     let resized = textures.try_recv()?;

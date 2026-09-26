@@ -42,20 +42,25 @@ fn srgb_encode(c: f32) -> f32 {
     return 1.055 * pow(c, 1.0 / 2.4) - 0.055;
 }
 
+fn present_color(rgb: vec3<f32>, alpha: f32) -> vec4<f32> {
+    if present.alpha == 1u {
+        return vec4<f32>(rgb * alpha, alpha);
+    }
+    return vec4<f32>(rgb, alpha);
+}
+
 @fragment
 fn fs_main(in: Vertex) -> @location(0) vec4<f32> {
     var p3 = textureSample(source, source_sampler, in.uv);
     var alpha = 1.0;
-    if present.alpha == 1u {
-        alpha = p3.a;
-    } else if present.alpha == 2u {
+    if present.alpha != 0u {
         alpha = p3.a;
         if p3.a > 0.0 {
             p3 = vec4<f32>(p3.rgb / p3.a, p3.a);
         }
     }
     if present.encode == 2u {
-        return vec4<f32>(p3.rgb, alpha);
+        return present_color(p3.rgb, alpha);
     }
     // Linear Display P3 → linear sRGB (Bradford-adapted, D65).
     let rgb = vec3<f32>(
@@ -65,12 +70,11 @@ fn fs_main(in: Vertex) -> @location(0) vec4<f32> {
     );
     let clamped = clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0));
     if present.encode == 1u {
-        return vec4<f32>(
+        return present_color(vec3<f32>(
             srgb_encode(clamped.r),
             srgb_encode(clamped.g),
             srgb_encode(clamped.b),
-            alpha,
-        );
+        ), alpha);
     }
-    return vec4<f32>(clamped, alpha);
+    return present_color(clamped, alpha);
 }

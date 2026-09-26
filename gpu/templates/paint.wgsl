@@ -1,3 +1,4 @@
+{% include "color.wgsl" %}
 struct Uniforms {
     time: f32,
     _padding: f32,

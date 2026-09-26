@@ -1160,7 +1160,7 @@ impl<'a> Lowering<'a> {
                     )?,
                     Outline::Stroke { shape, stroke } => {
                         let tol = path::FLATTEN / path::sigma_max(self.transform).max(1e-12);
-                        let content = path::hash_stroke(shape, stroke, tol);
+                        let content = path::hash_stroke_tolerance(*content, tol);
                         self.path(
                             content,
                             *rule,

@@ -625,7 +625,7 @@ impl Renderer {
                     })
                     .collect::<Result<Vec<_>, RenderError>>()
             })?;
-        self.glyph_cache.insert_batch(masks);
+        self.glyph_cache.insert_batch(masks)?;
         Ok(())
     }
 

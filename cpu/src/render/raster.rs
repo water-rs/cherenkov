@@ -54,6 +54,18 @@ impl BandScratch {
     }
 }
 
+/// The concrete target selected by the renderer-owned dispatch value.
+pub fn simd_name(architecture: pulp::Arch) -> &'static str {
+    struct Name;
+    impl pulp::WithSimd for Name {
+        type Output = &'static str;
+        fn with_simd<S: pulp::Simd>(self, _: S) -> Self::Output {
+            std::any::type_name::<S>()
+        }
+    }
+    architecture.dispatch(Name)
+}
+
 /// Bins items once, then shades disjoint bands in painter order. Isolation
 /// markers reach every band because non-normal blends can affect empty source.
 pub fn render_bands(
@@ -63,6 +75,7 @@ pub fn render_bands(
     w: usize,
     h: usize,
     scratch: &mut Vec<BandScratch>,
+    architecture: pulp::Arch,
 ) -> (u32, u32) {
     if w == 0 || h == 0 {
         return (0, 0);
@@ -104,49 +117,51 @@ pub fn render_bands(
         .zip(scratch.par_iter_mut())
         .enumerate()
         .for_each(|(index, (slice, scratch))| {
-            slice.fill(clear);
-            let len = slice.len();
-            let mut band = Band {
-                fb: slice,
-                w,
-                y0: index * BAND_H,
-            };
-            for &i in &scratch.items {
-                match &items[i] {
-                    Item::Draw {
-                        coverage, paint, ..
-                    } => {
-                        band.draw(&mut scratch.stack, coverage, paint);
-                    }
-                    Item::PushIsolate => {
-                        let mut buffer = scratch.spare.pop().unwrap_or_default();
-                        buffer.resize(len, [0.0; 4]);
-                        buffer.fill([0.0; 4]);
-                        scratch.stack.push(buffer);
-                    }
-                    Item::PopIsolate {
-                        opacity,
-                        blend,
-                        space,
-                    } => {
-                        let buffer = scratch.stack.pop().expect("balanced isolation items");
-                        band.composite_isolate(
-                            &buffer,
-                            *opacity,
-                            *blend,
-                            *space,
-                            &mut scratch.stack,
-                        );
-                        scratch.spare.push(buffer);
-                    }
-                    Item::Glyph {
-                        slot, x, y, paint, ..
-                    } => {
-                        band.glyph(&mut scratch.stack, slot, *x, *y, paint);
+            architecture.dispatch(|| {
+                slice.fill(clear);
+                let len = slice.len();
+                let mut band = Band {
+                    fb: slice,
+                    w,
+                    y0: index * BAND_H,
+                };
+                for &i in &scratch.items {
+                    match &items[i] {
+                        Item::Draw {
+                            coverage, paint, ..
+                        } => {
+                            band.draw(&mut scratch.stack, coverage, paint);
+                        }
+                        Item::PushIsolate => {
+                            let mut buffer = scratch.spare.pop().unwrap_or_default();
+                            buffer.resize(len, [0.0; 4]);
+                            buffer.fill([0.0; 4]);
+                            scratch.stack.push(buffer);
+                        }
+                        Item::PopIsolate {
+                            opacity,
+                            blend,
+                            space,
+                        } => {
+                            let buffer = scratch.stack.pop().expect("balanced isolation items");
+                            band.composite_isolate(
+                                &buffer,
+                                *opacity,
+                                *blend,
+                                *space,
+                                &mut scratch.stack,
+                            );
+                            scratch.spare.push(buffer);
+                        }
+                        Item::Glyph {
+                            slot, x, y, paint, ..
+                        } => {
+                            band.glyph(&mut scratch.stack, slot, *x, *y, paint);
+                        }
                     }
                 }
-            }
-            assert!(scratch.stack.is_empty(), "balanced isolation items");
+                assert!(scratch.stack.is_empty(), "balanced isolation items");
+            });
         });
     (draws, edges)
 }
@@ -303,6 +318,7 @@ struct Band<'a> {
 impl Band<'_> {
     /// Shades only nonempty runs. Opaque solid spans are direct stores.
     #[expect(clippy::cast_precision_loss, reason = "surface coordinates fit f32")]
+    #[inline(always)]
     fn draw(&mut self, stack: &mut [Vec<[f32; 4]>], coverage: &Coverage, paint: &PaintData) {
         let bottom = (self.y0 + self.fb.len() / self.w).min(coverage.bottom());
         let dst = top(&mut *self.fb, stack);
@@ -344,6 +360,7 @@ impl Band<'_> {
         clippy::cast_precision_loss,
         reason = "mask coordinates and pixel indices are small"
     )]
+    #[inline(always)]
     fn glyph(
         &mut self,
         stack: &mut [Vec<[f32; 4]>],
@@ -352,7 +369,7 @@ impl Band<'_> {
         oy: i32,
         paint: &PaintData,
     ) {
-        let Some(mask) = slot.get() else { return };
+        let mask = slot.get().expect("glyphs resolved before compositing");
         let bh = self.fb.len() / self.w;
         let (mx0, my0) = (ox + mask.left, oy + mask.top);
         let (x_lo, x_hi) = (
@@ -390,6 +407,7 @@ impl Band<'_> {
     }
 
     /// Composites the popped isolation buffer onto the buffer below.
+    #[inline(always)]
     fn composite_isolate(
         &mut self,
         scratch: &[[f32; 4]],
@@ -421,6 +439,76 @@ mod tests {
     use super::*;
     use crate::render::coverage::{Operand, rasterize};
     use cherenkov::FillRule;
+
+    #[test]
+    fn native_and_scalar_composition_are_bit_identical() {
+        let (width, height) = (37, 35);
+        let coverage = std::sync::Arc::new(Coverage::from_rows(
+            0,
+            (0..height).map(|y| {
+                (0..width)
+                    .map(|x| f32::from(u16::try_from((x * 17 + y * 13) % 101).unwrap()) / 100.0)
+                    .collect()
+            }),
+        ));
+        for space in [
+            cherenkov::BlendSpace::Linear,
+            cherenkov::BlendSpace::SrgbEncoded,
+        ] {
+            for blend in [
+                cherenkov::BlendMode::Normal,
+                cherenkov::BlendMode::Multiply,
+                cherenkov::BlendMode::DestIn,
+            ] {
+                let items = vec![
+                    Item::Draw {
+                        coverage: coverage.clone(),
+                        edge_count: 0,
+                        paint: PaintData::Solid([-0.1, 0.5, 1.1, 0.75]),
+                    },
+                    Item::PushIsolate,
+                    Item::Draw {
+                        coverage: coverage.clone(),
+                        edge_count: 0,
+                        paint: PaintData::Solid([0.35, 0.1, 0.45, 0.5]),
+                    },
+                    Item::PopIsolate {
+                        opacity: 0.625,
+                        blend,
+                        space,
+                    },
+                ];
+                let mut scalar = vec![[0.0; 4]; width * height];
+                let mut native = scalar.clone();
+                let mut scratch = Vec::new();
+                render_bands(
+                    &items,
+                    [0.25; 4],
+                    &mut scalar,
+                    width,
+                    height,
+                    &mut scratch,
+                    pulp::Arch::Scalar,
+                );
+                render_bands(
+                    &items,
+                    [0.25; 4],
+                    &mut native,
+                    width,
+                    height,
+                    &mut scratch,
+                    pulp::Arch::new(),
+                );
+                for (scalar, native) in scalar.into_iter().zip(native) {
+                    assert_eq!(
+                        scalar.map(f32::to_bits),
+                        native.map(f32::to_bits),
+                        "{space:?}, {blend:?}"
+                    );
+                }
+            }
+        }
+    }
 
     fn coverage_mask(edges: &[Edge], rule: FillRule, w: usize, h: usize) -> Vec<f32> {
         let coverage = rasterize(

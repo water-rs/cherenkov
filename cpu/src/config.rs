@@ -61,7 +61,7 @@ pub struct MemoryUsage {
 pub struct RasterInfo {
     /// Number of rayon worker threads.
     pub threads: usize,
-    /// The composite kernel in use (`"scalar"` in this slice).
+    /// The concrete vectorization target selected for the composite kernel.
     pub simd: &'static str,
     /// Host CPU model name, best effort.
     pub cpu: Option<String>,

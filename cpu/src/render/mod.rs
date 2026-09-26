@@ -115,6 +115,7 @@ struct SurfaceState {
 /// All render-thread state.
 struct Renderer {
     pool: rayon::ThreadPool,
+    architecture: pulp::Arch,
     surfaces: HashMap<SurfaceId, SurfaceState>,
     fonts: HashMap<u64, FontData>,
     /// Registered images.
@@ -154,14 +155,16 @@ pub fn run(
         .num_threads(config.threads.unwrap_or(0))
         .thread_name(|i| format!("cherenkov-raster-{i}"));
     let renderer = builder.build().map(|pool| {
+        let architecture = pulp::Arch::new();
         let info = RasterInfo {
             threads: pool.current_num_threads(),
-            simd: "scalar",
+            simd: raster::simd_name(architecture),
             cpu: cpu_model(),
         };
         (
             Renderer {
                 pool,
+                architecture,
                 surfaces: HashMap::new(),
                 fonts: HashMap::new(),
                 images: HashMap::new(),
@@ -560,8 +563,9 @@ impl Renderer {
         let clear = [r * a, g * a, b * a, a];
         let pool = &self.pool;
         let fb = &mut surf.fb;
-        let (draws, edges) =
-            pool.install(|| raster::render_bands(&items, clear, fb, w, h, &mut surf.bands));
+        let (draws, edges) = pool.install(|| {
+            raster::render_bands(&items, clear, fb, w, h, &mut surf.bands, self.architecture)
+        });
         if let (Some(start), Some(lowered), Some(resolved), Some(clipped)) =
             (start, lowered_at, resolved_at, clipped_at)
         {

@@ -64,7 +64,7 @@ impl Meter {
     pub fn probe() -> Result<(), BenchError> {
         if cfg!(target_os = "android") {
             odpm::snapshot().map(|_| ())
-        } else if cfg!(target_vendor = "apple") {
+        } else if cfg!(target_os = "macos") {
             powermetrics::check_sudo()
         } else {
             Err(unsupported())
@@ -82,7 +82,7 @@ impl Meter {
     pub fn begin(window_hint: Duration) -> Result<Self, BenchError> {
         if cfg!(target_os = "android") {
             Ok(Self::Odpm(odpm::snapshot()?, Instant::now()))
-        } else if cfg!(target_vendor = "apple") {
+        } else if cfg!(target_os = "macos") {
             powermetrics::Run::spawn(window_hint).map(Self::PowerMetrics)
         } else {
             Err(unsupported())

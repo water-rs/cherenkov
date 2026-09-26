@@ -353,21 +353,29 @@ fn unsupported_features_report_their_names() {
     let surface = engine
         .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF32))
         .expect("surface");
-    let sweep = SweepGradient::new((32.0, 32.0), 0.0, std::f64::consts::TAU)
-        .stop(0.0, RED)
-        .stop(1.0, WorkingColor::new([0., 0., 1., 1.]));
+    let mesh = cherenkov::MeshGradient::new(
+        1,
+        1,
+        vec![
+            cherenkov::kurbo::Point::new(0.0, 0.0),
+            cherenkov::kurbo::Point::new(64.0, 0.0),
+            cherenkov::kurbo::Point::new(0.0, 64.0),
+            cherenkov::kurbo::Point::new(64.0, 64.0),
+        ],
+        vec![RED; 4],
+    );
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|c| {
-            c.fill(Rect::new(0.0, 0.0, 64.0, 64.0), Paint::from(sweep));
+            c.fill(Rect::new(0.0, 0.0, 64.0, 64.0), Paint::from(mesh));
         }));
     });
     let e = engine
         .render(FrameTime::now())
-        .expect_err("sweep unsupported");
+        .expect_err("mesh unsupported");
     let msg = format!("{e}");
-    assert!(msg.contains("sweep-gradient"), "unsupported message: {msg}");
+    assert!(msg.contains("mesh-gradient"), "unsupported message: {msg}");
     // Per-glyph transforms are unsupported (a fresh engine, so the
-    // failed sweep frame above cannot shadow this error).
+    // failed mesh frame above cannot shadow this error).
     let engine2 = Engine::<Raster>::new(RasterConfig::default()).expect("engine");
     let data = std::fs::read("../scenes/fonts/NotoSans.ttf").expect("test font");
     let font = engine2
@@ -396,4 +404,56 @@ fn unsupported_features_report_their_names() {
         .expect_err("glyph transform unsupported");
     let msg = format!("{e}");
     assert!(msg.contains("glyph"), "glyph transform message: {msg}");
+}
+
+#[test]
+fn a_sweep_gradient_walks_the_circle() {
+    let engine = engine();
+    // Red at t=0, blue at t=1 over a full turn from angle 0.
+    let grad = SweepGradient::new((32.0, 32.0), 0.0, std::f64::consts::TAU)
+        .stop(0.0, RED)
+        .stop(1.0, WorkingColor::new([0., 0., 1., 1.]));
+    let px = render_f32(&engine, 64, 64, |c| {
+        c.fill(Rect::new(0.0, 0.0, 64.0, 64.0), Paint::from(grad));
+    });
+    let at = |x: usize, y: usize| px[y * 64 + x];
+    // t = atan2(y-32, x-32)/TAU: right 0, bottom 1/4, left 1/2, top 3/4.
+    let (r, b) = (at(56, 32), at(32, 56));
+    assert!(r[0] > 0.95 && r[2] < 0.05, "t=0 east {r:?}");
+    assert!(
+        (b[0] - 0.75).abs() < 0.01 && (b[2] - 0.25).abs() < 0.01,
+        "t=1/4 {b:?}"
+    );
+    let (w, n) = (at(8, 32), at(32, 8));
+    assert!(
+        (w[0] - 0.5).abs() < 0.01 && (w[2] - 0.5).abs() < 0.01,
+        "t=1/2 {w:?}"
+    );
+    assert!(
+        (n[0] - 0.25).abs() < 0.01 && (n[2] - 0.75).abs() < 0.01,
+        "t=3/4 {n:?}"
+    );
+}
+
+#[test]
+fn extend_none_is_transparent_outside_the_ramp() {
+    let engine = engine();
+    let grad = |e: Extend| {
+        LinearGradient::new((0.0, 0.0), (32.0, 0.0))
+            .stop(0.0, RED)
+            .stop(1.0, WorkingColor::new([0., 0., 1., 1.]))
+            .extend(e)
+    };
+    // A 0..32 gradient on a 64-wide surface: x=48 is t=1.5.
+    for (e, want) in [
+        (Extend::None, 0.0),
+        (Extend::Pad, 1.0),
+        (Extend::Repeat, 1.0), // t=1.5 wraps to t=0.5: still opaque
+    ] {
+        let px = render_f32(&engine, 64, 4, |c| {
+            c.fill(Rect::new(0.0, 0.0, 64.0, 4.0), Paint::from(grad(e)));
+        });
+        let p = px[2 * 64 + 48];
+        assert!((p[3] - want).abs() < 0.01, "extend {e:?} alpha {}", p[3]);
+    }
 }

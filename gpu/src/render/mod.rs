@@ -19,7 +19,7 @@ use crate::error::{EngineError, RenderError, SurfaceError};
 use crate::message::{ChangeSet, LayerId, LayerOp, Message, SurfaceId};
 use crate::surface::{FrameStats, Next, PassTiming, Readback};
 use glyph::{Atlas, FontData};
-use lower::{ContentData, Frame, GlyphContext, LayerNode, Lowering, Target};
+use lower::{ContentData, Frame, GlyphContext, LayerNode, Lowering, PipelineKind, Target};
 
 /// The surface target format: premultiplied linear Display P3.
 const TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
@@ -29,6 +29,55 @@ const TARGET_USAGES: wgpu::TextureUsages = wgpu::TextureUsages::from_bits_retain
         | wgpu::TextureUsages::COPY_SRC.bits()
         | wgpu::TextureUsages::TEXTURE_BINDING.bits(),
 );
+
+/// Decodes one sRGB-encoded byte channel to linear, `u8 → f64`.
+fn srgb_decode_u8(c: u8) -> f64 {
+    let v = f64::from(c) / 255.0;
+    if v <= 0.04045 {
+        v / 12.92
+    } else {
+        ((v + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// Linear sRGB (BT.709 primaries, D65) to CIE XYZ — the oracle's
+/// `SRGB_TO_XYZ`.
+const SRGB_TO_XYZ: [[f64; 3]; 3] = [
+    [
+        0.412_390_799_265_959_4,
+        0.357_584_339_383_878,
+        0.180_480_788_401_834_3,
+    ],
+    [
+        0.212_639_005_871_510_4,
+        0.715_168_678_767_756,
+        0.072_192_315_360_733_7,
+    ],
+    [
+        0.019_330_818_715_591_8,
+        0.119_194_779_410_625_9,
+        0.950_532_152_249_660_5,
+    ],
+];
+
+/// CIE XYZ to linear Display P3 (`P3_TO_XYZ` inverted), precomputed.
+const XYZ_TO_P3: [[f64; 3]; 3] = [
+    [
+        2.493_496_911_941_425,
+        -0.931_383_617_919_123_9,
+        -0.402_710_784_450_716_2,
+    ],
+    [
+        -0.829_488_969_561_574_7,
+        1.762_664_060_318_226_3,
+        0.023_624_685_848_943_6,
+    ],
+    [
+        0.035_845_830_243_784_5,
+        -0.076_172_389_268_041_4,
+        0.956_884_524_007_687_1,
+    ],
+];
 
 /// The `wgpu` format for a [`ScratchFormat`].
 const fn scratch_wgpu(format: ScratchFormat) -> wgpu::TextureFormat {
@@ -53,14 +102,25 @@ pub struct Init {
     pub info: GpuInfo,
 }
 
-/// One isolation scratch texture and its cached group-1 bind group.
+/// One isolation scratch or backdrop texture.
 struct ScratchTarget {
-    #[expect(dead_code, reason = "the texture keeps the view alive")]
     texture: wgpu::Texture,
     view: wgpu::TextureView,
-    bind: wgpu::BindGroup,
     width: u32,
     height: u32,
+}
+
+/// A GPU-resident image registered with the engine.
+pub struct GpuImage {
+    /// The texture holding premultiplied linear-P3 f16 texels.
+    #[expect(dead_code, reason = "the texture keeps the view alive")]
+    pub texture: wgpu::Texture,
+    /// Its view for bind group 1.
+    pub view: wgpu::TextureView,
+    /// Width in texels.
+    pub width: u32,
+    /// Height in texels.
+    pub height: u32,
 }
 
 /// One surface's GPU-side state.
@@ -73,6 +133,9 @@ struct SurfaceState {
     /// Scratch textures, one per isolation depth, sized to the largest
     /// region seen so far.
     scratch: Vec<ScratchTarget>,
+    /// Backdrop copies for blend composites: index 0 matches the surface
+    /// format, index 1 the scratch format.
+    backdrop: [Option<ScratchTarget>; 2],
     layers: HashMap<LayerId, LayerNode>,
     clear: cherenkov::WorkingColor,
     dirty: bool,
@@ -93,7 +156,19 @@ impl SurfaceState {
             .iter()
             .map(|s| u64::from(s.width) * u64::from(s.height) * scratch_texel)
             .sum();
-        surface_bytes + scratch_bytes
+        let backdrop_bytes: u64 = self
+            .backdrop
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| {
+                // Index 0 mirrors the surface format (f16), index 1 the
+                // scratch format.
+                let texel = if i == 0 { 8 } else { scratch_texel };
+                b.as_ref()
+                    .map(|b| u64::from(b.width) * u64::from(b.height) * texel)
+            })
+            .sum();
+        surface_bytes + scratch_bytes + backdrop_bytes
     }
 }
 
@@ -101,9 +176,9 @@ impl SurfaceState {
 struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
-    pipeline: wgpu::RenderPipeline,
-    /// The pipeline for scratch targets (may equal `pipeline`).
-    scratch_pipeline: wgpu::RenderPipeline,
+    /// `[format index][pipeline kind]`: 0 = surface format, 1 = scratch
+    /// format; kind 0 = source-over, 1 = replace.
+    pipelines: [[wgpu::RenderPipeline; 2]; 2],
     /// The configured isolation texture format.
     scratch_format: wgpu::TextureFormat,
     layout0: wgpu::BindGroupLayout,
@@ -121,9 +196,12 @@ struct Renderer {
     /// The globals buffer size `bind0` was built against.
     bound_globals_size: u64,
     atlas: Atlas,
-    dummy_bind1: wgpu::BindGroup,
+    /// A dummy 1×1 view for unused group-1 slots.
+    dummy_view: wgpu::TextureView,
     surfaces: HashMap<SurfaceId, SurfaceState>,
     fonts: HashMap<u64, FontData>,
+    /// Registered images.
+    images: HashMap<u64, GpuImage>,
     timestamps: bool,
     query_set: Option<wgpu::QuerySet>,
     query_buffer: Option<wgpu::Buffer>,
@@ -152,6 +230,7 @@ const fn node() -> LayerNode {
     LayerNode {
         transform: kurbo::Affine::IDENTITY,
         opacity: 1.0,
+        blend: cherenkov::BlendMode::Normal,
         clip: None,
         content: None,
         children: Vec::new(),
@@ -253,9 +332,39 @@ fn create_layouts(device: &wgpu::Device) -> (wgpu::BindGroupLayout, wgpu::BindGr
     });
     let layout1 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("source texture"),
-        entries: &[texture_entry(0)],
+        // 0: composite source, 1: blend backdrop, 2: image paint.
+        entries: &[texture_entry(0), texture_entry(1), texture_entry(2)],
     });
     (layout0, layout1)
+}
+
+/// Builds a group-1 bind group; `None` binds the dummy view.
+fn make_bind1(
+    device: &wgpu::Device,
+    layout1: &wgpu::BindGroupLayout,
+    dummy: &wgpu::TextureView,
+    source: Option<&wgpu::TextureView>,
+    backdrop: Option<&wgpu::TextureView>,
+    image: Option<&wgpu::TextureView>,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("source texture"),
+        layout: layout1,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(source.unwrap_or(dummy)),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(backdrop.unwrap_or(dummy)),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(image.unwrap_or(dummy)),
+            },
+        ],
+    })
 }
 
 /// Builds the group-0 bind group over the current buffers and atlas.
@@ -306,6 +415,7 @@ fn create_pipeline(
     layout0: &wgpu::BindGroupLayout,
     layout1: &wgpu::BindGroupLayout,
     format: wgpu::TextureFormat,
+    replace: bool,
 ) -> Result<wgpu::RenderPipeline, EngineError> {
     let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -332,9 +442,15 @@ fn create_pipeline(
             })
         })
     });
+    // Source-over premultiplied compositing, or `Replace` writing the
+    // shader's already-composited result verbatim.
     let component = wgpu::BlendComponent {
         src_factor: wgpu::BlendFactor::One,
-        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+        dst_factor: if replace {
+            wgpu::BlendFactor::Zero
+        } else {
+            wgpu::BlendFactor::OneMinusSrcAlpha
+        },
         operation: wgpu::BlendOperation::Add,
     };
     let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -417,10 +533,14 @@ pub fn run(config: GpuConfig, rx: Receiver<Message>, init_tx: Sender<Result<Init
     let init = create_device(&config).and_then(|(adapter, device, queue)| {
         let info = adapter.get_info();
         let (layout0, layout1) = create_layouts(&device);
-        let pipeline = create_pipeline(&device, &config, &layout0, &layout1, TARGET_FORMAT)?;
         let scratch_format = scratch_wgpu(config.scratch_format);
-        let scratch_pipeline =
-            create_pipeline(&device, &config, &layout0, &layout1, scratch_format)?;
+        let pipelines = |format| {
+            Ok::<_, EngineError>([
+                create_pipeline(&device, &config, &layout0, &layout1, format, false)?,
+                create_pipeline(&device, &config, &layout0, &layout1, format, true)?,
+            ])
+        };
+        let pipelines = [pipelines(TARGET_FORMAT)?, pipelines(scratch_format)?];
         let globals = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("globals"),
             size: 16,
@@ -448,14 +568,6 @@ pub fn run(config: GpuConfig, rx: Receiver<Message>, init_tx: Sender<Result<Init
             wgpu::TextureUsages::TEXTURE_BINDING,
             TARGET_FORMAT,
         );
-        let dummy_bind1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("dummy source"),
-            layout: &layout1,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&dummy_view),
-            }],
-        });
         let timestamps = device.features().contains(wgpu::Features::TIMESTAMP_QUERY);
         let timestamps_inside = device
             .features()
@@ -489,8 +601,7 @@ pub fn run(config: GpuConfig, rx: Receiver<Message>, init_tx: Sender<Result<Init
             max_texture: device.limits().max_texture_dimension_2d,
             device,
             queue,
-            pipeline,
-            scratch_pipeline,
+            pipelines,
             scratch_format,
             layout0,
             layout1,
@@ -498,14 +609,15 @@ pub fn run(config: GpuConfig, rx: Receiver<Message>, init_tx: Sender<Result<Init
             instances,
             stops,
             bind0,
+            dummy_view,
             bound_atlas: 0,
             bound_instance_size: 272 * 16,
             bound_stop_size: 32 * 16,
             bound_globals_size: 16,
             atlas,
-            dummy_bind1,
             surfaces: HashMap::new(),
             fonts: HashMap::new(),
+            images: HashMap::new(),
             timestamps,
             query_set,
             query_buffer,
@@ -542,6 +654,18 @@ pub fn run(config: GpuConfig, rx: Receiver<Message>, init_tx: Sender<Result<Init
             }
             Message::DestroySurface { id } => {
                 renderer.surfaces.remove(&id);
+            }
+            Message::AddImage {
+                id,
+                width,
+                height,
+                pixels,
+                color_space,
+            } => {
+                renderer.add_image(id, width, height, &pixels, color_space);
+            }
+            Message::DestroyImage { id } => {
+                renderer.images.remove(&id);
             }
             Message::AddFont { id, data, index } => {
                 renderer.fonts.insert(id, FontData { data, index });
@@ -601,6 +725,7 @@ impl Renderer {
                 target,
                 view,
                 scratch: Vec::new(),
+                backdrop: [None, None],
                 layers,
                 clear: cherenkov::WorkingColor::TRANSPARENT,
                 dirty: true,
@@ -608,6 +733,92 @@ impl Renderer {
             },
         );
         Ok(())
+    }
+
+    /// Uploads a registered image, converting straight-alpha RGBA8 into
+    /// premultiplied linear Display P3 f16 — the oracle's `Resources::image`
+    /// conversion.
+    fn add_image(
+        &mut self,
+        id: u64,
+        width: u32,
+        height: u32,
+        pixels: &[u8],
+        color_space: crate::image::ImageColorSpace,
+    ) {
+        let (texture, view) = create_target(
+            &self.device,
+            "image",
+            (width, height),
+            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            TARGET_FORMAT,
+        );
+        let mut data = Vec::with_capacity(pixels.len() * 2);
+        for px in pixels.as_chunks::<4>().0 {
+            let a = f64::from(px[3]) / 255.0;
+            let lin = [
+                srgb_decode_u8(px[0]),
+                srgb_decode_u8(px[1]),
+                srgb_decode_u8(px[2]),
+            ];
+            // Display P3 uses sRGB's transfer function; sRGB-encoded input
+            // additionally needs the primaries' matrix.
+            let lin_p3 = match color_space {
+                crate::image::ImageColorSpace::Srgb => {
+                    let [x, y, z] = [
+                        SRGB_TO_XYZ[0][2].mul_add(
+                            lin[2],
+                            SRGB_TO_XYZ[0][1].mul_add(lin[1], SRGB_TO_XYZ[0][0] * lin[0]),
+                        ),
+                        SRGB_TO_XYZ[1][2].mul_add(
+                            lin[2],
+                            SRGB_TO_XYZ[1][1].mul_add(lin[1], SRGB_TO_XYZ[1][0] * lin[0]),
+                        ),
+                        SRGB_TO_XYZ[2][2].mul_add(
+                            lin[2],
+                            SRGB_TO_XYZ[2][1].mul_add(lin[1], SRGB_TO_XYZ[2][0] * lin[0]),
+                        ),
+                    ];
+                    [
+                        XYZ_TO_P3[0][2].mul_add(z, XYZ_TO_P3[0][1].mul_add(y, XYZ_TO_P3[0][0] * x)),
+                        XYZ_TO_P3[1][2].mul_add(z, XYZ_TO_P3[1][1].mul_add(y, XYZ_TO_P3[1][0] * x)),
+                        XYZ_TO_P3[2][2].mul_add(z, XYZ_TO_P3[2][1].mul_add(y, XYZ_TO_P3[2][0] * x)),
+                    ]
+                }
+                crate::image::ImageColorSpace::DisplayP3 => lin,
+            };
+            for v in [a * lin_p3[0], a * lin_p3[1], a * lin_p3[2], a] {
+                data.extend_from_slice(&half::f16::from_f64(v).to_le_bytes());
+            }
+        }
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 8),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.images.insert(
+            id,
+            GpuImage {
+                texture,
+                view,
+                width,
+                height,
+            },
+        );
     }
 
     /// Applies one surface's change set.
@@ -636,6 +847,11 @@ impl Renderer {
                 LayerOp::Opacity(id, o) => {
                     if let Some(node) = state.layers.get_mut(&id) {
                         node.opacity = o;
+                    }
+                }
+                LayerOp::Blend(id, b) => {
+                    if let Some(node) = state.layers.get_mut(&id) {
+                        node.blend = b;
                     }
                 }
                 LayerOp::Clip(id, clip) => {
@@ -714,6 +930,11 @@ impl Renderer {
                 .surfaces
                 .values()
                 .map(SurfaceState::gpu_bytes)
+                .sum::<u64>()
+            + self
+                .images
+                .values()
+                .map(|i| u64::from(i.width) * u64::from(i.height) * 8)
                 .sum::<u64>();
         MemoryUsage {
             gpu: crate::Bytes(gpu),
@@ -799,6 +1020,7 @@ impl Renderer {
                         atlas: &mut self.atlas,
                         queue: &self.queue,
                         fonts: &self.fonts,
+                        images: &self.images,
                     };
                     let mut lowering = Lowering::new(&mut surf.frame, surf.size);
                     let result = lowering.run(root, &layers, surf.clear, &mut glyphs);
@@ -876,18 +1098,9 @@ impl Renderer {
                 TARGET_USAGES,
                 self.scratch_format,
             );
-            let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("scratch source"),
-                layout: &self.layout1,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                }],
-            });
             let target = ScratchTarget {
                 texture,
                 view,
-                bind,
                 width: nw,
                 height: nh,
             };
@@ -896,6 +1109,52 @@ impl Renderer {
             } else {
                 surf.scratch.push(target);
             }
+        }
+        // Backdrop textures for blend composites, sized like the scratch
+        // pool to the largest region copied this frame.
+        let mut backdrop_max = [(0u32, 0u32); 2];
+        for pass in &surf.frame.passes {
+            if let Some(r) = pass.backdrop_copy {
+                let slot = match pass.target {
+                    Target::Surface => 0,
+                    Target::Scratch(_) => 1,
+                };
+                backdrop_max[slot].0 = backdrop_max[slot].0.max(r[2]);
+                backdrop_max[slot].1 = backdrop_max[slot].1.max(r[3]);
+            }
+        }
+        for (slot, &(w, h)) in backdrop_max.iter().enumerate() {
+            if w == 0 || h == 0 {
+                continue;
+            }
+            if surf.backdrop[slot]
+                .as_ref()
+                .is_some_and(|b| b.width >= w && b.height >= h)
+            {
+                continue;
+            }
+            let (nw, nh) = (
+                w.max(surf.backdrop[slot].as_ref().map_or(0, |b| b.width)),
+                h.max(surf.backdrop[slot].as_ref().map_or(0, |b| b.height)),
+            );
+            let format = if slot == 0 {
+                TARGET_FORMAT
+            } else {
+                self.scratch_format
+            };
+            let (texture, view) = create_target(
+                &self.device,
+                "blend backdrop",
+                (nw, nh),
+                TARGET_USAGES | wgpu::TextureUsages::COPY_DST,
+                format,
+            );
+            surf.backdrop[slot] = Some(ScratchTarget {
+                texture,
+                view,
+                width: nw,
+                height: nh,
+            });
         }
         let inst_bytes = bytemuck::cast_slice::<instance::Instance, u8>(&surf.frame.instances);
         if !inst_bytes.is_empty() && inst_bytes.len() as u64 > self.instances.size() {
@@ -979,11 +1238,44 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame"),
             });
+        // Lazily-built group-1 bind groups for this frame, keyed by
+        // (source, backdrop-needed, image). Created up front so scratch
+        // borrows stay immutable inside the encoder loop.
+        let mut range_binds: HashMap<(Option<usize>, bool, Option<u64>), wgpu::BindGroup> =
+            HashMap::new();
         for (i, pass) in surf.frame.passes.iter().enumerate() {
-            let view = match pass.target {
-                Target::Surface => &surf.view,
-                Target::Scratch(i) => &surf.scratch[i].view,
+            let (view, texture) = match pass.target {
+                Target::Surface => (&surf.view, &surf.target),
+                Target::Scratch(i) => (&surf.scratch[i].view, &surf.scratch[i].texture),
             };
+            // A blend pass reads the target's prior contents from a copy;
+            // the copy must complete before the pass starts.
+            if let Some([bx, by, bw, bh]) = pass.backdrop_copy {
+                let slot = match pass.target {
+                    Target::Surface => 0,
+                    Target::Scratch(_) => 1,
+                };
+                let backdrop = surf.backdrop[slot].as_ref().expect("grown above");
+                encoder.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d { x: bx, y: by, z: 0 },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &backdrop.texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d {
+                        width: bw,
+                        height: bh,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
             let load = match pass.clear {
                 Some([r, g, b, a]) => wgpu::LoadOp::Clear(wgpu::Color {
                     r: f64::from(r),
@@ -1015,6 +1307,7 @@ impl Renderer {
                     Target::Scratch(_) => self.scratch_format,
                 }),
             });
+            let scratch_backdrop = pass.backdrop_copy.is_some();
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1031,10 +1324,11 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            render_pass.set_pipeline(match pass.target {
-                Target::Surface => &self.pipeline,
-                Target::Scratch(_) => &self.scratch_pipeline,
-            });
+            let format_i = match pass.target {
+                Target::Surface => 0,
+                Target::Scratch(_) => 1,
+            };
+            render_pass.set_pipeline(&self.pipelines[format_i][0]);
             // Scratch passes cover only their region; the surface pass the
             // whole target. `in.device` stays in true device space via the
             // per-pass Globals origin.
@@ -1054,11 +1348,39 @@ impl Renderer {
             #[expect(clippy::cast_possible_truncation)]
             let offset = (i * 256) as u32;
             render_pass.set_bind_group(0, &self.bind0, &[offset]);
+            let mut pipeline = PipelineKind::SrcOver;
             for range in &pass.ranges {
                 stats.draws += 1;
-                let bind = match range.source {
-                    Some(i) => &surf.scratch[i].bind,
-                    None => &self.dummy_bind1,
+                if range.pipeline != pipeline {
+                    pipeline = range.pipeline;
+                    render_pass.set_pipeline(
+                        &self.pipelines[format_i][usize::from(pipeline == PipelineKind::Replace)],
+                    );
+                }
+                let key = (range.source, scratch_backdrop, range.image);
+                let bind = match range_binds.entry(key) {
+                    std::collections::hash_map::Entry::Occupied(e) => &*e.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        let backdrop = if scratch_backdrop {
+                            let slot = match pass.target {
+                                Target::Surface => 0,
+                                Target::Scratch(_) => 1,
+                            };
+                            surf.backdrop[slot].as_ref().map(|b| &b.view)
+                        } else {
+                            None
+                        };
+                        &*e.insert(make_bind1(
+                            &self.device,
+                            &self.layout1,
+                            &self.dummy_view,
+                            range.source.map(|i| &surf.scratch[i].view),
+                            backdrop,
+                            range
+                                .image
+                                .and_then(|id| self.images.get(&id).map(|i| &i.view)),
+                        ))
+                    }
                 };
                 render_pass.set_bind_group(1, bind, &[]);
                 render_pass.draw(0..6, range.instances.clone());

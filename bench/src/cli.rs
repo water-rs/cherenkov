@@ -164,6 +164,10 @@ pub fn run_args(args: &[OsString]) -> i32 {
 /// unwinding cannot cross `extern "C"`, so a panicking run would
 /// otherwise abort the host and every queued run with it).
 ///
+/// # Panics
+/// `argc` is a count, so a negative value — outside the
+/// `main(argc, argv)` contract — panics.
+///
 /// # Safety
 /// `argv` must point to `argc` non-null pointers, each to a valid
 /// NUL-terminated C string — the `main(argc, argv)` contract.

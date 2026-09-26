@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/water-rs/cherenkov/compare/v0.2.1...v0.3.0) - 2026-09-26
+
+### Added
+
+- *(filtrate,shader)* [**breaking**] image size in the spatial ABI, WGSL libraries, size-relative footprints
+- *(filtrate)* [**breaking**] function-form stages composed by cherenkov-shader ([#13](https://github.com/water-rs/cherenkov/pull/13))
+
+### Fixed
+
+- *(filtrate)* rotate hue with the CSS/SVG hue-rotate matrix
+
+### Other
+
+- join the filtrate crates to the workspace
+- import filtrate with its history
+
 ### Changed
 
 - **Breaking:** stages are functions for the shared composer,

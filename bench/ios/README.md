@@ -75,10 +75,13 @@ engine looks like:
 
 Launch and keep it in the foreground — iOS forbids GPU work in the
 background. The app disables the idle timer and drops screen brightness
-to 0 for the whole run, then restores both. Each argument list runs
-through `cherenkov_bench_run` on a background thread; when the last one
-returns the app writes `Documents/out/done.json` (each run's args and
-exit code) and exits.
+to 0 for the whole run, then restores both. It first `chdir`s to the
+app's home directory (an app launches with cwd `/`), so relative
+`Documents/...` paths in the argument lists resolve as written. Each
+argument list runs through `cherenkov_bench_run` on a background thread
+with fd 2 redirected to `Documents/out/run-<n>.stderr`; when the last
+one returns the app writes `Documents/out/done.json` (each run's args
+and exit code) and exits.
 
     xcrun devicectl device process launch --device <udid> dev.cherenkov.bench
 

@@ -103,6 +103,16 @@ struct VsOut {
     @location(0) local: vec2<f32>,
     @location(1) pixel: vec2<f32>,
     @location(2) @interpolate(flat) instance: u32,
+    @location(3) @interpolate(flat) meta_: vec4<u32>,
+    @location(4) @interpolate(flat) color: vec4<f32>,
+    @location(5) @interpolate(flat) params: vec4<f32>,
+    // half.xy, aspect, exponent.
+    @location(6) @interpolate(flat) shape_a: vec4<f32>,
+    @location(7) @interpolate(flat) shape_radii: vec4<f32>,
+    @location(8) @interpolate(flat) affine0: vec4<f32>,
+    @location(9) @interpolate(flat) affine1: vec4<f32>,
+    // bounds.xy, uv.xy (glyph/mask cell texel origin).
+    @location(10) @interpolate(flat) cell: vec4<f32>,
 }
 
 fn apply(m: array<vec4<f32>, 2>, p: vec2<f32>) -> vec2<f32> {
@@ -142,6 +152,16 @@ fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
     let ndc = (out.pixel - globals.origin) / globals.size * 2.0 - 1.0;
     out.position = vec4<f32>(ndc.x, -ndc.y, 0.0, 1.0);
     out.instance = ii;
+    // Hoist the constants every fragment reads into flat varyings so the
+    // fragment shader only touches `instances` for kind-specific fields.
+    out.meta_ = inst.meta_;
+    out.color = inst.color;
+    out.params = inst.params;
+    out.shape_a = vec4<f32>(inst.shape.half, inst.shape.aspect, inst.shape.exponent);
+    out.shape_radii = inst.shape.radii;
+    out.affine0 = inst.affine[0];
+    out.affine1 = inst.affine[1];
+    out.cell = vec4<f32>(inst.bounds.xy, inst.uv.xy);
     return out;
 }
 
@@ -479,7 +499,7 @@ fn sample_image_tex(tex: texture_2d<f32>, u: f32, v: f32, w: f32, h: f32, biline
 }
 
 // Image paint: `grad`/`grad2` carry the local→image affine [a b c d e f]
-// and the image size [w, h]; meta.w packs extend_x | extend_y<<4 |
+// and the image size [w, h]; meta_.w packs extend_x | extend_y<<4 |
 // sampling<<8. The extends run in image-pixel space, like the oracle's
 // eval_image_paint.
 fn paint_image(i: u32, local: vec2<f32>) -> vec4<f32> {
@@ -502,10 +522,9 @@ fn paint_image(i: u32, local: vec2<f32>) -> vec4<f32> {
     return sample_image_tex(image_tex, u, v, g2.z, g2.w, ((meta_w >> 8u) & 1u) != 0u);
 }
 
-fn paint(i: u32, local: vec2<f32>, pixel: vec2<f32>) -> vec4<f32> {
-    switch instances[i].meta_.y {
+fn paint(i: u32, meta_: vec4<u32>, color: vec4<f32>, local: vec2<f32>, pixel: vec2<f32>) -> vec4<f32> {
+    switch meta_.y {
         case PAINT_SOLID: {
-            let color = instances[i].color;
             return vec4<f32>(color.rgb * color.a, color.a);
         }
         case PAINT_TEXTURE: {
@@ -517,9 +536,9 @@ fn paint(i: u32, local: vec2<f32>, pixel: vec2<f32>) -> vec4<f32> {
         }
         default: {
             var t: f32;
-            if instances[i].meta_.y == PAINT_LINEAR {
+            if meta_.y == PAINT_LINEAR {
                 t = linear_t(i, local);
-            } else if instances[i].meta_.y == PAINT_SWEEP {
+            } else if meta_.y == PAINT_SWEEP {
                 t = sweep_t(i, local);
             } else {
                 t = radial_t(i, local);
@@ -530,7 +549,7 @@ fn paint(i: u32, local: vec2<f32>, pixel: vec2<f32>) -> vec4<f32> {
             if (tbits & 0x7f800000u) == 0x7f800000u && (tbits & 0x007fffffu) != 0u {
                 return vec4<f32>(0.0);
             }
-            let meta_w = instances[i].meta_.w;
+            let meta_w = meta_.w;
             let extend = (meta_w >> 20u) & 0xfu;
             let interp = (meta_w >> 16u) & 0xfu;
             let count = meta_w & 0xffffu;
@@ -544,41 +563,44 @@ fn paint(i: u32, local: vec2<f32>, pixel: vec2<f32>) -> vec4<f32> {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    // Access instance fields through the storage array: copying the whole
-    // 272-byte struct per fragment is expensive on tilers.
+    // The constants every fragment needs arrive as flat varyings; the
+    // storage array is read only for kind-specific fields (inner, clip,
+    // mask, gradient data).
     let i = in.instance;
-    let flags = (instances[i].meta_.w >> 24u) & 0xffu;
+    let s = Shape(in.shape_a.xy, in.shape_a.z, in.shape_a.w, in.shape_radii);
+    let m = array<vec4<f32>, 2>(in.affine0, in.affine1);
+    let flags = (in.meta_.w >> 24u) & 0xffu;
     var cov: f32;
-    switch instances[i].meta_.x {
+    switch in.meta_.x {
         case KIND_STROKE_OFFSET: {
-            cov = shape_coverage(instances[i].shape, in.local, instances[i].affine);
+            cov = shape_coverage(s, in.local, m);
             if (flags & FLAG_HAS_INNER) != 0u {
-                cov -= shape_coverage(instances[i].inner, in.local, instances[i].affine);
+                cov -= shape_coverage(instances[i].inner, in.local, m);
             }
         }
         case KIND_STROKE_DIST: {
-            let d = sdf(instances[i].shape, in.local);
-            let g = device_grad(instances[i].affine, sdf_grad(instances[i].shape, in.local));
-            let hw = instances[i].params.x;
+            let d = sdf(s, in.local);
+            let g = device_grad(m, sdf_grad(s, in.local));
+            let hw = in.params.x;
             cov = coverage(d - hw, g) - coverage(d + hw, g);
         }
         case KIND_SHADOW: {
-            let sigma = instances[i].params.x;
+            let sigma = in.params.x;
             if sigma < 0.25 {
-                cov = shape_coverage(instances[i].shape, in.local, instances[i].affine);
+                cov = shape_coverage(s, in.local, m);
             } else {
-                cov = shadow(instances[i].shape, in.local, sigma);
+                cov = shadow(s, in.local, sigma);
             }
         }
         case KIND_GLYPH: {
-            let texel = vec2<i32>(floor(in.pixel - instances[i].bounds.xy)) + vec2<i32>(instances[i].uv.xy);
+            let texel = vec2<i32>(floor(in.pixel - in.cell.xy)) + vec2<i32>(in.cell.zw);
             cov = textureLoad(atlas, texel, 0).r;
         }
         case KIND_SPAN: {
             cov = 1.0;
         }
         default: {
-            cov = shape_coverage(instances[i].shape, in.local, instances[i].affine);
+            cov = shape_coverage(s, in.local, m);
         }
     }
     if (flags & FLAG_HAS_CLIP) != 0u {
@@ -592,17 +614,17 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     if (flags & FLAG_HAS_MASK) != 0u {
         // Mask texel for this device pixel; texels outside the cell
         // contribute zero coverage.
-        let mp = floor(in.pixel) - instances[i].params.zw;
+        let mp = floor(in.pixel) - in.params.zw;
         let msize = vec2<f32>(instances[i].clip.aspect, instances[i].clip.exponent);
         let inside = all(mp >= vec2<f32>(0.0)) && all(mp < msize);
         cov *= select(0.0, textureLoad(atlas, vec2<i32>(mp) + vec2<i32>(instances[i].uv.zw), 0).r, inside);
     }
-    cov = clamp(cov, 0.0, 1.0) * instances[i].params.y;
-    // A blended composite carries its mode in meta.w bits 16-23: sample the
+    cov = clamp(cov, 0.0, 1.0) * in.params.y;
+    // A blended composite carries its mode in meta_.w bits 16-23: sample the
     // source and backdrop, blend, and write the composited result verbatim
     // (the pass runs the Replace pipeline).
-    if instances[i].meta_.y == PAINT_TEXTURE {
-        let mode = (instances[i].meta_.w >> 16u) & 0xffu;
+    if in.meta_.y == PAINT_TEXTURE {
+        let mode = (in.meta_.w >> 16u) & 0xffu;
         if mode != 0u {
             let coord = vec2<i32>(floor(in.pixel - instances[i].grad.xy));
             let cs = textureLoad(source, coord, 0) * cov;
@@ -610,7 +632,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             return blend_color(mode, cb, cs);
         }
     }
-    return paint(i, in.local, in.pixel) * cov;
+    return paint(i, in.meta_, in.color, in.local, in.pixel) * cov;
 }
 
 // W3C Compositing and Blending Level 1, a literal port of

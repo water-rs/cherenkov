@@ -37,7 +37,9 @@ use std::marker::PhantomData;
 use std::rc::{Rc, Weak};
 use std::sync::mpsc::Sender;
 
-pub use crate::config::{Budget, Bytes, GpuConfig, GpuInfo, MemoryUsage, Pressure, ScratchFormat};
+pub use crate::config::{
+    Budget, Bytes, GpuConfig, GpuInfo, MemoryUsage, Pressure, ScratchFormat, TimestampSupport,
+};
 pub use crate::error::{EngineError, RenderError, ResourceError, SurfaceError, Unsupported};
 pub use crate::font::{Font, FontSource};
 pub use crate::image::{Image, ImageColorSpace, ImageSource};

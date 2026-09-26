@@ -30,6 +30,7 @@
 pub mod affinity;
 #[cfg(feature = "cherenkov")]
 pub mod cherenkov_ad;
+pub mod cli;
 pub mod conditions;
 pub mod convert;
 pub mod energy;
@@ -61,6 +62,9 @@ use cherenkov_scene::{Feature, Scene, SceneError};
 use serde::Serialize;
 
 use crate::convert::Blobs;
+
+#[cfg(unix)]
+pub use cli::cherenkov_bench_run;
 
 /// Errors an adapter or the CLI can produce.
 #[derive(Debug, thiserror::Error)]

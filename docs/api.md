@@ -29,14 +29,14 @@ Sections marked **Proposal** are not yet agreed; everything else records a decis
 
 Capabilities are traits implemented by backend types, so using a missing capability is a compile error:
 
-| Capability trait | `Gpu` | `Vello` | `Raster` | `Banded<P>` |
-|---|---|---|---|---|
-| `HdrOutput` | ✓ | | | |
-| `Backdrop` | ✓ | | ✓ | |
-| `GpuContent`, `ShaderPaint`, `ExternalFrames` | ✓ | `GpuContent`, `ShaderPaint` | | |
-| `Planes` (system-compositor promotion) | ✓ | | | |
-| `Runs<F>` for a filter `F`, `Effects` | every filter | every filter | filters with a CPU kernel | filters with a CPU kernel |
-| `Uploads<F>` for an image format `F` | every format | `Rgba8` | `Rgba8` | panel formats |
+| Capability trait | `Gpu` | `Vello` | `Raster` |
+|---|---|---|---|
+| `Uploads<F>` for an image format `F` | `Rgba8` | `Rgba8` | |
+| `GpuContent`, `ShaderPaint` | | both | |
+| `Filters`, `Runs<F>` for a filter `F`, `Effects` | | every filter | |
+| `HdrOutput`, `Backdrop`, `ExternalFrames`, `Planes` | | | |
+
+Targets beyond the current rows: `Gpu` is meant to accept every image format and grow `GpuContent`, `ShaderPaint`, `ExternalFrames`, `HdrOutput`, `Backdrop` and `Planes` (system-compositor promotion); `Raster` targets `Uploads<Rgba8>`, `Backdrop` and `Runs<F>`/`Effects` for filters with a CPU kernel; a `Banded<P>` microcontroller backend (banded output, panel formats, flash-resident assets) targets panel-format uploads and CPU-kernel filters.
 
 The table is the target; a backend slice implements the rows it has code for, and the compiler rejects the rest.
 
@@ -145,7 +145,7 @@ engine.trim(Pressure::Critical);       // system memory warning
 let usage: MemoryUsage = engine.memory();
 ```
 
-- The engine owns the device. `GpuContent` implementations reach wgpu through `cherenkov_gpu::interop::wgpu`.
+- The engine owns the device. `GpuContent` implementations reach wgpu through `cherenkov_vello::interop::wgpu`.
 - The pipeline set is closed and fully precompiled at creation, and the driver cache is persisted. Custom shaders compile when they are registered. Nothing compiles at draw time.
 - `Engine` is `!Send` and lives on the UI thread. It spawns and owns the render thread; dropping it sends `Shutdown` and joins the thread.
 - `engine.info()` is the backend's provenance (`B::Info`); `engine.stats()` the last frame's `FrameStats`.

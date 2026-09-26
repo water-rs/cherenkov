@@ -6,6 +6,7 @@
 mod blend;
 mod colr;
 mod coverage;
+mod gaussian;
 mod glyph;
 mod lower;
 mod mesh;

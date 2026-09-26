@@ -510,7 +510,7 @@ fn gaussian_tail_matches_erf() {
     for v in f.iter_mut().skip(48) {
         *v = 1.0;
     }
-    let g = gaussian_blur(&f, n, 1, sigma);
+    let g = gaussian_blur(&f, n, 1, sigma, kurbo::Affine::IDENTITY);
     let inv = 1.0 / (sigma * std::f64::consts::SQRT_2);
     for x in [16usize, 34, 44, 48] {
         let want = 0.5 * libm::erfc((48.0 - (x as f64 + 0.5)) * inv);

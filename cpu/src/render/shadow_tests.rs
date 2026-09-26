@@ -53,8 +53,8 @@ fn assert_shadow(outline: &BezPath, transform: Affine, clips: &[BezPath], size: 
     // Include effectively zero blur, a subpixel kernel, and a halo wider
     // than the canvas. The latter exercises clamping at every surface edge.
     for sigma in [0.0, 1e-10, 0.125, 0.75, 2.5, 9.0] {
-        let expected = shadow::gaussian_blur(&exact, width, height, sigma);
-        let actual = blur_coverage(&source, width, height, sigma);
+        let expected = shadow::gaussian_blur(&exact, width, height, sigma, transform);
+        let actual = blur_coverage(&source, width, height, sigma, transform);
         for (index, &value) in expected.iter().enumerate() {
             let x = index % width;
             let y = index / width;
@@ -83,6 +83,8 @@ fn rotated_and_sheared_shadow_uses_transformed_caster_coverage() {
     let outline = Rect::new(-4.125, -3.25, 4.75, 3.875).to_path(FLATTEN_TOL);
     for transform in [
         Affine::translate((8.125, 8.375)) * Affine::rotate(0.375),
+        Affine::translate((8.125, 8.375)) * Affine::scale_non_uniform(1.5, 0.75),
+        Affine::translate((8.125, 8.375)) * Affine::rotate(0.375) * Affine::scale_non_uniform(1.5, 0.75),
         Affine::new([1.0, 0.25, -0.5, 1.0, 8.125, 7.875]),
         Affine::new([-1.0, 0.25, 0.5, 1.0, 8.125, 7.875]),
     ] {
@@ -137,5 +139,33 @@ fn shadow_convolution_clamps_the_surface_not_the_caster_bounds() {
     for size in [(1, 1), (1, 9), (9, 1), (9, 9)] {
         assert_shadow(&outline, Affine::IDENTITY, &[], size);
         assert_shadow(&outline, Affine::translate((20.0, 20.0)), &[], size);
+    }
+}
+
+#[test]
+fn affine_gaussian_impulses_match_oracle_including_degenerate_covariances() {
+    let size = 17;
+    let mut exact = vec![0.0; size * size];
+    exact[8 * size + 8] = 1.0;
+    let source = super::coverage::Coverage::from_rows(8,
+        std::iter::once((0..size).map(|x| if x == 8 { 1.0 } else { 0.0 }).collect()));
+    for (sigma, transform) in [
+        (0.125, Affine::scale_non_uniform(3.0, 0.5)),
+        (1.25, Affine::rotate(0.4) * Affine::scale_non_uniform(2.0, 0.5)),
+        (0.75, Affine::new([1.0, 0.6, 0.0, 0.8, 0.0, 0.0])),
+        (0.75, Affine::new([-1.0, 0.6, 0.0, 0.8, 0.0, 0.0])),
+        (0.75, Affine::new([1.0, 1.0, 0.0, 1e-8, 0.0, 0.0])),
+        (0.75, Affine::new([1.0, 1.0, 0.0, 0.0, 0.0, 0.0])),
+        (0.75, Affine::new([0.0, 1.0, 0.0, 0.0, 0.0, 0.0])),
+        (0.75, Affine::scale(0.0)),
+        (1e-10, Affine::scale(1e10)),
+    ] {
+        let expected = shadow::gaussian_blur(&exact, size, size, sigma, transform);
+        let actual = blur_coverage(&source, size, size, sigma, transform);
+        for (index, &value) in expected.iter().enumerate() {
+            let rendered = f64::from(actual.at(index % size, index / size));
+            assert!((rendered - value).abs() < 3e-8,
+                "tap {index}, sigma {sigma}, transform {transform:?}: {rendered} versus {value}");
+        }
     }
 }

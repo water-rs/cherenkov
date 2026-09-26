@@ -8,7 +8,7 @@ use cherenkov::{BlendMode, BlendSpace, Draw, Glyph, GlyphRun, GlyphStyle, Group,
 use cherenkov_cpu::{Engine, FontSource, FrameTime, Offscreen, OffscreenFormat, Raster, RasterConfig};
 use cherenkov_oracle::{coverage::Coverage, path, shadow};
 use cherenkov_scene::FillRule;
-use kurbo::{Affine, BezPath, Point, Rect, Shape as _, Stroke};
+use kurbo::{Affine, BezPath, Point, Rect, Stroke};
 
 const SIZE: usize = 48;
 const COLOR: WorkingColor = WorkingColor::new([0.75, 0.25, 1.25, 0.5]);
@@ -57,10 +57,10 @@ fn arbitrary_shadow_rotation_offset_clips_and_cache_match_oracle() {
     let boundaries: Vec<_> = clips.iter().map(|clip| path::edges(&path::flatten(clip))).collect();
     let transform = Affine::translate((7.0, 1.0)) * Affine::rotate(0.25);
     let offset = (0.375, 1.125);
-    let coverage = shadow::spread_coverage(&caster, FillRule::NonZero,
+    let coverage = shadow::spread_coverage(&cherenkov_scene::Shape::Path { path: caster.clone() }, FillRule::NonZero,
         transform * Affine::translate(offset), 0.0, &boundaries, (SIZE, SIZE));
     for sigma in [0.0, 0.125, 2.25] {
-        let expected = colored(&shadow::gaussian_blur(&coverage, SIZE, SIZE, sigma), COLOR);
+        let expected = colored(&shadow::gaussian_blur(&coverage, SIZE, SIZE, sigma, transform), COLOR);
         for _ in 0..2 {
             let actual = render(&engine, |recorder| {
                 recorder.clip(clips[0].clone(), |recorder| {
@@ -82,14 +82,14 @@ fn rotated_box_shadows_and_signed_spread_match_oracle() {
     let rect = Rect::new(8.25, 7.125, 30.5, 28.75);
     let transform = Affine::translate((8.0, 1.0)) * Affine::rotate(0.25);
     for spread in [-1.5, 0.0, 2.25] {
-        let coverage = shadow::spread_coverage(&rect.to_path(0.001), FillRule::NonZero,
+        let coverage = shadow::spread_coverage(&cherenkov_scene::Shape::Rect(rect), FillRule::NonZero,
             transform, spread, &[], (SIZE, SIZE));
-        let expected = colored(&shadow::gaussian_blur(&coverage, SIZE, SIZE, 1.25), COLOR);
+        let expected = colored(&shadow::gaussian_blur(&coverage, SIZE, SIZE, 1.25, transform), COLOR);
         let actual = render(&engine, |recorder| recorder.transform(transform, |recorder| {
             recorder.shadow(rect, Shadow::new(1.25, COLOR).spread(spread));
         }));
-        // Spread's round joins have the same curve-flattening contract as fills.
-        assert_pixels(&actual, &expected, 0.004);
+        // Sharp box spread stays polygonal under rotation.
+        assert_pixels(&actual, &expected, 4e-6);
     }
 }
 
@@ -216,4 +216,45 @@ fn root_layer_state_uses_the_same_compositor_as_child_layers() {
     expected[3 * SIZE + 2] = cherenkov_oracle::blend::in_space(cherenkov_scene::BlendMode::Normal,
         BlendSpace::SrgbEncoded, [0.0; 4], colored(&[0.5], COLOR)[0]);
     assert_pixels(&surface.readback().expect("readback").pixels, &expected, 2e-5);
+}
+
+#[test]
+fn mixed_radius_box_spread_scales_and_clamps_like_oracle() {
+    let engine = engine();
+    let rect = kurbo::RoundedRect::from_rect(Rect::new(8.0, 8.0, 24.0, 24.0),
+        kurbo::RoundedRectRadii::new(0.0, 1.0, 3.0, 6.0));
+    let transforms = [Affine::scale_non_uniform(1.5, 0.75),
+        Affine::new([1.0, 0.25, 0.5, 1.0, 0.0, 0.0])];
+    for transform in transforms {
+        for spread in [-8.0, -2.0, 0.0, 2.0] {
+            let coverage = shadow::spread_coverage(&cherenkov_scene::Shape::RoundedRect(rect),
+                FillRule::NonZero, transform, spread, &[], (SIZE, SIZE));
+            let expected = colored(&shadow::gaussian_blur(&coverage, SIZE, SIZE, 0.75, transform), COLOR);
+            let actual = render(&engine, |recorder| recorder.transform(transform, |recorder| {
+                recorder.shadow(rect, Shadow::new(0.75, COLOR).spread(spread));
+            }));
+            // Rounded outlines retain the coverage compiler's curve tolerance.
+            assert_pixels(&actual, &expected, 0.004);
+        }
+    }
+}
+
+#[test]
+fn acute_path_spread_uses_miter_limit_four_under_shear_and_clipping() {
+    let engine = engine();
+    let caster = polygon(&[(12.0, 10.0), (13.0, 25.0), (11.0, 25.0)]);
+    let clip = polygon(&[(1.25, 0.5), (40.5, 7.25), (35.75, 43.5), (2.25, 39.75)]);
+    let boundaries = [path::edges(&path::flatten(&clip))];
+    let transform = Affine::new([1.5, 0.3, 0.25, 0.75, 1.0, 2.0]);
+    for spread in [-0.25, 0.0, 2.0] {
+        let coverage = shadow::spread_coverage(&cherenkov_scene::Shape::Path { path: caster.clone() },
+            FillRule::NonZero, transform, spread, &boundaries, (SIZE, SIZE));
+        let expected = colored(&shadow::gaussian_blur(&coverage, SIZE, SIZE, 0.25, transform), COLOR);
+        let actual = render(&engine, |recorder| recorder.clip(clip.clone(), |recorder| {
+            recorder.transform(transform, |recorder| {
+                recorder.shadow(caster.clone(), Shadow::new(0.25, COLOR).spread(spread));
+            });
+        }));
+        assert_pixels(&actual, &expected, 4e-6);
+    }
 }

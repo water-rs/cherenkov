@@ -15,10 +15,9 @@
 //!   fresh canvas (with the layer clip in force), then composits onto the
 //!   parent with the layer's opacity and blend mode (W3C Compositing and
 //!   Blending Level 1).
-//! - **Shadows** are the shape's exact coverage — clip-intersected, then
-//!   offset — convolved with a Gaussian in `f64`, filled with the colour.
-//!   Offsetting the edges before integration is exact because convolution
-//!   commutes with translation.
+//! - **Shadows** offset the shape in local space, transform it, then intersect
+//!   clips before computing exact coverage. Convolve in `f64` with the local
+//!   Gaussian pushed forward by the drawing transform; apply colour last.
 //! - **Strokes** expand with `kurbo`'s stroker; glyph outlines come from
 //!   `skrifa`, unhinted ([`crate::glyphs`]).
 
@@ -280,11 +279,11 @@ impl Renderer {
                 offset,
                 color,
             } => {
-                // Exact: shift the shape edges by the offset before coverage,
-                // then blur (convolution commutes with translation).
+                // Offset locally before the drawing transform and clip intersection.
+                // The linear transform also pushes forward the local Gaussian.
                 let tf_off = tf * Affine::translate((offset[0], offset[1]));
                 let coverage = self.shape_coverage(shape, FillRule::NonZero, tf_off, clips);
-                let blurred = gaussian_blur(&coverage, self.width, self.height, *blur_sigma);
+                let blurred = gaussian_blur(&coverage, self.width, self.height, *blur_sigma, tf);
                 let src = to_working(color);
                 for (px, &c) in canvas.pixels.iter_mut().zip(&blurred) {
                     if c > 0.0 {

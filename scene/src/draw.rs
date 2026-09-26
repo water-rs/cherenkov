@@ -357,9 +357,9 @@ pub enum Draw {
     Shadow {
         /// The shape producing the shadow.
         shape: Shape,
-        /// Gaussian blur standard deviation in pixels.
+        /// Gaussian blur standard deviation in the shape's units.
         blur_sigma: f64,
-        /// Shadow offset in pixels.
+        /// Shadow offset in the shape's units.
         offset: [f64; 2],
         /// Shadow colour.
         color: Color,

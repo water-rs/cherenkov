@@ -358,6 +358,24 @@ fn bbox_of(edges: &[Edge], w: usize, h: usize) -> IRect {
     }
 }
 
+/// Box spread adjusts semantic corner radii; other outlines use a miter band.
+fn shadow_path(shape: &ShapeData, spread: f64, tolerance: f64) -> Option<(BezPath, FillRule, f64)> {
+    use kurbo::Shape as _;
+    let rounded = match shape {
+        ShapeData::Rect(rect) => kurbo::RoundedRect::from_rect(*rect, 0.0),
+        ShapeData::RoundedRect(rect) => *rect,
+        _ => return shape_path(shape, tolerance).map(|(path, rule)| (path, rule, spread)),
+    };
+    let rect = rounded.rect().inflate(spread, spread);
+    if rect.width() <= 0.0 || rect.height() <= 0.0 { return None; }
+    let radius = |r: f64| if r > 0.0 { (r + spread).max(0.0) } else { 0.0 };
+    let radii = rounded.radii();
+    let path = kurbo::RoundedRect::from_rect(rect, kurbo::RoundedRectRadii::new(
+        radius(radii.top_left), radius(radii.top_right),
+        radius(radii.bottom_right), radius(radii.bottom_left))).to_path(tolerance);
+    Some((path, FillRule::NonZero, 0.0))
+}
+
 /// Close each authored contour, including an implicit final closing segment.
 fn closed_contours(path: &kurbo::BezPath) -> kurbo::BezPath {
     let mut closed = kurbo::BezPath::new();
@@ -750,35 +768,35 @@ impl<'a> Lowering<'a> {
     fn shadow(&mut self, shape: &ShapeData, shadow: &cherenkov::Shadow) {
         use crate::render::coverage::{Combine, rasterize_combined};
         let tolerance = FLATTEN_TOL / sigma_max(self.transform).max(1e-12);
-        let Some((path, rule)) = shape_path(shape, tolerance) else { return };
+        let Some((path, rule, spread)) = shadow_path(shape, shadow.spread, tolerance) else { return };
         let transform = self.transform * Affine::translate(shadow.offset);
         let clips = self.clip.as_ref().map_or(&[][..], |clip| clip.operands.as_slice());
         let mut key = crate::render::coverage::geometry_key(clips, self.width, self.height);
         key[0] = 1;
         key.push(u32::from(rule == FillRule::EvenOdd));
         key_path(&mut key, &path);
-        for value in transform.as_coeffs().into_iter().chain([shadow.sigma, shadow.spread]) {
+        for value in transform.as_coeffs().into_iter().chain([shadow.sigma, spread]) {
             key_float(&mut key, value);
         }
         let coverage = self.res.coverage_cache.get_or_insert(key, || {
             let mut operands = vec![Operand {
                 edges: flatten_edges(transform * path.clone(), FLATTEN_TOL).into(), rule,
             }];
-            let combine = if shadow.spread == 0.0 {
+            let combine = if spread == 0.0 {
                 Combine::Intersection
             } else {
-                let band = kurbo::stroke(closed_contours(&path), &kurbo::Stroke::new(2.0 * shadow.spread.abs())
-                    .with_join(kurbo::Join::Round).with_caps(kurbo::Cap::Round),
+                let band = kurbo::stroke(closed_contours(&path), &kurbo::Stroke::new(2.0 * spread.abs())
+                    .with_join(kurbo::Join::Miter).with_miter_limit(4.0),
                     &kurbo::StrokeOpts::default(), tolerance);
                 operands.push(Operand {
                     edges: flatten_edges(transform * band, FLATTEN_TOL).into(),
                     rule: FillRule::NonZero,
                 });
-                if shadow.spread > 0.0 { Combine::Union } else { Combine::Difference }
+                if spread > 0.0 { Combine::Union } else { Combine::Difference }
             };
             operands.extend_from_slice(clips);
             let caster = rasterize_combined(&operands, self.width, self.height, combine);
-            crate::render::raster::blur_coverage(&caster, self.width, self.height, shadow.sigma)
+            crate::render::raster::blur_coverage(&caster, self.width, self.height, shadow.sigma, transform)
         });
         let [red, green, blue, alpha] = shadow.color.components;
         self.items.push(Item::Draw {

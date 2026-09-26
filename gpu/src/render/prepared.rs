@@ -660,7 +660,7 @@ impl Lowerer<'_> {
             }
             ops.push(Op::Path {
                 local: ambient,
-                content: path::hash_stroke(shape, stroke, 0.0),
+                content: path::hash_stroke_source(shape, stroke),
                 rule: FillRule::NonZero,
                 outline: Outline::Stroke {
                     shape: shape.clone(),

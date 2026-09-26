@@ -44,6 +44,8 @@ pub mod vello_like;
 #[cfg(any(feature = "vello-classic", feature = "vello-hybrid"))]
 pub mod wgpu_ctx;
 
+#[cfg(feature = "cherenkov-vello")]
+pub mod cherenkov_vello_ad;
 #[cfg(any(feature = "skia", feature = "skia-metal"))]
 pub mod skia_ad;
 #[cfg(feature = "vello-classic")]
@@ -241,6 +243,8 @@ pub fn engine_names() -> Vec<&'static str> {
         skia_ad::SkiaVk::NAME,
         #[cfg(all(feature = "skia-metal", target_vendor = "apple"))]
         skia_ad::SkiaMtl::NAME,
+        #[cfg(feature = "cherenkov-vello")]
+        cherenkov_vello_ad::CherenkovVello::NAME,
     ]
 }
 
@@ -267,6 +271,10 @@ pub fn create_engine(name: &str) -> Result<Box<dyn Engine>, BenchError> {
         skia_ad::SkiaVk::NAME => skia_ad::SkiaVk::new().map(|e| Box::new(e) as Box<dyn Engine>),
         #[cfg(all(feature = "skia-metal", target_vendor = "apple"))]
         skia_ad::SkiaMtl::NAME => skia_ad::SkiaMtl::new().map(|e| Box::new(e) as Box<dyn Engine>),
+        #[cfg(feature = "cherenkov-vello")]
+        cherenkov_vello_ad::CherenkovVello::NAME => {
+            cherenkov_vello_ad::CherenkovVello::new().map(|e| Box::new(e) as Box<dyn Engine>)
+        }
         _ => Err(BenchError::Engine(format!(
             "unknown or uncompiled engine {name:?}; available: {:?}",
             engine_names()

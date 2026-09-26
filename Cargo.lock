@@ -316,8 +316,10 @@ version = "0.0.0"
 dependencies = [
  "ash",
  "bytemuck",
+ "cherenkov",
  "cherenkov-oracle",
  "cherenkov-scene",
+ "cherenkov-vello",
  "clap",
  "glifo",
  "kurbo",

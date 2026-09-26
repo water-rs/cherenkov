@@ -129,6 +129,13 @@ impl Registry {
                 "shader paint accepts at most 64 uniform floats".into(),
             ));
         }
+        let maximum = device.limits().max_texture_dimension_2d;
+        if key.size.0 > maximum || key.size.1 > maximum {
+            return Err(RenderError::Render(format!(
+                "shader texture {:?} exceeds device limit {maximum}",
+                key.size
+            )));
+        }
         let texture = textures.entry(key.clone()).or_insert_with(|| {
             let (texture, view) = super::create_target(
                 device,

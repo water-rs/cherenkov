@@ -384,6 +384,20 @@ impl From<ImagePattern> for Paint {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ShaderId(u64);
 
+impl ShaderId {
+    /// Creates an identifier from a backend-assigned raw value.
+    #[must_use]
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// The raw value.
+    #[must_use]
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
 /// A user shader used as a paint, with its uniform values.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ShaderPaint {

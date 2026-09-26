@@ -169,7 +169,16 @@ jobs:
         run: |
           cargo clippy --locked -p cherenkov-bench --all-targets \
             --features skia-metal,vello-classic,vello-hybrid,cherenkov -- -D warnings
-      - run: cargo build --locked --release -p cherenkov-bench --features skia-metal,vello-classic,vello-hybrid
+      - run: cargo build --locked --release -p cherenkov-bench --features skia-metal,vello-classic,vello-hybrid,cherenkov
+      # Many timed frames of the map scene on a Metal device: the workload
+      # that used to hang the render thread on Apple GPUs.
+      - name: Measure the map scene on Metal
+        run: |
+          set -euo pipefail
+          mkdir -p out/map-only
+          cp -R scenes/perf/map out/map-only/map
+          RUST_LOG=info,cherenkov_gpu=debug ./target/release/cherenkov-bench measure \
+            --engine cherenkov --corpus out/map-only --frames 20 --warmup 5 --out out/measure-metal
       - name: Render the corpus on Metal adapters
         run: |
           set -euo pipefail

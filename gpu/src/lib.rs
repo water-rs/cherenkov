@@ -171,7 +171,7 @@ impl Engine<Gpu> {
                 index: source.index,
             })
             .map_err(|_| ResourceError::Lost)?;
-        Ok(Font::new(cherenkov::FontId::new(id)))
+        Ok(Font::new(cherenkov::FontId::new(id), self.tx.clone()))
     }
 
     /// Registers an image.

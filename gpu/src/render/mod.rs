@@ -779,6 +779,10 @@ pub fn run(config: GpuConfig, rx: Receiver<Message>, init_tx: Sender<Result<Init
                     },
                 );
             }
+            Message::RemoveFont { id } => {
+                renderer.fonts.remove(&id);
+                renderer.atlas.remove_font(id);
+            }
             Message::Commit { surface, changes } => {
                 renderer.commit(surface, changes);
             }

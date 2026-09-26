@@ -146,7 +146,7 @@ fn a_clipped_path_is_cached_per_offset() -> Result<(), Box<dyn std::error::Error
     surface.update(|tx| {
         tx[&layer].content(surface.record(|c| {
             c.transform(cherenkov::kurbo::Affine::translate((64.0, 64.0)), |c| {
-                c.fill(overhang(), RED)
+                c.fill(overhang(), RED);
             });
         }));
     });
@@ -155,7 +155,7 @@ fn a_clipped_path_is_cached_per_offset() -> Result<(), Box<dyn std::error::Error
     // A fresh engine renders the same shifted draw for comparison.
     let Some(fresh) = render(|c| {
         c.transform(cherenkov::kurbo::Affine::translate((64.0, 64.0)), |c| {
-            c.fill(overhang(), RED)
+            c.fill(overhang(), RED);
         });
     })?
     else {

@@ -8,7 +8,9 @@ use std::sync::Arc;
 use std::sync::mpsc::Sender;
 
 use cherenkov::kurbo::Affine;
-use cherenkov::{ContentChange, Picture, ShapeData, WorkingColor};
+use cherenkov::{BlendMode, ContentChange, Picture, ShapeData, WorkingColor};
+
+use crate::image::ImageColorSpace;
 
 use crate::config::{MemoryUsage, Pressure};
 use crate::error::{RenderError, SurfaceError};
@@ -30,6 +32,8 @@ pub enum LayerOp {
     Transform(LayerId, Affine),
     /// Set the opacity.
     Opacity(LayerId, f32),
+    /// Set the blend mode.
+    Blend(LayerId, BlendMode),
     /// Set or clear the clip shape.
     Clip(LayerId, Option<ShapeData>),
     /// Set the layer content to a shared picture, or clear it.
@@ -95,6 +99,24 @@ pub enum Message {
         data: Arc<[u8]>,
         /// Font index inside a collection.
         index: u32,
+    },
+    /// Register an image.
+    AddImage {
+        /// The image id (`ImageId::raw`).
+        id: u64,
+        /// Width in pixels.
+        width: u32,
+        /// Height in pixels.
+        height: u32,
+        /// Straight-alpha RGBA8 pixels, row-major.
+        pixels: Arc<[u8]>,
+        /// The encoded colour space.
+        color_space: ImageColorSpace,
+    },
+    /// Release an image.
+    DestroyImage {
+        /// The image id.
+        id: u64,
     },
     /// Commit a surface's change set.
     Commit {

@@ -524,6 +524,18 @@ impl Renderer {
         state.dirty = true;
     }
 
+    /// Releases a node's current content: the replaced `GpuContent`'s
+    /// texture binding and the cached fragment's shader uses must be
+    /// unbound, not leaked in vello's override map.
+    fn release_content(vello: &mut vello::Renderer, node: &mut LayerNode) {
+        if let Some(old) = node.content.take() {
+            Self::unregister_content(vello, old);
+        }
+        for use_ in node.shader_uses.drain(..) {
+            vello.override_image(&use_.image, None);
+        }
+    }
+
     /// Applies one surface's change set.
     fn commit(&mut self, surface: SurfaceId, changes: ChangeSet) {
         let Some(state) = self.surfaces.get_mut(&surface) else {
@@ -569,12 +581,7 @@ impl Renderer {
                 }
                 LayerOp::Content(id, content) => {
                     if let Some(node) = state.layers.get_mut(&id) {
-                        if let Some(old) = node.content.take() {
-                            Self::unregister_content(&mut self.vello, old);
-                        }
-                        for use_ in node.shader_uses.drain(..) {
-                            self.vello.override_image(&use_.image, None);
-                        }
+                        Self::release_content(&mut self.vello, node);
                         node.content = content.map(|c| match c {
                             crate::message::LayerContentMsg::Picture(p) => ContentData::Picture(p),
                             crate::message::LayerContentMsg::Gpu(m) => {
@@ -588,6 +595,7 @@ impl Renderer {
                     if let Some(node) = state.layers.get_mut(&id) {
                         match change {
                             ContentChange::Replace(list) => {
+                                Self::release_content(&mut self.vello, node);
                                 node.content = Some(ContentData::List(list));
                             }
                             ContentChange::Update(updates) => {
@@ -1407,4 +1415,135 @@ fn rgba8_to_working(px: [u8; 4]) -> [f32; 4] {
     let m = &LINEAR_SRGB_TO_LINEAR_P3;
     let dot = |row: &[f32; 3]| row[2].mul_add(lin[2], row[1].mul_add(lin[1], row[0] * lin[0]));
     [dot(&m[0]), dot(&m[1]), dot(&m[2]), f32::from(px[3]) / 255.0]
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    use crate::message::{GpuContentMsg, LayerContentMsg};
+
+    use super::*;
+
+    /// A `Renderer` on the test adapter, or `None` without an adapter.
+    fn renderer() -> Option<Renderer> {
+        let (_adapter, device, queue) = create_device(&VelloConfig::default()).ok()?;
+        let vello = vello::Renderer::new(
+            &device,
+            RendererOptions {
+                use_cpu: false,
+                antialiasing_support: AaSupport::area_only(),
+                num_init_threads: NonZeroUsize::new(1),
+                pipeline_cache: None,
+            },
+        )
+        .expect("vello renderer");
+        let query_staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("timestamp staging"),
+            size: 16,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        Some(Renderer {
+            max_texture: device.limits().max_texture_dimension_2d,
+            device,
+            queue,
+            vello,
+            surfaces: HashMap::new(),
+            fonts: HashMap::new(),
+            images: HashMap::new(),
+            shaders: shader::ShaderRegistry::default(),
+            filters: filter::FilterRegistry::default(),
+            blitters: HashMap::new(),
+            start: Instant::now(),
+            timestamps: false,
+            query_set: None,
+            query_buffer: None,
+            query_staging,
+            timestamps_inside: false,
+        })
+    }
+
+    /// `GpuContent` that renders nothing.
+    struct NoopContent;
+
+    impl crate::gpu_content::GpuContent for NoopContent {
+        async fn setup(&mut self, _gpu: &interop::wgpu::Context<'_>) {}
+
+        fn render(&mut self, _frame: &mut interop::wgpu::Frame<'_>) {}
+    }
+
+    /// Whether `image` has a vello override bound — checked
+    /// non-destructively: a found binding is restored.
+    fn override_bound(renderer: &mut Renderer, image: &peniko::ImageData) -> bool {
+        let prev = renderer.vello.override_image(image, None);
+        let bound = prev.is_some();
+        renderer.vello.override_image(image, prev);
+        bound
+    }
+
+    /// The image identity `layer`'s Gpu slot bound on `surface`.
+    fn gpu_image(renderer: &Renderer, surface: SurfaceId, layer: LayerId) -> peniko::ImageData {
+        let node = &renderer.surfaces[&surface].layers[&layer];
+        let Some(ContentData::Gpu(slot)) = &node.content else {
+            panic!("expected gpu content");
+        };
+        slot.ready.as_ref().expect("rendered").image.clone()
+    }
+
+    /// Commits a surface with one layer holding a `GpuContent`, renders
+    /// once, and returns the image identity the slot bound.
+    fn bound_gpu_image(renderer: &mut Renderer) -> peniko::ImageData {
+        renderer
+            .create_surface(1, TargetSpec::Offscreen { size: (32, 32) })
+            .expect("surface");
+        renderer.commit(
+            1,
+            ChangeSet {
+                clear: None,
+                ops: vec![
+                    LayerOp::Create(1),
+                    LayerOp::Push { parent: 0, child: 1 },
+                    LayerOp::Content(
+                        1,
+                        Some(LayerContentMsg::Gpu(GpuContentMsg {
+                            id: 1,
+                            size: (8, 8),
+                            dirty: Arc::new(AtomicBool::new(false)),
+                            content: Box::new(NoopContent),
+                        })),
+                    ),
+                ],
+            },
+        );
+        renderer
+            .render_frame(crate::FrameTime::now())
+            .expect("render");
+        gpu_image(renderer, 1, 1)
+    }
+
+    /// Replacing a layer's live `Content` must run the same release as
+    /// `LayerOp::Content`: the old `GpuContent`'s override binding must be
+    /// removed, not leaked in vello's override map.
+    #[test]
+    fn replace_releases_the_old_contents_binding() {
+        let Some(mut renderer) = renderer() else { return };
+        let image = bound_gpu_image(&mut renderer);
+        assert!(override_bound(&mut renderer, &image), "setup: bound");
+        let replace = cherenkov::Content::record(|_| {})
+            .take_change()
+            .expect("first change is Replace");
+        renderer.commit(
+            1,
+            ChangeSet {
+                clear: None,
+                ops: vec![LayerOp::ContentChange(1, replace)],
+            },
+        );
+        assert!(
+            !override_bound(&mut renderer, &image),
+            "replaced content's override must be unbound"
+        );
+    }
 }

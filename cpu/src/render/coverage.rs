@@ -252,7 +252,11 @@ struct Line {
 }
 
 impl Line {
-    #[expect(clippy::suboptimal_flops, clippy::float_cmp, reason = "exact endpoint events preserve connectivity; avoid software FMA on baseline targets")]
+    #[expect(
+        clippy::suboptimal_flops,
+        clippy::float_cmp,
+        reason = "exact endpoint events preserve connectivity; avoid software FMA on baseline targets"
+    )]
     fn at(self, y: f64) -> f64 {
         if y == self.bottom {
             self.end_x
@@ -376,7 +380,10 @@ impl RowScratch {
         }
     }
 
-    #[expect(clippy::cast_possible_truncation, reason = "final coverage rounds once to framebuffer precision")]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "final coverage rounds once to framebuffer precision"
+    )]
     fn finish(&mut self, result: &mut Coverage, w: usize) {
         self.delta.sort_unstable_by_key(|&(x, _)| x);
         let row_start = result.spans.len();
@@ -423,11 +430,7 @@ fn row_lines(operands: &[Operand], top: usize, bottom: usize) -> Vec<Vec<Line>> 
                 bottom: hi,
                 x: if y0 < y1 { x0 } else { x1 },
                 end_x: if y0 < y1 { x1 } else { x0 },
-                slope: if y0 == y1 {
-                    0.0
-                } else {
-                    (x1 - x0) / (y1 - y0)
-                },
+                slope: if y0 == y1 { 0.0 } else { (x1 - x0) / (y1 - y0) },
                 dir: if y0 < y1 { 1 } else { -1 },
                 operand,
                 left: x0.min(x1),
@@ -477,8 +480,16 @@ pub fn rasterize(operands: &[Operand], w: usize, h: usize) -> Coverage {
     let mut top = 0;
     let mut bottom = h;
     for operand in operands {
-        let lo = operand.edges.iter().map(|e| e.y0.min(e.y1)).fold(f32::INFINITY, f32::min);
-        let hi = operand.edges.iter().map(|e| e.y0.max(e.y1)).fold(f32::NEG_INFINITY, f32::max);
+        let lo = operand
+            .edges
+            .iter()
+            .map(|e| e.y0.min(e.y1))
+            .fold(f32::INFINITY, f32::min);
+        let hi = operand
+            .edges
+            .iter()
+            .map(|e| e.y0.max(e.y1))
+            .fold(f32::NEG_INFINITY, f32::max);
         top = top.max((lo.floor() as usize).min(h));
         bottom = bottom.min((hi.ceil() as usize).min(h));
     }
@@ -524,18 +535,30 @@ mod tests {
     use super::*;
 
     fn polygon(points: &[(f32, f32)], rule: FillRule) -> Operand {
-        let edges = points.iter().enumerate().map(|(i, &(x0, y0))| {
-            let (x1, y1) = points[(i + 1) % points.len()];
-            Edge { x0, y0, x1, y1 }
-        }).collect();
+        let edges = points
+            .iter()
+            .enumerate()
+            .map(|(i, &(x0, y0))| {
+                let (x1, y1) = points[(i + 1) % points.len()];
+                Edge { x0, y0, x1, y1 }
+            })
+            .collect();
         Operand { edges, rule }
     }
 
     fn segments(operand: &Operand) -> Vec<cherenkov_oracle::clip::Segment> {
-        operand.edges.iter().map(|edge| (
-            f64::from(edge.x0), f64::from(edge.y0),
-            f64::from(edge.x1), f64::from(edge.y1),
-        )).collect()
+        operand
+            .edges
+            .iter()
+            .map(|edge| {
+                (
+                    f64::from(edge.x0),
+                    f64::from(edge.y0),
+                    f64::from(edge.x1),
+                    f64::from(edge.y1),
+                )
+            })
+            .collect()
     }
 
     fn oracle(operands: &[Operand], w: usize, h: usize) -> Vec<f64> {
@@ -558,15 +581,34 @@ mod tests {
         let got = rasterize(operands, w, h);
         for (i, want) in oracle(operands, w, h).into_iter().enumerate() {
             let actual = f64::from(got.at(i % w, i / w));
-            assert!((actual - want).abs() < 2e-6, "pixel ({}, {}): {actual} vs {want}", i % w, i / w);
+            assert!(
+                (actual - want).abs() < 2e-6,
+                "pixel ({}, {}): {actual} vs {want}",
+                i % w,
+                i / w
+            );
         }
     }
 
     #[test]
     fn nested_non_rectangular_clips_intersect_inside_pixels() {
-        let shape = polygon(&[(1.125, 1.125), (21.75, 2.375), (3.25, 21.875)], FillRule::NonZero);
-        let first = polygon(&[(2.625, 0.75), (20.875, 5.125), (16.625, 21.625), (0.875, 16.125)], FillRule::NonZero);
-        let second = polygon(&[(0.25, 3.75), (22.25, 1.25), (20.75, 20.75)], FillRule::NonZero);
+        let shape = polygon(
+            &[(1.125, 1.125), (21.75, 2.375), (3.25, 21.875)],
+            FillRule::NonZero,
+        );
+        let first = polygon(
+            &[
+                (2.625, 0.75),
+                (20.875, 5.125),
+                (16.625, 21.625),
+                (0.875, 16.125),
+            ],
+            FillRule::NonZero,
+        );
+        let second = polygon(
+            &[(0.25, 3.75), (22.25, 1.25), (20.75, 20.75)],
+            FillRule::NonZero,
+        );
         compare(&[shape, first, second], 24, 24);
     }
 
@@ -586,8 +628,16 @@ mod tests {
         let first = polygon(&[(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)], FillRule::NonZero);
         compare(&[first.clone(), first.clone(), first.clone()], 1, 1);
         assert!((rasterize(&[first.clone(), first.clone()], 1, 1).at(0, 0) - 0.5).abs() < 1e-7);
-        let doubled: Arc<[Edge]> = first.edges.iter().chain(first.edges.iter()).copied().collect();
-        let even = Operand { edges: doubled, rule: FillRule::EvenOdd };
+        let doubled: Arc<[Edge]> = first
+            .edges
+            .iter()
+            .chain(first.edges.iter())
+            .copied()
+            .collect();
+        let even = Operand {
+            edges: doubled,
+            rule: FillRule::EvenOdd,
+        };
         assert!(rasterize(&[first, even], 1, 1).at(0, 0).abs() < 1e-7);
     }
 
@@ -595,21 +645,56 @@ mod tests {
     fn fractional_horizontal_edges_connect_winding_groups() {
         // Dropping horizontal edges would make the winding carried through
         // the gap depend on y and incorrectly fill the upper/lower rows.
-        let shape = polygon(&[(-20.25, 0.25), (20.75, 0.25), (20.75, 17.75), (-20.25, 17.75)], FillRule::NonZero);
+        let shape = polygon(
+            &[
+                (-20.25, 0.25),
+                (20.75, 0.25),
+                (20.75, 17.75),
+                (-20.25, 17.75),
+            ],
+            FillRule::NonZero,
+        );
         compare(&[shape], 24, 24);
-        let shallow = polygon(&[(-30.5, 4.125), (40.25, 4.875), (40.25, 5.125), (-30.5, 4.375)], FillRule::NonZero);
+        let shallow = polygon(
+            &[
+                (-30.5, 4.125),
+                (40.25, 4.875),
+                (40.25, 5.125),
+                (-30.5, 4.375),
+            ],
+            FillRule::NonZero,
+        );
         compare(&[shallow], 24, 24);
     }
 
     #[test]
     fn winding_orientation_and_large_values_do_not_fold_signed_area() {
-        let contour = polygon(&[(2.25, 1.125), (21.75, 3.875), (4.25, 20.625)], FillRule::NonZero);
+        let contour = polygon(
+            &[(2.25, 1.125), (21.75, 3.875), (4.25, 20.625)],
+            FillRule::NonZero,
+        );
         let repeated: Arc<[Edge]> = (0..8).flat_map(|_| contour.edges.iter().copied()).collect();
         for rule in [FillRule::NonZero, FillRule::EvenOdd] {
-            compare(&[Operand { edges: repeated.clone(), rule }], 24, 24);
+            compare(
+                &[Operand {
+                    edges: repeated.clone(),
+                    rule,
+                }],
+                24,
+                24,
+            );
         }
         let reversed = Operand {
-            edges: contour.edges.iter().map(|e| Edge { x0: e.x1, y0: e.y1, x1: e.x0, y1: e.y0 }).collect(),
+            edges: contour
+                .edges
+                .iter()
+                .map(|e| Edge {
+                    x0: e.x1,
+                    y0: e.y1,
+                    x1: e.x0,
+                    y1: e.y0,
+                })
+                .collect(),
             rule: FillRule::NonZero,
         };
         compare(&[reversed], 24, 24);
@@ -617,7 +702,15 @@ mod tests {
 
     #[test]
     fn cache_hits_eviction_and_disabled_cache_are_bit_identical() {
-        let shape = polygon(&[(0.125, 0.25), (10.75, 0.25), (10.75, 12.875), (0.125, 12.875)], FillRule::NonZero);
+        let shape = polygon(
+            &[
+                (0.125, 0.25),
+                (10.75, 0.25),
+                (10.75, 12.875),
+                (0.125, 12.875),
+            ],
+            FillRule::NonZero,
+        );
         let mut cache = CoverageCache::new(1024 * 1024);
         let first = cache.intersection(std::slice::from_ref(&shape), 24, 24);
         let second = cache.intersection(std::slice::from_ref(&shape), 24, 24);

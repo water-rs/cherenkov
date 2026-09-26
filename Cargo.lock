@@ -357,6 +357,7 @@ dependencies = [
  "cherenkov-scene",
  "half",
  "kurbo",
+ "libm",
  "rayon",
  "skrifa 0.44.0",
  "thiserror",

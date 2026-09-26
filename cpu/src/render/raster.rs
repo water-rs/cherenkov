@@ -1,25 +1,14 @@
 // Copyright 2026 the Cherenkov Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! The banded exact-area coverage rasterizer.
-//!
-//! A port of the accumulation rasterizer from font-rs (`raster.rs`), also
-//! used by `cherenkov-gpu` for glyph masks: every flattened directed edge
-//! deposits a signed area into a `(width + 2) * band_h` accumulator whose
-//! column 0 guards everything left of the canvas and whose last column
-//! guards everything right of it, then each row is prefix-summed and the
-//! fill rule turns the winding-weighted area into coverage.
-//!
-//! The accumulator is exact for polygons that do not self-overlap inside a
-//! pixel — the oracle's `pixel_area` is exact even then; this is the known
-//! difference this backend documents.
+//! Sparse coverage compositing over independently owned framebuffer bands.
+//! See `coverage` for the geometric intersection compiler.
 
 use rayon::prelude::*;
 
-use cherenkov::FillRule;
-
 use crate::render::blend::{blend, src_over};
-use crate::render::lower::{ClipMask, ClipRef, IRect, Item};
+use crate::render::coverage::Coverage;
+use crate::render::lower::{IRect, Item};
 use crate::render::paint::PaintData;
 
 /// Rows per rasterization band.
@@ -41,367 +30,6 @@ pub struct Edge {
     pub y1: f32,
 }
 
-/// A signed-area accumulation buffer over a band of `h` rows.
-///
-/// Columns are indexed `x + 1`, so column 0 collects every deposit at
-/// `x <= -1` and column `w + 1` every deposit at `x >= w`. Deposits are
-/// clamped into that range: their row sum is what the prefix sum consumes,
-/// and a deposit's exact column below 0 or above `w` never changes the
-/// coverage of an on-canvas pixel.
-#[derive(Debug)]
-pub struct Accum {
-    w: usize,
-    h: usize,
-    /// `(w + 2) * h` cells.
-    a: Vec<f32>,
-    /// Guard-column window of the current draw: deposits clamp into
-    /// `[cmin, cmax]` (inclusive); clearing and the prefix sum touch
-    /// only that range.
-    cmin: usize,
-    cmax: usize,
-}
-
-impl Accum {
-    /// A zeroed accumulator of `w` × `h` cells.
-    pub fn new(w: usize, h: usize) -> Self {
-        Self {
-            w,
-            h,
-            a: vec![0.0; (w + 2) * h],
-            cmin: 0,
-            cmax: w + 1,
-        }
-    }
-
-    /// Restricts the draw window to pixels `x0..x1` (already clamped to
-    /// `0..w`): deposits clamp into guard columns `x0..x1 + 1`, so a
-    /// draw only ever pays its own bounding box's width.
-    pub fn set_window(&mut self, x0: usize, x1: usize) {
-        self.cmin = x0;
-        self.cmax = (x1 + 1).min(self.w + 1);
-    }
-
-    /// Zeros the window's columns for band rows `y_lo..y_hi`.
-    pub fn clear_range(&mut self, y_lo: usize, y_hi: usize) {
-        for y in y_lo..y_hi.min(self.h) {
-            let row = y * (self.w + 2);
-            self.a[row + self.cmin..=row + self.cmax].fill(0.0);
-        }
-    }
-
-    /// The accumulation cell for edge column `x` of band row `y`.
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_possible_wrap,
-        clippy::cast_sign_loss,
-        reason = "canvas width fits i32; the column is clamped non-negative"
-    )]
-    fn cell(&mut self, x: i32, y: usize) -> &mut f32 {
-        let col = (x + 1).clamp(self.cmin as i32, self.cmax as i32) as usize;
-        &mut self.a[y * (self.w + 2) + col]
-    }
-
-    /// Accumulates the signed area of the segment `(x0,y0)-(x1,y1)`, where
-    /// `y` is band-local (`0..h`).
-    #[expect(
-        clippy::similar_names,
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        clippy::suboptimal_flops,
-        reason = "a direct port of font-rs's scanline area accounting"
-    )]
-    pub fn draw_line(&mut self, x0: f32, y0: f32, x1: f32, y1: f32) {
-        if (y0 - y1).abs() <= f32::EPSILON {
-            return;
-        }
-        let (dir, x0, y0, x1, y1) = if y0 < y1 {
-            (1.0, x0, y0, x1, y1)
-        } else {
-            (-1.0, x1, y1, x0, y0)
-        };
-        let dxdy = (x1 - x0) / (y1 - y0);
-        let mut x = x0;
-        if y0 < 0.0 {
-            x -= y0 * dxdy;
-        }
-        let y_start = y0.max(0.0) as usize;
-        let y_end = self.h.min((y1.ceil() as usize).min(self.h));
-        for y in y_start..y_end {
-            let dy = ((y + 1) as f32).min(y1) - (y as f32).max(y0);
-            let xnext = x + dxdy * dy;
-            let d = dy * dir;
-            let (xa, xb) = if x < xnext { (x, xnext) } else { (xnext, x) };
-            let xa_floor = xa.floor();
-            let xa_i = xa_floor as i32;
-            let xb_ceil = xb.ceil();
-            let xb_i = xb_ceil as i32;
-            if xb_i <= xa_i + 1 {
-                // The piece stays within one cell column.
-                let xmf = x.midpoint(xnext) - xa_floor;
-                *self.cell(xa_i, y) += d - d * xmf;
-                *self.cell(xa_i + 1, y) += d * xmf;
-            } else {
-                let s = (xb - xa).recip();
-                let xa_f = xa - xa_floor;
-                let a0 = 0.5 * s * (1.0 - xa_f) * (1.0 - xa_f);
-                let xb_f = xb - xb_ceil + 1.0;
-                let am = 0.5 * s * xb_f * xb_f;
-                *self.cell(xa_i, y) += d * a0;
-                if xb_i == xa_i + 2 {
-                    *self.cell(xa_i + 1, y) += d * (1.0 - a0 - am);
-                } else {
-                    let a1 = s * (1.5 - xa_f);
-                    *self.cell(xa_i + 1, y) += d * (a1 - a0);
-                    for xi in xa_i + 2..xb_i - 1 {
-                        *self.cell(xi, y) += d * s;
-                    }
-                    let a2 = a1 + (xb_i - xa_i - 3) as f32 * s;
-                    *self.cell(xb_i - 1, y) += d * (1.0 - a2 - am);
-                    *self.cell(xb_i, y) += d * am;
-                    x = xnext;
-                    continue;
-                }
-                *self.cell(xb_i, y) += d * am;
-            }
-            x = xnext;
-        }
-    }
-
-    /// Folds band-local row `y` into per-pixel coverage, calling
-    /// `f(x, coverage)` for each pixel `x0..x1`.
-    ///
-    /// The prefix sum starts at guard column `x0` and the coverage of
-    /// pixel `x` is the sum through column `x + 1`. Deposits arrive via
-    /// [`deposit_exact`], which only ever produces winding ±1, so a
-    /// plain `abs().min(1)` fold is the coverage for either fill rule.
-    pub fn coverage_row(&self, y: usize, x0: usize, x1: usize, mut f: impl FnMut(usize, f32)) {
-        let row = y * (self.w + 2);
-        let mut acc = self.a[row + x0];
-        for x in x0..x1.min(self.w) {
-            acc += self.a[row + x + 1];
-            let cov = acc.abs().min(1.0);
-            if cov > 0.0 {
-                f(x, cov);
-            }
-        }
-    }
-}
-
-/// A polygon edge swept across a strip: `x(y) = top + dxdy·(y - ylo)`.
-#[derive(Clone, Copy, Debug)]
-struct Swept {
-    /// Top end y.
-    ylo: f32,
-    /// Bottom end y.
-    yhi: f32,
-    /// x at `ylo`.
-    top: f32,
-    /// dx/dy.
-    dxdy: f32,
-    /// Winding contribution when crossed left-to-right: +1 for a
-    /// downward edge, -1 for upward.
-    dir: f32,
-}
-
-impl Swept {
-    fn x_at(&self, y: f32) -> f32 {
-        self.dxdy.mul_add(y - self.ylo, self.top)
-    }
-}
-
-/// The smallest y below `above` at which adjacent crossings `order[k]`
-/// and `order[k+1]` change order, over all k, or `None`. Intersections
-/// at or just below `below` count — a pair can cross exactly on the
-/// strip top and still sort pre-flip by f32 rounding of `x_at`.
-fn next_crossing(lines: &[Swept], order: &[usize], below: f32, above: f32) -> Option<f32> {
-    let mut hit = None;
-    for pair in order.windows(2) {
-        let (a, b) = (lines[pair[0]], lines[pair[1]]);
-        if a.x_at(above) <= b.x_at(above) {
-            continue;
-        }
-        let dm = a.dxdy - b.dxdy;
-        if dm.abs() <= f32::EPSILON {
-            continue;
-        }
-        let y = (b.top - a.top + a.dxdy.mul_add(a.ylo, -b.dxdy * b.ylo)) / dm;
-        if y > below - 1e-5 && y < hit.unwrap_or(above) {
-            hit = Some(y);
-        }
-    }
-    hit
-}
-
-/// Deposits the inside of `edges` (band-local y within `0..bh`) into
-/// `acc` under `rule` as disjoint trapezoids of winding exactly ±1, so
-/// `coverage_row`'s `abs().min(1)` fold is exact even where the path
-/// self-intersects or contours overlap.
-///
-/// Each band row is split into strips at every interior edge endpoint;
-/// within a strip every edge is a straight line, so two adjacent
-/// crossings that swap order do so at one intersection y, which splits
-/// the strip further. Per sub-strip the inside intervals between
-/// consecutive crossings (a left→right walk accumulating winding) are
-/// deposited as a consistently oriented quad: the left edge down and
-/// the right edge up.
-#[expect(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::too_many_lines,
-    clippy::while_float,
-    reason = "row indices are small; y/x names mirror the geometry"
-)]
-pub fn deposit_exact(
-    acc: &mut Accum,
-    edges: impl Iterator<Item = Edge>,
-    rule: FillRule,
-    bh: usize,
-) {
-    const EPS_Y: f32 = 1e-7;
-    let mut lines = Vec::new();
-    // Row spans per swept line, then a counting sort into `bucket`
-    // (line indices grouped by row) with `offs` row offsets.
-    let mut spans: Vec<(usize, usize)> = Vec::new();
-    let mut offs = vec![0usize; bh + 1];
-    for e in edges {
-        if (e.y0 - e.y1).abs() <= f32::EPSILON {
-            continue;
-        }
-        let (ylo, yhi, top) = if e.y0 < e.y1 {
-            (e.y0, e.y1, e.x0)
-        } else {
-            (e.y1, e.y0, e.x1)
-        };
-        lines.push(Swept {
-            ylo,
-            yhi,
-            top,
-            dxdy: (e.x1 - e.x0) / (e.y1 - e.y0),
-            dir: if e.y0 < e.y1 { 1.0 } else { -1.0 },
-        });
-        let r0 = (ylo.floor() as usize).min(bh);
-        let r1 = ((yhi.ceil() as usize).min(bh)).max(r0);
-        spans.push((r0, r1));
-        for count in &mut offs[r0 + 1..=r1] {
-            *count += 1;
-        }
-    }
-    for r in 1..=bh {
-        offs[r] += offs[r - 1];
-    }
-    let mut bucket: Vec<usize> = vec![0; offs[bh]];
-    let mut cursor = offs.clone();
-    for (i, &(r0, r1)) in spans.iter().enumerate() {
-        for r in r0..r1 {
-            bucket[cursor[r]] = i;
-            cursor[r] += 1;
-        }
-    }
-    let mut order: Vec<usize> = Vec::new();
-    let mut prev: Vec<usize> = Vec::new();
-    let mut bounds: Vec<f32> = Vec::new();
-    for r in 0..bh {
-        let bucket = &bucket[offs[r]..offs[r + 1]];
-        if bucket.is_empty() {
-            continue;
-        }
-        // Strip bounds: the row edges plus every endpoint inside it.
-        bounds.clear();
-        bounds.push(r as f32);
-        bounds.push((r + 1) as f32);
-        for &i in bucket {
-            for y in [lines[i].ylo, lines[i].yhi] {
-                if y > bounds[0] && y < bounds[1] {
-                    bounds.push(y);
-                }
-            }
-        }
-        bounds.sort_by(f32::total_cmp);
-        bounds.dedup_by(|a, b| (*a - *b).abs() <= EPS_Y);
-        for strip in bounds.windows(2) {
-            let (s0, s1) = (strip[0], strip[1]);
-            if s1 - s0 <= EPS_Y {
-                continue;
-            }
-            let mid = s0.midpoint(s1);
-            // Endpoints strictly inside the row are strip bounds, so an
-            // edge covering this strip covers it fully.
-            order.clear();
-            order.extend(
-                bucket
-                    .iter()
-                    .copied()
-                    .filter(|&i| lines[i].ylo < mid && lines[i].yhi > mid),
-            );
-            if order.len() < 2 {
-                // A lone crossing pairs with nothing; it bounds no
-                // inside interval.
-                continue;
-            }
-            prev.clear();
-            let mut c0 = s0;
-            while c0 < s1 - EPS_Y {
-                order.sort_by(|&a, &b| {
-                    let ka = (lines[a].x_at(c0), lines[a].x_at(s1));
-                    let kb = (lines[b].x_at(c0), lines[b].x_at(s1));
-                    ka.partial_cmp(&kb).unwrap_or(std::cmp::Ordering::Equal)
-                });
-                let next = next_crossing(&lines, &order, c0, s1);
-                if let Some(y) = next
-                    && y <= c0 + EPS_Y
-                {
-                    // A pair crossed essentially at the strip top
-                    // but sorted pre-flip by rounding: skip the
-                    // hairline sliver so the re-sort sees the
-                    // post-flip order. The step must clear the f32
-                    // ulp of c0 (≈2e-6 at y=20) or it never lands.
-                    c0 = s1.min(c0 + (4.0 * c0 * f32::EPSILON).max(1e-5));
-                    continue;
-                }
-                let c1 = if order == prev {
-                    // A tangency cluster at c0 left the order unchanged:
-                    // close the strip out on the far end's order.
-                    order.sort_by(|&a, &b| {
-                        lines[a]
-                            .x_at(s1)
-                            .partial_cmp(&lines[b].x_at(s1))
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                    s1
-                } else {
-                    prev.clear();
-                    prev.extend_from_slice(&order);
-                    next.unwrap_or(s1).min(s1)
-                };
-                // Inside intervals between consecutive crossings.
-                let mut wind = 0.0f32;
-                for i in 1..order.len() {
-                    wind += lines[order[i - 1]].dir;
-                    let inside = match rule {
-                        FillRule::NonZero => wind != 0.0,
-                        FillRule::EvenOdd => (wind.rem_euclid(2.0) - 1.0).abs() < 0.5,
-                    };
-                    if !inside {
-                        continue;
-                    }
-                    // Crossings only sit on sub-strip bounds, so the
-                    // pair's true left/right order is consistent through
-                    // (c0, c1); a tie at an endpoint is broken by the
-                    // other end's geometry.
-                    let (a, b) = (lines[order[i - 1]], lines[order[i]]);
-                    let (l0, r0) = (a.x_at(c0).min(b.x_at(c0)), a.x_at(c0).max(b.x_at(c0)));
-                    let (l1, r1) = (a.x_at(c1).min(b.x_at(c1)), a.x_at(c1).max(b.x_at(c1)));
-                    acc.draw_line(l0, c0, l1, c1);
-                    acc.draw_line(r1, c1, r0, c0);
-                }
-                c0 = c1;
-            }
-        }
-    }
-}
-
 /// Abramowitz & Stegun 7.1.26 — the same approximation the GPU WGSL
 /// uses, |error| < 1.5e-7.
 #[expect(
@@ -413,15 +41,10 @@ pub fn deposit_exact(
 fn erf(x: f32) -> f32 {
     let s = x.signum();
     let a = x.abs();
-    let t = (0.327_591_1_f32.mul_add(a, 1.0)).recip();
-    let y = 1.0
-        - (1.061_405_429_f32
-            .mul_add(t, -1.453_152_027)
-            .mul_add(t, 1.421_413_741)
-            .mul_add(t, -0.284_496_736)
-            .mul_add(t, 0.254_829_592))
-            * t
-            * (-a * a).exp();
+    let t = (0.327_591_1_f32 * a + 1.0).recip();
+    let polynomial = ((((1.061_405_429_f32 * t - 1.453_152_027) * t + 1.421_413_741) * t
+        - 0.284_496_736) * t + 0.254_829_592) * t;
+    let y = 1.0 - polynomial * (-a * a).exp();
     s * y
 }
 
@@ -442,127 +65,219 @@ fn corner_inset(r: f32, dy: f32) -> f32 {
     r - (r * r - dd * dd).max(0.0).sqrt()
 }
 
-/// The clip coverage of `(px, py)`: 1/0 for the rect fast path, the mask
-/// sample otherwise.
-#[expect(
-    clippy::cast_sign_loss,
-    reason = "clip rect edges are clamped non-negative before indexing"
-)]
-fn clip_cov(clip: Option<&ClipRef>, w: usize, px: usize, py: usize) -> f32 {
-    match clip.map(std::convert::AsRef::as_ref) {
-        None => 1.0,
-        Some(ClipMask::Rect(r)) => f32::from(
-            px >= (r.x0.max(0) as usize)
-                && px < (r.x1.max(0) as usize)
-                && py >= (r.y0.max(0) as usize)
-                && py < (r.y1.max(0) as usize),
-        ),
-        Some(ClipMask::Cover(mask)) => mask[py * w + px],
-    }
-}
-
 /// The buffer at the top of the isolation stack, or the band's
 /// framebuffer slice.
 fn top<'a>(fb: &'a mut [[f32; 4]], stack: &'a mut [Vec<[f32; 4]>]) -> &'a mut [[f32; 4]] {
     stack.last_mut().map_or(fb, Vec::as_mut_slice)
 }
 
-/// Rasterizes the whole surface's items into `fb` (length `w*h`,
-/// premultiplied linear P3), parallel over [`BAND_H`]-row bands.
-///
-/// Each band owns a coverage accumulator and a stack of scratch colour
-/// buffers for [`Item::PushIsolate`]/[`Item::PopIsolate`], and walks the
-/// item list sequentially.
+/// Retained scheduling and isolation storage for one framebuffer band.
+#[derive(Default)]
+pub struct BandScratch {
+    items: Vec<usize>,
+    stack: Vec<Vec<[f32; 4]>>,
+    spare: Vec<Vec<[f32; 4]>>,
+}
+
+impl BandScratch {
+    /// Retained allocation bytes.
+    pub fn bytes(&self) -> usize {
+        self.items.capacity() * size_of::<usize>()
+            + self
+                .stack
+                .iter()
+                .chain(&self.spare)
+                .map(|buffer| buffer.capacity() * size_of::<[f32; 4]>())
+                .sum::<usize>()
+    }
+}
+
+/// Bins items once, then shades disjoint bands in painter order. Isolation
+/// markers reach every band because non-normal blends can affect empty source.
 pub fn render_bands(
     items: &[Item],
-    _clear: [f32; 4],
+    clear: [f32; 4],
     fb: &mut [[f32; 4]],
     w: usize,
-    _h: usize,
+    h: usize,
+    scratch: &mut Vec<BandScratch>,
 ) -> (u32, u32) {
+    if w == 0 || h == 0 {
+        return (0, 0);
+    }
+    scratch.resize_with(h.div_ceil(BAND_H), BandScratch::default);
+    for band in &mut *scratch {
+        band.items.clear();
+    }
     let (mut draws, mut edges) = (0_u32, 0_u32);
+    for (i, item) in items.iter().enumerate() {
+        let (top, bottom) = match item {
+            Item::Draw {
+                coverage,
+                edge_count,
+                ..
+            } => {
+                draws += 1;
+                edges += u32::try_from(*edge_count).unwrap_or(u32::MAX);
+                (coverage.top.min(h), coverage.bottom().min(h))
+            }
+            Item::Glyph { slot, y, .. } => {
+                let mask = slot.get().expect("glyphs resolved before compositing");
+                let top = i64::from(*y) + i64::from(mask.top);
+                let bottom = top + i64::from(mask.h);
+                (
+                    usize::try_from(top).unwrap_or(0).min(h),
+                    usize::try_from(bottom).unwrap_or(0).min(h),
+                )
+            }
+            Item::PushIsolate | Item::PopIsolate { .. } => (0, h),
+        };
+        if top < bottom {
+            for band in &mut scratch[top / BAND_H..bottom.div_ceil(BAND_H)] {
+                band.items.push(i);
+            }
+        }
+    }
     fb.par_chunks_mut(BAND_H * w)
+        .zip(scratch.par_iter_mut())
         .enumerate()
-        .for_each(|(band, slice)| {
-            let y0 = band * BAND_H;
-            let bh = slice.len() / w;
-            let mut acc = Accum::new(w, bh);
-            // The isolation stack: `slice` is the bottom. Each entry is a
-            // scratch colour buffer of the band.
-            let mut stack: Vec<Vec<[f32; 4]>> = Vec::new();
-            let mut band = Band { fb: slice, w, y0 };
-            for item in items {
-                match item {
-                    Item::Draw {
-                        edges,
-                        bbox,
-                        rule,
-                        exact,
-                        paint,
-                        clip,
-                    } => {
-                        band.draw(
-                            &mut acc,
-                            &mut stack,
-                            edges,
-                            *bbox,
-                            *rule,
-                            *exact,
-                            paint,
-                            clip.as_ref(),
-                        );
+        .for_each(|(index, (slice, scratch))| {
+            slice.fill(clear);
+            let len = slice.len();
+            let mut band = Band {
+                fb: slice,
+                w,
+                y0: index * BAND_H,
+            };
+            for &i in &scratch.items {
+                match &items[i] {
+                    Item::Draw { coverage, paint, .. } => {
+                        band.draw(&mut scratch.stack, coverage, paint);
                     }
                     Item::PushIsolate => {
-                        stack.push(vec![[0.0; 4]; slice_len(band.w, bh)]);
+                        let mut buffer = scratch.spare.pop().unwrap_or_default();
+                        buffer.resize(len, [0.0; 4]);
+                        buffer.fill([0.0; 4]);
+                        scratch.stack.push(buffer);
                     }
                     Item::PopIsolate { opacity, blend } => {
-                        let Some(scratch) = stack.pop() else {
-                            continue;
-                        };
-                        band.composite_isolate(&scratch, *opacity, *blend, &mut stack);
-                    }
-                    Item::Shadow {
-                        rbox,
-                        radii,
-                        sigma_eff,
-                        color,
-                        bbox,
-                        clip,
-                    } => {
-                        band.shadow(
-                            &mut stack,
-                            rbox,
-                            radii,
-                            *sigma_eff,
-                            color,
-                            *bbox,
-                            clip.as_ref(),
-                        );
+                        let buffer = scratch.stack.pop().expect("balanced isolation items");
+                        band.composite_isolate(&buffer, *opacity, *blend, &mut scratch.stack);
+                        scratch.spare.push(buffer);
                     }
                     Item::Glyph {
-                        slot,
-                        x,
-                        y,
-                        paint,
-                        clip,
+                        slot, x, y, paint, ..
                     } => {
-                        band.glyph(&mut stack, slot, *x, *y, paint, clip.as_ref());
+                        band.glyph(&mut scratch.stack, slot, *x, *y, paint);
                     }
                 }
             }
+            assert!(scratch.stack.is_empty(), "balanced isolation items");
         });
-    // Counted before the parallel pass.
-    for item in items {
-        if let Item::Draw { edges: e, .. } = item {
-            draws += 1;
-            edges += u32::try_from(e.len()).unwrap_or(u32::MAX);
-        }
-    }
     (draws, edges)
 }
 
-const fn slice_len(w: usize, bh: usize) -> usize {
-    w * bh
+/// Evaluates the analytic unoccluded rounded-box shadow once per geometry key.
+pub fn shadow_coverage(
+    rbox: &[f32; 4],
+    radii: &[f32; 4],
+    sigma: f32,
+    bbox: IRect,
+    w: usize,
+) -> Coverage {
+    let top = usize::try_from(bbox.y0).expect("clamped shadow bounds");
+    let bottom = usize::try_from(bbox.y1).expect("clamped shadow bounds");
+    let mut pixels = vec![[0.0; 4]; w * (bottom - top)];
+    let mut band = Band {
+        fb: &mut pixels,
+        w,
+        y0: top,
+    };
+    band.shadow(rbox, radii, sigma, &[1.0; 4], bbox);
+    Coverage::from_rows(
+        top,
+        pixels
+            .chunks_exact(w)
+            .map(|row| row.iter().map(|pixel| pixel[3]).collect()),
+    )
+}
+
+/// The oracle's integrated Gaussian taps, applied after exact caster clipping.
+/// The convolution is restricted to the caster's support plus the kernel halo.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::suboptimal_flops,
+    reason = "bounded surface/tap indices; f64 integration rounds once to coverage precision"
+)]
+pub fn blur_coverage(source: &Coverage, width: usize, height: usize, sigma: f64) -> Coverage {
+    if width == 0 || height == 0 || source.top == source.bottom() {
+        return Coverage::default();
+    }
+    let radius = if sigma <= 1e-9 {
+        0
+    } else {
+        (6.0 * sigma).ceil() as usize
+    };
+    let top = source.top.saturating_sub(radius);
+    let bottom = source.bottom().saturating_add(radius).min(height);
+    let mut kernel = Vec::with_capacity(2 * radius + 1);
+    if sigma <= 1e-9 {
+        kernel.push(1.0);
+    } else {
+        let inv = 1.0 / (sigma * std::f64::consts::SQRT_2);
+        for tap in 0..=2 * radius {
+            let distance = tap as f64 - radius as f64;
+            kernel.push(
+                0.5 * (libm::erf((distance + 0.5) * inv) - libm::erf((distance - 0.5) * inv)),
+            );
+        }
+        let sum: f64 = kernel.iter().sum();
+        for weight in &mut kernel {
+            *weight /= sum;
+        }
+    }
+    let mut horizontal = vec![0.0_f64; width * (source.bottom() - source.top)];
+    let mut row = vec![0.0_f64; width];
+    for y in source.top..source.bottom() {
+        row.fill(0.0);
+        let spans = source.row(y);
+        for span in spans {
+            for x in span.columns.clone() {
+                row[x] = f64::from(span.at(x));
+            }
+        }
+        if let (Some(first), Some(last)) = (spans.first(), spans.last()) {
+            let left = first.columns.start.saturating_sub(radius);
+            let right = last.columns.end.saturating_add(radius).min(width);
+            for x in left..right {
+                let mut value = 0.0;
+                for (tap, &weight) in kernel.iter().enumerate() {
+                    let column =
+                        (x as i64 + tap as i64 - radius as i64).clamp(0, width as i64 - 1) as usize;
+                    value += weight * row[column];
+                }
+                horizontal[(y - source.top) * width + x] = value;
+            }
+        }
+    }
+    Coverage::from_rows(top, (top..bottom).map(|y| {
+        let mut row = vec![0.0_f32; width];
+        for (x, value) in row.iter_mut().enumerate() {
+            let mut sum = 0.0;
+            for (tap, &weight) in kernel.iter().enumerate() {
+                let sample_y =
+                    (y as i64 + tap as i64 - radius as i64).clamp(0, height as i64 - 1) as usize;
+                if (source.top..source.bottom()).contains(&sample_y) {
+                    sum += weight * horizontal[(sample_y - source.top) * width + x];
+                }
+            }
+            *value = sum as f32;
+        }
+        row
+    }))
 }
 
 /// One band's rasterization state.
@@ -576,88 +291,39 @@ struct Band<'a> {
 }
 
 impl Band<'_> {
-    /// Rasterizes one draw item into the top isolation buffer.
-    #[expect(
-        clippy::cast_precision_loss,
-        clippy::too_many_arguments,
-        reason = "pixel indices and band offsets are far below 2^24"
-    )]
-    fn draw(
-        &mut self,
-        acc: &mut Accum,
-        stack: &mut Vec<Vec<[f32; 4]>>,
-        edges: &[Edge],
-        bbox: crate::render::lower::IRect,
-        rule: FillRule,
-        exact: bool,
-        paint: &PaintData,
-        clip: Option<&ClipRef>,
-    ) {
-        let bh = self.fb.len() / self.w;
-        // Band-intersect the device-space bounding box.
-        let (y_lo, y_hi) = (
-            usize::try_from(bbox.y0)
-                .unwrap_or(0)
-                .saturating_sub(self.y0)
-                .min(bh),
-            usize::try_from(bbox.y1)
-                .unwrap_or(0)
-                .saturating_sub(self.y0)
-                .min(bh),
-        );
-        if y_lo >= y_hi {
-            return;
-        }
-        let (x_lo, x_hi) = (
-            usize::try_from(bbox.x0).unwrap_or(0).min(self.w),
-            usize::try_from(bbox.x1).unwrap_or(0).min(self.w),
-        );
-        // Only the item's bbox columns participate: clear and deposit
-        // inside the guard window `x_lo .. x_hi + 1`.
-        acc.set_window(x_lo, x_hi);
-        acc.clear_range(y_lo, y_hi);
-        if exact {
-            deposit_exact(
-                acc,
-                edges.iter().filter_map(|e| {
-                    // Only edges crossing the band deposit anything.
-                    let ey0 = e.y0 - self.y0 as f32;
-                    let ey1 = e.y1 - self.y0 as f32;
-                    (ey0.max(ey1) >= 0.0 && ey0.min(ey1) < bh as f32).then_some(Edge {
-                        x0: e.x0,
-                        y0: ey0,
-                        x1: e.x1,
-                        y1: ey1,
-                    })
-                }),
-                rule,
-                bh,
-            );
-        } else {
-            // A single convex contour never exceeds winding +-1: the
-            // raw deposit is already exact.
-            for e in edges {
-                let ey0 = e.y0 - self.y0 as f32;
-                let ey1 = e.y1 - self.y0 as f32;
-                if ey0.max(ey1) < 0.0 || ey0.min(ey1) >= bh as f32 {
-                    continue;
+    /// Shades only nonempty runs. Opaque solid spans are direct stores.
+    #[expect(clippy::cast_precision_loss, reason = "surface coordinates fit f32")]
+    fn draw(&mut self, stack: &mut [Vec<[f32; 4]>], coverage: &Coverage, paint: &PaintData) {
+        let bottom = (self.y0 + self.fb.len() / self.w).min(coverage.bottom());
+        let dst = top(&mut *self.fb, stack);
+        for y in self.y0.max(coverage.top)..bottom {
+            let row = (y - self.y0) * self.w;
+            for span in coverage.row(y) {
+                if let PaintData::Solid(color) = paint {
+                    let pixels = &mut dst[row + span.columns.start..row + span.columns.end];
+                    if span.samples.is_empty() {
+                        let src = color.map(|value| value * span.alpha);
+                        if src[3].to_bits() == 1.0_f32.to_bits() {
+                            pixels.fill(src);
+                        } else {
+                            for pixel in pixels {
+                                *pixel = src_over(*pixel, src);
+                            }
+                        }
+                    } else {
+                        for (pixel, &alpha) in pixels.iter_mut().zip(&span.samples) {
+                            *pixel = src_over(*pixel, color.map(|value| value * alpha));
+                        }
+                    }
+                } else {
+                    for x in span.columns.clone() {
+                        let src = paint
+                            .eval(x as f32 + 0.5, y as f32 + 0.5)
+                            .map(|value| value * span.at(x));
+                        dst[row + x] = src_over(dst[row + x], src);
+                    }
                 }
-                acc.draw_line(e.x0, ey0, e.x1, ey1);
             }
-        }
-        for y in y_lo..y_hi {
-            let py = self.y0 + y;
-            acc.coverage_row(y, x_lo, x_hi, |x, cov| {
-                let cc = clip_cov(clip, self.w, x, py);
-                if cc <= 0.0 {
-                    return;
-                }
-                let src = paint
-                    .eval(x as f32 + 0.5, py as f32 + 0.5)
-                    .map(|v| v * cov * cc);
-                let dst = top(&mut *self.fb, stack.as_mut_slice());
-                dst[y * self.w + x] = src_over(dst[y * self.w + x], src);
-            });
         }
     }
 
@@ -668,7 +334,6 @@ impl Band<'_> {
         clippy::cast_possible_truncation,
         clippy::float_cmp,
         clippy::suboptimal_flops,
-        clippy::too_many_arguments,
         clippy::too_many_lines,
         reason = "pixel indices and band offsets are far below 2^24; the \
                   flat-row test is intentionally exact and the quadrature \
@@ -676,13 +341,11 @@ impl Band<'_> {
     )]
     fn shadow(
         &mut self,
-        stack: &mut Vec<Vec<[f32; 4]>>,
         rbox: &[f32; 4],
         radii: &[f32; 4],
         sigma_eff: f32,
         color: &[f32; 4],
         bbox: IRect,
-        clip: Option<&ClipRef>,
     ) {
         let bh = self.fb.len() / self.w;
         let (y_lo, y_hi) = (
@@ -706,20 +369,7 @@ impl Band<'_> {
         let half = [rbox[2], rbox[3]];
         let sigma = sigma_eff;
         let inv_sqrt2_sigma = 1.0 / (sigma * std::f32::consts::SQRT_2);
-        // Rect-clip rows touch only `cx_lo..cx_hi`; a coverage clip stays
-        // a per-pixel sample.
-        let (cx_lo, cx_hi, clip_mask) = match clip.map(AsRef::as_ref) {
-            Some(ClipMask::Rect(r)) => (
-                usize::try_from(r.x0).unwrap_or(0).clamp(x_lo, x_hi),
-                usize::try_from(r.x1).unwrap_or(0).clamp(x_lo, x_hi),
-                None,
-            ),
-            Some(ClipMask::Cover(mask)) => (x_lo, x_hi, Some(mask.as_slice())),
-            None => (x_lo, x_hi, None),
-        };
-        if cx_lo >= cx_hi && clip_mask.is_none() {
-            return;
-        }
+        let (cx_lo, cx_hi) = (x_lo, x_hi);
         // The 16 y-quadrature samples and their `gaussian*step` weights
         // are per item, not per pixel.
         let step = 6.0 * sigma / SHADOW_N as f32;
@@ -776,7 +426,7 @@ impl Band<'_> {
             if n == 0 || s <= 0.0 {
                 continue;
             }
-            let dst = top(&mut *self.fb, stack.as_mut_slice());
+            let dst = &mut *self.fb;
             if flat {
                 // Separable: `cov = x_term[px] * s` across the row.
                 let t = x_term.get_or_insert_with(|| {
@@ -793,11 +443,7 @@ impl Band<'_> {
                     if cov <= 0.0 {
                         continue;
                     }
-                    let cc = clip_mask.map_or(1.0, |m| m[py_i * self.w + x]);
-                    if cc <= 0.0 {
-                        continue;
-                    }
-                    let src = color.map(|v| v * cov.clamp(0.0, 1.0) * cc);
+                    let src = color.map(|v| v * cov.clamp(0.0, 1.0));
                     dst[y * self.w + x] = src_over(dst[y * self.w + x], src);
                 }
                 continue;
@@ -811,7 +457,7 @@ impl Band<'_> {
             let x_in_hi = usize::try_from((cx + xrm - margin + 0.5).floor() as i32 + 1)
                 .unwrap_or(0)
                 .clamp(x_in_lo, cx_hi);
-            let dst = top(&mut *self.fb, stack.as_mut_slice());
+            let dst = &mut *self.fb;
             let edge = |dst: &mut [[f32; 4]], f: usize, t: usize| {
                 for x in f..t {
                     let px = x as f32 + 0.5 - cx;
@@ -825,29 +471,20 @@ impl Band<'_> {
                     if cov <= 0.0 {
                         continue;
                     }
-                    let cc = clip_mask.map_or(1.0, |m| m[py_i * self.w + x]);
-                    if cc <= 0.0 {
-                        continue;
-                    }
-                    let src = color.map(|v| v * cov.clamp(0.0, 1.0) * cc);
+                    let src = color.map(|v| v * cov.clamp(0.0, 1.0));
                     dst[y * self.w + x] = src_over(dst[y * self.w + x], src);
                 }
             };
             edge(&mut *dst, cx_lo, x_in_lo);
             for x in x_in_lo..x_in_hi {
-                let cc = clip_mask.map_or(1.0, |m| m[py_i * self.w + x]);
-                if cc <= 0.0 {
-                    continue;
-                }
-                let src = color.map(|v| v * s.clamp(0.0, 1.0) * cc);
+                let src = color.map(|v| v * s.clamp(0.0, 1.0));
                 dst[y * self.w + x] = src_over(dst[y * self.w + x], src);
             }
             edge(&mut *dst, x_in_hi, cx_hi);
         }
     }
 
-    /// Rasterizes one glyph mask instance: `mask` rows intersecting the
-    /// band composite `paint * mask * clipcov`.
+    /// Composites one unclipped glyph mask; clipped outlines are prepared draws.
     #[expect(
         clippy::cast_possible_wrap,
         clippy::cast_possible_truncation,
@@ -856,12 +493,11 @@ impl Band<'_> {
     )]
     fn glyph(
         &mut self,
-        stack: &mut Vec<Vec<[f32; 4]>>,
+        stack: &mut [Vec<[f32; 4]>],
         slot: &std::sync::OnceLock<std::sync::Arc<crate::render::glyph::GlyphMask>>,
         ox: i32,
         oy: i32,
         paint: &PaintData,
-        clip: Option<&ClipRef>,
     ) {
         let Some(mask) = slot.get() else { return };
         let bh = self.fb.len() / self.w;
@@ -889,18 +525,14 @@ impl Band<'_> {
             let py = self.y0 + y;
             let row = usize::try_from(py as i32 - my0).unwrap_or(0) * mask.w as usize;
             for x in x_lo..x_hi {
-                let cc = clip_cov(clip, self.w, x, py);
-                if cc <= 0.0 {
-                    continue;
-                }
                 let cov = mask.cov[row + usize::try_from(x as i32 - mx0).unwrap_or(0)];
                 if cov <= 0.0 {
                     continue;
                 }
                 let src = paint
                     .eval(x as f32 + 0.5, py as f32 + 0.5)
-                    .map(|v| v * cov * cc);
-                let dst = top(&mut *self.fb, stack.as_mut_slice());
+                    .map(|v| v * cov);
+                let dst = top(&mut *self.fb, stack);
                 dst[y * self.w + x] = src_over(dst[y * self.w + x], src);
             }
         }
@@ -912,9 +544,9 @@ impl Band<'_> {
         scratch: &[[f32; 4]],
         opacity: f32,
         mode: cherenkov::BlendMode,
-        stack: &mut Vec<Vec<[f32; 4]>>,
+        stack: &mut [Vec<[f32; 4]>],
     ) {
-        let dst = top(&mut *self.fb, stack.as_mut_slice());
+        let dst = top(&mut *self.fb, stack);
         for (i, &src) in scratch.iter().enumerate() {
             let s = src.map(|v| v * opacity);
             dst[i] = if mode == cherenkov::BlendMode::Normal {
@@ -929,63 +561,18 @@ impl Band<'_> {
     }
 }
 
-/// Rasterizes a full-surface coverage mask of `edges` under `rule`,
-/// parallel over bands. `exact` selects the self-overlap-safe sweep;
-/// a single convex contour may pass `false` for the raw deposit.
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "band origins are small integers"
-)]
-pub fn coverage_mask(edges: &[Edge], rule: FillRule, w: usize, h: usize, exact: bool) -> Vec<f32> {
-    let mut mask = vec![0.0; w * h];
-    mask.par_chunks_mut(BAND_H * w)
-        .enumerate()
-        .for_each(|(band, slice)| {
-            let y0 = band * BAND_H;
-            let bh = slice.len() / w;
-            let mut acc = Accum::new(w, bh);
-            if exact {
-                deposit_exact(
-                    &mut acc,
-                    edges.iter().filter_map(|e| {
-                        let ey0 = e.y0 - y0 as f32;
-                        let ey1 = e.y1 - y0 as f32;
-                        (ey0.max(ey1) >= 0.0 && ey0.min(ey1) < bh as f32).then_some(Edge {
-                            x0: e.x0,
-                            y0: ey0,
-                            x1: e.x1,
-                            y1: ey1,
-                        })
-                    }),
-                    rule,
-                    bh,
-                );
-            } else {
-                for e in edges {
-                    let ey0 = e.y0 - y0 as f32;
-                    let ey1 = e.y1 - y0 as f32;
-                    if ey0.max(ey1) < 0.0 || ey0.min(ey1) >= bh as f32 {
-                        continue;
-                    }
-                    acc.draw_line(e.x0, ey0, e.x1, ey1);
-                }
-            }
-            for y in 0..bh {
-                acc.coverage_row(y, 0, w, |x, cov| {
-                    slice[y * w + x] = cov;
-                });
-            }
-        });
-    mask
-}
-
 #[cfg(test)]
 mod tests {
-    //! `deposit_exact` checked against the oracle's per-pixel exact-area
-    //! `Coverage`: the two must agree wherever a path's winding exceeds
-    //! ±1 (self-intersections, nested contours, overlapping contours).
+    //! The sparse coverage compiler checked against the independent oracle.
 
     use super::*;
+    use cherenkov::FillRule;
+    use crate::render::coverage::{Operand, rasterize};
+
+    fn coverage_mask(edges: &[Edge], rule: FillRule, w: usize, h: usize) -> Vec<f32> {
+        let coverage = rasterize(&[Operand { edges: edges.into(), rule }], w, h);
+        (0..h).flat_map(|y| (0..w).map(move |x| (x, y))).map(|(x, y)| coverage.at(x, y)).collect()
+    }
 
     fn scene_rule(rule: FillRule) -> cherenkov_scene::FillRule {
         match rule {
@@ -1009,7 +596,7 @@ mod tests {
 
     fn assert_matches_oracle(edges: &[Edge], name: &str) {
         for rule in [FillRule::NonZero, FillRule::EvenOdd] {
-            let got = coverage_mask(edges, rule, 24, 24, true);
+            let got = coverage_mask(edges, rule, 24, 24);
             let want = oracle_mask(edges, rule, 24, 24);
             let max_diff = got
                 .iter()
@@ -1074,13 +661,10 @@ mod tests {
         ]);
         assert_matches_oracle(&eight, "figure-eight");
 
-        // (d) bowtie: two triangles sharing a vertex.
+        // (d) bowtie: an interior crossing, not a shared endpoint.
         let bowtie = poly(&[
-            (4.0, 4.0),
-            (20.0, 4.0),
-            (12.0, 12.0),
-            (20.0, 20.0),
-            (4.0, 20.0),
+            (4.25, 4.125), (20.75, 20.875),
+            (4.25, 20.875), (20.75, 4.125),
         ]);
         assert_matches_oracle(&bowtie, "bowtie");
 
@@ -1104,58 +688,60 @@ mod tests {
         // Regression for the common path: a 10.5x10.5 axis-aligned
         // square must still accumulate 110.25 of coverage.
         let edges = poly(&[(4.0, 4.0), (14.5, 4.0), (14.5, 14.5), (4.0, 14.5)]);
-        let mask = coverage_mask(&edges, FillRule::NonZero, 24, 24, true);
+        let mask = coverage_mask(&edges, FillRule::NonZero, 24, 24);
         let total: f32 = mask.iter().sum();
         assert!((total - 110.25).abs() < 1e-3, "total coverage {total}");
     }
     #[test]
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "test geometry is far below 2^24"
-    )]
-    fn a_convex_contour_matches_exact_and_raw_deposit() {
-        // A rounded rect is a single strictly convex contour: the raw
-        // per-edge deposit must agree with the exact sweep.
-        fn line(
-            edges: &mut Vec<Edge>,
-            last: &mut cherenkov::kurbo::Point,
-            p: cherenkov::kurbo::Point,
-        ) {
-            if p != *last {
-                edges.push(Edge {
-                    x0: last.x as f32,
-                    y0: last.y as f32,
-                    x1: p.x as f32,
-                    y1: p.y as f32,
-                });
-                *last = p;
+    fn sharp_stroke_joins_and_caps_match_the_oracle() {
+        let mut path = kurbo::BezPath::new();
+        path.move_to((2.125, 20.25));
+        path.line_to((10.625, 3.125));
+        path.line_to((11.125, 19.875));
+        path.line_to((20.75, 3.625));
+        path.line_to((2.125, 10.375));
+        for join in [kurbo::Join::Miter, kurbo::Join::Bevel, kurbo::Join::Round] {
+            for cap in [kurbo::Cap::Butt, kurbo::Cap::Square, kurbo::Cap::Round] {
+                let stroke = kurbo::Stroke::new(3.75).with_join(join).with_caps(cap).with_miter_limit(12.0);
+                let outline = kurbo::stroke(&path, &stroke, &kurbo::StrokeOpts::default(), 0.02);
+                let edges = crate::render::lower::flatten_edges(outline, 0.02);
+                assert_matches_oracle(&edges, "sharp stroke");
             }
         }
+    }
+
+    #[test]
+    fn clipped_caster_is_blurred_after_geometric_intersection() {
+        let caster = poly(&[(1.25, 1.25), (6.75, 1.25), (6.75, 6.75), (1.25, 6.75)]);
+        let clip = poly(&[(0.25, 0.25), (7.75, 1.75), (2.25, 7.75)]);
+        let operands = [
+            Operand { edges: caster.clone().into(), rule: FillRule::NonZero },
+            Operand { edges: clip.clone().into(), rule: FillRule::NonZero },
+        ];
+        let segments = |edges: &[Edge]| edges.iter().map(|e| (
+            f64::from(e.x0), f64::from(e.y0), f64::from(e.x1), f64::from(e.y1),
+        )).collect::<Vec<_>>();
+        let intersection = cherenkov_oracle::clip::intersect_edges(
+            &segments(&caster), cherenkov_scene::FillRule::NonZero, &segments(&clip),
+        );
+        let mut oracle = cherenkov_oracle::coverage::Coverage::new(8, 8);
+        for (x0, y0, x1, y1) in intersection { oracle.add_line(x0, y0, x1, y1); }
+        let exact = oracle.finish(cherenkov_scene::FillRule::NonZero);
+        let source = rasterize(&operands, 8, 8);
+        for sigma in [0.0, 1.25] {
+            let expected = cherenkov_oracle::shadow::gaussian_blur(&exact, 8, 8, sigma);
+            let actual = blur_coverage(&source, 8, 8, sigma);
+            for (i, value) in expected.iter().enumerate() {
+                assert!((f64::from(actual.at(i % 8, i / 8)) - value).abs() < 2e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn a_convex_contour_matches_the_oracle() {
         use cherenkov::kurbo::Shape as _;
-        let mut edges = Vec::new();
         let path = cherenkov::kurbo::RoundedRect::new(2.3, 2.3, 21.7, 19.1, 4.2).to_path(0.1);
-        let mut last = cherenkov::kurbo::Point::ORIGIN;
-        let mut start = last;
-        cherenkov::kurbo::flatten(&path, 0.05, |el| match el {
-            cherenkov::kurbo::PathEl::MoveTo(p) => {
-                line(&mut edges, &mut last, start);
-                start = p;
-                last = p;
-            }
-            cherenkov::kurbo::PathEl::LineTo(p) => line(&mut edges, &mut last, p),
-            cherenkov::kurbo::PathEl::ClosePath => line(&mut edges, &mut last, start),
-            _ => unreachable!("flatten emits lines"),
-        });
-        line(&mut edges, &mut last, start);
-        for rule in [FillRule::NonZero, FillRule::EvenOdd] {
-            let raw = coverage_mask(&edges, rule, 24, 24, false);
-            let exact = coverage_mask(&edges, rule, 24, 24, true);
-            let max_diff = raw
-                .iter()
-                .zip(&exact)
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0f32, f32::max);
-            assert!(max_diff < 1e-5, "{rule:?}: raw vs exact max {max_diff}");
-        }
+        let edges = crate::render::lower::flatten_edges(path, 0.05);
+        assert_matches_oracle(&edges, "rounded rectangle");
     }
 }

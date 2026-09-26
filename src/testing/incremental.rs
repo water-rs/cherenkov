@@ -114,9 +114,7 @@ where
         renderer,
         &mut frames,
         ids[0],
-        layer,
-        &tree,
-        &list,
+        (layer, &tree, &list),
         size,
         start + Duration::from_secs(4),
     );
@@ -148,7 +146,7 @@ fn register_font(renderer: &mut impl Renderer) -> FontId {
 struct Frames(u64);
 
 impl Frames {
-    fn next(&mut self) -> FrameId {
+    const fn next(&mut self) -> FrameId {
         let id = FrameId::new(self.0);
         self.0 += 1;
         id
@@ -367,12 +365,11 @@ fn assert_patch_counts<R: Renderer>(
     renderer: &mut R,
     frames: &mut Frames,
     id: SurfaceId,
-    layer: LayerId,
-    tree: &SurfaceTree,
-    list: &crate::DisplayList,
+    scene: (LayerId, &SurfaceTree, &crate::DisplayList),
     size: (u32, u32),
     time: Instant,
 ) {
+    let (layer, tree, list) = scene;
     // Two stable leaf updates must lower exactly two commands in one layer.
     let updates: Vec<_> = list
         .commands()

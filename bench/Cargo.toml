@@ -15,6 +15,7 @@ default = []
 vello-classic = ["dep:vello", "dep:vello_common", "dep:wgpu", "dep:pollster"]
 vello-hybrid = ["dep:vello_hybrid", "dep:vello_common", "dep:wgpu", "dep:pollster", "dep:glifo"]
 vello-cpu = ["dep:vello_cpu", "dep:vello_common"]
+cherenkov-vello = ["dep:cherenkov", "dep:cherenkov-vello"]
 # `skia-safe` backend features stay in the feature lists, not on the
 # dependency: `skia-bindings` downloads a prebuilt Skia keyed on the whole
 # enabled set, and only the published combos (e.g. `metal,graphite`) have
@@ -30,6 +31,8 @@ cherenkov = ["dep:cherenkov", "dep:cherenkov-gpu"]
 cherenkov = { path = "..", optional = true }
 cherenkov-gpu = { path = "../gpu", optional = true }
 cherenkov-scene = { path = "../scene" }
+cherenkov = { path = "..", optional = true }
+cherenkov-vello = { path = "../vello", optional = true }
 cherenkov-oracle = { path = "../oracle" }
 kurbo = "0.13"
 serde = { version = "1", features = ["derive"] }

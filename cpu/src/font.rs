@@ -78,13 +78,19 @@ impl Font {
     }
 }
 
-/// Validates font data with `skrifa`, rejecting bitmap-only colour fonts.
+/// Validates font data with `skrifa`, rejecting colour fonts the
+/// rasterizer cannot draw.
 ///
 /// `COLR` fonts render through the colour-glyph lowering; fonts carrying
-/// `CBDT`/`CBLC` or `sbix` bitmaps without outline glyphs cannot rasterize.
+/// `CBDT`/`CBLC` or `sbix` bitmaps without outline glyphs cannot
+/// rasterize, and an `SVG ` table (SVG-in-OpenType) has no SVG glyph
+/// support at all.
 pub fn validate_font(data: &[u8], index: u32) -> Result<(), ResourceError> {
     let font = skrifa::FontRef::from_index(data, index)
         .map_err(|e| ResourceError::Font(format!("{e}")))?;
+    if font.data_for_tag(skrifa::Tag::new(b"SVG ")).is_some() {
+        return Err(Unsupported::ColorFont.into());
+    }
     if font.outline_glyphs().iter().next().is_none()
         && [skrifa::Tag::new(b"CBDT"), skrifa::Tag::new(b"sbix")]
             .iter()

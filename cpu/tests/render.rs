@@ -9,7 +9,10 @@ use cherenkov::{
     Draw, EvenOdd, Extend, Glyph, GlyphRun, Group, Interpolation, LinearGradient, Paint,
     RadialGradient, Shadow, SweepGradient, WorkingColor, kurbo::Stroke,
 };
-use cherenkov_cpu::{Engine, FrameTime, Offscreen, OffscreenFormat, Raster, RasterConfig};
+use cherenkov_cpu::{
+    Engine, FrameTime, Offscreen, OffscreenFormat, Raster, RasterConfig, ResourceError,
+    Unsupported,
+};
 
 fn engine() -> Engine<Raster> {
     Engine::<Raster>::new(RasterConfig::default()).expect("engine")
@@ -641,4 +644,87 @@ fn cached_geometry_and_band_scratch_preserve_pixels() {
                 .all(|(a, b)| a.map(f32::to_bits) == b.map(f32::to_bits))
         );
     }
+}
+
+/// Rewrites an SFNT's table directory: drops the `remove` tags, appends
+/// `add` tables, and writes fresh offsets, search parameters and
+/// per-table checksums. `head`'s `checkSumAdjustment` stays stale, which
+/// `skrifa` never verifies.
+fn sfnt_edit(font: &[u8], add: &[([u8; 4], &[u8])], remove: &[[u8; 4]]) -> Vec<u8> {
+    let count = usize::from(u16::from_be_bytes(
+        font[4..6].try_into().expect("num tables"),
+    ));
+    let mut tables: Vec<([u8; 4], &[u8])> = (0..count)
+        .map(|i| {
+            let record = &font[12 + 16 * i..12 + 16 * i + 16];
+            let offset = u32::from_be_bytes(record[8..12].try_into().expect("offset")) as usize;
+            let length = u32::from_be_bytes(record[12..16].try_into().expect("length")) as usize;
+            (
+                record[0..4].try_into().expect("tag"),
+                &font[offset..offset + length],
+            )
+        })
+        .filter(|(tag, _)| !remove.contains(tag))
+        .collect();
+    tables.extend(add.iter().map(|(tag, data)| (*tag, *data)));
+    tables.sort_by_key(|(tag, _)| *tag);
+    let n = u16::try_from(tables.len()).expect("table count");
+    let entry_selector = u16::try_from(n.ilog2()).expect("entry selector");
+    let search_range = (1u16 << entry_selector) * 16;
+    let range_shift = n * 16 - search_range;
+    let mut out = Vec::new();
+    out.extend_from_slice(&font[0..4]);
+    for word in [n, search_range, entry_selector, range_shift] {
+        out.extend_from_slice(&word.to_be_bytes());
+    }
+    let mut offset = 12 + 16 * tables.len();
+    for (tag, data) in &tables {
+        let checksum = data
+            .chunks(4)
+            .map(|chunk| {
+                let mut word = [0u8; 4];
+                word[..chunk.len()].copy_from_slice(chunk);
+                u32::from_be_bytes(word)
+            })
+            .fold(0u32, u32::wrapping_add);
+        out.extend_from_slice(tag);
+        out.extend_from_slice(&checksum.to_be_bytes());
+        out.extend_from_slice(&u32::try_from(offset).expect("offset").to_be_bytes());
+        out.extend_from_slice(&u32::try_from(data.len()).expect("length").to_be_bytes());
+        offset += data.len().div_ceil(4) * 4;
+    }
+    for (_, data) in &tables {
+        out.extend_from_slice(data);
+        out.resize(out.len().div_ceil(4) * 4, 0);
+    }
+    out
+}
+
+#[test]
+fn svg_and_bitmap_only_fonts_are_rejected() {
+    let engine = engine();
+    let noto = std::fs::read("../scenes/fonts/NotoSans.ttf").expect("test font");
+    // An `SVG ` table marks SVG-in-OpenType glyphs the rasterizer cannot
+    // draw.
+    let svg = sfnt_edit(&noto, &[(*b"SVG ", b"\0\0")], &[]);
+    let error = engine
+        .font(cherenkov_cpu::FontSource::bytes(svg))
+        .expect_err("SVG-in-OpenType font");
+    assert!(
+        matches!(error, ResourceError::Unsupported(Unsupported::ColorFont)),
+        "svg error: {error:?}"
+    );
+    // Bitmap-only colour fonts: a `CBDT` table and no outlines.
+    let bitmap = sfnt_edit(&noto, &[(*b"CBDT", b"\0\0")], &[*b"glyf", *b"loca"]);
+    let error = engine
+        .font(cherenkov_cpu::FontSource::bytes(bitmap))
+        .expect_err("bitmap-only font");
+    assert!(
+        matches!(error, ResourceError::Unsupported(Unsupported::ColorFont)),
+        "bitmap error: {error:?}"
+    );
+    // The unmodified font still registers.
+    engine
+        .font(cherenkov_cpu::FontSource::bytes(noto))
+        .expect("plain font");
 }

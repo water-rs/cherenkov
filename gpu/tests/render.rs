@@ -250,3 +250,82 @@ fn a_large_fill_spans_its_interior() -> Result<(), Box<dyn std::error::Error>> {
     );
     Ok(())
 }
+
+/// Per-variant pipelines: a frame with shadow strips, a solid fill, a
+/// clipped gradient fill, and a glyph run must emit ranges for at least
+/// the Simple/Shadow/Full variants — while the pixels stay correct.
+#[test]
+#[expect(clippy::float_cmp, reason = "the solid fill centre is exactly red")]
+#[expect(
+    clippy::many_single_char_names,
+    reason = "pixel channels r/g/b/a and gradient t are conventional"
+)]
+fn variants_split_ranges_but_not_pixels() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(engine) = engine() else {
+        return Ok(());
+    };
+    let font = engine.font(cherenkov_gpu::FontSource::bytes(std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../scenes/fonts/NotoSans.ttf"
+    ))?))?;
+    let surface = engine.surface(Offscreen::new((128, 96), OffscreenFormat::LinearF16))?;
+    let run = cherenkov::GlyphRun {
+        font: font.id(),
+        size: 24.0,
+        coords: Vec::new(),
+        glyphs: vec![cherenkov::Glyph {
+            id: 1,
+            x: 32.0,
+            y: 88.0,
+            transform: None,
+        }],
+        style: cherenkov::GlyphStyle::Fill,
+    };
+    surface.update(|tx| {
+        tx[surface.root()].content(surface.record(|c| {
+            let card = Rect::new(8., 8., 56., 56.);
+            c.shadow(
+                card,
+                cherenkov::Shadow::new(3.0, WorkingColor::new([0., 0., 0., 1.])).offset((2., 2.)),
+            );
+            c.fill(card, WorkingColor::new([1., 0., 0., 1.]));
+            c.clip(Rect::new(80., 8., 120., 56.), |c| {
+                c.fill(
+                    Rect::new(80., 8., 128., 56.),
+                    cherenkov::LinearGradient::new((80., 0.), (128., 0.))
+                        .stop(0.0, WorkingColor::new([1., 0., 0., 1.]))
+                        .stop(1.0, WorkingColor::new([0., 0., 1., 1.])),
+                );
+            });
+            c.glyphs(&run, WorkingColor::WHITE);
+        }));
+    });
+    engine.render(cherenkov_gpu::FrameTime::now())?;
+    let stats = engine.stats();
+    assert!(
+        stats.pipeline_switches >= 2 && stats.draws >= 3,
+        "expected variant-split ranges: {stats:?}"
+    );
+    let readback = surface.readback()?;
+    let px = |x: u32, y: u32| readback.pixels[(y * readback.width + x) as usize];
+    assert_eq!(
+        px(32, 32),
+        [1.0, 0.0, 0.0, 1.0],
+        "solid fill centre must be exactly opaque red"
+    );
+    let [r, g, b, a] = px(100, 30);
+    let t = (100.5 - 80.0) / 48.0;
+    assert!(
+        (f64::from(r) - (1.0 - t)).abs() < 1.0 / 255.0
+            && f64::from(g) < 1.0 / 255.0
+            && (f64::from(b) - t).abs() < 1.0 / 255.0
+            && (f64::from(a) - 1.0).abs() < 1.0 / 255.0,
+        "gradient under clip at (100,30): {r} {g} {b} {a}, t {t}"
+    );
+    assert_eq!(
+        px(125, 80),
+        [0.0; 4],
+        "inside the fill rect but outside the clip: nothing"
+    );
+    Ok(())
+}

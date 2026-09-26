@@ -163,6 +163,8 @@ pub struct FrameStats {
     pub passes: u32,
     /// Draw calls issued.
     pub draws: u32,
+    /// Pipeline state changes issued during draw range encoding.
+    pub pipeline_switches: u32,
     /// Quads drawn.
     pub instances: u32,
     /// Glyphs rasterized into the atlas this frame.

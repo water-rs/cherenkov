@@ -972,6 +972,14 @@ impl<'a> Lowering<'a> {
 
     /// Retain each leaf's instances and gradient stops independently. A dirty
     /// command drops just its entries; atlas resets invalidate device addresses.
+    ///
+    /// A miss realizes the leaf straight into this frame, in the form the
+    /// retained copy is defined in — unclipped, from an unbound image — and
+    /// copies the emitted range into the cache, so each instance is built
+    /// once. Unclipped, the realized range already is the composed output;
+    /// under a clip the range is rolled back and the retained copy is
+    /// composed under it like a hit, because draw ranges segment on the
+    /// clipped instances' shader variant.
     fn leaf(
         &mut self,
         op: &Op,
@@ -988,42 +996,63 @@ impl<'a> Lowering<'a> {
                     && e.size.map(f32::to_bits) == [self.width, self.height].map(f32::to_bits)
                     && e.generation == glyphs.atlas.generation()
             });
-        if !hit {
-            let mut frame = Frame::default();
-            if let Some(previous) = cache.data.take() {
-                frame.instances = previous.instances;
-                frame.stops = previous.stops;
-                frame.reset();
-            }
-            let mut compose = Lowering::new(&mut frame, (0, 0));
-            compose.width = self.width;
-            compose.height = self.height;
-            compose.transform = self.transform;
-            compose.begin_pass(Target::Surface, None);
-            compose.realize(op, cover, glyphs)?;
-            self.glyphs += compose.glyphs;
-            self.paths += compose.paths;
-            let image = compose.frame.open.as_ref().expect("leaf pass").image;
-            let pending_base = u32::try_from(self.pending.len()).expect("pending count fits u32");
-            self.pending.append(&mut compose.pending);
-            let pending_cells = compose
-                .cell_patches
-                .iter()
-                .map(|&(i, p, c)| (i, p + pending_base, c))
-                .collect();
-            cache.data = Some(Emission {
-                pending_cells,
-                cover,
-                transform: self.transform,
-                size: [self.width, self.height],
-                generation: glyphs.atlas.generation(),
-                instances: frame.instances,
-                stops: frame.stops,
-                image,
-            });
-        }
         cache.valid = true;
-        let emission = cache.data.as_ref().expect("leaf realized");
+        if hit {
+            self.compose(cache.data.as_ref().expect("a hit has data"), clip);
+            return Ok(false);
+        }
+        let previous = cache.data.take();
+        self.set_image(None);
+        let snapshot = clip.map(|_| self.frame.snapshot());
+        let first_instance = self.frame.instances.len();
+        let first_stop = self.frame.stops.len();
+        let first_patch = self.cell_patches.len();
+        self.clip = None;
+        let realized = self.realize(op, cover, glyphs);
+        self.clip = clip;
+        realized?;
+        let stop_base = u32::try_from(first_stop).expect("stop count fits u32");
+        let instance_base = u32::try_from(first_instance).expect("instance count fits u32");
+        let (mut instances, mut stops) =
+            previous.map_or_else(|| (Vec::new(), Vec::new()), |e| (e.instances, e.stops));
+        instances.clear();
+        instances.extend(self.frame.instances[first_instance..].iter().map(|inst| {
+            let mut inst = *inst;
+            inst.meta[2] -= stop_base;
+            inst
+        }));
+        stops.clear();
+        stops.extend_from_slice(&self.frame.stops[first_stop..]);
+        let emission = Emission {
+            pending_cells: self.cell_patches[first_patch..]
+                .iter()
+                .map(|&(i, p, c)| (i - instance_base, p, c))
+                .collect(),
+            cover,
+            transform: self.transform,
+            size: [self.width, self.height],
+            generation: glyphs.atlas.generation(),
+            instances,
+            stops,
+            image: self
+                .frame
+                .open
+                .as_ref()
+                .expect("a leaf lowers into an open pass")
+                .image,
+        };
+        if let Some(snapshot) = snapshot {
+            self.frame.restore(snapshot);
+            self.cell_patches.truncate(first_patch);
+            self.compose(&emission, clip);
+        }
+        cache.data = Some(emission);
+        Ok(true)
+    }
+
+    /// Emits a retained leaf's instances and stops into this frame under
+    /// `clip`, rebasing its stop and pending-cell indices.
+    fn compose(&mut self, emission: &Emission, clip: Option<DeviceClip>) {
         let offset = u32::try_from(self.frame.stops.len()).expect("stop count fits u32");
         self.frame.stops.extend_from_slice(&emission.stops);
         self.set_image(emission.image);
@@ -1041,7 +1070,6 @@ impl<'a> Lowering<'a> {
                 .iter()
                 .map(|&(i, p, c)| (i + instance_base, p, c)),
         );
-        Ok(!hit)
     }
 
     fn resolved_paint(&mut self, paint: &ResolvedPaint) -> PaintData {

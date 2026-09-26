@@ -204,7 +204,7 @@ mod tests {
         let coverage: Vec<_> = (0_u16..37)
             .map(|i| f32::from((i * 17) % 11) / 10.0)
             .collect();
-        let mut scalar = vec![[-0.0, -0.25, 1.5, 0.625]; coverage.len()];
+        let mut scalar = vec![[-0.0, -0.0, 1.5, 0.625]; coverage.len()];
         let mut native = scalar.clone();
         pulp::Arch::Scalar.dispatch(Glyph {
             pixels: &mut scalar,
@@ -217,7 +217,9 @@ mod tests {
         for ((scalar, native), coverage) in scalar.into_iter().zip(native).zip(coverage) {
             assert_eq!(scalar.map(f32::to_bits), native.map(f32::to_bits));
             if coverage == 0.0 {
-                assert_eq!(native[0].to_bits(), (-0.0_f32).to_bits());
+                // The positive green source produces +0 at zero coverage;
+                // an unmasked add would turn the destination's -0 into +0.
+                assert_eq!(native[1].to_bits(), (-0.0_f32).to_bits());
             }
         }
     }

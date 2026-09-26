@@ -7,7 +7,9 @@ use std::sync::{
 };
 
 use cherenkov::RenderError;
-use filtrate::{Effect, EffectContext, EffectFrameClock, EffectInput, EffectOutput, ShapeTextures};
+use filtrate::{
+    Effect, EffectContext, EffectFrameTiming, EffectInput, EffectOutput, ShapeTextures,
+};
 
 /// An effect moved to the render thread before its device resources exist.
 pub struct EffectBox(pub(crate) Box<dyn Source>);
@@ -72,9 +74,9 @@ impl<E: Effect> Runnable for E {
 
 struct Entry {
     effect: Box<dyn Runnable>,
-    clock: EffectFrameClock,
     dirty: Arc<AtomicBool>,
     again: bool,
+    input: Option<(wgpu::Texture, wgpu::TextureView)>,
     output: Option<(wgpu::Texture, wgpu::TextureView)>,
 }
 
@@ -108,9 +110,9 @@ impl Registry {
             id,
             Entry {
                 effect,
-                clock: EffectFrameClock::new(),
                 dirty,
                 again: false,
+                input: None,
                 output: None,
             },
         );
@@ -134,6 +136,7 @@ impl Registry {
         queue: &wgpu::Queue,
         scratch: &super::ScratchTarget,
         size: (u32, u32),
+        timing: EffectFrameTiming,
     ) -> Result<(), RenderError> {
         let entry = self
             .0
@@ -145,6 +148,13 @@ impl Registry {
             .as_ref()
             .is_none_or(|(tex, _)| (tex.width(), tex.height()) != size)
         {
+            entry.input = Some(super::create_target(
+                device,
+                "filter input",
+                size,
+                super::TARGET_USAGES,
+                format,
+            ));
             entry.output = Some(super::create_target(
                 device,
                 "filter output",
@@ -154,16 +164,29 @@ impl Registry {
             ));
         }
         let (texture, view) = entry.output.as_ref().expect("output allocated");
+        let (input_texture, input_view) = entry.input.as_ref().expect("input allocated");
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("engine filter"),
+        });
+        encoder.copy_texture_to_texture(
+            scratch.texture.as_image_copy(),
+            input_texture.as_image_copy(),
+            wgpu::Extent3d {
+                width: size.0,
+                height: size.1,
+                depth_or_array_layers: 1,
+            },
+        );
         entry.dirty.store(false, Ordering::Release);
         let input = EffectInput {
             device,
             queue,
-            texture: &scratch.texture,
-            view: scratch.view.clone(),
+            texture: input_texture,
+            view: input_view.clone(),
             format,
             width: size.0,
             height: size.1,
-            timing: entry.clock.tick(),
+            timing,
             shape: ShapeTextures::default(),
         };
         let output = EffectOutput {
@@ -175,9 +198,7 @@ impl Registry {
             width: size.0,
             height: size.1,
         };
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("engine filter"),
-        });
+
         entry.again = entry
             .effect
             .encode(&input, &output, &mut encoder)

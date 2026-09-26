@@ -161,13 +161,13 @@ impl ShaderPaintCapability for Vello {
     }
 
     fn remove_shader(r: &mut Self::Renderer, id: ShaderId) {
-        r.shaders.remove(id.raw());
+        r.remove_shader(id);
     }
 }
 
 impl Filters for Vello {
     fn remove_filter(r: &mut Self::Renderer, id: FilterId) {
-        r.filters.remove(id.raw());
+        r.remove_filter(id);
     }
 }
 

@@ -110,6 +110,8 @@ pub trait Renderer: 'static {
 /// [`Renderer::create_surface`].
 #[derive(Clone, Copy, Debug)]
 pub struct SurfaceInfo {
+    /// Largest supported surface dimension.
+    pub max_dimension: u32,
     /// The drawable size in pixels.
     pub size: (u32, u32),
     /// Whether [`Renderer::readback`] works on the surface.
@@ -117,13 +119,16 @@ pub struct SurfaceInfo {
 }
 
 /// Whether a backend wants another frame after the current one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Redraw {
     /// Nothing backend-side is animated.
     None,
     /// A backend source (custom GPU content, an animated shader paint)
     /// wants the next frame.
-    Wanted,
+    Wanted {
+        /// Inclusive display refresh range in hertz.
+        rate: crate::RefreshRange,
+    },
 }
 
 /// One frame's render input: every live surface with its sampled tree.

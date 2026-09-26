@@ -531,7 +531,7 @@ const fn missing_api(f: &Feature) -> Option<&'static str> {
 /// to. The names are the backend's `RenderError::Unsupported` strings.
 fn unsupported_feature(u: &str) -> Feature {
     match u {
-        "extend" => Feature::ExtendNone,
+        "extend-none" => Feature::ExtendNone,
         "gradient-interpolation" => Feature::InterpolationSpace(ColorSpace::Srgb),
         "blend-space" => Feature::Blend(BlendMode::Normal),
         "group-filter" | "filter" => Feature::Opacity,

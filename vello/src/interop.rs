@@ -73,9 +73,9 @@ pub mod wgpu {
         ///
         /// wgpu exposes no display refresh rate, so the embedder fills
         /// this in from the platform (e.g. the monitor's refresh rate
-        /// from the windowing toolkit) for [`crate::Next::At`] to report
+        /// from the windowing toolkit) for [`cherenkov::Next::At`] to report
         /// the display's real cadence.
-        pub rate: crate::RefreshRange,
+        pub rate: cherenkov::RefreshRange,
     }
 
     impl std::fmt::Debug for Window {

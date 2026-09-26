@@ -260,6 +260,7 @@ impl<T> Default for Realization<T> {
 
 /// One layer's display list, accumulated dirty commands, and retained output.
 pub struct Content<O, E> {
+    live: bool,
     list: DisplayList,
     dirty: Dirty,
     lowered: Option<Lowered<O>>,
@@ -271,6 +272,7 @@ impl<O: Operation, E> Content<O, E> {
     #[must_use]
     pub fn new(list: DisplayList) -> Self {
         Self {
+            live: true,
             list,
             dirty: Dirty::default(),
             lowered: None,
@@ -278,8 +280,27 @@ impl<O: Operation, E> Content<O, E> {
         }
     }
 
+    /// Retain immutable picture content, which cannot accept slot updates.
+    #[must_use]
+    pub fn picture(picture: crate::Picture) -> Self {
+        Self {
+            live: false,
+            ..Self::new(picture.display_list().clone())
+        }
+    }
+
+    /// Discard compiled resource references after a resource is removed.
+    pub fn invalidate(&mut self) {
+        self.lowered = None;
+        self.emissions.clear();
+    }
+
     /// Accumulate every commit arriving before the next render.
+    ///
+    /// # Panics
+    /// When slot updates target immutable picture content.
     pub fn update(&mut self, updates: Vec<crate::SlotUpdate>) {
+        assert!(self.live, "slot update targets immutable picture content");
         self.dirty.union(self.list.apply(updates));
     }
 

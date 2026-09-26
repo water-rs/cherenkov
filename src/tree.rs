@@ -53,6 +53,7 @@ pub struct LayerNode {
     pub backdrop: Option<BackdropId>,
     /// The child layers, in paint order.
     pub children: Vec<LayerId>,
+    parent: Option<LayerId>,
     transform_track: Option<Track<Affine>>,
     opacity_track: Option<Track<f32>>,
     scroll_track: Option<Track<Vec2>>,
@@ -84,6 +85,7 @@ impl LayerNode {
             filter: None,
             backdrop: None,
             children: Vec::new(),
+            parent: None,
             transform_track: None,
             opacity_track: None,
             scroll_track: None,
@@ -246,6 +248,7 @@ impl SurfaceTree {
             id.raw()
         );
         assert_ne!(id, self.root, "the root layer cannot be removed");
+        self.detach(id);
         let mut removed = Vec::new();
         let mut stack = vec![id];
         while let Some(current) = stack.pop() {
@@ -254,9 +257,6 @@ impl SurfaceTree {
             };
             stack.extend(node.children.iter().copied());
             removed.push(current);
-        }
-        for node in self.nodes.values_mut() {
-            node.children.retain(|child| *child != id);
         }
         removed
     }
@@ -307,7 +307,9 @@ impl SurfaceTree {
                     "pushing unknown layer {}",
                     child.raw()
                 );
+                self.assert_attachment(parent, child);
                 self.detach(child);
+                self.node_mut(child).parent = Some(parent);
                 self.node_mut(parent).children.push(child);
             }
             LayerOp::Insert {
@@ -320,21 +322,36 @@ impl SurfaceTree {
                     "inserting unknown layer {}",
                     child.raw()
                 );
+                self.assert_attachment(parent, child);
                 self.detach(child);
+                self.node_mut(child).parent = Some(parent);
                 let node = self.node_mut(parent);
                 let index = index.min(node.children.len());
                 node.children.insert(index, child);
             }
             LayerOp::Detach { parent, child } => {
-                let node = self.node_mut(parent);
-                node.children.retain(|c| *c != child);
+                assert_eq!(
+                    self.layer(child).parent,
+                    Some(parent),
+                    "detaching from the wrong parent"
+                );
+                self.detach(child);
             }
         }
     }
 
+    fn assert_attachment(&self, parent: LayerId, child: LayerId) {
+        assert_ne!(child, self.root, "the root layer cannot be attached");
+        let mut cursor = Some(parent);
+        while let Some(id) = cursor {
+            assert_ne!(id, child, "layer attachment would create a cycle");
+            cursor = self.layer(id).parent;
+        }
+    }
+
     fn detach(&mut self, child: LayerId) {
-        for node in self.nodes.values_mut() {
-            node.children.retain(|c| *c != child);
+        if let Some(parent) = self.node_mut(child).parent.take() {
+            self.node_mut(parent).children.retain(|c| *c != child);
         }
     }
 
@@ -493,4 +510,66 @@ fn snap(offset: Vec2, scale: f64) -> Vec2 {
         (offset.x * scale).round() / scale,
         (offset.y * scale).round() / scale,
     )
+}
+
+#[cfg(test)]
+mod hierarchy_tests {
+    use super::*;
+
+    fn tree() -> SurfaceTree {
+        let mut tree = SurfaceTree::new();
+        for id in 1..=3 {
+            tree.apply(LayerOp::Create(LayerId::new(id)));
+        }
+        tree.apply(LayerOp::Push {
+            parent: tree.root(),
+            child: LayerId::new(1),
+        });
+        tree.apply(LayerOp::Push {
+            parent: LayerId::new(1),
+            child: LayerId::new(2),
+        });
+        tree.apply(LayerOp::Push {
+            parent: tree.root(),
+            child: LayerId::new(3),
+        });
+        tree
+    }
+
+    #[test]
+    #[should_panic(expected = "layer attachment would create a cycle")]
+    fn attaching_a_layer_under_its_subtree_is_a_cycle() {
+        let mut tree = tree();
+        tree.apply(LayerOp::Push {
+            parent: LayerId::new(2),
+            child: LayerId::new(1),
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "layer attachment would create a cycle")]
+    fn inserting_a_layer_under_itself_is_a_cycle() {
+        let mut tree = tree();
+        tree.apply(LayerOp::Insert {
+            parent: LayerId::new(1),
+            child: LayerId::new(1),
+            index: 0,
+        });
+    }
+
+    #[test]
+    fn detach_and_remove_preserve_parent_links() {
+        let mut tree = tree();
+        tree.apply(LayerOp::Push {
+            parent: LayerId::new(3),
+            child: LayerId::new(1),
+        });
+        assert_eq!(tree.layer(tree.root()).children, [LayerId::new(3)]);
+        assert_eq!(tree.layer(LayerId::new(1)).parent, Some(LayerId::new(3)));
+        assert_eq!(
+            tree.remove(LayerId::new(1)),
+            [LayerId::new(1), LayerId::new(2)]
+        );
+        assert!(tree.layer(LayerId::new(3)).children.is_empty());
+    }
 }

@@ -120,7 +120,7 @@ fn a_full_atlas_grows_then_reports_exhaustion() -> Result<(), Box<dyn std::error
         return Ok(());
     };
     assert!(
-        matches!(&exhausted, Err(RenderError::Render(e)) if e == "glyph atlas exhausted"),
+        matches!(&exhausted, Err(RenderError::AtlasExhausted)),
         "expected AtlasExhausted, got {exhausted:?}"
     );
     Ok(())
@@ -297,17 +297,17 @@ fn dropping_a_font_frees_its_renderer_state() -> Result<(), Box<dyn std::error::
     let runs = text_runs(font_id, 8, 24.0);
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|c| {
-            c.glyphs(&runs[0], WorkingColor::WHITE);
+            c.glyphs(runs[0].clone(), WorkingColor::WHITE);
         }));
     });
-    engine.render(cherenkov_gpu::FrameTime::now())?;
+    engine.render(cherenkov::FrameTime::now())?;
     assert!(engine.memory().cpu > Bytes(0), "glyph cells cached");
     drop(font);
     // Dirty the surface so the next frame re-lowers and consults the font.
     surface.clear_color(WorkingColor::new([0.0, 0.0, 0.0, 1.0]));
     assert!(
         matches!(
-            engine.render(cherenkov_gpu::FrameTime::now()),
+            engine.render(cherenkov::FrameTime::now()),
             Err(RenderError::Font(_))
         ),
         "render after the last Font clone dropped"
@@ -341,7 +341,7 @@ fn timestamps_resolve_a_frame_late() -> Result<(), Box<dyn std::error::Error>> {
             );
         }));
     });
-    engine.render(cherenkov_gpu::FrameTime::now())?;
+    engine.render(cherenkov::FrameTime::now())?;
     assert!(
         engine.stats().gpu_seconds.is_none(),
         "a submitting frame returns before its queries resolve"
@@ -350,10 +350,10 @@ fn timestamps_resolve_a_frame_late() -> Result<(), Box<dyn std::error::Error>> {
     // see it; if not, the readback's `wait_indefinitely` poll is the
     // concrete readiness signal — it returns only once the map callback
     // has run — so the following drain resolves deterministically.
-    engine.render(cherenkov_gpu::FrameTime::now())?;
+    engine.render(cherenkov::FrameTime::now())?;
     let timed = engine.stats().gpu_seconds.is_some() || {
         let _ = surface.readback()?;
-        engine.render(cherenkov_gpu::FrameTime::now())?;
+        engine.render(cherenkov::FrameTime::now())?;
         engine.stats().gpu_seconds.is_some()
     };
     assert!(timed, "the previous frame's timing arrives a render late");
@@ -384,7 +384,7 @@ fn timestamps_off_reports_no_passes() -> Result<(), Box<dyn std::error::Error>> 
             );
         }));
     });
-    engine.render(cherenkov_gpu::FrameTime::now())?;
+    engine.render(cherenkov::FrameTime::now())?;
     let stats = engine.stats();
     assert!(stats.gpu_seconds.is_none());
     assert!(stats.passes_timed.is_empty());
@@ -421,7 +421,7 @@ fn bind_groups_are_reused_across_frames() -> Result<(), Box<dyn std::error::Erro
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|c| record(c)));
     });
-    engine.render(cherenkov_gpu::FrameTime::now())?;
+    engine.render(cherenkov::FrameTime::now())?;
     assert!(
         engine.stats().bind_groups_created > 0,
         "the first frame builds the bind groups"
@@ -429,7 +429,7 @@ fn bind_groups_are_reused_across_frames() -> Result<(), Box<dyn std::error::Erro
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|c| record(c)));
     });
-    engine.render(cherenkov_gpu::FrameTime::now())?;
+    engine.render(cherenkov::FrameTime::now())?;
     assert_eq!(
         engine.stats().bind_groups_created,
         0,
@@ -465,9 +465,9 @@ fn trim_releases_cached_memory() -> Result<(), Box<dyn std::error::Error>> {
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|c| scene(c)));
     });
-    engine.render(cherenkov_gpu::FrameTime::now())?;
+    engine.render(cherenkov::FrameTime::now())?;
     let before = engine.memory();
-    engine.trim(cherenkov_gpu::Pressure::Moderate)?;
+    engine.trim(cherenkov::Pressure::Moderate)?;
     let moderate = engine.memory();
     assert!(
         moderate.gpu.0 < before.gpu.0,
@@ -479,8 +479,8 @@ fn trim_releases_cached_memory() -> Result<(), Box<dyn std::error::Error>> {
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|c| scene(c)));
     });
-    engine.render(cherenkov_gpu::FrameTime::now())?;
-    engine.trim(cherenkov_gpu::Pressure::Critical)?;
+    engine.render(cherenkov::FrameTime::now())?;
+    engine.trim(cherenkov::Pressure::Critical)?;
     let critical = engine.memory();
     assert!(
         critical.gpu.0 <= moderate.gpu.0,
@@ -493,7 +493,7 @@ fn trim_releases_cached_memory() -> Result<(), Box<dyn std::error::Error>> {
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|c| scene(c)));
     });
-    engine.render(cherenkov_gpu::FrameTime::now())?;
+    engine.render(cherenkov::FrameTime::now())?;
     let rb = surface.readback()?;
     assert!(
         rb.pixels[20 * 64 + 30][3] > 0.5,
@@ -519,8 +519,8 @@ fn render_returns_idle() -> Result<(), Box<dyn std::error::Error>> {
         }));
     });
     assert_eq!(
-        engine.render(cherenkov_gpu::FrameTime::now())?,
-        cherenkov_gpu::Next::Idle
+        engine.render(cherenkov::FrameTime::now())?,
+        cherenkov::Next::Idle
     );
     Ok(())
 }
@@ -557,7 +557,7 @@ fn two_dirty_surfaces_lower_in_parallel() -> Result<(), Box<dyn std::error::Erro
                 // Shared atlas contention: both surfaces raster the same
                 // glyphs on their own thread.
                 for run in text_runs(font.id(), 96, 10.0) {
-                    c.glyphs(&run, WorkingColor::WHITE);
+                    c.glyphs(run, WorkingColor::WHITE);
                 }
             }));
         });
@@ -565,7 +565,7 @@ fn two_dirty_surfaces_lower_in_parallel() -> Result<(), Box<dyn std::error::Erro
     };
     let red = make(WorkingColor::new([1.0, 0.0, 0.0, 1.0]))?;
     let blue = make(WorkingColor::new([0.0, 0.0, 1.0, 1.0]))?;
-    engine.render(cherenkov_gpu::FrameTime::now())?;
+    engine.render(cherenkov::FrameTime::now())?;
     let pa = red.readback()?.pixels;
     let pb = blue.readback()?.pixels;
     // Center pixel of the 8..56 fill rect, row-major.

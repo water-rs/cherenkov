@@ -9,6 +9,8 @@ pub mod filter;
 mod gpu_content;
 mod lower;
 mod shader;
+#[cfg(test)]
+mod tests;
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
@@ -80,6 +82,7 @@ struct LayerCache {
     fragment: Option<vello::Scene>,
     /// Shader paint uses inside `fragment`, in command order.
     shader_uses: Vec<shader::ShaderUse>,
+    filter: Option<cherenkov::FilterId>,
 }
 
 /// What a surface renders into, on the render thread.
@@ -129,6 +132,7 @@ struct SurfaceState {
     target: TargetState,
     readable: bool,
     wants_next: bool,
+    rate: cherenkov::RefreshRange,
     /// Per-layer render caches, created on first content.
     layers: HashMap<LayerId, LayerCache>,
 }
@@ -347,6 +351,34 @@ pub fn init(config: VelloConfig) -> Result<(VelloRenderer, VelloInfo), EngineErr
 }
 
 impl VelloRenderer {
+    /// Remove a shader and invalidate fragments that may reference its texture.
+    pub fn remove_shader(&mut self, id: cherenkov::ShaderId) {
+        self.shaders.remove(id.raw());
+        self.flush_fragments();
+    }
+
+    /// Remove a filter and release its bound output image.
+    pub fn remove_filter(&mut self, id: cherenkov::FilterId) {
+        if let Some(image) = self.filters.remove(id.raw()) {
+            self.vello.override_image(&image, None);
+        }
+        for surface in self.surfaces.values_mut() {
+            surface.wants_next = true;
+        }
+    }
+
+    fn flush_fragments(&mut self) {
+        for surface in self.surfaces.values_mut() {
+            for cache in surface.layers.values_mut() {
+                for use_ in cache.shader_uses.drain(..) {
+                    self.vello.override_image(&use_.image, None);
+                }
+                cache.fragment = None;
+            }
+            surface.wants_next = true;
+        }
+    }
+
     /// Attaches a [`GpuContent`](crate::interop::GpuContent) box to a layer:
     /// the [`GpuContent`](cherenkov::GpuContent) capability hook.
     pub fn set_gpu_content(
@@ -510,8 +542,16 @@ impl VelloRenderer {
     ) -> Result<(), RenderError> {
         let node = tree.layer(id);
         let world = parent_xf * node.transform;
-        let content_world = parent_xf * node.content_transform();
         let mut cache = layers.remove(&id).unwrap_or_default();
+        if cache.filter != node.filter {
+            if let Some(id) = cache.filter
+                && let Some(image) = self.filters.output_image(id.raw())
+            {
+                self.vello.override_image(&image, None);
+            }
+            cache.filter = node.filter;
+        }
+        let content_world = parent_xf * node.content_transform();
         let result = (|| {
             self.layer_fragment(&mut cache, target_size)?;
             self.evaluate_shader_uses(&mut cache, now, wants_next)?;
@@ -539,7 +579,9 @@ impl VelloRenderer {
                     convert::shape_path,
                 );
                 scene.push_layer(
-                    peniko::Fill::NonZero,
+                    node.clip.as_ref().map_or(peniko::Fill::NonZero, |clip| {
+                        convert::fill(convert::shape_rule(clip))
+                    }),
                     convert::blend(node.blend),
                     node.opacity,
                     world,
@@ -787,18 +829,17 @@ impl VelloRenderer {
     /// them when it renders. First-rendered content needs no flag: setting
     /// the content already marked the surface `changed`.
     fn surface_needs_redraw(&self, state: &SurfaceState) -> bool {
-        state.wants_next
-            || state.layers.values().any(|cache| {
-                if let Some(ContentData::Gpu(slot)) = &cache.content
-                    && slot.wants_redraw()
-                {
-                    return true;
-                }
-                cache
-                    .shader_uses
-                    .iter()
-                    .any(|use_| self.shaders.animated(use_.shader))
-            })
+        state.layers.values().any(|cache| {
+            if let Some(ContentData::Gpu(slot)) = &cache.content
+                && slot.wants_redraw()
+            {
+                return true;
+            }
+            cache
+                .shader_uses
+                .iter()
+                .any(|use_| self.shaders.animated(use_.shader))
+        })
     }
 
     /// Composes and renders one surface's scene into its target, then
@@ -1063,6 +1104,20 @@ impl Renderer for VelloRenderer {
         id: SurfaceId,
         target: Self::Target,
     ) -> Result<SurfaceInfo, SurfaceError> {
+        let (size, rate) = match &target {
+            VelloTarget::Offscreen(o) => (o.size, o.refresh.clone()),
+            VelloTarget::Window(w) => ((w.config.width, w.config.height), w.rate.clone()),
+        };
+        if size.0 == 0 || size.1 == 0 {
+            return Err(SurfaceError::ZeroSize);
+        }
+        if size.0 > self.max_texture || size.1 > self.max_texture {
+            return Err(SurfaceError::TooLarge {
+                width: size.0,
+                height: size.1,
+                max: self.max_texture,
+            });
+        }
         let (target, size, readable) = match target {
             VelloTarget::Offscreen(offscreen) => {
                 // The vello target is `Rgba8Unorm`; `LinearF16` is the
@@ -1119,10 +1174,15 @@ impl Renderer for VelloRenderer {
                 target,
                 readable,
                 wants_next: false,
+                rate,
                 layers: HashMap::new(),
             },
         );
-        Ok(SurfaceInfo { size, readable })
+        Ok(SurfaceInfo {
+            size,
+            readable,
+            max_dimension: self.max_texture,
+        })
     }
 
     fn resize_surface(&mut self, id: SurfaceId, size: (u32, u32)) {
@@ -1161,6 +1221,11 @@ impl Renderer for VelloRenderer {
         if let Some(mut state) = self.surfaces.remove(&id) {
             for (_, mut cache) in state.layers.drain() {
                 Self::clear_content(&mut self.vello, &mut cache);
+                if let Some(id) = cache.filter
+                    && let Some(image) = self.filters.output_image(id.raw())
+                {
+                    self.vello.override_image(&image, None);
+                }
             }
         }
     }
@@ -1179,6 +1244,7 @@ impl Renderer for VelloRenderer {
 
     fn remove_font(&mut self, id: FontId) {
         self.fonts.remove(&id.raw());
+        self.flush_fragments();
     }
 
     fn add_image(&mut self, id: ImageId, image: ImageUpload) -> Result<(), ResourceError> {
@@ -1188,6 +1254,7 @@ impl Renderer for VelloRenderer {
 
     fn remove_image(&mut self, id: ImageId) {
         self.images.remove(&id.raw());
+        self.flush_fragments();
     }
 
     fn set_content(&mut self, surface: SurfaceId, layer: LayerId, content: Option<ContentOp>) {
@@ -1222,6 +1289,11 @@ impl Renderer for VelloRenderer {
         };
         if let Some(mut cache) = state.layers.remove(&layer) {
             Self::clear_content(&mut self.vello, &mut cache);
+            if let Some(id) = cache.filter
+                && let Some(image) = self.filters.output_image(id.raw())
+            {
+                self.vello.override_image(&image, None);
+            }
         }
     }
 
@@ -1232,14 +1304,11 @@ impl Renderer for VelloRenderer {
         frame: &cherenkov::Frame<'_>,
         stats: &mut FrameStats,
     ) -> Result<Redraw, RenderError> {
-        let mut wants_next = false;
+        let mut rates = Vec::new();
         // A surface is dirty when the front end says its tree or content
         // changed, or a backend-side source (GPU content redraw flag,
         // animated shader, filter redraw callback) asks for a frame.
         let filter_redraw = self.filters.take_redraw_requests();
-        if filter_redraw {
-            wants_next = true;
-        }
         let dirty: Vec<SurfaceId> = frame
             .surfaces
             .iter()
@@ -1248,8 +1317,7 @@ impl Renderer for VelloRenderer {
                     return false;
                 };
                 let backend_dirty = self.surface_needs_redraw(surface);
-                wants_next |= backend_dirty;
-                filter_redraw || sf.changed || backend_dirty
+                filter_redraw || sf.changed || surface.wants_next || backend_dirty
             })
             .map(|sf| sf.id)
             .collect();
@@ -1261,7 +1329,12 @@ impl Renderer for VelloRenderer {
                 if !dirty.contains(&sf.id) {
                     continue;
                 }
+                let mut wants_next =
+                    filter_redraw || self.surface_needs_redraw(&self.surfaces[&sf.id]);
                 result = self.render_surface(sf, stats, &mut wants_next, now);
+                if wants_next {
+                    rates.push(self.surfaces[&sf.id].rate.clone());
+                }
                 if result.is_err() {
                     break;
                 }
@@ -1273,11 +1346,10 @@ impl Renderer for VelloRenderer {
             self.wait()?;
             result?;
         }
-        Ok(if wants_next {
-            Redraw::Wanted
-        } else {
-            Redraw::None
-        })
+        let rate = rates
+            .into_iter()
+            .reduce(|a, b| (*a.start()).min(*b.start())..=(*a.end()).max(*b.end()));
+        Ok(rate.map_or(Redraw::None, |rate| Redraw::Wanted { rate }))
     }
 
     /// Copies a surface's target into `Readback` pixels: each stored

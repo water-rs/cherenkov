@@ -119,6 +119,7 @@ impl Renderer for NullRenderer {
         }
         let _ = self.events.send(Event::CreateSurface(id));
         Ok(SurfaceInfo {
+            max_dimension: u32::MAX,
             size: target.size,
             readable: true,
         })

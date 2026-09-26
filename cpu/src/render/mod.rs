@@ -141,6 +141,7 @@ impl Renderer for RasterRenderer {
             },
         );
         Ok(SurfaceInfo {
+            max_dimension: MAX_SURFACE,
             size,
             readable: true,
         })
@@ -166,6 +167,11 @@ impl Renderer for RasterRenderer {
 
     fn remove_font(&mut self, id: FontId) {
         self.fonts.remove(&id.raw());
+        for surface in self.surfaces.values_mut() {
+            for content in surface.layers.values_mut() {
+                content.invalidate();
+            }
+        }
     }
 
     fn add_image(&mut self, _id: ImageId, _image: ImageUpload) -> Result<(), ResourceError> {
@@ -185,14 +191,14 @@ impl Renderer for RasterRenderer {
                 state.layers.insert(layer, ContentData::new(list));
             }
             Some(ContentOp::Update(updates)) => {
-                if let Some(content) = state.layers.get_mut(&layer) {
-                    content.update(updates);
-                }
-            }
-            Some(ContentOp::Picture(picture)) => {
                 state
                     .layers
-                    .insert(layer, ContentData::new(picture.display_list().clone()));
+                    .get_mut(&layer)
+                    .expect("slot update targets a layer without content")
+                    .update(updates);
+            }
+            Some(ContentOp::Picture(picture)) => {
+                state.layers.insert(layer, ContentData::picture(picture));
             }
             None => {
                 state.layers.remove(&layer);

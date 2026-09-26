@@ -877,6 +877,7 @@ impl Renderer for GpuRenderer {
             },
         );
         Ok(SurfaceInfo {
+            max_dimension: self.max_texture,
             size,
             readable: true,
         })
@@ -921,6 +922,11 @@ impl Renderer for GpuRenderer {
 
     fn remove_font(&mut self, id: FontId) {
         self.fonts.remove(&id.raw());
+        for surface in self.surfaces.values_mut() {
+            for content in surface.layers.values_mut() {
+                content.invalidate();
+            }
+        }
         self.atlas.remove_font(id.raw());
     }
 
@@ -933,14 +939,14 @@ impl Renderer for GpuRenderer {
                 state.layers.insert(layer, ContentData::new(list));
             }
             Some(ContentOp::Update(updates)) => {
-                if let Some(content) = state.layers.get_mut(&layer) {
-                    content.update(updates);
-                }
-            }
-            Some(ContentOp::Picture(picture)) => {
                 state
                     .layers
-                    .insert(layer, ContentData::new(picture.display_list().clone()));
+                    .get_mut(&layer)
+                    .expect("slot update targets a layer without content")
+                    .update(updates);
+            }
+            Some(ContentOp::Picture(picture)) => {
+                state.layers.insert(layer, ContentData::picture(picture));
             }
             None => {
                 state.layers.remove(&layer);
@@ -1057,6 +1063,11 @@ impl Renderer for GpuRenderer {
 
     fn remove_image(&mut self, id: ImageId) {
         self.images.remove(&id.raw());
+        for surface in self.surfaces.values_mut() {
+            for content in surface.layers.values_mut() {
+                content.invalidate();
+            }
+        }
         self.images_gen += 1;
     }
 

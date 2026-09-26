@@ -189,16 +189,15 @@ fn render<B: Backend>(
     for state in surfaces.values_mut() {
         state.changed = false;
     }
-    let next = match (rate, redraw) {
-        (Some(rate), _) => Next::At {
-            time: time + Duration::from_secs_f64(1.0 / f64::from(*rate.end())),
-            rate,
-        },
-        (None, Redraw::Wanted) => Next::At {
-            time: time + Duration::from_secs_f64(1.0 / 120.0),
-            rate: crate::tree::RATE_FAST,
-        },
-        (None, Redraw::None) => Next::Idle,
-    };
+    if let Redraw::Wanted { rate: backend_rate } = redraw {
+        rate = Some(rate.map_or_else(
+            || backend_rate.clone(),
+            |r| (*r.start()).min(*backend_rate.start())..=(*r.end()).max(*backend_rate.end()),
+        ));
+    }
+    let next = rate.map_or(Next::Idle, |rate| Next::At {
+        time: time + Duration::from_secs_f64(1.0 / f64::from(*rate.end())),
+        rate,
+    });
     Ok((next, stats))
 }

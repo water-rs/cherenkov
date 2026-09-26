@@ -401,11 +401,13 @@ fn shader_paint_maps_in_shape_space_under_transform() {
     let Some(engine) = engine() else { return };
     // Gray ramp along uv.x.
     let ramp = engine
-        .shader(cherenkov_vello::ShaderSource::wgsl(
+        .shader(cherenkov::ShaderSource::wgsl(
             "@fragment fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> { return vec4<f32>(uv.x, uv.x, uv.x, 1.0); }",
         ))
         .expect("shader");
-    let surface = engine.surface(Offscreen::new((64, 64))).expect("surface");
+    let surface = engine
+        .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))
+        .expect("surface");
     surface.clear_color(WorkingColor::BLACK);
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|c| {
@@ -420,9 +422,7 @@ fn shader_paint_maps_in_shape_space_under_transform() {
             });
         }));
     });
-    let next = engine
-        .render(cherenkov_vello::FrameTime::now())
-        .expect("render");
+    let next = engine.render(cherenkov::FrameTime::now()).expect("render");
     assert_eq!(next, Next::Idle);
     let readback = surface.readback().expect("readback");
     let left = px(&readback, 18, 32);
@@ -530,7 +530,9 @@ fn filter_runs_over_the_layer_texture() {
 #[test]
 fn even_odd_layer_clip_punches_a_hole() {
     let Some(engine) = engine() else { return };
-    let surface = engine.surface(Offscreen::new((64, 64))).expect("surface");
+    let surface = engine
+        .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))
+        .expect("surface");
     surface.clear_color(WorkingColor::BLACK);
     let mut path = cherenkov::kurbo::BezPath::new();
     path.move_to((0., 0.));
@@ -552,9 +554,7 @@ fn even_odd_layer_clip_punches_a_hole() {
             }));
         tx[surface.root()].push(&clipped);
     });
-    let next = engine
-        .render(cherenkov_vello::FrameTime::now())
-        .expect("render");
+    let next = engine.render(cherenkov::FrameTime::now()).expect("render");
     assert_eq!(next, Next::Idle);
     let readback = surface.readback().expect("readback");
     assert_pixel(
@@ -578,7 +578,7 @@ fn even_odd_layer_clip_punches_a_hole() {
 /// `GpuContent` that counts its renders and always asks for another frame.
 struct LoopingContent(std::sync::Arc<std::sync::atomic::AtomicUsize>);
 
-impl cherenkov_vello::GpuContent for LoopingContent {
+impl cherenkov_vello::interop::GpuContent for LoopingContent {
     async fn setup(&mut self, _gpu: &wgpu::Context<'_>) {}
 
     fn render(&mut self, frame: &mut wgpu::Frame<'_>) {
@@ -619,10 +619,12 @@ impl filtrate::Effect for AlwaysHinting {
 #[test]
 fn animated_content_requests_every_frame() {
     let Some(engine) = engine() else { return };
-    let surface = engine.surface(Offscreen::new((64, 64))).expect("surface");
+    let surface = engine
+        .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))
+        .expect("surface");
     let animated = engine
         .shader(
-            cherenkov_vello::ShaderSource::wgsl(
+            cherenkov::ShaderSource::wgsl(
                 "@fragment fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> { return vec4<f32>(uv, 0.0, 1.0); }",
             )
             .animated(),
@@ -659,9 +661,7 @@ fn animated_content_requests_every_frame() {
             .push(&filtered_layer);
     });
     for frame in 0..3 {
-        let next = engine
-            .render(cherenkov_vello::FrameTime::now())
-            .expect("render");
+        let next = engine.render(cherenkov::FrameTime::now()).expect("render");
         assert!(matches!(next, Next::At { .. }), "frame {frame}: {next:?}");
     }
     let rendered = renders.load(std::sync::atomic::Ordering::Relaxed);
@@ -677,16 +677,23 @@ fn animated_content_requests_every_frame() {
 #[test]
 fn oversized_surface_fails_fast_and_the_engine_survives() {
     let Some(engine) = engine() else { return };
-    let err = engine.surface(Offscreen::new((u32::MAX, u32::MAX))).err();
+    let err = engine
+        .surface(Offscreen::new(
+            (u32::MAX, u32::MAX),
+            OffscreenFormat::LinearF16,
+        ))
+        .err();
     assert!(
-        matches!(err, Some(cherenkov_vello::SurfaceError::TooLarge { .. })),
+        matches!(err, Some(cherenkov::SurfaceError::TooLarge { .. })),
         "expected TooLarge, got {err:?}"
     );
     // The render thread is still alive and healthy surfaces still render.
-    let ok = engine.surface(Offscreen::new((8, 8))).expect("surface");
+    let ok = engine
+        .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))
+        .expect("surface");
     ok.clear_color(WorkingColor::BLACK);
     let next = engine
-        .render(cherenkov_vello::FrameTime::now())
+        .render(cherenkov::FrameTime::now())
         .expect("render after rejected surface");
     assert_eq!(next, Next::Idle);
     let readback = ok.readback().expect("readback");
@@ -780,10 +787,9 @@ fn skipped_window_present_retries_next_frame() {
         eprintln!("no alpha modes, skipping");
         return;
     };
-    let engine = Engine::<Vello>::with_device(
-        VelloConfig::default(),
+    let engine = Engine::<Vello>::new(VelloConfig::with_device(
         cherenkov_vello::interop::wgpu::DeviceSource::new(adapter, device, queue),
-    )
+    ))
     .expect("engine");
     let surface = engine
         .surface(cherenkov_vello::interop::wgpu::Window {
@@ -803,7 +809,7 @@ fn skipped_window_present_retries_next_frame() {
         .expect("window surface");
     surface.clear_color(WorkingColor::BLACK);
     let _ = engine
-        .render(cherenkov_vello::FrameTime::now())
+        .render(cherenkov::FrameTime::now())
         .expect("first render");
 
     // Destroying the window makes the next acquire report `Lost` — a
@@ -815,7 +821,7 @@ fn skipped_window_present_retries_next_frame() {
     let _ = conn.get_input_focus().expect("cookie").reply();
     surface.clear_color(WorkingColor::WHITE);
     let next = engine
-        .render(cherenkov_vello::FrameTime::now())
+        .render(cherenkov::FrameTime::now())
         .expect("second render");
     match next {
         Next::At { rate, .. } => assert_eq!(rate, 30..=120),
@@ -824,7 +830,7 @@ fn skipped_window_present_retries_next_frame() {
     // The retry keeps asking until the embedder destroys the surface.
     surface.clear_color(WorkingColor::BLACK);
     let next = engine
-        .render(cherenkov_vello::FrameTime::now())
+        .render(cherenkov::FrameTime::now())
         .expect("retry render");
     match next {
         Next::At { rate, .. } => assert_eq!(rate, 30..=120),
@@ -832,7 +838,7 @@ fn skipped_window_present_retries_next_frame() {
     }
     drop(surface);
     let next = engine
-        .render(cherenkov_vello::FrameTime::now())
+        .render(cherenkov::FrameTime::now())
         .expect("render after destroy");
     assert_eq!(next, Next::Idle);
 }
@@ -844,11 +850,11 @@ fn skipped_window_present_retries_next_frame() {
 fn next_at_reports_the_configured_refresh_range() {
     let Some(engine) = engine() else { return };
     let surface = engine
-        .surface(Offscreen::new((8, 8)).rate(30..=144))
+        .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16).rate(30..=144))
         .expect("surface");
     let animated = engine
         .shader(
-            cherenkov_vello::ShaderSource::wgsl(
+            cherenkov::ShaderSource::wgsl(
                 "@fragment fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> { return vec4<f32>(uv, 0.0, 1.0); }",
             )
             .animated(),
@@ -868,9 +874,7 @@ fn next_at_reports_the_configured_refresh_range() {
         tx[surface.root()].push(&layer);
     });
     let t0 = std::time::Instant::now();
-    let next = engine
-        .render(cherenkov_vello::FrameTime::at(t0))
-        .expect("render");
+    let next = engine.render(cherenkov::FrameTime::at(t0)).expect("render");
     match next {
         Next::At { time, rate } => {
             assert_eq!(rate, 30..=144);
@@ -890,10 +894,12 @@ fn next_at_reports_the_configured_refresh_range() {
 #[test]
 fn oversized_resize_fails_fast() {
     let Some(engine) = engine() else { return };
-    let mut surface = engine.surface(Offscreen::new((8, 8))).expect("surface");
+    let mut surface = engine
+        .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))
+        .expect("surface");
     let err = surface.resize((u32::MAX, 16)).err();
     assert!(
-        matches!(err, Some(cherenkov_vello::SurfaceError::TooLarge { .. })),
+        matches!(err, Some(cherenkov::SurfaceError::TooLarge { .. })),
         "expected TooLarge, got {err:?}"
     );
     assert_eq!(
@@ -905,7 +911,7 @@ fn oversized_resize_fails_fast() {
     surface.resize((16, 16)).expect("resize");
     surface.clear_color(WorkingColor::BLACK);
     let next = engine
-        .render(cherenkov_vello::FrameTime::now())
+        .render(cherenkov::FrameTime::now())
         .expect("render after resizes");
     assert_eq!(next, Next::Idle);
     let readback = surface.readback().expect("readback");
@@ -920,7 +926,9 @@ fn oversized_resize_fails_fast() {
 #[test]
 fn linear_normal_translucent_group_reports_unsupported() {
     let Some(engine) = engine() else { return };
-    let surface = engine.surface(Offscreen::new((64, 64))).expect("surface");
+    let surface = engine
+        .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))
+        .expect("surface");
     let translucent = surface.record(|c| {
         c.group(cherenkov::Group::new().opacity(0.5), |c| {
             c.fill(Rect::new(0., 0., 64., 64.), WorkingColor::WHITE);
@@ -929,13 +937,11 @@ fn linear_normal_translucent_group_reports_unsupported() {
     surface.update(|tx| {
         tx[surface.root()].content(translucent);
     });
-    let result = engine.render(cherenkov_vello::FrameTime::now());
+    let result = engine.render(cherenkov::FrameTime::now());
     assert!(
         matches!(
             result,
-            Err(cherenkov_vello::RenderError::Unsupported(
-                cherenkov_vello::Unsupported::BlendSpace
-            ))
+            Err(cherenkov::RenderError::Unsupported("blend-space"))
         ),
         "{result:?}"
     );
@@ -950,7 +956,7 @@ fn linear_normal_translucent_group_reports_unsupported() {
         tx[surface.root()].content(opaque);
     });
     let next = engine
-        .render(cherenkov_vello::FrameTime::now())
+        .render(cherenkov::FrameTime::now())
         .expect("default group renders");
     assert_eq!(next, Next::Idle);
 }

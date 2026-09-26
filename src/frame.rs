@@ -128,18 +128,38 @@ pub enum OffscreenFormat {
 }
 
 /// An offscreen render target description.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Offscreen {
     /// The target size in pixels.
     pub size: (u32, u32),
     /// The target storage format.
     pub format: OffscreenFormat,
+    /// Refresh range used by animated backend content.
+    pub refresh: RefreshRange,
 }
 
 impl Offscreen {
+    /// Configure the refresh range of this target.
+    ///
+    /// # Panics
+    /// When the range is empty or contains zero hertz.
+    #[must_use]
+    pub fn rate(mut self, rate: RefreshRange) -> Self {
+        assert!(
+            *rate.start() > 0 && !rate.is_empty(),
+            "refresh range must be positive and ordered"
+        );
+        self.refresh = rate;
+        self
+    }
+
     /// An offscreen target of `size` pixels in `format`.
     #[must_use]
     pub const fn new(size: (u32, u32), format: OffscreenFormat) -> Self {
-        Self { size, format }
+        Self {
+            size,
+            format,
+            refresh: 60..=60,
+        }
     }
 }

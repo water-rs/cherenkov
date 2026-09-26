@@ -510,6 +510,7 @@ pub struct Surface<B: Backend> {
     id: SurfaceId,
     size: Cell<(u32, u32)>,
     readable: bool,
+    max_dimension: u32,
     root: Layer,
     tx: Sender<Message<B>>,
 }
@@ -533,6 +534,7 @@ impl<B: Backend> Surface<B> {
             id,
             size: Cell::new(info.size),
             readable: info.readable,
+            max_dimension: info.max_dimension,
             root: Layer {
                 id: LayerId::new(0),
                 owner,
@@ -577,6 +579,13 @@ impl<B: Backend> Surface<B> {
     /// # Errors
     /// [`SurfaceError::Lost`] when the render thread is gone.
     pub fn resize(&self, size: (u32, u32)) -> Result<(), SurfaceError> {
+        if size.0 > self.max_dimension || size.1 > self.max_dimension {
+            return Err(SurfaceError::TooLarge {
+                width: size.0,
+                height: size.1,
+                max: self.max_dimension,
+            });
+        }
         self.tx
             .send(Message::ResizeSurface { id: self.id, size })
             .map_err(|_| SurfaceError::Lost)?;

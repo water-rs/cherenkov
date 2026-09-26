@@ -155,9 +155,11 @@ Nested groups perform these conversions at their own boundaries.
 
 Solid coverage spans, solid glyph rows and linear source-over isolation use
 portable SIMD selected once by the renderer. Each owned framebuffer band carries
-its concrete SIMD type through dispatch. Interleaved RGBA blocks are transposed
-into channel vectors, composited and transposed back; incomplete vectors use
-scalar arithmetic. Multiplication and addition remain separate and in the same
+its concrete SIMD type through dispatch. Constant spans retain packed RGBA,
+using one uniform inverse alpha without channel shuffles. Varying coverage is
+expanded over each pixel's four packed channels, so destination pixels need no
+transpose. Isolation transposes source and destination into matching channel
+vectors, composites and transposes back. Incomplete vectors use scalar arithmetic. Multiplication and addition remain separate and in the same
 order as scalar composition. Zero coverage and zero isolated alpha preserve the
 destination exactly. Native and scalar paths are checked bit for bit, including
 extended channels, partial vectors, partial bands and isolation.

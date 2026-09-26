@@ -1,11 +1,11 @@
 // Copyright 2026 the Cherenkov Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Channel-wise SIMD source-over, preserving the scalar multiplication/addition
-//! order.
+//! SIMD source-over, preserving the scalar multiplication/addition order.
 //!
-//! Each vector holds one channel from consecutive pixels; shuffles only
-//! transpose their layout. Partial vectors use the same scalar operation.
+//! Solid paints blend packed RGBA directly, expanding varying coverage over
+//! each pixel's channels. Isolation uses matching channel-vector permutations. Partial vectors use the same
+//! scalar operation.
 
 use pulp::Simd;
 
@@ -64,22 +64,21 @@ pub fn constant<S: Simd>(simd: S, pixels: &mut [[f32; 4]], color: [f32; 4]) {
     }
 }
 
-/// Put coverage in the same lane order as a four-channel pixel block.
-/// Pulp's shuffle transpose may permute pixels within each channel vector.
-/// Transposing coverage through that same layout keeps each value with its pixel.
+/// Repeat each coverage value over its packed RGBA channels. Keeping pixels
+/// packed avoids transposing the much larger destination read/write stream.
 #[expect(
     clippy::inline_always,
-    reason = "the coverage transpose must inline into the SIMD target-feature context"
+    reason = "coverage expansion must inline into the SIMD target-feature context"
 )]
 #[inline(always)]
-fn coverage_lanes<S: Simd>(simd: S, coverage: S::f32s) -> S::f32s {
+fn packed_coverage<S: Simd>(simd: S, coverage: S::f32s) -> [S::f32s; 4] {
     let mut pixels = [simd.splat_f32s(0.0); 4];
     let values: &[f32] = pulp::bytemuck::cast_slice(std::slice::from_ref(&coverage));
     let channels: &mut [[f32; 4]] = pulp::bytemuck::cast_slice_mut(&mut pixels);
     for (pixel, &value) in channels.iter_mut().zip(values) {
-        pixel[0] = value;
+        *pixel = [value; 4];
     }
-    simd.deinterleave_shfl_f32s(pixels)[0]
+    pixels
 }
 
 /// Composite a solid colour through a scalar coverage span.
@@ -93,16 +92,19 @@ pub fn solid_span<S: Simd>(simd: S, pixels: &mut [[f32; 4]], coverage: &[f32], c
     let (pixels, tail) = blocks::<S>(pixels);
     let count = pixels.len() * S::F32_LANES;
     let (coverage_vectors, _) = S::as_simd_f32s(&coverage[..count]);
-    let colors = color.map(|channel| simd.splat_f32s(channel));
+    let colors = simd.interleave_shfl_f32s(color.map(|channel| simd.splat_f32s(channel)));
+    let alpha = simd.splat_f32s(color[3]);
+    let one = simd.splat_f32s(1.0);
+    let zero = simd.splat_f32s(0.0);
     for (pixel, &coverage) in pixels.iter_mut().zip(coverage_vectors) {
-        let coverage = coverage_lanes(simd, coverage);
-        let destination = simd.deinterleave_shfl_f32s(*pixel);
-        let source = colors.map(|channel| simd.mul_f32s(channel, coverage));
-        let active = simd.greater_than_f32s(coverage, simd.splat_f32s(0.0));
-        let result = over(simd, destination, source);
-        *pixel = simd.interleave_shfl_f32s(std::array::from_fn::<_, 4, _>(|channel| {
-            simd.select_f32s(active, result[channel], destination[channel])
-        }));
+        let coverage = packed_coverage(simd, coverage);
+        for ((destination, color), coverage) in pixel.iter_mut().zip(colors).zip(coverage) {
+            let source = simd.mul_f32s(color, coverage);
+            let inverse = simd.sub_f32s(one, simd.mul_f32s(alpha, coverage));
+            let result = simd.add_f32s(simd.mul_f32s(*destination, inverse), source);
+            let active = simd.greater_than_f32s(coverage, zero);
+            *destination = simd.select_f32s(active, result, *destination);
+        }
     }
     for (pixel, &coverage) in tail.iter_mut().zip(&coverage[count..]) {
         if coverage > 0.0 {

@@ -28,6 +28,10 @@ const PAD: u32 = 1;
 pub struct FontData {
     pub data: Arc<[u8]>,
     pub index: u32,
+    /// Built font-space `COLRv1` pictures, per `(glyph id, coords hash,
+    /// paint hash)` — content is size-independent, so it is keyed without
+    /// the placement.
+    pub colr: std::cell::RefCell<HashMap<(u32, u64, u64), cherenkov::Picture>>,
 }
 
 /// A glyph cache key.

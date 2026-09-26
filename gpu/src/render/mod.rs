@@ -3,6 +3,7 @@
 
 //! The render thread: sole owner of GPU state.
 
+mod colr;
 mod glyph;
 mod instance;
 mod lower;
@@ -668,7 +669,14 @@ pub fn run(config: GpuConfig, rx: Receiver<Message>, init_tx: Sender<Result<Init
                 renderer.images.remove(&id);
             }
             Message::AddFont { id, data, index } => {
-                renderer.fonts.insert(id, FontData { data, index });
+                renderer.fonts.insert(
+                    id,
+                    FontData {
+                        data,
+                        index,
+                        colr: std::cell::RefCell::new(HashMap::new()),
+                    },
+                );
             }
             Message::Commit { surface, changes } => {
                 renderer.commit(surface, changes);

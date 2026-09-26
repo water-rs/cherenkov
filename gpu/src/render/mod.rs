@@ -141,6 +141,11 @@ struct SurfaceState {
     clear: cherenkov::WorkingColor,
     dirty: bool,
     frame: Frame,
+    /// This frame's offsets into the shared buffers: instances and globals
+    /// (256-byte slots) are laid out surface by surface so one upload covers
+    /// every dirty surface.
+    inst_base: u32,
+    globals_base: u32,
 }
 
 impl SurfaceState {
@@ -738,6 +743,8 @@ impl Renderer {
                 clear: cherenkov::WorkingColor::TRANSPARENT,
                 dirty: true,
                 frame: Frame::default(),
+                inst_base: 0,
+                globals_base: 0,
             },
         );
         Ok(())
@@ -966,12 +973,30 @@ impl Renderer {
         }
         self.frame_pass_count = 0;
         self.pass_meta.clear();
-        self.drain_and_stamp(0)?;
+        // Lower every dirty surface into the shared buffers first: the GPU
+        // timestamp bracket must start after CPU lowering (rasters, uploads)
+        // so it measures GPU work only. Instances, stops and globals are
+        // appended frame-wide at per-surface bases so a later surface's
+        // upload can't clobber an earlier one before it is encoded.
+        let mut inst_base = 0u32;
+        let mut stop_base = 0u32;
+        let mut globals_base = 0u32;
         let mut result = Ok(());
-        for id in dirty {
-            result = self.render_surface(id, &mut stats);
+        for &id in &dirty {
+            result = self.lower_surface(id, &mut stats, inst_base, stop_base, globals_base);
             if result.is_err() {
                 break;
+            }
+            if let Some(surf) = self.surfaces.get(&id) {
+                inst_base += u32::try_from(surf.frame.instances.len()).unwrap_or(u32::MAX);
+                stop_base += u32::try_from(surf.frame.stops.len()).unwrap_or(u32::MAX);
+                globals_base += u32::try_from(surf.frame.passes.len()).unwrap_or(u32::MAX);
+            }
+        }
+        self.drain_and_stamp(0)?;
+        if result.is_ok() {
+            for &id in &dirty {
+                self.encode_surface(id, &mut stats);
             }
         }
         if self.timestamps {
@@ -1002,13 +1027,21 @@ impl Renderer {
         Ok((Next::Idle, stats))
     }
 
-    /// Lowers and submits one surface.
+    /// Lowers one surface: CPU raster, scratch/backdrop growth, and the
+    /// shared-buffer uploads at `inst_base`/`stop_base`/`globals_base`.
     #[expect(
         clippy::too_many_lines,
         clippy::cast_precision_loss,
         reason = "pixel sizes are well within f32"
     )]
-    fn render_surface(&mut self, id: SurfaceId, stats: &mut FrameStats) -> Result<(), RenderError> {
+    fn lower_surface(
+        &mut self,
+        id: SurfaceId,
+        stats: &mut FrameStats,
+        inst_base: u32,
+        stop_base: u32,
+        globals_base: u32,
+    ) -> Result<(), RenderError> {
         // Lowering needs `surf.layers` and `surf.frame` plus `atlas`,
         // `fonts`, `device` and `queue`; take the layer map out of the
         // surface so the borrows stay disjoint.
@@ -1062,7 +1095,7 @@ impl Renderer {
             let passes = self.surfaces.get(&id).map_or(0, |s| {
                 u32::try_from(s.frame.passes.len()).unwrap_or(u32::MAX)
             });
-            self.ensure_query_capacity(2 + 2 * (self.frame_pass_count + passes));
+            self.ensure_query_capacity(2 + 2 * (globals_base + passes));
         }
         // Scratch textures for the frame's deepest isolation level.
         let Some(surf) = self.surfaces.get_mut(&id) else {
@@ -1164,9 +1197,22 @@ impl Renderer {
                 height: nh,
             });
         }
+        // Gradient instances index stops absolutely; shift each instance's
+        // first-stop index by this surface's stop base. Only gradient
+        // paints read `meta.z`, so bumping it unconditionally is safe.
+        if stop_base != 0 {
+            for inst in &mut surf.frame.instances {
+                inst.meta[2] += stop_base;
+            }
+        }
+        surf.inst_base = inst_base;
+        surf.globals_base = globals_base;
         let inst_bytes = bytemuck::cast_slice::<instance::Instance, u8>(&surf.frame.instances);
-        if !inst_bytes.is_empty() && inst_bytes.len() as u64 > self.instances.size() {
-            let size = (inst_bytes.len() as u64).next_power_of_two();
+        let inst_end = u64::from(inst_base)
+            * u64::try_from(std::mem::size_of::<instance::Instance>()).unwrap_or(u64::MAX)
+            + inst_bytes.len() as u64;
+        if !inst_bytes.is_empty() && inst_end > self.instances.size() {
+            let size = inst_end.next_power_of_two();
             self.instances = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("instances"),
                 size,
@@ -1175,11 +1221,18 @@ impl Renderer {
             });
         }
         if !inst_bytes.is_empty() {
-            self.queue.write_buffer(&self.instances, 0, inst_bytes);
+            self.queue.write_buffer(
+                &self.instances,
+                u64::from(inst_base) * std::mem::size_of::<instance::Instance>() as u64,
+                inst_bytes,
+            );
         }
         let stop_bytes = bytemuck::cast_slice::<instance::Stop, u8>(&surf.frame.stops);
-        if !stop_bytes.is_empty() && stop_bytes.len() as u64 > self.stops.size() {
-            let size = (stop_bytes.len() as u64).next_power_of_two();
+        let stop_end = u64::from(stop_base)
+            * u64::try_from(std::mem::size_of::<instance::Stop>()).unwrap_or(u64::MAX)
+            + stop_bytes.len() as u64;
+        if !stop_bytes.is_empty() && stop_end > self.stops.size() {
+            let size = stop_end.next_power_of_two();
             self.stops = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("stops"),
                 size,
@@ -1188,7 +1241,11 @@ impl Renderer {
             });
         }
         if !stop_bytes.is_empty() {
-            self.queue.write_buffer(&self.stops, 0, stop_bytes);
+            self.queue.write_buffer(
+                &self.stops,
+                u64::from(stop_base) * std::mem::size_of::<instance::Stop>() as u64,
+                stop_bytes,
+            );
         }
         if self.atlas.generation() != self.bound_atlas {
             self.bind0 = make_bind0(
@@ -1201,9 +1258,9 @@ impl Renderer {
             );
             self.bound_atlas = self.atlas.generation();
         }
-        // One Globals entry per pass at a 256-byte stride; grow the
-        // uniform buffer lazily and write each pass's target frame.
-        let needed = (surf.frame.passes.len().max(1) as u64) * 256;
+        // One Globals entry per pass at a 256-byte stride, continuing the
+        // frame-wide slot sequence across dirty surfaces.
+        let needed = (u64::from(globals_base) + surf.frame.passes.len().max(1) as u64) * 256;
         if needed > self.globals.size() {
             let size = needed.next_power_of_two();
             self.globals = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -1218,8 +1275,11 @@ impl Renderer {
                 [pass.region[2] as f32, pass.region[3] as f32],
                 [pass.region[0] as f32, pass.region[1] as f32],
             );
-            self.queue
-                .write_buffer(&self.globals, (i as u64) * 256, bytemuck::bytes_of(&g));
+            self.queue.write_buffer(
+                &self.globals,
+                (u64::from(globals_base) + i as u64) * 256,
+                bytemuck::bytes_of(&g),
+            );
         }
         // Buffers grown above leave `bind0` stale; rebuild when capacity
         // changed since the bind group was built.
@@ -1241,6 +1301,39 @@ impl Renderer {
             self.bound_globals_size = self.globals.size();
         }
 
+        Ok(())
+    }
+
+    /// Encodes and submits one surface's passes.
+    #[expect(
+        clippy::too_many_lines,
+        clippy::cast_precision_loss,
+        reason = "pixel sizes are well within f32"
+    )]
+    fn encode_surface(&mut self, id: SurfaceId, stats: &mut FrameStats) {
+        let Some(surf) = self.surfaces.get_mut(&id) else {
+            return;
+        };
+        // Buffers grown during lowering leave `bind0` stale; rebuild when
+        // capacity changed since the bind group was built.
+        if self.instances.size() > self.bound_instance_size
+            || self.stops.size() > self.bound_stop_size
+            || self.globals.size() > self.bound_globals_size
+        {
+            self.bind0 = make_bind0(
+                &self.device,
+                &self.layout0,
+                &self.globals,
+                &self.instances,
+                &self.stops,
+                &self.atlas,
+            );
+            self.bound_atlas = self.atlas.generation();
+            self.bound_instance_size = self.instances.size();
+            self.bound_stop_size = self.stops.size();
+            self.bound_globals_size = self.globals.size();
+        }
+        let inst_base = surf.inst_base;
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1251,7 +1344,7 @@ impl Renderer {
         // borrows stay immutable inside the encoder loop.
         let mut range_binds: HashMap<(Option<usize>, bool, Option<u64>), wgpu::BindGroup> =
             HashMap::new();
-        for (i, pass) in surf.frame.passes.iter().enumerate() {
+        for pass in &surf.frame.passes {
             let (view, texture) = match pass.target {
                 Target::Surface => (&surf.view, &surf.target),
                 Target::Scratch(i) => (&surf.scratch[i].view, &surf.scratch[i].texture),
@@ -1353,8 +1446,7 @@ impl Renderer {
             }
             // The uniform slot written for this pass above (256-byte
             // stride), which matches `surf.frame.passes` ordering.
-            #[expect(clippy::cast_possible_truncation)]
-            let offset = (i * 256) as u32;
+            let offset = pass_index * 256;
             render_pass.set_bind_group(0, &self.bind0, &[offset]);
             let mut pipeline = PipelineKind::SrcOver;
             for range in &pass.ranges {
@@ -1391,14 +1483,16 @@ impl Renderer {
                     }
                 };
                 render_pass.set_bind_group(1, bind, &[]);
-                render_pass.draw(0..6, range.instances.clone());
+                render_pass.draw(
+                    0..6,
+                    (inst_base + range.instances.start)..(inst_base + range.instances.end),
+                );
             }
         }
         self.queue.submit([encoder.finish()]);
         stats.passes += u32::try_from(surf.frame.passes.len()).unwrap_or(u32::MAX);
         stats.instances += u32::try_from(surf.frame.instances.len()).unwrap_or(u32::MAX);
         surf.dirty = false;
-        Ok(())
     }
 
     /// Blocks until the queue is drained.

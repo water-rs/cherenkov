@@ -196,6 +196,38 @@ fn device_grad(m: array<vec4<f32>, 2>, g: vec2<f32>) -> f32 {
 // differences. Derivative builtins are not used: they are unreliable in the
 // helper lanes along the quad's triangle seam.
 fn sdf_grad(s: Shape, p: vec2<f32>) -> vec2<f32> {
+    // Closed form for sharp and circular/elliptical corners: the unit
+    // gradient of the box distance, mirrored back out of the abs() fold.
+    if abs(s.exponent - 2.0) < 1e-4 || !(s.radii.x > 0.0 || s.radii.y > 0.0 || s.radii.z > 0.0 || s.radii.w > 0.0) {
+        let sgn = select(vec2<f32>(-1.0), vec2<f32>(1.0), p >= vec2<f32>(0.0));
+        let right = p.x > 0.0;
+        let bottom = p.y > 0.0;
+        let r = select(
+            select(s.radii.x, s.radii.w, bottom),
+            select(s.radii.y, s.radii.z, bottom),
+            right,
+        );
+        let rx = max(r, 0.0);
+        let ry = rx * s.aspect;
+        let a = abs(p) - s.half;
+        var g: vec2<f32>;
+        if rx <= 0.0 || ry <= 0.0 {
+            if a.x > 0.0 && a.y > 0.0 {
+                g = a / length(a);
+            } else {
+                g = select(vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), a.x > a.y);
+            }
+        } else {
+            let q = a + vec2<f32>(rx, ry);
+            if q.x > 0.0 && q.y > 0.0 {
+                let v = q / vec2<f32>(rx * rx, ry * ry);
+                g = v / max(length(v), 1e-12);
+            } else {
+                g = select(vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), a.x > a.y);
+            }
+        }
+        return sgn * g;
+    }
     const E: f32 = 0.05;
     return vec2<f32>(
         sdf(s, p + vec2<f32>(E, 0.0)) - sdf(s, p - vec2<f32>(E, 0.0)),
@@ -243,26 +275,47 @@ fn corner_inset(r: f32, dy: f32) -> f32 {
 // over ±3σ.
 fn shadow(s: Shape, p: vec2<f32>, sigma: f32) -> f32 {
     const N: i32 = 16;
-    let inv_sqrt2_sigma = 1.0 / (sigma * 1.4142135624);
-    let step = 6.0 * sigma / f32(N);
+    let k = 1.0 / (sigma * 1.4142135624);
+    // Rows within ±3σ of p that intersect the box.
+    let lo = max(p.y - 3.0 * sigma, -s.half.y);
+    let hi = min(p.y + 3.0 * sigma, s.half.y);
+    if hi <= lo {
+        return 0.0;
+    }
+    let rmax = max(max(max(s.radii.x, s.radii.y), max(s.radii.z, s.radii.w)), 0.0);
+    // Rows |y| < band have straight sides: the integral is separable.
+    let band = max(s.half.y - rmax, 0.0);
     var acc = 0.0;
-    for (var i = 0; i < N; i++) {
-        let dy = (f32(i) + 0.5) * step - 3.0 * sigma;
-        let y = p.y + dy;
-        if abs(y) > s.half.y {
+    let ya = max(lo, -band);
+    let yb = min(hi, band);
+    if yb > ya {
+        let row = 0.5 * (erf((s.half.x - p.x) * k) - erf((-s.half.x - p.x) * k));
+        acc += row * 0.5 * (erf((yb - p.y) * k) - erf((ya - p.y) * k));
+    }
+    // Corner bands: midpoint rule over the rows still inside ±3σ.
+    for (var side = 0; side < 2; side++) {
+        let ca = select(band, lo, side == 0);
+        let cb = select(hi, -band, side == 0);
+        let a = max(ca, lo);
+        let b = min(cb, hi);
+        if b <= a {
             continue;
         }
-        let top = y < 0.0;
-        let rl = select(s.radii.w, s.radii.x, top);
-        let rr = select(s.radii.z, s.radii.y, top);
-        let ay = abs(y);
-        let xl = -s.half.x + corner_inset(rl, ay - (s.half.y - rl));
-        let xr = s.half.x - corner_inset(rr, ay - (s.half.y - rr));
-        if xr <= xl {
-            continue;
+        let step = (b - a) / f32(N);
+        for (var i = 0; i < N; i++) {
+            let y = a + (f32(i) + 0.5) * step;
+            let top = y < 0.0;
+            let rl = select(s.radii.w, s.radii.x, top);
+            let rr = select(s.radii.z, s.radii.y, top);
+            let ay = abs(y);
+            let xl = -s.half.x + corner_inset(rl, ay - (s.half.y - rl));
+            let xr = s.half.x - corner_inset(rr, ay - (s.half.y - rr));
+            if xr <= xl {
+                continue;
+            }
+            let row = 0.5 * (erf((xr - p.x) * k) - erf((xl - p.x) * k));
+            acc += row * gaussian(y - p.y, sigma) * step;
         }
-        let row = 0.5 * (erf((xr - p.x) * inv_sqrt2_sigma) - erf((xl - p.x) * inv_sqrt2_sigma));
-        acc += row * gaussian(dy, sigma) * step;
     }
     return clamp(acc, 0.0, 1.0);
 }

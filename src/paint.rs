@@ -333,6 +333,20 @@ impl From<MeshGradient> for Paint {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ImageId(u64);
 
+impl ImageId {
+    /// Creates an identifier from a backend-assigned raw value.
+    #[must_use]
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// The raw value.
+    #[must_use]
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
 /// How an image is sampled.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Sampling {
@@ -367,6 +381,20 @@ impl From<ImagePattern> for Paint {
 /// A user shader registered with the engine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ShaderId(u64);
+
+impl ShaderId {
+    /// Creates an identifier from a backend-assigned raw value.
+    #[must_use]
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// The raw value.
+    #[must_use]
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
 
 /// A user shader used as a paint, with its uniform values.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

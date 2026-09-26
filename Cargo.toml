@@ -29,6 +29,7 @@ members = [
     "scene",
     "oracle",
     "bench",
+    "vello",
 ]
 
 [workspace.package]

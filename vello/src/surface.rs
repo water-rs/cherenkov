@@ -594,10 +594,7 @@ mod tests {
         let layer = surface.layer();
         surface.update(|tx| {
             tx[&layer].content(surface.record(|c| {
-                c.fill(
-                    Rect::new(0., 0., 4., 4.),
-                    WorkingColor::WHITE,
-                );
+                c.fill(Rect::new(0., 0., 4., 4.), WorkingColor::WHITE);
             }));
         });
         let id = layer.id;

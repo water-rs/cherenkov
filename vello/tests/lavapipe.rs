@@ -672,7 +672,10 @@ fn animated_content_requests_every_frame() {
         assert!(matches!(next, Next::At { .. }), "frame {frame}: {next:?}");
     }
     let rendered = renders.load(std::sync::atomic::Ordering::Relaxed);
-    assert!(rendered >= 3, "content rendered {rendered} times in 3 frames");
+    assert!(
+        rendered >= 3,
+        "content rendered {rendered} times in 3 frames"
+    );
 }
 
 /// An oversized surface must fail fast with `TooLarge` and leave the
@@ -683,10 +686,7 @@ fn oversized_surface_fails_fast_and_the_engine_survives() {
     let Some(engine) = engine() else { return };
     let err = engine.surface(Offscreen::new((u32::MAX, u32::MAX))).err();
     assert!(
-        matches!(
-            err,
-            Some(cherenkov_vello::SurfaceError::TooLarge { .. })
-        ),
+        matches!(err, Some(cherenkov_vello::SurfaceError::TooLarge { .. })),
         "expected TooLarge, got {err:?}"
     );
     // The render thread is still alive and healthy surfaces still render.
@@ -699,7 +699,146 @@ fn oversized_surface_fails_fast_and_the_engine_survives() {
     let readback = ok.readback().expect("readback");
     assert_pixel(
         px(&readback, 0, 0),
-        expected_pixel([0., 0., 0., 0.], WorkingColor::BLACK.components.map(f64::from)),
+        expected_pixel(
+            [0., 0., 0., 0.],
+            WorkingColor::BLACK.components.map(f64::from),
+        ),
         "black clear",
     );
+}
+
+/// A real X window destroyed mid-flight: the next `render` hits
+/// `CurrentSurfaceTexture::Lost`, skips the present, and must report
+/// `Next::At` so the host retries — not `Idle`, which would leave the
+/// stale frame up until an unrelated change arrived. And a dead window
+/// must not panic the render thread.
+#[cfg(target_os = "linux")]
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "a real X window lifecycle cannot be shortened without losing the scenario"
+)]
+fn skipped_window_present_retries_next_frame() {
+    use raw_window_handle::{RawDisplayHandle, RawWindowHandle, XcbDisplayHandle, XcbWindowHandle};
+    use x11rb::COPY_DEPTH_FROM_PARENT;
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{ConnectionExt as _, CreateWindowAux, WindowClass};
+    use x11rb::xcb_ffi::XCBConnection;
+
+    let Ok((conn, screen_num)) = XCBConnection::connect(None) else {
+        eprintln!("no X display, skipping");
+        return;
+    };
+    let screen = &conn.setup().roots[screen_num];
+    let window = conn.generate_id().expect("window id");
+    conn.create_window(
+        COPY_DEPTH_FROM_PARENT,
+        window,
+        screen.root,
+        0,
+        0,
+        64,
+        64,
+        0,
+        WindowClass::INPUT_OUTPUT,
+        screen.root_visual,
+        &CreateWindowAux::new(),
+    )
+    .expect("create_window");
+    conn.map_window(window).expect("map");
+    conn.flush().expect("flush");
+
+    let raw_display = RawDisplayHandle::Xcb(XcbDisplayHandle::new(
+        std::ptr::NonNull::new(conn.get_raw_xcb_connection()),
+        i32::try_from(screen_num).expect("screen number fits in i32"),
+    ));
+    let raw_window = RawWindowHandle::Xcb(XcbWindowHandle::new(
+        std::num::NonZero::new(window).expect("window id"),
+    ));
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let Ok(surface) = (unsafe {
+        instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+            raw_display_handle: Some(raw_display),
+            raw_window_handle: raw_window,
+        })
+    }) else {
+        eprintln!("no surface support, skipping");
+        return;
+    };
+    let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        compatible_surface: Some(&surface),
+        ..wgpu::RequestAdapterOptions::default()
+    })) else {
+        eprintln!("no adapter, skipping");
+        return;
+    };
+    let Ok((device, queue)) =
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+    else {
+        eprintln!("no device, skipping");
+        return;
+    };
+    let caps = surface.get_capabilities(&adapter);
+    let Some(&format) = caps.formats.first() else {
+        eprintln!("no surface formats, skipping");
+        return;
+    };
+    let Some(&alpha_mode) = caps.alpha_modes.first() else {
+        eprintln!("no alpha modes, skipping");
+        return;
+    };
+    let engine = Engine::<Vello>::with_device(
+        VelloConfig::default(),
+        cherenkov_vello::interop::wgpu::DeviceSource::new(adapter, device, queue),
+    )
+    .expect("engine");
+    let surface = engine
+        .surface(cherenkov_vello::interop::wgpu::Window {
+            surface,
+            config: wgpu::SurfaceConfiguration {
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                format,
+                width: 64,
+                height: 64,
+                present_mode: wgpu::PresentMode::Fifo,
+                desired_maximum_frame_latency: 1,
+                alpha_mode,
+                view_formats: vec![],
+            },
+        })
+        .expect("window surface");
+    surface.clear_color(WorkingColor::BLACK);
+    let _ = engine
+        .render(cherenkov_vello::FrameTime::now())
+        .expect("first render");
+
+    // Destroying the window makes the next acquire report `Lost` — a
+    // skipped present.
+    conn.destroy_window(window).expect("destroy_window");
+    conn.flush().expect("flush");
+    // Round-trip so the server has processed the destruction before the
+    // render thread acquires.
+    let _ = conn.get_input_focus().expect("cookie").reply();
+    surface.clear_color(WorkingColor::WHITE);
+    let next = engine
+        .render(cherenkov_vello::FrameTime::now())
+        .expect("second render");
+    assert!(
+        matches!(next, Next::At { .. }),
+        "skipped present must retry next frame, got {next:?}"
+    );
+    // The retry keeps asking until the embedder destroys the surface.
+    surface.clear_color(WorkingColor::BLACK);
+    let next = engine
+        .render(cherenkov_vello::FrameTime::now())
+        .expect("retry render");
+    assert!(
+        matches!(next, Next::At { .. }),
+        "a dead window must keep retrying, got {next:?}"
+    );
+    drop(surface);
+    let next = engine
+        .render(cherenkov_vello::FrameTime::now())
+        .expect("render after destroy");
+    assert_eq!(next, Next::Idle);
 }

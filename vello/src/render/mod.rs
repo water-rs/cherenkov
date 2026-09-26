@@ -21,7 +21,7 @@ use vello::{AaConfig, AaSupport, RendererOptions};
 
 use crate::error::{EngineError, RenderError, SurfaceError};
 use crate::message::{ChangeSet, LayerId, LayerOp, Message, SurfaceId, TargetSpec};
-use crate::surface::{FrameStats, Next, Readback};
+use crate::surface::{FrameStats, Next, Readback, RefreshRange};
 use crate::{Bytes, interop};
 use crate::{GpuInfo, MemoryUsage, Pressure, VelloConfig};
 
@@ -113,6 +113,17 @@ enum TargetState {
     },
 }
 
+/// Widens the frame's requested next-tick range to cover `rate`: the
+/// envelope over every surface asking for another frame.
+fn merge_rate(next_rate: &mut Option<RefreshRange>, rate: &RefreshRange) {
+    match next_rate {
+        Some(range) => {
+            *range = (*range.start()).min(*rate.start())..=(*range.end()).max(*rate.end());
+        }
+        None => *next_rate = Some(rate.clone()),
+    }
+}
+
 impl TargetState {
     /// The view vello renders into.
     const fn view(&self) -> &wgpu::TextureView {
@@ -142,6 +153,10 @@ struct SurfaceState {
     /// scan re-dirties the surface so the animation survives to the next
     /// frame; a compose that finds nothing animating clears it.
     wants_next: bool,
+    /// The refresh-rate range the surface's display reports, in hertz.
+    /// Window targets take it from the platform's display information via
+    /// the embedder; offscreen targets use the caller-configured range.
+    rate: RefreshRange,
 }
 
 impl SurfaceState {
@@ -427,9 +442,12 @@ impl Renderer {
         // panic on out-of-limit dimensions, which would kill the render
         // thread and turn one bad size into `SurfaceError::Lost` for the
         // whole engine.
-        let size = match &target {
-            TargetSpec::Offscreen { size } => *size,
-            TargetSpec::Window(window) => (window.config.width, window.config.height),
+        let (size, rate) = match &target {
+            TargetSpec::Offscreen { size, rate } => (*size, rate.clone()),
+            TargetSpec::Window(window) => (
+                (window.config.width, window.config.height),
+                window.rate.clone(),
+            ),
         };
         if size.0 > self.max_texture || size.1 > self.max_texture {
             return Err(SurfaceError::TooLarge {
@@ -439,13 +457,15 @@ impl Renderer {
             });
         }
         let (target, readable) = match target {
-            TargetSpec::Offscreen { size } => {
+            TargetSpec::Offscreen { size, .. } => {
                 let (texture, view) =
                     create_target(&self.device, "surface target", size, TARGET_USAGES);
                 (TargetState::Offscreen { texture, view }, true)
             }
             TargetSpec::Window(window) => {
-                let interop::wgpu::Window { surface, config } = *window;
+                let interop::wgpu::Window {
+                    surface, config, ..
+                } = *window;
                 surface.configure(&self.device, &config);
                 self.blitters.entry(config.format).or_insert_with(|| {
                     wgpu::util::TextureBlitter::new(&self.device, config.format)
@@ -475,6 +495,7 @@ impl Renderer {
                 clear: cherenkov::WorkingColor::TRANSPARENT,
                 dirty: true,
                 wants_next: false,
+                rate,
             },
         );
         Ok(())
@@ -1120,10 +1141,11 @@ impl Renderer {
 
     /// Marks surfaces dirty for pending `GpuContent`/`Filter` redraw
     /// requests and for surfaces whose last frame asked for another
-    /// (animated shaders, redraw-hinting filters, looping `GpuContent`).
-    /// Returns whether a redraw is pending.
-    fn scan_redraw_requests(&mut self) -> bool {
-        let mut pending = false;
+    /// (animated shaders, redraw-hinting filters, looping `GpuContent`),
+    /// and widens `next_rate` over every surface a request dirty-marks.
+    /// A surface re-dirtied by its carried `wants_next` does not merge —
+    /// this frame's compose decides whether it is still animating.
+    fn scan_redraw_requests(&mut self, next_rate: &mut Option<RefreshRange>) {
         for surface in self.surfaces.values_mut() {
             if surface.wants_next {
                 surface.dirty = true;
@@ -1133,24 +1155,24 @@ impl Renderer {
                     && slot.dirty.load(std::sync::atomic::Ordering::Relaxed)
                 {
                     surface.dirty = true;
-                    pending = true;
+                    merge_rate(next_rate, &surface.rate);
                 }
             }
         }
         if self.filters.take_redraw_requests() {
             for surface in self.surfaces.values_mut() {
                 surface.dirty = true;
+                merge_rate(next_rate, &surface.rate);
             }
-            pending = true;
         }
-        pending
     }
 
     /// Lowers and submits every dirty surface, bracketed by drained
     /// timestamp queries when enabled.
     fn render_frame(&mut self, time: crate::FrameTime) -> Result<(Next, FrameStats), RenderError> {
         let mut stats = FrameStats::default();
-        let mut wants_next = self.scan_redraw_requests();
+        let mut next_rate: Option<RefreshRange> = None;
+        self.scan_redraw_requests(&mut next_rate);
         let mut dirty: Vec<SurfaceId> = self
             .surfaces
             .iter()
@@ -1159,20 +1181,14 @@ impl Renderer {
             .collect();
         dirty.sort_unstable();
         if dirty.is_empty() {
-            return Ok((
-                if wants_next {
-                    Self::next_frame(time)
-                } else {
-                    Next::Idle
-                },
-                stats,
-            ));
+            let next = next_rate.map_or(Next::Idle, |rate| Self::next_frame(time, rate));
+            return Ok((next, stats));
         }
         let now = Instant::now();
         self.drain_and_stamp(0)?;
         let mut result = Ok(());
         for id in dirty {
-            result = self.render_surface(id, &mut stats, &mut wants_next, now);
+            result = self.render_surface(id, &mut stats, &mut next_rate, now);
             if result.is_err() {
                 break;
             }
@@ -1183,21 +1199,16 @@ impl Renderer {
         }
         self.wait()?;
         result?;
-        Ok((
-            if wants_next {
-                Self::next_frame(time)
-            } else {
-                Next::Idle
-            },
-            stats,
-        ))
+        let next = next_rate.map_or(Next::Idle, |rate| Self::next_frame(time, rate));
+        Ok((next, stats))
     }
 
-    /// The refresh request for an animating frame: one tick at 60 Hz.
-    fn next_frame(time: crate::FrameTime) -> Next {
+    /// The refresh request for an animating frame: one tick at the
+    /// fastest refresh rate the contributing surfaces' displays support.
+    fn next_frame(time: crate::FrameTime, rate: RefreshRange) -> Next {
         Next::At {
-            time: time.0 + Duration::from_secs_f64(1.0 / 60.0),
-            rate: 60..=60,
+            time: time.0 + Duration::from_secs_f64(1.0 / f64::from(*rate.end().max(&1))),
+            rate,
         }
     }
 
@@ -1207,13 +1218,13 @@ impl Renderer {
         &mut self,
         id: SurfaceId,
         stats: &mut FrameStats,
-        wants_next: &mut bool,
+        next_rate: &mut Option<RefreshRange>,
         now: Instant,
     ) -> Result<(), RenderError> {
         let Some(mut surf) = self.surfaces.remove(&id) else {
             return Ok(());
         };
-        let result = self.render_surface_inner(&mut surf, stats, wants_next, now);
+        let result = self.render_surface_inner(&mut surf, stats, next_rate, now);
         self.surfaces.insert(id, surf);
         result
     }
@@ -1224,7 +1235,7 @@ impl Renderer {
         &mut self,
         surf: &mut SurfaceState,
         stats: &mut FrameStats,
-        wants_next: &mut bool,
+        next_rate: &mut Option<RefreshRange>,
         now: Instant,
     ) -> Result<(), RenderError> {
         let mut scene = vello::Scene::new();
@@ -1267,7 +1278,9 @@ impl Renderer {
             .map_err(|e| RenderError::Render(format!("vello render: {e}")))?;
         stats.passes += 1;
         surf.wants_next = surface_next;
-        *wants_next |= surface_next;
+        if surface_next {
+            merge_rate(next_rate, &surf.rate);
+        }
         if let TargetState::Window {
             surface, config, ..
         } = &surf.target
@@ -1287,14 +1300,14 @@ impl Renderer {
                         surface.configure(&self.device, config);
                     }));
                     surf.wants_next = true;
-                    *wants_next = true;
+                    merge_rate(next_rate, &surf.rate);
                     return Ok(());
                 }
                 Current::Timeout | Current::Occluded => {
                     // Skip presenting this frame; the surface stays dirty
                     // and asks for a retry next frame.
                     surf.wants_next = true;
-                    *wants_next = true;
+                    merge_rate(next_rate, &surf.rate);
                     return Ok(());
                 }
                 Current::Validation => {
@@ -1568,7 +1581,13 @@ mod tests {
     /// once, and returns the image identity the slot bound.
     fn bound_gpu_image(renderer: &mut Renderer) -> peniko::ImageData {
         renderer
-            .create_surface(1, TargetSpec::Offscreen { size: (32, 32) })
+            .create_surface(
+                1,
+                TargetSpec::Offscreen {
+                    size: (32, 32),
+                    rate: 60..=60,
+                },
+            )
             .expect("surface");
         renderer.commit(
             1,
@@ -1607,7 +1626,13 @@ mod tests {
             return;
         };
         renderer
-            .create_surface(1, TargetSpec::Offscreen { size: (32, 32) })
+            .create_surface(
+                1,
+                TargetSpec::Offscreen {
+                    size: (32, 32),
+                    rate: 60..=60,
+                },
+            )
             .expect("surface");
         renderer
             .shaders
@@ -1688,7 +1713,13 @@ mod tests {
             return;
         };
         renderer
-            .create_surface(1, TargetSpec::Offscreen { size: (32, 32) })
+            .create_surface(
+                1,
+                TargetSpec::Offscreen {
+                    size: (32, 32),
+                    rate: 60..=60,
+                },
+            )
             .expect("surface");
         let bytes: Arc<[u8]> = Arc::from(&[255u8, 255, 255, 255][..]);
         renderer.images.insert(

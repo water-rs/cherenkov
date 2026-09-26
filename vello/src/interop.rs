@@ -54,6 +54,13 @@ pub mod wgpu {
         pub surface: Surface<'static>,
         /// The configuration the engine applies.
         pub config: SurfaceConfiguration,
+        /// The refresh-rate range of the window's display, in hertz.
+        ///
+        /// wgpu exposes no display refresh rate, so the embedder fills
+        /// this in from the platform (e.g. the monitor's refresh rate
+        /// from the windowing toolkit) for [`crate::Next::At`] to report
+        /// the display's real cadence.
+        pub rate: crate::RefreshRange,
     }
 
     impl std::fmt::Debug for Window {

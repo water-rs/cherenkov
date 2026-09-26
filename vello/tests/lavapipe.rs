@@ -805,6 +805,7 @@ fn skipped_window_present_retries_next_frame() {
                 alpha_mode,
                 view_formats: vec![],
             },
+            rate: 30..=120,
         })
         .expect("window surface");
     surface.clear_color(WorkingColor::BLACK);
@@ -823,22 +824,69 @@ fn skipped_window_present_retries_next_frame() {
     let next = engine
         .render(cherenkov_vello::FrameTime::now())
         .expect("second render");
-    assert!(
-        matches!(next, Next::At { .. }),
-        "skipped present must retry next frame, got {next:?}"
-    );
+    match next {
+        Next::At { rate, .. } => assert_eq!(rate, 30..=120),
+        other @ Next::Idle => panic!("skipped present must retry next frame, got {other:?}"),
+    }
     // The retry keeps asking until the embedder destroys the surface.
     surface.clear_color(WorkingColor::BLACK);
     let next = engine
         .render(cherenkov_vello::FrameTime::now())
         .expect("retry render");
-    assert!(
-        matches!(next, Next::At { .. }),
-        "a dead window must keep retrying, got {next:?}"
-    );
+    match next {
+        Next::At { rate, .. } => assert_eq!(rate, 30..=120),
+        other @ Next::Idle => panic!("a dead window must keep retrying, got {other:?}"),
+    }
     drop(surface);
     let next = engine
         .render(cherenkov_vello::FrameTime::now())
         .expect("render after destroy");
     assert_eq!(next, Next::Idle);
+}
+
+/// `Next::At` must report the refresh range the surface's display
+/// supports — the caller-configured range for an offscreen target —
+/// and a deadline at the fastest end of it, not a hard-coded 60 Hz.
+#[test]
+fn next_at_reports_the_configured_refresh_range() {
+    let Some(engine) = engine() else { return };
+    let surface = engine
+        .surface(Offscreen::new((8, 8)).rate(30..=144))
+        .expect("surface");
+    let animated = engine
+        .shader(
+            cherenkov_vello::ShaderSource::wgsl(
+                "@fragment fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> { return vec4<f32>(uv, 0.0, 1.0); }",
+            )
+            .animated(),
+        )
+        .expect("animated shader");
+    let layer = surface.layer();
+    surface.update(|tx| {
+        tx[&layer].content(surface.record(|c| {
+            c.fill(
+                Rect::new(0., 0., 8., 8.),
+                cherenkov::ShaderPaint {
+                    shader: animated.id(),
+                    uniforms: vec![],
+                },
+            );
+        }));
+        tx[surface.root()].push(&layer);
+    });
+    let t0 = std::time::Instant::now();
+    let next = engine
+        .render(cherenkov_vello::FrameTime::at(t0))
+        .expect("render");
+    match next {
+        Next::At { time, rate } => {
+            assert_eq!(rate, 30..=144);
+            assert_eq!(
+                time,
+                t0 + std::time::Duration::from_secs_f64(1.0 / 144.0),
+                "deadline must be one tick at the fastest supported rate"
+            );
+        }
+        other @ Next::Idle => panic!("expected At, got {other:?}"),
+    }
 }

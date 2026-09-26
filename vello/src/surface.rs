@@ -85,10 +85,13 @@ impl From<crate::GpuContentHandle> for LayerContent {
 }
 
 /// An offscreen render target description.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Offscreen {
     /// The target size in pixels.
     pub size: (u32, u32),
+    /// The refresh-rate range [`Next::At`] reports for this surface, in
+    /// hertz. Defaults to `60..=60`; set [`Self::rate`].
+    pub rate: RefreshRange,
 }
 
 impl Offscreen {
@@ -97,7 +100,27 @@ impl Offscreen {
     /// The target is `Rgba8Unorm`: premultiplied sRGB-encoded sRGB.
     #[must_use]
     pub const fn new(size: (u32, u32)) -> Self {
-        Self { size }
+        Self {
+            size,
+            rate: 60..=60,
+        }
+    }
+
+    /// Sets the refresh-rate range this surface's [`Next::At`] reports.
+    ///
+    /// An offscreen target has no display to read a rate from, so the
+    /// caller configures the range the host's frame scheduling supports.
+    ///
+    /// # Panics
+    /// Panics on an empty range or a maximum of 0 Hz.
+    #[must_use]
+    pub fn rate(mut self, rate: RefreshRange) -> Self {
+        assert!(
+            !rate.is_empty() && *rate.end() > 0,
+            "an offscreen refresh range must be non-empty and positive"
+        );
+        self.rate = rate;
+        self
     }
 }
 
@@ -110,6 +133,7 @@ impl From<Offscreen> for Target {
     fn from(offscreen: Offscreen) -> Self {
         Self(TargetSpec::Offscreen {
             size: offscreen.size,
+            rate: offscreen.rate,
         })
     }
 }
@@ -397,7 +421,7 @@ impl Surface {
             remove_on_drop: false,
         };
         let (size, readable) = match &target.0 {
-            TargetSpec::Offscreen { size } => (*size, true),
+            TargetSpec::Offscreen { size, .. } => (*size, true),
             TargetSpec::Window(window) => ((window.config.width, window.config.height), false),
         };
         let (reply, rx) = std::sync::mpsc::channel();

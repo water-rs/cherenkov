@@ -6,15 +6,14 @@
 
 use cherenkov::kurbo::{BezPath, Rect};
 use cherenkov::{Draw, WorkingColor};
-use cherenkov_gpu::{
-    Engine, EngineError, Gpu, GpuConfig, Next, Offscreen, OffscreenFormat, RenderError, Unsupported,
-};
+use cherenkov::{Engine, EngineError, Next, Offscreen, OffscreenFormat, RenderError};
+use cherenkov_gpu::{Gpu, GpuConfig};
 
 /// An engine, or `None` when no adapter exists.
 fn engine() -> Option<Engine<Gpu>> {
     match Engine::new(GpuConfig::default()) {
         Ok(engine) => Some(engine),
-        Err(EngineError::NoAdapter) => None,
+        Err(EngineError::Backend(_)) => None,
         Err(e) => panic!("engine init failed: {e}"),
     }
 }
@@ -34,7 +33,7 @@ fn a_red_rect_renders_and_reads_back() -> Result<(), Box<dyn std::error::Error>>
             );
         }));
     });
-    let next = engine.render(cherenkov_gpu::FrameTime::now())?;
+    let next = engine.render(cherenkov::FrameTime::now())?;
     assert_eq!(next, Next::Idle);
     let readback = surface.readback()?;
     let px = |x: u32, y: u32| readback.pixels[(y * readback.width + x) as usize];
@@ -62,7 +61,7 @@ fn a_path_fill_renders() -> Result<(), Box<dyn std::error::Error>> {
             c.fill(path, WorkingColor::new([1., 0., 0., 1.]));
         }));
     });
-    engine.render(cherenkov_gpu::FrameTime::now())?;
+    engine.render(cherenkov::FrameTime::now())?;
     let readback = surface.readback()?;
     let [r, ..] = readback.pixels[(30 * readback.width + 30) as usize];
     assert!(r > 0.5, "interior pixel: {r}");
@@ -87,9 +86,9 @@ fn a_path_shadow_reports_unsupported() -> Result<(), Box<dyn std::error::Error>>
             );
         }));
     });
-    let result = engine.render(cherenkov_gpu::FrameTime::now());
+    let result = engine.render(cherenkov::FrameTime::now());
     assert!(
-        matches!(result, Err(RenderError::Unsupported(Unsupported::Path))),
+        matches!(result, Err(RenderError::Unsupported("path"))),
         "expected Unsupported(Path), got {result:?}"
     );
     Ok(())

@@ -30,7 +30,9 @@ use cherenkov::{
     WorkingColor,
 };
 
-use crate::error::{RenderError, Unsupported};
+use cherenkov::RenderError;
+
+use crate::names;
 use crate::render::glyph::FontData;
 
 /// A canvas-covering rect in font space: `fill` brushes cover whatever clips
@@ -88,7 +90,7 @@ enum Node {
 
 /// The skrifa composite mode → the front-end blend mode, exactly the set the
 /// oracle maps; anything else rejects the glyph.
-fn composite_to_blend(mode: skrifa::color::CompositeMode) -> Result<BlendMode, RenderError> {
+const fn composite_to_blend(mode: skrifa::color::CompositeMode) -> Result<BlendMode, RenderError> {
     use skrifa::color::CompositeMode as Cm;
     Ok(match mode {
         Cm::Clear => BlendMode::Clear,
@@ -120,7 +122,7 @@ fn composite_to_blend(mode: skrifa::color::CompositeMode) -> Result<BlendMode, R
         Cm::HslSaturation => BlendMode::Saturation,
         Cm::HslColor => BlendMode::Color,
         Cm::HslLuminosity => BlendMode::Luminosity,
-        _ => return Err(Unsupported::ColorFont.into()),
+        _ => return Err(RenderError::Unsupported(names::COLOR_FONT)),
     })
 }
 
@@ -478,7 +480,7 @@ pub fn glyph_picture(
     let color_glyph = font_ref
         .color_glyphs()
         .get(gid)
-        .ok_or(Unsupported::ColorFont)?;
+        .ok_or(RenderError::Unsupported(names::COLOR_FONT))?;
     let palette: Vec<skrifa::color::Color> = font_ref
         .color_palettes()
         .get(0)

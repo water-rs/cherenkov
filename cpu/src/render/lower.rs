@@ -17,8 +17,9 @@ use skrifa::MetadataProvider as _;
 use skrifa::raw::TableProvider as _;
 
 use crate::error::{RenderError, Unsupported};
+use crate::render::coverage::{Coverage, CoverageCache, Operand};
 use crate::render::paint::{PaintData, paint_data};
-use crate::render::raster::{Edge, coverage_mask};
+use crate::render::raster::Edge;
 
 /// Curve-to-path and stroke tolerance in device pixels.
 pub const FLATTEN_TOL: f64 = 0.02;
@@ -36,56 +37,27 @@ pub struct IRect {
     pub y1: i32,
 }
 
-/// A rasterized clip: an integer rect fast path or a full-surface
-/// coverage mask.
+/// The geometric operands of the active clip intersection.
 #[derive(Debug)]
-pub enum ClipMask {
-    /// Axis-aligned rect with integer edges: coverage is 1 inside, 0
-    /// outside.
-    Rect(IRect),
-    /// Exact-area coverage of a general clip shape, `w * h` cells.
-    Cover(Vec<f32>),
+pub struct ClipGeometry {
+    /// Every clip retains its own fill rule until the intersection resolves.
+    pub operands: Vec<Operand>,
 }
 
 /// A clip shared by items; cheap to clone.
-pub type ClipRef = Arc<ClipMask>;
+pub type ClipRef = Arc<ClipGeometry>;
 
 /// One rasterization item of a lowered frame.
 #[derive(Debug)]
 pub enum Item {
     /// A filled, flattened polygon.
     Draw {
-        /// Directed edges in device space.
-        edges: Arc<[Edge]>,
-        /// Device-space bounding box of the edges.
-        bbox: IRect,
-        /// The fill rule.
-        rule: FillRule,
-        /// Whether the boundary can self-overlap: `Path` fills and all
-        /// strokes deposit through the exact sweep; primitive convex
-        /// fills (rect, rounded rect, circle, ellipse, continuous) use
-        /// the raw deposit, exact for a single convex contour.
-        exact: bool,
+        /// Prepared exact coverage, including every clip in force.
+        coverage: Arc<Coverage>,
+        /// Number of source edges, for frame statistics.
+        edge_count: usize,
         /// The paint evaluator.
         paint: PaintData,
-        /// The clip in force.
-        clip: Option<ClipRef>,
-    },
-    /// A Gaussian-blurred, axis-aligned rounded box.
-    Shadow {
-        /// The device-space axis-aligned rounded box half extents and
-        /// centre, `[cx, cy, hx, hy]`.
-        rbox: [f32; 4],
-        /// Per-corner radii.
-        radii: [f32; 4],
-        /// The effective blur sigma (`sqrt(sigma² + 1/6)`).
-        sigma_eff: f32,
-        /// Premultiplied colour.
-        color: [f32; 4],
-        /// Device-space bounding box.
-        bbox: IRect,
-        /// The clip in force.
-        clip: Option<ClipRef>,
     },
     /// A rasterized glyph mask instance.
     Glyph {
@@ -163,6 +135,8 @@ pub struct Resources<'a> {
     pub images: &'a HashMap<u64, std::sync::Arc<crate::render::CpuImage>>,
     /// Cached COLR glyph pictures by `(font, glyph, coords hash, paint hash)`.
     pub colr_cache: &'a mut HashMap<(u64, u32, u64, u64), cherenkov::Picture>,
+    /// Prepared coverage retained across frames.
+    pub coverage_cache: &'a mut CoverageCache,
 }
 
 /// The lowering walk state for one surface frame.
@@ -312,7 +286,7 @@ fn shape_path(shape: &ShapeData, tol: f64) -> Option<(BezPath, FillRule)> {
 
 /// Flattens `path` (already in device space) into directed edges.
 #[expect(clippy::cast_possible_truncation, reason = "geometry is f32")]
-fn flatten_edges(path: BezPath, tol: f64) -> Vec<Edge> {
+pub(super) fn flatten_edges(path: BezPath, tol: f64) -> Vec<Edge> {
     let mut edges = Vec::new();
     let mut cur = Point::ZERO;
     let mut start = Point::ZERO;
@@ -352,8 +326,6 @@ fn flatten_edges(path: BezPath, tol: f64) -> Vec<Edge> {
         }
     });
     close(&mut edges, cur, start);
-    #[expect(clippy::float_cmp, reason = "horizontal edges carry no area")]
-    edges.retain(|e| e.y0 != e.y1);
     edges
 }
 
@@ -399,22 +371,40 @@ fn device_rect(t: Affine, r: Rect) -> Rect {
     )
 }
 
-/// Whether all four edges of `r` are within `1e-6` of integers.
-fn integer_edges(r: Rect) -> Option<IRect> {
-    let close = |v: f64| (v - v.round()).abs() <= 1e-6;
-    if close(r.x0) && close(r.y0) && close(r.x1) && close(r.y1) {
-        Some(IRect {
-            #[expect(clippy::cast_possible_truncation)]
-            x0: r.x0.round() as i32,
-            #[expect(clippy::cast_possible_truncation)]
-            y0: r.y0.round() as i32,
-            #[expect(clippy::cast_possible_truncation)]
-            x1: r.x1.round() as i32,
-            #[expect(clippy::cast_possible_truncation)]
-            y1: r.y1.round() as i32,
-        })
-    } else {
-        None
+/// Lossless binary key words; no float hashing or quantization.
+#[expect(clippy::cast_possible_truncation, reason = "split the exact f64 bits into two u32 words")]
+fn key_float(key: &mut Vec<u32>, value: f64) {
+    let bits = value.to_bits();
+    key.extend([bits as u32, (bits >> 32) as u32]);
+}
+
+fn key_point(key: &mut Vec<u32>, point: Point) {
+    key_float(key, point.x);
+    key_float(key, point.y);
+}
+
+fn key_path(key: &mut Vec<u32>, path: &BezPath) {
+    key.push(u32::try_from(path.elements().len()).expect("path element count"));
+    for element in path.elements() {
+        match element {
+            PathEl::MoveTo(point) | PathEl::LineTo(point) => {
+                key.push(u32::from(matches!(element, PathEl::LineTo(_))));
+                key_point(key, *point);
+            }
+            PathEl::QuadTo(first, last) => {
+                key.push(2);
+                for point in [first, last] {
+                    key_point(key, *point);
+                }
+            }
+            PathEl::CurveTo(first, second, last) => {
+                key.push(3);
+                for point in [first, second, last] {
+                    key_point(key, *point);
+                }
+            }
+            PathEl::ClosePath => key.push(4),
+        }
     }
 }
 
@@ -449,63 +439,73 @@ impl<'a> Lowering<'a> {
         self.layer_items(root, layers)
     }
 
-    /// The coverage a clip contributes at `(px, py)`.
-    fn clip_cov_at(clip: &ClipMask, px: usize, py: usize, w: usize) -> f32 {
-        match clip {
-            ClipMask::Rect(r) => f32::from(
-                px >= usize::try_from(r.x0).unwrap_or(0)
-                    && px < usize::try_from(r.x1).unwrap_or(0)
-                    && py >= usize::try_from(r.y0).unwrap_or(0)
-                    && py < usize::try_from(r.y1).unwrap_or(0),
-            ),
-            ClipMask::Cover(mask) => mask[py * w + px],
-        }
+    /// Retains geometric operands; nested clipping is an intersection.
+    fn make_clip(&self, shape: &ShapeData) -> Option<ClipRef> {
+        let sm = sigma_max(self.transform).max(1e-12);
+        let (path, rule) = shape_path(shape, FLATTEN_TOL / sm)?;
+        let edges = flatten_edges(self.transform * path, FLATTEN_TOL);
+        let mut operands = self
+            .clip
+            .as_ref()
+            .map_or_else(Vec::new, |clip| clip.operands.clone());
+        operands.push(Operand {
+            edges: edges.into(),
+            rule,
+        });
+        Some(Arc::new(ClipGeometry { operands }))
     }
 
-    /// A clip shape under the current transform becomes a [`ClipRef`],
-    /// combined (coverage product) with the clip already in force.
-    fn make_clip(&self, shape: &ShapeData) -> Option<ClipRef> {
-        // The rect fast path: an axis-aligned rect with integer-ish edges.
-        let new_rect = match shape {
-            ShapeData::Rect(r) if axis_aligned(self.transform) => device_rect(self.transform, *r),
-            _ => Rect::ZERO, // sentinel: not applicable
-        };
-        let new_is_rect = matches!(shape, ShapeData::Rect(_))
-            && axis_aligned(self.transform)
-            && integer_edges(new_rect).is_some();
-        if let Some(current) = &self.clip {
-            if new_is_rect
-                && let ClipMask::Rect(cur) = current.as_ref()
-                && let Some(r) = integer_edges(new_rect)
-            {
-                return Some(Arc::new(ClipMask::Rect(IRect {
-                    x0: cur.x0.max(r.x0),
-                    y0: cur.y0.max(r.y0),
-                    x1: cur.x1.min(r.x1),
-                    y1: cur.y1.min(r.y1),
-                })));
-            }
-        } else if new_is_rect {
-            return integer_edges(new_rect).map(|r| Arc::new(ClipMask::Rect(r)));
+    /// Keys source geometry before stroking or flattening. A cache hit skips
+    /// both operations; exact transform bits prevent fractional reuse.
+    fn prepared(
+        &mut self,
+        path: BezPath,
+        rule: FillRule,
+        stroke: Option<&kurbo::Stroke>,
+        tolerance: f64,
+    ) -> Arc<Coverage> {
+        let mut operands = self
+            .clip
+            .as_ref()
+            .map_or_else(Vec::new, |clip| clip.operands.clone());
+        let mut key = crate::render::coverage::geometry_key(&operands, self.width, self.height);
+        key[0] = if stroke.is_some() { 3 } else { 2 };
+        key.push(u32::from(rule == FillRule::EvenOdd));
+        for coefficient in self.transform.as_coeffs() {
+            key_float(&mut key, coefficient);
         }
-        // General path: rasterize the new clip's coverage over the full
-        // surface, multiplied by the coverage of the clip already in
-        // force (coverage product — the oracle intersects geometry; the
-        // product is the accepted approximation, as on the GPU slice).
-        let (w, h) = (self.width, self.height);
-        let sm = sigma_max(self.transform).max(1e-12);
-        let tol_u = FLATTEN_TOL / sm;
-        let (path, rule) = shape_path(shape, tol_u)?;
-        let edges = flatten_edges(self.transform * path, FLATTEN_TOL);
-        let exact = matches!(shape, ShapeData::Path { .. });
-        let mut mask = coverage_mask(&edges, rule, w, h, exact);
-        if let Some(current) = &self.clip {
-            for (i, m) in mask.iter_mut().enumerate() {
-                let (px, py) = (i % w, i / w);
-                *m *= Self::clip_cov_at(current, px, py, w);
+        key_path(&mut key, &path);
+        if let Some(stroke) = stroke {
+            for value in [stroke.width, stroke.miter_limit, stroke.dash_offset] {
+                key_float(&mut key, value);
+            }
+            key.extend([
+                stroke.join as u32,
+                stroke.start_cap as u32,
+                stroke.end_cap as u32,
+            ]);
+            key.push(u32::try_from(stroke.dash_pattern.len()).expect("dash count"));
+            for &dash in &stroke.dash_pattern {
+                key_float(&mut key, dash);
             }
         }
-        Some(Arc::new(ClipMask::Cover(mask)))
+        self.res.coverage_cache.get_or_insert(key, || {
+            let path = if let Some(stroke) = stroke {
+                kurbo::stroke(path, stroke, &kurbo::StrokeOpts::default(), tolerance)
+            } else {
+                path
+            };
+            let edges = flatten_edges(self.transform * path, FLATTEN_TOL);
+            let bbox = bbox_of(&edges, self.width, self.height);
+            if bbox.x0 >= bbox.x1 || bbox.y0 >= bbox.y1 {
+                return Coverage::default();
+            }
+            operands.push(Operand {
+                edges: edges.into(),
+                rule,
+            });
+            crate::render::coverage::rasterize(&operands, self.width, self.height)
+        })
     }
 
     /// Applies `clip` around `body`: `None` passes through.
@@ -689,22 +689,13 @@ impl<'a> Lowering<'a> {
         let Some((path, rule)) = shape_path(shape, tol_u) else {
             return Ok(());
         };
-        let edges = flatten_edges(self.transform * path, FLATTEN_TOL);
-        if edges.is_empty() {
-            return Ok(());
-        }
         let paint = paint_data(paint, self.transform.inverse(), self.res.images)?;
-        let bbox = bbox_of(&edges, self.width, self.height);
-        if bbox.x0 >= bbox.x1 || bbox.y0 >= bbox.y1 {
-            return Ok(());
-        }
+        let coverage = self.prepared(path, rule, None, tol_u);
+        let edge_count = coverage.edge_count;
         self.items.push(Item::Draw {
-            edges: edges.into(),
-            bbox,
-            rule,
-            exact: matches!(shape, ShapeData::Path { .. }),
+            coverage,
+            edge_count,
             paint,
-            clip: self.clip.clone(),
         });
         Ok(())
     }
@@ -733,21 +724,13 @@ impl<'a> Lowering<'a> {
                 path
             }
         };
-        let outline = kurbo::stroke(path, stroke, &kurbo::StrokeOpts::default(), tol_u);
-        let edges = flatten_edges(self.transform * outline, FLATTEN_TOL);
-        if edges.is_empty() {
-            return Ok(());
-        }
         let paint = paint_data(paint, self.transform.inverse(), self.res.images)?;
-        let bbox = bbox_of(&edges, self.width, self.height);
+        let coverage = self.prepared(path, FillRule::NonZero, Some(stroke), tol_u);
+        let edge_count = coverage.edge_count;
         self.items.push(Item::Draw {
-            edges: edges.into(),
-            bbox,
-            rule: FillRule::NonZero,
-            // Kurbo's stroker self-overlaps at joins and caps.
-            exact: true,
+            coverage,
+            edge_count,
             paint,
-            clip: self.clip.clone(),
         });
         Ok(())
     }
@@ -835,15 +818,74 @@ impl<'a> Lowering<'a> {
             return Ok(());
         }
         let [r, g, bl, al] = shadow.color.components;
-        self.items.push(Item::Shadow {
-            rbox: [cx as f32, cy as f32, hx as f32, hy as f32],
-            radii: radii.map(|r| r as f32),
+        let coverage = self.prepared_shadow(
+            [cx, cy, hx, hy],
+            radii.map(|r| r as f32),
+            (shadow.sigma * smax) as f32,
             sigma_eff,
-            color: [r * al, g * al, bl * al, al],
             bbox,
-            clip: self.clip.clone(),
+        );
+        self.items.push(Item::Draw {
+            coverage,
+            edge_count: 0,
+            paint: PaintData::Solid([r * al, g * al, bl * al, al]),
         });
         Ok(())
+    }
+
+    /// Retains the scalar shadow field independently of its colour.
+    #[expect(clippy::cast_possible_truncation, reason = "analytic shadow coordinates use f32")]
+    fn prepared_shadow(
+        &mut self,
+        geometry: [f64; 4],
+        radii: [f32; 4],
+        sigma: f32,
+        sigma_eff: f32,
+        bbox: IRect,
+    ) -> Arc<Coverage> {
+        let [cx, cy, hx, hy] = geometry;
+        let rbox = geometry.map(|value| value as f32);
+        let operands = self
+            .clip
+            .as_ref()
+            .map_or(&[][..], |clip| clip.operands.as_slice());
+        let mut key = crate::render::coverage::geometry_key(operands, self.width, self.height);
+        key[0] = 1;
+        key.extend(rbox.map(f32::to_bits));
+        key.extend(radii.map(f32::to_bits));
+        key.push(sigma_eff.to_bits());
+        key.push(sigma.to_bits());
+        for coordinate in geometry {
+            key_float(&mut key, coordinate);
+        }
+        self.res.coverage_cache.get_or_insert(key, || {
+            if let Some(clip) = &self.clip {
+                // Oracle order: intersect the caster, then convolve coverage.
+                // Clipping the blurred image would cut off the shadow tail.
+                let shape = ShapeData::RoundedRect(kurbo::RoundedRect::new(
+                    cx - hx,
+                    cy - hy,
+                    cx + hx,
+                    cy + hy,
+                    kurbo::RoundedRectRadii::new(
+                        f64::from(radii[0]),
+                        f64::from(radii[1]),
+                        f64::from(radii[2]),
+                        f64::from(radii[3]),
+                    ),
+                ));
+                let (path, rule) = shape_path(&shape, FLATTEN_TOL).expect("rounded box has a path");
+                let mut operands = clip.operands.clone();
+                operands.push(Operand {
+                    edges: flatten_edges(path, FLATTEN_TOL).into(),
+                    rule,
+                });
+                let caster = crate::render::coverage::rasterize(&operands, self.width, self.height);
+                crate::render::raster::blur_coverage(&caster, self.width, self.height, f64::from(sigma))
+            } else {
+                crate::render::raster::shadow_coverage(&rbox, &radii, sigma_eff, bbox, self.width)
+            }
+        })
     }
 
     /// `Glyphs`: one mask request per positioned glyph. Font lookup and

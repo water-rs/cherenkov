@@ -17,11 +17,11 @@ impl Bytes {
 
 /// The engine's memory budgets.
 ///
-/// This slice only records the budgets; the CPU budget caps the glyph
-/// mask cache size.
+/// The CPU budget is split equally between glyph masks and prepared coverage.
+/// Framebuffers and in-flight frame data are accounted separately.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Budget {
-    /// CPU-side memory (the rasterized glyph cache).
+    /// Retained CPU caches (glyph masks and prepared geometric coverage).
     pub cpu: Bytes,
 }
 
@@ -46,10 +46,12 @@ pub enum Pressure {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MemoryUsage {
     /// Surface framebuffer bytes (f32 RGBA per pixel, plus isolation
-    /// scratch allocated this frame).
+    /// scratch retained for reuse).
     pub framebuffers: Bytes,
-    /// Rasterized glyph mask cache bytes.
+    /// Rasterized glyph masks and retained outline cache bytes.
     pub glyph_cache: Bytes,
+    /// Prepared shape, clip and shadow coverage cache bytes.
+    pub coverage_cache: Bytes,
     /// Registered image pixel stores (premultiplied f32 RGBA).
     pub images: Bytes,
 }

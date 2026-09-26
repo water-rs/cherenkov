@@ -403,6 +403,38 @@ mod tests {
         );
     }
 
+    /// A scroll axis pinned to one value (`x0 == x1` in the bounds) is a
+    /// legal bounds rect: `Rect::contains` is half-open, so the rubber
+    /// band must not fire for an offset inside such a rect.
+    #[test]
+    fn rubber_band_with_a_zero_width_bounds_rect() {
+        let (engine, rx) = engine();
+        let surface = engine
+            .surface(Offscreen::new((16, 16), OffscreenFormat::LinearF16))
+            .expect("surface");
+        let layer_handle = surface.layer();
+        let bounds = kurbo::Rect::new(0.0, 0.0, 0.0, 300.0);
+        surface.update(|tx| {
+            tx[surface.root()].push(&layer_handle);
+            tx[&layer_handle]
+                .scroll_offset(Vec2::new(0.0, 100.0))
+                .animation(Decay::new(Vec2::new(0.0, 2000.0)).rubber_band(bounds));
+        });
+        let t0 = Instant::now();
+        let mut t = t0;
+        loop {
+            t += Duration::from_millis(8);
+            let next = engine.render(FrameTime::at(t)).expect("render");
+            if matches!(next, Next::Idle) {
+                break;
+            }
+            assert!(t - t0 < Duration::from_secs(10), "never settled");
+        }
+        let record = frames(&rx).pop().expect("records");
+        let offset = layer(&record, layer_handle.id()).scroll_offset;
+        assert_eq!(offset, Vec2::new(0.0, 300.0), "settled offset");
+    }
+
     #[test]
     fn decay_starts_at_committed_value_and_stays_where_it_stops() {
         let (engine, rx) = engine();

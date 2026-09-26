@@ -36,6 +36,12 @@ pub mod cherenkov_ad;
 #[cfg(feature = "cherenkov-cpu")]
 pub mod cherenkov_cpu_ad;
 pub mod convert;
+#[cfg(any(
+    feature = "cherenkov",
+    feature = "cherenkov-cpu",
+    feature = "cherenkov-vello"
+))]
+pub mod motion;
 pub mod report;
 #[cfg(any(
     feature = "vello-classic",

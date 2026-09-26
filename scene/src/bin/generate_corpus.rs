@@ -15,12 +15,12 @@ use std::sync::Arc;
 
 use cherenkov_scene::corpus;
 use cherenkov_scene::kurbo::{
-    Affine, BezPath, Ellipse, Line, Point, Rect, RoundedRect, RoundedRectRadii,
+    Affine, BezPath, Ellipse, Line, Point, Rect, RoundedRect, RoundedRectRadii, Vec2,
 };
 use cherenkov_scene::{
     BlendMode, Color, ColorSpace, Extend, FillRule, Glyph, GlyphRun, GradientStop, ImagePaint,
-    LayerBuilder, LinearGradient, NormalizedCoord, Paint, RadialGradient, ResourceHash, Sampling,
-    Scene, SceneError, Shape, StrokeStyle, SweepGradient,
+    LayerBuilder, LinearGradient, Motion, MotionAnimation, NormalizedCoord, Paint, RadialGradient,
+    ResourceHash, Sampling, Scene, SceneError, Shape, StrokeStyle, SweepGradient,
 };
 use fontique::FontWeight;
 use parley::{
@@ -974,6 +974,205 @@ fn run() -> Result<(), SceneError> {
         );
     }
 
+    // ---- Motion and scrolling ----------------------------------------------
+    //
+    // Scenes exercising `Layer::scroll_offset` and `Layer::motion`. The
+    // oracle renders the settled state; the cherenkov adapters commit the
+    // `from` state then the animation/decay, and `render --readback`
+    // comparisons run until `Next::Idle`.
+
+    // A card that springs in from above the viewport (Spring 0.5/1.0).
+    corpus.scene("anim-spring-card", 256, 256, srgb(0.94, 0.95, 0.98), |l| {
+        l.layer(|card| {
+            card.transform(Affine::translate((0.0, 0.0)));
+            card.motion(Motion::Transform {
+                from: Affine::translate((0.0, -200.0)),
+                animation: MotionAnimation::Spring {
+                    response: 0.5,
+                    damping: 1.0,
+                },
+            });
+            let rect = RoundedRect::from_rect(
+                Rect::new(32.0, 96.0, 224.0, 208.0),
+                RoundedRectRadii::new(16.0, 16.0, 16.0, 16.0),
+            );
+            card.shadow(
+                Shape::RoundedRect(rect),
+                8.0,
+                [0.0, 6.0],
+                srgba(0.0, 0.0, 0.0, 0.25),
+            );
+            card.fill(Shape::RoundedRect(rect), solid(white));
+            card.fill(
+                Shape::RoundedRect(RoundedRect::from_rect(
+                    Rect::new(48.0, 120.0, 208.0, 140.0),
+                    RoundedRectRadii::new(6.0, 6.0, 6.0, 6.0),
+                )),
+                solid(srgb(0.35, 0.45, 0.85)),
+            );
+            card.fill(
+                Shape::RoundedRect(RoundedRect::from_rect(
+                    Rect::new(48.0, 152.0, 168.0, 164.0),
+                    RoundedRectRadii::new(4.0, 4.0, 4.0, 4.0),
+                )),
+                solid(srgb(0.8, 0.82, 0.88)),
+            );
+            card.fill(
+                Shape::RoundedRect(RoundedRect::from_rect(
+                    Rect::new(48.0, 174.0, 190.0, 186.0),
+                    RoundedRectRadii::new(4.0, 4.0, 4.0, 4.0),
+                )),
+                solid(srgb(0.8, 0.82, 0.88)),
+            );
+        });
+    });
+
+    // A panel sliding in on a 400 ms ease-in-out curve.
+    corpus.scene("anim-curve-slide", 256, 256, srgb(0.92, 0.94, 0.96), |l| {
+        l.layer(|panel| {
+            panel.transform(Affine::translate((0.0, 0.0)));
+            panel.motion(Motion::Transform {
+                from: Affine::translate((-180.0, 0.0)),
+                animation: MotionAnimation::Curve {
+                    duration_ms: 400,
+                    x1: 0.42,
+                    y1: 0.0,
+                    x2: 0.58,
+                    y2: 1.0,
+                },
+            });
+            panel.fill(
+                Shape::RoundedRect(RoundedRect::from_rect(
+                    Rect::new(24.0, 64.0, 232.0, 200.0),
+                    RoundedRectRadii::new(12.0, 12.0, 12.0, 12.0),
+                )),
+                solid(srgb(0.22, 0.5, 0.6)),
+            );
+            for i in 0u8..4 {
+                let y = 88.0 + f64::from(i) * 28.0;
+                panel.fill(
+                    Shape::RoundedRect(RoundedRect::from_rect(
+                        Rect::new(44.0, y, 44.0 + 150.0 - 22.0 * f64::from(i), y + 12.0),
+                        RoundedRectRadii::new(4.0, 4.0, 4.0, 4.0),
+                    )),
+                    solid(srgba(1.0, 1.0, 1.0, 0.75)),
+                );
+            }
+        });
+    });
+
+    // A clipped list scrolled to a static offset: rows 3.. are visible.
+    corpus.scene("scroll-static", 256, 192, srgb(0.97, 0.97, 0.98), |l| {
+        l.layer(|list| {
+            list.clip(Shape::Rect(Rect::new(8.0, 16.0, 248.0, 176.0)));
+            list.scroll_offset(Vec2::new(0.0, 96.0));
+            for i in 0u8..12 {
+                let y = f64::from(i) * 48.0;
+                list.fill(
+                    Shape::RoundedRect(RoundedRect::from_rect(
+                        Rect::new(16.0, y, 240.0, y + 40.0),
+                        RoundedRectRadii::new(8.0, 8.0, 8.0, 8.0),
+                    )),
+                    solid(srgb(
+                        0.3 + 0.05 * f32::from(i % 4),
+                        0.5,
+                        0.85 - 0.04 * f32::from(i % 4),
+                    )),
+                );
+            }
+        });
+    });
+
+    // A 60-row list in a clip: a fling decaying from below the rest
+    // position. from = rest - v/k with v = (0, -1800), k = 4.
+    corpus.scene("scroll-decay", 256, 320, srgb(0.97, 0.97, 0.98), |l| {
+        l.layer(|list| {
+            list.clip(Shape::Rect(Rect::new(8.0, 16.0, 248.0, 304.0)));
+            list.scroll_offset(Vec2::new(0.0, 600.0));
+            list.motion(Motion::Scroll {
+                from: Vec2::new(0.0, 1050.0),
+                velocity: Vec2::new(0.0, -1800.0),
+                deceleration: 4.0,
+                bounds: None,
+            });
+            for i in 0u8..60 {
+                let y = f64::from(i) * 48.0;
+                list.fill(
+                    Shape::RoundedRect(RoundedRect::from_rect(
+                        Rect::new(16.0, y, 240.0, y + 40.0),
+                        RoundedRectRadii::new(8.0, 8.0, 8.0, 8.0),
+                    )),
+                    Paint::Linear(LinearGradient {
+                        start: Point::new(16.0, y),
+                        end: Point::new(240.0, y),
+                        extend: Extend::Pad,
+                        interpolation: ColorSpace::Srgb,
+                        stops: vec![
+                            GradientStop {
+                                offset: 0.0,
+                                color: srgb(
+                                    0.25 + 0.01 * f32::from(i % 20),
+                                    0.5,
+                                    0.8 - 0.02 * f32::from(i % 10),
+                                ),
+                            },
+                            GradientStop {
+                                offset: 1.0,
+                                color: srgb(0.6, 0.7, 0.9),
+                            },
+                        ],
+                    }),
+                );
+            }
+        });
+    });
+
+    // The same list, flung hard enough to overshoot its bounds and
+    // rubber-band back; rest = the bound = the static scroll_offset.
+    corpus.scene(
+        "scroll-rubber-band",
+        256,
+        320,
+        srgb(0.97, 0.97, 0.98),
+        |l| {
+            l.layer(|list| {
+                list.clip(Shape::Rect(Rect::new(8.0, 16.0, 248.0, 304.0)));
+                list.scroll_offset(Vec2::new(0.0, 300.0));
+                list.motion(Motion::Scroll {
+                    from: Vec2::new(0.0, 100.0),
+                    velocity: Vec2::new(0.0, 2000.0),
+                    deceleration: 4.0,
+                    bounds: Some(Rect::new(0.0, 0.0, 0.0, 300.0)),
+                });
+                for i in 0u8..60 {
+                    let y = f64::from(i) * 48.0;
+                    list.fill(
+                        Shape::RoundedRect(RoundedRect::from_rect(
+                            Rect::new(16.0, y, 240.0, y + 40.0),
+                            RoundedRectRadii::new(8.0, 8.0, 8.0, 8.0),
+                        )),
+                        Paint::Linear(LinearGradient {
+                            start: Point::new(16.0, y),
+                            end: Point::new(240.0, y),
+                            extend: Extend::Pad,
+                            interpolation: ColorSpace::Srgb,
+                            stops: vec![
+                                GradientStop {
+                                    offset: 0.0,
+                                    color: srgb(0.75, 0.55, 0.85),
+                                },
+                                GradientStop {
+                                    offset: 1.0,
+                                    color: srgb(0.5, 0.35 + 0.01 * f32::from(i % 20), 0.75),
+                                },
+                            ],
+                        }),
+                    );
+                }
+            });
+        },
+    );
+
     // ---- Performance set ---------------------------------------------------
     //
     // Full-resolution scenes (the Pixel 9 Pro viewport, 1024x2216) modelling
@@ -1299,6 +1498,71 @@ fn run() -> Result<(), SceneError> {
                     }
                 });
             },
+        );
+    }
+
+    // A heavy scrolling list: 120 shadowed card rows inside a clipped,
+    // scroll-decaying layer — the frame-time scene for `measure` while a
+    // scroll is animating.
+    {
+        let title = ctx.shape(
+            "NotoSans.ttf",
+            "Inbox message subject",
+            28.0,
+            FontWeight::NORMAL,
+            &solid(dark),
+        );
+        let sub = ctx.shape(
+            "NotoSans.ttf",
+            "A short preview line of the message body",
+            20.0,
+            FontWeight::NORMAL,
+            &solid(srgb(0.4, 0.42, 0.45)),
+        );
+        let blobs = font_blobs(&ctx, &[&title, &sub]);
+        perf.scene_with_blobs(
+            "scroll-list",
+            pw as u32,
+            ph as u32,
+            srgb(0.96, 0.96, 0.97),
+            |l| {
+                l.layer(|list| {
+                    list.clip(Shape::Rect(Rect::new(0.0, 0.0, pw, ph)));
+                    list.scroll_offset(Vec2::new(0.0, 1200.0));
+                    list.motion(Motion::Scroll {
+                        from: Vec2::new(0.0, 1700.0),
+                        velocity: Vec2::new(0.0, -2000.0),
+                        deceleration: 4.0,
+                        bounds: Some(Rect::new(0.0, 0.0, 0.0, 120.0 * 96.0 - ph)),
+                    });
+                    let pitch = 96.0;
+                    for i in 0u16..120 {
+                        let y = 24.0 + f64::from(i) * pitch;
+                        let card = RoundedRect::from_rect(
+                            Rect::new(24.0, y, 1000.0, y + 88.0),
+                            RoundedRectRadii::new(14.0, 14.0, 14.0, 14.0),
+                        );
+                        list.shadow(
+                            Shape::RoundedRect(card),
+                            4.0,
+                            [0.0, 3.0],
+                            srgba(0.0, 0.0, 0.0, 0.22),
+                        );
+                        list.fill(Shape::RoundedRect(card), solid(white));
+                        list.fill(
+                            Shape::circle(64.0, y + 44.0, 24.0),
+                            solid(srgb(0.3 + 0.02 * f32::from(i % 16), 0.4, 0.8)),
+                        );
+                        for run in &title {
+                            list.glyphs(offset_run(run, 112.0, y + 40.0));
+                        }
+                        for run in &sub {
+                            list.glyphs(offset_run(run, 112.0, y + 72.0));
+                        }
+                    }
+                });
+            },
+            blobs,
         );
     }
 

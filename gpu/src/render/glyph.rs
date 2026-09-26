@@ -17,6 +17,8 @@ use skrifa::raw::types::F2Dot14;
 use crate::render::raster::Raster;
 use cherenkov::RenderError;
 
+use super::Encode;
+
 /// Initial atlas edge length.
 const ATLAS_START: u32 = 1024;
 /// Largest atlas edge length.
@@ -409,7 +411,7 @@ impl OutlinePen for PathPen {
 /// Rasterizes one glyph into the atlas and returns its entry, uploading the
 /// coverage texels through `queue`.
 ///
-/// Returns [`RenderError::Render("glyph atlas full".into())`] when the glyph's cell does not fit.
+/// Returns [`Encode::AtlasFull`] when the glyph's cell does not fit.
 #[expect(clippy::too_many_arguments)]
 #[expect(clippy::too_many_lines)]
 #[expect(clippy::many_single_char_names)]
@@ -426,7 +428,7 @@ pub fn rasterize(
     subpixel: (f32, f32),
     transform: Affine,
     coords: &[i16],
-) -> Result<Entry, RenderError> {
+) -> Result<Entry, Encode> {
     let font_ref = skrifa::FontRef::from_index(&font.data, font.index)
         .map_err(|e| RenderError::Font(format!("{e}")))?;
     let upem = font_ref
@@ -513,7 +515,7 @@ pub fn rasterize(
     let w = (right - left) as u32;
     let h = (bottom - top) as u32;
     let Some((cx, cy)) = atlas.alloc(w, h) else {
-        return Err(RenderError::Render("glyph atlas full".into()));
+        return Err(Encode::AtlasFull);
     };
     // Rasterize in cell space.
     let mut raster = Raster::new(w as usize, h as usize);

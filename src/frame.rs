@@ -51,6 +51,15 @@ pub enum Next {
 pub struct FrameId(pub(crate) u64);
 
 impl FrameId {
+    /// Creates an identifier from a raw value.
+    ///
+    /// [`Engine::render`](crate::Engine::render) numbers renders itself; this
+    /// is for harnesses driving a [`Renderer`](crate::Renderer) directly.
+    #[must_use]
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
     /// The render's position in the engine's sequence of renders.
     #[must_use]
     pub const fn get(self) -> u64 {

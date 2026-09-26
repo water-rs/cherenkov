@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use crate::kurbo::{Affine, BezPath, Circle, Rect, Stroke, Vec2};
 use crate::message::LayerOp;
 use crate::{
-    Animation, Command, ContentOp, Curve, Display, Draw, FontData, FontId, Frame, FrameStats,
-    FrameTime, Glyph, GlyphRun, GlyphStyle, Group, LayerId, LinearGradient, Offscreen,
+    Animation, Command, ContentOp, Curve, Display, Draw, FontData, FontId, Frame, FrameId,
+    FrameStats, FrameTime, Glyph, GlyphRun, GlyphStyle, Group, LayerId, LinearGradient, Offscreen,
     OffscreenFormat, Operand, Paint, Picture, Pressure, Prop, Renderer, Shadow, ShapeData,
     SlotUpdate, SurfaceFrame, SurfaceId, SurfaceTree, WorkingColor,
 };
@@ -55,6 +55,7 @@ where
         renderer.set_content(id, sibling, Some(ContentOp::Picture(stable.clone())));
     }
     let start = Instant::now();
+    let mut frames = Frames::default();
     for step in 0..160u32 {
         let mut dirty_count = 0;
         if step > 0 && step % 8 < 5 {
@@ -83,8 +84,8 @@ where
             layer,
             Some(ContentOp::Replace(crate::Picture::new(list.clone()))),
         );
-        let incremental = render(renderer, ids[0], &tree, size, time);
-        let full = render(renderer, ids[1], &tree, size, time);
+        let incremental = render(renderer, &mut frames, ids[0], &tree, size, time);
+        let full = render(renderer, &mut frames, ids[1], &tree, size, time);
         if step > 0 {
             if dirty_count == 0 {
                 assert_eq!(
@@ -111,6 +112,7 @@ where
     }
     assert_patch_counts(
         renderer,
+        &mut frames,
         ids[0],
         layer,
         &tree,
@@ -140,8 +142,22 @@ fn register_font(renderer: &mut impl Renderer) -> FontId {
     font
 }
 
+/// Numbers the renders a harness drives directly, as the engine's render
+/// loop numbers its own.
+#[derive(Default)]
+struct Frames(u64);
+
+impl Frames {
+    fn next(&mut self) -> FrameId {
+        let id = FrameId::new(self.0);
+        self.0 += 1;
+        id
+    }
+}
+
 fn render<R: Renderer>(
     renderer: &mut R,
+    frames: &mut Frames,
     id: SurfaceId,
     tree: &SurfaceTree,
     size: (u32, u32),
@@ -151,6 +167,7 @@ fn render<R: Renderer>(
     renderer
         .render(
             &Frame {
+                id: frames.next(),
                 time: FrameTime::at(time),
                 surfaces: &[SurfaceFrame {
                     id,
@@ -348,6 +365,7 @@ fn update_properties(tree: &mut SurfaceTree, layer: LayerId, step: u32) {
 
 fn assert_patch_counts<R: Renderer>(
     renderer: &mut R,
+    frames: &mut Frames,
     id: SurfaceId,
     layer: LayerId,
     tree: &SurfaceTree,
@@ -368,7 +386,7 @@ fn assert_patch_counts<R: Renderer>(
         })
         .collect();
     renderer.set_content(id, layer, Some(ContentOp::Update(updates)));
-    let stats = render(renderer, id, tree, size, time);
+    let stats = render(renderer, frames, id, tree, size, time);
     assert_eq!(
         stats.commands_lowered, 2,
         "two dirty fills must patch just two commands"
@@ -377,7 +395,7 @@ fn assert_patch_counts<R: Renderer>(
         stats.layers_composed, 1,
         "an unrelated layer was recomposed"
     );
-    let unchanged = render(renderer, id, tree, size, time);
+    let unchanged = render(renderer, frames, id, tree, size, time);
     assert_eq!(unchanged.commands_lowered, 0);
     assert_eq!(
         unchanged.layers_composed, 0,
@@ -409,7 +427,7 @@ fn assert_patch_counts<R: Renderer>(
             value: Operand::Run(changed_run),
         }])),
     );
-    let structural = render(renderer, id, tree, size, time);
+    let structural = render(renderer, frames, id, tree, size, time);
     assert_eq!(
         structural.commands_lowered,
         u32::try_from(list.len()).unwrap(),

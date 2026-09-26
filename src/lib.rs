@@ -63,8 +63,7 @@ pub use crate::engine::Engine;
 pub use crate::error::{EngineError, RenderError, ResourceError, SurfaceError};
 pub use crate::frame::{
     FrameId, FrameStats, FrameTime, FrameTiming, Next, Offscreen, OffscreenFormat, PassTiming,
-    Phases, Readback,
-    RefreshRange,
+    Phases, Readback, RefreshRange,
 };
 pub use crate::glyph::{FontId, Glyph, GlyphRun, GlyphStyle};
 pub use crate::image::{

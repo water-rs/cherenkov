@@ -1,10 +1,10 @@
 // Copyright 2026 the Cherenkov Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Frame-timing attribution for the adapters driving the shared
-//! `cherenkov` front end: a render's GPU timing can resolve during a later
-//! render, so each resolved [`FrameTiming`] is traced back to the bench
-//! frame that rendered it.
+//! Frame-timing attribution for the shared `cherenkov` front end.
+//!
+//! A render's GPU timing can resolve during a later render, so each resolved
+//! [`FrameTiming`] is traced back to the bench frame that rendered it.
 
 use std::collections::HashMap;
 

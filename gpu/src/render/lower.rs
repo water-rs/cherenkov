@@ -13,6 +13,8 @@ use cherenkov::{GlyphRun, GlyphStyle};
 
 use cherenkov::RenderError;
 
+use super::Encode;
+
 use crate::names;
 use cherenkov::{LayerId, SurfaceTree};
 
@@ -184,7 +186,7 @@ struct Boxed {
 /// approaches 4.
 ///
 /// A `Line` has no area and draws nothing, so it returns `None`.
-fn box_shape(shape: &ShapeData) -> Result<Option<Boxed>, RenderError> {
+fn box_shape(shape: &ShapeData) -> Result<Option<Boxed>, Encode> {
     let boxed = match shape {
         ShapeData::Rect(r) => {
             let half = [f32_f64(r.width() / 2.0), f32_f64(r.height() / 2.0)];
@@ -260,7 +262,7 @@ fn box_shape(shape: &ShapeData) -> Result<Option<Boxed>, RenderError> {
             }
         }
         ShapeData::Line(_) => return Ok(None),
-        ShapeData::Path { .. } => return Err(RenderError::Unsupported(names::PATH)),
+        ShapeData::Path { .. } => return Err(Encode::from(RenderError::Unsupported(names::PATH))),
     };
     Ok(Some(boxed))
 }
@@ -397,7 +399,7 @@ fn paint_data(
     to_local: Affine,
     stops: &mut Vec<Stop>,
     images: &HashMap<u64, GpuImage>,
-) -> Result<PaintData, RenderError> {
+) -> Result<PaintData, Encode> {
     let mut data = PaintData {
         kind: PAINT_SOLID,
         ..PaintData::default()
@@ -437,7 +439,7 @@ fn paint_data(
             data.first_stop = first;
             data.packed = packed;
         }
-        Paint::Mesh(_) => return Err(RenderError::Unsupported(names::MESH)),
+        Paint::Mesh(_) => return Err(Encode::from(RenderError::Unsupported(names::MESH))),
         Paint::Image(pattern) => {
             let img = images.get(&pattern.image.raw()).ok_or_else(|| {
                 RenderError::Image(format!("unregistered image {}", pattern.image.raw()))
@@ -458,7 +460,7 @@ fn paint_data(
                 | (sampling << 8);
             data.image = Some(pattern.image.raw());
         }
-        Paint::Shader(_) => return Err(RenderError::Unsupported(names::SHADER)),
+        Paint::Shader(_) => return Err(Encode::from(RenderError::Unsupported(names::SHADER))),
     }
     Ok(data)
 }
@@ -529,7 +531,7 @@ impl<'a> Lowering<'a> {
         caches: &HashMap<LayerId, ContentData>,
         clear: WorkingColor,
         glyphs: &mut GlyphContext<'_>,
-    ) -> Result<(), RenderError> {
+    ) -> Result<(), Encode> {
         let [r, g, b, a] = clear.components;
         self.begin_pass(Target::Surface, Some([r * a, g * a, b * a, a]));
         self.layer(tree.root(), tree, caches, glyphs)?;
@@ -651,9 +653,9 @@ impl<'a> Lowering<'a> {
         inner_clip: Option<DeviceClip>,
         opacity: f32,
         blend: cherenkov::BlendMode,
-        mut body: impl FnMut(&mut Self, &mut GlyphContext<'_>) -> Result<(), RenderError>,
+        mut body: impl FnMut(&mut Self, &mut GlyphContext<'_>) -> Result<(), Encode>,
         glyphs: &mut GlyphContext<'_>,
-    ) -> Result<(), RenderError> {
+    ) -> Result<(), Encode> {
         if opacity < 1.0
             && blend == cherenkov::BlendMode::Normal
             && self.try_passthrough(opacity, &mut body, glyphs)?
@@ -720,9 +722,9 @@ impl<'a> Lowering<'a> {
     fn try_passthrough(
         &mut self,
         opacity: f32,
-        body: &mut impl FnMut(&mut Self, &mut GlyphContext<'_>) -> Result<(), RenderError>,
+        body: &mut impl FnMut(&mut Self, &mut GlyphContext<'_>) -> Result<(), Encode>,
         glyphs: &mut GlyphContext<'_>,
-    ) -> Result<bool, RenderError> {
+    ) -> Result<bool, Encode> {
         let snap = self.frame.snapshot();
         let depth = self.depth;
         let clip = self.clip;
@@ -825,7 +827,7 @@ impl<'a> Lowering<'a> {
         param_x: f32,
         flags: u32,
         glyphs: &GlyphContext<'_>,
-    ) -> Result<(), RenderError> {
+    ) -> Result<(), Encode> {
         let b = boxed.bounds.inflate(margin, margin);
         if b.width() <= 0.0 || b.height() <= 0.0 {
             return Ok(());
@@ -859,9 +861,9 @@ impl<'a> Lowering<'a> {
     fn with_clip(
         &mut self,
         shape: Option<&ShapeData>,
-        mut body: impl FnMut(&mut Self, &mut GlyphContext<'_>) -> Result<(), RenderError>,
+        mut body: impl FnMut(&mut Self, &mut GlyphContext<'_>) -> Result<(), Encode>,
         glyphs: &mut GlyphContext<'_>,
-    ) -> Result<(), RenderError> {
+    ) -> Result<(), Encode> {
         let Some(shape_data) = shape else {
             return body(self, glyphs);
         };
@@ -892,9 +894,9 @@ impl<'a> Lowering<'a> {
     fn run_clipped(
         &mut self,
         clip: DeviceClip,
-        mut body: impl FnMut(&mut Self, &mut GlyphContext<'_>) -> Result<(), RenderError>,
+        mut body: impl FnMut(&mut Self, &mut GlyphContext<'_>) -> Result<(), Encode>,
         glyphs: &mut GlyphContext<'_>,
-    ) -> Result<(), RenderError> {
+    ) -> Result<(), Encode> {
         /// The merged axis-aligned rect clip for `cr ∩ dr`.
         fn merged_rect(cr: Rect, dr: Rect, mask: Option<MaskCell>) -> DeviceClip {
             let merged = cr.intersect(dr);
@@ -976,13 +978,13 @@ impl<'a> Lowering<'a> {
         tree: &SurfaceTree,
         caches: &HashMap<LayerId, ContentData>,
         glyphs: &mut GlyphContext<'_>,
-    ) -> Result<(), RenderError> {
+    ) -> Result<(), Encode> {
         let node = tree.layer(id);
         if node.filter.is_some() {
-            return Err(RenderError::Unsupported(names::FILTER));
+            return Err(Encode::from(RenderError::Unsupported(names::FILTER)));
         }
         if node.backdrop.is_some() {
-            return Err(RenderError::Unsupported(names::BACKDROP));
+            return Err(Encode::from(RenderError::Unsupported(names::BACKDROP)));
         }
         let saved = self.transform;
         self.transform = saved * node.transform;
@@ -1018,7 +1020,7 @@ impl<'a> Lowering<'a> {
         tree: &SurfaceTree,
         caches: &HashMap<LayerId, ContentData>,
         glyphs: &mut GlyphContext<'_>,
-    ) -> Result<(), RenderError> {
+    ) -> Result<(), Encode> {
         match caches.get(&id) {
             Some(ContentData::Picture(p)) => {
                 self.commands(p.display_list(), 0, p.display_list().len(), glyphs)?;
@@ -1041,7 +1043,7 @@ impl<'a> Lowering<'a> {
         mut i: usize,
         end: usize,
         glyphs: &mut GlyphContext<'_>,
-    ) -> Result<(), RenderError> {
+    ) -> Result<(), Encode> {
         let commands = list.commands();
         while i < end {
             match &commands[i] {
@@ -1086,10 +1088,10 @@ impl<'a> Lowering<'a> {
                 }
                 Command::BeginGroup { group, end } => {
                     if group.filter.is_some() {
-                        return Err(RenderError::Unsupported(names::FILTER));
+                        return Err(Encode::from(RenderError::Unsupported(names::FILTER)));
                     }
                     if group.blend_space != BlendSpace::Linear {
-                        return Err(RenderError::Unsupported(names::BLEND_SPACE));
+                        return Err(Encode::from(RenderError::Unsupported(names::BLEND_SPACE)));
                     }
                     let inner_end = (*end as usize).min(commands.len());
                     if group.opacity >= 1.0 && group.blend == BlendMode::Normal {
@@ -1119,7 +1121,7 @@ impl<'a> Lowering<'a> {
         shape: &ShapeData,
         paint: &Paint,
         glyphs: &mut GlyphContext<'_>,
-    ) -> Result<(), RenderError> {
+    ) -> Result<(), Encode> {
         if let ShapeData::Path { elements, rule } = shape {
             let content = path::hash_elements(elements, fill_tag(*rule));
             return self.path(
@@ -1155,7 +1157,7 @@ impl<'a> Lowering<'a> {
         dst: &Rect,
         sampling: cherenkov::Sampling,
         glyphs: &mut GlyphContext<'_>,
-    ) -> Result<(), RenderError> {
+    ) -> Result<(), Encode> {
         let img = glyphs
             .images
             .get(&image.raw())
@@ -1185,11 +1187,11 @@ impl<'a> Lowering<'a> {
         stroke: &kurbo::Stroke,
         paint: &Paint,
         glyphs: &mut GlyphContext<'_>,
-    ) -> Result<(), RenderError> {
+    ) -> Result<(), Encode> {
         // Path strokes and dashed strokes rasterize the stroked outline.
         if matches!(shape, ShapeData::Path { .. }) || !stroke.dash_pattern.is_empty() {
             if matches!(shape, ShapeData::Continuous(_)) {
-                return Err(RenderError::Unsupported(names::PATH));
+                return Err(Encode::from(RenderError::Unsupported(names::PATH)));
             }
             let tol = path::FLATTEN / path::sigma_max(self.transform).max(1e-12);
             let content = path::hash_stroke(shape, stroke, tol);
@@ -1227,12 +1229,14 @@ impl<'a> Lowering<'a> {
                         kurbo::Join::Round => f32_f64(hw),
                         kurbo::Join::Miter => {
                             if stroke.miter_limit < 1.415 {
-                                return Err(RenderError::Unsupported(names::STROKE_JOIN));
+                                return Err(Encode::from(RenderError::Unsupported(
+                                    names::STROKE_JOIN,
+                                )));
                             }
                             0.0
                         }
                         kurbo::Join::Bevel => {
-                            return Err(RenderError::Unsupported(names::STROKE_JOIN));
+                            return Err(Encode::from(RenderError::Unsupported(names::STROKE_JOIN)));
                         }
                     };
                 }
@@ -1285,9 +1289,9 @@ impl<'a> Lowering<'a> {
         stroke: &kurbo::Stroke,
         paint: &Paint,
         glyphs: &GlyphContext<'_>,
-    ) -> Result<(), RenderError> {
+    ) -> Result<(), Encode> {
         if stroke.start_cap != stroke.end_cap {
-            return Err(RenderError::Unsupported(names::STROKE_JOIN));
+            return Err(Encode::from(RenderError::Unsupported(names::STROKE_JOIN)));
         }
         let d = line.p1 - line.p0;
         let len = d.hypot();
@@ -1329,12 +1333,12 @@ impl<'a> Lowering<'a> {
     }
 
     /// `Shadow`: a Gaussian-blurred rounded box, offset and spread.
-    fn shadow(&mut self, shape: &ShapeData, shadow: &cherenkov::Shadow) -> Result<(), RenderError> {
+    fn shadow(&mut self, shape: &ShapeData, shadow: &cherenkov::Shadow) -> Result<(), Encode> {
         let Some(boxed) = box_shape(shape)? else {
             return Ok(());
         };
         if !shape_is_offsettable(boxed.shape) {
-            return Err(RenderError::Unsupported(names::SHADOW));
+            return Err(Encode::from(RenderError::Unsupported(names::SHADOW)));
         }
         let mut s = boxed.shape;
         let spread = f32_f64(shadow.spread);
@@ -1377,7 +1381,7 @@ impl<'a> Lowering<'a> {
         make: impl FnOnce() -> BezPath,
         paint: &Paint,
         glyphs: &mut GlyphContext<'_>,
-    ) -> Result<(), RenderError> {
+    ) -> Result<(), Encode> {
         #[expect(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
@@ -1424,7 +1428,7 @@ impl<'a> Lowering<'a> {
         offset: Vec2,
         paint: &Paint,
         glyphs: &GlyphContext<'_>,
-    ) -> Result<(), RenderError> {
+    ) -> Result<(), Encode> {
         let paint = paint_data(
             paint,
             Affine::IDENTITY,
@@ -1478,9 +1482,9 @@ impl<'a> Lowering<'a> {
         &mut self,
         elements: &[PathEl],
         rule: FillRule,
-        body: impl FnMut(&mut Self, &mut GlyphContext<'_>) -> Result<(), RenderError>,
+        body: impl FnMut(&mut Self, &mut GlyphContext<'_>) -> Result<(), Encode>,
         glyphs: &mut GlyphContext<'_>,
-    ) -> Result<(), RenderError> {
+    ) -> Result<(), Encode> {
         let surface = (self.width as u32, self.height as u32);
         let pl = path::placement(path::hash_elements(elements, 2), self.transform, surface);
         let stored = if let Some(mask) = glyphs
@@ -1503,13 +1507,17 @@ impl<'a> Lowering<'a> {
             };
             self.paths += 1;
             let (Ok(w), Ok(h)) = (u32::try_from(coverage.w), u32::try_from(coverage.h)) else {
-                return Err(RenderError::Unsupported(names::PATH_CLIP_TOO_LARGE));
+                return Err(Encode::from(RenderError::Unsupported(
+                    names::PATH_CLIP_TOO_LARGE,
+                )));
             };
             if !glyphs.atlas.can_ever_fit(w, h) {
-                return Err(RenderError::Unsupported(names::PATH_CLIP_TOO_LARGE));
+                return Err(Encode::from(RenderError::Unsupported(
+                    names::PATH_CLIP_TOO_LARGE,
+                )));
             }
             let Some((cx, cy)) = glyphs.atlas.alloc(w, h) else {
-                return Err(RenderError::Render("glyph atlas full".into()));
+                return Err(Encode::AtlasFull);
             };
             let texels: Vec<u8> = coverage
                 .data
@@ -1566,9 +1574,9 @@ impl<'a> Lowering<'a> {
         run: &GlyphRun,
         paint: &Paint,
         glyphs: &mut GlyphContext<'_>,
-    ) -> Result<(), RenderError> {
+    ) -> Result<(), Encode> {
         if matches!(run.style, GlyphStyle::Stroke(_)) {
-            return Err(RenderError::Unsupported(names::GLYPH_STROKE));
+            return Err(Encode::from(RenderError::Unsupported(names::GLYPH_STROKE)));
         }
         let font = glyphs
             .fonts
@@ -1580,7 +1588,9 @@ impl<'a> Lowering<'a> {
         let mut colr_checked = false;
         for glyph in &run.glyphs {
             if glyph.transform.is_some() {
-                return Err(RenderError::Unsupported(names::GLYPH_TRANSFORM));
+                return Err(Encode::from(RenderError::Unsupported(
+                    names::GLYPH_TRANSFORM,
+                )));
             }
             if !colr_checked {
                 colr_checked = true;
@@ -1601,7 +1611,7 @@ impl<'a> Lowering<'a> {
                     .is_some()
             {
                 if *upem <= 0.0 {
-                    return Err(RenderError::Font("zero units_per_em".into()));
+                    return Err(Encode::from(RenderError::Font("zero units_per_em".into())));
                 }
                 let picture =
                     crate::render::colr::glyph_picture(font, glyph.id, &run.coords, paint)?;

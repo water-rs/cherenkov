@@ -1682,22 +1682,23 @@ fn run() -> Result<(), SceneError> {
                 // Live bar: the last bar pulses every frame.
                 let last = l.item_count();
                 let bx = 56.0 + 23.0 * 39.0;
-                l.fill(
-                    Shape::Rect(Rect::new(bx + 39.0, chart_top + chart_h - 120.0, bx + 39.0 + 28.0, chart_top + chart_h)),
-                    bar_paint.clone(),
-                );
+                let live_bar = |h: f64| {
+                    Shape::Rect(Rect::new(
+                        bx + 39.0,
+                        chart_top + chart_h - h,
+                        bx + 39.0 + 28.0,
+                        chart_top + chart_h,
+                    ))
+                };
+                // `frames[0]` equals the base item (the first frame's h).
+                l.fill(live_bar(40.0), bar_paint.clone());
                 l.live(Live {
                     item: last,
                     frames: (0u8..60)
                         .map(|n| {
                             let h = 40.0 + f64::from(n) * 3.0;
                             Draw::Fill {
-                                shape: Shape::Rect(Rect::new(
-                                    bx + 39.0,
-                                    chart_top + chart_h - h,
-                                    bx + 39.0 + 28.0,
-                                    chart_top + chart_h,
-                                )),
+                                shape: live_bar(h),
                                 rule: FillRule::NonZero,
                                 paint: bar_paint.clone(),
                             }

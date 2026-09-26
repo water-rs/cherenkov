@@ -43,6 +43,8 @@ pub enum Extend {
     Repeat,
     /// The range repeats, mirrored every other time.
     Reflect,
+    /// Transparent outside the range.
+    None,
 }
 
 /// The space in which gradient stops are interpolated.

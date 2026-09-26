@@ -272,6 +272,11 @@ impl TryFrom<MeshGradientData> for MeshGradient {
 
 /// A mesh gradient: a grid of `columns` × `rows` patches whose corner points
 /// carry colours, interpolated across each patch.
+///
+/// Geometry and premultiplied working colours interpolate bilinearly. Outside
+/// the patches is transparent. Overlaps select the last row-major patch;
+/// folds select the inverse with greatest v, then u. A zero-Jacobian sample
+/// is transparent. The enclosing shape supplies coverage at the pixel centre.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "MeshGradientData")]
 pub struct MeshGradient {

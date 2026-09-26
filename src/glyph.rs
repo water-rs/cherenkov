@@ -31,7 +31,8 @@ pub struct Glyph {
     /// Vertical position of the glyph origin.
     pub y: f32,
     /// Per-glyph transform about its origin, for example an upright glyph in
-    /// vertical CJK text.
+    /// vertical CJK text. Applied in run units after scaling and stroke
+    /// expansion, before translating to `(x, y)` and applying the drawing transform.
     pub transform: Option<Affine>,
 }
 
@@ -41,7 +42,8 @@ pub enum GlyphStyle {
     /// Filled outlines.
     #[default]
     Fill,
-    /// Stroked outlines.
+    /// Monochrome base outlines stroked in run units before per-glyph placement.
+    /// Colour fonts use their base outline for this style, not their paint graph.
     Stroke(Stroke),
 }
 

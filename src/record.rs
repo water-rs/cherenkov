@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::display_list::{Command, DisplayList, Operand, Picture, SlotUpdate};
 use crate::glyph::GlyphRun;
 use crate::paint::{ImageId, Paint, Sampling};
-use crate::shape::{Shape, ShapeData};
+use crate::shape::Shape;
 use crate::style::{Group, Shadow};
 
 /// The drawing verbs, shared by [`StaticRecorder`] and [`Recorder`].
@@ -114,7 +114,7 @@ impl Draw for StaticRecorder {
         paint: impl Into<Fixed<P>>,
     ) {
         self.list.push(Command::Fill {
-            shape: ShapeData::of(&shape.into().0),
+            shape: shape.into().0.into_data(),
             paint: paint.into().0.into(),
         });
     }
@@ -126,7 +126,7 @@ impl Draw for StaticRecorder {
         paint: impl Into<Fixed<P>>,
     ) {
         self.list.push(Command::Stroke {
-            shape: ShapeData::of(&shape.into().0),
+            shape: shape.into().0.into_data(),
             stroke: stroke.into().0,
             paint: paint.into().0.into(),
         });
@@ -134,7 +134,7 @@ impl Draw for StaticRecorder {
 
     fn shadow<S: Shape>(&mut self, shape: impl Into<Fixed<S>>, shadow: impl Into<Fixed<Shadow>>) {
         self.list.push(Command::Shadow {
-            shape: ShapeData::of(&shape.into().0),
+            shape: shape.into().0.into_data(),
             shadow: shadow.into().0,
         });
     }
@@ -163,7 +163,7 @@ impl Draw for StaticRecorder {
 
     fn clip<S: Shape>(&mut self, shape: impl Into<Fixed<S>>, body: impl FnOnce(&mut Self)) {
         let begin = self.list.push(Command::BeginClip {
-            shape: ShapeData::of(&shape.into().0),
+            shape: shape.into().0.into_data(),
             end: 0,
         });
         body(self);
@@ -189,7 +189,26 @@ impl Draw for StaticRecorder {
     }
 }
 
-type Subscribe<T> = Box<dyn FnOnce(Box<dyn Fn(T)>) -> Option<Box<dyn Any>>>;
+/// Where a signal's later values go: the slot they update and how they
+/// become an operand.
+struct Watch<T> {
+    state: Weak<LiveState>,
+    command: u32,
+    convert: fn(T) -> Operand,
+}
+
+impl<T> Watch<T> {
+    fn notify(&self, value: T) {
+        if let Some(state) = self.state.upgrade() {
+            state.push(SlotUpdate {
+                command: self.command,
+                value: (self.convert)(value),
+            });
+        }
+    }
+}
+
+type Subscribe<T> = Box<dyn FnOnce(Watch<T>) -> Option<Box<dyn Any>>>;
 
 /// A value accepted by [`Recorder`]: the current value of a nami signal, and
 /// the subscription that reports its later changes.
@@ -211,8 +230,8 @@ impl<T: 'static, S: Signal<Output = T>> From<S> for Live<T> {
         let value = signal.snapshot();
         Self {
             value,
-            subscribe: Box::new(move |on_change: Box<dyn Fn(T)>| {
-                let guard = signal.watch(move |context| on_change(context.into_value()));
+            subscribe: Box::new(move |watch: Watch<T>| {
+                let guard = signal.watch(move |context| watch.notify(context.into_value()));
                 // A guard with no size and no drop glue unsubscribes nothing, so
                 // there is nothing to keep alive.
                 if size_of::<S::Guard>() == 0 && !needs_drop::<S::Guard>() {
@@ -265,17 +284,13 @@ impl Recorder {
         &self,
         subscribe: Subscribe<T>,
         command: u32,
-        convert: impl Fn(T) -> Operand + 'static,
+        convert: fn(T) -> Operand,
     ) {
-        let state: Weak<LiveState> = Rc::downgrade(&self.live);
-        let guard = subscribe(Box::new(move |value| {
-            if let Some(state) = state.upgrade() {
-                state.push(SlotUpdate {
-                    command,
-                    value: convert(value),
-                });
-            }
-        }));
+        let guard = subscribe(Watch {
+            state: Rc::downgrade(&self.live),
+            command,
+            convert,
+        });
         if let Some(guard) = guard {
             self.live.guards.borrow_mut().push(guard);
         }
@@ -296,11 +311,11 @@ impl Draw for Recorder {
     ) {
         let (shape, paint) = (shape.into(), paint.into());
         let command = self.list.push(Command::Fill {
-            shape: ShapeData::of(&shape.value),
+            shape: shape.value.into_data(),
             paint: paint.value.into(),
         });
         self.subscribe(shape.subscribe, command, |shape: S| {
-            Operand::Shape(ShapeData::of(&shape))
+            Operand::Shape(shape.into_data())
         });
         self.subscribe(paint.subscribe, command, paint_operand::<P>);
     }
@@ -313,12 +328,12 @@ impl Draw for Recorder {
     ) {
         let (shape, stroke, paint) = (shape.into(), stroke.into(), paint.into());
         let command = self.list.push(Command::Stroke {
-            shape: ShapeData::of(&shape.value),
+            shape: shape.value.into_data(),
             stroke: stroke.value,
             paint: paint.value.into(),
         });
         self.subscribe(shape.subscribe, command, |shape: S| {
-            Operand::Shape(ShapeData::of(&shape))
+            Operand::Shape(shape.into_data())
         });
         self.subscribe(stroke.subscribe, command, Operand::Stroke);
         self.subscribe(paint.subscribe, command, paint_operand::<P>);
@@ -327,11 +342,11 @@ impl Draw for Recorder {
     fn shadow<S: Shape>(&mut self, shape: impl Into<Live<S>>, shadow: impl Into<Live<Shadow>>) {
         let (shape, shadow) = (shape.into(), shadow.into());
         let command = self.list.push(Command::Shadow {
-            shape: ShapeData::of(&shape.value),
+            shape: shape.value.into_data(),
             shadow: shadow.value,
         });
         self.subscribe(shape.subscribe, command, |shape: S| {
-            Operand::Shape(ShapeData::of(&shape))
+            Operand::Shape(shape.into_data())
         });
         self.subscribe(shadow.subscribe, command, Operand::Shadow);
     }
@@ -367,11 +382,11 @@ impl Draw for Recorder {
     fn clip<S: Shape>(&mut self, shape: impl Into<Live<S>>, body: impl FnOnce(&mut Self)) {
         let shape = shape.into();
         let begin = self.list.push(Command::BeginClip {
-            shape: ShapeData::of(&shape.value),
+            shape: shape.value.into_data(),
             end: 0,
         });
         self.subscribe(shape.subscribe, begin, |shape: S| {
-            Operand::Shape(ShapeData::of(&shape))
+            Operand::Shape(shape.into_data())
         });
         body(self);
         self.list.end(begin);
@@ -506,6 +521,7 @@ mod tests {
 
     use super::*;
     use crate::color::{Color, Srgb};
+    use crate::shape::ShapeData;
 
     fn red() -> Color<Srgb> {
         Color::new([1., 0., 0., 1.])

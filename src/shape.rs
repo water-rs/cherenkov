@@ -3,7 +3,7 @@
 use std::any::Any;
 use std::borrow::Cow;
 
-use kurbo::{Circle, Ellipse, Line, PathEl, Rect, RoundedRect, RoundedRectRadii};
+use kurbo::{BezPath, Circle, Ellipse, Line, PathEl, Rect, RoundedRect, RoundedRectRadii};
 use nami_core::Signal;
 use nami_core::watcher::Context;
 use serde::{Deserialize, Serialize};
@@ -22,6 +22,15 @@ pub const PATH_TOLERANCE: f64 = 1e-3;
 pub trait Shape: 'static {
     /// What the engine may draw with a fast path.
     fn semantic(&self) -> Semantic<'_>;
+
+    /// The shape's recorded data. Shapes that store their path elements move
+    /// them instead of copying.
+    fn into_data(self) -> ShapeData
+    where
+        Self: Sized,
+    {
+        ShapeData::of(&self)
+    }
 }
 
 /// The engine's fast-path vocabulary: the shapes it draws analytically. Every
@@ -89,6 +98,19 @@ impl<T: kurbo::Shape + 'static> Shape for T {
             rule: FillRule::NonZero,
         })
     }
+
+    fn into_data(mut self) -> ShapeData {
+        let path = (&mut self as &mut dyn Any)
+            .downcast_mut::<BezPath>()
+            .map(std::mem::take);
+        path.map_or_else(
+            || ShapeData::of(&self),
+            |path| ShapeData::Path {
+                elements: path.into_iter().collect(),
+                rule: FillRule::NonZero,
+            },
+        )
+    }
 }
 
 /// A rectangle with continuous corners: each corner blends into the straight
@@ -144,6 +166,16 @@ impl<S: Shape> Shape for EvenOdd<S> {
                 rule: FillRule::EvenOdd,
                 ..path
             }),
+            other => other,
+        }
+    }
+
+    fn into_data(self) -> ShapeData {
+        match self.0.into_data() {
+            ShapeData::Path { elements, .. } => ShapeData::Path {
+                elements,
+                rule: FillRule::EvenOdd,
+            },
             other => other,
         }
     }
@@ -271,5 +303,36 @@ mod tests {
             panic!("still a path");
         };
         assert_eq!(even_odd.rule, FillRule::EvenOdd);
+    }
+
+    #[test]
+    fn into_data_moves_path_elements() {
+        let mut path = BezPath::new();
+        path.move_to((0., 0.));
+        path.line_to((10., 0.));
+        path.line_to((0., 10.));
+        path.close_path();
+        let elements: Vec<PathEl> = path.iter().collect();
+        let ShapeData::Path {
+            elements: moved,
+            rule,
+        } = path.into_data()
+        else {
+            panic!("a BezPath records as a path");
+        };
+        assert_eq!(moved, elements);
+        assert_eq!(rule, FillRule::NonZero);
+
+        let mut path = BezPath::new();
+        path.move_to((0., 0.));
+        path.line_to((1., 0.));
+        path.close_path();
+        let ShapeData::Path { rule, .. } = EvenOdd(path).into_data() else {
+            panic!("still a path");
+        };
+        assert_eq!(rule, FillRule::EvenOdd);
+
+        let rect = Rect::new(0., 0., 1., 1.);
+        assert_eq!(rect.into_data(), ShapeData::Rect(rect));
     }
 }

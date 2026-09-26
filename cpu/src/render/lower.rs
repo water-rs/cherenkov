@@ -794,7 +794,9 @@ impl<'a> Lowering<'a> {
     /// Compile the shifted caster and clips, then convolve the exact field.
     fn shadow(&mut self, shape: &ShapeData, shadow: &cherenkov::Shadow) {
         use crate::render::coverage::{Combine, rasterize_combined};
-        let tolerance = FLATTEN_TOL / sigma_max(self.transform).max(1e-12);
+        // Shape/stroke approximation and device flattening share one error budget.
+        let segment_tolerance = FLATTEN_TOL * 0.5;
+        let tolerance = segment_tolerance / sigma_max(self.transform).max(1e-12);
         let Some((path, rule, spread)) = shadow_path(shape, shadow.spread, tolerance) else {
             return;
         };
@@ -816,7 +818,7 @@ impl<'a> Lowering<'a> {
         }
         let coverage = self.res.coverage_cache.get_or_insert(key, || {
             let mut operands = vec![Operand {
-                edges: flatten_edges(transform * path.clone(), FLATTEN_TOL).into(),
+                edges: flatten_edges(transform * path.clone(), segment_tolerance).into(),
                 rule,
             }];
             let combine = if spread == 0.0 {
@@ -831,7 +833,7 @@ impl<'a> Lowering<'a> {
                     tolerance,
                 );
                 operands.push(Operand {
-                    edges: flatten_edges(transform * band, FLATTEN_TOL).into(),
+                    edges: flatten_edges(transform * band, segment_tolerance).into(),
                     rule: FillRule::NonZero,
                 });
                 if spread > 0.0 {

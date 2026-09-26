@@ -15,9 +15,9 @@ use skrifa::outline::{DrawSettings, OutlinePen};
 use skrifa::raw::TableProvider;
 use skrifa::raw::types::F2Dot14;
 
-use crate::error::RenderError;
 use crate::render::lower::GlyphReq;
 use crate::render::raster::{Accum, Edge};
+use cherenkov::{FontData, RenderError};
 
 /// A glyph cache key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -192,10 +192,7 @@ const fn empty() -> GlyphMask {
     clippy::many_single_char_names,
     reason = "glyph mask coordinates are small; a/b/c/d/m are affine names"
 )]
-pub fn rasterize_mask(
-    font: &crate::render::FontData,
-    req: &GlyphReq,
-) -> Result<GlyphMask, RenderError> {
+pub fn rasterize_mask(font: &FontData, req: &GlyphReq) -> Result<GlyphMask, RenderError> {
     let font_ref = skrifa::FontRef::from_index(&font.data, font.index)
         .map_err(|e| RenderError::Font(format!("{e}")))?;
     let upem = font_ref

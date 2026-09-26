@@ -133,6 +133,8 @@ pub enum Unsupported {
     GlyphTransform,
     /// A colour font (COLR, CBDT or sbix).
     ColorFont,
+    /// A transparent gradient or pattern extend (`Extend::None`).
+    Extend,
 }
 
 impl std::fmt::Display for Unsupported {
@@ -151,6 +153,7 @@ impl std::fmt::Display for Unsupported {
             Self::Shadow => "shadow",
             Self::GlyphTransform => "glyph-transform",
             Self::ColorFont => "color-font",
+            Self::Extend => "extend-none",
         })
     }
 }

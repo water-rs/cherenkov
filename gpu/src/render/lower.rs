@@ -529,8 +529,8 @@ pub struct LayerNode {
 pub enum ContentData {
     /// A shared picture.
     Picture(cherenkov::Picture),
-    /// A live display list.
-    List(DisplayList),
+    /// A live display list, shared with its `Content` until it changes.
+    List(cherenkov::Picture),
 }
 
 /// GPU resources the lowering needs to emit glyph instances.
@@ -1094,11 +1094,8 @@ impl<'a> Lowering<'a> {
         glyphs: &mut GlyphContext<'_>,
     ) -> Result<(), RenderError> {
         match &node.content {
-            Some(ContentData::Picture(p)) => {
+            Some(ContentData::Picture(p) | ContentData::List(p)) => {
                 self.commands(p.display_list(), 0, p.display_list().len(), glyphs)?;
-            }
-            Some(ContentData::List(list)) => {
-                self.commands(list, 0, list.len(), glyphs)?;
             }
             None => {}
         }

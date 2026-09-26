@@ -38,6 +38,24 @@ fn over<S: Simd>(simd: S, destination: [S::f32s; 4], source: [S::f32s; 4]) -> [S
     })
 }
 
+/// Put coverage in the same lane order as a four-channel pixel block.
+/// Pulp's shuffle transpose may permute pixels within each channel vector.
+/// Transposing coverage through that same layout keeps each value with its pixel.
+#[expect(
+    clippy::inline_always,
+    reason = "the coverage transpose must inline into the SIMD target-feature context"
+)]
+#[inline(always)]
+fn coverage_lanes<S: Simd>(simd: S, coverage: S::f32s) -> S::f32s {
+    let mut pixels = [simd.splat_f32s(0.0); 4];
+    let values: &[f32] = pulp::bytemuck::cast_slice(std::slice::from_ref(&coverage));
+    let channels: &mut [[f32; 4]] = pulp::bytemuck::cast_slice_mut(&mut pixels);
+    for (pixel, &value) in channels.iter_mut().zip(values) {
+        pixel[0] = value;
+    }
+    simd.deinterleave_shfl_f32s(pixels)[0]
+}
+
 /// Composite a solid colour through a scalar coverage span.
 /// Coverage and destination have matching lengths by construction.
 #[expect(
@@ -51,6 +69,7 @@ pub fn solid_span<S: Simd>(simd: S, pixels: &mut [[f32; 4]], coverage: &[f32], c
     let (coverage_vectors, _) = S::as_simd_f32s(&coverage[..count]);
     let colors = color.map(|channel| simd.splat_f32s(channel));
     for (pixel, &coverage) in pixels.iter_mut().zip(coverage_vectors) {
+        let coverage = coverage_lanes(simd, coverage);
         let destination = simd.deinterleave_shfl_f32s(*pixel);
         let source = colors.map(|channel| simd.mul_f32s(channel, coverage));
         let active = simd.greater_than_f32s(coverage, simd.splat_f32s(0.0));

@@ -141,7 +141,7 @@ impl LayerBuilder<'_> {
 
     /// The number of items pushed so far — the index the next item gets.
     #[must_use]
-    pub fn item_count(&self) -> usize {
+    pub const fn item_count(&self) -> usize {
         self.layer.items.len()
     }
 

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub use crate::render::filter::EffectBox;
+pub use crate::render::present::{OutputAlpha, OutputColor, Presenter, TextureOutput};
 
 /// The device types and drawing contexts exposed to custom GPU producers.
 pub mod wgpu {
@@ -165,5 +166,39 @@ impl RedrawCallback {
 impl std::fmt::Debug for RedrawCallback {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RedrawCallback").finish_non_exhaustive()
+    }
+}
+
+/// An existing device shared with a native presentation host.
+/// All four handles must belong to the same device creation chain.
+#[derive(Clone, Debug)]
+pub struct SharedDevice {
+    /// Instance used to create the adapter and native surfaces.
+    pub instance: wgpu::Instance,
+    /// Adapter used to create the device.
+    pub adapter: wgpu::Adapter,
+    /// Device used for both engine composition and native presentation.
+    pub device: wgpu::Device,
+    /// This device's submission queue.
+    pub queue: wgpu::Queue,
+}
+
+/// A surface whose engine-owned linear P3 texture is handed to a native host.
+/// The host receives a new texture only on creation and resize, then samples
+/// the retained texture after `Engine::render` completes. Presentation must
+/// use the same device supplied through `GpuConfig::device`.
+#[derive(Debug)]
+pub struct TextureTarget {
+    pub(crate) size: (u32, u32),
+    pub(crate) textures: std::sync::mpsc::Sender<wgpu::Texture>,
+}
+
+impl TextureTarget {
+    /// Creates a target and its resize notification channel.
+    /// Textures contain premultiplied linear Display P3, in `Rgba16Float`.
+    #[must_use]
+    pub fn new(size: (u32, u32)) -> (Self, std::sync::mpsc::Receiver<wgpu::Texture>) {
+        let (textures, receiver) = std::sync::mpsc::channel();
+        (Self { size, textures }, receiver)
     }
 }

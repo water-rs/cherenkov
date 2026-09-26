@@ -70,6 +70,8 @@ pub enum ScratchFormat {
 /// Configuration for the GPU engine.
 #[derive(Clone, Debug)]
 pub struct GpuConfig {
+    /// Shares a native host device; `None` creates an engine-owned device.
+    pub device: Option<interop::SharedDevice>,
     /// Which wgpu backends may be used. Defaults to all.
     pub backends: wgpu::Backends,
     /// Adapter power preference. Defaults to high performance.
@@ -94,6 +96,7 @@ pub struct GpuConfig {
 impl Default for GpuConfig {
     fn default() -> Self {
         Self {
+            device: None,
             backends: wgpu::Backends::all(),
             power_preference: wgpu::PowerPreference::HighPerformance,
             timestamps: false,
@@ -113,6 +116,8 @@ pub enum GpuTarget {
     Offscreen(Offscreen),
     /// A window.
     Window(WindowTarget),
+    /// Engine-owned output texture shared with a native presenter.
+    Texture(interop::TextureTarget),
 }
 
 /// A window the engine presents on: a raw window handle and the drawable
@@ -170,6 +175,12 @@ impl From<WindowTarget> for GpuTarget {
     }
 }
 
+impl From<interop::TextureTarget> for GpuTarget {
+    fn from(target: interop::TextureTarget) -> Self {
+        Self::Texture(target)
+    }
+}
+
 impl From<Offscreen> for GpuTarget {
     fn from(offscreen: Offscreen) -> Self {
         Self::Offscreen(offscreen)
@@ -215,6 +226,15 @@ impl cherenkov::Effects for Gpu {
 
 impl cherenkov::GpuContent for Gpu {
     type Content = interop::GpuContentBox;
+
+    fn resize_gpu_content(
+        renderer: &mut Self::Renderer,
+        surface: cherenkov::SurfaceId,
+        layer: cherenkov::LayerId,
+        size: (u32, u32),
+    ) {
+        renderer.resize_gpu_content(surface, layer, size);
+    }
 
     fn set_gpu_content(
         renderer: &mut Self::Renderer,

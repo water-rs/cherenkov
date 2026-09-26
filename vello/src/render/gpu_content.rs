@@ -23,6 +23,7 @@ pub struct GpuSlot {
     pub content: Box<dyn AnyGpuContent>,
     /// Created lazily on the first drawn frame.
     pub ready: Option<GpuReady>,
+    initialized: bool,
 }
 
 /// The lazily-created GPU state of a [`GpuSlot`].
@@ -54,6 +55,7 @@ impl GpuSlot {
             dirty,
             content,
             ready: None,
+            initialized: false,
         }
     }
 
@@ -100,13 +102,16 @@ impl GpuSlot {
             }
             self.ready = None;
         }
-        if self.ready.is_none() {
+        if !self.initialized {
             let ctx = Context {
                 device,
                 queue,
                 format: wgpu::TextureFormat::Rgba8Unorm,
             };
             self.content.setup(&ctx);
+            self.initialized = true;
+        }
+        if self.ready.is_none() {
             let texture = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("gpu content"),
                 size: wgpu::Extent3d {

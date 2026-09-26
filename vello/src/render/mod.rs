@@ -341,6 +341,17 @@ pub fn init(config: VelloConfig) -> Result<(VelloRenderer, VelloInfo), EngineErr
 impl VelloRenderer {
     /// Attaches a [`GpuContent`](crate::interop::GpuContent) box to a layer:
     /// the [`GpuContent`](cherenkov::GpuContent) capability hook.
+    pub fn resize_gpu_content(&mut self, surface: SurfaceId, layer: LayerId, size: (u32, u32)) {
+        let state = self.surfaces.get_mut(&surface).expect("GPU surface exists");
+        let cache = state.layers.get_mut(&layer).expect("GPU layer exists");
+        let Some(ContentData::Gpu(slot)) = &mut cache.content else {
+            panic!("layer has no GPU content");
+        };
+        assert!(size.0 > 0 && size.1 > 0, "GPU content size must be nonzero");
+        slot.size = size;
+        slot.dirty.store(true, std::sync::atomic::Ordering::Release);
+    }
+
     pub fn set_gpu_content(
         &mut self,
         surface: SurfaceId,

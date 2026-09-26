@@ -189,6 +189,15 @@ impl Effects for Vello {
 impl GpuContentCapability for Vello {
     type Content = interop::GpuContentBox;
 
+    fn resize_gpu_content(
+        renderer: &mut Self::Renderer,
+        surface: cherenkov::SurfaceId,
+        layer: cherenkov::LayerId,
+        size: (u32, u32),
+    ) {
+        renderer.resize_gpu_content(surface, layer, size);
+    }
+
     fn set_gpu_content(
         r: &mut Self::Renderer,
         surface: SurfaceId,

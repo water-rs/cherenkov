@@ -11,7 +11,7 @@ mod instance;
 mod lower;
 mod paint;
 mod path;
-mod present;
+pub mod present;
 mod raster;
 
 use std::collections::HashMap;
@@ -171,6 +171,7 @@ struct SurfaceState {
     shader_textures: HashMap<paint::Key, paint::Texture>,
     /// The swapchain the target is presented on, for window surfaces.
     window: Option<present::WindowSurface>,
+    textures: Option<std::sync::mpsc::Sender<wgpu::Texture>>,
 }
 
 impl SurfaceState {
@@ -300,6 +301,14 @@ struct PassMeta {
 fn create_device(
     config: &GpuConfig,
 ) -> Result<(wgpu::Instance, wgpu::Adapter, wgpu::Device, wgpu::Queue), EngineError> {
+    if let Some(shared) = &config.device {
+        return Ok((
+            shared.instance.clone(),
+            shared.adapter.clone(),
+            shared.device.clone(),
+            shared.queue.clone(),
+        ));
+    }
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: config.backends,
         ..wgpu::InstanceDescriptor::new_without_display_handle()
@@ -741,14 +750,15 @@ impl Renderer for GpuRenderer {
         id: SurfaceId,
         target: GpuTarget,
     ) -> Result<SurfaceInfo, SurfaceError> {
-        let (size, window) = match target {
+        let (size, window, textures) = match target {
+            GpuTarget::Texture(target) => (target.size, None, Some(target.textures)),
             GpuTarget::Offscreen(offscreen) => {
                 // The target is always Rgba16Float and readback decodes f16,
                 // so only the f16 readback format is honest.
                 if offscreen.format != cherenkov::OffscreenFormat::LinearF16 {
                     return Err(SurfaceError::UnsupportedFormat(offscreen.format));
                 }
-                (offscreen.size, None)
+                (offscreen.size, None, None)
             }
             GpuTarget::Window(window) => {
                 let (handle, size, transparent) = window.into_parts();
@@ -763,7 +773,7 @@ impl Renderer for GpuRenderer {
                     size,
                     transparent,
                 )?;
-                (size, Some(window))
+                (size, Some(window), None)
             }
         };
         if size.0 == 0 || size.1 == 0 {
@@ -783,6 +793,11 @@ impl Renderer for GpuRenderer {
             TARGET_USAGES,
             TARGET_FORMAT,
         );
+        if let Some(textures) = &textures {
+            textures.send(target.clone()).map_err(|_| {
+                SurfaceError::UnsupportedTarget("native texture receiver dropped".into())
+            })?;
+        }
         self.surfaces.insert(
             id,
             SurfaceState {
@@ -796,6 +811,7 @@ impl Renderer for GpuRenderer {
                 frame: LoweredFrame::default(),
                 shader_textures: HashMap::new(),
                 window,
+                textures,
             },
         );
         Ok(SurfaceInfo {
@@ -815,6 +831,11 @@ impl Renderer for GpuRenderer {
             TARGET_USAGES,
             TARGET_FORMAT,
         );
+        if let Some(textures) = &state.textures {
+            textures
+                .send(target.clone())
+                .expect("native texture receiver dropped before surface");
+        }
         state.size = size;
         state.target = target;
         state.view = view;
@@ -1174,6 +1195,19 @@ impl GpuRenderer {
         source: &cherenkov::ShaderSource,
     ) -> Result<(), ResourceError> {
         self.shaders.add(&self.device, id.raw(), source)
+    }
+
+    pub(crate) fn resize_gpu_content(
+        &mut self,
+        surface: SurfaceId,
+        layer: LayerId,
+        size: (u32, u32),
+    ) {
+        let state = self.surfaces.get_mut(&surface).expect("GPU surface exists");
+        let ContentData::Gpu(slot) = state.layers.get_mut(&layer).expect("GPU layer exists") else {
+            panic!("layer has no GPU content");
+        };
+        slot.resize(&self.device, size);
     }
 
     pub(crate) fn set_gpu_content(

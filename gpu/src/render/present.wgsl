@@ -54,6 +54,9 @@ fn fs_main(in: Vertex) -> @location(0) vec4<f32> {
             p3 = vec4<f32>(p3.rgb / p3.a, p3.a);
         }
     }
+    if present.encode == 2u {
+        return vec4<f32>(p3.rgb, alpha);
+    }
     // Linear Display P3 → linear sRGB (Bradford-adapted, D65).
     let rgb = vec3<f32>(
         1.2249402 * p3.r - 0.2249402 * p3.g,

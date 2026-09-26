@@ -307,6 +307,23 @@ pub struct LayerEdit<B: Backend> {
     default_animation: Option<Animation>,
 }
 
+impl<B: GpuContent> LayerEdit<B> {
+    /// Resizes this layer's GPU attachment, preserving its producer and setup.
+    ///
+    /// # Panics
+    /// When either dimension is zero or the layer has no GPU content.
+    pub fn gpu_content_size(&mut self, size: (u32, u32)) -> &mut Self {
+        assert!(size.0 > 0 && size.1 > 0, "GPU content size must be nonzero");
+        self.ops
+            .push(EditOp::Content(LayerContent::Install(Box::new(
+                move |renderer, surface, layer| {
+                    B::resize_gpu_content(renderer, surface, layer, size);
+                },
+            ))));
+        self
+    }
+}
+
 impl<B: Backend> LayerEdit<B> {
     /// Sets the local transform.
     pub fn transform(&mut self, transform: impl Into<Live<Affine>>) -> &mut Self {

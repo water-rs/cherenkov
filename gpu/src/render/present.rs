@@ -76,11 +76,6 @@ impl WindowSurface {
         Ok(Self { surface, config })
     }
 
-    /// The swapchain's texture format.
-    pub const fn format(&self) -> wgpu::TextureFormat {
-        self.config.format
-    }
-
     /// Reconfigures the swapchain to `size`.
     pub fn resize(&mut self, device: &wgpu::Device, size: (u32, u32)) {
         self.config.width = size.0.max(1);
@@ -112,6 +107,7 @@ impl WindowSurface {
 }
 
 /// The present pipelines, one per swapchain format seen.
+/// Presents retained engine textures into host-owned textures.
 pub struct Presenter {
     module: wgpu::ShaderModule,
     layout: wgpu::BindGroupLayout,
@@ -119,7 +115,7 @@ pub struct Presenter {
     sampler: wgpu::Sampler,
     pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
     /// Indexed by `encode * 3 + alpha`: see `Present` in `present.wgsl`.
-    uniforms: [wgpu::Buffer; 6],
+    uniforms: [wgpu::Buffer; 9],
 }
 
 impl Presenter {
@@ -197,6 +193,9 @@ impl Presenter {
                 uniform(1, 0),
                 uniform(1, 1),
                 uniform(1, 2),
+                uniform(2, 0),
+                uniform(2, 1),
+                uniform(2, 2),
             ],
         }
     }
@@ -249,15 +248,54 @@ impl Presenter {
         let Some(frame) = window.acquire(device)? else {
             return Ok(());
         };
-        let format = window.format();
-        let view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        let encode = usize::from(!format.is_srgb());
         let alpha = match window.config.alpha_mode {
-            wgpu::CompositeAlphaMode::PreMultiplied | wgpu::CompositeAlphaMode::Inherit => 1,
-            wgpu::CompositeAlphaMode::PostMultiplied => 2,
-            wgpu::CompositeAlphaMode::Auto | wgpu::CompositeAlphaMode::Opaque => 0,
+            wgpu::CompositeAlphaMode::PreMultiplied | wgpu::CompositeAlphaMode::Inherit => {
+                OutputAlpha::Premultiplied
+            }
+            wgpu::CompositeAlphaMode::PostMultiplied => OutputAlpha::Straight,
+            wgpu::CompositeAlphaMode::Auto | wgpu::CompositeAlphaMode::Opaque => {
+                OutputAlpha::Opaque
+            }
+        };
+        self.texture(
+            device,
+            queue,
+            source,
+            TextureOutput {
+                texture: &frame.texture,
+                color: OutputColor::Srgb,
+                alpha,
+            },
+        );
+        frame.present();
+        Ok(())
+    }
+
+    /// Composites an engine texture into a native texture on the same device.
+    /// `source` contains premultiplied linear Display P3. `color` describes
+    /// the destination's color space; sRGB texture formats encode in hardware.
+    pub fn texture(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        source: &wgpu::TextureView,
+        output: TextureOutput<'_>,
+    ) {
+        let TextureOutput {
+            texture: target,
+            color,
+            alpha,
+        } = output;
+        let format = target.format();
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let encode = match color {
+            OutputColor::Srgb => usize::from(!format.is_srgb()),
+            OutputColor::LinearDisplayP3 => 2,
+        };
+        let alpha = match alpha {
+            OutputAlpha::Opaque => 0,
+            OutputAlpha::Premultiplied => 1,
+            OutputAlpha::Straight => 2,
         };
         let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("present"),
@@ -302,7 +340,35 @@ impl Presenter {
             pass.draw(0..3, 0..1);
         }
         queue.submit([encoder.finish()]);
-        frame.present();
-        Ok(())
     }
+}
+
+/// Color space of a host-owned presentation texture.
+#[derive(Clone, Copy, Debug)]
+pub enum OutputColor {
+    /// sRGB primaries and transfer; sRGB texture formats encode in hardware.
+    Srgb,
+    /// Extended linear Display P3, preserving HDR values in float targets.
+    LinearDisplayP3,
+}
+
+/// Alpha convention of a host-owned presentation texture.
+#[derive(Clone, Copy, Debug)]
+pub enum OutputAlpha {
+    /// The destination is opaque.
+    Opaque,
+    /// Channels are multiplied by alpha.
+    Premultiplied,
+    /// Channels are independent of alpha.
+    Straight,
+}
+
+/// A host-owned texture and its presentation conventions.
+pub struct TextureOutput<'a> {
+    /// Attachment on the same device as the source.
+    pub texture: &'a wgpu::Texture,
+    /// Destination color encoding.
+    pub color: OutputColor,
+    /// Destination alpha convention.
+    pub alpha: OutputAlpha,
 }

@@ -309,8 +309,10 @@ fn shadow(s: Shape, p: vec2<f32>, sigma: f32) -> f32 {
         return 0.0;
     }
     let rmax = max(max(max(s.radii.x, s.radii.y), max(s.radii.z, s.radii.w)), 0.0);
+    // Rows whose corner insets are beyond 4σ of p integrate like straight rows.
+    let straight = abs(p.x) <= s.half.x - rmax - 4.0 * sigma;
     // Rows |y| < band have straight sides: the integral is separable.
-    let band = max(s.half.y - rmax, 0.0);
+    let band = select(max(s.half.y - rmax, 0.0), s.half.y, straight);
     var acc = 0.0;
     let ya = max(lo, -band);
     let yb = min(hi, band);

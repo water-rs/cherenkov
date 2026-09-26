@@ -59,22 +59,58 @@ pub const fn interpolation(i: Interpolation) -> Result<ColorSpaceTag, Unsupporte
     }
 }
 
-/// `cherenkov::Extend` → `peniko::Extend` (the same three variants).
-#[must_use]
-pub const fn extend(e: cherenkov::Extend) -> peniko::Extend {
+/// `cherenkov::Extend` → `peniko::Extend`. Peniko has no transparent
+/// extend, so [`Unsupported::Extend`] is returned for `Extend::None`.
+///
+/// # Errors
+/// [`Unsupported::Extend`] for `Extend::None`.
+pub const fn extend(e: cherenkov::Extend) -> Result<peniko::Extend, Unsupported> {
     match e {
-        cherenkov::Extend::Pad => peniko::Extend::Pad,
-        cherenkov::Extend::Repeat => peniko::Extend::Repeat,
-        cherenkov::Extend::Reflect => peniko::Extend::Reflect,
+        cherenkov::Extend::Pad => Ok(peniko::Extend::Pad),
+        cherenkov::Extend::Repeat => Ok(peniko::Extend::Repeat),
+        cherenkov::Extend::Reflect => Ok(peniko::Extend::Reflect),
+        cherenkov::Extend::None => Err(Unsupported::Extend),
     }
 }
 
-/// `cherenkov::BlendMode` → `peniko::BlendMode`: a `Mix` over `SrcOver`.
+/// `cherenkov::BlendMode` → `peniko::BlendMode`: separable and
+/// non-separable modes become a `Mix` over `SrcOver`; Porter-Duff modes
+/// become a `Compose` under `Mix::Normal`.
 #[must_use]
 pub const fn blend(m: BlendMode) -> peniko::BlendMode {
-    use peniko::Mix;
+    use peniko::{Compose, Mix};
+    let compose = match m {
+        BlendMode::Clear => Some(Compose::Clear),
+        BlendMode::Src => Some(Compose::Copy),
+        BlendMode::Dst => Some(Compose::Dest),
+        BlendMode::DestOver => Some(Compose::DestOver),
+        BlendMode::SrcIn => Some(Compose::SrcIn),
+        BlendMode::DestIn => Some(Compose::DestIn),
+        BlendMode::SrcOut => Some(Compose::SrcOut),
+        BlendMode::DestOut => Some(Compose::DestOut),
+        BlendMode::SrcAtop => Some(Compose::SrcAtop),
+        BlendMode::DestAtop => Some(Compose::DestAtop),
+        BlendMode::Xor => Some(Compose::Xor),
+        BlendMode::PlusLighter => Some(Compose::PlusLighter),
+        _ => None,
+    };
+    if let Some(compose) = compose {
+        return peniko::BlendMode::new(Mix::Normal, compose);
+    }
     let mix = match m {
-        BlendMode::Normal => Mix::Normal,
+        BlendMode::Normal
+        | BlendMode::Clear
+        | BlendMode::Src
+        | BlendMode::Dst
+        | BlendMode::DestOver
+        | BlendMode::SrcIn
+        | BlendMode::DestIn
+        | BlendMode::SrcOut
+        | BlendMode::DestOut
+        | BlendMode::SrcAtop
+        | BlendMode::DestAtop
+        | BlendMode::Xor
+        | BlendMode::PlusLighter => Mix::Normal,
         BlendMode::Multiply => Mix::Multiply,
         BlendMode::Screen => Mix::Screen,
         BlendMode::Overlay => Mix::Overlay,

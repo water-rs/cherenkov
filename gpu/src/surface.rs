@@ -133,12 +133,32 @@ pub enum Next {
     },
 }
 
+/// One timed render pass of the last [`crate::Engine::render`].
+#[derive(Clone, Debug)]
+pub struct PassTiming {
+    /// The pass's deterministic name: `"surface"` or `"scratch{n}"` by
+    /// isolation depth.
+    pub name: String,
+    /// Target width in pixels.
+    pub width: u32,
+    /// Target height in pixels.
+    pub height: u32,
+    /// Target texture format (`"rgba16float"`, `"rgba8unorm"`, ...).
+    pub format: &'static str,
+    /// GPU seconds the pass took, between its pass-boundary timestamp
+    /// writes.
+    pub gpu_seconds: f64,
+}
+
 /// Measurements of the last [`crate::Engine::render`].
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct FrameStats {
     /// GPU seconds the frame took, when timestamp queries are enabled and
     /// supported.
     pub gpu_seconds: Option<f64>,
+    /// Per-pass GPU seconds, in submission order; empty when timestamp
+    /// queries are disabled or unsupported.
+    pub passes_timed: Vec<PassTiming>,
     /// Render passes recorded.
     pub passes: u32,
     /// Draw calls issued.
@@ -147,6 +167,8 @@ pub struct FrameStats {
     pub instances: u32,
     /// Glyphs rasterized into the atlas this frame.
     pub glyphs_rasterized: u32,
+    /// Paths rasterized (cache misses) this frame.
+    pub paths_rasterized: u32,
 }
 
 /// Decoded pixels of a surface readback: premultiplied linear Display P3,

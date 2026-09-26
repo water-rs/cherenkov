@@ -98,7 +98,8 @@ pub struct GpuConfig {
     /// Adapter power preference. Defaults to high performance.
     pub power_preference: wgpu::PowerPreference,
     /// When true and the adapter supports it, [`Engine::render`] measures
-    /// GPU time with drained timestamp queries.
+    /// GPU time with timestamp queries resolved a frame late — never
+    /// stalling the frame on GPU idle.
     ///
     /// [`Engine::render`]: crate::Engine::render
     pub timestamps: bool,

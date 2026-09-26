@@ -133,7 +133,9 @@ pub enum Next {
     },
 }
 
-/// One timed render pass of the last [`crate::Engine::render`].
+/// One timed render pass of the most recently resolved submission,
+/// usually the previous frame — queries resolve a frame late so
+/// [`crate::Engine::render`] never waits for GPU idle.
 #[derive(Clone, Debug)]
 pub struct PassTiming {
     /// The pass's deterministic name: `"surface"` or `"scratch{n}"` by
@@ -153,11 +155,12 @@ pub struct PassTiming {
 /// Measurements of the last [`crate::Engine::render`].
 #[derive(Clone, Debug, Default)]
 pub struct FrameStats {
-    /// GPU seconds the frame took, when timestamp queries are enabled and
-    /// supported.
+    /// GPU seconds of the most recently resolved submission — usually the
+    /// previous frame — when timestamp queries are enabled and supported.
     pub gpu_seconds: Option<f64>,
-    /// Per-pass GPU seconds, in submission order; empty when timestamp
-    /// queries are disabled or unsupported.
+    /// Per-pass GPU seconds of that same resolved submission, in
+    /// submission order; empty when timestamp queries are disabled or
+    /// unsupported.
     pub passes_timed: Vec<PassTiming>,
     /// Render passes recorded.
     pub passes: u32,

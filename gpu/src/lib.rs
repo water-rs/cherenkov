@@ -224,8 +224,10 @@ impl Engine<Gpu> {
     }
 
     /// Renders every dirty surface for the frame at `time`, blocking until
-    /// the render thread has submitted and — when timestamps are enabled —
-    /// drained the GPU.
+    /// the render thread has submitted the frame — never until the GPU is
+    /// idle. When timestamp queries are enabled their results resolve on a
+    /// later `render`: [`Engine::stats`]' `gpu_seconds`/`passes_timed`
+    /// describe the most recently completed submission.
     ///
     /// # Errors
     /// [`RenderError::Unsupported`] when a surface's content needs a feature
@@ -255,7 +257,8 @@ impl Engine<Gpu> {
         Ok(next)
     }
 
-    /// Statistics of the last [`Engine::render`].
+    /// Statistics of the last [`Engine::render`]. GPU timing fields lag
+    /// one frame: timestamp queries resolve once the GPU catches up.
     #[must_use]
     pub fn stats(&self) -> FrameStats {
         self.stats.borrow().clone()

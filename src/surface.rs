@@ -665,7 +665,10 @@ impl<B: Backend> Surface<B> {
                     EditOp::Blend(blend) => ops.push(Op::Layer(LayerOp::Blend(id, blend))),
                     EditOp::Filter(filter) => ops.push(Op::Layer(LayerOp::Filter(id, filter))),
                     EditOp::Content(LayerContent::Content(content)) => {
-                        let stored = shared.contents.entry(id).or_insert(content);
+                        // A fresh `Content` replaces the previous one whole
+                        // (its first `take_change` is a `Replace`).
+                        shared.contents.insert(id, content);
+                        let stored = shared.contents.get_mut(&id).expect("just inserted");
                         if let Some(change) = stored.take_change() {
                             let content_op = match change {
                                 ContentChange::Replace(list) => ContentOp::Replace(list),

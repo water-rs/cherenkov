@@ -334,6 +334,7 @@ dependencies = [
  "glifo",
  "kurbo",
  "libc",
+ "nami",
  "objc2",
  "objc2-metal",
  "peniko",

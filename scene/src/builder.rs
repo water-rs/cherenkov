@@ -122,13 +122,13 @@ impl LayerBuilder<'_> {
         self
     }
 
-    /// Set the layer's one-time motion.
     /// Adds a per-frame live item (see [`Layer::live`]).
     pub fn live(&mut self, live: crate::Live) -> &mut Self {
         self.layer.live.push(live);
         self
     }
 
+    /// Set the layer's one-time motion.
     pub const fn motion(&mut self, motion: Motion) -> &mut Self {
         self.layer.motion = Some(motion);
         self

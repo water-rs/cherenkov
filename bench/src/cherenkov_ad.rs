@@ -88,11 +88,298 @@ enum Op {
     },
 }
 
+/// A scene shape as a live operand: the [`ShapeKind`] kinds plus the
+/// fill rule carried on the path variant, so the slot value is
+/// self-contained.
+#[derive(Clone, PartialEq)]
+enum LiveShape {
+    /// `ShapeKind::Rect`.
+    Rect(Rect),
+    /// `ShapeKind::RoundedRect`.
+    RoundedRect(RoundedRect),
+    /// `ShapeKind::Continuous`.
+    Continuous(cherenkov::ContinuousRect),
+    /// `ShapeKind::Circle`.
+    Circle(Circle),
+    /// `ShapeKind::Ellipse`.
+    Ellipse(Ellipse),
+    /// `ShapeKind::Line`.
+    Line(Line),
+    /// A path with the fill rule it was recorded under.
+    Path {
+        /// The path.
+        path: BezPath,
+        /// The fill rule.
+        rule: cherenkov::FillRule,
+    },
+}
+
+impl LiveShape {
+    /// The live operand for `shape` under `rule` (paths only).
+    fn of(shape: &ShapeKind, rule: cherenkov::FillRule) -> Self {
+        match shape {
+            ShapeKind::Rect(s) => Self::Rect(*s),
+            ShapeKind::RoundedRect(s) => Self::RoundedRect(*s),
+            ShapeKind::Continuous(s) => Self::Continuous(*s),
+            ShapeKind::Circle(s) => Self::Circle(*s),
+            ShapeKind::Ellipse(s) => Self::Ellipse(*s),
+            ShapeKind::Line(s) => Self::Line(*s),
+            ShapeKind::Path(path) => Self::Path {
+                path: path.clone(),
+                rule,
+            },
+        }
+    }
+}
+
+impl cherenkov::Shape for LiveShape {
+    fn semantic(&self) -> cherenkov::Semantic<'_> {
+        match self {
+            Self::Rect(s) => cherenkov::Semantic::Rect(*s),
+            Self::RoundedRect(s) => cherenkov::Semantic::RoundedRect(*s),
+            Self::Continuous(s) => cherenkov::Semantic::Continuous(*s),
+            Self::Circle(s) => cherenkov::Semantic::Circle(*s),
+            Self::Ellipse(s) => cherenkov::Semantic::Ellipse(*s),
+            Self::Line(s) => cherenkov::Semantic::Line(*s),
+            Self::Path { path, rule } => cherenkov::Semantic::Path(cherenkov::PathRef {
+                elements: std::borrow::Cow::Borrowed(path.elements()),
+                rule: *rule,
+            }),
+        }
+    }
+}
+
+/// The core fill rule a scene rule lowers to.
+fn core_rule(rule: cherenkov_scene::FillRule) -> cherenkov::FillRule {
+    match rule {
+        cherenkov_scene::FillRule::EvenOdd => cherenkov::FillRule::EvenOdd,
+        cherenkov_scene::FillRule::NonZero => cherenkov::FillRule::NonZero,
+    }
+}
+
+/// `op`'s shape operand, or `None` when it has none.
+fn shape_op(op: &Op) -> Option<LiveShape> {
+    match op {
+        Op::Fill { shape, rule, .. } => Some(LiveShape::of(shape, core_rule(*rule))),
+        Op::Stroke { shape, .. } | Op::Shadow { shape, .. } => {
+            Some(LiveShape::of(shape, cherenkov::FillRule::NonZero))
+        }
+        Op::Glyphs { .. } | Op::Image { .. } => None,
+    }
+}
+
+/// `op`'s paint operand.
+fn paint_op(op: &Op) -> Option<cherenkov::Paint> {
+    match op {
+        Op::Fill { paint, .. }
+        | Op::Stroke { paint, .. }
+        | Op::Glyphs { paint, .. } => Some(paint.clone()),
+        Op::Shadow { .. } | Op::Image { .. } => None,
+    }
+}
+
+/// `op`'s stroke-style operand.
+fn stroke_op(op: &Op) -> Option<kurbo::Stroke> {
+    match op {
+        Op::Stroke { stroke, .. } => Some(stroke.clone()),
+        _ => None,
+    }
+}
+
+/// `op`'s shadow operand.
+fn shadow_op(op: &Op) -> Option<cherenkov::Shadow> {
+    match op {
+        Op::Shadow { shadow, .. } => Some(*shadow),
+        _ => None,
+    }
+}
+
+/// `op`'s glyph-run operand.
+fn run_op(op: &Op) -> Option<cherenkov::GlyphRun> {
+    match op {
+        Op::Glyphs { run, .. } => Some(run.clone()),
+        _ => None,
+    }
+}
+
+/// `op`'s destination-rect operand.
+fn dst_op(op: &Op) -> Option<Rect> {
+    match op {
+        Op::Image { dst, .. } => Some(*dst),
+        _ => None,
+    }
+}
+
+/// The slot bindings a live op is recorded with: one per operand that
+/// differs between frames.
+#[derive(Default)]
+struct LiveBindings {
+    /// Fill/stroke/shadow shape.
+    shape: Option<nami::Binding<LiveShape>>,
+    /// Fill/stroke/glyph paint.
+    paint: Option<nami::Binding<cherenkov::Paint>>,
+    /// Stroke style.
+    stroke: Option<nami::Binding<kurbo::Stroke>>,
+    /// Shadow spec.
+    shadow: Option<nami::Binding<cherenkov::Shadow>>,
+    /// Glyph run.
+    run: Option<nami::Binding<cherenkov::GlyphRun>>,
+    /// Image destination.
+    dst: Option<nami::Binding<Rect>>,
+}
+
+impl LiveBindings {
+    /// Binds the operands that differ across `frames`.
+    fn for_frames(frames: &[Op]) -> Self {
+        let mut b = Self::default();
+        let Some(base) = frames.first() else {
+            return b;
+        };
+        if frames.iter().any(|f| shape_op(f) != shape_op(base)) {
+            b.shape = shape_op(base).map(nami::binding);
+        }
+        if frames.iter().any(|f| paint_op(f) != paint_op(base)) {
+            b.paint = paint_op(base).map(nami::binding);
+        }
+        if frames.iter().any(|f| stroke_op(f) != stroke_op(base)) {
+            b.stroke = stroke_op(base).map(nami::binding);
+        }
+        if frames.iter().any(|f| shadow_op(f) != shadow_op(base)) {
+            b.shadow = shadow_op(base).map(nami::binding);
+        }
+        if frames.iter().any(|f| run_op(f) != run_op(base)) {
+            b.run = run_op(base).map(nami::binding);
+        }
+        if frames.iter().any(|f| dst_op(f) != dst_op(base)) {
+            b.dst = dst_op(base).map(nami::binding);
+        }
+        b
+    }
+
+    /// Sets each bound operand to `op`'s value where it differs from `prev`.
+    fn set(&self, op: &Op, prev: Option<&Op>) {
+        if let Some(b) = &self.shape
+            && prev.map_or(true, |p| shape_op(p) != shape_op(op))
+        {
+            b.set(shape_op(op).expect("bound op has a shape"));
+        }
+        if let Some(b) = &self.paint
+            && prev.map_or(true, |p| paint_op(p) != paint_op(op))
+        {
+            b.set(paint_op(op).expect("bound op has a paint"));
+        }
+        if let Some(b) = &self.stroke
+            && prev.map_or(true, |p| stroke_op(p) != stroke_op(op))
+        {
+            b.set(stroke_op(op).expect("bound op has a stroke"));
+        }
+        if let Some(b) = &self.shadow
+            && prev.map_or(true, |p| shadow_op(p) != shadow_op(op))
+        {
+            b.set(shadow_op(op).expect("bound op has a shadow"));
+        }
+        if let Some(b) = &self.run
+            && prev.map_or(true, |p| run_op(p) != run_op(op))
+        {
+            b.set(run_op(op).expect("bound op has a run"));
+        }
+        if let Some(b) = &self.dst
+            && prev.map_or(true, |p| dst_op(p) != dst_op(op))
+        {
+            b.set(dst_op(op).expect("bound op has a dst"));
+        }
+    }
+}
+
+/// One live draw item: the op per frame and the bindings it is driven by.
+struct LiveRun {
+    /// Op index inside the owning content run.
+    index: usize,
+    /// The op per frame (`frames[n % len]`).
+    frames: Vec<Op>,
+    /// The bindings the varying operands were recorded with.
+    bindings: LiveBindings,
+    /// The frame index last set; `None` until the first advance.
+    previous: Option<usize>,
+}
+
+impl LiveRun {
+    /// Sets the bindings to frame `n`'s values where they differ.
+    fn advance(&mut self, frame: u64) {
+        let n = frame as usize % self.frames.len();
+        if self.previous == Some(n) {
+            return;
+        }
+        let prev = self.previous.map(|p| &self.frames[p]);
+        self.bindings.set(&self.frames[n], prev);
+        self.previous = Some(n);
+    }
+}
+
+/// The operand a live op records: the binding when the operand varies
+/// across frames, a constant otherwise.
+fn live_or_const<T: Clone + 'static>(
+    binding: &Option<nami::Binding<T>>,
+    value: &T,
+) -> cherenkov::Live<T> {
+    match binding {
+        Some(b) => b.clone().into(),
+        None => nami::constant(value.clone()).into(),
+    }
+}
+
+/// Records `op` like [`record_op`], but with slot bindings for the
+/// operands that vary across its frames.
+fn record_live(c: &mut cherenkov::Recorder, op: &Op, bindings: &LiveBindings) {
+    match op {
+        Op::Fill { shape, rule, paint } => c.fill(
+            live_or_const(&bindings.shape, &LiveShape::of(shape, core_rule(*rule))),
+            live_or_const(&bindings.paint, paint),
+        ),
+        Op::Stroke {
+            shape,
+            stroke,
+            paint,
+        } => c.stroke(
+            live_or_const(
+                &bindings.shape,
+                &LiveShape::of(shape, cherenkov::FillRule::NonZero),
+            ),
+            live_or_const(&bindings.stroke, stroke),
+            live_or_const(&bindings.paint, paint),
+        ),
+        Op::Shadow { shape, shadow } => c.shadow(
+            live_or_const(
+                &bindings.shape,
+                &LiveShape::of(shape, cherenkov::FillRule::NonZero),
+            ),
+            live_or_const(&bindings.shadow, shadow),
+        ),
+        Op::Glyphs { run, paint } => c.glyphs(
+            live_or_const(&bindings.run, run),
+            live_or_const(&bindings.paint, paint),
+        ),
+        Op::Image {
+            image,
+            dst,
+            sampling,
+        } => c.image(*image, live_or_const(&bindings.dst, dst), *sampling),
+    }
+}
+
+/// A maximal run of draw items, drawn as one layer's content.
+struct ContentRun {
+    /// The recorded ops.
+    ops: Vec<Op>,
+    /// Live items inside the run.
+    live: Vec<LiveRun>,
+}
+
 /// A prepared child item: a draw-item run wrapped in its own layer, or a
 /// real child layer.
 enum PrepItem {
     /// A maximal run of draw items, drawn as one layer's content.
-    Content(Vec<Op>),
+    Content(ContentRun),
     /// A child scene layer.
     Layer(Box<PrepLayer>),
 }
@@ -110,7 +397,7 @@ struct PrepLayer {
     /// Scroll offset applied to content and children.
     scroll_offset: Vec2,
     /// The layer's own content — only when every draw precedes every child.
-    own: Vec<Op>,
+    own: ContentRun,
     /// Ordered children.
     items: Vec<PrepItem>,
     /// The layer's one-time motion.
@@ -126,6 +413,8 @@ struct ContentLayer {
     /// Command count of the last recording, re-used as the next one's
     /// capacity.
     last_len: usize,
+    /// Live items inside `ops`.
+    live: Vec<LiveRun>,
     /// The layer's one-time motion, committed on the first encode.
     motion: Option<LayerMotion>,
 }
@@ -147,6 +436,10 @@ pub struct Cherenkov {
     has_motion: bool,
     /// Whether the motion commits have been sent (first encode).
     motion_committed: bool,
+    /// Whether any content layer carries live items.
+    has_live: bool,
+    /// Encode frames since `prepare` (`frames[n % len]` for live items).
+    frame: u64,
     /// The fixed frame clock `submit` renders at.
     clock: Clock,
     counters: Counters,
@@ -588,7 +881,10 @@ fn prep_layer(
         clip: layer.clip.as_ref().map(shape_kind),
         opacity: layer.opacity,
         blend: gpu_blend(layer.blend),
-        own: Vec::new(),
+        own: ContentRun {
+            ops: Vec::new(),
+            live: Vec::new(),
+        },
         items: Vec::new(),
         motion: layer
             .motion
@@ -596,22 +892,45 @@ fn prep_layer(
             .map(|m| LayerMotion::from_scene(m, layer.transform)),
     };
     if own {
-        for item in &layer.items {
+        for (index, item) in layer.items.iter().enumerate() {
             match item {
-                Item::Draw(d) => prep.own.push(op(d, fonts, images, blobs)?),
+                Item::Draw(d) => {
+                    prep.own.ops.push(op(d, fonts, images, blobs)?);
+                    if let Some(live) =
+                        live_run(layer, index, prep.own.ops.len() - 1, fonts, images, blobs)?
+                    {
+                        prep.own.live.push(live);
+                    }
+                }
                 Item::Layer(l) => prep.items.push(PrepItem::Layer(Box::new(prep_layer(
                     l, fonts, images, blobs,
                 )?))),
             }
         }
     } else {
-        let mut run: Vec<Op> = Vec::new();
-        for item in &layer.items {
+        let mut run = ContentRun {
+            ops: Vec::new(),
+            live: Vec::new(),
+        };
+        for (index, item) in layer.items.iter().enumerate() {
             match item {
-                Item::Draw(d) => run.push(op(d, fonts, images, blobs)?),
+                Item::Draw(d) => {
+                    run.ops.push(op(d, fonts, images, blobs)?);
+                    if let Some(live) =
+                        live_run(layer, index, run.ops.len() - 1, fonts, images, blobs)?
+                    {
+                        run.live.push(live);
+                    }
+                }
                 Item::Layer(l) => {
-                    if !run.is_empty() {
-                        prep.items.push(PrepItem::Content(std::mem::take(&mut run)));
+                    if !run.ops.is_empty() {
+                        prep.items.push(PrepItem::Content(std::mem::replace(
+                            &mut run,
+                            ContentRun {
+                                ops: Vec::new(),
+                                live: Vec::new(),
+                            },
+                        )));
                     }
                     prep.items.push(PrepItem::Layer(Box::new(prep_layer(
                         l, fonts, images, blobs,
@@ -619,11 +938,53 @@ fn prep_layer(
                 }
             }
         }
-        if !run.is_empty() {
+        if !run.ops.is_empty() {
             prep.items.push(PrepItem::Content(run));
         }
     }
     Ok(prep)
+}
+
+/// Resolves a scene `live` entry targeting item `index` into a [`LiveRun`]
+/// at `position` inside its content run. `None` when no entry targets it.
+/// Errors when the target is not a draw or the frames are not all the
+/// same draw variant as the item.
+fn live_run(
+    layer: &SceneLayer,
+    index: usize,
+    position: usize,
+    fonts: &HashMap<(ResourceHash, u32), cherenkov::Font>,
+    images: &HashMap<ResourceHash, cherenkov::ImageId>,
+    blobs: &Blobs,
+) -> Result<Option<LiveRun>, BenchError> {
+    let Some(entry) = layer.live.iter().find(|live| live.item == index) else {
+        return Ok(None);
+    };
+    if !matches!(layer.items[index], Item::Draw(_)) {
+        return Err(BenchError::Engine(
+            "cherenkov: a live entry does not target a draw item".into(),
+        ));
+    }
+    let kind = std::mem::discriminant(&match &layer.items[index] {
+        Item::Draw(d) => op(d, fonts, images, blobs)?,
+        Item::Layer(_) => unreachable!("checked above"),
+    });
+    let mut frames = Vec::with_capacity(entry.frames.len());
+    for draw in &entry.frames {
+        let op = op(draw, fonts, images, blobs)?;
+        if std::mem::discriminant(&op) != kind {
+            return Err(BenchError::Engine(
+                "cherenkov: a live frame is not the item's draw variant".into(),
+            ));
+        }
+        frames.push(op);
+    }
+    Ok(Some(LiveRun {
+        index: position,
+        bindings: LiveBindings::for_frames(&frames),
+        frames,
+        previous: Some(0),
+    }))
 }
 
 /// Builds one engine layer for `prep` under `parent`, recursing into
@@ -653,12 +1014,13 @@ fn build_layer(
     tx[parent].push(&layer);
     for item in prep.items {
         match item {
-            PrepItem::Content(ops) => {
+            PrepItem::Content(run) => {
                 let child = surface.layer();
                 tx[&layer].push(&child);
                 content_layers.push(ContentLayer {
                     layer: child,
-                    ops,
+                    ops: run.ops,
+                    live: run.live,
                     last_len: 0,
                     motion: None,
                 });
@@ -668,7 +1030,8 @@ fn build_layer(
     }
     content_layers.push(ContentLayer {
         layer,
-        ops: prep.own,
+        ops: prep.own.ops,
+        live: prep.own.live,
         last_len: 0,
         motion: prep.motion,
     });
@@ -713,6 +1076,8 @@ impl Cherenkov {
             content_layers: Vec::new(),
             has_motion: false,
             motion_committed: false,
+            has_live: false,
+            frame: 0,
             clock: Clock::new(),
             counters: Counters::default(),
         })
@@ -760,6 +1125,8 @@ impl Engine for Cherenkov {
         });
         self.has_motion = content_layers.iter().any(|c| c.motion.is_some());
         self.motion_committed = false;
+        self.has_live = content_layers.iter().any(|c| !c.live.is_empty());
+        self.frame = 0;
         self.content_layers = content_layers;
         self.surface = Some(surface);
         Ok(())
@@ -772,8 +1139,8 @@ impl Engine for Cherenkov {
             .surface
             .as_ref()
             .ok_or_else(|| BenchError::Engine("cherenkov: encode before prepare".into()))?;
-        let first_motion = self.has_motion && !self.motion_committed;
-        if first_motion {
+        let first_frame = self.frame == 0;
+        if self.has_motion && first_frame {
             for cl in &self.content_layers {
                 if let Some(motion) = &cl.motion {
                     motion.apply(surface, &cl.layer);
@@ -781,18 +1148,21 @@ impl Engine for Cherenkov {
             }
             self.motion_committed = true;
         }
-        // Motion scenes record their content once: later encodes only
-        // advance the clock. Static scenes keep re-recording each frame
-        // so their numbers stay comparable.
-        if !self.has_motion || first_motion {
+        // Motion and live scenes record their content once: later encodes
+        // only set live bindings and advance the clock. Static scenes keep
+        // re-recording each frame so their numbers stay comparable.
+        if first_frame || !(self.has_motion || self.has_live) {
             let contents: Vec<(usize, cherenkov::Content)> = self
                 .content_layers
                 .iter()
                 .enumerate()
                 .map(|(i, cl)| {
                     let content = cherenkov::Content::record_with_capacity(cl.last_len, |c| {
-                        for op in &cl.ops {
-                            record_op(c, op);
+                        for (index, op) in cl.ops.iter().enumerate() {
+                            match cl.live.iter().find(|live| live.index == index) {
+                                Some(live) => record_live(c, op, &live.bindings),
+                                None => record_op(c, op),
+                            }
                         }
                     });
                     (i, content)
@@ -805,7 +1175,14 @@ impl Engine for Cherenkov {
                     tx[&cl.layer].content(content);
                 }
             });
+        } else {
+            for cl in &mut self.content_layers {
+                for live in &mut cl.live {
+                    live.advance(self.frame);
+                }
+            }
         }
+        self.frame += 1;
         self.clock.advance();
         Ok(())
     }

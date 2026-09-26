@@ -329,45 +329,40 @@ fn linear_t(inst: Instance, p: vec2<f32>) -> f32 {
     return dot(p - inst.grad.xy, d) / dd;
 }
 
-// Two-point conical gradient parameter: the largest t with r(t) >= 0 such
-// that |p - c(t)| = r(t). NaN (no solution) yields a transparent pixel.
+// Two-point conical gradient parameter, a literal port of the oracle's
+// radial_t: the larger real root of |p - (c0 + t·dc)| = r0 + t·dr.
+// Degenerate coincident circles use the relative distance from the centre.
+// NaN (no solution) yields a transparent pixel.
 fn radial_t(inst: Instance, p: vec2<f32>) -> f32 {
     let c0 = inst.grad.xy;
     let c1 = inst.grad.zw;
     let r0 = inst.grad2.x;
     let r1 = inst.grad2.y;
-    let cd = c1 - c0;
+    let dc = c1 - c0;
     let dr = r1 - r0;
     let pd = p - c0;
-    let a = dot(cd, cd) - dr * dr;
-    let b = dot(pd, cd) + r0 * dr;
+    let a = dot(dc, dc) - dr * dr;
+    // b = -2·((p - c0)·dc + r0·dr)
+    let b = -2.0 * (dot(pd, dc) + r0 * dr);
     let c = dot(pd, pd) - r0 * r0;
-    if abs(a) < 1e-9 {
+    if abs(a) < 1e-12 {
         if abs(b) < 1e-12 {
-            return bitcast<f32>(0x7fc00000u); // NaN
+            // Coincident circles: distance relative to r0.
+            if abs(r0) < 1e-12 {
+                return 0.0;
+            }
+            return (length(pd) - r0) / abs(r0);
         }
-        let t = c / (2.0 * b);
-        if r0 + t * dr < 0.0 {
-            return bitcast<f32>(0x7fc00000u);
-        }
-        return t;
+        return -c / b;
     }
-    let disc = b * b - a * c;
+    let disc = b * b - 4.0 * a * c;
     if disc < 0.0 {
         return bitcast<f32>(0x7fc00000u);
     }
     let sq = sqrt(disc);
-    let t1 = (b + sq) / a;
-    let t2 = (b - sq) / a;
-    let hi = max(t1, t2);
-    let lo = min(t1, t2);
-    if r0 + hi * dr >= 0.0 {
-        return hi;
-    }
-    if r0 + lo * dr >= 0.0 {
-        return lo;
-    }
-    return bitcast<f32>(0x7fc00000u);
+    // The cone answer is the larger root; when `a` is negative that is the
+    // smaller numerator, so compare the roots themselves.
+    return max((-b + sq) / (2.0 * a), (-b - sq) / (2.0 * a));
 }
 
 fn paint(inst: Instance, local: vec2<f32>, device: vec2<f32>) -> vec4<f32> {
@@ -385,7 +380,10 @@ fn paint(inst: Instance, local: vec2<f32>, device: vec2<f32>) -> vec4<f32> {
             } else {
                 t = radial_t(inst, local);
             }
-            if t != t {
+            // NaN (exponent all-ones, nonzero mantissa) → transparent.
+            // `t != t` is not reliable under every driver.
+            let tbits = bitcast<u32>(t);
+            if (tbits & 0x7f800000u) == 0x7f800000u && (tbits & 0x007fffffu) != 0u {
                 return vec4<f32>(0.0);
             }
             let extend = (inst.meta_.w >> 20u) & 0xfu;

@@ -235,7 +235,7 @@ pub fn emit(coverage: &Coverage) -> Result<(PathEmit, Vec<CellTexels>), RenderEr
                      h: usize|
      -> Result<(), RenderError> {
         let (Ok(w32), Ok(h32)) = (u32::try_from(w), u32::try_from(h)) else {
-            return Err(RenderError::Render("glyph atlas full".into()));
+            return Err(RenderError::AtlasFull);
         };
         let mut rows = Vec::with_capacity(w * h);
         for row in 0..h {

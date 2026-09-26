@@ -25,18 +25,7 @@ pub fn equivalence<R: Renderer>(renderer: &mut R)
 where
     R::Target: From<Offscreen>,
 {
-    let font = FontId::new(1);
-    renderer
-        .add_font(
-            font,
-            FontData {
-                data: std::fs::read("../scenes/fonts/NotoSans.ttf")
-                    .expect("test font")
-                    .into(),
-                index: 0,
-            },
-        )
-        .expect("register font");
+    let font = register_font(renderer);
     let mut list = fixture(font).display_list().clone();
     let stable = Picture::record(|c| c.fill(Rect::new(1., 1., 4., 4.), WorkingColor::WHITE));
     let mut tree = SurfaceTree::new();
@@ -133,6 +122,22 @@ where
         renderer.destroy_surface(id);
     }
     renderer.remove_font(font);
+}
+
+fn register_font(renderer: &mut impl Renderer) -> FontId {
+    let font = FontId::new(1);
+    renderer
+        .add_font(
+            font,
+            FontData {
+                data: std::fs::read("../scenes/fonts/NotoSans.ttf")
+                    .expect("test font")
+                    .into(),
+                index: 0,
+            },
+        )
+        .expect("register font");
+    font
 }
 
 fn render<R: Renderer>(

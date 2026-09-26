@@ -99,6 +99,9 @@ pub enum OffscreenFormat {
 }
 
 /// The presentation timestamp handed to [`crate::Engine::render`].
+///
+/// Reserved for animation scheduling: the engine currently renders on
+/// demand and ignores it.
 #[derive(Clone, Copy, Debug)]
 pub struct FrameTime(pub Instant);
 
@@ -120,11 +123,16 @@ impl FrameTime {
 pub type RefreshRange = RangeInclusive<u32>;
 
 /// What the engine needs next, returned by [`crate::Engine::render`].
+///
+/// Animation scheduling is unimplemented: `render` always returns
+/// [`Next::Idle`]. The `At` variant is the API shape for when signal
+/// changes can request a future frame.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Next {
     /// No animation is running; the display link may sleep.
     Idle,
     /// The next frame is needed at `time`, at a refresh rate in `rate`.
+    /// Never produced today — see the enum's docs.
     At {
         /// When the next frame is due.
         time: Instant,

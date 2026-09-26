@@ -152,14 +152,16 @@ impl Engine<Gpu> {
 
     /// Registers a font.
     ///
-    /// The data is parsed on the caller thread to reject invalid data and
-    /// colour fonts (`COLR`, `CBDT` or `sbix` tables), then handed to the
-    /// render thread.
+    /// The data is parsed on the caller thread to reject invalid data,
+    /// then handed to the render thread. `COLR` colour fonts are
+    /// supported — they render through the colour-glyph lowering — while
+    /// bitmap-only fonts (`CBDT`/`CBLC` or `sbix` with no outlines) cannot
+    /// rasterize.
     ///
     /// # Errors
     /// [`ResourceError::Font`] for unparseable data and
-    /// `ResourceError::Unsupported(Unsupported::ColorFont)` for colour
-    /// fonts.
+    /// `ResourceError::Unsupported(Unsupported::ColorFont)` for
+    /// bitmap-only fonts.
     pub fn font(&self, source: FontSource) -> Result<Font, ResourceError> {
         font::validate_font(&source.data, source.index)?;
         let id = self.next_font.get();
@@ -227,7 +229,9 @@ impl Engine<Gpu> {
     /// the render thread has submitted the frame — never until the GPU is
     /// idle. When timestamp queries are enabled their results resolve on a
     /// later `render`: [`Engine::stats`]' `gpu_seconds`/`passes_timed`
-    /// describe the most recently completed submission.
+    /// describe the most recently completed submission. Returns
+    /// [`Next::Idle`] — animation scheduling (`Next::At`) is
+    /// unimplemented.
     ///
     /// # Errors
     /// [`RenderError::Unsupported`] when a surface's content needs a feature

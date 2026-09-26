@@ -58,13 +58,23 @@ pub struct GlyphMask {
 /// A resolved glyph mask awaiting the band pass.
 pub type GlyphSlot = Arc<OnceLock<Arc<GlyphMask>>>;
 
+/// A cached mask plus its last-use counter for eviction.
+#[derive(Debug)]
+struct CacheEntry {
+    mask: Arc<GlyphMask>,
+    /// The `tick` at which the mask was last fetched or inserted.
+    used: u64,
+}
+
 /// The glyph mask cache: keyed masks plus byte accounting against the
-/// CPU budget.
+/// CPU budget. Over-budget batches evict least-recently-used entries.
 #[derive(Default)]
 pub struct GlyphCache {
-    map: HashMap<GlyphKey, Arc<GlyphMask>>,
+    map: HashMap<GlyphKey, CacheEntry>,
     bytes: u64,
     budget: u64,
+    /// Monotonically increasing use counter.
+    tick: u64,
 }
 
 impl GlyphCache {
@@ -74,12 +84,16 @@ impl GlyphCache {
             map: HashMap::new(),
             bytes: 0,
             budget,
+            tick: 0,
         }
     }
 
-    /// A cached mask, if present.
-    pub fn get(&self, key: &GlyphKey) -> Option<Arc<GlyphMask>> {
-        self.map.get(key).cloned()
+    /// A cached mask, if present, marked most recently used.
+    pub fn get(&mut self, key: &GlyphKey) -> Option<Arc<GlyphMask>> {
+        let entry = self.map.get_mut(key)?;
+        self.tick += 1;
+        entry.used = self.tick;
+        Some(Arc::clone(&entry.mask))
     }
 
     /// Current cached bytes.
@@ -87,34 +101,57 @@ impl GlyphCache {
         self.bytes
     }
 
-    /// Drops every cached mask (`Trim(Critical)` or an over-budget
-    /// batch insert, like the GPU atlas's flush-everything policy).
+    /// Drops every cached mask (`Trim(Critical)`).
     pub fn clear(&mut self) {
         self.map.clear();
         self.bytes = 0;
     }
 
-    /// Inserts `masks` (one `(key, mask)` pair per missing request).
-    /// When the batch would push the cache over budget, everything is
-    /// evicted first.
-    pub fn insert_batch(&mut self, masks: Vec<(GlyphKey, Arc<GlyphMask>)>) {
+    /// Inserts `masks` (one `(key, mask)` pair per missing request),
+    /// evicting least-recently-used entries until the batch fits.
+    ///
+    /// # Errors
+    /// [`RenderError::GlyphCacheExhausted`] when the batch alone exceeds
+    /// the budget: the frame's glyph set cannot be cached.
+    pub fn insert_batch(
+        &mut self,
+        masks: Vec<(GlyphKey, Arc<GlyphMask>)>,
+    ) -> Result<(), RenderError> {
         let batch: u64 = masks.iter().map(|(_, m)| mask_bytes(m)).sum();
+        if batch > self.budget {
+            return Err(RenderError::GlyphCacheExhausted);
+        }
         if self.bytes + batch > self.budget {
-            self.clear();
+            // Evict least-recently-used entries until the batch fits.
+            let mut oldest_first: Vec<(u64, GlyphKey)> = self
+                .map
+                .iter()
+                .map(|(key, entry)| (entry.used, *key))
+                .collect();
+            oldest_first.sort_unstable_by_key(|(used, _)| *used);
+            for (_, key) in oldest_first {
+                if self.bytes + batch <= self.budget {
+                    break;
+                }
+                if let Some(entry) = self.map.remove(&key) {
+                    self.bytes -= mask_bytes(&entry.mask);
+                }
+            }
         }
         for (key, mask) in masks {
-            let bytes = mask_bytes(&mask);
-            if bytes > self.budget {
-                continue;
-            }
-            if self.bytes + bytes > self.budget {
-                self.clear();
-            }
-            self.bytes += bytes;
-            if let Some(previous) = self.map.insert(key, mask) {
-                self.bytes -= mask_bytes(&previous);
+            self.tick += 1;
+            self.bytes += mask_bytes(&mask);
+            if let Some(previous) = self.map.insert(
+                key,
+                CacheEntry {
+                    mask,
+                    used: self.tick,
+                },
+            ) {
+                self.bytes -= mask_bytes(&previous.mask);
             }
         }
+        Ok(())
     }
 }
 
@@ -326,4 +363,58 @@ pub fn rasterize_mask(
         edges: edges.into(),
         cov,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(n: u32) -> GlyphKey {
+        GlyphKey {
+            font: 0,
+            glyph: n,
+            size_bits: 0,
+            subpixel: [0; 2],
+            matrix: [0; 4],
+            coords_hash: 0,
+        }
+    }
+
+    /// A mask of `bytes` coverage bytes and no outline.
+    fn mask(bytes: usize) -> Arc<GlyphMask> {
+        Arc::new(GlyphMask {
+            left: 0,
+            top: 0,
+            w: 0,
+            h: 0,
+            edges: Arc::from(Vec::new()),
+            cov: vec![0.0; bytes / 4],
+        })
+    }
+
+    #[test]
+    fn an_over_budget_batch_evicts_least_recently_used() {
+        let mut cache = GlyphCache::new(100);
+        cache
+            .insert_batch(vec![(key(1), mask(40)), (key(2), mask(40))])
+            .expect("fits");
+        // Touch key 1 so key 2 is least recently used.
+        assert!(cache.get(&key(1)).is_some());
+        cache
+            .insert_batch(vec![(key(3), mask(40))])
+            .expect("fits after eviction");
+        assert!(cache.get(&key(1)).is_some(), "recently used stays");
+        assert!(cache.get(&key(2)).is_none(), "least recently used evicted");
+        assert!(cache.get(&key(3)).is_some(), "new entry cached");
+        assert!(cache.bytes() <= 100, "within budget");
+    }
+
+    #[test]
+    fn a_batch_larger_than_the_budget_errors() {
+        let mut cache = GlyphCache::new(100);
+        let error = cache
+            .insert_batch(vec![(key(1), mask(60)), (key(2), mask(60))])
+            .expect_err("frame glyph set exceeds the cache budget");
+        assert!(matches!(error, RenderError::GlyphCacheExhausted));
+    }
 }

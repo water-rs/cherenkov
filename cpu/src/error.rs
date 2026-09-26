@@ -68,6 +68,9 @@ pub enum RenderError {
     /// rasterization is not yet implemented.
     #[error("font: {0}")]
     Font(String),
+    /// The frame's glyph masks exceed the glyph cache budget.
+    #[error("glyph cache exhausted")]
+    GlyphCacheExhausted,
 }
 
 /// A feature the engine vocabulary has but this backend slice does not draw.

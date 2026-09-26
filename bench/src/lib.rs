@@ -20,15 +20,16 @@
 //! | `skia-metal` | `skia-safe` | Graphite/Metal | `RGBAF16` premul render target, linear-P3 colours |
 //!
 //! GPU time is reported only where a real GPU timestamp source exists.
-//! The wgpu adapters and skia-vulkan bracket the engine submission with
+//! The external wgpu adapters and skia-vulkan bracket the engine submission with
 //! timestamps written in standalone submissions after a full queue drain
-//! (see [`wgpu_ctx::drain_and_stamp`]); skia-metal brackets Graphite's
+//! (see `wgpu_ctx::drain_and_stamp` when those adapters are enabled); skia-metal brackets Graphite's
 //! submission with empty `MTLCommandBuffer` markers on the same serial
 //! queue, each preceded by a drain (`commit` + `waitUntilCompleted`),
 //! and reads their `GPUStartTime`/`GPUEndTime`. This **serializes CPU
 //! and GPU** for the measured frame — a synchronous probe, not a
 //! pipelined frame rate. Where no timestamp source exists the field is
-//! `null` — it is never estimated.
+//! `null` — it is never estimated. The Cherenkov GPU adapter instead collects
+//! timestamps from completed earlier submissions without draining each frame.
 
 pub mod affinity;
 #[cfg(feature = "cherenkov")]

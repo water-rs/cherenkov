@@ -231,14 +231,14 @@ fn a_large_fill_spans_its_interior() -> Result<(), Box<dyn std::error::Error>> {
         (160, 40),
         (160, 280),
     ] {
-        let [r, g, b, a] = px(px_x, px_y);
-        let t = (f64::from(px_x) - 10.0 + 0.5) / 300.0;
+        let [red, green, blue, alpha] = px(px_x, px_y);
+        let frac = (f64::from(px_x) - 10.0 + 0.5) / 300.0;
         assert!(
-            (f64::from(r) - (1.0 - t)).abs() < 1.0 / 255.0
-                && f64::from(g) < 1.0 / 255.0
-                && (f64::from(b) - t).abs() < 1.0 / 255.0
-                && (f64::from(a) - 1.0).abs() < 1.0 / 255.0,
-            "pixel ({px_x},{px_y}): {r} {g} {b} {a}, expected t {t}"
+            (f64::from(red) - (1.0 - frac)).abs() < 1.0 / 255.0
+                && f64::from(green) < 1.0 / 255.0
+                && (f64::from(blue) - frac).abs() < 1.0 / 255.0
+                && (f64::from(alpha) - 1.0).abs() < 1.0 / 255.0,
+            "pixel ({px_x},{px_y}): {red} {green} {blue} {alpha}, expected frac {frac}"
         );
     }
     // Pixel x == 10 has its centre on the rect's left edge (10.5): it is

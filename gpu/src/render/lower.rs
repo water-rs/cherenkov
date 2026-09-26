@@ -1533,6 +1533,7 @@ impl<'a> Lowering<'a> {
     fn push_shadow_quads(&mut self, inst: &Instance, b: Rect, covered: Option<Rect>) {
         let mut inst = *inst;
         let c = covered
+            .map(|c| c.intersect(b))
             .filter(|c| c.width() > 0.0 && c.height() > 0.0)
             .filter(|_| inst.params[1] == 1.0);
         match c {

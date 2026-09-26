@@ -113,6 +113,14 @@ fn content_is_retained_clipped_and_wakes_an_idle_host() -> Result<(), Box<dyn st
     assert_eq!(setups.load(Ordering::Relaxed), 1);
     let pixels = surface.readback()?.pixels;
     assert!((pixels[5 * 16 + 5][1] - 0.5).abs() < 0.001);
+    send.send(wgpu::Color::BLUE)?;
+    surface.update(|tx| {
+        tx[&layer].gpu_content_size((4, 4));
+    });
+    engine.render(FrameTime::now())?;
+    assert_eq!(setups.load(Ordering::Relaxed), 1, "resize preserves setup");
+    assert_eq!(frames.load(Ordering::Relaxed), 3);
+    assert!((surface.readback()?.pixels[5 * 16 + 5][2] - 0.5).abs() < 0.001);
     drop(layer);
     engine.render(FrameTime::now())?;
     assert_eq!(drops.load(Ordering::Relaxed), 1);

@@ -51,6 +51,27 @@ impl Slot {
         }
     }
 
+    pub fn resize(&mut self, device: &wgpu::Device, size: (u32, u32)) {
+        assert!(size.0 > 0 && size.1 > 0, "GPU content size must be nonzero");
+        if (self.image.width, self.image.height) == size {
+            return;
+        }
+        let (texture, view) = super::create_target(
+            device,
+            "GPU content",
+            size,
+            super::TARGET_USAGES,
+            super::TARGET_FORMAT,
+        );
+        self.image = super::GpuImage {
+            texture,
+            view,
+            width: size.0,
+            height: size.1,
+        };
+        self.again = true;
+    }
+
     pub fn wants_redraw(&self) -> bool {
         self.again || self.content.redraw.is_dirty()
     }

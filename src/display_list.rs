@@ -303,6 +303,21 @@ impl TryFrom<DisplayListData> for DisplayList {
 }
 
 impl DisplayList {
+    /// An empty list with room for `capacity` commands.
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self {
+            commands: Vec::with_capacity(capacity),
+        }
+    }
+
+    /// Releases spare capacity when less than half of it was used, so a
+    /// small list recorded after a large one does not keep its reservation.
+    pub(crate) fn trim_spare(&mut self) {
+        if self.commands.capacity() > 2 * self.commands.len() {
+            self.commands.shrink_to_fit();
+        }
+    }
+
     /// The commands.
     #[must_use]
     pub fn commands(&self) -> &[Command] {
@@ -429,6 +444,17 @@ impl Picture {
     #[must_use]
     pub fn display_list(&self) -> &DisplayList {
         &self.0
+    }
+
+    /// The list for applying updates, cloned first while still shared.
+    pub(crate) fn list_mut(&mut self) -> &mut DisplayList {
+        Arc::make_mut(&mut self.0)
+    }
+
+    /// Applies slot updates and returns the commands to regenerate, cloning
+    /// the shared list first if another reference still holds it.
+    pub fn apply(&mut self, updates: impl IntoIterator<Item = SlotUpdate>) -> Dirty {
+        self.list_mut().apply(updates)
     }
 }
 

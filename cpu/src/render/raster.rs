@@ -487,6 +487,10 @@ mod tests {
 
     #[test]
     fn native_and_scalar_composition_are_bit_identical() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .expect("test pool");
         let (width, height) = (37, 35);
         let coverage = std::sync::Arc::new(Coverage::from_rows(
             0,
@@ -526,24 +530,26 @@ mod tests {
                 let mut scalar = vec![[0.0; 4]; width * height];
                 let mut native = scalar.clone();
                 let mut scratch = Vec::new();
-                render_bands(
-                    &items,
-                    [0.25; 4],
-                    &mut scalar,
-                    width,
-                    height,
-                    &mut scratch,
-                    pulp::Arch::Scalar,
-                );
-                render_bands(
-                    &items,
-                    [0.25; 4],
-                    &mut native,
-                    width,
-                    height,
-                    &mut scratch,
-                    pulp::Arch::new(),
-                );
+                pool.install(|| {
+                    render_bands(
+                        &items,
+                        [0.25; 4],
+                        &mut scalar,
+                        width,
+                        height,
+                        &mut scratch,
+                        pulp::Arch::Scalar,
+                    );
+                    render_bands(
+                        &items,
+                        [0.25; 4],
+                        &mut native,
+                        width,
+                        height,
+                        &mut scratch,
+                        pulp::Arch::new(),
+                    );
+                });
                 for (scalar, native) in scalar.into_iter().zip(native) {
                     assert_eq!(
                         scalar.map(f32::to_bits),

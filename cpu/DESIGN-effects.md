@@ -19,7 +19,9 @@ continues to identify that capability boundary.
 
 For shape `S`, drawing transform `T`, local offset `o`, and device-space clips,
 coverage is `area(pixel ∩ ((T · translate(o)) S) ∩ clip₁ ∩ … ∩ clipₙ)`.
-Shift the geometry before integration. Intersect clips before convolution;
+Shape/stroke approximation and device-space flattening each receive half of
+the 0.02-pixel curve budget. Shift the geometry before integration. Intersect
+clips before convolution;
 clipping the blurred image instead would remove its tail. Arbitrary contours,
 self-intersections, holes, rotations and shears use the same coverage compiler.
 
@@ -151,6 +153,15 @@ decode, convert to linear P3 and premultiply for storage. Alpha is never encoded
 no gamut clamp is added. Zero-alpha conversion yields transparent black.
 Nested groups perform these conversions at their own boundaries.
 
+Solid coverage spans, solid glyph rows and linear source-over isolation use
+portable SIMD selected once by the renderer. Each owned framebuffer band carries
+its concrete SIMD type through dispatch. Interleaved RGBA blocks are transposed
+into channel vectors, composited and transposed back; incomplete vectors use
+scalar arithmetic. Multiplication and addition remain separate and in the same
+order as scalar composition. Zero coverage and zero isolated alpha preserve the
+destination exactly. Native and scalar paths are checked bit for bit, including
+extended channels, partial vectors, partial bands and isolation.
+
 The oracle's pre-existing sRGB transfer implementation produced NaNs for
 negative channels outside its linear segment. Signed encoding and decoding now
 preserve the extended range. The largest-singular-value calculation also clamps
@@ -205,5 +216,5 @@ transformed colour glyph paint graphs.
 Exact area is relative to flattened geometry, as in the coverage design.
 Oracle curves are finer than CPU curves, so curved glyph/spread comparisons use
 bounds appropriate to the 0.02-pixel flattening tolerance. Polygon and mesh
-comparisons use floating-point rounding tolerances. No build, formatter, test
-or benchmark was run on the coordinating Mac; the VM provides that evidence.
+comparisons use floating-point rounding tolerances. Compilation, tests and benchmarks run on the build VM. The coordinating Mac
+only edits, performs file-scoped formatting and reviews the returned evidence.

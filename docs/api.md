@@ -117,8 +117,9 @@ pub trait Renderer: 'static {
       fn add_shader(r: &mut Self::Renderer, id: ShaderId, source: ShaderSource) -> Result<(), ResourceError>;
       fn remove_shader(r: &mut Self::Renderer, id: ShaderId);
   }
-  pub trait Runs<F: filtrate::Filter + Send>: Backend { fn add_filter(r: &mut Self::Renderer, id: FilterId, filter: F); fn remove_filter(r: &mut Self::Renderer, id: FilterId); }
-  pub trait Effects: Backend { fn add_effect(r: &mut Self::Renderer, id: FilterId, effect: Box<dyn filtrate::Effect + Send>); fn remove_filter(r: &mut Self::Renderer, id: FilterId); }
+  pub trait Filters: Backend { fn remove_filter(r: &mut Self::Renderer, id: FilterId); }
+  pub trait Runs<F: filtrate_core::Filter + Send>: Filters { fn add_filter(r: &mut Self::Renderer, id: FilterId, filter: F); }
+  pub trait Effects: Filters { type Effect: Send + 'static; fn add_effect(r: &mut Self::Renderer, id: FilterId, effect: Self::Effect); } // Box<dyn filtrate::Effect + Send> on GPU backends
   pub trait GpuContent: Backend { type Content: Send + 'static; fn set_gpu_content(r: &mut Self::Renderer, surface: SurfaceId, layer: LayerId, size: (u32, u32), content: Self::Content); }
   pub trait ExternalFrames: Backend { type Frame: Send + 'static; fn set_external_frame(r: &mut Self::Renderer, surface: SurfaceId, layer: LayerId, frame: Self::Frame); }
   pub trait Uploads<F: Format>: Backend {}      // which image storage formats `add_image` accepts

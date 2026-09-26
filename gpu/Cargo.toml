@@ -8,6 +8,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+askama = "0.16.1"
 cherenkov = { path = ".." }
 filtrate = { path = "../filtrate" }
 filtrate-core = { path = "../filtrate/core" }

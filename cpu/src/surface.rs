@@ -413,7 +413,10 @@ impl Surface {
     ///
     /// # Panics
     /// Panics if `body` panics; the transaction is then dropped unapplied.
-    pub fn update(&self, body: impl FnOnce(&mut Transaction<'_>)) {
+    ///
+    /// # Errors
+    /// [`SurfaceError::Lost`] when the render thread is gone.
+    pub fn update(&self, body: impl FnOnce(&mut Transaction<'_>)) -> Result<(), SurfaceError> {
         let mut tx = Transaction {
             edits: Vec::new(),
             _surface: PhantomData,
@@ -461,10 +464,12 @@ impl Surface {
             }
         }
         let clear = self.shared.borrow_mut().clear.take();
-        let _ = self.tx.send(Message::Commit {
-            surface: self.id,
-            changes: ChangeSet { clear, ops },
-        });
+        self.tx
+            .send(Message::Commit {
+                surface: self.id,
+                changes: ChangeSet { clear, ops },
+            })
+            .map_err(|_| SurfaceError::Lost)
     }
 
     /// The pixels of the surface after the last [`crate::Engine::render`].

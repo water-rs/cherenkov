@@ -21,7 +21,7 @@ use cherenkov_scene::{
 };
 use cherenkov_vello::{
     Engine as VelloEngine, FontSource, FrameTime, ImageSource, Layer as VelloLayer, Offscreen,
-    RenderError, ResourceError, Surface, Transaction, Unsupported, Vello, VelloConfig,
+    RenderError, Surface, Transaction, Unsupported, Vello, VelloConfig,
 };
 use kurbo::{Affine, BezPath, Circle, Ellipse, Line, Rect, RoundedRect, Vec2};
 
@@ -218,7 +218,7 @@ const fn unsupported_feature(u: Unsupported) -> Feature {
         Unsupported::GroupFilter | Unsupported::Filter => Feature::Opacity,
         Unsupported::Image => Feature::Image,
         Unsupported::Shadow => Feature::Shadow,
-        Unsupported::GlyphTransform | Unsupported::ColorFont => Feature::Glyphs,
+        Unsupported::GlyphTransform => Feature::Glyphs,
         _ => Feature::Fill,
     }
 }
@@ -494,17 +494,8 @@ fn register_resources(
                             .ok_or(cherenkov_scene::SceneError::MissingResource(run.font))?;
                         let font = engine
                             .font(FontSource::bytes(blob.clone()).with_index(run.font_index))
-                            .map_err(|e| match e {
-                                ResourceError::Unsupported(Unsupported::ColorFont) => {
-                                    BenchError::Unsupported {
-                                        engine: CherenkovVello::NAME,
-                                        feature: Feature::Glyphs,
-                                        api: Some(
-                                            "colour fonts (COLR/CBDT/sbix) are not supported",
-                                        ),
-                                    }
-                                }
-                                e => BenchError::Engine(format!("cherenkov-vello font: {e}")),
+                            .map_err(|e| {
+                                BenchError::Engine(format!("cherenkov-vello font: {e}"))
                             })?;
                         e.insert(font);
                     }

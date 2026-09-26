@@ -287,14 +287,14 @@ impl Engine<Vello> {
 
     /// Registers a font.
     ///
-    /// The data is parsed on the caller thread to reject invalid data and
-    /// colour fonts (`COLR`, `CBDT` or `sbix` tables), then handed to the
-    /// render thread.
+    /// The data is parsed on the caller thread to reject invalid data,
+    /// then handed to the render thread. Colour fonts (`COLR`, `CBDT` or
+    /// `sbix` tables) are supported — vello rasterizes colour glyphs
+    /// through `skrifa`.
     ///
     /// # Errors
-    /// [`ResourceError::Font`] for unparseable data and
-    /// `ResourceError::Unsupported(Unsupported::ColorFont)` for colour
-    /// fonts.
+    /// [`ResourceError::Font`] for unparseable data or an out-of-range
+    /// face index.
     pub fn font(&self, source: FontSource) -> Result<Font, ResourceError> {
         resource::validate_font(&source.data, source.index)?;
         let id = self.next_font.get();

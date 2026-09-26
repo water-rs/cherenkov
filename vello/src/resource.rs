@@ -9,10 +9,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
 
-use skrifa::raw::TableProvider;
 use vello::peniko;
 
-use crate::error::{ResourceError, Unsupported};
+use crate::error::ResourceError;
 use crate::message::Message;
 
 /// The data of a font to register with the engine.
@@ -87,23 +86,13 @@ impl Drop for Font {
     }
 }
 
-/// Validates font data with `skrifa`, rejecting colour fonts.
+/// Validates font data with `skrifa`, rejecting unparseable data and
+/// out-of-range face indices.
 ///
-/// Fonts carrying `COLR`, `CBDT`/`CBLC` or `sbix` outlines are colour fonts,
-/// which vello rasterizes through a different path this backend does not
-/// validate.
+/// Colour fonts (`COLR`, `CBDT`/`CBLC` or `sbix` outlines) are accepted —
+/// vello rasterizes colour glyphs through `skrifa`.
 pub fn validate_font(data: &[u8], index: u32) -> Result<(), ResourceError> {
-    let font = skrifa::FontRef::from_index(data, index)
-        .map_err(|e| ResourceError::Font(format!("{e}")))?;
-    for tag in [
-        skrifa::Tag::new(b"COLR"),
-        skrifa::Tag::new(b"CBDT"),
-        skrifa::Tag::new(b"sbix"),
-    ] {
-        if font.data_for_tag(tag).is_some() {
-            return Err(Unsupported::ColorFont.into());
-        }
-    }
+    skrifa::FontRef::from_index(data, index).map_err(|e| ResourceError::Font(format!("{e}")))?;
     Ok(())
 }
 

@@ -156,7 +156,7 @@ impl pulp::WithSimd for ShadeBand<'_> {
             w,
             y0,
         } = self;
-        slice.fill(clear);
+        super::composite::fill(simd, slice, clear);
         let len = slice.len();
         let mut band = Band {
             fb: slice,

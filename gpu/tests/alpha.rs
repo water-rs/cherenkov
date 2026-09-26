@@ -141,27 +141,27 @@ fn an_isolated_scratch_target_is_region_sized() -> Result<(), Box<dyn std::error
         phases.lower_seconds + phases.encode_seconds + phases.wait_seconds > 0.0,
         "a non-empty frame must measure some render-thread CPU time: {phases:?}"
     );
-    if stats.passes_timed.is_empty() {
-        // Adapter without TIMESTAMP_QUERY: check pixels only.
-        return Ok(());
+    // Per-pass regions come with the frame's timing; an adapter without
+    // TIMESTAMP_QUERY reports none, and only the pixels are checked.
+    if let Some(timing) = engine.finish_timings()?.pop() {
+        let scratch = timing
+            .passes
+            .iter()
+            .find(|p| p.name.starts_with("scratch"))
+            .expect("a scratch pass");
+        assert!(
+            scratch.width < 256 && scratch.height < 256,
+            "scratch region {}x{} should be tight",
+            scratch.width,
+            scratch.height
+        );
+        assert!(
+            scratch.width <= 100 && scratch.height <= 100,
+            "{}x{}",
+            scratch.width,
+            scratch.height
+        );
     }
-    let scratch = stats
-        .passes_timed
-        .iter()
-        .find(|p| p.name.starts_with("scratch"))
-        .expect("a scratch pass");
-    assert!(
-        scratch.width < 256 && scratch.height < 256,
-        "scratch region {}x{} should be tight",
-        scratch.width,
-        scratch.height
-    );
-    assert!(
-        scratch.width <= 100 && scratch.height <= 100,
-        "{}x{}",
-        scratch.width,
-        scratch.height
-    );
     let rb = surface.readback()?;
     let px = |x: u32, y: u32| rb.pixels[(y * rb.width + x) as usize];
     let [r, g, b, a] = px(208, 208);

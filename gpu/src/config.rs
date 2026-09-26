@@ -82,9 +82,9 @@ pub struct GpuInfo {
 /// samples at pass boundaries, which every supporting level offers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TimestampSupport {
-    /// No timestamp queries; [`FrameStats::gpu_seconds`] stays `None`.
+    /// No timestamp queries; [`FrameStats::timings`] stays empty.
     ///
-    /// [`FrameStats::gpu_seconds`]: crate::FrameStats::gpu_seconds
+    /// [`FrameStats::timings`]: crate::FrameStats::timings
     Unsupported,
     /// Only at render and compute pass boundaries (Apple GPUs on Metal
     /// sample at stage boundaries).

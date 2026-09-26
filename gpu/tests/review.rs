@@ -318,9 +318,9 @@ fn dropping_a_font_frees_its_renderer_state() -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
-/// Timestamp queries resolve on a later render — the submitting frame
-/// never waits for GPU idle: the first render reports no GPU timing yet,
-/// and a later render carries that frame's bracket and per-pass timings.
+/// Timestamp queries resolve after the submitting render returns — it
+/// never waits for GPU idle — and each frame's timing is reported once,
+/// tagged with that frame, by a later render or by `finish_timings`.
 #[test]
 fn timestamps_resolve_a_frame_late() -> Result<(), Box<dyn std::error::Error>> {
     let Some(engine) = engine(GpuConfig {
@@ -344,28 +344,32 @@ fn timestamps_resolve_a_frame_late() -> Result<(), Box<dyn std::error::Error>> {
         }));
     });
     engine.render(cherenkov_gpu::FrameTime::now())?;
+    let first = engine.stats();
+    let frame = first.frame.expect("a drawing render submits");
     assert!(
-        engine.stats().gpu_seconds.is_none(),
+        first.timings.is_empty(),
         "a submitting frame returns before its queries resolve"
     );
-    // The next render's drain requests the staging map and may already
-    // see it; if not, the readback's `wait_indefinitely` poll is the
-    // concrete readiness signal — it returns only once the map callback
-    // has run — so the following drain resolves deterministically.
+    // A render with nothing dirty submits nothing, and may or may not
+    // find the first frame finished; `finish_timings` waits for the rest.
     engine.render(cherenkov_gpu::FrameTime::now())?;
-    let timed = engine.stats().gpu_seconds.is_some() || {
-        let _ = surface.readback()?;
-        engine.render(cherenkov_gpu::FrameTime::now())?;
-        engine.stats().gpu_seconds.is_some()
-    };
-    assert!(timed, "the previous frame's timing arrives a render late");
+    let second = engine.stats();
+    assert_eq!(second.frame, None, "nothing dirty, nothing submitted");
+    let mut timings = second.timings;
+    timings.extend(engine.finish_timings()?);
+    assert_eq!(
+        timings.iter().map(|t| t.frame).collect::<Vec<_>>(),
+        [frame],
+        "the frame is timed exactly once"
+    );
+    assert!(timings[0].gpu_seconds.is_some());
     assert!(
-        engine
-            .stats()
-            .passes_timed
-            .iter()
-            .any(|p| p.name == "surface"),
+        timings[0].passes.iter().any(|p| p.name == "surface"),
         "per-pass timing survives the deferred resolve"
+    );
+    assert!(
+        engine.finish_timings()?.is_empty(),
+        "nothing is outstanding once every timing is reported"
     );
     Ok(())
 }
@@ -388,8 +392,9 @@ fn timestamps_off_reports_no_passes() -> Result<(), Box<dyn std::error::Error>> 
     });
     engine.render(cherenkov_gpu::FrameTime::now())?;
     let stats = engine.stats();
-    assert!(stats.gpu_seconds.is_none());
-    assert!(stats.passes_timed.is_empty());
+    assert!(stats.frame.is_some());
+    assert!(stats.timings.is_empty());
+    assert!(engine.finish_timings()?.is_empty());
     Ok(())
 }
 

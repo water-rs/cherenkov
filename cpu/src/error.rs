@@ -68,8 +68,6 @@ pub enum RenderError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, thiserror::Error)]
 #[non_exhaustive]
 pub enum Unsupported {
-    /// A sweep (conic) gradient.
-    Sweep,
     /// A mesh gradient.
     Mesh,
     /// An image draw or image paint.
@@ -96,7 +94,6 @@ pub enum Unsupported {
 impl std::fmt::Display for Unsupported {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::Sweep => "sweep-gradient",
             Self::Mesh => "mesh-gradient",
             Self::Image => "image",
             Self::Shader => "shader-paint",

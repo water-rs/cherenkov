@@ -135,6 +135,8 @@ fn cherenkov_features() -> Vec<Feature> {
         Feature::HdrColor,
         Feature::WideGamut,
         Feature::Blend(BlendMode::Normal),
+        Feature::SweepGradient,
+        Feature::ExtendNone,
         // `sRGB` maps to `SrgbEncoded`; `linear-p3` and `linear-srgb` are
         // both linear interpolation, which is the working space already.
         Feature::InterpolationSpace(ColorSpace::Srgb),
@@ -146,10 +148,8 @@ fn cherenkov_features() -> Vec<Feature> {
 /// The upstream API this slice lacks for a declared scene feature.
 const fn missing_api(f: &Feature) -> Option<&'static str> {
     match f {
-        Feature::SweepGradient => Some("no sweep gradient in this slice"),
         Feature::Image | Feature::ImagePaint => Some("no images in this slice"),
         Feature::Blend(_) => Some("only normal blending in this slice"),
-        Feature::ExtendNone => Some("cherenkov::Extend has no None variant"),
         Feature::InterpolationSpace(_) => Some("only srgb / linear interpolation in this slice"),
         _ => None,
     }
@@ -158,7 +158,6 @@ const fn missing_api(f: &Feature) -> Option<&'static str> {
 /// The scene [`Feature`] a render-time [`Unsupported`] maps back to.
 const fn unsupported_feature(u: Unsupported) -> Feature {
     match u {
-        Unsupported::Sweep => Feature::SweepGradient,
         Unsupported::Mesh | Unsupported::Image | Unsupported::Shader => Feature::Image,
         Unsupported::Blend | Unsupported::BlendSpace => Feature::Blend(BlendMode::Normal),
         Unsupported::Filter => Feature::Opacity,
@@ -204,11 +203,7 @@ const fn extend(e: Extend) -> Result<cherenkov::Extend, BenchError> {
         Extend::Pad => Ok(cherenkov::Extend::Pad),
         Extend::Repeat => Ok(cherenkov::Extend::Repeat),
         Extend::Reflect => Ok(cherenkov::Extend::Reflect),
-        Extend::None => Err(BenchError::Unsupported {
-            engine: Cherenkov::NAME,
-            feature: Feature::ExtendNone,
-            api: missing_api(&Feature::ExtendNone),
-        }),
+        Extend::None => Ok(cherenkov::Extend::None),
     }
 }
 
@@ -254,13 +249,14 @@ fn front_paint(paint: &ScenePaint) -> Result<cherenkov::Paint, BenchError> {
             extend: extend(g.extend)?,
             interpolation: interpolation(g.interpolation)?,
         }),
-        ScenePaint::Sweep(_) => {
-            return Err(BenchError::Unsupported {
-                engine: Cherenkov::NAME,
-                feature: Feature::SweepGradient,
-                api: missing_api(&Feature::SweepGradient),
-            });
-        }
+        ScenePaint::Sweep(g) => cherenkov::Paint::Sweep(cherenkov::SweepGradient {
+            center: g.center,
+            start_angle: g.start_angle,
+            end_angle: g.end_angle,
+            stops: stops(&g.stops),
+            extend: extend(g.extend)?,
+            interpolation: interpolation(g.interpolation)?,
+        }),
         ScenePaint::Image(_) => {
             return Err(BenchError::Unsupported {
                 engine: Cherenkov::NAME,
@@ -649,7 +645,11 @@ impl Engine for Cherenkov {
         } else {
             None
         };
-        Ok(Submit { image, gpu_seconds })
+        Ok(Submit {
+            image,
+            gpu_seconds,
+            passes: Vec::new(),
+        })
     }
 
     fn counters(&self) -> Counters {

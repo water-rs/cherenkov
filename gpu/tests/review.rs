@@ -21,30 +21,41 @@ fn engine(config: GpuConfig) -> Option<Engine<Gpu>> {
     }
 }
 
+/// The committed corpus subset of Noto Sans (never a host system font).
+const FONT_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../scenes/fonts/NotoSans.ttf");
+
+/// Glyph ids the subset has outlines for.
+const FONT_GLYPHS: u32 = 200;
+
 fn font() -> cherenkov_gpu::FontSource {
-    cherenkov_gpu::FontSource::bytes(
-        std::fs::read("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf").expect("DejaVuSans.ttf"),
-    )
+    cherenkov_gpu::FontSource::bytes(std::fs::read(FONT_PATH).expect("scenes/fonts/NotoSans.ttf"))
 }
 
-/// A run of `count` distinct glyphs at `size` px, tiled on a grid.
+/// `count` distinct glyph-cache entries at `size` px, tiled on a grid: the
+/// glyph ids cycle through the subset, and each cycle steps the size so no
+/// two entries share an atlas cell.
 #[expect(clippy::cast_precision_loss)]
-fn text_run(font: cherenkov::FontId, count: u32, size: f32) -> GlyphRun {
-    let glyphs = (0..count)
-        .map(|i| cherenkov::Glyph {
-            id: 1 + i,
-            x: (i % 32) as f32 * (size * 0.8),
-            y: (1 + i / 32) as f32 * size,
-            transform: None,
+fn text_runs(font: cherenkov::FontId, count: u32, size: f32) -> Vec<GlyphRun> {
+    (0..count.div_ceil(FONT_GLYPHS))
+        .map(|cycle| {
+            let size = (cycle as f32).mul_add(2.0, size);
+            let glyphs = (cycle * FONT_GLYPHS..(cycle * FONT_GLYPHS + FONT_GLYPHS).min(count))
+                .map(|i| cherenkov::Glyph {
+                    id: 1 + i % FONT_GLYPHS,
+                    x: (i % 32) as f32 * (size * 0.8),
+                    y: (1 + i / 32) as f32 * size,
+                    transform: None,
+                })
+                .collect();
+            GlyphRun {
+                font,
+                size,
+                coords: Vec::new(),
+                glyphs,
+                style: cherenkov::GlyphStyle::Fill,
+            }
         })
-        .collect();
-    GlyphRun {
-        font,
-        size,
-        coords: Vec::new(),
-        glyphs,
-        style: cherenkov::GlyphStyle::Fill,
-    }
+        .collect()
 }
 
 fn render_text(
@@ -59,7 +70,9 @@ fn render_text(
         .expect("surface");
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|c| {
-            c.glyphs(&text_run(font.id(), count, size), WorkingColor::WHITE);
+            for run in text_runs(font.id(), count, size) {
+                c.glyphs(&run, WorkingColor::WHITE);
+            }
         }));
     });
     Some(

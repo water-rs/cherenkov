@@ -4,6 +4,7 @@
 //! The render thread: sole owner of the framebuffers and the worker pool.
 
 mod blend;
+mod colr;
 mod glyph;
 mod lower;
 mod paint;
@@ -24,7 +25,7 @@ use lower::{ContentData, Item, LayerNode, Lowering};
 const MAX_SURFACE: u32 = 16384;
 
 /// A registered font's data on the render thread.
-pub(crate) struct FontData {
+pub struct FontData {
     /// The font file data.
     pub data: std::sync::Arc<[u8]>,
     /// Font index inside a collection.
@@ -34,7 +35,7 @@ pub(crate) struct FontData {
 /// A registered image on the render thread: premultiplied linear Display
 /// P3 f32 pixels, `width * height` row-major.
 #[derive(Debug)]
-pub(crate) struct CpuImage {
+pub struct CpuImage {
     /// Width in pixels.
     pub width: u32,
     /// Height in pixels.

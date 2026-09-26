@@ -1,0 +1,520 @@
+// Copyright 2026 the Cherenkov Authors
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+
+//! `COLRv1` glyph expansion: a [`ColorPainter`] port of
+//! `oracle/src/glyphs.rs` that records each glyph's paint graph as a
+//! font-space [`Picture`] — font units, y-up. The caller replays it under
+//! `translate(x, y) * scale_non_uniform(size/upem, -size/upem)`.
+//!
+//! Brush transforms that are not (close to) similarity transforms can't be
+//! expressed exactly for radial/sweep gradients — radii are scaled by
+//! `sqrt(|det|)` and sweep angles left unrotated, as the oracle does. Font
+//! gradients interpolate in sRGB (`Interpolation::SrgbEncoded`) per the
+//! `COLRv1` spec's CSS images semantics.
+
+use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
+use kurbo::{Affine, BezPath, Point, Rect, Shape as _};
+use skrifa::raw::types::{BoundingBox, F2Dot14};
+use skrifa::{
+    GlyphId, MetadataProvider,
+    color::{Brush, ColorPainter, ColorStop},
+    instance::LocationRef,
+    outline::{DrawSettings, OutlinePen},
+};
+
+use cherenkov::{
+    BlendMode, BlendSpace, Color, ColorStop as FrontStop, Draw, Extend, Group, Interpolation,
+    LinearGradient, Paint, Picture, RadialGradient, Srgb, StaticRecorder, SweepGradient,
+    WorkingColor,
+};
+
+use crate::error::{RenderError, Unsupported};
+
+/// A canvas-covering rect in font space: `fill` brushes cover whatever clips
+/// enclose them, and the enclosing passes bound them to the surface.
+fn canvas_path() -> BezPath {
+    Rect::new(-1.0e6, -1.0e6, 1.0e6, 1.0e6).to_path(1e-9)
+}
+
+/// Collects path commands into a [`BezPath`], in font units.
+struct BezPen(BezPath);
+
+impl OutlinePen for BezPen {
+    fn move_to(&mut self, x: f32, y: f32) {
+        self.0.move_to((f64::from(x), f64::from(y)));
+    }
+    fn line_to(&mut self, x: f32, y: f32) {
+        self.0.line_to((f64::from(x), f64::from(y)));
+    }
+    fn quad_to(&mut self, cx: f32, cy: f32, x: f32, y: f32) {
+        self.0
+            .quad_to((f64::from(cx), f64::from(cy)), (f64::from(x), f64::from(y)));
+    }
+    fn curve_to(&mut self, cx0: f32, cy0: f32, cx1: f32, cy1: f32, x: f32, y: f32) {
+        self.0.curve_to(
+            (f64::from(cx0), f64::from(cy0)),
+            (f64::from(cx1), f64::from(cy1)),
+            (f64::from(x), f64::from(y)),
+        );
+    }
+    fn close(&mut self) {
+        self.0.close_path();
+    }
+}
+
+/// A node of the paint tree the painter builds, in font units.
+enum Node {
+    /// Fill `shape` (transform-applied font space) with `paint`. `None`
+    /// fills the enclosing clip region.
+    Fill {
+        /// The shape, or the canvas.
+        shape: Option<BezPath>,
+        /// The paint.
+        paint: Paint,
+    },
+    /// A group: optional clip + blend mode applied to `children`.
+    Group {
+        /// The clip path.
+        clip: Option<BezPath>,
+        /// The composite mode.
+        blend: BlendMode,
+        /// The children.
+        children: Vec<Self>,
+    },
+}
+
+/// The skrifa composite mode → the front-end blend mode, exactly the set the
+/// oracle maps; anything else rejects the glyph.
+fn composite_to_blend(mode: skrifa::color::CompositeMode) -> Result<BlendMode, RenderError> {
+    use skrifa::color::CompositeMode as Cm;
+    Ok(match mode {
+        Cm::Clear => BlendMode::Clear,
+        Cm::Src => BlendMode::Src,
+        Cm::Dest => BlendMode::Dst,
+        Cm::SrcOver => BlendMode::Normal,
+        Cm::DestOver => BlendMode::DestOver,
+        Cm::SrcIn => BlendMode::SrcIn,
+        Cm::DestIn => BlendMode::DestIn,
+        Cm::SrcOut => BlendMode::SrcOut,
+        Cm::DestOut => BlendMode::DestOut,
+        Cm::SrcAtop => BlendMode::SrcAtop,
+        Cm::DestAtop => BlendMode::DestAtop,
+        Cm::Xor => BlendMode::Xor,
+        // COLR `Plus` is the spec's "plus lighter" additive mode.
+        Cm::Plus => BlendMode::PlusLighter,
+        Cm::Screen => BlendMode::Screen,
+        Cm::Overlay => BlendMode::Overlay,
+        Cm::Darken => BlendMode::Darken,
+        Cm::Lighten => BlendMode::Lighten,
+        Cm::ColorDodge => BlendMode::ColorDodge,
+        Cm::ColorBurn => BlendMode::ColorBurn,
+        Cm::HardLight => BlendMode::HardLight,
+        Cm::SoftLight => BlendMode::SoftLight,
+        Cm::Difference => BlendMode::Difference,
+        Cm::Exclusion => BlendMode::Exclusion,
+        Cm::Multiply => BlendMode::Multiply,
+        Cm::HslHue => BlendMode::Hue,
+        Cm::HslSaturation => BlendMode::Saturation,
+        Cm::HslColor => BlendMode::Color,
+        Cm::HslLuminosity => BlendMode::Luminosity,
+        _ => return Err(Unsupported::ColorFont.into()),
+    })
+}
+
+const fn extend(e: skrifa::color::Extend) -> Extend {
+    match e {
+        skrifa::color::Extend::Repeat => Extend::Repeat,
+        skrifa::color::Extend::Reflect => Extend::Reflect,
+        // `Pad` and anything unrecognised pads the edge stops.
+        _ => Extend::Pad,
+    }
+}
+
+/// The `COLRv1` painter: keeps a transform stack (font space), a container
+/// stack for clips and composite layers, and emits [`Node`]s.
+struct ColrPainter<'a> {
+    font: &'a skrifa::FontRef<'a>,
+    coords: &'a [F2Dot14],
+    palette: Vec<skrifa::color::Color>,
+    /// The run's own paint — the COLR "foreground" brush
+    /// (`palette_index == 0xFFFF`) for solid brushes.
+    foreground: &'a Paint,
+    /// `foreground`'s colour as a stop colour. For a non-solid run paint —
+    /// which a gradient stop cannot express — opaque black.
+    foreground_color: WorkingColor,
+    /// Canvas rect in font units — what a `fill` with no glyph clip covers.
+    fill_rect_font: BezPath,
+    tf: Vec<Affine>,
+    containers: Vec<(Option<BezPath>, BlendMode, Vec<Node>)>,
+    top: Vec<Node>,
+    /// First failure recorded by a `ColorPainter` callback (the trait's
+    /// methods cannot return `Result`); checked after `paint()` returns.
+    err: Option<RenderError>,
+}
+
+impl ColrPainter<'_> {
+    fn cur(&self) -> Affine {
+        *self.tf.last().unwrap_or(&Affine::IDENTITY)
+    }
+
+    fn palette_color(&self, index: u16, alpha: f32) -> WorkingColor {
+        if index == 0xFFFF || usize::from(index) >= self.palette.len() {
+            let mut c = self.foreground_color;
+            c.components[3] *= alpha;
+            return c;
+        }
+        let c = self.palette[usize::from(index)];
+        Color::<Srgb>::new([
+            f32::from(c.red) / 255.0,
+            f32::from(c.green) / 255.0,
+            f32::from(c.blue) / 255.0,
+            f32::from(c.alpha) / 255.0 * alpha,
+        ])
+        .to_working()
+    }
+
+    fn stops(&self, stops: &[ColorStop]) -> Vec<FrontStop> {
+        stops
+            .iter()
+            .map(|s| FrontStop {
+                offset: s.offset,
+                color: self.palette_color(s.palette_index, s.alpha),
+            })
+            .collect()
+    }
+
+    /// Resolve a COLR brush into a front-end [`Paint`]; geometry is in font
+    /// units under transform `tf`.
+    fn brush_paint(&self, brush: &Brush<'_>, tf: Affine) -> Paint {
+        let det = tf.as_coeffs();
+        let scale = det[1].mul_add(-det[2], det[0] * det[3]).abs().sqrt();
+        match brush {
+            Brush::Solid {
+                palette_index,
+                alpha,
+            } => {
+                if *palette_index == 0xFFFF {
+                    // The foreground brush is the run's own paint — it may
+                    // be a gradient or image, not just a solid colour. The
+                    // COLR `alpha` applies to it as a paint opacity.
+                    let mut paint = self.foreground.clone();
+                    paint_opacity(&mut paint, *alpha);
+                    paint
+                } else {
+                    Paint::Solid(self.palette_color(*palette_index, *alpha))
+                }
+            }
+            Brush::LinearGradient {
+                p0,
+                p1,
+                color_stops,
+                extend: e,
+            } => Paint::Linear(LinearGradient {
+                start: tf * Point::new(f64::from(p0.x), f64::from(p0.y)),
+                end: tf * Point::new(f64::from(p1.x), f64::from(p1.y)),
+                stops: self.stops(color_stops),
+                extend: extend(*e),
+                interpolation: Interpolation::SrgbEncoded,
+            }),
+            Brush::RadialGradient {
+                c0,
+                r0,
+                c1,
+                r1,
+                color_stops,
+                extend: e,
+            } => Paint::Radial(RadialGradient {
+                start_center: tf * Point::new(f64::from(c0.x), f64::from(c0.y)),
+                start_radius: f64::from(*r0) * scale,
+                end_center: tf * Point::new(f64::from(c1.x), f64::from(c1.y)),
+                end_radius: f64::from(*r1) * scale,
+                stops: self.stops(color_stops),
+                extend: extend(*e),
+                interpolation: Interpolation::SrgbEncoded,
+            }),
+            Brush::SweepGradient {
+                c0,
+                start_angle,
+                end_angle,
+                color_stops,
+                extend: e,
+            } => Paint::Sweep(SweepGradient {
+                center: tf * Point::new(f64::from(c0.x), f64::from(c0.y)),
+                // skrifa hands degrees, interpreted clockwise in y-up font
+                // space; after the y-flip into y-down scene space the same
+                // angles read clockwise on screen, which is our convention.
+                start_angle: f64::from(*start_angle).to_radians(),
+                end_angle: f64::from(*end_angle).to_radians(),
+                stops: self.stops(color_stops),
+                extend: extend(*e),
+                interpolation: Interpolation::SrgbEncoded,
+            }),
+        }
+    }
+
+    fn glyph_path(&self, glyph_id: GlyphId) -> Result<BezPath, RenderError> {
+        let glyph = self.font.outline_glyphs().get(glyph_id).ok_or_else(|| {
+            RenderError::Font(format!("glyph {} has no outline", glyph_id.to_u32()))
+        })?;
+        let mut pen = BezPen(BezPath::new());
+        glyph
+            .draw(
+                DrawSettings::unhinted(
+                    skrifa::instance::Size::unscaled(),
+                    LocationRef::new(self.coords),
+                ),
+                &mut pen,
+            )
+            .map_err(|e| RenderError::Font(e.to_string()))?;
+        Ok(pen.0)
+    }
+}
+
+/// A skrifa COLR transform → a kurbo affine.
+fn to_affine(t: skrifa::color::Transform) -> Affine {
+    Affine::new([
+        f64::from(t.xx),
+        f64::from(t.yx),
+        f64::from(t.xy),
+        f64::from(t.yy),
+        f64::from(t.dx),
+        f64::from(t.dy),
+    ])
+}
+
+impl ColorPainter for ColrPainter<'_> {
+    fn push_transform(&mut self, transform: skrifa::color::Transform) {
+        self.tf.push(self.cur() * to_affine(transform));
+    }
+
+    fn pop_transform(&mut self) {
+        self.tf.pop();
+    }
+
+    fn push_clip_glyph(&mut self, glyph_id: GlyphId) {
+        if self.err.is_some() {
+            return;
+        }
+        let path = match self.glyph_path(glyph_id).map(|p| self.cur() * p) {
+            Ok(p) => p,
+            Err(e) => {
+                self.err = Some(e);
+                return;
+            }
+        };
+        self.containers
+            .push((Some(path), BlendMode::Normal, std::mem::take(&mut self.top)));
+    }
+
+    fn push_clip_box(&mut self, clip_box: BoundingBox<f32>) {
+        let rect = Rect::new(
+            f64::from(clip_box.x_min),
+            f64::from(clip_box.y_min),
+            f64::from(clip_box.x_max),
+            f64::from(clip_box.y_max),
+        );
+        let path = self.cur() * rect.to_path(1e-9);
+        self.containers
+            .push((Some(path), BlendMode::Normal, std::mem::take(&mut self.top)));
+    }
+
+    fn pop_clip(&mut self) {
+        if let Some((clip, blend, mut children)) = self.containers.pop() {
+            children.push(Node::Group {
+                clip,
+                blend,
+                children: std::mem::take(&mut self.top),
+            });
+            self.top = children;
+        }
+    }
+
+    fn fill(&mut self, brush: Brush<'_>) {
+        let paint = self.brush_paint(&brush, self.cur());
+        self.top.push(Node::Fill {
+            shape: Some(self.cur() * self.fill_rect_font.clone()),
+            paint,
+        });
+    }
+
+    fn fill_glyph(
+        &mut self,
+        glyph_id: GlyphId,
+        brush_transform: Option<skrifa::color::Transform>,
+        brush: Brush<'_>,
+    ) {
+        if self.err.is_some() {
+            return;
+        }
+        let cur = self.cur();
+        let shape = match self.glyph_path(glyph_id).map(|p| cur * p) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                self.err = Some(e);
+                return;
+            }
+        };
+        let paint = self.brush_paint(&brush, brush_transform.map_or(cur, |t| cur * to_affine(t)));
+        self.top.push(Node::Fill { shape, paint });
+    }
+
+    fn push_layer(&mut self, composite_mode: skrifa::color::CompositeMode) {
+        if self.err.is_some() {
+            return;
+        }
+        let blend = match composite_to_blend(composite_mode) {
+            Ok(b) => b,
+            Err(e) => {
+                self.err = Some(e);
+                return;
+            }
+        };
+        self.containers
+            .push((None, blend, std::mem::take(&mut self.top)));
+    }
+
+    fn pop_layer_with_mode(&mut self, composite_mode: skrifa::color::CompositeMode) {
+        if self.err.is_some() {
+            return;
+        }
+        if let Some((clip, _stored, mut children)) = self.containers.pop() {
+            let blend = match composite_to_blend(composite_mode) {
+                Ok(b) => b,
+                Err(e) => {
+                    self.err = Some(e);
+                    return;
+                }
+            };
+            children.push(Node::Group {
+                clip,
+                blend,
+                children: std::mem::take(&mut self.top),
+            });
+            self.top = children;
+        }
+    }
+}
+
+/// Multiply a paint's opacity by `alpha`: the colour's alpha for a solid
+/// paint, every stop's alpha for a gradient. `Paint::Image` carries no
+/// opacity channel, so it is left unchanged.
+fn paint_opacity(paint: &mut Paint, alpha: f32) {
+    let stops = match paint {
+        Paint::Linear(g) => Some(&mut g.stops),
+        Paint::Radial(g) => Some(&mut g.stops),
+        Paint::Sweep(g) => Some(&mut g.stops),
+        Paint::Solid(c) => {
+            c.components[3] *= alpha;
+            None
+        }
+        Paint::Image(_) | Paint::Mesh(_) | Paint::Shader(_) => None,
+    };
+    if let Some(stops) = stops {
+        for s in stops {
+            s.color.components[3] *= alpha;
+        }
+    }
+}
+
+/// Record one node (and its descendants) in font space.
+fn record_node(node: &Node, c: &mut StaticRecorder) {
+    match node {
+        Node::Fill { shape, paint } => {
+            let shape = shape.clone().unwrap_or_else(canvas_path);
+            c.fill(shape, paint.clone());
+        }
+        Node::Group {
+            clip,
+            blend,
+            children,
+        } => {
+            let group = Group {
+                opacity: 1.0,
+                blend: *blend,
+                blend_space: BlendSpace::Linear,
+                filter: None,
+            };
+            let body = |c: &mut StaticRecorder| {
+                for n in children {
+                    record_node(n, c);
+                }
+            };
+            if let Some(clip) = clip {
+                c.clip(clip.clone(), |c| c.group(group, body));
+            } else {
+                c.group(group, body);
+            }
+        }
+    }
+}
+
+/// The font-space [`Picture`] for one COLR glyph, built or fetched from
+/// `colr_cache` (keyed by font, glyph, coords and paint since `foreground`
+/// is baked into the picture).
+pub fn glyph_picture(
+    font_id: u64,
+    font_data: &[u8],
+    font_index: u32,
+    colr_cache: &mut HashMap<(u64, u32, u64, u64), Picture>,
+    glyph_id: u32,
+    coords: &[i16],
+    foreground: &Paint,
+) -> Result<Picture, RenderError> {
+    let mut hasher = DefaultHasher::new();
+    coords.hash(&mut hasher);
+    let coords_hash = hasher.finish();
+    let mut hasher = DefaultHasher::new();
+    format!("{foreground:?}").hash(&mut hasher);
+    let paint_hash = hasher.finish();
+    let key = (font_id, glyph_id, coords_hash, paint_hash);
+    if let Some(p) = colr_cache.get(&key) {
+        return Ok(p.clone());
+    }
+
+    let font_ref = skrifa::FontRef::from_index(font_data, font_index)
+        .map_err(|e| RenderError::Font(format!("{e}")))?;
+    let location: Vec<F2Dot14> = coords.iter().map(|c| F2Dot14::from_bits(*c)).collect();
+    let gid = GlyphId::new(glyph_id);
+    let color_glyph = font_ref
+        .color_glyphs()
+        .get(gid)
+        .ok_or(Unsupported::ColorFont)?;
+    let palette: Vec<skrifa::color::Color> = font_ref
+        .color_palettes()
+        .get(0)
+        .map(|p| p.colors().to_vec())
+        .unwrap_or_default();
+    let foreground_color = match foreground {
+        Paint::Solid(c) => *c,
+        _ => WorkingColor::BLACK,
+    };
+    let mut painter = ColrPainter {
+        font: &font_ref,
+        coords: &location,
+        palette,
+        foreground,
+        foreground_color,
+        fill_rect_font: canvas_path(),
+        tf: vec![Affine::IDENTITY],
+        containers: Vec::new(),
+        top: Vec::new(),
+        err: None,
+    };
+    color_glyph
+        .paint(LocationRef::new(&location), &mut painter)
+        .map_err(|e| RenderError::Font(format!("{e}")))?;
+    if let Some(e) = painter.err {
+        return Err(e);
+    }
+    let roots = std::mem::take(&mut painter.top);
+    let picture = Picture::record(|c| {
+        for n in &roots {
+            record_node(n, c);
+        }
+    });
+    colr_cache.insert(key, picture.clone());
+    Ok(picture)
+}

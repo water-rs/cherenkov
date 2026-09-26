@@ -7,6 +7,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use skrifa::MetadataProvider;
 use skrifa::raw::TableProvider;
 
 use crate::error::{ResourceError, Unsupported};
@@ -77,21 +78,19 @@ impl Font {
     }
 }
 
-/// Validates font data with `skrifa`, rejecting colour fonts.
+/// Validates font data with `skrifa`, rejecting bitmap-only colour fonts.
 ///
-/// Fonts carrying `COLR`, `CBDT`/`CBLC` or `sbix` outlines are colour fonts,
-/// which this slice cannot rasterize.
+/// `COLR` fonts render through the colour-glyph lowering; fonts carrying
+/// `CBDT`/`CBLC` or `sbix` bitmaps without outline glyphs cannot rasterize.
 pub fn validate_font(data: &[u8], index: u32) -> Result<(), ResourceError> {
     let font = skrifa::FontRef::from_index(data, index)
         .map_err(|e| ResourceError::Font(format!("{e}")))?;
-    for tag in [
-        skrifa::Tag::new(b"COLR"),
-        skrifa::Tag::new(b"CBDT"),
-        skrifa::Tag::new(b"sbix"),
-    ] {
-        if font.data_for_tag(tag).is_some() {
-            return Err(Unsupported::ColorFont.into());
-        }
+    if font.outline_glyphs().iter().next().is_none()
+        && [skrifa::Tag::new(b"CBDT"), skrifa::Tag::new(b"sbix")]
+            .iter()
+            .any(|tag| font.data_for_tag(*tag).is_some())
+    {
+        return Err(Unsupported::ColorFont.into());
     }
     Ok(())
 }

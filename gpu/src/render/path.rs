@@ -138,11 +138,14 @@ pub fn rasterize(
     let (ox, oy) = (x0 as f32, y0 as f32);
     let mut raster = Raster::new(w, h);
     for &(sx0, sy0, sx1, sy1) in segments {
-        let (x0, y0, x1, y1) = (sx0 - ox, sy0 - oy, sx1 - ox, sy1 - oy);
-        let Some((x0, y0, x1, y1)) = clip_x(x0, y0, x1, y1, w as f32) else {
-            continue;
-        };
-        raster.draw_line(x0, y0, x1, y1);
+        clip_x(
+            &mut raster,
+            sx0 - ox,
+            sy0 - oy,
+            sx1 - ox,
+            sy1 - oy,
+            w as f32,
+        );
     }
     Some(Coverage {
         x: x0,
@@ -154,31 +157,47 @@ pub fn rasterize(
     })
 }
 
-/// Clips a segment to `0 <= x <= w` in raster space, keeping the same
-/// winding deposit the un-clipped edge would have made on the covered
-/// columns. `None` for segments outside the range or with non-finite
-/// coordinates. Row clipping is `Raster`'s job: `y` is left untouched.
-fn clip_x(x0: f32, y0: f32, x1: f32, y1: f32, w: f32) -> Option<(f32, f32, f32, f32)> {
+/// Clips a segment to `0 <= x <= w` in raster space and draws it into
+/// `raster`, keeping the winding deposit the un-clipped edge would have
+/// made on the covered columns. Deposits only propagate rightward, so an
+/// edge's part at `x < 0` is not dropped: it is drawn as a vertical stub
+/// at `x = 0` spanning the same rows, which deposits the full signed area
+/// into column 0. Segments at `x > w` are dropped outright — their
+/// deposits land in the unread trailing column or beyond. Row clipping is
+/// `Raster`'s job: `y` is left untouched.
+fn clip_x(raster: &mut Raster, x0: f32, y0: f32, x1: f32, y1: f32, w: f32) {
     if !(x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite()) {
-        return None;
+        return;
     }
     let dx = x1 - x0;
+    let dy = y1 - y0;
     if dx.abs() <= f32::EPSILON {
-        return (x0 >= 0.0 && x0 <= w).then_some((x0, y0, x1, y1));
+        if x0 <= w {
+            let x = x0.max(0.0);
+            raster.draw_line(x, y0, x, y1);
+        }
+        return;
+    }
+    // The rows the segment runs at `x < 0` deposit at column 0: `dx > 0`
+    // enters through the left edge at `tz`, `dx < 0` exits through it.
+    let tz = -x0 / dx;
+    if dx > 0.0 && x0 < 0.0 {
+        raster.draw_line(0.0, y0, 0.0, dy.mul_add(tz.min(1.0), y0));
+    } else if dx < 0.0 && x1 < 0.0 {
+        raster.draw_line(0.0, dy.mul_add(tz.max(0.0), y0), 0.0, y1);
     }
     let (enter, exit) = if dx > 0.0 { (0.0, w) } else { (w, 0.0) };
     let t0 = ((enter - x0) / dx).max(0.0);
     let t1 = ((exit - x0) / dx).min(1.0);
     if t0 >= t1 {
-        return None;
+        return;
     }
-    let (dy, ix) = (y1 - y0, dx);
-    Some((
-        ix.mul_add(t0, x0),
+    raster.draw_line(
+        dx.mul_add(t0, x0).clamp(0.0, w),
         dy.mul_add(t0, y0),
-        ix.mul_add(t1, x0),
+        dx.mul_add(t1, x0).clamp(0.0, w),
         dy.mul_add(t1, y0),
-    ))
+    );
 }
 
 /// f32 coverage → `R8Unorm` texels.
@@ -480,6 +499,85 @@ pub fn placement(content_hash: u64, transform: Affine, surface: (u32, u32)) -> P
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_left_edge_outside_the_window_still_deposits_coverage() {
+        // A rect spanning x = -20..6, y = 1..9 on a 10x10 raster: the
+        // left edge sits outside the window, but the winding deposit it
+        // would make there must still propagate rightward at column 0.
+        let segments = [
+            (-20.0, 1.0, 6.0, 1.0),
+            (6.0, 1.0, 6.0, 9.0),
+            (6.0, 9.0, -20.0, 9.0),
+            (-20.0, 9.0, -20.0, 1.0),
+        ];
+        let coverage = rasterize(
+            &segments,
+            Rect::new(-20.0, 1.0, 6.0, 9.0),
+            (10.0, 10.0),
+            FillRule::NonZero,
+        )
+        .expect("the rect intersects the surface");
+        assert!(coverage.clipped, "the bbox hangs off the left edge");
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "the fixture coordinates are small non-negative integers"
+        )]
+        let at = |x: usize, y: usize| {
+            coverage.data[(y - coverage.y as usize) * coverage.w + (x - coverage.x as usize)]
+        };
+        for y in 2..8 {
+            for x in 0..6 {
+                assert!((at(x, y) - 1.0).abs() < 1e-6, "interior ({x}, {y})");
+            }
+            assert!(at(6, y).abs() < 1e-6, "past the right edge ({x})", x = 6);
+        }
+    }
+
+    #[test]
+    fn a_slanted_edge_entering_from_the_left_covers_below_it() {
+        // Triangle (-20, 2) - (6, 2) - (6, 8) - back to (-20, 2): the
+        // hypotenuse crosses the left window edge partway down.
+        let segments = [
+            (-20.0, 2.0, 6.0, 2.0),
+            (6.0, 2.0, 6.0, 8.0),
+            (6.0, 8.0, -20.0, 2.0),
+        ];
+        let coverage = rasterize(
+            &segments,
+            Rect::new(-20.0, 2.0, 6.0, 8.0),
+            (10.0, 10.0),
+            FillRule::NonZero,
+        )
+        .expect("the triangle intersects the surface");
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "the fixture coordinates are small non-negative integers"
+        )]
+        let at = |x: usize, y: usize| {
+            coverage.data[(y - coverage.y as usize) * coverage.w + (x - coverage.x as usize)]
+        };
+        // The hypotenuse crosses x = 0 at y = 8 - 6/26 * 6 = 6.615: rows
+        // 2..6 it spans entirely at x < 0 are covered from column 0 on.
+        for y in 2..6 {
+            assert!(
+                (at(0, y) - 1.0).abs() < 1e-6,
+                "row under the edge: {}",
+                at(0, y)
+            );
+            assert!((at(3, y) - 1.0).abs() < 1e-6, "interior: {}", at(3, y));
+        }
+        // Above the crossing (device row 7) the hypotenuse runs inside the
+        // window, from x = 1.67 at the row bottom to the vertex at
+        // (6, 8): coverage ramps up rightward and column 0 lies outside.
+        assert!(at(0, 7).abs() < 1e-6, "left of the hypotenuse");
+        assert!(at(4, 7) < at(5, 7), "coverage rises toward the vertex");
+        assert!(at(5, 7) > 0.5, "rightmost interior column: {}", at(5, 7));
+        // Above the triangle is empty.
+        assert!(at(3, 1).abs() < 1e-6, "above the triangle");
+    }
 
     #[test]
     fn even_odd_folds_winding_into_a_triangle_wave() {

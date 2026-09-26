@@ -9,7 +9,8 @@ use cherenkov::{
     Draw, EvenOdd, Extend, Glyph, GlyphRun, Group, Interpolation, LinearGradient, Paint,
     RadialGradient, Shadow, SweepGradient, WorkingColor, kurbo::Stroke,
 };
-use cherenkov_cpu::{Engine, FrameTime, Offscreen, OffscreenFormat, Raster, RasterConfig};
+use cherenkov::{Engine, FrameTime, Offscreen, OffscreenFormat};
+use cherenkov_cpu::{Raster, RasterConfig};
 
 fn engine() -> Engine<Raster> {
     Engine::<Raster>::new(RasterConfig::default()).expect("engine")
@@ -323,7 +324,7 @@ fn a_glyph_run_renders_and_the_second_frame_hits_the_cache() {
     let engine = engine();
     let data = std::fs::read("../scenes/fonts/NotoSans.ttf").expect("test font");
     let font = engine
-        .font(cherenkov_cpu::FontSource::bytes(data))
+        .font(cherenkov::FontSource::bytes(data))
         .expect("font");
     let run = GlyphRun {
         font: font.id(),
@@ -340,11 +341,11 @@ fn a_glyph_run_renders_and_the_second_frame_hits_the_cache() {
     let px = render_f32(&engine, 64, 64, |c| c.glyphs(&run, RED));
     let area: f64 = px.iter().map(|p| f64::from(p[3])).sum();
     assert!(area > 10.0, "glyph coverage {area}");
-    let cached = engine.memory().glyph_cache;
+    let cached = engine.memory().cpu;
     assert!(cached.0 > 0, "glyph cache populated");
     // Re-record the same run and render again: the cache must hit.
     render_f32(&engine, 64, 64, |c| c.glyphs(&run, RED));
-    assert_eq!(engine.memory().glyph_cache.0, cached.0, "cache hit");
+    assert_eq!(engine.memory().cpu.0, cached.0, "cache hit");
 }
 
 #[test]
@@ -371,7 +372,7 @@ fn unsupported_features_report_their_names() {
     let engine2 = Engine::<Raster>::new(RasterConfig::default()).expect("engine");
     let data = std::fs::read("../scenes/fonts/NotoSans.ttf").expect("test font");
     let font = engine2
-        .font(cherenkov_cpu::FontSource::bytes(data))
+        .font(cherenkov::FontSource::bytes(data))
         .expect("font");
     let run = GlyphRun {
         font: font.id(),

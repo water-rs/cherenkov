@@ -8,7 +8,9 @@
 use cherenkov::kurbo::Affine;
 use cherenkov::{ColorStop, Extend, Interpolation, Paint};
 
-use crate::error::Unsupported;
+use cherenkov::RenderError;
+
+use crate::names;
 
 /// Linear Display P3 to linear sRGB, for `SrgbEncoded` gradient stops.
 const P3_TO_SRGB: [[f32; 3]; 3] = [
@@ -159,7 +161,7 @@ fn stops(stops: &[ColorStop], interpolation: Interpolation) -> Box<[Stop]> {
     clippy::many_single_char_names,
     reason = "r/g/b/a are the channel names"
 )]
-pub fn paint_data(paint: &Paint, inv: Affine) -> Result<PaintData, Unsupported> {
+pub fn paint_data(paint: &Paint, inv: Affine) -> Result<PaintData, RenderError> {
     Ok(match paint {
         Paint::Solid(c) => {
             let [r, g, b, a] = c.components;
@@ -190,10 +192,10 @@ pub fn paint_data(paint: &Paint, inv: Affine) -> Result<PaintData, Unsupported> 
             extend: g.extend,
             interpolation: g.interpolation,
         },
-        Paint::Sweep(_) => return Err(Unsupported::Sweep),
-        Paint::Mesh(_) => return Err(Unsupported::Mesh),
-        Paint::Image(_) => return Err(Unsupported::Image),
-        Paint::Shader(_) => return Err(Unsupported::Shader),
+        Paint::Sweep(_) => return Err(RenderError::Unsupported(names::SWEEP)),
+        Paint::Mesh(_) => return Err(RenderError::Unsupported(names::MESH)),
+        Paint::Image(_) => return Err(RenderError::Unsupported(names::IMAGE)),
+        Paint::Shader(_) => return Err(RenderError::Unsupported(names::SHADER)),
     })
 }
 

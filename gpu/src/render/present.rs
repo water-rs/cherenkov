@@ -120,6 +120,7 @@ pub struct Presenter {
 
 impl Presenter {
     /// Creates the shared present state.
+    #[must_use]
     pub fn new(device: &wgpu::Device) -> Self {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("present"),
@@ -364,6 +365,7 @@ pub enum OutputAlpha {
 }
 
 /// A host-owned texture and its presentation conventions.
+#[derive(Clone, Copy, Debug)]
 pub struct TextureOutput<'a> {
     /// Attachment on the same device as the source.
     pub texture: &'a wgpu::Texture,

@@ -34,7 +34,7 @@ pub use draw::{
     NormalizedCoord, Paint, RadialGradient, Sampling, StrokeStyle, SweepGradient,
 };
 pub use error::SceneError;
-pub use layer::{Item, Layer, Motion, MotionAnimation};
+pub use layer::{Item, Layer, Live, Motion, MotionAnimation};
 pub use scene::{Feature, Scene, WorkingSpace};
 pub use shape::{ContinuousRect, Shape};
 

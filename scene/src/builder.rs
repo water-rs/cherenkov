@@ -123,6 +123,12 @@ impl LayerBuilder<'_> {
     }
 
     /// Set the layer's one-time motion.
+    /// Adds a per-frame live item (see [`Layer::live`]).
+    pub fn live(&mut self, live: crate::Live) -> &mut Self {
+        self.layer.live.push(live);
+        self
+    }
+
     pub const fn motion(&mut self, motion: Motion) -> &mut Self {
         self.layer.motion = Some(motion);
         self
@@ -134,6 +140,12 @@ impl LayerBuilder<'_> {
         f(&mut LayerBuilder { layer: &mut layer });
         self.layer.items.push(Item::Layer(layer));
         self
+    }
+
+    /// The number of items pushed so far — the index the next item gets.
+    #[must_use]
+    pub fn item_count(&self) -> usize {
+        self.layer.items.len()
     }
 
     /// Push a [`Draw::Fill`] item.

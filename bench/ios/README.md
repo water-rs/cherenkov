@@ -25,6 +25,23 @@ from `project.yml`; nothing generated is checked in.
 The unsigned app lands in
 `build/Build/Products/Release-iphoneos/CherenkovBench.app`.
 
+For a simulator run instead, build the Rust library for
+`aarch64-apple-ios-sim`, then `-destination 'platform=iOS Simulator'`;
+the product lands under `Release-iphonesimulator`. The simulator's
+paravirtual GPU is weaker than a real device (no `TIMESTAMP_QUERY` or
+`INDIRECT_EXECUTION`, so `gpu_seconds` are absent and `vello-classic`
+cannot run there) but it exercises the whole harness end to end:
+
+    xcodebuild -project CherenkovBench.xcodeproj -scheme CherenkovBench \
+        -destination 'platform=iOS Simulator,name=iPhone 17' \
+        -configuration Release -derivedDataPath build \
+        CODE_SIGNING_ALLOWED=NO build
+    xcrun simctl install booted \
+        build/Build/Products/Release-iphonesimulator/CherenkovBench.app
+    # Documents lives under:
+    #   xcrun simctl get_app_container booted dev.cherenkov.bench data
+    xcrun simctl launch booted dev.cherenkov.bench
+
 ## Sign
 
 The .app ships unsigned. To run it on a device it needs a development
@@ -79,9 +96,10 @@ to 0 for the whole run, then restores both. It first `chdir`s to the
 app's home directory (an app launches with cwd `/`), so relative
 `Documents/...` paths in the argument lists resolve as written. Each
 argument list runs through `cherenkov_bench_run` on a background thread
-with fd 2 redirected to `Documents/out/run-<n>.stderr`; when the last
-one returns the app writes `Documents/out/done.json` (each run's args
-and exit code) and exits.
+with fds 1 and 2 redirected to `Documents/out/run-<n>.log` (the
+suite's tracing goes to stderr); when the last one returns the app
+writes `Documents/out/done.json` (each run's args and exit code) and
+exits.
 
     xcrun devicectl device process launch --device <udid> dev.cherenkov.bench
 

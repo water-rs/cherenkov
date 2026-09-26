@@ -124,12 +124,14 @@ fn composite_to_blend(mode: skrifa::color::CompositeMode) -> Result<BlendMode, R
     })
 }
 
-const fn extend(e: skrifa::color::Extend) -> Extend {
+/// `Pad`/`Repeat`/`Reflect` are the only `Extend`s; anything else is a
+/// corrupt font, not a pad.
+const fn extend(e: skrifa::color::Extend) -> Option<Extend> {
     match e {
-        skrifa::color::Extend::Repeat => Extend::Repeat,
-        skrifa::color::Extend::Reflect => Extend::Reflect,
-        // `Pad` and anything unrecognised pads the edge stops.
-        _ => Extend::Pad,
+        skrifa::color::Extend::Pad => Some(Extend::Pad),
+        skrifa::color::Extend::Repeat => Some(Extend::Repeat),
+        skrifa::color::Extend::Reflect => Some(Extend::Reflect),
+        _ => None,
     }
 }
 
@@ -264,9 +266,20 @@ impl ColrPainter<'_> {
             .collect()
     }
 
+    /// A recognised `Extend` value. An unrecognised one is a corrupt
+    /// font: record it (`self.err` aborts the walk) — the returned value
+    /// is discarded.
+    fn extend(&mut self, e: skrifa::color::Extend) -> Extend {
+        extend(e).unwrap_or_else(|| {
+            self.err
+                .get_or_insert_with(|| Unsupported::ColorFont.into());
+            Extend::Pad
+        })
+    }
+
     /// Resolve a COLR brush into a front-end [`Paint`]; geometry is in font
     /// units under transform `tf`.
-    fn brush_paint(&self, brush: &Brush<'_>, tf: Affine) -> Paint {
+    fn brush_paint(&mut self, brush: &Brush<'_>, tf: Affine) -> Paint {
         let det = tf.as_coeffs();
         let scale = det[1].mul_add(-det[2], det[0] * det[3]).abs().sqrt();
         match brush {
@@ -294,7 +307,7 @@ impl ColrPainter<'_> {
                 start: tf * Point::new(f64::from(p0.x), f64::from(p0.y)),
                 end: tf * Point::new(f64::from(p1.x), f64::from(p1.y)),
                 stops: self.stops(color_stops),
-                extend: extend(*e),
+                extend: self.extend(*e),
                 interpolation: Interpolation::SrgbEncoded,
             }),
             Brush::RadialGradient {
@@ -310,7 +323,7 @@ impl ColrPainter<'_> {
                 end_center: tf * Point::new(f64::from(c1.x), f64::from(c1.y)),
                 end_radius: f64::from(*r1) * scale,
                 stops: self.stops(color_stops),
-                extend: extend(*e),
+                extend: self.extend(*e),
                 interpolation: Interpolation::SrgbEncoded,
             }),
             Brush::SweepGradient {
@@ -327,7 +340,7 @@ impl ColrPainter<'_> {
                 start_angle: f64::from(*start_angle).to_radians(),
                 end_angle: f64::from(*end_angle).to_radians(),
                 stops: self.stops(color_stops),
-                extend: extend(*e),
+                extend: self.extend(*e),
                 interpolation: Interpolation::SrgbEncoded,
             }),
         }
@@ -603,6 +616,16 @@ mod tests {
         let mut hasher = DefaultHasher::new();
         hash_paint(&mut hasher, paint);
         hasher.finish()
+    }
+
+    /// An unrecognised COLR `Extend` is a corrupt font, not a pad.
+    #[test]
+    fn an_unknown_extend_is_rejected() {
+        use skrifa::color::Extend as SkrifaExtend;
+        assert_eq!(extend(SkrifaExtend::Pad), Some(Extend::Pad));
+        assert_eq!(extend(SkrifaExtend::Repeat), Some(Extend::Repeat));
+        assert_eq!(extend(SkrifaExtend::Reflect), Some(Extend::Reflect));
+        assert_eq!(extend(SkrifaExtend::new(7)), None);
     }
 
     /// The paint hash covers every field that distinguishes paints — the

@@ -69,6 +69,8 @@ pub enum ImageSource {
     Registered(u64),
     /// A custom producer attached to this surface's layer.
     Content(LayerId),
+    /// A shader use in this frame.
+    Shader(usize),
 }
 
 /// One draw call's instance range and bound source texture.
@@ -113,6 +115,8 @@ pub struct Frame {
     pub stops: Vec<Stop>,
     /// Passes in submission order.
     pub passes: Vec<Pass>,
+    /// Shader textures requested by this lowering.
+    pub shaders: Vec<super::paint::Key>,
     open: Option<OpenPass>,
 }
 
@@ -134,6 +138,7 @@ struct FrameSnapshot {
     instances: usize,
     stops: usize,
     passes: usize,
+    shaders: usize,
     open: Option<OpenPass>,
 }
 
@@ -144,6 +149,7 @@ impl Frame {
             instances: self.instances.len(),
             stops: self.stops.len(),
             passes: self.passes.len(),
+            shaders: self.shaders.len(),
             open: self.open.clone(),
         }
     }
@@ -153,6 +159,7 @@ impl Frame {
         self.instances.truncate(snap.instances);
         self.stops.truncate(snap.stops);
         self.passes.truncate(snap.passes);
+        self.shaders.truncate(snap.shaders);
         self.open = snap.open;
     }
 }
@@ -163,6 +170,7 @@ impl Frame {
         self.instances.clear();
         self.stops.clear();
         self.passes.clear();
+        self.shaders.clear();
         self.open = None;
     }
 }
@@ -413,6 +421,9 @@ fn paint_data(
     to_local: Affine,
     stops: &mut Vec<Stop>,
     images: &HashMap<u64, GpuImage>,
+    shaders: &mut Vec<super::paint::Key>,
+    bounds: Rect,
+    transform: Affine,
 ) -> Result<PaintData, Encode> {
     let mut data = PaintData {
         kind: PAINT_SOLID,
@@ -474,7 +485,42 @@ fn paint_data(
                 | (sampling << 8);
             data.image = Some(ImageSource::Registered(pattern.image.raw()));
         }
-        Paint::Shader(_) => return Err(Encode::from(RenderError::Unsupported(names::SHADER))),
+        Paint::Shader(paint) => {
+            let device = transform.transform_rect_bbox(bounds);
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "positive texture extents; device limit validated before allocation"
+            )]
+            let size = (
+                device.width().ceil().max(1.0) as u32,
+                device.height().ceil().max(1.0) as u32,
+            );
+            let key = super::paint::Key {
+                shader: paint.shader.raw(),
+                uniforms: paint.uniforms.iter().map(|v| v.to_bits()).collect(),
+                size,
+            };
+            let index = shaders
+                .iter()
+                .position(|existing| *existing == key)
+                .unwrap_or_else(|| {
+                    shaders.push(key);
+                    shaders.len() - 1
+                });
+            let map = to_local
+                * Affine::translate((bounds.x0, bounds.y0))
+                * Affine::scale_non_uniform(
+                    bounds.width() / f64::from(size.0),
+                    bounds.height() / f64::from(size.1),
+                );
+            let [a, b, c, d, e, f] = map.inverse().as_coeffs();
+            data.kind = PAINT_IMAGE;
+            data.grad = [f32_f64(a), f32_f64(b), f32_f64(c), f32_f64(d)];
+            data.grad2 = [f32_f64(e), f32_f64(f), size.0 as f32, size.1 as f32];
+            data.packed = EXTEND_PAD | (EXTEND_PAD << 4) | (1 << 8);
+            data.image = Some(ImageSource::Shader(index));
+        }
     }
     Ok(data)
 }
@@ -872,6 +918,9 @@ impl<'a> Lowering<'a> {
             boxed.extra.inverse(),
             &mut self.frame.stops,
             glyphs.images,
+            &mut self.frame.shaders,
+            boxed.extra.transform_rect_bbox(boxed.bounds),
+            self.transform,
         )?;
         inst.color = paint.color;
         inst.grad = paint.grad;
@@ -1497,11 +1546,29 @@ impl<'a> Lowering<'a> {
         paint: &Paint,
         glyphs: &GlyphContext<'_>,
     ) -> Result<(), Encode> {
+        let bounds = emit
+            .spans
+            .iter()
+            .copied()
+            .chain(emit.cells.iter().map(|cell| cell.rect))
+            .map(|rect| {
+                Rect::new(
+                    f64::from(rect[0]) + offset.x,
+                    f64::from(rect[1]) + offset.y,
+                    f64::from(rect[2]) + offset.x,
+                    f64::from(rect[3]) + offset.y,
+                )
+            })
+            .reduce(Rect::union)
+            .unwrap_or(Rect::ZERO);
         let paint = paint_data(
             paint,
             Affine::IDENTITY,
             &mut self.frame.stops,
             glyphs.images,
+            &mut self.frame.shaders,
+            self.transform.inverse().transform_rect_bbox(bounds),
+            self.transform,
         )?;
         self.set_image(paint.image);
         for rect in &emit.spans {
@@ -1731,6 +1798,14 @@ impl<'a> Lowering<'a> {
                 Affine::IDENTITY,
                 &mut self.frame.stops,
                 glyphs.images,
+                &mut self.frame.shaders,
+                self.transform.inverse().transform_rect_bbox(Rect::new(
+                    f64::from(x0),
+                    f64::from(y0),
+                    f64::from(x0) + f64::from(entry.w),
+                    f64::from(y0) + f64::from(entry.h),
+                )),
+                self.transform,
             )?;
             self.set_image(paint_data.image);
             inst.color = paint_data.color;

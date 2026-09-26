@@ -17,16 +17,12 @@ pub const MESH: &str = "mesh-gradient";
     reason = "vocabulary reserved for lower paths landing later"
 )]
 pub const IMAGE: &str = "image";
-/// A user shader paint.
-pub const SHADER: &str = "shader-paint";
 /// A blend mode other than normal.
 #[expect(
     dead_code,
     reason = "blend modes are supported; the name is kept for parity"
 )]
 pub const BLEND: &str = "blend-mode";
-/// A filter on a group or layer.
-pub const FILTER: &str = "filter";
 /// A backdrop group.
 pub const BACKDROP: &str = "backdrop";
 /// A stroke join or cap combination with no analytic form.

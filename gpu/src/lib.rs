@@ -222,3 +222,17 @@ impl cherenkov::GpuContent for Gpu {
         renderer.set_gpu_content(surface, layer, size, content);
     }
 }
+
+impl cherenkov::ShaderPaintCapability for Gpu {
+    fn add_shader(
+        renderer: &mut Self::Renderer,
+        id: cherenkov::ShaderId,
+        source: cherenkov::ShaderSource,
+    ) -> Result<(), cherenkov::ResourceError> {
+        renderer.add_shader(id, &source)
+    }
+
+    fn remove_shader(renderer: &mut Self::Renderer, id: cherenkov::ShaderId) {
+        renderer.shaders.remove(id.raw());
+    }
+}

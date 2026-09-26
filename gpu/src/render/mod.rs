@@ -9,6 +9,7 @@ mod glyph;
 mod gpu_content;
 mod instance;
 mod lower;
+mod paint;
 mod path;
 mod present;
 mod raster;
@@ -168,6 +169,7 @@ struct SurfaceState {
     layers: HashMap<LayerId, ContentData>,
     /// The reused lowering output (instances, stops, passes).
     frame: LoweredFrame,
+    shader_textures: HashMap<paint::Key, paint::Texture>,
     /// The swapchain the target is presented on, for window surfaces.
     window: Option<present::WindowSurface>,
 }
@@ -221,6 +223,7 @@ pub struct GpuRenderer {
     queue: wgpu::Queue,
     presenter: present::Presenter,
     pub(crate) filters: filter::Registry,
+    pub(crate) shaders: paint::Registry,
     /// `[format index][pipeline kind]`: 0 = surface format, 1 = scratch
     /// format; kind 0 = source-over, 1 = replace.
     pipelines: [[wgpu::RenderPipeline; 2]; 2],
@@ -645,6 +648,7 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             queue,
             presenter,
             filters: filter::Registry::default(),
+            shaders: paint::Registry::default(),
             pipelines,
             scratch_format,
             layout0,
@@ -767,6 +771,7 @@ impl Renderer for GpuRenderer {
                 backdrop: [None, None],
                 layers: HashMap::new(),
                 frame: LoweredFrame::default(),
+                shader_textures: HashMap::new(),
                 window,
             },
         );
@@ -991,6 +996,11 @@ impl Renderer for GpuRenderer {
             .filter(|sf| {
                 sf.changed
                     || self.filters.wants_redraw()
+                    || self.surfaces[&sf.id]
+                        .frame
+                        .shaders
+                        .iter()
+                        .any(|key| self.shaders.animated(key))
                     || self.surfaces[&sf.id].layers.values().any(
                         |content| matches!(content, ContentData::Gpu(slot) if slot.wants_redraw()),
                     )
@@ -1022,7 +1032,11 @@ impl Renderer for GpuRenderer {
                     );
                 }
             }
-            result = self.render_surface(sf, stats);
+            result = self.render_surface(
+                sf,
+                frame.time.0.saturating_duration_since(origin).as_secs_f32(),
+                stats,
+            );
             if result.is_err() {
                 break;
             }
@@ -1054,6 +1068,13 @@ impl Renderer for GpuRenderer {
         result?;
         Ok(
             if self.filters.wants_redraw()
+                || self.surfaces.values().any(|surface| {
+                    surface
+                        .frame
+                        .shaders
+                        .iter()
+                        .any(|key| self.shaders.animated(key))
+                })
                 || self.surfaces.values().any(|surface| {
                     surface.layers.values().any(
                         |content| matches!(content, ContentData::Gpu(slot) if slot.wants_redraw()),
@@ -1137,6 +1158,14 @@ impl Renderer for GpuRenderer {
 }
 
 impl GpuRenderer {
+    pub(crate) fn add_shader(
+        &mut self,
+        id: cherenkov::ShaderId,
+        source: &cherenkov::ShaderSource,
+    ) -> Result<(), ResourceError> {
+        self.shaders.add(&self.device, id.raw(), source)
+    }
+
     pub(crate) fn set_gpu_content(
         &mut self,
         surface: SurfaceId,
@@ -1171,6 +1200,7 @@ impl GpuRenderer {
     fn render_surface(
         &mut self,
         sf: &SurfaceFrame<'_>,
+        time: f32,
         stats: &mut FrameStats,
     ) -> Result<(), RenderError> {
         let id = sf.id;
@@ -1221,6 +1251,19 @@ impl GpuRenderer {
             result
         };
         lowered.map_err(RenderError::from)?;
+        let surface = self.surfaces.get_mut(&id).expect("registered surface");
+        surface
+            .shader_textures
+            .retain(|key, _| surface.frame.shaders.contains(key));
+        for key in &surface.frame.shaders {
+            self.shaders.render(
+                &self.device,
+                &self.queue,
+                key,
+                &mut surface.shader_textures,
+                time,
+            )?;
+        }
         // Grow the query set lazily when this frame's passes exceed its
         // capacity; never mid-encoder.
         if self.timestamps {
@@ -1551,6 +1594,9 @@ impl GpuRenderer {
                             backdrop,
                             range.image.map(|source| match source {
                                 ImageSource::Registered(id) => &self.images[&id].view,
+                                ImageSource::Shader(index) => {
+                                    &surf.shader_textures[&surf.frame.shaders[index]].image.view
+                                }
                                 ImageSource::Content(layer) => {
                                     let ContentData::Gpu(slot) = &surf.layers[&layer] else {
                                         unreachable!("GPU texture range belongs to GPU content")

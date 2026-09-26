@@ -7,6 +7,7 @@ mod colr;
 mod glyph;
 mod instance;
 mod lower;
+mod prepared;
 mod path;
 mod raster;
 
@@ -772,15 +773,15 @@ impl Renderer for GpuRenderer {
         };
         match content {
             Some(ContentOp::Replace(list)) => {
-                state.layers.insert(layer, ContentData::List(list));
+                state.layers.insert(layer, ContentData::new(list));
             }
             Some(ContentOp::Update(updates)) => {
-                if let Some(ContentData::List(list)) = state.layers.get_mut(&layer) {
-                    let _ = list.apply(updates);
+                if let Some(content) = state.layers.get_mut(&layer) {
+                    content.update(updates);
                 }
             }
             Some(ContentOp::Picture(picture)) => {
-                state.layers.insert(layer, ContentData::Picture(picture));
+                state.layers.insert(layer, ContentData::new(picture.display_list().clone()));
             }
             None => {
                 state.layers.remove(&layer);
@@ -1065,7 +1066,7 @@ impl GpuRenderer {
                 return Ok(());
             };
             surf.frame.reset();
-            let caches = std::mem::take(&mut surf.layers);
+            let mut caches = std::mem::take(&mut surf.layers);
             // A full atlas is a recoverable signal: grow while the budget
             // allows, then clear once; a second failure after the clear
             // means the frame's live set exceeds the maximum atlas.
@@ -1079,9 +1080,11 @@ impl GpuRenderer {
                         images: &self.images,
                     };
                     let mut lowering = Lowering::new(&mut surf.frame, surf.size);
-                    let result = lowering.run(sf.tree, &caches, sf.clear, &mut glyphs);
+                    let result = lowering.run(sf.tree, &mut caches, sf.clear, &mut glyphs);
                     stats.glyphs_rasterized += lowering.glyphs_rasterized();
                     stats.paths_rasterized += lowering.paths_rasterized();
+                    stats.commands_lowered += lowering.commands_lowered;
+                    stats.layers_composed += lowering.layers_composed;
                     result
                 };
                 match result {

@@ -117,53 +117,84 @@ pub fn render_bands(
         .zip(scratch.par_iter_mut())
         .enumerate()
         .for_each(|(index, (slice, scratch))| {
-            architecture.dispatch(|| {
-                slice.fill(clear);
-                let len = slice.len();
-                let mut band = Band {
-                    fb: slice,
-                    w,
-                    y0: index * BAND_H,
-                };
-                for &i in &scratch.items {
-                    match &items[i] {
-                        Item::Draw {
-                            coverage, paint, ..
-                        } => {
-                            band.draw(&mut scratch.stack, coverage, paint);
-                        }
-                        Item::PushIsolate => {
-                            let mut buffer = scratch.spare.pop().unwrap_or_default();
-                            buffer.resize(len, [0.0; 4]);
-                            buffer.fill([0.0; 4]);
-                            scratch.stack.push(buffer);
-                        }
-                        Item::PopIsolate {
-                            opacity,
-                            blend,
-                            space,
-                        } => {
-                            let buffer = scratch.stack.pop().expect("balanced isolation items");
-                            band.composite_isolate(
-                                &buffer,
-                                *opacity,
-                                *blend,
-                                *space,
-                                &mut scratch.stack,
-                            );
-                            scratch.spare.push(buffer);
-                        }
-                        Item::Glyph {
-                            slot, x, y, paint, ..
-                        } => {
-                            band.glyph(&mut scratch.stack, slot, *x, *y, paint);
-                        }
-                    }
-                }
-                assert!(scratch.stack.is_empty(), "balanced isolation items");
+            architecture.dispatch(ShadeBand {
+                clear,
+                items,
+                slice,
+                scratch,
+                w,
+                y0: index * BAND_H,
             });
         });
     (draws, edges)
+}
+
+/// One owned band and the immutable painter-order input for its SIMD dispatch.
+struct ShadeBand<'a> {
+    clear: [f32; 4],
+    items: &'a [Item],
+    slice: &'a mut [[f32; 4]],
+    scratch: &'a mut BandScratch,
+    w: usize,
+    y0: usize,
+}
+
+impl pulp::WithSimd for ShadeBand<'_> {
+    type Output = ();
+
+    #[expect(
+        clippy::inline_always,
+        reason = "pulp requires the SIMD loop body inside its target-feature dispatch"
+    )]
+    #[inline(always)]
+    fn with_simd<S: pulp::Simd>(self, simd: S) {
+        let Self {
+            clear,
+            items,
+            slice,
+            scratch,
+            w,
+            y0,
+        } = self;
+        slice.fill(clear);
+        let len = slice.len();
+        let mut band = Band {
+            fb: slice,
+            w,
+            y0,
+            simd,
+        };
+        for &i in &scratch.items {
+            match &items[i] {
+                Item::Draw {
+                    coverage, paint, ..
+                } => {
+                    band.draw(&mut scratch.stack, coverage, paint);
+                }
+                Item::PushIsolate => {
+                    let mut buffer = scratch.spare.pop().unwrap_or_default();
+                    buffer.resize(len, [0.0; 4]);
+                    buffer.fill([0.0; 4]);
+                    scratch.stack.push(buffer);
+                }
+                Item::PopIsolate {
+                    opacity,
+                    blend,
+                    space,
+                } => {
+                    let buffer = scratch.stack.pop().expect("balanced isolation items");
+                    band.composite_isolate(&buffer, *opacity, *blend, *space, &mut scratch.stack);
+                    scratch.spare.push(buffer);
+                }
+                Item::Glyph {
+                    slot, x, y, paint, ..
+                } => {
+                    band.glyph(&mut scratch.stack, slot, *x, *y, paint);
+                }
+            }
+        }
+        assert!(scratch.stack.is_empty(), "balanced isolation items");
+    }
 }
 
 /// Convolve the clipped caster using the Gaussian in the shape's coordinate system.
@@ -306,7 +337,8 @@ fn blur_correlated(
 }
 
 /// One band's rasterization state.
-struct Band<'a> {
+struct Band<'a, S: pulp::Simd> {
+    simd: S,
     /// The band's framebuffer rows.
     fb: &'a mut [[f32; 4]],
     /// Surface width.
@@ -315,9 +347,13 @@ struct Band<'a> {
     y0: usize,
 }
 
-impl Band<'_> {
+impl<S: pulp::Simd> Band<'_, S> {
     /// Shades only nonempty runs. Opaque solid spans are direct stores.
     #[expect(clippy::cast_precision_loss, reason = "surface coordinates fit f32")]
+    #[expect(
+        clippy::inline_always,
+        reason = "the span loop must inherit the selected SIMD target features"
+    )]
     #[inline(always)]
     fn draw(&mut self, stack: &mut [Vec<[f32; 4]>], coverage: &Coverage, paint: &PaintData) {
         let bottom = (self.y0 + self.fb.len() / self.w).min(coverage.bottom());
@@ -337,9 +373,7 @@ impl Band<'_> {
                             }
                         }
                     } else {
-                        for (pixel, &alpha) in pixels.iter_mut().zip(&span.samples) {
-                            *pixel = src_over(*pixel, color.map(|value| value * alpha));
-                        }
+                        super::composite::solid_span(self.simd, pixels, &span.samples, *color);
                     }
                 } else {
                     for x in span.columns.clone() {
@@ -359,6 +393,10 @@ impl Band<'_> {
         clippy::cast_possible_truncation,
         clippy::cast_precision_loss,
         reason = "mask coordinates and pixel indices are small"
+    )]
+    #[expect(
+        clippy::inline_always,
+        reason = "the glyph loop must inherit the selected SIMD target features"
     )]
     #[inline(always)]
     fn glyph(
@@ -391,22 +429,34 @@ impl Band<'_> {
         if y_lo >= y_hi || x_lo >= x_hi {
             return;
         }
+        let dst = top(&mut *self.fb, stack);
         for y in y_lo..y_hi {
             let py = self.y0 + y;
-            let row = usize::try_from(py as i32 - my0).unwrap_or(0) * mask.w as usize;
-            for x in x_lo..x_hi {
-                let cov = mask.cov[row + usize::try_from(x as i32 - mx0).unwrap_or(0)];
-                if cov <= 0.0 {
-                    continue;
+            let row =
+                usize::try_from(py as i32 - my0).expect("clipped glyph row") * mask.w as usize;
+            let start = row + usize::try_from(x_lo as i32 - mx0).expect("clipped glyph column");
+            let samples = &mask.cov[start..start + x_hi - x_lo];
+            let pixels = &mut dst[y * self.w + x_lo..y * self.w + x_hi];
+            if let PaintData::Solid(color) = paint {
+                super::composite::solid_span(self.simd, pixels, samples, *color);
+            } else {
+                for (index, (pixel, &coverage)) in pixels.iter_mut().zip(samples).enumerate() {
+                    if coverage > 0.0 {
+                        let source = paint
+                            .eval((x_lo + index) as f32 + 0.5, py as f32 + 0.5)
+                            .map(|value| value * coverage);
+                        *pixel = src_over(*pixel, source);
+                    }
                 }
-                let src = paint.eval(x as f32 + 0.5, py as f32 + 0.5).map(|v| v * cov);
-                let dst = top(&mut *self.fb, stack);
-                dst[y * self.w + x] = src_over(dst[y * self.w + x], src);
             }
         }
     }
 
     /// Composites the popped isolation buffer onto the buffer below.
+    #[expect(
+        clippy::inline_always,
+        reason = "the layer loop must inherit the selected SIMD target features"
+    )]
     #[inline(always)]
     fn composite_isolate(
         &mut self,
@@ -417,17 +467,12 @@ impl Band<'_> {
         stack: &mut [Vec<[f32; 4]>],
     ) {
         let dst = top(&mut *self.fb, stack);
-        for (i, &src) in scratch.iter().enumerate() {
-            let s = src.map(|v| v * opacity);
-            dst[i] =
-                if mode == cherenkov::BlendMode::Normal && space == cherenkov::BlendSpace::Linear {
-                    if s[3] == 0.0 {
-                        continue;
-                    }
-                    src_over(dst[i], s)
-                } else {
-                    in_space(mode, space, dst[i], s)
-                };
+        if mode == cherenkov::BlendMode::Normal && space == cherenkov::BlendSpace::Linear {
+            super::composite::isolate(self.simd, dst, scratch, opacity);
+        } else {
+            for (pixel, source) in dst.iter_mut().zip(scratch) {
+                *pixel = in_space(mode, space, *pixel, source.map(|value| value * opacity));
+            }
         }
     }
 }

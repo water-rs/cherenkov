@@ -844,16 +844,13 @@ impl<'a> Lowering<'a> {
             region[2] as f32,
             region[3] as f32,
         );
-        let half = [rw / 2.0, rh / 2.0];
-        let mut inst = self.base(
-            KIND_FILL,
-            affine(Affine::translate((
-                f64::from(rx) + f64::from(half[0]),
-                f64::from(ry) + f64::from(half[1]),
-            ))),
-        );
-        inst.bounds = [-half[0], -half[1], half[0], half[1]];
-        inst.shape = Shape::rect(half);
+        // `KIND_SPAN` coverage is exactly 1: the region edge is the
+        // content's edge, not a shape boundary the SDF would antialias
+        // into a half-covered rim — wrong under a non-Normal blend.
+        // Bounds are device-space for spans and the texture paint reads
+        // `pixel`, so the affine is irrelevant.
+        let mut inst = self.base(KIND_SPAN, affine(Affine::IDENTITY));
+        inst.bounds = [rx, ry, rx + rw, ry + rh];
         inst.meta[1] = PAINT_TEXTURE;
         inst.params[1] = opacity;
         // `grad.xy` carries the scratch region's texel origin.
@@ -2052,6 +2049,67 @@ fn tight_region(instances: &[Instance], width: u32, height: u32) -> [u32; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An adapter plus device, or `None` where no GPU exists.
+    fn device_and_queue() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::all(),
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let adapter = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()))
+            .into_iter()
+            .next()?;
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()
+    }
+
+    /// An isolated group's composite quad is a `KIND_SPAN`: full coverage
+    /// over its device-space region, not an SDF edge that would half-cover
+    /// the rim texels.
+    #[test]
+    fn a_composite_is_a_full_coverage_span() {
+        let Some((device, queue)) = device_and_queue() else {
+            return;
+        };
+        let mut atlas = Atlas::new(&device, u64::MAX);
+        let fonts = HashMap::new();
+        let images = HashMap::new();
+        let mut frame = Frame::default();
+        let mut lowering = Lowering::new(&mut frame, (64, 64));
+        let mut glyphs = GlyphContext {
+            atlas: &mut atlas,
+            queue: &queue,
+            fonts: &fonts,
+            images: &images,
+        };
+        // Two overlapping rects defeat the pass-through speculation, so
+        // the group really isolates into a scratch and composites back.
+        lowering
+            .isolate(
+                None,
+                0.5,
+                BlendMode::Normal,
+                |s, g| {
+                    s.fill(
+                        &ShapeData::Rect(Rect::new(4.0, 4.0, 20.0, 20.0)),
+                        &Paint::Solid(WorkingColor::new([1.0, 0.0, 0.0, 1.0])),
+                        g,
+                    )?;
+                    s.fill(
+                        &ShapeData::Rect(Rect::new(12.0, 12.0, 28.0, 28.0)),
+                        &Paint::Solid(WorkingColor::new([0.0, 0.0, 1.0, 1.0])),
+                        g,
+                    )
+                },
+                &mut glyphs,
+            )
+            .expect("isolate");
+        let composite = frame
+            .instances
+            .iter()
+            .find(|i| i.meta[1] == PAINT_TEXTURE)
+            .expect("the composite instance");
+        assert_eq!(composite.meta[0], KIND_SPAN, "composites are spans");
+    }
 
     /// A shadow whose negative spread collapses the shape's box emits no
     /// quad — a zero-area shape casts nothing.

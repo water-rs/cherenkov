@@ -91,13 +91,16 @@ pub mod wgpu {
         pub width: u32,
         /// Height in pixels.
         pub height: u32,
-        /// Scale factor of the target.
+        /// Scale factor of the target. Always `1.0` for now: surfaces
+        /// carry no scale factor yet.
         pub scale: f32,
         /// Time since the engine started.
         pub elapsed: Duration,
-        /// Time since the previous frame, capped at 100 ms.
+        /// Time since the previous frame, capped at 100 ms (defaulting to
+        /// 1/60 s for the first frame).
         pub delta: Duration,
-        redraw: bool,
+        /// Set by `request_redraw`.
+        pub(crate) redraw: bool,
     }
 
     impl Frame<'_> {

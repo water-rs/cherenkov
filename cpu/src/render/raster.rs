@@ -365,13 +365,7 @@ impl<S: pulp::Simd> Band<'_, S> {
                     let pixels = &mut dst[row + span.columns.start..row + span.columns.end];
                     if span.samples.is_empty() {
                         let src = color.map(|value| value * span.alpha);
-                        if src[3].to_bits() == 1.0_f32.to_bits() {
-                            pixels.fill(src);
-                        } else {
-                            for pixel in pixels {
-                                *pixel = src_over(*pixel, src);
-                            }
-                        }
+                        super::composite::constant(self.simd, pixels, src);
                     } else {
                         super::composite::solid_span(self.simd, pixels, &span.samples, *color);
                     }
@@ -510,6 +504,22 @@ mod tests {
                 cherenkov::BlendMode::DestIn,
             ] {
                 let items = vec![
+                    Item::Draw {
+                        coverage: std::sync::Arc::new(Coverage::from_rows(
+                            0,
+                            (0..height).map(|_| vec![1.0; width]),
+                        )),
+                        edge_count: 0,
+                        paint: PaintData::Solid([-0.25, 0.3, 1.4, 1.0]),
+                    },
+                    Item::Draw {
+                        coverage: std::sync::Arc::new(Coverage::from_rows(
+                            0,
+                            (0..height).map(|_| vec![0.375; width]),
+                        )),
+                        edge_count: 0,
+                        paint: PaintData::Solid([0.4, -0.1, 0.3, 0.75]),
+                    },
                     Item::Draw {
                         coverage: coverage.clone(),
                         edge_count: 0,

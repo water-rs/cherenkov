@@ -38,6 +38,32 @@ fn over<S: Simd>(simd: S, destination: [S::f32s; 4], source: [S::f32s; 4]) -> [S
     })
 }
 
+/// A constant source has one inverse alpha for every channel, so its pixels
+/// stay interleaved. There is no reason to transpose the destination.
+#[expect(
+    clippy::inline_always,
+    reason = "packed source-over must inline into the SIMD target-feature context"
+)]
+#[inline(always)]
+pub fn constant<S: Simd>(simd: S, pixels: &mut [[f32; 4]], color: [f32; 4]) {
+    let (pixels, tail) = blocks::<S>(pixels);
+    let source = simd.interleave_shfl_f32s(color.map(|channel| simd.splat_f32s(channel)));
+    if color[3].to_bits() == 1.0_f32.to_bits() {
+        pixels.fill(source);
+        tail.fill(color);
+    } else {
+        let inverse = simd.splat_f32s(1.0 - color[3]);
+        for pixel in pixels {
+            for (destination, source) in pixel.iter_mut().zip(source) {
+                *destination = simd.add_f32s(simd.mul_f32s(*destination, inverse), source);
+            }
+        }
+        for pixel in tail {
+            *pixel = src_over(*pixel, color);
+        }
+    }
+}
+
 /// Put coverage in the same lane order as a four-channel pixel block.
 /// Pulp's shuffle transpose may permute pixels within each channel vector.
 /// Transposing coverage through that same layout keeps each value with its pixel.

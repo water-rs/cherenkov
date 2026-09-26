@@ -1553,9 +1553,14 @@ impl<'a> Lowering<'a> {
         for h in &mut s.half {
             *h += spread;
         }
+        if s.half[0] <= 0.0 || s.half[1] <= 0.0 {
+            // The spread collapsed the box: a zero-area shape casts no
+            // shadow.
+            return Ok(());
+        }
         for r in &mut s.radii {
             if *r > 0.0 {
-                *r += spread;
+                *r = (*r + spread).max(0.0);
             }
         }
         let sigma_eff = shadow_sigma(shadow.sigma);
@@ -2042,4 +2047,48 @@ fn tight_region(instances: &[Instance], width: u32, height: u32) -> [u32; 4] {
         return [0, 0, 0, 0];
     }
     [x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A shadow whose negative spread collapses the shape's box emits no
+    /// quad — a zero-area shape casts nothing.
+    #[test]
+    fn a_collapsed_shadow_emits_no_quads() {
+        let mut frame = Frame::default();
+        let mut lowering = Lowering::new(&mut frame, (64, 64));
+        // Half extents [20, 5]: a spread of -20 inverts both.
+        let bar = ShapeData::Rect(kurbo::Rect::new(20.0, 20.0, 60.0, 30.0));
+        let collapsed =
+            cherenkov::Shadow::new(2.0, WorkingColor::new([0.0, 0.0, 0.0, 1.0])).spread(-20.0);
+        lowering
+            .shadow(&bar, &collapsed, None)
+            .expect("collapsed shadow is not an error");
+        assert!(
+            lowering.frame.instances.is_empty(),
+            "a collapsed box emits no quad"
+        );
+        // A milder negative spread that leaves the box positive still
+        // emits — and its radii clamp at zero rather than going negative.
+        let shrunk =
+            cherenkov::Shadow::new(2.0, WorkingColor::new([0.0, 0.0, 0.0, 1.0])).spread(-4.0);
+        lowering.shadow(&bar, &shrunk, None).expect("shadow");
+        assert_eq!(lowering.frame.instances.len(), 1);
+        assert!(
+            lowering.frame.instances[0]
+                .shape
+                .half
+                .iter()
+                .all(|h| *h > 0.0)
+        );
+        assert!(
+            lowering.frame.instances[0]
+                .shape
+                .radii
+                .iter()
+                .all(|r| *r >= 0.0)
+        );
+    }
 }

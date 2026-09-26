@@ -24,8 +24,11 @@ vello-cpu = ["dep:vello_cpu", "dep:vello_common"]
 # binaries.
 skia = ["dep:skia-safe", "dep:ash", "dep:skia-bindings", "skia-safe/vulkan", "skia-safe/ganesh"]
 skia-metal = ["dep:skia-safe", "dep:objc2", "dep:objc2-metal", "dep:skia-bindings", "skia-safe/metal", "skia-safe/graphite"]
+cherenkov-cpu = ["dep:cherenkov", "dep:cherenkov-cpu"]
 
 [dependencies]
+cherenkov = { path = "..", optional = true }
+cherenkov-cpu = { path = "../cpu", optional = true }
 cherenkov-scene = { path = "../scene" }
 cherenkov-oracle = { path = "../oracle" }
 kurbo = "0.13"

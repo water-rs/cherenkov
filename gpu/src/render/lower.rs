@@ -298,6 +298,20 @@ fn aa_margin(transform: Affine) -> f64 {
     if lmin <= 1e-9 { 0.0 } else { 2.0 / lmin }
 }
 
+/// The up-to-four border strips of `b` minus the covered box `c`:
+/// top and bottom run the full width, left and right fit between them.
+/// Empty strips are dropped; `c` need not lie inside `b`.
+fn border_strips(b: Rect, c: Rect) -> impl Iterator<Item = Rect> {
+    [
+        Rect::new(b.x0, b.y0, b.x1, c.y0),
+        Rect::new(b.x0, c.y1, b.x1, b.y1),
+        Rect::new(b.x0, c.y0, c.x0, c.y1),
+        Rect::new(c.x1, c.y0, b.x1, c.y1),
+    ]
+    .into_iter()
+    .filter(|r| r.width() > 0.0 && r.height() > 0.0)
+}
+
 /// The blur sigma the shader integrates against, modelling the oracle's
 /// pixel-area sampling: `sqrt(sigma² + 1/12)` for a positive sigma.
 fn shadow_sigma(sigma: f64) -> f64 {
@@ -1054,7 +1068,10 @@ impl<'a> Lowering<'a> {
                     stroke,
                     paint,
                 } => self.stroke(shape, stroke, paint, glyphs)?,
-                Command::Shadow { shape, shadow } => self.shadow(shape, shadow)?,
+                Command::Shadow { shape, shadow } => {
+                    let covered = self.shadow_cover(commands.get(i + 1), shape, shadow);
+                    self.shadow(shape, shadow, covered)?;
+                }
                 Command::Glyphs { run, paint } => self.glyph_run(run, paint, glyphs)?,
                 Command::Image {
                     image,
@@ -1137,6 +1154,32 @@ impl<'a> Lowering<'a> {
             return Ok(());
         };
         let margin = aa_margin(self.transform);
+        // A large axis-aligned box fill shades a full interior of
+        // coverage 1: emit the guaranteed-covered device rect as one
+        // `KIND_SPAN` and only the four border strips as `KIND_FILL`s.
+        let to_device = self.transform * boxed.extra;
+        let [ta, tb, tc, td, te, tf] = to_device.as_coeffs();
+        if tb == 0.0 && tc == 0.0 && ta != 0.0 && td != 0.0 {
+            let max_r = boxed.shape.radii.iter().copied().fold(0.0, f32::max);
+            let inner =
+                rect_around_origin(boxed.shape.half).inset(-(f64::from(max_r) + margin + 1.0));
+            let (dx0, dx1) = if ta >= 0.0 {
+                (ta.mul_add(inner.x0, te), ta.mul_add(inner.x1, te))
+            } else {
+                (ta.mul_add(inner.x1, te), ta.mul_add(inner.x0, te))
+            };
+            let (dy0, dy1) = if td >= 0.0 {
+                (td.mul_add(inner.y0, tf), td.mul_add(inner.y1, tf))
+            } else {
+                (td.mul_add(inner.y1, tf), td.mul_add(inner.y0, tf))
+            };
+            if (dx1 - dx0) * (dy1 - dy0) >= 4096.0 {
+                let span = Rect::new(dx0.ceil(), dy0.ceil(), dx1.floor(), dy1.floor());
+                if span.width() > 0.0 && span.height() > 0.0 {
+                    return self.fill_span(&boxed, to_device, span, margin, paint, glyphs);
+                }
+            }
+        }
         self.emit(
             KIND_FILL,
             &boxed,
@@ -1148,6 +1191,77 @@ impl<'a> Lowering<'a> {
             0,
             glyphs,
         )
+    }
+
+    /// The box `covered` split of `fill`: one device-space `KIND_SPAN` for
+    /// the interior plus up to four `KIND_FILL` border strips of `b \ c`,
+    /// where `c` is the span's local-space pre-image. Every piece carries
+    /// the same shape, clip/mask flags, opacity and paint fields, so the
+    /// fragment result is identical — only the fragment count drops.
+    fn fill_span(
+        &mut self,
+        boxed: &Boxed,
+        to_device: Affine,
+        span: Rect,
+        margin: f64,
+        paint: &Paint,
+        glyphs: &GlyphContext<'_>,
+    ) -> Result<(), RenderError> {
+        let paint = paint_data(
+            paint,
+            boxed.extra.inverse(),
+            &mut self.frame.stops,
+            glyphs.images,
+        )?;
+        self.set_image(paint.image);
+        let apply = |inst: &mut Instance, bounds: [f32; 4]| {
+            inst.bounds = bounds;
+            inst.shape = boxed.shape;
+            inst.color = paint.color;
+            inst.grad = paint.grad;
+            inst.grad2 = paint.grad2;
+            inst.meta[1] = paint.kind;
+            inst.meta[2] = paint.first_stop;
+            inst.meta[3] |= paint.packed & 0x00ff_ffff;
+        };
+        let mut inst = self.base(KIND_SPAN, affine(to_device));
+        apply(
+            &mut inst,
+            [
+                f32_f64(span.x0),
+                f32_f64(span.y0),
+                f32_f64(span.x1),
+                f32_f64(span.y1),
+            ],
+        );
+        self.frame.instances.push(inst);
+        // The span's device rect back in local space: `to_device` is
+        // axis-aligned, so invert each axis independently.
+        let [ta, _, _, td, te, tf] = to_device.as_coeffs();
+        let (cx0, cx1) = if ta >= 0.0 {
+            ((span.x0 - te) / ta, (span.x1 - te) / ta)
+        } else {
+            ((span.x1 - te) / ta, (span.x0 - te) / ta)
+        };
+        let (cy0, cy1) = if td >= 0.0 {
+            ((span.y0 - tf) / td, (span.y1 - tf) / td)
+        } else {
+            ((span.y1 - tf) / td, (span.y0 - tf) / td)
+        };
+        let c = Rect::new(cx0, cy0, cx1, cy1);
+        let b = boxed.bounds.inflate(margin, margin);
+        let mut inst = self.base(KIND_FILL, affine(to_device));
+        apply(&mut inst, [0.0; 4]);
+        for strip in border_strips(b, c) {
+            inst.bounds = [
+                f32_f64(strip.x0),
+                f32_f64(strip.y0),
+                f32_f64(strip.x1),
+                f32_f64(strip.y1),
+            ];
+            self.frame.instances.push(inst);
+        }
+        Ok(())
     }
 
     /// `Image`: a fill of `dst` whose paint maps the rect onto the whole
@@ -1329,8 +1443,51 @@ impl<'a> Lowering<'a> {
         )
     }
 
+    /// When `commands[i]` is a `Shadow` immediately followed by an
+    /// opaque solid fill of the same shape, the fill covers the shadow
+    /// inside the fill's inner box. Returns that box in shadow-local
+    /// space (shadow local = translate(offset) * shape local), or `None`
+    /// when the next command doesn't qualify.
+    #[expect(
+        clippy::float_cmp,
+        reason = "coverage is exact only for a fully opaque fill"
+    )]
+    fn shadow_cover(
+        &self,
+        next: Option<&Command>,
+        shape: &ShapeData,
+        shadow: &cherenkov::Shadow,
+    ) -> Option<Rect> {
+        let Some(Command::Fill {
+            shape: fill_shape,
+            paint,
+        }) = next
+        else {
+            return None;
+        };
+        if fill_shape != shape {
+            return None;
+        }
+        let Paint::Solid(color) = paint else {
+            return None;
+        };
+        if color.components[3] != 1.0 {
+            return None;
+        }
+        let fb = box_shape(fill_shape).ok().flatten()?;
+        let max_r = fb.shape.radii.iter().copied().fold(0.0, f32::max);
+        let inner = rect_around_origin(fb.shape.half)
+            .inset(-(f64::from(max_r) + aa_margin(self.transform) + 1.0));
+        Some(inner - shadow.offset)
+    }
+
     /// `Shadow`: a Gaussian-blurred rounded box, offset and spread.
-    fn shadow(&mut self, shape: &ShapeData, shadow: &cherenkov::Shadow) -> Result<(), RenderError> {
+    fn shadow(
+        &mut self,
+        shape: &ShapeData,
+        shadow: &cherenkov::Shadow,
+        covered: Option<Rect>,
+    ) -> Result<(), RenderError> {
         let Some(boxed) = box_shape(shape)? else {
             return Ok(());
         };
@@ -1361,8 +1518,40 @@ impl<'a> Lowering<'a> {
         inst.params[0] = f32_f64(sigma_eff);
         inst.color = shadow.color.components;
         inst.meta[1] = PAINT_SOLID;
-        self.frame.instances.push(inst);
+        self.push_shadow_quads(&inst, b, covered);
         Ok(())
+    }
+
+    /// Pushes `inst` either as one quad or, when the shadow's local box
+    /// `covered` hides its interior, as the up-to-four border strips of
+    /// `b \ covered`. The interior behind an opaque card is opaque
+    /// shadow: coverage there is already saturated, so skipping it
+    /// changes no pixels — the strips' bounds only bound rasterization.
+    /// An opacity below 1 disables the split: a translucent group would
+    /// composite each strip separately.
+    #[expect(clippy::float_cmp, reason = "the split is exact only at full opacity")]
+    fn push_shadow_quads(&mut self, inst: &Instance, b: Rect, covered: Option<Rect>) {
+        let mut inst = *inst;
+        let c = covered
+            .filter(|c| c.width() > 0.0 && c.height() > 0.0)
+            .filter(|_| inst.params[1] == 1.0);
+        match c {
+            None => {
+                inst.bounds = [f32_f64(b.x0), f32_f64(b.y0), f32_f64(b.x1), f32_f64(b.y1)];
+                self.frame.instances.push(inst);
+            }
+            Some(c) => {
+                for strip in border_strips(b, c) {
+                    inst.bounds = [
+                        f32_f64(strip.x0),
+                        f32_f64(strip.y0),
+                        f32_f64(strip.x1),
+                        f32_f64(strip.y1),
+                    ];
+                    self.frame.instances.push(inst);
+                }
+            }
+        }
     }
 
     /// A path or stroked outline: rasterize once per

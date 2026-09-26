@@ -261,7 +261,10 @@ pub fn deposit_exact(
 ) {
     const EPS_Y: f32 = 1e-7;
     let mut lines = Vec::new();
-    let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); bh];
+    // Row spans per swept line, then a counting sort into `bucket`
+    // (line indices grouped by row) with `offs` row offsets.
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut offs = vec![0usize; bh + 1];
     for e in edges {
         if (e.y0 - e.y1).abs() <= f32::EPSILON {
             continue;
@@ -280,14 +283,27 @@ pub fn deposit_exact(
         });
         let r0 = (ylo.floor() as usize).min(bh);
         let r1 = ((yhi.ceil() as usize).min(bh)).max(r0);
-        for bucket in &mut buckets[r0..r1] {
-            bucket.push(lines.len() - 1);
+        spans.push((r0, r1));
+        for count in &mut offs[r0 + 1..=r1] {
+            *count += 1;
+        }
+    }
+    for r in 1..=bh {
+        offs[r] += offs[r - 1];
+    }
+    let mut bucket: Vec<usize> = vec![0; offs[bh]];
+    let mut cursor = offs.clone();
+    for (i, &(r0, r1)) in spans.iter().enumerate() {
+        for r in r0..r1 {
+            bucket[cursor[r]] = i;
+            cursor[r] += 1;
         }
     }
     let mut order: Vec<usize> = Vec::new();
     let mut prev: Vec<usize> = Vec::new();
     let mut bounds: Vec<f32> = Vec::new();
-    for (r, bucket) in buckets.iter().enumerate() {
+    for r in 0..bh {
+        let bucket = &bucket[offs[r]..offs[r + 1]];
         if bucket.is_empty() {
             continue;
         }
@@ -481,6 +497,7 @@ pub fn render_bands(
                         edges,
                         bbox,
                         rule,
+                        exact,
                         paint,
                         clip,
                     } => {
@@ -490,6 +507,7 @@ pub fn render_bands(
                             edges,
                             *bbox,
                             *rule,
+                            *exact,
                             paint,
                             clip.as_ref(),
                         );
@@ -571,6 +589,7 @@ impl Band<'_> {
         edges: &[Edge],
         bbox: crate::render::lower::IRect,
         rule: FillRule,
+        exact: bool,
         paint: &PaintData,
         clip: Option<&ClipRef>,
     ) {
@@ -597,22 +616,35 @@ impl Band<'_> {
         // inside the guard window `x_lo .. x_hi + 1`.
         acc.set_window(x_lo, x_hi);
         acc.clear_range(y_lo, y_hi);
-        deposit_exact(
-            acc,
-            edges.iter().filter_map(|e| {
-                // Only edges crossing the band deposit anything.
+        if exact {
+            deposit_exact(
+                acc,
+                edges.iter().filter_map(|e| {
+                    // Only edges crossing the band deposit anything.
+                    let ey0 = e.y0 - self.y0 as f32;
+                    let ey1 = e.y1 - self.y0 as f32;
+                    (ey0.max(ey1) >= 0.0 && ey0.min(ey1) < bh as f32).then_some(Edge {
+                        x0: e.x0,
+                        y0: ey0,
+                        x1: e.x1,
+                        y1: ey1,
+                    })
+                }),
+                rule,
+                bh,
+            );
+        } else {
+            // A single convex contour never exceeds winding +-1: the
+            // raw deposit is already exact.
+            for e in edges {
                 let ey0 = e.y0 - self.y0 as f32;
                 let ey1 = e.y1 - self.y0 as f32;
-                (ey0.max(ey1) >= 0.0 && ey0.min(ey1) < bh as f32).then_some(Edge {
-                    x0: e.x0,
-                    y0: ey0,
-                    x1: e.x1,
-                    y1: ey1,
-                })
-            }),
-            rule,
-            bh,
-        );
+                if ey0.max(ey1) < 0.0 || ey0.min(ey1) >= bh as f32 {
+                    continue;
+                }
+                acc.draw_line(e.x0, ey0, e.x1, ey1);
+            }
+        }
         for y in y_lo..y_hi {
             let py = self.y0 + y;
             acc.coverage_row(y, x_lo, x_hi, |x, cov| {
@@ -898,12 +930,13 @@ impl Band<'_> {
 }
 
 /// Rasterizes a full-surface coverage mask of `edges` under `rule`,
-/// parallel over bands.
+/// parallel over bands. `exact` selects the self-overlap-safe sweep;
+/// a single convex contour may pass `false` for the raw deposit.
 #[expect(
     clippy::cast_precision_loss,
     reason = "band origins are small integers"
 )]
-pub fn coverage_mask(edges: &[Edge], rule: FillRule, w: usize, h: usize) -> Vec<f32> {
+pub fn coverage_mask(edges: &[Edge], rule: FillRule, w: usize, h: usize, exact: bool) -> Vec<f32> {
     let mut mask = vec![0.0; w * h];
     mask.par_chunks_mut(BAND_H * w)
         .enumerate()
@@ -911,21 +944,32 @@ pub fn coverage_mask(edges: &[Edge], rule: FillRule, w: usize, h: usize) -> Vec<
             let y0 = band * BAND_H;
             let bh = slice.len() / w;
             let mut acc = Accum::new(w, bh);
-            deposit_exact(
-                &mut acc,
-                edges.iter().filter_map(|e| {
+            if exact {
+                deposit_exact(
+                    &mut acc,
+                    edges.iter().filter_map(|e| {
+                        let ey0 = e.y0 - y0 as f32;
+                        let ey1 = e.y1 - y0 as f32;
+                        (ey0.max(ey1) >= 0.0 && ey0.min(ey1) < bh as f32).then_some(Edge {
+                            x0: e.x0,
+                            y0: ey0,
+                            x1: e.x1,
+                            y1: ey1,
+                        })
+                    }),
+                    rule,
+                    bh,
+                );
+            } else {
+                for e in edges {
                     let ey0 = e.y0 - y0 as f32;
                     let ey1 = e.y1 - y0 as f32;
-                    (ey0.max(ey1) >= 0.0 && ey0.min(ey1) < bh as f32).then_some(Edge {
-                        x0: e.x0,
-                        y0: ey0,
-                        x1: e.x1,
-                        y1: ey1,
-                    })
-                }),
-                rule,
-                bh,
-            );
+                    if ey0.max(ey1) < 0.0 || ey0.min(ey1) >= bh as f32 {
+                        continue;
+                    }
+                    acc.draw_line(e.x0, ey0, e.x1, ey1);
+                }
+            }
             for y in 0..bh {
                 acc.coverage_row(y, 0, w, |x, cov| {
                     slice[y * w + x] = cov;
@@ -965,7 +1009,7 @@ mod tests {
 
     fn assert_matches_oracle(edges: &[Edge], name: &str) {
         for rule in [FillRule::NonZero, FillRule::EvenOdd] {
-            let got = coverage_mask(edges, rule, 24, 24);
+            let got = coverage_mask(edges, rule, 24, 24, true);
             let want = oracle_mask(edges, rule, 24, 24);
             let max_diff = got
                 .iter()
@@ -1060,8 +1104,58 @@ mod tests {
         // Regression for the common path: a 10.5x10.5 axis-aligned
         // square must still accumulate 110.25 of coverage.
         let edges = poly(&[(4.0, 4.0), (14.5, 4.0), (14.5, 14.5), (4.0, 14.5)]);
-        let mask = coverage_mask(&edges, FillRule::NonZero, 24, 24);
+        let mask = coverage_mask(&edges, FillRule::NonZero, 24, 24, true);
         let total: f32 = mask.iter().sum();
         assert!((total - 110.25).abs() < 1e-3, "total coverage {total}");
+    }
+    #[test]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "test geometry is far below 2^24"
+    )]
+    fn a_convex_contour_matches_exact_and_raw_deposit() {
+        // A rounded rect is a single strictly convex contour: the raw
+        // per-edge deposit must agree with the exact sweep.
+        fn line(
+            edges: &mut Vec<Edge>,
+            last: &mut cherenkov::kurbo::Point,
+            p: cherenkov::kurbo::Point,
+        ) {
+            if p != *last {
+                edges.push(Edge {
+                    x0: last.x as f32,
+                    y0: last.y as f32,
+                    x1: p.x as f32,
+                    y1: p.y as f32,
+                });
+                *last = p;
+            }
+        }
+        use cherenkov::kurbo::Shape as _;
+        let mut edges = Vec::new();
+        let path = cherenkov::kurbo::RoundedRect::new(2.3, 2.3, 21.7, 19.1, 4.2).to_path(0.1);
+        let mut last = cherenkov::kurbo::Point::ORIGIN;
+        let mut start = last;
+        cherenkov::kurbo::flatten(&path, 0.05, |el| match el {
+            cherenkov::kurbo::PathEl::MoveTo(p) => {
+                line(&mut edges, &mut last, start);
+                start = p;
+                last = p;
+            }
+            cherenkov::kurbo::PathEl::LineTo(p) => line(&mut edges, &mut last, p),
+            cherenkov::kurbo::PathEl::ClosePath => line(&mut edges, &mut last, start),
+            _ => unreachable!("flatten emits lines"),
+        });
+        line(&mut edges, &mut last, start);
+        for rule in [FillRule::NonZero, FillRule::EvenOdd] {
+            let raw = coverage_mask(&edges, rule, 24, 24, false);
+            let exact = coverage_mask(&edges, rule, 24, 24, true);
+            let max_diff = raw
+                .iter()
+                .zip(&exact)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(max_diff < 1e-5, "{rule:?}: raw vs exact max {max_diff}");
+        }
     }
 }

@@ -376,11 +376,16 @@ impl SurfaceTree {
                     && let Some(bounds) = decay.rubber_band
                 {
                     let offset = Vec2::from_lanes(pos);
-                    if !bounds.contains(offset.to_point()) {
+                    // "Outside the bounds" = clamping changes the offset:
+                    // `Rect::contains` is half-open and never holds on a
+                    // degenerate edge (a zero-width bounds rect), while a
+                    // scroll axis exactly on the bound must stay in.
+                    let clamped = clamp_to_rect(offset, bounds);
+                    if clamped != offset {
                         *track = Track {
                             from: pos,
                             velocity: vel,
-                            target: clamp_to_rect(offset, bounds),
+                            target: clamped,
                             animation: Animation::Spring(rubber_band_spring()),
                             start: Some(time),
                             last: track.last,

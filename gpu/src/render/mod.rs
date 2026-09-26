@@ -117,6 +117,32 @@ pub struct GpuImage {
     pub height: u32,
 }
 
+/// A lowering error: keeps the recoverable atlas-full signal typed so
+/// the retry loop matches it without string sentinels. Converted to
+/// [`RenderError`] only at the [`Renderer`] boundary.
+pub enum Encode {
+    /// The glyph/path atlas had no room for a cell; the caller may grow
+    /// or clear the atlas and retry the lowering.
+    AtlasFull,
+    /// Any other lowering failure.
+    Other(RenderError),
+}
+
+impl From<RenderError> for Encode {
+    fn from(error: RenderError) -> Self {
+        Self::Other(error)
+    }
+}
+
+impl From<Encode> for RenderError {
+    fn from(error: Encode) -> Self {
+        match error {
+            Encode::AtlasFull => Self::Render("glyph atlas exhausted".into()),
+            Encode::Other(e) => e,
+        }
+    }
+}
+
 /// One surface's GPU-side state.
 struct SurfaceState {
     size: (u32, u32),
@@ -660,9 +686,11 @@ impl Renderer for GpuRenderer {
     ) -> Result<SurfaceInfo, SurfaceError> {
         let GpuTarget::Offscreen(offscreen) = target;
         let size = offscreen.size;
-        // The target is always Rgba16Float; both offscreen formats are
-        // accepted and readback decodes f16.
-        let _ = offscreen.format;
+        // The target is always Rgba16Float and readback decodes f16, so
+        // only the f16 readback format is honest.
+        if offscreen.format != cherenkov::OffscreenFormat::LinearF16 {
+            return Err(SurfaceError::UnsupportedFormat(offscreen.format));
+        }
         if size.0 == 0 || size.1 == 0 {
             return Err(SurfaceError::ZeroSize);
         }
@@ -1057,7 +1085,7 @@ impl GpuRenderer {
                     result
                 };
                 match result {
-                    Err(RenderError::Render(e)) if e == "glyph atlas full" && !cleared => {
+                    Err(Encode::AtlasFull) if !cleared => {
                         surf.frame.reset();
                         if self.atlas.size() < self.atlas.cap() {
                             self.atlas.grow(&self.device);
@@ -1066,8 +1094,8 @@ impl GpuRenderer {
                             cleared = true;
                         }
                     }
-                    Err(RenderError::Render(e)) if e == "glyph atlas full" => {
-                        break Err(RenderError::Render("glyph atlas exhausted".into()));
+                    Err(Encode::AtlasFull) => {
+                        break Err(Encode::AtlasFull);
                     }
                     other => break other,
                 }
@@ -1075,7 +1103,7 @@ impl GpuRenderer {
             surf.layers = caches;
             result
         };
-        lowered?;
+        lowered.map_err(RenderError::from)?;
         // Grow the query set lazily when this frame's passes exceed its
         // capacity; never mid-encoder.
         if self.timestamps {

@@ -12,7 +12,8 @@ use kurbo::{Affine, BezPath, PathEl, Point, Rect, Shape as _, Vec2};
 
 use crate::render::glyph::{Atlas, PathCell, PathEmit};
 use crate::render::raster::Raster;
-use cherenkov::RenderError;
+
+use super::Encode;
 
 /// Coverage strip height in device rows.
 pub const STRIP_H: usize = 4;
@@ -204,7 +205,7 @@ pub fn emit(
     coverage: &Coverage,
     atlas: &mut Atlas,
     queue: &wgpu::Queue,
-) -> Result<PathEmit, RenderError> {
+) -> Result<PathEmit, Encode> {
     let mut out = PathEmit::default();
     let upload_cell = |atlas: &mut Atlas,
                        cells: &mut Vec<PathCell>,
@@ -212,12 +213,12 @@ pub fn emit(
                        y: usize,
                        w: usize,
                        h: usize|
-     -> Result<(), RenderError> {
+     -> Result<(), Encode> {
         let (Ok(w32), Ok(h32)) = (u32::try_from(w), u32::try_from(h)) else {
-            return Err(RenderError::Render("glyph atlas full".into()));
+            return Err(Encode::AtlasFull);
         };
         let Some((cx, cy)) = atlas.alloc(w32, h32) else {
-            return Err(RenderError::Render("glyph atlas full".into()));
+            return Err(Encode::AtlasFull);
         };
         let mut rows = Vec::with_capacity(w * h);
         for row in 0..h {

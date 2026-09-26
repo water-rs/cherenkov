@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 use crate::{
-    BlendMode, Color, Draw, FillRule, GlyphRun, Item, Layer, Paint, ResourceHash, Sampling, Scene,
-    Shape, StrokeStyle,
+    BlendMode, Color, Draw, FillRule, GlyphRun, Item, Layer, Motion, Paint, ResourceHash, Sampling,
+    Scene, Shape, StrokeStyle,
 };
-use kurbo::{Affine, Rect};
+use kurbo::{Affine, Rect, Vec2};
 
 /// Author a [`Scene`] in Rust. Obtained from [`Scene::builder`].
 ///
@@ -112,6 +112,19 @@ impl LayerBuilder<'_> {
     /// Set the blend mode.
     pub const fn blend(&mut self, blend: BlendMode) -> &mut Self {
         self.layer.blend = blend;
+        self
+    }
+
+    /// Set the scroll offset: content and children draw translated by
+    /// `-offset` inside the layer's clip.
+    pub const fn scroll_offset(&mut self, offset: Vec2) -> &mut Self {
+        self.layer.scroll_offset = offset;
+        self
+    }
+
+    /// Set the layer's one-time motion.
+    pub const fn motion(&mut self, motion: Motion) -> &mut Self {
+        self.layer.motion = Some(motion);
         self
     }
 

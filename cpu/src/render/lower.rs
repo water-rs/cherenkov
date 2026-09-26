@@ -10,10 +10,12 @@ use std::sync::Arc;
 use cherenkov::kurbo::{Affine, BezPath, PathEl, Point, Rect};
 use cherenkov::{
     BlendMode, BlendSpace, Command, ContinuousRect, DisplayList, FillRule, GlyphRun, GlyphStyle,
-    Paint, ShapeData, WorkingColor,
+    Paint, ShapeData,
 };
 
-use crate::error::{RenderError, Unsupported};
+use cherenkov::{LayerId, RenderError, SurfaceTree};
+
+use crate::names;
 use crate::render::paint::{PaintData, paint_data};
 use crate::render::raster::{Edge, coverage_mask};
 
@@ -101,20 +103,6 @@ pub enum Item {
         /// The clip in force at the pop.
         clip: Option<ClipRef>,
     },
-}
-
-/// A layer node on the render thread's side, handed to the lowering.
-pub struct LayerNode {
-    /// Local transform.
-    pub transform: Affine,
-    /// Opacity; below 1.0 isolates.
-    pub opacity: f32,
-    /// Clip shape.
-    pub clip: Option<ShapeData>,
-    /// The content.
-    pub content: Option<ContentData>,
-    /// Child layers, in order.
-    pub children: Vec<u64>,
 }
 
 /// A layer's content.
@@ -410,17 +398,15 @@ impl<'a> Lowering<'a> {
         }
     }
 
-    /// Lowers a root layer and its clear colour. The clear itself is
-    /// applied by the rasterizer to the framebuffer; the lowering emits
-    /// only the layer's items.
+    /// Lowers a surface's sampled [`SurfaceTree`]. `caches` holds each
+    /// layer's render-side content; the clear colour is applied by the
+    /// rasterizer, so the lowering emits only the layers' items.
     pub fn run(
         &mut self,
-        root: &LayerNode,
-        layers: &HashMap<u64, LayerNode>,
-        clear: WorkingColor,
+        tree: &SurfaceTree,
+        caches: &HashMap<LayerId, ContentData>,
     ) -> Result<(), RenderError> {
-        let _ = clear;
-        self.layer_items(root, layers)
+        self.layer(tree.root(), tree, caches)
     }
 
     /// The coverage a clip contributes at `(px, py)`.
@@ -520,21 +506,37 @@ impl<'a> Lowering<'a> {
     }
 
     /// A layer: push its transform, then clip, then isolate for opacity,
-    /// then content followed by children.
-    fn layer(&mut self, id: u64, layers: &HashMap<u64, LayerNode>) -> Result<(), RenderError> {
-        let Some(node) = layers.get(&id) else {
-            return Ok(());
-        };
+    /// then content followed by children. The clip applies in `transform`
+    /// space; content and children draw in `content_transform` space,
+    /// which is where `scroll_offset` bites.
+    fn layer(
+        &mut self,
+        id: LayerId,
+        tree: &SurfaceTree,
+        caches: &HashMap<LayerId, ContentData>,
+    ) -> Result<(), RenderError> {
+        let node = tree.layer(id);
+        if node.blend != BlendMode::Normal {
+            return Err(RenderError::Unsupported(names::BLEND));
+        }
+        if node.filter.is_some() {
+            return Err(RenderError::Unsupported(names::FILTER));
+        }
+        if node.backdrop.is_some() {
+            return Err(RenderError::Unsupported(names::BACKDROP));
+        }
         let saved = self.transform;
         self.transform = saved * node.transform;
+        let content_space = saved * node.content_transform();
         let result = self.with_clip(node.clip.as_ref(), |s| {
+            s.transform = content_space;
             if node.opacity < 1.0 {
                 let outer = s.clip.clone();
                 s.isolate(node.opacity, s.clip.clone(), outer, |s| {
-                    s.layer_items(node, layers)
+                    s.layer_items(id, node, tree, caches)
                 })
             } else {
-                s.layer_items(node, layers)
+                s.layer_items(id, node, tree, caches)
             }
         });
         self.transform = saved;
@@ -544,10 +546,12 @@ impl<'a> Lowering<'a> {
     /// Content first, then children — the engine's layer ordering.
     fn layer_items(
         &mut self,
-        node: &LayerNode,
-        layers: &HashMap<u64, LayerNode>,
+        id: LayerId,
+        node: &cherenkov::LayerNode,
+        tree: &SurfaceTree,
+        caches: &HashMap<LayerId, ContentData>,
     ) -> Result<(), RenderError> {
-        match &node.content {
+        match caches.get(&id) {
             Some(ContentData::Picture(p)) => {
                 let list = p.display_list();
                 self.commands(list, 0, list.len())?;
@@ -558,7 +562,7 @@ impl<'a> Lowering<'a> {
             None => {}
         }
         for child in &node.children {
-            self.layer(*child, layers)?;
+            self.layer(*child, tree, caches)?;
         }
         Ok(())
     }
@@ -581,7 +585,7 @@ impl<'a> Lowering<'a> {
                 } => self.stroke(shape, stroke, paint)?,
                 Command::Shadow { shape, shadow } => self.shadow(shape, shadow)?,
                 Command::Glyphs { run, paint } => self.glyph_run(run, paint)?,
-                Command::Image { .. } => return Err(Unsupported::Image.into()),
+                Command::Image { .. } => return Err(RenderError::Unsupported(names::IMAGE)),
                 Command::Picture { picture, transform } => {
                     let saved = self.transform;
                     self.transform = saved * *transform;
@@ -606,13 +610,13 @@ impl<'a> Lowering<'a> {
                 }
                 Command::BeginGroup { group, end } => {
                     if group.filter.is_some() {
-                        return Err(Unsupported::Filter.into());
+                        return Err(RenderError::Unsupported(names::FILTER));
                     }
                     if group.blend != BlendMode::Normal {
-                        return Err(Unsupported::Blend.into());
+                        return Err(RenderError::Unsupported(names::BLEND));
                     }
                     if group.blend_space != BlendSpace::Linear {
-                        return Err(Unsupported::BlendSpace.into());
+                        return Err(RenderError::Unsupported(names::BLEND_SPACE));
                     }
                     let inner_end = (*end as usize).min(commands.len());
                     if group.opacity >= 1.0 {
@@ -703,7 +707,7 @@ impl<'a> Lowering<'a> {
     ///
     /// Only shapes whose corners are circular under the transform —
     /// `Rect`, `RoundedRect`, `Circle` — under an axis-aligned
-    /// transform; everything else reports [`Unsupported::Shadow`].
+    /// transform; everything else reports an unsupported `shadow` error.
     /// Radii are handled per corner (the closed form works per corner).
     #[expect(
         clippy::cast_possible_truncation,
@@ -734,10 +738,10 @@ impl<'a> Lowering<'a> {
                 Rect::from_center_size(c.center, (c.radius * 2.0, c.radius * 2.0)),
                 [c.radius; 4],
             ),
-            _ => return Err(Unsupported::Shadow.into()),
+            _ => return Err(RenderError::Unsupported(names::SHADOW)),
         };
         if !axis_aligned(self.transform) {
-            return Err(Unsupported::Shadow.into());
+            return Err(RenderError::Unsupported(names::SHADOW));
         }
         let [a, b, c, d, _, _] = self.transform.as_coeffs();
         let (sx, sy) = (a.hypot(b), c.hypot(d));
@@ -803,7 +807,7 @@ impl<'a> Lowering<'a> {
     )]
     fn glyph_run(&mut self, run: &GlyphRun, paint: &Paint) -> Result<(), RenderError> {
         if matches!(run.style, GlyphStyle::Stroke(_)) {
-            return Err(Unsupported::GlyphStroke.into());
+            return Err(RenderError::Unsupported(names::GLYPH_STROKE));
         }
         let paint = paint_data(paint, self.transform.inverse())?;
         let [a, b, c, d, ..] = self.transform.as_coeffs();
@@ -811,7 +815,7 @@ impl<'a> Lowering<'a> {
         let coords: std::sync::Arc<[i16]> = run.coords.clone().into();
         for glyph in &run.glyphs {
             if glyph.transform.is_some() {
-                return Err(Unsupported::GlyphTransform.into());
+                return Err(RenderError::Unsupported(names::GLYPH_TRANSFORM));
             }
             let o = self.transform * Point::new(f64::from(glyph.x), f64::from(glyph.y));
             let (ix, iy) = (o.x.floor(), o.y.floor());

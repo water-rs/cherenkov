@@ -318,6 +318,48 @@ fn dropping_a_font_frees_its_renderer_state() -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
+/// Timestamp queries resolve on a later render — the submitting frame
+/// never waits for GPU idle: the first render reports no GPU timing yet,
+/// and a later render carries that frame's bracket and per-pass timings.
+#[test]
+fn timestamps_resolve_a_frame_late() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(engine) = engine(GpuConfig {
+        timestamps: true,
+        ..GpuConfig::default()
+    }) else {
+        return Ok(());
+    };
+    let surface = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
+    surface.update(|tx| {
+        tx[surface.root()].content(surface.record(|c| {
+            c.fill(
+                Rect::new(0.0, 0.0, 64.0, 64.0),
+                WorkingColor::new([1.0, 0.0, 0.0, 1.0]),
+            );
+        }));
+    });
+    engine.render(cherenkov_gpu::FrameTime::now())?;
+    assert!(
+        engine.stats().gpu_seconds.is_none(),
+        "a submitting frame returns before its queries resolve"
+    );
+    // An idle render still drains the pending resolve.
+    engine.render(cherenkov_gpu::FrameTime::now())?;
+    assert!(
+        engine.stats().gpu_seconds.is_some(),
+        "the previous frame's timing arrives a render late"
+    );
+    assert!(
+        engine
+            .stats()
+            .passes_timed
+            .iter()
+            .any(|p| p.name == "surface"),
+        "per-pass timing survives the deferred resolve"
+    );
+    Ok(())
+}
+
 /// A zero-size surface is rejected synchronously.
 #[test]
 fn a_zero_size_surface_is_an_error() {

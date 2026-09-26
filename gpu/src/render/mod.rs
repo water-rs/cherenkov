@@ -10,7 +10,9 @@ mod lower;
 mod path;
 mod raster;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 
 use cherenkov::ContentChange;
@@ -214,16 +216,39 @@ struct Renderer {
     timestamps: bool,
     query_set: Option<wgpu::QuerySet>,
     query_buffer: Option<wgpu::Buffer>,
-    query_staging: wgpu::Buffer,
+    /// A spare staging buffer recycled between frames; `None` while a
+    /// frame's resolve owns one.
+    query_staging: Option<wgpu::Buffer>,
     /// The query set's capacity in queries; indices 0/1 bracket the frame,
     /// `2 + 2i` each pass.
     query_capacity: u32,
+    /// Frames whose timestamp resolve was submitted but whose staging
+    /// buffer is not mapped yet — read on a later call, in order.
+    pending_timestamps: VecDeque<PendingTimestamps>,
     /// Passes encoded this frame, for the per-pass report.
     frame_pass_count: u32,
     /// `(name, width, height, format)` of each encoded pass this frame.
     pass_meta: Vec<PassMeta>,
     timestamps_inside: bool,
     max_texture: u32,
+}
+
+/// One submitted frame's timestamp queries awaiting GPU completion.
+///
+/// The resolve and the copy into `staging` are submitted with the frame;
+/// the map and read happen on a later [`Renderer::render_frame`] once a
+/// non-blocking poll reports the copy done, so rendering never stalls on
+/// GPU idle.
+struct PendingTimestamps {
+    staging: wgpu::Buffer,
+    /// Queries resolved: `2 + 2 * passes`.
+    count: u32,
+    /// Pass metadata for the per-pass report.
+    meta: Vec<PassMeta>,
+    /// Whether `map_async` was requested for `staging`.
+    map_requested: bool,
+    /// Set by the map callback once the copy is readable.
+    ready: Arc<AtomicBool>,
 }
 
 /// One encoded pass's report metadata.
@@ -691,12 +716,6 @@ pub fn run(config: GpuConfig, rx: Receiver<Message>, init_tx: Sender<Result<Init
         } else {
             (None, None)
         };
-        let query_staging = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("timestamp staging"),
-            size: 16,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
         // The initial query set holds the two frame-bracketing queries.
         let query_capacity = if query_set.is_some() { 2 } else { 0 };
         let renderer = Renderer {
@@ -723,8 +742,9 @@ pub fn run(config: GpuConfig, rx: Receiver<Message>, init_tx: Sender<Result<Init
             timestamps,
             query_set,
             query_buffer,
-            query_staging,
+            query_staging: None,
             query_capacity,
+            pending_timestamps: VecDeque::new(),
             frame_pass_count: 0,
             pass_meta: Vec::new(),
             timestamps_inside,
@@ -1094,10 +1114,16 @@ impl Renderer {
         }
     }
 
-    /// Lowers and submits every dirty surface, bracketed by drained
-    /// timestamp queries when enabled.
+    /// Lowers and submits every dirty surface, bracketed by timestamp
+    /// queries when enabled.
+    ///
+    /// The frame never waits for GPU idle: timestamp resolves are
+    /// submitted with the frame and mapped on a later call — usually the
+    /// next `render` — so `stats.gpu_seconds`/`passes_timed` describe the
+    /// most recently completed submission, not this one.
     fn render_frame(&mut self) -> Result<(Next, FrameStats), RenderError> {
         let mut stats = FrameStats::default();
+        self.drain_timestamps(&mut stats);
         let mut dirty: Vec<SurfaceId> = self
             .surfaces
             .iter()
@@ -1130,36 +1156,15 @@ impl Renderer {
                 globals_base += u32::try_from(surf.frame.passes.len()).unwrap_or(u32::MAX);
             }
         }
-        self.drain_and_stamp(0)?;
         if result.is_ok() {
+            self.stamp(0);
             for &id in &dirty {
                 self.encode_surface(id, &mut stats);
             }
-        }
-        if self.timestamps {
-            self.drain_and_stamp(1)?;
-            let ticks = self.resolve_timestamps(2 + 2 * self.frame_pass_count)?;
-            let period = f64::from(self.queue.get_timestamp_period());
-            #[expect(clippy::cast_precision_loss)]
-            let delta = |from: usize, to: usize| {
-                ticks
-                    .get(to)
-                    .zip(ticks.get(from))
-                    .filter(|(end, start)| end > start)
-                    .map(|(end, start)| period * (end - start) as f64 * 1e-9)
-            };
-            stats.gpu_seconds = delta(0, 1);
-            for (i, meta) in self.pass_meta.drain(..).enumerate() {
-                stats.passes_timed.push(PassTiming {
-                    name: meta.name,
-                    width: meta.width,
-                    height: meta.height,
-                    format: meta.format,
-                    gpu_seconds: delta(2 + 2 * i, 3 + 2 * i).unwrap_or(0.0),
-                });
+            if self.timestamps {
+                self.stamp_and_resolve(2 + 2 * self.frame_pass_count);
             }
         }
-        self.wait()?;
         result?;
         Ok((Next::Idle, stats))
     }
@@ -1640,21 +1645,12 @@ impl Renderer {
         surf.dirty = false;
     }
 
-    /// Blocks until the queue is drained.
-    fn wait(&self) -> Result<(), RenderError> {
-        self.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(|_| RenderError::DeviceLost)?;
-        Ok(())
-    }
-
-    /// Writes a timestamp query in its own drained submission, mirroring
-    /// `bench/src/wgpu_ctx.rs`.
-    fn drain_and_stamp(&self, index: u32) -> Result<(), RenderError> {
+    /// Writes a timestamp query in its own submission, queue-ordered
+    /// after all prior work — never draining.
+    fn stamp(&self, index: u32) {
         let Some(qs) = &self.query_set else {
-            return Ok(());
+            return;
         };
-        self.wait()?;
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1670,10 +1666,125 @@ impl Renderer {
             pass.write_timestamp(qs, index);
         }
         self.queue.submit([encoder.finish()]);
-        Ok(())
     }
 
-    /// Grows the query set and its resolve buffers to hold `queries`,
+    /// Writes the frame-end timestamp, resolves this frame's queries into
+    /// a staging buffer and queues the read — all inside one submission
+    /// after the frame's encodes, so the GPU resolves them as soon as the
+    /// passes finish. [`Self::drain_timestamps`] maps the buffer on a
+    /// later call without stalling this frame.
+    fn stamp_and_resolve(&mut self, count: u32) {
+        if self.query_set.is_none() || self.query_buffer.is_none() {
+            self.pass_meta.clear();
+            return;
+        }
+        let staging = self.timestamp_staging();
+        let (qs, buf) = (
+            self.query_set.as_ref().expect("checked above"),
+            self.query_buffer.as_ref().expect("checked above"),
+        );
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("timestamp resolve"),
+            });
+        if self.timestamps_inside {
+            encoder.write_timestamp(qs, 1);
+        } else {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("timestamp"),
+                timestamp_writes: None,
+            });
+            pass.write_timestamp(qs, 1);
+        }
+        encoder.resolve_query_set(qs, 0..count, buf, 0);
+        encoder.copy_buffer_to_buffer(buf, 0, &staging, 0, u64::from(count) * 8);
+        self.queue.submit([encoder.finish()]);
+        self.pending_timestamps.push_back(PendingTimestamps {
+            staging,
+            count,
+            meta: std::mem::take(&mut self.pass_meta),
+            map_requested: false,
+            ready: Arc::new(AtomicBool::new(false)),
+        });
+    }
+
+    /// A staging buffer sized to the query capacity, recycling the spare
+    /// when it fits.
+    fn timestamp_staging(&mut self) -> wgpu::Buffer {
+        let size = u64::from(self.query_capacity) * 8;
+        match self.query_staging.take() {
+            Some(buffer) if buffer.size() >= size => buffer,
+            _ => self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("timestamp staging"),
+                size,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            }),
+        }
+    }
+
+    /// Reads back every pending frame's resolved timestamps whose copy
+    /// has landed — submissions complete in order, so the first
+    /// unfinished one ends the drain. Fills `stats` with the most recent
+    /// completed frame's GPU timing.
+    fn drain_timestamps(&mut self, stats: &mut FrameStats) {
+        let period = f64::from(self.queue.get_timestamp_period());
+        while let Some(pending) = self.pending_timestamps.front_mut() {
+            if !pending.map_requested {
+                let flag = Arc::clone(&pending.ready);
+                pending
+                    .staging
+                    .slice(..u64::from(pending.count) * 8)
+                    .map_async(wgpu::MapMode::Read, move |result| {
+                        flag.store(result.is_ok(), Ordering::Relaxed);
+                    });
+                pending.map_requested = true;
+            }
+            if self.device.poll(wgpu::PollType::Poll).is_err()
+                || !pending.ready.load(Ordering::Relaxed)
+            {
+                break;
+            }
+            let Some(pending) = self.pending_timestamps.pop_front() else {
+                break;
+            };
+            {
+                let data = pending
+                    .staging
+                    .slice(..u64::from(pending.count) * 8)
+                    .get_mapped_range();
+                let ticks: &[u64] = bytemuck::cast_slice(&data);
+                #[expect(clippy::cast_precision_loss)]
+                let delta = |from: usize, to: usize| {
+                    ticks
+                        .get(to)
+                        .zip(ticks.get(from))
+                        .filter(|(end, start)| end > start)
+                        .map(|(end, start)| period * (end - start) as f64 * 1e-9)
+                };
+                stats.gpu_seconds = delta(0, 1);
+                stats.passes_timed = pending
+                    .meta
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, meta)| PassTiming {
+                        name: meta.name,
+                        width: meta.width,
+                        height: meta.height,
+                        format: meta.format,
+                        gpu_seconds: delta(2 + 2 * i, 3 + 2 * i).unwrap_or(0.0),
+                    })
+                    .collect();
+            }
+            pending.staging.unmap();
+            if pending.staging.size() >= u64::from(self.query_capacity) * 8 {
+                self.query_staging = Some(pending.staging);
+            }
+        }
+    }
+
+    /// Grows the query set and its resolve buffer to hold `queries`,
     /// between frames — never mid-encoder.
     fn ensure_query_capacity(&mut self, queries: u32) {
         if queries <= self.query_capacity {
@@ -1691,36 +1802,7 @@ impl Renderer {
             usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         }));
-        self.query_staging = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("timestamp staging"),
-            size: u64::from(capacity) * 8,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
         self.query_capacity = capacity;
-    }
-
-    /// Resolves the first `count` timestamp queries into raw ticks.
-    fn resolve_timestamps(&self, count: u32) -> Result<Vec<u64>, RenderError> {
-        let (Some(qs), Some(buf)) = (&self.query_set, &self.query_buffer) else {
-            return Ok(Vec::new());
-        };
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("timestamp resolve"),
-            });
-        encoder.resolve_query_set(qs, 0..count, buf, 0);
-        encoder.copy_buffer_to_buffer(buf, 0, &self.query_staging, 0, u64::from(count) * 8);
-        self.queue.submit([encoder.finish()]);
-        let slice = self.query_staging.slice(..u64::from(count) * 8);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        self.wait()?;
-        let data = slice.get_mapped_range();
-        let ticks: Vec<u64> = bytemuck::cast_slice(&data).to_vec();
-        drop(data);
-        self.query_staging.unmap();
-        Ok(ticks)
     }
 
     /// Copies a surface's target into `Readback` pixels, decoding f16 → f32.

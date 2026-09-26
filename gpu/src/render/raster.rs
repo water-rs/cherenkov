@@ -122,13 +122,27 @@ impl Raster {
 
     /// The accumulated coverage per cell, non-zero winding rule.
     pub fn coverage(&self) -> Vec<f32> {
+        self.coverage_rule(cherenkov::FillRule::NonZero)
+    }
+
+    /// The accumulated coverage per cell under `rule`.
+    ///
+    /// Non-zero clamps the winding magnitude; even-odd folds it into a
+    /// triangle wave of period 2 so odd windings cover and even ones don't.
+    pub fn coverage_rule(&self, rule: cherenkov::FillRule) -> Vec<f32> {
         let mut out = vec![0.0; self.w * self.h];
         for y in 0..self.h {
             let row = y * (self.w + 1);
             let mut acc = 0.0;
             for x in 0..self.w {
                 acc += self.a[row + x];
-                out[y * self.w + x] = acc.abs().min(1.0);
+                out[y * self.w + x] = match rule {
+                    cherenkov::FillRule::NonZero => acc.abs().min(1.0),
+                    cherenkov::FillRule::EvenOdd => {
+                        let a = acc.abs() % 2.0;
+                        1.0 - (a - 1.0).abs()
+                    }
+                };
             }
         }
         out

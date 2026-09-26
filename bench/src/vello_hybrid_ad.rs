@@ -340,7 +340,11 @@ impl Engine for VelloHybrid {
         } else {
             None
         };
-        Ok(Submit { image, gpu_seconds })
+        Ok(Submit {
+            image,
+            gpu_seconds,
+            passes: Vec::new(),
+        })
     }
 
     fn counters(&self) -> Counters {

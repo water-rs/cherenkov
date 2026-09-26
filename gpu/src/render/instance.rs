@@ -15,6 +15,8 @@ pub const KIND_STROKE_DIST: u32 = 2;
 pub const KIND_SHADOW: u32 = 3;
 /// Coverage sampled from the glyph atlas.
 pub const KIND_GLYPH: u32 = 4;
+/// A device-space run of fully covered columns from a path strip.
+pub const KIND_SPAN: u32 = 5;
 
 /// A single colour.
 pub const PAINT_SOLID: u32 = 0;
@@ -41,6 +43,8 @@ pub const INTERP_SRGB: u32 = 1;
 pub const FLAG_HAS_CLIP: u32 = 1;
 /// The stroke has an inner edge.
 pub const FLAG_HAS_INNER: u32 = 2;
+/// The clip carries a coverage mask sampled from the atlas.
+pub const FLAG_HAS_MASK: u32 = 4;
 
 /// A rounded box centred at the origin, mirroring the WGSL `Shape`.
 ///
@@ -79,8 +83,8 @@ impl Shape {
 pub struct Instance {
     /// Local-to-device affine: `[a, b, c, d, e, f, 0, 0]`.
     pub affine: [f32; 8],
-    /// Quad rectangle `(x0, y0, x1, y1)`, local space except `KIND_GLYPH`,
-    /// where it is the device-space atlas cell rectangle.
+    /// Quad rectangle `(x0, y0, x1, y1)`, local space except `KIND_GLYPH`
+    /// and `KIND_SPAN`, where it is the device-space atlas cell rectangle.
     pub bounds: [f32; 4],
     /// The shape being drawn.
     pub shape: Shape,
@@ -88,7 +92,8 @@ pub struct Instance {
     pub inner: Shape,
     /// Device-to-clip-local affine.
     pub clip_inv: [f32; 8],
-    /// The clip shape.
+    /// The clip shape. A masked clip is a sharp rect, so `aspect` and
+    /// `exponent` (unused by its SDF) carry the mask cell size.
     pub clip: Shape,
     /// Straight-alpha working-space colour.
     pub color: [f32; 4],
@@ -96,9 +101,10 @@ pub struct Instance {
     pub grad: [f32; 4],
     /// Radial: start radius, end radius.
     pub grad2: [f32; 4],
-    /// Glyph: atlas cell origin in texels.
+    /// Glyph/cell: atlas cell origin in texels. zw: mask atlas cell origin.
     pub uv: [f32; 4],
-    /// x: stroke half width or shadow sigma. y: opacity.
+    /// x: stroke half width or shadow sigma. y: opacity. zw: mask device
+    /// origin.
     pub params: [f32; 4],
     /// `[kind, paint, first_stop, count | interp<<16 | extend<<20 | flags<<24]`.
     pub meta: [u32; 4],
@@ -136,14 +142,15 @@ pub struct Stop {
     pub pad: [f32; 3],
 }
 
-/// Per-surface constants, mirroring the WGSL `Globals`.
+/// Per-pass constants, mirroring the WGSL `Globals`; one entry per pass
+/// at a 256-byte stride behind a dynamic uniform offset.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct Globals {
-    /// Target size in pixels.
+    /// Target size in pixels (the pass's region).
     pub size: [f32; 2],
-    /// Padding.
-    pub pad: [f32; 2],
+    /// Device-space origin of the target region.
+    pub origin: [f32; 2],
 }
 
 /// Converts a kurbo affine into the shader's `[a, b, c, d, e, f, 0, 0]`.

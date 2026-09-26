@@ -98,6 +98,11 @@ pub struct FrameStats {
     pub glyphs_rasterized: u32,
     /// Paths rasterized this frame.
     pub paths_rasterized: u32,
+    /// Display-list commands lowered this frame (a full lowering or the
+    /// dirty commands of a slot update).
+    pub commands_lowered: u32,
+    /// Layers whose device-space content run was rebuilt rather than reused.
+    pub layers_composed: u32,
 }
 
 /// Decoded pixels of a surface readback: premultiplied linear Display P3,

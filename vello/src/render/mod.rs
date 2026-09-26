@@ -366,7 +366,7 @@ pub fn run(
                 renderer.resize_surface(id, size);
             }
             Message::DestroySurface { id } => {
-                renderer.surfaces.remove(&id);
+                renderer.destroy_surface(id);
             }
             Message::AddFont { id, data, index } => {
                 renderer.fonts.insert(
@@ -519,6 +519,18 @@ impl Renderer {
         state.dirty = true;
     }
 
+    /// Removes a surface and unbinds every vello override its layers
+    /// bound — shader uses, `GpuContent` textures, filter outputs —
+    /// instead of leaving them in vello's override map until engine drop.
+    fn destroy_surface(&mut self, id: SurfaceId) {
+        if let Some(mut state) = self.surfaces.remove(&id) {
+            let ids: Vec<LayerId> = state.layers.keys().copied().collect();
+            for layer in ids {
+                Self::remove_node(&mut self.vello, &self.filters, &mut state.layers, layer);
+            }
+        }
+    }
+
     /// Releases a node's current content: the replaced `GpuContent`'s
     /// texture binding and the cached fragment's shader uses must be
     /// unbound, not leaked in vello's override map.
@@ -547,7 +559,7 @@ impl Renderer {
                     state.layers.entry(id).or_insert_with(node);
                 }
                 LayerOp::Remove(id) => {
-                    Self::remove_node(&mut self.vello, &mut state.layers, id);
+                    Self::remove_node(&mut self.vello, &self.filters, &mut state.layers, id);
                 }
                 LayerOp::Transform(id, t) => {
                     if let Some(node) = state.layers.get_mut(&id) {
@@ -683,10 +695,14 @@ impl Renderer {
         }
     }
 
-    /// Removes a node and its descendants, unbinding any vello image
-    /// overrides their textures registered.
+    /// Removes a node and its descendants, unbinding every vello image
+    /// override their textures registered — `GpuContent` and shader uses,
+    /// and the output image of a filter the node referenced (a shared
+    /// filter's output re-binds lazily on a surviving surface's next
+    /// compose).
     fn remove_node(
         vello: &mut vello::Renderer,
+        filters: &filter::FilterRegistry,
         layers: &mut HashMap<LayerId, LayerNode>,
         id: LayerId,
     ) {
@@ -698,8 +714,13 @@ impl Renderer {
             for use_ in node.shader_uses.drain(..) {
                 vello.override_image(&use_.image, None);
             }
+            if let Some(filter_id) = node.filter
+                && let Some(image) = filters.output_image(filter_id.raw())
+            {
+                vello.override_image(&image, None);
+            }
             for child in node.children {
-                Self::remove_node(vello, layers, child);
+                Self::remove_node(vello, filters, layers, child);
             }
         }
     }
@@ -1702,6 +1723,21 @@ mod tests {
         assert!(
             matches!(result, Err(RenderError::Image(_))),
             "re-lower must report the missing image: {result:?}"
+        );
+    }
+
+    /// Destroying a surface must walk its layer nodes and unbind every
+    /// vello override they registered — the same release `LayerOp::Remove`
+    /// performs — not hold the textures until engine drop.
+    #[test]
+    fn destroying_a_surface_unbinds_its_overrides() {
+        let Some(mut renderer) = renderer() else { return };
+        let image = bound_gpu_image(&mut renderer);
+        assert!(override_bound(&mut renderer, &image), "setup: bound");
+        renderer.destroy_surface(1);
+        assert!(
+            !override_bound(&mut renderer, &image),
+            "destroyed surface's overrides must be unbound"
         );
     }
 

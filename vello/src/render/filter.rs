@@ -214,6 +214,14 @@ impl FilterRegistry {
             .and_then(|e| e.output.as_ref().map(|(t, ..)| t.clone()))
     }
 
+    /// The image identity of `id`'s output texture, when produced — for
+    /// unbinding the override when a referencing layer is torn down.
+    pub fn output_image(&self, id: u64) -> Option<peniko::ImageData> {
+        self.entries
+            .get(&id)
+            .and_then(|e| e.output.as_ref().map(|(.., i)| i.clone()))
+    }
+
     /// Runs `id`'s effect over its capture texture, producing the output
     /// texture's view and its vello image identity, plus whether the
     /// effect asked for another frame. When the capture resizes, the old

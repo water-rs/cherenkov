@@ -63,6 +63,7 @@ use serde::Serialize;
 
 use crate::convert::Blobs;
 
+#[cfg(unix)]
 pub use cli::cherenkov_bench_run;
 
 /// Errors an adapter or the CLI can produce.

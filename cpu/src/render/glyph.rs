@@ -28,8 +28,8 @@ pub struct GlyphKey {
     glyph: u32,
     /// `(size * 64).round()` — 1/64th-pixel size granularity.
     size_bits: u32,
-    /// Quantized subpixel position: `(fx * 4) | ((fy * 4) << 4)`.
-    subpixel: u8,
+    /// Exact subpixel position: f32 bits of the fractional offset.
+    subpixel: [u32; 2],
     /// f32 bits of the device transform's 2x2.
     matrix: [u32; 4],
     /// Hash of the run's variation coordinates.
@@ -109,8 +109,7 @@ impl GlyphCache {
     }
 }
 
-/// The cache key for a glyph at a quantized device position — the same
-/// key the GPU slice computes.
+/// The cache key for a glyph at an exact subpixel position.
 #[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -124,7 +123,7 @@ pub fn glyph_key(run: &GlyphRun, glyph: u32, subpixel: (f32, f32), transform: Af
         font: run.font.raw(),
         glyph,
         size_bits: (run.size * 64.0).round() as u32,
-        subpixel: ((subpixel.0 * 4.0) as u8) | (((subpixel.1 * 4.0) as u8) << 4),
+        subpixel: [subpixel.0.to_bits(), subpixel.1.to_bits()],
         matrix: [
             (a as f32).to_bits(),
             (b as f32).to_bits(),
@@ -183,14 +182,18 @@ const fn empty() -> GlyphMask {
 /// Rasterizes one glyph's coverage mask, like the GPU's
 /// `glyph::rasterize`: the outline is drawn at `Size::unscaled` in font
 /// units, y flipped, scaled by `size / upem`, transformed by the run's
-/// 2x2, offset by the quantized subpixel, and flattened to 0.05 device
-/// px before exact-area accumulation over the glyph's own bbox.
+/// 2x2, offset by the glyph's subpixel offset, and flattened to 0.05
+/// device px before exact-area accumulation over the glyph's own bbox.
 #[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     clippy::cast_precision_loss,
     clippy::many_single_char_names,
     reason = "glyph mask coordinates are small; a/b/c/d/m are affine names"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "outline walk plus mask accumulation is one pass"
 )]
 pub fn rasterize_mask(
     font: &crate::render::FontData,
@@ -278,12 +281,20 @@ pub fn rasterize_mask(
     // Rasterize in mask space.
     let mut acc = Accum::new(w, h);
     let (ox, oy) = (left as f32, top as f32);
-    for e in &edges {
-        acc.draw_line(e.x0 - ox, e.y0 - oy, e.x1 - ox, e.y1 - oy);
-    }
+    crate::render::raster::deposit_exact(
+        &mut acc,
+        edges.iter().map(|e| Edge {
+            x0: e.x0 - ox,
+            y0: e.y0 - oy,
+            x1: e.x1 - ox,
+            y1: e.y1 - oy,
+        }),
+        cherenkov::FillRule::NonZero,
+        h,
+    );
     let mut cov = vec![0.0; w * h];
     for y in 0..h {
-        acc.coverage_row(y, cherenkov::FillRule::NonZero, 0, w, |x, c| {
+        acc.coverage_row(y, 0, w, |x, c| {
             cov[y * w + x] = c;
         });
     }

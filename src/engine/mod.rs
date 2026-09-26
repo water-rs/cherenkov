@@ -331,7 +331,7 @@ impl<B: Filters> Engine<B> {
     {
         let id = FilterId::new(Self::alloc(&self.next_filter));
         (self.release)(Box::new(move |r: &mut B::Renderer| {
-            B::add_filter(r, id, filter)
+            B::add_filter(r, id, filter);
         }));
         Filter::new(id, self.on_drop(move |r| B::remove_filter(r, id)))
     }
@@ -345,7 +345,7 @@ impl<B: Filters> Engine<B> {
         let id = FilterId::new(Self::alloc(&self.next_filter));
         let effect = effect.into();
         (self.release)(Box::new(move |r: &mut B::Renderer| {
-            B::add_effect(r, id, effect)
+            B::add_effect(r, id, effect);
         }));
         Filter::new(id, self.on_drop(move |r| B::remove_filter(r, id)))
     }

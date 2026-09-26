@@ -387,11 +387,11 @@ impl SurfaceTree {
                         };
                     }
                 }
+                // A decay keeps where it stopped; a settled spring (including
+                // the rubber-band handoff) reports its target exactly.
+                node.scroll_offset = snap(Vec2::from_lanes(pos), display.scale);
                 if done {
-                    node.scroll_offset = snap(track.target, display.scale);
                     node.scroll_track = None;
-                } else {
-                    node.scroll_offset = snap(Vec2::from_lanes(pos), display.scale);
                 }
             }
             // Rate classification of the tracks that remain.
@@ -435,6 +435,24 @@ fn set_prop<T: Animatable>(track: &mut Option<Track<T>>, value: &mut T, prop: &P
         None => {
             *value = prop.target;
             *track = None;
+        }
+        Some(animation @ Animation::Decay(decay)) => {
+            // A decay is a fling: it starts AT the committed value with its
+            // own velocity; the previous track is irrelevant.
+            let mut velocity = T::Lanes::zero();
+            for (i, v) in [decay.velocity.x, decay.velocity.y]
+                .into_iter()
+                .take(T::Lanes::N)
+                .enumerate()
+            {
+                velocity.set(i, v);
+            }
+            *track = Some(Track::new(
+                prop.target.into_lanes(),
+                velocity,
+                prop.target,
+                animation,
+            ));
         }
         Some(animation) => {
             let (from, velocity, last) = track.as_ref().map_or_else(

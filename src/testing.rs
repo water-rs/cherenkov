@@ -394,9 +394,44 @@ mod tests {
         }
         let record = frames(&rx).pop().expect("records");
         let offset = layer(&record, layer_handle.id()).scroll_offset;
+        // The rubber band settles on the bound edge, which `contains`
+        // excludes, so compare inclusively.
         assert!(
-            bounds.contains(offset.to_point()),
+            (bounds.min_x()..=bounds.max_x()).contains(&offset.x)
+                && (bounds.min_y()..=bounds.max_y()).contains(&offset.y),
             "offset {offset:?} outside {bounds:?}"
+        );
+    }
+
+    #[test]
+    fn decay_starts_at_committed_value_and_stays_where_it_stops() {
+        let (engine, rx) = engine();
+        let surface = engine
+            .surface(Offscreen::new((16, 16), OffscreenFormat::LinearF16))
+            .expect("surface");
+        let layer_handle = surface.layer();
+        surface.update(|tx| {
+            tx[surface.root()].push(&layer_handle);
+            tx[&layer_handle]
+                .scroll_offset(Vec2::ZERO)
+                .animation(Decay::new(Vec2::new(600.0, 0.0)));
+        });
+        let t0 = Instant::now();
+        let mut t = t0;
+        // Unbounded decay: position = v/k = 600/4 = 150, then Idle.
+        loop {
+            t += Duration::from_millis(8);
+            let next = engine.render(FrameTime::at(t)).expect("render");
+            if matches!(next, Next::Idle) {
+                break;
+            }
+            assert!(t - t0 < Duration::from_secs(10), "never settled");
+        }
+        let record = frames(&rx).pop().expect("records");
+        let offset = layer(&record, layer_handle.id()).scroll_offset;
+        assert!(
+            (offset.x - 150.0).abs() < 0.5 && offset.y.abs() < 0.5,
+            "offset {offset:?}, expected ≈(150, 0)"
         );
     }
 

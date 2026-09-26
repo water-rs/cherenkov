@@ -20,6 +20,13 @@ struct BenchRunner {
             logger.error("cannot create \(outDir.path, privacy: .public): \(error)")
             return 1
         }
+        // An iOS app launches with cwd `/`; the bench's relative
+        // `Documents/...` paths only resolve from the app's home.
+        guard FileManager.default.changeCurrentDirectoryPath(NSHomeDirectory()) else {
+            logger.error("cannot chdir to \(NSHomeDirectory(), privacy: .public)")
+            _ = Self.writeDone(["error": "cannot chdir to app home"], to: outDir)
+            return 1
+        }
         guard let argLists = Self.loadArgLists(from: documents.appendingPathComponent("bench-args.json"))
         else {
             _ = Self.writeDone(["error": "bench-args.json missing or invalid"], to: outDir)
@@ -29,7 +36,8 @@ struct BenchRunner {
         var firstFailure: Int32 = 0
         for (index, args) in argLists.enumerated() {
             logger.info("run \(index): \(args.joined(separator: " "), privacy: .public)")
-            let code = Self.invoke(args)
+            let stderrURL = outDir.appendingPathComponent("run-\(index).stderr")
+            let code = Self.invoke(args, stderrTo: stderrURL)
             logger.info("run \(index): exit \(code)")
             results.append(["args": args, "exit_code": code])
             if firstFailure == 0 { firstFailure = code }
@@ -39,11 +47,23 @@ struct BenchRunner {
     }
 
     /// Calls `cherenkov_bench_run` with `cherenkov-bench` as `argv[0]`
-    /// followed by `args`.
-    static func invoke(_ args: [String]) -> Int32 {
+    /// followed by `args`, with fd 2 redirected to `stderrURL` for the
+    /// duration of the call and restored afterwards.
+    static func invoke(_ args: [String], stderrTo stderrURL: URL) -> Int32 {
         var cArgs = (["cherenkov-bench"] + args).map { strdup($0) }
         defer { cArgs.forEach { free($0) } }
-        return cArgs.withUnsafeMutableBufferPointer { buffer in
+
+        let saved = dup(STDERR_FILENO)
+        let log = open(stderrURL.path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+        let redirected = saved >= 0 && log >= 0
+        if redirected {
+            dup2(log, STDERR_FILENO)
+        } else {
+            logger.error("stderr redirect to \(stderrURL.path, privacy: .public) failed (saved=\(saved), log=\(log))")
+        }
+        if log >= 0 { close(log) }
+
+        let code = cArgs.withUnsafeMutableBufferPointer { buffer in
             buffer.baseAddress!.withMemoryRebound(
                 to: UnsafePointer<CChar>?.self,
                 capacity: buffer.count
@@ -51,6 +71,11 @@ struct BenchRunner {
                 cherenkov_bench_run(Int32(buffer.count), argv)
             }
         }
+
+        fflush(nil)
+        if redirected { dup2(saved, STDERR_FILENO) }
+        if saved >= 0 { close(saved) }
+        return code
     }
 
     static func loadArgLists(from url: URL) -> [[String]]? {

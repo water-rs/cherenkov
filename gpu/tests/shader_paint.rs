@@ -66,3 +66,37 @@ fn shader_paint_uses_shape_coverage_and_presentation_time() -> Result<(), Box<dy
     );
     Ok(())
 }
+
+#[test]
+fn producer_color_helpers_match_working_space_and_alpha() -> Result<(), Box<dyn std::error::Error>>
+{
+    let engine = Engine::<Gpu>::new(GpuConfig::default())?;
+    let shader = engine.shader(ShaderSource::wgsl(include_str!("shaders/srgb.wgsl")))?;
+    let surface = engine.surface(Offscreen::new((8, 4), OffscreenFormat::LinearF16))?;
+    surface.update(|tx| {
+        tx[surface.root()].content(surface.record(|r| {
+            r.fill(
+                Rect::new(0.0, 0.0, 8.0, 4.0),
+                ShaderPaint {
+                    shader: shader.id(),
+                    uniforms: vec![],
+                },
+            );
+        }));
+    });
+    engine.render(FrameTime::now())?;
+    let expected = cherenkov::WorkingColor::from(cherenkov::Color::<cherenkov::Srgb>::new([
+        1.0, 0.5, 0.25, 0.5,
+    ]));
+    let pixels = surface.readback()?.pixels;
+    for index in [9, 14] {
+        let [r, g, b, a] = expected.components;
+        for (actual, expected) in pixels[index].into_iter().zip([r * a, g * a, b * a, a]) {
+            assert!(
+                (actual - expected).abs() < 0.001,
+                "color conversion: {actual} != {expected}"
+            );
+        }
+    }
+    Ok(())
+}

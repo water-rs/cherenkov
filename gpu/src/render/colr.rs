@@ -133,6 +133,84 @@ const fn extend(e: skrifa::color::Extend) -> Extend {
     }
 }
 
+/// Hashes a paint by value — every field's bits, never a
+/// `format!("{paint:?}")` allocation on the per-glyph-per-frame path.
+fn hash_paint(hasher: &mut impl Hasher, paint: &Paint) {
+    fn bits(h: &mut impl Hasher, v: f64) {
+        h.write_u64(v.to_bits());
+    }
+    fn point(h: &mut impl Hasher, p: Point) {
+        bits(h, p.x);
+        bits(h, p.y);
+    }
+    fn color(h: &mut impl Hasher, c: WorkingColor) {
+        for v in c.components {
+            bits(h, f64::from(v));
+        }
+    }
+    fn stops(h: &mut impl Hasher, stops: &[cherenkov::ColorStop]) {
+        h.write_usize(stops.len());
+        for s in stops {
+            bits(h, f64::from(s.offset));
+            color(h, s.color);
+        }
+    }
+    std::mem::discriminant(paint).hash(hasher);
+    match paint {
+        Paint::Solid(c) => color(hasher, *c),
+        Paint::Linear(g) => {
+            point(hasher, g.start);
+            point(hasher, g.end);
+            stops(hasher, &g.stops);
+            g.extend.hash(hasher);
+            g.interpolation.hash(hasher);
+        }
+        Paint::Radial(g) => {
+            point(hasher, g.start_center);
+            bits(hasher, g.start_radius);
+            point(hasher, g.end_center);
+            bits(hasher, g.end_radius);
+            stops(hasher, &g.stops);
+            g.extend.hash(hasher);
+            g.interpolation.hash(hasher);
+        }
+        Paint::Sweep(g) => {
+            point(hasher, g.center);
+            bits(hasher, g.start_angle);
+            bits(hasher, g.end_angle);
+            stops(hasher, &g.stops);
+            g.extend.hash(hasher);
+            g.interpolation.hash(hasher);
+        }
+        Paint::Mesh(g) => {
+            g.columns().hash(hasher);
+            g.rows().hash(hasher);
+            for p in g.points() {
+                point(hasher, *p);
+            }
+            for c in g.colors() {
+                color(hasher, *c);
+            }
+        }
+        Paint::Image(p) => {
+            p.image.hash(hasher);
+            for c in p.transform.as_coeffs() {
+                bits(hasher, c);
+            }
+            p.extend_x.hash(hasher);
+            p.extend_y.hash(hasher);
+            p.sampling.hash(hasher);
+        }
+        Paint::Shader(s) => {
+            s.shader.hash(hasher);
+            hasher.write_usize(s.uniforms.len());
+            for v in &s.uniforms {
+                bits(hasher, f64::from(*v));
+            }
+        }
+    }
+}
+
 /// The `COLRv1` painter: keeps a transform stack (font space), a container
 /// stack for clips and composite layers, and emits [`Node`]s.
 struct ColrPainter<'a> {
@@ -464,7 +542,7 @@ pub fn glyph_picture(
     coords.hash(&mut hasher);
     let coords_hash = hasher.finish();
     let mut hasher = DefaultHasher::new();
-    format!("{foreground:?}").hash(&mut hasher);
+    hash_paint(&mut hasher, foreground);
     let paint_hash = hasher.finish();
     let key = (glyph_id, coords_hash, paint_hash);
     if let Some(p) = font.colr.borrow().get(&key) {
@@ -514,4 +592,79 @@ pub fn glyph_picture(
     });
     font.colr.borrow_mut().insert(key, picture.clone());
     Ok(picture)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cherenkov::{LinearGradient, Sampling};
+
+    fn h(paint: &Paint) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        hash_paint(&mut hasher, paint);
+        hasher.finish()
+    }
+
+    /// The paint hash covers every field that distinguishes paints — the
+    /// cache key it feeds must not merge two different foregrounds.
+    #[test]
+    fn the_paint_hash_covers_every_field() {
+        let red = Paint::Solid(WorkingColor::new([1.0, 0.0, 0.0, 1.0]));
+        let red_again = Paint::Solid(WorkingColor::new([1.0, 0.0, 0.0, 1.0]));
+        let blue = Paint::Solid(WorkingColor::new([0.0, 0.0, 1.0, 1.0]));
+        assert_eq!(h(&red), h(&red_again), "equal paints hash equal");
+        assert_ne!(h(&red), h(&blue));
+
+        let base = LinearGradient::new((0.0, 0.0), (10.0, 0.0))
+            .stop(0.0, WorkingColor::new([1.0, 0.0, 0.0, 1.0]))
+            .stop(1.0, WorkingColor::new([0.0, 0.0, 1.0, 1.0]));
+        assert_ne!(h(&red), h(&Paint::from(base.clone())), "variants differ");
+        assert_ne!(
+            h(&Paint::from(base.clone())),
+            h(&Paint::from(
+                LinearGradient::new((0.0, 0.0), (20.0, 0.0))
+                    .stop(0.0, WorkingColor::new([1.0, 0.0, 0.0, 1.0]))
+                    .stop(1.0, WorkingColor::new([0.0, 0.0, 1.0, 1.0]))
+            )),
+            "gradient endpoints"
+        );
+        assert_ne!(
+            h(&Paint::from(base.clone())),
+            h(&Paint::from(
+                base.clone()
+                    .stop(0.5, WorkingColor::new([0.0, 1.0, 0.0, 1.0]))
+            )),
+            "stop list"
+        );
+        assert_ne!(
+            h(&Paint::from(base.clone().extend(Extend::Repeat))),
+            h(&Paint::from(base.clone())),
+            "extend"
+        );
+        assert_ne!(
+            h(&Paint::from(
+                base.clone().interpolation(Interpolation::SrgbEncoded)
+            )),
+            h(&Paint::from(base)),
+            "interpolation"
+        );
+
+        let image = |id, sampling| {
+            Paint::Image(cherenkov::ImagePattern {
+                image: cherenkov::ImageId::new(id),
+                transform: Affine::IDENTITY,
+                extend_x: Extend::Pad,
+                extend_y: Extend::Pad,
+                sampling,
+            })
+        };
+        assert_ne!(
+            h(&image(1, Sampling::Linear)),
+            h(&image(2, Sampling::Linear))
+        );
+        assert_ne!(
+            h(&image(1, Sampling::Linear)),
+            h(&image(1, Sampling::Nearest))
+        );
+    }
 }

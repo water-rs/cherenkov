@@ -14,10 +14,15 @@ struct BenchRunner {
     func runAll() -> Int32 {
         let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         let outDir = documents.appendingPathComponent("out", isDirectory: true)
+        // `out` holds this launch's results only: a `done.json` left by an
+        // earlier launch would read as this one having finished.
         do {
+            if FileManager.default.fileExists(atPath: outDir.path) {
+                try FileManager.default.removeItem(at: outDir)
+            }
             try FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
         } catch {
-            logger.error("cannot create \(outDir.path, privacy: .public): \(error)")
+            logger.error("cannot reset \(outDir.path, privacy: .public): \(error)")
             return 1
         }
         // An iOS app launches with cwd `/`; the bench's relative

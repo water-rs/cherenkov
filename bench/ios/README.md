@@ -133,7 +133,9 @@ Launch and keep it in the foreground — iOS forbids GPU work in the
 background. The app disables the idle timer and drops screen brightness
 to 0 for the whole run, then restores both. It first `chdir`s to the
 app's home directory (an app launches with cwd `/`), so relative
-`Documents/...` paths in the argument lists resolve as written. Each
+`Documents/...` paths in the argument lists resolve as written. A
+launch first empties `Documents/out`, so everything in it after the
+launch belongs to that launch. Each
 argument list runs through `cherenkov_bench_run` on a background thread
 with fds 1 and 2 redirected to `Documents/out/run-<n>.log` (the
 suite's tracing goes to stderr); when the last one returns the app

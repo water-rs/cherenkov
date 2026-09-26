@@ -1,0 +1,2 @@
+{% include "color.wgsl" %}
+{{ source }}

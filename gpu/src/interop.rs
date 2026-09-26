@@ -202,3 +202,27 @@ impl TextureTarget {
         (Self { size, textures }, receiver)
     }
 }
+
+/// Compiles a producer's WGSL with the engine's color conversion helpers.
+/// `cherenkov_srgb` converts straight-alpha sRGB and
+/// `cherenkov_premultiplied_srgb` converts encoded premultiplied sRGB into
+/// premultiplied linear Display P3, the GPU content attachment convention.
+///
+/// # Panics
+/// When shader creation fails or the compiled template cannot be rendered.
+#[must_use]
+pub fn shader_module(device: &wgpu::Device, label: &str, source: &str) -> wgpu::ShaderModule {
+    use askama::Template as _;
+    #[derive(askama::Template)]
+    #[template(path = "content.wgsl", escape = "none")]
+    struct Source<'a> {
+        source: &'a str,
+    }
+    let source = Source { source }
+        .render()
+        .expect("GPU shader template rendering failed");
+    device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some(label),
+        source: wgpu::ShaderSource::Wgsl(source.into()),
+    })
+}

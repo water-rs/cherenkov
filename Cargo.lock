@@ -311,9 +311,9 @@ dependencies = [
  "ash",
  "bytemuck",
  "cherenkov",
- "cherenkov-gpu",
  "cherenkov-oracle",
  "cherenkov-scene",
+ "cherenkov-vello",
  "clap",
  "glifo",
  "kurbo",
@@ -337,20 +337,6 @@ dependencies = [
  "vello_common",
  "vello_cpu",
  "vello_hybrid",
- "wgpu",
-]
-
-[[package]]
-name = "cherenkov-gpu"
-version = "0.0.0"
-dependencies = [
- "bytemuck",
- "cherenkov",
- "half",
- "kurbo",
- "pollster 0.4.0",
- "skrifa 0.44.0",
- "thiserror",
  "wgpu",
 ]
 

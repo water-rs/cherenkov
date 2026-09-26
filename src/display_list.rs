@@ -310,6 +310,14 @@ impl DisplayList {
         }
     }
 
+    /// Releases spare capacity when less than half of it was used, so a
+    /// small list recorded after a large one does not keep its reservation.
+    pub(crate) fn trim_spare(&mut self) {
+        if self.commands.capacity() > 2 * self.commands.len() {
+            self.commands.shrink_to_fit();
+        }
+    }
+
     /// The commands.
     #[must_use]
     pub fn commands(&self) -> &[Command] {

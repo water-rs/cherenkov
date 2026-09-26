@@ -82,16 +82,20 @@ pub struct Phases {
 pub struct FrameStats {
     /// CPU time spent in each render phase.
     pub phases: Phases,
-    /// GPU seconds the frame took, when timestamp queries are enabled and
-    /// supported.
+    /// GPU seconds of the most recently completed timed submission.
+    /// Backends with deferred queries may report an earlier frame.
     pub gpu_seconds: Option<f64>,
-    /// Per-pass GPU seconds, in submission order; empty when timestamp
-    /// queries are disabled or unsupported.
+    /// Per-pass GPU seconds of that same submission; empty when queries
+    /// are disabled or unsupported.
     pub passes_timed: Vec<PassTiming>,
     /// Render passes recorded (`render_to_texture` and effect passes).
     pub passes: u32,
     /// Scene commands encoded this frame.
     pub draws: u32,
+    /// Pipeline state changes issued while encoding draw ranges.
+    pub pipeline_switches: u32,
+    /// Texture bind groups created this frame; cached groups are reused.
+    pub bind_groups_created: u32,
     /// Layer content instances drawn.
     pub instances: u32,
     /// Glyphs rasterized this frame.

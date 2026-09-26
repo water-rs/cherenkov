@@ -27,7 +27,7 @@ use skrifa::MetadataProvider as _;
 use skrifa::raw::TableProvider as _;
 
 /// Linear Display P3 to linear sRGB (the inverse of the shader's
-/// `SRGB_TO_P3`), used to store `SrgbRenderErrord` gradient stops.
+/// `SRGB_TO_P3`), used to store `SrgbEncoded` gradient stops.
 const P3_TO_SRGB: [[f32; 3]; 3] = [
     [1.224_940_1, -0.224_940_4, 0.0],
     [-0.042_056_9, 1.042_057_1, 0.0],
@@ -234,7 +234,7 @@ fn push_stops(
     let count = u32::try_from(sorted.len().min(0xffff)).unwrap_or(0xffff);
     for stop in sorted.iter().take(count as usize) {
         let [r, g, b, a] = stop.color.components;
-        let color = if interpolation == Interpolation::SrgbRenderErrord {
+        let color = if interpolation == Interpolation::SrgbEncoded {
             let [sr, sg, sb] = [
                 P3_TO_SRGB[0][0].mul_add(r, P3_TO_SRGB[0][1].mul_add(g, P3_TO_SRGB[0][2] * b)),
                 P3_TO_SRGB[1][0].mul_add(r, P3_TO_SRGB[1][1].mul_add(g, P3_TO_SRGB[1][2] * b)),
@@ -252,7 +252,7 @@ fn push_stops(
     }
     let interp = match interpolation {
         Interpolation::Working => INTERP_WORKING,
-        Interpolation::SrgbRenderErrord => INTERP_SRGB,
+        Interpolation::SrgbEncoded => INTERP_SRGB,
     };
     (first, count | (interp << 16) | (extend_code(extend) << 20))
 }

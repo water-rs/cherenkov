@@ -10,8 +10,8 @@ use cherenkov::{
     RadialGradient, Shadow, SweepGradient, WorkingColor, kurbo::Stroke,
 };
 use cherenkov_cpu::{
-    Engine, FrameTime, Offscreen, OffscreenFormat, Raster, RasterConfig, ResourceError,
-    Unsupported,
+    Engine, FrameTime, Offscreen, OffscreenFormat, Raster, RasterConfig, RenderError,
+    ResourceError, SurfaceError, Unsupported,
 };
 
 fn engine() -> Engine<Raster> {
@@ -27,10 +27,12 @@ fn a_half_edge_rect_has_exact_coverage() {
     let surface = engine
         .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF32))
         .expect("surface");
-    surface.update(|tx| {
-        tx[surface.root()]
-            .content(surface.record(|c| c.fill(Rect::new(8.5, 8.5, 40.5, 40.5), RED)));
-    });
+    surface
+        .update(|tx| {
+            tx[surface.root()]
+                .content(surface.record(|c| c.fill(Rect::new(8.5, 8.5, 40.5, 40.5), RED)));
+        })
+        .expect("update");
     engine.render(FrameTime::now()).expect("render");
     let rb = surface.readback().expect("readback");
     let at = |x: usize, y: usize| rb.pixels[y * 64 + x];
@@ -57,10 +59,12 @@ fn linear_f16_is_the_f16_rounding_of_f32() {
         let surface = engine
             .surface(Offscreen::new((64, 64), format))
             .expect("surface");
-        surface.update(|tx| {
-            tx[surface.root()]
-                .content(surface.record(|c| c.fill(Rect::new(8.5, 8.5, 40.5, 40.5), RED)));
-        });
+        surface
+            .update(|tx| {
+                tx[surface.root()]
+                    .content(surface.record(|c| c.fill(Rect::new(8.5, 8.5, 40.5, 40.5), RED)));
+            })
+            .expect("update");
         engine.render(FrameTime::now()).expect("render");
         let rb = surface.readback().expect("readback");
         let px = rb.pixels[20 * 64 + 8];
@@ -97,9 +101,11 @@ fn even_odd_leaves_the_centre_of_concentric_squares_empty() {
                 c.fill(path.clone(), RED);
             }
         });
-        surface.update(|tx| {
-            tx[surface.root()].content(content);
-        });
+        surface
+            .update(|tx| {
+                tx[surface.root()].content(content);
+            })
+            .expect("update");
         engine.render(FrameTime::now()).expect("render");
         surface.readback().expect("readback").pixels[32 * 64 + 32]
     };
@@ -113,14 +119,16 @@ fn a_rotated_rects_coverage_sums_to_its_area() {
     let surface = engine
         .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF32))
         .expect("surface");
-    surface.update(|tx| {
-        tx[surface.root()].content(surface.record(|c| {
-            c.transform(
-                Affine::translate((32.0, 32.0)) * Affine::rotate(std::f64::consts::FRAC_PI_4),
-                |c| c.fill(Rect::new(-10.0, -10.0, 10.0, 10.0), RED),
-            );
-        }));
-    });
+    surface
+        .update(|tx| {
+            tx[surface.root()].content(surface.record(|c| {
+                c.transform(
+                    Affine::translate((32.0, 32.0)) * Affine::rotate(std::f64::consts::FRAC_PI_4),
+                    |c| c.fill(Rect::new(-10.0, -10.0, 10.0, 10.0), RED),
+                );
+            }));
+        })
+        .expect("update");
     engine.render(FrameTime::now()).expect("render");
     let rb = surface.readback().expect("readback");
     let area: f64 = rb.pixels.iter().map(|px| f64::from(px[3])).sum();
@@ -137,13 +145,15 @@ fn a_half_opacity_group_halves_the_alpha() {
     let surface = engine
         .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF32))
         .expect("surface");
-    surface.update(|tx| {
-        tx[surface.root()].content(surface.record(|c| {
-            c.group(Group::new().opacity(0.5), |c| {
-                c.fill(Rect::new(8.0, 8.0, 40.0, 40.0), RED);
-            });
-        }));
-    });
+    surface
+        .update(|tx| {
+            tx[surface.root()].content(surface.record(|c| {
+                c.group(Group::new().opacity(0.5), |c| {
+                    c.fill(Rect::new(8.0, 8.0, 40.0, 40.0), RED);
+                });
+            }));
+        })
+        .expect("update");
     engine.render(FrameTime::now()).expect("render");
     let rb = surface.readback().expect("readback");
     let px = rb.pixels[20 * 64 + 20];
@@ -161,9 +171,11 @@ fn render_f32(
     let surface = engine
         .surface(Offscreen::new((width, height), OffscreenFormat::LinearF32))
         .expect("surface");
-    surface.update(|tx| {
-        tx[surface.root()].content(surface.record(body));
-    });
+    surface
+        .update(|tx| {
+            tx[surface.root()].content(surface.record(body));
+        })
+        .expect("update");
     engine.render(FrameTime::now()).expect("render");
     surface.readback().expect("readback").pixels
 }
@@ -343,11 +355,15 @@ fn a_glyph_run_renders_and_the_second_frame_hits_the_cache() {
     let px = render_f32(&engine, 64, 64, |c| c.glyphs(&run, RED));
     let area: f64 = px.iter().map(|p| f64::from(p[3])).sum();
     assert!(area > 10.0, "glyph coverage {area}");
-    let cached = engine.memory().glyph_cache;
+    let cached = engine.memory().expect("memory").glyph_cache;
     assert!(cached.0 > 0, "glyph cache populated");
     // Re-record the same run and render again: the cache must hit.
     render_f32(&engine, 64, 64, |c| c.glyphs(&run, RED));
-    assert_eq!(engine.memory().glyph_cache.0, cached.0, "cache hit");
+    assert_eq!(
+        engine.memory().expect("memory").glyph_cache.0,
+        cached.0,
+        "cache hit"
+    );
 }
 
 #[test]
@@ -367,11 +383,13 @@ fn unsupported_features_report_their_names() {
         ],
         vec![RED; 4],
     );
-    surface.update(|tx| {
-        tx[surface.root()].content(surface.record(|c| {
-            c.fill(Rect::new(0.0, 0.0, 64.0, 64.0), Paint::from(mesh));
-        }));
-    });
+    surface
+        .update(|tx| {
+            tx[surface.root()].content(surface.record(|c| {
+                c.fill(Rect::new(0.0, 0.0, 64.0, 64.0), Paint::from(mesh));
+            }));
+        })
+        .expect("update");
     let e = engine
         .render(FrameTime::now())
         .expect_err("mesh unsupported");
@@ -399,9 +417,11 @@ fn unsupported_features_report_their_names() {
     let surface2 = engine2
         .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF32))
         .expect("surface");
-    surface2.update(|tx| {
-        tx[surface2.root()].content(surface2.record(|c| c.glyphs(&run, RED)));
-    });
+    surface2
+        .update(|tx| {
+            tx[surface2.root()].content(surface2.record(|c| c.glyphs(&run, RED)));
+        })
+        .expect("update");
     let e = engine2
         .render(FrameTime::now())
         .expect_err("glyph transform unsupported");
@@ -491,15 +511,17 @@ fn image_registration_validates_and_samples_texels() {
         .surface(Offscreen::new((32, 32), OffscreenFormat::LinearF32))
         .expect("surface");
     let id = img.id();
-    surface.update(|tx| {
-        tx[surface.root()].content(surface.record(|c| {
-            c.image(
-                id,
-                Rect::new(0.0, 0.0, 16.0, 16.0),
-                cherenkov::Sampling::Nearest,
-            );
-        }));
-    });
+    surface
+        .update(|tx| {
+            tx[surface.root()].content(surface.record(|c| {
+                c.image(
+                    id,
+                    Rect::new(0.0, 0.0, 16.0, 16.0),
+                    cherenkov::Sampling::Nearest,
+                );
+            }));
+        })
+        .expect("update");
     engine.render(FrameTime::now()).expect("render");
     let rb = surface.readback().expect("readback");
     let at = |x: usize, y: usize| rb.pixels[y * 32 + x];
@@ -541,9 +563,11 @@ fn a_colr_glyph_run_renders_its_picture() {
     let surface = engine
         .surface(Offscreen::new((160, 120), OffscreenFormat::LinearF32))
         .expect("surface");
-    surface.update(|tx| {
-        tx[surface.root()].content(surface.record(|c| c.glyphs(&run, RED)));
-    });
+    surface
+        .update(|tx| {
+            tx[surface.root()].content(surface.record(|c| c.glyphs(&run, RED)));
+        })
+        .expect("update");
     engine.render(FrameTime::now()).expect("render");
     let rb = surface.readback().expect("readback");
     // The COLR picture paints palette colours, not just the run's red:
@@ -631,9 +655,11 @@ fn cached_geometry_and_band_scratch_preserve_pixels() {
         .surface(Offscreen::new((48, 48), OffscreenFormat::LinearF32))
         .expect("surface");
     for offset in [0.125, 0.125, 0.375, 0.125] {
-        surface.update(|tx| {
-            tx[surface.root()].content(surface.record(|c| record(c, offset)));
-        });
+        surface
+            .update(|tx| {
+                tx[surface.root()].content(surface.record(|c| record(c, offset)));
+            })
+            .expect("update");
         cached.render(FrameTime::now()).expect("render");
         let actual = surface.readback().expect("readback").pixels;
         let expected = render_f32(&uncached, 48, 48, |c| record(c, offset));
@@ -727,4 +753,20 @@ fn svg_and_bitmap_only_fonts_are_rejected() {
     engine
         .font(cherenkov_cpu::FontSource::bytes(noto))
         .expect("plain font");
+}
+
+#[test]
+fn a_dead_render_thread_errors_instead_of_dropping_silently() {
+    let engine = engine();
+    let surface = engine
+        .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF32))
+        .expect("surface");
+    drop(engine);
+    assert!(matches!(
+        surface.update(|tx| {
+            tx[surface.root()].opacity(0.5);
+        }),
+        Err(SurfaceError::Lost)
+    ));
+    assert!(matches!(surface.readback(), Err(RenderError::Thread)));
 }

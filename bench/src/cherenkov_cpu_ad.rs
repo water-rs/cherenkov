@@ -730,10 +730,12 @@ impl Engine for Cherenkov {
         let prep = prep_layer(&input.scene.root, &self.fonts, &self.images, input.blobs)?;
         self.content_layers.clear();
         let mut content_layers = Vec::new();
-        surface.update(|tx| {
-            let root = surface.root();
-            build_layer(&surface, tx, root, prep, &mut content_layers);
-        });
+        surface
+            .update(|tx| {
+                let root = surface.root();
+                build_layer(&surface, tx, root, prep, &mut content_layers);
+            })
+            .map_err(|e| BenchError::Engine(format!("cherenkov update: {e}")))?;
         self.content_layers = content_layers;
         self.surface = Some(surface);
         Ok(())
@@ -759,11 +761,13 @@ impl Engine for Cherenkov {
                 (i, content)
             })
             .collect();
-        surface.update(|tx| {
-            for (i, content) in contents {
-                tx[&self.content_layers[i].layer].content(content);
-            }
-        });
+        surface
+            .update(|tx| {
+                for (i, content) in contents {
+                    tx[&self.content_layers[i].layer].content(content);
+                }
+            })
+            .map_err(|e| BenchError::Engine(format!("cherenkov update: {e}")))?;
         Ok(())
     }
 

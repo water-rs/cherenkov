@@ -27,7 +27,7 @@
 //!     tx[surface.root()].content(
 //!         surface.record(|c| c.fill(Rect::new(0., 0., 64., 64.), WorkingColor::WHITE)),
 //!     );
-//! });
+//! })?;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
@@ -132,40 +132,55 @@ impl Engine<Raster> {
 
     /// Reports system memory pressure. `Critical` clears glyph and prepared
     /// coverage caches and retained band scratch; `Moderate` does nothing.
-    pub fn trim(&self, pressure: Pressure) {
-        let _ = self.tx.send(Message::Trim(pressure));
+    ///
+    /// # Errors
+    /// [`EngineError::Thread`] when the render thread is gone.
+    pub fn trim(&self, pressure: Pressure) -> Result<(), EngineError> {
+        self.tx
+            .send(Message::Trim(pressure))
+            .map_err(|_| EngineError::Thread("render thread gone".into()))
     }
 
     /// The engine's current memory usage.
-    #[must_use]
-    pub fn memory(&self) -> MemoryUsage {
+    ///
+    /// # Errors
+    /// [`EngineError::Thread`] when the render thread is gone.
+    pub fn memory(&self) -> Result<MemoryUsage, EngineError> {
         let (reply, rx) = std::sync::mpsc::channel();
-        if self.tx.send(Message::Memory { reply }).is_err() {
-            return MemoryUsage::default();
-        }
-        rx.recv().unwrap_or_default()
+        self.tx
+            .send(Message::Memory { reply })
+            .map_err(|_| EngineError::Thread("render thread gone".into()))?;
+        rx.recv()
+            .map_err(|_| EngineError::Thread("render thread gone".into()))
     }
 
     /// Registers a font.
     ///
-    /// The data is parsed on the caller thread to reject invalid data and
-    /// bitmap-only colour fonts (`CBDT`/`sbix` without outlines), then
-    /// handed to the render thread. `COLR` colour fonts render through the
-    /// colour-glyph lowering.
+    /// The data is parsed on the caller thread to reject invalid data,
+    /// bitmap-only colour fonts (`CBDT`/`sbix` without outlines) and
+    /// SVG-in-OpenType fonts, then handed to the render thread. `COLR`
+    /// colour fonts render through the colour-glyph lowering.
     ///
     /// # Errors
-    /// [`ResourceError::Font`] for unparseable data and
-    /// `ResourceError::Unsupported(Unsupported::ColorFont)` for
-    /// bitmap-only colour fonts.
+    /// [`ResourceError::Font`] for unparseable data,
+    /// `ResourceError::Unsupported(Unsupported::ColorFont)` for colour
+    /// fonts and [`ResourceError::Io`] when the render thread is gone.
     pub fn font(&self, source: FontSource) -> Result<Font, ResourceError> {
         font::validate_font(&source.data, source.index)?;
         let id = self.next_font.get();
         self.next_font.set(id + 1);
-        let _ = self.tx.send(Message::AddFont {
-            id,
-            data: source.data,
-            index: source.index,
-        });
+        self.tx
+            .send(Message::AddFont {
+                id,
+                data: source.data,
+                index: source.index,
+            })
+            .map_err(|_| {
+                ResourceError::Io(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "render thread gone",
+                ))
+            })?;
         Ok(Font::new(cherenkov::FontId::new(id)))
     }
 
@@ -221,10 +236,12 @@ impl Engine<Raster> {
     pub fn render(&self, time: FrameTime) -> Result<Next, RenderError> {
         for (id, shared) in self.surfaces.borrow().iter() {
             if let Some(changes) = shared.borrow_mut().take_changes() {
-                let _ = self.tx.send(Message::Commit {
-                    surface: *id,
-                    changes,
-                });
+                self.tx
+                    .send(Message::Commit {
+                        surface: *id,
+                        changes,
+                    })
+                    .map_err(|_| RenderError::Thread)?;
             }
         }
         let (reply, rx) = std::sync::mpsc::channel();
@@ -249,5 +266,60 @@ impl<B: Backend> Drop for Engine<B> {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message::LayerOp;
+
+    /// An `Engine` whose render-thread receiver is already dropped.
+    fn dead_engine() -> Engine<Raster> {
+        let (tx, rx) = std::sync::mpsc::channel::<Message>();
+        drop(rx);
+        Engine {
+            tx,
+            info: RasterInfo {
+                threads: 1,
+                simd: "scalar",
+                cpu: None,
+            },
+            stats: Cell::new(FrameStats::default()),
+            surfaces: RefCell::new(HashMap::new()),
+            next_surface: Cell::new(0),
+            next_font: Cell::new(1),
+            thread: None,
+            _backend: PhantomData,
+            _not_send: PhantomData,
+        }
+    }
+
+    #[test]
+    fn a_dead_render_thread_errors_instead_of_dropping_silently() {
+        let engine = dead_engine();
+        assert!(matches!(
+            engine.trim(Pressure::Critical),
+            Err(EngineError::Thread(_))
+        ));
+        assert!(matches!(engine.memory(), Err(EngineError::Thread(_))));
+        let data = std::fs::read("../scenes/fonts/NotoSans.ttf").expect("test font");
+        assert!(engine.font(FontSource::bytes(data)).is_err());
+        assert!(matches!(
+            engine.render(FrameTime::now()),
+            Err(RenderError::Thread)
+        ));
+        // A pending surface change set fails its commit as well.
+        engine.surfaces.borrow_mut().insert(
+            7,
+            Rc::new(RefCell::new(SurfaceShared {
+                pending: vec![LayerOp::Create(0)],
+                ..SurfaceShared::default()
+            })),
+        );
+        assert!(matches!(
+            engine.render(FrameTime::now()),
+            Err(RenderError::Thread)
+        ));
     }
 }

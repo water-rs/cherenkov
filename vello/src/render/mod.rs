@@ -137,6 +137,11 @@ struct SurfaceState {
     layers: HashMap<LayerId, LayerNode>,
     clear: cherenkov::WorkingColor,
     dirty: bool,
+    /// Whether the last composed frame asked for another one (animated
+    /// shaders, `GpuContent` redraws or `redraw_hint` filters). The redraw
+    /// scan re-dirties the surface so the animation survives to the next
+    /// frame; a compose that finds nothing animating clears it.
+    wants_next: bool,
 }
 
 impl SurfaceState {
@@ -464,6 +469,7 @@ impl Renderer {
                 layers,
                 clear: cherenkov::WorkingColor::TRANSPARENT,
                 dirty: true,
+                wants_next: false,
             },
         );
         Ok(())
@@ -1027,10 +1033,15 @@ impl Renderer {
     }
 
     /// Marks surfaces dirty for pending `GpuContent`/`Filter` redraw
-    /// requests. Returns whether a redraw is pending.
+    /// requests and for surfaces whose last frame asked for another
+    /// (animated shaders, redraw-hinting filters, looping `GpuContent`).
+    /// Returns whether a redraw is pending.
     fn scan_redraw_requests(&mut self) -> bool {
         let mut pending = false;
         for surface in self.surfaces.values_mut() {
+            if surface.wants_next {
+                surface.dirty = true;
+            }
             for node in surface.layers.values() {
                 if let Some(ContentData::Gpu(slot)) = &node.content
                     && slot.dirty.load(std::sync::atomic::Ordering::Relaxed)
@@ -1132,6 +1143,10 @@ impl Renderer {
     ) -> Result<(), RenderError> {
         let mut scene = vello::Scene::new();
         let size = surf.size;
+        // `wants_next` is per-surface until composed: a frame that asked
+        // for a follow-up marks only the surfaces still animating, so one
+        // idle surface cannot keep another surface's animation dirty.
+        let mut surface_next = false;
         self.compose(
             &mut surf.layers,
             0,
@@ -1139,7 +1154,7 @@ impl Renderer {
             size,
             &mut scene,
             stats,
-            wants_next,
+            &mut surface_next,
             now,
         )?;
         self.vello
@@ -1157,6 +1172,8 @@ impl Renderer {
             )
             .map_err(|e| RenderError::Render(format!("vello render: {e}")))?;
         stats.passes += 1;
+        surf.wants_next = surface_next;
+        *wants_next |= surface_next;
         if let TargetState::Window {
             surface, config, ..
         } = &surf.target

@@ -485,3 +485,96 @@ fn filter_runs_over_the_layer_texture() {
     );
     assert_eq!(next, Next::Idle);
 }
+
+/// `GpuContent` that counts its renders and always asks for another frame.
+struct LoopingContent(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl cherenkov_vello::GpuContent for LoopingContent {
+    async fn setup(&mut self, _gpu: &wgpu::Context<'_>) {}
+
+    fn render(&mut self, frame: &mut wgpu::Frame<'_>) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        frame.request_redraw();
+    }
+}
+
+/// A `filtrate::Effect` whose `redraw_hint` keeps asking for a frame;
+/// `encode_render` itself reports no in-flight animation.
+struct AlwaysHinting;
+
+impl filtrate::Effect for AlwaysHinting {
+    fn setup(
+        &mut self,
+        _ctx: &filtrate::EffectContext<'_>,
+    ) -> impl std::future::Future<Output = filtrate::EffectSetupResult> {
+        std::future::ready(Ok(()))
+    }
+
+    fn encode_render(
+        &mut self,
+        _input: &filtrate::EffectInput<'_>,
+        _output: &filtrate::EffectOutput<'_>,
+        _encoder: &mut wgpu::CommandEncoder,
+    ) -> filtrate::EffectRenderResult {
+        Ok(false)
+    }
+
+    fn redraw_hint(&self) -> bool {
+        true
+    }
+}
+
+/// An animated shader, a looping `GpuContent` and a `redraw_hint` filter
+/// must keep the surface rendering: every `render` answers `Next::At` and
+/// the content is genuinely re-rendered each frame.
+#[test]
+fn animated_content_requests_every_frame() {
+    let Some(engine) = engine() else { return };
+    let surface = engine.surface(Offscreen::new((64, 64))).expect("surface");
+    let animated = engine
+        .shader(
+            cherenkov_vello::ShaderSource::wgsl(
+                "@fragment fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> { return vec4<f32>(uv, 0.0, 1.0); }",
+            )
+            .animated(),
+        )
+        .expect("animated shader");
+    let renders = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let content = engine.gpu_content((8, 8), LoopingContent(std::sync::Arc::clone(&renders)));
+    let filter = engine.effect(AlwaysHinting);
+    let shader_layer = surface.layer();
+    let gpu_layer = surface.layer();
+    let filtered_layer = surface.layer();
+    surface.update(|tx| {
+        tx[&shader_layer].content(surface.record(|c| {
+            c.fill(
+                Rect::new(0., 0., 8., 8.),
+                cherenkov::ShaderPaint {
+                    shader: animated.id(),
+                    uniforms: vec![],
+                },
+            );
+        }));
+        tx[&gpu_layer]
+            .transform(Affine::translate((16., 0.)))
+            .content(content);
+        tx[&filtered_layer]
+            .transform(Affine::translate((32., 0.)))
+            .filter(&filter)
+            .content(surface.record(|c| {
+                c.fill(Rect::new(0., 0., 8., 8.), WorkingColor::WHITE);
+            }));
+        tx[surface.root()]
+            .push(&shader_layer)
+            .push(&gpu_layer)
+            .push(&filtered_layer);
+    });
+    for frame in 0..3 {
+        let next = engine
+            .render(cherenkov_vello::FrameTime::now())
+            .expect("render");
+        assert!(matches!(next, Next::At { .. }), "frame {frame}: {next:?}");
+    }
+    let rendered = renders.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(rendered >= 3, "content rendered {rendered} times in 3 frames");
+}

@@ -13,7 +13,7 @@ use filtrate::{
 };
 use vello::peniko;
 
-use crate::error::RenderError;
+use cherenkov::RenderError;
 
 /// A filter or effect crossing to the render thread. `filtrate::Executor`
 /// is `!Send` (`WatchGuard` boxes `dyn Any`), so the message carries the
@@ -43,7 +43,7 @@ impl<E: Effect + Send> FilterSource for FromEffect<E> {
 
 /// Object-safe adapter over [`filtrate::Effect`]: `Effect::setup` returns
 /// an `impl Future`, so the boxed form blocks on it with `pollster` on the
-/// render thread. Errors surface as strings into [`RenderError::Filter`].
+/// render thread. Errors surface as strings into [`RenderError::Render`].
 ///
 /// Lives on the render thread only; it needs no `Send` bound because
 /// `filtrate::Executor` is `!Send`.
@@ -194,7 +194,7 @@ impl FilterRegistry {
         size: (u32, u32),
     ) -> Result<wgpu::TextureView, RenderError> {
         let Some(entry) = self.entries.get_mut(&id) else {
-            return Err(RenderError::Filter(format!("unregistered filter {id}")));
+            return Err(RenderError::Render(format!("unregistered filter {id}")));
         };
         let stale = entry.capture.as_ref().is_none_or(|(.., s)| *s != size);
         if stale {
@@ -225,10 +225,10 @@ impl FilterRegistry {
         size: (u32, u32),
     ) -> Result<(wgpu::TextureView, peniko::ImageData, bool), RenderError> {
         let Some(entry) = self.entries.get_mut(&id) else {
-            return Err(RenderError::Filter(format!("unregistered filter {id}")));
+            return Err(RenderError::Render(format!("unregistered filter {id}")));
         };
         if let Some(error) = &entry.setup_error {
-            return Err(RenderError::Filter(error.clone()));
+            return Err(RenderError::Render(format!("filter: {error}")));
         }
         if !entry.set_up {
             let ctx = EffectContext {
@@ -239,7 +239,7 @@ impl FilterRegistry {
             };
             if let Err(error) = entry.effect.setup(&ctx) {
                 entry.setup_error = Some(error.clone());
-                return Err(RenderError::Filter(error));
+                return Err(RenderError::Render(format!("filter: {error}")));
             }
             entry.set_up = true;
         }
@@ -286,7 +286,7 @@ impl FilterRegistry {
         let again = entry
             .effect
             .encode_render(&input, &output, &mut encoder)
-            .map_err(RenderError::Filter)?;
+            .map_err(|e| RenderError::Render(format!("filter: {e}")))?;
         queue.submit([encoder.finish()]);
         Ok((out_view.clone(), out_image.clone(), again))
     }

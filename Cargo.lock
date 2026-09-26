@@ -421,6 +421,7 @@ dependencies = [
  "bytemuck",
  "cherenkov",
  "filtrate",
+ "filtrate-core",
  "kurbo",
  "pollster 0.4.0",
  "skrifa 0.44.0",

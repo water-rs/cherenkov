@@ -189,13 +189,20 @@ impl Draw for StaticRecorder {
     }
 }
 
-type Subscribe<T> = Box<dyn FnOnce(Box<dyn Fn(T)>) -> Option<Box<dyn Any>>>;
+/// A signal's change subscription: `subscribe(callback)` registers
+/// `callback` for later changes, receiving the full nami
+/// [`Context`](nami_core::watcher::Context) so metadata (an `Animation`)
+/// reaches the consumer, and returns the guard to keep alive, if any.
+pub type Subscribe<T> =
+    Box<dyn FnOnce(Box<dyn Fn(nami_core::watcher::Context<T>)>) -> Option<Box<dyn Any>>>;
 
 /// A value accepted by [`Recorder`]: the current value of a nami signal, and
 /// the subscription that reports its later changes.
 pub struct Live<T> {
-    value: T,
-    subscribe: Subscribe<T>,
+    #[doc(hidden)]
+    pub value: T,
+    #[doc(hidden)]
+    pub subscribe: Subscribe<T>,
 }
 
 impl<T: std::fmt::Debug> std::fmt::Debug for Live<T> {
@@ -211,16 +218,18 @@ impl<T: 'static, S: Signal<Output = T>> From<S> for Live<T> {
         let value = signal.snapshot();
         Self {
             value,
-            subscribe: Box::new(move |on_change: Box<dyn Fn(T)>| {
-                let guard = signal.watch(move |context| on_change(context.into_value()));
-                // A guard with no size and no drop glue unsubscribes nothing, so
-                // there is nothing to keep alive.
-                if size_of::<S::Guard>() == 0 && !needs_drop::<S::Guard>() {
-                    None
-                } else {
-                    Some(Box::new(guard) as Box<dyn Any>)
-                }
-            }),
+            subscribe: Box::new(
+                move |on_change: Box<dyn Fn(nami_core::watcher::Context<T>)>| {
+                    let guard = signal.watch(on_change);
+                    // A guard with no size and no drop glue unsubscribes nothing, so
+                    // there is nothing to keep alive.
+                    if size_of::<S::Guard>() == 0 && !needs_drop::<S::Guard>() {
+                        None
+                    } else {
+                        Some(Box::new(guard) as Box<dyn Any>)
+                    }
+                },
+            ),
         }
     }
 }
@@ -268,11 +277,11 @@ impl Recorder {
         convert: impl Fn(T) -> Operand + 'static,
     ) {
         let state: Weak<LiveState> = Rc::downgrade(&self.live);
-        let guard = subscribe(Box::new(move |value| {
+        let guard = subscribe(Box::new(move |context: nami_core::watcher::Context<T>| {
             if let Some(state) = state.upgrade() {
                 state.push(SlotUpdate {
                     command,
-                    value: convert(value),
+                    value: convert(context.into_value()),
                 });
             }
         }));

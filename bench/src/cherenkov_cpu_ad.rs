@@ -117,7 +117,7 @@ pub struct Cherenkov {
     engine: CpuEngine<Raster>,
     surface: Option<Surface<Raster>>,
     /// Registered fonts per `(blob hash, face index)`.
-    fonts: HashMap<(ResourceHash, u32), cherenkov::FontId>,
+    fonts: HashMap<(ResourceHash, u32), cherenkov::Font>,
     /// Layers holding recorded content, in draw order.
     content_layers: Vec<ContentLayer>,
     /// Whether any layer carries a `motion`.
@@ -325,7 +325,7 @@ fn clip_shape(edit: &mut LayerEdit<Raster>, shape: &ShapeKind) {
 /// rather than silently dropping.
 fn op(
     draw: &SceneDraw,
-    fonts: &HashMap<(ResourceHash, u32), cherenkov::FontId>,
+    fonts: &HashMap<(ResourceHash, u32), cherenkov::Font>,
     blobs: &Blobs,
 ) -> Result<Op, BenchError> {
     Ok(match draw {
@@ -370,11 +370,12 @@ fn op(
 /// resolved `F2Dot14` coordinates.
 fn glyph_run(
     run: &SceneGlyphRun,
-    fonts: &HashMap<(ResourceHash, u32), cherenkov::FontId>,
+    fonts: &HashMap<(ResourceHash, u32), cherenkov::Font>,
     blobs: &Blobs,
 ) -> Result<cherenkov::GlyphRun, BenchError> {
-    let font = *fonts
+    let font = fonts
         .get(&(run.font, run.font_index))
+        .map(cherenkov::Font::id)
         .ok_or(cherenkov_scene::SceneError::MissingResource(run.font))?;
     let coords = blobs
         .get(&run.font)
@@ -399,7 +400,7 @@ fn glyph_run(
 
 /// Registers every font a glyph run references, once per `(hash, index)`.
 fn register_fonts(
-    fonts: &mut HashMap<(ResourceHash, u32), cherenkov::FontId>,
+    fonts: &mut HashMap<(ResourceHash, u32), cherenkov::Font>,
     engine: &CpuEngine<Raster>,
     layer: &SceneLayer,
     blobs: &Blobs,
@@ -424,7 +425,7 @@ fn register_fonts(
                         },
                         e => BenchError::Engine(format!("cherenkov font: {e}")),
                     })?;
-                fonts.insert((run.font, run.font_index), font.id());
+                fonts.insert((run.font, run.font_index), font);
             }
             Item::Draw(_) => {}
         }
@@ -436,7 +437,7 @@ fn register_fonts(
 /// draw run that must interleave with child layers.
 fn prep_layer(
     layer: &SceneLayer,
-    fonts: &HashMap<(ResourceHash, u32), cherenkov::FontId>,
+    fonts: &HashMap<(ResourceHash, u32), cherenkov::Font>,
     blobs: &Blobs,
 ) -> Result<PrepLayer, BenchError> {
     // The engine draws a layer's content before its children, so the draws

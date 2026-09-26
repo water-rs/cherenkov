@@ -135,6 +135,12 @@ fn an_isolated_scratch_target_is_region_sized() -> Result<(), Box<dyn std::error
     engine.render(cherenkov_gpu::FrameTime::now())?;
     let stats = engine.stats();
     assert_eq!(stats.passes, 3);
+    let phases = stats.phases;
+    assert!(phases.lower_seconds >= 0.0 && phases.stamp_seconds >= 0.0);
+    assert!(
+        phases.lower_seconds + phases.encode_seconds + phases.wait_seconds > 0.0,
+        "a non-empty frame must measure some render-thread CPU time: {phases:?}"
+    );
     if stats.passes_timed.is_empty() {
         // Adapter without TIMESTAMP_QUERY: check pixels only.
         return Ok(());

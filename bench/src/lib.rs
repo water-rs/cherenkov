@@ -184,6 +184,15 @@ pub struct PassSample {
     pub gpu_seconds: f64,
 }
 
+/// One render-thread CPU phase of a submitted frame.
+#[derive(Clone, Debug, Serialize)]
+pub struct PhaseSample {
+    /// The phase's name (`"lower"`, `"encode"`, `"stamp"`, `"wait"`).
+    pub name: String,
+    /// Wall-clock seconds the render thread spent in it.
+    pub seconds: f64,
+}
+
 /// The result of [`Engine::submit`].
 pub struct Submit {
     /// The rendered image in the working space, when readback was
@@ -195,6 +204,9 @@ pub struct Submit {
     /// Per-pass GPU timings, in submission order; empty when the backend
     /// exposes none.
     pub passes: Vec<PassSample>,
+    /// Per-phase render-thread CPU timings, in render order; empty when
+    /// the adapter exposes none.
+    pub phases: Vec<PhaseSample>,
 }
 
 /// Resources an adapter needs to encode one scene.

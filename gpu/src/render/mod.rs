@@ -14,6 +14,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
+use std::time::Instant;
 
 use cherenkov::ContentChange;
 
@@ -1293,6 +1294,7 @@ impl Renderer {
         // at per-surface bases so a later surface's upload can't clobber
         // an earlier one before it is encoded.
         // Take the states out so the lowering workers own them.
+        let t_lower = Instant::now();
         let mut pending: Vec<SurfaceState> = dirty
             .iter()
             .map(|id| self.surfaces.remove(id).expect("dirty surface must exist"))
@@ -1317,13 +1319,20 @@ impl Renderer {
                 globals_base += u32::try_from(surf.frame.passes.len()).unwrap_or(u32::MAX);
             }
         }
+        stats.phases.lower_seconds = t_lower.elapsed().as_secs_f64();
         if result.is_ok() {
+            let mut t = Instant::now();
             self.stamp(0);
+            stats.phases.stamp_seconds += t.elapsed().as_secs_f64();
+            t = Instant::now();
             for &id in &dirty {
                 self.encode_surface(id, &mut stats);
             }
+            stats.phases.encode_seconds = t.elapsed().as_secs_f64();
             if self.timestamps {
+                t = Instant::now();
                 self.stamp_and_resolve(2 + 2 * self.frame_pass_count);
+                stats.phases.stamp_seconds += t.elapsed().as_secs_f64();
             }
         }
         result?;

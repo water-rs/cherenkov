@@ -30,6 +30,8 @@ pub enum LayerOp {
     Transform(LayerId, Affine),
     /// Set the opacity.
     Opacity(LayerId, f32),
+    /// Set the blend mode.
+    Blend(LayerId, cherenkov::BlendMode),
     /// Set or clear the clip shape.
     Clip(LayerId, Option<ShapeData>),
     /// Set the layer content to a shared picture, or clear it.

@@ -74,8 +74,6 @@ pub enum Unsupported {
     Image,
     /// A user shader paint.
     Shader,
-    /// A blend mode other than normal.
-    Blend,
     /// A filter on a group.
     Filter,
     /// A stroked glyph run.
@@ -97,7 +95,6 @@ impl std::fmt::Display for Unsupported {
             Self::Mesh => "mesh-gradient",
             Self::Image => "image",
             Self::Shader => "shader-paint",
-            Self::Blend => "blend-mode",
             Self::Filter => "filter",
             Self::GlyphStroke => "glyph-stroke",
             Self::GlyphTransform => "glyph-transform",

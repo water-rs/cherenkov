@@ -6,10 +6,36 @@ import OSLog
 
 private let logger = Logger(subsystem: "dev.cherenkov", category: "bench")
 
+/// One finished run: its arguments and exit code, as recorded in
+/// `done.json`.
+struct BenchRunResult {
+    let args: [String]
+    let exitCode: Int32
+}
+
+/// Receives bench progress on the main thread.
+protocol BenchRunnerDelegate: AnyObject {
+    /// `index` (zero-based) of `total` is about to run `args`.
+    func benchRunner(_ runner: BenchRunner, didStartRun index: Int, of total: Int, args: [String])
+    /// Every run finished; `results` is in `done.json` order.
+    func benchRunner(_ runner: BenchRunner, didFinishWithResults results: [BenchRunResult])
+    /// The suite could not run to completion; `error` says why
+    /// (`bench-args.json` missing or invalid, `Documents/out` or
+    /// `done.json` unwritable, ...).
+    func benchRunner(_ runner: BenchRunner, didFailWithError error: String)
+}
+
 /// Runs every argument list in `Documents/bench-args.json` through
 /// `cherenkov_bench_run`, in order, and records each run's exit code in
 /// `Documents/out/done.json`.
 struct BenchRunner {
+    /// Receives progress on the main thread.
+    let delegate: BenchRunnerDelegate?
+
+    init(delegate: BenchRunnerDelegate? = nil) {
+        self.delegate = delegate
+    }
+
     /// The overall exit code: the first non-zero run's, else 0.
     func runAll() -> Int32 {
         let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
@@ -23,6 +49,7 @@ struct BenchRunner {
             try FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
         } catch {
             logger.error("cannot reset \(outDir.path, privacy: .public): \(error)")
+            report { $0.benchRunner(self, didFailWithError: "cannot reset \(outDir.path): \(error.localizedDescription)") }
             return 1
         }
         // An iOS app launches with cwd `/`; the bench's relative
@@ -30,25 +57,39 @@ struct BenchRunner {
         guard FileManager.default.changeCurrentDirectoryPath(NSHomeDirectory()) else {
             logger.error("cannot chdir to \(NSHomeDirectory(), privacy: .public)")
             _ = Self.writeDone(["error": "cannot chdir to app home"], to: outDir)
+            report { $0.benchRunner(self, didFailWithError: "cannot chdir to app home") }
             return 1
         }
         guard let argLists = Self.loadArgLists(from: documents.appendingPathComponent("bench-args.json"))
         else {
             _ = Self.writeDone(["error": "bench-args.json missing or invalid"], to: outDir)
+            report { $0.benchRunner(self, didFailWithError: "bench-args.json missing or invalid") }
             return 1
         }
-        var results: [[String: Any]] = []
+        var results: [BenchRunResult] = []
         var firstFailure: Int32 = 0
         for (index, args) in argLists.enumerated() {
             logger.info("run \(index): \(args.joined(separator: " "), privacy: .public)")
+            report { $0.benchRunner(self, didStartRun: index, of: argLists.count, args: args) }
             let logURL = outDir.appendingPathComponent("run-\(index).log")
             let code = Self.invoke(args, logTo: logURL)
             logger.info("run \(index): exit \(code)")
-            results.append(["args": args, "exit_code": code])
+            results.append(BenchRunResult(args: args, exitCode: code))
             if firstFailure == 0 { firstFailure = code }
         }
-        guard Self.writeDone(["results": results], to: outDir) else { return 1 }
+        let doneResults = results.map { ["args": $0.args, "exit_code": $0.exitCode] as [String: Any] }
+        guard Self.writeDone(["results": doneResults], to: outDir) else {
+            report { $0.benchRunner(self, didFailWithError: "cannot write done.json") }
+            return 1
+        }
+        report { $0.benchRunner(self, didFinishWithResults: results) }
         return firstFailure
+    }
+
+    /// Calls `body` with the delegate on the main thread.
+    private func report(_ body: @escaping (BenchRunnerDelegate) -> Void) {
+        guard let delegate else { return }
+        DispatchQueue.main.async { body(delegate) }
     }
 
     /// Calls `cherenkov_bench_run` with `cherenkov-bench` as `argv[0]`

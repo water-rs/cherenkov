@@ -383,6 +383,53 @@ fn timestamps_off_reports_no_passes() -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
+/// Re-rendering an unchanged scene creates no group-1 bind groups: the
+/// second frame binds the views cached under (scratch generation, image
+/// generation) rather than rebuilding them per encode.
+#[test]
+fn bind_groups_are_reused_across_frames() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(engine) = engine(GpuConfig::default()) else {
+        return Ok(());
+    };
+    let surface = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
+    let record = |c: &mut cherenkov::Recorder| {
+        c.fill(
+            Rect::new(0.0, 0.0, 64.0, 64.0),
+            WorkingColor::new([1.0, 0.0, 0.0, 1.0]),
+        );
+        // An isolated group with overlapping contents forces a scratch
+        // pass → a source-texture bind group.
+        c.group(cherenkov::Group::new().opacity(0.5), |c| {
+            c.fill(
+                Rect::new(8.0, 8.0, 32.0, 32.0),
+                WorkingColor::new([0.0, 0.0, 1.0, 1.0]),
+            );
+            c.fill(
+                Rect::new(16.0, 16.0, 48.0, 48.0),
+                WorkingColor::new([0.0, 1.0, 0.0, 1.0]),
+            );
+        });
+    };
+    surface.update(|tx| {
+        tx[surface.root()].content(surface.record(|c| record(c)));
+    });
+    engine.render(cherenkov_gpu::FrameTime::now())?;
+    assert!(
+        engine.stats().bind_groups_created > 0,
+        "the first frame builds the bind groups"
+    );
+    surface.update(|tx| {
+        tx[surface.root()].content(surface.record(|c| record(c)));
+    });
+    engine.render(cherenkov_gpu::FrameTime::now())?;
+    assert_eq!(
+        engine.stats().bind_groups_created,
+        0,
+        "an identical frame reuses the cached bind groups"
+    );
+    Ok(())
+}
+
 /// A zero-size surface is rejected synchronously.
 #[test]
 fn a_zero_size_surface_is_an_error() {

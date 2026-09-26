@@ -205,11 +205,13 @@ impl Layer {
 
 impl Drop for Layer {
     fn drop(&mut self) {
+        let mut shared = self.shared.borrow_mut();
+        // A live `Content` lives in `contents`, not in the op stream:
+        // without this the entry (and its signal subscriptions) would
+        // survive the layer for the surface's lifetime.
+        shared.contents.remove(&self.id);
         if self.remove_on_drop {
-            self.shared
-                .borrow_mut()
-                .pending
-                .push(LayerOp::Remove(self.id));
+            shared.pending.push(LayerOp::Remove(self.id));
         }
     }
 }
@@ -560,5 +562,50 @@ impl Surface {
 impl Drop for Surface {
     fn drop(&mut self) {
         let _ = self.tx.send(Message::DestroySurface { id: self.id });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use cherenkov::Draw as _;
+    use cherenkov::kurbo::Rect;
+
+    use super::*;
+
+    /// A `Surface` backed by a stub thread that only answers
+    /// `CreateSurface`; later messages accumulate on the channel.
+    fn stub_surface() -> Surface {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            while let Ok(msg) = rx.recv() {
+                if let Message::CreateSurface { reply, .. } = msg {
+                    let _ = reply.send(Ok(()));
+                }
+            }
+        });
+        Surface::new(1, Offscreen::new((8, 8)).into(), tx).expect("surface")
+    }
+
+    /// Dropping a layer must drop its `contents` entry too: the recorded
+    /// `Content` and its signal subscriptions must not outlive the layer.
+    #[test]
+    fn layer_drop_releases_its_content() {
+        let surface = stub_surface();
+        let layer = surface.layer();
+        surface.update(|tx| {
+            tx[&layer].content(surface.record(|c| {
+                c.fill(
+                    Rect::new(0., 0., 4., 4.),
+                    WorkingColor::WHITE,
+                );
+            }));
+        });
+        let id = layer.id;
+        assert!(surface.shared.borrow().contents.contains_key(&id));
+        drop(layer);
+        assert!(
+            !surface.shared.borrow().contents.contains_key(&id),
+            "dropped layer's content must be released"
+        );
     }
 }

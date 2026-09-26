@@ -1007,8 +1007,12 @@ impl<'a> Lowering<'a> {
         let first_instance = self.frame.instances.len();
         let first_stop = self.frame.stops.len();
         let first_patch = self.cell_patches.len();
+        // `realize` composes path and glyph ops' local transforms into
+        // `self.transform`; the leaf's placement is restored with the clip.
+        let transform = self.transform;
         self.clip = None;
         let realized = self.realize(op, cover, glyphs);
+        self.transform = transform;
         self.clip = clip;
         realized?;
         let stop_base = u32::try_from(first_stop).expect("stop count fits u32");
@@ -1032,7 +1036,7 @@ impl<'a> Lowering<'a> {
                 .map(|&(i, p, c)| (i - instance_base, p, c))
                 .collect(),
             cover,
-            transform: self.transform,
+            transform,
             size: [self.width, self.height],
             generation: glyphs.atlas.generation(),
             instances,

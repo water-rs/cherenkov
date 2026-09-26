@@ -18,6 +18,7 @@ use rayon::prelude::*;
 
 use cherenkov::FillRule;
 
+use crate::render::blend::{blend, src_over};
 use crate::render::lower::{ClipMask, ClipRef, IRect, Item};
 use crate::render::paint::PaintData;
 
@@ -263,17 +264,6 @@ fn top<'a>(fb: &'a mut [[f32; 4]], stack: &'a mut [Vec<[f32; 4]>]) -> &'a mut [[
     stack.last_mut().map_or(fb, Vec::as_mut_slice)
 }
 
-/// `src_over` composite of premultiplied `src` onto `dst`.
-fn src_over(dst: [f32; 4], src: [f32; 4]) -> [f32; 4] {
-    let inv = 1.0 - src[3];
-    [
-        src[0].mul_add(1.0, dst[0] * inv),
-        src[1].mul_add(1.0, dst[1] * inv),
-        src[2].mul_add(1.0, dst[2] * inv),
-        src[3].mul_add(1.0, dst[3] * inv),
-    ]
-}
-
 /// Rasterizes the whole surface's items into `fb` (length `w*h`,
 /// premultiplied linear P3), parallel over [`BAND_H`]-row bands.
 ///
@@ -320,11 +310,11 @@ pub fn render_bands(
                     Item::PushIsolate => {
                         stack.push(vec![[0.0; 4]; slice_len(band.w, bh)]);
                     }
-                    Item::PopIsolate { opacity, clip } => {
+                    Item::PopIsolate { opacity, blend } => {
                         let Some(scratch) = stack.pop() else {
                             continue;
                         };
-                        band.composite_isolate(&scratch, *opacity, clip.as_ref(), &mut stack);
+                        band.composite_isolate(&scratch, *opacity, *blend, &mut stack);
                     }
                     Item::Shadow {
                         rbox,
@@ -695,16 +685,20 @@ impl Band<'_> {
         &mut self,
         scratch: &[[f32; 4]],
         opacity: f32,
-        clip: Option<&ClipRef>,
+        mode: cherenkov::BlendMode,
         stack: &mut Vec<Vec<[f32; 4]>>,
     ) {
         let dst = top(&mut *self.fb, stack.as_mut_slice());
         for (i, &src) in scratch.iter().enumerate() {
-            let px = i % self.w;
-            let py = self.y0 + i / self.w;
-            let cc = clip_cov(clip, self.w, px, py);
-            let s = src.map(|v| v * opacity * cc);
-            dst[i] = src_over(dst[i], s);
+            let s = src.map(|v| v * opacity);
+            dst[i] = if mode == cherenkov::BlendMode::Normal {
+                if s[3] == 0.0 {
+                    continue;
+                }
+                src_over(dst[i], s)
+            } else {
+                blend(mode, dst[i], s)
+            };
         }
     }
 }

@@ -98,8 +98,8 @@ pub enum Item {
     PopIsolate {
         /// The opacity multiplier.
         opacity: f32,
-        /// The clip in force at the pop.
-        clip: Option<ClipRef>,
+        /// The blend mode to composite with.
+        blend: BlendMode,
     },
 }
 
@@ -109,6 +109,8 @@ pub struct LayerNode {
     pub transform: Affine,
     /// Opacity; below 1.0 isolates.
     pub opacity: f32,
+    /// Blend mode onto the parent; non-normal isolates.
+    pub blend: BlendMode,
     /// Clip shape.
     pub clip: Option<ShapeData>,
     /// The content.
@@ -502,18 +504,15 @@ impl<'a> Lowering<'a> {
     fn isolate(
         &mut self,
         opacity: f32,
+        blend: BlendMode,
         inner_clip: Option<ClipRef>,
-        outer_clip: Option<ClipRef>,
         body: impl FnOnce(&mut Self) -> Result<(), RenderError>,
     ) -> Result<(), RenderError> {
         let saved = std::mem::replace(&mut self.clip, inner_clip);
         self.items.push(Item::PushIsolate);
         let result = body(self);
         self.clip = saved;
-        self.items.push(Item::PopIsolate {
-            opacity,
-            clip: outer_clip,
-        });
+        self.items.push(Item::PopIsolate { opacity, blend });
         result
     }
 
@@ -526,9 +525,9 @@ impl<'a> Lowering<'a> {
         let saved = self.transform;
         self.transform = saved * node.transform;
         let result = self.with_clip(node.clip.as_ref(), |s| {
-            if node.opacity < 1.0 {
-                let outer = s.clip.clone();
-                s.isolate(node.opacity, s.clip.clone(), outer, |s| {
+            if node.opacity < 1.0 || node.blend != BlendMode::Normal {
+                let clip = s.clip.clone();
+                s.isolate(node.opacity, node.blend, clip, |s| {
                     s.layer_items(node, layers)
                 })
             } else {
@@ -603,18 +602,15 @@ impl<'a> Lowering<'a> {
                     if group.filter.is_some() {
                         return Err(Unsupported::Filter.into());
                     }
-                    if group.blend != BlendMode::Normal {
-                        return Err(Unsupported::Blend.into());
-                    }
                     if group.blend_space != BlendSpace::Linear {
                         return Err(Unsupported::BlendSpace.into());
                     }
                     let inner_end = (*end as usize).min(commands.len());
-                    if group.opacity >= 1.0 {
+                    if group.opacity >= 1.0 && group.blend == BlendMode::Normal {
                         self.commands(list, i + 1, inner_end)?;
                     } else {
                         let clip = self.clip.clone();
-                        self.isolate(group.opacity, clip.clone(), clip, |s| {
+                        self.isolate(group.opacity, group.blend, clip, |s| {
                             s.commands(list, i + 1, inner_end)
                         })?;
                     }

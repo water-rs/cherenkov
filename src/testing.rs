@@ -827,3 +827,6 @@ mod tests {
         );
     }
 }
+
+/// Retained-lowering equivalence checks for first-party backends.
+pub mod incremental;

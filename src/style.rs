@@ -82,6 +82,30 @@ pub enum BlendMode {
     Color,
     /// Luminosity.
     Luminosity,
+    /// Both source and destination are cleared.
+    Clear,
+    /// The source replaces the destination.
+    Src,
+    /// The destination replaces the source (source discarded).
+    Dst,
+    /// The destination is placed over the source.
+    DestOver,
+    /// The parts of the source that overlap the destination.
+    SrcIn,
+    /// The parts of the destination that overlap the source.
+    DestIn,
+    /// The parts of the source outside the destination.
+    SrcOut,
+    /// The parts of the destination outside the source.
+    DestOut,
+    /// The parts of the source overlapping the destination replace it.
+    SrcAtop,
+    /// The parts of the destination overlapping the source replace it.
+    DestAtop,
+    /// The non-overlapping regions of source and destination.
+    Xor,
+    /// Source and destination are summed without clamping.
+    PlusLighter,
 }
 
 /// The space in which a group blends.

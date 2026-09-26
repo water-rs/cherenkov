@@ -146,7 +146,7 @@ fn rotated_box_shadows_and_signed_spread_match_oracle() {
         let actual = render(&engine, |recorder| {
             recorder.transform(transform, |recorder| {
                 recorder.shadow(rect, Shadow::new(1.25, COLOR).spread(spread));
-            })
+            });
         });
         // Sharp box spread stays polygonal under rotation.
         assert_pixels(&actual, &expected, 4e-6);
@@ -179,7 +179,7 @@ fn mesh_sampling_transforms_hdr_alpha_and_outside_match_oracle() {
     let actual = render(&engine(), |recorder| {
         recorder.transform(transform, |recorder| {
             recorder.fill(Rect::new(-100.0, -100.0, 100.0, 100.0), mesh.clone());
-        })
+        });
     });
     let expected: Vec<_> = (0..48_u32)
         .flat_map(|y| (0..48_u32).map(move |x| (x, y)))
@@ -312,7 +312,7 @@ fn transformed_stroked_glyphs_and_cache_identity_match_oracle() {
         }
         let expected = colored(&coverage.finish(FillRule::NonZero), COLOR);
         let actual = render(&engine, |recorder| {
-            recorder.clip(clip.clone(), |recorder| recorder.glyphs(&run, COLOR))
+            recorder.clip(clip.clone(), |recorder| recorder.glyphs(&run, COLOR));
         });
         assert_pixels(&actual, &expected, 0.025);
     }
@@ -438,7 +438,7 @@ fn mixed_radius_box_spread_scales_and_clamps_like_oracle() {
             let actual = render(&engine, |recorder| {
                 recorder.transform(transform, |recorder| {
                     recorder.shadow(rect, Shadow::new(0.75, COLOR).spread(spread));
-                })
+                });
             });
             // Rounded outlines retain the coverage compiler's curve tolerance.
             assert_pixels(&actual, &expected, 0.004);
@@ -473,7 +473,7 @@ fn acute_path_spread_uses_miter_limit_four_under_shear_and_clipping() {
                 recorder.transform(transform, |recorder| {
                     recorder.shadow(caster.clone(), Shadow::new(0.25, COLOR).spread(spread));
                 });
-            })
+            });
         });
         assert_pixels(&actual, &expected, 4e-6);
     }

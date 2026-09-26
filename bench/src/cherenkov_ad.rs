@@ -4,11 +4,11 @@
 //! `cherenkov` adapter: the `cherenkov-gpu` backend slice on `wgpu`.
 //!
 //! Route: the front-end records a display list per content layer, lowered on
-//! the render thread into analytic f32 quads drawn by a single WGSL pipeline
+//! the render thread into retained analytic f32 quads drawn by specialized WGSL pipelines
 //! into a `Rgba16Float` texture (premultiplied linear Display P3 — the
 //! suite's working space end to end, so readback needs no conversion). GPU
-//! time is a real `wgpu` timestamp pair drained inside
-//! [`cherenkov_gpu::Engine::render`] with `GpuConfig::timestamps` set.
+//! time comes from real `wgpu` timestamps collected from completed earlier
+//! submissions inside [`cherenkov::Engine::render`] with `GpuConfig::timestamps` set.
 //!
 //! `CHERENKOV_SCRATCH_FORMAT=rgba8` selects `Rgba8Unorm` isolation targets
 //! (default `Rgba16Float`) to compare intermediate precision/bandwidth.

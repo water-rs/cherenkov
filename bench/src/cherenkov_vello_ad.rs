@@ -7,7 +7,7 @@
 //! the render thread into a `vello::Scene` rendered by vello's wgpu renderer
 //! into a `Rgba8Unorm` texture (premultiplied sRGB-encoded sRGB — vello
 //! blends in the encoded target). GPU time is a real `wgpu` timestamp pair
-//! drained inside [`cherenkov_vello::Engine::render`] with
+//! drained inside [`cherenkov::Engine::render`] with
 //! `VelloConfig::timestamps` set.
 
 use std::collections::{BTreeSet, HashMap};

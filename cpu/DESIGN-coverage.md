@@ -117,7 +117,7 @@ coverage usually varies at every pixel. Their colour is applied at composition.
 ## Cache identity, ownership, and memory
 
 The renderer owns the cache; no globals, worker-local caches, or locks are added.
-Keys retain their full binary contents, and HashMap equality checks them after
+Keys retain their full binary contents, and `HashMap` equality checks them after
 hashing. Hash collisions cannot alias geometry. Fractional transforms are keyed
 exactly and rerasterized, never reconstructed by resampling cached coverage.
 Changing paint reuses coverage but evaluates the new paint. Changing the surface
@@ -134,7 +134,7 @@ critical pressure clears caches and band storage. Glyph accounting includes the
 retained outlines and avoids double-counting replacement entries.
 
 Band item lists and isolation buffers belong to the surface and survive frames.
-Push/pop markers reach every band because blend modes such as Clear and DestIn
+Push/pop markers reach every band because blend modes such as Clear and `DestIn`
 can modify destination pixels even where source coverage is empty. Buffer reuse
 zeros each isolation layer before reuse. Framebuffer clearing happens in the band
 pass. There are no per-draw accumulators or per-frame clip-mask parallel launches.

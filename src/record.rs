@@ -451,6 +451,12 @@ impl Content {
         self.picture.display_list().len()
     }
 
+    /// Whether the recorded list has no commands.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.picture.display_list().is_empty()
+    }
+
     /// The change to send at the next commit, if any. The first call sends the
     /// whole display list; later calls send only the slots whose signals
     /// changed.

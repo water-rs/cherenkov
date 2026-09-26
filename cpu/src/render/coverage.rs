@@ -27,11 +27,12 @@ impl Combine {
                 let first = inside(winding[0], rules[0]);
                 let second = inside(winding[1], rules[1]);
                 let clips_inside = outside == usize::from(!first) + usize::from(!second);
-                clips_inside && if matches!(self, Self::Union) {
-                    first || second
-                } else {
-                    first && !second
-                }
+                clips_inside
+                    && if matches!(self, Self::Union) {
+                        first || second
+                    } else {
+                        first && !second
+                    }
             }
         }
     }
@@ -349,7 +350,14 @@ impl RowScratch {
 
     /// Resolve one x-connected group. The baseline winding is constant in y:
     /// no boundary intersects the vertical gap separating it from its neighbour.
-    fn group(&mut self, lines: &[Line], baseline: &[i32], rules: &[FillRule], w: usize, combine: Combine) {
+    fn group(
+        &mut self,
+        lines: &[Line],
+        baseline: &[i32],
+        rules: &[FillRule],
+        w: usize,
+        combine: Combine,
+    ) {
         self.bounds.clear();
         for line in lines {
             self.bounds.extend([line.top, line.bottom]);
@@ -515,7 +523,10 @@ pub fn rasterize_combined(operands: &[Operand], w: usize, h: usize, combine: Com
     // Intersect operand y extents before allocating row buckets.
     let mut top = 0;
     let mut bottom = h;
-    for operand in operands.iter().filter(|_| matches!(combine, Combine::Intersection)) {
+    for operand in operands
+        .iter()
+        .filter(|_| matches!(combine, Combine::Intersection))
+    {
         let lo = operand
             .edges
             .iter()
@@ -564,7 +575,11 @@ pub fn rasterize_combined(operands: &[Operand], w: usize, h: usize, combine: Com
         scratch.finish(&mut result, w);
     }
     if let Some(first) = result.rows.iter().position(|row| !row.is_empty()) {
-        let last = result.rows.iter().rposition(|row| !row.is_empty()).expect("nonempty field");
+        let last = result
+            .rows
+            .iter()
+            .rposition(|row| !row.is_empty())
+            .expect("nonempty field");
         result.rows.truncate(last + 1);
         drop(result.rows.drain(..first));
         result.top += first;
@@ -645,8 +660,12 @@ mod tests {
             let cut = rasterize_combined(&operands, 1, 1, Combine::Difference);
             assert!((merged.at(0, 0) - union).abs() < 1e-7);
             assert!((cut.at(0, 0) - difference).abs() < 1e-7);
-            let clipped = rasterize_combined(&[operands[0].clone(), operands[1].clone(), lower.clone()],
-                1, 1, Combine::Union);
+            let clipped = rasterize_combined(
+                &[operands[0].clone(), operands[1].clone(), lower.clone()],
+                1,
+                1,
+                Combine::Union,
+            );
             assert!((clipped.at(0, 0) - 0.5).abs() < 1e-7);
         }
     }

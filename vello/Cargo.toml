@@ -19,5 +19,10 @@ thiserror = "2"
 bytemuck = { version = "1", features = ["derive"] }
 skrifa = "0.44"
 
+[dev-dependencies]
+# Real X windows for the windowed-surface present tests.
+x11rb = { version = "0.13", default-features = false, features = ["dl-libxcb"] }
+raw-window-handle = "0.6"
+
 [lints]
 workspace = true

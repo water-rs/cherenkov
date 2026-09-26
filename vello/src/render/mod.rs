@@ -875,13 +875,7 @@ impl Renderer {
             let rule = node.clip.as_ref().map_or(peniko::Fill::NonZero, |clip| {
                 convert::fill(convert::shape_rule(clip))
             });
-            scene.push_layer(
-                rule,
-                convert::blend(node.blend),
-                node.opacity,
-                world,
-                &clip,
-            );
+            scene.push_layer(rule, convert::blend(node.blend), node.opacity, world, &clip);
         }
         self.compose_contents(
             layers,
@@ -1101,13 +1095,7 @@ impl Renderer {
             let rule = node.clip.as_ref().map_or(peniko::Fill::NonZero, |clip| {
                 convert::fill(convert::shape_rule(clip))
             });
-            scene.push_layer(
-                rule,
-                convert::blend(node.blend),
-                node.opacity,
-                world,
-                &clip,
-            );
+            scene.push_layer(rule, convert::blend(node.blend), node.opacity, world, &clip);
         }
         scene.draw_image(
             &peniko::ImageBrush {
@@ -1285,12 +1273,25 @@ impl Renderer {
             let frame = match surface.get_current_texture() {
                 Current::Success(frame) | Current::Suboptimal(frame) => frame,
                 Current::Lost | Current::Outdated => {
-                    // Reconfigure and try again next render.
-                    surface.configure(&self.device, config);
+                    // Reconfigure and retry on the next frame: the surface
+                    // stays dirty and asks for it, or a stale window would
+                    // sit unpresented until an unrelated change arrived.
+                    // `configure` panics inside wgpu on a destroyed window —
+                    // catch it so a dead window cannot kill the render
+                    // thread; the surface keeps asking until the embedder
+                    // destroys it.
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        surface.configure(&self.device, config);
+                    }));
+                    surf.wants_next = true;
+                    *wants_next = true;
                     return Ok(());
                 }
                 Current::Timeout | Current::Occluded => {
-                    // Skip presenting this frame; the surface stays dirty.
+                    // Skip presenting this frame; the surface stays dirty
+                    // and asks for a retry next frame.
+                    surf.wants_next = true;
+                    *wants_next = true;
                     return Ok(());
                 }
                 Current::Validation => {
@@ -1572,7 +1573,10 @@ mod tests {
                 clear: None,
                 ops: vec![
                     LayerOp::Create(1),
-                    LayerOp::Push { parent: 0, child: 1 },
+                    LayerOp::Push {
+                        parent: 0,
+                        child: 1,
+                    },
                     LayerOp::Content(
                         1,
                         Some(LayerContentMsg::Gpu(GpuContentMsg {
@@ -1596,7 +1600,9 @@ mod tests {
     /// of drawing its retained texture.
     #[test]
     fn removing_a_shader_invalidates_cached_fragments() {
-        let Some(mut renderer) = renderer() else { return };
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
         renderer
             .create_surface(1, TargetSpec::Offscreen { size: (32, 32) })
             .expect("surface");
@@ -1620,7 +1626,10 @@ mod tests {
                 clear: None,
                 ops: vec![
                     LayerOp::Create(1),
-                    LayerOp::Push { parent: 0, child: 1 },
+                    LayerOp::Push {
+                        parent: 0,
+                        child: 1,
+                    },
                     LayerOp::ContentChange(
                         1,
                         cherenkov::Content::record(|c| {
@@ -1672,7 +1681,9 @@ mod tests {
     /// dangling id instead of drawing retained pixels.
     #[test]
     fn removing_an_image_invalidates_cached_fragments() {
-        let Some(mut renderer) = renderer() else { return };
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
         renderer
             .create_surface(1, TargetSpec::Offscreen { size: (32, 32) })
             .expect("surface");
@@ -1693,7 +1704,10 @@ mod tests {
                 clear: None,
                 ops: vec![
                     LayerOp::Create(1),
-                    LayerOp::Push { parent: 0, child: 1 },
+                    LayerOp::Push {
+                        parent: 0,
+                        child: 1,
+                    },
                     LayerOp::ContentChange(
                         1,
                         cherenkov::Content::record(|c| {
@@ -1728,7 +1742,9 @@ mod tests {
     /// performs — not hold the textures until engine drop.
     #[test]
     fn destroying_a_surface_unbinds_its_overrides() {
-        let Some(mut renderer) = renderer() else { return };
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
         let image = bound_gpu_image(&mut renderer);
         assert!(override_bound(&mut renderer, &image), "setup: bound");
         renderer.destroy_surface(1);
@@ -1743,7 +1759,9 @@ mod tests {
     /// removed, not leaked in vello's override map.
     #[test]
     fn replace_releases_the_old_contents_binding() {
-        let Some(mut renderer) = renderer() else { return };
+        let Some(mut renderer) = renderer() else {
+            return;
+        };
         let image = bound_gpu_image(&mut renderer);
         assert!(override_bound(&mut renderer, &image), "setup: bound");
         let replace = cherenkov::Content::record(|_| {})

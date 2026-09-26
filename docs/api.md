@@ -476,3 +476,35 @@ tx[&sparks].content(GpuContentHandle::new(Particles::new()));
 ## Errors
 
 Errors are `thiserror` enums per operation family: `EngineError`, `SurfaceError`, `ResourceError`, `RenderError` (including device loss). Invariant violations panic with a message. Nothing silently degrades.
+
+## Retained lowering in the GPU and CPU backends
+
+The first-party backends retain each layer's resolved command operations and
+its device realizations. `DisplayList::apply` contributes normalized `Dirty`
+ranges to that layer; multiple commits before a render merge their ranges.
+The shared `lowering` module records each source command's operation span and
+ambient content transform. A stable update replaces just those spans and
+invalidates just their device instances, gradient stops and coverage. Dirty
+realizations reuse their vector storage. A changed operation count, glyph
+count or scope structure rebuilds the affected layer's layout.
+
+Layer transforms, scrolling, clips and opacity are read from the sampled tree
+while composing retained operations. They do not resolve content again.
+Device placement changes regenerate the coverage that depends on that
+placement, including fractional transforms; opacity-only changes reuse the
+content instances and assemble the required isolation/composite passes.
+Atlas generations invalidate retained GPU addresses on growth or eviction.
+Critical memory pressure releases retained CPU masks as well as the glyph
+cache.
+
+The CPU and GPU `dirty` integration tests run the same deterministic randomized
+slot updates and require exact readback bits against full lowering after every
+frame. The sequence includes nested scopes, glyph-count changes, animated layer
+properties, resize and cache eviction. Stable two-command updates assert
+`FrameStats::commands_lowered == 2`; property-only frames assert zero.
+
+`scenes/perf/live-dashboard` is the paired benchmark: one text value and one
+bar height change on every frame of an otherwise static page. `encode` measures
+the UI-thread slot changes; backend lowering runs inside `submit` with render
+composition and execution. GPU submission timing on lavapipe includes the
+software rasterizer, so it does not isolate lowering time.

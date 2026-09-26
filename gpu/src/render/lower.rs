@@ -4,15 +4,13 @@
 //! Lowering: a surface's layer tree and display lists become one list of
 //! instanced-quad passes.
 
+use cherenkov::lowering::Realization;
 use std::collections::HashMap;
 use std::ops::Range;
 
-use cherenkov::kurbo::{Affine, BezPath, Line, PathEl, Point, Rect, Vec2};
-use cherenkov::{
-    BlendMode, BlendSpace, Command, DisplayList, Extend, FillRule, ImageId, ImagePattern,
-    Interpolation, Paint, ShapeData, WorkingColor,
-};
-use cherenkov::{GlyphRun, GlyphStyle};
+use super::prepared::{ClipShape, Op, Outline, PaintData, ResolvedPaint, box_shape};
+use cherenkov::kurbo::{Affine, BezPath, PathEl, Point, Rect, Vec2};
+use cherenkov::{FillRule, GlyphRun, ShapeData, WorkingColor};
 
 use cherenkov::RenderError;
 
@@ -20,26 +18,14 @@ use crate::names;
 use cherenkov::{LayerId, SurfaceTree};
 
 use crate::render::GpuImage;
-use skrifa::MetadataProvider as _;
-use skrifa::raw::TableProvider as _;
 
-use crate::render::colr;
 use crate::render::glyph::{self, Atlas, FontData, MaskCell, PathEmit, PendingRaster, glyph_key};
 use crate::render::instance::{
-    EXTEND_NONE, EXTEND_PAD, EXTEND_REFLECT, EXTEND_REPEAT, FLAG_HAS_CLIP, FLAG_HAS_INNER,
-    FLAG_HAS_MASK, Globals, INTERP_SRGB, INTERP_WORKING, Instance, KIND_FILL, KIND_GLYPH,
-    KIND_SHADOW, KIND_SPAN, KIND_STROKE_DIST, KIND_STROKE_OFFSET, PAINT_IMAGE, PAINT_LINEAR,
-    PAINT_RADIAL, PAINT_SOLID, PAINT_SWEEP, PAINT_TEXTURE, Shape, Stop, affine, blend_code,
+    FLAG_HAS_CLIP, FLAG_HAS_INNER, FLAG_HAS_MASK, Globals, Instance, KIND_FILL, KIND_GLYPH,
+    KIND_SHADOW, KIND_SPAN, KIND_STROKE_DIST, KIND_STROKE_OFFSET, PAINT_SOLID, PAINT_TEXTURE,
+    Shape, Stop, affine, blend_code,
 };
 use crate::render::path;
-
-/// Linear Display P3 to linear sRGB (the inverse of the shader's
-/// `SRGB_TO_P3`), used to store `SrgbEncoded` gradient stops.
-const P3_TO_SRGB: [[f32; 3]; 3] = [
-    [1.224_940_1, -0.224_940_4, 0.0],
-    [-0.042_056_9, 1.042_057_1, 0.0],
-    [-0.019_637_6, -0.078_636_1, 1.098_273_5],
-];
 
 /// The target a pass draws into.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -213,134 +199,12 @@ impl ClipMask {
     }
 }
 
-/// A `ShapeData` expressed as a centred rounded box.
-struct Boxed {
-    /// Extra local transform (centre translation, plus rotation for
-    /// ellipses and stroked lines).
-    extra: Affine,
-    /// The centred shape.
-    shape: Shape,
-    /// The local bounds, centred.
-    bounds: Rect,
-}
-
-/// Converts a semantic shape into a centred rounded box plus the local
-/// transform that centres it.
-///
-/// A `ContinuousRect`'s Lamé exponent follows the scene/oracle model:
-/// `2 + 2 * smoothing`, so a circular corner is 2 and a fully continuous one
-/// approaches 4.
-///
-/// A `Line` has no area and draws nothing, so it returns `None`.
-fn box_shape(shape: &ShapeData) -> Result<Option<Boxed>, RenderError> {
-    let boxed = match shape {
-        ShapeData::Rect(r) => {
-            let half = [f32_f64(r.width() / 2.0), f32_f64(r.height() / 2.0)];
-            Boxed {
-                extra: Affine::translate(r.center().to_vec2()),
-                shape: Shape::rect(half),
-                bounds: rect_around_origin(half),
-            }
-        }
-        ShapeData::RoundedRect(rr) => {
-            let r = rr.rect();
-            let half = [f32_f64(r.width() / 2.0), f32_f64(r.height() / 2.0)];
-            let radii = clamped_radii(rr.radii(), half);
-            Boxed {
-                extra: Affine::translate(r.center().to_vec2()),
-                shape: Shape {
-                    half,
-                    aspect: 1.0,
-                    exponent: 2.0,
-                    radii,
-                },
-                bounds: rect_around_origin(half),
-            }
-        }
-        ShapeData::Continuous(c) => {
-            let r = c.rect;
-            let half = [f32_f64(r.width() / 2.0), f32_f64(r.height() / 2.0)];
-            let radii = clamped_radii(c.radii, half);
-            Boxed {
-                extra: Affine::translate(r.center().to_vec2()),
-                shape: Shape {
-                    half,
-                    aspect: 1.0,
-                    exponent: f32_f64(c.smoothing).clamp(0.0, 1.0).mul_add(2.0, 2.0),
-                    radii,
-                },
-                bounds: rect_around_origin(half),
-            }
-        }
-        ShapeData::Circle(c) => {
-            let r = c.radius;
-            if r <= 0.0 {
-                return Ok(None);
-            }
-            let half = [f32_f64(r), f32_f64(r)];
-            Boxed {
-                extra: Affine::translate(c.center.to_vec2()),
-                shape: Shape {
-                    half,
-                    aspect: 1.0,
-                    exponent: 2.0,
-                    radii: [f32_f64(r); 4],
-                },
-                bounds: rect_around_origin(half),
-            }
-        }
-        ShapeData::Ellipse(e) => {
-            let radii_v = e.radii();
-            let (a, b) = (radii_v.x, radii_v.y);
-            if a <= 0.0 {
-                return Ok(None);
-            }
-            let half = [f32_f64(a), f32_f64(b)];
-            Boxed {
-                extra: Affine::translate(e.center().to_vec2()) * Affine::rotate(e.rotation()),
-                shape: Shape {
-                    half,
-                    aspect: f32_f64(b / a),
-                    exponent: 2.0,
-                    radii: [f32_f64(a); 4],
-                },
-                bounds: rect_around_origin(half),
-            }
-        }
-        ShapeData::Line(_) => return Ok(None),
-        ShapeData::Path { .. } => return Err(RenderError::Unsupported(names::PATH)),
-    };
-    Ok(Some(boxed))
-}
-
 /// f64 to f32; instance data is f32 by design.
 #[expect(clippy::cast_possible_truncation)]
 const fn f32_f64(v: f64) -> f32 {
     v as f32
 }
 
-fn rect_around_origin(half: [f32; 2]) -> Rect {
-    Rect::new(
-        -f64::from(half[0]),
-        -f64::from(half[1]),
-        f64::from(half[0]),
-        f64::from(half[1]),
-    )
-}
-
-fn clamped_radii(radii: kurbo::RoundedRectRadii, half: [f32; 2]) -> [f32; 4] {
-    let limit = f64::from(half[0].min(half[1]));
-    [
-        f32_f64(radii.top_left.clamp(0.0, limit)),
-        f32_f64(radii.top_right.clamp(0.0, limit)),
-        f32_f64(radii.bottom_right.clamp(0.0, limit)),
-        f32_f64(radii.bottom_left.clamp(0.0, limit)),
-    ]
-}
-
-/// One device pixel in local space, for antialiasing margins: `2 / lmin`
-/// where `lmin` is the smaller column norm of the 2x2. A degenerate
-/// transform (`lmin` ~ 0) draws nothing, so the margin is 0.
 fn aa_margin(transform: Affine) -> f64 {
     let [c0, c1, c2, c3, _, _] = transform.as_coeffs();
     let lmin = c0.hypot(c1).min(c2.hypot(c3));
@@ -369,7 +233,7 @@ const fn variant_of(inst: &Instance) -> ShaderVariant {
 /// space: the fill's rounded box minus its corner squares, as the union of
 /// `wide` (corner rows excluded) and `tall` (corner columns excluded).
 /// Both are inset by an antialiasing margin so the fill's edge pixels stay.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 struct Cover {
     wide: Rect,
     tall: Rect,
@@ -424,176 +288,19 @@ fn cover_strips(b: Rect, c: Cover) -> impl Iterator<Item = Rect> {
     rects.into_iter().filter(move |r| nonempty(*r))
 }
 
-/// The blur sigma the shader integrates against, modelling the oracle's
-/// pixel-area sampling: `sqrt(sigma² + 1/12)` for a positive sigma.
-fn shadow_sigma(sigma: f64) -> f64 {
-    if sigma > 0.0 {
-        sigma.mul_add(sigma, 1.0 / 12.0).sqrt()
-    } else {
-        sigma
-    }
-}
+/// A layer's retained content and device output.
+pub type ContentData = cherenkov::lowering::Content<Op, Emission>;
 
-/// Exact `2.0`/`1.0` comparisons: these fields only ever hold the constants
-/// [`box_shape`] assigns.
-#[expect(clippy::float_cmp)]
-fn shape_is_offsettable(shape: Shape) -> bool {
-    shape.exponent == 2.0 && shape.aspect == 1.0
-}
-
-/// The paint data shared by every instance kind.
-#[derive(Default)]
-struct PaintData {
-    kind: u32,
-    color: [f32; 4],
-    grad: [f32; 4],
-    grad2: [f32; 4],
-    first_stop: u32,
-    /// `count | interp << 16 | extend << 20`; for `PAINT_IMAGE`,
-    /// `extend_x | extend_y << 4 | sampling << 8`.
-    packed: u32,
-    /// The bound image for `PAINT_IMAGE`.
+/// Per-operation device output under its sampled placement.
+pub struct Emission {
+    pub(crate) pending_cells: Vec<(u32, u32, u32)>,
+    cover: Option<Cover>,
+    transform: Affine,
+    size: [f32; 2],
+    generation: u64,
+    pub(crate) instances: Vec<Instance>,
+    stops: Vec<Stop>,
     image: Option<u64>,
-}
-
-/// sRGB-encodes one channel, preserving sign.
-fn srgb_encode(x: f32) -> f32 {
-    let e = if x.abs() <= 0.003_130_8 {
-        x.abs() * 12.92
-    } else {
-        1.055f32.mul_add(x.abs().powf(1.0 / 2.4), -0.055)
-    };
-    e.copysign(x)
-}
-
-fn push_stops(
-    stops: &mut Vec<Stop>,
-    gradient_stops: &[cherenkov::ColorStop],
-    interpolation: Interpolation,
-    extend: Extend,
-) -> (u32, u32) {
-    let first = u32::try_from(stops.len()).unwrap_or(u32::MAX);
-    let mut sorted = gradient_stops.to_vec();
-    sorted.sort_by(|a, b| a.offset.total_cmp(&b.offset));
-    let count = u32::try_from(sorted.len().min(0xffff)).unwrap_or(0xffff);
-    for stop in sorted.iter().take(count as usize) {
-        let [r, g, b, a] = stop.color.components;
-        let color = if interpolation == Interpolation::SrgbEncoded {
-            let [sr, sg, sb] = [
-                P3_TO_SRGB[0][0].mul_add(r, P3_TO_SRGB[0][1].mul_add(g, P3_TO_SRGB[0][2] * b)),
-                P3_TO_SRGB[1][0].mul_add(r, P3_TO_SRGB[1][1].mul_add(g, P3_TO_SRGB[1][2] * b)),
-                P3_TO_SRGB[2][0].mul_add(r, P3_TO_SRGB[2][1].mul_add(g, P3_TO_SRGB[2][2] * b)),
-            ];
-            [srgb_encode(sr), srgb_encode(sg), srgb_encode(sb), a]
-        } else {
-            [r, g, b, a]
-        };
-        stops.push(Stop {
-            color,
-            offset: stop.offset,
-            pad: [0.0; 3],
-        });
-    }
-    let interp = match interpolation {
-        Interpolation::Working => INTERP_WORKING,
-        Interpolation::SrgbEncoded => INTERP_SRGB,
-    };
-    (first, count | (interp << 16) | (extend_code(extend) << 20))
-}
-
-const fn extend_code(extend: Extend) -> u32 {
-    match extend {
-        Extend::Pad => EXTEND_PAD,
-        Extend::Repeat => EXTEND_REPEAT,
-        Extend::Reflect => EXTEND_REFLECT,
-        Extend::None => EXTEND_NONE,
-    }
-}
-
-/// Lowers a paint; `to_local` maps content space to the instance's local
-/// (shape-centred) space in which the shader evaluates gradient parameters.
-#[expect(
-    clippy::cast_precision_loss,
-    clippy::many_single_char_names,
-    reason = "image dimensions fit f32; affine coefficients are conventionally a..f"
-)]
-fn paint_data(
-    paint: &Paint,
-    to_local: Affine,
-    stops: &mut Vec<Stop>,
-    images: &HashMap<u64, GpuImage>,
-) -> Result<PaintData, RenderError> {
-    let mut data = PaintData {
-        kind: PAINT_SOLID,
-        ..PaintData::default()
-    };
-    match paint {
-        Paint::Solid(c) => data.color = c.components,
-        Paint::Linear(g) => {
-            data.kind = PAINT_LINEAR;
-            let start = to_local * g.start;
-            let end = to_local * g.end;
-            data.grad = [
-                f32_f64(start.x),
-                f32_f64(start.y),
-                f32_f64(end.x),
-                f32_f64(end.y),
-            ];
-            let (first, packed) = push_stops(stops, &g.stops, g.interpolation, g.extend);
-            data.first_stop = first;
-            data.packed = packed;
-        }
-        Paint::Radial(g) => {
-            data.kind = PAINT_RADIAL;
-            let c0 = to_local * g.start_center;
-            let c1 = to_local * g.end_center;
-            data.grad = [f32_f64(c0.x), f32_f64(c0.y), f32_f64(c1.x), f32_f64(c1.y)];
-            data.grad2 = [f32_f64(g.start_radius), f32_f64(g.end_radius), 0.0, 0.0];
-            let (first, packed) = push_stops(stops, &g.stops, g.interpolation, g.extend);
-            data.first_stop = first;
-            data.packed = packed;
-        }
-        Paint::Sweep(g) => {
-            data.kind = PAINT_SWEEP;
-            let center = to_local * g.center;
-            data.grad = [f32_f64(center.x), f32_f64(center.y), 0.0, 0.0];
-            data.grad2 = [f32_f64(g.start_angle), f32_f64(g.end_angle), 0.0, 0.0];
-            let (first, packed) = push_stops(stops, &g.stops, g.interpolation, g.extend);
-            data.first_stop = first;
-            data.packed = packed;
-        }
-        Paint::Mesh(_) => return Err(RenderError::Unsupported(names::MESH)),
-        Paint::Image(pattern) => {
-            let img = images.get(&pattern.image.raw()).ok_or_else(|| {
-                RenderError::Image(format!("unregistered image {}", pattern.image.raw()))
-            })?;
-            // `to_local * transform` maps image space to instance-local; the
-            // shader needs the inverse.
-            let [a, b, c, d, e, f] = (to_local * pattern.transform).inverse().as_coeffs();
-            data.kind = PAINT_IMAGE;
-            data.grad = [f32_f64(a), f32_f64(b), f32_f64(c), f32_f64(d)];
-            let (iw, ih) = (img.width as f32, img.height as f32);
-            data.grad2 = [f32_f64(e), f32_f64(f), iw, ih];
-            let sampling = match pattern.sampling {
-                cherenkov::Sampling::Nearest => 0,
-                cherenkov::Sampling::Linear => 1,
-            };
-            data.packed = extend_code(pattern.extend_x)
-                | (extend_code(pattern.extend_y) << 4)
-                | (sampling << 8);
-            data.image = Some(pattern.image.raw());
-        }
-        Paint::Shader(_) => return Err(RenderError::Unsupported(names::SHADER)),
-    }
-    Ok(data)
-}
-
-/// A layer's content.
-pub enum ContentData {
-    /// A shared picture.
-    Picture(cherenkov::Picture),
-    /// A live display list, shared with its `Content` until it changes.
-    List(cherenkov::DisplayList),
 }
 
 /// GPU resources the lowering needs to emit glyph instances.
@@ -614,6 +321,8 @@ pub struct GlyphContext<'a> {
 /// thread to commit before encoding.
 #[derive(Default)]
 pub struct Lowered {
+    pub commands: u32,
+    pub layers: u32,
     /// Glyphs rasterized during the lowering.
     pub glyphs: u32,
     /// Path rasters during the lowering (cache misses).
@@ -644,6 +353,8 @@ pub struct Lowering<'a> {
     pub(crate) mask_patches: Vec<(u32, u32)>,
     /// Atlas writes and cache updates to commit, in lowering order.
     pub(crate) pending: Vec<PendingRaster>,
+    pub commands_lowered: u32,
+    pub layers_composed: u32,
 }
 
 impl<'a> Lowering<'a> {
@@ -662,6 +373,8 @@ impl<'a> Lowering<'a> {
             cell_patches: Vec::new(),
             mask_patches: Vec::new(),
             pending: Vec::new(),
+            commands_lowered: 0,
+            layers_composed: 0,
         }
     }
 
@@ -680,10 +393,17 @@ impl<'a> Lowering<'a> {
     pub fn run(
         &mut self,
         tree: &SurfaceTree,
-        caches: &HashMap<LayerId, ContentData>,
+        caches: &mut HashMap<LayerId, ContentData>,
         clear: WorkingColor,
         glyphs: &GlyphContext<'_>,
     ) -> Result<(), RenderError> {
+        for content in caches.values_mut() {
+            self.commands_lowered += content.prepare(&mut super::prepared::Lowerer {
+                fonts: glyphs.fonts,
+                images: glyphs.images,
+                pending: &mut self.pending,
+            })?;
+        }
         let [r, g, b, a] = clear.components;
         self.begin_pass(Target::Surface, Some([r * a, g * a, b * a, a]));
         self.layer(tree.root(), tree, caches, glyphs)?;
@@ -911,6 +631,7 @@ impl<'a> Lowering<'a> {
         glyphs: &GlyphContext<'_>,
     ) -> Result<bool, RenderError> {
         let snap = self.frame.snapshot();
+        let patches = (self.cell_patches.len(), self.mask_patches.len());
         let depth = self.depth;
         let clip = self.clip;
         let transform = self.transform;
@@ -923,6 +644,8 @@ impl<'a> Lowering<'a> {
             return Ok(true);
         }
         self.frame.restore(snap);
+        self.cell_patches.truncate(patches.0);
+        self.mask_patches.truncate(patches.1);
         self.depth = depth;
         self.clip = clip;
         self.transform = transform;
@@ -975,7 +698,13 @@ impl<'a> Lowering<'a> {
     const fn base(&self, kind: u32, local_to_device: [f32; 8]) -> Instance {
         let mut inst = Instance::new(kind);
         inst.affine = local_to_device;
-        if let Some(clip) = &self.clip {
+        Self::apply_clip(&mut inst, self.clip);
+        inst
+    }
+
+    /// Clip state belongs to composition; coverage and glyph atlas UVs remain retained.
+    const fn apply_clip(inst: &mut Instance, clip: Option<DeviceClip>) {
+        if let Some(clip) = clip {
             inst.clip_inv = affine(clip.inv);
             inst.clip = clip.shape;
             inst.meta[3] |= FLAG_HAS_CLIP << 24;
@@ -995,50 +724,6 @@ impl<'a> Lowering<'a> {
                 }
             }
         }
-        inst
-    }
-
-    /// Emits a shaped instance: paint evaluated in local space, bounds the
-    /// local quad, `margin` inflation.
-    #[expect(clippy::too_many_arguments)]
-    fn emit(
-        &mut self,
-        kind: u32,
-        boxed: &Boxed,
-        shape: Shape,
-        inner: Option<Shape>,
-        margin: f64,
-        paint: &Paint,
-        param_x: f32,
-        flags: u32,
-        glyphs: &GlyphContext<'_>,
-    ) -> Result<(), RenderError> {
-        let b = boxed.bounds.inflate(margin, margin);
-        if b.width() <= 0.0 || b.height() <= 0.0 {
-            return Ok(());
-        }
-        let mut inst = self.base(kind, affine(self.transform * boxed.extra));
-        inst.bounds = [f32_f64(b.x0), f32_f64(b.y0), f32_f64(b.x1), f32_f64(b.y1)];
-        inst.shape = shape;
-        if let Some(inner) = inner {
-            inst.inner = inner;
-        }
-        inst.params[0] = param_x;
-        let paint = paint_data(
-            paint,
-            boxed.extra.inverse(),
-            &mut self.frame.stops,
-            glyphs.images,
-        )?;
-        inst.color = paint.color;
-        inst.grad = paint.grad;
-        inst.grad2 = paint.grad2;
-        inst.meta[1] = paint.kind;
-        inst.meta[2] = paint.first_stop;
-        inst.meta[3] |= (paint.packed & 0x00ff_ffff) | (flags << 24);
-        self.set_image(paint.image);
-        self.push_instance(&inst);
-        Ok(())
     }
 
     /// Applies `clip` around `body`, merging axis-aligned rects and
@@ -1161,7 +846,7 @@ impl<'a> Lowering<'a> {
         &mut self,
         id: LayerId,
         tree: &SurfaceTree,
-        caches: &HashMap<LayerId, ContentData>,
+        caches: &mut HashMap<LayerId, ContentData>,
         glyphs: &GlyphContext<'_>,
     ) -> Result<(), RenderError> {
         let node = tree.layer(id);
@@ -1203,17 +888,13 @@ impl<'a> Lowering<'a> {
         id: LayerId,
         node: &cherenkov::LayerNode,
         tree: &SurfaceTree,
-        caches: &HashMap<LayerId, ContentData>,
+        caches: &mut HashMap<LayerId, ContentData>,
         glyphs: &GlyphContext<'_>,
     ) -> Result<(), RenderError> {
-        match caches.get(&id) {
-            Some(ContentData::List(list)) => {
-                self.commands(list, 0, list.len(), glyphs)?;
-            }
-            Some(ContentData::Picture(p)) => {
-                self.commands(p.display_list(), 0, p.display_list().len(), glyphs)?;
-            }
-            None => {}
+        if let Some(content) = caches.get_mut(&id) {
+            let (ops, emissions) = content.prepared();
+            let changed = self.ops(ops, emissions, 0, ops.len(), glyphs)?;
+            self.layers_composed += u32::from(changed);
         }
         for child in &node.children {
             self.layer(*child, tree, caches, glyphs)?;
@@ -1221,208 +902,341 @@ impl<'a> Lowering<'a> {
         Ok(())
     }
 
-    /// Walks commands `[start, end)` of `list`.
-    fn commands(
+    /// Compose retained ops under the sampled layer state. Only invalid leaf
+    /// realizations produce new instances or coverage; scopes assemble passes.
+    fn ops(
         &mut self,
-        list: &DisplayList,
+        ops: &[Op],
+        emissions: &mut [Realization<Emission>],
         mut i: usize,
         end: usize,
         glyphs: &GlyphContext<'_>,
-    ) -> Result<(), RenderError> {
-        let commands = list.commands();
+    ) -> Result<bool, RenderError> {
+        let mut changed = false;
         while i < end {
-            match &commands[i] {
-                Command::Fill { shape, paint } => self.fill(shape, paint, glyphs)?,
-                Command::Stroke {
-                    shape,
-                    stroke,
-                    paint,
-                } => self.stroke(shape, stroke, paint, glyphs)?,
-                Command::Shadow { shape, shadow } => {
-                    let covered = self.shadow_cover(commands.get(i + 1), shape, shadow);
-                    self.shadow(shape, shadow, covered)?;
-                }
-                Command::Glyphs { run, paint } => self.glyph_run(run, paint, glyphs)?,
-                Command::Image {
-                    image,
-                    dst,
-                    sampling,
-                } => self.image_draw(*image, dst, *sampling, glyphs)?,
-                Command::Picture { picture, transform } => {
+            match &ops[i] {
+                Op::BeginClip { local, shape, end } => {
                     let saved = self.transform;
-                    self.transform = saved * *transform;
-                    let list = picture.display_list();
-                    let result = self.commands(list, 0, list.len(), glyphs);
+                    self.transform = saved * *local;
+                    let body = |s: &mut Self, g: &GlyphContext<'_>| {
+                        s.transform = saved;
+                        changed |= s.ops(ops, emissions, i + 1, *end as usize, g)?;
+                        Ok(())
+                    };
+                    match shape {
+                        ClipShape::Empty => {}
+                        ClipShape::Boxed { extra, shape, rect } => {
+                            let clip = DeviceClip {
+                                inv: (self.transform * *extra).inverse(),
+                                shape: *shape,
+                                aligned_rect: rect
+                                    .filter(|_| axis_aligned(self.transform))
+                                    .map(|r| device_rect(self.transform, r)),
+                                mask: None,
+                            };
+                            self.run_clipped(clip, body, glyphs)?;
+                        }
+                        ClipShape::Path { elements, rule, .. } => {
+                            self.with_path_clip(elements, *rule, body, glyphs)?;
+                        }
+                    }
                     self.transform = saved;
-                    result?;
+                    i = *end as usize;
                 }
-                Command::BeginClip { shape, end } => {
-                    let inner_end = (*end as usize).min(commands.len());
-                    self.with_clip(
-                        Some(shape),
-                        |s, glyphs| s.commands(list, i + 1, inner_end, glyphs),
+                Op::BeginIsolate {
+                    opacity,
+                    blend,
+                    end,
+                } => {
+                    self.isolate(
+                        None,
+                        *opacity,
+                        *blend,
+                        |s, g| {
+                            changed |= s.ops(ops, emissions, i + 1, *end as usize, g)?;
+                            Ok(())
+                        },
                         glyphs,
                     )?;
-                    i = inner_end;
+                    i = *end as usize;
                 }
-                Command::BeginTransform { transform, end } => {
-                    let saved = self.transform;
-                    self.transform = saved * *transform;
-                    let inner_end = (*end as usize).min(commands.len());
-                    let result = self.commands(list, i + 1, inner_end, glyphs);
-                    self.transform = saved;
-                    result?;
-                    i = inner_end;
+                Op::End => unreachable!("paired scopes consume their ends"),
+                op => changed |= self.leaf(op, ops.get(i + 1), &mut emissions[i], glyphs)?,
+            }
+            i += 1;
+        }
+        Ok(changed)
+    }
+
+    /// Retain each leaf's instances and gradient stops independently. A dirty
+    /// command drops just its entries; atlas resets invalidate device addresses.
+    fn leaf(
+        &mut self,
+        op: &Op,
+        next: Option<&Op>,
+        cache: &mut Realization<Emission>,
+        glyphs: &GlyphContext<'_>,
+    ) -> Result<bool, RenderError> {
+        let clip = self.clip;
+        let cover = self.shadow_cover(op, next);
+        let hit = cache.valid
+            && cache.data.as_ref().is_some_and(|e| {
+                e.cover == cover
+                    && e.transform == self.transform
+                    && e.size.map(f32::to_bits) == [self.width, self.height].map(f32::to_bits)
+                    && e.generation == glyphs.atlas.generation()
+            });
+        if !hit {
+            let mut frame = Frame::default();
+            if let Some(previous) = cache.data.take() {
+                frame.instances = previous.instances;
+                frame.stops = previous.stops;
+                frame.reset();
+            }
+            let mut compose = Lowering::new(&mut frame, (0, 0));
+            compose.width = self.width;
+            compose.height = self.height;
+            compose.transform = self.transform;
+            compose.begin_pass(Target::Surface, None);
+            compose.realize(op, cover, glyphs)?;
+            self.glyphs += compose.glyphs;
+            self.paths += compose.paths;
+            let image = compose.frame.open.as_ref().expect("leaf pass").image;
+            let pending_base = u32::try_from(self.pending.len()).expect("pending count fits u32");
+            self.pending.append(&mut compose.pending);
+            let pending_cells = compose
+                .cell_patches
+                .iter()
+                .map(|&(i, p, c)| (i, p + pending_base, c))
+                .collect();
+            cache.data = Some(Emission {
+                pending_cells,
+                cover,
+                transform: self.transform,
+                size: [self.width, self.height],
+                generation: glyphs.atlas.generation(),
+                instances: frame.instances,
+                stops: frame.stops,
+                image,
+            });
+        }
+        cache.valid = true;
+        let emission = cache.data.as_ref().expect("leaf realized");
+        let offset = u32::try_from(self.frame.stops.len()).expect("stop count fits u32");
+        self.frame.stops.extend_from_slice(&emission.stops);
+        self.set_image(emission.image);
+        let instance_base =
+            u32::try_from(self.frame.instances.len()).expect("instance count fits u32");
+        for inst in &emission.instances {
+            let mut inst = *inst;
+            inst.meta[2] += offset;
+            Self::apply_clip(&mut inst, clip);
+            self.push_instance(&inst);
+        }
+        self.cell_patches.extend(
+            emission
+                .pending_cells
+                .iter()
+                .map(|&(i, p, c)| (i + instance_base, p, c)),
+        );
+        Ok(!hit)
+    }
+
+    fn resolved_paint(&mut self, paint: &ResolvedPaint) -> PaintData {
+        let mut data = paint.data.clone();
+        data.first_stop += u32::try_from(self.frame.stops.len()).expect("stop count fits u32");
+        self.frame.stops.extend_from_slice(&paint.stops);
+        self.set_image(data.image);
+        data
+    }
+
+    fn realize(
+        &mut self,
+        op: &Op,
+        cover: Option<Cover>,
+        glyphs: &GlyphContext<'_>,
+    ) -> Result<(), RenderError> {
+        match op {
+            Op::Shaped {
+                kind,
+                local,
+                ambient,
+                shape,
+                inner,
+                bounds,
+                extra_margin,
+                paint,
+                param_x,
+                flags,
+            } => {
+                let margin = extra_margin + aa_margin(self.transform * *ambient);
+                let b = bounds.inflate(margin, margin);
+                if b.width() <= 0.0 || b.height() <= 0.0 {
+                    return Ok(());
                 }
-                Command::BeginGroup { group, end } => {
-                    if group.filter.is_some() {
-                        return Err(RenderError::Unsupported(names::FILTER));
-                    }
-                    if group.blend_space != BlendSpace::Linear {
-                        return Err(RenderError::Unsupported(names::BLEND_SPACE));
-                    }
-                    let inner_end = (*end as usize).min(commands.len());
-                    if group.opacity >= 1.0 && group.blend == BlendMode::Normal {
-                        self.commands(list, i + 1, inner_end, glyphs)?;
-                    } else {
-                        self.isolate(
-                            None,
-                            group.opacity,
-                            group.blend,
-                            |s, glyphs| s.commands(list, i + 1, inner_end, glyphs),
+                let mut inst = self.base(*kind, affine(self.transform * *local));
+                inst.bounds = [f32_f64(b.x0), f32_f64(b.y0), f32_f64(b.x1), f32_f64(b.y1)];
+                inst.shape = *shape;
+                if let Some(inner) = inner {
+                    inst.inner = *inner;
+                }
+                inst.params[0] = *param_x;
+                let paint = self.resolved_paint(paint);
+                inst.color = paint.color;
+                inst.grad = paint.grad;
+                inst.grad2 = paint.grad2;
+                inst.meta[1] = paint.kind;
+                inst.meta[2] = paint.first_stop;
+                inst.meta[3] |= (paint.packed & 0x00ff_ffff) | (flags << 24);
+                self.push_shaped(inst, self.transform * *local, *bounds, margin);
+            }
+            Op::Shadow {
+                local,
+                ambient,
+                shape,
+                bounds,
+                sigma_eff,
+                color,
+            } => {
+                let margin = sigma_eff.mul_add(3.0, 1.0) + aa_margin(self.transform * *ambient);
+                let b = bounds.inflate(margin, margin);
+                let mut inst = self.base(KIND_SHADOW, affine(self.transform * *local));
+                inst.bounds = [f32_f64(b.x0), f32_f64(b.y0), f32_f64(b.x1), f32_f64(b.y1)];
+                inst.shape = *shape;
+                inst.params[0] = f32_f64(*sigma_eff);
+                inst.color = *color;
+                inst.meta[1] = PAINT_SOLID;
+                self.push_shadow_quads(&inst, b, cover);
+            }
+            Op::Path {
+                local,
+                content,
+                rule,
+                outline,
+                paint,
+            } => {
+                self.transform *= *local;
+                match outline {
+                    Outline::Fill(elements) => self.path(
+                        *content,
+                        *rule,
+                        || BezPath::from_vec(elements.to_vec()),
+                        paint,
+                        glyphs,
+                    )?,
+                    Outline::Stroke { shape, stroke } => {
+                        let tol = path::FLATTEN / path::sigma_max(self.transform).max(1e-12);
+                        let content = path::hash_stroke(shape, stroke, tol);
+                        self.path(
+                            content,
+                            *rule,
+                            || {
+                                let path =
+                                    path::shape_path(shape, tol).expect("supported stroke shape");
+                                kurbo::stroke(path, stroke, &kurbo::StrokeOpts::default(), tol)
+                            },
+                            paint,
                             glyphs,
                         )?;
                     }
-                    i = inner_end;
                 }
-                Command::End => {}
             }
-            i += 1;
+            Op::Glyphs { local, run, paint } => {
+                self.transform *= *local;
+                self.glyph_run(run, paint, glyphs)?;
+            }
+            _ => unreachable!("scope is composed, never realized as a leaf"),
         }
         Ok(())
     }
 
-    /// `Fill`: a shaped quad inflated by the antialiasing margin; a path
-    /// goes through the coverage rasterizer.
-    fn fill(
-        &mut self,
-        shape: &ShapeData,
-        paint: &Paint,
-        glyphs: &GlyphContext<'_>,
-    ) -> Result<(), RenderError> {
-        if let ShapeData::Path { elements, rule } = shape {
-            let content = path::hash_elements(elements, fill_tag(*rule));
-            return self.path(
-                content,
-                *rule,
-                || BezPath::from_vec(elements.clone()),
-                paint,
-                glyphs,
-            );
-        }
-        let Some(boxed) = box_shape(shape)? else {
-            return Ok(());
+    /// A following opaque box hides a rectangle inside each pair of its corner rows.
+    #[expect(
+        clippy::float_cmp,
+        reason = "occlusion requires exact opacity and matching axes"
+    )]
+    fn shadow_cover(&self, op: &Op, next: Option<&Op>) -> Option<Cover> {
+        let Op::Shadow { local, .. } = op else {
+            return None;
         };
-        let margin = aa_margin(self.transform);
-        // A large axis-aligned box fill shades a full interior of
-        // coverage 1: emit the guaranteed-covered device rect as one
-        // `KIND_SPAN` and only the four border strips as `KIND_FILL`s.
-        let to_device = self.transform * boxed.extra;
-        let [ta, tb, tc, td, te, tf] = to_device.as_coeffs();
-        if tb == 0.0 && tc == 0.0 && ta != 0.0 && td != 0.0 {
-            let max_r = boxed.shape.radii.iter().copied().fold(0.0, f32::max);
-            let inner =
-                rect_around_origin(boxed.shape.half).inset(-(f64::from(max_r) + margin + 1.0));
-            let (dx0, dx1) = if ta >= 0.0 {
-                (ta.mul_add(inner.x0, te), ta.mul_add(inner.x1, te))
-            } else {
-                (ta.mul_add(inner.x1, te), ta.mul_add(inner.x0, te))
-            };
-            let (dy0, dy1) = if td >= 0.0 {
-                (td.mul_add(inner.y0, tf), td.mul_add(inner.y1, tf))
-            } else {
-                (td.mul_add(inner.y1, tf), td.mul_add(inner.y0, tf))
-            };
-            if (dx1 - dx0) * (dy1 - dy0) >= 4096.0 {
-                let span = Rect::new(dx0.ceil(), dy0.ceil(), dx1.floor(), dy1.floor());
-                if span.width() > 0.0 && span.height() > 0.0 {
-                    return self.fill_span(&boxed, to_device, span, margin, paint, glyphs);
-                }
-            }
-        }
-        self.emit(
-            KIND_FILL,
-            &boxed,
-            boxed.shape,
-            None,
-            margin,
+        let Some(Op::Shaped {
+            kind: KIND_FILL,
+            local: fill,
+            ambient,
+            shape,
+            bounds,
             paint,
-            0.0,
-            0,
-            glyphs,
-        )
+            flags: 0,
+            ..
+        }) = next
+        else {
+            return None;
+        };
+        if paint.data.kind != PAINT_SOLID || paint.data.color[3] != 1.0 {
+            return None;
+        }
+        let relative = local.inverse() * *fill;
+        let [a, b, c, d, x, y] = relative.as_coeffs();
+        if [a, b, c, d] != [1.0, 0.0, 0.0, 1.0] {
+            return None;
+        }
+        let max_r = f64::from(shape.radii.iter().copied().fold(0.0, f32::max));
+        let m = aa_margin(self.transform * *ambient) + 1.0;
+        Some(Cover {
+            wide: bounds.inset((-m, -(max_r + m))) + Vec2::new(x, y),
+            tall: bounds.inset((-(max_r + m), -m)) + Vec2::new(x, y),
+        })
     }
 
-    /// The box `covered` split of `fill`: one device-space `KIND_SPAN` for
-    /// the interior plus up to four `KIND_FILL` border strips of `b \ c`,
-    /// where `c` is the span's local-space pre-image. Every piece carries
-    /// the same shape, clip/mask flags, opacity and paint fields, so the
-    /// fragment result is identical — only the fragment count drops.
-    fn fill_span(
-        &mut self,
-        boxed: &Boxed,
-        to_device: Affine,
-        span: Rect,
-        margin: f64,
-        paint: &Paint,
-        glyphs: &GlyphContext<'_>,
-    ) -> Result<(), RenderError> {
-        let paint = paint_data(
-            paint,
-            boxed.extra.inverse(),
-            &mut self.frame.stops,
-            glyphs.images,
-        )?;
-        self.set_image(paint.image);
-        let apply = |inst: &mut Instance, bounds: [f32; 4]| {
-            inst.bounds = bounds;
-            inst.shape = boxed.shape;
-            inst.color = paint.color;
-            inst.grad = paint.grad;
-            inst.grad2 = paint.grad2;
-            inst.meta[1] = paint.kind;
-            inst.meta[2] = paint.first_stop;
-            inst.meta[3] |= paint.packed & 0x00ff_ffff;
-        };
-        let mut inst = self.base(KIND_SPAN, affine(to_device));
-        apply(
-            &mut inst,
-            [
-                f32_f64(span.x0),
-                f32_f64(span.y0),
-                f32_f64(span.x1),
-                f32_f64(span.y1),
-            ],
+    /// Split a large aligned fill into its full-coverage interior and antialiased border.
+    #[expect(
+        clippy::float_cmp,
+        reason = "the span split requires exact axis alignment"
+    )]
+    fn push_shaped(&mut self, mut inst: Instance, to_device: Affine, bounds: Rect, margin: f64) {
+        let [a, b, c, d, e, f] = to_device.as_coeffs();
+        if inst.meta[0] != KIND_FILL || b != 0.0 || c != 0.0 || a == 0.0 || d == 0.0 {
+            self.push_instance(&inst);
+            return;
+        }
+        let radius = f64::from(inst.shape.radii.iter().copied().fold(0.0, f32::max));
+        let inner = bounds.inset(-(radius + margin + 1.0));
+        let device = device_rect(to_device, inner);
+        let span = Rect::new(
+            device.x0.ceil(),
+            device.y0.ceil(),
+            device.x1.floor(),
+            device.y1.floor(),
         );
+        if inner.width() <= 0.0
+            || inner.height() <= 0.0
+            || device.area() < 4096.0
+            || span.width() <= 0.0
+            || span.height() <= 0.0
+        {
+            self.push_instance(&inst);
+            return;
+        }
+        inst.meta[0] = KIND_SPAN;
+        inst.bounds = [
+            f32_f64(span.x0),
+            f32_f64(span.y0),
+            f32_f64(span.x1),
+            f32_f64(span.y1),
+        ];
         self.push_instance(&inst);
-        // The span's device rect back in local space: `to_device` is
-        // axis-aligned, so invert each axis independently.
-        let [ta, _, _, td, te, tf] = to_device.as_coeffs();
-        let (cx0, cx1) = if ta >= 0.0 {
-            ((span.x0 - te) / ta, (span.x1 - te) / ta)
+        let (x0, x1) = if a >= 0.0 {
+            ((span.x0 - e) / a, (span.x1 - e) / a)
         } else {
-            ((span.x1 - te) / ta, (span.x0 - te) / ta)
+            ((span.x1 - e) / a, (span.x0 - e) / a)
         };
-        let (cy0, cy1) = if td >= 0.0 {
-            ((span.y0 - tf) / td, (span.y1 - tf) / td)
+        let (y0, y1) = if d >= 0.0 {
+            ((span.y0 - f) / d, (span.y1 - f) / d)
         } else {
-            ((span.y1 - tf) / td, (span.y0 - tf) / td)
+            ((span.y1 - f) / d, (span.y0 - f) / d)
         };
-        let c = Rect::new(cx0, cy0, cx1, cy1);
-        let b = boxed.bounds.inflate(margin, margin);
-        let mut inst = self.base(KIND_FILL, affine(to_device));
-        apply(&mut inst, [0.0; 4]);
-        for strip in border_strips(b, c)
+        inst.meta[0] = KIND_FILL;
+        for strip in border_strips(bounds.inflate(margin, margin), Rect::new(x0, y0, x1, y1))
             .into_iter()
             .filter(|r| r.width() > 0.0 && r.height() > 0.0)
         {
@@ -1434,278 +1248,6 @@ impl<'a> Lowering<'a> {
             ];
             self.push_instance(&inst);
         }
-        Ok(())
-    }
-
-    /// `Image`: a fill of `dst` whose paint maps the rect onto the whole
-    /// image, pad-extended, like the oracle's `Draw::Image`.
-    fn image_draw(
-        &mut self,
-        image: ImageId,
-        dst: &Rect,
-        sampling: cherenkov::Sampling,
-        glyphs: &GlyphContext<'_>,
-    ) -> Result<(), RenderError> {
-        let img = glyphs
-            .images
-            .get(&image.raw())
-            .ok_or_else(|| RenderError::Image(format!("unregistered image {}", image.raw())))?;
-        let (iw, ih) = (f64::from(img.width), f64::from(img.height));
-        let (dw, dh) = (dst.x1 - dst.x0, dst.y1 - dst.y0);
-        if dw <= 0.0 || dh <= 0.0 {
-            return Ok(());
-        }
-        let transform =
-            Affine::translate((dst.x0, dst.y0)) * Affine::scale_non_uniform(dw / iw, dh / ih);
-        let paint = Paint::Image(ImagePattern {
-            image,
-            transform,
-            extend_x: Extend::Pad,
-            extend_y: Extend::Pad,
-            sampling,
-        });
-        self.fill(&ShapeData::Rect(*dst), &paint, glyphs)
-    }
-
-    /// `Stroke`: offset strokes for circular-corner boxes, distance strokes
-    /// for continuous corners and ellipses, a box fast path for lines.
-    fn stroke(
-        &mut self,
-        shape: &ShapeData,
-        stroke: &kurbo::Stroke,
-        paint: &Paint,
-        glyphs: &GlyphContext<'_>,
-    ) -> Result<(), RenderError> {
-        // Path strokes and dashed strokes rasterize the stroked outline.
-        if matches!(shape, ShapeData::Path { .. }) || !stroke.dash_pattern.is_empty() {
-            if matches!(shape, ShapeData::Continuous(_)) {
-                return Err(RenderError::Unsupported(names::PATH));
-            }
-            let tol = path::FLATTEN / path::sigma_max(self.transform).max(1e-12);
-            let content = path::hash_stroke(shape, stroke, tol);
-            return self.path(
-                content,
-                FillRule::NonZero,
-                || {
-                    let outline_path = path::shape_path(shape, tol)
-                        .expect("shape_path is Some for non-Continuous shapes");
-                    kurbo::stroke(outline_path, stroke, &kurbo::StrokeOpts::default(), tol)
-                },
-                paint,
-                glyphs,
-            );
-        }
-        let hw = stroke.width / 2.0;
-        if let ShapeData::Line(line) = shape {
-            return self.stroke_line(line, hw, stroke, paint, glyphs);
-        }
-        let Some(boxed) = box_shape(shape)? else {
-            return Ok(());
-        };
-        let margin = hw + aa_margin(self.transform);
-        if shape_is_offsettable(boxed.shape) {
-            // Offset stroke: outer minus inner.
-            let mut outer = boxed.shape;
-            for h in &mut outer.half {
-                *h += f32_f64(hw);
-            }
-            for r in &mut outer.radii {
-                if *r > 0.0 {
-                    *r += f32_f64(hw);
-                } else {
-                    *r = match stroke.join {
-                        kurbo::Join::Round => f32_f64(hw),
-                        kurbo::Join::Miter => {
-                            if stroke.miter_limit < 1.415 {
-                                return Err(RenderError::Unsupported(names::STROKE_JOIN));
-                            }
-                            0.0
-                        }
-                        kurbo::Join::Bevel => {
-                            return Err(RenderError::Unsupported(names::STROKE_JOIN));
-                        }
-                    };
-                }
-            }
-            let mut inner = boxed.shape;
-            let has_inner = inner.half.iter().all(|h| *h > f32_f64(hw));
-            let inner_opt = if has_inner {
-                for h in &mut inner.half {
-                    *h -= f32_f64(hw);
-                }
-                for r in &mut inner.radii {
-                    *r = (*r - f32_f64(hw)).max(0.0);
-                }
-                Some(inner)
-            } else {
-                None
-            };
-            let flags = if has_inner { FLAG_HAS_INNER } else { 0 };
-            self.emit(
-                KIND_STROKE_OFFSET,
-                &boxed,
-                outer,
-                inner_opt,
-                margin,
-                paint,
-                f32_f64(hw),
-                flags,
-                glyphs,
-            )
-        } else {
-            self.emit(
-                KIND_STROKE_DIST,
-                &boxed,
-                boxed.shape,
-                None,
-                margin,
-                paint,
-                f32_f64(hw),
-                0,
-                glyphs,
-            )
-        }
-    }
-
-    /// A stroked line as a box in the line's local frame.
-    fn stroke_line(
-        &mut self,
-        line: &Line,
-        hw: f64,
-        stroke: &kurbo::Stroke,
-        paint: &Paint,
-        glyphs: &GlyphContext<'_>,
-    ) -> Result<(), RenderError> {
-        if stroke.start_cap != stroke.end_cap {
-            return Err(RenderError::Unsupported(names::STROKE_JOIN));
-        }
-        let d = line.p1 - line.p0;
-        let len = d.hypot();
-        if len <= 0.0 || hw <= 0.0 {
-            return Ok(());
-        }
-        let mid = line.p0 + d * 0.5;
-        let extra = Affine::translate(mid.to_vec2()) * Affine::rotate(d.y.atan2(d.x));
-        let half = match stroke.start_cap {
-            kurbo::Cap::Butt => [f32_f64(len / 2.0), f32_f64(hw)],
-            _ => [f32_f64(len / 2.0 + hw), f32_f64(hw)],
-        };
-        let radii = if stroke.start_cap == kurbo::Cap::Round {
-            [f32_f64(hw); 4]
-        } else {
-            [0.0; 4]
-        };
-        let boxed = Boxed {
-            extra,
-            shape: Shape {
-                half,
-                aspect: 1.0,
-                exponent: 2.0,
-                radii,
-            },
-            bounds: rect_around_origin(half),
-        };
-        self.emit(
-            KIND_FILL,
-            &boxed,
-            boxed.shape,
-            None,
-            aa_margin(self.transform),
-            paint,
-            0.0,
-            0,
-            glyphs,
-        )
-    }
-
-    /// When `commands[i]` is a `Shadow` immediately followed by an
-    /// opaque solid fill of the same shape, the fill covers the shadow
-    /// inside the fill's rounded box minus its corner squares. Returns
-    /// that cover in shadow-local space (shadow local =
-    /// translate(offset) * shape local), or `None` when the next command
-    /// doesn't qualify.
-    #[expect(
-        clippy::float_cmp,
-        reason = "coverage is exact only for a fully opaque fill"
-    )]
-    fn shadow_cover(
-        &self,
-        next: Option<&Command>,
-        shape: &ShapeData,
-        shadow: &cherenkov::Shadow,
-    ) -> Option<Cover> {
-        let Some(Command::Fill {
-            shape: fill_shape,
-            paint,
-        }) = next
-        else {
-            return None;
-        };
-        if fill_shape != shape {
-            return None;
-        }
-        let Paint::Solid(color) = paint else {
-            return None;
-        };
-        if color.components[3] != 1.0 {
-            return None;
-        }
-        let fb = box_shape(fill_shape).ok().flatten()?;
-        let max_r = f64::from(fb.shape.radii.iter().copied().fold(0.0, f32::max));
-        let m = aa_margin(self.transform) + 1.0;
-        let outer = rect_around_origin(fb.shape.half);
-        // `Rect::inset` takes positive insets as an outset; negative
-        // shrinks, matching the single-box cover below.
-        Some(Cover {
-            wide: outer.inset((-m, -(max_r + m))) - shadow.offset,
-            tall: outer.inset((-(max_r + m), -m)) - shadow.offset,
-        })
-    }
-
-    /// `Shadow`: a Gaussian-blurred rounded box, offset and spread.
-    fn shadow(
-        &mut self,
-        shape: &ShapeData,
-        shadow: &cherenkov::Shadow,
-        covered: Option<Cover>,
-    ) -> Result<(), RenderError> {
-        let Some(boxed) = box_shape(shape)? else {
-            return Ok(());
-        };
-        if !shape_is_offsettable(boxed.shape) {
-            return Err(RenderError::Unsupported(names::SHADOW));
-        }
-        let mut s = boxed.shape;
-        let spread = f32_f64(shadow.spread);
-        for h in &mut s.half {
-            *h += spread;
-        }
-        if s.half[0] <= 0.0 || s.half[1] <= 0.0 {
-            // The spread collapsed the box: a zero-area shape casts no
-            // shadow.
-            return Ok(());
-        }
-        for r in &mut s.radii {
-            if *r > 0.0 {
-                *r = (*r + spread).max(0.0);
-            }
-        }
-        let sigma_eff = shadow_sigma(shadow.sigma);
-        let boxed = Boxed {
-            extra: Affine::translate(shadow.offset) * boxed.extra,
-            shape: s,
-            bounds: rect_around_origin(s.half),
-        };
-        let margin = sigma_eff.mul_add(3.0, 1.0) + aa_margin(self.transform);
-        let mut inst = self.base(KIND_SHADOW, affine(self.transform * boxed.extra));
-        let b = boxed.bounds.inflate(margin, margin);
-        inst.bounds = [f32_f64(b.x0), f32_f64(b.y0), f32_f64(b.x1), f32_f64(b.y1)];
-        inst.shape = boxed.shape;
-        inst.params[0] = f32_f64(sigma_eff);
-        inst.color = shadow.color.components;
-        inst.meta[1] = PAINT_SOLID;
-        self.push_shadow_quads(&inst, b, covered);
-        Ok(())
     }
 
     /// Pushes `inst` either as one quad or, when the shadow's local
@@ -1749,7 +1291,7 @@ impl<'a> Lowering<'a> {
         content: u64,
         rule: FillRule,
         make: impl FnOnce() -> BezPath,
-        paint: &Paint,
+        paint: &ResolvedPaint,
         glyphs: &GlyphContext<'_>,
     ) -> Result<(), RenderError> {
         #[expect(
@@ -1804,33 +1346,20 @@ impl<'a> Lowering<'a> {
             });
             (stored, Some(pending))
         };
-        self.replay(&stored, pending, pl.offset, paint, glyphs)
+        self.replay(&stored, pending, pl.offset, paint);
+        Ok(())
     }
 
     /// Replays a cached path emission: `KIND_SPAN` runs and `KIND_GLYPH`
     /// cells at `offset` from their stored rects, painted like glyphs.
-    /// `pending` indexes `GlyphContext::pending` when the emission's
-    /// cells still lack atlas origins — each cell's `uv.xy` is patched
-    /// when the render thread stores it.
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "a surface emits far fewer than u32::MAX instances or cells"
-    )]
     fn replay(
         &mut self,
         emit: &PathEmit,
         pending: Option<u32>,
         offset: Vec2,
-        paint: &Paint,
-        glyphs: &GlyphContext<'_>,
-    ) -> Result<(), RenderError> {
-        let paint = paint_data(
-            paint,
-            Affine::IDENTITY,
-            &mut self.frame.stops,
-            glyphs.images,
-        )?;
-        self.set_image(paint.image);
+        paint: &ResolvedPaint,
+    ) {
+        let paint = self.resolved_paint(paint);
         for rect in &emit.spans {
             let mut inst = self.base(KIND_SPAN, affine(self.transform));
             inst.bounds = [
@@ -1868,7 +1397,6 @@ impl<'a> Lowering<'a> {
                     .push((self.frame.instances.len() as u32 - 1, pending, i as u32));
             }
         }
-        Ok(())
     }
 
     /// A clip with a `Path` shape: the coverage rasterized into one atlas
@@ -1974,66 +1502,14 @@ impl<'a> Lowering<'a> {
     fn glyph_run(
         &mut self,
         run: &GlyphRun,
-        paint: &Paint,
+        paint: &ResolvedPaint,
         glyphs: &GlyphContext<'_>,
     ) -> Result<(), RenderError> {
-        if matches!(run.style, GlyphStyle::Stroke(_)) {
-            return Err(RenderError::Unsupported(names::GLYPH_STROKE));
-        }
         let font = glyphs
             .fonts
             .get(&run.font.raw())
             .ok_or_else(|| RenderError::Font(format!("unregistered font {:?}", run.font)))?;
-        // `upem`/`color_glyphs` are resolved lazily — plain runs never parse
-        // the font here (the rasterizer does it on cache miss).
-        let mut colr_ctx: Option<(skrifa::FontRef<'_>, f64)> = None;
-        let mut colr_checked = false;
         for glyph in &run.glyphs {
-            if glyph.transform.is_some() {
-                return Err(RenderError::Unsupported(names::GLYPH_TRANSFORM));
-            }
-            if !colr_checked {
-                colr_checked = true;
-                let font_ref = skrifa::FontRef::from_index(&font.data, font.index)
-                    .map_err(|e| RenderError::Font(format!("{e}")))?;
-                if font_ref.colr().is_ok() {
-                    let upem = font_ref
-                        .head()
-                        .map_err(|e| RenderError::Font(format!("head: {e}")))?
-                        .units_per_em();
-                    colr_ctx = Some((font_ref, f64::from(upem)));
-                }
-            }
-            if let Some((font_ref, upem)) = colr_ctx.as_ref()
-                && font_ref
-                    .color_glyphs()
-                    .get(skrifa::GlyphId::new(glyph.id))
-                    .is_some()
-            {
-                if *upem <= 0.0 {
-                    return Err(RenderError::Font("zero units_per_em".into()));
-                }
-                let picture = colr::glyph_picture(
-                    font,
-                    run.font.raw(),
-                    glyph.id,
-                    &run.coords,
-                    paint,
-                    &mut self.pending,
-                )?;
-                // `translate(x, y) * scale_non_uniform(size/upem, -size/upem)`
-                // places the font-space picture at the glyph's origin.
-                let s = f64::from(run.size) / upem;
-                let place = Affine::translate((f64::from(glyph.x), f64::from(glyph.y)))
-                    * Affine::scale_non_uniform(s, -s);
-                let saved = self.transform;
-                self.transform = saved * place;
-                let list = picture.display_list();
-                let result = self.commands(list, 0, list.len(), glyphs);
-                self.transform = saved;
-                result?;
-                continue;
-            }
             let o = self.transform * Point::new(f64::from(glyph.x), f64::from(glyph.y));
             let ix = o.x.floor();
             let iy = o.y.floor();
@@ -2060,13 +1536,7 @@ impl<'a> Lowering<'a> {
             let y0 = f32_f64(iy + f64::from(entry.top));
             inst.bounds = [x0, y0, x0 + f32::from(entry.w), y0 + f32::from(entry.h)];
             inst.uv = [f32::from(entry.x), f32::from(entry.y), 0.0, 0.0];
-            let paint_data = paint_data(
-                paint,
-                Affine::IDENTITY,
-                &mut self.frame.stops,
-                glyphs.images,
-            )?;
-            self.set_image(paint_data.image);
+            let paint_data = self.resolved_paint(paint);
             inst.color = paint_data.color;
             inst.grad = paint_data.grad;
             inst.grad2 = paint_data.grad2;
@@ -2084,16 +1554,6 @@ impl<'a> Lowering<'a> {
     }
 }
 
-/// The path cache tag for a fill rule.
-const fn fill_tag(rule: FillRule) -> u64 {
-    match rule {
-        FillRule::NonZero => 0,
-        FillRule::EvenOdd => 1,
-    }
-}
-
-/// Whether the transform's 2x2 is axis-aligned (`b == c == 0`, or a 90°
-/// rotation with `a == d == 0`).
 fn axis_aligned(transform: Affine) -> bool {
     let [c0, c1, c2, c3, _, _] = transform.as_coeffs();
     (c1 == 0.0 && c2 == 0.0) || (c0 == 0.0 && c3 == 0.0)
@@ -2232,6 +1692,26 @@ mod tests {
         pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()
     }
 
+    fn draw(
+        lowering: &mut Lowering<'_>,
+        command: cherenkov::Command,
+        glyphs: &GlyphContext<'_>,
+    ) -> Result<(), RenderError> {
+        use cherenkov::lowering::Compiler as _;
+        let mut pending = Vec::new();
+        let mut compiler = super::super::prepared::Lowerer {
+            fonts: glyphs.fonts,
+            images: glyphs.images,
+            pending: &mut pending,
+        };
+        let mut ops = Vec::new();
+        compiler.draw(&command, Affine::IDENTITY, &mut ops)?;
+        for op in ops {
+            lowering.realize(&op, None, glyphs)?;
+        }
+        Ok(())
+    }
+
     /// An isolated group's composite quad is a `KIND_SPAN`: full coverage
     /// over its device-space region, not an SDF edge that would half-cover
     /// the rim texels.
@@ -2256,16 +1736,22 @@ mod tests {
             .isolate(
                 None,
                 0.5,
-                BlendMode::Normal,
+                cherenkov::BlendMode::Normal,
                 |s, g| {
-                    s.fill(
-                        &ShapeData::Rect(Rect::new(4.0, 4.0, 20.0, 20.0)),
-                        &Paint::Solid(WorkingColor::new([1.0, 0.0, 0.0, 1.0])),
+                    draw(
+                        s,
+                        cherenkov::Command::Fill {
+                            shape: ShapeData::Rect(Rect::new(4.0, 4.0, 20.0, 20.0)),
+                            paint: cherenkov::Paint::Solid(WorkingColor::new([1.0, 0.0, 0.0, 1.0])),
+                        },
                         g,
                     )?;
-                    s.fill(
-                        &ShapeData::Rect(Rect::new(12.0, 12.0, 28.0, 28.0)),
-                        &Paint::Solid(WorkingColor::new([0.0, 0.0, 1.0, 1.0])),
+                    draw(
+                        s,
+                        cherenkov::Command::Fill {
+                            shape: ShapeData::Rect(Rect::new(12.0, 12.0, 28.0, 28.0)),
+                            paint: cherenkov::Paint::Solid(WorkingColor::new([0.0, 0.0, 1.0, 1.0])),
+                        },
                         g,
                     )
                 },
@@ -2286,13 +1772,30 @@ mod tests {
     fn a_collapsed_shadow_emits_no_quads() {
         let mut frame = Frame::default();
         let mut lowering = Lowering::new(&mut frame, (64, 64));
+        let Some((device, _queue)) = device_and_queue() else {
+            return;
+        };
+        let atlas = Atlas::new(&device, u64::MAX);
+        let fonts = HashMap::new();
+        let images = HashMap::new();
+        let glyphs = GlyphContext {
+            atlas: &atlas,
+            fonts: &fonts,
+            images: &images,
+        };
         // Half extents [20, 5]: a spread of -20 inverts both.
         let bar = ShapeData::Rect(kurbo::Rect::new(20.0, 20.0, 60.0, 30.0));
         let collapsed =
             cherenkov::Shadow::new(2.0, WorkingColor::new([0.0, 0.0, 0.0, 1.0])).spread(-20.0);
-        lowering
-            .shadow(&bar, &collapsed, None)
-            .expect("collapsed shadow is not an error");
+        draw(
+            &mut lowering,
+            cherenkov::Command::Shadow {
+                shape: bar.clone(),
+                shadow: collapsed,
+            },
+            &glyphs,
+        )
+        .expect("collapsed shadow is not an error");
         assert!(
             lowering.frame.instances.is_empty(),
             "a collapsed box emits no quad"
@@ -2301,7 +1804,15 @@ mod tests {
         // emits — and its radii clamp at zero rather than going negative.
         let shrunk =
             cherenkov::Shadow::new(2.0, WorkingColor::new([0.0, 0.0, 0.0, 1.0])).spread(-4.0);
-        lowering.shadow(&bar, &shrunk, None).expect("shadow");
+        draw(
+            &mut lowering,
+            cherenkov::Command::Shadow {
+                shape: bar,
+                shadow: shrunk,
+            },
+            &glyphs,
+        )
+        .expect("shadow");
         assert_eq!(lowering.frame.instances.len(), 1);
         assert!(
             lowering.frame.instances[0]

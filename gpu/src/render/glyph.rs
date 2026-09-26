@@ -280,6 +280,10 @@ impl Atlas {
 
     /// Clears every entry without freeing the texture.
     pub fn clear(&mut self) {
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .expect("atlas generation overflow");
         self.map.clear();
         self.paths.clear();
         self.masks.clear();
@@ -479,7 +483,6 @@ impl Atlas {
         self.texture = texture;
         self.view = view;
         self.size = size;
-        self.generation += 1;
         self.clear();
     }
 

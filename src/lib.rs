@@ -30,6 +30,7 @@ mod error;
 mod frame;
 mod glyph;
 mod image;
+pub mod lowering;
 mod message;
 mod paint;
 mod record;

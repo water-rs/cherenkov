@@ -8,6 +8,7 @@
 mod glyph;
 mod lower;
 mod paint;
+mod prepared;
 mod raster;
 
 use std::collections::HashMap;
@@ -181,15 +182,17 @@ impl Renderer for RasterRenderer {
         };
         match content {
             Some(ContentOp::Replace(list)) => {
-                state.layers.insert(layer, ContentData::List(list));
+                state.layers.insert(layer, ContentData::new(list));
             }
             Some(ContentOp::Update(updates)) => {
-                if let Some(ContentData::List(list)) = state.layers.get_mut(&layer) {
-                    let _ = list.apply(updates);
+                if let Some(content) = state.layers.get_mut(&layer) {
+                    content.update(updates);
                 }
             }
             Some(ContentOp::Picture(picture)) => {
-                state.layers.insert(layer, ContentData::Picture(picture));
+                state
+                    .layers
+                    .insert(layer, ContentData::new(picture.display_list().clone()));
             }
             None => {
                 state.layers.remove(&layer);
@@ -251,6 +254,11 @@ impl Renderer for RasterRenderer {
         if pressure == Pressure::Critical {
             self.fonts.shrink_to_fit();
             self.glyph_cache.clear();
+            for surface in self.surfaces.values_mut() {
+                for content in surface.layers.values_mut() {
+                    content.trim();
+                }
+            }
         }
     }
 }
@@ -275,9 +283,11 @@ impl RasterRenderer {
             let Some(surf) = self.surfaces.get_mut(&id) else {
                 return Ok(());
             };
-            let caches = std::mem::take(&mut surf.layers);
+            let mut caches = std::mem::take(&mut surf.layers);
             let mut lowering = Lowering::new(&mut items, surf.size);
-            let result = lowering.run(sf.tree, &caches);
+            let result = lowering.run(sf.tree, &mut caches);
+            stats.commands_lowered += lowering.commands_lowered;
+            stats.layers_composed += lowering.layers_composed;
             glyph_reqs = std::mem::take(&mut lowering.glyphs);
             surf.layers = caches;
             result

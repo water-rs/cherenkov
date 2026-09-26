@@ -76,7 +76,7 @@ pub enum PaintData {
         /// Start and end points in content space.
         end_points: [f32; 4],
         /// Sorted stops.
-        stops: Box<[Stop]>,
+        stops: std::sync::Arc<[Stop]>,
         /// The continuation mode.
         extend: Extend,
         /// The interpolation space.
@@ -91,7 +91,7 @@ pub enum PaintData {
         /// Radii: `r0, r1`.
         radii: [f32; 2],
         /// Sorted stops.
-        stops: Box<[Stop]>,
+        stops: std::sync::Arc<[Stop]>,
         /// The continuation mode.
         extend: Extend,
         /// The interpolation space.
@@ -129,7 +129,7 @@ const fn f32_f64(v: f64) -> f32 {
 
 /// Converts stops into interpolation-space straight-alpha components,
 /// sorted by offset.
-fn stops(stops: &[ColorStop], interpolation: Interpolation) -> Box<[Stop]> {
+fn stops(stops: &[ColorStop], interpolation: Interpolation) -> std::sync::Arc<[Stop]> {
     let mut sorted = stops.to_vec();
     sorted.sort_by(|a, b| a.offset.total_cmp(&b.offset));
     sorted
@@ -294,6 +294,16 @@ fn radial_t(px: f32, py: f32, centres: [f32; 4], radii: [f32; 2]) -> f32 {
 }
 
 impl PaintData {
+    /// Apply sampled device placement without resolving or copying gradient stops.
+    pub fn transformed(&self, transform: Affine) -> Self {
+        let mut paint = self.clone();
+        match &mut paint {
+            Self::Solid(_) => {}
+            Self::Linear { inv, .. } | Self::Radial { inv, .. } => *inv = affine_f32(transform),
+        }
+        paint
+    }
+
     /// Evaluates the paint at device-space pixel centre `(dx, dy)`,
     /// returning premultiplied linear Display P3.
     pub fn eval(&self, dx: f32, dy: f32) -> [f32; 4] {

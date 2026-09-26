@@ -8,6 +8,7 @@ mod glyph;
 mod instance;
 mod lower;
 mod path;
+mod prepared;
 mod raster;
 
 use std::collections::{HashMap, VecDeque};
@@ -929,15 +930,17 @@ impl Renderer for GpuRenderer {
         };
         match content {
             Some(ContentOp::Replace(list)) => {
-                state.layers.insert(layer, ContentData::List(list));
+                state.layers.insert(layer, ContentData::new(list));
             }
             Some(ContentOp::Update(updates)) => {
-                if let Some(ContentData::List(list)) = state.layers.get_mut(&layer) {
-                    let _ = list.apply(updates);
+                if let Some(content) = state.layers.get_mut(&layer) {
+                    content.update(updates);
                 }
             }
             Some(ContentOp::Picture(picture)) => {
-                state.layers.insert(layer, ContentData::Picture(picture));
+                state
+                    .layers
+                    .insert(layer, ContentData::new(picture.display_list().clone()));
             }
             None => {
                 state.layers.remove(&layer);
@@ -1361,7 +1364,7 @@ impl GpuRenderer {
         surf.frame.reset();
         // Lowering borrows `layers` immutably while mutating `frame`;
         // taking the map out keeps the two borrows disjoint.
-        let layers = std::mem::take(&mut surf.layers);
+        let mut layers = std::mem::take(&mut surf.layers);
         let mut lowered = Lowered::default();
         let result = {
             let glyphs = GlyphContext {
@@ -1370,7 +1373,9 @@ impl GpuRenderer {
                 images,
             };
             let mut lowering = Lowering::new(&mut surf.frame, surf.size);
-            let result = lowering.run(frame.tree, &layers, frame.clear, &glyphs);
+            let result = lowering.run(frame.tree, &mut layers, frame.clear, &glyphs);
+            lowered.commands = lowering.commands_lowered;
+            lowered.layers = lowering.layers_composed;
             lowered.glyphs = lowering.glyphs_rasterized();
             lowered.paths = lowering.paths_rasterized();
             lowered.cell_patches = std::mem::take(&mut lowering.cell_patches);
@@ -1392,22 +1397,30 @@ impl GpuRenderer {
         for raster in pending {
             origins.push(self.apply_raster(raster)?);
         }
+        let cell_origin = |p: u32, c: u32| {
+            let PendingOrigin::Cells(cells) = &origins[p as usize] else {
+                unreachable!("cell patch must reference cell raster");
+            };
+            let (x, y) = cells[c as usize];
+            [f32::from(x), f32::from(y)]
+        };
         for (inst, p, c) in lowered.cell_patches.drain(..) {
-            let Some(PendingOrigin::Cells(cells)) = origins.get(p as usize) else {
-                continue;
-            };
-            let Some(&(x, y)) = cells.get(c as usize) else {
-                continue;
-            };
-            surf.frame.instances[inst as usize].uv[0] = x as f32;
-            surf.frame.instances[inst as usize].uv[1] = y as f32;
+            let [x, y] = cell_origin(p, c);
+            surf.frame.instances[inst as usize].uv[..2].copy_from_slice(&[x, y]);
+        }
+        for content in surf.layers.values_mut() {
+            let (_, emissions) = content.prepared();
+            for emission in emissions.iter_mut().filter_map(|e| e.data.as_mut()) {
+                for (inst, p, c) in emission.pending_cells.drain(..) {
+                    emission.instances[inst as usize].uv[..2].copy_from_slice(&cell_origin(p, c));
+                }
+            }
         }
         for (inst, p) in lowered.mask_patches.drain(..) {
-            let Some(PendingOrigin::Mask([x, y])) = origins.get(p as usize) else {
-                continue;
+            let PendingOrigin::Mask(origin) = &origins[p as usize] else {
+                unreachable!("mask patch must reference mask raster");
             };
-            surf.frame.instances[inst as usize].uv[2] = *x;
-            surf.frame.instances[inst as usize].uv[3] = *y;
+            surf.frame.instances[inst as usize].uv[2..].copy_from_slice(origin);
         }
         Ok(())
     }
@@ -1466,7 +1479,15 @@ impl GpuRenderer {
         globals_base: u32,
         lowered: Result<Lowered, RenderError>,
     ) -> Result<(), RenderError> {
-        let Lowered { glyphs, paths, .. } = lowered?;
+        let Lowered {
+            glyphs,
+            paths,
+            commands,
+            layers,
+            ..
+        } = lowered?;
+        stats.commands_lowered += commands;
+        stats.layers_composed += layers;
         stats.glyphs_rasterized += glyphs;
         stats.paths_rasterized += paths;
         // Grow the query set lazily when this frame's passes exceed its

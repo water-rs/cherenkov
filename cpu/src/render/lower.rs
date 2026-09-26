@@ -4,26 +4,25 @@
 //! Lowering: a surface's layer tree and display lists become one flat list
 //! of rasterization [`Item`]s in device space.
 
+use cherenkov::lowering::Realization;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use cherenkov::kurbo::{Affine, BezPath, PathEl, Point, Rect};
-use cherenkov::{
-    BlendMode, BlendSpace, Command, ContinuousRect, DisplayList, FillRule, GlyphRun, GlyphStyle,
-    Paint, ShapeData,
-};
+use cherenkov::{BlendMode, ContinuousRect, FillRule, GlyphRun, GlyphStyle, ShapeData};
 
 use cherenkov::{LayerId, RenderError, SurfaceTree};
 
+use super::prepared::Op;
 use crate::names;
-use crate::render::paint::{PaintData, paint_data};
+use crate::render::paint::PaintData;
 use crate::render::raster::{Edge, coverage_mask};
 
 /// Curve-to-path and stroke tolerance in device pixels.
 pub const FLATTEN_TOL: f64 = 0.02;
 
 /// An integer device-space rectangle (x ∈ `[x0, x1)`, y ∈ `[y0, y1)`).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IRect {
     /// Left edge.
     pub x0: i32,
@@ -37,7 +36,7 @@ pub struct IRect {
 
 /// A rasterized clip: an integer rect fast path or a full-surface
 /// coverage mask.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum ClipMask {
     /// Axis-aligned rect with integer edges: coverage is 1 inside, 0
     /// outside.
@@ -50,7 +49,7 @@ pub enum ClipMask {
 pub type ClipRef = Arc<ClipMask>;
 
 /// One rasterization item of a lowered frame.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum Item {
     /// A filled, flattened polygon.
     Draw {
@@ -105,12 +104,23 @@ pub enum Item {
     },
 }
 
-/// A layer's content.
-pub enum ContentData {
-    /// A shared picture.
-    Picture(cherenkov::Picture),
-    /// A live display list.
-    List(DisplayList),
+/// A layer's retained content and device output.
+pub type ContentData = cherenkov::lowering::Content<Op, Emission>;
+
+/// Per-operation device output under its sampled placement.
+pub enum Emission {
+    /// Rasterization items of a drawing operation.
+    Draw(DeviceData<Vec<Item>>),
+    /// Combined coverage of a clipping operation; None clips everything away.
+    Clip(DeviceData<Option<ClipRef>>),
+}
+
+/// Device placement paired with its realized output.
+pub struct DeviceData<T> {
+    transform: Affine,
+    clip: Option<ClipRef>,
+    size: (usize, usize),
+    output: T,
 }
 
 /// A glyph mask request lowering emits: everything needed to rasterize
@@ -143,6 +153,10 @@ pub struct Lowering<'a> {
     height: usize,
     transform: Affine,
     clip: Option<ClipRef>,
+    /// Source commands resolved this frame.
+    pub commands_lowered: u32,
+    /// Content layers composed this frame.
+    pub layers_composed: u32,
 }
 
 /// The largest singular value of `t`'s linear part — the worst-case factor
@@ -395,6 +409,8 @@ impl<'a> Lowering<'a> {
             height: size.1 as usize,
             transform: Affine::IDENTITY,
             clip: None,
+            commands_lowered: 0,
+            layers_composed: 0,
         }
     }
 
@@ -404,8 +420,11 @@ impl<'a> Lowering<'a> {
     pub fn run(
         &mut self,
         tree: &SurfaceTree,
-        caches: &HashMap<LayerId, ContentData>,
+        caches: &mut HashMap<LayerId, ContentData>,
     ) -> Result<(), RenderError> {
+        for content in caches.values_mut() {
+            self.commands_lowered += content.prepare(&mut super::prepared::Lowerer)?;
+        }
         self.layer(tree.root(), tree, caches)
     }
 
@@ -513,7 +532,7 @@ impl<'a> Lowering<'a> {
         &mut self,
         id: LayerId,
         tree: &SurfaceTree,
-        caches: &HashMap<LayerId, ContentData>,
+        caches: &mut HashMap<LayerId, ContentData>,
     ) -> Result<(), RenderError> {
         let node = tree.layer(id);
         if node.blend != BlendMode::Normal {
@@ -549,17 +568,12 @@ impl<'a> Lowering<'a> {
         id: LayerId,
         node: &cherenkov::LayerNode,
         tree: &SurfaceTree,
-        caches: &HashMap<LayerId, ContentData>,
+        caches: &mut HashMap<LayerId, ContentData>,
     ) -> Result<(), RenderError> {
-        match caches.get(&id) {
-            Some(ContentData::Picture(p)) => {
-                let list = p.display_list();
-                self.commands(list, 0, list.len())?;
-            }
-            Some(ContentData::List(list)) => {
-                self.commands(list, 0, list.len())?;
-            }
-            None => {}
+        if let Some(content) = caches.get_mut(&id) {
+            let (ops, emissions) = content.prepared();
+            let changed = self.ops(ops, emissions, 0, ops.len())?;
+            self.layers_composed += u32::from(changed);
         }
         for child in &node.children {
             self.layer(*child, tree, caches)?;
@@ -567,90 +581,156 @@ impl<'a> Lowering<'a> {
         Ok(())
     }
 
-    /// Walks commands `[start, end)` of `list`.
-    fn commands(
+    /// Assemble scopes around retained draw instances under the layer state.
+    fn ops(
         &mut self,
-        list: &DisplayList,
+        ops: &[Op],
+        emissions: &mut [Realization<Emission>],
         mut i: usize,
         end: usize,
-    ) -> Result<(), RenderError> {
-        let commands = list.commands();
+    ) -> Result<bool, RenderError> {
+        let mut changed = false;
         while i < end {
-            match &commands[i] {
-                Command::Fill { shape, paint } => self.fill(shape, paint)?,
-                Command::Stroke {
-                    shape,
-                    stroke,
-                    paint,
-                } => self.stroke(shape, stroke, paint)?,
-                Command::Shadow { shape, shadow } => self.shadow(shape, shadow)?,
-                Command::Glyphs { run, paint } => self.glyph_run(run, paint)?,
-                Command::Image { .. } => return Err(RenderError::Unsupported(names::IMAGE)),
-                Command::Picture { picture, transform } => {
+            match &ops[i] {
+                Op::BeginClip { local, shape, end } => {
                     let saved = self.transform;
-                    self.transform = saved * *transform;
-                    let list = picture.display_list();
-                    let result = self.commands(list, 0, list.len());
+                    self.transform = saved * *local;
+                    let clip = self.cached_clip(shape, &mut emissions[i]);
                     self.transform = saved;
-                    result?;
-                }
-                Command::BeginClip { shape, end } => {
-                    let inner_end = (*end as usize).min(commands.len());
-                    self.with_clip(Some(shape), |s| s.commands(list, i + 1, inner_end))?;
-                    i = inner_end;
-                }
-                Command::BeginTransform { transform, end } => {
-                    let saved = self.transform;
-                    self.transform = saved * *transform;
-                    let inner_end = (*end as usize).min(commands.len());
-                    let result = self.commands(list, i + 1, inner_end);
+                    if let Some(clip) = clip {
+                        let outer = self.clip.replace(clip);
+                        changed |= self.ops(ops, emissions, i + 1, *end as usize)?;
+                        self.clip = outer;
+                    }
                     self.transform = saved;
-                    result?;
-                    i = inner_end;
+                    i = *end as usize;
                 }
-                Command::BeginGroup { group, end } => {
-                    if group.filter.is_some() {
-                        return Err(RenderError::Unsupported(names::FILTER));
-                    }
-                    if group.blend != BlendMode::Normal {
-                        return Err(RenderError::Unsupported(names::BLEND));
-                    }
-                    if group.blend_space != BlendSpace::Linear {
-                        return Err(RenderError::Unsupported(names::BLEND_SPACE));
-                    }
-                    let inner_end = (*end as usize).min(commands.len());
-                    if group.opacity >= 1.0 {
-                        self.commands(list, i + 1, inner_end)?;
-                    } else {
-                        let clip = self.clip.clone();
-                        self.isolate(group.opacity, clip.clone(), clip, |s| {
-                            s.commands(list, i + 1, inner_end)
-                        })?;
-                    }
-                    i = inner_end;
+                Op::BeginIsolate { opacity, end } => {
+                    let clip = self.clip.clone();
+                    self.isolate(*opacity, clip.clone(), clip, |s| {
+                        changed |= s.ops(ops, emissions, i + 1, *end as usize)?;
+                        Ok(())
+                    })?;
+                    i = *end as usize;
                 }
-                Command::End => {}
+                Op::End => unreachable!("paired scope consumes its end"),
+                op => changed |= self.leaf(op, &mut emissions[i])?,
             }
             i += 1;
         }
-        Ok(())
+        Ok(changed)
+    }
+
+    /// Key comparison uses Arc identity for retained masks, without scanning
+    /// their coverage on a cache hit.
+    fn placement_matches<T>(&self, data: &DeviceData<T>) -> bool {
+        data.transform == self.transform
+            && data.clip == self.clip
+            && data.size == (self.width, self.height)
+    }
+
+    fn device_data<T>(&self, output: T) -> DeviceData<T> {
+        DeviceData {
+            transform: self.transform,
+            clip: self.clip.clone(),
+            size: (self.width, self.height),
+            output,
+        }
+    }
+
+    fn cached_clip(&self, shape: &ShapeData, cache: &mut Realization<Emission>) -> Option<ClipRef> {
+        if cache.valid
+            && let Some(Emission::Clip(data)) = &cache.data
+            && self.placement_matches(data)
+        {
+            return data.output.clone();
+        }
+        let clip = self.make_clip(shape);
+        cache.data = Some(Emission::Clip(self.device_data(clip.clone())));
+        cache.valid = true;
+        clip
+    }
+
+    /// Reuse coverage until either its source command or device placement changes.
+    fn leaf(&mut self, op: &Op, cache: &mut Realization<Emission>) -> Result<bool, RenderError> {
+        if cache.valid
+            && let Some(Emission::Draw(data)) = &cache.data
+            && self.placement_matches(data)
+        {
+            self.items.extend_from_slice(&data.output);
+            return Ok(false);
+        }
+        let mut items = match cache.data.take() {
+            Some(Emission::Draw(data)) => data.output,
+            None => Vec::new(),
+            Some(Emission::Clip(_)) => unreachable!("structural changes replace the cache layout"),
+        };
+        items.clear();
+        let mut compose = Lowering::new(&mut items, (0, 0));
+        compose.width = self.width;
+        compose.height = self.height;
+        compose.transform = self.transform;
+        compose.clip = self.clip.clone();
+        compose.realize(op)?;
+        self.glyphs.append(&mut compose.glyphs);
+        self.items.extend_from_slice(&items);
+        cache.data = Some(Emission::Draw(self.device_data(items)));
+        cache.valid = true;
+        Ok(true)
+    }
+
+    fn realize(&mut self, op: &Op) -> Result<(), RenderError> {
+        match op {
+            Op::Fill {
+                local,
+                shape,
+                paint,
+            } => {
+                self.transform *= *local;
+                self.fill(shape, paint);
+                Ok(())
+            }
+            Op::Stroke {
+                local,
+                shape,
+                stroke,
+                paint,
+            } => {
+                self.transform *= *local;
+                self.stroke(shape, stroke, paint);
+                Ok(())
+            }
+            Op::Shadow {
+                local,
+                shape,
+                shadow,
+            } => {
+                self.transform *= *local;
+                self.shadow(shape, shadow)
+            }
+            Op::Glyphs { local, run, paint } => {
+                self.transform *= *local;
+                self.glyph_run(run, paint)
+            }
+            _ => unreachable!("scope is composed, never realized as a leaf"),
+        }
     }
 
     /// `Fill`: a flattened polygon of edges in device space.
-    fn fill(&mut self, shape: &ShapeData, paint: &Paint) -> Result<(), RenderError> {
+    fn fill(&mut self, shape: &ShapeData, paint: &PaintData) {
         let sm = sigma_max(self.transform).max(1e-12);
         let tol_u = FLATTEN_TOL / sm;
         let Some((path, rule)) = shape_path(shape, tol_u) else {
-            return Ok(());
+            return;
         };
         let edges = flatten_edges(self.transform * path, FLATTEN_TOL);
         if edges.is_empty() {
-            return Ok(());
+            return;
         }
-        let paint = paint_data(paint, self.transform.inverse())?;
+        let paint = paint.transformed(self.transform.inverse());
         let bbox = bbox_of(&edges, self.width, self.height);
         if bbox.x0 >= bbox.x1 || bbox.y0 >= bbox.y1 {
-            return Ok(());
+            return;
         }
         self.items.push(Item::Draw {
             edges: edges.into(),
@@ -659,17 +739,11 @@ impl<'a> Lowering<'a> {
             paint,
             clip: self.clip.clone(),
         });
-        Ok(())
     }
 
     /// `Stroke`: `kurbo::stroke` the content-space path, transform,
     /// flatten and fill non-zero — dashes included, like the oracle.
-    fn stroke(
-        &mut self,
-        shape: &ShapeData,
-        stroke: &kurbo::Stroke,
-        paint: &Paint,
-    ) -> Result<(), RenderError> {
+    fn stroke(&mut self, shape: &ShapeData, stroke: &kurbo::Stroke, paint: &PaintData) {
         let sm = sigma_max(self.transform).max(1e-12);
         let tol_u = FLATTEN_TOL / sm;
         let path = match shape {
@@ -681,7 +755,7 @@ impl<'a> Lowering<'a> {
             }
             shape => {
                 let Some((path, _)) = shape_path(shape, tol_u) else {
-                    return Ok(());
+                    return;
                 };
                 path
             }
@@ -689,9 +763,9 @@ impl<'a> Lowering<'a> {
         let outline = kurbo::stroke(path, stroke, &kurbo::StrokeOpts::default(), tol_u);
         let edges = flatten_edges(self.transform * outline, FLATTEN_TOL);
         if edges.is_empty() {
-            return Ok(());
+            return;
         }
-        let paint = paint_data(paint, self.transform.inverse())?;
+        let paint = paint.transformed(self.transform.inverse());
         let bbox = bbox_of(&edges, self.width, self.height);
         self.items.push(Item::Draw {
             edges: edges.into(),
@@ -700,7 +774,6 @@ impl<'a> Lowering<'a> {
             paint,
             clip: self.clip.clone(),
         });
-        Ok(())
     }
 
     /// `Shadow`: a Gaussian-blurred rounded box in device space.
@@ -805,11 +878,11 @@ impl<'a> Lowering<'a> {
         clippy::many_single_char_names,
         reason = "glyph device coordinates fit i32 on a real surface"
     )]
-    fn glyph_run(&mut self, run: &GlyphRun, paint: &Paint) -> Result<(), RenderError> {
+    fn glyph_run(&mut self, run: &GlyphRun, paint: &PaintData) -> Result<(), RenderError> {
         if matches!(run.style, GlyphStyle::Stroke(_)) {
             return Err(RenderError::Unsupported(names::GLYPH_STROKE));
         }
-        let paint = paint_data(paint, self.transform.inverse())?;
+        let paint = paint.transformed(self.transform.inverse());
         let [a, b, c, d, ..] = self.transform.as_coeffs();
         let matrix = [a as f32, b as f32, c as f32, d as f32];
         let coords: std::sync::Arc<[i16]> = run.coords.clone().into();

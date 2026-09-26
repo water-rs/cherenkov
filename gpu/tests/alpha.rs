@@ -3,7 +3,8 @@
 
 use cherenkov::kurbo::{Affine, Rect};
 use cherenkov::{Draw, WorkingColor};
-use cherenkov_gpu::{Engine, EngineError, Gpu, GpuConfig, Offscreen, OffscreenFormat};
+use cherenkov::{Engine, EngineError, Offscreen, OffscreenFormat};
+use cherenkov_gpu::{Gpu, GpuConfig};
 
 const GREY: WorkingColor = WorkingColor::new([0.8, 0.8, 0.8, 1.0]);
 const RED: WorkingColor = WorkingColor::new([1.0, 0.0, 0.0, 1.0]);
@@ -13,14 +14,14 @@ const BLUE: WorkingColor = WorkingColor::new([0.0, 0.0, 1.0, 1.0]);
 fn a_disjoint_opacity_layer_passes_through() -> Result<(), Box<dyn std::error::Error>> {
     let engine = match Engine::<Gpu>::new(GpuConfig::default()) {
         Ok(engine) => engine,
-        Err(EngineError::NoAdapter) => return Ok(()),
+        Err(EngineError::Backend(_)) => return Ok(()),
         Err(e) => return Err(e.into()),
     };
     let surface = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
     surface.clear_color(GREY);
     let layer = surface.layer();
     surface.update(|tx| {
-        tx[&layer].opacity(0.5);
+        tx[&layer].opacity(0.5f32);
         tx[surface.root()].push(&layer);
     });
     surface.update(|tx| {
@@ -29,7 +30,7 @@ fn a_disjoint_opacity_layer_passes_through() -> Result<(), Box<dyn std::error::E
             c.fill(Rect::new(36., 36., 60., 60.), BLUE);
         }));
     });
-    engine.render(cherenkov_gpu::FrameTime::now())?;
+    engine.render(cherenkov::FrameTime::now())?;
     let stats = engine.stats();
     assert_eq!(stats.passes, 1, "disjoint rects should not isolate");
     let rb = surface.readback()?;
@@ -58,14 +59,14 @@ fn a_disjoint_opacity_layer_passes_through() -> Result<(), Box<dyn std::error::E
 fn an_overlapping_opacity_layer_still_isolates() -> Result<(), Box<dyn std::error::Error>> {
     let engine = match Engine::<Gpu>::new(GpuConfig::default()) {
         Ok(engine) => engine,
-        Err(EngineError::NoAdapter) => return Ok(()),
+        Err(EngineError::Backend(_)) => return Ok(()),
         Err(e) => return Err(e.into()),
     };
     let surface = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
     surface.clear_color(GREY);
     let layer = surface.layer();
     surface.update(|tx| {
-        tx[&layer].opacity(0.5);
+        tx[&layer].opacity(0.5f32);
         tx[surface.root()].push(&layer);
     });
     surface.update(|tx| {
@@ -74,7 +75,7 @@ fn an_overlapping_opacity_layer_still_isolates() -> Result<(), Box<dyn std::erro
             c.fill(Rect::new(24., 24., 56., 56.), BLUE);
         }));
     });
-    engine.render(cherenkov_gpu::FrameTime::now())?;
+    engine.render(cherenkov::FrameTime::now())?;
     let stats = engine.stats();
     assert_eq!(
         stats.passes, 3,
@@ -112,14 +113,14 @@ fn an_isolated_scratch_target_is_region_sized() -> Result<(), Box<dyn std::error
     };
     let engine = match Engine::<Gpu>::new(config) {
         Ok(engine) => engine,
-        Err(EngineError::NoAdapter) => return Ok(()),
+        Err(EngineError::Backend(_)) => return Ok(()),
         Err(e) => return Err(e.into()),
     };
     let surface = engine.surface(Offscreen::new((256, 256), OffscreenFormat::LinearF16))?;
     surface.clear_color(GREY);
     let layer = surface.layer();
     surface.update(|tx| {
-        tx[&layer].opacity(0.5);
+        tx[&layer].opacity(0.5f32);
         tx[surface.root()].push(&layer);
     });
     surface.update(|tx| {
@@ -129,7 +130,7 @@ fn an_isolated_scratch_target_is_region_sized() -> Result<(), Box<dyn std::error
             c.fill(Rect::new(192., 192., 250., 250.), BLUE);
         }));
     });
-    engine.render(cherenkov_gpu::FrameTime::now())?;
+    engine.render(cherenkov::FrameTime::now())?;
     let stats = engine.stats();
     assert_eq!(stats.passes, 3);
     if stats.passes_timed.is_empty() {
@@ -178,14 +179,14 @@ fn an_isolated_scratch_target_is_region_sized() -> Result<(), Box<dyn std::error
 fn a_child_layer_draws_once() -> Result<(), Box<dyn std::error::Error>> {
     let engine = match Engine::<Gpu>::new(GpuConfig::default()) {
         Ok(engine) => engine,
-        Err(EngineError::NoAdapter) => return Ok(()),
+        Err(EngineError::Backend(_)) => return Ok(()),
         Err(e) => return Err(e.into()),
     };
     let surface = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
     surface.clear_color(WorkingColor::new([0.8, 0.8, 0.8, 1.0]));
     let layer = surface.layer();
     surface.update(|tx| {
-        tx[&layer].transform(Affine::IDENTITY).opacity(1.0);
+        tx[&layer].transform(Affine::IDENTITY).opacity(1.0f32);
         tx[surface.root()].push(&layer);
     });
     surface.update(|tx| {
@@ -196,7 +197,7 @@ fn a_child_layer_draws_once() -> Result<(), Box<dyn std::error::Error>> {
             );
         }));
     });
-    engine.render(cherenkov_gpu::FrameTime::now())?;
+    engine.render(cherenkov::FrameTime::now())?;
     let readback = surface.readback()?;
     let [r, g, b, a] = readback.pixels[(32 * readback.width + 32) as usize];
     assert!(

@@ -26,6 +26,10 @@ pub const PAINT_LINEAR: u32 = 1;
 pub const PAINT_RADIAL: u32 = 2;
 /// A composite: sample the bound scratch texture at the device pixel.
 pub const PAINT_TEXTURE: u32 = 3;
+/// A sweep (conic) gradient.
+pub const PAINT_SWEEP: u32 = 4;
+/// An image sampled manually from the bound image texture.
+pub const PAINT_IMAGE: u32 = 5;
 
 /// Clamp the edge colours.
 pub const EXTEND_PAD: u32 = 0;
@@ -33,6 +37,8 @@ pub const EXTEND_PAD: u32 = 0;
 pub const EXTEND_REPEAT: u32 = 1;
 /// Repeat the range mirrored.
 pub const EXTEND_REFLECT: u32 = 2;
+/// Transparent outside the range.
+pub const EXTEND_NONE: u32 = 3;
 
 /// Stops stored in the working space.
 pub const INTERP_WORKING: u32 = 0;
@@ -45,6 +51,41 @@ pub const FLAG_HAS_CLIP: u32 = 1;
 pub const FLAG_HAS_INNER: u32 = 2;
 /// The clip carries a coverage mask sampled from the atlas.
 pub const FLAG_HAS_MASK: u32 = 4;
+
+/// The shader's blend-mode code for a [`cherenkov::BlendMode`]; `0` keeps the
+/// fixed-function source-over composite. Matches `blend_mode` in the WGSL.
+pub const fn blend_code(mode: cherenkov::BlendMode) -> u32 {
+    match mode {
+        cherenkov::BlendMode::Normal => 0,
+        cherenkov::BlendMode::Multiply => 1,
+        cherenkov::BlendMode::Screen => 2,
+        cherenkov::BlendMode::Overlay => 3,
+        cherenkov::BlendMode::Darken => 4,
+        cherenkov::BlendMode::Lighten => 5,
+        cherenkov::BlendMode::ColorDodge => 6,
+        cherenkov::BlendMode::ColorBurn => 7,
+        cherenkov::BlendMode::HardLight => 8,
+        cherenkov::BlendMode::SoftLight => 9,
+        cherenkov::BlendMode::Difference => 10,
+        cherenkov::BlendMode::Exclusion => 11,
+        cherenkov::BlendMode::Hue => 12,
+        cherenkov::BlendMode::Saturation => 13,
+        cherenkov::BlendMode::Color => 14,
+        cherenkov::BlendMode::Luminosity => 15,
+        cherenkov::BlendMode::Clear => 16,
+        cherenkov::BlendMode::Src => 17,
+        cherenkov::BlendMode::Dst => 18,
+        cherenkov::BlendMode::DestOver => 19,
+        cherenkov::BlendMode::SrcIn => 20,
+        cherenkov::BlendMode::DestIn => 21,
+        cherenkov::BlendMode::SrcOut => 22,
+        cherenkov::BlendMode::DestOut => 23,
+        cherenkov::BlendMode::SrcAtop => 24,
+        cherenkov::BlendMode::DestAtop => 25,
+        cherenkov::BlendMode::Xor => 26,
+        cherenkov::BlendMode::PlusLighter => 27,
+    }
+}
 
 /// A rounded box centred at the origin, mirroring the WGSL `Shape`.
 ///
@@ -98,8 +139,11 @@ pub struct Instance {
     /// Straight-alpha working-space colour.
     pub color: [f32; 4],
     /// Linear: start.xy, end.xy. Radial: start centre.xy, end centre.xy.
+    /// Sweep: centre.xy. Image: local→image affine `[a, b, c, d]`.
+    /// `PAINT_TEXTURE`: source region origin.xy.
     pub grad: [f32; 4],
-    /// Radial: start radius, end radius.
+    /// Radial: start radius, end radius. Sweep: start angle, end angle.
+    /// Image: local→image affine `[e, f]` and image `[w, h]`.
     pub grad2: [f32; 4],
     /// Glyph/cell: atlas cell origin in texels. zw: mask atlas cell origin.
     pub uv: [f32; 4],
@@ -107,6 +151,9 @@ pub struct Instance {
     /// origin.
     pub params: [f32; 4],
     /// `[kind, paint, first_stop, count | interp<<16 | extend<<20 | flags<<24]`.
+    /// For `PAINT_IMAGE`: `extend_x | extend_y<<4 | sampling<<8 | flags<<24`
+    /// (`sampling`: 0 nearest, 1 bilinear). For a blended `PAINT_TEXTURE`
+    /// composite: `blend_code<<16 | flags<<24`.
     pub meta: [u32; 4],
 }
 

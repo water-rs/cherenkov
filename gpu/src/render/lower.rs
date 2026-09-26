@@ -9,18 +9,19 @@ use std::ops::Range;
 
 use cherenkov::kurbo::{Affine, BezPath, Line, PathEl, Point, Rect, Vec2};
 use cherenkov::{
-    BlendMode, BlendSpace, Command, DisplayList, Extend, FillRule, Interpolation, Paint, ShapeData,
-    WorkingColor,
+    BlendMode, BlendSpace, Command, DisplayList, Extend, FillRule, ImageId, ImagePattern,
+    Interpolation, Paint, ShapeData, WorkingColor,
 };
 use cherenkov::{GlyphRun, GlyphStyle};
 
 use crate::error::{RenderError, Unsupported};
+use crate::render::GpuImage;
 use crate::render::glyph::{Atlas, FontData, MaskCell, PathEmit, glyph_key, rasterize};
 use crate::render::instance::{
-    EXTEND_PAD, EXTEND_REFLECT, EXTEND_REPEAT, FLAG_HAS_CLIP, FLAG_HAS_INNER, FLAG_HAS_MASK,
-    Globals, INTERP_SRGB, INTERP_WORKING, Instance, KIND_FILL, KIND_GLYPH, KIND_SHADOW, KIND_SPAN,
-    KIND_STROKE_DIST, KIND_STROKE_OFFSET, PAINT_LINEAR, PAINT_RADIAL, PAINT_SOLID, PAINT_TEXTURE,
-    Shape, Stop, affine,
+    EXTEND_NONE, EXTEND_PAD, EXTEND_REFLECT, EXTEND_REPEAT, FLAG_HAS_CLIP, FLAG_HAS_INNER,
+    FLAG_HAS_MASK, Globals, INTERP_SRGB, INTERP_WORKING, Instance, KIND_FILL, KIND_GLYPH,
+    KIND_SHADOW, KIND_SPAN, KIND_STROKE_DIST, KIND_STROKE_OFFSET, PAINT_IMAGE, PAINT_LINEAR,
+    PAINT_RADIAL, PAINT_SOLID, PAINT_SWEEP, PAINT_TEXTURE, Shape, Stop, affine, blend_code,
 };
 use crate::render::path;
 
@@ -41,11 +42,26 @@ pub enum Target {
     Scratch(usize),
 }
 
+/// The blend pipeline a draw range uses.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PipelineKind {
+    /// Fixed-function source-over compositing.
+    #[default]
+    SrcOver,
+    /// Write the fragment result unblended; blended composites do their
+    /// compositing in the shader.
+    Replace,
+}
+
 /// One draw call's instance range and bound source texture.
 #[derive(Clone, Debug)]
 pub struct DrawRange {
     /// The scratch texture bound as group 1, `None` for the dummy texture.
     pub source: Option<usize>,
+    /// The image texture bound for `PAINT_IMAGE` instances.
+    pub image: Option<u64>,
+    /// The pipeline variant this range draws with.
+    pub pipeline: PipelineKind,
     /// Range into the frame's instance buffer.
     pub instances: Range<u32>,
 }
@@ -63,6 +79,9 @@ pub struct Pass {
     /// whole surface for [`Target::Surface`], the tight union bbox of its
     /// content for [`Target::Scratch`].
     pub region: [u32; 4],
+    /// When set, the target's region is copied into the backdrop texture
+    /// before this pass begins — the blend composite reads it explicitly.
+    pub backdrop_copy: Option<[u32; 4]>,
 }
 
 /// A lowered frame.
@@ -82,6 +101,9 @@ struct OpenPass {
     target: Target,
     clear: Option<[f32; 4]>,
     source: Option<usize>,
+    image: Option<u64>,
+    pipeline: PipelineKind,
+    backdrop_copy: Option<[u32; 4]>,
     ranges: Vec<DrawRange>,
     seg_start: u32,
 }
@@ -298,8 +320,11 @@ struct PaintData {
     grad: [f32; 4],
     grad2: [f32; 4],
     first_stop: u32,
-    /// `count | interp << 16 | extend << 20`.
+    /// `count | interp << 16 | extend << 20`; for `PAINT_IMAGE`,
+    /// `extend_x | extend_y << 4 | sampling << 8`.
     packed: u32,
+    /// The bound image for `PAINT_IMAGE`.
+    image: Option<u64>,
 }
 
 /// sRGB-encodes one channel, preserving sign.
@@ -344,21 +369,31 @@ fn push_stops(
         Interpolation::Working => INTERP_WORKING,
         Interpolation::SrgbEncoded => INTERP_SRGB,
     };
-    let extend = match extend {
+    (first, count | (interp << 16) | (extend_code(extend) << 20))
+}
+
+const fn extend_code(extend: Extend) -> u32 {
+    match extend {
         Extend::Pad => EXTEND_PAD,
         Extend::Repeat => EXTEND_REPEAT,
         Extend::Reflect => EXTEND_REFLECT,
-    };
-    (first, count | (interp << 16) | (extend << 20))
+        Extend::None => EXTEND_NONE,
+    }
 }
 
 /// Lowers a paint; `to_local` maps content space to the instance's local
 /// (shape-centred) space in which the shader evaluates gradient parameters.
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::many_single_char_names,
+    reason = "image dimensions fit f32; affine coefficients are conventionally a..f"
+)]
 fn paint_data(
     paint: &Paint,
     to_local: Affine,
     stops: &mut Vec<Stop>,
-) -> Result<PaintData, Unsupported> {
+    images: &HashMap<u64, GpuImage>,
+) -> Result<PaintData, RenderError> {
     let mut data = PaintData {
         kind: PAINT_SOLID,
         ..PaintData::default()
@@ -389,10 +424,37 @@ fn paint_data(
             data.first_stop = first;
             data.packed = packed;
         }
-        Paint::Sweep(_) => return Err(Unsupported::Sweep),
-        Paint::Mesh(_) => return Err(Unsupported::Mesh),
-        Paint::Image(_) => return Err(Unsupported::Image),
-        Paint::Shader(_) => return Err(Unsupported::Shader),
+        Paint::Sweep(g) => {
+            data.kind = PAINT_SWEEP;
+            let center = to_local * g.center;
+            data.grad = [f32_f64(center.x), f32_f64(center.y), 0.0, 0.0];
+            data.grad2 = [f32_f64(g.start_angle), f32_f64(g.end_angle), 0.0, 0.0];
+            let (first, packed) = push_stops(stops, &g.stops, g.interpolation, g.extend);
+            data.first_stop = first;
+            data.packed = packed;
+        }
+        Paint::Mesh(_) => return Err(Unsupported::Mesh.into()),
+        Paint::Image(pattern) => {
+            let img = images
+                .get(&pattern.image.raw())
+                .ok_or_else(|| RenderError::Image(pattern.image.raw()))?;
+            // `to_local * transform` maps image space to instance-local; the
+            // shader needs the inverse.
+            let [a, b, c, d, e, f] = (to_local * pattern.transform).inverse().as_coeffs();
+            data.kind = PAINT_IMAGE;
+            data.grad = [f32_f64(a), f32_f64(b), f32_f64(c), f32_f64(d)];
+            let (iw, ih) = (img.width as f32, img.height as f32);
+            data.grad2 = [f32_f64(e), f32_f64(f), iw, ih];
+            let sampling = match pattern.sampling {
+                cherenkov::Sampling::Nearest => 0,
+                cherenkov::Sampling::Linear => 1,
+            };
+            data.packed = extend_code(pattern.extend_x)
+                | (extend_code(pattern.extend_y) << 4)
+                | (sampling << 8);
+            data.image = Some(pattern.image.raw());
+        }
+        Paint::Shader(_) => return Err(Unsupported::Shader.into()),
     }
     Ok(data)
 }
@@ -403,6 +465,8 @@ pub struct LayerNode {
     pub transform: Affine,
     /// Opacity; below 1.0 isolates.
     pub opacity: f32,
+    /// Blend mode onto the parent; non-normal isolates.
+    pub blend: cherenkov::BlendMode,
     /// Clip shape.
     pub clip: Option<ShapeData>,
     /// The content.
@@ -427,6 +491,8 @@ pub struct GlyphContext<'a> {
     pub queue: &'a wgpu::Queue,
     /// Registered fonts.
     pub fonts: &'a HashMap<u64, FontData>,
+    /// Registered images, for dimension lookup during lowering.
+    pub images: &'a HashMap<u64, GpuImage>,
 }
 
 /// The lowering walk state for one surface frame.
@@ -495,6 +561,8 @@ impl<'a> Lowering<'a> {
         if end > open.seg_start {
             open.ranges.push(DrawRange {
                 source: open.source,
+                image: open.image,
+                pipeline: open.pipeline,
                 instances: open.seg_start..end,
             });
             open.seg_start = end;
@@ -507,6 +575,9 @@ impl<'a> Lowering<'a> {
             target,
             clear,
             source: None,
+            image: None,
+            pipeline: PipelineKind::SrcOver,
+            backdrop_copy: None,
             ranges: Vec::new(),
             #[expect(clippy::cast_possible_truncation)]
             seg_start: self.frame.instances.len() as u32,
@@ -532,6 +603,7 @@ impl<'a> Lowering<'a> {
                 clear: open.clear,
                 ranges: open.ranges,
                 region,
+                backdrop_copy: open.backdrop_copy,
             });
         }
     }
@@ -542,6 +614,31 @@ impl<'a> Lowering<'a> {
             self.end_segment();
             if let Some(open) = &mut self.frame.open {
                 open.source = source;
+            }
+        }
+    }
+
+    /// Starts a new draw range when the bound image texture changes.
+    fn set_image(&mut self, image: Option<u64>) {
+        if self.frame.open.as_ref().is_some_and(|o| o.image != image) {
+            self.end_segment();
+            if let Some(open) = &mut self.frame.open {
+                open.image = image;
+            }
+        }
+    }
+
+    /// Starts a new draw range when the pipeline variant changes.
+    fn set_pipeline(&mut self, pipeline: PipelineKind) {
+        if self
+            .frame
+            .open
+            .as_ref()
+            .is_some_and(|o| o.pipeline != pipeline)
+        {
+            self.end_segment();
+            if let Some(open) = &mut self.frame.open {
+                open.pipeline = pipeline;
             }
         }
     }
@@ -564,10 +661,14 @@ impl<'a> Lowering<'a> {
         &mut self,
         inner_clip: Option<DeviceClip>,
         opacity: f32,
+        blend: cherenkov::BlendMode,
         mut body: impl FnMut(&mut Self, &mut GlyphContext<'_>) -> Result<(), RenderError>,
         glyphs: &mut GlyphContext<'_>,
     ) -> Result<(), RenderError> {
-        if opacity < 1.0 && self.try_passthrough(opacity, &mut body, glyphs)? {
+        if opacity < 1.0
+            && blend == cherenkov::BlendMode::Normal
+            && self.try_passthrough(opacity, &mut body, glyphs)?
+        {
             return Ok(());
         }
         self.depth += 1;
@@ -610,9 +711,16 @@ impl<'a> Lowering<'a> {
             }
         }
         self.begin_pass(outer_target, None);
+        if blend != cherenkov::BlendMode::Normal {
+            // The blend composite samples the backdrop explicitly: the
+            // target's current contents are copied aside before this pass.
+            if let Some(open) = &mut self.frame.open {
+                open.backdrop_copy = Some(region);
+            }
+        }
         // The composite instance: a quad over the scratch's region
         // sampling it with `grad.xy` as the texel origin.
-        self.emit_composite(scratch, opacity, region);
+        self.emit_composite(scratch, opacity, region, blend);
         Ok(())
     }
 
@@ -648,7 +756,13 @@ impl<'a> Lowering<'a> {
 
     /// Emits the composite quad for `scratch` onto the current target,
     /// covering `region` (`x, y, w, h` device pixels).
-    fn emit_composite(&mut self, scratch: usize, opacity: f32, region: [u32; 4]) {
+    fn emit_composite(
+        &mut self,
+        scratch: usize,
+        opacity: f32,
+        region: [u32; 4],
+        blend: cherenkov::BlendMode,
+    ) {
         #[expect(clippy::cast_precision_loss, reason = "region fits the surface")]
         let (rx, ry, rw, rh) = (
             region[0] as f32,
@@ -671,9 +785,17 @@ impl<'a> Lowering<'a> {
         // `grad.xy` carries the scratch region's texel origin.
         inst.grad[0] = rx;
         inst.grad[1] = ry;
+        let code = blend_code(blend);
+        if code != 0 {
+            inst.meta[3] |= code << 16;
+            self.set_pipeline(PipelineKind::Replace);
+        }
         self.set_source(Some(scratch));
         self.frame.instances.push(inst);
         self.set_source(None);
+        if code != 0 {
+            self.set_pipeline(PipelineKind::SrcOver);
+        }
     }
 
     /// An instance of `kind` under the current transform and clip.
@@ -713,6 +835,7 @@ impl<'a> Lowering<'a> {
         paint: &Paint,
         param_x: f32,
         flags: u32,
+        glyphs: &GlyphContext<'_>,
     ) -> Result<(), RenderError> {
         let b = boxed.bounds.inflate(margin, margin);
         if b.width() <= 0.0 || b.height() <= 0.0 {
@@ -725,13 +848,19 @@ impl<'a> Lowering<'a> {
             inst.inner = inner;
         }
         inst.params[0] = param_x;
-        let paint = paint_data(paint, boxed.extra.inverse(), &mut self.frame.stops)?;
+        let paint = paint_data(
+            paint,
+            boxed.extra.inverse(),
+            &mut self.frame.stops,
+            glyphs.images,
+        )?;
         inst.color = paint.color;
         inst.grad = paint.grad;
         inst.grad2 = paint.grad2;
         inst.meta[1] = paint.kind;
         inst.meta[2] = paint.first_stop;
         inst.meta[3] |= (paint.packed & 0x00ff_ffff) | (flags << 24);
+        self.set_image(paint.image);
         self.frame.instances.push(inst);
         Ok(())
     }
@@ -815,7 +944,7 @@ impl<'a> Lowering<'a> {
                     self.clip = Some(cur);
                     return Ok(());
                 }
-                self.isolate(Some(clip), 1.0, body, glyphs)
+                self.isolate(Some(clip), 1.0, cherenkov::BlendMode::Normal, body, glyphs)
             }
             Some(cur) => match (clip.mask, cur.aligned_rect, clip.aligned_rect) {
                 // A new masked clip merges with an aligned rect clip (or
@@ -843,7 +972,7 @@ impl<'a> Lowering<'a> {
                     self.clip = Some(cur);
                     Ok(())
                 }
-                _ => self.isolate(Some(clip), 1.0, body, glyphs),
+                _ => self.isolate(Some(clip), 1.0, cherenkov::BlendMode::Normal, body, glyphs),
             },
         }
     }
@@ -864,11 +993,12 @@ impl<'a> Lowering<'a> {
         let result = self.with_clip(
             node.clip.as_ref(),
             |s, glyphs| {
-                if node.opacity < 1.0 {
+                if node.opacity < 1.0 || node.blend != cherenkov::BlendMode::Normal {
                     let inner = s.clip;
                     s.isolate(
                         inner,
                         node.opacity,
+                        node.blend,
                         |s, glyphs| s.layer_items(node, layers, glyphs),
                         glyphs,
                     )
@@ -923,7 +1053,11 @@ impl<'a> Lowering<'a> {
                 } => self.stroke(shape, stroke, paint, glyphs)?,
                 Command::Shadow { shape, shadow } => self.shadow(shape, shadow)?,
                 Command::Glyphs { run, paint } => self.glyph_run(run, paint, glyphs)?,
-                Command::Image { .. } => return Err(Unsupported::Image.into()),
+                Command::Image {
+                    image,
+                    dst,
+                    sampling,
+                } => self.image_draw(*image, dst, *sampling, glyphs)?,
                 Command::Picture { picture, transform } => {
                     let saved = self.transform;
                     self.transform = saved * *transform;
@@ -954,19 +1088,17 @@ impl<'a> Lowering<'a> {
                     if group.filter.is_some() {
                         return Err(Unsupported::Filter.into());
                     }
-                    if group.blend != BlendMode::Normal {
-                        return Err(Unsupported::Blend(group.blend).into());
-                    }
                     if group.blend_space != BlendSpace::Linear {
                         return Err(Unsupported::BlendSpace.into());
                     }
                     let inner_end = (*end as usize).min(commands.len());
-                    if group.opacity >= 1.0 {
+                    if group.opacity >= 1.0 && group.blend == BlendMode::Normal {
                         self.commands(list, i + 1, inner_end, glyphs)?;
                     } else {
                         self.isolate(
                             None,
                             group.opacity,
+                            group.blend,
                             |s, glyphs| s.commands(list, i + 1, inner_end, glyphs),
                             glyphs,
                         )?;
@@ -1002,7 +1134,47 @@ impl<'a> Lowering<'a> {
             return Ok(());
         };
         let margin = aa_margin(self.transform);
-        self.emit(KIND_FILL, &boxed, boxed.shape, None, margin, paint, 0.0, 0)
+        self.emit(
+            KIND_FILL,
+            &boxed,
+            boxed.shape,
+            None,
+            margin,
+            paint,
+            0.0,
+            0,
+            glyphs,
+        )
+    }
+
+    /// `Image`: a fill of `dst` whose paint maps the rect onto the whole
+    /// image, pad-extended, like the oracle's `Draw::Image`.
+    fn image_draw(
+        &mut self,
+        image: ImageId,
+        dst: &Rect,
+        sampling: cherenkov::Sampling,
+        glyphs: &mut GlyphContext<'_>,
+    ) -> Result<(), RenderError> {
+        let img = glyphs
+            .images
+            .get(&image.raw())
+            .ok_or_else(|| RenderError::Image(image.raw()))?;
+        let (iw, ih) = (f64::from(img.width), f64::from(img.height));
+        let (dw, dh) = (dst.x1 - dst.x0, dst.y1 - dst.y0);
+        if dw <= 0.0 || dh <= 0.0 {
+            return Ok(());
+        }
+        let transform =
+            Affine::translate((dst.x0, dst.y0)) * Affine::scale_non_uniform(dw / iw, dh / ih);
+        let paint = Paint::Image(ImagePattern {
+            image,
+            transform,
+            extend_x: Extend::Pad,
+            extend_y: Extend::Pad,
+            sampling,
+        });
+        self.fill(&ShapeData::Rect(*dst), &paint, glyphs)
     }
 
     /// `Stroke`: offset strokes for circular-corner boxes, distance strokes
@@ -1035,7 +1207,7 @@ impl<'a> Lowering<'a> {
         }
         let hw = stroke.width / 2.0;
         if let ShapeData::Line(line) = shape {
-            return self.stroke_line(line, hw, stroke, paint);
+            return self.stroke_line(line, hw, stroke, paint, glyphs);
         }
         let Some(boxed) = box_shape(shape)? else {
             return Ok(());
@@ -1086,6 +1258,7 @@ impl<'a> Lowering<'a> {
                 paint,
                 f32_f64(hw),
                 flags,
+                glyphs,
             )
         } else {
             self.emit(
@@ -1097,6 +1270,7 @@ impl<'a> Lowering<'a> {
                 paint,
                 f32_f64(hw),
                 0,
+                glyphs,
             )
         }
     }
@@ -1108,6 +1282,7 @@ impl<'a> Lowering<'a> {
         hw: f64,
         stroke: &kurbo::Stroke,
         paint: &Paint,
+        glyphs: &GlyphContext<'_>,
     ) -> Result<(), RenderError> {
         if stroke.start_cap != stroke.end_cap {
             return Err(Unsupported::StrokeJoin.into());
@@ -1147,6 +1322,7 @@ impl<'a> Lowering<'a> {
             paint,
             0.0,
             0,
+            glyphs,
         )
     }
 
@@ -1235,13 +1411,25 @@ impl<'a> Lowering<'a> {
             glyphs.atlas.insert_path(key, stored.clone());
             stored
         };
-        self.replay(&stored, pl.offset, paint)
+        self.replay(&stored, pl.offset, paint, glyphs)
     }
 
     /// Replays a cached path emission: `KIND_SPAN` runs and `KIND_GLYPH`
     /// cells at `offset` from their stored rects, painted like glyphs.
-    fn replay(&mut self, emit: &PathEmit, offset: Vec2, paint: &Paint) -> Result<(), RenderError> {
-        let paint = paint_data(paint, Affine::IDENTITY, &mut self.frame.stops)?;
+    fn replay(
+        &mut self,
+        emit: &PathEmit,
+        offset: Vec2,
+        paint: &Paint,
+        glyphs: &GlyphContext<'_>,
+    ) -> Result<(), RenderError> {
+        let paint = paint_data(
+            paint,
+            Affine::IDENTITY,
+            &mut self.frame.stops,
+            glyphs.images,
+        )?;
+        self.set_image(paint.image);
         for rect in &emit.spans {
             let mut inst = self.base(KIND_SPAN, affine(self.transform));
             inst.bounds = [
@@ -1418,7 +1606,13 @@ impl<'a> Lowering<'a> {
             let y0 = f32_f64(iy + f64::from(entry.top));
             inst.bounds = [x0, y0, x0 + f32::from(entry.w), y0 + f32::from(entry.h)];
             inst.uv = [f32::from(entry.x), f32::from(entry.y), 0.0, 0.0];
-            let paint_data = paint_data(paint, Affine::IDENTITY, &mut self.frame.stops)?;
+            let paint_data = paint_data(
+                paint,
+                Affine::IDENTITY,
+                &mut self.frame.stops,
+                glyphs.images,
+            )?;
+            self.set_image(paint_data.image);
             inst.color = paint_data.color;
             inst.grad = paint_data.grad;
             inst.grad2 = paint_data.grad2;

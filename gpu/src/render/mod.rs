@@ -2219,6 +2219,12 @@ impl Renderer {
                     .slice(..u64::from(pending.count) * 8)
                     .get_mapped_range();
                 let ticks: &[u64] = bytemuck::cast_slice(&data);
+                tracing::trace!(
+                    frame = pending.frame.get(),
+                    period,
+                    ?ticks,
+                    "timestamp ticks"
+                );
                 #[expect(clippy::cast_precision_loss)]
                 let delta = |from: usize, to: usize| {
                     ticks

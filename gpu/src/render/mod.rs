@@ -844,9 +844,7 @@ pub fn run(config: GpuConfig, rx: Receiver<Message>, init_tx: Sender<Result<Init
                 let _ = reply.send(renderer.memory());
             }
             Message::Trim(pressure) => {
-                if pressure == Pressure::Critical {
-                    renderer.atlas.clear();
-                }
+                renderer.trim(pressure);
             }
             Message::Shutdown => break,
         }
@@ -1166,6 +1164,71 @@ impl Renderer {
                 Self::remove_node(layers, child);
             }
         }
+    }
+
+    /// Frees cacheable memory under system pressure.
+    ///
+    /// `Moderate` drops the per-surface scratch and backdrop textures —
+    /// they're transient render targets regrown lazily on the next frame.
+    /// `Critical` additionally clears the glyph atlas, every font's
+    /// resolved-COLR pictures, and returns the grow-only shared buffers
+    /// to their initial capacities.
+    fn trim(&mut self, pressure: Pressure) {
+        for surf in self.surfaces.values_mut() {
+            surf.scratch.clear();
+            surf.backdrop = [None, None];
+            // The bind groups' views died with the textures.
+            surf.binds1.clear();
+            surf.bind_gen += 1;
+        }
+        if pressure != Pressure::Critical {
+            return;
+        }
+        self.atlas.clear();
+        for font in self.fonts.values() {
+            font.colr.borrow_mut().clear();
+        }
+        for surf in self.surfaces.values_mut() {
+            surf.frame.instances.shrink_to_fit();
+            surf.frame.stops.shrink_to_fit();
+            surf.frame.passes.shrink_to_fit();
+        }
+        self.instances = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("instances"),
+            size: 272 * 16,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        self.stops = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("stops"),
+            size: 32 * 16,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        self.globals = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("globals"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        self.bound_instance_size = self.instances.size();
+        self.bound_stop_size = self.stops.size();
+        self.bound_globals_size = self.globals.size();
+        self.bind0 = make_bind0(
+            &self.device,
+            &self.layout0,
+            &self.globals,
+            &self.instances,
+            &self.stops,
+            &self.atlas,
+        );
+        self.bound_atlas = self.atlas.generation();
     }
 
     /// Memory usage across buffers, textures and the atlas.

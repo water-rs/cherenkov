@@ -145,3 +145,25 @@ impl<C: GpuContent> Content for C {
         GpuContent::render(self, frame);
     }
 }
+
+/// A host event-loop callback callable from the engine or producer threads.
+#[derive(Clone)]
+pub struct RedrawCallback(Arc<dyn Fn() + Send + Sync>);
+
+impl RedrawCallback {
+    /// Wraps the host's display-link or event-loop wake operation.
+    pub fn new(wake: impl Fn() + Send + Sync + 'static) -> Self {
+        Self(Arc::new(wake))
+    }
+
+    /// Asks the host to schedule an engine frame.
+    pub fn wake(&self) {
+        (self.0)();
+    }
+}
+
+impl std::fmt::Debug for RedrawCallback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RedrawCallback").finish_non_exhaustive()
+    }
+}

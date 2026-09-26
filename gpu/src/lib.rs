@@ -86,6 +86,9 @@ pub struct GpuConfig {
     /// The isolation (scratch) texture format. Defaults to
     /// [`ScratchFormat::LinearF16`].
     pub scratch_format: ScratchFormat,
+    /// Wakes an idle host when an asynchronous filter parameter changes.
+    /// Hosts that drive frames explicitly (such as offscreen exports) may omit it.
+    pub redraw: Option<interop::RedrawCallback>,
 }
 
 impl Default for GpuConfig {
@@ -97,6 +100,7 @@ impl Default for GpuConfig {
             budget: cherenkov::Budget::default(),
             pipeline_cache: None,
             scratch_format: ScratchFormat::default(),
+            redraw: None,
         }
     }
 }

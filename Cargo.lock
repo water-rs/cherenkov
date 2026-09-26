@@ -296,12 +296,14 @@ name = "cherenkov"
 version = "0.0.0"
 dependencies = [
  "color",
+ "filtrate-core",
  "kurbo",
  "nami",
  "nami-core",
  "serde",
  "serde_json",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]

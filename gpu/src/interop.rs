@@ -13,6 +13,8 @@ pub mod wgpu {
 
     /// Persistent device resources supplied once before rendering content.
     pub struct Context<'a> {
+        /// Adapter that owns the engine's device.
+        pub adapter: &'a Adapter,
         /// Engine-owned device.
         pub device: &'a Device,
         /// Engine-owned submission queue.

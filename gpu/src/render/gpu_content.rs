@@ -19,11 +19,13 @@ impl Slot {
     pub fn new(
         mut content: GpuContentBox,
         size: (u32, u32),
+        adapter: &wgpu::Adapter,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
     ) -> Self {
         assert!(size.0 > 0 && size.1 > 0, "GPU content size must be nonzero");
         content.content.setup(&Context {
+            adapter,
             device,
             queue,
             format: super::TARGET_FORMAT,

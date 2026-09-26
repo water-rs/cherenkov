@@ -430,6 +430,70 @@ fn bind_groups_are_reused_across_frames() -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
+/// `Pressure::Moderate` evicts scratch/backdrop textures; `Critical`
+/// additionally returns the grow-only shared buffers to baseline —
+/// `Engine::memory` shows the drop.
+#[test]
+fn trim_releases_cached_memory() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(engine) = engine(GpuConfig::default()) else {
+        return Ok(());
+    };
+    let surface = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
+    // Isolated group: forces a scratch pass and grows the instance buffer.
+    let scene = |c: &mut cherenkov::Recorder| {
+        c.fill(
+            Rect::new(0.0, 0.0, 64.0, 64.0),
+            WorkingColor::new([1.0, 0.0, 0.0, 1.0]),
+        );
+        c.group(cherenkov::Group::new().opacity(0.5), |c| {
+            for i in 0..300 {
+                c.fill(
+                    Rect::new(f64::from(i % 20), f64::from(i % 20), 60.0, 60.0),
+                    WorkingColor::new([0.0, 0.0, 1.0, 0.5]),
+                );
+            }
+        });
+    };
+    surface.update(|tx| {
+        tx[surface.root()].content(surface.record(|c| scene(c)));
+    });
+    engine.render(cherenkov_gpu::FrameTime::now())?;
+    let before = engine.memory();
+    engine.trim(cherenkov_gpu::Pressure::Moderate)?;
+    let moderate = engine.memory();
+    assert!(
+        moderate.gpu.0 < before.gpu.0,
+        "Moderate evicts scratch/backdrop textures: {} → {}",
+        before.gpu.0,
+        moderate.gpu.0
+    );
+    // Re-render so the instance buffer grows back, then trim hard.
+    surface.update(|tx| {
+        tx[surface.root()].content(surface.record(|c| scene(c)));
+    });
+    engine.render(cherenkov_gpu::FrameTime::now())?;
+    engine.trim(cherenkov_gpu::Pressure::Critical)?;
+    let critical = engine.memory();
+    assert!(
+        critical.gpu.0 <= moderate.gpu.0,
+        "Critical also frees buffers: {} → {}",
+        moderate.gpu.0,
+        critical.gpu.0
+    );
+    // The engine still renders correctly afterwards — this encode runs
+    // against the shrunk buffers and regrown scratch.
+    surface.update(|tx| {
+        tx[surface.root()].content(surface.record(|c| scene(c)));
+    });
+    engine.render(cherenkov_gpu::FrameTime::now())?;
+    let rb = surface.readback()?;
+    assert!(
+        rb.pixels[20 * 64 + 30][3] > 0.5,
+        "post-trim frame still draws"
+    );
+    Ok(())
+}
+
 /// `render` returns `Next::Idle` until animation scheduling exists —
 /// the contract the `Next::At` variant's docs state.
 #[test]

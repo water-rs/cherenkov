@@ -12,11 +12,11 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use cherenkov::Draw as _;
-use cherenkov_cpu::{
-    Engine as CpuEngine, FrameTime, Layer as CpuLayer, Offscreen, OffscreenFormat, Raster,
-    RasterConfig, RenderError, ResourceError, Surface, Transaction, Unsupported,
+use cherenkov::{
+    Draw as _, Engine as CpuEngine, FrameTime, Layer as CpuLayer, LayerEdit, Offscreen,
+    OffscreenFormat, RenderError, ResourceError, Surface, Transaction,
 };
+use cherenkov_cpu::{Raster, RasterConfig};
 use cherenkov_oracle::color::to_working;
 use cherenkov_scene::{
     BlendMode, ColorSpace, Draw as SceneDraw, Extend, Feature, GlyphRun as SceneGlyphRun, Item,
@@ -108,7 +108,7 @@ struct ContentLayer {
 pub struct Cherenkov {
     info: EngineInfo,
     engine: CpuEngine<Raster>,
-    surface: Option<Surface>,
+    surface: Option<Surface<Raster>>,
     /// Registered fonts per `(blob hash, face index)`.
     fonts: HashMap<(ResourceHash, u32), cherenkov::FontId>,
     /// Layers holding recorded content, in draw order.
@@ -155,17 +155,15 @@ const fn missing_api(f: &Feature) -> Option<&'static str> {
     }
 }
 
-/// The scene [`Feature`] a render-time [`Unsupported`] maps back to.
-const fn unsupported_feature(u: Unsupported) -> Feature {
+/// The scene [`Feature`] a render-time unsupported name maps back to.
+fn unsupported_feature(u: &str) -> Feature {
     match u {
-        Unsupported::Sweep => Feature::SweepGradient,
-        Unsupported::Mesh | Unsupported::Image | Unsupported::Shader => Feature::Image,
-        Unsupported::Blend | Unsupported::BlendSpace => Feature::Blend(BlendMode::Normal),
-        Unsupported::Filter => Feature::Opacity,
-        Unsupported::GlyphStroke | Unsupported::GlyphTransform | Unsupported::ColorFont => {
-            Feature::Glyphs
-        }
-        Unsupported::Shadow => Feature::Shadow,
+        "sweep-gradient" => Feature::SweepGradient,
+        "mesh-gradient" | "image" | "shader-paint" => Feature::Image,
+        "blend-mode" | "blend-space" | "backdrop" => Feature::Blend(BlendMode::Normal),
+        "filter" => Feature::Opacity,
+        "glyph-stroke" | "glyph-transform" | "color-font" => Feature::Glyphs,
+        "shadow" => Feature::Shadow,
         _ => Feature::Fill,
     }
 }
@@ -177,7 +175,7 @@ fn render_error(e: RenderError) -> BenchError {
         RenderError::Unsupported(u) => BenchError::Unsupported {
             engine: Cherenkov::NAME,
             feature: unsupported_feature(u),
-            api: Some(Box::leak(format!("{u}").into_boxed_str())),
+            api: Some(u),
         },
         e => BenchError::Gpu(format!("cherenkov render: {e}")),
     }
@@ -296,7 +294,7 @@ const fn front_rule(rule: cherenkov_scene::FillRule) -> cherenkov::FillRule {
 }
 
 /// Applies a clip shape to a layer edit.
-fn clip_shape(edit: &mut cherenkov_cpu::LayerEdit, shape: &ShapeKind) {
+fn clip_shape(edit: &mut LayerEdit<Raster>, shape: &ShapeKind) {
     match shape {
         ShapeKind::Rect(r) => drop(edit.clip(*r)),
         ShapeKind::RoundedRect(r) => drop(edit.clip(*r)),
@@ -402,17 +400,13 @@ fn register_fonts(
                     .get(&run.font)
                     .ok_or(cherenkov_scene::SceneError::MissingResource(run.font))?;
                 let font = engine
-                    .font(cherenkov_cpu::FontSource::bytes(blob.clone()).with_index(run.font_index))
+                    .font(cherenkov::FontSource::bytes(blob.clone()).with_index(run.font_index))
                     .map_err(|e| match e {
-                        ResourceError::Unsupported(Unsupported::ColorFont) => {
-                            BenchError::Unsupported {
-                                engine: Cherenkov::NAME,
-                                feature: Feature::Glyphs,
-                                api: Some(
-                                    "colour fonts (COLR/CBDT/sbix) are outside the first slice",
-                                ),
-                            }
-                        }
+                        ResourceError::Unsupported("color-font") => BenchError::Unsupported {
+                            engine: Cherenkov::NAME,
+                            feature: Feature::Glyphs,
+                            api: Some("colour fonts (COLR/CBDT/sbix) are outside the first slice"),
+                        },
                         e => BenchError::Engine(format!("cherenkov font: {e}")),
                     })?;
                 fonts.insert((run.font, run.font_index), font.id());
@@ -485,8 +479,8 @@ fn prep_layer(
     reason = "layer opacity is f32 at the engine boundary"
 )]
 fn build_layer(
-    surface: &Surface,
-    tx: &mut Transaction<'_>,
+    surface: &Surface<Raster>,
+    tx: &mut Transaction<'_, Raster>,
     parent: &CpuLayer,
     prep: PrepLayer,
     content_layers: &mut Vec<ContentLayer>,

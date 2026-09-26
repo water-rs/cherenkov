@@ -15,6 +15,7 @@ cherenkov = { path = ".." }
 cherenkov-scene = { path = "../scene" }
 kurbo = "0.13"
 libm = "0.2"
+i_overlay = "9"
 skrifa = "0.44"
 read-fonts = "0.41"
 png = "0.18"

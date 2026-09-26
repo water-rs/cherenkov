@@ -927,7 +927,7 @@ fn record_op(c: &mut cherenkov::Recorder, op: &Op) {
             ShapeKind::Line(s) => c.shadow(*s, *shadow),
             ShapeKind::Path(p) => c.shadow(p.clone(), *shadow),
         },
-        Op::Glyphs { run, paint } => c.glyphs(run, paint.clone()),
+        Op::Glyphs { run, paint } => c.glyphs(run.clone(), paint.clone()),
         Op::Image {
             image,
             dst,

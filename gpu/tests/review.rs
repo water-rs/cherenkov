@@ -59,7 +59,7 @@ fn render_text(
         .expect("surface");
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|c| {
-            c.glyphs(&text_run(font.id(), count, size), WorkingColor::WHITE);
+            c.glyphs(text_run(font.id(), count, size), WorkingColor::WHITE);
         }));
     });
     Some(

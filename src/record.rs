@@ -54,7 +54,7 @@ pub trait Draw {
     /// Draws a glyph run.
     fn glyphs<P: Into<Paint> + 'static>(
         &mut self,
-        run: &GlyphRun,
+        run: impl Into<Self::Value<GlyphRun>>,
         paint: impl Into<Self::Value<P>>,
     );
 
@@ -139,9 +139,13 @@ impl Draw for StaticRecorder {
         });
     }
 
-    fn glyphs<P: Into<Paint> + 'static>(&mut self, run: &GlyphRun, paint: impl Into<Fixed<P>>) {
+    fn glyphs<P: Into<Paint> + 'static>(
+        &mut self,
+        run: impl Into<Fixed<GlyphRun>>,
+        paint: impl Into<Fixed<P>>,
+    ) {
         self.list.push(Command::Glyphs {
-            run: run.clone(),
+            run: run.into().0,
             paint: paint.into().0.into(),
         });
     }
@@ -345,12 +349,18 @@ impl Draw for Recorder {
         self.subscribe(shadow.subscribe, command, Operand::Shadow);
     }
 
-    fn glyphs<P: Into<Paint> + 'static>(&mut self, run: &GlyphRun, paint: impl Into<Live<P>>) {
+    fn glyphs<P: Into<Paint> + 'static>(
+        &mut self,
+        run: impl Into<Live<GlyphRun>>,
+        paint: impl Into<Live<P>>,
+    ) {
+        let run = run.into();
         let paint = paint.into();
         let command = self.list.push(Command::Glyphs {
-            run: run.clone(),
+            run: run.value,
             paint: paint.value.into(),
         });
+        self.subscribe(run.subscribe, command, Operand::Run);
         self.subscribe(paint.subscribe, command, paint_operand::<P>);
     }
 

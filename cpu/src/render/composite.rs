@@ -3,9 +3,9 @@
 
 //! SIMD source-over, preserving the scalar multiplication/addition order.
 //!
-//! Solid paints blend packed RGBA directly, expanding varying coverage over
-//! each pixel's channels. Isolation uses matching channel-vector permutations. Partial vectors use the same
-//! scalar operation.
+//! Geometry spans blend packed RGBA directly, expanding varying coverage over
+//! each pixel's channels. Glyphs and isolation use matching channel-vector
+//! permutations. Partial vectors use the same scalar operation.
 
 use pulp::Simd;
 

@@ -70,7 +70,7 @@ pub struct Font {
 impl Font {
     /// A handle for the registered font `id`.
     #[must_use]
-    pub const fn new(id: cherenkov::FontId, tx: Sender<Message>) -> Self {
+    pub(crate) const fn new(id: cherenkov::FontId, tx: Sender<Message>) -> Self {
         Self { id, tx }
     }
 
@@ -152,7 +152,7 @@ impl ImageSource {
 
     /// Builds the `peniko` image payload the render thread registers.
     #[must_use]
-    pub fn into_image_data(self) -> peniko::ImageData {
+    pub(crate) fn into_image_data(self) -> peniko::ImageData {
         peniko::ImageData {
             data: peniko::Blob::new(std::sync::Arc::new(crate::message::SharedBytes(
                 self.data.clone(),
@@ -179,7 +179,7 @@ pub struct Image {
 impl Image {
     /// A handle for the registered image `id`.
     #[must_use]
-    pub const fn new(id: cherenkov::ImageId, tx: Sender<Message>) -> Self {
+    pub(crate) const fn new(id: cherenkov::ImageId, tx: Sender<Message>) -> Self {
         Self { id, tx }
     }
 
@@ -241,7 +241,7 @@ pub struct Shader {
 impl Shader {
     /// A handle for the registered shader `id`.
     #[must_use]
-    pub const fn new(id: cherenkov::ShaderId, tx: Sender<Message>) -> Self {
+    pub(crate) const fn new(id: cherenkov::ShaderId, tx: Sender<Message>) -> Self {
         Self { id, tx }
     }
 
@@ -269,7 +269,7 @@ pub struct Filter {
 impl Filter {
     /// A handle for the registered filter `id`.
     #[must_use]
-    pub const fn new(id: cherenkov::FilterId, tx: Sender<Message>) -> Self {
+    pub(crate) const fn new(id: cherenkov::FilterId, tx: Sender<Message>) -> Self {
         Self { id, tx }
     }
 

@@ -91,13 +91,15 @@ impl RedrawHandle {
 /// Object-safe adapter over [`GpuContent`]: `GpuContent::setup` returns an
 /// `impl Future`, which is not object safe, so the boxed form polls it with
 /// `pollster` on the render thread.
-pub trait AnyGpuContent: Send {
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "pub(crate) documents that nothing here escapes the crate"
+)]
+pub(crate) trait AnyGpuContent: Send {
     /// Runs `setup` to completion.
     fn setup(&mut self, gpu: &interop::wgpu::Context<'_>);
     /// Renders one frame.
     fn render(&mut self, frame: &mut interop::wgpu::Frame<'_>);
-    /// See [`GpuContent::is_opaque`].
-    fn is_opaque(&self) -> bool;
 }
 
 impl<T: GpuContent + Send> AnyGpuContent for T {
@@ -107,9 +109,5 @@ impl<T: GpuContent + Send> AnyGpuContent for T {
 
     fn render(&mut self, frame: &mut interop::wgpu::Frame<'_>) {
         GpuContent::render(self, frame);
-    }
-
-    fn is_opaque(&self) -> bool {
-        GpuContent::is_opaque(self)
     }
 }

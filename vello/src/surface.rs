@@ -29,7 +29,7 @@ use crate::message::{
 #[derive(Debug, Default)]
 pub struct SurfaceShared {
     /// Ops queued outside transactions (layer creates and drops).
-    pub pending: Vec<LayerOp>,
+    pub(crate) pending: Vec<LayerOp>,
     /// Live contents per layer.
     pub contents: HashMap<LayerId, Content>,
     /// Pending clear colour.
@@ -41,7 +41,7 @@ pub struct SurfaceShared {
 impl SurfaceShared {
     /// Drains pending ops and content changes into a change set. Returns
     /// `None` when nothing changed.
-    pub fn take_changes(&mut self) -> Option<ChangeSet> {
+    pub(crate) fn take_changes(&mut self) -> Option<ChangeSet> {
         let mut ops = std::mem::take(&mut self.pending);
         for (id, content) in &mut self.contents {
             if let Some(change) = content.take_change() {

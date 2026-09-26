@@ -1,0 +1,3877 @@
+{
+  "width": 256,
+  "height": 320,
+  "working_space": "linear-display-p3",
+  "clear": {
+    "space": "srgb",
+    "components": [
+      0.97,
+      0.97,
+      0.98,
+      1.0
+    ]
+  },
+  "features": [
+    {
+      "feature": "fill"
+    },
+    {
+      "feature": "linear-gradient"
+    },
+    {
+      "feature": "clip"
+    },
+    {
+      "feature": "scroll"
+    },
+    {
+      "feature": "animation"
+    },
+    {
+      "feature": "interpolation-space",
+      "value": "srgb"
+    }
+  ],
+  "root": {
+    "transform": [
+      1.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0
+    ],
+    "opacity": 1.0,
+    "blend": "normal",
+    "items": [
+      {
+        "layer": {
+          "transform": [
+            1.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0
+          ],
+          "clip": {
+            "rect": {
+              "x0": 8.0,
+              "y0": 16.0,
+              "x1": 248.0,
+              "y1": 304.0
+            }
+          },
+          "opacity": 1.0,
+          "blend": "normal",
+          "scroll_offset": {
+            "x": 0.0,
+            "y": 300.0
+          },
+          "motion": {
+            "motion": "scroll",
+            "value": {
+              "from": {
+                "x": 0.0,
+                "y": 100.0
+              },
+              "velocity": {
+                "x": 0.0,
+                "y": 2000.0
+              },
+              "deceleration": 4.0,
+              "bounds": {
+                "x0": 0.0,
+                "y0": 0.0,
+                "x1": 0.0,
+                "y1": 300.0
+              }
+            }
+          },
+          "items": [
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 0.0,
+                        "x1": 240.0,
+                        "y1": 40.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 0.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 0.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.35,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 48.0,
+                        "x1": 240.0,
+                        "y1": 88.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 48.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 48.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.35999998,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 96.0,
+                        "x1": 240.0,
+                        "y1": 136.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 96.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 96.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.37,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 144.0,
+                        "x1": 240.0,
+                        "y1": 184.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 144.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 144.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.38,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 192.0,
+                        "x1": 240.0,
+                        "y1": 232.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 192.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 192.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.39,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 240.0,
+                        "x1": 240.0,
+                        "y1": 280.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 240.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 240.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.39999998,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 288.0,
+                        "x1": 240.0,
+                        "y1": 328.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 288.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 288.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.41,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 336.0,
+                        "x1": 240.0,
+                        "y1": 376.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 336.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 336.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.42,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 384.0,
+                        "x1": 240.0,
+                        "y1": 424.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 384.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 384.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.43,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 432.0,
+                        "x1": 240.0,
+                        "y1": 472.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 432.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 432.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.44,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 480.0,
+                        "x1": 240.0,
+                        "y1": 520.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 480.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 480.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.45,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 528.0,
+                        "x1": 240.0,
+                        "y1": 568.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 528.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 528.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.45999998,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 576.0,
+                        "x1": 240.0,
+                        "y1": 616.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 576.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 576.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.47,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 624.0,
+                        "x1": 240.0,
+                        "y1": 664.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 624.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 624.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.48,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 672.0,
+                        "x1": 240.0,
+                        "y1": 712.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 672.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 672.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.49,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 720.0,
+                        "x1": 240.0,
+                        "y1": 760.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 720.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 720.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.5,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 768.0,
+                        "x1": 240.0,
+                        "y1": 808.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 768.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 768.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.51,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 816.0,
+                        "x1": 240.0,
+                        "y1": 856.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 816.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 816.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.52,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 864.0,
+                        "x1": 240.0,
+                        "y1": 904.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 864.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 864.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.53,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 912.0,
+                        "x1": 240.0,
+                        "y1": 952.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 912.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 912.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.53999996,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 960.0,
+                        "x1": 240.0,
+                        "y1": 1000.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 960.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 960.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.35,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 1008.0,
+                        "x1": 240.0,
+                        "y1": 1048.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 1008.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 1008.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.35999998,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 1056.0,
+                        "x1": 240.0,
+                        "y1": 1096.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 1056.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 1056.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.37,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 1104.0,
+                        "x1": 240.0,
+                        "y1": 1144.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 1104.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 1104.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.38,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 1152.0,
+                        "x1": 240.0,
+                        "y1": 1192.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 1152.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 1152.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.39,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 1200.0,
+                        "x1": 240.0,
+                        "y1": 1240.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 1200.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 1200.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.39999998,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 1248.0,
+                        "x1": 240.0,
+                        "y1": 1288.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 1248.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 1248.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.41,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 1296.0,
+                        "x1": 240.0,
+                        "y1": 1336.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 1296.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 1296.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.42,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 1344.0,
+                        "x1": 240.0,
+                        "y1": 1384.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 1344.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 1344.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.43,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 1392.0,
+                        "x1": 240.0,
+                        "y1": 1432.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 1392.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 1392.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.44,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 1440.0,
+                        "x1": 240.0,
+                        "y1": 1480.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 1440.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 1440.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.45,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 1488.0,
+                        "x1": 240.0,
+                        "y1": 1528.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 1488.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 1488.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.45999998,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 1536.0,
+                        "x1": 240.0,
+                        "y1": 1576.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 1536.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 1536.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.47,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 1584.0,
+                        "x1": 240.0,
+                        "y1": 1624.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 1584.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 1584.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.48,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 1632.0,
+                        "x1": 240.0,
+                        "y1": 1672.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 1632.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 1632.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.49,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 1680.0,
+                        "x1": 240.0,
+                        "y1": 1720.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 1680.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 1680.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.5,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 1728.0,
+                        "x1": 240.0,
+                        "y1": 1768.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 1728.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 1728.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.51,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 1776.0,
+                        "x1": 240.0,
+                        "y1": 1816.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 1776.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 1776.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.52,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 1824.0,
+                        "x1": 240.0,
+                        "y1": 1864.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 1824.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 1824.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.53,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 1872.0,
+                        "x1": 240.0,
+                        "y1": 1912.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 1872.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 1872.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.53999996,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 1920.0,
+                        "x1": 240.0,
+                        "y1": 1960.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 1920.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 1920.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.35,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 1968.0,
+                        "x1": 240.0,
+                        "y1": 2008.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 1968.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 1968.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.35999998,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 2016.0,
+                        "x1": 240.0,
+                        "y1": 2056.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 2016.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 2016.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.37,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 2064.0,
+                        "x1": 240.0,
+                        "y1": 2104.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 2064.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 2064.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.38,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 2112.0,
+                        "x1": 240.0,
+                        "y1": 2152.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 2112.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 2112.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.39,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 2160.0,
+                        "x1": 240.0,
+                        "y1": 2200.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 2160.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 2160.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.39999998,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 2208.0,
+                        "x1": 240.0,
+                        "y1": 2248.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 2208.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 2208.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.41,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 2256.0,
+                        "x1": 240.0,
+                        "y1": 2296.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 2256.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 2256.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.42,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 2304.0,
+                        "x1": 240.0,
+                        "y1": 2344.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 2304.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 2304.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.43,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 2352.0,
+                        "x1": 240.0,
+                        "y1": 2392.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 2352.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 2352.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.44,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 2400.0,
+                        "x1": 240.0,
+                        "y1": 2440.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 2400.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 2400.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.45,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 2448.0,
+                        "x1": 240.0,
+                        "y1": 2488.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 2448.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 2448.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.45999998,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 2496.0,
+                        "x1": 240.0,
+                        "y1": 2536.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 2496.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 2496.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.47,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 2544.0,
+                        "x1": 240.0,
+                        "y1": 2584.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 2544.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 2544.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.48,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 2592.0,
+                        "x1": 240.0,
+                        "y1": 2632.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 2592.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 2592.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.49,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 2640.0,
+                        "x1": 240.0,
+                        "y1": 2680.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 2640.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 2640.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.5,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 2688.0,
+                        "x1": 240.0,
+                        "y1": 2728.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 2688.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 2688.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.51,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 2736.0,
+                        "x1": 240.0,
+                        "y1": 2776.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 2736.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 2736.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.52,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 2784.0,
+                        "x1": 240.0,
+                        "y1": 2824.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 2784.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 2784.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.53,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 16.0,
+                        "y0": 2832.0,
+                        "x1": 240.0,
+                        "y1": 2872.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "linear": {
+                      "start": {
+                        "x": 16.0,
+                        "y": 2832.0
+                      },
+                      "end": {
+                        "x": 240.0,
+                        "y": 2832.0
+                      },
+                      "stops": [
+                        {
+                          "offset": 0.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.75,
+                              0.55,
+                              0.85,
+                              1.0
+                            ]
+                          }
+                        },
+                        {
+                          "offset": 1.0,
+                          "color": {
+                            "space": "srgb",
+                            "components": [
+                              0.5,
+                              0.53999996,
+                              0.75,
+                              1.0
+                            ]
+                          }
+                        }
+                      ],
+                      "extend": "pad",
+                      "interpolation": "srgb"
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

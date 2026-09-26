@@ -341,6 +341,7 @@ impl Engine for VelloHybrid {
             image,
             gpu_seconds,
             passes: Vec::new(),
+            phases: Vec::new(),
         })
     }
 

@@ -903,6 +903,7 @@ impl Engine for SkiaCpu {
             image,
             gpu_seconds: None,
             passes: Vec::new(),
+            phases: Vec::new(),
         })
     }
 
@@ -1285,6 +1286,7 @@ impl Engine for SkiaVk {
             image,
             gpu_seconds,
             passes: Vec::new(),
+            phases: Vec::new(),
         })
     }
 
@@ -1584,6 +1586,7 @@ mod graphite_metal {
                 image,
                 gpu_seconds,
                 passes: Vec::new(),
+                phases: Vec::new(),
             })
         }
 

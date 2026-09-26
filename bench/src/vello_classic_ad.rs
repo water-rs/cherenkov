@@ -287,6 +287,7 @@ impl Engine for VelloClassic {
             image,
             gpu_seconds,
             passes: Vec::new(),
+            phases: Vec::new(),
         })
     }
 

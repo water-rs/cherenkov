@@ -10,9 +10,9 @@ use std::hash::{Hash, Hasher};
 use cherenkov::{FillRule, ShapeData};
 use kurbo::{Affine, BezPath, PathEl, Point, Rect, Shape as _, Vec2};
 
-use crate::error::RenderError;
 use crate::render::glyph::{Atlas, PathCell, PathEmit};
 use crate::render::raster::Raster;
+use cherenkov::RenderError;
 
 /// Coverage strip height in device rows.
 pub const STRIP_H: usize = 4;
@@ -214,10 +214,10 @@ pub fn emit(
                        h: usize|
      -> Result<(), RenderError> {
         let (Ok(w32), Ok(h32)) = (u32::try_from(w), u32::try_from(h)) else {
-            return Err(RenderError::AtlasFull);
+            return Err(RenderError::Render("glyph atlas full".into()));
         };
         let Some((cx, cy)) = atlas.alloc(w32, h32) else {
-            return Err(RenderError::AtlasFull);
+            return Err(RenderError::Render("glyph atlas full".into()));
         };
         let mut rows = Vec::with_capacity(w * h);
         for row in 0..h {

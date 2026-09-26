@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use cherenkov::kurbo::Affine;
+use cherenkov::kurbo::{self, Affine, Shape};
 use cherenkov::{BlendSpace, Command, DisplayList, GlyphStyle, Paint};
 use vello::peniko::{self, Brush, ColorStops, Fill, ImageBrush, ImageSampler};
 use vello::{Glyph, Scene};
@@ -13,6 +13,7 @@ use vello::{Glyph, Scene};
 use crate::error::{RenderError, Unsupported};
 
 use super::convert;
+use super::shader::{self, ShaderRegistry, ShaderUse};
 
 /// The registries lowering resolves ids through.
 pub struct Resources<'a> {
@@ -20,8 +21,14 @@ pub struct Resources<'a> {
     pub fonts: &'a HashMap<u64, peniko::FontData>,
     /// Registered images, by `ImageId::raw`.
     pub images: &'a HashMap<u64, peniko::ImageData>,
+    /// Registered shaders, by `ShaderId::raw`.
+    pub shaders: &'a ShaderRegistry,
     /// The surface size in device pixels (group layers clip to it).
     pub target_size: (u32, u32),
+    /// The device texture limit, clamping shader-use texture sizes.
+    pub max_texture: u32,
+    /// Shader paint uses discovered while lowering, in command order.
+    pub shader_uses: &'a mut Vec<ShaderUse>,
 }
 
 /// Lowers `list` into `scene`, appending commands under `transform`.
@@ -34,7 +41,7 @@ pub fn lower(
     list: &DisplayList,
     scene: &mut Scene,
     transform: Affine,
-    resources: &Resources<'_>,
+    resources: &mut Resources<'_>,
 ) -> Result<(), RenderError> {
     // Stack entries carry whether the scope pushed a vello layer that must
     // be popped at `End`; `BeginTransform` pushes no layer.
@@ -43,8 +50,11 @@ pub fn lower(
         let xf = stack.last().expect("the stack never empties").0;
         match command {
             Command::Fill { shape, paint } => {
-                let (brush, brush_transform) = brush_of(paint, resources)?;
                 let path = convert::shape_path(shape);
+                let (brush, brush_transform) = match paint {
+                    Paint::Shader(sp) => shader_brush(sp, &path, xf, resources)?,
+                    _ => brush_of(paint, resources)?,
+                };
                 scene.fill(
                     convert::fill(convert::shape_rule(shape)),
                     xf,
@@ -58,8 +68,11 @@ pub fn lower(
                 stroke,
                 paint,
             } => {
-                let (brush, brush_transform) = brush_of(paint, resources)?;
                 let path = convert::shape_path(shape);
+                let (brush, brush_transform) = match paint {
+                    Paint::Shader(sp) => shader_brush(sp, &path, xf, resources)?,
+                    _ => brush_of(paint, resources)?,
+                };
                 scene.stroke(stroke, xf, &brush, brush_transform, &path);
             }
             Command::Shadow { shape, shadow } => {
@@ -153,13 +166,14 @@ pub fn lower(
                 if group.filter.is_some() {
                     return Err(Unsupported::GroupFilter.into());
                 }
-                // Vello blends groups in the encoded 8-bit target. A group
-                // that declared working-space blending cannot be honoured
-                // when it would actually isolate (a non-normal blend or
-                // reduced opacity); blending a plain src-over group is
-                // unaffected.
+                // Vello blends in the encoded 8-bit target for every
+                // fill, so a plain src-over group — even one isolating
+                // only by opacity — composites consistently with the
+                // rest of the frame. A non-normal separable or
+                // non-separable blend evaluated in the wrong space is
+                // the visibly different case: only that errors.
                 if group.blend_space == BlendSpace::Linear
-                    && (group.blend != cherenkov::BlendMode::Normal || group.opacity < 1.0)
+                    && group.blend != cherenkov::BlendMode::Normal
                 {
                     return Err(Unsupported::BlendSpace.into());
                 }
@@ -265,6 +279,59 @@ fn brush_of(
                 Some(pattern.transform),
             )
         }
-        Paint::Shader(_) => return Err(Unsupported::Shader.into()),
+        Paint::Shader(_) => unreachable!("shader paints resolve through shader_brush"),
     })
+}
+
+/// Resolves a `Paint::Shader` use to an image brush over the use's
+/// retained texture, with a brush transform mapping the texture onto the
+/// shape's device-space bounding box, and records the use for the
+/// render-side evaluator.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "bounding-box device pixels are small positive values"
+)]
+fn shader_brush(
+    paint: &cherenkov::ShaderPaint,
+    path: &kurbo::BezPath,
+    xf: Affine,
+    resources: &mut Resources<'_>,
+) -> Result<(Brush, Option<Affine>), RenderError> {
+    let id = paint.shader.raw();
+    if !resources.shaders.contains(id) {
+        return Err(RenderError::Shader(format!("unregistered shader {id}")));
+    }
+    if paint.uniforms.len() > shader::MAX_SHADER_PARAMS {
+        return Err(Unsupported::ShaderParams.into());
+    }
+    let bbox = (xf * path.clone()).bounding_box();
+    let w = (bbox.width().ceil() as u32).clamp(1, resources.max_texture);
+    let h = (bbox.height().ceil() as u32).clamp(1, resources.max_texture);
+    let image = shader::texture_image(w, h, peniko::ImageAlphaType::Alpha);
+    let brush = Brush::Image(ImageBrush {
+        image: image.clone(),
+        sampler: ImageSampler {
+            x_extend: peniko::Extend::Pad,
+            y_extend: peniko::Extend::Pad,
+            quality: peniko::ImageQuality::Medium,
+            alpha: 1.0,
+        },
+    });
+    // Map the `w`×`h` texture over the shape's device-space bbox.
+    let brush_transform = Affine::translate((bbox.x0, bbox.y0))
+        * Affine::scale_non_uniform(bbox.width() / f64::from(w), bbox.height() / f64::from(h));
+    resources.shader_uses.push(ShaderUse {
+        shader: id,
+        uniforms: paint.uniforms.clone(),
+        size: (w, h),
+        image,
+        texture: None,
+        view: None,
+        uniforms_buffer: None,
+        params_buffer: None,
+        bind_group: None,
+        rendered: false,
+    });
+    Ok((brush, Some(brush_transform)))
 }

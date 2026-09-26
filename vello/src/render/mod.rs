@@ -4,17 +4,22 @@
 //! The render thread: sole owner of GPU state.
 
 mod convert;
+pub mod filter;
+mod gpu_content;
 mod lower;
+mod shader;
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::mpsc::{Receiver, Sender};
+use std::time::{Duration, Instant};
 
 use cherenkov::ContentChange;
+use cherenkov::kurbo::{self, Shape as _};
 use vello::peniko;
 use vello::{AaConfig, AaSupport, RendererOptions};
 
-use crate::error::{EngineError, RenderError, SurfaceError, Unsupported};
+use crate::error::{EngineError, RenderError, SurfaceError};
 use crate::message::{ChangeSet, LayerId, LayerOp, Message, SurfaceId, TargetSpec};
 use crate::surface::{FrameStats, Next, Readback};
 use crate::{Bytes, interop};
@@ -51,6 +56,8 @@ enum ContentData {
     List(cherenkov::DisplayList),
     /// A shared immutable picture.
     Picture(cherenkov::Picture),
+    /// GPU-produced content.
+    Gpu(Box<gpu_content::GpuSlot>),
 }
 
 /// A retained layer node.
@@ -64,6 +71,8 @@ struct LayerNode {
     /// The content lowered into a reusable scene fragment; rebuilt whenever
     /// `content` changes or the surface is resized.
     fragment: Option<vello::Scene>,
+    /// Shader paint uses inside `fragment`, in command order.
+    shader_uses: Vec<shader::ShaderUse>,
     children: Vec<LayerId>,
 }
 
@@ -77,15 +86,53 @@ const fn node() -> LayerNode {
         filter: None,
         content: None,
         fragment: None,
+        shader_uses: Vec::new(),
         children: Vec::new(),
+    }
+}
+
+/// What a surface renders into, on the render thread.
+enum TargetState {
+    /// An offscreen texture.
+    Offscreen {
+        /// The target texture.
+        texture: wgpu::Texture,
+        /// Its view.
+        view: wgpu::TextureView,
+    },
+    /// A window surface plus its intermediate render texture.
+    Window {
+        /// The wgpu surface.
+        surface: wgpu::Surface<'static>,
+        /// The applied configuration.
+        config: wgpu::SurfaceConfiguration,
+        /// The intermediate texture vello renders into.
+        texture: wgpu::Texture,
+        /// Its view.
+        view: wgpu::TextureView,
+    },
+}
+
+impl TargetState {
+    /// The view vello renders into.
+    const fn view(&self) -> &wgpu::TextureView {
+        match self {
+            Self::Offscreen { view, .. } | Self::Window { view, .. } => view,
+        }
+    }
+
+    /// The target texture (readback).
+    const fn texture(&self) -> &wgpu::Texture {
+        match self {
+            Self::Offscreen { texture, .. } | Self::Window { texture, .. } => texture,
+        }
     }
 }
 
 /// One surface's GPU-side state.
 struct SurfaceState {
     size: (u32, u32),
-    target: wgpu::Texture,
-    view: wgpu::TextureView,
+    target: TargetState,
     readable: bool,
     layers: HashMap<LayerId, LayerNode>,
     clear: cherenkov::WorkingColor,
@@ -107,6 +154,13 @@ struct Renderer {
     surfaces: HashMap<SurfaceId, SurfaceState>,
     fonts: HashMap<u64, peniko::FontData>,
     images: HashMap<u64, peniko::ImageData>,
+    shaders: shader::ShaderRegistry,
+    filters: filter::FilterRegistry,
+    /// Presentation blit pipelines, one per swapchain format seen.
+    blitters: HashMap<wgpu::TextureFormat, wgpu::util::TextureBlitter>,
+    /// Engine start instant; `uniforms.time` and content `elapsed` are
+    /// measured from it.
+    start: Instant,
     timestamps: bool,
     query_set: Option<wgpu::QuerySet>,
     query_buffer: Option<wgpu::Buffer>,
@@ -272,6 +326,10 @@ pub fn run(
             surfaces: HashMap::new(),
             fonts: HashMap::new(),
             images: HashMap::new(),
+            shaders: shader::ShaderRegistry::default(),
+            filters: filter::FilterRegistry::default(),
+            blitters: HashMap::new(),
+            start: Instant::now(),
             timestamps,
             query_set,
             query_buffer,
@@ -319,6 +377,18 @@ pub fn run(
             Message::RemoveImage { id } => {
                 renderer.images.remove(&id);
             }
+            Message::AddShader { id, source, reply } => {
+                let _ = reply.send(renderer.shaders.add(&renderer.device, id, &source));
+            }
+            Message::RemoveShader { id } => {
+                renderer.shaders.remove(id);
+            }
+            Message::AddFilter { id, source } => {
+                renderer.filters.add(id, source);
+            }
+            Message::RemoveFilter { id } => {
+                renderer.filters.remove(id);
+            }
             Message::Commit { surface, changes } => {
                 renderer.commit(surface, changes);
             }
@@ -348,15 +418,32 @@ pub fn run(
 
 impl Renderer {
     /// Creates a surface's target texture and layer tree.
-    #[expect(
-        clippy::needless_pass_by_value,
-        reason = "the phase-2 window target is consumed"
-    )]
     fn create_surface(&mut self, id: SurfaceId, target: TargetSpec) -> Result<(), SurfaceError> {
-        let (size, readable) = match target {
-            TargetSpec::Offscreen { size } => (size, true),
-            TargetSpec::Window(_) => {
-                return Err(Unsupported::WindowSurface.into());
+        let (target, size, readable) = match target {
+            TargetSpec::Offscreen { size } => {
+                let (texture, view) =
+                    create_target(&self.device, "surface target", size, TARGET_USAGES);
+                (TargetState::Offscreen { texture, view }, size, true)
+            }
+            TargetSpec::Window(window) => {
+                let interop::wgpu::Window { surface, config } = *window;
+                let size = (config.width, config.height);
+                surface.configure(&self.device, &config);
+                self.blitters.entry(config.format).or_insert_with(|| {
+                    wgpu::util::TextureBlitter::new(&self.device, config.format)
+                });
+                let (texture, view) =
+                    create_target(&self.device, "surface target", size, TARGET_USAGES);
+                (
+                    TargetState::Window {
+                        surface,
+                        config,
+                        texture,
+                        view,
+                    },
+                    size,
+                    false,
+                )
             }
         };
         if size.0 > self.max_texture || size.1 > self.max_texture {
@@ -366,7 +453,6 @@ impl Renderer {
                 max: self.max_texture,
             });
         }
-        let (target, view) = create_target(&self.device, "surface target", size, TARGET_USAGES);
         let mut layers = HashMap::new();
         layers.insert(0, node());
         self.surfaces.insert(
@@ -374,7 +460,6 @@ impl Renderer {
             SurfaceState {
                 size,
                 target,
-                view,
                 readable,
                 layers,
                 clear: cherenkov::WorkingColor::TRANSPARENT,
@@ -384,7 +469,7 @@ impl Renderer {
         Ok(())
     }
 
-    /// Resizes a surface, recreating its target.
+    /// Resizes a surface, recreating its target (reconfiguring a window).
     fn resize_surface(&mut self, id: SurfaceId, size: (u32, u32)) {
         let Some(state) = self.surfaces.get_mut(&id) else {
             return;
@@ -392,10 +477,23 @@ impl Renderer {
         if size == state.size || size.0 > self.max_texture || size.1 > self.max_texture {
             return;
         }
-        let (target, view) = create_target(&self.device, "surface target", size, TARGET_USAGES);
+        let (texture, view) = create_target(&self.device, "surface target", size, TARGET_USAGES);
         state.size = size;
-        state.target = target;
-        state.view = view;
+        if let TargetState::Window {
+            surface,
+            config,
+            texture: t,
+            view: v,
+        } = &mut state.target
+        {
+            config.width = size.0;
+            config.height = size.1;
+            surface.configure(&self.device, config);
+            *t = texture;
+            *v = view;
+        } else {
+            state.target = TargetState::Offscreen { texture, view };
+        }
         // Fragments cached against the old size are still valid (they are
         // recorded in user space), but clip-less group layers used the old
         // surface rect; rebuild everything to keep it simple.
@@ -421,7 +519,7 @@ impl Renderer {
                     state.layers.entry(id).or_insert_with(node);
                 }
                 LayerOp::Remove(id) => {
-                    Self::remove_node(&mut state.layers, id);
+                    Self::remove_node(&mut self.vello, &mut state.layers, id);
                 }
                 LayerOp::Transform(id, t) => {
                     if let Some(node) = state.layers.get_mut(&id) {
@@ -450,8 +548,17 @@ impl Renderer {
                 }
                 LayerOp::Content(id, content) => {
                     if let Some(node) = state.layers.get_mut(&id) {
+                        if let Some(old) = node.content.take() {
+                            Self::unregister_content(&mut self.vello, old);
+                        }
+                        for use_ in node.shader_uses.drain(..) {
+                            self.vello.override_image(&use_.image, None);
+                        }
                         node.content = content.map(|c| match c {
                             crate::message::LayerContentMsg::Picture(p) => ContentData::Picture(p),
+                            crate::message::LayerContentMsg::Gpu(m) => {
+                                ContentData::Gpu(Box::new(gpu_content::GpuSlot::new(m)))
+                            }
                         });
                         node.fragment = None;
                     }
@@ -503,13 +610,31 @@ impl Renderer {
         }
     }
 
-    /// Removes a node and its descendants.
-    fn remove_node(layers: &mut HashMap<LayerId, LayerNode>, id: LayerId) {
+    /// Removes a node and its descendants, unbinding any vello image
+    /// overrides their textures registered.
+    fn remove_node(
+        vello: &mut vello::Renderer,
+        layers: &mut HashMap<LayerId, LayerNode>,
+        id: LayerId,
+    ) {
         Self::detach(layers, id);
-        if let Some(node) = layers.remove(&id) {
-            for child in node.children {
-                Self::remove_node(layers, child);
+        if let Some(mut node) = layers.remove(&id) {
+            if let Some(content) = node.content.take() {
+                Self::unregister_content(vello, content);
             }
+            for use_ in node.shader_uses.drain(..) {
+                vello.override_image(&use_.image, None);
+            }
+            for child in node.children {
+                Self::remove_node(vello, layers, child);
+            }
+        }
+    }
+
+    /// Unbinds a dropped content's vello image overrides.
+    fn unregister_content(vello: &mut vello::Renderer, content: ContentData) {
+        if let ContentData::Gpu(slot) = content {
+            slot.unregister(vello);
         }
     }
 
@@ -526,11 +651,11 @@ impl Renderer {
         }
     }
 
-    /// Composes `layer`'s fragment, building it when absent.
+    /// Composes `layer`'s fragment, building it when absent. Shader uses
+    /// discovered while lowering replace the node's previous set.
     fn layer_fragment(
+        &mut self,
         node: &mut LayerNode,
-        fonts: &HashMap<u64, peniko::FontData>,
-        images: &HashMap<u64, peniko::ImageData>,
         target_size: (u32, u32),
     ) -> Result<(), RenderError> {
         if node.fragment.is_some() {
@@ -539,53 +664,116 @@ impl Renderer {
         let Some(content) = &node.content else {
             return Ok(());
         };
+        if !matches!(content, ContentData::List(_) | ContentData::Picture(_)) {
+            return Ok(());
+        }
+        for use_ in node.shader_uses.drain(..) {
+            self.vello.override_image(&use_.image, None);
+        }
         let mut scene = vello::Scene::new();
-        let resources = lower::Resources {
-            fonts,
-            images,
-            target_size,
-        };
-        match content {
-            ContentData::List(list) => lower::lower(
-                list,
-                &mut scene,
-                cherenkov::kurbo::Affine::IDENTITY,
-                &resources,
-            ),
-            ContentData::Picture(picture) => lower::lower(
-                picture.display_list(),
-                &mut scene,
-                cherenkov::kurbo::Affine::IDENTITY,
-                &resources,
-            ),
-        }?;
+        let mut uses = Vec::new();
+        {
+            let mut resources = lower::Resources {
+                fonts: &self.fonts,
+                images: &self.images,
+                shaders: &self.shaders,
+                target_size,
+                max_texture: self.max_texture,
+                shader_uses: &mut uses,
+            };
+            match content {
+                ContentData::List(list) => lower::lower(
+                    list,
+                    &mut scene,
+                    cherenkov::kurbo::Affine::IDENTITY,
+                    &mut resources,
+                ),
+                ContentData::Picture(picture) => lower::lower(
+                    picture.display_list(),
+                    &mut scene,
+                    cherenkov::kurbo::Affine::IDENTITY,
+                    &mut resources,
+                ),
+                ContentData::Gpu(_) => unreachable!("early return above"),
+            }?;
+        }
+        node.shader_uses = uses;
         node.fragment = Some(scene);
+        Ok(())
+    }
+
+    /// Renders the shader paints `fragment` references that need
+    /// re-evaluation this frame (new, animated, or resized), and binds
+    /// their textures into vello's atlas.
+    fn evaluate_shader_uses(
+        &mut self,
+        node: &mut LayerNode,
+        now: Instant,
+        wants_next: &mut bool,
+    ) -> Result<(), RenderError> {
+        let time = now.saturating_duration_since(self.start).as_secs_f32();
+        for use_ in std::mem::take(&mut node.shader_uses) {
+            let mut use_ = use_;
+            if !use_.rendered || self.shaders.animated(use_.shader) {
+                self.shaders
+                    .evaluate(&self.device, &self.queue, &mut use_, time)
+                    .map_err(|e| match e {
+                        shader::RenderShader::Unregistered(id) => {
+                            RenderError::Shader(format!("unregistered shader {id}"))
+                        }
+                    })?;
+                self.vello.override_image(
+                    &use_.image,
+                    Some(wgpu::TexelCopyTextureInfoBase {
+                        texture: use_.texture.clone().expect("evaluated"),
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    }),
+                );
+                self.vello.mark_override_image_dirty(&use_.image);
+            }
+            *wants_next |= self.shaders.animated(use_.shader);
+            node.shader_uses.push(use_);
+        }
         Ok(())
     }
 
     /// Composes one layer and its children into `scene` under `parent_xf`.
     #[expect(
         clippy::too_many_arguments,
-        reason = "the registries and the layer map are disjoint borrows"
+        reason = "compose threads the scene, stats and refresh flag through recursion"
     )]
     fn compose(
+        &mut self,
         layers: &mut HashMap<LayerId, LayerNode>,
-        fonts: &HashMap<u64, peniko::FontData>,
-        images: &HashMap<u64, peniko::ImageData>,
         id: LayerId,
         parent_xf: cherenkov::kurbo::Affine,
         target_size: (u32, u32),
         scene: &mut vello::Scene,
         stats: &mut FrameStats,
+        wants_next: &mut bool,
+        now: Instant,
     ) -> Result<(), RenderError> {
         let Some(node) = layers.get_mut(&id) else {
             return Ok(());
         };
         let world = parent_xf * node.transform;
+        self.layer_fragment(node, target_size)?;
+        self.evaluate_shader_uses(node, now, wants_next)?;
         if node.filter.is_some() {
-            return Err(Unsupported::Filter.into());
+            return self.compose_filtered(
+                layers,
+                id,
+                parent_xf,
+                world,
+                target_size,
+                scene,
+                stats,
+                wants_next,
+                now,
+            );
         }
-        Self::layer_fragment(node, fonts, images, target_size)?;
         let needs_layer =
             node.opacity < 1.0 || node.blend != cherenkov::BlendMode::Normal || node.clip.is_some();
         if needs_layer {
@@ -601,22 +789,85 @@ impl Renderer {
                 &clip,
             );
         }
+        self.compose_contents(
+            layers,
+            id,
+            world,
+            target_size,
+            scene,
+            stats,
+            wants_next,
+            now,
+        )?;
+        if needs_layer {
+            scene.pop_layer();
+        }
+        Ok(())
+    }
+
+    /// Appends `id`'s content fragment (or gpu content image) and children
+    /// at `world` — the part of `compose` the filter capture path reuses.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "shared inner step of compose and compose_filtered"
+    )]
+    fn compose_contents(
+        &mut self,
+        layers: &mut HashMap<LayerId, LayerNode>,
+        id: LayerId,
+        world: cherenkov::kurbo::Affine,
+        target_size: (u32, u32),
+        scene: &mut vello::Scene,
+        stats: &mut FrameStats,
+        wants_next: &mut bool,
+        now: Instant,
+    ) -> Result<(), RenderError> {
+        let Some(node) = layers.get_mut(&id) else {
+            return Ok(());
+        };
         if let Some(fragment) = &node.fragment {
             stats.draws += 1;
             scene.append(fragment, Some(world));
         }
+        let gpu_image = if let Some(ContentData::Gpu(slot)) = &mut node.content {
+            *wants_next |=
+                slot.evaluate(&self.device, &self.queue, &mut self.vello, self.start, now);
+            let ready = slot.ready.as_ref().expect("evaluate ensured it");
+            Some((
+                ready.image.clone(),
+                f64::from(slot.size.0) / f64::from(ready.image.width),
+                f64::from(slot.size.1) / f64::from(ready.image.height),
+            ))
+        } else {
+            None
+        };
         let children = std::mem::take(&mut node.children);
+        if let Some((image, sx, sy)) = gpu_image {
+            scene.draw_image(
+                &peniko::ImageBrush {
+                    image,
+                    sampler: peniko::ImageSampler {
+                        x_extend: peniko::Extend::Pad,
+                        y_extend: peniko::Extend::Pad,
+                        quality: peniko::ImageQuality::Medium,
+                        alpha: 1.0,
+                    },
+                },
+                world * cherenkov::kurbo::Affine::scale_non_uniform(sx, sy),
+            );
+            stats.draws += 1;
+        }
         let mut result = Ok(());
         for child in &children {
-            result = Self::compose(
+            result = self.compose(
                 layers,
-                fonts,
-                images,
                 *child,
                 world,
                 target_size,
                 scene,
                 stats,
+                wants_next,
+                now,
             );
             if result.is_err() {
                 break;
@@ -624,17 +875,149 @@ impl Renderer {
         }
         let node = layers.get_mut(&id).expect("the node exists");
         node.children = children;
-        result?;
-        if needs_layer {
-            scene.pop_layer();
-        }
+        result
+    }
+
+    /// The filtered path: renders the layer's subtree into a capture
+    /// texture, runs the effect, and draws the output as an image at the
+    /// capture bounds.
+    ///
+    /// A filtered layer ignores `opacity`/`blend`: the filter replaces the
+    /// pushed composite layer (the clip bounds still bound the capture).
+    #[expect(
+        clippy::too_many_arguments,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "mirrors compose's parameters; device-pixel sizes are small positive values"
+    )]
+    fn compose_filtered(
+        &mut self,
+        layers: &mut HashMap<LayerId, LayerNode>,
+        id: LayerId,
+        parent_xf: cherenkov::kurbo::Affine,
+        world: cherenkov::kurbo::Affine,
+        target_size: (u32, u32),
+        scene: &mut vello::Scene,
+        stats: &mut FrameStats,
+        wants_next: &mut bool,
+        now: Instant,
+    ) -> Result<(), RenderError> {
+        let node = layers.get(&id).expect("the node exists");
+        let filter_id = node.filter.expect("checked by compose");
+        // Capture bounds in target space: the clip's device-space bounds,
+        // intersected with the target; the whole target when unclipped.
+        let clip_bounds = node.clip.as_ref().map(|clip| {
+            let rect = (world * convert::shape_path(clip)).bounding_box();
+            rect.intersect(kurbo::Rect::new(
+                0.0,
+                0.0,
+                f64::from(target_size.0),
+                f64::from(target_size.1),
+            ))
+        });
+        let bounds = clip_bounds.unwrap_or_else(|| {
+            kurbo::Rect::new(0.0, 0.0, f64::from(target_size.0), f64::from(target_size.1))
+        });
+        let size = (
+            (bounds.width().ceil() as u32).clamp(1, self.max_texture),
+            (bounds.height().ceil() as u32).clamp(1, self.max_texture),
+        );
+        // Compose the subtree into a capture scene; its parent transform
+        // shifts the capture bounds' origin to the texture's.
+        let capture_parent =
+            cherenkov::kurbo::Affine::translate((-bounds.x0, -bounds.y0)) * parent_xf;
+        let mut sub = vello::Scene::new();
+        let capture_world = capture_parent * node.transform;
+        self.compose_contents(
+            layers,
+            id,
+            capture_world,
+            target_size,
+            &mut sub,
+            stats,
+            wants_next,
+            now,
+        )?;
+        let capture_view = self
+            .filters
+            .ensure_capture(&self.device, filter_id.raw(), size)?;
+        self.vello
+            .render_to_texture(
+                &self.device,
+                &self.queue,
+                &sub,
+                &capture_view,
+                &vello::RenderParams {
+                    base_color: peniko::Color::TRANSPARENT,
+                    width: size.0,
+                    height: size.1,
+                    antialiasing_method: AaConfig::Area,
+                },
+            )
+            .map_err(|e| RenderError::Render(format!("filter capture: {e}")))?;
+        stats.passes += 1;
+        let (_out_view, image, again) =
+            self.filters
+                .evaluate(&self.device, &self.queue, filter_id.raw(), size)?;
+        let out_texture = self
+            .filters
+            .output_texture(filter_id.raw())
+            .expect("evaluate produced it");
+        self.vello.override_image(
+            &image,
+            Some(wgpu::TexelCopyTextureInfoBase {
+                texture: out_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            }),
+        );
+        self.vello.mark_override_image_dirty(&image);
+        scene.draw_image(
+            &peniko::ImageBrush {
+                image,
+                sampler: peniko::ImageSampler {
+                    x_extend: peniko::Extend::Pad,
+                    y_extend: peniko::Extend::Pad,
+                    quality: peniko::ImageQuality::Medium,
+                    alpha: 1.0,
+                },
+            },
+            cherenkov::kurbo::Affine::translate((bounds.x0, bounds.y0)),
+        );
+        stats.draws += 1;
+        *wants_next |= again || self.filters.redraw_hint(filter_id.raw());
         Ok(())
+    }
+
+    /// Marks surfaces dirty for pending `GpuContent`/`Filter` redraw
+    /// requests. Returns whether a redraw is pending.
+    fn scan_redraw_requests(&mut self) -> bool {
+        let mut pending = false;
+        for surface in self.surfaces.values_mut() {
+            for node in surface.layers.values() {
+                if let Some(ContentData::Gpu(slot)) = &node.content
+                    && slot.dirty.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    surface.dirty = true;
+                    pending = true;
+                }
+            }
+        }
+        if self.filters.take_redraw_requests() {
+            for surface in self.surfaces.values_mut() {
+                surface.dirty = true;
+            }
+            pending = true;
+        }
+        pending
     }
 
     /// Lowers and submits every dirty surface, bracketed by drained
     /// timestamp queries when enabled.
-    fn render_frame(&mut self, _time: crate::FrameTime) -> Result<(Next, FrameStats), RenderError> {
+    fn render_frame(&mut self, time: crate::FrameTime) -> Result<(Next, FrameStats), RenderError> {
         let mut stats = FrameStats::default();
+        let mut wants_next = self.scan_redraw_requests();
         let mut dirty: Vec<SurfaceId> = self
             .surfaces
             .iter()
@@ -643,12 +1026,20 @@ impl Renderer {
             .collect();
         dirty.sort_unstable();
         if dirty.is_empty() {
-            return Ok((Next::Idle, stats));
+            return Ok((
+                if wants_next {
+                    Self::next_frame(time)
+                } else {
+                    Next::Idle
+                },
+                stats,
+            ));
         }
+        let now = Instant::now();
         self.drain_and_stamp(0)?;
         let mut result = Ok(());
         for id in dirty {
-            result = self.render_surface(id, &mut stats);
+            result = self.render_surface(id, &mut stats, &mut wants_next, now);
             if result.is_err() {
                 break;
             }
@@ -659,35 +1050,68 @@ impl Renderer {
         }
         self.wait()?;
         result?;
-        Ok((Next::Idle, stats))
+        Ok((
+            if wants_next {
+                Self::next_frame(time)
+            } else {
+                Next::Idle
+            },
+            stats,
+        ))
     }
 
-    /// Composes and renders one surface's scene into its target.
-    fn render_surface(&mut self, id: SurfaceId, stats: &mut FrameStats) -> Result<(), RenderError> {
-        let Some(surf) = self.surfaces.get_mut(&id) else {
+    /// The refresh request for an animating frame: one tick at 60 Hz.
+    fn next_frame(time: crate::FrameTime) -> Next {
+        Next::At {
+            time: time.0 + Duration::from_secs_f64(1.0 / 60.0),
+            rate: 60..=60,
+        }
+    }
+
+    /// Composes and renders one surface's scene into its target, then
+    /// presents a window surface.
+    fn render_surface(
+        &mut self,
+        id: SurfaceId,
+        stats: &mut FrameStats,
+        wants_next: &mut bool,
+        now: Instant,
+    ) -> Result<(), RenderError> {
+        let Some(mut surf) = self.surfaces.remove(&id) else {
             return Ok(());
         };
+        let result = self.render_surface_inner(&mut surf, stats, wants_next, now);
+        self.surfaces.insert(id, surf);
+        result
+    }
+
+    /// The body of `render_surface`, with the surface taken out of the map
+    /// so `self` is free for `compose`.
+    fn render_surface_inner(
+        &mut self,
+        surf: &mut SurfaceState,
+        stats: &mut FrameStats,
+        wants_next: &mut bool,
+        now: Instant,
+    ) -> Result<(), RenderError> {
         let mut scene = vello::Scene::new();
-        let mut layers = std::mem::take(&mut surf.layers);
         let size = surf.size;
-        let result = Self::compose(
-            &mut layers,
-            &self.fonts,
-            &self.images,
+        self.compose(
+            &mut surf.layers,
             0,
             cherenkov::kurbo::Affine::IDENTITY,
             size,
             &mut scene,
             stats,
-        );
-        surf.layers = layers;
-        result?;
+            wants_next,
+            now,
+        )?;
         self.vello
             .render_to_texture(
                 &self.device,
                 &self.queue,
                 &scene,
-                &surf.view,
+                surf.target.view(),
                 &vello::RenderParams {
                     base_color: convert::color(&surf.clear),
                     width: size.0,
@@ -695,8 +1119,47 @@ impl Renderer {
                     antialiasing_method: AaConfig::Area,
                 },
             )
-            .map_err(|e| RenderError::Readback(format!("vello render: {e}")))?;
+            .map_err(|e| RenderError::Render(format!("vello render: {e}")))?;
         stats.passes += 1;
+        if let TargetState::Window {
+            surface, config, ..
+        } = &surf.target
+        {
+            use wgpu::CurrentSurfaceTexture as Current;
+            let frame = match surface.get_current_texture() {
+                Current::Success(frame) | Current::Suboptimal(frame) => frame,
+                Current::Lost | Current::Outdated => {
+                    // Reconfigure and try again next render.
+                    surface.configure(&self.device, config);
+                    return Ok(());
+                }
+                Current::Timeout | Current::Occluded => {
+                    // Skip presenting this frame; the surface stays dirty.
+                    return Ok(());
+                }
+                Current::Validation => {
+                    return Err(RenderError::Render(
+                        "surface acquisition hit a validation error".into(),
+                    ));
+                }
+            };
+            let format = config.format;
+            let blitter = self
+                .blitters
+                .entry(format)
+                .or_insert_with(|| wgpu::util::TextureBlitter::new(&self.device, format));
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("window blit"),
+                });
+            let frame_view = frame
+                .texture
+                .create_view(&wgpu::TextureViewDescriptor::default());
+            blitter.copy(&self.device, &mut encoder, surf.target.view(), &frame_view);
+            self.queue.submit([encoder.finish()]);
+            frame.present();
+        }
         surf.dirty = false;
         Ok(())
     }
@@ -790,7 +1253,7 @@ impl Renderer {
             });
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
-                texture: &state.target,
+                texture: state.target.texture(),
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,

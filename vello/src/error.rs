@@ -53,6 +53,9 @@ pub enum ResourceError {
     /// The image data is malformed.
     #[error("image: {0}")]
     Image(String),
+    /// The shader source failed validation or pipeline creation.
+    #[error("shader: {0}")]
+    Shader(String),
     /// The resource needs a feature this slice does not implement.
     #[error(transparent)]
     Unsupported(#[from] Unsupported),
@@ -79,9 +82,19 @@ pub enum RenderError {
     /// Pixel readback failed.
     #[error("readback: {0}")]
     Readback(String),
+    /// A GPU render pass failed (the vello scene render or a window
+    /// presentation step).
+    #[error("render: {0}")]
+    Render(String),
+    /// A layer filter's effect setup or render pass failed.
+    #[error("filter: {0}")]
+    Filter(String),
     /// A glyph run references a font that is not registered.
     #[error("font: {0}")]
     Font(String),
+    /// A shader paint references a shader that is not registered.
+    #[error("shader: {0}")]
+    Shader(String),
     /// A draw references an image that is not registered.
     #[error("image: {0}")]
     Image(String),
@@ -98,6 +111,8 @@ pub enum Unsupported {
     Interpolation,
     /// A user shader paint.
     Shader,
+    /// A shader paint declaring more than 64 uniform floats.
+    ShaderParams,
     /// A shader paint applied to a glyph run.
     ShaderGlyphs,
     /// A blend space vello cannot honour (it blends in the encoded 8-bit
@@ -126,6 +141,7 @@ impl std::fmt::Display for Unsupported {
             Self::MeshGradient => "mesh-gradient",
             Self::Interpolation => "gradient-interpolation",
             Self::Shader => "shader-paint",
+            Self::ShaderParams => "shader-params",
             Self::ShaderGlyphs => "shader-glyphs",
             Self::BlendSpace => "blend-space",
             Self::GroupFilter => "group-filter",

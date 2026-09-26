@@ -452,7 +452,7 @@ impl Picture {
 mod tests {
     use serde_json::json;
 
-    use super::{Command, DisplayList, Dirty, Operand, ScopeError, SlotUpdate};
+    use super::{Command, Dirty, DisplayList, Operand, ScopeError, SlotUpdate};
     use crate::glyph::{FontId, Glyph, GlyphRun, GlyphStyle};
     use crate::paint::Paint;
 
@@ -490,7 +490,7 @@ mod tests {
             command: 1,
             value: Operand::Run(run(2)),
         }]);
-        assert_eq!(dirty.ranges(), &[1..2]);
+        assert_eq!(dirty.ranges(), std::iter::once(1..2).collect::<Vec<_>>());
         let Command::Glyphs { run: got, .. } = &list.commands()[1] else {
             panic!("not a glyph run");
         };

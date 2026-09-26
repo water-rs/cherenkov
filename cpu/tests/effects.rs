@@ -45,13 +45,18 @@ fn polygon(points: &[(f64, f64)]) -> BezPath {
     outline
 }
 
-fn assert_pixels(actual: &[[f32; 4]], expected: &[[f64; 4]], tolerance: f64) {
+fn assert_pixels(
+    actual: &[[f32; 4]],
+    expected: &[[f64; 4]],
+    tolerance: f64,
+    context: impl std::fmt::Debug,
+) {
     assert_eq!(actual.len(), expected.len());
     for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
         for channel in 0..4 {
             assert!(
                 (f64::from(actual[channel]) - expected[channel]).abs() < tolerance,
-                "pixel {index}, channel {channel}: {actual:?} versus {expected:?}"
+                "{context:?}, pixel {index}, channel {channel}: {actual:?} versus {expected:?}"
             );
         }
     }
@@ -117,7 +122,7 @@ fn arbitrary_shadow_rotation_offset_clips_and_cache_match_oracle() {
                     });
                 });
             });
-            assert_pixels(&actual, &expected, 4e-6);
+            assert_pixels(&actual, &expected, 4e-6, sigma);
         }
     }
 }
@@ -146,7 +151,7 @@ fn rotated_box_shadows_and_signed_spread_match_oracle() {
             });
         });
         // Sharp box spread stays polygonal under rotation.
-        assert_pixels(&actual, &expected, 4e-6);
+        assert_pixels(&actual, &expected, 4e-6, (transform, spread));
     }
 }
 
@@ -187,7 +192,7 @@ fn mesh_sampling_transforms_hdr_alpha_and_outside_match_oracle() {
             )
         })
         .collect();
-    assert_pixels(&actual, &expected, 2e-6);
+    assert_pixels(&actual, &expected, 2e-6, ());
 }
 
 #[test]
@@ -218,7 +223,7 @@ fn encoded_groups_apply_opacity_before_compositing() {
             destination,
             source,
         );
-        assert_pixels(&actual, &vec![expected; SIZE * SIZE], 2e-5);
+        assert_pixels(&actual, &vec![expected; SIZE * SIZE], 2e-5, ());
     }
 }
 
@@ -256,6 +261,7 @@ fn encoded_layer_matches_an_encoded_group() {
         &surface.readback().expect("readback").pixels,
         &vec![expected; SIZE * SIZE],
         2e-5,
+        (),
     );
 }
 
@@ -311,7 +317,7 @@ fn transformed_stroked_glyphs_and_cache_identity_match_oracle() {
         let actual = render(&engine, |recorder| {
             recorder.clip(clip.clone(), |recorder| recorder.glyphs(&run, COLOR));
         });
-        assert_pixels(&actual, &expected, 0.025);
+        assert_pixels(&actual, &expected, 0.025, ());
     }
 }
 
@@ -372,7 +378,7 @@ fn a_transformed_colour_glyph_matches_the_oracle_paint_graph() {
         .iter()
         .map(|pixel| pixel.map(f64::from))
         .collect();
-    assert_pixels(&actual, &expected, 0.04);
+    assert_pixels(&actual, &expected, 0.04, ());
 }
 
 #[test]
@@ -404,6 +410,7 @@ fn root_layer_state_uses_the_same_compositor_as_child_layers() {
         &surface.readback().expect("readback").pixels,
         &expected,
         2e-5,
+        (),
     );
 }
 
@@ -438,7 +445,7 @@ fn mixed_radius_box_spread_scales_and_clamps_like_oracle() {
                 });
             });
             // Rounded outlines retain the coverage compiler's curve tolerance.
-            assert_pixels(&actual, &expected, 0.004);
+            assert_pixels(&actual, &expected, 0.004, (transform, spread));
         }
     }
 }
@@ -472,6 +479,6 @@ fn acute_path_spread_uses_miter_limit_four_under_shear_and_clipping() {
                 });
             });
         });
-        assert_pixels(&actual, &expected, 4e-6);
+        assert_pixels(&actual, &expected, 4e-6, (transform, spread));
     }
 }

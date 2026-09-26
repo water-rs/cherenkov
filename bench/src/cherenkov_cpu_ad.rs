@@ -71,6 +71,15 @@ enum Op {
         /// The paint.
         paint: cherenkov::Paint,
     },
+    /// `Draw::Image`.
+    Image {
+        /// The registered image.
+        image: cherenkov::ImageId,
+        /// Destination rect.
+        dst: Rect,
+        /// Sampling.
+        sampling: cherenkov::Sampling,
+    },
 }
 
 /// A prepared child item: a draw-item run wrapped in its own layer, or a
@@ -113,6 +122,10 @@ pub struct Cherenkov {
     surface: Option<Surface>,
     /// Registered fonts per `(blob hash, face index)`.
     fonts: HashMap<(ResourceHash, u32), cherenkov::FontId>,
+    /// Registered images per blob hash, plus the handles keeping them alive.
+    images: HashMap<ResourceHash, cherenkov::ImageId>,
+    /// Image handles owning the render-thread pixel stores.
+    image_handles: Vec<cherenkov_cpu::Image>,
     /// Layers holding recorded content, in draw order.
     content_layers: Vec<ContentLayer>,
     counters: Counters,
@@ -138,6 +151,8 @@ fn cherenkov_features() -> Vec<Feature> {
         Feature::WideGamut,
         Feature::SweepGradient,
         Feature::ExtendNone,
+        Feature::Image,
+        Feature::ImagePaint,
         // `sRGB` maps to `SrgbEncoded`; `linear-p3` and `linear-srgb` are
         // both linear interpolation, which is the working space already.
         Feature::InterpolationSpace(ColorSpace::Srgb),
@@ -152,7 +167,6 @@ fn cherenkov_features() -> Vec<Feature> {
 /// The upstream API this slice lacks for a declared scene feature.
 const fn missing_api(f: &Feature) -> Option<&'static str> {
     match f {
-        Feature::Image | Feature::ImagePaint => Some("no images in this slice"),
         Feature::InterpolationSpace(_) => Some("only srgb / linear interpolation in this slice"),
         _ => None,
     }
@@ -161,7 +175,7 @@ const fn missing_api(f: &Feature) -> Option<&'static str> {
 /// The scene [`Feature`] a render-time [`Unsupported`] maps back to.
 const fn unsupported_feature(u: Unsupported) -> Feature {
     match u {
-        Unsupported::Mesh | Unsupported::Image | Unsupported::Shader => Feature::Image,
+        Unsupported::Mesh | Unsupported::Shader => Feature::Image,
         Unsupported::BlendSpace => Feature::Blend(BlendMode::Normal),
         Unsupported::Filter => Feature::Opacity,
         Unsupported::GlyphStroke | Unsupported::GlyphTransform | Unsupported::ColorFont => {
@@ -267,7 +281,10 @@ fn stops(stops: &[cherenkov_scene::GradientStop]) -> Vec<cherenkov::ColorStop> {
 }
 
 /// A scene paint → the front-end paint.
-fn front_paint(paint: &ScenePaint) -> Result<cherenkov::Paint, BenchError> {
+fn front_paint(
+    paint: &ScenePaint,
+    images: &HashMap<ResourceHash, cherenkov::ImageId>,
+) -> Result<cherenkov::Paint, BenchError> {
     Ok(match paint {
         ScenePaint::Solid(c) => cherenkov::Paint::Solid(working(c)),
         ScenePaint::Linear(g) => cherenkov::Paint::Linear(cherenkov::LinearGradient {
@@ -294,13 +311,18 @@ fn front_paint(paint: &ScenePaint) -> Result<cherenkov::Paint, BenchError> {
             extend: extend(g.extend)?,
             interpolation: interpolation(g.interpolation)?,
         }),
-        ScenePaint::Image(_) => {
-            return Err(BenchError::Unsupported {
-                engine: Cherenkov::NAME,
-                feature: Feature::ImagePaint,
-                api: missing_api(&Feature::ImagePaint),
-            });
-        }
+        ScenePaint::Image(p) => cherenkov::Paint::Image(cherenkov::ImagePattern {
+            image: *images
+                .get(&p.image)
+                .ok_or(cherenkov_scene::SceneError::MissingResource(p.image))?,
+            transform: p.transform,
+            extend_x: extend(p.extend_x)?,
+            extend_y: extend(p.extend_y)?,
+            sampling: match p.sampling {
+                cherenkov_scene::Sampling::Nearest => cherenkov::Sampling::Nearest,
+                cherenkov_scene::Sampling::Bilinear => cherenkov::Sampling::Linear,
+            },
+        }),
     })
 }
 
@@ -346,12 +368,13 @@ fn clip_shape(edit: &mut cherenkov_cpu::LayerEdit, shape: &ShapeKind) {
 fn op(
     draw: &SceneDraw,
     fonts: &HashMap<(ResourceHash, u32), cherenkov::FontId>,
+    images: &HashMap<ResourceHash, cherenkov::ImageId>,
     blobs: &Blobs,
 ) -> Result<Op, BenchError> {
     Ok(match draw {
         SceneDraw::Fill { shape, rule, paint } => Op::Fill {
             shape: shape_kind(shape, front_rule(*rule)),
-            paint: front_paint(paint)?,
+            paint: front_paint(paint, images)?,
         },
         SceneDraw::Stroke {
             shape,
@@ -360,7 +383,7 @@ fn op(
         } => Op::Stroke {
             shape: shape_kind(shape, cherenkov::FillRule::NonZero),
             stroke: convert::stroke(stroke),
-            paint: front_paint(paint)?,
+            paint: front_paint(paint, images)?,
         },
         SceneDraw::Shadow {
             shape,
@@ -374,15 +397,22 @@ fn op(
         },
         SceneDraw::Glyphs(run) => Op::Glyphs {
             run: glyph_run(run, fonts, blobs)?,
-            paint: front_paint(&run.paint)?,
+            paint: front_paint(&run.paint, images)?,
         },
-        SceneDraw::Image { .. } => {
-            return Err(BenchError::Unsupported {
-                engine: Cherenkov::NAME,
-                feature: Feature::Image,
-                api: missing_api(&Feature::Image),
-            });
-        }
+        SceneDraw::Image {
+            image,
+            dst,
+            sampling,
+        } => Op::Image {
+            image: *images
+                .get(image)
+                .ok_or(cherenkov_scene::SceneError::MissingResource(*image))?,
+            dst: *dst,
+            sampling: match sampling {
+                cherenkov_scene::Sampling::Nearest => cherenkov::Sampling::Nearest,
+                cherenkov_scene::Sampling::Bilinear => cherenkov::Sampling::Linear,
+            },
+        },
     })
 }
 
@@ -418,6 +448,66 @@ fn glyph_run(
 }
 
 /// Registers every font a glyph run references, once per `(hash, index)`.
+/// PNGs carry sRGB data; [`cherenkov_oracle::image::decode_png_rgba8`] is
+/// the shared decoder the oracle and every adapter use, and the engine
+/// converts to the working space at registration.
+fn register_image(
+    images: &mut HashMap<ResourceHash, cherenkov::ImageId>,
+    handles: &mut Vec<cherenkov_cpu::Image>,
+    engine: &CpuEngine<Raster>,
+    hash: &ResourceHash,
+    blobs: &Blobs,
+) -> Result<(), BenchError> {
+    if images.contains_key(hash) {
+        return Ok(());
+    }
+    let blob = blobs
+        .get(hash)
+        .ok_or(cherenkov_scene::SceneError::MissingResource(*hash))?;
+    let (width, height, rgba) = cherenkov_oracle::image::decode_png_rgba8(blob)
+        .map_err(|e| BenchError::Engine(format!("cherenkov image decode: {e}")))?;
+    let image = engine
+        .image(cherenkov_cpu::ImageSource {
+            width,
+            height,
+            pixels: rgba,
+            color_space: cherenkov_cpu::ImageColorSpace::Srgb,
+        })
+        .map_err(|e| BenchError::Engine(format!("cherenkov image: {e}")))?;
+    images.insert(*hash, image.id());
+    handles.push(image);
+    Ok(())
+}
+
+/// Registers every image referenced by draws or image paints in `layer`.
+fn register_images(
+    images: &mut HashMap<ResourceHash, cherenkov::ImageId>,
+    handles: &mut Vec<cherenkov_cpu::Image>,
+    engine: &CpuEngine<Raster>,
+    layer: &SceneLayer,
+    blobs: &Blobs,
+) -> Result<(), BenchError> {
+    for item in &layer.items {
+        match item {
+            Item::Layer(l) => register_images(images, handles, engine, l, blobs)?,
+            Item::Draw(SceneDraw::Image { image, .. }) => {
+                register_image(images, handles, engine, image, blobs)?;
+            }
+            Item::Draw(d) => {
+                let paint = match d {
+                    SceneDraw::Fill { paint, .. } | SceneDraw::Stroke { paint, .. } => Some(paint),
+                    SceneDraw::Glyphs(run) => Some(&run.paint),
+                    _ => None,
+                };
+                if let Some(ScenePaint::Image(p)) = paint {
+                    register_image(images, handles, engine, &p.image, blobs)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn register_fonts(
     fonts: &mut HashMap<(ResourceHash, u32), cherenkov::FontId>,
     engine: &CpuEngine<Raster>,
@@ -461,6 +551,7 @@ fn register_fonts(
 fn prep_layer(
     layer: &SceneLayer,
     fonts: &HashMap<(ResourceHash, u32), cherenkov::FontId>,
+    images: &HashMap<ResourceHash, cherenkov::ImageId>,
     blobs: &Blobs,
 ) -> Result<PrepLayer, BenchError> {
     // The engine draws a layer's content before its children, so the draws
@@ -485,23 +576,23 @@ fn prep_layer(
     if own {
         for item in &layer.items {
             match item {
-                Item::Draw(d) => prep.own.push(op(d, fonts, blobs)?),
+                Item::Draw(d) => prep.own.push(op(d, fonts, images, blobs)?),
                 Item::Layer(l) => prep
                     .items
-                    .push(PrepItem::Layer(prep_layer(l, fonts, blobs)?)),
+                    .push(PrepItem::Layer(prep_layer(l, fonts, images, blobs)?)),
             }
         }
     } else {
         let mut run: Vec<Op> = Vec::new();
         for item in &layer.items {
             match item {
-                Item::Draw(d) => run.push(op(d, fonts, blobs)?),
+                Item::Draw(d) => run.push(op(d, fonts, images, blobs)?),
                 Item::Layer(l) => {
                     if !run.is_empty() {
                         prep.items.push(PrepItem::Content(std::mem::take(&mut run)));
                     }
                     prep.items
-                        .push(PrepItem::Layer(prep_layer(l, fonts, blobs)?));
+                        .push(PrepItem::Layer(prep_layer(l, fonts, images, blobs)?));
                 }
             }
         }
@@ -596,6 +687,8 @@ impl Cherenkov {
             engine,
             surface: None,
             fonts: HashMap::new(),
+            images: HashMap::new(),
+            image_handles: Vec::new(),
             content_layers: Vec::new(),
             counters: Counters::default(),
         })
@@ -627,7 +720,14 @@ impl Engine for Cherenkov {
             &input.scene.root,
             input.blobs,
         )?;
-        let prep = prep_layer(&input.scene.root, &self.fonts, input.blobs)?;
+        register_images(
+            &mut self.images,
+            &mut self.image_handles,
+            &self.engine,
+            &input.scene.root,
+            input.blobs,
+        )?;
+        let prep = prep_layer(&input.scene.root, &self.fonts, &self.images, input.blobs)?;
         self.content_layers.clear();
         let mut content_layers = Vec::new();
         surface.update(|tx| {
@@ -755,5 +855,10 @@ fn record_op(c: &mut cherenkov::Recorder, op: &Op) {
             ShapeKind::Path(p, _) => c.shadow(p.clone(), *shadow),
         },
         Op::Glyphs { run, paint } => c.glyphs(run, paint.clone()),
+        Op::Image {
+            image,
+            dst,
+            sampling,
+        } => c.image(*image, *dst, *sampling),
     }
 }

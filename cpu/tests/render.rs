@@ -457,3 +457,61 @@ fn extend_none_is_transparent_outside_the_ramp() {
         assert!((p[3] - want).abs() < 0.01, "extend {e:?} alpha {}", p[3]);
     }
 }
+
+#[test]
+fn image_registration_validates_and_samples_texels() {
+    let engine = engine();
+    // Wrong length is rejected.
+    let bad = cherenkov_cpu::ImageSource {
+        width: 2,
+        height: 2,
+        pixels: vec![0; 3],
+        color_space: cherenkov_cpu::ImageColorSpace::Srgb,
+    };
+    assert!(bad.validate().is_err());
+    // 2x2: red, green / blue, white — straight sRGB.
+    let img = engine
+        .image(cherenkov_cpu::ImageSource {
+            width: 2,
+            height: 2,
+            pixels: vec![
+                255, 0, 0, 255, // red
+                0, 255, 0, 255, // green
+                0, 0, 255, 255, // blue
+                255, 255, 255, 255, // white
+            ],
+            color_space: cherenkov_cpu::ImageColorSpace::Srgb,
+        })
+        .expect("image");
+    // Nearest draw scaled 8x: pixel (12,4) is texel (0,0)=red, (20,28)=white.
+    let surface = engine
+        .surface(Offscreen::new((32, 32), OffscreenFormat::LinearF32))
+        .expect("surface");
+    let id = img.id();
+    surface.update(|tx| {
+        tx[surface.root()].content(surface.record(|c| {
+            c.image(
+                id,
+                Rect::new(0.0, 0.0, 16.0, 16.0),
+                cherenkov::Sampling::Nearest,
+            );
+        }));
+    });
+    engine.render(FrameTime::now()).expect("render");
+    let rb = surface.readback().expect("readback");
+    let at = |x: usize, y: usize| rb.pixels[y * 32 + x];
+    // Texel (0,0) red: P3 red primary ~ [0.917,0.200,0.138].
+    let p = at(4, 4);
+    assert!(p[0] > 0.8 && p[1] < 0.3 && p[2] < 0.3, "red texel {p:?}");
+    // Texel (1,1) white: sRGB white converts to P3 (1,1,1) within 1e-3.
+    let p = at(12, 12);
+    for c in &p[..3] {
+        assert!((c - 1.0).abs() < 1e-3, "white texel {p:?}");
+    }
+    // Texel (1,0) green: P3 green primary ~ [0.458,0.985,0.298].
+    let p = at(12, 4);
+    assert!(p[1] > 0.8 && p[0] < 0.7 && p[2] < 0.6, "green texel {p:?}");
+    // Texel (0,1) blue: P3 blue primary ~ [0,0.282,1.0].
+    let p = at(4, 12);
+    assert!(p[2] > 0.9 && p[0] < 0.2, "blue texel {p:?}");
+}

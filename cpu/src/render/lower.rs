@@ -146,9 +146,26 @@ pub struct GlyphReq {
     pub slot: crate::render::glyph::GlyphSlot,
 }
 
+/// Render-thread resources the lowering reads: registered fonts and
+/// images (and the COLR picture cache).
+#[expect(
+    dead_code,
+    reason = "fonts and colr_cache are read by the COLR lowering"
+)]
+pub struct Resources<'a> {
+    /// Registered fonts by engine id.
+    pub fonts: &'a HashMap<u64, crate::render::FontData>,
+    /// Registered images by engine id.
+    pub images: &'a HashMap<u64, std::sync::Arc<crate::render::CpuImage>>,
+    /// Cached COLR glyph pictures by `(font, glyph, coords hash, paint hash)`.
+    pub colr_cache: &'a mut HashMap<(u64, u32, u64, u64), cherenkov::Picture>,
+}
+
 /// The lowering walk state for one surface frame.
 pub struct Lowering<'a> {
     items: &'a mut Vec<Item>,
+    /// The resources paints and glyph runs resolve against.
+    res: &'a mut Resources<'a>,
     /// Glyph mask requests emitted during the walk.
     pub glyphs: Vec<GlyphReq>,
     width: usize,
@@ -399,9 +416,10 @@ fn integer_edges(r: Rect) -> Option<IRect> {
 
 impl<'a> Lowering<'a> {
     /// Starts a lowering into `items` for a `w` × `h` surface.
-    pub const fn new(items: &'a mut Vec<Item>, size: (u32, u32)) -> Self {
+    pub fn new(items: &'a mut Vec<Item>, res: &'a mut Resources<'a>, size: (u32, u32)) -> Self {
         Self {
             items,
+            res,
             glyphs: Vec::new(),
             width: size.0 as usize,
             height: size.1 as usize,
@@ -575,7 +593,11 @@ impl<'a> Lowering<'a> {
                 } => self.stroke(shape, stroke, paint)?,
                 Command::Shadow { shape, shadow } => self.shadow(shape, shadow)?,
                 Command::Glyphs { run, paint } => self.glyph_run(run, paint)?,
-                Command::Image { .. } => return Err(Unsupported::Image.into()),
+                Command::Image {
+                    image,
+                    dst,
+                    sampling,
+                } => self.image_draw(*image, dst, *sampling)?,
                 Command::Picture { picture, transform } => {
                     let saved = self.transform;
                     self.transform = saved * *transform;
@@ -623,6 +645,34 @@ impl<'a> Lowering<'a> {
         Ok(())
     }
 
+    /// `Image`: a fill of `dst` whose paint maps the rect onto the whole
+    /// image, pad-extended, like the oracle's `Draw::Image`.
+    fn image_draw(
+        &mut self,
+        image: cherenkov::ImageId,
+        dst: &Rect,
+        sampling: cherenkov::Sampling,
+    ) -> Result<(), RenderError> {
+        let Some(img) = self.res.images.get(&image.raw()) else {
+            return Err(RenderError::Image(image.raw()));
+        };
+        let (iw, ih) = (f64::from(img.width), f64::from(img.height));
+        let (dw, dh) = (dst.x1 - dst.x0, dst.y1 - dst.y0);
+        if dw <= 0.0 || dh <= 0.0 {
+            return Ok(());
+        }
+        let transform =
+            Affine::translate((dst.x0, dst.y0)) * Affine::scale_non_uniform(dw / iw, dh / ih);
+        let paint = Paint::Image(cherenkov::ImagePattern {
+            image,
+            transform,
+            extend_x: cherenkov::Extend::Pad,
+            extend_y: cherenkov::Extend::Pad,
+            sampling,
+        });
+        self.fill(&ShapeData::Rect(*dst), &paint)
+    }
+
     /// `Fill`: a flattened polygon of edges in device space.
     fn fill(&mut self, shape: &ShapeData, paint: &Paint) -> Result<(), RenderError> {
         let sm = sigma_max(self.transform).max(1e-12);
@@ -634,7 +684,7 @@ impl<'a> Lowering<'a> {
         if edges.is_empty() {
             return Ok(());
         }
-        let paint = paint_data(paint, self.transform.inverse())?;
+        let paint = paint_data(paint, self.transform.inverse(), self.res.images)?;
         let bbox = bbox_of(&edges, self.width, self.height);
         if bbox.x0 >= bbox.x1 || bbox.y0 >= bbox.y1 {
             return Ok(());
@@ -678,7 +728,7 @@ impl<'a> Lowering<'a> {
         if edges.is_empty() {
             return Ok(());
         }
-        let paint = paint_data(paint, self.transform.inverse())?;
+        let paint = paint_data(paint, self.transform.inverse(), self.res.images)?;
         let bbox = bbox_of(&edges, self.width, self.height);
         self.items.push(Item::Draw {
             edges: edges.into(),
@@ -796,7 +846,7 @@ impl<'a> Lowering<'a> {
         if matches!(run.style, GlyphStyle::Stroke(_)) {
             return Err(Unsupported::GlyphStroke.into());
         }
-        let paint = paint_data(paint, self.transform.inverse())?;
+        let paint = paint_data(paint, self.transform.inverse(), self.res.images)?;
         let [a, b, c, d, ..] = self.transform.as_coeffs();
         let matrix = [a as f32, b as f32, c as f32, d as f32];
         let coords: std::sync::Arc<[i16]> = run.coords.clone().into();

@@ -390,7 +390,12 @@ impl VelloRenderer {
                 self.surfaces
                     .values()
                     .map(SurfaceState::gpu_bytes)
-                    .sum::<u64>(),
+                    .sum::<u64>()
+                    + self
+                        .images
+                        .values()
+                        .map(|image| image.data.data().len() as u64)
+                        .sum::<u64>(),
             ),
             cpu: cherenkov::Bytes(0),
         }

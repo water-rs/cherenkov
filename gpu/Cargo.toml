@@ -21,5 +21,9 @@ tracing = "0.1"
 [dev-dependencies]
 naga = { version = "29", features = ["wgsl-in", "spv-out", "msl-out", "hlsl-out"] }
 
+[dev-dependencies]
+cherenkov = { path = "..", features = ["testing"] }
+nami = { version = "0.11.1", default-features = false, features = ["std", "kurbo"] }
+
 [lints]
 workspace = true

@@ -919,3 +919,45 @@ fn oversized_resize_fails_fast() {
     assert_eq!(readback.width, 16);
     assert_eq!(readback.height, 16);
 }
+
+/// A `BlendSpace::Linear` + `Normal` + `opacity < 1` group asks for
+/// isolated linear-space compositing vello cannot express — it must
+/// error instead of compositing in the encoded target. The default
+/// `Linear + Normal + opacity 1` group stays legal.
+#[test]
+fn linear_normal_translucent_group_reports_unsupported() {
+    let Some(engine) = engine() else { return };
+    let surface = engine.surface(Offscreen::new((64, 64))).expect("surface");
+    let translucent = surface.record(|c| {
+        c.group(cherenkov::Group::new().opacity(0.5), |c| {
+            c.fill(Rect::new(0., 0., 64., 64.), WorkingColor::WHITE);
+        });
+    });
+    surface.update(|tx| {
+        tx[surface.root()].content(translucent);
+    });
+    let result = engine.render(cherenkov_vello::FrameTime::now());
+    assert!(
+        matches!(
+            result,
+            Err(cherenkov_vello::RenderError::Unsupported(
+                cherenkov_vello::Unsupported::BlendSpace
+            ))
+        ),
+        "{result:?}"
+    );
+
+    // The default group (Linear + Normal + opacity 1) still lowers.
+    let opaque = surface.record(|c| {
+        c.group(cherenkov::Group::new(), |c| {
+            c.fill(Rect::new(0., 0., 64., 64.), WorkingColor::WHITE);
+        });
+    });
+    surface.update(|tx| {
+        tx[surface.root()].content(opaque);
+    });
+    let next = engine
+        .render(cherenkov_vello::FrameTime::now())
+        .expect("default group renders");
+    assert_eq!(next, Next::Idle);
+}

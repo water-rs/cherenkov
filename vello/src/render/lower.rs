@@ -167,13 +167,13 @@ pub fn lower(
                     return Err(Unsupported::GroupFilter.into());
                 }
                 // Vello blends in the encoded 8-bit target for every
-                // fill, so a plain src-over group — even one isolating
-                // only by opacity — composites consistently with the
-                // rest of the frame. A non-normal separable or
-                // non-separable blend evaluated in the wrong space is
-                // the visibly different case: only that errors.
+                // fill, so a linear-blend-space group is expressible only
+                // when it has no observable blending to isolate: a normal
+                // blend at full opacity. Anything else must error — a
+                // 0.5-opacity isolated group is darker than linear-space
+                // math says when it composites in the encoded target.
                 if group.blend_space == BlendSpace::Linear
-                    && group.blend != cherenkov::BlendMode::Normal
+                    && (group.blend != cherenkov::BlendMode::Normal || group.opacity < 1.0)
                 {
                     return Err(Unsupported::BlendSpace.into());
                 }

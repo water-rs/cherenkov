@@ -25,6 +25,7 @@ impl WindowSurface {
         device: &wgpu::Device,
         handle: Box<dyn wgpu::WindowHandle>,
         size: (u32, u32),
+        transparent: bool,
     ) -> Result<Self, SurfaceError> {
         let surface = instance
             .create_surface(wgpu::SurfaceTarget::Window(handle))
@@ -39,7 +40,21 @@ impl WindowSurface {
             .ok_or_else(|| {
                 SurfaceError::UnsupportedTarget("adapter cannot present to the window".into())
             })?;
-        let alpha_mode = if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
+        let alpha_mode = if transparent {
+            [
+                wgpu::CompositeAlphaMode::PreMultiplied,
+                wgpu::CompositeAlphaMode::PostMultiplied,
+                wgpu::CompositeAlphaMode::Inherit,
+            ]
+            .into_iter()
+            .find(|mode| caps.alpha_modes.contains(mode))
+            .ok_or_else(|| {
+                SurfaceError::UnsupportedTarget(format!(
+                    "a transparent window needs a transparency-capable composite alpha mode, the adapter offers {:?}",
+                    caps.alpha_modes
+                ))
+            })?
+        } else if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
             wgpu::CompositeAlphaMode::Opaque
         } else {
             caps.alpha_modes
@@ -103,7 +118,8 @@ pub struct Presenter {
     pipeline_layout: wgpu::PipelineLayout,
     sampler: wgpu::Sampler,
     pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
-    uniforms: [wgpu::Buffer; 2],
+    /// Indexed by `encode * 3 + alpha`: see `Present` in `present.wgsl`.
+    uniforms: [wgpu::Buffer; 6],
 }
 
 impl Presenter {
@@ -155,7 +171,7 @@ impl Presenter {
             min_filter: wgpu::FilterMode::Nearest,
             ..wgpu::SamplerDescriptor::default()
         });
-        let uniform = |encode: u32| {
+        let uniform = |encode: u32, alpha: u32| {
             let buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("present uniform"),
                 size: 16,
@@ -165,7 +181,7 @@ impl Presenter {
             buffer
                 .slice(..)
                 .get_mapped_range_mut()
-                .copy_from_slice(&[encode.to_ne_bytes(), [0; 4], [0; 4], [0; 4]].concat());
+                .copy_from_slice(&[encode.to_ne_bytes(), alpha.to_ne_bytes(), [0; 4], [0; 4]].concat());
             buffer.unmap();
             buffer
         };
@@ -175,7 +191,14 @@ impl Presenter {
             pipeline_layout,
             sampler,
             pipelines: HashMap::new(),
-            uniforms: [uniform(0), uniform(1)],
+            uniforms: [
+                uniform(0, 0),
+                uniform(0, 1),
+                uniform(0, 2),
+                uniform(1, 0),
+                uniform(1, 1),
+                uniform(1, 2),
+            ],
         }
     }
 
@@ -232,6 +255,11 @@ impl Presenter {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
         let encode = usize::from(!format.is_srgb());
+        let alpha = match window.config.alpha_mode {
+            wgpu::CompositeAlphaMode::PreMultiplied | wgpu::CompositeAlphaMode::Inherit => 1,
+            wgpu::CompositeAlphaMode::PostMultiplied => 2,
+            wgpu::CompositeAlphaMode::Auto | wgpu::CompositeAlphaMode::Opaque => 0,
+        };
         let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("present"),
             layout: &self.layout,
@@ -246,7 +274,7 @@ impl Presenter {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: self.uniforms[encode].as_entire_binding(),
+                    resource: self.uniforms[encode * 3 + alpha].as_entire_binding(),
                 },
             ],
         });

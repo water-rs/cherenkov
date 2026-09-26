@@ -3,6 +3,7 @@
 
 //! The render thread: sole owner of GPU state.
 
+pub(crate) mod filter;
 mod colr;
 mod glyph;
 mod instance;
@@ -29,6 +30,7 @@ const TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 const TARGET_USAGES: wgpu::TextureUsages = wgpu::TextureUsages::from_bits_retain(
     wgpu::TextureUsages::RENDER_ATTACHMENT.bits()
         | wgpu::TextureUsages::COPY_SRC.bits()
+        | wgpu::TextureUsages::COPY_DST.bits()
         | wgpu::TextureUsages::TEXTURE_BINDING.bits(),
 );
 
@@ -204,6 +206,7 @@ pub struct GpuRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     presenter: present::Presenter,
+    pub(crate) filters: filter::Registry,
     /// `[format index][pipeline kind]`: 0 = surface format, 1 = scratch
     /// format; kind 0 = source-over, 1 = replace.
     pipelines: [[wgpu::RenderPipeline; 2]; 2],
@@ -625,6 +628,7 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             device,
             queue,
             presenter,
+            filters: filter::Registry::default(),
             pipelines,
             scratch_format,
             layout0,
@@ -704,7 +708,7 @@ impl Renderer for GpuRenderer {
                 (offscreen.size, None)
             }
             GpuTarget::Window(window) => {
-                let (handle, size) = window.into_parts();
+                let (handle, size, transparent) = window.into_parts();
                 if size.0 == 0 || size.1 == 0 {
                     return Err(SurfaceError::ZeroSize);
                 }
@@ -714,6 +718,7 @@ impl Renderer for GpuRenderer {
                     &self.device,
                     handle,
                     size,
+                    transparent,
                 )?;
                 (size, Some(window))
             }
@@ -963,7 +968,7 @@ impl Renderer for GpuRenderer {
     /// Lowers and submits every changed surface, bracketed by drained
     /// timestamp queries when enabled.
     fn render(&mut self, frame: &Frame<'_>, stats: &mut FrameStats) -> Result<Redraw, RenderError> {
-        let dirty: Vec<&SurfaceFrame<'_>> = frame.surfaces.iter().filter(|sf| sf.changed).collect();
+        let dirty: Vec<&SurfaceFrame<'_>> = frame.surfaces.iter().filter(|sf| sf.changed || self.filters.wants_redraw()).collect();
         if dirty.is_empty() {
             return Ok(Redraw::None);
         }
@@ -1002,8 +1007,7 @@ impl Renderer for GpuRenderer {
         }
         self.wait()?;
         result?;
-        // No backend-side redraw sources in this slice.
-        Ok(Redraw::None)
+        Ok(if self.filters.wants_redraw() { Redraw::Wanted } else { Redraw::None })
     }
 
     /// Copies a surface's target into `Readback` pixels, decoding f16 → f32.
@@ -1076,6 +1080,10 @@ impl Renderer for GpuRenderer {
 }
 
 impl GpuRenderer {
+    pub(crate) fn add_filter(&mut self, id: cherenkov::FilterId, source: Box<dyn filter::Source>) {
+        self.filters.add(id.raw(), source, &self.device, &self.queue, self.scratch_format);
+    }
+
     /// Lowers and submits one surface.
     #[expect(
         clippy::too_many_lines,
@@ -1471,6 +1479,13 @@ impl GpuRenderer {
                 };
                 render_pass.set_bind_group(1, bind, &[]);
                 render_pass.draw(0..6, range.instances.clone());
+            }
+            drop(render_pass);
+            if let Some(filter) = pass.filter {
+                self.queue.submit([encoder.finish()]);
+                let Target::Scratch(depth) = pass.target else { unreachable!("filters capture a scratch target") };
+                self.filters.apply(filter, &self.device, &self.queue, &surf.scratch[depth], (pass.region[2], pass.region[3]))?;
+                encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame after filter") });
             }
         }
         self.queue.submit([encoder.finish()]);

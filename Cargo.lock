@@ -363,6 +363,8 @@ version = "0.0.0"
 dependencies = [
  "bytemuck",
  "cherenkov",
+ "filtrate",
+ "filtrate-core",
  "half",
  "kurbo",
  "nami",
@@ -1661,7 +1663,6 @@ dependencies = [
 [[package]]
 name = "nami"
 version = "0.11.1"
-source = "git+https://github.com/water-rs/nami?rev=6908aac816de14ee5aff23bfffd7d2b109d08fea#6908aac816de14ee5aff23bfffd7d2b109d08fea"
 dependencies = [
  "async-channel",
  "executor-core",
@@ -1675,7 +1676,6 @@ dependencies = [
 [[package]]
 name = "nami-core"
 version = "0.3.3"
-source = "git+https://github.com/water-rs/nami?rev=6908aac816de14ee5aff23bfffd7d2b109d08fea#6908aac816de14ee5aff23bfffd7d2b109d08fea"
 dependencies = [
  "kurbo",
 ]
@@ -3557,3 +3557,371 @@ checksum = "27bc9d5b815bc103f142aa054f561d9187d191692ec7c2d1e2b4737f8dbd7296"
 dependencies = [
  "zune-core",
 ]
+
+[[patch.unused]]
+name = "waterui"
+version = "0.5.2"
+
+[[patch.unused]]
+name = "waterui-assets"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-assets-core"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-assets-macros"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-assets-planner"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-backend-core"
+version = "0.5.2"
+
+[[patch.unused]]
+name = "waterui-browser-cef"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-browser-wpe"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-chromium"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-controls"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-core"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-dylib"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-ffi"
+version = "0.5.2"
+
+[[patch.unused]]
+name = "waterui-ffi-generator"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "waterui-form"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-graphics"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-icon"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-icons-codegen"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-icons-fontawesome7"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-icons-lucide"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-icons-material-icon"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-icons-native"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-icons-sf-symbol"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-inspector-app"
+version = "0.5.2"
+
+[[patch.unused]]
+name = "waterui-inspector-protocol"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-internal"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-layout"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-locale"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-macros"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-map"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-mcp"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-mcp-protocol"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-media"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-navigation"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-preview"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-preview-protocol"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-shape"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-testing"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-text"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-url"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-video"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-watcher-set"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-webview"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-image"
+version = "0.5.0"
+
+[[patch.unused]]
+name = "waterui-svg"
+version = "0.4.0"
+
+[[patch.unused]]
+name = "hydrolysis-m3"
+version = "0.3.1"
+
+[[patch.unused]]
+name = "waterui"
+version = "0.5.2"
+
+[[patch.unused]]
+name = "waterui-assets"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-assets-core"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-assets-macros"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-assets-planner"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-backend-core"
+version = "0.5.2"
+
+[[patch.unused]]
+name = "waterui-browser-cef"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-browser-wpe"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-canvas"
+version = "0.2.0"
+
+[[patch.unused]]
+name = "waterui-chromium"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-controls"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-core"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-dylib"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-ffi"
+version = "0.5.2"
+
+[[patch.unused]]
+name = "waterui-ffi-generator"
+version = "0.1.0"
+
+[[patch.unused]]
+name = "waterui-form"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-graphics"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-icon"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-icons-codegen"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-icons-fontawesome7"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-icons-lucide"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-icons-material-icon"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-icons-native"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-icons-sf-symbol"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-image"
+version = "0.5.0"
+
+[[patch.unused]]
+name = "waterui-inspector-app"
+version = "0.5.2"
+
+[[patch.unused]]
+name = "waterui-inspector-protocol"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-internal"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-layout"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-locale"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-macros"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-map"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-mcp"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-mcp-protocol"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-media"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-navigation"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-preview"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-preview-protocol"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-shape"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-svg"
+version = "0.4.0"
+
+[[patch.unused]]
+name = "waterui-testing"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-text"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-url"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-video"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-watcher-set"
+version = "0.5.1"
+
+[[patch.unused]]
+name = "waterui-webview"
+version = "0.5.1"

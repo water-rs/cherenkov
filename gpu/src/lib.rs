@@ -25,6 +25,7 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+pub mod interop;
 mod names;
 mod render;
 
@@ -116,6 +117,7 @@ pub enum GpuTarget {
 pub struct WindowTarget {
     handle: Box<dyn wgpu::WindowHandle>,
     size: (u32, u32),
+    transparent: bool,
 }
 
 impl WindowTarget {
@@ -125,7 +127,18 @@ impl WindowTarget {
         Self {
             handle: Box::new(handle),
             size,
+            transparent: false,
         }
+    }
+
+    /// Presents with a composite alpha mode the compositor sees through
+    /// (premultiplied, else postmultiplied, else inherited). Surface creation
+    /// fails when the adapter offers none: an opaque composite would present
+    /// every pixel with no alpha.
+    #[must_use]
+    pub const fn transparent(mut self, transparent: bool) -> Self {
+        self.transparent = transparent;
+        self
     }
 
     /// The drawable size the swapchain is configured to.
@@ -134,8 +147,8 @@ impl WindowTarget {
         self.size
     }
 
-    pub(crate) fn into_parts(self) -> (Box<dyn wgpu::WindowHandle>, (u32, u32)) {
-        (self.handle, self.size)
+    pub(crate) fn into_parts(self) -> (Box<dyn wgpu::WindowHandle>, (u32, u32), bool) {
+        (self.handle, self.size, self.transparent)
     }
 }
 
@@ -176,3 +189,22 @@ impl Backend for Gpu {
 }
 
 impl Uploads<Rgba8> for Gpu {}
+
+impl cherenkov::Filters for Gpu {
+    fn remove_filter(r: &mut Self::Renderer, id: cherenkov::FilterId) {
+        r.filters.remove(id.raw());
+    }
+}
+
+impl<F: filtrate_core::Filter + Send> cherenkov::Runs<F> for Gpu {
+    fn add_filter(r: &mut Self::Renderer, id: cherenkov::FilterId, filter: F) {
+        r.add_filter(id, Box::new(render::filter::FromFilter(filter)));
+    }
+}
+
+impl cherenkov::Effects for Gpu {
+    type Effect = interop::EffectBox;
+    fn add_effect(r: &mut Self::Renderer, id: cherenkov::FilterId, effect: Self::Effect) {
+        r.add_filter(id, effect.0);
+    }
+}

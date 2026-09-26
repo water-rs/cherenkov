@@ -78,6 +78,8 @@ pub struct DrawRange {
 /// One render pass.
 #[derive(Clone, Debug)]
 pub struct Pass {
+    /// Filter applied after the final capture segment.
+    pub filter: Option<u64>,
     /// What it draws into.
     pub target: Target,
     /// Clear colour; `None` loads the previous contents.
@@ -593,6 +595,7 @@ impl<'a> Lowering<'a> {
                 Target::Scratch(_) => [0, 0, 0, 0],
             };
             self.frame.passes.push(Pass {
+                filter: None,
                 target: open.target,
                 clear: open.clear,
                 ranges: open.ranges,
@@ -654,12 +657,13 @@ impl<'a> Lowering<'a> {
     fn isolate(
         &mut self,
         inner_clip: Option<DeviceClip>,
+        filter: Option<cherenkov::FilterId>,
         opacity: f32,
         blend: cherenkov::BlendMode,
         mut body: impl FnMut(&mut Self, &mut GlyphContext<'_>) -> Result<(), Encode>,
         glyphs: &mut GlyphContext<'_>,
     ) -> Result<(), Encode> {
-        if opacity < 1.0
+        if filter.is_none() && opacity < 1.0
             && blend == cherenkov::BlendMode::Normal
             && self.try_passthrough(opacity, &mut body, glyphs)?
         {
@@ -683,11 +687,16 @@ impl<'a> Lowering<'a> {
         } else {
             Target::Scratch(self.depth - 1)
         };
-        let region = tight_region(
-            &self.frame.instances[inst_start..],
-            self.width as u32,
-            self.height as u32,
-        );
+        // Filters may sample outside the content bounds. Capture the surface
+        // extent, preserving transparent padding and the filter's input size.
+        let region = if filter.is_some() {
+            [0, 0, self.width as u32, self.height as u32]
+        } else {
+            tight_region(&self.frame.instances[inst_start..], self.width as u32, self.height as u32)
+        };
+        if let Some(filter) = filter {
+            self.frame.passes.last_mut().expect("capture pass").filter = Some(filter.raw());
+        }
         if region[2] == 0 || region[3] == 0 {
             // Nothing visible in the scratch: drop this depth's segment
             // passes and the composite entirely.
@@ -938,7 +947,7 @@ impl<'a> Lowering<'a> {
                     self.clip = Some(cur);
                     return Ok(());
                 }
-                self.isolate(Some(clip), 1.0, cherenkov::BlendMode::Normal, body, glyphs)
+                self.isolate(Some(clip), None, 1.0, cherenkov::BlendMode::Normal, body, glyphs)
             }
             Some(cur) => match (clip.mask, cur.aligned_rect, clip.aligned_rect) {
                 // A new masked clip merges with an aligned rect clip (or
@@ -966,7 +975,7 @@ impl<'a> Lowering<'a> {
                     self.clip = Some(cur);
                     Ok(())
                 }
-                _ => self.isolate(Some(clip), 1.0, cherenkov::BlendMode::Normal, body, glyphs),
+                _ => self.isolate(Some(clip), None, 1.0, cherenkov::BlendMode::Normal, body, glyphs),
             },
         }
     }
@@ -983,9 +992,6 @@ impl<'a> Lowering<'a> {
         glyphs: &mut GlyphContext<'_>,
     ) -> Result<(), Encode> {
         let node = tree.layer(id);
-        if node.filter.is_some() {
-            return Err(Encode::from(RenderError::Unsupported(names::FILTER)));
-        }
         if node.backdrop.is_some() {
             return Err(Encode::from(RenderError::Unsupported(names::BACKDROP)));
         }
@@ -996,10 +1002,11 @@ impl<'a> Lowering<'a> {
             node.clip.as_ref(),
             |s, glyphs| {
                 s.transform = content_space;
-                if node.opacity < 1.0 || node.blend != cherenkov::BlendMode::Normal {
+                if node.filter.is_some() || node.opacity < 1.0 || node.blend != cherenkov::BlendMode::Normal {
                     let inner = s.clip;
                     s.isolate(
                         inner,
+                        node.filter,
                         node.opacity,
                         node.blend,
                         |s, glyphs| s.layer_items(id, node, tree, caches, glyphs),
@@ -1090,18 +1097,16 @@ impl<'a> Lowering<'a> {
                     i = inner_end;
                 }
                 Command::BeginGroup { group, end } => {
-                    if group.filter.is_some() {
-                        return Err(Encode::from(RenderError::Unsupported(names::FILTER)));
-                    }
                     if group.blend_space != BlendSpace::Linear {
                         return Err(Encode::from(RenderError::Unsupported(names::BLEND_SPACE)));
                     }
                     let inner_end = (*end as usize).min(commands.len());
-                    if group.opacity >= 1.0 && group.blend == BlendMode::Normal {
+                    if group.filter.is_none() && group.opacity >= 1.0 && group.blend == BlendMode::Normal {
                         self.commands(list, i + 1, inner_end, glyphs)?;
                     } else {
                         self.isolate(
                             None,
+                            group.filter,
                             group.opacity,
                             group.blend,
                             |s, glyphs| s.commands(list, i + 1, inner_end, glyphs),

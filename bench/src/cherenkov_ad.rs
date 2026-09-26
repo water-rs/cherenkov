@@ -29,7 +29,8 @@ use kurbo::{Affine, BezPath, Circle, Ellipse, Line, Rect, RoundedRect, Vec2};
 
 use crate::convert::{self, Blobs};
 use crate::motion::{Clock, LayerMotion};
-use crate::{BenchError, Counters, DeviceInfo, EncodeInput, Engine, EngineInfo, Submit};
+use crate::timing::Timings;
+use crate::{BenchError, Counters, DeviceInfo, EncodeInput, Engine, EngineInfo, GpuSample, Submit};
 
 /// A scene shape in a form the front-end accepts.
 enum ShapeKind {
@@ -449,6 +450,9 @@ pub struct Cherenkov {
     frame: u64,
     /// The fixed frame clock `submit` renders at.
     clock: Clock,
+    /// Attributes each resolved GPU timing to the bench frame that
+    /// rendered it.
+    timings: Timings,
     counters: Counters,
 }
 
@@ -1077,6 +1081,7 @@ impl Cherenkov {
             },
             engine,
             surface: None,
+            timings: Timings::default(),
             fonts: HashMap::new(),
             images: HashMap::new(),
             image_handles: Vec::new(),
@@ -1194,52 +1199,27 @@ impl Engine for Cherenkov {
         Ok(())
     }
 
-    fn submit(&mut self, readback: bool) -> Result<Submit, BenchError> {
-        let surface = self
-            .surface
-            .as_ref()
-            .ok_or_else(|| BenchError::Engine("cherenkov: submit before prepare".into()))?;
-        self.engine
-            .render(self.clock.time())
-            .map_err(render_error)?;
-        if readback && self.has_motion {
-            // FLIP compares against the oracle's settled scene: render
-            // until the animations come to rest (cap 2000 frames).
-            let mut settled = false;
-            for _ in 0..2000 {
-                match self
-                    .engine
-                    .render(self.clock.time())
-                    .map_err(render_error)?
-                {
-                    cherenkov::Next::Idle => {
-                        settled = true;
-                        break;
-                    }
-                    cherenkov::Next::At { .. } => self.clock.advance(),
-                }
-            }
-            if !settled {
-                return Err(BenchError::Engine(
-                    "cherenkov: motion did not settle in 2000 frames".into(),
-                ));
-            }
+    fn submit(&mut self, frame: u64, readback: bool) -> Result<Submit, BenchError> {
+        if self.surface.is_none() {
+            return Err(BenchError::Engine(
+                "cherenkov: submit before prepare".into(),
+            ));
         }
+        let gpu = self.timings.render_frame(
+            &self.engine,
+            &mut self.clock,
+            frame,
+            readback && self.has_motion,
+            render_error,
+        )?;
         let stats = self.engine.stats();
-        let gpu_seconds = stats.gpu_seconds;
-        let passes = stats
-            .passes_timed
-            .iter()
-            .map(|p| crate::PassSample {
-                name: p.name.clone(),
-                width: p.width,
-                height: p.height,
-                format: p.format.to_string(),
-                gpu_seconds: p.gpu_seconds,
-            })
-            .collect();
         let image = if readback {
-            let rb = surface.readback().map_err(render_error)?;
+            let rb = self
+                .surface
+                .as_ref()
+                .ok_or_else(|| BenchError::Engine("cherenkov: submit before prepare".into()))?
+                .readback()
+                .map_err(render_error)?;
             Some(cherenkov_oracle::F32Image {
                 width: rb.width,
                 height: rb.height,
@@ -1261,12 +1241,12 @@ impl Engine for Cherenkov {
             seconds,
         })
         .collect();
-        Ok(Submit {
-            image,
-            gpu_seconds,
-            passes,
-            phases,
-        })
+        Ok(Submit { image, gpu, phases })
+    }
+
+    fn finish_gpu(&mut self) -> Result<Vec<GpuSample>, BenchError> {
+        let timings = self.engine.finish_timings().map_err(render_error)?;
+        Ok(self.timings.samples(timings))
     }
 
     fn counters(&self) -> Counters {

@@ -12,7 +12,7 @@ use std::time::Duration;
 use crate::WorkingColor;
 use crate::backend::{Backend, Display, Frame, Redraw, Renderer, SurfaceFrame};
 use crate::error::{EngineError, RenderError};
-use crate::frame::{FrameStats, Next};
+use crate::frame::{FrameId, FrameStats, Next};
 use crate::message::{ChangeSet, LayerOp, Message, Op, SurfaceId};
 use crate::tree::SurfaceTree;
 
@@ -43,6 +43,7 @@ pub fn run<B: Backend>(
     };
     let _ = init_reply.send(Ok(info));
     let mut surfaces: HashMap<SurfaceId, SurfaceState> = HashMap::new();
+    let mut next_frame = 0u64;
     while let Ok(message) = rx.recv() {
         match message {
             Message::CreateSurface { id, target, reply } => {
@@ -90,8 +91,13 @@ pub fn run<B: Backend>(
                 commits,
                 reply,
             } => {
-                let result = render::<B>(&mut renderer, &mut surfaces, time.0, commits);
+                let id = FrameId(next_frame);
+                next_frame += 1;
+                let result = render::<B>(&mut renderer, &mut surfaces, id, time.0, commits);
                 let _ = reply.send(result);
+            }
+            Message::FinishTimings { reply } => {
+                let _ = reply.send(renderer.finish_timings());
             }
             Message::Readback { surface, reply } => {
                 let _ = reply.send(renderer.readback(surface));
@@ -146,6 +152,7 @@ fn commit<B: Backend>(
 fn render<B: Backend>(
     renderer: &mut B::Renderer,
     surfaces: &mut HashMap<SurfaceId, SurfaceState>,
+    id: FrameId,
     time: std::time::Instant,
     commits: Vec<(SurfaceId, ChangeSet<B>)>,
 ) -> Result<(Next, FrameStats), RenderError> {
@@ -181,6 +188,7 @@ fn render<B: Backend>(
     let mut stats = FrameStats::default();
     let redraw = renderer.render(
         &Frame {
+            id,
             time: crate::frame::FrameTime(time),
             surfaces: &frames,
         },

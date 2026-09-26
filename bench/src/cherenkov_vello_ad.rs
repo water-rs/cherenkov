@@ -28,6 +28,7 @@ use kurbo::{Affine, BezPath, Circle, Ellipse, Line, Rect, RoundedRect, Vec2};
 
 use crate::convert::{self, Blobs, Prepared};
 use crate::motion::{Clock, LayerMotion};
+use crate::timing::Timings;
 use crate::{BenchError, Counters, DeviceInfo, EncodeInput, Engine, EngineInfo, Submit};
 
 /// A scene shape in a form the front-end accepts.
@@ -436,6 +437,9 @@ pub struct CherenkovVello {
     frame: u64,
     /// The fixed frame clock `submit` renders at.
     clock: Clock,
+    /// Attributes each resolved GPU timing to the bench frame that
+    /// rendered it.
+    timings: Timings,
     counters: Counters,
 }
 
@@ -1064,6 +1068,7 @@ impl CherenkovVello {
             has_live: false,
             frame: 0,
             clock: Clock::new(),
+            timings: Timings::default(),
             counters: Counters::default(),
         })
     }
@@ -1167,40 +1172,26 @@ impl Engine for CherenkovVello {
         Ok(())
     }
 
-    fn submit(&mut self, readback: bool) -> Result<Submit, BenchError> {
-        let surface = self
-            .surface
-            .as_ref()
-            .ok_or_else(|| BenchError::Engine("cherenkov-vello: submit before prepare".into()))?;
-        self.engine
-            .render(self.clock.time())
-            .map_err(render_error)?;
-        if readback && self.has_motion {
-            // FLIP compares against the oracle's settled scene: render
-            // until the animations come to rest (cap 2000 frames).
-            let mut settled = false;
-            for _ in 0..2000 {
-                match self
-                    .engine
-                    .render(self.clock.time())
-                    .map_err(render_error)?
-                {
-                    cherenkov::Next::Idle => {
-                        settled = true;
-                        break;
-                    }
-                    cherenkov::Next::At { .. } => self.clock.advance(),
-                }
-            }
-            if !settled {
-                return Err(BenchError::Engine(
-                    "cherenkov: motion did not settle in 2000 frames".into(),
-                ));
-            }
+    fn submit(&mut self, frame: u64, readback: bool) -> Result<Submit, BenchError> {
+        if self.surface.is_none() {
+            return Err(BenchError::Engine(
+                "cherenkov-vello: submit before prepare".into(),
+            ));
         }
-        let gpu_seconds = self.engine.stats().gpu_seconds;
+        let gpu = self.timings.render_frame(
+            &self.engine,
+            &mut self.clock,
+            frame,
+            readback && self.has_motion,
+            render_error,
+        )?;
         let image = if readback {
-            let rb = surface.readback().map_err(render_error)?;
+            let rb = self
+                .surface
+                .as_ref()
+                .expect("checked above")
+                .readback()
+                .map_err(render_error)?;
             Some(cherenkov_oracle::F32Image {
                 width: rb.width,
                 height: rb.height,
@@ -1211,8 +1202,7 @@ impl Engine for CherenkovVello {
         };
         Ok(Submit {
             image,
-            gpu_seconds,
-            passes: Vec::new(),
+            gpu,
             phases: Vec::new(),
         })
     }

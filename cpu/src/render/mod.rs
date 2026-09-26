@@ -215,6 +215,7 @@ impl Renderer for RasterRenderer {
     /// Lowers and rasterizes every changed surface.
     fn render(&mut self, frame: &Frame<'_>, stats: &mut FrameStats) -> Result<Redraw, RenderError> {
         for sf in frame.surfaces.iter().filter(|sf| sf.changed) {
+            stats.frame = Some(frame.id);
             self.render_surface(sf, stats)?;
         }
         // No backend-side redraw sources in this slice.

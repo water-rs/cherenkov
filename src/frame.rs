@@ -45,7 +45,39 @@ pub enum Next {
     },
 }
 
-/// One timed render pass of the last [`Engine::render`](crate::Engine::render).
+/// Identifies one [`Engine::render`](crate::Engine::render): the render
+/// loop numbers every render from zero, in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FrameId(pub(crate) u64);
+
+impl FrameId {
+    /// The render's position in the engine's sequence of renders.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// The GPU time of one submitted frame, read from its timestamp queries.
+///
+/// A backend whose queries resolve after the GPU finishes reports it in
+/// [`FrameStats::timings`] of a later [`Engine::render`](crate::Engine::render)
+/// or from [`Engine::finish_timings`](crate::Engine::finish_timings), so
+/// rendering never waits for GPU idle.
+#[derive(Clone, Debug)]
+pub struct FrameTiming {
+    /// The frame measured.
+    pub frame: FrameId,
+    /// GPU seconds from the first pass's start to the last pass's end;
+    /// `None` when the adapter wrote timestamps that do not increase
+    /// across that span.
+    pub gpu_seconds: Option<f64>,
+    /// Each pass of the frame, in submission order; empty when the
+    /// backend times only whole frames.
+    pub passes: Vec<PassTiming>,
+}
+
+/// One timed render pass of a [`FrameTiming`].
 #[derive(Clone, Debug)]
 pub struct PassTiming {
     /// The pass's deterministic name: `"surface"` or `"scratch{n}"` by
@@ -58,8 +90,9 @@ pub struct PassTiming {
     /// Target texture format (`"rgba16float"`, `"rgba8unorm"`, ...).
     pub format: &'static str,
     /// GPU seconds the pass took, between its pass-boundary timestamp
-    /// writes.
-    pub gpu_seconds: f64,
+    /// writes; `None` when the adapter's end timestamp does not exceed
+    /// its start.
+    pub gpu_seconds: Option<f64>,
 }
 
 /// Wall-clock seconds the render thread spent in each phase of the last
@@ -80,14 +113,16 @@ pub struct Phases {
 /// Measurements of the last [`Engine::render`](crate::Engine::render).
 #[derive(Clone, Debug, Default)]
 pub struct FrameStats {
+    /// This render's frame, when it drew any surface; `None` when no
+    /// surface had changed.
+    pub frame: Option<FrameId>,
+    /// Every frame whose GPU timing became available during this render,
+    /// oldest first: this frame's own for a backend that times
+    /// synchronously, earlier frames' for one whose queries resolve
+    /// later. Empty when GPU timing is disabled or unsupported.
+    pub timings: Vec<FrameTiming>,
     /// CPU time spent in each render phase.
     pub phases: Phases,
-    /// GPU seconds of the most recently completed timed submission.
-    /// Backends with deferred queries may report an earlier frame.
-    pub gpu_seconds: Option<f64>,
-    /// Per-pass GPU seconds of that same submission; empty when queries
-    /// are disabled or unsupported.
-    pub passes_timed: Vec<PassTiming>,
     /// Render passes recorded (`render_to_texture` and effect passes).
     pub passes: u32,
     /// Scene commands encoded this frame.

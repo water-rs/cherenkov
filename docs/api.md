@@ -87,6 +87,9 @@ pub trait Renderer: 'static {
     /// Renders every surface in `frame` whose tree or content changed; returns whether a
     /// backend-side source (custom GPU content, an animated shader) wants another frame.
     fn render(&mut self, frame: &Frame<'_>, stats: &mut FrameStats) -> Result<Redraw, RenderError>;
+    /// Waits for the GPU timings of every drawn frame not yet reported; a backend that
+    /// times synchronously, or not at all, keeps the default (nothing outstanding).
+    fn finish_timings(&mut self) -> Result<Vec<FrameTiming>, RenderError> { Ok(Vec::new()) }
     fn readback(&mut self, surface: SurfaceId) -> Result<Readback, RenderError>;
 
     fn memory(&self) -> MemoryUsage;
@@ -98,7 +101,7 @@ pub trait Renderer: 'static {
 - **One copy of the layer tree.** The render loop in `cherenkov` owns a `SurfaceTree` per surface: the layer graph, every layer property, its animation track and the sampled value for the current frame. The backend never receives property ops; it keeps only what it alone can produce (encoded fragments, live display lists, atlases, GPU content objects) keyed by `LayerId`, and it reads the tree through `Frame`:
 
   ```rust
-  pub struct Frame<'a> { pub time: FrameTime, pub surfaces: &'a [SurfaceFrame<'a>] }
+  pub struct Frame<'a> { pub id: FrameId, pub time: FrameTime, pub surfaces: &'a [SurfaceFrame<'a>] }
   pub struct SurfaceFrame<'a> { pub id: SurfaceId, pub size: (u32, u32), pub display: Display,
                                 pub clear: WorkingColor, pub changed: bool, pub tree: &'a SurfaceTree }
   impl SurfaceTree { pub fn root(&self) -> LayerId; pub fn layer(&self, id: LayerId) -> &LayerNode; }
@@ -150,6 +153,7 @@ let usage: MemoryUsage = engine.memory();
 - The pipeline set is closed and fully precompiled at creation, and the driver cache is persisted. Custom shaders compile when they are registered. Nothing compiles at draw time.
 - `Engine` is `!Send` and lives on the UI thread. It spawns and owns the render thread; dropping it sends `Shutdown` and joins the thread.
 - `engine.info()` is the backend's provenance (`B::Info`); `engine.stats()` the last frame's `FrameStats`.
+- **Frame timing.** The render loop numbers every render with a `FrameId` (`Frame::id`). A backend that draws reports it in `FrameStats::frame`, and every GPU timing it reports is a `FrameTiming` tagged with the frame it measures, in `FrameStats::timings`: the render's own for a backend that times synchronously (Vello), earlier renders' for one whose timestamp queries resolve after the frame is submitted (the GPU backend, which never waits for GPU idle). `engine.finish_timings()` waits for the timings still in flight — tooling at the end of a measured window, never a frame path.
 - **Waking the host.** Changes made outside a frame (a `surface.update`, a layer drop, a bound signal firing) are queued, not sent. When the display link is paused after `Next::Idle`, the host must learn that a frame is needed: `engine.set_waker(|| link.request_now())` registers a UI-thread callback that the engine calls at most once between two `render`s, the first time something is queued. No callback means the host renders on its own schedule.
 
 ## Resources

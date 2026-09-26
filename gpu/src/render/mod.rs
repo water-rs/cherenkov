@@ -18,9 +18,10 @@ use std::time::{Duration, Instant};
 
 use crate::{GpuConfig, GpuInfo, GpuTarget, ScratchFormat, TimestampSupport, names};
 use cherenkov::{
-    ContentOp, EngineError, FontData as EngineFontData, FontId, Frame, FrameStats, ImageId,
-    ImageUpload, LayerId, MemoryUsage, PassTiming, Pressure, Readback, Redraw, RenderError,
-    Renderer, ResourceError, SurfaceError, SurfaceFrame, SurfaceId, SurfaceInfo,
+    ContentOp, EngineError, FontData as EngineFontData, FontId, Frame, FrameId, FrameStats,
+    FrameTiming, ImageId, ImageUpload, LayerId, MemoryUsage, PassTiming, Pressure, Readback,
+    Redraw, RenderError, Renderer, ResourceError, SurfaceError, SurfaceFrame, SurfaceId,
+    SurfaceInfo,
 };
 use glyph::{Atlas, FontData, PendingRaster};
 use lower::{
@@ -249,6 +250,10 @@ enum PendingOrigin {
 /// non-blocking poll reports the copy done, so rendering never stalls on
 /// GPU idle.
 struct PendingTimestamps {
+    /// The frame these queries measure.
+    frame: FrameId,
+    /// The submission carrying the resolve and the copy into `staging`.
+    submission: wgpu::SubmissionIndex,
     staging: wgpu::Buffer,
     /// Queries resolved: `2 * passes`.
     count: u32,
@@ -259,6 +264,24 @@ struct PendingTimestamps {
     /// Set by the map callback: 1 once the copy is readable, 2 on a
     /// failed map.
     ready: Arc<AtomicU8>,
+}
+
+impl PendingTimestamps {
+    /// Requests the map of `staging`; the callback records the outcome
+    /// in `ready`.
+    fn request_map(&mut self) {
+        if self.map_requested {
+            return;
+        }
+        let flag = Arc::clone(&self.ready);
+        self.staging.slice(..u64::from(self.count) * 8).map_async(
+            wgpu::MapMode::Read,
+            move |result| {
+                flag.store(u8::from(result.is_err()) + 1, Ordering::Relaxed);
+            },
+        );
+        self.map_requested = true;
+    }
 }
 
 /// One encoded pass's report metadata.
@@ -634,14 +657,11 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
     create_device(&config).and_then(|(adapter, device, queue)| {
         let info = adapter.get_info();
         let supported = adapter.features();
-        let timestamp_support =
-            if supported.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS) {
-                TimestampSupport::Encoders
-            } else if supported.contains(wgpu::Features::TIMESTAMP_QUERY) {
-                TimestampSupport::PassBoundaries
-            } else {
-                TimestampSupport::Unsupported
-            };
+        let timestamp_support = if supported.contains(wgpu::Features::TIMESTAMP_QUERY) {
+            TimestampSupport::PassBoundaries
+        } else {
+            TimestampSupport::Unsupported
+        };
         let (layout0, layout1) = create_layouts(&device);
         let scratch_format = scratch_wgpu(config.scratch_format);
         // Three specialised fragment shaders from one source file: the
@@ -1147,7 +1167,7 @@ impl Renderer for GpuRenderer {
     }
 
     fn render(&mut self, frame: &Frame<'_>, stats: &mut FrameStats) -> Result<Redraw, RenderError> {
-        self.drain_timestamps(stats);
+        stats.timings = self.drain_timestamps();
         let dirty: Vec<_> = frame.surfaces.iter().filter(|sf| sf.changed).collect();
         if dirty.is_empty() {
             return Ok(Redraw::None);
@@ -1202,14 +1222,35 @@ impl Renderer for GpuRenderer {
                 self.encode_surface(sf.id, stats);
             }
             stats.phases.encode_seconds = t.elapsed().as_secs_f64();
+            stats.frame = Some(frame.id);
             if self.timestamps && self.frame_pass_count > 0 {
                 let t = Instant::now();
-                self.resolve_timestamps(2 * self.frame_pass_count);
+                self.resolve_timestamps(2 * self.frame_pass_count, frame.id);
                 stats.phases.stamp_seconds += t.elapsed().as_secs_f64();
             }
         }
         result?;
         Ok(Redraw::None)
+    }
+
+    /// Waits for the GPU to finish every pending frame's timestamp
+    /// resolve and returns their timings, oldest first.
+    fn finish_timings(&mut self) -> Result<Vec<FrameTiming>, RenderError> {
+        let Some(last) = self.pending_timestamps.back().map(|p| p.submission.clone()) else {
+            return Ok(Vec::new());
+        };
+        for pending in &mut self.pending_timestamps {
+            pending.request_map();
+        }
+        self.wait(last, "timestamp resolve")?;
+        let timings = self.drain_timestamps();
+        if self.pending_timestamps.is_empty() {
+            Ok(timings)
+        } else {
+            Err(RenderError::Readback(
+                "timestamp resolve: the map callback did not run after the wait".into(),
+            ))
+        }
     }
 
     fn readback(&mut self, surface: SurfaceId) -> Result<Readback, RenderError> {
@@ -1995,7 +2036,12 @@ impl GpuRenderer {
         }
     }
 
-    fn resolve_timestamps(&mut self, count: u32) {
+    /// Resolves this frame's timestamp queries into a staging buffer and
+    /// queues the read — all inside one submission after the frame's
+    /// encodes, so the GPU resolves them as soon as the passes finish.
+    /// [`Self::drain_timestamps`] maps the buffer on a later call without
+    /// stalling this frame.
+    fn resolve_timestamps(&mut self, count: u32, frame: FrameId) {
         if self.query_set.is_none() || self.query_buffer.is_none() {
             self.pass_meta.clear();
             return;
@@ -2015,6 +2061,8 @@ impl GpuRenderer {
         let submission = self.queue.submit([encoder.finish()]);
         tracing::trace!(count, ?submission, "timestamps resolved");
         self.pending_timestamps.push_back(PendingTimestamps {
+            frame,
+            submission,
             staging,
             count,
             meta: std::mem::take(&mut self.pass_meta),
@@ -2036,19 +2084,14 @@ impl GpuRenderer {
         }
     }
 
-    fn drain_timestamps(&mut self, stats: &mut FrameStats) {
+    /// Reads back every pending frame's resolved timestamps whose copy
+    /// has landed, oldest first — submissions complete in order, so the
+    /// first unfinished one ends the drain. Never blocks.
+    fn drain_timestamps(&mut self) -> Vec<FrameTiming> {
         let period = f64::from(self.queue.get_timestamp_period());
+        let mut timings = Vec::new();
         while let Some(pending) = self.pending_timestamps.front_mut() {
-            if !pending.map_requested {
-                let flag = Arc::clone(&pending.ready);
-                pending
-                    .staging
-                    .slice(..u64::from(pending.count) * 8)
-                    .map_async(wgpu::MapMode::Read, move |result| {
-                        flag.store(u8::from(result.is_err()) + 1, Ordering::Relaxed);
-                    });
-                pending.map_requested = true;
-            }
+            pending.request_map();
             if self.device.poll(wgpu::PollType::Poll).is_err() {
                 break;
             }
@@ -2056,7 +2099,10 @@ impl GpuRenderer {
                 // A failed map drops the frame's timing instead of
                 // blocking every later drain.
                 2 => {
-                    tracing::error!("the timestamp readback map failed");
+                    tracing::error!(
+                        frame = pending.frame.get(),
+                        "the timestamp readback map failed"
+                    );
                     if let Some(pending) = self.pending_timestamps.pop_front() {
                         pending.staging.unmap();
                     }
@@ -2068,7 +2114,7 @@ impl GpuRenderer {
             let Some(pending) = self.pending_timestamps.pop_front() else {
                 break;
             };
-            {
+            let timing = {
                 let data = pending
                     .staging
                     .slice(..u64::from(pending.count) * 8)
@@ -2082,32 +2128,38 @@ impl GpuRenderer {
                         .filter(|(end, start)| end > start)
                         .map(|(end, start)| period * (end - start) as f64 * 1e-9)
                 };
-                // The frame's GPU time runs from the first pass's start
-                // to the last pass's end.
-                stats.gpu_seconds = delta(0, pending.count as usize - 1);
-                stats.passes_timed = pending
-                    .meta
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, meta)| PassTiming {
-                        name: meta.name,
-                        width: meta.width,
-                        height: meta.height,
-                        format: meta.format,
-                        gpu_seconds: delta(2 * i, 2 * i + 1).unwrap_or(0.0),
-                    })
-                    .collect();
-            }
+                FrameTiming {
+                    frame: pending.frame,
+                    // The frame's GPU time runs from the first pass's
+                    // start to the last pass's end.
+                    gpu_seconds: delta(0, pending.count as usize - 1),
+                    passes: pending
+                        .meta
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, meta)| PassTiming {
+                            name: meta.name,
+                            width: meta.width,
+                            height: meta.height,
+                            format: meta.format,
+                            gpu_seconds: delta(2 * i, 2 * i + 1),
+                        })
+                        .collect(),
+                }
+            };
             tracing::debug!(
-                passes = stats.passes_timed.len(),
-                gpu_ms = stats.gpu_seconds.map(|s| s * 1e3),
+                frame = timing.frame.get(),
+                passes = timing.passes.len(),
+                gpu_ms = timing.gpu_seconds.map(|s| s * 1e3),
                 "frame timed"
             );
+            timings.push(timing);
             pending.staging.unmap();
             if pending.staging.size() >= u64::from(self.query_capacity) * 8 {
                 self.query_staging = Some(pending.staging);
             }
         }
+        timings
     }
 
     fn ensure_query_capacity(&mut self, queries: u32) {

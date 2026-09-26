@@ -17,13 +17,13 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Instant;
 
-use cherenkov::FrameStats;
 use cherenkov::kurbo::{self, Shape as _};
 use cherenkov::{
     ContentOp, EngineError, FontData, FontId, ImageId, ImageUpload, LayerId, LayerNode,
     MemoryUsage, OffscreenFormat, Pressure, Readback, Redraw, RenderError, Renderer, ResourceError,
     SurfaceError, SurfaceFrame, SurfaceId, SurfaceInfo, SurfaceTree,
 };
+use cherenkov::{FrameStats, FrameTiming};
 use vello::peniko;
 use vello::{AaConfig, AaSupport, RendererOptions};
 
@@ -1331,9 +1331,15 @@ impl Renderer for VelloRenderer {
                     break;
                 }
             }
+            stats.frame = Some(frame.id);
             if self.timestamps {
                 self.drain_and_stamp(1)?;
-                stats.gpu_seconds = self.resolve_timestamps()?;
+                // Resolved synchronously: the frame's own timing.
+                stats.timings.push(FrameTiming {
+                    frame: frame.id,
+                    gpu_seconds: self.resolve_timestamps()?,
+                    passes: Vec::new(),
+                });
             }
             self.wait()?;
             result?;

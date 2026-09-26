@@ -11,7 +11,7 @@
 use crate::WorkingColor;
 use crate::config::{MemoryUsage, Pressure};
 use crate::error::{EngineError, RenderError, ResourceError, SurfaceError};
-use crate::frame::{FrameStats, FrameTime, Readback};
+use crate::frame::{FrameId, FrameStats, FrameTime, FrameTiming, Readback};
 use crate::glyph::FontId;
 use crate::image::ImageUpload;
 use crate::message::{ContentOp, FontData, LayerId, SurfaceId};
@@ -92,6 +92,18 @@ pub trait Renderer: 'static {
     /// [`RenderError`] fails the whole `render` call.
     fn render(&mut self, frame: &Frame<'_>, stats: &mut FrameStats) -> Result<Redraw, RenderError>;
 
+    /// Waits for the GPU to finish every submitted frame whose timing no
+    /// render has reported yet, and returns those timings, oldest first.
+    /// A backend that times frames synchronously, or not at all, has
+    /// nothing outstanding.
+    ///
+    /// # Errors
+    /// [`RenderError::Timeout`] when the GPU does not finish in time,
+    /// [`RenderError::Readback`] when the timing buffers cannot be read.
+    fn finish_timings(&mut self) -> Result<Vec<FrameTiming>, RenderError> {
+        Ok(Vec::new())
+    }
+
     /// Reads back a surface's pixels.
     ///
     /// # Errors
@@ -133,6 +145,9 @@ pub enum Redraw {
 
 /// One frame's render input: every live surface with its sampled tree.
 pub struct Frame<'a> {
+    /// The render's id; a backend that draws any surface reports it in
+    /// [`FrameStats::frame`] and tags the frame's [`FrameTiming`] with it.
+    pub id: FrameId,
     /// The frame's presentation time.
     pub time: FrameTime,
     /// The surfaces to consider; render those with `changed` set.

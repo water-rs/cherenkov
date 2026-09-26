@@ -66,6 +66,8 @@ use skia_safe::{
     surfaces,
 };
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use crate::GpuSample;
 use crate::convert::{self, Blobs};
 use crate::{BenchError, Counters, DeviceInfo, EncodeInput, Engine, EngineInfo, Submit};
 
@@ -896,7 +898,7 @@ impl Engine for SkiaCpu {
         Ok(())
     }
 
-    fn submit(&mut self, readback: bool) -> Result<Submit, BenchError> {
+    fn submit(&mut self, _frame: u64, readback: bool) -> Result<Submit, BenchError> {
         let prepared = self
             .prepared
             .as_mut()
@@ -913,8 +915,7 @@ impl Engine for SkiaCpu {
         };
         Ok(Submit {
             image,
-            gpu_seconds: None,
-            passes: Vec::new(),
+            gpu: Vec::new(),
             phases: Vec::new(),
         })
     }
@@ -1255,7 +1256,7 @@ impl Engine for SkiaVk {
         Ok(())
     }
 
-    fn submit(&mut self, readback: bool) -> Result<Submit, BenchError> {
+    fn submit(&mut self, frame: u64, readback: bool) -> Result<Submit, BenchError> {
         if self.prepared.is_none() {
             return Err(BenchError::Engine(
                 "skia-vulkan: submit before prepare".into(),
@@ -1296,8 +1297,7 @@ impl Engine for SkiaVk {
         };
         Ok(Submit {
             image,
-            gpu_seconds,
-            passes: Vec::new(),
+            gpu: GpuSample::whole_frame(frame, gpu_seconds),
             phases: Vec::new(),
         })
     }
@@ -1341,7 +1341,9 @@ mod graphite_metal {
 
     use super::{SkiaPrepared, build_cmds, p3_cs, replay, skia_features, skia_missing_api};
     use crate::convert;
-    use crate::{BenchError, Counters, DeviceInfo, EncodeInput, Engine, EngineInfo, Submit};
+    use crate::{
+        BenchError, Counters, DeviceInfo, EncodeInput, Engine, EngineInfo, GpuSample, Submit,
+    };
 
     /// Skia Graphite on Metal: an offscreen `RGBAF16` linear-P3 render
     /// target on the system device, timed by command-buffer markers.
@@ -1541,7 +1543,7 @@ mod graphite_metal {
             Ok(())
         }
 
-        fn submit(&mut self, readback: bool) -> Result<Submit, BenchError> {
+        fn submit(&mut self, frame: u64, readback: bool) -> Result<Submit, BenchError> {
             if self.prepared.is_none() {
                 return Err(BenchError::Engine(
                     "skia-metal: submit before prepare".into(),
@@ -1596,8 +1598,7 @@ mod graphite_metal {
             };
             Ok(Submit {
                 image,
-                gpu_seconds,
-                passes: Vec::new(),
+                gpu: GpuSample::whole_frame(frame, gpu_seconds),
                 phases: Vec::new(),
             })
         }

@@ -186,19 +186,13 @@ fn many_timed_frames_complete_with_whole_frame_gpu_time() -> Result<(), Box<dyn 
 }
 
 /// The Metal-only counterpart: macOS always has a Metal adapter, so this
-/// fails rather than skips when it is missing, and checks that the Apple
-/// stage-boundary sampling is reported as pass-boundary support.
+/// fails rather than skips when it is missing. Apple GPUs sample only at
+/// stage boundaries, which the pass-boundary timestamps rely on.
 #[test]
 #[cfg(target_os = "macos")]
 fn metal_times_many_frames_at_pass_boundaries() -> Result<(), Box<dyn std::error::Error>> {
     let engine = timed_engine(wgpu::Backends::METAL).expect("a Metal adapter");
     assert_eq!(engine.info().backend, "Metal", "{:?}", engine.info());
-    assert_ne!(
-        engine.info().timestamps,
-        cherenkov_gpu::TimestampSupport::Encoders,
-        "Metal samples at stage boundaries only: {:?}",
-        engine.info()
-    );
     many_timed_frames(&engine)
 }
 
@@ -224,7 +218,8 @@ fn many_timed_frames(engine: &Engine<Gpu>) -> Result<(), Box<dyn std::error::Err
         "/../scenes/fonts/NotoSans.ttf"
     ))?))?;
     let surface = engine.surface(Offscreen::new((256, 256), OffscreenFormat::LinearF16))?;
-    let mut any_timed = false;
+    let mut submitted = Vec::new();
+    let mut timings = Vec::new();
     for frame in 0..60u32 {
         // A different glyph size each frame keeps rasterising new atlas
         // entries so the atlas grows and eventually clears.
@@ -259,32 +254,35 @@ fn many_timed_frames(engine: &Engine<Gpu>) -> Result<(), Box<dyn std::error::Err
         assert_eq!(next, Next::Idle, "frame {frame}");
         let stats = engine.stats();
         assert!(stats.passes > 0, "frame {frame} drew nothing: {stats:?}");
-        if timed {
-            // Resolves land a frame or more late: once timing has
-            // arrived the most recent timed frame still spans its
-            // passes, and this scene's pass count is constant.
-            if let Some(gpu) = stats.gpu_seconds {
-                any_timed = true;
-                assert_eq!(
-                    stats.passes_timed.len(),
-                    stats.passes as usize,
-                    "frame {frame}: every pass is timed: {stats:?}"
-                );
-                let passes: f64 = stats.passes_timed.iter().map(|p| p.gpu_seconds).sum();
-                assert!(
-                    gpu > 0.0 && gpu >= passes * 0.99,
-                    "frame {frame}: whole frame {gpu}s must span its passes {passes}s"
-                );
-            }
-        } else {
-            assert!(stats.gpu_seconds.is_none() && stats.passes_timed.is_empty());
-        }
+        submitted.push((stats.frame.expect("a drawing render submits"), stats.passes));
+        timings.extend(stats.timings);
     }
+    timings.extend(engine.finish_timings()?);
     if timed {
-        assert!(
-            any_timed,
-            "60 frames on a timed engine produced no GPU timing"
+        // Resolves land a frame or more late, but every submitted frame's
+        // timing arrives exactly once, in order, tagged with its frame,
+        // and spans that frame's passes.
+        assert_eq!(
+            timings.iter().map(|t| t.frame).collect::<Vec<_>>(),
+            submitted.iter().map(|(f, _)| *f).collect::<Vec<_>>(),
+            "every frame is timed once, in order"
         );
+        for (timing, (_, passes)) in timings.iter().zip(&submitted) {
+            assert_eq!(timing.passes.len(), *passes as usize, "{timing:?}");
+            let gpu = timing.gpu_seconds.expect("the frame's timestamps increase");
+            let spanned: f64 = timing
+                .passes
+                .iter()
+                .map(|p| p.gpu_seconds.expect("the pass's timestamps increase"))
+                .sum();
+            assert!(
+                gpu > 0.0 && gpu >= spanned * 0.99,
+                "{:?}: whole frame {gpu}s must span its passes {spanned}s",
+                timing.frame
+            );
+        }
+    } else {
+        assert!(timings.is_empty());
     }
     let readback = surface.readback()?;
     let [r, g, ..] = readback.pixels[(2 * readback.width + 2) as usize];

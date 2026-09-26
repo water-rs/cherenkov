@@ -36,8 +36,8 @@ struct BenchRunner {
         var firstFailure: Int32 = 0
         for (index, args) in argLists.enumerated() {
             logger.info("run \(index): \(args.joined(separator: " "), privacy: .public)")
-            let stderrURL = outDir.appendingPathComponent("run-\(index).stderr")
-            let code = Self.invoke(args, stderrTo: stderrURL)
+            let logURL = outDir.appendingPathComponent("run-\(index).log")
+            let code = Self.invoke(args, logTo: logURL)
             logger.info("run \(index): exit \(code)")
             results.append(["args": args, "exit_code": code])
             if firstFailure == 0 { firstFailure = code }
@@ -47,19 +47,22 @@ struct BenchRunner {
     }
 
     /// Calls `cherenkov_bench_run` with `cherenkov-bench` as `argv[0]`
-    /// followed by `args`, with fd 2 redirected to `stderrURL` for the
-    /// duration of the call and restored afterwards.
-    static func invoke(_ args: [String], stderrTo stderrURL: URL) -> Int32 {
+    /// followed by `args`, with fds 1 and 2 redirected to `logURL` for
+    /// the duration of the call and restored afterwards.
+    static func invoke(_ args: [String], logTo logURL: URL) -> Int32 {
         var cArgs = (["cherenkov-bench"] + args).map { strdup($0) }
         defer { cArgs.forEach { free($0) } }
 
-        let saved = dup(STDERR_FILENO)
-        let log = open(stderrURL.path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
-        let redirected = saved >= 0 && log >= 0
+        let savedOut = dup(STDOUT_FILENO)
+        let savedErr = dup(STDERR_FILENO)
+        let log = open(logURL.path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+        let redirected = savedOut >= 0 && savedErr >= 0 && log >= 0
         if redirected {
+            fflush(nil)
+            dup2(log, STDOUT_FILENO)
             dup2(log, STDERR_FILENO)
         } else {
-            logger.error("stderr redirect to \(stderrURL.path, privacy: .public) failed (saved=\(saved), log=\(log))")
+            logger.error("log redirect to \(logURL.path, privacy: .public) failed (savedOut=\(savedOut), savedErr=\(savedErr), log=\(log))")
         }
         if log >= 0 { close(log) }
 
@@ -73,8 +76,12 @@ struct BenchRunner {
         }
 
         fflush(nil)
-        if redirected { dup2(saved, STDERR_FILENO) }
-        if saved >= 0 { close(saved) }
+        if redirected {
+            dup2(savedOut, STDOUT_FILENO)
+            dup2(savedErr, STDERR_FILENO)
+        }
+        if savedOut >= 0 { close(savedOut) }
+        if savedErr >= 0 { close(savedErr) }
         return code
     }
 

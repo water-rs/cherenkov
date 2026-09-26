@@ -13,7 +13,7 @@ use crate::backend::{Backend, Display, SurfaceInfo};
 use crate::config::{MemoryUsage, Pressure};
 use crate::display_list::{Picture, SlotUpdate};
 use crate::error::{RenderError, SurfaceError};
-use crate::frame::{FrameStats, FrameTime, Next, Readback};
+use crate::frame::{FrameStats, FrameTime, FrameTiming, Next, Readback};
 use crate::shape::ShapeData;
 use crate::style::{BlendMode, FilterId};
 
@@ -225,6 +225,11 @@ pub enum Message<B: Backend> {
         commits: Vec<(SurfaceId, ChangeSet<B>)>,
         /// What the next frame needs and this frame's stats.
         reply: Sender<Result<(Next, FrameStats), RenderError>>,
+    },
+    /// Wait for every outstanding frame timing and return it.
+    FinishTimings {
+        /// The timings, oldest first.
+        reply: Sender<Result<Vec<FrameTiming>, RenderError>>,
     },
     /// Read back a surface's pixels.
     Readback {

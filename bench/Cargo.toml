@@ -77,6 +77,11 @@ sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# `staticlib` for hosts that cannot run a command-line binary — the iOS
+# bench app (`bench/ios`) links `cherenkov_bench_run` out of the .a.
+[lib]
+crate-type = ["rlib", "staticlib"]
+
 [[bin]]
 name = "cherenkov-bench"
 path = "src/bin.rs"

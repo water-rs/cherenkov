@@ -43,7 +43,7 @@ pub use crate::font::{Font, FontSource};
 pub use crate::image::{Image, ImageColorSpace, ImageSource};
 pub use crate::surface::{
     FrameStats, FrameTime, Layer, LayerContent, LayerEdit, Next, Offscreen, OffscreenFormat,
-    PassTiming, Readback, RefreshRange, Surface, Transaction,
+    PassTiming, Phases, Readback, RefreshRange, Surface, Transaction,
 };
 
 use crate::message::{Message, SurfaceId};

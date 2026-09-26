@@ -12,6 +12,7 @@ mod raster;
 
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender};
+use std::time::Instant;
 
 use cherenkov::ContentChange;
 
@@ -1078,6 +1079,7 @@ impl Renderer {
         let mut stop_base = 0u32;
         let mut globals_base = 0u32;
         let mut result = Ok(());
+        let t_lower = Instant::now();
         for &id in &dirty {
             result = self.lower_surface(id, &mut stats, inst_base, stop_base, globals_base);
             if result.is_err() {
@@ -1089,13 +1091,19 @@ impl Renderer {
                 globals_base += u32::try_from(surf.frame.passes.len()).unwrap_or(u32::MAX);
             }
         }
+        stats.phases.lower_seconds = t_lower.elapsed().as_secs_f64();
+        let mut t = Instant::now();
         self.drain_and_stamp(0)?;
+        stats.phases.stamp_seconds += t.elapsed().as_secs_f64();
+        t = Instant::now();
         if result.is_ok() {
             for &id in &dirty {
                 self.encode_surface(id, &mut stats);
             }
         }
+        stats.phases.encode_seconds = t.elapsed().as_secs_f64();
         if self.timestamps {
+            t = Instant::now();
             self.drain_and_stamp(1)?;
             let ticks = self.resolve_timestamps(2 + 2 * self.frame_pass_count)?;
             let period = f64::from(self.queue.get_timestamp_period());
@@ -1117,8 +1125,11 @@ impl Renderer {
                     gpu_seconds: delta(2 + 2 * i, 3 + 2 * i).unwrap_or(0.0),
                 });
             }
+            stats.phases.stamp_seconds += t.elapsed().as_secs_f64();
         }
+        let t_wait = Instant::now();
         self.wait()?;
+        stats.phases.wait_seconds = t_wait.elapsed().as_secs_f64();
         result?;
         Ok((Next::Idle, stats))
     }

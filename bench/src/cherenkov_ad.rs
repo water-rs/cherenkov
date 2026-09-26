@@ -837,10 +837,24 @@ impl Engine for Cherenkov {
         } else {
             None
         };
+        let phases = stats.phases;
+        let phases = [
+            ("lower", phases.lower_seconds),
+            ("encode", phases.encode_seconds),
+            ("stamp", phases.stamp_seconds),
+            ("wait", phases.wait_seconds),
+        ]
+        .into_iter()
+        .map(|(name, seconds)| crate::PhaseSample {
+            name: name.to_string(),
+            seconds,
+        })
+        .collect();
         Ok(Submit {
             image,
             gpu_seconds,
             passes,
+            phases,
         })
     }
 

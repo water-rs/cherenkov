@@ -61,6 +61,11 @@ pub enum Item {
         bbox: IRect,
         /// The fill rule.
         rule: FillRule,
+        /// Whether the boundary can self-overlap: `Path` fills and all
+        /// strokes deposit through the exact sweep; primitive convex
+        /// fills (rect, rounded rect, circle, ellipse, continuous) use
+        /// the raw deposit, exact for a single convex contour.
+        exact: bool,
         /// The paint evaluator.
         paint: PaintData,
         /// The clip in force.
@@ -494,7 +499,8 @@ impl<'a> Lowering<'a> {
         let tol_u = FLATTEN_TOL / sm;
         let (path, rule) = shape_path(shape, tol_u)?;
         let edges = flatten_edges(self.transform * path, FLATTEN_TOL);
-        let mut mask = coverage_mask(&edges, rule, w, h);
+        let exact = matches!(shape, ShapeData::Path { .. });
+        let mut mask = coverage_mask(&edges, rule, w, h, exact);
         if let Some(current) = &self.clip {
             for (i, m) in mask.iter_mut().enumerate() {
                 let (px, py) = (i % w, i / w);
@@ -701,6 +707,7 @@ impl<'a> Lowering<'a> {
             edges: edges.into(),
             bbox,
             rule,
+            exact: matches!(shape, ShapeData::Path { .. }),
             paint,
             clip: self.clip.clone(),
         });
@@ -742,6 +749,8 @@ impl<'a> Lowering<'a> {
             edges: edges.into(),
             bbox,
             rule: FillRule::NonZero,
+            // Kurbo's stroker self-overlaps at joins and caps.
+            exact: true,
             paint,
             clip: self.clip.clone(),
         });

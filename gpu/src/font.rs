@@ -5,12 +5,15 @@
 //! thread, then handed to the render thread by [`Font`].
 
 use std::path::Path;
+use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::mpsc::Sender;
 
 use skrifa::MetadataProvider;
 use skrifa::raw::TableProvider;
 
 use crate::error::{ResourceError, Unsupported};
+use crate::message::Message;
 
 /// The data of a font to register with the engine.
 #[derive(Clone)]
@@ -57,24 +60,38 @@ impl FontSource {
     }
 }
 
-/// A font registered with an engine. Cloning is cheap; ids are unique per
-/// engine.
-#[derive(Clone, Debug)]
-pub struct Font {
+/// The shared font state; dropping the last clone releases the font.
+struct FontInner {
     id: cherenkov::FontId,
+    tx: Sender<Message>,
+}
+
+impl Drop for FontInner {
+    fn drop(&mut self) {
+        let _ = self.tx.send(Message::RemoveFont { id: self.id.raw() });
+    }
+}
+
+/// A font registered with an engine. Cloning is cheap; the font data and
+/// its render-thread caches are released when the last clone drops.
+#[derive(Clone)]
+pub struct Font {
+    inner: Rc<FontInner>,
 }
 
 impl Font {
     /// A handle for the registered font `id`.
     #[must_use]
-    pub const fn new(id: cherenkov::FontId) -> Self {
-        Self { id }
+    pub fn new(id: cherenkov::FontId, tx: Sender<Message>) -> Self {
+        Self {
+            inner: Rc::new(FontInner { id, tx }),
+        }
     }
 
     /// The identifier glyph runs reference.
     #[must_use]
-    pub const fn id(&self) -> cherenkov::FontId {
-        self.id
+    pub fn id(&self) -> cherenkov::FontId {
+        self.inner.id
     }
 }
 

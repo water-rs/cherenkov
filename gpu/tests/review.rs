@@ -285,6 +285,39 @@ fn a_cone_gradient_matches_the_oracle() {
     }
 }
 
+/// Dropping the last `Font` clone frees the renderer's font state: the
+/// atlas's glyph cells are purged and a later frame referencing the id
+/// fails fast instead of silently keeping the font alive.
+#[test]
+fn dropping_a_font_frees_its_renderer_state() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(engine) = engine(GpuConfig::default()) else {
+        return Ok(());
+    };
+    let font = engine.font(font())?;
+    let font_id = font.id();
+    let surface = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
+    let runs = text_runs(font_id, 8, 24.0);
+    surface.update(|tx| {
+        tx[surface.root()].content(surface.record(|c| {
+            c.glyphs(&runs[0], WorkingColor::WHITE);
+        }));
+    });
+    engine.render(cherenkov_gpu::FrameTime::now())?;
+    assert!(engine.memory().cpu > Bytes(0), "glyph cells cached");
+    drop(font);
+    // Dirty the surface so the next frame re-lowers and consults the font.
+    surface.clear_color(WorkingColor::new([0.0, 0.0, 0.0, 1.0]));
+    assert!(
+        matches!(
+            engine.render(cherenkov_gpu::FrameTime::now()),
+            Err(RenderError::Font(_))
+        ),
+        "render after the last Font clone dropped"
+    );
+    assert_eq!(engine.memory().cpu, Bytes(0), "font cells released");
+    Ok(())
+}
+
 /// A zero-size surface is rejected synchronously.
 #[test]
 fn a_zero_size_surface_is_an_error() {

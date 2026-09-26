@@ -253,6 +253,18 @@ impl Atlas {
         self.cpu_bytes
     }
 
+    /// Drops every cached glyph of `font`. The freed texels stay claimed
+    /// in the shelf layout until the next [`Self::grow`] or
+    /// [`Self::clear`]; path and mask cells are font-independent and stay.
+    pub fn remove_font(&mut self, font: u64) {
+        let freed: u64 = self
+            .map
+            .extract_if(|key, _| key.font == font)
+            .map(|(_, entry)| u64::from(entry.w) * u64::from(entry.h))
+            .sum();
+        self.cpu_bytes = self.cpu_bytes.saturating_sub(freed);
+    }
+
     /// Clears every entry without freeing the texture.
     pub fn clear(&mut self) {
         self.map.clear();

@@ -118,6 +118,11 @@ pub enum Message {
         /// The image id.
         id: u64,
     },
+    /// Release a font.
+    RemoveFont {
+        /// The font id.
+        id: u64,
+    },
     /// Commit a surface's change set.
     Commit {
         /// The surface.

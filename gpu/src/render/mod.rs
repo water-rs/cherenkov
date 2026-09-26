@@ -6,6 +6,7 @@
 mod glyph;
 mod instance;
 mod lower;
+mod path;
 mod raster;
 
 use std::collections::HashMap;
@@ -13,10 +14,10 @@ use std::sync::mpsc::{Receiver, Sender};
 
 use cherenkov::ContentChange;
 
-use crate::config::{GpuConfig, GpuInfo, MemoryUsage, Pressure};
+use crate::config::{GpuConfig, GpuInfo, MemoryUsage, Pressure, ScratchFormat};
 use crate::error::{EngineError, RenderError, SurfaceError};
 use crate::message::{ChangeSet, LayerId, LayerOp, Message, SurfaceId};
-use crate::surface::{FrameStats, Next, Readback};
+use crate::surface::{FrameStats, Next, PassTiming, Readback};
 use glyph::{Atlas, FontData};
 use lower::{ContentData, Frame, GlyphContext, LayerNode, Lowering, Target};
 
@@ -29,20 +30,49 @@ const TARGET_USAGES: wgpu::TextureUsages = wgpu::TextureUsages::from_bits_retain
         | wgpu::TextureUsages::TEXTURE_BINDING.bits(),
 );
 
+/// The `wgpu` format for a [`ScratchFormat`].
+const fn scratch_wgpu(format: ScratchFormat) -> wgpu::TextureFormat {
+    match format {
+        ScratchFormat::LinearF16 => wgpu::TextureFormat::Rgba16Float,
+        ScratchFormat::Rgba8Unorm => wgpu::TextureFormat::Rgba8Unorm,
+    }
+}
+
+/// The pass-report spelling of a texture format.
+const fn format_name(format: wgpu::TextureFormat) -> &'static str {
+    match format {
+        wgpu::TextureFormat::Rgba16Float => "rgba16float",
+        wgpu::TextureFormat::Rgba8Unorm => "rgba8unorm",
+        _ => "unknown",
+    }
+}
+
 /// The render thread's reply to [`crate::Engine::new`].
 pub struct Init {
     /// Adapter info.
     pub info: GpuInfo,
 }
 
+/// One isolation scratch texture and its cached group-1 bind group.
+struct ScratchTarget {
+    #[expect(dead_code, reason = "the texture keeps the view alive")]
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    bind: wgpu::BindGroup,
+    width: u32,
+    height: u32,
+}
+
 /// One surface's GPU-side state.
 struct SurfaceState {
     size: (u32, u32),
+    /// The scratch texture format (set at creation).
+    scratch_format: wgpu::TextureFormat,
     target: wgpu::Texture,
     view: wgpu::TextureView,
-    /// Scratch textures, one per isolation depth, each with its cached
-    /// group-1 bind group.
-    scratch: Vec<(wgpu::Texture, wgpu::TextureView, wgpu::BindGroup)>,
+    /// Scratch textures, one per isolation depth, sized to the largest
+    /// region seen so far.
+    scratch: Vec<ScratchTarget>,
     layers: HashMap<LayerId, LayerNode>,
     clear: cherenkov::WorkingColor,
     dirty: bool,
@@ -52,8 +82,18 @@ struct SurfaceState {
 impl SurfaceState {
     /// Bytes held by this surface's textures.
     fn gpu_bytes(&self) -> u64 {
-        let texel = u64::from(self.size.0) * u64::from(self.size.1) * 8;
-        texel * (1 + self.scratch.len() as u64)
+        let surface_bytes = u64::from(self.size.0) * u64::from(self.size.1) * 8;
+        let scratch_texel = if self.scratch_format == wgpu::TextureFormat::Rgba8Unorm {
+            4
+        } else {
+            8
+        };
+        let scratch_bytes: u64 = self
+            .scratch
+            .iter()
+            .map(|s| u64::from(s.width) * u64::from(s.height) * scratch_texel)
+            .sum();
+        surface_bytes + scratch_bytes
     }
 }
 
@@ -62,6 +102,10 @@ struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::RenderPipeline,
+    /// The pipeline for scratch targets (may equal `pipeline`).
+    scratch_pipeline: wgpu::RenderPipeline,
+    /// The configured isolation texture format.
+    scratch_format: wgpu::TextureFormat,
     layout0: wgpu::BindGroupLayout,
     layout1: wgpu::BindGroupLayout,
     globals: wgpu::Buffer,
@@ -74,6 +118,8 @@ struct Renderer {
     bound_instance_size: u64,
     /// The stop buffer size `bind0` was built against.
     bound_stop_size: u64,
+    /// The globals buffer size `bind0` was built against.
+    bound_globals_size: u64,
     atlas: Atlas,
     dummy_bind1: wgpu::BindGroup,
     surfaces: HashMap<SurfaceId, SurfaceState>,
@@ -82,8 +128,23 @@ struct Renderer {
     query_set: Option<wgpu::QuerySet>,
     query_buffer: Option<wgpu::Buffer>,
     query_staging: wgpu::Buffer,
+    /// The query set's capacity in queries; indices 0/1 bracket the frame,
+    /// `2 + 2i` each pass.
+    query_capacity: u32,
+    /// Passes encoded this frame, for the per-pass report.
+    frame_pass_count: u32,
+    /// `(name, width, height, format)` of each encoded pass this frame.
+    pass_meta: Vec<PassMeta>,
     timestamps_inside: bool,
     max_texture: u32,
+}
+
+/// One encoded pass's report metadata.
+struct PassMeta {
+    name: String,
+    width: u32,
+    height: u32,
+    format: &'static str,
 }
 
 /// A new default layer node.
@@ -179,8 +240,9 @@ fn create_layouts(device: &wgpu::Device) -> (wgpu::BindGroupLayout, wgpu::BindGr
                 visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+                    // Each pass binds its own 256-byte-aligned Globals.
+                    has_dynamic_offset: true,
+                    min_binding_size: wgpu::BufferSize::new(16),
                 },
                 count: None,
             },
@@ -211,7 +273,13 @@ fn make_bind0(
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
-                resource: globals.as_entire_binding(),
+                // One 16-byte Globals window; the dynamic offset selects
+                // the pass's slot inside the buffer.
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: globals,
+                    offset: 0,
+                    size: wgpu::BufferSize::new(16),
+                }),
             },
             wgpu::BindGroupEntry {
                 binding: 1,
@@ -237,6 +305,7 @@ fn create_pipeline(
     config: &GpuConfig,
     layout0: &wgpu::BindGroupLayout,
     layout1: &wgpu::BindGroupLayout,
+    format: wgpu::TextureFormat,
 ) -> Result<wgpu::RenderPipeline, EngineError> {
     let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -282,7 +351,7 @@ fn create_pipeline(
             entry_point: Some("fs_main"),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             targets: &[Some(wgpu::ColorTargetState {
-                format: TARGET_FORMAT,
+                format,
                 blend: Some(wgpu::BlendState {
                     color: component,
                     alpha: component,
@@ -311,12 +380,13 @@ fn create_pipeline(
     Ok(pipeline)
 }
 
-/// A `w` × `h` texture in the target format.
+/// A `w` × `h` texture in `format`.
 fn create_target(
     device: &wgpu::Device,
     label: &'static str,
     size: (u32, u32),
     usages: wgpu::TextureUsages,
+    format: wgpu::TextureFormat,
 ) -> (wgpu::Texture, wgpu::TextureView) {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
@@ -328,7 +398,7 @@ fn create_target(
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: TARGET_FORMAT,
+        format,
         usage: usages,
         view_formats: &[],
     });
@@ -347,7 +417,10 @@ pub fn run(config: GpuConfig, rx: Receiver<Message>, init_tx: Sender<Result<Init
     let init = create_device(&config).and_then(|(adapter, device, queue)| {
         let info = adapter.get_info();
         let (layout0, layout1) = create_layouts(&device);
-        let pipeline = create_pipeline(&device, &config, &layout0, &layout1)?;
+        let pipeline = create_pipeline(&device, &config, &layout0, &layout1, TARGET_FORMAT)?;
+        let scratch_format = scratch_wgpu(config.scratch_format);
+        let scratch_pipeline =
+            create_pipeline(&device, &config, &layout0, &layout1, scratch_format)?;
         let globals = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("globals"),
             size: 16,
@@ -373,6 +446,7 @@ pub fn run(config: GpuConfig, rx: Receiver<Message>, init_tx: Sender<Result<Init
             "dummy source",
             (1, 1),
             wgpu::TextureUsages::TEXTURE_BINDING,
+            TARGET_FORMAT,
         );
         let dummy_bind1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("dummy source"),
@@ -409,11 +483,15 @@ pub fn run(config: GpuConfig, rx: Receiver<Message>, init_tx: Sender<Result<Init
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
+        // The initial query set holds the two frame-bracketing queries.
+        let query_capacity = if query_set.is_some() { 2 } else { 0 };
         let renderer = Renderer {
             max_texture: device.limits().max_texture_dimension_2d,
             device,
             queue,
             pipeline,
+            scratch_pipeline,
+            scratch_format,
             layout0,
             layout1,
             globals,
@@ -423,6 +501,7 @@ pub fn run(config: GpuConfig, rx: Receiver<Message>, init_tx: Sender<Result<Init
             bound_atlas: 0,
             bound_instance_size: 272 * 16,
             bound_stop_size: 32 * 16,
+            bound_globals_size: 16,
             atlas,
             dummy_bind1,
             surfaces: HashMap::new(),
@@ -431,6 +510,9 @@ pub fn run(config: GpuConfig, rx: Receiver<Message>, init_tx: Sender<Result<Init
             query_set,
             query_buffer,
             query_staging,
+            query_capacity,
+            frame_pass_count: 0,
+            pass_meta: Vec::new(),
             timestamps_inside,
         };
         Ok((renderer, info))
@@ -502,13 +584,20 @@ impl Renderer {
                 max: self.max_texture,
             });
         }
-        let (target, view) = create_target(&self.device, "surface target", size, TARGET_USAGES);
+        let (target, view) = create_target(
+            &self.device,
+            "surface target",
+            size,
+            TARGET_USAGES,
+            TARGET_FORMAT,
+        );
         let mut layers = HashMap::new();
         layers.insert(0, node());
         self.surfaces.insert(
             id,
             SurfaceState {
                 size,
+                scratch_format: self.scratch_format,
                 target,
                 view,
                 scratch: Vec::new(),
@@ -646,6 +735,8 @@ impl Renderer {
         if dirty.is_empty() {
             return Ok((Next::Idle, stats));
         }
+        self.frame_pass_count = 0;
+        self.pass_meta.clear();
         self.drain_and_stamp(0)?;
         let mut result = Ok(());
         for id in dirty {
@@ -656,7 +747,26 @@ impl Renderer {
         }
         if self.timestamps {
             self.drain_and_stamp(1)?;
-            stats.gpu_seconds = self.resolve_timestamps()?;
+            let ticks = self.resolve_timestamps(2 + 2 * self.frame_pass_count)?;
+            let period = f64::from(self.queue.get_timestamp_period());
+            #[expect(clippy::cast_precision_loss)]
+            let delta = |from: usize, to: usize| {
+                ticks
+                    .get(to)
+                    .zip(ticks.get(from))
+                    .filter(|(end, start)| end > start)
+                    .map(|(end, start)| period * (end - start) as f64 * 1e-9)
+            };
+            stats.gpu_seconds = delta(0, 1);
+            for (i, meta) in self.pass_meta.drain(..).enumerate() {
+                stats.passes_timed.push(PassTiming {
+                    name: meta.name,
+                    width: meta.width,
+                    height: meta.height,
+                    format: meta.format,
+                    gpu_seconds: delta(2 + 2 * i, 3 + 2 * i).unwrap_or(0.0),
+                });
+            }
         }
         self.wait()?;
         result?;
@@ -664,7 +774,11 @@ impl Renderer {
     }
 
     /// Lowers and submits one surface.
-    #[expect(clippy::too_many_lines)]
+    #[expect(
+        clippy::too_many_lines,
+        clippy::cast_precision_loss,
+        reason = "pixel sizes are well within f32"
+    )]
     fn render_surface(&mut self, id: SurfaceId, stats: &mut FrameStats) -> Result<(), RenderError> {
         // Lowering needs `surf.layers` and `surf.frame` plus `atlas`,
         // `fonts`, `device` and `queue`; take the layer map out of the
@@ -689,6 +803,7 @@ impl Renderer {
                     let mut lowering = Lowering::new(&mut surf.frame, surf.size);
                     let result = lowering.run(root, &layers, surf.clear, &mut glyphs);
                     stats.glyphs_rasterized += lowering.glyphs_rasterized();
+                    stats.paths_rasterized += lowering.paths_rasterized();
                     result
                 } else {
                     Ok(())
@@ -711,6 +826,14 @@ impl Renderer {
             result
         };
         lowered?;
+        // Grow the query set lazily when this frame's passes exceed its
+        // capacity; never mid-encoder.
+        if self.timestamps {
+            let passes = self.surfaces.get(&id).map_or(0, |s| {
+                u32::try_from(s.frame.passes.len()).unwrap_or(u32::MAX)
+            });
+            self.ensure_query_capacity(2 + 2 * (self.frame_pass_count + passes));
+        }
         // Scratch textures for the frame's deepest isolation level.
         let Some(surf) = self.surfaces.get_mut(&id) else {
             return Ok(());
@@ -725,9 +848,34 @@ impl Renderer {
             })
             .max()
             .unwrap_or(0);
-        while surf.scratch.len() < max_scratch {
-            let (texture, view) =
-                create_target(&self.device, "isolation scratch", surf.size, TARGET_USAGES);
+        // The largest region each isolation depth must hold this frame.
+        let mut region_max = vec![(0u32, 0u32); max_scratch];
+        for pass in &surf.frame.passes {
+            if let Target::Scratch(i) = pass.target {
+                region_max[i].0 = region_max[i].0.max(pass.region[2]);
+                region_max[i].1 = region_max[i].1.max(pass.region[3]);
+            }
+        }
+        // Grow each scratch to its needed size; never shrink.
+        for (i, &(w, h)) in region_max.iter().enumerate() {
+            let (nw, nh) = (
+                w.max(surf.scratch.get(i).map_or(0, |s| s.width)),
+                h.max(surf.scratch.get(i).map_or(0, |s| s.height)),
+            );
+            if surf
+                .scratch
+                .get(i)
+                .is_some_and(|s| s.width >= w && s.height >= h)
+            {
+                continue;
+            }
+            let (texture, view) = create_target(
+                &self.device,
+                "isolation scratch",
+                (nw, nh),
+                TARGET_USAGES,
+                self.scratch_format,
+            );
             let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("scratch source"),
                 layout: &self.layout1,
@@ -736,16 +884,19 @@ impl Renderer {
                     resource: wgpu::BindingResource::TextureView(&view),
                 }],
             });
-            surf.scratch.push((texture, view, bind));
+            let target = ScratchTarget {
+                texture,
+                view,
+                bind,
+                width: nw,
+                height: nh,
+            };
+            if i < surf.scratch.len() {
+                surf.scratch[i] = target;
+            } else {
+                surf.scratch.push(target);
+            }
         }
-        // Write the globals, grow and write the instance/stop buffers. The
-        // group-0 bind group is rebuilt only when a buffer or the atlas
-        // texture was recreated.
-        self.queue.write_buffer(
-            &self.globals,
-            0,
-            bytemuck::bytes_of(&lower::globals(surf.size)),
-        );
         let inst_bytes = bytemuck::cast_slice::<instance::Instance, u8>(&surf.frame.instances);
         if !inst_bytes.is_empty() && inst_bytes.len() as u64 > self.instances.size() {
             let size = (inst_bytes.len() as u64).next_power_of_two();
@@ -783,10 +934,31 @@ impl Renderer {
             );
             self.bound_atlas = self.atlas.generation();
         }
+        // One Globals entry per pass at a 256-byte stride; grow the
+        // uniform buffer lazily and write each pass's target frame.
+        let needed = (surf.frame.passes.len().max(1) as u64) * 256;
+        if needed > self.globals.size() {
+            let size = needed.next_power_of_two();
+            self.globals = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("globals"),
+                size,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        for (i, pass) in surf.frame.passes.iter().enumerate() {
+            let g = lower::globals(
+                [pass.region[2] as f32, pass.region[3] as f32],
+                [pass.region[0] as f32, pass.region[1] as f32],
+            );
+            self.queue
+                .write_buffer(&self.globals, (i as u64) * 256, bytemuck::bytes_of(&g));
+        }
         // Buffers grown above leave `bind0` stale; rebuild when capacity
         // changed since the bind group was built.
         if self.instances.size() > self.bound_instance_size
             || self.stops.size() > self.bound_stop_size
+            || self.globals.size() > self.bound_globals_size
         {
             self.bind0 = make_bind0(
                 &self.device,
@@ -799,6 +971,7 @@ impl Renderer {
             self.bound_atlas = self.atlas.generation();
             self.bound_instance_size = self.instances.size();
             self.bound_stop_size = self.stops.size();
+            self.bound_globals_size = self.globals.size();
         }
 
         let mut encoder = self
@@ -806,10 +979,10 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame"),
             });
-        for pass in &surf.frame.passes {
+        for (i, pass) in surf.frame.passes.iter().enumerate() {
             let view = match pass.target {
                 Target::Surface => &surf.view,
-                Target::Scratch(i) => &surf.scratch[i].1,
+                Target::Scratch(i) => &surf.scratch[i].view,
             };
             let load = match pass.clear {
                 Some([r, g, b, a]) => wgpu::LoadOp::Clear(wgpu::Color {
@@ -820,6 +993,28 @@ impl Renderer {
                 }),
                 None => wgpu::LoadOp::Load,
             };
+            let pass_index = self.frame_pass_count;
+            self.frame_pass_count += 1;
+            let timestamp_writes =
+                self.query_set
+                    .as_ref()
+                    .map(|qs| wgpu::RenderPassTimestampWrites {
+                        query_set: qs,
+                        beginning_of_pass_write_index: Some(2 + 2 * pass_index),
+                        end_of_pass_write_index: Some(3 + 2 * pass_index),
+                    });
+            self.pass_meta.push(PassMeta {
+                name: match pass.target {
+                    Target::Surface => "surface".to_string(),
+                    Target::Scratch(i) => format!("scratch{i}"),
+                },
+                width: pass.region[2],
+                height: pass.region[3],
+                format: format_name(match pass.target {
+                    Target::Surface => TARGET_FORMAT,
+                    Target::Scratch(_) => self.scratch_format,
+                }),
+            });
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -832,16 +1027,37 @@ impl Renderer {
                     depth_slice: None,
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes,
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            render_pass.set_pipeline(&self.pipeline);
-            render_pass.set_bind_group(0, &self.bind0, &[]);
+            render_pass.set_pipeline(match pass.target {
+                Target::Surface => &self.pipeline,
+                Target::Scratch(_) => &self.scratch_pipeline,
+            });
+            // Scratch passes cover only their region; the surface pass the
+            // whole target. `in.device` stays in true device space via the
+            // per-pass Globals origin.
+            if let Target::Scratch(_) = pass.target {
+                render_pass.set_viewport(
+                    0.0,
+                    0.0,
+                    pass.region[2] as f32,
+                    pass.region[3] as f32,
+                    0.0,
+                    1.0,
+                );
+                render_pass.set_scissor_rect(0, 0, pass.region[2], pass.region[3]);
+            }
+            // The uniform slot written for this pass above (256-byte
+            // stride), which matches `surf.frame.passes` ordering.
+            #[expect(clippy::cast_possible_truncation)]
+            let offset = (i * 256) as u32;
+            render_pass.set_bind_group(0, &self.bind0, &[offset]);
             for range in &pass.ranges {
                 stats.draws += 1;
                 let bind = match range.source {
-                    Some(i) => &surf.scratch[i].2,
+                    Some(i) => &surf.scratch[i].bind,
                     None => &self.dummy_bind1,
                 };
                 render_pass.set_bind_group(1, bind, &[]);
@@ -888,33 +1104,54 @@ impl Renderer {
         Ok(())
     }
 
-    /// Resolves the timestamp pair into seconds.
-    fn resolve_timestamps(&self) -> Result<Option<f64>, RenderError> {
+    /// Grows the query set and its resolve buffers to hold `queries`,
+    /// between frames — never mid-encoder.
+    fn ensure_query_capacity(&mut self, queries: u32) {
+        if queries <= self.query_capacity {
+            return;
+        }
+        let capacity = queries.next_power_of_two().max(2);
+        self.query_set = Some(self.device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("frame timestamps"),
+            ty: wgpu::QueryType::Timestamp,
+            count: capacity,
+        }));
+        self.query_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("timestamp resolve"),
+            size: u64::from(capacity) * 8,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        }));
+        self.query_staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("timestamp staging"),
+            size: u64::from(capacity) * 8,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        self.query_capacity = capacity;
+    }
+
+    /// Resolves the first `count` timestamp queries into raw ticks.
+    fn resolve_timestamps(&self, count: u32) -> Result<Vec<u64>, RenderError> {
         let (Some(qs), Some(buf)) = (&self.query_set, &self.query_buffer) else {
-            return Ok(None);
+            return Ok(Vec::new());
         };
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("timestamp resolve"),
             });
-        encoder.resolve_query_set(qs, 0..2, buf, 0);
-        encoder.copy_buffer_to_buffer(buf, 0, &self.query_staging, 0, 16);
+        encoder.resolve_query_set(qs, 0..count, buf, 0);
+        encoder.copy_buffer_to_buffer(buf, 0, &self.query_staging, 0, u64::from(count) * 8);
         self.queue.submit([encoder.finish()]);
-        let slice = self.query_staging.slice(..);
+        let slice = self.query_staging.slice(..u64::from(count) * 8);
         slice.map_async(wgpu::MapMode::Read, |_| {});
         self.wait()?;
         let data = slice.get_mapped_range();
-        let ticks: &[u64] = bytemuck::cast_slice(&data);
-        #[expect(clippy::cast_precision_loss)]
-        let seconds = if ticks.len() >= 2 && ticks[1] > ticks[0] {
-            Some(f64::from(self.queue.get_timestamp_period()) * (ticks[1] - ticks[0]) as f64 * 1e-9)
-        } else {
-            None
-        };
+        let ticks: Vec<u64> = bytemuck::cast_slice(&data).to_vec();
         drop(data);
         self.query_staging.unmap();
-        Ok(seconds)
+        Ok(ticks)
     }
 
     /// Copies a surface's target into `Readback` pixels, decoding f16 → f32.

@@ -64,6 +64,97 @@ pub struct Entry {
     pub top: i32,
 }
 
+/// One atlas cell emitted by the path rasterizer: a device-space quad
+/// sampling `w` × `h` coverage texels at `(x, y)`.
+#[derive(Clone, Copy, Debug)]
+pub struct PathCell {
+    /// Device-space quad `(x0, y0, x1, y1)`.
+    pub rect: [f32; 4],
+    /// Atlas texel origin.
+    pub x: u16,
+    /// Atlas texel origin.
+    pub y: u16,
+}
+
+/// What a cached path draw replays: full-coverage spans and atlas cells,
+/// in device space shifted by the cache's stored offset.
+#[derive(Clone, Debug, Default)]
+pub struct PathEmit {
+    /// Device rectangles of contiguous full-coverage columns.
+    pub spans: Vec<[f32; 4]>,
+    /// Partial-coverage atlas cells.
+    pub cells: Vec<PathCell>,
+}
+
+impl PathEmit {
+    /// This emission shifted by `(dx, dy)` device pixels.
+    #[must_use]
+    #[expect(clippy::cast_possible_truncation, reason = "device coords are f32")]
+    pub fn translated(&self, dx: f64, dy: f64) -> Self {
+        let shift = |r: [f32; 4]| {
+            [
+                f64::from(r[0]) + dx,
+                f64::from(r[1]) + dy,
+                f64::from(r[2]) + dx,
+                f64::from(r[3]) + dy,
+            ]
+        };
+        Self {
+            spans: self
+                .spans
+                .iter()
+                .map(|r| shift(*r).map(|v| v as f32))
+                .collect(),
+            cells: self
+                .cells
+                .iter()
+                .map(|c| PathCell {
+                    rect: shift(c.rect).map(|v| v as f32),
+                    x: c.x,
+                    y: c.y,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// A coverage mask in the atlas: a path clip rasterized into one cell.
+#[derive(Clone, Copy, Debug)]
+pub struct MaskCell {
+    /// Device-space origin of the mask.
+    pub device: [f32; 2],
+    /// Atlas texel origin of the cell.
+    pub atlas: [f32; 2],
+    /// Cell size in pixels.
+    pub size: [f32; 2],
+    /// The mask's device-space bounding rect `(x0, y0, x1, y1)` — the
+    /// clip's analytic shape shrinks to it.
+    pub rect: [f32; 4],
+}
+
+impl MaskCell {
+    /// This mask shifted by `(dx, dy)` device pixels; the atlas texels
+    /// do not move.
+    #[must_use]
+    #[expect(clippy::cast_possible_truncation, reason = "device coords are f32")]
+    pub fn translated(&self, dx: f64, dy: f64) -> Self {
+        Self {
+            device: [
+                (f64::from(self.device[0]) + dx) as f32,
+                (f64::from(self.device[1]) + dy) as f32,
+            ],
+            atlas: self.atlas,
+            size: self.size,
+            rect: [
+                (f64::from(self.rect[0]) + dx) as f32,
+                (f64::from(self.rect[1]) + dy) as f32,
+                (f64::from(self.rect[2]) + dx) as f32,
+                (f64::from(self.rect[3]) + dy) as f32,
+            ],
+        }
+    }
+}
+
 /// One shelf of the packer: a row of cells sharing a height class.
 struct Shelf {
     y: u32,
@@ -83,6 +174,10 @@ pub struct Atlas {
     generation: u64,
     shelves: Vec<Shelf>,
     map: HashMap<GlyphKey, Entry>,
+    /// Rasterized path emissions, keyed by content hash.
+    paths: HashMap<u64, PathEmit>,
+    /// Rasterized path-clip masks, keyed by content hash.
+    masks: HashMap<u64, MaskCell>,
     /// Sum of cell texels, an approximation of the CPU cache size.
     cpu_bytes: u64,
 }
@@ -109,6 +204,8 @@ impl Atlas {
             generation: 0,
             shelves: Vec::new(),
             map: HashMap::new(),
+            paths: HashMap::new(),
+            masks: HashMap::new(),
             cpu_bytes: 0,
         }
     }
@@ -155,8 +252,66 @@ impl Atlas {
     /// Clears every entry without freeing the texture.
     pub fn clear(&mut self) {
         self.map.clear();
+        self.paths.clear();
+        self.masks.clear();
         self.shelves.clear();
         self.cpu_bytes = 0;
+    }
+
+    /// A cached path emission.
+    pub fn path(&self, key: u64) -> Option<&PathEmit> {
+        self.paths.get(&key)
+    }
+
+    /// Caches a path emission.
+    pub fn insert_path(&mut self, key: u64, emit: PathEmit) {
+        self.cpu_bytes += (emit.spans.len() * 16 + emit.cells.len() * 24) as u64;
+        self.paths.insert(key, emit);
+    }
+
+    /// A cached path-clip mask.
+    pub fn mask(&self, key: u64) -> Option<&MaskCell> {
+        self.masks.get(&key)
+    }
+
+    /// Caches a path-clip mask.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "cell sizes are small positive floats"
+    )]
+    pub fn insert_mask(&mut self, key: u64, mask: MaskCell) {
+        self.cpu_bytes += (mask.size[0] * mask.size[1]) as u64;
+        self.masks.insert(key, mask);
+    }
+
+    /// Uploads `w` × `h` coverage texels into the cell at `(x, y)`.
+    pub fn write(&self, queue: &wgpu::Queue, x: u32, y: u32, w: u32, h: u32, texels: &[u8]) {
+        // `write_texture` needs rows padded to 256 bytes.
+        let pitch = w.div_ceil(256) * 256;
+        let mut staging = vec![0u8; (pitch * h) as usize];
+        for (row, line) in texels.chunks_exact(w as usize).enumerate() {
+            staging[row * pitch as usize..row * pitch as usize + w as usize].copy_from_slice(line);
+        }
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x, y, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &staging,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(pitch),
+                rows_per_image: Some(h),
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
     }
 
     /// The atlas edge in texels.
@@ -167,6 +322,11 @@ impl Atlas {
     /// The largest atlas edge the budget allows.
     pub const fn cap(&self) -> u32 {
         self.cap
+    }
+
+    /// Whether a `w` × `h` cell fits in an empty atlas at the cap.
+    pub const fn can_ever_fit(&self, w: u32, h: u32) -> bool {
+        w + 2 * PAD <= self.cap && (h + 2 * PAD).div_ceil(8) * 8 <= self.cap
     }
 
     /// Doubles the atlas up to the cap, dropping every cached entry.
@@ -185,7 +345,7 @@ impl Atlas {
 
     /// Reserves a `w` × `h` cell, or `None` when it does not fit. Never
     /// evicts: growth and clearing are the caller's decision.
-    fn alloc(&mut self, w: u32, h: u32) -> Option<(u32, u32)> {
+    pub(crate) fn alloc(&mut self, w: u32, h: u32) -> Option<(u32, u32)> {
         // Shelf height classes are multiples of 8.
         let class = (h + 2 * PAD).div_ceil(8) * 8;
         for shelf in &mut self.shelves {
@@ -363,31 +523,7 @@ pub fn rasterize(
         .iter()
         .map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8)
         .collect();
-    // `write_texture` needs rows padded to 256 bytes.
-    let pitch = w.div_ceil(256) * 256;
-    let mut staging = vec![0u8; (pitch * h) as usize];
-    for (row, line) in texels.chunks_exact(w as usize).enumerate() {
-        staging[row * pitch as usize..row * pitch as usize + w as usize].copy_from_slice(line);
-    }
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture: &atlas.texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d { x: cx, y: cy, z: 0 },
-            aspect: wgpu::TextureAspect::All,
-        },
-        &staging,
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(pitch),
-            rows_per_image: Some(h),
-        },
-        wgpu::Extent3d {
-            width: w,
-            height: h,
-            depth_or_array_layers: 1,
-        },
-    );
+    atlas.write(queue, cx, cy, w, h, &texels);
     atlas.cpu_bytes += u64::from(w) * u64::from(h);
     let entry = Entry {
         x: cx as u16,

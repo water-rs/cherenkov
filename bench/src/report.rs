@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use cherenkov_oracle::Metrics;
 use serde::Serialize;
 
-use crate::{Counters, DeviceInfo, EngineInfo};
+use crate::{Counters, DeviceInfo, EngineInfo, PassSample};
 
 /// `render` output: the engine provenance, the correctness metrics against
 /// the oracle, and the counters of what was submitted.
@@ -34,7 +34,7 @@ pub struct RenderReport {
 }
 
 /// One measured frame: raw samples, not percentiles.
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct FrameSample {
     /// Wall-clock seconds of the CPU encode phase.
     pub encode_seconds: f64,
@@ -52,6 +52,10 @@ pub struct FrameSample {
     pub cpu_end: Option<u32>,
     /// True when the thread migrated between `cpu_start` and `cpu_end`.
     pub migrated: bool,
+    /// Per-pass GPU timings for this frame, in submission order; omitted
+    /// when the backend provides none.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub passes: Vec<PassSample>,
 }
 
 /// CPU placement of a `measure` run.
@@ -223,7 +227,7 @@ pub struct MeasureReport {
 }
 
 /// Percentiles of each measured field.
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct Percentiles {
     /// `encode_seconds` percentiles `[p50, p90, p99]`.
     pub encode_seconds: [f64; 3],
@@ -232,6 +236,25 @@ pub struct Percentiles {
     /// `gpu_seconds` percentiles `[p50, p90, p99]`; `null` when the backend
     /// provides no GPU timestamps.
     pub gpu_seconds: Option<[f64; 3]>,
+    /// Per-pass GPU percentiles, grouped by pass index within the frame;
+    /// omitted when the backend provides no per-pass timings.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub passes: Vec<PassPercentiles>,
+}
+
+/// Percentiles of one render pass across the measured frames.
+#[derive(Clone, Debug, Serialize)]
+pub struct PassPercentiles {
+    /// The pass's name (`"surface"`, `"scratch{n}"`, ...).
+    pub name: String,
+    /// Target width in pixels.
+    pub width: u32,
+    /// Target height in pixels.
+    pub height: u32,
+    /// Target texture format.
+    pub format: String,
+    /// `gpu_seconds` percentiles `[p50, p90, p99]` for this pass.
+    pub gpu_seconds: [f64; 3],
 }
 
 /// Nearest-rank percentiles of `samples`, `[p50, p90, p99]`.

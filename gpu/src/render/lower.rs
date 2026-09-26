@@ -62,13 +62,22 @@ pub enum PipelineKind {
     Replace,
 }
 
+/// A sampled texture's identity, with separate namespaces for each owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ImageSource {
+    /// An uploaded image resource.
+    Registered(u64),
+    /// A custom producer attached to this surface's layer.
+    Content(LayerId),
+}
+
 /// One draw call's instance range and bound source texture.
 #[derive(Clone, Debug)]
 pub struct DrawRange {
     /// The scratch texture bound as group 1, `None` for the dummy texture.
     pub source: Option<usize>,
     /// The image texture bound for `PAINT_IMAGE` instances.
-    pub image: Option<u64>,
+    pub image: Option<ImageSource>,
     /// The pipeline variant this range draws with.
     pub pipeline: PipelineKind,
     /// Range into the frame's instance buffer.
@@ -112,7 +121,7 @@ struct OpenPass {
     target: Target,
     clear: Option<[f32; 4]>,
     source: Option<usize>,
-    image: Option<u64>,
+    image: Option<ImageSource>,
     pipeline: PipelineKind,
     backdrop_copy: Option<[u32; 4]>,
     ranges: Vec<DrawRange>,
@@ -335,7 +344,7 @@ struct PaintData {
     /// `extend_x | extend_y << 4 | sampling << 8`.
     packed: u32,
     /// The bound image for `PAINT_IMAGE`.
-    image: Option<u64>,
+    image: Option<ImageSource>,
 }
 
 /// sRGB-encodes one channel, preserving sign.
@@ -463,7 +472,7 @@ fn paint_data(
             data.packed = extend_code(pattern.extend_x)
                 | (extend_code(pattern.extend_y) << 4)
                 | (sampling << 8);
-            data.image = Some(pattern.image.raw());
+            data.image = Some(ImageSource::Registered(pattern.image.raw()));
         }
         Paint::Shader(_) => return Err(Encode::from(RenderError::Unsupported(names::SHADER))),
     }
@@ -476,6 +485,8 @@ pub enum ContentData {
     Picture(cherenkov::Picture),
     /// A live display list.
     List(DisplayList),
+    /// An engine-owned custom content texture.
+    Gpu(super::gpu_content::Slot),
 }
 
 /// GPU resources the lowering needs to emit glyph instances.
@@ -616,7 +627,7 @@ impl<'a> Lowering<'a> {
     }
 
     /// Starts a new draw range when the bound image texture changes.
-    fn set_image(&mut self, image: Option<u64>) {
+    fn set_image(&mut self, image: Option<ImageSource>) {
         if self.frame.open.as_ref().is_some_and(|o| o.image != image) {
             self.end_segment();
             if let Some(open) = &mut self.frame.open {
@@ -663,7 +674,8 @@ impl<'a> Lowering<'a> {
         mut body: impl FnMut(&mut Self, &mut GlyphContext<'_>) -> Result<(), Encode>,
         glyphs: &mut GlyphContext<'_>,
     ) -> Result<(), Encode> {
-        if filter.is_none() && opacity < 1.0
+        if filter.is_none()
+            && opacity < 1.0
             && blend == cherenkov::BlendMode::Normal
             && self.try_passthrough(opacity, &mut body, glyphs)?
         {
@@ -692,7 +704,11 @@ impl<'a> Lowering<'a> {
         let region = if filter.is_some() {
             [0, 0, self.width as u32, self.height as u32]
         } else {
-            tight_region(&self.frame.instances[inst_start..], self.width as u32, self.height as u32)
+            tight_region(
+                &self.frame.instances[inst_start..],
+                self.width as u32,
+                self.height as u32,
+            )
         };
         if let Some(filter) = filter {
             self.frame.passes.last_mut().expect("capture pass").filter = Some(filter.raw());
@@ -947,7 +963,14 @@ impl<'a> Lowering<'a> {
                     self.clip = Some(cur);
                     return Ok(());
                 }
-                self.isolate(Some(clip), None, 1.0, cherenkov::BlendMode::Normal, body, glyphs)
+                self.isolate(
+                    Some(clip),
+                    None,
+                    1.0,
+                    cherenkov::BlendMode::Normal,
+                    body,
+                    glyphs,
+                )
             }
             Some(cur) => match (clip.mask, cur.aligned_rect, clip.aligned_rect) {
                 // A new masked clip merges with an aligned rect clip (or
@@ -975,7 +998,14 @@ impl<'a> Lowering<'a> {
                     self.clip = Some(cur);
                     Ok(())
                 }
-                _ => self.isolate(Some(clip), None, 1.0, cherenkov::BlendMode::Normal, body, glyphs),
+                _ => self.isolate(
+                    Some(clip),
+                    None,
+                    1.0,
+                    cherenkov::BlendMode::Normal,
+                    body,
+                    glyphs,
+                ),
             },
         }
     }
@@ -1002,7 +1032,10 @@ impl<'a> Lowering<'a> {
             node.clip.as_ref(),
             |s, glyphs| {
                 s.transform = content_space;
-                if node.filter.is_some() || node.opacity < 1.0 || node.blend != cherenkov::BlendMode::Normal {
+                if node.filter.is_some()
+                    || node.opacity < 1.0
+                    || node.blend != cherenkov::BlendMode::Normal
+                {
                     let inner = s.clip;
                     s.isolate(
                         inner,
@@ -1037,6 +1070,30 @@ impl<'a> Lowering<'a> {
             }
             Some(ContentData::List(list)) => {
                 self.commands(list, 0, list.len(), glyphs)?;
+            }
+            Some(ContentData::Gpu(slot)) => {
+                let image = &slot.image;
+                let bounds = Rect::new(0.0, 0.0, f64::from(image.width), f64::from(image.height));
+                let boxed = box_shape(&ShapeData::Rect(bounds))?.expect("nonzero GPU content");
+                let mut inst = self.base(KIND_FILL, affine(self.transform * boxed.extra));
+                inst.bounds = [
+                    f32_f64(boxed.bounds.x0),
+                    f32_f64(boxed.bounds.y0),
+                    f32_f64(boxed.bounds.x1),
+                    f32_f64(boxed.bounds.y1),
+                ];
+                inst.shape = boxed.shape;
+                inst.meta[1] = PAINT_IMAGE;
+                inst.grad = [1.0, 0.0, 0.0, 1.0];
+                inst.grad2 = [
+                    f32_f64(bounds.width() / 2.0),
+                    f32_f64(bounds.height() / 2.0),
+                    f32_f64(bounds.width()),
+                    f32_f64(bounds.height()),
+                ];
+                inst.meta[3] |= EXTEND_PAD | (EXTEND_PAD << 4) | (1 << 8);
+                self.set_image(Some(ImageSource::Content(id)));
+                self.frame.instances.push(inst);
             }
             None => {}
         }
@@ -1101,7 +1158,10 @@ impl<'a> Lowering<'a> {
                         return Err(Encode::from(RenderError::Unsupported(names::BLEND_SPACE)));
                     }
                     let inner_end = (*end as usize).min(commands.len());
-                    if group.filter.is_none() && group.opacity >= 1.0 && group.blend == BlendMode::Normal {
+                    if group.filter.is_none()
+                        && group.opacity >= 1.0
+                        && group.blend == BlendMode::Normal
+                    {
                         self.commands(list, i + 1, inner_end, glyphs)?;
                     } else {
                         self.isolate(

@@ -208,3 +208,17 @@ impl cherenkov::Effects for Gpu {
         r.add_filter(id, effect.0);
     }
 }
+
+impl cherenkov::GpuContent for Gpu {
+    type Content = interop::GpuContentBox;
+
+    fn set_gpu_content(
+        renderer: &mut Self::Renderer,
+        surface: cherenkov::SurfaceId,
+        layer: cherenkov::LayerId,
+        size: (u32, u32),
+        content: Self::Content,
+    ) {
+        renderer.set_gpu_content(surface, layer, size, content);
+    }
+}

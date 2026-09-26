@@ -3,9 +3,10 @@
 
 //! The render thread: sole owner of GPU state.
 
-pub(crate) mod filter;
 mod colr;
+pub(crate) mod filter;
 mod glyph;
+mod gpu_content;
 mod instance;
 mod lower;
 mod path;
@@ -13,6 +14,7 @@ mod present;
 mod raster;
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use cherenkov::{
     ContentOp, EngineError, FontData as EngineFontData, FontId, Frame, FrameStats, ImageId,
@@ -20,7 +22,9 @@ use cherenkov::{
     Renderer, ResourceError, SurfaceError, SurfaceFrame, SurfaceId, SurfaceInfo,
 };
 use glyph::{Atlas, FontData};
-use lower::{ContentData, Frame as LoweredFrame, GlyphContext, Lowering, PipelineKind, Target};
+use lower::{
+    ContentData, Frame as LoweredFrame, GlyphContext, ImageSource, Lowering, PipelineKind, Target,
+};
 
 use crate::{GpuConfig, GpuInfo, GpuTarget, ScratchFormat, names};
 
@@ -194,7 +198,17 @@ impl SurfaceState {
                     .map(|b| u64::from(b.width) * u64::from(b.height) * texel)
             })
             .sum();
-        surface_bytes + scratch_bytes + backdrop_bytes
+        let content_bytes: u64 = self
+            .layers
+            .values()
+            .filter_map(|content| match content {
+                ContentData::Gpu(slot) => {
+                    Some(u64::from(slot.image.width) * u64::from(slot.image.height) * 8)
+                }
+                _ => None,
+            })
+            .sum();
+        surface_bytes + scratch_bytes + backdrop_bytes + content_bytes
     }
 }
 
@@ -246,6 +260,7 @@ pub struct GpuRenderer {
     pass_meta: Vec<PassMeta>,
     timestamps_inside: bool,
     max_texture: u32,
+    origin: Option<Instant>,
 }
 
 /// One encoded pass's report metadata.
@@ -623,6 +638,7 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
         let query_capacity = if query_set.is_some() { 2 } else { 0 };
         let renderer = GpuRenderer {
             max_texture: device.limits().max_texture_dimension_2d,
+            origin: None,
             instance,
             adapter,
             device,
@@ -968,7 +984,18 @@ impl Renderer for GpuRenderer {
     /// Lowers and submits every changed surface, bracketed by drained
     /// timestamp queries when enabled.
     fn render(&mut self, frame: &Frame<'_>, stats: &mut FrameStats) -> Result<Redraw, RenderError> {
-        let dirty: Vec<&SurfaceFrame<'_>> = frame.surfaces.iter().filter(|sf| sf.changed || self.filters.wants_redraw()).collect();
+        let origin = *self.origin.get_or_insert(frame.time.0);
+        let dirty: Vec<&SurfaceFrame<'_>> = frame
+            .surfaces
+            .iter()
+            .filter(|sf| {
+                sf.changed
+                    || self.filters.wants_redraw()
+                    || self.surfaces[&sf.id].layers.values().any(
+                        |content| matches!(content, ContentData::Gpu(slot) if slot.wants_redraw()),
+                    )
+            })
+            .collect();
         if dirty.is_empty() {
             return Ok(Redraw::None);
         }
@@ -977,6 +1004,24 @@ impl Renderer for GpuRenderer {
         self.drain_and_stamp(0)?;
         let mut result = Ok(());
         for sf in dirty {
+            for content in self
+                .surfaces
+                .get_mut(&sf.id)
+                .expect("registered surface")
+                .layers
+                .values_mut()
+            {
+                if let ContentData::Gpu(slot) = content {
+                    #[expect(clippy::cast_possible_truncation, reason = "display scale fits f32")]
+                    slot.render(
+                        &self.device,
+                        &self.queue,
+                        origin,
+                        frame.time.0,
+                        sf.display.scale as f32,
+                    );
+                }
+            }
             result = self.render_surface(sf, stats);
             if result.is_err() {
                 break;
@@ -1007,7 +1052,19 @@ impl Renderer for GpuRenderer {
         }
         self.wait()?;
         result?;
-        Ok(if self.filters.wants_redraw() { Redraw::Wanted } else { Redraw::None })
+        Ok(
+            if self.filters.wants_redraw()
+                || self.surfaces.values().any(|surface| {
+                    surface.layers.values().any(
+                        |content| matches!(content, ContentData::Gpu(slot) if slot.wants_redraw()),
+                    )
+                })
+            {
+                Redraw::Wanted
+            } else {
+                Redraw::None
+            },
+        )
     }
 
     /// Copies a surface's target into `Readback` pixels, decoding f16 → f32.
@@ -1080,8 +1137,29 @@ impl Renderer for GpuRenderer {
 }
 
 impl GpuRenderer {
+    pub(crate) fn set_gpu_content(
+        &mut self,
+        surface: SurfaceId,
+        layer: LayerId,
+        size: (u32, u32),
+        content: crate::interop::GpuContentBox,
+    ) {
+        let slot = gpu_content::Slot::new(content, size, &self.device, &self.queue);
+        self.surfaces
+            .get_mut(&surface)
+            .expect("GPU content surface exists")
+            .layers
+            .insert(layer, ContentData::Gpu(slot));
+    }
+
     pub(crate) fn add_filter(&mut self, id: cherenkov::FilterId, source: Box<dyn filter::Source>) {
-        self.filters.add(id.raw(), source, &self.device, &self.queue, self.scratch_format);
+        self.filters.add(
+            id.raw(),
+            source,
+            &self.device,
+            &self.queue,
+            self.scratch_format,
+        );
     }
 
     /// Lowers and submits one surface.
@@ -1336,7 +1414,7 @@ impl GpuRenderer {
         // Lazily-built group-1 bind groups for this frame, keyed by
         // (source, backdrop-needed, image). Created up front so scratch
         // borrows stay immutable inside the encoder loop.
-        let mut range_binds: HashMap<(Option<usize>, bool, Option<u64>), wgpu::BindGroup> =
+        let mut range_binds: HashMap<(Option<usize>, bool, Option<ImageSource>), wgpu::BindGroup> =
             HashMap::new();
         for (i, pass) in surf.frame.passes.iter().enumerate() {
             let (view, texture) = match pass.target {
@@ -1471,9 +1549,15 @@ impl GpuRenderer {
                             &self.dummy_view,
                             range.source.map(|i| &surf.scratch[i].view),
                             backdrop,
-                            range
-                                .image
-                                .and_then(|id| self.images.get(&id).map(|i| &i.view)),
+                            range.image.map(|source| match source {
+                                ImageSource::Registered(id) => &self.images[&id].view,
+                                ImageSource::Content(layer) => {
+                                    let ContentData::Gpu(slot) = &surf.layers[&layer] else {
+                                        unreachable!("GPU texture range belongs to GPU content")
+                                    };
+                                    &slot.image.view
+                                }
+                            }),
                         ))
                     }
                 };
@@ -1483,9 +1567,21 @@ impl GpuRenderer {
             drop(render_pass);
             if let Some(filter) = pass.filter {
                 self.queue.submit([encoder.finish()]);
-                let Target::Scratch(depth) = pass.target else { unreachable!("filters capture a scratch target") };
-                self.filters.apply(filter, &self.device, &self.queue, &surf.scratch[depth], (pass.region[2], pass.region[3]))?;
-                encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame after filter") });
+                let Target::Scratch(depth) = pass.target else {
+                    unreachable!("filters capture a scratch target")
+                };
+                self.filters.apply(
+                    filter,
+                    &self.device,
+                    &self.queue,
+                    &surf.scratch[depth],
+                    (pass.region[2], pass.region[3]),
+                )?;
+                encoder = self
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("frame after filter"),
+                    });
             }
         }
         self.queue.submit([encoder.finish()]);

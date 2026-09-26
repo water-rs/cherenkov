@@ -1,10 +1,11 @@
 use super::*;
-use cherenkov::{Draw as _, FrameTime, Offscreen, SurfaceTree};
+use cherenkov::{Draw as _, FrameId, FrameTime, Offscreen, SurfaceTree};
 
 struct Harness {
     renderer: VelloRenderer,
     tree: SurfaceTree,
     surface: SurfaceId,
+    frame: u64,
 }
 
 impl Harness {
@@ -21,6 +22,7 @@ impl Harness {
             renderer,
             tree: SurfaceTree::new(),
             surface,
+            frame: 0,
         })
     }
 
@@ -42,8 +44,11 @@ impl Harness {
             changed: true,
             tree: &self.tree,
         }];
+        let frame = self.frame;
+        self.frame += 1;
         self.renderer.render(
             &cherenkov::Frame {
+                id: FrameId::new(frame),
                 time: FrameTime::now(),
                 surfaces: &frames,
             },

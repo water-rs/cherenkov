@@ -56,7 +56,11 @@ impl From<crate::interop::wgpu::Window> for TargetSpec {
 }
 
 /// What a layer draws, crossing the channel.
-pub enum LayerContentMsg {
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "pub(crate) documents that nothing here escapes the crate"
+)]
+pub(crate) enum LayerContentMsg {
     /// A shared immutable picture.
     Picture(Picture),
     /// GPU-rendered content retained on the render thread.
@@ -78,7 +82,11 @@ impl std::fmt::Debug for LayerContentMsg {
 
 /// A [`GpuContentHandle`](crate::GpuContentHandle) crossing to the render
 /// thread.
-pub struct GpuContentMsg {
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "pub(crate) documents that nothing here escapes the crate"
+)]
+pub(crate) struct GpuContentMsg {
     /// The content's engine-wide id.
     pub id: u64,
     /// Content size in pixels.
@@ -100,7 +108,11 @@ pub struct ShaderSpec {
 
 /// One layer mutation in a committed change set.
 #[derive(Debug)]
-pub enum LayerOp {
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "pub(crate) documents that nothing here escapes the crate"
+)]
+pub(crate) enum LayerOp {
     /// Create a detached layer node.
     Create(LayerId),
     /// Remove a layer node and its descendants.
@@ -146,7 +158,11 @@ pub enum LayerOp {
 
 /// The committed change set for one surface.
 #[derive(Debug)]
-pub struct ChangeSet {
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "pub(crate) documents that nothing here escapes the crate"
+)]
+pub(crate) struct ChangeSet {
     /// New clear colour, when set this commit.
     pub clear: Option<WorkingColor>,
     /// The layer mutations, in order.
@@ -161,7 +177,11 @@ impl std::fmt::Debug for dyn crate::render::filter::FilterSource {
 
 /// A message to the render thread.
 #[derive(Debug)]
-pub enum Message {
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "pub(crate) documents that nothing here escapes the crate"
+)]
+pub(crate) enum Message {
     /// Create a surface.
     CreateSurface {
         /// The new surface id.

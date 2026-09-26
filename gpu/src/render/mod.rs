@@ -174,8 +174,13 @@ struct SurfaceState {
 }
 
 impl SurfaceState {
-    fn wants_redraw(&self, shaders: &paint::Registry) -> bool {
-        self.frame.shaders.iter().any(|key| shaders.animated(key))
+    fn wants_redraw(&self, shaders: &paint::Registry, filters: &filter::Registry) -> bool {
+        self.frame
+            .passes
+            .iter()
+            .filter_map(|pass| pass.filter)
+            .any(|id| filters.wants_redraw(id))
+            || self.frame.shaders.iter().any(|key| shaders.animated(key))
             || self
                 .layers
                 .values()
@@ -1012,9 +1017,7 @@ impl Renderer for GpuRenderer {
             .surfaces
             .iter()
             .filter(|sf| {
-                sf.changed
-                    || self.filters.wants_redraw()
-                    || self.surfaces[&sf.id].wants_redraw(&self.shaders)
+                sf.changed || self.surfaces[&sf.id].wants_redraw(&self.shaders, &self.filters)
             })
             .collect();
         if dirty.is_empty() {
@@ -1083,11 +1086,10 @@ impl Renderer for GpuRenderer {
         self.wait()?;
         result?;
         Ok(
-            if self.filters.wants_redraw()
-                || self
-                    .surfaces
-                    .values()
-                    .any(|surface| surface.wants_redraw(&self.shaders))
+            if self
+                .surfaces
+                .values()
+                .any(|surface| surface.wants_redraw(&self.shaders, &self.filters))
             {
                 Redraw::Wanted
             } else {

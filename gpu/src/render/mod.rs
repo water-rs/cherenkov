@@ -15,7 +15,7 @@ mod present;
 mod raster;
 
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use cherenkov::{
     ContentOp, EngineError, FontData as EngineFontData, FontId, Frame, FrameStats, ImageId,
@@ -264,6 +264,8 @@ pub struct GpuRenderer {
     timestamps_inside: bool,
     max_texture: u32,
     origin: Option<Instant>,
+    last_frame: Option<Instant>,
+    sequence: u64,
 }
 
 /// One encoded pass's report metadata.
@@ -642,6 +644,8 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
         let renderer = GpuRenderer {
             max_texture: device.limits().max_texture_dimension_2d,
             origin: None,
+            last_frame: None,
+            sequence: 0,
             instance,
             adapter,
             device,
@@ -1009,6 +1013,15 @@ impl Renderer for GpuRenderer {
         if dirty.is_empty() {
             return Ok(Redraw::None);
         }
+        let timing = filtrate::EffectFrameTiming::new(
+            frame.time.0.saturating_duration_since(origin),
+            self.last_frame.map_or(Duration::ZERO, |last| {
+                frame.time.0.saturating_duration_since(last)
+            }),
+            self.sequence,
+        );
+        self.sequence += 1;
+        self.last_frame = Some(frame.time.0);
         self.frame_pass_count = 0;
         self.pass_meta.clear();
         self.drain_and_stamp(0)?;
@@ -1032,11 +1045,7 @@ impl Renderer for GpuRenderer {
                     );
                 }
             }
-            result = self.render_surface(
-                sf,
-                frame.time.0.saturating_duration_since(origin).as_secs_f32(),
-                stats,
-            );
+            result = self.render_surface(sf, timing, stats);
             if result.is_err() {
                 break;
             }
@@ -1200,7 +1209,7 @@ impl GpuRenderer {
     fn render_surface(
         &mut self,
         sf: &SurfaceFrame<'_>,
-        time: f32,
+        timing: filtrate::EffectFrameTiming,
         stats: &mut FrameStats,
     ) -> Result<(), RenderError> {
         let id = sf.id;
@@ -1261,7 +1270,7 @@ impl GpuRenderer {
                 &self.queue,
                 key,
                 &mut surface.shader_textures,
-                time,
+                timing.presentation_time().as_secs_f32(),
             )?;
         }
         // Grow the query set lazily when this frame's passes exceed its
@@ -1622,6 +1631,7 @@ impl GpuRenderer {
                     &self.queue,
                     &surf.scratch[depth],
                     (pass.region[2], pass.region[3]),
+                    timing,
                 )?;
                 encoder = self
                     .device

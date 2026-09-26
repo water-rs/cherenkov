@@ -18,6 +18,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::{CStr, OsStr, OsString, c_char, c_int};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -134,13 +135,18 @@ pub fn run_args(args: &[OsString]) -> i32 {
             return e.exit_code();
         }
     };
-    match run(cli) {
+    let code = match run(cli) {
         Ok(()) => 0,
         Err(e) => {
             tracing::error!("{e}");
             1
         }
-    }
+    };
+    // The host keeps this process alive for the next argument list and
+    // may redirect our fds per call — leave no partial line buffered.
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    code
 }
 
 /// C entry point for hosts that cannot spawn a process.

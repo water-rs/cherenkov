@@ -378,25 +378,25 @@ pub fn run(
                 );
             }
             Message::RemoveFont { id } => {
-                renderer.fonts.remove(&id);
+                renderer.remove_font(id);
             }
             Message::AddImage { id, image } => {
                 renderer.images.insert(id, image);
             }
             Message::RemoveImage { id } => {
-                renderer.images.remove(&id);
+                renderer.remove_image(id);
             }
             Message::AddShader { id, source, reply } => {
                 let _ = reply.send(renderer.shaders.add(&renderer.device, id, &source));
             }
             Message::RemoveShader { id } => {
-                renderer.shaders.remove(id);
+                renderer.remove_shader(id);
             }
             Message::AddFilter { id, source } => {
                 renderer.filters.add(id, source);
             }
             Message::RemoveFilter { id } => {
-                renderer.filters.remove(id);
+                renderer.remove_filter(id);
             }
             Message::Commit { surface, changes } => {
                 renderer.commit(surface, changes);
@@ -412,12 +412,7 @@ pub fn run(
             }
             Message::Trim(pressure) => {
                 if pressure == Pressure::Critical {
-                    for surface in renderer.surfaces.values_mut() {
-                        for node in surface.layers.values_mut() {
-                            node.fragment = None;
-                        }
-                        surface.dirty = true;
-                    }
+                    renderer.flush_fragments();
                 }
             }
             Message::Shutdown => break,
@@ -629,6 +624,55 @@ impl Renderer {
                     }
                 }
             }
+        }
+    }
+
+    /// Removes a font and flushes every cached fragment: fragments embed
+    /// resources by value, so without a flush the removed font's retained
+    /// pixels keep drawing instead of erroring.
+    fn remove_font(&mut self, id: u64) {
+        self.fonts.remove(&id);
+        self.flush_fragments();
+    }
+
+    /// Removes an image and flushes every cached fragment (same contract
+    /// as [`Self::remove_font`]).
+    fn remove_image(&mut self, id: u64) {
+        self.images.remove(&id);
+        self.flush_fragments();
+    }
+
+    /// Removes a shader and flushes every cached fragment, unbinding the
+    /// shader-use overrides that referenced it.
+    fn remove_shader(&mut self, id: u64) {
+        self.shaders.remove(id);
+        self.flush_fragments();
+    }
+
+    /// Removes a filter, unbinding its output image's vello override, and
+    /// marks all surfaces dirty so a layer still referencing it errors on
+    /// the next compose.
+    fn remove_filter(&mut self, id: u64) {
+        if let Some(image) = self.filters.remove(id) {
+            self.vello.override_image(&image, None);
+        }
+        for surface in self.surfaces.values_mut() {
+            surface.dirty = true;
+        }
+    }
+
+    /// Drops every cached fragment and unbinds its shader-use overrides,
+    /// marking all surfaces dirty: the next compose re-lowers and reports
+    /// a removed resource instead of drawing its retained pixels.
+    fn flush_fragments(&mut self) {
+        for surface in self.surfaces.values_mut() {
+            for node in surface.layers.values_mut() {
+                for use_ in node.shader_uses.drain(..) {
+                    self.vello.override_image(&use_.image, None);
+                }
+                node.fragment = None;
+            }
+            surface.dirty = true;
         }
     }
 
@@ -986,9 +1030,13 @@ impl Renderer {
             )
             .map_err(|e| RenderError::Render(format!("filter capture: {e}")))?;
         stats.passes += 1;
-        let (_out_view, image, again) =
-            self.filters
-                .evaluate(&self.device, &self.queue, filter_id.raw(), size)?;
+        let (_out_view, image, again) = self.filters.evaluate(
+            &self.device,
+            &self.queue,
+            &mut self.vello,
+            filter_id.raw(),
+            size,
+        )?;
         let out_texture = self
             .filters
             .output_texture(filter_id.raw())
@@ -1422,6 +1470,8 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
+    use cherenkov::Draw as _;
+
     use crate::message::{GpuContentMsg, LayerContentMsg};
 
     use super::*;
@@ -1521,6 +1571,138 @@ mod tests {
             .render_frame(crate::FrameTime::now())
             .expect("render");
         gpu_image(renderer, 1, 1)
+    }
+
+    /// Removing a shader must invalidate the fragments that embedded it:
+    /// the next render re-lowers and reports the dangling shader instead
+    /// of drawing its retained texture.
+    #[test]
+    fn removing_a_shader_invalidates_cached_fragments() {
+        let Some(mut renderer) = renderer() else { return };
+        renderer
+            .create_surface(1, TargetSpec::Offscreen { size: (32, 32) })
+            .expect("surface");
+        renderer
+            .shaders
+            .add(
+                &renderer.device,
+                7,
+                &crate::message::ShaderSpec {
+                    source: std::borrow::Cow::Owned(
+                        "@fragment fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> { return vec4<f32>(uv, 0.0, 1.0); }"
+                            .into(),
+                    ),
+                    animated: false,
+                },
+            )
+            .expect("shader");
+        renderer.commit(
+            1,
+            ChangeSet {
+                clear: None,
+                ops: vec![
+                    LayerOp::Create(1),
+                    LayerOp::Push { parent: 0, child: 1 },
+                    LayerOp::ContentChange(
+                        1,
+                        cherenkov::Content::record(|c| {
+                            c.fill(
+                                cherenkov::kurbo::Rect::new(0., 0., 8., 8.),
+                                cherenkov::ShaderPaint {
+                                    shader: cherenkov::ShaderId::new(7),
+                                    uniforms: vec![],
+                                },
+                            );
+                        })
+                        .take_change()
+                        .expect("first change is Replace"),
+                    ),
+                ],
+            },
+        );
+        renderer
+            .render_frame(crate::FrameTime::now())
+            .expect("render");
+        let image = {
+            let node = &renderer.surfaces[&1].layers[&1];
+            assert!(node.fragment.is_some(), "setup: fragment cached");
+            assert!(!node.shader_uses.is_empty(), "setup: shader use");
+            node.shader_uses[0].image.clone()
+        };
+        assert!(override_bound(&mut renderer, &image), "setup: bound");
+
+        renderer.remove_shader(7);
+
+        {
+            let node = &renderer.surfaces[&1].layers[&1];
+            assert!(node.fragment.is_none(), "fragment flushed");
+            assert!(node.shader_uses.is_empty(), "shader uses drained");
+        }
+        assert!(
+            !override_bound(&mut renderer, &image),
+            "use's override unbound"
+        );
+        let result = renderer.render_frame(crate::FrameTime::now());
+        assert!(
+            matches!(result, Err(RenderError::Shader(_))),
+            "re-lower must report the missing shader: {result:?}"
+        );
+    }
+
+    /// The same invalidation for an embedded image: no override, but the
+    /// cached fragment must be flushed so the re-lower reports the
+    /// dangling id instead of drawing retained pixels.
+    #[test]
+    fn removing_an_image_invalidates_cached_fragments() {
+        let Some(mut renderer) = renderer() else { return };
+        renderer
+            .create_surface(1, TargetSpec::Offscreen { size: (32, 32) })
+            .expect("surface");
+        let bytes: Arc<[u8]> = Arc::from(&[255u8, 255, 255, 255][..]);
+        renderer.images.insert(
+            9,
+            peniko::ImageData {
+                data: peniko::Blob::new(Arc::new(crate::message::SharedBytes(bytes))),
+                format: peniko::ImageFormat::Rgba8,
+                alpha_type: peniko::ImageAlphaType::AlphaPremultiplied,
+                width: 1,
+                height: 1,
+            },
+        );
+        renderer.commit(
+            1,
+            ChangeSet {
+                clear: None,
+                ops: vec![
+                    LayerOp::Create(1),
+                    LayerOp::Push { parent: 0, child: 1 },
+                    LayerOp::ContentChange(
+                        1,
+                        cherenkov::Content::record(|c| {
+                            c.image(
+                                cherenkov::ImageId::new(9),
+                                cherenkov::kurbo::Rect::new(0., 0., 8., 8.),
+                                cherenkov::Sampling::Nearest,
+                            );
+                        })
+                        .take_change()
+                        .expect("first change is Replace"),
+                    ),
+                ],
+            },
+        );
+        renderer
+            .render_frame(crate::FrameTime::now())
+            .expect("render");
+        assert!(renderer.surfaces[&1].layers[&1].fragment.is_some());
+
+        renderer.remove_image(9);
+
+        let result = renderer.render_frame(crate::FrameTime::now());
+        assert!(
+            matches!(result, Err(RenderError::Image(_))),
+            "re-lower must report the missing image: {result:?}"
+        );
     }
 
     /// Replacing a layer's live `Content` must run the same release as

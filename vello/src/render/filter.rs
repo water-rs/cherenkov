@@ -165,9 +165,12 @@ impl FilterRegistry {
         );
     }
 
-    /// Drops the filter.
-    pub fn remove(&mut self, id: u64) {
-        self.entries.remove(&id);
+    /// Drops the filter, returning the output image's identity when one
+    /// was produced (the caller unbinds its vello override).
+    pub fn remove(&mut self, id: u64) -> Option<peniko::ImageData> {
+        self.entries
+            .remove(&id)
+            .and_then(|entry| entry.output.map(|(.., image)| image))
     }
 
     /// Whether any filter's redraw callback fired since the last check,
@@ -213,7 +216,8 @@ impl FilterRegistry {
 
     /// Runs `id`'s effect over its capture texture, producing the output
     /// texture's view and its vello image identity, plus whether the
-    /// effect asked for another frame.
+    /// effect asked for another frame. When the capture resizes, the old
+    /// output image's override is unbound from `vello`.
     ///
     /// The effect's setup runs once (blocking) with
     /// `EffectContext { Rgba8Unorm, Rgba8Unorm }`.
@@ -221,6 +225,7 @@ impl FilterRegistry {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        vello: &mut vello::Renderer,
         id: u64,
         size: (u32, u32),
     ) -> Result<(wgpu::TextureView, peniko::ImageData, bool), RenderError> {
@@ -254,7 +259,9 @@ impl FilterRegistry {
                 size.1.max(1),
                 peniko::ImageAlphaType::AlphaPremultiplied,
             );
-            entry.output = Some((texture, view, image));
+            if let Some((.., old_image)) = entry.output.replace((texture, view, image)) {
+                vello.override_image(&old_image, None);
+            }
         }
         let (cap_texture, cap_view, _) = entry.capture.as_ref().expect("ensure_capture first");
         let cap_texture = cap_texture.clone();

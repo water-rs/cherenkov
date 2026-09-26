@@ -38,6 +38,9 @@ pub enum ResourceError {
     /// The font data could not be parsed.
     #[error("font: {0}")]
     Font(String),
+    /// The image data failed validation.
+    #[error("image: {0}")]
+    Image(String),
     /// The resource needs a feature this slice does not implement.
     #[error(transparent)]
     Unsupported(#[from] Unsupported),
@@ -55,6 +58,9 @@ pub enum RenderError {
     /// The render thread failed or stopped.
     #[error("render thread stopped")]
     Thread,
+    /// A paint or draw references an unregistered image.
+    #[error("unregistered image {0}")]
+    Image(u64),
     /// Pixel readback failed.
     #[error("readback: {0}")]
     Readback(String),
@@ -70,8 +76,6 @@ pub enum RenderError {
 pub enum Unsupported {
     /// A mesh gradient.
     Mesh,
-    /// An image draw or image paint.
-    Image,
     /// A user shader paint.
     Shader,
     /// A filter on a group.
@@ -93,7 +97,6 @@ impl std::fmt::Display for Unsupported {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Mesh => "mesh-gradient",
-            Self::Image => "image",
             Self::Shader => "shader-paint",
             Self::Filter => "filter",
             Self::GlyphStroke => "glyph-stroke",

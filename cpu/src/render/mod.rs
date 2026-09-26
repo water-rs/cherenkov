@@ -24,10 +24,73 @@ use lower::{ContentData, Item, LayerNode, Lowering};
 const MAX_SURFACE: u32 = 16384;
 
 /// A registered font's data on the render thread.
-struct FontData {
-    data: std::sync::Arc<[u8]>,
-    index: u32,
+pub(crate) struct FontData {
+    /// The font file data.
+    pub data: std::sync::Arc<[u8]>,
+    /// Font index inside a collection.
+    pub index: u32,
 }
+
+/// A registered image on the render thread: premultiplied linear Display
+/// P3 f32 pixels, `width * height` row-major.
+#[derive(Debug)]
+pub(crate) struct CpuImage {
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+    /// Premultiplied linear P3 pixels.
+    pub pixels: Box<[[f32; 4]]>,
+}
+
+/// Decodes one sRGB-encoded byte channel to linear, `u8 → f64`.
+fn srgb_decode_u8(c: u8) -> f64 {
+    let v = f64::from(c) / 255.0;
+    if v <= 0.04045 {
+        v / 12.92
+    } else {
+        ((v + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// Linear sRGB (BT.709 primaries, D65) to CIE XYZ — the oracle's
+/// `SRGB_TO_XYZ`.
+const SRGB_TO_XYZ: [[f64; 3]; 3] = [
+    [
+        0.412_390_799_265_959_4,
+        0.357_584_339_383_878,
+        0.180_480_788_401_834_3,
+    ],
+    [
+        0.212_639_005_871_510_4,
+        0.715_168_678_767_756,
+        0.072_192_315_360_733_7,
+    ],
+    [
+        0.019_330_818_715_591_8,
+        0.119_194_779_410_625_9,
+        0.950_532_152_249_660_5,
+    ],
+];
+
+/// CIE XYZ to linear Display P3 (`P3_TO_XYZ` inverted), precomputed.
+const XYZ_TO_P3: [[f64; 3]; 3] = [
+    [
+        2.493_496_911_941_425,
+        -0.931_383_617_919_123_9,
+        -0.402_710_784_450_716_2,
+    ],
+    [
+        -0.829_488_969_561_574_7,
+        1.762_664_060_318_226_3,
+        0.023_624_685_848_943_6,
+    ],
+    [
+        0.035_845_830_243_784_5,
+        -0.076_172_389_268_041_4,
+        0.956_884_524_007_687_1,
+    ],
+];
 
 /// One surface's render-thread state.
 struct SurfaceState {
@@ -45,8 +108,12 @@ struct Renderer {
     pool: rayon::ThreadPool,
     surfaces: HashMap<SurfaceId, SurfaceState>,
     fonts: HashMap<u64, FontData>,
+    /// Registered images.
+    images: HashMap<u64, std::sync::Arc<CpuImage>>,
     /// The glyph mask cache, bounded by `Budget::cpu`.
     glyph_cache: glyph::GlyphCache,
+    /// COLR glyph picture cache, keyed by font, glyph, coords and paint.
+    colr_cache: HashMap<(u64, u32, u64, u64), cherenkov::Picture>,
 }
 
 /// A new default layer node.
@@ -86,7 +153,9 @@ pub fn run(
                 pool,
                 surfaces: HashMap::new(),
                 fonts: HashMap::new(),
+                images: HashMap::new(),
                 glyph_cache: glyph::GlyphCache::new(config.budget.cpu.0),
+                colr_cache: HashMap::new(),
             },
             info,
         )
@@ -114,6 +183,18 @@ pub fn run(
             }
             Message::AddFont { id, data, index } => {
                 renderer.fonts.insert(id, FontData { data, index });
+            }
+            Message::AddImage {
+                id,
+                width,
+                height,
+                pixels,
+                color_space,
+            } => {
+                renderer.add_image(id, width, height, &pixels, color_space);
+            }
+            Message::DestroyImage { id } => {
+                renderer.images.remove(&id);
             }
             Message::Commit { surface, changes } => {
                 renderer.commit(surface, changes);
@@ -297,10 +378,79 @@ impl Renderer {
             .values()
             .map(|s| u64::from(s.size.0) * u64::from(s.size.1) * 16)
             .sum();
+        let images = self
+            .images
+            .values()
+            .map(|i| u64::from(i.width) * u64::from(i.height) * 16)
+            .sum();
         MemoryUsage {
             framebuffers: Bytes(framebuffers),
             glyph_cache: Bytes(self.glyph_cache.bytes()),
+            images: Bytes(images),
         }
+    }
+
+    /// Converts a registered image's straight-alpha RGBA8 into
+    /// premultiplied linear Display P3 f32 — the oracle's
+    /// `Resources::image` conversion.
+    #[expect(clippy::cast_possible_truncation, reason = "working colours are f32")]
+    fn add_image(
+        &mut self,
+        id: u64,
+        width: u32,
+        height: u32,
+        pixels: &[u8],
+        color_space: crate::image::ImageColorSpace,
+    ) {
+        let mut data = Vec::with_capacity(pixels.len());
+        for px in pixels.as_chunks::<4>().0 {
+            let a = f64::from(px[3]) / 255.0;
+            let lin = [
+                srgb_decode_u8(px[0]),
+                srgb_decode_u8(px[1]),
+                srgb_decode_u8(px[2]),
+            ];
+            // Display P3 uses sRGB's transfer function; sRGB-encoded input
+            // additionally needs the primaries' matrix.
+            let lin_p3 = match color_space {
+                crate::image::ImageColorSpace::Srgb => {
+                    let [x, y, z] = [
+                        SRGB_TO_XYZ[0][2].mul_add(
+                            lin[2],
+                            SRGB_TO_XYZ[0][1].mul_add(lin[1], SRGB_TO_XYZ[0][0] * lin[0]),
+                        ),
+                        SRGB_TO_XYZ[1][2].mul_add(
+                            lin[2],
+                            SRGB_TO_XYZ[1][1].mul_add(lin[1], SRGB_TO_XYZ[1][0] * lin[0]),
+                        ),
+                        SRGB_TO_XYZ[2][2].mul_add(
+                            lin[2],
+                            SRGB_TO_XYZ[2][1].mul_add(lin[1], SRGB_TO_XYZ[2][0] * lin[0]),
+                        ),
+                    ];
+                    [
+                        XYZ_TO_P3[0][2].mul_add(z, XYZ_TO_P3[0][1].mul_add(y, XYZ_TO_P3[0][0] * x)),
+                        XYZ_TO_P3[1][2].mul_add(z, XYZ_TO_P3[1][1].mul_add(y, XYZ_TO_P3[1][0] * x)),
+                        XYZ_TO_P3[2][2].mul_add(z, XYZ_TO_P3[2][1].mul_add(y, XYZ_TO_P3[2][0] * x)),
+                    ]
+                }
+                crate::image::ImageColorSpace::DisplayP3 => lin,
+            };
+            data.push([
+                (a * lin_p3[0]) as f32,
+                (a * lin_p3[1]) as f32,
+                (a * lin_p3[2]) as f32,
+                a as f32,
+            ]);
+        }
+        self.images.insert(
+            id,
+            std::sync::Arc::new(CpuImage {
+                width,
+                height,
+                pixels: data.into_boxed_slice(),
+            }),
+        );
     }
 
     /// Lowers and rasterizes every dirty surface.
@@ -338,7 +488,12 @@ impl Renderer {
             };
             let layers = std::mem::take(&mut surf.layers);
             let result = if let Some(root) = layers.get(&0) {
-                let mut lowering = Lowering::new(&mut items, surf.size);
+                let mut res = lower::Resources {
+                    fonts: &self.fonts,
+                    images: &self.images,
+                    colr_cache: &mut self.colr_cache,
+                };
+                let mut lowering = Lowering::new(&mut items, &mut res, surf.size);
                 let result = lowering.run(root, &layers, surf.clear);
                 glyph_reqs = std::mem::take(&mut lowering.glyphs);
                 result

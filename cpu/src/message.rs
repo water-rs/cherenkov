@@ -100,6 +100,24 @@ pub enum Message {
         /// Font index inside a collection.
         index: u32,
     },
+    /// Register an image.
+    AddImage {
+        /// The image id (`ImageId::raw`).
+        id: u64,
+        /// Width in pixels.
+        width: u32,
+        /// Height in pixels.
+        height: u32,
+        /// Straight-alpha RGBA8 pixels, row-major.
+        pixels: Arc<[u8]>,
+        /// The encoded colour space.
+        color_space: crate::image::ImageColorSpace,
+    },
+    /// Release an image.
+    DestroyImage {
+        /// The image id.
+        id: u64,
+    },
     /// Commit a surface's change set.
     Commit {
         /// The surface.

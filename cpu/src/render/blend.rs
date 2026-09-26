@@ -272,10 +272,10 @@ mod tests {
         ];
         // Pseudo-random premultiplied pairs: alpha from {0, 0.5, 1} and
         // channels from a small LCG, components kept <= alpha.
-        let mut seed = 0x9e3779b9u32;
+        let mut seed = 0x9e37_79b9_u32;
         let mut next = move || {
-            seed = seed.wrapping_mul(747796405).wrapping_add(2891336453);
-            (seed >> 24) as f32 / 255.0
+            seed = seed.wrapping_mul(747_796_405).wrapping_add(2_891_336_453);
+            f32::from_bits(seed >> 24 | 0x3f80_0000) - 1.0 // [0,1) float
         };
         let mut cases = Vec::new();
         for i in 0..50u32 {

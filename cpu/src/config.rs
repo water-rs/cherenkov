@@ -50,6 +50,8 @@ pub struct MemoryUsage {
     pub framebuffers: Bytes,
     /// Rasterized glyph mask cache bytes.
     pub glyph_cache: Bytes,
+    /// Registered image pixel stores (premultiplied f32 RGBA).
+    pub images: Bytes,
 }
 
 /// CPU worker information for provenance.

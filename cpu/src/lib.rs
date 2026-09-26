@@ -39,6 +39,7 @@
 mod config;
 mod error;
 mod font;
+mod image;
 mod message;
 mod render;
 mod surface;
@@ -52,6 +53,7 @@ use std::sync::mpsc::Sender;
 pub use crate::config::{Budget, Bytes, MemoryUsage, Pressure, RasterConfig, RasterInfo};
 pub use crate::error::{EngineError, RenderError, ResourceError, SurfaceError, Unsupported};
 pub use crate::font::{Font, FontSource};
+pub use crate::image::{Image, ImageColorSpace, ImageSource};
 pub use crate::surface::{
     FrameStats, FrameTime, Layer, LayerContent, LayerEdit, Next, Offscreen, OffscreenFormat,
     Readback, RefreshRange, Surface, Transaction,
@@ -167,6 +169,33 @@ impl Engine<Raster> {
             index: source.index,
         });
         Ok(Font::new(cherenkov::FontId::new(id)))
+    }
+
+    /// Registers an image. The caller-thread [`ImageSource`] is converted
+    /// to premultiplied linear Display P3 on the render thread.
+    ///
+    /// # Errors
+    /// [`ResourceError::Image`] for a zero dimension or a pixel-length
+    /// mismatch.
+    pub fn image(&self, source: ImageSource) -> Result<Image, ResourceError> {
+        source.validate()?;
+        let id = self.next_font.get();
+        self.next_font.set(id + 1);
+        self.tx
+            .send(Message::AddImage {
+                id,
+                width: source.width,
+                height: source.height,
+                pixels: source.pixels.into(),
+                color_space: source.color_space,
+            })
+            .map_err(|_| {
+                ResourceError::Io(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "render thread gone",
+                ))
+            })?;
+        Ok(Image::new(cherenkov::ImageId::new(id), self.tx.clone()))
     }
 
     /// Creates an offscreen surface.

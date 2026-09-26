@@ -95,6 +95,19 @@ pub enum PaintData {
         /// The interpolation space.
         interpolation: Interpolation,
     },
+    /// An image pattern.
+    Image {
+        /// Device-to-image-pixel-space transform.
+        inv: [f32; 6],
+        /// The registered image.
+        image: std::sync::Arc<crate::render::CpuImage>,
+        /// Horizontal continuation.
+        extend_x: Extend,
+        /// Vertical continuation.
+        extend_y: Extend,
+        /// Sampling.
+        sampling: cherenkov::Sampling,
+    },
     /// A sweep (conic) gradient.
     Sweep {
         /// Device-to-content transform.
@@ -170,6 +183,54 @@ fn stops(stops: &[ColorStop], interpolation: Interpolation) -> Box<[Stop]> {
         .collect()
 }
 
+/// Samples an image at pixel-space `(u, v)` — the oracle's
+/// `sample_image` in f32 (centre-based: texel centres at integer + 0.5).
+#[expect(
+    clippy::many_single_char_names,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    reason = "u/v/w/h/x/y are the natural names; texel coordinates are clamped before indexing"
+)]
+fn sample_image(
+    img: &crate::render::CpuImage,
+    u: f32,
+    v: f32,
+    sampling: cherenkov::Sampling,
+) -> [f32; 4] {
+    let (w, h) = (img.width as usize, img.height as usize);
+    let at = |x: usize, y: usize| img.pixels[y.min(h - 1) * w + x.min(w - 1)];
+    match sampling {
+        cherenkov::Sampling::Nearest => {
+            let x = (u - 0.5).round().clamp(0.0, w as f32 - 1.0) as usize;
+            let y = (v - 0.5).round().clamp(0.0, h as f32 - 1.0) as usize;
+            at(x, y)
+        }
+        cherenkov::Sampling::Linear => {
+            // Clamp the *sample coordinate* into texel-centre space before
+            // taking the fraction: outside the border texels every tap must
+            // collapse onto the edge texel, not blend inward with a flipped
+            // weight.
+            let fx = (u - 0.5).clamp(0.0, w as f32 - 1.0);
+            let fy = (v - 0.5).clamp(0.0, h as f32 - 1.0);
+            let x0 = fx.floor() as usize;
+            let y0 = fy.floor() as usize;
+            let x1 = (x0 + 1).min(w - 1);
+            let y1 = (y0 + 1).min(h - 1);
+            let tx = fx - x0 as f32;
+            let ty = fy - y0 as f32;
+            let (c00, c10, c01, c11) = (at(x0, y0), at(x1, y0), at(x0, y1), at(x1, y1));
+            let mut out = [0.0; 4];
+            for i in 0..4 {
+                let top = c00[i] + tx * (c10[i] - c00[i]);
+                let bot = c01[i] + tx * (c11[i] - c01[i]);
+                out[i] = top + ty * (bot - top);
+            }
+            out
+        }
+    }
+}
+
 /// Lowers a `Paint` into [`PaintData`]. `inv` maps device space into the
 /// content space the gradient parameters live in.
 #[expect(
@@ -177,7 +238,11 @@ fn stops(stops: &[ColorStop], interpolation: Interpolation) -> Box<[Stop]> {
     clippy::while_float,
     reason = "r/g/b/a are the channel names; the sweep span wrap loop is the clearest form"
 )]
-pub fn paint_data(paint: &Paint, inv: Affine) -> Result<PaintData, Unsupported> {
+pub fn paint_data(
+    paint: &Paint,
+    inv: Affine,
+    images: &std::collections::HashMap<u64, std::sync::Arc<crate::render::CpuImage>>,
+) -> Result<PaintData, crate::error::RenderError> {
     Ok(match paint {
         Paint::Solid(c) => {
             let [r, g, b, a] = c.components;
@@ -223,9 +288,20 @@ pub fn paint_data(paint: &Paint, inv: Affine) -> Result<PaintData, Unsupported> 
                 interpolation: g.interpolation,
             }
         }
-        Paint::Mesh(_) => return Err(Unsupported::Mesh),
-        Paint::Image(_) => return Err(Unsupported::Image),
-        Paint::Shader(_) => return Err(Unsupported::Shader),
+        Paint::Mesh(_) => return Err(Unsupported::Mesh.into()),
+        Paint::Image(p) => {
+            let Some(image) = images.get(&p.image.raw()) else {
+                return Err(crate::error::RenderError::Image(p.image.raw()));
+            };
+            PaintData::Image {
+                inv: affine_f32(p.transform.inverse() * inv),
+                image: std::sync::Arc::clone(image),
+                extend_x: p.extend_x,
+                extend_y: p.extend_y,
+                sampling: p.sampling,
+            }
+        }
+        Paint::Shader(_) => return Err(Unsupported::Shader.into()),
     })
 }
 
@@ -329,6 +405,23 @@ impl PaintData {
     pub fn eval(&self, dx: f32, dy: f32) -> [f32; 4] {
         match self {
             Self::Solid(c) => *c,
+            Self::Image {
+                inv,
+                image,
+                extend_x,
+                extend_y,
+                sampling,
+            } => {
+                let (qx, qy) = apply(*inv, dx, dy);
+                let (iw, ih) = (image.width as f32, image.height as f32);
+                let Some(u) = extend_t(qx / iw, *extend_x).map(|t| t * iw) else {
+                    return [0.0; 4];
+                };
+                let Some(v) = extend_t(qy / ih, *extend_y).map(|t| t * ih) else {
+                    return [0.0; 4];
+                };
+                sample_image(image, u, v, *sampling)
+            }
             Self::Linear {
                 inv,
                 end_points,

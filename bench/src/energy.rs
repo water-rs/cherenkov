@@ -311,6 +311,11 @@ pub mod odpm {
                 rails.insert(key, uws);
             }
         }
+        if rails.is_empty() {
+            return Err(BenchError::Engine(
+                "energy: the ODPM devices list no rails in energy_value".into(),
+            ));
+        }
         Ok(Snapshot {
             rails,
             subsystems,
@@ -975,6 +980,18 @@ pub mod powermetrics {
                         format!(": {stderr}")
                     }
                 )));
+            }
+            // A machine whose GPU and CPU expose no energy counters
+            // (a paravirtual VM) still emits samples, with no
+            // processor section: no energy was measured, and a zero
+            // report would read as a measurement.
+            if samples
+                .iter()
+                .all(|s| s.joules.is_empty() && s.package.is_none())
+            {
+                return Err(BenchError::Engine(
+                    "energy: powermetrics reported no energy counters on this machine".into(),
+                ));
             }
             let window = (
                 start.saturating_duration_since(self.spawned_at),

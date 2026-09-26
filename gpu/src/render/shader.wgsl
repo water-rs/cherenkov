@@ -35,6 +35,12 @@ const FLAG_HAS_CLIP: u32 = 1u;
 const FLAG_HAS_INNER: u32 = 2u;
 const FLAG_HAS_MASK: u32 = 4u;      // clip coverage x atlas mask cell
 
+// The Rust side prepends `const VARIANT: u32 = <n>u;` when building each
+// module; the file stays compilable standalone.
+const VARIANT_SIMPLE: u32 = 0u;
+const VARIANT_SHADOW: u32 = 1u;
+const VARIANT_FULL: u32 = 2u;
+
 // A rounded box centred at the origin. `radii` are the corner radii along x
 // in the order top-left, top-right, bottom-right, bottom-left; the radius
 // along y is `radius * aspect`. `exponent` is the Lamé exponent of the corner
@@ -563,6 +569,53 @@ fn paint(i: u32, meta_: vec4<u32>, color: vec4<f32>, local: vec2<f32>, pixel: ve
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    if VARIANT == VARIANT_SIMPLE {
+        return fs_simple(in);
+    }
+    if VARIANT == VARIANT_SHADOW {
+        return fs_shadow(in);
+    }
+    return fs_full(in);
+}
+
+// Solid fill/span/glyph coverage: no clip, mask, inner, or paint()
+// evaluation, and no `instances` reads at all.
+fn fs_simple(in: VsOut) -> vec4<f32> {
+    let s = Shape(in.shape_a.xy, in.shape_a.z, in.shape_a.w, in.shape_radii);
+    let m = array<vec4<f32>, 2>(in.affine0, in.affine1);
+    var cov: f32;
+    switch in.meta_.x {
+        case KIND_GLYPH: {
+            let texel = vec2<i32>(floor(in.pixel - in.cell.xy)) + vec2<i32>(in.cell.zw);
+            cov = textureLoad(atlas, texel, 0).r;
+        }
+        case KIND_SPAN: {
+            cov = 1.0;
+        }
+        default: {
+            cov = shape_coverage(s, in.local, m);
+        }
+    }
+    cov = clamp(cov, 0.0, 1.0) * in.params.y;
+    return vec4<f32>(in.color.rgb * in.color.a, in.color.a) * cov;
+}
+
+// The shadow kernel plus the same opacity/solid-colour tail.
+fn fs_shadow(in: VsOut) -> vec4<f32> {
+    let s = Shape(in.shape_a.xy, in.shape_a.z, in.shape_a.w, in.shape_radii);
+    let m = array<vec4<f32>, 2>(in.affine0, in.affine1);
+    let sigma = in.params.x;
+    var cov: f32;
+    if sigma < 0.25 {
+        cov = shape_coverage(s, in.local, m);
+    } else {
+        cov = shadow(s, in.local, sigma);
+    }
+    cov = clamp(cov, 0.0, 1.0) * in.params.y;
+    return vec4<f32>(in.color.rgb * in.color.a, in.color.a) * cov;
+}
+
+fn fs_full(in: VsOut) -> vec4<f32> {
     // The constants every fragment needs arrive as flat varyings; the
     // storage array is read only for kind-specific fields (inner, clip,
     // mask, gradient data).

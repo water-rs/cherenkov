@@ -14,8 +14,8 @@ use skrifa::outline::{DrawSettings, OutlinePen};
 use skrifa::raw::TableProvider;
 use skrifa::raw::types::F2Dot14;
 
-use crate::error::RenderError;
 use crate::render::raster::Raster;
+use cherenkov::RenderError;
 
 /// Initial atlas edge length.
 const ATLAS_START: u32 = 1024;

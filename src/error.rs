@@ -80,6 +80,20 @@ pub enum ResourceError {
 /// Rendering or readback failure.
 #[derive(Debug, thiserror::Error)]
 pub enum RenderError {
+    /// The GPU did not complete within the backend's configured deadline.
+    #[error("the GPU did not finish {what} within {timeout:?}")]
+    Timeout {
+        /// The operation waiting for completion.
+        what: &'static str,
+        /// The elapsed deadline.
+        timeout: std::time::Duration,
+    },
+    /// The atlas needs to grow or clear before the frame can be committed.
+    #[error("glyph atlas full")]
+    AtlasFull,
+    /// The frame's live coverage exceeds the maximum atlas capacity.
+    #[error("glyph atlas exhausted")]
+    AtlasExhausted,
     /// The frame needs a feature this backend does not implement; the
     /// string is the feature name the benchmark harness maps back to a
     /// scene feature.

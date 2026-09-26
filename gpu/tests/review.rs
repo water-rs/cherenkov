@@ -6,17 +6,17 @@
 //! gradient parameter and the zero-size surface error.
 
 use cherenkov::kurbo::{Point, Rect};
-use cherenkov::{Draw, GlyphRun, WorkingColor};
-use cherenkov_gpu::{
-    Budget, Bytes, Engine, EngineError, Gpu, GpuConfig, Offscreen, OffscreenFormat, RenderError,
-    SurfaceError, TimestampSupport,
+use cherenkov::{
+    Budget, Bytes, Engine, EngineError, Offscreen, OffscreenFormat, RenderError, SurfaceError,
 };
+use cherenkov::{Draw, GlyphRun, WorkingColor};
+use cherenkov_gpu::{Gpu, GpuConfig, TimestampSupport};
 
 /// An engine under `config`, or `None` when no adapter exists.
 fn engine(config: GpuConfig) -> Option<Engine<Gpu>> {
     match Engine::<Gpu>::new(config) {
         Ok(engine) => Some(engine),
-        Err(EngineError::NoAdapter) => None,
+        Err(EngineError::Backend(_)) => None,
         Err(e) => panic!("engine init failed: {e}"),
     }
 }
@@ -27,8 +27,8 @@ const FONT_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../scenes/fonts/No
 /// Glyph ids the subset has outlines for.
 const FONT_GLYPHS: u32 = 200;
 
-fn font() -> cherenkov_gpu::FontSource {
-    cherenkov_gpu::FontSource::bytes(std::fs::read(FONT_PATH).expect("scenes/fonts/NotoSans.ttf"))
+fn font() -> cherenkov::FontSource {
+    cherenkov::FontSource::bytes(std::fs::read(FONT_PATH).expect("scenes/fonts/NotoSans.ttf"))
 }
 
 /// `count` distinct glyph-cache entries at `size` px, tiled on a grid: the
@@ -77,7 +77,7 @@ fn render_text(
     });
     Some(
         engine
-            .render(cherenkov_gpu::FrameTime::now())
+            .render(cherenkov::FrameTime::now())
             .and_then(|_| surface.readback())
             .map(|r| r.pixels),
     )
@@ -120,7 +120,7 @@ fn a_full_atlas_grows_then_reports_exhaustion() -> Result<(), Box<dyn std::error
         return Ok(());
     };
     assert!(
-        matches!(exhausted, Err(RenderError::AtlasExhausted)),
+        matches!(&exhausted, Err(RenderError::Render(e)) if e == "glyph atlas exhausted"),
         "expected AtlasExhausted, got {exhausted:?}"
     );
     Ok(())
@@ -134,10 +134,10 @@ fn a_clear_only_commit_renders() -> Result<(), Box<dyn std::error::Error>> {
     };
     let surface = engine.surface(Offscreen::new((16, 16), OffscreenFormat::LinearF16))?;
     surface.clear_color(WorkingColor::new([1.0, 0.0, 0.0, 1.0]));
-    engine.render(cherenkov_gpu::FrameTime::now())?;
+    engine.render(cherenkov::FrameTime::now())?;
     assert!(surface.readback()?.pixels[0][0] > 0.9, "red clear");
     surface.clear_color(WorkingColor::new([0.0, 0.0, 1.0, 1.0]));
-    engine.render(cherenkov_gpu::FrameTime::now())?;
+    engine.render(cherenkov::FrameTime::now())?;
     let [r, g, b, a] = surface.readback()?.pixels[0];
     assert!(
         b > 0.9 && r < 0.1 && g < 0.1 && a > 0.9,
@@ -156,7 +156,7 @@ fn dropped_surfaces_do_not_leak() -> Result<(), Box<dyn std::error::Error>> {
     for _ in 0..200 {
         drop(engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?);
     }
-    engine.render(cherenkov_gpu::FrameTime::now())?;
+    engine.render(cherenkov::FrameTime::now())?;
     assert_eq!(engine.live_surfaces(), 0, "surfaces still live");
     assert_eq!(engine.memory().gpu, before, "gpu memory grew");
     Ok(())
@@ -227,9 +227,7 @@ fn render_radial(gradient: cherenkov::RadialGradient) -> Option<Vec<[f32; 4]>> {
             );
         }));
     });
-    engine
-        .render(cherenkov_gpu::FrameTime::now())
-        .expect("render");
+    engine.render(cherenkov::FrameTime::now()).expect("render");
     Some(surface.readback().expect("readback").pixels)
 }
 

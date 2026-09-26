@@ -7,7 +7,8 @@
 
 use cherenkov::kurbo::{BezPath, Circle, Point};
 use cherenkov::{Draw, EvenOdd, WorkingColor};
-use cherenkov_gpu::{Engine, EngineError, Gpu, GpuConfig, Offscreen, OffscreenFormat, Surface};
+use cherenkov::{Engine, EngineError, Offscreen, OffscreenFormat};
+use cherenkov_gpu::{Gpu, GpuConfig};
 
 const CLEAR: WorkingColor = WorkingColor::new([0.0, 0.0, 0.0, 1.0]);
 const RED: WorkingColor = WorkingColor::new([1.0, 0.0, 0.0, 1.0]);
@@ -31,13 +32,13 @@ fn star() -> BezPath {
 
 fn render(
     draw: impl FnOnce(&mut cherenkov::Recorder),
-) -> Result<Option<cherenkov_gpu::Readback>, Box<dyn std::error::Error>> {
+) -> Result<Option<cherenkov::Readback>, Box<dyn std::error::Error>> {
     let engine = match Engine::<Gpu>::new(GpuConfig::default()) {
         Ok(engine) => engine,
-        Err(EngineError::NoAdapter) => return Ok(None),
+        Err(EngineError::Backend(_)) => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-    let surface: Surface = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
+    let surface = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
     surface.clear_color(CLEAR);
     let layer = surface.layer();
     surface.update(|tx| {
@@ -46,11 +47,11 @@ fn render(
     surface.update(|tx| {
         tx[&layer].content(surface.record(draw));
     });
-    engine.render(cherenkov_gpu::FrameTime::now())?;
+    engine.render(cherenkov::FrameTime::now())?;
     Ok(Some(surface.readback()?))
 }
 
-fn px(readback: &cherenkov_gpu::Readback, x: u32, y: u32) -> [f32; 4] {
+fn px(readback: &cherenkov::Readback, x: u32, y: u32) -> [f32; 4] {
     readback.pixels[(y * readback.width + x) as usize]
 }
 
@@ -128,7 +129,7 @@ fn overhang() -> BezPath {
 fn a_clipped_path_is_cached_per_offset() -> Result<(), Box<dyn std::error::Error>> {
     let engine = match Engine::<Gpu>::new(GpuConfig::default()) {
         Ok(engine) => engine,
-        Err(EngineError::NoAdapter) => return Ok(()),
+        Err(EngineError::Backend(_)) => return Ok(()),
         Err(e) => return Err(e.into()),
     };
     let surface = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
@@ -141,7 +142,7 @@ fn a_clipped_path_is_cached_per_offset() -> Result<(), Box<dyn std::error::Error
     surface.update(|tx| {
         tx[&layer].content(surface.record(|c| c.fill(overhang(), RED)));
     });
-    engine.render(cherenkov_gpu::FrameTime::now())?;
+    engine.render(cherenkov::FrameTime::now())?;
     // Frame 2: the same path at a different integer offset.
     surface.update(|tx| {
         tx[&layer].content(surface.record(|c| {
@@ -150,7 +151,7 @@ fn a_clipped_path_is_cached_per_offset() -> Result<(), Box<dyn std::error::Error
             });
         }));
     });
-    engine.render(cherenkov_gpu::FrameTime::now())?;
+    engine.render(cherenkov::FrameTime::now())?;
     let shifted = surface.readback()?;
     // A fresh engine renders the same shifted draw for comparison.
     let Some(fresh) = render(|c| {

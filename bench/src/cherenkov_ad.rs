@@ -15,11 +15,11 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use cherenkov::Draw as _;
-use cherenkov_gpu::{
-    Engine as GpuEngine, FrameTime, Gpu, GpuConfig, Layer as GpuLayer, Offscreen, OffscreenFormat,
-    RenderError, ResourceError, ScratchFormat, Surface, Transaction, Unsupported,
+use cherenkov::{
+    Draw as _, Engine as GpuEngine, FrameTime, ImageData, Layer as GpuLayer, LayerEdit, Offscreen,
+    OffscreenFormat, RenderError, ResourceError, Rgba8, Surface, Transaction,
 };
+use cherenkov_gpu::{Gpu, GpuConfig, ScratchFormat};
 use cherenkov_oracle::color::to_working;
 use cherenkov_scene::{
     BlendMode, ColorSpace, Draw as SceneDraw, Extend, Feature, GlyphRun as SceneGlyphRun, Item,
@@ -127,13 +127,13 @@ struct ContentLayer {
 pub struct Cherenkov {
     info: EngineInfo,
     engine: GpuEngine<Gpu>,
-    surface: Option<Surface>,
+    surface: Option<Surface<Gpu>>,
     /// Registered fonts per `(blob hash, face index)`.
     fonts: HashMap<(ResourceHash, u32), cherenkov_gpu::Font>,
     /// Registered images per blob hash (kept alive for the engine).
     images: HashMap<ResourceHash, cherenkov::ImageId>,
     /// The `Image` handles keeping `images` registered.
-    image_handles: Vec<cherenkov_gpu::Image>,
+    image_handles: Vec<cherenkov::Image<cherenkov::Rgba8>>,
     /// Layers holding recorded content, in draw order.
     content_layers: Vec<ContentLayer>,
     counters: Counters,
@@ -182,40 +182,6 @@ const fn missing_api(f: &Feature) -> Option<&'static str> {
     }
 }
 
-/// The scene blend mode matching a front-end mode one-for-one by name.
-const fn scene_blend(m: cherenkov::BlendMode) -> BlendMode {
-    match m {
-        cherenkov::BlendMode::Normal => BlendMode::Normal,
-        cherenkov::BlendMode::Multiply => BlendMode::Multiply,
-        cherenkov::BlendMode::Screen => BlendMode::Screen,
-        cherenkov::BlendMode::Overlay => BlendMode::Overlay,
-        cherenkov::BlendMode::Darken => BlendMode::Darken,
-        cherenkov::BlendMode::Lighten => BlendMode::Lighten,
-        cherenkov::BlendMode::ColorDodge => BlendMode::ColorDodge,
-        cherenkov::BlendMode::ColorBurn => BlendMode::ColorBurn,
-        cherenkov::BlendMode::HardLight => BlendMode::HardLight,
-        cherenkov::BlendMode::SoftLight => BlendMode::SoftLight,
-        cherenkov::BlendMode::Difference => BlendMode::Difference,
-        cherenkov::BlendMode::Exclusion => BlendMode::Exclusion,
-        cherenkov::BlendMode::Hue => BlendMode::Hue,
-        cherenkov::BlendMode::Saturation => BlendMode::Saturation,
-        cherenkov::BlendMode::Color => BlendMode::Color,
-        cherenkov::BlendMode::Luminosity => BlendMode::Luminosity,
-        cherenkov::BlendMode::Clear => BlendMode::Clear,
-        cherenkov::BlendMode::Src => BlendMode::Src,
-        cherenkov::BlendMode::Dst => BlendMode::Dst,
-        cherenkov::BlendMode::DestOver => BlendMode::DestOver,
-        cherenkov::BlendMode::SrcIn => BlendMode::SrcIn,
-        cherenkov::BlendMode::DestIn => BlendMode::DestIn,
-        cherenkov::BlendMode::SrcOut => BlendMode::SrcOut,
-        cherenkov::BlendMode::DestOut => BlendMode::DestOut,
-        cherenkov::BlendMode::SrcAtop => BlendMode::SrcAtop,
-        cherenkov::BlendMode::DestAtop => BlendMode::DestAtop,
-        cherenkov::BlendMode::Xor => BlendMode::Xor,
-        cherenkov::BlendMode::PlusLighter => BlendMode::PlusLighter,
-    }
-}
-
 /// The front-end blend mode matching a scene mode one-for-one by name.
 const fn gpu_blend(m: BlendMode) -> cherenkov::BlendMode {
     match m {
@@ -250,26 +216,22 @@ const fn gpu_blend(m: BlendMode) -> cherenkov::BlendMode {
     }
 }
 
-/// The scene [`Feature`] a render-time [`Unsupported`] maps back to.
+/// The scene [`Feature`] a render-time unsupported name maps back to.
 ///
-/// `Shader`, `Mesh`, `Filter` and `BlendSpace` have no scene feature of
-/// their own; they report the nearest declared one (`Fill`) while the `api`
-/// string names the real construct.
-const fn unsupported_feature(u: Unsupported) -> Feature {
+/// `shader-paint`, `mesh-gradient`, `filter` and `blend-space` have no
+/// scene feature of their own; they report the nearest declared one
+/// (`Fill`) while the `api` string names the real construct. `blend-mode`
+/// is unreachable — every blend mode is supported.
+fn unsupported_feature(u: &str) -> Feature {
     match u {
-        Unsupported::Path | Unsupported::PathClipTooLarge => Feature::Path,
-        Unsupported::Sweep => Feature::SweepGradient,
-        Unsupported::Image => Feature::Image,
-        Unsupported::Blend(mode) => Feature::Blend(scene_blend(mode)),
-        Unsupported::Mesh | Unsupported::Shader | Unsupported::Filter | Unsupported::BlendSpace => {
-            Feature::Fill
-        }
-        Unsupported::StrokeDash => Feature::StrokeDash,
-        Unsupported::StrokeJoin => Feature::Stroke,
-        Unsupported::GlyphStroke | Unsupported::GlyphTransform | Unsupported::ColorFont => {
-            Feature::Glyphs
-        }
-        Unsupported::Shadow => Feature::Shadow,
+        "path" | "path-clip-too-large" => Feature::Path,
+        "sweep-gradient" => Feature::SweepGradient,
+        "image" => Feature::Image,
+        "stroke-dash" => Feature::StrokeDash,
+        "stroke-join" => Feature::Stroke,
+        "glyph-stroke" | "glyph-transform" | "color-font" => Feature::Glyphs,
+        "shadow" => Feature::Shadow,
+        _ => Feature::Fill,
     }
 }
 
@@ -280,7 +242,7 @@ fn render_error(e: RenderError) -> BenchError {
         RenderError::Unsupported(u) => BenchError::Unsupported {
             engine: Cherenkov::NAME,
             feature: unsupported_feature(u),
-            api: Some(Box::leak(format!("{u}").into_boxed_str())),
+            api: Some(u),
         },
         e => BenchError::Gpu(format!("cherenkov render: {e}")),
     }
@@ -395,7 +357,7 @@ fn shape_kind(shape: &Shape) -> ShapeKind {
 }
 
 /// Applies a clip shape to a layer edit.
-fn clip_shape(edit: &mut cherenkov_gpu::LayerEdit, shape: &ShapeKind) {
+fn clip_shape(edit: &mut LayerEdit<Gpu>, shape: &ShapeKind) {
     match shape {
         ShapeKind::Rect(r) => drop(edit.clip(*r)),
         ShapeKind::RoundedRect(r) => drop(edit.clip(*r)),
@@ -511,17 +473,13 @@ fn register_fonts(
                     .get(&run.font)
                     .ok_or(cherenkov_scene::SceneError::MissingResource(run.font))?;
                 let font = engine
-                    .font(cherenkov_gpu::FontSource::bytes(blob.clone()).with_index(run.font_index))
+                    .font(cherenkov::FontSource::bytes(blob.clone()).with_index(run.font_index))
                     .map_err(|e| match e {
-                        ResourceError::Unsupported(Unsupported::ColorFont) => {
-                            BenchError::Unsupported {
-                                engine: Cherenkov::NAME,
-                                feature: Feature::Glyphs,
-                                api: Some(
-                                    "colour fonts (COLR/CBDT/sbix) are outside the first slice",
-                                ),
-                            }
-                        }
+                        ResourceError::Unsupported("color-font") => BenchError::Unsupported {
+                            engine: Cherenkov::NAME,
+                            feature: Feature::Glyphs,
+                            api: Some("colour fonts (COLR/CBDT/sbix) are outside the first slice"),
+                        },
                         e => BenchError::Engine(format!("cherenkov font: {e}")),
                     })?;
                 fonts.insert((run.font, run.font_index), font);
@@ -539,7 +497,7 @@ fn register_fonts(
 /// to the working space at upload.
 fn register_image(
     images: &mut HashMap<ResourceHash, cherenkov::ImageId>,
-    handles: &mut Vec<cherenkov_gpu::Image>,
+    handles: &mut Vec<cherenkov::Image<cherenkov::Rgba8>>,
     engine: &GpuEngine<Gpu>,
     hash: &ResourceHash,
     blobs: &Blobs,
@@ -553,12 +511,11 @@ fn register_image(
     let (width, height, rgba) = cherenkov_oracle::image::decode_png_rgba8(blob)
         .map_err(|e| BenchError::Engine(format!("cherenkov image decode: {e}")))?;
     let image = engine
-        .image(cherenkov_gpu::ImageSource {
-            width,
-            height,
-            pixels: rgba,
-            color_space: cherenkov_gpu::ImageColorSpace::Srgb,
-        })
+        .image(
+            ImageData::<Rgba8>::new(width, height, rgba)
+                .map_err(|e| BenchError::Engine(format!("cherenkov image: {e}")))?
+                .color_space(cherenkov::ImageColorSpace::Srgb),
+        )
         .map_err(|e| BenchError::Engine(format!("cherenkov image: {e}")))?;
     images.insert(*hash, image.id());
     handles.push(image);
@@ -568,7 +525,7 @@ fn register_image(
 /// Registers every image referenced by draws or image paints in `layer`.
 fn register_images(
     images: &mut HashMap<ResourceHash, cherenkov::ImageId>,
-    handles: &mut Vec<cherenkov_gpu::Image>,
+    handles: &mut Vec<cherenkov::Image<cherenkov::Rgba8>>,
     engine: &GpuEngine<Gpu>,
     layer: &SceneLayer,
     blobs: &Blobs,
@@ -655,8 +612,8 @@ fn prep_layer(
     reason = "layer opacity is f32 at the engine boundary"
 )]
 fn build_layer(
-    surface: &Surface,
-    tx: &mut Transaction<'_>,
+    surface: &Surface<Gpu>,
+    tx: &mut Transaction<'_, Gpu>,
     parent: &GpuLayer,
     prep: PrepLayer,
     content_layers: &mut Vec<ContentLayer>,

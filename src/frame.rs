@@ -62,9 +62,26 @@ pub struct PassTiming {
     pub gpu_seconds: f64,
 }
 
+/// Wall-clock seconds the render thread spent in each phase of the last
+/// [`crate::Engine::render`]; independent of GPU timestamp support.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Phases {
+    /// CPU lowering of every dirty surface (raster, instance build, uploads).
+    pub lower_seconds: f64,
+    /// Command encoding and queue submission.
+    pub encode_seconds: f64,
+    /// Timestamp bracket overhead: the drains around the stamps and the
+    /// timestamp resolve/readback. Zero when timestamps are off.
+    pub stamp_seconds: f64,
+    /// The final blocking drain of the queue.
+    pub wait_seconds: f64,
+}
+
 /// Measurements of the last [`Engine::render`](crate::Engine::render).
 #[derive(Clone, Debug, Default)]
 pub struct FrameStats {
+    /// CPU time spent in each render phase.
+    pub phases: Phases,
     /// GPU seconds the frame took, when timestamp queries are enabled and
     /// supported.
     pub gpu_seconds: Option<f64>,

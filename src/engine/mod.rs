@@ -258,6 +258,14 @@ impl<B: Backend> Engine<B> {
         Ok(surface)
     }
 
+    /// The number of surfaces still alive, for leak testing.
+    #[doc(hidden)]
+    pub fn live_surfaces(&self) -> usize {
+        let mut surfaces = self.surfaces.borrow_mut();
+        surfaces.retain(|weak| weak.strong_count() > 0);
+        surfaces.len()
+    }
+
     /// Renders every dirty surface for the frame at `time`, blocking until
     /// the render thread has applied the queued commits, sampled the
     /// animations and rendered.

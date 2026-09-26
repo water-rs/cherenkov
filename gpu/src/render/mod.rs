@@ -243,6 +243,37 @@ const fn node() -> LayerNode {
     }
 }
 
+/// Recreates `old` at `size` bytes, preserving the first `preserve` bytes
+/// of its contents. Earlier dirty surfaces write their slices before a
+/// later surface grows a shared buffer; dropping the old buffer would lose
+/// those uploads, so the used prefix is copied over in a separate
+/// submission — queue order guarantees the earlier `write_buffer`s landed
+/// in `old` first. `usage` must include `COPY_SRC` and `COPY_DST`.
+fn grow_preserving(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &'static str,
+    old: &wgpu::Buffer,
+    size: u64,
+    usage: wgpu::BufferUsages,
+    preserve: u64,
+) -> wgpu::Buffer {
+    let new = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size,
+        usage,
+        mapped_at_creation: false,
+    });
+    if preserve > 0 {
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("buffer grow"),
+        });
+        encoder.copy_buffer_to_buffer(old, 0, &new, 0, preserve);
+        queue.submit([encoder.finish()]);
+    }
+    new
+}
+
 /// Creates an adapter plus device. Fails when no adapter allows the target
 /// format's required usages.
 fn create_device(
@@ -550,19 +581,25 @@ pub fn run(config: GpuConfig, rx: Receiver<Message>, init_tx: Sender<Result<Init
         let globals = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("globals"),
             size: 16,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::UNIFORM
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let instances = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("instances"),
             size: 272 * 16,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let stops = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("stops"),
             size: 32 * 16,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let atlas = Atlas::new(&device, config.budget.gpu.0);
@@ -1208,44 +1245,44 @@ impl Renderer {
         surf.inst_base = inst_base;
         surf.globals_base = globals_base;
         let inst_bytes = bytemuck::cast_slice::<instance::Instance, u8>(&surf.frame.instances);
-        let inst_end = u64::from(inst_base)
-            * u64::try_from(std::mem::size_of::<instance::Instance>()).unwrap_or(u64::MAX)
-            + inst_bytes.len() as u64;
-        if !inst_bytes.is_empty() && inst_end > self.instances.size() {
-            let size = inst_end.next_power_of_two();
-            self.instances = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("instances"),
+        let inst_offset = u64::from(inst_base) * std::mem::size_of::<instance::Instance>() as u64;
+        if !inst_bytes.is_empty() && inst_offset + inst_bytes.len() as u64 > self.instances.size() {
+            let size = (inst_offset + inst_bytes.len() as u64).next_power_of_two();
+            self.instances = grow_preserving(
+                &self.device,
+                &self.queue,
+                "instances",
+                &self.instances,
                 size,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
+                wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
+                inst_offset,
+            );
         }
         if !inst_bytes.is_empty() {
-            self.queue.write_buffer(
-                &self.instances,
-                u64::from(inst_base) * std::mem::size_of::<instance::Instance>() as u64,
-                inst_bytes,
-            );
+            self.queue
+                .write_buffer(&self.instances, inst_offset, inst_bytes);
         }
         let stop_bytes = bytemuck::cast_slice::<instance::Stop, u8>(&surf.frame.stops);
-        let stop_end = u64::from(stop_base)
-            * u64::try_from(std::mem::size_of::<instance::Stop>()).unwrap_or(u64::MAX)
-            + stop_bytes.len() as u64;
-        if !stop_bytes.is_empty() && stop_end > self.stops.size() {
-            let size = stop_end.next_power_of_two();
-            self.stops = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("stops"),
+        let stop_offset = u64::from(stop_base) * std::mem::size_of::<instance::Stop>() as u64;
+        if !stop_bytes.is_empty() && stop_offset + stop_bytes.len() as u64 > self.stops.size() {
+            let size = (stop_offset + stop_bytes.len() as u64).next_power_of_two();
+            self.stops = grow_preserving(
+                &self.device,
+                &self.queue,
+                "stops",
+                &self.stops,
                 size,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
+                wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
+                stop_offset,
+            );
         }
         if !stop_bytes.is_empty() {
-            self.queue.write_buffer(
-                &self.stops,
-                u64::from(stop_base) * std::mem::size_of::<instance::Stop>() as u64,
-                stop_bytes,
-            );
+            self.queue
+                .write_buffer(&self.stops, stop_offset, stop_bytes);
         }
         if self.atlas.generation() != self.bound_atlas {
             self.bind0 = make_bind0(
@@ -1263,12 +1300,17 @@ impl Renderer {
         let needed = (u64::from(globals_base) + surf.frame.passes.len().max(1) as u64) * 256;
         if needed > self.globals.size() {
             let size = needed.next_power_of_two();
-            self.globals = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("globals"),
+            self.globals = grow_preserving(
+                &self.device,
+                &self.queue,
+                "globals",
+                &self.globals,
                 size,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
+                wgpu::BufferUsages::UNIFORM
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
+                u64::from(globals_base) * 256,
+            );
         }
         for (i, pass) in surf.frame.passes.iter().enumerate() {
             let g = lower::globals(

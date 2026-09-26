@@ -94,3 +94,57 @@ fn a_path_shadow_reports_unsupported() -> Result<(), Box<dyn std::error::Error>>
     );
     Ok(())
 }
+
+/// Two dirty surfaces sharing one frame: the second surface lowers far
+/// more instances than the initial instance buffer holds, forcing a grow
+/// that must preserve the first surface's upload.
+#[test]
+fn an_earlier_surfaces_uploads_survive_a_shared_buffer_grow()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(engine) = engine() else {
+        return Ok(());
+    };
+    let small = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
+    let big = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
+    small.update(|tx| {
+        tx[small.root()].content(small.record(|c| {
+            c.fill(
+                Rect::new(8., 8., 56., 56.),
+                WorkingColor::new([1., 0., 0., 1.]),
+            );
+        }));
+    });
+    big.update(|tx| {
+        tx[big.root()].content(big.record(|c| {
+            // 3000 4×4 green rects in a grid — far past the 16-instance
+            // initial buffer.
+            for i in 0..3000u32 {
+                let x = f64::from(i % 55) * 1.0;
+                let y = f64::from(i / 55) * 1.0;
+                if y > 60.0 {
+                    break;
+                }
+                c.fill(
+                    Rect::new(x, y, x + 0.5, y + 0.5),
+                    WorkingColor::new([0., 1., 0., 1.]),
+                );
+            }
+        }));
+    });
+    let next = engine.render(cherenkov_gpu::FrameTime::now())?;
+    assert_eq!(next, Next::Idle);
+    let small_rb = small.readback()?;
+    let [r, g, b, a] = small_rb.pixels[(32 * small_rb.width + 32) as usize];
+    assert!(
+        (r - 1.0).abs() < 1e-2 && g.abs() < 1e-2 && b.abs() < 1e-2 && (a - 1.0).abs() < 1e-2,
+        "first surface's pixel must still be red: {r} {g} {b} {a}"
+    );
+    let big_rb = big.readback()?;
+    let [r, g, b, a] = big_rb.pixels[(4 * big_rb.width + 4) as usize];
+    // 0.5-wide rects cover the pixel partially; green is what matters.
+    assert!(
+        g > 0.1 && r < 0.1,
+        "second surface must render green: {r} {g} {b} {a}"
+    );
+    Ok(())
+}

@@ -83,10 +83,10 @@ pub fn isolate<S: Simd>(simd: S, pixels: &mut [[f32; 4]], source: &[[f32; 4]], o
         let source = simd
             .deinterleave_shfl_f32s(source)
             .map(|channel| simd.mul_f32s(channel, alpha));
-        let active = simd.not_equal_f32s(source[3], simd.splat_f32s(0.0));
+        let transparent = simd.equal_f32s(source[3], simd.splat_f32s(0.0));
         let result = over(simd, destination, source);
         *pixel = simd.interleave_shfl_f32s(std::array::from_fn::<_, 4, _>(|channel| {
-            simd.select_f32s(active, result[channel], destination[channel])
+            simd.select_f32s(transparent, destination[channel], result[channel])
         }));
     }
     for (pixel, source) in tail.iter_mut().zip(&source[count..]) {

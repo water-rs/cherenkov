@@ -519,9 +519,13 @@ macro_rules! behaviour_suite {
                 let v = (c1 - c0) / dt;
                 assert!(v > 30.0, "not mid-flight: v={v}");
 
-                // Retarget into a very soft spring (response 4 s): its own
-                // acceleration per frame is ~ω·dt/2 ≈ 0.7%, inside the 1%
-                // bound, so the step measures the inherited velocity.
+                // Retarget into a very soft, critically damped spring
+                // (response 4 s, ω = 2π/4). It starts at the committed
+                // position with the inherited velocity v and follows
+                // x(t) = x_t + (C1 + C2·t)·e^(−ωt), C1 = x0 − x_t, C2 = v + ω·C1,
+                // which over one frame is about 1% short of v·dt: the step
+                // is checked against that trajectory, so it tests the
+                // inherited velocity rather than the spring's own pull.
                 surface.update(|tx| {
                     tx[&layer]
                         .transform(Affine::translate((160.0, 16.0)))
@@ -538,11 +542,19 @@ macro_rules! behaviour_suite {
                 render_at(&engine, t1 + TICK * 2);
                 let (c3, _) =
                     square_center(&surface.readback().expect("readback")).expect("square");
-                let expected = v * dt;
+                // The square's centre at the target: 16 + 160.
+                let target = 176.0;
+                let omega = std::f64::consts::TAU / 4.0;
+                let offset = c2 - target;
+                let expected = omega
+                    .mul_add(offset, v)
+                    .mul_add(dt, offset)
+                    .mul_add((-omega * dt).exp(), -offset);
                 assert!(
-                    (c3 - c2 - expected).abs() <= expected.abs() * 0.01,
-                    "displacement {} vs velocity·dt {expected}",
-                    c3 - c2
+                    (c3 - c2 - expected).abs() <= (v * dt).abs() * 0.01,
+                    "displacement {} vs the spring's trajectory {expected} (v·dt {})",
+                    c3 - c2,
+                    v * dt
                 );
             }
 

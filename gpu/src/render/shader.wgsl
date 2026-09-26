@@ -20,10 +20,13 @@ const PAINT_SOLID: u32 = 0u;
 const PAINT_LINEAR: u32 = 1u;
 const PAINT_RADIAL: u32 = 2u;
 const PAINT_TEXTURE: u32 = 3u;      // composite: sample the bound texture at the device pixel
+const PAINT_SWEEP: u32 = 4u;
+const PAINT_IMAGE: u32 = 5u;
 
 const EXTEND_PAD: u32 = 0u;
 const EXTEND_REPEAT: u32 = 1u;
 const EXTEND_REFLECT: u32 = 2u;
+const EXTEND_NONE: u32 = 3u;
 
 const INTERP_WORKING: u32 = 0u;
 const INTERP_SRGB: u32 = 1u;
@@ -91,6 +94,9 @@ struct Globals {
 @group(0) @binding(2) var<storage, read> stops: array<Stop>;
 @group(0) @binding(3) var atlas: texture_2d<f32>;
 @group(1) @binding(0) var source: texture_2d<f32>;
+// The blend backdrop: a copy of the target's region, sampled like `source`.
+@group(1) @binding(1) var backdrop: texture_2d<f32>;
+@group(1) @binding(2) var image_tex: texture_2d<f32>;
 
 struct VsOut {
     @builtin(position) position: vec4<f32>,
@@ -280,6 +286,12 @@ const SRGB_TO_P3 = mat3x3<f32>(
     vec3<f32>(0.0, 0.0, 0.9105199),
 );
 
+// Returns false when EXTEND_NONE leaves t outside [0,1] — the caller
+// returns transparent. NaN fails the range test and is also rejected.
+fn extend_ok(t: f32, mode: u32) -> bool {
+    return mode != EXTEND_NONE || (t >= 0.0 && t <= 1.0);
+}
+
 fn extend_t(t: f32, mode: u32) -> f32 {
     switch mode {
         case EXTEND_REPEAT: {
@@ -371,6 +383,72 @@ fn radial_t(i: u32, p: vec2<f32>) -> f32 {
     return max((-b + sq) / (2.0 * a), (-b - sq) / (2.0 * a));
 }
 
+// Sweep (conic) parameter: the wrapped angle of p - center mapped into
+// [start_angle, end_angle). A literal port of the oracle's sweep_t.
+fn sweep_t(i: u32, p: vec2<f32>) -> f32 {
+    let start = instances[i].grad2.x;
+    var end = instances[i].grad2.y;
+    let tau = 6.283185307179586;
+    while end <= start {
+        end += tau;
+    }
+    let span = end - start;
+    let c = instances[i].grad.xy;
+    var theta = atan2(p.y - c.y, p.x - c.x);
+    while theta < start {
+        theta += tau;
+    }
+    while theta >= start + tau {
+        theta -= tau;
+    }
+    return (theta - start) / span;
+}
+
+// Samples `tex` like the oracle's sample_image: texel centres at n + 0.5,
+// coordinate already in image-pixel space after the per-axis extend.
+fn sample_image_tex(tex: texture_2d<f32>, u: f32, v: f32, w: f32, h: f32, bilinear: bool) -> vec4<f32> {
+    let dims = vec2<f32>(w, h);
+    if bilinear {
+        // Clamp the sample coordinate into texel-centre space before the
+        // fraction: taps outside the border texels collapse onto the edge.
+        let f = clamp(vec2<f32>(u, v) - 0.5, vec2<f32>(0.0), dims - 1.0);
+        let lo = vec2<i32>(floor(f));
+        let hi = min(lo + 1, vec2<i32>(dims) - 1);
+        let t = f - floor(f);
+        let c00 = textureLoad(tex, vec2<i32>(lo.x, lo.y), 0);
+        let c10 = textureLoad(tex, vec2<i32>(hi.x, lo.y), 0);
+        let c01 = textureLoad(tex, vec2<i32>(lo.x, hi.y), 0);
+        let c11 = textureLoad(tex, vec2<i32>(hi.x, hi.y), 0);
+        return mix(mix(c00, c10, t.x), mix(c01, c11, t.x), t.y);
+    }
+    let xy = clamp(round(vec2<f32>(u, v) - 0.5), vec2<f32>(0.0), dims - 1.0);
+    return textureLoad(tex, vec2<i32>(xy), 0);
+}
+
+// Image paint: `grad`/`grad2` carry the local→image affine [a b c d e f]
+// and the image size [w, h]; meta.w packs extend_x | extend_y<<4 |
+// sampling<<8. The extends run in image-pixel space, like the oracle's
+// eval_image_paint.
+fn paint_image(i: u32, local: vec2<f32>) -> vec4<f32> {
+    let g = instances[i].grad;
+    let g2 = instances[i].grad2;
+    let q = vec2<f32>(
+        g.x * local.x + g.z * local.y + g2.x,
+        g.y * local.x + g.w * local.y + g2.y,
+    );
+    let meta_w = instances[i].meta_.w;
+    let ex = meta_w & 0xfu;
+    let ey = (meta_w >> 4u) & 0xfu;
+    let tu = q.x / g2.z;
+    let tv = q.y / g2.w;
+    if !extend_ok(tu, ex) || !extend_ok(tv, ey) {
+        return vec4<f32>(0.0);
+    }
+    let u = extend_t(tu, ex) * g2.z;
+    let v = extend_t(tv, ey) * g2.w;
+    return sample_image_tex(image_tex, u, v, g2.z, g2.w, ((meta_w >> 8u) & 1u) != 0u);
+}
+
 fn paint(i: u32, local: vec2<f32>, device: vec2<f32>) -> vec4<f32> {
     switch instances[i].meta_.y {
         case PAINT_SOLID: {
@@ -381,10 +459,15 @@ fn paint(i: u32, local: vec2<f32>, device: vec2<f32>) -> vec4<f32> {
             // `grad.xy` carries the source region's device-space origin.
             return textureLoad(source, vec2<i32>(floor(device - instances[i].grad.xy)), 0);
         }
+        case PAINT_IMAGE: {
+            return paint_image(i, local);
+        }
         default: {
             var t: f32;
             if instances[i].meta_.y == PAINT_LINEAR {
                 t = linear_t(i, local);
+            } else if instances[i].meta_.y == PAINT_SWEEP {
+                t = sweep_t(i, local);
             } else {
                 t = radial_t(i, local);
             }
@@ -398,6 +481,9 @@ fn paint(i: u32, local: vec2<f32>, device: vec2<f32>) -> vec4<f32> {
             let extend = (meta_w >> 20u) & 0xfu;
             let interp = (meta_w >> 16u) & 0xfu;
             let count = meta_w & 0xffffu;
+            if !extend_ok(t, extend) {
+                return vec4<f32>(0.0);
+            }
             return eval_stops(instances[i].meta_.z, count, interp, extend_t(t, extend));
         }
     }
@@ -459,5 +545,166 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         cov *= select(0.0, textureLoad(atlas, vec2<i32>(mp) + vec2<i32>(instances[i].uv.zw), 0).r, inside);
     }
     cov = clamp(cov, 0.0, 1.0) * instances[i].params.y;
+    // A blended composite carries its mode in meta.w bits 16-23: sample the
+    // source and backdrop, blend, and write the composited result verbatim
+    // (the pass runs the Replace pipeline).
+    if instances[i].meta_.y == PAINT_TEXTURE {
+        let mode = (instances[i].meta_.w >> 16u) & 0xffu;
+        if mode != 0u {
+            let coord = vec2<i32>(floor(in.device - instances[i].grad.xy));
+            let cs = textureLoad(source, coord, 0) * cov;
+            let cb = textureLoad(backdrop, coord, 0);
+            return blend_color(mode, cb, cs);
+        }
+    }
     return paint(i, in.local, in.device) * cov;
+}
+
+// W3C Compositing and Blending Level 1, a literal port of
+// oracle/src/blend.rs. Premultiplied inputs and output.
+
+fn lum(c: vec3<f32>) -> f32 {
+    return 0.3 * c.x + 0.59 * c.y + 0.11 * c.z;
+}
+
+fn sat(c: vec3<f32>) -> f32 {
+    return max(c.x, max(c.y, c.z)) - min(c.x, min(c.y, c.z));
+}
+
+fn clip_color(c_in: vec3<f32>) -> vec3<f32> {
+    var c = c_in;
+    let l = lum(c);
+    let n = min(c.x, min(c.y, c.z));
+    let x = max(c.x, max(c.y, c.z));
+    if n < 0.0 {
+        c = l + (c - l) * l / (l - n);
+    }
+    if x > 1.0 {
+        c = l + (c - l) * (1.0 - l) / (x - l);
+    }
+    return c;
+}
+
+fn set_lum(c: vec3<f32>, l: f32) -> vec3<f32> {
+    let d = l - lum(c);
+    return clip_color(c + d);
+}
+
+fn set_sat(c: vec3<f32>, s: f32) -> vec3<f32> {
+    var mn = 0;
+    var mx = 0;
+    for (var i = 1; i < 3; i += 1) {
+        if c[i] < c[mn] {
+            mn = i;
+        }
+        if c[i] > c[mx] {
+            mx = i;
+        }
+    }
+    let imid = 3 - mn - mx;
+    var out = vec3<f32>(0.0);
+    if c[mx] > c[mn] {
+        out[imid] = (c[imid] - c[mn]) * s / (c[mx] - c[mn]);
+        out[mx] = s;
+    }
+    return out;
+}
+
+// B(Cb, Cs) for one channel pair, separable modes; non-separable modes and
+// Porter-Duff operators are handled in blend_color, not here.
+fn blend_channel(mode: u32, cb: f32, cs: f32) -> f32 {
+    switch mode {
+        case 1u: { return cb * cs; }                                 // Multiply
+        case 2u: { return cb + cs - cb * cs; }                       // Screen
+        case 3u: {                                                   // Overlay
+            if cb <= 0.5 { return 2.0 * cb * cs; }
+            return 1.0 - 2.0 * (1.0 - cb) * (1.0 - cs);
+        }
+        case 4u: { return min(cb, cs); }                             // Darken
+        case 5u: { return max(cb, cs); }                             // Lighten
+        case 6u: {                                                   // ColorDodge
+            if cs >= 1.0 { return 1.0; }
+            return min(cb / (1.0 - cs), 1.0);
+        }
+        case 7u: {                                                   // ColorBurn
+            if cs <= 0.0 { return 0.0; }
+            return 1.0 - min((1.0 - cb) / cs, 1.0);
+        }
+        case 8u: {                                                   // HardLight
+            if cs <= 0.5 { return 2.0 * cb * cs; }
+            return 1.0 - 2.0 * (1.0 - cb) * (1.0 - cs);
+        }
+        case 9u: {                                                   // SoftLight
+            if cs <= 0.5 {
+                return cb - (1.0 - 2.0 * cs) * cb * (1.0 - cb);
+            }
+            var d: f32;
+            if cb <= 0.25 {
+                d = ((16.0 * cb - 12.0) * cb + 4.0) * cb;
+            } else {
+                d = sqrt(cb);
+            }
+            return cb + (2.0 * cs - 1.0) * (d - cb);
+        }
+        case 10u: { return abs(cb - cs); }                           // Difference
+        case 11u: { return cb + cs - 2.0 * cb * cs; }                // Exclusion
+        default: { return cs; }
+    }
+}
+
+// Porter-Duff: co = αs·Fa·Cs + αb·Fb·Cb in premultiplied form.
+fn porter_duff(fa: f32, fb: f32, cb: vec4<f32>, cs: vec4<f32>) -> vec4<f32> {
+    return fa * cs + fb * cb;
+}
+
+// blend(mode, cb, cs): premultiplied backdrop and source, composited
+// premultiplied output — oracle blend().
+fn blend_color(mode: u32, cb: vec4<f32>, cs: vec4<f32>) -> vec4<f32> {
+    let ab = cb.a;
+    let as_ = cs.a;
+    switch mode {
+        case 16u: { return vec4<f32>(0.0); }                              // Clear
+        case 17u: { return cs; }                                          // Src
+        case 18u: { return cb; }                                          // Dst
+        case 19u: { return porter_duff(1.0 - ab, 1.0, cb, cs); }           // DestOver
+        case 20u: { return porter_duff(ab, 0.0, cb, cs); }                 // SrcIn
+        case 21u: { return porter_duff(0.0, as_, cb, cs); }                // DestIn
+        case 22u: { return porter_duff(1.0 - ab, 0.0, cb, cs); }           // SrcOut
+        case 23u: { return porter_duff(0.0, 1.0 - as_, cb, cs); }          // DestOut
+        case 24u: { return porter_duff(ab, 1.0 - as_, cb, cs); }           // SrcAtop
+        case 25u: { return porter_duff(1.0 - ab, as_, cb, cs); }           // DestAtop
+        case 26u: { return porter_duff(1.0 - ab, 1.0 - as_, cb, cs); }     // Xor
+        case 27u: { return porter_duff(1.0, 1.0, cb, cs); }                // PlusLighter
+        default: {}
+    }
+    if as_ == 0.0 {
+        return cb;
+    }
+    var ub = vec3<f32>(0.0);
+    if ab > 0.0 {
+        ub = cb.rgb / ab;
+    }
+    let us = cs.rgb / as_;
+    var b: vec3<f32>;
+    switch mode {
+        case 12u: { b = set_lum(set_sat(us, sat(ub)), lum(ub)); }          // Hue
+        case 13u: { b = set_lum(set_sat(ub, sat(us)), lum(ub)); }          // Saturation
+        case 14u: { b = set_lum(us, lum(ub)); }                            // Color
+        case 15u: { b = set_lum(ub, lum(us)); }                            // Luminosity
+        default: {
+            b = vec3<f32>(
+                blend_channel(mode, ub.x, us.x),
+                blend_channel(mode, ub.y, us.y),
+                blend_channel(mode, ub.z, us.z),
+            );
+        }
+    }
+    // Cr = (1-αb)·Cs + αb·B(Cb,Cs); premultiplied: αs·Cr + (1-αs)·Cb.
+    var out: vec4<f32>;
+    for (var i = 0; i < 3; i += 1) {
+        let cr = (1.0 - ab) * us[i] + ab * b[i];
+        out[i] = as_ * cr + (1.0 - as_) * cb[i];
+    }
+    out.a = as_ + ab * (1.0 - as_);
+    return out;
 }

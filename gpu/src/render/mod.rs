@@ -1178,7 +1178,7 @@ impl GpuRenderer {
         size: (u32, u32),
         content: crate::interop::GpuContentBox,
     ) {
-        let slot = gpu_content::Slot::new(content, size, &self.device, &self.queue);
+        let slot = gpu_content::Slot::new(content, size, &self.adapter, &self.device, &self.queue);
         self.surfaces
             .get_mut(&surface)
             .expect("GPU content surface exists")

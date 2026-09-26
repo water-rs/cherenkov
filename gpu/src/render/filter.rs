@@ -26,7 +26,7 @@ impl<E: Effect + Send> From<E> for EffectBox {
     }
 }
 
-pub(crate) trait Source: Send {
+pub trait Source: Send {
     fn build(self: Box<Self>) -> Box<dyn Runnable>;
 }
 
@@ -36,7 +36,7 @@ impl<E: Effect + Send> Source for E {
     }
 }
 
-pub(crate) struct FromFilter<F>(pub F);
+pub struct FromFilter<F>(pub F);
 
 impl<F: filtrate_core::Filter + Send> Source for FromFilter<F> {
     fn build(self: Box<Self>) -> Box<dyn Runnable> {
@@ -44,7 +44,7 @@ impl<F: filtrate_core::Filter + Send> Source for FromFilter<F> {
     }
 }
 
-pub(crate) trait Runnable {
+pub trait Runnable {
     fn setup(&mut self, ctx: &EffectContext<'_>) -> Result<(), filtrate::EffectSetupError>;
     fn encode(
         &mut self,
@@ -81,7 +81,7 @@ struct Entry {
 }
 
 #[derive(Default)]
-pub(crate) struct Registry(HashMap<u64, Entry>);
+pub struct Registry(HashMap<u64, Entry>);
 
 impl Registry {
     pub fn add(

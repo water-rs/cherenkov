@@ -4,7 +4,7 @@
 //! The render thread: sole owner of GPU state.
 
 mod colr;
-pub(crate) mod filter;
+pub mod filter;
 mod glyph;
 mod gpu_content;
 mod instance;
@@ -105,7 +105,7 @@ const fn format_name(format: wgpu::TextureFormat) -> &'static str {
 }
 
 /// One isolation scratch or backdrop texture.
-struct ScratchTarget {
+pub struct ScratchTarget {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
     width: u32,
@@ -115,7 +115,6 @@ struct ScratchTarget {
 /// A GPU-resident image registered with the engine.
 pub struct GpuImage {
     /// The texture holding premultiplied linear-P3 f16 texels.
-    #[expect(dead_code, reason = "the texture keeps the view alive")]
     pub texture: wgpu::Texture,
     /// Its view for bind group 1.
     pub view: wgpu::TextureView,
@@ -175,6 +174,14 @@ struct SurfaceState {
 }
 
 impl SurfaceState {
+    fn wants_redraw(&self, shaders: &paint::Registry) -> bool {
+        self.frame.shaders.iter().any(|key| shaders.animated(key))
+            || self
+                .layers
+                .values()
+                .any(|content| matches!(content, ContentData::Gpu(slot) if slot.wants_redraw()))
+    }
+
     /// Bytes held by this surface's textures.
     fn gpu_bytes(&self) -> u64 {
         let surface_bytes = u64::from(self.size.0) * u64::from(self.size.1) * 8;
@@ -1007,14 +1014,7 @@ impl Renderer for GpuRenderer {
             .filter(|sf| {
                 sf.changed
                     || self.filters.wants_redraw()
-                    || self.surfaces[&sf.id]
-                        .frame
-                        .shaders
-                        .iter()
-                        .any(|key| self.shaders.animated(key))
-                    || self.surfaces[&sf.id].layers.values().any(
-                        |content| matches!(content, ContentData::Gpu(slot) if slot.wants_redraw()),
-                    )
+                    || self.surfaces[&sf.id].wants_redraw(&self.shaders)
             })
             .collect();
         if dirty.is_empty() {
@@ -1084,18 +1084,10 @@ impl Renderer for GpuRenderer {
         result?;
         Ok(
             if self.filters.wants_redraw()
-                || self.surfaces.values().any(|surface| {
-                    surface
-                        .frame
-                        .shaders
-                        .iter()
-                        .any(|key| self.shaders.animated(key))
-                })
-                || self.surfaces.values().any(|surface| {
-                    surface.layers.values().any(
-                        |content| matches!(content, ContentData::Gpu(slot) if slot.wants_redraw()),
-                    )
-                })
+                || self
+                    .surfaces
+                    .values()
+                    .any(|surface| surface.wants_redraw(&self.shaders))
             {
                 Redraw::Wanted
             } else {
@@ -1194,7 +1186,7 @@ impl GpuRenderer {
             .get_mut(&surface)
             .expect("GPU content surface exists")
             .layers
-            .insert(layer, ContentData::Gpu(slot));
+            .insert(layer, ContentData::Gpu(Box::new(slot)));
     }
 
     pub(crate) fn add_filter(&mut self, id: cherenkov::FilterId, source: Box<dyn filter::Source>) {

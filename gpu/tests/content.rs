@@ -82,7 +82,7 @@ fn content_is_retained_clipped_and_wakes_an_idle_host() -> Result<(), Box<dyn st
         tx[&layer]
             .transform(Affine::translate((4.0, 4.0)))
             .clip(Rect::new(0.0, 0.0, 4.0, 4.0))
-            .opacity(0.5)
+            .opacity(0.5_f32)
             .content(engine.gpu_content((8, 8), content));
     });
     assert_eq!(engine.render(FrameTime::now())?, Next::Idle);

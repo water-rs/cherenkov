@@ -210,7 +210,9 @@ pub fn in_space(
     backdrop: [f64; 4],
     source: [f64; 4],
 ) -> [f64; 4] {
-    use crate::color::{linear_p3_to_linear_srgb, linear_srgb_to_linear_p3, srgb_decode, srgb_encode};
+    use crate::color::{
+        linear_p3_to_linear_srgb, linear_srgb_to_linear_p3, srgb_decode, srgb_encode,
+    };
     if space == cherenkov::BlendSpace::Linear {
         return blend(mode, backdrop, source);
     }
@@ -221,7 +223,12 @@ pub fn in_space(
         }
         let straight = [pixel[0] / alpha, pixel[1] / alpha, pixel[2] / alpha];
         let encoded = linear_p3_to_linear_srgb(straight).map(srgb_encode);
-        [encoded[0] * alpha, encoded[1] * alpha, encoded[2] * alpha, alpha]
+        [
+            encoded[0] * alpha,
+            encoded[1] * alpha,
+            encoded[2] * alpha,
+            alpha,
+        ]
     };
     let mixed = blend(mode, encode(backdrop), encode(source));
     let alpha = mixed[3];
@@ -230,7 +237,12 @@ pub fn in_space(
     }
     let linear = [mixed[0] / alpha, mixed[1] / alpha, mixed[2] / alpha].map(srgb_decode);
     let working = linear_srgb_to_linear_p3(linear);
-    [working[0] * alpha, working[1] * alpha, working[2] * alpha, alpha]
+    [
+        working[0] * alpha,
+        working[1] * alpha,
+        working[2] * alpha,
+        alpha,
+    ]
 }
 
 #[cfg(test)]
@@ -240,8 +252,12 @@ mod space_tests {
 
     #[test]
     fn encoded_source_over_is_encoded_before_compositing() {
-        let actual = in_space(BlendMode::Normal, BlendSpace::SrgbEncoded,
-            [0.0, 0.0, 0.0, 1.0], [0.5; 4]);
+        let actual = in_space(
+            BlendMode::Normal,
+            BlendSpace::SrgbEncoded,
+            [0.0, 0.0, 0.0, 1.0],
+            [0.5; 4],
+        );
         let midpoint = crate::color::srgb_decode(0.5);
         for value in &actual[..3] {
             assert!((value - midpoint).abs() < 1e-12);
@@ -256,7 +272,10 @@ mod space_tests {
         for (value, expected) in actual.into_iter().zip(source) {
             assert!((value - expected).abs() < 1e-12);
         }
-        assert!(in_space(BlendMode::Clear, BlendSpace::SrgbEncoded, source, source)
-            .iter().all(|v| v.abs() < 1e-12));
+        assert!(
+            in_space(BlendMode::Clear, BlendSpace::SrgbEncoded, source, source)
+                .iter()
+                .all(|v| v.abs() < 1e-12)
+        );
     }
 }

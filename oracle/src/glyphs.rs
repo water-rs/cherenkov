@@ -85,13 +85,26 @@ pub fn styled_outline(
     use skrifa::raw::TableProvider as _;
     let font = skrifa::FontRef::from_index(data, index)
         .map_err(|error| GlyphError::Font(error.to_string()))?;
-    let upem = font.head().map_err(|error| GlyphError::Font(error.to_string()))?.units_per_em();
+    let upem = font
+        .head()
+        .map_err(|error| GlyphError::Font(error.to_string()))?
+        .units_per_em();
     let id = u16::try_from(glyph.id).map_err(|_| GlyphError::GlyphId(glyph.id))?;
     let outlines = font.outline_glyphs();
-    let outline = outlines.get(GlyphId::from(id)).ok_or(GlyphError::NoOutline(id))?;
-    let coords: Vec<_> = run.coords.iter().map(|&value| F2Dot14Coord::from_bits(value)).collect();
+    let outline = outlines
+        .get(GlyphId::from(id))
+        .ok_or(GlyphError::NoOutline(id))?;
+    let coords: Vec<_> = run
+        .coords
+        .iter()
+        .map(|&value| F2Dot14Coord::from_bits(value))
+        .collect();
     let mut pen = BezPen(BezPath::new());
-    outline.draw(DrawSettings::unhinted(Size::unscaled(), LocationRef::new(&coords)), &mut pen)
+    outline
+        .draw(
+            DrawSettings::unhinted(Size::unscaled(), LocationRef::new(&coords)),
+            &mut pen,
+        )
         .map_err(|error| GlyphError::Font(error.to_string()))?;
     let scale = f64::from(run.size) / f64::from(upem);
     let path = Affine::scale_non_uniform(scale, -scale) * pen.0;
@@ -101,8 +114,11 @@ pub fn styled_outline(
     let path = match &run.style {
         cherenkov::GlyphStyle::Fill => path,
         cherenkov::GlyphStyle::Stroke(stroke) => kurbo::stroke(
-            path, stroke, &kurbo::StrokeOpts::default(),
-            crate::path::SEGMENT_TOLERANCE / crate::path::sigma_max(placement).max(1e-12)),
+            path,
+            stroke,
+            &kurbo::StrokeOpts::default(),
+            crate::path::SEGMENT_TOLERANCE / crate::path::sigma_max(placement).max(1e-12),
+        ),
     };
     Ok(placement * path)
 }

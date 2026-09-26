@@ -127,7 +127,9 @@ pub fn srgb_encode(c: f64) -> f64 {
     if c.abs() <= 0.003_130_8 {
         c * 12.92
     } else {
-        1.055f64.mul_add(c.abs().powf(1.0 / 2.4), -0.055).copysign(c)
+        1.055f64
+            .mul_add(c.abs().powf(1.0 / 2.4), -0.055)
+            .copysign(c)
     }
 }
 

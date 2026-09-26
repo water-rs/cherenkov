@@ -64,7 +64,12 @@ pub(super) fn convert_pixel(pixel: [f32; 4], encode: bool) -> [f32; 4] {
     } else {
         mat3(&SRGB_TO_P3, straight.map(srgb_decode))
     };
-    [converted[0] * alpha, converted[1] * alpha, converted[2] * alpha, alpha]
+    [
+        converted[0] * alpha,
+        converted[1] * alpha,
+        converted[2] * alpha,
+        alpha,
+    ]
 }
 
 /// A gradient stop in interpolation-space straight-alpha components.

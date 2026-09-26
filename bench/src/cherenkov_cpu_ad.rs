@@ -177,9 +177,7 @@ const fn unsupported_feature(u: Unsupported) -> Feature {
     match u {
         Unsupported::Shader => Feature::Image,
         Unsupported::Filter => Feature::Opacity,
-        Unsupported::ColorFont => {
-            Feature::Glyphs
-        }
+        Unsupported::ColorFont => Feature::Glyphs,
         _ => Feature::Fill,
     }
 }

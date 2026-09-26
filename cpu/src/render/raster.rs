@@ -124,9 +124,19 @@ pub fn render_bands(
                         buffer.fill([0.0; 4]);
                         scratch.stack.push(buffer);
                     }
-                    Item::PopIsolate { opacity, blend, space } => {
+                    Item::PopIsolate {
+                        opacity,
+                        blend,
+                        space,
+                    } => {
                         let buffer = scratch.stack.pop().expect("balanced isolation items");
-                        band.composite_isolate(&buffer, *opacity, *blend, *space, &mut scratch.stack);
+                        band.composite_isolate(
+                            &buffer,
+                            *opacity,
+                            *blend,
+                            *space,
+                            &mut scratch.stack,
+                        );
                         scratch.spare.push(buffer);
                     }
                     Item::Glyph {
@@ -143,14 +153,21 @@ pub fn render_bands(
 
 /// Convolve the clipped caster using the Gaussian in the shape's coordinate system.
 pub fn blur_coverage(
-    source: &Coverage, width: usize, height: usize, sigma: f64, transform: kurbo::Affine,
+    source: &Coverage,
+    width: usize,
+    height: usize,
+    sigma: f64,
+    transform: kurbo::Affine,
 ) -> Coverage {
     use super::gaussian::{Kernel, kernel};
-    if width == 0 || height == 0 || source.is_empty() { return Coverage::default(); }
+    if width == 0 || height == 0 || source.is_empty() {
+        return Coverage::default();
+    }
     match kernel(sigma, transform) {
-        Kernel::Separable { horizontal, vertical } => {
-            blur_separable(source, width, height, &horizontal, &vertical)
-        }
+        Kernel::Separable {
+            horizontal,
+            vertical,
+        } => blur_separable(source, width, height, &horizontal, &vertical),
         Kernel::Correlated { radius_x, rows } => {
             blur_correlated(source, width, height, radius_x, &rows)
         }
@@ -159,12 +176,18 @@ pub fn blur_coverage(
 
 /// Independent covariance axes require only two one-dimensional passes.
 #[expect(
-    clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
     clippy::suboptimal_flops,
     reason = "bounded surface/tap indices; f64 integration rounds once to coverage precision"
 )]
 fn blur_separable(
-    source: &Coverage, width: usize, height: usize, kernel_x: &[f64], kernel_y: &[f64],
+    source: &Coverage,
+    width: usize,
+    height: usize,
+    kernel_x: &[f64],
+    kernel_y: &[f64],
 ) -> Coverage {
     let radius_x = kernel_x.len() / 2;
     let radius_y = kernel_y.len() / 2;
@@ -186,8 +209,8 @@ fn blur_separable(
             for x in left..right {
                 let mut value = 0.0;
                 for (tap, &weight) in kernel_x.iter().enumerate() {
-                    let column =
-                        (x as i64 + tap as i64 - radius_x as i64).clamp(0, width as i64 - 1) as usize;
+                    let column = (x as i64 + tap as i64 - radius_x as i64)
+                        .clamp(0, width as i64 - 1) as usize;
                     value += weight * row[column];
                 }
                 horizontal[(y - source.top) * width + x] = value;
@@ -216,10 +239,18 @@ fn blur_separable(
 
 /// General covariance uses integrated two-dimensional taps. The dense source
 /// only stores occupied rows; coordinates still clamp to the surface boundary.
-#[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap,
-    reason = "bounded surface/tap indices and final f64-to-f32 coverage rounding")]
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    reason = "bounded surface/tap indices and final f64-to-f32 coverage rounding"
+)]
 fn blur_correlated(
-    source: &Coverage, width: usize, height: usize, radius_x: usize, kernel: &[Vec<f64>],
+    source: &Coverage,
+    width: usize,
+    height: usize,
+    radius_x: usize,
+    kernel: &[Vec<f64>],
 ) -> Coverage {
     let radius_y = kernel.len() / 2;
     let top = source.top.saturating_sub(radius_y);
@@ -232,25 +263,31 @@ fn blur_correlated(
             }
         }
     }
-    Coverage::from_rows(top, (top..bottom).map(|y| {
-        let mut result = vec![0.0; width];
-        for (x, pixel) in result.iter_mut().enumerate() {
-            let mut value = 0.0;
-            for (tap_y, weights) in kernel.iter().enumerate() {
-                let sample_y = (y as i64 + tap_y as i64 - radius_y as i64)
-                    .clamp(0, height as i64 - 1) as usize;
-                if !(source.top..source.bottom()).contains(&sample_y) { continue; }
-                let row = (sample_y - source.top) * width;
-                for (tap_x, &weight) in weights.iter().enumerate() {
-                    let column = (x as i64 + tap_x as i64 - radius_x as i64)
-                        .clamp(0, width as i64 - 1) as usize;
-                    value = weight.mul_add(dense[row + column], value);
+    Coverage::from_rows(
+        top,
+        (top..bottom).map(|y| {
+            let mut result = vec![0.0; width];
+            for (x, pixel) in result.iter_mut().enumerate() {
+                let mut value = 0.0;
+                for (tap_y, weights) in kernel.iter().enumerate() {
+                    let sample_y = (y as i64 + tap_y as i64 - radius_y as i64)
+                        .clamp(0, height as i64 - 1) as usize;
+                    if !(source.top..source.bottom()).contains(&sample_y) {
+                        continue;
+                    }
+                    let row = (sample_y - source.top) * width;
+                    for (tap_x, &weight) in weights.iter().enumerate() {
+                        let column = (x as i64 + tap_x as i64 - radius_x as i64)
+                            .clamp(0, width as i64 - 1)
+                            as usize;
+                        value = weight.mul_add(dense[row + column], value);
+                    }
                 }
+                *pixel = value as f32;
             }
-            *pixel = value as f32;
-        }
-        result
-    }))
+            result
+        }),
+    )
 }
 
 /// One band's rasterization state.
@@ -364,14 +401,15 @@ impl Band<'_> {
         let dst = top(&mut *self.fb, stack);
         for (i, &src) in scratch.iter().enumerate() {
             let s = src.map(|v| v * opacity);
-            dst[i] = if mode == cherenkov::BlendMode::Normal && space == cherenkov::BlendSpace::Linear {
-                if s[3] == 0.0 {
-                    continue;
-                }
-                src_over(dst[i], s)
-            } else {
-                in_space(mode, space, dst[i], s)
-            };
+            dst[i] =
+                if mode == cherenkov::BlendMode::Normal && space == cherenkov::BlendSpace::Linear {
+                    if s[3] == 0.0 {
+                        continue;
+                    }
+                    src_over(dst[i], s)
+                } else {
+                    in_space(mode, space, dst[i], s)
+                };
         }
     }
 }
@@ -579,7 +617,13 @@ mod tests {
         let exact = oracle.finish(cherenkov_scene::FillRule::NonZero);
         let source = rasterize(&operands, 8, 8);
         for sigma in [0.0, 1.25] {
-            let expected = cherenkov_oracle::shadow::gaussian_blur(&exact, 8, 8, sigma, kurbo::Affine::IDENTITY);
+            let expected = cherenkov_oracle::shadow::gaussian_blur(
+                &exact,
+                8,
+                8,
+                sigma,
+                kurbo::Affine::IDENTITY,
+            );
             let actual = blur_coverage(&source, 8, 8, sigma, kurbo::Affine::IDENTITY);
             for (i, value) in expected.iter().enumerate() {
                 assert!((f64::from(actual.at(i % 8, i / 8)) - value).abs() < 2e-6);

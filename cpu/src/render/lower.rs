@@ -367,12 +367,21 @@ fn shadow_path(shape: &ShapeData, spread: f64, tolerance: f64) -> Option<(BezPat
         _ => return shape_path(shape, tolerance).map(|(path, rule)| (path, rule, spread)),
     };
     let rect = rounded.rect().inflate(spread, spread);
-    if rect.width() <= 0.0 || rect.height() <= 0.0 { return None; }
+    if rect.width() <= 0.0 || rect.height() <= 0.0 {
+        return None;
+    }
     let radius = |r: f64| if r > 0.0 { (r + spread).max(0.0) } else { 0.0 };
     let radii = rounded.radii();
-    let path = kurbo::RoundedRect::from_rect(rect, kurbo::RoundedRectRadii::new(
-        radius(radii.top_left), radius(radii.top_right),
-        radius(radii.bottom_right), radius(radii.bottom_left))).to_path(tolerance);
+    let path = kurbo::RoundedRect::from_rect(
+        rect,
+        kurbo::RoundedRectRadii::new(
+            radius(radii.top_left),
+            radius(radii.top_right),
+            radius(radii.bottom_right),
+            radius(radii.bottom_left),
+        ),
+    )
+    .to_path(tolerance);
     Some((path, FillRule::NonZero, 0.0))
 }
 
@@ -383,7 +392,9 @@ fn closed_contours(path: &kurbo::BezPath) -> kurbo::BezPath {
     for &element in path.elements() {
         match element {
             kurbo::PathEl::MoveTo(_) => {
-                if open { closed.close_path(); }
+                if open {
+                    closed.close_path();
+                }
                 open = true;
             }
             kurbo::PathEl::ClosePath => open = false,
@@ -391,7 +402,9 @@ fn closed_contours(path: &kurbo::BezPath) -> kurbo::BezPath {
         }
         closed.push(element);
     }
-    if open { closed.close_path(); }
+    if open {
+        closed.close_path();
+    }
     closed
 }
 
@@ -567,7 +580,11 @@ impl<'a> Lowering<'a> {
         self.items.push(Item::PushIsolate);
         let result = body(self);
         self.clip = saved;
-        self.items.push(Item::PopIsolate { opacity, blend, space });
+        self.items.push(Item::PopIsolate {
+            opacity,
+            blend,
+            space,
+        });
         result
     }
 
@@ -580,11 +597,18 @@ impl<'a> Lowering<'a> {
         self.layer_node(node, layers)
     }
 
-    fn layer_node(&mut self, node: &LayerNode, layers: &HashMap<u64, LayerNode>) -> Result<(), RenderError> {
+    fn layer_node(
+        &mut self,
+        node: &LayerNode,
+        layers: &HashMap<u64, LayerNode>,
+    ) -> Result<(), RenderError> {
         let saved = self.transform;
         self.transform = saved * node.transform;
         let result = self.with_clip(node.clip.as_ref(), |s| {
-            if node.opacity < 1.0 || node.blend != BlendMode::Normal || node.blend_space != BlendSpace::Linear {
+            if node.opacity < 1.0
+                || node.blend != BlendMode::Normal
+                || node.blend_space != BlendSpace::Linear
+            {
                 let clip = s.clip.clone();
                 s.isolate(node.opacity, node.blend, node.blend_space, clip, |s| {
                     s.layer_items(node, layers)
@@ -666,7 +690,10 @@ impl<'a> Lowering<'a> {
                         return Err(Unsupported::Filter.into());
                     }
                     let inner_end = (*end as usize).min(commands.len());
-                    if group.opacity >= 1.0 && group.blend == BlendMode::Normal && group.blend_space == BlendSpace::Linear {
+                    if group.opacity >= 1.0
+                        && group.blend == BlendMode::Normal
+                        && group.blend_space == BlendSpace::Linear
+                    {
                         self.commands(list, i + 1, inner_end)?;
                     } else {
                         let clip = self.clip.clone();
@@ -768,39 +795,65 @@ impl<'a> Lowering<'a> {
     fn shadow(&mut self, shape: &ShapeData, shadow: &cherenkov::Shadow) {
         use crate::render::coverage::{Combine, rasterize_combined};
         let tolerance = FLATTEN_TOL / sigma_max(self.transform).max(1e-12);
-        let Some((path, rule, spread)) = shadow_path(shape, shadow.spread, tolerance) else { return };
+        let Some((path, rule, spread)) = shadow_path(shape, shadow.spread, tolerance) else {
+            return;
+        };
         let transform = self.transform * Affine::translate(shadow.offset);
-        let clips = self.clip.as_ref().map_or(&[][..], |clip| clip.operands.as_slice());
+        let clips = self
+            .clip
+            .as_ref()
+            .map_or(&[][..], |clip| clip.operands.as_slice());
         let mut key = crate::render::coverage::geometry_key(clips, self.width, self.height);
         key[0] = 1;
         key.push(u32::from(rule == FillRule::EvenOdd));
         key_path(&mut key, &path);
-        for value in transform.as_coeffs().into_iter().chain([shadow.sigma, spread]) {
+        for value in transform
+            .as_coeffs()
+            .into_iter()
+            .chain([shadow.sigma, spread])
+        {
             key_float(&mut key, value);
         }
         let coverage = self.res.coverage_cache.get_or_insert(key, || {
             let mut operands = vec![Operand {
-                edges: flatten_edges(transform * path.clone(), FLATTEN_TOL).into(), rule,
+                edges: flatten_edges(transform * path.clone(), FLATTEN_TOL).into(),
+                rule,
             }];
             let combine = if spread == 0.0 {
                 Combine::Intersection
             } else {
-                let band = kurbo::stroke(closed_contours(&path), &kurbo::Stroke::new(2.0 * spread.abs())
-                    .with_join(kurbo::Join::Miter).with_miter_limit(4.0),
-                    &kurbo::StrokeOpts::default(), tolerance);
+                let band = kurbo::stroke(
+                    closed_contours(&path),
+                    &kurbo::Stroke::new(2.0 * spread.abs())
+                        .with_join(kurbo::Join::Miter)
+                        .with_miter_limit(4.0),
+                    &kurbo::StrokeOpts::default(),
+                    tolerance,
+                );
                 operands.push(Operand {
                     edges: flatten_edges(transform * band, FLATTEN_TOL).into(),
                     rule: FillRule::NonZero,
                 });
-                if spread > 0.0 { Combine::Union } else { Combine::Difference }
+                if spread > 0.0 {
+                    Combine::Union
+                } else {
+                    Combine::Difference
+                }
             };
             operands.extend_from_slice(clips);
             let caster = rasterize_combined(&operands, self.width, self.height, combine);
-            crate::render::raster::blur_coverage(&caster, self.width, self.height, shadow.sigma, transform)
+            crate::render::raster::blur_coverage(
+                &caster,
+                self.width,
+                self.height,
+                shadow.sigma,
+                transform,
+            )
         });
         let [red, green, blue, alpha] = shadow.color.components;
         self.items.push(Item::Draw {
-            coverage, edge_count: 0,
+            coverage,
+            edge_count: 0,
             paint: PaintData::Solid([red * alpha, green * alpha, blue * alpha, alpha]),
         });
     }
@@ -826,8 +879,12 @@ impl<'a> Lowering<'a> {
         let font_ref = skrifa::FontRef::from_index(&font_data, font_index)
             .map_err(|error| RenderError::Font(error.to_string()))?;
         let colr_upem = if font_ref.colr().is_ok() {
-            Some(f64::from(font_ref.head()
-                .map_err(|error| RenderError::Font(format!("head: {error}")))?.units_per_em()))
+            Some(f64::from(
+                font_ref
+                    .head()
+                    .map_err(|error| RenderError::Font(format!("head: {error}")))?
+                    .units_per_em(),
+            ))
         } else {
             None
         };

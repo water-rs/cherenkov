@@ -643,7 +643,10 @@ impl Renderer {
         self.glyph_cache.insert_batch(masks)?;
         for req in reqs {
             if req.slot.get().is_none() {
-                let mask = self.glyph_cache.get(&req.key).expect("batch retained its masks");
+                let mask = self
+                    .glyph_cache
+                    .get(&req.key)
+                    .expect("batch retained its masks");
                 let _ = req.slot.set(mask);
             }
         }

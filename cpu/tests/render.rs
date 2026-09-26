@@ -6,9 +6,8 @@
 
 use cherenkov::kurbo::{Affine, BezPath, Line, Rect};
 use cherenkov::{
-    Draw, EvenOdd, Extend, Glyph, GlyphRun, Group, Interpolation,
-    LinearGradient, Paint, RadialGradient, Shadow, SweepGradient, WorkingColor,
-    kurbo::Stroke,
+    Draw, EvenOdd, Extend, Glyph, GlyphRun, Group, Interpolation, LinearGradient, Paint,
+    RadialGradient, Shadow, SweepGradient, WorkingColor, kurbo::Stroke,
 };
 use cherenkov_cpu::{
     Engine, FrameTime, Offscreen, OffscreenFormat, Raster, RasterConfig, RenderError,

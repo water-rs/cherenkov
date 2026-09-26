@@ -16,7 +16,10 @@ use std::sync::Arc;
 /// Inverts a bilinear patch at `point`, selecting the last parameter-space
 /// branch. Corner order is 00, 10, 01, 11.
 #[must_use]
-#[expect(clippy::many_single_char_names, reason = "bilinear polynomial coefficients and parameters")]
+#[expect(
+    clippy::many_single_char_names,
+    reason = "bilinear polynomial coefficients and parameters"
+)]
 fn coordinates(corners: [Point; 4], point: Point) -> Option<(f64, f64)> {
     let [origin, right, bottom, opposite] = corners;
     let e = right - origin;
@@ -38,7 +41,11 @@ fn coordinates(corners: [Point; 4], point: Point) -> Option<(f64, f64)> {
             return None;
         }
         let t = -0.5 * (b + discriminant.sqrt().copysign(b));
-        if t == 0.0 { [-b / (2.0 * a); 2] } else { [t / a, c / t] }
+        if t == 0.0 {
+            [-b / (2.0 * a); 2]
+        } else {
+            [t / a, c / t]
+        }
     };
     let mut result: Option<(f64, f64)> = None;
     for v in roots {
@@ -91,28 +98,49 @@ impl Mesh {
                     let [red, green, blue, alpha] = mesh.colors()[i].components.map(f64::from);
                     [red * alpha, green * alpha, blue * alpha, alpha]
                 });
-                let bounds = corners.iter().fold(Rect::new(corners[0].x, corners[0].y, corners[0].x, corners[0].y),
-                    |bounds, &point| bounds.union_pt(point));
-                patches.push(Patch { corners, colors, bounds });
+                let bounds = corners.iter().fold(
+                    Rect::new(corners[0].x, corners[0].y, corners[0].x, corners[0].y),
+                    |bounds, &point| bounds.union_pt(point),
+                );
+                patches.push(Patch {
+                    corners,
+                    colors,
+                    bounds,
+                });
             }
         }
-        Self { inverse, patches: patches.into() }
+        Self {
+            inverse,
+            patches: patches.into(),
+        }
     }
 
     /// Evaluate at the device pixel centre; coverage is supplied by the draw.
-    #[expect(clippy::cast_possible_truncation, reason = "paint rounds once to framebuffer precision")]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "paint rounds once to framebuffer precision"
+    )]
     pub fn eval(&self, x: f32, y: f32) -> [f32; 4] {
         let point = self.inverse * Point::new(f64::from(x), f64::from(y));
         for patch in self.patches.iter().rev() {
-            if point.x < patch.bounds.x0 || point.x > patch.bounds.x1
-                || point.y < patch.bounds.y0 || point.y > patch.bounds.y1 {
+            if point.x < patch.bounds.x0
+                || point.x > patch.bounds.x1
+                || point.y < patch.bounds.y0
+                || point.y > patch.bounds.y1
+            {
                 continue;
             }
             if let Some((u, v)) = coordinates(patch.corners, point) {
                 let mut out = [0.0; 4];
                 for (channel, value) in out.iter_mut().enumerate() {
-                    let top = u.mul_add(patch.colors[1][channel] - patch.colors[0][channel], patch.colors[0][channel]);
-                    let bottom = u.mul_add(patch.colors[3][channel] - patch.colors[2][channel], patch.colors[2][channel]);
+                    let top = u.mul_add(
+                        patch.colors[1][channel] - patch.colors[0][channel],
+                        patch.colors[0][channel],
+                    );
+                    let bottom = u.mul_add(
+                        patch.colors[3][channel] - patch.colors[2][channel],
+                        patch.colors[2][channel],
+                    );
                     *value = v.mul_add(bottom - top, top) as f32;
                 }
                 return out;
@@ -129,18 +157,45 @@ mod tests {
 
     #[test]
     fn folded_overlapping_and_collapsed_patches_match_the_oracle() {
-        let colors = vec![WorkingColor::new([1.0, 0.0, 0.0, 0.5]), WorkingColor::WHITE,
-            WorkingColor::new([0.0, 1.0, 0.0, 0.25]), WorkingColor::new([-1.0, 0.0, 2.0, 1.0])];
+        let colors = vec![
+            WorkingColor::new([1.0, 0.0, 0.0, 0.5]),
+            WorkingColor::WHITE,
+            WorkingColor::new([0.0, 1.0, 0.0, 0.25]),
+            WorkingColor::new([-1.0, 0.0, 2.0, 1.0]),
+        ];
         let meshes = [
-            MeshGradient::new(1, 1,
-                vec![Point::ORIGIN, Point::new(1.0, 0.0), Point::new(0.0, 1.0), Point::new(-1.0, -1.0)], colors.clone()),
+            MeshGradient::new(
+                1,
+                1,
+                vec![
+                    Point::ORIGIN,
+                    Point::new(1.0, 0.0),
+                    Point::new(0.0, 1.0),
+                    Point::new(-1.0, -1.0),
+                ],
+                colors.clone(),
+            ),
             MeshGradient::new(1, 1, vec![Point::ORIGIN; 4], colors),
-            MeshGradient::new(2, 1,
-                vec![(0.0, 0.0).into(), (1.0, 0.0).into(), (0.0, 0.0).into(),
-                    (0.0, 1.0).into(), (1.0, 1.0).into(), (0.0, 1.0).into()],
-                vec![WorkingColor::WHITE, WorkingColor::new([1.0, 0.0, 0.0, 1.0]),
-                    WorkingColor::new([0.0, 0.0, 1.0, 0.5]), WorkingColor::WHITE,
-                    WorkingColor::WHITE, WorkingColor::TRANSPARENT]),
+            MeshGradient::new(
+                2,
+                1,
+                vec![
+                    (0.0, 0.0).into(),
+                    (1.0, 0.0).into(),
+                    (0.0, 0.0).into(),
+                    (0.0, 1.0).into(),
+                    (1.0, 1.0).into(),
+                    (0.0, 1.0).into(),
+                ],
+                vec![
+                    WorkingColor::WHITE,
+                    WorkingColor::new([1.0, 0.0, 0.0, 1.0]),
+                    WorkingColor::new([0.0, 0.0, 1.0, 0.5]),
+                    WorkingColor::WHITE,
+                    WorkingColor::WHITE,
+                    WorkingColor::TRANSPARENT,
+                ],
+            ),
         ];
         for mesh in meshes {
             let prepared = Mesh::new(&mesh, Affine::IDENTITY);

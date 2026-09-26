@@ -80,6 +80,8 @@ pub enum Item {
         opacity: f32,
         /// The blend mode to composite with.
         blend: BlendMode,
+        /// Space used for the group composite.
+        space: BlendSpace,
     },
 }
 
@@ -91,6 +93,8 @@ pub struct LayerNode {
     pub opacity: f32,
     /// Blend mode onto the parent; non-normal isolates.
     pub blend: BlendMode,
+    /// Space used to composite this layer.
+    pub blend_space: BlendSpace,
     /// Clip shape.
     pub clip: Option<ShapeData>,
     /// The content.
@@ -116,7 +120,9 @@ pub struct GlyphReq {
     pub glyph_id: u32,
     /// The run's size.
     pub size: f32,
-    /// The quantized subpixel offset of the glyph origin.
+    /// Stroke in run units, or fill.
+    pub style: GlyphStyle,
+    /// The exact fractional device-space offset of the glyph origin.
     pub subpixel: (f32, f32),
     /// The device transform's 2x2 as f32.
     pub matrix: [f32; 4],
@@ -158,11 +164,11 @@ pub struct Lowering<'a> {
     clippy::many_single_char_names,
     reason = "a/b/c/d are the conventional affine matrix coefficient names"
 )]
-fn sigma_max(t: Affine) -> f64 {
+pub(super) fn sigma_max(t: Affine) -> f64 {
     let [a, b, c, d, _, _] = t.as_coeffs();
     let p = a.mul_add(a, b * b) + c.mul_add(c, d * d);
     let det = a.mul_add(d, -(b * c));
-    let disc = p.mul_add(p, (-4.0 * det) * det).sqrt();
+    let disc = p.mul_add(p, (-4.0 * det) * det).max(0.0).sqrt();
     p.midpoint(disc).sqrt()
 }
 
@@ -352,23 +358,23 @@ fn bbox_of(edges: &[Edge], w: usize, h: usize) -> IRect {
     }
 }
 
-/// Whether the transform's 2x2 is axis-aligned (`b == c == 0`, or a 90°
-/// rotation with `a == d == 0`).
-fn axis_aligned(transform: Affine) -> bool {
-    let [c0, c1, c2, c3, _, _] = transform.as_coeffs();
-    (c1 == 0.0 && c2 == 0.0) || (c0 == 0.0 && c3 == 0.0)
-}
-
-/// The device-space rectangle of a rect under an axis-aligned transform.
-fn device_rect(t: Affine, r: Rect) -> Rect {
-    let p0 = t * Point::new(r.x0, r.y0);
-    let p1 = t * Point::new(r.x1, r.y1);
-    Rect::new(
-        p0.x.min(p1.x),
-        p0.y.min(p1.y),
-        p0.x.max(p1.x),
-        p0.y.max(p1.y),
-    )
+/// Close each authored contour, including an implicit final closing segment.
+fn closed_contours(path: &kurbo::BezPath) -> kurbo::BezPath {
+    let mut closed = kurbo::BezPath::new();
+    let mut open = false;
+    for &element in path.elements() {
+        match element {
+            kurbo::PathEl::MoveTo(_) => {
+                if open { closed.close_path(); }
+                open = true;
+            }
+            kurbo::PathEl::ClosePath => open = false,
+            _ => {}
+        }
+        closed.push(element);
+    }
+    if open { closed.close_path(); }
+    closed
 }
 
 /// Lossless binary key words; no float hashing or quantization.
@@ -439,7 +445,7 @@ impl<'a> Lowering<'a> {
         clear: WorkingColor,
     ) -> Result<(), RenderError> {
         let _ = clear;
-        self.layer_items(root, layers)
+        self.layer_node(root, layers)
     }
 
     /// Retains geometric operands; nested clipping is an intersection.
@@ -535,6 +541,7 @@ impl<'a> Lowering<'a> {
         &mut self,
         opacity: f32,
         blend: BlendMode,
+        space: BlendSpace,
         inner_clip: Option<ClipRef>,
         body: impl FnOnce(&mut Self) -> Result<(), RenderError>,
     ) -> Result<(), RenderError> {
@@ -542,7 +549,7 @@ impl<'a> Lowering<'a> {
         self.items.push(Item::PushIsolate);
         let result = body(self);
         self.clip = saved;
-        self.items.push(Item::PopIsolate { opacity, blend });
+        self.items.push(Item::PopIsolate { opacity, blend, space });
         result
     }
 
@@ -552,12 +559,16 @@ impl<'a> Lowering<'a> {
         let Some(node) = layers.get(&id) else {
             return Ok(());
         };
+        self.layer_node(node, layers)
+    }
+
+    fn layer_node(&mut self, node: &LayerNode, layers: &HashMap<u64, LayerNode>) -> Result<(), RenderError> {
         let saved = self.transform;
         self.transform = saved * node.transform;
         let result = self.with_clip(node.clip.as_ref(), |s| {
-            if node.opacity < 1.0 || node.blend != BlendMode::Normal {
+            if node.opacity < 1.0 || node.blend != BlendMode::Normal || node.blend_space != BlendSpace::Linear {
                 let clip = s.clip.clone();
-                s.isolate(node.opacity, node.blend, clip, |s| {
+                s.isolate(node.opacity, node.blend, node.blend_space, clip, |s| {
                     s.layer_items(node, layers)
                 })
             } else {
@@ -603,7 +614,7 @@ impl<'a> Lowering<'a> {
                     stroke,
                     paint,
                 } => self.stroke(shape, stroke, paint)?,
-                Command::Shadow { shape, shadow } => self.shadow(shape, shadow)?,
+                Command::Shadow { shape, shadow } => self.shadow(shape, shadow),
                 Command::Glyphs { run, paint } => self.glyph_run(run, paint)?,
                 Command::Image {
                     image,
@@ -636,15 +647,12 @@ impl<'a> Lowering<'a> {
                     if group.filter.is_some() {
                         return Err(Unsupported::Filter.into());
                     }
-                    if group.blend_space != BlendSpace::Linear {
-                        return Err(Unsupported::BlendSpace.into());
-                    }
                     let inner_end = (*end as usize).min(commands.len());
-                    if group.opacity >= 1.0 && group.blend == BlendMode::Normal {
+                    if group.opacity >= 1.0 && group.blend == BlendMode::Normal && group.blend_space == BlendSpace::Linear {
                         self.commands(list, i + 1, inner_end)?;
                     } else {
                         let clip = self.clip.clone();
-                        self.isolate(group.opacity, group.blend, clip, |s| {
+                        self.isolate(group.opacity, group.blend, group.blend_space, clip, |s| {
                             s.commands(list, i + 1, inner_end)
                         })?;
                     }
@@ -738,165 +746,45 @@ impl<'a> Lowering<'a> {
         Ok(())
     }
 
-    /// `Shadow`: a Gaussian-blurred rounded box in device space.
-    ///
-    /// Only shapes whose corners are circular under the transform —
-    /// `Rect`, `RoundedRect`, `Circle` — under an axis-aligned
-    /// transform; everything else reports [`Unsupported::Shadow`].
-    /// Radii are handled per corner (the closed form works per corner).
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_possible_wrap,
-        clippy::many_single_char_names,
-        reason = "shadow geometry is f32 and surface sizes fit i32"
-    )]
-    fn shadow(&mut self, shape: &ShapeData, shadow: &cherenkov::Shadow) -> Result<(), RenderError> {
-        // The shape as a centred rect plus per-corner radii, in content
-        // space.
-        let (rect, radii) = match shape {
-            ShapeData::Rect(r) => (*r, [0.0; 4]),
-            ShapeData::RoundedRect(rr) => {
-                let r = rr.rect();
-                let limit = r.width().min(r.height()) / 2.0;
-                let radii = rr.radii();
-                (
-                    r,
-                    [
-                        radii.top_left.clamp(0.0, limit),
-                        radii.top_right.clamp(0.0, limit),
-                        radii.bottom_right.clamp(0.0, limit),
-                        radii.bottom_left.clamp(0.0, limit),
-                    ],
-                )
-            }
-            ShapeData::Circle(c) => (
-                Rect::from_center_size(c.center, (c.radius * 2.0, c.radius * 2.0)),
-                [c.radius; 4],
-            ),
-            _ => return Err(Unsupported::Shadow.into()),
-        };
-        if !axis_aligned(self.transform) {
-            return Err(Unsupported::Shadow.into());
-        }
-        let [a, b, c, d, _, _] = self.transform.as_coeffs();
-        let (sx, sy) = (a.hypot(b), c.hypot(d));
-        let smax = sx.max(sy).max(1e-12);
-        // The device-space box: transform the rect, offset by the linear
-        // part applied to the shadow offset.
-        let dr = device_rect(self.transform, rect);
-        let (cx, cy) = (
-            c.mul_add(
-                shadow.offset.y,
-                a.mul_add(shadow.offset.x, dr.x0.midpoint(dr.x1)),
-            ),
-            d.mul_add(
-                shadow.offset.y,
-                b.mul_add(shadow.offset.x, dr.y0.midpoint(dr.y1)),
-            ),
-        );
-        let spread = shadow.spread * smax;
-        let (hx, hy) = (
-            (dr.width() / 2.0 + spread).max(0.0),
-            (dr.height() / 2.0 + spread).max(0.0),
-        );
-        let limit = hx.min(hy);
-        let radii = radii.map(|r| {
-            if r > 0.0 {
-                r.mul_add(smax, spread).clamp(0.0, limit)
-            } else {
-                0.0
-            }
-        });
-        let sigma_eff =
-            ((shadow.sigma * smax).mul_add(shadow.sigma * smax, 1.0 / 6.0)).sqrt() as f32;
-        let margin = f64::from(sigma_eff).mul_add(3.0, 1.0);
-        let (w, h) = (self.width as i32, self.height as i32);
-        let bbox = IRect {
-            x0: ((cx - hx - margin).floor() as i32).clamp(0, w),
-            y0: ((cy - hy - margin).floor() as i32).clamp(0, h),
-            x1: ((cx + hx + margin).ceil() as i32).clamp(0, w),
-            y1: ((cy + hy + margin).ceil() as i32).clamp(0, h),
-        };
-        if bbox.x0 >= bbox.x1 || bbox.y0 >= bbox.y1 {
-            return Ok(());
-        }
-        let [r, g, bl, al] = shadow.color.components;
-        let coverage = self.prepared_shadow(
-            [cx, cy, hx, hy],
-            radii.map(|r| r as f32),
-            (shadow.sigma * smax) as f32,
-            sigma_eff,
-            bbox,
-        );
-        self.items.push(Item::Draw {
-            coverage,
-            edge_count: 0,
-            paint: PaintData::Solid([r * al, g * al, bl * al, al]),
-        });
-        Ok(())
-    }
-
-    /// Retains the scalar shadow field independently of its colour.
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "analytic shadow coordinates use f32"
-    )]
-    fn prepared_shadow(
-        &mut self,
-        geometry: [f64; 4],
-        radii: [f32; 4],
-        sigma: f32,
-        sigma_eff: f32,
-        bbox: IRect,
-    ) -> Arc<Coverage> {
-        let [cx, cy, hx, hy] = geometry;
-        let rbox = geometry.map(|value| value as f32);
-        let operands = self
-            .clip
-            .as_ref()
-            .map_or(&[][..], |clip| clip.operands.as_slice());
-        let mut key = crate::render::coverage::geometry_key(operands, self.width, self.height);
+    /// Compile the shifted caster and clips, then convolve the exact field.
+    fn shadow(&mut self, shape: &ShapeData, shadow: &cherenkov::Shadow) {
+        use crate::render::coverage::{Combine, rasterize_combined};
+        let tolerance = FLATTEN_TOL / sigma_max(self.transform).max(1e-12);
+        let Some((path, rule)) = shape_path(shape, tolerance) else { return };
+        let transform = self.transform * Affine::translate(shadow.offset);
+        let clips = self.clip.as_ref().map_or(&[][..], |clip| clip.operands.as_slice());
+        let mut key = crate::render::coverage::geometry_key(clips, self.width, self.height);
         key[0] = 1;
-        key.extend(rbox.map(f32::to_bits));
-        key.extend(radii.map(f32::to_bits));
-        key.push(sigma_eff.to_bits());
-        key.push(sigma.to_bits());
-        for coordinate in geometry {
-            key_float(&mut key, coordinate);
+        key.push(u32::from(rule == FillRule::EvenOdd));
+        key_path(&mut key, &path);
+        for value in transform.as_coeffs().into_iter().chain([shadow.sigma, shadow.spread]) {
+            key_float(&mut key, value);
         }
-        self.res.coverage_cache.get_or_insert(key, || {
-            if let Some(clip) = &self.clip {
-                // Oracle order: intersect the caster, then convolve coverage.
-                // Clipping the blurred image would cut off the shadow tail.
-                let shape = ShapeData::RoundedRect(kurbo::RoundedRect::new(
-                    cx - hx,
-                    cy - hy,
-                    cx + hx,
-                    cy + hy,
-                    kurbo::RoundedRectRadii::new(
-                        f64::from(radii[0]),
-                        f64::from(radii[1]),
-                        f64::from(radii[2]),
-                        f64::from(radii[3]),
-                    ),
-                ));
-                let (path, rule) = shape_path(&shape, FLATTEN_TOL).expect("rounded box has a path");
-                let mut operands = clip.operands.clone();
-                operands.push(Operand {
-                    edges: flatten_edges(path, FLATTEN_TOL).into(),
-                    rule,
-                });
-                let caster = crate::render::coverage::rasterize(&operands, self.width, self.height);
-                crate::render::raster::blur_coverage(
-                    &caster,
-                    self.width,
-                    self.height,
-                    f64::from(sigma),
-                )
+        let coverage = self.res.coverage_cache.get_or_insert(key, || {
+            let mut operands = vec![Operand {
+                edges: flatten_edges(transform * path.clone(), FLATTEN_TOL).into(), rule,
+            }];
+            let combine = if shadow.spread == 0.0 {
+                Combine::Intersection
             } else {
-                crate::render::raster::shadow_coverage(&rbox, &radii, sigma_eff, bbox, self.width)
-            }
-        })
+                let band = kurbo::stroke(closed_contours(&path), &kurbo::Stroke::new(2.0 * shadow.spread.abs())
+                    .with_join(kurbo::Join::Round).with_caps(kurbo::Cap::Round),
+                    &kurbo::StrokeOpts::default(), tolerance);
+                operands.push(Operand {
+                    edges: flatten_edges(transform * band, FLATTEN_TOL).into(),
+                    rule: FillRule::NonZero,
+                });
+                if shadow.spread > 0.0 { Combine::Union } else { Combine::Difference }
+            };
+            operands.extend_from_slice(clips);
+            let caster = rasterize_combined(&operands, self.width, self.height, combine);
+            crate::render::raster::blur_coverage(&caster, self.width, self.height, shadow.sigma)
+        });
+        let [red, green, blue, alpha] = shadow.color.components;
+        self.items.push(Item::Draw {
+            coverage, edge_count: 0,
+            paint: PaintData::Solid([red * alpha, green * alpha, blue * alpha, alpha]),
+        });
     }
 
     /// `Glyphs`: one mask request per positioned glyph. Font lookup and
@@ -908,9 +796,6 @@ impl<'a> Lowering<'a> {
         reason = "glyph device coordinates fit i32 on a real surface"
     )]
     fn glyph_run(&mut self, run: &GlyphRun, paint: &Paint) -> Result<(), RenderError> {
-        if matches!(run.style, GlyphStyle::Stroke(_)) {
-            return Err(Unsupported::GlyphStroke.into());
-        }
         let (font_data, font_index) = {
             let font =
                 self.res.fonts.get(&run.font.raw()).ok_or_else(|| {
@@ -919,36 +804,29 @@ impl<'a> Lowering<'a> {
             (font.data.clone(), font.index)
         };
         let pdata = paint_data(paint, self.transform.inverse(), self.res.images)?;
-        let [a, b, c, d, ..] = self.transform.as_coeffs();
-        let matrix = [a as f32, b as f32, c as f32, d as f32];
         let coords: std::sync::Arc<[i16]> = run.coords.clone().into();
-        // `upem`/`color_glyphs` are resolved lazily — plain runs never parse
-        // the font here (the rasterizer does it on cache miss).
-        let mut colr_ctx: Option<(skrifa::FontRef<'_>, f64)> = None;
-        let mut colr_checked = false;
+        let font_ref = skrifa::FontRef::from_index(&font_data, font_index)
+            .map_err(|error| RenderError::Font(error.to_string()))?;
+        let colr_upem = if font_ref.colr().is_ok() {
+            Some(f64::from(font_ref.head()
+                .map_err(|error| RenderError::Font(format!("head: {error}")))?.units_per_em()))
+        } else {
+            None
+        };
         for glyph in &run.glyphs {
-            if glyph.transform.is_some() {
-                return Err(Unsupported::GlyphTransform.into());
-            }
-            if !colr_checked {
-                colr_checked = true;
-                let font_ref = skrifa::FontRef::from_index(&font_data, font_index)
-                    .map_err(|e| RenderError::Font(format!("{e}")))?;
-                if font_ref.colr().is_ok() {
-                    let upem = font_ref
-                        .head()
-                        .map_err(|e| RenderError::Font(format!("head: {e}")))?
-                        .units_per_em();
-                    colr_ctx = Some((font_ref, f64::from(upem)));
-                }
-            }
-            if let Some((font_ref, upem)) = colr_ctx.as_ref()
+            let placement = self.transform
+                * Affine::translate((f64::from(glyph.x), f64::from(glyph.y)))
+                * glyph.transform.unwrap_or(Affine::IDENTITY);
+            let [a, b, c, d, ..] = placement.as_coeffs();
+            let matrix = [a as f32, b as f32, c as f32, d as f32];
+            if matches!(run.style, GlyphStyle::Fill)
+                && let Some(upem) = colr_upem
                 && font_ref
                     .color_glyphs()
                     .get(skrifa::GlyphId::new(glyph.id))
                     .is_some()
             {
-                if *upem <= 0.0 {
+                if upem <= 0.0 {
                     return Err(RenderError::Font("zero units_per_em".into()));
                 }
                 let picture = crate::render::colr::glyph_picture(
@@ -963,23 +841,22 @@ impl<'a> Lowering<'a> {
                 // `translate(x, y) * scale_non_uniform(size/upem, -size/upem)`
                 // places the font-space picture at the glyph's origin.
                 let s = f64::from(run.size) / upem;
-                let place = Affine::translate((f64::from(glyph.x), f64::from(glyph.y)))
-                    * Affine::scale_non_uniform(s, -s);
+                let place = placement * Affine::scale_non_uniform(s, -s);
                 let saved = self.transform;
-                self.transform = saved * place;
+                self.transform = place;
                 let list = picture.display_list();
                 let result = self.commands(list, 0, list.len());
                 self.transform = saved;
                 result?;
                 continue;
             }
-            let o = self.transform * Point::new(f64::from(glyph.x), f64::from(glyph.y));
+            let o = placement * Point::ORIGIN;
             let (ix, iy) = (o.x.floor(), o.y.floor());
             // The oracle places glyphs at their exact origins: the mask
             // keeps the subpixel fraction unquantized (a 1/4px quantize
             // would shift every edge by up to 0.25px).
             let subpixel = ((o.x - ix) as f32, (o.y - iy) as f32);
-            let key = crate::render::glyph::glyph_key(run, glyph.id, subpixel, self.transform);
+            let key = crate::render::glyph::glyph_key(run, &coords, glyph.id, subpixel, placement);
             let slot: crate::render::glyph::GlyphSlot =
                 std::sync::Arc::new(std::sync::OnceLock::new());
             self.glyphs.push(GlyphReq {
@@ -987,6 +864,7 @@ impl<'a> Lowering<'a> {
                 font: run.font.raw(),
                 glyph_id: glyph.id,
                 size: run.size,
+                style: run.style.clone(),
                 subpixel,
                 matrix,
                 coords: coords.clone(),

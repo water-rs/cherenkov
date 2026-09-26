@@ -77,36 +77,20 @@ pub enum RenderError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, thiserror::Error)]
 #[non_exhaustive]
 pub enum Unsupported {
-    /// A mesh gradient.
-    Mesh,
     /// A user shader paint.
     Shader,
     /// A filter on a group.
     Filter,
-    /// A stroked glyph run.
-    GlyphStroke,
-    /// A per-glyph transform.
-    GlyphTransform,
     /// A colour font (COLR, CBDT or sbix).
     ColorFont,
-    /// A blend space other than linear.
-    BlendSpace,
-    /// A shadow from a shape without a rounded-box form (in this slice,
-    /// every shadow).
-    Shadow,
 }
 
 impl std::fmt::Display for Unsupported {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::Mesh => "mesh-gradient",
             Self::Shader => "shader-paint",
             Self::Filter => "filter",
-            Self::GlyphStroke => "glyph-stroke",
-            Self::GlyphTransform => "glyph-transform",
             Self::ColorFont => "color-font",
-            Self::BlendSpace => "blend-space",
-            Self::Shadow => "shadow",
         })
     }
 }

@@ -32,6 +32,7 @@
 //! ```
 
 #![doc = include_str!("../DESIGN-coverage.md")]
+#![doc = include_str!("../DESIGN-effects.md")]
 
 mod config;
 mod error;

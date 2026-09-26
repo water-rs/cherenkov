@@ -29,7 +29,7 @@ pub fn sigma_max(t: Affine) -> f64 {
     // where p = tr(MᵀM) and det² = det(M)² = det(MᵀM).
     let p = a.mul_add(a, b * b) + c.mul_add(c, d * d);
     let det = a.mul_add(d, -(b * c));
-    let disc = p.mul_add(p, (-4.0 * det) * det).sqrt();
+    let disc = p.mul_add(p, (-4.0 * det) * det).max(0.0).sqrt();
     p.midpoint(disc).sqrt()
 }
 

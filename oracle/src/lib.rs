@@ -31,6 +31,7 @@ pub mod coverage;
 pub mod glyphs;
 pub mod image;
 pub mod metrics;
+pub mod mesh;
 pub mod paint;
 pub mod path;
 pub mod render;

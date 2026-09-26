@@ -65,6 +65,48 @@ impl std::error::Error for GlyphError {}
 /// Collects path commands into a [`BezPath`].
 struct BezPen(BezPath);
 
+/// Reference outline for a frontend glyph, including style and placement.
+/// Font outlines are unhinted and y-up. Scale to the run's y-down units,
+/// expand a stroke in those units, then apply the glyph's local transform,
+/// its origin translation and the enclosing transform, in that order.
+/// Paint stays in the enclosing drawing space. Stroke style selects the
+/// monochrome base outline even for a font that also supplies COLR paints;
+/// filled colour glyphs retain their paint graph and transform it as a whole.
+///
+/// # Errors
+/// Returns [`GlyphError`] for an invalid font or missing outline.
+pub fn styled_outline(
+    data: &[u8],
+    index: u32,
+    run: &cherenkov::GlyphRun,
+    glyph: &cherenkov::Glyph,
+    transform: Affine,
+) -> Result<BezPath, GlyphError> {
+    use skrifa::raw::TableProvider as _;
+    let font = skrifa::FontRef::from_index(data, index)
+        .map_err(|error| GlyphError::Font(error.to_string()))?;
+    let upem = font.head().map_err(|error| GlyphError::Font(error.to_string()))?.units_per_em();
+    let id = u16::try_from(glyph.id).map_err(|_| GlyphError::GlyphId(glyph.id))?;
+    let outlines = font.outline_glyphs();
+    let outline = outlines.get(GlyphId::from(id)).ok_or(GlyphError::NoOutline(id))?;
+    let coords: Vec<_> = run.coords.iter().map(|&value| F2Dot14Coord::from_bits(value)).collect();
+    let mut pen = BezPen(BezPath::new());
+    outline.draw(DrawSettings::unhinted(Size::unscaled(), LocationRef::new(&coords)), &mut pen)
+        .map_err(|error| GlyphError::Font(error.to_string()))?;
+    let scale = f64::from(run.size) / f64::from(upem);
+    let path = Affine::scale_non_uniform(scale, -scale) * pen.0;
+    let placement = transform
+        * Affine::translate((f64::from(glyph.x), f64::from(glyph.y)))
+        * glyph.transform.unwrap_or(Affine::IDENTITY);
+    let path = match &run.style {
+        cherenkov::GlyphStyle::Fill => path,
+        cherenkov::GlyphStyle::Stroke(stroke) => kurbo::stroke(
+            path, stroke, &kurbo::StrokeOpts::default(),
+            crate::path::SEGMENT_TOLERANCE / crate::path::sigma_max(placement).max(1e-12)),
+    };
+    Ok(placement * path)
+}
+
 impl OutlinePen for BezPen {
     fn move_to(&mut self, x: f32, y: f32) {
         self.0.move_to((f64::from(x), f64::from(y)));

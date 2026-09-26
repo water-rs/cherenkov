@@ -6,16 +6,13 @@
 
 use rayon::prelude::*;
 
-use crate::render::blend::{blend, src_over};
+use crate::render::blend::{in_space, src_over};
 use crate::render::coverage::Coverage;
-use crate::render::lower::{IRect, Item};
+use crate::render::lower::Item;
 use crate::render::paint::PaintData;
 
 /// Rows per rasterization band.
 pub const BAND_H: usize = 16;
-
-/// Sample count of the shadow y-quadrature (the GPU uses the same).
-const SHADOW_N: usize = 16;
 
 /// A directed edge in device space.
 #[derive(Clone, Copy, Debug)]
@@ -28,43 +25,6 @@ pub struct Edge {
     pub x1: f32,
     /// End point.
     pub y1: f32,
-}
-
-/// Abramowitz & Stegun 7.1.26 — the same approximation the GPU WGSL
-/// uses, |error| < 1.5e-7.
-#[expect(
-    clippy::many_single_char_names,
-    clippy::excessive_precision,
-    clippy::suboptimal_flops,
-    reason = "the A&S formula and its coefficients are cited verbatim"
-)]
-fn erf(x: f32) -> f32 {
-    let s = x.signum();
-    let a = x.abs();
-    let t = (0.327_591_1_f32 * a + 1.0).recip();
-    let polynomial =
-        ((((1.061_405_429_f32 * t - 1.453_152_027) * t + 1.421_413_741) * t - 0.284_496_736) * t
-            + 0.254_829_592)
-            * t;
-    let y = 1.0 - polynomial * (-a * a).exp();
-    s * y
-}
-
-/// `exp(-x²/2σ²) / (σ√2π)`.
-#[expect(clippy::excessive_precision, reason = "sqrt(2π) to f32 accuracy")]
-fn gaussian(x: f32, sigma: f32) -> f32 {
-    (-(x * x) / (2.0 * sigma * sigma)).exp() / (2.506_628_274_6 * sigma)
-}
-
-/// Horizontal inset of a circular corner of radius `r` at distance `dy`
-/// past the start of the corner (`dy <= 0` is the straight edge).
-#[expect(clippy::suboptimal_flops, reason = "the reference formula verbatim")]
-fn corner_inset(r: f32, dy: f32) -> f32 {
-    if dy <= 0.0 || r <= 0.0 {
-        return 0.0;
-    }
-    let dd = dy.min(r);
-    r - (r * r - dd * dd).max(0.0).sqrt()
 }
 
 /// The buffer at the top of the isolation stack, or the band's
@@ -164,9 +124,9 @@ pub fn render_bands(
                         buffer.fill([0.0; 4]);
                         scratch.stack.push(buffer);
                     }
-                    Item::PopIsolate { opacity, blend } => {
+                    Item::PopIsolate { opacity, blend, space } => {
                         let buffer = scratch.stack.pop().expect("balanced isolation items");
-                        band.composite_isolate(&buffer, *opacity, *blend, &mut scratch.stack);
+                        band.composite_isolate(&buffer, *opacity, *blend, *space, &mut scratch.stack);
                         scratch.spare.push(buffer);
                     }
                     Item::Glyph {
@@ -181,31 +141,6 @@ pub fn render_bands(
     (draws, edges)
 }
 
-/// Evaluates the analytic unoccluded rounded-box shadow once per geometry key.
-pub fn shadow_coverage(
-    rbox: &[f32; 4],
-    radii: &[f32; 4],
-    sigma: f32,
-    bbox: IRect,
-    w: usize,
-) -> Coverage {
-    let top = usize::try_from(bbox.y0).expect("clamped shadow bounds");
-    let bottom = usize::try_from(bbox.y1).expect("clamped shadow bounds");
-    let mut pixels = vec![[0.0; 4]; w * (bottom - top)];
-    let mut band = Band {
-        fb: &mut pixels,
-        w,
-        y0: top,
-    };
-    band.shadow(rbox, radii, sigma, &[1.0; 4], bbox);
-    Coverage::from_rows(
-        top,
-        pixels
-            .chunks_exact(w)
-            .map(|row| row.iter().map(|pixel| pixel[3]).collect()),
-    )
-}
-
 /// The oracle's integrated Gaussian taps, applied after exact caster clipping.
 /// The convolution is restricted to the caster's support plus the kernel halo.
 #[expect(
@@ -217,7 +152,7 @@ pub fn shadow_coverage(
     reason = "bounded surface/tap indices; f64 integration rounds once to coverage precision"
 )]
 pub fn blur_coverage(source: &Coverage, width: usize, height: usize, sigma: f64) -> Coverage {
-    if width == 0 || height == 0 || source.top == source.bottom() {
+    if width == 0 || height == 0 || source.is_empty() {
         return Coverage::default();
     }
     let radius = if sigma <= 1e-9 {
@@ -334,163 +269,6 @@ impl Band<'_> {
         }
     }
 
-    /// Rasterizes a blurred rounded box: analytic coverage per pixel in
-    /// `bbox` ∩ band.
-    #[expect(
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::float_cmp,
-        clippy::suboptimal_flops,
-        clippy::too_many_lines,
-        reason = "pixel indices and band offsets are far below 2^24; the \
-                  flat-row test is intentionally exact and the quadrature \
-                  weights mirror the reference formula"
-    )]
-    fn shadow(
-        &mut self,
-        rbox: &[f32; 4],
-        radii: &[f32; 4],
-        sigma_eff: f32,
-        color: &[f32; 4],
-        bbox: IRect,
-    ) {
-        let bh = self.fb.len() / self.w;
-        let (y_lo, y_hi) = (
-            usize::try_from(bbox.y0)
-                .unwrap_or(0)
-                .saturating_sub(self.y0)
-                .min(bh),
-            usize::try_from(bbox.y1)
-                .unwrap_or(0)
-                .saturating_sub(self.y0)
-                .min(bh),
-        );
-        let (x_lo, x_hi) = (
-            usize::try_from(bbox.x0).unwrap_or(0).min(self.w),
-            usize::try_from(bbox.x1).unwrap_or(0).min(self.w),
-        );
-        if y_lo >= y_hi || x_lo >= x_hi {
-            return;
-        }
-        let (cx, cy) = (rbox[0], rbox[1]);
-        let half = [rbox[2], rbox[3]];
-        let sigma = sigma_eff;
-        let inv_sqrt2_sigma = 1.0 / (sigma * std::f32::consts::SQRT_2);
-        let (cx_lo, cx_hi) = (x_lo, x_hi);
-        // The 16 y-quadrature samples and their `gaussian*step` weights
-        // are per item, not per pixel.
-        let step = 6.0 * sigma / SHADOW_N as f32;
-        let mut dy = [0.0_f32; SHADOW_N];
-        let mut gw = [0.0_f32; SHADOW_N];
-        for (i, (d, w)) in dy.iter_mut().zip(gw.iter_mut()).enumerate() {
-            *d = (i as f32 + 0.5) * step - 3.0 * sigma;
-            *w = gaussian(*d, sigma) * step;
-        }
-        // Per row the quadrature's x-integral saturates except near the
-        // left/right edges: `erf` reaches ±1 within `MARGIN` of an edge,
-        // so interior columns all evaluate to the same `S` (the sum of
-        // in-box sample weights) and only the two edge bands pay the
-        // 32-`erf` sum. For `sigma`-wide margins the tail error is
-        // `erf(5)-1 < 1e-11`.
-        let margin = 5.0 * sigma * std::f32::consts::SQRT_2;
-        // Flat rows — every sample has zero corner inset — share the
-        // straight-wall x-integral, one `erf` pair per column computed
-        // once for the whole item.
-        let mut x_term: Option<Vec<f32>> = None;
-        let mut xl = [0.0_f32; SHADOW_N];
-        let mut xr = [0.0_f32; SHADOW_N];
-        let mut wg = [0.0_f32; SHADOW_N];
-        for y in y_lo..y_hi {
-            let py_i = self.y0 + y;
-            let py = py_i as f32 + 0.5 - cy;
-            // The row's sample table: left/right x-edges per in-box
-            // sample, their weights, the interior-coverage sum `s`, and
-            // the most-inset edges bounding the interior zone.
-            let mut n = 0_usize;
-            let mut s = 0.0_f32;
-            let mut flat = true;
-            let (mut xlm, mut xrm) = (f32::MIN, f32::MAX);
-            for (d, w) in dy.iter().zip(gw.iter()) {
-                let yi = py + d;
-                if yi.abs() > half[1] {
-                    continue;
-                }
-                let (rl, rr) = if yi < 0.0 {
-                    (radii[0], radii[1])
-                } else {
-                    (radii[3], radii[2])
-                };
-                let ay = yi.abs();
-                xl[n] = -half[0] + corner_inset(rl, ay - (half[1] - rl));
-                xr[n] = half[0] - corner_inset(rr, ay - (half[1] - rr));
-                wg[n] = *w;
-                flat &= xl[n] == -half[0] && xr[n] == half[0];
-                xlm = xlm.max(xl[n]);
-                xrm = xrm.min(xr[n]);
-                s += w;
-                n += 1;
-            }
-            if n == 0 || s <= 0.0 {
-                continue;
-            }
-            let dst = &mut *self.fb;
-            if flat {
-                // Separable: `cov = x_term[px] * s` across the row.
-                let t = x_term.get_or_insert_with(|| {
-                    (cx_lo..cx_hi)
-                        .map(|x| {
-                            let px = x as f32 + 0.5 - cx;
-                            0.5 * (erf((half[0] - px) * inv_sqrt2_sigma)
-                                - erf((-half[0] - px) * inv_sqrt2_sigma))
-                        })
-                        .collect()
-                });
-                for x in cx_lo..cx_hi {
-                    let cov = t[x - cx_lo] * s;
-                    if cov <= 0.0 {
-                        continue;
-                    }
-                    let src = color.map(|v| v * cov.clamp(0.0, 1.0));
-                    dst[y * self.w + x] = src_over(dst[y * self.w + x], src);
-                }
-                continue;
-            }
-            // Interior columns: `px >= xlm + margin` saturates every
-            // `erf((xl-px)*is)` at -1 and `px <= xrm - margin` saturates
-            // every `erf((xr-px)*is)` at +1, so `cov = s` for all of them.
-            let x_in_lo = usize::try_from((cx + xlm + margin - 0.5).ceil() as i32)
-                .unwrap_or(0)
-                .clamp(cx_lo, cx_hi);
-            let x_in_hi = usize::try_from((cx + xrm - margin + 0.5).floor() as i32 + 1)
-                .unwrap_or(0)
-                .clamp(x_in_lo, cx_hi);
-            let dst = &mut *self.fb;
-            let edge = |dst: &mut [[f32; 4]], f: usize, t: usize| {
-                for x in f..t {
-                    let px = x as f32 + 0.5 - cx;
-                    let mut cov = 0.0_f32;
-                    for k in 0..n {
-                        cov += 0.5
-                            * (erf((xr[k] - px) * inv_sqrt2_sigma)
-                                - erf((xl[k] - px) * inv_sqrt2_sigma))
-                            * wg[k];
-                    }
-                    if cov <= 0.0 {
-                        continue;
-                    }
-                    let src = color.map(|v| v * cov.clamp(0.0, 1.0));
-                    dst[y * self.w + x] = src_over(dst[y * self.w + x], src);
-                }
-            };
-            edge(&mut *dst, cx_lo, x_in_lo);
-            for x in x_in_lo..x_in_hi {
-                let src = color.map(|v| v * s.clamp(0.0, 1.0));
-                dst[y * self.w + x] = src_over(dst[y * self.w + x], src);
-            }
-            edge(&mut *dst, x_in_hi, cx_hi);
-        }
-    }
-
     /// Composites one unclipped glyph mask; clipped outlines are prepared draws.
     #[expect(
         clippy::cast_possible_wrap,
@@ -549,18 +327,19 @@ impl Band<'_> {
         scratch: &[[f32; 4]],
         opacity: f32,
         mode: cherenkov::BlendMode,
+        space: cherenkov::BlendSpace,
         stack: &mut [Vec<[f32; 4]>],
     ) {
         let dst = top(&mut *self.fb, stack);
         for (i, &src) in scratch.iter().enumerate() {
             let s = src.map(|v| v * opacity);
-            dst[i] = if mode == cherenkov::BlendMode::Normal {
+            dst[i] = if mode == cherenkov::BlendMode::Normal && space == cherenkov::BlendSpace::Linear {
                 if s[3] == 0.0 {
                     continue;
                 }
                 src_over(dst[i], s)
             } else {
-                blend(mode, dst[i], s)
+                in_space(mode, space, dst[i], s)
             };
         }
     }

@@ -8,11 +8,13 @@ use crate::color::WorkingColor;
 /// A shadow cast by a shape.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Shadow {
-    /// Standard deviation of the Gaussian blur, in the shape's units.
+    /// Standard deviation of the Gaussian blur, in device pixels.
     pub sigma: f64,
     /// Offset of the shadow from the shape.
     pub offset: Vec2,
-    /// How far the shape grows (positive) or shrinks (negative) before blurring.
+    /// Round contour spread in shape units before blurring: union the fill
+    /// with a band of this radius for positive values, subtract it for negative
+    /// values. All authored contours participate, including internal contours.
     pub spread: f64,
     /// Colour of the shadow.
     pub color: WorkingColor,
@@ -114,7 +116,9 @@ pub enum BlendSpace {
     /// The linear working space.
     #[default]
     Linear,
-    /// sRGB-encoded values, for web compatibility.
+    /// sRGB-encoded primaries and transfer curve for the group's final blend
+    /// and compositing operation. The isolated content remains linear P3.
+    /// Conversion preserves alpha and extended-range channels.
     SrgbEncoded,
 }
 

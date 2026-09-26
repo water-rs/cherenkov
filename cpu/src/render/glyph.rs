@@ -4,12 +4,10 @@
 //! The glyph mask cache and mask rasterization.
 
 use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::sync::{Arc, OnceLock};
 
-use cherenkov::GlyphRun;
-use cherenkov::kurbo::{Affine, PathEl, Point, Vec2};
+use cherenkov::{GlyphRun, GlyphStyle};
+use cherenkov::kurbo::{Affine, Vec2};
 use skrifa::MetadataProvider;
 use skrifa::outline::{DrawSettings, OutlinePen};
 use skrifa::raw::TableProvider;
@@ -21,7 +19,7 @@ use crate::render::lower::GlyphReq;
 use crate::render::raster::Edge;
 
 /// A glyph cache key.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct GlyphKey {
     /// The engine font id.
     font: u64,
@@ -33,8 +31,10 @@ pub struct GlyphKey {
     subpixel: [u32; 2],
     /// f32 bits of the device transform's 2x2.
     matrix: [u32; 4],
-    /// Hash of the run's variation coordinates.
-    coords_hash: u64,
+    /// Full variation coordinates; hash collisions cannot alias outlines.
+    coords: Arc<[i16]>,
+    /// Full stroke parameters in exact-bit form, or empty for a fill.
+    stroke: Vec<u64>,
 }
 
 /// A rasterized coverage mask: `w * h` cells anchored at `left`/`top`
@@ -117,7 +117,7 @@ impl GlyphCache {
         &mut self,
         masks: Vec<(GlyphKey, Arc<GlyphMask>)>,
     ) -> Result<(), RenderError> {
-        let batch: u64 = masks.iter().map(|(_, m)| mask_bytes(m)).sum();
+        let batch: u64 = masks.iter().map(|(key, mask)| key_bytes(key) + mask_bytes(mask)).sum();
         if batch > self.budget {
             return Err(RenderError::GlyphCacheExhausted);
         }
@@ -126,33 +126,33 @@ impl GlyphCache {
             let mut oldest_first: Vec<(u64, GlyphKey)> = self
                 .map
                 .iter()
-                .map(|(key, entry)| (entry.used, *key))
+                .map(|(key, entry)| (entry.used, key.clone()))
                 .collect();
             oldest_first.sort_unstable_by_key(|(used, _)| *used);
             for (_, key) in oldest_first {
                 if self.bytes + batch <= self.budget {
                     break;
                 }
-                if let Some(entry) = self.map.remove(&key) {
-                    self.bytes -= mask_bytes(&entry.mask);
+                if let Some((stored_key, entry)) = self.map.remove_entry(&key) {
+                    self.bytes -= key_bytes(&stored_key) + mask_bytes(&entry.mask);
                 }
             }
         }
         for (key, mask) in masks {
             self.tick += 1;
-            self.bytes += mask_bytes(&mask);
-            if let Some(previous) = self.map.insert(
-                key,
-                CacheEntry {
-                    mask,
-                    used: self.tick,
-                },
-            ) {
-                self.bytes -= mask_bytes(&previous.mask);
+            if let Some((old_key, previous)) = self.map.remove_entry(&key) {
+                self.bytes -= key_bytes(&old_key) + mask_bytes(&previous.mask);
             }
+            self.bytes += key_bytes(&key) + mask_bytes(&mask);
+            self.map.insert(key, CacheEntry { mask, used: self.tick });
         }
         Ok(())
     }
+}
+
+fn key_bytes(key: &GlyphKey) -> u64 {
+    u64::try_from(size_of_val(&*key.coords) + key.stroke.capacity() * size_of::<u64>())
+        .expect("glyph key allocation fits u64")
 }
 
 fn mask_bytes(mask: &GlyphMask) -> u64 {
@@ -165,9 +165,14 @@ fn mask_bytes(mask: &GlyphMask) -> u64 {
     clippy::cast_possible_truncation,
     reason = "the stored linear transform uses the same f32 precision as glyph rasterization"
 )]
-pub fn glyph_key(run: &GlyphRun, glyph: u32, subpixel: (f32, f32), transform: Affine) -> GlyphKey {
-    let mut hasher = DefaultHasher::new();
-    run.coords.hash(&mut hasher);
+pub fn glyph_key(run: &GlyphRun, coords: &Arc<[i16]>, glyph: u32, subpixel: (f32, f32), transform: Affine) -> GlyphKey {
+    let mut stroke_key = Vec::new();
+    if let GlyphStyle::Stroke(stroke) = &run.style {
+        stroke_key.extend([stroke.width.to_bits(), stroke.miter_limit.to_bits(),
+            stroke.dash_offset.to_bits(), stroke.join as u64,
+            stroke.start_cap as u64, stroke.end_cap as u64]);
+        stroke_key.extend(stroke.dash_pattern.iter().map(|value| value.to_bits()));
+    }
     let [a, b, c, d, ..] = transform.as_coeffs();
     GlyphKey {
         font: run.font.raw(),
@@ -180,7 +185,8 @@ pub fn glyph_key(run: &GlyphRun, glyph: u32, subpixel: (f32, f32), transform: Af
             (c as f32).to_bits(),
             (d as f32).to_bits(),
         ],
-        coords_hash: hasher.finish(),
+        coords: Arc::clone(coords),
+        stroke: stroke_key,
     }
 }
 
@@ -233,19 +239,8 @@ fn empty() -> GlyphMask {
 /// Rasterizes one glyph's coverage mask, like the GPU's
 /// `glyph::rasterize`: the outline is drawn at `Size::unscaled` in font
 /// units, y flipped, scaled by `size / upem`, transformed by the run's
-/// 2x2, offset by the glyph's subpixel offset, and flattened to 0.05
+/// 2x2, offset by the glyph's subpixel offset, and flattened to 0.02
 /// device px before exact-area accumulation over the glyph's own bbox.
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_precision_loss,
-    clippy::many_single_char_names,
-    reason = "glyph mask coordinates are small; a/b/c/d/m are affine names"
-)]
-#[expect(
-    clippy::too_many_lines,
-    reason = "outline walk plus mask accumulation is one pass"
-)]
 pub fn rasterize_mask(
     font: &crate::render::FontData,
     req: &GlyphReq,
@@ -257,9 +252,8 @@ pub fn rasterize_mask(
         .map_err(|e| RenderError::Font(format!("head: {e}")))?
         .units_per_em();
     let outlines = font_ref.outline_glyphs();
-    let Some(outline) = outlines.get(skrifa::GlyphId::new(req.glyph_id)) else {
-        return Ok(empty());
-    };
+    let outline = outlines.get(skrifa::GlyphId::new(req.glyph_id))
+        .ok_or_else(|| RenderError::Font(format!("missing outline for glyph {}", req.glyph_id)))?;
     let location: Vec<F2Dot14> = req.coords.iter().map(|c| F2Dot14::from_bits(*c)).collect();
     let mut pen = PathPen {
         path: kurbo::BezPath::new(),
@@ -268,61 +262,43 @@ pub fn rasterize_mask(
         skrifa::instance::Size::unscaled(),
         skrifa::instance::LocationRef::new(&location),
     );
-    if outline.draw(settings, &mut pen).is_err() || pen.path.is_empty() {
+    outline.draw(settings, &mut pen).map_err(|error| RenderError::Font(error.to_string()))?;
+    if pen.path.is_empty() {
         return Ok(empty());
     }
-    // Font units to device pixels: y flips, scale is size per em, then
-    // the run's transform's linear part.
+    // Stroke width, caps and dashes are in run units, before the glyph's
+    // local transform. Flatten only after the complete device transform.
     let scale = f64::from(req.size) / f64::from(upem);
     let [a, b, c, d] = req.matrix;
-    let m = Affine::new([
-        f64::from(a),
-        f64::from(b),
-        f64::from(c),
-        f64::from(d),
-        0.0,
-        0.0,
-    ]) * Affine::scale_non_uniform(scale, -scale);
-    let (fx, fy) = req.subpixel;
-    let offset = Vec2::new(f64::from(fx), f64::from(fy));
-    let mut edges: Vec<Edge> = Vec::new();
-    let mut bbox = kurbo::Rect::new(f64::MAX, f64::MAX, f64::MIN, f64::MIN);
-    let mut last = Point::ORIGIN;
-    let mut start = Point::ORIGIN;
-    let mut line = |p0: Point, p1: Point| {
-        if p0 == p1 {
-            return;
-        }
-        let a = m * p0 + offset;
-        let b = m * p1 + offset;
-        bbox = bbox.union_pt(a).union_pt(b);
-        edges.push(Edge {
-            x0: a.x as f32,
-            y0: a.y as f32,
-            x1: b.x as f32,
-            y1: b.y as f32,
-        });
+    let linear = Affine::new([
+        f64::from(a), f64::from(b), f64::from(c), f64::from(d), 0.0, 0.0,
+    ]);
+    let path = Affine::scale_non_uniform(scale, -scale) * pen.path;
+    let path = match &req.style {
+        GlyphStyle::Fill => path,
+        GlyphStyle::Stroke(stroke) => kurbo::stroke(path, stroke, &kurbo::StrokeOpts::default(),
+            0.02 / super::lower::sigma_max(linear).max(1e-12)),
     };
-    // Every subpath is closed: an open contour is closed implicitly.
-    kurbo::flatten(&pen.path, 0.05 / scale.max(1e-6), |el| match el {
-        PathEl::MoveTo(p) => {
-            line(last, start);
-            start = p;
-            last = p;
-        }
-        PathEl::LineTo(p) => {
-            line(last, p);
-            last = p;
-        }
-        PathEl::QuadTo(..) | PathEl::CurveTo(..) => unreachable!("flatten emits lines"),
-        PathEl::ClosePath => {
-            line(last, start);
-            last = start;
-        }
-    });
-    line(last, start);
+    let offset = Vec2::new(f64::from(req.subpixel.0), f64::from(req.subpixel.1));
+    let edges = super::lower::flatten_edges(Affine::translate(offset) * linear * path, 0.02);
+    Ok(mask_from_edges(edges))
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    reason = "glyph mask bounds fit device pixel indices and f32 geometry"
+)]
+fn mask_from_edges(edges: Vec<Edge>) -> GlyphMask {
+    let bbox = edges.iter().fold(
+        kurbo::Rect::new(f64::MAX, f64::MAX, f64::MIN, f64::MIN),
+        |bounds, edge| bounds
+            .union_pt(kurbo::Point::new(f64::from(edge.x0), f64::from(edge.y0)))
+            .union_pt(kurbo::Point::new(f64::from(edge.x1), f64::from(edge.y1))),
+    );
     if edges.is_empty() || bbox.width() <= 0.0 || bbox.height() <= 0.0 {
-        return Ok(empty());
+        return empty();
     }
     let left = bbox.x0.floor() as i32 - 1;
     let top = bbox.y0.floor() as i32 - 1;
@@ -332,11 +308,11 @@ pub fn rasterize_mask(
     // Keep the outline at its original precision for clipped instances.
     let local: Arc<[Edge]> = edges
         .iter()
-        .map(|e| Edge {
-            x0: e.x0 - left as f32,
-            y0: e.y0 - top as f32,
-            x1: e.x1 - left as f32,
-            y1: e.y1 - top as f32,
+        .map(|edge| Edge {
+            x0: edge.x0 - left as f32,
+            y0: edge.y0 - top as f32,
+            x1: edge.x1 - left as f32,
+            y1: edge.y1 - top as f32,
         })
         .collect();
     let coverage = rasterize(
@@ -355,14 +331,14 @@ pub fn rasterize_mask(
             }
         }
     }
-    Ok(GlyphMask {
+    GlyphMask {
         left,
         top,
         w: w as u32,
         h: h as u32,
         edges: edges.into(),
         cov,
-    })
+    }
 }
 
 #[cfg(test)]
@@ -376,7 +352,8 @@ mod tests {
             size_bits: 0,
             subpixel: [0; 2],
             matrix: [0; 4],
-            coords_hash: 0,
+            coords: Arc::from([]),
+            stroke: Vec::new(),
         }
     }
 
@@ -390,6 +367,25 @@ mod tests {
             edges: Arc::from(Vec::new()),
             cov: vec![0.0; bytes / 4],
         })
+    }
+
+    #[test]
+    fn mask_identity_retains_stroke_details_and_variations() {
+        let mut run = GlyphRun {
+            font: cherenkov::FontId::new(1), size: 24.0, coords: Vec::new(),
+            glyphs: Vec::new(), style: GlyphStyle::Stroke(kurbo::Stroke::new(2.0)),
+        };
+        let coords = Arc::from([]);
+        let original = glyph_key(&run, &coords, 36, (0.25, 0.5), Affine::IDENTITY);
+        for stroke in [kurbo::Stroke::new(2.0).with_join(kurbo::Join::Round),
+            kurbo::Stroke::new(2.0).with_caps(kurbo::Cap::Round),
+            kurbo::Stroke::new(2.0).with_miter_limit(8.0),
+            kurbo::Stroke::new(2.0).with_dashes(0.25, [1.0, 2.0])] {
+            run.style = GlyphStyle::Stroke(stroke);
+            assert_ne!(original, glyph_key(&run, &coords, 36, (0.25, 0.5), Affine::IDENTITY));
+        }
+        run.style = GlyphStyle::Stroke(kurbo::Stroke::new(2.0));
+        assert_ne!(original, glyph_key(&run, &Arc::from([1_i16]), 36, (0.25, 0.5), Affine::IDENTITY));
     }
 
     #[test]

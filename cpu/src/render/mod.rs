@@ -8,8 +8,12 @@ mod colr;
 mod coverage;
 mod glyph;
 mod lower;
+mod mesh;
 mod paint;
 mod raster;
+
+#[cfg(test)]
+mod shadow_tests;
 
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender};
@@ -127,6 +131,7 @@ const fn node() -> LayerNode {
         transform: kurbo::Affine::IDENTITY,
         opacity: 1.0,
         blend: cherenkov::BlendMode::Normal,
+        blend_space: cherenkov::BlendSpace::Linear,
         clip: None,
         content: None,
         children: Vec::new(),
@@ -313,6 +318,11 @@ impl Renderer {
                 LayerOp::Blend(id, b) => {
                     if let Some(node) = state.layers.get_mut(&id) {
                         node.blend = b;
+                    }
+                }
+                LayerOp::BlendSpace(id, space) => {
+                    if let Some(node) = state.layers.get_mut(&id) {
+                        node.blend_space = space;
                     }
                 }
                 LayerOp::Opacity(id, o) => {
@@ -602,10 +612,11 @@ impl Renderer {
     fn resolve_glyphs(&mut self, reqs: &[lower::GlyphReq]) -> Result<(), RenderError> {
         use rayon::prelude::*;
         let mut missing = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         for req in reqs {
             if let Some(mask) = self.glyph_cache.get(&req.key) {
                 let _ = req.slot.set(mask);
-            } else {
+            } else if seen.insert(&req.key) {
                 missing.push(req);
             }
         }
@@ -624,11 +635,17 @@ impl Renderer {
                         })?;
                         let mask = std::sync::Arc::new(glyph::rasterize_mask(font, req)?);
                         let _ = req.slot.set(mask.clone());
-                        Ok((req.key, mask))
+                        Ok((req.key.clone(), mask))
                     })
                     .collect::<Result<Vec<_>, RenderError>>()
             })?;
         self.glyph_cache.insert_batch(masks)?;
+        for req in reqs {
+            if req.slot.get().is_none() {
+                let mask = self.glyph_cache.get(&req.key).expect("batch retained its masks");
+                let _ = req.slot.set(mask);
+            }
+        }
         Ok(())
     }
 

@@ -4,10 +4,10 @@
 //! Raster smoke tests: exact-area coverage, readback formats, fill rules,
 //! transform and group isolation.
 
-use cherenkov::kurbo::{Affine, BezPath, Line, Point, Rect};
+use cherenkov::kurbo::{Affine, BezPath, Line, Rect};
 use cherenkov::{
-    BlendSpace, Draw, EvenOdd, Extend, Glyph, GlyphRun, GlyphStyle, Group, Interpolation,
-    LinearGradient, MeshGradient, Paint, RadialGradient, Shadow, SweepGradient, WorkingColor,
+    Draw, EvenOdd, Extend, Glyph, GlyphRun, Group, Interpolation,
+    LinearGradient, Paint, RadialGradient, Shadow, SweepGradient, WorkingColor,
     kurbo::Stroke,
 };
 use cherenkov_cpu::{
@@ -328,8 +328,7 @@ fn a_zero_sigma_shadow_covers_the_rect() {
         );
     });
     let area: f64 = px.iter().map(|p| f64::from(p[3])).sum();
-    // sigma_eff = sqrt(1/6) slightly leaks past 400 px²; within 2%.
-    assert!((area - 400.0).abs() < 8.0, "shadow area {area}");
+    assert!((area - 400.0).abs() < 1e-6, "shadow area {area}");
     let centre = px[32 * 64 + 32];
     assert!((centre[3] - 1.0).abs() < 1e-2, "centre alpha: {centre:?}");
 }
@@ -365,69 +364,6 @@ fn a_glyph_run_renders_and_the_second_frame_hits_the_cache() {
         cached.0,
         "cache hit"
     );
-}
-
-#[test]
-fn unsupported_features_report_their_names() {
-    let engine = engine();
-    let surface = engine
-        .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF32))
-        .expect("surface");
-    let mesh = cherenkov::MeshGradient::new(
-        1,
-        1,
-        vec![
-            cherenkov::kurbo::Point::new(0.0, 0.0),
-            cherenkov::kurbo::Point::new(64.0, 0.0),
-            cherenkov::kurbo::Point::new(0.0, 64.0),
-            cherenkov::kurbo::Point::new(64.0, 64.0),
-        ],
-        vec![RED; 4],
-    );
-    surface
-        .update(|tx| {
-            tx[surface.root()].content(surface.record(|c| {
-                c.fill(Rect::new(0.0, 0.0, 64.0, 64.0), Paint::from(mesh));
-            }));
-        })
-        .expect("update");
-    let e = engine
-        .render(FrameTime::now())
-        .expect_err("mesh unsupported");
-    let msg = format!("{e}");
-    assert!(msg.contains("mesh-gradient"), "unsupported message: {msg}");
-    // Per-glyph transforms are unsupported (a fresh engine, so the
-    // failed mesh frame above cannot shadow this error).
-    let engine2 = Engine::<Raster>::new(RasterConfig::default()).expect("engine");
-    let data = std::fs::read("../scenes/fonts/NotoSans.ttf").expect("test font");
-    let font = engine2
-        .font(cherenkov_cpu::FontSource::bytes(data))
-        .expect("font");
-    let run = GlyphRun {
-        font: font.id(),
-        size: 32.0,
-        coords: Vec::new(),
-        glyphs: vec![Glyph {
-            id: 36,
-            x: 8.0,
-            y: 40.0,
-            transform: Some(Affine::rotate(0.5)),
-        }],
-        style: cherenkov::GlyphStyle::Fill,
-    };
-    let surface2 = engine2
-        .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF32))
-        .expect("surface");
-    surface2
-        .update(|tx| {
-            tx[surface2.root()].content(surface2.record(|c| c.glyphs(&run, RED)));
-        })
-        .expect("update");
-    let e = engine2
-        .render(FrameTime::now())
-        .expect_err("glyph transform unsupported");
-    let msg = format!("{e}");
-    assert!(msg.contains("glyph"), "glyph transform message: {msg}");
 }
 
 #[test]
@@ -775,21 +711,6 @@ fn expect_unsupported_on(
 #[test]
 fn every_unsupported_variant_reports_an_error() {
     let rect = || Rect::new(8.0, 8.0, 40.0, 40.0);
-    let mesh = MeshGradient::new(
-        1,
-        1,
-        vec![
-            Point::new(0.0, 0.0),
-            Point::new(64.0, 0.0),
-            Point::new(0.0, 64.0),
-            Point::new(64.0, 64.0),
-        ],
-        vec![RED; 4],
-    );
-    assert!(matches!(
-        expect_unsupported_on(&engine(), |c| c.fill(rect(), Paint::from(mesh))),
-        RenderError::Unsupported(Unsupported::Mesh)
-    ));
     // `ShaderId`/`FilterId` are opaque handles with no public constructor;
     // deserialize them to stand in for a GPU engine's registration.
     let shader: Paint = serde_json::from_value(serde_json::json!({
@@ -807,52 +728,6 @@ fn every_unsupported_variant_reports_an_error() {
             c.group(Group::new().filter(filter), |c| c.fill(rect(), RED));
         }),
         RenderError::Unsupported(Unsupported::Filter)
-    ));
-    assert!(matches!(
-        expect_unsupported_on(&engine(), |c| {
-            c.group(Group::new().blend_space(BlendSpace::SrgbEncoded), |c| {
-                c.fill(rect(), RED);
-            });
-        }),
-        RenderError::Unsupported(Unsupported::BlendSpace)
-    ));
-    // Shadows exist only for rounded boxes: a general path is unsupported.
-    let mut tri = BezPath::new();
-    tri.move_to((32.0, 8.0));
-    tri.line_to((56.0, 56.0));
-    tri.line_to((8.0, 56.0));
-    tri.close_path();
-    assert!(matches!(
-        expect_unsupported_on(&engine(), |c| c.shadow(tri, Shadow::new(1.0, RED))),
-        RenderError::Unsupported(Unsupported::Shadow)
-    ));
-    // Glyph runs need a registered font on their engine.
-    let engine = engine();
-    let data = std::fs::read("../scenes/fonts/NotoSans.ttf").expect("test font");
-    let font = engine
-        .font(cherenkov_cpu::FontSource::bytes(data))
-        .expect("font");
-    let run = |style: GlyphStyle, transform: Option<Affine>| GlyphRun {
-        font: font.id(),
-        size: 32.0,
-        coords: Vec::new(),
-        glyphs: vec![Glyph {
-            id: 36,
-            x: 8.0,
-            y: 40.0,
-            transform,
-        }],
-        style,
-    };
-    assert!(matches!(
-        expect_unsupported_on(&engine, |c| c
-            .glyphs(&run(GlyphStyle::Stroke(Stroke::new(1.0)), None), RED,)),
-        RenderError::Unsupported(Unsupported::GlyphStroke)
-    ));
-    assert!(matches!(
-        expect_unsupported_on(&engine, |c| c
-            .glyphs(&run(GlyphStyle::Fill, Some(Affine::rotate(0.5))), RED,)),
-        RenderError::Unsupported(Unsupported::GlyphTransform)
     ));
 }
 

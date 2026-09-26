@@ -223,6 +223,8 @@ pub enum EditOp {
     Transform(Affine),
     Opacity(f32),
     Blend(cherenkov::BlendMode),
+    /// Set the compositing space.
+    BlendSpace(cherenkov::BlendSpace),
     Clip(Option<ShapeData>),
     Content(LayerContent),
     Push(LayerId),
@@ -246,6 +248,12 @@ impl LayerEdit {
     /// Sets the blend mode.
     pub fn blend(&mut self, blend: cherenkov::BlendMode) -> &mut Self {
         self.ops.push(EditOp::Blend(blend));
+        self
+    }
+
+    /// Sets the space in which this layer composites onto its parent.
+    pub fn blend_space(&mut self, space: cherenkov::BlendSpace) -> &mut Self {
+        self.ops.push(EditOp::BlendSpace(space));
         self
     }
 
@@ -431,6 +439,7 @@ impl Surface {
                         EditOp::Transform(t) => ops.push(LayerOp::Transform(id, t)),
                         EditOp::Opacity(o) => ops.push(LayerOp::Opacity(id, o)),
                         EditOp::Blend(b) => ops.push(LayerOp::Blend(id, b)),
+                        EditOp::BlendSpace(space) => ops.push(LayerOp::BlendSpace(id, space)),
                         EditOp::Clip(shape) => ops.push(LayerOp::Clip(id, shape)),
                         EditOp::Content(LayerContent::Content(content)) => {
                             shared.contents.insert(id, content);

@@ -391,6 +391,7 @@ dependencies = [
 name = "cherenkov-oracle"
 version = "0.0.0"
 dependencies = [
+ "cherenkov",
  "cherenkov-scene",
  "kurbo",
  "libm",

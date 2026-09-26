@@ -11,6 +11,35 @@ use cherenkov::FillRule;
 
 use super::raster::Edge;
 
+/// Boolean operation on the first two operands; remaining operands are clips.
+#[derive(Clone, Copy)]
+pub enum Combine {
+    /// Intersect every operand.
+    Intersection,
+    /// Union the caster and its contour spread band, then intersect clips.
+    Union,
+    /// Remove the contour spread band from the caster, then intersect clips.
+    Difference,
+}
+
+impl Combine {
+    fn inside(self, outside: usize, winding: &[i32], rules: &[FillRule]) -> bool {
+        match self {
+            Self::Intersection => outside == 0,
+            Self::Union | Self::Difference => {
+                let first = inside(winding[0], rules[0]);
+                let second = inside(winding[1], rules[1]);
+                let clips_inside = outside == usize::from(!first) + usize::from(!second);
+                clips_inside && if matches!(self, Self::Union) {
+                    first || second
+                } else {
+                    first && !second
+                }
+            }
+        }
+    }
+}
+
 /// One operand of a geometric intersection.
 #[derive(Clone, Debug)]
 pub struct Operand {
@@ -54,6 +83,11 @@ pub struct Coverage {
 }
 
 impl Coverage {
+    /// Whether the field has any covered pixels.
+    pub const fn is_empty(&self) -> bool {
+        self.spans.is_empty()
+    }
+
     /// Runs for a device-space row; rows outside the geometry are empty.
     pub fn row(&self, y: usize) -> &[Span] {
         y.checked_sub(self.top)
@@ -318,7 +352,7 @@ impl RowScratch {
 
     /// Resolve one x-connected group. The baseline winding is constant in y:
     /// no boundary intersects the vertical gap separating it from its neighbour.
-    fn group(&mut self, lines: &[Line], baseline: &[i32], rules: &[FillRule], w: usize) {
+    fn group(&mut self, lines: &[Line], baseline: &[i32], rules: &[FillRule], w: usize, combine: Combine) {
         self.bounds.clear();
         for line in lines {
             self.bounds.extend([line.top, line.bottom]);
@@ -366,12 +400,12 @@ impl RowScratch {
                 .count();
             for crossing in 0..self.order.len() {
                 let line = lines[self.order[crossing]];
-                let was_inside = outside == 0;
+                let was_inside = combine.inside(outside, &self.winding, rules);
                 let wind = &mut self.winding[line.operand];
                 outside -= usize::from(!inside(*wind, rules[line.operand]));
                 *wind += line.dir;
                 outside += usize::from(!inside(*wind, rules[line.operand]));
-                let is_inside = outside == 0;
+                let is_inside = combine.inside(outside, &self.winding, rules);
                 if was_inside != is_inside {
                     let sign = if is_inside { 1.0 } else { -1.0 };
                     self.boundary(line.at(top), line.at(bottom), sign * (bottom - top), w);
@@ -464,6 +498,11 @@ fn row_lines(operands: &[Operand], top: usize, bottom: usize) -> Vec<Vec<Line>> 
     rows
 }
 
+/// Exact area of the intersection of every operand.
+pub fn rasterize(operands: &[Operand], w: usize, h: usize) -> Coverage {
+    rasterize_combined(operands, w, h, Combine::Intersection)
+}
+
 /// Exact area of the intersection, relative to the supplied flattened edges.
 /// Endpoint and crossing events resolve winding *before* integrating area.
 #[expect(
@@ -472,14 +511,14 @@ fn row_lines(operands: &[Operand], top: usize, bottom: usize) -> Vec<Vec<Line>> 
     clippy::cast_sign_loss,
     reason = "surface-clamped row indices and f32 input coordinates fit exactly in f64"
 )]
-pub fn rasterize(operands: &[Operand], w: usize, h: usize) -> Coverage {
+pub fn rasterize_combined(operands: &[Operand], w: usize, h: usize, combine: Combine) -> Coverage {
     if operands.is_empty() || w == 0 || h == 0 {
         return Coverage::default();
     }
     // Intersect operand y extents before allocating row buckets.
     let mut top = 0;
     let mut bottom = h;
-    for operand in operands {
+    for operand in operands.iter().filter(|_| matches!(combine, Combine::Intersection)) {
         let lo = operand
             .edges
             .iter()
@@ -516,7 +555,7 @@ pub fn rasterize(operands: &[Operand], w: usize, h: usize) -> Coverage {
                 right = right.max(lines[end].right);
                 end += 1;
             }
-            scratch.group(&lines[first..end], &baseline, &rules, w);
+            scratch.group(&lines[first..end], &baseline, &rules, w, combine);
             let middle = (top + row) as f64 + 0.5;
             for line in &lines[first..end] {
                 if line.top <= middle && line.bottom > middle {
@@ -526,6 +565,15 @@ pub fn rasterize(operands: &[Operand], w: usize, h: usize) -> Coverage {
             first = end;
         }
         scratch.finish(&mut result, w);
+    }
+    if let Some(first) = result.rows.iter().position(|row| !row.is_empty()) {
+        let last = result.rows.iter().rposition(|row| !row.is_empty()).expect("nonempty field");
+        result.rows.truncate(last + 1);
+        drop(result.rows.drain(..first));
+        result.top += first;
+    } else {
+        result.rows.clear();
+        result.top = 0;
     }
     result
 }
@@ -587,6 +635,22 @@ mod tests {
                 i % w,
                 i / w
             );
+        }
+    }
+
+    #[test]
+    fn spread_predicates_resolve_partial_pixels_before_integration() {
+        let lower = polygon(&[(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)], FillRule::NonZero);
+        let upper = polygon(&[(0.0, 1.0), (1.0, 0.0), (1.0, 1.0)], FillRule::NonZero);
+        for (second, union, difference) in [(lower.clone(), 0.5, 0.0), (upper, 1.0, 0.5)] {
+            let operands = [lower.clone(), second];
+            let merged = rasterize_combined(&operands, 1, 1, Combine::Union);
+            let cut = rasterize_combined(&operands, 1, 1, Combine::Difference);
+            assert!((merged.at(0, 0) - union).abs() < 1e-7);
+            assert!((cut.at(0, 0) - difference).abs() < 1e-7);
+            let clipped = rasterize_combined(&[operands[0].clone(), operands[1].clone(), lower.clone()],
+                1, 1, Combine::Union);
+            assert!((clipped.at(0, 0) - 0.5).abs() < 1e-7);
         }
     }
 

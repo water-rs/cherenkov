@@ -175,13 +175,11 @@ const fn missing_api(f: &Feature) -> Option<&'static str> {
 /// The scene [`Feature`] a render-time [`Unsupported`] maps back to.
 const fn unsupported_feature(u: Unsupported) -> Feature {
     match u {
-        Unsupported::Mesh | Unsupported::Shader => Feature::Image,
-        Unsupported::BlendSpace => Feature::Blend(BlendMode::Normal),
+        Unsupported::Shader => Feature::Image,
         Unsupported::Filter => Feature::Opacity,
-        Unsupported::GlyphStroke | Unsupported::GlyphTransform | Unsupported::ColorFont => {
+        Unsupported::ColorFont => {
             Feature::Glyphs
         }
-        Unsupported::Shadow => Feature::Shadow,
         _ => Feature::Fill,
     }
 }

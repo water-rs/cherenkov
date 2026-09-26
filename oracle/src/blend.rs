@@ -196,3 +196,67 @@ pub fn src_over(dst: [f64; 4], src: [f64; 4]) -> [f64; 4] {
         dst[3].mul_add(1.0 - src[3], src[3]),
     ]
 }
+
+/// Composite an isolated group in its selected space. Inputs and output are
+/// premultiplied linear P3. For encoded sRGB, unpremultiply, convert primaries,
+/// encode with the signed sRGB curve, and premultiply before applying BOTH
+/// the blend function and Porter-Duff operation. Decode the result back to
+/// linear P3 afterward. Alpha is never encoded; extended channels are never
+/// clamped. Group opacity has already multiplied all source components.
+#[must_use]
+pub fn in_space(
+    mode: BlendMode,
+    space: cherenkov::BlendSpace,
+    backdrop: [f64; 4],
+    source: [f64; 4],
+) -> [f64; 4] {
+    use crate::color::{linear_p3_to_linear_srgb, linear_srgb_to_linear_p3, srgb_decode, srgb_encode};
+    if space == cherenkov::BlendSpace::Linear {
+        return blend(mode, backdrop, source);
+    }
+    let encode = |pixel: [f64; 4]| {
+        let alpha = pixel[3];
+        if alpha == 0.0 {
+            return [0.0; 4];
+        }
+        let straight = [pixel[0] / alpha, pixel[1] / alpha, pixel[2] / alpha];
+        let encoded = linear_p3_to_linear_srgb(straight).map(srgb_encode);
+        [encoded[0] * alpha, encoded[1] * alpha, encoded[2] * alpha, alpha]
+    };
+    let mixed = blend(mode, encode(backdrop), encode(source));
+    let alpha = mixed[3];
+    if alpha == 0.0 {
+        return [0.0; 4];
+    }
+    let linear = [mixed[0] / alpha, mixed[1] / alpha, mixed[2] / alpha].map(srgb_decode);
+    let working = linear_srgb_to_linear_p3(linear);
+    [working[0] * alpha, working[1] * alpha, working[2] * alpha, alpha]
+}
+
+#[cfg(test)]
+mod space_tests {
+    use super::*;
+    use cherenkov::BlendSpace;
+
+    #[test]
+    fn encoded_source_over_is_encoded_before_compositing() {
+        let actual = in_space(BlendMode::Normal, BlendSpace::SrgbEncoded,
+            [0.0, 0.0, 0.0, 1.0], [0.5; 4]);
+        let midpoint = crate::color::srgb_decode(0.5);
+        for value in &actual[..3] {
+            assert!((value - midpoint).abs() < 1e-12);
+        }
+        assert!((actual[3] - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn encoded_round_trip_retains_negative_hdr_and_alpha() {
+        let source = [-0.25, 1.5, 0.125, 0.5];
+        let actual = in_space(BlendMode::Src, BlendSpace::SrgbEncoded, [0.0; 4], source);
+        for (value, expected) in actual.into_iter().zip(source) {
+            assert!((value - expected).abs() < 1e-12);
+        }
+        assert!(in_space(BlendMode::Clear, BlendSpace::SrgbEncoded, source, source)
+            .iter().all(|v| v.abs() < 1e-12));
+    }
+}

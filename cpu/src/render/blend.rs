@@ -202,6 +202,15 @@ pub fn src_over(dst: [f32; 4], src: [f32; 4]) -> [f32; 4] {
     ]
 }
 
+/// Resolve a group in its selected compositing space and return linear P3.
+pub fn in_space(mode: BlendMode, space: cherenkov::BlendSpace, backdrop: [f32; 4], source: [f32; 4]) -> [f32; 4] {
+    use super::paint::convert_pixel;
+    if space == cherenkov::BlendSpace::Linear {
+        return blend(mode, backdrop, source);
+    }
+    convert_pixel(blend(mode, convert_pixel(backdrop, true), convert_pixel(source, true)), false)
+}
+
 #[cfg(test)]
 mod tests {
     use cherenkov_scene::BlendMode as SceneBlend;
@@ -279,7 +288,7 @@ mod tests {
         let mut seed = 0x9e37_79b9_u32;
         let mut next = move || {
             seed = seed.wrapping_mul(747_796_405).wrapping_add(2_891_336_453);
-            f32::from_bits(seed >> 24 | 0x3f80_0000) - 1.0 // [0,1) float
+            f32::from_bits(seed >> 9 | 0x3f80_0000) - 1.0 // [0,1) float
         };
         let mut cases = Vec::new();
         for i in 0..50u32 {
@@ -291,17 +300,15 @@ mod tests {
         }
         for mode in modes {
             for (cb, cs) in &cases {
-                let got = blend(mode, *cb, *cs);
-                let want = cherenkov_oracle::blend::blend(
-                    scene_mode(mode),
-                    cb.map(f64::from),
-                    cs.map(f64::from),
-                );
-                for c in 0..4 {
-                    assert!(
-                        (f64::from(got[c]) - want[c]).abs() < 1e-5,
-                        "{mode:?} {cb:?} {cs:?}: got {got:?} want {want:?}"
-                    );
+                for space in [cherenkov::BlendSpace::Linear, cherenkov::BlendSpace::SrgbEncoded] {
+                    let got = in_space(mode, space, *cb, *cs);
+                    let want = cherenkov_oracle::blend::in_space(
+                        scene_mode(mode), space, cb.map(f64::from), cs.map(f64::from));
+                    let tolerance = if space == cherenkov::BlendSpace::Linear { 1e-5 } else { 2e-5 };
+                    for channel in 0..4 {
+                        assert!((f64::from(got[channel]) - want[channel]).abs() < tolerance,
+                            "{mode:?} {space:?} {cb:?} {cs:?}: got {got:?} want {want:?}");
+                    }
                 }
             }
         }

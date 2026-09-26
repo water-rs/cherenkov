@@ -52,6 +52,21 @@ fn srgb_decode(x: f32) -> f32 {
     d.copysign(x)
 }
 
+/// Convert a premultiplied pixel between linear P3 and encoded sRGB.
+pub(super) fn convert_pixel(pixel: [f32; 4], encode: bool) -> [f32; 4] {
+    let alpha = pixel[3];
+    if alpha == 0.0 {
+        return [0.0; 4];
+    }
+    let straight = [pixel[0] / alpha, pixel[1] / alpha, pixel[2] / alpha];
+    let converted = if encode {
+        mat3(&P3_TO_SRGB, straight).map(srgb_encode)
+    } else {
+        mat3(&SRGB_TO_P3, straight.map(srgb_decode))
+    };
+    [converted[0] * alpha, converted[1] * alpha, converted[2] * alpha, alpha]
+}
+
 /// A gradient stop in interpolation-space straight-alpha components.
 #[derive(Clone, Copy, Debug)]
 pub struct Stop {
@@ -65,6 +80,8 @@ pub struct Stop {
 /// parameters the evaluator needs.
 #[derive(Clone, Debug)]
 pub enum PaintData {
+    /// Bilinear mesh paint.
+    Mesh(super::mesh::Mesh),
     /// Premultiplied solid colour.
     Solid([f32; 4]),
     /// A linear gradient.
@@ -288,7 +305,7 @@ pub fn paint_data(
                 interpolation: g.interpolation,
             }
         }
-        Paint::Mesh(_) => return Err(Unsupported::Mesh.into()),
+        Paint::Mesh(mesh) => PaintData::Mesh(super::mesh::Mesh::new(mesh, inv)),
         Paint::Image(p) => {
             let Some(image) = images.get(&p.image.raw()) else {
                 return Err(crate::error::RenderError::Image(p.image.raw()));
@@ -409,6 +426,7 @@ impl PaintData {
     pub fn eval(&self, dx: f32, dy: f32) -> [f32; 4] {
         match self {
             Self::Solid(c) => *c,
+            Self::Mesh(mesh) => mesh.eval(dx, dy),
             Self::Image {
                 inv,
                 image,

@@ -105,14 +105,10 @@ origin. Unclipped glyph instances use their cached coverage. Clipped instances
 translate that outline and enter the same intersection compiler. The exact
 subpixel offset and f32 font size remain part of glyph identity.
 
-Unclipped rounded-box shadows retain the existing analytic quadrature, now
-prepared once per geometry key. Clipped shadows follow the oracle's operation
-order: intersect the caster with every clip, then convolve that coverage with
-pixel-integrated Gaussian taps. Clipping an already blurred image is incorrect
-because it cuts off the blur tail. The convolution uses the existing workspace
-`libm` implementation for f64 erf, a six-sigma kernel, and the oracle's surface
-edge clamping. Shadow rows use dense samples within nonempty runs because their
-coverage usually varies at every pixel. Their colour is applied at composition.
+All shadow casters use the coverage compiler followed by the oracle's
+pixel-integrated Gaussian convolution. The caster is shifted, spread and
+intersected with every clip before convolution. See `DESIGN-effects.md` for
+units, spread predicates, colour spaces, mesh sampling and glyph styles.
 
 ## Cache identity, ownership, and memory
 
@@ -160,7 +156,7 @@ segments in row r, `m` the number in one connected group, `X` its actual crossin
 - A warm source lookup costs key construction/hash/equality, proportional to
   source geometry and clips. Stroking, flattening, event construction and area
   integration are skipped. Composition costs `O(P)` plus item/band references.
-- Clipped-shadow cold preparation adds separable convolution work proportional
+- Shadow cold preparation adds separable convolution work proportional
   to the affected rows/columns times the kernel radius. Warm shadows reuse their
   prepared coverage.
 
@@ -183,7 +179,7 @@ measurements belong to the Linux verification run.
 | chart | Largest reduction from skipping repeated stroke expansion and geometric sweeps; only covered spans are shaded. |
 | map | Less per-band item scanning and bounding-box work, plus prepared paths/strokes; key construction and pixel blending may become dominant. |
 | ui-list | Reuses path and shadow coverage; band scratch reuse removes recurring isolation allocations. |
-| effects | Warm frames eliminate analytic shadow evaluation; cost shifts to coverage reads and composition. Cold clipped shadows pay convolution. |
+| effects | Warm frames reuse convolved shadow fields; cost shifts to coverage reads and composition. Cold shadows pay convolution. |
 | text-page | Band binning and cheaper source-over help; glyph hit frames already skipped coverage, so expect a smaller improvement. |
 
 The p50/p99 target is an acceptance criterion, not a measured result of this

@@ -396,6 +396,9 @@ pub struct Surface {
     root: Layer,
     /// The shared pending-changes state.
     pub shared: Rc<RefCell<SurfaceShared>>,
+    /// The device's maximum texture dimension, for fail-fast resize
+    /// validation on the UI thread.
+    max_texture: u32,
     tx: Sender<Message>,
 }
 
@@ -410,6 +413,7 @@ impl Surface {
         id: SurfaceId,
         target: Target,
         tx: Sender<Message>,
+        max_texture: u32,
     ) -> Result<Self, SurfaceError> {
         let shared = Rc::new(RefCell::new(SurfaceShared {
             next_layer: Cell::new(1),
@@ -438,6 +442,7 @@ impl Surface {
             readable,
             root,
             shared,
+            max_texture,
             tx,
         })
     }
@@ -460,12 +465,20 @@ impl Surface {
         self.size
     }
 
-    /// Resizes the surface. The render thread validates the size on receipt;
-    /// an oversized size fails the next [`crate::Engine::render`].
+    /// Resizes the surface.
     ///
     /// # Errors
-    /// [`SurfaceError::Lost`] when the render thread is gone.
+    /// [`SurfaceError::TooLarge`] when a dimension exceeds the device
+    /// limit (the surface keeps its old size) and [`SurfaceError::Lost`]
+    /// when the render thread is gone.
     pub fn resize(&mut self, size: (u32, u32)) -> Result<(), SurfaceError> {
+        if size.0 > self.max_texture || size.1 > self.max_texture {
+            return Err(SurfaceError::TooLarge {
+                width: size.0,
+                height: size.1,
+                max: self.max_texture,
+            });
+        }
         self.tx
             .send(Message::ResizeSurface { id: self.id, size })
             .map_err(|_| SurfaceError::Lost)?;
@@ -607,7 +620,7 @@ mod tests {
                 }
             }
         });
-        Surface::new(1, Offscreen::new((8, 8)).into(), tx).expect("surface")
+        Surface::new(1, Offscreen::new((8, 8)).into(), tx, 8192).expect("surface")
     }
 
     /// Dropping a layer must drop its `contents` entry too: the recorded

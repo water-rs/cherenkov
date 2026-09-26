@@ -890,3 +890,32 @@ fn next_at_reports_the_configured_refresh_range() {
         other @ Next::Idle => panic!("expected At, got {other:?}"),
     }
 }
+
+/// An oversized `Surface::resize` must fail fast with `TooLarge` and
+/// keep the old size — not report `Ok` while the render thread silently
+/// ignores it.
+#[test]
+fn oversized_resize_fails_fast() {
+    let Some(engine) = engine() else { return };
+    let mut surface = engine.surface(Offscreen::new((8, 8))).expect("surface");
+    let err = surface.resize((u32::MAX, 16)).err();
+    assert!(
+        matches!(err, Some(cherenkov_vello::SurfaceError::TooLarge { .. })),
+        "expected TooLarge, got {err:?}"
+    );
+    assert_eq!(
+        surface.size(),
+        (8, 8),
+        "a rejected resize keeps the old size"
+    );
+    // A legal resize still applies and the engine still renders.
+    surface.resize((16, 16)).expect("resize");
+    surface.clear_color(WorkingColor::BLACK);
+    let next = engine
+        .render(cherenkov_vello::FrameTime::now())
+        .expect("render after resizes");
+    assert_eq!(next, Next::Idle);
+    let readback = surface.readback().expect("readback");
+    assert_eq!(readback.width, 16);
+    assert_eq!(readback.height, 16);
+}

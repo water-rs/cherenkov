@@ -48,6 +48,9 @@ pub enum DeviceRequest {
 pub struct Init {
     /// Adapter info.
     pub info: GpuInfo,
+    /// The device's maximum texture dimension, so [`crate::Surface::resize`]
+    /// can reject oversized sizes on the UI thread.
+    pub max_texture: u32,
 }
 
 /// What a layer draws, on the render thread.
@@ -371,6 +374,7 @@ pub fn run(
     };
     let _ = init_tx.send(Ok(Init {
         info: gpu_info(&info),
+        max_texture: renderer.max_texture,
     }));
     while let Ok(message) = rx.recv() {
         match message {

@@ -189,6 +189,9 @@ impl Default for VelloConfig {
 pub struct Engine<B: Backend> {
     tx: Sender<Message>,
     info: GpuInfo,
+    /// The device's maximum texture dimension, handed to each `Surface`
+    /// for fail-fast resize validation.
+    max_texture: u32,
     stats: Cell<FrameStats>,
     surfaces: RefCell<HashMap<SurfaceId, Rc<RefCell<SurfaceShared>>>>,
     next_surface: Cell<SurfaceId>,
@@ -246,6 +249,7 @@ impl Engine<Vello> {
         Ok(Self {
             tx,
             info: init.info,
+            max_texture: init.max_texture,
             stats: Cell::new(FrameStats::default()),
             surfaces: RefCell::new(HashMap::new()),
             next_surface: Cell::new(0),
@@ -331,7 +335,7 @@ impl Engine<Vello> {
     pub fn surface(&self, target: impl Into<Target>) -> Result<Surface, SurfaceError> {
         let id = self.next_surface.get();
         self.next_surface.set(id + 1);
-        let surface = Surface::new(id, target.into(), self.tx.clone())?;
+        let surface = Surface::new(id, target.into(), self.tx.clone(), self.max_texture)?;
         self.surfaces
             .borrow_mut()
             .insert(id, Rc::clone(&surface.shared));

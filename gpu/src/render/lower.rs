@@ -1016,9 +1016,12 @@ impl<'a> Lowering<'a> {
         let (mut instances, mut stops) =
             previous.map_or_else(|| (Vec::new(), Vec::new()), |e| (e.instances, e.stops));
         instances.clear();
+        // Every stop reference the leaf realized is at least `stop_base`;
+        // an instance without stops carries 0, which stays 0 — exactly the
+        // leaf-relative form a retained copy holds.
         instances.extend(self.frame.instances[first_instance..].iter().map(|inst| {
             let mut inst = *inst;
-            inst.meta[2] -= stop_base;
+            inst.meta[2] = inst.meta[2].saturating_sub(stop_base);
             inst
         }));
         stops.clear();

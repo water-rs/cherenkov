@@ -28,7 +28,9 @@
 //! `null` — it is never estimated.
 
 pub mod affinity;
+pub mod conditions;
 pub mod convert;
+pub mod energy;
 pub mod report;
 #[cfg(any(
     feature = "vello-classic",

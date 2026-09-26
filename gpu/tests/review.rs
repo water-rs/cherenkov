@@ -284,3 +284,43 @@ fn a_zero_size_surface_is_an_error() {
         );
     }
 }
+
+/// Reflecting a symmetric shape must preserve its fractional edge coverage.
+#[test]
+fn reflected_shape_preserves_antialiasing() -> Result<(), Box<dyn std::error::Error>> {
+    use cherenkov::kurbo::{Affine, Circle};
+
+    let engine = Engine::<Gpu>::new(GpuConfig::default())?;
+    let normal = engine.surface(Offscreen::new((32, 32), OffscreenFormat::LinearF16))?;
+    let reflected = engine.surface(Offscreen::new((32, 32), OffscreenFormat::LinearF16))?;
+    for (surface, transform) in [
+        (&normal, Affine::IDENTITY),
+        (&reflected, Affine::new([-1.0, 0.0, 0.0, 1.0, 32.0, 0.0])),
+    ] {
+        surface.update(|tx| {
+            tx[surface.root()].content(surface.record(|recorder| {
+                recorder.transform(transform, |recorder| {
+                    recorder.fill(Circle::new((16.0, 16.0), 9.25), WorkingColor::WHITE);
+                });
+            }));
+        });
+    }
+    engine.render(cherenkov::FrameTime::now())?;
+    let normal = normal.readback()?;
+    let reflected = reflected.readback()?;
+    assert!(
+        normal
+            .pixels
+            .iter()
+            .any(|pixel| pixel[3] > 0.0 && pixel[3] < 1.0)
+    );
+    for (index, (normal, reflected)) in normal.pixels.iter().zip(&reflected.pixels).enumerate() {
+        assert!(
+            (normal[3] - reflected[3]).abs() < 0.001,
+            "reflection changed edge coverage at pixel {index}: {} vs {}",
+            normal[3],
+            reflected[3]
+        );
+    }
+    Ok(())
+}

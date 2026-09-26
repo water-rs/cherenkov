@@ -19,8 +19,8 @@ thiserror = "2"
 bytemuck = { version = "1", features = ["derive"] }
 skrifa = "0.44"
 
-[dev-dependencies]
-# Real X windows for the windowed-surface present tests.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# Real X windows for the windowed-surface present test, which is Linux-only.
 x11rb = { version = "0.13", default-features = false, features = ["dl-libxcb"] }
 raw-window-handle = "0.6"
 

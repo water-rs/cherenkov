@@ -197,6 +197,61 @@ fn a_path_clip_masks_content() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// A rect drawn as a path hanging off the surface's left edge: the
+/// out-of-window edge's winding deposit must still reach column 0, or the
+/// interior stays clear.
+#[test]
+fn a_fill_overhanging_the_left_edge_paints_its_interior() -> Result<(), Box<dyn std::error::Error>>
+{
+    let mut left_edge_rect = BezPath::new();
+    left_edge_rect.move_to((-40.0, 10.0));
+    left_edge_rect.line_to((30.0, 10.0));
+    left_edge_rect.line_to((30.0, 50.0));
+    left_edge_rect.line_to((-40.0, 50.0));
+    left_edge_rect.close_path();
+    let Some(readback) = render(|c| c.fill(left_edge_rect, RED))? else {
+        return Ok(());
+    };
+    for x in [5, 15, 28] {
+        let [r, g, b, a] = px(&readback, x, 20);
+        assert!(
+            r > 0.9 && g < 0.1 && b < 0.1 && a > 0.9,
+            "interior ({x},20): {r} {g} {b} {a}"
+        );
+    }
+    // Right of the fill stays clear.
+    let [r, ..] = px(&readback, 40, 20);
+    assert!(r < 0.05, "outside: {r}");
+    Ok(())
+}
+
+/// A clip path whose left edge sits outside the window still masks its
+/// interior: a path clip rasterizes through the same deposit pipeline.
+#[test]
+fn a_clip_overhanging_the_left_edge_masks_its_interior() -> Result<(), Box<dyn std::error::Error>> {
+    let mut clip = BezPath::new();
+    clip.move_to((-40.0, -10.0));
+    clip.line_to((32.0, -10.0));
+    clip.line_to((32.0, 74.0));
+    clip.line_to((-40.0, 74.0));
+    clip.close_path();
+    let Some(readback) = render(|c| {
+        c.clip(clip, |c| {
+            c.fill(cherenkov::kurbo::Rect::new(0.0, 0.0, 64.0, 64.0), RED);
+        });
+    })?
+    else {
+        return Ok(());
+    };
+    // Inside the clip's right half.
+    let [r, ..] = px(&readback, 20, 32);
+    assert!(r > 0.9, "clipped interior: {r}");
+    // Right of the clip the fill is masked out.
+    let [r, ..] = px(&readback, 40, 32);
+    assert!(r < 0.05, "outside clip: {r}");
+    Ok(())
+}
+
 /// A rect clip merged with a path clip: the mask still applies inside the
 /// intersected rectangle.
 #[test]

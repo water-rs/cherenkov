@@ -16,7 +16,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use cherenkov::{
-    Draw as _, Engine as GpuEngine, FrameTime, ImageData, Layer as GpuLayer, LayerEdit, Offscreen,
+    Draw as _, Engine as GpuEngine, ImageData, Layer as GpuLayer, LayerEdit, Offscreen,
     OffscreenFormat, RenderError, ResourceError, Rgba8, Surface, Transaction,
 };
 use cherenkov_gpu::{Gpu, GpuConfig, ScratchFormat};
@@ -28,6 +28,7 @@ use cherenkov_scene::{
 use kurbo::{Affine, BezPath, Circle, Ellipse, Line, Rect, RoundedRect, Vec2};
 
 use crate::convert::{self, Blobs};
+use crate::motion::{Clock, LayerMotion};
 use crate::{BenchError, Counters, DeviceInfo, EncodeInput, Engine, EngineInfo, Submit};
 
 /// A scene shape in a form the front-end accepts.
@@ -106,10 +107,14 @@ struct PrepLayer {
     opacity: f64,
     /// Blend onto the parent.
     blend: cherenkov::BlendMode,
+    /// Scroll offset applied to content and children.
+    scroll_offset: Vec2,
     /// The layer's own content — only when every draw precedes every child.
     own: Vec<Op>,
     /// Ordered children.
     items: Vec<PrepItem>,
+    /// The layer's one-time motion.
+    motion: Option<LayerMotion>,
 }
 
 /// An engine layer plus the ops it records each frame.
@@ -121,6 +126,8 @@ struct ContentLayer {
     /// Command count of the last recording, re-used as the next one's
     /// capacity.
     last_len: usize,
+    /// The layer's one-time motion, committed on the first encode.
+    motion: Option<LayerMotion>,
 }
 
 /// `cherenkov-gpu` adapter.
@@ -136,6 +143,12 @@ pub struct Cherenkov {
     image_handles: Vec<cherenkov::Image<cherenkov::Rgba8>>,
     /// Layers holding recorded content, in draw order.
     content_layers: Vec<ContentLayer>,
+    /// Whether any layer carries a `motion`.
+    has_motion: bool,
+    /// Whether the motion commits have been sent (first encode).
+    motion_committed: bool,
+    /// The fixed frame clock `submit` renders at.
+    clock: Clock,
     counters: Counters,
 }
 
@@ -152,6 +165,8 @@ fn cherenkov_features() -> Vec<Feature> {
         Feature::Shadow,
         Feature::Glyphs,
         Feature::FontVariations,
+        Feature::Scroll,
+        Feature::Animation,
         Feature::HdrColor,
         Feature::WideGamut,
         Feature::Path,
@@ -569,11 +584,16 @@ fn prep_layer(
     };
     let mut prep = PrepLayer {
         transform: layer.transform,
+        scroll_offset: layer.scroll_offset,
         clip: layer.clip.as_ref().map(shape_kind),
         opacity: layer.opacity,
         blend: gpu_blend(layer.blend),
         own: Vec::new(),
         items: Vec::new(),
+        motion: layer
+            .motion
+            .as_ref()
+            .map(|m| LayerMotion::from_scene(m, layer.transform)),
     };
     if own {
         for item in &layer.items {
@@ -622,6 +642,7 @@ fn build_layer(
     {
         let edit = &mut tx[&layer];
         edit.transform(prep.transform);
+        edit.scroll_offset(prep.scroll_offset);
         edit.opacity(prep.opacity as f32);
         edit.blend(prep.blend);
         if let Some(clip) = &prep.clip {
@@ -638,6 +659,7 @@ fn build_layer(
                     layer: child,
                     ops,
                     last_len: 0,
+                    motion: None,
                 });
             }
             PrepItem::Layer(p) => build_layer(surface, tx, &layer, p, content_layers),
@@ -647,6 +669,7 @@ fn build_layer(
         layer,
         ops: prep.own,
         last_len: 0,
+        motion: prep.motion,
     });
 }
 
@@ -687,6 +710,9 @@ impl Cherenkov {
             images: HashMap::new(),
             image_handles: Vec::new(),
             content_layers: Vec::new(),
+            has_motion: false,
+            motion_committed: false,
+            clock: Clock::new(),
             counters: Counters::default(),
         })
     }
@@ -731,6 +757,8 @@ impl Engine for Cherenkov {
             let root = surface.root();
             build_layer(&surface, tx, root, prep, &mut content_layers);
         });
+        self.has_motion = content_layers.iter().any(|c| c.motion.is_some());
+        self.motion_committed = false;
         self.content_layers = content_layers;
         self.surface = Some(surface);
         Ok(())
@@ -743,26 +771,41 @@ impl Engine for Cherenkov {
             .surface
             .as_ref()
             .ok_or_else(|| BenchError::Engine("cherenkov: encode before prepare".into()))?;
-        let contents: Vec<(usize, cherenkov::Content)> = self
-            .content_layers
-            .iter()
-            .enumerate()
-            .map(|(i, cl)| {
-                let content = cherenkov::Content::record_with_capacity(cl.last_len, |c| {
-                    for op in &cl.ops {
-                        record_op(c, op);
-                    }
-                });
-                (i, content)
-            })
-            .collect();
-        surface.update(|tx| {
-            for (i, content) in contents {
-                let cl = &mut self.content_layers[i];
-                cl.last_len = content.len();
-                tx[&cl.layer].content(content);
+        let first_motion = self.has_motion && !self.motion_committed;
+        if first_motion {
+            for cl in &self.content_layers {
+                if let Some(motion) = &cl.motion {
+                    motion.apply(surface, &cl.layer);
+                }
             }
-        });
+            self.motion_committed = true;
+        }
+        // Motion scenes record their content once: later encodes only
+        // advance the clock. Static scenes keep re-recording each frame
+        // so their numbers stay comparable.
+        if !self.has_motion || first_motion {
+            let contents: Vec<(usize, cherenkov::Content)> = self
+                .content_layers
+                .iter()
+                .enumerate()
+                .map(|(i, cl)| {
+                    let content = cherenkov::Content::record_with_capacity(cl.last_len, |c| {
+                        for op in &cl.ops {
+                            record_op(c, op);
+                        }
+                    });
+                    (i, content)
+                })
+                .collect();
+            surface.update(|tx| {
+                for (i, content) in contents {
+                    let cl = &mut self.content_layers[i];
+                    cl.last_len = content.len();
+                    tx[&cl.layer].content(content);
+                }
+            });
+        }
+        self.clock.advance();
         Ok(())
     }
 
@@ -771,7 +814,32 @@ impl Engine for Cherenkov {
             .surface
             .as_ref()
             .ok_or_else(|| BenchError::Engine("cherenkov: submit before prepare".into()))?;
-        self.engine.render(FrameTime::now()).map_err(render_error)?;
+        self.engine
+            .render(self.clock.time())
+            .map_err(render_error)?;
+        if readback && self.has_motion {
+            // FLIP compares against the oracle's settled scene: render
+            // until the animations come to rest (cap 2000 frames).
+            let mut settled = false;
+            for _ in 0..2000 {
+                match self
+                    .engine
+                    .render(self.clock.time())
+                    .map_err(render_error)?
+                {
+                    cherenkov::Next::Idle => {
+                        settled = true;
+                        break;
+                    }
+                    cherenkov::Next::At { .. } => self.clock.advance(),
+                }
+            }
+            if !settled {
+                return Err(BenchError::Engine(
+                    "cherenkov: motion did not settle in 2000 frames".into(),
+                ));
+            }
+        }
         let stats = self.engine.stats();
         let gpu_seconds = stats.gpu_seconds;
         let passes = stats

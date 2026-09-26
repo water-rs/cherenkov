@@ -35,7 +35,7 @@ impl Effect for CopyEffect {
                 depth_or_array_layers: 1,
             },
         );
-        Ok(false)
+        Ok(true)
     }
 }
 
@@ -58,7 +58,10 @@ fn engine_executes_composed_filters_and_effects_after_resize()
         }));
     });
     let start = Instant::now();
-    assert_eq!(engine.render(FrameTime::at(start))?, Next::Idle);
+    assert!(matches!(
+        engine.render(FrameTime::at(start))?,
+        Next::At { .. }
+    ));
     assert_eq!(receive.try_recv()?.presentation_time(), Duration::ZERO);
     let readback = surface.readback()?;
     for (actual, expected) in readback.pixels[16 * 32 + 16]
@@ -76,5 +79,13 @@ fn engine_executes_composed_filters_and_effects_after_resize()
     assert_eq!(timing.presentation_time(), Duration::from_millis(250));
     assert_eq!(timing.delta(), Duration::from_millis(250));
     assert_eq!(timing.sequence(), 1);
+    surface.update(|tx| {
+        tx[surface.root()].clear_filter();
+    });
+    assert_eq!(
+        engine.render(FrameTime::at(start + Duration::from_millis(500)))?,
+        Next::Idle,
+        "a registered effect detached from every layer cannot keep the host awake"
+    );
     Ok(())
 }

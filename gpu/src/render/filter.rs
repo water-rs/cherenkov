@@ -122,10 +122,10 @@ impl Registry {
         self.0.remove(&id);
     }
 
-    pub fn wants_redraw(&self) -> bool {
+    pub fn wants_redraw(&self, id: u64) -> bool {
         self.0
-            .values()
-            .any(|entry| entry.again || entry.dirty.load(Ordering::Acquire))
+            .get(&id)
+            .is_some_and(|entry| entry.again || entry.dirty.load(Ordering::Acquire))
     }
 
     /// Runs after the capture pass and before its parent samples the scratch.

@@ -9,7 +9,7 @@ use cherenkov::kurbo::{Point, Rect};
 use cherenkov::{Draw, GlyphRun, WorkingColor};
 use cherenkov_gpu::{
     Budget, Bytes, Engine, EngineError, Gpu, GpuConfig, Offscreen, OffscreenFormat, RenderError,
-    SurfaceError,
+    SurfaceError, TimestampSupport,
 };
 
 /// An engine under `config`, or `None` when no adapter exists.
@@ -329,6 +329,11 @@ fn timestamps_resolve_a_frame_late() -> Result<(), Box<dyn std::error::Error>> {
     }) else {
         return Ok(());
     };
+    // An adapter without timestamp queries (the Apple Paravirtual device
+    // on hosted macOS runners) never reports GPU timing, by contract.
+    if engine.info().timestamps == TimestampSupport::Unsupported {
+        return Ok(());
+    }
     let surface = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|c| {

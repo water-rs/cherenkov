@@ -189,7 +189,7 @@ fn device_grad(m: array<vec4<f32>, 2>, g: vec2<f32>) -> f32 {
     let d = m[0].w;
     let det = a * d - b * c;
     let inv_det = select(1.0 / det, 0.0, abs(det) < 1e-12);
-    return max(length(vec2<f32>(d * g.x - b * g.y, -c * g.x + a * g.y)) * inv_det, 1e-6);
+    return max(length(vec2<f32>(d * g.x - b * g.y, -c * g.x + a * g.y)) * abs(inv_det), 1e-6);
 }
 
 // Local-space gradient of the signed distance to `s` at `p`, by central

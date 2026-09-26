@@ -8,13 +8,20 @@ use crate::color::WorkingColor;
 /// A shadow cast by a shape.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Shadow {
-    /// Standard deviation of the Gaussian blur, in device pixels.
+    /// Standard deviation of the Gaussian blur, in the shape's units.
+    /// The drawing transform pushes the local Gaussian into device space;
+    /// nonuniform scale and shear therefore produce an anisotropic blur.
     pub sigma: f64,
     /// Offset of the shadow from the shape.
     pub offset: Vec2,
-    /// Round contour spread in shape units before blurring: union the fill
-    /// with a band of this radius for positive values, subtract it for negative
-    /// values. All authored contours participate, including internal contours.
+    /// Outline expansion in shape units, before blurring. Box half-extents
+    /// grow by this amount; a positive rounded-box corner radius `r` becomes
+    /// `max(0, r + spread)`, and a sharp corner stays sharp. Negative spread
+    /// shrinks the box; a nonpositive resulting extent produces no shadow.
+    /// Other outlines use miter joins with a miter limit of 4 (the SVG
+    /// default), beveling beyond the limit. Positive spread unions the band
+    /// with the fill; negative spread subtracts it. All authored contours
+    /// participate.
     pub spread: f64,
     /// Colour of the shadow.
     pub color: WorkingColor,

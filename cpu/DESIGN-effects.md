@@ -4,8 +4,8 @@
 
 The oracle remains the specification. Its frontend reference entry points are
 `mesh::sample`, `glyphs::styled_outline`, `blend::in_space`, and
-`shadow::spread_coverage` followed by `shadow::gaussian_blur`. They accept the
-frontend types directly, so tests can specify mesh grids, glyph styles and
+`shadow::spread_coverage` followed by `shadow::gaussian_blur`. They accept geometry and
+frontend values directly, so tests can specify mesh grids, glyph styles and
 per-glyph transforms without encoding backend resource IDs into scene files.
 The existing scene renderer continues to provide the independent colour-glyph
 paint-graph reference. These functions are CPU-independent; the production CPU
@@ -23,41 +23,68 @@ Shift the geometry before integration. Intersect clips before convolution;
 clipping the blurred image instead would remove its tail. Arbitrary contours,
 self-intersections, holes, rotations and shears use the same coverage compiler.
 
-The oracle's sigma is in device pixels: transformed geometry is followed by an
-isotropic device-space convolution. The frontend's former “shape units” sigma
-comment contradicted `oracle/src/render.rs`; the comment now states the oracle
-contract. Offsets and spread remain in shape units.
+Sigma, offset and spread are in the shape's units. With linear transform `A`,
+the local isotropic Gaussian becomes a device Gaussian with covariance
+`Σ = sigma² A Aᵀ`. Translation moves the caster without changing covariance.
+Uniform scale scales the blur; nonuniform scale and shear generally make it
+anisotropic. Rotation of an isotropic Gaussian alone leaves it isotropic. The
+former device-sigma oracle was inconsistent with `Shadow::sigma`; the oracle
+now follows that API contract.
 
-Spread is explicitly a contour operation. Stroke the authored contours with
-round joins/caps and width `2 * abs(spread)` before the drawing transform.
-Positive spread unions that band with the fill; negative spread subtracts it.
-All authored contours participate, including internal contours. This definition
-is distinct from eroding only the exposed boundary of a previously unioned
-silhouette. The coverage compiler resolves union/difference and all clip
-intersections before integrating any area. The oracle independently uses
-`area(A ∪ B) = area(A) + area(B) − area(A ∩ B)` and
-`area(A − B) = area(A) − area(A ∩ B)` with geometric intersections.
+For rectangles and rounded rectangles, spread grows each half-extent by its
+signed value. A positive corner radius `r` becomes `max(0, r + spread)`; a sharp
+corner remains sharp. A nonpositive resulting extent is empty. This is the
+CSS box-shadow corner rule. It is applied to semantic box geometry before the
+transform, including rotated boxes.
 
-For positive sigma the Gaussian has radius `ceil(6 * sigma)`, with tap `d`
-proportional to
-`(erf((d + 0.5)/(sigma * sqrt(2))) − erf((d − 0.5)/(sigma * sqrt(2)))) / 2`.
-Normalize the finite kernel, convolve horizontally, then vertically. Clamp
-sample coordinates to the surface, never to the caster bounds. Sigma at or
-below `1e-9` returns the input field. Empty fields remain empty.
+Other shapes offset their closed authored contours with miter joins, miter
+limit 4 (the SVG default), and bevels beyond that limit. Construct a band of
+width `2 * abs(spread)` in local space. Positive spread unions it with the fill;
+negative spread subtracts it. All authored contours participate, including
+internal contours. The coverage compiler resolves union/difference and clip
+intersections before integrating area. The independent oracle uses geometric
+intersections and `area(A ∪ B) = area(A) + area(B) − area(A ∩ B)` and
+`area(A − B) = area(A) − area(A ∩ B)`.
 
-Separable convolution is the oracle algorithm, with no box approximation or
-point-sampled taps. Intermediates use f64; coverage storage and the final field
-use f32. The old rounded-box quadrature, extra variance and three-sigma cutoff
-are removed entirely. Colour is applied after convolution, so colour changes
-reuse the cached scalar field. Cache identity includes source geometry, fill
-rule, clips, transform, offset, spread, sigma and surface size.
+For each device offset `(i, j)`, the tap is the Gaussian probability of
+`[i−0.5, i+0.5] × [j−0.5, j+0.5]`. Retain offsets through
+`rx = ceil(6 * sqrt(Σxx))` and `ry = ceil(6 * sqrt(Σyy))`, inclusive; normalize
+the retained mass. The outside mass is below `4e-9` by the two marginal tail
+bounds. Clamp samples to the surface, never the caster bounds. For diagonal
+covariance, each axis has the original integrated tap
+`(erf((d+0.5)/(s*sqrt(2))) − erf((d−0.5)/(s*sqrt(2)))) / 2`, where `s` is that
+axis's marginal sigma. Nonpositive sigma gives the identity. Every positive
+sigma uses integrated taps, with no sharpness threshold or added variance.
 
-With kernel radius `r`, width `W`, caster height `Hc`, and halo height `Ho`,
-convolution costs at most `O(W(Hc + Ho)(2r + 1))` and `O(WHc + W)` temporary
-scalar storage, plus output. Horizontal work is restricted to occupied row
-intervals and their halos. Warm draws read prepared fields. Union/difference
-spread uses the same row/group event compiler as intersections; each crossing
-updates a constant-time Boolean predicate.
+For correlated covariance write `X = sx Z`, `Y = b Z + c W`, with independent
+standard normal variables `Z` and `W`. Integrate the conditional normal interval
+probability against the density of `Z`. Compute `c` from the determinant rather
+than subtracting almost equal variances. Split quadrature at integer standard
+normal coordinates and both conditional transitions (including their tails),
+so near-singular transforms cannot hide narrow mass between quadrature nodes.
+The oracle uses adaptive Simpson integration with absolute tolerance `2e-15`
+per panel; CPU uses independently refined eight-point Gauss-Legendre integration
+with `2e-14` per panel. Integration outside twelve standard deviations can
+contribute less than `4e-33`. This numerical bound is below the integration
+precision; the specified retained kernel remains the six-sigma pixel rectangle.
+Rank-one covariance integrates the resulting line measure analytically, and
+zero variance is a point mass. Neither requires an inverse transform.
+
+Diagonal covariance uses two separable passes. Correlated covariance uses the
+full integrated two-dimensional kernel, preserving the same pixel-footprint
+reference. With width `W`, caster height `Hc` and output halo height `Ho`, the
+separable cost is `O(W Hc (2rx+1) + W Ho (2ry+1))`, with horizontal work further
+restricted to occupied intervals and their halos. Correlated convolution costs
+`O(W Ho (2rx+1)(2ry+1))`. Both store `O(W Hc + W)` temporary scalar pixels, plus
+output; kernel storage is linear in the radii for the separable case and their
+product for the correlated case. Kernel integration occurs once per cache miss.
+Intermediates are `f64`; coverage storage and final output are `f32`.
+
+Colour is applied after convolution, so colour changes reuse the cached scalar
+field. Cache identity includes realized spread geometry, fill rule, residual
+contour-band spread, clips, transform, offset, sigma and surface size. Warm
+draws read prepared fields. Spread uses the existing row/group event compiler;
+each crossing updates a constant-time Boolean predicate.
 
 ## Glyph styles and placement
 
@@ -135,24 +162,45 @@ At `ab47a3f`, GPU lowering rejects mesh paint, stroked glyphs, per-glyph
 transforms and non-linear blend spaces. It therefore has no alternative
 implemented semantics for those four features.
 
-GPU shadows differ: rounded-box analytic integration uses
-`sqrt(sigma² + 1/12)` and a three-sigma bound, in the box's local coordinates.
-Its spread grows box half-extents and existing corner radii, keeping a sharp
-box sharp. CPU/oracle shadows use six-sigma integrated pixel taps in device
-space and the explicitly round contour spread defined above. These differ at
-small sigma, scaled transforms, tails and spread corners. This change does not
-alter GPU code or silently treat the two formulas as equivalent.
+GPU shadow conformance requires the following changes:
+
+- Replace the `sqrt(sigma² + 1/12)` variance adjustment and the shader's
+  `sigma < 0.25` sharp-coverage branch with integrated taps for every positive
+  sigma. The adjustment currently makes that branch unreachable for positive
+  authored sigma, creating a discontinuity at zero. The sixteen-row midpoint
+  corner integration also differs from the exact-coverage convolution reference.
+- Replace the shader's 3σ integration cut and lowering's corresponding bound
+  with the normalized six-sigma integrated kernel and its full device halo.
+  Include coverage beyond 3σ rather than suppressing its tail.
+- Preserve local sigma semantics while accounting for transformed pixel
+  footprints: the GPU already evaluates the Gaussian in local coordinates,
+  but its pixel-variance adjustment does not implement the pushed-forward
+  pixel-integrated covariance above.
+- Add general-path spread with miter limit 4 and bevels beyond the limit;
+  `box_shape` currently rejects those casters. The rectangle/rounded-rectangle
+  spread-corner disagreement is resolved by this oracle correction: GPU
+  half-extents and positive radii grow by spread, and sharp corners stay sharp.
+  Although lowering can store a negative radius after shrinkage, `corner_inset`
+  and the distance functions already treat it as zero. There is no remaining
+  box-corner rounding difference in those formulas.
+
+GPU implementation changes are separate work; this change modifies no GPU files.
 
 ## Validation
 
 Oracle tests cover bilinear interpolation and premultiplied alpha, folds,
 reflection, degeneracy, signed extended-range colour conversion, encoded
 source-over, glyph origin transforms, stroke width units and signed spread area.
+Shadow checks additionally cover analytic correlated quadrant probabilities,
+impulse covariance, scale/rotation/reflection invariance, tiny local sigma under
+magnification, singular line/point kernels, mixed sharp/round box corners,
+negative spread through radius zero, collapsed boxes and beveled acute miters.
 CPU unit tests compare all blend modes in both spaces, folded/overlapping mesh
 patches, and the independent coverage/clip/convolution shadow pipeline.
 End-to-end tests add rotated/path shadows, offset and nested clips, signed
-spread, warm cache reuse, transformed mesh paint, group opacity, layer blend
-space, styled glyph cache transitions, and transformed colour glyph paint graphs.
+spread under nonuniform scale and shear, warm cache reuse, transformed mesh
+paint, group opacity, layer blend space, styled glyph cache transitions, and
+transformed colour glyph paint graphs.
 
 Exact area is relative to flattened geometry, as in the coverage design.
 Oracle curves are finer than CPU curves, so curved glyph/spread comparisons use

@@ -13,16 +13,16 @@
 
 use cherenkov::kurbo::{Affine, Rect};
 use cherenkov::{Draw, Extend, ImagePattern, Paint, Sampling};
-use cherenkov_gpu::{
-    Engine, EngineError, Gpu, GpuConfig, Image, ImageColorSpace, ImageSource, Offscreen,
-    OffscreenFormat,
+use cherenkov::{
+    Engine, EngineError, Image, ImageColorSpace, ImageData, Offscreen, OffscreenFormat, Rgba8,
 };
+use cherenkov_gpu::{Gpu, GpuConfig};
 
 /// An engine, or `None` when no adapter exists.
 fn engine() -> Option<Engine<Gpu>> {
     match Engine::<Gpu>::new(GpuConfig::default()) {
         Ok(engine) => Some(engine),
-        Err(EngineError::NoAdapter) => None,
+        Err(EngineError::Backend(_)) => None,
         Err(e) => panic!("engine init failed: {e}"),
     }
 }
@@ -74,19 +74,22 @@ fn close_px(px: [f32; 4], want_p3_premul: [f32; 4]) {
 
 /// A 2×2 image: opaque red / opaque green on row 0, opaque blue /
 /// half-alpha white on row 1.
-fn two_by_two(engine: &Engine<Gpu>) -> Image {
+fn two_by_two(engine: &Engine<Gpu>) -> Image<Rgba8> {
     engine
-        .image(ImageSource {
-            width: 2,
-            height: 2,
-            pixels: vec![
-                255, 0, 0, 255, // red
-                0, 255, 0, 255, // green
-                0, 0, 255, 255, // blue
-                255, 255, 255, 128, // half white
-            ],
-            color_space: ImageColorSpace::Srgb,
-        })
+        .image(
+            ImageData::<Rgba8>::new(
+                2,
+                2,
+                vec![
+                    255, 0, 0, 255, // red
+                    0, 255, 0, 255, // green
+                    0, 0, 255, 255, // blue
+                    255, 255, 255, 128, // half white
+                ],
+            )
+            .unwrap()
+            .color_space(ImageColorSpace::Srgb),
+        )
         .unwrap()
 }
 
@@ -102,7 +105,7 @@ fn an_image_draws_nearest() -> Result<(), Box<dyn std::error::Error>> {
             c.image(image.id(), Rect::new(0., 0., 64., 64.), Sampling::Nearest);
         }));
     });
-    engine.render(cherenkov_gpu::FrameTime::now())?;
+    engine.render(cherenkov::FrameTime::now())?;
     let rb = surface.readback()?;
     let px = |x: u32, y: u32| rb.pixels[(y * rb.width + x) as usize];
     close_px(px(16, 16), premul_p3([255, 0, 0, 255]));
@@ -124,7 +127,7 @@ fn an_image_interpolates_bilinear() -> Result<(), Box<dyn std::error::Error>> {
             c.image(image.id(), Rect::new(0., 0., 64., 64.), Sampling::Linear);
         }));
     });
-    engine.render(cherenkov_gpu::FrameTime::now())?;
+    engine.render(cherenkov::FrameTime::now())?;
     let rb = surface.readback()?;
     // Pixel centre (32,32) sits exactly between the four texels.
     let mut avg = [0f32; 4];
@@ -167,7 +170,7 @@ fn an_image_pattern_repeats() -> Result<(), Box<dyn std::error::Error>> {
             );
         }));
     });
-    engine.render(cherenkov_gpu::FrameTime::now())?;
+    engine.render(cherenkov::FrameTime::now())?;
     let rb = surface.readback()?;
     let px = |x: u32, y: u32| rb.pixels[(y * rb.width + x) as usize];
     // Identity transform maps image pixels 1:1; texel (0,0) is red and
@@ -198,7 +201,7 @@ fn an_image_pattern_with_extend_none_is_transparent() -> Result<(), Box<dyn std:
             );
         }));
     });
-    engine.render(cherenkov_gpu::FrameTime::now())?;
+    engine.render(cherenkov::FrameTime::now())?;
     let rb = surface.readback()?;
     let px = |x: u32, y: u32| rb.pixels[(y * rb.width + x) as usize];
     close_px(px(0, 0), premul_p3([255, 0, 0, 255]));

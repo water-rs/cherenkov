@@ -11,16 +11,16 @@ mod path;
 mod raster;
 
 use std::collections::HashMap;
-use std::sync::mpsc::{Receiver, Sender};
 
-use cherenkov::ContentChange;
-
-use crate::config::{GpuConfig, GpuInfo, MemoryUsage, Pressure, ScratchFormat};
-use crate::error::{EngineError, RenderError, SurfaceError};
-use crate::message::{ChangeSet, LayerId, LayerOp, Message, SurfaceId};
-use crate::surface::{FrameStats, Next, PassTiming, Readback};
+use cherenkov::{
+    ContentOp, EngineError, FontData as EngineFontData, FontId, Frame, FrameStats, ImageId,
+    ImageUpload, LayerId, MemoryUsage, PassTiming, Pressure, Readback, Redraw, RenderError,
+    Renderer, ResourceError, SurfaceError, SurfaceFrame, SurfaceId, SurfaceInfo,
+};
 use glyph::{Atlas, FontData};
-use lower::{ContentData, Frame, GlyphContext, LayerNode, Lowering, PipelineKind, Target};
+use lower::{ContentData, Frame as LoweredFrame, GlyphContext, Lowering, PipelineKind, Target};
+
+use crate::{GpuConfig, GpuInfo, GpuTarget, ScratchFormat, names};
 
 /// The surface target format: premultiplied linear Display P3.
 const TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
@@ -31,9 +31,8 @@ const TARGET_USAGES: wgpu::TextureUsages = wgpu::TextureUsages::from_bits_retain
         | wgpu::TextureUsages::TEXTURE_BINDING.bits(),
 );
 
-/// Decodes one sRGB-encoded byte channel to linear, `u8 → f64`.
-fn srgb_decode_u8(c: u8) -> f64 {
-    let v = f64::from(c) / 255.0;
+/// Decodes one sRGB-encoded channel to linear, `0..=1 → f64`.
+fn srgb_decode_u8_f64(v: f64) -> f64 {
     if v <= 0.04045 {
         v / 12.92
     } else {
@@ -97,12 +96,6 @@ const fn format_name(format: wgpu::TextureFormat) -> &'static str {
     }
 }
 
-/// The render thread's reply to [`crate::Engine::new`].
-pub struct Init {
-    /// Adapter info.
-    pub info: GpuInfo,
-}
-
 /// One isolation scratch or backdrop texture.
 struct ScratchTarget {
     texture: wgpu::Texture,
@@ -137,10 +130,11 @@ struct SurfaceState {
     /// Backdrop copies for blend composites: index 0 matches the surface
     /// format, index 1 the scratch format.
     backdrop: [Option<ScratchTarget>; 2],
-    layers: HashMap<LayerId, LayerNode>,
-    clear: cherenkov::WorkingColor,
-    dirty: bool,
-    frame: Frame,
+    /// Per-layer content caches; the sampled layer state lives in the
+    /// front end's [`cherenkov::SurfaceTree`].
+    layers: HashMap<LayerId, ContentData>,
+    /// The reused lowering output (instances, stops, passes).
+    frame: LoweredFrame,
 }
 
 impl SurfaceState {
@@ -173,8 +167,9 @@ impl SurfaceState {
     }
 }
 
-/// All render-thread state.
-struct Renderer {
+/// All render-thread state: the [`Gpu`](crate::Gpu) backend's
+/// [`Renderer`] implementation.
+pub struct GpuRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     /// `[format index][pipeline kind]`: 0 = surface format, 1 = scratch
@@ -226,18 +221,6 @@ struct PassMeta {
     format: &'static str,
 }
 
-/// A new default layer node.
-const fn node() -> LayerNode {
-    LayerNode {
-        transform: kurbo::Affine::IDENTITY,
-        opacity: 1.0,
-        blend: cherenkov::BlendMode::Normal,
-        clip: None,
-        content: None,
-        children: Vec::new(),
-    }
-}
-
 /// Creates an adapter plus device. Fails when no adapter allows the target
 /// format's required usages.
 fn create_device(
@@ -255,7 +238,7 @@ fn create_device(
                 .allowed_usages
                 .contains(TARGET_USAGES)
         })
-        .ok_or(EngineError::NoAdapter)?;
+        .ok_or_else(|| EngineError::Backend("no suitable wgpu adapter".into()))?;
     let supported = adapter.features();
     let mut required = wgpu::Features::empty();
     if config.timestamps && supported.contains(wgpu::Features::TIMESTAMP_QUERY) {
@@ -275,7 +258,7 @@ fn create_device(
         memory_hints: wgpu::MemoryHints::Performance,
         trace: wgpu::Trace::Off,
     }))
-    .map_err(|e| EngineError::RequestDevice(format!("{e}")))?;
+    .map_err(|e| EngineError::Backend(format!("device request failed: {e}")))?;
     Ok((adapter, device, queue))
 }
 
@@ -487,7 +470,7 @@ fn create_pipeline(
         cache: cache.as_ref(),
     });
     if let Some(error) = pollster::block_on(error_scope.pop()) {
-        return Err(EngineError::Shader(format!("{error}")));
+        return Err(EngineError::Backend(format!("shader: {error}")));
     }
     if let (Some(cache), Some(path)) = (&cache, &config.pipeline_cache)
         && let Some(data) = cache.get_data()
@@ -523,15 +506,19 @@ fn create_target(
     (texture, view)
 }
 
-/// The render-thread entry point: initializes, replies, then loops over
-/// messages until [`Message::Shutdown`].
+/// Runs on the render thread once: creates the device and precompiles
+/// the closed pipeline set, returning the backend's [`Renderer`].
+///
+/// # Errors
+/// [`EngineError::Backend`] when no suitable adapter exists, device
+/// creation fails or a pipeline fails validation.
 #[expect(
     clippy::too_many_lines,
     clippy::needless_pass_by_value,
-    reason = "moved into the render thread"
+    reason = "the contract moves the config onto the render thread"
 )]
-pub fn run(config: GpuConfig, rx: Receiver<Message>, init_tx: Sender<Result<Init, EngineError>>) {
-    let init = create_device(&config).and_then(|(adapter, device, queue)| {
+pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
+    create_device(&config).and_then(|(adapter, device, queue)| {
         let info = adapter.get_info();
         let (layout0, layout1) = create_layouts(&device);
         let scratch_format = scratch_wgpu(config.scratch_format);
@@ -598,7 +585,7 @@ pub fn run(config: GpuConfig, rx: Receiver<Message>, init_tx: Sender<Result<Init
         });
         // The initial query set holds the two frame-bracketing queries.
         let query_capacity = if query_set.is_some() { 2 } else { 0 };
-        let renderer = Renderer {
+        let renderer = GpuRenderer {
             max_texture: device.limits().max_texture_dimension_2d,
             device,
             queue,
@@ -628,84 +615,54 @@ pub fn run(config: GpuConfig, rx: Receiver<Message>, init_tx: Sender<Result<Init
             pass_meta: Vec::new(),
             timestamps_inside,
         };
-        Ok((renderer, info))
-    });
-    let (mut renderer, info) = match init {
-        Ok(pair) => pair,
-        Err(e) => {
-            let _ = init_tx.send(Err(e));
-            return;
-        }
-    };
-    let _ = init_tx.send(Ok(Init {
-        info: GpuInfo {
-            name: info.name,
-            backend: format!("{:?}", info.backend),
-            vendor: info.vendor,
-            device: info.device,
-            device_type: format!("{:?}", info.device_type),
-            driver: info.driver,
-            driver_info: info.driver_info,
-        },
-    }));
-    while let Ok(message) = rx.recv() {
-        match message {
-            Message::CreateSurface { id, size, reply } => {
-                let _ = reply.send(renderer.create_surface(id, size));
-            }
-            Message::DestroySurface { id } => {
-                renderer.surfaces.remove(&id);
-            }
-            Message::AddImage {
-                id,
-                width,
-                height,
-                pixels,
-                color_space,
-            } => {
-                renderer.add_image(id, width, height, &pixels, color_space);
-            }
-            Message::DestroyImage { id } => {
-                renderer.images.remove(&id);
-            }
-            Message::AddFont { id, data, index } => {
-                renderer.fonts.insert(
-                    id,
-                    FontData {
-                        data,
-                        index,
-                        colr: std::cell::RefCell::new(HashMap::new()),
-                    },
-                );
-            }
-            Message::Commit { surface, changes } => {
-                renderer.commit(surface, changes);
-            }
-            Message::Render { time, reply } => {
-                // The frame time exists for future scheduling; this slice
-                // renders immediately.
-                let _ = time;
-                let _ = reply.send(renderer.render_frame());
-            }
-            Message::Readback { surface, reply } => {
-                let _ = reply.send(renderer.readback(surface));
-            }
-            Message::Memory { reply } => {
-                let _ = reply.send(renderer.memory());
-            }
-            Message::Trim(pressure) => {
-                if pressure == Pressure::Critical {
-                    renderer.atlas.clear();
-                }
-            }
-            Message::Shutdown => break,
-        }
-    }
+        Ok((
+            renderer,
+            GpuInfo {
+                name: info.name,
+                backend: format!("{:?}", info.backend),
+                vendor: info.vendor,
+                device: info.device,
+                device_type: format!("{:?}", info.device_type),
+                driver: info.driver,
+                driver_info: info.driver_info,
+            },
+        ))
+    })
 }
 
-impl Renderer {
-    /// Creates a surface's target texture and layer tree.
-    fn create_surface(&mut self, id: SurfaceId, size: (u32, u32)) -> Result<(), SurfaceError> {
+/// Validates font data with `skrifa`, rejecting bitmap-only colour fonts.
+///
+/// `COLR` fonts render through the colour-glyph lowering; fonts carrying
+/// `CBDT`/`CBLC` or `sbix` bitmaps without outline glyphs cannot
+/// rasterize.
+fn validate_font(data: &[u8], index: u32) -> Result<(), ResourceError> {
+    use skrifa::MetadataProvider as _;
+    use skrifa::raw::TableProvider as _;
+    let font = skrifa::FontRef::from_index(data, index)
+        .map_err(|e| ResourceError::Font(format!("{e}")))?;
+    if font.outline_glyphs().iter().next().is_none()
+        && [skrifa::Tag::new(b"CBDT"), skrifa::Tag::new(b"sbix")]
+            .iter()
+            .any(|tag| font.data_for_tag(*tag).is_some())
+    {
+        return Err(ResourceError::Unsupported(names::COLOR_FONT));
+    }
+    Ok(())
+}
+
+impl Renderer for GpuRenderer {
+    type Target = GpuTarget;
+
+    fn create_surface(
+        &mut self,
+        id: SurfaceId,
+        target: GpuTarget,
+    ) -> Result<SurfaceInfo, SurfaceError> {
+        let GpuTarget::Offscreen(offscreen) = target;
+        let size = offscreen.size;
+        // The target is always Rgba16Float; both offscreen formats are
+        // accepted and readback decodes f16.
+        let _ = offscreen.format;
         if size.0 == 0 || size.1 == 0 {
             return Err(SurfaceError::ZeroSize);
         }
@@ -723,8 +680,6 @@ impl Renderer {
             TARGET_USAGES,
             TARGET_FORMAT,
         );
-        let mut layers = HashMap::new();
-        layers.insert(0, node());
         self.surfaces.insert(
             id,
             SurfaceState {
@@ -734,26 +689,95 @@ impl Renderer {
                 view,
                 scratch: Vec::new(),
                 backdrop: [None, None],
-                layers,
-                clear: cherenkov::WorkingColor::TRANSPARENT,
-                dirty: true,
-                frame: Frame::default(),
+                layers: HashMap::new(),
+                frame: LoweredFrame::default(),
+            },
+        );
+        Ok(SurfaceInfo {
+            size,
+            readable: true,
+        })
+    }
+
+    fn resize_surface(&mut self, id: SurfaceId, size: (u32, u32)) {
+        let Some(state) = self.surfaces.get_mut(&id) else {
+            return;
+        };
+        let (target, view) = create_target(
+            &self.device,
+            "surface target",
+            size,
+            TARGET_USAGES,
+            TARGET_FORMAT,
+        );
+        state.size = size;
+        state.target = target;
+        state.view = view;
+        state.scratch.clear();
+        state.backdrop = [None, None];
+    }
+
+    fn destroy_surface(&mut self, id: SurfaceId) {
+        self.surfaces.remove(&id);
+    }
+
+    fn add_font(&mut self, id: FontId, font: EngineFontData) -> Result<(), ResourceError> {
+        validate_font(&font.data, font.index)?;
+        self.fonts.insert(
+            id.raw(),
+            FontData {
+                data: font.data,
+                index: font.index,
+                colr: std::cell::RefCell::new(HashMap::new()),
             },
         );
         Ok(())
     }
 
-    /// Uploads a registered image, converting straight-alpha RGBA8 into
-    /// premultiplied linear Display P3 f16 — the oracle's `Resources::image`
-    /// conversion.
-    fn add_image(
-        &mut self,
-        id: u64,
-        width: u32,
-        height: u32,
-        pixels: &[u8],
-        color_space: crate::image::ImageColorSpace,
-    ) {
+    fn remove_font(&mut self, id: FontId) {
+        self.fonts.remove(&id.raw());
+    }
+
+    fn set_content(&mut self, surface: SurfaceId, layer: LayerId, content: Option<ContentOp>) {
+        let Some(state) = self.surfaces.get_mut(&surface) else {
+            return;
+        };
+        match content {
+            Some(ContentOp::Replace(list)) => {
+                state.layers.insert(layer, ContentData::List(list));
+            }
+            Some(ContentOp::Update(updates)) => {
+                if let Some(ContentData::List(list)) = state.layers.get_mut(&layer) {
+                    let _ = list.apply(updates);
+                }
+            }
+            Some(ContentOp::Picture(picture)) => {
+                state.layers.insert(layer, ContentData::Picture(picture));
+            }
+            None => {
+                state.layers.remove(&layer);
+            }
+        }
+    }
+
+    fn remove_layer(&mut self, surface: SurfaceId, layer: LayerId) {
+        if let Some(state) = self.surfaces.get_mut(&surface) {
+            state.layers.remove(&layer);
+        }
+    }
+
+    /// Uploads a registered image, converting the upload's RGBA8 into
+    /// premultiplied linear Display P3 f16 — the oracle's
+    /// `Resources::image` conversion.
+    fn add_image(&mut self, id: ImageId, image: ImageUpload) -> Result<(), ResourceError> {
+        if image.format != cherenkov::ImageFormat::Rgba8 {
+            return Err(ResourceError::Image(format!(
+                "unsupported image format {:?}",
+                image.format
+            )));
+        }
+        let (width, height) = (image.width, image.height);
+        let pixels: &[u8] = &image.data;
         let (texture, view) = create_target(
             &self.device,
             "image",
@@ -764,15 +788,30 @@ impl Renderer {
         let mut data = Vec::with_capacity(pixels.len() * 2);
         for px in pixels.as_chunks::<4>().0 {
             let a = f64::from(px[3]) / 255.0;
-            let lin = [
-                srgb_decode_u8(px[0]),
-                srgb_decode_u8(px[1]),
-                srgb_decode_u8(px[2]),
-            ];
-            // Display P3 uses sRGB's transfer function; sRGB-encoded input
-            // additionally needs the primaries' matrix.
-            let lin_p3 = match color_space {
-                crate::image::ImageColorSpace::Srgb => {
+            // Straight-alpha input decodes each channel; premultiplied
+            // input is un-premultiplied in the encoded domain first.
+            let decode = |v: u8| {
+                if image.premultiplied && a > 0.0 {
+                    ((f64::from(v) / 255.0) / a).min(1.0)
+                } else {
+                    f64::from(v) / 255.0
+                }
+            };
+            let lin = match image.color_space {
+                cherenkov::ImageColorSpace::LinearSrgb => {
+                    [decode(px[0]), decode(px[1]), decode(px[2])]
+                }
+                _ => [
+                    srgb_decode_u8_f64(decode(px[0])),
+                    srgb_decode_u8_f64(decode(px[1])),
+                    srgb_decode_u8_f64(decode(px[2])),
+                ],
+            };
+            // sRGB-primaries input additionally needs the primaries'
+            // matrix; Display P3 uses sRGB's transfer function, so the
+            // decode above covers both encoded spaces.
+            let lin_p3 = match image.color_space {
+                cherenkov::ImageColorSpace::Srgb | cherenkov::ImageColorSpace::LinearSrgb => {
                     let [x, y, z] = [
                         SRGB_TO_XYZ[0][2].mul_add(
                             lin[2],
@@ -793,7 +832,7 @@ impl Renderer {
                         XYZ_TO_P3[2][2].mul_add(z, XYZ_TO_P3[2][1].mul_add(y, XYZ_TO_P3[2][0] * x)),
                     ]
                 }
-                crate::image::ImageColorSpace::DisplayP3 => lin,
+                cherenkov::ImageColorSpace::DisplayP3 => lin,
             };
             for v in [a * lin_p3[0], a * lin_p3[1], a * lin_p3[2], a] {
                 data.extend_from_slice(&half::f16::from_f64(v).to_le_bytes());
@@ -819,7 +858,7 @@ impl Renderer {
             },
         );
         self.images.insert(
-            id,
+            id.raw(),
             GpuImage {
                 texture,
                 view,
@@ -827,105 +866,11 @@ impl Renderer {
                 height,
             },
         );
+        Ok(())
     }
 
-    /// Applies one surface's change set.
-    fn commit(&mut self, surface: SurfaceId, changes: ChangeSet) {
-        let Some(state) = self.surfaces.get_mut(&surface) else {
-            return;
-        };
-        if let Some(clear) = changes.clear {
-            state.clear = clear;
-            state.dirty = true;
-        }
-        for op in changes.ops {
-            state.dirty = true;
-            match op {
-                LayerOp::Create(id) => {
-                    state.layers.entry(id).or_insert_with(node);
-                }
-                LayerOp::Remove(id) => {
-                    Self::remove_node(&mut state.layers, id);
-                }
-                LayerOp::Transform(id, t) => {
-                    if let Some(node) = state.layers.get_mut(&id) {
-                        node.transform = t;
-                    }
-                }
-                LayerOp::Opacity(id, o) => {
-                    if let Some(node) = state.layers.get_mut(&id) {
-                        node.opacity = o;
-                    }
-                }
-                LayerOp::Blend(id, b) => {
-                    if let Some(node) = state.layers.get_mut(&id) {
-                        node.blend = b;
-                    }
-                }
-                LayerOp::Clip(id, clip) => {
-                    if let Some(node) = state.layers.get_mut(&id) {
-                        node.clip = clip;
-                    }
-                }
-                LayerOp::Content(id, picture) => {
-                    if let Some(node) = state.layers.get_mut(&id) {
-                        node.content = picture.map(ContentData::Picture);
-                    }
-                }
-                LayerOp::ContentChange(id, change) => {
-                    if let Some(node) = state.layers.get_mut(&id) {
-                        match change {
-                            ContentChange::Replace(list) => {
-                                node.content = Some(ContentData::List(list));
-                            }
-                            ContentChange::Update(updates) => {
-                                if let Some(ContentData::List(list)) = &mut node.content {
-                                    let _ = list.apply(updates);
-                                }
-                            }
-                        }
-                    }
-                }
-                LayerOp::Push { parent, child } => {
-                    Self::detach(&mut state.layers, child);
-                    if let Some(node) = state.layers.get_mut(&parent) {
-                        node.children.push(child);
-                    }
-                }
-                LayerOp::Insert {
-                    parent,
-                    index,
-                    child,
-                } => {
-                    Self::detach(&mut state.layers, child);
-                    if let Some(node) = state.layers.get_mut(&parent) {
-                        node.children.insert(index.min(node.children.len()), child);
-                    }
-                }
-                LayerOp::Detach { parent, child } => {
-                    if let Some(node) = state.layers.get_mut(&parent) {
-                        node.children.retain(|c| *c != child);
-                    }
-                }
-            }
-        }
-    }
-
-    /// Removes `child` from every child list holding it.
-    fn detach(layers: &mut HashMap<LayerId, LayerNode>, child: LayerId) {
-        for node in layers.values_mut() {
-            node.children.retain(|c| *c != child);
-        }
-    }
-
-    /// Removes a node and its descendants.
-    fn remove_node(layers: &mut HashMap<LayerId, LayerNode>, id: LayerId) {
-        Self::detach(layers, id);
-        if let Some(node) = layers.remove(&id) {
-            for child in node.children {
-                Self::remove_node(layers, child);
-            }
-        }
+    fn remove_image(&mut self, id: ImageId) {
+        self.images.remove(&id.raw());
     }
 
     /// Memory usage across buffers, textures and the atlas.
@@ -945,31 +890,30 @@ impl Renderer {
                 .map(|i| u64::from(i.width) * u64::from(i.height) * 8)
                 .sum::<u64>();
         MemoryUsage {
-            gpu: crate::Bytes(gpu),
-            cpu: crate::Bytes(self.atlas.cpu_bytes()),
+            gpu: cherenkov::Bytes(gpu),
+            cpu: cherenkov::Bytes(self.atlas.cpu_bytes()),
         }
     }
 
-    /// Lowers and submits every dirty surface, bracketed by drained
+    fn trim(&mut self, pressure: Pressure) {
+        if pressure == Pressure::Critical {
+            self.atlas.clear();
+        }
+    }
+
+    /// Lowers and submits every changed surface, bracketed by drained
     /// timestamp queries when enabled.
-    fn render_frame(&mut self) -> Result<(Next, FrameStats), RenderError> {
-        let mut stats = FrameStats::default();
-        let mut dirty: Vec<SurfaceId> = self
-            .surfaces
-            .iter()
-            .filter(|(_, s)| s.dirty)
-            .map(|(id, _)| *id)
-            .collect();
-        dirty.sort_unstable();
+    fn render(&mut self, frame: &Frame<'_>, stats: &mut FrameStats) -> Result<Redraw, RenderError> {
+        let dirty: Vec<&SurfaceFrame<'_>> = frame.surfaces.iter().filter(|sf| sf.changed).collect();
         if dirty.is_empty() {
-            return Ok((Next::Idle, stats));
+            return Ok(Redraw::None);
         }
         self.frame_pass_count = 0;
         self.pass_meta.clear();
         self.drain_and_stamp(0)?;
         let mut result = Ok(());
-        for id in dirty {
-            result = self.render_surface(id, &mut stats);
+        for sf in dirty {
+            result = self.render_surface(sf, stats);
             if result.is_err() {
                 break;
             }
@@ -999,16 +943,92 @@ impl Renderer {
         }
         self.wait()?;
         result?;
-        Ok((Next::Idle, stats))
+        // No backend-side redraw sources in this slice.
+        Ok(Redraw::None)
     }
 
+    /// Copies a surface's target into `Readback` pixels, decoding f16 → f32.
+    fn readback(&mut self, surface: SurfaceId) -> Result<Readback, RenderError> {
+        let Some(state) = self.surfaces.get(&surface) else {
+            return Err(RenderError::Readback("unknown surface".into()));
+        };
+        let (w, h) = state.size;
+        let bytes_per_row = (w * 8).div_ceil(256) * 256;
+        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback"),
+            size: u64::from(bytes_per_row) * u64::from(h),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("readback"),
+            });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &state.target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit([encoder.finish()]);
+        let slice = buf.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|e| RenderError::Readback(format!("poll: {e}")))?;
+        let data = slice.get_mapped_range();
+        let mut pixels = Vec::with_capacity((w * h) as usize);
+        for row in 0..h {
+            let start = (row * bytes_per_row) as usize;
+            for px in data[start..start + (w * 8) as usize].as_chunks::<8>().0 {
+                let bits: [u16; 4] = bytemuck::cast(*px);
+                pixels.push([
+                    half::f16::from_bits(bits[0]).to_f32(),
+                    half::f16::from_bits(bits[1]).to_f32(),
+                    half::f16::from_bits(bits[2]).to_f32(),
+                    half::f16::from_bits(bits[3]).to_f32(),
+                ]);
+            }
+        }
+        drop(data);
+        buf.unmap();
+        Ok(Readback {
+            width: w,
+            height: h,
+            pixels,
+        })
+    }
+}
+
+impl GpuRenderer {
     /// Lowers and submits one surface.
     #[expect(
         clippy::too_many_lines,
         clippy::cast_precision_loss,
         reason = "pixel sizes are well within f32"
     )]
-    fn render_surface(&mut self, id: SurfaceId, stats: &mut FrameStats) -> Result<(), RenderError> {
+    fn render_surface(
+        &mut self,
+        sf: &SurfaceFrame<'_>,
+        stats: &mut FrameStats,
+    ) -> Result<(), RenderError> {
+        let id = sf.id;
         // Lowering needs `surf.layers` and `surf.frame` plus `atlas`,
         // `fonts`, `device` and `queue`; take the layer map out of the
         // surface so the borrows stay disjoint.
@@ -1017,13 +1037,13 @@ impl Renderer {
                 return Ok(());
             };
             surf.frame.reset();
-            let layers = std::mem::take(&mut surf.layers);
+            let caches = std::mem::take(&mut surf.layers);
             // A full atlas is a recoverable signal: grow while the budget
             // allows, then clear once; a second failure after the clear
             // means the frame's live set exceeds the maximum atlas.
             let mut cleared = false;
             let result = loop {
-                let result = if let Some(root) = layers.get(&0) {
+                let result = {
                     let mut glyphs = GlyphContext {
                         atlas: &mut self.atlas,
                         queue: &self.queue,
@@ -1031,15 +1051,13 @@ impl Renderer {
                         images: &self.images,
                     };
                     let mut lowering = Lowering::new(&mut surf.frame, surf.size);
-                    let result = lowering.run(root, &layers, surf.clear, &mut glyphs);
+                    let result = lowering.run(sf.tree, &caches, sf.clear, &mut glyphs);
                     stats.glyphs_rasterized += lowering.glyphs_rasterized();
                     stats.paths_rasterized += lowering.paths_rasterized();
                     result
-                } else {
-                    Ok(())
                 };
                 match result {
-                    Err(RenderError::AtlasFull) if !cleared => {
+                    Err(RenderError::Render(e)) if e == "glyph atlas full" && !cleared => {
                         surf.frame.reset();
                         if self.atlas.size() < self.atlas.cap() {
                             self.atlas.grow(&self.device);
@@ -1048,11 +1066,13 @@ impl Renderer {
                             cleared = true;
                         }
                     }
-                    Err(RenderError::AtlasFull) => break Err(RenderError::AtlasExhausted),
+                    Err(RenderError::Render(e)) if e == "glyph atlas full" => {
+                        break Err(RenderError::Render("glyph atlas exhausted".into()));
+                    }
                     other => break other,
                 }
             };
-            surf.layers = layers;
+            surf.layers = caches;
             result
         };
         lowered?;
@@ -1397,7 +1417,6 @@ impl Renderer {
         self.queue.submit([encoder.finish()]);
         stats.passes += u32::try_from(surf.frame.passes.len()).unwrap_or(u32::MAX);
         stats.instances += u32::try_from(surf.frame.instances.len()).unwrap_or(u32::MAX);
-        surf.dirty = false;
         Ok(())
     }
 
@@ -1482,73 +1501,5 @@ impl Renderer {
         drop(data);
         self.query_staging.unmap();
         Ok(ticks)
-    }
-
-    /// Copies a surface's target into `Readback` pixels, decoding f16 → f32.
-    fn readback(&self, surface: SurfaceId) -> Result<Readback, RenderError> {
-        let Some(state) = self.surfaces.get(&surface) else {
-            return Err(RenderError::Readback("unknown surface".into()));
-        };
-        let (w, h) = state.size;
-        let bytes_per_row = (w * 8).div_ceil(256) * 256;
-        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("readback"),
-            size: u64::from(bytes_per_row) * u64::from(h),
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("readback"),
-            });
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &state.target,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &buf,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(bytes_per_row),
-                    rows_per_image: Some(h),
-                },
-            },
-            wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-        );
-        self.queue.submit([encoder.finish()]);
-        let slice = buf.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        self.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .map_err(|e| RenderError::Readback(format!("poll: {e}")))?;
-        let data = slice.get_mapped_range();
-        let mut pixels = Vec::with_capacity((w * h) as usize);
-        for row in 0..h {
-            let start = (row * bytes_per_row) as usize;
-            for px in data[start..start + (w * 8) as usize].as_chunks::<8>().0 {
-                let bits: [u16; 4] = bytemuck::cast(*px);
-                pixels.push([
-                    half::f16::from_bits(bits[0]).to_f32(),
-                    half::f16::from_bits(bits[1]).to_f32(),
-                    half::f16::from_bits(bits[2]).to_f32(),
-                    half::f16::from_bits(bits[3]).to_f32(),
-                ]);
-            }
-        }
-        drop(data);
-        buf.unmap();
-        Ok(Readback {
-            width: w,
-            height: h,
-            pixels,
-        })
     }
 }

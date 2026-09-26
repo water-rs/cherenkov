@@ -5,7 +5,8 @@
 //! clips and blend groups, not the foreground paint alone.
 
 use cherenkov::{Draw, Glyph, GlyphRun, WorkingColor};
-use cherenkov_gpu::{Engine, EngineError, FontSource, Gpu, GpuConfig, Offscreen, OffscreenFormat};
+use cherenkov::{Engine, EngineError, FontSource, Offscreen, OffscreenFormat};
+use cherenkov_gpu::{Gpu, GpuConfig};
 
 const FONT_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -52,7 +53,7 @@ fn colr_glyphs_render_their_paint_graph() -> Result<(), Box<dyn std::error::Erro
     };
     let engine = match Engine::<Gpu>::new(GpuConfig::default()) {
         Ok(engine) => engine,
-        Err(EngineError::NoAdapter) => return Ok(()),
+        Err(EngineError::Backend(_)) => return Ok(()),
         Err(e) => return Err(e.into()),
     };
     let font = engine.font(FontSource::bytes(bytes))?;
@@ -62,7 +63,7 @@ fn colr_glyphs_render_their_paint_graph() -> Result<(), Box<dyn std::error::Erro
             c.glyphs(&run(font.id()), WorkingColor::new([1.0, 0.0, 0.0, 1.0]));
         }));
     });
-    engine.render(cherenkov_gpu::FrameTime::now())?;
+    engine.render(cherenkov::FrameTime::now())?;
     let rb = surface.readback()?;
     // Count distinct hues: quantize each non-clear pixel's chroma angle.
     let mut hues = std::collections::HashSet::new();

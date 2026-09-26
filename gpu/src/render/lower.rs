@@ -14,7 +14,11 @@ use cherenkov::{
 };
 use cherenkov::{GlyphRun, GlyphStyle};
 
-use crate::error::{RenderError, Unsupported};
+use cherenkov::RenderError;
+
+use crate::names;
+use cherenkov::{LayerId, SurfaceTree};
+
 use crate::render::GpuImage;
 use skrifa::MetadataProvider as _;
 use skrifa::raw::TableProvider as _;
@@ -183,7 +187,7 @@ struct Boxed {
 /// approaches 4.
 ///
 /// A `Line` has no area and draws nothing, so it returns `None`.
-fn box_shape(shape: &ShapeData) -> Result<Option<Boxed>, Unsupported> {
+fn box_shape(shape: &ShapeData) -> Result<Option<Boxed>, RenderError> {
     let boxed = match shape {
         ShapeData::Rect(r) => {
             let half = [f32_f64(r.width() / 2.0), f32_f64(r.height() / 2.0)];
@@ -259,7 +263,7 @@ fn box_shape(shape: &ShapeData) -> Result<Option<Boxed>, Unsupported> {
             }
         }
         ShapeData::Line(_) => return Ok(None),
-        ShapeData::Path { .. } => return Err(Unsupported::Path),
+        ShapeData::Path { .. } => return Err(RenderError::Unsupported(names::PATH)),
     };
     Ok(Some(boxed))
 }
@@ -436,11 +440,11 @@ fn paint_data(
             data.first_stop = first;
             data.packed = packed;
         }
-        Paint::Mesh(_) => return Err(Unsupported::Mesh.into()),
+        Paint::Mesh(_) => return Err(RenderError::Unsupported(names::MESH)),
         Paint::Image(pattern) => {
-            let img = images
-                .get(&pattern.image.raw())
-                .ok_or_else(|| RenderError::Image(pattern.image.raw()))?;
+            let img = images.get(&pattern.image.raw()).ok_or_else(|| {
+                RenderError::Image(format!("unregistered image {}", pattern.image.raw()))
+            })?;
             // `to_local * transform` maps image space to instance-local; the
             // shader needs the inverse.
             let [a, b, c, d, e, f] = (to_local * pattern.transform).inverse().as_coeffs();
@@ -457,25 +461,9 @@ fn paint_data(
                 | (sampling << 8);
             data.image = Some(pattern.image.raw());
         }
-        Paint::Shader(_) => return Err(Unsupported::Shader.into()),
+        Paint::Shader(_) => return Err(RenderError::Unsupported(names::SHADER)),
     }
     Ok(data)
-}
-
-/// A layer node on the render thread's side, handed to the lowering.
-pub struct LayerNode {
-    /// Local transform.
-    pub transform: Affine,
-    /// Opacity; below 1.0 isolates.
-    pub opacity: f32,
-    /// Blend mode onto the parent; non-normal isolates.
-    pub blend: cherenkov::BlendMode,
-    /// Clip shape.
-    pub clip: Option<ShapeData>,
-    /// The content.
-    pub content: Option<ContentData>,
-    /// Child layers, in order.
-    pub children: Vec<u64>,
 }
 
 /// A layer's content.
@@ -536,17 +524,18 @@ impl<'a> Lowering<'a> {
         self.paths
     }
 
-    /// Lowers a root layer and its clear colour into the frame.
+    /// Lowers a surface's sampled [`SurfaceTree`] and its clear colour
+    /// into the frame. `caches` holds each layer's render-side content.
     pub fn run(
         &mut self,
-        root: &LayerNode,
-        layers: &HashMap<u64, LayerNode>,
+        tree: &SurfaceTree,
+        caches: &HashMap<LayerId, ContentData>,
         clear: WorkingColor,
         glyphs: &mut GlyphContext<'_>,
     ) -> Result<(), RenderError> {
         let [r, g, b, a] = clear.components;
         self.begin_pass(Target::Surface, Some([r * a, g * a, b * a, a]));
-        self.layer_items(root, layers, glyphs)?;
+        self.layer(tree.root(), tree, caches, glyphs)?;
         self.finish_pass();
         Ok(())
     }
@@ -980,33 +969,42 @@ impl<'a> Lowering<'a> {
         }
     }
 
-    /// A layer: push its transform, then clip, then isolate for opacity,
-    /// then content followed by children.
+    /// A layer: push its transform, then clip, then isolate for opacity
+    /// and blend, then content followed by children. The clip applies in
+    /// `transform` space; content and children draw in
+    /// `content_transform` space, which is where `scroll_offset` bites.
     fn layer(
         &mut self,
-        id: u64,
-        layers: &HashMap<u64, LayerNode>,
+        id: LayerId,
+        tree: &SurfaceTree,
+        caches: &HashMap<LayerId, ContentData>,
         glyphs: &mut GlyphContext<'_>,
     ) -> Result<(), RenderError> {
-        let Some(node) = layers.get(&id) else {
-            return Ok(());
-        };
+        let node = tree.layer(id);
+        if node.filter.is_some() {
+            return Err(RenderError::Unsupported(names::FILTER));
+        }
+        if node.backdrop.is_some() {
+            return Err(RenderError::Unsupported(names::BACKDROP));
+        }
         let saved = self.transform;
         self.transform = saved * node.transform;
+        let content_space = saved * node.content_transform();
         let result = self.with_clip(
             node.clip.as_ref(),
             |s, glyphs| {
+                s.transform = content_space;
                 if node.opacity < 1.0 || node.blend != cherenkov::BlendMode::Normal {
                     let inner = s.clip;
                     s.isolate(
                         inner,
                         node.opacity,
                         node.blend,
-                        |s, glyphs| s.layer_items(node, layers, glyphs),
+                        |s, glyphs| s.layer_items(id, node, tree, caches, glyphs),
                         glyphs,
                     )
                 } else {
-                    s.layer_items(node, layers, glyphs)
+                    s.layer_items(id, node, tree, caches, glyphs)
                 }
             },
             glyphs,
@@ -1018,11 +1016,13 @@ impl<'a> Lowering<'a> {
     /// Content first, then children — the engine's layer ordering.
     fn layer_items(
         &mut self,
-        node: &LayerNode,
-        layers: &HashMap<u64, LayerNode>,
+        id: LayerId,
+        node: &cherenkov::LayerNode,
+        tree: &SurfaceTree,
+        caches: &HashMap<LayerId, ContentData>,
         glyphs: &mut GlyphContext<'_>,
     ) -> Result<(), RenderError> {
-        match &node.content {
+        match caches.get(&id) {
             Some(ContentData::Picture(p)) => {
                 self.commands(p.display_list(), 0, p.display_list().len(), glyphs)?;
             }
@@ -1032,7 +1032,7 @@ impl<'a> Lowering<'a> {
             None => {}
         }
         for child in &node.children {
-            self.layer(*child, layers, glyphs)?;
+            self.layer(*child, tree, caches, glyphs)?;
         }
         Ok(())
     }
@@ -1089,10 +1089,10 @@ impl<'a> Lowering<'a> {
                 }
                 Command::BeginGroup { group, end } => {
                     if group.filter.is_some() {
-                        return Err(Unsupported::Filter.into());
+                        return Err(RenderError::Unsupported(names::FILTER));
                     }
                     if group.blend_space != BlendSpace::Linear {
-                        return Err(Unsupported::BlendSpace.into());
+                        return Err(RenderError::Unsupported(names::BLEND_SPACE));
                     }
                     let inner_end = (*end as usize).min(commands.len());
                     if group.opacity >= 1.0 && group.blend == BlendMode::Normal {
@@ -1162,7 +1162,7 @@ impl<'a> Lowering<'a> {
         let img = glyphs
             .images
             .get(&image.raw())
-            .ok_or_else(|| RenderError::Image(image.raw()))?;
+            .ok_or_else(|| RenderError::Image(format!("unregistered image {}", image.raw())))?;
         let (iw, ih) = (f64::from(img.width), f64::from(img.height));
         let (dw, dh) = (dst.x1 - dst.x0, dst.y1 - dst.y0);
         if dw <= 0.0 || dh <= 0.0 {
@@ -1192,7 +1192,7 @@ impl<'a> Lowering<'a> {
         // Path strokes and dashed strokes rasterize the stroked outline.
         if matches!(shape, ShapeData::Path { .. }) || !stroke.dash_pattern.is_empty() {
             if matches!(shape, ShapeData::Continuous(_)) {
-                return Err(Unsupported::Path.into());
+                return Err(RenderError::Unsupported(names::PATH));
             }
             let tol = path::FLATTEN / path::sigma_max(self.transform).max(1e-12);
             let content = path::hash_stroke(shape, stroke, tol);
@@ -1230,11 +1230,13 @@ impl<'a> Lowering<'a> {
                         kurbo::Join::Round => f32_f64(hw),
                         kurbo::Join::Miter => {
                             if stroke.miter_limit < 1.415 {
-                                return Err(Unsupported::StrokeJoin.into());
+                                return Err(RenderError::Unsupported(names::STROKE_JOIN));
                             }
                             0.0
                         }
-                        kurbo::Join::Bevel => return Err(Unsupported::StrokeJoin.into()),
+                        kurbo::Join::Bevel => {
+                            return Err(RenderError::Unsupported(names::STROKE_JOIN));
+                        }
                     };
                 }
             }
@@ -1288,7 +1290,7 @@ impl<'a> Lowering<'a> {
         glyphs: &GlyphContext<'_>,
     ) -> Result<(), RenderError> {
         if stroke.start_cap != stroke.end_cap {
-            return Err(Unsupported::StrokeJoin.into());
+            return Err(RenderError::Unsupported(names::STROKE_JOIN));
         }
         let d = line.p1 - line.p0;
         let len = d.hypot();
@@ -1335,7 +1337,7 @@ impl<'a> Lowering<'a> {
             return Ok(());
         };
         if !shape_is_offsettable(boxed.shape) {
-            return Err(Unsupported::Shadow.into());
+            return Err(RenderError::Unsupported(names::SHADOW));
         }
         let mut s = boxed.shape;
         let spread = f32_f64(shadow.spread);
@@ -1504,13 +1506,13 @@ impl<'a> Lowering<'a> {
             };
             self.paths += 1;
             let (Ok(w), Ok(h)) = (u32::try_from(coverage.w), u32::try_from(coverage.h)) else {
-                return Err(Unsupported::PathClipTooLarge.into());
+                return Err(RenderError::Unsupported(names::PATH_CLIP_TOO_LARGE));
             };
             if !glyphs.atlas.can_ever_fit(w, h) {
-                return Err(Unsupported::PathClipTooLarge.into());
+                return Err(RenderError::Unsupported(names::PATH_CLIP_TOO_LARGE));
             }
             let Some((cx, cy)) = glyphs.atlas.alloc(w, h) else {
-                return Err(RenderError::AtlasFull);
+                return Err(RenderError::Render("glyph atlas full".into()));
             };
             let texels: Vec<u8> = coverage
                 .data
@@ -1569,7 +1571,7 @@ impl<'a> Lowering<'a> {
         glyphs: &mut GlyphContext<'_>,
     ) -> Result<(), RenderError> {
         if matches!(run.style, GlyphStyle::Stroke(_)) {
-            return Err(Unsupported::GlyphStroke.into());
+            return Err(RenderError::Unsupported(names::GLYPH_STROKE));
         }
         let font = glyphs
             .fonts
@@ -1581,7 +1583,7 @@ impl<'a> Lowering<'a> {
         let mut colr_checked = false;
         for glyph in &run.glyphs {
             if glyph.transform.is_some() {
-                return Err(Unsupported::GlyphTransform.into());
+                return Err(RenderError::Unsupported(names::GLYPH_TRANSFORM));
             }
             if !colr_checked {
                 colr_checked = true;

@@ -1,5 +1,6 @@
 //! The render thread: sole owner of the framebuffers and the worker pool.
 
+mod blend;
 mod glyph;
 mod lower;
 mod paint;
@@ -50,6 +51,7 @@ const fn node() -> LayerNode {
     LayerNode {
         transform: kurbo::Affine::IDENTITY,
         opacity: 1.0,
+        blend: cherenkov::BlendMode::Normal,
         clip: None,
         content: None,
         children: Vec::new(),
@@ -207,6 +209,11 @@ impl Renderer {
                 LayerOp::Transform(id, t) => {
                     if let Some(node) = state.layers.get_mut(&id) {
                         node.transform = t;
+                    }
+                }
+                LayerOp::Blend(id, b) => {
+                    if let Some(node) = state.layers.get_mut(&id) {
+                        node.blend = b;
                     }
                 }
                 LayerOp::Opacity(id, o) => {

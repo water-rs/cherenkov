@@ -36,6 +36,9 @@ pub enum TargetSpec {
     Offscreen {
         /// Size in pixels.
         size: (u32, u32),
+        /// The refresh-rate range the caller configured for
+        /// [`Next::At`](crate::Next::At).
+        rate: crate::RefreshRange,
     },
     /// A window surface.
     Window(Box<crate::interop::wgpu::Window>),
@@ -45,6 +48,7 @@ impl From<Offscreen> for TargetSpec {
     fn from(offscreen: Offscreen) -> Self {
         Self::Offscreen {
             size: offscreen.size,
+            rate: offscreen.rate,
         }
     }
 }

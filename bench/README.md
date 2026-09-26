@@ -25,3 +25,43 @@ set, `controlled`/`heterogeneous` flags, per-CPU sample counts and each
 CPU's `cpuinfo_max_freq`. Without `--cpu` on a heterogeneous host the
 run still proceeds but the report marks `controlled: false` and the log
 warns once — publish those numbers only with the caveat attached.
+
+## Measuring energy per frame
+
+`measure --rate <hz>` paces the measured frames at a fixed rate instead
+of running flat out: frame `n` starts on the deadline `start + n/rate`
+(the one sleep in the loop is frame pacing). The report's `pacing`
+block records the requested rate, the achieved rate, and how many
+frames missed their deadline. Energy per frame is only comparable
+between engines at a fixed rate.
+
+`measure --energy` brackets the measured window — after warmup, from
+just before the first measured frame to just after the last — with the
+platform's power meter and adds an `energy` block: joules, joules per
+frame and average watts per rail and in total.
+
+**Android** (Pixel-class devices with ODPM): every rail named in
+`/sys/bus/iio/devices/iio:device*/enabled_rails` is read from
+`energy_value` before and after the window. The rails are root-only —
+run the bench rooted:
+
+    adb shell su -c '/data/local/tmp/cherenkov-bench measure \
+        --engine vello-cpu --scene /data/local/tmp/scenes/perf/chart \
+        --frames 120 --rate 60 --cpu 7 --energy --out /data/local/tmp/measure.json'
+
+`--energy` is mandatory: if the rails can't be read, the command fails
+with an error naming the path and the permission rather than writing a
+report without energy.
+
+**macOS**: `sudo -n powermetrics --samplers cpu_power,gpu_power -i <ms>
+--format plist` runs for exactly the measured window and the CPU, GPU
+and ANE package energies are summed. `sudo -n` must be permitted (a
+cached credential or a sudoers entry); if it isn't, the command fails
+with a clear error.
+
+The report's `conditions` block records what else skewed the numbers:
+thermal status (`dumpsys thermalservice` severity on Android,
+`powermetrics` `thermal_pressure` on macOS) and the first readable
+`/sys/class/thermal` zone temperature, screen state and brightness
+where readable, alongside the `placement` block `--cpu` already
+produces. Screen brightness is not recorded on macOS or Windows.

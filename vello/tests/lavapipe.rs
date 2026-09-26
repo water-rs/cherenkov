@@ -200,3 +200,283 @@ fn layer_tree_composes_transform_opacity_clip() {
     // Outside both: untouched black clear.
     assert_pixel(px(&readback, 50, 50), clear, "cleared pixel");
 }
+
+/// The expected working-space pixel of stored sRGB-encoded texel `enc`
+/// (values in 0..1) composited src-over onto `dst` (straight working P3):
+/// quantize, then treat the encoded premultiplied value as the source.
+#[expect(
+    clippy::many_single_char_names,
+    reason = "channel names r/g/b/a are the clearest here"
+)]
+fn expected_stored(enc: [f64; 4], dst: [f64; 4]) -> [f64; 4] {
+    let s: Vec<f64> = enc
+        .iter()
+        .map(|v| (v.clamp(0.0, 1.0) * 255.0).round() / 255.0)
+        .collect();
+    let d: Vec<f64> = {
+        let [r, g, b, a] = dst;
+        let [r, g, b] = mat_vec(&LINEAR_P3_TO_LINEAR_SRGB, [r, g, b]);
+        [
+            srgb_encode(r.clamp(0.0, 1.0)) * a,
+            srgb_encode(g.clamp(0.0, 1.0)) * a,
+            srgb_encode(b.clamp(0.0, 1.0)) * a,
+            a,
+        ]
+        .into_iter()
+        .map(|v| (v.clamp(0.0, 1.0) * 255.0).round() / 255.0)
+        .collect()
+    };
+    let s3 = s[3];
+    let over = |s: f64, d: f64| (1.0 - s3).mul_add(d, s);
+    let out = [
+        over(s[0], d[0]),
+        over(s[1], d[1]),
+        over(s[2], d[2]),
+        over(s3, d[3]),
+    ];
+    let lin = [
+        srgb_decode(out[0]),
+        srgb_decode(out[1]),
+        srgb_decode(out[2]),
+    ];
+    let p3 = mat_vec(&LINEAR_SRGB_TO_LINEAR_P3, lin);
+    [p3[0], p3[1], p3[2], out[3]]
+}
+
+/// `GpuContent` that clears its texture to a constant colour.
+struct ClearContent(wgpu::Color);
+
+use cherenkov_vello::interop::wgpu;
+
+impl cherenkov_vello::GpuContent for ClearContent {
+    async fn setup(&mut self, _gpu: &wgpu::Context<'_>) {}
+
+    fn render(&mut self, frame: &mut wgpu::Frame<'_>) {
+        let mut encoder = frame
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("test clear"),
+            });
+        {
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("test clear"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: frame.view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(self.0),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+        }
+        frame.queue.submit([encoder.finish()]);
+    }
+}
+
+#[test]
+fn gpu_content_composites_as_an_image() {
+    let Some(engine) = engine() else { return };
+    let surface = engine.surface(Offscreen::new((64, 64))).expect("surface");
+    surface.clear_color(WorkingColor::TRANSPARENT);
+    // Opaque colour, so straight == premultiplied in the stored texel.
+    let enc = [0.9, 0.1, 0.2];
+    let content = engine.gpu_content(
+        (20, 20),
+        ClearContent(wgpu::Color {
+            r: enc[0],
+            g: enc[1],
+            b: enc[2],
+            a: 1.0,
+        }),
+    );
+    let redraw = content.redraw_handle();
+    let layer = surface.layer();
+    surface.update(|tx| {
+        tx[&layer]
+            .transform(Affine::translate((10., 10.)))
+            .content(content);
+        tx[surface.root()].push(&layer);
+    });
+    let next = engine
+        .render(cherenkov_vello::FrameTime::now())
+        .expect("render");
+    assert_eq!(next, Next::Idle);
+    let readback = surface.readback().expect("readback");
+    assert_pixel(
+        px(&readback, 15, 15),
+        expected_stored([enc[0], enc[1], enc[2], 1.0], [0., 0., 0., 0.]),
+        "content pixel",
+    );
+    assert_pixel(
+        px(&readback, 5, 5),
+        expected_stored([0., 0., 0., 0.], [0., 0., 0., 0.]),
+        "outside content",
+    );
+    // Nothing changed: second frame is idle.
+    let next = engine
+        .render(cherenkov_vello::FrameTime::now())
+        .expect("render");
+    assert_eq!(next, Next::Idle);
+    // A redraw request re-renders the content and schedules a frame.
+    redraw.request_redraw();
+    let next = engine
+        .render(cherenkov_vello::FrameTime::now())
+        .expect("render");
+    assert!(matches!(next, Next::At { .. }), "{next:?}");
+    assert!(!redraw.is_dirty());
+}
+
+#[test]
+fn shader_paint_is_sampled_as_an_image() {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "test colours are exact in f32"
+    )]
+    fn uniforms(enc: [f64; 3]) -> Vec<f32> {
+        vec![enc[0] as f32, enc[1] as f32, enc[2] as f32, 1.0]
+    }
+    let Some(engine) = engine() else { return };
+    let shader = engine
+        .shader(cherenkov_vello::ShaderSource::wgsl(
+            "@fragment fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> { return vec4<f32>(params[0].rgb, params[0].w); }",
+        ))
+        .expect("shader");
+    let animated = engine
+        .shader(
+            cherenkov_vello::ShaderSource::wgsl(
+                "@fragment fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> { return vec4<f32>(params[0].rgb, params[0].w); }",
+            )
+            .animated(),
+        )
+        .expect("animated shader");
+    let surface = engine.surface(Offscreen::new((64, 64))).expect("surface");
+    surface.clear_color(WorkingColor::TRANSPARENT);
+    let enc = [0.9, 0.1, 0.2];
+    let paint = cherenkov::ShaderPaint {
+        shader: shader.id(),
+        uniforms: uniforms(enc),
+    };
+    let anim_paint = cherenkov::ShaderPaint {
+        shader: animated.id(),
+        uniforms: uniforms(enc),
+    };
+    let anim_layer = surface.layer();
+    surface.update(|tx| {
+        tx[surface.root()].content(surface.record(|c| {
+            c.fill(Rect::new(8., 8., 40., 40.), paint);
+        }));
+        tx[&anim_layer]
+            .transform(Affine::translate((32., 32.)))
+            .content(surface.record(|c| {
+                c.fill(Rect::new(0., 0., 16., 16.), anim_paint);
+            }));
+        tx[surface.root()].push(&anim_layer);
+    });
+    // The animated shader keeps the frame refresh alive.
+    let next = engine
+        .render(cherenkov_vello::FrameTime::now())
+        .expect("render");
+    assert!(matches!(next, Next::At { .. }), "{next:?}");
+    let readback = surface.readback().expect("readback");
+    assert_pixel(
+        px(&readback, 24, 24),
+        expected_stored([enc[0], enc[1], enc[2], 1.0], [0., 0., 0., 0.]),
+        "shader pixel",
+    );
+    // Drop the animated layer: the static shader alone leaves the engine idle.
+    drop(anim_layer);
+    let next = engine
+        .render(cherenkov_vello::FrameTime::now())
+        .expect("render");
+    assert_eq!(next, Next::Idle);
+}
+
+#[test]
+fn bad_wgsl_returns_resource_error() {
+    let Some(engine) = engine() else { return };
+    let result = engine.shader(cherenkov_vello::ShaderSource::wgsl(
+        "this is not valid wgsl {{{",
+    ));
+    assert!(
+        matches!(result, Err(cherenkov_vello::ResourceError::Shader(_))),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn mesh_paint_reports_unsupported() {
+    let Some(engine) = engine() else { return };
+    let surface = engine.surface(Offscreen::new((64, 64))).expect("surface");
+    let mesh = cherenkov::MeshGradient::new(
+        1,
+        1,
+        vec![
+            cherenkov::kurbo::Point::new(0., 0.),
+            cherenkov::kurbo::Point::new(64., 0.),
+            cherenkov::kurbo::Point::new(0., 64.),
+            cherenkov::kurbo::Point::new(64., 64.),
+        ],
+        vec![WorkingColor::WHITE; 4],
+    );
+    surface.update(|tx| {
+        tx[surface.root()].content(surface.record(|c| {
+            c.fill(Rect::new(0., 0., 64., 64.), mesh);
+        }));
+    });
+    let result = engine.render(cherenkov_vello::FrameTime::now());
+    assert!(
+        matches!(
+            result,
+            Err(cherenkov_vello::RenderError::Unsupported(
+                cherenkov_vello::Unsupported::MeshGradient
+            ))
+        ),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn filter_runs_over_the_layer_texture() {
+    let Some(engine) = engine() else { return };
+    let filter = engine.filter(filtrate::filters::Invert);
+    let surface = engine.surface(Offscreen::new((64, 64))).expect("surface");
+    surface.clear_color(WorkingColor::BLACK);
+    let fill = WorkingColor::new([0.9, 0.1, 0.2, 1.0]);
+    let layer = surface.layer();
+    surface.update(|tx| {
+        tx[&layer]
+            .content(surface.record(|c| {
+                c.fill(Rect::new(0., 0., 64., 64.), fill);
+            }))
+            .filter(&filter);
+        tx[surface.root()].push(&layer);
+    });
+    let next = engine
+        .render(cherenkov_vello::FrameTime::now())
+        .expect("render");
+    let readback = surface.readback().expect("readback");
+    // Invert is `a - rgb` on premultiplied values in the space the
+    // executor samples — our encoded texels. So the stored output is
+    // `1 - enc` per channel.
+    let [r, g, b, a] = fill.components.map(f64::from);
+    let lin = mat_vec(&LINEAR_P3_TO_LINEAR_SRGB, [r, g, b]);
+    let enc = [
+        srgb_encode(lin[0].clamp(0.0, 1.0)) * a,
+        srgb_encode(lin[1].clamp(0.0, 1.0)) * a,
+        srgb_encode(lin[2].clamp(0.0, 1.0)) * a,
+        a,
+    ];
+    let inverted = [1.0 - enc[0], 1.0 - enc[1], 1.0 - enc[2], enc[3]];
+    assert_pixel(
+        px(&readback, 32, 32),
+        expected_stored(inverted, WorkingColor::BLACK.components.map(f64::from)),
+        "inverted pixel",
+    );
+    assert_eq!(next, Next::Idle);
+}

@@ -195,3 +195,94 @@ impl Drop for Image {
         let _ = self.tx.send(Message::RemoveImage { id: self.id.raw() });
     }
 }
+
+/// A user shader's WGSL fragment source.
+///
+/// The engine prepends a prelude declaring `uniforms` (time, resolution),
+/// `params` (up to 16 `vec4<f32>` of [`ShaderPaint`](cherenkov::ShaderPaint)
+/// uniforms, zero-padded) and a fullscreen-triangle vertex shader; the
+/// source supplies `@fragment fn main(@location(0) uv: vec2<f32>) ->
+/// @location(0) vec4<f32>` returning a straight-alpha colour.
+#[derive(Clone, Debug)]
+pub struct ShaderSource {
+    /// The fragment source, without the prelude.
+    pub source: std::borrow::Cow<'static, str>,
+    /// Whether the shader animates: when true, it is re-rendered every
+    /// frame so `uniforms.time` advances and the engine keeps refreshing.
+    pub animated: bool,
+}
+
+impl ShaderSource {
+    /// A static shader from a WGSL fragment body.
+    pub fn wgsl(fragment: impl Into<std::borrow::Cow<'static, str>>) -> Self {
+        Self {
+            source: fragment.into(),
+            animated: false,
+        }
+    }
+
+    /// Marks the shader as animated (re-rendered each frame).
+    #[must_use]
+    pub fn animated(self) -> Self {
+        Self {
+            source: self.source,
+            animated: true,
+        }
+    }
+}
+
+/// A shader registered with an engine. Dropping it unregisters the shader.
+#[derive(Debug)]
+pub struct Shader {
+    id: cherenkov::ShaderId,
+    tx: Sender<Message>,
+}
+
+impl Shader {
+    /// A handle for the registered shader `id`.
+    #[must_use]
+    pub const fn new(id: cherenkov::ShaderId, tx: Sender<Message>) -> Self {
+        Self { id, tx }
+    }
+
+    /// The identifier [`ShaderPaint`](cherenkov::ShaderPaint) references.
+    #[must_use]
+    pub const fn id(&self) -> cherenkov::ShaderId {
+        self.id
+    }
+}
+
+impl Drop for Shader {
+    fn drop(&mut self) {
+        let _ = self.tx.send(Message::RemoveShader { id: self.id.raw() });
+    }
+}
+
+/// A filter effect registered with an engine. Dropping it unregisters the
+/// filter.
+#[derive(Debug)]
+pub struct Filter {
+    id: cherenkov::FilterId,
+    tx: Sender<Message>,
+}
+
+impl Filter {
+    /// A handle for the registered filter `id`.
+    #[must_use]
+    pub const fn new(id: cherenkov::FilterId, tx: Sender<Message>) -> Self {
+        Self { id, tx }
+    }
+
+    /// The identifier [`LayerEdit::filter`](crate::LayerEdit::filter)
+    /// references.
+    #[must_use]
+    pub const fn id(&self) -> cherenkov::FilterId {
+        self.id
+    }
+}
+
+impl Drop for Filter {
+    fn drop(&mut self) {
+        let _ = self.tx.send(Message::RemoveFilter { id: self.id.raw() });
+    }
+}

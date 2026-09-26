@@ -5,13 +5,14 @@
 //! channel is owned and `Send`; there are no locks anywhere in the engine.
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::Sender;
 
 use cherenkov::kurbo::Affine;
 use cherenkov::{BlendMode, ContentChange, FilterId, Picture, ShapeData, WorkingColor};
 use vello::peniko;
 
-use crate::error::{RenderError, SurfaceError};
+use crate::error::{RenderError, ResourceError, SurfaceError};
 use crate::surface::{FrameStats, FrameTime, Next, Offscreen, Readback};
 use crate::{MemoryUsage, Pressure};
 
@@ -39,7 +40,7 @@ pub enum TargetSpec {
         /// Size in pixels.
         size: (u32, u32),
     },
-    /// A window surface (phase 2; not yet drawable).
+    /// A window surface.
     Window(Box<crate::interop::wgpu::Window>),
 }
 
@@ -58,10 +59,46 @@ impl From<crate::interop::wgpu::Window> for TargetSpec {
 }
 
 /// What a layer draws, crossing the channel.
-#[derive(Debug)]
 pub enum LayerContentMsg {
     /// A shared immutable picture.
     Picture(Picture),
+    /// GPU-rendered content retained on the render thread.
+    Gpu(GpuContentMsg),
+}
+
+impl std::fmt::Debug for LayerContentMsg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Picture(_) => f.write_str("Picture(..)"),
+            Self::Gpu(g) => f
+                .debug_struct("Gpu")
+                .field("id", &g.id)
+                .field("size", &g.size)
+                .finish(),
+        }
+    }
+}
+
+/// A [`GpuContentHandle`](crate::GpuContentHandle) crossing to the render
+/// thread.
+pub struct GpuContentMsg {
+    /// The content's engine-wide id.
+    pub id: u64,
+    /// Content size in pixels.
+    pub size: (u32, u32),
+    /// The shared redraw flag.
+    pub dirty: Arc<AtomicBool>,
+    /// The content object.
+    pub content: Box<dyn crate::gpu_content::AnyGpuContent>,
+}
+
+/// A shader's WGSL fragment source, crossing to the render thread.
+#[derive(Debug)]
+pub struct ShaderSpec {
+    /// The fragment source (without the prelude).
+    pub source: std::borrow::Cow<'static, str>,
+    /// Whether the shader is re-rendered every frame (`time` uniform).
+    pub animated: bool,
 }
 
 /// One layer mutation in a committed change set.
@@ -119,6 +156,12 @@ pub struct ChangeSet {
     pub ops: Vec<LayerOp>,
 }
 
+impl std::fmt::Debug for dyn crate::render::filter::FilterSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FilterSource(..)")
+    }
+}
+
 /// A message to the render thread.
 #[derive(Debug)]
 pub enum Message {
@@ -167,6 +210,33 @@ pub enum Message {
     /// Unregister an image.
     RemoveImage {
         /// The image id.
+        id: u64,
+    },
+    /// Register a shader and build its pipeline.
+    AddShader {
+        /// The shader id (`ShaderId::raw`).
+        id: u64,
+        /// The fragment source.
+        source: ShaderSpec,
+        /// Validation result.
+        reply: Sender<Result<(), ResourceError>>,
+    },
+    /// Unregister a shader.
+    RemoveShader {
+        /// The shader id.
+        id: u64,
+    },
+    /// Register a filter effect (built into an executor/effect on the
+    /// render thread: `filtrate::Executor` is not `Send`).
+    AddFilter {
+        /// The filter id (`FilterId::raw`).
+        id: u64,
+        /// The erased filter or effect.
+        source: Box<dyn crate::render::filter::FilterSource>,
+    },
+    /// Unregister a filter.
+    RemoveFilter {
+        /// The filter id.
         id: u64,
     },
     /// Commit a surface's change set.

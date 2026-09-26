@@ -28,6 +28,7 @@
 
 pub mod capability;
 mod error;
+mod gpu_content;
 pub mod interop;
 mod message;
 mod render;
@@ -41,7 +42,8 @@ use std::rc::Rc;
 use std::sync::mpsc::Sender;
 
 pub use crate::error::{EngineError, RenderError, ResourceError, SurfaceError, Unsupported};
-pub use crate::resource::{Font, FontSource, Image, ImageSource};
+pub use crate::gpu_content::{GpuContent, GpuContentHandle, RedrawHandle};
+pub use crate::resource::{Filter, Font, FontSource, Image, ImageSource, Shader, ShaderSource};
 pub use crate::surface::{
     FrameStats, FrameTime, Layer, LayerContent, LayerEdit, Next, Offscreen, Readback, RefreshRange,
     Surface, Target, Transaction,
@@ -192,6 +194,9 @@ pub struct Engine<B: Backend> {
     next_surface: Cell<SurfaceId>,
     next_font: Cell<u64>,
     next_image: Cell<u64>,
+    next_shader: Cell<u64>,
+    next_filter: Cell<u64>,
+    next_content: Cell<u64>,
     thread: Option<std::thread::JoinHandle<()>>,
     _backend: PhantomData<B>,
     // `!Send`: the engine lives on the UI thread.
@@ -246,6 +251,9 @@ impl Engine<Vello> {
             next_surface: Cell::new(0),
             next_font: Cell::new(1),
             next_image: Cell::new(1),
+            next_shader: Cell::new(1),
+            next_filter: Cell::new(1),
+            next_content: Cell::new(1),
             thread: Some(thread),
             _backend: PhantomData,
             _not_send: PhantomData,
@@ -313,8 +321,8 @@ impl Engine<Vello> {
         Ok(Image::new(cherenkov::ImageId::new(id), self.tx.clone()))
     }
 
-    /// Creates a surface over `target` (an [`Offscreen`], or in a later
-    /// slice a window).
+    /// Creates a surface over `target`: an [`Offscreen`] texture or an
+    /// [`interop::wgpu::Window`].
     ///
     /// # Errors
     /// [`SurfaceError::TooLarge`] when the size exceeds the device limit,
@@ -361,6 +369,84 @@ impl Engine<Vello> {
     #[must_use]
     pub const fn stats(&self) -> FrameStats {
         self.stats.get()
+    }
+}
+
+impl<B: Backend + capability::ShaderPaint> Engine<B> {
+    /// Registers a WGSL shader, blocking until the render thread has
+    /// compiled and validated its pipeline.
+    ///
+    /// `source` supplies the fragment body (without the prelude); see
+    /// [`ShaderSource`].
+    ///
+    /// # Errors
+    /// [`ResourceError::Shader`] when the WGSL fails validation or the
+    /// pipeline fails to build, and [`ResourceError::Io`] is never returned
+    /// here.
+    pub fn shader(&self, source: ShaderSource) -> Result<Shader, ResourceError> {
+        let id = self.next_shader.get();
+        self.next_shader.set(id + 1);
+        let (reply, rx) = std::sync::mpsc::channel();
+        self.tx
+            .send(Message::AddShader {
+                id,
+                source: crate::message::ShaderSpec {
+                    source: source.source,
+                    animated: source.animated,
+                },
+                reply,
+            })
+            .map_err(|_| ResourceError::Shader("the render thread stopped".into()))?;
+        rx.recv()
+            .map_err(|_| ResourceError::Shader("the render thread stopped".into()))??;
+        Ok(Shader::new(cherenkov::ShaderId::new(id), self.tx.clone()))
+    }
+}
+
+impl<B: Backend + capability::GpuContent> Engine<B> {
+    /// Creates GPU content of `size` pixels, attachable to a layer with
+    /// [`LayerEdit::content`](crate::LayerEdit::content).
+    #[must_use]
+    pub fn gpu_content(
+        &self,
+        size: (u32, u32),
+        content: impl gpu_content::GpuContent + Send,
+    ) -> GpuContentHandle {
+        let id = self.next_content.get();
+        self.next_content.set(id + 1);
+        GpuContentHandle {
+            id,
+            size,
+            dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            content: Some(Box::new(content)),
+        }
+    }
+}
+
+impl<B: Backend> Engine<B> {
+    /// Registers a [`filtrate::Filter`] run by the reference
+    /// [`filtrate::Executor`] on the render thread.
+    pub fn filter<F: filtrate::Filter + Send>(&self, filter: F) -> Filter
+    where
+        B: capability::Runs<F>,
+    {
+        self.register_effect(render::filter::FromFilter(filter))
+    }
+
+    /// Registers a custom [`filtrate::Effect`] (e.g. a `WaterUI` `ViewEffect`
+    /// renderer) run on the render thread.
+    pub fn effect<E: filtrate::Effect + Send>(&self, effect: E) -> Filter {
+        self.register_effect(render::filter::FromEffect(effect))
+    }
+
+    fn register_effect(&self, source: impl render::filter::FilterSource + 'static) -> Filter {
+        let id = self.next_filter.get();
+        self.next_filter.set(id + 1);
+        let _ = self.tx.send(Message::AddFilter {
+            id,
+            source: Box::new(source),
+        });
+        Filter::new(cherenkov::FilterId::new(id), self.tx.clone())
     }
 }
 

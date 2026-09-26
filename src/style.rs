@@ -122,6 +122,20 @@ pub enum BlendSpace {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FilterId(u64);
 
+impl FilterId {
+    /// Creates an identifier from a backend-assigned raw value.
+    #[must_use]
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// The raw value.
+    #[must_use]
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
 /// The isolation of a group: its opacity, how it blends and its filter.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Group {

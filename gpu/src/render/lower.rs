@@ -1556,7 +1556,7 @@ impl<'a> Lowering<'a> {
                     f64::from(rect[3]) + offset.y,
                 )
             })
-            .reduce(Rect::union)
+            .reduce(|bounds, rect| bounds.union(rect))
             .unwrap_or(Rect::ZERO);
         let paint = paint_data(
             paint,

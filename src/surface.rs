@@ -241,8 +241,9 @@ impl<B: Backend> From<Picture> for LayerContent<B> {
 pub struct GpuContentHandle<B: GpuContent> {
     /// The content size in pixels.
     pub size: (u32, u32),
-    /// The content object.
-    pub(crate) content: B::Content,
+    /// The content object; backend content types may expose handles of
+    /// their own (e.g. a redraw requester).
+    pub content: B::Content,
 }
 
 impl<B: GpuContent> From<GpuContentHandle<B>> for LayerContent<B> {

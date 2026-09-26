@@ -14,15 +14,16 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use cherenkov::Draw as _;
+use cherenkov::{
+    Engine as VelloEngine, FontSource, FrameTime, ImageData, Layer as VelloLayer, Offscreen,
+    OffscreenFormat, RenderError, Rgba8, Surface, Transaction,
+};
 use cherenkov_oracle::color::to_working;
 use cherenkov_scene::{
     BlendMode, ColorSpace, Draw as SceneDraw, Extend, Feature, FillRule, GlyphRun as SceneGlyphRun,
     Item, Layer as SceneLayer, Paint as ScenePaint, ResourceHash, Shape,
 };
-use cherenkov_vello::{
-    Engine as VelloEngine, FontSource, FrameTime, ImageSource, Layer as VelloLayer, Offscreen,
-    RenderError, Surface, Transaction, Unsupported, Vello, VelloConfig,
-};
+use cherenkov_vello::{Vello, VelloConfig};
 use kurbo::{Affine, BezPath, Circle, Ellipse, Line, Rect, RoundedRect, Vec2};
 
 use crate::convert::{self, Blobs, Prepared};
@@ -121,12 +122,12 @@ struct ContentLayer {
 pub struct CherenkovVello {
     info: EngineInfo,
     engine: VelloEngine<Vello>,
-    surface: Option<Surface>,
+    surface: Option<Surface<Vello>>,
     /// Registered fonts per `(blob hash, face index)` (keeps the handles
     /// alive).
-    fonts: HashMap<(ResourceHash, u32), cherenkov_vello::Font>,
+    fonts: HashMap<(ResourceHash, u32), cherenkov::Font>,
     /// Registered images per blob hash.
-    images: HashMap<ResourceHash, cherenkov_vello::Image>,
+    images: HashMap<ResourceHash, cherenkov::Image<Rgba8>>,
     /// Layers holding recorded content, in draw order.
     content_layers: Vec<ContentLayer>,
     /// Decoded texel bytes prepared this scene (`bytes_uploaded`).
@@ -210,15 +211,16 @@ const fn missing_api(f: &Feature) -> Option<&'static str> {
     }
 }
 
-/// The scene [`Feature`] a render-time [`Unsupported`] maps back to.
-const fn unsupported_feature(u: Unsupported) -> Feature {
+/// The scene [`Feature`] a render-time unsupported feature name maps back
+/// to. The names are the backend's `RenderError::Unsupported` strings.
+fn unsupported_feature(u: &str) -> Feature {
     match u {
-        Unsupported::Interpolation => Feature::InterpolationSpace(ColorSpace::Srgb),
-        Unsupported::BlendSpace => Feature::Blend(BlendMode::Normal),
-        Unsupported::GroupFilter | Unsupported::Filter => Feature::Opacity,
-        Unsupported::Image => Feature::Image,
-        Unsupported::Shadow => Feature::Shadow,
-        Unsupported::GlyphTransform => Feature::Glyphs,
+        "gradient-interpolation" => Feature::InterpolationSpace(ColorSpace::Srgb),
+        "blend-space" => Feature::Blend(BlendMode::Normal),
+        "group-filter" | "filter" => Feature::Opacity,
+        "image" => Feature::Image,
+        "shadow" => Feature::Shadow,
+        "glyph-transform" => Feature::Glyphs,
         _ => Feature::Fill,
     }
 }
@@ -230,7 +232,7 @@ fn render_error(e: RenderError) -> BenchError {
         RenderError::Unsupported(u) => BenchError::Unsupported {
             engine: CherenkovVello::NAME,
             feature: unsupported_feature(u),
-            api: Some(Box::leak(format!("{u}").into_boxed_str())),
+            api: Some(u),
         },
         e => BenchError::Gpu(format!("cherenkov-vello render: {e}")),
     }
@@ -320,7 +322,7 @@ fn stops(stops: &[cherenkov_scene::GradientStop]) -> Vec<cherenkov::ColorStop> {
 /// the registered images.
 fn front_paint(
     paint: &ScenePaint,
-    images: &HashMap<ResourceHash, cherenkov_vello::Image>,
+    images: &HashMap<ResourceHash, cherenkov::Image<Rgba8>>,
 ) -> Result<cherenkov::Paint, BenchError> {
     Ok(match paint {
         ScenePaint::Solid(c) => cherenkov::Paint::Solid(working(c)),
@@ -380,7 +382,7 @@ fn shape_kind(shape: &Shape) -> ShapeKind {
 }
 
 /// A shape's clip applied to a layer edit.
-fn clip_shape(edit: &mut cherenkov_vello::LayerEdit, shape: &ShapeKind) {
+fn clip_shape(edit: &mut cherenkov::LayerEdit<Vello>, shape: &ShapeKind) {
     match shape {
         ShapeKind::Rect(r) => drop(edit.clip(*r)),
         ShapeKind::RoundedRect(r) => drop(edit.clip(*r)),
@@ -395,8 +397,8 @@ fn clip_shape(edit: &mut cherenkov_vello::LayerEdit, shape: &ShapeKind) {
 /// A scene draw → an [`Op`].
 fn op(
     draw: &SceneDraw,
-    fonts: &HashMap<(ResourceHash, u32), cherenkov_vello::Font>,
-    images: &HashMap<ResourceHash, cherenkov_vello::Image>,
+    fonts: &HashMap<(ResourceHash, u32), cherenkov::Font>,
+    images: &HashMap<ResourceHash, cherenkov::Image<Rgba8>>,
     prepared: &Prepared,
 ) -> Result<Op, BenchError> {
     Ok(match draw {
@@ -447,7 +449,7 @@ fn op(
 /// resolved `F2Dot14` coordinates.
 fn glyph_run(
     run: &SceneGlyphRun,
-    fonts: &HashMap<(ResourceHash, u32), cherenkov_vello::Font>,
+    fonts: &HashMap<(ResourceHash, u32), cherenkov::Font>,
     prepared: &Prepared,
 ) -> Result<cherenkov::GlyphRun, BenchError> {
     let font = fonts
@@ -475,8 +477,8 @@ fn glyph_run(
 
 /// Registers every font and image a layer references, once each.
 fn register_resources(
-    fonts: &mut HashMap<(ResourceHash, u32), cherenkov_vello::Font>,
-    images: &mut HashMap<ResourceHash, cherenkov_vello::Image>,
+    fonts: &mut HashMap<(ResourceHash, u32), cherenkov::Font>,
+    images: &mut HashMap<ResourceHash, cherenkov::Image<Rgba8>>,
     engine: &VelloEngine<Vello>,
     prepared: &Prepared,
     layer: &SceneLayer,
@@ -516,7 +518,10 @@ fn register_resources(
                     let data = prepared.image(hash)?;
                     let bytes: Arc<[u8]> = Arc::from(data.data.data());
                     let image = engine
-                        .image(ImageSource::rgba8(data.width, data.height, bytes))
+                        .image(
+                            ImageData::<Rgba8>::new(data.width, data.height, bytes)
+                                .map_err(|e| BenchError::Engine(format!("image data: {e}")))?,
+                        )
                         .map_err(|e| BenchError::Engine(format!("cherenkov-vello image: {e}")))?;
                     e.insert(image);
                 }
@@ -530,8 +535,8 @@ fn register_resources(
 /// draw run that must interleave with child layers.
 fn prep_layer(
     layer: &SceneLayer,
-    fonts: &HashMap<(ResourceHash, u32), cherenkov_vello::Font>,
-    images: &HashMap<ResourceHash, cherenkov_vello::Image>,
+    fonts: &HashMap<(ResourceHash, u32), cherenkov::Font>,
+    images: &HashMap<ResourceHash, cherenkov::Image<Rgba8>>,
     prepared: &Prepared,
 ) -> Result<PrepLayer, BenchError> {
     // The engine draws a layer's content before its children, so the draws
@@ -587,8 +592,8 @@ fn prep_layer(
     reason = "layer opacity is f32 at the engine boundary"
 )]
 fn build_layer(
-    surface: &Surface,
-    tx: &mut Transaction<'_>,
+    surface: &Surface<Vello>,
+    tx: &mut Transaction<'_, Vello>,
     parent: &VelloLayer,
     prep: PrepLayer,
     content_layers: &mut Vec<ContentLayer>,
@@ -672,7 +677,10 @@ impl Engine for CherenkovVello {
         let prepared = Prepared::build(input.scene, input.blobs)?;
         let surface = self
             .engine
-            .surface(Offscreen::new((input.scene.width, input.scene.height)))
+            .surface(Offscreen::new(
+                (input.scene.width, input.scene.height),
+                OffscreenFormat::LinearF16,
+            ))
             .map_err(|e| BenchError::Gpu(format!("cherenkov-vello surface: {e}")))?;
         surface.clear_color(working(&input.scene.clear));
         register_resources(

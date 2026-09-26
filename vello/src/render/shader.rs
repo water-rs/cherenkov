@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use vello::peniko;
 
-use crate::error::ResourceError;
+use cherenkov::ResourceError;
 
 /// The maximum number of `f32` uniform values a [`Paint::Shader`] use may
 /// carry: `params` is `array<vec4<f32>, 16>`.
@@ -17,7 +17,7 @@ use crate::error::ResourceError;
 /// [`Paint::Shader`]: cherenkov::Paint::Shader
 pub const MAX_SHADER_PARAMS: usize = 64;
 
-/// The WGSL prelude prepended to every [`ShaderSource`](crate::ShaderSource)
+/// The WGSL prelude prepended to every `ShaderSource`
 /// fragment: `uniforms` (time and resolution), `params` (zero-padded use
 /// uniforms) and a fullscreen-triangle vertex shader whose `uv` spans
 /// `[0,1]` with y down.
@@ -109,7 +109,7 @@ pub struct ShaderUse {
 pub fn texture_image(width: u32, height: u32, alpha: peniko::ImageAlphaType) -> peniko::ImageData {
     let empty: std::sync::Arc<[u8]> = std::sync::Arc::from(&[][..]);
     peniko::ImageData {
-        data: peniko::Blob::new(std::sync::Arc::new(crate::message::SharedBytes(empty))),
+        data: peniko::Blob::new(std::sync::Arc::new(super::SharedBytes(empty))),
         format: peniko::ImageFormat::Rgba8,
         alpha_type: alpha,
         width,
@@ -136,7 +136,7 @@ impl ShaderRegistry {
         &mut self,
         device: &wgpu::Device,
         id: u64,
-        spec: &crate::message::ShaderSpec,
+        spec: &super::ShaderSpec,
     ) -> Result<(), ResourceError> {
         let source = format!("{PRELUDE}\n{}", spec.source);
         let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);

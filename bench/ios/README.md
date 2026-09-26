@@ -12,35 +12,74 @@ from `project.yml`; nothing generated is checked in.
 
     # Rust static library (from the repo root). If the skia-bindings
     # prebuilt download for aarch64-apple-ios fails, drop `skia-metal`.
-    cargo build --release --target aarch64-apple-ios -p cherenkov-bench \
+    cargo build --locked --release --target aarch64-apple-ios \
+        -p cherenkov-bench --lib \
         --features cherenkov,vello-hybrid,vello-classic,skia-metal
 
     cd bench/ios
     xcodegen generate
     xcodebuild -project CherenkovBench.xcodeproj -scheme CherenkovBench \
-        -destination 'generic/platform=iOS' -configuration Release \
-        -derivedDataPath build \
+        -sdk iphoneos -configuration Release -derivedDataPath build \
         CODE_SIGNING_ALLOWED=NO build
+
+A fresh Xcode may report "iOS is not installed" — the SDK ships but
+device support is a separate component:
+
+    xcodebuild -downloadPlatform iOS
 
 The unsigned app lands in
 `build/Build/Products/Release-iphoneos/CherenkovBench.app`.
 
-For a simulator run instead, build the Rust library for
-`aarch64-apple-ios-sim`, then `-destination 'platform=iOS Simulator'`;
-the product lands under `Release-iphonesimulator`. The simulator's
-paravirtual GPU is weaker than a real device (no `TIMESTAMP_QUERY` or
-`INDIRECT_EXECUTION`, so `gpu_seconds` are absent and `vello-classic`
-cannot run there) but it exercises the whole harness end to end:
+## Simulator
+
+Build the Rust library for `aarch64-apple-ios-sim` first:
+
+    cargo build --locked --release --target aarch64-apple-ios-sim \
+        -p cherenkov-bench --lib \
+        --features cherenkov,vello-hybrid,vello-classic,skia-metal
+
+Then the app. `-destination` is required — `-sdk iphonesimulator` alone
+resolves to "Any iOS Simulator Device", a universal arm64+x86_64 build
+that fails to link because `libcherenkov_bench.a` is arm64-only. The
+product lands under `Release-iphonesimulator`:
 
     xcodebuild -project CherenkovBench.xcodeproj -scheme CherenkovBench \
+        -sdk iphonesimulator \
         -destination 'platform=iOS Simulator,name=iPhone 17' \
         -configuration Release -derivedDataPath build \
         CODE_SIGNING_ALLOWED=NO build
+
+The simulator's paravirtual GPU is weaker than a real device (no
+`TIMESTAMP_QUERY` or `INDIRECT_EXECUTION`, so `gpu_seconds` are absent
+and `vello-classic` cannot run there) but it exercises the whole
+harness end to end. Boot a simulator (`open -a Simulator`, or
+`xcrun simctl boot 'iPhone 17'`), then:
+
     xcrun simctl install booted \
         build/Build/Products/Release-iphonesimulator/CherenkovBench.app
-    # Documents lives under:
-    #   xcrun simctl get_app_container booted dev.cherenkov.bench data
+
+Push the inputs into the app's Documents. `simctl` has no file copy,
+so write the container directory directly —
+`get_app_container ... data` returns its sandbox home:
+
+    DATA=$(xcrun simctl get_app_container booted dev.cherenkov.bench data)
+    cp -R ../../scenes "$DATA/Documents/scenes"
+    # bench-args.json: one argument list per run — a 30-frame measure of
+    # the map scene on the cherenkov backend:
+    cat > "$DATA/Documents/bench-args.json" <<'EOF'
+    [
+        ["engines"],
+        ["measure", "--engine", "cherenkov", "--scene",
+         "Documents/scenes/perf/map", "--frames", "30", "--warmup",
+         "5", "--out", "Documents/out/measure-cherenkov-map.json"]
+    ]
+    EOF
+
     xcrun simctl launch booted dev.cherenkov.bench
+
+    # pull the report and the captured stderr/stdout log back
+    cp -R "$DATA/Documents/out" ./out
+    cat ./out/done.json ./out/measure-cherenkov-map.json ./out/run-1.log
 
 ## Sign
 

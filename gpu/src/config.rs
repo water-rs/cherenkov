@@ -78,19 +78,21 @@ pub struct GpuInfo {
     pub timestamps: TimestampSupport,
 }
 
-/// Where an adapter can sample GPU timestamps. The renderer only ever
-/// samples at pass boundaries, which every supporting level offers.
+/// Where the adapter lets the renderer sample GPU timestamps.
+///
+/// The renderer samples only at pass boundaries, the one position every
+/// adapter with timestamp queries honours. Encoder-level sampling is not
+/// a level here: Metal on Apple GPUs advertises it but samples only at
+/// stage boundaries, through a dummy blit encoder wgpu documents as
+/// unreliable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TimestampSupport {
-    /// No timestamp queries; [`FrameStats::gpu_seconds`] stays `None`.
+    /// No timestamp queries; [`FrameStats::timings`] stays empty.
     ///
-    /// [`FrameStats::gpu_seconds`]: crate::FrameStats::gpu_seconds
+    /// [`FrameStats::timings`]: crate::FrameStats::timings
     Unsupported,
-    /// Only at render and compute pass boundaries (Apple GPUs on Metal
-    /// sample at stage boundaries).
+    /// At render and compute pass boundaries.
     PassBoundaries,
-    /// Anywhere inside a command encoder as well as at pass boundaries.
-    Encoders,
 }
 
 /// The texture format used for intermediate (isolation) render targets.

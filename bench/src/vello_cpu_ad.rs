@@ -242,7 +242,7 @@ impl Engine for VelloCpu {
         Ok(())
     }
 
-    fn submit(&mut self, readback: bool) -> Result<Submit, BenchError> {
+    fn submit(&mut self, _frame: u64, readback: bool) -> Result<Submit, BenchError> {
         let ctx = self
             .ctx
             .as_mut()
@@ -261,8 +261,7 @@ impl Engine for VelloCpu {
         });
         Ok(Submit {
             image,
-            gpu_seconds: None,
-            passes: Vec::new(),
+            gpu: Vec::new(),
             phases: Vec::new(),
         })
     }

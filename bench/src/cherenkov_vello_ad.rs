@@ -26,7 +26,7 @@ use cherenkov_vello::{
 use kurbo::{Affine, BezPath, Circle, Ellipse, Line, Rect, RoundedRect, Vec2};
 
 use crate::convert::{self, Blobs, Prepared};
-use crate::{BenchError, Counters, DeviceInfo, EncodeInput, Engine, EngineInfo, Submit};
+use crate::{BenchError, Counters, DeviceInfo, EncodeInput, Engine, EngineInfo, GpuSample, Submit};
 
 /// A scene shape in a form the front-end accepts.
 enum ShapeKind {
@@ -736,7 +736,7 @@ impl Engine for CherenkovVello {
         Ok(())
     }
 
-    fn submit(&mut self, readback: bool) -> Result<Submit, BenchError> {
+    fn submit(&mut self, frame: u64, readback: bool) -> Result<Submit, BenchError> {
         let surface = self
             .surface
             .as_ref()
@@ -755,8 +755,7 @@ impl Engine for CherenkovVello {
         };
         Ok(Submit {
             image,
-            gpu_seconds,
-            passes: Vec::new(),
+            gpu: GpuSample::whole_frame(frame, gpu_seconds),
             phases: Vec::new(),
         })
     }

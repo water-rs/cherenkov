@@ -349,7 +349,7 @@ fn measure_cmd(engine: &str, opts: MeasureOpts<'_>) -> Result<(), BenchError> {
                         pass = %pass.name,
                         size = %format!("{}x{}", pass.width, pass.height),
                         format = %pass.format,
-                        gpu_p50 = pass.gpu_seconds[0],
+                        gpu_p50 = ?pass.gpu_seconds.map(|g| g[0]),
                         "pass"
                     );
                 }
@@ -423,7 +423,7 @@ fn render_scene(engine: &mut dyn Engine, dir: &Path) -> Result<RenderOutput, Ben
     };
     engine.prepare(&input)?;
     engine.encode(&input)?;
-    let submit = engine.submit(true)?;
+    let submit = engine.submit(0, true)?;
     let test = submit
         .image
         .ok_or_else(|| BenchError::Engine("adapter returned no image".into()))?;
@@ -530,28 +530,43 @@ fn run_frames(
         let t0 = Instant::now();
         engine.encode(input)?;
         let t1 = Instant::now();
-        let submit = engine.submit(false)?;
+        let submit = engine.submit(u64::from(frame), false)?;
         let t2 = Instant::now();
         let cpu_end = affinity::current_cpu();
         if frame >= warmup {
             samples.push(FrameSample {
                 encode_seconds: t1.duration_since(t0).as_secs_f64(),
                 submit_seconds: t2.duration_since(t1).as_secs_f64(),
-                gpu_seconds: submit.gpu_seconds,
+                gpu_seconds: None,
                 cpu_start,
                 cpu_end,
                 migrated: matches!((cpu_start, cpu_end), (Some(a), Some(b)) if a != b),
-                passes: submit.passes,
+                passes: Vec::new(),
                 phases: submit.phases,
             });
         }
+        attribute_gpu(&mut samples, warmup, submit.gpu);
     }
+    attribute_gpu(&mut samples, warmup, engine.finish_gpu()?);
     Ok(Window {
         samples,
         meter,
         start,
         missed_deadlines,
     })
+}
+
+/// Stores each GPU timing on the measured sample of the frame it times;
+/// warmup frames' timings are dropped.
+fn attribute_gpu(samples: &mut [FrameSample], warmup: u32, gpu: Vec<crate::GpuSample>) {
+    for timing in gpu {
+        let Some(index) = timing.frame.checked_sub(u64::from(warmup)) else {
+            continue;
+        };
+        let sample = &mut samples[usize::try_from(index).expect("a frame index fits usize")];
+        sample.gpu_seconds = timing.gpu_seconds;
+        sample.passes = timing.passes;
+    }
 }
 
 /// `--rate` validation + derivation: the per-frame period must fit a
@@ -693,13 +708,16 @@ fn pass_percentiles(samples: &[FrameSample]) -> Vec<PassPercentiles> {
     let frames: Vec<&FrameSample> = samples.iter().filter(|s| s.passes.len() == mode).collect();
     (0..mode)
         .map(|i| {
-            let times: Vec<f64> = frames.iter().map(|s| s.passes[i].gpu_seconds).collect();
+            let times: Vec<f64> = frames
+                .iter()
+                .filter_map(|s| s.passes[i].gpu_seconds)
+                .collect();
             PassPercentiles {
                 name: frames[0].passes[i].name.clone(),
                 width: frames[0].passes[i].width,
                 height: frames[0].passes[i].height,
                 format: frames[0].passes[i].format.clone(),
-                gpu_seconds: percentiles(&times).unwrap_or([0.0; 3]),
+                gpu_seconds: percentiles(&times),
             }
         })
         .collect()

@@ -44,8 +44,8 @@ pub use crate::error::{EngineError, RenderError, ResourceError, SurfaceError, Un
 pub use crate::font::{Font, FontSource};
 pub use crate::image::{Image, ImageColorSpace, ImageSource};
 pub use crate::surface::{
-    FrameStats, FrameTime, Layer, LayerContent, LayerEdit, Next, Offscreen, OffscreenFormat,
-    PassTiming, Phases, Readback, RefreshRange, Surface, Transaction,
+    FrameId, FrameStats, FrameTime, FrameTiming, Layer, LayerContent, LayerEdit, Next, Offscreen,
+    OffscreenFormat, PassTiming, Phases, Readback, RefreshRange, Surface, Transaction,
 };
 
 use crate::message::{Message, SurfaceId};
@@ -229,9 +229,10 @@ impl Engine<Gpu> {
 
     /// Renders every dirty surface for the frame at `time`, blocking until
     /// the render thread has submitted the frame — never until the GPU is
-    /// idle. When timestamp queries are enabled their results resolve on a
-    /// later `render`: [`Engine::stats`]' `gpu_seconds`/`passes_timed`
-    /// describe the most recently completed submission. Returns
+    /// idle. When timestamp queries are enabled a frame's timing resolves
+    /// on a later `render` and arrives in that render's
+    /// [`FrameStats::timings`], tagged with the frame it measures; see
+    /// [`Engine::finish_timings`] for the frames still in flight. Returns
     /// [`Next::Idle`] — animation scheduling (`Next::At`) is
     /// unimplemented.
     ///
@@ -263,11 +264,32 @@ impl Engine<Gpu> {
         Ok(next)
     }
 
-    /// Statistics of the last [`Engine::render`]. GPU timing fields lag
-    /// one frame: timestamp queries resolve once the GPU catches up.
+    /// Statistics of the last [`Engine::render`]. Its GPU timings are
+    /// those of earlier frames: timestamp queries resolve once the GPU
+    /// catches up.
     #[must_use]
     pub fn stats(&self) -> FrameStats {
         self.stats.borrow().clone()
+    }
+
+    /// Waits for every submitted frame whose timing no render has
+    /// reported yet, and returns those timings, oldest first — the end of
+    /// a measured window, where the last frames are still on the GPU.
+    /// Blocks the render thread until the GPU finishes them, so it
+    /// belongs to tooling, never to a frame path. Empty when timestamp
+    /// queries are disabled or unsupported.
+    ///
+    /// # Errors
+    /// [`RenderError::Timeout`] when the GPU does not finish within
+    /// [`GpuConfig::wait_timeout`], [`RenderError::Readback`] when a
+    /// timestamp buffer does not map after the wait, and
+    /// [`RenderError::Thread`] when the render thread is gone.
+    pub fn finish_timings(&self) -> Result<Vec<FrameTiming>, RenderError> {
+        let (reply, rx) = std::sync::mpsc::channel();
+        self.tx
+            .send(Message::FinishTimings { reply })
+            .map_err(|_| RenderError::Thread)?;
+        rx.recv().map_err(|_| RenderError::Thread)?
     }
 }
 

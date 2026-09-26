@@ -261,8 +261,9 @@ pub struct PassPercentiles {
     pub height: u32,
     /// Target texture format.
     pub format: String,
-    /// `gpu_seconds` percentiles `[p50, p90, p99]` for this pass.
-    pub gpu_seconds: [f64; 3],
+    /// `gpu_seconds` percentiles `[p50, p90, p99]` for this pass; `null`
+    /// when no frame's timestamps span it.
+    pub gpu_seconds: Option<[f64; 3]>,
 }
 
 /// Percentiles of one render-thread CPU phase across the measured frames.

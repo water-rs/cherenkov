@@ -184,8 +184,37 @@ pub struct PassSample {
     pub height: u32,
     /// Target texture format (`"rgba16float"`, `"rgba8unorm"`, ...).
     pub format: String,
-    /// GPU seconds the pass took.
-    pub gpu_seconds: f64,
+    /// GPU seconds the pass took; `null` when the backend's end
+    /// timestamp does not exceed its start.
+    pub gpu_seconds: Option<f64>,
+}
+
+/// The GPU timing of one submitted frame.
+pub struct GpuSample {
+    /// The `frame` passed to the [`Engine::submit`] that submitted it.
+    pub frame: u64,
+    /// GPU seconds from real GPU timestamps; `None` when the backend's
+    /// timestamps do not span the frame. Never estimated.
+    pub gpu_seconds: Option<f64>,
+    /// Per-pass GPU timings, in submission order; empty when the backend
+    /// exposes none.
+    pub passes: Vec<PassSample>,
+}
+
+impl GpuSample {
+    /// What a backend that times whole frames synchronously reports:
+    /// `frame`'s own timing, when it has one.
+    #[must_use]
+    pub fn whole_frame(frame: u64, gpu_seconds: Option<f64>) -> Vec<Self> {
+        gpu_seconds
+            .map(|gpu_seconds| Self {
+                frame,
+                gpu_seconds: Some(gpu_seconds),
+                passes: Vec::new(),
+            })
+            .into_iter()
+            .collect()
+    }
 }
 
 /// One render-thread CPU phase of a submitted frame.
@@ -202,12 +231,12 @@ pub struct Submit {
     /// The rendered image in the working space, when readback was
     /// requested.
     pub image: Option<F32Image>,
-    /// GPU seconds measured via real GPU timestamps; `None` when the
-    /// backend exposes none. Never estimated.
-    pub gpu_seconds: Option<f64>,
-    /// Per-pass GPU timings, in submission order; empty when the backend
-    /// exposes none.
-    pub passes: Vec<PassSample>,
+    /// GPU timings that became available with this call: this frame's
+    /// for a backend that times synchronously, earlier frames' for one
+    /// whose timestamps resolve later (the rest arrive from
+    /// [`Engine::finish_gpu`]). Empty when the backend exposes no GPU
+    /// timestamps.
+    pub gpu: Vec<GpuSample>,
     /// Per-phase render-thread CPU timings, in render order; empty when
     /// the adapter exposes none.
     pub phases: Vec<PhaseSample>,
@@ -252,11 +281,21 @@ pub trait Engine {
     /// [`BenchError::Unsupported`] for unimplemented features, or an
     /// engine-level error.
     fn encode(&mut self, input: &EncodeInput<'_>) -> Result<(), BenchError>;
-    /// Rasterize the encoded scene; with `readback`, return the pixels.
+    /// Rasterize the encoded scene as `frame`, the tag its
+    /// [`GpuSample`] carries; with `readback`, return the pixels.
     ///
     /// # Errors
     /// [`BenchError`] on engine or GPU failure.
-    fn submit(&mut self, readback: bool) -> Result<Submit, BenchError>;
+    fn submit(&mut self, frame: u64, readback: bool) -> Result<Submit, BenchError>;
+    /// Wait for the GPU timings of every submitted frame not yet
+    /// returned by [`Engine::submit`]. Only a backend whose timestamps
+    /// resolve after its submit returns has any.
+    ///
+    /// # Errors
+    /// [`BenchError`] on engine or GPU failure.
+    fn finish_gpu(&mut self) -> Result<Vec<GpuSample>, BenchError> {
+        Ok(Vec::new())
+    }
     /// Counters describing what [`Engine::encode`] issued.
     fn counters(&self) -> Counters;
     /// Device/thermal metadata.

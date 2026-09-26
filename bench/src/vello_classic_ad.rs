@@ -22,7 +22,7 @@ use vello::{AaConfig, AaSupport, RenderParams, Renderer, RendererOptions, Scene 
 use crate::convert::{self, Prepared};
 use crate::vello_like::{Lowered, Op, lower, vello_features};
 use crate::wgpu_ctx::{Gpu, Target, drain_and_stamp, readback, resolve_timestamps};
-use crate::{BenchError, Counters, DeviceInfo, EncodeInput, Engine, EngineInfo, Submit};
+use crate::{BenchError, Counters, DeviceInfo, EncodeInput, Engine, EngineInfo, GpuSample, Submit};
 
 /// `vello` classic adapter.
 pub struct VelloClassic {
@@ -250,7 +250,7 @@ impl Engine for VelloClassic {
         Ok(())
     }
 
-    fn submit(&mut self, readback_flag: bool) -> Result<Submit, BenchError> {
+    fn submit(&mut self, frame: u64, readback_flag: bool) -> Result<Submit, BenchError> {
         let (Some(scene), Some(target), Some(renderer)) =
             (&self.scene, &self.target, &mut self.renderer)
         else {
@@ -288,8 +288,7 @@ impl Engine for VelloClassic {
         };
         Ok(Submit {
             image,
-            gpu_seconds,
-            passes: Vec::new(),
+            gpu: GpuSample::whole_frame(frame, gpu_seconds),
             phases: Vec::new(),
         })
     }

@@ -14,7 +14,7 @@ use crate::image::ImageColorSpace;
 
 use crate::config::{MemoryUsage, Pressure};
 use crate::error::{RenderError, SurfaceError};
-use crate::surface::{FrameStats, FrameTime, Next, Readback};
+use crate::surface::{FrameStats, FrameTime, FrameTiming, Next, Readback};
 
 /// Identifier of a surface.
 pub type SurfaceId = u64;
@@ -136,6 +136,11 @@ pub enum Message {
         time: FrameTime,
         /// What the next frame needs and this frame's stats.
         reply: Sender<Result<(Next, FrameStats), RenderError>>,
+    },
+    /// Wait for every outstanding frame timing and return it.
+    FinishTimings {
+        /// The timings, oldest first.
+        reply: Sender<Result<Vec<FrameTiming>, RenderError>>,
     },
     /// Read back a surface's pixels.
     Readback {

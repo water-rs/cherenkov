@@ -24,7 +24,7 @@ use vello_hybrid::{
 use crate::convert::{self, Prepared};
 use crate::vello_like::{Lowered, VelloLikeCtx, lower, replay, vello_features, vello_missing_api};
 use crate::wgpu_ctx::{Gpu, Target, drain_and_stamp, readback, resolve_timestamps};
-use crate::{BenchError, Counters, DeviceInfo, EncodeInput, Engine, EngineInfo, Submit};
+use crate::{BenchError, Counters, DeviceInfo, EncodeInput, Engine, EngineInfo, GpuSample, Submit};
 
 /// `vello_hybrid` adapter.
 pub struct VelloHybrid {
@@ -297,7 +297,7 @@ impl Engine for VelloHybrid {
         Ok(())
     }
 
-    fn submit(&mut self, readback_flag: bool) -> Result<Submit, BenchError> {
+    fn submit(&mut self, frame: u64, readback_flag: bool) -> Result<Submit, BenchError> {
         let (Some(scene), Some(res), Some(renderer), Some(target)) =
             (&self.scene, &mut self.res, &mut self.renderer, &self.target)
         else {
@@ -342,8 +342,7 @@ impl Engine for VelloHybrid {
         };
         Ok(Submit {
             image,
-            gpu_seconds,
-            passes: Vec::new(),
+            gpu: GpuSample::whole_frame(frame, gpu_seconds),
             phases: Vec::new(),
         })
     }

@@ -17,8 +17,9 @@ use std::collections::{BTreeSet, HashMap};
 
 use cherenkov::Draw as _;
 use cherenkov_gpu::{
-    Engine as GpuEngine, FrameTime, Gpu, GpuConfig, Layer as GpuLayer, Offscreen, OffscreenFormat,
-    RenderError, ResourceError, ScratchFormat, Surface, Transaction, Unsupported,
+    Engine as GpuEngine, FrameId, FrameTime, FrameTiming, Gpu, GpuConfig, Layer as GpuLayer,
+    Offscreen, OffscreenFormat, RenderError, ResourceError, ScratchFormat, Surface, Transaction,
+    Unsupported,
 };
 use cherenkov_oracle::color::to_working;
 use cherenkov_scene::{
@@ -28,7 +29,7 @@ use cherenkov_scene::{
 use kurbo::{Affine, BezPath, Circle, Ellipse, Line, Rect, RoundedRect, Vec2};
 
 use crate::convert::{self, Blobs};
-use crate::{BenchError, Counters, DeviceInfo, EncodeInput, Engine, EngineInfo, Submit};
+use crate::{BenchError, Counters, DeviceInfo, EncodeInput, Engine, EngineInfo, GpuSample, Submit};
 
 /// A scene shape in a form the front-end accepts.
 enum ShapeKind {
@@ -136,6 +137,9 @@ pub struct Cherenkov {
     image_handles: Vec<cherenkov_gpu::Image>,
     /// Layers holding recorded content, in draw order.
     content_layers: Vec<ContentLayer>,
+    /// The bench frame of every submitted engine frame whose GPU timing
+    /// has not resolved yet.
+    in_flight: HashMap<FrameId, u64>,
     counters: Counters,
 }
 
@@ -694,6 +698,32 @@ fn build_layer(
 }
 
 impl Cherenkov {
+    /// Tags each resolved engine frame timing with the bench frame that
+    /// submitted it.
+    fn gpu_samples(&mut self, timings: Vec<FrameTiming>) -> Vec<GpuSample> {
+        timings
+            .into_iter()
+            .map(|timing| GpuSample {
+                frame: self
+                    .in_flight
+                    .remove(&timing.frame)
+                    .expect("the engine times only frames this adapter submitted"),
+                gpu_seconds: timing.gpu_seconds,
+                passes: timing
+                    .passes
+                    .into_iter()
+                    .map(|p| crate::PassSample {
+                        name: p.name,
+                        width: p.width,
+                        height: p.height,
+                        format: p.format.to_string(),
+                        gpu_seconds: p.gpu_seconds,
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
     /// Adapter key.
     pub const NAME: &'static str = "cherenkov";
 
@@ -726,6 +756,7 @@ impl Cherenkov {
             },
             engine,
             surface: None,
+            in_flight: HashMap::new(),
             fonts: HashMap::new(),
             images: HashMap::new(),
             image_handles: Vec::new(),
@@ -809,27 +840,28 @@ impl Engine for Cherenkov {
         Ok(())
     }
 
-    fn submit(&mut self, readback: bool) -> Result<Submit, BenchError> {
-        let surface = self
-            .surface
-            .as_ref()
-            .ok_or_else(|| BenchError::Engine("cherenkov: submit before prepare".into()))?;
+    fn submit(&mut self, frame: u64, readback: bool) -> Result<Submit, BenchError> {
+        if self.surface.is_none() {
+            return Err(BenchError::Engine(
+                "cherenkov: submit before prepare".into(),
+            ));
+        }
         self.engine.render(FrameTime::now()).map_err(render_error)?;
         let stats = self.engine.stats();
-        let gpu_seconds = stats.gpu_seconds;
-        let passes = stats
-            .passes_timed
-            .iter()
-            .map(|p| crate::PassSample {
-                name: p.name.clone(),
-                width: p.width,
-                height: p.height,
-                format: p.format.to_string(),
-                gpu_seconds: p.gpu_seconds,
-            })
-            .collect();
+        self.in_flight.insert(
+            stats
+                .frame
+                .expect("the bench updates content every frame, so every render submits"),
+            frame,
+        );
+        let gpu = self.gpu_samples(stats.timings);
         let image = if readback {
-            let rb = surface.readback().map_err(render_error)?;
+            let rb = self
+                .surface
+                .as_ref()
+                .ok_or_else(|| BenchError::Engine("cherenkov: submit before prepare".into()))?
+                .readback()
+                .map_err(render_error)?;
             Some(cherenkov_oracle::F32Image {
                 width: rb.width,
                 height: rb.height,
@@ -851,12 +883,12 @@ impl Engine for Cherenkov {
             seconds,
         })
         .collect();
-        Ok(Submit {
-            image,
-            gpu_seconds,
-            passes,
-            phases,
-        })
+        Ok(Submit { image, gpu, phases })
+    }
+
+    fn finish_gpu(&mut self) -> Result<Vec<GpuSample>, BenchError> {
+        let timings = self.engine.finish_timings().map_err(render_error)?;
+        Ok(self.gpu_samples(timings))
     }
 
     fn counters(&self) -> Counters {

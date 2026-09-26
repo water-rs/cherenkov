@@ -338,13 +338,13 @@ fn a_glyph_run_renders_and_the_second_frame_hits_the_cache() {
         }],
         style: cherenkov::GlyphStyle::Fill,
     };
-    let px = render_f32(&engine, 64, 64, |c| c.glyphs(&run, RED));
+    let px = render_f32(&engine, 64, 64, |c| c.glyphs(run.clone(), RED));
     let area: f64 = px.iter().map(|p| f64::from(p[3])).sum();
     assert!(area > 10.0, "glyph coverage {area}");
     let cached = engine.memory().cpu;
     assert!(cached.0 > 0, "glyph cache populated");
     // Re-record the same run and render again: the cache must hit.
-    render_f32(&engine, 64, 64, |c| c.glyphs(&run, RED));
+    render_f32(&engine, 64, 64, |c| c.glyphs(run.clone(), RED));
     assert_eq!(engine.memory().cpu.0, cached.0, "cache hit");
 }
 
@@ -390,7 +390,7 @@ fn unsupported_features_report_their_names() {
         .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF32))
         .expect("surface");
     surface2.update(|tx| {
-        tx[surface2.root()].content(surface2.record(|c| c.glyphs(&run, RED)));
+        tx[surface2.root()].content(surface2.record(|c| c.glyphs(run.clone(), RED)));
     });
     let e = engine2
         .render(FrameTime::now())

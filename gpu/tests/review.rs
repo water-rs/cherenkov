@@ -71,7 +71,7 @@ fn render_text(
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|c| {
             for run in text_runs(font.id(), count, size) {
-                c.glyphs(&run, WorkingColor::WHITE);
+                c.glyphs(run, WorkingColor::WHITE);
             }
         }));
     });

@@ -59,3 +59,5 @@ pub struct GlyphRun {
     /// Fill or stroke.
     pub style: GlyphStyle,
 }
+
+nami_core::impl_constant!(GlyphRun, GlyphStyle);

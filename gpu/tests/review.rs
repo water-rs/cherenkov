@@ -360,6 +360,29 @@ fn timestamps_resolve_a_frame_late() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// With timestamps disabled a render reports no timing — and never
+/// allocates the per-pass metadata only the timestamp path consumes.
+#[test]
+fn timestamps_off_reports_no_passes() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(engine) = engine(GpuConfig::default()) else {
+        return Ok(());
+    };
+    let surface = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
+    surface.update(|tx| {
+        tx[surface.root()].content(surface.record(|c| {
+            c.fill(
+                Rect::new(0.0, 0.0, 64.0, 64.0),
+                WorkingColor::new([1.0, 0.0, 0.0, 1.0]),
+            );
+        }));
+    });
+    engine.render(cherenkov_gpu::FrameTime::now())?;
+    let stats = engine.stats();
+    assert!(stats.gpu_seconds.is_none());
+    assert!(stats.passes_timed.is_empty());
+    Ok(())
+}
+
 /// A zero-size surface is rejected synchronously.
 #[test]
 fn a_zero_size_surface_is_an_error() {

@@ -1543,18 +1543,22 @@ impl Renderer {
                         beginning_of_pass_write_index: Some(2 + 2 * pass_index),
                         end_of_pass_write_index: Some(3 + 2 * pass_index),
                     });
-            self.pass_meta.push(PassMeta {
-                name: match pass.target {
-                    Target::Surface => "surface".to_string(),
-                    Target::Scratch(i) => format!("scratch{i}"),
-                },
-                width: pass.region[2],
-                height: pass.region[3],
-                format: format_name(match pass.target {
-                    Target::Surface => TARGET_FORMAT,
-                    Target::Scratch(_) => self.scratch_format,
-                }),
-            });
+            // Only the timestamp path reads `pass_meta`; skip the
+            // allocation when timing is off.
+            if self.timestamps {
+                self.pass_meta.push(PassMeta {
+                    name: match pass.target {
+                        Target::Surface => "surface".to_string(),
+                        Target::Scratch(i) => format!("scratch{i}"),
+                    },
+                    width: pass.region[2],
+                    height: pass.region[3],
+                    format: format_name(match pass.target {
+                        Target::Surface => TARGET_FORMAT,
+                        Target::Scratch(_) => self.scratch_format,
+                    }),
+                });
+            }
             let scratch_backdrop = pass.backdrop_copy.is_some();
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("pass"),

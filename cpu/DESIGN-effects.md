@@ -156,12 +156,12 @@ Nested groups perform these conversions at their own boundaries.
 Solid coverage spans, solid glyph rows and linear source-over isolation use
 portable SIMD selected once by the renderer. Each owned framebuffer band carries
 its concrete SIMD type through dispatch. Constant spans retain packed RGBA,
-using one uniform inverse alpha without channel shuffles. Varying coverage is
-expanded over each pixel's four packed channels, so destination pixels need no
-transpose. The coverage compiler exposes strictly positive samples through a
-borrowed type; these runs need no zero-coverage masks. Glyph masks can contain
-zeros and use channel vectors with matching coverage permutations. Isolation
-also uses matching channel vectors. Incomplete vectors use scalar arithmetic. Multiplication and addition remain separate and in the same
+using one uniform inverse alpha without channel shuffles. Varying coverage,
+glyphs and isolation use channel vectors with matching pixel permutations.
+The coverage compiler exposes strictly positive samples through a borrowed
+type; these runs need no zero-coverage masks. Glyph masks can contain zeros
+and preserve the corresponding destination pixels. Incomplete vectors use
+scalar arithmetic. Multiplication and addition remain separate and in the same
 order as scalar composition. Zero coverage and zero isolated alpha preserve the
 destination exactly. Native and scalar paths are checked bit for bit, including
 extended channels, partial vectors, partial bands and isolation.

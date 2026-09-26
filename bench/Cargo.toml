@@ -25,10 +25,12 @@ cherenkov-vello = ["dep:cherenkov", "dep:cherenkov-vello"]
 # binaries.
 skia = ["dep:skia-safe", "dep:ash", "dep:skia-bindings", "skia-safe/vulkan", "skia-safe/ganesh"]
 skia-metal = ["dep:skia-safe", "dep:objc2", "dep:objc2-metal", "dep:skia-bindings", "skia-safe/metal", "skia-safe/graphite"]
+cherenkov = ["dep:cherenkov", "dep:cherenkov-gpu"]
 
 [dependencies]
-cherenkov-scene = { path = "../scene" }
 cherenkov = { path = "..", optional = true }
+cherenkov-gpu = { path = "../gpu", optional = true }
+cherenkov-scene = { path = "../scene" }
 cherenkov-vello = { path = "../vello", optional = true }
 cherenkov-oracle = { path = "../oracle" }
 kurbo = "0.13"

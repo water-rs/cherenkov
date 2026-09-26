@@ -435,6 +435,7 @@ impl Content {
         };
         body(&mut recorder);
         LAST_LIST_LEN.with(|len| len.set(recorder.list.len()));
+        recorder.list.trim_spare();
         Self {
             picture: Picture::new(recorder.list),
             live: recorder.live,

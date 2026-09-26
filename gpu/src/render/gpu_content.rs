@@ -8,7 +8,7 @@ use crate::interop::{
     wgpu::{Context, Frame},
 };
 
-pub(crate) struct Slot {
+pub struct Slot {
     content: GpuContentBox,
     pub image: super::GpuImage,
     last_frame: Option<Instant>,

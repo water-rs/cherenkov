@@ -70,7 +70,7 @@ fn engine_executes_composed_filters_and_effects_after_resize()
             "filter output {actual}, expected {expected}"
         );
     }
-    surface.resize((8, 8));
+    surface.resize((8, 8))?;
     engine.render(FrameTime::at(start + Duration::from_millis(250)))?;
     let timing = receive.try_recv()?;
     assert_eq!(timing.presentation_time(), Duration::from_millis(250));

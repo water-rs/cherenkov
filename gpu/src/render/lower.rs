@@ -529,7 +529,7 @@ pub enum ContentData {
     /// A live display list.
     List(DisplayList),
     /// An engine-owned custom content texture.
-    Gpu(super::gpu_content::Slot),
+    Gpu(Box<super::gpu_content::Slot>),
 }
 
 /// GPU resources the lowering needs to emit glyph instances.
@@ -1792,12 +1792,9 @@ impl<'a> Lowering<'a> {
                 &mut self.frame.stops,
                 glyphs.images,
                 &mut self.frame.shaders,
-                self.transform.inverse().transform_rect_bbox(Rect::new(
-                    f64::from(x0),
-                    f64::from(y0),
-                    f64::from(x0) + f64::from(entry.w),
-                    f64::from(y0) + f64::from(entry.h),
-                )),
+                self.transform
+                    .inverse()
+                    .transform_rect_bbox(rect_f32(inst.bounds)),
                 self.transform,
             )?;
             self.set_image(paint_data.image);
@@ -1943,4 +1940,9 @@ fn tight_region(instances: &[Instance], width: u32, height: u32) -> [u32; 4] {
         return [0, 0, 0, 0];
     }
     [x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32]
+}
+
+fn rect_f32(bounds: [f32; 4]) -> Rect {
+    let [x0, y0, x1, y1] = bounds.map(f64::from);
+    Rect::new(x0, y0, x1, y1)
 }

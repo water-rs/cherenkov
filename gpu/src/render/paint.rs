@@ -20,7 +20,7 @@ pub struct Key {
     pub size: (u32, u32),
 }
 
-struct Pipeline {
+struct Entry {
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
     animated: bool,
@@ -35,7 +35,7 @@ pub struct Texture {
 }
 
 #[derive(Default)]
-pub struct Registry(HashMap<u64, Pipeline>);
+pub struct Registry(HashMap<u64, Entry>);
 
 impl Registry {
     pub fn add(
@@ -70,21 +70,21 @@ impl Registry {
                 module: &module,
                 entry_point: Some("vs_main"),
                 buffers: &[],
-                compilation_options: Default::default(),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(wgpu::FragmentState {
                 module: &module,
                 entry_point: Some("main"),
-                compilation_options: Default::default(),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: super::TARGET_FORMAT,
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
-            primitive: Default::default(),
+            primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
-            multisample: Default::default(),
+            multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
             cache: None,
         });
@@ -93,7 +93,7 @@ impl Registry {
         }
         self.0.insert(
             id,
-            Pipeline {
+            Entry {
                 pipeline,
                 layout,
                 animated: source.animated,
@@ -207,7 +207,7 @@ impl Registry {
     }
 }
 
-fn uniform_binding(binding: u32, size: u64) -> wgpu::BindGroupLayoutEntry {
+const fn uniform_binding(binding: u32, size: u64) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::FRAGMENT,

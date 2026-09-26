@@ -267,7 +267,33 @@ impl std::fmt::Debug for Recorder {
     }
 }
 
+impl Default for Recorder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Recorder {
+    /// Starts a recording; [`Recorder::finish`] turns it into [`Content`].
+    /// [`Content::record`] is the closure form of the same pair.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            list: DisplayList::default(),
+            live: Rc::default(),
+        }
+    }
+
+    /// Ends the recording.
+    #[must_use]
+    pub fn finish(self) -> Content {
+        Content {
+            list: self.list,
+            live: self.live,
+            sent: false,
+        }
+    }
+
     /// Subscribes to a value's later changes, which update operand `convert`
     /// produces on command `command`.
     fn subscribe<T: 'static>(
@@ -433,16 +459,9 @@ impl Content {
     /// Records content.
     #[must_use]
     pub fn record(body: impl FnOnce(&mut Recorder)) -> Self {
-        let mut recorder = Recorder {
-            list: DisplayList::default(),
-            live: Rc::default(),
-        };
+        let mut recorder = Recorder::new();
         body(&mut recorder);
-        Self {
-            list: recorder.list,
-            live: recorder.live,
-            sent: false,
-        }
+        recorder.finish()
     }
 
     /// The change to send at the next commit, if any. The first call sends the
@@ -458,6 +477,18 @@ impl Content {
             return Some(ContentChange::Replace(self.list.clone()));
         }
         (!updates.is_empty()).then_some(ContentChange::Update(updates))
+    }
+
+    /// Freezes the content into a [`Picture`]: the display list with every
+    /// signal change received so far applied, and no subscriptions. For
+    /// content recorded once and shared, or nested into another recording.
+    #[must_use]
+    pub fn into_picture(mut self) -> Picture {
+        let updates = self.live.pending.take();
+        if !updates.is_empty() {
+            let _ = self.list.apply(updates);
+        }
+        Picture::new(self.list)
     }
 
     /// The display list with every signal change received so far applied, for

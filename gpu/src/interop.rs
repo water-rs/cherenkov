@@ -3,6 +3,7 @@
 
 //! Device sharing and presentation of the engine's retained working-space output.
 
+pub use crate::render::filter::EffectBox;
 pub use crate::render::present::{OutputAlpha, OutputColor, Presenter, TextureOutput};
 use std::future::Future;
 use std::sync::Arc;

@@ -89,6 +89,9 @@ pub enum ScratchFormat {
 /// Configuration for the GPU engine.
 #[derive(Clone, Debug)]
 pub struct GpuConfig {
+    /// Wakes an idle host for asynchronous filter parameter changes. The
+    /// callback can run on producer threads; offscreen callers may omit it.
+    pub redraw: Option<interop::RedrawCallback>,
     /// Uses an existing host device. Handles must share one creation chain.
     /// Device limits and enabled features govern engine capabilities.
     pub device: Option<interop::SharedDevice>,
@@ -117,6 +120,7 @@ impl Default for GpuConfig {
     fn default() -> Self {
         Self {
             device: None,
+            redraw: None,
             backends: wgpu::Backends::all(),
             power_preference: wgpu::PowerPreference::HighPerformance,
             timestamps: false,
@@ -267,5 +271,22 @@ impl cherenkov::ShaderPaintCapability for Gpu {
     }
     fn remove_shader(r: &mut Self::Renderer, id: cherenkov::ShaderId) {
         r.remove_shader(id);
+    }
+}
+
+impl cherenkov::Filters for Gpu {
+    fn remove_filter(r: &mut Self::Renderer, id: cherenkov::FilterId) {
+        r.remove_filter(id);
+    }
+}
+impl<F: filtrate_core::Filter + Send> cherenkov::Runs<F> for Gpu {
+    fn add_filter(r: &mut Self::Renderer, id: cherenkov::FilterId, filter: F) {
+        r.add_filter(id, Box::new(render::filter::FromFilter(filter)));
+    }
+}
+impl cherenkov::Effects for Gpu {
+    type Effect = interop::EffectBox;
+    fn add_effect(r: &mut Self::Renderer, id: cherenkov::FilterId, effect: Self::Effect) {
+        r.add_filter(id, effect.0);
     }
 }

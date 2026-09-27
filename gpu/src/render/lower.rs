@@ -110,6 +110,7 @@ pub struct Frame {
     /// Passes in submission order.
     pub passes: Vec<Pass>,
     pub content: Vec<LayerId>,
+    pub filters: Vec<(usize, u64)>,
     open: Option<OpenPass>,
 }
 
@@ -132,6 +133,7 @@ struct FrameSnapshot {
     instances: usize,
     stops: usize,
     passes: usize,
+    filters: usize,
     open: Option<OpenPass>,
 }
 
@@ -142,6 +144,7 @@ impl Frame {
             instances: self.instances.len(),
             stops: self.stops.len(),
             passes: self.passes.len(),
+            filters: self.filters.len(),
             open: self.open.clone(),
         }
     }
@@ -151,6 +154,7 @@ impl Frame {
         self.instances.truncate(snap.instances);
         self.stops.truncate(snap.stops);
         self.passes.truncate(snap.passes);
+        self.filters.truncate(snap.filters);
         self.open = snap.open;
     }
 }
@@ -162,6 +166,7 @@ impl Frame {
         self.stops.clear();
         self.passes.clear();
         self.content.clear();
+        self.filters.clear();
         self.open = None;
     }
 }
@@ -779,12 +784,14 @@ impl<'a> Lowering<'a> {
     fn isolate(
         &mut self,
         inner_clip: Option<DeviceClip>,
+        filter: Option<cherenkov::FilterId>,
         opacity: f32,
         blend: cherenkov::BlendMode,
         mut body: impl FnMut(&mut Self, &GlyphContext<'_>) -> Result<(), RenderError>,
         glyphs: &GlyphContext<'_>,
     ) -> Result<(), RenderError> {
-        if opacity < 1.0
+        if filter.is_none()
+            && opacity < 1.0
             && blend == cherenkov::BlendMode::Normal
             && self.try_passthrough(opacity, inner_clip.is_none(), &mut body, glyphs)?
         {
@@ -808,17 +815,33 @@ impl<'a> Lowering<'a> {
         } else {
             Target::Scratch(self.depth - 1)
         };
-        let region = tight_region(
-            &self.frame.instances[inst_start..],
-            self.width as u32,
-            self.height as u32,
-        );
+        let region = if let Some(filter) = filter {
+            self.frame
+                .filters
+                .push((self.frame.passes.len() - 1, filter.raw()));
+            [0, 0, self.width as u32, self.height as u32]
+        } else {
+            tight_region(
+                &self.frame.instances[inst_start..],
+                self.width as u32,
+                self.height as u32,
+            )
+        };
         if region[2] == 0 || region[3] == 0 {
             // Nothing visible in the scratch: drop this depth's segment
             // passes and the composite entirely.
             for i in (passes_start..self.frame.passes.len()).rev() {
                 if self.frame.passes[i].target == Target::Scratch(scratch) {
                     self.frame.passes.remove(i);
+                    self.frame.filters.retain_mut(|(pass, _)| {
+                        if *pass == i {
+                            return false;
+                        }
+                        if *pass > i {
+                            *pass -= 1;
+                        }
+                        true
+                    });
                 }
             }
             self.begin_pass(outer_target, None);
@@ -1081,7 +1104,14 @@ impl<'a> Lowering<'a> {
                     self.clip = Some(cur);
                     return Ok(());
                 }
-                self.isolate(Some(clip), 1.0, cherenkov::BlendMode::Normal, body, glyphs)
+                self.isolate(
+                    Some(clip),
+                    None,
+                    1.0,
+                    cherenkov::BlendMode::Normal,
+                    body,
+                    glyphs,
+                )
             }
             Some(cur) => match (clip.mask, cur.aligned_rect, clip.aligned_rect) {
                 // A new masked clip merges with an aligned rect clip (or
@@ -1109,7 +1139,14 @@ impl<'a> Lowering<'a> {
                     self.clip = Some(cur);
                     Ok(())
                 }
-                _ => self.isolate(Some(clip), 1.0, cherenkov::BlendMode::Normal, body, glyphs),
+                _ => self.isolate(
+                    Some(clip),
+                    None,
+                    1.0,
+                    cherenkov::BlendMode::Normal,
+                    body,
+                    glyphs,
+                ),
             },
         }
     }
@@ -1126,9 +1163,6 @@ impl<'a> Lowering<'a> {
         glyphs: &GlyphContext<'_>,
     ) -> Result<(), RenderError> {
         let node = tree.layer(id);
-        if node.filter.is_some() {
-            return Err(RenderError::Unsupported(names::FILTER));
-        }
         if node.backdrop.is_some() {
             return Err(RenderError::Unsupported(names::BACKDROP));
         }
@@ -1139,10 +1173,14 @@ impl<'a> Lowering<'a> {
             node.clip.as_ref(),
             |s, glyphs| {
                 s.transform = content_space;
-                if node.opacity < 1.0 || node.blend != cherenkov::BlendMode::Normal {
+                if node.filter.is_some()
+                    || node.opacity < 1.0
+                    || node.blend != cherenkov::BlendMode::Normal
+                {
                     let inner = s.clip;
                     s.isolate(
                         inner,
+                        node.filter,
                         node.opacity,
                         node.blend,
                         |s, glyphs| s.layer_items(id, node, tree, caches, glyphs),
@@ -1257,10 +1295,12 @@ impl<'a> Lowering<'a> {
                 Op::BeginIsolate {
                     opacity,
                     blend,
+                    filter,
                     end,
                 } => {
                     self.isolate(
                         None,
+                        *filter,
                         *opacity,
                         *blend,
                         |s, g| {
@@ -2458,6 +2498,7 @@ mod tests {
         // the group really isolates into a scratch and composites back.
         lowering
             .isolate(
+                None,
                 None,
                 0.5,
                 cherenkov::BlendMode::Normal,

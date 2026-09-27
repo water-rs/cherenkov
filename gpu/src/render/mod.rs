@@ -823,7 +823,7 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
 /// `COLR` fonts render through the colour-glyph lowering; fonts carrying
 /// `CBDT`/`CBLC` or `sbix` bitmaps without outline glyphs cannot
 /// rasterize.
-fn validate_font(data: &[u8], index: u32) -> Result<(), ResourceError> {
+fn validate_font(data: &[u8], index: u32) -> Result<bool, ResourceError> {
     use skrifa::MetadataProvider as _;
     use skrifa::raw::TableProvider as _;
     let font = skrifa::FontRef::from_index(data, index)
@@ -835,7 +835,7 @@ fn validate_font(data: &[u8], index: u32) -> Result<(), ResourceError> {
     {
         return Err(ResourceError::Unsupported(names::COLOR_FONT));
     }
-    Ok(())
+    Ok(font.colr().is_ok())
 }
 
 impl Renderer for GpuRenderer {
@@ -917,12 +917,13 @@ impl Renderer for GpuRenderer {
     }
 
     fn add_font(&mut self, id: FontId, font: EngineFontData) -> Result<(), ResourceError> {
-        validate_font(&font.data, font.index)?;
+        let has_colr = validate_font(&font.data, font.index)?;
         self.fonts.insert(
             id.raw(),
             FontData {
                 data: font.data,
                 index: font.index,
+                has_colr,
                 colr: std::cell::RefCell::new(HashMap::new()),
             },
         );

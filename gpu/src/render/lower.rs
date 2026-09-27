@@ -994,9 +994,16 @@ impl<'a> Lowering<'a> {
         glyphs: &GlyphContext<'_>,
     ) -> Result<(), RenderError> {
         if let Some(content) = caches.get_mut(&id) {
-            let (ops, emissions) = content.retained.prepared();
+            let (ops, emissions, source) = content.retained.prepared_source();
             content.storage.compact(emissions);
-            let changed = self.ops(ops, emissions, &mut content.storage, 0, ops.len(), glyphs)?;
+            let changed = self.ops(
+                source,
+                ops,
+                emissions,
+                &mut content.storage,
+                0..ops.len(),
+                glyphs,
+            )?;
             self.layers_composed += u32::from(changed);
         }
         for child in &node.children {
@@ -1009,22 +1016,24 @@ impl<'a> Lowering<'a> {
     /// realizations produce new instances or coverage; scopes assemble passes.
     fn ops(
         &mut self,
+        source: &cherenkov::DisplayList,
         ops: &[Op],
         emissions: &mut [Realization<Emission>],
         storage: &mut EmissionStorage,
-        mut i: usize,
-        end: usize,
+        range: Range<usize>,
         glyphs: &GlyphContext<'_>,
     ) -> Result<bool, RenderError> {
         let mut changed = false;
-        while i < end {
+        let mut i = range.start;
+        while i < range.end {
             match &ops[i] {
                 Op::BeginClip { local, shape, end } => {
                     let saved = self.transform;
                     self.transform = saved * *local;
                     let body = |s: &mut Self, g: &GlyphContext<'_>| {
                         s.transform = saved;
-                        changed |= s.ops(ops, emissions, storage, i + 1, *end as usize, g)?;
+                        changed |=
+                            s.ops(source, ops, emissions, storage, i + 1..*end as usize, g)?;
                         Ok(())
                     };
                     match shape {
@@ -1057,7 +1066,8 @@ impl<'a> Lowering<'a> {
                         *opacity,
                         *blend,
                         |s, g| {
-                            changed |= s.ops(ops, emissions, storage, i + 1, *end as usize, g)?;
+                            changed |=
+                                s.ops(source, ops, emissions, storage, i + 1..*end as usize, g)?;
                             Ok(())
                         },
                         glyphs,
@@ -1066,7 +1076,14 @@ impl<'a> Lowering<'a> {
                 }
                 Op::End => unreachable!("paired scopes consume their ends"),
                 op => {
-                    changed |= self.leaf(op, ops.get(i + 1), &mut emissions[i], storage, glyphs)?;
+                    changed |= self.leaf(
+                        op,
+                        ops.get(i + 1),
+                        &mut emissions[i],
+                        storage,
+                        glyphs,
+                        source,
+                    )?;
                 }
             }
             i += 1;
@@ -1091,6 +1108,7 @@ impl<'a> Lowering<'a> {
         cache: &mut Realization<Emission>,
         storage: &mut EmissionStorage,
         glyphs: &GlyphContext<'_>,
+        source: &cherenkov::DisplayList,
     ) -> Result<bool, RenderError> {
         let clip = self.clip;
         let cover = self.shadow_cover(op, next);
@@ -1115,7 +1133,7 @@ impl<'a> Lowering<'a> {
         // `self.transform`; the leaf's placement is restored with the clip.
         let transform = self.transform;
         self.clip = None;
-        let realized = self.realize(op, cover, glyphs);
+        let realized = self.realize(op, cover, glyphs, source);
         self.transform = transform;
         self.clip = clip;
         realized?;
@@ -1216,6 +1234,7 @@ impl<'a> Lowering<'a> {
         op: &Op,
         cover: Option<Cover>,
         glyphs: &GlyphContext<'_>,
+        source: &cherenkov::DisplayList,
     ) -> Result<(), RenderError> {
         match op {
             Op::Shaped {
@@ -1285,29 +1304,56 @@ impl<'a> Lowering<'a> {
                         glyphs,
                     )?,
                     Outline::Stroke { shape, stroke } => {
-                        let tol = path::FLATTEN / path::sigma_max(self.transform).max(1e-12);
-                        let content = path::hash_stroke(shape, stroke, tol);
-                        self.path(
-                            content,
-                            *rule,
-                            || {
-                                let path =
-                                    path::shape_path(shape, tol).expect("supported stroke shape");
-                                kurbo::stroke(path, stroke, &kurbo::StrokeOpts::default(), tol)
-                            },
-                            paint,
-                            glyphs,
-                        )?;
+                        self.stroke_path(shape, stroke, *rule, paint, glyphs)?;
                     }
+                    Outline::Source { command, content } => match &source.commands()[*command] {
+                        cherenkov::Command::Fill {
+                            shape: ShapeData::Path { elements, .. },
+                            ..
+                        } => {
+                            self.path(
+                                content.expect("prepared fill has a hash"),
+                                *rule,
+                                || BezPath::from_vec(elements.clone()),
+                                paint,
+                                glyphs,
+                            )?;
+                        }
+                        cherenkov::Command::Stroke { shape, stroke, .. } => {
+                            self.stroke_path(shape, stroke, *rule, paint, glyphs)?;
+                        }
+                        _ => unreachable!("prepared outline keeps its source kind"),
+                    },
                 }
             }
             Op::Glyphs { local, run, paint } => {
                 self.transform *= *local;
-                self.glyph_run(run, paint, glyphs)?;
+                self.glyph_run(run.get(source), paint, glyphs)?;
             }
             _ => unreachable!("scope is composed, never realized as a leaf"),
         }
         Ok(())
+    }
+
+    fn stroke_path(
+        &mut self,
+        shape: &ShapeData,
+        stroke: &cherenkov::kurbo::Stroke,
+        rule: FillRule,
+        paint: &ResolvedPaint,
+        glyphs: &GlyphContext<'_>,
+    ) -> Result<(), RenderError> {
+        let tol = path::FLATTEN / path::sigma_max(self.transform).max(1e-12);
+        self.path(
+            path::hash_stroke(shape, stroke, tol),
+            rule,
+            || {
+                let path = path::shape_path(shape, tol).expect("supported stroke shape");
+                kurbo::stroke(path, stroke, &kurbo::StrokeOpts::default(), tol)
+            },
+            paint,
+            glyphs,
+        )
     }
 
     /// A following opaque box hides a rectangle inside each pair of its corner rows.
@@ -1534,24 +1580,26 @@ impl<'a> Lowering<'a> {
         paint: &ResolvedPaint,
     ) {
         let paint = self.resolved_paint(paint);
+        let mut template = self.base(KIND_SPAN, affine(self.transform));
+        template.color = paint.color;
+        template.grad = paint.grad;
+        template.grad2 = paint.grad2;
+        template.meta[1] = paint.kind;
+        template.meta[2] = paint.first_stop;
+        template.meta[3] |= paint.packed & 0x00ff_ffff;
         for rect in &emit.spans {
-            let mut inst = self.base(KIND_SPAN, affine(self.transform));
+            let mut inst = template;
             inst.bounds = [
                 f32_f64(f64::from(rect[0]) + offset.x),
                 f32_f64(f64::from(rect[1]) + offset.y),
                 f32_f64(f64::from(rect[2]) + offset.x),
                 f32_f64(f64::from(rect[3]) + offset.y),
             ];
-            inst.color = paint.color;
-            inst.grad = paint.grad;
-            inst.grad2 = paint.grad2;
-            inst.meta[1] = paint.kind;
-            inst.meta[2] = paint.first_stop;
-            inst.meta[3] |= paint.packed & 0x00ff_ffff;
             self.push_instance(&inst);
         }
+        template.meta[0] = KIND_GLYPH;
         for (i, cell) in emit.cells.iter().enumerate() {
-            let mut inst = self.base(KIND_GLYPH, affine(self.transform));
+            let mut inst = template;
             inst.bounds = [
                 f32_f64(f64::from(cell.rect[0]) + offset.x),
                 f32_f64(f64::from(cell.rect[1]) + offset.y),
@@ -1559,12 +1607,6 @@ impl<'a> Lowering<'a> {
                 f32_f64(f64::from(cell.rect[3]) + offset.y),
             ];
             inst.uv = [f32::from(cell.x), f32::from(cell.y), inst.uv[2], inst.uv[3]];
-            inst.color = paint.color;
-            inst.grad = paint.grad;
-            inst.grad2 = paint.grad2;
-            inst.meta[1] = paint.kind;
-            inst.meta[2] = paint.first_stop;
-            inst.meta[3] |= paint.packed & 0x00ff_ffff;
             self.push_instance(&inst);
             if let Some(pending) = pending {
                 self.cell_patches.push((
@@ -1686,13 +1728,15 @@ impl<'a> Lowering<'a> {
             .fonts
             .get(&run.font.raw())
             .ok_or_else(|| RenderError::Font(format!("unregistered font {:?}", run.font)))?;
+        let key = glyph_key(run, 0, (0.0, 0.0), self.transform);
+        let mut template = None;
         for glyph in &run.glyphs {
             let o = self.transform * Point::new(f64::from(glyph.x), f64::from(glyph.y));
             let ix = o.x.floor();
             let iy = o.y.floor();
             let fx = ((o.x - ix) * 4.0).floor() / 4.0;
             let fy = ((o.y - iy) * 4.0).floor() / 4.0;
-            let key = glyph_key(run, glyph.id, (f32_f64(fx), f32_f64(fy)), self.transform);
+            let key = key.at(glyph.id, (f32_f64(fx), f32_f64(fy)));
             let (entry, pending) = glyph::entry(
                 glyphs.atlas,
                 font,
@@ -1708,18 +1752,21 @@ impl<'a> Lowering<'a> {
             if entry.w == 0 || entry.h == 0 {
                 continue;
             }
-            let mut inst = self.base(KIND_GLYPH, affine(self.transform));
+            let mut inst = *template.get_or_insert_with(|| {
+                let mut inst = self.base(KIND_GLYPH, affine(self.transform));
+                let data = self.resolved_paint(paint);
+                inst.color = data.color;
+                inst.grad = data.grad;
+                inst.grad2 = data.grad2;
+                inst.meta[1] = data.kind;
+                inst.meta[2] = data.first_stop;
+                inst.meta[3] |= data.packed & 0x00ff_ffff;
+                inst
+            });
             let x0 = f32_f64(ix + f64::from(entry.left));
             let y0 = f32_f64(iy + f64::from(entry.top));
             inst.bounds = [x0, y0, x0 + f32::from(entry.w), y0 + f32::from(entry.h)];
             inst.uv = [f32::from(entry.x), f32::from(entry.y), 0.0, 0.0];
-            let paint_data = self.resolved_paint(paint);
-            inst.color = paint_data.color;
-            inst.grad = paint_data.grad;
-            inst.grad2 = paint_data.grad2;
-            inst.meta[1] = paint_data.kind;
-            inst.meta[2] = paint_data.first_stop;
-            inst.meta[3] |= paint_data.packed & 0x00ff_ffff;
             self.push_instance(&inst);
             if let Some(pending) = pending {
                 let inst =
@@ -1884,7 +1931,7 @@ mod tests {
         let mut ops = Vec::new();
         compiler.draw(command, Affine::IDENTITY, &mut ops)?;
         for op in ops {
-            lowering.realize(&op, None, glyphs)?;
+            lowering.realize(&op, None, glyphs, &cherenkov::DisplayList::default())?;
         }
         Ok(())
     }

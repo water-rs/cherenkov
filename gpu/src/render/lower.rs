@@ -289,17 +289,120 @@ fn cover_strips(b: Rect, c: Cover) -> impl Iterator<Item = Rect> {
 }
 
 /// A layer's retained content and device output.
-pub type ContentData = cherenkov::lowering::Content<Op, Emission>;
+pub struct ContentData {
+    pub(crate) retained: cherenkov::lowering::Content<Op, Emission>,
+    pub(crate) storage: EmissionStorage,
+}
+
+impl ContentData {
+    pub fn new(list: cherenkov::Picture) -> Self {
+        Self {
+            retained: cherenkov::lowering::Content::new(list),
+            storage: EmissionStorage::default(),
+        }
+    }
+
+    pub fn replace(&mut self, list: cherenkov::Picture) {
+        self.retained.replace(list);
+        self.storage.instances.clear();
+        self.storage.stops.clear();
+    }
+
+    pub fn picture(list: cherenkov::Picture) -> Self {
+        Self {
+            retained: cherenkov::lowering::Content::picture(list),
+            storage: EmissionStorage::default(),
+        }
+    }
+
+    pub fn update(&mut self, updates: Vec<cherenkov::SlotUpdate>) {
+        self.retained.update(updates);
+    }
+
+    pub fn invalidate(&mut self) {
+        self.retained.invalidate();
+        self.storage = EmissionStorage::default();
+    }
+
+    pub fn trim(&mut self) {
+        self.retained.trim();
+        self.storage = EmissionStorage::default();
+    }
+}
+
+/// A layer's device data. Leaf ranges remain independent for dirty updates.
+#[derive(Default)]
+pub struct EmissionStorage {
+    pub(crate) instances: Vec<RetainedInstance>,
+    stops: Vec<Stop>,
+}
+
+impl EmissionStorage {
+    /// Reclaim obsolete ranges after patches without rebuilding valid leaves.
+    fn compact(&mut self, emissions: &mut [Realization<Emission>]) {
+        if self.instances.is_empty() && self.stops.is_empty() {
+            return;
+        }
+        let (instances, stops) = emissions
+            .iter()
+            .filter_map(|e| e.data.as_ref())
+            .fold((0, 0), |(i, s), e| {
+                (i + e.instances.len(), s + e.stops.len())
+            });
+        if self.instances.len() <= instances * 2 && self.stops.len() <= stops * 2 {
+            return;
+        }
+        let mut storage = Self {
+            instances: Vec::with_capacity(instances),
+            stops: Vec::with_capacity(stops),
+        };
+        for e in emissions.iter_mut().filter_map(|e| e.data.as_mut()) {
+            let first = storage.instances.len();
+            storage
+                .instances
+                .extend_from_slice(&self.instances[e.instances.clone()]);
+            e.instances = first..storage.instances.len();
+            let first = storage.stops.len();
+            storage
+                .stops
+                .extend_from_slice(&self.stops[e.stops.clone()]);
+            e.stops = first..storage.stops.len();
+        }
+        *self = storage;
+    }
+}
+
+/// Fields that vary within one realized leaf. Shape, placement and paint are
+/// shared by all its quads, including a box's interior/border split.
+#[derive(Clone, Copy)]
+pub struct RetainedInstance {
+    bounds: [f32; 4],
+    pub(crate) uv: [f32; 2],
+    kind: u32,
+    first_stop: u32,
+}
+
+impl RetainedInstance {
+    fn restore(self, template: &Instance, stop_base: u32) -> Instance {
+        let mut inst = *template;
+        inst.bounds = self.bounds;
+        inst.uv[..2].copy_from_slice(&self.uv);
+        inst.meta[0] = self.kind;
+        inst.meta[2] = self.first_stop + stop_base;
+        inst
+    }
+}
 
 /// Per-operation device output under its sampled placement.
 pub struct Emission {
     pub(crate) pending_cells: Vec<(u32, u32, u32)>,
+    template: Instance,
     cover: Option<Cover>,
     transform: Affine,
     size: [f32; 2],
     generation: u64,
-    pub(crate) instances: Vec<Instance>,
-    stops: Vec<Stop>,
+    pub(crate) instances: Range<usize>,
+    stops: Range<usize>,
     image: Option<u64>,
 }
 
@@ -400,7 +503,7 @@ impl<'a> Lowering<'a> {
         glyphs: &GlyphContext<'_>,
     ) -> Result<(), RenderError> {
         for content in caches.values_mut() {
-            self.commands_lowered += content.prepare(&mut super::prepared::Lowerer {
+            self.commands_lowered += content.retained.prepare(&mut super::prepared::Lowerer {
                 fonts: glyphs.fonts,
                 images: glyphs.images,
                 pending: &mut self.pending,
@@ -894,8 +997,9 @@ impl<'a> Lowering<'a> {
         glyphs: &GlyphContext<'_>,
     ) -> Result<(), RenderError> {
         if let Some(content) = caches.get_mut(&id) {
-            let (ops, emissions) = content.prepared();
-            let changed = self.ops(ops, emissions, 0, ops.len(), glyphs)?;
+            let (ops, emissions) = content.retained.prepared();
+            content.storage.compact(emissions);
+            let changed = self.ops(ops, emissions, &mut content.storage, 0, ops.len(), glyphs)?;
             self.layers_composed += u32::from(changed);
         }
         for child in &node.children {
@@ -910,6 +1014,7 @@ impl<'a> Lowering<'a> {
         &mut self,
         ops: &[Op],
         emissions: &mut [Realization<Emission>],
+        storage: &mut EmissionStorage,
         mut i: usize,
         end: usize,
         glyphs: &GlyphContext<'_>,
@@ -922,7 +1027,7 @@ impl<'a> Lowering<'a> {
                     self.transform = saved * *local;
                     let body = |s: &mut Self, g: &GlyphContext<'_>| {
                         s.transform = saved;
-                        changed |= s.ops(ops, emissions, i + 1, *end as usize, g)?;
+                        changed |= s.ops(ops, emissions, storage, i + 1, *end as usize, g)?;
                         Ok(())
                     };
                     match shape {
@@ -955,7 +1060,7 @@ impl<'a> Lowering<'a> {
                         *opacity,
                         *blend,
                         |s, g| {
-                            changed |= s.ops(ops, emissions, i + 1, *end as usize, g)?;
+                            changed |= s.ops(ops, emissions, storage, i + 1, *end as usize, g)?;
                             Ok(())
                         },
                         glyphs,
@@ -963,7 +1068,9 @@ impl<'a> Lowering<'a> {
                     i = *end as usize;
                 }
                 Op::End => unreachable!("paired scopes consume their ends"),
-                op => changed |= self.leaf(op, ops.get(i + 1), &mut emissions[i], glyphs)?,
+                op => {
+                    changed |= self.leaf(op, ops.get(i + 1), &mut emissions[i], storage, glyphs)?;
+                }
             }
             i += 1;
         }
@@ -985,6 +1092,7 @@ impl<'a> Lowering<'a> {
         op: &Op,
         next: Option<&Op>,
         cache: &mut Realization<Emission>,
+        storage: &mut EmissionStorage,
         glyphs: &GlyphContext<'_>,
     ) -> Result<bool, RenderError> {
         let clip = self.clip;
@@ -998,10 +1106,9 @@ impl<'a> Lowering<'a> {
             });
         cache.valid = true;
         if hit {
-            self.compose(cache.data.as_ref().expect("a hit has data"), clip);
+            self.compose(cache.data.as_ref().expect("a hit has data"), storage, clip);
             return Ok(false);
         }
-        let previous = cache.data.take();
         self.set_image(None);
         let snapshot = clip.map(|_| self.frame.snapshot());
         let first_instance = self.frame.instances.len();
@@ -1017,30 +1124,44 @@ impl<'a> Lowering<'a> {
         realized?;
         let stop_base = u32::try_from(first_stop).expect("stop count fits u32");
         let instance_base = u32::try_from(first_instance).expect("instance count fits u32");
-        let (mut instances, mut stops) =
-            previous.map_or_else(|| (Vec::new(), Vec::new()), |e| (e.instances, e.stops));
-        instances.clear();
-        // Every stop reference the leaf realized is at least `stop_base`;
-        // an instance without stops carries 0, which stays 0 — exactly the
-        // leaf-relative form a retained copy holds.
-        instances.extend(self.frame.instances[first_instance..].iter().map(|inst| {
-            let mut inst = *inst;
-            inst.meta[2] = inst.meta[2].saturating_sub(stop_base);
-            inst
-        }));
-        stops.clear();
-        stops.extend_from_slice(&self.frame.stops[first_stop..]);
+        let retained_instance = storage.instances.len();
+        let retained_stop = storage.stops.len();
+        let template = self
+            .frame
+            .instances
+            .get(first_instance)
+            .copied()
+            .unwrap_or_else(|| Instance::new(0));
+        storage
+            .instances
+            .extend(self.frame.instances[first_instance..].iter().map(|inst| {
+                let retained = RetainedInstance {
+                    bounds: inst.bounds,
+                    uv: [inst.uv[0], inst.uv[1]],
+                    kind: inst.meta[0],
+                    first_stop: inst.meta[2].saturating_sub(stop_base),
+                };
+                // Keep this invariant checked as new leaf emitters are added. Stop
+                // indices without gradients are unused but preserve their input too.
+                let restored = retained.restore(&template, inst.meta[2] - retained.first_stop);
+                debug_assert_eq!(bytemuck::bytes_of(&restored), bytemuck::bytes_of(inst));
+                retained
+            }));
+        storage
+            .stops
+            .extend_from_slice(&self.frame.stops[first_stop..]);
         let emission = Emission {
             pending_cells: self.cell_patches[first_patch..]
                 .iter()
                 .map(|&(i, p, c)| (i - instance_base, p, c))
                 .collect(),
+            template,
             cover,
             transform,
             size: [self.width, self.height],
             generation: glyphs.atlas.generation(),
-            instances,
-            stops,
+            instances: retained_instance..storage.instances.len(),
+            stops: retained_stop..storage.stops.len(),
             image: self
                 .frame
                 .open
@@ -1051,7 +1172,7 @@ impl<'a> Lowering<'a> {
         if let Some(snapshot) = snapshot {
             self.frame.restore(snapshot);
             self.cell_patches.truncate(first_patch);
-            self.compose(&emission, clip);
+            self.compose(&emission, storage, clip);
         }
         cache.data = Some(emission);
         Ok(true)
@@ -1059,15 +1180,21 @@ impl<'a> Lowering<'a> {
 
     /// Emits a retained leaf's instances and stops into this frame under
     /// `clip`, rebasing its stop and pending-cell indices.
-    fn compose(&mut self, emission: &Emission, clip: Option<DeviceClip>) {
+    fn compose(
+        &mut self,
+        emission: &Emission,
+        storage: &EmissionStorage,
+        clip: Option<DeviceClip>,
+    ) {
         let offset = u32::try_from(self.frame.stops.len()).expect("stop count fits u32");
-        self.frame.stops.extend_from_slice(&emission.stops);
+        self.frame
+            .stops
+            .extend_from_slice(&storage.stops[emission.stops.clone()]);
         self.set_image(emission.image);
         let instance_base =
             u32::try_from(self.frame.instances.len()).expect("instance count fits u32");
-        for inst in &emission.instances {
-            let mut inst = *inst;
-            inst.meta[2] += offset;
+        for inst in &storage.instances[emission.instances.clone()] {
+            let mut inst = inst.restore(&emission.template, offset);
             Self::apply_clip(&mut inst, clip);
             self.push_instance(&inst);
         }
@@ -1147,14 +1274,13 @@ impl<'a> Lowering<'a> {
             }
             Op::Path {
                 local,
-                content,
                 rule,
                 outline,
                 paint,
             } => {
                 self.transform *= *local;
                 match outline {
-                    Outline::Fill(elements) => self.path(
+                    Outline::Fill { elements, content } => self.path(
                         *content,
                         *rule,
                         || BezPath::from_vec(elements.to_vec()),
@@ -1351,14 +1477,15 @@ impl<'a> Lowering<'a> {
         )]
         let surface = (self.width as u32, self.height as u32);
         let pl = path::placement(content, self.transform, surface);
+        if let Some(emit) = glyphs
+            .atlas
+            .path(pl.key)
+            .or_else(|| glyphs.atlas.path(pl.key_exact))
+        {
+            self.replay(emit, None, pl.offset, paint);
+            return Ok(());
+        }
         let (stored, pending) = 'stored: {
-            if let Some(emit) = glyphs
-                .atlas
-                .path(pl.key)
-                .or_else(|| glyphs.atlas.path(pl.key_exact))
-            {
-                break 'stored (emit.clone(), None);
-            }
             let device = pl.raster * make();
             let (segments, bbox) = path::flatten_segments(&device, path::FLATTEN);
             let Some(coverage) = path::rasterize(

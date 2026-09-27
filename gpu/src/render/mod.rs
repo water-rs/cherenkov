@@ -948,7 +948,11 @@ impl Renderer for GpuRenderer {
         };
         match content {
             Some(ContentOp::Replace(list)) => {
-                state.layers.insert(layer, ContentData::new(list));
+                if let Some(content) = state.layers.get_mut(&layer) {
+                    content.replace(list);
+                } else {
+                    state.layers.insert(layer, ContentData::new(list));
+                }
             }
             Some(ContentOp::Update(updates)) => {
                 state
@@ -1460,10 +1464,11 @@ impl GpuRenderer {
             surf.frame.instances[inst as usize].uv[..2].copy_from_slice(&[x, y]);
         }
         for content in surf.layers.values_mut() {
-            let (_, emissions) = content.prepared();
+            let (_, emissions) = content.retained.prepared();
             for emission in emissions.iter_mut().filter_map(|e| e.data.as_mut()) {
                 for (inst, p, c) in emission.pending_cells.drain(..) {
-                    emission.instances[inst as usize].uv[..2].copy_from_slice(&cell_origin(p, c));
+                    content.storage.instances[emission.instances.start + inst as usize].uv[..2]
+                        .copy_from_slice(&cell_origin(p, c));
                 }
             }
         }

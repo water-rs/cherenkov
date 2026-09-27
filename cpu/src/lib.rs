@@ -56,8 +56,8 @@ pub struct RasterConfig {
     /// Worker thread count for the banded rasterizer. `None` uses the
     /// rayon default (one thread per logical core).
     pub threads: Option<usize>,
-    /// Memory budgets; only `budget.cpu` is used (the glyph mask cache —
-    /// this slice has no device-side memory).
+    /// Memory budgets; only `budget.cpu` is used for resident images and cached glyph masks.
+    /// Surface framebuffers and in-flight frame data are not evictable caches.
     pub budget: cherenkov::Budget,
 }
 
@@ -79,6 +79,8 @@ impl From<Offscreen> for RasterTarget {
 /// into f32 framebuffers on a rayon pool.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Raster;
+
+impl cherenkov::Uploads<cherenkov::Rgba8> for Raster {}
 
 impl Backend for Raster {
     type Config = RasterConfig;

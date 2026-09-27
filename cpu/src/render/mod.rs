@@ -2,7 +2,12 @@
 //! of the framebuffers and the worker pool, driven by the shared front
 //! end's render loop.
 
+mod blend;
 mod glyph;
+mod image;
+mod mesh;
+use image::CpuImage;
+use std::sync::Arc;
 mod lower;
 mod paint;
 mod prepared;
@@ -39,6 +44,8 @@ pub struct RasterRenderer {
     pool: rayon::ThreadPool,
     surfaces: HashMap<SurfaceId, SurfaceState>,
     fonts: HashMap<u64, FontData>,
+    images: HashMap<u64, Arc<CpuImage>>,
+    image_budget: u64,
     /// The glyph mask cache, bounded by `Budget::cpu`.
     glyph_cache: glyph::GlyphCache,
 }
@@ -69,6 +76,8 @@ pub fn init(config: RasterConfig) -> Result<(RasterRenderer, RasterInfo), Engine
                     pool,
                     surfaces: HashMap::new(),
                     fonts: HashMap::new(),
+                    images: HashMap::new(),
+                    image_budget: config.budget.cpu.0,
                     glyph_cache: glyph::GlyphCache::new(config.budget.cpu.0),
                 },
                 info,
@@ -103,6 +112,7 @@ fn validate_font(data: &[u8], index: u32) -> Result<(), ResourceError> {
         skrifa::Tag::new(b"COLR"),
         skrifa::Tag::new(b"CBDT"),
         skrifa::Tag::new(b"sbix"),
+        skrifa::Tag::new(b"SVG "),
     ] {
         if font.data_for_tag(tag).is_some() {
             return Err(ResourceError::Unsupported(names::COLOR_FONT));
@@ -171,13 +181,32 @@ impl Renderer for RasterRenderer {
         }
     }
 
-    fn add_image(&mut self, _id: ImageId, _image: ImageUpload) -> Result<(), ResourceError> {
-        Err(ResourceError::Image(
-            "this slice does not draw images".into(),
-        ))
+    fn add_image(&mut self, id: ImageId, image: ImageUpload) -> Result<(), ResourceError> {
+        let resident: u64 = self.images.values().map(|image| image.bytes()).sum();
+        let required = u64::from(image.width)
+            .checked_mul(u64::from(image.height))
+            .and_then(|count| count.checked_mul(16));
+        if required.is_none_or(|bytes| bytes > self.image_budget.saturating_sub(resident)) {
+            return Err(ResourceError::Image("CPU image budget exhausted".into()));
+        }
+        let decoded = Arc::new(CpuImage::decode(&image)?);
+        self.glyph_cache
+            .set_budget(self.image_budget.saturating_sub(resident + decoded.bytes()));
+        self.images.insert(id.raw(), decoded);
+        Ok(())
     }
 
-    fn remove_image(&mut self, _id: ImageId) {}
+    fn remove_image(&mut self, id: ImageId) {
+        self.images.remove(&id.raw());
+        let resident: u64 = self.images.values().map(|image| image.bytes()).sum();
+        self.glyph_cache
+            .set_budget(self.image_budget.saturating_sub(resident));
+        for surface in self.surfaces.values_mut() {
+            for content in surface.layers.values_mut() {
+                content.invalidate();
+            }
+        }
+    }
 
     fn set_content(&mut self, surface: SurfaceId, layer: LayerId, content: Option<ContentOp>) {
         let Some(state) = self.surfaces.get_mut(&surface) else {
@@ -241,7 +270,7 @@ impl Renderer for RasterRenderer {
         })
     }
 
-    /// Memory usage across framebuffers and the glyph mask cache.
+    /// Memory usage across framebuffers, registered images and the glyph mask cache.
     fn memory(&self) -> MemoryUsage {
         let framebuffers: u64 = self
             .surfaces
@@ -250,7 +279,11 @@ impl Renderer for RasterRenderer {
             .sum();
         MemoryUsage {
             gpu: cherenkov::Bytes(0),
-            cpu: cherenkov::Bytes(framebuffers + self.glyph_cache.bytes()),
+            cpu: cherenkov::Bytes(
+                framebuffers
+                    + self.glyph_cache.bytes()
+                    + self.images.values().map(|image| image.bytes()).sum::<u64>(),
+            ),
         }
     }
 
@@ -278,6 +311,8 @@ impl RasterRenderer {
         sf: &cherenkov::SurfaceFrame<'_>,
         stats: &mut FrameStats,
     ) -> Result<(), RenderError> {
+        let profile = tracing::enabled!(target: "cherenkov_cpu::profile", tracing::Level::DEBUG);
+        let start = profile.then(std::time::Instant::now);
         let id = sf.id;
         let mut items: Vec<Item> = Vec::new();
         let glyph_reqs;
@@ -289,7 +324,7 @@ impl RasterRenderer {
             };
             let mut caches = std::mem::take(&mut surf.layers);
             let mut lowering = Lowering::new(&mut items, surf.size);
-            let result = lowering.run(sf.tree, &mut caches);
+            let result = lowering.run(sf.tree, &mut caches, &self.images, &self.fonts);
             stats.commands_lowered += lowering.commands_lowered;
             stats.layers_composed += lowering.layers_composed;
             glyph_reqs = std::mem::take(&mut lowering.glyphs);
@@ -297,7 +332,9 @@ impl RasterRenderer {
             result
         };
         lowered?;
+        let lowered_at = start.map(|_| std::time::Instant::now());
         self.resolve_glyphs(&glyph_reqs)?;
+        let resolved_at = start.map(|_| std::time::Instant::now());
         let Some(surf) = self.surfaces.get_mut(&id) else {
             return Ok(());
         };
@@ -308,6 +345,13 @@ impl RasterRenderer {
         let pool = &self.pool;
         let fb = &mut surf.fb;
         let (draws, edges) = pool.install(|| raster::render_bands(&items, clear, fb, w, h));
+        if let (Some(start), Some(lowered), Some(resolved)) = (start, lowered_at, resolved_at) {
+            tracing::debug!(target: "cherenkov_cpu::profile",
+                lower_ns = lowered.duration_since(start).as_nanos(),
+                glyph_ns = resolved.duration_since(lowered).as_nanos(),
+                shade_ns = resolved.elapsed().as_nanos(),
+                items = items.len(), glyphs = glyph_reqs.len(), "raster phases");
+        }
         stats.draws += draws;
         stats.instances += edges;
         stats.passes += u32::try_from(h.div_ceil(raster::BAND_H)).unwrap_or(u32::MAX);

@@ -232,3 +232,22 @@ impl TextureTarget {
         )
     }
 }
+
+/// Compiles producer WGSL with color conversion helpers.
+///
+/// `cherenkov_srgb`
+/// accepts straight-alpha encoded sRGB; `cherenkov_premultiplied_srgb` accepts
+/// encoded-domain premultiplied sRGB. Both return premultiplied linear Display P3.
+/// Extended signed components are preserved.
+///
+/// # Panics
+/// Invalid WGSL is reported through wgpu's configured error handler.
+#[must_use]
+pub fn shader_module(device: &wgpu::Device, label: &str, source: &str) -> wgpu::ShaderModule {
+    device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some(label),
+        source: wgpu::ShaderSource::Wgsl(
+            format!("{}\n{source}", include_str!("render/color.wgsl")).into(),
+        ),
+    })
+}

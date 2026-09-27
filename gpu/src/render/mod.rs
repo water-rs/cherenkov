@@ -9,6 +9,7 @@ mod instance;
 mod lower;
 mod path;
 mod prepared;
+pub mod present;
 mod raster;
 
 use std::collections::{HashMap, VecDeque};
@@ -121,6 +122,10 @@ pub struct GpuImage {
 
 /// One surface's GPU-side state.
 struct SurfaceState {
+    window: Option<present::WindowSurface>,
+    textures: Option<std::sync::mpsc::Sender<wgpu::Texture>>,
+    refresh: cherenkov::RefreshRange,
+    present_pending: bool,
     size: (u32, u32),
     /// The scratch texture format (set at creation).
     scratch_format: wgpu::TextureFormat,
@@ -181,6 +186,9 @@ impl SurfaceState {
 
 /// All render-thread state.
 pub struct GpuRenderer {
+    instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
+    presenter: Option<present::Presenter>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     /// `[format index][pipeline kind][shader variant]`:
@@ -369,7 +377,15 @@ fn grow_preserving(
 /// format's required usages.
 fn create_device(
     config: &GpuConfig,
-) -> Result<(wgpu::Adapter, wgpu::Device, wgpu::Queue), EngineError> {
+) -> Result<(wgpu::Instance, wgpu::Adapter, wgpu::Device, wgpu::Queue), EngineError> {
+    if let Some(shared) = &config.device {
+        return Ok((
+            shared.instance.clone(),
+            shared.adapter.clone(),
+            shared.device.clone(),
+            shared.queue.clone(),
+        ));
+    }
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: config.backends,
         ..wgpu::InstanceDescriptor::new_without_display_handle()
@@ -422,7 +438,7 @@ fn create_device(
     }))
     .map_err(|e| EngineError::Backend(format!("{e}")))?;
     tracing::info!(features = ?device.features(), "device");
-    Ok((adapter, device, queue))
+    Ok((instance, adapter, device, queue))
 }
 
 const fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
@@ -686,7 +702,7 @@ fn create_target(
     reason = "moved into the render thread"
 )]
 pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
-    create_device(&config).and_then(|(adapter, device, queue)| {
+    create_device(&config).and_then(|(instance, adapter, device, queue)| {
         let info = adapter.get_info();
         let supported = adapter.features();
         let timestamp_support = if supported.contains(wgpu::Features::TIMESTAMP_QUERY) {
@@ -785,7 +801,8 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             wgpu::TextureUsages::TEXTURE_BINDING,
             TARGET_FORMAT,
         );
-        let timestamps = device.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+        let timestamps =
+            config.timestamps && device.features().contains(wgpu::Features::TIMESTAMP_QUERY);
         let (query_set, query_buffer) = if timestamps {
             (
                 Some(device.create_query_set(&wgpu::QuerySetDescriptor {
@@ -811,6 +828,9 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
                 .collect()
         });
         let renderer = GpuRenderer {
+            instance,
+            adapter,
+            presenter: None,
             max_texture: device.limits().max_texture_dimension_2d,
             device,
             queue,
@@ -889,11 +909,11 @@ impl Renderer for GpuRenderer {
         id: SurfaceId,
         target: GpuTarget,
     ) -> Result<SurfaceInfo, SurfaceError> {
-        let GpuTarget::Offscreen(offscreen) = target;
-        let size = offscreen.size;
-        // The target is always Rgba16Float; both offscreen formats are
-        // accepted and readback decodes f16.
-        let _ = offscreen.format;
+        let size = match &target {
+            GpuTarget::Offscreen(offscreen) => offscreen.size,
+            GpuTarget::Window(window) => window.size,
+            GpuTarget::Texture(texture) => texture.size,
+        };
         if size.0 == 0 || size.1 == 0 {
             return Err(SurfaceError::ZeroSize);
         }
@@ -904,6 +924,23 @@ impl Renderer for GpuRenderer {
                 max: self.max_texture,
             });
         }
+        let (window, textures, refresh) = match target {
+            GpuTarget::Offscreen(offscreen) => (None, None, offscreen.refresh),
+            GpuTarget::Texture(texture) => (None, Some(texture.textures), texture.refresh),
+            GpuTarget::Window(window) => {
+                let surface = present::WindowSurface::new(
+                    &self.instance,
+                    &self.adapter,
+                    &self.device,
+                    window.handle,
+                    size,
+                    window.transparent,
+                )?;
+                self.presenter
+                    .get_or_insert_with(|| present::Presenter::new(&self.device));
+                (Some(surface), None, window.refresh)
+            }
+        };
         let (target, view) = create_target(
             &self.device,
             "surface target",
@@ -911,9 +948,16 @@ impl Renderer for GpuRenderer {
             TARGET_USAGES,
             TARGET_FORMAT,
         );
+        if let Some(sender) = &textures {
+            let _ = sender.send(target.clone());
+        }
         self.surfaces.insert(
             id,
             SurfaceState {
+                window,
+                textures,
+                refresh,
+                present_pending: false,
                 size,
                 scratch_format: self.scratch_format,
                 target,
@@ -947,6 +991,12 @@ impl Renderer for GpuRenderer {
             TARGET_USAGES,
             TARGET_FORMAT,
         );
+        if let Some(window) = &mut state.window {
+            window.resize(&self.device, size);
+        }
+        if let Some(sender) = &state.textures {
+            let _ = sender.send(target.clone());
+        }
         state.size = size;
         state.target = target;
         state.view = view;
@@ -1216,7 +1266,7 @@ impl Renderer for GpuRenderer {
         stats.timings = self.drain_timestamps();
         let dirty: Vec<_> = frame.surfaces.iter().filter(|sf| sf.changed).collect();
         if dirty.is_empty() {
-            return Ok(Redraw::None);
+            return self.present_windows(frame);
         }
         self.frame_pass_count = 0;
         self.frame_submission = None;
@@ -1267,6 +1317,8 @@ impl Renderer for GpuRenderer {
             let t = Instant::now();
             for sf in &dirty {
                 self.encode_surface(sf.id, stats);
+                let surface = self.surfaces.get_mut(&sf.id).expect("rendered surface");
+                surface.present_pending = surface.window.is_some();
             }
             stats.phases.encode_seconds = t.elapsed().as_secs_f64();
             stats.frame = Some(frame.id);
@@ -1277,7 +1329,7 @@ impl Renderer for GpuRenderer {
             }
         }
         result?;
-        Ok(Redraw::None)
+        self.present_windows(frame)
     }
 
     /// Waits for the GPU to finish every pending frame and returns their
@@ -1377,6 +1429,31 @@ impl Renderer for GpuRenderer {
 }
 
 impl GpuRenderer {
+    fn present_windows(&mut self, frame: &Frame<'_>) -> Result<Redraw, RenderError> {
+        let Some(presenter) = &mut self.presenter else {
+            return Ok(Redraw::None);
+        };
+        let mut redraw = None::<cherenkov::RefreshRange>;
+        for sf in frame.surfaces {
+            let surface = self.surfaces.get_mut(&sf.id).expect("registered surface");
+            if surface.present_pending {
+                let window = surface.window.as_ref().expect("pending window");
+                surface.present_pending =
+                    !presenter.present(&self.device, &self.queue, window, &surface.view)?;
+                if surface.present_pending {
+                    redraw = Some(redraw.map_or_else(
+                        || surface.refresh.clone(),
+                        |rate| {
+                            (*rate.start()).min(*surface.refresh.start())
+                                ..=(*rate.end()).max(*surface.refresh.end())
+                        },
+                    ));
+                }
+            }
+        }
+        Ok(redraw.map_or(Redraw::None, |rate| Redraw::Wanted { rate }))
+    }
+
     fn lower_all(
         &mut self,
         pending: &mut [SurfaceState],

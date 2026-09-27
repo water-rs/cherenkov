@@ -435,34 +435,39 @@ fn hash_elements_into(hasher: &mut impl Hasher, elements: &[PathEl]) {
         bytes[1..9].copy_from_slice(&p.x.to_bits().to_ne_bytes());
         bytes[9..17].copy_from_slice(&p.y.to_bits().to_ne_bytes());
     }
-    for el in elements {
-        let mut bytes = [0; 51];
-        let len = match el {
-            PathEl::MoveTo(p) => {
-                point(&mut bytes[..17], 0, *p);
-                17
-            }
-            PathEl::LineTo(p) => {
-                point(&mut bytes[..17], 1, *p);
-                17
-            }
-            PathEl::QuadTo(c, p) => {
-                point(&mut bytes[..17], 2, *c);
-                point(&mut bytes[17..34], 2, *p);
-                34
-            }
-            PathEl::CurveTo(c0, c1, p) => {
-                point(&mut bytes[..17], 3, *c0);
-                point(&mut bytes[17..34], 3, *c1);
-                point(&mut bytes[34..], 3, *p);
-                51
-            }
-            PathEl::ClosePath => {
-                bytes[0] = 4;
-                1
-            }
-        };
-        hasher.write(&bytes[..len]);
+    for chunk in elements.chunks(8) {
+        let mut bytes = [0; 8 * 51];
+        let mut used = 0;
+        for el in chunk {
+            let bytes = &mut bytes[used..used + 51];
+            let len = match el {
+                PathEl::MoveTo(p) => {
+                    point(&mut bytes[..17], 0, *p);
+                    17
+                }
+                PathEl::LineTo(p) => {
+                    point(&mut bytes[..17], 1, *p);
+                    17
+                }
+                PathEl::QuadTo(c, p) => {
+                    point(&mut bytes[..17], 2, *c);
+                    point(&mut bytes[17..34], 2, *p);
+                    34
+                }
+                PathEl::CurveTo(c0, c1, p) => {
+                    point(&mut bytes[..17], 3, *c0);
+                    point(&mut bytes[17..34], 3, *c1);
+                    point(&mut bytes[34..], 3, *p);
+                    51
+                }
+                PathEl::ClosePath => {
+                    bytes[0] = 4;
+                    1
+                }
+            };
+            used += len;
+        }
+        hasher.write(&bytes[..used]);
     }
 }
 

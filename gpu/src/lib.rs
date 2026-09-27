@@ -94,7 +94,8 @@ pub struct GpuConfig {
     pub power_preference: wgpu::PowerPreference,
     /// When true and the adapter supports it,
     /// [`Engine::render`](cherenkov::Engine::render) measures GPU time
-    /// with deferred timestamp queries.
+    /// with timestamp queries resolved after completion and reported on a
+    /// later render, never stalling the frame on GPU idle.
     pub timestamps: bool,
     /// Maximum duration of a GPU wait.
     pub wait_timeout: std::time::Duration,

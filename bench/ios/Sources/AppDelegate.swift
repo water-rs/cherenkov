@@ -18,7 +18,8 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         // A real window keeps the app in the foreground — iOS forbids
         // GPU work in the background, so the run must stay foregrounded.
         let window = UIWindow(frame: UIScreen.main.bounds)
-        window.rootViewController = UIViewController()
+        let status = StatusViewController()
+        window.rootViewController = status
         window.makeKeyAndVisible()
         self.window = window
 
@@ -28,15 +29,14 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         logger.info("launch: idle timer disabled, brightness -> 0")
 
         Thread.detachNewThread { [weak self] in
-            let code = BenchRunner().runAll()
-            DispatchQueue.main.sync {
+            let code = BenchRunner(delegate: status).runAll()
+            DispatchQueue.main.async {
                 application.isIdleTimerDisabled = false
                 if let brightness = self?.originalBrightness {
                     UIScreen.main.brightness = brightness
                 }
             }
-            logger.info("all runs done; exit \(code)")
-            exit(code)
+            logger.info("all runs done; exit code \(code)")
         }
         return true
     }

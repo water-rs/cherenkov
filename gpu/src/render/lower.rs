@@ -710,6 +710,11 @@ impl<'a> Lowering<'a> {
     }
 
     /// Starts a new draw range when the bound image texture changes.
+    #[expect(
+        clippy::inline_always,
+        reason = "keep ordinary image identity changes as cheap as the original Copy path"
+    )]
+    #[inline(always)]
     fn set_image(&mut self, image: Option<ImageSource>) {
         if self.frame.open.as_ref().is_some_and(|o| o.image != image) {
             self.end_segment();
@@ -1507,7 +1512,11 @@ impl<'a> Lowering<'a> {
         );
     }
 
-    #[inline]
+    #[expect(
+        clippy::inline_always,
+        reason = "let leaf emitters eliminate unused paint fields instead of copying the full payload"
+    )]
+    #[inline(always)]
     fn resolved_paint(&mut self, paint: &ResolvedPaint) -> PaintData {
         let offset = u32::try_from(self.frame.stops.len()).expect("stop count fits u32");
         let data = match paint {
@@ -1520,13 +1529,13 @@ impl<'a> Lowering<'a> {
             },
             ResolvedPaint::Resources(resources) => {
                 let (data, stops) = resources.as_ref();
-                let mut data = data.clone();
+                let mut data = *data;
                 data.first_stop += offset;
                 self.frame.stops.extend_from_slice(stops);
                 data
             }
         };
-        self.set_image(data.image.clone());
+        self.set_image(data.image.map(ImageSource::Registered));
         data
     }
 
@@ -1535,6 +1544,8 @@ impl<'a> Lowering<'a> {
         clippy::cast_sign_loss,
         reason = "bounded texture extents"
     )]
+    #[cold]
+    #[inline(never)]
     fn shader_paint(
         &mut self,
         paint: &cherenkov::ShaderPaint,
@@ -1596,10 +1607,9 @@ impl<'a> Lowering<'a> {
                 f32_f64(f64::from(size.1)),
             ],
             packed: super::instance::EXTEND_PAD | (super::instance::EXTEND_PAD << 4) | (1 << 8),
-            image: Some(ImageSource::Shader(key)),
             ..PaintData::default()
         };
-        self.set_image(data.image.clone());
+        self.set_image(Some(ImageSource::Shader(key)));
         Ok(data)
     }
 
@@ -1622,6 +1632,11 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    #[expect(
+        clippy::inline_always,
+        reason = "preserve dev inlining of common leaf realization as capabilities grow"
+    )]
+    #[inline(always)]
     fn realize(
         &mut self,
         op: &Op,
@@ -1890,6 +1905,19 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// Bounds-dependent shader preparation must not expand ordinary path replay.
+    #[cold]
+    #[inline(never)]
+    fn shader_outline(
+        &mut self,
+        make: impl FnOnce() -> BezPath,
+        paint: &cherenkov::ShaderPaint,
+    ) -> Result<(BezPath, PaintData), RenderError> {
+        let path = make();
+        let data = self.shader_paint(paint, kurbo::Shape::bounding_box(&path), self.transform)?;
+        Ok((path, data))
+    }
+
     /// A path or stroked outline: rasterize once per
     /// (content, matrix, subpixel, surface) and replay spans plus atlas
     /// cells. `content` hashes the draw's semantics; `make` builds the
@@ -1912,13 +1940,11 @@ impl<'a> Lowering<'a> {
         let surface = (self.width as u32, self.height as u32);
         let pl = path::placement(content, self.transform, surface);
         let mut make = Some(make);
-        let shader_path =
-            matches!(paint, ResolvedPaint::Shader(_)).then(|| make.take().expect("path factory")());
-        let shader_data = if let (ResolvedPaint::Shader(shader), Some(path)) = (paint, &shader_path)
-        {
-            Some(self.shader_paint(shader, kurbo::Shape::bounding_box(path), self.transform)?)
+        let (shader_path, shader_data) = if let ResolvedPaint::Shader(shader) = paint {
+            let (path, data) = self.shader_outline(make.take().expect("path factory"), shader)?;
+            (Some(path), Some(data))
         } else {
-            None
+            (None, None)
         };
         if let Some(emit) = glyphs
             .atlas
@@ -1982,7 +2008,7 @@ impl<'a> Lowering<'a> {
         shader_data: Option<&PaintData>,
     ) {
         let paint = shader_data
-            .cloned()
+            .copied()
             .unwrap_or_else(|| self.resolved_paint(paint));
         let mut template = self.base(KIND_SPAN, affine(self.transform));
         template.color = paint.color;
@@ -2145,6 +2171,8 @@ impl<'a> Lowering<'a> {
         self.run_clipped(clip, body, glyphs)
     }
 
+    #[cold]
+    #[inline(never)]
     fn shader_glyph_run(
         &mut self,
         run: &GlyphRun,

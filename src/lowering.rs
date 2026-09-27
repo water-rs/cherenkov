@@ -34,6 +34,21 @@ pub trait Compiler {
         ambient: Affine,
         ops: &mut Vec<Self::Op>,
     ) -> Result<(), Self::Error>;
+    /// Lower a command with its index in the root source list, when it belongs
+    /// to that list. Nested pictures and expanded glyphs have no root index.
+    ///
+    /// # Errors
+    /// Propagates the backend compiler's error.
+    fn draw_at(
+        &mut self,
+        command: &Command,
+        ambient: Affine,
+        ops: &mut Vec<Self::Op>,
+        _source: Option<usize>,
+    ) -> Result<(), Self::Error> {
+        self.draw(command, ambient, ops)
+    }
+
     /// Open a clip scope; its matching end is filled by the walker.
     ///
     /// # Errors
@@ -92,6 +107,7 @@ impl<T: Operation> Lowered<T> {
             compiler,
             &mut self.ops,
             &mut self.spans,
+            true,
         )
     }
 
@@ -122,6 +138,7 @@ impl<T: Operation> Lowered<T> {
                 compiler,
                 &mut ops,
                 &mut spans,
+                true,
             )?;
             let lo = self.spans[range.start].ops.start as usize;
             let hi = self.spans[range.end - 1].ops.end as usize;
@@ -170,7 +187,15 @@ pub fn append<C: Compiler>(
     ops: &mut Vec<C::Op>,
 ) -> Result<(), C::Error> {
     let mut spans = Vec::with_capacity(list.len());
-    walk(list, 0..list.len(), ambient, compiler, ops, &mut spans)
+    walk(
+        list,
+        0..list.len(),
+        ambient,
+        compiler,
+        ops,
+        &mut spans,
+        false,
+    )
 }
 
 fn walk<C: Compiler>(
@@ -180,6 +205,7 @@ fn walk<C: Compiler>(
     compiler: &mut C,
     ops: &mut Vec<C::Op>,
     spans: &mut Vec<Span>,
+    root: bool,
 ) -> Result<(), C::Error> {
     let mut i = range.start;
     while i < range.end {
@@ -200,7 +226,7 @@ fn walk<C: Compiler>(
             }
             Command::End => unreachable!("validated scopes consume their end"),
             command => {
-                compiler.draw(command, ambient, ops)?;
+                compiler.draw_at(command, ambient, ops, root.then_some(i))?;
                 None
             }
         };
@@ -211,7 +237,7 @@ fn walk<C: Compiler>(
                 ops: start..u32::try_from(ops.len()).expect("op index fits u32"),
                 ambient,
             });
-            walk(list, i + 1..end, inner, compiler, ops, spans)?;
+            walk(list, i + 1..end, inner, compiler, ops, spans, root)?;
             let close = u32::try_from(ops.len()).expect("op index fits u32");
             if emitted {
                 *ops[start as usize]
@@ -283,6 +309,10 @@ impl<O: Operation, E> Content<O, E> {
         self.list = list;
         self.dirty = Dirty::default();
         self.emissions.clear();
+        if let Some(lowered) = &mut self.lowered {
+            lowered.ops.clear();
+            lowered.spans.clear();
+        }
         self.rebuild = true;
     }
 
@@ -366,6 +396,15 @@ impl<O: Operation, E> Content<O, E> {
     /// # Panics
     /// When composition runs before preparation.
     pub fn prepared(&mut self) -> (&[O], &mut [Realization<E>]) {
+        let (ops, emissions, _) = self.prepared_source();
+        (ops, emissions)
+    }
+
+    /// Prepared operations, their device output, and the source they may index.
+    ///
+    /// # Panics
+    /// When composition runs before preparation.
+    pub fn prepared_source(&mut self) -> (&[O], &mut [Realization<E>], &DisplayList) {
         (
             &self
                 .lowered
@@ -373,6 +412,7 @@ impl<O: Operation, E> Content<O, E> {
                 .expect("content prepared before composition")
                 .ops,
             &mut self.emissions,
+            self.list.display_list(),
         )
     }
 

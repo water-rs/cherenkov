@@ -382,6 +382,13 @@ pub enum ClipShape {
 
 /// The outline a `Path` op rasterizes on a cache miss.
 pub enum Outline {
+    /// Geometry borrowed from this content's retained source list.
+    Source {
+        /// Root command index.
+        command: usize,
+        /// A fill's hash; strokes include tolerance at realization.
+        content: Option<u64>,
+    },
     /// A fill's local geometry and its exact content identity.
     Fill {
         /// The path elements.
@@ -397,6 +404,35 @@ pub enum Outline {
         /// The stroke style.
         stroke: kurbo::Stroke,
     },
+}
+
+/// A prepared glyph run either indexes retained source or owns expanded glyphs.
+pub enum GlyphSource {
+    /// A partial run produced by nested pictures or COLR expansion.
+    Run(GlyphRun),
+    /// An unchanged root run; count preserves structural patch validation.
+    Command { index: usize, count: usize },
+}
+
+impl GlyphSource {
+    const fn len(&self) -> usize {
+        match self {
+            Self::Run(run) => run.glyphs.len(),
+            Self::Command { count, .. } => *count,
+        }
+    }
+
+    pub fn get<'a>(&'a self, source: &'a cherenkov::DisplayList) -> &'a GlyphRun {
+        match self {
+            Self::Run(run) => run,
+            Self::Command { index, .. } => {
+                let Command::Glyphs { run, .. } = &source.commands()[*index] else {
+                    unreachable!("prepared glyph command keeps its source kind");
+                };
+                run
+            }
+        }
+    }
 }
 
 /// A stage-1 draw or scope op: device-independent.
@@ -460,7 +496,7 @@ pub enum Op {
         /// The ambient transform.
         local: Affine,
         /// The run, minus its COLR glyphs.
-        run: GlyphRun,
+        run: GlyphSource,
         /// The resolved paint (identity local space).
         paint: ResolvedPaint,
     },
@@ -510,7 +546,7 @@ impl cherenkov::lowering::Operation for Op {
             _ => {}
         }
         std::mem::discriminant(self) == std::mem::discriminant(other)
-            && !matches!((self, other), (Self::Glyphs { run: a, .. }, Self::Glyphs { run: b, .. }) if a.glyphs.len() != b.glyphs.len())
+            && !matches!((self, other), (Self::Glyphs { run: a, .. }, Self::Glyphs { run: b, .. }) if a.len() != b.len())
     }
 }
 
@@ -533,15 +569,25 @@ impl cherenkov::lowering::Compiler for Lowerer<'_> {
         ambient: Affine,
         ops: &mut Vec<Op>,
     ) -> Result<(), RenderError> {
+        self.draw_at(command, ambient, ops, None)
+    }
+
+    fn draw_at(
+        &mut self,
+        command: &Command,
+        ambient: Affine,
+        ops: &mut Vec<Op>,
+        source: Option<usize>,
+    ) -> Result<(), RenderError> {
         match command {
-            Command::Fill { shape, paint } => self.fill(ambient, shape, paint, ops),
+            Command::Fill { shape, paint } => self.fill(ambient, shape, paint, ops, source),
             Command::Stroke {
                 shape,
                 stroke,
                 paint,
-            } => self.stroke(ambient, shape, stroke, paint, ops),
+            } => self.stroke(ambient, shape, stroke, paint, ops, source),
             Command::Shadow { shape, shadow } => Self::shadow(ambient, shape, shadow, ops),
-            Command::Glyphs { run, paint } => self.glyph_run(ambient, run, paint, ops),
+            Command::Glyphs { run, paint } => self.glyph_run(ambient, run, paint, ops, source),
             Command::Image {
                 image,
                 dst,
@@ -586,15 +632,22 @@ impl Lowerer<'_> {
         shape: &ShapeData,
         paint: &Paint,
         ops: &mut Vec<Op>,
+        source: Option<usize>,
     ) -> Result<(), RenderError> {
         if let ShapeData::Path { elements, rule } = shape {
             ops.push(Op::Path {
                 local: ambient,
                 rule: *rule,
-                outline: Outline::Fill {
-                    elements: Arc::from(elements.as_slice()),
-                    content: path::hash_elements(elements, fill_tag(*rule)),
-                },
+                outline: source.map_or_else(
+                    || Outline::Fill {
+                        elements: Arc::from(elements.as_slice()),
+                        content: path::hash_elements(elements, fill_tag(*rule)),
+                    },
+                    |command| Outline::Source {
+                        command,
+                        content: Some(path::hash_elements(elements, fill_tag(*rule))),
+                    },
+                ),
                 paint: resolve(paint, Affine::IDENTITY, self.images)?,
             });
             return Ok(());
@@ -645,7 +698,7 @@ impl Lowerer<'_> {
             extend_y: Extend::Pad,
             sampling,
         });
-        self.fill(ambient, &ShapeData::Rect(*dst), &paint, ops)
+        self.fill(ambient, &ShapeData::Rect(*dst), &paint, ops, None)
     }
 
     /// `Stroke`: offset strokes for circular-corner boxes, distance
@@ -658,6 +711,7 @@ impl Lowerer<'_> {
         stroke: &kurbo::Stroke,
         paint: &Paint,
         ops: &mut Vec<Op>,
+        source: Option<usize>,
     ) -> Result<(), RenderError> {
         if matches!(shape, ShapeData::Path { .. }) || !stroke.dash_pattern.is_empty() {
             if matches!(shape, ShapeData::Continuous(_)) {
@@ -666,10 +720,16 @@ impl Lowerer<'_> {
             ops.push(Op::Path {
                 local: ambient,
                 rule: FillRule::NonZero,
-                outline: Outline::Stroke {
-                    shape: shape.clone(),
-                    stroke: stroke.clone(),
-                },
+                outline: source.map_or_else(
+                    || Outline::Stroke {
+                        shape: shape.clone(),
+                        stroke: stroke.clone(),
+                    },
+                    |command| Outline::Source {
+                        command,
+                        content: None,
+                    },
+                ),
                 paint: resolve(paint, Affine::IDENTITY, self.images)?,
             });
             return Ok(());
@@ -847,6 +907,7 @@ impl Lowerer<'_> {
         run: &GlyphRun,
         paint: &Paint,
         ops: &mut Vec<Op>,
+        source: Option<usize>,
     ) -> Result<(), RenderError> {
         if matches!(run.style, GlyphStyle::Stroke(_)) {
             return Err(RenderError::Unsupported(names::GLYPH_STROKE));
@@ -856,6 +917,37 @@ impl Lowerer<'_> {
             .get(&run.font.raw())
             .ok_or_else(|| RenderError::Font(format!("unregistered font {:?}", run.font)))?;
         let resolved = resolve(paint, Affine::IDENTITY, self.images)?;
+        if !font.has_colr {
+            if run.glyphs.iter().any(|glyph| glyph.transform.is_some()) {
+                return Err(RenderError::Unsupported(names::GLYPH_TRANSFORM));
+            }
+            if !run.glyphs.is_empty() {
+                ops.push(Op::Glyphs {
+                    local: ambient,
+                    run: source.map_or_else(
+                        || GlyphSource::Run(run.clone()),
+                        |index| GlyphSource::Command {
+                            index,
+                            count: run.glyphs.len(),
+                        },
+                    ),
+                    paint: resolved,
+                });
+            }
+            return Ok(());
+        }
+        self.color_glyph_run(ambient, run, paint, ops, font, resolved)
+    }
+
+    fn color_glyph_run(
+        &mut self,
+        ambient: Affine,
+        run: &GlyphRun,
+        paint: &Paint,
+        ops: &mut Vec<Op>,
+        font: &FontData,
+        resolved: ResolvedPaint,
+    ) -> Result<(), RenderError> {
         let mut pending: Vec<cherenkov::Glyph> = Vec::new();
         let mut colr_ctx: Option<(skrifa::FontRef<'_>, f64)> = None;
         let mut colr_checked = false;
@@ -887,13 +979,13 @@ impl Lowerer<'_> {
                 if !pending.is_empty() {
                     ops.push(Op::Glyphs {
                         local: ambient,
-                        run: GlyphRun {
+                        run: GlyphSource::Run(GlyphRun {
                             font: run.font,
                             size: run.size,
                             coords: run.coords.clone(),
                             glyphs: std::mem::take(&mut pending),
                             style: run.style.clone(),
-                        },
+                        }),
                         paint: resolved.clone(),
                     });
                 }
@@ -929,13 +1021,13 @@ impl Lowerer<'_> {
         if !pending.is_empty() {
             ops.push(Op::Glyphs {
                 local: ambient,
-                run: GlyphRun {
+                run: GlyphSource::Run(GlyphRun {
                     font: run.font,
                     size: run.size,
                     coords: run.coords.clone(),
                     glyphs: pending,
                     style: run.style.clone(),
-                },
+                }),
                 paint: resolved,
             });
         }

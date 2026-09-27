@@ -657,7 +657,12 @@ fn glyph_run(
                 transform: None,
             })
             .collect(),
-        style: cherenkov::GlyphStyle::Fill,
+        style: run
+            .stroke
+            .as_ref()
+            .map_or(cherenkov::GlyphStyle::Fill, |stroke| {
+                cherenkov::GlyphStyle::Stroke(stroke.into())
+            }),
     })
 }
 

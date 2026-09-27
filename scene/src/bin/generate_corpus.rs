@@ -173,6 +173,7 @@ impl TextContext {
                     })
                     .collect();
                 runs.push(GlyphRun {
+                    stroke: None,
                     font: ResourceHash::of(data),
                     font_index: font_data.index,
                     size,

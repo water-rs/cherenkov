@@ -30,6 +30,7 @@ pub mod color;
 pub mod coverage;
 pub mod glyphs;
 pub mod image;
+mod mesh;
 pub mod metrics;
 pub mod paint;
 pub mod path;

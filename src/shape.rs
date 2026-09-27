@@ -213,6 +213,27 @@ impl ShapeData {
     }
 }
 
+impl Shape for ShapeData {
+    fn semantic(&self) -> Semantic<'_> {
+        match self {
+            Self::Rect(rect) => Semantic::Rect(*rect),
+            Self::RoundedRect(rounded) => Semantic::RoundedRect(*rounded),
+            Self::Continuous(continuous) => Semantic::Continuous(*continuous),
+            Self::Circle(circle) => Semantic::Circle(*circle),
+            Self::Ellipse(ellipse) => Semantic::Ellipse(*ellipse),
+            Self::Line(line) => Semantic::Line(*line),
+            Self::Path { elements, rule } => Semantic::Path(PathRef {
+                elements: Cow::Borrowed(elements),
+                rule: *rule,
+            }),
+        }
+    }
+
+    fn into_data(self) -> ShapeData {
+        self
+    }
+}
+
 impl From<Semantic<'_>> for ShapeData {
     fn from(semantic: Semantic<'_>) -> Self {
         match semantic {
@@ -231,6 +252,7 @@ impl From<Semantic<'_>> for ShapeData {
 }
 
 nami_core::impl_constant!(ContinuousRect);
+nami_core::impl_constant!(ShapeData);
 
 impl<S: Clone + 'static> Signal for EvenOdd<S> {
     type Output = Self;

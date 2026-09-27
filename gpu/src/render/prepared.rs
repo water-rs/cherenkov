@@ -180,7 +180,7 @@ const fn fill_tag(rule: FillRule) -> u64 {
 }
 
 /// The paint data shared by every instance kind.
-#[derive(Clone, Default)]
+#[derive(Clone, Copy, Default)]
 pub struct PaintData {
     /// `PAINT_*`.
     pub kind: u32,
@@ -195,8 +195,9 @@ pub struct PaintData {
     /// `count | interp << 16 | extend << 20`; for `PAINT_IMAGE`,
     /// `extend_x | extend_y << 4 | sampling << 8`.
     pub packed: u32,
-    /// The bound image for `PAINT_IMAGE`.
-    pub image: Option<super::lower::ImageSource>,
+    /// A registered image ID. Shader identities belong to the emitted range,
+    /// keeping ordinary paint fields trivially copyable.
+    pub image: Option<u64>,
 }
 
 /// Resolved solid paint stays inline. Gradient and image fields are only
@@ -336,7 +337,7 @@ fn paint_data(
             data.packed = extend_code(pattern.extend_x)
                 | (extend_code(pattern.extend_y) << 4)
                 | (sampling << 8);
-            data.image = Some(super::lower::ImageSource::Registered(pattern.image.raw()));
+            data.image = Some(pattern.image.raw());
         }
         Paint::Shader(_) => return Err(RenderError::Unsupported(names::SHADER)),
     }
@@ -346,6 +347,7 @@ fn paint_data(
 /// Resolves `paint` device-independently; `to_local` is the
 /// instance-local transform the shader paints in (the boxed `extra`
 /// inverse, or identity for device-space replay).
+#[inline]
 fn resolve(
     paint: &Paint,
     to_local: Affine,
@@ -354,6 +356,16 @@ fn resolve(
     if let Paint::Solid(color) = paint {
         return Ok(ResolvedPaint::Solid(color.components));
     }
+    resolve_resources(paint, to_local, images)
+}
+
+/// Keep allocation and shader ownership out of solid paint preparation.
+#[inline(never)]
+fn resolve_resources(
+    paint: &Paint,
+    to_local: Affine,
+    images: &HashMap<u64, GpuImage>,
+) -> Result<ResolvedPaint, RenderError> {
     if let Paint::Shader(shader) = paint {
         return Ok(ResolvedPaint::Shader(Box::new(shader.clone())));
     }

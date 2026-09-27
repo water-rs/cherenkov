@@ -7,7 +7,8 @@ use cherenkov::{BlendSpace, Command, DisplayList, GlyphStyle, Paint};
 use vello::peniko::{self, Brush, ColorStops, Fill, ImageBrush, ImageSampler};
 use vello::{Glyph, Scene};
 
-use crate::error::{RenderError, Unsupported};
+use crate::names;
+use cherenkov::RenderError;
 
 use super::convert;
 use super::shader::{self, ShaderRegistry, ShaderUse};
@@ -74,7 +75,7 @@ pub fn lower(
             }
             Command::Shadow { shape, shadow } => {
                 let Some((rect, radius)) = convert::expressible_shadow(shape) else {
-                    return Err(Unsupported::Shadow.into());
+                    return Err(RenderError::Unsupported(names::SHADOW));
                 };
                 let spread = shadow.spread;
                 let rect = rect.inflate(spread, spread);
@@ -90,11 +91,11 @@ pub fn lower(
             }
             Command::Glyphs { run, paint } => {
                 let (brush, brush_transform) = match paint {
-                    Paint::Shader(_) => return Err(Unsupported::ShaderGlyphs.into()),
+                    Paint::Shader(_) => return Err(RenderError::Unsupported(names::SHADER_GLYPHS)),
                     _ => brush_of(paint, resources)?,
                 };
                 if run.glyphs.iter().any(|g| g.transform.is_some()) {
-                    return Err(Unsupported::GlyphTransform.into());
+                    return Err(RenderError::Unsupported(names::GLYPH_TRANSFORM));
                 }
                 let Some(font) = resources.fonts.get(&run.font.raw()) else {
                     return Err(RenderError::Font(format!(
@@ -161,7 +162,7 @@ pub fn lower(
             }
             Command::BeginGroup { group, .. } => {
                 if group.filter.is_some() {
-                    return Err(Unsupported::GroupFilter.into());
+                    return Err(RenderError::Unsupported(names::GROUP_FILTER));
                 }
                 // Vello blends in the encoded 8-bit target for every
                 // fill, so a linear-blend-space group is expressible only
@@ -172,7 +173,7 @@ pub fn lower(
                 if group.blend_space == BlendSpace::Linear
                     && (group.blend != cherenkov::BlendMode::Normal || group.opacity < 1.0)
                 {
-                    return Err(Unsupported::BlendSpace.into());
+                    return Err(RenderError::Unsupported(names::BLEND_SPACE));
                 }
                 let (w, h) = resources.target_size;
                 scene.push_layer(
@@ -255,7 +256,7 @@ fn brush_of(
             }),
             None,
         ),
-        Paint::Mesh(_) => return Err(Unsupported::MeshGradient.into()),
+        Paint::Mesh(_) => return Err(RenderError::Unsupported(names::MESH_GRADIENT)),
         Paint::Image(pattern) => {
             let Some(data) = resources.images.get(&pattern.image.raw()) else {
                 return Err(RenderError::Image(format!(
@@ -300,7 +301,7 @@ fn shader_brush(
         return Err(RenderError::Shader(format!("unregistered shader {id}")));
     }
     if paint.uniforms.len() > shader::MAX_SHADER_PARAMS {
-        return Err(Unsupported::ShaderParams.into());
+        return Err(RenderError::Unsupported(names::SHADER_PARAMS));
     }
     let bbox = (xf * path.clone()).bounding_box();
     let w = (bbox.width().ceil() as u32).clamp(1, resources.max_texture);

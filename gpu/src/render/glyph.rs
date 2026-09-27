@@ -11,8 +11,8 @@ use skrifa::outline::{DrawSettings, OutlinePen};
 use skrifa::raw::TableProvider;
 use skrifa::raw::types::F2Dot14;
 
-use crate::error::RenderError;
 use crate::render::raster::Raster;
+use cherenkov::RenderError;
 
 /// Initial atlas edge length.
 const ATLAS_START: u32 = 1024;
@@ -25,6 +25,8 @@ const PAD: u32 = 1;
 pub struct FontData {
     pub data: Arc<[u8]>,
     pub index: u32,
+    /// Validated once at registration; plain runs do not reparse font tables.
+    pub has_colr: bool,
     /// Built font-space `COLRv1` pictures, per `(glyph id, coords hash,
     /// paint hash)` — content is size-independent, so it is keyed without
     /// the placement. Interior mutability, not shared: parallel lowering
@@ -39,13 +41,14 @@ impl FontData {
         Self {
             data: self.data.clone(),
             index: self.index,
+            has_colr: self.has_colr,
             colr: std::cell::RefCell::new(self.colr.borrow().clone()),
         }
     }
 }
 
 /// A glyph cache key.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GlyphKey {
     /// The engine font id.
     font: u64,
@@ -59,6 +62,42 @@ pub struct GlyphKey {
     matrix: [u32; 4],
     /// Hash of the run's variation coordinates.
     coords_hash: u64,
+}
+
+// Match the derived field hash byte-for-byte, but submit one contiguous write
+// to the atlas hasher. The array's length prefix is part of that original hash.
+impl Hash for GlyphKey {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let matrix = 17 + size_of::<usize>();
+        let coords = matrix + 16;
+        let mut bytes = [0; 41 + size_of::<usize>()];
+        bytes[..8].copy_from_slice(&self.font.to_ne_bytes());
+        bytes[8..12].copy_from_slice(&self.glyph.to_ne_bytes());
+        bytes[12..16].copy_from_slice(&self.size_bits.to_ne_bytes());
+        bytes[16] = self.subpixel;
+        bytes[17..matrix].copy_from_slice(&4usize.to_ne_bytes());
+        for (dst, value) in bytes[matrix..coords]
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(self.matrix)
+        {
+            *dst = value.to_ne_bytes();
+        }
+        bytes[coords..].copy_from_slice(&self.coords_hash.to_ne_bytes());
+        state.write(&bytes);
+    }
+}
+
+impl GlyphKey {
+    /// Change just the glyph and quantized position; run identity stays exact.
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    pub fn at(mut self, glyph: u32, subpixel: (f32, f32)) -> Self {
+        self.glyph = glyph;
+        self.subpixel = ((subpixel.0 * 4.0) as u8) | (((subpixel.1 * 4.0) as u8) << 4);
+        self
+    }
 }
 
 /// An atlas cell.
@@ -187,11 +226,11 @@ pub struct Atlas {
     /// rebuilt.
     generation: u64,
     shelves: Vec<Shelf>,
-    map: HashMap<GlyphKey, Entry>,
+    map: rustc_hash::FxHashMap<GlyphKey, Entry>,
     /// Rasterized path emissions, keyed by content hash.
-    paths: HashMap<u64, PathEmit>,
+    paths: rustc_hash::FxHashMap<u64, PathEmit>,
     /// Rasterized path-clip masks, keyed by content hash.
-    masks: HashMap<u64, MaskCell>,
+    masks: rustc_hash::FxHashMap<u64, MaskCell>,
     /// Sum of cell texels, an approximation of the CPU cache size.
     cpu_bytes: u64,
 }
@@ -217,9 +256,9 @@ impl Atlas {
             cap,
             generation: 0,
             shelves: Vec::new(),
-            map: HashMap::new(),
-            paths: HashMap::new(),
-            masks: HashMap::new(),
+            map: rustc_hash::FxHashMap::default(),
+            paths: rustc_hash::FxHashMap::default(),
+            masks: rustc_hash::FxHashMap::default(),
             cpu_bytes: 0,
         }
     }
@@ -277,6 +316,10 @@ impl Atlas {
 
     /// Clears every entry without freeing the texture.
     pub fn clear(&mut self) {
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .expect("atlas generation overflow");
         self.map.clear();
         self.paths.clear();
         self.masks.clear();
@@ -476,7 +519,6 @@ impl Atlas {
         self.texture = texture;
         self.view = view;
         self.size = size;
-        self.generation += 1;
         self.clear();
     }
 
@@ -826,6 +868,45 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    #[test]
+    fn a_run_key_keeps_exact_identity_at_each_glyph_position() {
+        let mut run = cherenkov::GlyphRun {
+            font: cherenkov::FontId::new(91),
+            size: 19.25,
+            coords: vec![],
+            glyphs: vec![],
+            style: cherenkov::GlyphStyle::Fill,
+        };
+        for coords in [vec![], vec![0], vec![i16::MIN, 123, i16::MAX]] {
+            run.coords = coords;
+            for transform in [
+                Affine::IDENTITY,
+                Affine::new([1.5, -0.0, 0.25, 2.0, 7.0, -8.0]),
+            ] {
+                let base = glyph_key(&run, 0, (0.0, 0.0), transform);
+                for glyph in [0, 1, 65_535, u32::MAX] {
+                    for position in [(0.0, 0.0), (0.25, 0.5), (0.75, 0.25)] {
+                        assert_eq!(
+                            base.at(glyph, position),
+                            glyph_key(&run, glyph, position, transform)
+                        );
+                        let key = base.at(glyph, position);
+                        let mut actual = DefaultHasher::new();
+                        key.hash(&mut actual);
+                        let mut expected = DefaultHasher::new();
+                        key.font.hash(&mut expected);
+                        key.glyph.hash(&mut expected);
+                        key.size_bits.hash(&mut expected);
+                        key.subpixel.hash(&mut expected);
+                        key.matrix.hash(&mut expected);
+                        key.coords_hash.hash(&mut expected);
+                        assert_eq!(actual.finish(), expected.finish());
+                    }
+                }
+            }
+        }
+    }
+
     /// An adapter plus device, or `None` where no GPU exists.
     fn device_and_queue() -> Option<(wgpu::Device, wgpu::Queue)> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -896,6 +977,7 @@ mod tests {
                 .as_slice()
                 .into(),
             index: 0,
+            has_colr: false,
             colr: std::cell::RefCell::new(HashMap::new()),
         };
         let key = |glyph: u32| GlyphKey {

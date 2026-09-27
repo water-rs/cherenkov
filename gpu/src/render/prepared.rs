@@ -190,7 +190,7 @@ pub struct PaintData {
     pub grad: [f32; 4],
     /// Gradient/image coefficients (see `Instance::grad2`).
     pub grad2: [f32; 4],
-    /// First stop, relative to [`ResolvedPaint::stops`].
+    /// First stop, relative to the resolved paint's stop buffer.
     pub first_stop: u32,
     /// `count | interp << 16 | extend << 20`; for `PAINT_IMAGE`,
     /// `extend_x | extend_y << 4 | sampling << 8`.
@@ -199,14 +199,14 @@ pub struct PaintData {
     pub image: Option<u64>,
 }
 
-/// A paint resolved at lowering: device-independent shader data plus its
-/// gradient stops.
-#[derive(Clone, Default)]
-pub struct ResolvedPaint {
-    /// The instance paint fields.
-    pub data: PaintData,
-    /// The gradient stops this paint pushes (`data.first_stop` indexes it).
-    pub stops: Vec<Stop>,
+/// Resolved solid paint stays inline. Gradient and image fields are only
+/// allocated for paints that use them, keeping every prepared op compact.
+#[derive(Clone)]
+pub enum ResolvedPaint {
+    /// Working-space solid color.
+    Solid([f32; 4]),
+    /// Gradient/image shader fields and their stop buffer.
+    Resources(Box<(PaintData, Vec<Stop>)>),
 }
 
 /// sRGB-encodes one channel, preserving sign.
@@ -349,9 +349,12 @@ fn resolve(
     to_local: Affine,
     images: &HashMap<u64, GpuImage>,
 ) -> Result<ResolvedPaint, RenderError> {
+    if let Paint::Solid(color) = paint {
+        return Ok(ResolvedPaint::Solid(color.components));
+    }
     let mut stops = Vec::new();
     let data = paint_data(paint, to_local, &mut stops, images)?;
-    Ok(ResolvedPaint { data, stops })
+    Ok(ResolvedPaint::Resources(Box::new((data, stops))))
 }
 
 /// A clip shape, resolved at lowering.

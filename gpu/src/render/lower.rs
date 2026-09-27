@@ -331,7 +331,7 @@ impl ContentData {
 /// A layer's device data. Leaf ranges remain independent for dirty updates.
 #[derive(Default)]
 pub struct EmissionStorage {
-    templates: Vec<Instance>,
+    templates: Vec<InstanceTemplate>,
     pub(crate) instances: Vec<RetainedInstance>,
     stops: Vec<Stop>,
 }
@@ -377,6 +377,53 @@ impl EmissionStorage {
     }
 }
 
+/// The non-varying fields of an unclipped leaf. Clip fields, affine padding,
+/// mask coordinates and per-quad fields are reconstructed when composed.
+#[derive(Clone, Copy)]
+struct InstanceTemplate {
+    affine: [f32; 6],
+    shape: Shape,
+    inner: Shape,
+    color: [f32; 4],
+    grad: [f32; 4],
+    grad2: [f32; 4],
+    params: [f32; 2],
+    paint: u32,
+    packed: u32,
+}
+
+impl InstanceTemplate {
+    fn new(inst: &Instance) -> Self {
+        Self {
+            affine: inst.affine[..6]
+                .try_into()
+                .expect("six affine coefficients"),
+            shape: inst.shape,
+            inner: inst.inner,
+            color: inst.color,
+            grad: inst.grad,
+            grad2: inst.grad2,
+            params: [inst.params[0], inst.params[1]],
+            paint: inst.meta[1],
+            packed: inst.meta[3],
+        }
+    }
+
+    fn restore(&self) -> Instance {
+        let mut inst = Instance::new(0);
+        inst.affine[..6].copy_from_slice(&self.affine);
+        inst.shape = self.shape;
+        inst.inner = self.inner;
+        inst.color = self.color;
+        inst.grad = self.grad;
+        inst.grad2 = self.grad2;
+        inst.params[..2].copy_from_slice(&self.params);
+        inst.meta[1] = self.paint;
+        inst.meta[3] = self.packed;
+        inst
+    }
+}
+
 /// Fields that vary within one realized leaf. Shape, placement and paint are
 /// shared by all its quads, including a box's interior/border split.
 #[derive(Clone, Copy)]
@@ -388,8 +435,8 @@ pub struct RetainedInstance {
 }
 
 impl RetainedInstance {
-    fn restore(self, template: &Instance, stop_base: u32) -> Instance {
-        let mut inst = *template;
+    fn restore(self, template: &InstanceTemplate, stop_base: u32) -> Instance {
+        let mut inst = template.restore();
         inst.bounds = self.bounds;
         inst.uv[..2].copy_from_slice(&self.uv);
         inst.meta[0] = self.kind;
@@ -1196,13 +1243,12 @@ impl<'a> Lowering<'a> {
         let retained_instance = storage.instances.len();
         let retained_stop = storage.stops.len();
         let template = storage.templates.len();
-        if first_instance < self.frame.instances.len() {
-            storage
-                .templates
-                .extend_from_slice(&self.frame.instances[first_instance..=first_instance]);
-        } else {
-            storage.templates.push(Instance::new(0));
-        }
+        storage.templates.push(InstanceTemplate::new(
+            self.frame
+                .instances
+                .get(first_instance)
+                .unwrap_or(&Instance::new(0)),
+        ));
         storage
             .instances
             .extend(self.frame.instances[first_instance..].iter().map(|inst| {
@@ -1274,10 +1320,24 @@ impl<'a> Lowering<'a> {
         );
     }
 
+    #[inline]
     fn resolved_paint(&mut self, paint: &ResolvedPaint) -> PaintData {
-        let mut data = paint.data.clone();
-        data.first_stop += u32::try_from(self.frame.stops.len()).expect("stop count fits u32");
-        self.frame.stops.extend_from_slice(&paint.stops);
+        let offset = u32::try_from(self.frame.stops.len()).expect("stop count fits u32");
+        let data = match paint {
+            ResolvedPaint::Solid(color) => PaintData {
+                kind: PAINT_SOLID,
+                color: *color,
+                first_stop: offset,
+                ..PaintData::default()
+            },
+            ResolvedPaint::Resources(resources) => {
+                let (data, stops) = resources.as_ref();
+                let mut data = data.clone();
+                data.first_stop += offset;
+                self.frame.stops.extend_from_slice(stops);
+                data
+            }
+        };
         self.set_image(data.image);
         data
     }
@@ -1431,7 +1491,7 @@ impl<'a> Lowering<'a> {
         else {
             return None;
         };
-        if paint.data.kind != PAINT_SOLID || paint.data.color[3] != 1.0 {
+        if !matches!(paint, ResolvedPaint::Solid(color) if color[3] == 1.0) {
             return None;
         }
         let relative = local.inverse() * *fill;
@@ -1678,8 +1738,8 @@ impl<'a> Lowering<'a> {
         }
         self.set_variant(variant_of(template));
         let first = self.frame.instances.len();
-        self.frame.instances.extend(quads.map(|(rect, uv)| {
-            let mut inst = *template;
+        self.frame.instances.resize(first + quads.len(), *template);
+        for (inst, (rect, uv)) in self.frame.instances[first..].iter_mut().zip(quads) {
             inst.bounds = [
                 f32_f64(f64::from(rect[0]) + offset.x),
                 f32_f64(f64::from(rect[1]) + offset.y),
@@ -1687,8 +1747,7 @@ impl<'a> Lowering<'a> {
                 f32_f64(f64::from(rect[3]) + offset.y),
             ];
             inst.uv[..2].copy_from_slice(&uv);
-            inst
-        }));
+        }
         if let Some(ClipMask::Pending(_, pending)) = self.clip.and_then(|c| c.mask) {
             self.mask_patches.extend(
                 (first..self.frame.instances.len())

@@ -519,8 +519,13 @@ pub fn placement(content_hash: u64, transform: Affine, surface: (u32, u32)) -> P
     let qy = ((f - iy) * 4.0).floor() / 4.0;
     let mut bytes = [0; 33];
     bytes[..8].copy_from_slice(&content_hash.to_ne_bytes());
-    for (dst, value) in bytes[8..24].chunks_exact_mut(4).zip([a, b, c, d]) {
-        dst.copy_from_slice(&(value as f32).to_bits().to_ne_bytes());
+    for (dst, value) in bytes[8..24]
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip([a, b, c, d])
+    {
+        *dst = (value as f32).to_bits().to_ne_bytes();
     }
     bytes[24] = (qx * 4.0) as u8 | (((qy * 4.0) as u8) << 4);
     bytes[25..29].copy_from_slice(&surface.0.to_ne_bytes());

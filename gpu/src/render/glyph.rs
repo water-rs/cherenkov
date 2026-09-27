@@ -80,8 +80,13 @@ impl Hash for GlyphKey {
         bytes[12..16].copy_from_slice(&self.size_bits.to_ne_bytes());
         bytes[16] = self.subpixel;
         bytes[17..matrix].copy_from_slice(&4usize.to_ne_bytes());
-        for (dst, value) in bytes[matrix..coords].chunks_exact_mut(4).zip(self.matrix) {
-            dst.copy_from_slice(&value.to_ne_bytes());
+        for (dst, value) in bytes[matrix..coords]
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(self.matrix)
+        {
+            *dst = value.to_ne_bytes();
         }
         bytes[coords..].copy_from_slice(&self.coords_hash.to_ne_bytes());
         state.write(&bytes);

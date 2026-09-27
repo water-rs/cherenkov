@@ -691,6 +691,7 @@ impl<B: Backend> Surface<B> {
                     EditOp::Content(LayerContent::Content(content)) => {
                         // A fresh `Content` replaces the previous one whole
                         // (its first `take_change` is a `Replace`).
+                        content.attach_waker(&shared.waker);
                         shared.contents.insert(id, content);
                         let stored = shared.contents.get_mut(&id).expect("just inserted");
                         if let Some(change) = stored.take_change() {

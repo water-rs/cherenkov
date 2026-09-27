@@ -839,6 +839,52 @@ mod tests {
             "no RemoveLayer in {events:?}"
         );
     }
+
+    #[test]
+    fn live_recorded_operands_wake_the_idle_owner_and_disconnect_on_drop() {
+        use crate::{Draw, WorkingColor};
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let (engine, _events) = engine();
+        let surface = engine
+            .surface(crate::Offscreen::new(
+                (8, 8),
+                crate::OffscreenFormat::LinearF16,
+            ))
+            .unwrap();
+        let layer = surface.layer();
+        let color = nami::binding(WorkingColor::WHITE);
+        surface.update(|tx| {
+            tx[surface.root()].push(&layer);
+            tx[&layer].content(
+                surface.record(|r| r.fill(kurbo::Rect::new(0., 0., 8., 8.), color.clone())),
+            );
+        });
+        engine.render(FrameTime::now()).unwrap();
+        let count = Rc::new(Cell::new(0));
+        let wakes = count.clone();
+        engine.set_waker(move || wakes.set(wakes.get() + 1));
+        color.set(WorkingColor::BLACK);
+        color.set(WorkingColor::WHITE);
+        assert_eq!(
+            count.get(),
+            1,
+            "live updates coalesce without host transactions"
+        );
+        engine.render(FrameTime::now()).unwrap();
+        color.set(WorkingColor::BLACK);
+        assert_eq!(count.get(), 2, "render re-arms host notification");
+        drop(layer);
+        engine.render(FrameTime::now()).unwrap();
+        let before = count.get();
+        color.set(WorkingColor::WHITE);
+        assert_eq!(
+            count.get(),
+            before,
+            "removed content cannot wake the engine"
+        );
+    }
+
 }
 
 /// Retained-lowering equivalence checks for first-party backends.

@@ -390,8 +390,10 @@ fn hash_shape_fields(hasher: &mut DefaultHasher, shape: &ShapeData) {
     }
 }
 
-/// Hash the source geometry and stroke style once during preparation.
-pub fn hash_stroke_source(shape: &ShapeData, stroke: &kurbo::Stroke) -> u64 {
+/// A stable hash of a stroked draw: the outline's source shape plus every
+/// stroke parameter and the local flatten tolerance, tagged so it never
+/// collides with a fill of the same geometry.
+pub fn hash_stroke(shape: &ShapeData, stroke: &kurbo::Stroke, tolerance: f64) -> u64 {
     let mut hasher = DefaultHasher::new();
     2u64.hash(&mut hasher);
     hash_shape_fields(&mut hasher, shape);
@@ -405,14 +407,6 @@ pub fn hash_stroke_source(shape: &ShapeData, stroke: &kurbo::Stroke) -> u64 {
         v.to_bits().hash(&mut hasher);
     }
     stroke.dash_offset.to_bits().hash(&mut hasher);
-    hasher.finish()
-}
-
-/// Include the device-dependent flatten tolerance without re-hashing the
-/// source geometry at composition time.
-pub fn hash_stroke_tolerance(source: u64, tolerance: f64) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    source.hash(&mut hasher);
     tolerance.to_bits().hash(&mut hasher);
     hasher.finish()
 }

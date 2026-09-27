@@ -41,6 +41,8 @@ pub enum Feature {
     RadialGradient,
     /// Sweep gradients.
     SweepGradient,
+    /// Bilinear mesh-gradient paint.
+    MeshGradient,
     /// `Image` draw commands.
     Image,
     /// Image pattern paints.
@@ -265,6 +267,12 @@ fn collect_paint_features(paint: &Paint, f: &mut BTreeSet<Feature>) {
                 f.insert(Feature::ExtendNone);
             }
             collect_stops(&g.stops, f);
+        }
+        Paint::Mesh(mesh) => {
+            f.insert(Feature::MeshGradient);
+            for color in mesh.colors() {
+                collect_color_features(color, f);
+            }
         }
         Paint::Image(ip) => {
             f.insert(Feature::ImagePaint);

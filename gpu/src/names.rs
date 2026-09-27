@@ -6,8 +6,6 @@
 
 /// A general path.
 pub const PATH: &str = "path";
-/// A mesh gradient.
-pub const MESH: &str = "mesh-gradient";
 /// An image draw or image paint.
 #[expect(
     dead_code,

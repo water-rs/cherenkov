@@ -33,6 +33,8 @@ pub enum Feature {
     Path,
     /// Continuous (superellipse) corners.
     ContinuousCorners,
+    /// Independent paint-coordinate transforms.
+    PaintTransform,
     /// Linear gradients.
     LinearGradient,
     /// Two-point radial gradients.
@@ -214,23 +216,31 @@ fn collect_resource_refs(layer: &Layer, out: &mut Vec<ResourceHash>) {
             Item::Layer(l) => collect_resource_refs(l, out),
             Item::Draw(Draw::Glyphs(run)) => {
                 out.push(run.font);
-                if let Paint::Image(ip) = &run.paint {
-                    out.push(ip.image);
-                }
+                collect_paint_resources(&run.paint, out);
             }
             Item::Draw(Draw::Image { image, .. }) => out.push(*image),
             Item::Draw(Draw::Fill { paint, .. } | Draw::Stroke { paint, .. }) => {
-                if let Paint::Image(ip) = paint {
-                    out.push(ip.image);
-                }
+                collect_paint_resources(paint, out);
             }
             Item::Draw(Draw::Shadow { .. }) => {}
         }
     }
 }
 
+fn collect_paint_resources(paint: &Paint, out: &mut Vec<ResourceHash>) {
+    match paint {
+        Paint::Transformed { paint, .. } => collect_paint_resources(paint, out),
+        Paint::Image(image) => out.push(image.image),
+        _ => {}
+    }
+}
+
 fn collect_paint_features(paint: &Paint, f: &mut BTreeSet<Feature>) {
     match paint {
+        Paint::Transformed { paint, .. } => {
+            f.insert(Feature::PaintTransform);
+            collect_paint_features(paint, f);
+        }
         Paint::Solid(c) => collect_color_features(c, f),
         Paint::Linear(g) => {
             f.insert(Feature::LinearGradient);

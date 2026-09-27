@@ -2,6 +2,9 @@
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum SceneError {
+    /// An independent paint transform cannot be inverted to sample its paint.
+    #[error("paint transform must be finite and invertible")]
+    PaintTransform,
     /// An I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

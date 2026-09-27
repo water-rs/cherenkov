@@ -368,6 +368,13 @@ fn mk_paint(engine: &'static str, paint: &SPaint, blobs: &Blobs) -> Result<Paint
     p.set_anti_alias(true);
     let p3 = p3_cs(engine)?;
     match paint {
+        SPaint::Transformed { .. } => {
+            return Err(BenchError::Unsupported {
+                engine,
+                feature: Feature::PaintTransform,
+                api: Some("independent paint transform adapter"),
+            });
+        }
         SPaint::Solid(c) => {
             p.set_color4f(p3_linear4f(c), &p3);
         }

@@ -158,6 +158,12 @@ fn hash_paint(hasher: &mut impl Hasher, paint: &Paint) {
     }
     std::mem::discriminant(paint).hash(hasher);
     match paint {
+        Paint::Transformed(mapped) => {
+            for coefficient in mapped.transform.as_coeffs() {
+                bits(hasher, coefficient);
+            }
+            hash_paint(hasher, &mapped.paint);
+        }
         Paint::Solid(c) => color(hasher, *c),
         Paint::Linear(g) => {
             point(hasher, g.start);
@@ -498,6 +504,10 @@ fn paint_opacity(paint: &mut Paint, alpha: f32) {
         Paint::Sweep(g) => Some(&mut g.stops),
         Paint::Solid(c) => {
             c.components[3] *= alpha;
+            None
+        }
+        Paint::Transformed(mapped) => {
+            paint_opacity(std::sync::Arc::make_mut(&mut mapped.paint), alpha);
             None
         }
         Paint::Image(_) | Paint::Mesh(_) | Paint::Shader(_) => None,

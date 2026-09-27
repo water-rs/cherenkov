@@ -1545,7 +1545,7 @@ impl<'a> Lowering<'a> {
     #[inline(never)]
     fn shader_paint(
         &mut self,
-        paint: &cherenkov::ShaderPaint,
+        paint: &super::prepared::ResolvedShader,
         bounds: Rect,
         transform: Affine,
     ) -> Result<PaintData, RenderError> {
@@ -1568,8 +1568,8 @@ impl<'a> Lowering<'a> {
             device.height().ceil().max(1.0) as u32,
         );
         let key = std::sync::Arc::new(super::paint::Key {
-            shader: paint.shader.raw(),
-            uniforms: paint.uniforms.iter().map(|v| v.to_bits()).collect(),
+            shader: paint.source.shader.raw(),
+            uniforms: paint.source.uniforms.iter().map(|v| v.to_bits()).collect(),
             size,
         });
         // Collapsed axes sample their center. Coverage still comes from the
@@ -1594,12 +1594,14 @@ impl<'a> Lowering<'a> {
         } else {
             -bounds.y0 * y
         };
+        let [xx, yx, xy, yy, tx, ty] =
+            (Affine::new([x, 0.0, 0.0, y, offset_x, offset_y]) * paint.sampling).as_coeffs();
         let data = PaintData {
             kind: super::instance::PAINT_IMAGE,
-            grad: [f32_f64(x), 0.0, 0.0, f32_f64(y)],
+            grad: [f32_f64(xx), f32_f64(yx), f32_f64(xy), f32_f64(yy)],
             grad2: [
-                f32_f64(offset_x),
-                f32_f64(offset_y),
+                f32_f64(tx),
+                f32_f64(ty),
                 f32_f64(f64::from(size.0)),
                 f32_f64(f64::from(size.1)),
             ],
@@ -1908,7 +1910,7 @@ impl<'a> Lowering<'a> {
     fn shader_outline(
         &mut self,
         make: impl FnOnce() -> BezPath,
-        paint: &cherenkov::ShaderPaint,
+        paint: &super::prepared::ResolvedShader,
     ) -> Result<(BezPath, PaintData), RenderError> {
         let path = make();
         let data = self.shader_paint(paint, kurbo::Shape::bounding_box(&path), self.transform)?;
@@ -2173,7 +2175,7 @@ impl<'a> Lowering<'a> {
     fn shader_glyph_run(
         &mut self,
         run: &GlyphRun,
-        paint: &cherenkov::ShaderPaint,
+        paint: &super::prepared::ResolvedShader,
         glyphs: &GlyphContext<'_>,
         font: &FontData,
     ) -> Result<(), RenderError> {

@@ -445,6 +445,7 @@ fn transform_paint(paint: &mut Paint, t: Affine) {
         }
         Paint::Sweep(g) => g.center = t * g.center,
         Paint::Image(i) => i.transform = t * i.transform,
+        Paint::Transformed { transform, .. } => *transform = t * *transform,
         Paint::Solid(_) => {}
     }
 }
@@ -459,6 +460,10 @@ fn paint_opacity(paint: &mut Paint, alpha: f32) {
         Paint::Sweep(g) => Some(&mut g.stops),
         Paint::Solid(c) => {
             c.components[3] *= alpha;
+            None
+        }
+        Paint::Transformed { paint, .. } => {
+            paint_opacity(paint, alpha);
             None
         }
         Paint::Image(_) => None,

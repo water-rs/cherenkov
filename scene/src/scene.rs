@@ -60,6 +60,8 @@ pub enum Feature {
     Shadow,
     /// `Glyphs` draw commands.
     Glyphs,
+    /// Glyph runs drawn with a stroke style.
+    GlyphStroke,
     /// Variable-font normalized coordinates.
     FontVariations,
     /// Any colour channel above `1.0`.
@@ -340,6 +342,12 @@ fn collect_layer_features(layer: &Layer, f: &mut BTreeSet<Feature>) {
                 }
                 Draw::Glyphs(run) => {
                     f.insert(Feature::Glyphs);
+                    if let Some(stroke) = &run.stroke {
+                        f.insert(Feature::GlyphStroke);
+                        if !stroke.dash_pattern.is_empty() {
+                            f.insert(Feature::StrokeDash);
+                        }
+                    }
                     if !run.normalized_coords.is_empty() {
                         f.insert(Feature::FontVariations);
                     }

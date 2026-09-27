@@ -207,6 +207,8 @@ pub enum ResolvedPaint {
     Solid([f32; 4]),
     /// Gradient/image shader fields and their stop buffer.
     Resources(Box<(PaintData, Vec<Stop>)>),
+    /// Deferred until device scale and full shape bounds are known.
+    Shader(Box<cherenkov::ShaderPaint>),
 }
 
 /// sRGB-encodes one channel, preserving sign.
@@ -351,6 +353,9 @@ fn resolve(
 ) -> Result<ResolvedPaint, RenderError> {
     if let Paint::Solid(color) = paint {
         return Ok(ResolvedPaint::Solid(color.components));
+    }
+    if let Paint::Shader(shader) = paint {
+        return Ok(ResolvedPaint::Shader(Box::new(shader.clone())));
     }
     let mut stops = Vec::new();
     let data = paint_data(paint, to_local, &mut stops, images)?;

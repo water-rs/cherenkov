@@ -253,3 +253,16 @@ impl cherenkov::GpuContent for Gpu {
         r.resize_gpu_content(surface, layer, size);
     }
 }
+
+impl cherenkov::ShaderPaintCapability for Gpu {
+    fn add_shader(
+        r: &mut Self::Renderer,
+        id: cherenkov::ShaderId,
+        source: cherenkov::ShaderSource,
+    ) -> Result<(), cherenkov::ResourceError> {
+        r.add_shader(id, &source)
+    }
+    fn remove_shader(r: &mut Self::Renderer, id: cherenkov::ShaderId) {
+        r.remove_shader(id);
+    }
+}

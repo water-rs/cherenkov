@@ -325,6 +325,7 @@ impl<T: 'static, S: Signal<Output = T>> From<S> for Live<T> {
 struct LiveState {
     pending: RefCell<Vec<SlotUpdate>>,
     guards: RefCell<Vec<Box<dyn Any>>>,
+    waker: RefCell<Weak<crate::engine::Waker>>,
 }
 
 impl LiveState {
@@ -334,6 +335,11 @@ impl LiveState {
         match pending.iter_mut().find(|queued| queued.slot() == slot) {
             Some(queued) => *queued = update,
             None => pending.push(update),
+        }
+        drop(pending);
+        let waker = self.waker.borrow().upgrade();
+        if let Some(waker) = waker {
+            waker.wake();
         }
     }
 }
@@ -580,6 +586,14 @@ impl Content {
             picture: Picture::new(recorder.list),
             live: recorder.live,
             sent: false,
+        }
+    }
+
+    /// Connect installed live operands to the owning surface's host callback.
+    pub(crate) fn attach_waker(&self, waker: &Rc<crate::engine::Waker>) {
+        // Constant recordings need no callback or weak-count traffic.
+        if !self.live.guards.borrow().is_empty() {
+            *self.live.waker.borrow_mut() = Rc::downgrade(waker);
         }
     }
 

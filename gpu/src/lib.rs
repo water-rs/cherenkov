@@ -233,8 +233,14 @@ impl Backend for Gpu {
     type Target = GpuTarget;
     type Renderer = render::GpuRenderer;
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn init(config: GpuConfig) -> Result<(Self::Renderer, Self::Info), EngineError> {
         render::init(config)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn init(config: GpuConfig) -> Result<(Self::Renderer, Self::Info), EngineError> {
+        render::init(config).await
     }
 }
 
@@ -262,12 +268,22 @@ impl cherenkov::GpuContent for Gpu {
 }
 
 impl cherenkov::ShaderPaintCapability for Gpu {
+    #[cfg(not(target_arch = "wasm32"))]
     fn add_shader(
         r: &mut Self::Renderer,
         id: cherenkov::ShaderId,
         source: cherenkov::ShaderSource,
     ) -> Result<(), cherenkov::ResourceError> {
         r.add_shader(id, &source)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn add_shader(
+        r: &mut Self::Renderer,
+        id: cherenkov::ShaderId,
+        source: cherenkov::ShaderSource,
+    ) -> Result<(), cherenkov::ResourceError> {
+        r.add_shader(id, &source).await
     }
     fn remove_shader(r: &mut Self::Renderer, id: cherenkov::ShaderId) {
         r.remove_shader(id);
@@ -279,7 +295,7 @@ impl cherenkov::Filters for Gpu {
         r.remove_filter(id);
     }
 }
-impl<F: filtrate_core::Filter + Send> cherenkov::Runs<F> for Gpu {
+impl<F: filtrate_core::Filter + cherenkov::RenderTransfer> cherenkov::Runs<F> for Gpu {
     fn add_filter(r: &mut Self::Renderer, id: cherenkov::FilterId, filter: F) {
         r.add_filter(id, Box::new(render::filter::FromFilter(filter)));
     }

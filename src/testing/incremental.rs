@@ -3,9 +3,10 @@
 
 //! Exact incremental/full lowering checks shared by the CPU and GPU backends.
 
+use crate::Instant;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::kurbo::{Affine, BezPath, Circle, Rect, Stroke, Vec2};
 use crate::message::LayerOp;
@@ -21,6 +22,7 @@ use crate::{
 ///
 /// # Panics
 /// If a backend fails, output differs, or unrelated commands are re-lowered.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn equivalence<R: Renderer>(renderer: &mut R)
 where
     R::Target: From<Offscreen>,
@@ -124,14 +126,126 @@ where
     renderer.remove_font(font);
 }
 
+#[cfg(target_arch = "wasm32")]
+/// Browser version of the same deterministic incremental/full comparison.
+///
+/// # Panics
+/// If rendering fails, pixels differ, or unchanged commands are rebuilt.
+pub async fn equivalence<R: Renderer>(renderer: &mut R)
+where
+    R::Target: From<Offscreen>,
+{
+    let font = register_font(renderer);
+    let mut list = fixture(font).display_list().clone();
+    let stable = Picture::record(|c| c.fill(Rect::new(1., 1., 4., 4.), WorkingColor::WHITE));
+    let mut tree = SurfaceTree::new();
+    let layer = LayerId::new(1);
+    let sibling = LayerId::new(2);
+    tree.apply(LayerOp::Create(layer));
+    tree.apply(LayerOp::Create(sibling));
+    tree.apply(LayerOp::Push {
+        parent: tree.root(),
+        child: layer,
+    });
+    tree.apply(LayerOp::Push {
+        parent: tree.root(),
+        child: sibling,
+    });
+    let ids = [SurfaceId::new(1), SurfaceId::new(2)];
+    let mut size = (96, 96);
+    for id in ids {
+        renderer
+            .create_surface(id, Offscreen::new(size, OffscreenFormat::LinearF16).into())
+            .expect("surface");
+        renderer.set_content(
+            id,
+            layer,
+            Some(ContentOp::Replace(crate::Picture::new(list.clone()))),
+        );
+        renderer.set_content(id, sibling, Some(ContentOp::Picture(stable.clone())));
+    }
+    let start = Instant::now();
+    let mut frames = Frames::default();
+    for step in 0..160u32 {
+        let mut dirty_count = 0;
+        if step > 0 && step % 8 < 5 {
+            // Two separate commits exercise Dirty::union before one render.
+            for batch in 0..2 {
+                let updates = updates(&list, step * 2 + batch);
+                let dirty = list.apply(updates.clone());
+                dirty_count += dirty.ranges().iter().map(|r| r.end - r.start).sum::<u32>();
+                renderer.set_content(ids[0], layer, Some(ContentOp::Update(updates)));
+            }
+        }
+        update_properties(&mut tree, layer, step);
+        if step == 71 {
+            size = (104, 100);
+            for id in ids {
+                renderer.resize_surface(id, size);
+            }
+        }
+        if step == 93 {
+            renderer.trim(Pressure::Critical);
+        }
+        let time = start + Duration::from_millis(u64::from(step) * 16);
+        let _ = tree.sample(time, Display::default());
+        renderer.set_content(
+            ids[1],
+            layer,
+            Some(ContentOp::Replace(crate::Picture::new(list.clone()))),
+        );
+        let incremental = render(renderer, &mut frames, ids[0], &tree, size, time).await;
+        let full = render(renderer, &mut frames, ids[1], &tree, size, time).await;
+        if step > 0 {
+            if dirty_count == 0 {
+                assert_eq!(
+                    incremental.commands_lowered, 0,
+                    "properties re-lowered content at {step}"
+                );
+            } else {
+                assert!(
+                    incremental.commands_lowered <= u32::try_from(list.len()).unwrap(),
+                    "rebuilt an unrelated layer at {step}"
+                );
+            }
+            assert_eq!(full.commands_lowered, u32::try_from(list.len()).unwrap());
+        }
+        let a = renderer
+            .readback(ids[0])
+            .await
+            .expect("incremental readback");
+        let b = renderer.readback(ids[1]).await.expect("full readback");
+        for (pixel, (a, b)) in a.pixels.iter().zip(&b.pixels).enumerate() {
+            assert_eq!(
+                a.map(f32::to_bits),
+                b.map(f32::to_bits),
+                "frame {step}, pixel {pixel}"
+            );
+        }
+    }
+    assert_patch_counts(
+        renderer,
+        &mut frames,
+        ids[0],
+        (layer, &tree, &list),
+        size,
+        start + Duration::from_secs(4),
+    )
+    .await;
+    for id in ids {
+        renderer.destroy_surface(id);
+    }
+    renderer.remove_font(font);
+}
+
 fn register_font(renderer: &mut impl Renderer) -> FontId {
     let font = FontId::new(1);
     renderer
         .add_font(
             font,
             FontData {
-                data: std::fs::read("../scenes/fonts/NotoSans.ttf")
-                    .expect("test font")
+                data: include_bytes!("../../scenes/fonts/NotoSans.ttf")
+                    .as_slice()
                     .into(),
                 index: 0,
             },
@@ -153,6 +267,7 @@ impl Frames {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn render<R: Renderer>(
     renderer: &mut R,
     frames: &mut Frames,
@@ -178,6 +293,37 @@ fn render<R: Renderer>(
             },
             &mut stats,
         )
+        .expect("render");
+    stats
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn render<R: Renderer>(
+    renderer: &mut R,
+    frames: &mut Frames,
+    id: SurfaceId,
+    tree: &SurfaceTree,
+    size: (u32, u32),
+    time: Instant,
+) -> FrameStats {
+    let mut stats = FrameStats::default();
+    renderer
+        .render(
+            &Frame {
+                id: frames.next(),
+                time: FrameTime::at(time),
+                surfaces: &[SurfaceFrame {
+                    id,
+                    size,
+                    display: Display::default(),
+                    clear: WorkingColor::new([0.1, 0.2, 0.3, 1.]),
+                    changed: true,
+                    tree,
+                }],
+            },
+            &mut stats,
+        )
+        .await
         .expect("render");
     stats
 }
@@ -364,6 +510,7 @@ fn update_properties(tree: &mut SurfaceTree, layer: LayerId, step: u32) {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn assert_patch_counts<R: Renderer>(
     renderer: &mut R,
     frames: &mut Frames,
@@ -428,6 +575,78 @@ fn assert_patch_counts<R: Renderer>(
         }])),
     );
     let structural = render(renderer, frames, id, tree, size, time);
+    assert_eq!(
+        structural.commands_lowered,
+        u32::try_from(list.len()).unwrap(),
+        "a glyph-count change must rebuild only its layer"
+    );
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn assert_patch_counts<R: Renderer>(
+    renderer: &mut R,
+    frames: &mut Frames,
+    id: SurfaceId,
+    scene: (LayerId, &SurfaceTree, &crate::DisplayList),
+    size: (u32, u32),
+    time: Instant,
+) {
+    let (layer, tree, list) = scene;
+    // Two stable leaf updates must lower exactly two commands in one layer.
+    let updates: Vec<_> = list
+        .commands()
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| matches!(c, Command::Fill { .. }).then_some(u32::try_from(i).unwrap()))
+        .take(2)
+        .map(|command| SlotUpdate {
+            command,
+            value: Operand::Paint(Paint::Solid(WorkingColor::WHITE)),
+        })
+        .collect();
+    renderer.set_content(id, layer, Some(ContentOp::Update(updates)));
+    let stats = render(renderer, frames, id, tree, size, time).await;
+    assert_eq!(
+        stats.commands_lowered, 2,
+        "two dirty fills must patch just two commands"
+    );
+    assert_eq!(
+        stats.layers_composed, 1,
+        "an unrelated layer was recomposed"
+    );
+    let unchanged = render(renderer, frames, id, tree, size, time).await;
+    assert_eq!(unchanged.commands_lowered, 0);
+    assert_eq!(
+        unchanged.layers_composed, 0,
+        "unchanged device output must be reused"
+    );
+    let (index, mut changed_run) = list
+        .commands()
+        .iter()
+        .enumerate()
+        .find_map(|(i, command)| {
+            if let Command::Glyphs { run, .. } = command {
+                Some((i, run.clone()))
+            } else {
+                None
+            }
+        })
+        .expect("glyph fixture");
+    changed_run.glyphs.push(Glyph {
+        id: 36,
+        x: 12.,
+        y: 60.,
+        transform: None,
+    });
+    renderer.set_content(
+        id,
+        layer,
+        Some(ContentOp::Update(vec![SlotUpdate {
+            command: u32::try_from(index).unwrap(),
+            value: Operand::Run(changed_run),
+        }])),
+    );
+    let structural = render(renderer, frames, id, tree, size, time).await;
     assert_eq!(
         structural.commands_lowered,
         u32::try_from(list.len()).unwrap(),

@@ -518,3 +518,54 @@ composition and submission. The GPU backend also reports render-thread CPU
 phases, including `lower_seconds`, independently of its deferred GPU timestamps.
 Submission time can include driver backpressure; use the lowering phase to
 isolate CPU lowering work.
+
+
+### Browser executor (#80)
+
+On native targets the existing synchronous API and dedicated render thread
+remain unchanged. Configurations, targets and custom producers must be `Send`.
+On wasm32 an engine owns one serial executor on the JS thread that created it.
+WebGPU handles, custom producers and filter setup futures remain on that thread.
+`RenderTransfer` expresses this target-dependent requirement; it is `Send` on
+native and imposes no transfer bound on wasm32. There is no unsafe `Send` shim.
+Browser lowering currently runs on that same thread; no GPU-bearing payload is
+sent to workers. Any future worker protocol must consist only of owned `Send`
+CPU data, never resource tables or JavaScript handles.
+
+On wasm32 `Engine::new`, `font`, `image`, `shader`, `surface`, `render`, `memory`,
+`finish_timings`, and `Surface::readback` are asynchronous. Hosts await these
+methods from their event loop. Recording, edits, resource drops and signal
+notifications remain synchronous and enqueue ordered work. An operation already
+enqueued completes even if its reply future is dropped. Engine drop enqueues
+shutdown after preceding operations; remaining handles become disconnected.
+Host notifications arriving during an awaited render request the next frame.
+Hosts serialize frame requests and continue honoring `Next` and the wake callback.
+
+`GpuConfig::device` preserves the supplied adapter/device/queue on both targets,
+including all enabled features. Browser initialization, shader validation,
+producer/filter setup, texture readback and timing completion yield to browser
+promises rather than block on channels or device polling. `cherenkov::Instant`
+uses the browser performance clock on wasm32 and is `std::time::Instant` on
+native. Native callers need no timestamp conversion.
+
+#### Running the browser tests
+
+The `browser` test target in `cherenkov-gpu` executes against a real
+WebGPU-enabled headless browser:
+
+```
+CHROMEDRIVER=/path/to/chromedriver \
+WASM_BINDGEN_TEST_WEBDRIVER_JSON=/path/to/webdriver.json \
+CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
+cargo test --locked -p cherenkov-gpu --test browser --target wasm32-unknown-unknown
+```
+
+The `wasm-bindgen-test-runner` binary version must match the crate's
+`wasm-bindgen` version, and `chromedriver` must match the installed Chrome.
+`webdriver.json` supplies the browser capabilities; Chrome must launch with
+WebGPU available (for headless runs, `--enable-unsafe-webgpu` plus a working
+rasterizer such as `--use-angle=swiftshader`). The suite covers `!Send`
+producers on the owning JS thread, `SharedDevice` reuse across engines,
+asynchronous shader validation and filter setup, host wakes requested while a
+render is awaiting browser work, and incremental lowering matching full
+lowering pixel-for-pixel.

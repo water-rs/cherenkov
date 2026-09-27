@@ -15,10 +15,11 @@ mod prepared;
 pub mod present;
 mod raster;
 
+use cherenkov::Instant;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::{GpuConfig, GpuInfo, GpuTarget, ScratchFormat, TimestampSupport, names};
 use cherenkov::{
@@ -409,6 +410,7 @@ fn grow_preserving(
 
 /// Creates an adapter plus device. Fails when no adapter allows the target
 /// format's required usages.
+#[cfg(not(target_arch = "wasm32"))]
 fn create_device(
     config: &GpuConfig,
 ) -> Result<(wgpu::Instance, wgpu::Adapter, wgpu::Device, wgpu::Queue), EngineError> {
@@ -471,6 +473,83 @@ fn create_device(
         trace: wgpu::Trace::Off,
     }))
     .map_err(|e| EngineError::Backend(format!("{e}")))?;
+    tracing::info!(features = ?device.features(), "device");
+    Ok((instance, adapter, device, queue))
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn create_device(
+    config: &GpuConfig,
+) -> Result<(wgpu::Instance, wgpu::Adapter, wgpu::Device, wgpu::Queue), EngineError> {
+    if let Some(shared) = &config.device {
+        return Ok((
+            shared.instance.clone(),
+            shared.adapter.clone(),
+            shared.device.clone(),
+            shared.queue.clone(),
+        ));
+    }
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: config.backends,
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: config.power_preference,
+            force_fallback_adapter: false,
+            compatible_surface: None,
+        })
+        .await
+        .map_err(|error| EngineError::Backend(error.to_string()))?;
+    if !adapter
+        .get_texture_format_features(TARGET_FORMAT)
+        .allowed_usages
+        .contains(TARGET_USAGES)
+    {
+        return Err(EngineError::Backend(
+            "adapter cannot render the working-space format".into(),
+        ));
+    }
+    let supported = adapter.features();
+    let info = adapter.get_info();
+    tracing::info!(
+        name = %info.name,
+        backend = ?info.backend,
+        device_type = ?info.device_type,
+        driver = %info.driver,
+        driver_info = %info.driver_info,
+        timestamp_query = supported.contains(wgpu::Features::TIMESTAMP_QUERY),
+        timestamps_inside_encoders =
+            supported.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS),
+        timestamps_inside_passes = supported.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES),
+        "adapter"
+    );
+    tracing::debug!(limits = ?adapter.limits(), "adapter limits");
+    let mut required = wgpu::Features::empty();
+    // Only pass-boundary timestamps are requested: Metal on Apple GPUs
+    // advertises `TIMESTAMP_QUERY_INSIDE_ENCODERS` but samples only at
+    // stage boundaries, so an encoder-level `write_timestamp` goes through
+    // a dummy blit encoder that wgpu itself documents as unreliable.
+    if config.timestamps && supported.contains(wgpu::Features::TIMESTAMP_QUERY) {
+        required |= wgpu::Features::TIMESTAMP_QUERY;
+    }
+    if config.pipeline_cache.is_some() && supported.contains(wgpu::Features::PIPELINE_CACHE) {
+        required |= wgpu::Features::PIPELINE_CACHE;
+    }
+    let (device, queue) = adapter
+        .request_device(&wgpu::DeviceDescriptor {
+            label: Some("cherenkov-gpu"),
+            required_features: required,
+            // Clamp the portable defaults to what the adapter reports:
+            // iOS Metal offers 15 inter-stage varyings (60 components)
+            // where `Limits::default` asks for 16.
+            required_limits: wgpu::Limits::default().or_worse_values_from(&adapter.limits()),
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            memory_hints: wgpu::MemoryHints::Performance,
+            trace: wgpu::Trace::Off,
+        })
+        .await
+        .map_err(|e| EngineError::Backend(format!("{e}")))?;
     tracing::info!(features = ?device.features(), "device");
     Ok((instance, adapter, device, queue))
 }
@@ -616,6 +695,7 @@ const fn variant_index(variant: ShaderVariant) -> usize {
 /// The closed pipeline set: one instanced-quad pipeline from `shader.wgsl`.
 /// When a pipeline cache path is configured and supported, the cache is
 /// loaded beforehand and persisted afterwards, best effort.
+#[cfg(not(target_arch = "wasm32"))]
 fn create_pipeline(
     device: &wgpu::Device,
     config: &GpuConfig,
@@ -700,6 +780,91 @@ fn create_pipeline(
     Ok(pipeline)
 }
 
+#[cfg(target_arch = "wasm32")]
+async fn create_pipeline(
+    device: &wgpu::Device,
+    config: &GpuConfig,
+    layout0: &wgpu::BindGroupLayout,
+    layout1: &wgpu::BindGroupLayout,
+    module: &wgpu::ShaderModule,
+    format: wgpu::TextureFormat,
+    replace: bool,
+) -> Result<wgpu::RenderPipeline, EngineError> {
+    let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("cherenkov"),
+        bind_group_layouts: &[Some(layout0), Some(layout1)],
+        immediate_size: 0,
+    });
+    let cache = config.pipeline_cache.as_ref().and_then(|path| {
+        if !device.features().contains(wgpu::Features::PIPELINE_CACHE) {
+            return None;
+        }
+        let data = std::fs::read(path).ok();
+        // SAFETY: `data` is either a blob previously produced by wgpu or
+        // absent; `fallback: true` keeps us off the unsafe fallback path.
+        Some(unsafe {
+            device.create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
+                label: Some("cherenkov"),
+                data: data.as_deref(),
+                fallback: true,
+            })
+        })
+    });
+    // Source-over premultiplied compositing, or `Replace` writing the
+    // shader's already-composited result verbatim.
+    let component = wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::One,
+        dst_factor: if replace {
+            wgpu::BlendFactor::Zero
+        } else {
+            wgpu::BlendFactor::OneMinusSrcAlpha
+        },
+        operation: wgpu::BlendOperation::Add,
+    };
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("cherenkov"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module,
+            entry_point: Some("vs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module,
+            entry_point: Some("fs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState {
+                    color: component,
+                    alpha: component,
+                }),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            ..wgpu::PrimitiveState::default()
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: cache.as_ref(),
+    });
+    if let Some(error) = error_scope.pop().await {
+        return Err(EngineError::Backend(format!("{error}")));
+    }
+    if let (Some(cache), Some(path)) = (&cache, &config.pipeline_cache)
+        && let Some(data) = cache.get_data()
+    {
+        let _ = std::fs::write(path, data);
+    }
+    Ok(pipeline)
+}
+
 /// A `w` × `h` texture in `format`.
 fn create_target(
     device: &wgpu::Device,
@@ -735,6 +900,7 @@ fn create_target(
     clippy::needless_pass_by_value,
     reason = "moved into the render thread"
 )]
+#[cfg(not(target_arch = "wasm32"))]
 pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
     create_device(&config).and_then(|(instance, adapter, device, queue)| {
         let info = adapter.get_info();
@@ -918,6 +1084,198 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             },
         ))
     })
+}
+
+#[cfg(target_arch = "wasm32")]
+pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
+    let (instance, adapter, device, queue) = create_device(&config).await?;
+    let info = adapter.get_info();
+    let supported = adapter.features();
+    let timestamp_support = if supported.contains(wgpu::Features::TIMESTAMP_QUERY) {
+        TimestampSupport::PassBoundaries
+    } else {
+        TimestampSupport::Unsupported
+    };
+    let (layout0, layout1) = create_layouts(&device);
+    let scratch_format = scratch_wgpu(config.scratch_format);
+    // Three specialised fragment shaders from one source file: the
+    // prepended `VARIANT` constant makes fs_main a constant-folded
+    // dispatch to fs_simple/fs_shadow/fs_full.
+    let shader_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let modules = [0u32, 1, 2].map(|v| {
+        device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("cherenkov"),
+            source: wgpu::ShaderSource::Wgsl(
+                format!(
+                    "const VARIANT: u32 = {v}u;\n{}",
+                    include_str!("shader.wgsl")
+                )
+                .into(),
+            ),
+        })
+    });
+    if let Some(error) = shader_scope.pop().await {
+        return Err(EngineError::Backend(error.to_string()));
+    }
+    let pipelines = async |format: wgpu::TextureFormat, replace: bool| {
+        Ok::<_, EngineError>([
+            create_pipeline(
+                &device,
+                &config,
+                &layout0,
+                &layout1,
+                &modules[0],
+                format,
+                replace,
+            )
+            .await?,
+            create_pipeline(
+                &device,
+                &config,
+                &layout0,
+                &layout1,
+                &modules[1],
+                format,
+                replace,
+            )
+            .await?,
+            create_pipeline(
+                &device,
+                &config,
+                &layout0,
+                &layout1,
+                &modules[2],
+                format,
+                replace,
+            )
+            .await?,
+        ])
+    };
+    let pipelines = [
+        [
+            pipelines(TARGET_FORMAT, false).await?,
+            pipelines(TARGET_FORMAT, true).await?,
+        ],
+        [
+            pipelines(scratch_format, false).await?,
+            pipelines(scratch_format, true).await?,
+        ],
+    ];
+    let globals = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("globals"),
+        size: 16,
+        usage: wgpu::BufferUsages::UNIFORM
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let instances = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("instances"),
+        size: 272 * 16,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let stops = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("stops"),
+        size: 32 * 16,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let atlas = Atlas::new(&device, config.budget.gpu.0);
+    let bind0 = make_bind0(&device, &layout0, &globals, &instances, &stops, &atlas);
+    let (_, dummy_view) = create_target(
+        &device,
+        "dummy source",
+        (1, 1),
+        wgpu::TextureUsages::TEXTURE_BINDING,
+        TARGET_FORMAT,
+    );
+    let timestamps =
+        config.timestamps && device.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+    let (query_set, query_buffer) = if timestamps {
+        (
+            Some(device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("frame timestamps"),
+                ty: wgpu::QueryType::Timestamp,
+                count: 2 * TIMESTAMP_FRAMES_PER_SET,
+            })),
+            Some(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("timestamp resolve"),
+                size: 16,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            })),
+        )
+    } else {
+        (None, None)
+    };
+    // Two queries per frame, reserving 64 independent frame ranges.
+    let query_capacity = if query_set.is_some() { 2 } else { 0 };
+    let query_pool = query_set.as_ref().map_or_else(Vec::new, |set| {
+        (1..TIMESTAMP_FRAMES_PER_SET)
+            .map(|slot| (set.clone(), slot * 2, 2))
+            .collect()
+    });
+    let renderer = GpuRenderer {
+        instance,
+        adapter,
+        presenter: None,
+        shaders: paint::Registry::default(),
+        filters: filter::Registry::new(config.redraw.clone()),
+        last_frame: None,
+        origin: None,
+        max_texture: device.limits().max_texture_dimension_2d,
+        device,
+        queue,
+        pipelines,
+        scratch_format,
+        layout0,
+        layout1,
+        globals,
+        instances,
+        stops,
+        bind0,
+        dummy_view,
+        bound_atlas: 0,
+        bound_instance_size: 272 * 16,
+        bound_stop_size: 32 * 16,
+        bound_globals_size: 16,
+        atlas,
+        surfaces: HashMap::new(),
+        fonts: HashMap::new(),
+        images: HashMap::new(),
+        images_gen: 0,
+        timestamps,
+        query_set,
+        query_base: 0,
+        query_pool,
+        pending_queries: VecDeque::new(),
+        frame_submission: None,
+        query_buffer,
+        query_staging: None,
+        query_capacity,
+        pending_timestamps: VecDeque::new(),
+        frame_pass_count: 0,
+        pass_meta: Vec::new(),
+        wait_timeout: config.wait_timeout,
+    };
+    Ok((
+        renderer,
+        GpuInfo {
+            name: info.name,
+            backend: format!("{:?}", info.backend),
+            vendor: info.vendor,
+            device: info.device,
+            device_type: format!("{:?}", info.device_type),
+            driver: info.driver,
+            driver_info: info.driver_info,
+            timestamps: timestamp_support,
+        },
+    ))
 }
 
 /// Validates font data with `skrifa`, rejecting bitmap-only colour fonts.
@@ -1309,6 +1667,7 @@ impl Renderer for GpuRenderer {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn render(&mut self, frame: &Frame<'_>, stats: &mut FrameStats) -> Result<Redraw, RenderError> {
         let origin = *self.origin.get_or_insert(frame.time.0);
         stats.timings = self.drain_timestamps();
@@ -1413,8 +1772,119 @@ impl Renderer for GpuRenderer {
         Ok(self.requested_redraw(present))
     }
 
+    #[cfg(target_arch = "wasm32")]
+    async fn render(
+        &mut self,
+        frame: &Frame<'_>,
+        stats: &mut FrameStats,
+    ) -> Result<Redraw, RenderError> {
+        let origin = *self.origin.get_or_insert(frame.time.0);
+        stats.timings = self.drain_timestamps();
+        let dirty: Vec<_> = frame
+            .surfaces
+            .iter()
+            .filter(|sf| {
+                sf.changed
+                    || self.surfaces[&sf.id]
+                        .frame
+                        .filters
+                        .iter()
+                        .any(|(_, id)| self.filters.wants_redraw(*id))
+                    || self.surfaces[&sf.id].content_wants_redraw()
+                    || self.surfaces[&sf.id]
+                        .shader_textures
+                        .keys()
+                        .any(|key| self.shaders.animated(key))
+            })
+            .collect();
+        if dirty.is_empty() {
+            return self.present_windows(frame);
+        }
+        let timing = self.filter_timing(frame, origin);
+        self.frame_pass_count = 0;
+        self.frame_submission = None;
+        self.pass_meta.clear();
+        // Lower every dirty surface first: the GPU timestamp bracket must
+        // start after CPU lowering (rasters, uploads) so it measures GPU
+        // work only. Instances, stops and globals are appended frame-wide
+        // at per-surface bases so a later surface's upload can't clobber
+        // an earlier one before it is encoded.
+        // Take the states out so the lowering workers own them.
+        let t_lower = Instant::now();
+        let mut pending: Vec<SurfaceState> = dirty
+            .iter()
+            .map(|id| {
+                self.surfaces
+                    .remove(&id.id)
+                    .expect("dirty surface must exist")
+            })
+            .collect();
+        let results = self.lower_all(&mut pending, &dirty);
+        for (id, surf) in dirty.iter().zip(pending) {
+            self.surfaces.insert(id.id, surf);
+        }
+        let mut inst_base = 0u32;
+        let mut stop_base = 0u32;
+        let mut globals_base = 0u32;
+        let mut result = Ok(());
+        for (sf, lowered) in dirty.iter().zip(results) {
+            let id = sf.id;
+            result = self.lower_surface(id, stats, inst_base, stop_base, globals_base, lowered);
+            if result.is_err() {
+                break;
+            }
+            if let Some(surf) = self.surfaces.get(&id) {
+                inst_base += u32::try_from(surf.frame.instances.len()).unwrap_or(u32::MAX);
+                stop_base += u32::try_from(surf.frame.stops.len()).unwrap_or(u32::MAX);
+                globals_base += u32::try_from(surf.frame.passes.len()).unwrap_or(u32::MAX);
+            }
+        }
+        stats.phases.lower_seconds = t_lower.elapsed().as_secs_f64();
+        tracing::debug!(
+            surfaces = dirty.len(),
+            lower_ms = stats.phases.lower_seconds * 1e3,
+            ok = result.is_ok(),
+            "frame lowered"
+        );
+        if result.is_ok() {
+            self.update_filter_activity();
+            for sf in &dirty {
+                self.render_shaders(
+                    sf.id,
+                    frame.time.0.saturating_duration_since(origin).as_secs_f32(),
+                )?;
+                self.render_producers(sf, frame.time.0).await?;
+                self.prepare_filters(sf.id).await?;
+            }
+            let t = Instant::now();
+            for sf in &dirty {
+                let count = self.frame_pass_count;
+                let meta = self.pass_meta.len();
+                if let Err(error) = self.encode_surface(sf.id, timing, stats) {
+                    self.frame_pass_count = count;
+                    self.pass_meta.truncate(meta);
+                    result = Err(error);
+                    break;
+                }
+                let surface = self.surfaces.get_mut(&sf.id).expect("rendered surface");
+                surface.present_pending = surface.window.is_some();
+            }
+            stats.phases.encode_seconds = t.elapsed().as_secs_f64();
+            stats.frame = Some(frame.id);
+            if self.timestamps && self.frame_pass_count > 0 {
+                let t = Instant::now();
+                self.queue_timestamps(2 * self.frame_pass_count, frame.id);
+                stats.phases.stamp_seconds += t.elapsed().as_secs_f64();
+            }
+        }
+        result?;
+        let present = self.present_windows(frame)?;
+        Ok(self.requested_redraw(present))
+    }
+
     /// Waits for the GPU to finish every pending frame and returns their
     /// timings, oldest first.
+    #[cfg(not(target_arch = "wasm32"))]
     fn finish_timings(&mut self) -> Result<Vec<FrameTiming>, RenderError> {
         // Tooling may wait; the frame path only polls. First complete draws
         // so their resolves can be encoded, then complete the resolve copies.
@@ -1443,6 +1913,36 @@ impl Renderer for GpuRenderer {
         }
     }
 
+    #[cfg(target_arch = "wasm32")]
+    async fn finish_timings(&mut self) -> Result<Vec<FrameTiming>, RenderError> {
+        // Tooling may wait; the frame path only polls. First complete draws
+        // so their resolves can be encoded, then complete the resolve copies.
+        if let Some(last) = self.pending_queries.back().map(|p| p.submission.clone()) {
+            self.wait(last, "timestamp draws").await?;
+        }
+        let mut timings = self.drain_timestamps();
+        if !self.pending_queries.is_empty() {
+            return Err(RenderError::Readback(
+                "timestamp draws: the completion callback did not run after the wait".into(),
+            ));
+        }
+        if let Some(last) = self.pending_timestamps.back().map(|p| p.submission.clone()) {
+            for pending in &mut self.pending_timestamps {
+                pending.request_map();
+            }
+            self.wait(last, "timestamp resolve").await?;
+            timings.extend(self.drain_timestamps());
+        }
+        if self.pending_timestamps.is_empty() {
+            Ok(timings)
+        } else {
+            Err(RenderError::Readback(
+                "timestamp resolve: the map callback did not run after the wait".into(),
+            ))
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn readback(&mut self, surface: SurfaceId) -> Result<Readback, RenderError> {
         let Some(state) = self.surfaces.get(&surface) else {
             return Err(RenderError::Readback("unknown surface".into()));
@@ -1507,6 +2007,73 @@ impl Renderer for GpuRenderer {
             pixels,
         })
     }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn readback(&mut self, surface: SurfaceId) -> Result<Readback, RenderError> {
+        let Some(state) = self.surfaces.get(&surface) else {
+            return Err(RenderError::Readback("unknown surface".into()));
+        };
+        let (w, h) = state.size;
+        let bytes_per_row = (w * 8).div_ceil(256) * 256;
+        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback"),
+            size: u64::from(bytes_per_row) * u64::from(h),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("readback"),
+            });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &state.target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        let submission = self.queue.submit([encoder.finish()]);
+        tracing::trace!(?surface, ?submission, "readback submitted");
+        let slice = buf.slice(..);
+        self.map_read(slice, submission, "the pixel readback")
+            .await?;
+        let data = slice.get_mapped_range();
+        let mut pixels = Vec::with_capacity((w * h) as usize);
+        for row in 0..h {
+            let start = (row * bytes_per_row) as usize;
+            for px in data[start..start + (w * 8) as usize].as_chunks::<8>().0 {
+                let bits: [u16; 4] = bytemuck::cast(*px);
+                pixels.push([
+                    half::f16::from_bits(bits[0]).to_f32(),
+                    half::f16::from_bits(bits[1]).to_f32(),
+                    half::f16::from_bits(bits[2]).to_f32(),
+                    half::f16::from_bits(bits[3]).to_f32(),
+                ]);
+            }
+        }
+        drop(data);
+        buf.unmap();
+        Ok(Readback {
+            width: w,
+            height: h,
+            pixels,
+        })
+    }
 }
 
 impl GpuRenderer {
@@ -1536,12 +2103,22 @@ impl GpuRenderer {
     pub(crate) fn remove_filter(&mut self, id: cherenkov::FilterId) {
         self.filters.remove(id.raw());
     }
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn add_shader(
         &mut self,
         id: cherenkov::ShaderId,
         source: &cherenkov::ShaderSource,
     ) -> Result<(), ResourceError> {
         self.shaders.add(&self.device, id.raw(), source)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) async fn add_shader(
+        &mut self,
+        id: cherenkov::ShaderId,
+        source: &cherenkov::ShaderSource,
+    ) -> Result<(), ResourceError> {
+        self.shaders.add(&self.device, id.raw(), source).await
     }
 
     pub(crate) fn remove_shader(&mut self, id: cherenkov::ShaderId) {
@@ -1584,6 +2161,7 @@ impl GpuRenderer {
         Ok(())
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn render_producers(
         &mut self,
         sf: &SurfaceFrame<'_>,
@@ -1609,6 +2187,37 @@ impl GpuRenderer {
                     time,
                     sf.display.scale as f32,
                 )?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn render_producers(
+        &mut self,
+        sf: &SurfaceFrame<'_>,
+        time: Instant,
+    ) -> Result<(), RenderError> {
+        let surface = self.surfaces.get_mut(&sf.id).expect("registered surface");
+        for (id, slot) in &mut surface.content {
+            slot.set_active(surface.frame.content.contains(id));
+        }
+        for id in &surface.frame.content {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "validated display scale fits f32"
+            )]
+            surface
+                .content
+                .get_mut(id)
+                .expect("composed GPU content")
+                .render(
+                    &self.adapter,
+                    &self.device,
+                    &self.queue,
+                    time,
+                    sf.display.scale as f32,
+                )
+                .await?;
         }
         Ok(())
     }
@@ -1697,6 +2306,7 @@ impl GpuRenderer {
         Ok(redraw.map_or(Redraw::None, |rate| Redraw::Wanted { rate }))
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn lower_all(
         &mut self,
         pending: &mut [SurfaceState],
@@ -1739,6 +2349,60 @@ impl GpuRenderer {
                     })
                     .collect()
             };
+            // Commit every surface's pending rasters serially, in dirty
+            // order.
+            for (surf, result) in pending.iter_mut().zip(results.iter_mut()) {
+                let Ok(lowered) = result else {
+                    continue;
+                };
+                match self.apply_pending(surf, lowered) {
+                    Ok(()) => {}
+                    Err(RenderError::AtlasFull) => {
+                        if self.atlas.size() < self.atlas.cap() {
+                            self.atlas.grow(&self.device);
+                            tracing::debug!(
+                                size = self.atlas.size(),
+                                generation = self.atlas.generation(),
+                                "atlas grown"
+                            );
+                        } else if cleared {
+                            *result = Err(RenderError::AtlasExhausted);
+                            break 'batch results;
+                        } else {
+                            self.atlas.clear();
+                            cleared = true;
+                            tracing::debug!(size = self.atlas.size(), "atlas cleared");
+                        }
+                        // Growing or clearing emptied the atlas: every
+                        // hit any lowering took is now a miss, so lower
+                        // the whole batch again.
+                        continue 'batch;
+                    }
+                    Err(e) => {
+                        *result = Err(e);
+                        break 'batch results;
+                    }
+                }
+            }
+            break results;
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn lower_all(
+        &mut self,
+        pending: &mut [SurfaceState],
+        frames: &[&SurfaceFrame<'_>],
+    ) -> Vec<Result<Lowered, RenderError>> {
+        let mut cleared = false;
+        'batch: loop {
+            let mut results: Vec<Result<Lowered, RenderError>> = pending
+                .iter_mut()
+                .zip(frames)
+                .map(|(surf, frame)| {
+                    Self::lower_content(surf, frame, &self.atlas, &self.fonts, &self.images)
+                })
+                .collect();
             // Commit every surface's pending rasters serially, in dirty
             // order.
             for (surf, result) in pending.iter_mut().zip(results.iter_mut()) {
@@ -2399,6 +3063,7 @@ impl GpuRenderer {
         Ok(())
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn wait(
         &self,
         submission: wgpu::SubmissionIndex,
@@ -2434,6 +3099,20 @@ impl GpuRenderer {
         }
     }
 
+    #[cfg(target_arch = "wasm32")]
+    async fn wait(
+        &self,
+        _submission: wgpu::SubmissionIndex,
+        what: &'static str,
+    ) -> Result<(), RenderError> {
+        let (tx, rx) = futures_channel::oneshot::channel();
+        self.queue.on_submitted_work_done(move || {
+            let _ = tx.send(());
+        });
+        browser_wait(rx, self.wait_timeout, what).await
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn map_read(
         &self,
         slice: wgpu::BufferSlice<'_>,
@@ -2453,6 +3132,22 @@ impl GpuRenderer {
                 "{what}: the map callback did not run after the wait"
             ))),
         }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn map_read(
+        &self,
+        slice: wgpu::BufferSlice<'_>,
+        _submission: wgpu::SubmissionIndex,
+        what: &'static str,
+    ) -> Result<(), RenderError> {
+        let (tx, rx) = futures_channel::oneshot::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        browser_wait(rx, self.wait_timeout, what)
+            .await?
+            .map_err(|error| RenderError::Readback(format!("{what}: {error}")))
     }
 
     /// Hands this frame's samples to the completion queue without waiting.
@@ -2678,5 +3373,58 @@ fn srgb_decode_u8_f64(v: f64) -> f64 {
         v / 12.92
     } else {
         ((v + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// A browser completion with the same configured timeout as native waits.
+#[cfg(target_arch = "wasm32")]
+async fn browser_wait<T>(
+    rx: futures_channel::oneshot::Receiver<T>,
+    timeout: std::time::Duration,
+    what: &'static str,
+) -> Result<T, RenderError> {
+    use futures_util::future::{Either, select};
+    let millis = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
+    match select(
+        Box::pin(rx),
+        Box::pin(gloo_timers::future::TimeoutFuture::new(millis)),
+    )
+    .await
+    {
+        Either::Left((Ok(value), _)) => Ok(value),
+        Either::Left((Err(_), _)) => Err(RenderError::DeviceLost),
+        Either::Right(_) => Err(RenderError::Timeout { what, timeout }),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl GpuRenderer {
+    async fn prepare_filters(&mut self, surface: SurfaceId) -> Result<(), RenderError> {
+        let surface = &self.surfaces[&surface];
+        let uses: Vec<_> = surface
+            .frame
+            .filters
+            .iter()
+            .map(|(pass, id)| {
+                let Target::Scratch(depth) = surface.frame.passes[*pass].target else {
+                    unreachable!("filter captures scratch")
+                };
+                (*id, surface.scratch[depth].texture.format())
+            })
+            .collect();
+        for (id, format) in uses {
+            self.filters
+                .prepare(
+                    id,
+                    &filtrate::EffectContext {
+                        device: &self.device,
+                        queue: &self.queue,
+                        input_format: format,
+                        output_format: format,
+                    },
+                )
+                .await?;
+        }
+        Ok(())
     }
 }

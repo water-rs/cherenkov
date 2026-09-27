@@ -5,7 +5,10 @@
 //! types they carry. Everything crossing the channel is owned and `Send`;
 //! there are no locks anywhere in the engine.
 
+#[cfg(target_arch = "wasm32")]
+use crate::local::ReplySender as Sender;
 use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::mpsc::Sender;
 
 use kurbo::{Affine, Vec2};
@@ -21,7 +24,18 @@ use crate::shape::ShapeData;
 use crate::style::{BlendMode, FilterId};
 
 /// A render-thread operation a capability method or a resource drop queues.
+#[cfg(not(target_arch = "wasm32"))]
 pub type ResOp<B> = Box<dyn FnOnce(&mut <B as Backend>::Renderer) + Send>;
+/// A resource operation that stays on the creating JS thread.
+#[cfg(target_arch = "wasm32")]
+pub type ResOp<B> = Box<dyn FnOnce(&mut <B as Backend>::Renderer)>;
+#[cfg(target_arch = "wasm32")]
+/// An asynchronous resource operation on the owning JS thread.
+pub type AsyncResOp<B> = Box<
+    dyn for<'a> FnOnce(
+        &'a mut <B as Backend>::Renderer,
+    ) -> core::pin::Pin<Box<dyn core::future::Future<Output = ()> + 'a>>,
+>;
 
 /// Identifier of a surface.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -219,6 +233,9 @@ pub enum Message<B: Backend> {
     /// removal, capability hooks. Reply-carrying operations capture their
     /// `Sender` in the closure.
     Resource(ResOp<B>),
+    /// Browser operation awaiting local device work.
+    #[cfg(target_arch = "wasm32")]
+    AsyncResource(AsyncResOp<B>),
     /// Render every dirty surface for the frame at `time`, applying every
     /// surface's queued change set first.
     Render {

@@ -1121,7 +1121,6 @@ impl<'a> Lowering<'a> {
         glyphs: &GlyphContext<'_>,
         source: &cherenkov::DisplayList,
     ) -> Result<bool, RenderError> {
-        let clip = self.clip;
         let cover = self.shadow_cover(op, next);
         let hit = cache.valid
             && cache.data.as_ref().is_some_and(|e| {
@@ -1132,21 +1131,68 @@ impl<'a> Lowering<'a> {
             });
         cache.valid = true;
         if hit {
-            self.compose(cache.data.as_ref().expect("a hit has data"), storage, clip);
+            self.compose(
+                cache.data.as_ref().expect("a hit has data"),
+                storage,
+                self.clip,
+            );
             return Ok(false);
         }
+        if self.clip.is_some() {
+            self.realize_clipped_leaf(op, cover, cache, storage, glyphs, source)?;
+        } else {
+            self.realize_leaf(op, cover, cache, storage, glyphs, source)?;
+        }
+        Ok(true)
+    }
+
+    /// Clipped misses need a rollback because clipping can change draw variants.
+    /// Keep their large clip/snapshot values off the ordinary miss path.
+    fn realize_clipped_leaf(
+        &mut self,
+        op: &Op,
+        cover: Option<Cover>,
+        cache: &mut Realization<Emission>,
+        storage: &mut EmissionStorage,
+        glyphs: &GlyphContext<'_>,
+        source: &cherenkov::DisplayList,
+    ) -> Result<(), RenderError> {
         self.set_image(None);
-        let snapshot = clip.map(|_| self.frame.snapshot());
+        let snapshot = self.frame.snapshot();
+        let first_patch = self.cell_patches.len();
+        let clip = self.clip.take();
+        let result = self.realize_leaf(op, cover, cache, storage, glyphs, source);
+        self.clip = clip;
+        result?;
+        self.frame.restore(snapshot);
+        self.cell_patches.truncate(first_patch);
+        self.compose(
+            cache.data.as_ref().expect("realized leaf has data"),
+            storage,
+            clip,
+        );
+        Ok(())
+    }
+
+    fn realize_leaf(
+        &mut self,
+        op: &Op,
+        cover: Option<Cover>,
+        cache: &mut Realization<Emission>,
+        storage: &mut EmissionStorage,
+        glyphs: &GlyphContext<'_>,
+        source: &cherenkov::DisplayList,
+    ) -> Result<(), RenderError> {
+        debug_assert!(self.clip.is_none());
+        self.set_image(None);
         let first_instance = self.frame.instances.len();
         let first_stop = self.frame.stops.len();
         let first_patch = self.cell_patches.len();
         // `realize` composes path and glyph ops' local transforms into
         // `self.transform`; the leaf's placement is restored with the clip.
         let transform = self.transform;
-        self.clip = None;
         let realized = self.realize(op, cover, glyphs, source);
         self.transform = transform;
-        self.clip = clip;
         realized?;
         let stop_base = u32::try_from(first_stop).expect("stop count fits u32");
         let instance_base = u32::try_from(first_instance).expect("instance count fits u32");
@@ -1181,7 +1227,7 @@ impl<'a> Lowering<'a> {
         storage
             .stops
             .extend_from_slice(&self.frame.stops[first_stop..]);
-        let emission = Emission {
+        cache.data = Some(Emission {
             pending_cells: self.cell_patches[first_patch..]
                 .iter()
                 .map(|&(i, p, c)| (i - instance_base, p, c))
@@ -1199,14 +1245,8 @@ impl<'a> Lowering<'a> {
                 .as_ref()
                 .expect("a leaf lowers into an open pass")
                 .image,
-        };
-        if let Some(snapshot) = snapshot {
-            self.frame.restore(snapshot);
-            self.cell_patches.truncate(first_patch);
-            self.compose(&emission, storage, clip);
-        }
-        cache.data = Some(emission);
-        Ok(true)
+        });
+        Ok(())
     }
 
     /// Emits a retained leaf's instances and stops into this frame under

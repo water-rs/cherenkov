@@ -224,11 +224,11 @@ pub struct Atlas {
     /// rebuilt.
     generation: u64,
     shelves: Vec<Shelf>,
-    map: HashMap<GlyphKey, Entry>,
+    map: rustc_hash::FxHashMap<GlyphKey, Entry>,
     /// Rasterized path emissions, keyed by content hash.
-    paths: HashMap<u64, PathEmit>,
+    paths: rustc_hash::FxHashMap<u64, PathEmit>,
     /// Rasterized path-clip masks, keyed by content hash.
-    masks: HashMap<u64, MaskCell>,
+    masks: rustc_hash::FxHashMap<u64, MaskCell>,
     /// Sum of cell texels, an approximation of the CPU cache size.
     cpu_bytes: u64,
 }
@@ -254,9 +254,9 @@ impl Atlas {
             cap,
             generation: 0,
             shelves: Vec::new(),
-            map: HashMap::new(),
-            paths: HashMap::new(),
-            masks: HashMap::new(),
+            map: rustc_hash::FxHashMap::default(),
+            paths: rustc_hash::FxHashMap::default(),
+            masks: rustc_hash::FxHashMap::default(),
             cpu_bytes: 0,
         }
     }

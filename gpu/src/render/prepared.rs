@@ -572,6 +572,7 @@ impl cherenkov::lowering::Compiler for Lowerer<'_> {
         self.draw_at(command, ambient, ops, None)
     }
 
+    #[inline]
     fn draw_at(
         &mut self,
         command: &Command,
@@ -626,6 +627,7 @@ impl cherenkov::lowering::Compiler for Lowerer<'_> {
 impl Lowerer<'_> {
     /// `Fill`: a shaped quad; a path goes through the coverage
     /// rasterizer.
+    #[inline]
     fn fill(
         &self,
         ambient: Affine,
@@ -704,6 +706,7 @@ impl Lowerer<'_> {
     /// `Stroke`: offset strokes for circular-corner boxes, distance
     /// strokes for continuous corners and ellipses, a box fast path for
     /// lines; paths and dashed strokes become `Outline::Stroke`.
+    #[inline]
     fn stroke(
         &self,
         ambient: Affine,

@@ -199,7 +199,7 @@ pub struct PaintData {
     /// `extend_x | extend_y << 4 | sampling << 8`.
     pub packed: u32,
     /// The bound image for `PAINT_IMAGE`.
-    pub image: Option<u64>,
+    pub image: Option<super::lower::ImageSource>,
 }
 
 /// Resolved solid paint stays inline. Gradient and image fields are only
@@ -337,7 +337,7 @@ fn paint_data(
             data.packed = extend_code(pattern.extend_x)
                 | (extend_code(pattern.extend_y) << 4)
                 | (sampling << 8);
-            data.image = Some(pattern.image.raw());
+            data.image = Some(super::lower::ImageSource::Registered(pattern.image.raw()));
         }
         Paint::Shader(_) => return Err(RenderError::Unsupported(names::SHADER)),
     }

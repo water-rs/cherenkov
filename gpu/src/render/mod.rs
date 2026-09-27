@@ -5,6 +5,7 @@
 
 mod colr;
 mod glyph;
+mod gpu_content;
 mod instance;
 mod lower;
 mod path;
@@ -110,7 +111,6 @@ struct ScratchTarget {
 /// A GPU-resident image registered with the engine.
 pub struct GpuImage {
     /// The texture holding premultiplied linear-P3 f16 texels.
-    #[expect(dead_code, reason = "the texture keeps the view alive")]
     pub texture: wgpu::Texture,
     /// Its view for bind group 1.
     pub view: wgpu::TextureView,
@@ -138,6 +138,7 @@ struct SurfaceState {
     /// format, index 1 the scratch format.
     backdrop: [Option<ScratchTarget>; 2],
     layers: HashMap<LayerId, ContentData>,
+    content: HashMap<LayerId, gpu_content::Slot>,
     frame: LoweredFrame,
     /// This frame's offsets into the shared buffers: instances and globals
     /// (256-byte slots) are laid out surface by surface so one upload covers
@@ -149,12 +150,21 @@ struct SurfaceState {
     bind_gen: u64,
     /// Group-1 bind groups keyed by `(source scratch, backdrop, image)`,
     /// reused across frames while `binds1_stamp` is current.
-    binds1: HashMap<(Option<usize>, bool, Option<u64>), wgpu::BindGroup>,
+    binds1: HashMap<(Option<usize>, bool, Option<lower::ImageSource>), wgpu::BindGroup>,
     /// The `(bind_gen, images_gen)` pair `binds1` was built under.
     binds1_stamp: (u64, u64),
 }
 
 impl SurfaceState {
+    fn content_wants_redraw(&self) -> bool {
+        !self.content.is_empty()
+            && self.frame.content.iter().any(|id| {
+                self.content
+                    .get(id)
+                    .is_some_and(gpu_content::Slot::wants_redraw)
+            })
+    }
+
     /// Bytes held by this surface's textures.
     fn gpu_bytes(&self) -> u64 {
         let surface_bytes = u64::from(self.size.0) * u64::from(self.size.1) * 8;
@@ -180,7 +190,15 @@ impl SurfaceState {
                     .map(|b| u64::from(b.width) * u64::from(b.height) * texel)
             })
             .sum();
-        surface_bytes + scratch_bytes + backdrop_bytes
+        surface_bytes
+            + scratch_bytes
+            + backdrop_bytes
+            + self
+                .content
+                .values()
+                .filter_map(|slot| slot.image.as_ref())
+                .map(|image| u64::from(image.width) * u64::from(image.height) * 8)
+                .sum::<u64>()
     }
 }
 
@@ -965,6 +983,7 @@ impl Renderer for GpuRenderer {
                 scratch: Vec::new(),
                 backdrop: [None, None],
                 layers: HashMap::new(),
+                content: HashMap::new(),
                 frame: LoweredFrame::default(),
                 inst_base: 0,
                 globals_base: 0,
@@ -1038,6 +1057,9 @@ impl Renderer for GpuRenderer {
         let Some(state) = self.surfaces.get_mut(&surface) else {
             return;
         };
+        if state.content.remove(&layer).is_some() {
+            state.binds1.clear();
+        }
         match content {
             Some(ContentOp::Replace(list)) => {
                 if let Some(content) = state.layers.get_mut(&layer) {
@@ -1065,6 +1087,9 @@ impl Renderer for GpuRenderer {
     fn remove_layer(&mut self, surface: SurfaceId, layer: LayerId) {
         if let Some(state) = self.surfaces.get_mut(&surface) {
             state.layers.remove(&layer);
+            if state.content.remove(&layer).is_some() {
+                state.binds1.clear();
+            }
         }
     }
 
@@ -1264,7 +1289,11 @@ impl Renderer for GpuRenderer {
 
     fn render(&mut self, frame: &Frame<'_>, stats: &mut FrameStats) -> Result<Redraw, RenderError> {
         stats.timings = self.drain_timestamps();
-        let dirty: Vec<_> = frame.surfaces.iter().filter(|sf| sf.changed).collect();
+        let dirty: Vec<_> = frame
+            .surfaces
+            .iter()
+            .filter(|sf| sf.changed || self.surfaces[&sf.id].content_wants_redraw())
+            .collect();
         if dirty.is_empty() {
             return self.present_windows(frame);
         }
@@ -1314,6 +1343,29 @@ impl Renderer for GpuRenderer {
             "frame lowered"
         );
         if result.is_ok() {
+            for sf in &dirty {
+                let surface = self.surfaces.get_mut(&sf.id).expect("registered surface");
+                for (id, slot) in &mut surface.content {
+                    slot.set_active(surface.frame.content.contains(id));
+                }
+                for id in &surface.frame.content {
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "validated display scale fits f32"
+                    )]
+                    surface
+                        .content
+                        .get_mut(id)
+                        .expect("composed GPU content")
+                        .render(
+                            &self.adapter,
+                            &self.device,
+                            &self.queue,
+                            frame.time.0,
+                            sf.display.scale as f32,
+                        )?;
+                }
+            }
             let t = Instant::now();
             for sf in &dirty {
                 self.encode_surface(sf.id, stats);
@@ -1329,7 +1381,8 @@ impl Renderer for GpuRenderer {
             }
         }
         result?;
-        self.present_windows(frame)
+        let present = self.present_windows(frame)?;
+        Ok(self.requested_redraw(present))
     }
 
     /// Waits for the GPU to finish every pending frame and returns their
@@ -1429,6 +1482,55 @@ impl Renderer for GpuRenderer {
 }
 
 impl GpuRenderer {
+    fn requested_redraw(&self, present: Redraw) -> Redraw {
+        let mut rate = match present {
+            Redraw::None => None,
+            Redraw::Wanted { rate } => Some(rate),
+        };
+        for surface in self.surfaces.values() {
+            if surface.content_wants_redraw() {
+                rate = Some(rate.map_or_else(
+                    || surface.refresh.clone(),
+                    |rate| {
+                        (*rate.start()).min(*surface.refresh.start())
+                            ..=(*rate.end()).max(*surface.refresh.end())
+                    },
+                ));
+            }
+        }
+        rate.map_or(Redraw::None, |rate| Redraw::Wanted { rate })
+    }
+
+    pub(crate) fn set_gpu_content(
+        &mut self,
+        surface: SurfaceId,
+        layer: LayerId,
+        size: (u32, u32),
+        content: crate::interop::GpuContentBox,
+    ) {
+        let state = self.surfaces.get_mut(&surface).expect("GPU surface exists");
+        state.layers.remove(&layer);
+        state
+            .content
+            .insert(layer, gpu_content::Slot::new(content, size));
+        state.binds1.clear();
+    }
+
+    pub(crate) fn resize_gpu_content(
+        &mut self,
+        surface: SurfaceId,
+        layer: LayerId,
+        size: (u32, u32),
+    ) {
+        let state = self.surfaces.get_mut(&surface).expect("GPU surface exists");
+        state
+            .content
+            .get_mut(&layer)
+            .expect("layer has GPU content")
+            .resize(size);
+        state.binds1.clear();
+    }
+
     fn present_windows(&mut self, frame: &Frame<'_>) -> Result<Redraw, RenderError> {
         let Some(presenter) = &mut self.presenter else {
             return Ok(Redraw::None);
@@ -1552,6 +1654,7 @@ impl GpuRenderer {
                 atlas,
                 fonts,
                 images,
+                content: &surf.content,
             };
             let mut lowering = Lowering::new(&mut surf.frame, surf.size);
             let result = lowering.run(frame.tree, &mut layers, frame.clear, &glyphs);
@@ -1565,6 +1668,8 @@ impl GpuRenderer {
             result
         };
         surf.layers = layers;
+        surf.frame.content.sort_unstable_by_key(|id| id.raw());
+        surf.frame.content.dedup();
         result.map(|()| lowered)
     }
 
@@ -2090,9 +2195,18 @@ impl GpuRenderer {
                             &self.dummy_view,
                             range.source.map(|i| &surf.scratch[i].view),
                             backdrop,
-                            range
-                                .image
-                                .and_then(|id| self.images.get(&id).map(|i| &i.view)),
+                            range.image.and_then(|source| match source {
+                                lower::ImageSource::Registered(id) => {
+                                    self.images.get(&id).map(|image| &image.view)
+                                }
+                                lower::ImageSource::Content(layer) => Some(
+                                    &surf.content[&layer]
+                                        .image
+                                        .as_ref()
+                                        .expect("rendered content")
+                                        .view,
+                                ),
+                            }),
                         ))
                     }
                 };

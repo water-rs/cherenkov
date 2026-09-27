@@ -60,6 +60,14 @@ pub trait Effects: Filters {
 pub trait GpuContent: Backend {
     /// The content payload type.
     type Content: Send + 'static;
+    /// Resizes an installed producer's attachment without repeating setup.
+    /// Called in transaction order; the layer must contain GPU content.
+    fn resize_gpu_content(
+        r: &mut Self::Renderer,
+        surface: SurfaceId,
+        layer: LayerId,
+        size: (u32, u32),
+    );
     /// Attaches GPU content to a layer.
     fn set_gpu_content(
         r: &mut Self::Renderer,

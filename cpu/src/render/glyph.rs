@@ -84,6 +84,14 @@ impl GlyphCache {
         self.bytes
     }
 
+    /// Resize the cache allowance after registered image residency changes.
+    pub fn set_budget(&mut self, budget: u64) {
+        self.budget = budget;
+        if self.bytes > budget {
+            self.clear();
+        }
+    }
+
     /// Drops every cached mask (`Trim(Critical)` or an over-budget
     /// batch insert, like the GPU atlas's flush-everything policy).
     pub fn clear(&mut self) {
@@ -95,18 +103,66 @@ impl GlyphCache {
     /// When the batch would push the cache over budget, everything is
     /// evicted first.
     pub fn insert_batch(&mut self, masks: Vec<(GlyphKey, Arc<GlyphMask>)>) {
-        let batch: u64 = masks
-            .iter()
-            .map(|(_, m)| u64::from(m.w) * u64::from(m.h) * 4)
-            .sum();
-        if self.bytes + batch > self.budget {
-            self.clear();
-        }
         for (key, mask) in masks {
-            self.bytes += u64::from(mask.w) * u64::from(mask.h) * 4;
+            if self.map.contains_key(&key) {
+                continue;
+            }
+            let bytes = u64::from(mask.w) * u64::from(mask.h) * 4;
+            if bytes > self.budget {
+                continue;
+            }
+            if bytes > self.budget.saturating_sub(self.bytes) {
+                self.clear();
+            }
+            self.bytes += bytes;
             self.map.insert(key, mask);
         }
     }
+}
+
+/// Unhinted outlines in run coordinates for semantic glyph strokes.
+/// Strokes use the font's outline, including on COLR fonts; palette paint
+/// graphs apply only to filled glyphs. Missing outlines are explicit errors.
+pub fn stroke_outlines(
+    font: &FontData,
+    run: &cherenkov::GlyphRun,
+) -> Result<Vec<kurbo::BezPath>, RenderError> {
+    let font_ref = skrifa::FontRef::from_index(&font.data, font.index)
+        .map_err(|e| RenderError::Font(e.to_string()))?;
+    let upem = font_ref
+        .head()
+        .map_err(|e| RenderError::Font(e.to_string()))?
+        .units_per_em();
+    if upem == 0 {
+        return Err(RenderError::Font("zero units_per_em".into()));
+    }
+    let scale = f64::from(run.size) / f64::from(upem);
+    let coords: Vec<F2Dot14> = run.coords.iter().map(|c| F2Dot14::from_bits(*c)).collect();
+    let outlines = font_ref.outline_glyphs();
+    let mut paths = Vec::with_capacity(run.glyphs.len());
+    for glyph in &run.glyphs {
+        let outline = outlines
+            .get(skrifa::GlyphId::new(glyph.id))
+            .ok_or_else(|| {
+                RenderError::Font(format!("glyph {} has no stroke outline", glyph.id))
+            })?;
+        let mut pen = PathPen {
+            path: kurbo::BezPath::new(),
+        };
+        outline
+            .draw(
+                DrawSettings::unhinted(
+                    skrifa::instance::Size::unscaled(),
+                    skrifa::instance::LocationRef::new(&coords),
+                ),
+                &mut pen,
+            )
+            .map_err(|e| RenderError::Font(format!("glyph {}: {e}", glyph.id)))?;
+        let placement = Affine::translate((f64::from(glyph.x), f64::from(glyph.y)))
+            * Affine::scale_non_uniform(scale, -scale);
+        paths.push(placement * pen.path);
+    }
+    Ok(paths)
 }
 
 /// The cache key for a glyph at a quantized device position — the same
@@ -291,4 +347,34 @@ pub fn rasterize_mask(font: &FontData, req: &GlyphReq) -> Result<GlyphMask, Rend
         h: h as u32,
         cov,
     })
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    #[test]
+    fn duplicate_and_oversized_masks_do_not_inflate_cache_bytes() {
+        let run = GlyphRun {
+            font: cherenkov::FontId::new(1),
+            size: 12.0,
+            coords: vec![],
+            glyphs: vec![],
+            style: cherenkov::GlyphStyle::Fill,
+        };
+        let key = glyph_key(&run, 1, (0.0, 0.0), Affine::IDENTITY);
+        let mask = Arc::new(GlyphMask {
+            left: 0,
+            top: 0,
+            w: 2,
+            h: 2,
+            cov: vec![1.0; 4],
+        });
+        let mut cache = GlyphCache::new(16);
+        cache.insert_batch(vec![(key, mask.clone()), (key, mask.clone())]);
+        assert_eq!(cache.bytes(), 16);
+        cache.set_budget(8);
+        assert_eq!(cache.bytes(), 0);
+        cache.insert_batch(vec![(key, mask)]);
+        assert_eq!(cache.bytes(), 0);
+    }
 }

@@ -99,6 +99,8 @@ pub enum Item {
     PopIsolate {
         /// The opacity multiplier.
         opacity: f32,
+        /// Group compositing mode and working space.
+        blend: (BlendMode, cherenkov::BlendSpace),
         /// The clip in force at the pop.
         clip: Option<ClipRef>,
     },
@@ -421,9 +423,12 @@ impl<'a> Lowering<'a> {
         &mut self,
         tree: &SurfaceTree,
         caches: &mut HashMap<LayerId, ContentData>,
+        images: &HashMap<u64, Arc<super::image::CpuImage>>,
+        fonts: &HashMap<u64, cherenkov::FontData>,
     ) -> Result<(), RenderError> {
         for content in caches.values_mut() {
-            self.commands_lowered += content.prepare(&mut super::prepared::Lowerer)?;
+            self.commands_lowered +=
+                content.prepare(&mut super::prepared::Lowerer { images, fonts })?;
         }
         self.layer(tree.root(), tree, caches)
     }
@@ -509,6 +514,7 @@ impl<'a> Lowering<'a> {
     fn isolate(
         &mut self,
         opacity: f32,
+        blend: (BlendMode, cherenkov::BlendSpace),
         inner_clip: Option<ClipRef>,
         outer_clip: Option<ClipRef>,
         body: impl FnOnce(&mut Self) -> Result<(), RenderError>,
@@ -519,6 +525,7 @@ impl<'a> Lowering<'a> {
         self.clip = saved;
         self.items.push(Item::PopIsolate {
             opacity,
+            blend,
             clip: outer_clip,
         });
         result
@@ -535,9 +542,6 @@ impl<'a> Lowering<'a> {
         caches: &mut HashMap<LayerId, ContentData>,
     ) -> Result<(), RenderError> {
         let node = tree.layer(id);
-        if node.blend != BlendMode::Normal {
-            return Err(RenderError::Unsupported(names::BLEND));
-        }
         if node.filter.is_some() {
             return Err(RenderError::Unsupported(names::FILTER));
         }
@@ -549,11 +553,15 @@ impl<'a> Lowering<'a> {
         let content_space = saved * node.content_transform();
         let result = self.with_clip(node.clip.as_ref(), |s| {
             s.transform = content_space;
-            if node.opacity < 1.0 {
+            if node.opacity < 1.0 || node.blend != BlendMode::Normal {
                 let outer = s.clip.clone();
-                s.isolate(node.opacity, s.clip.clone(), outer, |s| {
-                    s.layer_items(id, node, tree, caches)
-                })
+                s.isolate(
+                    node.opacity,
+                    (node.blend, cherenkov::BlendSpace::Linear),
+                    s.clip.clone(),
+                    outer,
+                    |s| s.layer_items(id, node, tree, caches),
+                )
             } else {
                 s.layer_items(id, node, tree, caches)
             }
@@ -605,9 +613,14 @@ impl<'a> Lowering<'a> {
                     self.transform = saved;
                     i = *end as usize;
                 }
-                Op::BeginIsolate { opacity, end } => {
+                Op::BeginIsolate {
+                    opacity,
+                    blend,
+                    space,
+                    end,
+                } => {
                     let clip = self.clip.clone();
-                    self.isolate(*opacity, clip.clone(), clip, |s| {
+                    self.isolate(*opacity, (*blend, *space), clip.clone(), clip, |s| {
                         changed |= s.ops(ops, emissions, i + 1, *end as usize)?;
                         Ok(())
                     })?;

@@ -20,7 +20,9 @@ impl Bytes {
 pub struct Budget {
     /// Device-side memory (buffers, textures, the glyph atlas).
     pub gpu: Bytes,
-    /// CPU-side memory (the rasterized glyph cache).
+    /// CPU-side resident image and rasterized glyph cache budget.
+    /// This bounds cache residency, not total process memory; surface framebuffers
+    /// and active retained frame data are not evictable caches.
     pub cpu: Bytes,
 }
 

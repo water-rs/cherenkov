@@ -249,7 +249,7 @@ fn batched_hashes_preserve_every_stroke_field_and_path_verb() {
         let actual = placement(content, transform, surface);
         let expected = reference::placement(content, transform, surface);
         assert_eq!(
-            (actual.key, actual.key_exact),
+            (actual.key, actual.key_exact()),
             (expected.key, expected.key_exact)
         );
         assert_eq!(

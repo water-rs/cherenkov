@@ -474,14 +474,26 @@ fn hash_elements_into(hasher: &mut impl Hasher, elements: &[PathEl]) {
 pub struct Placement {
     /// Cache key: content hash + matrix + quantized subpixel + surface.
     pub key: u64,
-    /// `key` plus the integer translation: coverage clipped by the
-    /// surface is only valid at this offset.
-    pub key_exact: u64,
     /// The transform to rasterize under: the true 2x2 and the translation
     /// snapped to the 1/4 px grid.
     pub raster: Affine,
     /// The integer translation the cache's stored rects are relative to.
     pub offset: Vec2,
+}
+
+impl Placement {
+    /// Offset-specific identity is only needed after the translation-independent
+    /// lookup misses, or for coverage clipped by the surface.
+    #[expect(clippy::cast_possible_truncation)]
+    pub fn key_exact(self) -> u64 {
+        let mut bytes = [0; 24];
+        bytes[..8].copy_from_slice(&self.key.to_ne_bytes());
+        bytes[8..16].copy_from_slice(&(self.offset.x as i64).to_ne_bytes());
+        bytes[16..].copy_from_slice(&(self.offset.y as i64).to_ne_bytes());
+        let mut hasher = DefaultHasher::new();
+        hasher.write(&bytes);
+        hasher.finish()
+    }
 }
 
 /// Builds the [`Placement`] for a draw under `transform` on a
@@ -511,15 +523,8 @@ pub fn placement(content_hash: u64, transform: Affine, surface: (u32, u32)) -> P
     let mut hasher = DefaultHasher::new();
     hasher.write(&bytes);
     let key = hasher.finish();
-    let mut bytes = [0; 24];
-    bytes[..8].copy_from_slice(&key.to_ne_bytes());
-    bytes[8..16].copy_from_slice(&(ix as i64).to_ne_bytes());
-    bytes[16..].copy_from_slice(&(iy as i64).to_ne_bytes());
-    let mut hasher = DefaultHasher::new();
-    hasher.write(&bytes);
     Placement {
         key,
-        key_exact: hasher.finish(),
         raster: Affine::new([a, b, c, d, ix + qx, iy + qy]),
         offset: Vec2::new(ix, iy),
     }

@@ -306,6 +306,7 @@ impl ContentData {
         self.retained.replace(list);
         self.storage.instances.clear();
         self.storage.stops.clear();
+        self.storage.templates.clear();
     }
 
     pub fn picture(list: cherenkov::Picture) -> Self {
@@ -333,6 +334,7 @@ impl ContentData {
 /// A layer's device data. Leaf ranges remain independent for dirty updates.
 #[derive(Default)]
 pub struct EmissionStorage {
+    templates: Vec<Instance>,
     pub(crate) instances: Vec<RetainedInstance>,
     stops: Vec<Stop>,
 }
@@ -340,23 +342,29 @@ pub struct EmissionStorage {
 impl EmissionStorage {
     /// Reclaim obsolete ranges after patches without rebuilding valid leaves.
     fn compact(&mut self, emissions: &mut [Realization<Emission>]) {
-        if self.instances.is_empty() && self.stops.is_empty() {
+        if self.templates.is_empty() {
             return;
         }
-        let (instances, stops) = emissions
+        let (instances, stops, templates) = emissions
             .iter()
             .filter_map(|e| e.data.as_ref())
-            .fold((0, 0), |(i, s), e| {
-                (i + e.instances.len(), s + e.stops.len())
+            .fold((0, 0, 0), |(i, s, t), e| {
+                (i + e.instances.len(), s + e.stops.len(), t + 1)
             });
-        if self.instances.len() <= instances * 2 && self.stops.len() <= stops * 2 {
+        if self.instances.len() <= instances * 2
+            && self.stops.len() <= stops * 2
+            && self.templates.len() <= templates * 2
+        {
             return;
         }
         let mut storage = Self {
+            templates: Vec::with_capacity(templates),
             instances: Vec::with_capacity(instances),
             stops: Vec::with_capacity(stops),
         };
         for e in emissions.iter_mut().filter_map(|e| e.data.as_mut()) {
+            storage.templates.push(self.templates[e.template]);
+            e.template = storage.templates.len() - 1;
             let first = storage.instances.len();
             storage
                 .instances
@@ -396,7 +404,7 @@ impl RetainedInstance {
 /// Per-operation device output under its sampled placement.
 pub struct Emission {
     pub(crate) pending_cells: Vec<(u32, u32, u32)>,
-    template: Instance,
+    template: usize,
     cover: Option<Cover>,
     transform: Affine,
     size: [f32; 2],
@@ -1144,12 +1152,14 @@ impl<'a> Lowering<'a> {
         let instance_base = u32::try_from(first_instance).expect("instance count fits u32");
         let retained_instance = storage.instances.len();
         let retained_stop = storage.stops.len();
-        let template = self
-            .frame
-            .instances
-            .get(first_instance)
-            .copied()
-            .unwrap_or_else(|| Instance::new(0));
+        let template = storage.templates.len();
+        if first_instance < self.frame.instances.len() {
+            storage
+                .templates
+                .extend_from_slice(&self.frame.instances[first_instance..=first_instance]);
+        } else {
+            storage.templates.push(Instance::new(0));
+        }
         storage
             .instances
             .extend(self.frame.instances[first_instance..].iter().map(|inst| {
@@ -1161,7 +1171,10 @@ impl<'a> Lowering<'a> {
                 };
                 // Keep this invariant checked as new leaf emitters are added. Stop
                 // indices without gradients are unused but preserve their input too.
-                let restored = retained.restore(&template, inst.meta[2] - retained.first_stop);
+                let restored = retained.restore(
+                    &storage.templates[template],
+                    inst.meta[2] - retained.first_stop,
+                );
                 debug_assert_eq!(bytemuck::bytes_of(&restored), bytemuck::bytes_of(inst));
                 retained
             }));
@@ -1212,7 +1225,7 @@ impl<'a> Lowering<'a> {
         let instance_base =
             u32::try_from(self.frame.instances.len()).expect("instance count fits u32");
         for inst in &storage.instances[emission.instances.clone()] {
-            let mut inst = inst.restore(&emission.template, offset);
+            let mut inst = inst.restore(&storage.templates[emission.template], offset);
             Self::apply_clip(&mut inst, clip);
             self.push_instance(&inst);
         }
@@ -1526,7 +1539,7 @@ impl<'a> Lowering<'a> {
         if let Some(emit) = glyphs
             .atlas
             .path(pl.key)
-            .or_else(|| glyphs.atlas.path(pl.key_exact))
+            .or_else(|| glyphs.atlas.path(pl.key_exact()))
         {
             self.replay(emit, None, pl.offset, paint);
             return Ok(());
@@ -1545,7 +1558,7 @@ impl<'a> Lowering<'a> {
                 // exact key.
                 let pending = u32::try_from(self.pending.len()).expect("pending count fits u32");
                 self.pending.push(PendingRaster::Path {
-                    key: pl.key_exact,
+                    key: pl.key_exact(),
                     emit: PathEmit::default(),
                     cells: Vec::new(),
                 });
@@ -1557,7 +1570,7 @@ impl<'a> Lowering<'a> {
             // stored record keeps that frame.
             let stored = emit.translated(-pl.offset.x, -pl.offset.y);
             let key = if coverage.clipped {
-                pl.key_exact
+                pl.key_exact()
             } else {
                 pl.key
             };
@@ -1590,34 +1603,60 @@ impl<'a> Lowering<'a> {
         template.meta[1] = paint.kind;
         template.meta[2] = paint.first_stop;
         template.meta[3] |= paint.packed & 0x00ff_ffff;
-        for rect in &emit.spans {
-            let mut inst = template;
+        self.replay_quads(
+            &template,
+            emit.spans.iter().map(|rect| (*rect, [0.0; 2])),
+            offset,
+        );
+        template.meta[0] = KIND_GLYPH;
+        let first = self.frame.instances.len();
+        self.replay_quads(
+            &template,
+            emit.cells
+                .iter()
+                .map(|cell| (cell.rect, [f32::from(cell.x), f32::from(cell.y)])),
+            offset,
+        );
+        if let Some(pending) = pending {
+            self.cell_patches.extend((0..emit.cells.len()).map(|i| {
+                (
+                    u32::try_from(first + i).expect("instance index fits u32"),
+                    pending,
+                    u32::try_from(i).expect("cell index fits u32"),
+                )
+            }));
+        }
+    }
+
+    /// All quads in a path group share paint, clip and shader variant. Reserve
+    /// and segment once, then write their instances directly into the frame.
+    fn replay_quads(
+        &mut self,
+        template: &Instance,
+        quads: impl ExactSizeIterator<Item = ([f32; 4], [f32; 2])>,
+        offset: Vec2,
+    ) {
+        if quads.len() == 0 {
+            return;
+        }
+        self.set_variant(variant_of(template));
+        let first = self.frame.instances.len();
+        self.frame.instances.extend(quads.map(|(rect, uv)| {
+            let mut inst = *template;
             inst.bounds = [
                 f32_f64(f64::from(rect[0]) + offset.x),
                 f32_f64(f64::from(rect[1]) + offset.y),
                 f32_f64(f64::from(rect[2]) + offset.x),
                 f32_f64(f64::from(rect[3]) + offset.y),
             ];
-            self.push_instance(&inst);
-        }
-        template.meta[0] = KIND_GLYPH;
-        for (i, cell) in emit.cells.iter().enumerate() {
-            let mut inst = template;
-            inst.bounds = [
-                f32_f64(f64::from(cell.rect[0]) + offset.x),
-                f32_f64(f64::from(cell.rect[1]) + offset.y),
-                f32_f64(f64::from(cell.rect[2]) + offset.x),
-                f32_f64(f64::from(cell.rect[3]) + offset.y),
-            ];
-            inst.uv = [f32::from(cell.x), f32::from(cell.y), inst.uv[2], inst.uv[3]];
-            self.push_instance(&inst);
-            if let Some(pending) = pending {
-                self.cell_patches.push((
-                    u32::try_from(self.frame.instances.len() - 1).expect("instance index fits u32"),
-                    pending,
-                    u32::try_from(i).expect("cell index fits u32"),
-                ));
-            }
+            inst.uv[..2].copy_from_slice(&uv);
+            inst
+        }));
+        if let Some(ClipMask::Pending(_, pending)) = self.clip.and_then(|c| c.mask) {
+            self.mask_patches.extend(
+                (first..self.frame.instances.len())
+                    .map(|i| (u32::try_from(i).expect("instance index fits u32"), pending)),
+            );
         }
     }
 
@@ -1640,7 +1679,7 @@ impl<'a> Lowering<'a> {
             if let Some(mask) = glyphs
                 .atlas
                 .mask(pl.key)
-                .or_else(|| glyphs.atlas.mask(pl.key_exact))
+                .or_else(|| glyphs.atlas.mask(pl.key_exact()))
             {
                 break 'stored ClipMask::Cell(*mask);
             }
@@ -1665,7 +1704,7 @@ impl<'a> Lowering<'a> {
                 .map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8)
                 .collect();
             let key = if coverage.clipped {
-                pl.key_exact
+                pl.key_exact()
             } else {
                 pl.key
             };

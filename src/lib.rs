@@ -45,7 +45,10 @@ pub mod testing;
 
 pub use kurbo;
 
-pub use crate::animation::{Animatable, Animation, Curve, Decay, Lanes, Spring};
+pub use crate::animation::{
+    Animatable, Animation, Curve, Decay, Lanes, Spring, curve_value, decay_step, settled,
+    spring_step,
+};
 pub use crate::backend::{Backend, Display, Frame, Redraw, Renderer, SurfaceFrame, SurfaceInfo};
 pub use crate::capability::{
     Backdrop, Effects, ExternalFrames, Filters, GpuContent, HdrOutput, Planes, Runs,
@@ -62,8 +65,8 @@ pub use crate::display_list::{
 pub use crate::engine::Engine;
 pub use crate::error::{EngineError, RenderError, ResourceError, SurfaceError};
 pub use crate::frame::{
-    FrameId, FrameStats, FrameTime, FrameTiming, Next, Offscreen, OffscreenFormat, PassTiming,
-    Phases, Readback, RefreshRange,
+    DEFAULT_REFRESH, FrameId, FrameStats, FrameTime, FrameTiming, Next, Offscreen, OffscreenFormat,
+    PassTiming, Phases, Readback, RefreshRange,
 };
 pub use crate::glyph::{FontId, Glyph, GlyphRun, GlyphStyle};
 pub use crate::image::{

@@ -183,7 +183,7 @@ const fn fill_tag(rule: FillRule) -> u64 {
 }
 
 /// The paint data shared by every instance kind.
-#[derive(Clone, Default)]
+#[derive(Clone, Copy, Default)]
 pub struct PaintData {
     /// `PAINT_*`.
     pub kind: u32,
@@ -198,7 +198,8 @@ pub struct PaintData {
     /// `count | interp << 16 | extend << 20`; for `PAINT_IMAGE`,
     /// `extend_x | extend_y << 4 | sampling << 8`.
     pub packed: u32,
-    /// The bound image for `PAINT_IMAGE`.
+    /// A registered image ID. Shader identities belong to the emitted range,
+    /// keeping ordinary paint fields trivially copyable.
     pub image: Option<u64>,
 }
 
@@ -210,6 +211,8 @@ pub enum ResolvedPaint {
     Solid([f32; 4]),
     /// Gradient/image shader fields and their stop buffer.
     Resources(Box<(PaintData, Vec<Stop>)>),
+    /// Deferred until device scale and full shape bounds are known.
+    Shader(Box<cherenkov::ShaderPaint>),
 }
 
 /// sRGB-encodes one channel, preserving sign.
@@ -347,6 +350,7 @@ fn paint_data(
 /// Resolves `paint` device-independently; `to_local` is the
 /// instance-local transform the shader paints in (the boxed `extra`
 /// inverse, or identity for device-space replay).
+#[inline]
 fn resolve(
     paint: &Paint,
     to_local: Affine,
@@ -354,6 +358,19 @@ fn resolve(
 ) -> Result<ResolvedPaint, RenderError> {
     if let Paint::Solid(color) = paint {
         return Ok(ResolvedPaint::Solid(color.components));
+    }
+    resolve_resources(paint, to_local, images)
+}
+
+/// Keep allocation and shader ownership out of solid paint preparation.
+#[inline(never)]
+fn resolve_resources(
+    paint: &Paint,
+    to_local: Affine,
+    images: &HashMap<u64, GpuImage>,
+) -> Result<ResolvedPaint, RenderError> {
+    if let Paint::Shader(shader) = paint {
+        return Ok(ResolvedPaint::Shader(Box::new(shader.clone())));
     }
     let mut stops = Vec::new();
     let data = paint_data(paint, to_local, &mut stops, images)?;
@@ -520,6 +537,8 @@ pub enum Op {
         opacity: f32,
         /// The group blend mode.
         blend: BlendMode,
+        /// Filter over the captured group.
+        filter: Option<cherenkov::FilterId>,
         /// Op index of the matching `End` op.
         end: u32,
     },
@@ -608,18 +627,17 @@ impl cherenkov::lowering::Compiler for Lowerer<'_> {
         })
     }
     fn group(&mut self, group: &cherenkov::Group) -> Result<Option<Op>, RenderError> {
-        if group.filter.is_some() {
-            return Err(RenderError::Unsupported(names::FILTER));
-        }
         if group.blend_space != BlendSpace::Linear {
             return Err(RenderError::Unsupported(names::BLEND_SPACE));
         }
         Ok(
-            (group.opacity < 1.0 || group.blend != BlendMode::Normal).then_some(Op::BeginIsolate {
-                opacity: group.opacity,
-                blend: group.blend,
-                end: 0,
-            }),
+            (group.filter.is_some() || group.opacity < 1.0 || group.blend != BlendMode::Normal)
+                .then_some(Op::BeginIsolate {
+                    opacity: group.opacity,
+                    blend: group.blend,
+                    filter: group.filter,
+                    end: 0,
+                }),
         )
     }
     fn end(&mut self) -> Op {

@@ -59,13 +59,21 @@ pub enum ShaderVariant {
     Full,
 }
 
+/// A texture identity scoped to its resource owner.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ImageSource {
+    Registered(u64),
+    Content(LayerId),
+    Shader(std::sync::Arc<super::paint::Key>),
+}
+
 /// One draw call's instance range and bound source texture.
 #[derive(Clone, Debug)]
 pub struct DrawRange {
     /// The scratch texture bound as group 1, `None` for the dummy texture.
     pub source: Option<usize>,
     /// The image texture bound for `PAINT_IMAGE` instances.
-    pub image: Option<u64>,
+    pub image: Option<ImageSource>,
     /// The pipeline variant this range draws with.
     pub pipeline: PipelineKind,
     /// The fragment-shader variant this range draws with.
@@ -101,6 +109,8 @@ pub struct Frame {
     pub stops: Vec<Stop>,
     /// Passes in submission order.
     pub passes: Vec<Pass>,
+    pub content: Vec<LayerId>,
+    pub filters: Vec<(usize, u64)>,
     open: Option<OpenPass>,
 }
 
@@ -109,7 +119,7 @@ struct OpenPass {
     target: Target,
     clear: Option<[f32; 4]>,
     source: Option<usize>,
-    image: Option<u64>,
+    image: Option<ImageSource>,
     pipeline: PipelineKind,
     variant: ShaderVariant,
     backdrop_copy: Option<[u32; 4]>,
@@ -123,6 +133,7 @@ struct FrameSnapshot {
     instances: usize,
     stops: usize,
     passes: usize,
+    filters: usize,
     open: Option<OpenPass>,
 }
 
@@ -133,6 +144,7 @@ impl Frame {
             instances: self.instances.len(),
             stops: self.stops.len(),
             passes: self.passes.len(),
+            filters: self.filters.len(),
             open: self.open.clone(),
         }
     }
@@ -142,6 +154,7 @@ impl Frame {
         self.instances.truncate(snap.instances);
         self.stops.truncate(snap.stops);
         self.passes.truncate(snap.passes);
+        self.filters.truncate(snap.filters);
         self.open = snap.open;
     }
 }
@@ -152,6 +165,8 @@ impl Frame {
         self.instances.clear();
         self.stops.clear();
         self.passes.clear();
+        self.content.clear();
+        self.filters.clear();
         self.open = None;
     }
 }
@@ -472,7 +487,7 @@ pub struct Emission {
     generation: u64,
     pub(crate) instances: Range<usize>,
     stops: Range<usize>,
-    image: Option<u64>,
+    image: Option<ImageSource>,
 }
 
 /// GPU resources the lowering needs to emit glyph instances.
@@ -486,6 +501,7 @@ pub struct GlyphContext<'a> {
     pub fonts: &'a HashMap<u64, FontData>,
     /// Registered images, for dimension lookup during lowering.
     pub images: &'a HashMap<u64, GpuImage>,
+    pub content: &'a HashMap<LayerId, super::gpu_content::Slot>,
 }
 
 /// One surface's lowering output: the raster counts plus every deferred
@@ -625,7 +641,7 @@ impl<'a> Lowering<'a> {
         if end > open.seg_start {
             open.ranges.push(DrawRange {
                 source: open.source,
-                image: open.image,
+                image: open.image.clone(),
                 pipeline: open.pipeline,
                 variant: open.variant,
                 instances: open.seg_start..end,
@@ -694,7 +710,12 @@ impl<'a> Lowering<'a> {
     }
 
     /// Starts a new draw range when the bound image texture changes.
-    fn set_image(&mut self, image: Option<u64>) {
+    #[expect(
+        clippy::inline_always,
+        reason = "keep ordinary image identity changes as cheap as the original Copy path"
+    )]
+    #[inline(always)]
+    fn set_image(&mut self, image: Option<ImageSource>) {
         if self.frame.open.as_ref().is_some_and(|o| o.image != image) {
             self.end_segment();
             if let Some(open) = &mut self.frame.open {
@@ -768,12 +789,14 @@ impl<'a> Lowering<'a> {
     fn isolate(
         &mut self,
         inner_clip: Option<DeviceClip>,
+        filter: Option<cherenkov::FilterId>,
         opacity: f32,
         blend: cherenkov::BlendMode,
         mut body: impl FnMut(&mut Self, &GlyphContext<'_>) -> Result<(), RenderError>,
         glyphs: &GlyphContext<'_>,
     ) -> Result<(), RenderError> {
-        if opacity < 1.0
+        if filter.is_none()
+            && opacity < 1.0
             && blend == cherenkov::BlendMode::Normal
             && self.try_passthrough(opacity, inner_clip.is_none(), &mut body, glyphs)?
         {
@@ -797,17 +820,33 @@ impl<'a> Lowering<'a> {
         } else {
             Target::Scratch(self.depth - 1)
         };
-        let region = tight_region(
-            &self.frame.instances[inst_start..],
-            self.width as u32,
-            self.height as u32,
-        );
+        let region = if let Some(filter) = filter {
+            self.frame
+                .filters
+                .push((self.frame.passes.len() - 1, filter.raw()));
+            [0, 0, self.width as u32, self.height as u32]
+        } else {
+            tight_region(
+                &self.frame.instances[inst_start..],
+                self.width as u32,
+                self.height as u32,
+            )
+        };
         if region[2] == 0 || region[3] == 0 {
             // Nothing visible in the scratch: drop this depth's segment
             // passes and the composite entirely.
             for i in (passes_start..self.frame.passes.len()).rev() {
                 if self.frame.passes[i].target == Target::Scratch(scratch) {
                     self.frame.passes.remove(i);
+                    self.frame.filters.retain_mut(|(pass, _)| {
+                        if *pass == i {
+                            return false;
+                        }
+                        if *pass > i {
+                            *pass -= 1;
+                        }
+                        true
+                    });
                 }
             }
             self.begin_pass(outer_target, None);
@@ -1070,7 +1109,14 @@ impl<'a> Lowering<'a> {
                     self.clip = Some(cur);
                     return Ok(());
                 }
-                self.isolate(Some(clip), 1.0, cherenkov::BlendMode::Normal, body, glyphs)
+                self.isolate(
+                    Some(clip),
+                    None,
+                    1.0,
+                    cherenkov::BlendMode::Normal,
+                    body,
+                    glyphs,
+                )
             }
             Some(cur) => match (clip.mask, cur.aligned_rect, clip.aligned_rect) {
                 // A new masked clip merges with an aligned rect clip (or
@@ -1098,7 +1144,14 @@ impl<'a> Lowering<'a> {
                     self.clip = Some(cur);
                     Ok(())
                 }
-                _ => self.isolate(Some(clip), 1.0, cherenkov::BlendMode::Normal, body, glyphs),
+                _ => self.isolate(
+                    Some(clip),
+                    None,
+                    1.0,
+                    cherenkov::BlendMode::Normal,
+                    body,
+                    glyphs,
+                ),
             },
         }
     }
@@ -1115,9 +1168,6 @@ impl<'a> Lowering<'a> {
         glyphs: &GlyphContext<'_>,
     ) -> Result<(), RenderError> {
         let node = tree.layer(id);
-        if node.filter.is_some() {
-            return Err(RenderError::Unsupported(names::FILTER));
-        }
         if node.backdrop.is_some() {
             return Err(RenderError::Unsupported(names::BACKDROP));
         }
@@ -1128,10 +1178,14 @@ impl<'a> Lowering<'a> {
             node.clip.as_ref(),
             |s, glyphs| {
                 s.transform = content_space;
-                if node.opacity < 1.0 || node.blend != cherenkov::BlendMode::Normal {
+                if node.filter.is_some()
+                    || node.opacity < 1.0
+                    || node.blend != cherenkov::BlendMode::Normal
+                {
                     let inner = s.clip;
                     s.isolate(
                         inner,
+                        node.filter,
                         node.opacity,
                         node.blend,
                         |s, glyphs| s.layer_items(id, node, tree, caches, glyphs),
@@ -1168,6 +1222,30 @@ impl<'a> Lowering<'a> {
                 glyphs,
             )?;
             self.layers_composed += u32::from(changed);
+        }
+        if let Some(slot) = glyphs.content.get(&id) {
+            self.frame.content.push(id);
+            let bounds = Rect::new(0.0, 0.0, f64::from(slot.size.0), f64::from(slot.size.1));
+            if let Some(boxed) = box_shape(&ShapeData::Rect(bounds))? {
+                let transform = self.transform * boxed.extra;
+                let mut inst = self.base(KIND_FILL, affine(transform));
+                let margin = self.margin(self.transform);
+                let b = boxed.bounds.inflate(margin, margin);
+                inst.bounds = [f32_f64(b.x0), f32_f64(b.y0), f32_f64(b.x1), f32_f64(b.y1)];
+                inst.shape = boxed.shape;
+                inst.meta[1] = super::instance::PAINT_IMAGE;
+                inst.grad = [1.0, 0.0, 0.0, 1.0];
+                inst.grad2 = [
+                    f32_f64(bounds.width() / 2.0),
+                    f32_f64(bounds.height() / 2.0),
+                    f32_f64(bounds.width()),
+                    f32_f64(bounds.height()),
+                ];
+                inst.meta[3] |=
+                    super::instance::EXTEND_PAD | (super::instance::EXTEND_PAD << 4) | (1 << 8);
+                self.set_image(Some(ImageSource::Content(id)));
+                self.push_shaped(inst, transform, boxed.bounds, margin);
+            }
         }
         for child in &node.children {
             self.layer(*child, tree, caches, glyphs)?;
@@ -1222,10 +1300,12 @@ impl<'a> Lowering<'a> {
                 Op::BeginIsolate {
                     opacity,
                     blend,
+                    filter,
                     end,
                 } => {
                     self.isolate(
                         None,
+                        *filter,
                         *opacity,
                         *blend,
                         |s, g| {
@@ -1398,7 +1478,8 @@ impl<'a> Lowering<'a> {
                 .open
                 .as_ref()
                 .expect("a leaf lowers into an open pass")
-                .image,
+                .image
+                .clone(),
         });
         Ok(())
     }
@@ -1415,7 +1496,7 @@ impl<'a> Lowering<'a> {
         self.frame
             .stops
             .extend_from_slice(&storage.stops[emission.stops.clone()]);
-        self.set_image(emission.image);
+        self.set_image(emission.image.clone());
         let instance_base =
             u32::try_from(self.frame.instances.len()).expect("instance count fits u32");
         for inst in &storage.instances[emission.instances.clone()] {
@@ -1431,10 +1512,15 @@ impl<'a> Lowering<'a> {
         );
     }
 
-    #[inline]
+    #[expect(
+        clippy::inline_always,
+        reason = "let leaf emitters eliminate unused paint fields instead of copying the full payload"
+    )]
+    #[inline(always)]
     fn resolved_paint(&mut self, paint: &ResolvedPaint) -> PaintData {
         let offset = u32::try_from(self.frame.stops.len()).expect("stop count fits u32");
         let data = match paint {
+            ResolvedPaint::Shader(_) => unreachable!("shader paint needs draw bounds"),
             ResolvedPaint::Solid(color) => PaintData {
                 kind: PAINT_SOLID,
                 color: *color,
@@ -1443,16 +1529,114 @@ impl<'a> Lowering<'a> {
             },
             ResolvedPaint::Resources(resources) => {
                 let (data, stops) = resources.as_ref();
-                let mut data = data.clone();
+                let mut data = *data;
                 data.first_stop += offset;
                 self.frame.stops.extend_from_slice(stops);
                 data
             }
         };
-        self.set_image(data.image);
+        self.set_image(data.image.map(ImageSource::Registered));
         data
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "bounded texture extents"
+    )]
+    #[cold]
+    #[inline(never)]
+    fn shader_paint(
+        &mut self,
+        paint: &cherenkov::ShaderPaint,
+        bounds: Rect,
+        transform: Affine,
+    ) -> Result<PaintData, RenderError> {
+        let device = transform.transform_rect_bbox(bounds);
+        if ![
+            device.width(),
+            device.height(),
+            bounds.width(),
+            bounds.height(),
+        ]
+        .iter()
+        .all(|v| v.is_finite())
+        {
+            return Err(RenderError::Render(
+                "shader paint requires finite bounds".into(),
+            ));
+        }
+        let size = (
+            device.width().ceil().max(1.0) as u32,
+            device.height().ceil().max(1.0) as u32,
+        );
+        let key = std::sync::Arc::new(super::paint::Key {
+            shader: paint.shader.raw(),
+            uniforms: paint.uniforms.iter().map(|v| v.to_bits()).collect(),
+            size,
+        });
+        // Collapsed axes sample their center. Coverage still comes from the
+        // ordinary shape/path lowering, including zero-area geometry.
+        let x = if bounds.width() == 0.0 {
+            0.0
+        } else {
+            f64::from(size.0) / bounds.width()
+        };
+        let y = if bounds.height() == 0.0 {
+            0.0
+        } else {
+            f64::from(size.1) / bounds.height()
+        };
+        let offset_x = if bounds.width() == 0.0 {
+            0.5
+        } else {
+            -bounds.x0 * x
+        };
+        let offset_y = if bounds.height() == 0.0 {
+            0.5
+        } else {
+            -bounds.y0 * y
+        };
+        let data = PaintData {
+            kind: super::instance::PAINT_IMAGE,
+            grad: [f32_f64(x), 0.0, 0.0, f32_f64(y)],
+            grad2: [
+                f32_f64(offset_x),
+                f32_f64(offset_y),
+                f32_f64(f64::from(size.0)),
+                f32_f64(f64::from(size.1)),
+            ],
+            packed: super::instance::EXTEND_PAD | (super::instance::EXTEND_PAD << 4) | (1 << 8),
+            ..PaintData::default()
+        };
+        self.set_image(Some(ImageSource::Shader(key)));
+        Ok(data)
+    }
+
+    #[inline]
+    fn shaped_paint(
+        &mut self,
+        paint: &ResolvedPaint,
+        bounds: Rect,
+        local: Affine,
+        extra_margin: f64,
+    ) -> Result<PaintData, RenderError> {
+        if let ResolvedPaint::Shader(shader) = paint {
+            self.shader_paint(
+                shader,
+                bounds.inflate(extra_margin, extra_margin),
+                self.transform * local,
+            )
+        } else {
+            Ok(self.resolved_paint(paint))
+        }
+    }
+
+    #[expect(
+        clippy::inline_always,
+        reason = "preserve dev inlining of common leaf realization as capabilities grow"
+    )]
+    #[inline(always)]
     fn realize(
         &mut self,
         op: &Op,
@@ -1485,7 +1669,7 @@ impl<'a> Lowering<'a> {
                     inst.inner = *inner;
                 }
                 inst.params[0] = *param_x;
-                let paint = self.resolved_paint(paint);
+                let paint = self.shaped_paint(paint, *bounds, *local, *extra_margin)?;
                 inst.color = paint.color;
                 inst.grad = paint.grad;
                 inst.grad2 = paint.grad2;
@@ -1534,15 +1718,13 @@ impl<'a> Lowering<'a> {
                         cherenkov::Command::Fill {
                             shape: ShapeData::Path { elements, .. },
                             ..
-                        } => {
-                            self.path(
-                                content.expect("prepared fill has a hash"),
-                                *rule,
-                                || BezPath::from_vec(elements.clone()),
-                                paint,
-                                glyphs,
-                            )?;
-                        }
+                        } => self.path(
+                            content.expect("prepared fill has a hash"),
+                            *rule,
+                            || BezPath::from_vec(elements.clone()),
+                            paint,
+                            glyphs,
+                        )?,
                         cherenkov::Command::Stroke { shape, stroke, .. } => {
                             self.stroke_path(shape, stroke, *rule, paint, glyphs)?;
                         }
@@ -1723,6 +1905,19 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// Bounds-dependent shader preparation must not expand ordinary path replay.
+    #[cold]
+    #[inline(never)]
+    fn shader_outline(
+        &mut self,
+        make: impl FnOnce() -> BezPath,
+        paint: &cherenkov::ShaderPaint,
+    ) -> Result<(BezPath, PaintData), RenderError> {
+        let path = make();
+        let data = self.shader_paint(paint, kurbo::Shape::bounding_box(&path), self.transform)?;
+        Ok((path, data))
+    }
+
     /// A path or stroked outline: rasterize once per
     /// (content, matrix, subpixel, surface) and replay spans plus atlas
     /// cells. `content` hashes the draw's semantics; `make` builds the
@@ -1744,16 +1939,24 @@ impl<'a> Lowering<'a> {
         )]
         let surface = (self.width as u32, self.height as u32);
         let pl = path::placement(content, self.transform, surface);
+        let mut make = Some(make);
+        let (shader_path, shader_data) = if let ResolvedPaint::Shader(shader) = paint {
+            let (path, data) = self.shader_outline(make.take().expect("path factory"), shader)?;
+            (Some(path), Some(data))
+        } else {
+            (None, None)
+        };
         if let Some(emit) = glyphs
             .atlas
             .path(pl.key)
             .or_else(|| glyphs.atlas.path(pl.key_exact()))
         {
-            self.replay(emit, None, pl.offset, paint);
+            self.replay(emit, None, pl.offset, paint, shader_data.as_ref());
             return Ok(());
         }
         let (stored, pending) = 'stored: {
-            let device = pl.raster * make();
+            let device =
+                pl.raster * shader_path.unwrap_or_else(|| make.take().expect("path factory")());
             let (segments, bbox) = path::flatten_segments(&device, path::FLATTEN);
             let Some(coverage) = path::rasterize(
                 &segments,
@@ -1790,7 +1993,7 @@ impl<'a> Lowering<'a> {
             });
             (stored, Some(pending))
         };
-        self.replay(&stored, pending, pl.offset, paint);
+        self.replay(&stored, pending, pl.offset, paint, shader_data.as_ref());
         Ok(())
     }
 
@@ -1802,8 +2005,11 @@ impl<'a> Lowering<'a> {
         pending: Option<u32>,
         offset: Vec2,
         paint: &ResolvedPaint,
+        shader_data: Option<&PaintData>,
     ) {
-        let paint = self.resolved_paint(paint);
+        let paint = shader_data
+            .copied()
+            .unwrap_or_else(|| self.resolved_paint(paint));
         let mut template = self.base(KIND_SPAN, affine(self.transform));
         template.color = paint.color;
         template.grad = paint.grad;
@@ -1965,6 +2171,81 @@ impl<'a> Lowering<'a> {
         self.run_clipped(clip, body, glyphs)
     }
 
+    #[cold]
+    #[inline(never)]
+    fn shader_glyph_run(
+        &mut self,
+        run: &GlyphRun,
+        paint: &cherenkov::ShaderPaint,
+        glyphs: &GlyphContext<'_>,
+        font: &FontData,
+    ) -> Result<(), RenderError> {
+        let key = glyph_key(run, 0, (0.0, 0.0), self.transform);
+        let mut entries = Vec::new();
+        let mut bounds = None::<Rect>;
+        for glyph in &run.glyphs {
+            let origin = self.transform * Point::new(f64::from(glyph.x), f64::from(glyph.y));
+            let x = origin.x.floor();
+            let y = origin.y.floor();
+            let fraction = (
+                f32_f64(((origin.x - x) * 4.0).floor() / 4.0),
+                f32_f64(((origin.y - y) * 4.0).floor() / 4.0),
+            );
+            let (entry, pending) = glyph::entry(
+                glyphs.atlas,
+                font,
+                key.at(glyph.id, fraction),
+                glyph.id,
+                run.size,
+                fraction,
+                self.transform,
+                &run.coords,
+                &mut self.pending,
+            )?;
+            self.glyphs += u32::from(pending.is_some());
+            if entry.w == 0 || entry.h == 0 {
+                continue;
+            }
+            let rect = Rect::from_origin_size(
+                (x + f64::from(entry.left), y + f64::from(entry.top)),
+                (f64::from(entry.w), f64::from(entry.h)),
+            );
+            bounds = Some(bounds.map_or(rect, |bounds| bounds.union(rect)));
+            entries.push((entry, pending, rect));
+        }
+        let Some(bounds) = bounds else {
+            return Ok(());
+        };
+        let data = self.shader_paint(
+            paint,
+            self.transform.inverse().transform_rect_bbox(bounds),
+            self.transform,
+        )?;
+        for (entry, pending, rect) in entries {
+            let mut inst = self.base(KIND_GLYPH, affine(self.transform));
+            inst.grad = data.grad;
+            inst.grad2 = data.grad2;
+            inst.meta[1] = data.kind;
+            inst.meta[3] |= data.packed;
+            inst.bounds = [
+                f32_f64(rect.x0),
+                f32_f64(rect.y0),
+                f32_f64(rect.x1),
+                f32_f64(rect.y1),
+            ];
+            inst.uv = [f32::from(entry.x), f32::from(entry.y), 0.0, 0.0];
+            self.push_instance(&inst);
+            if let Some(pending) = pending {
+                self.cell_patches.push((
+                    u32::try_from(self.frame.instances.len() - 1).expect("instance count fits u32"),
+                    pending,
+                    0,
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// `Glyphs`: rasterize missing atlas entries and emit one quad per
     /// glyph.
     fn glyph_run(
@@ -1977,6 +2258,9 @@ impl<'a> Lowering<'a> {
             .fonts
             .get(&run.font.raw())
             .ok_or_else(|| RenderError::Font(format!("unregistered font {:?}", run.font)))?;
+        if let ResolvedPaint::Shader(shader) = paint {
+            return self.shader_glyph_run(run, shader, glyphs, font);
+        }
         let key = glyph_key(run, 0, (0.0, 0.0), self.transform);
         let mut template = None;
         for glyph in &run.glyphs {
@@ -2268,6 +2552,7 @@ mod tests {
             atlas: &atlas,
             fonts: &fonts,
             images: &images,
+            content: &HashMap::new(),
         };
         let prefix = cherenkov::Command::Fill {
             shape: ShapeData::Rect(Rect::new(0.0, 0.0, 2.0, 2.0)),
@@ -2279,6 +2564,7 @@ mod tests {
         // the group really isolates into a scratch and composites back.
         lowering
             .isolate(
+                None,
                 None,
                 0.5,
                 cherenkov::BlendMode::Normal,
@@ -2339,6 +2625,7 @@ mod tests {
             atlas: &atlas,
             fonts: &fonts,
             images: &images,
+            content: &HashMap::new(),
         };
         // Half extents [20, 5]: a spread of -20 inverts both.
         let bar = ShapeData::Rect(kurbo::Rect::new(20.0, 20.0, 60.0, 30.0));

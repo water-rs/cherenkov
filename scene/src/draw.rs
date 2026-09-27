@@ -231,6 +231,13 @@ pub struct ImagePaint {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Paint {
+    /// Maps paint coordinates into shape space without transforming geometry.
+    Transformed {
+        /// The underlying paint.
+        paint: Box<Self>,
+        /// Paint-to-shape transform, finite and invertible.
+        transform: Affine,
+    },
     /// A solid colour.
     Solid(Color),
     /// A linear gradient.

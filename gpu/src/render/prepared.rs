@@ -212,7 +212,14 @@ pub enum ResolvedPaint {
     /// Gradient/image shader fields and their stop buffer.
     Resources(Box<(PaintData, Vec<Stop>)>),
     /// Deferred until device scale and full shape bounds are known.
-    Shader(Box<cherenkov::ShaderPaint>),
+    Shader(Box<ResolvedShader>),
+}
+
+/// A shader use and the independent shape-local sampling transform.
+#[derive(Clone)]
+pub struct ResolvedShader {
+    pub source: cherenkov::ShaderPaint,
+    pub sampling: Affine,
 }
 
 /// sRGB-encodes one channel, preserving sign.
@@ -343,6 +350,7 @@ fn paint_data(
             data.image = Some(pattern.image.raw());
         }
         Paint::Shader(_) => return Err(RenderError::Unsupported(names::SHADER)),
+        Paint::Transformed(_) => unreachable!("transformed paints resolve separately"),
     }
     Ok(data)
 }
@@ -369,11 +377,79 @@ fn resolve_resources(
     to_local: Affine,
     images: &HashMap<u64, GpuImage>,
 ) -> Result<ResolvedPaint, RenderError> {
+    if let Paint::Transformed(_) = paint {
+        return resolve_transformed(paint, to_local, images);
+    }
     if let Paint::Shader(shader) = paint {
-        return Ok(ResolvedPaint::Shader(Box::new(shader.clone())));
+        return Ok(ResolvedPaint::Shader(Box::new(ResolvedShader {
+            source: shader.clone(),
+            sampling: Affine::IDENTITY,
+        })));
     }
     let mut stops = Vec::new();
     let data = paint_data(paint, to_local, &mut stops, images)?;
+    Ok(ResolvedPaint::Resources(Box::new((data, stops))))
+}
+
+/// Resolves only explicit paint transforms, preserving the ordinary paint
+/// preparation path and instance size.
+fn resolve_transformed(
+    mut paint: &Paint,
+    to_local: Affine,
+    images: &HashMap<u64, GpuImage>,
+) -> Result<ResolvedPaint, RenderError> {
+    let mut transform = Affine::IDENTITY;
+    while let Paint::Transformed(mapped) = paint {
+        if !mapped.transform.is_finite() || !mapped.transform.inverse().is_finite() {
+            return Err(RenderError::Render(
+                "paint transform must be finite and invertible".into(),
+            ));
+        }
+        transform *= mapped.transform;
+        paint = &mapped.paint;
+    }
+    let inverse = (to_local * transform).inverse();
+    if !inverse.is_finite() {
+        return Err(RenderError::Render(
+            "composed paint transform must be finite and invertible".into(),
+        ));
+    }
+    if let Paint::Shader(shader) = paint {
+        return Ok(ResolvedPaint::Shader(Box::new(ResolvedShader {
+            source: shader.clone(),
+            sampling: to_local * transform.inverse() * to_local.inverse(),
+        })));
+    }
+    if let Paint::Solid(color) = paint {
+        return Ok(ResolvedPaint::Solid(color.components));
+    }
+    if let Paint::Image(pattern) = paint {
+        // Images already carry a full sampling affine. Compose in f64 once,
+        // before rounding to GPU coefficients; two f32 maps can disagree at
+        // nearest-neighbour texel boundaries.
+        let mut pattern = pattern.clone();
+        pattern.transform = transform * pattern.transform;
+        let mut stops = Vec::new();
+        let data = paint_data(&Paint::Image(pattern), to_local, &mut stops, images)?;
+        return Ok(ResolvedPaint::Resources(Box::new((data, stops))));
+    }
+    let [xx, yx, xy, yy, tx, ty] = inverse.as_coeffs();
+    let mut stops = vec![
+        Stop {
+            color: [f32_f64(xx), f32_f64(yx), f32_f64(xy), f32_f64(yy)],
+            offset: 0.0,
+            pad: [0.0; 3],
+        },
+        Stop {
+            color: [f32_f64(tx), f32_f64(ty), 0.0, 0.0],
+            offset: 0.0,
+            pad: [0.0; 3],
+        },
+    ];
+    let mut data = paint_data(paint, Affine::IDENTITY, &mut stops, images)?;
+    // Images have no gradient stops, but still point just past the header.
+    data.first_stop = 2;
+    data.kind |= super::instance::PAINT_TRANSFORMED;
     Ok(ResolvedPaint::Resources(Box::new((data, stops))))
 }
 

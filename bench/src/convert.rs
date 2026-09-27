@@ -155,6 +155,13 @@ impl Prepared {
     )]
     fn brush_inner(&self, engine: &'static str, paint: &Paint) -> Result<Brush, BenchError> {
         Ok(match paint {
+            Paint::Transformed { .. } => {
+                return Err(BenchError::Unsupported {
+                    engine,
+                    feature: Feature::PaintTransform,
+                    api: Some("independent paint transform adapter"),
+                });
+            }
             Paint::Solid(c) => Brush::Solid(peniko_solid(c)),
             Paint::Linear(g) => Brush::Gradient(gradient(
                 engine,
@@ -308,8 +315,10 @@ fn visit(p: &mut Prepared, layer: &Layer, blobs: &Blobs) -> Result<(), BenchErro
 }
 
 /// The `Paint::Image` inside a draw's paint, when any.
-const fn image_paint(paint: &Paint) -> Option<&ImagePaint> {
+#[must_use]
+pub fn image_paint(paint: &Paint) -> Option<&ImagePaint> {
     match paint {
+        Paint::Transformed { paint, .. } => image_paint(paint),
         Paint::Image(ip) => Some(ip),
         _ => None,
     }
@@ -323,7 +332,7 @@ fn paint_images(scene: &Scene) -> Vec<ResourceHash> {
             match item {
                 Item::Layer(l) => visit(l, out),
                 Item::Draw(Draw::Glyphs(run)) => {
-                    if let Paint::Image(ip) = &run.paint {
+                    if let Some(ip) = image_paint(&run.paint) {
                         out.push(ip.image);
                     }
                 }
@@ -596,6 +605,13 @@ pub fn image_brush(
 )]
 pub fn brush(engine: &'static str, paint: &Paint, blobs: &Blobs) -> Result<Brush, BenchError> {
     Ok(match paint {
+        Paint::Transformed { .. } => {
+            return Err(BenchError::Unsupported {
+                engine,
+                feature: Feature::PaintTransform,
+                api: Some("independent paint transform adapter"),
+            });
+        }
         Paint::Solid(c) => Brush::Solid(peniko_solid(c)),
         Paint::Linear(g) => Brush::Gradient(gradient(
             engine,

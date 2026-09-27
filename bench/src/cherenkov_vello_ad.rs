@@ -466,6 +466,7 @@ fn vello_ad_features() -> Vec<Feature> {
         Feature::StrokeDash,
         Feature::Path,
         Feature::ContinuousCorners,
+        Feature::PaintTransform,
         Feature::LinearGradient,
         Feature::RadialGradient,
         Feature::SweepGradient,
@@ -647,6 +648,9 @@ fn front_paint(
     images: &HashMap<ResourceHash, cherenkov::Image<Rgba8>>,
 ) -> Result<cherenkov::Paint, BenchError> {
     Ok(match paint {
+        ScenePaint::Transformed { paint, transform } => {
+            front_paint(paint, images)?.transformed(*transform)
+        }
         ScenePaint::Solid(c) => cherenkov::Paint::Solid(working(c)),
         ScenePaint::Linear(g) => cherenkov::Paint::Linear(cherenkov::LinearGradient {
             start: g.start,
@@ -833,10 +837,9 @@ fn register_resources(
                     SceneDraw::Image { image, .. } => Some(*image),
                     SceneDraw::Fill { paint, .. }
                     | SceneDraw::Stroke { paint, .. }
-                    | SceneDraw::Glyphs(SceneGlyphRun { paint, .. }) => match paint {
-                        ScenePaint::Image(p) => Some(p.image),
-                        _ => None,
-                    },
+                    | SceneDraw::Glyphs(SceneGlyphRun { paint, .. }) => {
+                        crate::convert::image_paint(paint).map(|p| p.image)
+                    }
                     SceneDraw::Shadow { .. } => None,
                 };
                 if let Some(hash) = image_hash

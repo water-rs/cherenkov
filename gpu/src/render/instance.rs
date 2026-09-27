@@ -30,6 +30,9 @@ pub const PAINT_TEXTURE: u32 = 3;
 pub const PAINT_SWEEP: u32 = 4;
 /// An image sampled manually from the bound image texture.
 pub const PAINT_IMAGE: u32 = 5;
+/// Paint coordinates are mapped by the two stop-buffer entries immediately
+/// preceding `first_stop`; lower bits keep the underlying paint kind.
+pub const PAINT_TRANSFORMED: u32 = 1 << 16;
 
 /// Clamp the edge colours.
 pub const EXTEND_PAD: u32 = 0;

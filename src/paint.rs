@@ -1,5 +1,7 @@
 //! Paint: what fills a shape.
 
+use std::sync::Arc;
+
 use kurbo::{Affine, Point};
 use serde::{Deserialize, Serialize};
 
@@ -22,6 +24,59 @@ pub enum Paint {
     Image(ImagePattern),
     /// A user shader paint. It needs the GPU backend.
     Shader(ShaderPaint),
+    /// A paint whose coordinates are mapped into shape space independently
+    /// of the shape's geometry. See [`TransformedPaint`].
+    Transformed(TransformedPaint),
+}
+
+/// A paint with its own coordinate system.
+///
+/// `transform` maps the underlying paint's coordinates into shape space.
+/// Geometry, stroke width, clipping and coverage are unchanged. Nested
+/// transforms compose outside-in: an outer `A` around an inner `B` maps a
+/// paint point by `A * B`. For an image pattern this precedes the pattern's
+/// texel-to-paint transform. Shader paints transform their sampling coordinates
+/// relative to their ordinary, untransformed shape-bounds domain.
+///
+/// A non-finite or non-invertible transform fails rendering with
+/// [`crate::RenderError::Render`], including for solid paints. Reflections are
+/// valid. The shared paint keeps stops and mesh data shared when a live signal
+/// updates only `transform`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TransformedPaint {
+    /// Immutable paint, shared across transform updates.
+    pub paint: Arc<Paint>,
+    /// Paint-to-shape coordinates; identity preserves the original paint.
+    pub transform: Affine,
+}
+
+impl TransformedPaint {
+    /// Shares `paint` and maps its coordinates into shape space.
+    #[must_use]
+    pub fn new(paint: impl Into<Paint>, transform: Affine) -> Self {
+        Self {
+            paint: Arc::new(paint.into()),
+            transform,
+        }
+    }
+}
+
+impl From<TransformedPaint> for Paint {
+    fn from(paint: TransformedPaint) -> Self {
+        Self::Transformed(paint)
+    }
+}
+
+impl Paint {
+    /// Maps this paint into shape space without changing geometry or stroke
+    /// width. Successive calls compose on the left. See [`TransformedPaint`].
+    #[must_use]
+    pub fn transformed(self, transform: Affine) -> Self {
+        if transform == Affine::IDENTITY {
+            return self;
+        }
+        Self::Transformed(TransformedPaint::new(self, transform))
+    }
 }
 
 /// One colour stop of a gradient.
@@ -438,5 +493,6 @@ nami_core::impl_constant!(
     SweepGradient,
     MeshGradient,
     ImagePattern,
-    ShaderPaint
+    ShaderPaint,
+    TransformedPaint
 );

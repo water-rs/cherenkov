@@ -401,6 +401,7 @@ fn cherenkov_features() -> Vec<Feature> {
         Feature::EvenOdd,
         Feature::StrokeDash,
         Feature::ContinuousCorners,
+        Feature::PaintTransform,
         Feature::LinearGradient,
         Feature::RadialGradient,
         Feature::Clip,
@@ -513,6 +514,7 @@ fn stops(stops: &[cherenkov_scene::GradientStop]) -> Vec<cherenkov::ColorStop> {
 /// A scene paint → the front-end paint.
 fn front_paint(paint: &ScenePaint) -> Result<cherenkov::Paint, BenchError> {
     Ok(match paint {
+        ScenePaint::Transformed { paint, transform } => front_paint(paint)?.transformed(*transform),
         ScenePaint::Solid(c) => cherenkov::Paint::Solid(working(c)),
         ScenePaint::Linear(g) => cherenkov::Paint::Linear(cherenkov::LinearGradient {
             start: g.start,

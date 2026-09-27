@@ -67,6 +67,8 @@ pub struct Stop {
 /// parameters the evaluator needs.
 #[derive(Clone, Debug)]
 pub enum PaintData {
+    /// A shared prepared paint and its shape-to-paint coordinate map.
+    Transformed(std::sync::Arc<Self>, Affine),
     /// Premultiplied solid colour.
     Solid([f32; 4]),
     /// A linear gradient.
@@ -163,6 +165,27 @@ fn stops(stops: &[ColorStop], interpolation: Interpolation) -> std::sync::Arc<[S
 )]
 pub fn paint_data(paint: &Paint, inv: Affine) -> Result<PaintData, RenderError> {
     Ok(match paint {
+        Paint::Transformed(_) => {
+            let mut transform = Affine::IDENTITY;
+            let mut inner = paint;
+            while let Paint::Transformed(mapped) = inner {
+                if !mapped.transform.is_finite() || !mapped.transform.inverse().is_finite() {
+                    return Err(RenderError::Render(
+                        "paint transform must be finite and invertible".into(),
+                    ));
+                }
+                transform *= mapped.transform;
+                inner = &mapped.paint;
+            }
+            let inverse = transform.inverse();
+            if !transform.is_finite() || !inverse.is_finite() {
+                return Err(RenderError::Render(
+                    "composed paint transform must be finite and invertible".into(),
+                ));
+            }
+            let inner = paint_data(inner, Affine::IDENTITY)?;
+            PaintData::Transformed(std::sync::Arc::new(inner), inverse * inv)
+        }
         Paint::Solid(c) => {
             let [r, g, b, a] = c.components;
             PaintData::Solid([r * a, g * a, b * a, a])
@@ -298,6 +321,7 @@ impl PaintData {
     pub fn transformed(&self, transform: Affine) -> Self {
         let mut paint = self.clone();
         match &mut paint {
+            Self::Transformed(inner, inverse) => return inner.transformed(*inverse * transform),
             Self::Solid(_) => {}
             Self::Linear { inv, .. } | Self::Radial { inv, .. } => *inv = affine_f32(transform),
         }
@@ -308,6 +332,10 @@ impl PaintData {
     /// returning premultiplied linear Display P3.
     pub fn eval(&self, dx: f32, dy: f32) -> [f32; 4] {
         match self {
+            Self::Transformed(inner, inverse) => {
+                let (x, y) = apply(affine_f32(*inverse), dx, dy);
+                inner.eval(x, y)
+            }
             Self::Solid(c) => *c,
             Self::Linear {
                 inv,

@@ -465,6 +465,7 @@ fn cherenkov_features() -> Vec<Feature> {
         Feature::Opacity,
         Feature::Shadow,
         Feature::Glyphs,
+        Feature::GlyphStroke,
         Feature::FontVariations,
         Feature::Scroll,
         Feature::Animation,
@@ -767,7 +768,12 @@ fn glyph_run(
                 transform: None,
             })
             .collect(),
-        style: cherenkov::GlyphStyle::Fill,
+        style: run
+            .stroke
+            .as_ref()
+            .map_or(cherenkov::GlyphStyle::Fill, |stroke| {
+                cherenkov::GlyphStyle::Stroke(stroke.into())
+            }),
     })
 }
 

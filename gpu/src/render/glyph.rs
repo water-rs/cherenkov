@@ -829,6 +829,51 @@ fn rasterize_texels(
     }))
 }
 
+/// Unhinted outlines in run coordinates for semantic glyph strokes.
+/// Strokes use the font's outline, including on COLR fonts; palette paint
+/// graphs apply only to filled glyphs. Missing outlines are explicit errors.
+pub fn stroke_outlines(
+    font: &FontData,
+    run: &cherenkov::GlyphRun,
+) -> Result<Vec<kurbo::BezPath>, RenderError> {
+    let font_ref = skrifa::FontRef::from_index(&font.data, font.index)
+        .map_err(|e| RenderError::Font(e.to_string()))?;
+    let upem = font_ref
+        .head()
+        .map_err(|e| RenderError::Font(e.to_string()))?
+        .units_per_em();
+    if upem == 0 {
+        return Err(RenderError::Font("zero units_per_em".into()));
+    }
+    let scale = f64::from(run.size) / f64::from(upem);
+    let coords: Vec<F2Dot14> = run.coords.iter().map(|c| F2Dot14::from_bits(*c)).collect();
+    let outlines = font_ref.outline_glyphs();
+    let mut paths = Vec::with_capacity(run.glyphs.len());
+    for glyph in &run.glyphs {
+        let outline = outlines
+            .get(skrifa::GlyphId::new(glyph.id))
+            .ok_or_else(|| {
+                RenderError::Font(format!("glyph {} has no stroke outline", glyph.id))
+            })?;
+        let mut pen = PathPen {
+            path: kurbo::BezPath::new(),
+        };
+        outline
+            .draw(
+                DrawSettings::unhinted(
+                    skrifa::instance::Size::unscaled(),
+                    skrifa::instance::LocationRef::new(&coords),
+                ),
+                &mut pen,
+            )
+            .map_err(|e| RenderError::Font(format!("glyph {}: {e}", glyph.id)))?;
+        let placement = Affine::translate((f64::from(glyph.x), f64::from(glyph.y)))
+            * Affine::scale_non_uniform(scale, -scale);
+        paths.push(placement * pen.path);
+    }
+    Ok(paths)
+}
+
 /// The cache key for a glyph at a quantized device position.
 #[expect(clippy::cast_possible_truncation)]
 #[expect(clippy::cast_sign_loss)]

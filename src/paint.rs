@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::color::{Color, ColorSpace, DynColor, WorkingColor};
 
 /// What fills a shape or a glyph.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub enum Paint {
     /// A single colour.
     Solid(WorkingColor),
@@ -27,6 +27,26 @@ pub enum Paint {
     /// A paint whose coordinates are mapped into shape space independently
     /// of the shape's geometry. See [`TransformedPaint`].
     Transformed(TransformedPaint),
+}
+
+impl Clone for Paint {
+    #[expect(
+        clippy::inline_always,
+        reason = "recording should specialize common solid copies without an out-of-line paint dispatch"
+    )]
+    #[inline(always)]
+    fn clone(&self) -> Self {
+        match self {
+            Self::Solid(color) => Self::Solid(*color),
+            Self::Linear(gradient) => Self::Linear(gradient.clone()),
+            Self::Radial(gradient) => Self::Radial(gradient.clone()),
+            Self::Sweep(gradient) => Self::Sweep(gradient.clone()),
+            Self::Mesh(mesh) => Self::Mesh(mesh.clone()),
+            Self::Image(pattern) => Self::Image(pattern.clone()),
+            Self::Shader(shader) => Self::Shader(shader.clone()),
+            Self::Transformed(paint) => Self::Transformed(paint.clone()),
+        }
+    }
 }
 
 /// A paint with its own coordinate system.

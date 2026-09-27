@@ -180,6 +180,9 @@ pub fn paint_data(paint: &Paint, inv: Affine) -> Result<PaintData, RenderError> 
                     "composed paint transform must be finite and invertible".into(),
                 ));
             }
+            if transform == Affine::IDENTITY {
+                return paint_data(inner, inv);
+            }
             let inner = paint_data(inner, Affine::IDENTITY)?;
             PaintData::Transformed(std::sync::Arc::new(inner), inverse * inv)
         }

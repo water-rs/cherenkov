@@ -405,6 +405,9 @@ fn resolve_transformed(
         transform *= mapped.transform;
         paint = &mapped.paint;
     }
+    if transform == Affine::IDENTITY {
+        return resolve(paint, to_local, images);
+    }
     let inverse = (to_local * transform).inverse();
     if !inverse.is_finite() {
         return Err(RenderError::Render(

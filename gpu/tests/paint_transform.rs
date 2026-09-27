@@ -115,3 +115,8 @@ fn image_paint_transform_composes_before_pattern_transform() {
         assert_eq!(a.map(f32::to_bits), b.map(f32::to_bits));
     }
 }
+
+#[test]
+fn explicit_identity_mapping_preserves_pixels_exactly() {
+    common::identity::<cherenkov_gpu::Gpu>(cherenkov_gpu::GpuConfig::default());
+}

@@ -14,3 +14,8 @@ fn nested_paint_transforms_compose_and_sample_analytically() {
 fn singular_and_non_finite_paint_transforms_fail() {
     common::invalid::<cherenkov_cpu::Raster>(cherenkov_cpu::RasterConfig::default());
 }
+
+#[test]
+fn explicit_identity_mapping_preserves_pixels_exactly() {
+    common::identity::<cherenkov_cpu::Raster>(cherenkov_cpu::RasterConfig::default());
+}

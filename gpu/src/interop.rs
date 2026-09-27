@@ -60,7 +60,7 @@ pub mod wgpu {
 
 /// A producer moved to the engine's render thread for its entire lifetime.
 /// UI-thread-bound producers send owned frame data over a channel to this object.
-pub trait GpuContent: Send + 'static {
+pub trait GpuContent: cherenkov::RenderTransfer + 'static {
     /// Creates persistent resources once before the first frame.
     fn setup(&mut self, context: &wgpu::Context<'_>) -> impl Future<Output = ()>;
     /// Draws into the provided engine-owned attachment.
@@ -135,14 +135,29 @@ impl RedrawHandle {
     }
 }
 
-pub(crate) trait Content: Send {
+pub(crate) trait Content: cherenkov::RenderTransfer {
+    #[cfg(not(target_arch = "wasm32"))]
     fn setup(&mut self, context: &wgpu::Context<'_>);
+    #[cfg(target_arch = "wasm32")]
+    fn setup<'a>(
+        &'a mut self,
+        context: &'a wgpu::Context<'a>,
+    ) -> core::pin::Pin<Box<dyn Future<Output = ()> + 'a>>;
     fn render(&mut self, frame: &mut wgpu::Frame<'_>);
 }
 
 impl<C: GpuContent> Content for C {
+    #[cfg(not(target_arch = "wasm32"))]
     fn setup(&mut self, context: &wgpu::Context<'_>) {
         pollster::block_on(GpuContent::setup(self, context));
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn setup<'a>(
+        &'a mut self,
+        context: &'a wgpu::Context<'a>,
+    ) -> core::pin::Pin<Box<dyn Future<Output = ()> + 'a>> {
+        Box::pin(GpuContent::setup(self, context))
     }
 
     fn render(&mut self, frame: &mut wgpu::Frame<'_>) {

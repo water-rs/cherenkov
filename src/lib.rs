@@ -27,6 +27,8 @@ mod error;
 mod frame;
 mod glyph;
 mod image;
+#[cfg(target_arch = "wasm32")]
+mod local;
 pub mod lowering;
 mod message;
 mod paint;
@@ -40,7 +42,10 @@ mod tree;
 #[cfg(feature = "testing")]
 pub mod testing;
 
+pub use crate::backend::RenderTransfer;
 pub use kurbo;
+/// Monotonic presentation clock: std on native, browser performance clock on wasm.
+pub use web_time::Instant;
 
 pub use crate::animation::{
     Animatable, Animation, Curve, Decay, Lanes, Spring, curve_value, decay_step, settled,

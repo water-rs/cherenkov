@@ -446,8 +446,12 @@ fn linear_t(i: u32, p: vec2<f32>) -> f32 {
 // Two-point conical gradient parameter, a literal port of the oracle's
 // radial_t: the larger real root of |p - (c0 + t·dc)| = r0 + t·dr.
 // Degenerate coincident circles use the relative distance from the centre.
-// NaN (no solution) yields a transparent pixel.
-fn radial_t(i: u32, p: vec2<f32>) -> f32 {
+// Explicit validity avoids a non-finite constant, which WGSL rejects.
+struct RadialParameter {
+    value: f32,
+    valid: bool,
+}
+fn radial_t(i: u32, p: vec2<f32>) -> RadialParameter {
     let c0 = instances[i].grad.xy;
     let c1 = instances[i].grad.zw;
     let r0 = instances[i].grad2.x;
@@ -463,20 +467,20 @@ fn radial_t(i: u32, p: vec2<f32>) -> f32 {
         if abs(b) < 1e-12 {
             // Coincident circles: distance relative to r0.
             if abs(r0) < 1e-12 {
-                return 0.0;
+                return RadialParameter(0.0, true);
             }
-            return (length(pd) - r0) / abs(r0);
+            return RadialParameter((length(pd) - r0) / abs(r0), true);
         }
-        return -c / b;
+        return RadialParameter(-c / b, true);
     }
     let disc = b * b - 4.0 * a * c;
     if disc < 0.0 {
-        return bitcast<f32>(0x7fc00000u);
+        return RadialParameter(0.0, false);
     }
     let sq = sqrt(disc);
     // The cone answer is the larger root; when `a` is negative that is the
     // smaller numerator, so compare the roots themselves.
-    return max((-b + sq) / (2.0 * a), (-b - sq) / (2.0 * a));
+    return RadialParameter(max((-b + sq) / (2.0 * a), (-b - sq) / (2.0 * a)), true);
 }
 
 // Sweep (conic) parameter: the wrapped angle of p - center mapped into
@@ -635,7 +639,11 @@ fn paint(i: u32, meta_: vec4<u32>, color: vec4<f32>, local: vec2<f32>, pixel: ve
             } else if kind == PAINT_SWEEP {
                 t = sweep_t(i, point);
             } else {
-                t = radial_t(i, point);
+                let radial = radial_t(i, point);
+                if !radial.valid {
+                    return vec4<f32>(0.0);
+                }
+                t = radial.value;
             }
             // NaN (exponent all-ones, nonzero mantissa) → transparent.
             // `t != t` is not reliable under every driver.

@@ -9,10 +9,10 @@ mod shader;
 #[cfg(test)]
 mod tests;
 
+use cherenkov::Instant;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::time::Instant;
 
 use cherenkov::kurbo::{self, Shape as _};
 use cherenkov::{
@@ -1307,7 +1307,68 @@ impl Renderer for VelloRenderer {
 
     /// Lowers and submits every dirty surface, bracketed by drained
     /// timestamp queries when enabled.
+    #[cfg(not(target_arch = "wasm32"))]
     fn render(
+        &mut self,
+        frame: &cherenkov::Frame<'_>,
+        stats: &mut FrameStats,
+    ) -> Result<Redraw, RenderError> {
+        let mut rates = Vec::new();
+        // A surface is dirty when the front end says its tree or content
+        // changed, or a backend-side source (GPU content redraw flag,
+        // animated shader, filter redraw callback) asks for a frame.
+        let filter_redraw = self.filters.take_redraw_requests();
+        let dirty: Vec<SurfaceId> = frame
+            .surfaces
+            .iter()
+            .filter(|sf| {
+                let Some(surface) = self.surfaces.get(&sf.id) else {
+                    return false;
+                };
+                let backend_dirty = self.surface_needs_redraw(surface);
+                filter_redraw || sf.changed || surface.wants_next || backend_dirty
+            })
+            .map(|sf| sf.id)
+            .collect();
+        let now = Instant::now();
+        let mut result = Ok(());
+        if !dirty.is_empty() {
+            self.drain_and_stamp(0)?;
+            for sf in frame.surfaces {
+                if !dirty.contains(&sf.id) {
+                    continue;
+                }
+                let mut wants_next =
+                    filter_redraw || self.surface_needs_redraw(&self.surfaces[&sf.id]);
+                result = self.render_surface(sf, stats, &mut wants_next, now);
+                if wants_next {
+                    rates.push(self.surfaces[&sf.id].rate.clone());
+                }
+                if result.is_err() {
+                    break;
+                }
+            }
+            stats.frame = Some(frame.id);
+            if self.timestamps {
+                self.drain_and_stamp(1)?;
+                // Resolved synchronously: the frame's own timing.
+                stats.timings.push(FrameTiming {
+                    frame: frame.id,
+                    gpu_seconds: self.resolve_timestamps()?,
+                    passes: Vec::new(),
+                });
+            }
+            self.wait()?;
+            result?;
+        }
+        let rate = rates
+            .into_iter()
+            .reduce(|a, b| (*a.start()).min(*b.start())..=(*a.end()).max(*b.end()));
+        Ok(rate.map_or(Redraw::None, |rate| Redraw::Wanted { rate }))
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn render(
         &mut self,
         frame: &cherenkov::Frame<'_>,
         stats: &mut FrameStats,
@@ -1369,7 +1430,73 @@ impl Renderer for VelloRenderer {
     /// Copies a surface's target into `Readback` pixels: each stored
     /// sRGB-encoded premultiplied `rgba8` is decoded per channel to linear
     /// sRGB and mapped into linear Display P3.
+    #[cfg(not(target_arch = "wasm32"))]
     fn readback(&mut self, surface: SurfaceId) -> Result<Readback, RenderError> {
+        let Some(state) = self.surfaces.get(&surface) else {
+            return Err(RenderError::Readback("unknown surface".into()));
+        };
+        if !state.readable {
+            return Err(RenderError::NotReadable);
+        }
+        let (w, h) = state.size;
+        let bytes_per_row = (w * 4).div_ceil(256) * 256;
+        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback"),
+            size: u64::from(bytes_per_row) * u64::from(h),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("readback"),
+            });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: state.target.texture(),
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit([encoder.finish()]);
+        let slice = buf.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|e| RenderError::Readback(format!("poll: {e}")))?;
+        let data = slice.get_mapped_range();
+        let mut pixels = Vec::with_capacity((w * h) as usize);
+        for row in 0..h {
+            let start = (row * bytes_per_row) as usize;
+            for px in data[start..start + (w * 4) as usize].as_chunks::<4>().0 {
+                pixels.push(rgba8_to_working(*px));
+            }
+        }
+        drop(data);
+        buf.unmap();
+        Ok(Readback {
+            width: w,
+            height: h,
+            pixels,
+        })
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn readback(&mut self, surface: SurfaceId) -> Result<Readback, RenderError> {
         let Some(state) = self.surfaces.get(&surface) else {
             return Err(RenderError::Readback("unknown surface".into()));
         };

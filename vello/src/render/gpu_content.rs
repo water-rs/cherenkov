@@ -1,9 +1,10 @@
 //! Render-side `GpuContent`: each content object owns a retained
 //! `Rgba8Unorm` texture vello composites as an image.
 
+use cherenkov::Instant;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use vello::peniko;
 

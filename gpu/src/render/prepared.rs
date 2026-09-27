@@ -522,6 +522,8 @@ pub enum Op {
         opacity: f32,
         /// The group blend mode.
         blend: BlendMode,
+        /// Filter over the captured group.
+        filter: Option<cherenkov::FilterId>,
         /// Op index of the matching `End` op.
         end: u32,
     },
@@ -610,18 +612,17 @@ impl cherenkov::lowering::Compiler for Lowerer<'_> {
         })
     }
     fn group(&mut self, group: &cherenkov::Group) -> Result<Option<Op>, RenderError> {
-        if group.filter.is_some() {
-            return Err(RenderError::Unsupported(names::FILTER));
-        }
         if group.blend_space != BlendSpace::Linear {
             return Err(RenderError::Unsupported(names::BLEND_SPACE));
         }
         Ok(
-            (group.opacity < 1.0 || group.blend != BlendMode::Normal).then_some(Op::BeginIsolate {
-                opacity: group.opacity,
-                blend: group.blend,
-                end: 0,
-            }),
+            (group.filter.is_some() || group.opacity < 1.0 || group.blend != BlendMode::Normal)
+                .then_some(Op::BeginIsolate {
+                    opacity: group.opacity,
+                    blend: group.blend,
+                    filter: group.filter,
+                    end: 0,
+                }),
         )
     }
     fn end(&mut self) -> Op {

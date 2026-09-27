@@ -8,6 +8,8 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+filtrate = { path = "../filtrate" }
+filtrate-core = { path = "../filtrate/core" }
 cherenkov = { path = ".." }
 wgpu = "29"
 pollster = "0.4"

@@ -22,8 +22,6 @@ pub const SHADER: &str = "shader-paint";
     reason = "blend modes are supported; the name is kept for parity"
 )]
 pub const BLEND: &str = "blend-mode";
-/// A filter on a group or layer.
-pub const FILTER: &str = "filter";
 /// A backdrop group.
 pub const BACKDROP: &str = "backdrop";
 /// A stroke join or cap combination with no analytic form.

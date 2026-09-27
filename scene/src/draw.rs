@@ -324,6 +324,10 @@ pub struct GlyphRun {
     pub normalized_coords: Vec<NormalizedCoord>,
     /// Positioned glyphs (pen-relative).
     pub glyphs: Vec<Glyph>,
+    /// Stroke outlines in run units; absent means filled glyphs. Enclosing
+    /// transforms apply after expansion, exactly as for stroked paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stroke: Option<StrokeStyle>,
     /// The paint used for all glyphs in the run.
     pub paint: Paint,
 }

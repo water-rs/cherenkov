@@ -74,6 +74,7 @@ fn scene_save_load() {
             Paint::Solid(Color::new(ColorSpace::DisplayP3, [0.0, 1.0, 0.0, 1.0])),
         )
         .glyphs(GlyphRun {
+            stroke: None,
             font,
             font_index: 0,
             size: 24.0,

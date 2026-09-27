@@ -930,8 +930,8 @@ impl Lowerer<'_> {
         ops: &mut Vec<Op>,
         source: Option<usize>,
     ) -> Result<(), RenderError> {
-        if matches!(run.style, GlyphStyle::Stroke(_)) {
-            return Err(RenderError::Unsupported(names::GLYPH_STROKE));
+        if let GlyphStyle::Stroke(style) = &run.style {
+            return self.stroked_glyph_run(ambient, run, style, paint, ops);
         }
         let font = self
             .fonts
@@ -958,6 +958,39 @@ impl Lowerer<'_> {
             return Ok(());
         }
         self.color_glyph_run(ambient, run, paint, ops, font, resolved)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn stroked_glyph_run(
+        &self,
+        ambient: Affine,
+        run: &GlyphRun,
+        style: &kurbo::Stroke,
+        paint: &Paint,
+        ops: &mut Vec<Op>,
+    ) -> Result<(), RenderError> {
+        let font = self
+            .fonts
+            .get(&run.font.raw())
+            .ok_or_else(|| RenderError::Font(format!("unregistered font {:?}", run.font)))?;
+        if run.glyphs.iter().any(|glyph| glyph.transform.is_some()) {
+            return Err(RenderError::Unsupported(names::GLYPH_TRANSFORM));
+        }
+        for path in super::glyph::stroke_outlines(font, run)? {
+            self.stroke(
+                ambient,
+                &ShapeData::Path {
+                    elements: path.into_elements(),
+                    rule: FillRule::NonZero,
+                },
+                style,
+                paint,
+                ops,
+                None,
+            )?;
+        }
+        Ok(())
     }
 
     fn color_glyph_run(

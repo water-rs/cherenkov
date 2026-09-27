@@ -540,7 +540,6 @@ pub fn items_for_glyph_run(
         .map(|c| F2Dot14Coord::from_f32(c.value))
         .collect();
 
-    let outlines = font.outline_glyphs();
     let color_glyphs = font.color_glyphs();
     let palette: Vec<skrifa::color::Color> = font
         .color_palettes()
@@ -564,7 +563,16 @@ pub fn items_for_glyph_run(
         let place =
             Affine::translate((f64::from(g.x), f64::from(g.y))) * Affine::scale_non_uniform(s, -s);
 
-        if let Some(color_glyph) = color_glyphs.get(gid) {
+        if let Some(stroke) = &run.stroke {
+            let pen = BezPen(outline_path(&font, gid_u16, &coords)?);
+            items.push(Item::Draw(Draw::Stroke {
+                shape: Shape::Path {
+                    path: place * pen.0,
+                },
+                stroke: stroke.clone(),
+                paint: run.paint.clone(),
+            }));
+        } else if let Some(color_glyph) = color_glyphs.get(gid) {
             // fill_rect_font: canvas rect expressed in font units.
             let inv = place.inverse();
             let corners = [
@@ -608,14 +616,7 @@ pub fn items_for_glyph_run(
                     .map(|n| node_to_item(n, place, scene_rect)),
             );
         } else {
-            let outline = outlines.get(gid).ok_or(GlyphError::NoOutline(gid_u16))?;
-            let mut pen = BezPen(BezPath::new());
-            outline
-                .draw(
-                    DrawSettings::unhinted(Size::unscaled(), LocationRef::new(&coords)),
-                    &mut pen,
-                )
-                .map_err(|e| GlyphError::Font(e.to_string()))?;
+            let pen = BezPen(outline_path(&font, gid_u16, &coords)?);
             if pen.0.elements().is_empty() {
                 continue;
             }
@@ -629,4 +630,24 @@ pub fn items_for_glyph_run(
         }
     }
     Ok(items)
+}
+
+/// Obtain one unhinted outline without applying placement or paint.
+fn outline_path(
+    font: &skrifa::FontRef<'_>,
+    glyph: u16,
+    coords: &[F2Dot14Coord],
+) -> Result<BezPath, GlyphError> {
+    let outlines = font.outline_glyphs();
+    let outline = outlines
+        .get(GlyphId::from(glyph))
+        .ok_or(GlyphError::NoOutline(glyph))?;
+    let mut pen = BezPen(BezPath::new());
+    outline
+        .draw(
+            DrawSettings::unhinted(Size::unscaled(), LocationRef::new(coords)),
+            &mut pen,
+        )
+        .map_err(|error| GlyphError::Font(error.to_string()))?;
+    Ok(pen.0)
 }

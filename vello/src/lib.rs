@@ -136,13 +136,36 @@ impl Backend for Vello {
     type Target = VelloTarget;
     type Renderer = render::VelloRenderer;
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn init(config: VelloConfig) -> Result<(Self::Renderer, Self::Info), EngineError> {
+        render::init(config)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn init(config: VelloConfig) -> Result<(Self::Renderer, Self::Info), EngineError> {
         render::init(config)
     }
 }
 
 impl ShaderPaintCapability for Vello {
+    #[cfg(not(target_arch = "wasm32"))]
     fn add_shader(
+        r: &mut Self::Renderer,
+        id: ShaderId,
+        source: ShaderSource,
+    ) -> Result<(), ResourceError> {
+        r.shaders.add(
+            &r.device,
+            id.raw(),
+            &render::ShaderSpec {
+                source: source.source,
+                animated: source.animated,
+            },
+        )
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn add_shader(
         r: &mut Self::Renderer,
         id: ShaderId,
         source: ShaderSource,

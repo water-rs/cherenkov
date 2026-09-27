@@ -23,11 +23,22 @@ pub trait ShaderPaint: Backend {
     /// # Errors
     /// [`ResourceError::Shader`] when the source fails validation or
     /// pipeline creation.
+    #[cfg(not(target_arch = "wasm32"))]
     fn add_shader(
         r: &mut Self::Renderer,
         id: ShaderId,
         source: ShaderSource,
     ) -> Result<(), ResourceError>;
+    /// Validates shader registration without blocking the JS event loop.
+    ///
+    /// # Errors
+    /// Returns shader validation errors.
+    #[cfg(target_arch = "wasm32")]
+    fn add_shader(
+        r: &mut Self::Renderer,
+        id: ShaderId,
+        source: ShaderSource,
+    ) -> impl core::future::Future<Output = Result<(), ResourceError>>;
     /// Unregisters a shader.
     fn remove_shader(r: &mut Self::Renderer, id: ShaderId);
 }
@@ -39,7 +50,7 @@ pub trait Filters: Backend {
 }
 
 /// The backend can run the filtrate filter `F`.
-pub trait Runs<F: filtrate_core::Filter + Send>: Filters {
+pub trait Runs<F: filtrate_core::Filter + crate::RenderTransfer>: Filters {
     /// Registers a filter on the render thread.
     fn add_filter(r: &mut Self::Renderer, id: FilterId, filter: F);
 }
@@ -48,7 +59,7 @@ pub trait Runs<F: filtrate_core::Filter + Send>: Filters {
 /// GPU backends).
 pub trait Effects: Filters {
     /// The effect payload type.
-    type Effect: Send + 'static;
+    type Effect: crate::RenderTransfer + 'static;
     /// Registers an effect on the render thread.
     fn add_effect(r: &mut Self::Renderer, id: FilterId, effect: Self::Effect);
 }
@@ -56,7 +67,7 @@ pub trait Effects: Filters {
 /// The backend composites user GPU-rendered content as layer content.
 pub trait GpuContent: Backend {
     /// The content payload type.
-    type Content: Send + 'static;
+    type Content: crate::RenderTransfer + 'static;
     /// Resizes an installed producer's attachment without repeating setup.
     /// Called in transaction order; the layer must contain GPU content.
     fn resize_gpu_content(
@@ -78,7 +89,7 @@ pub trait GpuContent: Backend {
 /// The backend consumes externally produced frames (video, web views).
 pub trait ExternalFrames: Backend {
     /// The frame payload type.
-    type Frame: Send + 'static;
+    type Frame: crate::RenderTransfer + 'static;
     /// Attaches an external frame to a layer.
     fn set_external_frame(
         r: &mut Self::Renderer,

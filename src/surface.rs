@@ -5,12 +5,15 @@
 //! surface's queue into one [`Message::Render`], so the render thread
 //! wakes once per frame.
 
+#[cfg(target_arch = "wasm32")]
+use crate::local::Sender;
 use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::ops::{Index, IndexMut};
 use std::rc::Rc;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::mpsc::Sender;
 
 use kurbo::{Affine, Vec2};
@@ -272,7 +275,10 @@ impl<B: ExternalFrames> From<ExternalFrameHandle<B>> for LayerContent<B> {
 /// An opaque render-side install a [`GpuContent`] or [`ExternalFrames`]
 /// capability wraps; the closure learns its surface and layer at apply
 /// time.
+#[cfg(not(target_arch = "wasm32"))]
 type InstallOp<B> = Box<dyn FnOnce(&mut <B as Backend>::Renderer, SurfaceId, LayerId) + Send>;
+#[cfg(target_arch = "wasm32")]
+type InstallOp<B> = Box<dyn FnOnce(&mut <B as Backend>::Renderer, SurfaceId, LayerId)>;
 
 /// A recorded layer edit inside a [`Transaction`].
 enum EditOp<B: Backend> {
@@ -744,6 +750,7 @@ impl<B: Backend> Surface<B> {
     /// [`RenderError::NotReadable`] for a non-readable surface,
     /// [`RenderError::Readback`] when the readback fails, or
     /// [`RenderError::Thread`] when the render thread is gone.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn readback(&self) -> Result<Readback, RenderError> {
         if !self.readable {
             return Err(RenderError::NotReadable);
@@ -756,6 +763,25 @@ impl<B: Backend> Surface<B> {
             })
             .map_err(|_| RenderError::Thread)?;
         rx.recv().map_err(|_| RenderError::Thread)?
+    }
+
+    /// Reads the last rendered pixels, yielding until browser mapping completes.
+    ///
+    /// # Errors
+    /// Returns `NotReadable`, a readback error, or `Thread` if the executor stopped.
+    #[cfg(target_arch = "wasm32")]
+    pub async fn readback(&self) -> Result<Readback, RenderError> {
+        if !self.readable {
+            return Err(RenderError::NotReadable);
+        }
+        let (reply, rx) = crate::local::channel();
+        self.tx
+            .send(Message::Readback {
+                surface: self.id,
+                reply,
+            })
+            .map_err(|_| RenderError::Thread)?;
+        rx.recv().await.map_err(|_| RenderError::Thread)?
     }
 }
 

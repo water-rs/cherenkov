@@ -21,6 +21,14 @@ thiserror = "2"
 tracing = "0.1"
 rustc-hash = "2"
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+futures-channel = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+gloo-timers = { version = "0.3", features = ["futures"] }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
+
 [dev-dependencies]
 naga = { version = "29", features = ["wgsl-in", "spv-out", "msl-out", "hlsl-out"] }
 

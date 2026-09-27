@@ -3,8 +3,8 @@
 //!
 //! [`Engine::render`]: crate::Engine::render
 
+use crate::Instant;
 use std::ops::RangeInclusive;
-use std::time::Instant;
 
 /// The presentation timestamp handed to [`Engine::render`](crate::Engine::render).
 #[derive(Clone, Copy, Debug)]

@@ -462,6 +462,7 @@ fn cherenkov_features() -> Vec<Feature> {
         Feature::Fill,
         Feature::Stroke,
         Feature::ContinuousCorners,
+        Feature::PaintTransform,
         Feature::LinearGradient,
         Feature::RadialGradient,
         Feature::Clip,
@@ -621,6 +622,9 @@ fn front_paint(
     images: &HashMap<ResourceHash, cherenkov::ImageId>,
 ) -> Result<cherenkov::Paint, BenchError> {
     Ok(match paint {
+        ScenePaint::Transformed { paint, transform } => {
+            front_paint(paint, images)?.transformed(*transform)
+        }
         ScenePaint::Solid(c) => cherenkov::Paint::Solid(working(c)),
         ScenePaint::Linear(g) => cherenkov::Paint::Linear(cherenkov::LinearGradient {
             start: g.start,
@@ -867,7 +871,7 @@ fn register_images(
                     SceneDraw::Glyphs(run) => Some(&run.paint),
                     _ => None,
                 };
-                if let Some(ScenePaint::Image(p)) = paint {
+                if let Some(p) = paint.and_then(crate::convert::image_paint) {
                     register_image(images, handles, engine, &p.image, blobs)?;
                 }
             }

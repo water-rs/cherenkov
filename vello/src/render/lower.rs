@@ -52,10 +52,7 @@ pub fn lower(
         match command {
             Command::Fill { shape, paint } => {
                 let path = convert::shape_path(shape);
-                let (brush, brush_transform) = match paint {
-                    Paint::Shader(sp) => shader_brush(sp, &path, xf, resources)?,
-                    _ => brush_of(paint, resources)?,
-                };
+                let (brush, brush_transform) = draw_brush(paint, &path, xf, resources)?;
                 scene.fill(
                     convert::fill(convert::shape_rule(shape)),
                     xf,
@@ -70,10 +67,7 @@ pub fn lower(
                 paint,
             } => {
                 let path = convert::shape_path(shape);
-                let (brush, brush_transform) = match paint {
-                    Paint::Shader(sp) => shader_brush(sp, &path, xf, resources)?,
-                    _ => brush_of(paint, resources)?,
-                };
+                let (brush, brush_transform) = draw_brush(paint, &path, xf, resources)?;
                 scene.stroke(stroke, xf, &brush, brush_transform, &path);
             }
             Command::Shadow { shape, shadow } => {
@@ -205,6 +199,37 @@ fn stops(stops: &[cherenkov::ColorStop]) -> ColorStops {
     ColorStops::from(&v[..])
 }
 
+fn paint_transform(transform: Affine) -> Result<Affine, RenderError> {
+    if !transform.is_finite() || !transform.inverse().is_finite() {
+        return Err(RenderError::Render(
+            "paint transform must be finite and invertible".into(),
+        ));
+    }
+    Ok(transform)
+}
+
+fn draw_brush(
+    paint: &Paint,
+    path: &kurbo::BezPath,
+    xf: Affine,
+    resources: &mut Resources<'_>,
+) -> Result<(Brush, Option<Affine>), RenderError> {
+    match paint {
+        Paint::Shader(shader) => shader_brush(shader, path, xf, resources),
+        Paint::Transformed(mapped) => {
+            let transform = paint_transform(mapped.transform)?;
+            let (brush, inner) = draw_brush(&mapped.paint, path, xf, resources)?;
+            Ok((
+                brush,
+                Some(paint_transform(
+                    transform * inner.unwrap_or(Affine::IDENTITY),
+                )?),
+            ))
+        }
+        _ => brush_of(paint, resources),
+    }
+}
+
 /// Resolves a `Paint` to a `peniko::Brush` plus an optional brush-space
 /// transform (image patterns only).
 #[expect(
@@ -216,6 +241,16 @@ fn brush_of(
     resources: &Resources<'_>,
 ) -> Result<(Brush, Option<Affine>), RenderError> {
     Ok(match paint {
+        Paint::Transformed(mapped) => {
+            let transform = paint_transform(mapped.transform)?;
+            let (brush, inner) = brush_of(&mapped.paint, resources)?;
+            (
+                brush,
+                Some(paint_transform(
+                    transform * inner.unwrap_or(Affine::IDENTITY),
+                )?),
+            )
+        }
         Paint::Solid(c) => (Brush::Solid(convert::color(c)), None),
         Paint::Linear(g) => (
             Brush::Gradient(peniko::Gradient {
@@ -280,7 +315,7 @@ fn brush_of(
                 Some(pattern.transform),
             )
         }
-        Paint::Shader(_) => unreachable!("shader paints resolve through shader_brush"),
+        Paint::Shader(_) => return Err(RenderError::Unsupported(names::SHADER_GLYPHS)),
     })
 }
 

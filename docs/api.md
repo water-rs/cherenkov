@@ -342,11 +342,13 @@ pub enum Paint {
     Mesh(MeshGradient),              // Hydrolysis panics on this today
     Image(ImagePaint),               // pattern: image, transform, extend modes, sampling
     Shader(ShaderPaint),             // user WGSL fragment shader; GPU only (ShaderPaint capability)
+    Transformed(TransformedPaint),   // shared paint plus independent paint-to-shape Affine
 }
 ```
 
 - `impl<CS: ColorSpace> From<Color<CS>> for Paint`, and likewise for each gradient type.
 - **Gradients.** Stops are colours in any space. The interpolation space is a gradient property; the default is the working space, and an sRGB-encoded option exists for web compatibility.
+- **Paint coordinates.** `Paint::transformed` maps paint coordinates into shape space without changing geometry, stroke width or clipping. `TransformedPaint` shares its source through `Arc<Paint>`; a live transform updates only its recorded users. Nested transforms compose outside-in, and non-finite or non-invertible transforms fail rendering. See [the #68 decision](paint-transform.md).
 - **Stroke** is `kurbo::Stroke`: width, joins, caps, miter limit, dashes.
 - **Shader paints** replace `ShaderSurface`, `FlowingGradient` and `ViewEffect`. They inherit the shape, clip, antialiasing and on-chip blending, and they receive time and any signal-bound uniforms.
 - **Shader paints follow a portable contract.** Inputs are explicit: coordinates, time, uniforms, declared resources and sampling footprints. Gradients are passed explicitly, and nothing relies on implicit fragment derivatives or on fragment-stage built-ins. This lets the same paint run in a fragment shader, a tile interpreter or a compute shader, so the paint contract never pre-selects the raster architecture.

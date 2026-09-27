@@ -545,7 +545,15 @@ fn paint_image(i: u32, local: vec2<f32>) -> vec4<f32> {
 }
 
 fn paint(i: u32, meta_: vec4<u32>, color: vec4<f32>, local: vec2<f32>, pixel: vec2<f32>) -> vec4<f32> {
-    switch meta_.y {
+    let kind = meta_.y & 0xffffu;
+    var point = local;
+    if (meta_.y & 0x10000u) != 0u {
+        let linear = stops[meta_.z - 2u].color;
+        let offset = stops[meta_.z - 1u].color.xy;
+        point = vec2<f32>(linear.x * local.x + linear.z * local.y,
+                          linear.y * local.x + linear.w * local.y) + offset;
+    }
+    switch kind {
         case PAINT_SOLID: {
             return vec4<f32>(color.rgb * color.a, color.a);
         }
@@ -554,16 +562,16 @@ fn paint(i: u32, meta_: vec4<u32>, color: vec4<f32>, local: vec2<f32>, pixel: ve
             return textureLoad(source, vec2<i32>(floor(pixel - instances[i].grad.xy)), 0);
         }
         case PAINT_IMAGE: {
-            return paint_image(i, local);
+            return paint_image(i, point);
         }
         default: {
             var t: f32;
-            if meta_.y == PAINT_LINEAR {
-                t = linear_t(i, local);
-            } else if meta_.y == PAINT_SWEEP {
-                t = sweep_t(i, local);
+            if kind == PAINT_LINEAR {
+                t = linear_t(i, point);
+            } else if kind == PAINT_SWEEP {
+                t = sweep_t(i, point);
             } else {
-                t = radial_t(i, local);
+                t = radial_t(i, point);
             }
             // NaN (exponent all-ones, nonzero mantissa) → transparent.
             // `t != t` is not reliable under every driver.

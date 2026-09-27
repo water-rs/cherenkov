@@ -201,6 +201,13 @@ pub fn eval_paint(
     resources: &mut Resources,
 ) -> Result<[f64; 4], cherenkov_scene::SceneError> {
     Ok(match paint {
+        Paint::Transformed { paint, transform } => {
+            let inverse = transform.inverse();
+            if !transform.is_finite() || !inverse.is_finite() {
+                return Err(cherenkov_scene::SceneError::PaintTransform);
+            }
+            eval_paint(paint, inverse * p, resources)?
+        }
         Paint::Solid(c) => to_working(c),
         Paint::Linear(g) => extend_t(linear_t(p, g), g.extend)
             .map_or([0.0; 4], |t| eval_stops(&g.stops, t, g.interpolation)),

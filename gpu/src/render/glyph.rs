@@ -33,13 +33,14 @@ pub struct FontData {
     /// Built font-space `COLRv1` pictures, per `(glyph id, coords hash,
     /// paint hash)` — content is size-independent, so it is keyed without
     /// the placement. Interior mutability, not shared: parallel lowering
-    /// works on a per-thread [`Self::snapshot`].
+    /// works on a per-thread snapshot.
     pub colr: std::cell::RefCell<HashMap<(u32, u64, u64), cherenkov::Picture>>,
 }
 
 impl FontData {
     /// A per-thread copy: shares the font bytes, clones the COLR cache.
     /// Workers each own one so `colr` can stay a plain `RefCell`.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn snapshot(&self) -> Self {
         Self {
             data: self.data.clone(),

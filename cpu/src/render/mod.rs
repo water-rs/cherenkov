@@ -242,7 +242,22 @@ impl Renderer for RasterRenderer {
     }
 
     /// Lowers and rasterizes every changed surface.
+    #[cfg(not(target_arch = "wasm32"))]
     fn render(&mut self, frame: &Frame<'_>, stats: &mut FrameStats) -> Result<Redraw, RenderError> {
+        for sf in frame.surfaces.iter().filter(|sf| sf.changed) {
+            stats.frame = Some(frame.id);
+            self.render_surface(sf, stats)?;
+        }
+        // No backend-side redraw sources in this slice.
+        Ok(Redraw::None)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn render(
+        &mut self,
+        frame: &Frame<'_>,
+        stats: &mut FrameStats,
+    ) -> Result<Redraw, RenderError> {
         for sf in frame.surfaces.iter().filter(|sf| sf.changed) {
             stats.frame = Some(frame.id);
             self.render_surface(sf, stats)?;
@@ -254,7 +269,28 @@ impl Renderer for RasterRenderer {
     /// Materializes a surface's framebuffer into `Readback` pixels,
     /// rounding through `f16` for
     /// [`OffscreenFormat::LinearF16`](cherenkov::OffscreenFormat::LinearF16).
+    #[cfg(not(target_arch = "wasm32"))]
     fn readback(&mut self, surface: SurfaceId) -> Result<Readback, RenderError> {
+        let Some(state) = self.surfaces.get(&surface) else {
+            return Err(RenderError::Readback("unknown surface".into()));
+        };
+        let pixels = match state.format {
+            cherenkov::OffscreenFormat::LinearF32 => state.fb.clone(),
+            cherenkov::OffscreenFormat::LinearF16 => state
+                .fb
+                .iter()
+                .map(|px| px.map(|v| half::f16::from_f32(v).to_f32()))
+                .collect(),
+        };
+        Ok(Readback {
+            width: state.size.0,
+            height: state.size.1,
+            pixels,
+        })
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn readback(&mut self, surface: SurfaceId) -> Result<Readback, RenderError> {
         let Some(state) = self.surfaces.get(&surface) else {
             return Err(RenderError::Readback("unknown surface".into()));
         };
@@ -315,7 +351,7 @@ impl RasterRenderer {
         stats: &mut FrameStats,
     ) -> Result<(), RenderError> {
         let profile = tracing::enabled!(target: "cherenkov_cpu::profile", tracing::Level::DEBUG);
-        let start = profile.then(std::time::Instant::now);
+        let start = profile.then(cherenkov::Instant::now);
         let id = sf.id;
         let mut items: Vec<Item> = Vec::new();
         let glyph_reqs;
@@ -335,9 +371,9 @@ impl RasterRenderer {
             result
         };
         lowered?;
-        let lowered_at = start.map(|_| std::time::Instant::now());
+        let lowered_at = start.map(|_| cherenkov::Instant::now());
         self.resolve_glyphs(&glyph_reqs)?;
-        let resolved_at = start.map(|_| std::time::Instant::now());
+        let resolved_at = start.map(|_| cherenkov::Instant::now());
         let Some(surf) = self.surfaces.get_mut(&id) else {
             return Ok(());
         };

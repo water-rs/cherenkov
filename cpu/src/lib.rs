@@ -91,7 +91,13 @@ impl Backend for Raster {
     type Target = RasterTarget;
     type Renderer = render::RasterRenderer;
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn init(config: RasterConfig) -> Result<(Self::Renderer, Self::Info), EngineError> {
+        render::init(config)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn init(config: RasterConfig) -> Result<(Self::Renderer, Self::Info), EngineError> {
         render::init(config)
     }
 }

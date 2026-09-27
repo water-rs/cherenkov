@@ -9,6 +9,20 @@
 //! `interop` module.
 
 use crate::WorkingColor;
+
+/// Values crossing the native render-thread boundary. On wasm32 the render
+/// executor is local to the creating JS thread, so transfer is not required.
+#[cfg(not(target_arch = "wasm32"))]
+pub trait RenderTransfer: Send {}
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Send + ?Sized> RenderTransfer for T {}
+
+/// Values retained by the local browser executor; they need not be `Send`.
+#[cfg(target_arch = "wasm32")]
+pub trait RenderTransfer {}
+#[cfg(target_arch = "wasm32")]
+impl<T: ?Sized> RenderTransfer for T {}
+
 use crate::config::{MemoryUsage, Pressure};
 use crate::error::{EngineError, RenderError, ResourceError, SurfaceError};
 use crate::frame::{FrameId, FrameStats, FrameTime, FrameTiming, Readback};
@@ -22,12 +36,12 @@ use crate::tree::SurfaceTree;
 /// (`Gpu`, `Vello`, `Raster`).
 pub trait Backend: Sized + 'static {
     /// The backend's configuration type.
-    type Config: Send + 'static;
+    type Config: RenderTransfer + 'static;
     /// Provenance for reports.
     type Info: Clone + Send + 'static;
     /// A surface target: [`Offscreen`](crate::Offscreen) or an interop
     /// window target.
-    type Target: From<crate::Offscreen> + Send + 'static;
+    type Target: From<crate::Offscreen> + RenderTransfer + 'static;
     /// The render-thread state; never leaves that thread.
     type Renderer: Renderer<Target = Self::Target>;
 
@@ -35,7 +49,17 @@ pub trait Backend: Sized + 'static {
     ///
     /// # Errors
     /// [`EngineError`] when the device or pool cannot be created.
+    #[cfg(not(target_arch = "wasm32"))]
     fn init(config: Self::Config) -> Result<(Self::Renderer, Self::Info), EngineError>;
+
+    /// Initializes on the owning JS thread without blocking its event loop.
+    ///
+    /// # Errors
+    /// Returns a backend initialization error.
+    #[cfg(target_arch = "wasm32")]
+    fn init(
+        config: Self::Config,
+    ) -> impl core::future::Future<Output = Result<(Self::Renderer, Self::Info), EngineError>>;
 }
 
 /// Everything the render loop asks of a backend. Every method runs on the
@@ -90,7 +114,19 @@ pub trait Renderer: 'static {
     ///
     /// # Errors
     /// [`RenderError`] fails the whole `render` call.
+    #[cfg(not(target_arch = "wasm32"))]
     fn render(&mut self, frame: &Frame<'_>, stats: &mut FrameStats) -> Result<Redraw, RenderError>;
+
+    /// Executes on the owning JS thread, yielding for browser operations.
+    ///
+    /// # Errors
+    /// Returns the corresponding render or readback error.
+    #[cfg(target_arch = "wasm32")]
+    fn render(
+        &mut self,
+        frame: &Frame<'_>,
+        stats: &mut FrameStats,
+    ) -> impl core::future::Future<Output = Result<Redraw, RenderError>>;
 
     /// Waits for the GPU to finish every submitted frame whose timing no
     /// render has reported yet, and returns those timings, oldest first.
@@ -100,8 +136,20 @@ pub trait Renderer: 'static {
     /// # Errors
     /// [`RenderError::Timeout`] when the GPU does not finish in time,
     /// [`RenderError::Readback`] when the timing buffers cannot be read.
+    #[cfg(not(target_arch = "wasm32"))]
     fn finish_timings(&mut self) -> Result<Vec<FrameTiming>, RenderError> {
         Ok(Vec::new())
+    }
+
+    /// Awaits outstanding GPU timing readbacks without blocking JavaScript.
+    ///
+    /// # Errors
+    /// Returns a timeout or readback error.
+    #[cfg(target_arch = "wasm32")]
+    fn finish_timings(
+        &mut self,
+    ) -> impl core::future::Future<Output = Result<Vec<FrameTiming>, RenderError>> {
+        core::future::ready(Ok(Vec::new()))
     }
 
     /// Reads back a surface's pixels.
@@ -109,7 +157,18 @@ pub trait Renderer: 'static {
     /// # Errors
     /// [`RenderError::NotReadable`] for non-readable surfaces,
     /// [`RenderError::Readback`] on failure.
+    #[cfg(not(target_arch = "wasm32"))]
     fn readback(&mut self, surface: SurfaceId) -> Result<Readback, RenderError>;
+
+    /// Executes on the owning JS thread, yielding for browser operations.
+    ///
+    /// # Errors
+    /// Returns the corresponding render or readback error.
+    #[cfg(target_arch = "wasm32")]
+    fn readback(
+        &mut self,
+        surface: SurfaceId,
+    ) -> impl core::future::Future<Output = Result<Readback, RenderError>>;
 
     /// The backend's current memory usage.
     fn memory(&self) -> MemoryUsage;

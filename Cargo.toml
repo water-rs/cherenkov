@@ -11,6 +11,7 @@ publish = false
 testing = []
 
 [dependencies]
+web-time = "1"
 color = { version = "0.3.3", features = ["serde"] }
 filtrate-core = { path = "filtrate/core" }
 kurbo = { version = "0.13.1", features = ["serde"] }
@@ -18,6 +19,9 @@ nami-core = { version = "0.3.3", features = ["kurbo"] }
 serde = { version = "1", features = ["derive", "rc"] }
 thiserror = "2"
 tracing = "0.1"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen-futures = "0.4"
 
 [dev-dependencies]
 nami = { version = "0.11.1", default-features = false, features = ["std", "kurbo"] }

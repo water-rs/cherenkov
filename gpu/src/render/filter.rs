@@ -23,17 +23,17 @@ impl std::fmt::Debug for EffectBox {
     }
 }
 
-impl<E: Effect + Send> From<E> for EffectBox {
+impl<E: Effect + cherenkov::RenderTransfer> From<E> for EffectBox {
     fn from(effect: E) -> Self {
         Self(Box::new(effect))
     }
 }
 
-pub trait Source: Send {
+pub trait Source: cherenkov::RenderTransfer {
     fn build(self: Box<Self>) -> Box<dyn Runnable>;
 }
 
-impl<E: Effect + Send> Source for E {
+impl<E: Effect + cherenkov::RenderTransfer> Source for E {
     fn build(self: Box<Self>) -> Box<dyn Runnable> {
         self
     }
@@ -41,14 +41,22 @@ impl<E: Effect + Send> Source for E {
 
 pub struct FromFilter<F>(pub F);
 
-impl<F: filtrate_core::Filter + Send> Source for FromFilter<F> {
+impl<F: filtrate_core::Filter + cherenkov::RenderTransfer> Source for FromFilter<F> {
     fn build(self: Box<Self>) -> Box<dyn Runnable> {
         Box::new(filtrate::Executor::new(self.0))
     }
 }
 
 pub trait Runnable {
+    #[cfg(not(target_arch = "wasm32"))]
     fn setup(&mut self, ctx: &EffectContext<'_>) -> Result<(), filtrate::EffectSetupError>;
+    #[cfg(target_arch = "wasm32")]
+    fn setup<'a>(
+        &'a mut self,
+        ctx: &'a EffectContext<'a>,
+    ) -> core::pin::Pin<
+        Box<dyn core::future::Future<Output = Result<(), filtrate::EffectSetupError>> + 'a>,
+    >;
     fn encode(
         &mut self,
         input: &EffectInput<'_>,
@@ -59,8 +67,19 @@ pub trait Runnable {
 }
 
 impl<E: Effect> Runnable for E {
+    #[cfg(not(target_arch = "wasm32"))]
     fn setup(&mut self, ctx: &EffectContext<'_>) -> Result<(), filtrate::EffectSetupError> {
         pollster::block_on(Effect::setup(self, ctx))
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn setup<'a>(
+        &'a mut self,
+        ctx: &'a EffectContext<'a>,
+    ) -> core::pin::Pin<
+        Box<dyn core::future::Future<Output = Result<(), filtrate::EffectSetupError>> + 'a>,
+    > {
+        Box::pin(Effect::setup(self, ctx))
     }
     fn encode(
         &mut self,
@@ -82,8 +101,41 @@ struct Entry {
     again: bool,
     sequence: Option<u64>,
     setup: Option<Result<(), String>>,
+    #[cfg(target_arch = "wasm32")]
+    setup_pending_frame: bool,
     input: Option<(wgpu::Texture, wgpu::TextureView)>,
     output: Option<(wgpu::Texture, wgpu::TextureView)>,
+}
+
+impl Entry {
+    fn check_setup(
+        &mut self,
+        id: u64,
+        context: &EffectContext<'_>,
+        format: wgpu::TextureFormat,
+    ) -> Result<(), RenderError> {
+        #[cfg(not(target_arch = "wasm32"))]
+        let setup = self.setup.get_or_insert_with(|| {
+            self.effect
+                .setup(&EffectContext {
+                    input_format: format,
+                    output_format: format,
+                    ..*context
+                })
+                .map_err(|error| error.to_string())
+        });
+        #[cfg(target_arch = "wasm32")]
+        let setup = {
+            let _ = (context, format);
+            self.setup
+                .as_ref()
+                .expect("browser prepares active filters before encoding")
+        };
+        setup
+            .as_ref()
+            .copied()
+            .map_err(|error| RenderError::Render(format!("filter {id} setup: {error}")))
+    }
 }
 
 pub struct Registry {
@@ -122,6 +174,8 @@ impl Registry {
                 again: false,
                 sequence: None,
                 setup: None,
+                #[cfg(target_arch = "wasm32")]
+                setup_pending_frame: false,
                 input: None,
                 output: None,
             },
@@ -189,25 +243,22 @@ impl Registry {
             timing
         };
         if !repeated {
-            entry.dirty.swap(false, Ordering::AcqRel);
-            entry.again = false;
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                entry.dirty.swap(false, Ordering::AcqRel);
+                entry.again = false;
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                // Browser setup consumes the initial request before awaiting.
+                // A request arriving during setup still needs a second frame.
+                let requested = entry.dirty.swap(false, Ordering::AcqRel);
+                entry.again = std::mem::take(&mut entry.setup_pending_frame) && requested;
+            }
             entry.sequence = Some(timing.sequence());
         }
         let format = scratch.texture.format();
-        let setup = entry.setup.get_or_insert_with(|| {
-            entry
-                .effect
-                .setup(&EffectContext {
-                    device,
-                    queue,
-                    input_format: format,
-                    output_format: format,
-                })
-                .map_err(|error| error.to_string())
-        });
-        if let Err(error) = setup {
-            return Err(RenderError::Render(format!("filter {id} setup: {error}")));
-        }
+        entry.check_setup(id, context, format)?;
         if entry
             .input
             .as_ref()
@@ -278,5 +329,37 @@ impl Drop for Registry {
         for entry in self.entries.values() {
             entry.active.store(false, Ordering::Release);
         }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl Registry {
+    pub(super) async fn prepare(
+        &mut self,
+        id: u64,
+        context: &EffectContext<'_>,
+    ) -> Result<(), RenderError> {
+        let entry = self
+            .entries
+            .get_mut(&id)
+            .ok_or_else(|| RenderError::Render(format!("unregistered filter {id}")))?;
+        if entry.setup.is_none() {
+            entry.dirty.swap(false, Ordering::AcqRel);
+            entry.setup_pending_frame = true;
+            entry.setup = Some(
+                entry
+                    .effect
+                    .setup(context)
+                    .await
+                    .map_err(|error| error.to_string()),
+            );
+        }
+        entry
+            .setup
+            .as_ref()
+            .expect("setup completed")
+            .as_ref()
+            .copied()
+            .map_err(|error| RenderError::Render(format!("filter {id} setup: {error}")))
     }
 }

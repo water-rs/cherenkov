@@ -96,7 +96,18 @@ impl Backend for Null {
     type Target = Offscreen;
     type Renderer = NullRenderer;
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn init(config: NullConfig) -> Result<(NullRenderer, NullInfo), EngineError> {
+        Ok((
+            NullRenderer {
+                events: config.events,
+            },
+            (),
+        ))
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn init(config: NullConfig) -> Result<(NullRenderer, NullInfo), EngineError> {
         Ok((
             NullRenderer {
                 events: config.events,
@@ -159,6 +170,7 @@ impl Renderer for NullRenderer {
         let _ = self.events.send(Event::RemoveLayer(surface, layer));
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn render(
         &mut self,
         frame: &Frame<'_>,
@@ -185,7 +197,45 @@ impl Renderer for NullRenderer {
         Ok(Redraw::None)
     }
 
+    #[cfg(target_arch = "wasm32")]
+    async fn render(
+        &mut self,
+        frame: &Frame<'_>,
+        _stats: &mut crate::FrameStats,
+    ) -> Result<Redraw, RenderError> {
+        for surface in frame.surfaces {
+            let layers = surface
+                .tree
+                .layers()
+                .map(|(id, node)| LayerSample {
+                    id,
+                    transform: node.transform,
+                    opacity: node.opacity,
+                    scroll_offset: node.scroll_offset,
+                    children: node.children.clone(),
+                })
+                .collect();
+            let _ = self.events.send(Event::Frame(FrameRecord {
+                surface: surface.id,
+                changed: surface.changed,
+                layers,
+            }));
+        }
+        Ok(Redraw::None)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn readback(&mut self, surface: SurfaceId) -> Result<Readback, RenderError> {
+        let _ = surface;
+        Ok(Readback {
+            width: 0,
+            height: 0,
+            pixels: Vec::new(),
+        })
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn readback(&mut self, surface: SurfaceId) -> Result<Readback, RenderError> {
         let _ = surface;
         Ok(Readback {
             width: 0,
@@ -232,7 +282,8 @@ macro_rules! behaviour_suite {
         /// Image-lifetime checks for backends implementing
         /// `Uploads<Rgba8>`.
         mod behaviour_suite_uploads {
-            use std::time::{Duration, Instant};
+            use std::time::Duration;
+use $crate::Instant;
 
             use $crate::{Draw as _, Engine, FrameTime, ImageData, Layer, Offscreen, OffscreenFormat, Readback, Rgba8, Surface, WorkingColor};
             use $crate::kurbo::{Affine, Rect, Vec2};
@@ -281,7 +332,8 @@ macro_rules! behaviour_suite {
     };
     { @impl $backend:ty, $config:expr } => {
         mod behaviour_suite {
-            use std::time::{Duration, Instant};
+            use std::time::Duration;
+use $crate::Instant;
 
             use ::nami::SignalExt as _;
             use $crate::kurbo::{Affine, Rect, Vec2};
@@ -693,7 +745,8 @@ macro_rules! behaviour_suite {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    use crate::Instant;
+    use std::time::Duration;
 
     use super::*;
     use crate::image::ImageData;
@@ -887,7 +940,6 @@ mod tests {
             "removed content cannot wake the engine"
         );
     }
-
 }
 
 /// Retained-lowering equivalence checks for first-party backends.

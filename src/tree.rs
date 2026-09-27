@@ -8,8 +8,8 @@
 //! The backend never receives property ops; it reads the sampled tree
 //! through [`SurfaceFrame`](crate::SurfaceFrame).
 
+use crate::Instant;
 use std::collections::HashMap;
-use std::time::Instant;
 
 use kurbo::{Affine, Vec2};
 

@@ -158,7 +158,7 @@ impl WindowTarget {
             handle: Box::new(handle),
             size,
             transparent: false,
-            refresh: 60..=60,
+            refresh: cherenkov::DEFAULT_REFRESH,
         }
     }
 

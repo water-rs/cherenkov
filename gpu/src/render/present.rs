@@ -53,10 +53,10 @@ impl WindowSurface {
         } else if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
             wgpu::CompositeAlphaMode::Opaque
         } else {
-            caps.alpha_modes
+            *caps
+                .alpha_modes
                 .first()
-                .copied()
-                .unwrap_or(wgpu::CompositeAlphaMode::Auto)
+                .expect("a configurable surface reports at least one alpha mode")
         };
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,

@@ -224,6 +224,134 @@ pub struct ImagePaint {
     pub sampling: Sampling,
 }
 
+/// A mesh gradient's fields before its grid is validated: the form it
+/// deserializes from, so that captured scenes cannot bypass the invariants.
+#[derive(Deserialize)]
+struct MeshGradientData {
+    columns: u32,
+    rows: u32,
+    points: Vec<Point>,
+    colors: Vec<Color>,
+}
+
+/// Why a mesh gradient's grid is malformed.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum MeshGradientError {
+    /// Grid dimensions overflow addressable storage.
+    #[error("mesh grid exceeds addressable storage")]
+    GridOverflow,
+    /// The grid has no patch.
+    #[error("a mesh gradient needs at least one patch, got {columns} x {rows}")]
+    Empty {
+        /// Patches per row.
+        columns: u32,
+        /// Patches per column.
+        rows: u32,
+    },
+    /// A per-vertex list does not hold one entry per grid vertex.
+    #[error("a mesh gradient needs one {list} per grid vertex: {vertices} vertices, {len} entries")]
+    VertexCount {
+        /// Which list: points or colours.
+        list: &'static str,
+        /// Vertices in the grid.
+        vertices: usize,
+        /// Entries in the list.
+        len: usize,
+    },
+}
+
+impl TryFrom<MeshGradientData> for MeshGradient {
+    type Error = MeshGradientError;
+
+    fn try_from(data: MeshGradientData) -> Result<Self, Self::Error> {
+        let MeshGradientData {
+            columns,
+            rows,
+            points,
+            colors,
+        } = data;
+        if columns == 0 || rows == 0 {
+            return Err(MeshGradientError::Empty { columns, rows });
+        }
+        let vertices = usize::try_from(columns)
+            .ok()
+            .and_then(|n| n.checked_add(1))
+            .zip(usize::try_from(rows).ok().and_then(|n| n.checked_add(1)))
+            .and_then(|(columns, rows)| columns.checked_mul(rows))
+            .ok_or(MeshGradientError::GridOverflow)?;
+        for (list, len) in [("point", points.len()), ("colour", colors.len())] {
+            if len != vertices {
+                return Err(MeshGradientError::VertexCount {
+                    list,
+                    vertices,
+                    len,
+                });
+            }
+        }
+        Ok(Self {
+            columns,
+            rows,
+            points,
+            colors,
+        })
+    }
+}
+
+/// A mesh gradient: a grid of `columns` × `rows` patches whose corner points
+/// carry colours, interpolated across each patch.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "MeshGradientData")]
+pub struct MeshGradient {
+    columns: u32,
+    rows: u32,
+    points: Vec<Point>,
+    colors: Vec<Color>,
+}
+
+impl MeshGradient {
+    /// Creates a mesh gradient. `points` and `colors` list the
+    /// `(columns + 1) × (rows + 1)` grid vertices row by row.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the grid is empty or when either list does not hold one
+    /// entry per vertex.
+    #[must_use]
+    pub fn new(columns: u32, rows: u32, points: Vec<Point>, colors: Vec<Color>) -> Self {
+        Self::try_from(MeshGradientData {
+            columns,
+            rows,
+            points,
+            colors,
+        })
+        .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Patches per row.
+    #[must_use]
+    pub const fn columns(&self) -> u32 {
+        self.columns
+    }
+
+    /// Patches per column.
+    #[must_use]
+    pub const fn rows(&self) -> u32 {
+        self.rows
+    }
+
+    /// Grid vertices, row by row.
+    #[must_use]
+    pub fn points(&self) -> &[Point] {
+        &self.points
+    }
+
+    /// Vertex colours, row by row.
+    #[must_use]
+    pub fn colors(&self) -> &[Color] {
+        &self.colors
+    }
+}
+
 /// A paint: what covers the inside of a shape.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -243,6 +371,8 @@ pub enum Paint {
     Radial(RadialGradient),
     /// A sweep gradient.
     Sweep(SweepGradient),
+    /// Bilinear patches with premultiplied working-space vertex colours.
+    Mesh(MeshGradient),
     /// An image pattern.
     Image(ImagePaint),
 }
@@ -383,4 +513,19 @@ pub enum Draw {
         /// Sampling quality.
         sampling: Sampling,
     },
+}
+
+#[cfg(test)]
+mod mesh_overflow_tests {
+    #[test]
+    fn overflowing_grid_is_rejected_before_vertex_access() {
+        let error = super::MeshGradient::try_from(super::MeshGradientData {
+            columns: u32::MAX,
+            rows: u32::MAX,
+            points: vec![],
+            colors: vec![],
+        })
+        .expect_err("unaddressable grid");
+        assert_eq!(error, super::MeshGradientError::GridOverflow);
+    }
 }

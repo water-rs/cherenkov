@@ -159,6 +159,13 @@ impl Prepared {
                     api: Some("independent paint transform adapter"),
                 });
             }
+            Paint::Mesh(_) => {
+                return Err(BenchError::Unsupported {
+                    engine,
+                    feature: cherenkov_scene::Feature::MeshGradient,
+                    api: Some("bilinear mesh paint"),
+                });
+            }
             Paint::Solid(c) => Brush::Solid(peniko_solid(c)),
             Paint::Linear(g) => Brush::Gradient(gradient(
                 engine,
@@ -607,6 +614,13 @@ pub fn brush(engine: &'static str, paint: &Paint, blobs: &Blobs) -> Result<Brush
                 engine,
                 feature: Feature::PaintTransform,
                 api: Some("independent paint transform adapter"),
+            });
+        }
+        Paint::Mesh(_) => {
+            return Err(BenchError::Unsupported {
+                engine,
+                feature: cherenkov_scene::Feature::MeshGradient,
+                api: Some("bilinear mesh paint"),
             });
         }
         Paint::Solid(c) => Brush::Solid(peniko_solid(c)),

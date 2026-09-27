@@ -14,7 +14,7 @@ use cherenkov::{GlyphRun, GlyphStyle};
 use super::instance::{
     EXTEND_NONE, EXTEND_PAD, EXTEND_REFLECT, EXTEND_REPEAT, FLAG_HAS_INNER, INTERP_SRGB,
     INTERP_WORKING, KIND_FILL, KIND_STROKE_DIST, KIND_STROKE_OFFSET, PAINT_IMAGE, PAINT_LINEAR,
-    PAINT_RADIAL, PAINT_SOLID, PAINT_SWEEP, Shape, Stop,
+    PAINT_MESH, PAINT_RADIAL, PAINT_SOLID, PAINT_SWEEP, Shape, Stop,
 };
 use super::path;
 use crate::names;
@@ -325,7 +325,7 @@ fn paint_data(
             data.first_stop = first;
             data.packed = packed;
         }
-        Paint::Mesh(_) => return Err(RenderError::Unsupported(names::MESH)),
+        Paint::Mesh(mesh) => return mesh_paint(mesh, to_local, stops),
         Paint::Image(pattern) => {
             let img = images.get(&pattern.image.raw()).ok_or_else(|| {
                 RenderError::Image(format!("unregistered image {}", pattern.image.raw()))
@@ -348,6 +348,68 @@ fn paint_data(
         }
         Paint::Shader(_) => return Err(RenderError::Unsupported(names::SHADER)),
         Paint::Transformed(_) => unreachable!("transformed paints resolve separately"),
+    }
+    Ok(data)
+}
+
+/// Pack mesh-only resources without growing ordinary paint preparation.
+fn mesh_paint(
+    mesh: &cherenkov::MeshGradient,
+    to_local: Affine,
+    stops: &mut Vec<Stop>,
+) -> Result<PaintData, RenderError> {
+    let mut data = PaintData {
+        kind: PAINT_MESH,
+        ..PaintData::default()
+    };
+    data.first_stop = u32::try_from(stops.len())
+        .map_err(|_| RenderError::Render("mesh paint buffer exceeds u32".into()))?;
+    data.packed = mesh
+        .columns()
+        .checked_mul(mesh.rows())
+        .filter(|count| {
+            *count <= 0x00ff_ffff
+                && count
+                    .checked_mul(6)
+                    .and_then(|len| len.checked_add(data.first_stop))
+                    .is_some()
+        })
+        .ok_or_else(|| RenderError::Render("mesh paint buffer exceeds u32".into()))?;
+    let stride = mesh.columns() as usize + 1;
+    for row in 0..mesh.rows() as usize {
+        for column in 0..mesh.columns() as usize {
+            let base = row * stride + column;
+            let indices = [base, base + 1, base + stride, base + stride + 1];
+            let points = indices.map(|index| to_local * mesh.points()[index]);
+            if points
+                .iter()
+                .any(|p| !p.is_finite() || !f32_f64(p.x).is_finite() || !f32_f64(p.y).is_finite())
+            {
+                return Err(RenderError::Render(
+                    "mesh points must be finite GPU coordinates".into(),
+                ));
+            }
+            for pair in points.as_chunks::<2>().0 {
+                stops.push(Stop {
+                    color: [
+                        f32_f64(pair[0].x),
+                        f32_f64(pair[0].y),
+                        f32_f64(pair[1].x),
+                        f32_f64(pair[1].y),
+                    ],
+                    offset: 0.0,
+                    pad: [0.0; 3],
+                });
+            }
+            for index in indices {
+                let [red, green, blue, alpha] = mesh.colors()[index].components;
+                stops.push(Stop {
+                    color: [red * alpha, green * alpha, blue * alpha, alpha],
+                    offset: 0.0,
+                    pad: [0.0; 3],
+                });
+            }
+        }
     }
     Ok(data)
 }

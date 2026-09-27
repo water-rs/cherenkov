@@ -22,6 +22,7 @@ const PAINT_RADIAL: u32 = 2u;
 const PAINT_TEXTURE: u32 = 3u;      // composite: sample the bound texture at the device pixel
 const PAINT_SWEEP: u32 = 4u;
 const PAINT_IMAGE: u32 = 5u;
+const PAINT_MESH: u32 = 6u;
 
 const EXTEND_PAD: u32 = 0u;
 const EXTEND_REPEAT: u32 = 1u;
@@ -544,6 +545,66 @@ fn paint_image(i: u32, local: vec2<f32>) -> vec4<f32> {
     return sample_image_tex(image_tex, u, v, g2.z, g2.w, ((meta_w >> 8u) & 1u) != 0u);
 }
 
+// Bilinear inverse in f32, solving for v. The f64 oracle solves for u.
+fn mesh_cross(a: vec2<f32>, b: vec2<f32>) -> f32 {
+    return a.x * b.y - a.y * b.x;
+}
+
+fn mesh_uv(point: vec2<f32>, top: vec4<f32>, bottom: vec4<f32>) -> vec3<f32> {
+    let horizontal = top.zw - top.xy;
+    let vertical = bottom.xy - top.xy;
+    let bend = bottom.zw - bottom.xy - horizontal;
+    let delta = point - top.xy;
+    let qa = -mesh_cross(vertical, bend);
+    let qb = mesh_cross(delta, bend) - mesh_cross(vertical, horizontal);
+    let qc = mesh_cross(delta, horizontal);
+    var roots = vec2<f32>(-1.0);
+    if qa == 0.0 {
+        if qb == 0.0 { return vec3<f32>(0.0); }
+        roots = vec2<f32>(-qc / qb);
+    } else {
+        let discriminant = qb * qb - 4.0 * qa * qc;
+        if discriminant < 0.0 { return vec3<f32>(0.0); }
+        let signed_root = select(-sqrt(discriminant), sqrt(discriminant), qb >= 0.0);
+        let numerator = -0.5 * (qb + signed_root);
+        roots = vec2<f32>(numerator / qa);
+        if numerator != 0.0 { roots.y = qc / numerator; }
+    }
+    var answer = vec3<f32>(0.0);
+    for (var index = 0u; index < 2u; index += 1u) {
+        let v = roots[index];
+        if !(v >= 0.0 && v <= 1.0) { continue; }
+        let direction = horizontal + v * bend;
+        let remainder = delta - v * vertical;
+        var u: f32;
+        if abs(direction.x) >= abs(direction.y) {
+            if direction.x == 0.0 { continue; }
+            u = remainder.x / direction.x;
+        } else {
+            u = remainder.y / direction.y;
+        }
+        if !(u >= 0.0 && u <= 1.0) { continue; }
+        if mesh_cross(direction, vertical + u * bend) == 0.0 { continue; }
+        if answer.z == 0.0 || v > answer.y || (v == answer.y && u > answer.x) {
+            answer = vec3<f32>(u, v, 1.0);
+        }
+    }
+    return answer;
+}
+
+fn paint_mesh(first: u32, count: u32, point: vec2<f32>) -> vec4<f32> {
+    for (var remaining = count; remaining > 0u; remaining -= 1u) {
+        let base = first + (remaining - 1u) * 6u;
+        let uv = mesh_uv(point, stops[base].color, stops[base + 1u].color);
+        if uv.z != 0.0 {
+            let top = mix(stops[base + 2u].color, stops[base + 3u].color, uv.x);
+            let bottom = mix(stops[base + 4u].color, stops[base + 5u].color, uv.x);
+            return mix(top, bottom, uv.y);
+        }
+    }
+    return vec4<f32>(0.0);
+}
+
 fn paint(i: u32, meta_: vec4<u32>, color: vec4<f32>, local: vec2<f32>, pixel: vec2<f32>) -> vec4<f32> {
     let kind = meta_.y & 0xffffu;
     var point = local;
@@ -560,6 +621,9 @@ fn paint(i: u32, meta_: vec4<u32>, color: vec4<f32>, local: vec2<f32>, pixel: ve
         case PAINT_TEXTURE: {
             // `grad.xy` carries the source region's device-space origin.
             return textureLoad(source, vec2<i32>(floor(pixel - instances[i].grad.xy)), 0);
+        }
+        case PAINT_MESH: {
+            return paint_mesh(meta_.z, meta_.w & 0x00ffffffu, point);
         }
         case PAINT_IMAGE: {
             return paint_image(i, point);

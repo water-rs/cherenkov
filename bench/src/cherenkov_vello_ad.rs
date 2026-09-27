@@ -648,6 +648,13 @@ fn front_paint(
         ScenePaint::Transformed { paint, transform } => {
             front_paint(paint, images)?.transformed(*transform)
         }
+        ScenePaint::Mesh(_) => {
+            return Err(BenchError::Unsupported {
+                engine: CherenkovVello::NAME,
+                feature: Feature::MeshGradient,
+                api: Some("bilinear mesh paint"),
+            });
+        }
         ScenePaint::Solid(c) => cherenkov::Paint::Solid(working(c)),
         ScenePaint::Linear(g) => cherenkov::Paint::Linear(cherenkov::LinearGradient {
             start: g.start,

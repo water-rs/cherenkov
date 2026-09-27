@@ -444,6 +444,14 @@ fn transform_paint(paint: &mut Paint, t: Affine) {
             g.r1 *= scale;
         }
         Paint::Sweep(g) => g.center = t * g.center,
+        Paint::Mesh(mesh) => {
+            *mesh = cherenkov_scene::MeshGradient::new(
+                mesh.columns(),
+                mesh.rows(),
+                mesh.points().iter().map(|point| t * *point).collect(),
+                mesh.colors().to_vec(),
+            );
+        }
         Paint::Image(i) => i.transform = t * i.transform,
         Paint::Transformed { transform, .. } => *transform = t * *transform,
         Paint::Solid(_) => {}
@@ -464,6 +472,24 @@ fn paint_opacity(paint: &mut Paint, alpha: f32) {
         }
         Paint::Transformed { paint, .. } => {
             paint_opacity(paint, alpha);
+            None
+        }
+        Paint::Mesh(mesh) => {
+            let colors = mesh
+                .colors()
+                .iter()
+                .copied()
+                .map(|mut color| {
+                    color.components[3] *= alpha;
+                    color
+                })
+                .collect();
+            *mesh = cherenkov_scene::MeshGradient::new(
+                mesh.columns(),
+                mesh.rows(),
+                mesh.points().to_vec(),
+                colors,
+            );
             None
         }
         Paint::Image(_) => None,

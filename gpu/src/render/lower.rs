@@ -1549,26 +1549,49 @@ impl<'a> Lowering<'a> {
             bounds.height(),
         ]
         .iter()
-        .all(|v| v.is_finite() && *v > 0.0)
+        .all(|v| v.is_finite())
         {
             return Err(RenderError::Render(
-                "shader paint requires finite nonempty bounds".into(),
+                "shader paint requires finite bounds".into(),
             ));
         }
-        let size = (device.width().ceil() as u32, device.height().ceil() as u32);
+        let size = (
+            device.width().ceil().max(1.0) as u32,
+            device.height().ceil().max(1.0) as u32,
+        );
         let key = std::sync::Arc::new(super::paint::Key {
             shader: paint.shader.raw(),
             uniforms: paint.uniforms.iter().map(|v| v.to_bits()).collect(),
             size,
         });
-        let x = f64::from(size.0) / bounds.width();
-        let y = f64::from(size.1) / bounds.height();
+        // Collapsed axes sample their center. Coverage still comes from the
+        // ordinary shape/path lowering, including zero-area geometry.
+        let x = if bounds.width() == 0.0 {
+            0.0
+        } else {
+            f64::from(size.0) / bounds.width()
+        };
+        let y = if bounds.height() == 0.0 {
+            0.0
+        } else {
+            f64::from(size.1) / bounds.height()
+        };
+        let offset_x = if bounds.width() == 0.0 {
+            0.5
+        } else {
+            -bounds.x0 * x
+        };
+        let offset_y = if bounds.height() == 0.0 {
+            0.5
+        } else {
+            -bounds.y0 * y
+        };
         let data = PaintData {
             kind: super::instance::PAINT_IMAGE,
             grad: [f32_f64(x), 0.0, 0.0, f32_f64(y)],
             grad2: [
-                f32_f64(-bounds.x0 * x),
-                f32_f64(-bounds.y0 * y),
+                f32_f64(offset_x),
+                f32_f64(offset_y),
                 f32_f64(f64::from(size.0)),
                 f32_f64(f64::from(size.1)),
             ],
@@ -1578,6 +1601,25 @@ impl<'a> Lowering<'a> {
         };
         self.set_image(data.image.clone());
         Ok(data)
+    }
+
+    #[inline]
+    fn shaped_paint(
+        &mut self,
+        paint: &ResolvedPaint,
+        bounds: Rect,
+        local: Affine,
+        extra_margin: f64,
+    ) -> Result<PaintData, RenderError> {
+        if let ResolvedPaint::Shader(shader) = paint {
+            self.shader_paint(
+                shader,
+                bounds.inflate(extra_margin, extra_margin),
+                self.transform * local,
+            )
+        } else {
+            Ok(self.resolved_paint(paint))
+        }
     }
 
     fn realize(
@@ -1612,11 +1654,7 @@ impl<'a> Lowering<'a> {
                     inst.inner = *inner;
                 }
                 inst.params[0] = *param_x;
-                let paint = if let ResolvedPaint::Shader(shader) = paint {
-                    self.shader_paint(shader, *bounds, self.transform * *local)?
-                } else {
-                    self.resolved_paint(paint)
-                };
+                let paint = self.shaped_paint(paint, *bounds, *local, *extra_margin)?;
                 inst.color = paint.color;
                 inst.grad = paint.grad;
                 inst.grad2 = paint.grad2;

@@ -30,7 +30,7 @@ Detached producers retain pending requests but do not run or wake the host. Reat
 
 `Engine::shader(ShaderSource::wgsl(source))` validates and registers WGSL on the render thread. Source provides a fragment entry named `main`, receives normalized UVs at location 0, and returns premultiplied linear Display P3. The prelude exposes `uniforms.time`, `uniforms.resolution`, `params` (16 `vec4<f32>` values), and the working-space conversion helpers.
 
-A `ShaderPaint` supplies at most 64 uniform floats. Resource keys preserve every float's exact bits, shader identity and texture extent. Retained emissions own stable keys across frames; a dirty live paint operand cannot retarget another cached draw. Shader coordinates cover complete geometry, including the part outside the viewport. Ordinary non-shader paints keep their existing preparation and path cache behavior.
+A `ShaderPaint` supplies at most 64 uniform floats. Resource keys preserve every float's exact bits, shader identity and texture extent. Retained emissions own stable keys across frames; a dirty live paint operand cannot retarget another cached draw. Shader coordinates cover complete geometry, including stroke expansion and the part outside the viewport. Collapsed axes sample the center of a one-pixel shader texture; ordinary geometry lowering still determines coverage. Ordinary non-shader paints keep their existing preparation and path cache behavior.
 
 Static shader textures render once per key. Animated sources sample the engine presentation timeline and keep `Next` active only while used by attached output. Removing or replacing a use releases its unused textures and invalidates corresponding bindings.
 

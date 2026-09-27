@@ -207,3 +207,74 @@ fn removed_shader_reports_an_error_instead_of_panicking() -> Result<(), Box<dyn 
     assert_eq!(engine.render(FrameTime::now())?, Next::Idle);
     Ok(())
 }
+
+#[test]
+fn shader_strokes_and_degenerate_geometry_keep_ordinary_coverage()
+-> Result<(), Box<dyn std::error::Error>> {
+    let engine = Engine::<Gpu>::new(GpuConfig::default())?;
+    let shader = engine.shader(ShaderSource::wgsl(
+        "@fragment fn main() -> @location(0) vec4<f32> { return vec4<f32>(1.0); }",
+    ))?;
+    let surface = engine.surface(Offscreen::new((16, 16), OffscreenFormat::LinearF16))?;
+    for geometry in 0..3 {
+        let mut outputs = Vec::new();
+        for paint in [
+            cherenkov::Paint::from(cherenkov::WorkingColor::WHITE),
+            cherenkov::Paint::from(ShaderPaint {
+                shader: shader.id(),
+                uniforms: vec![],
+            }),
+        ] {
+            surface.update(|tx| {
+                tx[surface.root()].content(surface.record(|r| match geometry {
+                    0 => r.stroke(
+                        cherenkov::kurbo::Line::new((2.0, 8.0), (14.0, 8.0)),
+                        cherenkov::Stroke::new(2.0),
+                        paint,
+                    ),
+                    1 => r.fill(Rect::new(8.0, 2.0, 8.0, 14.0), paint),
+                    _ => r.fill(cherenkov::kurbo::BezPath::new(), paint),
+                }));
+            });
+            engine
+                .render(FrameTime::now())
+                .map_err(|error| format!("geometry {geometry}: {error}"))?;
+            outputs.push(
+                surface
+                    .readback()?
+                    .pixels
+                    .into_iter()
+                    .map(|pixel| pixel.map(f32::to_bits))
+                    .collect::<Vec<_>>(),
+            );
+        }
+        assert_eq!(outputs[0], outputs[1], "geometry {geometry}");
+    }
+    Ok(())
+}
+
+#[test]
+fn shader_stroke_coordinates_include_the_outline() -> Result<(), Box<dyn std::error::Error>> {
+    let engine = Engine::<Gpu>::new(GpuConfig::default())?;
+    let shader = engine.shader(ShaderSource::wgsl("@fragment fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> { return vec4<f32>(uv.x, 0.0, 0.0, 1.0); }"))?;
+    let surface = engine.surface(Offscreen::new((16, 16), OffscreenFormat::LinearF16))?;
+    surface.update(|tx| {
+        tx[surface.root()].content(surface.record(|r| {
+            r.stroke(
+                Rect::new(4.0, 4.0, 12.0, 12.0),
+                cherenkov::Stroke::new(4.0),
+                ShaderPaint {
+                    shader: shader.id(),
+                    uniforms: vec![],
+                },
+            );
+        }));
+    });
+    engine.render(FrameTime::now())?;
+    let pixel = surface.readback()?.pixels[8 * 16 + 3];
+    assert!(
+        (pixel[0] - 1.5 / 12.0).abs() < 0.002,
+        "complete stroke coordinates: {pixel:?}"
+    );
+    Ok(())
+}

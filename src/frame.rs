@@ -30,6 +30,10 @@ impl FrameTime {
 /// An inclusive refresh-rate range in hertz.
 pub type RefreshRange = RangeInclusive<u32>;
 
+/// The refresh range a surface requests when its host does not set one: up
+/// to 120 Hz, the performance target on current high-refresh displays.
+pub const DEFAULT_REFRESH: RefreshRange = 60..=120;
+
 /// What the engine needs next, returned by
 /// [`Engine::render`](crate::Engine::render).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -207,7 +211,7 @@ impl Offscreen {
         Self {
             size,
             format,
-            refresh: 60..=60,
+            refresh: DEFAULT_REFRESH,
         }
     }
 }

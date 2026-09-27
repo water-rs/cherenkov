@@ -148,7 +148,7 @@ impl GpuSlot {
             let ready = self.ready.as_mut().expect("just ensured");
             let elapsed = now.saturating_duration_since(origin);
             let delta = ready.last_frame.map_or_else(
-                || Duration::from_secs_f32(1.0 / 60.0),
+                || Duration::from_secs_f64(1.0 / f64::from(*cherenkov::DEFAULT_REFRESH.end())),
                 |last| {
                     now.saturating_duration_since(last)
                         .min(Duration::from_millis(100))

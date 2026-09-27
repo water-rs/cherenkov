@@ -227,7 +227,7 @@ impl TextureTarget {
             Self {
                 size,
                 textures,
-                refresh: 60..=60,
+                refresh: cherenkov::DEFAULT_REFRESH,
             },
             receiver,
         )

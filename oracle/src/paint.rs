@@ -219,6 +219,7 @@ pub fn eval_paint(
         },
         Paint::Sweep(g) => extend_t(sweep_t(p, g), g.extend)
             .map_or([0.0; 4], |t| eval_stops(&g.stops, t, g.interpolation)),
+        Paint::Mesh(mesh) => crate::mesh::eval(mesh, p),
         Paint::Image(ip) => eval_image_paint(ip, p, resources)?,
     })
 }

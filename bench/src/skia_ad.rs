@@ -416,6 +416,13 @@ fn mk_paint(engine: &'static str, paint: &SPaint, blobs: &Blobs) -> Result<Paint
                 None,
             ));
         }
+        SPaint::Mesh(_) => {
+            return Err(BenchError::Unsupported {
+                engine,
+                feature: Feature::MeshGradient,
+                api: Some("bilinear mesh paint"),
+            });
+        }
         SPaint::Image(ip) => {
             let (w, h, rgba) = convert::decode_png(blob(blobs, ip.image)?)?;
             let img = sk_image(w, h, &rgba);

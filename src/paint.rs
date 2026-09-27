@@ -293,6 +293,9 @@ struct MeshGradientData {
 /// Why a mesh gradient's grid is malformed.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum MeshGradientError {
+    /// Grid dimensions overflow addressable storage.
+    #[error("mesh grid exceeds addressable storage")]
+    GridOverflow,
     /// The grid has no patch.
     #[error("a mesh gradient needs at least one patch, got {columns} x {rows}")]
     Empty {
@@ -326,7 +329,12 @@ impl TryFrom<MeshGradientData> for MeshGradient {
         if columns == 0 || rows == 0 {
             return Err(MeshGradientError::Empty { columns, rows });
         }
-        let vertices = (columns as usize + 1) * (rows as usize + 1);
+        let vertices = usize::try_from(columns)
+            .ok()
+            .and_then(|n| n.checked_add(1))
+            .zip(usize::try_from(rows).ok().and_then(|n| n.checked_add(1)))
+            .and_then(|(columns, rows)| columns.checked_mul(rows))
+            .ok_or(MeshGradientError::GridOverflow)?;
         for (list, len) in [("point", points.len()), ("colour", colors.len())] {
             if len != vertices {
                 return Err(MeshGradientError::VertexCount {
@@ -516,3 +524,18 @@ nami_core::impl_constant!(
     ShaderPaint,
     TransformedPaint
 );
+
+#[cfg(test)]
+mod mesh_overflow_tests {
+    #[test]
+    fn overflowing_grid_is_rejected_before_vertex_access() {
+        let error = super::MeshGradient::try_from(super::MeshGradientData {
+            columns: u32::MAX,
+            rows: u32::MAX,
+            points: vec![],
+            colors: vec![],
+        })
+        .expect_err("unaddressable grid");
+        assert_eq!(error, super::MeshGradientError::GridOverflow);
+    }
+}

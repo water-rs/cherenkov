@@ -479,6 +479,7 @@ fn cherenkov_features() -> Vec<Feature> {
         Feature::EvenOdd,
         Feature::StrokeDash,
         Feature::SweepGradient,
+        Feature::MeshGradient,
         Feature::Image,
         Feature::ImagePaint,
         Feature::ExtendNone,
@@ -625,6 +626,13 @@ fn front_paint(
         ScenePaint::Transformed { paint, transform } => {
             front_paint(paint, images)?.transformed(*transform)
         }
+        ScenePaint::Mesh(mesh) => cherenkov::MeshGradient::new(
+            mesh.columns(),
+            mesh.rows(),
+            mesh.points().to_vec(),
+            mesh.colors().iter().map(working).collect(),
+        )
+        .into(),
         ScenePaint::Solid(c) => cherenkov::Paint::Solid(working(c)),
         ScenePaint::Linear(g) => cherenkov::Paint::Linear(cherenkov::LinearGradient {
             start: g.start,

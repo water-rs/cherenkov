@@ -33,6 +33,8 @@ pub const PAINT_IMAGE: u32 = 5;
 /// Paint coordinates are mapped by the two stop-buffer entries immediately
 /// preceding `first_stop`; lower bits keep the underlying paint kind.
 pub const PAINT_TRANSFORMED: u32 = 1 << 16;
+/// Bilinear mesh patches in the shared paint buffer.
+pub const PAINT_MESH: u32 = 6;
 
 /// Clamp the edge colours.
 pub const EXTEND_PAD: u32 = 0;

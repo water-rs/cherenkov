@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use cherenkov::Draw as _;
 use cherenkov::{
-    Engine as VelloEngine, FontSource, ImageData, Layer as VelloLayer, Offscreen, OffscreenFormat,
-    RenderError, Rgba8, Surface, Transaction,
+    Engine as VelloEngine, Fixed, FontSource, ImageData, Layer as VelloLayer, Offscreen,
+    OffscreenFormat, RenderError, Rgba8, Surface, Transaction,
 };
 use cherenkov_oracle::color::to_working;
 use cherenkov_scene::{
@@ -1241,29 +1241,41 @@ fn record_op(c: &mut cherenkov::Recorder, op: &Op) {
             stroke,
             paint,
         } => match shape {
-            ShapeKind::Rect(s) => c.stroke(*s, stroke.clone(), paint.clone()),
-            ShapeKind::RoundedRect(s) => c.stroke(*s, stroke.clone(), paint.clone()),
-            ShapeKind::Continuous(s) => c.stroke(*s, stroke.clone(), paint.clone()),
-            ShapeKind::Circle(s) => c.stroke(*s, stroke.clone(), paint.clone()),
-            ShapeKind::Ellipse(s) => c.stroke(*s, stroke.clone(), paint.clone()),
-            ShapeKind::Line(s) => c.stroke(*s, stroke.clone(), paint.clone()),
-            ShapeKind::Path(s) => c.stroke(s.clone(), stroke.clone(), paint.clone()),
+            ShapeKind::Rect(s) => c.stroke(Fixed(*s), Fixed(stroke.clone()), Fixed(paint.clone())),
+            ShapeKind::RoundedRect(s) => {
+                c.stroke(Fixed(*s), Fixed(stroke.clone()), Fixed(paint.clone()));
+            }
+            ShapeKind::Continuous(s) => {
+                c.stroke(Fixed(*s), Fixed(stroke.clone()), Fixed(paint.clone()));
+            }
+            ShapeKind::Circle(s) => {
+                c.stroke(Fixed(*s), Fixed(stroke.clone()), Fixed(paint.clone()));
+            }
+            ShapeKind::Ellipse(s) => {
+                c.stroke(Fixed(*s), Fixed(stroke.clone()), Fixed(paint.clone()));
+            }
+            ShapeKind::Line(s) => c.stroke(Fixed(*s), Fixed(stroke.clone()), Fixed(paint.clone())),
+            ShapeKind::Path(s) => c.stroke(
+                Fixed(s.clone()),
+                Fixed(stroke.clone()),
+                Fixed(paint.clone()),
+            ),
         },
         Op::Shadow { shape, shadow } => match shape {
-            ShapeKind::Rect(s) => c.shadow(*s, *shadow),
-            ShapeKind::RoundedRect(s) => c.shadow(*s, *shadow),
-            ShapeKind::Continuous(s) => c.shadow(*s, *shadow),
-            ShapeKind::Circle(s) => c.shadow(*s, *shadow),
-            ShapeKind::Ellipse(s) => c.shadow(*s, *shadow),
-            ShapeKind::Line(s) => c.shadow(*s, *shadow),
-            ShapeKind::Path(s) => c.shadow(s.clone(), *shadow),
+            ShapeKind::Rect(s) => c.shadow(Fixed(*s), Fixed(*shadow)),
+            ShapeKind::RoundedRect(s) => c.shadow(Fixed(*s), Fixed(*shadow)),
+            ShapeKind::Continuous(s) => c.shadow(Fixed(*s), Fixed(*shadow)),
+            ShapeKind::Circle(s) => c.shadow(Fixed(*s), Fixed(*shadow)),
+            ShapeKind::Ellipse(s) => c.shadow(Fixed(*s), Fixed(*shadow)),
+            ShapeKind::Line(s) => c.shadow(Fixed(*s), Fixed(*shadow)),
+            ShapeKind::Path(s) => c.shadow(Fixed(s.clone()), Fixed(*shadow)),
         },
-        Op::Glyphs { run, paint } => c.glyphs(run.clone(), paint.clone()),
+        Op::Glyphs { run, paint } => c.glyphs(Fixed(run.clone()), Fixed(paint.clone())),
         Op::Image {
             image,
             dst,
             sampling,
-        } => c.image(*image, *dst, *sampling),
+        } => c.image(*image, Fixed(*dst), *sampling),
     }
 }
 
@@ -1273,16 +1285,16 @@ fn fill(c: &mut cherenkov::Recorder, shape: &ShapeKind, paint: &cherenkov::Paint
     macro_rules! fill_shape {
         ($s:expr, clone) => {
             if even_odd {
-                c.fill(cherenkov::EvenOdd($s.clone()), paint.clone());
+                c.fill(Fixed(cherenkov::EvenOdd($s.clone())), Fixed(paint.clone()));
             } else {
-                c.fill($s.clone(), paint.clone());
+                c.fill(Fixed($s.clone()), Fixed(paint.clone()));
             }
         };
         ($s:expr) => {
             if even_odd {
-                c.fill(cherenkov::EvenOdd(*$s), paint.clone());
+                c.fill(Fixed(cherenkov::EvenOdd(*$s)), Fixed(paint.clone()));
             } else {
-                c.fill(*$s, paint.clone());
+                c.fill(Fixed(*$s), Fixed(paint.clone()));
             }
         };
     }

@@ -10,8 +10,8 @@
 use std::collections::{BTreeSet, HashMap};
 
 use cherenkov::{
-    Draw as _, Engine as CpuEngine, Layer as CpuLayer, LayerEdit, Offscreen, OffscreenFormat,
-    RenderError, ResourceError, Surface, Transaction,
+    Draw as _, Engine as CpuEngine, Fixed, Layer as CpuLayer, LayerEdit, Offscreen,
+    OffscreenFormat, RenderError, ResourceError, Surface, Transaction,
 };
 use cherenkov_cpu::{Raster, RasterConfig};
 use cherenkov_oracle::color::to_working;
@@ -1075,17 +1075,23 @@ impl Engine for Cherenkov {
 fn record_op(c: &mut cherenkov::Recorder, op: &Op) {
     match op {
         Op::Fill { shape, paint } => match shape {
-            ShapeKind::Rect(s) => c.fill(*s, paint.clone()),
-            ShapeKind::RoundedRect(s) => c.fill(*s, paint.clone()),
-            ShapeKind::Continuous(s) => c.fill(*s, paint.clone()),
-            ShapeKind::Circle(s) => c.fill(*s, paint.clone()),
-            ShapeKind::Ellipse(s) => c.fill(*s, paint.clone()),
-            ShapeKind::Line(s) => c.fill(*s, paint.clone()),
+            ShapeKind::Rect(s) => c.fill(Fixed(*s), Fixed(paint.clone())),
+            ShapeKind::RoundedRect(s) => {
+                c.fill(Fixed(*s), Fixed(paint.clone()));
+            }
+            ShapeKind::Continuous(s) => {
+                c.fill(Fixed(*s), Fixed(paint.clone()));
+            }
+            ShapeKind::Circle(s) => c.fill(Fixed(*s), Fixed(paint.clone())),
+            ShapeKind::Ellipse(s) => c.fill(Fixed(*s), Fixed(paint.clone())),
+            ShapeKind::Line(s) => c.fill(Fixed(*s), Fixed(paint.clone())),
             ShapeKind::Path(p, rule) => match rule {
                 cherenkov::FillRule::EvenOdd => {
-                    c.fill(cherenkov::EvenOdd(p.clone()), paint.clone());
+                    c.fill(Fixed(cherenkov::EvenOdd(p.clone())), Fixed(paint.clone()));
                 }
-                cherenkov::FillRule::NonZero => c.fill(p.clone(), paint.clone()),
+                cherenkov::FillRule::NonZero => {
+                    c.fill(Fixed(p.clone()), Fixed(paint.clone()));
+                }
             },
         },
         Op::Stroke {
@@ -1093,23 +1099,37 @@ fn record_op(c: &mut cherenkov::Recorder, op: &Op) {
             stroke,
             paint,
         } => match shape {
-            ShapeKind::Rect(s) => c.stroke(*s, stroke.clone(), paint.clone()),
-            ShapeKind::RoundedRect(s) => c.stroke(*s, stroke.clone(), paint.clone()),
-            ShapeKind::Continuous(s) => c.stroke(*s, stroke.clone(), paint.clone()),
-            ShapeKind::Circle(s) => c.stroke(*s, stroke.clone(), paint.clone()),
-            ShapeKind::Ellipse(s) => c.stroke(*s, stroke.clone(), paint.clone()),
-            ShapeKind::Line(s) => c.stroke(*s, stroke.clone(), paint.clone()),
-            ShapeKind::Path(p, _) => c.stroke(p.clone(), stroke.clone(), paint.clone()),
+            ShapeKind::Rect(s) => c.stroke(Fixed(*s), Fixed(stroke.clone()), Fixed(paint.clone())),
+            ShapeKind::RoundedRect(s) => {
+                c.stroke(Fixed(*s), Fixed(stroke.clone()), Fixed(paint.clone()));
+            }
+            ShapeKind::Continuous(s) => {
+                c.stroke(Fixed(*s), Fixed(stroke.clone()), Fixed(paint.clone()));
+            }
+            ShapeKind::Circle(s) => {
+                c.stroke(Fixed(*s), Fixed(stroke.clone()), Fixed(paint.clone()));
+            }
+            ShapeKind::Ellipse(s) => {
+                c.stroke(Fixed(*s), Fixed(stroke.clone()), Fixed(paint.clone()));
+            }
+            ShapeKind::Line(s) => c.stroke(Fixed(*s), Fixed(stroke.clone()), Fixed(paint.clone())),
+            ShapeKind::Path(p, _) => c.stroke(
+                Fixed(p.clone()),
+                Fixed(stroke.clone()),
+                Fixed(paint.clone()),
+            ),
         },
         Op::Shadow { shape, shadow } => match shape {
-            ShapeKind::Rect(s) => c.shadow(*s, *shadow),
-            ShapeKind::RoundedRect(s) => c.shadow(*s, *shadow),
-            ShapeKind::Continuous(s) => c.shadow(*s, *shadow),
-            ShapeKind::Circle(s) => c.shadow(*s, *shadow),
-            ShapeKind::Ellipse(s) => c.shadow(*s, *shadow),
-            ShapeKind::Line(s) => c.shadow(*s, *shadow),
-            ShapeKind::Path(p, _) => c.shadow(p.clone(), *shadow),
+            ShapeKind::Rect(s) => c.shadow(Fixed(*s), Fixed(*shadow)),
+            ShapeKind::RoundedRect(s) => c.shadow(Fixed(*s), Fixed(*shadow)),
+            ShapeKind::Continuous(s) => c.shadow(Fixed(*s), Fixed(*shadow)),
+            ShapeKind::Circle(s) => c.shadow(Fixed(*s), Fixed(*shadow)),
+            ShapeKind::Ellipse(s) => c.shadow(Fixed(*s), Fixed(*shadow)),
+            ShapeKind::Line(s) => c.shadow(Fixed(*s), Fixed(*shadow)),
+            ShapeKind::Path(p, _) => {
+                c.shadow(Fixed(p.clone()), Fixed(*shadow));
+            }
         },
-        Op::Glyphs { run, paint } => c.glyphs(run.clone(), paint.clone()),
+        Op::Glyphs { run, paint } => c.glyphs(Fixed(run.clone()), Fixed(paint.clone())),
     }
 }

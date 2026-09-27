@@ -1,12 +1,12 @@
-// Presents a surface's premultiplied linear Display P3 target on a window:
-// converts to linear sRGB and, when the swapchain format is not an sRGB
-// format, applies the sRGB transfer function itself.
+// Presents retained premultiplied linear Display P3 on a host attachment.
+// sRGB output premultiplies after the transfer function, including when
+// hardware applies that transfer. Linear P3 output preserves extended values.
 
 struct Present {
-    // 1 when the shader encodes sRGB, 0 when the swapchain format does.
+    // 1: shader sRGB transfer, 0: hardware sRGB transfer, 2: linear P3.
     encode: u32,
-    // 0: opaque (alpha forced to 1), 1: premultiplied alpha passes through,
-    // 2: postmultiplied (colour is un-premultiplied).
+    // 0: opaque (alpha forced to 1), 1: premultiplied in the output space,
+    // 2: straight alpha.
     alpha: u32,
     _pad1: u32,
     _pad2: u32,

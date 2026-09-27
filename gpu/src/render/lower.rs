@@ -56,13 +56,20 @@ pub enum ShaderVariant {
     Full,
 }
 
+/// A texture identity scoped to its resource owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ImageSource {
+    Registered(u64),
+    Content(LayerId),
+}
+
 /// One draw call's instance range and bound source texture.
 #[derive(Clone, Debug)]
 pub struct DrawRange {
     /// The scratch texture bound as group 1, `None` for the dummy texture.
     pub source: Option<usize>,
     /// The image texture bound for `PAINT_IMAGE` instances.
-    pub image: Option<u64>,
+    pub image: Option<ImageSource>,
     /// The pipeline variant this range draws with.
     pub pipeline: PipelineKind,
     /// The fragment-shader variant this range draws with.
@@ -98,6 +105,7 @@ pub struct Frame {
     pub stops: Vec<Stop>,
     /// Passes in submission order.
     pub passes: Vec<Pass>,
+    pub content: Vec<LayerId>,
     open: Option<OpenPass>,
 }
 
@@ -106,7 +114,7 @@ struct OpenPass {
     target: Target,
     clear: Option<[f32; 4]>,
     source: Option<usize>,
-    image: Option<u64>,
+    image: Option<ImageSource>,
     pipeline: PipelineKind,
     variant: ShaderVariant,
     backdrop_copy: Option<[u32; 4]>,
@@ -149,6 +157,7 @@ impl Frame {
         self.instances.clear();
         self.stops.clear();
         self.passes.clear();
+        self.content.clear();
         self.open = None;
     }
 }
@@ -469,7 +478,7 @@ pub struct Emission {
     generation: u64,
     pub(crate) instances: Range<usize>,
     stops: Range<usize>,
-    image: Option<u64>,
+    image: Option<ImageSource>,
 }
 
 /// GPU resources the lowering needs to emit glyph instances.
@@ -483,6 +492,7 @@ pub struct GlyphContext<'a> {
     pub fonts: &'a HashMap<u64, FontData>,
     /// Registered images, for dimension lookup during lowering.
     pub images: &'a HashMap<u64, GpuImage>,
+    pub content: &'a HashMap<LayerId, super::gpu_content::Slot>,
 }
 
 /// One surface's lowering output: the raster counts plus every deferred
@@ -691,7 +701,7 @@ impl<'a> Lowering<'a> {
     }
 
     /// Starts a new draw range when the bound image texture changes.
-    fn set_image(&mut self, image: Option<u64>) {
+    fn set_image(&mut self, image: Option<ImageSource>) {
         if self.frame.open.as_ref().is_some_and(|o| o.image != image) {
             self.end_segment();
             if let Some(open) = &mut self.frame.open {
@@ -1165,6 +1175,30 @@ impl<'a> Lowering<'a> {
                 glyphs,
             )?;
             self.layers_composed += u32::from(changed);
+        }
+        if let Some(slot) = glyphs.content.get(&id) {
+            self.frame.content.push(id);
+            let bounds = Rect::new(0.0, 0.0, f64::from(slot.size.0), f64::from(slot.size.1));
+            if let Some(boxed) = box_shape(&ShapeData::Rect(bounds))? {
+                let transform = self.transform * boxed.extra;
+                let mut inst = self.base(KIND_FILL, affine(transform));
+                let margin = self.margin(self.transform);
+                let b = boxed.bounds.inflate(margin, margin);
+                inst.bounds = [f32_f64(b.x0), f32_f64(b.y0), f32_f64(b.x1), f32_f64(b.y1)];
+                inst.shape = boxed.shape;
+                inst.meta[1] = super::instance::PAINT_IMAGE;
+                inst.grad = [1.0, 0.0, 0.0, 1.0];
+                inst.grad2 = [
+                    f32_f64(bounds.width() / 2.0),
+                    f32_f64(bounds.height() / 2.0),
+                    f32_f64(bounds.width()),
+                    f32_f64(bounds.height()),
+                ];
+                inst.meta[3] |=
+                    super::instance::EXTEND_PAD | (super::instance::EXTEND_PAD << 4) | (1 << 8);
+                self.set_image(Some(ImageSource::Content(id)));
+                self.push_shaped(inst, transform, boxed.bounds, margin);
+            }
         }
         for child in &node.children {
             self.layer(*child, tree, caches, glyphs)?;
@@ -2265,6 +2299,7 @@ mod tests {
             atlas: &atlas,
             fonts: &fonts,
             images: &images,
+            content: &HashMap::new(),
         };
         let prefix = cherenkov::Command::Fill {
             shape: ShapeData::Rect(Rect::new(0.0, 0.0, 2.0, 2.0)),
@@ -2336,6 +2371,7 @@ mod tests {
             atlas: &atlas,
             fonts: &fonts,
             images: &images,
+            content: &HashMap::new(),
         };
         // Half extents [20, 5]: a spread of -20 inverts both.
         let bar = ShapeData::Rect(kurbo::Rect::new(20.0, 20.0, 60.0, 30.0));

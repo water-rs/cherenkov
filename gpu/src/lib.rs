@@ -232,3 +232,24 @@ impl Backend for Gpu {
 }
 
 impl Uploads<Rgba8> for Gpu {}
+
+impl cherenkov::GpuContent for Gpu {
+    type Content = interop::GpuContentBox;
+    fn set_gpu_content(
+        r: &mut Self::Renderer,
+        surface: cherenkov::SurfaceId,
+        layer: cherenkov::LayerId,
+        size: (u32, u32),
+        content: Self::Content,
+    ) {
+        r.set_gpu_content(surface, layer, size, content);
+    }
+    fn resize_gpu_content(
+        r: &mut Self::Renderer,
+        surface: cherenkov::SurfaceId,
+        layer: cherenkov::LayerId,
+        size: (u32, u32),
+    ) {
+        r.resize_gpu_content(surface, layer, size);
+    }
+}

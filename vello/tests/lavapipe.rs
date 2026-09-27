@@ -957,3 +957,50 @@ fn linear_normal_translucent_group_reports_unsupported() {
         .expect("default group renders");
     assert_eq!(next, Next::Idle);
 }
+
+struct CountedContent(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl cherenkov_vello::interop::GpuContent for CountedContent {
+    async fn setup(&mut self, _: &wgpu::Context<'_>) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn render(&mut self, frame: &mut wgpu::Frame<'_>) {
+        <ClearContent as cherenkov_vello::interop::GpuContent>::render(
+            &mut ClearContent(wgpu::Color::WHITE),
+            frame,
+        );
+    }
+}
+
+#[test]
+fn gpu_content_resize_preserves_setup_and_changes_attachment() {
+    let Some(engine) = engine() else { return };
+    let surface = engine
+        .surface(Offscreen::new((32, 32), OffscreenFormat::LinearF16))
+        .expect("surface");
+    let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let layer = surface.layer();
+    surface.update(|tx| {
+        tx[surface.root()].push(&layer);
+        tx[&layer]
+            .content(engine.gpu_content((24, 24), CountedContent(std::sync::Arc::clone(&count))));
+    });
+    engine
+        .render(cherenkov::FrameTime::now())
+        .expect("first render");
+    assert_pixel(
+        px(&surface.readback().expect("pixels"), 16, 16),
+        [1.0; 4],
+        "initial attachment",
+    );
+    surface.update(|tx| {
+        tx[&layer].gpu_content_size((8, 8));
+    });
+    engine
+        .render(cherenkov::FrameTime::now())
+        .expect("resized render");
+    assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 1);
+    let pixels = surface.readback().expect("pixels");
+    assert_pixel(px(&pixels, 4, 4), [1.0; 4], "resized attachment");
+    assert_pixel(px(&pixels, 16, 16), [0.0; 4], "old extent cleared");
+}

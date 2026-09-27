@@ -377,6 +377,8 @@ version = "0.0.0"
 dependencies = [
  "bytemuck",
  "cherenkov",
+ "filtrate",
+ "filtrate-core",
  "half",
  "kurbo",
  "naga",

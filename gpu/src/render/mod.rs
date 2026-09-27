@@ -1,11 +1,15 @@
 //! The render thread: sole owner of GPU state.
 
 mod colr;
+pub mod filter;
 mod glyph;
+mod gpu_content;
 mod instance;
 mod lower;
+mod paint;
 mod path;
 mod prepared;
+pub mod present;
 mod raster;
 
 use std::collections::{HashMap, VecDeque};
@@ -36,6 +40,7 @@ const TIMESTAMP_FRAMES_PER_SET: u32 = 64;
 const TARGET_USAGES: wgpu::TextureUsages = wgpu::TextureUsages::from_bits_retain(
     wgpu::TextureUsages::RENDER_ATTACHMENT.bits()
         | wgpu::TextureUsages::COPY_SRC.bits()
+        | wgpu::TextureUsages::COPY_DST.bits()
         | wgpu::TextureUsages::TEXTURE_BINDING.bits(),
 );
 
@@ -106,7 +111,6 @@ struct ScratchTarget {
 /// A GPU-resident image registered with the engine.
 pub struct GpuImage {
     /// The texture holding premultiplied linear-P3 f16 texels.
-    #[expect(dead_code, reason = "the texture keeps the view alive")]
     pub texture: wgpu::Texture,
     /// Its view for bind group 1.
     pub view: wgpu::TextureView,
@@ -118,6 +122,10 @@ pub struct GpuImage {
 
 /// One surface's GPU-side state.
 struct SurfaceState {
+    window: Option<present::WindowSurface>,
+    textures: Option<std::sync::mpsc::Sender<wgpu::Texture>>,
+    refresh: cherenkov::RefreshRange,
+    present_pending: bool,
     size: (u32, u32),
     /// The scratch texture format (set at creation).
     scratch_format: wgpu::TextureFormat,
@@ -130,6 +138,8 @@ struct SurfaceState {
     /// format, index 1 the scratch format.
     backdrop: [Option<ScratchTarget>; 2],
     layers: HashMap<LayerId, ContentData>,
+    content: HashMap<LayerId, gpu_content::Slot>,
+    shader_textures: HashMap<std::sync::Arc<paint::Key>, paint::Texture>,
     frame: LoweredFrame,
     /// This frame's offsets into the shared buffers: instances and globals
     /// (256-byte slots) are laid out surface by surface so one upload covers
@@ -141,12 +151,21 @@ struct SurfaceState {
     bind_gen: u64,
     /// Group-1 bind groups keyed by `(source scratch, backdrop, image)`,
     /// reused across frames while `binds1_stamp` is current.
-    binds1: HashMap<(Option<usize>, bool, Option<u64>), wgpu::BindGroup>,
+    binds1: HashMap<(Option<usize>, bool, Option<lower::ImageSource>), wgpu::BindGroup>,
     /// The `(bind_gen, images_gen)` pair `binds1` was built under.
     binds1_stamp: (u64, u64),
 }
 
 impl SurfaceState {
+    fn content_wants_redraw(&self) -> bool {
+        !self.content.is_empty()
+            && self.frame.content.iter().any(|id| {
+                self.content
+                    .get(id)
+                    .is_some_and(gpu_content::Slot::wants_redraw)
+            })
+    }
+
     /// Bytes held by this surface's textures.
     fn gpu_bytes(&self) -> u64 {
         let surface_bytes = u64::from(self.size.0) * u64::from(self.size.1) * 8;
@@ -172,12 +191,35 @@ impl SurfaceState {
                     .map(|b| u64::from(b.width) * u64::from(b.height) * texel)
             })
             .sum();
-        surface_bytes + scratch_bytes + backdrop_bytes
+        let shader_bytes = self
+            .shader_textures
+            .values()
+            .map(|texture| {
+                u64::from(texture.image.width) * u64::from(texture.image.height) * 8 + 272
+            })
+            .sum::<u64>();
+        surface_bytes
+            + scratch_bytes
+            + backdrop_bytes
+            + shader_bytes
+            + self
+                .content
+                .values()
+                .filter_map(|slot| slot.image.as_ref())
+                .map(|image| u64::from(image.width) * u64::from(image.height) * 8)
+                .sum::<u64>()
     }
 }
 
 /// All render-thread state.
 pub struct GpuRenderer {
+    instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
+    presenter: Option<present::Presenter>,
+    shaders: paint::Registry,
+    filters: filter::Registry,
+    last_frame: Option<Instant>,
+    origin: Option<Instant>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     /// `[format index][pipeline kind][shader variant]`:
@@ -366,7 +408,15 @@ fn grow_preserving(
 /// format's required usages.
 fn create_device(
     config: &GpuConfig,
-) -> Result<(wgpu::Adapter, wgpu::Device, wgpu::Queue), EngineError> {
+) -> Result<(wgpu::Instance, wgpu::Adapter, wgpu::Device, wgpu::Queue), EngineError> {
+    if let Some(shared) = &config.device {
+        return Ok((
+            shared.instance.clone(),
+            shared.adapter.clone(),
+            shared.device.clone(),
+            shared.queue.clone(),
+        ));
+    }
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: config.backends,
         ..wgpu::InstanceDescriptor::new_without_display_handle()
@@ -419,7 +469,7 @@ fn create_device(
     }))
     .map_err(|e| EngineError::Backend(format!("{e}")))?;
     tracing::info!(features = ?device.features(), "device");
-    Ok((adapter, device, queue))
+    Ok((instance, adapter, device, queue))
 }
 
 const fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
@@ -683,7 +733,7 @@ fn create_target(
     reason = "moved into the render thread"
 )]
 pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
-    create_device(&config).and_then(|(adapter, device, queue)| {
+    create_device(&config).and_then(|(instance, adapter, device, queue)| {
         let info = adapter.get_info();
         let supported = adapter.features();
         let timestamp_support = if supported.contains(wgpu::Features::TIMESTAMP_QUERY) {
@@ -782,7 +832,8 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             wgpu::TextureUsages::TEXTURE_BINDING,
             TARGET_FORMAT,
         );
-        let timestamps = device.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+        let timestamps =
+            config.timestamps && device.features().contains(wgpu::Features::TIMESTAMP_QUERY);
         let (query_set, query_buffer) = if timestamps {
             (
                 Some(device.create_query_set(&wgpu::QuerySetDescriptor {
@@ -808,6 +859,13 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
                 .collect()
         });
         let renderer = GpuRenderer {
+            instance,
+            adapter,
+            presenter: None,
+            shaders: paint::Registry::default(),
+            filters: filter::Registry::new(config.redraw.clone()),
+            last_frame: None,
+            origin: None,
             max_texture: device.limits().max_texture_dimension_2d,
             device,
             queue,
@@ -886,11 +944,11 @@ impl Renderer for GpuRenderer {
         id: SurfaceId,
         target: GpuTarget,
     ) -> Result<SurfaceInfo, SurfaceError> {
-        let GpuTarget::Offscreen(offscreen) = target;
-        let size = offscreen.size;
-        // The target is always Rgba16Float; both offscreen formats are
-        // accepted and readback decodes f16.
-        let _ = offscreen.format;
+        let size = match &target {
+            GpuTarget::Offscreen(offscreen) => offscreen.size,
+            GpuTarget::Window(window) => window.size,
+            GpuTarget::Texture(texture) => texture.size,
+        };
         if size.0 == 0 || size.1 == 0 {
             return Err(SurfaceError::ZeroSize);
         }
@@ -901,6 +959,23 @@ impl Renderer for GpuRenderer {
                 max: self.max_texture,
             });
         }
+        let (window, textures, refresh) = match target {
+            GpuTarget::Offscreen(offscreen) => (None, None, offscreen.refresh),
+            GpuTarget::Texture(texture) => (None, Some(texture.textures), texture.refresh),
+            GpuTarget::Window(window) => {
+                let surface = present::WindowSurface::new(
+                    &self.instance,
+                    &self.adapter,
+                    &self.device,
+                    window.handle,
+                    size,
+                    window.transparent,
+                )?;
+                self.presenter
+                    .get_or_insert_with(|| present::Presenter::new(&self.device));
+                (Some(surface), None, window.refresh)
+            }
+        };
         let (target, view) = create_target(
             &self.device,
             "surface target",
@@ -908,9 +983,16 @@ impl Renderer for GpuRenderer {
             TARGET_USAGES,
             TARGET_FORMAT,
         );
+        if let Some(sender) = &textures {
+            let _ = sender.send(target.clone());
+        }
         self.surfaces.insert(
             id,
             SurfaceState {
+                window,
+                textures,
+                refresh,
+                present_pending: false,
                 size,
                 scratch_format: self.scratch_format,
                 target,
@@ -918,6 +1000,8 @@ impl Renderer for GpuRenderer {
                 scratch: Vec::new(),
                 backdrop: [None, None],
                 layers: HashMap::new(),
+                content: HashMap::new(),
+                shader_textures: HashMap::new(),
                 frame: LoweredFrame::default(),
                 inst_base: 0,
                 globals_base: 0,
@@ -944,6 +1028,12 @@ impl Renderer for GpuRenderer {
             TARGET_USAGES,
             TARGET_FORMAT,
         );
+        if let Some(window) = &mut state.window {
+            window.resize(&self.device, size);
+        }
+        if let Some(sender) = &state.textures {
+            let _ = sender.send(target.clone());
+        }
         state.size = size;
         state.target = target;
         state.view = view;
@@ -955,6 +1045,7 @@ impl Renderer for GpuRenderer {
 
     fn destroy_surface(&mut self, id: SurfaceId) {
         self.surfaces.remove(&id);
+        self.update_filter_activity();
     }
 
     fn add_font(&mut self, id: FontId, font: EngineFontData) -> Result<(), ResourceError> {
@@ -985,6 +1076,9 @@ impl Renderer for GpuRenderer {
         let Some(state) = self.surfaces.get_mut(&surface) else {
             return;
         };
+        if state.content.remove(&layer).is_some() {
+            state.binds1.clear();
+        }
         match content {
             Some(ContentOp::Replace(list)) => {
                 if let Some(content) = state.layers.get_mut(&layer) {
@@ -1012,6 +1106,9 @@ impl Renderer for GpuRenderer {
     fn remove_layer(&mut self, surface: SurfaceId, layer: LayerId) {
         if let Some(state) = self.surfaces.get_mut(&surface) {
             state.layers.remove(&layer);
+            if state.content.remove(&layer).is_some() {
+                state.binds1.clear();
+            }
         }
     }
 
@@ -1204,17 +1301,35 @@ impl Renderer for GpuRenderer {
                 .map(|i| u64::from(i.width) * u64::from(i.height) * 8)
                 .sum::<u64>();
         MemoryUsage {
-            gpu: cherenkov::Bytes(gpu),
+            gpu: cherenkov::Bytes(gpu + self.filters.gpu_bytes()),
             cpu: cherenkov::Bytes(self.atlas.cpu_bytes()),
         }
     }
 
     fn render(&mut self, frame: &Frame<'_>, stats: &mut FrameStats) -> Result<Redraw, RenderError> {
+        let origin = *self.origin.get_or_insert(frame.time.0);
         stats.timings = self.drain_timestamps();
-        let dirty: Vec<_> = frame.surfaces.iter().filter(|sf| sf.changed).collect();
+        let dirty: Vec<_> = frame
+            .surfaces
+            .iter()
+            .filter(|sf| {
+                sf.changed
+                    || self.surfaces[&sf.id]
+                        .frame
+                        .filters
+                        .iter()
+                        .any(|(_, id)| self.filters.wants_redraw(*id))
+                    || self.surfaces[&sf.id].content_wants_redraw()
+                    || self.surfaces[&sf.id]
+                        .shader_textures
+                        .keys()
+                        .any(|key| self.shaders.animated(key))
+            })
+            .collect();
         if dirty.is_empty() {
-            return Ok(Redraw::None);
+            return self.present_windows(frame);
         }
+        let timing = self.filter_timing(frame, origin);
         self.frame_pass_count = 0;
         self.frame_submission = None;
         self.pass_meta.clear();
@@ -1261,9 +1376,26 @@ impl Renderer for GpuRenderer {
             "frame lowered"
         );
         if result.is_ok() {
+            self.update_filter_activity();
+            for sf in &dirty {
+                self.render_shaders(
+                    sf.id,
+                    frame.time.0.saturating_duration_since(origin).as_secs_f32(),
+                )?;
+                self.render_producers(sf, frame.time.0)?;
+            }
             let t = Instant::now();
             for sf in &dirty {
-                self.encode_surface(sf.id, stats);
+                let count = self.frame_pass_count;
+                let meta = self.pass_meta.len();
+                if let Err(error) = self.encode_surface(sf.id, timing, stats) {
+                    self.frame_pass_count = count;
+                    self.pass_meta.truncate(meta);
+                    result = Err(error);
+                    break;
+                }
+                let surface = self.surfaces.get_mut(&sf.id).expect("rendered surface");
+                surface.present_pending = surface.window.is_some();
             }
             stats.phases.encode_seconds = t.elapsed().as_secs_f64();
             stats.frame = Some(frame.id);
@@ -1274,7 +1406,8 @@ impl Renderer for GpuRenderer {
             }
         }
         result?;
-        Ok(Redraw::None)
+        let present = self.present_windows(frame)?;
+        Ok(self.requested_redraw(present))
     }
 
     /// Waits for the GPU to finish every pending frame and returns their
@@ -1374,6 +1507,193 @@ impl Renderer for GpuRenderer {
 }
 
 impl GpuRenderer {
+    fn filter_timing(&mut self, frame: &Frame<'_>, origin: Instant) -> filtrate::EffectFrameTiming {
+        let timing = filtrate::EffectFrameTiming::new(
+            frame.time.0.saturating_duration_since(origin),
+            self.last_frame.map_or(std::time::Duration::ZERO, |last| {
+                frame.time.0.saturating_duration_since(last)
+            }),
+            frame.id.get(),
+        );
+        self.last_frame = Some(frame.time.0);
+        timing
+    }
+
+    fn update_filter_activity(&self) {
+        let active = self
+            .surfaces
+            .values()
+            .flat_map(|surface| surface.frame.filters.iter().map(|(_, id)| *id))
+            .collect();
+        self.filters.set_active(&active);
+    }
+    pub(crate) fn add_filter(&mut self, id: cherenkov::FilterId, source: Box<dyn filter::Source>) {
+        self.filters.add(id.raw(), source);
+    }
+    pub(crate) fn remove_filter(&mut self, id: cherenkov::FilterId) {
+        self.filters.remove(id.raw());
+    }
+    pub(crate) fn add_shader(
+        &mut self,
+        id: cherenkov::ShaderId,
+        source: &cherenkov::ShaderSource,
+    ) -> Result<(), ResourceError> {
+        self.shaders.add(&self.device, id.raw(), source)
+    }
+
+    pub(crate) fn remove_shader(&mut self, id: cherenkov::ShaderId) {
+        self.shaders.remove(id.raw());
+        for surface in self.surfaces.values_mut() {
+            surface
+                .shader_textures
+                .retain(|key, _| key.shader != id.raw());
+            surface.binds1.clear();
+        }
+    }
+    fn render_shaders(&mut self, id: SurfaceId, elapsed: f32) -> Result<(), RenderError> {
+        let surface = self.surfaces.get_mut(&id).expect("registered surface");
+        if self.shaders.has_registrations() {
+            let keys: std::collections::HashSet<_> = surface
+                .frame
+                .passes
+                .iter()
+                .flat_map(|pass| &pass.ranges)
+                .filter_map(|range| match &range.image {
+                    Some(lower::ImageSource::Shader(key)) => Some(std::sync::Arc::clone(key)),
+                    _ => None,
+                })
+                .collect();
+            let count = surface.shader_textures.len();
+            surface.shader_textures.retain(|key, _| keys.contains(key));
+            if count != surface.shader_textures.len() {
+                surface.binds1.clear();
+            }
+            for key in keys {
+                self.shaders.render(
+                    &self.device,
+                    &self.queue,
+                    &key,
+                    &mut surface.shader_textures,
+                    elapsed,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn render_producers(
+        &mut self,
+        sf: &SurfaceFrame<'_>,
+        time: Instant,
+    ) -> Result<(), RenderError> {
+        let surface = self.surfaces.get_mut(&sf.id).expect("registered surface");
+        for (id, slot) in &mut surface.content {
+            slot.set_active(surface.frame.content.contains(id));
+        }
+        for id in &surface.frame.content {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "validated display scale fits f32"
+            )]
+            surface
+                .content
+                .get_mut(id)
+                .expect("composed GPU content")
+                .render(
+                    &self.adapter,
+                    &self.device,
+                    &self.queue,
+                    time,
+                    sf.display.scale as f32,
+                )?;
+        }
+        Ok(())
+    }
+
+    fn requested_redraw(&self, present: Redraw) -> Redraw {
+        let mut rate = match present {
+            Redraw::None => None,
+            Redraw::Wanted { rate } => Some(rate),
+        };
+        for surface in self.surfaces.values() {
+            if surface
+                .frame
+                .filters
+                .iter()
+                .any(|(_, id)| self.filters.wants_redraw(*id))
+                || surface.content_wants_redraw()
+                || surface
+                    .shader_textures
+                    .keys()
+                    .any(|key| self.shaders.animated(key))
+            {
+                rate = Some(rate.map_or_else(
+                    || surface.refresh.clone(),
+                    |rate| {
+                        (*rate.start()).min(*surface.refresh.start())
+                            ..=(*rate.end()).max(*surface.refresh.end())
+                    },
+                ));
+            }
+        }
+        rate.map_or(Redraw::None, |rate| Redraw::Wanted { rate })
+    }
+
+    pub(crate) fn set_gpu_content(
+        &mut self,
+        surface: SurfaceId,
+        layer: LayerId,
+        size: (u32, u32),
+        content: crate::interop::GpuContentBox,
+    ) {
+        let state = self.surfaces.get_mut(&surface).expect("GPU surface exists");
+        state.layers.remove(&layer);
+        state
+            .content
+            .insert(layer, gpu_content::Slot::new(content, size));
+        state.binds1.clear();
+    }
+
+    pub(crate) fn resize_gpu_content(
+        &mut self,
+        surface: SurfaceId,
+        layer: LayerId,
+        size: (u32, u32),
+    ) {
+        let state = self.surfaces.get_mut(&surface).expect("GPU surface exists");
+        state
+            .content
+            .get_mut(&layer)
+            .expect("layer has GPU content")
+            .resize(size);
+        state.binds1.clear();
+    }
+
+    fn present_windows(&mut self, frame: &Frame<'_>) -> Result<Redraw, RenderError> {
+        let Some(presenter) = &mut self.presenter else {
+            return Ok(Redraw::None);
+        };
+        let mut redraw = None::<cherenkov::RefreshRange>;
+        for sf in frame.surfaces {
+            let surface = self.surfaces.get_mut(&sf.id).expect("registered surface");
+            if surface.present_pending {
+                let window = surface.window.as_ref().expect("pending window");
+                surface.present_pending =
+                    !presenter.present(&self.device, &self.queue, window, &surface.view)?;
+                if surface.present_pending {
+                    redraw = Some(redraw.map_or_else(
+                        || surface.refresh.clone(),
+                        |rate| {
+                            (*rate.start()).min(*surface.refresh.start())
+                                ..=(*rate.end()).max(*surface.refresh.end())
+                        },
+                    ));
+                }
+            }
+        }
+        Ok(redraw.map_or(Redraw::None, |rate| Redraw::Wanted { rate }))
+    }
+
     fn lower_all(
         &mut self,
         pending: &mut [SurfaceState],
@@ -1472,6 +1792,7 @@ impl GpuRenderer {
                 atlas,
                 fonts,
                 images,
+                content: &surf.content,
             };
             let mut lowering = Lowering::new(&mut surf.frame, surf.size);
             let result = lowering.run(frame.tree, &mut layers, frame.clear, &glyphs);
@@ -1485,6 +1806,8 @@ impl GpuRenderer {
             result
         };
         surf.layers = layers;
+        surf.frame.content.sort_unstable_by_key(|id| id.raw());
+        surf.frame.content.dedup();
         result.map(|()| lowered)
     }
 
@@ -1832,9 +2155,14 @@ impl GpuRenderer {
         clippy::cast_precision_loss,
         reason = "pixel sizes are well within f32"
     )]
-    fn encode_surface(&mut self, id: SurfaceId, stats: &mut FrameStats) {
+    fn encode_surface(
+        &mut self,
+        id: SurfaceId,
+        timing: filtrate::EffectFrameTiming,
+        stats: &mut FrameStats,
+    ) -> Result<(), RenderError> {
         let Some(surf) = self.surfaces.get_mut(&id) else {
-            return;
+            return Ok(());
         };
         // Buffers grown during lowering leave `bind0` stale; rebuild when
         // capacity changed since the bind group was built.
@@ -1870,7 +2198,7 @@ impl GpuRenderer {
             surf.binds1.clear();
             surf.binds1_stamp = stamp;
         }
-        for pass in &surf.frame.passes {
+        for (i, pass) in surf.frame.passes.iter().enumerate() {
             let (view, texture) = match pass.target {
                 Target::Surface => (&surf.view, &surf.target),
                 Target::Scratch(i) => (&surf.scratch[i].view, &surf.scratch[i].texture),
@@ -1990,7 +2318,7 @@ impl GpuRenderer {
                             [variant_index(pipeline.1)],
                     );
                 }
-                let key = (range.source, scratch_backdrop, range.image);
+                let key = (range.source, scratch_backdrop, range.image.clone());
                 let bind = match surf.binds1.entry(key) {
                     std::collections::hash_map::Entry::Occupied(e) => &*e.into_mut(),
                     std::collections::hash_map::Entry::Vacant(e) => {
@@ -2010,9 +2338,21 @@ impl GpuRenderer {
                             &self.dummy_view,
                             range.source.map(|i| &surf.scratch[i].view),
                             backdrop,
-                            range
-                                .image
-                                .and_then(|id| self.images.get(&id).map(|i| &i.view)),
+                            range.image.as_ref().and_then(|source| match source {
+                                lower::ImageSource::Registered(id) => {
+                                    self.images.get(id).map(|image| &image.view)
+                                }
+                                lower::ImageSource::Shader(key) => {
+                                    Some(&surf.shader_textures[key].image.view)
+                                }
+                                lower::ImageSource::Content(layer) => Some(
+                                    &surf.content[layer]
+                                        .image
+                                        .as_ref()
+                                        .expect("rendered content")
+                                        .view,
+                                ),
+                            }),
                         ))
                     }
                 };
@@ -2021,6 +2361,25 @@ impl GpuRenderer {
                     0..6,
                     (inst_base + range.instances.start)..(inst_base + range.instances.end),
                 );
+            }
+            drop(render_pass);
+            if let Some((_, filter)) = surf.frame.filters.iter().find(|(pass, _)| *pass == i) {
+                let Target::Scratch(depth) = pass.target else {
+                    unreachable!("filter captures scratch");
+                };
+                self.filters.apply(
+                    *filter,
+                    &filtrate::EffectContext {
+                        device: &self.device,
+                        queue: &self.queue,
+                        input_format: TARGET_FORMAT,
+                        output_format: TARGET_FORMAT,
+                    },
+                    &surf.scratch[depth],
+                    (pass.region[2], pass.region[3]),
+                    timing,
+                    &mut encoder,
+                )?;
             }
         }
         let submission = self.queue.submit([encoder.finish()]);
@@ -2034,6 +2393,7 @@ impl GpuRenderer {
         );
         stats.passes += u32::try_from(surf.frame.passes.len()).unwrap_or(u32::MAX);
         stats.instances += u32::try_from(surf.frame.instances.len()).unwrap_or(u32::MAX);
+        Ok(())
     }
 
     fn wait(

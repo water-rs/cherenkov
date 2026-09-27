@@ -32,11 +32,11 @@ Capabilities are traits implemented by backend types, so using a missing capabil
 | Capability trait | `Gpu` | `Vello` | `Raster` |
 |---|---|---|---|
 | `Uploads<F>` for an image format `F` | `Rgba8` | `Rgba8` | |
-| `GpuContent`, `ShaderPaint` | | both | |
-| `Filters`, `Runs<F>` for a filter `F`, `Effects` | | every filter | |
+| `GpuContent`, `ShaderPaint` | both | both | |
+| `Filters`, `Runs<F>` for a filter `F`, `Effects` | every filter | every filter | |
 | `HdrOutput`, `Backdrop`, `ExternalFrames`, `Planes` | | | |
 
-Targets beyond the current rows: `Gpu` is meant to accept every image format and grow `GpuContent`, `ShaderPaint`, `ExternalFrames`, `HdrOutput`, `Backdrop` and `Planes` (system-compositor promotion); `Raster` targets `Uploads<Rgba8>`, `Backdrop` and `Runs<F>`/`Effects` for filters with a CPU kernel; a `Banded<P>` microcontroller backend (banded output, panel formats, flash-resident assets) targets panel-format uploads and CPU-kernel filters.
+Targets beyond the current rows: `Gpu` is meant to accept every image format and grow `ExternalFrames`, `HdrOutput`, `Backdrop` and `Planes` (system-compositor promotion); `Raster` targets `Uploads<Rgba8>`, `Backdrop` and `Runs<F>`/`Effects` for filters with a CPU kernel; a `Banded<P>` microcontroller backend (banded output, panel formats, flash-resident assets) targets panel-format uploads and CPU-kernel filters.
 
 The table is the target; a backend slice implements the rows it has code for, and the compiler rejects the rest.
 
@@ -149,7 +149,7 @@ engine.trim(Pressure::Critical);       // system memory warning
 let usage: MemoryUsage = engine.memory();
 ```
 
-- The engine owns the device. `GpuContent` implementations reach wgpu through `cherenkov_vello::interop::wgpu`.
+- The engine owns its render state and may create its device or accept a `cherenkov_gpu::interop::SharedDevice` from the host. `GpuContent` implementations reach wgpu through their backend's `interop::wgpu`. See [retained host integrations](retained-integrations.md) for presentation, producer, shader and filter contracts.
 - The pipeline set is closed and fully precompiled at creation, and the driver cache is persisted. Custom shaders compile when they are registered. Nothing compiles at draw time.
 - `Engine` is `!Send` and lives on the UI thread. It spawns and owns the render thread; dropping it sends `Shutdown` and joins the thread.
 - `engine.info()` is the backend's provenance (`B::Info`); `engine.stats()` the last frame's `FrameStats`.

@@ -353,7 +353,36 @@ impl std::fmt::Debug for Recorder {
     }
 }
 
+impl Default for Recorder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Recorder {
+    /// Starts a recording with live subscriptions. [`Self::finish`] transfers
+    /// those subscriptions to the resulting [`Content`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            list: DisplayList::default(),
+            live: Rc::default(),
+        }
+    }
+
+    /// Finishes a recording without freezing its live operands. Subsequent
+    /// signal changes remain incremental updates when the content is installed.
+    #[must_use]
+    #[inline]
+    pub fn finish(mut self) -> Content {
+        self.list.trim_spare();
+        Content {
+            picture: Picture::new(self.list),
+            live: self.live,
+            sent: false,
+        }
+    }
+
     /// Subscribes to a value's later changes, which update operand `convert`
     /// produces on command `command`.
     #[expect(
@@ -554,6 +583,19 @@ impl Content {
         }
     }
 
+    /// Freezes the latest received operand values into a shareable picture.
+    /// This consumes the content and releases its subscriptions; later signal
+    /// changes cannot alter the picture. Prefer installing live `Content`
+    /// directly when changes should continue to reach the engine.
+    #[must_use]
+    pub fn into_picture(mut self) -> Picture {
+        let updates = self.live.pending.take();
+        if !updates.is_empty() {
+            let _ = self.picture.list_mut().apply(updates);
+        }
+        self.picture
+    }
+
     /// Commands in the recorded list.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -619,6 +661,58 @@ mod tests {
 
     fn red() -> Color<Srgb> {
         Color::new([1., 0., 0., 1.])
+    }
+
+    #[test]
+    fn explicit_recording_keeps_live_operands_until_frozen() {
+        let radius = binding::<f64>(1.0);
+        let mut recorder = Recorder::new();
+        recorder.fill(radius.map(|r| Circle::new((0.0, 0.0), r)), red());
+        let mut content = recorder.finish();
+        let Some(ContentChange::Replace(original)) = content.take_change() else {
+            panic!("initial picture");
+        };
+        radius.set(2.0);
+        assert!(matches!(
+            content.take_change(),
+            Some(ContentChange::Update(_))
+        ));
+        radius.set(3.0);
+        let frozen = content.into_picture();
+        radius.set(4.0);
+        let Command::Fill { shape, .. } = &frozen.display_list().commands()[0] else {
+            panic!("frozen fill");
+        };
+        assert_eq!(*shape, ShapeData::Circle(Circle::new((0.0, 0.0), 3.0)));
+        let Command::Fill { shape, .. } = &original.display_list().commands()[0] else {
+            panic!("original fill");
+        };
+        assert_eq!(*shape, ShapeData::Circle(Circle::new((0.0, 0.0), 1.0)));
+    }
+
+    #[test]
+    fn owned_path_recording_preserves_storage_and_fill_rule() {
+        let elements = vec![
+            kurbo::PathEl::MoveTo((0.0, 0.0).into()),
+            kurbo::PathEl::LineTo((1.0, 1.0).into()),
+        ];
+        let pointer = elements.as_ptr();
+        let shape = ShapeData::Path {
+            elements,
+            rule: crate::FillRule::EvenOdd,
+        };
+        let mut recorder = Recorder::default();
+        recorder.fill(Fixed(shape), red());
+        let picture = recorder.finish().into_picture();
+        let Command::Fill {
+            shape: ShapeData::Path { elements, rule },
+            ..
+        } = &picture.display_list().commands()[0]
+        else {
+            panic!("path fill");
+        };
+        assert_eq!(elements.as_ptr(), pointer);
+        assert_eq!(*rule, crate::FillRule::EvenOdd);
     }
 
     #[test]

@@ -22,6 +22,7 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+pub mod interop;
 mod names;
 mod render;
 
@@ -85,6 +86,12 @@ pub enum ScratchFormat {
 /// Configuration for the GPU engine.
 #[derive(Clone, Debug)]
 pub struct GpuConfig {
+    /// Wakes an idle host for asynchronous filter parameter changes. The
+    /// callback can run on producer threads; offscreen callers may omit it.
+    pub redraw: Option<interop::RedrawCallback>,
+    /// Uses an existing host device. Handles must share one creation chain.
+    /// Device limits and enabled features govern engine capabilities.
+    pub device: Option<interop::SharedDevice>,
     /// Which wgpu backends may be used. Defaults to all.
     pub backends: wgpu::Backends,
     /// Adapter power preference. Defaults to high performance.
@@ -109,6 +116,8 @@ pub struct GpuConfig {
 impl Default for GpuConfig {
     fn default() -> Self {
         Self {
+            device: None,
+            redraw: None,
             backends: wgpu::Backends::all(),
             power_preference: wgpu::PowerPreference::HighPerformance,
             timestamps: false,
@@ -120,12 +129,88 @@ impl Default for GpuConfig {
     }
 }
 
-/// The surface targets [`Gpu`] draws into: only an [`Offscreen`] texture
-/// in this slice.
+/// The surface targets [`Gpu`] draws into, retaining linear Display P3 output.
 #[derive(Debug)]
 pub enum GpuTarget {
     /// An offscreen texture.
     Offscreen(Offscreen),
+    /// A native window; retains readable working-space pixels before presentation.
+    Window(WindowTarget),
+    /// Engine-owned working-space texture shared with a native host.
+    Texture(interop::TextureTarget),
+}
+
+/// A window the engine presents on: a raw window handle and the drawable
+/// size in pixels. The engine renders into its own linear f16 target and
+/// blits it onto the swapchain, so the surface stays readable.
+pub struct WindowTarget {
+    handle: Box<dyn wgpu::WindowHandle>,
+    size: (u32, u32),
+    transparent: bool,
+    refresh: cherenkov::RefreshRange,
+}
+
+impl WindowTarget {
+    /// Wraps `handle` (any `raw-window-handle` window, e.g. an
+    /// `Arc<winit::window::Window>`) at `size` device pixels.
+    pub fn new(handle: impl wgpu::WindowHandle + 'static, size: (u32, u32)) -> Self {
+        Self {
+            handle: Box::new(handle),
+            size,
+            transparent: false,
+            refresh: cherenkov::DEFAULT_REFRESH,
+        }
+    }
+
+    /// Presents with a composite alpha mode the compositor sees through
+    /// (premultiplied, else postmultiplied). Surface creation
+    /// fails when the adapter offers none: an opaque composite would present
+    /// every pixel with no alpha.
+    #[must_use]
+    pub const fn transparent(mut self, transparent: bool) -> Self {
+        self.transparent = transparent;
+        self
+    }
+
+    /// Sets the refresh range for backend animation and presentation retries.
+    ///
+    /// # Panics
+    /// When the range is empty or includes zero.
+    #[must_use]
+    pub fn rate(mut self, rate: cherenkov::RefreshRange) -> Self {
+        assert!(
+            *rate.start() > 0 && !rate.is_empty(),
+            "refresh range must be positive and ordered"
+        );
+        self.refresh = rate;
+        self
+    }
+
+    /// The drawable size the swapchain is configured to.
+    #[must_use]
+    pub const fn size(&self) -> (u32, u32) {
+        self.size
+    }
+}
+
+impl core::fmt::Debug for WindowTarget {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("WindowTarget")
+            .field("size", &self.size)
+            .finish_non_exhaustive()
+    }
+}
+
+impl From<WindowTarget> for GpuTarget {
+    fn from(window: WindowTarget) -> Self {
+        Self::Window(window)
+    }
+}
+
+impl From<interop::TextureTarget> for GpuTarget {
+    fn from(target: interop::TextureTarget) -> Self {
+        Self::Texture(target)
+    }
 }
 
 impl From<Offscreen> for GpuTarget {
@@ -151,3 +236,54 @@ impl Backend for Gpu {
 }
 
 impl Uploads<Rgba8> for Gpu {}
+
+impl cherenkov::GpuContent for Gpu {
+    type Content = interop::GpuContentBox;
+    fn set_gpu_content(
+        r: &mut Self::Renderer,
+        surface: cherenkov::SurfaceId,
+        layer: cherenkov::LayerId,
+        size: (u32, u32),
+        content: Self::Content,
+    ) {
+        r.set_gpu_content(surface, layer, size, content);
+    }
+    fn resize_gpu_content(
+        r: &mut Self::Renderer,
+        surface: cherenkov::SurfaceId,
+        layer: cherenkov::LayerId,
+        size: (u32, u32),
+    ) {
+        r.resize_gpu_content(surface, layer, size);
+    }
+}
+
+impl cherenkov::ShaderPaintCapability for Gpu {
+    fn add_shader(
+        r: &mut Self::Renderer,
+        id: cherenkov::ShaderId,
+        source: cherenkov::ShaderSource,
+    ) -> Result<(), cherenkov::ResourceError> {
+        r.add_shader(id, &source)
+    }
+    fn remove_shader(r: &mut Self::Renderer, id: cherenkov::ShaderId) {
+        r.remove_shader(id);
+    }
+}
+
+impl cherenkov::Filters for Gpu {
+    fn remove_filter(r: &mut Self::Renderer, id: cherenkov::FilterId) {
+        r.remove_filter(id);
+    }
+}
+impl<F: filtrate_core::Filter + Send> cherenkov::Runs<F> for Gpu {
+    fn add_filter(r: &mut Self::Renderer, id: cherenkov::FilterId, filter: F) {
+        r.add_filter(id, Box::new(render::filter::FromFilter(filter)));
+    }
+}
+impl cherenkov::Effects for Gpu {
+    type Effect = interop::EffectBox;
+    fn add_effect(r: &mut Self::Renderer, id: cherenkov::FilterId, effect: Self::Effect) {
+        r.add_filter(id, effect.0);
+    }
+}

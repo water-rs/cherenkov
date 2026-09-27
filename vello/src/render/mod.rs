@@ -373,6 +373,18 @@ impl VelloRenderer {
         }
     }
 
+    /// Resizes a retained producer attachment without repeating setup.
+    pub fn resize_gpu_content(&mut self, surface: SurfaceId, layer: LayerId, size: (u32, u32)) {
+        let state = self.surfaces.get_mut(&surface).expect("GPU surface exists");
+        let cache = state.layers.get_mut(&layer).expect("GPU layer exists");
+        let Some(ContentData::Gpu(slot)) = &mut cache.content else {
+            panic!("layer has no GPU content");
+        };
+        slot.size = size;
+        slot.dirty.store(true, std::sync::atomic::Ordering::Release);
+        cache.fragment = None;
+    }
+
     /// Attaches a [`GpuContent`](crate::interop::GpuContent) box to a layer:
     /// the [`GpuContent`](cherenkov::GpuContent) capability hook.
     pub fn set_gpu_content(
@@ -628,6 +640,13 @@ impl VelloRenderer {
             scene.append(fragment, Some(content_world));
         }
         let gpu_image = if let Some(ContentData::Gpu(slot)) = &mut cache.content {
+            let maximum = self.device.limits().max_texture_dimension_2d;
+            if slot.size.0 > maximum || slot.size.1 > maximum {
+                return Err(RenderError::Render(format!(
+                    "GPU content size {:?} exceeds device limit {maximum}",
+                    slot.size
+                )));
+            }
             *wants_next |=
                 slot.evaluate(&self.device, &self.queue, &mut self.vello, self.start, now);
             let ready = slot.ready.as_ref().expect("evaluate ensured it");

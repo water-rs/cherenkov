@@ -29,6 +29,10 @@ use lower::{
 /// The surface target format: premultiplied linear Display P3.
 const TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
+/// Amortize Metal's limited number of counter sample buffers across frames.
+/// Each range remains exclusive until its frame's readback completes.
+const TIMESTAMP_FRAMES_PER_SET: u32 = 64;
+
 const TARGET_USAGES: wgpu::TextureUsages = wgpu::TextureUsages::from_bits_retain(
     wgpu::TextureUsages::RENDER_ATTACHMENT.bits()
         | wgpu::TextureUsages::COPY_SRC.bits()
@@ -208,12 +212,21 @@ pub struct GpuRenderer {
     images_gen: u64,
     timestamps: bool,
     query_set: Option<wgpu::QuerySet>,
+    /// First query of the active frame's independent range.
+    query_base: u32,
+    /// Free frame ranges: (set, first query, capacity). Sharing a set keeps
+    /// many frames in flight without exhausting Metal's sample-buffer limit.
+    query_pool: Vec<(wgpu::QuerySet, u32, u32)>,
+    /// Frames still writing their pass-boundary samples on the GPU.
+    pending_queries: VecDeque<PendingQueries>,
+    /// Last draw submission of the current frame.
+    frame_submission: Option<wgpu::SubmissionIndex>,
     query_buffer: Option<wgpu::Buffer>,
     /// A spare staging buffer recycled between frames; `None` while a
     /// frame's resolve owns one.
     query_staging: Option<wgpu::Buffer>,
-    /// The query set's capacity in queries; pass `i` writes `2i` at its
-    /// start and `2i + 1` at its end. The frame's GPU time runs from the
+    /// Capacity of one frame's query range; pass `i` writes `base + 2i`
+    /// at its start and `base + 2i + 1` at its end. GPU time runs from the
     /// first pass's start to the last pass's end: pass boundaries are the
     /// one timestamp position every backend with `TIMESTAMP_QUERY`
     /// supports (Metal on Apple GPUs samples only at stage boundaries).
@@ -240,13 +253,32 @@ enum PendingOrigin {
     None,
 }
 
+/// A frame owns its query range until its samples have been resolved and read.
+/// Resolving is encoded only after the draw completion callback fires: on
+/// newer Apple GPUs an earlier Metal blit resolve can see incomplete end
+/// samples even with an explicit GPU fence or event.
+struct PendingQueries {
+    frame: FrameId,
+    submission: wgpu::SubmissionIndex,
+    query_set: wgpu::QuerySet,
+    base: u32,
+    capacity: u32,
+    count: u32,
+    meta: Vec<PassMeta>,
+    complete: Arc<AtomicU8>,
+}
+
 /// One submitted frame's timestamp queries awaiting GPU completion.
 ///
-/// The resolve and the copy into `staging` are submitted with the frame;
-/// the map and read happen on a later [`Renderer::render`] once a
-/// non-blocking poll reports the copy done, so rendering never stalls on
-/// GPU idle.
+/// The resolve and copy are submitted after the frame's draws complete.
+/// The map and read happen on a later non-blocking poll, so rendering never
+/// stalls on GPU idle. The query range cannot be reused until this readback
+/// completes.
 struct PendingTimestamps {
+    /// Samples remain owned by this frame until the resolve copy completes.
+    query_set: wgpu::QuerySet,
+    query_base: u32,
+    query_capacity: u32,
     /// The frame these queries measure.
     frame: FrameId,
     /// The submission carrying the resolve and the copy into `staging`.
@@ -756,7 +788,7 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
                 Some(device.create_query_set(&wgpu::QuerySetDescriptor {
                     label: Some("frame timestamps"),
                     ty: wgpu::QueryType::Timestamp,
-                    count: 2,
+                    count: 2 * TIMESTAMP_FRAMES_PER_SET,
                 })),
                 Some(device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("timestamp resolve"),
@@ -768,8 +800,13 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
         } else {
             (None, None)
         };
-        // The initial query set holds one pass's two queries.
+        // Two queries per frame, reserving 64 independent frame ranges.
         let query_capacity = if query_set.is_some() { 2 } else { 0 };
+        let query_pool = query_set.as_ref().map_or_else(Vec::new, |set| {
+            (1..TIMESTAMP_FRAMES_PER_SET)
+                .map(|slot| (set.clone(), slot * 2, 2))
+                .collect()
+        });
         let renderer = GpuRenderer {
             max_texture: device.limits().max_texture_dimension_2d,
             device,
@@ -794,6 +831,10 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             images_gen: 0,
             timestamps,
             query_set,
+            query_base: 0,
+            query_pool,
+            pending_queries: VecDeque::new(),
+            frame_submission: None,
             query_buffer,
             query_staging: None,
             query_capacity,
@@ -1175,6 +1216,7 @@ impl Renderer for GpuRenderer {
             return Ok(Redraw::None);
         }
         self.frame_pass_count = 0;
+        self.frame_submission = None;
         self.pass_meta.clear();
         // Lower every dirty surface first: the GPU timestamp bracket must
         // start after CPU lowering (rasters, uploads) so it measures GPU
@@ -1227,7 +1269,7 @@ impl Renderer for GpuRenderer {
             stats.frame = Some(frame.id);
             if self.timestamps && self.frame_pass_count > 0 {
                 let t = Instant::now();
-                self.resolve_timestamps(2 * self.frame_pass_count, frame.id);
+                self.queue_timestamps(2 * self.frame_pass_count, frame.id);
                 stats.phases.stamp_seconds += t.elapsed().as_secs_f64();
             }
         }
@@ -1235,17 +1277,27 @@ impl Renderer for GpuRenderer {
         Ok(Redraw::None)
     }
 
-    /// Waits for the GPU to finish every pending frame's timestamp
-    /// resolve and returns their timings, oldest first.
+    /// Waits for the GPU to finish every pending frame and returns their
+    /// timings, oldest first.
     fn finish_timings(&mut self) -> Result<Vec<FrameTiming>, RenderError> {
-        let Some(last) = self.pending_timestamps.back().map(|p| p.submission.clone()) else {
-            return Ok(Vec::new());
-        };
-        for pending in &mut self.pending_timestamps {
-            pending.request_map();
+        // Tooling may wait; the frame path only polls. First complete draws
+        // so their resolves can be encoded, then complete the resolve copies.
+        if let Some(last) = self.pending_queries.back().map(|p| p.submission.clone()) {
+            self.wait(last, "timestamp draws")?;
         }
-        self.wait(last, "timestamp resolve")?;
-        let timings = self.drain_timestamps();
+        let mut timings = self.drain_timestamps();
+        if !self.pending_queries.is_empty() {
+            return Err(RenderError::Readback(
+                "timestamp draws: the completion callback did not run after the wait".into(),
+            ));
+        }
+        if let Some(last) = self.pending_timestamps.back().map(|p| p.submission.clone()) {
+            for pending in &mut self.pending_timestamps {
+                pending.request_map();
+            }
+            self.wait(last, "timestamp resolve")?;
+            timings.extend(self.drain_timestamps());
+        }
         if self.pending_timestamps.is_empty() {
             Ok(timings)
         } else {
@@ -1867,8 +1919,8 @@ impl GpuRenderer {
                     .as_ref()
                     .map(|qs| wgpu::RenderPassTimestampWrites {
                         query_set: qs,
-                        beginning_of_pass_write_index: Some(2 * pass_index),
-                        end_of_pass_write_index: Some(2 * pass_index + 1),
+                        beginning_of_pass_write_index: Some(self.query_base + 2 * pass_index),
+                        end_of_pass_write_index: Some(self.query_base + 2 * pass_index + 1),
                     });
             // Only the timestamp path reads `pass_meta`; skip the
             // allocation when timing is off.
@@ -1972,6 +2024,7 @@ impl GpuRenderer {
             }
         }
         let submission = self.queue.submit([encoder.finish()]);
+        self.frame_submission = Some(submission.clone());
         tracing::trace!(
             surface = ?id,
             passes = surf.frame.passes.len(),
@@ -2039,36 +2092,62 @@ impl GpuRenderer {
         }
     }
 
-    /// Resolves this frame's timestamp queries into a staging buffer and
-    /// queues the read — all inside one submission after the frame's
-    /// encodes, so the GPU resolves them as soon as the passes finish.
-    /// [`Self::drain_timestamps`] maps the buffer on a later call without
-    /// stalling this frame.
-    fn resolve_timestamps(&mut self, count: u32, frame: FrameId) {
-        if self.query_set.is_none() || self.query_buffer.is_none() {
-            self.pass_meta.clear();
-            return;
-        }
+    /// Hands this frame's samples to the completion queue without waiting.
+    fn queue_timestamps(&mut self, count: u32, frame: FrameId) {
+        let query_set = self.query_set.take().expect("a timed frame owns queries");
+        let submission = self.frame_submission.clone().expect("a timed frame drew");
+        let complete = Arc::new(AtomicU8::new(0));
+        let flag = Arc::clone(&complete);
+        self.queue.on_submitted_work_done(move || {
+            flag.store(1, Ordering::Release);
+        });
+        self.pending_queries.push_back(PendingQueries {
+            frame,
+            submission,
+            query_set,
+            base: self.query_base,
+            capacity: self.query_capacity,
+            count,
+            meta: std::mem::take(&mut self.pass_meta),
+            complete,
+        });
+    }
+
+    /// Encodes the resolve only once the frame's samples are complete.
+    fn resolve_timestamps(&mut self, pending: PendingQueries) {
         let staging = self.timestamp_staging();
-        let (qs, buf) = (
-            self.query_set.as_ref().expect("checked above"),
-            self.query_buffer.as_ref().expect("checked above"),
-        );
+        let buf = self
+            .query_buffer
+            .as_ref()
+            .expect("timing has a resolve buffer");
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("timestamp resolve"),
             });
-        encoder.resolve_query_set(qs, 0..count, buf, 0);
-        encoder.copy_buffer_to_buffer(buf, 0, &staging, 0, u64::from(count) * 8);
+        encoder.resolve_query_set(
+            &pending.query_set,
+            pending.base..pending.base + pending.count,
+            buf,
+            0,
+        );
+        encoder.copy_buffer_to_buffer(buf, 0, &staging, 0, u64::from(pending.count) * 8);
         let submission = self.queue.submit([encoder.finish()]);
-        tracing::trace!(count, ?submission, "timestamps resolved");
+        tracing::trace!(
+            frame = pending.frame.get(),
+            count = pending.count,
+            ?submission,
+            "timestamps resolved after draw completion"
+        );
         self.pending_timestamps.push_back(PendingTimestamps {
-            frame,
+            query_set: pending.query_set,
+            query_base: pending.base,
+            query_capacity: pending.capacity,
+            frame: pending.frame,
             submission,
             staging,
-            count,
-            meta: std::mem::take(&mut self.pass_meta),
+            count: pending.count,
+            meta: pending.meta,
             map_requested: false,
             ready: Arc::new(AtomicU8::new(0)),
         });
@@ -2091,6 +2170,18 @@ impl GpuRenderer {
     /// has landed, oldest first — submissions complete in order, so the
     /// first unfinished one ends the drain. Never blocks.
     fn drain_timestamps(&mut self) -> Vec<FrameTiming> {
+        if !self.pending_queries.is_empty() {
+            // Poll dispatches completion callbacks; it never waits for GPU idle.
+            let _ = self.device.poll(wgpu::PollType::Poll);
+            while self
+                .pending_queries
+                .front()
+                .is_some_and(|pending| pending.complete.load(Ordering::Acquire) != 0)
+            {
+                let pending = self.pending_queries.pop_front().expect("checked above");
+                self.resolve_timestamps(pending);
+            }
+        }
         let period = f64::from(self.queue.get_timestamp_period());
         let mut timings = Vec::new();
         while let Some(pending) = self.pending_timestamps.front_mut() {
@@ -2123,6 +2214,12 @@ impl GpuRenderer {
                     .slice(..u64::from(pending.count) * 8)
                     .get_mapped_range();
                 let ticks: &[u64] = bytemuck::cast_slice(&data);
+                tracing::trace!(
+                    frame = pending.frame.get(),
+                    period,
+                    ?ticks,
+                    "timestamp ticks"
+                );
                 #[expect(clippy::cast_precision_loss)]
                 let delta = |from: usize, to: usize| {
                     ticks
@@ -2158,6 +2255,13 @@ impl GpuRenderer {
             );
             timings.push(timing);
             pending.staging.unmap();
+            if pending.query_capacity >= self.query_capacity {
+                self.query_pool.push((
+                    pending.query_set,
+                    pending.query_base,
+                    pending.query_capacity,
+                ));
+            }
             if pending.staging.size() >= u64::from(self.query_capacity) * 8 {
                 self.query_staging = Some(pending.staging);
             }
@@ -2165,23 +2269,45 @@ impl GpuRenderer {
         timings
     }
 
+    /// Acquires a frame's queries and grows the resolve buffer if needed.
+    /// All surfaces are lowered before encoding, so replacing an undersized
+    /// active set here cannot discard samples already written this frame.
     fn ensure_query_capacity(&mut self, queries: u32) {
-        if queries <= self.query_capacity {
+        if queries <= self.query_capacity && self.query_set.is_some() {
             return;
         }
-        let capacity = queries.next_power_of_two().max(2);
-        self.query_set = Some(self.device.create_query_set(&wgpu::QuerySetDescriptor {
-            label: Some("frame timestamps"),
-            ty: wgpu::QueryType::Timestamp,
-            count: capacity,
-        }));
-        self.query_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("timestamp resolve"),
-            size: u64::from(capacity) * 8,
-            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        }));
-        self.query_capacity = capacity;
+        let capacity = queries.next_power_of_two().max(2).max(self.query_capacity);
+        if let Some(index) = self
+            .query_pool
+            .iter()
+            .position(|(_, _, size)| *size == capacity)
+        {
+            let (set, base, _) = self.query_pool.swap_remove(index);
+            self.query_set = Some(set);
+            self.query_base = base;
+        } else {
+            let slots = (wgpu::QUERY_SET_MAX_QUERIES / capacity).clamp(1, TIMESTAMP_FRAMES_PER_SET);
+            let set = self.device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("frame timestamps"),
+                ty: wgpu::QueryType::Timestamp,
+                count: capacity * slots,
+            });
+            self.query_pool
+                .extend((1..slots).map(|slot| (set.clone(), slot * capacity, capacity)));
+            self.query_set = Some(set);
+            self.query_base = 0;
+            tracing::debug!(capacity, slots, "timestamp query ranges allocated");
+        }
+        if capacity > self.query_capacity {
+            self.query_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("timestamp resolve"),
+                size: u64::from(capacity) * 8,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            }));
+            self.query_capacity = capacity;
+            self.query_pool.retain(|(_, _, size)| *size >= capacity);
+        }
     }
 }
 fn srgb_decode_u8_f64(v: f64) -> f64 {

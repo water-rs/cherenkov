@@ -255,6 +255,13 @@ fn many_timed_frames(engine: &Engine<Gpu>) -> Result<(), Box<dyn std::error::Err
         timings.extend(stats.timings);
     }
     timings.extend(engine.finish_timings()?);
+    assert!(
+        engine.finish_timings()?.is_empty(),
+        "timings are consumed once"
+    );
+    assert_eq!(engine.render(cherenkov::FrameTime::now())?, Next::Idle);
+    let idle = engine.stats();
+    assert!(idle.frame.is_none() && idle.timings.is_empty(), "{idle:?}");
     if timed {
         // Resolves land a frame or more late, but every submitted frame's
         // timing arrives exactly once, in order, tagged with its frame,

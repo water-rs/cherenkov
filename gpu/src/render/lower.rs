@@ -307,6 +307,7 @@ impl ContentData {
         self.storage.instances.clear();
         self.storage.stops.clear();
         self.storage.templates.clear();
+        self.storage.covers.clear();
     }
 
     pub fn picture(list: cherenkov::Picture) -> Self {
@@ -335,6 +336,7 @@ impl ContentData {
 #[derive(Default)]
 pub struct EmissionStorage {
     templates: Vec<InstanceTemplate>,
+    covers: Vec<Cover>,
     pub(crate) instances: Vec<RetainedInstance>,
     stops: Vec<Stop>,
 }
@@ -345,26 +347,37 @@ impl EmissionStorage {
         if self.templates.is_empty() {
             return;
         }
-        let (instances, stops, templates) = emissions
+        let (instances, stops, templates, covers) = emissions
             .iter()
             .filter_map(|e| e.data.as_ref())
-            .fold((0, 0, 0), |(i, s, t), e| {
-                (i + e.instances.len(), s + e.stops.len(), t + 1)
+            .fold((0, 0, 0, 0), |(i, s, t, c), e| {
+                (
+                    i + e.instances.len(),
+                    s + e.stops.len(),
+                    t + 1,
+                    c + usize::from(e.cover.is_some()),
+                )
             });
         if self.instances.len() <= instances * 2
             && self.stops.len() <= stops * 2
             && self.templates.len() <= templates * 2
+            && self.covers.len() <= covers * 2
         {
             return;
         }
         let mut storage = Self {
             templates: Vec::with_capacity(templates),
+            covers: Vec::with_capacity(covers),
             instances: Vec::with_capacity(instances),
             stops: Vec::with_capacity(stops),
         };
         for e in emissions.iter_mut().filter_map(|e| e.data.as_mut()) {
             storage.templates.push(self.templates[e.template]);
             e.template = storage.templates.len() - 1;
+            if let Some(cover) = &mut e.cover {
+                storage.covers.push(self.covers[*cover]);
+                *cover = storage.covers.len() - 1;
+            }
             let first = storage.instances.len();
             storage
                 .instances
@@ -452,7 +465,8 @@ impl RetainedInstance {
 pub struct Emission {
     pub(crate) pending_cells: Vec<(u32, u32, u32)>,
     template: usize,
-    cover: Option<Cover>,
+    // Only shadows carry an occlusion key; ordinary leaves keep a small index.
+    cover: Option<usize>,
     transform: Affine,
     size: [f32; 2],
     generation: u64,
@@ -501,6 +515,9 @@ pub struct Lowering<'a> {
     width: f32,
     height: f32,
     transform: Affine,
+    // The margin depends only on the transform's linear coefficients. Keep
+    // their exact bits so signed zero and non-finite inputs retain semantics.
+    margin: Option<([u64; 4], f64)>,
     clip: Option<DeviceClip>,
     depth: usize,
     glyphs: u32,
@@ -526,6 +543,7 @@ impl<'a> Lowering<'a> {
             width: size.0 as f32,
             height: size.1 as f32,
             transform: Affine::IDENTITY,
+            margin: None,
             clip: None,
             depth: 0,
             glyphs: 0,
@@ -536,6 +554,20 @@ impl<'a> Lowering<'a> {
             commands_lowered: 0,
             layers_composed: 0,
         }
+    }
+
+    /// Reuse only the scalar margin, never a command's device realization.
+    fn margin(&mut self, transform: Affine) -> f64 {
+        let [a, b, c, d, _, _] = transform.as_coeffs();
+        let linear = [a, b, c, d].map(f64::to_bits);
+        if let Some((cached, value)) = self.margin
+            && cached == linear
+        {
+            return value;
+        }
+        let value = aa_margin(transform);
+        self.margin = Some((linear, value));
+        value
     }
 
     /// Glyphs rasterized during this lowering.
@@ -573,6 +605,15 @@ impl<'a> Lowering<'a> {
 
     /// Ends the open draw range at the current source boundary.
     fn end_segment(&mut self) {
+        self.end_segment_at(self.frame.instances.len());
+    }
+
+    #[expect(
+        clippy::inline_always,
+        reason = "keep current-length calls as cheap as the original unsplit hot path"
+    )]
+    #[inline(always)]
+    fn end_segment_at(&mut self, end: usize) {
         let Some(open) = &mut self.frame.open else {
             return;
         };
@@ -580,7 +621,7 @@ impl<'a> Lowering<'a> {
             clippy::cast_possible_truncation,
             reason = "instance counts fit u32 in practice"
         )]
-        let end = self.frame.instances.len() as u32;
+        let end = end as u32;
         if end > open.seg_start {
             open.ranges.push(DrawRange {
                 source: open.source,
@@ -609,13 +650,22 @@ impl<'a> Lowering<'a> {
         });
     }
 
+    fn finish_pass(&mut self) {
+        self.finish_pass_at(self.frame.instances.len());
+    }
+
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
         reason = "surface size is a small positive float"
     )]
-    fn finish_pass(&mut self) {
-        self.end_segment();
+    #[expect(
+        clippy::inline_always,
+        reason = "keep current-length calls as cheap as the original unsplit hot path"
+    )]
+    #[inline(always)]
+    fn finish_pass_at(&mut self, end: usize) {
+        self.end_segment_at(end);
         if let Some(open) = self.frame.open.take() {
             let region = match open.target {
                 Target::Surface => [0, 0, self.width as u32, self.height as u32],
@@ -706,13 +756,15 @@ impl<'a> Lowering<'a> {
     /// non-isolated: if it stays in the current pass and its instances'
     /// device bboxes are pairwise disjoint, the instances cannot overlap
     /// and folding `opacity` into each is identical to the isolated
-    /// composite. Otherwise the attempt is rolled back and isolation runs
-    /// as before.
+    /// composite. An unclipped overlapping batch can become the scratch pass
+    /// directly; nested or clipped batches are rolled back and isolated again.
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
         reason = "surface size is a small positive float"
     )]
+    // Keep isolation's speculative buffers off the ordinary drawing walk's stack.
+    #[inline(never)]
     fn isolate(
         &mut self,
         inner_clip: Option<DeviceClip>,
@@ -723,7 +775,7 @@ impl<'a> Lowering<'a> {
     ) -> Result<(), RenderError> {
         if opacity < 1.0
             && blend == cherenkov::BlendMode::Normal
-            && self.try_passthrough(opacity, &mut body, glyphs)?
+            && self.try_passthrough(opacity, inner_clip.is_none(), &mut body, glyphs)?
         {
             return Ok(());
         }
@@ -781,12 +833,13 @@ impl<'a> Lowering<'a> {
     }
 
     /// Speculative pass-through for [`Lowering::isolate`]. Returns `Ok(true)`
-    /// when `body` stayed in the current pass with disjoint device bboxes
-    /// (opacity folded per instance), `Ok(false)` after rolling back so the
-    /// caller can isolate for real.
+    /// when `body` stayed in one pass (folding opacity for disjoint bounds,
+    /// or promoting an unclipped overlapping batch into a scratch pass).
+    /// Otherwise rolls back and returns `Ok(false)` for nested/clipped isolation.
     fn try_passthrough(
         &mut self,
         opacity: f32,
+        inner_unclipped: bool,
         body: &mut impl FnMut(&mut Self, &GlyphContext<'_>) -> Result<(), RenderError>,
         glyphs: &GlyphContext<'_>,
     ) -> Result<bool, RenderError> {
@@ -803,6 +856,15 @@ impl<'a> Lowering<'a> {
             }
             return Ok(true);
         }
+        if result.is_ok()
+            && inner_unclipped
+            && clip.is_none()
+            && self.frame.passes.len() == snap.passes
+            && self.frame.open.is_some()
+        {
+            self.promote_isolation(snap, opacity);
+            return Ok(true);
+        }
         self.frame.restore(snap);
         self.cell_patches.truncate(patches.0);
         self.mask_patches.truncate(patches.1);
@@ -811,6 +873,49 @@ impl<'a> Lowering<'a> {
         self.transform = transform;
         result?;
         Ok(false)
+    }
+
+    /// Reuse an overlapping speculative batch as the isolated pass. The body
+    /// stayed in one pass and used the same (empty) inner and outer clip, so
+    /// its instances, stops and pending atlas patches already are final.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "surface dimensions and instance indices fit u32"
+    )]
+    fn promote_isolation(&mut self, snap: FrameSnapshot, opacity: f32) {
+        self.end_segment();
+        let mut open = self
+            .frame
+            .open
+            .take()
+            .expect("speculation has an open pass");
+        let first = snap.instances as u32;
+        open.ranges.retain_mut(|range| {
+            range.instances.start = range.instances.start.max(first);
+            range.instances.start < range.instances.end
+        });
+        let outer_target = open.target;
+        self.frame.open = snap.open;
+        self.finish_pass_at(snap.instances);
+        let region = tight_region(
+            &self.frame.instances[snap.instances..],
+            self.width as u32,
+            self.height as u32,
+        );
+        if region[2] != 0 && region[3] != 0 {
+            self.frame.passes.push(Pass {
+                target: Target::Scratch(self.depth),
+                clear: Some([0.0; 4]),
+                ranges: open.ranges,
+                region,
+                backdrop_copy: None,
+            });
+        }
+        self.begin_pass(outer_target, None);
+        if region[2] != 0 && region[3] != 0 {
+            self.emit_composite(self.depth, opacity, region, cherenkov::BlendMode::Normal);
+        }
     }
 
     /// Emits the composite quad for `scratch` onto the current target,
@@ -1171,7 +1276,7 @@ impl<'a> Lowering<'a> {
         let cover = self.shadow_cover(op, next);
         let hit = cache.valid
             && cache.data.as_ref().is_some_and(|e| {
-                e.cover == cover
+                e.cover.map(|index| storage.covers[index]) == cover
                     && e.transform == self.transform
                     && e.size.map(f32::to_bits) == [self.width, self.height].map(f32::to_bits)
                     && e.generation == glyphs.atlas.generation()
@@ -1279,7 +1384,10 @@ impl<'a> Lowering<'a> {
                 .map(|&(i, p, c)| (i - instance_base, p, c))
                 .collect(),
             template,
-            cover,
+            cover: cover.map(|cover| {
+                storage.covers.push(cover);
+                storage.covers.len() - 1
+            }),
             transform,
             size: [self.width, self.height],
             generation: glyphs.atlas.generation(),
@@ -1365,7 +1473,7 @@ impl<'a> Lowering<'a> {
                 param_x,
                 flags,
             } => {
-                let margin = extra_margin + aa_margin(self.transform * *ambient);
+                let margin = extra_margin + self.margin(self.transform * *ambient);
                 let b = bounds.inflate(margin, margin);
                 if b.width() <= 0.0 || b.height() <= 0.0 {
                     return Ok(());
@@ -1394,7 +1502,7 @@ impl<'a> Lowering<'a> {
                 sigma_eff,
                 color,
             } => {
-                let margin = sigma_eff.mul_add(3.0, 1.0) + aa_margin(self.transform * *ambient);
+                let margin = sigma_eff.mul_add(3.0, 1.0) + self.margin(self.transform * *ambient);
                 let b = bounds.inflate(margin, margin);
                 let mut inst = self.base(KIND_SHADOW, affine(self.transform * *local));
                 inst.bounds = [f32_f64(b.x0), f32_f64(b.y0), f32_f64(b.x1), f32_f64(b.y1)];
@@ -1477,7 +1585,7 @@ impl<'a> Lowering<'a> {
         clippy::float_cmp,
         reason = "occlusion requires exact opacity and matching axes"
     )]
-    fn shadow_cover(&self, op: &Op, next: Option<&Op>) -> Option<Cover> {
+    fn shadow_cover(&mut self, op: &Op, next: Option<&Op>) -> Option<Cover> {
         let Op::Shadow { local, .. } = op else {
             return None;
         };
@@ -1503,7 +1611,7 @@ impl<'a> Lowering<'a> {
             return None;
         }
         let max_r = f64::from(shape.radii.iter().copied().fold(0.0, f32::max));
-        let m = aa_margin(self.transform * *ambient) + 1.0;
+        let m = self.margin(self.transform * *ambient) + 1.0;
         Some(Cover {
             wide: bounds.inset((-m, -(max_r + m))) + Vec2::new(offset_x, offset_y),
             tall: bounds.inset((-(max_r + m), -m)) + Vec2::new(offset_x, offset_y),
@@ -1979,14 +2087,32 @@ fn boxes_overlap(a: [f32; 4], b: [f32; 4]) -> bool {
 /// Whether every instance's device bbox is pairwise non-overlapping —
 /// O(n²) up to 256 instances, a sort-by-x sweep beyond.
 fn bboxes_disjoint(instances: &[Instance]) -> bool {
-    let mut boxes: Vec<[f32; 4]> = instances.iter().map(device_bbox).collect();
-    if boxes.len() <= 256 {
-        for (i, a) in boxes.iter().enumerate() {
-            if boxes[i + 1..].iter().any(|b| boxes_overlap(*a, *b)) {
+    if instances.len() <= 256 {
+        let mut boxes = Vec::with_capacity(instances.len());
+        for inst in instances {
+            let a = device_bbox(inst);
+            if boxes.iter().any(|b| boxes_overlap(*b, a)) {
                 return false;
             }
+            boxes.push(a);
         }
         return true;
+    }
+    let mut boxes = Vec::with_capacity(instances.len());
+    for inst in instances {
+        let b = device_bbox(inst);
+        // Splitting a draw into border strips can put intersecting boxes a
+        // few instances apart. Check a bounded prefix pairwise before sorting;
+        // after that, checking neighbors keeps the extra work linear.
+        let recent = if boxes.len() < 32 {
+            boxes.as_slice()
+        } else {
+            &boxes[boxes.len() - 1..]
+        };
+        if recent.iter().any(|a| boxes_overlap(*a, b)) {
+            return false;
+        }
+        boxes.push(b);
     }
     boxes.sort_by(|a, b| a[0].total_cmp(&b[0]));
     let mut reach = f32::NEG_INFINITY;
@@ -2045,6 +2171,53 @@ fn tight_region(instances: &[Instance], width: u32, height: u32) -> [u32; 4] {
 mod tests {
     use super::*;
 
+    #[test]
+    fn cached_margin_preserves_exact_transform_results() {
+        let mut frame = Frame::default();
+        let mut lowering = Lowering::new(&mut frame, (64, 64));
+        let transforms = [
+            Affine::IDENTITY,
+            Affine::scale_non_uniform(2.0, 3.0),
+            Affine::rotate(0.7),
+            Affine::new([1.0, 0.2, -0.3, 2.0, 4.0, 5.0]),
+            Affine::new([-0.0, 0.0, 0.0, -0.0, 0.0, 0.0]),
+            Affine::new([f64::MIN_POSITIVE, 0.0, 0.0, 1.0, 0.0, 0.0]),
+            Affine::new([f64::INFINITY, 0.0, 0.0, 1.0, 0.0, 0.0]),
+            Affine::new([f64::NAN, 0.0, 0.0, f64::NAN, 0.0, 0.0]),
+        ];
+        for transform in transforms.into_iter().cycle().take(24) {
+            let expected = aa_margin(transform).to_bits();
+            assert_eq!(lowering.margin(transform).to_bits(), expected);
+            assert_eq!(lowering.margin(transform).to_bits(), expected);
+            let [a, b, c, d, _, _] = transform.as_coeffs();
+            let translated = Affine::new([a, b, c, d, 123.0, -456.0]);
+            assert_eq!(lowering.margin(translated).to_bits(), expected);
+        }
+    }
+
+    #[test]
+    fn large_opacity_groups_detect_adjacent_and_distant_overlaps() {
+        let mut instances: Vec<_> = (0_u16..300)
+            .map(|index| {
+                let mut instance = Instance::new(KIND_SPAN);
+                let x = f32::from(index) * 2.0;
+                instance.bounds = [x, 0.0, x + 1.0, 1.0];
+                instance
+            })
+            .collect();
+        assert!(bboxes_disjoint(&instances));
+        let last = instances[299].bounds;
+        instances[299].bounds = instances[0].bounds;
+        assert!(!bboxes_disjoint(&instances));
+        instances[299].bounds = last;
+        let within_prefix = instances[15].bounds;
+        instances[15].bounds = instances[0].bounds;
+        assert!(!bboxes_disjoint(&instances));
+        instances[15].bounds = within_prefix;
+        instances[1].bounds = instances[0].bounds;
+        assert!(!bboxes_disjoint(&instances));
+    }
+
     /// An adapter plus device, or `None` where no GPU exists.
     fn device_and_queue() -> Option<(wgpu::Device, wgpu::Queue)> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -2090,11 +2263,18 @@ mod tests {
         let images = HashMap::new();
         let mut frame = Frame::default();
         let mut lowering = Lowering::new(&mut frame, (64, 64));
+        lowering.begin_pass(Target::Surface, None);
         let glyphs = GlyphContext {
             atlas: &atlas,
             fonts: &fonts,
             images: &images,
         };
+        let prefix = cherenkov::Command::Fill {
+            shape: ShapeData::Rect(Rect::new(0.0, 0.0, 2.0, 2.0)),
+            paint: cherenkov::Paint::Solid(WorkingColor::new([0.0, 1.0, 0.0, 1.0])),
+        };
+        draw(&mut lowering, &prefix, &glyphs).expect("prefix");
+        let mut calls = 0;
         // Two overlapping rects defeat the pass-through speculation, so
         // the group really isolates into a scratch and composites back.
         lowering
@@ -2103,6 +2283,7 @@ mod tests {
                 0.5,
                 cherenkov::BlendMode::Normal,
                 |s, g| {
+                    calls += 1;
                     draw(
                         s,
                         &cherenkov::Command::Fill {
@@ -2123,6 +2304,17 @@ mod tests {
                 &glyphs,
             )
             .expect("isolate");
+        assert_eq!(calls, 1, "promote the speculative output without replay");
+        draw(&mut lowering, &prefix, &glyphs).expect("suffix");
+        lowering.finish_pass();
+        assert_eq!(frame.passes.len(), 3);
+        assert_eq!(frame.passes[0].target, Target::Surface);
+        assert_eq!(frame.passes[0].ranges[0].instances, 0..1);
+        assert_eq!(frame.passes[1].target, Target::Scratch(0));
+        assert_eq!(frame.passes[1].ranges[0].instances, 1..3);
+        assert_eq!(frame.passes[2].target, Target::Surface);
+        assert_eq!(frame.passes[2].ranges[0].instances, 3..4);
+        assert_eq!(frame.passes[2].ranges[1].instances, 4..5);
         let composite = frame
             .instances
             .iter()

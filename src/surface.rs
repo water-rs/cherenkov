@@ -129,7 +129,7 @@ impl<B: Backend> Shared<B> {
     {
         let weak = Rc::downgrade(shared);
         let waker = Rc::clone(&shared.borrow().waker);
-        let guard = subscribe(crate::record::Watch::binding(move |context: Context<T>| {
+        let guard = subscribe.start(crate::record::Watch::binding(move |context: Context<T>| {
             let animation = context.metadata().try_get::<Animation>();
             let target = context.into_value();
             if let Some(shared) = weak.upgrade() {

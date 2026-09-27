@@ -211,6 +211,9 @@ fn fixture(font: FontId) -> Picture {
                         Rect::new(20., 30., 40., 50.),
                         Shadow::new(2., WorkingColor::new([0., 0., 0., 0.4])),
                     );
+                    // Exercise shadow occlusion-key reuse and invalidation when
+                    // the following opaque shape is patched or repainted.
+                    c.fill(Rect::new(20., 30., 40., 50.), WorkingColor::WHITE);
                     c.picture(&nested, Affine::translate((35., 30.)));
                 });
             });

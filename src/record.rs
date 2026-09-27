@@ -20,7 +20,8 @@ use crate::style::{Group, Shadow};
 ///
 /// [`Draw::Value`] decides what a parameter accepts: a plain value for
 /// [`StaticRecorder`], any nami [`Signal`] for [`Recorder`]. Constants are
-/// signals, so a plain value works with both.
+/// signals, so a plain value works with both. Wrap an owned constant in
+/// [`Fixed`] to move it without an extra signal snapshot.
 ///
 /// State changes are closure scopes only: [`clip`](Draw::clip),
 /// [`transform`](Draw::transform) and [`group`](Draw::group) take the body
@@ -78,7 +79,10 @@ pub trait Draw {
     fn group(&mut self, group: impl Into<Self::Value<Group>>, body: impl FnOnce(&mut Self));
 }
 
-/// A plain value accepted by [`StaticRecorder`].
+/// A fixed value accepted by either recorder.
+///
+/// [`Recorder`] consumes the value without taking a signal snapshot or
+/// creating a subscription. This avoids cloning owned data such as glyph runs.
 #[derive(Clone, Copy, Debug)]
 pub struct Fixed<T>(pub T);
 
@@ -237,10 +241,45 @@ impl<T> Watch<T> {
 
 /// A signal's subscription factory and the guard keeping it alive.
 #[doc(hidden)]
-pub type Subscribe<T> = Box<dyn FnOnce(Watch<T>) -> Option<Box<dyn Any>>>;
+pub struct Subscribe<T>(Option<Box<dyn Subscription<T>>>);
 
-/// A value accepted by [`Recorder`]: the current value of a nami signal, and
-/// the subscription that reports its later changes.
+trait Subscription<T> {
+    fn start(self: Box<Self>, watch: Watch<T>) -> Option<Box<dyn Any>>;
+}
+
+struct SignalSubscription<S>(S);
+
+impl<S: Signal> Subscription<S::Output> for SignalSubscription<S> {
+    #[expect(
+        clippy::inline_always,
+        reason = "erase constant watches after devirtualizing the subscription"
+    )]
+    #[inline(always)]
+    fn start(self: Box<Self>, watch: Watch<S::Output>) -> Option<Box<dyn Any>> {
+        let guard = self.0.watch(move |context| watch.notify(context));
+        // The watch always runs. Only guards with neither size nor drop glue
+        // can be discarded instead of retained for unsubscription.
+        if size_of::<S::Guard>() == 0 && !needs_drop::<S::Guard>() {
+            None
+        } else {
+            Some(Box::new(guard) as Box<dyn Any>)
+        }
+    }
+}
+
+impl<T> Subscribe<T> {
+    #[expect(
+        clippy::inline_always,
+        reason = "expose the concrete subscription to the recorder's call site"
+    )]
+    #[inline(always)]
+    pub(crate) fn start(self, watch: Watch<T>) -> Option<Box<dyn Any>> {
+        self.0.and_then(|subscription| subscription.start(watch))
+    }
+}
+
+/// A value accepted by [`Recorder`]: a [`Fixed`] value, or the current value
+/// of a nami signal with the subscription that reports its later changes.
 pub struct Live<T> {
     #[doc(hidden)]
     pub value: T,
@@ -256,22 +295,27 @@ impl<T: std::fmt::Debug> std::fmt::Debug for Live<T> {
     }
 }
 
-impl<T: 'static, S: Signal<Output = T>> From<S> for Live<T> {
+impl<T> From<Fixed<T>> for Live<T> {
     #[inline]
+    fn from(value: Fixed<T>) -> Self {
+        Self {
+            value: value.0,
+            subscribe: Subscribe(None),
+        }
+    }
+}
+
+impl<T: 'static, S: Signal<Output = T>> From<S> for Live<T> {
+    #[expect(
+        clippy::inline_always,
+        reason = "expose constant signal subscriptions to call-site dead code elimination"
+    )]
+    #[inline(always)]
     fn from(signal: S) -> Self {
         let value = signal.snapshot();
         Self {
             value,
-            subscribe: Box::new(move |watch: Watch<T>| {
-                let guard = signal.watch(move |context| watch.notify(context));
-                // A guard with no size and no drop glue unsubscribes nothing, so
-                // there is nothing to keep alive.
-                if size_of::<S::Guard>() == 0 && !needs_drop::<S::Guard>() {
-                    None
-                } else {
-                    Some(Box::new(guard) as Box<dyn Any>)
-                }
-            }),
+            subscribe: Subscribe(Some(Box::new(SignalSubscription(signal)))),
         }
     }
 }
@@ -312,14 +356,18 @@ impl std::fmt::Debug for Recorder {
 impl Recorder {
     /// Subscribes to a value's later changes, which update operand `convert`
     /// produces on command `command`.
-    #[inline]
+    #[expect(
+        clippy::inline_always,
+        reason = "expose constant signal subscriptions to call-site dead code elimination"
+    )]
+    #[inline(always)]
     fn subscribe<T: 'static>(
         &self,
         subscribe: Subscribe<T>,
         command: u32,
         convert: fn(T) -> Operand,
     ) {
-        let guard = subscribe(Watch {
+        let guard = subscribe.start(Watch {
             destination: Destination::Slot {
                 state: Rc::downgrade(&self.live),
                 command,
@@ -386,6 +434,11 @@ impl Draw for Recorder {
         self.subscribe(shadow.subscribe, command, Operand::Shadow);
     }
 
+    #[expect(
+        clippy::inline_always,
+        reason = "expose constant signal subscriptions to call-site dead code elimination"
+    )]
+    #[inline(always)]
     fn glyphs<P: Into<Paint> + 'static>(
         &mut self,
         run: impl Into<Live<GlyphRun>>,
@@ -566,6 +619,54 @@ mod tests {
 
     fn red() -> Color<Srgb> {
         Color::new([1., 0., 0., 1.])
+    }
+
+    #[test]
+    fn fixed_glyph_runs_move_their_storage_into_the_command() {
+        let run = GlyphRun {
+            font: crate::FontId::new(0),
+            size: 12.0,
+            coords: vec![123],
+            glyphs: vec![crate::Glyph {
+                id: 7,
+                x: 0.0,
+                y: 0.0,
+                transform: None,
+            }],
+            style: crate::GlyphStyle::Fill,
+        };
+        let glyphs = run.glyphs.as_ptr();
+        let coords = run.coords.as_ptr();
+        let content = Content::record(|c| c.glyphs(Fixed(run), red()));
+        let Command::Glyphs { run, .. } = &content.picture.display_list().commands()[0] else {
+            panic!("the recorded glyph run");
+        };
+        assert_eq!(run.glyphs.as_ptr(), glyphs);
+        assert_eq!(run.coords.as_ptr(), coords);
+    }
+
+    #[test]
+    fn a_zero_sized_guard_does_not_skip_the_watch() {
+        #[derive(Clone)]
+        struct Observed(Rc<std::cell::Cell<usize>>);
+
+        impl Signal for Observed {
+            type Output = Rect;
+            type Guard = ();
+
+            fn snapshot(&self) -> Rect {
+                Rect::new(0.0, 0.0, 8.0, 8.0)
+            }
+
+            fn watch(&self, _watcher: impl Fn(nami_core::watcher::Context<Rect>) + 'static) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+
+        let calls = Rc::new(std::cell::Cell::new(0));
+        let content = Content::record(|c| c.fill(Observed(Rc::clone(&calls)), red()));
+        assert_eq!(calls.get(), 1);
+        assert_eq!(content.len(), 1);
     }
 
     #[test]

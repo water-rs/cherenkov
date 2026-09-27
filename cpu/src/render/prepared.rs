@@ -44,7 +44,12 @@ pub enum Op {
         end: u32,
     },
     /// Open an opacity group.
-    BeginIsolate { opacity: f32, end: u32 },
+    BeginIsolate {
+        opacity: f32,
+        blend: BlendMode,
+        space: BlendSpace,
+        end: u32,
+    },
     /// Close a scope.
     End,
 }
@@ -63,9 +68,12 @@ impl cherenkov::lowering::Operation for Op {
 }
 
 /// Resolve CPU paints while retaining content-space geometry.
-pub struct Lowerer;
+pub struct Lowerer<'a> {
+    pub images: &'a std::collections::HashMap<u64, std::sync::Arc<super::image::CpuImage>>,
+    pub fonts: &'a std::collections::HashMap<u64, cherenkov::FontData>,
+}
 
-impl cherenkov::lowering::Compiler for Lowerer {
+impl cherenkov::lowering::Compiler for Lowerer<'_> {
     type Op = Op;
     type Error = RenderError;
     fn draw(
@@ -74,11 +82,17 @@ impl cherenkov::lowering::Compiler for Lowerer {
         ambient: Affine,
         ops: &mut Vec<Op>,
     ) -> Result<(), RenderError> {
+        if let Command::Glyphs { run, paint } = command
+            && let cherenkov::GlyphStyle::Stroke(stroke) = &run.style
+        {
+            self.stroke_glyphs(ambient, run, stroke, paint, ops)?;
+            return Ok(());
+        }
         ops.push(match command {
             Command::Fill { shape, paint } => Op::Fill {
                 local: ambient,
                 shape: shape.clone(),
-                paint: paint_data(paint, Affine::IDENTITY)?,
+                paint: paint_data(paint, Affine::IDENTITY, self.images)?,
             },
             Command::Stroke {
                 shape,
@@ -88,7 +102,7 @@ impl cherenkov::lowering::Compiler for Lowerer {
                 local: ambient,
                 shape: shape.clone(),
                 stroke: stroke.clone(),
-                paint: paint_data(paint, Affine::IDENTITY)?,
+                paint: paint_data(paint, Affine::IDENTITY, self.images)?,
             },
             Command::Shadow { shape, shadow } => Op::Shadow {
                 local: ambient,
@@ -98,9 +112,34 @@ impl cherenkov::lowering::Compiler for Lowerer {
             Command::Glyphs { run, paint } => Op::Glyphs {
                 local: ambient,
                 run: run.clone(),
-                paint: paint_data(paint, Affine::IDENTITY)?,
+                paint: paint_data(paint, Affine::IDENTITY, self.images)?,
             },
-            Command::Image { .. } => return Err(RenderError::Unsupported(names::IMAGE)),
+            Command::Image {
+                image,
+                dst,
+                sampling,
+            } => {
+                let source = self.images.get(&image.raw()).ok_or_else(|| {
+                    RenderError::Image(format!("unregistered image {}", image.raw()))
+                })?;
+                let transform = Affine::translate((dst.x0, dst.y0))
+                    * Affine::scale_non_uniform(
+                        dst.width() / f64::from(source.width),
+                        dst.height() / f64::from(source.height),
+                    );
+                let paint = cherenkov::Paint::Image(cherenkov::ImagePattern {
+                    image: *image,
+                    transform,
+                    extend_x: cherenkov::Extend::Pad,
+                    extend_y: cherenkov::Extend::Pad,
+                    sampling: *sampling,
+                });
+                Op::Fill {
+                    local: ambient,
+                    shape: ShapeData::Rect(*dst),
+                    paint: paint_data(&paint, Affine::IDENTITY, self.images)?,
+                }
+            }
             _ => unreachable!("shared walker handles scopes and pictures"),
         });
         Ok(())
@@ -116,18 +155,49 @@ impl cherenkov::lowering::Compiler for Lowerer {
         if group.filter.is_some() {
             return Err(RenderError::Unsupported(names::FILTER));
         }
-        if group.blend_space != BlendSpace::Linear {
-            return Err(RenderError::Unsupported(names::BLEND_SPACE));
-        }
-        if group.blend != BlendMode::Normal {
-            return Err(RenderError::Unsupported(names::BLEND));
-        }
-        Ok((group.opacity < 1.0).then_some(Op::BeginIsolate {
-            opacity: group.opacity,
-            end: 0,
-        }))
+        Ok((group.opacity < 1.0
+            || group.blend != BlendMode::Normal
+            || group.blend_space != BlendSpace::Linear)
+            .then_some(Op::BeginIsolate {
+                opacity: group.opacity,
+                blend: group.blend,
+                space: group.blend_space,
+                end: 0,
+            }))
     }
     fn end(&mut self) -> Op {
         Op::End
+    }
+}
+
+impl Lowerer<'_> {
+    fn stroke_glyphs(
+        &self,
+        ambient: Affine,
+        run: &GlyphRun,
+        stroke: &kurbo::Stroke,
+        paint: &cherenkov::Paint,
+        ops: &mut Vec<Op>,
+    ) -> Result<(), RenderError> {
+        if run.glyphs.iter().any(|glyph| glyph.transform.is_some()) {
+            return Err(RenderError::Unsupported(names::GLYPH_TRANSFORM));
+        }
+        let font = self
+            .fonts
+            .get(&run.font.raw())
+            .ok_or_else(|| RenderError::Font(format!("unregistered font {:?}", run.font)))?;
+        let paint = paint_data(paint, Affine::IDENTITY, self.images)?;
+        for path in super::glyph::stroke_outlines(font, run)? {
+            ops.push(Op::Stroke {
+                local: ambient,
+                shape: ShapeData::Path {
+                    elements: path.into_elements(),
+                    rule: cherenkov::FillRule::NonZero,
+                },
+                stroke: stroke.clone(),
+                paint: paint.clone(),
+            });
+        }
+        Ok(())
     }
 }

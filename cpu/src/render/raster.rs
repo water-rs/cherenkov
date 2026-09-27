@@ -320,11 +320,21 @@ pub fn render_bands(
                     Item::PushIsolate => {
                         stack.push(vec![[0.0; 4]; slice_len(band.w, bh)]);
                     }
-                    Item::PopIsolate { opacity, clip } => {
+                    Item::PopIsolate {
+                        opacity,
+                        blend,
+                        clip,
+                    } => {
                         let Some(scratch) = stack.pop() else {
                             continue;
                         };
-                        band.composite_isolate(&scratch, *opacity, clip.as_ref(), &mut stack);
+                        band.composite_isolate(
+                            &scratch,
+                            *opacity,
+                            *blend,
+                            clip.as_ref(),
+                            &mut stack,
+                        );
                     }
                     Item::Shadow {
                         rbox,
@@ -695,6 +705,7 @@ impl Band<'_> {
         &mut self,
         scratch: &[[f32; 4]],
         opacity: f32,
+        blend: (cherenkov::BlendMode, cherenkov::BlendSpace),
         clip: Option<&ClipRef>,
         stack: &mut Vec<Vec<[f32; 4]>>,
     ) {
@@ -703,8 +714,22 @@ impl Band<'_> {
             let px = i % self.w;
             let py = self.y0 + i / self.w;
             let cc = clip_cov(clip, self.w, px, py);
-            let s = src.map(|v| v * opacity * cc);
-            dst[i] = src_over(dst[i], s);
+            if blend == (cherenkov::BlendMode::Normal, cherenkov::BlendSpace::Linear) {
+                let s = src.map(|v| v * opacity * cc);
+                dst[i] = src_over(dst[i], s);
+            } else if cc > 0.0 {
+                let source = src.map(|value| value * opacity);
+                let result = super::blend::in_space(blend.0, blend.1, dst[i], source);
+                // The clip limits the composite operation, including Clear
+                // and DestIn; multiplying only source alpha is not equivalent.
+                dst[i] = if cc >= 1.0 {
+                    result
+                } else {
+                    std::array::from_fn(|channel| {
+                        cc.mul_add(result[channel] - dst[i][channel], dst[i][channel])
+                    })
+                };
+            }
         }
     }
 }

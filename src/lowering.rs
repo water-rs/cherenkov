@@ -51,15 +51,6 @@ struct Span {
     ambient: Affine,
 }
 
-impl Default for Span {
-    fn default() -> Self {
-        Self {
-            ops: 0..0,
-            ambient: Affine::IDENTITY,
-        }
-    }
-}
-
 /// Retained backend operations and the source commands that produced them.
 pub struct Lowered<T> {
     /// Draws and paired scopes in painter order.
@@ -76,17 +67,29 @@ impl<T: Operation> Lowered<T> {
         list: &DisplayList,
         compiler: &mut C,
     ) -> Result<Self, C::Error> {
-        let mut ops = Vec::new();
-        let mut spans = vec![Span::default(); list.len()];
+        let mut lowered = Self {
+            ops: Vec::with_capacity(list.len()),
+            spans: Vec::with_capacity(list.len()),
+        };
+        lowered.refill(list, compiler)?;
+        Ok(lowered)
+    }
+
+    fn refill<C: Compiler<Op = T>>(
+        &mut self,
+        list: &DisplayList,
+        compiler: &mut C,
+    ) -> Result<(), C::Error> {
+        self.ops.clear();
+        self.spans.clear();
         walk(
             list,
             0..list.len(),
             Affine::IDENTITY,
             compiler,
-            &mut ops,
-            &mut spans,
-        )?;
-        Ok(Self { ops, spans })
+            &mut self.ops,
+            &mut self.spans,
+        )
     }
 
     /// Patch dirty command spans in place. `None` means the operation count or
@@ -108,7 +111,7 @@ impl<T: Operation> Lowered<T> {
         for range in dirty.ranges() {
             let range = range.start as usize..range.end as usize;
             let mut ops = Vec::new();
-            let mut spans = vec![Span::default(); range.len()];
+            let mut spans = Vec::with_capacity(range.len());
             walk(
                 list,
                 range.clone(),
@@ -163,7 +166,7 @@ pub fn append<C: Compiler>(
     compiler: &mut C,
     ops: &mut Vec<C::Op>,
 ) -> Result<(), C::Error> {
-    let mut spans = vec![Span::default(); list.len()];
+    let mut spans = Vec::with_capacity(list.len());
     walk(list, 0..list.len(), ambient, compiler, ops, &mut spans)
 }
 
@@ -173,10 +176,9 @@ fn walk<C: Compiler>(
     ambient: Affine,
     compiler: &mut C,
     ops: &mut Vec<C::Op>,
-    spans: &mut [Span],
+    spans: &mut Vec<Span>,
 ) -> Result<(), C::Error> {
-    let base = range.start;
-    let mut i = base;
+    let mut i = range.start;
     while i < range.end {
         let start = u32::try_from(ops.len()).expect("op index fits u32");
         let scope = match &list.commands()[i] {
@@ -202,18 +204,11 @@ fn walk<C: Compiler>(
         if let Some((end, inner, opener)) = scope {
             let emitted = opener.is_some();
             ops.extend(opener);
-            spans[i - base] = Span {
+            spans.push(Span {
                 ops: start..u32::try_from(ops.len()).expect("op index fits u32"),
                 ambient,
-            };
-            walk(
-                list,
-                i + 1..end,
-                inner,
-                compiler,
-                ops,
-                &mut spans[i + 1 - base..end - base],
-            )?;
+            });
+            walk(list, i + 1..end, inner, compiler, ops, spans)?;
             let close = u32::try_from(ops.len()).expect("op index fits u32");
             if emitted {
                 *ops[start as usize]
@@ -221,16 +216,16 @@ fn walk<C: Compiler>(
                     .expect("scope opener has an end") = close;
                 ops.push(compiler.end());
             }
-            spans[end - base] = Span {
+            spans.push(Span {
                 ops: close..u32::try_from(ops.len()).expect("op index fits u32"),
                 ambient: inner,
-            };
+            });
             i = end + 1;
         } else {
-            spans[i - base] = Span {
+            spans.push(Span {
                 ops: start..u32::try_from(ops.len()).expect("op index fits u32"),
                 ambient,
-            };
+            });
             i += 1;
         }
     }
@@ -258,6 +253,7 @@ impl<T> Default for Realization<T> {
 /// One layer's display list, accumulated dirty commands, and retained output.
 pub struct Content<O, E> {
     live: bool,
+    rebuild: bool,
     list: crate::Picture,
     dirty: Dirty,
     lowered: Option<Lowered<O>>,
@@ -270,11 +266,21 @@ impl<O: Operation, E> Content<O, E> {
     pub fn new(list: crate::Picture) -> Self {
         Self {
             live: true,
+            rebuild: false,
             list,
             dirty: Dirty::default(),
             lowered: None,
             emissions: Vec::new(),
         }
+    }
+
+    /// Replace all source commands while keeping the lowering buffers available.
+    pub fn replace(&mut self, list: crate::Picture) {
+        self.live = true;
+        self.list = list;
+        self.dirty = Dirty::default();
+        self.emissions.clear();
+        self.rebuild = true;
     }
 
     /// Retain immutable picture content, which cannot accept slot updates.
@@ -310,6 +316,18 @@ impl<O: Operation, E> Content<O, E> {
     /// When the command count exceeds u32.
     pub fn prepare<C: Compiler<Op = O>>(&mut self, compiler: &mut C) -> Result<u32, C::Error> {
         let count;
+        if self.rebuild
+            && let Some(lowered) = &mut self.lowered
+        {
+            lowered.refill(self.list.display_list(), compiler)?;
+            self.emissions
+                .resize_with(lowered.ops.len(), Realization::default);
+            self.dirty = Dirty::default();
+            self.rebuild = false;
+            return Ok(
+                u32::try_from(self.list.display_list().len()).expect("command count fits u32")
+            );
+        }
         if let Some(lowered) = &mut self.lowered {
             if self.dirty.is_empty() {
                 return Ok(0);
@@ -336,6 +354,7 @@ impl<O: Operation, E> Content<O, E> {
             count = u32::try_from(self.list.display_list().len()).expect("command count fits u32");
         }
         self.dirty = Dirty::default();
+        self.rebuild = false;
         Ok(count)
     }
 

@@ -257,6 +257,7 @@ impl<T: std::fmt::Debug> std::fmt::Debug for Live<T> {
 }
 
 impl<T: 'static, S: Signal<Output = T>> From<S> for Live<T> {
+    #[inline]
     fn from(signal: S) -> Self {
         let value = signal.snapshot();
         Self {
@@ -311,6 +312,7 @@ impl std::fmt::Debug for Recorder {
 impl Recorder {
     /// Subscribes to a value's later changes, which update operand `convert`
     /// produces on command `command`.
+    #[inline]
     fn subscribe<T: 'static>(
         &self,
         subscribe: Subscribe<T>,

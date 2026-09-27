@@ -379,8 +379,13 @@ pub enum ClipShape {
 
 /// The outline a `Path` op rasterizes on a cache miss.
 pub enum Outline {
-    /// Fill `elements` under `rule`.
-    Fill(Arc<[PathEl]>),
+    /// A fill's local geometry and its exact content identity.
+    Fill {
+        /// The path elements.
+        elements: Arc<[PathEl]>,
+        /// Hash of the elements and fill rule.
+        content: u64,
+    },
     /// Stroke `shape` with `stroke`; the device-dependent tolerance is
     /// mixed into the content hash at compose.
     Stroke {
@@ -439,8 +444,6 @@ pub enum Op {
     Path {
         /// The ambient transform.
         local: Affine,
-        /// The content hash (stroke hashes exclude the tolerance).
-        content: u64,
         /// The fill rule.
         rule: FillRule,
         /// The outline builder.
@@ -584,9 +587,11 @@ impl Lowerer<'_> {
         if let ShapeData::Path { elements, rule } = shape {
             ops.push(Op::Path {
                 local: ambient,
-                content: path::hash_elements(elements, fill_tag(*rule)),
                 rule: *rule,
-                outline: Outline::Fill(Arc::from(elements.as_slice())),
+                outline: Outline::Fill {
+                    elements: Arc::from(elements.as_slice()),
+                    content: path::hash_elements(elements, fill_tag(*rule)),
+                },
                 paint: resolve(paint, Affine::IDENTITY, self.images)?,
             });
             return Ok(());
@@ -657,7 +662,6 @@ impl Lowerer<'_> {
             }
             ops.push(Op::Path {
                 local: ambient,
-                content: path::hash_stroke(shape, stroke, 0.0),
                 rule: FillRule::NonZero,
                 outline: Outline::Stroke {
                     shape: shape.clone(),

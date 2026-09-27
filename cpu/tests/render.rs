@@ -346,7 +346,7 @@ fn a_glyph_run_renders_and_the_second_frame_hits_the_cache() {
 }
 
 #[test]
-fn unsupported_features_report_their_names() {
+fn sweep_renders_and_remaining_unsupported_features_report_their_names() {
     let engine = engine();
     let surface = engine
         .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF32))
@@ -359,13 +359,13 @@ fn unsupported_features_report_their_names() {
             c.fill(Rect::new(0.0, 0.0, 64.0, 64.0), Paint::from(sweep));
         }));
     });
-    let e = engine
-        .render(FrameTime::now())
-        .expect_err("sweep unsupported");
-    let msg = format!("{e}");
-    assert!(msg.contains("sweep-gradient"), "unsupported message: {msg}");
-    // Per-glyph transforms are unsupported (a fresh engine, so the
-    // failed sweep frame above cannot shadow this error).
+    engine.render(FrameTime::now()).expect("sweep supported");
+    let pixel = surface.readback().expect("sweep pixels").pixels[32 * 64 + 48];
+    let angle = 0.5_f64.atan2(16.5) / std::f64::consts::TAU;
+    assert!((f64::from(pixel[0]) - (1.0 - angle)).abs() < 1e-6);
+    assert!((f64::from(pixel[2]) - angle).abs() < 1e-6);
+    assert_eq!(pixel[3].to_bits(), 1.0_f32.to_bits());
+    // Per-glyph transforms remain explicitly unsupported on a fresh engine.
     let engine2 = Engine::<Raster>::new(RasterConfig::default()).expect("engine");
     let data = std::fs::read("../scenes/fonts/NotoSans.ttf").expect("test font");
     let font = engine2

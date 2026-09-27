@@ -148,3 +148,36 @@ pub fn invalid<B: Backend>(config: B::Config) {
         );
     }
 }
+
+pub fn identity<B: Backend>(config: B::Config) {
+    let engine = Engine::<B>::new(config).expect("engine");
+    let plain = engine
+        .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))
+        .expect("surface");
+    let wrapped = engine
+        .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))
+        .expect("surface");
+    plain.update(|tx| {
+        tx[plain.root()].content(plain.record(|c| {
+            c.fill(Rect::new(3.25, 2.5, 61.0, 60.0), gradient());
+        }));
+    });
+    wrapped.update(|tx| {
+        tx[wrapped.root()].content(wrapped.record(|c| {
+            c.fill(
+                Rect::new(3.25, 2.5, 61.0, 60.0),
+                TransformedPaint::new(gradient(), Affine::IDENTITY),
+            );
+        }));
+    });
+    engine.render(FrameTime::now()).expect("identity");
+    for (a, b) in plain
+        .readback()
+        .expect("plain")
+        .pixels
+        .into_iter()
+        .zip(wrapped.readback().expect("wrapped").pixels)
+    {
+        assert_eq!(a.map(f32::to_bits), b.map(f32::to_bits));
+    }
+}

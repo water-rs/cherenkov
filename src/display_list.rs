@@ -106,6 +106,8 @@ pub enum OperandKind {
     Group,
     /// The destination rectangle of an image.
     Rect,
+    /// The run of a glyph run.
+    Run,
 }
 
 /// A value that replaces one operand of a command.
@@ -125,6 +127,8 @@ pub enum Operand {
     Group(Group),
     /// A rectangle.
     Rect(Rect),
+    /// A glyph run.
+    Run(GlyphRun),
 }
 
 impl Operand {
@@ -139,6 +143,7 @@ impl Operand {
             Self::Transform(_) => OperandKind::Transform,
             Self::Group(_) => OperandKind::Group,
             Self::Rect(_) => OperandKind::Rect,
+            Self::Run(_) => OperandKind::Run,
         }
     }
 }
@@ -193,6 +198,13 @@ impl Dirty {
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.ranges.is_empty()
+    }
+
+    /// Merges `other` into this set: afterwards the ranges cover both
+    /// sets. Reuse the same normalized form as a fresh merge.
+    pub fn union(&mut self, other: Self) {
+        self.ranges.extend(other.ranges);
+        *self = Self::from_unsorted(std::mem::take(&mut self.ranges));
     }
 
     /// Whether a command needs regenerating.
@@ -377,6 +389,10 @@ impl DisplayList {
                     *stroke = new;
                     command
                 }
+                (Command::Glyphs { run, .. }, Operand::Run(new)) => {
+                    *run = new;
+                    command
+                }
                 (Command::Shadow { shadow, .. }, Operand::Shadow(new)) => {
                     *shadow = new;
                     command
@@ -462,7 +478,58 @@ impl Picture {
 mod tests {
     use serde_json::json;
 
-    use super::{DisplayList, ScopeError};
+    use super::{Command, Dirty, DisplayList, Operand, ScopeError, SlotUpdate};
+    use crate::glyph::{FontId, Glyph, GlyphRun, GlyphStyle};
+    use crate::paint::Paint;
+
+    fn run(id: u32) -> GlyphRun {
+        GlyphRun {
+            font: FontId::new(0),
+            size: 12.0,
+            coords: Vec::new(),
+            glyphs: vec![Glyph {
+                id,
+                x: 0.0,
+                y: 0.0,
+                transform: None,
+            }],
+            style: GlyphStyle::Fill,
+        }
+    }
+
+    #[test]
+    fn a_run_update_dirties_only_its_command() {
+        let mut list = DisplayList::default();
+        list.push(Command::Fill {
+            shape: crate::shape::ShapeData::of(&kurbo::Rect::new(0.0, 0.0, 1.0, 1.0)),
+            paint: Paint::from(crate::color::WorkingColor::WHITE),
+        });
+        list.push(Command::Glyphs {
+            run: run(1),
+            paint: Paint::from(crate::color::WorkingColor::WHITE),
+        });
+        list.push(Command::Fill {
+            shape: crate::shape::ShapeData::of(&kurbo::Rect::new(0.0, 0.0, 2.0, 2.0)),
+            paint: Paint::from(crate::color::WorkingColor::WHITE),
+        });
+        let dirty = list.apply([SlotUpdate {
+            command: 1,
+            value: Operand::Run(run(2)),
+        }]);
+        assert_eq!(dirty.ranges(), std::iter::once(1..2).collect::<Vec<_>>());
+        let Command::Glyphs { run: got, .. } = &list.commands()[1] else {
+            panic!("not a glyph run");
+        };
+        assert_eq!(got.glyphs[0].id, 2);
+    }
+
+    #[test]
+    fn union_merges_two_dirty_sets() {
+        let mut a = Dirty::from_unsorted(vec![0..2, 5..7]);
+        let b = Dirty::from_unsorted(vec![2..5, 9..10]);
+        a.union(b);
+        assert_eq!(a.ranges(), &[0..7, 9..10]);
+    }
 
     fn scopes(commands: &serde_json::Value) -> Result<DisplayList, String> {
         serde_json::from_value(json!({ "commands": commands })).map_err(|error| error.to_string())

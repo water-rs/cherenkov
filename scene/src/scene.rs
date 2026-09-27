@@ -50,6 +50,10 @@ pub enum Feature {
     Blend(BlendMode),
     /// Layer clips.
     Clip,
+    /// A non-zero `scroll_offset` on a layer.
+    Scroll,
+    /// A `motion` on a layer.
+    Animation,
     /// Group opacity below `1.0`.
     Opacity,
     /// `Shadow` draw commands.
@@ -298,6 +302,12 @@ fn collect_layer_features(layer: &Layer, f: &mut BTreeSet<Feature>) {
     }
     if layer.blend != BlendMode::Normal {
         f.insert(Feature::Blend(layer.blend));
+    }
+    if layer.scroll_offset != kurbo::Vec2::ZERO {
+        f.insert(Feature::Scroll);
+    }
+    if layer.motion.is_some() {
+        f.insert(Feature::Animation);
     }
     for item in &layer.items {
         match item {

@@ -95,6 +95,7 @@ pub fn skia_features() -> Vec<Feature> {
         Feature::ImagePaint,
         Feature::Clip,
         Feature::Opacity,
+        Feature::Scroll,
         Feature::Shadow,
         Feature::Glyphs,
         Feature::FontVariations,
@@ -209,6 +210,14 @@ fn encode_layer(
         lp.set_blend_mode(blend(layer.blend));
         lp.set_alpha_f(layer.opacity.clamp(0.0, 1.0) as f32);
         cmds.push(Cmd::SaveLayer(lp));
+    }
+    // Content and children draw translated by -scroll_offset inside the
+    // clip; `motion` is unsupported (not in `skia_features`).
+    if layer.scroll_offset != kurbo::Vec2::ZERO {
+        cmds.push(Cmd::Concat(sk_matrix(kurbo::Affine::translate((
+            -layer.scroll_offset.x,
+            -layer.scroll_offset.y,
+        )))));
     }
     for item in &layer.items {
         match item {

@@ -10,9 +10,9 @@ use std::hash::{Hash, Hasher};
 use cherenkov::{FillRule, ShapeData};
 use kurbo::{Affine, BezPath, PathEl, Point, Rect, Shape as _, Vec2};
 
-use crate::error::RenderError;
 use crate::render::glyph::{CellTexels, PathCell, PathEmit};
 use crate::render::raster::Raster;
+use cherenkov::RenderError;
 
 /// Coverage strip height in device rows.
 pub const STRIP_H: usize = 4;
@@ -325,11 +325,11 @@ pub fn emit(coverage: &Coverage) -> Result<(PathEmit, Vec<CellTexels>), RenderEr
 
 /// A stable hash of a shape's field bits, for strokes of non-path shapes
 /// which have no element list to hash.
-fn hash_shape_fields(hasher: &mut DefaultHasher, shape: &ShapeData) {
-    fn v(hasher: &mut DefaultHasher, x: f64) {
+fn hash_shape_fields(hasher: &mut impl Hasher, shape: &ShapeData) {
+    fn v(hasher: &mut impl Hasher, x: f64) {
         x.to_bits().hash(hasher);
     }
-    fn rect(hasher: &mut DefaultHasher, r: &Rect) {
+    fn rect(hasher: &mut impl Hasher, r: &Rect) {
         v(hasher, r.x0);
         v(hasher, r.y0);
         v(hasher, r.x1);
@@ -395,20 +395,32 @@ fn hash_shape_fields(hasher: &mut DefaultHasher, shape: &ShapeData) {
 /// collides with a fill of the same geometry.
 pub fn hash_stroke(shape: &ShapeData, stroke: &kurbo::Stroke, tolerance: f64) -> u64 {
     let mut hasher = DefaultHasher::new();
-    2u64.hash(&mut hasher);
-    hash_shape_fields(&mut hasher, shape);
-    stroke.width.to_bits().hash(&mut hasher);
-    (stroke.join as u8).hash(&mut hasher);
-    stroke.miter_limit.to_bits().hash(&mut hasher);
-    (stroke.start_cap as u8).hash(&mut hasher);
-    (stroke.end_cap as u8).hash(&mut hasher);
-    (stroke.dash_pattern.len() as u64).hash(&mut hasher);
-    for v in &stroke.dash_pattern {
-        v.to_bits().hash(&mut hasher);
-    }
-    stroke.dash_offset.to_bits().hash(&mut hasher);
-    tolerance.to_bits().hash(&mut hasher);
+    stroke_into(&mut hasher, shape, stroke, tolerance);
     hasher.finish()
+}
+
+fn stroke_into(
+    hasher: &mut impl Hasher,
+    shape: &ShapeData,
+    stroke: &kurbo::Stroke,
+    tolerance: f64,
+) {
+    2u64.hash(hasher);
+    hash_shape_fields(hasher, shape);
+    // The original field sequence, coalesced into native-endian byte writes.
+    let mut style = [0; 27];
+    style[..8].copy_from_slice(&stroke.width.to_bits().to_ne_bytes());
+    style[8] = stroke.join as u8;
+    style[9..17].copy_from_slice(&stroke.miter_limit.to_bits().to_ne_bytes());
+    style[17] = stroke.start_cap as u8;
+    style[18] = stroke.end_cap as u8;
+    style[19..].copy_from_slice(&(stroke.dash_pattern.len() as u64).to_ne_bytes());
+    hasher.write(&style);
+    hasher.write(bytemuck::cast_slice(stroke.dash_pattern.as_slice()));
+    let mut tail = [0; 16];
+    tail[..8].copy_from_slice(&stroke.dash_offset.to_bits().to_ne_bytes());
+    tail[8..].copy_from_slice(&tolerance.to_bits().to_ne_bytes());
+    hasher.write(&tail);
 }
 
 /// A stable hash of a local path's element list, tagged by draw mode so a
@@ -420,27 +432,45 @@ pub fn hash_elements(elements: &[PathEl], tag: u64) -> u64 {
     hasher.finish()
 }
 
-fn hash_elements_into(hasher: &mut DefaultHasher, elements: &[PathEl]) {
-    fn point(hasher: &mut DefaultHasher, disc: u8, p: Point) {
-        disc.hash(hasher);
-        p.x.to_bits().hash(hasher);
-        p.y.to_bits().hash(hasher);
+fn hash_elements_into(hasher: &mut impl Hasher, elements: &[PathEl]) {
+    fn point(bytes: &mut [u8], disc: u8, p: Point) {
+        bytes[0] = disc;
+        bytes[1..9].copy_from_slice(&p.x.to_bits().to_ne_bytes());
+        bytes[9..17].copy_from_slice(&p.y.to_bits().to_ne_bytes());
     }
-    for el in elements {
-        match el {
-            PathEl::MoveTo(p) => point(hasher, 0, *p),
-            PathEl::LineTo(p) => point(hasher, 1, *p),
-            PathEl::QuadTo(c, p) => {
-                point(hasher, 2, *c);
-                point(hasher, 2, *p);
-            }
-            PathEl::CurveTo(c0, c1, p) => {
-                point(hasher, 3, *c0);
-                point(hasher, 3, *c1);
-                point(hasher, 3, *p);
-            }
-            PathEl::ClosePath => 4u8.hash(hasher),
+    for chunk in elements.chunks(8) {
+        let mut bytes = [0; 8 * 51];
+        let mut used = 0;
+        for el in chunk {
+            let bytes = &mut bytes[used..used + 51];
+            let len = match el {
+                PathEl::MoveTo(p) => {
+                    point(&mut bytes[..17], 0, *p);
+                    17
+                }
+                PathEl::LineTo(p) => {
+                    point(&mut bytes[..17], 1, *p);
+                    17
+                }
+                PathEl::QuadTo(c, p) => {
+                    point(&mut bytes[..17], 2, *c);
+                    point(&mut bytes[17..34], 2, *p);
+                    34
+                }
+                PathEl::CurveTo(c0, c1, p) => {
+                    point(&mut bytes[..17], 3, *c0);
+                    point(&mut bytes[17..34], 3, *c1);
+                    point(&mut bytes[34..], 3, *p);
+                    51
+                }
+                PathEl::ClosePath => {
+                    bytes[0] = 4;
+                    1
+                }
+            };
+            used += len;
         }
+        hasher.write(&bytes[..used]);
     }
 }
 
@@ -449,14 +479,26 @@ fn hash_elements_into(hasher: &mut DefaultHasher, elements: &[PathEl]) {
 pub struct Placement {
     /// Cache key: content hash + matrix + quantized subpixel + surface.
     pub key: u64,
-    /// `key` plus the integer translation: coverage clipped by the
-    /// surface is only valid at this offset.
-    pub key_exact: u64,
     /// The transform to rasterize under: the true 2x2 and the translation
     /// snapped to the 1/4 px grid.
     pub raster: Affine,
     /// The integer translation the cache's stored rects are relative to.
     pub offset: Vec2,
+}
+
+impl Placement {
+    /// Offset-specific identity is only needed after the translation-independent
+    /// lookup misses, or for coverage clipped by the surface.
+    #[expect(clippy::cast_possible_truncation)]
+    pub fn key_exact(self) -> u64 {
+        let mut bytes = [0; 24];
+        bytes[..8].copy_from_slice(&self.key.to_ne_bytes());
+        bytes[8..16].copy_from_slice(&(self.offset.x as i64).to_ne_bytes());
+        bytes[16..].copy_from_slice(&(self.offset.y as i64).to_ne_bytes());
+        let mut hasher = DefaultHasher::new();
+        hasher.write(&bytes);
+        hasher.finish()
+    }
 }
 
 /// Builds the [`Placement`] for a draw under `transform` on a
@@ -475,21 +517,24 @@ pub fn placement(content_hash: u64, transform: Affine, surface: (u32, u32)) -> P
     let iy = f.floor();
     let qx = ((e - ix) * 4.0).floor() / 4.0;
     let qy = ((f - iy) * 4.0).floor() / 4.0;
-    let mut hasher = DefaultHasher::new();
-    content_hash.hash(&mut hasher);
-    for v in [a, b, c, d] {
-        (v as f32).to_bits().hash(&mut hasher);
+    let mut bytes = [0; 33];
+    bytes[..8].copy_from_slice(&content_hash.to_ne_bytes());
+    for (dst, value) in bytes[8..24]
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip([a, b, c, d])
+    {
+        *dst = (value as f32).to_bits().to_ne_bytes();
     }
-    ((qx * 4.0) as u8 | (((qy * 4.0) as u8) << 4)).hash(&mut hasher);
-    surface.hash(&mut hasher);
-    let key = hasher.finish();
+    bytes[24] = (qx * 4.0) as u8 | (((qy * 4.0) as u8) << 4);
+    bytes[25..29].copy_from_slice(&surface.0.to_ne_bytes());
+    bytes[29..].copy_from_slice(&surface.1.to_ne_bytes());
     let mut hasher = DefaultHasher::new();
-    key.hash(&mut hasher);
-    (ix as i64).hash(&mut hasher);
-    (iy as i64).hash(&mut hasher);
+    hasher.write(&bytes);
+    let key = hasher.finish();
     Placement {
         key,
-        key_exact: hasher.finish(),
         raster: Affine::new([a, b, c, d, ix + qx, iy + qy]),
         offset: Vec2::new(ix, iy),
     }
@@ -608,3 +653,6 @@ mod tests {
         assert!((eo[0] - 0.5).abs() < 1e-6, "edge: {}", eo[0]);
     }
 }
+
+#[cfg(test)]
+mod hash_identity;

@@ -120,9 +120,11 @@ impl Renderer {
         let mut resources = Resources::new(scene_dir.to_path_buf());
         let clear = to_working(&scene.clear);
         let mut canvas = Canvas::new(self.width, self.height, clear);
+        let root_tf = scene.root.transform
+            * Affine::translate((-scene.root.scroll_offset.x, -scene.root.scroll_offset.y));
         self.render_items(
             &scene.root.items,
-            Affine::IDENTITY * scene.root.transform,
+            root_tf,
             &scene_clip_stack(&scene.root, scene.root.transform, self.width, self.height),
             &mut canvas,
             &mut resources,
@@ -173,9 +175,13 @@ impl Renderer {
         if let Some(clip) = &child.clip {
             child_clips.push(shape_edges(clip, tf));
         }
+        // Content and children draw translated by -scroll_offset inside
+        // the clip; `motion` is ignored — the oracle renders the settled
+        // scene.
+        let content_tf = tf * Affine::translate((-child.scroll_offset.x, -child.scroll_offset.y));
 
         let mut sub = Canvas::new(canvas.width, canvas.height, [0.0; 4]);
-        self.render_items(&child.items, tf, &child_clips, &mut sub, resources)?;
+        self.render_items(&child.items, content_tf, &child_clips, &mut sub, resources)?;
 
         let opacity = child.opacity;
         for (dst, &src) in canvas.pixels.iter_mut().zip(&sub.pixels) {

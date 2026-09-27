@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use vello::peniko;
 
-use crate::gpu_content::AnyGpuContent;
+use crate::interop::AnyGpuContent;
 use crate::interop::wgpu::{Context, Frame};
 
 /// One `GpuContent` attachment's render-thread state.
@@ -47,14 +47,23 @@ const CONTENT_USAGES: wgpu::TextureUsages = wgpu::TextureUsages::from_bits_retai
 );
 
 impl GpuSlot {
-    /// Wraps a content message.
-    pub fn new(msg: crate::message::GpuContentMsg) -> Self {
+    /// Wraps a [`GpuContentBox`](crate::interop::GpuContentBox)'s payload.
+    pub fn new(size: (u32, u32), dirty: Arc<AtomicBool>, content: Box<dyn AnyGpuContent>) -> Self {
         Self {
-            size: msg.size,
-            dirty: msg.dirty,
-            content: msg.content,
+            size,
+            dirty,
+            content,
             ready: None,
         }
+    }
+
+    /// Whether the content asked for another frame — a `RedrawHandle`
+    /// request or the previous frame's `request_redraw`. Unlike
+    /// [`GpuSlot::needs_render`], the not-yet-rendered state does not
+    /// count: that state is already covered by the content change.
+    pub fn wants_redraw(&self) -> bool {
+        self.dirty.load(std::sync::atomic::Ordering::Relaxed)
+            || self.ready.as_ref().is_some_and(|r| r.wants_redraw)
     }
 
     /// Whether the content needs re-rendering this frame: first frame, a

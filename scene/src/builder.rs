@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 use crate::{
-    BlendMode, Color, Draw, FillRule, GlyphRun, Item, Layer, Paint, ResourceHash, Sampling, Scene,
-    Shape, StrokeStyle,
+    BlendMode, Color, Draw, FillRule, GlyphRun, Item, Layer, Motion, Paint, ResourceHash, Sampling,
+    Scene, Shape, StrokeStyle,
 };
-use kurbo::{Affine, Rect};
+use kurbo::{Affine, Rect, Vec2};
 
 /// Author a [`Scene`] in Rust. Obtained from [`Scene::builder`].
 ///
@@ -115,12 +115,37 @@ impl LayerBuilder<'_> {
         self
     }
 
+    /// Set the scroll offset: content and children draw translated by
+    /// `-offset` inside the layer's clip.
+    pub const fn scroll_offset(&mut self, offset: Vec2) -> &mut Self {
+        self.layer.scroll_offset = offset;
+        self
+    }
+
+    /// Adds a per-frame live item (see [`Layer::live`]).
+    pub fn live(&mut self, live: crate::Live) -> &mut Self {
+        self.layer.live.push(live);
+        self
+    }
+
+    /// Set the layer's one-time motion.
+    pub const fn motion(&mut self, motion: Motion) -> &mut Self {
+        self.layer.motion = Some(motion);
+        self
+    }
+
     /// Add a child layer and build it in `f`.
     pub fn layer(&mut self, f: impl FnOnce(&mut LayerBuilder)) -> &mut Self {
         let mut layer = Layer::default();
         f(&mut LayerBuilder { layer: &mut layer });
         self.layer.items.push(Item::Layer(layer));
         self
+    }
+
+    /// The number of items pushed so far — the index the next item gets.
+    #[must_use]
+    pub const fn item_count(&self) -> usize {
+        self.layer.items.len()
     }
 
     /// Push a [`Draw::Fill`] item.

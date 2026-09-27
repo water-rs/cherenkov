@@ -9,7 +9,8 @@
 
 use cherenkov::kurbo::{Affine, Rect};
 use cherenkov::{Draw, WorkingColor};
-use cherenkov_vello::{Engine, Next, Offscreen, Vello, VelloConfig};
+use cherenkov::{Engine, Next, Offscreen, OffscreenFormat};
+use cherenkov_vello::{Vello, VelloConfig};
 
 /// sRGB transfer-function encode.
 fn srgb_encode(c: f64) -> f64 {
@@ -106,23 +107,23 @@ fn assert_pixel(actual: [f32; 4], expected: [f64; 4], what: &str) {
     }
 }
 
-fn px(readback: &cherenkov_vello::Readback, x: u32, y: u32) -> [f32; 4] {
+fn px(readback: &cherenkov::Readback, x: u32, y: u32) -> [f32; 4] {
     readback.pixels[(y * readback.width + x) as usize]
 }
 
 #[test]
 fn solid_fill_matches_expected_pixels() {
     let Some(engine) = engine() else { return };
-    let surface = engine.surface(Offscreen::new((64, 64))).expect("surface");
+    let surface = engine
+        .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))
+        .expect("surface");
     surface.clear_color(WorkingColor::TRANSPARENT);
     // A P3 colour: mostly red.
     let fill = WorkingColor::new([0.9, 0.1, 0.2, 1.0]);
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|c| c.fill(Rect::new(8., 8., 40., 40.), fill)));
     });
-    let next = engine
-        .render(cherenkov_vello::FrameTime::now())
-        .expect("render");
+    let next = engine.render(cherenkov::FrameTime::now()).expect("render");
     assert_eq!(next, Next::Idle);
     let readback = surface.readback().expect("readback");
     // Centre pixel: the fill colour through the full conversion pipeline.
@@ -148,7 +149,9 @@ fn solid_fill_matches_expected_pixels() {
 #[test]
 fn layer_tree_composes_transform_opacity_clip() {
     let Some(engine) = engine() else { return };
-    let surface = engine.surface(Offscreen::new((64, 64))).expect("surface");
+    let surface = engine
+        .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))
+        .expect("surface");
     surface.clear_color(WorkingColor::BLACK);
 
     let moved = surface.layer();
@@ -165,16 +168,14 @@ fn layer_tree_composes_transform_opacity_clip() {
         // `moved`: translate (10,10), opacity 0.5, white square.
         tx[&moved]
             .transform(Affine::translate((10., 10.)))
-            .opacity(0.5)
+            .opacity(0.5f32)
             .content(white);
         // `clipped`: clip to Rect(0,0,20,20), full-width white fill.
         tx[&clipped].clip(Rect::new(0., 0., 20., 20.)).content(wide);
         tx[surface.root()].push(&moved).push(&clipped);
     });
 
-    let next = engine
-        .render(cherenkov_vello::FrameTime::now())
-        .expect("render");
+    let next = engine.render(cherenkov::FrameTime::now()).expect("render");
     assert_eq!(next, Next::Idle);
     let readback = surface.readback().expect("readback");
 
@@ -248,7 +249,7 @@ struct ClearContent(wgpu::Color);
 
 use cherenkov_vello::interop::wgpu;
 
-impl cherenkov_vello::GpuContent for ClearContent {
+impl cherenkov_vello::interop::GpuContent for ClearContent {
     async fn setup(&mut self, _gpu: &wgpu::Context<'_>) {}
 
     fn render(&mut self, frame: &mut wgpu::Frame<'_>) {
@@ -282,7 +283,9 @@ impl cherenkov_vello::GpuContent for ClearContent {
 #[test]
 fn gpu_content_composites_as_an_image() {
     let Some(engine) = engine() else { return };
-    let surface = engine.surface(Offscreen::new((64, 64))).expect("surface");
+    let surface = engine
+        .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))
+        .expect("surface");
     surface.clear_color(WorkingColor::TRANSPARENT);
     // Opaque colour, so straight == premultiplied in the stored texel.
     let enc = [0.9, 0.1, 0.2];
@@ -295,7 +298,7 @@ fn gpu_content_composites_as_an_image() {
             a: 1.0,
         }),
     );
-    let redraw = content.redraw_handle();
+    let redraw = content.content.redraw_handle();
     let layer = surface.layer();
     surface.update(|tx| {
         tx[&layer]
@@ -303,9 +306,7 @@ fn gpu_content_composites_as_an_image() {
             .content(content);
         tx[surface.root()].push(&layer);
     });
-    let next = engine
-        .render(cherenkov_vello::FrameTime::now())
-        .expect("render");
+    let next = engine.render(cherenkov::FrameTime::now()).expect("render");
     assert_eq!(next, Next::Idle);
     let readback = surface.readback().expect("readback");
     assert_pixel(
@@ -319,15 +320,11 @@ fn gpu_content_composites_as_an_image() {
         "outside content",
     );
     // Nothing changed: second frame is idle.
-    let next = engine
-        .render(cherenkov_vello::FrameTime::now())
-        .expect("render");
+    let next = engine.render(cherenkov::FrameTime::now()).expect("render");
     assert_eq!(next, Next::Idle);
     // A redraw request re-renders the content and schedules a frame.
     redraw.request_redraw();
-    let next = engine
-        .render(cherenkov_vello::FrameTime::now())
-        .expect("render");
+    let next = engine.render(cherenkov::FrameTime::now()).expect("render");
     assert!(matches!(next, Next::At { .. }), "{next:?}");
     assert!(!redraw.is_dirty());
 }
@@ -343,19 +340,21 @@ fn shader_paint_is_sampled_as_an_image() {
     }
     let Some(engine) = engine() else { return };
     let shader = engine
-        .shader(cherenkov_vello::ShaderSource::wgsl(
+        .shader(cherenkov::ShaderSource::wgsl(
             "@fragment fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> { return vec4<f32>(params[0].rgb, params[0].w); }",
         ))
         .expect("shader");
     let animated = engine
         .shader(
-            cherenkov_vello::ShaderSource::wgsl(
+            cherenkov::ShaderSource::wgsl(
                 "@fragment fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> { return vec4<f32>(params[0].rgb, params[0].w); }",
             )
             .animated(),
         )
         .expect("animated shader");
-    let surface = engine.surface(Offscreen::new((64, 64))).expect("surface");
+    let surface = engine
+        .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))
+        .expect("surface");
     surface.clear_color(WorkingColor::TRANSPARENT);
     let enc = [0.9, 0.1, 0.2];
     let paint = cherenkov::ShaderPaint {
@@ -379,9 +378,7 @@ fn shader_paint_is_sampled_as_an_image() {
         tx[surface.root()].push(&anim_layer);
     });
     // The animated shader keeps the frame refresh alive.
-    let next = engine
-        .render(cherenkov_vello::FrameTime::now())
-        .expect("render");
+    let next = engine.render(cherenkov::FrameTime::now()).expect("render");
     assert!(matches!(next, Next::At { .. }), "{next:?}");
     let readback = surface.readback().expect("readback");
     assert_pixel(
@@ -391,9 +388,7 @@ fn shader_paint_is_sampled_as_an_image() {
     );
     // Drop the animated layer: the static shader alone leaves the engine idle.
     drop(anim_layer);
-    let next = engine
-        .render(cherenkov_vello::FrameTime::now())
-        .expect("render");
+    let next = engine.render(cherenkov::FrameTime::now()).expect("render");
     assert_eq!(next, Next::Idle);
 }
 
@@ -406,11 +401,13 @@ fn shader_paint_maps_in_shape_space_under_transform() {
     let Some(engine) = engine() else { return };
     // Gray ramp along uv.x.
     let ramp = engine
-        .shader(cherenkov_vello::ShaderSource::wgsl(
+        .shader(cherenkov::ShaderSource::wgsl(
             "@fragment fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> { return vec4<f32>(uv.x, uv.x, uv.x, 1.0); }",
         ))
         .expect("shader");
-    let surface = engine.surface(Offscreen::new((64, 64))).expect("surface");
+    let surface = engine
+        .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))
+        .expect("surface");
     surface.clear_color(WorkingColor::BLACK);
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|c| {
@@ -425,9 +422,7 @@ fn shader_paint_maps_in_shape_space_under_transform() {
             });
         }));
     });
-    let next = engine
-        .render(cherenkov_vello::FrameTime::now())
-        .expect("render");
+    let next = engine.render(cherenkov::FrameTime::now()).expect("render");
     assert_eq!(next, Next::Idle);
     let readback = surface.readback().expect("readback");
     let left = px(&readback, 18, 32);
@@ -445,11 +440,9 @@ fn shader_paint_maps_in_shape_space_under_transform() {
 #[test]
 fn bad_wgsl_returns_resource_error() {
     let Some(engine) = engine() else { return };
-    let result = engine.shader(cherenkov_vello::ShaderSource::wgsl(
-        "this is not valid wgsl {{{",
-    ));
+    let result = engine.shader(cherenkov::ShaderSource::wgsl("this is not valid wgsl {{{"));
     assert!(
-        matches!(result, Err(cherenkov_vello::ResourceError::Shader(_))),
+        matches!(result, Err(cherenkov::ResourceError::Shader(_))),
         "{result:?}"
     );
 }
@@ -457,7 +450,9 @@ fn bad_wgsl_returns_resource_error() {
 #[test]
 fn mesh_paint_reports_unsupported() {
     let Some(engine) = engine() else { return };
-    let surface = engine.surface(Offscreen::new((64, 64))).expect("surface");
+    let surface = engine
+        .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))
+        .expect("surface");
     let mesh = cherenkov::MeshGradient::new(
         1,
         1,
@@ -474,13 +469,11 @@ fn mesh_paint_reports_unsupported() {
             c.fill(Rect::new(0., 0., 64., 64.), mesh);
         }));
     });
-    let result = engine.render(cherenkov_vello::FrameTime::now());
+    let result = engine.render(cherenkov::FrameTime::now());
     assert!(
         matches!(
             result,
-            Err(cherenkov_vello::RenderError::Unsupported(
-                cherenkov_vello::Unsupported::MeshGradient
-            ))
+            Err(cherenkov::RenderError::Unsupported("mesh-gradient"))
         ),
         "{result:?}"
     );
@@ -490,7 +483,9 @@ fn mesh_paint_reports_unsupported() {
 fn filter_runs_over_the_layer_texture() {
     let Some(engine) = engine() else { return };
     let filter = engine.filter(filtrate::filters::Invert);
-    let surface = engine.surface(Offscreen::new((64, 64))).expect("surface");
+    let surface = engine
+        .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))
+        .expect("surface");
     surface.clear_color(WorkingColor::BLACK);
     let fill = WorkingColor::new([0.9, 0.1, 0.2, 1.0]);
     let layer = surface.layer();
@@ -500,12 +495,10 @@ fn filter_runs_over_the_layer_texture() {
                 c.fill(Rect::new(0., 0., 64., 64.), fill);
             }))
             .filter(&filter)
-            .opacity(0.5);
+            .opacity(0.5f32);
         tx[surface.root()].push(&layer);
     });
-    let next = engine
-        .render(cherenkov_vello::FrameTime::now())
-        .expect("render");
+    let next = engine.render(cherenkov::FrameTime::now()).expect("render");
     let readback = surface.readback().expect("readback");
     // Invert is `a - rgb` on premultiplied values in the space the
     // executor samples — our encoded texels. So the stored output is
@@ -537,7 +530,9 @@ fn filter_runs_over_the_layer_texture() {
 #[test]
 fn even_odd_layer_clip_punches_a_hole() {
     let Some(engine) = engine() else { return };
-    let surface = engine.surface(Offscreen::new((64, 64))).expect("surface");
+    let surface = engine
+        .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))
+        .expect("surface");
     surface.clear_color(WorkingColor::BLACK);
     let mut path = cherenkov::kurbo::BezPath::new();
     path.move_to((0., 0.));
@@ -559,9 +554,7 @@ fn even_odd_layer_clip_punches_a_hole() {
             }));
         tx[surface.root()].push(&clipped);
     });
-    let next = engine
-        .render(cherenkov_vello::FrameTime::now())
-        .expect("render");
+    let next = engine.render(cherenkov::FrameTime::now()).expect("render");
     assert_eq!(next, Next::Idle);
     let readback = surface.readback().expect("readback");
     assert_pixel(
@@ -585,7 +578,7 @@ fn even_odd_layer_clip_punches_a_hole() {
 /// `GpuContent` that counts its renders and always asks for another frame.
 struct LoopingContent(std::sync::Arc<std::sync::atomic::AtomicUsize>);
 
-impl cherenkov_vello::GpuContent for LoopingContent {
+impl cherenkov_vello::interop::GpuContent for LoopingContent {
     async fn setup(&mut self, _gpu: &wgpu::Context<'_>) {}
 
     fn render(&mut self, frame: &mut wgpu::Frame<'_>) {
@@ -626,10 +619,12 @@ impl filtrate::Effect for AlwaysHinting {
 #[test]
 fn animated_content_requests_every_frame() {
     let Some(engine) = engine() else { return };
-    let surface = engine.surface(Offscreen::new((64, 64))).expect("surface");
+    let surface = engine
+        .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))
+        .expect("surface");
     let animated = engine
         .shader(
-            cherenkov_vello::ShaderSource::wgsl(
+            cherenkov::ShaderSource::wgsl(
                 "@fragment fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> { return vec4<f32>(uv, 0.0, 1.0); }",
             )
             .animated(),
@@ -666,9 +661,7 @@ fn animated_content_requests_every_frame() {
             .push(&filtered_layer);
     });
     for frame in 0..3 {
-        let next = engine
-            .render(cherenkov_vello::FrameTime::now())
-            .expect("render");
+        let next = engine.render(cherenkov::FrameTime::now()).expect("render");
         assert!(matches!(next, Next::At { .. }), "frame {frame}: {next:?}");
     }
     let rendered = renders.load(std::sync::atomic::Ordering::Relaxed);
@@ -684,16 +677,23 @@ fn animated_content_requests_every_frame() {
 #[test]
 fn oversized_surface_fails_fast_and_the_engine_survives() {
     let Some(engine) = engine() else { return };
-    let err = engine.surface(Offscreen::new((u32::MAX, u32::MAX))).err();
+    let err = engine
+        .surface(Offscreen::new(
+            (u32::MAX, u32::MAX),
+            OffscreenFormat::LinearF16,
+        ))
+        .err();
     assert!(
-        matches!(err, Some(cherenkov_vello::SurfaceError::TooLarge { .. })),
+        matches!(err, Some(cherenkov::SurfaceError::TooLarge { .. })),
         "expected TooLarge, got {err:?}"
     );
     // The render thread is still alive and healthy surfaces still render.
-    let ok = engine.surface(Offscreen::new((8, 8))).expect("surface");
+    let ok = engine
+        .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))
+        .expect("surface");
     ok.clear_color(WorkingColor::BLACK);
     let next = engine
-        .render(cherenkov_vello::FrameTime::now())
+        .render(cherenkov::FrameTime::now())
         .expect("render after rejected surface");
     assert_eq!(next, Next::Idle);
     let readback = ok.readback().expect("readback");
@@ -787,10 +787,9 @@ fn skipped_window_present_retries_next_frame() {
         eprintln!("no alpha modes, skipping");
         return;
     };
-    let engine = Engine::<Vello>::with_device(
-        VelloConfig::default(),
+    let engine = Engine::<Vello>::new(VelloConfig::with_device(
         cherenkov_vello::interop::wgpu::DeviceSource::new(adapter, device, queue),
-    )
+    ))
     .expect("engine");
     let surface = engine
         .surface(cherenkov_vello::interop::wgpu::Window {
@@ -810,7 +809,7 @@ fn skipped_window_present_retries_next_frame() {
         .expect("window surface");
     surface.clear_color(WorkingColor::BLACK);
     let _ = engine
-        .render(cherenkov_vello::FrameTime::now())
+        .render(cherenkov::FrameTime::now())
         .expect("first render");
 
     // Destroying the window makes the next acquire report `Lost` — a
@@ -822,7 +821,7 @@ fn skipped_window_present_retries_next_frame() {
     let _ = conn.get_input_focus().expect("cookie").reply();
     surface.clear_color(WorkingColor::WHITE);
     let next = engine
-        .render(cherenkov_vello::FrameTime::now())
+        .render(cherenkov::FrameTime::now())
         .expect("second render");
     match next {
         Next::At { rate, .. } => assert_eq!(rate, 30..=120),
@@ -831,7 +830,7 @@ fn skipped_window_present_retries_next_frame() {
     // The retry keeps asking until the embedder destroys the surface.
     surface.clear_color(WorkingColor::BLACK);
     let next = engine
-        .render(cherenkov_vello::FrameTime::now())
+        .render(cherenkov::FrameTime::now())
         .expect("retry render");
     match next {
         Next::At { rate, .. } => assert_eq!(rate, 30..=120),
@@ -839,7 +838,7 @@ fn skipped_window_present_retries_next_frame() {
     }
     drop(surface);
     let next = engine
-        .render(cherenkov_vello::FrameTime::now())
+        .render(cherenkov::FrameTime::now())
         .expect("render after destroy");
     assert_eq!(next, Next::Idle);
 }
@@ -851,11 +850,11 @@ fn skipped_window_present_retries_next_frame() {
 fn next_at_reports_the_configured_refresh_range() {
     let Some(engine) = engine() else { return };
     let surface = engine
-        .surface(Offscreen::new((8, 8)).rate(30..=144))
+        .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16).rate(30..=144))
         .expect("surface");
     let animated = engine
         .shader(
-            cherenkov_vello::ShaderSource::wgsl(
+            cherenkov::ShaderSource::wgsl(
                 "@fragment fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> { return vec4<f32>(uv, 0.0, 1.0); }",
             )
             .animated(),
@@ -875,9 +874,7 @@ fn next_at_reports_the_configured_refresh_range() {
         tx[surface.root()].push(&layer);
     });
     let t0 = std::time::Instant::now();
-    let next = engine
-        .render(cherenkov_vello::FrameTime::at(t0))
-        .expect("render");
+    let next = engine.render(cherenkov::FrameTime::at(t0)).expect("render");
     match next {
         Next::At { time, rate } => {
             assert_eq!(rate, 30..=144);
@@ -897,10 +894,12 @@ fn next_at_reports_the_configured_refresh_range() {
 #[test]
 fn oversized_resize_fails_fast() {
     let Some(engine) = engine() else { return };
-    let mut surface = engine.surface(Offscreen::new((8, 8))).expect("surface");
+    let surface = engine
+        .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))
+        .expect("surface");
     let err = surface.resize((u32::MAX, 16)).err();
     assert!(
-        matches!(err, Some(cherenkov_vello::SurfaceError::TooLarge { .. })),
+        matches!(err, Some(cherenkov::SurfaceError::TooLarge { .. })),
         "expected TooLarge, got {err:?}"
     );
     assert_eq!(
@@ -912,7 +911,7 @@ fn oversized_resize_fails_fast() {
     surface.resize((16, 16)).expect("resize");
     surface.clear_color(WorkingColor::BLACK);
     let next = engine
-        .render(cherenkov_vello::FrameTime::now())
+        .render(cherenkov::FrameTime::now())
         .expect("render after resizes");
     assert_eq!(next, Next::Idle);
     let readback = surface.readback().expect("readback");
@@ -927,7 +926,9 @@ fn oversized_resize_fails_fast() {
 #[test]
 fn linear_normal_translucent_group_reports_unsupported() {
     let Some(engine) = engine() else { return };
-    let surface = engine.surface(Offscreen::new((64, 64))).expect("surface");
+    let surface = engine
+        .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))
+        .expect("surface");
     let translucent = surface.record(|c| {
         c.group(cherenkov::Group::new().opacity(0.5), |c| {
             c.fill(Rect::new(0., 0., 64., 64.), WorkingColor::WHITE);
@@ -936,13 +937,11 @@ fn linear_normal_translucent_group_reports_unsupported() {
     surface.update(|tx| {
         tx[surface.root()].content(translucent);
     });
-    let result = engine.render(cherenkov_vello::FrameTime::now());
+    let result = engine.render(cherenkov::FrameTime::now());
     assert!(
         matches!(
             result,
-            Err(cherenkov_vello::RenderError::Unsupported(
-                cherenkov_vello::Unsupported::BlendSpace
-            ))
+            Err(cherenkov::RenderError::Unsupported("blend-space"))
         ),
         "{result:?}"
     );
@@ -957,7 +956,7 @@ fn linear_normal_translucent_group_reports_unsupported() {
         tx[surface.root()].content(opaque);
     });
     let next = engine
-        .render(cherenkov_vello::FrameTime::now())
+        .render(cherenkov::FrameTime::now())
         .expect("default group renders");
     assert_eq!(next, Next::Idle);
 }

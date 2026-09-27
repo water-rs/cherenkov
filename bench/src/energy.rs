@@ -1287,7 +1287,7 @@ CH7(T=349894)[S1M_VDD_MIF], 21091363
         assert_eq!(samples[0].start, Duration::ZERO);
         assert_eq!(samples[0].end, Duration::from_millis(500));
         assert_eq!(samples[1].start, Duration::from_millis(500));
-        assert_eq!(samples[1].end, Duration::from_millis(1000));
+        assert_eq!(samples[1].end, Duration::from_secs(1));
         assert_eq!(samples[0].joules["cpu"], 0.64);
         assert_eq!(samples[0].joules["gpu"], 0.305);
         assert_eq!(samples[0].joules["ane"], 0.012);

@@ -20,21 +20,25 @@ Sections marked **Proposal** are not yet agreed; everything else records a decis
 
 | Crate | Directory | Contents |
 |---|---|---|
-| `cherenkov` | `src/` | Front end: API types, recording, layer tree, animation, CPU geometry. No GPU dependency. |
+| `cherenkov` | `src/` | Front end: API types, recording, engine, surfaces, layer tree, transactions, resource handles, animation, scrolling, the render-thread loop and the `Backend` contract, CPU geometry. No GPU dependency. |
 | `cherenkov-gpu` | `gpu/` | GPU backend `Gpu` and the wgpu, Apple, Android, Windows and Wayland interop. |
+| `cherenkov-vello` | `vello/` | Reference GPU backend `Vello` over the Vello renderer, with the wgpu interop. |
 | `cherenkov-cpu` | `cpu/` | CPU backends `Raster` (desktop/server: full framebuffer, multi-threaded, SIMD) and `Banded<P>` (microcontroller: banded output, panel pixel formats, flash-resident assets). |
 | `cherenkov-shader` | `shader/` | The shared shader composer on naga IR, used by the engine and by filtrate. |
 | `filtrate`, `filtrate-core`, `filtrate-derive` | `filtrate/` | Independent filter library: definitions, a thin reference executor, and a derive macro. It keeps its own name and does not depend on the engine crates. |
 
 Capabilities are traits implemented by backend types, so using a missing capability is a compile error:
 
-| Capability trait | `Gpu` | `Raster` | `Banded<P>` |
+| Capability trait | `Gpu` | `Vello` | `Raster` |
 |---|---|---|---|
-| `HdrOutput` | ✓ | | |
-| `Backdrop` | ✓ | ✓ | |
-| `GpuContent`, `ShaderPaint`, `ExternalFrames` | ✓ | | |
-| `Planes` (system-compositor promotion) | ✓ | | |
-| `Runs<F>` for a filter `F` | every filter | filters with a CPU kernel | filters with a CPU kernel |
+| `Uploads<F>` for an image format `F` | `Rgba8` | `Rgba8` | |
+| `GpuContent`, `ShaderPaint` | | both | |
+| `Filters`, `Runs<F>` for a filter `F`, `Effects` | | every filter | |
+| `HdrOutput`, `Backdrop`, `ExternalFrames`, `Planes` | | | |
+
+Targets beyond the current rows: `Gpu` is meant to accept every image format and grow `GpuContent`, `ShaderPaint`, `ExternalFrames`, `HdrOutput`, `Backdrop` and `Planes` (system-compositor promotion); `Raster` targets `Uploads<Rgba8>`, `Backdrop` and `Runs<F>`/`Effects` for filters with a CPU kernel; a `Banded<P>` microcontroller backend (banded output, panel formats, flash-resident assets) targets panel-format uploads and CPU-kernel filters.
+
+The table is the target; a backend slice implements the rows it has code for, and the compiler rejects the rest.
 
 Recorded content (`Picture`, `Content`) is backend-independent. Components such as math, chart, svg and map never name a backend. Only the host names one.
 
@@ -46,6 +50,91 @@ On the native Android backend, the host picks `Gpu` or `Raster` once at process 
 - **Render thread: sole owner of GPU state.** A commit sends an owned change set over a channel.
 - **Parallelism over immutable data only.** Recorded `Picture`s are `Send`. Flattening, strip generation and glyph rasterization are data-parallel over owned data.
 - **No locks anywhere in the engine.**
+
+## Backend contract
+
+The `cherenkov` crate owns the whole front end and the render thread's loop. A backend crate supplies the render side only: a config type, a `Backend` implementation, its capability implementations, and an `interop` module. Nothing in a backend crate is a public front-end type, and nothing is re-exported.
+
+```rust
+/// The render-thread contract. Implemented by a zero-sized marker type (`Gpu`, `Vello`, `Raster`).
+pub trait Backend: Sized + 'static {
+    type Config: Send + 'static;                         // GpuConfig, VelloConfig, RasterConfig
+    type Info: Clone + Send + 'static;                   // GpuInfo, RasterInfo: provenance for reports
+    type Target: From<Offscreen> + Send + 'static;       // Offscreen or an interop window target
+    type Renderer: Renderer;                             // the render-thread state; never leaves that thread
+
+    /// Runs on the render thread, once. Creates the device or worker pool.
+    fn init(config: Self::Config) -> Result<(Self::Renderer, Self::Info), EngineError>;
+}
+
+/// Everything the render loop asks of a backend. Every method runs on the render thread.
+pub trait Renderer: 'static {
+    type Target;
+    fn create_surface(&mut self, id: SurfaceId, target: Self::Target) -> Result<SurfaceInfo, SurfaceError>;
+    fn resize_surface(&mut self, id: SurfaceId, size: (u32, u32));
+    fn destroy_surface(&mut self, id: SurfaceId);
+
+    fn add_font(&mut self, id: FontId, font: FontData) -> Result<(), ResourceError>;
+    fn remove_font(&mut self, id: FontId);
+    fn add_image(&mut self, id: ImageId, image: ImageUpload) -> Result<(), ResourceError>;
+    fn remove_image(&mut self, id: ImageId);
+
+    /// Replaces or updates a layer's recorded content (`Content` / `Picture`), or clears it.
+    fn set_content(&mut self, surface: SurfaceId, layer: LayerId, content: Option<ContentOp>);
+    /// The layer is gone: drop every cache keyed on it.
+    fn remove_layer(&mut self, surface: SurfaceId, layer: LayerId);
+
+    /// Renders every surface in `frame` whose tree or content changed; returns whether a
+    /// backend-side source (custom GPU content, an animated shader) wants another frame.
+    fn render(&mut self, frame: &Frame<'_>, stats: &mut FrameStats) -> Result<Redraw, RenderError>;
+    /// Waits for the GPU timings of every drawn frame not yet reported; a backend that
+    /// times synchronously, or not at all, keeps the default (nothing outstanding).
+    fn finish_timings(&mut self) -> Result<Vec<FrameTiming>, RenderError> { Ok(Vec::new()) }
+    fn readback(&mut self, surface: SurfaceId) -> Result<Readback, RenderError>;
+
+    fn memory(&self) -> MemoryUsage;
+    fn trim(&mut self, pressure: Pressure);
+}
+```
+
+- **Surface limits and cadence.** `SurfaceInfo::max_dimension` lets the UI thread reject an oversized resize before sending it to a backend. Animated backend content returns `Redraw::Wanted { rate }`; the frontend combines its refresh range with active property animations. Vello uses the window's supplied range or `Offscreen::rate` (60 Hz by default).
+- **One copy of the layer tree.** The render loop in `cherenkov` owns a `SurfaceTree` per surface: the layer graph, every layer property, its animation track and the sampled value for the current frame. The backend never receives property ops; it keeps only what it alone can produce (encoded fragments, live display lists, atlases, GPU content objects) keyed by `LayerId`, and it reads the tree through `Frame`:
+
+  ```rust
+  pub struct Frame<'a> { pub id: FrameId, pub time: FrameTime, pub surfaces: &'a [SurfaceFrame<'a>] }
+  pub struct SurfaceFrame<'a> { pub id: SurfaceId, pub size: (u32, u32), pub display: Display,
+                                pub clear: WorkingColor, pub changed: bool, pub tree: &'a SurfaceTree }
+  impl SurfaceTree { pub fn root(&self) -> LayerId; pub fn layer(&self, id: LayerId) -> &LayerNode; }
+  pub struct LayerNode { /* sampled for this frame: */ pub transform: Affine, pub opacity: f32,
+                         pub scroll_offset: Vec2, pub clip: Option<ShapeData>, pub blend: BlendMode,
+                         pub filter: Option<FilterId>, pub backdrop: Option<BackdropId>, pub children: Vec<LayerId>, /* tracks: private */ }
+  impl LayerNode { /// `transform * translate(-scroll_offset)`: the space of the content and children.
+                   pub fn content_transform(&self) -> Affine; }
+  ```
+
+  The clip applies in the layer's own space (`transform`); content and children are drawn in `content_transform()`, so scrolling moves them inside the clip and never re-records anything. `changed` is true when a property op, a content op or an animation step touched the surface since the last render; the backend renders exactly those surfaces.
+- **One wake-up per frame.** `Surface::update`, layer drops and bound-signal changes only queue owned ops on the UI thread. `Engine::render(time)` drains every surface's queue into one `Message::Render { time, commits, reply }` and blocks on the reply, so the render thread wakes once per frame and applies the commits, samples the animations at `time`, renders, and answers with `Next` and the `FrameStats`. Surface creation, readback, `memory()` and capability registrations that can fail (shader compilation) are request/reply messages; everything else is fire-and-forget.
+- **Capabilities carry their render-side hooks.** A capability trait is not a marker: it declares the function the render loop calls, so a backend without the capability has no code path to reach, and no default or stub exists.
+
+  ```rust
+  pub trait ShaderPaint: Backend {
+      fn add_shader(r: &mut Self::Renderer, id: ShaderId, source: ShaderSource) -> Result<(), ResourceError>;
+      fn remove_shader(r: &mut Self::Renderer, id: ShaderId);
+  }
+  pub trait Filters: Backend { fn remove_filter(r: &mut Self::Renderer, id: FilterId); }
+  pub trait Runs<F: filtrate_core::Filter + Send>: Filters { fn add_filter(r: &mut Self::Renderer, id: FilterId, filter: F); }
+  pub trait Effects: Filters { type Effect: Send + 'static; fn add_effect(r: &mut Self::Renderer, id: FilterId, effect: Self::Effect); } // Box<dyn filtrate::Effect + Send> on GPU backends
+  pub trait GpuContent: Backend { type Content: Send + 'static; fn set_gpu_content(r: &mut Self::Renderer, surface: SurfaceId, layer: LayerId, size: (u32, u32), content: Self::Content); }
+  pub trait ExternalFrames: Backend { type Frame: Send + 'static; fn set_external_frame(r: &mut Self::Renderer, surface: SurfaceId, layer: LayerId, frame: Self::Frame); }
+  pub trait Uploads<F: Format>: Backend {}      // which image storage formats `add_image` accepts
+  pub trait Backdrop: Backend {}                // `surface.backdrop_group`, `tx[&l].backdrop`
+  pub trait HdrOutput: Backend {}
+  pub trait Planes: Backend {}
+  ```
+
+  The `Engine`/`Transaction` methods bounded by these traits (`engine.shader`, `engine.filter`, `engine.gpu_content`, `tx[&l].content(gpu)`, `engine.image::<Astc4x4>`) wrap the hook into an owned `FnOnce(&mut B::Renderer) + Send` op that travels in the commit with the layer ops, in order. The `Renderer` core trait therefore has no shader, filter or GPU-content methods at all.
+- **Resource lifetime.** Handles (`Font`, `Image<F>`, `Shader`, `Filter`) are `Clone` over an `Rc`; the last drop queues the `remove_*` op, which reaches the backend in the next frame's commit. The backend frees the GPU copy there (deferred to after in-flight frames where the API needs it).
+- **Errors.** `init` failures surface from `Engine::new` as `EngineError`. Surface creation errors are returned from `engine.surface`. Render errors fail that `render` call. Resource validation that needs the device (shader compilation, image format support) is a reply; validation that does not (font parsing, byte lengths) happens on the UI thread before any message is sent.
 
 ## Engine
 
@@ -60,9 +149,12 @@ engine.trim(Pressure::Critical);       // system memory warning
 let usage: MemoryUsage = engine.memory();
 ```
 
-- The engine owns the device. `GpuContent` implementations reach wgpu through `cherenkov_gpu::interop::wgpu`.
+- The engine owns the device. `GpuContent` implementations reach wgpu through `cherenkov_vello::interop::wgpu`.
 - The pipeline set is closed and fully precompiled at creation, and the driver cache is persisted. Custom shaders compile when they are registered. Nothing compiles at draw time.
-- `Engine` is `!Send` and lives on the UI thread. It spawns and owns the render thread.
+- `Engine` is `!Send` and lives on the UI thread. It spawns and owns the render thread; dropping it sends `Shutdown` and joins the thread.
+- `engine.info()` is the backend's provenance (`B::Info`); `engine.stats()` the last frame's `FrameStats`.
+- **Frame timing.** The render loop numbers every render with a `FrameId` (`Frame::id`). A backend that draws reports it in `FrameStats::frame`, and every GPU timing it reports is a `FrameTiming` tagged with the frame it measures, in `FrameStats::timings`: the render's own for a backend that times synchronously (Vello), earlier renders' for one whose timestamp queries resolve after the frame is submitted (the GPU backend, which never waits for GPU idle). `engine.finish_timings()` waits for the timings still in flight — tooling at the end of a measured window, never a frame path.
+- **Waking the host.** Changes made outside a frame (a `surface.update`, a layer drop, a bound signal firing) are queued, not sent. When the display link is paused after `Next::Idle`, the host must learn that a frame is needed: `engine.set_waker(|| link.request_now())` registers a UI-thread callback that the engine calls at most once between two `render`s, the first time something is queued. No callback means the host renders on its own schedule.
 
 ## Resources
 
@@ -102,6 +194,9 @@ match engine.render(FrameTime::at(target_presentation_time))? {
 }
 ```
 
+- `Next::At` is returned while any animation track is unsettled, or a backend source (custom GPU content, an animated shader paint) asked for a redraw. `time` is the frame time plus one interval at the top of `rate`; `rate` is `60..=120` while a spring, curve or fast decay runs and `30..=60` while only a decay slower than one device pixel per frame at 60 Hz remains. A curve that ends before the next frame is sampled at its endpoint on that frame and then settles.
+- Animation tracks start on the first frame that samples them, so a transaction committed between frames starts at the next presentation time, never at wall-clock commit time.
+
 ## Layer tree
 
 ```rust
@@ -118,6 +213,7 @@ drop(card);                                      // removed at the next commit
 ```
 
 - **Properties:** `transform`, `opacity`, `clip`, `blend`, `filter`, `backdrop`, `scroll_offset`, `content`, and child order (`push`, `insert`, `remove`). Each property accepts a constant or a nami signal. A bound signal keeps updating the layer with no further transactions. The subscription is owned by the layer and released when the layer drops.
+- **Binding.** `transform`, `opacity`, `scroll_offset` and `clip` take `impl Into<Live<T>>`, the same target the `Recorder` uses: any `Signal<Output = T>`, and constants are signals. Binding a property replaces that property's previous subscription. A change fires on the UI thread, is queued as the same owned op a transaction would produce, reaches the render thread with the next frame, and calls the waker. If the change's nami `Context` metadata carries an `Animation`, the op carries it too and the render thread interpolates; otherwise the value snaps. A transaction that sets the property again also replaces the binding.
 - **Stable identity.** The layer handle is the identity. Content versions are internal: setting `content` bumps the version, and caching keys on (layer, version).
 - **Content kinds:** recorded `Content`, a shared `Picture`, `ExternalFrame` (video, web views), `GpuContent` (custom GPU pipelines).
 
@@ -133,6 +229,21 @@ surface.update_animated(Spring::smooth(), |tx| {
 - **Two levels.** A transaction-wide animation applies to every property it changes, and `.animation(...)` overrides it for one property.
 - **From nami.** A bound signal's change carries WaterUI's `Animation` in its `Context` metadata. The engine reads it and interpolates, so WaterUI's `.animation(...)` reaches the engine with no glue.
 - **One set of animation types.** `Spring { response, damping }`, `Curve` (cubic Bézier with a duration), and `Decay { velocity, deceleration }` with optional rubber-banding. WaterUI's `Animation` becomes these types, the same way colours were unified.
+
+  ```rust
+  pub enum Animation { Spring(Spring), Curve(Curve), Decay(Decay) }   // the value nami metadata carries
+  pub struct Spring { pub response: f64, pub damping: f64 }            // period in seconds; damping ratio (1 = critical)
+  impl Spring { pub fn smooth() -> Self /* 0.5, 1.0 */; pub fn snappy() -> Self /* 0.5, 0.85 */; pub fn bouncy() -> Self /* 0.5, 0.7 */;
+                pub fn from_physics(stiffness: f64, damping: f64) -> Self /* WaterUI's Spring, unit mass */ }
+  pub struct Curve { pub p1: Point, pub p2: Point, pub duration: Duration } // control points of x(t), y(t) on [0, 1]
+  impl Curve { pub fn bezier(duration, x1, y1, x2, y2) -> Self /* WaterUI's Bezier */; pub fn linear(d); pub fn ease_in(d); pub fn ease_out(d); pub fn ease_in_out(d) }
+  pub struct Decay { pub velocity: Vec2, pub deceleration: f64, pub rubber_band: Option<Rect> }
+  impl Decay { pub fn new(velocity: Vec2) -> Self /* deceleration 4.0 s⁻¹ */; pub fn rubber_band(self, bounds: Rect) -> Self }
+  ```
+
+- **Sampling.** A track holds the start value, the target, the animation and the time it started. `Spring` is the closed-form damped oscillator per lane (`Affine` has six lanes, `Vec2` two, `f32` one), from the start value with the start velocity; it settles when every lane is within `1e-3` of the target and slower than `1e-3` per second. `Curve` is `start + (target − start) · y(x⁻¹(t / duration))`, clamped to the endpoints. Sampling never touches recorded content: the backend draws the same fragments under a new `transform`, `opacity` or `scroll_offset`.
+- **Retargeting.** A new value for a property with a running track starts a new track from the value *and velocity* the old track had at the last sampled frame, so a spring retargeted mid-flight is continuous in position and velocity, and a curve restarts from its current value. A change without an animation snaps and drops the track.
+- **Animatable properties** are `transform`, `opacity` and `scroll_offset`. `.animation(...)` on any other property, or `Decay` on anything but `scroll_offset`, is an invariant violation and panics.
 - **Out-of-process handoff.** On promoted layers, `transform` and `opacity` animations are handed to Core Animation (Apple) or DirectComposition (Windows) whenever the curve maps exactly: springs map to `CASpringAnimation`, and Bézier curves map to `CAMediaTimingFunction`. Everything else, and everything on Android, is engine-driven.
 
 ## Scrolling
@@ -144,6 +255,10 @@ tx[&list].scroll_offset(target).animation(
 ```
 
 Scrolled content is never re-recorded. Gesture recognition stays with the host.
+
+- `scroll_offset` translates the layer's content and children by `−offset` inside the layer's clip; `transform` is untouched.
+- **Decay** starts at the value set by the transaction with `velocity` and decelerates exponentially: `x(t) = x₀ + v·(1 − e^(−k·t)) / k`, `k = deceleration` per second. With `rubber_band(bounds)`, the moment the offset leaves `bounds` the remaining motion becomes a critically damped `Spring { response: 0.4, damping: 1.0 }` from the current position and velocity back to the nearest point of `bounds`, so the overshoot and the return are one continuous motion. Without rubber-banding the decay runs until its velocity is below `1e-3` px/s.
+- **Snapping.** The sampled offset is rounded to the device-pixel grid of the surface (`surface.display(Display { scale, .. })`, default `1.0`) before it reaches the backend: `round(offset · scale) / scale`. The track itself is not snapped, so a slow decay still settles smoothly.
 
 ## Recording
 
@@ -169,7 +284,7 @@ pub trait Draw {
                         paint: impl Into<Self::Value<Paint>>);
     fn shadow<S: Shape>(&mut self, shape: impl Into<Self::Value<S>>, shadow: impl Into<Self::Value<Shadow>>);
     fn text(&mut self, layout: &TextLayout, origin: Point);
-    fn glyphs(&mut self, run: &GlyphRun<'_>);
+    fn glyphs(&mut self, run: impl Into<Self::Value<GlyphRun>>, paint: impl Into<Self::Value<Paint>>);
     fn image<F: Format>(&mut self, image: &Image<F>, dst: impl Into<Self::Value<Rect>>, sampling: Sampling);
     fn picture(&mut self, picture: &Picture, transform: impl Into<Self::Value<Affine>>);
 
@@ -179,7 +294,7 @@ pub trait Draw {
 }
 ```
 
-- **Numeric changes.** A signal passed to `Recorder` becomes an engine-side value slot. When it changes, only the commands that reference it are regenerated, and damage is exactly those commands. Structural changes re-record.
+- **Numeric changes.** A signal passed to `Recorder` becomes an engine-side value slot. When it changes, only the commands that reference it are regenerated, and damage is exactly those commands. Structural changes re-record. A glyph run is a value slot too, so a reshaped text value is a slot update, not a re-record.
 - **Shape signals.** A signal of a shape (`radius.map(|r| Circle::new(c, r))`) is how geometry becomes reactive. nami's `map` and `zip` compose it, and there is no per-field generic.
 - **Paired state is closure scopes only.** There is no ambient mutable state and no push/pop.
 - **nami `kurbo` feature.** nami gains a `kurbo` feature that implements constant `Signal` for kurbo types, so `impl Signal<Output = Affine>` accepts a plain `Affine`. The orphan rule prevents Cherenkov from doing this itself. Cherenkov's own types implement constant `Signal` in Cherenkov.
@@ -366,3 +481,38 @@ tx[&sparks].content(GpuContentHandle::new(Particles::new()));
 ## Errors
 
 Errors are `thiserror` enums per operation family: `EngineError`, `SurfaceError`, `ResourceError`, `RenderError` (including device loss). Invariant violations panic with a message. Nothing silently degrades.
+
+## Retained lowering in the GPU and CPU backends
+
+The first-party backends retain each layer's resolved command operations and
+its device realizations. `DisplayList::apply` contributes normalized `Dirty`
+ranges to that layer; multiple commits before a render merge their ranges.
+The shared `lowering` module records each source command's operation span and
+ambient content transform. A stable update replaces just those spans and
+invalidates just their device instances, gradient stops and coverage. Dirty
+realizations reuse their vector storage. A changed operation count, glyph
+count or scope structure rebuilds the affected layer's layout.
+
+Layer transforms, scrolling, clips and opacity are read from the sampled tree
+while composing retained operations. They do not resolve content again.
+Device placement changes regenerate the coverage that depends on that
+placement, including fractional transforms; opacity-only changes reuse the
+content instances and assemble the required isolation/composite passes.
+Atlas generations invalidate retained GPU addresses on growth or eviction.
+Deferred GPU atlas writes patch both the frame instances and retained cache
+addresses before submission. Critical memory pressure releases retained device
+output as well as the glyph caches.
+
+The CPU and GPU `dirty` integration tests run the same deterministic randomized
+slot updates and require exact readback bits against full lowering after every
+frame. The sequence includes nested scopes, glyph-count changes, animated layer
+properties, resize and cache eviction. Stable two-command updates assert
+`FrameStats::commands_lowered == 2`; property-only frames assert zero.
+
+`scenes/perf/live-dashboard` is the paired benchmark: one text value and one
+bar height change on every frame of an otherwise static page. `encode` measures
+the UI-thread slot changes; backend lowering runs inside `submit` with render
+composition and submission. The GPU backend also reports render-thread CPU
+phases, including `lower_seconds`, independently of its deferred GPU timestamps.
+Submission time can include driver backpressure; use the lowering phase to
+isolate CPU lowering work.

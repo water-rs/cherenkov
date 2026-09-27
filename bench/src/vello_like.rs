@@ -152,6 +152,7 @@ pub fn vello_features() -> Vec<Feature> {
         Feature::ImagePaint,
         Feature::Clip,
         Feature::Opacity,
+        Feature::Scroll,
         Feature::Shadow,
         Feature::Glyphs,
         Feature::FontVariations,
@@ -348,19 +349,24 @@ fn lower_layer<B>(
             opacity: layer.opacity as f32,
         });
     }
+    // Content and children draw translated by -scroll_offset inside the
+    // clip; `motion` is unsupported (not in `vello_features`).
+    let content_tf = tf * Affine::translate((-layer.scroll_offset.x, -layer.scroll_offset.y));
     for item in &layer.items {
         match item {
             Item::Layer(l) => lower_layer(
                 lowered,
                 l,
-                tf,
+                content_tf,
                 prepared,
                 engine,
                 opaque_clip,
                 paint_fn,
                 image_fn,
             )?,
-            Item::Draw(d) => lower_draw(lowered, d, tf, prepared, engine, paint_fn, image_fn)?,
+            Item::Draw(d) => {
+                lower_draw(lowered, d, content_tf, prepared, engine, paint_fn, image_fn)?;
+            }
         }
     }
     if grouped {

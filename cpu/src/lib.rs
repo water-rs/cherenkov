@@ -201,6 +201,45 @@ where
     }
 }
 
+impl cherenkov::Backdrop for Raster {
+    fn add_backdrop_group(
+        renderer: &mut Self::Renderer,
+        surface: cherenkov::SurfaceId,
+        id: cherenkov::BackdropId,
+    ) {
+        renderer.filters.add_backdrop_group(surface, id);
+    }
+
+    fn remove_backdrop_group(
+        renderer: &mut Self::Renderer,
+        surface: cherenkov::SurfaceId,
+        id: cherenkov::BackdropId,
+    ) {
+        renderer.filters.remove_backdrop_group(surface, id);
+    }
+}
+
+impl<K, F> cherenkov::BackdropRuns<K, F> for Raster
+where
+    K: filtrate_core::kind::Kind,
+    F: cherenkov::BackdropChain<K>
+        + filtrate_core::CpuFilter
+        + cherenkov::RenderTransfer
+        + Send
+        + Sync,
+{
+    fn add_filtered_backdrop_group(
+        renderer: &mut Self::Renderer,
+        surface: cherenkov::SurfaceId,
+        id: cherenkov::BackdropId,
+        filter: F,
+    ) {
+        renderer
+            .filters
+            .add_filtered_backdrop_group(surface, id, filter);
+    }
+}
+
 impl Backend for Raster {
     type Config = RasterConfig;
     type Info = RasterInfo;

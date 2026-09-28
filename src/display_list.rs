@@ -336,6 +336,16 @@ impl DisplayList {
         &self.commands
     }
 
+    /// Heap bytes held by the command buffer, including each command's own
+    /// allocations as reported by `nested`.
+    pub fn heap_bytes(&self, mut nested: impl FnMut(&Command) -> u64) -> u64 {
+        let mut bytes = (self.commands.capacity() * size_of::<Command>()) as u64;
+        for command in &self.commands {
+            bytes += nested(command);
+        }
+        bytes
+    }
+
     /// Number of commands.
     #[must_use]
     pub const fn len(&self) -> usize {

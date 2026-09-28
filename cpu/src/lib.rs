@@ -18,9 +18,15 @@
 //! geometric area, the accumulator is exact only for polygons that do not
 //! self-overlap inside a single pixel.
 //!
-//! Measured on the render corpus, materializing readbacks as f16 costs
-//! +0.0013 mean FLIP versus keeping f32 (0.00406 vs 0.00278) — the
-//! framebuffer itself is always f32.
+//! Pixel work is band-bounded: a [`RasterTarget::Bands`] surface keeps no
+//! framebuffer at all and streams each finished 16-row band to the host's
+//! sink, so peak pixel memory is one band plus its apron. An
+//! [`Offscreen`] surface keeps exactly one full-frame buffer, in the
+//! [`OffscreenFormat`] the host asked for — `LinearF16` stores f16
+//! directly, rounding once where readback used to round.
+//!
+//! Measured on the render corpus, f16 output storage costs +0.0013 mean
+//! FLIP versus keeping f32 (0.00406 vs 0.00278).
 //!
 //! ```no_run
 //! use cherenkov::{Draw, Engine, Offscreen, OffscreenFormat, WorkingColor};
@@ -40,7 +46,7 @@
 mod names;
 mod render;
 
-use cherenkov::{Backend, EngineError, Offscreen};
+use cherenkov::{Backend, EngineError, Offscreen, OffscreenFormat};
 
 /// CPU worker information for provenance.
 #[derive(Clone, Debug)]
@@ -64,12 +70,14 @@ pub struct RasterConfig {
     pub budget: cherenkov::Budget,
 }
 
-/// The surface targets [`Raster`] draws into: only an [`Offscreen`]
-/// framebuffer in this slice.
+/// The surface targets [`Raster`] draws into: an [`Offscreen`]
+/// framebuffer, or a [`Bands`] streaming sink.
 #[derive(Debug)]
 pub enum RasterTarget {
     /// An offscreen framebuffer.
     Offscreen(Offscreen),
+    /// A band-streaming sink.
+    Bands(Bands),
 }
 
 impl From<Offscreen> for RasterTarget {
@@ -78,8 +86,75 @@ impl From<Offscreen> for RasterTarget {
     }
 }
 
+impl From<Bands> for RasterTarget {
+    fn from(bands: Bands) -> Self {
+        Self::Bands(bands)
+    }
+}
+
+/// A band-streaming surface target for hosts that consume pixels in row
+/// order — a display driver's row DMA, an image encoder, a tile printer.
+///
+/// No full-frame buffer exists on the surface: each rasterized band is
+/// handed to the sink and its storage reused, so peak pixel memory is one
+/// band plus its apron. Such surfaces are not readable: `readback`
+/// returns an error.
+pub struct Bands {
+    /// Surface size in pixels.
+    pub size: (u32, u32),
+    /// The pixel format bands are delivered in.
+    pub format: OffscreenFormat,
+    /// The host's band consumer, called in row order on the render
+    /// thread. Pixels are borrowed for the call's duration; copy what is
+    /// kept.
+    pub sink: Box<dyn FnMut(Band<'_>) + Send>,
+}
+
+impl Bands {
+    /// A streaming target of `size` pixels delivering bands in `format`
+    /// to `sink`.
+    pub fn new(
+        size: (u32, u32),
+        format: OffscreenFormat,
+        sink: impl FnMut(Band<'_>) + Send + 'static,
+    ) -> Self {
+        Self {
+            size,
+            format,
+            sink: Box::new(sink),
+        }
+    }
+}
+
+impl std::fmt::Debug for Bands {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Bands")
+            .field("size", &self.size)
+            .field("format", &self.format)
+            .finish_non_exhaustive()
+    }
+}
+
+/// One rasterized band handed to a [`Bands`] sink.
+pub struct Band<'a> {
+    /// First device row of this band.
+    pub y: u32,
+    /// The band's pixels, `width * rows` in row order, premultiplied
+    /// linear Display P3 in the target's format.
+    pub pixels: BandPixels<'a>,
+}
+
+/// Band pixels in the surface's output format.
+#[derive(Clone, Copy, Debug)]
+pub enum BandPixels<'a> {
+    /// One `f32` per channel (`LinearF32`).
+    F32(&'a [[f32; 4]]),
+    /// One `f16` per channel (`LinearF16`).
+    F16(&'a [[half::f16; 4]]),
+}
+
 /// The CPU raster backend: renders the shared front end's layer trees
-/// into f32 framebuffers on a rayon pool.
+/// band by band on a rayon pool.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Raster;
 

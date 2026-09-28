@@ -5,6 +5,7 @@
 //! of the framebuffers and the worker pool, driven by the shared front
 //! end's render loop.
 
+mod account;
 mod blend;
 mod colr;
 mod font;
@@ -27,20 +28,55 @@ use cherenkov::{
 };
 use lower::{ContentData, Item, Lowering};
 
-use crate::{RasterConfig, RasterInfo, RasterTarget, names};
+use crate::{Band, RasterConfig, RasterInfo, RasterTarget, names};
 
 /// The largest surface dimension the CPU framebuffer supports.
 const MAX_SURFACE: u32 = 16384;
 
+/// A surface's pixel destination.
+enum Output {
+    /// Full-frame storage in `LinearF32`: the readback buffer.
+    F32(Vec<[f32; 4]>),
+    /// Full-frame storage in `LinearF16`: the readback buffer in the
+    /// host's requested format.
+    F16(Vec<[half::f16; 4]>),
+    /// No frame storage: finished bands stream to the host's sink in row
+    /// order. `emit` is the `LinearF16` conversion buffer.
+    Stream {
+        format: cherenkov::OffscreenFormat,
+        sink: Box<dyn FnMut(Band<'_>) + Send>,
+        emit: Vec<[half::f16; 4]>,
+    },
+}
+
 /// One surface's render-thread state.
 struct SurfaceState {
     size: (u32, u32),
-    format: cherenkov::OffscreenFormat,
-    /// The f32 premultiplied framebuffer, `width * height` pixels.
-    fb: Vec<[f32; 4]>,
+    /// Where finished pixels land; only `Offscreen` targets retain a
+    /// full-frame buffer, in the format the host asked for.
+    output: Output,
     /// Per-layer content caches; the sampled layer state lives in the
     /// front end's [`cherenkov::SurfaceTree`].
     layers: HashMap<LayerId, ContentData>,
+}
+
+impl SurfaceState {
+    /// Heap bytes of the output storage (`Stream` keeps none).
+    const fn output_bytes(&self) -> u64 {
+        match &self.output {
+            Output::F32(fb) => (fb.capacity() * size_of::<[f32; 4]>()) as u64,
+            Output::F16(fb) => (fb.capacity() * size_of::<[half::f16; 4]>()) as u64,
+            Output::Stream { .. } => 0,
+        }
+    }
+
+    /// Heap bytes of the surface's own band-format working buffer.
+    const fn band_bytes(&self) -> u64 {
+        match &self.output {
+            Output::Stream { emit, .. } => (emit.capacity() * size_of::<[half::f16; 4]>()) as u64,
+            _ => 0,
+        }
+    }
 }
 
 /// All render-thread state: the [`Raster`](crate::Raster) backend's
@@ -133,8 +169,34 @@ impl Renderer for RasterRenderer {
         id: SurfaceId,
         target: RasterTarget,
     ) -> Result<SurfaceInfo, SurfaceError> {
-        let RasterTarget::Offscreen(offscreen) = target;
-        let (size, format) = (offscreen.size, offscreen.format);
+        let (size, output, readable) = match target {
+            RasterTarget::Offscreen(offscreen) => {
+                let pixels = (offscreen.size.0 * offscreen.size.1) as usize;
+                let output = match offscreen.format {
+                    cherenkov::OffscreenFormat::LinearF32 => Output::F32(vec![[0.0; 4]; pixels]),
+                    cherenkov::OffscreenFormat::LinearF16 => {
+                        Output::F16(vec![[half::f16::ZERO; 4]; pixels])
+                    }
+                };
+                (offscreen.size, output, true)
+            }
+            RasterTarget::Bands(bands) => (
+                bands.size,
+                Output::Stream {
+                    format: bands.format,
+                    sink: bands.sink,
+                    // Exactly one band's worth for f16 emission, so
+                    // `memory()` is stable. f32 streams borrow the scratch.
+                    emit: match bands.format {
+                        cherenkov::OffscreenFormat::LinearF16 => Vec::with_capacity(
+                            bands.size.0 as usize * raster::BAND_H.min(bands.size.1 as usize),
+                        ),
+                        cherenkov::OffscreenFormat::LinearF32 => Vec::new(),
+                    },
+                },
+                false,
+            ),
+        };
         if size.0 > MAX_SURFACE || size.1 > MAX_SURFACE {
             return Err(SurfaceError::TooLarge {
                 width: size.0,
@@ -146,15 +208,14 @@ impl Renderer for RasterRenderer {
             id,
             SurfaceState {
                 size,
-                format,
-                fb: vec![[0.0; 4]; (size.0 * size.1) as usize],
+                output,
                 layers: HashMap::new(),
             },
         );
         Ok(SurfaceInfo {
             max_dimension: MAX_SURFACE,
             size,
-            readable: true,
+            readable,
         })
     }
 
@@ -163,7 +224,19 @@ impl Renderer for RasterRenderer {
             return;
         };
         state.size = size;
-        state.fb = vec![[0.0; 4]; (size.0 * size.1) as usize];
+        let pixels = (size.0 * size.1) as usize;
+        match &mut state.output {
+            Output::F32(fb) => *fb = vec![[0.0; 4]; pixels],
+            Output::F16(fb) => *fb = vec![[half::f16::ZERO; 4]; pixels],
+            Output::Stream { format, emit, .. } => {
+                *emit = match format {
+                    cherenkov::OffscreenFormat::LinearF16 => {
+                        Vec::with_capacity(size.0 as usize * raster::BAND_H.min(size.1 as usize))
+                    }
+                    cherenkov::OffscreenFormat::LinearF32 => Vec::new(),
+                };
+            }
+        }
     }
 
     fn destroy_surface(&mut self, id: SurfaceId) {
@@ -274,21 +347,22 @@ impl Renderer for RasterRenderer {
         Ok(Redraw::None)
     }
 
-    /// Materializes a surface's framebuffer into `Readback` pixels,
-    /// rounding through `f16` for
-    /// [`OffscreenFormat::LinearF16`](cherenkov::OffscreenFormat::LinearF16).
+    /// Materializes a surface's output buffer into `Readback` pixels.
+    /// `LinearF16` stores already round once; the readback only widens.
+    /// Band-streaming surfaces have no frame buffer to read.
     #[cfg(not(target_arch = "wasm32"))]
     fn readback(&mut self, surface: SurfaceId) -> Result<Readback, RenderError> {
         let Some(state) = self.surfaces.get(&surface) else {
             return Err(RenderError::Readback("unknown surface".into()));
         };
-        let pixels = match state.format {
-            cherenkov::OffscreenFormat::LinearF32 => state.fb.clone(),
-            cherenkov::OffscreenFormat::LinearF16 => state
-                .fb
-                .iter()
-                .map(|px| px.map(|v| half::f16::from_f32(v).to_f32()))
-                .collect(),
+        let pixels = match &state.output {
+            Output::F32(fb) => fb.clone(),
+            Output::F16(fb) => fb.iter().map(|px| px.map(half::f16::to_f32)).collect(),
+            Output::Stream { .. } => {
+                return Err(RenderError::Readback(
+                    "band-streaming surfaces are not readable".into(),
+                ));
+            }
         };
         Ok(Readback {
             width: state.size.0,
@@ -302,13 +376,14 @@ impl Renderer for RasterRenderer {
         let Some(state) = self.surfaces.get(&surface) else {
             return Err(RenderError::Readback("unknown surface".into()));
         };
-        let pixels = match state.format {
-            cherenkov::OffscreenFormat::LinearF32 => state.fb.clone(),
-            cherenkov::OffscreenFormat::LinearF16 => state
-                .fb
-                .iter()
-                .map(|px| px.map(|v| half::f16::from_f32(v).to_f32()))
-                .collect(),
+        let pixels = match &state.output {
+            Output::F32(fb) => fb.clone(),
+            Output::F16(fb) => fb.iter().map(|px| px.map(half::f16::to_f32)).collect(),
+            Output::Stream { .. } => {
+                return Err(RenderError::Readback(
+                    "band-streaming surfaces are not readable".into(),
+                ));
+            }
         };
         Ok(Readback {
             width: state.size.0,
@@ -317,21 +392,40 @@ impl Renderer for RasterRenderer {
         })
     }
 
-    /// Memory usage across framebuffers, registered images and the glyph mask cache.
+    /// Memory usage across output targets, band working buffers, retained
+    /// layer content, registered images and the glyph caches.
     fn memory(&self) -> MemoryUsage {
-        let framebuffers: u64 = self
+        let mut categories = account::Categories::default();
+        for surface in self.surfaces.values() {
+            categories.output += surface.output_bytes();
+            categories.retained += surface
+                .layers
+                .values()
+                .map(account::content_bytes)
+                .sum::<u64>();
+        }
+        categories.bands = self
             .surfaces
             .values()
-            .map(|s| u64::from(s.size.0) * u64::from(s.size.1) * 16)
-            .sum();
+            .map(SurfaceState::band_bytes)
+            .sum::<u64>();
+        categories.glyphs = self.glyph_cache.bytes();
+        categories.images = self.images.values().map(|image| image.bytes()).sum();
+        categories.colr = self.fonts.values().map(font::Font::colr_bytes).sum();
+        if std::env::var_os("CHERENKOV_CPU_MEMORY").is_some() {
+            eprintln!(
+                "cherenkov-cpu memory: output={} bands={} retained={} images={} glyphs={} colr={}",
+                categories.output,
+                categories.bands,
+                categories.retained,
+                categories.images,
+                categories.glyphs,
+                categories.colr,
+            );
+        }
         MemoryUsage {
             gpu: cherenkov::Bytes(0),
-            cpu: cherenkov::Bytes(
-                framebuffers
-                    + self.glyph_cache.bytes()
-                    + self.images.values().map(|image| image.bytes()).sum::<u64>()
-                    + self.fonts.values().map(font::Font::colr_bytes).sum::<u64>(),
-            ),
+            cpu: cherenkov::Bytes(categories.total()),
         }
     }
 
@@ -394,10 +488,14 @@ impl RasterRenderer {
         let (w, h) = (surf.size.0 as usize, surf.size.1 as usize);
         let [r, g, b, a] = sf.clear.components;
         let clear = [r * a, g * a, b * a, a];
-        surf.fb.fill(clear);
         let pool = &self.pool;
-        let fb = &mut surf.fb;
-        let (draws, edges) = pool.install(|| raster::render_bands(&items, clear, fb, w, h));
+        let (draws, edges) = match &mut surf.output {
+            Output::F32(fb) => pool.install(|| raster::render_bands(&items, clear, fb, w)),
+            Output::F16(out) => pool.install(|| raster::render_bands_f16(&items, clear, out, w)),
+            Output::Stream { format, sink, emit } => {
+                raster::render_bands_stream(&items, clear, (w, h), emit, *format, sink.as_mut())
+            }
+        };
         if let (Some(start), Some(lowered), Some(resolved)) = (start, lowered_at, resolved_at) {
             tracing::debug!(target: "cherenkov_cpu::profile",
                 lower_ns = lowered.duration_since(start).as_nanos(),

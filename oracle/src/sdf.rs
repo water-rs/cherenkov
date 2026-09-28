@@ -255,6 +255,7 @@ pub fn bilinear(capture: &[[f64; 4]], width: usize, height: usize, q: [f64; 2]) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kurbo::RoundedRect;
 
     fn rect_shape(w: f64, h: f64) -> BoxShape {
         BoxShape {
@@ -341,5 +342,92 @@ mod tests {
         // Clamped outside the capture.
         let v = bilinear(&px, 4, 4, [-3.0, 0.5]);
         assert_eq!(v, px[0]);
+    }
+
+    /// The exact signed distance and outward unit normal of an
+    /// axis-aligned rounded rect, computed independently of the ported
+    /// SDF: the closest-point construction `q = |p - c| - (half - r)`,
+    /// `d = |max(q, 0)| + min(max(qx, qy), 0) - r`, the normal the outward
+    /// direction of the closest feature (the corner arc, or the axis of
+    /// the nearer straight edge). Also returns `q` for the caller's
+    /// ambiguity checks.
+    #[allow(clippy::many_single_char_names)] // c/q/r follow the formula's names
+    fn exact_rounded_rect(
+        x0: f64,
+        y0: f64,
+        x1: f64,
+        y1: f64,
+        r: f64,
+        p: [f64; 2],
+    ) -> (f64, [f64; 2], [f64; 2]) {
+        let c = [(x0 + x1) / 2.0, (y0 + y1) / 2.0];
+        let half = [(x1 - x0) / 2.0, (y1 - y0) / 2.0];
+        let rel = [p[0] - c[0], p[1] - c[1]];
+        let q = [rel[0].abs() - (half[0] - r), rel[1].abs() - (half[1] - r)];
+        let d = q[0].max(0.0).hypot(q[1].max(0.0)) + q[0].max(q[1]).min(0.0) - r;
+        // The outward normal in the first quadrant: along the arc when
+        // both components overflow, along the nearer edge's axis inside.
+        let nq = if q[0] > 0.0 && q[1] > 0.0 {
+            let len = q[0].hypot(q[1]);
+            [q[0] / len, q[1] / len]
+        } else if q[0] > q[1] {
+            [1.0, 0.0]
+        } else {
+            [0.0, 1.0]
+        };
+        (d, [nq[0] * rel[0].signum(), nq[1] * rel[1].signum()], q)
+    }
+
+    /// The ported SDF is checked against an independently computed exact
+    /// rounded-rect distance and normal over the effect scenes' member
+    /// clips: a literal port cannot catch a GPU-side formula bug by
+    /// agreement alone.
+    #[test]
+    fn effect_sdf_matches_the_exact_rounded_rect() {
+        // Every member clip of the backdrop effect scenes: the three
+        // refraction members, the tint and rim members — all rounded
+        // rects, one radius each.
+        let clips = [
+            RoundedRect::new(40.0, 32.0, 88.0, 80.0, 16.0),
+            RoundedRect::new(112.0, 96.0, 208.0, 192.0, 16.0),
+            RoundedRect::new(80.0, 200.0, 240.0, 250.0, 16.0),
+            RoundedRect::new(24.0, 24.0, 140.0, 124.0, 16.0),
+            RoundedRect::new(116.0, 132.0, 232.0, 232.0, 16.0),
+            RoundedRect::new(32.0, 48.0, 224.0, 176.0, 20.0),
+            RoundedRect::new(80.0, 160.0, 240.0, 240.0, 24.0),
+        ];
+        for clip in clips {
+            let (shape, extra) =
+                box_params(&Shape::RoundedRect(clip)).expect("a rounded rect has an analytic box");
+            let clip_inv = (Affine::IDENTITY * extra).inverse();
+            let r = clip.rect();
+            let radius = clip.radii().as_single_radius().unwrap_or_default();
+            let mut x = r.x0 - 20.0;
+            while x <= r.x1 + 20.0 {
+                let mut y = r.y0 - 20.0;
+                while y <= r.y1 + 20.0 {
+                    let p = [x, y];
+                    let (want_d, want_n, q) = exact_rounded_rect(r.x0, r.y0, r.x1, r.y1, radius, p);
+                    let (d, n) = distance_and_normal(&shape, &clip_inv, p);
+                    assert!(
+                        (d - want_d).abs() < 1e-9,
+                        "distance mismatch at {p:?}: {d} vs {want_d} for {clip:?}"
+                    );
+                    // The interior closest feature is ambiguous on the
+                    // quadrant diagonal, and the normal is undefined at
+                    // the arc centre; skip the normal check there.
+                    let ambiguous = (q[0] - q[1]).abs() < 1e-6 && q[0] <= 0.0 && q[1] <= 0.0;
+                    let at_arc_centre = q[0].abs() < 1e-6 && q[1].abs() < 1e-6;
+                    if !ambiguous && !at_arc_centre {
+                        assert!(
+                            (n[0] - want_n[0]).abs() < 1e-9 && (n[1] - want_n[1]).abs() < 1e-9,
+                            "normal mismatch at {p:?}: {n:?} vs {want_n:?} for {clip:?}"
+                        );
+                    }
+                    y += 0.5;
+                }
+                x += 0.5;
+            }
+        }
     }
 }

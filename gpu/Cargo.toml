@@ -35,6 +35,7 @@ wasm-bindgen-test = "0.3"
 naga = { version = "29", features = ["wgsl-in", "spv-out", "msl-out"] }
 
 [dev-dependencies]
+cherenkov-oracle = { path = "../oracle" }
 naga = { version = "29", features = ["wgsl-in", "spv-out", "msl-out", "hlsl-out"] }
 
 cherenkov = { path = "..", features = ["testing"] }

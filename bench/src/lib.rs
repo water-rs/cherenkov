@@ -40,6 +40,7 @@ pub mod cli;
 pub mod conditions;
 pub mod convert;
 pub mod energy;
+pub mod gamut_sweep;
 pub mod memory;
 #[cfg(any(
     feature = "cherenkov",
@@ -47,6 +48,8 @@ pub mod memory;
     feature = "cherenkov-vello"
 ))]
 pub mod motion;
+#[cfg(feature = "cherenkov")]
+pub mod present_cost;
 pub mod report;
 #[cfg(any(
     feature = "cherenkov",

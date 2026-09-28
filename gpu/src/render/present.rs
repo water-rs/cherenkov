@@ -259,6 +259,23 @@ impl Presenter {
         source: &wgpu::TextureView,
         output: TextureOutput<'_>,
     ) {
+        self.texture_timed(device, queue, source, output, None);
+    }
+
+    /// [`Self::texture`], writing GPU timestamps around the render pass —
+    /// the presentation cost probe the cross-engine bench's `present-cost`
+    /// mode uses (#96). The device must have `Features::TIMESTAMP_QUERY`.
+    ///
+    /// # Panics
+    /// As [`Self::texture`].
+    pub fn texture_timed(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        source: &wgpu::TextureView,
+        output: TextureOutput<'_>,
+        timestamps: Option<wgpu::RenderPassTimestampWrites<'_>>,
+    ) {
         let TextureOutput {
             texture: target,
             color,
@@ -313,7 +330,7 @@ impl Presenter {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: timestamps,
                 occlusion_query_set: None,
                 multiview_mask: None,
             });

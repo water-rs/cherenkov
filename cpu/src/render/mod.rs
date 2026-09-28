@@ -17,6 +17,7 @@ use std::sync::Arc;
 mod lower;
 mod paint;
 mod prepared;
+pub mod present;
 mod raster;
 
 use std::collections::HashMap;

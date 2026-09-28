@@ -386,3 +386,69 @@ fn plus_lighter_saturates_alpha_not_colour() -> Result<(), Box<dyn std::error::E
     );
     Ok(())
 }
+
+/// A clipped blended layer's clip coverage must scale the source once,
+/// not again at the composite: Screen over 0.5 grey at a half-covered
+/// edge is `B(cb, 0.5·cs) = 0.75`, not `c²` = 0.4375. Clear keeps the
+/// lerp-by-clip bound.
+#[test]
+fn clipped_blend_layer_scales_source_by_clip_coverage() -> Result<(), Box<dyn std::error::Error>> {
+    const GREY: WorkingColor = WorkingColor::new([0.5, 0.5, 0.5, 1.0]);
+    let Some(engine) = engine() else {
+        return Ok(());
+    };
+    let surface = engine.surface(Offscreen::new((12, 12), OffscreenFormat::LinearF16))?;
+    surface.update(|tx| {
+        tx[surface.root()].content(surface.record(|c| {
+            c.fill(Rect::new(0.0, 0.0, 12.0, 12.0), GREY);
+        }));
+    });
+    // Screen layer clipped to the top half, Clear to the bottom half;
+    // both clips share the half-covered left edge at x = 4.5. The layer
+    // handles must outlive the render or the layer detaches.
+    let mut layers = Vec::new();
+    for (blend, y0, y1) in [(BlendMode::Screen, 0.0, 6.0), (BlendMode::Clear, 6.0, 12.0)] {
+        let layer = surface.layer();
+        surface.update(|tx| {
+            tx[&layer].blend(blend);
+            tx[&layer].clip(Rect::new(4.5, y0, 8.0, y1));
+            tx[surface.root()].push(&layer);
+        });
+        surface.update(|tx| {
+            tx[&layer].content(surface.record(|c| {
+                c.fill(Rect::new(0.0, 0.0, 12.0, 12.0), WorkingColor::WHITE);
+            }));
+        });
+        layers.push(layer);
+    }
+    assert_eq!(layers.len(), 2);
+    engine.render(cherenkov::FrameTime::now())?;
+    let pixels = surface.readback()?.pixels;
+    let px = |x: usize, y: usize| pixels[y * 12 + x];
+    let approx = |got: [f32; 4], want: [f32; 4], what: &str| {
+        for i in 0..4 {
+            assert!(
+                (got[i] - want[i]).abs() < 0.02,
+                "{what}: got {got:?}, want {want:?}"
+            );
+        }
+    };
+    // Screen rows (3): untouched outside, screen(0.5, 1) = 1 inside,
+    // B(0.5, 0.5·white) = 0.75 at the half-covered edge.
+    approx(px(2, 3), [0.5, 0.5, 0.5, 1.0], "screen outside clip");
+    approx(
+        px(4, 3),
+        [0.75, 0.75, 0.75, 1.0],
+        "screen at half-covered edge",
+    );
+    approx(px(6, 3), [1.0; 4], "screen inside clip");
+    // Clear rows (9): the destructive path lerps by the clip coverage.
+    approx(px(2, 9), [0.5, 0.5, 0.5, 1.0], "clear outside clip");
+    approx(
+        px(4, 9),
+        [0.25, 0.25, 0.25, 0.5],
+        "clear at half-covered edge",
+    );
+    approx(px(6, 9), [0.0; 4], "clear inside clip");
+    Ok(())
+}

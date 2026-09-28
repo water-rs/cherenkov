@@ -80,6 +80,29 @@ const ENGINE_WGSL2: &str = concat!(
     include_str!("shader.wgsl")
 );
 
+/// The effect-module text for a user `backdrop_effect` source.
+///
+/// The full engine module — `ENGINE_WGSL2`, the same `const VARIANT` +
+/// `shared` prelude + tail pieces the engine composes — with the stub
+/// `backdrop_effect` removed and the user source appended. The stub sits
+/// between two `// backdrop-effect-stub` marker lines, so removal is a
+/// plain string split.
+///
+/// # Panics
+///
+/// If the stub markers are missing from `shader.wgsl` (a build bug).
+#[must_use]
+pub fn backdrop_effect_text(user: &str) -> Cow<'static, str> {
+    const MARK: &str = "// backdrop-effect-stub";
+    let (head, rest) = ENGINE_WGSL2
+        .split_once(MARK)
+        .expect("the backdrop-effect stub marker is part of shader.wgsl");
+    let (_, tail) = rest
+        .split_once(MARK)
+        .expect("the backdrop-effect stub has a closing marker");
+    format!("{head}{tail}\n{user}").into()
+}
+
 // The passthrough artifacts are embedded only where they can be loaded:
 // wasm keeps WGSL, and `.metallib` files exist only in Apple builds
 // (`build.rs` refuses to produce them otherwise, and a Metal backend cannot

@@ -14,7 +14,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use cherenkov::kurbo::{Affine, BezPath, PathEl, Point, Rect};
 use cherenkov::{BlendMode, FillRule, FrameId, GlyphRun, GlyphStyle, ShapeData};
 
-use cherenkov::{BackdropId, LayerId, RenderError, SurfaceId, SurfaceTree};
+use cherenkov::{LayerId, RenderError, SurfaceId, SurfaceTree};
 
 use super::filter::{Erased, Registry};
 use super::prepared::Op;
@@ -576,7 +576,8 @@ impl<'a, 'b> Lowering<'a, 'b> {
         scopes: &mut Vec<LayerId>,
     ) -> Result<(), RenderError> {
         let node = tree.layer(id);
-        if let Some(gid) = node.backdrop {
+        if let Some(sample) = &node.backdrop {
+            let gid = sample.group();
             let g = gid.raw();
             self.used_groups.insert(g);
             let prepared = match groups.entry(g) {
@@ -964,7 +965,7 @@ impl<'a, 'b> Lowering<'a, 'b> {
         caches: &mut FxHashMap<LayerId, ContentData>,
     ) -> Result<(), RenderError> {
         let node = tree.layer(id);
-        let backdrop = node.backdrop.map(BackdropId::raw);
+        let backdrop = node.backdrop.as_ref().map(|sample| sample.group().raw());
         let saved = self.transform;
         let saved_animating = self.animating;
         self.animating |= node.animating();

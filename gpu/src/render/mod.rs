@@ -43,6 +43,7 @@ use lower::{
     BackdropGroupInfo, ContentData, Frame as LoweredFrame, GlyphContext, Lowered, Lowering,
     PipelineKind, ShaderVariant, Source, Target,
 };
+use shaders::backdrop_effect_text;
 
 /// The pipeline bound for a pass range: engine pipelines and the external
 /// frame pipeline are mutually exclusive, so an engine range always rebinds
@@ -347,6 +348,10 @@ pub struct GpuRenderer {
     /// format 0 = surface, 1 = scratch; kind 0 = source-over, 1 = replace;
     /// variant 0/1/2 = simple/shadow/full fragment shader.
     pipelines: [[[wgpu::RenderPipeline; 3]; 2]; 2],
+    /// Registered backdrop effect shaders, by raw id, one Full-variant
+    /// SrcOver pipeline per target format (`[surface, scratch]`),
+    /// compiled at registration.
+    backdrop_shaders: FxHashMap<u64, [wgpu::RenderPipeline; 2]>,
     /// The configured isolation texture format.
     scratch_format: wgpu::TextureFormat,
     layout0: wgpu::BindGroupLayout,
@@ -424,6 +429,8 @@ pub struct GpuRenderer {
     /// The allocation-event diagnostic sink (issue #169); `None` in
     /// timed runs.
     diag: Option<diag::Sink>,
+    /// Kept so registered-effect pipelines use the same pipeline cache.
+    config: GpuConfig,
 }
 
 /// Atlas origins produced by one deferred raster.
@@ -1268,6 +1275,7 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             presenter: None,
             shader_delivery,
             shaders: paint::Registry::default(),
+            backdrop_shaders: FxHashMap::default(),
             filters: filter::Registry::new(config.redraw.clone()),
             shadow_blur: shadow::Blur::new(&device, scratch_format),
             last_frame: None,
@@ -1315,6 +1323,7 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             pass_meta: Vec::new(),
             wait_timeout: config.wait_timeout,
             diag: config.alloc_diag.clone(),
+            config,
         };
         Ok((
             renderer,
@@ -1481,6 +1490,7 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
         presenter: None,
         shader_delivery,
         shaders: paint::Registry::default(),
+        backdrop_shaders: FxHashMap::default(),
         filters: filter::Registry::new(config.redraw.clone()),
         shadow_blur: shadow::Blur::new(&device, scratch_format),
         last_frame: None,
@@ -1528,6 +1538,7 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
         pass_meta: Vec::new(),
         wait_timeout: config.wait_timeout,
         diag: config.alloc_diag.clone(),
+        config,
     };
     Ok((
         renderer,
@@ -2802,6 +2813,91 @@ impl GpuRenderer {
         source: &cherenkov::ShaderSource,
     ) -> Result<(), ResourceError> {
         self.shaders.add(&self.device, id.raw(), source).await
+    }
+
+    /// Compiles `source` into a backdrop effect pipeline per target
+    /// format. The module text is the stock shader with the stub
+    /// `backdrop_effect` removed and the user source appended — the
+    /// stub sits between two `// backdrop-effect-stub` marker lines, so
+    /// removal is a plain string split.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn add_backdrop_shader(
+        &mut self,
+        id: cherenkov::BackdropShaderId,
+        source: &cherenkov::BackdropShaderSource,
+    ) -> Result<(), ResourceError> {
+        let module = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("backdrop effect"),
+                source: wgpu::ShaderSource::Wgsl(backdrop_effect_text(&source.source)),
+            });
+        let make = |format| -> Result<wgpu::RenderPipeline, ResourceError> {
+            create_pipeline(
+                &self.device,
+                &self.config,
+                &self.layout0,
+                &self.layout1,
+                &module,
+                format,
+                false,
+            )
+            .map_err(|e| ResourceError::Shader(e.to_string()))
+        };
+        let pipelines = [make(TARGET_FORMAT)?, make(self.scratch_format)?];
+        self.backdrop_shaders.insert(id.raw(), pipelines);
+        Ok(())
+    }
+
+    /// The wasm variant of [`GpuRenderer::add_backdrop_shader`].
+    #[cfg(target_arch = "wasm32")]
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
+    pub(crate) async fn add_backdrop_shader(
+        &mut self,
+        id: cherenkov::BackdropShaderId,
+        source: &cherenkov::BackdropShaderSource,
+    ) -> Result<(), ResourceError> {
+        let module = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("backdrop effect"),
+                source: wgpu::ShaderSource::Wgsl(backdrop_effect_text(&source.source)),
+            });
+        let pipelines = [
+            create_pipeline(
+                &self.device,
+                &self.config,
+                &self.layout0,
+                &self.layout1,
+                &module,
+                TARGET_FORMAT,
+                false,
+            )
+            .await
+            .map_err(|e| ResourceError::Shader(e.to_string()))?,
+            create_pipeline(
+                &self.device,
+                &self.config,
+                &self.layout0,
+                &self.layout1,
+                &module,
+                self.scratch_format,
+                false,
+            )
+            .await
+            .map_err(|e| ResourceError::Shader(e.to_string()))?,
+        ];
+        self.backdrop_shaders.insert(id.raw(), pipelines);
+        Ok(())
+    }
+
+    /// Frees a backdrop effect shader's pipelines. A member that still
+    /// samples it fails at encode with a render error.
+    pub(crate) fn remove_backdrop_shader(&mut self, id: cherenkov::BackdropShaderId) {
+        self.backdrop_shaders.remove(&id.raw());
     }
 
     pub(crate) fn remove_shader(&mut self, id: cherenkov::ShaderId) {
@@ -4279,10 +4375,22 @@ impl GpuRenderer {
                     let Bound::Engine(kind, variant) = pipeline else {
                         unreachable!("engine want")
                     };
-                    render_pass.set_pipeline(
-                        &self.pipelines[format_i][usize::from(kind == PipelineKind::Replace)]
-                            [variant_index(variant)],
-                    );
+                    let pipe = match kind {
+                        PipelineKind::Effect(id) => self
+                            .backdrop_shaders
+                            .get(&id)
+                            .map(|p| &p[format_i])
+                            .ok_or_else(|| {
+                                RenderError::Render(format!(
+                                    "backdrop shader {id} is not registered"
+                                ))
+                            })?,
+                        kind => {
+                            &self.pipelines[format_i][usize::from(kind == PipelineKind::Replace)]
+                                [variant_index(variant)]
+                        }
+                    };
+                    render_pass.set_pipeline(pipe);
                 }
                 let key = (
                     range.source,

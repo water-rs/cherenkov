@@ -238,14 +238,94 @@ impl BackdropGroup {
     /// A sample of this group for [`LayerEdit::backdrop`](crate::LayerEdit::backdrop).
     #[must_use]
     pub fn sample(&self) -> BackdropSample {
-        BackdropSample { group: self.id() }
+        BackdropSample {
+            group: self.id(),
+            effect: None,
+        }
+    }
+
+    /// A sample of this group with a per-member effect, evaluated in the
+    /// member's composite against the shared filtered capture.
+    #[must_use]
+    pub fn sample_with(&self, effect: impl Into<crate::BackdropEffect>) -> BackdropSample {
+        BackdropSample {
+            group: self.id(),
+            effect: Some(effect.into()),
+        }
     }
 }
 
 /// A sample of a [`BackdropGroup`], attached to a layer by
 /// [`LayerEdit::backdrop`](crate::LayerEdit::backdrop).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct BackdropSample {
     /// The sampled group.
-    pub(crate) group: BackdropId,
+    group: BackdropId,
+    /// The per-member effect applied in the member's composite.
+    effect: Option<crate::BackdropEffect>,
+}
+
+impl BackdropSample {
+    /// The sampled group.
+    #[must_use]
+    pub const fn group(&self) -> BackdropId {
+        self.group
+    }
+
+    /// The per-member effect, when the sample was made with
+    /// [`BackdropGroup::sample_with`].
+    #[must_use]
+    pub const fn effect(&self) -> Option<&crate::BackdropEffect> {
+        self.effect.as_ref()
+    }
+}
+
+/// A backdrop effect shader registered with an engine
+/// ([`Engine::backdrop_shader`](crate::Engine::backdrop_shader)).
+/// Dropping the last clone unregisters it; a member still sampling it
+/// makes the frame fail.
+#[derive(Debug)]
+pub struct BackdropShader {
+    inner: Rc<Inner<crate::message::BackdropShaderId>>,
+    reach: f32,
+}
+
+impl Clone for BackdropShader {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Rc::clone(&self.inner),
+            reach: self.reach,
+        }
+    }
+}
+
+impl BackdropShader {
+    pub(crate) fn new(
+        id: crate::message::BackdropShaderId,
+        reach: f32,
+        on_drop: impl FnOnce() + 'static,
+    ) -> Self {
+        Self {
+            inner: handle(id, on_drop),
+            reach,
+        }
+    }
+
+    /// The identifier [`BackdropShaderEffect`] references.
+    #[must_use]
+    pub fn id(&self) -> crate::message::BackdropShaderId {
+        self.inner.id
+    }
+
+    /// A [`BackdropEffect::Shader`] for
+    /// [`BackdropGroup::sample_with`], with `uniforms` in the shader's
+    /// declared order (at most 64 finite values, packed four per `vec4`).
+    #[must_use]
+    pub fn effect(&self, uniforms: Vec<f32>) -> crate::BackdropShaderEffect {
+        crate::BackdropShaderEffect {
+            shader: self.id(),
+            uniforms,
+            reach: self.reach,
+        }
+    }
 }

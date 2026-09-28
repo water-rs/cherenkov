@@ -275,6 +275,63 @@ fn font_blob<'a>(ctx: &'a TextContext, run: &'a GlyphRun) -> &'a Vec<u8> {
     &ctx.blobs[&run.font]
 }
 
+/// A `blend-*` scene under a rounded clip: full-canvas gradient backdrop,
+/// then a layer clipped to a rounded rect whose gradient content overruns
+/// the clip so the anti-aliased clip edge has source under it.
+fn blend_mode_clip_scene(
+    corpus: &mut Corpus,
+    name: String,
+    mode: BlendMode,
+    backdrop: [Color; 2],
+    content: [Color; 2],
+    interpolation: ColorSpace,
+) {
+    corpus.scene(name, 96, 96, srgb(0.7, 0.5, 0.2), |l| {
+        l.fill(
+            Shape::rect(0.0, 0.0, 96.0, 96.0),
+            Paint::Linear(LinearGradient {
+                start: Point::new(0.0, 0.0),
+                end: Point::new(96.0, 96.0),
+                stops: vec![
+                    GradientStop {
+                        offset: 0.0,
+                        color: backdrop[0],
+                    },
+                    GradientStop {
+                        offset: 1.0,
+                        color: backdrop[1],
+                    },
+                ],
+                extend: Extend::Pad,
+                interpolation,
+            }),
+        );
+        l.layer(|a| {
+            a.clip(Shape::rounded_rect(16.0, 16.0, 64.0, 64.0, 14.0));
+            a.blend(mode);
+            a.fill(
+                Shape::circle(48.0, 48.0, 40.0),
+                Paint::Linear(LinearGradient {
+                    start: Point::new(24.0, 24.0),
+                    end: Point::new(72.0, 72.0),
+                    stops: vec![
+                        GradientStop {
+                            offset: 0.0,
+                            color: content[0],
+                        },
+                        GradientStop {
+                            offset: 1.0,
+                            color: content[1],
+                        },
+                    ],
+                    extend: Extend::Pad,
+                    interpolation,
+                }),
+            );
+        });
+    });
+}
+
 fn encode_png_rgba(width: u32, height: u32, pixels: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     {
@@ -1284,6 +1341,41 @@ fn run() -> Result<(), SceneError> {
             ),
         ] {
             blend_clip_scene(
+                &mut corpus,
+                format!("blend-{mname}-clip{suffix}"),
+                mode,
+                backdrop,
+                content,
+                interpolation,
+            );
+        }
+    }
+
+    // Every non-linear blend mode under a rounded clip the content
+    // overruns: coverage at the anti-aliased clip edge must scale the
+    // source, not the whole composite.
+    for (mname, mode) in modes[..modes.len() - 1].iter().copied() {
+        for (suffix, backdrop, content, interpolation) in [
+            (
+                "",
+                [srgb(0.9, 0.5, 0.1), srgb(0.1, 0.3, 0.8)],
+                [srgb(0.2, 0.9, 0.4), srgb(0.9, 0.2, 0.6)],
+                ColorSpace::Srgb,
+            ),
+            (
+                "-p3",
+                [p3(1.0, 0.0, 0.6), p3(0.0, 1.0, 1.0)],
+                [p3(0.0, 1.0, 0.0), p3(1.0, 0.0, 0.0)],
+                ColorSpace::LinearP3,
+            ),
+            (
+                "-hdr",
+                [hdr(16.0, 2.0, 0.5), hdr(0.0, 8.0, 16.0)],
+                [hdr(4.0, 16.0, 1.0), hdr(16.0, 16.0, 16.0)],
+                ColorSpace::LinearP3,
+            ),
+        ] {
+            blend_mode_clip_scene(
                 &mut corpus,
                 format!("blend-{mname}-clip{suffix}"),
                 mode,

@@ -173,13 +173,51 @@ pub struct CaptureItem {
     pub flatten: usize,
 }
 
-/// How a backdrop sample composites into the member's layer. Only the
-/// plain sample exists so far; the variant is the seam for a sampled
-/// effect (#116).
-#[derive(Clone, Copy, Debug)]
+/// How a backdrop sample composites into the member's layer. `None` is
+/// the plain sample; the rest are #116's per-member effects.
+#[derive(Clone, Debug)]
 pub enum SampleEffect {
     /// Composite the captured rows unchanged under the member clip.
     None,
+    /// A 3×4 premultiplied colour matrix (filtrate `ColorMatrix`
+    /// layout): `dot(row, c)` per channel, alpha passes through.
+    Color([f32; 12]),
+    /// An effect reading the member clip's signed distance, carried as
+    /// the clip flattened to device-space edges.
+    Sdf(SdfEffect),
+}
+
+/// An SDF-reading member effect and the clip boundary it reads.
+#[derive(Clone, Debug)]
+pub struct SdfEffect {
+    /// The member clip flattened to device-space edges (implicit-close
+    /// applied; only non-`Path` shapes reach this).
+    pub edges: Arc<[Edge]>,
+    /// Which effect the distance and normal feed.
+    pub kind: SdfKind,
+}
+
+/// The SDF effect evaluated per member pixel (the engine's
+/// [`cherenkov::Refraction`] and [`cherenkov::Rim`]).
+#[derive(Clone, Copy, Debug)]
+pub enum SdfKind {
+    /// `q = p - n · strength · t²` with `t = clamp(1 + d / depth, 0, 1)`.
+    Refraction {
+        /// Fade depth inside the edge, device pixels.
+        depth: f32,
+        /// Maximum displacement at the edge, device pixels.
+        strength: f32,
+    },
+    /// `c.rgb += color.rgb · color.a · gain · t²` with
+    /// `t = clamp(1 + d / width, 0, 1)`, alpha unchanged.
+    Rim {
+        /// Rim width inside the edge, device pixels.
+        width: f32,
+        /// Highlight colour, straight-alpha linear Display P3.
+        color: [f32; 4],
+        /// Highlight gain.
+        gain: f32,
+    },
 }
 
 pub(super) type FrameFilter = (Arc<dyn Erased + Send + Sync>, Arc<[f32]>);
@@ -258,11 +296,21 @@ struct BackdropPlan {
     reach: usize,
     /// The prepared chain, when the group is filtered.
     filter: Option<FrameFilter>,
-    /// Each member layer's device-space clip bounds and innermost
-    /// enclosing filter scope.
-    members: FxHashMap<LayerId, (Rect, Option<LayerId>)>,
+    /// Each member layer's plan entry, keyed by layer.
+    members: FxHashMap<LayerId, Member>,
     /// The innermost filter scope the capture item lands in.
     scope: Option<LayerId>,
+}
+
+/// One backdrop member's plan entry.
+struct Member {
+    /// The member's device-space clip bounds, inflated by the effect's
+    /// sampling reach.
+    bounds: Rect,
+    /// The innermost enclosing filter scope.
+    scope: Option<LayerId>,
+    /// The member's resolved per-member effect.
+    effect: SampleEffect,
 }
 
 /// The lowering walk state for one surface frame.
@@ -315,6 +363,81 @@ fn sigma_max(t: Affine) -> f64 {
     p.midpoint(disc).sqrt()
 }
 
+/// Resolves a member's engine effect into a [`SampleEffect`], also
+/// returning its sampling reach (the member's bounds grow by it).
+/// `Path`/`Line` clips give SDF effects no analytic boundary — the same
+/// `backdrop-effect-sdf-path` error as the GPU slice; a `Shader` effect
+/// is a GPU-only capability on this backend.
+fn member_effect(
+    effect: Option<&cherenkov::BackdropEffect>,
+    clip: &ShapeData,
+    transform: Affine,
+) -> Result<(SampleEffect, f64), RenderError> {
+    let Some(effect) = effect else {
+        return Ok((SampleEffect::None, 0.0));
+    };
+    let kind = match effect {
+        cherenkov::BackdropEffect::Color(m) => {
+            return if m.0.iter().all(|v| v.is_finite()) {
+                Ok((SampleEffect::Color(m.0), 0.0))
+            } else {
+                Err(RenderError::Render(
+                    "backdrop colour effect has a non-finite matrix entry".into(),
+                ))
+            };
+        }
+        cherenkov::BackdropEffect::Refraction(r) => {
+            if !(r.depth.is_finite()
+                && r.depth > 0.0
+                && r.strength.is_finite()
+                && r.strength >= 0.0)
+            {
+                return Err(RenderError::Render(
+                    "backdrop refraction needs depth > 0 and strength >= 0, finite".into(),
+                ));
+            }
+            SdfKind::Refraction {
+                depth: r.depth,
+                strength: r.strength,
+            }
+        }
+        cherenkov::BackdropEffect::Rim(r) => {
+            if !(r.width.is_finite()
+                && r.width > 0.0
+                && r.gain.is_finite()
+                && r.color.iter().all(|v| v.is_finite()))
+            {
+                return Err(RenderError::Render(
+                    "backdrop rim needs width > 0 and a finite colour and gain".into(),
+                ));
+            }
+            SdfKind::Rim {
+                width: r.width,
+                color: r.color,
+                gain: r.gain,
+            }
+        }
+        cherenkov::BackdropEffect::Shader(_) => {
+            return Err(RenderError::Unsupported(names::BACKDROP_SHADER));
+        }
+    };
+    let sm = sigma_max(transform).max(1e-12);
+    let (path, _) = match clip {
+        ShapeData::Rect(_)
+        | ShapeData::RoundedRect(_)
+        | ShapeData::Continuous(_)
+        | ShapeData::Circle(_)
+        | ShapeData::Ellipse(_) => shape_path(clip, FLATTEN_TOL / sm),
+        _ => None,
+    }
+    .ok_or(RenderError::Unsupported(names::BACKDROP_EFFECT_SDF_PATH))?;
+    let edges: Arc<[Edge]> = boundary_edges(transform * path, FLATTEN_TOL).into();
+    Ok((
+        SampleEffect::Sdf(SdfEffect { edges, kind }),
+        f64::from(effect.reach()),
+    ))
+}
+
 /// A `ShapeData` as a kurbo path in content space, plus its fill rule.
 /// `Line` fills draw nothing.
 fn shape_path(shape: &ShapeData, tol: f64) -> Option<(BezPath, FillRule)> {
@@ -330,9 +453,11 @@ fn shape_path(shape: &ShapeData, tol: f64) -> Option<(BezPath, FillRule)> {
     }
 }
 
-/// Flattens `path` (already in device space) into directed edges.
+/// The path's flattened boundary edges, implicit-close applied.
+/// Horizontal edges are kept: the SDF reader measures to the real
+/// boundary.
 #[expect(clippy::cast_possible_truncation, reason = "geometry is f32")]
-fn flatten_edges(path: BezPath, tol: f64) -> Vec<Edge> {
+fn boundary_edges(path: BezPath, tol: f64) -> Vec<Edge> {
     let mut edges = Vec::new();
     let mut cur = Point::ZERO;
     let mut start = Point::ZERO;
@@ -372,6 +497,13 @@ fn flatten_edges(path: BezPath, tol: f64) -> Vec<Edge> {
         }
     });
     close(&mut edges, cur, start);
+    edges
+}
+
+/// Flattens `path` (already in device space) into directed edges for
+/// coverage rasterization: horizontal edges carry no area and drop out.
+fn flatten_edges(path: BezPath, tol: f64) -> Vec<Edge> {
+    let mut edges = boundary_edges(path, tol);
     #[expect(clippy::float_cmp, reason = "horizontal edges carry no area")]
     edges.retain(|e| e.y0 != e.y1);
     edges
@@ -594,7 +726,10 @@ impl<'a, 'b> Lowering<'a, 'b> {
                 .clip
                 .as_ref()
                 .ok_or(RenderError::Unsupported(names::BACKDROP_UNCLIPPED))?;
-            let member = clip_device_bounds(parent * node.transform, clip);
+            let transform = parent * node.transform;
+            let member = clip_device_bounds(transform, clip);
+            let (effect, reach) = member_effect(sample.effect(), clip, transform)?;
+            let member = member.inflate(reach, reach);
             let plan = self.backdrops.entry(g).or_insert_with(|| BackdropPlan {
                 first: id,
                 union: member,
@@ -612,7 +747,14 @@ impl<'a, 'b> Lowering<'a, 'b> {
                 scope: scopes.last().copied(),
             });
             plan.union = plan.union.union(member);
-            plan.members.insert(id, (member, scopes.last().copied()));
+            plan.members.insert(
+                id,
+                Member {
+                    bounds: member,
+                    scope: scopes.last().copied(),
+                    effect,
+                },
+            );
         }
         let children = parent * node.content_transform();
         if node.filter.is_some() {
@@ -700,7 +842,7 @@ impl<'a, 'b> Lowering<'a, 'b> {
             for &scope in plan
                 .members
                 .values()
-                .filter_map(|(_, s)| s.as_ref())
+                .filter_map(|m| m.scope.as_ref())
                 .chain(plan.scope.iter())
             {
                 if let std::collections::hash_map::Entry::Vacant(e) = aprons.entry(scope) {
@@ -727,7 +869,7 @@ impl<'a, 'b> Lowering<'a, 'b> {
                 let reach = plan
                     .members
                     .values()
-                    .filter_map(|(_, s)| s.map(|s| aprons[&s]))
+                    .filter_map(|m| m.scope.map(|s| aprons[&s]))
                     .fold(0, usize::max);
                 changed |= reach != plan.reach;
                 plan.reach = reach;
@@ -759,9 +901,10 @@ impl<'a, 'b> Lowering<'a, 'b> {
         if plan.region.x0 >= plan.region.x1 || plan.region.y0 >= plan.region.y1 {
             return;
         }
-        let Some(&(bounds, _)) = plan.members.get(&member) else {
+        let Some(entry) = plan.members.get(&member) else {
             return;
         };
+        let (bounds, effect) = (entry.bounds, entry.effect.clone());
         let region = Rect::new(
             f64::from(plan.region.x0),
             f64::from(plan.region.y0),
@@ -787,7 +930,7 @@ impl<'a, 'b> Lowering<'a, 'b> {
             group: gid,
             bounds,
             clip: self.clip.clone(),
-            effect: SampleEffect::None,
+            effect,
         });
     }
 
@@ -1523,7 +1666,6 @@ impl<'a, 'b> Lowering<'a, 'b> {
         Ok(())
     }
 }
-
 /// Heap residency of completed silhouette coverage owned by this content.
 pub fn silhouette_bytes(content: &ContentData) -> u64 {
     content
@@ -1547,4 +1689,30 @@ pub fn silhouette_bytes(content: &ContentData) -> u64 {
                 .sum::<u64>()
         })
         .sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::boundary_edges;
+    use cherenkov::kurbo::{RoundedRect, Shape as _};
+
+    /// SDF edges keep horizontal segments: coverage drops them as
+    /// area-free, but distance effects measure to the real boundary.
+    #[test]
+    fn boundary_edges_include_horizontals() {
+        let path = RoundedRect::new(0.0, 0.0, 100.0, 80.0, 12.0).to_path(0.02);
+        let edges = boundary_edges(path, 0.02);
+        let horizontal = edges
+            .iter()
+            .filter(|e| e.y0.to_bits() == e.y1.to_bits())
+            .count();
+        assert!(
+            horizontal >= 2,
+            "top and bottom edges kept, got {horizontal}"
+        );
+        assert!(
+            edges.iter().any(|e| (e.x0 - 100.0).abs() < 1e-4),
+            "right edge kept"
+        );
+    }
 }

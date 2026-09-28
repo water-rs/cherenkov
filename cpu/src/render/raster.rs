@@ -17,7 +17,9 @@ use std::ops::Range;
 
 use cherenkov::FillRule;
 
-use crate::render::lower::{ClipMask, ClipRef, FrameFilter, IRect, Item, SampleEffect};
+use crate::render::lower::{
+    ClipMask, ClipRef, FrameFilter, IRect, Item, SampleEffect, SdfEffect, SdfKind,
+};
 use crate::render::paint::PaintData;
 use crate::{Band as BandOut, BandPixels};
 use cherenkov::OffscreenFormat;
@@ -422,6 +424,121 @@ fn src_over(dst: [f32; 4], src: [f32; 4]) -> [f32; 4] {
         src[2].mul_add(1.0, dst[2] * inv),
         src[3].mul_add(1.0, dst[3] * inv),
     ]
+}
+
+/// A 3×4 premultiplied colour matrix on `s` (filtrate `ColorMatrix`
+/// layout): `dot(row, s)` per channel, alpha passes through.
+fn color_matrix(m: &[f32; 12], s: [f32; 4]) -> [f32; 4] {
+    [
+        s[0].mul_add(m[0], s[1].mul_add(m[1], s[2].mul_add(m[2], s[3] * m[3]))),
+        s[0].mul_add(m[4], s[1].mul_add(m[5], s[2].mul_add(m[6], s[3] * m[7]))),
+        s[0].mul_add(m[8], s[1].mul_add(m[9], s[2].mul_add(m[10], s[3] * m[11]))),
+        s[3],
+    ]
+}
+
+/// Evaluates an [`SdfEffect`] at pixel centre `(px + 0.5, py + 0.5)`:
+/// `Refraction` displaced-bilinear reads the capture, `Rim` adds the
+/// highlight to the sampled colour (alpha unchanged — gaining alpha
+/// would cancel under src-over).
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "pixels stay well below f32's integer bound"
+)]
+fn sdf_sample(capture: &Capture, sdf: &SdfEffect, px: usize, py: usize, crow: usize) -> [f32; 4] {
+    let (d, nx, ny) = sdf_at(&sdf.edges, px as f32 + 0.5, py as f32 + 0.5);
+    match sdf.kind {
+        SdfKind::Refraction { depth, strength } => {
+            let t = d.mul_add(depth.recip(), 1.0).clamp(0.0, 1.0);
+            let qx = (nx * strength * t).mul_add(-t, px as f32 + 0.5);
+            let qy = (ny * strength * t).mul_add(-t, py as f32 + 0.5);
+            capture_sample(capture, qx, qy)
+        }
+        SdfKind::Rim { width, color, gain } => {
+            let t = d.mul_add(width.recip(), 1.0).clamp(0.0, 1.0);
+            let k = color[3] * gain * t * t;
+            let s = capture.buf[crow + px - capture.x0];
+            [
+                color[0].mul_add(k, s[0]),
+                color[1].mul_add(k, s[1]),
+                color[2].mul_add(k, s[2]),
+                s[3],
+            ]
+        }
+    }
+}
+
+/// Signed distance and unit outward normal of `(x, y)` to a closed edge
+/// boundary: `d < 0` inside; the normal points away from the interior.
+/// Points on the boundary get distance `1e-6` and a zero normal (no
+/// displacement — the measure-zero set).
+fn sdf_at(edges: &[Edge], x: f32, y: f32) -> (f32, f32, f32) {
+    let mut dist = f32::MAX;
+    let (mut qx, mut qy) = (0.0f32, 0.0f32);
+    let mut inside = false;
+    for e in edges {
+        let dx = e.x1 - e.x0;
+        let dy = e.y1 - e.y0;
+        let len2 = dx.mul_add(dx, dy * dy);
+        let t = if len2 > 0.0 {
+            ((x - e.x0).mul_add(dx, (y - e.y0) * dy)).clamp(0.0, len2) / len2
+        } else {
+            0.0
+        };
+        let cx = dx.mul_add(t, e.x0);
+        let cy = dy.mul_add(t, e.y0);
+        let dd = (x - cx).hypot(y - cy);
+        if dd < dist {
+            dist = dd;
+            qx = cx;
+            qy = cy;
+        }
+        if (e.y0 > y) != (e.y1 > y) {
+            let xi = e.x0 + (y - e.y0) * (e.x1 - e.x0) / (e.y1 - e.y0);
+            if x < xi {
+                inside = !inside;
+            }
+        }
+    }
+    let d = dist.max(1e-6);
+    let (nx, ny) = ((x - qx) / d, (y - qy) / d);
+    if inside { (-d, -nx, -ny) } else { (d, nx, ny) }
+}
+
+/// Bilinear sample of `capture` at device point `(x, y)`: texel centres
+/// at integer + 0.5, clamped to the capture region — the GPU's
+/// `backdrop_sample` convention.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    reason = "the coordinates are clamped into the capture first"
+)]
+fn capture_sample(capture: &Capture, x: f32, y: f32) -> [f32; 4] {
+    let fx = (x - capture.x0 as f32 - 0.5).clamp(0.0, capture.w as f32 - 1.0);
+    let fy = (y - capture.y0 as f32 - 0.5).clamp(0.0, capture.rows as f32 - 1.0);
+    let (x_lo, y_lo) = (fx.floor() as usize, fy.floor() as usize);
+    let (x_hi, y_hi) = (
+        (x_lo + 1).min(capture.w - 1),
+        (y_lo + 1).min(capture.rows - 1),
+    );
+    let (tx, ty) = (fx - x_lo as f32, fy - y_lo as f32);
+    let at = |x: usize, y: usize| capture.buf[y * capture.w + x];
+    let (c00, c10, c01, c11) = (
+        at(x_lo, y_lo),
+        at(x_hi, y_lo),
+        at(x_lo, y_hi),
+        at(x_hi, y_hi),
+    );
+    let mix = |a: [f32; 4], b: [f32; 4], t: f32| {
+        [
+            (b[0] - a[0]).mul_add(t, a[0]),
+            (b[1] - a[1]).mul_add(t, a[1]),
+            (b[2] - a[2]).mul_add(t, a[2]),
+            (b[3] - a[3]).mul_add(t, a[3]),
+        ]
+    };
+    mix(mix(c00, c10, tx), mix(c01, c11, tx), ty)
 }
 
 /// `(draws, edges)` stats for an item list.
@@ -922,9 +1039,14 @@ fn run(
                 clip,
                 effect,
             } => {
-                let SampleEffect::None = effect;
                 if let Some(capture) = ctx.captures.get(group) {
-                    band.sample(capture, *bounds, clip.as_ref(), stack.as_mut_slice());
+                    band.sample(
+                        capture,
+                        *bounds,
+                        clip.as_ref(),
+                        effect,
+                        stack.as_mut_slice(),
+                    );
                 }
             }
             Item::Shadow {
@@ -1320,11 +1442,15 @@ impl Band<'_> {
 
     /// Composites `capture`'s rows over the band's top inside `bounds`,
     /// under `clip` — the member's backdrop sample.
+    /// Samples `capture` under `clip` with the member's `effect`
+    /// (`SampleEffect::None` reads the capture unchanged). Writes are
+    /// `clip`-coverage-gated: nothing lands outside the member clip.
     fn sample(
         &mut self,
         capture: &Capture,
         bounds: IRect,
         clip: Option<&ClipRef>,
+        effect: &SampleEffect,
         stack: &mut [Vec<[f32; 4]>],
     ) {
         let bh = self.fb.len() / self.w;
@@ -1356,7 +1482,12 @@ impl Band<'_> {
                 if cc <= 0.0 {
                     continue;
                 }
-                let src = capture.buf[crow + px - capture.x0].map(|v| v * cc);
+                let c = match effect {
+                    SampleEffect::None => capture.buf[crow + px - capture.x0],
+                    SampleEffect::Color(m) => color_matrix(m, capture.buf[crow + px - capture.x0]),
+                    SampleEffect::Sdf(sdf) => sdf_sample(capture, sdf, px, py, crow),
+                };
+                let src = c.map(|v| v * cc);
                 dst[row + px] = src_over(dst[row + px], src);
             }
         }

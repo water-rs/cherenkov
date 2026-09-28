@@ -108,10 +108,10 @@ fn item_bytes(item: &Item) -> u64 {
 }
 
 /// Heap bytes of a shape's path elements.
-const fn shape_bytes(shape: &cherenkov::ShapeData) -> u64 {
+fn shape_bytes(shape: &cherenkov::ShapeData) -> u64 {
     match shape {
         cherenkov::ShapeData::Path { elements, .. } => {
-            (elements.capacity() * size_of::<PathEl>()) as u64
+            (elements.len() * size_of::<PathEl>()) as u64
         }
         _ => 0,
     }

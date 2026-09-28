@@ -2277,7 +2277,7 @@ impl<'a> Lowering<'a> {
                         } => self.path(
                             content.expect("prepared fill has a hash"),
                             *rule,
-                            || BezPath::from_vec(elements.clone()),
+                            || BezPath::from_vec(elements.to_vec()),
                             paint,
                             glyphs,
                         )?,

@@ -215,11 +215,11 @@ fn batched_hashes_preserve_every_stroke_field_and_path_verb() {
             ShapeData::Ellipse(Ellipse::new(a, (next(), next()), next())),
             ShapeData::Line(Line::new(a, b)),
             ShapeData::Path {
-                elements: elements.clone(),
+                elements: elements.clone().into(),
                 rule: FillRule::NonZero,
             },
             ShapeData::Path {
-                elements: elements.clone(),
+                elements: elements.clone().into(),
                 rule: FillRule::EvenOdd,
             },
         ];

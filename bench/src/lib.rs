@@ -54,6 +54,7 @@ pub mod report;
     feature = "cherenkov-vello"
 ))]
 pub mod timing;
+pub mod tone_sweep;
 pub mod transform;
 #[cfg(any(
     feature = "vello-classic",

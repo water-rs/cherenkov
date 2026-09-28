@@ -1695,6 +1695,8 @@ impl Engine for Cherenkov {
         counters.passes = Some(stats.passes);
         counters.memory_gpu_bytes = Some(memory.gpu.0);
         counters.memory_cpu_bytes = Some(memory.cpu.0);
+        counters.memory_backdrop_captures = Some(memory.backdrop_captures.0);
+        counters.memory_backdrop_capture_format = memory.backdrop_capture_format.map(str::to_owned);
         counters
     }
 

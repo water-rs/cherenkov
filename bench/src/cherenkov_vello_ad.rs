@@ -1274,6 +1274,7 @@ impl Engine for CherenkovVello {
             engine: Reading::Measured(EngineBytes {
                 cpu_bytes: usage.cpu.0,
                 gpu_bytes: usage.gpu.0,
+                backdrop_capture_bytes: 0,
             }),
             wgpu_allocator: wgpu_allocator(&self.device_source.device, adapter_info.backend),
             skia_budgeted: Reading::unavailable("not a Skia adapter"),

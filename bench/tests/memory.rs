@@ -57,6 +57,10 @@ fn measure_reports_memory_snapshots_for_cherenkov_cpu() {
             report["memory"][point]["engine"]["measured"].is_object(),
             "memory.{point}.engine is not Measured: {report}"
         );
+        assert!(
+            report["memory"][point]["engine"]["measured"]["backdrop_capture_bytes"].is_number(),
+            "memory.{point}.engine lacks backdrop_capture_bytes: {report}"
+        );
     }
     std::fs::remove_dir_all(out_dir).expect("remove report directory");
 }

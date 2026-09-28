@@ -67,8 +67,8 @@ impl Image {
 #[derive(Debug)]
 pub(super) struct Intermediates {
     pub(super) size: (u32, u32),
-    /// The frame sequence that last encoded through these slots; sizes a
-    /// frame does not use are dropped rather than retained.
+    /// The frame sequence that last encoded through these slots; a size
+    /// unused for a whole frame is dropped rather than retained.
     pub(super) last_used: u64,
     pub(super) views: Vec<wgpu::TextureView>,
 }
@@ -269,8 +269,11 @@ impl Gpu {
         {
             self.intermediates[index].last_used = sequence;
         }
+        // Keep every size this or the previous frame used: a frame that
+        // encodes several sizes would otherwise drop the sizes encoded
+        // before this call and reallocate them on the next frame.
         self.intermediates
-            .retain(|intermediates| intermediates.last_used >= sequence);
+            .retain(|intermediates| intermediates.last_used.saturating_add(1) >= sequence);
         let intermediates_index = self
             .intermediates
             .iter()

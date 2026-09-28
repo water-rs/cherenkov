@@ -2419,24 +2419,36 @@ fn gpu_intermediates_evicted_when_size_unused() {
     let size_b = (64, 32);
     encode(&gpu, &mut executor, size_a, 1);
     assert_eq!(sizes(&executor), vec![size_a]);
+    // A size the previous frame used is still live.
     encode(&gpu, &mut executor, size_b, 2);
-    assert_eq!(sizes(&executor), vec![size_b]);
-    encode(&gpu, &mut executor, size_a, 3);
-    encode(&gpu, &mut executor, size_b, 3);
     let mut got = sizes(&executor);
     got.sort_unstable();
     assert_eq!(got, vec![size_b, size_a]);
+    // A size unused for a whole frame is dropped.
+    encode(&gpu, &mut executor, size_b, 3);
+    assert_eq!(sizes(&executor), vec![size_b]);
 
-    // Steady state: encoding the same size every frame must reuse that
-    // size's slots, not drop and reallocate them each frame.
+    // Steady state with two sizes alternating every frame: both sizes'
+    // intermediates stay allocated and are reused, not dropped and
+    // reallocated on each encode.
     encode(&gpu, &mut executor, size_a, 4);
-    let slots4 = slots_of(&executor, size_a);
+    encode(&gpu, &mut executor, size_b, 4);
+    assert_eq!(sizes(&executor).len(), 2);
+    let frame4 = (slots_of(&executor, size_a), slots_of(&executor, size_b));
     encode(&gpu, &mut executor, size_a, 5);
-    let slots5 = slots_of(&executor, size_a);
+    encode(&gpu, &mut executor, size_b, 5);
+    assert_eq!(sizes(&executor).len(), 2);
+    let frame5 = (slots_of(&executor, size_a), slots_of(&executor, size_b));
     encode(&gpu, &mut executor, size_a, 6);
-    let slots6 = slots_of(&executor, size_a);
+    encode(&gpu, &mut executor, size_b, 6);
+    assert_eq!(sizes(&executor).len(), 2);
+    let frame6 = (slots_of(&executor, size_a), slots_of(&executor, size_b));
     assert!(
-        slots4 == slots5 && slots5 == slots6,
-        "a size encoded every frame must keep its intermediates"
+        frame4.0 == frame5.0 && frame5.0 == frame6.0,
+        "size A encoded every frame must keep its intermediates"
+    );
+    assert!(
+        frame4.1 == frame5.1 && frame5.1 == frame6.1,
+        "size B encoded every frame must keep its intermediates"
     );
 }

@@ -104,7 +104,7 @@ mod tests {
         // 0.5 in P3 maps to ~0.5 in sRGB; sRGB-encodes to ~0.7354.
         assert_close(
             px(&present_srgb(1.0, &img([0.5, 0.5, 0.5, 1.0]))),
-            [0.735357, 0.735357, 0.735357, 1.0],
+            [0.735_357, 0.735_357, 0.735_357, 1.0],
         );
     }
 
@@ -124,7 +124,7 @@ mod tests {
         // → 0.7156 encoded.
         assert_close(
             px(&present_srgb(1.0, &img([0.0, 1.0, 0.5, 1.0]))),
-            [0.0, 1.0, 0.715583, 1.0],
+            [0.0, 1.0, 0.715_583, 1.0],
         );
     }
 
@@ -142,7 +142,7 @@ mod tests {
         // P3 (0.25, 0.5, 0.75): in-gamut after the matrix, then encoded.
         assert_close(
             px(&present_srgb(1.0, &img([0.25, 0.5, 0.75, 1.0]))),
-            [0.477456, 0.742240, 0.895978, 1.0],
+            [0.477_456, 0.742_240, 0.895_978, 1.0],
         );
     }
 
@@ -152,7 +152,7 @@ mod tests {
         // the encoded result is re-premultiplied.
         assert_close(
             px(&present_srgb(1.0, &img([0.1, 0.2, 0.05, 0.5]))),
-            [0.215091, 0.335728, 0.151213, 0.5],
+            [0.215_091, 0.335_728, 0.151_213, 0.5],
         );
         // Transparent pixels present as transparent black.
         assert_close(px(&present_srgb(1.0, &img([0.0, 0.0, 0.0, 0.0]))), [0.0; 4]);
@@ -162,7 +162,10 @@ mod tests {
     fn linear_p3_is_identity() {
         // Extended range — HDR and out-of-sRGB values pass through.
         let pixel = [4.0, -0.25, 1.5, 0.75];
-        assert_eq!(px(&present_linear_p3(4.0, &img(pixel))), pixel);
+        assert_eq!(
+            px(&present_linear_p3(4.0, &img(pixel))).map(f64::to_bits),
+            pixel.map(f64::to_bits)
+        );
     }
 
     #[test]

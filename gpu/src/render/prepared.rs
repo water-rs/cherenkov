@@ -692,6 +692,19 @@ pub enum Op {
         /// The resolved paint (identity local space).
         paint: ResolvedPaint,
     },
+    /// A size-independent bitmap glyph realized at device scale.
+    BitmapGlyph {
+        /// The content transform at the glyph's origin.
+        local: Affine,
+        /// The registered font identity.
+        font: u64,
+        /// The glyph index.
+        glyph: u32,
+        /// The glyph origin in run coordinates.
+        origin: [f32; 2],
+        /// The run size.
+        size: f32,
+    },
     /// Open a clip scope.
     BeginClip {
         /// The ambient transform (the clip's own `extra` is inside
@@ -1157,7 +1170,10 @@ impl Lowerer<'_> {
             .get(&run.font.raw())
             .ok_or_else(|| RenderError::Font(format!("unregistered font {:?}", run.font)))?;
         let resolved = resolve(paint, Affine::IDENTITY, self.images)?;
-        if !font.has_colr && !run.glyphs.iter().any(|glyph| glyph.transform.is_some()) {
+        if !font.has_colr
+            && font.bitmap.is_none()
+            && !run.glyphs.iter().any(|glyph| glyph.transform.is_some())
+        {
             if !run.glyphs.is_empty() {
                 ops.push(Op::Glyphs {
                     local: ambient,
@@ -1190,6 +1206,9 @@ impl Lowerer<'_> {
             .fonts
             .get(&run.font.raw())
             .ok_or_else(|| RenderError::Font(format!("unregistered font {:?}", run.font)))?;
+        if font.bitmap.is_some() {
+            return Err(RenderError::Unsupported(names::GLYPH_STROKE));
+        }
         for path in super::glyph::stroke_outlines(font, run)? {
             self.stroke(
                 ambient,
@@ -1287,6 +1306,24 @@ impl Lowerer<'_> {
                     &mut lowerer,
                     ops,
                 )?;
+                continue;
+            }
+            if font.bitmap.is_some() {
+                let (local, origin) = match super::glyph::classify(glyph)? {
+                    super::glyph::GlyphPlacement::Translate(glyph) => {
+                        (ambient, [glyph.x, glyph.y])
+                    }
+                    super::glyph::GlyphPlacement::Outline(place) => {
+                        (ambient * place, [0.0, 0.0])
+                    }
+                };
+                ops.push(Op::BitmapGlyph {
+                    local,
+                    font: run.font.raw(),
+                    glyph: glyph.id,
+                    origin,
+                    size: run.size,
+                });
                 continue;
             }
             let place = match super::glyph::classify(glyph)? {

@@ -434,6 +434,39 @@ fn self_intersecting_path() -> BezPath {
     p
 }
 
+/// Two same-direction circles overlapping as one `NonZero` path (their
+/// union renders flat), a self-crossing bow-tie quad, and two nested
+/// same-direction squares for `EvenOdd` hole-punching.
+fn overlap_winding_path() -> (BezPath, BezPath, BezPath) {
+    // κ·r for a four-cubic circle approximation.
+    const R: f64 = 28.0;
+    const KR: f64 = 0.5523 * R;
+    let mut circles = BezPath::new();
+    for (cx, cy) in [(44.3, 52.6), (72.7, 60.2)] {
+        circles.move_to((cx + R, cy));
+        circles.curve_to((cx + R, cy - KR), (cx + KR, cy - R), (cx, cy - R));
+        circles.curve_to((cx - KR, cy - R), (cx - R, cy - KR), (cx - R, cy));
+        circles.curve_to((cx - R, cy + KR), (cx - KR, cy + R), (cx, cy + R));
+        circles.curve_to((cx + KR, cy + R), (cx + R, cy + KR), (cx + R, cy));
+        circles.close_path();
+    }
+    let mut bow_tie = BezPath::new();
+    bow_tie.move_to((20.0, 90.0));
+    bow_tie.line_to((108.0, 120.0));
+    bow_tie.line_to((108.0, 90.0));
+    bow_tie.line_to((20.0, 120.0));
+    bow_tie.close_path();
+    let mut squares = BezPath::new();
+    for (x0, y0, x1, y1) in [(12.0, 12.0, 52.0, 52.0), (22.5, 22.5, 41.5, 41.5)] {
+        squares.move_to((x0, y0));
+        squares.line_to((x1, y0));
+        squares.line_to((x1, y1));
+        squares.line_to((x0, y1));
+        squares.close_path();
+    }
+    (circles, bow_tie, squares)
+}
+
 /// A path mixing lines and curves.
 fn curved_path() -> BezPath {
     let mut p = BezPath::new();
@@ -891,6 +924,36 @@ fn run() -> Result<(), SceneError> {
             solid(srgb(0.8, 0.2, 0.4)),
         );
     });
+
+    // Self-overlapping fills: overlapping windings resolve to the union
+    // boundary, a bow-tie keeps both lobes, and even-odd punches a hole.
+    for (name, c0, c1, c2) in [
+        (
+            "path-overlap-winding",
+            srgb(0.85, 0.25, 0.35),
+            srgb(0.2, 0.45, 0.85),
+            srgb(0.25, 0.6, 0.35),
+        ),
+        (
+            "path-overlap-winding-p3",
+            p3(1.0, 0.0, 0.6),
+            p3(0.0, 0.4, 1.0),
+            p3(0.0, 0.9, 0.3),
+        ),
+        (
+            "path-overlap-winding-hdr",
+            hdr(8.0, 0.0, 4.0),
+            hdr(0.0, 8.0, 16.0),
+            hdr(0.0, 10.0, 2.0),
+        ),
+    ] {
+        corpus.scene(name, 128, 128, white, |l| {
+            let (circles, bow_tie, squares) = overlap_winding_path();
+            l.fill(Shape::Path { path: circles }, solid(c0));
+            l.fill(Shape::Path { path: bow_tie }, solid(c1));
+            l.fill_rule(Shape::Path { path: squares }, FillRule::EvenOdd, solid(c2));
+        });
+    }
 
     for (name, rule) in [
         ("path-nonzero", FillRule::NonZero),

@@ -132,7 +132,7 @@ pub fn rasterize(
         return None;
     }
     let (ox, oy) = (x0 as f32, y0 as f32);
-    let resolved = super::winding::resolve(segments, rule);
+    let resolved = cherenkov::lowering::resolve_winding(segments, rule);
     let segments = resolved.as_deref().unwrap_or(segments);
     let rule = if resolved.is_some() {
         FillRule::NonZero

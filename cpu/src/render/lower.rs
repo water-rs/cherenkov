@@ -259,7 +259,7 @@ fn flatten_edges(path: BezPath, tol: f64) -> Vec<Edge> {
 fn resolve_edges(edges: Vec<Edge>, rule: FillRule) -> (Vec<Edge>, FillRule) {
     let segments: Vec<(f32, f32, f32, f32)> =
         edges.iter().map(|e| (e.x0, e.y0, e.x1, e.y1)).collect();
-    super::winding::resolve(&segments, rule).map_or((edges, rule), |resolved| {
+    cherenkov::lowering::resolve_winding(&segments, rule).map_or((edges, rule), |resolved| {
         (
             resolved
                 .into_iter()

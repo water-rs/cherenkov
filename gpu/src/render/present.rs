@@ -7,6 +7,8 @@ use std::collections::HashMap;
 
 use cherenkov::{RenderError, SurfaceError};
 
+use super::{bindings, layout_entries, shaders::ShaderDelivery};
+
 /// A window's swapchain and its configuration.
 pub struct WindowSurface {
     surface: wgpu::Surface<'static>,
@@ -120,41 +122,11 @@ pub struct Presenter {
 impl Presenter {
     /// Creates the shared present state.
     #[must_use]
-    pub fn new(device: &wgpu::Device) -> Self {
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("present"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("present.wgsl").into()),
-        });
+    pub fn new(device: &wgpu::Device, delivery: ShaderDelivery) -> Self {
+        let module = delivery.present_module(device);
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("present"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
+            entries: &layout_entries(bindings::PRESENT_GROUP0),
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("present"),

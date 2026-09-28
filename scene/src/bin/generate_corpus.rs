@@ -3309,52 +3309,44 @@ fn run() -> Result<(), SceneError> {
         );
     }
 
-    {
-        let coffee = ctx.shape(
-            "NotoSans.ttf",
-            "Coffee ",
-            32.0,
-            FontWeight::NORMAL,
-            &solid(dark),
-        );
+    for (suffix, paint) in [
+        ("", solid(dark)),
+        ("-p3", solid(p3(0.0, 1.0, 0.0))),
+        ("-hdr", solid(hdr(16.0, 2.0, 0.5))),
+    ] {
+        let coffee = ctx.shape("NotoSans.ttf", "Coffee ", 32.0, FontWeight::NORMAL, &paint);
         let cbdt = ctx.shape(
             "NotoColorEmojiSubset.ttf",
             corpus::BITMAP_EMOJI,
             32.0,
             FontWeight::NORMAL,
-            &solid(dark),
+            &paint,
         );
-        let warning = ctx.shape(
-            "NotoSans.ttf",
-            "Warning ",
-            32.0,
-            FontWeight::NORMAL,
-            &solid(dark),
-        );
+        let warning = ctx.shape("NotoSans.ttf", "Warning ", 32.0, FontWeight::NORMAL, &paint);
         let sbix = ctx.shape(
             "CherenkovSbixTest.ttf",
             corpus::BITMAP_EMOJI,
             32.0,
             FontWeight::NORMAL,
-            &solid(dark),
+            &paint,
         );
         let overlap = ctx.shape(
             "NotoColorEmojiSubset.ttf",
             corpus::BITMAP_EMOJI,
             40.0,
             FontWeight::NORMAL,
-            &solid(dark),
+            &paint,
         );
         let latin = ctx.shape(
             "NotoSans.ttf",
             "overlapping text",
             24.0,
             FontWeight::NORMAL,
-            &solid(dark),
+            &paint,
         );
         let blobs = font_blobs(&ctx, &[&coffee, &cbdt, &warning, &sbix, &overlap, &latin]);
         corpus.scene_with_blobs(
-            "text-bitmap-mixed",
+            format!("text-bitmap-mixed{suffix}"),
             480,
             240,
             bitmap_white,

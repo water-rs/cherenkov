@@ -600,3 +600,20 @@ This is a layer capability rather than animation metadata on a recorded
 matrix operand: components can bind directly to signals without a host tree
 walk or re-encoding. Backend lowering sees only the sampled affine matrix.
 Layers using only the existing matrix allocate no component storage.
+
+### Mesh colour interpolation (#79)
+
+`MeshGradient::interpolation(MeshColorInterpolation)` selects `Linear` (the
+default) or `Smoothstep`; `interpolation_mode()` reads it. Linear preserves
+the existing bilinear premultiplied-linear-P3 colour weights. Smoothstep
+first replaces each recovered patch coordinate `t` by `t*t*(3-2*t)`, then
+uses the same bilinear colour interpolation. At `t=0.25`, its weight is
+`0.15625`. Alpha is interpolated together with premultiplied colour.
+
+This setting changes colour weights only. Geometry, inverse branch selection,
+overlap ownership, coverage, transparent samples outside all patches and
+paint-coordinate transforms retain their existing contracts. It is independent
+of gradient colour-space interpolation. CPU, GPU and the f64 oracle implement
+both modes. Captured meshes without a setting deserialize as Linear; Linear
+is omitted when serializing, preserving old captures. Live mesh operands may
+switch modes while preserving unrelated retained commands and device output.

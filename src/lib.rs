@@ -77,9 +77,9 @@ pub use crate::image::{
 };
 pub use crate::message::{BackdropId, ContentOp, FontData, LayerId, Prop, SurfaceId};
 pub use crate::paint::{
-    ColorStop, Extend, ImageId, ImagePattern, Interpolation, LinearGradient, MeshGradient,
-    MeshGradientError, Paint, RadialGradient, Sampling, ShaderId, ShaderPaint, SweepGradient,
-    TransformedPaint,
+    ColorStop, Extend, ImageId, ImagePattern, Interpolation, LinearGradient,
+    MeshColorInterpolation, MeshGradient, MeshGradientError, Paint, RadialGradient, Sampling,
+    ShaderId, ShaderPaint, SweepGradient, TransformedPaint,
 };
 pub use crate::record::{Content, ContentChange, Draw, Fixed, Live, Recorder, StaticRecorder};
 pub use crate::resource::{Filter, Font, FontSource, Image, Shader};

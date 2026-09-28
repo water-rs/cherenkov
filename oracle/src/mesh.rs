@@ -67,6 +67,13 @@ pub fn eval(mesh: &MeshGradient, point: Point) -> [f64; 4] {
             let base = row * stride + column;
             let indices = [base, base + 1, base + stride, base + stride + 1];
             if let Some((u, v)) = inverse(point, indices.map(|index| mesh.points()[index])) {
+                let (u, v) = match mesh.interpolation_mode() {
+                    cherenkov_scene::MeshColorInterpolation::Linear => (u, v),
+                    cherenkov_scene::MeshColorInterpolation::Smoothstep => (
+                        u.powi(2) * (-2.0_f64).mul_add(u, 3.0),
+                        v.powi(2) * (-2.0_f64).mul_add(v, 3.0),
+                    ),
+                };
                 let colors = indices.map(|index| crate::color::to_working(&mesh.colors()[index]));
                 let weights = [(1.0 - u) * (1.0 - v), u * (1.0 - v), (1.0 - u) * v, u * v];
                 return std::array::from_fn(|channel| {

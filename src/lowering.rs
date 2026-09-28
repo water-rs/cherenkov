@@ -7,7 +7,7 @@ use std::ops::Range;
 
 use kurbo::Affine;
 
-use crate::{Command, Dirty, DisplayList, Group, ShapeData};
+use crate::{BlendMode, Command, Dirty, DisplayList, Group, ShapeData};
 
 /// A backend operation whose scope indices can be relocated during a patch.
 pub trait Operation {
@@ -55,10 +55,13 @@ pub trait Compiler {
     /// Returns a backend error for unsupported or invalid content.
     fn clip(&mut self, shape: &ShapeData, ambient: Affine) -> Result<Self::Op, Self::Error>;
     /// Open a group, or omit isolation when the group is a pass-through.
+    /// `isolate` forces isolation for a group that would otherwise compose
+    /// in place: a blended descendant group must composite against this
+    /// group's own raster, not the parent's.
     ///
     /// # Errors
     /// Returns a backend error for unsupported or invalid content.
-    fn group(&mut self, group: &Group) -> Result<Option<Self::Op>, Self::Error>;
+    fn group(&mut self, group: &Group, isolate: bool) -> Result<Option<Self::Op>, Self::Error>;
     /// Close a retained scope.
     fn end(&mut self) -> Self::Op;
 }
@@ -218,7 +221,14 @@ fn walk<C: Compiler>(
                 Some((*end as usize, ambient, Some(compiler.clip(shape, ambient)?)))
             }
             Command::BeginGroup { group, end } => {
-                Some((*end as usize, ambient, compiler.group(group)?))
+                // A pass-through group still isolates when a descendant
+                // group blends: without it the descendant's composite would
+                // land on the parent's raster, not the group's own.
+                let isolate = group.blend == BlendMode::Normal
+                    && group.opacity >= 1.0
+                    && group.filter.is_none()
+                    && blends_within(list, i + 1..*end as usize);
+                Some((*end as usize, ambient, compiler.group(group, isolate)?))
             }
             Command::Picture { picture, transform } => {
                 append(picture.display_list(), ambient * *transform, compiler, ops)?;
@@ -259,6 +269,29 @@ fn walk<C: Compiler>(
         }
     }
     Ok(())
+}
+
+/// Whether any command in `range` opens a group with a non-`Normal` blend.
+/// Nested pictures count: their contents are walked the same way. Glyphs
+/// need no scan — a colour glyph's expansion is itself wrapped in the
+/// outer `SrcOver` group this rule isolates.
+fn blends_within(list: &DisplayList, range: Range<usize>) -> bool {
+    for command in &list.commands()[range] {
+        match command {
+            Command::BeginGroup { group, .. } => {
+                if group.blend != BlendMode::Normal {
+                    return true;
+                }
+            }
+            Command::Picture { picture, .. }
+                if blends_within(picture.display_list(), 0..picture.display_list().len()) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// A retained device realization. Invalidation keeps the storage available for

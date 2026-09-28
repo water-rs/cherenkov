@@ -6,7 +6,7 @@
 #![expect(clippy::float_cmp, reason = "clear pixels are exact")]
 
 use cherenkov::kurbo::{Point, Rect};
-use cherenkov::{BlendMode, ColorStop, Draw, Extend, Interpolation, Paint, WorkingColor};
+use cherenkov::{BlendMode, ColorStop, Draw, Extend, Group, Interpolation, Paint, WorkingColor};
 use cherenkov::{Engine, EngineError, Offscreen, OffscreenFormat};
 use cherenkov_gpu::{Gpu, GpuConfig};
 
@@ -198,5 +198,36 @@ fn a_sweep_gradient_resolves_angles() -> Result<(), Box<dyn std::error::Error>> 
     );
     // atan2 of (0,−1) ≈ 3π/2 → t ≈ 0.75, mostly blue.
     assert!(top[2] > 0.6 && top[0] < 0.4, "top is blue-ish: {top:?}");
+    Ok(())
+}
+
+/// A `Normal` group flattens unless a descendant group blends; then it
+/// must isolate, or the descendant's composite would reach the scene.
+#[test]
+fn blended_descendant_isolates_its_normal_group() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(engine) = engine() else {
+        return Ok(());
+    };
+    let surface = engine.surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))?;
+    surface.update(|tx| {
+        tx[surface.root()].content(surface.record(|c| {
+            c.fill(Rect::new(0., 0., 8., 8.), RED);
+            c.group(Group::new(), |c| {
+                c.fill(Rect::new(0., 0., 4., 8.), BLUE);
+                c.group(Group::new().blend(BlendMode::Clear), |c| {
+                    c.fill(Rect::new(2., 0., 6., 8.), WorkingColor::WHITE);
+                });
+            });
+        }));
+    });
+    engine.render(cherenkov::FrameTime::now())?;
+    let rb = surface.readback()?;
+    // `Clear` zeroes the inner group's whole raster — but only inside the
+    // outer group's offscreen, which then composites `Normal` over the red
+    // background. Without outer isolation the `Clear` reached the scene
+    // framebuffer and every pixel came out transparent.
+    for (i, px) in rb.pixels.iter().enumerate() {
+        assert_eq!(*px, [1.0, 0.0, 0.0, 1.0], "pixel {i}");
+    }
     Ok(())
 }

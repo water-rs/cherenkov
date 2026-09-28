@@ -33,6 +33,44 @@ fn clear_composite_preserves_destination_outside_clip() {
 }
 
 #[test]
+fn blended_descendant_isolates_its_normal_group() {
+    let engine = Engine::<Raster>::new(RasterConfig::default()).expect("engine");
+    let surface = engine
+        .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF32))
+        .expect("surface");
+    surface.update(|tx| {
+        tx[surface.root()].content(surface.record(|c| {
+            c.fill(
+                Rect::new(0.0, 0.0, 8.0, 8.0),
+                WorkingColor::new([1.0, 0.0, 0.0, 1.0]),
+            );
+            c.group(Group::new(), |c| {
+                c.fill(
+                    Rect::new(0.0, 0.0, 4.0, 8.0),
+                    WorkingColor::new([0.0, 0.0, 1.0, 1.0]),
+                );
+                c.group(Group::new().blend(BlendMode::Clear), |c| {
+                    c.fill(
+                        Rect::new(2.0, 0.0, 6.0, 8.0),
+                        WorkingColor::new([1.0, 1.0, 1.0, 1.0]),
+                    );
+                });
+            });
+        }));
+    });
+    engine.render(FrameTime::now()).expect("render");
+    let pixels = surface.readback().expect("pixels").pixels;
+    // `Clear` zeroes the inner group's whole raster — but only inside the
+    // outer group's offscreen, which then composites `Normal` over the red
+    // background. Without outer isolation the `Clear` reached the scene
+    // framebuffer and every pixel came out transparent.
+    let red = [1.0_f32, 0.0, 0.0, 1.0].map(f32::to_bits);
+    for (i, px) in pixels.iter().enumerate() {
+        assert_eq!(px.map(f32::to_bits), red, "pixel {i}");
+    }
+}
+
+#[test]
 fn encoded_group_composites_in_encoded_space() {
     let engine = Engine::<Raster>::new(RasterConfig::default()).expect("engine");
     let surface = engine

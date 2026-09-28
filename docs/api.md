@@ -32,7 +32,7 @@ Capabilities are traits implemented by backend types, so using a missing capabil
 
 | Capability trait | `Gpu` | `Vello` | `Raster` |
 |---|---|---|---|
-| `Uploads<F>` for an image format `F` | `Rgba8` | `Rgba8` | |
+| `Uploads<F>` for an image format `F` | `Rgba8`, `Rgba16F` | `Rgba8` | `Rgba8`, `Rgba16F` |
 | `GpuContent`, `ShaderPaint` | both | both | |
 | `Filters`, `Runs<F>` for a filter `F`, `Effects` | every filter | every filter | |
 | `HdrOutput`, `Backdrop`, `ExternalFrames`, `Planes` | | | |

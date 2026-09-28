@@ -329,6 +329,7 @@ impl Shape for ContinuousRect { /* Semantic::Continuous */ }
 // kurbo::Ellipse by type and gives it Semantic::Ellipse; no separate oval type.
 ```
 
+- `ContinuousRect::to_path(tolerance)` expands its Lamé corners to a `BezPath` of line segments within `tolerance`; smoothing 0 gives circular-arc corners.
 - **Custom shapes are open.** `waterui-shape` merges here, and Lyon is removed.
 - **The semantic vocabulary is closed.** It is the set of fast paths. Besides the shapes above, it includes `Border` (a stroked rounded or continuous rectangle of a given width) and `InnerShadow`. These are the most common UI elements after the rounded rectangle, and otherwise they would fall to the general path route.
 - **Proposal: native path type.** If profiling shows `BezPath`'s f64 storage is a bottleneck for large paths, add an engine-native f32 path type that also implements `Shape`. `BezPath` stays accepted.
@@ -350,6 +351,7 @@ pub enum Paint {
 - **Gradients.** Stops are colours in any space. The interpolation space is a gradient property; the default is the working space, and an sRGB-encoded option exists for web compatibility.
 - **Paint coordinates.** `Paint::transformed` maps paint coordinates into shape space without changing geometry, stroke width or clipping. `TransformedPaint` shares its source through `Arc<Paint>`; a live transform updates only its recorded users. Nested transforms compose outside-in, and non-finite or non-invertible transforms fail rendering. See [the #68 decision](paint-transform.md).
 - **Stroke** is `kurbo::Stroke`: width, joins, caps, miter limit, dashes.
+- Every join, cap and miter limit renders on every shape. The GPU backend draws round joins, and miter joins with a limit ≥ √2 on right-angle corners, analytically; other combinations are stroked to a path and rasterized by coverage.
 - **Shader paints** replace `ShaderSurface`, `FlowingGradient` and `ViewEffect`. They inherit the shape, clip, antialiasing and on-chip blending, and they receive time and any signal-bound uniforms.
 - **Shader paints follow a portable contract.** Inputs are explicit: coordinates, time, uniforms, declared resources and sampling footprints. Gradients are passed explicitly, and nothing relies on implicit fragment derivatives or on fragment-stage built-ins. This lets the same paint run in a fragment shader, a tile interpreter or a compute shader, so the paint contract never pre-selects the raster architecture.
 

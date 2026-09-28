@@ -175,6 +175,31 @@ fn shape_is_offsettable(shape: Shape) -> bool {
     shape.exponent == 2.0 && shape.aspect == 1.0
 }
 
+/// Whether the analytic stroke kernels reproduce `stroke`'s joins on `shape`.
+///
+/// A corner with a positive radius is a smooth curve: there is no join, so
+/// every join style and miter limit draw the same outline. A sharp corner of
+/// an offsettable (circular-corner, aspect-1) shape is a right angle whose
+/// miter ratio is 1/sin(45°) = √2: a round join is the offset shape's
+/// quarter-circle, and a miter join with limit ≥ √2 keeps the sharp corner.
+/// Below √2 kurbo bevels the corner, and a bevel join always does, neither of
+/// which the offset kernel can express. A sharp corner of a non-offsettable
+/// shape (superelliptical, or elliptical with aspect ≠ 1) is drawn by the
+/// distance kernel, which only produces the round join.
+fn analytic_join(shape: Shape, stroke: &kurbo::Stroke) -> bool {
+    let sharp = shape.radii.iter().any(|&r| r <= 0.0);
+    if !sharp {
+        return true;
+    }
+    match stroke.join {
+        kurbo::Join::Round => true,
+        kurbo::Join::Miter => {
+            shape_is_offsettable(shape) && stroke.miter_limit >= std::f64::consts::SQRT_2
+        }
+        kurbo::Join::Bevel => false,
+    }
+}
+
 /// The path cache tag for a fill rule.
 const fn fill_tag(rule: FillRule) -> u64 {
     match rule {
@@ -884,10 +909,17 @@ impl Lowerer<'_> {
         ops: &mut Vec<Op>,
         source: Option<usize>,
     ) -> Result<(), RenderError> {
-        if matches!(shape, ShapeData::Path { .. }) || !stroke.dash_pattern.is_empty() {
-            if matches!(shape, ShapeData::Continuous(_)) {
-                return Err(RenderError::Unsupported(names::PATH));
-            }
+        let hw = stroke.width / 2.0;
+        let general = match shape {
+            ShapeData::Path { .. } => true,
+            _ if !stroke.dash_pattern.is_empty() => true,
+            ShapeData::Line(_) => stroke.start_cap != stroke.end_cap,
+            _ => match box_shape(shape)? {
+                None => return Ok(()),
+                Some(boxed) => !analytic_join(boxed.shape, stroke),
+            },
+        };
+        if general {
             ops.push(Op::Path {
                 local: ambient,
                 rule: FillRule::NonZero,
@@ -905,7 +937,6 @@ impl Lowerer<'_> {
             });
             return Ok(());
         }
-        let hw = stroke.width / 2.0;
         if let ShapeData::Line(line) = shape {
             return self.stroke_line(ambient, line, hw, stroke, paint, ops);
         }
@@ -922,17 +953,12 @@ impl Lowerer<'_> {
                 if *r > 0.0 {
                     *r += f32_f64(hw);
                 } else {
-                    *r = match stroke.join {
-                        kurbo::Join::Round => f32_f64(hw),
-                        kurbo::Join::Miter => {
-                            if stroke.miter_limit < 1.415 {
-                                return Err(RenderError::Unsupported(names::STROKE_JOIN));
-                            }
-                            0.0
-                        }
-                        kurbo::Join::Bevel => {
-                            return Err(RenderError::Unsupported(names::STROKE_JOIN));
-                        }
+                    // `analytic_join` routed only round joins and kept
+                    // miters here; both draw the offset shape's corner.
+                    *r = if stroke.join == kurbo::Join::Round {
+                        f32_f64(hw)
+                    } else {
+                        0.0
                     };
                 }
             }
@@ -989,9 +1015,6 @@ impl Lowerer<'_> {
         paint: &Paint,
         ops: &mut Vec<Op>,
     ) -> Result<(), RenderError> {
-        if stroke.start_cap != stroke.end_cap {
-            return Err(RenderError::Unsupported(names::STROKE_JOIN));
-        }
         let d = line.p1 - line.p0;
         let len = d.hypot();
         if len <= 0.0 || hw <= 0.0 {

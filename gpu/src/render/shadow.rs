@@ -94,6 +94,12 @@ impl Blur {
         }
     }
 
+    /// Release retained allocations without recompiling the fixed pipeline.
+    pub fn trim(&mut self) {
+        self.kernels = std::array::from_fn(|_| None);
+        self.temporary = None;
+    }
+
     pub fn gpu_bytes(&self) -> u64 {
         self.kernels
             .iter()

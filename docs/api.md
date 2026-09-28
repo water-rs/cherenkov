@@ -665,6 +665,10 @@ local disk; negative spread erodes it. The blur follows both affine axes, so a
 nonuniform scale or skew also changes its covariance. The enclosing clip applies
 to the completed shadow. Off-viewport shape coverage can contribute visible blur.
 
+The GPU convolution pipeline is created with the renderer. Its intermediate
+texture and kernels allocate only when needed; memory pressure drops those
+allocations while preserving the pipeline, so drawing never compiles it.
+
 GPU convolution stays on the GPU after native coverage capture. CPU convolution
 uses the CPU renderer's coverage. Both retain prepared content and device output;
 changing a live shadow patches its command, while unrelated commands are reused.

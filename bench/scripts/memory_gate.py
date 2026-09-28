@@ -222,25 +222,22 @@ def build(path: Path, out: Path, side: str) -> Path:
     return executable
 
 
-def read_engine_memory(report_path: Path) -> dict[str, Any]:
-    try:
-        report = json.loads(report_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise GateError(f"could not read report {report_path}: {error}") from error
-    memory = report.get("memory") if isinstance(report, dict) else None
-    if not isinstance(memory, dict):
-        raise GateError(f"{report_path} has no memory report; {HARNESS_HINT}")
-    steady = memory.get("steady")
-    engine = steady.get("engine") if isinstance(steady, dict) else None
-    if not isinstance(engine, dict):
-        raise GateError(f"{report_path} has no steady engine memory reading")
-    if "unavailable" in engine:
-        return {"unavailable": engine["unavailable"]}
-    measured = engine.get("measured")
-    if not isinstance(measured, dict):
-        raise GateError(f"{report_path} has an invalid steady engine memory reading")
-    cpu_bytes = measured.get("cpu_bytes")
-    gpu_bytes = measured.get("gpu_bytes")
+def counter_engine_memory(
+    report_path: Path, report: dict[str, Any]
+) -> dict[str, Any] | None:
+    counters = report.get("counters")
+    if not isinstance(counters, dict):
+        return None
+    has_cpu = "memory_cpu_bytes" in counters
+    has_gpu = "memory_gpu_bytes" in counters
+    if not has_cpu and not has_gpu:
+        return None
+    if not has_cpu or not has_gpu:
+        raise GateError(f"{report_path} has incomplete CPU/GPU engine memory counters")
+    cpu_bytes = counters["memory_cpu_bytes"]
+    gpu_bytes = counters["memory_gpu_bytes"]
+    if cpu_bytes is None and gpu_bytes is None:
+        return None
     if (
         not isinstance(cpu_bytes, int)
         or isinstance(cpu_bytes, bool)
@@ -249,8 +246,53 @@ def read_engine_memory(report_path: Path) -> dict[str, Any]:
         or cpu_bytes < 0
         or gpu_bytes < 0
     ):
-        raise GateError(f"{report_path} has invalid CPU/GPU engine bytes")
+        raise GateError(f"{report_path} has invalid CPU/GPU engine memory counters")
     return {"measured": {"cpu_bytes": cpu_bytes, "gpu_bytes": gpu_bytes}}
+
+
+def read_engine_memory(report_path: Path) -> dict[str, Any]:
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise GateError(f"could not read report {report_path}: {error}") from error
+    if not isinstance(report, dict):
+        raise GateError(f"{report_path} has no memory report; {HARNESS_HINT}")
+    memory = report.get("memory")
+    if not isinstance(memory, dict):
+        counters = counter_engine_memory(report_path, report)
+        if counters is not None:
+            return counters
+        raise GateError(f"{report_path} has no memory report; {HARNESS_HINT}")
+    steady = memory.get("steady")
+    engine = steady.get("engine") if isinstance(steady, dict) else None
+    if not isinstance(engine, dict):
+        raise GateError(f"{report_path} has no steady engine memory reading")
+    if "unavailable" in engine:
+        engine_memory = {"unavailable": engine["unavailable"]}
+    else:
+        measured = engine.get("measured")
+        if not isinstance(measured, dict):
+            raise GateError(f"{report_path} has an invalid steady engine memory reading")
+        cpu_bytes = measured.get("cpu_bytes")
+        gpu_bytes = measured.get("gpu_bytes")
+        if (
+            not isinstance(cpu_bytes, int)
+            or isinstance(cpu_bytes, bool)
+            or not isinstance(gpu_bytes, int)
+            or isinstance(gpu_bytes, bool)
+            or cpu_bytes < 0
+            or gpu_bytes < 0
+        ):
+            raise GateError(f"{report_path} has invalid CPU/GPU engine bytes")
+        engine_memory = {"measured": {"cpu_bytes": cpu_bytes, "gpu_bytes": gpu_bytes}}
+
+    counters = counter_engine_memory(report_path, report)
+    if counters is not None and counters != engine_memory:
+        raise GateError(
+            f"{report_path} has inconsistent memory readings: "
+            f"memory.steady.engine={engine_memory}, counters={counters}"
+        )
+    return engine_memory
 
 
 def measure_side(

@@ -593,7 +593,7 @@ fn effect_members_do_not_duplicate_the_capture() -> Result<(), Box<dyn std::erro
             tx[surface.root()].push(member);
             tx[member]
                 .clip(Rect::new(4.0, 4.0, 20.0, 20.0))
-                .backdrop(group.sample_with(tint.clone()));
+                .backdrop(group.sample_with(tint));
         }
     });
     engine.render(FrameTime::now())?;

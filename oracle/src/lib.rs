@@ -37,6 +37,7 @@ pub mod path;
 pub mod present;
 pub mod render;
 pub mod resources;
+mod sdf;
 pub mod shadow;
 pub mod tone;
 

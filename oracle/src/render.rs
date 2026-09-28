@@ -457,14 +457,37 @@ impl Renderer {
         })?;
         let coverage = self.shape_coverage(clip, FillRule::NonZero, tf, clips);
         if let Some(capture) = backdrops.captures.get(&gid) {
-            for (dst, (&c, &src)) in canvas
-                .pixels
-                .iter_mut()
-                .zip(coverage.iter().zip(&capture.pixels))
-            {
-                if c > 0.0 {
-                    *dst = src_over(*dst, src.map(|v| v * c));
+            // SDF effects need the member clip's analytic box (the GPU
+            // errors the same name for a mask or path clip).
+            let sdf_clip = match &child.backdrop_effect {
+                None | Some(cherenkov_scene::BackdropEffectSpec::ColorMatrix { .. }) => None,
+                Some(_) => Some(
+                    crate::sdf::box_params(clip)
+                        .map(|(shape, extra)| (shape, (tf * extra).inverse()))
+                        .ok_or_else(|| {
+                            RenderError::Backdrop("backdrop-effect-sdf-path".to_string())
+                        })?,
+                ),
+            };
+            let (w, h) = (capture.width, capture.height);
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "pixel indices are far below 2^53"
+            )]
+            for (i, dst) in canvas.pixels.iter_mut().enumerate() {
+                let c = coverage[i];
+                if c == 0.0 {
+                    continue;
                 }
+                let src = sample_backdrop(
+                    child,
+                    &capture.pixels,
+                    w,
+                    h,
+                    [(i % w) as f64 + 0.5, (i / w) as f64 + 0.5],
+                    sdf_clip.as_ref(),
+                );
+                *dst = src_over(*dst, src.map(|v| v * c));
             }
         }
         Ok(())
@@ -707,6 +730,65 @@ impl Renderer {
             }
         }
         Ok(())
+    }
+}
+
+/// The member's backdrop composite at device pixel centre `p`: the
+/// per-member effect's sample of the filtered capture, before coverage and
+/// opacity. `sdf_clip` is the member clip's box shape and device →
+/// box-local inverse, `Some` whenever the effect reads the clip's SDF.
+fn sample_backdrop(
+    layer: &Layer,
+    capture: &[[f64; 4]],
+    width: usize,
+    height: usize,
+    p: [f64; 2],
+    sdf_clip: Option<&(crate::sdf::BoxShape, Affine)>,
+) -> [f64; 4] {
+    use cherenkov_scene::BackdropEffectSpec as E;
+    match &layer.backdrop_effect {
+        None => {
+            // `bilinear` at a texel centre is the texel: keep the exact
+            // pre-effect read.
+            capture[usize::min(p[1] as usize, height - 1) * width
+                + usize::min(p[0] as usize, width - 1)]
+        }
+        Some(E::ColorMatrix { matrix }) => {
+            // 3x4 on the premultiplied sample, filtrate layout: the fourth
+            // column is a bias that scales with alpha; alpha passes through.
+            let c = crate::sdf::bilinear(capture, width, height, p);
+            [
+                matrix[0] * c[0] + matrix[1] * c[1] + matrix[2] * c[2] + matrix[3] * c[3],
+                matrix[4] * c[0] + matrix[5] * c[1] + matrix[6] * c[2] + matrix[7] * c[3],
+                matrix[8] * c[0] + matrix[9] * c[1] + matrix[10] * c[2] + matrix[11] * c[3],
+                c[3],
+            ]
+        }
+        Some(E::Refraction { depth, strength }) => {
+            let (shape, clip_inv) = sdf_clip.expect("SDF effects carry a box clip");
+            let (d, n) = crate::sdf::distance_and_normal(shape, clip_inv, p);
+            let t = (1.0 + d / depth).clamp(0.0, 1.0);
+            let q = [
+                p[0] - n[0] * strength * t * t,
+                p[1] - n[1] * strength * t * t,
+            ];
+            crate::sdf::bilinear(capture, width, height, q)
+        }
+        Some(E::RimLight {
+            width: rim_w,
+            color,
+            gain,
+        }) => {
+            let (shape, clip_inv) = sdf_clip.expect("SDF effects carry a box clip");
+            let (d, _) = crate::sdf::distance_and_normal(shape, clip_inv, p);
+            let t = (1.0 + d / rim_w).clamp(0.0, 1.0);
+            let mut c = crate::sdf::bilinear(capture, width, height, p);
+            let k = color[3] * gain * t * t;
+            c[0] += color[0] * k;
+            c[1] += color[1] * k;
+            c[2] += color[2] * k;
+            c
+        }
     }
 }
 

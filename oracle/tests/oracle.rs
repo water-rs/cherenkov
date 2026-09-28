@@ -694,3 +694,32 @@ fn destructive_layer_blend_is_bounded_by_the_clip() {
         "unclipped clear covers the whole parent"
     );
 }
+
+#[test]
+fn refraction_on_a_path_clip_is_the_named_error() {
+    use cherenkov_scene::{BackdropEffectSpec, BackdropFilter};
+    let mut b = Scene::builder(W, H);
+    b.backdrop_group(1, vec![BackdropFilter::GaussianBlur { sigma: 2.0 }]);
+    b.root().layer(|m| {
+        let mut path = kurbo::BezPath::new();
+        path.move_to((2.0, 2.0));
+        path.line_to((14.0, 2.0));
+        path.line_to((14.0, 14.0));
+        path.close_path();
+        m.clip(Shape::Path { path });
+        m.backdrop(1);
+        m.backdrop_effect(BackdropEffectSpec::Refraction {
+            depth: 4.0,
+            strength: 2.0,
+        });
+    });
+    let scene = b.build();
+    let result = Renderer::new(W as usize, H as usize).render(&scene, &tmp());
+    match result {
+        Err(e) => assert!(
+            e.to_string().contains("backdrop-effect-sdf-path"),
+            "unexpected error {e}"
+        ),
+        Ok(_) => panic!("path clip with an SDF effect must fail"),
+    }
+}

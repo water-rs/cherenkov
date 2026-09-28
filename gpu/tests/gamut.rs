@@ -35,13 +35,17 @@ fn shared_device()
 }
 
 /// The oracle's expected stored byte for one opaque working-space pixel:
-/// P3 -> linear sRGB, the analytic gamut map, encode, round to unorm8.
+/// the headroom tone map in P3 (#97), P3 -> linear sRGB, the analytic
+/// gamut map, encode, round to unorm8.
 #[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     reason = "mapped channels are in [0,1]; the unorm-8 store rounds"
 )]
-fn expected_bytes(p3: [f64; 3]) -> [u8; 4] {
+fn expected_bytes(headroom: f64, p3: [f64; 3]) -> [u8; 4] {
+    // An sRGB destination's ceiling caps the tone-map target at 1, and
+    // the shoulder runs in the working space.
+    let p3 = cherenkov_oracle::tone::tone_map(headroom.min(1.0), p3);
     let srgb: [f64; 3] = P3_TO_LINEAR_SRGB
         .iter()
         .map(|row| row[0].mul_add(p3[0], row[1].mul_add(p3[1], row[2] * p3[2])))
@@ -122,52 +126,66 @@ fn present_gamut_map_matches_oracle() -> Result<(), Box<dyn std::error::Error>> 
         },
         source.size(),
     );
-    let output = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("gamut output"),
-        size: wgpu::Extent3d {
-            width: w,
-            height: h,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8Unorm,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-        view_formats: &[],
-    });
     let delivery = shader_delivery(adapter.get_info().backend, &device)?;
     let mut presenter = Presenter::new(&device, delivery);
-    presenter.texture(
-        &device,
-        &queue,
-        &source.create_view(&wgpu::TextureViewDescriptor::default()),
-        TextureOutput {
-            texture: &output,
-            color: OutputColor::Srgb,
-            alpha: OutputAlpha::Premultiplied,
-        },
-    );
+    // SDR and HDR display headrooms: the >1 pixels take the tone-map
+    // branch at both (#97).
+    let headrooms = [1.0f32, 2.0];
+    let outputs: Vec<wgpu::Texture> = headrooms
+        .iter()
+        .map(|_| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("gamut output"),
+                size: wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            })
+        })
+        .collect();
+    let source_view = source.create_view(&wgpu::TextureViewDescriptor::default());
+    for (output, &headroom) in outputs.iter().zip(&headrooms) {
+        presenter.texture(
+            &device,
+            &queue,
+            &source_view,
+            TextureOutput {
+                texture: output,
+                color: OutputColor::Srgb,
+                alpha: OutputAlpha::Premultiplied,
+                headroom,
+            },
+        );
+    }
     let row = (w * 4).div_ceil(256) * 256;
     let buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("gamut readback"),
-        size: u64::from(row * h),
+        size: u64::from(row * h) * outputs.len() as u64,
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-    encoder.copy_texture_to_buffer(
-        output.as_image_copy(),
-        wgpu::TexelCopyBufferInfo {
-            buffer: &buffer,
-            layout: wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(row),
-                rows_per_image: Some(h),
+    for (j, output) in outputs.iter().enumerate() {
+        encoder.copy_texture_to_buffer(
+            output.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: j as u64 * u64::from(row * h),
+                    bytes_per_row: Some(row),
+                    rows_per_image: Some(h),
+                },
             },
-        },
-        output.size(),
-    );
+            output.size(),
+        );
+    }
     let submission = queue.submit([encoder.finish()]);
     let (send, receive) = std::sync::mpsc::channel();
     buffer
@@ -181,18 +199,23 @@ fn present_gamut_map_matches_oracle() -> Result<(), Box<dyn std::error::Error>> 
     })?;
     receive.recv()??;
     let bytes = buffer.slice(..).get_mapped_range();
-    for (i, p) in pixels.iter().enumerate() {
-        let got = &bytes[i * 4..i * 4 + 4];
-        let want = expected_bytes(
-            <[f64; 3]>::try_from(p[..3].iter().map(|&c| f64::from(c)).collect::<Vec<_>>()).unwrap(),
-        );
-        for (g, w) in got.iter().zip(want) {
-            // f32 shader vs f64 oracle: same algorithm, ±2 LSB of unorm-8
-            // for rounding at step boundaries.
-            assert!(
-                g.abs_diff(w) <= 2,
-                "pixel {i} {p:?}: shader {got:?} vs oracle {want:?}"
+    for (j, &headroom) in headrooms.iter().enumerate() {
+        let base = j * usize::try_from(row * h)?;
+        for (i, p) in pixels.iter().enumerate() {
+            let got = &bytes[base + i * 4..base + i * 4 + 4];
+            let want = expected_bytes(
+                f64::from(headroom),
+                <[f64; 3]>::try_from(p[..3].iter().map(|&c| f64::from(c)).collect::<Vec<_>>())
+                    .unwrap(),
             );
+            for (g, w) in got.iter().zip(want) {
+                // f32 shader vs f64 oracle: same algorithm, ±2 LSB of
+                // unorm-8 for rounding at step boundaries.
+                assert!(
+                    g.abs_diff(w) <= 2,
+                    "headroom {headroom} pixel {i} {p:?}: shader {got:?} vs oracle {want:?}"
+                );
+            }
         }
     }
     Ok(())

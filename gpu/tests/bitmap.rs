@@ -158,7 +158,7 @@ fn image_source(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "one helper checks equivalence across font, strike, size, and transform"
+    reason = "one helper checks equivalence across font, strike, size, and transforms"
 )]
 fn equivalent(
     engine: &Engine<Gpu>,
@@ -168,6 +168,7 @@ fn equivalent(
     gid: u32,
     ppem: f32,
     size: f32,
+    ambient: Affine,
     glyph_transform: Option<Affine>,
 ) {
     let (image_data, rect) = image_source(bytes, format, gid, ppem, size);
@@ -183,13 +184,17 @@ fn equivalent(
         .expect("reference surface");
     actual.update(|tx| {
         tx[actual.root()].content(actual.record(|c| {
-            c.glyphs(run.clone(), WorkingColor::new([1.0, 0.0, 0.0, 1.0]));
+            c.transform(ambient, |c| {
+                c.glyphs(run.clone(), WorkingColor::new([1.0, 0.0, 0.0, 1.0]));
+            });
         }));
     });
     reference.update(|tx| {
         tx[reference.root()].content(reference.record(|c| {
-            c.transform(placement, |c| {
-                c.image(image.id(), rect, Sampling::Linear);
+            c.transform(ambient, |c| {
+                c.transform(placement, |c| {
+                    c.image(image.id(), rect, Sampling::Linear);
+                });
             });
         }));
     });
@@ -209,6 +214,10 @@ fn equivalent(
     );
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "covers ambient and per-glyph bitmap transform cases"
+)]
 #[test]
 fn cbdt_and_sbix_glyphs_match_image_draws() {
     let Some(engine) = engine() else {
@@ -219,6 +228,9 @@ fn cbdt_and_sbix_glyphs_match_image_draws() {
     let cbdt_font = engine
         .font(FontSource::bytes(cbdt.clone()))
         .expect("register CBDT font");
+    let ambient_cbdt = Affine::translate((24.0, 12.0))
+        * Affine::rotate(0.22)
+        * Affine::scale_non_uniform(1.2, 0.9);
     equivalent(
         &engine,
         &cbdt_font,
@@ -227,6 +239,18 @@ fn cbdt_and_sbix_glyphs_match_image_draws() {
         cbdt_id,
         109.0,
         48.0,
+        Affine::IDENTITY,
+        None,
+    );
+    equivalent(
+        &engine,
+        &cbdt_font,
+        &cbdt,
+        BitmapFormat::Cbdt,
+        cbdt_id,
+        109.0,
+        48.0,
+        ambient_cbdt,
         None,
     );
     let transformed =
@@ -239,6 +263,7 @@ fn cbdt_and_sbix_glyphs_match_image_draws() {
         cbdt_id,
         109.0,
         48.0,
+        Affine::IDENTITY,
         Some(transformed),
     );
 
@@ -255,6 +280,7 @@ fn cbdt_and_sbix_glyphs_match_image_draws() {
         sbix_id,
         32.0,
         20.0,
+        Affine::IDENTITY,
         None,
     );
     equivalent(
@@ -264,7 +290,8 @@ fn cbdt_and_sbix_glyphs_match_image_draws() {
         BitmapFormat::Sbix,
         sbix_id,
         96.0,
-        40.0,
+        48.0,
+        Affine::IDENTITY,
         None,
     );
     equivalent(
@@ -275,6 +302,18 @@ fn cbdt_and_sbix_glyphs_match_image_draws() {
         sbix_id,
         96.0,
         20.0,
+        Affine::scale(2.0),
+        None,
+    );
+    equivalent(
+        &engine,
+        &sbix_font,
+        &sbix,
+        BitmapFormat::Sbix,
+        sbix_id,
+        96.0,
+        20.0,
+        Affine::IDENTITY,
         Some(Affine::scale(2.0)),
     );
     equivalent(
@@ -285,7 +324,19 @@ fn cbdt_and_sbix_glyphs_match_image_draws() {
         sbix_id,
         96.0,
         48.0,
+        Affine::IDENTITY,
         Some(transformed),
+    );
+    equivalent(
+        &engine,
+        &sbix_font,
+        &sbix,
+        BitmapFormat::Sbix,
+        sbix_id,
+        96.0,
+        20.0,
+        Affine::scale(1.5),
+        Some(Affine::scale_non_uniform(1.2, 0.9)),
     );
 }
 
@@ -326,6 +377,60 @@ fn bitmap_cache_reuses_transformed_glyphs_and_uses_font_identity() {
     let mut changed = glyph_run(first_font.id(), large, 48.0);
     changed.glyphs[0].x = 100.0;
     changed.glyphs[0].transform = Some(transform);
+    first.set(changed);
+    engine.render(FrameTime::now()).expect("dirty glyph");
+    assert_eq!(engine.stats().glyphs_rasterized, 1);
+
+    let only_second = surface.record(|c| {
+        c.glyphs(second.clone(), WorkingColor::WHITE);
+    });
+    surface.update(|tx| {
+        tx[surface.root()].content(only_second);
+    });
+    drop(first_font);
+    engine.render(FrameTime::now()).expect("font removal");
+    assert_eq!(engine.stats().glyphs_rasterized, 0);
+    assert!(
+        surface
+            .readback()
+            .expect("readback")
+            .pixels
+            .iter()
+            .any(|pixel| pixel[3] > 0.0)
+    );
+}
+
+#[test]
+fn bitmap_cache_reuses_unchanged_glyphs_and_uses_font_identity() {
+    let Some(engine) = engine() else {
+        return;
+    };
+    let bytes = std::fs::read(CBDT_PATH).expect("CBDT fixture");
+    let small = glyph_id(&bytes, '☕');
+    let large = glyph_id(&bytes, '😀');
+    let first_font = engine
+        .font(FontSource::bytes(bytes.clone()))
+        .expect("first font");
+    let second_font = engine.font(FontSource::bytes(bytes)).expect("second font");
+    let first = nami::Binding::container(glyph_run(first_font.id(), small, 48.0));
+    let second = nami::Binding::container(glyph_run(second_font.id(), small, 48.0));
+    let surface = engine
+        .surface(Offscreen::new((240, 160), OffscreenFormat::LinearF16))
+        .expect("surface");
+    let content = surface.record(|c| {
+        c.glyphs(first.clone(), WorkingColor::WHITE);
+        c.glyphs(second.clone(), WorkingColor::WHITE);
+    });
+    surface.update(|tx| {
+        tx[surface.root()].content(content);
+    });
+    engine.render(FrameTime::now()).expect("initial frame");
+    assert_eq!(engine.stats().glyphs_rasterized, 2);
+    engine.render(FrameTime::now()).expect("identical frame");
+    assert_eq!(engine.stats().glyphs_rasterized, 0);
+
+    let mut changed = glyph_run(first_font.id(), large, 48.0);
+    changed.glyphs[0].x = 100.0;
     first.set(changed);
     engine.render(FrameTime::now()).expect("dirty glyph");
     assert_eq!(engine.stats().glyphs_rasterized, 1);

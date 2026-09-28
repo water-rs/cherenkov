@@ -1249,10 +1249,6 @@ impl Lowerer<'_> {
         });
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "COLR and bitmap glyph handling share run ordering and flush logic"
-    )]
     fn color_glyph_run(
         &mut self,
         ambient: Affine,
@@ -1314,12 +1310,8 @@ impl Lowerer<'_> {
             }
             if font.bitmap.is_some() {
                 let (local, origin) = match super::glyph::classify(glyph)? {
-                    super::glyph::GlyphPlacement::Translate(glyph) => {
-                        (ambient, [glyph.x, glyph.y])
-                    }
-                    super::glyph::GlyphPlacement::Outline(place) => {
-                        (ambient * place, [0.0, 0.0])
-                    }
+                    super::glyph::GlyphPlacement::Translate(glyph) => (ambient, [glyph.x, glyph.y]),
+                    super::glyph::GlyphPlacement::Outline(place) => (ambient * place, [0.0, 0.0]),
                 };
                 ops.push(Op::BitmapGlyph {
                     local,

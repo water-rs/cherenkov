@@ -1412,7 +1412,7 @@ impl<'a> Lowering<'a> {
         if region[2] == 0 || region[3] == 0 {
             return Ok(());
         }
-        let Some(&bounds) = plan.members.get(&member) else {
+        let Some(&member_bounds) = plan.members.get(&member) else {
             return Ok(());
         };
         let (rx, ry, rw, rh) = (
@@ -1421,7 +1421,7 @@ impl<'a> Lowering<'a> {
             region[2] as f32,
             region[3] as f32,
         );
-        let bounds = bounds.intersect(Rect::new(
+        let bounds = member_bounds.intersect(Rect::new(
             f64::from(region[0]),
             f64::from(region[1]),
             f64::from(region[0] + region[2]),
@@ -1457,7 +1457,14 @@ impl<'a> Lowering<'a> {
             inst.meta[1] = super::instance::PAINT_BACKDROP;
             inst.meta[2] = first;
             inst.meta[3] |= kind | (count << 8);
-            inst.grad2 = [rw, rh, f32_f64(bounds.width()), f32_f64(bounds.height())];
+            // `grad2.zw` is the member's device size for effect shaders:
+            // the unclipped bounds, not the visible intersection.
+            inst.grad2 = [
+                rw,
+                rh,
+                f32_f64(member_bounds.width()),
+                f32_f64(member_bounds.height()),
+            ];
             if let cherenkov::BackdropEffect::Shader(s) = effect {
                 pipeline = PipelineKind::Effect(s.shader.raw());
             }

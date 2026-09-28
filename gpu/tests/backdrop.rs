@@ -498,6 +498,39 @@ fn shader_effect_lights_the_rim() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn shader_effect_size_is_the_unclipped_member_size() -> Result<(), Box<dyn std::error::Error>> {
+    let engine = Engine::<Gpu>::new(GpuConfig::default())?;
+    let shader = engine.backdrop_shader(cherenkov::BackdropShaderSource::wgsl(
+        "fn backdrop_effect(p: vec2<f32>, sdf: f32, normal: vec2<f32>, size: vec2<f32>, params: array<vec4<f32>, 16>) -> vec4<f32> {
+            return vec4<f32>(size.x / 256.0, size.y / 256.0, 0.0, 1.0);
+        }",
+    ))?;
+    let surface = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
+    let group = surface.backdrop_group_unfiltered();
+    let member = surface.layer();
+    surface.update(|tx| {
+        tx[surface.root()].content(surface.record(|r| {
+            r.fill(
+                Rect::new(0.0, 0.0, 64.0, 64.0),
+                WorkingColor::new([1.0, 0.0, 0.0, 1.0]),
+            );
+        }));
+        tx[surface.root()].push(&member);
+        // The member clip runs 32 px off the left of the surface: its
+        // device bounds are 64x16, only half of it visible.
+        tx[&member]
+            .clip(Rect::new(-32.0, 0.0, 32.0, 16.0))
+            .backdrop(group.sample_with(shader.effect(Vec::new())));
+    });
+    engine.render(FrameTime::now())?;
+    let readback = surface.readback()?;
+    // `size` reports the member's 64x16 device bounds, not the 32x16
+    // intersection with the capture region.
+    assert_pixel(pixel(&readback, 8, 8), [0.25, 0.0625, 0.0, 1.0], 1e-3);
+    Ok(())
+}
+
+#[test]
 fn invalid_backdrop_shader_source_is_a_shader_error() {
     let engine = Engine::<Gpu>::new(GpuConfig::default()).expect("engine");
     let result = engine.backdrop_shader(cherenkov::BackdropShaderSource::wgsl(

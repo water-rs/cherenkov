@@ -537,6 +537,9 @@ pub struct Lowering<'a> {
     width: f32,
     height: f32,
     transform: Affine,
+    /// Whether an enclosing layer's transform or scroll track is running;
+    /// content then snaps its translation to the ¼-pixel grid.
+    animating: bool,
     // The margin depends only on the transform's linear coefficients. Keep
     // their exact bits so signed zero and non-finite inputs retain semantics.
     margin: Option<([u64; 4], f64)>,
@@ -570,6 +573,7 @@ impl<'a> Lowering<'a> {
             width: size.0 as f32,
             height: size.1 as f32,
             transform: Affine::IDENTITY,
+            animating: false,
             margin: None,
             clip: None,
             mask_key: None,
@@ -1241,8 +1245,14 @@ impl<'a> Lowering<'a> {
             return Err(RenderError::Unsupported(names::BACKDROP));
         }
         let saved = self.transform;
+        let saved_animating = self.animating;
+        self.animating |= node.animating();
         self.transform = saved * node.transform;
-        let content_space = saved * node.content_transform();
+        let mut content_space = saved * node.content_transform();
+        if self.animating {
+            self.transform = cherenkov::snap_animating(self.transform);
+            content_space = cherenkov::snap_animating(content_space);
+        }
         let result = self.with_clip(
             node.clip.as_ref(),
             |s, glyphs| {
@@ -1269,6 +1279,7 @@ impl<'a> Lowering<'a> {
             glyphs,
         );
         self.transform = saved;
+        self.animating = saved_animating;
         result
     }
 

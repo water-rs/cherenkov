@@ -13,6 +13,7 @@ Sections marked **Proposal** are not yet agreed; everything else records a decis
 - **Invisible optimizations are verified invisible.** Layer caching and damage tracking must produce bit-identical output when disabled. This is exact by construction, not by tolerance:
   - Canonical f16 rounding and materialization points are part of the semantics, so a cached and an uncached render round at the same places.
   - Scroll offsets and integer layer translations snap to device pixels as part of the semantics.
+  - While a layer's transform, component or scroll track is animating, its content's device translation is placed on the ¼-device-pixel grid (round to nearest), so a cached coverage emission is reused across the animation instead of re-rasterizing every frame. The frame a track settles — and every static frame — is placed exactly.
   - Content under a fractional transform is re-rasterized rather than resampled from a cache. Promotion to system-compositor planes is compared against in-engine composition with a perceptual tolerance.
 - **No runtime fallback.** A backend is chosen deliberately, at build time or once at process start by capability. A failure is an error.
 
@@ -111,7 +112,9 @@ pub trait Renderer: 'static {
   impl LayerNode { /// `transform * translate(-scroll_offset)`: the space of the content and children.
                    pub fn content_transform(&self) -> Affine;
                    /// Whether child layers or content groups blend onto this layer.
-                   pub fn blends_within(&self) -> bool; }
+                   pub fn blends_within(&self) -> bool;
+                   /// A transform, component or scroll track is running this frame.
+                   pub fn animating(&self) -> bool; }
   ```
 
   The clip applies in the layer's own space (`transform`); content and children are drawn in `content_transform()`, so scrolling moves them inside the clip and never re-records anything. `changed` is true when a property op, a content op or an animation step touched the surface since the last render; the backend renders exactly those surfaces.

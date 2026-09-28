@@ -151,6 +151,9 @@ pub struct Lowering<'a> {
     width: usize,
     height: usize,
     transform: Affine,
+    /// Whether an enclosing layer's transform or scroll track is running;
+    /// content then snaps its translation to the ¼-pixel grid.
+    animating: bool,
     clip: Option<ClipRef>,
     /// Source commands resolved this frame.
     pub commands_lowered: u32,
@@ -304,6 +307,7 @@ impl<'a> Lowering<'a> {
             width: size.0 as usize,
             height: size.1 as usize,
             transform: Affine::IDENTITY,
+            animating: false,
             clip: None,
             commands_lowered: 0,
             layers_composed: 0,
@@ -443,8 +447,14 @@ impl<'a> Lowering<'a> {
             return Err(RenderError::Unsupported(names::BACKDROP));
         }
         let saved = self.transform;
+        let saved_animating = self.animating;
+        self.animating |= node.animating();
         self.transform = saved * node.transform;
-        let content_space = saved * node.content_transform();
+        let mut content_space = saved * node.content_transform();
+        if self.animating {
+            self.transform = cherenkov::snap_animating(self.transform);
+            content_space = cherenkov::snap_animating(content_space);
+        }
         let result = self.with_clip(node.clip.as_ref(), |s| {
             s.transform = content_space;
             if node.opacity < 1.0
@@ -465,6 +475,7 @@ impl<'a> Lowering<'a> {
             }
         });
         self.transform = saved;
+        self.animating = saved_animating;
         result
     }
 

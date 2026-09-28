@@ -714,3 +714,30 @@ fn an_animating_layer_places_paths_on_the_quarter_pixel_grid()
     assert!((r - 0.8).abs() < 0.03, "settled edge: {r}");
     Ok(())
 }
+
+#[test]
+fn overlapping_fills_cover_their_union_not_their_winding() -> Result<(), Box<dyn std::error::Error>>
+{
+    // Two squares [0,2.5]² and [0.5,3]² in one non-zero fill. Pixel
+    // (2,0) is half-covered by each square with a 0.25 overlap: union
+    // coverage 0.75, not the accumulator's clamped 1.0.
+    let Some(readback) = render(|c| {
+        let mut path = BezPath::new();
+        for (x0, y0, x1, y1) in [(0.0, 0.0, 2.5, 2.5), (0.5, 0.5, 3.0, 3.0)] {
+            path.move_to((x0, y0));
+            path.line_to((x1, y0));
+            path.line_to((x1, y1));
+            path.line_to((x0, y1));
+            path.close_path();
+        }
+        c.fill(path, RED);
+    })?
+    else {
+        return Ok(());
+    };
+    let [r, ..] = px(&readback, 2, 0);
+    assert!((r - 0.75).abs() < 0.01, "union coverage: {r}");
+    let [r, ..] = px(&readback, 2, 2);
+    assert!(r > 0.99, "interior: {r}");
+    Ok(())
+}

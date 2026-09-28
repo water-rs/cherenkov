@@ -256,6 +256,23 @@ fn flatten_edges(path: BezPath, tol: f64) -> Vec<Edge> {
     edges
 }
 
+/// Resolves overlapping windings: `Some` swaps in boundary edges whose
+/// winding is 0 or 1 everywhere, drawn under `NonZero`. `None` keeps the
+/// original edges and rule untouched.
+fn resolve_edges(edges: Vec<Edge>, rule: FillRule) -> (Vec<Edge>, FillRule) {
+    let segments: Vec<(f32, f32, f32, f32)> =
+        edges.iter().map(|e| (e.x0, e.y0, e.x1, e.y1)).collect();
+    super::winding::resolve(&segments, rule).map_or((edges, rule), |resolved| {
+        (
+            resolved
+                .into_iter()
+                .map(|(x0, y0, x1, y1)| Edge { x0, y0, x1, y1 })
+                .collect(),
+            FillRule::NonZero,
+        )
+    })
+}
+
 /// The bounding box of `edges` as an integer rect intersected with the
 /// surface.
 #[expect(
@@ -399,6 +416,7 @@ impl<'a> Lowering<'a> {
         let tol_u = FLATTEN_TOL / sm;
         let (path, rule) = shape_path(shape, tol_u)?;
         let edges = flatten_edges(self.transform * path, FLATTEN_TOL);
+        let (edges, rule) = resolve_edges(edges, rule);
         let mut mask = coverage_mask(&edges, rule, w, h);
         if let Some(current) = &self.clip {
             for (i, m) in mask.iter_mut().enumerate() {
@@ -677,6 +695,7 @@ impl<'a> Lowering<'a> {
             return;
         };
         let edges = flatten_edges(self.transform * path, FLATTEN_TOL);
+        let (edges, rule) = resolve_edges(edges, rule);
         if edges.is_empty() {
             return;
         }
@@ -715,6 +734,7 @@ impl<'a> Lowering<'a> {
         };
         let outline = kurbo::stroke(path, stroke, &kurbo::StrokeOpts::default(), tol_u);
         let edges = flatten_edges(self.transform * outline, FLATTEN_TOL);
+        let (edges, _) = resolve_edges(edges, FillRule::NonZero);
         if edges.is_empty() {
             return;
         }

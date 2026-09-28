@@ -90,7 +90,7 @@ fn a_path_fill_renders() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-fn a_path_shadow_reports_unsupported() -> Result<(), Box<dyn std::error::Error>> {
+fn a_path_shadow_renders() -> Result<(), Box<dyn std::error::Error>> {
     let Some(engine) = engine() else {
         return Ok(());
     };
@@ -107,11 +107,12 @@ fn a_path_shadow_reports_unsupported() -> Result<(), Box<dyn std::error::Error>>
             );
         }));
     });
-    let result = engine.render(cherenkov::FrameTime::now());
-    assert!(
-        matches!(result, Err(RenderError::Unsupported("path"))),
-        "expected Unsupported(Path), got {result:?}"
-    );
+    engine.render(cherenkov::FrameTime::now())?;
+    let readback = surface.readback()?;
+    let [_, _, _, interior] = readback.pixels[(30 * readback.width + 30) as usize];
+    let [_, _, _, corner] = readback.pixels[(63 * readback.width + 63) as usize];
+    assert!(interior > 0.5, "interior alpha: {interior}");
+    assert!(corner < 0.01, "far corner alpha: {corner}");
     Ok(())
 }
 

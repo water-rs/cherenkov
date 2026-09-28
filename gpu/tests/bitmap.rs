@@ -140,10 +140,10 @@ fn image_source(
         Origin::BottomLeft => (-y - height, -y),
     };
     let rect = Rect::new(
-        f64::from(size).mul_add(x0, 24.0),
-        f64::from(size).mul_add(y0, 112.0),
-        f64::from(size).mul_add(x0 + width, 24.0),
-        f64::from(size).mul_add(y1, 112.0),
+        f64::from(size) * x0,
+        f64::from(size) * y0,
+        f64::from(size) * (x0 + width),
+        f64::from(size) * y1,
     );
     (
         ImageData::<Rgba8>::new(glyph.width, glyph.height, rgba)
@@ -165,11 +165,13 @@ fn equivalent(
     gid: u32,
     ppem: f32,
     size: f32,
-    transform: Affine,
+    glyph_transform: Option<Affine>,
 ) {
     let (image_data, rect) = image_source(bytes, format, gid, ppem, size);
     let image = engine.image(image_data).expect("reference image");
-    let run = glyph_run(font.id(), gid, size);
+    let mut run = glyph_run(font.id(), gid, size);
+    run.glyphs[0].transform = glyph_transform;
+    let placement = Affine::translate((24.0, 112.0)) * glyph_transform.unwrap_or(Affine::IDENTITY);
     let actual = engine
         .surface(Offscreen::new((320, 220), OffscreenFormat::LinearF16))
         .expect("actual surface");
@@ -178,14 +180,12 @@ fn equivalent(
         .expect("reference surface");
     actual.update(|tx| {
         tx[actual.root()].content(actual.record(|c| {
-            c.transform(transform, |c| {
-                c.glyphs(run.clone(), WorkingColor::new([1.0, 0.0, 0.0, 1.0]));
-            });
+            c.glyphs(run.clone(), WorkingColor::new([1.0, 0.0, 0.0, 1.0]));
         }));
     });
     reference.update(|tx| {
         tx[reference.root()].content(reference.record(|c| {
-            c.transform(transform, |c| {
+            c.transform(placement, |c| {
                 c.image(image.id(), rect, Sampling::Linear);
             });
         }));
@@ -224,8 +224,10 @@ fn cbdt_and_sbix_glyphs_match_image_draws() {
         cbdt_id,
         109.0,
         48.0,
-        Affine::IDENTITY,
+        None,
     );
+    let transformed =
+        Affine::rotate(0.22) * Affine::skew(0.18, -0.12) * Affine::scale_non_uniform(1.2, 0.9);
     equivalent(
         &engine,
         &cbdt_font,
@@ -234,9 +236,7 @@ fn cbdt_and_sbix_glyphs_match_image_draws() {
         cbdt_id,
         109.0,
         48.0,
-        Affine::translate((24.0, 12.0))
-            * Affine::rotate(0.22)
-            * Affine::scale_non_uniform(1.2, 0.9),
+        Some(transformed),
     );
 
     let sbix = std::fs::read(SBIX_PATH).expect("sbix fixture");
@@ -252,7 +252,7 @@ fn cbdt_and_sbix_glyphs_match_image_draws() {
         sbix_id,
         32.0,
         20.0,
-        Affine::IDENTITY,
+        None,
     );
     equivalent(
         &engine,
@@ -261,8 +261,8 @@ fn cbdt_and_sbix_glyphs_match_image_draws() {
         BitmapFormat::Sbix,
         sbix_id,
         96.0,
-        48.0,
-        Affine::IDENTITY,
+        40.0,
+        None,
     );
     equivalent(
         &engine,
@@ -272,12 +272,22 @@ fn cbdt_and_sbix_glyphs_match_image_draws() {
         sbix_id,
         96.0,
         20.0,
-        Affine::scale(2.0),
+        Some(Affine::scale(2.0)),
+    );
+    equivalent(
+        &engine,
+        &sbix_font,
+        &sbix,
+        BitmapFormat::Sbix,
+        sbix_id,
+        96.0,
+        48.0,
+        Some(transformed),
     );
 }
 
 #[test]
-fn bitmap_cache_reuses_unchanged_glyphs_and_uses_font_identity() {
+fn bitmap_cache_reuses_transformed_glyphs_and_uses_font_identity() {
     let Some(engine) = engine() else {
         return;
     };
@@ -288,8 +298,13 @@ fn bitmap_cache_reuses_unchanged_glyphs_and_uses_font_identity() {
         .font(FontSource::bytes(bytes.clone()))
         .expect("first font");
     let second_font = engine.font(FontSource::bytes(bytes)).expect("second font");
-    let first = nami::Binding::container(glyph_run(first_font.id(), small, 48.0));
-    let second = nami::Binding::container(glyph_run(second_font.id(), small, 48.0));
+    let transform = Affine::rotate(0.2) * Affine::scale_non_uniform(1.2, 0.8);
+    let mut first_run = glyph_run(first_font.id(), small, 48.0);
+    first_run.glyphs[0].transform = Some(transform);
+    let mut second_run = glyph_run(second_font.id(), small, 48.0);
+    second_run.glyphs[0].transform = Some(transform);
+    let first = nami::Binding::container(first_run);
+    let second = nami::Binding::container(second_run);
     let surface = engine
         .surface(Offscreen::new((240, 160), OffscreenFormat::LinearF16))
         .expect("surface");
@@ -307,6 +322,7 @@ fn bitmap_cache_reuses_unchanged_glyphs_and_uses_font_identity() {
 
     let mut changed = glyph_run(first_font.id(), large, 48.0);
     changed.glyphs[0].x = 100.0;
+    changed.glyphs[0].transform = Some(transform);
     first.set(changed);
     engine.render(FrameTime::now()).expect("dirty glyph");
     assert_eq!(engine.stats().glyphs_rasterized, 1);
@@ -331,7 +347,7 @@ fn bitmap_cache_reuses_unchanged_glyphs_and_uses_font_identity() {
 }
 
 #[test]
-fn missing_notdef_is_empty_and_bitmap_transforms_or_strokes_are_unsupported() {
+fn missing_notdef_is_empty_and_bitmap_transforms_validate_and_strokes_are_unsupported() {
     let Some(engine) = engine() else {
         return;
     };
@@ -362,7 +378,7 @@ fn missing_notdef_is_empty_and_bitmap_transforms_or_strokes_are_unsupported() {
     );
 
     missing.glyphs[0].id = glyph_id(&std::fs::read(CBDT_PATH).expect("CBDT fixture"), '😀');
-    missing.glyphs[0].transform = Some(Affine::rotate(0.2));
+    missing.glyphs[0].transform = Some(Affine::scale_non_uniform(0.0, 1.0));
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|c| {
             c.glyphs(missing.clone(), WorkingColor::WHITE);
@@ -370,10 +386,11 @@ fn missing_notdef_is_empty_and_bitmap_transforms_or_strokes_are_unsupported() {
     });
     assert!(matches!(
         engine.render(FrameTime::now()),
-        Err(cherenkov::RenderError::Unsupported("glyph-transform"))
+        Err(cherenkov::RenderError::Render(message))
+            if message == "glyph transform must be finite and invertible"
     ));
 
-    missing.glyphs[0].transform = None;
+    missing.glyphs[0].transform = Some(Affine::rotate(0.2));
     missing.style = GlyphStyle::Stroke(cherenkov::kurbo::Stroke::new(1.0));
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|c| {

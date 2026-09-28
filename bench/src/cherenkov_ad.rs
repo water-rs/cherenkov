@@ -421,8 +421,8 @@ struct PrepLayer {
 
 /// An engine layer plus the ops it records each frame.
 struct ContentLayer {
-    /// The layer handle.
-    layer: GpuLayer,
+    /// The layer handle; `None` for the surface root.
+    layer: Option<GpuLayer>,
     /// Its recorded ops.
     ops: Vec<Op>,
     /// Command count of the last recording, re-used as the next one's
@@ -432,6 +432,13 @@ struct ContentLayer {
     live: Vec<LiveRun>,
     /// The layer's one-time motion, committed on the first encode.
     motion: Option<LayerMotion>,
+}
+
+impl ContentLayer {
+    /// The engine layer handle, resolving `None` to the surface root.
+    fn handle<'a>(&'a self, surface: &'a Surface<Gpu>) -> &'a GpuLayer {
+        self.layer.as_ref().unwrap_or_else(|| surface.root())
+    }
 }
 
 /// `cherenkov-gpu` adapter.
@@ -1296,7 +1303,9 @@ fn live_run(
 }
 
 /// Builds one engine layer for `prep` under `parent`, recursing into
-/// children in item order.
+/// children in item order. The scene root maps onto the surface root, as
+/// in the oracle, so a blended child of the scene root composites against
+/// the surface clear colour; nested layers get their own engine layer.
 #[expect(
     clippy::cast_possible_truncation,
     reason = "layer opacity is f32 at the engine boundary"
@@ -1304,13 +1313,14 @@ fn live_run(
 fn build_layer(
     surface: &Surface<Gpu>,
     tx: &mut Transaction<'_, Gpu>,
-    parent: &GpuLayer,
+    parent: Option<&GpuLayer>,
     prep: PrepLayer,
     content_layers: &mut Vec<ContentLayer>,
 ) {
-    let layer = surface.layer();
+    let owned = parent.map(|_| surface.layer());
+    let layer = owned.as_ref().unwrap_or_else(|| surface.root());
     {
-        let edit = &mut tx[&layer];
+        let edit = &mut tx[layer];
         edit.transform(prep.transform);
         edit.scroll_offset(prep.scroll_offset);
         edit.opacity(prep.opacity as f32);
@@ -1319,25 +1329,27 @@ fn build_layer(
             clip_shape(edit, clip);
         }
     }
-    tx[parent].push(&layer);
+    if let Some(parent) = parent {
+        tx[parent].push(layer);
+    }
     for item in prep.items {
         match item {
             PrepItem::Content(run) => {
                 let child = surface.layer();
-                tx[&layer].push(&child);
+                tx[layer].push(&child);
                 content_layers.push(ContentLayer {
-                    layer: child,
+                    layer: Some(child),
                     ops: run.ops,
                     live: run.live,
                     last_len: 0,
                     motion: None,
                 });
             }
-            PrepItem::Layer(p) => build_layer(surface, tx, &layer, *p, content_layers),
+            PrepItem::Layer(p) => build_layer(surface, tx, Some(layer), *p, content_layers),
         }
     }
     content_layers.push(ContentLayer {
-        layer,
+        layer: owned,
         ops: prep.own.ops,
         live: prep.own.live,
         last_len: 0,
@@ -1484,8 +1496,7 @@ impl Engine for Cherenkov {
         self.content_layers.clear();
         let mut content_layers = Vec::new();
         surface.update(|tx| {
-            let root = surface.root();
-            build_layer(&surface, tx, root, prep, &mut content_layers);
+            build_layer(&surface, tx, None, prep, &mut content_layers);
         });
         self.has_motion = content_layers.iter().any(|c| c.motion.is_some());
         self.motion_committed = false;
@@ -1507,7 +1518,7 @@ impl Engine for Cherenkov {
         if self.has_motion && first_frame {
             for cl in &self.content_layers {
                 if let Some(motion) = &cl.motion {
-                    motion.apply(surface, &cl.layer);
+                    motion.apply(surface, cl.handle(surface));
                 }
             }
             self.motion_committed = true;
@@ -1536,7 +1547,7 @@ impl Engine for Cherenkov {
                 for (i, content) in contents {
                     let cl = &mut self.content_layers[i];
                     cl.last_len = content.len();
-                    tx[&cl.layer].content(content);
+                    tx[cl.handle(surface)].content(content);
                 }
             });
         } else {

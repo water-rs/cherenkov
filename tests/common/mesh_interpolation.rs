@@ -27,6 +27,13 @@ fn mesh(mode: MeshColorInterpolation) -> MeshGradient {
     .interpolation(mode)
 }
 
+/// The distance between adjacent binary16 values at a normal, positive
+/// `value`: the resolution of the `LinearF16` target. A conforming device may
+/// round the shader's result to either neighbour of an exact value.
+const fn f16_spacing(value: f32) -> f32 {
+    f32::from_bits((value.to_bits() & 0x7f80_0000) - (10 << 23))
+}
+
 /// Changing only the weight rule patches exactly its recorded command.
 pub fn interpolation<B: Backend>(config: B::Config) {
     let engine = Engine::<B>::new(config).expect("backend");
@@ -54,7 +61,10 @@ pub fn interpolation<B: Backend>(config: B::Config) {
         assert_eq!(engine.stats().commands_lowered, 1);
         let pixels = surface.readback().expect("pixels").pixels;
         for c in &pixels[8 * 24 + 4][..3] {
-            assert!((c - expected).abs() < 0.0001, "{mode:?}: {c} != {expected}");
+            assert!(
+                (c - expected).abs() <= f16_spacing(expected),
+                "{mode:?}: {c} != {expected}"
+            );
         }
         assert!(
             (pixels[8 * 24 + 22][0] - 1.).abs() < 0.0001,

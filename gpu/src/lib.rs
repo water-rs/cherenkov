@@ -31,7 +31,7 @@ mod render;
 
 use std::path::PathBuf;
 
-use cherenkov::{Backend, EngineError, Offscreen, Rgba8, Uploads};
+use cherenkov::{Backend, EngineError, Offscreen, Rgba8, Rgba16F, Uploads};
 
 /// Adapter information for provenance.
 #[derive(Clone, Debug)]
@@ -245,6 +245,7 @@ impl Backend for Gpu {
 }
 
 impl Uploads<Rgba8> for Gpu {}
+impl Uploads<Rgba16F> for Gpu {}
 
 impl cherenkov::GpuContent for Gpu {
     type Content = interop::GpuContentBox;

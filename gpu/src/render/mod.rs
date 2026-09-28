@@ -1493,14 +1493,7 @@ impl Renderer for GpuRenderer {
     }
 
     fn add_image(&mut self, id: ImageId, image: ImageUpload) -> Result<(), ResourceError> {
-        if image.format != cherenkov::ImageFormat::Rgba8 {
-            return Err(ResourceError::Image(format!(
-                "unsupported image format {:?}",
-                image.format
-            )));
-        }
         let (width, height) = (image.width, image.height);
-        let pixels: &[u8] = &image.data;
         let (texture, view) = create_target(
             &self.device,
             "image",
@@ -1508,60 +1501,7 @@ impl Renderer for GpuRenderer {
             wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             TARGET_FORMAT,
         );
-        let mut data = Vec::with_capacity(pixels.len() * 2);
-        for px in pixels.as_chunks::<4>().0 {
-            let a = f64::from(px[3]) / 255.0;
-            // Straight-alpha input decodes each channel; premultiplied
-            // input is un-premultiplied in the encoded domain first.
-            let decode = |v: u8| {
-                if image.premultiplied && a > 0.0 {
-                    ((f64::from(v) / 255.0) / a).min(1.0)
-                } else {
-                    f64::from(v) / 255.0
-                }
-            };
-            let lin = match image.color_space {
-                cherenkov::ImageColorSpace::LinearSrgb | cherenkov::ImageColorSpace::LinearP3 => {
-                    [decode(px[0]), decode(px[1]), decode(px[2])]
-                }
-                _ => [
-                    srgb_decode_u8_f64(decode(px[0])),
-                    srgb_decode_u8_f64(decode(px[1])),
-                    srgb_decode_u8_f64(decode(px[2])),
-                ],
-            };
-            // sRGB-primaries input additionally needs the primaries'
-            // matrix; Display P3 uses sRGB's transfer function, so the
-            // decode above covers both encoded spaces. `LinearP3` is
-            // already the working space: no transfer, no matrix.
-            let lin_p3 = match image.color_space {
-                cherenkov::ImageColorSpace::Srgb | cherenkov::ImageColorSpace::LinearSrgb => {
-                    let [x, y, z] = [
-                        SRGB_TO_XYZ[0][2].mul_add(
-                            lin[2],
-                            SRGB_TO_XYZ[0][1].mul_add(lin[1], SRGB_TO_XYZ[0][0] * lin[0]),
-                        ),
-                        SRGB_TO_XYZ[1][2].mul_add(
-                            lin[2],
-                            SRGB_TO_XYZ[1][1].mul_add(lin[1], SRGB_TO_XYZ[1][0] * lin[0]),
-                        ),
-                        SRGB_TO_XYZ[2][2].mul_add(
-                            lin[2],
-                            SRGB_TO_XYZ[2][1].mul_add(lin[1], SRGB_TO_XYZ[2][0] * lin[0]),
-                        ),
-                    ];
-                    [
-                        XYZ_TO_P3[0][2].mul_add(z, XYZ_TO_P3[0][1].mul_add(y, XYZ_TO_P3[0][0] * x)),
-                        XYZ_TO_P3[1][2].mul_add(z, XYZ_TO_P3[1][1].mul_add(y, XYZ_TO_P3[1][0] * x)),
-                        XYZ_TO_P3[2][2].mul_add(z, XYZ_TO_P3[2][1].mul_add(y, XYZ_TO_P3[2][0] * x)),
-                    ]
-                }
-                cherenkov::ImageColorSpace::DisplayP3 | cherenkov::ImageColorSpace::LinearP3 => lin,
-            };
-            for v in [a * lin_p3[0], a * lin_p3[1], a * lin_p3[2], a] {
-                data.extend_from_slice(&half::f16::from_f64(v).to_le_bytes());
-            }
-        }
+        let data = image_texels_f16(&image)?;
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &texture,
@@ -3439,6 +3379,92 @@ impl GpuRenderer {
         }
     }
 }
+/// `Rgba8` or `Rgba16F` upload bytes -> premultiplied linear-P3 f16 texels,
+/// the working texel format of [`GpuImage`].
+///
+/// Straight-alpha input decodes each channel; premultiplied input is
+/// un-premultiplied in the encoded domain first — bounded at 1.0 for the
+/// quantized `Rgba8` encoding, unbounded for `Rgba16F`, whose texels keep
+/// extended (HDR and wide-gamut) values.
+fn image_texels_f16(image: &ImageUpload) -> Result<Vec<u8>, ResourceError> {
+    let convert = |enc: [f64; 4], unpremul_max: f64, data: &mut Vec<u8>| {
+        let a = enc[3];
+        // Straight-alpha input decodes each channel; premultiplied input
+        // is un-premultiplied in the encoded domain first.
+        let decode = |v: f64| {
+            if image.premultiplied && a > 0.0 {
+                (v / a).min(unpremul_max)
+            } else {
+                v
+            }
+        };
+        let lin = match image.color_space {
+            cherenkov::ImageColorSpace::LinearSrgb | cherenkov::ImageColorSpace::LinearP3 => {
+                [decode(enc[0]), decode(enc[1]), decode(enc[2])]
+            }
+            _ => [
+                srgb_decode_u8_f64(decode(enc[0])),
+                srgb_decode_u8_f64(decode(enc[1])),
+                srgb_decode_u8_f64(decode(enc[2])),
+            ],
+        };
+        // sRGB-primaries input additionally needs the primaries' matrix;
+        // Display P3 uses sRGB's transfer function, so the decode above
+        // covers both encoded spaces. `LinearP3` is already the working
+        // space: no transfer, no matrix.
+        let lin_p3 = match image.color_space {
+            cherenkov::ImageColorSpace::Srgb | cherenkov::ImageColorSpace::LinearSrgb => {
+                let [x, y, z] = [
+                    SRGB_TO_XYZ[0][2].mul_add(
+                        lin[2],
+                        SRGB_TO_XYZ[0][1].mul_add(lin[1], SRGB_TO_XYZ[0][0] * lin[0]),
+                    ),
+                    SRGB_TO_XYZ[1][2].mul_add(
+                        lin[2],
+                        SRGB_TO_XYZ[1][1].mul_add(lin[1], SRGB_TO_XYZ[1][0] * lin[0]),
+                    ),
+                    SRGB_TO_XYZ[2][2].mul_add(
+                        lin[2],
+                        SRGB_TO_XYZ[2][1].mul_add(lin[1], SRGB_TO_XYZ[2][0] * lin[0]),
+                    ),
+                ];
+                [
+                    XYZ_TO_P3[0][2].mul_add(z, XYZ_TO_P3[0][1].mul_add(y, XYZ_TO_P3[0][0] * x)),
+                    XYZ_TO_P3[1][2].mul_add(z, XYZ_TO_P3[1][1].mul_add(y, XYZ_TO_P3[1][0] * x)),
+                    XYZ_TO_P3[2][2].mul_add(z, XYZ_TO_P3[2][1].mul_add(y, XYZ_TO_P3[2][0] * x)),
+                ]
+            }
+            cherenkov::ImageColorSpace::DisplayP3 | cherenkov::ImageColorSpace::LinearP3 => lin,
+        };
+        for v in [a * lin_p3[0], a * lin_p3[1], a * lin_p3[2], a] {
+            data.extend_from_slice(&half::f16::from_f64(v).to_le_bytes());
+        }
+    };
+    let mut data = Vec::with_capacity(image.width as usize * image.height as usize * 8);
+    let pixels: &[u8] = &image.data;
+    match image.format {
+        cherenkov::ImageFormat::Rgba8 => {
+            for px in pixels.as_chunks::<4>().0 {
+                convert(px.map(|v| f64::from(v) / 255.0), 1.0, &mut data);
+            }
+        }
+        cherenkov::ImageFormat::Rgba16F => {
+            for px in pixels.as_chunks::<8>().0 {
+                let enc = std::array::from_fn(|i| {
+                    f64::from(half::f16::from_le_bytes([px[2 * i], px[2 * i + 1]]))
+                });
+                convert(enc, f64::INFINITY, &mut data);
+            }
+        }
+        format => {
+            return Err(ResourceError::Image(format!(
+                "unsupported image format {format:?}"
+            )));
+        }
+    }
+    Ok(data)
+}
+
 fn srgb_decode_u8_f64(v: f64) -> f64 {
     if v <= 0.04045 {
         v / 12.92

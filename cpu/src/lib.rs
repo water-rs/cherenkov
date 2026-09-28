@@ -81,6 +81,7 @@ impl From<Offscreen> for RasterTarget {
 pub struct Raster;
 
 impl cherenkov::Uploads<cherenkov::Rgba8> for Raster {}
+impl cherenkov::Uploads<cherenkov::Rgba16F> for Raster {}
 
 impl Backend for Raster {
     type Config = RasterConfig;

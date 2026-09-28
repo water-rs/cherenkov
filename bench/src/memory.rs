@@ -130,12 +130,15 @@ pub struct MemorySnapshot {
 pub struct MemoryReport {
     /// Snapshot taken once after engine creation and before scene preparation.
     pub idle: MemorySnapshot,
-    /// Snapshot after the last measured frame, or the readback submission for render.
+    /// Snapshot after the measured window and its energy meter close, or
+    /// the readback submission for render.
     pub steady: MemorySnapshot,
-    /// Field-wise maximum after prepare and every frame, including warmup,
-    /// sampled outside the encode and submit timing intervals.
+    /// Field-wise maximum over prepare, the warmup frames and the steady
+    /// snapshot — measured frames sample nothing, so the paced window
+    /// never pays a capture (#162).
     pub peak: MemorySnapshot,
-    /// Number of post-prepare and post-frame snapshots included in the peak window.
+    /// Number of snapshots included in the peak window: prepare, one per
+    /// warmup frame, and steady.
     pub samples: usize,
 }
 
@@ -679,7 +682,20 @@ fn android_dumpsys_memory() -> (Result<u64, String>, Result<u64, String>) {
     let text = String::from_utf8_lossy(&output.stdout);
     match parse_android_dumpsys(&text) {
         Ok((graphics, gl_mtrack)) => (Ok(graphics), Ok(gl_mtrack)),
-        Err(error) => (Err(error.clone()), Err(error)),
+        // A parse miss is only diagnosable from the output it failed
+        // on — carry the whole call's evidence, untruncated (#162).
+        Err(error) => {
+            let reason = format!(
+                "{error}\n\
+                 dumpsys meminfo exit status: {}\n\
+                 dumpsys meminfo stdout:\n{}\n\
+                 dumpsys meminfo stderr:\n{}",
+                output.status,
+                text,
+                String::from_utf8_lossy(&output.stderr),
+            );
+            (Err(reason.clone()), Err(reason))
+        }
     }
 }
 

@@ -2291,16 +2291,64 @@ fn run() -> Result<(), SceneError> {
             ph as u32,
             white,
             |l| {
-                let pitch = 54.0;
-                for (i, runs) in (0u8..38).map(|i| (i, &shaped[usize::from(i) % shaped.len()])) {
-                    let y = 56.0 + f64::from(i) * pitch;
-                    for run in runs {
-                        l.glyphs(offset_run(run, 24.0 - f64::from(TEXT_PAD), y));
-                    }
-                }
+                text_page_body(l, &shaped);
+            },
+            blobs.clone(),
+        );
+    }
+
+    // The text page under a smooth pan: a fractional offset per frame for
+    // 4 s, then at rest at identity (= the text-page scene itself).
+    // Exercises the glyph cache's behaviour when the translation's
+    // fraction changes every frame.
+    {
+        let scripts = [
+            ("NotoSans.ttf", corpus::LATIN, 34.0_f32),
+            ("NotoSansSC.ttf", corpus::CJK, 34.0),
+            ("NotoSansArabic.ttf", corpus::ARABIC, 36.0),
+            ("NotoSansDevanagari.ttf", corpus::DEVANAGARI, 34.0),
+            ("NotoEmoji.ttf", corpus::EMOJI, 34.0),
+        ];
+        let shaped: Vec<Vec<GlyphRun>> = scripts
+            .iter()
+            .map(|(file, text, size)| {
+                ctx.shape(file, text, *size, FontWeight::NORMAL, &solid(dark))
+            })
+            .collect();
+        let blobs = font_blobs(&ctx, &shaped.iter().map(Vec::as_slice).collect::<Vec<_>>());
+        perf.scene_with_blobs(
+            "text-pan",
+            pw as u32,
+            ph as u32,
+            white,
+            |l| {
+                l.layer(|pan| {
+                    pan.transform(Affine::IDENTITY);
+                    pan.motion(Motion::Transform {
+                        from: Affine::translate((-281.7, -209.3)),
+                        animation: MotionAnimation::Curve {
+                            duration_ms: 4000,
+                            x1: 0.25,
+                            y1: 0.25,
+                            x2: 0.75,
+                            y2: 0.75,
+                        },
+                    });
+                    text_page_body(pan, &shaped);
+                });
             },
             blobs,
         );
+    }
+
+    fn text_page_body(l: &mut LayerBuilder, shaped: &[Vec<GlyphRun>]) {
+        let pitch = 54.0;
+        for (i, runs) in (0u8..38).map(|i| (i, &shaped[usize::from(i) % shaped.len()])) {
+            let y = 56.0 + f64::from(i) * pitch;
+            for run in runs {
+                l.glyphs(offset_run(run, 24.0 - f64::from(TEXT_PAD), y));
+            }
+        }
     }
 
     // Map-like page: ~2,000 stroked and filled paths — short segments,

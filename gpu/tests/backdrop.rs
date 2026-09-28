@@ -270,3 +270,69 @@ fn two_members_share_one_capture() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(memory.backdrop_capture_format, Some("rgba16float"));
     Ok(())
 }
+
+/// A member inside a tree layer that isolates only because a sibling
+/// blends onto it: the layer's scratch is clip-only for capture purposes,
+/// so the capture is the outer target with the layer's partial contents
+/// composited over it — the member sees what painted earlier inside the
+/// layer and nothing painted after it on the surface.
+#[test]
+fn member_inside_blended_descendant_layer_sees_the_layer_contents(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let engine = Engine::<Gpu>::new(GpuConfig::default())?;
+    let surface = engine.surface(Offscreen::new((32, 32), OffscreenFormat::LinearF16))?;
+    let group = surface.backdrop_group_unfiltered();
+    let outer = surface.layer();
+    let cutout = surface.layer();
+    let member = surface.layer();
+    let late = surface.layer();
+    surface.update(|tx| {
+        // Opaque blue surface content.
+        tx[surface.root()].content(surface.record(|r| {
+            r.fill(
+                Rect::new(0.0, 0.0, 32.0, 32.0),
+                WorkingColor::new([0.0, 0.0, 1.0, 1.0]),
+            );
+        }));
+        tx[surface.root()].push(&outer);
+        tx[surface.root()].push(&late);
+        // `outer` is a Normal-blend layer; the DestOut child makes it
+        // isolate (`blends_within`) without becoming a semantic isolation.
+        tx[&outer].content(surface.record(|r| {
+            r.fill(
+                Rect::new(0.0, 0.0, 16.0, 32.0),
+                WorkingColor::new([1.0, 0.0, 0.0, 1.0]),
+            );
+        }));
+        tx[&outer].push(&cutout);
+        tx[&cutout]
+            .blend(cherenkov::BlendMode::DestOut)
+            .content(surface.record(|r| {
+                r.fill(
+                    Rect::new(24.0, 24.0, 32.0, 32.0),
+                    WorkingColor::new([1.0, 1.0, 1.0, 1.0]),
+                );
+            }));
+        tx[&outer].push(&member);
+        tx[&member]
+            .clip(Rect::new(4.0, 4.0, 12.0, 12.0))
+            .backdrop(group.sample());
+        // Painted after `outer` composites: must not be in the capture.
+        tx[&late].content(surface.record(|r| {
+            r.fill(
+                Rect::new(0.0, 0.0, 4.0, 32.0),
+                WorkingColor::new([0.0, 1.0, 0.0, 1.0]),
+            );
+        }));
+    });
+    engine.render(FrameTime::now())?;
+    let readback = surface.readback()?;
+    // Inside the member's clip the sampled backdrop is the layer's red
+    // over the blue base — the in-scratch content reached the capture.
+    assert_pixel(pixel(&readback, 8, 8), [1.0, 0.0, 0.0, 1.0], 1e-3);
+    // The later sibling overdraws outside the member's clip.
+    assert_pixel(pixel(&readback, 2, 8), [0.0, 1.0, 0.0, 1.0], 1e-3);
+    // The DestOut sibling cleared its corner inside `outer`'s scratch.
+    assert_pixel(pixel(&readback, 28, 28), [0.0, 0.0, 1.0, 1.0], 1e-3);
+    Ok(())
+}

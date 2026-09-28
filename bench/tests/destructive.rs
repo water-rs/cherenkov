@@ -65,10 +65,12 @@ fn assert_destructive_scenes(engine: &str) {
     for entry in std::fs::read_dir(corpus()).expect("read scenes/corpus") {
         let entry = entry.expect("corpus entry");
         let name = entry.file_name().to_string_lossy().into_owned();
-        if DESTRUCTIVE_PREFIXES
-            .iter()
-            .any(|prefix| name.starts_with(prefix))
-        {
+        let destructive = DESTRUCTIVE_PREFIXES.iter().any(|prefix| {
+            name.strip_prefix(prefix).is_some_and(|rest| {
+                rest.is_empty() || rest.starts_with("-clip") || rest == "-p3" || rest == "-hdr"
+            })
+        });
+        if destructive {
             copy_dir(&entry.path(), &corpus_dir.join(&name));
             scenes.push(name);
         }

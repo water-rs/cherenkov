@@ -272,7 +272,7 @@ fn walk<C: Compiler>(
 /// Nested pictures count: their contents are walked the same way. Glyphs
 /// need no scan — a colour glyph's expansion is itself wrapped in the
 /// outer `SrcOver` group this rule isolates.
-fn blends_within(list: &DisplayList, range: Range<usize>) -> bool {
+pub(crate) fn blends_within(list: &DisplayList, range: Range<usize>) -> bool {
     for command in &list.commands()[range] {
         match command {
             Command::BeginGroup { group, .. } => {

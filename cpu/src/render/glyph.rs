@@ -228,7 +228,11 @@ pub fn stroke_outlines(
 
 /// The cache key for a glyph at a quantized device position — the same
 /// key the GPU slice computes.
-#[expect(clippy::cast_possible_truncation, reason = "size is a small non-negative value")]
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "size is a small non-negative value"
+)]
 pub fn glyph_key(run: &GlyphRun, glyph: u32, subpixel: (f32, f32), transform: Affine) -> GlyphKey {
     let mut hasher = DefaultHasher::new();
     run.coords.hash(&mut hasher);

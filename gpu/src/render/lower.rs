@@ -2308,10 +2308,7 @@ impl<'a> Lowering<'a> {
             let origin = self.transform * Point::new(f64::from(glyph.x), f64::from(glyph.y));
             let x = origin.x.floor();
             let y = origin.y.floor();
-            let fraction = (
-                f32_f64(origin.x - x),
-                f32_f64(origin.y - y),
-            );
+            let fraction = (f32_f64(origin.x - x), f32_f64(origin.y - y));
             let (entry, pending) = glyph::entry(
                 glyphs.atlas,
                 font,

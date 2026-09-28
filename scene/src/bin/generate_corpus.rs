@@ -1100,6 +1100,42 @@ fn backdrop_background(l: &mut LayerBuilder) {
     );
 }
 
+// Refraction backdrop: hard 16 px stripes so the edge displacement is
+// obvious, plus three discs for organic geometry.
+fn stripes(l: &mut LayerBuilder, a: Color, b: Color, discs: [Color; 3]) {
+    for i in 0..8 {
+        let x0 = 32.0 * f64::from(i);
+        l.fill(Shape::rect(x0, 0.0, x0 + 16.0, 256.0), solid(a));
+        l.fill(Shape::rect(x0 + 16.0, 0.0, x0 + 32.0, 256.0), solid(b));
+    }
+    l.fill(Shape::circle(64.0, 200.0, 36.0), solid(discs[0]));
+    l.fill(Shape::circle(192.0, 56.0, 28.0), solid(discs[1]));
+    l.fill(Shape::circle(224.0, 224.0, 24.0), solid(discs[2]));
+}
+
+// The three members: rounded-rect clips (radius 16) of sizes 48, 96 and
+// 160 px, each centred on a stripe boundary so refraction has two
+// colours to pull.
+fn refraction_member(
+    l: &mut LayerBuilder,
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+    depth: f64,
+    strength: f64,
+) {
+    l.layer(|m| {
+        m.clip(Shape::RoundedRect(RoundedRect::new(x0, y0, x1, y1, 16.0)));
+        m.backdrop(1);
+        m.backdrop_effect(BackdropEffectSpec::Refraction { depth, strength });
+        m.fill(
+            Shape::rect(x0 + 2.0, y0 + 2.0, x1 - 2.0, y1 - 2.0),
+            solid(srgba(1.0, 1.0, 1.0, 0.12)),
+        );
+    });
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "a linear sequence of independent scene builders; it reads top to bottom"
@@ -4305,47 +4341,6 @@ fn run() -> Result<(), SceneError> {
     });
 
     // ---- Per-member backdrop effects --------------------------------------
-
-    // Refraction backdrop: hard 16 px stripes so the edge displacement is
-    // obvious, plus three discs for organic geometry.
-    fn stripes(l: &mut LayerBuilder, a: Color, b: Color, discs: [Color; 3]) {
-        for i in 0..8 {
-            l.fill(
-                Shape::rect(32.0 * i as f64, 0.0, 32.0 * i as f64 + 16.0, 256.0),
-                solid(a),
-            );
-            l.fill(
-                Shape::rect(32.0 * i as f64 + 16.0, 0.0, 32.0 * i as f64 + 32.0, 256.0),
-                solid(b),
-            );
-        }
-        l.fill(Shape::circle(64.0, 200.0, 36.0), solid(discs[0]));
-        l.fill(Shape::circle(192.0, 56.0, 28.0), solid(discs[1]));
-        l.fill(Shape::circle(224.0, 224.0, 24.0), solid(discs[2]));
-    }
-
-    // The three members: rounded-rect clips (radius 16) of sizes 48, 96 and
-    // 160 px, each centred on a stripe boundary so refraction has two
-    // colours to pull.
-    fn refraction_member(
-        l: &mut LayerBuilder,
-        x0: f64,
-        y0: f64,
-        x1: f64,
-        y1: f64,
-        depth: f64,
-        strength: f64,
-    ) {
-        l.layer(|m| {
-            m.clip(Shape::RoundedRect(RoundedRect::new(x0, y0, x1, y1, 16.0)));
-            m.backdrop(1);
-            m.backdrop_effect(BackdropEffectSpec::Refraction { depth, strength });
-            m.fill(
-                Shape::rect(x0 + 2.0, y0 + 2.0, x1 - 2.0, y1 - 2.0),
-                solid(srgba(1.0, 1.0, 1.0, 0.12)),
-            );
-        });
-    }
 
     corpus.scene_setup("backdrop-refraction", 256, 256, white, |b| {
         b.backdrop_group(1, vec![BackdropFilter::GaussianBlur { sigma: 6.0 }]);

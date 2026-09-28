@@ -66,6 +66,8 @@ def outlines():
     pen = TTGlyphPen(None)
     glyphs[".notdef"] = pen.glyph()
 
+    glyphs["space"] = TTGlyphPen(None).glyph()
+
     pen = TTGlyphPen(None)
     rect(pen, 50, 0, 950, 900)
     glyphs["box"] = pen.glyph()
@@ -212,21 +214,25 @@ def build():
         colr_names.append(name)
         glyphs[name] = TTGlyphPen(None).glyph()
 
-    order = [".notdef", "box", "disc", "discL", "discR", "cross"] + colr_names
-    cmap = {cp: f"g{cp:04X}" for cp in (
+    # `space` comes last so every existing glyph id is unchanged.
+    order = [".notdef", "box", "disc", "discL", "discR", "cross"] + colr_names + ["space"]
+    cmap = {0x0020: "space"}
+    cmap.update({cp: f"g{cp:04X}" for cp in (
         list(range(0xE000, 0xE009))
         + list(range(0xE100, 0xE11C))
         + [0xE200, 0xE201]
         + list(range(0xE300, 0xE304))
         + [0xE400, 0xE500]
-    )}
+    )})
     cmap[0xE600] = "cross"
 
     fb = FontBuilder(UPEM, isTTF=True)
     fb.setupGlyphOrder(order)
     fb.setupCharacterMap(cmap)
     fb.setupGlyf(glyphs)
-    fb.setupHorizontalMetrics({name: (1000, 0) for name in order})
+    fb.setupHorizontalMetrics(
+        {name: (250 if name == "space" else 1000, 0) for name in order}
+    )
     fb.setupHorizontalHeader(ascent=900, descent=-100)
     fb.setupOS2(
         sTypoAscender=900,

@@ -28,11 +28,12 @@
 //! items in order, depth-first) is reached — a full-canvas copy of the
 //! compositing canvas the member is drawn into at that moment, meaning the
 //! nearest enclosing layer isolated for opacity `< 1` or a non-Normal blend
-//! (clips never isolate). A member with opacity `1` and `Normal` blend
-//! draws directly into its parent's canvas, so the plain canvas copy covers
-//! every non-isolated ancestor too; a member that is itself isolated sees
-//! the parent canvas, since the capture happens before its own isolation
-//! begins. The group's filters then run over the copy: `GaussianBlur` is a
+//! (clips never isolate). Every child layer composites into a fresh
+//! canvas, so a member sitting inside clip-only ancestors sees the
+//! semantic level's canvas composited with each ancestor's partial
+//! contents in order (see [`flattened`]); a member that is itself
+//! isolated sees the parent canvas, since the capture happens before its
+//! own isolation begins. The group's filters then run over the copy: `GaussianBlur` is a
 //! separable true Gaussian `w(o) = exp(-o² / 2σ²)` normalized over
 //! `⌈3σ⌉` taps, clamp-to-edge; `ColorMatrix` applies its three rows to
 //! the premultiplied `[r, g, b, a]` pixel, alpha untouched. Every member
@@ -115,6 +116,45 @@ impl Canvas {
     }
 }
 
+/// One compositing level: a canvas plus the opacity and blend mode it
+/// composites into the level below it with. `semantic` marks the canvases
+/// a backdrop capture sees as its compositing target: the surface canvas
+/// and every layer isolated for `opacity < 1` or a non-Normal blend.
+struct Level {
+    canvas: Canvas,
+    opacity: f64,
+    blend: BlendMode,
+    semantic: bool,
+}
+
+/// The canvas at the top of `chain`.
+const fn top(chain: &mut [Level]) -> &mut Canvas {
+    &mut chain.last_mut().expect("a canvas is always pushed").canvas
+}
+
+/// What has been painted so far into the top level's compositing target:
+/// the nearest semantic level's canvas, composited with the partial
+/// contents of every clip-only level above it in order — exactly what the
+/// chain would produce if every pending level composited right now.
+fn flattened(chain: &[Level]) -> Canvas {
+    let sem = chain
+        .iter()
+        .rposition(|level| level.semantic)
+        .expect("the root level is semantic");
+    let mut acc = chain[sem].canvas.clone();
+    for level in &chain[sem + 1..] {
+        for (dst, &src) in acc.pixels.iter_mut().zip(&level.canvas.pixels) {
+            let s = src.map(|v| v * level.opacity);
+            *dst = if level.blend == BlendMode::Normal {
+                src_over(*dst, s)
+            } else {
+                blend(level.blend, *dst, s)
+            };
+        }
+    }
+    acc
+}
+
 /// Backdrop-group render state: the scene's declared groups plus each
 /// group's filtered capture, taken at its first member's paint point.
 struct Backdrops<'a> {
@@ -158,6 +198,9 @@ impl Renderer {
     ///
     /// # Errors
     /// `RenderError` on glyph failures or missing resources.
+    ///
+    /// # Panics
+    /// If the canvas chain is corrupted (internal invariant).
     pub fn render(
         &self,
         scene: &Scene,
@@ -180,7 +223,12 @@ impl Renderer {
     ) -> Result<Image, RenderError> {
         let mut resources = Resources::new(scene_dir.to_path_buf());
         let clear = to_working(&scene.clear);
-        let mut canvas = Canvas::new(self.width, self.height, clear);
+        let mut chain = vec![Level {
+            canvas: Canvas::new(self.width, self.height, clear),
+            opacity: 1.0,
+            blend: BlendMode::Normal,
+            semantic: true,
+        }];
         let mut backdrops = Backdrops {
             groups: &scene.backdrop_groups,
             captures: HashMap::new(),
@@ -191,10 +239,11 @@ impl Renderer {
             &scene.root.items,
             root_tf,
             &scene_clip_stack(&scene.root, scene.root.transform, self.width, self.height),
-            &mut canvas,
+            &mut chain,
             &mut resources,
             &mut backdrops,
         )?;
+        let Level { canvas, .. } = chain.pop().expect("the root canvas is always pushed");
         Ok(Image {
             width: self.width,
             height: self.height,
@@ -202,7 +251,8 @@ impl Renderer {
         })
     }
 
-    /// Render `items` (a layer's contents) into `canvas`.
+    /// Render `items` (a layer's contents) into the canvas on top of
+    /// `chain`.
     ///
     /// `tf` maps the items' user space to scene space; `clips` is the stack
     /// of active clip boundary edge sets, already in scene space.
@@ -211,47 +261,51 @@ impl Renderer {
         items: &[Item],
         tf: Affine,
         clips: &[Vec<Segment>],
-        canvas: &mut Canvas,
+        chain: &mut Vec<Level>,
         resources: &mut Resources,
         backdrops: &mut Backdrops<'_>,
     ) -> Result<(), RenderError> {
         for item in items {
             match item {
                 Item::Draw(draw) => {
-                    self.render_draw(draw, tf, clips, canvas, resources, backdrops)?;
+                    self.render_draw(draw, tf, clips, chain, resources, backdrops)?;
                 }
                 Item::Layer(child) => {
                     if let Some(gid) = child.backdrop {
                         // The group's one capture point is this position in
-                        // painter order: a copy of the canvas the member
-                        // draws into, filtered once, shared by all members.
+                        // painter order: what has been painted so far into
+                        // the member's compositing canvas — the nearest
+                        // semantic level's canvas plus, in order, the
+                        // partial contents of every clip-only level the
+                        // member sits inside — filtered once and shared by
+                        // all members.
                         let group = backdrops.group(gid)?;
-                        let mut capture = canvas.clone();
+                        let mut capture = flattened(chain);
                         for filter in &group.filters {
                             apply_backdrop_filter(&mut capture, filter);
                         }
                         backdrops.captures.entry(gid).or_insert(capture);
                     }
-                    self.render_child_layer(child, tf, clips, canvas, resources, backdrops)?;
+                    self.render_child_layer(child, tf, clips, chain, resources, backdrops)?;
                 }
             }
         }
         Ok(())
     }
 
-    /// Composite a child layer. A layer isolated for `opacity < 1` or a
-    /// non-Normal blend renders into a fresh canvas under the accumulated
-    /// clips plus the child's own clip, then composites with opacity and
-    /// blend mode; a plain `opacity == 1`, `Normal` layer draws directly
-    /// into the parent's canvas (`src_over` over `src_over` is the same
-    /// premultiplied result), which is also what the backdrop semantics
-    /// need: the member's compositing canvas is the parent's.
+    /// Composite a child layer. Every child renders into a fresh canvas
+    /// under the accumulated clips plus the child's own clip, then
+    /// composites with opacity and blend mode: a `Normal`-blend child sees
+    /// (and blends against) only what painted into its own canvas, never
+    /// the parent's. Clip-only levels are not semantic isolations — a
+    /// backdrop capture looks through them to the nearest `opacity < 1` or
+    /// `blend != Normal` level (see `flattened`).
     fn render_child_layer(
         &self,
         child: &Layer,
         parent_tf: Affine,
         clips: &[Vec<Segment>],
-        canvas: &mut Canvas,
+        chain: &mut Vec<Level>,
         resources: &mut Resources,
         backdrops: &mut Backdrops<'_>,
     ) -> Result<(), RenderError> {
@@ -265,64 +319,63 @@ impl Renderer {
         // scene.
         let content_tf = tf * Affine::translate((-child.scroll_offset.x, -child.scroll_offset.y));
 
-        if child.opacity < 1.0 || child.blend != BlendMode::Normal {
-            let mut sub = Canvas::new(canvas.width, canvas.height, [0.0; 4]);
-            self.render_layer_body(
-                child,
-                tf,
-                clips,
-                content_tf,
-                &child_clips,
-                &mut sub,
-                resources,
-                backdrops,
-            )?;
+        let (w, h) = (top(chain).width, top(chain).height);
+        let semantic = child.opacity < 1.0 || child.blend != BlendMode::Normal;
+        chain.push(Level {
+            canvas: Canvas::new(w, h, [0.0; 4]),
+            opacity: child.opacity,
+            blend: child.blend,
+            semantic,
+        });
+        self.render_layer_body(
+            child,
+            tf,
+            clips,
+            content_tf,
+            &child_clips,
+            chain,
+            resources,
+            backdrops,
+        )?;
+        let Level {
+            canvas: sub,
+            opacity,
+            blend: mode,
+            ..
+        } = chain.pop().expect("the child level is pushed above");
 
-            // A destructive operator is bounded by the effective clip: outside
-            // it the destination is untouched, and the clip edge is antialiased
-            // between the backdrop and the blended result. Unclipped it covers
-            // the whole parent.
-            let clip_cov: Option<Vec<f64>> =
-                if Self::is_destructive(child.blend) && !child_clips.is_empty() {
-                    let mut segs = child_clips[0].clone();
-                    for c in &child_clips[1..] {
-                        segs = intersect_edges(&segs, FillRule::NonZero, c);
-                    }
-                    let mut cov = Coverage::new(self.width, self.height);
-                    for &s in &segs {
-                        cov.add_line(s.0, s.1, s.2, s.3);
-                    }
-                    Some(cov.finish(FillRule::NonZero))
-                } else {
-                    None
-                };
+        // A destructive operator is bounded by the effective clip: outside
+        // it the destination is untouched, and the clip edge is antialiased
+        // between the backdrop and the blended result. Unclipped it covers
+        // the whole parent.
+        let clip_cov: Option<Vec<f64>> =
+            if Self::is_destructive(mode) && !child_clips.is_empty() {
+                let mut segs = child_clips[0].clone();
+                for c in &child_clips[1..] {
+                    segs = intersect_edges(&segs, FillRule::NonZero, c);
+                }
+                let mut cov = Coverage::new(self.width, self.height);
+                for &s in &segs {
+                    cov.add_line(s.0, s.1, s.2, s.3);
+                }
+                Some(cov.finish(FillRule::NonZero))
+            } else {
+                None
+            };
 
-            let opacity = child.opacity;
-            for (i, (dst, &src)) in canvas.pixels.iter_mut().zip(&sub.pixels).enumerate() {
-                let s = src.map(|v| v * opacity);
-                *dst = if child.blend == BlendMode::Normal {
-                    src_over(*dst, s)
-                } else {
-                    let b = blend(child.blend, *dst, s);
-                    match clip_cov.as_ref().map(|v| v[i]) {
-                        Some(c) if c >= 1.0 => b,
-                        Some(c) if c <= 0.0 => *dst,
-                        Some(c) => std::array::from_fn(|ch| c.mul_add(b[ch] - dst[ch], dst[ch])),
-                        None => b,
-                    }
-                };
-            }
-        } else {
-            self.render_layer_body(
-                child,
-                tf,
-                clips,
-                content_tf,
-                &child_clips,
-                canvas,
-                resources,
-                backdrops,
-            )?;
+        for (i, (dst, &src)) in top(chain).pixels.iter_mut().zip(&sub.pixels).enumerate() {
+            let s = src.map(|v| v * opacity);
+            *dst = if mode == BlendMode::Normal {
+                src_over(*dst, s)
+            } else {
+                let b = blend(mode, *dst, s);
+                match clip_cov.as_ref().map(|v| v[i]) {
+                    Some(c) if c >= 1.0 => b,
+                    Some(c) if c <= 0.0 => *dst,
+                    Some(c) => std::array::from_fn(|ch| c.mul_add(b[ch] - dst[ch], dst[ch])),
+                    None => b,
+                }
+            };
         }
         Ok(())
     }
@@ -358,7 +411,7 @@ impl Renderer {
         clips: &[Vec<Segment>],
         content_tf: Affine,
         child_clips: &[Vec<Segment>],
-        target: &mut Canvas,
+        target: &mut Vec<Level>,
         resources: &mut Resources,
         backdrops: &mut Backdrops<'_>,
     ) -> Result<(), RenderError> {
@@ -370,7 +423,7 @@ impl Renderer {
             // was reached; sample it under the member clip's coverage.
             let coverage = self.shape_coverage(clip, FillRule::NonZero, tf, clips);
             if let Some(capture) = backdrops.captures.get(&gid) {
-                for (dst, (&c, &src)) in target
+                for (dst, (&c, &src)) in top(target)
                     .pixels
                     .iter_mut()
                     .zip(coverage.iter().zip(&capture.pixels))
@@ -451,7 +504,7 @@ impl Renderer {
         draw: &Draw,
         tf: Affine,
         clips: &[Vec<Segment>],
-        canvas: &mut Canvas,
+        chain: &mut Vec<Level>,
         resources: &mut Resources,
         backdrops: &mut Backdrops<'_>,
     ) -> Result<(), RenderError> {
@@ -459,7 +512,7 @@ impl Renderer {
         match draw {
             Draw::Fill { shape, rule, paint } => {
                 let coverage = self.shape_coverage(shape, *rule, tf, clips);
-                Self::composite_paint(canvas, &coverage, paint, inv_tf, resources)?;
+                Self::composite_paint(top(chain), &coverage, paint, inv_tf, resources)?;
             }
             Draw::Stroke {
                 shape,
@@ -475,7 +528,7 @@ impl Renderer {
                     cov.add_line(s.0, s.1, s.2, s.3);
                 }
                 let coverage = cov.finish(FillRule::NonZero);
-                Self::composite_paint(canvas, &coverage, paint, inv_tf, resources)?;
+                Self::composite_paint(top(chain), &coverage, paint, inv_tf, resources)?;
             }
             Draw::Shadow {
                 shape,
@@ -489,7 +542,7 @@ impl Renderer {
                 let coverage = self.shape_coverage(shape, FillRule::NonZero, tf_off, clips);
                 let blurred = gaussian_blur(&coverage, self.width, self.height, *blur_sigma);
                 let src = to_working(color);
-                for (px, &c) in canvas.pixels.iter_mut().zip(&blurred) {
+                for (px, &c) in top(chain).pixels.iter_mut().zip(&blurred) {
                     if c > 0.0 {
                         *px = src_over(*px, src.map(|v| v * c));
                     }
@@ -497,7 +550,7 @@ impl Renderer {
             }
             Draw::Glyphs(run) => {
                 let items = glyphs::items_for_glyph_run(run, resources, self.scene_rect)?;
-                self.render_items(&items, tf, clips, canvas, resources, backdrops)?;
+                self.render_items(&items, tf, clips, chain, resources, backdrops)?;
             }
             Draw::Image {
                 image,
@@ -509,7 +562,7 @@ impl Renderer {
                 let coverage =
                     self.shape_coverage(&Shape::Rect(*dst), FillRule::NonZero, tf, clips);
                 let img = resources.image(*image, *encoding)?.clone();
-                let (w, h) = (canvas.width, canvas.height);
+                let (w, h) = (top(chain).width, top(chain).height);
                 for py in 0..h {
                     for px in 0..w {
                         let c = coverage[py * w + px];
@@ -523,7 +576,7 @@ impl Renderer {
                         let v = (p.y - dst.y0) / dh * img.height as f64;
                         let src = sample_image(&img, u, v, *sampling).map(|x| x * c);
                         let idx = py * w + px;
-                        canvas.pixels[idx] = src_over(canvas.pixels[idx], src);
+                        top(chain).pixels[idx] = src_over(top(chain).pixels[idx], src);
                     }
                 }
             }

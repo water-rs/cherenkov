@@ -2799,6 +2799,42 @@ fn run() -> Result<(), SceneError> {
         );
     }
 
+    // ---- Winding test-font scenes -------------------------------------------
+    //
+    // `CherenkovWindingTest.ttf` (in `corpus::TEST_FONTS`) puts overlapping
+    // contours on PUA codepoints: a composite of two overlapping circles, a
+    // self-crossing bowtie and two same-direction nested squares. Each must
+    // fill by its union, as paths do since #136.
+    {
+        let text = "\u{e200}\u{e201}\u{e202}";
+        for (name, paint) in [
+            ("glyph-overlap-winding", solid(srgb(0.2, 0.45, 0.85))),
+            ("glyph-overlap-winding-p3", solid(p3(0.0, 0.4, 1.0))),
+            ("glyph-overlap-winding-hdr", solid(hdr(0.0, 8.0, 16.0))),
+        ] {
+            let runs = ctx.shape(
+                "CherenkovWindingTest.ttf",
+                text,
+                64.0,
+                FontWeight::NORMAL,
+                &paint,
+            );
+            let blobs = font_blobs(&ctx, &[&runs]);
+            corpus.scene_with_blobs(
+                name,
+                256,
+                96,
+                white,
+                |l| {
+                    for run in &runs {
+                        l.glyphs(run.clone());
+                    }
+                },
+                blobs,
+            );
+        }
+    }
+
     // ---- Motion and scrolling ----------------------------------------------
     //
     // Scenes exercising `Layer::scroll_offset` and `Layer::motion`. The

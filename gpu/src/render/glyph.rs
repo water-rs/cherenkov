@@ -979,6 +979,10 @@ fn rasterize_texels(
     if segments.is_empty() || bbox.width() <= 0.0 || bbox.height() <= 0.0 {
         return Ok(None);
     }
+    // Overlapping contours resolve to the union's boundary edges, like
+    // `path::rasterize`: `None` keeps the glyph bit-identical.
+    let resolved = cherenkov::lowering::resolve_winding(&segments, cherenkov::FillRule::NonZero);
+    let segments = resolved.as_deref().unwrap_or(&segments);
     let left = bbox.x0.floor() as i32 - 1;
     let top = bbox.y0.floor() as i32 - 1;
     let right = bbox.x1.ceil() as i32 + 1;
@@ -989,7 +993,7 @@ fn rasterize_texels(
     let mut raster = Raster::new(w as usize, h as usize);
     let ox = left as f32;
     let oy = top as f32;
-    for (x0, y0, x1, y1) in segments {
+    for &(x0, y0, x1, y1) in segments {
         raster.draw_line(x0 - ox, y0 - oy, x1 - ox, y1 - oy);
     }
     let coverage = raster.coverage();

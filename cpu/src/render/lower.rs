@@ -122,6 +122,22 @@ pub struct DeviceData<T> {
     output: T,
 }
 
+impl<T> DeviceData<T> {
+    /// Heap bytes: the placement's clip mask plus `inner` on the output.
+    pub fn heap_bytes(&self, inner: impl FnOnce(&T) -> u64) -> u64 {
+        self.clip.as_deref().map_or(0, clip_bytes) + inner(&self.output)
+    }
+}
+
+/// Heap bytes of a rasterized clip: the coverage mask or nothing for the
+/// rect fast path.
+pub const fn clip_bytes(clip: &ClipMask) -> u64 {
+    match clip {
+        ClipMask::Rect(_) => 0,
+        ClipMask::Cover(mask) => (mask.capacity() * size_of::<f32>()) as u64,
+    }
+}
+
 /// A glyph mask request lowering emits: everything needed to rasterize
 /// the mask in parallel, plus the slot the [`Item::Glyph`] reads.
 pub struct GlyphReq {

@@ -1104,14 +1104,14 @@ impl Cherenkov {
                 source_rev: option_env!("DEP_CHERENKOV_CPU_SOURCE_REV").map(String::from),
                 output_format: match Self::readback_format() {
                     OffscreenFormat::LinearF16 => {
-                        "f32 framebuffer read back through f16 (premultiplied linear P3)"
+                        "f16 framebuffer, rounded once at band emit (premultiplied linear P3)"
                     }
                     OffscreenFormat::LinearF32 => {
                         "f32 framebuffer, unrounded (premultiplied linear P3)"
                     }
                 }
                 .to_string(),
-                precision: "f32 exact-area coverage bands; f32 working-space framebuffer",
+                precision: "f32 exact-area coverage bands; f32 band scratch, output-format framebuffer",
                 route: "cpu-raster (rayon bands)",
                 color_note: "premultiplied linear Display P3 end to end; HDR channels unclamped",
                 encode_scope: "records `cherenkov::Content` calls (fill/stroke/shadow/glyphs) \

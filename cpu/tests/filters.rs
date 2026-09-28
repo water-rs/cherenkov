@@ -10,7 +10,9 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use cherenkov::kurbo::Rect;
-use cherenkov::{Draw, Engine, FrameTime, Group, Next, Offscreen, OffscreenFormat, WorkingColor};
+use cherenkov::{
+    BlendMode, Draw, Engine, FrameTime, Group, Next, Offscreen, OffscreenFormat, WorkingColor,
+};
 use cherenkov_cpu::{Raster, RasterConfig, RedrawCallback};
 use filtrate::{
     AnimatedCallback, AnimatedTarget, AuxData, AuxImage, AuxSource, CpuFilter, CpuFilterError,
@@ -79,6 +81,104 @@ fn colour_chains_run_on_layers_and_recorded_groups() {
             (actual - expected).abs() < 1.0e-6,
             "patched filtered group pixel: {patched:?}"
         );
+    }
+}
+
+#[test]
+fn filtered_group_isolates_blended_descendant_inside_pass_through_group() {
+    let engine = engine();
+    let identity = engine.filter(filters::ColorMatrix([
+        1.0_f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0,
+    ]));
+    let surface = engine
+        .surface(Offscreen::new((8, 40), OffscreenFormat::LinearF32))
+        .expect("surface");
+    surface.update(|tx| {
+        tx[surface.root()].content(surface.record(|r| {
+            r.fill(
+                Rect::new(0.0, 0.0, 8.0, 40.0),
+                WorkingColor::new([1.0, 0.0, 0.0, 1.0]),
+            );
+            r.group(Group::new().filter(identity.id()), |r| {
+                r.fill(
+                    Rect::new(0.0, 0.0, 8.0, 40.0),
+                    WorkingColor::new([0.0, 0.0, 1.0, 1.0]),
+                );
+                r.group(Group::new(), |r| {
+                    r.fill(
+                        Rect::new(0.0, 0.0, 8.0, 40.0),
+                        WorkingColor::new([0.0, 1.0, 0.0, 1.0]),
+                    );
+                    r.group(Group::new().blend(BlendMode::DestOut), |r| {
+                        r.fill(Rect::new(0.0, 12.0, 8.0, 28.0), WorkingColor::WHITE);
+                    });
+                });
+            });
+        }));
+    });
+    engine.render(FrameTime::now()).expect("render");
+    let pixels = surface.readback().expect("readback").pixels;
+    for y in 0..40 {
+        let expected = if (12..28).contains(&y) {
+            [0.0, 0.0, 1.0, 1.0]
+        } else {
+            [0.0, 1.0, 0.0, 1.0]
+        };
+        for x in 0..8 {
+            let pixel = pixels[y * 8 + x];
+            for (actual, expected) in pixel.into_iter().zip(expected) {
+                assert!(
+                    (actual - expected).abs() <= 1.0e-6,
+                    "pixel ({x}, {y}): {pixel:?}, expected {expected}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn filtered_group_contains_direct_blended_descendant() {
+    let engine = engine();
+    let identity = engine.filter(filters::ColorMatrix([
+        1.0_f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0,
+    ]));
+    let surface = engine
+        .surface(Offscreen::new((8, 40), OffscreenFormat::LinearF32))
+        .expect("surface");
+    surface.update(|tx| {
+        tx[surface.root()].content(surface.record(|r| {
+            r.fill(
+                Rect::new(0.0, 0.0, 8.0, 40.0),
+                WorkingColor::new([1.0, 0.0, 0.0, 1.0]),
+            );
+            r.group(Group::new().filter(identity.id()), |r| {
+                r.fill(
+                    Rect::new(0.0, 0.0, 8.0, 40.0),
+                    WorkingColor::new([0.0, 0.0, 1.0, 1.0]),
+                );
+                r.group(Group::new().blend(BlendMode::DestOut), |r| {
+                    r.fill(Rect::new(0.0, 12.0, 8.0, 28.0), WorkingColor::WHITE);
+                });
+            });
+        }));
+    });
+    engine.render(FrameTime::now()).expect("render");
+    let pixels = surface.readback().expect("readback").pixels;
+    for y in 0..40 {
+        let expected = if (12..28).contains(&y) {
+            [1.0, 0.0, 0.0, 1.0]
+        } else {
+            [0.0, 0.0, 1.0, 1.0]
+        };
+        for x in 0..8 {
+            let pixel = pixels[y * 8 + x];
+            for (actual, expected) in pixel.into_iter().zip(expected) {
+                assert!(
+                    (actual - expected).abs() <= 1.0e-6,
+                    "pixel ({x}, {y}): {pixel:?}, expected {expected}"
+                );
+            }
+        }
     }
 }
 

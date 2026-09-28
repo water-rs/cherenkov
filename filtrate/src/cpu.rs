@@ -5,8 +5,13 @@
 //! per pixel, the output accumulated column by column with fused
 //! multiply-adds.
 
-use filtrate_core::WorkingSpace;
+use filtrate_core::{
+    AuxData, AuxFormat, AuxImage, CpuFilter, CpuFilterError, CpuImage, FilterParam, SpatialFilter,
+    WorkingSpace,
+};
 use wide::f32x4;
+
+use crate::filters::{BlendWithImage, Blur, GaussianBlur};
 
 /// A 4x4 matrix on premultiplied RGBA, stored as columns: the output is
 /// `c[0] * r + c[1] * g + c[2] * b + c[3] * a`.
@@ -114,4 +119,423 @@ pub fn color_matrix(params: [f32; 12], _space: &WorkingSpace, pixels: &mut [[f32
         column(3, 1.0),
     ])
     .apply(pixels);
+}
+
+impl<T: FilterParam> CpuFilter for GaussianBlur<T> {
+    fn cpu_footprint(params: &Self::Params) -> filtrate_core::Footprint {
+        Self::footprint_of(params)
+    }
+
+    fn apply_cpu_image(
+        &self,
+        params: &Self::Params,
+        _space: &WorkingSpace,
+        image: &mut CpuImage<'_>,
+    ) -> Result<(), CpuFilterError> {
+        gaussian_blur(params[0], image);
+        Ok(())
+    }
+}
+
+impl<T: FilterParam> CpuFilter for Blur<T> {
+    fn cpu_footprint(params: &Self::Params) -> filtrate_core::Footprint {
+        Self::footprint_of(params)
+    }
+
+    fn apply_cpu_image(
+        &self,
+        params: &Self::Params,
+        _space: &WorkingSpace,
+        image: &mut CpuImage<'_>,
+    ) -> Result<(), CpuFilterError> {
+        box_blur(params[0], image);
+        Ok(())
+    }
+}
+
+impl<A: FilterParam> CpuFilter for BlendWithImage<A> {
+    fn cpu_footprint(params: &Self::Params) -> filtrate_core::Footprint {
+        Self::footprint_of(params)
+    }
+
+    fn apply_cpu_image(
+        &self,
+        params: &Self::Params,
+        _space: &WorkingSpace,
+        image: &mut CpuImage<'_>,
+    ) -> Result<(), CpuFilterError> {
+        let data = self
+            .image
+            .data()
+            .ok_or(CpuFilterError::GpuImage { index: 0 })?;
+        blend_with_image(
+            *params,
+            data,
+            self.image.width(),
+            self.image.height(),
+            image,
+        );
+        Ok(())
+    }
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the positive WGSL radius is converted to the CPU loop index"
+)]
+fn gaussian_blur(sigma: f32, image: &mut CpuImage<'_>) {
+    let width = image.size.0;
+    if width == 0 || image.pixels.is_empty() {
+        return;
+    }
+    let height = image.pixels.len() / width;
+    debug_assert_eq!(height * width, image.pixels.len());
+    let sigma = sigma.max(0.001);
+    let radius = (sigma * 3.0).ceil() as usize;
+    if radius == 0 {
+        return;
+    }
+    let mut temporary = vec![[0.0; 4]; image.pixels.len()];
+    gaussian_pass(
+        image.pixels,
+        &mut temporary,
+        width,
+        height,
+        radius,
+        false,
+        sigma,
+    );
+    gaussian_pass(&temporary, image.pixels, width, height, radius, true, sigma);
+}
+
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "preserves the WGSL blur recurrence and accumulation order"
+)]
+fn gaussian_pass(
+    input: &[[f32; 4]],
+    output: &mut [[f32; 4]],
+    width: usize,
+    height: usize,
+    radius: usize,
+    vertical: bool,
+    sigma: f32,
+) {
+    let inv_two_sigma_sq = 1.0 / (2.0 * sigma * sigma);
+    let ratio_step = (-2.0 * inv_two_sigma_sq).exp();
+    for y in 0..height {
+        for x in 0..width {
+            let center = y * width + x;
+            let mut sum = input[center];
+            let mut weight_total = 1.0;
+            let mut side_weight = 1.0;
+            let mut side_ratio = (-inv_two_sigma_sq).exp();
+            for offset in 1..=radius {
+                side_weight *= side_ratio;
+                side_ratio *= ratio_step;
+                let (minus, plus) = if vertical {
+                    let y0 = y.saturating_sub(offset) * width + x;
+                    let y1 = y.saturating_add(offset).min(height - 1) * width + x;
+                    (input[y0], input[y1])
+                } else {
+                    let x0 = x.saturating_sub(offset);
+                    let x1 = x.saturating_add(offset).min(width - 1);
+                    (input[y * width + x0], input[y * width + x1])
+                };
+                for channel in 0..4 {
+                    sum[channel] += (minus[channel] + plus[channel]) * side_weight;
+                }
+                weight_total += 2.0 * side_weight;
+            }
+            for channel in &mut sum {
+                *channel /= weight_total;
+            }
+            output[center] = sum;
+        }
+    }
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the nonnegative WGSL radius is converted to the CPU loop index"
+)]
+fn box_blur(radius: f32, image: &mut CpuImage<'_>) {
+    let width = image.size.0;
+    if width == 0 || image.pixels.is_empty() {
+        return;
+    }
+    let height = image.pixels.len() / width;
+    debug_assert_eq!(height * width, image.pixels.len());
+    let radius = radius.round().max(0.0) as usize;
+    if radius == 0 {
+        return;
+    }
+    let mut temporary = vec![[0.0; 4]; image.pixels.len()];
+    box_pass(image.pixels, &mut temporary, width, height, radius, false);
+    box_pass(&temporary, image.pixels, width, height, radius, true);
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "blur radii are bounded by the Raster surface dimensions"
+)]
+fn box_pass(
+    input: &[[f32; 4]],
+    output: &mut [[f32; 4]],
+    width: usize,
+    height: usize,
+    radius: usize,
+    vertical: bool,
+) {
+    let divisor = radius.saturating_mul(2).saturating_add(1) as f32;
+    for y in 0..height {
+        for x in 0..width {
+            let center = y * width + x;
+            let mut sum = input[center];
+            for offset in 1..=radius {
+                let (minus, plus) = if vertical {
+                    let y0 = y.saturating_sub(offset) * width + x;
+                    let y1 = y.saturating_add(offset).min(height - 1) * width + x;
+                    (input[y0], input[y1])
+                } else {
+                    let x0 = x.saturating_sub(offset);
+                    let x1 = x.saturating_add(offset).min(width - 1);
+                    (input[y * width + x0], input[y * width + x1])
+                };
+                for channel in 0..4 {
+                    sum[channel] += minus[channel] + plus[channel];
+                }
+            }
+            for channel in &mut sum {
+                *channel /= divisor;
+            }
+            output[center] = sum;
+        }
+    }
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    reason = "WGSL samples and mode selectors use f32 and bounded Raster dimensions"
+)]
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "preserves the WGSL blend interpolation order"
+)]
+fn blend_with_image(
+    params: [f32; 2],
+    data: AuxData<'_>,
+    aux_width: u32,
+    aux_height: u32,
+    image: &mut CpuImage<'_>,
+) {
+    let width = image.size.0;
+    let height = image.pixels.len().checked_div(width).unwrap_or(0);
+    if width == 0 || height == 0 {
+        return;
+    }
+    let amount = params[0].clamp(0.0, 1.0);
+    let mode = (params[1] + 0.5) as u32;
+    for y in 0..height {
+        let v = (image.top + y) as f32 + 0.5;
+        let aux_y = ((v / image.size.1 as f32) * aux_height as f32)
+            .floor()
+            .clamp(0.0, aux_height.saturating_sub(1) as f32) as usize;
+        for x in 0..width {
+            let u = x as f32 + 0.5;
+            let aux_x = ((u / width as f32) * aux_width as f32)
+                .floor()
+                .clamp(0.0, aux_width.saturating_sub(1) as f32) as usize;
+            let index = aux_y * aux_width as usize + aux_x;
+            let top = aux_pixel(data, index);
+            let base = image.pixels[y * width + x];
+            let blended = blend_color([base[0], base[1], base[2]], [top[0], top[1], top[2]], mode);
+            for channel in 0..3 {
+                image.pixels[y * width + x][channel] =
+                    base[channel] * (1.0 - amount) + blended[channel] * amount;
+            }
+            image.pixels[y * width + x][3] = base[3];
+        }
+    }
+}
+
+fn aux_pixel(data: AuxData<'_>, index: usize) -> [f32; 4] {
+    match data.format {
+        AuxFormat::Rgba8 => {
+            let start = index * 4;
+            std::array::from_fn(|channel| f32::from(data.bytes[start + channel]) / 255.0)
+        }
+        AuxFormat::Rgba16Float => {
+            let start = index * 8;
+            std::array::from_fn(|channel| {
+                let byte = start + channel * 2;
+                half::f16::from_bits(u16::from_le_bytes([data.bytes[byte], data.bytes[byte + 1]]))
+                    .to_f32()
+            })
+        }
+        AuxFormat::Rgba32Float => {
+            let start = index * 16;
+            std::array::from_fn(|channel| {
+                let byte = start + channel * 4;
+                f32::from_le_bytes([
+                    data.bytes[byte],
+                    data.bytes[byte + 1],
+                    data.bytes[byte + 2],
+                    data.bytes[byte + 3],
+                ])
+            })
+        }
+    }
+}
+
+#[expect(clippy::suboptimal_flops, reason = "preserves the WGSL blend formulas")]
+fn blend_color(base: [f32; 3], top: [f32; 3], mode: u32) -> [f32; 3] {
+    match mode {
+        1 => std::array::from_fn(|i| base[i] * top[i]),
+        2 => std::array::from_fn(|i| 1.0 - (1.0 - base[i]) * (1.0 - top[i])),
+        3 => blend_overlay(base, top),
+        4 => std::array::from_fn(|i| base[i].min(top[i])),
+        5 => std::array::from_fn(|i| base[i].max(top[i])),
+        6 => blend_soft_light(base, top),
+        7 => blend_overlay(top, base),
+        8 => std::array::from_fn(|i| (base[i] - top[i]).abs()),
+        9 => std::array::from_fn(|i| base[i] + top[i] - 2.0 * base[i] * top[i]),
+        10 => std::array::from_fn(|i| base[i] / (1.0 - top[i]).max(0.0001)),
+        11 => std::array::from_fn(|i| 1.0 - (1.0 - base[i]) / top[i].max(0.0001)),
+        12 => blend_hsl(base, top, true, false, false),
+        13 => blend_hsl(base, top, false, true, false),
+        14 => blend_hsl(base, top, true, true, false),
+        15 => blend_hsl(base, top, false, false, true),
+        _ => top,
+    }
+}
+
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "preserves the WGSL overlay formula"
+)]
+fn blend_overlay(base: [f32; 3], top: [f32; 3]) -> [f32; 3] {
+    std::array::from_fn(|i| {
+        if base[i] < 0.5 {
+            2.0 * base[i] * top[i]
+        } else {
+            1.0 - 2.0 * (1.0 - base[i]) * (1.0 - top[i])
+        }
+    })
+}
+
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "preserves the WGSL soft-light formula"
+)]
+fn blend_soft_light(base: [f32; 3], top: [f32; 3]) -> [f32; 3] {
+    std::array::from_fn(|i| {
+        if top[i] < 0.5 {
+            base[i] - (1.0 - 2.0 * top[i]) * base[i] * (1.0 - base[i])
+        } else {
+            base[i] + (2.0 * top[i] - 1.0) * (base[i].max(0.0).sqrt() - base[i])
+        }
+    })
+}
+
+fn blend_hsl(
+    base: [f32; 3],
+    top: [f32; 3],
+    hue_from_top: bool,
+    saturation_from_top: bool,
+    lightness_from_top: bool,
+) -> [f32; 3] {
+    let base_hsl = rgb_to_hsl(base);
+    let top_hsl = rgb_to_hsl(top);
+    hsl_to_rgb([
+        if hue_from_top {
+            top_hsl[0]
+        } else {
+            base_hsl[0]
+        },
+        if saturation_from_top {
+            top_hsl[1]
+        } else {
+            base_hsl[1]
+        },
+        if lightness_from_top {
+            top_hsl[2]
+        } else {
+            base_hsl[2]
+        },
+    ])
+}
+
+#[expect(
+    clippy::float_cmp,
+    reason = "the branch matches the WGSL HSL implementation exactly"
+)]
+fn rgb_to_hsl(rgb: [f32; 3]) -> [f32; 3] {
+    let max = rgb[0].max(rgb[1]).max(rgb[2]);
+    let min = rgb[0].min(rgb[1]).min(rgb[2]);
+    let lightness = (max + min) * 0.5;
+    if max == min {
+        return [0.0, 0.0, lightness];
+    }
+    let delta = max - min;
+    let saturation = if lightness > 0.5 {
+        delta / (max + min)
+    } else {
+        delta / (2.0 - max - min)
+    };
+    let hue = if max == rgb[0] {
+        (rgb[1] - rgb[2]) / delta + if rgb[1] < rgb[2] { 6.0 } else { 0.0 }
+    } else if max == rgb[1] {
+        (rgb[2] - rgb[0]) / delta + 2.0
+    } else {
+        (rgb[0] - rgb[1]) / delta + 4.0
+    } / 6.0;
+    [hue, saturation, lightness]
+}
+
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "preserves the WGSL hue conversion order"
+)]
+fn hue_to_rgb(p: f32, q: f32, mut t: f32) -> f32 {
+    if t < 0.0 {
+        t += 1.0;
+    }
+    if t > 1.0 {
+        t -= 1.0;
+    }
+    if t < 1.0 / 6.0 {
+        p + (q - p) * 6.0 * t
+    } else if t < 0.5 {
+        q
+    } else if t < 2.0 / 3.0 {
+        p + (q - p) * (2.0 / 3.0 - t) * 6.0
+    } else {
+        p
+    }
+}
+
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "preserves the WGSL HSL conversion order"
+)]
+fn hsl_to_rgb(hsl: [f32; 3]) -> [f32; 3] {
+    if hsl[1] == 0.0 {
+        return [hsl[2]; 3];
+    }
+    let q = if hsl[2] < 0.5 {
+        hsl[2] * (1.0 + hsl[1])
+    } else {
+        hsl[2] + hsl[1] - hsl[2] * hsl[1]
+    };
+    let p = 2.0 * hsl[2] - q;
+    [
+        hue_to_rgb(p, q, hsl[0] + 1.0 / 3.0),
+        hue_to_rgb(p, q, hsl[0]),
+        hue_to_rgb(p, q, hsl[0] - 1.0 / 3.0),
+    ]
 }

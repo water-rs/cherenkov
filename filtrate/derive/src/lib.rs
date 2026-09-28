@@ -252,8 +252,8 @@ struct StageTokens<'a> {
 }
 
 impl StageTokens<'_> {
-    /// The kind, the `collect_stages` body, and the `ColorFilter` and
-    /// `CpuKernel` implementations of a colour filter.
+    /// The kind, the `collect_stages` body, and the `ColorFilter`,
+    /// `CpuKernel`, and `CpuFilter` implementations of a colour filter.
     fn color(
         &self,
         linear: bool,
@@ -278,15 +278,37 @@ impl StageTokens<'_> {
             collector.color(#core::Placed::new(&STAGE));
         };
         let kernel = cpu.map(|path| {
-            let header = impl_for(quote! { #core::CpuKernel });
+            let kernel_header = impl_for(quote! { #core::CpuKernel });
+            let filter_header = impl_for(quote! { #core::CpuFilter });
             quote! {
-                #header {
+                #kernel_header {
                     fn apply_cpu(
                         params: &[f32; #total_params],
                         space: &#core::WorkingSpace,
                         pixels: &mut [[f32; 4]],
                     ) {
                         #path(*params, space, pixels);
+                    }
+                }
+                #filter_header {
+                    fn cpu_footprint(
+                        _params: &Self::Params,
+                    ) -> #core::Footprint {
+                        #core::Footprint::ZERO
+                    }
+
+                    fn apply_cpu_image(
+                        &self,
+                        params: &Self::Params,
+                        space: &#core::WorkingSpace,
+                        image: &mut #core::CpuImage<'_>,
+                    ) -> ::core::result::Result<(), #core::CpuFilterError> {
+                        <Self as #core::CpuKernel>::apply_cpu(
+                            params,
+                            space,
+                            image.pixels,
+                        );
+                        ::core::result::Result::Ok(())
                     }
                 }
             }

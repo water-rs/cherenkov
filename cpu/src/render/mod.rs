@@ -89,8 +89,6 @@ pub struct RasterRenderer {
     image_budget: u64,
     /// The glyph mask cache, bounded by `Budget::cpu`.
     glyph_cache: glyph::GlyphCache,
-    /// Reusable band working buffers shared by every surface.
-    band_pool: raster::BandPool,
 }
 
 /// Runs on the render thread once: builds the worker pool, returning the
@@ -114,7 +112,6 @@ pub fn init(config: RasterConfig) -> Result<(RasterRenderer, RasterInfo), Engine
                 simd: "scalar",
                 cpu: cpu_model(),
             };
-            let band_pool = raster::BandPool::new(pool.current_num_threads());
             (
                 RasterRenderer {
                     pool,
@@ -123,7 +120,6 @@ pub fn init(config: RasterConfig) -> Result<(RasterRenderer, RasterInfo), Engine
                     images: HashMap::new(),
                     image_budget: config.budget.cpu.0,
                     glyph_cache: glyph::GlyphCache::new(config.budget.cpu.0),
-                    band_pool,
                 },
                 info,
             )
@@ -408,12 +404,11 @@ impl Renderer for RasterRenderer {
                 .map(account::content_bytes)
                 .sum::<u64>();
         }
-        categories.bands = self.band_pool.bytes()
-            + self
-                .surfaces
-                .values()
-                .map(SurfaceState::band_bytes)
-                .sum::<u64>();
+        categories.bands = self
+            .surfaces
+            .values()
+            .map(SurfaceState::band_bytes)
+            .sum::<u64>();
         categories.glyphs = self.glyph_cache.bytes();
         categories.images = self.images.values().map(|image| image.bytes()).sum();
         categories.colr = self.fonts.values().map(font::Font::colr_bytes).sum();
@@ -443,7 +438,6 @@ impl Renderer for RasterRenderer {
             }
             self.fonts.shrink_to_fit();
             self.glyph_cache.clear();
-            self.band_pool.clear();
             for surface in self.surfaces.values_mut() {
                 for content in surface.layers.values_mut() {
                     content.trim();
@@ -495,23 +489,12 @@ impl RasterRenderer {
         let [r, g, b, a] = sf.clear.components;
         let clear = [r * a, g * a, b * a, a];
         let pool = &self.pool;
-        let band_pool = &self.band_pool;
         let (draws, edges) = match &mut surf.output {
-            Output::F32(fb) => {
-                pool.install(|| raster::render_bands(&items, clear, fb, w, band_pool))
+            Output::F32(fb) => pool.install(|| raster::render_bands(&items, clear, fb, w)),
+            Output::F16(out) => pool.install(|| raster::render_bands_f16(&items, clear, out, w)),
+            Output::Stream { format, sink, emit } => {
+                raster::render_bands_stream(&items, clear, (w, h), emit, *format, sink.as_mut())
             }
-            Output::F16(out) => {
-                pool.install(|| raster::render_bands_f16(&items, clear, out, w, band_pool))
-            }
-            Output::Stream { format, sink, emit } => raster::render_bands_stream(
-                &items,
-                clear,
-                (w, h),
-                emit,
-                *format,
-                sink.as_mut(),
-                band_pool,
-            ),
         };
         if let (Some(start), Some(lowered), Some(resolved)) = (start, lowered_at, resolved_at) {
             tracing::debug!(target: "cherenkov_cpu::profile",

@@ -4354,7 +4354,11 @@ fn run() -> Result<(), SceneError> {
             l,
             srgb(0.05, 0.30, 0.95),
             srgb(0.95, 0.25, 0.05),
-            [srgb(0.95, 0.75, 0.05), srgb(0.10, 0.85, 0.40), srgb(0.70, 0.10, 0.90)],
+            [
+                srgb(0.95, 0.75, 0.05),
+                srgb(0.10, 0.85, 0.40),
+                srgb(0.70, 0.10, 0.90),
+            ],
         );
         refraction_member(l, 40.0, 32.0, 88.0, 80.0, 12.0, 6.0);
         refraction_member(l, 112.0, 96.0, 208.0, 192.0, 12.0, 6.0);
@@ -4403,8 +4407,14 @@ fn run() -> Result<(), SceneError> {
     corpus.scene_setup("backdrop-tint-p3", 256, 256, white, |b| {
         b.backdrop_group(1, Vec::new());
         let l = &mut b.root();
-        l.fill(Shape::rect(0.0, 0.0, 128.0, 256.0), solid(p3(1.0, 0.0, 0.0)));
-        l.fill(Shape::rect(128.0, 0.0, 256.0, 256.0), solid(p3(0.0, 0.9, 0.4)));
+        l.fill(
+            Shape::rect(0.0, 0.0, 128.0, 256.0),
+            solid(p3(1.0, 0.0, 0.0)),
+        );
+        l.fill(
+            Shape::rect(128.0, 0.0, 256.0, 256.0),
+            solid(p3(0.0, 0.9, 0.4)),
+        );
         l.fill(Shape::circle(96.0, 96.0, 56.0), solid(p3(0.9, 0.7, 0.0)));
         l.fill(Shape::circle(190.0, 180.0, 48.0), solid(p3(0.5, 0.0, 1.0)));
         l.layer(|m| {
@@ -4435,7 +4445,10 @@ fn run() -> Result<(), SceneError> {
             Shape::rect(0.0, 0.0, 256.0, 256.0),
             solid(p3(0.45, 0.45, 0.5)),
         );
-        l.fill(Shape::circle(128.0, 128.0, 72.0), solid(hdr(16.0, 16.0, 16.0)));
+        l.fill(
+            Shape::circle(128.0, 128.0, 72.0),
+            solid(hdr(16.0, 16.0, 16.0)),
+        );
         l.fill(Shape::circle(64.0, 208.0, 32.0), solid(hdr(0.5, 8.0, 3.0)));
         let rim = BackdropEffectSpec::RimLight {
             width: 10.0,

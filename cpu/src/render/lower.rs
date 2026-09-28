@@ -265,7 +265,7 @@ struct BackdropPlan {
 }
 
 /// The lowering walk state for one surface frame.
-pub struct Lowering<'a> {
+pub struct Lowering<'a, 'b> {
     items: &'a mut Vec<Item>,
     filters: Option<&'a mut Registry>,
     frame: FrameId,
@@ -274,6 +274,10 @@ pub struct Lowering<'a> {
     used_groups: HashSet<u64>,
     /// Glyph mask requests emitted during the walk.
     pub glyphs: Vec<GlyphReq>,
+    pub glyphs_rasterized: u32,
+    fonts: &'b mut HashMap<u64, super::font::Font>,
+    bitmap_fonts: &'b HashMap<u64, Arc<super::bitmap::BitmapFont>>,
+    bitmap_cache: &'b mut super::bitmap::BitmapCache,
     width: usize,
     height: usize,
     transform: Affine,
@@ -476,13 +480,16 @@ fn integer_edges(r: Rect) -> Option<IRect> {
     }
 }
 
-impl<'a> Lowering<'a> {
+impl<'a, 'b> Lowering<'a, 'b> {
     /// Starts a lowering into `items` for a `w` × `h` surface.
     pub fn new(
         items: &'a mut Vec<Item>,
         size: (u32, u32),
         filters: Option<&'a mut Registry>,
         frame: FrameId,
+        fonts: &'b mut HashMap<u64, super::font::Font>,
+        bitmap_fonts: &'b HashMap<u64, Arc<super::bitmap::BitmapFont>>,
+        bitmap_cache: &'b mut super::bitmap::BitmapCache,
     ) -> Self {
         Self {
             items,
@@ -491,6 +498,10 @@ impl<'a> Lowering<'a> {
             used_filters: HashSet::new(),
             used_groups: HashSet::new(),
             glyphs: Vec::new(),
+            glyphs_rasterized: 0,
+            fonts,
+            bitmap_fonts,
+            bitmap_cache,
             width: size.0 as usize,
             height: size.1 as usize,
             transform: Affine::IDENTITY,
@@ -514,9 +525,12 @@ impl<'a> Lowering<'a> {
         tree: &SurfaceTree,
         caches: &mut HashMap<LayerId, ContentData>,
         images: &HashMap<u64, Arc<super::image::CpuImage>>,
-        fonts: &mut HashMap<u64, super::font::Font>,
     ) -> Result<(), RenderError> {
-        let mut lowerer = super::prepared::Lowerer { images, fonts };
+        let mut lowerer = super::prepared::Lowerer {
+            images,
+            fonts: &mut *self.fonts,
+            bitmap_fonts: self.bitmap_fonts,
+        };
         for content in caches.values_mut() {
             self.commands_lowered += content.prepare(&mut lowerer)?;
         }
@@ -1170,13 +1184,22 @@ impl<'a> Lowering<'a> {
             Some(Emission::Clip(_)) => unreachable!("structural changes replace the cache layout"),
         };
         items.clear();
-        let mut compose = Lowering::new(&mut items, (0, 0), None, FrameId::new(0));
+        let mut compose = Lowering::new(
+            &mut items,
+            (0, 0),
+            None,
+            FrameId::new(0),
+            &mut *self.fonts,
+            self.bitmap_fonts,
+            &mut *self.bitmap_cache,
+        );
         compose.width = self.width;
         compose.height = self.height;
         compose.transform = self.transform;
         compose.clip = self.clip.clone();
         compose.realize(op)?;
         self.glyphs.append(&mut compose.glyphs);
+        self.glyphs_rasterized += compose.glyphs_rasterized;
         self.items.extend_from_slice(&items);
         cache.data = Some(Emission::Draw(self.device_data(items)));
         cache.valid = true;
@@ -1215,6 +1238,16 @@ impl<'a> Lowering<'a> {
             Op::Glyphs { local, run, paint } => {
                 self.transform *= *local;
                 self.glyph_run(run, paint)
+            }
+            Op::BitmapGlyph {
+                local,
+                font,
+                glyph,
+                origin,
+                size,
+            } => {
+                self.transform *= *local;
+                self.bitmap_glyph(*font, *glyph, *origin, *size)
             }
             _ => unreachable!("scope is composed, never realized as a leaf"),
         }
@@ -1375,6 +1408,68 @@ impl<'a> Lowering<'a> {
             bbox,
             clip: self.clip.clone(),
         });
+        Ok(())
+    }
+
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "glyph placement is represented at raster precision"
+    )]
+    fn bitmap_glyph(
+        &mut self,
+        font_id: u64,
+        glyph_id: u32,
+        origin: [f32; 2],
+        size: f32,
+    ) -> Result<(), RenderError> {
+        let bitmap_font = self
+            .bitmap_fonts
+            .get(&font_id)
+            .ok_or_else(|| RenderError::Font(format!("unregistered bitmap font {font_id}")))?;
+        let device_ppem = (f64::from(size) * sigma_max(self.transform)) as f32;
+        let strike = bitmap_font.select(device_ppem);
+        let key = super::bitmap::BitmapKey {
+            font: font_id,
+            strike,
+            glyph: glyph_id,
+        };
+        let bitmap = if let Some(bitmap) = self.bitmap_cache.get(&key) {
+            bitmap
+        } else {
+            let font = self
+                .fonts
+                .get(&font_id)
+                .ok_or_else(|| RenderError::Font(format!("unregistered font {font_id}")))?;
+            let Some(decoded) = super::bitmap::decode(
+                &font.data.data,
+                font.data.index,
+                bitmap_font,
+                strike,
+                glyph_id,
+            )?
+            else {
+                return Ok(());
+            };
+            let bitmap = super::bitmap::cpu_bitmap(decoded)?;
+            self.bitmap_cache.insert(key, bitmap)?;
+            self.glyphs_rasterized += 1;
+            self.bitmap_cache
+                .get(&key)
+                .expect("inserted bitmap is present in the cache")
+        };
+        let rect = Rect::new(
+            f64::from(origin[0]) + f64::from(size) * bitmap.em.x0,
+            f64::from(origin[1]) + f64::from(size) * bitmap.em.y0,
+            f64::from(origin[0]) + f64::from(size) * bitmap.em.x1,
+            f64::from(origin[1]) + f64::from(size) * bitmap.em.y1,
+        );
+        let image_transform = Affine::translate((rect.x0, rect.y0))
+            * Affine::scale_non_uniform(
+                rect.width() / f64::from(bitmap.image.width),
+                rect.height() / f64::from(bitmap.image.height),
+            );
+        let paint = PaintData::bitmap(Arc::clone(&bitmap.image), image_transform);
+        self.fill(&ShapeData::Rect(rect), &paint);
         Ok(())
     }
 

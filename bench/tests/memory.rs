@@ -1,9 +1,9 @@
 // Copyright 2026 the Cherenkov Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-#![cfg(feature = "cherenkov-cpu")]
-
 //! Verifies that measure reports include CPU memory snapshots.
+
+#![cfg(feature = "cherenkov-cpu")]
 
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};

@@ -732,6 +732,7 @@ fn cherenkov_features() -> Vec<Feature> {
         Feature::Backdrop,
         Feature::BackdropBlur,
         Feature::BackdropColorMatrix,
+        Feature::BackdropEffect,
         // `sRGB` maps to `SrgbEncoded`; `linear-p3` and `linear-srgb` are
         // both linear interpolation, which is the working space already.
         Feature::InterpolationSpace(ColorSpace::Srgb),

@@ -19,39 +19,55 @@ impl CpuImage {
 
     /// Decode once on registration. Alpha is unpremultiplied in the encoded
     /// domain before transfer/primary conversion, then premultiplied in P3.
+    /// `Rgba16F` texels convert f16 -> f64 directly — never through 8 bits —
+    /// and keep values outside `[0, 1]`.
     #[expect(
         clippy::cast_possible_truncation,
         reason = "decoded working pixels use f32"
     )]
     pub fn decode(image: &ImageUpload) -> Result<Self, ResourceError> {
-        if image.format != ImageFormat::Rgba8 || image.width == 0 || image.height == 0 {
+        if image.width == 0 || image.height == 0 {
             return Err(ResourceError::Image(
-                "CPU uploads require nonempty RGBA8".into(),
+                "CPU uploads require nonempty images".into(),
             ));
         }
+        let bytes_per_texel = match image.format {
+            ImageFormat::Rgba8 => 4,
+            ImageFormat::Rgba16F => 8,
+            format => {
+                return Err(ResourceError::Image(format!(
+                    "unsupported image format {format:?}"
+                )));
+            }
+        };
+        // u8 data can be premultiplied-encodable only up to 1.0; f16 texels
+        // keep extended values, so their un-premultiply is unbounded.
+        let unpremul_max = match image.format {
+            ImageFormat::Rgba8 => 1.0,
+            _ => f64::INFINITY,
+        };
         let count = usize::try_from(image.width)
             .ok()
             .zip(usize::try_from(image.height).ok())
             .and_then(|(width, height)| width.checked_mul(height))
-            .and_then(|count| count.checked_mul(4));
+            .and_then(|count| count.checked_mul(bytes_per_texel));
         if count != Some(image.data.len()) {
             return Err(ResourceError::Image(
                 "image dimensions and byte length disagree".into(),
             ));
         }
-        let mut pixels = Vec::with_capacity(image.data.len() / 4);
-        for pixel in image.data.as_chunks::<4>().0 {
-            let alpha = f64::from(pixel[3]) / 255.0;
+        let mut pixels = Vec::with_capacity(image.data.len() / bytes_per_texel);
+        let mut texel = |encoded: [f64; 4]| {
+            let alpha = encoded[3];
             if alpha == 0.0 {
                 pixels.push([0.0; 4]);
-                continue;
+                return;
             }
             let linear = std::array::from_fn(|channel| {
-                let encoded = f64::from(pixel[channel]) / 255.0;
                 let straight = if image.premultiplied {
-                    (encoded / alpha).min(1.0)
+                    (encoded[channel] / alpha).min(unpremul_max)
                 } else {
-                    encoded
+                    encoded[channel]
                 };
                 if image.color_space == ImageColorSpace::LinearSrgb
                     || image.color_space == ImageColorSpace::LinearP3
@@ -76,6 +92,24 @@ impl CpuImage {
                 (working[2] * alpha) as f32,
                 alpha as f32,
             ]);
+        };
+        match image.format {
+            ImageFormat::Rgba8 => {
+                for pixel in image.data.as_chunks::<4>().0 {
+                    texel(pixel.map(|v| f64::from(v) / 255.0));
+                }
+            }
+            ImageFormat::Rgba16F => {
+                for pixel in image.data.as_chunks::<8>().0 {
+                    texel(std::array::from_fn(|channel| {
+                        f64::from(half::f16::from_le_bytes([
+                            pixel[2 * channel],
+                            pixel[2 * channel + 1],
+                        ]))
+                    }));
+                }
+            }
+            _ => unreachable!("format validated above"),
         }
         Ok(Self {
             width: image.width,

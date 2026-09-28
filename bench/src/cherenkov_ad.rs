@@ -17,7 +17,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use cherenkov::{
     Draw as _, Engine as GpuEngine, Fixed, ImageData, Layer as GpuLayer, LayerEdit, Offscreen,
-    OffscreenFormat, RenderError, ResourceError, Rgba8, Surface, Transaction,
+    OffscreenFormat, RenderError, ResourceError, Rgba8, Rgba16F, Surface, Transaction,
 };
 use cherenkov_gpu::interop::{
     OutputAlpha, OutputColor, Presenter, SharedDevice, TextureOutput, TextureTarget,
@@ -448,7 +448,7 @@ pub struct Cherenkov {
     /// Registered images per (blob hash, declared encoding).
     images: HashMap<(ResourceHash, ImageEncoding), cherenkov::ImageId>,
     /// The `Image` handles keeping `images` registered.
-    image_handles: Vec<cherenkov::Image<cherenkov::Rgba8>>,
+    image_handles: Vec<ImageHandle>,
     /// Layers holding recorded content, in draw order.
     content_layers: Vec<ContentLayer>,
     /// Whether any layer carries a `motion`.
@@ -691,10 +691,12 @@ fn cherenkov_features() -> Vec<Feature> {
         Feature::Image,
         Feature::ImagePaint,
         Feature::ExtendNone,
-        // Display P3 PNGs upload verbatim; `Rgba16F` blobs and the linear
-        // spaces they can carry stay unsupported until the engine grows an
-        // `Uploads<Rgba16F>` path.
+        // Display P3 PNGs upload verbatim; the `Rgba16F` path carries the
+        // linear primaries as well.
         Feature::ImageColorSpace(ImageColorSpace::DisplayP3),
+        Feature::ImageColorSpace(ImageColorSpace::LinearP3),
+        Feature::ImageColorSpace(ImageColorSpace::LinearSrgb),
+        Feature::ImageF16,
         // `sRGB` maps to `SrgbEncoded`; `linear-p3` and `linear-srgb` are
         // both linear interpolation, which is the working space already.
         Feature::InterpolationSpace(ColorSpace::Srgb),
@@ -1046,16 +1048,24 @@ fn register_fonts(
     Ok(())
 }
 
+/// Keeps a registered image alive until the engine's surface drops —
+/// `Image<F>` is format-typed, so the two encodings box separately.
+#[expect(dead_code, reason = "the handles exist to keep uploads alive")]
+enum ImageHandle {
+    Rgba8(cherenkov::Image<cherenkov::Rgba8>),
+    Rgba16F(cherenkov::Image<cherenkov::Rgba16F>),
+}
+
 /// Registers one scene image resource, once per (hash, encoding).
 ///
 /// PNGs carry encoded sRGB or Display P3 data;
 /// [`cherenkov_oracle::image::decode_png_rgba8`] is the shared decoder the
 /// oracle and every adapter use, and the engine converts to the working
-/// space at upload. `Rgba16F` blobs report `image-f16` unsupported: the
-/// engine has no `Uploads<Rgba16F>` impl.
+/// space at upload; `Rgba16F` blobs go through `Uploads<Rgba16F>` —
+/// straight-alpha, already linear-light in the declared primaries.
 fn register_image(
     images: &mut HashMap<(ResourceHash, ImageEncoding), cherenkov::ImageId>,
-    handles: &mut Vec<cherenkov::Image<cherenkov::Rgba8>>,
+    handles: &mut Vec<ImageHandle>,
     engine: &GpuEngine<Gpu>,
     hash: &ResourceHash,
     encoding: ImageEncoding,
@@ -1083,14 +1093,38 @@ fn register_image(
             };
             (width, height, rgba, space)
         }
-        // The engine has no `Uploads<Rgba16F>` impl: report the feature the
-        // scene needed rather than faking an upload.
-        ImageEncoding::Rgba16F { .. } => {
-            return Err(BenchError::Unsupported {
-                engine: Cherenkov::NAME,
-                feature: Feature::ImageF16,
-                api: Some("Rgba16F image upload"),
-            });
+        ImageEncoding::Rgba16F {
+            width,
+            height,
+            color_space,
+        } => {
+            let expected = usize::try_from(width * height * 8)
+                .map_err(|e| BenchError::Engine(format!("f16 image: {e}")))?;
+            if blob.len() != expected {
+                return Err(BenchError::Engine(format!(
+                    "f16 image: {} bytes for {width}x{height}, expected {expected}",
+                    blob.len()
+                )));
+            }
+            let space = match color_space {
+                ImageColorSpace::LinearSrgb => cherenkov::ImageColorSpace::LinearSrgb,
+                ImageColorSpace::LinearP3 => cherenkov::ImageColorSpace::LinearP3,
+                _ => {
+                    return Err(BenchError::Engine(format!(
+                        "f16 images are linear-light, not {color_space:?}"
+                    )));
+                }
+            };
+            let image = engine
+                .image(
+                    ImageData::<Rgba16F>::new(width, height, blob.clone())
+                        .map_err(|e| BenchError::Engine(format!("cherenkov image: {e}")))?
+                        .color_space(space),
+                )
+                .map_err(|e| BenchError::Engine(format!("cherenkov image: {e}")))?;
+            images.insert(key, image.id());
+            handles.push(ImageHandle::Rgba16F(image));
+            return Ok(());
         }
     };
     let image = engine
@@ -1101,14 +1135,14 @@ fn register_image(
         )
         .map_err(|e| BenchError::Engine(format!("cherenkov image: {e}")))?;
     images.insert(key, image.id());
-    handles.push(image);
+    handles.push(ImageHandle::Rgba8(image));
     Ok(())
 }
 
 /// Registers every image referenced by draws or image paints in `layer`.
 fn register_images(
     images: &mut HashMap<(ResourceHash, ImageEncoding), cherenkov::ImageId>,
-    handles: &mut Vec<cherenkov::Image<cherenkov::Rgba8>>,
+    handles: &mut Vec<ImageHandle>,
     engine: &GpuEngine<Gpu>,
     layer: &SceneLayer,
     blobs: &Blobs,

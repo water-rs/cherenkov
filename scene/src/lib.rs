@@ -25,7 +25,7 @@ mod shape;
 #[doc(hidden)]
 pub mod corpus;
 
-pub use backdrop::{BackdropFilter, BackdropGroup};
+pub use backdrop::{BackdropEffectSpec, BackdropFilter, BackdropGroup};
 pub use builder::{LayerBuilder, SceneBuilder};
 pub use color::{Color, ColorSpace};
 pub use draw::{

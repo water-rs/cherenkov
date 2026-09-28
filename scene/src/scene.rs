@@ -91,6 +91,8 @@ pub enum Feature {
     BackdropBlur,
     /// A backdrop group whose capture runs through a colour matrix.
     BackdropColorMatrix,
+    /// A member layer carries a per-member backdrop sampling effect.
+    BackdropEffect,
 }
 
 /// The scene's working space. Only linear Display P3 exists today; the enum
@@ -228,6 +230,12 @@ impl Scene {
                     return Err(SceneError::UnknownBackdropGroup(id));
                 }
             }
+            if let Some(effect) = &layer.backdrop_effect {
+                if layer.backdrop.is_none() {
+                    return Err(SceneError::BackdropEffectWithoutGroup);
+                }
+                Scene::validate_effect(effect)?;
+            }
             for item in &layer.items {
                 if let Item::Layer(l) = item {
                     walk(l, groups)?;
@@ -236,6 +244,42 @@ impl Scene {
             Ok(())
         }
         walk(&self.root, &self.backdrop_groups)
+    }
+
+    /// A `backdrop_effect`'s parameters must be finite and in range.
+    fn validate_effect(effect: &crate::BackdropEffectSpec) -> Result<(), SceneError> {
+        use crate::BackdropEffectSpec as E;
+        match effect {
+            E::ColorMatrix { matrix } if matrix.iter().all(|v| v.is_finite()) => Ok(()),
+            E::ColorMatrix { .. } => {
+                Err(SceneError::InvalidBackdropEffect("non-finite matrix entry"))
+            }
+            E::Refraction { depth, .. } if !(depth.is_finite() && *depth > 0.0) => {
+                Err(SceneError::InvalidBackdropEffect(
+                    "refraction depth must be a finite positive number",
+                ))
+            }
+            E::Refraction { strength, .. } if !(strength.is_finite() && *strength >= 0.0) => {
+                Err(SceneError::InvalidBackdropEffect(
+                    "refraction strength must be a finite non-negative number",
+                ))
+            }
+            E::Refraction { .. } => Ok(()),
+            E::RimLight { width, .. } if !(width.is_finite() && *width > 0.0) => {
+                Err(SceneError::InvalidBackdropEffect(
+                    "rim-light width must be a finite positive number",
+                ))
+            }
+            E::RimLight { color, gain, .. } => {
+                if color.iter().all(|v| v.is_finite()) && gain.is_finite() && *gain >= 0.0 {
+                    Ok(())
+                } else {
+                    Err(SceneError::InvalidBackdropEffect(
+                        "rim-light colour and gain must be finite, gain non-negative",
+                    ))
+                }
+            }
+        }
     }
 
     /// Write `scene.json` into `dir` (creating it), without touching
@@ -467,6 +511,9 @@ fn collect_layer_features(layer: &Layer, f: &mut BTreeSet<Feature>) {
     }
     if layer.backdrop.is_some() {
         f.insert(Feature::Backdrop);
+    }
+    if layer.backdrop_effect.is_some() {
+        f.insert(Feature::BackdropEffect);
     }
     for item in &layer.items {
         match item {

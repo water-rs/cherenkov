@@ -23,6 +23,12 @@ pub enum SceneError {
     /// A backdrop-group member layer has no clip.
     #[error("backdrop group {0} member layer has no clip")]
     BackdropMemberUnclipped(u32),
+    /// A layer has a `backdrop_effect` without a `backdrop` group.
+    #[error("layer has a backdrop effect but no backdrop group")]
+    BackdropEffectWithoutGroup,
+    /// A `backdrop_effect` parameter is non-finite or out of range.
+    #[error("invalid backdrop effect: {0}")]
+    InvalidBackdropEffect(&'static str),
     /// The `features` set stored in `scene.json` does not match the features
     /// recomputed from the layer tree.
     #[error("stored features {declared:?} do not match recomputed {computed:?}")]

@@ -11,16 +11,21 @@ use std::{
     },
 };
 
-use cherenkov::{FilterId, FrameId, FrameTime, RenderError};
+use cherenkov::{BackdropId, FilterId, FrameId, FrameTime, RenderError, SurfaceId};
 use filtrate_core::{
-    AnimatedTarget, AnimationTrack, CpuFilter, CpuFilterError, CpuImage, ParamArray, SignalVisitor,
-    WatchGuard, WorkingSpace,
+    AnimatedTarget, AnimationTrack, CpuFilter, CpuFilterError, CpuImage, Footprint, ParamArray,
+    SignalVisitor, WatchGuard, WorkingSpace,
 };
 
 use crate::RedrawCallback;
 
 pub(super) trait Erased: Send + Sync {
     fn footprint(&self, params: &[f32], size: (usize, usize)) -> f32;
+    /// The filter's unresolved footprint bound: the same value
+    /// [`cherenkov::BackdropChain::footprint_bound`] reports, because a
+    /// spatial `CpuFilter` defines `cpu_footprint` as `footprint_of` and
+    /// colour chains contribute [`Footprint::ZERO`] either way.
+    fn footprint_bound(&self, params: &[f32]) -> Footprint;
     fn apply(
         &self,
         params: &[f32],
@@ -30,6 +35,16 @@ pub(super) trait Erased: Send + Sync {
 }
 
 pub(super) type Prepared = (Arc<dyn Erased + Send + Sync>, Arc<[f32]>, f32);
+
+/// A backdrop group's prepared chain state for one frame.
+pub(super) struct PreparedBackdrop {
+    /// The chain and its sampled parameters; `None` for an unfiltered
+    /// group.
+    pub filter: Option<super::lower::FrameFilter>,
+    /// The chain's footprint bound over the frame's animation magnitudes
+    /// ([`Footprint::ZERO`] unfiltered).
+    pub footprint: Footprint,
+}
 
 impl<F> Erased for F
 where
@@ -42,6 +57,10 @@ where
     fn footprint(&self, params: &[f32], size: (usize, usize)) -> f32 {
         let params = F::Params::read_from(params);
         F::cpu_footprint(&params).resolve((size.0 as f32, size.1 as f32))
+    }
+
+    fn footprint_bound(&self, params: &[f32]) -> Footprint {
+        F::cpu_footprint(&F::Params::read_from(params))
     }
 
     fn apply(
@@ -128,6 +147,9 @@ impl SignalVisitor for WatcherInstaller<'_> {
 #[derive(Default)]
 pub struct Registry {
     entries: std::collections::HashMap<u64, Entry>,
+    /// Backdrop groups by `(surface, group)`; `None` is an unfiltered
+    /// group's registration marker.
+    backdrops: std::collections::HashMap<(u64, u64), Option<Entry>>,
     redraw: Option<RedrawCallback>,
     last_frame: Option<(FrameId, cherenkov::Instant)>,
     delta: Duration,
@@ -140,7 +162,9 @@ impl Registry {
         registry
     }
 
-    pub fn add<F>(&mut self, id: FilterId, filter: F)
+    /// Builds the [`Entry`] for `filter`: its initial parameters,
+    /// animation tracks and redraw watchers.
+    fn entry<F>(&self, filter: F) -> Entry
     where
         F: CpuFilter + cherenkov::RenderTransfer + Send + Sync,
     {
@@ -158,21 +182,68 @@ impl Registry {
             redraw: self.redraw.clone(),
             guards: &mut guards,
         });
-        let filter: Arc<dyn Erased + Send + Sync> = Arc::new(filter);
-        self.entries.insert(
-            id.raw(),
-            Entry {
-                filter,
-                tracks: initial.iter().copied().map(AnimationTrack::new).collect(),
-                events,
-                pending_events: VecDeque::new(),
-                dirty,
-                active,
-                _guards: guards,
-                sequence: None,
-                params: initial,
-            },
-        );
+        Entry {
+            filter: Arc::new(filter),
+            tracks: initial.iter().copied().map(AnimationTrack::new).collect(),
+            events,
+            pending_events: VecDeque::new(),
+            dirty,
+            active,
+            _guards: guards,
+            sequence: None,
+            params: initial,
+        }
+    }
+
+    /// One entry's footprint bound over its animation magnitudes.
+    fn footprint_bound(entry: &Entry) -> Footprint {
+        let bounds: Vec<f32> = entry
+            .tracks
+            .iter()
+            .map(AnimationTrack::magnitude_bound)
+            .collect();
+        entry.filter.footprint_bound(&bounds)
+    }
+
+    pub fn add<F>(&mut self, id: FilterId, filter: F)
+    where
+        F: CpuFilter + cherenkov::RenderTransfer + Send + Sync,
+    {
+        let entry = self.entry(filter);
+        self.entries.insert(id.raw(), entry);
+    }
+
+    /// Registers an unfiltered backdrop group.
+    pub fn add_backdrop_group(&mut self, surface: SurfaceId, id: BackdropId) {
+        if let Some(entry) = self
+            .backdrops
+            .insert((surface.raw(), id.raw()), None)
+            .flatten()
+        {
+            entry.active.store(false, Ordering::Release);
+        }
+    }
+
+    /// Registers a backdrop group whose capture runs `filter`.
+    pub fn add_filtered_backdrop_group<F>(&mut self, surface: SurfaceId, id: BackdropId, filter: F)
+    where
+        F: CpuFilter + cherenkov::RenderTransfer + Send + Sync,
+    {
+        let entry = self.entry(filter);
+        if let Some(old) = self
+            .backdrops
+            .insert((surface.raw(), id.raw()), Some(entry))
+            .flatten()
+        {
+            old.active.store(false, Ordering::Release);
+        }
+    }
+
+    /// Unregisters a backdrop group.
+    pub fn remove_backdrop_group(&mut self, surface: SurfaceId, id: BackdropId) {
+        if let Some(entry) = self.backdrops.remove(&(surface.raw(), id.raw())).flatten() {
+            entry.active.store(false, Ordering::Release);
+        }
     }
 
     pub fn remove(&mut self, id: FilterId) {
@@ -224,25 +295,85 @@ impl Registry {
         ))
     }
 
-    pub(super) fn set_active(&self, used: &std::collections::HashSet<u64>) {
+    /// The frame's chain state for backdrop group `id` on `surface`, plus
+    /// its unresolved [`Footprint`] bound over the frame's animation
+    /// magnitudes.
+    pub(super) fn prepare_backdrop(
+        &mut self,
+        surface: SurfaceId,
+        id: BackdropId,
+        sequence: FrameId,
+    ) -> Result<PreparedBackdrop, RenderError> {
+        let Some(group) = self.backdrops.get_mut(&(surface.raw(), id.raw())) else {
+            return Err(RenderError::Render(format!(
+                "unregistered backdrop group {}",
+                id.raw()
+            )));
+        };
+        let Some(entry) = group else {
+            return Ok(PreparedBackdrop {
+                filter: None,
+                footprint: Footprint::ZERO,
+            });
+        };
+        entry.prepare(sequence, self.delta);
+        Ok(PreparedBackdrop {
+            filter: Some((Arc::clone(&entry.filter), Arc::clone(&entry.params))),
+            footprint: Self::footprint_bound(entry),
+        })
+    }
+
+    /// Whether backdrop group `id` on `surface` needs another frame.
+    pub(super) fn wants_redraw_group(&self, surface: SurfaceId, id: BackdropId) -> bool {
+        self.backdrops
+            .get(&(surface.raw(), id.raw()))
+            .is_some_and(|group| group.as_ref().is_some_and(Entry::wants_redraw))
+    }
+
+    /// Marks filters and backdrop chains not sampled this frame inactive.
+    pub(super) fn set_active(
+        &self,
+        used: &std::collections::HashSet<u64>,
+        used_groups: &std::collections::HashSet<(u64, u64)>,
+    ) {
         for (id, entry) in &self.entries {
             entry.active.store(used.contains(id), Ordering::Release);
         }
+        for (key, group) in &self.backdrops {
+            if let Some(entry) = group {
+                entry
+                    .active
+                    .store(used_groups.contains(key), Ordering::Release);
+            }
+        }
     }
 
-    pub(super) fn finish_frame(&mut self, used: &std::collections::HashSet<u64>) {
+    /// The per-frame housekeeping for every entry sampled this frame.
+    fn finish_entry(entry: &mut Entry) {
+        if !entry.pending_events.is_empty() {
+            entry.dirty.store(true, Ordering::Release);
+            return;
+        }
+        entry.dirty.store(false, Ordering::Release);
+        if let Ok(event) = entry.events.try_recv() {
+            entry.pending_events.push_back(event);
+            entry.dirty.store(true, Ordering::Release);
+        }
+    }
+
+    pub(super) fn finish_frame(
+        &mut self,
+        used: &std::collections::HashSet<u64>,
+        used_groups: &std::collections::HashSet<(u64, u64)>,
+    ) {
         for id in used {
-            let Some(entry) = self.entries.get_mut(id) else {
-                continue;
-            };
-            if !entry.pending_events.is_empty() {
-                entry.dirty.store(true, Ordering::Release);
-                continue;
+            if let Some(entry) = self.entries.get_mut(id) {
+                Self::finish_entry(entry);
             }
-            entry.dirty.store(false, Ordering::Release);
-            if let Ok(event) = entry.events.try_recv() {
-                entry.pending_events.push_back(event);
-                entry.dirty.store(true, Ordering::Release);
+        }
+        for key in used_groups {
+            if let Some(Some(entry)) = self.backdrops.get_mut(key) {
+                Self::finish_entry(entry);
             }
         }
     }
@@ -250,7 +381,11 @@ impl Registry {
 
 impl Drop for Registry {
     fn drop(&mut self) {
-        for entry in self.entries.values() {
+        for entry in self
+            .entries
+            .values()
+            .chain(self.backdrops.values().flatten())
+        {
             entry.active.store(false, Ordering::Release);
         }
     }

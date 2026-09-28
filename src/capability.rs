@@ -130,25 +130,29 @@ impl<F: filtrate_core::Filter<Kind = filtrate_core::kind::Color>>
     }
 }
 
-/// The backend captures and samples backdrops (`Surface::backdrop_group`,
-/// `LayerEdit::backdrop`).
+/// The backend captures and samples backdrops
+/// (`Surface::backdrop_group_unfiltered`, `LayerEdit::backdrop`).
 pub trait Backdrop: Filters {
     /// Registers backdrop group `id` on `surface` with no filter chain.
     fn add_backdrop_group(r: &mut Self::Renderer, surface: SurfaceId, id: BackdropId);
 
+    /// Unregisters a backdrop group; frames that still sample it fail.
+    fn remove_backdrop_group(r: &mut Self::Renderer, surface: SurfaceId, id: BackdropId);
+}
+
+/// The backend can run the backdrop chain `F` of kind `K`
+/// (`Surface::backdrop_group`).
+pub trait BackdropRuns<K: filtrate_core::kind::Kind, F: BackdropChain<K> + crate::RenderTransfer>:
+    Backdrop
+{
     /// Registers backdrop group `id` on `surface` whose capture runs
     /// through `filter`.
-    fn add_filtered_backdrop_group<K, F>(
+    fn add_filtered_backdrop_group(
         r: &mut Self::Renderer,
         surface: SurfaceId,
         id: BackdropId,
         filter: F,
-    ) where
-        K: filtrate_core::kind::Kind,
-        F: BackdropChain<K> + crate::RenderTransfer;
-
-    /// Unregisters a backdrop group; frames that still sample it fail.
-    fn remove_backdrop_group(r: &mut Self::Renderer, surface: SurfaceId, id: BackdropId);
+    );
 }
 
 /// The backend produces HDR output.

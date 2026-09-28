@@ -573,12 +573,13 @@ pub fn resolve_winding(
     if segs.is_empty() {
         return None;
     }
-    let mut ys: Vec<f64> = segs.iter().flat_map(|s| [s.y0, s.y1]).collect();
+    let mut ys: Vec<f64> = Vec::with_capacity(2 * segs.len());
+    ys.extend(segs.iter().flat_map(|s| [s.y0, s.y1]));
     ys.sort_by(f64::total_cmp);
     ys.dedup();
     segs.sort_by(|a, b| a.y0.total_cmp(&b.y0));
 
-    let mut out: Vec<(f64, f64, f64, f64)> = Vec::new();
+    let mut out: Vec<(f64, f64, f64, f64)> = Vec::with_capacity(segs.len());
     let mut overlap = false;
     // `next` admits segments as the sweep reaches their top; `active`
     // retires them once they end at or above the band's top. No segment
@@ -586,7 +587,7 @@ pub fn resolve_winding(
     // don't change admission — so the incremental set matches a fresh
     // `y0 <= ya && y1 >= yb` scan every band.
     let mut next = 0usize;
-    let mut active: Vec<usize> = Vec::new();
+    let mut active: Vec<usize> = Vec::with_capacity(segs.len());
     // Per-segment open boundary run: (index into `out`, orientation,
     // emitting band). A segment that is a boundary again in the very
     // next band with the same orientation extends its emitted edge
@@ -598,8 +599,10 @@ pub fn resolve_winding(
     // cross-segment collinear merge: (index into `out`, orientation,
     // x at the band's bottom, slope). Rebuilt after each emitting
     // band; a split `continue` leaves it untouched since no band was
-    // emitted between.
-    let mut prev_open: Vec<(usize, bool, f64, f64)> = Vec::new();
+    // emitted between. `open` is the band under construction; the two
+    // buffers swap so no band allocates.
+    let mut prev_open: Vec<(usize, bool, f64, f64)> = Vec::with_capacity(segs.len());
+    let mut open: Vec<(usize, bool, f64, f64)> = Vec::new();
     let mut band = 0usize;
     while band + 1 < ys.len() {
         let (ya, yb) = (ys[band], ys[band + 1]);
@@ -650,7 +653,7 @@ pub fn resolve_winding(
         let mut inside = false;
         let mut wmin = 0.0f64;
         let mut wmax = 0.0f64;
-        let mut open: Vec<(usize, bool, f64, f64)> = Vec::new();
+        open.clear();
         for &i in &active {
             let seg = &segs[i];
             w += seg.dir;
@@ -704,7 +707,7 @@ pub fn resolve_winding(
                 inside = now;
             }
         }
-        prev_open = open;
+        std::mem::swap(&mut open, &mut prev_open);
         // A winding magnitude above one, or both signs in one band,
         // means regions overlap — only then is rewriting needed.
         if wmax >= 2.0 || wmin <= -2.0 || (wmin < 0.0 && wmax > 0.0) {

@@ -10,6 +10,9 @@ use cherenkov_gpu::{Gpu, GpuConfig};
 const RED: WorkingColor = WorkingColor::new([1.0, 0.0, 0.0, 1.0]);
 const BLUE: WorkingColor = WorkingColor::new([0.0, 0.0, 1.0, 1.0]);
 const GREEN: WorkingColor = WorkingColor::new([0.0, 1.0, 0.0, 1.0]);
+/// HDR primaries so a `PlusLighter` sum exceeds SDR white.
+const HDR_RED: WorkingColor = WorkingColor::new([1.5, 0.0, 0.0, 1.0]);
+const HDR_BLUE: WorkingColor = WorkingColor::new([0.0, 0.0, 1.25, 1.0]);
 
 /// An engine, or `None` when no adapter exists.
 fn engine() -> Option<Engine<Gpu>> {
@@ -341,6 +344,42 @@ fn nested_tree_layers_isolate_at_the_blending_parent() -> Result<(), Box<dyn std
     assert_eq!(
         pixel(3, 3).map(f32::to_bits),
         [0.0_f32, 0.0, 1.0, 1.0].map(f32::to_bits)
+    );
+    Ok(())
+}
+
+/// Two overlapping opaque `PlusLighter` layers: coverage saturates at 1,
+/// summed light exceeds 1 and survives in the extended working space (#126).
+#[test]
+fn plus_lighter_saturates_alpha_not_colour() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(engine) = engine() else {
+        return Ok(());
+    };
+    let surface = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
+    surface.update(|tx| {
+        tx[surface.root()].content(surface.record(|c| {
+            c.fill(Rect::new(0., 0., 32., 64.), HDR_RED);
+        }));
+    });
+    let layer = surface.layer();
+    surface.update(|tx| {
+        tx[&layer].blend(BlendMode::PlusLighter);
+        tx[surface.root()].push(&layer);
+    });
+    surface.update(|tx| {
+        tx[&layer].content(surface.record(|c| {
+            c.fill(Rect::new(16., 0., 64., 64.), HDR_BLUE);
+        }));
+    });
+    engine.render(cherenkov::FrameTime::now())?;
+    let px = surface.readback()?.pixels[(32 * 64 + 24) as usize];
+    assert!(
+        px[3] <= 1.0 + 1e-3,
+        "plus-lighter alpha must saturate: {px:?}"
+    );
+    assert!(
+        (px[0] - 1.5).abs() < 1e-2 && (px[2] - 1.25).abs() < 1e-2,
+        "plus-lighter colour adds unclamped: {px:?}"
     );
     Ok(())
 }

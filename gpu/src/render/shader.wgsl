@@ -926,7 +926,7 @@ fn blend_color(mode: u32, cb: vec4<f32>, cs: vec4<f32>) -> vec4<f32> {
         case 24u: { return porter_duff(ab, 1.0 - as_, cb, cs); }           // SrcAtop
         case 25u: { return porter_duff(1.0 - ab, as_, cb, cs); }           // DestAtop
         case 26u: { return porter_duff(1.0 - ab, 1.0 - as_, cb, cs); }     // Xor
-        case 27u: { return porter_duff(1.0, 1.0, cb, cs); }                // PlusLighter
+        case 27u: { return vec4<f32>(cs.rgb + cb.rgb, min(as_ + ab, 1.0)); } // PlusLighter
         default: {}
     }
     if as_ == 0.0 {

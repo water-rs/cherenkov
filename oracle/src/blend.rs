@@ -148,7 +148,15 @@ pub fn blend(mode: BlendMode, cb: [f64; 4], cs: [f64; 4]) -> [f64; 4] {
         BlendMode::SrcAtop => return porter_duff(ab, 1.0 - as_),
         BlendMode::DestAtop => return porter_duff(1.0 - ab, as_),
         BlendMode::Xor => return porter_duff(1.0 - ab, 1.0 - as_),
-        BlendMode::PlusLighter => return porter_duff(1.0, 1.0),
+        BlendMode::PlusLighter => {
+            // Additive light: colour sums unclamped; coverage saturates.
+            return [
+                cs[0] + cb[0],
+                cs[1] + cb[1],
+                cs[2] + cb[2],
+                (as_ + ab).min(1.0),
+            ];
+        }
         _ => {}
     }
     if as_ == 0.0 {
@@ -192,4 +200,35 @@ pub fn src_over(dst: [f64; 4], src: [f64; 4]) -> [f64; 4] {
         dst[2].mul_add(1.0 - src[3], src[2]),
         dst[3].mul_add(1.0 - src[3], src[3]),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plus_lighter_saturates_alpha_but_not_colour() {
+        // Two opaque sources: coverage saturates at 1, light adds
+        // unclamped — extended-range colour survives (#126).
+        let out = blend(
+            BlendMode::PlusLighter,
+            [0.5, 0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.5, 1.0],
+        );
+        assert_eq!(
+            out.map(f64::to_bits),
+            [1.5, 0.0, 0.5, 1.0].map(f64::to_bits)
+        );
+
+        // Half-over-full coverage sums to 1 exactly, colour adds too.
+        let out = blend(
+            BlendMode::PlusLighter,
+            [0.25, 0.25, 0.25, 0.5],
+            [0.5, 0.0, 0.0, 1.0],
+        );
+        assert_eq!(
+            out.map(f64::to_bits),
+            [0.75, 0.25, 0.25, 1.0].map(f64::to_bits)
+        );
+    }
 }

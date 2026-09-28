@@ -783,6 +783,43 @@ fn chevron(x: f64, y: f64) -> BezPath {
     p
 }
 
+/// One silhouette-shadow corpus scene: `shape` under `transform` with a
+/// shadow, then the same shape filled on a light clear.
+fn silhouette_scene(
+    corpus: &mut Corpus,
+    name: &str,
+    shape: Shape,
+    transform: Affine,
+    color: Color,
+) {
+    corpus.scene(name, 128, 128, srgb(0.95, 0.95, 0.95), |l| {
+        l.transform(transform);
+        l.shadow(shape.clone(), 3.0, [7.0, 8.0], color);
+        l.fill(shape, solid(srgb(1.0, 0.65, 0.15)));
+    });
+}
+
+/// The star silhouette the shadow scenes share.
+fn shadow_star() -> Shape {
+    let mut path = star_path(64.0, 64.0, 24.0, 56.0);
+    path.extend(star_path(64.0, 64.0, 10.0, 24.0));
+    Shape::Path { path }
+}
+
+/// The ellipse silhouette the shadow scenes share.
+fn shadow_ellipse() -> Shape {
+    Shape::Ellipse(Ellipse::new((48.0, 48.0), (40.0, 24.0), 0.0))
+}
+
+/// The uneven-corner silhouette the shadow scenes share.
+const fn shadow_uneven() -> Shape {
+    Shape::Continuous(cherenkov_scene::ContinuousRect::new(
+        Rect::new(16.0, 16.0, 80.0, 80.0),
+        28.0,
+        1.0,
+    ))
+}
+
 /// Write `corpus` into `dir`, one `<name>/` per entry.
 fn write_corpus(out: &Path, corpus: &Corpus) -> Result<(), SceneError> {
     std::fs::create_dir_all(out)?;
@@ -2656,6 +2693,58 @@ fn run() -> Result<(), SceneError> {
             solid(hdr(4.0, 16.0, 1.0)),
         );
     });
+
+    // ---- Silhouette shadows --------------------------------------------------
+    //
+    // Shapes the analytic rounded-box kernel cannot express — paths,
+    // ellipses, superellipse rects, and any shape under a non-axis-aligned
+    // transform — capture and convolve a silhouette instead. The shared
+    // layout: a blue shadow, offset down-right, under an orange fill of the
+    // same shape on a light clear.
+
+    let blue = srgba(0.1, 0.25, 0.6, 0.8);
+    silhouette_scene(
+        &mut corpus,
+        "shadow-silhouette-ellipse",
+        shadow_ellipse(),
+        Affine::IDENTITY,
+        blue,
+    );
+    silhouette_scene(
+        &mut corpus,
+        "shadow-silhouette-path",
+        shadow_star(),
+        Affine::IDENTITY,
+        blue,
+    );
+    silhouette_scene(
+        &mut corpus,
+        "shadow-silhouette-affine-path",
+        shadow_star(),
+        Affine::new([0.72, 0.22, -0.15, 0.7, 28.0, 4.0]),
+        blue,
+    );
+    silhouette_scene(
+        &mut corpus,
+        "shadow-silhouette-continuous",
+        shadow_uneven(),
+        Affine::IDENTITY,
+        blue,
+    );
+    silhouette_scene(
+        &mut corpus,
+        "shadow-silhouette-p3",
+        shadow_star(),
+        Affine::IDENTITY,
+        Color::new(ColorSpace::LinearP3, [1.0, 0.0, 0.3, 0.9]),
+    );
+    silhouette_scene(
+        &mut corpus,
+        "shadow-silhouette-hdr",
+        shadow_star(),
+        Affine::IDENTITY,
+        Color::new(ColorSpace::LinearP3, [3.6, 0.0, 0.6, 0.9]),
+    );
 
     // ---- Text ----------------------------------------------------------------
 

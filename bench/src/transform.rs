@@ -121,10 +121,12 @@ fn translate_draw(draw: &Draw, d: Vec2) -> Draw {
         Draw::Glyphs(run) => Draw::Glyphs(translate_run(run, d)),
         Draw::Image {
             image,
+            encoding,
             dst,
             sampling,
         } => Draw::Image {
             image: *image,
+            encoding: *encoding,
             dst: translate_rect(*dst, d),
             sampling: *sampling,
         },
@@ -207,6 +209,7 @@ fn translate_paint(paint: &Paint, d: Vec2) -> Paint {
         ),
         Paint::Image(ip) => Paint::Image(cherenkov_scene::ImagePaint {
             image: ip.image,
+            encoding: ip.encoding,
             transform: Affine::translate(d) * ip.transform,
             extend_x: ip.extend_x,
             extend_y: ip.extend_y,

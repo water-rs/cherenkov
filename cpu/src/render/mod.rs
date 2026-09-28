@@ -529,21 +529,12 @@ impl RasterRenderer {
         let clear = [r * a, g * a, b * a, a];
         let pool = &self.pool;
         let (draws, edges) = match &mut surf.output {
-            Output::F32(fb) => {
-                pool.install(|| raster::render_bands(&items, clear, fb, w, h))?
-            }
+            Output::F32(fb) => pool.install(|| raster::render_bands(&items, clear, fb, w, h))?,
             Output::F16(out) => {
                 pool.install(|| raster::render_bands_f16(&items, clear, out, w, h))?
             }
             Output::Stream { format, sink, emit } => {
-                raster::render_bands_stream(
-                    &items,
-                    clear,
-                    (w, h),
-                    emit,
-                    *format,
-                    sink.as_mut(),
-                )?
+                raster::render_bands_stream(&items, clear, (w, h), emit, *format, sink.as_mut())?
             }
         };
         if let (Some(start), Some(lowered), Some(resolved)) = (start, lowered_at, resolved_at) {

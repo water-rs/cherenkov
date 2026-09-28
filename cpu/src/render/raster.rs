@@ -27,6 +27,10 @@ pub const BAND_H: usize = 16;
 
 /// One worker's reusable raster and filter buffers.
 ///
+/// Created per rayon worker for the duration of a pass (`for_each_init`);
+/// buffers are single-owner, never locked, and nothing is retained after the
+/// pass.
+///
 /// The transient pixel bound is `workers × (band + Σ filter windows at the
 /// deepest nesting)`, where each filter window is `w × (bh + 2·apron)`.
 pub struct Scratch {
@@ -452,15 +456,7 @@ pub fn render_bands_stream(
     let mut y0 = 0;
     while y0 < h {
         let bh = (h - y0).min(BAND_H);
-        if let Err(error) = shade(
-            items,
-            clear,
-            &mut band_px[..w * bh],
-            w,
-            y0,
-            h,
-            &mut scratch,
-        ) {
+        if let Err(error) = shade(items, clear, &mut band_px[..w * bh], w, y0, h, &mut scratch) {
             scratch.buffers.give_color(band_px);
             return Err(error);
         }
@@ -493,6 +489,10 @@ const fn slice_len(w: usize, bh: usize) -> usize {
     w * bh
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "keeps ordered item processing and recursive filter scopes together"
+)]
 fn run(
     items: &[Item],
     range: Range<usize>,
@@ -556,8 +556,7 @@ fn run(
                         w: band.w,
                         y0: top,
                     };
-                    let mut filter_acc =
-                        Accum::with_buffer(band.w, bottom - top, coverage);
+                    let mut filter_acc = Accum::with_buffer(band.w, bottom - top, coverage);
                     let mut filter_stack = Vec::new();
                     let result = run(
                         items,

@@ -1010,6 +1010,7 @@ fn build_layer(
         edit.transform(prep.transform);
         edit.scroll_offset(prep.scroll_offset);
         edit.opacity(prep.opacity as f32);
+        edit.blend(prep.blend);
         if let Some(clip) = &prep.clip {
             clip_shape(edit, clip);
         }

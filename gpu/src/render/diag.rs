@@ -921,6 +921,7 @@ fn kind_json(kind: &EventKind, out: &mut String) {
                 let (x, y, w, h) = rect;
                 out.push_str("{\"atlas_cell\":{\"rect\":[");
                 let _ = write!(out, "{x},{y},{w},{h}]}}");
+                out.push('}');
             };
         }
     });

@@ -19,8 +19,12 @@ use cherenkov::{
     Draw as _, Engine as GpuEngine, Fixed, ImageData, Layer as GpuLayer, LayerEdit, Offscreen,
     OffscreenFormat, RenderError, ResourceError, Rgba8, Surface, Transaction,
 };
-use cherenkov_gpu::{Gpu, GpuConfig, ScratchFormat, interop::SharedDevice};
+use cherenkov_gpu::interop::{
+    OutputAlpha, OutputColor, Presenter, SharedDevice, TextureOutput, TextureTarget, wgpu,
+};
+use cherenkov_gpu::{Gpu, GpuConfig, ScratchFormat};
 use cherenkov_oracle::color::to_working;
+use cherenkov_oracle::present::presented_srgb_to_working;
 use cherenkov_scene::{
     BlendMode, ColorSpace, Draw as SceneDraw, Extend, Feature, GlyphRun as SceneGlyphRun,
     ImageColorSpace, ImageEncoding, Item, Layer as SceneLayer, Paint as ScenePaint, ResourceHash,
@@ -32,7 +36,10 @@ use crate::convert::{self, Blobs};
 use crate::memory::{AdapterMemory, EngineBytes, Reading, wgpu_allocator, wgpu_vk_memory_budget};
 use crate::motion::{Clock, LayerMotion};
 use crate::timing::Timings;
-use crate::{BenchError, Counters, DeviceInfo, EncodeInput, Engine, EngineInfo, GpuSample, Submit};
+use crate::{
+    BenchError, Counters, DeviceInfo, EncodeInput, Engine, EngineInfo, GpuSample, PresentKind,
+    Submit,
+};
 
 /// A scene shape in a form the front-end accepts.
 enum ShapeKind {
@@ -457,6 +464,201 @@ pub struct Cherenkov {
     /// rendered it.
     timings: Timings,
     counters: Counters,
+    /// `--present` mode: the shared device, the presentation pass and the
+    /// per-scene source/destination textures. `None` renders offscreen.
+    present: Option<Present>,
+}
+
+/// `--present` state: the engine runs on a bench-owned shared device so a
+/// render's working-space texture can be presented into the kind's
+/// destination and read back.
+struct Present {
+    /// The `--present` kind in force.
+    kind: PresentKind,
+    /// The real presentation pass (`present.wgsl`).
+    presenter: Presenter,
+    /// The prepared surface's working-space texture (`Rgba16Float`),
+    /// delivered by its `TextureTarget` channel.
+    source: Option<wgpu::Texture>,
+    /// The kind's destination texture, sized to the prepared scene.
+    destination: Option<wgpu::Texture>,
+}
+
+/// The destination texture format of a `--present` kind.
+const fn present_format(kind: PresentKind) -> wgpu::TextureFormat {
+    match kind {
+        PresentKind::SrgbHw => wgpu::TextureFormat::Rgba8UnormSrgb,
+        PresentKind::SrgbShader => wgpu::TextureFormat::Rgba8Unorm,
+        PresentKind::LinearP3 => wgpu::TextureFormat::Rgba16Float,
+    }
+}
+
+/// Bytes per pixel of a kind's destination texture.
+const fn present_texel_size(kind: PresentKind) -> u32 {
+    match kind {
+        PresentKind::SrgbHw | PresentKind::SrgbShader => 4,
+        PresentKind::LinearP3 => 8,
+    }
+}
+
+/// The `--present` destination texture.
+fn present_target(device: &wgpu::Device, size: (u32, u32), kind: PresentKind) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("bench presentation"),
+        size: wgpu::Extent3d {
+            width: size.0,
+            height: size.1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: present_format(kind),
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    })
+}
+
+/// Copies the destination texture to a mapped buffer and returns its
+/// texels.
+fn read_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    texel: u32,
+) -> Result<Vec<u8>, BenchError> {
+    let (w, h) = (texture.width(), texture.height());
+    let bytes_per_row = (w * texel).div_ceil(256) * 256;
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("presentation readback"),
+        size: u64::from(bytes_per_row) * u64::from(h),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("presentation readback"),
+    });
+    encoder.copy_texture_to_buffer(
+        texture.as_image_copy(),
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bytes_per_row),
+                rows_per_image: Some(h),
+            },
+        },
+        wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+    );
+    let submission = queue.submit([encoder.finish()]);
+    let (send, receive) = std::sync::mpsc::channel();
+    buffer
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, move |result| {
+            let _ = send.send(result);
+        });
+    device
+        .poll(wgpu::PollType::Wait {
+            submission_index: Some(submission),
+            timeout: Some(std::time::Duration::from_secs(30)),
+        })
+        .map_err(|e| BenchError::Gpu(format!("presentation readback wait: {e}")))?;
+    receive
+        .recv()
+        .map_err(|e| BenchError::Gpu(format!("presentation readback: {e}")))?
+        .map_err(|e| BenchError::Gpu(format!("presentation readback map: {e}")))?;
+    let data = buffer.slice(..).get_mapped_range();
+    let row = (w * texel) as usize;
+    let mut packed = Vec::with_capacity(row * h as usize);
+    for y in 0..h as usize {
+        packed
+            .extend_from_slice(&data[y * bytes_per_row as usize..y * bytes_per_row as usize + row]);
+    }
+    drop(data);
+    buffer.unmap();
+    Ok(packed)
+}
+
+/// Decodes the presented destination texels into the working-space
+/// interchange image. sRGB kinds hold encoded premultiplied sRGB bytes —
+/// the displayed colour — lifted back to linear P3 so both sides of the
+/// comparison live in the working space. `linear-p3` is the f16
+/// working-space texel verbatim.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "u8 texels decode through f64 into the f32 interchange image"
+)]
+fn presented_pixels(
+    kind: PresentKind,
+    width: u32,
+    height: u32,
+    packed: &[u8],
+) -> cherenkov_oracle::F32Image {
+    let mut pixels = Vec::with_capacity((width * height) as usize);
+    match kind {
+        PresentKind::SrgbHw | PresentKind::SrgbShader => {
+            for texel in packed.as_chunks::<4>().0 {
+                let encoded = texel.map(|v| f64::from(v) / 255.0);
+                let p3 = presented_srgb_to_working(encoded);
+                pixels.push([p3[0] as f32, p3[1] as f32, p3[2] as f32, p3[3] as f32]);
+            }
+        }
+        PresentKind::LinearP3 => {
+            for texel in packed.as_chunks::<8>().0 {
+                let mut p = [0.0; 4];
+                for (c, b) in p.iter_mut().zip(texel.as_chunks::<2>().0) {
+                    *c = half::f16::from_bits(u16::from_le_bytes(*b)).to_f32();
+                }
+                pixels.push(p);
+            }
+        }
+    }
+    cherenkov_oracle::F32Image {
+        width,
+        height,
+        pixels,
+    }
+}
+
+impl Present {
+    /// Presents the prepared scene's working-space texture into the
+    /// kind's destination on `shared`'s device and queue and reads it back.
+    fn read(&mut self, shared: &SharedDevice) -> Result<cherenkov_oracle::F32Image, BenchError> {
+        let source = self
+            .source
+            .as_ref()
+            .ok_or_else(|| BenchError::Engine("present before prepare".into()))?;
+        let destination = self.destination.as_ref().expect("set at prepare");
+        self.presenter.texture(
+            &shared.device,
+            &shared.queue,
+            &source.create_view(&wgpu::TextureViewDescriptor::default()),
+            TextureOutput {
+                texture: destination,
+                color: match self.kind {
+                    PresentKind::SrgbHw | PresentKind::SrgbShader => OutputColor::Srgb,
+                    PresentKind::LinearP3 => OutputColor::LinearDisplayP3,
+                },
+                alpha: OutputAlpha::Premultiplied,
+            },
+        );
+        let packed = read_texture(
+            &shared.device,
+            &shared.queue,
+            destination,
+            present_texel_size(self.kind),
+        )?;
+        Ok(presented_pixels(
+            self.kind,
+            destination.width(),
+            destination.height(),
+            &packed,
+        ))
+    }
 }
 
 /// The features this slice executes faithfully.
@@ -1161,6 +1363,7 @@ impl Cherenkov {
             frame: 0,
             clock: Clock::new(),
             counters: Counters::default(),
+            present: None,
         })
     }
 }
@@ -1174,15 +1377,54 @@ impl Engine for Cherenkov {
         cherenkov_features().into_iter().collect()
     }
 
+    fn present(&mut self, kind: PresentKind) -> Result<(), BenchError> {
+        // The engine already runs on the bench-owned SharedDevice (#101), so
+        // the presented destination can be read back on the same device and
+        // queue.
+        self.present = Some(Present {
+            kind,
+            presenter: Presenter::new(&self.shared_device.device),
+            source: None,
+            destination: None,
+        });
+        Ok(())
+    }
+
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Display::headroom is f32 at the engine boundary"
+    )]
     fn prepare(&mut self, input: &EncodeInput<'_>) -> Result<(), BenchError> {
         convert::check_features(Self::NAME, input.scene, &cherenkov_features(), missing_api)?;
-        let surface = self
-            .engine
-            .surface(Offscreen::new(
-                (input.scene.width, input.scene.height),
-                OffscreenFormat::LinearF16,
-            ))
-            .map_err(|e| BenchError::Gpu(format!("cherenkov surface: {e}")))?;
+        let size = (input.scene.width, input.scene.height);
+        let surface = match &mut self.present {
+            Some(present) => {
+                let (target, textures) = TextureTarget::new(size);
+                let surface = self
+                    .engine
+                    .surface(target)
+                    .map_err(|e| BenchError::Gpu(format!("cherenkov surface: {e}")))?;
+                present.source =
+                    Some(textures.try_recv().map_err(|e| {
+                        BenchError::Engine(format!("cherenkov texture target: {e}"))
+                    })?);
+                present.destination =
+                    Some(present_target(&self.shared_device.device, size, present.kind));
+                surface
+            }
+            None => self
+                .engine
+                .surface(Offscreen::new(size, OffscreenFormat::LinearF16))
+                .map_err(|e| BenchError::Gpu(format!("cherenkov surface: {e}")))?,
+        };
+        if self.present.is_some() {
+            // Announce the scene's declared headroom as a host display
+            // would; the present pass does not read it yet (#97).
+            let _ = surface.display(cherenkov::Display {
+                headroom: input.scene.present_headroom as f32,
+                ..cherenkov::Display::default()
+            });
+        }
         surface.clear_color(working(&input.scene.clear));
         register_fonts(
             &mut self.fonts,
@@ -1282,7 +1524,13 @@ impl Engine for Cherenkov {
             render_error,
         )?;
         let stats = self.engine.stats();
-        let image = if readback {
+        let image = if !readback {
+            None
+        } else if let Some(present) = &mut self.present {
+            // The presented destination, lifted back into the working
+            // space for the sRGB kinds.
+            Some(present.read(&self.shared_device)?)
+        } else {
             let rb = self
                 .surface
                 .as_ref()
@@ -1294,8 +1542,6 @@ impl Engine for Cherenkov {
                 height: rb.height,
                 pixels: rb.pixels,
             })
-        } else {
-            None
         };
         let phases = stats.phases;
         let phases = [

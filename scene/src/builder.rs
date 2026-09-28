@@ -40,6 +40,14 @@ impl SceneBuilder {
         self
     }
 
+    /// Set the display headroom the scene asks to be presented at
+    /// (`render --present`); `1.0` is the default SDR display.
+    #[must_use]
+    pub const fn present_headroom(mut self, headroom: f64) -> Self {
+        self.scene.present_headroom = headroom;
+        self
+    }
+
     /// A [`LayerBuilder`] over the root layer.
     pub const fn root(&mut self) -> LayerBuilder<'_> {
         LayerBuilder {

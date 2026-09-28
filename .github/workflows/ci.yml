@@ -223,6 +223,29 @@ jobs:
               assert 'info' in d and d['info']['crate_version'], f'{f} lacks provenance'
           print(f'{len(files)} reports ({len(measured)} measured) across {len(scenes)} scenes')
           PY
+      # #100: the corpus through the real presentation pass, one run per
+      # output kind, compared to the oracle's matching presentation.
+      - name: Render the presentation corpus
+        run: |
+          set -euo pipefail
+          for kind in srgb-hw srgb-shader linear-p3; do
+            ./target/release/cherenkov-bench render --engine cherenkov \
+              --present "$kind" --corpus scenes/corpus --out-dir "out/present-$kind"
+          done
+          python3 - <<'PY'
+          import glob, json
+          files = glob.glob('out/present-*/render-*.json')
+          scenes = {json.load(open(f))['scene'] for f in files}
+          corpus = {p.split('/')[-2] for p in glob.glob('scenes/corpus/*/scene.json')}
+          missing = corpus - scenes
+          assert not missing, f'scenes without a report: {missing}'
+          measured = [f for f in files if 'metrics' in json.load(open(f))]
+          assert measured, 'no metrics JSON produced'
+          for f in files:
+              d = json.load(open(f))
+              assert d.get('present'), f'{f} lacks the presentation record'
+          print(f'{len(files)} presentation reports ({len(measured)} measured)')
+          PY
 
   bench-android:
     name: Bench / aarch64-linux-android build

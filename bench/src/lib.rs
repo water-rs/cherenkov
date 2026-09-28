@@ -274,6 +274,31 @@ pub struct EncodeInput<'a> {
     pub blobs: &'a Blobs,
 }
 
+/// A presentation output kind for `render --present` — the destination a
+/// backend's presentation pass writes and the adapter reads back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum PresentKind {
+    /// sRGB texture format (`Rgba8UnormSrgb`); the hardware transfer encodes.
+    SrgbHw,
+    /// Unorm texture (`Rgba8Unorm`); `present.wgsl` applies the transfer.
+    SrgbShader,
+    /// `Rgba16Float` extended linear Display P3
+    /// (`OutputColor::LinearDisplayP3`).
+    LinearP3,
+}
+
+impl PresentKind {
+    /// The CLI value and report/file-name token.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::SrgbHw => "srgb-hw",
+            Self::SrgbShader => "srgb-shader",
+            Self::LinearP3 => "linear-p3",
+        }
+    }
+}
+
 /// A rendering-engine adapter.
 ///
 /// Lifecycle: [`Engine::prepare`] runs once per scene outside the timed
@@ -305,6 +330,21 @@ pub trait Engine {
     /// [`BenchError::Unsupported`] for unimplemented features, or an
     /// engine-level error.
     fn encode(&mut self, input: &EncodeInput<'_>) -> Result<(), BenchError>;
+    /// Puts the adapter into presentation mode: [`Engine::submit`] then
+    /// returns the image after the backend's real presentation pass into a
+    /// `kind` output. Called once, right after construction and before
+    /// `prepare`. Backends without a presentation step fail rather than
+    /// compare a raw working-space readback.
+    ///
+    /// # Errors
+    /// [`BenchError::Engine`] when the backend has no presentation step.
+    fn present(&mut self, kind: PresentKind) -> Result<(), BenchError> {
+        let _ = kind;
+        Err(BenchError::Engine(format!(
+            "{} renders into the working space directly; it has no presentation step to measure",
+            self.info().name
+        )))
+    }
     /// Rasterize the encoded scene as `frame`, the tag its
     /// [`GpuSample`] carries; with `readback`, return the pixels.
     ///

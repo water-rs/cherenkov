@@ -118,6 +118,21 @@ impl Renderer {
         scene: &Scene,
         scene_dir: &std::path::Path,
     ) -> Result<F32Image, RenderError> {
+        self.render_image(scene, scene_dir)
+            .map(|image| F32Image::from_f64(&image))
+    }
+
+    /// Render `scene` into a premultiplied linear-P3 `f64` image — the
+    /// full-precision reference the presentation functions
+    /// ([`crate::present`]) consume.
+    ///
+    /// # Errors
+    /// `RenderError` on glyph failures or missing resources.
+    pub fn render_image(
+        &self,
+        scene: &Scene,
+        scene_dir: &std::path::Path,
+    ) -> Result<Image, RenderError> {
         let mut resources = Resources::new(scene_dir.to_path_buf());
         let clear = to_working(&scene.clear);
         let mut canvas = Canvas::new(self.width, self.height, clear);
@@ -130,11 +145,11 @@ impl Renderer {
             &mut canvas,
             &mut resources,
         )?;
-        Ok(F32Image::from_f64(&Image {
+        Ok(Image {
             width: self.width,
             height: self.height,
             pixels: canvas.pixels,
-        }))
+        })
     }
 
     /// Render `items` (a layer's contents) into `canvas`.

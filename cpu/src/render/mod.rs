@@ -247,7 +247,7 @@ impl Renderer for RasterRenderer {
             font::Font {
                 data: font,
                 has_colr,
-                colr: std::sync::Mutex::new(HashMap::new()),
+                colr: HashMap::new(),
             },
         );
         Ok(())
@@ -429,9 +429,7 @@ impl Renderer for RasterRenderer {
     fn trim(&mut self, pressure: Pressure) {
         if pressure == Pressure::Critical {
             for font in self.fonts.values_mut() {
-                if let Ok(mut cache) = font.colr.lock() {
-                    cache.clear();
-                }
+                font.colr.clear();
             }
             self.fonts.shrink_to_fit();
             self.glyph_cache.clear();
@@ -468,7 +466,7 @@ impl RasterRenderer {
             };
             let mut caches = std::mem::take(&mut surf.layers);
             let mut lowering = Lowering::new(&mut items, surf.size);
-            let result = lowering.run(sf.tree, &mut caches, &self.images, &self.fonts);
+            let result = lowering.run(sf.tree, &mut caches, &self.images, &mut self.fonts);
             stats.commands_lowered += lowering.commands_lowered;
             stats.layers_composed += lowering.layers_composed;
             glyph_reqs = std::mem::take(&mut lowering.glyphs);

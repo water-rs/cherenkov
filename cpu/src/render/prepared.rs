@@ -5,7 +5,9 @@
 use super::paint::{PaintData, paint_data};
 use crate::names;
 use cherenkov::kurbo::Affine;
-use cherenkov::{BlendMode, BlendSpace, Command, GlyphRun, RenderError, Shadow, ShapeData};
+use cherenkov::{
+    BlendMode, BlendSpace, Command, FontData, GlyphRun, RenderError, Shadow, ShapeData,
+};
 use skrifa::MetadataProvider as _;
 use skrifa::raw::TableProvider as _;
 use skrifa::raw::types::F2Dot14;
@@ -69,10 +71,11 @@ impl cherenkov::lowering::Operation for Op {
     }
 }
 
-/// Resolve CPU paints while retaining content-space geometry.
+/// Resolve CPU paints while retaining content-space geometry. `fonts` is
+/// mutable: lowering builds the `COLRv1` node trees the frame uses.
 pub struct Lowerer<'a> {
     pub images: &'a std::collections::HashMap<u64, std::sync::Arc<super::image::CpuImage>>,
-    pub fonts: &'a std::collections::HashMap<u64, Font>,
+    pub fonts: &'a mut std::collections::HashMap<u64, Font>,
 }
 
 impl cherenkov::lowering::Compiler for Lowerer<'_> {
@@ -190,7 +193,7 @@ impl Lowerer<'_> {
             .get(&run.font.raw())
             .ok_or_else(|| RenderError::Font(format!("unregistered font {:?}", run.font)))?;
         if font.has_colr {
-            return self.color_glyph_run(ambient, run, paint, font, ops);
+            return self.color_glyph_run(ambient, run, paint, &font.data.clone(), ops);
         }
         if run.glyphs.iter().any(|glyph| glyph.transform.is_some()) {
             return self.fill_glyphs(ambient, run, paint, ops);
@@ -207,12 +210,15 @@ impl Lowerer<'_> {
 
     /// A filled run on a `COLR` font: colour glyphs expand their
     /// font-space picture in place; ordinary glyphs keep the mask path.
+    /// `font_data` is an owned handle so the `FontRef` below borrows no
+    /// part of the fonts map — colour glyphs re-borrow it mutably to fill
+    /// each font's node-tree cache.
     fn color_glyph_run(
         &mut self,
         ambient: Affine,
         run: &GlyphRun,
         paint: &cherenkov::Paint,
-        font: &Font,
+        font_data: &FontData,
         ops: &mut Vec<Op>,
     ) -> Result<(), RenderError> {
         let mut pending: Vec<cherenkov::Glyph> = Vec::new();
@@ -221,7 +227,7 @@ impl Lowerer<'_> {
         for glyph in &run.glyphs {
             if !colr_checked {
                 colr_checked = true;
-                let font_ref = skrifa::FontRef::from_index(&font.data.data, font.data.index)
+                let font_ref = skrifa::FontRef::from_index(&font_data.data, font_data.index)
                     .map_err(|e| RenderError::Font(format!("{e}")))?;
                 if font_ref.colr().is_ok() {
                     let upem = font_ref
@@ -253,7 +259,14 @@ impl Lowerer<'_> {
                         paint: paint_data(paint, Affine::IDENTITY, self.images)?,
                     });
                 }
-                let picture = super::colr::glyph_picture(font, glyph.id, &run.coords, paint)?;
+                let picture = super::colr::glyph_picture(
+                    self.fonts.get_mut(&run.font.raw()).ok_or_else(|| {
+                        RenderError::Font(format!("unregistered font {:?}", run.font))
+                    })?,
+                    glyph.id,
+                    &run.coords,
+                    paint,
+                )?;
                 // `translate(x, y) * transform * scale_non_uniform(size/upem,
                 // -size/upem)` places the font-space picture at the
                 // glyph's origin.

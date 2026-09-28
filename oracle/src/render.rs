@@ -216,6 +216,10 @@ impl Renderer {
     ///
     /// # Errors
     /// `RenderError` on glyph failures or missing resources.
+    ///
+    /// # Panics
+    /// Never; the root canvas is always pushed, so the final `pop` cannot
+    /// fail.
     pub fn render_image(
         &self,
         scene: &Scene,

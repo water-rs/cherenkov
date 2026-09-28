@@ -923,6 +923,20 @@ fn run() -> Result<(), SceneError> {
             solid(srgb(0.4, 0.1, 0.5)),
         );
     });
+    corpus.scene("stroke-continuous-s50", 96, 96, white, |l| {
+        l.stroke(
+            Shape::Continuous(cherenkov_scene::ContinuousRect::new(
+                Rect::new(16.0, 16.0, 80.0, 80.0),
+                28.0,
+                0.5,
+            )),
+            StrokeStyle {
+                width: 6.0,
+                ..StrokeStyle::default()
+            },
+            solid(srgb(0.2, 0.4, 0.9)),
+        );
+    });
 
     corpus.scene("stroke-curve", 128, 128, white, |l| {
         l.stroke(
@@ -1652,6 +1666,37 @@ fn run() -> Result<(), SceneError> {
             solid(hdr(0.0, 8.0, 16.0)),
         );
     });
+
+    // Ellipse and Lamé corners with wide-gamut / HDR paint (#160).
+    for (shape, name) in [
+        (
+            Shape::Continuous(cherenkov_scene::ContinuousRect::new(
+                Rect::new(16.0, 16.0, 80.0, 80.0),
+                28.0,
+                0.5,
+            )),
+            "continuous-s50",
+        ),
+        (
+            Shape::Ellipse(Ellipse::new((48.0, 48.0), (40.0, 24.0), 0.0)),
+            "ellipse",
+        ),
+    ] {
+        corpus.scene(format!("{name}-p3"), 96, 96, white, |l| {
+            l.fill(shape.clone(), solid(p3(0.0, 1.0, 0.0)));
+            l.fill(
+                shape.clone(),
+                solid(Color::new(ColorSpace::LinearP3, [1.0, 0.0, 0.6, 0.7])),
+            );
+        });
+        corpus.scene(format!("{name}-hdr"), 96, 96, white, |l| {
+            l.fill(shape.clone(), solid(hdr(16.0, 16.0, 16.0)));
+            l.fill(
+                shape.clone(),
+                solid(Color::new(ColorSpace::LinearP3, [16.0, 2.0, 0.5, 0.7])),
+            );
+        });
+    }
 
     // Gradient stops crossing the sRGB boundary (p3) or the [0,1] range
     // (hdr); both interpolate in the working space.

@@ -463,7 +463,8 @@ pub struct Cherenkov {
     counters: Counters,
     /// `--present` mode: the shared device, the presentation pass and the
     /// per-scene source/destination textures. `None` renders offscreen.
-    present: Option<Present>,
+    /// Boxed so the mode stays off the hot struct.
+    present: Option<Box<Present>>,
 }
 
 /// `--present` state: the engine runs on a bench-owned shared device so a
@@ -1378,12 +1379,12 @@ impl Engine for Cherenkov {
         // The engine already runs on the bench-owned SharedDevice (#101), so
         // the presented destination can be read back on the same device and
         // queue.
-        self.present = Some(Present {
+        self.present = Some(Box::new(Present {
             kind,
             presenter: Presenter::new(&self.shared_device.device),
             source: None,
             destination: None,
-        });
+        }));
         Ok(())
     }
 
@@ -1394,7 +1395,7 @@ impl Engine for Cherenkov {
     fn prepare(&mut self, input: &EncodeInput<'_>) -> Result<(), BenchError> {
         convert::check_features(Self::NAME, input.scene, &cherenkov_features(), missing_api)?;
         let size = (input.scene.width, input.scene.height);
-        let surface = match &mut self.present {
+        let surface = match self.present.as_deref_mut() {
             Some(present) => {
                 let (target, textures) = TextureTarget::new(size);
                 let surface = self
@@ -1526,7 +1527,7 @@ impl Engine for Cherenkov {
         let stats = self.engine.stats();
         let image = if !readback {
             None
-        } else if let Some(present) = &mut self.present {
+        } else if let Some(present) = self.present.as_deref_mut() {
             // The presented destination, lifted back into the working
             // space for the sRGB kinds.
             Some(present.read(&self.shared_device)?)

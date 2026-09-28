@@ -779,7 +779,11 @@ fn fs_full(in: VsOut) -> vec4<f32> {
         }
         cov *= select(0.0, m, inside);
     }
-    cov = clamp(cov, 0.0, 1.0) * in.params.y;
+    // Coverage before the opacity multiply is the composite's clip coverage:
+    // the destructive Porter-Duff branch antialiases the clip edge between
+    // the backdrop and the blended result.
+    let inside_cov = clamp(cov, 0.0, 1.0);
+    cov = inside_cov * in.params.y;
     // A blended composite carries its mode in meta_.w bits 16-23: sample the
     // source and backdrop, blend, and write the composited result verbatim
     // (the pass runs the Replace pipeline).
@@ -787,6 +791,13 @@ fn fs_full(in: VsOut) -> vec4<f32> {
         let mode = (in.meta_.w >> 16u) & 0xffu;
         if mode != 0u {
             let coord = vec2<i32>(floor(in.pixel - instances[i].grad.xy));
+            if blend_is_destructive(mode) {
+                // Destructive operators composite over the whole region: a
+                // transparent source still writes over the backdrop.
+                let cs = textureLoad(source, coord, 0) * in.params.y;
+                let cb = textureLoad(backdrop, coord, 0);
+                return mix(cb, blend_color(mode, cb, cs), inside_cov);
+            }
             let cs = textureLoad(source, coord, 0) * cov;
             let cb = textureLoad(backdrop, coord, 0);
             return blend_color(mode, cb, cs);
@@ -843,6 +854,12 @@ fn set_sat(c: vec3<f32>, s: f32) -> vec3<f32> {
         out[mx] = s;
     }
     return out;
+}
+
+// The Porter-Duff operators whose transparent source replaces the
+// destination rather than leaving it unchanged (codes per blend_code).
+fn blend_is_destructive(mode: u32) -> bool {
+    return mode == 16u || mode == 17u || mode == 20u || mode == 21u || mode == 22u || mode == 25u;
 }
 
 // B(Cb, Cs) for one channel pair, separable modes; non-separable modes and

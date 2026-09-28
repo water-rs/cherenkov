@@ -255,10 +255,10 @@ mod tests {
             },
         ));
         assert!(tree.layer(LayerId::new(1)).components.is_none());
-        println!(
-            "component bytes={} layer bytes={}",
-            std::mem::size_of::<Components>(),
-            std::mem::size_of::<LayerNode>()
+        tracing::debug!(
+            component_bytes = std::mem::size_of::<Components>(),
+            layer_bytes = std::mem::size_of::<LayerNode>(),
+            "tree node sizes",
         );
     }
 }

@@ -49,6 +49,7 @@ pub enum Op {
     },
     /// Open an opacity group.
     BeginIsolate {
+        filter: Option<cherenkov::FilterId>,
         opacity: f32,
         blend: BlendMode,
         space: BlendSpace,
@@ -159,19 +160,18 @@ impl cherenkov::lowering::Compiler for Lowerer<'_> {
         group: &cherenkov::Group,
         isolate: bool,
     ) -> Result<Option<Op>, RenderError> {
-        if group.filter.is_some() {
-            return Err(RenderError::Unsupported(names::FILTER));
-        }
         Ok((isolate
             || group.opacity < 1.0
             || group.blend != BlendMode::Normal
-            || group.blend_space != BlendSpace::Linear)
-            .then_some(Op::BeginIsolate {
-                opacity: group.opacity,
-                blend: group.blend,
-                space: group.blend_space,
-                end: 0,
-            }))
+            || group.blend_space != BlendSpace::Linear
+            || group.filter.is_some())
+        .then_some(Op::BeginIsolate {
+            filter: group.filter,
+            opacity: group.opacity,
+            blend: group.blend,
+            space: group.blend_space,
+            end: 0,
+        }))
     }
     fn end(&mut self) -> Op {
         Op::End

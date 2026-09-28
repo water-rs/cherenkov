@@ -91,10 +91,12 @@ fn item_bytes(item: &Item) -> u64 {
         Item::Glyph { paint, clip, .. } => {
             paint_data_bytes(paint) + clip.as_deref().map_or(0, clip_bytes)
         }
-        Item::Shadow { clip, .. } | Item::PopIsolate { clip, .. } => {
+        Item::Shadow { clip, .. }
+        | Item::PopIsolate { clip, .. }
+        | Item::PopFilter { clip, .. } => {
             clip.as_deref().map_or(0, clip_bytes)
         }
-        Item::PushIsolate => 0,
+        Item::PushIsolate | Item::PushFilter { .. } => 0,
     }
 }
 

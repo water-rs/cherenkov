@@ -17,6 +17,7 @@ use vello::peniko::Fill;
 use vello::{AaConfig, AaSupport, RenderParams, Renderer, RendererOptions, Scene as VelloScene};
 
 use crate::convert::{self, Prepared};
+use crate::memory::{AdapterMemory, Reading, wgpu_allocator, wgpu_vk_memory_budget};
 use crate::vello_like::{Lowered, Op, lower, vello_features};
 use crate::wgpu_ctx::{Gpu, Target, drain_and_stamp, readback, resolve_timestamps};
 use crate::{BenchError, Counters, DeviceInfo, EncodeInput, Engine, EngineInfo, GpuSample, Submit};
@@ -296,5 +297,18 @@ impl Engine for VelloClassic {
 
     fn device(&self) -> DeviceInfo {
         self.gpu.device_info()
+    }
+
+    fn memory(&self) -> AdapterMemory {
+        AdapterMemory {
+            engine: Reading::unavailable("Vello classic does not expose engine memory"),
+            wgpu_allocator: wgpu_allocator(&self.gpu.device, self.gpu.info.backend),
+            skia_budgeted: Reading::unavailable("Vello classic has no Skia budget"),
+            vk_memory_budget: wgpu_vk_memory_budget(
+                &self.gpu.device,
+                self.gpu.info.backend,
+                &self.gpu.info.name,
+            ),
+        }
     }
 }

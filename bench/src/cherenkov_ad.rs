@@ -16,7 +16,7 @@ use cherenkov::{
     Draw as _, Engine as GpuEngine, Fixed, ImageData, Layer as GpuLayer, LayerEdit, Offscreen,
     OffscreenFormat, RenderError, ResourceError, Rgba8, Surface, Transaction,
 };
-use cherenkov_gpu::{Gpu, GpuConfig, ScratchFormat};
+use cherenkov_gpu::{Gpu, GpuConfig, ScratchFormat, interop::SharedDevice};
 use cherenkov_oracle::color::to_working;
 use cherenkov_scene::{
     BlendMode, ColorSpace, Draw as SceneDraw, Extend, Feature, GlyphRun as SceneGlyphRun, Item,
@@ -25,6 +25,7 @@ use cherenkov_scene::{
 use kurbo::{Affine, BezPath, Circle, Ellipse, Line, Rect, RoundedRect, Vec2};
 
 use crate::convert::{self, Blobs};
+use crate::memory::{AdapterMemory, EngineBytes, Reading, wgpu_allocator, wgpu_vk_memory_budget};
 use crate::motion::{Clock, LayerMotion};
 use crate::timing::Timings;
 use crate::{BenchError, Counters, DeviceInfo, EncodeInput, Engine, EngineInfo, GpuSample, Submit};
@@ -428,6 +429,7 @@ struct ContentLayer {
 pub struct Cherenkov {
     info: EngineInfo,
     engine: GpuEngine<Gpu>,
+    shared_device: SharedDevice,
     surface: Option<Surface<Gpu>>,
     /// Registered fonts per `(blob hash, face index)`.
     fonts: HashMap<(ResourceHash, u32), cherenkov::Font>,
@@ -1079,13 +1081,19 @@ impl Cherenkov {
     /// # Errors
     /// [`BenchError::Gpu`] when no adapter exists or device creation fails.
     pub fn new() -> Result<Self, BenchError> {
-        let engine = GpuEngine::<Gpu>::new(GpuConfig {
+        let config = GpuConfig {
             timestamps: true,
             scratch_format: match std::env::var("CHERENKOV_SCRATCH_FORMAT").as_deref() {
                 Ok("rgba8") => ScratchFormat::Rgba8Unorm,
                 _ => ScratchFormat::LinearF16,
             },
             ..GpuConfig::default()
+        };
+        let shared_device = SharedDevice::create(&config)
+            .map_err(|e| BenchError::Gpu(format!("cherenkov engine: {e}")))?;
+        let engine = GpuEngine::<Gpu>::new(GpuConfig {
+            device: Some(shared_device.clone()),
+            ..config
         })
         .map_err(|e| BenchError::Gpu(format!("cherenkov engine: {e}")))?;
         Ok(Self {
@@ -1102,6 +1110,7 @@ impl Cherenkov {
                                against fonts and the layer tree prepared once",
             },
             engine,
+            shared_device,
             surface: None,
             timings: Timings::default(),
             fonts: HashMap::new(),
@@ -1294,6 +1303,24 @@ impl Engine for Cherenkov {
             target_format: Some("Rgba16Float".to_string()),
             cpu: crate::cpu_model(),
             thermal_celsius: crate::thermal_celsius(),
+        }
+    }
+
+    fn memory(&self) -> AdapterMemory {
+        let usage = self.engine.memory();
+        let adapter_info = self.shared_device.adapter.get_info();
+        AdapterMemory {
+            engine: Reading::Measured(EngineBytes {
+                cpu_bytes: usage.cpu.0,
+                gpu_bytes: usage.gpu.0,
+            }),
+            wgpu_allocator: wgpu_allocator(&self.shared_device.device, adapter_info.backend),
+            skia_budgeted: Reading::unavailable("not a Skia adapter"),
+            vk_memory_budget: wgpu_vk_memory_budget(
+                &self.shared_device.device,
+                adapter_info.backend,
+                &adapter_info.name,
+            ),
         }
     }
 }

@@ -222,6 +222,24 @@ fn create_device(
     Ok((adapter, device, queue))
 }
 
+impl interop::wgpu::DeviceSource {
+    /// Creates the adapter and device the Vello engine would use for `config`.
+    ///
+    /// Pass the result back through [`VelloConfig::with_device`] to drive
+    /// the engine with this exact device.
+    ///
+    /// # Errors
+    /// [`EngineError`] when no suitable adapter exists or device creation
+    /// fails.
+    pub fn create(config: &VelloConfig) -> Result<Self, EngineError> {
+        if let Some(source) = &config.device {
+            return Ok(source.clone());
+        }
+        let (adapter, device, queue) = create_device(config)?;
+        Ok(Self::new(adapter, device, queue))
+    }
+}
+
 fn gpu_info(info: &wgpu::AdapterInfo) -> VelloInfo {
     VelloInfo {
         name: info.name.clone(),

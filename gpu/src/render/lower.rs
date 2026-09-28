@@ -3115,6 +3115,19 @@ fn effect_reach(effect: &cherenkov::BackdropEffect) -> Result<f32, RenderError> 
                 ))
             }
         }
+        cherenkov::BackdropEffect::Rim(r) => {
+            if r.width.is_finite()
+                && r.width > 0.0
+                && r.gain.is_finite()
+                && r.color.iter().all(|v| v.is_finite())
+            {
+                Ok(0.0)
+            } else {
+                Err(RenderError::Render(
+                    "backdrop rim needs width > 0 and a finite colour and gain".into(),
+                ))
+            }
+        }
         cherenkov::BackdropEffect::Shader(s) => {
             if s.uniforms.len() <= 64
                 && s.uniforms.iter().all(|v| v.is_finite())
@@ -3133,10 +3146,10 @@ fn effect_reach(effect: &cherenkov::BackdropEffect) -> Result<f32, RenderError> 
 /// Pushes a member effect's parameters into `stops` and returns its
 /// `(kind, stop count)`: `Color` packs three row stops (the row's
 /// `[r, g, b, bias]` in `color`), `Refraction` one stop (`depth`,
-/// `strength` in `color.xy`), `Shader` the uniforms packed four per
-/// stop, zero-filled.
+/// `strength` in `color.xy`), `Rim` two stops (`(width, r, g, b)` and
+/// `(a, gain)`), `Shader` the uniforms packed four per stop, zero-filled.
 fn push_effect_stops(stops: &mut Vec<Stop>, effect: &cherenkov::BackdropEffect) -> (u32, u32) {
-    use super::instance::{EFFECT_COLOR, EFFECT_REFRACTION, EFFECT_SHADER};
+    use super::instance::{EFFECT_COLOR, EFFECT_REFRACTION, EFFECT_RIM, EFFECT_SHADER};
     let push = |stops: &mut Vec<Stop>, v: [f32; 4]| {
         stops.push(Stop {
             color: v,
@@ -3154,6 +3167,11 @@ fn push_effect_stops(stops: &mut Vec<Stop>, effect: &cherenkov::BackdropEffect) 
         cherenkov::BackdropEffect::Refraction(r) => {
             push(stops, [r.depth, r.strength, 0.0, 0.0]);
             (EFFECT_REFRACTION, 1)
+        }
+        cherenkov::BackdropEffect::Rim(r) => {
+            push(stops, [r.width, r.color[0], r.color[1], r.color[2]]);
+            push(stops, [r.color[3], r.gain, 0.0, 0.0]);
+            (EFFECT_RIM, 2)
         }
         cherenkov::BackdropEffect::Shader(s) => {
             let mut count = 0;

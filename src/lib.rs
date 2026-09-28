@@ -56,12 +56,13 @@ pub use crate::animation::{
     spring_step,
 };
 pub use crate::backdrop::{
-    BackdropEffect, BackdropShaderEffect, BackdropShaderSource, ColorMatrix, Refraction,
+    BackdropEffect, BackdropShaderEffect, BackdropShaderSource, ColorMatrix, Refraction, Rim,
 };
 pub use crate::backend::{Backend, Display, Frame, Redraw, Renderer, SurfaceFrame, SurfaceInfo};
 pub use crate::capability::{
     Backdrop, BackdropChain, BackdropRuns, BackdropShaders, Effects, ExternalFrames, Filters,
-    GpuContent, HdrOutput, Planes, Runs, ShaderPaint as ShaderPaintCapability, ShaderSource, Uploads,
+    GpuContent, HdrOutput, Planes, Runs, ShaderPaint as ShaderPaintCapability, ShaderSource,
+    Uploads,
 };
 pub use crate::color::{
     Color, ColorSpace, DisplayP3, DynColor, LinearDisplayP3, LinearSrgb, Rec2020, Srgb,

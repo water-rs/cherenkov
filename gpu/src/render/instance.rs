@@ -46,6 +46,8 @@ pub const EFFECT_COLOR: u32 = 1;
 pub const EFFECT_REFRACTION: u32 = 2;
 /// A registered backdrop effect shader.
 pub const EFFECT_SHADER: u32 = 3;
+/// A rim highlight additive on the sample inside the clip edge.
+pub const EFFECT_RIM: u32 = 4;
 /// Smooth colour weights; low 16 bits still identify the mesh paint kind.
 pub const PAINT_MESH_SMOOTH: u32 = 1 << 17;
 

@@ -472,6 +472,17 @@ fn paint_backdrop(i: u32, pixel: vec2<f32>) -> vec4<f32> {
         let t = clamp(1.0 + d / p0.x, 0.0, 1.0);
         return backdrop_sample(pixel - n * p0.y * t * t);
     }
+    if kind == EFFECT_RIM {
+        // stops[first].color = (width, r, g, b); stops[first+1].color =
+        // (a, gain). The rim is an additive term on the sampled colour
+        // (alpha unchanged — gaining alpha would cancel under src-over).
+        let p0 = stops[first].color;
+        let p1 = stops[first + 1u].color;
+        let t = clamp(1.0 + d / p0.x, 0.0, 1.0);
+        let k = p1.x * p1.y * t * t;
+        let c = backdrop_sample(pixel);
+        return vec4<f32>(c.rgb + p0.yzw * k, c.a);
+    }
     var params = array<vec4<f32>, 16>();
     let count = (inst.meta_.w >> 8u) & 0xffu;
     for (var j = 0u; j < count; j = j + 1u) {

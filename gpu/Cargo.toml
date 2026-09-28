@@ -29,6 +29,11 @@ gloo-timers = { version = "0.3", features = ["futures"] }
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = "0.3"
 
+[build-dependencies]
+# The WGSL engine shaders are compiled once at build time (issue #57), at
+# the naga version wgpu 29 links.
+naga = { version = "29", features = ["wgsl-in", "spv-out", "msl-out"] }
+
 [dev-dependencies]
 naga = { version = "29", features = ["wgsl-in", "spv-out", "msl-out", "hlsl-out"] }
 

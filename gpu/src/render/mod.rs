@@ -3,6 +3,7 @@
 
 //! The render thread: sole owner of GPU state.
 
+mod bindings;
 mod colr;
 pub mod filter;
 mod glyph;
@@ -14,6 +15,7 @@ mod path;
 mod prepared;
 pub mod present;
 mod raster;
+pub mod shaders;
 
 use cherenkov::Instant;
 use std::collections::{HashMap, VecDeque};
@@ -226,6 +228,9 @@ pub struct GpuRenderer {
     instance: wgpu::Instance,
     adapter: wgpu::Adapter,
     presenter: Option<present::Presenter>,
+    /// How the fixed modules reach this device (`shaders.rs`): SPIR-V,
+    /// metallib, or WGSL — decided once at init by the adapter backend.
+    shader_delivery: shaders::ShaderDelivery,
     shaders: paint::Registry,
     filters: filter::Registry,
     last_frame: Option<Instant>,
@@ -457,6 +462,14 @@ fn create_device(
     );
     tracing::debug!(limits = ?adapter.limits(), "adapter limits");
     let mut required = wgpu::Features::empty();
+    // The fixed engine shaders are precompiled (#57): Vulkan loads SPIR-V
+    // and Metal a metallib through the passthrough API; wgpu-hal advertises
+    // the feature unconditionally on both backends.
+    if matches!(info.backend, wgpu::Backend::Vulkan | wgpu::Backend::Metal)
+        && supported.contains(wgpu::Features::PASSTHROUGH_SHADERS)
+    {
+        required |= wgpu::Features::PASSTHROUGH_SHADERS;
+    }
     // Only pass-boundary timestamps are requested: Metal on Apple GPUs
     // advertises `TIMESTAMP_QUERY_INSIDE_ENCODERS` but samples only at
     // stage boundaries, so an encoder-level `write_timestamp` goes through
@@ -581,34 +594,38 @@ async fn create_device(
     Ok((instance, adapter, device, queue))
 }
 
-const fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::FRAGMENT,
-        ty: wgpu::BindingType::Texture {
-            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-            view_dimension: wgpu::TextureViewDimension::D2,
-            multisampled: false,
-        },
-        count: None,
-    }
-}
-
-fn storage_entry(binding: u32, fragment: bool) -> wgpu::BindGroupLayoutEntry {
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: if fragment {
-            wgpu::ShaderStages::FRAGMENT
-        } else {
-            wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT
-        },
-        ty: wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Storage { read_only: true },
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        },
-        count: None,
-    }
+/// Maps a layout-table entry to the wgpu descriptor. The same table feeds
+/// `build.rs`'s slot assignment, so a precompiled shader cannot drift from
+/// the layout built here.
+pub fn layout_entries(entries: &[bindings::Entry]) -> Vec<wgpu::BindGroupLayoutEntry> {
+    entries
+        .iter()
+        .map(|entry| wgpu::BindGroupLayoutEntry {
+            binding: entry.binding,
+            visibility: wgpu::ShaderStages::from_bits_retain(u32::from(entry.stages)),
+            ty: match entry.kind {
+                bindings::Kind::Uniform => wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: entry.dynamic_offset,
+                    min_binding_size: wgpu::BufferSize::new(entry.min_size),
+                },
+                bindings::Kind::StorageRead => wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: entry.dynamic_offset,
+                    min_binding_size: wgpu::BufferSize::new(entry.min_size),
+                },
+                bindings::Kind::Texture => wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                bindings::Kind::Sampler => {
+                    wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)
+                }
+            },
+            count: None,
+        })
+        .collect()
 }
 
 /// The bind group layouts: group 0 is engine data, group 1 the texture a
@@ -616,33 +633,13 @@ fn storage_entry(binding: u32, fragment: bool) -> wgpu::BindGroupLayoutEntry {
 fn create_layouts(device: &wgpu::Device) -> (wgpu::BindGroupLayout, wgpu::BindGroupLayout) {
     let layout0 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("engine data"),
-        entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    // Each pass binds its own 256-byte-aligned Globals.
-                    has_dynamic_offset: true,
-                    min_binding_size: wgpu::BufferSize::new(16),
-                },
-                count: None,
-            },
-            storage_entry(1, false),
-            storage_entry(2, true),
-            texture_entry(3),
-        ],
+        entries: &layout_entries(bindings::ENGINE_GROUP0),
     });
     let layout1 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("source texture"),
         // 0: composite source, 1: blend backdrop, 2: image paint,
         // 3: clip mask texture.
-        entries: &[
-            texture_entry(0),
-            texture_entry(1),
-            texture_entry(2),
-            texture_entry(3),
-        ],
+        entries: &layout_entries(bindings::ENGINE_GROUP1),
     });
     (layout0, layout1)
 }
@@ -950,21 +947,12 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
         };
         let (layout0, layout1) = create_layouts(&device);
         let scratch_format = scratch_wgpu(config.scratch_format);
-        // Three specialised fragment shaders from one source file: the
-        // prepended `VARIANT` constant makes fs_main a constant-folded
-        // dispatch to fs_simple/fs_shadow/fs_full.
-        let modules = [0u32, 1, 2].map(|v| {
-            device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("cherenkov"),
-                source: wgpu::ShaderSource::Wgsl(
-                    format!(
-                        "const VARIANT: u32 = {v}u;\n{}",
-                        include_str!("shader.wgsl")
-                    )
-                    .into(),
-                ),
-            })
-        });
+        // Three specialised fragment shaders from one source file, compiled
+        // at build time: the prepended `VARIANT` constant makes fs_main a
+        // constant-folded dispatch to fs_simple/fs_shadow/fs_full. On Vulkan
+        // and Metal these are the embedded passthrough binaries (#57).
+        let shader_delivery = shaders::delivery(info.backend, &device)?;
+        let modules = [0usize, 1, 2].map(|v| shader_delivery.engine_module(&device, v));
         let pipelines = |format: wgpu::TextureFormat, replace: bool| {
             Ok::<_, EngineError>([
                 create_pipeline(
@@ -1069,6 +1057,7 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             instance,
             adapter,
             presenter: None,
+            shader_delivery,
             shaders: paint::Registry::default(),
             filters: filter::Registry::new(config.redraw.clone()),
             last_frame: None,
@@ -1138,20 +1127,10 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
     let scratch_format = scratch_wgpu(config.scratch_format);
     // Three specialised fragment shaders from one source file: the
     // prepended `VARIANT` constant makes fs_main a constant-folded
-    // dispatch to fs_simple/fs_shadow/fs_full.
+    // dispatch to fs_simple/fs_shadow/fs_full. WebGPU keeps WGSL (#57).
     let shader_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
-    let modules = [0u32, 1, 2].map(|v| {
-        device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("cherenkov"),
-            source: wgpu::ShaderSource::Wgsl(
-                format!(
-                    "const VARIANT: u32 = {v}u;\n{}",
-                    include_str!("shader.wgsl")
-                )
-                .into(),
-            ),
-        })
-    });
+    let shader_delivery = shaders::delivery(info.backend, &device)?;
+    let modules = [0usize, 1, 2].map(|v| shader_delivery.engine_module(&device, v));
     if let Some(error) = shader_scope.pop().await {
         return Err(EngineError::Backend(error.to_string()));
     }
@@ -1262,6 +1241,7 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
         instance,
         adapter,
         presenter: None,
+        shader_delivery,
         shaders: paint::Registry::default(),
         filters: filter::Registry::new(config.redraw.clone()),
         last_frame: None,
@@ -1370,8 +1350,9 @@ impl Renderer for GpuRenderer {
                     size,
                     window.transparent,
                 )?;
-                self.presenter
-                    .get_or_insert_with(|| present::Presenter::new(&self.device));
+                self.presenter.get_or_insert_with(|| {
+                    present::Presenter::new(&self.device, self.shader_delivery)
+                });
                 (Some(surface), None, window.refresh)
             }
         };

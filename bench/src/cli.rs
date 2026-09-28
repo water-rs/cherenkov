@@ -58,6 +58,24 @@ struct Cli {
     cmd: Sub,
 }
 
+/// `present-cost --pattern` choices; see [`crate::present_cost`].
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub(crate) enum PresentPattern {
+    /// Every pixel a fully out-of-gamut P3 primary or secondary.
+    Oog,
+    /// Left half in-gamut, right half out-of-gamut.
+    Mixed,
+}
+
+/// `present-cost --encode` choices; see [`crate::present_cost`].
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub(crate) enum PresentEncode {
+    /// `Rgba8UnormSrgb` destination; hardware applies the transfer.
+    SrgbHw,
+    /// `Rgba8Unorm` destination; the shader applies the transfer.
+    SrgbShader,
+}
+
 #[derive(Subcommand)]
 enum Sub {
     /// Render scene(s) and report correctness metrics vs the oracle.
@@ -181,6 +199,40 @@ enum Sub {
         /// own (see `measure --native`).
         #[arg(long, value_name = "WxH")]
         native: Option<String>,
+    },
+    /// Time the presentation pass alone — one `Presenter::texture_timed`
+    /// call per frame into an offscreen sRGB texture, bracketed by
+    /// pass-boundary GPU timestamps (#96). Requires the `cherenkov`
+    /// feature. On the M1 and iPad this is the gamut-map cost evidence;
+    /// on a shared VM it is a sanity check only.
+    PresentCost {
+        /// Destination size, `WxH` — the iPad-class 2752x2064 by default.
+        #[arg(long, default_value = "2752x2064", value_name = "WxH")]
+        size: String,
+        /// Measured frames (after warmup).
+        #[arg(long, default_value_t = 60)]
+        frames: u32,
+        /// Warmup frames (pipeline creation included) discarded.
+        #[arg(long, default_value_t = 5)]
+        warmup: u32,
+        /// Source pattern: `oog` maps every pixel, `mixed` is half
+        /// in-gamut.
+        #[arg(long, value_enum, default_value = "oog")]
+        pattern: PresentPattern,
+        /// Encode path timed: hardware sRGB transfer or the shader one.
+        #[arg(long, value_enum, default_value = "srgb-hw")]
+        encode: PresentEncode,
+        /// Report JSON path.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Sweep the P3 gamut boundary and report each candidate map's `ΔE_OK`
+    /// and hue shift against the CSS Color 4 reference (#96). No engine —
+    /// pure oracle `f64` math.
+    GamutSweep {
+        /// Report text path; stdout when omitted.
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
     /// List compiled-in adapter keys.
     Engines,
@@ -338,7 +390,44 @@ fn run(cli: Cli) -> Result<(), BenchError> {
                 native: native.as_deref(),
             },
         ),
+        Sub::PresentCost {
+            size,
+            frames,
+            warmup,
+            pattern,
+            encode,
+            out,
+        } => present_cost_cmd(size.as_str(), frames, warmup, pattern, encode, &out),
+        Sub::GamutSweep { out } => crate::gamut_sweep::run(out.as_deref()),
     }
+}
+
+/// `present-cost` needs the GPU adapter's shared device and Presenter.
+#[cfg(feature = "cherenkov")]
+fn present_cost_cmd(
+    size: &str,
+    frames: u32,
+    warmup: u32,
+    pattern: PresentPattern,
+    encode: PresentEncode,
+    out: &Path,
+) -> Result<(), BenchError> {
+    let size = parse_native(Some(size))?.expect("size is required");
+    crate::present_cost::run(size, frames, warmup, pattern, encode, out)
+}
+
+#[cfg(not(feature = "cherenkov"))]
+fn present_cost_cmd(
+    _size: &str,
+    _frames: u32,
+    _warmup: u32,
+    _pattern: PresentPattern,
+    _encode: PresentEncode,
+    _out: &Path,
+) -> Result<(), BenchError> {
+    Err(BenchError::Engine(
+        "present-cost needs the `cherenkov` adapter feature".into(),
+    ))
 }
 
 /// The `measure` subcommand's fields, borrowed to avoid cloning paths.

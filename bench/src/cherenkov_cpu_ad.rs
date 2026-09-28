@@ -15,6 +15,7 @@ use cherenkov::{
 };
 use cherenkov_cpu::{Raster, RasterConfig};
 use cherenkov_oracle::color::to_working;
+use cherenkov_oracle::present::presented_srgb_to_working;
 use cherenkov_scene::{
     BlendMode, ColorSpace, Draw as SceneDraw, Extend, Feature, GlyphRun as SceneGlyphRun,
     ImageColorSpace, ImageEncoding, Item, Layer as SceneLayer, Paint as ScenePaint, ResourceHash,
@@ -26,7 +27,9 @@ use crate::convert::{self, Blobs};
 use crate::memory::{AdapterMemory, EngineBytes, Reading};
 use crate::motion::{Clock, LayerMotion};
 use crate::timing::Timings;
-use crate::{BenchError, Counters, DeviceInfo, EncodeInput, Engine, EngineInfo, Submit};
+use crate::{
+    BenchError, Counters, DeviceInfo, EncodeInput, Engine, EngineInfo, PresentKind, Submit,
+};
 
 /// A scene shape in a form the front-end accepts.
 enum ShapeKind {
@@ -422,6 +425,9 @@ pub struct Cherenkov {
     /// rendered it.
     timings: Timings,
     counters: Counters,
+    /// `--present` mode: the presentation kind `submit` applies to the
+    /// readback before handing pixels over.
+    present: Option<PresentKind>,
 }
 
 /// The features this slice executes faithfully.
@@ -1164,6 +1170,7 @@ impl Cherenkov {
             clock: Clock::new(),
             timings: Timings::default(),
             counters: Counters::default(),
+            present: None,
         })
     }
 }
@@ -1179,11 +1186,18 @@ impl Engine for Cherenkov {
 
     fn prepare(&mut self, input: &EncodeInput<'_>) -> Result<(), BenchError> {
         convert::check_features(Self::NAME, input.scene, &cherenkov_features(), missing_api)?;
+        // sRGB presentation reads the native f32 framebuffer; the
+        // linear-P3 destination stores f16, modelled by the f16 readback.
+        let format = match self.present {
+            Some(PresentKind::SrgbHw | PresentKind::SrgbShader) => OffscreenFormat::LinearF32,
+            Some(PresentKind::LinearP3) => OffscreenFormat::LinearF16,
+            None => Self::readback_format(),
+        };
         let surface = self
             .engine
             .surface(Offscreen::new(
                 (input.scene.width, input.scene.height),
-                Self::readback_format(),
+                format,
             ))
             .map_err(|e| BenchError::Gpu(format!("cherenkov surface: {e}")))?;
         surface.clear_color(working(&input.scene.clear));
@@ -1269,6 +1283,18 @@ impl Engine for Cherenkov {
         Ok(())
     }
 
+    /// Puts the adapter into presentation mode: `submit`'s readback is
+    /// run through the backend's presentation and lifted back to the
+    /// working space, matching the GPU adapter.
+    fn present(&mut self, kind: PresentKind) -> Result<(), BenchError> {
+        self.present = Some(kind);
+        Ok(())
+    }
+
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "working-space pixels fit f32"
+    )]
     fn submit(&mut self, frame: u64, readback: bool) -> Result<Submit, BenchError> {
         if self.surface.is_none() {
             return Err(BenchError::Engine(
@@ -1289,10 +1315,31 @@ impl Engine for Cherenkov {
                 .expect("checked above")
                 .readback()
                 .map_err(render_error)?;
+            let pixels = match self.present {
+                // sRGB presentation: the framebuffer goes through the
+                // backend's present path into encoded premultiplied
+                // sRGB bytes, then lifts back to the working space for
+                // the comparison — the same interchange the GPU adapter
+                // uses on its presented texture.
+                Some(PresentKind::SrgbHw | PresentKind::SrgbShader) => {
+                    cherenkov_cpu::present_srgb8(&rb.pixels)
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|texel| {
+                            let encoded = texel.map(|v| f64::from(v) / 255.0);
+                            let p3 = presented_srgb_to_working(encoded);
+                            [p3[0] as f32, p3[1] as f32, p3[2] as f32, p3[3] as f32]
+                        })
+                        .collect()
+                }
+                // Extended linear Display P3 passes through verbatim.
+                Some(PresentKind::LinearP3) | None => rb.pixels,
+            };
             Some(cherenkov_oracle::F32Image {
                 width: rb.width,
                 height: rb.height,
-                pixels: rb.pixels,
+                pixels,
             })
         } else {
             None

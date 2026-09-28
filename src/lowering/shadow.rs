@@ -58,9 +58,11 @@ fn kernel_count(count: f64, limit: f64) -> Result<usize, RenderError> {
     Ok(count as usize)
 }
 
-/// Gaussian kernel taps along `axis` for a blur of `sigma`: `(x, y, weight)`
-/// samples at unit offsets over `±6σ` of the axis length, normalized to a
-/// unit sum. The empty kernel for `sigma <= 0` is a single identity tap.
+/// Gaussian kernel taps along `axis` for a blur of `sigma`.
+///
+/// `(x, y, weight)` samples at unit offsets over `±6σ` of the axis length,
+/// normalized to a unit sum. The empty kernel for `sigma <= 0` is a single
+/// identity tap.
 ///
 /// # Errors
 /// Returns [`RenderError::Render`] when the kernel would exceed `limit`

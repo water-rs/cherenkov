@@ -29,6 +29,9 @@ pub struct Font {
     pub data: FontData,
     /// Validated once at registration; plain runs do not reparse tables.
     pub has_colr: bool,
+    /// Resolved once at registration like `has_colr`: the font carries an
+    /// sbix or CBDT/CBLC bitmap strike.
+    pub has_bitmap: bool,
     /// Foreground-independent `COLRv1` node trees, per `(glyph, coords)`.
     /// Written only during single-threaded lowering; the raster phase
     /// reads the shared [`Node`] trees through `Arc` handles.

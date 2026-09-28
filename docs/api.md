@@ -35,9 +35,10 @@ Capabilities are traits implemented by backend types, so using a missing capabil
 | `Uploads<F>` for an image format `F` | `Rgba8`, `Rgba16F` | `Rgba8` | `Rgba8`, `Rgba16F` |
 | `GpuContent`, `ShaderPaint` | both | both | |
 | `Filters`, `Runs<F>` for a filter `F`, `Effects` | every filter | every filter | filters with a CPU kernel |
-| `HdrOutput`, `Backdrop`, `ExternalFrames`, `Planes` | | | |
+| `Backdrop`, `BackdropRuns<K, F>` for a backdrop chain `F` | every chain | every chain | chains with a CPU kernel |
+| `HdrOutput`, `ExternalFrames`, `Planes` | | | |
 
-Targets beyond the current rows: `Gpu` is meant to accept every image format and grow `ExternalFrames`, `HdrOutput`, `Backdrop` and `Planes` (system-compositor promotion); `Raster` targets `Uploads<Rgba8>`, `Backdrop`, and `Filters`/`Runs<F>` for filters with a CPU kernel; a `Banded<P>` microcontroller backend (banded output, panel formats, flash-resident assets) targets panel-format uploads and CPU-kernel filters.
+Targets beyond the current rows: `Gpu` is meant to accept every image format and grow `ExternalFrames`, `HdrOutput` and `Planes` (system-compositor promotion); `Raster` targets `Uploads<Rgba8>` and `Filters`/`Runs<F>` for filters with a CPU kernel; a `Banded<P>` microcontroller backend (banded output, panel formats, flash-resident assets) targets panel-format uploads and CPU-kernel filters.
 
 The table is the target; a backend slice implements the rows it has code for, and the compiler rejects the rest.
 
@@ -132,7 +133,13 @@ pub trait Renderer: 'static {
   pub trait GpuContent: Backend { type Content: Send + 'static; fn set_gpu_content(r: &mut Self::Renderer, surface: SurfaceId, layer: LayerId, size: (u32, u32), content: Self::Content); }
   pub trait ExternalFrames: Backend { type Frame: Send + 'static; fn set_external_frame(r: &mut Self::Renderer, surface: SurfaceId, layer: LayerId, frame: Self::Frame); }
   pub trait Uploads<F: Format>: Backend {}      // which image storage formats `add_image` accepts
-  pub trait Backdrop: Backend {}                // `surface.backdrop_group`, `tx[&l].backdrop`
+  pub trait Backdrop: Backend {               // unfiltered groups: `surface.backdrop_group_unfiltered`
+      fn add_backdrop_group(r: &mut Self::Renderer, surface: SurfaceId, id: BackdropId);
+      fn remove_backdrop_group(r: &mut Self::Renderer, surface: SurfaceId, id: BackdropId);
+  }
+  pub trait BackdropRuns<K, F>: Backdrop {    // filtered groups: `surface.backdrop_group`
+      fn add_filtered_backdrop_group(r: &mut Self::Renderer, surface: SurfaceId, id: BackdropId, filter: F);
+  }
   pub trait HdrOutput: Backend {}
   pub trait Planes: Backend {}
   ```
@@ -434,7 +441,7 @@ The composer produces a normalized form: segment boundaries plus the possible ma
   - **Parameters** are value slots, which may be bound to nami signals. Changing one updates a uniform only; nothing is recompiled or re-recorded.
   - **Compilation** happens when a chain is first registered, and the driver pipeline cache is persisted.
   - **Apple tile passes.** naga cannot express imageblocks, tile render pipelines or raster order groups. On the GPU backend's Apple route, tile and imageblock passes are therefore thin native MSL scaffolding around function bodies emitted by the shared naga composer. Every shared function still comes from the composer; only the tile-pass declarations are native.
-  - **CPU backends** apply pushed-down colour functions per span and run spatial kernels with footprint-wide aprons between bands.
+  - **CPU backends** apply pushed-down colour functions per span, run spatial kernels with footprint-wide aprons between bands, and capture backdrops into band-bounded buffers scheduled the same way: a capture plus its chain's apron is a windowed intermediate, never a full-frame buffer.
 
 ```rust
 tx[&card].filter(Saturation(1.2).then(Brightness(0.9)));  // ColorFilter: fused, no extra pass
@@ -445,7 +452,7 @@ Multi-input operations (blend with an image, displacement, LUT) take `Image<F>` 
 
 ## Backdrop
 
-Requires the `Backdrop` capability.
+Requires the `Backdrop` capability for an unfiltered group; `surface.backdrop_group` requires `BackdropRuns<K, F>` for a chain `F` in kind `K`.
 
 ```rust
 let glass: BackdropGroup = surface.backdrop_group(Blur::new(24.0).then(Saturation(1.8))); // SpatialFilter

@@ -21,7 +21,7 @@ use nami_core::watcher::Context;
 
 use crate::animation::Animation;
 use crate::backend::{Backend, Display, SurfaceInfo};
-use crate::capability::{Backdrop, BackdropChain, ExternalFrames, GpuContent};
+use crate::capability::{Backdrop, BackdropChain, BackdropRuns, ExternalFrames, GpuContent};
 use crate::engine::Waker;
 use crate::error::{RenderError, SurfaceError};
 use crate::frame::Readback;
@@ -978,6 +978,7 @@ impl<B: Backdrop> Surface<B> {
     where
         K: filtrate_core::kind::Kind,
         F: BackdropChain<K> + crate::RenderTransfer,
+        B: BackdropRuns<K, F>,
     {
         self.new_backdrop_group(move |r, surface, id| {
             B::add_filtered_backdrop_group(r, surface, id, filter);

@@ -75,9 +75,9 @@ fn clip_to_rect(s: Segment, x0: f64, y0: f64, x1: f64, y1: f64) -> Option<Segmen
 /// so each segment's crossing position at the strip's midline `ymid`
 /// is linear and correctly ordered. The crossings sort into pairs; the
 /// interval between each consecutive pair is covered iff the winding
-/// number there satisfies `rule`. The winding is seeded by [`winding`]
-/// of the full boundary at the strip's left edge and updated by each
-/// crossing's direction (`+1` upward, `−1` downward).
+/// number there satisfies `rule`. The winding is seeded by
+/// [`seed_winding`] of the full boundary at the strip's left edge and
+/// updated by each crossing's direction (`+1` upward, `−1` downward).
 fn pixel_area(segs: &[Segment], x0: f64, y0: f64, rule: FillRule) -> f64 {
     let (x1, y1) = (x0 + 1.0, y0 + 1.0);
     let mut inside_segs = Vec::new();
@@ -154,8 +154,8 @@ fn pixel_area(segs: &[Segment], x0: f64, y0: f64, rule: FillRule) -> f64 {
         }
         xs.sort_by(|a, b| a.0.total_cmp(&b.0));
         // Wind from the pixel's left edge; crossings strictly right of it
-        // are already counted by `winding`.
-        let mut wind = winding(segs, x0, ymid);
+        // are already counted by `seed_winding`.
+        let mut wind = seed_winding(segs, x0, ymid);
         let mut xprev = x0;
         let mut i = 0;
         while i < xs.len() {
@@ -178,6 +178,29 @@ fn pixel_area(segs: &[Segment], x0: f64, y0: f64, rule: FillRule) -> f64 {
         }
     }
     area.clamp(0.0, 1.0)
+}
+
+/// Winding number at `(px, py)` from the edges whose crossing of the
+/// horizontal line through `py` lies more than `EPS` right of `px` — the
+/// same classification `pixel_area` applies to strip crossings, so an
+/// edge hugging the pixel's left border is either seeded or crossed,
+/// never seeded and then dropped.
+fn seed_winding(edges: &[Segment], px: f64, py: f64) -> i32 {
+    let mut w = 0;
+    for &(x0, y0, x1, y1) in edges {
+        let dir = if y0 <= py && y1 > py {
+            1
+        } else if y1 <= py && y0 > py {
+            -1
+        } else {
+            continue;
+        };
+        let xi = (x1 - x0).mul_add((py - y0) / (y1 - y0), x0);
+        if xi > px + EPS {
+            w += dir;
+        }
+    }
+    w
 }
 
 /// A coverage buffer: all boundary segments of the shape, accumulated for
@@ -236,5 +259,60 @@ impl Coverage {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build the (16,16)-(48,48) rectangle, optionally with its left edge
+    /// replaced by ~300 collinear vertices at x = 16 + δ cycling through
+    /// tiny sub-EPS offsets, as the Lamé flattening emits near a
+    /// tangent-integer junction. `reverse` traverses the rect the other
+    /// way.
+    fn rect_polyline(noisy_edge: bool, reverse: bool) -> Vec<(f64, f64)> {
+        // Counter-clockwise: TL -> TR -> BR -> BL, then up the left edge.
+        let mut pts = vec![(16.0, 16.0), (48.0, 16.0), (48.0, 48.0)];
+        if noisy_edge {
+            const N: usize = 300;
+            const DS: [f64; 4] = [0.0, 3e-10, 7e-10, 1e-10];
+            for k in 0..=N {
+                let y = 48.0
+                    - 32.0 * f64::from(u32::try_from(k).unwrap())
+                        / f64::from(u32::try_from(N).unwrap());
+                pts.push((16.0 + DS[k % DS.len()], y));
+            }
+        } else {
+            pts.push((16.0, 48.0));
+        }
+        if reverse {
+            pts.reverse();
+        }
+        pts
+    }
+
+    #[test]
+    fn collinear_run_on_pixel_column_matches_merged_edge() {
+        for reverse in [false, true] {
+            let mut a = Coverage::new(64, 64);
+            a.add_polyline(&rect_polyline(true, reverse), true);
+            let mut b = Coverage::new(64, 64);
+            b.add_polyline(&rect_polyline(false, reverse), true);
+            let pa = a.finish(FillRule::NonZero);
+            let pb = b.finish(FillRule::NonZero);
+            for (i, (x, y)) in pa.iter().zip(pb.iter()).enumerate() {
+                assert!(
+                    (x - y).abs() <= 1e-9,
+                    "reverse={reverse} pixel {i}: noisy {x} vs merged {y}"
+                );
+            }
+            // The left-edge column is covered: the noisy run must not
+            // leak a fully-transparent strip through it.
+            for y in 16..48usize {
+                let v = pa[y * 64 + 16];
+                assert!(v >= 1.0 - 1e-9, "reverse={reverse} (16,{y}) = {v}");
+            }
+        }
     }
 }

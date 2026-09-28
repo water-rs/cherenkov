@@ -19,7 +19,7 @@ use crate::animation::{
 use crate::backend::Display;
 use crate::display_list::{Operand, SlotUpdate};
 use crate::frame::RefreshRange;
-use crate::message::{BackdropId, ContentOp, LayerId, LayerOp, Prop};
+use crate::message::{ContentOp, LayerId, LayerOp, Prop};
 use crate::shape::ShapeData;
 use crate::style::{BlendMode, FilterId};
 

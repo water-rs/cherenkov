@@ -9,8 +9,10 @@ pub const SHADER: &str = "shader-paint";
 
 /// A filter requiring an auxiliary GPU image with no CPU texels.
 pub const FILTER_GPU_IMAGE: &str = "filter-gpu-image";
-/// A backdrop group.
-pub const BACKDROP: &str = "backdrop";
+/// A backdrop member without a clip shape.
+pub const BACKDROP_UNCLIPPED: &str = "backdrop-unclipped";
+/// A backdrop group whose filter footprint cannot be bounded.
+pub const BACKDROP_FOOTPRINT: &str = "backdrop-footprint";
 /// A stroked glyph run.
 pub const GLYPH_STROKE: &str = "glyph-stroke";
 /// A colour font construct this backend cannot render: a bitmap-only

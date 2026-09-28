@@ -1,0 +1,212 @@
+{
+ "width": 128,
+ "height": 128,
+ "working_space": "linear-display-p3",
+ "clear": {
+  "space": "srgb",
+  "components": [
+   0.95,
+   0.95,
+   0.95,
+   1.0
+  ]
+ },
+ "present_headroom": 2.0,
+ "features": [
+  {
+   "feature": "fill"
+  },
+  {
+   "feature": "linear-gradient"
+  },
+  {
+   "feature": "hdr-color"
+  },
+  {
+   "feature": "wide-gamut"
+  },
+  {
+   "feature": "interpolation-space",
+   "value": "linear-p3"
+  }
+ ],
+ "root": {
+  "transform": [
+   1.0,
+   0.0,
+   0.0,
+   1.0,
+   0.0,
+   0.0
+  ],
+  "opacity": 1.0,
+  "blend": "normal",
+  "items": [
+   {
+    "draw": {
+     "fill": {
+      "shape": {
+       "rect": {
+        "x0": 8,
+        "y0": 8,
+        "x1": 120,
+        "y1": 40
+       }
+      },
+      "rule": "non-zero",
+      "paint": {
+       "linear": {
+        "start": {
+         "x": 8,
+         "y": 0
+        },
+        "end": {
+         "x": 120,
+         "y": 0
+        },
+        "stops": [
+         {
+          "offset": 0.0,
+          "color": {
+           "space": "linear-p3",
+           "components": [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+           ]
+          }
+         },
+         {
+          "offset": 1.0,
+          "color": {
+           "space": "linear-p3",
+           "components": [
+            8.0,
+            8.0,
+            8.0,
+            1.0
+           ]
+          }
+         }
+        ],
+        "extend": "pad",
+        "interpolation": "linear-p3"
+       }
+      }
+     }
+    }
+   },
+   {
+    "draw": {
+     "fill": {
+      "shape": {
+       "rect": {
+        "x0": 8,
+        "y0": 48,
+        "x1": 120,
+        "y1": 80
+       }
+      },
+      "rule": "non-zero",
+      "paint": {
+       "linear": {
+        "start": {
+         "x": 8,
+         "y": 0
+        },
+        "end": {
+         "x": 120,
+         "y": 0
+        },
+        "stops": [
+         {
+          "offset": 0.0,
+          "color": {
+           "space": "linear-p3",
+           "components": [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+           ]
+          }
+         },
+         {
+          "offset": 1.0,
+          "color": {
+           "space": "linear-p3",
+           "components": [
+            8.0,
+            0.0,
+            0.0,
+            1.0
+           ]
+          }
+         }
+        ],
+        "extend": "pad",
+        "interpolation": "linear-p3"
+       }
+      }
+     }
+    }
+   },
+   {
+    "draw": {
+     "fill": {
+      "shape": {
+       "rect": {
+        "x0": 8,
+        "y0": 88,
+        "x1": 120,
+        "y1": 120
+       }
+      },
+      "rule": "non-zero",
+      "paint": {
+       "linear": {
+        "start": {
+         "x": 8,
+         "y": 0
+        },
+        "end": {
+         "x": 120,
+         "y": 0
+        },
+        "stops": [
+         {
+          "offset": 0.0,
+          "color": {
+           "space": "linear-p3",
+           "components": [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+           ]
+          }
+         },
+         {
+          "offset": 1.0,
+          "color": {
+           "space": "linear-p3",
+           "components": [
+            8.0,
+            3.0,
+            0.3,
+            1.0
+           ]
+          }
+         }
+        ],
+        "extend": "pad",
+        "interpolation": "linear-p3"
+       }
+      }
+     }
+    }
+   }
+  ]
+ }
+}

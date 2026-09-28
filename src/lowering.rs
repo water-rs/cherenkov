@@ -586,15 +586,22 @@ pub fn resolve_winding(
     // don't change admission — so the incremental set matches a fresh
     // `y0 <= ya && y1 >= yb` scan every band.
     let mut next = 0usize;
-    let mut active: Vec<&Seg> = Vec::new();
+    let mut active: Vec<usize> = Vec::new();
+    // Per-segment open boundary run: (index into `out`, orientation,
+    // emitting band). A segment that is a boundary again in the very
+    // next band with the same orientation extends its emitted edge
+    // instead of starting a new piece; a run not emitted in a band
+    // fails the `band - 1` test and closes itself. The merged edge is
+    // exactly the union of the per-band pieces of the same line.
+    let mut runs: Vec<Option<(usize, bool, usize)>> = vec![None; segs.len()];
     let mut band = 0usize;
     while band + 1 < ys.len() {
         let (ya, yb) = (ys[band], ys[band + 1]);
         while next < segs.len() && segs[next].y0 <= ya + EPS {
-            active.push(&segs[next]);
+            active.push(next);
             next += 1;
         }
-        active.retain(|s| s.y1 > ya + EPS);
+        active.retain(|&i| segs[i].y1 > ya + EPS);
         if active.is_empty() {
             band += 1;
             continue;
@@ -609,14 +616,15 @@ pub fn resolve_winding(
         // never cross and give the same regions in any order.
         let ym = ya.midpoint(yb);
         active.sort_by(|a, b| {
-            a.x_at(ym)
-                .total_cmp(&b.x_at(ym))
-                .then_with(|| a.slope.total_cmp(&b.slope))
+            segs[*a]
+                .x_at(ym)
+                .total_cmp(&segs[*b].x_at(ym))
+                .then_with(|| segs[*a].slope.total_cmp(&segs[*b].slope))
         });
         // Split at the smallest crossing strictly inside the band.
         let mut split = None;
         for pair in active.windows(2) {
-            let (p, q) = (pair[0], pair[1]);
+            let (p, q) = (&segs[pair[0]], &segs[pair[1]]);
             if (p.slope - q.slope).abs() > EPS {
                 // p.x0 + p.slope*(y-p.y0) == q.x0 + q.slope*(y-q.y0)
                 let yc = q.slope.mul_add(q.y0, p.slope.mul_add(-p.y0, p.x0) - q.x0)
@@ -635,8 +643,9 @@ pub fn resolve_winding(
         let mut inside = false;
         let mut wmin = 0.0f64;
         let mut wmax = 0.0f64;
-        for s in &active {
-            w += s.dir;
+        for &i in &active {
+            let seg = &segs[i];
+            w += seg.dir;
             wmin = wmin.min(w);
             wmax = wmax.max(w);
             let now = match rule {
@@ -644,10 +653,43 @@ pub fn resolve_winding(
                 FillRule::EvenOdd => w.rem_euclid(2.0) > 0.5,
             };
             if now != inside {
-                let (xa, xb) = (s.x_at(ya), s.x_at(yb));
-                if now {
+                let (xa, xb) = (seg.x_at(ya), seg.x_at(yb));
+                // Continue this segment's own open run, or another
+                // segment's run that ends exactly where this piece
+                // starts (collinear segments share the same boundary
+                // line, so the extension is exact).
+                let run = match runs[i] {
+                    Some((edge, orient, last)) if orient == now && last + 1 == band => Some(edge),
+                    _ => runs.iter().find_map(|r| match *r {
+                        Some((edge, orient, last)) if orient == now && last + 1 == band => {
+                            let old = out[edge];
+                            let end = if now { (old.2, old.3) } else { (old.0, old.1) };
+                            // Collinear pieces only: at a kink the
+                            // boundary continues on a different line
+                            // and must start a new edge. The emitted
+                            // edge's y-extent is never zero.
+                            let collinear =
+                                ((old.2 - old.0) / (old.3 - old.1) - seg.slope).abs() <= EPS;
+                            (end == (xa, ya) && collinear).then_some(edge)
+                        }
+                        _ => None,
+                    }),
+                };
+                if let Some(edge) = run {
+                    let piece = &mut out[edge];
+                    if now {
+                        piece.2 = xb;
+                        piece.3 = yb;
+                    } else {
+                        piece.0 = xb;
+                        piece.1 = yb;
+                    }
+                    runs[i] = Some((edge, now, band));
+                } else if now {
+                    runs[i] = Some((out.len(), now, band));
                     out.push((xa, ya, xb, yb));
                 } else {
+                    runs[i] = Some((out.len(), now, band));
                     out.push((xb, yb, xa, ya));
                 }
                 inside = now;
@@ -706,6 +748,8 @@ mod tests {
         let mut segs = square(0.0, 0.0, 3.0, 3.0);
         segs.extend(square(1.5, 1.5, 4.5, 4.5));
         let resolved = resolve_winding(&segs, FillRule::NonZero).expect("overlap present");
+        // One merged edge per boundary line: x=0, x=3, x=1.5, x=4.5.
+        assert_eq!(resolved.len(), 4, "merged edges: {resolved:?}");
         assert!(
             (area(&resolved).abs() - 15.75).abs() < 1e-3,
             "union area {}",
@@ -719,6 +763,25 @@ mod tests {
                 .iter()
                 .all(|e| e.0 >= 0.0 && e.1 >= 0.0 && e.2 >= 0.0 && e.3 >= 0.0),
             "edges outside input bounds: {resolved:?}"
+        );
+    }
+
+    #[test]
+    fn stacked_rectangles_emit_one_edge_per_side() {
+        // 40 rectangles [0,10]×[0.5i, 0.5i+5], all same winding: many
+        // bands and heavy overlap, but the union is one rectangle
+        // [0,10]×[0,24.5] — two merged boundary edges, area 245.
+        let mut segs = Vec::new();
+        for i in 0..40u8 {
+            let y = 0.5 * f32::from(i);
+            segs.extend(square(0.0, y, 10.0, y + 5.0));
+        }
+        let resolved = resolve_winding(&segs, FillRule::NonZero).expect("overlap present");
+        assert_eq!(resolved.len(), 2, "merged edges: {resolved:?}");
+        assert!(
+            (area(&resolved).abs() - 245.0).abs() < 1e-3,
+            "union area {}",
+            area(&resolved)
         );
     }
 
@@ -761,6 +824,26 @@ mod tests {
         );
     }
 
+    /// Whether the open interiors of two segments intersect.
+    fn edges_cross(e: (f32, f32, f32, f32), f: (f32, f32, f32, f32)) -> bool {
+        let cross = |p: (f64, f64), q: (f64, f64), r: (f64, f64)| {
+            (q.1 - p.1).mul_add(-(r.0 - p.0), (q.0 - p.0) * (r.1 - p.1))
+        };
+        let (e0, e1, f0, f1) = (
+            (f64::from(e.0), f64::from(e.1)),
+            (f64::from(e.2), f64::from(e.3)),
+            (f64::from(f.0), f64::from(f.1)),
+            (f64::from(f.2), f64::from(f.3)),
+        );
+        let (d1, d2, d3, d4) = (
+            cross(f0, f1, e0),
+            cross(f0, f1, e1),
+            cross(e0, e1, f0),
+            cross(e0, e1, f1),
+        );
+        ((d1 > 0.0) != (d2 > 0.0)) && ((d3 > 0.0) != (d4 > 0.0)) && d1 != 0.0 && d2 != 0.0
+    }
+
     #[test]
     fn a_later_crossing_still_splits_the_band() {
         // The first inverted pair (0,0)-(4,4) vs (1e-10,0)-(-4,4) crosses
@@ -774,12 +857,16 @@ mod tests {
             (6.0, 0.0, 3.0, 4.0),
         ];
         let resolved = resolve_winding(&segs, FillRule::NonZero).expect("crossing present");
-        assert!(
-            resolved
-                .iter()
-                .any(|e| (e.1 - 2.0).abs() < 1e-6 || (e.3 - 2.0).abs() < 1e-6),
-            "no edge boundary at the y=2 crossing: {resolved:?}"
-        );
+        // The crossing splits the band, so no two emitted edges cross
+        // strictly inside (the pre-fix walk emitted crossing pieces).
+        for (i, first) in resolved.iter().enumerate() {
+            for second in &resolved[i + 1..] {
+                assert!(
+                    !edges_cross(*first, *second),
+                    "emitted edges cross: {first:?} x {second:?}"
+                );
+            }
+        }
     }
 
     #[test]

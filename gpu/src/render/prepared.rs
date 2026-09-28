@@ -1246,6 +1246,7 @@ impl Lowerer<'_> {
         });
     }
 
+    #[inline(never)]
     fn color_glyph_run(
         &mut self,
         ambient: Affine,

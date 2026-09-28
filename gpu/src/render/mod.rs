@@ -2846,10 +2846,12 @@ impl GpuRenderer {
         let surface = make(TARGET_FORMAT);
         let scratch = make(self.scratch_format);
         let scope_error = pollster::block_on(scope.pop());
-        let pipelines = [surface?, scratch?];
+        // An invalid module reports through the scope and fails the
+        // pipelines only as a consequence: surface it first.
         if let Some(error) = scope_error {
             return Err(ResourceError::Shader(format!("{error}")));
         }
+        let pipelines = [surface?, scratch?];
         self.backdrop_shaders.insert(id.raw(), pipelines);
         Ok(())
     }
@@ -2872,33 +2874,37 @@ impl GpuRenderer {
                 label: Some("backdrop effect"),
                 source: wgpu::ShaderSource::Wgsl(backdrop_effect_text(&source.source)),
             });
-        let pipelines = [
-            create_pipeline(
-                &self.device,
-                &self.config,
-                &self.layout0,
-                &self.layout1,
-                &module,
-                TARGET_FORMAT,
-                false,
-            )
-            .await
-            .map_err(|e| ResourceError::Shader(e.to_string()))?,
-            create_pipeline(
-                &self.device,
-                &self.config,
-                &self.layout0,
-                &self.layout1,
-                &module,
-                self.scratch_format,
-                false,
-            )
-            .await
-            .map_err(|e| ResourceError::Shader(e.to_string()))?,
-        ];
-        if let Some(error) = scope.pop().await {
+        let surface = create_pipeline(
+            &self.device,
+            &self.config,
+            &self.layout0,
+            &self.layout1,
+            &module,
+            TARGET_FORMAT,
+            false,
+        )
+        .await
+        .map_err(|e| ResourceError::Shader(e.to_string()));
+        let scratch = create_pipeline(
+            &self.device,
+            &self.config,
+            &self.layout0,
+            &self.layout1,
+            &module,
+            self.scratch_format,
+            false,
+        )
+        .await
+        .map_err(|e| ResourceError::Shader(e.to_string()));
+        // The scope is popped before `?` propagates: an early return must
+        // not leak an unbalanced error scope. An invalid module reports
+        // through the scope and fails the pipelines only as a
+        // consequence: surface it first.
+        let scope_error = scope.pop().await;
+        if let Some(error) = scope_error {
             return Err(ResourceError::Shader(format!("{error}")));
         }
+        let pipelines = [surface?, scratch?];
         self.backdrop_shaders.insert(id.raw(), pipelines);
         Ok(())
     }

@@ -30,6 +30,8 @@ pub struct FontData {
     pub index: u32,
     /// Validated once at registration; plain runs do not reparse font tables.
     pub has_colr: bool,
+    /// Resolved once at registration like `has_colr`: `bitmap` is `Some`.
+    pub has_bitmap: bool,
     /// Bitmap strike sizes validated at registration.
     pub bitmap: Option<Arc<super::bitmap::BitmapFont>>,
     /// Built font-space `COLRv1` pictures, per `(glyph id, coords hash,
@@ -48,6 +50,7 @@ impl FontData {
             data: self.data.clone(),
             index: self.index,
             has_colr: self.has_colr,
+            has_bitmap: self.has_bitmap,
             bitmap: self.bitmap.clone(),
             colr: std::cell::RefCell::new(self.colr.borrow().clone()),
         }
@@ -1643,6 +1646,7 @@ mod tests {
                 .into(),
             index: 0,
             has_colr: false,
+            has_bitmap: false,
             bitmap: None,
             colr: std::cell::RefCell::new(HashMap::new()),
         };

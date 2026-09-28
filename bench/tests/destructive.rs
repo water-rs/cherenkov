@@ -14,9 +14,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
-/// The `blend-{clear,src,src-in,src-out,dest-in,dest-atop}*` corpus scenes,
-/// including their `-clip` variants: the modes whose extent rule reads the
-/// canvas under the group.
+/// The corpus scenes whose result depends on the backdrop the scene root's
+/// children composite against, including their `-clip` and `-solid`
+/// variants: the six destructive operators plus `dest-out`, `xor` and
+/// `plus-lighter`, which all read the canvas under the group.
 const DESTRUCTIVE_PREFIXES: &[&str] = &[
     "blend-clear",
     "blend-src",
@@ -24,6 +25,9 @@ const DESTRUCTIVE_PREFIXES: &[&str] = &[
     "blend-src-out",
     "blend-dest-in",
     "blend-dest-atop",
+    "blend-dest-out",
+    "blend-xor",
+    "blend-plus-lighter",
 ];
 
 fn corpus() -> PathBuf {
@@ -67,7 +71,11 @@ fn assert_destructive_scenes(engine: &str) {
         let name = entry.file_name().to_string_lossy().into_owned();
         let destructive = DESTRUCTIVE_PREFIXES.iter().any(|prefix| {
             name.strip_prefix(prefix).is_some_and(|rest| {
-                rest.is_empty() || rest.starts_with("-clip") || rest == "-p3" || rest == "-hdr"
+                rest.is_empty()
+                    || rest.starts_with("-clip")
+                    || rest.starts_with("-solid")
+                    || rest == "-p3"
+                    || rest == "-hdr"
             })
         });
         if destructive {

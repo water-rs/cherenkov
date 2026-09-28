@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 cherenkov-scene = { path = "../scene" }
+half = "2"
 kurbo = "0.13"
 libm = "0.2"
 skrifa = "0.44"

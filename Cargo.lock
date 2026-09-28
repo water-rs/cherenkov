@@ -420,6 +420,7 @@ name = "cherenkov-oracle"
 version = "0.0.0"
 dependencies = [
  "cherenkov-scene",
+ "half",
  "kurbo",
  "libm",
  "png",

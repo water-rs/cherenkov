@@ -304,7 +304,9 @@ fn resource_image_converts_srgb_to_linear_p3() {
     );
     let hash = Scene::store_resource(&dir, &png).expect("store");
     let mut res = cherenkov_oracle::Resources::new(dir);
-    let img = res.image(hash).expect("decode");
+    let img = res
+        .image(hash, cherenkov_scene::ImageEncoding::default())
+        .expect("decode");
     let want = linear_srgb_to_linear_p3([1.0, 0.0, 0.0]);
     let px = img.pixels[0];
     assert!(
@@ -318,6 +320,83 @@ fn resource_image_converts_srgb_to_linear_p3() {
     // 0.033, 0.017) in P3 coordinates); this fails if the conversion
     // is skipped.
     assert!(want[0] < 0.90 && want[1] < 0.10);
+}
+
+/// A PNG tagged `DisplayP3` skips the primaries matrix: encoded red
+/// (255,0,0) decodes to linear-P3 exactly (1,0,0), not to sRGB red's
+/// P3 coordinates.
+#[test]
+fn resource_image_display_p3_skips_primaries_conversion() {
+    use cherenkov_scene::{ImageColorSpace, ImageEncoding};
+    let dir = tmp().join("res-display-p3");
+    let png = encode_png(
+        png::ColorType::Rgba,
+        png::BitDepth::Eight,
+        1,
+        1,
+        &[255, 0, 0, 255],
+        None,
+    );
+    let hash = Scene::store_resource(&dir, &png).expect("store");
+    let mut res = cherenkov_oracle::Resources::new(dir);
+    let img = res
+        .image(
+            hash,
+            ImageEncoding::Png {
+                color_space: ImageColorSpace::DisplayP3,
+            },
+        )
+        .expect("decode");
+    let px = img.pixels[0];
+    assert!(
+        (px[0] - 1.0).abs() < 2e-3 && px[1].abs() < 2e-3 && px[2].abs() < 2e-3,
+        "DisplayP3 red must decode to P3 (1,0,0); got {px:?}"
+    );
+}
+
+/// A `Rgba16F` blob in `LinearP3` is raw half floats straight to the
+/// working space — a 16.0 channel survives unclamped.
+#[test]
+fn resource_image_rgba16f_linear_p3_is_unclamped() {
+    use cherenkov_scene::{ImageColorSpace, ImageEncoding};
+    let dir = tmp().join("res-f16");
+    let mut blob = Vec::new();
+    for c in [16.0f32, 0.0, 0.0, 1.0] {
+        blob.extend_from_slice(&half::f16::from_f32(c).to_le_bytes());
+    }
+    let hash = Scene::store_resource(&dir, &blob).expect("store");
+    let mut res = cherenkov_oracle::Resources::new(dir);
+    let img = res
+        .image(
+            hash,
+            ImageEncoding::Rgba16F {
+                width: 1,
+                height: 1,
+                color_space: ImageColorSpace::LinearP3,
+            },
+        )
+        .expect("decode");
+    let px = img.pixels[0];
+    assert!(
+        (px[0] - 16.0).abs() < 1e-6 && (px[3] - 1.0).abs() < 1e-6,
+        "HDR texel must survive: got {px:?}"
+    );
+
+    // A truncated blob is an error, not a silent partial image.
+    let dir2 = tmp().join("res-f16-short");
+    let hash2 = Scene::store_resource(&dir2, &blob[..4]).expect("store");
+    let mut res2 = cherenkov_oracle::Resources::new(dir2);
+    assert!(
+        res2.image(
+            hash2,
+            ImageEncoding::Rgba16F {
+                width: 1,
+                height: 1,
+                color_space: ImageColorSpace::LinearP3,
+            },
+        )
+        .is_err()
+    );
 }
 
 /// Exact covered area under winding: two overlapping rectangles

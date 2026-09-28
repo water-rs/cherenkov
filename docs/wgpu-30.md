@@ -12,9 +12,13 @@ still required before readback; the newly fallible mapped-range access keeps
 the previous invariant checks. Shader generation keeps naga's integer-division
 checks enabled, matching the previous compiler's behavior.
 
-Both Vello fork histories used by the workspace are upgraded and pinned
-separately. The classic and hybrid forks are not merged into one revision:
-that would import unrelated renderer changes into this dependency upgrade.
+The bench's Vello baselines are not upgraded: the pinned lexoliu/vello forks
+require `wgpu ^29`, and Vello is not this project's code to port. The bench
+links both majors — `wgpu` 30 for the cherenkov adapter, `wgpu29` (a renamed
+`wgpu` 29 dependency) for `vello-classic`, `vello-hybrid` and their shared
+`wgpu_ctx` — and each engine keeps its own device. The transitional
+in-repo Vello backend is removed: `cherenkov-gpu` has superseded it, and
+it could not survive filtrate's move to wgpu 30.
 
 `TRANSIENT_ATTACHMENT` is not enabled by this change. No existing attachment
 uses the old `TRANSIENT` spelling, and converting persistent attachments to

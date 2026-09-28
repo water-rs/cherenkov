@@ -19,7 +19,7 @@ use vello_hybrid::{
 };
 
 use crate::convert::{self, Prepared};
-use crate::memory::{AdapterMemory, Reading, wgpu_allocator, wgpu_vk_memory_budget};
+use crate::memory::{AdapterMemory, Reading, wgpu29_allocator, wgpu29_vk_memory_budget};
 use crate::vello_like::{Lowered, VelloLikeCtx, lower, replay, vello_features, vello_missing_api};
 use crate::wgpu_ctx::{Gpu, Target, drain_and_stamp, readback, resolve_timestamps};
 use crate::{BenchError, Counters, DeviceInfo, EncodeInput, Engine, EngineInfo, GpuSample, Submit};
@@ -211,7 +211,7 @@ impl Engine for VelloHybrid {
             let mut encoder =
                 self.gpu
                     .device
-                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    .create_command_encoder(&wgpu29::CommandEncoderDescriptor {
                         label: Some("vello-hybrid image uploads"),
                     });
             for hash in hashes {
@@ -309,12 +309,12 @@ impl Engine for VelloHybrid {
         // the render and would bracket an empty interval. The drain
         // serializes CPU and GPU for the measured frame by design.
         drain_and_stamp(&self.gpu, 0)?;
-        let mut encoder = self
-            .gpu
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("vello-hybrid frame"),
-            });
+        let mut encoder =
+            self.gpu
+                .device
+                .create_command_encoder(&wgpu29::CommandEncoderDescriptor {
+                    label: Some("vello-hybrid frame"),
+                });
         renderer
             .render(
                 scene,
@@ -356,9 +356,9 @@ impl Engine for VelloHybrid {
     fn memory(&self) -> AdapterMemory {
         AdapterMemory {
             engine: Reading::unavailable("Vello hybrid does not expose engine memory"),
-            wgpu_allocator: wgpu_allocator(&self.gpu.device, self.gpu.info.backend),
+            wgpu_allocator: wgpu29_allocator(&self.gpu.device, self.gpu.info.backend),
             skia_budgeted: Reading::unavailable("Vello hybrid has no Skia budget"),
-            vk_memory_budget: wgpu_vk_memory_budget(
+            vk_memory_budget: wgpu29_vk_memory_budget(
                 &self.gpu.device,
                 self.gpu.info.backend,
                 &self.gpu.info.name,

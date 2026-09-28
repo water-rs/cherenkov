@@ -12,8 +12,8 @@ workspace = true
 
 [features]
 default = []
-vello-classic = ["dep:vello", "dep:vello_common", "dep:wgpu", "dep:pollster", "dep:ash"]
-vello-hybrid = ["dep:vello_hybrid", "dep:vello_common", "dep:wgpu", "dep:pollster", "dep:glifo", "dep:ash"]
+vello-classic = ["dep:vello", "dep:vello_common", "dep:wgpu29", "dep:pollster", "dep:ash"]
+vello-hybrid = ["dep:vello_hybrid", "dep:vello_common", "dep:wgpu29", "dep:pollster", "dep:glifo", "dep:ash"]
 vello-cpu = ["dep:vello_cpu", "dep:vello_common"]
 # `skia-safe` backend features stay in the feature lists, not on the
 # dependency: `skia-bindings` downloads a prebuilt Skia keyed on the whole
@@ -61,6 +61,10 @@ objc2-metal = { version = "0.3.2", optional = true, default-features = false, fe
     "objc2-core-foundation",
 ] }
 wgpu = { version = "30.0.1", optional = true }
+# The `vello-classic`/`vello-hybrid` baselines stay on wgpu 29: the pinned
+# lexoliu/vello forks require `wgpu ^29`. Both majors link into the bench;
+# each engine keeps its own device.
+wgpu29 = { package = "wgpu", version = "29", optional = true }
 pollster = { version = "0.4", optional = true }
 peniko = "0.6"
 skrifa = "0.44"

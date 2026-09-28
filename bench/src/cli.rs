@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::convert;
+use crate::memory::{MemoryReport, MemorySnapshot, SampleDetail};
 use crate::report::{
     CpuUse, FrameSample, MeasureReport, Pacing, PassPercentiles, Percentiles, PhasePercentiles,
     Placement, RenderReport, UnsupportedReport, percentiles,
@@ -204,6 +205,7 @@ fn run(cli: Cli) -> Result<(), BenchError> {
             out_dir,
         } => {
             let mut engine = create_engine(&engine)?;
+            let idle_memory = MemorySnapshot::capture(engine.memory(), SampleDetail::Full);
             for dir in scene_dirs(scene.as_deref(), corpus.as_deref())? {
                 let out_path = match (&out, &out_dir) {
                     (Some(o), None) => o.clone(),
@@ -214,7 +216,7 @@ fn run(cli: Cli) -> Result<(), BenchError> {
                     )),
                     _ => return Err(BenchError::Engine("--out or --out-dir required".into())),
                 };
-                match render_scene(&mut *engine, &dir) {
+                match render_scene(&mut *engine, &dir, idle_memory.clone()) {
                     Ok(rendered) => {
                         write_render(&rendered, &out_path)?;
                         tracing::info!(
@@ -227,7 +229,14 @@ fn run(cli: Cli) -> Result<(), BenchError> {
                         );
                     }
                     Err(BenchError::Unsupported { feature, api, .. }) => {
-                        write_unsupported(&*engine, &dir, feature.clone(), api, &out_path)?;
+                        write_unsupported(
+                            &*engine,
+                            &dir,
+                            feature.clone(),
+                            api,
+                            idle_memory.clone(),
+                            &out_path,
+                        )?;
                         tracing::warn!(
                             scene = %dir.display(),
                             ?feature,
@@ -313,6 +322,7 @@ fn measure_cmd(engine: &str, opts: MeasureOpts<'_>) -> Result<(), BenchError> {
         affinity::pin_current_thread(cpus)?;
     }
     let mut engine = create_engine(engine)?;
+    let idle_memory = MemorySnapshot::capture(engine.memory(), SampleDetail::Full);
     for dir in scene_dirs(opts.scene, opts.corpus)? {
         let out_path = match (opts.out, opts.out_dir) {
             (Some(o), None) => o.to_path_buf(),
@@ -326,45 +336,28 @@ fn measure_cmd(engine: &str, opts: MeasureOpts<'_>) -> Result<(), BenchError> {
         match measure_scene(
             &mut *engine,
             &dir,
-            opts.frames,
-            opts.warmup,
-            pinned.as_deref(),
-            opts.rate,
-            opts.energy,
+            MeasureSceneOptions {
+                frames: opts.frames,
+                warmup: opts.warmup,
+                pinned: pinned.as_deref(),
+                rate: opts.rate,
+                measure_energy: opts.energy,
+                idle_memory: idle_memory.clone(),
+            },
         ) {
             Ok(report) => {
                 write_json(&report, &out_path)?;
-                tracing::info!(
-                    scene = %dir.display(),
-                    prepare_s = report.prepare_seconds,
-                    encode_p50 = report.percentiles.encode_seconds[0],
-                    submit_p50 = report.percentiles.submit_seconds[0],
-                    gpu_p50 = ?report.percentiles.gpu_seconds.map(|g| g[0]),
-                    out = %out_path.display(),
-                    "measure"
-                );
-                for pass in &report.percentiles.passes {
-                    tracing::info!(
-                        scene = %dir.display(),
-                        pass = %pass.name,
-                        size = %format!("{}x{}", pass.width, pass.height),
-                        format = %pass.format,
-                        gpu_p50 = ?pass.gpu_seconds.map(|g| g[0]),
-                        "pass"
-                    );
-                }
-                for phase in &report.percentiles.phases {
-                    tracing::info!(
-                        scene = %dir.display(),
-                        phase = %phase.name,
-                        p50 = phase.seconds[0],
-                        p99 = phase.seconds[2],
-                        "phase"
-                    );
-                }
+                log_measure_details(&dir, &report, &out_path);
             }
             Err(BenchError::Unsupported { feature, api, .. }) => {
-                write_unsupported(&*engine, &dir, feature.clone(), api, &out_path)?;
+                write_unsupported(
+                    &*engine,
+                    &dir,
+                    feature.clone(),
+                    api,
+                    idle_memory.clone(),
+                    &out_path,
+                )?;
                 tracing::warn!(
                     scene = %dir.display(),
                     ?feature,
@@ -376,6 +369,38 @@ fn measure_cmd(engine: &str, opts: MeasureOpts<'_>) -> Result<(), BenchError> {
         }
     }
     Ok(())
+}
+
+fn log_measure_details(dir: &Path, report: &MeasureReport, out_path: &Path) {
+    tracing::info!(
+        scene = %dir.display(),
+        prepare_s = report.prepare_seconds,
+        encode_p50 = report.percentiles.encode_seconds[0],
+        submit_p50 = report.percentiles.submit_seconds[0],
+        gpu_p50 = ?report.percentiles.gpu_seconds.map(|g| g[0]),
+        engine_memory = ?report.memory.steady.engine,
+        out = %out_path.display(),
+        "measure"
+    );
+    for pass in &report.percentiles.passes {
+        tracing::info!(
+            scene = %dir.display(),
+            pass = %pass.name,
+            size = %format!("{}x{}", pass.width, pass.height),
+            format = %pass.format,
+            gpu_p50 = ?pass.gpu_seconds.map(|g| g[0]),
+            "pass"
+        );
+    }
+    for phase in &report.percentiles.phases {
+        tracing::info!(
+            scene = %dir.display(),
+            phase = %phase.name,
+            p50 = phase.seconds[0],
+            p99 = phase.seconds[2],
+            "phase"
+        );
+    }
 }
 
 /// `--scene` gives one dir; `--corpus` gives every child holding
@@ -412,7 +437,11 @@ struct RenderOutput {
     heatmap: Vec<u8>,
 }
 
-fn render_scene(engine: &mut dyn Engine, dir: &Path) -> Result<RenderOutput, BenchError> {
+fn render_scene(
+    engine: &mut dyn Engine,
+    dir: &Path,
+    idle_memory: MemorySnapshot,
+) -> Result<RenderOutput, BenchError> {
     let scene = Scene::load(dir)?;
     let blobs = convert::load_blobs(&scene, dir)?;
     let reference =
@@ -422,8 +451,10 @@ fn render_scene(engine: &mut dyn Engine, dir: &Path) -> Result<RenderOutput, Ben
         blobs: &blobs,
     };
     engine.prepare(&input)?;
+    let prepare_memory = MemorySnapshot::capture(engine.memory(), SampleDetail::Full);
     engine.encode(&input)?;
     let submit = engine.submit(0, true)?;
+    let steady_memory = MemorySnapshot::capture(engine.memory(), SampleDetail::Full);
     let test = submit
         .image
         .ok_or_else(|| BenchError::Engine("adapter returned no image".into()))?;
@@ -441,6 +472,7 @@ fn render_scene(engine: &mut dyn Engine, dir: &Path) -> Result<RenderOutput, Ben
             height: scene.height,
             metrics: metrics_v,
             counters: engine.counters(),
+            memory: MemoryReport::new(idle_memory, &[prepare_memory, steady_memory]),
             device: engine.device(),
         },
         image: test,
@@ -472,6 +504,7 @@ fn cpu_use(prepare_cpu: Option<u32>, samples: &[FrameSample]) -> BTreeMap<u32, C
 /// What [`run_frames`] collected.
 struct Window {
     samples: Vec<FrameSample>,
+    memory_samples: Vec<MemorySnapshot>,
     meter: Option<energy::Meter>,
     start: Instant,
     missed_deadlines: u32,
@@ -499,7 +532,9 @@ fn run_frames(
     let mut start = Instant::now();
     let mut missed_deadlines = 0u32;
     let mut samples = Vec::with_capacity(frames as usize);
-    for frame in 0..(warmup + frames) {
+    let total_frames = warmup + frames;
+    let mut memory_samples = Vec::with_capacity(total_frames as usize);
+    for frame in 0..total_frames {
         if frame == warmup {
             // The energy window and the pacing clock both open
             // immediately before the first measured frame.
@@ -533,6 +568,12 @@ fn run_frames(
         let submit = engine.submit(u64::from(frame), false)?;
         let t2 = Instant::now();
         let cpu_end = affinity::current_cpu();
+        let detail = if frame + 1 == total_frames {
+            SampleDetail::Full
+        } else {
+            SampleDetail::Frame
+        };
+        memory_samples.push(MemorySnapshot::capture(engine.memory(), detail));
         if frame >= warmup {
             samples.push(FrameSample {
                 encode_seconds: t1.duration_since(t0).as_secs_f64(),
@@ -550,6 +591,7 @@ fn run_frames(
     attribute_gpu(&mut samples, warmup, engine.finish_gpu()?);
     Ok(Window {
         samples,
+        memory_samples,
         meter,
         start,
         missed_deadlines,
@@ -587,15 +629,28 @@ fn pacing(rate: f64, frames: u32) -> Result<(Duration, Duration), BenchError> {
     Ok((period, window))
 }
 
+struct MeasureSceneOptions<'a> {
+    frames: u32,
+    warmup: u32,
+    pinned: Option<&'a [u32]>,
+    rate: Option<f64>,
+    measure_energy: bool,
+    idle_memory: MemorySnapshot,
+}
+
 fn measure_scene(
     engine: &mut dyn Engine,
     dir: &Path,
-    frames: u32,
-    warmup: u32,
-    pinned: Option<&[u32]>,
-    rate: Option<f64>,
-    measure_energy: bool,
+    options: MeasureSceneOptions<'_>,
 ) -> Result<MeasureReport, BenchError> {
+    let MeasureSceneOptions {
+        frames,
+        warmup,
+        pinned,
+        rate,
+        measure_energy,
+        idle_memory,
+    } = options;
     let scene = Scene::load(dir)?;
     let blobs = convert::load_blobs(&scene, dir)?;
     let input = EncodeInput {
@@ -613,6 +668,7 @@ fn measure_scene(
     let t_prepare = Instant::now();
     engine.prepare(&input)?;
     let prepare_seconds = t_prepare.elapsed().as_secs_f64();
+    let prepare_memory = MemorySnapshot::capture(engine.memory(), SampleDetail::Full);
     let (period, window_hint) = match rate {
         Some(hz) => pacing(hz, frames).map(|(p, w)| (Some(p), w))?,
         None => (None, Duration::from_secs(30)),
@@ -626,6 +682,8 @@ fn measure_scene(
         window_hint,
         measure_energy,
     )?;
+    let mut memory_samples = vec![prepare_memory];
+    memory_samples.extend(window.memory_samples.iter().cloned());
     let window_end = Instant::now();
     let window_seconds = window_end.duration_since(window.start).as_secs_f64();
     let energy_outcome = window
@@ -649,14 +707,7 @@ fn measure_scene(
             .as_ref()
             .and_then(|o| o.thermal_pressure.clone()),
     );
-    let placement = Placement {
-        requested: pinned.map(<[u32]>::to_vec),
-        controlled: pinned.is_some(),
-        heterogeneous,
-        prepare_cpu,
-        cpus: cpu_use(prepare_cpu, &samples),
-        migrated: u32::try_from(samples.iter().filter(|s| s.migrated).count()).unwrap_or(u32::MAX),
-    };
+    let placement = measure_placement(pinned, heterogeneous, prepare_cpu, &samples);
     let enc: Vec<f64> = samples.iter().map(|s| s.encode_seconds).collect();
     let sub: Vec<f64> = samples.iter().map(|s| s.submit_seconds).collect();
     let gpu: Vec<f64> = samples.iter().filter_map(|s| s.gpu_seconds).collect();
@@ -687,8 +738,25 @@ fn measure_scene(
         energy: energy_outcome.map(|o| o.report),
         conditions,
         counters: engine.counters(),
+        memory: MemoryReport::new(idle_memory, &memory_samples),
         device: engine.device(),
     })
+}
+
+fn measure_placement(
+    pinned: Option<&[u32]>,
+    heterogeneous: bool,
+    prepare_cpu: Option<u32>,
+    samples: &[FrameSample],
+) -> Placement {
+    Placement {
+        requested: pinned.map(<[u32]>::to_vec),
+        controlled: pinned.is_some(),
+        heterogeneous,
+        prepare_cpu,
+        cpus: cpu_use(prepare_cpu, samples),
+        migrated: u32::try_from(samples.iter().filter(|s| s.migrated).count()).unwrap_or(u32::MAX),
+    }
 }
 
 /// Percentiles per pass index, over the frames with the modal pass
@@ -754,6 +822,7 @@ fn write_unsupported(
     dir: &Path,
     feature: cherenkov_scene::Feature,
     api: Option<&'static str>,
+    memory_idle: MemorySnapshot,
     out: &Path,
 ) -> Result<(), BenchError> {
     if let Some(parent) = out.parent() {
@@ -770,6 +839,7 @@ fn write_unsupported(
                 .into_owned(),
             unsupported: feature,
             missing_api: api,
+            memory_idle,
         },
         out,
     )

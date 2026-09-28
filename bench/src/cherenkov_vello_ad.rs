@@ -23,10 +23,11 @@ use cherenkov_scene::{
     BlendMode, ColorSpace, Draw as SceneDraw, Extend, Feature, FillRule, GlyphRun as SceneGlyphRun,
     Item, Layer as SceneLayer, Paint as ScenePaint, ResourceHash, Shape,
 };
-use cherenkov_vello::{Vello, VelloConfig};
+use cherenkov_vello::{Vello, VelloConfig, interop::wgpu::DeviceSource};
 use kurbo::{Affine, BezPath, Circle, Ellipse, Line, Rect, RoundedRect, Vec2};
 
 use crate::convert::{self, Blobs, Prepared};
+use crate::memory::{AdapterMemory, EngineBytes, Reading, wgpu_allocator, wgpu_vk_memory_budget};
 use crate::motion::{Clock, LayerMotion};
 use crate::timing::Timings;
 use crate::{BenchError, Counters, DeviceInfo, EncodeInput, Engine, EngineInfo, Submit};
@@ -417,6 +418,7 @@ struct ContentLayer {
 pub struct CherenkovVello {
     info: EngineInfo,
     engine: VelloEngine<Vello>,
+    device_source: DeviceSource,
     surface: Option<Surface<Vello>>,
     /// Registered fonts per `(blob hash, face index)` (keeps the handles
     /// alive).
@@ -1055,9 +1057,15 @@ impl CherenkovVello {
     /// # Errors
     /// [`BenchError::Gpu`] when no adapter exists or device creation fails.
     pub fn new() -> Result<Self, BenchError> {
-        let engine = VelloEngine::<Vello>::new(VelloConfig {
+        let config = VelloConfig {
             timestamps: true,
             ..VelloConfig::default()
+        };
+        let device_source = DeviceSource::create(&config)
+            .map_err(|e| BenchError::Gpu(format!("cherenkov-vello engine: {e}")))?;
+        let engine = VelloEngine::<Vello>::new(VelloConfig {
+            device: Some(device_source.clone()),
+            ..config
         })
         .map_err(|e| BenchError::Gpu(format!("cherenkov-vello engine: {e}")))?;
         Ok(Self {
@@ -1074,6 +1082,7 @@ impl CherenkovVello {
                                image) against fonts, images and the layer tree prepared once",
             },
             engine,
+            device_source,
             surface: None,
             fonts: HashMap::new(),
             images: HashMap::new(),
@@ -1243,6 +1252,24 @@ impl Engine for CherenkovVello {
             target_format: Some("Rgba8Unorm".to_string()),
             cpu: crate::cpu_model(),
             thermal_celsius: crate::thermal_celsius(),
+        }
+    }
+
+    fn memory(&self) -> AdapterMemory {
+        let usage = self.engine.memory();
+        let adapter_info = self.device_source.adapter.get_info();
+        AdapterMemory {
+            engine: Reading::Measured(EngineBytes {
+                cpu_bytes: usage.cpu.0,
+                gpu_bytes: usage.gpu.0,
+            }),
+            wgpu_allocator: wgpu_allocator(&self.device_source.device, adapter_info.backend),
+            skia_budgeted: Reading::unavailable("not a Skia adapter"),
+            vk_memory_budget: wgpu_vk_memory_budget(
+                &self.device_source.device,
+                adapter_info.backend,
+                &adapter_info.name,
+            ),
         }
     }
 }

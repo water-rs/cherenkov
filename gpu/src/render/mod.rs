@@ -483,6 +483,27 @@ fn create_device(
     Ok((instance, adapter, device, queue))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+impl crate::interop::SharedDevice {
+    /// Creates the adapter and device the GPU engine would use for `config`.
+    ///
+    /// Pass the result back through [`GpuConfig::device`] to drive the engine
+    /// with this exact device.
+    ///
+    /// # Errors
+    /// [`EngineError`] when no adapter allows the target format or device
+    /// creation fails.
+    pub fn create(config: &GpuConfig) -> Result<Self, EngineError> {
+        let (instance, adapter, device, queue) = create_device(config)?;
+        Ok(Self {
+            instance,
+            adapter,
+            device,
+            queue,
+        })
+    }
+}
+
 #[cfg(target_arch = "wasm32")]
 async fn create_device(
     config: &GpuConfig,

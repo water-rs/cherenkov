@@ -552,6 +552,14 @@ promises rather than block on channels or device polling. `cherenkov::Instant`
 uses the browser performance clock on wasm32 and is `std::time::Instant` on
 native. Native callers need no timestamp conversion.
 
+### Memory measurement (#101)
+
+Native hosts can obtain the exact device an engine would create with
+`SharedDevice::create(&gpu_config)` or `DeviceSource::create(&vello_config)`,
+then pass it back through `GpuConfig::device` or `VelloConfig::with_device`.
+These helpers wrap the engines' normal creation paths, preserving adapter
+selection, enabled capabilities and rendering behavior by construction.
+
 #### Running the browser tests
 
 The `browser` test target in `cherenkov-gpu` executes against a real

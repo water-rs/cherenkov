@@ -16,6 +16,7 @@ use vello_cpu::peniko::{BlendMode as PBlendMode, Fill, FontData, ImageBrush};
 use vello_cpu::{Pixmap, PixmapMut, RenderContext, Resources};
 
 use crate::convert::{self, Prepared};
+use crate::memory::{AdapterMemory, Reading};
 use crate::vello_like::{Lowered, VelloLikeCtx, lower, replay, vello_features};
 use crate::{
     BenchError, Counters, DeviceInfo, EncodeInput, Engine, EngineInfo, Submit, cpu_model,
@@ -275,6 +276,15 @@ impl Engine for VelloCpu {
             cpu: cpu_model(),
             thermal_celsius: thermal_celsius(),
             ..Default::default()
+        }
+    }
+
+    fn memory(&self) -> AdapterMemory {
+        AdapterMemory {
+            engine: Reading::unavailable("Vello CPU does not expose engine memory"),
+            wgpu_allocator: Reading::unavailable("Vello CPU has no wgpu allocator"),
+            skia_budgeted: Reading::unavailable("Vello CPU has no Skia budget"),
+            vk_memory_budget: Reading::unavailable("Vello CPU has no Vulkan device"),
         }
     }
 }

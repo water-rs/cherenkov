@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use cherenkov_oracle::Metrics;
 use serde::Serialize;
 
+use crate::memory::{MemoryReport, MemorySnapshot};
 use crate::{Counters, DeviceInfo, EngineInfo, PassSample, PhaseSample};
 
 /// `render` output: the engine provenance, the correctness metrics against
@@ -29,6 +30,8 @@ pub struct RenderReport {
     pub metrics: Metrics,
     /// What the adapter issued.
     pub counters: Counters,
+    /// Idle, steady-state and peak memory readings for this scene.
+    pub memory: MemoryReport,
     /// Device/thermal metadata at render time.
     pub device: DeviceInfo,
 }
@@ -113,6 +116,8 @@ pub struct UnsupportedReport {
     /// (e.g. `peniko::Extend` has no `None` variant). `null` when the
     /// limitation is adapter coverage rather than a named upstream API.
     pub missing_api: Option<&'static str>,
+    /// Engine and process memory before any scene was prepared.
+    pub memory_idle: MemorySnapshot,
 }
 
 /// Frame pacing of a `measure` run at a fixed rate (`--rate`).
@@ -226,6 +231,8 @@ pub struct MeasureReport {
     pub conditions: Conditions,
     /// What the adapter issued per frame.
     pub counters: Counters,
+    /// Idle, steady-state and peak memory readings for this scene.
+    pub memory: MemoryReport,
     /// Device/thermal metadata at measure time.
     pub device: DeviceInfo,
 }

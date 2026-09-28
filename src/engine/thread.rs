@@ -132,6 +132,7 @@ fn commit<B: Backend>(
             }
             Op::Layer(LayerOp::Content(layer, content)) => {
                 state.tree.apply(LayerOp::Content(layer, None));
+                state.tree.note_content(layer, content.as_ref());
                 renderer.set_content(surface, layer, content);
                 state.changed = true;
             }

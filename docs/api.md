@@ -109,7 +109,9 @@ pub trait Renderer: 'static {
                          pub scroll_offset: Vec2, pub clip: Option<ShapeData>, pub blend: BlendMode,
                          pub filter: Option<FilterId>, pub backdrop: Option<BackdropId>, pub children: Vec<LayerId>, /* tracks: private */ }
   impl LayerNode { /// `transform * translate(-scroll_offset)`: the space of the content and children.
-                   pub fn content_transform(&self) -> Affine; }
+                   pub fn content_transform(&self) -> Affine;
+                   /// Whether child layers or content groups blend onto this layer.
+                   pub fn blends_within(&self) -> bool; }
   ```
 
   The clip applies in the layer's own space (`transform`); content and children are drawn in `content_transform()`, so scrolling moves them inside the clip and never re-records anything. `changed` is true when a property op, a content op or an animation step touched the surface since the last render; the backend renders exactly those surfaces.
@@ -366,7 +368,7 @@ DynColor::from_css(parsed)                         // colour space known only at
 - **Typed colour spaces.** `Color<CS>` converts to the working space (linear Display P3) through a matrix that is constant-folded when monomorphised. HDR is extended values above 1.0, relative to SDR white.
 - **The display supplies headroom.** Effects may read it. Output tone-maps to the display's headroom.
 - **Blending space** is linear by default. Groups can opt into sRGB-encoded blending for web compatibility.
-- **Group isolation.** A group is composited through its own offscreen when it blends, has opacity below one, carries a filter, or contains a blended descendant group; every other group composes in place with identical results.
+- **Group and tree-layer isolation.** A group or tree layer composites through its own offscreen when it blends, has opacity below one, carries a filter, or has a blended descendant: a group, or for a layer a child layer or a group in its content. A blending child isolates its own layer in turn, so a layer checks direct children only. The root layer renders into the surface target and needs no offscreen. Every other group or layer composes in place with identical results.
 - **WaterUI unification.** WaterUI's `ResolvedColor` becomes Cherenkov's colour type, with headroom folded into extended values.
 
 ## Text

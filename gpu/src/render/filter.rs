@@ -1,10 +1,11 @@
 //! Engine execution of composed filtrate filters and custom effects.
 
-use std::collections::HashMap;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+
+use std::collections::{HashMap, HashSet};
 
 use cherenkov::RenderError;
 use filtrate::{
@@ -44,7 +45,90 @@ impl<F: filtrate_core::Filter + cherenkov::RenderTransfer> Source for FromFilter
     }
 }
 
+/// A filter chain registered for a backdrop group capture.
+pub struct FromBackdropChain<K, F>(pub F, pub std::marker::PhantomData<fn() -> K>);
+
+impl<K, F> Source for FromBackdropChain<K, F>
+where
+    K: filtrate_core::kind::Kind,
+    F: cherenkov::BackdropChain<K> + cherenkov::RenderTransfer,
+{
+    fn build(self: Box<Self>) -> Box<dyn Runnable> {
+        Box::new(BackdropRunnable::<K, F>(
+            filtrate::Executor::new(self.0),
+            std::marker::PhantomData,
+        ))
+    }
+}
+
+/// An `Executor` over a backdrop chain, reporting its footprint bound.
+struct BackdropRunnable<K, F: filtrate_core::Filter>(
+    filtrate::Executor<F>,
+    std::marker::PhantomData<fn() -> K>,
+);
+
+impl<K, F> Runnable for BackdropRunnable<K, F>
+where
+    K: filtrate_core::kind::Kind,
+    F: cherenkov::BackdropChain<K> + cherenkov::RenderTransfer,
+{
+    #[cfg(not(target_arch = "wasm32"))]
+    fn setup(&mut self, ctx: &EffectContext<'_>) -> Result<(), filtrate::EffectSetupError> {
+        Runnable::setup(&mut self.0, ctx)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn setup<'a>(
+        &'a mut self,
+        ctx: &'a EffectContext<'a>,
+    ) -> core::pin::Pin<
+        Box<dyn core::future::Future<Output = Result<(), filtrate::EffectSetupError>> + 'a>,
+    > {
+        Runnable::setup(&mut self.0, ctx)
+    }
+
+    fn encode(
+        &mut self,
+        input: &EffectInput<'_>,
+        output: &EffectOutput<'_>,
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> Result<bool, filtrate::EffectRenderError> {
+        Runnable::encode(&mut self.0, input, output, encoder)
+    }
+
+    fn set_redraw(&mut self, callback: filtrate::EffectRedrawCallback) {
+        Runnable::set_redraw(&mut self.0, callback);
+    }
+
+    fn footprint_bound(&mut self) -> Option<filtrate_core::Footprint> {
+        Some(<F as cherenkov::BackdropChain<K>>::footprint_bound(
+            &self.0.param_bounds(),
+        ))
+    }
+}
+
+/// A registered filter's identity: a layer filter or a backdrop group's
+/// capture chain on a surface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FilterKey {
+    /// A layer's filter (`FilterId`'s raw value).
+    Layer(u64),
+    /// A backdrop group's capture chain.
+    Backdrop {
+        /// The surface's raw id.
+        surface: u64,
+        /// The group's raw id.
+        group: u64,
+    },
+}
+
 pub trait Runnable {
+    /// The filter's spatial footprint bound; `None` for effects without
+    /// one (a colour filter contributes no reach either way).
+    fn footprint_bound(&mut self) -> Option<filtrate_core::Footprint> {
+        None
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     fn setup(&mut self, ctx: &EffectContext<'_>) -> Result<(), filtrate::EffectSetupError>;
     #[cfg(target_arch = "wasm32")]
@@ -107,7 +191,7 @@ struct Entry {
 impl Entry {
     fn check_setup(
         &mut self,
-        id: u64,
+        id: FilterKey,
         context: &EffectContext<'_>,
         format: wgpu::TextureFormat,
     ) -> Result<(), RenderError> {
@@ -131,12 +215,12 @@ impl Entry {
         setup
             .as_ref()
             .copied()
-            .map_err(|error| RenderError::Render(format!("filter {id} setup: {error}")))
+            .map_err(|error| RenderError::Render(format!("filter {id:?} setup: {error}")))
     }
 }
 
 pub struct Registry {
-    entries: HashMap<u64, Entry>,
+    entries: HashMap<FilterKey, Entry>,
     host: Option<crate::interop::RedrawCallback>,
 }
 
@@ -148,7 +232,7 @@ impl Registry {
         }
     }
 
-    pub fn add(&mut self, id: u64, source: Box<dyn Source>) {
+    pub fn add(&mut self, id: FilterKey, source: Box<dyn Source>) {
         let mut effect = source.build();
         let dirty = Arc::new(AtomicBool::new(false));
         let active = Arc::new(AtomicBool::new(false));
@@ -179,19 +263,19 @@ impl Registry {
         );
     }
 
-    pub fn remove(&mut self, id: u64) {
+    pub fn remove(&mut self, id: FilterKey) {
         if let Some(entry) = self.entries.remove(&id) {
             entry.active.store(false, Ordering::Release);
         }
     }
 
-    pub fn set_active(&self, uses: &std::collections::HashSet<u64>) {
+    pub fn set_active(&self, uses: &HashSet<FilterKey>) {
         for (id, entry) in &self.entries {
             entry.active.store(uses.contains(id), Ordering::Release);
         }
     }
 
-    pub fn wants_redraw(&self, id: u64) -> bool {
+    pub fn wants_redraw(&self, id: FilterKey) -> bool {
         self.entries
             .get(&id)
             .is_some_and(|entry| entry.again || entry.dirty.load(Ordering::Acquire))
@@ -214,9 +298,17 @@ impl Registry {
             .sum()
     }
 
+    /// The registered filter's footprint bound; `None` when `key` is not
+    /// registered (an error for callers).
+    pub fn footprint_bound(&mut self, key: FilterKey) -> Option<filtrate_core::Footprint> {
+        self.entries
+            .get_mut(&key)
+            .and_then(|entry| entry.effect.footprint_bound())
+    }
+
     pub(super) fn apply(
         &mut self,
-        id: u64,
+        id: FilterKey,
         context: &EffectContext<'_>,
         scratch: &super::ScratchTarget,
         size: (u32, u32),
@@ -227,7 +319,7 @@ impl Registry {
         let entry = self
             .entries
             .get_mut(&id)
-            .ok_or_else(|| RenderError::Render(format!("unregistered filter {id}")))?;
+            .ok_or_else(|| RenderError::Render(format!("unregistered filter {id:?}")))?;
         let repeated = entry.sequence == Some(timing.sequence());
         let timing = if repeated {
             EffectFrameTiming::new(
@@ -311,7 +403,7 @@ impl Registry {
         entry.again |= entry
             .effect
             .encode(&input, &output, encoder)
-            .map_err(|error| RenderError::Render(format!("filter {id}: {error}")))?;
+            .map_err(|error| RenderError::Render(format!("filter {id:?}: {error}")))?;
         encoder.copy_texture_to_texture(
             output_texture.as_image_copy(),
             scratch.texture.as_image_copy(),
@@ -333,13 +425,13 @@ impl Drop for Registry {
 impl Registry {
     pub(super) async fn prepare(
         &mut self,
-        id: u64,
+        id: FilterKey,
         context: &EffectContext<'_>,
     ) -> Result<(), RenderError> {
         let entry = self
             .entries
             .get_mut(&id)
-            .ok_or_else(|| RenderError::Render(format!("unregistered filter {id}")))?;
+            .ok_or_else(|| RenderError::Render(format!("unregistered filter {id:?}")))?;
         if entry.setup.is_none() {
             entry.dirty.swap(false, Ordering::AcqRel);
             entry.setup_pending_frame = true;
@@ -357,6 +449,6 @@ impl Registry {
             .expect("setup completed")
             .as_ref()
             .copied()
-            .map_err(|error| RenderError::Render(format!("filter {id} setup: {error}")))
+            .map_err(|error| RenderError::Render(format!("filter {id:?} setup: {error}")))
     }
 }

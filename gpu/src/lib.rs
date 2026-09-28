@@ -304,3 +304,37 @@ impl cherenkov::Effects for Gpu {
         r.add_filter(id, effect.0);
     }
 }
+impl cherenkov::Backdrop for Gpu {
+    fn add_backdrop_group(
+        r: &mut Self::Renderer,
+        surface: cherenkov::SurfaceId,
+        id: cherenkov::BackdropId,
+    ) {
+        r.add_backdrop_group(surface, id, None);
+    }
+    fn add_filtered_backdrop_group<K, F>(
+        r: &mut Self::Renderer,
+        surface: cherenkov::SurfaceId,
+        id: cherenkov::BackdropId,
+        filter: F,
+    ) where
+        K: filtrate_core::kind::Kind,
+        F: cherenkov::BackdropChain<K> + cherenkov::RenderTransfer,
+    {
+        r.add_backdrop_group(
+            surface,
+            id,
+            Some(Box::new(render::filter::FromBackdropChain::<K, F>(
+                filter,
+                std::marker::PhantomData,
+            ))),
+        );
+    }
+    fn remove_backdrop_group(
+        r: &mut Self::Renderer,
+        surface: cherenkov::SurfaceId,
+        id: cherenkov::BackdropId,
+    ) {
+        r.remove_backdrop_group(surface, id);
+    }
+}

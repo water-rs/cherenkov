@@ -17,7 +17,8 @@ use cherenkov::{
     OffscreenFormat, RenderError, ResourceError, Rgba8, Surface, Transaction,
 };
 use cherenkov_gpu::interop::{
-    OutputAlpha, OutputColor, Presenter, SharedDevice, TextureOutput, TextureTarget, wgpu,
+    OutputAlpha, OutputColor, Presenter, SharedDevice, TextureOutput, TextureTarget,
+    shader_delivery, wgpu,
 };
 use cherenkov_gpu::{Gpu, GpuConfig, ScratchFormat};
 use cherenkov_oracle::color::to_working;
@@ -1379,9 +1380,14 @@ impl Engine for Cherenkov {
         // The engine already runs on the bench-owned SharedDevice (#101), so
         // the presented destination can be read back on the same device and
         // queue.
+        let delivery = shader_delivery(
+            self.shared_device.adapter.get_info().backend,
+            &self.shared_device.device,
+        )
+        .map_err(|e| BenchError::Engine(e.to_string()))?;
         self.present = Some(Box::new(Present {
             kind,
-            presenter: Presenter::new(&self.shared_device.device),
+            presenter: Presenter::new(&self.shared_device.device, delivery),
             source: None,
             destination: None,
         }));

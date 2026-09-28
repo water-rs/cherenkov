@@ -38,6 +38,7 @@ pub mod present;
 pub mod render;
 pub mod resources;
 pub mod shadow;
+pub mod tone;
 
 pub use image::{F32Image, Image};
 pub use metrics::Metrics;

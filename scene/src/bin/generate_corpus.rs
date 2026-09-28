@@ -2628,7 +2628,7 @@ fn run() -> Result<(), SceneError> {
                     solid(srgba(0.0, 0.0, 0.0, 0.25)),
                 );
                 let bar_paint = solid(srgb(0.2, 0.5, 0.9));
-                for i in 0u8..24 {
+                for i in 0u16..24 {
                     let x = 56.0 + f64::from(i) * 39.0;
                     let h = 40.0 + f64::from((i * 37) % 200);
                     l.fill(

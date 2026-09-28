@@ -11,6 +11,22 @@
 
 use cherenkov::BlendMode;
 
+/// Operators where a transparent source changes the destination
+/// (`Clear`, `Src`, `SrcIn`, `SrcOut`, `DestIn`, `DestAtop`). Their
+/// composite is bounded by the effective clip instead of the tight
+/// content bounds.
+pub const fn is_destructive(mode: BlendMode) -> bool {
+    matches!(
+        mode,
+        BlendMode::Clear
+            | BlendMode::Src
+            | BlendMode::SrcIn
+            | BlendMode::SrcOut
+            | BlendMode::DestIn
+            | BlendMode::DestAtop
+    )
+}
+
 fn lum(c: [f32; 3]) -> f32 {
     0.11f32.mul_add(c[2], 0.59f32.mul_add(c[1], 0.3 * c[0]))
 }

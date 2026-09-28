@@ -194,7 +194,10 @@ fn hardware_and_shader_srgb_store_the_same_premultiplied_bytes()
             timeout: Some(std::time::Duration::from_secs(30)),
         })?;
         receive.recv()??;
-        let bytes = buffer.slice(..).get_mapped_range();
+        let bytes = buffer
+            .slice(..)
+            .get_mapped_range()
+            .expect("buffer range is mapped and not overlapping");
         for (a, b) in bytes[..4].iter().zip(&bytes[256..260]) {
             assert!(
                 a.abs_diff(*b) <= 1,

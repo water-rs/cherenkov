@@ -195,6 +195,7 @@ fn create_device(
                         PowerPreference::High => wgpu::PowerPreference::HighPerformance,
                     },
                     force_fallback_adapter: false,
+                    apply_limit_buckets: false,
                     compatible_surface: None,
                 })
                 .await
@@ -995,7 +996,7 @@ impl VelloRenderer {
                 .create_view(&wgpu::TextureViewDescriptor::default());
             blitter.copy(&self.device, &mut encoder, surf.target.view(), &frame_view);
             self.queue.submit([encoder.finish()]);
-            frame.present();
+            self.queue.present(frame);
         }
         Ok(())
     }
@@ -1048,7 +1049,9 @@ impl VelloRenderer {
         let slice = self.query_staging.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
         self.wait()?;
-        let data = slice.get_mapped_range();
+        let data = slice
+            .get_mapped_range()
+            .expect("buffer range is mapped and not overlapping");
         let ticks: &[u64] = bytemuck::cast_slice(&data);
         #[expect(
             clippy::cast_precision_loss,
@@ -1498,7 +1501,9 @@ impl Renderer for VelloRenderer {
         self.device
             .poll(wgpu::PollType::wait_indefinitely())
             .map_err(|e| RenderError::Readback(format!("poll: {e}")))?;
-        let data = slice.get_mapped_range();
+        let data = slice
+            .get_mapped_range()
+            .expect("buffer range is mapped and not overlapping");
         let mut pixels = Vec::with_capacity((w * h) as usize);
         for row in 0..h {
             let start = (row * bytes_per_row) as usize;
@@ -1563,7 +1568,9 @@ impl Renderer for VelloRenderer {
         self.device
             .poll(wgpu::PollType::wait_indefinitely())
             .map_err(|e| RenderError::Readback(format!("poll: {e}")))?;
-        let data = slice.get_mapped_range();
+        let data = slice
+            .get_mapped_range()
+            .expect("buffer range is mapped and not overlapping");
         let mut pixels = Vec::with_capacity((w * h) as usize);
         for row in 0..h {
             let start = (row * bytes_per_row) as usize;

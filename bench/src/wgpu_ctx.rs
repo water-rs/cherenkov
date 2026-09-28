@@ -281,7 +281,9 @@ pub fn readback(gpu: &Gpu, target: &Target) -> Result<F32Image, BenchError> {
     tracing::trace!(?submission, "readback submitted");
     let slice = buf.slice(..);
     map_read(gpu, slice, submission, "the pixel readback")?;
-    let data = slice.get_mapped_range();
+    let data = slice
+        .get_mapped_range()
+        .expect("buffer range is mapped and not overlapping");
     let mut rgba8 = Vec::with_capacity((target.width * target.height * 4) as usize);
     for row in 0..target.height {
         let start = (row * bytes_per_row) as usize;
@@ -454,7 +456,9 @@ pub fn resolve_timestamps(gpu: &Gpu) -> Result<Option<f64>, BenchError> {
     tracing::trace!(?submission, "timestamps resolved");
     let slice = staging.slice(..);
     map_read(gpu, slice, submission, "the timestamp readback")?;
-    let data = slice.get_mapped_range();
+    let data = slice
+        .get_mapped_range()
+        .expect("buffer range is mapped and not overlapping");
     let ticks: &[u64] = bytemuck::cast_slice(&data);
     let seconds = if ticks.len() >= 2 && ticks[1] > ticks[0] {
         Some(f64::from(gpu.queue.get_timestamp_period()) * (ticks[1] - ticks[0]) as f64 * 1e-9)

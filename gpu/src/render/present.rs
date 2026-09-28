@@ -61,6 +61,7 @@ impl WindowSurface {
                 .expect("a configurable surface reports at least one alpha mode")
         };
         let config = wgpu::SurfaceConfiguration {
+            color_space: wgpu::SurfaceColorSpace::Auto,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
             width: size.0.max(1),
@@ -225,7 +226,7 @@ impl Presenter {
                 headroom,
             },
         );
-        frame.present();
+        queue.present(frame);
         Ok(true)
     }
 

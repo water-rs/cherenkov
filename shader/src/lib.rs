@@ -115,6 +115,6 @@ pub use chain::{
 };
 pub use emit::{msl, spirv, validate, wgsl};
 pub use errors::{ComposeError, EmitError, SnippetError};
-/// The naga version modules are built with; the same one wgpu 29 links.
+/// The naga version modules are built with; the same one wgpu 30 links.
 pub use naga;
 pub use parse::{LibrarySource, SampleCount, Snippet, SnippetSource, Variant};

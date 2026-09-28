@@ -11,7 +11,7 @@ publish = false
 filtrate = { path = "../filtrate" }
 filtrate-core = { path = "../filtrate/core" }
 cherenkov = { path = ".." }
-wgpu = "29"
+wgpu = "30.0.1"
 pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
 kurbo = "0.13"
@@ -31,12 +31,12 @@ wasm-bindgen-test = "0.3"
 
 [build-dependencies]
 # The WGSL engine shaders are compiled once at build time (issue #57), at
-# the naga version wgpu 29 links.
-naga = { version = "29", features = ["wgsl-in", "spv-out", "msl-out"] }
+# the naga version wgpu 30 links.
+naga = { version = "30.0.1", features = ["wgsl-in", "spv-out", "msl-out"] }
 
 [dev-dependencies]
 cherenkov-oracle = { path = "../oracle" }
-naga = { version = "29", features = ["wgsl-in", "spv-out", "msl-out", "hlsl-out"] }
+naga = { version = "30.0.1", features = ["wgsl-in", "spv-out", "msl-out", "hlsl-out"] }
 
 cherenkov = { path = "..", features = ["testing"] }
 nami = { version = "0.11.1", default-features = false, features = ["std", "kurbo"] }

@@ -14,7 +14,7 @@ fn engine() -> Option<Engine<Gpu>> {
 }
 
 /// Supersampled area of `f(x, y) <= 0` over the unit pixel at (x, y).
-fn supersample(x: u32, y: u32, f: impl Fn(f64, f64) -> f64) -> f64 {
+fn supersample(x: u32, y: u32, f: &dyn Fn(f64, f64) -> f64) -> f64 {
     const N: u32 = 64;
     let mut inside = 0usize;
     for sy in 0..N {
@@ -65,7 +65,7 @@ fn oblique_rim_pixels_get_their_exact_area() -> Result<(), Box<dyn std::error::E
             if x >= 4 && (4..=8).contains(&y) {
                 continue;
             }
-            let exact = supersample(x, y, |px, py| (px - 16.0).hypot(py - 16.0) - 14.0);
+            let exact = supersample(x, y, &|px, py| (px - 16.0).hypot(py - 16.0) - 14.0);
             max_err = max_err.max((alpha(x, y) - exact).abs());
         }
     }
@@ -95,7 +95,7 @@ fn oblique_rim_pixels_get_their_exact_area() -> Result<(), Box<dyn std::error::E
             if !(1.0..=5.0).contains(&r) {
                 continue;
             }
-            let exact = supersample(x, y, |px, py| (px - 8.5).hypot(py - 8.5) - 3.0);
+            let exact = supersample(x, y, &|px, py| (px - 8.5).hypot(py - 8.5) - 3.0);
             max_err = max_err.max((alpha(x, y) - exact).abs());
         }
     }
@@ -127,5 +127,102 @@ fn axis_aligned_edges_keep_the_ramp() -> Result<(), Box<dyn std::error::Error>> 
         "interior: {}",
         alpha(16, 5)
     );
+    Ok(())
+}
+
+/// Elliptical and Lamé corner rims get their exact pixel area now that
+/// their distance is second-order (`lame_corner`), the same class of
+/// accuracy the circular arcs reached with the κw³/24 term.
+#[test]
+fn elliptical_and_lame_rims_get_their_exact_area() -> Result<(), Box<dyn std::error::Error>> {
+    use cherenkov::{ContinuousRect, kurbo::Ellipse};
+    // (shape name, draw fn, inside indicator).
+    type Case = (
+        &'static str,
+        fn(&mut cherenkov::Recorder),
+        Box<dyn Fn(f64, f64) -> f64>,
+    );
+    fn draw_ellipse(c: &mut cherenkov::Recorder) {
+        c.fill(
+            Ellipse::new((16.0, 16.0), (14.0, 6.0), 0.0),
+            WorkingColor::WHITE,
+        );
+    }
+    fn inside_ellipse(px: f64, py: f64) -> f64 {
+        let ux = (px - 16.0) / 14.0;
+        let uy = (py - 16.0) / 6.0;
+        ux.mul_add(ux, uy * uy) - 1.0
+    }
+    fn inside_continuous(n: i32) -> impl Fn(f64, f64) -> f64 {
+        move |px, py| {
+            let qx = (px - 16.0).abs() - 2.0;
+            let qy = (py - 16.0).abs() - 2.0;
+            if qx <= 0.0 || qy <= 0.0 {
+                (px - 16.0).abs().max((py - 16.0).abs()) - 14.0
+            } else {
+                (qx / 12.0).powi(n) + (qy / 12.0).powi(n) - 1.0
+            }
+        }
+    }
+    fn draw_lame(c: &mut cherenkov::Recorder, smoothing: f64) {
+        c.fill(
+            ContinuousRect::new(Rect::new(2.0, 2.0, 30.0, 30.0), 12.0).with_smoothing(smoothing),
+            WorkingColor::WHITE,
+        );
+    }
+    let cases: Vec<Case> = vec![
+        ("ellipse 14x6", draw_ellipse, Box::new(inside_ellipse)),
+        (
+            "continuous n=3 r=12",
+            |c| draw_lame(c, 0.5),
+            Box::new(inside_continuous(3)),
+        ),
+        (
+            "continuous n=4 r=12",
+            |c| draw_lame(c, 1.0),
+            Box::new(inside_continuous(4)),
+        ),
+    ];
+    let Some(engine) = engine() else {
+        return Ok(());
+    };
+    for (name, draw, inside) in cases {
+        let surface = engine.surface(Offscreen::new((32, 32), OffscreenFormat::LinearF16))?;
+        surface.update(|tx| {
+            tx[surface.root()].content(surface.record(|c| {
+                draw(c);
+            }));
+        });
+        engine.render(cherenkov::FrameTime::now())?;
+        let pixels = surface.readback()?.pixels;
+        let alpha = |x: u32, y: u32| f64::from(pixels[(y * 32 + x) as usize][3]);
+        let mut max_err = 0.0_f64;
+        let mut worst = (0u32, 0u32);
+        for y in 0..32u32 {
+            for x in 0..32u32 {
+                // Rim band around the corner arcs: a ring in max-norm
+                // coordinates that catches every partially-covered pixel.
+                let dx = (f64::from(x) + 0.5 - 16.0).abs();
+                let dy = (f64::from(y) + 0.5 - 16.0).abs();
+                if !(dx.max(dy) >= 5.0 && dx.max(dy) <= 15.5) {
+                    continue;
+                }
+                let exact = supersample(x, y, inside.as_ref());
+                if (exact - 0.5).abs() > 0.499 {
+                    continue; // fully in/out: skip saturated pixels
+                }
+                let err = (alpha(x, y) - exact).abs();
+                if err > max_err {
+                    max_err = err;
+                    worst = (x, y);
+                }
+            }
+        }
+        eprintln!("max_err {name}: {max_err} at {worst:?}");
+        assert!(
+            max_err < 0.004,
+            "{name}: max |Δalpha| {max_err} at {worst:?}"
+        );
+    }
     Ok(())
 }

@@ -184,8 +184,15 @@ struct Entry {
     setup: Option<Result<(), String>>,
     #[cfg(target_arch = "wasm32")]
     setup_pending_frame: bool,
-    input: Option<(wgpu::Texture, wgpu::TextureView)>,
-    output: Option<(wgpu::Texture, wgpu::TextureView)>,
+    /// Input/output targets per size, capped; a frame can apply one filter
+    /// to several region sizes (#117 sparse backdrop captures).
+    io: Vec<((u32, u32), FilterTargets)>,
+}
+
+/// The input and output targets of one size.
+struct FilterTargets {
+    input: (wgpu::Texture, wgpu::TextureView),
+    output: (wgpu::Texture, wgpu::TextureView),
 }
 
 impl Entry {
@@ -223,6 +230,73 @@ impl Entry {
             .as_ref()
             .copied()
             .map_err(|error| RenderError::Render(format!("filter {id:?} setup: {error}")))
+    }
+
+    /// The index of `size`'s input/output targets, allocating on first use.
+    fn targets_index(
+        &mut self,
+        device: &wgpu::Device,
+        size: (u32, u32),
+        format: wgpu::TextureFormat,
+    ) -> usize {
+        self.io
+            .iter()
+            .position(|(io_size, _)| *io_size == size)
+            .unwrap_or_else(|| {
+                const MAX_FILTER_TARGET_SIZES: usize = 4;
+                if self.io.len() == MAX_FILTER_TARGET_SIZES {
+                    let evicted = self.io.remove(0).1;
+                    for (label, (texture, _)) in [
+                        ("filter input", evicted.input),
+                        ("filter output", evicted.output),
+                    ] {
+                        crate::diag::retire(
+                            device,
+                            crate::diag::RetireArgs {
+                                label,
+                                class: crate::diag::Class::Target,
+                                bytes: u64::from(texture.width())
+                                    * u64::from(texture.height())
+                                    * super::texel_bytes(texture.format()),
+                                used_in_latest_submit: true,
+                                reason: "filter size eviction",
+                            },
+                        );
+                    }
+                }
+                self.io.push((
+                    size,
+                    FilterTargets {
+                        input: super::create_target(
+                            device,
+                            "filter input",
+                            size,
+                            super::TARGET_USAGES,
+                            format,
+                        ),
+                        output: super::create_target(
+                            device,
+                            "filter output",
+                            size,
+                            super::TARGET_USAGES,
+                            format,
+                        ),
+                    },
+                ));
+                let created = u64::from(size.0) * u64::from(size.1) * super::texel_bytes(format);
+                for label in ["filter input", "filter output"] {
+                    crate::diag::grow(
+                        device,
+                        label,
+                        crate::diag::Class::Target,
+                        0,
+                        created,
+                        0,
+                        true,
+                    );
+                }
+                self.io.len() - 1
+            })
     }
 }
 
@@ -264,8 +338,7 @@ impl Registry {
                 setup: None,
                 #[cfg(target_arch = "wasm32")]
                 setup_pending_frame: false,
-                input: None,
-                output: None,
+                io: Vec::new(),
             },
         );
     }
@@ -277,10 +350,11 @@ impl Registry {
             return 0;
         };
         entry.active.store(false, Ordering::Release);
-        [entry.input, entry.output]
-            .into_iter()
-            .flatten()
-            .map(|(texture, _)| {
+        entry
+            .io
+            .iter()
+            .flat_map(|(_, targets)| [&targets.input.0, &targets.output.0])
+            .map(|texture| {
                 u64::from(texture.width())
                     * u64::from(texture.height())
                     * super::texel_bytes(texture.format())
@@ -306,8 +380,8 @@ impl Registry {
     pub(super) fn trim(&mut self) -> u64 {
         let mut bytes = 0;
         for entry in self.entries.values_mut() {
-            for slot in [&mut entry.input, &mut entry.output] {
-                if let Some((texture, _)) = slot.take() {
+            for (_, targets) in std::mem::take(&mut entry.io) {
+                for texture in [targets.input.0, targets.output.0] {
                     bytes += u64::from(texture.width())
                         * u64::from(texture.height())
                         * super::texel_bytes(texture.format());
@@ -320,9 +394,9 @@ impl Registry {
     pub fn gpu_bytes(&self) -> u64 {
         self.entries
             .values()
-            .flat_map(|entry| [entry.input.as_ref(), entry.output.as_ref()])
-            .flatten()
-            .map(|(texture, _)| {
+            .flat_map(|entry| entry.io.iter())
+            .flat_map(|(_, targets)| [&targets.input.0, &targets.output.0])
+            .map(|texture| {
                 u64::from(texture.width())
                     * u64::from(texture.height())
                     * if texture.format() == wgpu::TextureFormat::Rgba16Float {
@@ -342,10 +416,6 @@ impl Registry {
             .and_then(|entry| entry.effect.footprint_bound())
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one entry's wait, capacity check, target allocation and dispatch in sequence"
-    )]
     pub(super) fn apply(
         &mut self,
         id: FilterKey,
@@ -388,54 +458,10 @@ impl Registry {
         }
         let format = scratch.texture.format();
         entry.check_setup(id, context, format)?;
-        // `EffectInput::{width,height}` names the input texture's exact
-        // size, so unlike scratch a filter target resizes with its frame
-        // region — `trim` releases them outside the hot path (#169 A4).
-        if entry
-            .input
-            .as_ref()
-            .is_none_or(|(texture, _)| (texture.width(), texture.height()) != size)
-        {
-            let old = entry.input.as_ref().map_or(0, |(texture, _)| {
-                u64::from(texture.width())
-                    * u64::from(texture.height())
-                    * super::texel_bytes(texture.format())
-            });
-            entry.input = Some(super::create_target(
-                device,
-                "filter input",
-                size,
-                super::TARGET_USAGES,
-                format,
-            ));
-            entry.output = Some(super::create_target(
-                device,
-                "filter output",
-                size,
-                super::TARGET_USAGES,
-                format,
-            ));
-            crate::diag::grow(
-                device,
-                "filter input",
-                crate::diag::Class::Target,
-                old,
-                u64::from(size.0) * u64::from(size.1) * super::texel_bytes(format),
-                0,
-                true,
-            );
-            crate::diag::grow(
-                device,
-                "filter output",
-                crate::diag::Class::Target,
-                old,
-                u64::from(size.0) * u64::from(size.1) * super::texel_bytes(format),
-                0,
-                true,
-            );
-        }
-        let (input_texture, input_view) = entry.input.as_ref().expect("input allocated");
-        let (output_texture, output_view) = entry.output.as_ref().expect("output allocated");
+        let targets_index = entry.targets_index(device, size, format);
+        let targets = &entry.io[targets_index].1;
+        let (input_texture, input_view) = &targets.input;
+        let (output_texture, output_view) = &targets.output;
         let extent = wgpu::Extent3d {
             width: size.0,
             height: size.1,

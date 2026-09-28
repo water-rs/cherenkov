@@ -948,13 +948,10 @@ impl<B: Backdrop> Surface<B> {
     /// Allocates a group id and queues its registration with `op`.
     fn new_backdrop_group(
         &self,
-        op: impl FnOnce(&mut B::Renderer, SurfaceId, BackdropId) + Send + 'static,
+        op: impl FnOnce(&mut B::Renderer, SurfaceId, BackdropId) + crate::RenderTransfer + 'static,
     ) -> crate::BackdropGroup {
         let id = BackdropId::new(self.shared.borrow().next_backdrop.get());
-        self.shared
-            .borrow_mut()
-            .next_backdrop
-            .set(id.raw() + 1);
+        self.shared.borrow_mut().next_backdrop.set(id.raw() + 1);
         let surface = self.id;
         let _ = self.tx.send(Message::Resource(Box::new(move |r| {
             op(r, surface, id);

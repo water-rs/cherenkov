@@ -309,9 +309,9 @@ mod tests {
 
         blend_image(&image, 1.0, FilterBlend::Luminosity, &mut pixels, 3, 1);
 
-        assert_eq!(pixels[0], [0.0; 4]);
-        assert_eq!(pixels[1][3], 1.0);
-        assert_eq!(pixels[2][3], alpha);
+        assert_eq!(pixels[0].map(f64::to_bits), [0; 4]);
+        assert_eq!(pixels[1][3].to_bits(), 1.0_f64.to_bits());
+        assert_eq!(pixels[2][3].to_bits(), alpha.to_bits());
         for (channel, full) in pixels[1][..3].iter().enumerate() {
             let expected = *full * alpha;
             let tolerance = expected.abs() * 1.0e-12 + 1.0e-20;

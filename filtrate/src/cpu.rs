@@ -359,9 +359,8 @@ fn blend_with_image(
             let colour = [base[0] / base[3], base[1] / base[3], base[2] / base[3]];
             let blended = blend_color(colour, [top[0], top[1], top[2]], mode);
             for channel in 0..3 {
-                image.pixels[y * width + x][channel] = (colour[channel] * (1.0 - amount)
-                    + blended[channel] * amount)
-                    * base[3];
+                image.pixels[y * width + x][channel] =
+                    (colour[channel] * (1.0 - amount) + blended[channel] * amount) * base[3];
             }
             image.pixels[y * width + x][3] = base[3];
         }
@@ -548,8 +547,8 @@ fn hsl_to_rgb(hsl: [f32; 3]) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::{hsl_to_rgb, rgb_to_hsl};
-    use crate::filters::{BlendMode, BlendWithImage};
     use crate::FilterImage;
+    use crate::filters::{BlendMode, BlendWithImage};
     use filtrate_core::{CpuFilter, CpuImage, Filter, WorkingSpace};
 
     fn apply_blend(mode: BlendMode, pixels: &mut [[f32; 4]]) {
@@ -645,18 +644,18 @@ mod tests {
             ];
             apply_blend(mode, &mut pixels);
 
-            assert_eq!(pixels[0], [0.0; 4], "{mode:?}");
+            assert_eq!(pixels[0].map(f32::to_bits), [0; 4], "{mode:?}");
             for (index, alpha) in [(1, low_alpha), (2, mid_alpha)] {
                 for (channel, full) in pixels[3][..3].iter().enumerate() {
                     let expected = *full * alpha;
-                    let tolerance = expected.abs() * 1.0e-5 + 1.0e-12;
+                    let tolerance = expected.abs().mul_add(1.0e-5, 1.0e-12);
                     assert!(
                         (pixels[index][channel] - expected).abs() <= tolerance,
                         "{mode:?}, alpha {alpha}, channel {channel}: expected {expected}, got {}",
                         pixels[index][channel]
                     );
                 }
-                assert_eq!(pixels[index][3], alpha, "{mode:?}");
+                assert_eq!(pixels[index][3].to_bits(), alpha.to_bits(), "{mode:?}");
             }
 
             if mode == BlendMode::Multiply {

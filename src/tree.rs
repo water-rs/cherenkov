@@ -115,7 +115,7 @@ impl LayerNode {
     /// onto this layer with a non-`Normal` blend. Such a layer isolates like a
     /// group with a blended descendant.
     #[must_use]
-    pub fn blends_within(&self) -> bool {
+    pub const fn blends_within(&self) -> bool {
         self.blending_children > 0 || self.content_blends
     }
 }
@@ -343,14 +343,14 @@ impl SurfaceTree {
                 let parent = node.parent;
                 let was_blending = node.blend != BlendMode::Normal;
                 let is_blending = blend != BlendMode::Normal;
-                if was_blending != is_blending {
-                    if let Some(parent) = parent {
-                        let count = &mut self.node_mut(parent).blending_children;
-                        if is_blending {
-                            *count += 1;
-                        } else {
-                            *count -= 1;
-                        }
+                if was_blending != is_blending
+                    && let Some(parent) = parent
+                {
+                    let count = &mut self.node_mut(parent).blending_children;
+                    if is_blending {
+                        *count += 1;
+                    } else {
+                        *count -= 1;
                     }
                 }
                 self.node_mut(id).blend = blend;

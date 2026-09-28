@@ -99,8 +99,14 @@ fn tree_layer_isolates_blended_child_layer() {
     engine.render(FrameTime::now()).expect("render");
     let pixels = surface.readback().expect("pixels").pixels;
     let pixel = |x: usize, y: usize| pixels[y * 8 + x];
-    assert_eq!(pixel(1, 3), [0.0, 0.0, 1.0, 1.0]);
-    assert_eq!(pixel(3, 3), [1.0, 0.0, 0.0, 1.0]);
+    assert_eq!(
+        pixel(1, 3).map(f32::to_bits),
+        [0.0_f32, 0.0, 1.0, 1.0].map(f32::to_bits)
+    );
+    assert_eq!(
+        pixel(3, 3).map(f32::to_bits),
+        [1.0_f32, 0.0, 0.0, 1.0].map(f32::to_bits)
+    );
 }
 
 #[test]
@@ -126,8 +132,14 @@ fn tree_layer_isolates_blended_content_group() {
     engine.render(FrameTime::now()).expect("render");
     let pixels = surface.readback().expect("pixels").pixels;
     let pixel = |x: usize, y: usize| pixels[y * 8 + x];
-    assert_eq!(pixel(1, 3), [0.0, 0.0, 1.0, 1.0]);
-    assert_eq!(pixel(3, 3), [1.0, 0.0, 0.0, 1.0]);
+    assert_eq!(
+        pixel(1, 3).map(f32::to_bits),
+        [0.0_f32, 0.0, 1.0, 1.0].map(f32::to_bits)
+    );
+    assert_eq!(
+        pixel(3, 3).map(f32::to_bits),
+        [1.0_f32, 0.0, 0.0, 1.0].map(f32::to_bits)
+    );
 }
 
 #[test]
@@ -162,8 +174,14 @@ fn nested_tree_layers_isolate_at_the_blending_parent() {
     engine.render(FrameTime::now()).expect("render");
     let pixels = surface.readback().expect("pixels").pixels;
     let pixel = |x: usize, y: usize| pixels[y * 8 + x];
-    assert_eq!(pixel(1, 3), [0.0, 1.0, 0.0, 1.0]);
-    assert_eq!(pixel(3, 3), [0.0, 0.0, 1.0, 1.0]);
+    assert_eq!(
+        pixel(1, 3).map(f32::to_bits),
+        [0.0_f32, 1.0, 0.0, 1.0].map(f32::to_bits)
+    );
+    assert_eq!(
+        pixel(3, 3).map(f32::to_bits),
+        [0.0_f32, 0.0, 1.0, 1.0].map(f32::to_bits)
+    );
 }
 
 #[test]

@@ -1103,6 +1103,44 @@ fn run() -> Result<(), SceneError> {
         });
     });
 
+    corpus.scene("layer-isolates-blended-child", 64, 96, white, |l| {
+        l.layer(|outer| {
+            outer.fill(
+                Shape::rect(8.0, 8.0, 48.0, 80.0),
+                solid(Color::new(ColorSpace::DisplayP3, [0.0, 0.85, 0.3, 1.0])),
+            );
+            outer.layer(|cutout| {
+                cutout.blend(BlendMode::DestOut);
+                cutout.fill(
+                    Shape::rect(20.0, 30.0, 24.0, 36.0),
+                    solid(srgb(1.0, 1.0, 1.0)),
+                );
+            });
+        });
+    });
+
+    corpus.scene("layer-isolates-nested-blend", 64, 96, white, |l| {
+        l.layer(|outer| {
+            outer.fill(
+                Shape::rect(4.0, 4.0, 56.0, 88.0),
+                solid(Color::new(ColorSpace::LinearSrgb, [2.0, 0.3, 0.1, 1.0])),
+            );
+            outer.layer(|inner| {
+                inner.fill(
+                    Shape::rect(12.0, 20.0, 40.0, 56.0),
+                    solid(srgb(0.12, 0.32, 0.9)),
+                );
+                inner.layer(|cutout| {
+                    cutout.blend(BlendMode::DestOut);
+                    cutout.fill(
+                        Shape::rect(24.0, 36.0, 16.0, 24.0),
+                        solid(srgb(1.0, 1.0, 1.0)),
+                    );
+                });
+            });
+        });
+    });
+
     corpus.scene("group-opacity", 128, 128, white, |l| {
         l.fill(
             Shape::rect(0.0, 0.0, 128.0, 128.0),

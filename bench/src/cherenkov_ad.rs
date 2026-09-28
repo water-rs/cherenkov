@@ -543,15 +543,12 @@ const fn gpu_blend(m: BlendMode) -> cherenkov::BlendMode {
 ///
 /// `shader-paint`, `mesh-gradient`, `filter` and `blend-space` have no
 /// scene feature of their own; they report the nearest declared one
-/// (`Fill`) while the `api` string names the real construct. `blend-mode`
-/// is unreachable — every blend mode is supported.
+/// (`Fill`) while the `api` string names the real construct.
 fn unsupported_feature(u: &str) -> Feature {
     match u {
         "path" | "path-clip-too-large" => Feature::Path,
         "sweep-gradient" => Feature::SweepGradient,
-        "image" => Feature::Image,
         "stroke-dash" => Feature::StrokeDash,
-        "stroke-join" => Feature::Stroke,
         "glyph-stroke" | "color-font" => Feature::Glyphs,
         "glyph-transform" => Feature::GlyphTransform,
         "shadow" => Feature::Shadow,

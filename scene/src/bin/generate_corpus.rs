@@ -593,10 +593,7 @@ fn filter_nested_content(l: &mut LayerBuilder<'_>, colors: &FilterColorSet) {
     for y in [
         15.0, 16.0, 31.0, 32.0, 47.0, 48.0, 127.0, 128.0, 191.0, 192.0,
     ] {
-        l.fill(
-            Shape::rect(26.0, y, 12.0, 1.0),
-            solid(colors.nested_blue),
-        );
+        l.fill(Shape::rect(26.0, y, 12.0, 1.0), solid(colors.nested_blue));
     }
     l.fill(
         Shape::rect(26.0, 122.0, 12.0, 12.0),

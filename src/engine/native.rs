@@ -6,7 +6,7 @@ use super::{Waker, thread};
 use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
 use std::rc::Rc;
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Receiver, SyncSender};
 
 use crate::ShaderId;
 use crate::backend::{Backend, Renderer};
@@ -18,7 +18,7 @@ use crate::error::{EngineError, RenderError, ResourceError, SurfaceError};
 use crate::frame::{FrameStats, FrameTime, FrameTiming, Next};
 use crate::glyph::FontId;
 use crate::image::{Format, ImageData};
-use crate::message::{ChangeSet, FontData, Message, ResOp, SurfaceId};
+use crate::message::{ChangeSet, FontData, MemoryReply, Message, RenderReply, ResOp, SurfaceId};
 use crate::paint::ImageId;
 use crate::resource::{Filter, Font, FontSource, Image, Shader};
 use crate::style::FilterId;
@@ -31,14 +31,22 @@ use crate::surface::{ExternalFrameHandle, GpuContentHandle, Shared, Surface};
 /// `!Send` — everything it hands out (`Surface`, `Layer`, resource
 /// handles) may only live on the UI thread that created the engine.
 ///
+/// The native UI-to-render message queue is bounded to 64 messages. If the
+/// UI thread gets more than 64 messages ahead, it waits for the render thread.
+///
 /// ```compile_fail
 /// fn assert_send<T: Send>() {}
 /// assert_send::<cherenkov::Engine<cherenkov::testing::Null>>();
 /// ```
 pub struct Engine<B: Backend> {
-    tx: Sender<Message<B>>,
+    tx: SyncSender<Message<B>>,
     info: B::Info,
     stats: RefCell<FrameStats>,
+    render_reply: RefCell<Option<SyncSender<RenderReply<B>>>>,
+    render_reply_rx: Receiver<RenderReply<B>>,
+    memory_reply: RefCell<Option<SyncSender<MemoryReply>>>,
+    memory_reply_rx: Receiver<MemoryReply>,
+    commits: RefCell<Vec<(SurfaceId, ChangeSet<B>)>>,
     /// The live surfaces' shared queues, drained into one `Render` message
     /// per frame.
     surfaces: RefCell<Vec<std::rc::Weak<RefCell<Shared<B>>>>>,
@@ -69,8 +77,10 @@ impl<B: Backend> Engine<B> {
     /// [`EngineError`] when the backend fails to initialize or the render
     /// thread cannot start.
     pub fn new(config: B::Config) -> Result<Self, EngineError> {
-        let (tx, rx) = std::sync::mpsc::channel::<Message<B>>();
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Message<B>>(64);
         let (init_tx, init_rx) = std::sync::mpsc::channel();
+        let (render_reply, render_reply_rx) = std::sync::mpsc::sync_channel(1);
+        let (memory_reply, memory_reply_rx) = std::sync::mpsc::sync_channel(1);
         let render_thread = std::thread::Builder::new()
             .name("cherenkov-render".into())
             .spawn(move || thread::run::<B>(config, &rx, &init_tx))
@@ -83,6 +93,11 @@ impl<B: Backend> Engine<B> {
             tx,
             info,
             stats: RefCell::new(FrameStats::default()),
+            render_reply: RefCell::new(Some(render_reply)),
+            render_reply_rx,
+            memory_reply: RefCell::new(Some(memory_reply)),
+            memory_reply_rx,
+            commits: RefCell::new(Vec::new()),
             surfaces: RefCell::new(Vec::new()),
             next_surface: Cell::new(0),
             next_font: Cell::new(1),
@@ -131,16 +146,24 @@ impl<B: Backend> Engine<B> {
 
     /// The engine's current memory usage.
     ///
-    /// # Panics
-    /// Panics if the reply channel drops without answering, which cannot
-    /// happen while the render thread is alive.
     #[must_use]
     pub fn memory(&self) -> MemoryUsage {
-        let (reply, rx) = std::sync::mpsc::channel();
-        if self.tx.send(Message::Memory { reply }).is_err() {
+        let Some(reply_sender) = self.memory_reply.borrow_mut().take() else {
+            return MemoryUsage::default();
+        };
+        if let Err(error) = self.tx.send(Message::Memory {
+            reply: reply_sender,
+        }) {
+            if let Message::Memory { reply } = error.0 {
+                *self.memory_reply.borrow_mut() = Some(reply);
+            }
             return MemoryUsage::default();
         }
-        rx.recv().unwrap_or_default()
+        let Ok(reply) = self.memory_reply_rx.recv() else {
+            return MemoryUsage::default();
+        };
+        *self.memory_reply.borrow_mut() = Some(reply.sender);
+        reply.usage
     }
 
     /// Reports system memory pressure. `Critical` drops every cache.
@@ -259,7 +282,11 @@ impl<B: Backend> Engine<B> {
     /// [`RenderError`] fails this call; a surface that failed to render is
     /// left in its previous state.
     pub fn render(&self, time: FrameTime) -> Result<Next, RenderError> {
-        let mut commits: Vec<(SurfaceId, ChangeSet<B>)> = Vec::new();
+        let Some(reply_sender) = self.render_reply.borrow_mut().take() else {
+            return Err(RenderError::Thread);
+        };
+        let mut commits = std::mem::take(&mut *self.commits.borrow_mut());
+        commits.clear();
         self.surfaces.borrow_mut().retain(|weak| {
             let Some(shared) = weak.upgrade() else {
                 return false;
@@ -270,18 +297,45 @@ impl<B: Backend> Engine<B> {
             }
             true
         });
-        let (reply, rx) = std::sync::mpsc::channel();
-        self.tx
-            .send(Message::Render {
-                time,
-                commits,
-                reply,
-            })
+        if let Err(error) = self.tx.send(Message::Render {
+            time,
+            commits,
+            reply: reply_sender,
+        }) {
+            if let Message::Render { commits, reply, .. } = error.0 {
+                *self.commits.borrow_mut() = commits;
+                *self.render_reply.borrow_mut() = Some(reply);
+            }
+            return Err(RenderError::Thread);
+        }
+        let mut reply = self
+            .render_reply_rx
+            .recv()
             .map_err(|_| RenderError::Thread)?;
-        let (next, stats) = rx.recv().map_err(|_| RenderError::Thread)??;
+        *self.render_reply.borrow_mut() = Some(reply.sender);
+        self.recycle_commits(&mut reply.commits);
+        reply.commits.clear();
+        *self.commits.borrow_mut() = reply.commits;
+        let (next, stats) = reply.result?;
         *self.stats.borrow_mut() = stats;
         self.waker.arm();
         Ok(next)
+    }
+
+    fn recycle_commits(&self, commits: &mut [(SurfaceId, ChangeSet<B>)]) {
+        let surfaces = self.surfaces.borrow();
+        for (id, changes) in commits {
+            let Some(shared) = surfaces
+                .iter()
+                .filter_map(std::rc::Weak::upgrade)
+                .find(|shared| shared.borrow().id == *id)
+            else {
+                continue;
+            };
+            shared
+                .borrow_mut()
+                .recycle_ops(std::mem::take(&mut changes.ops));
+        }
     }
 
     fn on_drop(

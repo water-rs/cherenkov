@@ -14,7 +14,7 @@ use std::marker::PhantomData;
 use std::ops::{Index, IndexMut};
 use std::rc::Rc;
 #[cfg(not(target_arch = "wasm32"))]
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::SyncSender as Sender;
 
 use kurbo::{Affine, Vec2};
 use nami_core::watcher::Context;
@@ -59,6 +59,11 @@ pub struct Shared<B: Backend> {
     /// Ops queued outside transactions (layer creates and drops, bound
     /// signal changes) plus queued transaction ops.
     pending: Vec<Op<B>>,
+    /// Reusable frame-handoff op buffer.
+    spare_ops: Vec<Op<B>>,
+    /// Reusable transaction edit buffers.
+    edit_buffer: Vec<(LayerId, LayerEdit<B>)>,
+    edit_ops: Vec<Vec<EditOp<B>>>,
     /// Live contents per layer.
     contents: HashMap<LayerId, Content>,
     /// Retired recorded contents whose storage may be reused.
@@ -93,6 +98,9 @@ impl<B: Backend> Shared<B> {
         Self {
             id,
             pending: Vec::new(),
+            spare_ops: Vec::new(),
+            edit_buffer: Vec::new(),
+            edit_ops: Vec::new(),
             contents: HashMap::new(),
             spares: HashMap::new(),
             clear: None,
@@ -113,7 +121,8 @@ impl<B: Backend> Shared<B> {
     /// Drains pending ops and live content changes into a change set.
     /// Returns `None` when nothing changed.
     pub fn take_changes(&mut self) -> Option<ChangeSet<B>> {
-        let mut ops = std::mem::take(&mut self.pending);
+        let mut ops = std::mem::take(&mut self.spare_ops);
+        ops.append(&mut self.pending);
         for (id, content) in &mut self.contents {
             if let Some(change) = content.take_change() {
                 ops.push(Op::Layer(LayerOp::Content(
@@ -126,7 +135,16 @@ impl<B: Backend> Shared<B> {
             }
         }
         let clear = self.clear.take();
-        (clear.is_some() || !ops.is_empty()).then_some(ChangeSet { clear, ops })
+        if clear.is_some() || !ops.is_empty() {
+            Some(ChangeSet { clear, ops })
+        } else {
+            self.spare_ops = ops;
+            None
+        }
+    }
+
+    pub(crate) fn recycle_ops(&mut self, ops: Vec<Op<B>>) {
+        self.spare_ops = ops;
     }
 
     /// Binds `subscribe` so changes queue `op(layer, value, animation)` and
@@ -632,6 +650,7 @@ impl<B: Backend> LayerEdit<B> {
 /// the [`LayerEdit`] accumulating that layer's changes.
 pub struct Transaction<'a, B: Backend> {
     edits: Vec<(LayerId, LayerEdit<B>)>,
+    edit_ops: Vec<Vec<EditOp<B>>>,
     shared: &'a Rc<RefCell<Shared<B>>>,
     /// The transaction-wide animation (`Surface::update_animated`).
     animation: Option<Animation>,
@@ -648,7 +667,7 @@ impl<B: Backend> Transaction<'_, B> {
             self.edits.push((
                 id,
                 LayerEdit {
-                    ops: Vec::new(),
+                    ops: self.edit_ops.pop().unwrap_or_default(),
                     layer: id,
                     shared: Rc::clone(self.shared),
                     default_animation: self.animation,
@@ -826,8 +845,16 @@ impl<B: Backend> Surface<B> {
         animation: Option<Animation>,
         body: impl FnOnce(&mut Transaction<'_, B>),
     ) {
+        let (edits, edit_ops) = {
+            let mut shared = self.shared.borrow_mut();
+            (
+                std::mem::take(&mut shared.edit_buffer),
+                std::mem::take(&mut shared.edit_ops),
+            )
+        };
         let mut tx = Transaction {
-            edits: Vec::new(),
+            edits,
+            edit_ops,
             shared: &self.shared,
             animation,
             _surface: PhantomData,
@@ -838,79 +865,93 @@ impl<B: Backend> Surface<B> {
         // changes) come first.
         let pending = std::mem::take(&mut shared.pending);
         let mut ops = pending;
-        for (id, edit) in tx.edits {
-            for op in edit.ops {
+        for (id, edit) in &mut tx.edits {
+            for op in edit.ops.drain(..) {
                 match op {
-                    EditOp::Transform(prop) => ops.push(Op::Layer(LayerOp::Transform(id, prop))),
+                    EditOp::Transform(prop) => {
+                        ops.push(Op::Layer(LayerOp::Transform(*id, prop)));
+                    }
                     EditOp::Translation(prop) => {
-                        ops.push(Op::Layer(LayerOp::Translation(id, prop)));
+                        ops.push(Op::Layer(LayerOp::Translation(*id, prop)));
                     }
-                    EditOp::Rotation(prop) => ops.push(Op::Layer(LayerOp::Rotation(id, prop))),
-                    EditOp::Scale(prop) => ops.push(Op::Layer(LayerOp::Scale(id, prop))),
-                    EditOp::Skew(prop) => ops.push(Op::Layer(LayerOp::Skew(id, prop))),
-                    EditOp::Pivot(prop) => ops.push(Op::Layer(LayerOp::Pivot(id, prop))),
+                    EditOp::Rotation(prop) => {
+                        ops.push(Op::Layer(LayerOp::Rotation(*id, prop)));
+                    }
+                    EditOp::Scale(prop) => ops.push(Op::Layer(LayerOp::Scale(*id, prop))),
+                    EditOp::Skew(prop) => ops.push(Op::Layer(LayerOp::Skew(*id, prop))),
+                    EditOp::Pivot(prop) => ops.push(Op::Layer(LayerOp::Pivot(*id, prop))),
 
-                    EditOp::Opacity(prop) => ops.push(Op::Layer(LayerOp::Opacity(id, prop))),
-                    EditOp::ScrollOffset(prop) => {
-                        ops.push(Op::Layer(LayerOp::ScrollOffset(id, prop)));
+                    EditOp::Opacity(prop) => {
+                        ops.push(Op::Layer(LayerOp::Opacity(*id, prop)));
                     }
-                    EditOp::Clip(clip) => ops.push(Op::Layer(LayerOp::Clip(id, clip))),
-                    EditOp::Blend(blend) => ops.push(Op::Layer(LayerOp::Blend(id, blend))),
-                    EditOp::Filter(filter) => ops.push(Op::Layer(LayerOp::Filter(id, filter))),
+                    EditOp::ScrollOffset(prop) => {
+                        ops.push(Op::Layer(LayerOp::ScrollOffset(*id, prop)));
+                    }
+                    EditOp::Clip(clip) => ops.push(Op::Layer(LayerOp::Clip(*id, clip))),
+                    EditOp::Blend(blend) => ops.push(Op::Layer(LayerOp::Blend(*id, blend))),
+                    EditOp::Filter(filter) => ops.push(Op::Layer(LayerOp::Filter(*id, filter))),
                     EditOp::Backdrop(backdrop) => {
-                        ops.push(Op::Layer(LayerOp::Backdrop(id, backdrop)));
+                        ops.push(Op::Layer(LayerOp::Backdrop(*id, backdrop)));
                     }
                     EditOp::Content(LayerContent::Content(content)) => {
                         // A fresh `Content` replaces the previous one whole
                         // (its first `take_change` is a `Replace`).
-                        if let Some(previous) = shared.contents.remove(&id) {
-                            shared.spares.insert(id, previous.retire());
+                        if let Some(previous) = shared.contents.remove(id) {
+                            shared.spares.insert(*id, previous.retire());
                         }
                         content.attach_waker(&shared.waker);
-                        shared.contents.insert(id, content);
-                        let stored = shared.contents.get_mut(&id).expect("just inserted");
+                        shared.contents.insert(*id, content);
+                        let stored = shared.contents.get_mut(id).expect("just inserted");
                         if let Some(change) = stored.take_change() {
                             let content_op = match change {
                                 ContentChange::Replace(list) => ContentOp::Replace(list),
                                 ContentChange::Update(updates) => ContentOp::Update(updates),
                             };
-                            ops.push(Op::Layer(LayerOp::Content(id, Some(content_op))));
+                            ops.push(Op::Layer(LayerOp::Content(*id, Some(content_op))));
                         }
                     }
                     EditOp::Content(LayerContent::Picture(picture)) => {
-                        shared.contents.remove(&id);
-                        shared.spares.remove(&id);
+                        shared.contents.remove(id);
+                        shared.spares.remove(id);
                         ops.push(Op::Layer(LayerOp::Content(
-                            id,
+                            *id,
                             Some(ContentOp::Picture(picture)),
                         )));
                     }
                     EditOp::Content(LayerContent::Install(install)) => {
-                        shared.contents.remove(&id);
-                        shared.spares.remove(&id);
+                        shared.contents.remove(id);
+                        shared.spares.remove(id);
                         let surface = self.id;
+                        let layer = *id;
                         ops.push(Op::Install(Box::new(move |r| {
-                            install(r, surface, id);
+                            install(r, surface, layer);
                         })));
                     }
                     EditOp::Content(LayerContent::None) => {
-                        shared.contents.remove(&id);
-                        shared.spares.remove(&id);
-                        ops.push(Op::Layer(LayerOp::Content(id, None)));
+                        shared.contents.remove(id);
+                        shared.spares.remove(id);
+                        ops.push(Op::Layer(LayerOp::Content(*id, None)));
                     }
-                    EditOp::Push(child) => ops.push(Op::Layer(LayerOp::Push { parent: id, child })),
+                    EditOp::Push(child) => {
+                        ops.push(Op::Layer(LayerOp::Push { parent: *id, child }));
+                    }
                     EditOp::Insert(index, child) => ops.push(Op::Layer(LayerOp::Insert {
-                        parent: id,
+                        parent: *id,
                         index,
                         child,
                     })),
                     EditOp::Detach(child) => {
-                        ops.push(Op::Layer(LayerOp::Detach { parent: id, child }));
+                        ops.push(Op::Layer(LayerOp::Detach { parent: *id, child }));
                     }
                 }
             }
         }
         shared.pending = ops;
+        for (_, edit) in tx.edits.drain(..) {
+            tx.edit_ops.push(edit.ops);
+        }
+        shared.edit_buffer = tx.edits;
+        shared.edit_ops = tx.edit_ops;
         shared.waker.wake();
     }
 

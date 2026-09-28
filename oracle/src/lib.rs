@@ -25,6 +25,7 @@ pub mod blend;
 pub mod clip;
 pub mod color;
 pub mod coverage;
+pub mod gamut;
 pub mod glyphs;
 pub mod image;
 mod mesh;

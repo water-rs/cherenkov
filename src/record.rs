@@ -349,6 +349,7 @@ impl LiveState {
 pub struct Recorder {
     list: DisplayList,
     live: Rc<LiveState>,
+    picture: Option<Picture>,
 }
 
 impl std::fmt::Debug for Recorder {
@@ -373,6 +374,7 @@ impl Recorder {
         Self {
             list: DisplayList::default(),
             live: Rc::default(),
+            picture: None,
         }
     }
 
@@ -382,8 +384,15 @@ impl Recorder {
     #[inline]
     pub fn finish(mut self) -> Content {
         self.list.trim_spare();
+        let picture = match self.picture.take() {
+            Some(mut picture) => {
+                picture.put_unique_list(self.list);
+                picture
+            }
+            None => Picture::new(self.list),
+        };
         Content {
-            picture: Picture::new(self.list),
+            picture,
             live: self.live,
             sent: false,
         }
@@ -555,6 +564,11 @@ pub struct Content {
     sent: bool,
 }
 
+pub struct ContentSpare {
+    picture: Picture,
+    live: Rc<LiveState>,
+}
+
 impl std::fmt::Debug for Content {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Content")
@@ -571,6 +585,46 @@ impl Content {
         Self::record_with_capacity(0, body)
     }
 
+    pub(crate) fn record_reusing(
+        spare: Option<ContentSpare>,
+        body: impl FnOnce(&mut Recorder),
+    ) -> Self {
+        let Some(ContentSpare {
+            mut picture,
+            mut live,
+        }) = spare
+        else {
+            return Self::record(body);
+        };
+        let (picture, list) = picture.take_unique_list().map_or_else(
+            || (None, DisplayList::default()),
+            |mut list| {
+                list.clear();
+                (Some(picture), list)
+            },
+        );
+        let live = if Rc::get_mut(&mut live).is_some() {
+            live
+        } else {
+            Rc::new(LiveState::default())
+        };
+        let mut recorder = Recorder {
+            list,
+            live,
+            picture,
+        };
+        body(&mut recorder);
+        recorder.finish()
+    }
+
+    pub(crate) fn retire(self) -> ContentSpare {
+        let Self { picture, live, .. } = self;
+        live.guards.borrow_mut().clear();
+        live.pending.borrow_mut().clear();
+        *live.waker.borrow_mut() = Weak::new();
+        ContentSpare { picture, live }
+    }
+
     /// Like [`record`](Self::record), reserving room for `capacity` commands —
     /// pass the previous recording's [`len`](Self::len) when re-recording the
     /// same content.
@@ -579,6 +633,7 @@ impl Content {
         let mut recorder = Recorder {
             list: DisplayList::with_capacity(capacity),
             live: Rc::default(),
+            picture: None,
         };
         body(&mut recorder);
         recorder.list.trim_spare();
@@ -728,6 +783,16 @@ mod tests {
         };
         assert_eq!(elements.as_ptr(), pointer);
         assert_eq!(*rule, crate::FillRule::EvenOdd);
+    }
+
+    #[test]
+    fn shared_retired_picture_falls_back_to_fresh_storage() {
+        let mut content = Content::record(|_| {});
+        let pointer = std::ptr::from_ref(content.picture.display_list());
+        let held = content.take_change();
+        let reused = Content::record_reusing(Some(content.retire()), |_| {});
+        assert_ne!(std::ptr::from_ref(reused.picture.display_list()), pointer);
+        drop(held);
     }
 
     #[test]

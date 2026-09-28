@@ -330,6 +330,10 @@ impl DisplayList {
         }
     }
 
+    pub(crate) fn clear(&mut self) {
+        self.commands.clear();
+    }
+
     /// The commands.
     #[must_use]
     pub fn commands(&self) -> &[Command] {
@@ -464,6 +468,14 @@ pub struct Picture(Arc<DisplayList>);
 impl Picture {
     pub(crate) fn new(list: DisplayList) -> Self {
         Self(Arc::new(list))
+    }
+
+    pub(crate) fn take_unique_list(&mut self) -> Option<DisplayList> {
+        Arc::get_mut(&mut self.0).map(std::mem::take)
+    }
+
+    pub(crate) fn put_unique_list(&mut self, list: DisplayList) {
+        *Arc::get_mut(&mut self.0).expect("picture must be unique") = list;
     }
 
     /// The recorded commands.

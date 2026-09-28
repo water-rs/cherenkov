@@ -28,7 +28,7 @@ use crate::frame::Readback;
 use crate::message::{
     BackdropId, ChangeSet, ContentOp, LayerId, LayerOp, Message, Op, Prop, SurfaceId,
 };
-use crate::record::{Content, Live};
+use crate::record::{Content, ContentSpare, Live};
 use crate::shape::{Shape, ShapeData};
 use crate::style::{BlendMode, FilterId};
 use crate::{ContentChange, Picture, WorkingColor};
@@ -61,6 +61,8 @@ pub struct Shared<B: Backend> {
     pending: Vec<Op<B>>,
     /// Live contents per layer.
     contents: HashMap<LayerId, Content>,
+    /// Retired recorded contents whose storage may be reused.
+    spares: HashMap<LayerId, ContentSpare>,
     /// Pending clear colour.
     clear: Option<WorkingColor>,
     /// Layer id allocator (0 is the root).
@@ -92,6 +94,7 @@ impl<B: Backend> Shared<B> {
             id,
             pending: Vec::new(),
             contents: HashMap::new(),
+            spares: HashMap::new(),
             clear: None,
             next_layer: Cell::new(1),
             next_backdrop: Cell::new(1),
@@ -183,6 +186,7 @@ impl<B: Backend> LayerOwner for RefCell<Shared<B>> {
         let mut shared = self.borrow_mut();
         shared.bindings.retain(|(layer, _), _| *layer != id.raw());
         shared.contents.remove(&id);
+        shared.spares.remove(&id);
         shared.push(Op::Layer(LayerOp::Remove(id)));
     }
 }
@@ -559,6 +563,15 @@ impl<B: Backend> LayerEdit<B> {
         self
     }
 
+    /// Records content, reusing a retired recording's storage when available.
+    pub fn record(&mut self, body: impl FnOnce(&mut crate::Recorder)) -> &mut Self {
+        let spare = self.shared.borrow_mut().spares.remove(&self.layer);
+        self.ops.push(EditOp::Content(LayerContent::Content(
+            Content::record_reusing(spare, body),
+        )));
+        self
+    }
+
     /// Clears the content.
     pub fn clear_content(&mut self) -> &mut Self {
         self.ops.push(EditOp::Content(LayerContent::None));
@@ -850,6 +863,9 @@ impl<B: Backend> Surface<B> {
                     EditOp::Content(LayerContent::Content(content)) => {
                         // A fresh `Content` replaces the previous one whole
                         // (its first `take_change` is a `Replace`).
+                        if let Some(previous) = shared.contents.remove(&id) {
+                            shared.spares.insert(id, previous.retire());
+                        }
                         content.attach_waker(&shared.waker);
                         shared.contents.insert(id, content);
                         let stored = shared.contents.get_mut(&id).expect("just inserted");
@@ -863,6 +879,7 @@ impl<B: Backend> Surface<B> {
                     }
                     EditOp::Content(LayerContent::Picture(picture)) => {
                         shared.contents.remove(&id);
+                        shared.spares.remove(&id);
                         ops.push(Op::Layer(LayerOp::Content(
                             id,
                             Some(ContentOp::Picture(picture)),
@@ -870,6 +887,7 @@ impl<B: Backend> Surface<B> {
                     }
                     EditOp::Content(LayerContent::Install(install)) => {
                         shared.contents.remove(&id);
+                        shared.spares.remove(&id);
                         let surface = self.id;
                         ops.push(Op::Install(Box::new(move |r| {
                             install(r, surface, id);
@@ -877,6 +895,7 @@ impl<B: Backend> Surface<B> {
                     }
                     EditOp::Content(LayerContent::None) => {
                         shared.contents.remove(&id);
+                        shared.spares.remove(&id);
                         ops.push(Op::Layer(LayerOp::Content(id, None)));
                     }
                     EditOp::Push(child) => ops.push(Op::Layer(LayerOp::Push { parent: id, child })),
@@ -987,5 +1006,49 @@ impl<B: Backdrop> Surface<B> {
         self.new_backdrop_group(move |r, surface, id| {
             B::add_filtered_backdrop_group(r, surface, id, filter);
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+    use std::sync::mpsc;
+
+    use crate::testing::{Null, NullConfig};
+    use crate::{Engine, FrameTime, Offscreen, OffscreenFormat};
+
+    #[test]
+    fn layer_record_reuses_picture_storage_every_other_frame() {
+        let (events, _receiver) = mpsc::channel();
+        let engine = Engine::<Null>::new(NullConfig {
+            events,
+            reject: HashSet::new(),
+        })
+        .expect("init");
+        let surface = engine
+            .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))
+            .expect("surface");
+        let layer = surface.layer();
+        let mut pointers = Vec::new();
+
+        for _ in 0..7 {
+            surface.update(|tx| {
+                tx[&layer].record(|_| {});
+            });
+            engine.render(FrameTime::now()).expect("render");
+            let mut shared = surface.shared.borrow_mut();
+            let content = shared
+                .contents
+                .get_mut(&layer.id())
+                .expect("recorded content");
+            pointers.push(std::ptr::from_ref(content.snapshot()));
+        }
+
+        assert_eq!(pointers[0], pointers[2]);
+        assert_eq!(pointers[1], pointers[3]);
+        assert_eq!(pointers[2], pointers[4]);
+        assert_eq!(pointers[3], pointers[5]);
+        assert_eq!(pointers[4], pointers[6]);
+        assert_ne!(pointers[0], pointers[1]);
     }
 }

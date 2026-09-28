@@ -225,6 +225,10 @@ enum Sub {
         /// Encode path timed: hardware sRGB transfer or the shader one.
         #[arg(long, value_enum, default_value = "srgb-hw")]
         encode: PresentEncode,
+        /// Display headroom presented to (#97). Above 1 exercises the
+        /// tone-map shoulder on the `oog` pattern's HDR channels.
+        #[arg(long, default_value_t = 4.0)]
+        headroom: f32,
         /// Report JSON path.
         #[arg(long)]
         out: PathBuf,
@@ -233,6 +237,15 @@ enum Sub {
     /// and hue shift against the CSS Color 4 reference (#96). No engine —
     /// pure oracle `f64` math.
     GamutSweep {
+        /// Report text path; stdout when omitted.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Sweep the presentation tone-map candidates over an HDR ramp at
+    /// headrooms 1/2/4/8 and report monotonicity, `C1` knee continuity,
+    /// plateau onset and hue preservation (#97). No engine — pure oracle
+    /// `f64` math.
+    ToneSweep {
         /// Report text path; stdout when omitted.
         #[arg(long)]
         out: Option<PathBuf>,
@@ -399,9 +412,19 @@ fn run(cli: Cli) -> Result<(), BenchError> {
             warmup,
             pattern,
             encode,
+            headroom,
             out,
-        } => present_cost_cmd(size.as_str(), frames, warmup, pattern, encode, &out),
+        } => present_cost_cmd(
+            size.as_str(),
+            frames,
+            warmup,
+            pattern,
+            encode,
+            headroom,
+            &out,
+        ),
         Sub::GamutSweep { out } => crate::gamut_sweep::run(out.as_deref()),
+        Sub::ToneSweep { out } => crate::tone_sweep::run(out.as_deref()),
     }
 }
 
@@ -413,10 +436,11 @@ fn present_cost_cmd(
     warmup: u32,
     pattern: PresentPattern,
     encode: PresentEncode,
+    headroom: f32,
     out: &Path,
 ) -> Result<(), BenchError> {
     let size = parse_native(Some(size))?.expect("size is required");
-    crate::present_cost::run(size, frames, warmup, pattern, encode, out)
+    crate::present_cost::run(size, frames, warmup, pattern, encode, headroom, out)
 }
 
 #[cfg(not(feature = "cherenkov"))]
@@ -426,6 +450,7 @@ fn present_cost_cmd(
     _warmup: u32,
     _pattern: PresentPattern,
     _encode: PresentEncode,
+    _headroom: f32,
     _out: &Path,
 ) -> Result<(), BenchError> {
     Err(BenchError::Engine(

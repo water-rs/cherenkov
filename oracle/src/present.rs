@@ -23,39 +23,51 @@ const P3_TO_LINEAR_SRGB: [[f64; 3]; 3] = [
 /// Presents `image` to an sRGB output at display `headroom`.
 ///
 /// The `present.wgsl` shader-transfer path per pixel under premultiplied
-/// output alpha: unpremultiply, the P3 → sRGB matrix, the analytic `OKLab`
-/// gamut map of [`crate::gamut`], the sRGB transfer, re-premultiply.
-/// In-gamut P3 colours pass through bit-for-bit; out-of-gamut colours
-/// keep their hue and land on the sRGB boundary instead of clipping
-/// per-channel (#96). Values above `1.0` still land at the gamut's
-/// lightness end — no tone mapping yet.
+/// output alpha: unpremultiply, the P3 → sRGB matrix, the headroom tone
+/// map of [`crate::tone`], the analytic `OKLab` gamut map of
+/// [`crate::gamut`], the sRGB transfer, re-premultiply. In-gamut P3
+/// colours pass through bit-for-bit; out-of-gamut colours keep their hue
+/// and land on the sRGB boundary instead of clipping per-channel (#96).
+/// Values above `1.0` compress into `min(headroom, 1)` — an sRGB
+/// destination cannot store more — with the highlight shoulder rolling
+/// off instead of the old clamp (#97).
 ///
 /// Returns premultiplied *encoded* sRGB in `[0, 1]` with linear alpha —
 /// the values an sRGB presentation texture stores.
 ///
-/// `headroom` is the scene's declared presentation headroom; presentation
-/// does not tone-map yet (#97), so it is accepted and unused.
+/// `headroom` is the scene's declared presentation headroom; the sRGB
+/// surface's representable ceiling caps the tone-map target at `1`.
 #[must_use]
 pub fn present_srgb(headroom: f64, image: &Image) -> Image {
-    let _ = headroom;
+    let target = headroom.min(1.0);
     Image {
         width: image.width,
         height: image.height,
         pixels: image
             .pixels
             .iter()
-            .map(|&p| present_srgb_pixel(p))
+            .map(|&p| present_srgb_pixel(p, target))
             .collect(),
     }
 }
 
 /// Presents `image` to an extended linear Display P3 host texture
-/// (`OutputColor::LinearDisplayP3`): the identity — the extended range is
-/// handed to the host unchanged. `headroom` is carried for #97.
+/// (`OutputColor::LinearDisplayP3`).
+///
+/// Unpremultiply, tone-map to the display `headroom` on the maximum
+/// channel, re-premultiply — the `f16` host attachment holds the
+/// `[0, headroom]` extended range (#97).
 #[must_use]
 pub fn present_linear_p3(headroom: f64, image: &Image) -> Image {
-    let _ = headroom;
-    image.clone()
+    Image {
+        width: image.width,
+        height: image.height,
+        pixels: image
+            .pixels
+            .iter()
+            .map(|&p| present_linear_p3_pixel(p, headroom))
+            .collect(),
+    }
 }
 
 /// Quantizes a presented image to the unorm-8 steps a destination texture
@@ -94,17 +106,31 @@ pub fn presented_srgb_to_working([r, g, b, a]: [f64; 4]) -> [f64; 4] {
 }
 
 /// `present.wgsl`'s sRGB path for one premultiplied working-space pixel
-/// under `OutputAlpha::Premultiplied`: straight alpha is recovered for the
-/// gamut conversion, and the encoded colour is re-premultiplied.
-fn present_srgb_pixel([r, g, b, a]: [f64; 4]) -> [f64; 4] {
+/// under `OutputAlpha::Premultiplied`: straight alpha is recovered for
+/// the headroom tone map in the working space (#97 — an sRGB-intensity
+/// P3 colour never takes the shoulder), then the matrix into linear sRGB,
+/// the gamut map, and the encoded colour is re-premultiplied.
+fn present_srgb_pixel([r, g, b, a]: [f64; 4], target: f64) -> [f64; 4] {
     let straight = if a > 0.0 {
-        [r / a, g / a, b / a]
+        crate::tone::tone_map(target, [r / a, g / a, b / a])
     } else {
         [0.0; 3]
     };
     let srgb = crate::gamut::gamut_map_srgb_analytic(mat3_mul(&P3_TO_LINEAR_SRGB, straight))
         .map(srgb_encode);
     [srgb[0] * a, srgb[1] * a, srgb[2] * a, a]
+}
+
+/// `present.wgsl`'s linear P3 path for one premultiplied pixel: the tone
+/// map runs on the straight colour, then the result re-premultiplies.
+fn present_linear_p3_pixel([r, g, b, a]: [f64; 4], headroom: f64) -> [f64; 4] {
+    let straight = if a > 0.0 {
+        [r / a, g / a, b / a]
+    } else {
+        [0.0; 3]
+    };
+    let p3 = crate::tone::tone_map(headroom, straight);
+    [p3[0] * a, p3[1] * a, p3[2] * a, a]
 }
 
 #[cfg(test)]
@@ -157,8 +183,9 @@ mod tests {
 
     #[test]
     fn srgb_hdr_white_maps_to_sdr_white() {
-        // 4× SDR white lands on the gamut's lightness end — no tone
-        // mapping yet.
+        // 4× SDR white tone-maps onto the sRGB target's ceiling (h = 1
+        // regardless of the display's headroom) — not the old channel
+        // clamp, but the same stored bytes here.
         assert_close(
             px(&present_srgb(4.0, &img([4.0, 4.0, 4.0, 1.0]))),
             [1.0, 1.0, 1.0, 1.0],
@@ -199,12 +226,30 @@ mod tests {
     }
 
     #[test]
-    fn linear_p3_is_identity() {
-        // Extended range — HDR and out-of-sRGB values pass through.
-        let pixel = [4.0, -0.25, 1.5, 0.75];
+    fn linear_p3_sdr_is_identity() {
+        // The SDR range — including out-of-gamut negative channels —
+        // passes through bit-for-bit at any headroom.
+        let pixel = [0.125, -0.05, 0.25, 0.5];
         assert_eq!(
             px(&present_linear_p3(4.0, &img(pixel))).map(f64::to_bits),
             pixel.map(f64::to_bits)
+        );
+    }
+
+    #[test]
+    fn linear_p3_hdr_rolls_off_to_headroom() {
+        // 8× SDR white on a headroom-2 display compresses below the peak:
+        // the extended range is tone-mapped, never handed over beyond the
+        // headroom and never hard-clipped.
+        let [r, g, b, a] = px(&present_linear_p3(2.0, &img([8.0, 8.0, 8.0, 1.0])));
+        assert_eq!(g.to_bits(), r.to_bits());
+        assert_eq!(b.to_bits(), r.to_bits());
+        assert!(r < 2.0 && r > 1.0, "8x at h=2: {r}");
+        assert_eq!(a.to_bits(), 1.0f64.to_bits());
+        // At headroom 1 the same pixel lands on SDR white.
+        assert_eq!(
+            px(&present_linear_p3(1.0, &img([8.0, 8.0, 8.0, 1.0]))).map(f64::to_bits),
+            [1.0, 1.0, 1.0, 1.0].map(f64::to_bits)
         );
     }
 

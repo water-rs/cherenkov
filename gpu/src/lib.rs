@@ -247,6 +247,11 @@ impl Backend for Gpu {
 impl Uploads<Rgba8> for Gpu {}
 impl Uploads<Rgba16F> for Gpu {}
 
+// HDR output (#97): `LinearDisplayP3` texture output and window
+// presentation tone-map to the display's `Display::headroom` in the
+// present shader — see `render::present`.
+impl cherenkov::HdrOutput for Gpu {}
+
 impl cherenkov::GpuContent for Gpu {
     type Content = interop::GpuContentBox;
     fn set_gpu_content(

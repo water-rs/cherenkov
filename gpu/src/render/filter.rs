@@ -193,6 +193,9 @@ struct Entry {
 struct FilterTargets {
     input: (wgpu::Texture, wgpu::TextureView),
     output: (wgpu::Texture, wgpu::TextureView),
+    /// The frame sequence that last applied through these targets; sizes a
+    /// frame does not use are dropped rather than retained.
+    last_used: u64,
 }
 
 impl Entry {
@@ -238,7 +241,17 @@ impl Entry {
         device: &wgpu::Device,
         size: (u32, u32),
         format: wgpu::TextureFormat,
+        sequence: u64,
     ) -> usize {
+        // A used size is live this frame: mark it before stale sizes are
+        // dropped so steady state reuses its targets.
+        if let Some(index) = self.io.iter().position(|(io_size, _)| *io_size == size) {
+            self.io[index].1.last_used = sequence;
+        }
+        // Stale sizes go first so the lookup below cannot pick them up
+        // and the cap stays a bound on live sizes only.
+        self.io
+            .retain(|(_, targets)| targets.last_used >= sequence);
         self.io
             .iter()
             .position(|(io_size, _)| *io_size == size)
@@ -281,6 +294,7 @@ impl Entry {
                             super::TARGET_USAGES,
                             format,
                         ),
+                        last_used: sequence,
                     },
                 ));
                 let created = u64::from(size.0) * u64::from(size.1) * super::texel_bytes(format);
@@ -458,7 +472,7 @@ impl Registry {
         }
         let format = scratch.texture.format();
         entry.check_setup(id, context, format)?;
-        let targets_index = entry.targets_index(device, size, format);
+        let targets_index = entry.targets_index(device, size, format, timing.sequence());
         let targets = &entry.io[targets_index].1;
         let (input_texture, input_view) = &targets.input;
         let (output_texture, output_view) = &targets.output;

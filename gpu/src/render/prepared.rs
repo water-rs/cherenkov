@@ -604,7 +604,7 @@ pub enum GlyphSource {
 }
 
 impl GlyphSource {
-    const fn len(&self) -> usize {
+    fn len(&self) -> usize {
         match self {
             Self::Run(run) => run.glyphs.len(),
             Self::Command { count, .. } => *count,
@@ -1239,7 +1239,7 @@ impl Lowerer<'_> {
                 font: run.font,
                 size: run.size,
                 coords: run.coords.clone(),
-                glyphs: std::mem::take(pending),
+                glyphs: std::mem::take(pending).into(),
                 style: run.style.clone(),
             }),
             paint,
@@ -1275,7 +1275,7 @@ impl Lowerer<'_> {
             (font.has_colr && font_ref.colr().is_ok()).then(|| font_ref.color_glyphs());
         let bitmap = font.has_bitmap;
         let mut pending: Vec<cherenkov::Glyph> = Vec::new();
-        for glyph in &run.glyphs {
+        for glyph in run.glyphs.iter() {
             if let Some(color_glyphs) = color_glyphs.as_ref()
                 && color_glyphs.get(skrifa::GlyphId::new(glyph.id)).is_some()
             {

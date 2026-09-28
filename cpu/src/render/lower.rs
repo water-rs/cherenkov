@@ -1488,8 +1488,8 @@ impl<'a, 'b> Lowering<'a, 'b> {
         let paint = paint.transformed(self.transform.inverse());
         let [a, b, c, d, ..] = self.transform.as_coeffs();
         let matrix = [a as f32, b as f32, c as f32, d as f32];
-        let coords: std::sync::Arc<[i16]> = run.coords.clone().into();
-        for glyph in &run.glyphs {
+        let coords = run.coords.clone();
+        for glyph in run.glyphs.iter() {
             if glyph.transform.is_some() {
                 return Err(RenderError::Unsupported("glyph-transform"));
             }

@@ -22,12 +22,12 @@ fn colr_font(engine: &Engine<Raster>) -> cherenkov::Font {
         .expect("registered font")
 }
 
-const fn run(font: cherenkov::FontId, glyphs: Vec<Glyph>) -> GlyphRun {
+fn run(font: cherenkov::FontId, glyphs: Vec<Glyph>) -> GlyphRun {
     GlyphRun {
         font,
         size: 64.0,
-        coords: Vec::new(),
-        glyphs,
+        coords: Vec::new().into(),
+        glyphs: glyphs.into(),
         style: GlyphStyle::Fill,
     }
 }

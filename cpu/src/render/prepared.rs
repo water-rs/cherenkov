@@ -237,7 +237,7 @@ impl Lowerer<'_> {
         let mut colr_checked = false;
         let has_bitmap = self.bitmap_fonts.contains_key(&run.font.raw());
         let mut bitmap_paint_checked = false;
-        for glyph in &run.glyphs {
+        for glyph in run.glyphs.iter() {
             if !colr_checked {
                 colr_checked = true;
                 colr_ctx = Self::color_font_context(font_data)?;
@@ -258,7 +258,7 @@ impl Lowerer<'_> {
                             font: run.font,
                             size: run.size,
                             coords: run.coords.clone(),
-                            glyphs: std::mem::take(&mut pending),
+                            glyphs: std::mem::take(&mut pending).into(),
                             style: run.style.clone(),
                         },
                         paint: paint_data(paint, Affine::IDENTITY, self.images)?,
@@ -294,7 +294,7 @@ impl Lowerer<'_> {
                             font: run.font,
                             size: run.size,
                             coords: run.coords.clone(),
-                            glyphs: std::mem::take(&mut pending),
+                            glyphs: std::mem::take(&mut pending).into(),
                             style: run.style.clone(),
                         },
                         paint: paint_data(paint, Affine::IDENTITY, self.images)?,
@@ -306,7 +306,7 @@ impl Lowerer<'_> {
                         font: run.font,
                         size: run.size,
                         coords: run.coords.clone(),
-                        glyphs: vec![*glyph],
+                        glyphs: vec![*glyph].into(),
                         style: run.style.clone(),
                     },
                     paint,
@@ -323,7 +323,7 @@ impl Lowerer<'_> {
                     font: run.font,
                     size: run.size,
                     coords: run.coords.clone(),
-                    glyphs: pending,
+                    glyphs: pending.into(),
                     style: run.style.clone(),
                 },
                 paint: paint_data(paint, Affine::IDENTITY, self.images)?,
@@ -432,7 +432,7 @@ impl Lowerer<'_> {
         let outlines = font_ref.outline_glyphs();
         let paint = paint_data(paint, Affine::IDENTITY, self.images)?;
         let mut pending: Vec<cherenkov::Glyph> = Vec::new();
-        for glyph in &run.glyphs {
+        for glyph in run.glyphs.iter() {
             let place = match super::glyph::classify(glyph)? {
                 super::glyph::GlyphPlacement::Translate(g) => {
                     pending.push(g);
@@ -456,7 +456,7 @@ impl Lowerer<'_> {
                         font: run.font,
                         size: run.size,
                         coords: run.coords.clone(),
-                        glyphs: std::mem::take(&mut pending),
+                        glyphs: std::mem::take(&mut pending).into(),
                         style: run.style.clone(),
                     },
                     paint: paint.clone(),
@@ -478,7 +478,7 @@ impl Lowerer<'_> {
                     font: run.font,
                     size: run.size,
                     coords: run.coords.clone(),
-                    glyphs: pending,
+                    glyphs: pending.into(),
                     style: run.style.clone(),
                 },
                 paint,

@@ -2904,7 +2904,7 @@ impl<'a> Lowering<'a> {
         let key = glyph_key(run, 0, (0.0, 0.0), self.transform);
         let mut entries = Vec::new();
         let mut bounds = None::<Rect>;
-        for glyph in &run.glyphs {
+        for glyph in run.glyphs.iter() {
             let origin = self.transform * Point::new(f64::from(glyph.x), f64::from(glyph.y));
             let x = origin.x.floor();
             let y = origin.y.floor();
@@ -2981,7 +2981,7 @@ impl<'a> Lowering<'a> {
         }
         let key = glyph_key(run, 0, (0.0, 0.0), self.transform);
         let mut template = None;
-        for glyph in &run.glyphs {
+        for glyph in run.glyphs.iter() {
             let o = self.transform * Point::new(f64::from(glyph.x), f64::from(glyph.y));
             let ix = o.x.floor();
             let iy = o.y.floor();

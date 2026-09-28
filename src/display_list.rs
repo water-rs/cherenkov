@@ -496,13 +496,14 @@ mod tests {
         GlyphRun {
             font: FontId::new(0),
             size: 12.0,
-            coords: Vec::new(),
+            coords: Vec::new().into(),
             glyphs: vec![Glyph {
                 id,
                 x: 0.0,
                 y: 0.0,
                 transform: None,
-            }],
+            }]
+            .into(),
             style: GlyphStyle::Fill,
         }
     }

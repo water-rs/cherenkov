@@ -206,6 +206,8 @@ pub struct ChangeSet<B: Backend> {
     pub clear: Option<WorkingColor>,
     /// The ops, in order.
     pub ops: Vec<Op<B>>,
+    /// Replaced pictures, cleared on the render thread, whose storage returns to the UI thread.
+    pub recycled: Vec<(LayerId, Picture)>,
 }
 
 /// The render result and drained buffers returned to the UI thread.

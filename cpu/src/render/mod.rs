@@ -308,27 +308,34 @@ impl Renderer for RasterRenderer {
         }
     }
 
-    fn set_content(&mut self, surface: SurfaceId, layer: LayerId, content: Option<ContentOp>) {
-        let Some(state) = self.surfaces.get_mut(&surface) else {
-            return;
-        };
+    fn set_content(
+        &mut self,
+        surface: SurfaceId,
+        layer: LayerId,
+        content: Option<ContentOp>,
+    ) -> Option<cherenkov::Picture> {
+        let state = self.surfaces.get_mut(&surface)?;
         match content {
-            Some(ContentOp::Replace(list)) => {
-                state.layers.insert(layer, ContentData::new(list));
-            }
+            Some(ContentOp::Replace(list)) => state
+                .layers
+                .insert(layer, ContentData::new(list))
+                .map(cherenkov::lowering::Content::into_picture),
             Some(ContentOp::Update(updates)) => {
                 state
                     .layers
                     .get_mut(&layer)
                     .expect("slot update targets a layer without content")
                     .update(updates);
+                None
             }
-            Some(ContentOp::Picture(picture)) => {
-                state.layers.insert(layer, ContentData::picture(picture));
-            }
-            None => {
-                state.layers.remove(&layer);
-            }
+            Some(ContentOp::Picture(picture)) => state
+                .layers
+                .insert(layer, ContentData::picture(picture))
+                .map(cherenkov::lowering::Content::into_picture),
+            None => state
+                .layers
+                .remove(&layer)
+                .map(cherenkov::lowering::Content::into_picture),
         }
     }
 

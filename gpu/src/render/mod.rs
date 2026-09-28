@@ -1810,11 +1810,14 @@ impl Renderer for GpuRenderer {
         self.atlas.remove_font(id.raw());
     }
 
-    fn set_content(&mut self, surface: SurfaceId, layer: LayerId, content: Option<ContentOp>) {
+    fn set_content(
+        &mut self,
+        surface: SurfaceId,
+        layer: LayerId,
+        content: Option<ContentOp>,
+    ) -> Option<cherenkov::Picture> {
         let _diag_guard = diag::Guard::scope(self.diag.as_ref());
-        let Some(state) = self.surfaces.get_mut(&surface) else {
-            return;
-        };
+        let state = self.surfaces.get_mut(&surface)?;
         if state.content.remove(&layer).is_some() {
             diag::bind_groups_dropped(&self.device, state.binds1.len() as u64, "content change");
             state.binds1.clear();
@@ -1823,9 +1826,10 @@ impl Renderer for GpuRenderer {
         match content {
             Some(ContentOp::Replace(list)) => {
                 if let Some(content) = state.layers.get_mut(&layer) {
-                    content.replace(list);
+                    Some(content.replace(list))
                 } else {
                     state.layers.insert(layer, ContentData::new(list));
+                    None
                 }
             }
             Some(ContentOp::Update(updates)) => {
@@ -1834,13 +1838,13 @@ impl Renderer for GpuRenderer {
                     .get_mut(&layer)
                     .expect("slot update targets a layer without content")
                     .update(updates);
+                None
             }
-            Some(ContentOp::Picture(picture)) => {
-                state.layers.insert(layer, ContentData::picture(picture));
-            }
-            None => {
-                state.layers.remove(&layer);
-            }
+            Some(ContentOp::Picture(picture)) => state
+                .layers
+                .insert(layer, ContentData::picture(picture))
+                .map(ContentData::into_picture),
+            None => state.layers.remove(&layer).map(ContentData::into_picture),
         }
     }
 

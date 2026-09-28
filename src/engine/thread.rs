@@ -130,11 +130,16 @@ fn commit<B: Backend>(
     surface: SurfaceId,
     changes: &mut ChangeSet<B>,
 ) {
-    if let Some(clear) = changes.clear.take() {
+    let ChangeSet {
+        clear,
+        ops,
+        recycled,
+    } = changes;
+    if let Some(clear) = clear.take() {
         state.clear = clear;
         state.changed = true;
     }
-    for op in changes.ops.drain(..) {
+    for op in ops.drain(..) {
         match op {
             Op::Layer(LayerOp::Remove(layer)) => {
                 for removed in state.tree.remove(layer) {
@@ -145,7 +150,11 @@ fn commit<B: Backend>(
             Op::Layer(LayerOp::Content(layer, content)) => {
                 state.tree.apply(LayerOp::Content(layer, None));
                 state.tree.note_content(layer, content.as_ref());
-                renderer.set_content(surface, layer, content);
+                if let Some(mut old) = renderer.set_content(surface, layer, content)
+                    && old.clear_unique()
+                {
+                    recycled.push((layer, old));
+                }
                 state.changed = true;
             }
             Op::Layer(op) => {
@@ -290,6 +299,62 @@ async fn render_local<B: Backend>(
         rate,
     });
     Ok((next, stats))
+}
+
+#[cfg(all(test, feature = "testing", not(target_arch = "wasm32")))]
+mod tests {
+    use super::{SurfaceState, commit};
+    use crate::WorkingColor;
+    use crate::backend::{Backend, Display};
+    use crate::display_list::{Command, DisplayList, Picture};
+    use crate::message::{ChangeSet, ContentOp, LayerId, LayerOp, Op, SurfaceId};
+    use crate::testing::{Null, NullConfig};
+    use crate::tree::SurfaceTree;
+
+    #[test]
+    fn caller_shared_picture_is_not_recycled() {
+        let (events, _receiver) = std::sync::mpsc::channel();
+        let (mut renderer, ()) = <Null as Backend>::init(NullConfig {
+            events,
+            reject: std::collections::HashSet::new(),
+        })
+        .expect("null backend");
+        let surface = SurfaceId::new(1);
+        let layer = LayerId::new(0);
+        let mut list = DisplayList::with_capacity(1);
+        list.push(Command::End);
+        let caller_picture = Picture::new(list);
+        let mut state = SurfaceState {
+            tree: SurfaceTree::new(),
+            size: (1, 1),
+            display: Display::default(),
+            clear: WorkingColor::TRANSPARENT,
+            changed: false,
+        };
+
+        let mut first = ChangeSet::<Null> {
+            clear: None,
+            ops: vec![Op::Layer(LayerOp::Content(
+                layer,
+                Some(ContentOp::Picture(caller_picture.clone())),
+            ))],
+            recycled: Vec::new(),
+        };
+        commit(&mut renderer, &mut state, surface, &mut first);
+        let mut second = ChangeSet::<Null> {
+            clear: None,
+            ops: vec![Op::Layer(LayerOp::Content(
+                layer,
+                Some(ContentOp::Picture(Picture::new(DisplayList::default()))),
+            ))],
+            recycled: Vec::new(),
+        };
+
+        commit(&mut renderer, &mut state, surface, &mut second);
+
+        assert!(second.recycled.is_empty());
+        assert_eq!(caller_picture.display_list().len(), 1);
+    }
 }
 
 #[cfg(target_arch = "wasm32")]

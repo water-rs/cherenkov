@@ -46,12 +46,12 @@ where
         renderer
             .create_surface(id, Offscreen::new(size, OffscreenFormat::LinearF16).into())
             .expect("surface");
-        renderer.set_content(
+        let _ = renderer.set_content(
             id,
             layer,
             Some(ContentOp::Replace(crate::Picture::new(list.clone()))),
         );
-        renderer.set_content(id, sibling, Some(ContentOp::Picture(stable.clone())));
+        let _ = renderer.set_content(id, sibling, Some(ContentOp::Picture(stable.clone())));
     }
     let start = Instant::now();
     let mut frames = Frames::default();
@@ -63,7 +63,7 @@ where
                 let updates = updates(&list, step * 2 + batch);
                 let dirty = list.apply(updates.clone());
                 dirty_count += dirty.ranges().iter().map(|r| r.end - r.start).sum::<u32>();
-                renderer.set_content(ids[0], layer, Some(ContentOp::Update(updates)));
+                let _ = renderer.set_content(ids[0], layer, Some(ContentOp::Update(updates)));
             }
         }
         update_properties(&mut tree, layer, step);
@@ -78,7 +78,7 @@ where
         }
         let time = start + Duration::from_millis(u64::from(step) * 16);
         let _ = tree.sample(time, Display::default());
-        renderer.set_content(
+        let _ = renderer.set_content(
             ids[1],
             layer,
             Some(ContentOp::Replace(crate::Picture::new(list.clone()))),
@@ -158,12 +158,12 @@ where
         renderer
             .create_surface(id, Offscreen::new(size, OffscreenFormat::LinearF16).into())
             .expect("surface");
-        renderer.set_content(
+        let _ = renderer.set_content(
             id,
             layer,
             Some(ContentOp::Replace(crate::Picture::new(list.clone()))),
         );
-        renderer.set_content(id, sibling, Some(ContentOp::Picture(stable.clone())));
+        let _ = renderer.set_content(id, sibling, Some(ContentOp::Picture(stable.clone())));
     }
     let start = Instant::now();
     let mut frames = Frames::default();
@@ -175,7 +175,7 @@ where
                 let updates = updates(&list, step * 2 + batch);
                 let dirty = list.apply(updates.clone());
                 dirty_count += dirty.ranges().iter().map(|r| r.end - r.start).sum::<u32>();
-                renderer.set_content(ids[0], layer, Some(ContentOp::Update(updates)));
+                let _ = renderer.set_content(ids[0], layer, Some(ContentOp::Update(updates)));
             }
         }
         update_properties(&mut tree, layer, step);
@@ -190,7 +190,7 @@ where
         }
         let time = start + Duration::from_millis(u64::from(step) * 16);
         let _ = tree.sample(time, Display::default());
-        renderer.set_content(
+        let _ = renderer.set_content(
             ids[1],
             layer,
             Some(ContentOp::Replace(crate::Picture::new(list.clone()))),
@@ -534,7 +534,7 @@ fn assert_patch_counts<R: Renderer>(
             value: Operand::Paint(Paint::Solid(WorkingColor::WHITE)),
         })
         .collect();
-    renderer.set_content(id, layer, Some(ContentOp::Update(updates)));
+    let _ = renderer.set_content(id, layer, Some(ContentOp::Update(updates)));
     let stats = render(renderer, frames, id, tree, size, time);
     assert_eq!(
         stats.commands_lowered, 2,
@@ -570,7 +570,7 @@ fn assert_patch_counts<R: Renderer>(
         transform: None,
     });
     changed_run.glyphs = glyphs.into();
-    renderer.set_content(
+    let _ = renderer.set_content(
         id,
         layer,
         Some(ContentOp::Update(vec![SlotUpdate {
@@ -608,7 +608,7 @@ async fn assert_patch_counts<R: Renderer>(
             value: Operand::Paint(Paint::Solid(WorkingColor::WHITE)),
         })
         .collect();
-    renderer.set_content(id, layer, Some(ContentOp::Update(updates)));
+    let _ = renderer.set_content(id, layer, Some(ContentOp::Update(updates)));
     let stats = render(renderer, frames, id, tree, size, time).await;
     assert_eq!(
         stats.commands_lowered, 2,
@@ -644,7 +644,7 @@ async fn assert_patch_counts<R: Renderer>(
         transform: None,
     });
     changed_run.glyphs = glyphs.into();
-    renderer.set_content(
+    let _ = renderer.set_content(
         id,
         layer,
         Some(ContentOp::Update(vec![SlotUpdate {

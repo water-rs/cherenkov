@@ -9,7 +9,6 @@
 use crate::local::Sender;
 use std::any::Any;
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::ops::{Index, IndexMut};
 use std::rc::Rc;
@@ -18,6 +17,7 @@ use std::sync::mpsc::SyncSender as Sender;
 
 use kurbo::{Affine, Vec2};
 use nami_core::watcher::Context;
+use rustc_hash::FxHashMap;
 
 use crate::animation::Animation;
 use crate::backend::{Backend, Display, SurfaceInfo};
@@ -61,13 +61,13 @@ pub struct Shared<B: Backend> {
     pending: Vec<Op<B>>,
     /// Reusable frame-handoff op buffer.
     spare_ops: Vec<Op<B>>,
+    /// Reusable frame-handoff recycled-picture buffer.
+    spare_recycled: Vec<(LayerId, Picture)>,
     /// Reusable transaction edit buffers.
     edit_buffer: Vec<(LayerId, LayerEdit<B>)>,
     edit_ops: Vec<Vec<EditOp<B>>>,
-    /// Live contents per layer.
-    contents: HashMap<LayerId, Content>,
-    /// Retired recorded contents whose storage may be reused.
-    spares: HashMap<LayerId, ContentSpare>,
+    /// Content and reusable storage per layer.
+    contents: FxHashMap<LayerId, ContentSlot>,
     /// Pending clear colour.
     clear: Option<WorkingColor>,
     /// Layer id allocator (0 is the root).
@@ -77,11 +77,17 @@ pub struct Shared<B: Backend> {
     /// Live property subscriptions, keyed by layer and property. Binding a
     /// property replaces its previous subscription; dropping a layer drops
     /// them all.
-    bindings: HashMap<(u64, PropKind), Box<dyn Any>>,
+    bindings: FxHashMap<(u64, PropKind), Box<dyn Any>>,
     /// The engine wake-up, fired when an op is queued outside a frame.
     waker: Rc<Waker>,
     /// The last display properties announced to the render thread.
     display: Cell<Display>,
+}
+
+#[derive(Default)]
+struct ContentSlot {
+    content: Option<Content>,
+    spare: ContentSpare,
 }
 
 impl<B: Backend> std::fmt::Debug for Shared<B> {
@@ -99,14 +105,14 @@ impl<B: Backend> Shared<B> {
             id,
             pending: Vec::new(),
             spare_ops: Vec::new(),
+            spare_recycled: Vec::new(),
             edit_buffer: Vec::new(),
             edit_ops: Vec::new(),
-            contents: HashMap::new(),
-            spares: HashMap::new(),
+            contents: FxHashMap::default(),
             clear: None,
             next_layer: Cell::new(1),
             next_backdrop: Cell::new(1),
-            bindings: HashMap::new(),
+            bindings: FxHashMap::default(),
             waker,
             display: Cell::new(Display::default()),
         }
@@ -122,9 +128,10 @@ impl<B: Backend> Shared<B> {
     /// Returns `None` when nothing changed.
     pub fn take_changes(&mut self) -> Option<ChangeSet<B>> {
         let mut ops = std::mem::take(&mut self.spare_ops);
+        let recycled = std::mem::take(&mut self.spare_recycled);
         ops.append(&mut self.pending);
-        for (id, content) in &mut self.contents {
-            if let Some(change) = content.take_change() {
+        for (id, slot) in &mut self.contents {
+            if let Some(change) = slot.content.as_mut().and_then(Content::take_change) {
                 ops.push(Op::Layer(LayerOp::Content(
                     *id,
                     Some(match change {
@@ -135,16 +142,27 @@ impl<B: Backend> Shared<B> {
             }
         }
         let clear = self.clear.take();
-        if clear.is_some() || !ops.is_empty() {
-            Some(ChangeSet { clear, ops })
+        if clear.is_some() || !ops.is_empty() || !recycled.is_empty() {
+            Some(ChangeSet {
+                clear,
+                ops,
+                recycled,
+            })
         } else {
             self.spare_ops = ops;
+            self.spare_recycled = recycled;
             None
         }
     }
 
-    pub(crate) fn recycle_ops(&mut self, ops: Vec<Op<B>>) {
+    pub(crate) fn recycle(&mut self, ops: Vec<Op<B>>, recycled: &mut Vec<(LayerId, Picture)>) {
         self.spare_ops = ops;
+        for (layer, picture) in recycled.drain(..) {
+            if let Some(slot) = self.contents.get_mut(&layer) {
+                slot.spare.picture = Some(picture);
+            }
+        }
+        self.spare_recycled = std::mem::take(recycled);
     }
 
     /// Binds `subscribe` so changes queue `op(layer, value, animation)` and
@@ -204,7 +222,6 @@ impl<B: Backend> LayerOwner for RefCell<Shared<B>> {
         let mut shared = self.borrow_mut();
         shared.bindings.retain(|(layer, _), _| *layer != id.raw());
         shared.contents.remove(&id);
-        shared.spares.remove(&id);
         shared.push(Op::Layer(LayerOp::Remove(id)));
     }
 }
@@ -581,9 +598,12 @@ impl<B: Backend> LayerEdit<B> {
         self
     }
 
-    /// Records content, reusing a retired recording's storage when available.
+    /// Records content, reusing picture storage returned by the render thread.
     pub fn record(&mut self, body: impl FnOnce(&mut crate::Recorder)) -> &mut Self {
-        let spare = self.shared.borrow_mut().spares.remove(&self.layer);
+        let spare = {
+            let mut shared = self.shared.borrow_mut();
+            std::mem::take(&mut shared.contents.entry(self.layer).or_default().spare)
+        };
         self.ops.push(EditOp::Content(LayerContent::Content(
             Content::record_reusing(spare, body),
         )));
@@ -840,6 +860,7 @@ impl<B: Backend> Surface<B> {
         self.run_transaction(Some(animation.into()), body);
     }
 
+    #[expect(clippy::too_many_lines, reason = "one edit-op dispatch per design")]
     fn run_transaction(
         &self,
         animation: Option<Animation>,
@@ -896,12 +917,13 @@ impl<B: Backend> Surface<B> {
                     EditOp::Content(LayerContent::Content(content)) => {
                         // A fresh `Content` replaces the previous one whole
                         // (its first `take_change` is a `Replace`).
-                        if let Some(previous) = shared.contents.remove(id) {
-                            shared.spares.insert(*id, previous.retire());
+                        let waker = Rc::clone(&shared.waker);
+                        let slot = shared.contents.entry(*id).or_default();
+                        if let Some(previous) = slot.content.replace(content) {
+                            slot.spare.live = previous.retire().live;
                         }
-                        content.attach_waker(&shared.waker);
-                        shared.contents.insert(*id, content);
-                        let stored = shared.contents.get_mut(id).expect("just inserted");
+                        let stored = slot.content.as_mut().expect("just inserted");
+                        stored.attach_waker(&waker);
                         if let Some(change) = stored.take_change() {
                             let content_op = match change {
                                 ContentChange::Replace(list) => ContentOp::Replace(list),
@@ -912,7 +934,6 @@ impl<B: Backend> Surface<B> {
                     }
                     EditOp::Content(LayerContent::Picture(picture)) => {
                         shared.contents.remove(id);
-                        shared.spares.remove(id);
                         ops.push(Op::Layer(LayerOp::Content(
                             *id,
                             Some(ContentOp::Picture(picture)),
@@ -920,7 +941,6 @@ impl<B: Backend> Surface<B> {
                     }
                     EditOp::Content(LayerContent::Install(install)) => {
                         shared.contents.remove(id);
-                        shared.spares.remove(id);
                         let surface = self.id;
                         let layer = *id;
                         ops.push(Op::Install(Box::new(move |r| {
@@ -929,7 +949,6 @@ impl<B: Backend> Surface<B> {
                     }
                     EditOp::Content(LayerContent::None) => {
                         shared.contents.remove(id);
-                        shared.spares.remove(id);
                         ops.push(Op::Layer(LayerOp::Content(*id, None)));
                     }
                     EditOp::Push(child) => {
@@ -1082,7 +1101,13 @@ mod tests {
                 .contents
                 .get_mut(&layer.id())
                 .expect("recorded content");
-            pointers.push(std::ptr::from_ref(content.snapshot()));
+            pointers.push(std::ptr::from_ref(
+                content
+                    .content
+                    .as_mut()
+                    .expect("recorded content")
+                    .snapshot(),
+            ));
         }
 
         assert_eq!(pointers[0], pointers[2]);

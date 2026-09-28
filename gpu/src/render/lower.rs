@@ -381,12 +381,17 @@ impl ContentData {
         }
     }
 
-    pub fn replace(&mut self, list: cherenkov::Picture) {
-        self.retained.replace(list);
+    pub fn replace(&mut self, list: cherenkov::Picture) -> cherenkov::Picture {
+        let previous = self.retained.replace(list);
         self.storage.instances.clear();
         self.storage.stops.clear();
         self.storage.templates.clear();
         self.storage.covers.clear();
+        previous
+    }
+
+    pub fn into_picture(self) -> cherenkov::Picture {
+        self.retained.into_picture()
     }
 
     pub fn picture(list: cherenkov::Picture) -> Self {

@@ -20,6 +20,7 @@ pub trait RenderTransfer {}
 #[cfg(target_arch = "wasm32")]
 impl<T: ?Sized> RenderTransfer for T {}
 
+use crate::Picture;
 use crate::config::{MemoryUsage, Pressure};
 use crate::error::{EngineError, RenderError, ResourceError, SurfaceError};
 use crate::frame::{FrameId, FrameStats, FrameTime, FrameTiming, Readback};
@@ -99,8 +100,15 @@ pub trait Renderer: 'static {
     /// Unregisters an image.
     fn remove_image(&mut self, id: ImageId);
 
-    /// Replaces or updates a layer's recorded content, or clears it.
-    fn set_content(&mut self, surface: SurfaceId, layer: LayerId, content: Option<ContentOp>);
+    /// Replaces or updates a layer's content, or clears it. Returns the
+    /// previous picture when replaced or cleared, and `None` for updates or
+    /// when the layer held no picture.
+    fn set_content(
+        &mut self,
+        surface: SurfaceId,
+        layer: LayerId,
+        content: Option<ContentOp>,
+    ) -> Option<Picture>;
 
     /// The layer is gone: drop every cache keyed on it.
     fn remove_layer(&mut self, surface: SurfaceId, layer: LayerId);

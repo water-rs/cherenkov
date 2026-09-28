@@ -478,6 +478,14 @@ impl Picture {
         *Arc::get_mut(&mut self.0).expect("picture must be unique") = list;
     }
 
+    pub(crate) fn clear_unique(&mut self) -> bool {
+        let Some(list) = Arc::get_mut(&mut self.0) else {
+            return false;
+        };
+        list.clear();
+        true
+    }
+
     /// The recorded commands.
     #[must_use]
     pub fn display_list(&self) -> &DisplayList {
@@ -500,7 +508,7 @@ impl Picture {
 mod tests {
     use serde_json::json;
 
-    use super::{Command, Dirty, DisplayList, Operand, ScopeError, SlotUpdate};
+    use super::{Command, Dirty, DisplayList, Operand, Picture, ScopeError, SlotUpdate};
     use crate::glyph::{FontId, Glyph, GlyphRun, GlyphStyle};
     use crate::paint::Paint;
 
@@ -587,5 +595,21 @@ mod tests {
             unmatched.contains(&ScopeError::UnmatchedEnd { index: 0 }.to_string()),
             "{unmatched}"
         );
+    }
+
+    #[test]
+    fn clearing_a_unique_picture_keeps_its_command_buffer() {
+        let mut list = DisplayList::with_capacity(2);
+        list.push(Command::End);
+        let mut picture = Picture::new(list);
+        let shared = picture.clone();
+        let pointer = picture.display_list().commands().as_ptr();
+
+        assert!(!picture.clear_unique());
+        assert_eq!(shared.display_list().len(), 1);
+        drop(shared);
+        assert!(picture.clear_unique());
+        assert!(picture.display_list().is_empty());
+        assert_eq!(picture.display_list().commands().as_ptr(), pointer);
     }
 }

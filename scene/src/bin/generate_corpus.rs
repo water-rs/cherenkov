@@ -81,9 +81,9 @@ fn stops8() -> Vec<GradientStop> {
     ];
     RAINBOW
         .iter()
-        .enumerate()
-        .map(|(i, [r, g, b])| GradientStop {
-            offset: i as f32 / 7.0,
+        .zip(0u16..)
+        .map(|([r, g, b], i)| GradientStop {
+            offset: f32::from(i) / 7.0,
             color: srgb(*r, *g, *b),
         })
         .collect()
@@ -361,34 +361,51 @@ fn gradient_png() -> Vec<u8> {
     let mut px = Vec::with_capacity(16 * 16 * 4);
     for y in 0..16u8 {
         for x in 0..16u8 {
-            px.extend_from_slice(&[x * 16, 128, y * 16, (u16::from(x) * 255 / 15) as u8]);
+            px.extend_from_slice(&[
+                x * 16,
+                128,
+                y * 16,
+                u8::try_from(u16::from(x) * 255 / 15).expect("ramp alpha fits u8"),
+            ]);
         }
     }
     encode_png_rgba(16, 16, &px)
 }
 
-/// A `w`×`h` PNG whose bytes are sRGB-transfer-encoded Display P3 values:
+/// A `width`×`height` PNG whose bytes are sRGB-transfer-encoded Display P3 values:
 /// a ramp from P3 red through P3 green (both outside the sRGB gamut).
-fn p3_png(w: u32, h: u32) -> Vec<u8> {
-    let mut px = Vec::with_capacity(w as usize * h as usize * 4);
-    for y in 0..h {
-        for x in 0..w {
-            let t = x as f32 / (w - 1).max(1) as f32;
-            let v = y as f32 / (h - 1).max(1) as f32;
+fn p3_png(width: u32, height: u32) -> Vec<u8> {
+    let w = u16::try_from(width).expect("canvas width fits u16");
+    let h = u16::try_from(height).expect("canvas height fits u16");
+    let mut px = Vec::with_capacity(usize::from(w) * usize::from(h) * 4);
+    for row in 0..h {
+        for col in 0..w {
+            let t = f32::from(col) / f32::from((w - 1).max(1));
+            let dark = f32::from(row) / f32::from((h - 1).max(1));
             // Linear P3 red→green horizontally, darkened vertically.
-            let lin = [1.0 - t, t, v];
+            let lin = [1.0 - t, t, dark];
             for c in lin {
-                let e = if c <= 0.003_130_8 {
+                #[expect(
+                    clippy::suboptimal_flops,
+                    reason = "the mul_add rewrite changes the encoded byte; corpus pixels are pinned"
+                )]
+                let enc = if c <= 0.003_130_8 {
                     c * 12.92
                 } else {
                     1.055 * c.powf(1.0 / 2.4) - 0.055
                 };
-                px.push((e.clamp(0.0, 1.0) * 255.0).round() as u8);
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "clamped and rounded to an integral value in 0..=255"
+                )]
+                let byte = (enc.clamp(0.0, 1.0) * 255.0).round() as u8;
+                px.push(byte);
             }
             px.push(255);
         }
     }
-    encode_png_rgba(w, h, &px)
+    encode_png_rgba(width, height, &px)
 }
 
 /// A `w`×`h` `Rgba16F` blob in linear Display P3 (straight alpha) filled by
@@ -475,11 +492,14 @@ fn font_blobs(ctx: &TextContext, runs: &[&[GlyphRun]]) -> Vec<Vec<u8>> {
     out
 }
 
+/// A `Rect` -> [`Shape`] constructor in the stroke-join table.
+type ShapeBuild = fn(Rect) -> Shape;
+
 /// xorshift64* — deterministic pseudo-random content without a `rand` dep.
 struct Rng(u64);
 
 impl Rng {
-    fn next(&mut self) -> u64 {
+    const fn next(&mut self) -> u64 {
         let mut x = self.0;
         x ^= x >> 12;
         x ^= x << 25;
@@ -595,7 +615,112 @@ fn main() -> ExitCode {
     }
 }
 
-#[allow(clippy::too_many_lines)] // the corpus table is inherently long
+/// The text-page body: 38 lines cycling through the shaped scripts.
+fn text_page_body(l: &mut LayerBuilder, shaped: &[Vec<GlyphRun>]) {
+    let pitch = 54.0;
+    for (i, runs) in (0u8..38).map(|i| (i, &shaped[usize::from(i) % shaped.len()])) {
+        // Exact either way: i < 38 and pitch = 54 are small integers.
+        let y = f64::from(i).mul_add(pitch, 56.0);
+        for run in runs {
+            l.glyphs(offset_run(run, 24.0 - f64::from(TEXT_PAD), y));
+        }
+    }
+}
+
+/// The map-like page: ~2,000 stroked and filled paths — short segments,
+/// closed polygons and curved outlines distributed over the viewport.
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "the suggested mul_add rewrites alter serialized float bytes; perf scenes are pinned"
+)]
+fn map_body(l: &mut LayerBuilder, pw: f64, ph: f64) {
+    let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+    let palette = [
+        srgb(0.45, 0.60, 0.45),
+        srgb(0.55, 0.50, 0.38),
+        srgb(0.40, 0.55, 0.65),
+        srgb(0.70, 0.55, 0.45),
+        srgb(0.50, 0.45, 0.60),
+    ];
+    let thin = StrokeStyle {
+        start_cap: kurbo::Cap::Round,
+        end_cap: kurbo::Cap::Round,
+        ..StrokeStyle::default()
+    };
+    for i in 0..2000 {
+        let (x, y) = (rng.f64() * pw, rng.f64() * ph);
+        let color = palette[rng.below(palette.len())];
+        match i % 4 {
+            // Polyline segment.
+            0 => {
+                let (dx, dy) = (rng.f64() * 90.0 - 45.0, rng.f64() * 90.0 - 45.0);
+                l.stroke(
+                    Shape::Line(Line::new((x, y), (x + dx, y + dy))),
+                    StrokeStyle {
+                        width: 0.5 + rng.f64() * 4.0,
+                        ..thin.clone()
+                    },
+                    solid(color),
+                );
+            }
+            // Closed polygon (park/parcel fill).
+            1 => {
+                let radius = 8.0 + rng.f64() * 48.0;
+                let sides = 3 + rng.below(5);
+                let mut path = BezPath::new();
+                for vi in 0..sides {
+                    #[expect(clippy::cast_precision_loss, reason = "vertex index is below 8")]
+                    let angle = (vi as f64) * std::f64::consts::TAU / (sides as f64);
+                    let pt = (x + radius * angle.cos(), y + radius * angle.sin());
+                    if vi == 0 {
+                        path.move_to(pt);
+                    } else {
+                        path.line_to(pt);
+                    }
+                }
+                path.close_path();
+                l.fill(Shape::Path { path }, solid(color));
+            }
+            // Open polyline of 3-6 points (road/river line).
+            2 => {
+                let mut p = BezPath::new();
+                let (mut cx, mut cy) = (x, y);
+                p.move_to((cx, cy));
+                for _ in 0..2 + rng.below(4) {
+                    cx += rng.f64() * 120.0 - 60.0;
+                    cy += rng.f64() * 60.0 - 30.0;
+                    p.line_to((cx, cy));
+                }
+                l.stroke(
+                    Shape::Path { path: p },
+                    StrokeStyle {
+                        width: 1.0 + rng.f64() * 5.0,
+                        ..thin.clone()
+                    },
+                    solid(color),
+                );
+            }
+            // Curved closed path (lake/contour).
+            _ => {
+                let (rx, ry) = (10.0 + rng.f64() * 60.0, 6.0 + rng.f64() * 40.0);
+                l.fill(
+                    Shape::Ellipse(Ellipse::new((x, y), (rx, ry), 0.0)),
+                    solid(color),
+                );
+            }
+        }
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "a linear sequence of independent scene builders; it reads top to bottom"
+)]
+#[expect(
+    clippy::imprecise_flops,
+    clippy::suboptimal_flops,
+    reason = "the suggested mul_add/hypot rewrites alter serialized float bytes;               corpus and perf scenes are pinned byte-identical"
+)]
 fn run() -> Result<(), SceneError> {
     let root = corpus::repo_root();
     let out = corpus::corpus_dir(&root);
@@ -721,8 +846,8 @@ fn run() -> Result<(), SceneError> {
     // ---- Strokes -----------------------------------------------------------
 
     corpus.scene("stroke-widths", 128, 128, white, |l| {
-        for (i, w) in [1.0, 3.0, 8.0].iter().enumerate() {
-            let y = (i as f64).mul_add(40.0, 24.0);
+        for (w, i) in [1.0, 3.0, 8.0].iter().zip(0u16..) {
+            let y = f64::from(i).mul_add(40.0, 24.0);
             l.stroke(
                 Shape::Line(Line::new((12.0, y), (116.0, y))),
                 StrokeStyle {
@@ -735,15 +860,15 @@ fn run() -> Result<(), SceneError> {
     });
 
     corpus.scene("stroke-joins", 128, 128, white, |l| {
-        for (i, join) in [
+        for (join, i) in [
             cherenkov_scene::kurbo::Join::Miter,
             cherenkov_scene::kurbo::Join::Round,
             cherenkov_scene::kurbo::Join::Bevel,
         ]
         .iter()
-        .enumerate()
+        .zip(0u16..)
         {
-            let y = (i as f64).mul_add(40.0, 20.0);
+            let y = f64::from(i).mul_add(40.0, 20.0);
             let mut p = BezPath::new();
             p.move_to((16.0, y + 20.0));
             p.line_to((44.0, y));
@@ -762,15 +887,15 @@ fn run() -> Result<(), SceneError> {
     });
 
     corpus.scene("stroke-caps", 128, 128, white, |l| {
-        for (i, cap) in [
+        for (cap, i) in [
             cherenkov_scene::kurbo::Cap::Butt,
             cherenkov_scene::kurbo::Cap::Round,
             cherenkov_scene::kurbo::Cap::Square,
         ]
         .iter()
-        .enumerate()
+        .zip(0u16..)
         {
-            let y = (i as f64).mul_add(36.0, 28.0);
+            let y = f64::from(i).mul_add(36.0, 28.0);
             l.stroke(
                 Shape::Line(Line::new((16.0, y), (112.0, y))),
                 StrokeStyle {
@@ -813,7 +938,7 @@ fn run() -> Result<(), SceneError> {
     // Every analytic shape family x every join class, each at all three
     // caps, solid and dashed. The dashed row's period (18) divides the box
     // edge (36), so every corner sits centred in a dash.
-    let families: &[(&str, fn(Rect) -> Shape)] = &[
+    let families: &[(&str, ShapeBuild)] = &[
         ("rect", |r| Shape::Rect(r)),
         ("rounded", |r| {
             Shape::RoundedRect(RoundedRect::from_rect(
@@ -844,18 +969,18 @@ fn run() -> Result<(), SceneError> {
     for &(family, build) in families {
         for &(suffix, join, miter_limit) in joins {
             corpus.scene(
-                &format!("stroke-join-{family}-{suffix}"),
+                format!("stroke-join-{family}-{suffix}"),
                 156,
                 108,
                 white,
                 |l| {
-                    for (col, cap) in [kurbo::Cap::Butt, kurbo::Cap::Round, kurbo::Cap::Square]
+                    for (cap, col) in [kurbo::Cap::Butt, kurbo::Cap::Round, kurbo::Cap::Square]
                         .iter()
-                        .enumerate()
+                        .zip(0u16..)
                     {
-                        let x0 = 12.0 + 48.0 * col as f64;
+                        let x0 = 12.0 + 48.0 * f64::from(col);
                         for row in 0..2 {
-                            let y0 = 12.0 + 48.0 * row as f64;
+                            let y0 = 12.0 + 48.0 * f64::from(row);
                             let dashed = row == 1;
                             l.stroke(
                                 build(Rect::new(x0, y0, x0 + 36.0, y0 + 36.0)),
@@ -882,16 +1007,16 @@ fn run() -> Result<(), SceneError> {
     }
 
     corpus.scene("stroke-caps-mixed", 128, 128, white, |l| {
-        for (i, (start_cap, end_cap)) in [
+        for ((start_cap, end_cap), i) in [
             (kurbo::Cap::Butt, kurbo::Cap::Round),
             (kurbo::Cap::Round, kurbo::Cap::Square),
             (kurbo::Cap::Square, kurbo::Cap::Butt),
             (kurbo::Cap::Butt, kurbo::Cap::Square),
         ]
         .iter()
-        .enumerate()
+        .zip(0u16..)
         {
-            let y = (i as f64).mul_add(32.0, 24.0);
+            let y = f64::from(i).mul_add(32.0, 24.0);
             let dashed = i == 3;
             l.stroke(
                 Shape::Line(Line::new((16.0, y), (112.0, y))),
@@ -1473,8 +1598,8 @@ fn run() -> Result<(), SceneError> {
     });
 
     corpus.scene("stroke-p3", 128, 128, white, |l| {
-        for (i, w) in [1.0, 3.0, 8.0].iter().enumerate() {
-            let y = (i as f64).mul_add(40.0, 24.0);
+        for (w, i) in [1.0, 3.0, 8.0].iter().zip(0u16..) {
+            let y = f64::from(i).mul_add(40.0, 24.0);
             l.stroke(
                 Shape::Line(Line::new((12.0, y), (116.0, y))),
                 StrokeStyle {
@@ -1486,8 +1611,8 @@ fn run() -> Result<(), SceneError> {
         }
     });
     corpus.scene("stroke-hdr", 128, 128, white, |l| {
-        for (i, w) in [1.0, 3.0, 8.0].iter().enumerate() {
-            let y = (i as f64).mul_add(40.0, 24.0);
+        for (w, i) in [1.0, 3.0, 8.0].iter().zip(0u16..) {
+            let y = f64::from(i).mul_add(40.0, 24.0);
             l.stroke(
                 Shape::Line(Line::new((12.0, y), (116.0, y))),
                 StrokeStyle {
@@ -1613,8 +1738,8 @@ fn run() -> Result<(), SceneError> {
     // with a radial ramp to 16.0 and some alpha < 1 texels.
     let p3_img = p3_png(32, 32);
     let f16_img = rgba16f_blob(32, 32, |x, y| {
-        let dx = x as f32 - 15.5;
-        let dy = y as f32 - 15.5;
+        let dx = f32::from(u16::try_from(x).expect("blob coords fit u16")) - 15.5;
+        let dy = f32::from(u16::try_from(y).expect("blob coords fit u16")) - 15.5;
         let d = (dx * dx + dy * dy).sqrt() / 16.0;
         let v = (1.0 - d.min(1.0)) * 16.0;
         [v, v * 0.5, 16.0 - v, if x < 8 { 0.5 } else { 1.0 }]
@@ -2297,7 +2422,7 @@ fn run() -> Result<(), SceneError> {
     // per-primitive correctness sweeps above. Deterministic throughout; the
     // only pseudo-randomness is the seeded xorshift in the map scene.
 
-    let (pw, ph) = (1024.0_f64, 2216.0_f64);
+    let (pw, ph) = (1024u32, 2216u32);
     let mut perf = Corpus::new();
 
     // Scrolling UI list: 30 rows, each a shadowed rounded card with an
@@ -2320,8 +2445,8 @@ fn run() -> Result<(), SceneError> {
         let blobs = font_blobs(&ctx, &[&title, &sub]);
         perf.scene_with_blobs(
             "ui-list",
-            pw as u32,
-            ph as u32,
+            pw,
+            ph,
             srgb(0.96, 0.96, 0.97),
             |l| {
                 let pitch = 72.0;
@@ -2379,13 +2504,13 @@ fn run() -> Result<(), SceneError> {
         let blobs = font_blobs(&ctx, &shaped.iter().map(Vec::as_slice).collect::<Vec<_>>());
         perf.scene_with_blobs(
             "text-page",
-            pw as u32,
-            ph as u32,
+            pw,
+            ph,
             white,
             |l| {
                 text_page_body(l, &shaped);
             },
-            blobs.clone(),
+            blobs,
         );
     }
 
@@ -2410,8 +2535,8 @@ fn run() -> Result<(), SceneError> {
         let blobs = font_blobs(&ctx, &shaped.iter().map(Vec::as_slice).collect::<Vec<_>>());
         perf.scene_with_blobs(
             "text-pan",
-            pw as u32,
-            ph as u32,
+            pw,
+            ph,
             white,
             |l| {
                 l.layer(|pan| {
@@ -2433,100 +2558,12 @@ fn run() -> Result<(), SceneError> {
         );
     }
 
-    fn text_page_body(l: &mut LayerBuilder, shaped: &[Vec<GlyphRun>]) {
-        let pitch = 54.0;
-        for (i, runs) in (0u8..38).map(|i| (i, &shaped[usize::from(i) % shaped.len()])) {
-            let y = 56.0 + f64::from(i) * pitch;
-            for run in runs {
-                l.glyphs(offset_run(run, 24.0 - f64::from(TEXT_PAD), y));
-            }
-        }
-    }
-
     // Map-like page: ~2,000 stroked and filled paths — short segments,
     // closed polygons and curved outlines distributed over the viewport.
-    fn map_body(l: &mut LayerBuilder, pw: f64, ph: f64) {
-        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
-        let palette = [
-            srgb(0.45, 0.60, 0.45),
-            srgb(0.55, 0.50, 0.38),
-            srgb(0.40, 0.55, 0.65),
-            srgb(0.70, 0.55, 0.45),
-            srgb(0.50, 0.45, 0.60),
-        ];
-        let thin = StrokeStyle {
-            start_cap: kurbo::Cap::Round,
-            end_cap: kurbo::Cap::Round,
-            ..StrokeStyle::default()
-        };
-        for i in 0..2000 {
-            let (x, y) = (rng.f64() * pw, rng.f64() * ph);
-            let color = palette[rng.below(palette.len())];
-            match i % 4 {
-                // Polyline segment.
-                0 => {
-                    let (dx, dy) = (rng.f64() * 90.0 - 45.0, rng.f64() * 90.0 - 45.0);
-                    l.stroke(
-                        Shape::Line(Line::new((x, y), (x + dx, y + dy))),
-                        StrokeStyle {
-                            width: 0.5 + rng.f64() * 4.0,
-                            ..thin.clone()
-                        },
-                        solid(color),
-                    );
-                }
-                // Closed polygon (park/parcel fill).
-                1 => {
-                    let r = 8.0 + rng.f64() * 48.0;
-                    let sides = 3 + rng.below(5);
-                    let mut p = BezPath::new();
-                    for v in 0..sides {
-                        #[expect(clippy::cast_precision_loss, reason = "vertex index is below 8")]
-                        let a = (v as f64) * std::f64::consts::TAU / (sides as f64);
-                        let pt = (x + r * a.cos(), y + r * a.sin());
-                        if v == 0 {
-                            p.move_to(pt);
-                        } else {
-                            p.line_to(pt);
-                        }
-                    }
-                    p.close_path();
-                    l.fill(Shape::Path { path: p }, solid(color));
-                }
-                // Open polyline of 3-6 points (road/river line).
-                2 => {
-                    let mut p = BezPath::new();
-                    let (mut cx, mut cy) = (x, y);
-                    p.move_to((cx, cy));
-                    for _ in 0..2 + rng.below(4) {
-                        cx += rng.f64() * 120.0 - 60.0;
-                        cy += rng.f64() * 60.0 - 30.0;
-                        p.line_to((cx, cy));
-                    }
-                    l.stroke(
-                        Shape::Path { path: p },
-                        StrokeStyle {
-                            width: 1.0 + rng.f64() * 5.0,
-                            ..thin.clone()
-                        },
-                        solid(color),
-                    );
-                }
-                // Curved closed path (lake/contour).
-                _ => {
-                    let (rx, ry) = (10.0 + rng.f64() * 60.0, 6.0 + rng.f64() * 40.0);
-                    l.fill(
-                        Shape::Ellipse(Ellipse::new((x, y), (rx, ry), 0.0)),
-                        solid(color),
-                    );
-                }
-            }
-        }
-    }
 
     {
-        perf.scene("map", pw as u32, ph as u32, srgb(0.93, 0.95, 0.90), |l| {
-            map_body(l, pw, ph);
+        perf.scene("map", pw, ph, srgb(0.93, 0.95, 0.90), |l| {
+            map_body(l, f64::from(pw), f64::from(ph));
         });
     }
 
@@ -2535,28 +2572,22 @@ fn run() -> Result<(), SceneError> {
     // path cache's behaviour when the translation's fraction changes
     // every frame.
     {
-        perf.scene(
-            "map-pan",
-            pw as u32,
-            ph as u32,
-            srgb(0.93, 0.95, 0.90),
-            |l| {
-                l.layer(|pan| {
-                    pan.transform(Affine::IDENTITY);
-                    pan.motion(Motion::Transform {
-                        from: Affine::translate((-281.7, -209.3)),
-                        animation: MotionAnimation::Curve {
-                            duration_ms: 4000,
-                            x1: 0.25,
-                            y1: 0.25,
-                            x2: 0.75,
-                            y2: 0.75,
-                        },
-                    });
-                    map_body(pan, pw, ph);
+        perf.scene("map-pan", pw, ph, srgb(0.93, 0.95, 0.90), |l| {
+            l.layer(|pan| {
+                pan.transform(Affine::IDENTITY);
+                pan.motion(Motion::Transform {
+                    from: Affine::translate((-281.7, -209.3)),
+                    animation: MotionAnimation::Curve {
+                        duration_ms: 4000,
+                        x1: 0.25,
+                        y1: 0.25,
+                        x2: 0.75,
+                        y2: 0.75,
+                    },
                 });
-            },
-        );
+                map_body(pan, f64::from(pw), f64::from(ph));
+            });
+        });
     }
 
     // Chart page: a 2,000-point line chart, a bar chart, axes and labels.
@@ -2578,8 +2609,8 @@ fn run() -> Result<(), SceneError> {
         let blobs = font_blobs(&ctx, &[&label, &tick]);
         perf.scene_with_blobs(
             "chart",
-            pw as u32,
-            ph as u32,
+            pw,
+            ph,
             white,
             |l| {
                 // Axes + grid.
@@ -2654,46 +2685,40 @@ fn run() -> Result<(), SceneError> {
 
     // Effects page: 20 shadowed cards under a group-opacity layer.
     {
-        perf.scene(
-            "effects",
-            pw as u32,
-            ph as u32,
-            srgb(0.98, 0.97, 0.96),
-            |l| {
-                l.layer(|group| {
-                    group.opacity(0.82);
-                    for i in 0u8..20 {
-                        let (col, row) = (i % 4, i / 4);
-                        let (x, y) = (32.0 + f64::from(col) * 250.0, 48.0 + f64::from(row) * 420.0);
-                        let card = RoundedRect::from_rect(
-                            Rect::new(x, y, x + 226.0, y + 380.0),
-                            RoundedRectRadii::new(20.0, 20.0, 20.0, 20.0),
-                        );
-                        group.shadow(
-                            Shape::RoundedRect(card),
-                            12.0,
-                            [0.0, 10.0],
-                            srgba(0.15, 0.1, 0.3, 0.35),
-                        );
-                        group.fill(
-                            Shape::RoundedRect(card),
-                            solid(srgb(
-                                0.55 + 0.05 * f32::from(col),
-                                0.35 + 0.03 * f32::from(row),
-                                0.75,
-                            )),
-                        );
-                        group.fill(
-                            Shape::RoundedRect(RoundedRect::from_rect(
-                                Rect::new(x + 20.0, y + 24.0, x + 206.0, y + 120.0),
-                                RoundedRectRadii::new(10.0, 10.0, 10.0, 10.0),
-                            )),
-                            solid(srgba(1.0, 1.0, 1.0, 0.6)),
-                        );
-                    }
-                });
-            },
-        );
+        perf.scene("effects", pw, ph, srgb(0.98, 0.97, 0.96), |l| {
+            l.layer(|group| {
+                group.opacity(0.82);
+                for i in 0u8..20 {
+                    let (col, row) = (i % 4, i / 4);
+                    let (x, y) = (32.0 + f64::from(col) * 250.0, 48.0 + f64::from(row) * 420.0);
+                    let card = RoundedRect::from_rect(
+                        Rect::new(x, y, x + 226.0, y + 380.0),
+                        RoundedRectRadii::new(20.0, 20.0, 20.0, 20.0),
+                    );
+                    group.shadow(
+                        Shape::RoundedRect(card),
+                        12.0,
+                        [0.0, 10.0],
+                        srgba(0.15, 0.1, 0.3, 0.35),
+                    );
+                    group.fill(
+                        Shape::RoundedRect(card),
+                        solid(srgb(
+                            0.55 + 0.05 * f32::from(col),
+                            0.35 + 0.03 * f32::from(row),
+                            0.75,
+                        )),
+                    );
+                    group.fill(
+                        Shape::RoundedRect(RoundedRect::from_rect(
+                            Rect::new(x + 20.0, y + 24.0, x + 206.0, y + 120.0),
+                            RoundedRectRadii::new(10.0, 10.0, 10.0, 10.0),
+                        )),
+                        solid(srgba(1.0, 1.0, 1.0, 0.6)),
+                    );
+                }
+            });
+        });
     }
 
     // A heavy scrolling list: 120 shadowed card rows inside a clipped,
@@ -2717,18 +2742,23 @@ fn run() -> Result<(), SceneError> {
         let blobs = font_blobs(&ctx, &[&title, &sub]);
         perf.scene_with_blobs(
             "scroll-list",
-            pw as u32,
-            ph as u32,
+            pw,
+            ph,
             srgb(0.96, 0.96, 0.97),
             |l| {
                 l.layer(|list| {
-                    list.clip(Shape::Rect(Rect::new(0.0, 0.0, pw, ph)));
+                    list.clip(Shape::Rect(Rect::new(
+                        0.0,
+                        0.0,
+                        f64::from(pw),
+                        f64::from(ph),
+                    )));
                     list.scroll_offset(Vec2::new(0.0, 1200.0));
                     list.motion(Motion::Scroll {
                         from: Vec2::new(0.0, 1700.0),
                         velocity: Vec2::new(0.0, -2000.0),
                         deceleration: 4.0,
-                        bounds: Some(Rect::new(0.0, 0.0, 0.0, 120.0 * 96.0 - ph)),
+                        bounds: Some(Rect::new(0.0, 0.0, 0.0, 120.0 * 96.0 - f64::from(ph))),
                     });
                     let pitch = 96.0;
                     for i in 0u16..120 {
@@ -2802,15 +2832,15 @@ fn run() -> Result<(), SceneError> {
         let blobs = font_blobs(&ctx, &[&title, &body, &label, &digits[0]]);
         perf.scene_with_blobs(
             "live-dashboard",
-            pw as u32,
-            ph as u32,
+            pw,
+            ph,
             srgb(0.96, 0.96, 0.97),
             |l| {
                 for run in &title {
                     l.glyphs(offset_run(run, 40.0, 40.0));
                 }
-                for (i, run) in body.iter().enumerate() {
-                    l.glyphs(offset_run(run, 40.0, 140.0 + 34.0 * i as f64));
+                for (run, i) in body.iter().zip(0u16..) {
+                    l.glyphs(offset_run(run, 40.0, 140.0 + 34.0 * f64::from(i)));
                 }
                 // Card grid: 4 columns x 3 rows of shadowed cards.
                 for row in 0u8..3 {

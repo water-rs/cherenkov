@@ -604,7 +604,7 @@ use $crate::Instant;
                 // up to ~¼ px of quantization and centroid bias; the same
                 // uncertainty feeds back through v.
                 assert!(
-                    (c3 - c2 - expected).abs() <= (v * dt).abs() * 0.01 + 0.75,
+                    (c3 - c2 - expected).abs() <= (v * dt).abs().mul_add(0.01, 0.75),
                     "displacement {} vs the spring's trajectory {expected} (v·dt {})",
                     c3 - c2,
                     v * dt

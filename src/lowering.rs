@@ -591,6 +591,12 @@ pub fn resolve_winding(
     // fails the `band - 1` test and closes itself. The merged edge is
     // exactly the union of the per-band pieces of the same line.
     let mut runs: Vec<Option<(usize, bool, usize)>> = vec![None; segs.len()];
+    // The runs emitted or extended in the previous band, for the
+    // cross-segment collinear merge: (index into `out`, orientation,
+    // x at the band's bottom, slope). Rebuilt after each emitting
+    // band; a split `continue` leaves it untouched since no band was
+    // emitted between.
+    let mut prev_open: Vec<(usize, bool, f64, f64)> = Vec::new();
     let mut band = 0usize;
     while band + 1 < ys.len() {
         let (ya, yb) = (ys[band], ys[band + 1]);
@@ -600,6 +606,7 @@ pub fn resolve_winding(
         }
         active.retain(|&i| segs[i].y1 > ya + EPS);
         if active.is_empty() {
+            prev_open.clear();
             band += 1;
             continue;
         }
@@ -640,6 +647,7 @@ pub fn resolve_winding(
         let mut inside = false;
         let mut wmin = 0.0f64;
         let mut wmax = 0.0f64;
+        let mut open: Vec<(usize, bool, f64, f64)> = Vec::new();
         for &i in &active {
             let seg = &segs[i];
             w += seg.dir;
@@ -655,24 +663,22 @@ pub fn resolve_winding(
                 // segment's run that ends exactly where this piece
                 // starts (collinear segments share the same boundary
                 // line, so the extension is exact).
+                // Continue this segment's own open run, or an open
+                // run from the previous band that ends where this
+                // piece starts and shares its slope — coincident
+                // collinear segments form one boundary line, so the
+                // extension is exact; at a kink the slope differs and
+                // a new edge starts.
                 let run = match runs[i] {
                     Some((edge, orient, last)) if orient == now && last + 1 == band => Some(edge),
-                    _ => runs.iter().find_map(|r| match *r {
-                        Some((edge, orient, last)) if orient == now && last + 1 == band => {
-                            let old = out[edge];
-                            let end = if now { (old.2, old.3) } else { (old.0, old.1) };
-                            // Collinear pieces only: at a kink the
-                            // boundary continues on a different line
-                            // and must start a new edge. The emitted
-                            // edge's y-extent is never zero.
-                            let collinear =
-                                ((old.2 - old.0) / (old.3 - old.1) - seg.slope).abs() <= EPS;
-                            (end == (xa, ya) && collinear).then_some(edge)
-                        }
-                        _ => None,
+                    _ => prev_open.iter().find_map(|&(edge, orient, x_end, slope)| {
+                        (orient == now
+                            && (x_end - xa).abs() <= EPS * (1.0 + xa.abs())
+                            && (slope - seg.slope).abs() <= EPS)
+                            .then_some(edge)
                     }),
                 };
-                if let Some(edge) = run {
+                let edge = if let Some(edge) = run {
                     let piece = &mut out[edge];
                     if now {
                         piece.2 = xb;
@@ -681,17 +687,21 @@ pub fn resolve_winding(
                         piece.0 = xb;
                         piece.1 = yb;
                     }
-                    runs[i] = Some((edge, now, band));
-                } else if now {
-                    runs[i] = Some((out.len(), now, band));
-                    out.push((xa, ya, xb, yb));
+                    edge
                 } else {
-                    runs[i] = Some((out.len(), now, band));
-                    out.push((xb, yb, xa, ya));
-                }
+                    if now {
+                        out.push((xa, ya, xb, yb));
+                    } else {
+                        out.push((xb, yb, xa, ya));
+                    }
+                    out.len() - 1
+                };
+                runs[i] = Some((edge, now, band));
+                open.push((edge, now, xb, seg.slope));
                 inside = now;
             }
         }
+        prev_open = open;
         // A winding magnitude above one, or both signs in one band,
         // means regions overlap — only then is rewriting needed.
         if wmax >= 2.0 || wmin <= -2.0 || (wmin < 0.0 && wmax > 0.0) {

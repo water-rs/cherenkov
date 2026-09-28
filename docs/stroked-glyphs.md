@@ -6,7 +6,10 @@ joins, caps, miter limit, dash pattern and dash offset have the same semantics
 as a path stroke. Paint remains in run coordinates. COLR fonts use their base
 outline when stroked; palette paint graphs remain a filled-glyph operation.
 A missing outline is an explicit font error. Empty outlines draw nothing.
-Per-glyph transforms remain the backend's existing unsupported capability.
+Per-glyph transforms compose into the stroke placement about the glyph
+origin, between the font scale and the glyph position (#69); a non-finite
+or non-invertible transform is a render error, and a missing outline an
+explicit font error.
 
 The GPU backend resolves these semantic glyphs into its existing cached stroke
 coverage operations. It does not change normal filled-glyph atlas keys, frame

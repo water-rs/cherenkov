@@ -1110,6 +1110,7 @@ pub fn stroke_outlines(
 
 /// The cache key for a glyph at a quantized device position.
 #[expect(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_sign_loss)]
 pub fn glyph_key(
     run: &cherenkov::GlyphRun,
     glyph: u32,

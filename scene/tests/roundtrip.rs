@@ -198,3 +198,79 @@ fn smoothing_zero_matches_circular_corner() {
     let path = shape.to_path();
     assert!(path.elements().len() > 10);
 }
+
+#[test]
+fn image_encodings_roundtrip() {
+    use cherenkov_scene::{ImageColorSpace, ImageEncoding, ImagePaint};
+
+    let png_hash = ResourceHash::of(b"fake-png");
+    let raw_hash = ResourceHash::of(b"fake-f16");
+    let mut scene = Scene::builder(8, 8);
+    scene.root().image_encoded(
+        png_hash,
+        ImageEncoding::Png {
+            color_space: ImageColorSpace::DisplayP3,
+        },
+        Rect::new(0.0, 0.0, 8.0, 8.0),
+        Sampling::Bilinear,
+    );
+    scene.root().fill(
+        Shape::Rect(Rect::new(0.0, 0.0, 4.0, 4.0)),
+        Paint::Image(ImagePaint {
+            image: raw_hash,
+            encoding: ImageEncoding::Rgba16F {
+                width: 2,
+                height: 2,
+                color_space: ImageColorSpace::LinearP3,
+            },
+            transform: Affine::IDENTITY,
+            extend_x: cherenkov_scene::Extend::Pad,
+            extend_y: cherenkov_scene::Extend::Pad,
+            sampling: Sampling::Nearest,
+        }),
+    );
+    let scene = scene.build();
+    assert!(scene.features.contains(&Feature::ImageF16));
+    assert!(
+        scene
+            .features
+            .contains(&Feature::ImageColorSpace(ImageColorSpace::DisplayP3))
+    );
+    assert!(
+        scene
+            .features
+            .contains(&Feature::ImageColorSpace(ImageColorSpace::LinearP3))
+    );
+
+    let json = serde_json::to_string(&scene).unwrap();
+    let back: Scene = serde_json::from_str(&json).unwrap();
+    assert_eq!(scene, back);
+
+    // A default (sRGB PNG) encoding is omitted from the JSON, so existing
+    // scene files keep serializing byte-identically.
+    let mut srgb = Scene::builder(8, 8);
+    srgb.root()
+        .image(png_hash, Rect::new(0.0, 0.0, 8.0, 8.0), Sampling::Bilinear);
+    let srgb = srgb.build();
+    assert!(!serde_json::to_string(&srgb).unwrap().contains("encoding"));
+
+    // Encoding/colour-space combinations that cannot decode are rejected.
+    for bad in [
+        ImageEncoding::Png {
+            color_space: ImageColorSpace::LinearP3,
+        },
+        ImageEncoding::Rgba16F {
+            width: 0,
+            height: 1,
+            color_space: ImageColorSpace::LinearP3,
+        },
+        ImageEncoding::Rgba16F {
+            width: 1,
+            height: 1,
+            color_space: ImageColorSpace::DisplayP3,
+        },
+    ] {
+        assert!(bad.validate().is_err());
+    }
+    assert!(ImageEncoding::default().validate().is_ok());
+}

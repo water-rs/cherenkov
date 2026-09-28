@@ -303,6 +303,7 @@ impl Renderer {
                 image,
                 dst,
                 sampling,
+                ..
             } => {
                 let (dw, dh) = (dst.x1 - dst.x0, dst.y1 - dst.y0);
                 let coverage =

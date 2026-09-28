@@ -827,6 +827,7 @@ fn run() -> Result<(), SceneError> {
                 Shape::rounded_rect(8.0, 8.0, 112.0, 112.0, 16.0),
                 Paint::Image(ImagePaint {
                     image: ResourceHash::of(&checker),
+                    encoding: cherenkov_scene::ImageEncoding::default(),
                     transform: Affine::translate((40.0, 40.0)) * Affine::scale(4.0),
                     extend_x: Extend::Repeat,
                     extend_y: Extend::Repeat,

@@ -2723,6 +2723,20 @@ fn run() -> Result<(), SceneError> {
     );
     silhouette_scene(
         &mut corpus,
+        "shadow-silhouette-affine-ellipse",
+        shadow_ellipse(),
+        Affine::new([0.72, 0.22, -0.15, 0.7, 28.0, 4.0]),
+        blue,
+    );
+    silhouette_scene(
+        &mut corpus,
+        "shadow-silhouette-affine-continuous",
+        shadow_uneven(),
+        Affine::new([0.72, 0.22, -0.15, 0.7, 28.0, 4.0]),
+        blue,
+    );
+    silhouette_scene(
+        &mut corpus,
         "shadow-silhouette-continuous",
         shadow_uneven(),
         Affine::IDENTITY,

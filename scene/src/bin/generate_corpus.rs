@@ -4377,7 +4377,11 @@ fn run() -> Result<(), SceneError> {
             ],
         );
         l.layer(|m| {
-            m.clip(Shape::Ellipse(Ellipse::new((72.0, 72.0), (48.0, 28.0), 0.0)));
+            m.clip(Shape::Ellipse(Ellipse::new(
+                (72.0, 72.0),
+                (48.0, 28.0),
+                0.0,
+            )));
             m.backdrop(1);
             m.backdrop_effect(BackdropEffectSpec::Refraction {
                 depth: 12.0,

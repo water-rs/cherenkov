@@ -44,7 +44,8 @@
 use std::collections::HashMap;
 
 use cherenkov_scene::{
-    BackdropFilter, BackdropGroup, BlendMode, Draw, FillRule, Item, Layer, Paint, Scene, Shape,
+    BackdropFilter, BackdropGroup, BlendMode, Draw, FillRule, Item, Layer, LayerFilter, Paint,
+    Scene, Shape,
 };
 use kurbo::{Affine, Point, Rect};
 
@@ -116,7 +117,8 @@ impl Canvas {
 /// One compositing level: a canvas plus the opacity and blend mode it
 /// composites into the level below it with. `semantic` marks the canvases
 /// a backdrop capture sees as its compositing target: the surface canvas
-/// and every layer isolated for `opacity < 1` or a non-Normal blend.
+/// and every layer isolated for a filter, `opacity < 1` or a non-Normal
+/// blend.
 struct Level {
     canvas: Canvas,
     opacity: f64,
@@ -322,7 +324,12 @@ impl Renderer {
         let content_tf = tf * Affine::translate((-child.scroll_offset.x, -child.scroll_offset.y));
 
         let (w, h) = (top(chain).width, top(chain).height);
-        let semantic = child.opacity < 1.0 || child.blend != BlendMode::Normal;
+        // A filtered layer is a semantic isolation too: a backdrop capture
+        // inside it reads this canvas, and its body — including the member's
+        // own backdrop sample — is filtered as a whole before compositing,
+        // matching `isolate` in gpu/src/render/lower.rs.
+        let semantic =
+            child.filter.is_some() || child.opacity < 1.0 || child.blend != BlendMode::Normal;
         chain.push(Level {
             canvas: Canvas::new(w, h, [0.0; 4]),
             opacity: child.opacity,
@@ -340,11 +347,32 @@ impl Renderer {
             backdrops,
         )?;
         let Level {
-            canvas: sub,
+            canvas: mut sub,
             opacity,
             blend: mode,
             ..
         } = chain.pop().expect("the child level is pushed above");
+        if let Some(filter) = child.filter.as_deref() {
+            let texels = match filter {
+                LayerFilter::BlendImage { image, .. } => {
+                    Some(resources.texels(*image).map_err(RenderError::Resource)?)
+                }
+                _ => None,
+            };
+            crate::filter::apply(filter, texels, &mut sub.pixels, sub.width, sub.height);
+            // The layer clip masks the filter's output, not only its input.
+            if !child_clips.is_empty() {
+                let mask = self.shape_coverage(
+                    &Shape::Rect(self.scene_rect),
+                    FillRule::NonZero,
+                    Affine::IDENTITY,
+                    &child_clips,
+                );
+                for (px, m) in sub.pixels.iter_mut().zip(mask) {
+                    *px = px.map(|v| v * m);
+                }
+            }
+        }
 
         // A destructive operator is bounded by the effective clip: outside
         // it the destination is untouched, and the clip edge is antialiased

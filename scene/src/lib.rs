@@ -35,7 +35,7 @@ pub use draw::{
     SweepGradient,
 };
 pub use error::SceneError;
-pub use layer::{Item, Layer, Live, Motion, MotionAnimation};
+pub use layer::{FilterBlend, Item, Layer, LayerFilter, Live, Motion, MotionAnimation};
 pub use scene::{Feature, Scene, WorkingSpace};
 pub use shape::{ContinuousRect, Shape};
 

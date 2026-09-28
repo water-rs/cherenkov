@@ -15,6 +15,7 @@
 //!   rule. Glyph outlines ([`glyphs`]) come from `skrifa`, unhinted.
 //! - [`blend`] implements the 16 W3C Compositing and Blending Level 1
 //!   modes in premultiplied linear Display P3.
+//! - [`filter`] applies layer filters to a layer's isolated content.
 //! - [`shadow`] convolves exact coverage with a true Gaussian in `f64`.
 //! - [`metrics`] implements FLIP (and HDR-FLIP for values > `1.0`), ported
 //!   from `FLIP.h` (NVlabs/flip, BSD-3-Clause — Andersson et al., HPG 2020
@@ -25,6 +26,7 @@ pub mod blend;
 pub mod clip;
 pub mod color;
 pub mod coverage;
+pub mod filter;
 pub mod gamut;
 pub mod glyphs;
 pub mod image;

@@ -874,6 +874,12 @@ impl<'a> Lowering<'a> {
                 .filters
                 .push((self.frame.passes.len() - 1, filter.raw()));
             [0, 0, self.width as u32, self.height as u32]
+        } else if is_destructive(blend) {
+            clip_region(
+                inner_clip.or(outer_clip),
+                self.width as u32,
+                self.height as u32,
+            )
         } else {
             tight_region(
                 &self.frame.instances[inst_start..],
@@ -915,8 +921,16 @@ impl<'a> Lowering<'a> {
             }
         }
         // The composite instance: a quad over the scratch's region
-        // sampling it with `grad.xy` as the texel origin.
+        // sampling it with `grad.xy` as the texel origin. A destructive
+        // composite carries the effective clip itself: its coverage decides
+        // where the operator applies across the whole region.
+        if is_destructive(blend) {
+            self.set_clip(inner_clip.or(outer_clip));
+        }
         self.emit_composite(scratch, opacity, region, blend);
+        if is_destructive(blend) {
+            self.set_clip(outer_clip);
+        }
         Ok(())
     }
 
@@ -2514,12 +2528,6 @@ fn bboxes_disjoint(instances: &[Instance]) -> bool {
 /// The union device bbox of `instances` clipped to the surface, inflated
 /// by one pixel and integer-rounded, as `(x, y, w, h)`; `[0, 0, 0, 0]`
 /// when empty.
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_precision_loss,
-    reason = "region coordinates are finite, non-negative and below the surface size"
-)]
 fn tight_region(instances: &[Instance], width: u32, height: u32) -> [u32; 4] {
     let mut min = [f32::INFINITY; 2];
     let mut max = [f32::NEG_INFINITY; 2];
@@ -2532,6 +2540,18 @@ fn tight_region(instances: &[Instance], width: u32, height: u32) -> [u32; 4] {
         max[0] = max[0].max(b[2]);
         max[1] = max[1].max(b[3]);
     }
+    padded_region(min, max, width, height)
+}
+
+/// The `[x, y, w, h]` texel region covering a float bbox: floor−1 / ceil+1,
+/// clamped to the surface, `[0, 0, 0, 0]` when empty.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    reason = "region coordinates are finite, non-negative and below the surface size"
+)]
+fn padded_region(min: [f32; 2], max: [f32; 2], width: u32, height: u32) -> [u32; 4] {
     let x0 = (min[0].floor() - 1.0).max(0.0);
     let y0 = (min[1].floor() - 1.0).max(0.0);
     let x1 = (max[0].ceil() + 1.0).min(width as f32);
@@ -2540,6 +2560,52 @@ fn tight_region(instances: &[Instance], width: u32, height: u32) -> [u32; 4] {
         return [0, 0, 0, 0];
     }
     [x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32]
+}
+
+/// Porter-Duff operators where a transparent source writes over the
+/// destination instead of leaving it unchanged. These composite over the
+/// layer's whole clip (or parent), not the tight content region.
+const fn is_destructive(blend: cherenkov::BlendMode) -> bool {
+    use cherenkov::BlendMode as B;
+    matches!(
+        blend,
+        B::Clear | B::Src | B::SrcIn | B::SrcOut | B::DestIn | B::DestAtop
+    )
+}
+
+/// The device region a destructive composite covers: the clip's extent,
+/// or the whole parent when there is no clip. Without an axis-aligned
+/// rect, the conservative bbox is the clip shape's half extents mapped to
+/// device space (`inv` maps device to clip-local, so `inv⁻¹` maps back);
+/// the clip shape itself still bounds coverage per pixel.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "clip extents fit the f32 surface space"
+)]
+fn clip_region(clip: Option<DeviceClip>, width: u32, height: u32) -> [u32; 4] {
+    let Some(clip) = clip else {
+        return [0, 0, width, height];
+    };
+    if let Some(rect) = clip.aligned_rect {
+        return padded_region(
+            [rect.x0 as f32, rect.y0 as f32],
+            [rect.x1 as f32, rect.y1 as f32],
+            width,
+            height,
+        );
+    }
+    let inv = clip.inv.inverse();
+    let (hx, hy) = (clip.shape.half[0], clip.shape.half[1]);
+    let mut min = [f32::INFINITY; 2];
+    let mut max = [f32::NEG_INFINITY; 2];
+    for (x, y) in [(hx, hy), (-hx, hy), (hx, -hy), (-hx, -hy)] {
+        let p = inv * Point::new(f64::from(x), f64::from(y));
+        min[0] = min[0].min(p.x as f32);
+        min[1] = min[1].min(p.y as f32);
+        max[0] = max[0].max(p.x as f32);
+        max[1] = max[1].max(p.y as f32);
+    }
+    padded_region(min, max, width, height)
 }
 
 #[cfg(test)]
@@ -2698,6 +2764,186 @@ mod tests {
             .find(|i| i.meta[1] == PAINT_TEXTURE)
             .expect("the composite instance");
         assert_eq!(composite.meta[0], KIND_SPAN, "composites are spans");
+    }
+
+    fn one_rect_body(s: &mut Lowering<'_>, g: &GlyphContext<'_>) -> Result<(), RenderError> {
+        draw(
+            s,
+            &cherenkov::Command::Fill {
+                shape: ShapeData::Rect(Rect::new(4.0, 4.0, 20.0, 20.0)),
+                paint: cherenkov::Paint::Solid(WorkingColor::new([1.0, 0.0, 0.0, 1.0])),
+            },
+            g,
+        )
+    }
+
+    /// A destructive blend composites over the whole clip (or parent),
+    /// not the tight region of the layer's content.
+    #[test]
+    #[expect(clippy::float_cmp, reason = "integer regions compare exactly")]
+    fn destructive_composite_covers_the_whole_parent() {
+        let Some((device, _queue)) = device_and_queue() else {
+            return;
+        };
+        let atlas = Atlas::new(&device, u64::MAX);
+        let fonts = HashMap::new();
+        let images = HashMap::new();
+        let glyphs = GlyphContext {
+            atlas: &atlas,
+            fonts: &fonts,
+            images: &images,
+            content: &HashMap::new(),
+        };
+        let mut frame = Frame::default();
+        let mut lowering = Lowering::new(&mut frame, (64, 64));
+        lowering.begin_pass(Target::Surface, None);
+        lowering
+            .isolate(
+                None,
+                None,
+                1.0,
+                cherenkov::BlendMode::Clear,
+                |s, g| one_rect_body(s, g),
+                &glyphs,
+            )
+            .expect("destructive isolate");
+        lowering
+            .isolate(
+                None,
+                None,
+                1.0,
+                cherenkov::BlendMode::Multiply,
+                |s, g| one_rect_body(s, g),
+                &glyphs,
+            )
+            .expect("tight isolate");
+        lowering.finish_pass();
+        let scratch: Vec<_> = frame
+            .passes
+            .iter()
+            .filter(|p| matches!(p.target, Target::Scratch(_)))
+            .map(|p| p.region)
+            .collect();
+        assert_eq!(scratch, vec![[0, 0, 64, 64], [1, 1, 22, 22]]);
+        let composites: Vec<_> = frame
+            .instances
+            .iter()
+            .filter(|i| i.meta[1] == PAINT_TEXTURE)
+            .map(|i| i.bounds)
+            .collect();
+        assert_eq!(
+            composites[0],
+            [0.0, 0.0, 64.0, 64.0],
+            "the destructive composite covers the whole parent"
+        );
+        assert_eq!(
+            composites[1],
+            [1.0, 1.0, 23.0, 23.0],
+            "the multiply composite keeps the tight region"
+        );
+    }
+
+    /// A clipped destructive composite covers the padded clip rect and
+    /// carries the clip on the composite instance.
+    #[test]
+    #[expect(clippy::float_cmp, reason = "integer regions compare exactly")]
+    fn destructive_composite_is_bounded_by_the_clip() {
+        let Some((device, _queue)) = device_and_queue() else {
+            return;
+        };
+        let atlas = Atlas::new(&device, u64::MAX);
+        let fonts = HashMap::new();
+        let images = HashMap::new();
+        let glyphs = GlyphContext {
+            atlas: &atlas,
+            fonts: &fonts,
+            images: &images,
+            content: &HashMap::new(),
+        };
+        let clip = DeviceClip {
+            inv: Affine::translate(Vec2::new(-20.0, -20.0)),
+            shape: Shape::rect([10.0, 10.0]),
+            aligned_rect: Some(Rect::new(10.0, 10.0, 30.0, 30.0)),
+            mask: None,
+        };
+        let mut frame = Frame::default();
+        let mut lowering = Lowering::new(&mut frame, (64, 64));
+        lowering.begin_pass(Target::Surface, None);
+        lowering
+            .isolate(
+                Some(clip),
+                None,
+                1.0,
+                cherenkov::BlendMode::DestAtop,
+                |s, g| one_rect_body(s, g),
+                &glyphs,
+            )
+            .expect("clipped destructive isolate");
+        lowering.finish_pass();
+        let scratch = frame
+            .passes
+            .iter()
+            .find(|p| matches!(p.target, Target::Scratch(_)))
+            .expect("scratch pass");
+        assert_eq!(scratch.region, [9, 9, 22, 22]);
+        let composite = frame
+            .instances
+            .iter()
+            .find(|i| i.meta[1] == PAINT_TEXTURE)
+            .expect("the composite instance");
+        assert_eq!(composite.bounds, [9.0, 9.0, 31.0, 31.0]);
+        assert_ne!(
+            composite.meta[3] & (FLAG_HAS_CLIP << 24),
+            0,
+            "the composite carries the effective clip"
+        );
+    }
+
+    #[test]
+    fn is_destructive_lists_the_six_operators() {
+        use cherenkov::BlendMode as B;
+        let all = [
+            B::Normal,
+            B::Multiply,
+            B::Screen,
+            B::Overlay,
+            B::Darken,
+            B::Lighten,
+            B::ColorDodge,
+            B::ColorBurn,
+            B::HardLight,
+            B::SoftLight,
+            B::Difference,
+            B::Exclusion,
+            B::Hue,
+            B::Saturation,
+            B::Color,
+            B::Luminosity,
+            B::Clear,
+            B::Src,
+            B::Dst,
+            B::DestOver,
+            B::SrcIn,
+            B::DestIn,
+            B::SrcOut,
+            B::DestOut,
+            B::SrcAtop,
+            B::DestAtop,
+            B::Xor,
+            B::PlusLighter,
+        ];
+        let destructive: Vec<_> = all.into_iter().filter(|b| is_destructive(*b)).collect();
+        assert_eq!(
+            destructive,
+            [
+                B::Clear,
+                B::Src,
+                B::SrcIn,
+                B::DestIn,
+                B::SrcOut,
+                B::DestAtop
+            ]
+        );
     }
 
     /// A shadow whose negative spread collapses the shape's box emits no

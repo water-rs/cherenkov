@@ -102,6 +102,8 @@ pub enum ImageColorSpace {
     DisplayP3,
     /// Linear sRGB (extended values allowed).
     LinearSrgb,
+    /// Linear Display P3 — the working space; decoding is the identity.
+    LinearP3,
 }
 
 /// The data of an image to register, typed by its storage [`Format`].

@@ -81,7 +81,7 @@ impl BackdropEffect {
     /// pixel only; `Refraction` reaches `strength`; a shader reaches its
     /// registered `reach`.
     #[must_use]
-    pub fn reach(&self) -> f32 {
+    pub const fn reach(&self) -> f32 {
         match self {
             Self::Color(_) => 0.0,
             Self::Refraction(r) => r.strength,

@@ -852,7 +852,7 @@ impl Corpus {
         f: impl FnOnce(&mut LayerBuilder),
         blobs: Vec<Vec<u8>>,
     ) {
-        self.scene_headroom_blobs(name, w, h, clear, 1.0, f, blobs);
+        self.scene_from(name, Scene::builder(w, h).clear(clear), f, blobs);
     }
 
     /// `w`x`h` scene via `f` that asks `render --present` to tone-map to
@@ -866,20 +866,19 @@ impl Corpus {
         headroom: f64,
         f: impl FnOnce(&mut LayerBuilder),
     ) {
-        self.scene_headroom_blobs(name, w, h, clear, headroom, f, Vec::new());
+        let builder = Scene::builder(w, h).clear(clear).present_headroom(headroom);
+        self.scene_from(name, builder, f, Vec::new());
     }
 
-    fn scene_headroom_blobs(
+    /// Build a scene from a configured `builder` whose root layer is
+    /// drawn by `f`, and queue it with its image `blobs`.
+    fn scene_from(
         &mut self,
         name: impl Into<String>,
-        w: u32,
-        h: u32,
-        clear: Color,
-        headroom: f64,
+        mut builder: SceneBuilder,
         f: impl FnOnce(&mut LayerBuilder),
         blobs: Vec<Vec<u8>>,
     ) {
-        let mut builder = Scene::builder(w, h).clear(clear).present_headroom(headroom);
         {
             let mut root = builder.root();
             f(&mut root);
@@ -2501,12 +2500,11 @@ fn run() -> Result<(), SceneError> {
                 }
             },
         );
-        corpus.scene_headroom_blobs(
+        corpus.scene_from(
             format!("hdr-image-f16-{hname}"),
-            128,
-            128,
-            white,
-            headroom,
+            Scene::builder(128, 128)
+                .clear(white)
+                .present_headroom(headroom),
             |l| {
                 l.fill(
                     Shape::rect(8.0, 8.0, 112.0, 112.0),

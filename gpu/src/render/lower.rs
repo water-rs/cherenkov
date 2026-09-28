@@ -616,11 +616,13 @@ pub struct BackdropGroupInfo {
     pub footprint: Option<filtrate_core::Footprint>,
 }
 
-/// The per-region capture pass overhead expressed in captured pixels
-/// (copy + pass setup + filter dispatch ≈ that many pixels of work): the
-/// clustering cost model pays it per extra region.
-// measured in #117, see report
-const OVERHEAD_PX: u64 = 65_536;
+/// The per-region capture overhead in captured pixels: a separated pair
+/// merges only while its bounding box wastes fewer pixels than this.
+/// Measured on lavapipe (#117): frame GPU time fits
+/// `c + a·regions + b·pixels` with `a` indistinguishable from zero
+/// (at most ~123 px of work at σ = 8), so the threshold is that bound
+/// rounded up to a power of two.
+const OVERHEAD_PX: u64 = 128;
 
 /// Groups with more members than this use one union region: the O(n²)
 /// clustering pass is bounded, and the union is always a correct answer.

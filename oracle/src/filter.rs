@@ -8,12 +8,6 @@
 //! - the image blend operates on the input's unpremultiplied colour and the
 //!   sampled texel, then re-premultiplies with the unchanged input alpha.
 
-#![expect(
-    clippy::many_single_char_names,
-    clippy::suboptimal_flops,
-    reason = "names and operation order mirror the filter formulas"
-)]
-
 use cherenkov_scene::{FilterBlend, LayerFilter};
 
 use crate::shadow::gaussian_blur;
@@ -64,6 +58,11 @@ pub fn apply(
     }
 }
 
+#[expect(
+    clippy::many_single_char_names,
+    clippy::suboptimal_flops,
+    reason = "channel letters and the multiply-add order mirror the matrix-row formula"
+)]
 fn color_matrix(m: &[f64; 12], pixels: &mut [[f64; 4]]) {
     for p in pixels {
         let [r, g, b, a] = *p;
@@ -114,6 +113,10 @@ fn box_blur(radius: f64, pixels: &mut [[f64; 4]], width: usize, height: usize) {
     clippy::cast_precision_loss,
     reason = "texel indices are small non-negative values"
 )]
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "the amount interpolation mirrors the blend lerp definition"
+)]
 fn blend_image(
     image: &Texels,
     amount: f64,
@@ -143,6 +146,10 @@ fn blend_image(
     }
 }
 
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "operation order mirrors the separable blend-mode formulas"
+)]
 fn blend(mode: FilterBlend, base: [f64; 3], top: [f64; 3]) -> [f64; 3] {
     let each = |f: fn(f64, f64) -> f64| std::array::from_fn(|c| f(base[c], top[c]));
     match mode {
@@ -172,6 +179,10 @@ fn blend(mode: FilterBlend, base: [f64; 3], top: [f64; 3]) -> [f64; 3] {
 }
 
 /// `2·b·t` where `b < ½`, else `1 − 2(1 − b)(1 − t)`.
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "operation order mirrors the formula in the doc comment"
+)]
 fn overlay(b: f64, t: f64) -> f64 {
     if b < 0.5 {
         2.0 * b * t
@@ -188,6 +199,10 @@ fn hsl_mix(base: [f64; 3], top: [f64; 3], take: [bool; 3]) -> [f64; 3] {
 
 /// The hexcone HSL model; hue in `0..1`.
 #[expect(clippy::float_cmp, reason = "exact channel ties select the hue sector")]
+#[expect(
+    clippy::many_single_char_names,
+    reason = "r, g, b and the derived h, s, l are the hexcone channel names"
+)]
 fn rgb_to_hsl([r, g, b]: [f64; 3]) -> [f64; 3] {
     let max = r.max(g).max(b);
     let min = r.min(g).min(b);
@@ -211,6 +226,11 @@ fn rgb_to_hsl([r, g, b]: [f64; 3]) -> [f64; 3] {
     [h / 6.0, s, l]
 }
 
+#[expect(
+    clippy::many_single_char_names,
+    clippy::suboptimal_flops,
+    reason = "h, s, l, p, q and t are the hexcone-model names and the operation order mirrors the conversion"
+)]
 fn hsl_to_rgb([h, s, l]: [f64; 3]) -> [f64; 3] {
     if s == 0.0 {
         return [l; 3];
@@ -288,6 +308,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "the tolerance is spelled as relative-plus-absolute, not fused"
+    )]
     fn image_blend_unpremultiplies_and_preserves_transparent_pixels() {
         let alpha = 1.0e-8;
         let colour = [0.6, 0.1, 0.1];

@@ -19,9 +19,9 @@ use cherenkov_scene::kurbo::{
 };
 use cherenkov_scene::{
     BlendMode, Color, ColorSpace, Draw, Extend, FillRule, Glyph, GlyphRun, GradientStop,
-    ImagePaint, LayerBuilder, LinearGradient, Live, Motion, MotionAnimation, NormalizedCoord,
-    Paint, RadialGradient, ResourceHash, Sampling, Scene, SceneError, Shape, StrokeStyle,
-    SweepGradient,
+    ImageColorSpace, ImageEncoding, ImagePaint, LayerBuilder, LinearGradient, Live, Motion,
+    MotionAnimation, NormalizedCoord, Paint, RadialGradient, ResourceHash, Sampling, Scene,
+    SceneError, Shape, StrokeStyle, SweepGradient,
 };
 use fontique::FontWeight;
 use parley::{
@@ -209,6 +209,16 @@ fn font_blob<'a>(ctx: &'a TextContext, run: &'a GlyphRun) -> &'a Vec<u8> {
     &ctx.blobs[&run.font]
 }
 
+/// A colour in the linear Display P3 working space (wide gamut).
+const fn p3(r: f32, g: f32, b: f32) -> Color {
+    Color::new(ColorSpace::LinearP3, [r, g, b, 1.0])
+}
+
+/// An HDR colour in the linear Display P3 working space (channels > 1).
+const fn hdr(r: f32, g: f32, b: f32) -> Color {
+    Color::new(ColorSpace::LinearP3, [r, g, b, 1.0])
+}
+
 fn encode_png_rgba(width: u32, height: u32, pixels: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     {
@@ -245,6 +255,44 @@ fn gradient_png() -> Vec<u8> {
         }
     }
     encode_png_rgba(16, 16, &px)
+}
+
+/// A `w`×`h` PNG whose bytes are sRGB-transfer-encoded Display P3 values:
+/// a ramp from P3 red through P3 green (both outside the sRGB gamut).
+fn p3_png(w: u32, h: u32) -> Vec<u8> {
+    let mut px = Vec::with_capacity(w as usize * h as usize * 4);
+    for y in 0..h {
+        for x in 0..w {
+            let t = x as f32 / (w - 1).max(1) as f32;
+            let v = y as f32 / (h - 1).max(1) as f32;
+            // Linear P3 red→green horizontally, darkened vertically.
+            let lin = [1.0 - t, t, v];
+            for c in lin {
+                let e = if c <= 0.003_130_8 {
+                    c * 12.92
+                } else {
+                    1.055 * c.powf(1.0 / 2.4) - 0.055
+                };
+                px.push((e.clamp(0.0, 1.0) * 255.0).round() as u8);
+            }
+            px.push(255);
+        }
+    }
+    encode_png_rgba(w, h, &px)
+}
+
+/// A `w`×`h` `Rgba16F` blob in linear Display P3 (straight alpha) filled by
+/// `f(x, y) -> [r, g, b, a]` in `f32` linear light.
+fn rgba16f_blob(w: u32, h: u32, f: impl Fn(u32, u32) -> [f32; 4]) -> Vec<u8> {
+    let mut blob = Vec::with_capacity(w as usize * h as usize * 8);
+    for y in 0..h {
+        for x in 0..w {
+            for c in f(x, y) {
+                blob.extend_from_slice(&half::f16::from_f32(c).to_le_bytes());
+            }
+        }
+    }
+    blob
 }
 
 /// A self-intersecting figure-eight-ish cubic path.
@@ -1161,6 +1209,390 @@ fn run() -> Result<(), SceneError> {
         },
     );
 
+    // ---- Wide gamut (linear P3) and HDR ------------------------------------
+    //
+    // A `-p3` sibling of each feature family draws the same geometry with
+    // colours outside the sRGB gamut; a `-hdr` sibling uses linear-P3
+    // colours with channels reaching 16.0.
+
+    corpus.scene("fill-p3", 96, 96, white, |l| {
+        l.fill(Shape::rect(8.0, 8.0, 48.0, 48.0), solid(p3(0.0, 1.0, 0.0)));
+        l.fill(
+            Shape::rect(40.0, 40.0, 48.0, 48.0),
+            solid(Color::new(ColorSpace::LinearP3, [1.0, 0.0, 0.6, 0.7])),
+        );
+    });
+    corpus.scene("fill-hdr", 96, 96, white, |l| {
+        l.fill(
+            Shape::rect(8.0, 8.0, 48.0, 48.0),
+            solid(hdr(16.0, 16.0, 16.0)),
+        );
+        l.fill(
+            Shape::rect(40.0, 40.0, 48.0, 48.0),
+            solid(Color::new(ColorSpace::LinearP3, [16.0, 2.0, 0.5, 0.7])),
+        );
+    });
+
+    corpus.scene("stroke-p3", 128, 128, white, |l| {
+        for (i, w) in [1.0, 3.0, 8.0].iter().enumerate() {
+            let y = (i as f64).mul_add(40.0, 24.0);
+            l.stroke(
+                Shape::Line(Line::new((12.0, y), (116.0, y))),
+                StrokeStyle {
+                    width: *w,
+                    ..StrokeStyle::default()
+                },
+                solid(p3(0.0, 1.0, 1.0)),
+            );
+        }
+    });
+    corpus.scene("stroke-hdr", 128, 128, white, |l| {
+        for (i, w) in [1.0, 3.0, 8.0].iter().enumerate() {
+            let y = (i as f64).mul_add(40.0, 24.0);
+            l.stroke(
+                Shape::Line(Line::new((12.0, y), (116.0, y))),
+                StrokeStyle {
+                    width: *w,
+                    ..StrokeStyle::default()
+                },
+                solid(hdr(16.0, 16.0, 16.0)),
+            );
+        }
+    });
+
+    corpus.scene("stroke-dash-p3", 128, 128, white, |l| {
+        l.stroke(
+            Shape::Path {
+                path: curved_path(),
+            },
+            StrokeStyle {
+                width: 3.0,
+                dash_pattern: vec![8.0, 4.0, 2.0, 4.0],
+                dash_offset: 2.0,
+                ..StrokeStyle::default()
+            },
+            solid(p3(1.0, 0.0, 0.6)),
+        );
+    });
+    corpus.scene("stroke-dash-hdr", 128, 128, white, |l| {
+        l.stroke(
+            Shape::Path {
+                path: curved_path(),
+            },
+            StrokeStyle {
+                width: 3.0,
+                dash_pattern: vec![8.0, 4.0, 2.0, 4.0],
+                dash_offset: 2.0,
+                ..StrokeStyle::default()
+            },
+            solid(hdr(0.0, 8.0, 16.0)),
+        );
+    });
+
+    // Gradient stops crossing the sRGB boundary (p3) or the [0,1] range
+    // (hdr); both interpolate in the working space.
+    let stops_p3 = vec![
+        GradientStop {
+            offset: 0.0,
+            color: srgb(0.2, 0.4, 0.9),
+        },
+        GradientStop {
+            offset: 0.35,
+            color: p3(0.0, 1.0, 1.0),
+        },
+        GradientStop {
+            offset: 0.7,
+            color: p3(0.0, 1.0, 0.0),
+        },
+        GradientStop {
+            offset: 1.0,
+            color: p3(1.0, 0.0, 0.6),
+        },
+    ];
+    let stops_hdr = vec![
+        GradientStop {
+            offset: 0.0,
+            color: hdr(0.5, 0.5, 0.5),
+        },
+        GradientStop {
+            offset: 0.35,
+            color: hdr(4.0, 16.0, 1.0),
+        },
+        GradientStop {
+            offset: 0.7,
+            color: hdr(16.0, 16.0, 16.0),
+        },
+        GradientStop {
+            offset: 1.0,
+            color: hdr(16.0, 2.0, 0.5),
+        },
+    ];
+    for (suffix, stops) in [("p3", stops_p3), ("hdr", stops_hdr)] {
+        corpus.scene(format!("grad-linear-{suffix}"), 128, 128, white, |l| {
+            l.fill(
+                gradient_rect.clone(),
+                Paint::Linear(LinearGradient {
+                    start: Point::new(32.0, 48.0),
+                    end: Point::new(96.0, 80.0),
+                    stops: stops.clone(),
+                    extend: Extend::Pad,
+                    interpolation: ColorSpace::LinearP3,
+                }),
+            );
+        });
+        corpus.scene(format!("grad-radial-{suffix}"), 128, 128, white, |l| {
+            l.fill(
+                gradient_rect.clone(),
+                Paint::Radial(RadialGradient {
+                    center0: Point::new(64.0, 64.0),
+                    r0: 8.0,
+                    center1: Point::new(80.0, 72.0),
+                    r1: 40.0,
+                    stops: stops.clone(),
+                    extend: Extend::Pad,
+                    interpolation: ColorSpace::LinearP3,
+                }),
+            );
+        });
+        corpus.scene(format!("grad-sweep-{suffix}"), 128, 128, white, |l| {
+            l.fill(
+                gradient_rect.clone(),
+                Paint::Sweep(SweepGradient {
+                    center: Point::new(64.0, 64.0),
+                    start_angle: 0.0,
+                    end_angle: 1.6 * std::f64::consts::PI,
+                    stops: stops.clone(),
+                    extend: Extend::Pad,
+                    interpolation: ColorSpace::LinearP3,
+                }),
+            );
+        });
+    }
+
+    // Images in wide-gamut and half-float encodings. The P3 PNG carries
+    // Display-P3-encoded bytes; the f16 blobs are linear P3 straight alpha
+    // with a radial ramp to 16.0 and some alpha < 1 texels.
+    let p3_img = p3_png(32, 32);
+    let f16_img = rgba16f_blob(32, 32, |x, y| {
+        let dx = x as f32 - 15.5;
+        let dy = y as f32 - 15.5;
+        let d = (dx * dx + dy * dy).sqrt() / 16.0;
+        let v = (1.0 - d.min(1.0)) * 16.0;
+        [v, v * 0.5, 16.0 - v, if x < 8 { 0.5 } else { 1.0 }]
+    });
+    let f16_encoding = ImageEncoding::Rgba16F {
+        width: 32,
+        height: 32,
+        color_space: ImageColorSpace::LinearP3,
+    };
+
+    corpus.scene_with_blobs(
+        "img-p3",
+        96,
+        96,
+        white,
+        |l| {
+            l.image_encoded(
+                ResourceHash::of(&p3_img),
+                ImageEncoding::Png {
+                    color_space: ImageColorSpace::DisplayP3,
+                },
+                Rect::new(12.0, 12.0, 84.0, 84.0),
+                Sampling::Bilinear,
+            );
+        },
+        vec![p3_img.clone()],
+    );
+    corpus.scene_with_blobs(
+        "img-f16-hdr",
+        96,
+        96,
+        white,
+        |l| {
+            l.image_encoded(
+                ResourceHash::of(&f16_img),
+                f16_encoding,
+                Rect::new(12.0, 12.0, 84.0, 84.0),
+                Sampling::Bilinear,
+            );
+        },
+        vec![f16_img.clone()],
+    );
+    corpus.scene_with_blobs(
+        "imgpattern-p3",
+        128,
+        128,
+        white,
+        |l| {
+            l.fill(
+                Shape::rounded_rect(8.0, 8.0, 112.0, 112.0, 16.0),
+                Paint::Image(ImagePaint {
+                    image: ResourceHash::of(&p3_img),
+                    encoding: ImageEncoding::Png {
+                        color_space: ImageColorSpace::DisplayP3,
+                    },
+                    transform: Affine::translate((40.0, 40.0)) * Affine::scale(4.0),
+                    extend_x: Extend::Repeat,
+                    extend_y: Extend::Repeat,
+                    sampling: Sampling::Bilinear,
+                }),
+            );
+        },
+        vec![p3_img.clone()],
+    );
+    corpus.scene_with_blobs(
+        "imgpattern-f16-hdr",
+        128,
+        128,
+        white,
+        |l| {
+            l.fill(
+                Shape::rounded_rect(8.0, 8.0, 112.0, 112.0, 16.0),
+                Paint::Image(ImagePaint {
+                    image: ResourceHash::of(&f16_img),
+                    encoding: f16_encoding,
+                    transform: Affine::translate((40.0, 40.0)) * Affine::scale(4.0),
+                    extend_x: Extend::Repeat,
+                    extend_y: Extend::Repeat,
+                    sampling: Sampling::Bilinear,
+                }),
+            );
+        },
+        vec![f16_img.clone()],
+    );
+
+    // Blend modes over P3 and HDR content, same geometry as `blend-*`.
+    for mode in BlendMode::ALL {
+        let mname = serde_json::to_value(mode)
+            .expect("blend mode serializes")
+            .as_str()
+            .expect("blend mode name is a string")
+            .to_owned();
+        corpus.scene(
+            format!("blend-{mname}-p3"),
+            96,
+            96,
+            srgb(0.7, 0.5, 0.2),
+            |l| {
+                l.fill(
+                    Shape::rect(0.0, 0.0, 96.0, 96.0),
+                    Paint::Linear(LinearGradient {
+                        start: Point::new(0.0, 0.0),
+                        end: Point::new(96.0, 96.0),
+                        stops: vec![
+                            GradientStop {
+                                offset: 0.0,
+                                color: p3(1.0, 0.0, 0.6),
+                            },
+                            GradientStop {
+                                offset: 1.0,
+                                color: p3(0.0, 1.0, 1.0),
+                            },
+                        ],
+                        extend: Extend::Pad,
+                        interpolation: ColorSpace::LinearP3,
+                    }),
+                );
+                l.layer(|a| {
+                    a.blend(mode);
+                    a.fill(
+                        Shape::circle(48.0, 48.0, 34.0),
+                        Paint::Linear(LinearGradient {
+                            start: Point::new(14.0, 14.0),
+                            end: Point::new(82.0, 82.0),
+                            stops: vec![
+                                GradientStop {
+                                    offset: 0.0,
+                                    color: p3(0.0, 1.0, 0.0),
+                                },
+                                GradientStop {
+                                    offset: 1.0,
+                                    color: p3(1.0, 0.0, 0.0),
+                                },
+                            ],
+                            extend: Extend::Pad,
+                            interpolation: ColorSpace::LinearP3,
+                        }),
+                    );
+                });
+            },
+        );
+        corpus.scene(
+            format!("blend-{mname}-hdr"),
+            96,
+            96,
+            srgb(0.7, 0.5, 0.2),
+            |l| {
+                l.fill(
+                    Shape::rect(0.0, 0.0, 96.0, 96.0),
+                    Paint::Linear(LinearGradient {
+                        start: Point::new(0.0, 0.0),
+                        end: Point::new(96.0, 96.0),
+                        stops: vec![
+                            GradientStop {
+                                offset: 0.0,
+                                color: hdr(16.0, 2.0, 0.5),
+                            },
+                            GradientStop {
+                                offset: 1.0,
+                                color: hdr(0.0, 8.0, 16.0),
+                            },
+                        ],
+                        extend: Extend::Pad,
+                        interpolation: ColorSpace::LinearP3,
+                    }),
+                );
+                l.layer(|a| {
+                    a.blend(mode);
+                    a.fill(
+                        Shape::circle(48.0, 48.0, 34.0),
+                        Paint::Linear(LinearGradient {
+                            start: Point::new(14.0, 14.0),
+                            end: Point::new(82.0, 82.0),
+                            stops: vec![
+                                GradientStop {
+                                    offset: 0.0,
+                                    color: hdr(4.0, 16.0, 1.0),
+                                },
+                                GradientStop {
+                                    offset: 1.0,
+                                    color: hdr(16.0, 16.0, 16.0),
+                                },
+                            ],
+                            extend: Extend::Pad,
+                            interpolation: ColorSpace::LinearP3,
+                        }),
+                    );
+                });
+            },
+        );
+    }
+
+    corpus.scene("shadow-p3", 128, 128, dark, |l| {
+        l.shadow(
+            Shape::rounded_rect(32.0, 32.0, 64.0, 64.0, 12.0),
+            5.0,
+            [0.0, 0.0],
+            Color::new(ColorSpace::LinearP3, [0.0, 0.5, 0.0, 0.8]),
+        );
+        l.fill(
+            Shape::rounded_rect(32.0, 32.0, 64.0, 64.0, 12.0),
+            solid(p3(1.0, 0.0, 0.0)),
+        );
+    });
+    corpus.scene("shadow-hdr", 128, 128, dark, |l| {
+        l.shadow(
+            Shape::rounded_rect(32.0, 32.0, 64.0, 64.0, 12.0),
+            5.0,
+            [0.0, 0.0],
+            Color::new(ColorSpace::LinearP3, [8.0, 8.0, 8.0, 0.8]),
+        );
+        l.fill(
+            Shape::rounded_rect(32.0, 32.0, 64.0, 64.0, 12.0),
+            solid(hdr(4.0, 16.0, 1.0)),
+        );
+    });
+
     // ---- Text ----------------------------------------------------------------
 
     let text_specs: &[(&str, &str, &str, f32)] = &[
@@ -1183,6 +1615,53 @@ fn run() -> Result<(), SceneError> {
         let blobs: Vec<Vec<u8>> = runs.iter().map(|r| font_blob(&ctx, r).clone()).collect();
         corpus.scene_with_blobs(
             *name,
+            320,
+            160,
+            white,
+            |l| {
+                for run in &runs {
+                    l.glyphs(run.clone());
+                }
+            },
+            blobs,
+        );
+    }
+
+    // Wide-gamut and HDR text: the same Latin sheet and the COLR glyphs
+    // drawn with linear-P3 paints.
+    for (name, paint) in [
+        ("text-p3", solid(p3(0.0, 1.0, 0.0))),
+        ("text-hdr", solid(hdr(16.0, 2.0, 0.5))),
+    ] {
+        let runs = ctx.shape(
+            "NotoSans.ttf",
+            corpus::LATIN,
+            30.0,
+            FontWeight::NORMAL,
+            &paint,
+        );
+        let blobs: Vec<Vec<u8>> = runs.iter().map(|r| font_blob(&ctx, r).clone()).collect();
+        corpus.scene_with_blobs(
+            name,
+            320,
+            160,
+            white,
+            |l| {
+                for run in &runs {
+                    l.glyphs(run.clone());
+                }
+            },
+            blobs,
+        );
+    }
+    for (name, paint) in [
+        ("text-colr-p3", solid(p3(0.0, 1.0, 1.0))),
+        ("text-colr-hdr", solid(hdr(4.0, 16.0, 1.0))),
+    ] {
+        let runs = ctx.shape("Nabla.ttf", corpus::COLR, 64.0, FontWeight::NORMAL, &paint);
+        let blobs: Vec<Vec<u8>> = runs.iter().map(|r| font_blob(&ctx, r).clone()).collect();
+        corpus.scene_with_blobs(
+            name,
             320,
             160,
             white,
@@ -1321,6 +1800,7 @@ fn run() -> Result<(), SceneError> {
             extend_x: Extend::Repeat,
             extend_y: Extend::Repeat,
             sampling: Sampling::Bilinear,
+            encoding: ImageEncoding::default(),
         });
         let text = "\u{e300} \u{e301}";
         let runs = ctx.shape(colr_font, text, 52.0, FontWeight::NORMAL, &fg);

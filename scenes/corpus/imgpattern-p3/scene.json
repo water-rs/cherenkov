@@ -1,0 +1,83 @@
+{
+  "width": 128,
+  "height": 128,
+  "working_space": "linear-display-p3",
+  "clear": {
+    "space": "srgb",
+    "components": [
+      0.95,
+      0.95,
+      0.95,
+      1.0
+    ]
+  },
+  "features": [
+    {
+      "feature": "fill"
+    },
+    {
+      "feature": "image-paint"
+    },
+    {
+      "feature": "image-color-space",
+      "value": "display-p3"
+    }
+  ],
+  "root": {
+    "transform": [
+      1.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0
+    ],
+    "opacity": 1.0,
+    "blend": "normal",
+    "items": [
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rounded-rect": {
+                "rect": {
+                  "x0": 8.0,
+                  "y0": 8.0,
+                  "x1": 120.0,
+                  "y1": 120.0
+                },
+                "radii": {
+                  "top_left": 16.0,
+                  "top_right": 16.0,
+                  "bottom_right": 16.0,
+                  "bottom_left": 16.0
+                }
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "image": {
+                "image": "7b9800d3dc0ad5b0d7f64d62633dd3c71f275645e7378849b012ac7566bbcd64",
+                "encoding": {
+                  "encoding": "png",
+                  "color_space": "display-p3"
+                },
+                "transform": [
+                  4.0,
+                  0.0,
+                  0.0,
+                  4.0,
+                  40.0,
+                  40.0
+                ],
+                "extend_x": "repeat",
+                "extend_y": "repeat",
+                "sampling": "bilinear"
+              }
+            }
+          }
+        }
+      }
+    ]
+  }
+}

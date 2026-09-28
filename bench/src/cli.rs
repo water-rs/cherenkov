@@ -929,6 +929,9 @@ fn render_scene(
     engine.encode(&input)?;
     let submit = engine.submit(0, true)?;
     let steady_memory = MemorySnapshot::capture(engine.memory(), SampleDetail::Full);
+    // Counters embed a memory snapshot; take them at steady state,
+    // before retirement shrinks what the engine reports.
+    let counters = engine.counters();
     // #169 A5: the post-retirement observation follows the engine's
     // explicit retirement pass, after the window and its submission.
     engine.trim()?;
@@ -953,7 +956,7 @@ fn render_scene(
                 headroom: scene.present_headroom,
             }),
             metrics: metrics_v,
-            counters: engine.counters(),
+            counters,
             memory: MemoryReport::new(
                 idle_memory,
                 &[prepare_memory, steady_memory],
@@ -1225,6 +1228,9 @@ fn measure_scene(
     // The steady snapshot lands after the pacing window and the meter
     // close, so its capture is never charged to a measured frame.
     let steady_memory = MemorySnapshot::capture(engine.memory(), SampleDetail::Full);
+    // Counters embed a memory snapshot; take them at steady state,
+    // before retirement shrinks what the engine reports.
+    let counters = engine.counters();
     // #169 A5: retire, then take the post-retirement observation.
     engine.trim()?;
     let post_retire_memory = MemorySnapshot::capture(engine.memory(), SampleDetail::Full);
@@ -1268,7 +1274,7 @@ fn measure_scene(
         pacing,
         energy: energy_outcome.map(|o| o.report),
         conditions,
-        counters: engine.counters(),
+        counters,
         memory: MemoryReport::new(idle_memory, &memory_samples, Some(post_retire_memory)),
         device: engine.device(),
     })

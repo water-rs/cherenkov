@@ -263,6 +263,9 @@ pub struct Atlas {
     mask_budget: u64,
     /// Sum of cell texels, an approximation of the CPU cache size.
     cpu_bytes: u64,
+    /// Upload assembly scratch for [`Self::upload_committed`]: the span
+    /// buffer is rebuilt in place each commit instead of reallocated.
+    upload_scratch: Vec<u8>,
 }
 
 impl Atlas {
@@ -300,6 +303,7 @@ impl Atlas {
             mask_texture_gen: 0,
             mask_budget: budget / 16,
             cpu_bytes: 0,
+            upload_scratch: Vec::new(),
         }
     }
 
@@ -407,12 +411,15 @@ impl Atlas {
     /// claimed spans — and no full-size CPU shadow of the atlas is
     /// kept to assemble them (#169 A3).
     pub fn upload_committed(
-        &self,
+        &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         bounds: &[u32],
         cells: &[CellWrite],
     ) {
+        if cells.is_empty() {
+            return;
+        }
         let mut buckets: Vec<Vec<&CellWrite>> = vec![Vec::new(); self.shelves.len()];
         for cell in cells {
             buckets[cell.shelf].push(cell);
@@ -423,16 +430,29 @@ impl Atlas {
                 continue;
             }
             let (w, h) = (shelf.x - x0, shelf.h);
-            let mut data = vec![0u8; (w * h) as usize];
-            for cell in &buckets[i] {
-                let xo = (cell.x - x0) as usize;
-                let yo = (cell.y - shelf.y) as usize;
-                for (row, line) in cell.texels.chunks_exact(cell.w as usize).enumerate() {
-                    let dst = (yo + row) * w as usize + xo;
-                    data[dst..dst + cell.w as usize].copy_from_slice(line);
-                }
+            // One cell that fills the whole new span uploads its own
+            // texels without assembly.
+            let single = match buckets[i].as_slice() {
+                [cell] if cell.x == x0 && cell.w == w && cell.h == h => Some(cell),
+                _ => None,
+            };
+            let data: &[u8] = if let Some(cell) = single {
                 crate::diag::atlas_cell(device, (cell.x, cell.y, cell.w, cell.h));
-            }
+                cell.texels.as_slice()
+            } else {
+                self.upload_scratch.clear();
+                self.upload_scratch.resize((w * h) as usize, 0);
+                for cell in &buckets[i] {
+                    let xo = (cell.x - x0) as usize;
+                    let yo = (cell.y - shelf.y) as usize;
+                    for (row, line) in cell.texels.chunks_exact(cell.w as usize).enumerate() {
+                        let dst = (yo + row) * w as usize + xo;
+                        self.upload_scratch[dst..dst + cell.w as usize].copy_from_slice(line);
+                    }
+                    crate::diag::atlas_cell(device, (cell.x, cell.y, cell.w, cell.h));
+                }
+                &self.upload_scratch
+            };
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &self.texture,
@@ -444,7 +464,7 @@ impl Atlas {
                     },
                     aspect: wgpu::TextureAspect::All,
                 },
-                &data,
+                data,
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(w),

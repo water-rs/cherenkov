@@ -126,25 +126,8 @@ pub enum Item {
     /// Capture the rows a backdrop group's members can sample: flatten
     /// the trailing `flatten` clip-only isolation levels over the nearest
     /// semantic level's contents and run the group's chain on the copy.
-    Capture {
-        /// The group's renderer key (`BackdropId::raw()`).
-        group: u64,
-        /// The capture rect in device pixels (`union ⊕ apron`, clamped to
-        /// the surface).
-        region: IRect,
-        /// The members' union rows, clamped to the surface.
-        union: IRect,
-        /// The apron rows the chain reads past the sampled rows.
-        apron: usize,
-        /// Extra rows around each band the capture covers: the deepest
-        /// enclosing filter-scope apron over the group's members.
-        reach: usize,
-        /// The prepared chain, when the group is filtered.
-        filter: Option<FrameFilter>,
-        /// Clip-only isolation levels on the stack flattened over the
-        /// nearest semantic level.
-        flatten: usize,
-    },
+    /// Boxed: a capture is rare and large — it must not grow `Item`.
+    Capture(Box<CaptureItem>),
     /// Sample a group's captured backdrop as a member's bottom-most
     /// content, inside the member's clip, over `bounds`.
     Sample {
@@ -157,6 +140,28 @@ pub enum Item {
         /// What the sample becomes once composited.
         effect: SampleEffect,
     },
+}
+
+/// The capture item's payload, boxed inside [`Item::Capture`].
+#[derive(Clone)]
+pub struct CaptureItem {
+    /// The group's renderer key (`BackdropId::raw()`).
+    pub group: u64,
+    /// The capture rect in device pixels (`union ⊕ apron`, clamped to
+    /// the surface).
+    pub region: IRect,
+    /// The members' union rows, clamped to the surface.
+    pub union: IRect,
+    /// The apron rows the chain reads past the sampled rows.
+    pub apron: usize,
+    /// Extra rows around each band the capture covers: the deepest
+    /// enclosing filter-scope apron over the group's members.
+    pub reach: usize,
+    /// The prepared chain, when the group is filtered.
+    pub filter: Option<FrameFilter>,
+    /// Clip-only isolation levels on the stack flattened over the
+    /// nearest semantic level.
+    pub flatten: usize,
 }
 
 /// How a backdrop sample composites into the member's layer. Only the
@@ -955,7 +960,7 @@ impl<'a> Lowering<'a> {
             let reach = plan.reach;
             let filter = plan.filter.clone();
             let flatten = self.iso_kinds.iter().rev().take_while(|&&k| k).count();
-            self.items.push(Item::Capture {
+            self.items.push(Item::Capture(Box::new(CaptureItem {
                 group: gid,
                 region,
                 union: IRect {
@@ -983,7 +988,7 @@ impl<'a> Lowering<'a> {
                 reach,
                 filter,
                 flatten,
-            });
+            })));
         }
         let outer = self.clip.clone();
         let result = self.with_clip(node.clip.as_ref(), |s| {
@@ -1411,3 +1416,4 @@ impl<'a> Lowering<'a> {
         Ok(())
     }
 }
+

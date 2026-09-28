@@ -64,6 +64,83 @@ const fn hdr(r: f32, g: f32, b: f32) -> Color {
     Color::new(ColorSpace::LinearP3, [r, g, b, 1.0])
 }
 
+#[derive(Clone, Copy)]
+struct FilterColorSet {
+    gradient_space: ColorSpace,
+    gradient_start: Color,
+    gradient_end: Color,
+    matrix_circle: Color,
+    matrix_rounded_rect: Color,
+    blur_rect: Color,
+    blur_circle: Color,
+    blur_star: Color,
+    blur_stroke: Color,
+    blend_round_rect: Color,
+    blend_circle: Color,
+    blend_rect: Color,
+    nested_blue: Color,
+    nested_red: Color,
+    blended_descendant: Color,
+    nested_blend_outer: Color,
+}
+
+const FILTER_COLORS_SRGB: FilterColorSet = FilterColorSet {
+    gradient_space: ColorSpace::Srgb,
+    gradient_start: srgb(1.0, 0.0, 0.0),
+    gradient_end: srgb(0.0, 0.0, 1.0),
+    matrix_circle: srgb(0.15, 0.8, 0.28),
+    matrix_rounded_rect: srgb(0.18, 0.3, 0.9),
+    blur_rect: srgb(0.9, 0.15, 0.12),
+    blur_circle: srgb(0.12, 0.35, 0.9),
+    blur_star: srgb(0.95, 0.65, 0.08),
+    blur_stroke: srgb(0.12, 0.62, 0.24),
+    blend_round_rect: srgba(0.92, 0.18, 0.22, 0.72),
+    blend_circle: srgba(0.1, 0.75, 0.88, 0.68),
+    blend_rect: srgba(0.74, 0.24, 0.82, 0.66),
+    nested_blue: srgb(0.12, 0.32, 0.9),
+    nested_red: srgb(0.9, 0.24, 0.12),
+    blended_descendant: Color::new(ColorSpace::DisplayP3, [0.0, 0.85, 0.3, 1.0]),
+    nested_blend_outer: Color::new(ColorSpace::LinearSrgb, [2.0, 0.3, 0.1, 1.0]),
+};
+
+const FILTER_COLORS_P3: FilterColorSet = FilterColorSet {
+    gradient_space: ColorSpace::LinearP3,
+    gradient_start: p3(1.0, 0.0, 0.0),
+    gradient_end: p3(0.0, 1.0, 0.0),
+    matrix_circle: p3(0.0, 1.0, 0.0),
+    matrix_rounded_rect: p3(0.0, 0.0, 1.0),
+    blur_rect: p3(1.0, 0.0, 0.0),
+    blur_circle: p3(0.0, 1.0, 0.0),
+    blur_star: p3(0.0, 0.0, 1.0),
+    blur_stroke: p3(0.0, 1.0, 0.0),
+    blend_round_rect: p3(1.0, 0.0, 0.0).with_alpha(0.72),
+    blend_circle: p3(0.0, 1.0, 0.0).with_alpha(0.68),
+    blend_rect: p3(0.0, 0.0, 1.0).with_alpha(0.66),
+    nested_blue: p3(0.0, 0.0, 1.0),
+    nested_red: p3(1.0, 0.0, 0.0),
+    blended_descendant: p3(0.0, 1.0, 0.0),
+    nested_blend_outer: p3(1.0, 0.0, 0.0),
+};
+
+const FILTER_COLORS_HDR: FilterColorSet = FilterColorSet {
+    gradient_space: ColorSpace::LinearP3,
+    gradient_start: hdr(7.0, 2.0, 0.2),
+    gradient_end: hdr(0.2, 5.0, 7.0),
+    matrix_circle: hdr(2.0, 6.0, 1.0),
+    matrix_rounded_rect: hdr(2.0, 1.0, 7.0),
+    blur_rect: hdr(6.0, 2.0, 1.0),
+    blur_circle: hdr(0.5, 3.0, 7.0),
+    blur_star: hdr(5.0, 4.0, 0.5),
+    blur_stroke: hdr(1.0, 4.0, 2.0),
+    blend_round_rect: hdr(7.0, 2.0, 1.0).with_alpha(0.72),
+    blend_circle: hdr(0.5, 6.0, 7.0).with_alpha(0.68),
+    blend_rect: hdr(5.0, 1.0, 6.0).with_alpha(0.66),
+    nested_blue: hdr(1.0, 2.0, 7.0),
+    nested_red: hdr(7.0, 2.0, 1.0),
+    blended_descendant: hdr(1.0, 6.0, 1.5),
+    nested_blend_outer: hdr(7.0, 2.0, 1.0),
+};
+
 fn stops2() -> Vec<GradientStop> {
     vec![
         GradientStop {
@@ -454,41 +531,41 @@ fn filter_image_png() -> Vec<u8> {
     encode_png_rgba(128, 128, &px)
 }
 
-fn filter_color_content(l: &mut LayerBuilder<'_>) {
+fn filter_color_content(l: &mut LayerBuilder<'_>, colors: &FilterColorSet) {
     l.fill(
         Shape::rect(20.0, 20.0, 108.0, 108.0),
         Paint::Linear(LinearGradient {
             start: Point::new(24.0, 28.0),
             end: Point::new(104.0, 100.0),
-            stops: stops2(),
+            stops: vec![
+                GradientStop {
+                    offset: 0.0,
+                    color: colors.gradient_start,
+                },
+                GradientStop {
+                    offset: 1.0,
+                    color: colors.gradient_end,
+                },
+            ],
             extend: Extend::Pad,
-            interpolation: ColorSpace::Srgb,
+            interpolation: colors.gradient_space,
         }),
     );
-    l.fill(
-        Shape::circle(48.0, 64.0, 16.0),
-        solid(srgb(0.15, 0.8, 0.28)),
-    );
+    l.fill(Shape::circle(48.0, 64.0, 16.0), solid(colors.matrix_circle));
     l.fill(
         Shape::rounded_rect(68.0, 40.0, 96.0, 88.0, 6.0),
-        solid(srgb(0.18, 0.3, 0.9)),
+        solid(colors.matrix_rounded_rect),
     );
 }
 
-fn filter_blur_content(l: &mut LayerBuilder<'_>) {
-    l.fill(
-        Shape::rect(30.0, 30.0, 68.0, 68.0),
-        solid(srgb(0.9, 0.15, 0.12)),
-    );
-    l.fill(
-        Shape::circle(84.0, 48.0, 18.0),
-        solid(srgb(0.12, 0.35, 0.9)),
-    );
+fn filter_blur_content(l: &mut LayerBuilder<'_>, colors: &FilterColorSet) {
+    l.fill(Shape::rect(30.0, 30.0, 68.0, 68.0), solid(colors.blur_rect));
+    l.fill(Shape::circle(84.0, 48.0, 18.0), solid(colors.blur_circle));
     l.fill(
         Shape::Path {
             path: star_path(68.0, 78.0, 8.0, 18.0),
         },
-        solid(srgb(0.95, 0.65, 0.08)),
+        solid(colors.blur_star),
     );
     l.stroke(
         Shape::Line(Line::new((30.0, 96.0), (98.0, 96.0))),
@@ -496,23 +573,69 @@ fn filter_blur_content(l: &mut LayerBuilder<'_>) {
             width: 1.0,
             ..StrokeStyle::default()
         },
-        solid(srgb(0.12, 0.62, 0.24)),
+        solid(colors.blur_stroke),
     );
 }
 
-fn filter_blend_content(l: &mut LayerBuilder<'_>) {
+fn filter_blend_content(l: &mut LayerBuilder<'_>, colors: &FilterColorSet) {
     l.fill(
         Shape::rounded_rect(24.0, 24.0, 104.0, 104.0, 8.0),
-        solid(srgba(0.92, 0.18, 0.22, 0.72)),
+        solid(colors.blend_round_rect),
     );
-    l.fill(
-        Shape::circle(50.0, 62.0, 20.0),
-        solid(srgba(0.1, 0.75, 0.88, 0.68)),
-    );
+    l.fill(Shape::circle(50.0, 62.0, 20.0), solid(colors.blend_circle));
     l.fill(
         Shape::rect(64.0, 52.0, 96.0, 88.0),
-        solid(srgba(0.74, 0.24, 0.82, 0.66)),
+        solid(colors.blend_rect),
     );
+}
+
+fn filter_nested_content(l: &mut LayerBuilder<'_>, colors: &FilterColorSet) {
+    for y in [
+        15.0, 16.0, 31.0, 32.0, 47.0, 48.0, 127.0, 128.0, 191.0, 192.0,
+    ] {
+        l.fill(
+            Shape::rect(26.0, y, 38.0, y + 1.0),
+            solid(colors.nested_blue),
+        );
+    }
+    l.fill(
+        Shape::rect(26.0, 122.0, 38.0, 134.0),
+        solid(colors.nested_red),
+    );
+}
+
+fn filter_blended_descendant_content(l: &mut LayerBuilder<'_>, colors: &FilterColorSet) {
+    l.fill(
+        Shape::rect(8.0, 8.0, 48.0, 80.0),
+        solid(colors.blended_descendant),
+    );
+    l.layer(|cutout| {
+        cutout.blend(BlendMode::DestOut);
+        cutout.fill(
+            Shape::rect(20.0, 30.0, 24.0, 36.0),
+            solid(srgb(1.0, 1.0, 1.0)),
+        );
+    });
+}
+
+fn filter_isolates_nested_blend_content(l: &mut LayerBuilder<'_>, colors: &FilterColorSet) {
+    l.fill(
+        Shape::rect(4.0, 4.0, 56.0, 88.0),
+        solid(colors.nested_blend_outer),
+    );
+    l.layer(|inner| {
+        inner.fill(
+            Shape::rect(12.0, 20.0, 40.0, 56.0),
+            solid(colors.nested_blue),
+        );
+        inner.layer(|cutout| {
+            cutout.blend(BlendMode::DestOut);
+            cutout.fill(
+                Shape::rect(24.0, 36.0, 16.0, 24.0),
+                solid(srgb(1.0, 1.0, 1.0)),
+            );
+        });
+    });
 }
 
 /// A self-intersecting figure-eight-ish cubic path.
@@ -1570,6 +1693,38 @@ fn run() -> Result<(), SceneError> {
         });
     });
 
+    corpus.scene("layer-isolates-blended-child-hdr", 64, 96, white, |l| {
+        l.layer(|outer| {
+            outer.fill(Shape::rect(8.0, 8.0, 48.0, 80.0), solid(hdr(0.5, 6.0, 2.0)));
+            outer.layer(|cutout| {
+                cutout.blend(BlendMode::DestOut);
+                cutout.fill(
+                    Shape::rect(20.0, 30.0, 24.0, 36.0),
+                    solid(srgb(1.0, 1.0, 1.0)),
+                );
+            });
+        });
+    });
+
+    corpus.scene("layer-isolates-nested-blend-p3", 64, 96, white, |l| {
+        l.layer(|outer| {
+            outer.fill(Shape::rect(4.0, 4.0, 56.0, 88.0), solid(p3(0.0, 1.0, 0.0)));
+            outer.layer(|inner| {
+                inner.fill(
+                    Shape::rect(12.0, 20.0, 40.0, 56.0),
+                    solid(p3(0.0, 0.0, 1.0)),
+                );
+                inner.layer(|cutout| {
+                    cutout.blend(BlendMode::DestOut);
+                    cutout.fill(
+                        Shape::rect(24.0, 36.0, 16.0, 24.0),
+                        solid(srgb(1.0, 1.0, 1.0)),
+                    );
+                });
+            });
+        });
+    });
+
     corpus.scene("group-opacity", 128, 128, white, |l| {
         l.fill(
             Shape::rect(0.0, 0.0, 128.0, 128.0),
@@ -1767,38 +1922,70 @@ fn run() -> Result<(), SceneError> {
 
     // ---- Filters -----------------------------------------------------------
 
-    corpus.scene("filter-color-matrix", 128, 128, white, |l| {
-        l.layer(|group| {
-            group.filter(LayerFilter::ColorMatrix {
-                matrix: FILTER_COLOR_MATRIX,
+    let filter_color_variants = [
+        ("", &FILTER_COLORS_SRGB),
+        ("-p3", &FILTER_COLORS_P3),
+        ("-hdr", &FILTER_COLORS_HDR),
+    ];
+
+    for &(suffix, colors) in &filter_color_variants {
+        corpus.scene(
+            format!("filter-color-matrix{suffix}"),
+            128,
+            128,
+            white,
+            |l| {
+                l.layer(|group| {
+                    group.filter(LayerFilter::ColorMatrix {
+                        matrix: FILTER_COLOR_MATRIX,
+                    });
+                    filter_color_content(group, colors);
+                });
+            },
+        );
+    }
+
+    for &(suffix, colors) in &filter_color_variants {
+        corpus.scene(
+            format!("filter-color-matrix-chain{suffix}"),
+            128,
+            128,
+            white,
+            |l| {
+                l.layer(|group| {
+                    group.filter(LayerFilter::ColorMatrixChain {
+                        first: FILTER_SEPIA_MATRIX,
+                        second: FILTER_CHAIN_SECOND,
+                    });
+                    filter_color_content(group, colors);
+                });
+            },
+        );
+    }
+
+    for &(suffix, colors) in &filter_color_variants {
+        corpus.scene(
+            format!("filter-gaussian-blur{suffix}"),
+            128,
+            128,
+            white,
+            |l| {
+                l.layer(|group| {
+                    group.filter(LayerFilter::GaussianBlur { sigma: 4.0 });
+                    filter_blur_content(group, colors);
+                });
+            },
+        );
+    }
+
+    for &(suffix, colors) in &filter_color_variants {
+        corpus.scene(format!("filter-box-blur{suffix}"), 128, 128, white, |l| {
+            l.layer(|group| {
+                group.filter(LayerFilter::BoxBlur { radius: 3.0 });
+                filter_blur_content(group, colors);
             });
-            filter_color_content(group);
         });
-    });
-
-    corpus.scene("filter-color-matrix-chain", 128, 128, white, |l| {
-        l.layer(|group| {
-            group.filter(LayerFilter::ColorMatrixChain {
-                first: FILTER_SEPIA_MATRIX,
-                second: FILTER_CHAIN_SECOND,
-            });
-            filter_color_content(group);
-        });
-    });
-
-    corpus.scene("filter-gaussian-blur", 128, 128, white, |l| {
-        l.layer(|group| {
-            group.filter(LayerFilter::GaussianBlur { sigma: 4.0 });
-            filter_blur_content(group);
-        });
-    });
-
-    corpus.scene("filter-box-blur", 128, 128, white, |l| {
-        l.layer(|group| {
-            group.filter(LayerFilter::BoxBlur { radius: 3.0 });
-            filter_blur_content(group);
-        });
-    });
+    }
 
     let image = filter_image_png();
     let image_hash = ResourceHash::of(&image);
@@ -1810,89 +1997,72 @@ fn run() -> Result<(), SceneError> {
             FilterBlend::Luminosity,
         ),
     ] {
-        corpus.scene_with_blobs(
-            name,
-            128,
-            128,
+        for &(suffix, colors) in &filter_color_variants {
+            corpus.scene_with_blobs(
+                format!("{name}{suffix}"),
+                128,
+                128,
+                white,
+                |l| {
+                    l.layer(|group| {
+                        group.opacity(0.82);
+                        group.filter(LayerFilter::BlendImage {
+                            image: image_hash,
+                            amount,
+                            mode,
+                        });
+                        filter_blend_content(group, colors);
+                    });
+                },
+                vec![image.clone()],
+            );
+        }
+    }
+
+    for &(suffix, colors) in &filter_color_variants {
+        corpus.scene(format!("filter-nested{suffix}"), 64, 256, white, |l| {
+            l.layer(|outer| {
+                outer.opacity(0.8);
+                outer.filter(LayerFilter::ColorMatrix {
+                    matrix: FILTER_COLOR_MATRIX,
+                });
+                outer.layer(|inner| {
+                    inner.filter(LayerFilter::GaussianBlur { sigma: 6.0 });
+                    filter_nested_content(inner, colors);
+                });
+            });
+        });
+    }
+
+    for &(suffix, colors) in &filter_color_variants {
+        corpus.scene(
+            format!("filter-blended-descendant{suffix}"),
+            64,
+            96,
             white,
             |l| {
-                l.layer(|group| {
-                    group.opacity(0.82);
-                    group.filter(LayerFilter::BlendImage {
-                        image: image_hash,
-                        amount,
-                        mode,
-                    });
-                    filter_blend_content(group);
+                l.layer(|outer| {
+                    outer.filter(LayerFilter::GaussianBlur { sigma: 3.0 });
+                    filter_blended_descendant_content(outer, colors);
                 });
             },
-            vec![image.clone()],
         );
     }
 
-    corpus.scene("filter-nested", 64, 256, white, |l| {
-        l.layer(|outer| {
-            outer.opacity(0.8);
-            outer.filter(LayerFilter::ColorMatrix {
-                matrix: FILTER_COLOR_MATRIX,
-            });
-            outer.layer(|inner| {
-                inner.filter(LayerFilter::GaussianBlur { sigma: 6.0 });
-                for y in [
-                    15.0, 16.0, 31.0, 32.0, 47.0, 48.0, 127.0, 128.0, 191.0, 192.0,
-                ] {
-                    inner.fill(
-                        Shape::rect(26.0, y, 38.0, y + 1.0),
-                        solid(srgb(0.12, 0.32, 0.9)),
-                    );
-                }
-                inner.fill(
-                    Shape::rect(26.0, 122.0, 38.0, 134.0),
-                    solid(srgb(0.9, 0.24, 0.12)),
-                );
-            });
-        });
-    });
-
-    corpus.scene("filter-blended-descendant", 64, 96, white, |l| {
-        l.layer(|outer| {
-            outer.filter(LayerFilter::GaussianBlur { sigma: 3.0 });
-            outer.fill(
-                Shape::rect(8.0, 8.0, 48.0, 80.0),
-                solid(Color::new(ColorSpace::DisplayP3, [0.0, 0.85, 0.3, 1.0])),
-            );
-            outer.layer(|cutout| {
-                cutout.blend(BlendMode::DestOut);
-                cutout.fill(
-                    Shape::rect(20.0, 30.0, 24.0, 36.0),
-                    solid(srgb(1.0, 1.0, 1.0)),
-                );
-            });
-        });
-    });
-
-    corpus.scene("filter-isolates-nested-blend", 64, 96, white, |l| {
-        l.layer(|outer| {
-            outer.filter(LayerFilter::GaussianBlur { sigma: 3.0 });
-            outer.fill(
-                Shape::rect(4.0, 4.0, 56.0, 88.0),
-                solid(Color::new(ColorSpace::LinearSrgb, [2.0, 0.3, 0.1, 1.0])),
-            );
-            outer.layer(|inner| {
-                inner.fill(
-                    Shape::rect(12.0, 20.0, 40.0, 56.0),
-                    solid(srgb(0.12, 0.32, 0.9)),
-                );
-                inner.layer(|cutout| {
-                    cutout.blend(BlendMode::DestOut);
-                    cutout.fill(
-                        Shape::rect(24.0, 36.0, 16.0, 24.0),
-                        solid(srgb(1.0, 1.0, 1.0)),
-                    );
+    for &(suffix, colors) in &filter_color_variants {
+        corpus.scene(
+            format!("filter-isolates-nested-blend{suffix}"),
+            64,
+            96,
+            white,
+            |l| {
+                l.layer(|outer| {
+                    outer.filter(LayerFilter::GaussianBlur { sigma: 3.0 });
+                    filter_isolates_nested_blend_content(outer, colors);
                 });
-            });
-        });
-    });
+            },
+        );
+    }
 
     // ---- HDR -----------------------------------------------------------------
 

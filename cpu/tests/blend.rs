@@ -218,3 +218,81 @@ fn encoded_group_composites_in_encoded_space() {
     }
     assert_eq!(pixel[3].to_bits(), 1.0_f32.to_bits());
 }
+
+/// A non-destructive blended layer under a clip scales the source by the
+/// clip coverage, not the whole composite: Screen over 0.5 grey at a
+/// half-covered edge is `B(cb, 0.5·cs) = 0.75`, not `lerp(cb, B, 0.5) =
+/// 0.625` (nor `c² = 0.4375`). Destructive modes keep the lerp-by-clip
+/// bound.
+#[test]
+fn clipped_blend_layer_scales_source_by_clip_coverage() {
+    const GREY: WorkingColor = WorkingColor::new([0.5, 0.5, 0.5, 1.0]);
+    let engine = Engine::<Raster>::new(RasterConfig::default()).expect("engine");
+    let surface = engine
+        .surface(Offscreen::new((12, 12), OffscreenFormat::LinearF32))
+        .expect("surface");
+    surface.update(|tx| {
+        tx[surface.root()].content(surface.record(|c| {
+            c.fill(Rect::new(0.0, 0.0, 12.0, 12.0), GREY);
+        }));
+    });
+    // Screen layer clipped to the top half, Clear to the bottom half;
+    // both clips share the half-covered left edge at x = 4.5. The layer
+    // handles must outlive the render or the layer detaches.
+    let mut layers = Vec::new();
+    for (blend, y0, y1) in [(BlendMode::Screen, 0.0, 6.0), (BlendMode::Clear, 6.0, 12.0)] {
+        let layer = surface.layer();
+        surface.update(|tx| {
+            tx[&layer].blend(blend);
+            tx[&layer].clip(Rect::new(4.5, y0, 8.0, y1));
+            tx[surface.root()].push(&layer);
+        });
+        surface.update(|tx| {
+            tx[&layer].content(surface.record(|c| {
+                c.fill(Rect::new(0.0, 0.0, 12.0, 12.0), WorkingColor::WHITE);
+            }));
+        });
+        layers.push(layer);
+    }
+    assert_eq!(layers.len(), 2);
+    engine.render(FrameTime::now()).expect("render");
+    let pixels = surface.readback().expect("pixels").pixels;
+    let w = 12;
+    // Screen rows (3): outside the clip the backdrop is untouched;
+    // fully inside, screen(0.5, 1) = 1; at the half-covered edge the
+    // coverage scales the source — B(0.5, 0.5·white) = 0.75 premultiplied.
+    assert_eq!(
+        pixels[3 * w + 2].map(f32::to_bits),
+        [0.5_f32, 0.5, 0.5, 1.0].map(f32::to_bits),
+        "screen outside clip"
+    );
+    assert_eq!(
+        pixels[3 * w + 4].map(f32::to_bits),
+        [0.75_f32, 0.75, 0.75, 1.0].map(f32::to_bits),
+        "screen at half-covered clip edge: {:?}",
+        pixels[3 * w + 4]
+    );
+    assert_eq!(
+        pixels[3 * w + 6].map(f32::to_bits),
+        [1.0_f32; 4].map(f32::to_bits),
+        "screen inside clip"
+    );
+    // Clear rows (9): the destructive path lerps by the clip coverage —
+    // untouched outside, cleared inside, halfway at the edge.
+    assert_eq!(
+        pixels[9 * w + 2].map(f32::to_bits),
+        [0.5_f32, 0.5, 0.5, 1.0].map(f32::to_bits),
+        "clear outside clip"
+    );
+    assert_eq!(
+        pixels[9 * w + 4].map(f32::to_bits),
+        [0.25_f32, 0.25, 0.25, 0.5].map(f32::to_bits),
+        "clear at half-covered clip edge: {:?}",
+        pixels[9 * w + 4]
+    );
+    assert_eq!(
+        pixels[9 * w + 6].map(f32::to_bits),
+        [0.0_f32; 4].map(f32::to_bits),
+        "clear inside clip"
+    );
+}

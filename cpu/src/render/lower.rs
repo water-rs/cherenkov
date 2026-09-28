@@ -455,6 +455,7 @@ impl<'a> Lowering<'a> {
             self.transform = cherenkov::snap_animating(self.transform);
             content_space = cherenkov::snap_animating(content_space);
         }
+        let outer = self.clip.clone();
         let result = self.with_clip(node.clip.as_ref(), |s| {
             s.transform = content_space;
             if node.opacity < 1.0
@@ -462,12 +463,22 @@ impl<'a> Lowering<'a> {
                 // The root already renders into the surface target.
                 || (id != tree.root() && node.blends_within())
             {
-                let outer = s.clip.clone();
+                // The composite's clip: for destructive operators the
+                // operator applies over the layer's effective clip, so the
+                // combined clip is the bound; for every other mode a
+                // transparent source leaves the destination unchanged, so
+                // the clip in force before the layer's own clip suffices —
+                // the layer clip's coverage is already on the content.
+                let composite_clip = if crate::render::blend::is_destructive(node.blend) {
+                    s.clip.clone()
+                } else {
+                    outer.clone()
+                };
                 s.isolate(
                     node.opacity,
                     (node.blend, cherenkov::BlendSpace::Linear),
                     s.clip.clone(),
-                    outer,
+                    composite_clip,
                     |s| s.layer_items(id, node, tree, caches),
                 )
             } else {

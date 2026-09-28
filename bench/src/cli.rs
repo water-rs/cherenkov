@@ -77,6 +77,13 @@ enum Sub {
         /// Output directory (with `--corpus`).
         #[arg(long)]
         out_dir: Option<PathBuf>,
+        /// Render through the backend's presentation pass into this output
+        /// kind instead of reading back the working-space target, and
+        /// compare against the oracle's matching presentation of the
+        /// scene's `f64` reference. Backends without a presentation step
+        /// fail.
+        #[arg(long, value_enum)]
+        present: Option<crate::PresentKind>,
     },
     /// Measure encode/submit/GPU frame times.
     Measure {
@@ -268,12 +275,14 @@ fn run(cli: Cli) -> Result<(), BenchError> {
             corpus,
             out,
             out_dir,
+            present,
         } => render_cmd(
             &engine,
             scene.as_deref(),
             corpus.as_deref(),
             out.as_deref(),
             out_dir.as_deref(),
+            present,
         ),
         Sub::Measure {
             engine,
@@ -355,20 +364,20 @@ fn render_cmd(
     corpus: Option<&Path>,
     out: Option<&Path>,
     out_dir: Option<&Path>,
+    present: Option<crate::PresentKind>,
 ) -> Result<(), BenchError> {
     let mut engine = create_engine(engine)?;
     let idle_memory = MemorySnapshot::capture(engine.memory(), SampleDetail::Full);
+    if let Some(kind) = present {
+        engine.present(kind)?;
+    }
     for dir in scene_dirs(scene, corpus)? {
         let out_path = match (out, out_dir) {
             (Some(o), None) => o.to_path_buf(),
-            (None, Some(d)) => d.join(format!(
-                "render-{}-{}.json",
-                engine.info().name,
-                dir.file_name().unwrap_or_default().to_string_lossy()
-            )),
+            (None, Some(d)) => d.join(render_report_name(engine.info().name, present, &dir)),
             _ => return Err(BenchError::Engine("--out or --out-dir required".into())),
         };
-        match render_scene(&mut *engine, &dir, idle_memory.clone()) {
+        match render_scene(&mut *engine, &dir, idle_memory.clone(), present) {
             Ok(rendered) => {
                 write_render(&rendered, &out_path)?;
                 tracing::info!(
@@ -576,11 +585,44 @@ fn render_scene(
     engine: &mut dyn Engine,
     dir: &Path,
     idle_memory: MemorySnapshot,
+    present: Option<crate::PresentKind>,
 ) -> Result<RenderOutput, BenchError> {
     let scene = Scene::load(dir)?;
     let blobs = convert::load_blobs(&scene, dir)?;
-    let reference =
-        Renderer::new(scene.width as usize, scene.height as usize).render(&scene, dir)?;
+    let renderer = Renderer::new(scene.width as usize, scene.height as usize);
+    // With `--present` the reference is the oracle's `f64` image through
+    // the matching presentation function, lifted back into the working
+    // space where the output was encoded.
+    let reference = match present {
+        None => renderer.render(&scene, dir)?,
+        Some(kind) => {
+            let image = renderer.render_image(&scene, dir)?;
+            let headroom = scene.present_headroom;
+            let presented = match kind {
+                crate::PresentKind::LinearP3 => {
+                    cherenkov_oracle::present::present_linear_p3(headroom, &image)
+                }
+                crate::PresentKind::SrgbHw | crate::PresentKind::SrgbShader => {
+                    cherenkov_oracle::present::present_srgb(headroom, &image)
+                }
+            };
+            let working = match kind {
+                crate::PresentKind::LinearP3 => presented,
+                crate::PresentKind::SrgbHw | crate::PresentKind::SrgbShader => {
+                    cherenkov_oracle::Image {
+                        width: presented.width,
+                        height: presented.height,
+                        pixels: presented
+                            .pixels
+                            .iter()
+                            .map(|&p| cherenkov_oracle::present::presented_srgb_to_working(p))
+                            .collect(),
+                    }
+                }
+            };
+            cherenkov_oracle::F32Image::from_f64(&working)
+        }
+    };
     let input = EncodeInput {
         scene: &scene,
         blobs: &blobs,
@@ -605,6 +647,10 @@ fn render_scene(
                 .into_owned(),
             width: scene.width,
             height: scene.height,
+            present: present.map(|kind| crate::report::PresentInfo {
+                kind: kind.name(),
+                headroom: scene.present_headroom,
+            }),
             metrics: metrics_v,
             counters: engine.counters(),
             memory: MemoryReport::new(idle_memory, &[prepare_memory, steady_memory]),

@@ -31,6 +31,7 @@ mod mesh;
 pub mod metrics;
 pub mod paint;
 pub mod path;
+pub mod present;
 pub mod render;
 pub mod resources;
 pub mod shadow;

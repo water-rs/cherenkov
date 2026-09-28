@@ -106,6 +106,57 @@ fn clip_is_geometric_intersection() {
     assert_eq!(img.pixels[10][3], 0.0);
 }
 
+/// A member clipped by an ellipse never writes outside the clip: the
+/// clip's flattened boundary must be a sealed contour even when the curve
+/// approximation's last point lands a rounding ulp off its start (kurbo's
+/// `Arc`-based ellipse path ends open, without `ClosePath`).
+///
+/// Regression for a 24×16 px leak: the unsealed tip let the geometric
+/// clip drop the fill's inside piece, and the open contour read as
+/// covered to the left of the clip.
+#[expect(
+    clippy::float_cmp,
+    reason = "zero alpha outside the clip is the assertion under test"
+)]
+#[test]
+fn ellipse_clip_writes_nothing_outside_the_tip() {
+    const W: usize = 144;
+    let mut b = Scene::builder(144, 144).clear(Color::new(
+        cherenkov_scene::ColorSpace::Srgb,
+        [0.0, 0.0, 0.0, 0.0],
+    ));
+    {
+        let mut root = b.root();
+        root.layer(|m| {
+            m.clip(Shape::Ellipse(kurbo::Ellipse::new(
+                (72.0, 72.0),
+                (48.0, 28.0),
+                0.0,
+            )));
+            m.fill(
+                Shape::Rect(Rect::new(26.0, 46.0, 144.0, 144.0)),
+                Paint::Solid(Color::srgb(1.0, 1.0, 1.0)),
+            );
+        });
+    }
+    let scene = b.build();
+    let img = Renderer::new(W, W)
+        .render(&scene, &tmp())
+        .expect("oracle render");
+    // The tip is at x = 24: every pixel left of it is outside the clip.
+    for y in 64..80usize {
+        for x in 0..24usize {
+            assert_eq!(
+                img.pixels[y * W + x][3],
+                0.0,
+                "pixel ({x},{y}) written outside the ellipse clip"
+            );
+        }
+    }
+    // The interior is painted.
+    assert!(img.pixels[72 * W + 72][3] > 0.99);
+}
+
 /// Shading rule: gradients are evaluated at the pixel centre and multiplied
 /// by exact coverage.
 #[expect(

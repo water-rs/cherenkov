@@ -2271,3 +2271,89 @@ fn gpu_export_filter_gallery_images() {
         }
     );
 }
+
+/// Two encodes of one effect at different sizes in a single encoder must
+/// stay independent: parameters used to be a queue write into one buffer,
+/// so both recorded passes ran with the last encode's `size`.
+#[test]
+fn gpu_one_effect_two_sizes_one_encoder() {
+    use filters::GaussianBlur;
+    let gpu = create_test_device();
+    let mut executor = Executor::new(GaussianBlur(8.0_f32));
+    setup(&gpu, &mut executor);
+    let size_a = (64, 64);
+    let size_b = (64, 32);
+    let rgba_a = test_pixels(size_a.0 * size_a.1);
+    let rgba_b = test_pixels(size_b.0 * size_b.1);
+    let input_a = upload(&gpu, size_a, &rgba_a);
+    let input_b = upload(&gpu, size_b, &rgba_b);
+    let output_a = texture(
+        &gpu,
+        size_a,
+        wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+    );
+    let output_b = texture(
+        &gpu,
+        size_b,
+        wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+    );
+    let mut encoder = gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("two-size encode"),
+        });
+    executor
+        .encode_render(
+            &frame_input(
+                &gpu,
+                &input_a,
+                size_a,
+                Duration::ZERO,
+                ShapeTextures::default(),
+            ),
+            &frame_output(&gpu, &output_a, size_a),
+            &mut encoder,
+        )
+        .expect("first encode should succeed");
+    executor
+        .encode_render(
+            &frame_input(
+                &gpu,
+                &input_b,
+                size_b,
+                Duration::ZERO,
+                ShapeTextures::default(),
+            ),
+            &frame_output(&gpu, &output_b, size_b),
+            &mut encoder,
+        )
+        .expect("second encode should succeed");
+    gpu.queue.submit([encoder.finish()]);
+    // References: the same effect, one encode per submission.
+    let want_a = run(
+        &gpu,
+        GaussianBlur(8.0_f32),
+        size_a,
+        &rgba_a,
+        ShapeTextures::default(),
+    );
+    let want_b = run(
+        &gpu,
+        GaussianBlur(8.0_f32),
+        size_b,
+        &rgba_b,
+        ShapeTextures::default(),
+    );
+    assert_rgba8_close(
+        &readback_rgba8_image(&gpu, &output_a, size_a),
+        &want_a,
+        0,
+        "first encode",
+    );
+    assert_rgba8_close(
+        &readback_rgba8_image(&gpu, &output_b, size_b),
+        &want_b,
+        0,
+        "second encode",
+    );
+}

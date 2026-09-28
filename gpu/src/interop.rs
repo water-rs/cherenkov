@@ -2,6 +2,7 @@
 
 pub use crate::render::filter::EffectBox;
 pub use crate::render::present::{OutputAlpha, OutputColor, Presenter, TextureOutput};
+pub use crate::render::shaders::{ShaderDelivery, delivery as shader_delivery};
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -189,6 +190,11 @@ impl std::fmt::Debug for RedrawCallback {
 
 /// An existing device shared with a native presentation host.
 /// All four handles must belong to the same device creation chain.
+///
+/// On Vulkan and Metal adapters the device must be created with
+/// `wgpu::Features::PASSTHROUGH_SHADERS`: the engine's fixed shaders are
+/// precompiled binaries loaded through the passthrough API (issue #57), so
+/// `Engine::new` fails explicitly on a device created without the feature.
 #[derive(Clone, Debug)]
 pub struct SharedDevice {
     /// Instance used to create the adapter and native surfaces.
@@ -196,6 +202,7 @@ pub struct SharedDevice {
     /// Adapter used to create the device.
     pub adapter: wgpu::Adapter,
     /// Device used for both engine composition and native presentation.
+    /// Request `Features::PASSTHROUGH_SHADERS` on Vulkan and Metal.
     pub device: wgpu::Device,
     /// This device's submission queue.
     pub queue: wgpu::Queue,

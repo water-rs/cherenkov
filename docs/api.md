@@ -23,21 +23,20 @@ Sections marked **Proposal** are not yet agreed; everything else records a decis
 |---|---|---|
 | `cherenkov` | `src/` | Front end: API types, recording, engine, surfaces, layer tree, transactions, resource handles, animation, scrolling, the render-thread loop and the `Backend` contract, CPU geometry. No GPU dependency. |
 | `cherenkov-gpu` | `gpu/` | GPU backend `Gpu` and the wgpu, Apple, Android, Windows and Wayland interop. |
-| `cherenkov-vello` | `vello/` | Reference GPU backend `Vello` over the Vello renderer, with the wgpu interop. |
 | `cherenkov-cpu` | `cpu/` | CPU backends `Raster` (desktop/server: full framebuffer, multi-threaded, SIMD) and `Banded<P>` (microcontroller: banded output, panel pixel formats, flash-resident assets). |
 | `cherenkov-shader` | `shader/` | The shared shader composer on naga IR, used by the engine and by filtrate. |
 | `filtrate`, `filtrate-core`, `filtrate-derive` | `filtrate/` | Independent filter library: definitions, a thin reference executor, and a derive macro. It keeps its own name and does not depend on the engine crates. |
 
 Capabilities are traits implemented by backend types, so using a missing capability is a compile error:
 
-| Capability trait | `Gpu` | `Vello` | `Raster` |
-|---|---|---|---|
-| `Uploads<F>` for an image format `F` | `Rgba8`, `Rgba16F` | `Rgba8` | `Rgba8`, `Rgba16F` |
-| `GpuContent`, `ShaderPaint` | both | both | |
-| `Filters`, `Runs<F>` for a filter `F`, `Effects` | every filter | every filter | filters with a CPU kernel |
-| `Backdrop`, `BackdropRuns<K, F>` for a backdrop chain `F` | every chain | every chain | chains with a CPU kernel |
-| `HdrOutput` | tone-mapped extended output | | |
-| `ExternalFrames`, `Planes` | | | |
+| Capability trait | `Gpu` | `Raster` |
+|---|---|---|
+| `Uploads<F>` for an image format `F` | `Rgba8`, `Rgba16F` | `Rgba8`, `Rgba16F` |
+| `GpuContent`, `ShaderPaint` | both | |
+| `Filters`, `Runs<F>` for a filter `F`, `Effects` | every filter | filters with a CPU kernel |
+| `Backdrop`, `BackdropRuns<K, F>` for a backdrop chain `F` | every chain | chains with a CPU kernel |
+| `HdrOutput` | tone-mapped extended output | |
+| `ExternalFrames`, `Planes` | | |
 
 Targets beyond the current rows: `Gpu` is meant to accept every image format and grow `ExternalFrames` and `Planes` (system-compositor promotion); `Raster` targets `Uploads<Rgba8>` and `Filters`/`Runs<F>` for filters with a CPU kernel; a `Banded<P>` microcontroller backend (banded output, panel formats, flash-resident assets) targets panel-format uploads and CPU-kernel filters.
 
@@ -59,9 +58,9 @@ On the native Android backend, the host picks `Gpu` or `Raster` once at process 
 The `cherenkov` crate owns the whole front end and the render thread's loop. A backend crate supplies the render side only: a config type, a `Backend` implementation, its capability implementations, and an `interop` module. Nothing in a backend crate is a public front-end type, and nothing is re-exported.
 
 ```rust
-/// The render-thread contract. Implemented by a zero-sized marker type (`Gpu`, `Vello`, `Raster`).
+/// The render-thread contract. Implemented by a zero-sized marker type (`Gpu`, `Raster`).
 pub trait Backend: Sized + 'static {
-    type Config: Send + 'static;                         // GpuConfig, VelloConfig, RasterConfig
+    type Config: Send + 'static;                         // GpuConfig, RasterConfig
     type Info: Clone + Send + 'static;                   // GpuInfo, RasterInfo: provenance for reports
     type Target: From<Offscreen> + Send + 'static;       // Offscreen or an interop window target
     type Renderer: Renderer;                             // the render-thread state; never leaves that thread
@@ -100,7 +99,7 @@ pub trait Renderer: 'static {
 }
 ```
 
-- **Surface limits and cadence.** `SurfaceInfo::max_dimension` lets the UI thread reject an oversized resize before sending it to a backend. Animated backend content returns `Redraw::Wanted { rate }`; the frontend combines its refresh range with active property animations. Vello uses the window's supplied range or `Offscreen::rate` (60 Hz by default).
+- **Surface limits and cadence.** `SurfaceInfo::max_dimension` lets the UI thread reject an oversized resize before sending it to a backend. Animated backend content returns `Redraw::Wanted { rate }`; the frontend combines its refresh range with active property animations. A window target uses the host-supplied range; `Offscreen` uses `Offscreen::rate` (60 Hz by default).
 - **One copy of the layer tree.** The render loop in `cherenkov` owns a `SurfaceTree` per surface: the layer graph, every layer property, its animation track and the sampled value for the current frame. The backend never receives property ops; it keeps only what it alone can produce (encoded fragments, live display lists, atlases, GPU content objects) keyed by `LayerId`, and it reads the tree through `Frame`:
 
   ```rust
@@ -166,7 +165,7 @@ let usage: MemoryUsage = engine.memory();
 - The pipeline set is closed and fully precompiled at creation, and the driver cache is persisted. Custom shaders compile when they are registered. Nothing compiles at draw time.
 - `Engine` is `!Send` and lives on the UI thread. It spawns and owns the render thread; dropping it sends `Shutdown` and joins the thread.
 - `engine.info()` is the backend's provenance (`B::Info`); `engine.stats()` the last frame's `FrameStats`.
-- **Frame timing.** The render loop numbers every render with a `FrameId` (`Frame::id`). A backend that draws reports it in `FrameStats::frame`, and every GPU timing it reports is a `FrameTiming` tagged with the frame it measures, in `FrameStats::timings`: the render's own for a backend that times synchronously (Vello), earlier renders' for one whose timestamp queries resolve after the frame is submitted (the GPU backend, which never waits for GPU idle). `engine.finish_timings()` waits for the timings still in flight — tooling at the end of a measured window, never a frame path.
+- **Frame timing.** The render loop numbers every render with a `FrameId` (`Frame::id`). A backend that draws reports it in `FrameStats::frame`, and every GPU timing it reports is a `FrameTiming` tagged with the frame it measures, in `FrameStats::timings`: the render's own for a backend that times synchronously, earlier renders' for one whose timestamp queries resolve after the frame is submitted (the GPU backend, which never waits for GPU idle). `engine.finish_timings()` waits for the timings still in flight — tooling at the end of a measured window, never a frame path.
 - **Waking the host.** Changes made outside a frame (a `surface.update`, a layer drop, a bound signal firing) are queued, not sent. When the display link is paused after `Next::Idle`, the host must learn that a frame is needed: `engine.set_waker(|| link.request_now())` registers a UI-thread callback that the engine calls at most once between two `render`s, the first time something is queued. No callback means the host renders on its own schedule.
 
 ## Resources
@@ -583,10 +582,10 @@ native. Native callers need no timestamp conversion.
 ### Memory measurement (#101)
 
 Native hosts can obtain the exact device an engine would create with
-`SharedDevice::create(&gpu_config)` or `DeviceSource::create(&vello_config)`,
-then pass it back through `GpuConfig::device` or `VelloConfig::with_device`.
-These helpers wrap the engines' normal creation paths, preserving adapter
-selection, enabled capabilities and rendering behavior by construction.
+`SharedDevice::create(&gpu_config)`, then pass it back through
+`GpuConfig::device`. This helper wraps the engine's normal creation path,
+preserving adapter selection, enabled capabilities and rendering behavior by
+construction.
 
 #### Running the browser tests
 

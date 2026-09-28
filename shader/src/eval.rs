@@ -341,6 +341,8 @@ impl<'m> Eval<'m> {
                     reason = "evaluated literals are small"
                 )]
                 Literal::AbstractFloat(value) | Literal::F64(value) => Value::Float(value as f32),
+                Literal::I16(value) => Value::Int(i64::from(value)),
+                Literal::U16(value) => Value::Int(i64::from(value)),
                 Literal::I32(value) => Value::Int(i64::from(value)),
                 Literal::U32(value) => Value::Int(i64::from(value)),
                 Literal::AbstractInt(value) | Literal::I64(value) => Value::Int(value),

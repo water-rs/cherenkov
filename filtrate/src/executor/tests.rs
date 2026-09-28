@@ -1821,7 +1821,9 @@ fn upload_f16(gpu: &TestGpu, size: (u32, u32), pixels: &[[f32; 4]]) -> wgpu::Tex
 
 fn readback_f16_image(gpu: &TestGpu, texture: &wgpu::Texture, size: (u32, u32)) -> Vec<[f32; 4]> {
     readback_bytes(gpu, texture, size, 8)
-        .chunks_exact(8)
+        .as_chunks::<8>()
+        .0
+        .iter()
         .map(|pixel| {
             std::array::from_fn(|channel| {
                 let offset = channel * 2;

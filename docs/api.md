@@ -329,7 +329,7 @@ impl Shape for ContinuousRect { /* Semantic::Continuous */ }
 // kurbo::Ellipse by type and gives it Semantic::Ellipse; no separate oval type.
 ```
 
-- `ContinuousRect::to_path(tolerance)` expands its Lamé corners to a `BezPath` of line segments within `tolerance`; smoothing 0 is `RoundedRect::to_path`.
+- `ContinuousRect::to_path(tolerance)` expands its Lamé corners to a `BezPath` of line segments within `tolerance`; smoothing 0 gives circular-arc corners.
 - **Custom shapes are open.** `waterui-shape` merges here, and Lyon is removed.
 - **The semantic vocabulary is closed.** It is the set of fast paths. Besides the shapes above, it includes `Border` (a stroked rounded or continuous rectangle of a given width) and `InnerShadow`. These are the most common UI elements after the rounded rectangle, and otherwise they would fall to the general path route.
 - **Proposal: native path type.** If profiling shows `BezPath`'s f64 storage is a bottleneck for large paths, add an engine-native f32 path type that also implements `Shape`. `BezPath` stays accepted.

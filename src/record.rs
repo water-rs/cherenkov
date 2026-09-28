@@ -322,7 +322,7 @@ impl<T: 'static, S: Signal<Output = T>> From<S> for Live<T> {
 
 /// State shared between a [`Content`] and the watchers of its signals.
 #[derive(Default)]
-struct LiveState {
+pub struct LiveState {
     pending: RefCell<Vec<SlotUpdate>>,
     guards: RefCell<Vec<Box<dyn Any>>>,
     waker: RefCell<Weak<crate::engine::Waker>>,
@@ -556,6 +556,8 @@ impl Draw for Recorder {
 /// Content recorded on the UI thread. It owns the subscriptions of the signals
 /// it was recorded with, and turns their changes into [`ContentChange`]s.
 ///
+/// Replaced picture storage can return after the render thread releases it.
+///
 /// `Content` is not `Send`: its signals live on the UI thread. What crosses to
 /// the render thread is the owned [`ContentChange`].
 pub struct Content {
@@ -564,9 +566,10 @@ pub struct Content {
     sent: bool,
 }
 
+#[derive(Default)]
 pub struct ContentSpare {
-    picture: Picture,
-    live: Rc<LiveState>,
+    pub(crate) picture: Option<Picture>,
+    pub(crate) live: Option<Rc<LiveState>>,
 }
 
 impl std::fmt::Debug for Content {
@@ -586,23 +589,22 @@ impl Content {
     }
 
     pub(crate) fn record_reusing(
-        spare: Option<ContentSpare>,
+        mut spare: ContentSpare,
         body: impl FnOnce(&mut Recorder),
     ) -> Self {
-        let Some(ContentSpare {
-            mut picture,
-            mut live,
-        }) = spare
-        else {
-            return Self::record(body);
-        };
-        let (picture, list) = picture.take_unique_list().map_or_else(
+        let (picture, list) = spare.picture.take().map_or_else(
             || (None, DisplayList::default()),
-            |mut list| {
-                list.clear();
-                (Some(picture), list)
+            |mut picture| {
+                picture.take_unique_list().map_or_else(
+                    || (None, DisplayList::default()),
+                    |mut list| {
+                        list.clear();
+                        (Some(picture), list)
+                    },
+                )
             },
         );
+        let mut live = spare.live.take().unwrap_or_default();
         let live = if Rc::get_mut(&mut live).is_some() {
             live
         } else {
@@ -622,7 +624,11 @@ impl Content {
         live.guards.borrow_mut().clear();
         live.pending.borrow_mut().clear();
         *live.waker.borrow_mut() = Weak::new();
-        ContentSpare { picture, live }
+        drop(picture);
+        ContentSpare {
+            picture: None,
+            live: Some(live),
+        }
     }
 
     /// Like [`record`](Self::record), reserving room for `capacity` commands —
@@ -790,7 +796,7 @@ mod tests {
         let mut content = Content::record(|_| {});
         let pointer = std::ptr::from_ref(content.picture.display_list());
         let held = content.take_change();
-        let reused = Content::record_reusing(Some(content.retire()), |_| {});
+        let reused = Content::record_reusing(content.retire(), |_| {});
         assert_ne!(std::ptr::from_ref(reused.picture.display_list()), pointer);
         drop(held);
     }

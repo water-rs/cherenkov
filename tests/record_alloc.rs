@@ -5,20 +5,23 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::collections::HashSet;
+use std::mem::{align_of, size_of};
 use std::sync::Arc;
 use std::sync::mpsc;
 
 use cherenkov::kurbo::{PathEl, Point, Rect};
 use cherenkov::testing::{Null, NullConfig};
 use cherenkov::{
-    Draw, Engine, FillRule, Fixed, FrameTime, Glyph, GlyphRun, GlyphStyle, Offscreen,
+    Command, Draw, Engine, FillRule, Fixed, FrameTime, Glyph, GlyphRun, GlyphStyle, Offscreen,
     OffscreenFormat, ShapeData, WorkingColor,
 };
 
 thread_local! {
     static TRACKING: Cell<bool> = const { Cell::new(false) };
     static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+    static REALLOCATIONS: Cell<usize> = const { Cell::new(0) };
     static FREES: Cell<usize> = const { Cell::new(0) };
+    static COMMAND_BUFFERS: Cell<([usize; 32], usize)> = const { Cell::new(([0; 32], 0)) };
 }
 
 struct ThreadAllocator;
@@ -30,12 +33,14 @@ unsafe impl GlobalAlloc for ThreadAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let pointer = unsafe { System.alloc(layout) };
         allocation();
+        observe_command_buffer(pointer, layout.size(), layout.align());
         pointer
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         let pointer = unsafe { System.alloc_zeroed(layout) };
         allocation();
+        observe_command_buffer(pointer, layout.size(), layout.align());
         pointer
     }
 
@@ -46,8 +51,8 @@ unsafe impl GlobalAlloc for ThreadAllocator {
 
     unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
         let pointer = unsafe { System.realloc(pointer, layout, size) };
-        allocation();
-        release();
+        reallocation();
+        observe_command_buffer(pointer, size, layout.align());
         pointer
     }
 }
@@ -64,15 +69,50 @@ fn release() {
     }
 }
 
+fn reallocation() {
+    if TRACKING.try_with(Cell::get).unwrap_or(false) {
+        let _ = REALLOCATIONS.try_with(|count| count.set(count.get() + 1));
+    }
+}
+
+fn observe_command_buffer(pointer: *mut u8, size: usize, align: usize) {
+    if pointer.is_null()
+        || align != align_of::<Command>()
+        || size < size_of::<Command>()
+        || !size.is_multiple_of(size_of::<Command>())
+        || !TRACKING.try_with(Cell::get).unwrap_or(false)
+    {
+        return;
+    }
+    let _ = COMMAND_BUFFERS.try_with(|buffers| {
+        let (mut pointers, mut len) = buffers.get();
+        let pointer = pointer as usize;
+        if !pointers[..len].contains(&pointer) && len < pointers.len() {
+            pointers[len] = pointer;
+            len += 1;
+            buffers.set((pointers, len));
+        }
+    });
+}
+
 fn start_tracking() {
     ALLOCATIONS.with(|count| count.set(0));
+    REALLOCATIONS.with(|count| count.set(0));
     FREES.with(|count| count.set(0));
     TRACKING.with(|tracking| tracking.set(true));
 }
 
-fn stop_tracking() -> (usize, usize) {
+fn stop_tracking() -> (usize, usize, usize) {
     TRACKING.with(|tracking| tracking.set(false));
-    (ALLOCATIONS.with(Cell::get), FREES.with(Cell::get))
+    (
+        ALLOCATIONS.with(Cell::get),
+        REALLOCATIONS.with(Cell::get),
+        FREES.with(Cell::get),
+    )
+}
+
+fn command_buffer_count() -> usize {
+    COMMAND_BUFFERS.with(|buffers| buffers.get().1)
 }
 
 #[test]
@@ -122,11 +162,15 @@ fn recording_and_rendering_reuse_ui_thread_allocations() {
                 recorder.glyphs(Fixed(run.clone()), Fixed(WorkingColor::WHITE));
             });
         });
-        let result = engine.render(time);
         let counts = stop_tracking();
-        result.expect("render");
         if frame >= 3 {
-            assert_eq!(counts, (0, 0), "frame {}", frame + 1);
+            assert_eq!(counts, (0, 0, 0), "frame {}", frame + 1);
         }
+        engine.render(time).expect("render");
     }
+    let buffers = command_buffer_count();
+    assert!(
+        (1..=3).contains(&buffers),
+        "observed {buffers} command buffers"
+    );
 }

@@ -5,7 +5,7 @@
 //! call as an [`Event`] on a channel, so tests and the cross-backend
 //! behaviour suite can assert what the front end committed.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::Sender;
 
 use kurbo::{Affine, Vec2};
@@ -19,7 +19,7 @@ use crate::glyph::FontId;
 use crate::image::{ImageUpload, Rgba8, Rgba16F};
 use crate::message::{ContentOp, FontData, LayerId, SurfaceId};
 use crate::paint::{ImageId, ShaderId};
-use crate::{Offscreen, Pressure, Uploads};
+use crate::{Offscreen, Picture, Pressure, Uploads};
 
 /// A render-thread event [`Null`] reports.
 #[derive(Debug)]
@@ -117,6 +117,7 @@ pub struct NullRenderer {
     fonts: HashSet<FontId>,
     images: HashSet<ImageId>,
     shaders: HashSet<ShaderId>,
+    pictures: HashMap<(SurfaceId, LayerId), Picture>,
 }
 
 impl NullRenderer {
@@ -128,6 +129,7 @@ impl NullRenderer {
             fonts: HashSet::new(),
             images: HashSet::new(),
             shaders: HashSet::new(),
+            pictures: HashMap::new(),
         }
     }
 }
@@ -181,6 +183,7 @@ impl Renderer for NullRenderer {
     }
 
     fn destroy_surface(&mut self, id: SurfaceId) {
+        self.pictures.retain(|(surface, _), _| *surface != id);
         if self.surfaces.remove(&id) {
             let _ = self.events.send(Event::DestroySurface(id));
         }
@@ -216,11 +219,25 @@ impl Renderer for NullRenderer {
         }
     }
 
-    fn set_content(&mut self, surface: SurfaceId, layer: LayerId, _content: Option<ContentOp>) {
+    fn set_content(
+        &mut self,
+        surface: SurfaceId,
+        layer: LayerId,
+        content: Option<ContentOp>,
+    ) -> Option<Picture> {
+        let previous = match content {
+            Some(ContentOp::Replace(picture) | ContentOp::Picture(picture)) => {
+                self.pictures.insert((surface, layer), picture)
+            }
+            Some(ContentOp::Update(_)) => None,
+            None => self.pictures.remove(&(surface, layer)),
+        };
         let _ = self.events.send(Event::SetContent(surface, layer));
+        previous
     }
 
     fn remove_layer(&mut self, surface: SurfaceId, layer: LayerId) {
+        self.pictures.remove(&(surface, layer));
         let _ = self.events.send(Event::RemoveLayer(surface, layer));
     }
 

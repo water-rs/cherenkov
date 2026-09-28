@@ -412,7 +412,7 @@ impl<B: Backend> Engine<B> {
             };
             shared
                 .borrow_mut()
-                .recycle_ops(std::mem::take(&mut changes.ops));
+                .recycle(std::mem::take(&mut changes.ops), &mut changes.recycled);
         }
     }
 

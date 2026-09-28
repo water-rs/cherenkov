@@ -213,8 +213,7 @@ impl ContinuousRect {
         ];
         let Rect { x0, y0, x1, y1 } = rect;
         // Corner centres in order top-right, bottom-right, bottom-left,
-        // top-left; a zero radius still emits its corner point, matching the
-        // scene's degenerate-radius behaviour.
+        // top-left.
         let corners = [
             (x1 - r[0], y0 + r[0]),
             (x1 - r[1], y1 - r[1]),
@@ -224,10 +223,18 @@ impl ContinuousRect {
         let mut path = BezPath::new();
         path.move_to((x0 + r[3], y0));
         for (c, &(cx, cy)) in corners.iter().enumerate() {
-            let centre = Point::new(cx, cy);
+            // Straight edge to this corner's arc start.
+            let rc = r[c];
+            let start = match c {
+                0 => Point::new(cx, cy - rc),
+                1 => Point::new(cx + rc, cy),
+                2 => Point::new(cx, cy + rc),
+                _ => Point::new(cx - rc, cy),
+            };
+            path.line_to(start);
             emit(
-                centre,
-                r[c],
+                Point::new(cx, cy),
+                rc,
                 c,
                 0.0,
                 std::f64::consts::FRAC_PI_2,
@@ -236,17 +243,6 @@ impl ContinuousRect {
                 &mut path,
                 0,
             );
-            // Straight edge to the next corner's start.
-            let next = (c + 1) % 4;
-            let (nx, ny) = corners[next];
-            let rn = r[next];
-            let p = match next {
-                0 => Point::new(nx, ny - rn),
-                1 => Point::new(nx + rn, ny),
-                2 => Point::new(nx, ny + rn),
-                _ => Point::new(nx - rn, ny),
-            };
-            path.line_to(p);
         }
         path.close_path();
         path

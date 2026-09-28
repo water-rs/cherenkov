@@ -734,13 +734,14 @@ mod tests {
         let run = GlyphRun {
             font: crate::FontId::new(0),
             size: 12.0,
-            coords: vec![123],
+            coords: vec![123].into(),
             glyphs: vec![crate::Glyph {
                 id: 7,
                 x: 0.0,
                 y: 0.0,
                 transform: None,
-            }],
+            }]
+            .into(),
             style: crate::GlyphStyle::Fill,
         };
         let glyphs = run.glyphs.as_ptr();

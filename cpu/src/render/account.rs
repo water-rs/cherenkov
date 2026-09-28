@@ -121,9 +121,8 @@ const fn shape_bytes(shape: &cherenkov::ShapeData) -> u64 {
 }
 
 /// Heap bytes of a glyph run's positioned glyphs and coordinates.
-const fn glyph_run_bytes(run: &cherenkov::GlyphRun) -> u64 {
-    (run.glyphs.capacity() * size_of::<cherenkov::Glyph>()
-        + run.coords.capacity() * size_of::<i16>()) as u64
+fn glyph_run_bytes(run: &cherenkov::GlyphRun) -> u64 {
+    (run.glyphs.len() * size_of::<cherenkov::Glyph>() + run.coords.len() * size_of::<i16>()) as u64
 }
 
 /// Heap bytes of a front-end paint's own allocations.

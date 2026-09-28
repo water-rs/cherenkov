@@ -39,7 +39,8 @@ fn text_runs(font: cherenkov::FontId, count: u32, size: f32) -> Vec<GlyphRun> {
     (0..count.div_ceil(FONT_GLYPHS))
         .map(|cycle| {
             let size = (cycle as f32).mul_add(2.0, size);
-            let glyphs = (cycle * FONT_GLYPHS..(cycle * FONT_GLYPHS + FONT_GLYPHS).min(count))
+            let glyphs: Vec<_> = (cycle * FONT_GLYPHS
+                ..(cycle * FONT_GLYPHS + FONT_GLYPHS).min(count))
                 .map(|i| cherenkov::Glyph {
                     id: 1 + i % FONT_GLYPHS,
                     x: (i % 32) as f32 * (size * 0.8),
@@ -50,8 +51,8 @@ fn text_runs(font: cherenkov::FontId, count: u32, size: f32) -> Vec<GlyphRun> {
             GlyphRun {
                 font,
                 size,
-                coords: Vec::new(),
-                glyphs,
+                coords: Vec::new().into(),
+                glyphs: glyphs.into(),
                 style: cherenkov::GlyphStyle::Fill,
             }
         })

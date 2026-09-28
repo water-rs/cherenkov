@@ -19,7 +19,7 @@ fn run(font: cherenkov::FontId) -> GlyphRun {
     GlyphRun {
         font,
         size: 64.0,
-        coords: Vec::new(),
+        coords: Vec::new().into(),
         glyphs: [
             Glyph {
                 id: 1,

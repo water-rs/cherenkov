@@ -251,7 +251,7 @@ fn many_timed_frames(engine: &Engine<Gpu>) -> Result<(), Box<dyn std::error::Err
         let run = cherenkov::GlyphRun {
             font: font.id(),
             size: 12.0 + f32::from(u16::try_from(frame)?),
-            coords: Vec::new(),
+            coords: Vec::new().into(),
             glyphs: (0..40u16)
                 .map(|i| cherenkov::Glyph {
                     id: 1 + (u32::from(i) + frame) % 60,
@@ -259,7 +259,8 @@ fn many_timed_frames(engine: &Engine<Gpu>) -> Result<(), Box<dyn std::error::Err
                     y: 40.0 + f32::from(i / 10) * 50.0,
                     transform: None,
                 })
-                .collect(),
+                .collect::<Vec<_>>()
+                .into(),
             style: cherenkov::GlyphStyle::Fill,
         };
         surface.update(|tx| {
@@ -443,13 +444,14 @@ fn variants_split_ranges_but_not_pixels() -> Result<(), Box<dyn std::error::Erro
     let run = cherenkov::GlyphRun {
         font: font.id(),
         size: 24.0,
-        coords: Vec::new(),
+        coords: Vec::new().into(),
         glyphs: vec![cherenkov::Glyph {
             id: 1,
             x: 32.0,
             y: 88.0,
             transform: None,
-        }],
+        }]
+        .into(),
         style: cherenkov::GlyphStyle::Fill,
     };
     surface.update(|tx| {

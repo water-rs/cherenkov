@@ -1024,7 +1024,7 @@ fn glyph_run(
     Ok(cherenkov::GlyphRun {
         font,
         size: run.size,
-        coords,
+        coords: coords.into(),
         glyphs: run
             .glyphs
             .iter()
@@ -1034,7 +1034,8 @@ fn glyph_run(
                 y: g.y,
                 transform: g.transform,
             })
-            .collect(),
+            .collect::<Vec<_>>()
+            .into(),
         style: run
             .stroke
             .as_ref()

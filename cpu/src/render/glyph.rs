@@ -214,7 +214,7 @@ pub fn stroke_outlines(
     let coords: Vec<F2Dot14> = run.coords.iter().map(|c| F2Dot14::from_bits(*c)).collect();
     let outlines = font_ref.outline_glyphs();
     let mut paths = Vec::with_capacity(run.glyphs.len());
-    for glyph in &run.glyphs {
+    for glyph in run.glyphs.iter() {
         let path = outline(&outlines, &coords, glyph.id)?.ok_or_else(|| {
             RenderError::Font(format!("glyph {} has no stroke outline", glyph.id))
         })?;
@@ -421,8 +421,8 @@ mod budget_tests {
         let run = GlyphRun {
             font: cherenkov::FontId::new(1),
             size: 12.0,
-            coords: vec![],
-            glyphs: vec![],
+            coords: Vec::new().into(),
+            glyphs: Vec::new().into(),
             style: cherenkov::GlyphStyle::Fill,
         };
         let key = glyph_key(&run, 1, (0.0, 0.0), Affine::IDENTITY);

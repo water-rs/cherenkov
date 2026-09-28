@@ -391,8 +391,8 @@ Shaping stays outside the engine: parley, which covers complex scripts (Arabic, 
 ```rust
 c.text(&layout, origin);          // parley adapter: TextLayout wraps parley::Layout<Paint>
 c.glyphs(&GlyphRun {
-    font, size: 17.0, coords: variation_coords,
-    glyphs,                       // id, position, and an optional per-glyph transform (vertical CJK)
+    font, size: 17.0, coords: variation_coords.into(),
+    glyphs: glyphs.into(),        // id, position, and an optional per-glyph transform (vertical CJK)
     style: GlyphStyle::Fill,
 }, paint);                        // paint is a separate parameter, so it can be bound to a signal
 ```

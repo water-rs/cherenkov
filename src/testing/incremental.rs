@@ -412,7 +412,7 @@ fn run(font: FontId, count: u32, value: f64) -> GlyphRun {
     GlyphRun {
         font,
         size: 14.,
-        coords: Vec::new(),
+        coords: Vec::new().into(),
         style: GlyphStyle::Fill,
         glyphs: (0..count)
             .map(|i| Glyph {
@@ -421,7 +421,8 @@ fn run(font: FontId, count: u32, value: f64) -> GlyphRun {
                 y: 65. + if value > 0.5 { 0.25 } else { 0.75 },
                 transform: None,
             })
-            .collect(),
+            .collect::<Vec<_>>()
+            .into(),
     }
 }
 
@@ -564,12 +565,14 @@ fn assert_patch_counts<R: Renderer>(
             }
         })
         .expect("glyph fixture");
-    changed_run.glyphs.push(Glyph {
+    let mut glyphs = changed_run.glyphs.to_vec();
+    glyphs.push(Glyph {
         id: 36,
         x: 12.,
         y: 60.,
         transform: None,
     });
+    changed_run.glyphs = glyphs.into();
     renderer.set_content(
         id,
         layer,
@@ -636,12 +639,14 @@ async fn assert_patch_counts<R: Renderer>(
             }
         })
         .expect("glyph fixture");
-    changed_run.glyphs.push(Glyph {
+    let mut glyphs = changed_run.glyphs.to_vec();
+    glyphs.push(Glyph {
         id: 36,
         x: 12.,
         y: 60.,
         transform: None,
     });
+    changed_run.glyphs = glyphs.into();
     renderer.set_content(
         id,
         layer,

@@ -336,3 +336,55 @@ fn member_inside_blended_descendant_layer_sees_the_layer_contents()
     assert_pixel(pixel(&readback, 28, 28), [0.0, 0.0, 1.0, 1.0], 1e-3);
     Ok(())
 }
+
+/// A member layer that itself isolates (opacity < 1 on a Normal blend):
+/// the member's sample draws to the current target under the member
+/// clip, before and outside the layer's own isolation, so it is not
+/// attenuated by the layer opacity; the layer's content is (#134).
+#[test]
+fn member_sample_is_not_attenuated_by_layer_opacity() -> Result<(), Box<dyn std::error::Error>> {
+    fn render(opacity: f32) -> Result<cherenkov::Readback, Box<dyn std::error::Error>> {
+        let engine = Engine::<Gpu>::new(GpuConfig::default())?;
+        let surface = engine.surface(Offscreen::new((32, 32), OffscreenFormat::LinearF16))?;
+        let group = surface.backdrop_group_unfiltered();
+        let member = surface.layer();
+        let child = surface.layer();
+        surface.update(|tx| {
+            tx[surface.root()].content(surface.record(|r| {
+                r.fill(
+                    Rect::new(0.0, 0.0, 32.0, 32.0),
+                    WorkingColor::new([1.0, 0.0, 0.0, 1.0]),
+                );
+            }));
+            tx[surface.root()].push(&member);
+            tx[&member]
+                .clip(RoundedRect::new(4.0, 4.0, 28.0, 28.0, 6.0))
+                .opacity(opacity)
+                .backdrop(group.sample());
+            tx[&member].push(&child);
+            tx[&child].content(surface.record(|r| {
+                r.fill(
+                    Rect::new(16.0, 4.0, 28.0, 28.0),
+                    WorkingColor::new([0.0, 0.0, 1.0, 1.0]),
+                );
+            }));
+        });
+        engine.render(FrameTime::now())?;
+        Ok(surface.readback()?)
+    }
+
+    let half = render(0.5)?;
+    // Sample-only area (left half of the clip): the red backdrop at full
+    // strength, unaffected by the layer's 0.5 opacity.
+    assert_pixel(pixel(&half, 10, 16), [1.0, 0.0, 0.0, 1.0], 1e-3);
+    // Inside the child: 50% blue over the sampled red = [0.5, 0.0, 0.5].
+    assert_pixel(pixel(&half, 20, 16), [0.5, 0.0, 0.5, 1.0], 1e-3);
+    // Outside the clip: the surface is untouched.
+    assert_pixel(pixel(&half, 1, 16), [1.0, 0.0, 0.0, 1.0], 1e-3);
+    // The clip edge is not squared: a corner pixel's coverage matches the
+    // same layer at full opacity.
+    let full = render(1.0)?;
+    assert_pixel(pixel(&half, 5, 5), pixel(&full, 5, 5), 1e-3);
+    assert_pixel(pixel(&half, 7, 7), pixel(&full, 7, 7), 1e-3);
+    Ok(())
+}

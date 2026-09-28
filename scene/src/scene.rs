@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    BlendMode, Color, ColorSpace, Draw, Extend, Item, Layer, Paint, ResourceHash, SceneError, Shape,
+    BlendMode, Color, ColorSpace, Draw, Extend, ImageEncoding, Item, Layer, Paint, ResourceHash,
+    SceneError, Shape,
 };
 
 /// The file name of the serialized scene inside a scene directory.
@@ -74,6 +75,10 @@ pub enum Feature {
     /// A gradient or image pattern with `Extend::None` (transparent outside
     /// the domain). Several paint APIs only offer pad/repeat/reflect.
     ExtendNone,
+    /// An image resource in `Rgba16F` encoding (half-float texels).
+    ImageF16,
+    /// An image resource in a non-sRGB colour space (payload is the space).
+    ImageColorSpace(crate::ImageColorSpace),
     /// A gradient whose stops are interpolated in the payload space. Engines
     /// that cannot interpolate in a declared space must report it instead of
     /// silently remapping.
@@ -147,6 +152,7 @@ impl Scene {
         // it from the layer tree and reject scenes that lie about what they
         // use (a stale or hand-edited file would otherwise bypass an
         // adapter's capability check).
+        scene.validate_image_encodings()?;
         let declared = std::mem::take(&mut scene.features);
         scene.compute_features();
         if scene.features != declared {
@@ -231,6 +237,42 @@ fn collect_resource_refs(layer: &Layer, out: &mut Vec<ResourceHash>) {
     }
 }
 
+impl Scene {
+    /// Validates every `Draw::Image`/`Paint::Image` encoding declaration.
+    ///
+    /// # Errors
+    /// [`SceneError::InvalidImageEncoding`] on the first bad declaration.
+    fn validate_image_encodings(&self) -> Result<(), SceneError> {
+        fn paint_encoding(paint: &Paint) -> Option<&ImageEncoding> {
+            match paint {
+                Paint::Transformed { paint, .. } => paint_encoding(paint),
+                Paint::Image(ip) => Some(&ip.encoding),
+                _ => None,
+            }
+        }
+        fn visit(layer: &Layer) -> Result<(), SceneError> {
+            for item in &layer.items {
+                match item {
+                    Item::Layer(l) => visit(l)?,
+                    Item::Draw(d) => match d {
+                        Draw::Image { encoding, .. } => encoding.validate()?,
+                        Draw::Fill { paint, .. }
+                        | Draw::Stroke { paint, .. }
+                        | Draw::Glyphs(crate::GlyphRun { paint, .. }) => {
+                            if let Some(encoding) = paint_encoding(paint) {
+                                encoding.validate()?;
+                            }
+                        }
+                        Draw::Shadow { .. } => {}
+                    },
+                }
+            }
+            Ok(())
+        }
+        visit(&self.root)
+    }
+}
+
 fn collect_paint_resources(paint: &Paint, out: &mut Vec<ResourceHash>) {
     match paint {
         Paint::Transformed { paint, .. } => collect_paint_resources(paint, out),
@@ -278,9 +320,24 @@ fn collect_paint_features(paint: &Paint, f: &mut BTreeSet<Feature>) {
         }
         Paint::Image(ip) => {
             f.insert(Feature::ImagePaint);
+            collect_encoding_features(&ip.encoding, f);
             if ip.extend_x == Extend::None || ip.extend_y == Extend::None {
                 f.insert(Feature::ExtendNone);
             }
+        }
+    }
+}
+
+fn collect_encoding_features(encoding: &ImageEncoding, f: &mut BTreeSet<Feature>) {
+    match encoding {
+        ImageEncoding::Png { color_space } => {
+            if *color_space != crate::ImageColorSpace::Srgb {
+                f.insert(Feature::ImageColorSpace(*color_space));
+            }
+        }
+        ImageEncoding::Rgba16F { color_space, .. } => {
+            f.insert(Feature::ImageF16);
+            f.insert(Feature::ImageColorSpace(*color_space));
         }
     }
 }
@@ -373,8 +430,9 @@ fn collect_layer_features(layer: &Layer, f: &mut BTreeSet<Feature>) {
                     }
                     collect_paint_features(&run.paint, f);
                 }
-                Draw::Image { .. } => {
+                Draw::Image { encoding, .. } => {
                     f.insert(Feature::Image);
+                    collect_encoding_features(encoding, f);
                 }
             },
         }

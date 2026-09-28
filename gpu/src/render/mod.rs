@@ -1537,7 +1537,7 @@ impl Renderer for GpuRenderer {
                 }
             };
             let lin = match image.color_space {
-                cherenkov::ImageColorSpace::LinearSrgb => {
+                cherenkov::ImageColorSpace::LinearSrgb | cherenkov::ImageColorSpace::LinearP3 => {
                     [decode(px[0]), decode(px[1]), decode(px[2])]
                 }
                 _ => [
@@ -1548,7 +1548,8 @@ impl Renderer for GpuRenderer {
             };
             // sRGB-primaries input additionally needs the primaries'
             // matrix; Display P3 uses sRGB's transfer function, so the
-            // decode above covers both encoded spaces.
+            // decode above covers both encoded spaces. `LinearP3` is
+            // already the working space: no transfer, no matrix.
             let lin_p3 = match image.color_space {
                 cherenkov::ImageColorSpace::Srgb | cherenkov::ImageColorSpace::LinearSrgb => {
                     let [x, y, z] = [
@@ -1571,7 +1572,7 @@ impl Renderer for GpuRenderer {
                         XYZ_TO_P3[2][2].mul_add(z, XYZ_TO_P3[2][1].mul_add(y, XYZ_TO_P3[2][0] * x)),
                     ]
                 }
-                cherenkov::ImageColorSpace::DisplayP3 => lin,
+                cherenkov::ImageColorSpace::DisplayP3 | cherenkov::ImageColorSpace::LinearP3 => lin,
             };
             for v in [a * lin_p3[0], a * lin_p3[1], a * lin_p3[2], a] {
                 data.extend_from_slice(&half::f16::from_f64(v).to_le_bytes());

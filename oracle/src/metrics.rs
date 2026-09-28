@@ -8,17 +8,18 @@
 //!   "FLIP: A Difference Evaluator for Alternating Images", HPG 2020.
 //! - Andersson, Nilsson, Åström, Oskarsson. "HDR-FLIP", 2021.
 //!
-//! Inputs are linear-light RGB in sRGB primaries (the metrics layer converts
-//! the working space, linear Display P3, to linear sRGB and compares
-//! premultiplied RGBA: premultiplied RGB is the colour over black, which is
-//! what an opaque-surface comparison sees).
+//! Inputs are linear-light RGB in Display P3 primaries — the working space
+//! itself (premultiplied RGBA: premultiplied RGB is the colour over black,
+//! which is what an opaque-surface comparison sees). FLIP's XYZ step uses
+//! the P3→XYZ matrix, so colours outside the sRGB gamut are measured rather
+//! than clipped into it; `cmax` is the P3 green–blue `HyAB` distance.
 //!
 //! PPD uses the reference default: viewing distance 0.7 m, screen width
 //! 3840 px, monitor width 0.7 m → `0.7 * (3840 / 0.7) * π/180 ≈ 67.0`.
 
 use std::f64::consts::PI;
 
-use crate::color::{linear_p3_to_linear_srgb, mat3_mul};
+use crate::color::{P3_TO_XYZ, mat3_inv, mat3_mul};
 use crate::image::F32Image;
 
 /// The default pixels-per-degree of the reference implementation.
@@ -38,33 +39,6 @@ const B2: [f64; 3] = [1.0e-5, 1.0e-5, 0.025];
 const INV_ILLUMINANT: [f64; 3] = [1.052156925, 1.0, 0.918357670];
 #[allow(clippy::unreadable_literal)]
 const ILLUMINANT: [f64; 3] = [0.950428545, 1.0, 1.088900371];
-
-/// Linear RGB to XYZ (D65), the matrix used by the reference implementation.
-#[allow(clippy::unreadable_literal)] // exact reference rationals
-const RGB_TO_XYZ: [[f64; 3]; 3] = [
-    [
-        10135552.0 / 24577794.0,
-        8788810.0 / 24577794.0,
-        4435075.0 / 24577794.0,
-    ],
-    [
-        2613072.0 / 12288897.0,
-        8788810.0 / 12288897.0,
-        887015.0 / 12288897.0,
-    ],
-    [
-        1425312.0 / 73733382.0,
-        8788810.0 / 73733382.0,
-        70074185.0 / 73733382.0,
-    ],
-];
-
-#[allow(clippy::unreadable_literal)]
-const XYZ_TO_RGB: [[f64; 3]; 3] = [
-    [3.241003275, -1.537398934, -0.498615861],
-    [-0.969224334, 1.875930071, 0.041554224],
-    [0.055639423, -0.204011202, 1.057148933],
-];
 
 /// ACES tone-mapping coefficients (index 1 of `ToneMappingCoefficients`).
 const ACES: [f64; 6] = [0.9036, 0.018, 0.0, 0.8748, 0.354, 0.14];
@@ -129,7 +103,7 @@ fn gaussian_sqrt(x2: f64, a: f64, b: f64) -> f64 {
 
 /// Compute `cmax` (maximum `HyAB` distance, green vs blue, `gqc`-powered).
 fn compute_max_distance() -> f64 {
-    let lab = |rgb: [f64; 3]| xyz_to_cielab(mat3_mul(&RGB_TO_XYZ, rgb));
+    let lab = |rgb: [f64; 3]| xyz_to_cielab(mat3_mul(&P3_TO_XYZ, rgb));
     let g = lab([0.0, 1.0, 0.0]);
     let b = lab([0.0, 0.0, 1.0]);
     let gh = [g[0], hunt(g[0], g[1]), hunt(g[0], g[2])];
@@ -232,10 +206,11 @@ fn color_difference(
     pccmax: f64,
 ) -> Vec<f64> {
     let radius = fycx.len() / 2;
+    let xyz_to_p3 = mat3_inv(&P3_TO_XYZ);
     // Step 1: YCxCz conversion.
     let to_ycxcz = |img: &[[f64; 3]]| -> Vec<[f64; 3]> {
         img.iter()
-            .map(|rgb| xyz_to_ycxcz(mat3_mul(&RGB_TO_XYZ, *rgb)))
+            .map(|rgb| xyz_to_ycxcz(mat3_mul(&P3_TO_XYZ, *rgb)))
             .collect()
     };
     let ref_ycxcz = to_ycxcz(reference);
@@ -280,12 +255,12 @@ fn color_difference(
                 }
                 [sycx[0], sycx[1], scz[0] + scz[1]]
             };
-            let rgb_r = mat3_mul(&XYZ_TO_RGB, ycxcz_to_xyz(filtered(&ref_ycx, &ref_cz)))
+            let rgb_r = mat3_mul(&xyz_to_p3, ycxcz_to_xyz(filtered(&ref_ycx, &ref_cz)))
                 .map(|v| v.clamp(0.0, 1.0));
-            let rgb_t = mat3_mul(&XYZ_TO_RGB, ycxcz_to_xyz(filtered(&test_ycx, &test_cz)))
+            let rgb_t = mat3_mul(&xyz_to_p3, ycxcz_to_xyz(filtered(&test_ycx, &test_cz)))
                 .map(|v| v.clamp(0.0, 1.0));
-            let lab_r = xyz_to_cielab(mat3_mul(&RGB_TO_XYZ, rgb_r));
-            let lab_t = xyz_to_cielab(mat3_mul(&RGB_TO_XYZ, rgb_t));
+            let lab_r = xyz_to_cielab(mat3_mul(&P3_TO_XYZ, rgb_r));
+            let lab_t = xyz_to_cielab(mat3_mul(&P3_TO_XYZ, rgb_t));
             let hr = [lab_r[0], hunt(lab_r[0], lab_r[1]), hunt(lab_r[0], lab_r[2])];
             let ht = [lab_t[0], hunt(lab_t[0], lab_t[1]), hunt(lab_t[0], lab_t[2])];
             let mut cd = hyab(hr, ht).powf(GQC);
@@ -359,8 +334,8 @@ fn feature_difference(
     out
 }
 
-/// LDR FLIP error map between two linear-RGB images (`w*h` RGB pixels,
-/// values in `[0,1]`). Returns per-pixel error in `[0,1]`.
+/// LDR FLIP error map between two linear-P3 images (`w*h` RGB pixels,
+/// values in the P3 gamut `[0,1]`). Returns per-pixel error in `[0,1]`.
 #[must_use]
 pub fn ldr_flip(
     reference: &[[f64; 3]],
@@ -380,7 +355,7 @@ pub fn ldr_flip(
     let cd = color_difference(&r, &t, width, height, &fycx, &fcz, cmax, pccmax);
     let to_y = |img: &[[f64; 3]]| -> Vec<f64> {
         img.iter()
-            .map(|rgb| xyz_to_ycxcz(mat3_mul(&RGB_TO_XYZ, *rgb))[0])
+            .map(|rgb| xyz_to_ycxcz(mat3_mul(&P3_TO_XYZ, *rgb))[0])
             .collect()
     };
     let fd = feature_difference(&to_y(&r), &to_y(&t), width, height, &feature_filter(ppd));
@@ -483,18 +458,18 @@ pub fn max_local_error(reference: &F32Image, test: &F32Image) -> f64 {
     max
 }
 
-/// Convert a premultiplied linear-P3 `f32` image to linear sRGB `f64` RGB
-/// for FLIP (premultiplied = over-black comparison).
+/// Extract a premultiplied linear-P3 `f32` image's RGB as `f64` for FLIP
+/// (premultiplied = over-black comparison).
 #[must_use]
-pub fn to_linear_srgb(img: &F32Image) -> Vec<[f64; 3]> {
+pub fn to_linear_p3(img: &F32Image) -> Vec<[f64; 3]> {
     img.pixels
         .iter()
-        .map(|p| linear_p3_to_linear_srgb([f64::from(p[0]), f64::from(p[1]), f64::from(p[2])]))
+        .map(|p| [f64::from(p[0]), f64::from(p[1]), f64::from(p[2])])
         .collect()
 }
 
-/// Whether `img` has any HDR content (channel > 1.0 after linear-P3 →
-/// linear-sRGB conversion; alpha excluded).
+/// Whether `img` has any HDR content (channel > 1.0 in linear P3; alpha
+/// excluded).
 #[must_use]
 pub fn is_hdr(img: &[[f64; 3]]) -> bool {
     img.iter().any(|c| c.iter().any(|v| *v > 1.0))
@@ -549,8 +524,8 @@ pub struct Metrics {
 )]
 pub fn compare(reference: &F32Image, test: &F32Image) -> (Metrics, Vec<u8>) {
     let (w, h) = (reference.width as usize, reference.height as usize);
-    let ref_rgb = to_linear_srgb(reference);
-    let test_rgb = to_linear_srgb(test);
+    let ref_rgb = to_linear_p3(reference);
+    let test_rgb = to_linear_p3(test);
     let hdr = is_hdr(&ref_rgb);
     let error = if hdr {
         hdr_flip(&ref_rgb, &test_rgb, w, h, DEFAULT_PPD)

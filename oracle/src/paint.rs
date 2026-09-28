@@ -234,7 +234,7 @@ fn eval_image_paint(
     p: Point,
     resources: &mut Resources,
 ) -> Result<[f64; 4], cherenkov_scene::SceneError> {
-    let img = resources.image(ip.image)?;
+    let img = resources.image(ip.image, ip.encoding)?;
     let (w, h) = (img.width as f64, img.height as f64);
     let q = ip.transform.inverse() * p;
     let Some(u) = extend_t(q.x / w, ip.extend_x).map(|t| t * w) else {

@@ -404,6 +404,7 @@ fn lower_draw<B>(
             image,
             dst,
             sampling,
+            ..
         } => {
             let data = prepared.image(*image)?;
             Op::ImageFill {

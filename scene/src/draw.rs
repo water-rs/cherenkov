@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{Color, ColorSpace, ResourceHash, Shape};
+use crate::{Color, ColorSpace, ResourceHash, SceneError, Shape};
 use kurbo::{Affine, Point, Rect};
 
 /// How a fill decides coverage: the winding rule or parity.
@@ -209,11 +209,90 @@ pub struct SweepGradient {
     pub interpolation: ColorSpace,
 }
 
+/// Primaries and transfer of an image resource.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum ImageColorSpace {
+    /// sRGB primaries and transfer function.
+    #[default]
+    Srgb,
+    /// Display P3 primaries with the sRGB transfer function.
+    DisplayP3,
+    /// Linear-light sRGB primaries.
+    LinearSrgb,
+    /// Linear-light Display P3 — the suite's working space.
+    LinearP3,
+}
+
+/// How an image resource's bytes decode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "encoding", rename_all = "kebab-case")]
+pub enum ImageEncoding {
+    /// An 8-bit PNG with the sRGB transfer curve in `color_space`'s
+    /// primaries (`Srgb` or `DisplayP3`).
+    Png {
+        /// The encoded primaries.
+        #[serde(default)]
+        color_space: ImageColorSpace,
+    },
+    /// Raw little-endian IEEE half floats, `width * height * 4` channels,
+    /// straight alpha, linear light in `color_space`'s primaries
+    /// (`LinearSrgb` or `LinearP3`).
+    Rgba16F {
+        /// Width in pixels.
+        width: u32,
+        /// Height in pixels.
+        height: u32,
+        /// The encoded primaries.
+        color_space: ImageColorSpace,
+    },
+}
+
+impl Default for ImageEncoding {
+    fn default() -> Self {
+        Self::Png {
+            color_space: ImageColorSpace::Srgb,
+        }
+    }
+}
+
+impl ImageEncoding {
+    /// `true` for the default encoding (8-bit sRGB PNG).
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Rejects an encoding/colour-space combination that cannot decode.
+    ///
+    /// # Errors
+    /// [`SceneError::InvalidImageEncoding`] on an incompatible pair or a
+    /// zero dimension.
+    pub const fn validate(&self) -> Result<(), SceneError> {
+        match *self {
+            Self::Png {
+                color_space: ImageColorSpace::Srgb | ImageColorSpace::DisplayP3,
+            } => Ok(()),
+            Self::Rgba16F {
+                width,
+                height,
+                color_space: ImageColorSpace::LinearSrgb | ImageColorSpace::LinearP3,
+            } if width > 0 && height > 0 => Ok(()),
+            _ => Err(SceneError::InvalidImageEncoding(*self)),
+        }
+    }
+}
+
 /// An image pattern paint.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ImagePaint {
-    /// BLAKE3 hash of the image blob in `resources/` (PNG).
+    /// BLAKE3 hash of the image blob in `resources/`.
     pub image: ResourceHash,
+    /// How the blob's bytes decode (default: 8-bit sRGB PNG).
+    #[serde(default, skip_serializing_if = "ImageEncoding::is_default")]
+    pub encoding: ImageEncoding,
     /// Maps pattern space into the paint's user space.
     pub transform: Affine,
     /// Horizontal edge behaviour.
@@ -554,8 +633,11 @@ pub enum Draw {
     Glyphs(GlyphRun),
     /// An image drawn into a destination rectangle.
     Image {
-        /// BLAKE3 hash of the image blob in `resources/` (PNG).
+        /// BLAKE3 hash of the image blob in `resources/`.
         image: ResourceHash,
+        /// How the blob's bytes decode (default: 8-bit sRGB PNG).
+        #[serde(default, skip_serializing_if = "ImageEncoding::is_default")]
+        encoding: ImageEncoding,
         /// Destination rectangle in user space.
         dst: Rect,
         /// Sampling quality.

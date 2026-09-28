@@ -22,8 +22,9 @@ use cherenkov::{
 use cherenkov_gpu::{Gpu, GpuConfig, ScratchFormat};
 use cherenkov_oracle::color::to_working;
 use cherenkov_scene::{
-    BlendMode, ColorSpace, Draw as SceneDraw, Extend, Feature, GlyphRun as SceneGlyphRun, Item,
-    Layer as SceneLayer, Paint as ScenePaint, ResourceHash, Shape,
+    BlendMode, ColorSpace, Draw as SceneDraw, Extend, Feature, GlyphRun as SceneGlyphRun,
+    ImageColorSpace, ImageEncoding, Item, Layer as SceneLayer, Paint as ScenePaint, ResourceHash,
+    Shape,
 };
 use kurbo::{Affine, BezPath, Circle, Ellipse, Line, Rect, RoundedRect, Vec2};
 
@@ -434,8 +435,8 @@ pub struct Cherenkov {
     surface: Option<Surface<Gpu>>,
     /// Registered fonts per `(blob hash, face index)`.
     fonts: HashMap<(ResourceHash, u32), cherenkov::Font>,
-    /// Registered images per blob hash (kept alive for the engine).
-    images: HashMap<ResourceHash, cherenkov::ImageId>,
+    /// Registered images per (blob hash, declared encoding).
+    images: HashMap<(ResourceHash, ImageEncoding), cherenkov::ImageId>,
     /// The `Image` handles keeping `images` registered.
     image_handles: Vec<cherenkov::Image<cherenkov::Rgba8>>,
     /// Layers holding recorded content, in draw order.
@@ -484,6 +485,10 @@ fn cherenkov_features() -> Vec<Feature> {
         Feature::Image,
         Feature::ImagePaint,
         Feature::ExtendNone,
+        // Display P3 PNGs upload verbatim; `Rgba16F` blobs and the linear
+        // spaces they can carry stay unsupported until the engine grows an
+        // `Uploads<Rgba16F>` path.
+        Feature::ImageColorSpace(ImageColorSpace::DisplayP3),
         // `sRGB` maps to `SrgbEncoded`; `linear-p3` and `linear-srgb` are
         // both linear interpolation, which is the working space already.
         Feature::InterpolationSpace(ColorSpace::Srgb),
@@ -619,7 +624,7 @@ fn stops(stops: &[cherenkov_scene::GradientStop]) -> Vec<cherenkov::ColorStop> {
 /// A scene paint → the front-end paint.
 fn front_paint(
     paint: &ScenePaint,
-    images: &HashMap<ResourceHash, cherenkov::ImageId>,
+    images: &HashMap<(ResourceHash, ImageEncoding), cherenkov::ImageId>,
 ) -> Result<cherenkov::Paint, BenchError> {
     Ok(match paint {
         ScenePaint::Transformed { paint, transform } => {
@@ -667,7 +672,7 @@ fn front_paint(
         }),
         ScenePaint::Image(p) => cherenkov::Paint::Image(cherenkov::ImagePattern {
             image: *images
-                .get(&p.image)
+                .get(&(p.image, p.encoding))
                 .ok_or(cherenkov_scene::SceneError::MissingResource(p.image))?,
             transform: p.transform,
             extend_x: extend(p.extend_x),
@@ -713,7 +718,7 @@ fn clip_shape(edit: &mut LayerEdit<Gpu>, shape: &ShapeKind) {
 fn op(
     draw: &SceneDraw,
     fonts: &HashMap<(ResourceHash, u32), cherenkov::Font>,
-    images: &HashMap<ResourceHash, cherenkov::ImageId>,
+    images: &HashMap<(ResourceHash, ImageEncoding), cherenkov::ImageId>,
     blobs: &Blobs,
 ) -> Result<Op, BenchError> {
     Ok(match draw {
@@ -747,11 +752,12 @@ fn op(
         },
         SceneDraw::Image {
             image,
+            encoding,
             dst,
             sampling,
         } => Op::Image {
             image: *images
-                .get(image)
+                .get(&(*image, *encoding))
                 .ok_or(cherenkov_scene::SceneError::MissingResource(*image))?,
             dst: *dst,
             sampling: match sampling {
@@ -834,41 +840,68 @@ fn register_fonts(
     Ok(())
 }
 
-/// Registers one scene image resource, once per hash.
+/// Registers one scene image resource, once per (hash, encoding).
 ///
-/// PNGs carry sRGB data; [`cherenkov_oracle::image::decode_png_rgba8`] is the
-/// shared decoder the oracle and every adapter use, and the engine converts
-/// to the working space at upload.
+/// PNGs carry encoded sRGB or Display P3 data;
+/// [`cherenkov_oracle::image::decode_png_rgba8`] is the shared decoder the
+/// oracle and every adapter use, and the engine converts to the working
+/// space at upload. `Rgba16F` blobs report `image-f16` unsupported: the
+/// engine has no `Uploads<Rgba16F>` impl.
 fn register_image(
-    images: &mut HashMap<ResourceHash, cherenkov::ImageId>,
+    images: &mut HashMap<(ResourceHash, ImageEncoding), cherenkov::ImageId>,
     handles: &mut Vec<cherenkov::Image<cherenkov::Rgba8>>,
     engine: &GpuEngine<Gpu>,
     hash: &ResourceHash,
+    encoding: ImageEncoding,
     blobs: &Blobs,
 ) -> Result<(), BenchError> {
-    if images.contains_key(hash) {
+    let key = (*hash, encoding);
+    if images.contains_key(&key) {
         return Ok(());
     }
     let blob = blobs
         .get(hash)
         .ok_or(cherenkov_scene::SceneError::MissingResource(*hash))?;
-    let (width, height, rgba) = cherenkov_oracle::image::decode_png_rgba8(blob)
-        .map_err(|e| BenchError::Engine(format!("cherenkov image decode: {e}")))?;
+    let (width, height, rgba, color_space) = match encoding {
+        ImageEncoding::Png { color_space } => {
+            let (width, height, rgba) = cherenkov_oracle::image::decode_png_rgba8(blob)
+                .map_err(|e| BenchError::Engine(format!("cherenkov image decode: {e}")))?;
+            let space = match color_space {
+                ImageColorSpace::Srgb => cherenkov::ImageColorSpace::Srgb,
+                ImageColorSpace::DisplayP3 => cherenkov::ImageColorSpace::DisplayP3,
+                _ => {
+                    return Err(BenchError::Engine(format!(
+                        "PNG images are sRGB-encoded, not {color_space:?}"
+                    )));
+                }
+            };
+            (width, height, rgba, space)
+        }
+        // The engine has no `Uploads<Rgba16F>` impl: report the feature the
+        // scene needed rather than faking an upload.
+        ImageEncoding::Rgba16F { .. } => {
+            return Err(BenchError::Unsupported {
+                engine: Cherenkov::NAME,
+                feature: Feature::ImageF16,
+                api: Some("Rgba16F image upload"),
+            });
+        }
+    };
     let image = engine
         .image(
             ImageData::<Rgba8>::new(width, height, rgba)
                 .map_err(|e| BenchError::Engine(format!("cherenkov image: {e}")))?
-                .color_space(cherenkov::ImageColorSpace::Srgb),
+                .color_space(color_space),
         )
         .map_err(|e| BenchError::Engine(format!("cherenkov image: {e}")))?;
-    images.insert(*hash, image.id());
+    images.insert(key, image.id());
     handles.push(image);
     Ok(())
 }
 
 /// Registers every image referenced by draws or image paints in `layer`.
 fn register_images(
-    images: &mut HashMap<ResourceHash, cherenkov::ImageId>,
+    images: &mut HashMap<(ResourceHash, ImageEncoding), cherenkov::ImageId>,
     handles: &mut Vec<cherenkov::Image<cherenkov::Rgba8>>,
     engine: &GpuEngine<Gpu>,
     layer: &SceneLayer,
@@ -877,8 +910,10 @@ fn register_images(
     for item in &layer.items {
         match item {
             Item::Layer(l) => register_images(images, handles, engine, l, blobs)?,
-            Item::Draw(SceneDraw::Image { image, .. }) => {
-                register_image(images, handles, engine, image, blobs)?;
+            Item::Draw(SceneDraw::Image {
+                image, encoding, ..
+            }) => {
+                register_image(images, handles, engine, image, *encoding, blobs)?;
             }
             Item::Draw(d) => {
                 let paint = match d {
@@ -887,7 +922,7 @@ fn register_images(
                     _ => None,
                 };
                 if let Some(p) = paint.and_then(crate::convert::image_paint) {
-                    register_image(images, handles, engine, &p.image, blobs)?;
+                    register_image(images, handles, engine, &p.image, p.encoding, blobs)?;
                 }
             }
         }
@@ -900,7 +935,7 @@ fn register_images(
 fn prep_layer(
     layer: &SceneLayer,
     fonts: &HashMap<(ResourceHash, u32), cherenkov::Font>,
-    images: &HashMap<ResourceHash, cherenkov::ImageId>,
+    images: &HashMap<(ResourceHash, ImageEncoding), cherenkov::ImageId>,
     blobs: &Blobs,
 ) -> Result<PrepLayer, BenchError> {
     // The engine draws a layer's content before its children, so the draws
@@ -990,7 +1025,7 @@ fn live_run(
     index: usize,
     position: usize,
     fonts: &HashMap<(ResourceHash, u32), cherenkov::Font>,
-    images: &HashMap<ResourceHash, cherenkov::ImageId>,
+    images: &HashMap<(ResourceHash, ImageEncoding), cherenkov::ImageId>,
     blobs: &Blobs,
 ) -> Result<Option<LiveRun>, BenchError> {
     let Some(entry) = layer.live.iter().find(|live| live.item == index) else {

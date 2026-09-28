@@ -546,7 +546,7 @@ fn unsupported_feature(u: &str) -> Feature {
         "extend-none" => Feature::ExtendNone,
         "gradient-interpolation" => Feature::InterpolationSpace(ColorSpace::Srgb),
         "blend-space" => Feature::Blend(BlendMode::Normal),
-        "group-filter" => Feature::Opacity,
+        "group-filter" => Feature::Filter,
         "filter" => Feature::Filter,
         "image" => Feature::Image,
         "shadow" => Feature::Shadow,

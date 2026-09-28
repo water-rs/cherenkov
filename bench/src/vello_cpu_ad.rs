@@ -260,7 +260,7 @@ impl Engine for VelloCpu {
         Ok(Submit {
             image,
             gpu: Vec::new(),
-            phases: Vec::new(),
+            phases: None,
         })
     }
 

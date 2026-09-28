@@ -287,7 +287,7 @@ impl Engine for VelloClassic {
         Ok(Submit {
             image,
             gpu: GpuSample::whole_frame(frame, gpu_seconds),
-            phases: Vec::new(),
+            phases: None,
         })
     }
 

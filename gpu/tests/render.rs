@@ -242,7 +242,6 @@ fn many_timed_frames(engine: &Engine<Gpu>) -> Result<(), Box<dyn std::error::Err
     ))?))?;
     let surface = engine.surface(Offscreen::new((256, 256), OffscreenFormat::LinearF16))?;
     let mut submitted = Vec::new();
-    let mut timings = Vec::new();
     for frame in 0..60u32 {
         // A different glyph size each frame keeps rasterising new atlas
         // entries so the atlas grows and eventually clears.
@@ -278,20 +277,18 @@ fn many_timed_frames(engine: &Engine<Gpu>) -> Result<(), Box<dyn std::error::Err
         let stats = engine.stats();
         assert!(stats.passes > 0, "frame {frame} drew nothing: {stats:?}");
         submitted.push((stats.frame.expect("a drawing render submits"), stats.passes));
-        timings.extend(stats.timings);
     }
-    timings.extend(engine.finish_timings()?);
+    let timings = engine.finish_timings()?;
     assert!(
         engine.finish_timings()?.is_empty(),
         "timings are consumed once"
     );
     assert_eq!(engine.render(cherenkov::FrameTime::now())?, Next::Idle);
     let idle = engine.stats();
-    assert!(idle.frame.is_none() && idle.timings.is_empty(), "{idle:?}");
+    assert!(idle.frame.is_none(), "{idle:?}");
     if timed {
-        // Resolves land a frame or more late, but every submitted frame's
-        // timing arrives exactly once, in order, tagged with its frame,
-        // and spans that frame's passes.
+        // Every submitted frame's timing arrives exactly once, in order,
+        // tagged with its frame, and spans that frame's passes.
         assert_eq!(
             timings.iter().map(|t| t.frame).collect::<Vec<_>>(),
             submitted.iter().map(|(f, _)| *f).collect::<Vec<_>>(),

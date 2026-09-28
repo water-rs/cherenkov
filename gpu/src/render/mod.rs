@@ -407,6 +407,8 @@ pub struct GpuRenderer {
     /// Frames whose timestamp resolve was submitted but whose staging
     /// buffer is not mapped yet — read on a later call, in order.
     pending_timestamps: VecDeque<PendingTimestamps>,
+    /// Resolved timings retained until `finish_timings`.
+    timings: Vec<FrameTiming>,
     /// Passes encoded this frame, for the per-pass report.
     frame_pass_count: u32,
     /// `(name, width, height, format)` of each encoded pass this frame.
@@ -1303,6 +1305,7 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             query_staging: Vec::new(),
             query_capacity,
             pending_timestamps: VecDeque::new(),
+            timings: Vec::new(),
             frame_pass_count: 0,
             pass_meta: Vec::new(),
             wait_timeout: config.wait_timeout,
@@ -1515,6 +1518,7 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
         query_staging: Vec::new(),
         query_capacity,
         pending_timestamps: VecDeque::new(),
+        timings: Vec::new(),
         frame_pass_count: 0,
         pass_meta: Vec::new(),
         wait_timeout: config.wait_timeout,
@@ -2200,7 +2204,7 @@ impl Renderer for GpuRenderer {
         if let Some(last) = self.pending_queries.back().map(|p| p.submission.clone()) {
             self.wait(last, "timestamp draws")?;
         }
-        let mut timings = self.drain_timestamps();
+        self.drain_timestamps();
         if !self.pending_queries.is_empty() {
             return Err(RenderError::Readback(
                 "timestamp draws: the completion callback did not run after the wait".into(),
@@ -2211,10 +2215,10 @@ impl Renderer for GpuRenderer {
                 pending.request_map();
             }
             self.wait(last, "timestamp resolve")?;
-            timings.extend(self.drain_timestamps());
+            self.drain_timestamps();
         }
         if self.pending_timestamps.is_empty() {
-            Ok(timings)
+            Ok(std::mem::take(&mut self.timings))
         } else {
             Err(RenderError::Readback(
                 "timestamp resolve: the map callback did not run after the wait".into(),
@@ -2234,7 +2238,7 @@ impl Renderer for GpuRenderer {
         if let Some(last) = self.pending_queries.back().map(|p| p.submission.clone()) {
             self.wait(last, "timestamp draws").await?;
         }
-        let mut timings = self.drain_timestamps();
+        self.drain_timestamps();
         if !self.pending_queries.is_empty() {
             return Err(RenderError::Readback(
                 "timestamp draws: the completion callback did not run after the wait".into(),
@@ -2245,10 +2249,10 @@ impl Renderer for GpuRenderer {
                 pending.request_map();
             }
             self.wait(last, "timestamp resolve").await?;
-            timings.extend(self.drain_timestamps());
+            self.drain_timestamps();
         }
         if self.pending_timestamps.is_empty() {
-            Ok(timings)
+            Ok(std::mem::take(&mut self.timings))
         } else {
             Err(RenderError::Readback(
                 "timestamp resolve: the map callback did not run after the wait".into(),
@@ -2448,7 +2452,7 @@ impl GpuRenderer {
         stats: &mut FrameStats,
     ) -> Result<Redraw, RenderError> {
         let origin = *self.origin.get_or_insert(frame.time.0);
-        stats.timings = self.drain_timestamps();
+        self.drain_timestamps();
         let dirty: Vec<_> = frame
             .surfaces
             .iter()
@@ -2573,7 +2577,7 @@ impl GpuRenderer {
         stats: &mut FrameStats,
     ) -> Result<Redraw, RenderError> {
         let origin = *self.origin.get_or_insert(frame.time.0);
-        stats.timings = self.drain_timestamps();
+        self.drain_timestamps();
         let dirty: Vec<_> = frame
             .surfaces
             .iter()
@@ -4602,7 +4606,7 @@ impl GpuRenderer {
     /// Reads back every pending frame's resolved timestamps whose copy
     /// has landed, oldest first — submissions complete in order, so the
     /// first unfinished one ends the drain. Never blocks.
-    fn drain_timestamps(&mut self) -> Vec<FrameTiming> {
+    fn drain_timestamps(&mut self) {
         if !self.pending_queries.is_empty() {
             // Poll dispatches completion callbacks; it never waits for GPU idle.
             let _ = self.device.poll(wgpu::PollType::Poll);
@@ -4617,7 +4621,6 @@ impl GpuRenderer {
             }
         }
         let period = f64::from(self.queue.get_timestamp_period());
-        let mut timings = Vec::new();
         while let Some(pending) = self.pending_timestamps.front_mut() {
             pending.request_map();
             diag::map(
@@ -4694,7 +4697,7 @@ impl GpuRenderer {
                 gpu_ms = timing.gpu_seconds.map(|s| s * 1e3),
                 "frame timed"
             );
-            timings.push(timing);
+            self.timings.push(timing);
             pending.staging.unmap();
             if pending.query_capacity >= self.query_capacity {
                 self.query_pool.push((
@@ -4707,7 +4710,6 @@ impl GpuRenderer {
                 self.query_staging.push(pending.staging);
             }
         }
-        timings
     }
 
     /// Acquires a frame's queries and grows the resolve buffer if needed.

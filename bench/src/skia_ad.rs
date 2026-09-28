@@ -939,7 +939,7 @@ impl Engine for SkiaCpu {
         Ok(Submit {
             image,
             gpu: Vec::new(),
-            phases: Vec::new(),
+            phases: None,
         })
     }
 
@@ -1334,7 +1334,7 @@ impl Engine for SkiaVk {
         Ok(Submit {
             image,
             gpu: GpuSample::whole_frame(frame, gpu_seconds),
-            phases: Vec::new(),
+            phases: None,
         })
     }
 
@@ -1650,7 +1650,7 @@ mod graphite_metal {
             Ok(Submit {
                 image,
                 gpu: GpuSample::whole_frame(frame, gpu_seconds),
-                phases: Vec::new(),
+                phases: None,
             })
         }
 

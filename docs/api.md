@@ -89,8 +89,7 @@ pub trait Renderer: 'static {
     /// Renders every surface in `frame` whose tree or content changed; returns whether a
     /// backend-side source (custom GPU content, an animated shader) wants another frame.
     fn render(&mut self, frame: &Frame<'_>, stats: &mut FrameStats) -> Result<Redraw, RenderError>;
-    /// Waits for the GPU timings of every drawn frame not yet reported; a backend that
-    /// times synchronously, or not at all, keeps the default (nothing outstanding).
+    /// Returns accumulated GPU timings, oldest first, waiting for frames still in flight.
     fn finish_timings(&mut self) -> Result<Vec<FrameTiming>, RenderError> { Ok(Vec::new()) }
     fn readback(&mut self, surface: SurfaceId) -> Result<Readback, RenderError>;
 
@@ -165,7 +164,7 @@ let usage: MemoryUsage = engine.memory();
 - The pipeline set is closed and fully precompiled at creation, and the driver cache is persisted. Custom shaders compile when they are registered. Nothing compiles at draw time.
 - `Engine` is `!Send` and lives on the UI thread. It spawns and owns the render thread; dropping it sends `Shutdown` and joins the thread.
 - `engine.info()` is the backend's provenance (`B::Info`); `engine.stats()` the last frame's `FrameStats`.
-- **Frame timing.** The render loop numbers every render with a `FrameId` (`Frame::id`). A backend that draws reports it in `FrameStats::frame`, and every GPU timing it reports is a `FrameTiming` tagged with the frame it measures, in `FrameStats::timings`: the render's own for a backend that times synchronously, earlier renders' for one whose timestamp queries resolve after the frame is submitted (the GPU backend, which never waits for GPU idle). `engine.finish_timings()` waits for the timings still in flight — tooling at the end of a measured window, never a frame path.
+- **Frame timing.** The render loop numbers every render with a `FrameId` (`Frame::id`), and a backend that draws reports it in `FrameStats::frame`. Every GPU timing is a `FrameTiming` tagged with the frame it measures; the render thread retains them and returns them only from `engine.finish_timings()`, oldest first. They accumulate until that call, which waits for frames still on the GPU; use it at the end of a measured window, never on the frame path. Timestamps (off by default in `GpuConfig`) are for tooling that calls `finish_timings()` at the end of its window.
 - **Waking the host.** Changes made outside a frame (a `surface.update`, a layer drop, a bound signal firing) are queued, not sent. When the display link is paused after `Next::Idle`, the host must learn that a frame is needed: `engine.set_waker(|| link.request_now())` registers a UI-thread callback that the engine calls at most once between two `render`s, the first time something is queued. No callback means the host renders on its own schedule.
 
 ## Resources

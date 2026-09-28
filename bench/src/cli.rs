@@ -1074,7 +1074,7 @@ fn run_frames(
                 cpu_end,
                 migrated: matches!((cpu_start, cpu_end), (Some(a), Some(b)) if a != b),
                 passes: Vec::new(),
-                phases: submit.phases,
+                phases: submit.phases.map(phase_samples).unwrap_or_default(),
             });
         }
         attribute_gpu(&mut samples, warmup, submit.gpu);
@@ -1087,6 +1087,22 @@ fn run_frames(
         start,
         missed_deadlines,
     })
+}
+
+/// The render-thread phase timings of one frame as named samples.
+fn phase_samples(phases: crate::Phases) -> Vec<crate::PhaseSample> {
+    [
+        ("lower", phases.lower),
+        ("encode", phases.encode),
+        ("stamp", phases.stamp),
+        ("wait", phases.wait),
+    ]
+    .into_iter()
+    .map(|(name, seconds)| crate::PhaseSample {
+        name: name.to_string(),
+        seconds,
+    })
+    .collect()
 }
 
 /// Stores each GPU timing on the measured sample of the frame it times;

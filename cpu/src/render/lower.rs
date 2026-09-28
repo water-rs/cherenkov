@@ -901,7 +901,7 @@ impl<'a> Lowering<'a> {
         let coords: std::sync::Arc<[i16]> = run.coords.clone().into();
         for glyph in &run.glyphs {
             if glyph.transform.is_some() {
-                return Err(RenderError::Unsupported(names::GLYPH_TRANSFORM));
+                return Err(RenderError::Unsupported("glyph-transform"));
             }
             let o = self.transform * Point::new(f64::from(glyph.x), f64::from(glyph.y));
             let (ix, iy) = (o.x.floor(), o.y.floor());

@@ -116,7 +116,8 @@ pub struct Phases {
     /// Timestamp bracket overhead: the drains around the stamps and the
     /// timestamp resolve/readback. Zero when timestamps are off.
     pub stamp_seconds: f64,
-    /// The final blocking drain of the queue.
+    /// Blocking waits on the GPU: for an upload staging slot still in
+    /// flight, and the final drain of the queue.
     pub wait_seconds: f64,
 }
 

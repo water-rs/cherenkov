@@ -353,10 +353,15 @@ fn blend_with_image(
             let index = aux_y * aux_width as usize + aux_x;
             let top = aux_pixel(data, index);
             let base = image.pixels[y * width + x];
-            let blended = blend_color([base[0], base[1], base[2]], [top[0], top[1], top[2]], mode);
+            if base[3] <= 0.0 {
+                continue;
+            }
+            let colour = [base[0] / base[3], base[1] / base[3], base[2] / base[3]];
+            let blended = blend_color(colour, [top[0], top[1], top[2]], mode);
             for channel in 0..3 {
-                image.pixels[y * width + x][channel] =
-                    base[channel] * (1.0 - amount) + blended[channel] * amount;
+                image.pixels[y * width + x][channel] = (colour[channel] * (1.0 - amount)
+                    + blended[channel] * amount)
+                    * base[3];
             }
             image.pixels[y * width + x][3] = base[3];
         }
@@ -543,6 +548,30 @@ fn hsl_to_rgb(hsl: [f32; 3]) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::{hsl_to_rgb, rgb_to_hsl};
+    use crate::filters::{BlendMode, BlendWithImage};
+    use crate::FilterImage;
+    use filtrate_core::{CpuFilter, CpuImage, Filter, WorkingSpace};
+
+    fn apply_blend(mode: BlendMode, pixels: &mut [[f32; 4]]) {
+        let filter = BlendWithImage {
+            image: FilterImage::from_rgba8(1, 1, vec![240, 36, 48, 255]),
+            amount: 1.0_f32,
+            mode,
+        };
+        let params = filter.params();
+        let size = (pixels.len(), 1);
+        filter
+            .apply_cpu_image(
+                &params,
+                &WorkingSpace::LINEAR_DISPLAY_P3,
+                &mut CpuImage {
+                    pixels,
+                    top: 0,
+                    size,
+                },
+            )
+            .expect("CPU image blend should succeed");
+    }
 
     #[test]
     fn hsl_saturation_uses_the_lightness_branch_and_round_trips() {
@@ -569,6 +598,77 @@ mod tests {
                 light[channel],
                 round_trip[channel]
             );
+        }
+    }
+
+    #[test]
+    fn image_blend_uses_unpremultiplied_colour_for_all_modes() {
+        let modes = [
+            BlendMode::Normal,
+            BlendMode::Multiply,
+            BlendMode::Screen,
+            BlendMode::Overlay,
+            BlendMode::Darken,
+            BlendMode::Lighten,
+            BlendMode::SoftLight,
+            BlendMode::HardLight,
+            BlendMode::Difference,
+            BlendMode::Exclusion,
+            BlendMode::ColorDodge,
+            BlendMode::ColorBurn,
+            BlendMode::Hue,
+            BlendMode::Saturation,
+            BlendMode::Color,
+            BlendMode::Luminosity,
+        ];
+        let colour = [0.6_f32, 0.1, 0.1];
+        let top = [240.0_f32 / 255.0, 36.0 / 255.0, 48.0 / 255.0];
+        let low_alpha = 1.0e-8_f32;
+        let mid_alpha = 0.3_f32;
+
+        for mode in modes {
+            let mut pixels = [
+                [0.0; 4],
+                [
+                    colour[0] * low_alpha,
+                    colour[1] * low_alpha,
+                    colour[2] * low_alpha,
+                    low_alpha,
+                ],
+                [
+                    colour[0] * mid_alpha,
+                    colour[1] * mid_alpha,
+                    colour[2] * mid_alpha,
+                    mid_alpha,
+                ],
+                [colour[0], colour[1], colour[2], 1.0],
+            ];
+            apply_blend(mode, &mut pixels);
+
+            assert_eq!(pixels[0], [0.0; 4], "{mode:?}");
+            for (index, alpha) in [(1, low_alpha), (2, mid_alpha)] {
+                for (channel, full) in pixels[3][..3].iter().enumerate() {
+                    let expected = *full * alpha;
+                    let tolerance = expected.abs() * 1.0e-5 + 1.0e-12;
+                    assert!(
+                        (pixels[index][channel] - expected).abs() <= tolerance,
+                        "{mode:?}, alpha {alpha}, channel {channel}: expected {expected}, got {}",
+                        pixels[index][channel]
+                    );
+                }
+                assert_eq!(pixels[index][3], alpha, "{mode:?}");
+            }
+
+            if mode == BlendMode::Multiply {
+                for (channel, base) in colour.iter().enumerate() {
+                    let expected = base * top[channel];
+                    assert!(
+                        (pixels[3][channel] - expected).abs() <= 1.0e-6,
+                        "Multiply, channel {channel}: expected {expected}, got {}",
+                        pixels[3][channel]
+                    );
+                }
+            }
         }
     }
 }

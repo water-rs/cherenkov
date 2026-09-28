@@ -128,8 +128,8 @@ const BLEND_WITH_IMAGE: SpatialStage = stage(
     &[AuxSource::Image(0)],
 );
 
-/// Blends the input with an auxiliary image through one of sixteen blend
-/// operators, sampled at the same position, then mixes by `amount`.
+/// Blends the input's unpremultiplied colour with the sampled auxiliary
+/// texel, mixes by `amount`, then re-premultiplies with the input's alpha.
 #[derive(Debug, Clone)]
 pub struct BlendWithImage<A: FilterParam = f32> {
     /// Image blended over the input.

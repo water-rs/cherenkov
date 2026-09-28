@@ -2035,6 +2035,27 @@ fn cpu_image_blend_modes_match_the_wgpu_executor() {
 }
 
 #[test]
+fn image_blend_hsl_and_screen_match_gpu_at_alpha_edges() {
+    let gpu = create_test_device();
+    let input = [
+        [0.0, 0.0, 0.0, 0.0],
+        [0.6e-6, 0.1e-6, 0.1e-6, 1.0e-6],
+        [0.3, 0.05, 0.05, 0.5],
+        [0.6, 0.1, 0.1, 1.0],
+    ];
+
+    for mode in [filters::BlendMode::Luminosity, filters::BlendMode::Screen] {
+        let filter = filters::BlendWithImage {
+            image: crate::FilterImage::from_rgba8(1, 1, vec![240, 36, 48, 255]),
+            amount: 1.0_f32,
+            mode,
+        };
+        let label = format!("BlendWithImage::{mode:?}, alpha edges");
+        assert_f16_matches_cpu(&gpu, filter, (4, 1), &input, &label);
+    }
+}
+
+#[test]
 fn derived_colour_filters_apply_through_cpu_filter() {
     let filter = filters::Brightness(0.25_f32);
     let mut pixels = [[0.2, 0.3, 0.4, 0.5]];

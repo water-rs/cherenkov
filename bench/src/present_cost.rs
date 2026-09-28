@@ -36,6 +36,8 @@ struct CostReport {
     height: u32,
     pattern: &'static str,
     encode: &'static str,
+    /// The display headroom presented to (#97).
+    headroom: f32,
     warmup_frames: u32,
     measured_frames: u32,
     /// Pass GPU time per measured frame, milliseconds.
@@ -131,6 +133,7 @@ pub(crate) fn run(
     warmup: u32,
     pattern: PresentPattern,
     encode: PresentEncode,
+    headroom: f32,
     out: &Path,
 ) -> Result<(), BenchError> {
     let (width, height) = size;
@@ -212,6 +215,7 @@ pub(crate) fn run(
         texture: &destination,
         color: OutputColor::Srgb,
         alpha: OutputAlpha::Premultiplied,
+        headroom,
     };
     for _ in 0..warmup {
         presenter.texture_timed(device, queue, &source_view, output(), None);
@@ -284,6 +288,7 @@ pub(crate) fn run(
             PresentEncode::SrgbHw => "srgb-hw",
             PresentEncode::SrgbShader => "srgb-shader",
         },
+        headroom,
         warmup_frames: warmup,
         measured_frames: frames,
         mean_ms: samples_ms.iter().sum::<f64>() / n as f64,

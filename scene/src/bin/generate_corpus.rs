@@ -4469,6 +4469,90 @@ fn run() -> Result<(), SceneError> {
         });
     });
 
+    corpus.scene_setup("backdrop-rim-p3", 256, 256, white, |b| {
+        b.backdrop_group(1, vec![BackdropFilter::GaussianBlur { sigma: 8.0 }]);
+        let l = &mut b.root();
+        // P3-only colours, none of them HDR: the rim highlight must carry
+        // wide gamut without exceeding SDR white.
+        l.fill(
+            Shape::rect(0.0, 0.0, 256.0, 256.0),
+            solid(p3(0.0, 0.35, 0.6)),
+        );
+        l.fill(Shape::circle(128.0, 128.0, 72.0), solid(p3(1.0, 0.0, 0.0)));
+        l.fill(Shape::circle(64.0, 208.0, 32.0), solid(p3(0.0, 0.9, 0.4)));
+        let rim = BackdropEffectSpec::RimLight {
+            width: 10.0,
+            color: [0.0, 1.0, 0.0, 1.0],
+            gain: 1.0,
+        };
+        l.layer(|m| {
+            let clip = Shape::RoundedRect(RoundedRect::new(32.0, 48.0, 224.0, 176.0, 20.0));
+            m.clip(clip);
+            m.backdrop(1);
+            m.backdrop_effect(rim.clone());
+        });
+        l.layer(|m| {
+            let clip = Shape::RoundedRect(RoundedRect::new(80.0, 160.0, 240.0, 240.0, 24.0));
+            m.clip(clip);
+            m.backdrop(1);
+            m.backdrop_effect(rim);
+        });
+    });
+
+    corpus.scene_setup("backdrop-refraction-hdr", 256, 256, white, |b| {
+        b.backdrop_group(1, vec![BackdropFilter::GaussianBlur { sigma: 6.0 }]);
+        let l = &mut b.root();
+        stripes(
+            l,
+            hdr(6.0, 0.5, 0.2),
+            hdr(0.3, 0.8, 12.0),
+            [
+                hdr(16.0, 16.0, 16.0),
+                hdr(0.2, 5.0, 1.0),
+                hdr(3.0, 0.1, 8.0),
+            ],
+        );
+        refraction_member(l, 40.0, 32.0, 88.0, 80.0, 12.0, 6.0);
+        refraction_member(l, 112.0, 96.0, 208.0, 192.0, 12.0, 6.0);
+        refraction_member(l, 80.0, 200.0, 240.0, 250.0, 12.0, 6.0);
+    });
+
+    corpus.scene_setup("backdrop-tint-hdr", 256, 256, white, |b| {
+        b.backdrop_group(1, Vec::new());
+        let l = &mut b.root();
+        // HDR backdrop: the tint matrix scales values already above one.
+        l.fill(
+            Shape::rect(0.0, 0.0, 128.0, 256.0),
+            solid(hdr(4.0, 1.0, 0.5)),
+        );
+        l.fill(
+            Shape::rect(128.0, 0.0, 256.0, 256.0),
+            solid(hdr(0.5, 2.0, 8.0)),
+        );
+        l.fill(
+            Shape::circle(96.0, 96.0, 56.0),
+            solid(hdr(16.0, 16.0, 16.0)),
+        );
+        l.fill(Shape::circle(190.0, 180.0, 48.0), solid(hdr(0.2, 6.0, 1.0)));
+        l.layer(|m| {
+            let clip = Shape::RoundedRect(RoundedRect::new(24.0, 24.0, 140.0, 124.0, 16.0));
+            m.clip(clip);
+            m.backdrop(1);
+        });
+        l.layer(|m| {
+            let clip = Shape::RoundedRect(RoundedRect::new(116.0, 132.0, 232.0, 232.0, 16.0));
+            m.clip(clip);
+            m.backdrop(1);
+            m.backdrop_effect(BackdropEffectSpec::ColorMatrix {
+                matrix: [
+                    1.1, 0.0, 0.0, 0.05, //
+                    0.0, 0.95, 0.0, 0.02, //
+                    0.0, 0.0, 0.8, 0.0,
+                ],
+            });
+        });
+    });
+
     // ---- Write out ---------------------------------------------------------
 
     let perf_out = corpus::perf_dir(&root);

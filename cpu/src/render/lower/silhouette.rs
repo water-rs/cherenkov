@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 //! Coverage convolution for silhouettes without an analytic shadow form.
 use super::{FLATTEN_TOL, Item, Lowering, coverage_mask, flatten_edges, shape_path};
+use crate::names;
 use crate::render::{glyph::GlyphMask, paint::PaintData};
 use cherenkov::lowering::shadow::{capture_padding, gaussian_taps, spread_taps};
 use cherenkov::{RenderError, Shadow, ShapeData};
@@ -58,7 +59,7 @@ impl Lowering<'_> {
             .ok_or_else(|| RenderError::Render("shadow coverage overflow".into()))?;
         let scale = ma.hypot(mb).max(mc.hypot(md)).max(1e-12);
         let Some((path, rule)) = shape_path(shape, FLATTEN_TOL / scale) else {
-            return Ok(());
+            return Err(RenderError::Unsupported(names::SHADOW));
         };
         let placement = Affine::translate((px as f64, py as f64))
             * self.transform

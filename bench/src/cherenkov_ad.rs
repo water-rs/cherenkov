@@ -1117,7 +1117,7 @@ fn register_image(
             };
             let image = engine
                 .image(
-                    ImageData::<Rgba16F>::new(width, height, blob.to_vec())
+                    ImageData::<Rgba16F>::new(width, height, blob.clone())
                         .map_err(|e| BenchError::Engine(format!("cherenkov image: {e}")))?
                         .color_space(space),
                 )

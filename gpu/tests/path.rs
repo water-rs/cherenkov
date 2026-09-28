@@ -280,7 +280,14 @@ fn engine() -> Result<Option<Engine<Gpu>>, Box<dyn std::error::Error>> {
 fn big_surface(
     engine: &Engine<Gpu>,
 ) -> Result<(cherenkov::Surface<Gpu>, cherenkov::Layer), Box<dyn std::error::Error>> {
-    let surface = engine.surface(Offscreen::new((320, 320), OffscreenFormat::LinearF16))?;
+    sized_surface(engine, (320, 320))
+}
+
+fn sized_surface(
+    engine: &Engine<Gpu>,
+    size: (u32, u32),
+) -> Result<(cherenkov::Surface<Gpu>, cherenkov::Layer), Box<dyn std::error::Error>> {
+    let surface = engine.surface(Offscreen::new(size, OffscreenFormat::LinearF16))?;
     surface.clear_color(CLEAR);
     let layer = surface.layer();
     surface.update(|tx| {
@@ -562,5 +569,60 @@ fn a_rect_clip_merges_with_a_path_clip() -> Result<(), Box<dyn std::error::Error
     // Outside the rect even where the star would cover.
     let [r, ..] = px(&readback, 4, 32);
     assert!(r < 0.05, "outside rect: {r}");
+    Ok(())
+}
+
+/// A clip wider than the atlas cap can't take a cell at all; it gets a
+/// dedicated texture.
+#[test]
+fn a_path_clip_wider_than_the_atlas_cap() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(engine) = engine()? else {
+        return Ok(());
+    };
+    let Ok((surface, layer)) = sized_surface(&engine, (4200, 96)) else {
+        // The device can't hold a 4200-wide surface; nothing to test.
+        return Ok(());
+    };
+    // An elongated hexagonal band covering the middle rows.
+    let mut band = BezPath::new();
+    band.move_to((20.0, 48.0));
+    band.line_to((40.0, 10.0));
+    band.line_to((4160.0, 10.0));
+    band.line_to((4180.0, 48.0));
+    band.line_to((4160.0, 86.0));
+    band.line_to((40.0, 86.0));
+    band.close_path();
+    surface.update(|tx| {
+        tx[&layer].content(surface.record(|c| {
+            c.fill(cherenkov::kurbo::Rect::new(0.0, 0.0, 4200.0, 96.0), RED);
+        }));
+    });
+    engine.render(cherenkov::FrameTime::now())?;
+    let unmasked = engine.memory().gpu.0;
+    surface.update(|tx| {
+        tx[&layer].content(surface.record(|c| {
+            c.clip(band, |c| {
+                c.fill(cherenkov::kurbo::Rect::new(0.0, 0.0, 4200.0, 96.0), RED);
+            });
+        }));
+    });
+    engine.render(cherenkov::FrameTime::now())?;
+    assert_eq!(engine.stats().paths_rasterized, 1);
+    // ~4160×76 mask texels on a dedicated texture.
+    assert!(
+        engine.memory().gpu.0 >= unmasked + 300_000,
+        "gpu {} vs {}",
+        engine.memory().gpu.0,
+        unmasked
+    );
+    let readback = surface.readback()?;
+    let [r, ..] = px(&readback, 2100, 48);
+    assert!(r > 0.9, "interior: {r}");
+    // A corner sits outside the band.
+    let [r, g, b, a] = px(&readback, 5, 5);
+    assert!(
+        r < 0.05 && g < 0.05 && b < 0.05 && a > 0.99,
+        "corner: {r} {g} {b} {a}"
+    );
     Ok(())
 }

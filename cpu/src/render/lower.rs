@@ -5,14 +5,15 @@
 //! of rasterization [`Item`]s in device space.
 
 use cherenkov::lowering::Realization;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use cherenkov::kurbo::{Affine, BezPath, PathEl, Point, Rect};
-use cherenkov::{BlendMode, FillRule, GlyphRun, GlyphStyle, ShapeData};
+use cherenkov::{BlendMode, FillRule, FrameId, GlyphRun, GlyphStyle, ShapeData};
 
 use cherenkov::{LayerId, RenderError, SurfaceTree};
 
+use super::filter::{Erased, Registry};
 use super::prepared::Op;
 use crate::names;
 use crate::render::paint::PaintData;
@@ -49,7 +50,7 @@ pub enum ClipMask {
 pub type ClipRef = Arc<ClipMask>;
 
 /// One rasterization item of a lowered frame.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum Item {
     /// A filled, flattened polygon.
     Draw {
@@ -104,7 +105,27 @@ pub enum Item {
         /// The clip in force at the pop.
         clip: Option<ClipRef>,
     },
+    /// Start rendering a filtered scope with a vertical apron.
+    PushFilter {
+        /// The index of the paired [`Item::PopFilter`].
+        end: u32,
+        /// Rows of apron above and below each band.
+        apron: usize,
+    },
+    /// Filter and composite the current scratch window.
+    PopFilter {
+        /// The filter and its sampled parameter values.
+        filter: FrameFilter,
+        /// The opacity multiplier.
+        opacity: f32,
+        /// Group compositing mode and working space.
+        blend: (BlendMode, cherenkov::BlendSpace),
+        /// The clip in force at the pop.
+        clip: Option<ClipRef>,
+    },
 }
+
+pub(super) type FrameFilter = (Arc<dyn Erased + Send + Sync>, Arc<[f32]>);
 
 /// A layer's retained content and device output.
 pub type ContentData = cherenkov::lowering::Content<Op, Emission>;
@@ -165,6 +186,9 @@ pub struct GlyphReq {
 /// The lowering walk state for one surface frame.
 pub struct Lowering<'a> {
     items: &'a mut Vec<Item>,
+    filters: Option<&'a mut Registry>,
+    frame: FrameId,
+    used_filters: HashSet<u64>,
     /// Glyph mask requests emitted during the walk.
     pub glyphs: Vec<GlyphReq>,
     width: usize,
@@ -336,9 +360,17 @@ fn integer_edges(r: Rect) -> Option<IRect> {
 
 impl<'a> Lowering<'a> {
     /// Starts a lowering into `items` for a `w` × `h` surface.
-    pub const fn new(items: &'a mut Vec<Item>, size: (u32, u32)) -> Self {
+    pub fn new(
+        items: &'a mut Vec<Item>,
+        size: (u32, u32),
+        filters: Option<&'a mut Registry>,
+        frame: FrameId,
+    ) -> Self {
         Self {
             items,
+            filters,
+            frame,
+            used_filters: HashSet::new(),
             glyphs: Vec::new(),
             width: size.0 as usize,
             height: size.1 as usize,
@@ -366,6 +398,10 @@ impl<'a> Lowering<'a> {
             self.commands_lowered += content.prepare(&mut lowerer)?;
         }
         self.layer(tree.root(), tree, caches)
+    }
+
+    pub fn take_used_filters(&mut self) -> HashSet<u64> {
+        std::mem::take(&mut self.used_filters)
     }
 
     /// The coverage a clip contributes at `(px, py)`.
@@ -467,6 +503,52 @@ impl<'a> Lowering<'a> {
         result
     }
 
+    fn filter_isolate(
+        &mut self,
+        id: cherenkov::FilterId,
+        opacity: f32,
+        blend: (BlendMode, cherenkov::BlendSpace),
+        clip: Option<ClipRef>,
+        body: impl FnOnce(&mut Self) -> Result<(), RenderError>,
+    ) -> Result<(), RenderError> {
+        let (filter, params, footprint) = self
+            .filters
+            .as_deref_mut()
+            .ok_or_else(|| RenderError::Render(format!("unregistered filter {}", id.raw())))?
+            .prepare(id, self.frame, (self.width, self.height))?;
+        if !footprint.is_finite() || footprint < 0.0 {
+            return Err(RenderError::Render(format!(
+                "filter {} has invalid CPU footprint {footprint}",
+                id.raw()
+            )));
+        }
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss,
+            reason = "the nonnegative footprint is compared with the bounded surface height first"
+        )]
+        let apron = if footprint >= self.height as f32 {
+            self.height
+        } else {
+            footprint.ceil() as usize
+        };
+        self.used_filters.insert(id.raw());
+        let push = self.items.len();
+        self.items.push(Item::PushFilter { end: 0, apron });
+        let result = body(self);
+        let end = u32::try_from(self.items.len())
+            .map_err(|_| RenderError::Render(format!("filter {} scope is too large", id.raw())))?;
+        self.items[push] = Item::PushFilter { end, apron };
+        self.items.push(Item::PopFilter {
+            filter: (filter, params),
+            opacity,
+            blend,
+            clip,
+        });
+        result
+    }
+
     /// A layer: push its transform, then clip, then isolate for opacity,
     /// then content followed by children. The clip applies in `transform`
     /// space; content and children draw in `content_transform` space,
@@ -478,9 +560,6 @@ impl<'a> Lowering<'a> {
         caches: &mut HashMap<LayerId, ContentData>,
     ) -> Result<(), RenderError> {
         let node = tree.layer(id);
-        if node.filter.is_some() {
-            return Err(RenderError::Unsupported(names::FILTER));
-        }
         if node.backdrop.is_some() {
             return Err(RenderError::Unsupported(names::BACKDROP));
         }
@@ -496,7 +575,16 @@ impl<'a> Lowering<'a> {
         let outer = self.clip.clone();
         let result = self.with_clip(node.clip.as_ref(), |s| {
             s.transform = content_space;
-            if node.opacity < 1.0
+            if let Some(filter) = node.filter {
+                let clip = s.clip.clone();
+                s.filter_isolate(
+                    filter,
+                    node.opacity,
+                    (node.blend, cherenkov::BlendSpace::Linear),
+                    clip,
+                    |s| s.layer_items(id, node, tree, caches),
+                )
+            } else if node.opacity < 1.0
                 || node.blend != BlendMode::Normal
                 // The root already renders into the surface target.
                 || (id != tree.root() && node.blends_within())
@@ -572,16 +660,24 @@ impl<'a> Lowering<'a> {
                     i = *end as usize;
                 }
                 Op::BeginIsolate {
+                    filter,
                     opacity,
                     blend,
                     space,
                     end,
                 } => {
                     let clip = self.clip.clone();
-                    self.isolate(*opacity, (*blend, *space), clip.clone(), clip, |s| {
-                        changed |= s.ops(ops, emissions, i + 1, *end as usize)?;
-                        Ok(())
-                    })?;
+                    if let Some(filter) = filter {
+                        self.filter_isolate(*filter, *opacity, (*blend, *space), clip, |s| {
+                            changed |= s.ops(ops, emissions, i + 1, *end as usize)?;
+                            Ok(())
+                        })?;
+                    } else {
+                        self.isolate(*opacity, (*blend, *space), clip.clone(), clip, |s| {
+                            changed |= s.ops(ops, emissions, i + 1, *end as usize)?;
+                            Ok(())
+                        })?;
+                    }
                     i = *end as usize;
                 }
                 Op::End => unreachable!("paired scope consumes its end"),
@@ -637,7 +733,7 @@ impl<'a> Lowering<'a> {
             Some(Emission::Clip(_)) => unreachable!("structural changes replace the cache layout"),
         };
         items.clear();
-        let mut compose = Lowering::new(&mut items, (0, 0));
+        let mut compose = Lowering::new(&mut items, (0, 0), None, FrameId::new(0));
         compose.width = self.width;
         compose.height = self.height;
         compose.transform = self.transform;

@@ -36,9 +36,10 @@ Capabilities are traits implemented by backend types, so using a missing capabil
 | `GpuContent`, `ShaderPaint` | both | both | |
 | `Filters`, `Runs<F>` for a filter `F`, `Effects` | every filter | every filter | filters with a CPU kernel |
 | `Backdrop`, `BackdropRuns<K, F>` for a backdrop chain `F` | every chain | every chain | chains with a CPU kernel |
-| `HdrOutput`, `ExternalFrames`, `Planes` | | | |
+| `HdrOutput` | tone-mapped extended output | | |
+| `ExternalFrames`, `Planes` | | | |
 
-Targets beyond the current rows: `Gpu` is meant to accept every image format and grow `ExternalFrames`, `HdrOutput` and `Planes` (system-compositor promotion); `Raster` targets `Uploads<Rgba8>` and `Filters`/`Runs<F>` for filters with a CPU kernel; a `Banded<P>` microcontroller backend (banded output, panel formats, flash-resident assets) targets panel-format uploads and CPU-kernel filters.
+Targets beyond the current rows: `Gpu` is meant to accept every image format and grow `ExternalFrames` and `Planes` (system-compositor promotion); `Raster` targets `Uploads<Rgba8>` and `Filters`/`Runs<F>` for filters with a CPU kernel; a `Banded<P>` microcontroller backend (banded output, panel formats, flash-resident assets) targets panel-format uploads and CPU-kernel filters.
 
 The table is the target; a backend slice implements the rows it has code for, and the compiler rejects the rest.
 
@@ -196,7 +197,7 @@ let panel = engine.surface(Bands::new(size, OffscreenFormat::LinearF16, |band| d
 
 - **System-compositor parents.** Targets that expose one (`CALayer`, `SurfaceControl`, a DirectComposition visual, a Wayland subsurface) let the engine build **planes**. Most layers are composited inside the engine onto one plane. Eligible layers are promoted automatically to their own system layers: video frames, custom GPU content and large stable layers. A layer is not promoted when it is under a backdrop, uses a non-default blend or has a clip the system cannot express. Hardware overlay budgets also limit promotion.
 - **Many small surfaces are first-class.** A native backend embeds one surface per self-drawn component, and a list may hold dozens. All surfaces share the engine's pipelines, atlases and caches. Creating and dropping one is cheap. All dirty surfaces render in one submission per frame.
-- **Display properties.** Headroom and scale belong to the display, so the host sets them when they change: `surface.display(Display { headroom, scale })`.
+- **Display properties.** Headroom and scale belong to the display, so the host sets them when they change: `surface.display(Display { headroom, scale })`. Presentation reads `headroom` every frame — a headroom change takes effect on the next frame and never re-lowers or re-records content.
 
 ## Frame driving
 
@@ -379,7 +380,7 @@ DynColor::from_css(parsed)                         // colour space known only at
 ```
 
 - **Typed colour spaces.** `Color<CS>` converts to the working space (linear Display P3) through a matrix that is constant-folded when monomorphised. HDR is extended values above 1.0, relative to SDR white.
-- **The display supplies headroom.** Effects may read it. Output tone-maps to the display's headroom.
+- **The display supplies headroom.** Effects may read it. Output tone-maps to the display's headroom (#97): presentation scales each pixel by the extended-Reinhard/EDR shoulder evaluated at its largest channel — a per-pixel scalar, so saturated highlights keep their hue. Values in `[0, 1]` pass through; values above `1` compress smoothly towards `H` (an SDR display is `H = 1`, so highlights roll off instead of clipping). The tone map runs before the #96 gamut map. An sRGB destination's ceiling is `1` regardless of `headroom`; an extended `LinearDisplayP3` destination rolls off to the host's headroom and keeps values above 1 extended. The same curve runs in the f64 oracle (`oracle/src/tone.rs`), `present.wgsl`, and the CPU backend's `present_srgb8`.
 - **sRGB output gamut-maps, never channel-clips (#96).** Linear P3 components outside `[0, 1]` go through Ottosson's analytic OKLab clip — the hue slice's cusp triangle with one Halley refinement, projecting towards the lightness axis at adaptively-chosen lightness (`ok_color.h`'s `gamut_clip_adaptive_L0_L_cusp`) — so out-of-gamut colours keep their hue and gradients stay continuous across the boundary. It was chosen over the CSS Color 4 chroma binary search (the ΔE_OK/JND spec map, which served as the measurement reference): on the boundary sweep the analytic clip held its mean ΔE_OK to the spec map at 0.0104 (p99 0.072, max 0.177 at HDR lightness the spec maps to an end colour) with hue preserved to a 7.5° maximum, while its fixed per-pixel cost measured ~3× cheaper in the present pass on lavapipe (28.5 vs 92 ms per 2752×2064 frame; the channel-clip baseline is ~15 ms — software-rasterizer sanity numbers only). The map also carries the spec's local-MINDE rule: where the plain clip is already within one ΔE_OK JND of the colour, the clip's bytes are kept — so in-gamut colours and P3↔sRGB round-trip ULP noise pass through bit-for-bit, yielding exactly the bytes the old convert-and-clamp produced. The same algorithm runs in the f64 oracle (`oracle/src/gamut.rs`), in `present.wgsl`, and in the CPU backend's `present_srgb8`.
 - **Blending space** is linear by default. Groups can opt into sRGB-encoded blending for web compatibility.
 - **Group and tree-layer isolation.** A group or tree layer composites through its own offscreen when it blends, has opacity below one, carries a filter, or has a blended descendant: a group, or for a layer a child layer or a group in its content. A blending child isolates its own layer in turn, so a layer checks direct children only. The root layer renders into the surface target and needs no offscreen. Every other group or layer composes in place with identical results.

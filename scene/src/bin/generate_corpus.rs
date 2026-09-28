@@ -1,3 +1,15 @@
+#![expect(
+    clippy::imprecise_flops,
+    clippy::suboptimal_flops,
+    reason = "FMA and hypot rewrites alter float bytes; corpus output is pinned"
+)]
+#![expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    reason = "generator indices and canvas coordinates are small and bounded"
+)]
+
 //! Writes the initial scene corpus to `scenes/corpus/`.
 //!
 //! Run `prepare-fonts` first: it produces the OFL subsets in `scenes/fonts/`
@@ -367,28 +379,28 @@ fn gradient_png() -> Vec<u8> {
     encode_png_rgba(16, 16, &px)
 }
 
-/// A `w`×`h` PNG whose bytes are sRGB-transfer-encoded Display P3 values:
+/// A `width`×`height` PNG whose bytes are sRGB-transfer-encoded Display P3 values:
 /// a ramp from P3 red through P3 green (both outside the sRGB gamut).
-fn p3_png(w: u32, h: u32) -> Vec<u8> {
-    let mut px = Vec::with_capacity(w as usize * h as usize * 4);
-    for y in 0..h {
-        for x in 0..w {
-            let t = x as f32 / (w - 1).max(1) as f32;
-            let v = y as f32 / (h - 1).max(1) as f32;
+fn p3_png(width: u32, height: u32) -> Vec<u8> {
+    let mut px = Vec::with_capacity(width as usize * height as usize * 4);
+    for row in 0..height {
+        for col in 0..width {
+            let t = col as f32 / (width - 1).max(1) as f32;
+            let dark = row as f32 / (height - 1).max(1) as f32;
             // Linear P3 red→green horizontally, darkened vertically.
-            let lin = [1.0 - t, t, v];
+            let lin = [1.0 - t, t, dark];
             for c in lin {
-                let e = if c <= 0.003_130_8 {
+                let enc = if c <= 0.003_130_8 {
                     c * 12.92
                 } else {
                     1.055 * c.powf(1.0 / 2.4) - 0.055
                 };
-                px.push((e.clamp(0.0, 1.0) * 255.0).round() as u8);
+                px.push((enc.clamp(0.0, 1.0) * 255.0).round() as u8);
             }
             px.push(255);
         }
     }
-    encode_png_rgba(w, h, &px)
+    encode_png_rgba(width, height, &px)
 }
 
 /// A `w`×`h` `Rgba16F` blob in linear Display P3 (straight alpha) filled by
@@ -475,11 +487,14 @@ fn font_blobs(ctx: &TextContext, runs: &[&[GlyphRun]]) -> Vec<Vec<u8>> {
     out
 }
 
+/// A `Rect` -> [`Shape`] constructor in the stroke-join table.
+type ShapeBuild = fn(Rect) -> Shape;
+
 /// xorshift64* — deterministic pseudo-random content without a `rand` dep.
 struct Rng(u64);
 
 impl Rng {
-    fn next(&mut self) -> u64 {
+    const fn next(&mut self) -> u64 {
         let mut x = self.0;
         x ^= x >> 12;
         x ^= x << 25;
@@ -595,7 +610,91 @@ fn main() -> ExitCode {
     }
 }
 
-#[allow(clippy::too_many_lines)] // the corpus table is inherently long
+/// The map-like page: ~2,000 stroked and filled paths — short segments,
+/// closed polygons and curved outlines distributed over the viewport.
+fn map_body(l: &mut LayerBuilder, pw: f64, ph: f64) {
+    let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+    let palette = [
+        srgb(0.45, 0.60, 0.45),
+        srgb(0.55, 0.50, 0.38),
+        srgb(0.40, 0.55, 0.65),
+        srgb(0.70, 0.55, 0.45),
+        srgb(0.50, 0.45, 0.60),
+    ];
+    let thin = StrokeStyle {
+        start_cap: kurbo::Cap::Round,
+        end_cap: kurbo::Cap::Round,
+        ..StrokeStyle::default()
+    };
+    for i in 0..2000 {
+        let (x, y) = (rng.f64() * pw, rng.f64() * ph);
+        let color = palette[rng.below(palette.len())];
+        match i % 4 {
+            // Polyline segment.
+            0 => {
+                let (dx, dy) = (rng.f64() * 90.0 - 45.0, rng.f64() * 90.0 - 45.0);
+                l.stroke(
+                    Shape::Line(Line::new((x, y), (x + dx, y + dy))),
+                    StrokeStyle {
+                        width: 0.5 + rng.f64() * 4.0,
+                        ..thin.clone()
+                    },
+                    solid(color),
+                );
+            }
+            // Closed polygon (park/parcel fill).
+            1 => {
+                let radius = 8.0 + rng.f64() * 48.0;
+                let sides = 3 + rng.below(5);
+                let mut path = BezPath::new();
+                for vi in 0..sides {
+                    #[expect(clippy::cast_precision_loss, reason = "vertex index is below 8")]
+                    let angle = (vi as f64) * std::f64::consts::TAU / (sides as f64);
+                    let pt = (x + radius * angle.cos(), y + radius * angle.sin());
+                    if vi == 0 {
+                        path.move_to(pt);
+                    } else {
+                        path.line_to(pt);
+                    }
+                }
+                path.close_path();
+                l.fill(Shape::Path { path }, solid(color));
+            }
+            // Open polyline of 3-6 points (road/river line).
+            2 => {
+                let mut p = BezPath::new();
+                let (mut cx, mut cy) = (x, y);
+                p.move_to((cx, cy));
+                for _ in 0..2 + rng.below(4) {
+                    cx += rng.f64() * 120.0 - 60.0;
+                    cy += rng.f64() * 60.0 - 30.0;
+                    p.line_to((cx, cy));
+                }
+                l.stroke(
+                    Shape::Path { path: p },
+                    StrokeStyle {
+                        width: 1.0 + rng.f64() * 5.0,
+                        ..thin.clone()
+                    },
+                    solid(color),
+                );
+            }
+            // Curved closed path (lake/contour).
+            _ => {
+                let (rx, ry) = (10.0 + rng.f64() * 60.0, 6.0 + rng.f64() * 40.0);
+                l.fill(
+                    Shape::Ellipse(Ellipse::new((x, y), (rx, ry), 0.0)),
+                    solid(color),
+                );
+            }
+        }
+    }
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "a linear sequence of independent scene builders; it reads top to bottom"
+)]
 fn run() -> Result<(), SceneError> {
     let root = corpus::repo_root();
     let out = corpus::corpus_dir(&root);
@@ -813,7 +912,7 @@ fn run() -> Result<(), SceneError> {
     // Every analytic shape family x every join class, each at all three
     // caps, solid and dashed. The dashed row's period (18) divides the box
     // edge (36), so every corner sits centred in a dash.
-    let families: &[(&str, fn(Rect) -> Shape)] = &[
+    let families: &[(&str, ShapeBuild)] = &[
         ("rect", |r| Shape::Rect(r)),
         ("rounded", |r| {
             Shape::RoundedRect(RoundedRect::from_rect(
@@ -844,7 +943,7 @@ fn run() -> Result<(), SceneError> {
     for &(family, build) in families {
         for &(suffix, join, miter_limit) in joins {
             corpus.scene(
-                &format!("stroke-join-{family}-{suffix}"),
+                format!("stroke-join-{family}-{suffix}"),
                 156,
                 108,
                 white,
@@ -855,7 +954,7 @@ fn run() -> Result<(), SceneError> {
                     {
                         let x0 = 12.0 + 48.0 * col as f64;
                         for row in 0..2 {
-                            let y0 = 12.0 + 48.0 * row as f64;
+                            let y0 = 12.0 + 48.0 * f64::from(row);
                             let dashed = row == 1;
                             l.stroke(
                                 build(Rect::new(x0, y0, x0 + 36.0, y0 + 36.0)),
@@ -2445,84 +2544,6 @@ fn run() -> Result<(), SceneError> {
 
     // Map-like page: ~2,000 stroked and filled paths — short segments,
     // closed polygons and curved outlines distributed over the viewport.
-    fn map_body(l: &mut LayerBuilder, pw: f64, ph: f64) {
-        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
-        let palette = [
-            srgb(0.45, 0.60, 0.45),
-            srgb(0.55, 0.50, 0.38),
-            srgb(0.40, 0.55, 0.65),
-            srgb(0.70, 0.55, 0.45),
-            srgb(0.50, 0.45, 0.60),
-        ];
-        let thin = StrokeStyle {
-            start_cap: kurbo::Cap::Round,
-            end_cap: kurbo::Cap::Round,
-            ..StrokeStyle::default()
-        };
-        for i in 0..2000 {
-            let (x, y) = (rng.f64() * pw, rng.f64() * ph);
-            let color = palette[rng.below(palette.len())];
-            match i % 4 {
-                // Polyline segment.
-                0 => {
-                    let (dx, dy) = (rng.f64() * 90.0 - 45.0, rng.f64() * 90.0 - 45.0);
-                    l.stroke(
-                        Shape::Line(Line::new((x, y), (x + dx, y + dy))),
-                        StrokeStyle {
-                            width: 0.5 + rng.f64() * 4.0,
-                            ..thin.clone()
-                        },
-                        solid(color),
-                    );
-                }
-                // Closed polygon (park/parcel fill).
-                1 => {
-                    let r = 8.0 + rng.f64() * 48.0;
-                    let sides = 3 + rng.below(5);
-                    let mut p = BezPath::new();
-                    for v in 0..sides {
-                        #[expect(clippy::cast_precision_loss, reason = "vertex index is below 8")]
-                        let a = (v as f64) * std::f64::consts::TAU / (sides as f64);
-                        let pt = (x + r * a.cos(), y + r * a.sin());
-                        if v == 0 {
-                            p.move_to(pt);
-                        } else {
-                            p.line_to(pt);
-                        }
-                    }
-                    p.close_path();
-                    l.fill(Shape::Path { path: p }, solid(color));
-                }
-                // Open polyline of 3-6 points (road/river line).
-                2 => {
-                    let mut p = BezPath::new();
-                    let (mut cx, mut cy) = (x, y);
-                    p.move_to((cx, cy));
-                    for _ in 0..2 + rng.below(4) {
-                        cx += rng.f64() * 120.0 - 60.0;
-                        cy += rng.f64() * 60.0 - 30.0;
-                        p.line_to((cx, cy));
-                    }
-                    l.stroke(
-                        Shape::Path { path: p },
-                        StrokeStyle {
-                            width: 1.0 + rng.f64() * 5.0,
-                            ..thin.clone()
-                        },
-                        solid(color),
-                    );
-                }
-                // Curved closed path (lake/contour).
-                _ => {
-                    let (rx, ry) = (10.0 + rng.f64() * 60.0, 6.0 + rng.f64() * 40.0);
-                    l.fill(
-                        Shape::Ellipse(Ellipse::new((x, y), (rx, ry), 0.0)),
-                        solid(color),
-                    );
-                }
-            }
-        }
-    }
 
     {
         perf.scene("map", pw as u32, ph as u32, srgb(0.93, 0.95, 0.90), |l| {

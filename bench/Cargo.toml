@@ -25,7 +25,7 @@ cherenkov-vello = ["dep:cherenkov", "dep:cherenkov-vello", "dep:wgpu", "dep:ash"
 # binaries.
 skia = ["dep:skia-safe", "dep:ash", "dep:skia-bindings", "skia-safe/vulkan", "skia-safe/ganesh"]
 skia-metal = ["dep:skia-safe", "dep:objc2", "dep:objc2-metal", "dep:skia-bindings", "skia-safe/metal", "skia-safe/graphite"]
-cherenkov = ["dep:cherenkov", "dep:cherenkov-gpu", "dep:wgpu", "dep:ash"]
+cherenkov = ["dep:cherenkov", "dep:cherenkov-gpu", "dep:wgpu", "dep:ash", "dep:half"]
 cherenkov-cpu = ["dep:cherenkov", "dep:cherenkov-cpu"]
 
 [dependencies]
@@ -68,6 +68,7 @@ skrifa = "0.44"
 read-fonts = "0.41"
 png = "0.18"
 bytemuck = "1"
+half = { version = "2", optional = true }
 glifo = { version = "0.3", optional = true }
 # Minimal surface: CPU list + brand string for `cpu_model`.
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }

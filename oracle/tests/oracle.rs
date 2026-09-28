@@ -658,3 +658,39 @@ fn max_local_error_filters_then_diffs() {
         "signed-difference cancellation: got {mle}, want 0.1 (box-of-abs gives 0.2)"
     );
 }
+
+/// A destructive layer operator is bounded by the effective clip: inside
+/// `rect(4,4,8,8)` the clear erases the opaque backdrop; outside it the
+/// backdrop is untouched. Unclipped, the same clear covers the whole parent.
+#[expect(
+    clippy::float_cmp,
+    reason = "cleared and opaque-white pixels are exact"
+)]
+#[test]
+fn destructive_layer_blend_is_bounded_by_the_clip() {
+    use cherenkov_scene::BlendMode;
+    let mut b = Scene::builder(W, H).clear(Color::srgb(1.0, 1.0, 1.0));
+    b.root().layer(|a| {
+        a.clip(Shape::Rect(Rect::new(4.0, 4.0, 8.0, 8.0)));
+        a.blend(BlendMode::Clear);
+    });
+    let scene = b.build();
+    let img = render(&scene, &tmp());
+    // (6,6) is inside the clip: cleared to transparent.
+    assert_eq!(img.pixels[6 * W as usize + 6], [0.0; 4]);
+    // (0,0) is outside: the opaque white backdrop survives.
+    assert_eq!(img.pixels[0], [1.0, 1.0, 1.0, 1.0]);
+    // (12,12) is outside the clip too.
+    assert_eq!(img.pixels[12 * W as usize + 12], [1.0, 1.0, 1.0, 1.0]);
+
+    let mut b = Scene::builder(W, H).clear(Color::srgb(1.0, 1.0, 1.0));
+    b.root().layer(|a| {
+        a.blend(BlendMode::Clear);
+    });
+    let scene = b.build();
+    let img = render(&scene, &tmp());
+    assert!(
+        img.pixels.iter().all(|p| *p == [0.0; 4]),
+        "unclipped clear covers the whole parent"
+    );
+}

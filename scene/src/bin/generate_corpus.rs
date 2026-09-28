@@ -18,10 +18,10 @@ use cherenkov_scene::kurbo::{
     Affine, BezPath, Ellipse, Line, Point, Rect, RoundedRect, RoundedRectRadii, Vec2,
 };
 use cherenkov_scene::{
-    BackdropFilter, BlendMode, Color, ColorSpace, Draw, Extend, FillRule, Glyph, GlyphRun,
-    GradientStop, ImageColorSpace, ImageEncoding, ImagePaint, LayerBuilder, LinearGradient, Live,
-    Motion, MotionAnimation, NormalizedCoord, Paint, RadialGradient, ResourceHash, Sampling, Scene,
-    SceneBuilder, SceneError, Shape, StrokeStyle, SweepGradient,
+    BackdropFilter, BlendMode, Color, ColorSpace, Draw, Extend, FillRule, FilterBlend, Glyph,
+    GlyphRun, GradientStop, ImageColorSpace, ImageEncoding, ImagePaint, LayerBuilder, LayerFilter,
+    LinearGradient, Live, Motion, MotionAnimation, NormalizedCoord, Paint, RadialGradient,
+    ResourceHash, Sampling, Scene, SceneBuilder, SceneError, Shape, StrokeStyle, SweepGradient,
 };
 use fontique::FontWeight;
 use parley::{
@@ -35,6 +35,15 @@ use skrifa::MetadataProvider;
 const TEXT_PAD: f32 = 12.0;
 /// Maximum line advance for shaped text.
 const TEXT_WRAP: f32 = 280.0;
+
+const FILTER_COLOR_MATRIX: [f64; 12] =
+    [0.2, 0.7, 0.1, 0.0, 0.6, 0.3, 0.1, 0.05, 0.1, 0.1, 0.8, 0.0];
+const FILTER_SEPIA_MATRIX: [f64; 12] = [
+    0.393, 0.769, 0.189, 0.0, 0.349, 0.686, 0.168, 0.0, 0.272, 0.534, 0.131, 0.0,
+];
+const FILTER_CHAIN_SECOND: [f64; 12] = [
+    1.2, 0.0, 0.0, -0.1, 0.0, 1.2, 0.0, -0.1, 0.0, 0.0, 1.2, -0.1,
+];
 
 const fn srgb(r: f32, g: f32, b: f32) -> Color {
     Color::srgb(r, g, b)
@@ -423,6 +432,90 @@ fn rgba16f_blob(w: u32, h: u32, f: impl Fn(u32, u32) -> [f32; 4]) -> Vec<u8> {
         }
     }
     blob
+}
+
+fn filter_image_png() -> Vec<u8> {
+    let mut px = Vec::with_capacity(128 * 128 * 4);
+    for y in 0u8..128 {
+        for x in 0u8..128 {
+            let blue = u8::try_from((u16::from(x) + u16::from(y)) * 255 / 254)
+                .expect("gradient channel is at most 255");
+            let color = if (16..40).contains(&x) && (16..40).contains(&y) {
+                [240, 36, 48, 255]
+            } else if (82..110).contains(&x) && (18..42).contains(&y) {
+                [24, 208, 196, 255]
+            } else if (18..44).contains(&x) && (82..108).contains(&y) {
+                [244, 204, 24, 255]
+            } else if (82..110).contains(&x) && (82..108).contains(&y) {
+                [144, 48, 224, 255]
+            } else {
+                [x * 2, y * 2, blue, 255]
+            };
+            px.extend_from_slice(&color);
+        }
+    }
+    encode_png_rgba(128, 128, &px)
+}
+
+fn filter_color_content(l: &mut LayerBuilder<'_>) {
+    l.fill(
+        Shape::rect(20.0, 20.0, 108.0, 108.0),
+        Paint::Linear(LinearGradient {
+            start: Point::new(24.0, 28.0),
+            end: Point::new(104.0, 100.0),
+            stops: stops2(),
+            extend: Extend::Pad,
+            interpolation: ColorSpace::Srgb,
+        }),
+    );
+    l.fill(
+        Shape::circle(48.0, 64.0, 16.0),
+        solid(srgb(0.15, 0.8, 0.28)),
+    );
+    l.fill(
+        Shape::rounded_rect(68.0, 40.0, 96.0, 88.0, 6.0),
+        solid(srgb(0.18, 0.3, 0.9)),
+    );
+}
+
+fn filter_blur_content(l: &mut LayerBuilder<'_>) {
+    l.fill(
+        Shape::rect(30.0, 30.0, 68.0, 68.0),
+        solid(srgb(0.9, 0.15, 0.12)),
+    );
+    l.fill(
+        Shape::circle(84.0, 48.0, 18.0),
+        solid(srgb(0.12, 0.35, 0.9)),
+    );
+    l.fill(
+        Shape::Path {
+            path: star_path(68.0, 78.0, 8.0, 18.0),
+        },
+        solid(srgb(0.95, 0.65, 0.08)),
+    );
+    l.stroke(
+        Shape::Line(Line::new((30.0, 96.0), (98.0, 96.0))),
+        StrokeStyle {
+            width: 1.0,
+            ..StrokeStyle::default()
+        },
+        solid(srgb(0.12, 0.62, 0.24)),
+    );
+}
+
+fn filter_blend_content(l: &mut LayerBuilder<'_>) {
+    l.fill(
+        Shape::rounded_rect(24.0, 24.0, 104.0, 104.0, 8.0),
+        solid(srgba(0.92, 0.18, 0.22, 0.72)),
+    );
+    l.fill(
+        Shape::circle(50.0, 62.0, 20.0),
+        solid(srgba(0.1, 0.75, 0.88, 0.68)),
+    );
+    l.fill(
+        Shape::rect(64.0, 52.0, 96.0, 88.0),
+        solid(srgba(0.74, 0.24, 0.82, 0.66)),
+    );
 }
 
 /// A self-intersecting figure-eight-ish cubic path.
@@ -1673,6 +1766,95 @@ fn run() -> Result<(), SceneError> {
             srgba(0.0, 0.0, 0.2, 0.7),
         );
         l.fill(Shape::circle(56.0, 56.0, 30.0), solid(srgb(0.2, 0.5, 0.9)));
+    });
+
+    // ---- Filters -----------------------------------------------------------
+
+    corpus.scene("filter-color-matrix", 128, 128, white, |l| {
+        l.layer(|group| {
+            group.filter(LayerFilter::ColorMatrix {
+                matrix: FILTER_COLOR_MATRIX,
+            });
+            filter_color_content(group);
+        });
+    });
+
+    corpus.scene("filter-color-matrix-chain", 128, 128, white, |l| {
+        l.layer(|group| {
+            group.filter(LayerFilter::ColorMatrixChain {
+                first: FILTER_SEPIA_MATRIX,
+                second: FILTER_CHAIN_SECOND,
+            });
+            filter_color_content(group);
+        });
+    });
+
+    corpus.scene("filter-gaussian-blur", 128, 128, white, |l| {
+        l.layer(|group| {
+            group.filter(LayerFilter::GaussianBlur { sigma: 4.0 });
+            filter_blur_content(group);
+        });
+    });
+
+    corpus.scene("filter-box-blur", 128, 128, white, |l| {
+        l.layer(|group| {
+            group.filter(LayerFilter::BoxBlur { radius: 3.0 });
+            filter_blur_content(group);
+        });
+    });
+
+    let image = filter_image_png();
+    let image_hash = ResourceHash::of(&image);
+    for (name, amount, mode) in [
+        ("filter-blend-image", 0.8, FilterBlend::Multiply),
+        (
+            "filter-blend-image-luminosity",
+            1.0,
+            FilterBlend::Luminosity,
+        ),
+    ] {
+        corpus.scene_with_blobs(
+            name,
+            128,
+            128,
+            white,
+            |l| {
+                l.layer(|group| {
+                    group.opacity(0.82);
+                    group.filter(LayerFilter::BlendImage {
+                        image: image_hash,
+                        amount,
+                        mode,
+                    });
+                    filter_blend_content(group);
+                });
+            },
+            vec![image.clone()],
+        );
+    }
+
+    corpus.scene("filter-nested", 64, 256, white, |l| {
+        l.layer(|outer| {
+            outer.opacity(0.8);
+            outer.filter(LayerFilter::ColorMatrix {
+                matrix: FILTER_COLOR_MATRIX,
+            });
+            outer.layer(|inner| {
+                inner.filter(LayerFilter::GaussianBlur { sigma: 6.0 });
+                for y in [
+                    15.0, 16.0, 31.0, 32.0, 47.0, 48.0, 127.0, 128.0, 191.0, 192.0,
+                ] {
+                    inner.fill(
+                        Shape::rect(26.0, y, 38.0, y + 1.0),
+                        solid(srgb(0.12, 0.32, 0.9)),
+                    );
+                }
+                inner.fill(
+                    Shape::rect(26.0, 122.0, 38.0, 134.0),
+                    solid(srgb(0.9, 0.24, 0.12)),
+                );
+            });
+        });
     });
 
     // ---- HDR -----------------------------------------------------------------

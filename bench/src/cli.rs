@@ -156,6 +156,38 @@ enum Sub {
         #[arg(long, value_name = "WxH")]
         native: Option<String>,
     },
+    /// Record the #169 allocation-event diagnostic for one scene.
+    ///
+    /// Runs the scene through the `cherenkov` adapter with
+    /// `GpuConfig::alloc_diag` installed and writes every allocation,
+    /// growth, upload and submission boundary — with the wgpu
+    /// allocator's state at each — as JSON Lines to `--out`.
+    /// Diagnostics only: the per-event allocator snapshot is expensive,
+    /// so this mode never joins timed or energy runs.
+    AllocDiag {
+        /// One scene directory.
+        #[arg(long)]
+        scene: PathBuf,
+        /// Measured frame count (after warmup).
+        #[arg(long, default_value_t = 60)]
+        frames: u32,
+        /// Warmup frames discarded before measuring.
+        #[arg(long, default_value_t = 5)]
+        warmup: u32,
+        /// JSON Lines report path.
+        #[arg(long)]
+        out: PathBuf,
+        /// Render at the device's native resolution (`WxH`; see
+        /// `measure --native`).
+        #[arg(long, value_name = "WxH")]
+        native: Option<String>,
+        /// Pace the frames to this rate in Hz (see `measure --rate`).
+        #[arg(long, value_name = "HZ")]
+        rate: Option<f64>,
+        /// Pin the run to these CPUs (see `measure --cpu`).
+        #[arg(long, value_name = "LIST")]
+        cpu: Option<String>,
+    },
     /// Sweep scene load to find each engine's sustained capacity.
     ///
     /// The draw list is repeated `k` times, doubling `k` until a probe's
@@ -329,6 +361,10 @@ pub unsafe extern "C" fn cherenkov_bench_run(argc: c_int, argv: *const *const c_
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_args(&args))).unwrap_or(101)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one match arm per subcommand; the run dispatch table"
+)]
 fn run(cli: Cli) -> Result<(), BenchError> {
     match cli.cmd {
         Sub::Engines => {
@@ -378,6 +414,23 @@ fn run(cli: Cli) -> Result<(), BenchError> {
                 energy,
                 native: native.as_deref(),
             },
+        ),
+        Sub::AllocDiag {
+            scene,
+            frames,
+            warmup,
+            out,
+            native,
+            rate,
+            cpu,
+        } => alloc_diag_cmd(
+            &scene,
+            frames,
+            warmup,
+            native.as_deref(),
+            rate,
+            cpu.as_deref(),
+            &out,
         ),
         Sub::Capacity {
             engine,
@@ -455,6 +508,80 @@ fn present_cost_cmd(
 ) -> Result<(), BenchError> {
     Err(BenchError::Engine(
         "present-cost needs the `cherenkov` adapter feature".into(),
+    ))
+}
+
+/// The `alloc-diag` subcommand: a fresh-process allocation event trace
+/// for issue #169, at the issue's resolution and pacing.
+#[cfg(feature = "cherenkov")]
+fn alloc_diag_cmd(
+    dir: &Path,
+    frames: u32,
+    warmup: u32,
+    native: Option<&str>,
+    rate: Option<f64>,
+    cpu: Option<&str>,
+    out: &Path,
+) -> Result<(), BenchError> {
+    let native = parse_native(native)?;
+    if let Some(rate) = rate {
+        if !(rate.is_finite() && rate > 0.0) {
+            return Err(BenchError::Engine(format!(
+                "--rate must be a positive, finite Hz value, got {rate}"
+            )));
+        }
+        pacing(rate, frames)?;
+    }
+    if let Some(cpus) = cpu.map(affinity::parse_cpu_list).transpose()? {
+        affinity::pin_current_thread(&cpus)?;
+    }
+    let sink = cherenkov_gpu::diag::Sink::new();
+    let mut engine = crate::cherenkov_ad::Cherenkov::with_alloc_diag(sink.clone())?;
+    let (scene, _native) = load_scene(dir, native)?;
+    let blobs = convert::load_blobs(&scene, dir)?;
+    let input = EncodeInput {
+        scene: &scene,
+        blobs: &blobs,
+    };
+    engine.prepare(&input)?;
+    let (period, window_hint) = match rate {
+        Some(hz) => pacing(hz, frames).map(|(p, w)| (Some(p), w))?,
+        None => (None, Duration::from_secs(30)),
+    };
+    run_frames(
+        &mut engine,
+        &input,
+        frames,
+        warmup,
+        period,
+        window_hint,
+        false,
+    )?;
+    engine.alloc_diag_teardown();
+    drop(engine);
+    let count = sink
+        .write_json(out)
+        .map_err(|e| BenchError::Engine(format!("writing {}: {e}", out.display())))?;
+    tracing::info!(
+        events = count,
+        out = %out.display(),
+        "alloc-diag"
+    );
+    Ok(())
+}
+
+#[cfg(not(feature = "cherenkov"))]
+fn alloc_diag_cmd(
+    _scene: &Path,
+    _frames: u32,
+    _warmup: u32,
+    _native: Option<&str>,
+    _rate: Option<f64>,
+    _cpu: Option<&str>,
+    _out: &Path,
+) -> Result<(), BenchError> {
+    Err(BenchError::Engine(
+        "alloc-diag needs the `cherenkov` adapter feature".into(),
     ))
 }
 

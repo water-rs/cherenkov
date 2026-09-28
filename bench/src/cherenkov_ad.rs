@@ -486,6 +486,8 @@ pub struct Cherenkov {
     /// per-scene source/destination textures. `None` renders offscreen.
     /// Boxed so the mode stays off the hot struct.
     present: Option<Box<Present>>,
+    /// The #169 allocation diagnostic sink, when the run installed one.
+    alloc_diag: Option<cherenkov_gpu::diag::Sink>,
 }
 
 /// `--present` state: the engine runs on a bench-owned shared device so a
@@ -1515,12 +1517,33 @@ impl Cherenkov {
     /// # Errors
     /// [`BenchError::Gpu`] when no adapter exists or device creation fails.
     pub fn new() -> Result<Self, BenchError> {
+        Self::make(None)
+    }
+
+    /// Creates the adapter with the #169 allocation diagnostic installed.
+    ///
+    /// # Errors
+    /// [`BenchError::Gpu`] when no adapter exists or device creation fails.
+    pub fn with_alloc_diag(sink: cherenkov_gpu::diag::Sink) -> Result<Self, BenchError> {
+        Self::make(Some(sink))
+    }
+
+    /// A final snapshot event after the engine's last submission, so a
+    /// trace ends with the post-drop allocator state.
+    pub fn alloc_diag_teardown(&self) {
+        if let Some(sink) = &self.alloc_diag {
+            sink.teardown(&self.shared_device.device);
+        }
+    }
+
+    fn make(alloc_diag: Option<cherenkov_gpu::diag::Sink>) -> Result<Self, BenchError> {
         let config = GpuConfig {
             timestamps: true,
             scratch_format: match std::env::var("CHERENKOV_SCRATCH_FORMAT").as_deref() {
                 Ok("rgba8") => ScratchFormat::Rgba8Unorm,
                 _ => ScratchFormat::LinearF16,
             },
+            alloc_diag: alloc_diag.clone(),
             ..GpuConfig::default()
         };
         let shared_device = SharedDevice::create(&config)
@@ -1560,6 +1583,7 @@ impl Cherenkov {
             clock: Clock::new(),
             counters: Counters::default(),
             present: None,
+            alloc_diag,
         })
     }
 }

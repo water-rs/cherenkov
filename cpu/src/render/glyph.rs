@@ -381,6 +381,9 @@ pub fn rasterize_mask(font: &FontData, req: &GlyphReq) -> Result<GlyphMask, Rend
     if edges.is_empty() || bbox.width() <= 0.0 || bbox.height() <= 0.0 {
         return Ok(empty());
     }
+    // Overlapping contours resolve to the union's boundary edges, like
+    // the path lowering: `None` keeps the glyph bit-identical.
+    let (edges, _) = crate::render::lower::resolve_edges(edges, cherenkov::FillRule::NonZero);
     let left = bbox.x0.floor() as i32 - 1;
     let top = bbox.y0.floor() as i32 - 1;
     let right = bbox.x1.ceil() as i32 + 1;

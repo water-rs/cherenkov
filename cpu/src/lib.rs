@@ -47,6 +47,30 @@ mod names;
 mod render;
 
 use cherenkov::{Backend, EngineError, Offscreen, OffscreenFormat};
+use std::sync::Arc;
+
+/// Wakes the host to schedule a frame.
+#[derive(Clone)]
+pub struct RedrawCallback(Arc<dyn Fn() + Send + Sync>);
+
+impl RedrawCallback {
+    /// Creates a callback that wakes the host.
+    #[must_use]
+    pub fn new(callback: impl Fn() + Send + Sync + 'static) -> Self {
+        Self(Arc::new(callback))
+    }
+
+    /// Wakes an idle host for asynchronous filter parameter changes.
+    pub fn wake(&self) {
+        (self.0)();
+    }
+}
+
+impl std::fmt::Debug for RedrawCallback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RedrawCallback").finish_non_exhaustive()
+    }
+}
 
 /// CPU worker information for provenance.
 #[derive(Clone, Debug)]
@@ -65,6 +89,8 @@ pub struct RasterConfig {
     /// Worker thread count for the banded rasterizer. `None` uses the
     /// rayon default (one thread per logical core).
     pub threads: Option<usize>,
+    /// Wakes an idle host for asynchronous filter parameter changes.
+    pub redraw: Option<RedrawCallback>,
     /// Memory budgets; only `budget.cpu` is used for resident images and cached glyph masks.
     /// Surface framebuffers and in-flight frame data are not evictable caches.
     pub budget: cherenkov::Budget,
@@ -162,6 +188,21 @@ pub struct Raster;
 
 impl cherenkov::Uploads<cherenkov::Rgba8> for Raster {}
 impl cherenkov::Uploads<cherenkov::Rgba16F> for Raster {}
+
+impl cherenkov::Filters for Raster {
+    fn remove_filter(renderer: &mut Self::Renderer, id: cherenkov::FilterId) {
+        renderer.filters.remove(id);
+    }
+}
+
+impl<F> cherenkov::Runs<F> for Raster
+where
+    F: filtrate_core::CpuFilter + cherenkov::RenderTransfer + Send + Sync,
+{
+    fn add_filter(renderer: &mut Self::Renderer, id: cherenkov::FilterId, filter: F) {
+        renderer.filters.add(id, filter);
+    }
+}
 
 impl Backend for Raster {
     type Config = RasterConfig;

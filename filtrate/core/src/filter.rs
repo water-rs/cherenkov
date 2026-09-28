@@ -214,7 +214,10 @@ mod tests {
     use alloc::vec::Vec;
 
     use super::*;
-    use crate::{ColorStage, OperatingSpace, ParamSource, Placed, SpatialStage};
+    use crate::{
+        ColorStage, CpuFilter, CpuFilterError, CpuImage, OperatingSpace, ParamSource, Placed,
+        SpatialStage, WorkingSpace,
+    };
 
     const COLOR: ColorStage = ColorStage {
         name: "color",
@@ -247,6 +250,20 @@ mod tests {
     impl ColorFilter for Tint {
         const LINEAR: bool = true;
     }
+    impl CpuFilter for Tint {
+        fn cpu_footprint(_params: &Self::Params) -> Footprint {
+            Footprint::ZERO
+        }
+
+        fn apply_cpu_image(
+            &self,
+            _params: &Self::Params,
+            _space: &WorkingSpace,
+            _image: &mut CpuImage<'_>,
+        ) -> Result<(), CpuFilterError> {
+            Ok(())
+        }
+    }
 
     struct Clamp;
     impl Filter for Clamp {
@@ -260,6 +277,20 @@ mod tests {
     }
     impl ColorFilter for Clamp {
         const LINEAR: bool = false;
+    }
+    impl CpuFilter for Clamp {
+        fn cpu_footprint(_params: &Self::Params) -> Footprint {
+            Footprint::ZERO
+        }
+
+        fn apply_cpu_image(
+            &self,
+            _params: &Self::Params,
+            _space: &WorkingSpace,
+            _image: &mut CpuImage<'_>,
+        ) -> Result<(), CpuFilterError> {
+            Ok(())
+        }
     }
 
     struct Spread;
@@ -277,6 +308,20 @@ mod tests {
     impl SpatialFilter for Spread {
         fn footprint_of(params: &[f32; 2]) -> Footprint {
             Footprint::new(params[0], params[1] / 4.0)
+        }
+    }
+    impl CpuFilter for Spread {
+        fn cpu_footprint(params: &Self::Params) -> Footprint {
+            Self::footprint_of(params)
+        }
+
+        fn apply_cpu_image(
+            &self,
+            _params: &Self::Params,
+            _space: &WorkingSpace,
+            _image: &mut CpuImage<'_>,
+        ) -> Result<(), CpuFilterError> {
+            Ok(())
         }
     }
 
@@ -301,6 +346,39 @@ mod tests {
         );
         // Resolving adds the extent fraction of the larger dimension.
         assert_eq!(Spread.footprint().resolve((100.0, 200.0)), 152.0);
+    }
+
+    #[test]
+    fn cpu_chain_footprints_match_spatial_chain_footprints() {
+        let color_spatial = Tint.then(Spread);
+        let color_spatial_params = color_spatial.params();
+        assert_eq!(
+            <Chain<Tint, Spread> as CpuFilter>::cpu_footprint(&color_spatial_params),
+            <Chain<Tint, Spread> as SpatialFilter>::footprint_of(&color_spatial_params)
+        );
+
+        let spatial_color = Spread.then(Tint);
+        let spatial_color_params = spatial_color.params();
+        assert_eq!(
+            <Chain<Spread, Tint> as CpuFilter>::cpu_footprint(&spatial_color_params),
+            <Chain<Spread, Tint> as SpatialFilter>::footprint_of(&spatial_color_params)
+        );
+
+        let spatial_spatial = Spread.then(Spread);
+        let spatial_spatial_params = spatial_spatial.params();
+        assert_eq!(
+            <Chain<Spread, Spread> as CpuFilter>::cpu_footprint(&spatial_spatial_params),
+            <Chain<Spread, Spread> as SpatialFilter>::footprint_of(&spatial_spatial_params)
+        );
+    }
+
+    #[test]
+    fn cpu_colour_chain_footprint_is_zero() {
+        let color_color = Tint.then(Clamp);
+        assert_eq!(
+            <Chain<Tint, Clamp> as CpuFilter>::cpu_footprint(&color_color.params()),
+            Footprint::ZERO
+        );
     }
 
     #[test]

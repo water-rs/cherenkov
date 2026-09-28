@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 use crate::{
-    BackdropFilter, BackdropGroup, BlendMode, Color, Draw, FillRule, GlyphRun, Item, Layer, Motion,
-    Paint, ResourceHash, Sampling, Scene, Shape, StrokeStyle,
+    BackdropFilter, BackdropGroup, BlendMode, Color, Draw, FillRule, GlyphRun, Item, Layer,
+    LayerFilter, Motion, Paint, ResourceHash, Sampling, Scene, Shape, StrokeStyle,
 };
 use kurbo::{Affine, Rect, Vec2};
 
@@ -138,6 +138,12 @@ impl LayerBuilder<'_> {
     /// layer's clip.
     pub const fn backdrop(&mut self, group: u32) -> &mut Self {
         self.layer.backdrop = Some(group);
+        self
+    }
+
+    /// Set the filter applied to the layer's isolated content.
+    pub fn filter(&mut self, filter: LayerFilter) -> &mut Self {
+        self.layer.filter = Some(Box::new(filter));
         self
     }
 

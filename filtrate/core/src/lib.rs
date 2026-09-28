@@ -97,7 +97,7 @@ mod visitor;
 pub use animation::AnimationTrack;
 pub use filter::{Chain, ColorFilter, Filter, FilterExt, Footprint, SpatialFilter};
 pub use image::{AuxData, AuxFormat, AuxImage, ImageVisitor};
-pub use kernel::CpuKernel;
+pub use kernel::{CpuFilter, CpuFilterError, CpuImage, CpuKernel};
 pub use param::{AnimatedCallback, AnimatedTarget, FilterParam, Interpolator, WatchGuard};
 pub use params::ParamArray;
 pub use space::{OperatingSpace, WorkingSpace};

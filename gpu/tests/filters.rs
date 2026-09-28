@@ -4,7 +4,9 @@
 //! Filter composition, capture sizes and engine-provided effect timing.
 
 use cherenkov::kurbo::Rect;
-use cherenkov::{Draw, Engine, FrameTime, Next, Offscreen, OffscreenFormat, WorkingColor};
+use cherenkov::{
+    BlendMode, Draw, Engine, FrameTime, Group, Next, Offscreen, OffscreenFormat, WorkingColor,
+};
 use cherenkov_gpu::{Gpu, GpuConfig, interop::EffectBox};
 use filtrate::{
     Effect, EffectContext, EffectFrameTiming, EffectInput, EffectOutput, EffectRenderResult,
@@ -43,6 +45,103 @@ impl Effect for CopyEffect {
         );
         Ok(true)
     }
+}
+
+#[test]
+fn filtered_group_isolates_blended_descendant_inside_pass_through_group()
+-> Result<(), Box<dyn std::error::Error>> {
+    let engine = Engine::<Gpu>::new(GpuConfig::default())?;
+    let identity = engine.filter(filtrate::filters::ColorMatrix([
+        1.0_f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0,
+    ]));
+    let surface = engine.surface(Offscreen::new((8, 40), OffscreenFormat::LinearF32))?;
+    surface.update(|tx| {
+        tx[surface.root()].content(surface.record(|r| {
+            r.fill(
+                Rect::new(0.0, 0.0, 8.0, 40.0),
+                WorkingColor::new([1.0, 0.0, 0.0, 1.0]),
+            );
+            r.group(Group::new().filter(identity.id()), |r| {
+                r.fill(
+                    Rect::new(0.0, 0.0, 8.0, 40.0),
+                    WorkingColor::new([0.0, 0.0, 1.0, 1.0]),
+                );
+                r.group(Group::new(), |r| {
+                    r.fill(
+                        Rect::new(0.0, 0.0, 8.0, 40.0),
+                        WorkingColor::new([0.0, 1.0, 0.0, 1.0]),
+                    );
+                    r.group(Group::new().blend(BlendMode::DestOut), |r| {
+                        r.fill(Rect::new(0.0, 12.0, 8.0, 28.0), WorkingColor::WHITE);
+                    });
+                });
+            });
+        }));
+    });
+    engine.render(FrameTime::now())?;
+    let pixels = surface.readback()?.pixels;
+    for y in 0..40 {
+        let expected = if (12..28).contains(&y) {
+            [0.0, 0.0, 1.0, 1.0]
+        } else {
+            [0.0, 1.0, 0.0, 1.0]
+        };
+        for x in 0..8 {
+            let pixel = pixels[y * 8 + x];
+            for (actual, expected) in pixel.into_iter().zip(expected) {
+                assert!(
+                    (actual - expected).abs() <= 1.0e-3,
+                    "pixel ({x}, {y}): {pixel:?}, expected {expected}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn filtered_group_contains_direct_blended_descendant() -> Result<(), Box<dyn std::error::Error>> {
+    let engine = Engine::<Gpu>::new(GpuConfig::default())?;
+    let identity = engine.filter(filtrate::filters::ColorMatrix([
+        1.0_f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0,
+    ]));
+    let surface = engine.surface(Offscreen::new((8, 40), OffscreenFormat::LinearF32))?;
+    surface.update(|tx| {
+        tx[surface.root()].content(surface.record(|r| {
+            r.fill(
+                Rect::new(0.0, 0.0, 8.0, 40.0),
+                WorkingColor::new([1.0, 0.0, 0.0, 1.0]),
+            );
+            r.group(Group::new().filter(identity.id()), |r| {
+                r.fill(
+                    Rect::new(0.0, 0.0, 8.0, 40.0),
+                    WorkingColor::new([0.0, 0.0, 1.0, 1.0]),
+                );
+                r.group(Group::new().blend(BlendMode::DestOut), |r| {
+                    r.fill(Rect::new(0.0, 12.0, 8.0, 28.0), WorkingColor::WHITE);
+                });
+            });
+        }));
+    });
+    engine.render(FrameTime::now())?;
+    let pixels = surface.readback()?.pixels;
+    for y in 0..40 {
+        let expected = if (12..28).contains(&y) {
+            [1.0, 0.0, 0.0, 1.0]
+        } else {
+            [0.0, 0.0, 1.0, 1.0]
+        };
+        for x in 0..8 {
+            let pixel = pixels[y * 8 + x];
+            for (actual, expected) in pixel.into_iter().zip(expected) {
+                assert!(
+                    (actual - expected).abs() <= 1.0e-3,
+                    "pixel ({x}, {y}): {pixel:?}, expected {expected}"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 #[test]

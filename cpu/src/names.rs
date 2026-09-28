@@ -10,8 +10,8 @@
 /// A user shader paint.
 pub const SHADER: &str = "shader-paint";
 
-/// A filter on a group or layer.
-pub const FILTER: &str = "filter";
+/// A filter requiring an auxiliary GPU image with no CPU texels.
+pub const FILTER_GPU_IMAGE: &str = "filter-gpu-image";
 /// A backdrop group.
 pub const BACKDROP: &str = "backdrop";
 /// A stroked glyph run.

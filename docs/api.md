@@ -34,10 +34,10 @@ Capabilities are traits implemented by backend types, so using a missing capabil
 |---|---|---|---|
 | `Uploads<F>` for an image format `F` | `Rgba8`, `Rgba16F` | `Rgba8` | `Rgba8`, `Rgba16F` |
 | `GpuContent`, `ShaderPaint` | both | both | |
-| `Filters`, `Runs<F>` for a filter `F`, `Effects` | every filter | every filter | |
+| `Filters`, `Runs<F>` for a filter `F`, `Effects` | every filter | every filter | filters with a CPU kernel |
 | `HdrOutput`, `Backdrop`, `ExternalFrames`, `Planes` | | | |
 
-Targets beyond the current rows: `Gpu` is meant to accept every image format and grow `ExternalFrames`, `HdrOutput`, `Backdrop` and `Planes` (system-compositor promotion); `Raster` targets `Uploads<Rgba8>`, `Backdrop` and `Runs<F>`/`Effects` for filters with a CPU kernel; a `Banded<P>` microcontroller backend (banded output, panel formats, flash-resident assets) targets panel-format uploads and CPU-kernel filters.
+Targets beyond the current rows: `Gpu` is meant to accept every image format and grow `ExternalFrames`, `HdrOutput`, `Backdrop` and `Planes` (system-compositor promotion); `Raster` targets `Uploads<Rgba8>`, `Backdrop`, and `Filters`/`Runs<F>` for filters with a CPU kernel; a `Banded<P>` microcontroller backend (banded output, panel formats, flash-resident assets) targets panel-format uploads and CPU-kernel filters.
 
 The table is the target; a backend slice implements the rows it has code for, and the compiler rejects the rest.
 
@@ -420,7 +420,7 @@ A shared **shader composer** crate, `cherenkov-shader` in `shader/`, is built on
 3. **Footprint.** `SpatialFilter::footprint(&self) -> Footprint` is the maximum sample reach for the current parameters — an absolute pixel component plus a fraction of the image extent, which reaches like twirl or perspective report instead of claiming an unbounded reach; while a parameter animates, it is the maximum over its animation track. The executor resolves it against the actual input size. It sizes intermediates, damage expansion, backdrop regions and band or tile aprons.
 4. **Working-space constants and operating space.** Luma and saturation coefficients come from the working space (linear P3) as engine-provided constants. A filter also declares the colour space it operates in. For web compatibility, CSS filter functions operate in sRGB, so the engine converts around them. Extended values (negative components, values above 1) stay extended.
 5. **Shape input.** A filter can declare that it needs the clip shape's signed distance field or its mask.
-6. **CPU kernels.** A filter may provide a SIMD CPU kernel, which makes it `Runs<Raster>` and `Runs<Banded<_>>`. The oracle cross-checks every kernel against its shader.
+6. **CPU kernels.** A filter may implement `CpuFilter` with a CPU kernel, which makes it available through `Filters` and `Runs<Raster>`; `Banded<_>` can also run filters with CPU kernels. CPU-run filters are `Send + Sync`: bands apply them in parallel. The oracle cross-checks every kernel against its shader. `RasterConfig::redraw` wakes an idle host when filter parameters change asynchronously.
 
 ### Execution
 

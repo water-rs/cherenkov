@@ -61,6 +61,8 @@ pub enum Feature {
     Animation,
     /// Group opacity below `1.0`.
     Opacity,
+    /// A layer filter.
+    Filter,
     /// `Shadow` draw commands.
     Shadow,
     /// `Glyphs` draw commands.
@@ -293,6 +295,9 @@ impl Scene {
 }
 
 fn collect_resource_refs(layer: &Layer, out: &mut Vec<ResourceHash>) {
+    if let Some(crate::LayerFilter::BlendImage { image, .. }) = layer.filter.as_deref() {
+        out.push(*image);
+    }
     for item in &layer.items {
         match item {
             Item::Layer(l) => collect_resource_refs(l, out),
@@ -447,6 +452,9 @@ fn collect_layer_features(layer: &Layer, f: &mut BTreeSet<Feature>) {
     }
     if layer.opacity < 1.0 {
         f.insert(Feature::Opacity);
+    }
+    if layer.filter.is_some() {
+        f.insert(Feature::Filter);
     }
     if layer.blend != BlendMode::Normal {
         f.insert(Feature::Blend(layer.blend));

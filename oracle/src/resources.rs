@@ -10,12 +10,14 @@ use std::path::PathBuf;
 use cherenkov_scene::{ResourceHash, Scene, SceneError};
 
 use crate::color::{linear_srgb_to_linear_p3, srgb_decode};
+use crate::filter::Texels;
 use crate::image::Image;
 
 /// Lazily decoded `resources/` blobs for one scene directory.
 pub struct Resources {
     dir: PathBuf,
     images: HashMap<(ResourceHash, cherenkov_scene::ImageEncoding), Image>,
+    texels: HashMap<ResourceHash, Texels>,
     fonts: HashMap<ResourceHash, Vec<u8>>,
 }
 
@@ -26,6 +28,7 @@ impl Resources {
         Self {
             dir: scene_dir,
             images: HashMap::new(),
+            texels: HashMap::new(),
             fonts: HashMap::new(),
         }
     }
@@ -120,6 +123,40 @@ impl Resources {
             );
         }
         Ok(self.images.get(&key).unwrap())
+    }
+
+    /// The raw straight-alpha texels of filter image `hash`, `channel /
+    /// 255` with no colour conversion, decoding on first use.
+    ///
+    /// # Errors
+    /// As [`Self::image`].
+    /// # Panics
+    /// Never — the cache entry was just inserted on the miss path.
+    pub fn texels(&mut self, hash: ResourceHash) -> Result<&Texels, SceneError> {
+        if !self.texels.contains_key(&hash) {
+            let bytes = self.blob(hash)?;
+            let (width, height, rgba) = crate::image::decode_png_rgba8(&bytes).map_err(|e| {
+                SceneError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    e.to_string(),
+                ))
+            })?;
+            let texels = rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|px| px.map(|v| f64::from(v) / 255.0))
+                .collect();
+            self.texels.insert(
+                hash,
+                Texels {
+                    width: width as usize,
+                    height: height as usize,
+                    texels,
+                },
+            );
+        }
+        Ok(self.texels.get(&hash).unwrap())
     }
 
     /// The font bytes for `hash`, loading on first use.

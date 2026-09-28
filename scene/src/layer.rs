@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{BlendMode, Draw, Shape};
+use crate::{BlendMode, Draw, ResourceHash, Shape};
 use kurbo::{Affine, Rect, Vec2};
 
 /// One item in a layer's ordered item list: a child layer or a draw command.
@@ -46,6 +46,10 @@ pub struct Layer {
     /// that clip.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backdrop: Option<u32>,
+    /// A filter applied to the layer's isolated content, in device pixels,
+    /// before `opacity` and `blend`; the layer clip masks its output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<Box<LayerFilter>>,
     /// The layer's scroll offset: content and children are translated by
     /// `-scroll_offset` inside the layer's clip; `transform` is untouched.
     /// Zero (the default) draws them untranslated.
@@ -67,6 +71,90 @@ pub struct Layer {
     /// others render frame 0.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub live: Vec<Live>,
+}
+
+/// A filtrate filter on a layer's isolated content, in premultiplied
+/// linear Display P3 device pixels. Spatial filters clamp at the surface
+/// edge.
+///
+/// Serialized externally tagged, like [`Item`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LayerFilter {
+    /// `rgb' = M · rgb + bias · a` on premultiplied colour, alpha
+    /// unchanged. Rows are `[r, g, b, bias]` for red, green and blue.
+    ColorMatrix {
+        /// The 3x4 matrix, row-major.
+        matrix: [f64; 12],
+    },
+    /// `first`, then `second`, as one chained filter.
+    ColorMatrixChain {
+        /// The matrix applied first.
+        first: [f64; 12],
+        /// The matrix applied second.
+        second: [f64; 12],
+    },
+    /// A separable Gaussian blur of standard deviation `sigma` pixels.
+    GaussianBlur {
+        /// Standard deviation in pixels.
+        sigma: f64,
+    },
+    /// A separable box blur: the mean of `2r + 1` texels per axis,
+    /// `r = round(radius)`.
+    BoxBlur {
+        /// Radius in pixels, rounded.
+        radius: f64,
+    },
+    /// Blends each pixel's unpremultiplied colour with the sampled straight
+    /// texel, mixes by `amount`, and re-premultiplies with the unchanged alpha.
+    BlendImage {
+        /// BLAKE3 hash of the image blob in `resources/` (PNG).
+        image: ResourceHash,
+        /// Mix factor, clamped to `0.0..=1.0`.
+        amount: f64,
+        /// The blend operator.
+        mode: FilterBlend,
+    },
+}
+
+/// The operators of [`LayerFilter::BlendImage`]: filtrate's blend
+/// composite, on non-premultiplied operand values. Soft light, colour
+/// dodge and burn and the HSL modes differ from W3C [`BlendMode`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FilterBlend {
+    /// `top`.
+    Normal,
+    /// `base · top`.
+    Multiply,
+    /// `1 − (1 − base)(1 − top)`.
+    Screen,
+    /// Hard light with the operands swapped.
+    Overlay,
+    /// `min(base, top)`.
+    Darken,
+    /// `max(base, top)`.
+    Lighten,
+    /// `base ∓ …` with the `√base` upper branch.
+    SoftLight,
+    /// `2·base·top` below `top = ½`, screen above.
+    HardLight,
+    /// `|base − top|`.
+    Difference,
+    /// `base + top − 2·base·top`.
+    Exclusion,
+    /// `base / max(1 − top, 10⁻⁴)`.
+    ColorDodge,
+    /// `1 − (1 − base) / max(top, 10⁻⁴)`.
+    ColorBurn,
+    /// HSL: hue of `top`.
+    Hue,
+    /// HSL: saturation of `top`.
+    Saturation,
+    /// HSL: hue and saturation of `top`.
+    Color,
+    /// HSL: lightness of `top`.
+    Luminosity,
 }
 
 /// Per-frame values for one draw item: `frames[n % len]` replaces the
@@ -165,6 +253,7 @@ impl Default for Layer {
             opacity: 1.0,
             blend: BlendMode::Normal,
             backdrop: None,
+            filter: None,
             scroll_offset: Vec2::ZERO,
             motion: None,
             items: Vec::new(),

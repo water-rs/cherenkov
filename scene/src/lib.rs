@@ -12,6 +12,7 @@
 //! it uses so that an adapter can report a scene as unsupported instead of
 //! silently emulating it.
 
+mod backdrop;
 mod builder;
 mod color;
 mod draw;
@@ -24,6 +25,7 @@ mod shape;
 #[doc(hidden)]
 pub mod corpus;
 
+pub use backdrop::{BackdropFilter, BackdropGroup};
 pub use builder::{LayerBuilder, SceneBuilder};
 pub use color::{Color, ColorSpace};
 pub use draw::{

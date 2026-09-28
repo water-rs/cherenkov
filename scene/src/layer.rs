@@ -37,6 +37,12 @@ pub struct Layer {
     /// The blend mode used when compositing onto the parent.
     #[serde(default)]
     pub blend: BlendMode,
+    /// The id of the [`crate::BackdropGroup`] this layer samples, if any.
+    /// A member layer must have a `clip`; the group's capture runs through
+    /// the group's filters and is drawn as the bottom-most content inside
+    /// that clip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backdrop: Option<u32>,
     /// The layer's scroll offset: content and children are translated by
     /// `-scroll_offset` inside the layer's clip; `transform` is untouched.
     /// Zero (the default) draws them untranslated.
@@ -155,6 +161,7 @@ impl Default for Layer {
             clip: None,
             opacity: 1.0,
             blend: BlendMode::Normal,
+            backdrop: None,
             scroll_offset: Vec2::ZERO,
             motion: None,
             items: Vec::new(),

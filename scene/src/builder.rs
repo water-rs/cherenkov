@@ -1,6 +1,6 @@
 use crate::{
-    BlendMode, Color, Draw, FillRule, GlyphRun, Item, Layer, Motion, Paint, ResourceHash, Sampling,
-    Scene, Shape, StrokeStyle,
+    BackdropFilter, BackdropGroup, BlendMode, Color, Draw, FillRule, GlyphRun, Item, Layer, Motion,
+    Paint, ResourceHash, Sampling, Scene, Shape, StrokeStyle,
 };
 use kurbo::{Affine, Rect, Vec2};
 
@@ -45,6 +45,15 @@ impl SceneBuilder {
         self
     }
 
+    /// Declare a backdrop group `id` with `filters`; layers sample it via
+    /// [`LayerBuilder::backdrop`].
+    pub fn backdrop_group(&mut self, id: u32, filters: Vec<BackdropFilter>) -> &mut Self {
+        self.scene
+            .backdrop_groups
+            .push(BackdropGroup { id, filters });
+        self
+    }
+
     /// A [`LayerBuilder`] over the root layer.
     pub const fn root(&mut self) -> LayerBuilder<'_> {
         LayerBuilder {
@@ -80,6 +89,7 @@ impl SceneBuilder {
         fn clip(shape: Shape);
         fn opacity(opacity: f64);
         fn blend(blend: BlendMode);
+        fn backdrop(group: u32);
         fn fill(shape: Shape, paint: Paint);
         fn fill_rule(shape: Shape, rule: FillRule, paint: Paint);
         fn stroke(shape: Shape, stroke: StrokeStyle, paint: Paint);
@@ -117,6 +127,14 @@ impl LayerBuilder<'_> {
     /// Set the blend mode.
     pub const fn blend(&mut self, blend: BlendMode) -> &mut Self {
         self.layer.blend = blend;
+        self
+    }
+
+    /// Make the layer a member of backdrop group `group`: the group's
+    /// filtered capture is drawn as the bottom-most content inside the
+    /// layer's clip.
+    pub const fn backdrop(&mut self, group: u32) -> &mut Self {
+        self.layer.backdrop = Some(group);
         self
     }
 

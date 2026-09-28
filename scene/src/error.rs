@@ -17,6 +17,12 @@ pub enum SceneError {
     /// An image's declared encoding cannot decode its bytes.
     #[error("invalid image encoding {0:?}")]
     InvalidImageEncoding(crate::ImageEncoding),
+    /// A layer samples a backdrop group the scene does not declare.
+    #[error("layer samples unknown backdrop group {0}")]
+    UnknownBackdropGroup(u32),
+    /// A backdrop-group member layer has no clip.
+    #[error("backdrop group {0} member layer has no clip")]
+    BackdropMemberUnclipped(u32),
     /// The `features` set stored in `scene.json` does not match the features
     /// recomputed from the layer tree.
     #[error("stored features {declared:?} do not match recomputed {computed:?}")]

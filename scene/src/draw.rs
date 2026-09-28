@@ -437,6 +437,11 @@ pub struct Glyph {
     pub x: f32,
     /// Pen-relative y position.
     pub y: f32,
+    /// Per-glyph transform about its origin, applied after the font-size
+    /// scale and before the glyph position (for example an upright glyph
+    /// in vertical CJK text).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transform: Option<kurbo::Affine>,
 }
 
 /// A normalized variation coordinate of a variable font.

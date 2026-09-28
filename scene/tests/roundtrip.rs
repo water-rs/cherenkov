@@ -32,6 +32,10 @@ fn hash_roundtrip() {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the fixture scene is one long literal"
+)]
 fn scene_save_load() {
     let dir = std::env::temp_dir().join(format!("cherenkov-scene-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -83,6 +87,7 @@ fn scene_save_load() {
                 id: 36,
                 x: 0.0,
                 y: 0.0,
+                transform: None,
             }],
             paint: Paint::Solid(Color::srgb(0.0, 0.0, 0.0)),
         })

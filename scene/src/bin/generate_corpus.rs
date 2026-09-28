@@ -167,6 +167,7 @@ impl TextContext {
                         id: g.id,
                         x: g.x + TEXT_PAD,
                         y: g.y + TEXT_PAD,
+                        transform: None,
                     })
                     .collect();
                 runs.push(GlyphRun {

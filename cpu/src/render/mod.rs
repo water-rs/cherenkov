@@ -426,6 +426,8 @@ impl Renderer for RasterRenderer {
         MemoryUsage {
             gpu: cherenkov::Bytes(0),
             cpu: cherenkov::Bytes(categories.total()),
+            backdrop_captures: cherenkov::Bytes(0),
+            backdrop_capture_format: None,
         }
     }
 

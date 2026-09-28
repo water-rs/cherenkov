@@ -4683,9 +4683,9 @@ fn run() -> Result<(), SceneError> {
 
     // One group, five members: an overlapping pair, a nearly-touching
     // pair inside the apron (helped by the Refraction member's reach)
-    // and one far corner member that stays separate. The waste between
-    // the two pairs is under the merge overhead, so all four merge and
-    // the group resolves to two regions: pairs + corner.
+    // and one far corner member. The empty space between the pairs
+    // costs more than the merge overhead, so the group resolves to
+    // three regions: each pair and the corner.
     corpus.scene_setup("backdrop-sparse-mixed", 512, 512, white, |b| {
         b.backdrop_group(1, vec![BackdropFilter::GaussianBlur { sigma: 4.0 }]);
         let l = &mut b.root();

@@ -223,3 +223,54 @@ fn elliptical_and_lame_rims_get_their_exact_area() -> Result<(), Box<dyn std::er
     }
     Ok(())
 }
+
+/// A sharp corner inside a pixel: the exact area inside both folded
+/// half-planes, not either one's linear ramp. The rect corner at the
+/// centre of pixel (14, 14) covers one quarter of it (0.25); the same
+/// corner as a stroke's inner hole covers three quarters (0.75).
+#[test]
+fn a_sharp_corner_inside_a_pixel_gets_its_exact_area(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(engine) = engine() else {
+        return Ok(());
+    };
+    let tol = 2.0 / 255.0;
+    let surface = engine.surface(Offscreen::new((32, 32), OffscreenFormat::LinearF16))?;
+    surface.update(|tx| {
+        tx[surface.root()].content(surface.record(|c| {
+            c.fill(Rect::new(14.5, 14.5, 30.5, 30.5), WorkingColor::WHITE);
+        }));
+    });
+    engine.render(cherenkov::FrameTime::now())?;
+    let pixels = surface.readback()?.pixels;
+    let alpha = |x: u32, y: u32| f64::from(pixels[(y * 32 + x) as usize][3]);
+    assert!(
+        (alpha(14, 14) - 0.25).abs() < tol,
+        "corner pixel (14,14): {}",
+        alpha(14, 14)
+    );
+
+    let stroke = engine.surface(Offscreen::new((32, 32), OffscreenFormat::LinearF16))?;
+    stroke.update(|tx| {
+        tx[stroke.root()].content(stroke.record(|c| {
+            c.stroke(
+                Rect::new(11.5, 11.5, 22.5, 22.5),
+                kurbo::Stroke {
+                    width: 2.0,
+                    join: kurbo::Join::Round,
+                    ..kurbo::Stroke::default()
+                },
+                WorkingColor::WHITE,
+            );
+        }));
+    });
+    engine.render(cherenkov::FrameTime::now())?;
+    let pixels = stroke.readback()?.pixels;
+    let alpha = |x: u32, y: u32| f64::from(pixels[(y * 32 + x) as usize][3]);
+    assert!(
+        (alpha(12, 12) - 0.75).abs() < tol,
+        "stroke inner corner pixel (12,12): {}",
+        alpha(12, 12)
+    );
+    Ok(())
+}

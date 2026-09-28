@@ -1056,25 +1056,19 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
         let globals = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("globals"),
             size: 16,
-            usage: wgpu::BufferUsages::UNIFORM
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let instances = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("instances"),
             size: 272 * 16,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let stops = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("stops"),
             size: 32 * 16,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         diag::create(&device, "globals", globals.size());
@@ -1252,25 +1246,19 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
     let globals = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("globals"),
         size: 16,
-        usage: wgpu::BufferUsages::UNIFORM
-            | wgpu::BufferUsages::COPY_DST
-            | wgpu::BufferUsages::COPY_SRC,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
     let instances = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("instances"),
         size: 272 * 16,
-        usage: wgpu::BufferUsages::STORAGE
-            | wgpu::BufferUsages::COPY_DST
-            | wgpu::BufferUsages::COPY_SRC,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
     let stops = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("stops"),
         size: 32 * 16,
-        usage: wgpu::BufferUsages::STORAGE
-            | wgpu::BufferUsages::COPY_DST
-            | wgpu::BufferUsages::COPY_SRC,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
     diag::create(&device, "globals", globals.size());
@@ -1862,25 +1850,19 @@ impl Renderer for GpuRenderer {
         self.instances = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("instances"),
             size: 272 * 16,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         self.stops = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("stops"),
             size: 32 * 16,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         self.globals = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("globals"),
             size: 16,
-            usage: wgpu::BufferUsages::UNIFORM
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         self.bound_instance_size = self.instances.size();
@@ -3067,14 +3049,6 @@ impl GpuRenderer {
         stats.layers_composed += layers;
         stats.glyphs_rasterized += glyphs;
         stats.paths_rasterized += paths;
-        // Grow the query set lazily when this frame's passes exceed its
-        // capacity; never mid-encoder.
-        if self.timestamps {
-            let passes = self.surfaces.get(&id).map_or(0, |s| {
-                u32::try_from(s.frame.passes.len()).unwrap_or(u32::MAX)
-            });
-            self.ensure_query_capacity(2 * (globals_base + passes));
-        }
         // Scratch textures for the frame's deepest isolation level.
         let Some(surf) = self.surfaces.get_mut(&id) else {
             return Ok(());
@@ -3280,34 +3254,6 @@ impl GpuRenderer {
         }
         surf.inst_base = inst_base;
         surf.globals_base = globals_base;
-        let inst_bytes = bytemuck::cast_slice::<instance::Instance, u8>(&surf.frame.instances);
-        let inst_offset = u64::from(inst_base) * std::mem::size_of::<instance::Instance>() as u64;
-        if !inst_bytes.is_empty() && inst_offset + inst_bytes.len() as u64 > self.instances.size() {
-            let size = (inst_offset + inst_bytes.len() as u64).next_power_of_two();
-            self.instances = grow_buffer(
-                &self.device,
-                "instances",
-                &self.instances,
-                size,
-                wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::COPY_SRC,
-            );
-        }
-        let stop_bytes = bytemuck::cast_slice::<instance::Stop, u8>(&surf.frame.stops);
-        let stop_offset = u64::from(stop_base) * std::mem::size_of::<instance::Stop>() as u64;
-        if !stop_bytes.is_empty() && stop_offset + stop_bytes.len() as u64 > self.stops.size() {
-            let size = (stop_offset + stop_bytes.len() as u64).next_power_of_two();
-            self.stops = grow_buffer(
-                &self.device,
-                "stops",
-                &self.stops,
-                size,
-                wgpu::BufferUsages::STORAGE
-                    | wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::COPY_SRC,
-            );
-        }
         {
             let atlas = &self.atlas;
             if atlas.generation() != self.bound_atlas {
@@ -3323,29 +3269,14 @@ impl GpuRenderer {
                 self.bound_atlas = atlas.generation();
             }
         }
-        // One Globals entry per pass at a 256-byte stride, continuing the
-        // frame-wide slot sequence across dirty surfaces.
-        let needed = (u64::from(globals_base) + surf.frame.passes.len().max(1) as u64) * 256;
-        if needed > self.globals.size() {
-            let size = needed.next_power_of_two();
-            self.globals = grow_buffer(
-                &self.device,
-                "globals",
-                &self.globals,
-                size,
-                wgpu::BufferUsages::UNIFORM
-                    | wgpu::BufferUsages::COPY_DST
-                    | wgpu::BufferUsages::COPY_SRC,
-            );
-        }
         // Buffers grown above leave `bind0` stale; rebuild when capacity
         // changed since the bind group was built.
         if self.instances.size() > self.bound_instance_size
             || self.stops.size() > self.bound_stop_size
             || self.globals.size() > self.bound_globals_size
         {
-            let atlas = &self.atlas;
             diag::bind_groups_dropped(&self.device, 1, "buffer growth");
+            let atlas = &self.atlas;
             self.bind0 = make_bind0(
                 &self.device,
                 &self.layout0,
@@ -3361,6 +3292,50 @@ impl GpuRenderer {
         }
 
         Ok(())
+    }
+
+    /// Grows each frame-wide buffer once for the frame's whole upload
+    /// range, before the frame's first submission — never per surface
+    /// mid-frame (#169 A2 on the staging ring).
+    fn grow_frame_buffers(&mut self, copies: &[upload::Copy]) {
+        let mut passes = 0u64;
+        for copy in copies {
+            let (label, usage, buffer) = match copy.dest {
+                upload::Dest::Instances => (
+                    "instances",
+                    wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    &mut self.instances,
+                ),
+                upload::Dest::Stops => (
+                    "stops",
+                    wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    &mut self.stops,
+                ),
+                upload::Dest::Globals => (
+                    "globals",
+                    wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    &mut self.globals,
+                ),
+            };
+            let needed = copy.dst + copy.size;
+            if needed > buffer.size() {
+                *buffer = grow_buffer(
+                    &self.device,
+                    label,
+                    buffer,
+                    needed.next_power_of_two(),
+                    usage,
+                );
+            }
+            if matches!(copy.dest, upload::Dest::Globals) {
+                passes = copy.size / 256;
+            }
+        }
+        // The timestamp query set and resolve buffer grow once for the
+        // frame's whole pass count; never mid-encoder.
+        if self.timestamps && passes > 0 {
+            self.ensure_query_capacity(2 * u32::try_from(passes).unwrap_or(u32::MAX));
+        }
     }
 
     /// The frame's upload size and copies: every dirty surface's instances,
@@ -3450,6 +3425,7 @@ impl GpuRenderer {
         if size == 0 {
             return Ok(());
         }
+        self.grow_frame_buffers(&copies);
         if let upload::Acquire::Wait(submission) = self.uploads.acquire(&self.device, size)? {
             let start = Instant::now();
             self.wait(submission, "upload staging")?;
@@ -3472,6 +3448,7 @@ impl GpuRenderer {
         if size == 0 {
             return Ok(());
         }
+        self.grow_frame_buffers(&copies);
         if let upload::Acquire::Wait(submission) = self.uploads.acquire(&self.device, size)? {
             tracing::trace!(?submission, "awaiting the upload slot's map");
             let start = Instant::now();

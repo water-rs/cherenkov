@@ -9,7 +9,7 @@ fn rgb_to_hsl(rgb: vec3<f32>) -> vec3<f32> {
         return vec3<f32>(0.0, 0.0, l);
     }
     let d = max_c - min_c;
-    let s = select(d / (2.0 - max_c - min_c), d / (max_c + min_c), l > 0.5);
+    let s = select(d / (max_c + min_c), d / (2.0 - max_c - min_c), l > 0.5);
     var h: f32;
     if max_c == rgb.r {
         h = (rgb.g - rgb.b) / d + select(0.0, 6.0, rgb.g < rgb.b);

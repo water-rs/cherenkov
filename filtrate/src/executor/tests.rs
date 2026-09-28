@@ -2357,3 +2357,86 @@ fn gpu_one_effect_two_sizes_one_encoder() {
         "second encode",
     );
 }
+
+/// Intermediate slots for a size a frame does not encode against are
+/// dropped; sizes encoded in the same frame all stay.
+#[test]
+fn gpu_intermediates_evicted_when_size_unused() {
+    use filters::GaussianBlur;
+    fn encode<F: Filter>(
+        gpu: &TestGpu,
+        executor: &mut Executor<F>,
+        size: (u32, u32),
+        sequence: u64,
+    ) {
+        let input = upload(gpu, size, &test_pixels(size.0 * size.1));
+        let output = texture(
+            gpu,
+            size,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        executor
+            .encode_render(
+                &EffectInput {
+                    timing: EffectFrameTiming::new(Duration::ZERO, Duration::ZERO, sequence),
+                    ..frame_input(gpu, &input, size, Duration::ZERO, ShapeTextures::default())
+                },
+                &frame_output(gpu, &output, size),
+                &mut encoder,
+            )
+            .expect("encode should succeed");
+        gpu.queue.submit([encoder.finish()]);
+    }
+    fn sizes<F: Filter>(executor: &Executor<F>) -> Vec<(u32, u32)> {
+        executor
+            .gpu
+            .as_ref()
+            .expect("executor set up")
+            .intermediates
+            .iter()
+            .map(|intermediates| intermediates.size)
+            .collect()
+    }
+    fn slots_of<F: Filter>(executor: &Executor<F>, size: (u32, u32)) -> wgpu::TextureView {
+        executor
+            .gpu
+            .as_ref()
+            .expect("executor set up")
+            .intermediates
+            .iter()
+            .find(|intermediates| intermediates.size == size)
+            .expect("size's intermediates exist")
+            .views[0]
+            .clone()
+    }
+    let gpu = create_test_device();
+    let mut executor = Executor::new(GaussianBlur(4.0_f32));
+    setup(&gpu, &mut executor);
+    let size_a = (64, 64);
+    let size_b = (64, 32);
+    encode(&gpu, &mut executor, size_a, 1);
+    assert_eq!(sizes(&executor), vec![size_a]);
+    encode(&gpu, &mut executor, size_b, 2);
+    assert_eq!(sizes(&executor), vec![size_b]);
+    encode(&gpu, &mut executor, size_a, 3);
+    encode(&gpu, &mut executor, size_b, 3);
+    let mut got = sizes(&executor);
+    got.sort_unstable();
+    assert_eq!(got, vec![size_b, size_a]);
+
+    // Steady state: encoding the same size every frame must reuse that
+    // size's slots, not drop and reallocate them each frame.
+    encode(&gpu, &mut executor, size_a, 4);
+    let slots4 = slots_of(&executor, size_a);
+    encode(&gpu, &mut executor, size_a, 5);
+    let slots5 = slots_of(&executor, size_a);
+    encode(&gpu, &mut executor, size_a, 6);
+    let slots6 = slots_of(&executor, size_a);
+    assert!(
+        slots4 == slots5 && slots5 == slots6,
+        "a size encoded every frame must keep its intermediates"
+    );
+}

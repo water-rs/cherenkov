@@ -304,8 +304,15 @@ fn coverage_dir(d: f32, v: vec2<f32>, scale: f32, ramp: bool, radius: f32) -> f3
     let ax = abs(v.x);
     let ay = abs(v.y);
     let b = min(ax, ay);
-    if ramp || b <= 1e-6 * len {
+    if ramp {
         return coverage(d, g);
+    }
+    if b <= 1e-6 * len {
+        let area = coverage(d, g);
+        if radius > 0.0 && area > 0.0 && area < 1.0 {
+            return clamp(area - (g / radius) / 24.0, 0.0, 1.0);
+        }
+        return area;
     }
     let a = max(ax, ay) / len;
     let bn = b / len;

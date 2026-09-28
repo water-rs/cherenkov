@@ -17,6 +17,7 @@ use crate::RenderError;
 ///
 /// # Errors
 /// Returns [`RenderError::Render`] when `sigma` is negative or non-finite.
+#[inline]
 pub fn check_sigma(sigma: f64) -> Result<(), RenderError> {
     if !sigma.is_finite() || sigma < 0.0 {
         return Err(RenderError::Render("invalid shadow sigma".into()));
@@ -28,6 +29,7 @@ pub fn check_sigma(sigma: f64) -> Result<(), RenderError> {
 /// the surface: the spread's reach plus `6σ` of blur support plus a 2 px
 /// rasterization margin, along each device axis.
 #[must_use]
+#[inline]
 pub fn capture_padding(transform: Affine, sigma: f64, spread: f64) -> (f64, f64) {
     let [a, b, c, d, _, _] = transform.as_coeffs();
     let spread = spread.abs();
@@ -46,6 +48,7 @@ pub fn capture_padding(transform: Affine, sigma: f64, spread: f64) -> (f64, f64)
     clippy::cast_sign_loss,
     reason = "finite bounded count"
 )]
+#[inline]
 fn kernel_count(count: f64, limit: f64) -> Result<usize, RenderError> {
     if !count.is_finite() || count < 1.0 || count > limit {
         return Err(RenderError::Render(
@@ -69,6 +72,7 @@ fn kernel_count(count: f64, limit: f64) -> Result<usize, RenderError> {
     clippy::cast_possible_truncation,
     reason = "bounded kernel indices and f32 taps"
 )]
+#[inline]
 pub fn gaussian_taps(axis: [f64; 2], sigma: f64, limit: f64) -> Result<Vec<[f32; 3]>, RenderError> {
     let length = axis[0].hypot(axis[1]);
     let sigma = sigma * length;
@@ -109,6 +113,7 @@ pub fn gaussian_taps(axis: [f64; 2], sigma: f64, limit: f64) -> Result<Vec<[f32;
     clippy::cast_sign_loss,
     reason = "bounded morphology footprint and f32 taps"
 )]
+#[inline]
 pub fn spread_taps(
     matrix: [f64; 4],
     spread: f64,

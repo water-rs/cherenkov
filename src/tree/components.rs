@@ -94,6 +94,17 @@ macro_rules! property {
     };
 }
 
+impl Components {
+    /// Any component track still running.
+    pub(super) const fn animating(&self) -> bool {
+        self.translation_track.is_some()
+            || self.rotation_track.is_some()
+            || self.scale_track.is_some()
+            || self.skew_track.is_some()
+            || self.pivot_track.is_some()
+    }
+}
+
 impl LayerNode {
     property!(set_translation, translation, translation_track, Vec2);
     property!(set_rotation, rotation, rotation_track, f64);

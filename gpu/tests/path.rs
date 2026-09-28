@@ -657,3 +657,60 @@ fn a_path_fill_keeps_its_subpixel_translation() -> Result<(), Box<dyn std::error
     assert!(r > 0.99, "interior pixel: {r}");
     Ok(())
 }
+
+/// While a layer's transform animates, its content's device translation
+/// is placed on the quarter-pixel grid, so a cached emission is reused
+/// across frames; the settled frame is placed exactly.
+#[test]
+fn an_animating_layer_places_paths_on_the_quarter_pixel_grid()
+-> Result<(), Box<dyn std::error::Error>> {
+    use cherenkov::kurbo::Affine;
+    use nami::SignalExt as _;
+    use std::time::{Duration, Instant};
+
+    let engine = match Engine::<Gpu>::new(GpuConfig::default()) {
+        Ok(engine) => engine,
+        Err(EngineError::Backend(_)) => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    let surface = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
+    surface.clear_color(CLEAR);
+    let layer = surface.layer();
+    surface.update(|tx| {
+        tx[surface.root()].push(&layer);
+    });
+    surface.update(|tx| {
+        tx[&layer].content(surface.record(|c| {
+            let mut rect = BezPath::new();
+            rect.move_to((10.0, 10.0));
+            rect.line_to((40.0, 10.0));
+            rect.line_to((40.0, 40.0));
+            rect.line_to((10.0, 40.0));
+            rect.close_path();
+            c.fill(rect, RED);
+        }));
+    });
+    let translate = nami::binding(Affine::IDENTITY);
+    surface.update(|tx| {
+        tx[&layer].transform(translate.clone().with(cherenkov::Animation::from(
+            cherenkov::Curve::linear(Duration::from_secs(1)),
+        )));
+    });
+    let start = Instant::now();
+    translate.set(Affine::translate((1.2, 0.0)));
+    // The track starts at the first sampled frame.
+    engine.render(cherenkov::FrameTime::at(start))?;
+    // Mid-animation at e = 0.3: snapped to 0.25, the edge lands at 10.25.
+    let next = engine.render(cherenkov::FrameTime::at(start + Duration::from_millis(250)))?;
+    assert!(matches!(next, cherenkov::Next::At { .. }));
+    let readback = surface.readback()?;
+    let [r, ..] = px(&readback, 10, 25);
+    assert!((r - 0.75).abs() < 0.03, "snapped edge: {r}");
+    // Settled at e = 1.2 exactly: the edge lands at 11.2.
+    let next = engine.render(cherenkov::FrameTime::at(start + Duration::from_secs(2)))?;
+    assert!(matches!(next, cherenkov::Next::Idle));
+    let readback = surface.readback()?;
+    let [r, ..] = px(&readback, 11, 25);
+    assert!((r - 0.8).abs() < 0.03, "settled edge: {r}");
+    Ok(())
+}

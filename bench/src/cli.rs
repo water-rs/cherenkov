@@ -556,13 +556,12 @@ fn alloc_diag_cmd(
     )?;
     engine.alloc_diag_teardown();
     drop(engine);
-    let count = sink
-        .write_json(out)
-        .map_err(|e| BenchError::Engine(format!("writing {}: {e}", out.display())))?;
     // #169 A5: the allocation-event high-water observation. Frame-boundary
     // snapshots can miss the event that caused a permanently retained
     // block, so this scans the per-event snapshots, not the lifecycle.
     let events = sink.take();
+    let count = cherenkov_gpu::diag::write_events(&events, out)
+        .map_err(|e| BenchError::Engine(format!("writing {}: {e}", out.display())))?;
     let mut allocated = 0u64;
     let mut reserved = 0u64;
     let mut blocks = 0u64;

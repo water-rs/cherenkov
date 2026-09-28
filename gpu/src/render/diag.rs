@@ -986,17 +986,25 @@ impl Sink {
     /// # Errors
     /// [`std::io::Error`] when the file cannot be created or written.
     pub fn write_json(&self, path: &std::path::Path) -> std::io::Result<usize> {
-        use std::io::Write as _;
-        let events = self.take();
-        let mut file = std::io::BufWriter::new(std::fs::File::create(path)?);
-        let mut line = String::with_capacity(1024);
-        for ev in &events {
-            line.clear();
-            event_json(ev, &mut line);
-            file.write_all(line.as_bytes())?;
-            file.write_all(b"\n")?;
-        }
-        file.flush()?;
-        Ok(events.len())
+        write_events(&self.take(), path)
     }
+}
+
+/// Writes `events` as one JSON object per line (#169 A5 splits the
+/// take/serialize pair so callers can scan the same events).
+///
+/// # Errors
+/// Any write failure on `path`.
+pub fn write_events(events: &[AllocEvent], path: &std::path::Path) -> std::io::Result<usize> {
+    use std::io::Write as _;
+    let mut file = std::io::BufWriter::new(std::fs::File::create(path)?);
+    let mut line = String::with_capacity(1024);
+    for ev in events {
+        line.clear();
+        event_json(ev, &mut line);
+        file.write_all(line.as_bytes())?;
+        file.write_all(b"\n")?;
+    }
+    file.flush()?;
+    Ok(events.len())
 }

@@ -1545,7 +1545,7 @@ fn has_rim(prep: &PrepLayer) -> bool {
 /// g, b)` and `params[1]` `(a, gain)`; the rim is an additive term on the
 /// sampled colour (alpha unchanged — gaining alpha would cancel under
 /// src-over), exactly the oracle's `RimLight` formula.
-const RIM_LIGHT_WGSL: &str = r#"
+const RIM_LIGHT_WGSL: &str = "
 fn backdrop_effect(
     p: vec2<f32>,
     sdf: f32,
@@ -1561,7 +1561,7 @@ fn backdrop_effect(
     let c = backdrop_sample(p);
     return vec4<f32>(c.rgb + color.rgb * k, c.a);
 }
-"#;
+";
 
 /// Creates the engine backdrop group for a scene group. The chain type is
 /// static, so the combinations this adapter builds are a blur alone, a

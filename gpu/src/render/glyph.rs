@@ -273,6 +273,11 @@ pub struct Atlas {
     dedupe_masks: rustc_hash::FxHashSet<u64>,
     plan_cells: Vec<(u32, u32)>,
     plan_all: Vec<(u32, u32)>,
+    /// Per-shelf cell counts, scatter cursors and the flat cell order
+    /// for [`Self::upload_committed`], rebuilt in place each commit.
+    bucket_counts: Vec<u32>,
+    bucket_next: Vec<u32>,
+    bucket_order: Vec<u32>,
 }
 
 impl Atlas {
@@ -315,6 +320,9 @@ impl Atlas {
             dedupe_paths: rustc_hash::FxHashSet::default(),
             dedupe_masks: rustc_hash::FxHashSet::default(),
             plan_cells: Vec::new(),
+            bucket_counts: Vec::new(),
+            bucket_next: Vec::new(),
+            bucket_order: Vec::new(),
             plan_all: Vec::new(),
         }
     }
@@ -432,9 +440,25 @@ impl Atlas {
         if cells.is_empty() {
             return;
         }
-        let mut buckets: Vec<Vec<&CellWrite>> = vec![Vec::new(); self.shelves.len()];
+        let n = self.shelves.len();
+        self.bucket_counts.clear();
+        self.bucket_counts.resize(n, 0);
         for cell in cells {
-            buckets[cell.shelf].push(cell);
+            self.bucket_counts[cell.shelf] += 1;
+        }
+        self.bucket_next.clear();
+        let mut acc = 0u32;
+        for &count in &self.bucket_counts {
+            self.bucket_next.push(acc);
+            acc += count;
+        }
+        self.bucket_order.clear();
+        self.bucket_order.resize(cells.len(), 0);
+        for (idx, cell) in cells.iter().enumerate() {
+            let slot = cell.shelf;
+            self.bucket_order[self.bucket_next[slot] as usize] =
+                u32::try_from(idx).expect("upload batch fits u32");
+            self.bucket_next[slot] += 1;
         }
         for (i, shelf) in self.shelves.iter().enumerate() {
             let x0 = bounds.get(i).copied().unwrap_or(0);
@@ -442,10 +466,18 @@ impl Atlas {
                 continue;
             }
             let (w, h) = (shelf.x - x0, shelf.h);
+            // After the scatter `bucket_next` holds each bucket's end
+            // offset; start = end - count.
+            let end = self.bucket_next[i] as usize;
+            let len = self.bucket_counts[i] as usize;
+            let bucket = &self.bucket_order[end - len..end];
             // One cell that fills the whole new span uploads its own
             // texels without assembly.
-            let single = match buckets[i].as_slice() {
-                [cell] if cell.x == x0 && cell.w == w && cell.h == h => Some(cell),
+            let single = match bucket {
+                &[idx] => {
+                    let cell = &cells[idx as usize];
+                    (cell.x == x0 && cell.w == w && cell.h == h).then_some(cell)
+                }
                 _ => None,
             };
             let data: &[u8] = if let Some(cell) = single {
@@ -454,7 +486,8 @@ impl Atlas {
             } else {
                 self.upload_scratch.clear();
                 self.upload_scratch.resize((w * h) as usize, 0);
-                for cell in &buckets[i] {
+                for &idx in bucket {
+                    let cell = &cells[idx as usize];
                     let xo = (cell.x - x0) as usize;
                     let yo = (cell.y - shelf.y) as usize;
                     for (row, line) in cell.texels.chunks_exact(cell.w as usize).enumerate() {

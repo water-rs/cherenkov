@@ -51,6 +51,7 @@ pub mod report;
     feature = "cherenkov-vello"
 ))]
 pub mod timing;
+pub mod transform;
 #[cfg(any(
     feature = "vello-classic",
     feature = "vello-cpu",

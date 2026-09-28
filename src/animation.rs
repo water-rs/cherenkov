@@ -141,6 +141,16 @@ pub trait Animatable: Copy + Send + 'static {
     fn from_lanes(lanes: Self::Lanes) -> Self;
 }
 
+impl Animatable for f64 {
+    type Lanes = [Self; 1];
+    fn into_lanes(self) -> Self::Lanes {
+        [self]
+    }
+    fn from_lanes(lanes: Self::Lanes) -> Self {
+        lanes[0]
+    }
+}
+
 impl Animatable for f32 {
     type Lanes = [f64; 1];
     fn into_lanes(self) -> Self::Lanes {

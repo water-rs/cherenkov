@@ -201,7 +201,10 @@ fn present_gamut_map_matches_oracle() -> Result<(), Box<dyn std::error::Error>> 
         timeout: Some(std::time::Duration::from_secs(30)),
     })?;
     receive.recv()??;
-    let bytes = buffer.slice(..).get_mapped_range();
+    let bytes = buffer
+        .slice(..)
+        .get_mapped_range()
+        .expect("buffer range is mapped and not overlapping");
     for (j, &headroom) in headrooms.iter().enumerate() {
         let base = j * usize::try_from(row * h)?;
         for (i, p) in pixels.iter().enumerate() {

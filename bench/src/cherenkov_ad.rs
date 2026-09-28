@@ -592,7 +592,10 @@ fn read_texture(
         .recv()
         .map_err(|e| BenchError::Gpu(format!("presentation readback: {e}")))?
         .map_err(|e| BenchError::Gpu(format!("presentation readback map: {e}")))?;
-    let data = buffer.slice(..).get_mapped_range();
+    let data = buffer
+        .slice(..)
+        .get_mapped_range()
+        .expect("buffer range is mapped and not overlapping");
     let row = (w * texel) as usize;
     let mut packed = Vec::with_capacity(row * h as usize);
     for y in 0..h as usize {

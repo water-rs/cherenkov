@@ -40,6 +40,7 @@ impl GpuBench {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: None,
             force_fallback_adapter: false,
+            apply_limit_buckets: false,
         }))
         .expect("filtrate benchmark requires a high-performance GPU adapter");
         let (device, queue) =

@@ -255,7 +255,10 @@ pub(crate) fn run(
     recv.recv()
         .map_err(|e| BenchError::Gpu(format!("present-cost readback: {e}")))?
         .map_err(|e| BenchError::Gpu(format!("present-cost map: {e}")))?;
-    let data = staging.slice(..).get_mapped_range();
+    let data = staging
+        .slice(..)
+        .get_mapped_range()
+        .expect("buffer range is mapped and not overlapping");
     let stamps: Vec<u64> = data
         .as_chunks::<8>()
         .0

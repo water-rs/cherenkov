@@ -55,7 +55,7 @@ tracing = "0.1.44"
 # Portable SIMD for the CPU kernels.
 wide = "1.7"
 # `naga-ir`: pass modules reach wgpu as composed naga IR, never as text.
-wgpu = { version = "29.0.4", features = ["naga-ir"] }
+wgpu = { version = "30.0.1", features = ["naga-ir"] }
 
 # `std::time::Instant::now` panics on wasm32-unknown-unknown; web-time backs it
 # with `performance.now()` there and delegates to std everywhere else.

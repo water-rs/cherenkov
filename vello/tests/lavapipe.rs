@@ -795,6 +795,7 @@ fn skipped_window_present_retries_next_frame() {
         .surface(cherenkov_vello::interop::wgpu::Window {
             surface,
             config: wgpu::SurfaceConfiguration {
+                color_space: wgpu::SurfaceColorSpace::Auto,
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
                 format,
                 width: 64,

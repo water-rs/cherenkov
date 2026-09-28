@@ -78,8 +78,8 @@ nami-core = { git = "https://github.com/water-rs/nami", rev = "6908aac816de14ee5
 # `glifo-canonical-location` — without it, an explicit all-default location
 # (`[0, 0, …]`) never matched a stored hint entry and every glyph run repaid
 # a HintingInstance reconfigure.
-vello = { git = "https://github.com/lexoliu/vello", rev = "7f5e1ca5769a96dc4404b812e7fa0351499cd2c4" }
-vello_hybrid = { git = "https://github.com/lexoliu/vello", rev = "a01e5039c290fa869e0f6f3708e621056740f49b" }
-vello_common = { git = "https://github.com/lexoliu/vello", rev = "a01e5039c290fa869e0f6f3708e621056740f49b" }
-vello_sparse_shaders = { git = "https://github.com/lexoliu/vello", rev = "a01e5039c290fa869e0f6f3708e621056740f49b" }
-glifo = { git = "https://github.com/lexoliu/vello", rev = "a01e5039c290fa869e0f6f3708e621056740f49b" }
+vello = { git = "https://github.com/lexoliu/vello", rev = "df9bd23bab15baabe9c051a01f2351fbba915274" }
+vello_hybrid = { git = "https://github.com/lexoliu/vello", rev = "28b5f9cc2642b8bb40d08259a27510dfd3bc203c" }
+vello_common = { git = "https://github.com/lexoliu/vello", rev = "28b5f9cc2642b8bb40d08259a27510dfd3bc203c" }
+vello_sparse_shaders = { git = "https://github.com/lexoliu/vello", rev = "28b5f9cc2642b8bb40d08259a27510dfd3bc203c" }
+glifo = { git = "https://github.com/lexoliu/vello", rev = "28b5f9cc2642b8bb40d08259a27510dfd3bc203c" }

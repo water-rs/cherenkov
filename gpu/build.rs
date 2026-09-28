@@ -198,6 +198,9 @@ fn write_spirv(out_dir: &Path, spec: &Spec, module: &naga::Module, info: &naga::
         zero_initialize_workgroup_memory: spv::ZeroInitializeWorkgroupMemoryMode::Native,
         force_loop_bounding: false,
         ray_query_initialization_tracking: false,
+        trace_ray_argument_validation: false,
+        // naga 29 guarded integer division unconditionally; preserve it.
+        emit_int_div_checks: true,
         use_storage_input_output_16: false,
         debug_info: None,
         task_dispatch_limits: None,
@@ -265,6 +268,11 @@ fn write_metal(out_dir: &Path, spec: &Spec, module: &naga::Module, sdk: Option<&
         bounds_check_policies: UNCHECKED,
         zero_initialize_workgroup_memory: false,
         force_loop_bounding: false,
+        task_dispatch_limits: None,
+        mesh_shader_primitive_indices_clamp: false,
+        ray_query_initialization_tracking: false,
+        // Preserve naga 29's integer division semantics.
+        emit_int_div_checks: true,
     };
     // The engine's pipelines declare no vertex buffers, so wgpu-hal's
     // `vertex_pulling_transform` never applies; it is still passed so the
@@ -274,6 +282,7 @@ fn write_metal(out_dir: &Path, spec: &Spec, module: &naga::Module, sdk: Option<&
         allow_and_force_point_size: false,
         vertex_pulling_transform: true,
         vertex_buffer_mappings: Vec::new(),
+        binding_array_length_map: naga::FastHashMap::default(),
     };
     let (source, translation_info) = msl::write_string(&module, &info, &options, &pipeline_options)
         .unwrap_or_else(|e| panic!("{}: MSL emission failed: {e:?}", spec.name));

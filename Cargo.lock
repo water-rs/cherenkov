@@ -383,6 +383,7 @@ name = "cherenkov-cpu"
 version = "0.0.0"
 dependencies = [
  "cherenkov",
+ "cherenkov-oracle",
  "half",
  "kurbo",
  "nami",
@@ -398,6 +399,7 @@ version = "0.0.0"
 dependencies = [
  "bytemuck",
  "cherenkov",
+ "cherenkov-oracle",
  "filtrate",
  "filtrate-core",
  "futures-channel",

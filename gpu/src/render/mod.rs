@@ -280,6 +280,28 @@ type Bind1Key = (
     Option<u64>,
 );
 
+/// Drops the group-1 bind groups `reject` marks obsolete — unsubmitted
+/// groups whose views keep a replaced texture's predecessor alive
+/// (#169 A4) — and refreshes `binds1_stamp` so the survivors persist
+/// past the next encode. Bind groups already consumed by a submitted
+/// encoder are wgpu's to retain until that submission completes.
+fn retire_binds1(
+    surf: &mut SurfaceState,
+    device: &wgpu::Device,
+    images_gen: u64,
+    mask_gen: u64,
+    reason: &'static str,
+    reject: impl Fn(&Bind1Key) -> bool,
+) {
+    let before = surf.binds1.len();
+    surf.binds1.retain(|key, _| !reject(key));
+    let dropped = before - surf.binds1.len();
+    if dropped > 0 {
+        diag::bind_groups_dropped(device, dropped as u64, reason);
+    }
+    surf.binds1_stamp = (surf.bind_gen, images_gen, mask_gen);
+}
+
 /// All render-thread state.
 pub struct GpuRenderer {
     instance: wgpu::Instance,
@@ -1732,7 +1754,7 @@ impl Renderer for GpuRenderer {
             data.len() as u64,
             Some((0, 0, width, height)),
         );
-        self.images.insert(
+        let replaced = self.images.insert(
             id.raw(),
             GpuImage {
                 texture,
@@ -1742,6 +1764,32 @@ impl Renderer for GpuRenderer {
             },
         );
         self.images_gen += 1;
+        if let Some(old) = replaced {
+            diag::retire(
+                &self.device,
+                diag::RetireArgs {
+                    label: "image",
+                    class: diag::Class::Image,
+                    bytes: u64::from(old.width) * u64::from(old.height) * 8,
+                    used_in_latest_submit: true,
+                    reason: "add_image",
+                },
+            );
+            // #169 A4: bind groups created against the replaced view are
+            // stale — `Registered(id)` now binds the new texture.
+            let images_gen = self.images_gen;
+            let mask_gen = self.atlas.mask_texture_generation();
+            for surf in self.surfaces.values_mut() {
+                retire_binds1(
+                    surf,
+                    &self.device,
+                    images_gen,
+                    mask_gen,
+                    "image replaced",
+                    |key| key.2 == Some(lower::ImageSource::Registered(id.raw())),
+                );
+            }
+        }
         Ok(())
     }
 
@@ -1760,12 +1808,24 @@ impl Renderer for GpuRenderer {
             );
         }
         self.images.remove(&id.raw());
-        for surface in self.surfaces.values_mut() {
-            for content in surface.layers.values_mut() {
+        self.images_gen += 1;
+        // #169 A4: drop unsubmitted bind groups holding the removed
+        // image's view; submitted encoders keep it until completion.
+        let images_gen = self.images_gen;
+        let mask_gen = self.atlas.mask_texture_generation();
+        for surf in self.surfaces.values_mut() {
+            retire_binds1(
+                surf,
+                &self.device,
+                images_gen,
+                mask_gen,
+                "image removed",
+                |key| key.2 == Some(lower::ImageSource::Registered(id.raw())),
+            );
+            for content in surf.layers.values_mut() {
                 content.invalidate();
             }
         }
-        self.images_gen += 1;
     }
 
     #[expect(
@@ -1788,6 +1848,12 @@ impl Renderer for GpuRenderer {
                 .flatten()
                 .map(|s| u64::from(s.width) * u64::from(s.height) * texel_bytes(s.texture.format()))
                 .sum();
+            let capture_bytes: u64 = surf
+                .backdrop_groups
+                .values()
+                .flat_map(|state| state.capture.iter())
+                .map(|s| u64::from(s.width) * u64::from(s.height) * texel_bytes(s.texture.format()))
+                .sum();
             let dropped = surf.binds1.len() as u64;
             if dropped > 0 {
                 diag::bind_groups_dropped(&self.device, dropped, "trim");
@@ -1795,6 +1861,7 @@ impl Renderer for GpuRenderer {
             for (label, bytes) in [
                 ("isolation scratch", scratch_bytes),
                 ("blend backdrop", backdrop_bytes),
+                ("backdrop capture", capture_bytes),
             ] {
                 if bytes > 0 {
                     diag::retire(
@@ -1811,9 +1878,25 @@ impl Renderer for GpuRenderer {
             }
             surf.scratch.clear();
             surf.backdrop = [None, None];
+            for state in surf.backdrop_groups.values_mut() {
+                state.capture = None;
+            }
             // The bind groups' views died with the textures.
             surf.binds1.clear();
             surf.bind_gen += 1;
+        }
+        let filter_bytes = self.filters.trim();
+        if filter_bytes > 0 {
+            diag::retire(
+                &self.device,
+                diag::RetireArgs {
+                    label: "filter targets",
+                    class: diag::Class::Target,
+                    bytes: filter_bytes,
+                    used_in_latest_submit: true,
+                    reason: "trim",
+                },
+            );
         }
         if pressure != Pressure::Critical {
             return;
@@ -2493,10 +2576,30 @@ impl GpuRenderer {
         };
         if let Some(state) = surf.backdrop_groups.remove(&id.raw()) {
             if let Some(key) = state.filter {
-                self.filters.remove(key);
+                let bytes = self.filters.remove(key);
+                if bytes > 0 {
+                    diag::retire(
+                        &self.device,
+                        diag::RetireArgs {
+                            label: "filter targets",
+                            class: diag::Class::Target,
+                            bytes,
+                            used_in_latest_submit: true,
+                            reason: "backdrop group removed",
+                        },
+                    );
+                }
             }
             if state.capture.is_some() {
                 surf.bind_gen += 1;
+                retire_binds1(
+                    surf,
+                    &self.device,
+                    self.images_gen,
+                    self.atlas.mask_texture_generation(),
+                    "backdrop group removed",
+                    |key| key.0 == Some(Source::Backdrop(id.raw())),
+                );
             }
         }
     }
@@ -2680,8 +2783,18 @@ impl GpuRenderer {
             .get_mut(&layer)
             .expect("layer has GPU content")
             .resize(size);
-        diag::bind_groups_dropped(&self.device, state.binds1.len() as u64, "content resize");
-        state.binds1.clear();
+        // #169 A4: only entries referencing this layer's content image
+        // went stale — drop them, keep the rest.
+        let images_gen = self.images_gen;
+        let mask_gen = self.atlas.mask_texture_generation();
+        retire_binds1(
+            state,
+            &self.device,
+            images_gen,
+            mask_gen,
+            "content resize",
+            |key| key.2 == Some(lower::ImageSource::Content(layer)),
+        );
     }
 
     fn present_windows(&mut self, frame: &Frame<'_>) -> Result<Redraw, RenderError> {
@@ -2912,8 +3025,26 @@ impl GpuRenderer {
             .flat_map(|pass| pass.ranges.iter())
             .filter_map(|range| range.mask)
             .collect();
+        let gen_before = self.atlas.mask_texture_generation();
         self.atlas
             .evict_mask_textures(&self.device, |key| live.contains(&key));
+        if self.atlas.mask_texture_generation() == gen_before {
+            return;
+        }
+        // #169 A4: unsubmitted bind groups holding an evicted view are
+        // obsolete — drop them now rather than at the next encode.
+        let mask_gen = self.atlas.mask_texture_generation();
+        let images_gen = self.images_gen;
+        for surf in self.surfaces.values_mut() {
+            retire_binds1(
+                surf,
+                &self.device,
+                images_gen,
+                mask_gen,
+                "mask texture evict",
+                |key| key.3.is_some_and(|mask| !live.contains(&mask)),
+            );
+        }
     }
 
     /// Commits every surface's pending rasters transactionally
@@ -3178,6 +3309,16 @@ impl GpuRenderer {
                 surf.scratch.push(target);
             }
             surf.bind_gen += 1;
+            // #169 A4: unsubmitted group-1 bind groups referencing the
+            // replaced view keep its predecessor alive — drop them now.
+            retire_binds1(
+                surf,
+                &self.device,
+                self.images_gen,
+                self.atlas.mask_texture_generation(),
+                "scratch regen",
+                |key| key.0 == Some(Source::Scratch(i)),
+            );
         }
         // Backdrop-group captures are exactly their pass's region, in the
         // format of the target the capture copies from, and sampled by
@@ -3203,10 +3344,18 @@ impl GpuRenderer {
                     capture.group
                 )));
             };
+            // #169 A4: like scratch, a capture is never shrunk or
+            // regrown around an animated region size — it grows only
+            // when the frame needs more, and `trim` releases it outside
+            // the hot path.
+            let (nw, nh) = (
+                w.max(group_state.capture.as_ref().map_or(0, |c| c.width)),
+                h.max(group_state.capture.as_ref().map_or(0, |c| c.height)),
+            );
             if group_state
                 .capture
                 .as_ref()
-                .is_none_or(|c| (c.width, c.height) != (w, h) || c.texture.format() != format)
+                .is_none_or(|c| c.width < w || c.height < h || c.texture.format() != format)
             {
                 let old_capture = group_state.capture.as_ref().map_or(0, |c| {
                     u64::from(c.width) * u64::from(c.height) * texel_bytes(c.texture.format())
@@ -3214,26 +3363,41 @@ impl GpuRenderer {
                 let (texture, view) = create_target(
                     &self.device,
                     "backdrop capture",
-                    (w, h),
+                    (nw, nh),
                     TARGET_USAGES | wgpu::TextureUsages::COPY_DST,
                     format,
                 );
                 group_state.capture = Some(ScratchTarget {
                     texture,
                     view,
-                    width: w,
-                    height: h,
+                    width: nw,
+                    height: nh,
                 });
                 diag::grow(
                     &self.device,
                     "backdrop capture",
                     diag::Class::Target,
                     old_capture,
-                    u64::from(w) * u64::from(h) * texel_bytes(format),
+                    u64::from(nw) * u64::from(nh) * texel_bytes(format),
                     0,
                     true,
                 );
                 surf.bind_gen += 1;
+                // #169 A4: unsubmitted group-1 bind groups referencing
+                // the replaced view keep its predecessor alive — drop
+                // them now.
+                let before = surf.binds1.len();
+                surf.binds1
+                    .retain(|key, _| key.0 != Some(Source::Backdrop(capture.group)));
+                let dropped = before - surf.binds1.len();
+                if dropped > 0 {
+                    diag::bind_groups_dropped(&self.device, dropped as u64, "capture regen");
+                }
+                surf.binds1_stamp = (
+                    surf.bind_gen,
+                    self.images_gen,
+                    self.atlas.mask_texture_generation(),
+                );
             }
         }
         // Backdrop textures for blend composites, sized like the scratch
@@ -3299,6 +3463,14 @@ impl GpuRenderer {
                 true,
             );
             surf.bind_gen += 1;
+            retire_binds1(
+                surf,
+                &self.device,
+                self.images_gen,
+                self.atlas.mask_texture_generation(),
+                "backdrop regen",
+                |key| key.1,
+            );
         }
         // Gradient instances index stops absolutely; shift each instance's
         // first-stop index by this surface's stop base. Only gradient

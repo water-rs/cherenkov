@@ -13,6 +13,7 @@ mod prepared;
 pub mod present;
 mod raster;
 pub mod shaders;
+mod winding;
 
 use cherenkov::Instant;
 use std::collections::{HashMap, VecDeque};

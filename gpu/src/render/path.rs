@@ -132,6 +132,13 @@ pub fn rasterize(
         return None;
     }
     let (ox, oy) = (x0 as f32, y0 as f32);
+    let resolved = super::winding::resolve(segments, rule);
+    let segments = resolved.as_deref().unwrap_or(segments);
+    let rule = if resolved.is_some() {
+        FillRule::NonZero
+    } else {
+        rule
+    };
     let mut raster = Raster::new(w, h);
     for &(sx0, sy0, sx1, sy1) in segments {
         clip_x(

@@ -1169,6 +1169,9 @@ impl<'a> Lowering<'a> {
         }
         let sigma = parameters.sigma.max(0.0);
         let transform = self.transform * parameters.transform;
+        if !transform.is_finite() || !transform.inverse().is_finite() {
+            return Err(RenderError::Render("invalid silhouette transform".into()));
+        }
         let [a, b, c, d, _, _] = transform.as_coeffs();
         let spread = parameters.spread.abs();
         let px = (spread.mul_add(a.hypot(c), 6.0 * sigma * (a.abs() + c.abs())) + 2.0).ceil();
@@ -1221,6 +1224,7 @@ impl<'a> Lowering<'a> {
         instance.grad[1] = -(py as f32);
         self.set_source(Some(Source::Scratch(scratch)));
         self.push_instance(&instance);
+        self.set_source(None);
         Ok(())
     }
 

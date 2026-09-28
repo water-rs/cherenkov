@@ -20,6 +20,12 @@ impl Lowering<'_> {
         if !shadow.sigma.is_finite() || !shadow.spread.is_finite() {
             return Err(RenderError::Render("non-finite shadow parameters".into()));
         }
+        if !self.transform.is_finite() || !self.transform.inverse().is_finite() {
+            return Err(RenderError::Render("invalid silhouette transform".into()));
+        }
+        if !shadow.offset.x.is_finite() || !shadow.offset.y.is_finite() {
+            return Err(RenderError::Render("non-finite shadow offset".into()));
+        }
         let sigma = shadow.sigma.max(0.0);
         let [ma, mb, mc, md, _, _] = self.transform.as_coeffs();
         let px = (shadow

@@ -38,6 +38,12 @@ use crate::{ContentChange, Picture, WorkingColor};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum PropKind {
     Transform,
+    Translation,
+    Rotation,
+    Scale,
+    Skew,
+    Pivot,
+
     Opacity,
     ScrollOffset,
     Clip,
@@ -286,6 +292,12 @@ type InstallOp<B> = Box<dyn FnOnce(&mut <B as Backend>::Renderer, SurfaceId, Lay
 /// A recorded layer edit inside a [`Transaction`].
 enum EditOp<B: Backend> {
     Transform(Prop<Affine>),
+    Translation(Prop<Vec2>),
+    Rotation(Prop<f64>),
+    Scale(Prop<Vec2>),
+    Skew(Prop<Vec2>),
+    Pivot(Prop<Vec2>),
+
     Opacity(Prop<f32>),
     ScrollOffset(Prop<Vec2>),
     Clip(Option<ShapeData>),
@@ -345,6 +357,109 @@ impl<B: Backend> LayerEdit<B> {
             PropKind::Transform,
             live.subscribe,
             |layer, target, animation| LayerOp::Transform(layer, Prop { target, animation }),
+        );
+        self
+    }
+
+    /// Sets the translation in local coordinates; initially zero.
+    /// Component properties compose after [`Self::transform`], in the order
+    /// documented in `docs/api.md`. Each keeps its own live subscription and
+    /// animation track; changing it never re-records content.
+    pub fn translation(&mut self, value: impl Into<Live<Vec2>>) -> &mut Self {
+        let live = value.into();
+        self.ops.push(EditOp::Translation(Prop {
+            target: live.value,
+            animation: self.default_animation,
+        }));
+        Shared::bind(
+            &self.shared,
+            self.layer,
+            PropKind::Translation,
+            live.subscribe,
+            |layer, target, animation| LayerOp::Translation(layer, Prop { target, animation }),
+        );
+        self
+    }
+
+    /// Sets the unwrapped rotation angle in radians; initially zero.
+    /// Positive angles rotate clockwise in a downward-y coordinate system.
+    /// Full turns are preserved; no shortest-path angle normalization occurs.
+    /// Component properties compose after [`Self::transform`], in the order
+    /// documented in `docs/api.md`. Each keeps its own live subscription and
+    /// animation track; changing it never re-records content.
+    pub fn rotation(&mut self, value: impl Into<Live<f64>>) -> &mut Self {
+        let live = value.into();
+        self.ops.push(EditOp::Rotation(Prop {
+            target: live.value,
+            animation: self.default_animation,
+        }));
+        Shared::bind(
+            &self.shared,
+            self.layer,
+            PropKind::Rotation,
+            live.subscribe,
+            |layer, target, animation| LayerOp::Rotation(layer, Prop { target, animation }),
+        );
+        self
+    }
+
+    /// Sets the x/y scale factors; initially (1, 1).
+    /// Component properties compose after [`Self::transform`], in the order
+    /// documented in `docs/api.md`. Each keeps its own live subscription and
+    /// animation track; changing it never re-records content.
+    pub fn scale(&mut self, value: impl Into<Live<Vec2>>) -> &mut Self {
+        let live = value.into();
+        self.ops.push(EditOp::Scale(Prop {
+            target: live.value,
+            animation: self.default_animation,
+        }));
+        Shared::bind(
+            &self.shared,
+            self.layer,
+            PropKind::Scale,
+            live.subscribe,
+            |layer, target, animation| LayerOp::Scale(layer, Prop { target, animation }),
+        );
+        self
+    }
+
+    /// Sets x/y skew angles in radians; initially zero.
+    /// The skew matrix is `[1, tan(y), tan(x), 1, 0, 0]`.
+    /// Component properties compose after [`Self::transform`], in the order
+    /// documented in `docs/api.md`. Each keeps its own live subscription and
+    /// animation track; changing it never re-records content.
+    pub fn skew(&mut self, value: impl Into<Live<Vec2>>) -> &mut Self {
+        let live = value.into();
+        self.ops.push(EditOp::Skew(Prop {
+            target: live.value,
+            animation: self.default_animation,
+        }));
+        Shared::bind(
+            &self.shared,
+            self.layer,
+            PropKind::Skew,
+            live.subscribe,
+            |layer, target, animation| LayerOp::Skew(layer, Prop { target, animation }),
+        );
+        self
+    }
+
+    /// Sets the local pivot for rotation, skew and scale; initially zero.
+    /// Component properties compose after [`Self::transform`], in the order
+    /// documented in `docs/api.md`. Each keeps its own live subscription and
+    /// animation track; changing it never re-records content.
+    pub fn pivot(&mut self, value: impl Into<Live<Vec2>>) -> &mut Self {
+        let live = value.into();
+        self.ops.push(EditOp::Pivot(Prop {
+            target: live.value,
+            animation: self.default_animation,
+        }));
+        Shared::bind(
+            &self.shared,
+            self.layer,
+            PropKind::Pivot,
+            live.subscribe,
+            |layer, target, animation| LayerOp::Pivot(layer, Prop { target, animation }),
         );
         self
     }
@@ -455,7 +570,7 @@ impl<B: Backend> LayerEdit<B> {
     /// Overrides the animation of the last recorded property op.
     ///
     /// # Panics
-    /// Panics unless the last op was `transform`, `opacity` or
+    /// Panics unless the last op was a transform component, `transform`, `opacity` or
     /// `scroll_offset` — `.animation(...)` on any other property is an
     /// invariant violation — and panics when `animation` is a
     /// [`Decay`](crate::Decay) on anything but `scroll_offset`.
@@ -468,9 +583,17 @@ impl<B: Backend> LayerEdit<B> {
         );
         match self.ops.last_mut() {
             Some(EditOp::Transform(prop)) => prop.animation = Some(animation),
+            Some(
+                EditOp::Translation(prop)
+                | EditOp::Scale(prop)
+                | EditOp::Skew(prop)
+                | EditOp::Pivot(prop)
+                | EditOp::ScrollOffset(prop),
+            ) => prop.animation = Some(animation),
+            Some(EditOp::Rotation(prop)) => prop.animation = Some(animation),
+
             Some(EditOp::Opacity(prop)) => prop.animation = Some(animation),
-            Some(EditOp::ScrollOffset(prop)) => prop.animation = Some(animation),
-            _ => panic!("animation() must follow transform, opacity or scroll_offset"),
+            _ => panic!("animation() must follow an animatable layer property"),
         }
         self
     }
@@ -690,6 +813,14 @@ impl<B: Backend> Surface<B> {
             for op in edit.ops {
                 match op {
                     EditOp::Transform(prop) => ops.push(Op::Layer(LayerOp::Transform(id, prop))),
+                    EditOp::Translation(prop) => {
+                        ops.push(Op::Layer(LayerOp::Translation(id, prop)));
+                    }
+                    EditOp::Rotation(prop) => ops.push(Op::Layer(LayerOp::Rotation(id, prop))),
+                    EditOp::Scale(prop) => ops.push(Op::Layer(LayerOp::Scale(id, prop))),
+                    EditOp::Skew(prop) => ops.push(Op::Layer(LayerOp::Skew(id, prop))),
+                    EditOp::Pivot(prop) => ops.push(Op::Layer(LayerOp::Pivot(id, prop))),
+
                     EditOp::Opacity(prop) => ops.push(Op::Layer(LayerOp::Opacity(id, prop))),
                     EditOp::ScrollOffset(prop) => {
                         ops.push(Op::Layer(LayerOp::ScrollOffset(id, prop)));

@@ -8,6 +8,8 @@
 //! The backend never receives property ops; it reads the sampled tree
 //! through [`SurfaceFrame`](crate::SurfaceFrame).
 
+mod components;
+
 use crate::Instant;
 use std::collections::HashMap;
 
@@ -55,6 +57,7 @@ pub struct LayerNode {
     pub children: Vec<LayerId>,
     parent: Option<LayerId>,
     transform_track: Option<Track<Affine>>,
+    components: Option<Box<components::Components>>,
     opacity_track: Option<Track<f32>>,
     scroll_track: Option<Track<Vec2>>,
 }
@@ -87,6 +90,7 @@ impl LayerNode {
             children: Vec::new(),
             parent: None,
             transform_track: None,
+            components: None,
             opacity_track: None,
             scroll_track: None,
         }
@@ -280,8 +284,18 @@ impl SurfaceTree {
             LayerOp::Remove(_) => unreachable!("Remove is handled by the render loop"),
             LayerOp::Transform(id, prop) => {
                 let node = self.node_mut(id);
-                set_prop(&mut node.transform_track, &mut node.transform, &prop);
+                if let Some(components) = &mut node.components {
+                    set_prop(&mut node.transform_track, &mut components.base, &prop);
+                    node.transform = components.matrix();
+                } else {
+                    set_prop(&mut node.transform_track, &mut node.transform, &prop);
+                }
             }
+            LayerOp::Translation(id, prop) => self.node_mut(id).set_translation(prop),
+            LayerOp::Rotation(id, prop) => self.node_mut(id).set_rotation(prop),
+            LayerOp::Scale(id, prop) => self.node_mut(id).set_scale(prop),
+            LayerOp::Skew(id, prop) => self.node_mut(id).set_skew(prop),
+            LayerOp::Pivot(id, prop) => self.node_mut(id).set_pivot(prop),
             LayerOp::Opacity(id, prop) => {
                 let node = self.node_mut(id);
                 set_prop(&mut node.opacity_track, &mut node.opacity, &prop);
@@ -370,13 +384,31 @@ impl SurfaceTree {
         let mut fast = false;
         let mut slow = false;
         for node in self.nodes.values_mut() {
+            let mut transform_changed = false;
             if let Some(track) = &mut node.transform_track {
                 stepped = true;
+                transform_changed = true;
                 let (pos, _vel, done) = track.sample(time);
-                node.transform = Affine::from_lanes(pos);
+                let matrix = if done {
+                    track.target
+                } else {
+                    Affine::from_lanes(pos)
+                };
+                if let Some(components) = &mut node.components {
+                    components.base = matrix;
+                } else {
+                    node.transform = matrix;
+                }
                 if done {
-                    node.transform = track.target;
                     node.transform_track = None;
+                }
+            }
+            if let Some(components) = &mut node.components {
+                let (component_step, running) = components.sample(time);
+                stepped |= component_step;
+                fast |= running;
+                if transform_changed || component_step {
+                    node.transform = components.matrix();
                 }
             }
             if let Some(track) = &mut node.opacity_track {

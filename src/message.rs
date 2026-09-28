@@ -140,6 +140,16 @@ pub enum LayerOp {
     Remove(LayerId),
     /// Set the local transform.
     Transform(LayerId, Prop<Affine>),
+    /// Sets the translation in local coordinates; initially zero.
+    Translation(LayerId, Prop<Vec2>),
+    /// Sets the unwrapped rotation angle in radians; initially zero.
+    Rotation(LayerId, Prop<f64>),
+    /// Sets the x/y scale factors; initially (1, 1).
+    Scale(LayerId, Prop<Vec2>),
+    /// Sets x/y skew angles in radians; initially zero.
+    Skew(LayerId, Prop<Vec2>),
+    /// Sets the local pivot for rotation, skew and scale; initially zero.
+    Pivot(LayerId, Prop<Vec2>),
     /// Set the opacity.
     Opacity(LayerId, Prop<f32>),
     /// Set the scroll offset.

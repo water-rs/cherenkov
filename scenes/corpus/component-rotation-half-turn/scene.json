@@ -1,0 +1,126 @@
+{
+  "width": 64,
+  "height": 64,
+  "working_space": "linear-display-p3",
+  "clear": {
+    "space": "srgb",
+    "components": [
+      0.95,
+      0.95,
+      0.95,
+      1.0
+    ]
+  },
+  "features": [
+    {
+      "feature": "fill"
+    },
+    {
+      "feature": "animation"
+    }
+  ],
+  "root": {
+    "transform": [
+      1,
+      0,
+      0,
+      1,
+      0,
+      0
+    ],
+    "opacity": 1.0,
+    "blend": "normal",
+    "items": [
+      {
+        "layer": {
+          "transform": [
+            -1.0,
+            1.2246467991473532e-16,
+            -1.2246467991473532e-16,
+            -1.0,
+            64.0,
+            64.0
+          ],
+          "opacity": 1.0,
+          "blend": "normal",
+          "motion": {
+            "motion": "rotation",
+            "value": {
+              "from": 0.0,
+              "to": 3.141592653589793,
+              "pivot": {
+                "x": 32.0,
+                "y": 32.0
+              },
+              "animation": {
+                "animation": "curve",
+                "value": {
+                  "duration_ms": 500,
+                  "x1": 0.0,
+                  "y1": 0.0,
+                  "x2": 1.0,
+                  "y2": 1.0
+                }
+              }
+            }
+          },
+          "items": [
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rect": {
+                      "x0": 30.0,
+                      "y0": 12.0,
+                      "x1": 38.0,
+                      "y1": 34.0
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "solid": {
+                      "space": "srgb",
+                      "components": [
+                        0.1,
+                        0.5,
+                        0.9,
+                        1.0
+                      ]
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "circle": {
+                      "center": {
+                        "x": 38.0,
+                        "y": 15.0
+                      },
+                      "radius": 5.0
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "solid": {
+                      "space": "srgb",
+                      "components": [
+                        0.9,
+                        0.3,
+                        0.1,
+                        1.0
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

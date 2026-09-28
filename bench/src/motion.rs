@@ -18,6 +18,19 @@ use kurbo::{Affine, Vec2};
 
 /// A scene [`Motion`] translated into front-end animation types.
 pub enum LayerMotion {
+    /// Engine-sampled scalar rotation, independent of the affine base.
+    Rotation {
+        /// Fixed base matrix.
+        base: Affine,
+        /// Unwrapped starting angle in radians.
+        from: f64,
+        /// Unwrapped target angle in radians.
+        to: f64,
+        /// Rotation pivot in local coordinates.
+        pivot: Vec2,
+        /// Curve or spring.
+        animation: Animation,
+    },
     /// `transform` animates `from` → `to` under `animation`.
     Transform {
         /// The start transform.
@@ -45,6 +58,21 @@ impl LayerMotion {
     #[must_use]
     pub fn from_scene(motion: &Motion, transform: Affine) -> Self {
         match motion {
+            Motion::Rotation {
+                from,
+                to,
+                pivot,
+                animation,
+            } => Self::Rotation {
+                base: transform
+                    * Affine::translate(*pivot)
+                    * Affine::rotate(-to)
+                    * Affine::translate(-*pivot),
+                from: *from,
+                to: *to,
+                pivot: *pivot,
+                animation: motion_animation(*animation),
+            },
             Motion::Transform { from, animation } => Self::Transform {
                 from: *from,
                 to: transform,
@@ -70,6 +98,20 @@ impl LayerMotion {
     /// animated commit to the static value.
     pub fn apply<B: Backend>(&self, surface: &Surface<B>, layer: &Layer) {
         match self {
+            Self::Rotation {
+                base,
+                from,
+                to,
+                pivot,
+                animation,
+            } => {
+                surface.update(|tx| {
+                    tx[layer].transform(*base).pivot(*pivot).rotation(*from);
+                });
+                surface.update_animated(*animation, |tx| {
+                    tx[layer].rotation(*to);
+                });
+            }
             Self::Transform {
                 from,
                 to,

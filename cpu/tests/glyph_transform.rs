@@ -4,7 +4,7 @@
 use cherenkov::kurbo::{Affine, Stroke};
 use cherenkov::{
     Draw, Engine, FontSource, FrameTime, Glyph, GlyphRun, GlyphStyle, Offscreen, OffscreenFormat,
-    RenderError, ResourceError, WorkingColor,
+    RenderError, WorkingColor,
 };
 use cherenkov_cpu::{Raster as Gpu, RasterConfig as GpuConfig};
 use nami::Binding;
@@ -155,14 +155,13 @@ fn invalid_transform_is_an_error() {
 }
 
 #[test]
-fn color_font_is_still_unsupported() {
+fn color_font_registers() {
     let Ok(bytes) = std::fs::read(COLR_FONT_PATH) else {
         eprintln!("text-colr font not checked out; skipping");
         return;
     };
     let engine = Engine::<Gpu>::new(GpuConfig::default()).expect("CPU engine");
-    match engine.font(FontSource::bytes(bytes)) {
-        Err(ResourceError::Unsupported("color-font")) => {}
-        other => panic!("expected unsupported color-font, got {other:?}"),
-    }
+    engine
+        .font(FontSource::bytes(bytes))
+        .expect("a COLR font registers");
 }

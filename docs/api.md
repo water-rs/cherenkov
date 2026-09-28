@@ -366,6 +366,7 @@ DynColor::from_css(parsed)                         // colour space known only at
 - **Typed colour spaces.** `Color<CS>` converts to the working space (linear Display P3) through a matrix that is constant-folded when monomorphised. HDR is extended values above 1.0, relative to SDR white.
 - **The display supplies headroom.** Effects may read it. Output tone-maps to the display's headroom.
 - **Blending space** is linear by default. Groups can opt into sRGB-encoded blending for web compatibility.
+- **Group isolation.** A group is composited through its own offscreen when it blends, has opacity below one, carries a filter, or contains a blended descendant group; every other group composes in place with identical results.
 - **WaterUI unification.** WaterUI's `ResolvedColor` becomes Cherenkov's colour type, with headroom folded into extended values.
 
 ## Text

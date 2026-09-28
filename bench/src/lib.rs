@@ -158,6 +158,12 @@ pub struct Counters {
     pub dispatches: Option<u32>,
     /// Render/dispatch pass count, where the backend exposes it.
     pub passes: Option<u32>,
+    /// `Engine::memory()` GPU bytes at the end of the run, where the adapter
+    /// exposes it; `None` for other engines.
+    pub memory_gpu_bytes: Option<u64>,
+    /// `Engine::memory()` CPU bytes at the end of the run, where the adapter
+    /// exposes it; `None` for other engines.
+    pub memory_cpu_bytes: Option<u64>,
 }
 
 /// Device and thermal metadata captured at measure time.

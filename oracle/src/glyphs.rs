@@ -9,11 +9,12 @@
 //! position `x, y` is the glyph's origin on the baseline in y-down scene
 //! coordinates.
 //!
-//! `COLRv1` brush transforms that are not (close to) similarity transforms
-//! can't be expressed exactly for radial/sweep gradients — radii are scaled
-//! by `sqrt(|det|)` and sweep angles are left unrotated. Font gradients are
-//! interpolated in sRGB per the `COLRv1` spec's use of CSS images semantics;
-//! [`ColorSpace::Srgb`] is used as the interpolation space.
+//! `COLRv1` brush transforms are exact: gradient geometry stays in
+//! brush-local coordinates under a [`Paint::Transformed`] map, so skewed
+//! and non-uniformly scaled radial/sweep brushes are evaluated in their
+//! own space. Font gradients are interpolated in sRGB per the `COLRv1`
+//! spec's use of CSS images semantics; [`ColorSpace::Srgb`] is used as the
+//! interpolation space.
 
 use cherenkov_scene::{
     BlendMode, Color, ColorSpace, Draw, Extend, FillRule, GlyphRun, GradientStop, Item, Layer,
@@ -102,6 +103,9 @@ enum Node {
     Group {
         clip: Option<BezPath>,
         blend: BlendMode,
+        /// Group opacity: a foreground brush's COLR `alpha` when the run
+        /// paint carries no alpha channel.
+        opacity: f32,
         children: Vec<Self>,
     },
 }
@@ -209,11 +213,10 @@ impl ColrPainter<'_> {
             .collect()
     }
 
-    /// Resolve a COLR brush into a scene [`Paint`]; geometry is in font
-    /// units under transform `tf`.
+    /// Resolve a COLR brush into a scene [`Paint`]. Gradient geometry
+    /// stays in brush-local font units under a paint transform `tf`, so
+    /// non-similarity brushes are exact.
     fn brush_paint(&self, brush: &Brush<'_>, tf: Affine) -> Paint {
-        let det = tf.as_coeffs();
-        let scale = det[1].mul_add(-det[2], det[0] * det[3]).abs().sqrt();
         match brush {
             Brush::Solid {
                 palette_index,
@@ -235,13 +238,16 @@ impl ColrPainter<'_> {
                 p1,
                 color_stops,
                 extend: e,
-            } => Paint::Linear(LinearGradient {
-                start: tf * Point::new(f64::from(p0.x), f64::from(p0.y)),
-                end: tf * Point::new(f64::from(p1.x), f64::from(p1.y)),
-                stops: self.stops(color_stops),
-                extend: extend(*e),
-                interpolation: ColorSpace::Srgb,
-            }),
+            } => transformed(
+                Paint::Linear(LinearGradient {
+                    start: Point::new(f64::from(p0.x), f64::from(p0.y)),
+                    end: Point::new(f64::from(p1.x), f64::from(p1.y)),
+                    stops: self.stops(color_stops),
+                    extend: extend(*e),
+                    interpolation: ColorSpace::Srgb,
+                }),
+                tf,
+            ),
             Brush::RadialGradient {
                 c0,
                 r0,
@@ -249,32 +255,38 @@ impl ColrPainter<'_> {
                 r1,
                 color_stops,
                 extend: e,
-            } => Paint::Radial(RadialGradient {
-                center0: tf * Point::new(f64::from(c0.x), f64::from(c0.y)),
-                r0: f64::from(*r0) * scale,
-                center1: tf * Point::new(f64::from(c1.x), f64::from(c1.y)),
-                r1: f64::from(*r1) * scale,
-                stops: self.stops(color_stops),
-                extend: extend(*e),
-                interpolation: ColorSpace::Srgb,
-            }),
+            } => transformed(
+                Paint::Radial(RadialGradient {
+                    center0: Point::new(f64::from(c0.x), f64::from(c0.y)),
+                    r0: f64::from(*r0),
+                    center1: Point::new(f64::from(c1.x), f64::from(c1.y)),
+                    r1: f64::from(*r1),
+                    stops: self.stops(color_stops),
+                    extend: extend(*e),
+                    interpolation: ColorSpace::Srgb,
+                }),
+                tf,
+            ),
             Brush::SweepGradient {
                 c0,
                 start_angle,
                 end_angle,
                 color_stops,
                 extend: e,
-            } => Paint::Sweep(SweepGradient {
-                center: tf * Point::new(f64::from(c0.x), f64::from(c0.y)),
-                // skrifa hands degrees, interpreted clockwise in y-up font
-                // space; after the y-flip into y-down scene space the same
-                // angles read clockwise on screen, which is our convention.
-                start_angle: f64::from(*start_angle).to_radians(),
-                end_angle: f64::from(*end_angle).to_radians(),
-                stops: self.stops(color_stops),
-                extend: extend(*e),
-                interpolation: ColorSpace::Srgb,
-            }),
+            } => transformed(
+                Paint::Sweep(SweepGradient {
+                    center: Point::new(f64::from(c0.x), f64::from(c0.y)),
+                    // skrifa hands degrees, interpreted clockwise in y-up font
+                    // space; after the y-flip into y-down scene space the same
+                    // angles read clockwise on screen, which is our convention.
+                    start_angle: f64::from(*start_angle).to_radians(),
+                    end_angle: f64::from(*end_angle).to_radians(),
+                    stops: self.stops(color_stops),
+                    extend: extend(*e),
+                    interpolation: ColorSpace::Srgb,
+                }),
+                tf,
+            ),
         }
     }
 
@@ -346,6 +358,7 @@ impl ColorPainter for ColrPainter<'_> {
             children.push(Node::Group {
                 clip,
                 blend,
+                opacity: 1.0,
                 children: std::mem::take(&mut self.top),
             });
             self.top = children;
@@ -354,10 +367,11 @@ impl ColorPainter for ColrPainter<'_> {
 
     fn fill(&mut self, brush: Brush<'_>) {
         let paint = self.brush_paint(&brush, self.cur());
-        self.top.push(Node::Fill {
-            shape: Some(self.cur() * self.fill_rect_font.clone()),
+        self.emit(
+            Some(self.cur() * self.fill_rect_font.clone()),
+            &brush,
             paint,
-        });
+        );
     }
 
     fn fill_glyph(
@@ -390,7 +404,7 @@ impl ColorPainter for ColrPainter<'_> {
                 ])
             }),
         );
-        self.top.push(Node::Fill { shape, paint });
+        self.emit(shape, &brush, paint);
     }
 
     fn push_layer(&mut self, composite_mode: skrifa::color::CompositeMode) {
@@ -423,10 +437,60 @@ impl ColorPainter for ColrPainter<'_> {
             children.push(Node::Group {
                 clip,
                 blend,
+                opacity: 1.0,
                 children: std::mem::take(&mut self.top),
             });
             self.top = children;
         }
+    }
+}
+
+/// Wrap a brush-local paint in its paint transform; identity is a no-op.
+fn transformed(paint: Paint, tf: Affine) -> Paint {
+    if tf == Affine::IDENTITY {
+        paint
+    } else {
+        Paint::Transformed {
+            paint: Box::new(paint),
+            transform: tf,
+        }
+    }
+}
+
+/// Whether `paint` carries no alpha channel an opacity could scale:
+/// image, mesh and shader paints. A foreground brush's COLR `alpha`
+/// then needs a group instead of a colour multiply.
+fn opacity_needs_group(paint: &Paint) -> bool {
+    match paint {
+        Paint::Transformed { paint, .. } => opacity_needs_group(paint),
+        Paint::Image(_) | Paint::Mesh(_) => true,
+        _ => false,
+    }
+}
+
+impl ColrPainter<'_> {
+    /// Emit a fill node — or, for a foreground brush whose `alpha` cannot
+    /// fold into the run paint, the fill wrapped in an opacity group.
+    fn emit(&mut self, shape: Option<BezPath>, brush: &Brush<'_>, paint: Paint) {
+        if let Brush::Solid {
+            palette_index: 0xFFFF,
+            alpha,
+        } = *brush
+            && alpha < 1.0
+            && opacity_needs_group(&paint)
+        {
+            self.top.push(Node::Group {
+                clip: None,
+                blend: BlendMode::Normal,
+                opacity: alpha,
+                children: vec![Node::Fill {
+                    shape,
+                    paint: self.foreground.clone(),
+                }],
+            });
+            return;
+        }
+        self.top.push(Node::Fill { shape, paint });
     }
 }
 
@@ -525,11 +589,12 @@ fn node_to_item(node: Node, place: Affine, scene_rect: Rect) -> Item {
         Node::Group {
             clip,
             blend,
+            opacity,
             children,
         } => Item::Layer(Layer {
             transform: Affine::IDENTITY,
             clip: clip.map(|p| Shape::Path { path: place * p }),
-            opacity: 1.0,
+            opacity: f64::from(opacity),
             blend,
             scroll_offset: kurbo::Vec2::ZERO,
             motion: None,

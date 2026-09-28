@@ -17,8 +17,9 @@ struct Present {
     // 0: opaque (alpha forced to 1), 1: premultiplied in the output space,
     // 2: straight alpha.
     alpha: u32,
-    _pad1: u32,
-    _pad2: u32,
+    // The display's HDR headroom (#97): `Display::headroom`, 1.0 for SDR.
+    headroom: f32,
+    _pad: u32,
 }
 
 @group(0) @binding(0) var source: texture_2d<f32>;
@@ -95,6 +96,33 @@ fn oklab_to_srgb(lab: vec3<f32>) -> vec3<f32> {
 
 fn in_gamut(rgb: vec3<f32>) -> bool {
     return all(rgb >= vec3<f32>(0.0)) && all(rgb <= vec3<f32>(1.0));
+}
+
+// ---- Tone mapping to the display headroom (#97) ------------------------
+
+// The shoulder: identity on [0, 1], then highlights compress smoothly
+// towards the headroom h — the extended-Reinhard/EDR knee at 1,
+// asymptote h, so highlight ordering survives for every finite input
+// (#97; the BT.2390-adapted EETF plateaued at 3h-2 and lost it).
+// oracle/src/tone.rs is the f64 reference.
+fn tone_shoulder(x: f32, h: f32) -> f32 {
+    if !(x > 1.0) {
+        return x;
+    }
+    let d = max(h - 1.0, 0.0);
+    let t = x - 1.0;
+    return 1.0 + d * (1.0 - d / (t + d));
+}
+
+// One pixel's tone map: scale every channel by the shoulder's value at
+// the maximum channel — a per-pixel scalar, so hue and saturation are
+// preserved. max <= 1 returns the input unchanged.
+fn tone_map(rgb: vec3<f32>, headroom: f32) -> vec3<f32> {
+    let m = max(rgb.r, max(rgb.g, rgb.b));
+    if !(m > 1.0) {
+        return rgb;
+    }
+    return rgb * (tone_shoulder(m, headroom) / m);
 }
 
 // The analytic OKLab clip — Ottosson's cusp-triangle boundary
@@ -284,13 +312,18 @@ fn fs_main(in: Vertex) -> @location(0) vec4<f32> {
         }
     }
     if present.encode == 2u {
-        return present_color(p3.rgb, alpha);
+        // Extended linear P3 output rolls off to the host's headroom.
+        return present_color(tone_map(p3.rgb, present.headroom), alpha);
     }
+    // Highlights roll off in the working space — an sRGB-intensity P3
+    // colour never takes the shoulder — then the matrix, then the gamut
+    // map (#97).
+    let p3_toned = tone_map(p3.rgb, min(present.headroom, 1.0));
     // Linear Display P3 → linear sRGB (Bradford-adapted, D65).
     let rgb = vec3<f32>(
-        1.2249402 * p3.r - 0.2249402 * p3.g,
-        -0.04205695 * p3.r + 1.0420569 * p3.g,
-        -0.01963755 * p3.r - 0.07863605 * p3.g + 1.0982736 * p3.b,
+        1.2249402 * p3_toned.r - 0.2249402 * p3_toned.g,
+        -0.04205695 * p3_toned.r + 1.0420569 * p3_toned.g,
+        -0.01963755 * p3_toned.r - 0.07863605 * p3_toned.g + 1.0982736 * p3_toned.b,
     );
     let clamped = gamut_map(rgb);
     if present.encode == 1u {

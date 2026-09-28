@@ -2360,8 +2360,13 @@ impl GpuRenderer {
             let surface = self.surfaces.get_mut(&sf.id).expect("registered surface");
             if surface.present_pending {
                 let window = surface.window.as_ref().expect("pending window");
-                surface.present_pending =
-                    !presenter.present(&self.device, &self.queue, window, &surface.view)?;
+                surface.present_pending = !presenter.present(
+                    &self.device,
+                    &self.queue,
+                    window,
+                    &surface.view,
+                    sf.display.headroom,
+                )?;
                 if surface.present_pending {
                     redraw = Some(redraw.map_or_else(
                         || surface.refresh.clone(),

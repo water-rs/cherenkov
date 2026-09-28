@@ -63,15 +63,26 @@ fn exported_texture_preserves_hdr_and_updates_after_resize()
             texture: &output,
             color: OutputColor::LinearDisplayP3,
             alpha: OutputAlpha::Premultiplied,
+            headroom: 4.0,
         },
     );
     let pixel = destination.readback()?.pixels[0];
-    for (actual, expected) in pixel.into_iter().zip([2.0, 0.25, 0.0, 0.5]) {
+    // The stored texel is premultiplied [2, 0.25, 0, 0.5] — straight
+    // (4, 0.5, 0). The tone map compresses it towards headroom 4 by a
+    // per-pixel scalar (#97): the HDR channel stays extended (never
+    // clipped) and the hue ratio survives.
+    let straight = cherenkov_oracle::tone::tone_map(4.0, [4.0, 0.5, 0.0]);
+    for (actual, expected) in
+        pixel
+            .into_iter()
+            .zip([straight[0] * 0.5, straight[1] * 0.5, 0.0, 0.5])
+    {
         assert!(
-            (actual - expected).abs() < 0.001,
+            (f64::from(actual) - expected).abs() < 0.001,
             "native output {actual} != {expected}"
         );
     }
+    assert!(pixel[0] > 1.0, "extended output keeps HDR range: {pixel:?}");
     source.clear_color(WorkingColor::new([1.0, 1.0, 1.0, 0.5]));
     engine.render(FrameTime::now())?;
     presenter.texture(
@@ -82,6 +93,7 @@ fn exported_texture_preserves_hdr_and_updates_after_resize()
             texture: &output,
             color: OutputColor::Srgb,
             alpha: OutputAlpha::Premultiplied,
+            headroom: 4.0,
         },
     );
     let pixel = destination.readback()?.pixels[0];
@@ -150,6 +162,7 @@ fn hardware_and_shader_srgb_store_the_same_premultiplied_bytes()
                     texture: output,
                     color: OutputColor::Srgb,
                     alpha: OutputAlpha::Premultiplied,
+                    headroom: 1.0,
                 },
             );
         }

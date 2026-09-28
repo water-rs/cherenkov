@@ -118,6 +118,19 @@ impl LayerNode {
     pub const fn blends_within(&self) -> bool {
         self.blending_children > 0 || self.content_blends
     }
+
+    /// Whether an engine-driven track moved this layer this frame: a
+    /// running transform, component or scroll track. False on the frame
+    /// a track settles.
+    #[must_use]
+    pub const fn animating(&self) -> bool {
+        self.transform_track.is_some()
+            || self.scroll_track.is_some()
+            || match &self.components {
+                Some(components) => components.animating(),
+                None => false,
+            }
+    }
 }
 
 /// One running animation track.
@@ -602,13 +615,27 @@ fn snap(offset: Vec2, scale: f64) -> Vec2 {
     )
 }
 
+/// Places a device transform's translation on the ¼-pixel grid, the
+/// placement of content under an animating layer.
+#[must_use]
+#[expect(
+    clippy::many_single_char_names,
+    reason = "a/b/c/d are the conventional affine matrix coefficient names"
+)]
+pub const fn snap_animating(t: Affine) -> Affine {
+    let [a, b, c, d, e, f] = t.as_coeffs();
+    Affine::new([a, b, c, d, (e * 4.0).round() / 4.0, (f * 4.0).round() / 4.0])
+}
+
 #[cfg(test)]
 mod hierarchy_tests {
     use super::*;
     use crate::display_list::{Operand, Picture, SlotUpdate};
     use crate::style::Group;
+    use crate::{Curve, Decay};
     use crate::{Draw, WorkingColor};
     use kurbo::Rect;
+    use std::time::Duration;
 
     fn tree() -> SurfaceTree {
         let mut tree = SurfaceTree::new();
@@ -659,6 +686,56 @@ mod hierarchy_tests {
             parent: LayerId::new(2),
             child: tree.root(),
         });
+    }
+
+    #[test]
+    fn animating_reports_a_running_track() {
+        let mut tree = SurfaceTree::new();
+        let start = Instant::now();
+        tree.apply(LayerOp::Transform(
+            tree.root(),
+            Prop {
+                target: Affine::translate((10., 0.)),
+                animation: Some(Curve::linear(Duration::from_secs(1)).into()),
+            },
+        ));
+        tree.sample(start, Display::default());
+        tree.sample(start + Duration::from_millis(500), Display::default());
+        assert!(tree.layer(tree.root()).animating());
+        tree.sample(start + Duration::from_secs(1), Display::default());
+        assert!(!tree.layer(tree.root()).animating());
+    }
+
+    #[test]
+    fn a_running_scroll_decay_counts_as_animating() {
+        let mut tree = SurfaceTree::new();
+        let start = Instant::now();
+        tree.apply(LayerOp::ScrollOffset(
+            tree.root(),
+            Prop {
+                target: Vec2::ZERO,
+                animation: Some(Decay::new(Vec2::new(0., 400.)).into()),
+            },
+        ));
+        tree.sample(start + Duration::from_millis(100), Display::default());
+        assert!(tree.layer(tree.root()).animating());
+        tree.sample(start + Duration::from_secs(10), Display::default());
+        assert!(!tree.layer(tree.root()).animating());
+    }
+
+    #[test]
+    fn opacity_animation_does_not_count_as_animating() {
+        let mut tree = SurfaceTree::new();
+        let start = Instant::now();
+        tree.apply(LayerOp::Opacity(
+            tree.root(),
+            Prop {
+                target: 0.5,
+                animation: Some(Curve::linear(Duration::from_secs(1)).into()),
+            },
+        ));
+        tree.sample(start + Duration::from_millis(500), Display::default());
+        assert!(!tree.layer(tree.root()).animating());
     }
 
     #[test]

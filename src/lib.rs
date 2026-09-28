@@ -90,5 +90,5 @@ pub use crate::style::{BlendMode, BlendSpace, FilterId, Group, Shadow};
 pub use crate::surface::{
     ExternalFrameHandle, GpuContentHandle, Layer, LayerContent, LayerEdit, Surface, Transaction,
 };
-pub use crate::tree::{LayerNode, SurfaceTree};
+pub use crate::tree::{LayerNode, SurfaceTree, snap_animating};
 pub use kurbo::Stroke;

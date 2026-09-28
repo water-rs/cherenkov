@@ -3,7 +3,7 @@
 use cherenkov::kurbo::{Affine, Circle, Rect, Vec2};
 use cherenkov::{
     Animation, Backend, Curve, Draw, Engine, FrameTime, Next, Offscreen, OffscreenFormat, Picture,
-    WorkingColor,
+    WorkingColor, snap_animating,
 };
 use nami::SignalExt as _;
 use std::cell::Cell;
@@ -64,6 +64,12 @@ pub fn component_animation<B: Backend>(config: B::Config) {
             * Affine::new([1., skew.y.tan(), skew.x.tan(), 1., 0., 0.])
             * Affine::scale_non_uniform(scale.x, scale.y)
             * Affine::translate(-pivot);
+        // Moving content snaps to the ¼-pixel grid; the settled frame is exact.
+        let matrix = if step < 8 {
+            snap_animating(matrix)
+        } else {
+            matrix
+        };
         reference.update(|tx| {
             tx[reference.root()].transform(matrix);
         });
@@ -101,6 +107,16 @@ pub fn component_animation<B: Backend>(config: B::Config) {
         "a signal wakes an idle engine without a transaction"
     );
     drop(layer);
+    signal_drops_with_the_layer(&engine, &angle, &wakes, start);
+}
+
+/// After a bound layer drops, its signal no longer wakes the engine.
+fn signal_drops_with_the_layer<B: Backend>(
+    engine: &Engine<B>,
+    angle: &nami::Binding<f64>,
+    wakes: &Cell<usize>,
+    start: Instant,
+) {
     engine
         .render(FrameTime::at(start + Duration::from_secs(2)))
         .expect("remove bound layer");

@@ -395,7 +395,7 @@ impl Lowerer<'_> {
             ops.push(Op::Stroke {
                 local: ambient,
                 shape: ShapeData::Path {
-                    elements: path.into_elements(),
+                    elements: path.into_elements().into(),
                     rule: cherenkov::FillRule::NonZero,
                 },
                 stroke: stroke.clone(),
@@ -468,7 +468,7 @@ impl Lowerer<'_> {
             ops.push(Op::Fill {
                 local: ambient,
                 shape: ShapeData::Path {
-                    elements: (place * font_scale * path).into_elements(),
+                    elements: (place * font_scale * path).into_elements().into(),
                     rule: cherenkov::FillRule::NonZero,
                 },
                 paint: paint.clone(),

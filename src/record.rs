@@ -710,6 +710,7 @@ mod tests {
             kurbo::PathEl::MoveTo((0.0, 0.0).into()),
             kurbo::PathEl::LineTo((1.0, 1.0).into()),
         ];
+        let elements: std::sync::Arc<[kurbo::PathEl]> = elements.into();
         let pointer = elements.as_ptr();
         let shape = ShapeData::Path {
             elements,

@@ -2,6 +2,7 @@
 
 use std::any::Any;
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use kurbo::{BezPath, Circle, Ellipse, Line, PathEl, Point, Rect, RoundedRect, RoundedRectRadii};
 use nami_core::Signal;
@@ -300,7 +301,7 @@ pub enum ShapeData {
     /// A general path.
     Path {
         /// The path elements.
-        elements: Vec<PathEl>,
+        elements: Arc<[PathEl]>,
         /// The fill rule.
         rule: FillRule,
     },
@@ -345,7 +346,7 @@ impl From<Semantic<'_>> for ShapeData {
             Semantic::Ellipse(ellipse) => Self::Ellipse(ellipse),
             Semantic::Line(line) => Self::Line(line),
             Semantic::Path(path) => Self::Path {
-                elements: path.elements.into_owned(),
+                elements: path.elements.into_owned().into(),
                 rule: path.rule,
             },
         }
@@ -461,7 +462,7 @@ mod tests {
         else {
             panic!("a BezPath records as a path");
         };
-        assert_eq!(moved, elements);
+        assert_eq!(moved.as_ref(), elements.as_slice());
         assert_eq!(rule, FillRule::NonZero);
 
         let mut path = BezPath::new();

@@ -328,7 +328,7 @@ fn shape_path(shape: &ShapeData, tol: f64) -> Option<(BezPath, FillRule)> {
         ShapeData::Circle(c) => Some((c.to_path(tol), FillRule::NonZero)),
         ShapeData::Ellipse(e) => Some((e.to_path(tol), FillRule::NonZero)),
         ShapeData::Line(_) => None,
-        ShapeData::Path { elements, rule } => Some((BezPath::from_vec(elements.clone()), *rule)),
+        ShapeData::Path { elements, rule } => Some((BezPath::from_vec(elements.to_vec()), *rule)),
     }
 }
 

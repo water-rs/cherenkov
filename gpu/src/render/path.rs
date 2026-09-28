@@ -58,7 +58,7 @@ pub fn shape_path(shape: &ShapeData, tolerance: f64) -> BezPath {
         ShapeData::Ellipse(e) => e.to_path(tolerance),
         ShapeData::Line(l) => l.to_path(tolerance),
         ShapeData::Continuous(c) => c.to_path(tolerance),
-        ShapeData::Path { elements, .. } => BezPath::from_vec(elements.clone()),
+        ShapeData::Path { elements, .. } => BezPath::from_vec(elements.to_vec()),
     }
 }
 

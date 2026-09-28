@@ -862,7 +862,7 @@ impl Lowerer<'_> {
                 rule: *rule,
                 outline: source.map_or_else(
                     || Outline::Fill {
-                        elements: Arc::from(elements.as_slice()),
+                        elements: Arc::clone(elements),
                         content: path::hash_elements(elements, fill_tag(*rule)),
                     },
                     |command| Outline::Source {
@@ -1213,7 +1213,7 @@ impl Lowerer<'_> {
             self.stroke(
                 ambient,
                 &ShapeData::Path {
-                    elements: path.into_elements(),
+                    elements: path.into_elements().into(),
                     rule: FillRule::NonZero,
                 },
                 style,
@@ -1344,7 +1344,7 @@ impl Lowerer<'_> {
             self.fill(
                 ambient,
                 &ShapeData::Path {
-                    elements: (place * font_scale * path).into_elements(),
+                    elements: (place * font_scale * path).into_elements().into(),
                     rule: FillRule::NonZero,
                 },
                 paint,
@@ -1361,7 +1361,7 @@ impl Lowerer<'_> {
 fn clip_shape(shape: &ShapeData) -> Result<ClipShape, RenderError> {
     if let ShapeData::Path { elements, rule } = shape {
         return Ok(ClipShape::Path {
-            elements: Arc::from(elements.as_slice()),
+            elements: Arc::clone(elements),
             rule: *rule,
         });
     }

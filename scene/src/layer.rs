@@ -105,9 +105,8 @@ pub enum LayerFilter {
         /// Radius in pixels, rounded.
         radius: f64,
     },
-    /// Blends each pixel's premultiplied colour with the texel of `image`
-    /// covering it (the PNG's raw straight channels over `255`), then mixes
-    /// by `amount`; alpha is unchanged.
+    /// Blends each pixel's unpremultiplied colour with the sampled straight
+    /// texel, mixes by `amount`, and re-premultiplies with the unchanged alpha.
     BlendImage {
         /// BLAKE3 hash of the image blob in `resources/` (PNG).
         image: ResourceHash,

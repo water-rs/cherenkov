@@ -8,7 +8,8 @@
 //! - the Gaussian blur is the oracle's true Gaussian ([`gaussian_blur`]),
 //!   per channel, edge-clamped;
 //! - the box blur averages `2r + 1` edge-clamped texels per axis;
-//! - the image blend takes the texel covering each pixel centre.
+//! - the image blend operates on the input's unpremultiplied colour and the
+//!   sampled texel, then re-premultiplies with the unchanged input alpha.
 
 #![expect(
     clippy::many_single_char_names,
@@ -132,10 +133,14 @@ fn blend_image(
             let tx = tx.min(image.width - 1);
             let t = image.texels[ty * image.width + tx];
             let p = &mut pixels[y * width + x];
-            let base = [p[0], p[1], p[2]];
-            let blended = blend(mode, base, [t[0], t[1], t[2]]);
+            let alpha = p[3];
+            if alpha <= 0.0 {
+                continue;
+            }
+            let colour = [p[0] / alpha, p[1] / alpha, p[2] / alpha];
+            let blended = blend(mode, colour, [t[0], t[1], t[2]]);
             for c in 0..3 {
-                p[c] = base[c] + (blended[c] - base[c]) * amount;
+                p[c] = (colour[c] * (1.0 - amount) + blended[c] * amount) * alpha;
             }
         }
     }
@@ -282,6 +287,42 @@ mod tests {
             for c in 0..3 {
                 assert!((back[c] - rgb[c]).abs() < 1e-12, "{rgb:?} -> {back:?}");
             }
+        }
+    }
+
+    #[test]
+    fn image_blend_unpremultiplies_and_preserves_transparent_pixels() {
+        let alpha = 1.0e-8;
+        let colour = [0.6, 0.1, 0.1];
+        let image = Texels {
+            width: 1,
+            height: 1,
+            texels: vec![[240.0 / 255.0, 36.0 / 255.0, 48.0 / 255.0, 1.0]],
+        };
+        let mut pixels = [
+            [0.0; 4],
+            [colour[0], colour[1], colour[2], 1.0],
+            [
+                colour[0] * alpha,
+                colour[1] * alpha,
+                colour[2] * alpha,
+                alpha,
+            ],
+        ];
+
+        blend_image(&image, 1.0, FilterBlend::Luminosity, &mut pixels, 3, 1);
+
+        assert_eq!(pixels[0], [0.0; 4]);
+        assert_eq!(pixels[1][3], 1.0);
+        assert_eq!(pixels[2][3], alpha);
+        for (channel, full) in pixels[1][..3].iter().enumerate() {
+            let expected = *full * alpha;
+            let tolerance = expected.abs() * 1.0e-12 + 1.0e-20;
+            assert!(
+                (pixels[2][channel] - expected).abs() <= tolerance,
+                "channel {channel}: expected {expected}, got {}",
+                pixels[2][channel]
+            );
         }
     }
 }

@@ -16,7 +16,7 @@ use crate::ShaderId;
 use crate::backend::Backend;
 use crate::error::ResourceError;
 use crate::image::Format;
-use crate::message::{LayerId, SurfaceId};
+use crate::message::{BackdropId, LayerId, SurfaceId};
 use crate::style::FilterId;
 
 /// The backend draws user WGSL shader paints.
@@ -106,13 +106,50 @@ pub trait ExternalFrames: Backend {
 /// [`ImageData<F>`](crate::ImageData).
 pub trait Uploads<F: Format>: Backend {}
 
-/// The backend samples the backdrop behind a layer.
+/// A filtrate chain a backdrop group can run, with its footprint bound.
 ///
-/// The `surface.backdrop_group` / `tx[&l].backdrop` API lands with the
-/// first backend implementing this trait; [`BackdropId`](crate::BackdropId)
-/// and the [`LayerNode::backdrop`](crate::LayerNode::backdrop) field exist
-/// already.
-pub trait Backdrop: Backend {}
+/// Spatial chains report their own footprint; colour chains read no
+/// neighbour texels and report [`Footprint::ZERO`](filtrate_core::Footprint::ZERO).
+pub trait BackdropChain<K: filtrate_core::kind::Kind>: filtrate_core::Filter<Kind = K> {
+    /// The chain's footprint for `params` (see
+    /// [`SpatialFilter::footprint_of`](filtrate_core::SpatialFilter::footprint_of)).
+    fn footprint_bound(params: &Self::Params) -> filtrate_core::Footprint;
+}
+
+impl<F: filtrate_core::SpatialFilter> BackdropChain<filtrate_core::kind::Spatial> for F {
+    fn footprint_bound(params: &Self::Params) -> filtrate_core::Footprint {
+        F::footprint_of(params)
+    }
+}
+
+impl<F: filtrate_core::Filter<Kind = filtrate_core::kind::Color>>
+    BackdropChain<filtrate_core::kind::Color> for F
+{
+    fn footprint_bound(_params: &Self::Params) -> filtrate_core::Footprint {
+        filtrate_core::Footprint::ZERO
+    }
+}
+
+/// The backend captures and samples backdrops (`Surface::backdrop_group`,
+/// `LayerEdit::backdrop`).
+pub trait Backdrop: Filters {
+    /// Registers backdrop group `id` on `surface` with no filter chain.
+    fn add_backdrop_group(r: &mut Self::Renderer, surface: SurfaceId, id: BackdropId);
+
+    /// Registers backdrop group `id` on `surface` whose capture runs
+    /// through `filter`.
+    fn add_filtered_backdrop_group<K, F>(
+        r: &mut Self::Renderer,
+        surface: SurfaceId,
+        id: BackdropId,
+        filter: F,
+    ) where
+        K: filtrate_core::kind::Kind,
+        F: BackdropChain<K> + crate::RenderTransfer;
+
+    /// Unregisters a backdrop group; frames that still sample it fail.
+    fn remove_backdrop_group(r: &mut Self::Renderer, surface: SurfaceId, id: BackdropId);
+}
 
 /// The backend produces HDR output.
 pub trait HdrOutput: Backend {}

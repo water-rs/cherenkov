@@ -457,6 +457,8 @@ impl VelloRenderer {
                         .sum::<u64>(),
             ),
             cpu: cherenkov::Bytes(0),
+            backdrop_captures: cherenkov::Bytes(0),
+            backdrop_capture_format: None,
         }
     }
 

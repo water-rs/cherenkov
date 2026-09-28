@@ -758,7 +758,7 @@ fn register_fonts(
                         ResourceError::Unsupported("color-font") => BenchError::Unsupported {
                             engine: Cherenkov::NAME,
                             feature: Feature::Glyphs,
-                            api: Some("colour fonts (COLR/CBDT/sbix) are outside the first slice"),
+                            api: Some("bitmap colour fonts (CBDT/sbix) are unsupported"),
                         },
                         e => BenchError::Engine(format!("cherenkov font: {e}")),
                     })?;
@@ -1202,8 +1202,11 @@ impl Engine for Cherenkov {
     fn counters(&self) -> Counters {
         let mut counters = self.counters.clone();
         let stats = self.engine.stats();
+        let memory = self.engine.memory();
         counters.dispatches = Some(stats.draws);
         counters.passes = Some(stats.passes);
+        counters.memory_gpu_bytes = Some(memory.gpu.0);
+        counters.memory_cpu_bytes = Some(memory.cpu.0);
         counters
     }
 

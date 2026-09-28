@@ -6,6 +6,8 @@
 //! end's render loop.
 
 mod blend;
+mod colr;
+mod font;
 mod glyph;
 mod image;
 mod mesh;
@@ -46,7 +48,7 @@ struct SurfaceState {
 pub struct RasterRenderer {
     pool: rayon::ThreadPool,
     surfaces: HashMap<SurfaceId, SurfaceState>,
-    fonts: HashMap<u64, FontData>,
+    fonts: HashMap<u64, font::Font>,
     images: HashMap<u64, Arc<CpuImage>>,
     image_budget: u64,
     /// The glyph mask cache, bounded by `Budget::cpu`.
@@ -103,25 +105,24 @@ fn cpu_model() -> Option<String> {
     None
 }
 
-/// Validates font data with `skrifa`, rejecting colour fonts.
+/// Validates font data with `skrifa`, rejecting bitmap-only colour fonts.
 ///
-/// Fonts carrying `COLR`, `CBDT`/`CBLC` or `sbix` outlines are colour
-/// fonts, which this slice cannot rasterize.
-fn validate_font(data: &[u8], index: u32) -> Result<(), ResourceError> {
+/// `COLR` fonts render through the colour-glyph lowering; fonts carrying
+/// `CBDT`/`CBLC` or `sbix` bitmaps without outline glyphs cannot
+/// rasterize.
+fn validate_font(data: &[u8], index: u32) -> Result<bool, ResourceError> {
+    use skrifa::MetadataProvider as _;
     use skrifa::raw::TableProvider as _;
     let font = skrifa::FontRef::from_index(data, index)
         .map_err(|e| ResourceError::Font(format!("{e}")))?;
-    for tag in [
-        skrifa::Tag::new(b"COLR"),
-        skrifa::Tag::new(b"CBDT"),
-        skrifa::Tag::new(b"sbix"),
-        skrifa::Tag::new(b"SVG "),
-    ] {
-        if font.data_for_tag(tag).is_some() {
-            return Err(ResourceError::Unsupported(names::COLOR_FONT));
-        }
+    if font.outline_glyphs().iter().next().is_none()
+        && [skrifa::Tag::new(b"CBDT"), skrifa::Tag::new(b"sbix")]
+            .iter()
+            .any(|tag| font.data_for_tag(*tag).is_some())
+    {
+        return Err(ResourceError::Unsupported(names::COLOR_FONT));
     }
-    Ok(())
+    Ok(font.colr().is_ok())
 }
 
 impl Renderer for RasterRenderer {
@@ -170,8 +171,15 @@ impl Renderer for RasterRenderer {
     }
 
     fn add_font(&mut self, id: FontId, font: FontData) -> Result<(), ResourceError> {
-        validate_font(&font.data, font.index)?;
-        self.fonts.insert(id.raw(), font);
+        let has_colr = validate_font(&font.data, font.index)?;
+        self.fonts.insert(
+            id.raw(),
+            font::Font {
+                data: font,
+                has_colr,
+                colr: std::sync::Mutex::new(HashMap::new()),
+            },
+        );
         Ok(())
     }
 
@@ -321,13 +329,19 @@ impl Renderer for RasterRenderer {
             cpu: cherenkov::Bytes(
                 framebuffers
                     + self.glyph_cache.bytes()
-                    + self.images.values().map(|image| image.bytes()).sum::<u64>(),
+                    + self.images.values().map(|image| image.bytes()).sum::<u64>()
+                    + self.fonts.values().map(font::Font::colr_bytes).sum::<u64>(),
             ),
         }
     }
 
     fn trim(&mut self, pressure: Pressure) {
         if pressure == Pressure::Critical {
+            for font in self.fonts.values_mut() {
+                if let Ok(mut cache) = font.colr.lock() {
+                    cache.clear();
+                }
+            }
             self.fonts.shrink_to_fit();
             self.glyph_cache.clear();
             for surface in self.surfaces.values_mut() {
@@ -423,7 +437,7 @@ impl RasterRenderer {
                         let font = fonts.get(&req.font).ok_or_else(|| {
                             RenderError::Font(format!("unregistered font {}", req.font))
                         })?;
-                        let mask = std::sync::Arc::new(glyph::rasterize_mask(font, req)?);
+                        let mask = std::sync::Arc::new(glyph::rasterize_mask(&font.data, req)?);
                         let _ = req.slot.set(mask.clone());
                         Ok((req.key, mask))
                     })

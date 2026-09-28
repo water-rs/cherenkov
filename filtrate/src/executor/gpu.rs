@@ -65,9 +65,12 @@ impl Image {
 
 /// The intermediate slots for one input size.
 #[derive(Debug)]
-struct Intermediates {
-    size: (u32, u32),
-    views: Vec<wgpu::TextureView>,
+pub(super) struct Intermediates {
+    pub(super) size: (u32, u32),
+    /// The frame sequence that last encoded through these slots; sizes a
+    /// frame does not use are dropped rather than retained.
+    pub(super) last_used: u64,
+    pub(super) views: Vec<wgpu::TextureView>,
 }
 
 /// Bindings every pass may read.
@@ -91,7 +94,7 @@ pub(super) struct Gpu {
     shared: Shared,
     /// Intermediate slots per input size, capped; a frame can encode one
     /// effect against several sizes (backdrop capture regions).
-    intermediates: Vec<Intermediates>,
+    pub(super) intermediates: Vec<Intermediates>,
     input_format: wgpu::TextureFormat,
     output_format: wgpu::TextureFormat,
 }
@@ -256,6 +259,18 @@ impl Gpu {
                 shape_view(input, shape)?;
             }
         }
+        let sequence = input.timing.sequence();
+        // A used size is live this frame: mark it before stale sizes are
+        // dropped so steady state reuses its slots.
+        if let Some(index) = self
+            .intermediates
+            .iter()
+            .position(|intermediates| intermediates.size == size)
+        {
+            self.intermediates[index].last_used = sequence;
+        }
+        self.intermediates
+            .retain(|intermediates| intermediates.last_used >= sequence);
         let intermediates_index = self
             .intermediates
             .iter()
@@ -265,8 +280,12 @@ impl Gpu {
                 if self.intermediates.len() == MAX_INTERMEDIATE_SETS {
                     self.intermediates.remove(0);
                 }
-                self.intermediates
-                    .push(Intermediates::new(input.device, size, self.slot_count));
+                self.intermediates.push(Intermediates::new(
+                    input.device,
+                    size,
+                    self.slot_count,
+                    sequence,
+                ));
                 self.intermediates.len() - 1
             });
 
@@ -591,9 +610,10 @@ fn assign_slots(passes: &[PassPlan]) -> (Vec<usize>, usize) {
 }
 
 impl Intermediates {
-    fn new(device: &wgpu::Device, size: (u32, u32), count: usize) -> Self {
+    fn new(device: &wgpu::Device, size: (u32, u32), count: usize, last_used: u64) -> Self {
         Self {
             size,
+            last_used,
             views: (0..count)
                 .map(|_| {
                     intermediate_texture(device, size)

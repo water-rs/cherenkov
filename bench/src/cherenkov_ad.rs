@@ -471,9 +471,6 @@ pub struct Cherenkov {
     /// The backdrop groups created in `prepare`, alive while the surface
     /// is (dropping one fails frames that still sample it).
     backdrop_groups: HashMap<u32, cherenkov::BackdropGroup>,
-    /// The rim-light shader registered when a prepared scene used one;
-    /// kept alive for the effect handles that sample it.
-    rim_light: Option<cherenkov::BackdropShader>,
     /// Whether any content layer carries live items.
     has_live: bool,
     /// Encode frames since `prepare` (`frames[n % len]` for live items).
@@ -798,7 +795,10 @@ fn unsupported_feature(u: &str) -> Feature {
         "glyph-stroke" | "color-font" => Feature::Glyphs,
         "glyph-transform" => Feature::GlyphTransform,
         "shadow" => Feature::Shadow,
-        "backdrop-unclipped" | "backdrop-footprint" => Feature::Backdrop,
+        "backdrop-unclipped"
+        | "backdrop-footprint"
+        | "backdrop-effect-sdf-path"
+        | "backdrop-shader" => Feature::Backdrop,
         _ => Feature::Fill,
     }
 }
@@ -1427,7 +1427,6 @@ fn build_layer(
     parent: Option<&GpuLayer>,
     prep: PrepLayer,
     groups: &HashMap<u32, cherenkov::BackdropGroup>,
-    rim_light: Option<&cherenkov::BackdropShader>,
     content_layers: &mut Vec<ContentLayer>,
     filter_handles: &mut Vec<cherenkov::Filter>,
 ) {
@@ -1466,17 +1465,12 @@ fn build_layer(
                             strength: *strength as f32,
                         }
                         .into(),
-                        S::RimLight { width, color, gain } => rim_light
-                            .expect("prepare registers the rim shader for RimLight specs")
-                            .effect(vec![
-                                *width as f32,
-                                color[0] as f32,
-                                color[1] as f32,
-                                color[2] as f32,
-                                color[3] as f32,
-                                *gain as f32,
-                            ])
-                            .into(),
+                        S::RimLight { width, color, gain } => cherenkov::Rim {
+                            width: *width as f32,
+                            color: color.map(|v| v as f32),
+                            gain: *gain as f32,
+                        }
+                        .into(),
                     };
                     edit.backdrop(group.sample_with(effect));
                 }
@@ -1505,7 +1499,6 @@ fn build_layer(
                     Some(layer),
                     *p,
                     groups,
-                    rim_light,
                     content_layers,
                     filter_handles,
                 );
@@ -1522,41 +1515,6 @@ fn build_layer(
         motion: prep.motion,
     });
 }
-
-/// Whether the prepared tree carries a `RimLight` spec (which compiles the
-/// rim shader once per adapter).
-fn has_rim(prep: &PrepLayer) -> bool {
-    matches!(
-        prep.backdrop_effect,
-        Some(BackdropEffectSpec::RimLight { .. })
-    ) || prep
-        .items
-        .iter()
-        .any(|i| matches!(i, PrepItem::Layer(p) if has_rim(p)))
-}
-
-/// The rim-light effect shader, registered once per adapter for scenes
-/// that declare `BackdropEffectSpec::RimLight`. `params[0]` is `(width, r,
-/// g, b)` and `params[1]` `(a, gain)`; the rim is an additive term on the
-/// sampled colour (alpha unchanged — gaining alpha would cancel under
-/// src-over), exactly the oracle's `RimLight` formula.
-const RIM_LIGHT_WGSL: &str = "
-fn backdrop_effect(
-    p: vec2<f32>,
-    sdf: f32,
-    normal: vec2<f32>,
-    size: vec2<f32>,
-    params: array<vec4<f32>, 16>,
-) -> vec4<f32> {
-    let width = params[0].x;
-    let color = vec4<f32>(params[0].yzw, params[1].x);
-    let gain = params[1].y;
-    let t = clamp(1.0 + sdf / width, 0.0, 1.0);
-    let k = color.a * gain * t * t;
-    let c = backdrop_sample(p);
-    return vec4<f32>(c.rgb + color.rgb * k, c.a);
-}
-";
 
 /// Creates the engine backdrop group for a scene group. The chain type is
 /// static, so the combinations this adapter builds are a blur alone, a
@@ -1663,7 +1621,6 @@ impl Cherenkov {
             filter_handles: Vec::new(),
             content_layers: Vec::new(),
             backdrop_groups: HashMap::new(),
-            rim_light: None,
             has_motion: false,
             motion_committed: false,
             has_live: false,
@@ -1772,13 +1729,6 @@ impl Engine for Cherenkov {
         }
         let mut content_layers = Vec::new();
         let mut filter_handles = Vec::new();
-        if has_rim(&prep) && self.rim_light.is_none() {
-            self.rim_light = Some(
-                self.engine
-                    .backdrop_shader(cherenkov::BackdropShaderSource::wgsl(RIM_LIGHT_WGSL))
-                    .map_err(|e| BenchError::Gpu(format!("cherenkov backdrop shader: {e}")))?,
-            );
-        }
         surface.update(|tx| {
             build_layer(
                 &surface,
@@ -1786,7 +1736,6 @@ impl Engine for Cherenkov {
                 None,
                 prep,
                 &backdrop_groups,
-                self.rim_light.as_ref(),
                 &mut content_layers,
                 &mut filter_handles,
             );

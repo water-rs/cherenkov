@@ -69,6 +69,9 @@ use skia_safe::{
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use crate::GpuSample;
 use crate::convert::{self, Blobs};
+use crate::memory::{AdapterMemory, Reading};
+#[cfg(all(feature = "skia", any(target_os = "linux", target_os = "android")))]
+use crate::memory::{ash_vk_memory_budget, skia_budget};
 use crate::{BenchError, Counters, DeviceInfo, EncodeInput, Engine, EngineInfo, Submit};
 
 /// Features the Skia adapter executes faithfully on its `RGBAF16`
@@ -947,6 +950,15 @@ impl Engine for SkiaCpu {
             ..DeviceInfo::default()
         }
     }
+
+    fn memory(&self) -> AdapterMemory {
+        AdapterMemory {
+            engine: Reading::unavailable("Skia raster does not expose engine memory"),
+            wgpu_allocator: Reading::unavailable("Skia raster has no wgpu allocator"),
+            skia_budgeted: Reading::unavailable("Skia raster has no budgeted GPU resources"),
+            vk_memory_budget: Reading::unavailable("Skia raster has no Vulkan device"),
+        }
+    }
 }
 
 /// `skia-vulkan`: Ganesh Vulkan adapter (Linux and Android only).
@@ -955,6 +967,8 @@ pub struct SkiaVk {
     info: EngineInfo,
     dctx: skia_safe::gpu::DirectContext,
     _bctx: skia_safe::gpu::vk::BackendContext<'static>,
+    vk_instance: &'static ash::Instance,
+    vk_physical_device: ash::vk::PhysicalDevice,
     /// Raw device handle for our own timestamp submissions.
     vk_dev: &'static ash::Device,
     /// The queue Skia submits on — the timestamps must run on it too.
@@ -1133,6 +1147,8 @@ impl SkiaVk {
             },
             dctx,
             _bctx: bctx,
+            vk_instance: instance,
+            vk_physical_device: pd,
             vk_dev: device,
             vk_queue: queue,
             vk_ts,
@@ -1329,6 +1345,19 @@ impl Engine for SkiaVk {
             ..DeviceInfo::default()
         }
     }
+
+    fn memory(&self) -> AdapterMemory {
+        AdapterMemory {
+            engine: Reading::unavailable("Skia Ganesh does not expose engine memory"),
+            wgpu_allocator: Reading::unavailable("Skia Vulkan does not use the wgpu allocator"),
+            skia_budgeted: skia_budget("ganesh", self.dctx.resource_cache_usage().resource_bytes),
+            vk_memory_budget: ash_vk_memory_budget(
+                self.vk_instance,
+                self.vk_physical_device,
+                &self.device_name,
+            ),
+        }
+    }
 }
 
 /// `skia-metal`: Skia Graphite on Metal, Apple platforms only.
@@ -1348,6 +1377,7 @@ mod graphite_metal {
     use objc2_metal::{MTLCommandBuffer, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice};
     use skia_safe::gpu::graphite::{self, mtl as gmtl};
     use skia_safe::gpu::{Mipmapped, graphite::surfaces};
+    use skia_safe::wrapper::PointerWrapper;
     use skia_safe::{AlphaType, ColorType, ImageInfo};
 
     use cherenkov_oracle::F32Image;
@@ -1355,6 +1385,7 @@ mod graphite_metal {
 
     use super::{SkiaPrepared, build_cmds, p3_cs, replay, skia_features, skia_missing_api};
     use crate::convert;
+    use crate::memory::{AdapterMemory, Reading, skia_budget};
     use crate::{
         BenchError, Counters, DeviceInfo, EncodeInput, Engine, EngineInfo, GpuSample, Submit,
     };
@@ -1629,6 +1660,19 @@ mod graphite_metal {
                 cpu: crate::cpu_model(),
                 thermal_celsius: crate::thermal_celsius(),
                 ..DeviceInfo::default()
+            }
+        }
+
+        fn memory(&self) -> AdapterMemory {
+            let native: &skia_bindings::skgpu_graphite_Context = PointerWrapper::inner(&self.ctx);
+            AdapterMemory {
+                engine: Reading::unavailable("Skia Graphite does not expose engine memory"),
+                wgpu_allocator: Reading::unavailable("Skia Graphite does not use wgpu"),
+                skia_budgeted: skia_budget("graphite", unsafe {
+                    // SAFETY: the context is alive and currentBudgetedBytes is a const getter.
+                    native.currentBudgetedBytes()
+                }),
+                vk_memory_budget: Reading::unavailable("Skia Graphite uses Metal, not Vulkan"),
             }
         }
     }

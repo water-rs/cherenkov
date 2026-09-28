@@ -22,6 +22,7 @@ use vello_hybrid::{
 };
 
 use crate::convert::{self, Prepared};
+use crate::memory::{AdapterMemory, Reading, wgpu_allocator, wgpu_vk_memory_budget};
 use crate::vello_like::{Lowered, VelloLikeCtx, lower, replay, vello_features, vello_missing_api};
 use crate::wgpu_ctx::{Gpu, Target, drain_and_stamp, readback, resolve_timestamps};
 use crate::{BenchError, Counters, DeviceInfo, EncodeInput, Engine, EngineInfo, GpuSample, Submit};
@@ -353,5 +354,18 @@ impl Engine for VelloHybrid {
 
     fn device(&self) -> DeviceInfo {
         self.gpu.device_info()
+    }
+
+    fn memory(&self) -> AdapterMemory {
+        AdapterMemory {
+            engine: Reading::unavailable("Vello hybrid does not expose engine memory"),
+            wgpu_allocator: wgpu_allocator(&self.gpu.device, self.gpu.info.backend),
+            skia_budgeted: Reading::unavailable("Vello hybrid has no Skia budget"),
+            vk_memory_budget: wgpu_vk_memory_budget(
+                &self.gpu.device,
+                self.gpu.info.backend,
+                &self.gpu.info.name,
+            ),
+        }
     }
 }

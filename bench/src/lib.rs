@@ -40,6 +40,7 @@ pub mod cli;
 pub mod conditions;
 pub mod convert;
 pub mod energy;
+pub mod memory;
 #[cfg(any(
     feature = "cherenkov",
     feature = "cherenkov-cpu",
@@ -80,6 +81,7 @@ use cherenkov_scene::{Feature, Scene, SceneError};
 use serde::Serialize;
 
 use crate::convert::Blobs;
+use crate::memory::AdapterMemory;
 
 #[cfg(unix)]
 pub use cli::cherenkov_bench_run;
@@ -319,6 +321,8 @@ pub trait Engine {
     }
     /// Counters describing what [`Engine::encode`] issued.
     fn counters(&self) -> Counters;
+    /// Memory sources the adapter can report at this point in the run.
+    fn memory(&self) -> AdapterMemory;
     /// Device/thermal metadata.
     fn device(&self) -> DeviceInfo;
 }

@@ -17,6 +17,7 @@
 //!   on the render thread.
 
 mod animation;
+mod backdrop;
 mod backend;
 mod capability;
 mod color;
@@ -51,10 +52,13 @@ pub use crate::animation::{
     Animatable, Animation, Curve, Decay, Lanes, Spring, curve_value, decay_step, settled,
     spring_step,
 };
+pub use crate::backdrop::{
+    BackdropEffect, BackdropShaderEffect, BackdropShaderSource, ColorMatrix, Refraction,
+};
 pub use crate::backend::{Backend, Display, Frame, Redraw, Renderer, SurfaceFrame, SurfaceInfo};
 pub use crate::capability::{
-    Backdrop, BackdropChain, BackdropRuns, Effects, ExternalFrames, Filters, GpuContent, HdrOutput,
-    Planes, Runs, ShaderPaint as ShaderPaintCapability, ShaderSource, Uploads,
+    Backdrop, BackdropChain, BackdropRuns, BackdropShaders, Effects, ExternalFrames, Filters,
+    GpuContent, HdrOutput, Planes, Runs, ShaderPaint as ShaderPaintCapability, ShaderSource, Uploads,
 };
 pub use crate::color::{
     Color, ColorSpace, DisplayP3, DynColor, LinearDisplayP3, LinearSrgb, Rec2020, Srgb,
@@ -75,14 +79,18 @@ pub use crate::image::{
     Astc4x4, Bc7, Etc2Rgba, Format, ImageColorSpace, ImageData, ImageFormat, ImageUpload, Rgba8,
     Rgba16F,
 };
-pub use crate::message::{BackdropId, ContentOp, FontData, LayerId, Prop, SurfaceId};
+pub use crate::message::{
+    BackdropId, BackdropShaderId, ContentOp, FontData, LayerId, Prop, SurfaceId,
+};
 pub use crate::paint::{
     ColorStop, Extend, ImageId, ImagePattern, Interpolation, LinearGradient,
     MeshColorInterpolation, MeshGradient, MeshGradientError, Paint, RadialGradient, Sampling,
     ShaderId, ShaderPaint, SweepGradient, TransformedPaint,
 };
 pub use crate::record::{Content, ContentChange, Draw, Fixed, Live, Recorder, StaticRecorder};
-pub use crate::resource::{BackdropGroup, BackdropSample, Filter, Font, FontSource, Image, Shader};
+pub use crate::resource::{
+    BackdropGroup, BackdropSample, BackdropShader, Filter, Font, FontSource, Image, Shader,
+};
 pub use crate::shape::{
     ContinuousRect, EvenOdd, FillRule, PATH_TOLERANCE, PathRef, Semantic, Shape, ShapeData,
 };

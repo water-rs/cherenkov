@@ -32,6 +32,17 @@ pub const PAINT_IMAGE: u32 = 5;
 pub const PAINT_TRANSFORMED: u32 = 1 << 16;
 /// Bilinear mesh patches in the shared paint buffer.
 pub const PAINT_MESH: u32 = 6;
+/// A backdrop member composite with a per-member effect: bilinear sample
+/// of the bound capture, then the effect from `meta[3]`'s low bits.
+pub const PAINT_BACKDROP: u32 = 7;
+
+/// Effect kinds packed into `meta[3]`'s low byte of a `PAINT_BACKDROP`
+/// instance (`param stop count << 8`, flags still `<< 24`).
+pub const EFFECT_COLOR: u32 = 1;
+/// [`EFFECT_COLOR`]'s sibling: displace the sample along the edge normal.
+pub const EFFECT_REFRACTION: u32 = 2;
+/// A registered backdrop effect shader.
+pub const EFFECT_SHADER: u32 = 3;
 /// Smooth colour weights; low 16 bits still identify the mesh paint kind.
 pub const PAINT_MESH_SMOOTH: u32 = 1 << 17;
 
@@ -160,7 +171,9 @@ pub struct Instance {
     /// `[kind, paint, first_stop, count | interp<<16 | extend<<20 | flags<<24]`.
     /// For `PAINT_IMAGE`: `extend_x | extend_y<<4 | sampling<<8 | flags<<24`
     /// (`sampling`: 0 nearest, 1 bilinear). For a blended `PAINT_TEXTURE`
-    /// composite: `blend_code<<16 | flags<<24`.
+    /// composite: `blend_code<<16 | flags<<24` (the low 16 bits are free
+    /// there). For `PAINT_BACKDROP`: `effect_kind | stop_count<<8 |
+    /// flags<<24`.
     pub meta: [u32; 4],
 }
 

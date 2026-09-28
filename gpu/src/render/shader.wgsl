@@ -407,6 +407,79 @@ fn paint(i: u32, meta_: vec4<u32>, color: vec4<f32>, local: vec2<f32>, pixel: ve
     }
 }
 
+// Per-member backdrop effects: a member composite bilinearly samples the
+// bound capture and applies the effect packed in meta_.w's low bits.
+// `backdrop_origin`/`backdrop_size` are set per instance by
+// paint_backdrop; registered effect shaders call backdrop_sample.
+var<private> backdrop_origin: vec2<f32>;
+var<private> backdrop_size: vec2<f32>;
+
+// Bilinear sample of the bound capture at device point `q`: the four
+// texels around `q - 0.5` (texel centres), clamped to the capture
+// region, values unclamped.
+fn backdrop_sample(q: vec2<f32>) -> vec4<f32> {
+    let f = clamp(q - backdrop_origin - 0.5, vec2<f32>(0.0), backdrop_size - 1.0);
+    let lo = vec2<i32>(floor(f));
+    let hi = min(lo + 1, vec2<i32>(backdrop_size) - 1);
+    let t = f - floor(f);
+    let c00 = textureLoad(source, lo, 0);
+    let c10 = textureLoad(source, vec2<i32>(hi.x, lo.y), 0);
+    let c01 = textureLoad(source, vec2<i32>(lo.x, hi.y), 0);
+    let c11 = textureLoad(source, hi, 0);
+    return mix(mix(c00, c10, t.x), mix(c01, c11, t.x), t.y);
+}
+
+// backdrop-effect-stub
+fn backdrop_effect(p: vec2<f32>, sdf: f32, normal: vec2<f32>, size: vec2<f32>, params: array<vec4<f32>, 16>) -> vec4<f32> {
+    return backdrop_sample(p);
+}
+// backdrop-effect-stub
+
+// The member composite for a PAINT_BACKDROP instance: the effect in
+// meta_.w's low bits (`kind | stop count << 8`) evaluated at the device
+// pixel centre `pixel`. grad.xy is the capture origin, grad2.xy its
+// size, grad2.zw the member's device size.
+fn paint_backdrop(i: u32, pixel: vec2<f32>) -> vec4<f32> {
+    let inst = instances[i];
+    backdrop_origin = inst.grad.xy;
+    backdrop_size = inst.grad2.xy;
+    let kind = inst.meta_.w & 0xffu;
+    let first = inst.meta_.z;
+    if kind == EFFECT_COLOR {
+        // 3x4 premultiplied matrix, filtrate ColorMatrix layout:
+        // dot(row, c) per channel, alpha passes through.
+        let c = backdrop_sample(pixel);
+        return vec4<f32>(
+            dot(stops[first].color, c),
+            dot(stops[first + 1u].color, c),
+            dot(stops[first + 2u].color, c),
+            c.a,
+        );
+    }
+    // Refraction and effect shaders need the member clip's SDF: signed
+    // distance and unit outward normal in device space, the same
+    // J^-T math the clip coverage block uses.
+    let pc = apply(inst.clip_inv, pixel);
+    let g = sdf_grad(inst.clip, pc);
+    let ci = inst.clip_inv;
+    let dg = vec2<f32>(ci[0].x * g.x + ci[0].y * g.y, ci[0].z * g.x + ci[0].w * g.y);
+    let len = max(length(dg), 1e-6);
+    let d = sdf(inst.clip, pc) / len;
+    let n = dg / len;
+    if kind == EFFECT_REFRACTION {
+        // stops[first].color.xy = (depth, strength).
+        let p0 = stops[first].color;
+        let t = clamp(1.0 + d / p0.x, 0.0, 1.0);
+        return backdrop_sample(pixel - n * p0.y * t * t);
+    }
+    var params = array<vec4<f32>, 16>();
+    let count = (inst.meta_.w >> 8u) & 0xffu;
+    for (var j = 0u; j < count; j = j + 1u) {
+        params[j] = stops[first + j].color;
+    }
+    return backdrop_effect(pixel, d, n, inst.grad2.zw, params);
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     if VARIANT == VARIANT_SIMPLE {
@@ -524,6 +597,9 @@ fn fs_full(in: VsOut) -> vec4<f32> {
             let cb = textureLoad(backdrop, coord, 0);
             return blend_color(mode, cb, cs);
         }
+    }
+    if in.meta_.y == PAINT_BACKDROP {
+        return paint_backdrop(i, in.pixel) * cov;
     }
     return paint(i, in.meta_, in.color, in.local, in.pixel) * cov;
 }

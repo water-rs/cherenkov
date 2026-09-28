@@ -47,6 +47,7 @@ pub struct Engine<B: Backend> {
     next_image: Cell<u64>,
     next_shader: Cell<u64>,
     next_filter: Cell<u64>,
+    next_backdrop_shader: Cell<u64>,
     /// The type-erased `Message::Resource` sender resource drops use.
     release: Rc<dyn Fn(ResOp<B>)>,
     waker: Rc<Waker>,
@@ -113,6 +114,7 @@ impl<B: Backend> Engine<B> {
             next_image: Cell::new(1),
             next_shader: Cell::new(1),
             next_filter: Cell::new(1),
+            next_backdrop_shader: Cell::new(1),
             release: Rc::new(move |op: ResOp<B>| {
                 let _ = release_tx.send(Message::Resource(op));
             }),
@@ -462,6 +464,46 @@ impl<B: ShaderPaint> Engine<B> {
             }
             Err(_) => Err(ResourceError::Lost),
         }
+    }
+}
+
+impl<B: crate::BackdropShaders> Engine<B> {
+    /// Registers a backdrop effect shader, awaiting browser compilation
+    /// and validation.
+    ///
+    /// # Errors
+    /// [`ResourceError::Shader`] when the source fails validation, its
+    /// `reach` is not a finite non-negative number, or pipeline creation
+    /// fails; [`ResourceError::Lost`] when the render thread is gone.
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
+    pub async fn backdrop_shader(
+        &self,
+        source: crate::BackdropShaderSource,
+    ) -> Result<crate::BackdropShader, ResourceError> {
+        if !(source.reach.is_finite() && source.reach >= 0.0) {
+            return Err(ResourceError::Shader(
+                "backdrop shader reach must be a finite non-negative number".into(),
+            ));
+        }
+        let id = crate::BackdropShaderId::new(Self::alloc(&self.next_backdrop_shader));
+        let reach = source.reach;
+        let (reply, rx) = crate::local::channel();
+        self.tx
+            .send(Message::AsyncResource(Box::new(move |r| {
+                Box::pin(async move {
+                    let _ = reply.send(B::add_backdrop_shader(r, id, source).await);
+                })
+            })))
+            .map_err(|_| ResourceError::Lost)?;
+        rx.recv().await.map_err(|_| ResourceError::Lost)??;
+        Ok(crate::BackdropShader::new(
+            id,
+            reach,
+            self.on_drop(move |r| B::remove_backdrop_shader(r, id)),
+        ))
     }
 }
 

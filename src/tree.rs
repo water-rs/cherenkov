@@ -49,8 +49,9 @@ pub struct LayerNode {
     pub blend: BlendMode,
     /// The filter applied to this layer's subtree.
     pub filter: Option<FilterId>,
-    /// The backdrop group this layer samples.
-    pub backdrop: Option<BackdropId>,
+    /// The backdrop group (and optional per-member effect) this layer
+    /// samples.
+    pub backdrop: Option<crate::BackdropSample>,
     /// The child layers, in paint order.
     pub children: Vec<LayerId>,
     /// Counts direct children that blend; each such child isolates itself so

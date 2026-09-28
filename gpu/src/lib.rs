@@ -28,6 +28,10 @@ mod render;
 
 /// The allocation-event diagnostic sink (issue #169).
 pub use render::diag;
+/// The registered-effect module text the renderer compiles; exposed for
+/// `tests/shader.rs`, which translates it through every naga backend.
+#[doc(hidden)]
+pub use render::shaders::backdrop_effect_text;
 
 use std::path::PathBuf;
 
@@ -374,5 +378,30 @@ where
                 std::marker::PhantomData,
             ))),
         );
+    }
+}
+impl cherenkov::BackdropShaders for Gpu {
+    #[cfg(not(target_arch = "wasm32"))]
+    fn add_backdrop_shader(
+        r: &mut Self::Renderer,
+        id: cherenkov::BackdropShaderId,
+        source: cherenkov::BackdropShaderSource,
+    ) -> Result<(), cherenkov::ResourceError> {
+        r.add_backdrop_shader(id, &source)
+    }
+    #[cfg(target_arch = "wasm32")]
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
+    async fn add_backdrop_shader(
+        r: &mut Self::Renderer,
+        id: cherenkov::BackdropShaderId,
+        source: cherenkov::BackdropShaderSource,
+    ) -> Result<(), cherenkov::ResourceError> {
+        r.add_backdrop_shader(id, &source).await
+    }
+    fn remove_backdrop_shader(r: &mut Self::Renderer, id: cherenkov::BackdropShaderId) {
+        r.remove_backdrop_shader(id);
     }
 }

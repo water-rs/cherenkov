@@ -94,6 +94,25 @@ impl BackdropId {
     }
 }
 
+/// Identifier of a backdrop effect shader, allocated by
+/// [`Engine::backdrop_shader`](crate::Engine::backdrop_shader).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct BackdropShaderId(u64);
+
+impl BackdropShaderId {
+    /// Creates an identifier from a raw value.
+    #[must_use]
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// The raw value.
+    #[must_use]
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
 /// A font crossing to the render thread.
 #[derive(Clone)]
 pub struct FontData {
@@ -161,8 +180,9 @@ pub enum LayerOp {
     Blend(LayerId, BlendMode),
     /// Set or clear the filter.
     Filter(LayerId, Option<FilterId>),
-    /// Set or clear the backdrop group.
-    Backdrop(LayerId, Option<BackdropId>),
+    /// Set or clear the backdrop sample (group and optional per-member
+    /// effect).
+    Backdrop(LayerId, Option<crate::BackdropSample>),
     /// Set the layer content, or clear it.
     Content(LayerId, Option<ContentOp>),
     /// Append a child.

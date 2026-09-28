@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use cherenkov::kurbo::{Affine, BezPath, PathEl, Point, Rect};
-use cherenkov::{BlendMode, ContinuousRect, FillRule, GlyphRun, GlyphStyle, ShapeData};
+use cherenkov::{BlendMode, FillRule, GlyphRun, GlyphStyle, ShapeData};
 
 use cherenkov::{LayerId, RenderError, SurfaceTree};
 
@@ -175,109 +175,6 @@ fn sigma_max(t: Affine) -> f64 {
     p.midpoint(disc).sqrt()
 }
 
-/// A `ContinuousRect` as a path of Lamé-corner line segments, like the
-/// scene's `ContinuousRect::to_path_at` but with per-corner radii.
-///
-/// Each corner is a quarter Lamé curve `x = r·|cos t|^e`, `y = r·|sin t|^e`
-/// with `e = 2/n` and `n = 2 + 2·smoothing`, recursively bisected in `t`
-/// until within `tolerance` of the chord.
-#[expect(
-    clippy::many_single_char_names,
-    clippy::too_many_arguments,
-    reason = "x/y/r/e/n geometry names, mirroring the scene expansion"
-)]
-fn continuous_path(c: &ContinuousRect, tolerance: f64) -> BezPath {
-    fn emit(
-        centre: Point,
-        r: f64,
-        c: usize,
-        t0: f64,
-        t1: f64,
-        e: f64,
-        tol: f64,
-        path: &mut BezPath,
-        depth: u32,
-    ) {
-        const MAX_DEPTH: u32 = 24;
-        // Point on corner `c`'s Lamé arc at `t ∈ [0, π/2]`.
-        let arc = |t: f64| -> Point {
-            let (s, co) = (r * t.sin().powf(e), r * t.cos().powf(e));
-            let (dx, dy) = match c {
-                0 => (s, -co),  // TR: from (cx, cy-r) to (cx+r, cy)
-                1 => (co, s),   // BR: from (cx+r, cy) to (cx, cy+r)
-                2 => (-s, co),  // BL: from (cx, cy+r) to (cx-r, cy)
-                _ => (-co, -s), // TL: from (cx-r, cy) to (cx, cy-r)
-            };
-            Point::new(centre.x + dx, centre.y + dy)
-        };
-        let (p0, p1) = (arc(t0), arc(t1));
-        let flat = (1..4).all(|k| {
-            let s = f64::from(k) * 0.25;
-            let pm = arc((t1 - t0).mul_add(s, t0));
-            let (cx, cy) = (p0.x + s * (p1.x - p0.x), p0.y + s * (p1.y - p0.y));
-            (pm.x - cx).hypot(pm.y - cy) <= tol
-        });
-        if flat || depth >= MAX_DEPTH {
-            path.line_to(p1);
-        } else {
-            let tm = (t1 - t0).mul_add(0.5, t0);
-            emit(centre, r, c, t0, tm, e, tol, path, depth + 1);
-            emit(centre, r, c, tm, t1, e, tol, path, depth + 1);
-        }
-    }
-
-    let n = 2.0f64.mul_add(c.smoothing.clamp(0.0, 1.0), 2.0);
-    let e = 2.0 / n;
-    let (rect, radii) = (c.rect, c.radii);
-    let half_w = rect.width() / 2.0;
-    let half_h = rect.height() / 2.0;
-    let r = [
-        radii.top_right.clamp(0.0, half_w.min(half_h)),
-        radii.bottom_right.clamp(0.0, half_w.min(half_h)),
-        radii.bottom_left.clamp(0.0, half_w.min(half_h)),
-        radii.top_left.clamp(0.0, half_w.min(half_h)),
-    ];
-    let Rect { x0, y0, x1, y1 } = rect;
-    // Corner centres in order top-right, bottom-right, bottom-left,
-    // top-left; a zero radius still emits its corner point, matching the
-    // scene's degenerate-radius behaviour.
-    let corners = [
-        (x1 - r[0], y0 + r[0]),
-        (x1 - r[1], y1 - r[1]),
-        (x0 + r[2], y1 - r[2]),
-        (x0 + r[3], y0 + r[3]),
-    ];
-    let mut path = BezPath::new();
-    path.move_to((x0 + r[3], y0));
-    for (c, &(cx, cy)) in corners.iter().enumerate() {
-        let centre = Point::new(cx, cy);
-        emit(
-            centre,
-            r[c],
-            c,
-            0.0,
-            std::f64::consts::FRAC_PI_2,
-            e,
-            tolerance,
-            &mut path,
-            0,
-        );
-        // Straight edge to the next corner's start.
-        let next = (c + 1) % 4;
-        let (nx, ny) = corners[next];
-        let rn = r[next];
-        let p = match next {
-            0 => Point::new(nx, ny - rn),
-            1 => Point::new(nx + rn, ny),
-            2 => Point::new(nx, ny + rn),
-            _ => Point::new(nx - rn, ny),
-        };
-        path.line_to(p);
-    }
-    path.close_path();
-    path
-}
-
 /// A `ShapeData` as a kurbo path in content space, plus its fill rule.
 /// `Line` fills draw nothing.
 fn shape_path(shape: &ShapeData, tol: f64) -> Option<(BezPath, FillRule)> {
@@ -285,7 +182,7 @@ fn shape_path(shape: &ShapeData, tol: f64) -> Option<(BezPath, FillRule)> {
     match shape {
         ShapeData::Rect(r) => Some((r.to_path(tol), FillRule::NonZero)),
         ShapeData::RoundedRect(r) => Some((r.to_path(tol), FillRule::NonZero)),
-        ShapeData::Continuous(c) => Some((continuous_path(c, tol), FillRule::NonZero)),
+        ShapeData::Continuous(c) => Some((c.to_path(tol), FillRule::NonZero)),
         ShapeData::Circle(c) => Some((c.to_path(tol), FillRule::NonZero)),
         ShapeData::Ellipse(e) => Some((e.to_path(tol), FillRule::NonZero)),
         ShapeData::Line(_) => None,

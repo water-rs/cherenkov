@@ -74,10 +74,13 @@ pub fn run<B: Backend>(
                 }
             }
             Message::DestroySurface { id } => {
-                if surfaces.remove(&id).is_none() {
+                if surfaces.remove(&id).is_some() {
+                    renderer.destroy_surface(id);
+                } else {
+                    // Nothing was committed — a dropped `Engine::surface`
+                    // future whose create failed may still send this (#150).
                     tracing::trace!(surface = id.raw(), "destroy of unknown surface");
                 }
-                renderer.destroy_surface(id);
             }
             Message::Display { id, display } => {
                 if let Some(state) = surfaces.get_mut(&id) {
@@ -342,10 +345,13 @@ impl<B: Backend> LocalState<B> {
                 }
             }
             Message::DestroySurface { id } => {
-                if surfaces.remove(&id).is_none() {
+                if surfaces.remove(&id).is_some() {
+                    renderer.destroy_surface(id);
+                } else {
+                    // Nothing was committed — a dropped `Engine::surface`
+                    // future whose create failed may still send this (#150).
                     tracing::trace!(surface = id.raw(), "destroy of unknown surface");
                 }
-                renderer.destroy_surface(id);
             }
             Message::Display { id, display } => {
                 if let Some(state) = surfaces.get_mut(&id) {

@@ -304,13 +304,14 @@ impl Renderer {
             }
             Draw::Image {
                 image,
+                encoding,
                 dst,
                 sampling,
             } => {
                 let (dw, dh) = (dst.x1 - dst.x0, dst.y1 - dst.y0);
                 let coverage =
                     self.shape_coverage(&Shape::Rect(*dst), FillRule::NonZero, tf, clips);
-                let img = resources.image(*image)?.clone();
+                let img = resources.image(*image, *encoding)?.clone();
                 let (w, h) = (canvas.width, canvas.height);
                 for py in 0..h {
                     for px in 0..w {

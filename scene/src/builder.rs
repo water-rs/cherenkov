@@ -192,10 +192,22 @@ impl LayerBuilder<'_> {
         self.push(Draw::Glyphs(run))
     }
 
-    /// Push a [`Draw::Image`] item.
+    /// Push a [`Draw::Image`] item (8-bit sRGB PNG).
     pub fn image(&mut self, image: ResourceHash, dst: Rect, sampling: Sampling) -> &mut Self {
+        self.image_encoded(image, crate::ImageEncoding::default(), dst, sampling)
+    }
+
+    /// Push a [`Draw::Image`] item with an explicit encoding.
+    pub fn image_encoded(
+        &mut self,
+        image: ResourceHash,
+        encoding: crate::ImageEncoding,
+        dst: Rect,
+        sampling: Sampling,
+    ) -> &mut Self {
         self.push(Draw::Image {
             image,
+            encoding,
             dst,
             sampling,
         })

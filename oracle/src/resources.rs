@@ -15,7 +15,7 @@ use crate::image::Image;
 /// Lazily decoded `resources/` blobs for one scene directory.
 pub struct Resources {
     dir: PathBuf,
-    images: HashMap<ResourceHash, Image>,
+    images: HashMap<(ResourceHash, cherenkov_scene::ImageEncoding), Image>,
     fonts: HashMap<ResourceHash, Vec<u8>>,
 }
 
@@ -34,40 +34,84 @@ impl Resources {
         Scene::resource(&self.dir, hash)
     }
 
-    /// The decoded image for `hash`, decoding on first use.
+    /// The decoded image for `hash` under `encoding`, decoding on first use.
     ///
-    /// PNGs carry sRGB data; every colour type is handled by
-    /// [`crate::image::decode_png_rgba8`], then decoded to linear and
-    /// converted linear-sRGB → linear-P3 into the premultiplied `f64`
-    /// working image — the same conversion the bench adapters apply on
-    /// readback.
+    /// `Png` blobs carry encoded 8-bit data (`Srgb` primaries, or `DisplayP3`
+    /// which shares the sRGB transfer function); every PNG colour type is
+    /// handled by [`crate::image::decode_png_rgba8`]. `Rgba16F` blobs are raw
+    /// little-endian half floats, straight alpha, in linear light. sRGB
+    /// primaries then convert to linear Display P3; P3 primaries pass
+    /// through — into the premultiplied `f64` working image.
     ///
     /// # Errors
     /// [`SceneError::MissingResource`] if the blob is absent, [`SceneError::Io`]
-    /// on read or decode failure.
+    /// on read or decode failure, [`SceneError::InvalidImageEncoding`] if the
+    /// blob length does not match the declared `Rgba16F` dimensions.
     /// # Panics
     /// Never — the cache entry was just inserted on the miss path.
-    pub fn image(&mut self, hash: ResourceHash) -> Result<&Image, SceneError> {
-        if !self.images.contains_key(&hash) {
+    pub fn image(
+        &mut self,
+        hash: ResourceHash,
+        encoding: cherenkov_scene::ImageEncoding,
+    ) -> Result<&Image, SceneError> {
+        use cherenkov_scene::{ImageColorSpace, ImageEncoding};
+        let key = (hash, encoding);
+        if !self.images.contains_key(&key) {
             let bytes = self.blob(hash)?;
-            let (width, height, rgba) = crate::image::decode_png_rgba8(&bytes).map_err(|e| {
-                SceneError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    e.to_string(),
-                ))
-            })?;
-            let mut pixels = Vec::with_capacity(width as usize * height as usize);
-            for px in rgba.as_chunks::<4>().0 {
-                let a = f64::from(px[3]) / 255.0;
-                let lin_p3 = linear_srgb_to_linear_p3([
-                    srgb_decode(f64::from(px[0]) / 255.0),
-                    srgb_decode(f64::from(px[1]) / 255.0),
-                    srgb_decode(f64::from(px[2]) / 255.0),
-                ]);
-                pixels.push([a * lin_p3[0], a * lin_p3[1], a * lin_p3[2], a]);
-            }
+            let invalid =
+                |e: String| SceneError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e));
+            let (width, height, pixels) = match encoding {
+                ImageEncoding::Png { color_space } => {
+                    let (width, height, rgba) = crate::image::decode_png_rgba8(&bytes)
+                        .map_err(|e| invalid(e.to_string()))?;
+                    let mut pixels = Vec::with_capacity(width as usize * height as usize);
+                    for px in rgba.as_chunks::<4>().0 {
+                        let a = f64::from(px[3]) / 255.0;
+                        let srgb = [
+                            srgb_decode(f64::from(px[0]) / 255.0),
+                            srgb_decode(f64::from(px[1]) / 255.0),
+                            srgb_decode(f64::from(px[2]) / 255.0),
+                        ];
+                        let lin_p3 = match color_space {
+                            ImageColorSpace::Srgb => linear_srgb_to_linear_p3(srgb),
+                            ImageColorSpace::DisplayP3 => srgb,
+                            _ => return Err(SceneError::InvalidImageEncoding(encoding)),
+                        };
+                        pixels.push([a * lin_p3[0], a * lin_p3[1], a * lin_p3[2], a]);
+                    }
+                    (width, height, pixels)
+                }
+                ImageEncoding::Rgba16F {
+                    width,
+                    height,
+                    color_space,
+                } => {
+                    let expected = width as usize * height as usize * 8;
+                    if bytes.len() != expected {
+                        return Err(invalid(format!(
+                            "rgba16f blob is {} bytes, expected {expected}",
+                            bytes.len()
+                        )));
+                    }
+                    let mut pixels = Vec::with_capacity(width as usize * height as usize);
+                    for texel in bytes.as_chunks::<8>().0 {
+                        let f = |i: usize| {
+                            f64::from(half::f16::from_le_bytes([texel[2 * i], texel[2 * i + 1]]))
+                        };
+                        let a = f(3);
+                        let rgb = [f(0), f(1), f(2)];
+                        let lin_p3 = match color_space {
+                            ImageColorSpace::LinearSrgb => linear_srgb_to_linear_p3(rgb),
+                            ImageColorSpace::LinearP3 => rgb,
+                            _ => return Err(SceneError::InvalidImageEncoding(encoding)),
+                        };
+                        pixels.push([a * lin_p3[0], a * lin_p3[1], a * lin_p3[2], a]);
+                    }
+                    (width, height, pixels)
+                }
+            };
             self.images.insert(
-                hash,
+                key,
                 Image {
                     width: width as usize,
                     height: height as usize,
@@ -75,7 +119,7 @@ impl Resources {
                 },
             );
         }
-        Ok(self.images.get(&hash).unwrap())
+        Ok(self.images.get(&key).unwrap())
     }
 
     /// The font bytes for `hash`, loading on first use.

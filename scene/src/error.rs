@@ -17,6 +17,9 @@ pub enum SceneError {
     /// A referenced resource blob is missing.
     #[error("missing resource {0}")]
     MissingResource(crate::ResourceHash),
+    /// An image's declared encoding cannot decode its bytes.
+    #[error("invalid image encoding {0:?}")]
+    InvalidImageEncoding(crate::ImageEncoding),
     /// The `features` set stored in `scene.json` does not match the features
     /// recomputed from the layer tree.
     #[error("stored features {declared:?} do not match recomputed {computed:?}")]

@@ -769,6 +769,7 @@ fn op(
             image,
             dst,
             sampling: s,
+            ..
         } => Op::Image {
             image: images
                 .get(image)

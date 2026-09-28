@@ -50,7 +50,9 @@ impl CpuImage {
                 } else {
                     encoded
                 };
-                if image.color_space == ImageColorSpace::LinearSrgb {
+                if image.color_space == ImageColorSpace::LinearSrgb
+                    || image.color_space == ImageColorSpace::LinearP3
+                {
                     straight
                 } else if straight <= 0.04045 {
                     straight / 12.92
@@ -58,7 +60,9 @@ impl CpuImage {
                     ((straight + 0.055) / 1.055).powf(2.4)
                 }
             });
-            let working = if image.color_space == ImageColorSpace::DisplayP3 {
+            let working = if image.color_space == ImageColorSpace::DisplayP3
+                || image.color_space == ImageColorSpace::LinearP3
+            {
                 linear
             } else {
                 mul(&XYZ_TO_P3, mul(&SRGB_TO_XYZ, linear))
@@ -114,4 +118,29 @@ const XYZ_TO_P3: [[f64; 3]; 3] = [
 ];
 fn mul(matrix: &[[f64; 3]; 3], value: [f64; 3]) -> [f64; 3] {
     matrix.map(|row| row[2].mul_add(value[2], row[1].mul_add(value[1], row[0] * value[0])))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `LinearP3` upload is the working space already: no transfer
+    /// function and no primaries matrix — the byte value passes through.
+    #[expect(
+        clippy::float_cmp,
+        reason = "255/255 decodes to exactly 1.0 — an exact assertion"
+    )]
+    #[test]
+    fn linear_p3_upload_decodes_as_identity() {
+        let image = ImageUpload {
+            width: 1,
+            height: 1,
+            data: vec![255, 0, 0, 255].into(),
+            color_space: ImageColorSpace::LinearP3,
+            premultiplied: false,
+            format: ImageFormat::Rgba8,
+        };
+        let decoded = CpuImage::decode(&image).expect("decode");
+        assert_eq!(decoded.pixels[0], [1.0, 0.0, 0.0, 1.0]);
+    }
 }

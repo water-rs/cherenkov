@@ -168,7 +168,7 @@ let shader: ShaderPaintHandle = engine.shader_paint(wgsl_source)?; // compiled h
 ```
 
 - **`Image<F>`.** `F` is the storage format: `Rgba8`, `Rgba16F`, `Astc4x4`, `Etc2Rgba`, `Bc7`, and panel formats for `Banded`. Only uncompressed formats have `update(region, pixels)`. Compressed formats are uploaded as-is, and compression is an explicit step (`engine.compress::<Astc4x4>(image)`), never implicit.
-- **Colour metadata.** Every image carries its colour space and optional HDR metadata. Conversion into the working space happens when the image is sampled.
+- **Colour metadata.** Every image carries its colour space and optional HDR metadata. `ImageColorSpace` is `Srgb`, `DisplayP3`, `LinearSrgb` or `LinearP3`; `LinearP3` is the working space and decodes as the identity. Conversion into the working space happens when the image is sampled.
 
 ## Surfaces and output
 

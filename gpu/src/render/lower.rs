@@ -550,6 +550,11 @@ pub struct Lowering<'a> {
     /// `(instance, pending)` pairs whose `uv.zw` are set when the render
     /// thread stores the pending clip mask.
     pub(crate) mask_patches: Vec<(u32, u32)>,
+    /// The open range's bound mask texture key; `None` for the dummy view.
+    /// Kept in sync with `clip` by `set_clip`.
+    mask_key: Option<u64>,
+    /// The current clip's pending mask raster index, if any.
+    mask_pending: Option<u32>,
     /// Atlas writes and cache updates to commit, in lowering order.
     pub(crate) pending: Vec<PendingRaster>,
     pub commands_lowered: u32,
@@ -567,6 +572,8 @@ impl<'a> Lowering<'a> {
             transform: Affine::IDENTITY,
             margin: None,
             clip: None,
+            mask_key: None,
+            mask_pending: None,
             depth: 0,
             glyphs: 0,
             paths: 0,
@@ -672,6 +679,8 @@ impl<'a> Lowering<'a> {
             #[expect(clippy::cast_possible_truncation)]
             seg_start: self.frame.instances.len() as u32,
         });
+        // A masked clip can span passes; the new pass binds its texture.
+        self.set_mask(self.mask_key);
     }
 
     fn finish_pass(&mut self) {
@@ -747,7 +756,29 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// Sets the current clip and the open range's bound mask texture.
+    /// `mask_key`/`mask_pending` derive from the clip, so the per-instance
+    /// path only reads scalars.
+    fn set_clip(&mut self, clip: Option<DeviceClip>) {
+        self.clip = clip;
+        let mask = clip.and_then(|c| c.mask);
+        self.mask_key = match mask {
+            Some(ClipMask::Texture(_, key)) => Some(key),
+            _ => None,
+        };
+        self.mask_pending = match mask {
+            Some(ClipMask::Pending(_, p)) => Some(p),
+            _ => None,
+        };
+        self.set_mask(self.mask_key);
+    }
+
     /// Starts a new draw range when the bound mask texture changes.
+    #[expect(
+        clippy::inline_always,
+        reason = "a compare on the hot push_instance path"
+    )]
+    #[inline(always)]
     fn set_mask(&mut self, mask: Option<u64>) {
         if self.frame.open.as_ref().is_some_and(|o| o.mask != mask) {
             self.end_segment();
@@ -780,14 +811,9 @@ impl<'a> Lowering<'a> {
         reason = "a surface emits far fewer than u32::MAX instances"
     )]
     fn push_instance(&mut self, inst: &Instance) {
-        let mask = self.clip.and_then(|c| c.mask);
         self.set_variant(variant_of(inst));
-        self.set_mask(match mask {
-            Some(ClipMask::Texture(_, key)) => Some(key),
-            _ => None,
-        });
         self.frame.instances.push(*inst);
-        if let Some(ClipMask::Pending(_, pending)) = mask {
+        if let Some(pending) = self.mask_pending {
             self.mask_patches
                 .push((self.frame.instances.len() as u32 - 1, pending));
         }
@@ -828,7 +854,7 @@ impl<'a> Lowering<'a> {
         self.depth += 1;
         let scratch = self.depth - 1;
         let outer_clip = self.clip;
-        self.clip = inner_clip;
+        self.set_clip(inner_clip);
         // Nested isolations split this scratch's open pass into segments;
         // every segment at this depth needs the region.
         let passes_start = self.frame.passes.len();
@@ -837,7 +863,7 @@ impl<'a> Lowering<'a> {
         body(self, glyphs)?;
         self.finish_pass();
         self.depth -= 1;
-        self.clip = outer_clip;
+        self.set_clip(outer_clip);
         let outer_target = if self.depth == 0 {
             Target::Surface
         } else {
@@ -931,7 +957,7 @@ impl<'a> Lowering<'a> {
         self.cell_patches.truncate(patches.0);
         self.mask_patches.truncate(patches.1);
         self.depth = depth;
-        self.clip = clip;
+        self.set_clip(clip);
         self.transform = transform;
         result?;
         Ok(false)
@@ -1122,9 +1148,9 @@ impl<'a> Lowering<'a> {
         }
         match self.clip {
             None => {
-                self.clip = Some(clip);
+                self.set_clip(Some(clip));
                 body(self, glyphs)?;
-                self.clip = None;
+                self.set_clip(None);
                 Ok(())
             }
             // The current clip is masked: only an aligned rect merges
@@ -1133,9 +1159,9 @@ impl<'a> Lowering<'a> {
                 if clip.mask.is_none()
                     && let (Some(cr), Some(dr)) = (cur.aligned_rect, clip.aligned_rect)
                 {
-                    self.clip = Some(merged_rect(cr, dr, cur.mask));
+                    self.set_clip(Some(merged_rect(cr, dr, cur.mask)));
                     body(self, glyphs)?;
-                    self.clip = Some(cur);
+                    self.set_clip(Some(cur));
                     return Ok(());
                 }
                 self.isolate(
@@ -1151,26 +1177,26 @@ impl<'a> Lowering<'a> {
                 // A new masked clip merges with an aligned rect clip (or
                 // attaches to the current clip's analytic shape).
                 (Some(mask), Some(cr), Some(dr)) => {
-                    self.clip = Some(merged_rect(cr, dr, Some(mask)));
+                    self.set_clip(Some(merged_rect(cr, dr, Some(mask))));
                     body(self, glyphs)?;
-                    self.clip = Some(cur);
+                    self.set_clip(Some(cur));
                     Ok(())
                 }
                 (Some(mask), _, _) => {
-                    self.clip = Some(DeviceClip {
+                    self.set_clip(Some(DeviceClip {
                         inv: cur.inv,
                         shape: cur.shape,
                         aligned_rect: cur.aligned_rect,
                         mask: Some(mask),
-                    });
+                    }));
                     body(self, glyphs)?;
-                    self.clip = Some(cur);
+                    self.set_clip(Some(cur));
                     Ok(())
                 }
                 (None, Some(cr), Some(dr)) => {
-                    self.clip = Some(merged_rect(cr, dr, None));
+                    self.set_clip(Some(merged_rect(cr, dr, None)));
                     body(self, glyphs)?;
-                    self.clip = Some(cur);
+                    self.set_clip(Some(cur));
                     Ok(())
                 }
                 _ => self.isolate(
@@ -1421,9 +1447,10 @@ impl<'a> Lowering<'a> {
         self.set_image(None);
         let snapshot = self.frame.snapshot();
         let first_patch = self.cell_patches.len();
-        let clip = self.clip.take();
+        let clip = self.clip;
+        self.set_clip(None);
         let result = self.realize_leaf(op, cover, cache, storage, glyphs, source);
-        self.clip = clip;
+        self.set_clip(clip);
         result?;
         self.frame.restore(snapshot);
         self.cell_patches.truncate(first_patch);
@@ -2084,12 +2111,7 @@ impl<'a> Lowering<'a> {
         if quads.len() == 0 {
             return;
         }
-        let mask = self.clip.and_then(|c| c.mask);
         self.set_variant(variant_of(template));
-        self.set_mask(match mask {
-            Some(ClipMask::Texture(_, key)) => Some(key),
-            _ => None,
-        });
         let first = self.frame.instances.len();
         self.frame.instances.resize(first + quads.len(), *template);
         for (inst, (rect, uv)) in self.frame.instances[first..].iter_mut().zip(quads) {
@@ -2101,7 +2123,7 @@ impl<'a> Lowering<'a> {
             ];
             inst.uv[..2].copy_from_slice(&uv);
         }
-        if let Some(ClipMask::Pending(_, pending)) = mask {
+        if let Some(pending) = self.mask_pending {
             self.mask_patches.extend(
                 (first..self.frame.instances.len())
                     .map(|i| (u32::try_from(i).expect("instance index fits u32"), pending)),

@@ -565,13 +565,14 @@ impl RasterRenderer {
         let clear = [r * a, g * a, b * a, a];
         let pool = &self.pool;
         let peak = std::sync::atomic::AtomicU64::new(0);
+        let has_backdrop = !surf.groups.is_empty();
         let (draws, edges) = match &mut surf.output {
-            Output::F32(fb) => {
-                pool.install(|| raster::render_bands(&items, clear, fb, w, h, Some(&peak)))?
-            }
-            Output::F16(out) => {
-                pool.install(|| raster::render_bands_f16(&items, clear, out, w, h, Some(&peak)))?
-            }
+            Output::F32(fb) => pool.install(|| {
+                raster::render_bands(&items, clear, fb, w, h, Some(&peak), has_backdrop)
+            })?,
+            Output::F16(out) => pool.install(|| {
+                raster::render_bands_f16(&items, clear, out, w, h, Some(&peak), has_backdrop)
+            })?,
             Output::Stream { format, sink, emit } => raster::render_bands_stream(
                 &items,
                 clear,
@@ -580,6 +581,7 @@ impl RasterRenderer {
                 *format,
                 sink.as_mut(),
                 Some(&peak),
+                has_backdrop,
             )?,
         };
         surf.backdrop_capture_peak = peak.load(std::sync::atomic::Ordering::Relaxed);

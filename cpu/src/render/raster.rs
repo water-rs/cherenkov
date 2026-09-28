@@ -468,6 +468,7 @@ fn shade(
     h: usize,
     scratch: &mut Scratch,
     peak: Option<&std::sync::atomic::AtomicU64>,
+    has_backdrop: bool,
 ) -> Result<(), cherenkov::RenderError> {
     let bh = slice.len() / w;
     for (_, capture) in scratch.captures.drain() {
@@ -477,24 +478,28 @@ fn shade(
     slice.fill(clear);
     let surface = (y0, y0 + bh);
     // The top-level captures this band serves (captures inside filter
-    // scopes are handled by the scope's own windowed run).
+    // scopes are handled by the scope's own windowed run). A surface that
+    // used no backdrop group cannot contain a `Capture`, so the scan is
+    // skipped outright.
     let mut captures: Vec<(usize, usize, usize)> = Vec::new();
-    let mut i = 0;
-    while i < items.len() {
-        match &items[i] {
-            Item::PushFilter { end, .. } => {
-                i = usize::try_from(*end).unwrap_or(items.len());
-                continue;
-            }
-            Item::Capture(capture) => {
-                let (kept0, kept1) = kept_rows(&capture.union, capture.reach, surface, h);
-                if kept0 < kept1 {
-                    captures.push((i, kept0, kept1));
+    if has_backdrop {
+        let mut i = 0;
+        while i < items.len() {
+            match &items[i] {
+                Item::PushFilter { end, .. } => {
+                    i = usize::try_from(*end).unwrap_or(items.len());
+                    continue;
                 }
+                Item::Capture(capture) => {
+                    let (kept0, kept1) = kept_rows(&capture.union, capture.reach, surface, h);
+                    if kept0 < kept1 {
+                        captures.push((i, kept0, kept1));
+                    }
+                }
+                _ => {}
             }
-            _ => {}
+            i += 1;
         }
-        i += 1;
     }
     let coverage = std::mem::take(&mut scratch.coverage);
     let result = if let Some(&(last, ..)) = captures.last() {
@@ -659,12 +664,23 @@ pub fn render_bands(
     w: usize,
     h: usize,
     peak: Option<&std::sync::atomic::AtomicU64>,
+    has_backdrop: bool,
 ) -> Result<(u32, u32), cherenkov::RenderError> {
     let stats = stats(items);
     fb.par_chunks_mut(BAND_H * w)
         .enumerate()
         .try_for_each_init(Scratch::new, |scratch, (band, slice)| {
-            shade(items, clear, slice, w, band * BAND_H, h, scratch, peak)
+            shade(
+                items,
+                clear,
+                slice,
+                w,
+                band * BAND_H,
+                h,
+                scratch,
+                peak,
+                has_backdrop,
+            )
         })?;
     Ok(stats)
 }
@@ -678,6 +694,7 @@ pub fn render_bands_f16(
     w: usize,
     h: usize,
     peak: Option<&std::sync::atomic::AtomicU64>,
+    has_backdrop: bool,
 ) -> Result<(u32, u32), cherenkov::RenderError> {
     let stats = stats(items);
     out.par_chunks_mut(BAND_H * w)
@@ -693,6 +710,7 @@ pub fn render_bands_f16(
                 h,
                 scratch,
                 peak,
+                has_backdrop,
             );
             if result.is_ok() {
                 for (dst, src) in out_slice.iter_mut().zip(band_px.iter()) {
@@ -709,6 +727,10 @@ pub fn render_bands_f16(
 /// `sink` in the target's format. No full-frame buffer exists.
 ///
 /// `emit` is the surface's conversion buffer for `LinearF16` output.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the band context travels together"
+)]
 pub fn render_bands_stream(
     items: &[Item],
     clear: [f32; 4],
@@ -717,6 +739,7 @@ pub fn render_bands_stream(
     format: OffscreenFormat,
     sink: &mut dyn FnMut(BandOut<'_>),
     peak: Option<&std::sync::atomic::AtomicU64>,
+    has_backdrop: bool,
 ) -> Result<(u32, u32), cherenkov::RenderError> {
     let stats = stats(items);
     let (w, h) = size;
@@ -734,6 +757,7 @@ pub fn render_bands_stream(
             h,
             &mut scratch,
             peak,
+            has_backdrop,
         ) {
             scratch.buffers.give_color(band_px);
             return Err(error);

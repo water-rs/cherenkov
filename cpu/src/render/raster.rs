@@ -486,8 +486,8 @@ fn shade(
                 i = usize::try_from(*end).unwrap_or(items.len());
                 continue;
             }
-            Item::Capture { union, reach, .. } => {
-                let (kept0, kept1) = kept_rows(union, *reach, surface, h);
+            Item::Capture(capture) => {
+                let (kept0, kept1) = kept_rows(&capture.union, capture.reach, surface, h);
                 if kept0 < kept1 {
                     captures.push((i, kept0, kept1));
                 }
@@ -583,11 +583,11 @@ fn shade_windowed(
     let mut win0 = y0;
     let mut win1 = y1;
     for &(item, kept0, kept1) in captures {
-        let Item::Capture { apron, .. } = &items[item] else {
+        let Item::Capture(capture) = &items[item] else {
             unreachable!("scanned item kind");
         };
-        win0 = win0.min(kept0.saturating_sub(*apron));
-        win1 = win1.max(kept1.saturating_add(*apron));
+        win0 = win0.min(kept0.saturating_sub(capture.apron));
+        win1 = win1.max(kept1.saturating_add(capture.apron));
     }
     let win1 = win1.min(h);
     let rows = win1 - win0;
@@ -871,27 +871,19 @@ fn run(
                     "unpaired filter scope".into(),
                 ));
             }
-            Item::Capture {
-                group,
-                region,
-                union,
-                apron,
-                reach,
-                filter,
-                flatten,
-            } => {
-                let (kept0, kept1) = kept_rows(union, *reach, ctx.surface, h);
+            Item::Capture(capture) => {
+                let (kept0, kept1) = kept_rows(&capture.union, capture.reach, ctx.surface, h);
                 if kept0 < kept1 {
                     capture_band(
                         band,
                         stack.as_slice(),
                         buffers,
                         ctx,
-                        *group,
-                        *region,
-                        *apron,
-                        filter.as_ref(),
-                        *flatten,
+                        capture.group,
+                        capture.region,
+                        capture.apron,
+                        capture.filter.as_ref(),
+                        capture.flatten,
                         (kept0, kept1),
                     )?;
                 }

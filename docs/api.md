@@ -569,3 +569,33 @@ producers on the owning JS thread, `SharedDevice` reuse across engines,
 asynchronous shader validation and filter setup, host wakes requested while a
 render is awaiting browser work, and incremental lowering matching full
 lowering pixel-for-pixel.
+
+### Component transform animation (#77)
+
+Layer edits gain `translation(Live<Vec2>)`, `rotation(Live<f64>)`,
+`scale(Live<Vec2>)`, `skew(Live<Vec2>)` and `pivot(Live<Vec2>)`, accepting the
+same constants/signals and `.animation(...)` as the existing properties.
+Their defaults are zero except scale, whose default is `(1, 1)`. The existing
+`transform(Live<Affine>)` remains an independent base matrix with its existing
+coefficient interpolation; it never decomposes or overwrites the components.
+
+The sampled local matrix is
+`base * translate(translation + pivot) * rotate(rotation) * skew(skew) *
+scale(scale) * translate(-pivot)`. The rightmost operation acts first. Skew's
+off-diagonal entries are `tan(y)` and `tan(x)`; both skew and rotation use
+radians. Pivot is in the content's local coordinates. Scroll offset still
+applies after this matrix, exactly as before.
+
+Rotation is an unwrapped scalar: `0 -> pi` passes through a quarter turn,
+`0 -> 2*pi` makes a full turn, and negative or multiple turns keep their
+direction and winding. There is no inferred shortest path. Each property
+has its own subscription and curve/spring track, sampled at presentation
+time. Retargeting keeps the last sampled position and velocity. Clearing
+one binding or snapping one property leaves all other components running.
+Decay remains exclusive to scroll offsets. `Next` requests frames while any
+component track runs and becomes idle after all tracks settle.
+
+This is a layer capability rather than animation metadata on a recorded
+matrix operand: components can bind directly to signals without a host tree
+walk or re-encoding. Backend lowering sees only the sampled affine matrix.
+Layers using only the existing matrix allocate no component storage.

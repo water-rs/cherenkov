@@ -18,6 +18,10 @@ pub const STRIP_H: usize = 4;
 /// splitting a partial run.
 const FULL_RUN_MIN: usize = 8;
 
+/// Empty-column gaps up to this width between two partial runs are carried as
+/// zero texels inside one cell rather than as a separate cell instance.
+const PARTIAL_GAP_MAX: usize = 8;
+
 /// A path whose raster bbox fits inside this edge length is emitted as one
 /// whole-bbox cell, skipping strips.
 const SMALL_BBOX: f64 = 32.0;
@@ -223,10 +227,6 @@ fn texels(coverage: &[f32]) -> Vec<u8> {
 /// rasters in the second return value index for index.
 #[expect(clippy::cast_possible_truncation)]
 #[expect(clippy::cast_precision_loss)]
-#[expect(
-    clippy::float_cmp,
-    reason = "a column is 'full' exactly when coverage clamped to 1.0"
-)]
 pub fn emit(coverage: &Coverage) -> Result<(PathEmit, Vec<CellTexels>), RenderError> {
     let mut out = PathEmit::default();
     let mut rasters: Vec<CellTexels> = Vec::new();
@@ -263,40 +263,7 @@ pub fn emit(coverage: &Coverage) -> Result<(PathEmit, Vec<CellTexels>), RenderEr
     }
     for sy in (0..coverage.h).step_by(STRIP_H) {
         let sh = STRIP_H.min(coverage.h - sy);
-        // Classify columns: 0 empty, 1 full, 2 partial.
-        let mut class = vec![0u8; coverage.w];
-        for (x, c) in class.iter_mut().enumerate() {
-            let mut empty = true;
-            let mut full = true;
-            for row in 0..sh {
-                let v = coverage.data[(sy + row) * coverage.w + x];
-                empty &= v == 0.0;
-                full &= v == 1.0;
-            }
-            *c = if empty {
-                0
-            } else if full {
-                1
-            } else {
-                2
-            };
-        }
-        // Demote full runs narrower than `FULL_RUN_MIN` to partial so a
-        // partial run is not fragmented by isolated full columns.
-        let mut x = 0;
-        while x < coverage.w {
-            if class[x] == 1 {
-                let end = (x + 1..coverage.w)
-                    .find(|&i| class[i] != 1)
-                    .unwrap_or(coverage.w);
-                if end - x < FULL_RUN_MIN {
-                    class[x..end].fill(2);
-                }
-                x = end;
-            } else {
-                x += 1;
-            }
-        }
+        let class = strip_class(coverage, sy, sh);
         // Emit runs: all-full runs become spans, the rest cells.
         let mut x = 0;
         while x < coverage.w {
@@ -324,6 +291,70 @@ pub fn emit(coverage: &Coverage) -> Result<(PathEmit, Vec<CellTexels>), RenderEr
         }
     }
     Ok((out, rasters))
+}
+
+/// Classifies one strip's columns as 0 empty, 1 full (1.0 in every row),
+/// 2 partial. Full runs narrower than `FULL_RUN_MIN` are demoted to
+/// partial so a partial run is not fragmented by isolated full columns,
+/// and empty gaps up to `PARTIAL_GAP_MAX` between two partial runs are
+/// carried as zero texels inside one cell rather than as a separate cell
+/// instance.
+#[expect(
+    clippy::float_cmp,
+    reason = "a column is 'full' exactly when coverage clamped to 1.0"
+)]
+fn strip_class(coverage: &Coverage, sy: usize, sh: usize) -> Vec<u8> {
+    let mut class = vec![0u8; coverage.w];
+    for (x, c) in class.iter_mut().enumerate() {
+        let mut empty = true;
+        let mut full = true;
+        for row in 0..sh {
+            let v = coverage.data[(sy + row) * coverage.w + x];
+            empty &= v == 0.0;
+            full &= v == 1.0;
+        }
+        *c = if empty {
+            0
+        } else if full {
+            1
+        } else {
+            2
+        };
+    }
+    let mut x = 0;
+    while x < coverage.w {
+        if class[x] == 1 {
+            let end = (x + 1..coverage.w)
+                .find(|&i| class[i] != 1)
+                .unwrap_or(coverage.w);
+            if end - x < FULL_RUN_MIN {
+                class[x..end].fill(2);
+            }
+            x = end;
+        } else {
+            x += 1;
+        }
+    }
+    let mut x = 0;
+    while x < coverage.w {
+        if class[x] == 0 {
+            let end = (x + 1..coverage.w)
+                .find(|&i| class[i] != 0)
+                .unwrap_or(coverage.w);
+            if x > 0
+                && end < coverage.w
+                && class[x - 1] == 2
+                && class[end] == 2
+                && end - x <= PARTIAL_GAP_MAX
+            {
+                class[x..end].fill(2);
+            }
+            x = end;
+        } else {
+            x += 1;
+        }
+    }
+    class
 }
 
 /// A stable hash of a shape's field bits, for strokes of non-path shapes
@@ -673,6 +704,51 @@ mod tests {
         edge.draw_line(0.5, 0.0, 0.5, 3.0);
         let eo = edge.coverage_rule(FillRule::EvenOdd);
         assert!((eo[0] - 0.5).abs() < 1e-6, "edge: {}", eo[0]);
+    }
+
+    /// Empty gaps up to `PARTIAL_GAP_MAX` between partial columns are
+    /// carried inside one cell; wider gaps, and gaps next to a full run,
+    /// still split.
+    #[test]
+    fn short_empty_gaps_merge_into_one_cell() {
+        let cov = |partial: &[(usize, usize)], full: &[(usize, usize)], w: usize, h: usize| {
+            let mut data = vec![0.0f32; w * h];
+            for row in 0..h {
+                for &(a, b) in partial {
+                    data[row * w + a..row * w + b].fill(0.5);
+                }
+                for &(a, b) in full {
+                    data[row * w + a..row * w + b].fill(1.0);
+                }
+            }
+            Coverage {
+                x: 0.0,
+                y: 0.0,
+                w,
+                h,
+                clipped: false,
+                data,
+            }
+        };
+        // Gap of `PARTIAL_GAP_MAX` between two partial runs: one cell.
+        let g = PARTIAL_GAP_MAX.max(1);
+        let (emitted, rasters) = emit(&cov(&[(0, 3), (3 + g, 6 + g)], &[], 40, 4)).unwrap();
+        assert_eq!(emitted.cells.len(), 1);
+        assert_eq!(rasters[0].0 as usize, 6 + g);
+        // The carried gap's texels are zero coverage.
+        for row in 0..4 {
+            for x in 3..3 + g {
+                assert_eq!(rasters[0].2[row * (6 + g) + x], 0);
+            }
+        }
+        // Gap of `PARTIAL_GAP_MAX + 1`: two separate cells.
+        let (emitted, _) = emit(&cov(&[(0, 3), (4 + g, 7 + g)], &[], 40, 4)).unwrap();
+        assert_eq!(emitted.cells.len(), 2);
+        // A gap bounded by a full run (wider than `FULL_RUN_MIN`) is not
+        // filled: the partial run ends before it and the full run spans.
+        let (emitted, _) = emit(&cov(&[(0, 3)], &[(3 + g, 12 + g)], 40, 4)).unwrap();
+        assert_eq!(emitted.cells.len(), 1);
+        assert_eq!(emitted.spans.len(), 1);
     }
 }
 

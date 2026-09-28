@@ -4,6 +4,42 @@ Engine adapters and the render/measure CLI for the Cherenkov cross-engine
 suite. Adapters are feature-gated: `vello-classic`, `vello-hybrid`,
 `vello-cpu`, `skia`, `skia-metal`.
 
+## Native resolution
+
+`measure --native WxH` renders into a `W`×`H` surface — the device's own
+resolution, which a windowed host would read from its window and an
+offscreen run supplies on the command line — with the scene drawn under
+the uniform scale `s = W / scene_width`, like a device pixel ratio, so
+the pixel load matches the device rather than the scene file. The
+report's `native` block records the size and `s`; the top-level
+`width`/`height` are the rendered surface size. Pair with `--rate` to
+pace at the panel's refresh:
+
+    cherenkov-bench measure --engine cherenkov --scene scenes/perf/chart \
+        --native 2752x2064 --rate 120 --frames 120 --cpu 7 \
+        --out measure-cherenkov-chart-native.json   # iPad Pro M4
+
+## Capacity sweep
+
+`capacity` finds the largest scene load each engine sustains within a
+frame budget. The draw list is repeated `k` times — each copy offset by
+a fixed translation that wraps inside the canvas, so element count and
+overdraw grow linearly — doubling `k` until a probe's p99 frame time
+exceeds `--budget-ms` (default 8.333, the 120 fps budget), then
+binary-searching the largest `k` that stays within it. Each probe is an
+interleaved round across the `--engine` list at `measure`'s warmup and
+frame counts:
+
+    cherenkov-bench capacity --engine cherenkov --engine vello-classic \
+        --corpus scenes/perf --frames 60 --warmup 5 --cpu 7 \
+        --out-dir capacity-out
+
+A frame's seconds are `encode + submit`, raised to the frame's GPU time
+where the backend reports it. The per-scene report records each engine's
+max sustained `k`, the p99 at `k` and at `k + 1`, and every probe.
+`--max-k` (default 1024) caps the doubling; `--native` retargets every
+probe exactly as for `measure`.
+
 ## Measuring on big.LITTLE hardware
 
 On hosts whose CPUs have differing `cpuinfo_max_freq` (e.g. Tensor G4:

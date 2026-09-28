@@ -196,6 +196,23 @@ pub struct Conditions {
     pub screen_brightness: Option<u32>,
 }
 
+/// The native-resolution retarget of a `measure`/`capacity` run
+/// (`--native`).
+///
+/// The engine rendered into a `width`×`height` surface with the scene
+/// drawn under the uniform `scale` — a device-pixel-ratio scale — instead
+/// of the scene's own pixel size.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct NativeResolution {
+    /// Surface width in pixels.
+    pub width: u32,
+    /// Surface height in pixels.
+    pub height: u32,
+    /// The uniform scale applied to the scene tree,
+    /// `width / scene_width`.
+    pub scale: f64,
+}
+
 /// `measure` output.
 #[derive(Serialize)]
 pub struct MeasureReport {
@@ -205,10 +222,13 @@ pub struct MeasureReport {
     pub info: EngineInfo,
     /// Scene directory name.
     pub scene: String,
-    /// Scene pixel size.
+    /// Scene pixel size — the native surface size under `--native`.
     pub width: u32,
-    /// Scene pixel size.
+    /// Scene pixel size — the native surface size under `--native`.
     pub height: u32,
+    /// The `--native` retarget of this run; `null` when the run rendered
+    /// at the scene's own size.
+    pub native: Option<NativeResolution>,
     /// One-time scene preparation in seconds — resource creation and
     /// scene conversion done once outside the timed loop (fonts,
     /// images, GPU uploads, immutable shaders). Not a per-frame cost.
@@ -280,6 +300,71 @@ pub struct PhasePercentiles {
     pub name: String,
     /// `seconds` percentiles `[p50, p90, p99]` for this phase.
     pub seconds: [f64; 3],
+}
+
+/// One load-level probe of a `capacity` sweep: the p99 frame time the
+/// engine sustained at repetition factor `k`.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct CapacityProbe {
+    /// The draw-list repetition factor probed.
+    pub k: u32,
+    /// p99 frame seconds at `k`. A frame's seconds are
+    /// `encode_seconds + submit_seconds`, raised to the frame's
+    /// `gpu_seconds` where the backend reports them — the throughput
+    /// limit of a pipelined renderer is its slowest stage.
+    pub p99_seconds: f64,
+}
+
+/// One engine's `capacity` result on one scene: the largest repetition
+/// factor whose p99 frame time stayed within the budget.
+#[derive(Serialize)]
+pub struct CapacityResult {
+    /// Adapter key.
+    pub engine: &'static str,
+    /// The adapter's pinned provenance.
+    pub info: EngineInfo,
+    /// The scene feature the adapter cannot execute, when the sweep never
+    /// ran; `null` on a completed sweep.
+    pub unsupported: Option<cherenkov_scene::Feature>,
+    /// The upstream API the engine lacks, when known (see
+    /// [`UnsupportedReport::missing_api`]).
+    pub missing_api: Option<&'static str>,
+    /// The largest probed `k` within the frame budget. `0` means even
+    /// `k = 1` exceeded it.
+    pub max_k: u32,
+    /// p99 frame seconds at `max_k`; `null` when `max_k` is `0`.
+    pub p99_seconds: Option<f64>,
+    /// p99 frame seconds at `max_k + 1` — the first over-budget level;
+    /// `null` when the sweep saturated at `--max-k` without exceeding the
+    /// budget.
+    pub p99_seconds_next: Option<f64>,
+    /// Every probe of the sweep, in the order it ran.
+    pub probes: Vec<CapacityProbe>,
+    /// Idle, steady-state and peak memory across the sweep's probes —
+    /// `peak` is the field-wise maximum over every probed `k`, so it
+    /// reflects the heaviest level measured; `idle` is the engine's
+    /// pre-scene baseline.
+    pub memory: MemoryReport,
+}
+
+/// `capacity` output for one scene: the sweep result per engine.
+#[derive(Serialize)]
+pub struct CapacityReport {
+    /// Scene directory name.
+    pub scene: String,
+    /// The frame-time budget in milliseconds (`--budget-ms`).
+    pub budget_ms: f64,
+    /// Measured frames per probe (`--frames`).
+    pub frames: u32,
+    /// Warmup frames discarded per probe (`--warmup`).
+    pub warmup: u32,
+    /// The `--native` retarget every probe ran under; `null` when probes
+    /// rendered at the scene's own size.
+    pub native: Option<NativeResolution>,
+    /// One result per engine, in command-line order.
+    pub results: Vec<CapacityResult>,
+    /// Device/thermal metadata of the host.
+    pub device: DeviceInfo,
 }
 
 /// Nearest-rank percentiles of `samples`, `[p50, p90, p99]`.

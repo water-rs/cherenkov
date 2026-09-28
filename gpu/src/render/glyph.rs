@@ -57,8 +57,8 @@ pub struct GlyphKey {
     glyph: u32,
     /// `(size * 64).round()` — 1/64th-pixel size granularity.
     size_bits: u32,
-    /// Quantized subpixel position: `(fx * 4) | ((fy * 4) << 4)`.
-    subpixel: u8,
+    /// Exact subpixel position: `f32` bits of `fx` | `f32` bits of `fy`.
+    subpixel: u64,
     /// f32 bits of the device transform's 2x2.
     matrix: [u32; 4],
     /// Hash of the run's variation coordinates.
@@ -70,14 +70,14 @@ pub struct GlyphKey {
 impl Hash for GlyphKey {
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
-        let matrix = 17 + size_of::<usize>();
+        let matrix = 24 + size_of::<usize>();
         let coords = matrix + 16;
-        let mut bytes = [0; 41 + size_of::<usize>()];
+        let mut bytes = [0; 48 + size_of::<usize>()];
         bytes[..8].copy_from_slice(&self.font.to_ne_bytes());
         bytes[8..12].copy_from_slice(&self.glyph.to_ne_bytes());
         bytes[12..16].copy_from_slice(&self.size_bits.to_ne_bytes());
-        bytes[16] = self.subpixel;
-        bytes[17..matrix].copy_from_slice(&4usize.to_ne_bytes());
+        bytes[16..24].copy_from_slice(&self.subpixel.to_ne_bytes());
+        bytes[24..matrix].copy_from_slice(&4usize.to_ne_bytes());
         for (dst, value) in bytes[matrix..coords]
             .as_chunks_mut::<4>()
             .0
@@ -92,11 +92,10 @@ impl Hash for GlyphKey {
 }
 
 impl GlyphKey {
-    /// Change just the glyph and quantized position; run identity stays exact.
-    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    /// Change just the glyph and subpixel position; run identity stays exact.
     pub fn at(mut self, glyph: u32, subpixel: (f32, f32)) -> Self {
         self.glyph = glyph;
-        self.subpixel = ((subpixel.0 * 4.0) as u8) | (((subpixel.1 * 4.0) as u8) << 4);
+        self.subpixel = u64::from(subpixel.0.to_bits()) | (u64::from(subpixel.1.to_bits()) << 32);
         self
     }
 }
@@ -1125,7 +1124,7 @@ pub fn glyph_key(
         font: run.font.raw(),
         glyph,
         size_bits: (run.size * 64.0).round() as u32,
-        subpixel: ((subpixel.0 * 4.0) as u8) | (((subpixel.1 * 4.0) as u8) << 4),
+        subpixel: u64::from(subpixel.0.to_bits()) | (u64::from(subpixel.1.to_bits()) << 32),
         matrix: [
             (a as f32).to_bits(),
             (b as f32).to_bits(),

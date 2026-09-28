@@ -814,10 +814,7 @@ impl<'a> Lowering<'a> {
             }
             let o = self.transform * Point::new(f64::from(glyph.x), f64::from(glyph.y));
             let (ix, iy) = (o.x.floor(), o.y.floor());
-            let (fx, fy) = (
-                ((o.x - ix) * 4.0).floor() / 4.0,
-                ((o.y - iy) * 4.0).floor() / 4.0,
-            );
+            let (fx, fy) = (o.x - ix, o.y - iy);
             let subpixel = (fx as f32, fy as f32);
             let key = crate::render::glyph::glyph_key(run, glyph.id, subpixel, self.transform);
             let slot: crate::render::glyph::GlyphSlot =

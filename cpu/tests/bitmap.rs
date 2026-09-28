@@ -505,3 +505,111 @@ fn bitmap_runs_validate_image_paints_like_outline_runs() {
         unregistered_image_error(&outline, 'A')
     );
 }
+
+fn render_static_bitmap(
+    engine: &Engine<Raster>,
+    font: FontId,
+    glyph: u32,
+    transform: Affine,
+) -> Vec<[f32; 4]> {
+    let surface = engine
+        .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF32))
+        .expect("surface");
+    surface.clear_color(WorkingColor::BLACK);
+    let layer = surface.layer();
+    surface.update(|tx| {
+        tx[surface.root()].push(&layer);
+    });
+    let mut run = glyph_run(font, glyph, 48.0);
+    run.glyphs[0].x = 10.0;
+    run.glyphs[0].y = 56.0;
+    surface.update(|tx| {
+        tx[&layer]
+            .transform(transform)
+            .content(surface.record(|c| c.glyphs(run, WorkingColor::WHITE)));
+    });
+    engine
+        .render(FrameTime::now())
+        .expect("render static glyph");
+    surface.readback().expect("readback").pixels
+}
+
+fn bitmap_pixel_bits(pixels: &[[f32; 4]]) -> Vec<[u32; 4]> {
+    pixels.iter().map(|pixel| pixel.map(f32::to_bits)).collect()
+}
+
+/// Animated bitmap placement follows the layer's quarter-pixel snap and
+/// returns to exact placement when the animation settles.
+#[test]
+fn an_animating_layer_places_bitmap_glyphs_on_the_quarter_pixel_grid() {
+    use nami::SignalExt as _;
+    use std::time::{Duration, Instant};
+
+    let engine = engine();
+    let bytes = std::fs::read(SBIX_PATH).expect("sbix fixture");
+    let glyph = glyph_id(&bytes, '😀');
+    let font = engine
+        .font(FontSource::bytes(bytes))
+        .expect("register sbix font");
+    let surface = engine
+        .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF32))
+        .expect("surface");
+    surface.clear_color(WorkingColor::BLACK);
+    let layer = surface.layer();
+    surface.update(|tx| {
+        tx[surface.root()].push(&layer);
+    });
+    let mut run = glyph_run(font.id(), glyph, 48.0);
+    run.glyphs[0].x = 10.0;
+    run.glyphs[0].y = 56.0;
+    surface.update(|tx| {
+        tx[&layer].content(surface.record(|c| c.glyphs(run, WorkingColor::WHITE)));
+    });
+    let translate = nami::binding(Affine::IDENTITY);
+    surface.update(|tx| {
+        tx[&layer].transform(translate.clone().with(cherenkov::Animation::from(
+            cherenkov::Curve::linear(Duration::from_secs(1)),
+        )));
+    });
+
+    let start = Instant::now();
+    translate.set(Affine::translate((1.2, 0.0)));
+    engine
+        .render(FrameTime::at(start))
+        .expect("animation start");
+    let at_start = surface.readback().expect("start readback").pixels;
+    assert!(matches!(
+        engine
+            .render(FrameTime::at(start + Duration::from_millis(250)))
+            .expect("quarter-pixel frame"),
+        cherenkov::Next::At { .. }
+    ));
+    let quarter = surface.readback().expect("quarter-pixel readback").pixels;
+    assert_eq!(
+        engine
+            .render(FrameTime::at(start + Duration::from_secs(2)))
+            .expect("settled frame"),
+        cherenkov::Next::Idle
+    );
+    let settled = surface.readback().expect("settled readback").pixels;
+
+    let identity = render_static_bitmap(&engine, font.id(), glyph, Affine::IDENTITY);
+    let quarter_static =
+        render_static_bitmap(&engine, font.id(), glyph, Affine::translate((0.25, 0.0)));
+    let off_grid = render_static_bitmap(&engine, font.id(), glyph, Affine::translate((0.3, 0.0)));
+    let settled_static =
+        render_static_bitmap(&engine, font.id(), glyph, Affine::translate((1.2, 0.0)));
+    let off_settled =
+        render_static_bitmap(&engine, font.id(), glyph, Affine::translate((1.25, 0.0)));
+    assert_eq!(bitmap_pixel_bits(&at_start), bitmap_pixel_bits(&identity));
+    assert_eq!(
+        bitmap_pixel_bits(&quarter),
+        bitmap_pixel_bits(&quarter_static)
+    );
+    assert_ne!(bitmap_pixel_bits(&quarter), bitmap_pixel_bits(&off_grid));
+    assert_eq!(
+        bitmap_pixel_bits(&settled),
+        bitmap_pixel_bits(&settled_static)
+    );
+    assert_ne!(bitmap_pixel_bits(&settled), bitmap_pixel_bits(&off_settled));
+}

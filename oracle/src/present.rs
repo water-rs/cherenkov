@@ -23,9 +23,12 @@ const P3_TO_LINEAR_SRGB: [[f64; 3]; 3] = [
 /// Presents `image` to an sRGB output at display `headroom`.
 ///
 /// The `present.wgsl` shader-transfer path per pixel under premultiplied
-/// output alpha: unpremultiply, the P3 → sRGB matrix, clamp to `[0, 1]`,
-/// the sRGB transfer, re-premultiply. Out-of-gamut P3 colours and values
-/// above `1.0` clip, matching the pass's current contract.
+/// output alpha: unpremultiply, the P3 → sRGB matrix, the analytic `OKLab`
+/// gamut map of [`crate::gamut`], the sRGB transfer, re-premultiply.
+/// In-gamut P3 colours pass through bit-for-bit; out-of-gamut colours
+/// keep their hue and land on the sRGB boundary instead of clipping
+/// per-channel (#96). Values above `1.0` still land at the gamut's
+/// lightness end — no tone mapping yet.
 ///
 /// Returns premultiplied *encoded* sRGB in `[0, 1]` with linear alpha —
 /// the values an sRGB presentation texture stores.
@@ -99,7 +102,8 @@ fn present_srgb_pixel([r, g, b, a]: [f64; 4]) -> [f64; 4] {
     } else {
         [0.0; 3]
     };
-    let srgb = mat3_mul(&P3_TO_LINEAR_SRGB, straight).map(|c| srgb_encode(c.clamp(0.0, 1.0)));
+    let srgb = crate::gamut::gamut_map_srgb_analytic(mat3_mul(&P3_TO_LINEAR_SRGB, straight))
+        .map(srgb_encode);
     [srgb[0] * a, srgb[1] * a, srgb[2] * a, a]
 }
 
@@ -131,28 +135,30 @@ mod tests {
     }
 
     #[test]
-    fn srgb_p3_red_clips_to_srgb_red() {
-        // P3's red primary is outside sRGB: the [0,1] clamp lands on
-        // encoded sRGB red.
+    fn srgb_p3_red_maps_to_hue_preserved_red() {
+        // P3's red primary is outside sRGB: the gamut map keeps its hue
+        // and lands on the boundary — encoded sRGB red with a perceptual
+        // chroma remainder, not the old per-channel clamp's [1, 0, 0].
         assert_close(
             px(&present_srgb(1.0, &img([1.0, 0.0, 0.0, 1.0]))),
-            [1.0, 0.0, 0.0, 1.0],
+            [1.0, 0.202_234, 0.157_756, 1.0],
         );
     }
 
     #[test]
-    fn srgb_out_of_gamut_channel_clips() {
-        // P3 (0, 1, 0.5): r and g clip, b survives at 0.47050075 linear
-        // → 0.7156 encoded.
+    fn srgb_out_of_gamut_maps_to_boundary() {
+        // P3 (0, 1, 0.5): out of gamut on r and g; the map keeps the
+        // green-cyan hue — the clamp had produced encoded [0, 1, 0.716].
         assert_close(
             px(&present_srgb(1.0, &img([0.0, 1.0, 0.5, 1.0]))),
-            [0.0, 1.0, 0.715_583, 1.0],
+            [0.000_001, 0.974_930, 0.748_692, 1.0],
         );
     }
 
     #[test]
-    fn srgb_hdr_white_clips_to_sdr_white() {
-        // 4× SDR white clamps at the [0,1] contract — no tone mapping yet.
+    fn srgb_hdr_white_maps_to_sdr_white() {
+        // 4× SDR white lands on the gamut's lightness end — no tone
+        // mapping yet.
         assert_close(
             px(&present_srgb(4.0, &img([4.0, 4.0, 4.0, 1.0]))),
             [1.0, 1.0, 1.0, 1.0],

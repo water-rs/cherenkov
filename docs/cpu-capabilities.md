@@ -35,9 +35,11 @@ pattern mappings compose in f64 before sampling, preventing nearest-neighbor
 boundary changes from separately rounded transforms.
 
 Bitmap-only sbix and CBDT/CBLC fonts are decoded as image glyphs on the render
-thread. Strike selection uses run size multiplied by the largest singular value
-of the full content-to-device transform; missing glyphs in the selected strike
-draw nothing. COLR and SVG colour fonts remain unsupported.
+thread. Per-glyph transforms compose as `translate(x,y) * t * scale(size)` on
+the em-space image rectangle, and strike selection uses run size multiplied by
+the largest singular value of `CTM * translate(x,y) * t`. Missing glyphs in
+the selected strike draw nothing. Bitmap-font strokes, COLR and SVG colour
+fonts remain unsupported.
 
 Group and layer blends use the existing public BlendMode vocabulary. Groups
 also support BlendSpace::SrgbEncoded. Opacity applies before conversion and

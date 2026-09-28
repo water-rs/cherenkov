@@ -13,19 +13,24 @@ errors.
 
 At device realization, the renderer computes device ppem as the run size
 multiplied by the largest singular value of the full content-to-device
-transform. It chooses the smallest strike whose ppem is greater than or equal
-to device ppem; if there is no such strike, it chooses the largest. Equal-size
-strikes are ordered by their table index. A non-finite or non-positive device
-ppem selects the largest strike. This choice is made for each realization, so
-scaling and rotation can select a different strike without changing the
-device-independent prepared glyph.
+transform composed with the glyph's position and per-glyph transform:
+`size × σ_max(CTM × translate(x,y) × t)`, where `t` is identity when absent.
+It chooses the smallest strike whose ppem is greater than or equal to device
+ppem; if there is no such strike, it chooses the largest. Equal-size strikes
+are ordered by their table index. A non-finite or non-positive device ppem
+selects the largest strike. This choice is made for each realization, so
+scaling, rotation, skew and per-glyph transforms can select a different strike
+without changing the device-independent prepared glyph.
 
 ## Placement and compositing
 
 Glyph placement is stored in em-space, using bitmap bearings, inner bearings,
-strike ppem and units per em. The user-space destination is the glyph origin
-plus the em-space rectangle multiplied by run size. CBDT's top-left origin and
-sbix's bottom-left origin are converted to the renderer's y-down coordinates.
+strike ppem and units per em. The em-space image rectangle is placed by
+`translate(x,y) × t × scale(size)`, with `t` identity when absent. CBDT's
+top-left origin and sbix's bottom-left origin are converted to the renderer's
+y-down coordinates. Rotation, skew and non-uniform scale transform the bitmap
+quad itself, not only its axis-aligned bounds; pure translations can fold into
+the glyph origin.
 
 PNG data is expanded to straight-alpha RGBA8 and decoded as sRGB. BGRA data is
 reordered to RGBA8 and treated as premultiplied sRGB. A bitmap glyph is
@@ -38,10 +43,10 @@ There is no substitution from another strike, an outline, or `.notdef`.
 ## Unsupported formats and caching
 
 Non-PNG/BGRA bitmap payloads and masks return the `color-font` unsupported
-error. Per-glyph transforms and bitmap-font strokes return
-`glyph-transform` and `glyph-stroke`, respectively. sbix `dupe` records resolve
-one level to their target glyph in the same strike; absent targets and chains
-of duplicates are font errors.
+error. Non-finite or non-invertible per-glyph transforms are render errors;
+bitmap-font strokes return the `glyph-stroke` unsupported error. sbix `dupe`
+records resolve one level to their target glyph in the same strike; absent
+targets and chains of duplicates are font errors.
 
 Decoded entries are keyed by exact `FontId`, strike table index and glyph id.
 The key intentionally excludes run size and transform; the cached placement

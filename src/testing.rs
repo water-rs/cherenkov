@@ -2,18 +2,20 @@
 //! call as an [`Event`] on a channel, so tests and the cross-backend
 //! behaviour suite can assert what the front end committed.
 
+use std::collections::HashSet;
 use std::sync::mpsc::Sender;
 
 use kurbo::{Affine, Vec2};
 
 use crate::backend::{Backend, Frame, Redraw, Renderer, SurfaceInfo};
+use crate::capability::{ShaderPaint, ShaderSource};
 use crate::config::MemoryUsage;
 use crate::error::{EngineError, RenderError, ResourceError, SurfaceError};
 use crate::frame::Readback;
 use crate::glyph::FontId;
 use crate::image::{ImageUpload, Rgba8, Rgba16F};
 use crate::message::{ContentOp, FontData, LayerId, SurfaceId};
-use crate::paint::ImageId;
+use crate::paint::{ImageId, ShaderId};
 use crate::{Offscreen, Pressure, Uploads};
 
 /// A render-thread event [`Null`] reports.
@@ -34,6 +36,10 @@ pub enum Event {
     AddImage(ImageId),
     /// `remove_image` ran.
     RemoveImage(ImageId),
+    /// `add_shader` ran.
+    AddShader(ShaderId),
+    /// `remove_shader` ran.
+    RemoveShader(ShaderId),
     /// `set_content` ran.
     SetContent(SurfaceId, LayerId),
     /// `remove_layer` ran.
@@ -77,14 +83,50 @@ pub struct Null;
 pub struct NullConfig {
     /// The event probe. A test keeps the matching `Receiver`.
     pub events: Sender<Event>,
+    /// Registration kinds the backend refuses: the matching `add_*` or
+    /// `create_surface` call returns its error without committing.
+    pub reject: HashSet<NullReject>,
+}
+
+/// A registration [`Null`] refuses, for failure-path tests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum NullReject {
+    /// `create_surface` returns [`SurfaceError::UnsupportedTarget`].
+    Surface,
+    /// `add_font` returns [`ResourceError::Font`].
+    Font,
+    /// `add_image` returns [`ResourceError::Image`].
+    Image,
+    /// `add_shader` returns [`ResourceError::Shader`].
+    Shader,
 }
 
 /// `Null`'s provenance: nothing to report.
 pub type NullInfo = ();
 
-/// The `Null` render-thread state.
+/// The `Null` render-thread state. Registration and removal events are
+/// reported only for committed transitions — a `remove_*` for an id the
+/// backend never added is a no-op, as in a real backend.
 pub struct NullRenderer {
     events: Sender<Event>,
+    reject: HashSet<NullReject>,
+    surfaces: HashSet<SurfaceId>,
+    fonts: HashSet<FontId>,
+    images: HashSet<ImageId>,
+    shaders: HashSet<ShaderId>,
+}
+
+impl NullRenderer {
+    fn new(config: NullConfig) -> Self {
+        Self {
+            events: config.events,
+            reject: config.reject,
+            surfaces: HashSet::new(),
+            fonts: HashSet::new(),
+            images: HashSet::new(),
+            shaders: HashSet::new(),
+        }
+    }
 }
 
 impl Backend for Null {
@@ -95,22 +137,12 @@ impl Backend for Null {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn init(config: NullConfig) -> Result<(NullRenderer, NullInfo), EngineError> {
-        Ok((
-            NullRenderer {
-                events: config.events,
-            },
-            (),
-        ))
+        Ok((NullRenderer::new(config), ()))
     }
 
     #[cfg(target_arch = "wasm32")]
     async fn init(config: NullConfig) -> Result<(NullRenderer, NullInfo), EngineError> {
-        Ok((
-            NullRenderer {
-                events: config.events,
-            },
-            (),
-        ))
+        Ok((NullRenderer::new(config), ()))
     }
 }
 
@@ -125,6 +157,10 @@ impl Renderer for NullRenderer {
         if target.size.0 == 0 || target.size.1 == 0 {
             return Err(SurfaceError::ZeroSize);
         }
+        if self.reject.contains(&NullReject::Surface) {
+            return Err(SurfaceError::UnsupportedTarget("injected rejection".into()));
+        }
+        self.surfaces.insert(id);
         let _ = self.events.send(Event::CreateSurface(id));
         Ok(SurfaceInfo {
             max_dimension: u32::MAX,
@@ -138,25 +174,39 @@ impl Renderer for NullRenderer {
     }
 
     fn destroy_surface(&mut self, id: SurfaceId) {
-        let _ = self.events.send(Event::DestroySurface(id));
+        if self.surfaces.remove(&id) {
+            let _ = self.events.send(Event::DestroySurface(id));
+        }
     }
 
     fn add_font(&mut self, id: FontId, _font: FontData) -> Result<(), ResourceError> {
+        if self.reject.contains(&NullReject::Font) {
+            return Err(ResourceError::Font("injected rejection".into()));
+        }
+        self.fonts.insert(id);
         let _ = self.events.send(Event::AddFont(id));
         Ok(())
     }
 
     fn remove_font(&mut self, id: FontId) {
-        let _ = self.events.send(Event::RemoveFont(id));
+        if self.fonts.remove(&id) {
+            let _ = self.events.send(Event::RemoveFont(id));
+        }
     }
 
     fn add_image(&mut self, id: ImageId, _image: ImageUpload) -> Result<(), ResourceError> {
+        if self.reject.contains(&NullReject::Image) {
+            return Err(ResourceError::Image("injected rejection".into()));
+        }
+        self.images.insert(id);
         let _ = self.events.send(Event::AddImage(id));
         Ok(())
     }
 
     fn remove_image(&mut self, id: ImageId) {
-        let _ = self.events.send(Event::RemoveImage(id));
+        if self.images.remove(&id) {
+            let _ = self.events.send(Event::RemoveImage(id));
+        }
     }
 
     fn set_content(&mut self, surface: SurfaceId, layer: LayerId, _content: Option<ContentOp>) {
@@ -246,6 +296,42 @@ impl Renderer for NullRenderer {
     }
 
     fn trim(&mut self, _pressure: Pressure) {}
+}
+
+impl ShaderPaint for Null {
+    #[cfg(not(target_arch = "wasm32"))]
+    fn add_shader(
+        r: &mut NullRenderer,
+        id: ShaderId,
+        _source: ShaderSource,
+    ) -> Result<(), ResourceError> {
+        if r.reject.contains(&NullReject::Shader) {
+            return Err(ResourceError::Shader("injected rejection".into()));
+        }
+        r.shaders.insert(id);
+        let _ = r.events.send(Event::AddShader(id));
+        Ok(())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn add_shader(
+        r: &mut NullRenderer,
+        id: ShaderId,
+        _source: ShaderSource,
+    ) -> Result<(), ResourceError> {
+        if r.reject.contains(&NullReject::Shader) {
+            return Err(ResourceError::Shader("injected rejection".into()));
+        }
+        r.shaders.insert(id);
+        let _ = r.events.send(Event::AddShader(id));
+        Ok(())
+    }
+
+    fn remove_shader(r: &mut NullRenderer, id: ShaderId) {
+        if r.shaders.remove(&id) {
+            let _ = r.events.send(Event::RemoveShader(id));
+        }
+    }
 }
 
 impl Uploads<Rgba8> for Null {}
@@ -744,18 +830,74 @@ use $crate::Instant;
     };
 }
 
+/// Registration lifetime checks shared by both executors: the committed
+/// `Add*`/`Remove*` (`CreateSurface`/`DestroySurface`) events of each
+/// resource kind must balance (#150).
 #[cfg(test)]
+mod balance {
+    use std::sync::mpsc::Receiver;
+
+    use super::Event;
+
+    /// The registration transitions in `events`, as `kind raw-id` strings.
+    /// Returns `(committed, released)`.
+    pub fn transitions(events: &[Event]) -> (Vec<String>, Vec<String>) {
+        let (mut commits, mut releases) = (Vec::new(), Vec::new());
+        for event in events {
+            let (kind, id, committed) = match event {
+                Event::AddFont(id) => ("font", id.raw(), true),
+                Event::RemoveFont(id) => ("font", id.raw(), false),
+                Event::AddImage(id) => ("image", id.raw(), true),
+                Event::RemoveImage(id) => ("image", id.raw(), false),
+                Event::AddShader(id) => ("shader", id.raw(), true),
+                Event::RemoveShader(id) => ("shader", id.raw(), false),
+                Event::CreateSurface(id) => ("surface", id.raw(), true),
+                Event::DestroySurface(id) => ("surface", id.raw(), false),
+                _ => continue,
+            };
+            let entry = format!("{kind} {id}");
+            if committed {
+                commits.push(entry);
+            } else {
+                releases.push(entry);
+            }
+        }
+        (commits, releases)
+    }
+
+    /// Drains the probe and asserts every committed registration was
+    /// released exactly once, kind and id matching.
+    pub fn assert_balanced(rx: &Receiver<Event>) {
+        let events: Vec<Event> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let (mut commits, mut releases) = transitions(&events);
+        commits.sort();
+        releases.sort();
+        assert_eq!(
+            commits, releases,
+            "unbalanced registration events: {events:?}"
+        );
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use crate::Instant;
     use std::time::Duration;
 
     use super::*;
     use crate::image::ImageData;
-    use crate::{Decay, Engine, FrameTime, Next, OffscreenFormat, Spring};
+    use crate::resource::FontSource;
+    use crate::{Decay, Engine, FrameTime, Next, OffscreenFormat, ShaderSource, Spring};
 
     fn engine() -> (Engine<Null>, std::sync::mpsc::Receiver<Event>) {
+        engine_rejecting(HashSet::new())
+    }
+
+    fn engine_rejecting(
+        reject: HashSet<NullReject>,
+    ) -> (Engine<Null>, std::sync::mpsc::Receiver<Event>) {
         let (tx, rx) = std::sync::mpsc::channel();
-        let engine = Engine::<Null>::new(NullConfig { events: tx }).expect("init");
+        let engine = Engine::<Null>::new(NullConfig { events: tx, reject }).expect("init");
         (engine, rx)
     }
 
@@ -941,7 +1083,259 @@ mod tests {
             "removed content cannot wake the engine"
         );
     }
+
+    /// A completed registration releases its backend resource when the
+    /// handle drops — the only cancellation window a synchronous engine
+    /// has. The async executor's windows are covered by `wasm_tests`.
+    #[test]
+    fn completed_registrations_release_on_drop() {
+        let (engine, rx) = engine();
+        let font = engine.font(FontSource::bytes(vec![0u8; 8])).expect("font");
+        let image = engine
+            .image(ImageData::<Rgba8>::new(1, 1, vec![0u8; 4]).expect("image data"))
+            .expect("image");
+        let shader = engine
+            .shader(ShaderSource::wgsl("@fragment fn f() { }"))
+            .expect("shader");
+        let surface = engine
+            .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))
+            .expect("surface");
+        drop(font);
+        drop(image);
+        drop(shader);
+        drop(surface);
+        // The reply lands only after every earlier message was applied.
+        let _ = engine.memory();
+        balance::assert_balanced(&rx);
+    }
+
+    /// A registration the backend refused enqueues no removal: nothing
+    /// ever existed to release.
+    #[test]
+    fn rejected_registrations_enqueue_no_removal() {
+        let reject = HashSet::from([
+            NullReject::Surface,
+            NullReject::Font,
+            NullReject::Image,
+            NullReject::Shader,
+        ]);
+        let (engine, rx) = engine_rejecting(reject);
+        assert!(
+            engine.font(FontSource::bytes(vec![0u8; 8])).is_err(),
+            "font"
+        );
+        assert!(
+            engine
+                .image(ImageData::<Rgba8>::new(1, 1, vec![0u8; 4]).expect("image data"))
+                .is_err(),
+            "image"
+        );
+        assert!(
+            engine
+                .shader(ShaderSource::wgsl("@fragment fn f() { }"))
+                .is_err(),
+            "shader"
+        );
+        assert!(
+            engine
+                .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))
+                .is_err(),
+            "surface"
+        );
+        let _ = engine.memory();
+        balance::assert_balanced(&rx);
+    }
 }
 
 /// Retained-lowering equivalence checks for first-party backends.
 pub mod incremental;
+
+/// The async executor's registration windows (#150): a registration
+/// future owns the backend id from the moment the request is enqueued, so
+/// dropping it at any point still releases what the backend committed.
+/// Run under the Node `wasm-bindgen-test-runner` (or a browser):
+///
+/// ```console
+/// CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
+/// cargo test -p cherenkov --features testing --lib \
+///     --target wasm32-unknown-unknown
+/// ```
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_tests {
+    use std::fmt::Debug;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::mpsc::Receiver;
+    use std::task::{Context, Waker};
+
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    use super::balance;
+    use super::{Event, Null, NullConfig, NullReject};
+    use crate::image::ImageData;
+    use crate::resource::FontSource;
+    use crate::{Engine, Offscreen, OffscreenFormat, Rgba8, ShaderSource};
+
+    async fn engine(
+        reject: std::collections::HashSet<NullReject>,
+    ) -> (Engine<Null>, Receiver<Event>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let engine = Engine::<Null>::new(NullConfig { events: tx, reject })
+            .await
+            .expect("init");
+        (engine, rx)
+    }
+
+    /// Runs the registration future until it has enqueued its request and
+    /// is parked on the reply.
+    fn enqueued<F: Future>(registration: Pin<&mut F>) {
+        assert!(
+            registration
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending(),
+            "registration returned before its reply await"
+        );
+    }
+
+    /// Everything enqueued before this call has been applied: the
+    /// `Memory` reply lands after them in the serial executor.
+    async fn flush(engine: &Engine<Null>) {
+        let _ = engine.memory().await;
+    }
+
+    /// Window (a): dropped after enqueue, before the backend ran.
+    async fn drop_after_enqueue<F, O, E>(engine: &Engine<Null>, register: F)
+    where
+        F: Future<Output = Result<O, E>>,
+        E: Debug,
+    {
+        let mut registration = Box::pin(register);
+        enqueued(registration.as_mut());
+        drop(registration);
+        flush(engine).await;
+    }
+
+    /// Window (b): dropped after the backend committed, before the reply
+    /// was adopted. The first `flush` returns once the commit is done.
+    async fn drop_after_commit<F, O, E>(engine: &Engine<Null>, register: F)
+    where
+        F: Future<Output = Result<O, E>>,
+        E: Debug,
+    {
+        let mut registration = Box::pin(register);
+        enqueued(registration.as_mut());
+        flush(engine).await;
+        drop(registration);
+        flush(engine).await;
+    }
+
+    /// Window (c): the reply was adopted and the handle dropped.
+    async fn drop_after_reply<F, O, E>(engine: &Engine<Null>, register: F)
+    where
+        F: Future<Output = Result<O, E>>,
+        E: Debug,
+    {
+        drop(register.await.expect("registration"));
+        flush(engine).await;
+    }
+
+    /// Every window, for one registration kind.
+    async fn all_windows<O, E>(
+        engine: &Engine<Null>,
+        register: impl for<'a> Fn(&'a Engine<Null>) -> Pin<Box<dyn Future<Output = Result<O, E>> + 'a>>,
+    ) where
+        E: Debug,
+    {
+        drop_after_enqueue(engine, register(engine)).await;
+        drop_after_commit(engine, register(engine)).await;
+        drop_after_reply(engine, register(engine)).await;
+    }
+
+    #[wasm_bindgen_test]
+    async fn dropped_font_registration_still_releases_it() {
+        let (engine, rx) = engine(Default::default()).await;
+        all_windows(&engine, |engine| {
+            Box::pin(engine.font(FontSource::bytes(vec![0u8; 8])))
+        })
+        .await;
+        balance::assert_balanced(&rx);
+    }
+
+    #[wasm_bindgen_test]
+    async fn dropped_image_registration_still_releases_it() {
+        let (engine, rx) = engine(Default::default()).await;
+        all_windows(&engine, |engine| {
+            Box::pin(engine.image(ImageData::<Rgba8>::new(1, 1, vec![0u8; 4]).expect("image data")))
+        })
+        .await;
+        balance::assert_balanced(&rx);
+    }
+
+    #[wasm_bindgen_test]
+    async fn dropped_shader_registration_still_releases_it() {
+        let (engine, rx) = engine(Default::default()).await;
+        all_windows(&engine, |engine| {
+            Box::pin(engine.shader(ShaderSource::wgsl("@fragment fn f() { }")))
+        })
+        .await;
+        balance::assert_balanced(&rx);
+    }
+
+    #[wasm_bindgen_test]
+    async fn dropped_surface_creation_still_destroys_it() {
+        let (engine, rx) = engine(Default::default()).await;
+        all_windows(&engine, |engine| {
+            Box::pin(engine.surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16)))
+        })
+        .await;
+        balance::assert_balanced(&rx);
+    }
+
+    /// A registration the backend refused enqueues no removal — the
+    /// resource never existed — whether the caller awaited the error or
+    /// dropped the future on the way.
+    #[wasm_bindgen_test]
+    async fn rejected_registrations_enqueue_no_removal() {
+        let reject = std::collections::HashSet::from([
+            NullReject::Surface,
+            NullReject::Font,
+            NullReject::Image,
+            NullReject::Shader,
+        ]);
+        let (engine, rx) = engine(reject).await;
+        assert!(
+            engine.font(FontSource::bytes(vec![0u8; 8])).await.is_err(),
+            "font"
+        );
+        assert!(
+            engine
+                .image(ImageData::<Rgba8>::new(1, 1, vec![0u8; 4]).expect("image data"))
+                .await
+                .is_err(),
+            "image"
+        );
+        assert!(
+            engine
+                .shader(ShaderSource::wgsl("@fragment fn f() { }"))
+                .await
+                .is_err(),
+            "shader"
+        );
+        assert!(
+            engine
+                .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))
+                .await
+                .is_err(),
+            "surface"
+        );
+        // Dropped before the rejected reply: the enqueued removal finds
+        // no committed resource and reports nothing.
+        drop_after_enqueue(
+            &engine,
+            engine.image(ImageData::<Rgba8>::new(1, 1, vec![0u8; 4]).expect("image data")),
+        )
+        .await;
+        flush(&engine).await;
+        balance::assert_balanced(&rx);
+    }
+}

@@ -549,7 +549,11 @@ On wasm32 `Engine::new`, `font`, `image`, `shader`, `surface`, `render`, `memory
 `finish_timings`, and `Surface::readback` are asynchronous. Hosts await these
 methods from their event loop. Recording, edits, resource drops and signal
 notifications remain synchronous and enqueue ordered work. An operation already
-enqueued completes even if its reply future is dropped. Engine drop enqueues
+enqueued completes even if its reply future is dropped. The registration
+futures own their backend id from the moment the request is enqueued, so
+dropping `font`, `image`, `shader` or `surface` before the reply still releases
+the allocation once the backend commits it; a rejected request releases
+nothing. Engine drop enqueues
 shutdown after preceding operations; remaining handles become disconnected.
 Host notifications arriving during an awaited render request the next frame.
 Hosts serialize frame requests and continue honoring `Next` and the wake callback.

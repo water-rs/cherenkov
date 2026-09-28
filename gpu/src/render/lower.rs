@@ -1256,31 +1256,53 @@ impl<'a> Lowering<'a> {
             self.transform = cherenkov::snap_animating(self.transform);
             content_space = cherenkov::snap_animating(content_space);
         }
-        let result = self.with_clip(
-            node.clip.as_ref(),
-            |s, glyphs| {
-                s.transform = content_space;
-                if node.filter.is_some()
-                    || node.opacity < 1.0
-                    || node.blend != cherenkov::BlendMode::Normal
-                    // The root already renders into the surface target.
-                    || (id != tree.root() && node.blends_within())
-                {
-                    let inner = s.clip;
-                    s.isolate(
-                        inner,
-                        node.filter,
-                        node.opacity,
-                        node.blend,
-                        |s, glyphs| s.layer_items(id, node, tree, caches, glyphs),
+        let isolates = node.filter.is_some()
+            || node.opacity < 1.0
+            || node.blend != cherenkov::BlendMode::Normal
+            // The root already renders into the surface target.
+            || (id != tree.root() && node.blends_within());
+        let result = if isolates && node.filter.is_none() && !is_destructive(node.blend) {
+            // The layer clip applies inside the scratch only; the composite
+            // runs under the clip in force outside the layer.
+            self.isolate(
+                None,
+                None,
+                node.opacity,
+                node.blend,
+                |s, glyphs| {
+                    s.with_clip(
+                        node.clip.as_ref(),
+                        |s, glyphs| {
+                            s.transform = content_space;
+                            s.layer_items(id, node, tree, caches, glyphs)
+                        },
                         glyphs,
                     )
-                } else {
-                    s.layer_items(id, node, tree, caches, glyphs)
-                }
-            },
-            glyphs,
-        );
+                },
+                glyphs,
+            )
+        } else {
+            self.with_clip(
+                node.clip.as_ref(),
+                |s, glyphs| {
+                    s.transform = content_space;
+                    if isolates {
+                        let inner = s.clip;
+                        s.isolate(
+                            inner,
+                            node.filter,
+                            node.opacity,
+                            node.blend,
+                            |s, glyphs| s.layer_items(id, node, tree, caches, glyphs),
+                            glyphs,
+                        )
+                    } else {
+                        s.layer_items(id, node, tree, caches, glyphs)
+                    }
+                },
+                glyphs,
+            )
+        };
         self.transform = saved;
         self.animating = saved_animating;
         result

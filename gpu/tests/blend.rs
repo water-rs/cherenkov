@@ -10,6 +10,7 @@ use cherenkov_gpu::{Gpu, GpuConfig};
 const RED: WorkingColor = WorkingColor::new([1.0, 0.0, 0.0, 1.0]);
 const BLUE: WorkingColor = WorkingColor::new([0.0, 0.0, 1.0, 1.0]);
 const GREEN: WorkingColor = WorkingColor::new([0.0, 1.0, 0.0, 1.0]);
+const GREY: WorkingColor = WorkingColor::new([0.5, 0.5, 0.5, 1.0]);
 /// HDR primaries so a `PlusLighter` sum exceeds SDR white.
 const HDR_RED: WorkingColor = WorkingColor::new([1.5, 0.0, 0.0, 1.0]);
 const HDR_BLUE: WorkingColor = WorkingColor::new([0.0, 0.0, 1.25, 1.0]);
@@ -447,5 +448,90 @@ fn clipped_blend_layer_scales_source_by_clip_coverage() -> Result<(), Box<dyn st
         "clear at half-covered edge",
     );
     approx(px(6, 9), [0.0; 4], "clear inside clip");
+    Ok(())
+}
+
+/// A destructive child of the surface root composites against the surface
+/// clear colour — the scene root is not isolated, as in the oracle. `DestIn`
+/// keeps the backdrop where the source covers it and zeroes the rest
+/// (transparent, not the clear colour); Clear empties the surface; Src
+/// writes the source verbatim.
+#[test]
+fn destructive_child_of_root_clears_the_surface_clear_colour()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(engine) = engine() else {
+        return Ok(());
+    };
+    for (mode, left, right) in [
+        (BlendMode::DestIn, RED, WorkingColor::new([0.0; 4])),
+        (
+            BlendMode::Clear,
+            WorkingColor::new([0.0; 4]),
+            WorkingColor::new([0.0; 4]),
+        ),
+        (BlendMode::Src, BLUE, WorkingColor::new([0.0; 4])),
+    ] {
+        let surface = engine.surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))?;
+        surface.clear_color(GREY);
+        let cutout = surface.layer();
+        surface.update(|tx| {
+            tx[surface.root()].content(surface.record(|c| {
+                c.fill(Rect::new(0.0, 0.0, 8.0, 8.0), RED);
+            }));
+            tx[surface.root()].push(&cutout);
+            tx[&cutout].blend(mode).content(surface.record(|c| {
+                c.fill(Rect::new(0.0, 0.0, 4.0, 8.0), BLUE);
+            }));
+        });
+        engine.render(cherenkov::FrameTime::now())?;
+        let pixels = surface.readback()?.pixels;
+        let pixel = |x: usize, y: usize| pixels[y * 8 + x];
+        for (x, expected) in [(1usize, left), (6usize, right)] {
+            let px = pixel(x, 3);
+            for (got, want) in px.iter().zip(expected.components) {
+                assert!(
+                    (*got - want).abs() < 0.02,
+                    "{mode:?} x={x}: {px:?} != {expected:?}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The same destructive child under a real intermediate layer stays
+/// isolated: the `DestIn` cuts the pass's own content, and the cleared
+/// region reads back as the surface clear colour through the composite.
+#[test]
+fn destructive_child_of_an_intermediate_layer_stays_isolated()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(engine) = engine() else {
+        return Ok(());
+    };
+    let surface = engine.surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))?;
+    surface.clear_color(GREY);
+    let pass = surface.layer();
+    let cutout = surface.layer();
+    surface.update(|tx| {
+        tx[surface.root()].push(&pass);
+        tx[&pass].content(surface.record(|c| {
+            c.fill(Rect::new(0.0, 0.0, 8.0, 8.0), RED);
+        }));
+        tx[&pass].push(&cutout);
+        tx[&cutout]
+            .blend(BlendMode::DestIn)
+            .content(surface.record(|c| {
+                c.fill(Rect::new(0.0, 0.0, 4.0, 8.0), WorkingColor::WHITE);
+            }));
+    });
+    engine.render(cherenkov::FrameTime::now())?;
+    let pixels = surface.readback()?.pixels;
+    let pixel = |x: usize, y: usize| pixels[y * 8 + x];
+    for (x, expected) in [(1usize, RED), (6usize, GREY)] {
+        let px = pixel(x, 3);
+        for (got, want) in px.iter().zip(expected.components) {
+            assert!((*got - want).abs() < 0.02, "x={x}: {px:?} != {expected:?}");
+        }
+    }
     Ok(())
 }

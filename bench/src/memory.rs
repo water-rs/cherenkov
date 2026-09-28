@@ -391,6 +391,7 @@ pub(crate) fn wgpu_allocator(
     })
 }
 
+#[cfg(any(feature = "skia", all(feature = "skia-metal", target_vendor = "apple")))]
 pub(crate) fn skia_budget(api: &'static str, bytes: usize) -> Reading<SkiaBudget> {
     match u64::try_from(bytes) {
         Ok(bytes) => Reading::Measured(SkiaBudget { api, bytes }),
@@ -425,16 +426,7 @@ pub(crate) fn wgpu_vk_memory_budget(
     vk_memory_budget(instance, hal_device.raw_physical_device(), adapter_name)
 }
 
-#[cfg(all(
-    target_os = "linux",
-    any(
-        feature = "cherenkov",
-        feature = "cherenkov-vello",
-        feature = "vello-classic",
-        feature = "vello-hybrid",
-        feature = "skia"
-    )
-))]
+#[cfg(all(target_os = "linux", feature = "skia"))]
 pub(crate) fn ash_vk_memory_budget(
     instance: &ash::Instance,
     physical_device: ash::vk::PhysicalDevice,
@@ -892,7 +884,7 @@ mod tests {
 
     #[test]
     fn parses_android_dumpsys_graphics_and_gl_mtrack() {
-        let dumpsys = r#"
+        let dumpsys = r"
 ** MEMINFO in pid 12345 [com.example.app] **
                    Pss  Private  Private  SwapPss     Rss
                  Total    Dirty    Clean    Dirty   Total
@@ -906,7 +898,7 @@ mod tests {
                 Java Heap: 10
                   Graphics: 2048
               TOTAL PSS: 30000
-"#;
+";
         assert_eq!(
             parse_android_dumpsys(dumpsys).unwrap(),
             (2048 * 1024, 13824 * 1024)

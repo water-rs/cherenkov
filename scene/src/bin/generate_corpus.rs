@@ -3263,6 +3263,9 @@ fn run() -> Result<(), SceneError> {
         let mut index = 0;
         for run in &mut sbix {
             for glyph in &mut run.glyphs {
+                #[expect(clippy::cast_precision_loss, reason = "glyph count is small")]
+                let x = 70.113 + index as f32 * 69.0;
+                glyph.x = x;
                 glyph.transform = Some(sbix_transforms[index]);
                 index += 1;
             }
@@ -3271,6 +3274,9 @@ fn run() -> Result<(), SceneError> {
         index = 0;
         for run in &mut cbdt {
             for glyph in &mut run.glyphs {
+                #[expect(clippy::cast_precision_loss, reason = "glyph count is small")]
+                let x = 46.214 + index as f32 * 76.0;
+                glyph.x = x;
                 glyph.transform = Some(cbdt_transforms[index]);
                 index += 1;
             }
@@ -3280,17 +3286,17 @@ fn run() -> Result<(), SceneError> {
         corpus.scene_with_blobs(
             "text-bitmap-glyph-transform",
             440,
-            300,
+            195,
             bitmap_white,
             |l| {
                 l.layer(|row| {
-                    row.transform(Affine::translate((100.0, 90.0)));
+                    row.transform(Affine::translate((0.0, 15.439)));
                     for run in &sbix {
                         row.glyphs(run.clone());
                     }
                 });
                 l.layer(|row| {
-                    row.transform(Affine::translate((40.0, 225.0)));
+                    row.transform(Affine::translate((0.0, 88.392)));
                     for run in &cbdt {
                         row.glyphs(run.clone());
                     }

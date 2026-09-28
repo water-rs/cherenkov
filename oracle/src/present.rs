@@ -55,10 +55,12 @@ pub fn present_linear_p3(headroom: f64, image: &Image) -> Image {
 /// Quantizes a presented image to the unorm-8 steps a destination texture
 /// stores.
 ///
-/// `round(c * 255) / 255` per channel — the value an ideal presenter
-/// stores. Comparing a read-back u8 output against the quantized reference
-/// removes the format's quantization floor from the metric, so what remains
-/// is the presentation pass's own error.
+/// `round(clamp(c, 0, 1) * 255) / 255` per channel — the value an ideal
+/// presenter stores; the store also clamps, which shows for a `>1` alpha
+/// or premultiplied channel (e.g. plus-lighter output). Comparing a
+/// read-back u8 output against the quantized reference removes the format's
+/// quantization floor from the metric, so what remains is the presentation
+/// pass's own error.
 #[must_use]
 pub fn quantize_unorm8(image: &Image) -> Image {
     Image {
@@ -67,7 +69,7 @@ pub fn quantize_unorm8(image: &Image) -> Image {
         pixels: image
             .pixels
             .iter()
-            .map(|p| p.map(|c| (c * 255.0).round() / 255.0))
+            .map(|p| p.map(|c| (c.clamp(0.0, 1.0) * 255.0).round() / 255.0))
             .collect(),
     }
 }

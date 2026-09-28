@@ -208,7 +208,9 @@ fn decode_glyph(
             }
             (
                 bytes
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .flat_map(|pixel| [pixel[2], pixel[1], pixel[0], pixel[3]])
                     .collect(),
                 true,

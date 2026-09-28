@@ -787,6 +787,7 @@ fn cpu_use(prepare_cpu: Option<u32>, samples: &[FrameSample]) -> BTreeMap<u32, C
 /// What [`run_frames`] collected.
 struct Window {
     samples: Vec<FrameSample>,
+    /// Warmup-frame captures only — measured frames sample nothing.
     memory_samples: Vec<MemorySnapshot>,
     meter: Option<energy::Meter>,
     start: Instant,
@@ -801,7 +802,11 @@ const PACING_TOLERANCE: Duration = Duration::from_millis(1);
 ///
 /// With `--rate` each measured frame starts on `start + n / rate` —
 /// the one sleep in the bench is frame pacing — and the energy meter
-/// wraps exactly the measured window.
+/// wraps exactly the measured window. Memory is sampled after warmup
+/// frames only: the measured window holds pacing, encode, submit and
+/// GPU-timing attribution and nothing else — on Android a capture
+/// walks `/proc/self/smaps_rollup` and a full snapshot spawns `dumpsys
+/// gpu --gpumem`, which would tax the pacing and energy it brackets (#162).
 fn run_frames(
     engine: &mut dyn Engine,
     input: &EncodeInput<'_>,
@@ -816,7 +821,7 @@ fn run_frames(
     let mut missed_deadlines = 0u32;
     let mut samples = Vec::with_capacity(frames as usize);
     let total_frames = warmup + frames;
-    let mut memory_samples = Vec::with_capacity(total_frames as usize);
+    let mut memory_samples = Vec::with_capacity(warmup as usize);
     for frame in 0..total_frames {
         if frame == warmup {
             // The energy window and the pacing clock both open
@@ -851,12 +856,12 @@ fn run_frames(
         let submit = engine.submit(u64::from(frame), false)?;
         let t2 = Instant::now();
         let cpu_end = affinity::current_cpu();
-        let detail = if frame + 1 == total_frames {
-            SampleDetail::Full
-        } else {
-            SampleDetail::Frame
-        };
-        memory_samples.push(MemorySnapshot::capture(engine.memory(), detail));
+        if frame < warmup {
+            memory_samples.push(MemorySnapshot::capture(
+                engine.memory(),
+                SampleDetail::Frame,
+            ));
+        }
         if frame >= warmup {
             samples.push(FrameSample {
                 encode_seconds: t1.duration_since(t0).as_secs_f64(),
@@ -988,14 +993,16 @@ fn measure_scene(
         window_hint,
         measure_energy,
     )?;
-    let mut memory_samples = vec![prepare_memory];
-    memory_samples.extend(window.memory_samples.iter().cloned());
     let window_end = Instant::now();
     let window_seconds = window_end.duration_since(window.start).as_secs_f64();
     let energy_outcome = window
         .meter
         .map(|m| m.finish(window.start, window_end, frames))
         .transpose()?;
+    // The steady snapshot lands after the pacing window and the meter
+    // close, so its capture is never charged to a measured frame.
+    let steady_memory = MemorySnapshot::capture(engine.memory(), SampleDetail::Full);
+    let memory_samples = memory_samples(prepare_memory, &window.memory_samples, steady_memory);
     let missed_deadlines = window.missed_deadlines;
     let samples = window.samples;
     let pacing = rate.map(|requested_hz| Pacing {
@@ -1048,6 +1055,21 @@ fn measure_scene(
         memory: MemoryReport::new(idle_memory, &memory_samples),
         device: engine.device(),
     })
+}
+
+/// The sample list a report's peak folds over: prepare, the warmup
+/// captures `run_frames` returned — measured frames sample nothing —
+/// and the steady snapshot taken after the window and meter closed.
+fn memory_samples(
+    prepare: MemorySnapshot,
+    warmup: &[MemorySnapshot],
+    steady: MemorySnapshot,
+) -> Vec<MemorySnapshot> {
+    let mut samples = Vec::with_capacity(warmup.len() + 2);
+    samples.push(prepare);
+    samples.extend(warmup.iter().cloned());
+    samples.push(steady);
+    samples
 }
 
 fn measure_placement(
@@ -1155,7 +1177,8 @@ struct Sweep {
     probes: Vec<CapacityProbe>,
     /// The feature that stopped the sweep before its first probe.
     unsupported: Option<(cherenkov_scene::Feature, Option<&'static str>)>,
-    /// Prepare and per-frame snapshots across every probe, in run order.
+    /// Prepare, warmup-frame and post-window snapshots across every
+    /// probe, in run order.
     memory_samples: Vec<MemorySnapshot>,
     /// The sweep converged or saturated — or never ran (unsupported).
     done: bool,
@@ -1206,7 +1229,9 @@ fn frame_seconds(s: &FrameSample) -> f64 {
 
 /// One capacity probe: prepare `scene` (already at factor `k`) and run
 /// the same warmup + measured frame loop `measure` runs, flat out.
-/// Returns the p99 frame seconds and the probe's memory snapshots.
+/// Returns the p99 frame seconds and the probe's memory snapshots:
+/// prepare, one per warmup frame, and a full snapshot after the
+/// window.
 fn probe_once(
     engine: &mut dyn Engine,
     scene: &Scene,
@@ -1218,9 +1243,8 @@ fn probe_once(
     engine.prepare(&input)?;
     let prepare_memory = MemorySnapshot::capture(engine.memory(), SampleDetail::Full);
     let window = run_frames(engine, &input, frames, warmup, None, Duration::ZERO, false)?;
-    let mut memory = Vec::with_capacity(window.memory_samples.len() + 1);
-    memory.push(prepare_memory);
-    memory.extend(window.memory_samples.iter().cloned());
+    let steady_memory = MemorySnapshot::capture(engine.memory(), SampleDetail::Full);
+    let memory = memory_samples(prepare_memory, &window.memory_samples, steady_memory);
     let times: Vec<f64> = window.samples.iter().map(frame_seconds).collect();
     let p99 = percentiles(&times).map(|p| p[2]).ok_or_else(|| {
         BenchError::Engine("capacity: --frames 0 leaves nothing to measure".into())

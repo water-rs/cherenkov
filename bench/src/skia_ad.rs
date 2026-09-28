@@ -265,6 +265,7 @@ fn encode_draw(
             image,
             dst,
             sampling,
+            ..
         } => {
             let (w, h, rgba) = convert::decode_png(blob(blobs, *image)?)?;
             let img = sk_image(w, h, &rgba);

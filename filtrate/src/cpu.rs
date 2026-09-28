@@ -11,7 +11,7 @@ use filtrate_core::{
 };
 use wide::f32x4;
 
-use crate::filters::{BlendWithImage, Blur, GaussianBlur};
+use crate::filters::{BlendWithImage, Blur, GAUSSIAN_RADIUS_PER_SIGMA, GaussianBlur};
 
 /// A 4x4 matrix on premultiplied RGBA, stored as columns: the output is
 /// `c[0] * r + c[1] * g + c[2] * b + c[3] * a`.
@@ -192,48 +192,84 @@ fn gaussian_blur(sigma: f32, image: &mut CpuImage<'_>) {
     let height = image.pixels.len() / width;
     debug_assert_eq!(height * width, image.pixels.len());
     let sigma = sigma.max(0.001);
-    let radius = (sigma * 3.0).ceil() as usize;
-    if radius == 0 {
-        return;
-    }
+    let radius = (sigma * GAUSSIAN_RADIUS_PER_SIGMA).ceil() as usize;
+    let (weights, weight_total) = gaussian_weights(sigma, radius);
     let mut temporary = vec![[0.0; 4]; image.pixels.len()];
     gaussian_pass(
         image.pixels,
         &mut temporary,
         width,
         height,
-        radius,
         false,
-        sigma,
+        &weights,
+        weight_total,
     );
-    gaussian_pass(&temporary, image.pixels, width, height, radius, true, sigma);
+    gaussian_pass(
+        &temporary,
+        image.pixels,
+        width,
+        height,
+        true,
+        &weights,
+        weight_total,
+    );
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::suboptimal_flops,
+    reason = "the blur loop mirrors WGSL f32 offsets and accumulation order"
+)]
+fn gaussian_weights(sigma: f32, radius: usize) -> (Vec<f32>, f32) {
+    let k = 1.0 / (sigma * std::f32::consts::SQRT_2);
+    let mut edge = gaussian_erf(0.5 * k);
+    let mut weights = Vec::with_capacity(radius + 1);
+    weights.push(edge);
+    let mut total = edge;
+    for offset in 1..=radius {
+        let next_edge = gaussian_erf((offset as f32 + 0.5) * k);
+        let weight = 0.5 * (next_edge - edge);
+        weights.push(weight);
+        total += 2.0 * weight;
+        edge = next_edge;
+    }
+    (weights, total)
 }
 
 #[expect(
     clippy::suboptimal_flops,
-    reason = "preserves the WGSL blur recurrence and accumulation order"
+    reason = "matches the Abramowitz and Stegun 7.1.26 WGSL evaluation order"
+)]
+fn gaussian_erf(x: f32) -> f32 {
+    let sign = x.signum();
+    let a = x.abs();
+    let t = 1.0 / (1.0 + 0.327_591_1 * a);
+    let y = 1.0
+        - (((((1.061_405_4 * t - 1.453_152_1) * t + 1.421_413_8) * t - 0.284_496_72) * t
+            + 0.254_829_6)
+            * t
+            * (-a * a).exp());
+    sign * y
+}
+
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "the per-pixel accumulation order mirrors WGSL"
 )]
 fn gaussian_pass(
     input: &[[f32; 4]],
     output: &mut [[f32; 4]],
     width: usize,
     height: usize,
-    radius: usize,
     vertical: bool,
-    sigma: f32,
+    weights: &[f32],
+    weight_total: f32,
 ) {
-    let inv_two_sigma_sq = 1.0 / (2.0 * sigma * sigma);
-    let ratio_step = (-2.0 * inv_two_sigma_sq).exp();
     for y in 0..height {
         for x in 0..width {
             let center = y * width + x;
-            let mut sum = input[center];
-            let mut weight_total = 1.0;
-            let mut side_weight = 1.0;
-            let mut side_ratio = (-inv_two_sigma_sq).exp();
-            for offset in 1..=radius {
-                side_weight *= side_ratio;
-                side_ratio *= ratio_step;
+            let mut sum = input[center].map(|channel| channel * weights[0]);
+            for (offset, weight) in weights.iter().enumerate().skip(1) {
                 let (minus, plus) = if vertical {
                     let y0 = y.saturating_sub(offset) * width + x;
                     let y1 = y.saturating_add(offset).min(height - 1) * width + x;
@@ -244,9 +280,8 @@ fn gaussian_pass(
                     (input[y * width + x0], input[y * width + x1])
                 };
                 for channel in 0..4 {
-                    sum[channel] += (minus[channel] + plus[channel]) * side_weight;
+                    sum[channel] += (minus[channel] + plus[channel]) * *weight;
                 }
-                weight_total += 2.0 * side_weight;
             }
             for channel in &mut sum {
                 *channel /= weight_total;
@@ -546,10 +581,85 @@ fn hsl_to_rgb(hsl: [f32; 3]) -> [f32; 3] {
 
 #[cfg(test)]
 mod tests {
-    use super::{hsl_to_rgb, rgb_to_hsl};
+    use super::{
+        GAUSSIAN_RADIUS_PER_SIGMA, gaussian_blur, gaussian_weights, hsl_to_rgb, rgb_to_hsl,
+    };
     use crate::FilterImage;
     use crate::filters::{BlendMode, BlendWithImage};
     use filtrate_core::{CpuFilter, CpuImage, Filter, WorkingSpace};
+
+    #[expect(
+        clippy::suboptimal_flops,
+        reason = "the reference follows the Abramowitz and Stegun 7.1.26 evaluation order"
+    )]
+    fn erf_reference(x: f64) -> f64 {
+        let sign = x.signum();
+        let a = x.abs();
+        let t = 1.0 / (1.0 + 0.327_591_1 * a);
+        let y = 1.0
+            - (((((1.061_405_429 * t - 1.453_152_027) * t + 1.421_413_741) * t - 0.284_496_736)
+                * t
+                + 0.254_829_592)
+                * t
+                * (-a * a).exp());
+        sign * y
+    }
+
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss,
+        clippy::suboptimal_flops,
+        reason = "fixed positive test sigmas keep reference radii and offsets bounded"
+    )]
+    #[test]
+    fn gaussian_weights_match_integrated_kernel() {
+        for sigma in [0.3_f32, 0.6, 1.7, 4.0, 12.0] {
+            let radius = (sigma * GAUSSIAN_RADIUS_PER_SIGMA).ceil() as usize;
+            let (weights, total) = gaussian_weights(sigma, radius);
+            let k = 1.0 / (f64::from(sigma) * std::f64::consts::SQRT_2);
+            let mut edge = erf_reference(0.5 * k);
+            let mut reference = vec![edge];
+            for offset in 1..=radius {
+                let next_edge = erf_reference((offset as f64 + 0.5) * k);
+                reference.push(0.5 * (next_edge - edge));
+                edge = next_edge;
+            }
+
+            for (offset, (actual, expected)) in weights.iter().zip(reference).enumerate() {
+                assert!(
+                    (f64::from(*actual) - expected).abs() <= 2.0e-6,
+                    "sigma {sigma}, offset {offset}: expected {expected}, got {actual}"
+                );
+            }
+
+            let normalized_sum = (weights[0] + 2.0 * weights.iter().skip(1).sum::<f32>()) / total;
+            assert!(
+                (normalized_sum - 1.0).abs() <= 1.0e-6,
+                "sigma {sigma}: normalized sum is {normalized_sum}"
+            );
+        }
+    }
+
+    #[test]
+    fn gaussian_blur_at_minimum_sigma_is_identity() {
+        let expected = [
+            [0.25, 0.5, 0.75, 1.0],
+            [2.0, 1.0, 0.5, 1.0],
+            [0.0, 0.25, 0.125, 0.5],
+            [4.0, 3.0, 2.0, 1.0],
+        ];
+        let mut pixels = expected;
+        gaussian_blur(
+            0.001,
+            &mut CpuImage {
+                pixels: &mut pixels,
+                top: 0,
+                size: (2, 2),
+            },
+        );
+        assert_eq!(pixels, expected);
+    }
 
     fn apply_blend(mode: BlendMode, pixels: &mut [[f32; 4]]) {
         let filter = BlendWithImage {

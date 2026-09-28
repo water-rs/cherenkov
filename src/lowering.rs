@@ -178,6 +178,19 @@ impl<T: Operation> Lowered<T> {
     }
 }
 
+impl<T> Lowered<T> {
+    /// Heap bytes of the operation and span buffers, including each
+    /// operation's own allocations as reported by `nested`.
+    fn heap_bytes(&self, mut nested: impl FnMut(&T) -> u64) -> u64 {
+        let mut bytes = (self.ops.capacity() * size_of::<T>()
+            + self.spans.capacity() * size_of::<Span>()) as u64;
+        for op in &self.ops {
+            bytes += nested(op);
+        }
+        bytes
+    }
+}
+
 /// Append a nested picture or an expanded colour glyph. Its operations belong
 /// to the enclosing source command's span.
 ///
@@ -454,5 +467,30 @@ impl<O: Operation, E> Content<O, E> {
         self.emissions
             .iter_mut()
             .for_each(|entry| *entry = Realization::default());
+    }
+
+    /// Heap bytes retained by this content: the source list, the lowered
+    /// operations and the device realizations. `command`, `op` and
+    /// `emission` report each element's own heap allocations.
+    ///
+    /// The source list is an `Arc`: contents shared with another layer's
+    /// picture are counted at each retain.
+    pub fn heap_bytes(
+        &self,
+        mut command: impl FnMut(&Command) -> u64,
+        mut op: impl FnMut(&O) -> u64,
+        mut emission: impl FnMut(&E) -> u64,
+    ) -> u64 {
+        let mut bytes = self.list.display_list().heap_bytes(&mut command)
+            + (self.emissions.capacity() * size_of::<Realization<E>>()) as u64;
+        if let Some(lowered) = &self.lowered {
+            bytes += lowered.heap_bytes(&mut op);
+        }
+        for entry in &self.emissions {
+            if let Some(data) = &entry.data {
+                bytes += emission(data);
+            }
+        }
+        bytes
     }
 }

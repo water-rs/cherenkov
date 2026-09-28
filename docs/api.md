@@ -182,7 +182,10 @@ let window = engine.surface(interop::apple::LayerTarget::new(ca_layer))?;  // sy
 let embedded = engine.surface(interop::android::SurfaceControlTarget::new(parent))?;
 let plain = engine.surface(interop::window::Target::new(raw_window_handle))?; // single surface
 let snapshot = engine.surface(Offscreen::new(size, OffscreenFormat::LinearF16))?;
+let panel = engine.surface(Bands::new(size, OffscreenFormat::LinearF16, |band| dma.send(band)))?; // Raster
 ```
+
+- **Output storage follows the target.** An `Offscreen` surface holds exactly one full-frame buffer, in the `OffscreenFormat` the host asked for — it is the readback image. A `Bands` target on `Raster` holds no framebuffer at all: each rasterized band (a row strip with its filter apron) is delivered to the sink in row order and its storage reused, so peak pixel memory is band-sized, not frame-sized. `Bands` surfaces are not readable; `readback` returns an error. Working scratch never scales with the frame: bands, coverage accumulators and isolation aprons are pooled per worker and bounded by band size (#114).
 
 - **System-compositor parents.** Targets that expose one (`CALayer`, `SurfaceControl`, a DirectComposition visual, a Wayland subsurface) let the engine build **planes**. Most layers are composited inside the engine onto one plane. Eligible layers are promoted automatically to their own system layers: video frames, custom GPU content and large stable layers. A layer is not promoted when it is under a backdrop, uses a non-default blend or has a clip the system cannot express. Hardware overlay budgets also limit promotion.
 - **Many small surfaces are first-class.** A native backend embeds one surface per self-drawn component, and a list may hold dozens. All surfaces share the engine's pipelines, atlases and caches. Creating and dropping one is cheap. All dirty surfaces render in one submission per frame.

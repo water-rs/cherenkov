@@ -128,6 +128,11 @@ impl Mesh {
         }
     }
 
+    /// Heap bytes of the shared patch grid.
+    pub fn heap_bytes(&self) -> u64 {
+        (self.patches.len() * size_of::<Patch>()) as u64
+    }
+
     /// Evaluate at the device pixel centre; coverage is supplied by the draw.
     #[expect(
         clippy::cast_possible_truncation,

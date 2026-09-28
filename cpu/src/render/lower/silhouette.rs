@@ -19,7 +19,7 @@ impl Lowering<'_> {
         shape: &ShapeData,
         shadow: &Shadow,
     ) -> Result<(), RenderError> {
-        if !shadow.sigma.is_finite() || !shadow.spread.is_finite() {
+        if !shadow.spread.is_finite() {
             return Err(RenderError::Render("non-finite shadow parameters".into()));
         }
         if !self.transform.is_finite() || !self.transform.inverse().is_finite() {
@@ -28,7 +28,7 @@ impl Lowering<'_> {
         if !shadow.offset.x.is_finite() || !shadow.offset.y.is_finite() {
             return Err(RenderError::Render("non-finite shadow offset".into()));
         }
-        let sigma = shadow.sigma.max(0.0);
+        let sigma = shadow.sigma;
         let [ma, mb, mc, md, _, _] = self.transform.as_coeffs();
         let (px, py) = capture_padding(self.transform, sigma, shadow.spread);
         if !px.is_finite()

@@ -41,18 +41,17 @@ pub fn sigma_max(t: Affine) -> f64 {
     p.midpoint(disc).sqrt()
 }
 
-/// A semantic shape as a local `BezPath`, or `None` for a `ContinuousRect`,
-/// which has no `kurbo` path form.
+/// A semantic shape as a local `BezPath`.
 #[must_use]
-pub fn shape_path(shape: &ShapeData, tolerance: f64) -> Option<BezPath> {
+pub fn shape_path(shape: &ShapeData, tolerance: f64) -> BezPath {
     match shape {
-        ShapeData::Rect(r) => Some(r.to_path(tolerance)),
-        ShapeData::RoundedRect(rr) => Some(rr.to_path(tolerance)),
-        ShapeData::Circle(c) => Some(c.to_path(tolerance)),
-        ShapeData::Ellipse(e) => Some(e.to_path(tolerance)),
-        ShapeData::Line(l) => Some(l.to_path(tolerance)),
-        ShapeData::Continuous(_) => None,
-        ShapeData::Path { elements, .. } => Some(BezPath::from_vec(elements.clone())),
+        ShapeData::Rect(r) => r.to_path(tolerance),
+        ShapeData::RoundedRect(rr) => rr.to_path(tolerance),
+        ShapeData::Circle(c) => c.to_path(tolerance),
+        ShapeData::Ellipse(e) => e.to_path(tolerance),
+        ShapeData::Line(l) => l.to_path(tolerance),
+        ShapeData::Continuous(c) => c.to_path(tolerance),
+        ShapeData::Path { elements, .. } => BezPath::from_vec(elements.clone()),
     }
 }
 

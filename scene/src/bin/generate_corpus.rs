@@ -616,6 +616,103 @@ fn run() -> Result<(), SceneError> {
         );
     });
 
+    // Every analytic shape family x every join class, each at all three
+    // caps, solid and dashed. The dashed row's period (18) divides the box
+    // edge (36), so every corner sits centred in a dash.
+    let families: &[(&str, fn(Rect) -> Shape)] = &[
+        ("rect", |r| Shape::Rect(r)),
+        ("rounded", |r| {
+            Shape::RoundedRect(RoundedRect::from_rect(
+                r,
+                RoundedRectRadii::new(0.0, 2.0, 8.0, 14.0),
+            ))
+        }),
+        ("continuous", |r| {
+            Shape::Continuous(cherenkov_scene::ContinuousRect::new(r, 10.0, 0.6))
+        }),
+        ("continuous-sharp", |r| {
+            Shape::Continuous(cherenkov_scene::ContinuousRect::new(r, 0.0, 0.6))
+        }),
+        ("continuous-s00", |r| {
+            Shape::Continuous(cherenkov_scene::ContinuousRect::new(r, 0.0, 0.0))
+        }),
+        ("ellipse", |r| {
+            Shape::Ellipse(Ellipse::new(r.center(), (18.0, 12.0), 0.0))
+        }),
+    ];
+    let joins: &[(&str, kurbo::Join, f64)] = &[
+        ("miter-lo", kurbo::Join::Miter, 1.0),
+        ("miter-rt2", kurbo::Join::Miter, std::f64::consts::SQRT_2),
+        ("miter-hi", kurbo::Join::Miter, 4.0),
+        ("round", kurbo::Join::Round, 4.0),
+        ("bevel", kurbo::Join::Bevel, 4.0),
+    ];
+    for &(family, build) in families {
+        for &(suffix, join, miter_limit) in joins {
+            corpus.scene(
+                &format!("stroke-join-{family}-{suffix}"),
+                156,
+                108,
+                white,
+                |l| {
+                    for (col, cap) in [kurbo::Cap::Butt, kurbo::Cap::Round, kurbo::Cap::Square]
+                        .iter()
+                        .enumerate()
+                    {
+                        let x0 = 12.0 + 48.0 * col as f64;
+                        for row in 0..2 {
+                            let y0 = 12.0 + 48.0 * row as f64;
+                            let dashed = row == 1;
+                            l.stroke(
+                                build(Rect::new(x0, y0, x0 + 36.0, y0 + 36.0)),
+                                StrokeStyle {
+                                    width: 5.0,
+                                    join,
+                                    miter_limit,
+                                    start_cap: *cap,
+                                    end_cap: *cap,
+                                    dash_pattern: if dashed { vec![12.0, 6.0] } else { Vec::new() },
+                                    dash_offset: if dashed { 6.0 } else { 0.0 },
+                                },
+                                solid(if dashed {
+                                    srgb(0.6, 0.1, 0.1)
+                                } else {
+                                    srgb(0.1, 0.3, 0.6)
+                                }),
+                            );
+                        }
+                    }
+                },
+            );
+        }
+    }
+
+    corpus.scene("stroke-caps-mixed", 128, 128, white, |l| {
+        for (i, (start_cap, end_cap)) in [
+            (kurbo::Cap::Butt, kurbo::Cap::Round),
+            (kurbo::Cap::Round, kurbo::Cap::Square),
+            (kurbo::Cap::Square, kurbo::Cap::Butt),
+            (kurbo::Cap::Butt, kurbo::Cap::Square),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let y = (i as f64).mul_add(32.0, 24.0);
+            let dashed = i == 3;
+            l.stroke(
+                Shape::Line(Line::new((16.0, y), (112.0, y))),
+                StrokeStyle {
+                    width: 10.0,
+                    start_cap: *start_cap,
+                    end_cap: *end_cap,
+                    dash_pattern: if dashed { vec![16.0, 8.0] } else { Vec::new() },
+                    ..StrokeStyle::default()
+                },
+                solid(srgb(0.1, 0.3, 0.6)),
+            );
+        }
+    });
+
     // ---- Gradients ---------------------------------------------------------
 
     let gradient_rect = Shape::rect(8.0, 8.0, 112.0, 112.0);

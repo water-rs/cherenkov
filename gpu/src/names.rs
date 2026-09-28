@@ -23,6 +23,10 @@ pub const BLEND: &str = "blend-mode";
 /// A backdrop group.
 pub const BACKDROP: &str = "backdrop";
 /// A stroke join or cap combination with no analytic form.
+#[expect(
+    dead_code,
+    reason = "every join and cap combination renders; the name is kept for parity"
+)]
 pub const STROKE_JOIN: &str = "stroke-join";
 /// A colour font (COLR, CBDT or sbix).
 pub const COLOR_FONT: &str = "color-font";

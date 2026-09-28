@@ -15,11 +15,12 @@
 //! difference this backend documents.
 
 use rayon::prelude::*;
+use std::collections::HashMap;
 use std::ops::Range;
 
 use cherenkov::FillRule;
 
-use crate::render::lower::{ClipMask, ClipRef, FrameFilter, IRect, Item};
+use crate::render::lower::{ClipMask, ClipRef, FrameFilter, IRect, Item, SampleEffect};
 use crate::render::paint::PaintData;
 use crate::{Band as BandOut, BandPixels};
 use cherenkov::OffscreenFormat;
@@ -42,23 +43,96 @@ pub struct Scratch {
     /// Isolation-stack colour buffers currently in use.
     stack: Vec<Vec<[f32; 4]>>,
     buffers: Buffers,
+    /// This band's captured backdrops, by group id.
+    captures: Captures,
 }
 
 struct Buffers {
     free: Vec<Vec<[f32; 4]>>,
     coverage: Vec<Vec<f32>>,
+    /// Live colour-buffer bytes and their peak for the current band.
+    meter: Meter,
+}
+
+/// Live pixel-buffer accounting: pixels held across a band's run.
+#[derive(Default)]
+struct Meter {
+    live: usize,
+    /// `live` at reset: the caller's own band buffer, not capture cost.
+    base: usize,
+    peak: usize,
+    /// Whether a backdrop capture ran in the band being metered.
+    captured: bool,
+}
+
+/// The rows one group's captured backdrop holds this band.
+struct Capture {
+    /// `w × rows` premultiplied pixels starting at `y0`.
+    buf: Vec<[f32; 4]>,
+    /// First kept row's device y.
+    y0: usize,
+    /// Kept row count.
+    rows: usize,
+    /// First column (the capture region's `x0`).
+    x0: usize,
+    /// Row stride (the capture region's width).
+    w: usize,
+}
+
+/// This band's captures by backdrop group id.
+type Captures = HashMap<u64, Capture>;
+
+/// Per-band state shared across the recursive `run` calls.
+struct FrameCtx<'a> {
+    /// The surface band rows `[y0, y1)` this run derives from.
+    surface: (usize, usize),
+    /// The surface height.
+    h: usize,
+    /// The band's captured backdrops.
+    captures: &'a mut Captures,
+}
+
+impl Meter {
+    /// Resets the per-band peak around the caller's live buffers (the
+    /// output band buffer is held across `shade` on streamed targets).
+    const fn reset(&mut self) {
+        self.base = self.live;
+        self.peak = self.live;
+        self.captured = false;
+    }
+
+    const fn take(&mut self, len: usize) {
+        self.live += len;
+        self.peak = if self.peak < self.live {
+            self.live
+        } else {
+            self.peak
+        };
+    }
+
+    const fn give(&mut self, len: usize) {
+        self.live -= len;
+    }
+
+    /// The capture-attributable peak: live pixels above the caller's
+    /// baseline at the band's fullest point.
+    const fn delta_peak(&self) -> usize {
+        self.peak - self.base
+    }
 }
 
 impl Scratch {
     /// An empty working set; buffers grow to band size on first use.
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             coverage: Vec::new(),
             stack: Vec::new(),
             buffers: Buffers {
                 free: Vec::new(),
                 coverage: Vec::new(),
+                meter: Meter::default(),
             },
+            captures: Captures::new(),
         }
     }
 }
@@ -69,11 +143,13 @@ impl Buffers {
         let mut buf = self.free.pop().unwrap_or_default();
         buf.clear();
         buf.resize(len, [0.0; 4]);
+        self.meter.take(len);
         buf
     }
 
     /// Returns a colour buffer to the freelist.
     fn give_color(&mut self, buf: Vec<[f32; 4]>) {
+        self.meter.give(buf.len());
         self.free.push(buf);
     }
 
@@ -363,8 +439,29 @@ fn stats(items: &[Item]) -> (u32, u32) {
     (draws, edges)
 }
 
+/// The rows `union`'s capture covers for the surface band
+/// `[y0, y1)`: the union's rows within `reach` of the band.
+fn kept_rows(union: &IRect, reach: usize, band: (usize, usize), h: usize) -> (usize, usize) {
+    let kept0 = usize::try_from(union.y0)
+        .unwrap_or(0)
+        .max(band.0.saturating_sub(reach));
+    let kept1 = usize::try_from(union.y1)
+        .unwrap_or(0)
+        .min(band.1.saturating_add(reach).min(h));
+    (kept0, kept1)
+}
+
 /// Shades one band of `slice` rows (`w * bh` pixels, cleared first),
 /// starting at device row `y0`.
+///
+/// With no `Capture` item the band renders `w * bh` pixels as before.
+/// When a capture exists, the rows its window needs extend past the
+/// band, so the item list runs over an expanded window up to the last
+/// top-level capture, then collapses to the band for the rest.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the band context travels together"
+)]
 fn shade(
     items: &[Item],
     clear: [f32; 4],
@@ -373,11 +470,77 @@ fn shade(
     y0: usize,
     h: usize,
     scratch: &mut Scratch,
+    peak: Option<&std::sync::atomic::AtomicU64>,
 ) -> Result<(), cherenkov::RenderError> {
     let bh = slice.len() / w;
+    for (_, capture) in scratch.captures.drain() {
+        scratch.buffers.give_color(capture.buf);
+    }
+    scratch.buffers.meter.reset();
     slice.fill(clear);
+    let surface = (y0, y0 + bh);
+    // The top-level captures this band serves (captures inside filter
+    // scopes are handled by the scope's own windowed run).
+    let mut captures: Vec<(usize, usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < items.len() {
+        match &items[i] {
+            Item::PushFilter { end, .. } => {
+                i = usize::try_from(*end).unwrap_or(items.len());
+                continue;
+            }
+            Item::Capture { union, reach, .. } => {
+                let (kept0, kept1) = kept_rows(union, *reach, surface, h);
+                if kept0 < kept1 {
+                    captures.push((i, kept0, kept1));
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
     let coverage = std::mem::take(&mut scratch.coverage);
-    let mut acc = Accum::with_buffer(w, bh, coverage);
+    let result = if let Some(&(last, ..)) = captures.last() {
+        shade_windowed(
+            items,
+            clear,
+            slice,
+            w,
+            surface,
+            h,
+            (&captures, last),
+            coverage,
+            scratch,
+        )
+    } else {
+        shade_plain(items, slice, w, surface, h, coverage, scratch)
+    };
+    for buf in scratch.stack.drain(..) {
+        scratch.buffers.give_color(buf);
+    }
+    if scratch.buffers.meter.captured
+        && let Some(peak) = peak
+    {
+        peak.fetch_max(
+            (scratch.buffers.meter.delta_peak() * size_of::<[f32; 4]>()) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    result
+}
+
+/// The band's pass with no capture: `run` over the caller's slice.
+fn shade_plain(
+    items: &[Item],
+    slice: &mut [[f32; 4]],
+    w: usize,
+    surface: (usize, usize),
+    h: usize,
+    coverage: Vec<f32>,
+    scratch: &mut Scratch,
+) -> Result<(), cherenkov::RenderError> {
+    let (y0, y1) = surface;
+    let mut acc = Accum::with_buffer(w, y1 - y0, coverage);
     let mut band = Band { fb: slice, w, y0 };
     let result = run(
         items,
@@ -386,9 +549,103 @@ fn shade(
         &mut acc,
         &mut scratch.stack,
         &mut scratch.buffers,
-        h,
+        &mut FrameCtx {
+            surface,
+            h,
+            captures: &mut scratch.captures,
+        },
     );
-    scratch.buffers.free.append(&mut scratch.stack);
+    scratch.coverage = acc.into_buffer();
+    result
+}
+
+/// The band's pass with top-level captures: `run` over an expanded
+/// window up to the last capture, then over the band for the rest.
+///
+/// The window covers the band plus every capture's `kept ± apron` rows;
+/// the capture canvas clamps to its region inside it. On success the
+/// central rows copy back into `slice` and each live isolation buffer
+/// crops to band size.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the band's captured state travels together"
+)]
+fn shade_windowed(
+    items: &[Item],
+    clear: [f32; 4],
+    slice: &mut [[f32; 4]],
+    w: usize,
+    surface: (usize, usize),
+    h: usize,
+    (captures, last): (&[(usize, usize, usize)], usize),
+    coverage: Vec<f32>,
+    scratch: &mut Scratch,
+) -> Result<(), cherenkov::RenderError> {
+    let (y0, y1) = surface;
+    let bh = y1 - y0;
+    let mut win0 = y0;
+    let mut win1 = y1;
+    for &(item, kept0, kept1) in captures {
+        let Item::Capture { apron, .. } = &items[item] else {
+            unreachable!("scanned item kind");
+        };
+        win0 = win0.min(kept0.saturating_sub(*apron));
+        win1 = win1.max(kept1.saturating_add(*apron));
+    }
+    let win1 = win1.min(h);
+    let rows = win1 - win0;
+    let mut window = scratch.buffers.take_color(w * rows);
+    window.fill(clear);
+    let mut acc = Accum::with_buffer(w, rows, coverage);
+    let mut band = Band {
+        fb: &mut window,
+        w,
+        y0: win0,
+    };
+    let first_pass = run(
+        items,
+        0..last + 1,
+        &mut band,
+        &mut acc,
+        &mut scratch.stack,
+        &mut scratch.buffers,
+        &mut FrameCtx {
+            surface,
+            h,
+            captures: &mut scratch.captures,
+        },
+    );
+    if first_pass.is_ok() {
+        // Collapse to the band: the central rows go to the output slice
+        // and each live isolation buffer shrinks to band size.
+        let first = (y0 - win0) * w;
+        slice.copy_from_slice(&window[first..first + w * bh]);
+        for buf in &mut scratch.stack {
+            let mut cropped = scratch.buffers.take_color(w * bh);
+            cropped.copy_from_slice(&buf[first..first + w * bh]);
+            scratch.buffers.give_color(std::mem::replace(buf, cropped));
+        }
+    }
+    scratch.buffers.give_color(window);
+    if let Err(error) = first_pass {
+        scratch.coverage = acc.into_buffer();
+        return Err(error);
+    }
+    let mut acc = Accum::with_buffer(w, bh, acc.into_buffer());
+    let mut band = Band { fb: slice, w, y0 };
+    let result = run(
+        items,
+        last + 1..items.len(),
+        &mut band,
+        &mut acc,
+        &mut scratch.stack,
+        &mut scratch.buffers,
+        &mut FrameCtx {
+            surface,
+            h,
+            captures: &mut scratch.captures,
+        },
+    );
     scratch.coverage = acc.into_buffer();
     result
 }
@@ -404,12 +661,13 @@ pub fn render_bands(
     fb: &mut [[f32; 4]],
     w: usize,
     h: usize,
+    peak: Option<&std::sync::atomic::AtomicU64>,
 ) -> Result<(u32, u32), cherenkov::RenderError> {
     let stats = stats(items);
     fb.par_chunks_mut(BAND_H * w)
         .enumerate()
         .try_for_each_init(Scratch::new, |scratch, (band, slice)| {
-            shade(items, clear, slice, w, band * BAND_H, h, scratch)
+            shade(items, clear, slice, w, band * BAND_H, h, scratch, peak)
         })?;
     Ok(stats)
 }
@@ -422,13 +680,23 @@ pub fn render_bands_f16(
     out: &mut [[half::f16; 4]],
     w: usize,
     h: usize,
+    peak: Option<&std::sync::atomic::AtomicU64>,
 ) -> Result<(u32, u32), cherenkov::RenderError> {
     let stats = stats(items);
     out.par_chunks_mut(BAND_H * w)
         .enumerate()
         .try_for_each_init(Scratch::new, |scratch, (band, out_slice)| {
             let mut band_px = scratch.buffers.take_color(out_slice.len());
-            let result = shade(items, clear, &mut band_px, w, band * BAND_H, h, scratch);
+            let result = shade(
+                items,
+                clear,
+                &mut band_px,
+                w,
+                band * BAND_H,
+                h,
+                scratch,
+                peak,
+            );
             if result.is_ok() {
                 for (dst, src) in out_slice.iter_mut().zip(band_px.iter()) {
                     *dst = src.map(half::f16::from_f32);
@@ -451,6 +719,7 @@ pub fn render_bands_stream(
     emit: &mut Vec<[half::f16; 4]>,
     format: OffscreenFormat,
     sink: &mut dyn FnMut(BandOut<'_>),
+    peak: Option<&std::sync::atomic::AtomicU64>,
 ) -> Result<(u32, u32), cherenkov::RenderError> {
     let stats = stats(items);
     let (w, h) = size;
@@ -459,7 +728,16 @@ pub fn render_bands_stream(
     let mut y0 = 0;
     while y0 < h {
         let bh = (h - y0).min(BAND_H);
-        if let Err(error) = shade(items, clear, &mut band_px[..w * bh], w, y0, h, &mut scratch) {
+        if let Err(error) = shade(
+            items,
+            clear,
+            &mut band_px[..w * bh],
+            w,
+            y0,
+            h,
+            &mut scratch,
+            peak,
+        ) {
             scratch.buffers.give_color(band_px);
             return Err(error);
         }
@@ -503,9 +781,10 @@ fn run(
     acc: &mut Accum,
     stack: &mut Vec<Vec<[f32; 4]>>,
     buffers: &mut Buffers,
-    h: usize,
+    ctx: &mut FrameCtx<'_>,
 ) -> Result<(), cherenkov::RenderError> {
     let bh = band.fb.len() / band.w;
+    let h = ctx.h;
     let mut i = range.start;
     while i < range.end {
         match &items[i] {
@@ -568,9 +847,11 @@ fn run(
                         &mut filter_acc,
                         &mut filter_stack,
                         buffers,
-                        h,
+                        ctx,
                     );
-                    buffers.free.append(&mut filter_stack);
+                    for buf in filter_stack {
+                        buffers.give_color(buf);
+                    }
                     buffers.give_coverage(filter_acc.into_buffer());
                     result
                 };
@@ -592,6 +873,42 @@ fn run(
                 return Err(cherenkov::RenderError::Render(
                     "unpaired filter scope".into(),
                 ));
+            }
+            Item::Capture {
+                group,
+                region,
+                union,
+                apron,
+                reach,
+                filter,
+                flatten,
+            } => {
+                let (kept0, kept1) = kept_rows(union, *reach, ctx.surface, h);
+                if kept0 < kept1 {
+                    capture_band(
+                        band,
+                        stack.as_slice(),
+                        buffers,
+                        ctx,
+                        *group,
+                        *region,
+                        *apron,
+                        filter.as_ref(),
+                        *flatten,
+                        (kept0, kept1),
+                    )?;
+                }
+            }
+            Item::Sample {
+                group,
+                bounds,
+                clip,
+                effect,
+            } => {
+                let SampleEffect::None = effect;
+                if let Some(capture) = ctx.captures.get(group) {
+                    band.sample(capture, *bounds, clip.as_ref(), stack.as_mut_slice());
+                }
             }
             Item::Shadow {
                 rbox,
@@ -631,6 +948,94 @@ fn apply_filter(
                 cherenkov::RenderError::Unsupported(crate::names::FILTER_GPU_IMAGE)
             }
         })
+}
+
+/// Runs one backdrop group's capture for this band: copies the run's
+/// `win` rows of the nearest semantic level with the trailing `flatten`
+/// clip-only levels composited raw over it, applies the group's chain,
+/// and keeps the `kept` rows for this band's samples.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the item's fields travel together"
+)]
+fn capture_band(
+    band: &Band<'_>,
+    stack: &[Vec<[f32; 4]>],
+    buffers: &mut Buffers,
+    ctx: &mut FrameCtx<'_>,
+    group: u64,
+    region: IRect,
+    apron: usize,
+    filter: Option<&FrameFilter>,
+    flatten: usize,
+    kept: (usize, usize),
+) -> Result<(), cherenkov::RenderError> {
+    let (kept0, kept1) = kept;
+    let w = band.w;
+    let rx0 = usize::try_from(region.x0).unwrap_or(0);
+    let rx1 = usize::try_from(region.x1).unwrap_or(0).min(w);
+    let ry0 = usize::try_from(region.y0).unwrap_or(0);
+    let ry1 = usize::try_from(region.y1).unwrap_or(0);
+    let rw = rx1.saturating_sub(rx0);
+    // The window the chain reads: `kept` plus `apron` rows, clamped to
+    // the region.
+    let win0 = kept0.saturating_sub(apron).max(ry0);
+    let win1 = kept1.saturating_add(apron).min(ry1);
+    let rows = win1.saturating_sub(win0);
+    if rw == 0 || rows == 0 {
+        return Ok(());
+    }
+    let bh = band.fb.len() / w;
+    if win0 < band.y0 || win1 > band.y0 + bh {
+        return Err(cherenkov::RenderError::Render(
+            "backdrop capture reads outside the run window".into(),
+        ));
+    }
+    if flatten > stack.len() {
+        return Err(cherenkov::RenderError::Render(
+            "backdrop capture flatten underflow".into(),
+        ));
+    }
+    let mut canvas = buffers.take_color(rw * rows);
+    let base = stack.len() - flatten;
+    {
+        // The nearest semantic level: the framebuffer when every live
+        // level is clip-only, else the level below the flattened ones.
+        let src: &[[f32; 4]] = if base == 0 { band.fb } else { &stack[base - 1] };
+        for row in win0..win1 {
+            let dst = &mut canvas[(row - win0) * rw..(row - win0) * rw + rw];
+            dst.copy_from_slice(&src[(row - band.y0) * w + rx0..(row - band.y0) * w + rx0 + rw]);
+        }
+    }
+    // Clip-only levels composite raw src-over, matching the oracle's
+    // `flattened`.
+    for level in &stack[base..] {
+        for row in win0..win1 {
+            for px in 0..rw {
+                let dst = &mut canvas[(row - win0) * rw + px];
+                *dst = src_over(*dst, level[(row - band.y0) * w + rx0 + px]);
+            }
+        }
+    }
+    if let Some(filter) = filter {
+        apply_filter(filter, &mut canvas, win0 - ry0, (rw, ry1 - ry0))?;
+    }
+    let kept_rows = kept1 - kept0;
+    let mut buf = buffers.take_color(rw * kept_rows);
+    buf.copy_from_slice(&canvas[(kept0 - win0) * rw..(kept0 - win0) * rw + rw * kept_rows]);
+    buffers.give_color(canvas);
+    buffers.meter.captured = true;
+    ctx.captures.insert(
+        group,
+        Capture {
+            buf,
+            y0: kept0,
+            rows: kept_rows,
+            x0: rx0,
+            w: rw,
+        },
+    );
+    Ok(())
 }
 
 /// One band's rasterization state.
@@ -890,6 +1295,50 @@ impl Band<'_> {
                 dst[y * self.w + x] = src_over(dst[y * self.w + x], src);
             }
             edge(&mut *dst, x_in_hi, cx_hi);
+        }
+    }
+
+    /// Composites `capture`'s rows over the band's top inside `bounds`,
+    /// under `clip` — the member's backdrop sample.
+    fn sample(
+        &mut self,
+        capture: &Capture,
+        bounds: IRect,
+        clip: Option<&ClipRef>,
+        stack: &mut [Vec<[f32; 4]>],
+    ) {
+        let bh = self.fb.len() / self.w;
+        let y_lo = usize::try_from(bounds.y0)
+            .unwrap_or(0)
+            .max(self.y0)
+            .max(capture.y0);
+        let y_hi = usize::try_from(bounds.y1)
+            .unwrap_or(0)
+            .min(self.y0 + bh)
+            .min(capture.y0 + capture.rows);
+        let x_lo = usize::try_from(bounds.x0)
+            .unwrap_or(0)
+            .max(capture.x0)
+            .min(self.w);
+        let x_hi = usize::try_from(bounds.x1)
+            .unwrap_or(0)
+            .min(capture.x0 + capture.w)
+            .min(self.w);
+        if y_lo >= y_hi || x_lo >= x_hi {
+            return;
+        }
+        let dst = top(&mut *self.fb, stack);
+        for py in y_lo..y_hi {
+            let row = (py - self.y0) * self.w;
+            let crow = (py - capture.y0) * capture.w;
+            for px in x_lo..x_hi {
+                let cc = clip_cov(clip, self.w, px, py);
+                if cc <= 0.0 {
+                    continue;
+                }
+                let src = capture.buf[crow + px - capture.x0].map(|v| v * cc);
+                dst[row + px] = src_over(dst[row + px], src);
+            }
         }
     }
 

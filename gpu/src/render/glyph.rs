@@ -693,7 +693,10 @@ impl Atlas {
             }
         }
         let top = self.shelves.last().map_or(0, |s| s.y + s.h);
-        if top + class <= self.size {
+        // A new shelf also needs the cell's width: a cell wider than the
+        // atlas must fail here so the caller grows (or clears) instead of
+        // writing past the texture edge.
+        if w + 2 * PAD <= self.size && top + class <= self.size {
             self.shelves.push(Shelf {
                 y: top,
                 h: class,

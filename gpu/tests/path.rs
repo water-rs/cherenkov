@@ -629,3 +629,31 @@ fn a_path_clip_wider_than_the_atlas_cap() -> Result<(), Box<dyn std::error::Erro
     );
     Ok(())
 }
+
+/// A fractional translation is rasterized exactly, not snapped to a
+/// quarter-pixel grid: the fill's left edge at x=10.2 deposits 0.8
+/// coverage in column 10.
+#[test]
+fn a_path_fill_keeps_its_subpixel_translation() -> Result<(), Box<dyn std::error::Error>> {
+    let mut rect = BezPath::new();
+    rect.move_to((10.0, 10.0));
+    rect.line_to((40.0, 10.0));
+    rect.line_to((40.0, 40.0));
+    rect.line_to((10.0, 40.0));
+    rect.close_path();
+    let Some(readback) = render(|c| {
+        c.transform(cherenkov::kurbo::Affine::translate((0.2, 0.0)), |c| {
+            c.fill(rect, RED);
+        });
+    })?
+    else {
+        return Ok(());
+    };
+    let [r, ..] = px(&readback, 10, 25);
+    assert!((r - 0.8).abs() < 0.03, "edge pixel: {r}");
+    let [r, ..] = px(&readback, 9, 25);
+    assert!(r < 0.01, "outside pixel: {r}");
+    let [r, ..] = px(&readback, 25, 25);
+    assert!(r > 0.99, "interior pixel: {r}");
+    Ok(())
+}

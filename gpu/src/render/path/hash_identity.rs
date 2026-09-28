@@ -144,10 +144,9 @@ mod reference {
 
     /// Builds the [`Placement`] for a draw under `transform` on a
     /// `surface`-pixel target. The key holds the 2x2, the translation's
-    /// fractional part quantized to 1/4 px and the surface size, so identical
-    /// geometry at different integer translations replays the same emission.
+    /// fractional part and the surface size, so identical geometry at
+    /// different integer translations replays the same emission.
     #[expect(clippy::cast_possible_truncation)]
-    #[expect(clippy::cast_sign_loss)]
     #[expect(
         clippy::many_single_char_names,
         reason = "a..f are the conventional affine coefficient names"
@@ -160,14 +159,13 @@ mod reference {
         let [a, b, c, d, e, f] = transform.as_coeffs();
         let ix = e.floor();
         let iy = f.floor();
-        let qx = ((e - ix) * 4.0).floor() / 4.0;
-        let qy = ((f - iy) * 4.0).floor() / 4.0;
+        let qx = e - ix;
+        let qy = f - iy;
         let mut hasher = DefaultHasher::new();
         content_hash.hash(&mut hasher);
-        for v in [a, b, c, d] {
+        for v in [a, b, c, d, qx, qy] {
             (v as f32).to_bits().hash(&mut hasher);
         }
-        ((qx * 4.0) as u8 | (((qy * 4.0) as u8) << 4)).hash(&mut hasher);
         surface.hash(&mut hasher);
         let key = hasher.finish();
         let mut hasher = DefaultHasher::new();

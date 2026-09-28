@@ -21,7 +21,3 @@ pub const GLYPH_STROKE: &str = "glyph-stroke";
 /// A colour font construct this backend cannot render: a bitmap-only
 /// font (CBDT/sbix without outlines) or an unmapped COLR paint.
 pub const COLOR_FONT: &str = "color-font";
-
-/// A shadow from a shape without a rounded-box form (in this slice,
-/// every shadow).
-pub const SHADOW: &str = "shadow";

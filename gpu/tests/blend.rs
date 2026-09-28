@@ -12,6 +12,7 @@ use cherenkov_gpu::{Gpu, GpuConfig};
 
 const RED: WorkingColor = WorkingColor::new([1.0, 0.0, 0.0, 1.0]);
 const BLUE: WorkingColor = WorkingColor::new([0.0, 0.0, 1.0, 1.0]);
+const GREEN: WorkingColor = WorkingColor::new([0.0, 1.0, 0.0, 1.0]);
 
 /// An engine, or `None` when no adapter exists.
 fn engine() -> Option<Engine<Gpu>> {
@@ -229,5 +230,102 @@ fn blended_descendant_isolates_its_normal_group() -> Result<(), Box<dyn std::err
     for (i, px) in rb.pixels.iter().enumerate() {
         assert_eq!(*px, [1.0, 0.0, 0.0, 1.0], "pixel {i}");
     }
+    Ok(())
+}
+
+#[test]
+fn tree_layer_isolates_blended_child_layer() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(engine) = engine() else {
+        return Ok(());
+    };
+    let surface = engine.surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))?;
+    let background = surface.layer();
+    let pass = surface.layer();
+    let cutout = surface.layer();
+    surface.update(|tx| {
+        tx[surface.root()].push(&background).push(&pass);
+        tx[&background].content(surface.record(|c| {
+            c.fill(Rect::new(0.0, 0.0, 8.0, 8.0), RED);
+        }));
+        tx[&pass].content(surface.record(|c| {
+            c.fill(Rect::new(0.0, 0.0, 4.0, 8.0), BLUE);
+        }));
+        tx[&pass].push(&cutout);
+        tx[&cutout]
+            .blend(BlendMode::DestOut)
+            .content(surface.record(|c| {
+                c.fill(Rect::new(2.0, 0.0, 6.0, 8.0), WorkingColor::WHITE);
+            }));
+    });
+    engine.render(cherenkov::FrameTime::now())?;
+    let pixels = surface.readback()?.pixels;
+    let pixel = |x: usize, y: usize| pixels[y * 8 + x];
+    assert_eq!(pixel(1, 3), [0.0, 0.0, 1.0, 1.0]);
+    assert_eq!(pixel(3, 3), [1.0, 0.0, 0.0, 1.0]);
+    Ok(())
+}
+
+#[test]
+fn tree_layer_isolates_blended_content_group() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(engine) = engine() else {
+        return Ok(());
+    };
+    let surface = engine.surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))?;
+    let background = surface.layer();
+    let pass = surface.layer();
+    surface.update(|tx| {
+        tx[surface.root()].push(&background).push(&pass);
+        tx[&background].content(surface.record(|c| {
+            c.fill(Rect::new(0.0, 0.0, 8.0, 8.0), RED);
+        }));
+        tx[&pass].content(surface.record(|c| {
+            c.fill(Rect::new(0.0, 0.0, 4.0, 8.0), BLUE);
+            c.group(Group::new().blend(BlendMode::DestOut), |c| {
+                c.fill(Rect::new(2.0, 0.0, 6.0, 8.0), WorkingColor::WHITE);
+            });
+        }));
+    });
+    engine.render(cherenkov::FrameTime::now())?;
+    let pixels = surface.readback()?.pixels;
+    let pixel = |x: usize, y: usize| pixels[y * 8 + x];
+    assert_eq!(pixel(1, 3), [0.0, 0.0, 1.0, 1.0]);
+    assert_eq!(pixel(3, 3), [1.0, 0.0, 0.0, 1.0]);
+    Ok(())
+}
+
+#[test]
+fn nested_tree_layers_isolate_at_the_blending_parent() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(engine) = engine() else {
+        return Ok(());
+    };
+    let surface = engine.surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))?;
+    let background = surface.layer();
+    let outer = surface.layer();
+    let inner = surface.layer();
+    let cutout = surface.layer();
+    surface.update(|tx| {
+        tx[surface.root()].push(&background).push(&outer);
+        tx[&outer].push(&inner);
+        tx[&inner].push(&cutout);
+        tx[&background].content(surface.record(|c| {
+            c.fill(Rect::new(0.0, 0.0, 8.0, 8.0), RED);
+        }));
+        tx[&outer].content(surface.record(|c| {
+            c.fill(Rect::new(0.0, 0.0, 8.0, 8.0), BLUE);
+        }));
+        tx[&inner].content(surface.record(|c| {
+            c.fill(Rect::new(0.0, 0.0, 4.0, 8.0), GREEN);
+        }));
+        tx[&cutout]
+            .blend(BlendMode::DestOut)
+            .content(surface.record(|c| {
+                c.fill(Rect::new(2.0, 0.0, 6.0, 8.0), WorkingColor::WHITE);
+            }));
+    });
+    engine.render(cherenkov::FrameTime::now())?;
+    let pixels = surface.readback()?.pixels;
+    let pixel = |x: usize, y: usize| pixels[y * 8 + x];
+    assert_eq!(pixel(1, 3), [0.0, 1.0, 0.0, 1.0]);
+    assert_eq!(pixel(3, 3), [0.0, 0.0, 1.0, 1.0]);
     Ok(())
 }

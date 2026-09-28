@@ -108,20 +108,25 @@ pub fn resolve(
             band += 1;
             continue;
         }
+        // Order at the band's midpoint: segments that meet at a vertex
+        // on ya or yb are separated at ym, so boundary ties cannot hide
+        // a crossing. If two non-adjacent segments p < r cross at yc
+        // inside the band, the segment q between them at ym must have
+        // swapped with p or r somewhere between ym and yc, so an
+        // adjacent pair also crosses strictly inside — checking only
+        // adjacent pairs is complete. Genuinely coincident segments
+        // never cross and give the same regions in any order.
+        let ym = ya.midpoint(yb);
         active.sort_by(|a, b| {
-            a.x_at(ya)
-                .total_cmp(&b.x_at(ya))
-                .then_with(|| a.x_at(yb).total_cmp(&b.x_at(yb)))
+            a.x_at(ym)
+                .total_cmp(&b.x_at(ym))
+                .then_with(|| a.slope.total_cmp(&b.slope))
         });
-        // Any order change inside the band shows up as an adjacent
-        // inversion at the band's bottom; split at the earliest valid
-        // crossing y. A pair whose crossing sits on the boundary (a
-        // tie) or that is ~parallel yields no split and does not stop
-        // the scan — a later pair may still cross inside.
+        // Split at the smallest crossing strictly inside the band.
         let mut split = None;
         for pair in active.windows(2) {
             let (p, q) = (pair[0], pair[1]);
-            if p.x_at(yb) > q.x_at(yb) + EPS && (p.slope - q.slope).abs() > EPS {
+            if (p.slope - q.slope).abs() > EPS {
                 // p.x0 + p.slope*(y-p.y0) == q.x0 + q.slope*(y-q.y0)
                 let yc = q.slope.mul_add(q.y0, p.slope.mul_add(-p.y0, p.x0) - q.x0)
                     / (q.slope - p.slope);
@@ -296,6 +301,33 @@ mod tests {
                 .iter()
                 .any(|e| (e.1 - 2.0).abs() < 1e-6 || (e.3 - 2.0).abs() < 1e-6),
             "no edge boundary at the y=2 crossing: {resolved:?}"
+        );
+    }
+
+    #[test]
+    fn a_nonadjacent_crossing_still_splits_the_band() {
+        // Real geometry from a stroked glyph: at the band top the sweep
+        // order is A(+1) B(−1) C(−1) with B just left of C, so the only
+        // *adjacent* inversion is B×C — which crossed exactly at the
+        // band's top boundary and yields no valid split. C also crosses
+        // A inside the band at y≈42.72, non-adjacently; an adjacent-only
+        // scan misses it and emits edges that cross inside the band.
+        // Verbatim segments from a stroked glyph (the +1 edge, the two
+        // diagonals, and the long contour edge sharing its top vertex).
+        let segs = vec![
+            (110.472_26f32, 43.915_257, 108.866_936, 27.915_59),
+            (110.856_94, 27.715_923, 112.462_265, 43.715_59),
+            (113.483_76, 27.452_364, 115.089_07, 43.452_03),
+            (113.099_07, 43.651_7, 111.493_744, 27.652_03),
+            (111.367_424, 42.820_42, 113.994_24, 42.55686),
+            (113.994_24, 42.55686, 113.099_07, 43.651_7),
+        ];
+        let resolved = resolve(&segs, FillRule::NonZero).expect("crossing present");
+        assert!(
+            resolved
+                .iter()
+                .any(|e| (e.1 - 42.7206).abs() < 1e-3 || (e.3 - 42.7206).abs() < 1e-3),
+            "no edge boundary at the y≈42.72 crossing: {resolved:?}"
         );
     }
 }

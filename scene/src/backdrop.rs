@@ -43,11 +43,12 @@ pub enum BackdropFilter {
 }
 
 /// A member layer's per-member effect on its backdrop composite
-/// ([`crate::Layer::backdrop_effect`]). The effect samples the group's
-/// filtered capture inside the member's clip; `ColorMatrix` needs only the
-/// member's own pixel, while `Refraction` and `RimLight` read the clip's
-/// signed distance and are unsupported on a path clip
-/// (`backdrop-effect-sdf-path`).
+/// ([`crate::Layer::backdrop_effect`]).
+///
+/// The effect samples the group's filtered capture inside the member's
+/// clip; `ColorMatrix` needs only the member's own pixel, while
+/// `Refraction` and `RimLight` read the clip's signed distance and are
+/// unsupported on a path clip (`backdrop-effect-sdf-path`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "effect", content = "value", rename_all = "kebab-case")]
 pub enum BackdropEffectSpec {

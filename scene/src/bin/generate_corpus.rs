@@ -4360,6 +4360,52 @@ fn run() -> Result<(), SceneError> {
         refraction_member(l, 80.0, 200.0, 240.0, 250.0, 12.0, 6.0);
     });
 
+    // The same backdrop and blur with non-rounded member clips: the
+    // ellipse and the continuous rect run the second-order SDFs (#173),
+    // not the rounded-rect closed form.
+    corpus.scene_setup("backdrop-refraction-shapes", 256, 256, white, |b| {
+        b.backdrop_group(1, vec![BackdropFilter::GaussianBlur { sigma: 6.0 }]);
+        let l = &mut b.root();
+        stripes(
+            l,
+            srgb(0.05, 0.30, 0.95),
+            srgb(0.95, 0.25, 0.05),
+            [
+                srgb(0.95, 0.75, 0.05),
+                srgb(0.10, 0.85, 0.40),
+                srgb(0.70, 0.10, 0.90),
+            ],
+        );
+        l.layer(|m| {
+            m.clip(Shape::Ellipse(Ellipse::new((72.0, 72.0), (48.0, 28.0), 0.0)));
+            m.backdrop(1);
+            m.backdrop_effect(BackdropEffectSpec::Refraction {
+                depth: 12.0,
+                strength: 6.0,
+            });
+            m.fill(
+                Shape::rect(26.0, 46.0, 118.0, 98.0),
+                solid(srgba(1.0, 1.0, 1.0, 0.12)),
+            );
+        });
+        l.layer(|m| {
+            m.clip(Shape::Continuous(cherenkov_scene::ContinuousRect::new(
+                Rect::new(120.0, 120.0, 240.0, 232.0),
+                32.0,
+                0.6,
+            )));
+            m.backdrop(1);
+            m.backdrop_effect(BackdropEffectSpec::Refraction {
+                depth: 12.0,
+                strength: 6.0,
+            });
+            m.fill(
+                Shape::rect(122.0, 122.0, 238.0, 230.0),
+                solid(srgba(1.0, 1.0, 1.0, 0.12)),
+            );
+        });
+    });
+
     corpus.scene_setup("backdrop-refraction-p3", 256, 256, white, |b| {
         b.backdrop_group(1, vec![BackdropFilter::GaussianBlur { sigma: 6.0 }]);
         let l = &mut b.root();

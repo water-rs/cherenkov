@@ -46,10 +46,16 @@ jobs:
         run: brew install spirv-tools
       - name: Install SPIRV-Tools
         if: runner.os == 'Windows'
-        shell: msys2 {0}
-        run: |
-          pacman -S --noconfirm mingw-w64-ucrt-x86_64-spirv-tools
-          echo "C:/msys64/ucrt64/bin" >> "$GITHUB_PATH"
+        id: msys2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          install: mingw-w64-ucrt-x86_64-spirv-tools
+      - name: Put SPIRV-Tools on the PATH
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Add-Content -Path $env:GITHUB_PATH -Value "${{ steps.msys2.outputs.msys2-location }}\ucrt64\bin"
       # wgpu's DX12 backend compiles shaders with `dxc` when it finds it on the
       # PATH (`Dx12Compiler::Auto`), which the runner image does not carry.
       - name: Install DirectX Shader Compiler

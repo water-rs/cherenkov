@@ -196,8 +196,8 @@ struct Entry {
 struct FilterTargets {
     input: (wgpu::Texture, wgpu::TextureView),
     output: (wgpu::Texture, wgpu::TextureView),
-    /// The frame sequence that last applied through these targets; sizes a
-    /// frame does not use are dropped rather than retained.
+    /// The frame sequence that last applied through these targets; a size
+    /// unused for a whole frame is dropped rather than retained.
     last_used: u64,
 }
 
@@ -252,8 +252,12 @@ impl Entry {
             self.io[index].1.last_used = sequence;
         }
         // Stale sizes go first so the lookup below cannot pick them up
-        // and the cap stays a bound on live sizes only.
-        self.io.retain(|(_, targets)| targets.last_used >= sequence);
+        // and the cap stays a bound on live sizes only. A size stays live
+        // through the frame after its last use: a frame encoding several
+        // region sizes would otherwise drop the earlier ones and
+        // reallocate them on the next frame.
+        self.io
+            .retain(|(_, targets)| targets.last_used.saturating_add(1) >= sequence);
         self.io
             .iter()
             .position(|(io_size, _)| *io_size == size)
@@ -562,5 +566,77 @@ impl Registry {
             .as_ref()
             .copied()
             .map_err(|error| RenderError::Render(format!("filter {id:?} setup: {error}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use filtrate::filters::GaussianBlur;
+
+    /// An adapter plus device, or `None` where no GPU exists.
+    fn device_and_queue() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::all(),
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let adapter = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()))
+            .into_iter()
+            .next()?;
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()
+    }
+
+    fn entry() -> Entry {
+        Entry {
+            effect: Box::new(filtrate::Executor::new(GaussianBlur(2.0_f32))),
+            dirty: Arc::new(AtomicBool::new(false)),
+            active: Arc::new(AtomicBool::new(false)),
+            again: false,
+            sequence: None,
+            setup: None,
+            io: Vec::new(),
+        }
+    }
+
+    /// A size the previous frame used stays live; a size unused for a
+    /// whole frame is dropped. Steady state with two alternating sizes
+    /// keeps both sets of targets instead of reallocating one per frame.
+    #[test]
+    fn targets_index_keeps_the_previous_frame_sizes() {
+        let Some((device, _queue)) = device_and_queue() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let format = wgpu::TextureFormat::Rgba16Float;
+        let size_a = (64, 64);
+        let size_b = (64, 32);
+        let mut entry = entry();
+        entry.targets_index(&device, size_a, format, 1);
+        entry.targets_index(&device, size_b, format, 1);
+        entry.targets_index(&device, size_a, format, 2);
+        assert!(
+            entry.io.iter().any(|(size, _)| *size == size_b),
+            "a size the previous frame used is still live"
+        );
+        let index = entry.targets_index(&device, size_b, format, 2);
+        let input_b = entry.io[index].1.input.0.clone();
+        assert!(
+            input_b
+                == entry
+                    .io
+                    .iter()
+                    .find(|(size, _)| *size == size_b)
+                    .expect("size B targets")
+                    .1
+                    .input
+                    .0,
+            "size B's targets are reused, not reallocated"
+        );
+        entry.targets_index(&device, size_a, format, 3);
+        entry.targets_index(&device, size_a, format, 4);
+        assert!(
+            !entry.io.iter().any(|(size, _)| *size == size_b),
+            "a size unused for a whole frame is dropped"
+        );
     }
 }

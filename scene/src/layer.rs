@@ -78,6 +78,18 @@ pub struct Live {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", tag = "motion", content = "value")]
 pub enum Motion {
+    /// Unwrapped scalar rotation about `pivot`. The layer's static transform
+    /// is the final composed transform; the adapter recovers its base matrix.
+    Rotation {
+        /// Starting angle in radians, preserving winding.
+        from: f64,
+        /// Final angle in radians, preserving winding.
+        to: f64,
+        /// Local pivot, before rotation.
+        pivot: Vec2,
+        /// How the angle moves.
+        animation: MotionAnimation,
+    },
     /// `transform` starts at `from` and animates to the layer's
     /// `transform`.
     Transform {

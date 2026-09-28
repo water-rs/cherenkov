@@ -10,7 +10,7 @@ use cherenkov::kurbo::Rect;
 use cherenkov::{
     BlendMode, Draw, Engine, FrameTime, Group, Next, Offscreen, OffscreenFormat, WorkingColor,
 };
-use cherenkov_cpu::{Raster, RasterConfig, RedrawCallback};
+use cherenkov_cpu::{BandPixels, Bands, Raster, RasterConfig, RedrawCallback};
 use filtrate::{
     AnimatedCallback, AnimatedTarget, AuxData, AuxImage, AuxSource, CpuFilter, CpuFilterError,
     CpuImage, Filter, FilterExt, FilterImage, FilterParam, Footprint, ImageVisitor, Interpolator,
@@ -238,6 +238,74 @@ fn nested_spatial_filters_match_full_surface_application_at_band_edges() {
         .expect("CPU gaussian blur");
     let actual = filtered.readback().expect("filtered readback").pixels;
     assert_eq!(actual, expected);
+}
+
+#[test]
+fn band_streamed_filtered_groups_match_offscreen_linear_f32() {
+    let engine = engine();
+    let size = (32, 64);
+    let width = usize::try_from(size.0).expect("width fits usize");
+    let height = usize::try_from(size.1).expect("height fits usize");
+    let filter = engine.filter(filters::GaussianBlur(3.0_f32));
+    let streamed_bands = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&streamed_bands);
+    let bands = engine
+        .surface(Bands::new(size, OffscreenFormat::LinearF32, move |band| {
+            let pixels = match band.pixels {
+                BandPixels::F32(pixels) => pixels,
+                BandPixels::F16(_) => panic!("expected LinearF32 bands"),
+            };
+            sink.lock()
+                .expect("stream pixels mutex poisoned")
+                .push((band.y, pixels.to_vec()));
+        }))
+        .expect("bands surface");
+    let offscreen = engine
+        .surface(Offscreen::new(size, OffscreenFormat::LinearF32))
+        .expect("offscreen surface");
+    let content = |surface: &cherenkov::Surface<Raster>| {
+        surface.record(|r| {
+            r.group(Group::new().filter(filter.id()), |r| {
+                for y in [14.0, 15.0, 16.0, 31.0, 32.0, 33.0, 47.0, 48.0] {
+                    r.fill(
+                        Rect::new(6.0, y, 26.0, y + 1.0),
+                        WorkingColor::new([0.8, 0.3, 0.1, 0.75]),
+                    );
+                }
+            });
+        })
+    };
+    bands.update(|tx| {
+        tx[bands.root()].content(content(&bands));
+    });
+    offscreen.update(|tx| {
+        tx[offscreen.root()].content(content(&offscreen));
+    });
+    engine.render(FrameTime::now()).expect("render");
+
+    let mut streamed = Vec::with_capacity(width * height);
+    let mut next_y = 0_u32;
+    for (y, band) in streamed_bands
+        .lock()
+        .expect("stream pixels mutex poisoned")
+        .iter()
+    {
+        assert_eq!(*y, next_y);
+        assert_eq!(band.len() % width, 0);
+        next_y += u32::try_from(band.len() / width).expect("band rows");
+        streamed.extend_from_slice(band);
+    }
+    assert_eq!(next_y, size.1);
+    let expected = offscreen.readback().expect("readback").pixels;
+    let streamed_bits = streamed
+        .iter()
+        .flat_map(|pixel| pixel.map(f32::to_bits))
+        .collect::<Vec<_>>();
+    let expected_bits = expected
+        .iter()
+        .flat_map(|pixel| pixel.map(f32::to_bits))
+        .collect::<Vec<_>>();
+    assert_eq!(streamed_bits, expected_bits);
 }
 
 #[test]

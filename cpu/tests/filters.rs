@@ -4,8 +4,9 @@
 //! CPU filter execution and rendering tests.
 
 use std::sync::{
-    Arc, Mutex,
+    Arc,
     atomic::{AtomicUsize, Ordering},
+    mpsc,
 };
 use std::time::{Duration, Instant};
 
@@ -250,17 +251,15 @@ fn band_streamed_filtered_groups_match_offscreen_linear_f32() {
     let width = usize::try_from(size.0).expect("width fits usize");
     let height = usize::try_from(size.1).expect("height fits usize");
     let filter = engine.filter(filters::GaussianBlur(3.0_f32));
-    let streamed_bands = Arc::new(Mutex::new(Vec::new()));
-    let sink = Arc::clone(&streamed_bands);
+    let (sink, streamed_bands) = mpsc::channel();
     let bands = engine
         .surface(Bands::new(size, OffscreenFormat::LinearF32, move |band| {
             let pixels = match band.pixels {
                 BandPixels::F32(pixels) => pixels,
                 BandPixels::F16(_) => panic!("expected LinearF32 bands"),
             };
-            sink.lock()
-                .expect("stream pixels mutex poisoned")
-                .push((band.y, pixels.to_vec()));
+            sink.send((band.y, pixels.to_vec()))
+                .expect("stream pixels channel open");
         }))
         .expect("bands surface");
     let offscreen = engine
@@ -288,15 +287,11 @@ fn band_streamed_filtered_groups_match_offscreen_linear_f32() {
 
     let mut streamed = Vec::with_capacity(width * height);
     let mut next_y = 0_u32;
-    for (y, band) in streamed_bands
-        .lock()
-        .expect("stream pixels mutex poisoned")
-        .iter()
-    {
-        assert_eq!(*y, next_y);
+    for (y, band) in streamed_bands.try_iter() {
+        assert_eq!(y, next_y);
         assert_eq!(band.len() % width, 0);
         next_y += u32::try_from(band.len() / width).expect("band rows");
-        streamed.extend_from_slice(band);
+        streamed.extend_from_slice(&band);
     }
     assert_eq!(next_y, size.1);
     let expected = offscreen.readback().expect("readback").pixels;
@@ -348,30 +343,31 @@ fn rgba8_filter_images_blend_on_the_cpu() {
     }
 }
 
-#[derive(Clone)]
 struct ScriptedParam {
     initial: f32,
-    callback: Arc<Mutex<Option<AnimatedCallback>>>,
+    callback: mpsc::Sender<AnimatedCallback>,
 }
 
 impl ScriptedParam {
-    fn new(initial: f32) -> Self {
-        Self {
-            initial,
-            callback: Arc::default(),
-        }
+    fn new(initial: f32) -> (Self, mpsc::Receiver<AnimatedCallback>) {
+        let (callback, installed) = mpsc::channel();
+        (Self { initial, callback }, installed)
     }
+}
 
-    fn fire(&self, value: f32, interpolator: Option<Box<dyn Interpolator>>) {
-        self.callback
-            .lock()
-            .expect("parameter callback mutex poisoned")
-            .as_ref()
-            .expect("filter watcher installed")(AnimatedTarget {
-            value,
-            interpolator,
-        });
+fn fire(
+    installed: &mpsc::Receiver<AnimatedCallback>,
+    callback: &mut Option<AnimatedCallback>,
+    value: f32,
+    interpolator: Option<Box<dyn Interpolator>>,
+) {
+    if let Some(new) = installed.try_iter().last() {
+        *callback = Some(new);
     }
+    callback.as_ref().expect("filter watcher installed")(AnimatedTarget {
+        value,
+        interpolator,
+    });
 }
 
 impl FilterParam for ScriptedParam {
@@ -380,10 +376,9 @@ impl FilterParam for ScriptedParam {
     }
 
     fn watch_animated(&self, callback: AnimatedCallback) -> WatchGuard {
-        *self
-            .callback
-            .lock()
-            .expect("parameter callback mutex poisoned") = Some(callback);
+        self.callback
+            .send(callback)
+            .expect("parameter callback channel open");
         WatchGuard::new(())
     }
 }
@@ -418,8 +413,9 @@ fn animated_parameters_rerender_and_request_frames() {
     let other_surface = engine
         .surface(Offscreen::new((4, 4), OffscreenFormat::LinearF32).rate(45..=90))
         .expect("other surface");
-    let parameter = ScriptedParam::new(0.0);
-    let filter = engine.filter(filters::Brightness(parameter.clone()));
+    let (parameter, installed) = ScriptedParam::new(0.0);
+    let mut callback = None;
+    let filter = engine.filter(filters::Brightness(parameter));
     for filtered_surface in [&surface, &other_surface] {
         filtered_surface.update(|tx| {
             tx[filtered_surface.root()]
@@ -438,7 +434,7 @@ fn animated_parameters_rerender_and_request_frames() {
         Next::Idle
     );
 
-    parameter.fire(0.2, None);
+    fire(&installed, &mut callback, 0.2, None);
     assert_eq!(wakes.load(Ordering::Relaxed), 1);
     assert_eq!(
         engine
@@ -450,7 +446,12 @@ fn animated_parameters_rerender_and_request_frames() {
     let snapped = surface.readback().expect("snap readback").pixels[2 * 4 + 2];
     assert!((snapped[0] - 0.3).abs() < 1.0e-6);
 
-    parameter.fire(0.8, Some(Box::new(LinearRamp(Duration::from_millis(100)))));
+    fire(
+        &installed,
+        &mut callback,
+        0.8,
+        Some(Box::new(LinearRamp(Duration::from_millis(100)))),
+    );
     assert_eq!(wakes.load(Ordering::Relaxed), 2);
     let mid_time = start + Duration::from_millis(60);
     let next = engine

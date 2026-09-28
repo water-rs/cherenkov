@@ -2,6 +2,7 @@
 
 mod bindings;
 mod colr;
+pub mod diag;
 pub mod filter;
 mod glyph;
 mod gpu_content;
@@ -354,6 +355,9 @@ pub struct GpuRenderer {
     /// Bound on every GPU wait; see [`GpuConfig::wait_timeout`].
     wait_timeout: Duration,
     max_texture: u32,
+    /// The allocation-event diagnostic sink (issue #169); `None` in
+    /// timed runs.
+    diag: Option<diag::Sink>,
 }
 
 /// Atlas origins produced by one deferred raster.
@@ -445,12 +449,22 @@ fn grow_buffer(
     usage: wgpu::BufferUsages,
 ) -> wgpu::Buffer {
     tracing::debug!(label, from = old.size(), to = size, "buffer grown");
-    device.create_buffer(&wgpu::BufferDescriptor {
+    let new = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
         size,
         usage,
         mapped_at_creation: false,
-    })
+    });
+    diag::grow(
+        device,
+        label,
+        diag::Class::for_label(label),
+        old.size(),
+        size,
+        0,
+        false,
+    );
+    new
 }
 
 /// Creates an adapter plus device. Fails when no adapter allows the target
@@ -961,6 +975,12 @@ fn create_target(
     (texture, view)
 }
 
+/// Byte size of a `w` × `h` uncompressed texture in `format` — what the
+/// diagnostic tracks for target allocations.
+pub fn texel_bytes(format: wgpu::TextureFormat) -> u64 {
+    u64::from(format.block_copy_size(None).unwrap_or(0))
+}
+
 /// Creates GPU state on the shared engine render thread.
 ///
 /// # Errors
@@ -972,6 +992,7 @@ fn create_target(
 )]
 #[cfg(not(target_arch = "wasm32"))]
 pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
+    let _diag_guard = diag::Guard::scope(config.alloc_diag.as_ref());
     create_device(&config).and_then(|(instance, adapter, device, queue)| {
         let info = adapter.get_info();
         let supported = adapter.features();
@@ -1053,6 +1074,9 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
                 | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
+        diag::create(&device, "globals", globals.size());
+        diag::create(&device, "instances", instances.size());
+        diag::create(&device, "stops", stops.size());
         let atlas = Atlas::new(&device, config.budget.gpu.0);
         let bind0 = make_bind0(&device, &layout0, &globals, &instances, &stops, &atlas);
         let (_, dummy_view) = create_target(
@@ -1062,6 +1086,7 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             wgpu::TextureUsages::TEXTURE_BINDING,
             TARGET_FORMAT,
         );
+        diag::create(&device, "dummy source", 8);
         let timestamps =
             config.timestamps && device.features().contains(wgpu::Features::TIMESTAMP_QUERY);
         let (query_set, query_buffer) = if timestamps {
@@ -1081,6 +1106,10 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
         } else {
             (None, None)
         };
+        if let Some(buffer) = &query_buffer {
+            diag::create(&device, "frame timestamps", 0);
+            diag::create(&device, "timestamp resolve", buffer.size());
+        }
         // Two queries per frame, reserving 64 independent frame ranges.
         let query_capacity = if query_set.is_some() { 2 } else { 0 };
         let query_pool = query_set.as_ref().map_or_else(Vec::new, |set| {
@@ -1133,6 +1162,7 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             frame_pass_count: 0,
             pass_meta: Vec::new(),
             wait_timeout: config.wait_timeout,
+            diag: config.alloc_diag.clone(),
         };
         Ok((
             renderer,
@@ -1152,6 +1182,7 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
 
 #[cfg(target_arch = "wasm32")]
 pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
+    let _diag_guard = diag::Guard::scope(config.alloc_diag.as_ref());
     let (instance, adapter, device, queue) = create_device(&config).await?;
     let info = adapter.get_info();
     let supported = adapter.features();
@@ -1239,6 +1270,9 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
             | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
+    diag::create(&device, "globals", globals.size());
+    diag::create(&device, "instances", instances.size());
+    diag::create(&device, "stops", stops.size());
     let atlas = Atlas::new(&device, config.budget.gpu.0);
     let bind0 = make_bind0(&device, &layout0, &globals, &instances, &stops, &atlas);
     let (_, dummy_view) = create_target(
@@ -1248,6 +1282,7 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
         wgpu::TextureUsages::TEXTURE_BINDING,
         TARGET_FORMAT,
     );
+    diag::create(&device, "dummy source", 8);
     let timestamps =
         config.timestamps && device.features().contains(wgpu::Features::TIMESTAMP_QUERY);
     let (query_set, query_buffer) = if timestamps {
@@ -1267,6 +1302,10 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
     } else {
         (None, None)
     };
+    if let Some(buffer) = &query_buffer {
+        diag::create(&device, "frame timestamps", 0);
+        diag::create(&device, "timestamp resolve", buffer.size());
+    }
     // Two queries per frame, reserving 64 independent frame ranges.
     let query_capacity = if query_set.is_some() { 2 } else { 0 };
     let query_pool = query_set.as_ref().map_or_else(Vec::new, |set| {
@@ -1319,6 +1358,7 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
         frame_pass_count: 0,
         pass_meta: Vec::new(),
         wait_timeout: config.wait_timeout,
+        diag: config.alloc_diag.clone(),
     };
     Ok((
         renderer,
@@ -1362,6 +1402,8 @@ impl Renderer for GpuRenderer {
         id: SurfaceId,
         target: GpuTarget,
     ) -> Result<SurfaceInfo, SurfaceError> {
+        let _diag_guard = diag::Guard::scope(self.diag.as_ref());
+        diag::set_surface(Some(id.raw()));
         let size = match &target {
             GpuTarget::Offscreen(offscreen) => offscreen.size,
             GpuTarget::Window(window) => window.size,
@@ -1405,6 +1447,11 @@ impl Renderer for GpuRenderer {
         if let Some(sender) = &textures {
             let _ = sender.send(target.clone());
         }
+        diag::create(
+            &self.device,
+            "surface target",
+            u64::from(size.0) * u64::from(size.1) * texel_bytes(TARGET_FORMAT),
+        );
         self.surfaces.insert(
             id,
             SurfaceState {
@@ -1430,6 +1477,7 @@ impl Renderer for GpuRenderer {
                 binds1_stamp: (u64::MAX, u64::MAX, u64::MAX),
             },
         );
+        diag::set_surface(None);
         Ok(SurfaceInfo {
             max_dimension: self.max_texture,
             size,
@@ -1438,7 +1486,10 @@ impl Renderer for GpuRenderer {
     }
 
     fn resize_surface(&mut self, id: SurfaceId, size: (u32, u32)) {
+        let _diag_guard = diag::Guard::scope(self.diag.as_ref());
+        diag::set_surface(Some(id.raw()));
         let Some(state) = self.surfaces.get_mut(&id) else {
+            diag::set_surface(None);
             return;
         };
         let (target, view) = create_target(
@@ -1454,6 +1505,47 @@ impl Renderer for GpuRenderer {
         if let Some(sender) = &state.textures {
             let _ = sender.send(target.clone());
         }
+        let dropped = state.binds1.len() as u64;
+        if dropped > 0 {
+            diag::bind_groups_dropped(&self.device, dropped, "resize");
+        }
+        let scratch_bytes: u64 = state
+            .scratch
+            .iter()
+            .map(|s| u64::from(s.width) * u64::from(s.height) * texel_bytes(s.texture.format()))
+            .sum();
+        let backdrop_bytes: u64 = state
+            .backdrop
+            .iter()
+            .flatten()
+            .map(|s| u64::from(s.width) * u64::from(s.height) * texel_bytes(s.texture.format()))
+            .sum();
+        let old_target =
+            u64::from(state.size.0) * u64::from(state.size.1) * texel_bytes(state.target.format());
+        if scratch_bytes > 0 {
+            diag::retire(
+                &self.device,
+                diag::RetireArgs {
+                    label: "isolation scratch",
+                    class: diag::Class::Target,
+                    bytes: scratch_bytes,
+                    used_in_latest_submit: true,
+                    reason: "resize",
+                },
+            );
+        }
+        if backdrop_bytes > 0 {
+            diag::retire(
+                &self.device,
+                diag::RetireArgs {
+                    label: "blend backdrop",
+                    class: diag::Class::Target,
+                    bytes: backdrop_bytes,
+                    used_in_latest_submit: true,
+                    reason: "resize",
+                },
+            );
+        }
         state.size = size;
         state.target = target;
         state.view = view;
@@ -1461,9 +1553,67 @@ impl Renderer for GpuRenderer {
         state.backdrop = [None, None];
         state.binds1.clear();
         state.bind_gen += 1;
+        diag::grow(
+            &self.device,
+            "surface target",
+            diag::Class::Target,
+            old_target,
+            u64::from(size.0) * u64::from(size.1) * texel_bytes(TARGET_FORMAT),
+            0,
+            true,
+        );
+        diag::set_surface(None);
     }
 
     fn destroy_surface(&mut self, id: SurfaceId) {
+        let _diag_guard = diag::Guard::scope(self.diag.as_ref());
+        if let Some(state) = self.surfaces.get(&id) {
+            diag::set_surface(Some(id.raw()));
+            let target_bytes = u64::from(state.size.0)
+                * u64::from(state.size.1)
+                * texel_bytes(state.target.format());
+            let scratch_bytes: u64 = state
+                .scratch
+                .iter()
+                .map(|s| u64::from(s.width) * u64::from(s.height) * texel_bytes(s.texture.format()))
+                .sum();
+            let backdrop_bytes: u64 = state
+                .backdrop
+                .iter()
+                .flatten()
+                .map(|s| u64::from(s.width) * u64::from(s.height) * texel_bytes(s.texture.format()))
+                .sum();
+            let capture_bytes: u64 = state
+                .backdrop_groups
+                .values()
+                .filter_map(|g| g.capture.as_ref())
+                .map(|s| u64::from(s.width) * u64::from(s.height) * texel_bytes(s.texture.format()))
+                .sum();
+            let dropped = state.binds1.len() as u64;
+            if dropped > 0 {
+                diag::bind_groups_dropped(&self.device, dropped, "destroy");
+            }
+            for (label, bytes) in [
+                ("surface target", target_bytes),
+                ("isolation scratch", scratch_bytes),
+                ("blend backdrop", backdrop_bytes),
+                ("backdrop capture", capture_bytes),
+            ] {
+                if bytes > 0 {
+                    diag::retire(
+                        &self.device,
+                        diag::RetireArgs {
+                            label,
+                            class: diag::Class::Target,
+                            bytes,
+                            used_in_latest_submit: true,
+                            reason: "destroy",
+                        },
+                    );
+                }
+            }
+        }
+        diag::set_surface(None);
         self.surfaces.remove(&id);
         self.update_filter_activity();
     }
@@ -1493,10 +1643,12 @@ impl Renderer for GpuRenderer {
     }
 
     fn set_content(&mut self, surface: SurfaceId, layer: LayerId, content: Option<ContentOp>) {
+        let _diag_guard = diag::Guard::scope(self.diag.as_ref());
         let Some(state) = self.surfaces.get_mut(&surface) else {
             return;
         };
         if state.content.remove(&layer).is_some() {
+            diag::bind_groups_dropped(&self.device, state.binds1.len() as u64, "content change");
             state.binds1.clear();
         }
         match content {
@@ -1524,9 +1676,15 @@ impl Renderer for GpuRenderer {
     }
 
     fn remove_layer(&mut self, surface: SurfaceId, layer: LayerId) {
+        let _diag_guard = diag::Guard::scope(self.diag.as_ref());
         if let Some(state) = self.surfaces.get_mut(&surface) {
             state.layers.remove(&layer);
             if state.content.remove(&layer).is_some() {
+                diag::bind_groups_dropped(
+                    &self.device,
+                    state.binds1.len() as u64,
+                    "content change",
+                );
                 state.binds1.clear();
             }
         }
@@ -1542,6 +1700,11 @@ impl Renderer for GpuRenderer {
             TARGET_FORMAT,
         );
         let data = image_texels_f16(&image)?;
+        diag::create(
+            &self.device,
+            "image",
+            u64::from(width) * u64::from(height) * texel_bytes(TARGET_FORMAT),
+        );
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &texture,
@@ -1561,6 +1724,12 @@ impl Renderer for GpuRenderer {
                 depth_or_array_layers: 1,
             },
         );
+        diag::upload(
+            &self.device,
+            "image",
+            data.len() as u64,
+            Some((0, 0, width, height)),
+        );
         self.images.insert(
             id.raw(),
             GpuImage {
@@ -1575,6 +1744,19 @@ impl Renderer for GpuRenderer {
     }
 
     fn remove_image(&mut self, id: ImageId) {
+        let _diag_guard = diag::Guard::scope(self.diag.as_ref());
+        if let Some(image) = self.images.get(&id.raw()) {
+            diag::retire(
+                &self.device,
+                diag::RetireArgs {
+                    label: "image",
+                    class: diag::Class::Image,
+                    bytes: u64::from(image.width) * u64::from(image.height) * 8,
+                    used_in_latest_submit: true,
+                    reason: "remove_image",
+                },
+            );
+        }
         self.images.remove(&id.raw());
         for surface in self.surfaces.values_mut() {
             for content in surface.layers.values_mut() {
@@ -1584,9 +1766,47 @@ impl Renderer for GpuRenderer {
         self.images_gen += 1;
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "rebuilds every surface's scratch, bindings and buffers in pressure order"
+    )]
     fn trim(&mut self, pressure: Pressure) {
+        let _diag_guard = diag::Guard::scope(self.diag.as_ref());
+        diag::set_phase("trim");
         self.shadow_blur.trim();
         for surf in self.surfaces.values_mut() {
+            let scratch_bytes: u64 = surf
+                .scratch
+                .iter()
+                .map(|s| u64::from(s.width) * u64::from(s.height) * texel_bytes(s.texture.format()))
+                .sum();
+            let backdrop_bytes: u64 = surf
+                .backdrop
+                .iter()
+                .flatten()
+                .map(|s| u64::from(s.width) * u64::from(s.height) * texel_bytes(s.texture.format()))
+                .sum();
+            let dropped = surf.binds1.len() as u64;
+            if dropped > 0 {
+                diag::bind_groups_dropped(&self.device, dropped, "trim");
+            }
+            for (label, bytes) in [
+                ("isolation scratch", scratch_bytes),
+                ("blend backdrop", backdrop_bytes),
+            ] {
+                if bytes > 0 {
+                    diag::retire(
+                        &self.device,
+                        diag::RetireArgs {
+                            label,
+                            class: diag::Class::Target,
+                            bytes,
+                            used_in_latest_submit: true,
+                            reason: "trim",
+                        },
+                    );
+                }
+            }
             surf.scratch.clear();
             surf.backdrop = [None, None];
             // The bind groups' views died with the textures.
@@ -1609,6 +1829,33 @@ impl Renderer for GpuRenderer {
             surf.frame.passes.shrink_to_fit();
         }
         self.uploads = upload::Uploads::default();
+        diag::grow(
+            &self.device,
+            "instances",
+            diag::Class::Buffer,
+            self.instances.size(),
+            272 * 16,
+            0,
+            true,
+        );
+        diag::grow(
+            &self.device,
+            "stops",
+            diag::Class::Buffer,
+            self.stops.size(),
+            32 * 16,
+            0,
+            true,
+        );
+        diag::grow(
+            &self.device,
+            "globals",
+            diag::Class::Buffer,
+            self.globals.size(),
+            16,
+            0,
+            true,
+        );
         self.instances = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("instances"),
             size: 272 * 16,
@@ -1637,6 +1884,7 @@ impl Renderer for GpuRenderer {
         self.bound_stop_size = self.stops.size();
         self.bound_globals_size = self.globals.size();
         let atlas = &self.atlas;
+        diag::bind_groups_dropped(&self.device, 1, "trim");
         self.bind0 = make_bind0(
             &self.device,
             &self.layout0,
@@ -1646,6 +1894,7 @@ impl Renderer for GpuRenderer {
             atlas,
         );
         self.bound_atlas = atlas.generation();
+        diag::set_phase("render");
     }
 
     fn memory(&self) -> MemoryUsage {
@@ -1687,115 +1936,269 @@ impl Renderer for GpuRenderer {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn render(&mut self, frame: &Frame<'_>, stats: &mut FrameStats) -> Result<Redraw, RenderError> {
-        let origin = *self.origin.get_or_insert(frame.time.0);
-        stats.timings = self.drain_timestamps();
-        let dirty: Vec<_> = frame
-            .surfaces
-            .iter()
-            .filter(|sf| {
-                sf.changed
-                    || self.surfaces[&sf.id]
-                        .frame
-                        .filters
-                        .iter()
-                        .any(|(_, id)| self.filters.wants_redraw(*id))
-                    || self.surfaces[&sf.id].content_wants_redraw()
-                    || self.surfaces[&sf.id]
-                        .shader_textures
-                        .keys()
-                        .any(|key| self.shaders.animated(key))
-            })
-            .collect();
-        if dirty.is_empty() {
-            return self.present_windows(frame);
-        }
-        let timing = self.filter_timing(frame, origin);
-        self.frame_pass_count = 0;
-        self.frame_submission = None;
-        self.pass_meta.clear();
-        // Lower every dirty surface first: the GPU timestamp bracket must
-        // start after CPU lowering (rasters, uploads) so it measures GPU
-        // work only. Instances, stops and globals are appended frame-wide
-        // at per-surface bases so a later surface's upload can't clobber
-        // an earlier one before it is encoded.
-        // Take the states out so the lowering workers own them.
-        let t_lower = Instant::now();
-        let mut pending: Vec<SurfaceState> = dirty
-            .iter()
-            .map(|id| {
-                self.surfaces
-                    .remove(&id.id)
-                    .expect("dirty surface must exist")
-            })
-            .collect();
-        let results = self.lower_all(&mut pending, &dirty);
-        for (id, surf) in dirty.iter().zip(pending) {
-            self.surfaces.insert(id.id, surf);
-        }
-        let mut inst_base = 0u32;
-        let mut stop_base = 0u32;
-        let mut globals_base = 0u32;
-        let mut result = Ok(());
-        for (sf, lowered) in dirty.iter().zip(results) {
-            let id = sf.id;
-            result = self.lower_surface(id, stats, inst_base, stop_base, globals_base, lowered);
-            if result.is_err() {
-                break;
-            }
-            if let Some(surf) = self.surfaces.get(&id) {
-                inst_base += u32::try_from(surf.frame.instances.len()).unwrap_or(u32::MAX);
-                stop_base += u32::try_from(surf.frame.stops.len()).unwrap_or(u32::MAX);
-                globals_base += u32::try_from(surf.frame.passes.len()).unwrap_or(u32::MAX);
-            }
-        }
-        let wait = stats.phases.wait_seconds;
-        result = result.and_then(|()| self.upload_frame(&dirty, stats));
-        stats.phases.lower_seconds =
-            t_lower.elapsed().as_secs_f64() - (stats.phases.wait_seconds - wait);
-        tracing::debug!(
-            surfaces = dirty.len(),
-            lower_ms = stats.phases.lower_seconds * 1e3,
-            ok = result.is_ok(),
-            "frame lowered"
-        );
-        if result.is_ok() {
-            self.update_filter_activity();
-            for sf in &dirty {
-                self.render_shaders(
-                    sf.id,
-                    frame.time.0.saturating_duration_since(origin).as_secs_f32(),
-                )?;
-                self.render_producers(sf, frame.time.0)?;
-            }
-            let t = Instant::now();
-            for sf in &dirty {
-                let count = self.frame_pass_count;
-                let meta = self.pass_meta.len();
-                if let Err(error) = self.encode_surface(sf.id, timing, stats) {
-                    self.frame_pass_count = count;
-                    self.pass_meta.truncate(meta);
-                    result = Err(error);
-                    break;
-                }
-                let surface = self.surfaces.get_mut(&sf.id).expect("rendered surface");
-                surface.present_pending = surface.window.is_some();
-            }
-            stats.phases.encode_seconds = t.elapsed().as_secs_f64();
-            stats.frame = Some(frame.id);
-            if self.timestamps && self.frame_pass_count > 0 {
-                let t = Instant::now();
-                self.queue_timestamps(2 * self.frame_pass_count, frame.id);
-                stats.phases.stamp_seconds += t.elapsed().as_secs_f64();
-            }
-            self.evict_dead_mask_textures();
-        }
-        result?;
-        let present = self.present_windows(frame)?;
-        Ok(self.requested_redraw(present))
+        let _diag_guard = diag::Guard::scope(self.diag.as_ref());
+        diag::set_phase("render");
+        diag::frame_boundary(&self.device, frame.id.get(), true, false);
+        let outcome = self.render_inner(frame, stats);
+        diag::frame_boundary(&self.device, frame.id.get(), false, outcome.is_ok());
+        outcome
     }
 
     #[cfg(target_arch = "wasm32")]
     async fn render(
+        &mut self,
+        frame: &Frame<'_>,
+        stats: &mut FrameStats,
+    ) -> Result<Redraw, RenderError> {
+        let _diag_guard = diag::Guard::scope(self.diag.as_ref());
+        diag::set_phase("render");
+        diag::frame_boundary(&self.device, frame.id.get(), true, false);
+        let outcome = self.render_inner(frame, stats).await;
+        diag::frame_boundary(&self.device, frame.id.get(), false, outcome.is_ok());
+        outcome
+    }
+
+    /// Waits for the GPU to finish every pending frame and returns their
+    /// timings, oldest first.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn finish_timings(&mut self) -> Result<Vec<FrameTiming>, RenderError> {
+        let _diag_guard = diag::Guard::scope(self.diag.as_ref());
+        // Tooling may wait; the frame path only polls. First complete draws
+        // so their resolves can be encoded, then complete the resolve copies.
+        if let Some(last) = self.pending_queries.back().map(|p| p.submission.clone()) {
+            self.wait(last, "timestamp draws")?;
+        }
+        let mut timings = self.drain_timestamps();
+        if !self.pending_queries.is_empty() {
+            return Err(RenderError::Readback(
+                "timestamp draws: the completion callback did not run after the wait".into(),
+            ));
+        }
+        if let Some(last) = self.pending_timestamps.back().map(|p| p.submission.clone()) {
+            for pending in &mut self.pending_timestamps {
+                pending.request_map();
+            }
+            self.wait(last, "timestamp resolve")?;
+            timings.extend(self.drain_timestamps());
+        }
+        if self.pending_timestamps.is_empty() {
+            Ok(timings)
+        } else {
+            Err(RenderError::Readback(
+                "timestamp resolve: the map callback did not run after the wait".into(),
+            ))
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn finish_timings(&mut self) -> Result<Vec<FrameTiming>, RenderError> {
+        let _diag_guard = diag::Guard::scope(self.diag.as_ref());
+        // Tooling may wait; the frame path only polls. First complete draws
+        // so their resolves can be encoded, then complete the resolve copies.
+        if let Some(last) = self.pending_queries.back().map(|p| p.submission.clone()) {
+            self.wait(last, "timestamp draws").await?;
+        }
+        let mut timings = self.drain_timestamps();
+        if !self.pending_queries.is_empty() {
+            return Err(RenderError::Readback(
+                "timestamp draws: the completion callback did not run after the wait".into(),
+            ));
+        }
+        if let Some(last) = self.pending_timestamps.back().map(|p| p.submission.clone()) {
+            for pending in &mut self.pending_timestamps {
+                pending.request_map();
+            }
+            self.wait(last, "timestamp resolve").await?;
+            timings.extend(self.drain_timestamps());
+        }
+        if self.pending_timestamps.is_empty() {
+            Ok(timings)
+        } else {
+            Err(RenderError::Readback(
+                "timestamp resolve: the map callback did not run after the wait".into(),
+            ))
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn readback(&mut self, surface: SurfaceId) -> Result<Readback, RenderError> {
+        let _diag_guard = diag::Guard::scope(self.diag.as_ref());
+        let Some(state) = self.surfaces.get(&surface) else {
+            return Err(RenderError::Readback("unknown surface".into()));
+        };
+        let (w, h) = state.size;
+        diag::set_surface(Some(surface.raw()));
+        diag::set_phase("readback");
+        let bytes_per_row = (w * 8).div_ceil(256) * 256;
+        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback"),
+            size: u64::from(bytes_per_row) * u64::from(h),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        diag::create(&self.device, "readback", buf.size());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("readback"),
+            });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &state.target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        let submission = self.queue.submit([encoder.finish()]);
+        diag::submit(&self.device, &self.queue, "readback");
+        tracing::trace!(?surface, ?submission, "readback submitted");
+        let slice = buf.slice(..);
+        self.map_read(slice, submission, "the pixel readback")?;
+        let data = slice
+            .get_mapped_range()
+            .expect("buffer range is mapped and not overlapping");
+        let mut pixels = Vec::with_capacity((w * h) as usize);
+        for row in 0..h {
+            let start = (row * bytes_per_row) as usize;
+            for px in data[start..start + (w * 8) as usize].as_chunks::<8>().0 {
+                let bits: [u16; 4] = bytemuck::cast(*px);
+                pixels.push([
+                    half::f16::from_bits(bits[0]).to_f32(),
+                    half::f16::from_bits(bits[1]).to_f32(),
+                    half::f16::from_bits(bits[2]).to_f32(),
+                    half::f16::from_bits(bits[3]).to_f32(),
+                ]);
+            }
+        }
+        drop(data);
+        buf.unmap();
+        diag::retire(
+            &self.device,
+            diag::RetireArgs {
+                label: "readback",
+                class: diag::Class::MapBuffer,
+                bytes: buf.size(),
+                used_in_latest_submit: true,
+                reason: "readback done",
+            },
+        );
+        diag::set_surface(None);
+        diag::set_phase("render");
+        Ok(Readback {
+            width: w,
+            height: h,
+            pixels,
+        })
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    async fn readback(&mut self, surface: SurfaceId) -> Result<Readback, RenderError> {
+        let _diag_guard = diag::Guard::scope(self.diag.as_ref());
+        let Some(state) = self.surfaces.get(&surface) else {
+            return Err(RenderError::Readback("unknown surface".into()));
+        };
+        let (w, h) = state.size;
+        diag::set_surface(Some(surface.raw()));
+        diag::set_phase("readback");
+        let bytes_per_row = (w * 8).div_ceil(256) * 256;
+        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback"),
+            size: u64::from(bytes_per_row) * u64::from(h),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        diag::create(&self.device, "readback", buf.size());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("readback"),
+            });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &state.target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        let submission = self.queue.submit([encoder.finish()]);
+        diag::submit(&self.device, &self.queue, "readback");
+        tracing::trace!(?surface, ?submission, "readback submitted");
+        let slice = buf.slice(..);
+        self.map_read(slice, submission, "the pixel readback")
+            .await?;
+        let data = slice
+            .get_mapped_range()
+            .expect("buffer range is mapped and not overlapping");
+        let mut pixels = Vec::with_capacity((w * h) as usize);
+        for row in 0..h {
+            let start = (row * bytes_per_row) as usize;
+            for px in data[start..start + (w * 8) as usize].as_chunks::<8>().0 {
+                let bits: [u16; 4] = bytemuck::cast(*px);
+                pixels.push([
+                    half::f16::from_bits(bits[0]).to_f32(),
+                    half::f16::from_bits(bits[1]).to_f32(),
+                    half::f16::from_bits(bits[2]).to_f32(),
+                    half::f16::from_bits(bits[3]).to_f32(),
+                ]);
+            }
+        }
+        drop(data);
+        buf.unmap();
+        diag::retire(
+            &self.device,
+            diag::RetireArgs {
+                label: "readback",
+                class: diag::Class::MapBuffer,
+                bytes: buf.size(),
+                used_in_latest_submit: true,
+                reason: "readback done",
+            },
+        );
+        diag::set_surface(None);
+        diag::set_phase("render");
+        Ok(Readback {
+            width: w,
+            height: h,
+            pixels,
+        })
+    }
+}
+
+impl GpuRenderer {
+    #[cfg(target_arch = "wasm32")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the frame pipeline: lowers, uploads, encodes and presents in one pass"
+    )]
+    async fn render_inner(
         &mut self,
         frame: &Frame<'_>,
         stats: &mut FrameStats,
@@ -1820,6 +2223,7 @@ impl Renderer for GpuRenderer {
             })
             .collect();
         if dirty.is_empty() {
+            diag::set_phase("present");
             return self.present_windows(frame);
         }
         let timing = self.filter_timing(frame, origin);
@@ -1841,6 +2245,7 @@ impl Renderer for GpuRenderer {
                     .expect("dirty surface must exist")
             })
             .collect();
+        diag::set_phase("lower");
         let results = self.lower_all(&mut pending, &dirty);
         for (id, surf) in dirty.iter().zip(pending) {
             self.surfaces.insert(id.id, surf);
@@ -1883,6 +2288,7 @@ impl Renderer for GpuRenderer {
                 self.render_producers(sf, frame.time.0).await?;
                 self.prepare_filters(sf.id).await?;
             }
+            diag::set_phase("encode");
             let t = Instant::now();
             for sf in &dirty {
                 let count = self.frame_pass_count;
@@ -1899,6 +2305,7 @@ impl Renderer for GpuRenderer {
             stats.phases.encode_seconds = t.elapsed().as_secs_f64();
             stats.frame = Some(frame.id);
             if self.timestamps && self.frame_pass_count > 0 {
+                diag::set_phase("timestamps");
                 let t = Instant::now();
                 self.queue_timestamps(2 * self.frame_pass_count, frame.id);
                 stats.phases.stamp_seconds += t.elapsed().as_secs_f64();
@@ -1906,209 +2313,133 @@ impl Renderer for GpuRenderer {
             self.evict_dead_mask_textures();
         }
         result?;
+        diag::set_phase("present");
         let present = self.present_windows(frame)?;
         Ok(self.requested_redraw(present))
     }
 
-    /// Waits for the GPU to finish every pending frame and returns their
-    /// timings, oldest first.
     #[cfg(not(target_arch = "wasm32"))]
-    fn finish_timings(&mut self) -> Result<Vec<FrameTiming>, RenderError> {
-        // Tooling may wait; the frame path only polls. First complete draws
-        // so their resolves can be encoded, then complete the resolve copies.
-        if let Some(last) = self.pending_queries.back().map(|p| p.submission.clone()) {
-            self.wait(last, "timestamp draws")?;
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the frame pipeline: lowers, uploads, encodes and presents in one pass"
+    )]
+    fn render_inner(
+        &mut self,
+        frame: &Frame<'_>,
+        stats: &mut FrameStats,
+    ) -> Result<Redraw, RenderError> {
+        let origin = *self.origin.get_or_insert(frame.time.0);
+        stats.timings = self.drain_timestamps();
+        let dirty: Vec<_> = frame
+            .surfaces
+            .iter()
+            .filter(|sf| {
+                sf.changed
+                    || self.surfaces[&sf.id]
+                        .frame
+                        .filters
+                        .iter()
+                        .any(|(_, id)| self.filters.wants_redraw(*id))
+                    || self.surfaces[&sf.id].content_wants_redraw()
+                    || self.surfaces[&sf.id]
+                        .shader_textures
+                        .keys()
+                        .any(|key| self.shaders.animated(key))
+            })
+            .collect();
+        if dirty.is_empty() {
+            diag::set_phase("present");
+            return self.present_windows(frame);
         }
-        let mut timings = self.drain_timestamps();
-        if !self.pending_queries.is_empty() {
-            return Err(RenderError::Readback(
-                "timestamp draws: the completion callback did not run after the wait".into(),
-            ));
+        let timing = self.filter_timing(frame, origin);
+        self.frame_pass_count = 0;
+        self.frame_submission = None;
+        self.pass_meta.clear();
+        // Lower every dirty surface first: the GPU timestamp bracket must
+        // start after CPU lowering (rasters, uploads) so it measures GPU
+        // work only. Instances, stops and globals are appended frame-wide
+        // at per-surface bases so a later surface's upload can't clobber
+        // an earlier one before it is encoded.
+        // Take the states out so the lowering workers own them.
+        let t_lower = Instant::now();
+        let mut pending: Vec<SurfaceState> = dirty
+            .iter()
+            .map(|id| {
+                self.surfaces
+                    .remove(&id.id)
+                    .expect("dirty surface must exist")
+            })
+            .collect();
+        diag::set_phase("lower");
+        let results = self.lower_all(&mut pending, &dirty);
+        for (id, surf) in dirty.iter().zip(pending) {
+            self.surfaces.insert(id.id, surf);
         }
-        if let Some(last) = self.pending_timestamps.back().map(|p| p.submission.clone()) {
-            for pending in &mut self.pending_timestamps {
-                pending.request_map();
+        let mut inst_base = 0u32;
+        let mut stop_base = 0u32;
+        let mut globals_base = 0u32;
+        let mut result = Ok(());
+        for (sf, lowered) in dirty.iter().zip(results) {
+            let id = sf.id;
+            result = self.lower_surface(id, stats, inst_base, stop_base, globals_base, lowered);
+            if result.is_err() {
+                break;
             }
-            self.wait(last, "timestamp resolve")?;
-            timings.extend(self.drain_timestamps());
-        }
-        if self.pending_timestamps.is_empty() {
-            Ok(timings)
-        } else {
-            Err(RenderError::Readback(
-                "timestamp resolve: the map callback did not run after the wait".into(),
-            ))
-        }
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    async fn finish_timings(&mut self) -> Result<Vec<FrameTiming>, RenderError> {
-        // Tooling may wait; the frame path only polls. First complete draws
-        // so their resolves can be encoded, then complete the resolve copies.
-        if let Some(last) = self.pending_queries.back().map(|p| p.submission.clone()) {
-            self.wait(last, "timestamp draws").await?;
-        }
-        let mut timings = self.drain_timestamps();
-        if !self.pending_queries.is_empty() {
-            return Err(RenderError::Readback(
-                "timestamp draws: the completion callback did not run after the wait".into(),
-            ));
-        }
-        if let Some(last) = self.pending_timestamps.back().map(|p| p.submission.clone()) {
-            for pending in &mut self.pending_timestamps {
-                pending.request_map();
+            if let Some(surf) = self.surfaces.get(&id) {
+                inst_base += u32::try_from(surf.frame.instances.len()).unwrap_or(u32::MAX);
+                stop_base += u32::try_from(surf.frame.stops.len()).unwrap_or(u32::MAX);
+                globals_base += u32::try_from(surf.frame.passes.len()).unwrap_or(u32::MAX);
             }
-            self.wait(last, "timestamp resolve").await?;
-            timings.extend(self.drain_timestamps());
         }
-        if self.pending_timestamps.is_empty() {
-            Ok(timings)
-        } else {
-            Err(RenderError::Readback(
-                "timestamp resolve: the map callback did not run after the wait".into(),
-            ))
-        }
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    fn readback(&mut self, surface: SurfaceId) -> Result<Readback, RenderError> {
-        let Some(state) = self.surfaces.get(&surface) else {
-            return Err(RenderError::Readback("unknown surface".into()));
-        };
-        let (w, h) = state.size;
-        let bytes_per_row = (w * 8).div_ceil(256) * 256;
-        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("readback"),
-            size: u64::from(bytes_per_row) * u64::from(h),
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("readback"),
-            });
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &state.target,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &buf,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(bytes_per_row),
-                    rows_per_image: Some(h),
-                },
-            },
-            wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
+        let wait = stats.phases.wait_seconds;
+        result = result.and_then(|()| self.upload_frame(&dirty, stats));
+        stats.phases.lower_seconds =
+            t_lower.elapsed().as_secs_f64() - (stats.phases.wait_seconds - wait);
+        tracing::debug!(
+            surfaces = dirty.len(),
+            lower_ms = stats.phases.lower_seconds * 1e3,
+            ok = result.is_ok(),
+            "frame lowered"
         );
-        let submission = self.queue.submit([encoder.finish()]);
-        tracing::trace!(?surface, ?submission, "readback submitted");
-        let slice = buf.slice(..);
-        self.map_read(slice, submission, "the pixel readback")?;
-        let data = slice
-            .get_mapped_range()
-            .expect("buffer range is mapped and not overlapping");
-        let mut pixels = Vec::with_capacity((w * h) as usize);
-        for row in 0..h {
-            let start = (row * bytes_per_row) as usize;
-            for px in data[start..start + (w * 8) as usize].as_chunks::<8>().0 {
-                let bits: [u16; 4] = bytemuck::cast(*px);
-                pixels.push([
-                    half::f16::from_bits(bits[0]).to_f32(),
-                    half::f16::from_bits(bits[1]).to_f32(),
-                    half::f16::from_bits(bits[2]).to_f32(),
-                    half::f16::from_bits(bits[3]).to_f32(),
-                ]);
+        if result.is_ok() {
+            self.update_filter_activity();
+            for sf in &dirty {
+                self.render_shaders(
+                    sf.id,
+                    frame.time.0.saturating_duration_since(origin).as_secs_f32(),
+                )?;
+                self.render_producers(sf, frame.time.0)?;
             }
+            diag::set_phase("encode");
+            let t = Instant::now();
+            for sf in &dirty {
+                let count = self.frame_pass_count;
+                let meta = self.pass_meta.len();
+                if let Err(error) = self.encode_surface(sf.id, timing, stats) {
+                    self.frame_pass_count = count;
+                    self.pass_meta.truncate(meta);
+                    result = Err(error);
+                    break;
+                }
+                let surface = self.surfaces.get_mut(&sf.id).expect("rendered surface");
+                surface.present_pending = surface.window.is_some();
+            }
+            stats.phases.encode_seconds = t.elapsed().as_secs_f64();
+            stats.frame = Some(frame.id);
+            if self.timestamps && self.frame_pass_count > 0 {
+                diag::set_phase("timestamps");
+                let t = Instant::now();
+                self.queue_timestamps(2 * self.frame_pass_count, frame.id);
+                stats.phases.stamp_seconds += t.elapsed().as_secs_f64();
+            }
+            self.evict_dead_mask_textures();
         }
-        drop(data);
-        buf.unmap();
-        Ok(Readback {
-            width: w,
-            height: h,
-            pixels,
-        })
+        result?;
+        diag::set_phase("present");
+        let present = self.present_windows(frame)?;
+        Ok(self.requested_redraw(present))
     }
 
-    #[cfg(target_arch = "wasm32")]
-    async fn readback(&mut self, surface: SurfaceId) -> Result<Readback, RenderError> {
-        let Some(state) = self.surfaces.get(&surface) else {
-            return Err(RenderError::Readback("unknown surface".into()));
-        };
-        let (w, h) = state.size;
-        let bytes_per_row = (w * 8).div_ceil(256) * 256;
-        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("readback"),
-            size: u64::from(bytes_per_row) * u64::from(h),
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("readback"),
-            });
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &state.target,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &buf,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(bytes_per_row),
-                    rows_per_image: Some(h),
-                },
-            },
-            wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-        );
-        let submission = self.queue.submit([encoder.finish()]);
-        tracing::trace!(?surface, ?submission, "readback submitted");
-        let slice = buf.slice(..);
-        self.map_read(slice, submission, "the pixel readback")
-            .await?;
-        let data = slice
-            .get_mapped_range()
-            .expect("buffer range is mapped and not overlapping");
-        let mut pixels = Vec::with_capacity((w * h) as usize);
-        for row in 0..h {
-            let start = (row * bytes_per_row) as usize;
-            for px in data[start..start + (w * 8) as usize].as_chunks::<8>().0 {
-                let bits: [u16; 4] = bytemuck::cast(*px);
-                pixels.push([
-                    half::f16::from_bits(bits[0]).to_f32(),
-                    half::f16::from_bits(bits[1]).to_f32(),
-                    half::f16::from_bits(bits[2]).to_f32(),
-                    half::f16::from_bits(bits[3]).to_f32(),
-                ]);
-            }
-        }
-        drop(data);
-        buf.unmap();
-        Ok(Readback {
-            width: w,
-            height: h,
-            pixels,
-        })
-    }
-}
-
-impl GpuRenderer {
     fn filter_timing(&mut self, frame: &Frame<'_>, origin: Instant) -> filtrate::EffectFrameTiming {
         let timing = filtrate::EffectFrameTiming::new(
             frame.time.0.saturating_duration_since(origin),
@@ -2179,6 +2510,7 @@ impl GpuRenderer {
         id: cherenkov::ShaderId,
         source: &cherenkov::ShaderSource,
     ) -> Result<(), ResourceError> {
+        let _diag_guard = diag::Guard::scope(self.diag.as_ref());
         self.shaders.add(&self.device, id.raw(), source)
     }
 
@@ -2192,6 +2524,7 @@ impl GpuRenderer {
     }
 
     pub(crate) fn remove_shader(&mut self, id: cherenkov::ShaderId) {
+        let _diag_guard = diag::Guard::scope(self.diag.as_ref());
         self.shaders.remove(id.raw());
         for surface in self.surfaces.values_mut() {
             surface
@@ -2328,11 +2661,13 @@ impl GpuRenderer {
         size: (u32, u32),
         content: crate::interop::GpuContentBox,
     ) {
+        let _diag_guard = diag::Guard::scope(self.diag.as_ref());
         let state = self.surfaces.get_mut(&surface).expect("GPU surface exists");
         state.layers.remove(&layer);
         state
             .content
             .insert(layer, gpu_content::Slot::new(content, size));
+        diag::bind_groups_dropped(&self.device, state.binds1.len() as u64, "content change");
         state.binds1.clear();
     }
 
@@ -2342,12 +2677,14 @@ impl GpuRenderer {
         layer: LayerId,
         size: (u32, u32),
     ) {
+        let _diag_guard = diag::Guard::scope(self.diag.as_ref());
         let state = self.surfaces.get_mut(&surface).expect("GPU surface exists");
         state
             .content
             .get_mut(&layer)
             .expect("layer has GPU content")
             .resize(size);
+        diag::bind_groups_dropped(&self.device, state.binds1.len() as u64, "content resize");
         state.binds1.clear();
     }
 
@@ -2466,6 +2803,12 @@ impl GpuRenderer {
                         // Growing or clearing emptied the atlas: every
                         // hit any lowering took is now a miss, so lower
                         // the whole batch again.
+                        diag::event(
+                            &self.device,
+                            diag::EventKind::Phase {
+                                name: "atlas retry",
+                            },
+                        );
                         continue 'batch;
                     }
                     Err(e) => {
@@ -2525,6 +2868,12 @@ impl GpuRenderer {
                         // Growing or clearing emptied the atlas: every
                         // hit any lowering took is now a miss, so lower
                         // the whole batch again.
+                        diag::event(
+                            &self.device,
+                            diag::EventKind::Phase {
+                                name: "atlas retry",
+                            },
+                        );
                         continue 'batch;
                     }
                     Err(e) => {
@@ -2587,7 +2936,8 @@ impl GpuRenderer {
             .flat_map(|pass| pass.ranges.iter())
             .filter_map(|range| range.mask)
             .collect();
-        self.atlas.evict_mask_textures(|key| live.contains(&key));
+        self.atlas
+            .evict_mask_textures(&self.device, |key| live.contains(&key));
     }
 
     #[expect(
@@ -2644,12 +2994,12 @@ impl GpuRenderer {
                 texels,
             } => self
                 .atlas
-                .store_glyph(&self.queue, key, left, top, w, h, &texels)
+                .store_glyph(&self.device, &self.queue, key, left, top, w, h, &texels)
                 .map(|(x, y)| PendingOrigin::Cells(vec![(x, y)]))
                 .ok_or(RenderError::AtlasFull),
             PendingRaster::Path { key, emit, cells } => {
                 self.atlas
-                    .store_path(&self.queue, key, emit, &cells)
+                    .store_path(&self.device, &self.queue, key, emit, &cells)
                     .ok_or(RenderError::AtlasFull)?;
                 Ok(PendingOrigin::Cells(
                     self.atlas.path_origins(key).expect("just stored"),
@@ -2663,7 +3013,7 @@ impl GpuRenderer {
                 texels,
             } => {
                 self.atlas
-                    .store_mask(&self.queue, key, mask, w, h, &texels)
+                    .store_mask(&self.device, &self.queue, key, mask, w, h, &texels)
                     .ok_or(RenderError::AtlasFull)?;
                 Ok(PendingOrigin::Mask(
                     self.atlas.mask_origin(key).expect("just stored"),
@@ -2702,6 +3052,7 @@ impl GpuRenderer {
         globals_base: u32,
         lowered: Result<Lowered, RenderError>,
     ) -> Result<(), RenderError> {
+        diag::set_surface(Some(id.raw()));
         let Lowered {
             glyphs,
             paths,
@@ -2763,6 +3114,9 @@ impl GpuRenderer {
                     "isolation capture exceeds device texture extent".into(),
                 ));
             }
+            let old_scratch = surf.scratch.get(i).map_or(0, |s| {
+                u64::from(s.width) * u64::from(s.height) * texel_bytes(s.texture.format())
+            });
             let (texture, view) = create_target(
                 &self.device,
                 "isolation scratch",
@@ -2776,6 +3130,15 @@ impl GpuRenderer {
                 width: nw,
                 height: nh,
             };
+            diag::grow(
+                &self.device,
+                "isolation scratch",
+                diag::Class::Target,
+                old_scratch,
+                u64::from(nw) * u64::from(nh) * texel_bytes(self.scratch_format),
+                0,
+                true,
+            );
             if i < surf.scratch.len() {
                 surf.scratch[i] = target;
             } else {
@@ -2812,6 +3175,9 @@ impl GpuRenderer {
                 .as_ref()
                 .is_none_or(|c| (c.width, c.height) != (w, h) || c.texture.format() != format)
             {
+                let old_capture = group_state.capture.as_ref().map_or(0, |c| {
+                    u64::from(c.width) * u64::from(c.height) * texel_bytes(c.texture.format())
+                });
                 let (texture, view) = create_target(
                     &self.device,
                     "backdrop capture",
@@ -2825,6 +3191,15 @@ impl GpuRenderer {
                     width: w,
                     height: h,
                 });
+                diag::grow(
+                    &self.device,
+                    "backdrop capture",
+                    diag::Class::Target,
+                    old_capture,
+                    u64::from(w) * u64::from(h) * texel_bytes(format),
+                    0,
+                    true,
+                );
                 surf.bind_gen += 1;
             }
         }
@@ -2865,6 +3240,9 @@ impl GpuRenderer {
             } else {
                 self.scratch_format
             };
+            let old_backdrop = surf.backdrop[slot].as_ref().map_or(0, |b| {
+                u64::from(b.width) * u64::from(b.height) * texel_bytes(b.texture.format())
+            });
             let (texture, view) = create_target(
                 &self.device,
                 "blend backdrop",
@@ -2878,6 +3256,15 @@ impl GpuRenderer {
                 width: nw,
                 height: nh,
             });
+            diag::grow(
+                &self.device,
+                "blend backdrop",
+                diag::Class::Target,
+                old_backdrop,
+                u64::from(nw) * u64::from(nh) * texel_bytes(format),
+                0,
+                true,
+            );
             surf.bind_gen += 1;
         }
         // Gradient instances index stops absolutely; shift each instance's
@@ -2921,6 +3308,7 @@ impl GpuRenderer {
         {
             let atlas = &self.atlas;
             if atlas.generation() != self.bound_atlas {
+                diag::bind_groups_dropped(&self.device, 1, "atlas generation");
                 self.bind0 = make_bind0(
                     &self.device,
                     &self.layout0,
@@ -2954,6 +3342,7 @@ impl GpuRenderer {
             || self.globals.size() > self.bound_globals_size
         {
             let atlas = &self.atlas;
+            diag::bind_groups_dropped(&self.device, 1, "buffer growth");
             self.bind0 = make_bind0(
                 &self.device,
                 &self.layout0,
@@ -3014,6 +3403,7 @@ impl GpuRenderer {
         reason = "pixel sizes are well within f32"
     )]
     fn write_uploads(&mut self, dirty: &[&SurfaceFrame<'_>], size: u64, copies: &[upload::Copy]) {
+        diag::upload(&self.device, "frame staging", size, None);
         let surfaces: Vec<&SurfaceState> = dirty
             .iter()
             .filter_map(|sf| self.surfaces.get(&sf.id))
@@ -3106,6 +3496,7 @@ impl GpuRenderer {
         let Some(surf) = self.surfaces.get_mut(&id) else {
             return Ok(());
         };
+        diag::set_surface(Some(id.raw()));
         // Buffers grown during lowering leave `bind0` stale; rebuild when
         // capacity changed since the bind group was built.
         if self.instances.size() > self.bound_instance_size
@@ -3113,6 +3504,7 @@ impl GpuRenderer {
             || self.globals.size() > self.bound_globals_size
         {
             let atlas = &self.atlas;
+            diag::bind_groups_dropped(&self.device, 1, "buffer growth");
             self.bind0 = make_bind0(
                 &self.device,
                 &self.layout0,
@@ -3155,6 +3547,10 @@ impl GpuRenderer {
             self.atlas.mask_texture_generation(),
         );
         if surf.binds1_stamp != stamp {
+            let dropped = surf.binds1.len() as u64;
+            if dropped > 0 {
+                diag::bind_groups_dropped(&self.device, dropped, "stamp change");
+            }
             surf.binds1.clear();
             surf.binds1_stamp = stamp;
         }
@@ -3441,6 +3837,7 @@ impl GpuRenderer {
         if uploads.is_some() {
             self.uploads.submitted(submission.clone());
         }
+        diag::submit(&self.device, &self.queue, "frame");
         self.frame_submission = Some(submission.clone());
         tracing::trace!(
             surface = ?id,
@@ -3465,6 +3862,7 @@ impl GpuRenderer {
             submission_index: Some(submission),
             timeout: Some(self.wait_timeout),
         });
+        diag::poll(&self.device, status.is_ok());
         let elapsed = start.elapsed();
         match status {
             Ok(status) => {
@@ -3515,6 +3913,7 @@ impl GpuRenderer {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             let _ = tx.send(result);
         });
+        diag::map(&self.device, what, 0);
         self.wait(submission, what)?;
         match rx.try_recv() {
             Ok(Ok(())) => Ok(()),
@@ -3582,6 +3981,7 @@ impl GpuRenderer {
         );
         encoder.copy_buffer_to_buffer(buf, 0, &staging, 0, u64::from(pending.count) * 8);
         let submission = self.queue.submit([encoder.finish()]);
+        diag::submit(&self.device, &self.queue, "timestamp resolve");
         tracing::trace!(
             frame = pending.frame.get(),
             count = pending.count,
@@ -3606,6 +4006,7 @@ impl GpuRenderer {
         let size = u64::from(self.query_capacity) * 8;
         self.query_staging.retain(|buffer| buffer.size() >= size);
         self.query_staging.pop().unwrap_or_else(|| {
+            diag::create(&self.device, "timestamp staging", size);
             self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("timestamp staging"),
                 size,
@@ -3622,6 +4023,7 @@ impl GpuRenderer {
         if !self.pending_queries.is_empty() {
             // Poll dispatches completion callbacks; it never waits for GPU idle.
             let _ = self.device.poll(wgpu::PollType::Poll);
+            diag::poll(&self.device, false);
             while self
                 .pending_queries
                 .front()
@@ -3635,9 +4037,15 @@ impl GpuRenderer {
         let mut timings = Vec::new();
         while let Some(pending) = self.pending_timestamps.front_mut() {
             pending.request_map();
+            diag::map(
+                &self.device,
+                "timestamp staging",
+                u64::from(pending.count) * 8,
+            );
             if self.device.poll(wgpu::PollType::Poll).is_err() {
                 break;
             }
+            diag::poll(&self.device, false);
             match pending.ready.load(Ordering::Relaxed) {
                 // A failed map drops the frame's timing instead of
                 // blocking every later drain.
@@ -3742,6 +4150,7 @@ impl GpuRenderer {
                 ty: wgpu::QueryType::Timestamp,
                 count: capacity * slots,
             });
+            diag::create(&self.device, "frame timestamps", 0);
             self.query_pool
                 .extend((1..slots).map(|slot| (set.clone(), slot * capacity, capacity)));
             self.query_set = Some(set);
@@ -3749,12 +4158,22 @@ impl GpuRenderer {
             tracing::debug!(capacity, slots, "timestamp query ranges allocated");
         }
         if capacity > self.query_capacity {
+            let old = self.query_buffer.as_ref().map_or(0, wgpu::Buffer::size);
             self.query_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("timestamp resolve"),
                 size: u64::from(capacity) * 8,
                 usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             }));
+            diag::grow(
+                &self.device,
+                "timestamp resolve",
+                diag::Class::Query,
+                old,
+                u64::from(capacity) * 8,
+                0,
+                true,
+            );
             self.query_capacity = capacity;
             self.query_pool.retain(|(_, _, size)| *size >= capacity);
         }

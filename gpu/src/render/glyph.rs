@@ -266,6 +266,11 @@ impl Atlas {
     /// per byte).
     pub fn new(device: &wgpu::Device, budget: u64) -> Self {
         let (texture, view) = Self::allocate(device, ATLAS_START);
+        crate::diag::create(
+            device,
+            "glyph atlas",
+            u64::from(ATLAS_START) * u64::from(ATLAS_START),
+        );
         #[expect(
             clippy::cast_possible_truncation,
             clippy::cast_precision_loss,
@@ -386,7 +391,20 @@ impl Atlas {
     }
 
     /// Uploads `w` × `h` coverage texels into the cell at `(x, y)`.
-    pub fn write(&self, queue: &wgpu::Queue, x: u32, y: u32, w: u32, h: u32, texels: &[u8]) {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the device and queue plus the pending raster record's fields"
+    )]
+    pub fn write(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        texels: &[u8],
+    ) {
         // `write_texture` needs rows padded to 256 bytes.
         let pitch = w.div_ceil(256) * 256;
         let mut staging = vec![0u8; (pitch * h) as usize];
@@ -411,6 +429,12 @@ impl Atlas {
                 height: h,
                 depth_or_array_layers: 1,
             },
+        );
+        crate::diag::upload(
+            device,
+            "glyph atlas",
+            u64::from(w) * u64::from(h),
+            Some((x, y, w, h)),
         );
     }
 
@@ -483,6 +507,7 @@ impl Atlas {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
+        crate::diag::create(device, "clip mask", u64::from(w) * u64::from(h));
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &texture,
@@ -501,6 +526,12 @@ impl Atlas {
                 height: h,
                 depth_or_array_layers: 1,
             },
+        );
+        crate::diag::upload(
+            device,
+            "clip mask",
+            u64::from(w) * u64::from(h),
+            Some((0, 0, w, h)),
         );
         cell.atlas = [0.0, 0.0];
         let bytes = u64::from(w) * u64::from(h);
@@ -539,12 +570,25 @@ impl Atlas {
 
     /// Drops every mask texture whose key `live` rejects. Frames and
     /// bind groups referencing a kept texture stay valid.
-    pub fn evict_mask_textures(&mut self, live: impl Fn(u64) -> bool) {
-        let freed: u64 = self
+    pub fn evict_mask_textures(&mut self, device: &wgpu::Device, live: impl Fn(u64) -> bool) {
+        let evicted: Vec<u64> = self
             .mask_textures
             .extract_if(|key, _| !live(*key))
             .map(|(_, t)| t.bytes)
-            .sum();
+            .collect();
+        for bytes in &evicted {
+            crate::diag::retire(
+                device,
+                crate::diag::RetireArgs {
+                    label: "clip mask",
+                    class: crate::diag::Class::MaskTexture,
+                    bytes: *bytes,
+                    used_in_latest_submit: true,
+                    reason: "mask texture evict",
+                },
+            );
+        }
+        let freed: u64 = evicted.into_iter().sum();
         if freed > 0 {
             self.mask_texture_bytes = self.mask_texture_bytes.saturating_sub(freed);
             self.cpu_bytes = self.cpu_bytes.saturating_sub(freed);
@@ -568,6 +612,7 @@ impl Atlas {
     )]
     pub fn store_glyph(
         &mut self,
+        device: &wgpu::Device,
         queue: &wgpu::Queue,
         key: GlyphKey,
         left: i32,
@@ -581,10 +626,11 @@ impl Atlas {
         }
         if w == 0 {
             self.map.insert(key, Entry::default());
+            crate::diag::atlas_cell(device, (0, 0, 0, 0));
             return Some((0, 0));
         }
         let (cx, cy) = self.alloc(w, h)?;
-        self.write(queue, cx, cy, w, h, texels);
+        self.write(device, queue, cx, cy, w, h, texels);
         self.cpu_bytes += u64::from(w) * u64::from(h);
         let entry = Entry {
             x: cx as u16,
@@ -607,6 +653,7 @@ impl Atlas {
     )]
     pub fn store_path(
         &mut self,
+        device: &wgpu::Device,
         queue: &wgpu::Queue,
         key: u64,
         emit: PathEmit,
@@ -618,7 +665,7 @@ impl Atlas {
         let mut emit = emit;
         for (cell, (w, h, texels)) in emit.cells.iter_mut().zip(cells) {
             let (cx, cy) = self.alloc(*w, *h)?;
-            self.write(queue, cx, cy, *w, *h, texels);
+            self.write(device, queue, cx, cy, *w, *h, texels);
             cell.x = cx as u16;
             cell.y = cy as u16;
         }
@@ -629,11 +676,16 @@ impl Atlas {
     /// Stores a path-clip mask, setting `mask.atlas` to the cell origin.
     /// `None` when the atlas is full.
     #[expect(
+        clippy::too_many_arguments,
+        reason = "the device and queue plus the pending raster record's fields"
+    )]
+    #[expect(
         clippy::cast_precision_loss,
         reason = "atlas coords are well within f32"
     )]
     pub fn store_mask(
         &mut self,
+        device: &wgpu::Device,
         queue: &wgpu::Queue,
         key: u64,
         mut mask: MaskCell,
@@ -645,7 +697,7 @@ impl Atlas {
             return Some(());
         }
         let (cx, cy) = self.alloc(w, h)?;
-        self.write(queue, cx, cy, w, h, texels);
+        self.write(device, queue, cx, cy, w, h, texels);
         mask.atlas = [cx as f32, cy as f32];
         self.insert_mask(key, mask);
         Some(())
@@ -672,10 +724,20 @@ impl Atlas {
         if size == self.size {
             return;
         }
+        let old = u64::from(self.size) * u64::from(self.size);
         let (texture, view) = Self::allocate(device, size);
         self.texture = texture;
         self.view = view;
         self.size = size;
+        crate::diag::grow(
+            device,
+            "glyph atlas",
+            crate::diag::Class::Atlas,
+            old,
+            u64::from(size) * u64::from(size),
+            0,
+            true,
+        );
         self.clear();
     }
 
@@ -1232,7 +1294,12 @@ mod tests {
             pending
         }
         /// Commit one pending list, the way `apply_raster` does.
-        fn apply(atlas: &mut Atlas, queue: &wgpu::Queue, pending: Vec<PendingRaster>) {
+        fn apply(
+            atlas: &mut Atlas,
+            device: &wgpu::Device,
+            queue: &wgpu::Queue,
+            pending: Vec<PendingRaster>,
+        ) {
             for raster in pending {
                 let PendingRaster::Glyph {
                     key,
@@ -1247,7 +1314,7 @@ mod tests {
                 };
                 assert!(
                     atlas
-                        .store_glyph(queue, key, left, top, w, h, &texels)
+                        .store_glyph(device, queue, key, left, top, w, h, &texels)
                         .is_some()
                 );
             }
@@ -1283,7 +1350,7 @@ mod tests {
         let mut serial = Atlas::new(&device, u64::MAX);
         for keys in &surfaces {
             let pending = lower(&serial, &font, keys);
-            apply(&mut serial, &queue, pending);
+            apply(&mut serial, &device, &queue, pending);
         }
         // Parallel: both lowerings read the same empty atlas, so every
         // miss becomes a pending raster — duplicates included — then the
@@ -1294,7 +1361,7 @@ mod tests {
             .map(|keys| lower(&parallel, &font, keys))
             .collect();
         for pending in batches {
-            apply(&mut parallel, &queue, pending);
+            apply(&mut parallel, &device, &queue, pending);
         }
         for keys in &surfaces {
             for &k in keys {
@@ -1315,13 +1382,13 @@ mod tests {
         };
         assert!(
             parallel
-                .store_mask(&queue, 0xdead, mask, 2, 2, &[255u8; 4])
+                .store_mask(&device, &queue, 0xdead, mask, 2, 2, &[255u8; 4])
                 .is_some()
         );
         let stored = parallel.mask_origin(0xdead).expect("stored");
         assert!(
             parallel
-                .store_mask(&queue, 0xdead, mask, 2, 2, &[0u8; 4])
+                .store_mask(&device, &queue, 0xdead, mask, 2, 2, &[0u8; 4])
                 .is_some(),
             "duplicate mask resolves to the stored cell"
         );

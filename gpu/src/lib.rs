@@ -26,6 +26,9 @@ pub mod interop;
 mod names;
 mod render;
 
+/// The allocation-event diagnostic sink (issue #169).
+pub use render::diag;
+
 use std::path::PathBuf;
 
 use cherenkov::{Backend, EngineError, Offscreen, Rgba8, Rgba16F, Uploads};
@@ -111,6 +114,10 @@ pub struct GpuConfig {
     /// The isolation (scratch) texture format. Defaults to
     /// [`ScratchFormat::LinearF16`].
     pub scratch_format: ScratchFormat,
+    /// When set, the renderer records an allocation-event trace into
+    /// this sink. Diagnostics only; the per-event allocator snapshot is
+    /// deliberately expensive, so keep it out of timed runs.
+    pub alloc_diag: Option<diag::Sink>,
 }
 
 impl Default for GpuConfig {
@@ -125,6 +132,7 @@ impl Default for GpuConfig {
             budget: cherenkov::Budget::default(),
             pipeline_cache: None,
             scratch_format: ScratchFormat::default(),
+            alloc_diag: None,
         }
     }
 }

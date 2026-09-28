@@ -306,6 +306,10 @@ impl Registry {
             .and_then(|entry| entry.effect.footprint_bound())
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one entry's wait, capacity check, target allocation and dispatch in sequence"
+    )]
     pub(super) fn apply(
         &mut self,
         id: FilterKey,
@@ -353,6 +357,11 @@ impl Registry {
             .as_ref()
             .is_none_or(|(texture, _)| (texture.width(), texture.height()) != size)
         {
+            let old = entry.input.as_ref().map_or(0, |(texture, _)| {
+                u64::from(texture.width())
+                    * u64::from(texture.height())
+                    * super::texel_bytes(texture.format())
+            });
             entry.input = Some(super::create_target(
                 device,
                 "filter input",
@@ -367,6 +376,24 @@ impl Registry {
                 super::TARGET_USAGES,
                 format,
             ));
+            crate::diag::grow(
+                device,
+                "filter input",
+                crate::diag::Class::Target,
+                old,
+                u64::from(size.0) * u64::from(size.1) * super::texel_bytes(format),
+                0,
+                true,
+            );
+            crate::diag::grow(
+                device,
+                "filter output",
+                crate::diag::Class::Target,
+                old,
+                u64::from(size.0) * u64::from(size.1) * super::texel_bytes(format),
+                0,
+                true,
+            );
         }
         let (input_texture, input_view) = entry.input.as_ref().expect("input allocated");
         let (output_texture, output_view) = entry.output.as_ref().expect("output allocated");

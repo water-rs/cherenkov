@@ -1558,6 +1558,11 @@ impl Engine for Cherenkov {
         counters
     }
 
+    fn trim(&mut self) -> Result<(), BenchError> {
+        self.engine.trim(cherenkov::Pressure::Moderate);
+        Ok(())
+    }
+
     fn device(&self) -> DeviceInfo {
         let info = self.engine.info();
         DeviceInfo {

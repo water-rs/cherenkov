@@ -559,6 +559,47 @@ fn alloc_diag_cmd(
     let count = sink
         .write_json(out)
         .map_err(|e| BenchError::Engine(format!("writing {}: {e}", out.display())))?;
+    // #169 A5: the allocation-event high-water observation. Frame-boundary
+    // snapshots can miss the event that caused a permanently retained
+    // block, so this scans the per-event snapshots, not the lifecycle.
+    let events = sink.take();
+    let mut allocated = 0u64;
+    let mut reserved = 0u64;
+    let mut blocks = 0u64;
+    let mut retired_in_flight = 0u64;
+    let mut staging = 0u64;
+    let mut first_two_block_seq = None;
+    for event in &events {
+        allocated = allocated.max(event.alloc.allocated);
+        reserved = reserved.max(event.alloc.reserved);
+        blocks = blocks.max(event.alloc.blocks);
+        retired_in_flight = retired_in_flight.max(event.retired_in_flight);
+        staging = staging.max(event.alloc.staging.1);
+        if event.alloc.blocks >= 2 && first_two_block_seq.is_none() {
+            first_two_block_seq = Some(event.seq);
+        }
+    }
+    let summary = serde_json::json!({
+        "high_water": {
+            "allocated_bytes": allocated,
+            "reserved_bytes": reserved,
+            "blocks": blocks,
+            "retired_in_flight_bytes": retired_in_flight,
+            "staging_bytes": staging,
+            "first_two_block_seq": first_two_block_seq,
+            "events": events.len(),
+        }
+    });
+    {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(out)
+            .map_err(|e| BenchError::Engine(format!("appending to {}: {e}", out.display())))?;
+        writeln!(file, "{summary}")
+            .map_err(|e| BenchError::Engine(format!("writing {}: {e}", out.display())))?;
+    }
+    println!("alloc-diag high water: {summary}");
     tracing::info!(
         events = count,
         out = %out.display(),
@@ -886,6 +927,10 @@ fn render_scene(
     engine.encode(&input)?;
     let submit = engine.submit(0, true)?;
     let steady_memory = MemorySnapshot::capture(engine.memory(), SampleDetail::Full);
+    // #169 A5: the post-retirement observation follows the engine's
+    // explicit retirement pass, after the window and its submission.
+    engine.trim()?;
+    let post_retire_memory = MemorySnapshot::capture(engine.memory(), SampleDetail::Full);
     let test = submit
         .image
         .ok_or_else(|| BenchError::Engine("adapter returned no image".into()))?;
@@ -907,7 +952,11 @@ fn render_scene(
             }),
             metrics: metrics_v,
             counters: engine.counters(),
-            memory: MemoryReport::new(idle_memory, &[prepare_memory, steady_memory]),
+            memory: MemoryReport::new(
+                idle_memory,
+                &[prepare_memory, steady_memory],
+                Some(post_retire_memory),
+            ),
             device: engine.device(),
         },
         image: test,
@@ -1100,6 +1149,26 @@ fn load_scene(
     ))
 }
 
+/// The run's pacing summary, when a rate was requested: requested Hz,
+/// achieved Hz over the measured window and missed deadlines.
+fn pacing_report(
+    requested_hz: f64,
+    frames: u32,
+    missed_deadlines: u32,
+    window_seconds: f64,
+) -> Pacing {
+    Pacing {
+        requested_hz,
+        achieved_hz: if window_seconds > 0.0 {
+            f64::from(frames) / window_seconds
+        } else {
+            0.0
+        },
+        missed_deadlines,
+        window_seconds,
+    }
+}
+
 fn measure_scene(
     engine: &mut dyn Engine,
     dir: &Path,
@@ -1154,19 +1223,13 @@ fn measure_scene(
     // The steady snapshot lands after the pacing window and the meter
     // close, so its capture is never charged to a measured frame.
     let steady_memory = MemorySnapshot::capture(engine.memory(), SampleDetail::Full);
+    // #169 A5: retire, then take the post-retirement observation.
+    engine.trim()?;
+    let post_retire_memory = MemorySnapshot::capture(engine.memory(), SampleDetail::Full);
     let memory_samples = memory_samples(prepare_memory, &window.memory_samples, steady_memory);
     let missed_deadlines = window.missed_deadlines;
     let samples = window.samples;
-    let pacing = rate.map(|requested_hz| Pacing {
-        requested_hz,
-        achieved_hz: if window_seconds > 0.0 {
-            f64::from(frames) / window_seconds
-        } else {
-            0.0
-        },
-        missed_deadlines,
-        window_seconds,
-    });
+    let pacing = rate.map(|hz| pacing_report(hz, frames, missed_deadlines, window_seconds));
     let conditions = conditions::collect(
         energy_outcome
             .as_ref()
@@ -1204,7 +1267,7 @@ fn measure_scene(
         energy: energy_outcome.map(|o| o.report),
         conditions,
         counters: engine.counters(),
-        memory: MemoryReport::new(idle_memory, &memory_samples),
+        memory: MemoryReport::new(idle_memory, &memory_samples, Some(post_retire_memory)),
         device: engine.device(),
     })
 }
@@ -1542,7 +1605,7 @@ fn sweep_scene(
                     .find(|p| p.k == sweep.lo + 1)
                     .map(|p| p.p99_seconds),
                 probes: sweep.probes.clone(),
-                memory: MemoryReport::new(idle.clone(), &sweep.memory_samples),
+                memory: MemoryReport::new(idle.clone(), &sweep.memory_samples, None),
             }
         })
         .collect();

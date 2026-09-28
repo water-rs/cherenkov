@@ -124,14 +124,25 @@ pub struct MemorySnapshot {
     pub process: ProcessMemory,
 }
 
-/// Idle, steady-state and peak memory for one scene.
+/// Lifecycle memory for one scene: idle, the preparation peak, the
+/// warm-up peak, steady state and the post-retirement observation the
+/// #169 gate compares.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct MemoryReport {
     /// Snapshot taken once after engine creation and before scene preparation.
     pub idle: MemorySnapshot,
+    /// Snapshot once after `prepare` returns — the preparation peak.
+    pub preparation: MemorySnapshot,
+    /// Field-wise maximum over the warmup-frame captures; `None` when
+    /// the run sampled no warmup frame.
+    pub warmup_peak: Option<MemorySnapshot>,
     /// Snapshot after the measured window and its energy meter close, or
     /// the readback submission for render.
     pub steady: MemorySnapshot,
+    /// Snapshot after the engine's explicit retirement pass
+    /// ([`Engine::trim`](crate::Engine::trim)) — what it keeps
+    /// long-term. `None` where the reporting path did not retire.
+    pub post_retire: Option<MemorySnapshot>,
     /// Field-wise maximum over prepare, the warmup frames and the steady
     /// snapshot — measured frames sample nothing, so the paced window
     /// never pays a capture (#162).
@@ -170,14 +181,30 @@ impl MemorySnapshot {
 }
 
 impl MemoryReport {
-    pub(crate) fn new(idle: MemorySnapshot, samples: &[MemorySnapshot]) -> Self {
+    /// `samples` is `[prepare, ..warmup frames.., steady]`; `post_retire`
+    /// is the snapshot after the explicit retirement pass, when the
+    /// reporting path ran one.
+    pub(crate) fn new(
+        idle: MemorySnapshot,
+        samples: &[MemorySnapshot],
+        post_retire: Option<MemorySnapshot>,
+    ) -> Self {
         let steady = samples
             .last()
             .map_or_else(|| idle.clone(), |snapshot| (*snapshot).clone());
+        let preparation = samples
+            .first()
+            .map_or_else(|| idle.clone(), |snapshot| (*snapshot).clone());
+        let warmup_peak = samples
+            .get(1..samples.len().saturating_sub(1))
+            .and_then(MemorySnapshot::peak);
         let peak = MemorySnapshot::peak(samples).unwrap_or_else(|| steady.clone());
         Self {
             idle,
+            preparation,
+            warmup_peak,
             steady,
+            post_retire,
             peak,
             samples: samples.len(),
         }

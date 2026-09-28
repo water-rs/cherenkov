@@ -1,0 +1,155 @@
+{
+  "width": 128,
+  "height": 128,
+  "working_space": "linear-display-p3",
+  "clear": {
+    "space": "srgb",
+    "components": [
+      0.95,
+      0.95,
+      0.95,
+      1.0
+    ]
+  },
+  "features": [
+    {
+      "feature": "fill"
+    },
+    {
+      "feature": "opacity"
+    },
+    {
+      "feature": "filter"
+    },
+    {
+      "feature": "hdr-color"
+    },
+    {
+      "feature": "wide-gamut"
+    }
+  ],
+  "root": {
+    "transform": [
+      1.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0
+    ],
+    "opacity": 1.0,
+    "blend": "normal",
+    "items": [
+      {
+        "layer": {
+          "transform": [
+            1.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0
+          ],
+          "opacity": 0.82,
+          "blend": "normal",
+          "filter": {
+            "blend-image": {
+              "image": "3351ac7495c7fad124be7b181719c60c2064099ab240be78dd00ef078d794646",
+              "amount": 1.0,
+              "mode": "luminosity"
+            }
+          },
+          "items": [
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rounded-rect": {
+                      "rect": {
+                        "x0": 24.0,
+                        "y0": 24.0,
+                        "x1": 128.0,
+                        "y1": 128.0
+                      },
+                      "radii": {
+                        "top_left": 8.0,
+                        "top_right": 8.0,
+                        "bottom_right": 8.0,
+                        "bottom_left": 8.0
+                      }
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "solid": {
+                      "space": "linear-p3",
+                      "components": [
+                        7.0,
+                        2.0,
+                        1.0,
+                        0.72
+                      ]
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "circle": {
+                      "center": {
+                        "x": 50.0,
+                        "y": 62.0
+                      },
+                      "radius": 20.0
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "solid": {
+                      "space": "linear-p3",
+                      "components": [
+                        0.5,
+                        6.0,
+                        7.0,
+                        0.68
+                      ]
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rect": {
+                      "x0": 64.0,
+                      "y0": 52.0,
+                      "x1": 160.0,
+                      "y1": 140.0
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "solid": {
+                      "space": "linear-p3",
+                      "components": [
+                        5.0,
+                        1.0,
+                        6.0,
+                        0.66
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

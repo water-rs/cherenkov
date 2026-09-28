@@ -548,12 +548,12 @@ impl RasterRenderer {
         frame: cherenkov::FrameId,
         stats: &mut FrameStats,
     ) -> Result<(), RenderError> {
-        self.refresh_cache_budgets();
         let profile = tracing::enabled!(target: "cherenkov_cpu::profile", tracing::Level::DEBUG);
         let start = profile.then(cherenkov::Instant::now);
         let id = sf.id;
         let mut items: Vec<Item> = Vec::new();
         let glyph_reqs;
+        let glyphs_rasterized;
         // Lowering borrows the layer caches; the surface borrow ends
         // before glyph resolution touches `self.fonts`/`self.glyph_cache`.
         let lowered = {
@@ -571,7 +571,8 @@ impl RasterRenderer {
                 &mut self.bitmap_cache,
             );
             let result = lowering.run(id, sf.tree, &mut caches, &self.images);
-            stats.glyphs_rasterized += lowering.glyphs_rasterized;
+            glyphs_rasterized = lowering.glyphs_rasterized;
+            stats.glyphs_rasterized += glyphs_rasterized;
             stats.commands_lowered += lowering.commands_lowered;
             stats.layers_composed += lowering.layers_composed;
             glyph_reqs = std::mem::take(&mut lowering.glyphs);
@@ -581,7 +582,9 @@ impl RasterRenderer {
             result
         };
         lowered?;
-        self.refresh_cache_budgets();
+        if glyphs_rasterized > 0 {
+            self.refresh_cache_budgets();
+        }
         let lowered_at = start.map(|_| cherenkov::Instant::now());
         self.resolve_glyphs(&glyph_reqs)?;
         let resolved_at = start.map(|_| cherenkov::Instant::now());

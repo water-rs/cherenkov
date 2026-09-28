@@ -2,8 +2,9 @@
 
 use cherenkov::kurbo::{Affine, Rect, Stroke};
 use cherenkov::{
-    Draw, Engine, FontId, FontSource, FrameTime, Glyph, GlyphRun, GlyphStyle, ImageColorSpace,
-    ImageData, Offscreen, OffscreenFormat, Rgba8, Sampling, WorkingColor,
+    Draw, Engine, Extend, FontId, FontSource, FrameTime, Glyph, GlyphRun, GlyphStyle,
+    ImageColorSpace, ImageData, ImageId, ImagePattern, Offscreen, OffscreenFormat, Paint, Rgba8,
+    Sampling, WorkingColor,
 };
 use cherenkov_cpu::{Raster, RasterConfig};
 use skrifa::MetadataProvider;
@@ -18,6 +19,7 @@ const SBIX_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../scenes/fonts/CherenkovSbixTest.ttf"
 );
+const OUTLINE_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../scenes/fonts/NotoSans.ttf");
 
 fn engine() -> Engine<Raster> {
     Engine::<Raster>::new(RasterConfig::default()).expect("CPU engine")
@@ -44,6 +46,36 @@ fn glyph_run(font: FontId, id: u32, size: f32) -> GlyphRun {
             transform: None,
         }],
         style: GlyphStyle::Fill,
+    }
+}
+
+fn unregistered_image_error(bytes: &[u8], character: char) -> String {
+    let engine = engine();
+    let font = engine
+        .font(FontSource::bytes(bytes.to_vec()))
+        .expect("register font");
+    let run = glyph_run(font.id(), glyph_id(bytes, character), 48.0);
+    let surface = engine
+        .surface(Offscreen::new((160, 120), OffscreenFormat::LinearF32))
+        .expect("surface");
+    surface.update(|tx| {
+        tx[surface.root()].content(surface.record(|c| {
+            c.glyphs(
+                run,
+                Paint::Image(ImagePattern {
+                    image: ImageId::new(u64::MAX),
+                    transform: Affine::IDENTITY,
+                    extend_x: Extend::Pad,
+                    extend_y: Extend::Pad,
+                    sampling: Sampling::Linear,
+                }),
+            );
+        }));
+    });
+    match engine.render(FrameTime::now()) {
+        Err(cherenkov::RenderError::Image(message)) => message,
+        Err(error) => panic!("expected unregistered-image error, got {error}"),
+        Ok(_) => panic!("unregistered-image paint unexpectedly rendered"),
     }
 }
 
@@ -222,6 +254,16 @@ fn cbdt_and_sbix_glyphs_match_image_draws() {
         48.0,
         Affine::IDENTITY,
     );
+    equivalent(
+        &engine,
+        &sbix_font,
+        &sbix,
+        BitmapFormat::Sbix,
+        sbix_id,
+        96.0,
+        20.0,
+        Affine::scale(2.0),
+    );
 }
 
 #[test]
@@ -328,4 +370,14 @@ fn missing_notdef_is_empty_and_bitmap_transforms_or_strokes_are_unsupported() {
         engine.render(FrameTime::now()),
         Err(cherenkov::RenderError::Unsupported("glyph-stroke"))
     ));
+}
+
+#[test]
+fn bitmap_runs_validate_image_paints_like_outline_runs() {
+    let cbdt = std::fs::read(CBDT_PATH).expect("CBDT fixture");
+    let outline = std::fs::read(OUTLINE_PATH).expect("outline fixture");
+    assert_eq!(
+        unregistered_image_error(&cbdt, '😀'),
+        unregistered_image_error(&outline, 'A')
+    );
 }

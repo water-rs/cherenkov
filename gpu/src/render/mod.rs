@@ -1786,6 +1786,7 @@ impl Renderer for GpuRenderer {
                 data: font.data,
                 index: font.index,
                 has_colr,
+                has_bitmap: bitmap.is_some(),
                 bitmap,
                 colr: std::cell::RefCell::new(HashMap::new()),
             },

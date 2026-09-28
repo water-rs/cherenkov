@@ -1168,7 +1168,7 @@ impl Lowerer<'_> {
             .ok_or_else(|| RenderError::Font(format!("unregistered font {:?}", run.font)))?;
         let resolved = resolve(paint, Affine::IDENTITY, self.images)?;
         if !font.has_colr
-            && font.bitmap.is_none()
+            && !font.has_bitmap
             && !run.glyphs.iter().any(|glyph| glyph.transform.is_some())
         {
             if !run.glyphs.is_empty() {
@@ -1203,7 +1203,7 @@ impl Lowerer<'_> {
             .fonts
             .get(&run.font.raw())
             .ok_or_else(|| RenderError::Font(format!("unregistered font {:?}", run.font)))?;
-        if font.bitmap.is_some() {
+        if font.has_bitmap {
             return Err(RenderError::Unsupported(names::GLYPH_STROKE));
         }
         for path in super::glyph::stroke_outlines(font, run)? {
@@ -1273,6 +1273,7 @@ impl Lowerer<'_> {
         let outlines = font_ref.outline_glyphs();
         let color_glyphs =
             (font.has_colr && font_ref.colr().is_ok()).then(|| font_ref.color_glyphs());
+        let bitmap = font.has_bitmap;
         let mut pending: Vec<cherenkov::Glyph> = Vec::new();
         for glyph in &run.glyphs {
             if let Some(color_glyphs) = color_glyphs.as_ref()
@@ -1306,7 +1307,7 @@ impl Lowerer<'_> {
                 )?;
                 continue;
             }
-            if font.bitmap.is_some() {
+            if bitmap {
                 let (local, origin) = match super::glyph::classify(glyph)? {
                     super::glyph::GlyphPlacement::Translate(glyph) => (ambient, [glyph.x, glyph.y]),
                     super::glyph::GlyphPlacement::Outline(place) => (ambient * place, [0.0, 0.0]),

@@ -536,7 +536,7 @@ fn filter_image_png() -> Vec<u8> {
 
 fn filter_color_content(l: &mut LayerBuilder<'_>, colors: &FilterColorSet) {
     l.fill(
-        Shape::rect(20.0, 20.0, 108.0, 108.0),
+        Shape::rect(20.0, 20.0, 88.0, 88.0),
         Paint::Linear(LinearGradient {
             start: Point::new(24.0, 28.0),
             end: Point::new(104.0, 100.0),
@@ -556,7 +556,7 @@ fn filter_color_content(l: &mut LayerBuilder<'_>, colors: &FilterColorSet) {
     );
     l.fill(Shape::circle(48.0, 64.0, 16.0), solid(colors.matrix_circle));
     l.fill(
-        Shape::rounded_rect(68.0, 40.0, 96.0, 88.0, 6.0),
+        Shape::rounded_rect(68.0, 40.0, 28.0, 48.0, 6.0),
         solid(colors.matrix_rounded_rect),
     );
 }
@@ -582,12 +582,12 @@ fn filter_blur_content(l: &mut LayerBuilder<'_>, colors: &FilterColorSet) {
 
 fn filter_blend_content(l: &mut LayerBuilder<'_>, colors: &FilterColorSet) {
     l.fill(
-        Shape::rounded_rect(24.0, 24.0, 104.0, 104.0, 8.0),
+        Shape::rounded_rect(24.0, 24.0, 80.0, 80.0, 8.0),
         solid(colors.blend_round_rect),
     );
     l.fill(Shape::circle(50.0, 62.0, 20.0), solid(colors.blend_circle));
     l.fill(
-        Shape::rect(64.0, 52.0, 96.0, 88.0),
+        Shape::rect(64.0, 52.0, 32.0, 36.0),
         solid(colors.blend_rect),
     );
 }
@@ -597,12 +597,12 @@ fn filter_nested_content(l: &mut LayerBuilder<'_>, colors: &FilterColorSet) {
         15.0, 16.0, 31.0, 32.0, 47.0, 48.0, 127.0, 128.0, 191.0, 192.0,
     ] {
         l.fill(
-            Shape::rect(26.0, y, 38.0, y + 1.0),
+            Shape::rect(26.0, y, 12.0, 1.0),
             solid(colors.nested_blue),
         );
     }
     l.fill(
-        Shape::rect(26.0, 122.0, 38.0, 134.0),
+        Shape::rect(26.0, 122.0, 12.0, 12.0),
         solid(colors.nested_red),
     );
 }

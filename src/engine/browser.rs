@@ -128,19 +128,18 @@ impl<B: Backend> Engine<B> {
         &self.info
     }
 
-    /// Statistics of the last [`Engine::render`]. A backend whose GPU
-    /// timestamps resolve after its submit reports earlier frames'
-    /// timings here, once the GPU has caught up.
+    /// Statistics of the last [`Engine::render`]. GPU timings are kept by
+    /// the render thread and returned by [`Engine::finish_timings`] instead.
     #[must_use]
     pub fn stats(&self) -> FrameStats {
         self.stats.borrow().clone()
     }
 
-    /// Waits for every submitted frame whose timing no render has reported
-    /// yet, and returns those timings, oldest first — the end of a
-    /// measured window, where the last frames are still on the GPU. Awaits
-    /// completion without blocking JavaScript; intended for tooling. Empty when the backend reports no
-    /// GPU timing or has nothing outstanding.
+    /// Returns all GPU timings accumulated since the previous call,
+    /// oldest first. Awaits frames still in flight without blocking
+    /// JavaScript, so this marks the end of a measured window and belongs
+    /// to tooling, never to a frame path. Empty when the backend reports
+    /// no GPU timing or has nothing outstanding.
     ///
     /// # Errors
     /// [`RenderError::Timeout`] when the GPU does not finish in time,

@@ -32,7 +32,8 @@ use crate::memory::{AdapterMemory, EngineBytes, Reading};
 use crate::motion::{Clock, LayerMotion};
 use crate::timing::Timings;
 use crate::{
-    BenchError, Counters, DeviceInfo, EncodeInput, Engine, EngineInfo, PresentKind, Submit,
+    BenchError, Counters, DeviceInfo, EncodeInput, Engine, EngineInfo, GpuSample, PresentKind,
+    Submit,
 };
 
 /// A scene shape in a form the front-end accepts.
@@ -1496,7 +1497,7 @@ impl Engine for Cherenkov {
                 "cherenkov: submit before prepare".into(),
             ));
         }
-        let gpu = self.timings.render_frame(
+        self.timings.render_frame(
             &self.engine,
             &mut self.clock,
             frame,
@@ -1545,9 +1546,14 @@ impl Engine for Cherenkov {
         };
         Ok(Submit {
             image,
-            gpu,
-            phases: Vec::new(),
+            gpu: Vec::new(),
+            phases: None,
         })
+    }
+
+    fn finish_gpu(&mut self) -> Result<Vec<GpuSample>, BenchError> {
+        let timings = self.engine.finish_timings().map_err(render_error)?;
+        Ok(self.timings.samples(timings))
     }
 
     fn counters(&self) -> Counters {

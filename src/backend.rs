@@ -128,10 +128,11 @@ pub trait Renderer: 'static {
         stats: &mut FrameStats,
     ) -> impl core::future::Future<Output = Result<Redraw, RenderError>>;
 
-    /// Waits for the GPU to finish every submitted frame whose timing no
-    /// render has reported yet, and returns those timings, oldest first.
-    /// A backend that times frames synchronously, or not at all, has
-    /// nothing outstanding.
+    /// Returns all GPU timings accumulated since the previous call,
+    /// oldest first. Timings stay on the renderer rather than being
+    /// returned by `render`; this tooling call waits for frames still on
+    /// the GPU. A backend that times frames synchronously, or not at all,
+    /// may have nothing outstanding.
     ///
     /// # Errors
     /// [`RenderError::Timeout`] when the GPU does not finish in time,
@@ -141,7 +142,9 @@ pub trait Renderer: 'static {
         Ok(Vec::new())
     }
 
-    /// Awaits outstanding GPU timing readbacks without blocking JavaScript.
+    /// Awaits outstanding GPU timing readbacks without blocking JavaScript
+    /// and returns all accumulated timings, oldest first. Render calls
+    /// never return GPU timings.
     ///
     /// # Errors
     /// Returns a timeout or readback error.

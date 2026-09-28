@@ -66,9 +66,7 @@ pub struct GpuInfo {
 /// unreliable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TimestampSupport {
-    /// No timestamp queries; [`FrameStats::timings`] stays empty.
-    ///
-    /// [`FrameStats::timings`]: cherenkov::FrameStats::timings
+    /// No timestamp queries; `finish_timings` returns no GPU timings.
     Unsupported,
     /// At render and compute pass boundaries.
     PassBoundaries,

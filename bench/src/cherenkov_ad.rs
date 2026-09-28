@@ -1769,7 +1769,7 @@ impl Engine for Cherenkov {
                 "cherenkov: submit before prepare".into(),
             ));
         }
-        let gpu = self.timings.render_frame(
+        self.timings.render_frame(
             &self.engine,
             &mut self.clock,
             frame,
@@ -1797,19 +1797,16 @@ impl Engine for Cherenkov {
             })
         };
         let phases = stats.phases;
-        let phases = [
-            ("lower", phases.lower_seconds),
-            ("encode", phases.encode_seconds),
-            ("stamp", phases.stamp_seconds),
-            ("wait", phases.wait_seconds),
-        ]
-        .into_iter()
-        .map(|(name, seconds)| crate::PhaseSample {
-            name: name.to_string(),
-            seconds,
+        Ok(Submit {
+            image,
+            gpu: Vec::new(),
+            phases: Some(crate::Phases {
+                lower: phases.lower_seconds,
+                encode: phases.encode_seconds,
+                stamp: phases.stamp_seconds,
+                wait: phases.wait_seconds,
+            }),
         })
-        .collect();
-        Ok(Submit { image, gpu, phases })
     }
 
     fn finish_gpu(&mut self) -> Result<Vec<GpuSample>, BenchError> {

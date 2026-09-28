@@ -251,20 +251,30 @@ pub struct PhaseSample {
     pub seconds: f64,
 }
 
+/// Render-thread CPU seconds of each phase of one frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Phases {
+    /// CPU lowering of dirty surfaces.
+    pub lower: f64,
+    /// Command encoding and queue submission.
+    pub encode: f64,
+    /// Timestamp drain and resolve work.
+    pub stamp: f64,
+    /// The final blocking queue drain.
+    pub wait: f64,
+}
+
 /// The result of [`Engine::submit`].
 pub struct Submit {
     /// The rendered image in the working space, when readback was
     /// requested.
     pub image: Option<F32Image>,
-    /// GPU timings that became available with this call: this frame's
-    /// for a backend that times synchronously, earlier frames' for one
-    /// whose timestamps resolve later (the rest arrive from
-    /// [`Engine::finish_gpu`]). Empty when the backend exposes no GPU
-    /// timestamps.
+    /// GPU timings returned with this submission. Cherenkov adapters
+    /// return their timings from [`Engine::finish_gpu`].
     pub gpu: Vec<GpuSample>,
-    /// Per-phase render-thread CPU timings, in render order; empty when
-    /// the adapter exposes none.
-    pub phases: Vec<PhaseSample>,
+    /// Render-thread CPU timings for Cherenkov GPU; `None` when the adapter
+    /// does not expose phase timings.
+    pub phases: Option<Phases>,
 }
 
 /// Resources an adapter needs to encode one scene.

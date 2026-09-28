@@ -3,12 +3,12 @@
 
 //! Frame-timing attribution for the shared `cherenkov` front end.
 //!
-//! A render's GPU timing can resolve during a later render, so each resolved
-//! [`FrameTiming`] is traced back to the bench frame that rendered it.
+//! GPU timings are returned at the end of the measured window, so compact
+//! frame spans trace each [`FrameTiming`] back to its bench frame.
 
-use std::collections::HashMap;
+use std::cmp::Ordering;
 
-use cherenkov::{Backend, Engine, FrameId, FrameStats, FrameTiming, Next, RenderError};
+use cherenkov::{Backend, Engine, FrameStats, FrameTiming, Next, RenderError};
 
 use crate::motion::Clock;
 use crate::{BenchError, GpuSample, PassSample};
@@ -17,19 +17,25 @@ use crate::{BenchError, GpuSample, PassSample};
 /// to rest.
 const SETTLE_FRAMES: u32 = 2000;
 
-/// The bench frame of every engine frame whose GPU timing has not
-/// resolved yet.
+/// A contiguous run of engine frames mapped to contiguous bench frames.
+struct Span {
+    first: u64,
+    frame: u64,
+    len: u64,
+}
+
+/// The engine frames whose GPU timings are being collected.
 #[derive(Default)]
 pub struct Timings {
-    in_flight: HashMap<FrameId, u64>,
+    spans: Vec<Span>,
 }
 
 impl Timings {
     /// Renders bench frame `frame` at `clock`'s time. With `settle`,
     /// keeps rendering, advancing the clock, until the scene's motion
     /// comes to rest — FLIP compares against the oracle's settled scene.
-    /// Every render is recorded as `frame`; returns the GPU timings those
-    /// renders resolved.
+    /// Every render is recorded as `frame`; GPU timings are returned by
+    /// [`Timings::samples`] after `finish_timings`.
     ///
     /// # Errors
     /// A render failure mapped through `render_error`, or
@@ -42,22 +48,22 @@ impl Timings {
         frame: u64,
         settle: bool,
         render_error: fn(RenderError) -> BenchError,
-    ) -> Result<Vec<GpuSample>, BenchError> {
+    ) -> Result<(), BenchError> {
         let mut next = engine.render(clock.time()).map_err(render_error)?;
-        let mut gpu = self.record(frame, engine.stats());
+        self.record(frame, &engine.stats());
         if !settle {
-            return Ok(gpu);
+            return Ok(());
         }
         for _ in 0..SETTLE_FRAMES {
             if next == Next::Idle {
-                return Ok(gpu);
+                return Ok(());
             }
             clock.advance();
             next = engine.render(clock.time()).map_err(render_error)?;
-            gpu.extend(self.record(frame, engine.stats()));
+            self.record(frame, &engine.stats());
         }
         if next == Next::Idle {
-            return Ok(gpu);
+            return Ok(());
         }
         Err(BenchError::Engine(format!(
             "motion did not settle in {SETTLE_FRAMES} frames"
@@ -65,12 +71,23 @@ impl Timings {
     }
 
     /// Records the engine frame one render drew (if it drew anything) as
-    /// bench frame `frame`, and returns the timings that render resolved.
-    pub fn record(&mut self, frame: u64, stats: FrameStats) -> Vec<GpuSample> {
+    /// bench frame `frame`.
+    pub fn record(&mut self, frame: u64, stats: &FrameStats) {
         if let Some(id) = stats.frame {
-            self.in_flight.insert(id, frame);
+            let first = id.get();
+            if let Some(span) = self.spans.last_mut()
+                && span.first + span.len == first
+                && span.frame + span.len == frame
+            {
+                span.len += 1;
+            } else {
+                self.spans.push(Span {
+                    first,
+                    frame,
+                    len: 1,
+                });
+            }
         }
-        self.samples(stats.timings)
     }
 
     /// Tags each resolved engine frame timing with the bench frame that
@@ -79,27 +96,97 @@ impl Timings {
     /// # Panics
     /// When a timing names an engine frame [`Timings::record`] never saw —
     /// the engine times only frames its renders drew.
-    pub fn samples(&mut self, timings: Vec<FrameTiming>) -> Vec<GpuSample> {
+    #[must_use]
+    pub fn samples(&self, timings: Vec<FrameTiming>) -> Vec<GpuSample> {
         timings
             .into_iter()
-            .map(|timing| GpuSample {
-                frame: self
-                    .in_flight
-                    .remove(&timing.frame)
-                    .expect("the engine times only frames its renders drew"),
-                gpu_seconds: timing.gpu_seconds,
-                passes: timing
-                    .passes
-                    .into_iter()
-                    .map(|p| PassSample {
-                        name: p.name,
-                        width: p.width,
-                        height: p.height,
-                        format: p.format.to_string(),
-                        gpu_seconds: p.gpu_seconds,
+            .map(|timing| {
+                let frame_id = timing.frame.get();
+                let span = self
+                    .spans
+                    .binary_search_by(|span| {
+                        if frame_id < span.first {
+                            Ordering::Greater
+                        } else if frame_id >= span.first + span.len {
+                            Ordering::Less
+                        } else {
+                            Ordering::Equal
+                        }
                     })
-                    .collect(),
+                    .map(|index| &self.spans[index])
+                    .expect("the engine times only frames its renders drew");
+                GpuSample {
+                    frame: span.frame + (frame_id - span.first),
+                    gpu_seconds: timing.gpu_seconds,
+                    passes: timing
+                        .passes
+                        .into_iter()
+                        .map(|p| PassSample {
+                            name: p.name,
+                            width: p.width,
+                            height: p.height,
+                            format: p.format.to_string(),
+                            gpu_seconds: p.gpu_seconds,
+                        })
+                        .collect(),
+                }
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Timings;
+    use cherenkov::{FrameId, FrameStats, FrameTiming};
+
+    fn record(timings: &mut Timings, bench_frame: u64, engine_frame: u64) {
+        let stats = FrameStats {
+            frame: Some(FrameId::new(engine_frame)),
+            ..FrameStats::default()
+        };
+        timings.record(bench_frame, &stats);
+    }
+
+    fn timing(frame: u64) -> FrameTiming {
+        FrameTiming {
+            frame: FrameId::new(frame),
+            gpu_seconds: None,
+            passes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn contiguous_frames_share_a_span() {
+        let mut timings = Timings::default();
+        record(&mut timings, 0, 10);
+        record(&mut timings, 1, 11);
+        record(&mut timings, 2, 12);
+
+        let samples = timings.samples(vec![timing(10), timing(11), timing(12)]);
+        assert_eq!(
+            samples
+                .iter()
+                .map(|sample| sample.frame)
+                .collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn repeated_settle_renders_keep_the_same_bench_frame() {
+        let mut timings = Timings::default();
+        record(&mut timings, 3, 20);
+        record(&mut timings, 3, 21);
+        record(&mut timings, 3, 22);
+
+        let samples = timings.samples(vec![timing(20), timing(21), timing(22)]);
+        assert_eq!(
+            samples
+                .iter()
+                .map(|sample| sample.frame)
+                .collect::<Vec<_>>(),
+            [3, 3, 3]
+        );
     }
 }

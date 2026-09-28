@@ -596,14 +596,16 @@ fn mesh_uv(point: vec2<f32>, top: vec4<f32>, bottom: vec4<f32>) -> vec3<f32> {
     return answer;
 }
 
-fn paint_mesh(first: u32, count: u32, point: vec2<f32>) -> vec4<f32> {
+fn paint_mesh(first: u32, count: u32, point: vec2<f32>, smooth_color: bool) -> vec4<f32> {
     for (var remaining = count; remaining > 0u; remaining -= 1u) {
         let base = first + (remaining - 1u) * 6u;
         let uv = mesh_uv(point, stops[base].color, stops[base + 1u].color);
         if uv.z != 0.0 {
-            let top = mix(stops[base + 2u].color, stops[base + 3u].color, uv.x);
-            let bottom = mix(stops[base + 4u].color, stops[base + 5u].color, uv.x);
-            return mix(top, bottom, uv.y);
+            var weight = uv.xy;
+            if smooth_color { weight = weight * weight * (3.0 - 2.0 * weight); }
+            let top = mix(stops[base + 2u].color, stops[base + 3u].color, weight.x);
+            let bottom = mix(stops[base + 4u].color, stops[base + 5u].color, weight.x);
+            return mix(top, bottom, weight.y);
         }
     }
     return vec4<f32>(0.0);
@@ -627,7 +629,7 @@ fn paint(i: u32, meta_: vec4<u32>, color: vec4<f32>, local: vec2<f32>, pixel: ve
             return textureLoad(source, vec2<i32>(floor(pixel - instances[i].grad.xy)), 0);
         }
         case PAINT_MESH: {
-            return paint_mesh(meta_.z, meta_.w & 0x00ffffffu, point);
+            return paint_mesh(meta_.z, meta_.w & 0x00ffffffu, point, (meta_.y & 0x20000u) != 0u);
         }
         case PAINT_IMAGE: {
             return paint_image(i, point);

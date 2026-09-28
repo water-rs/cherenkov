@@ -35,6 +35,8 @@ pub const PAINT_IMAGE: u32 = 5;
 pub const PAINT_TRANSFORMED: u32 = 1 << 16;
 /// Bilinear mesh patches in the shared paint buffer.
 pub const PAINT_MESH: u32 = 6;
+/// Smooth colour weights; low 16 bits still identify the mesh paint kind.
+pub const PAINT_MESH_SMOOTH: u32 = 1 << 17;
 
 /// Clamp the edge colours.
 pub const EXTEND_PAD: u32 = 0;

@@ -18,9 +18,9 @@ use crate::render::GpuImage;
 
 use crate::render::glyph::{self, Atlas, FontData, MaskCell, PathEmit, PendingRaster, glyph_key};
 use crate::render::instance::{
-    FLAG_HAS_CLIP, FLAG_HAS_INNER, FLAG_HAS_MASK, Globals, Instance, KIND_FILL, KIND_GLYPH,
-    KIND_SHADOW, KIND_SPAN, KIND_STROKE_DIST, KIND_STROKE_OFFSET, PAINT_SOLID, PAINT_TEXTURE,
-    Shape, Stop, affine, blend_code,
+    FLAG_HAS_CLIP, FLAG_HAS_INNER, FLAG_HAS_MASK, FLAG_MASK_TEXTURE, Globals, Instance, KIND_FILL,
+    KIND_GLYPH, KIND_SHADOW, KIND_SPAN, KIND_STROKE_DIST, KIND_STROKE_OFFSET, PAINT_SOLID,
+    PAINT_TEXTURE, Shape, Stop, affine, blend_code,
 };
 use crate::render::path;
 
@@ -71,6 +71,8 @@ pub struct DrawRange {
     pub source: Option<usize>,
     /// The image texture bound for `PAINT_IMAGE` instances.
     pub image: Option<ImageSource>,
+    /// The mask texture bound at group-1 binding 3, by key.
+    pub mask: Option<u64>,
     /// The pipeline variant this range draws with.
     pub pipeline: PipelineKind,
     /// The fragment-shader variant this range draws with.
@@ -117,6 +119,8 @@ struct OpenPass {
     clear: Option<[f32; 4]>,
     source: Option<usize>,
     image: Option<ImageSource>,
+    /// The mask texture bound at group-1 binding 3, by key.
+    mask: Option<u64>,
     pipeline: PipelineKind,
     variant: ShaderVariant,
     backdrop_copy: Option<[u32; 4]>,
@@ -182,13 +186,17 @@ struct DeviceClip {
     mask: Option<ClipMask>,
 }
 
-/// A path-clip mask: stored in the atlas, or produced by a pending
-/// raster the render thread will store — then `uv.zw` of every instance
-/// emitted under it is patched by `Lowering::mask_patches`.
+/// A path-clip mask: stored in the atlas or on its own texture, or
+/// produced by a pending raster the render thread will store — then
+/// `uv.zw` of every instance emitted under it is patched by
+/// `Lowering::mask_patches`.
 #[derive(Clone, Copy, Debug)]
 enum ClipMask {
-    /// Stored: the atlas origin is `cell.atlas`.
+    /// Stored in the atlas: the atlas origin is `cell.atlas`.
     Cell(MaskCell),
+    /// Stored on a dedicated texture: the mask's content-hash key,
+    /// bound at group-1 binding 3.
+    Texture(MaskCell, u64),
     /// Pending its raster (index into `Lowering::pending`).
     Pending(MaskCell, u32),
 }
@@ -198,7 +206,7 @@ impl ClipMask {
     /// origin.
     const fn cell(self) -> MaskCell {
         match self {
-            Self::Cell(m) | Self::Pending(m, _) => m,
+            Self::Cell(m) | Self::Texture(m, _) | Self::Pending(m, _) => m,
         }
     }
 
@@ -206,6 +214,7 @@ impl ClipMask {
     fn translated(self, dx: f64, dy: f64) -> Self {
         match self {
             Self::Cell(m) => Self::Cell(m.translated(dx, dy)),
+            Self::Texture(m, key) => Self::Texture(m.translated(dx, dy), key),
             Self::Pending(m, i) => Self::Pending(m.translated(dx, dy), i),
         }
     }
@@ -541,6 +550,11 @@ pub struct Lowering<'a> {
     /// `(instance, pending)` pairs whose `uv.zw` are set when the render
     /// thread stores the pending clip mask.
     pub(crate) mask_patches: Vec<(u32, u32)>,
+    /// The open range's bound mask texture key; `None` for the dummy view.
+    /// Kept in sync with `clip` by `set_clip`.
+    mask_key: Option<u64>,
+    /// The current clip's pending mask raster index, if any.
+    mask_pending: Option<u32>,
     /// Atlas writes and cache updates to commit, in lowering order.
     pub(crate) pending: Vec<PendingRaster>,
     pub commands_lowered: u32,
@@ -558,6 +572,8 @@ impl<'a> Lowering<'a> {
             transform: Affine::IDENTITY,
             margin: None,
             clip: None,
+            mask_key: None,
+            mask_pending: None,
             depth: 0,
             glyphs: 0,
             paths: 0,
@@ -639,6 +655,7 @@ impl<'a> Lowering<'a> {
             open.ranges.push(DrawRange {
                 source: open.source,
                 image: open.image.clone(),
+                mask: open.mask,
                 pipeline: open.pipeline,
                 variant: open.variant,
                 instances: open.seg_start..end,
@@ -654,6 +671,7 @@ impl<'a> Lowering<'a> {
             clear,
             source: None,
             image: None,
+            mask: None,
             pipeline: PipelineKind::SrcOver,
             variant: ShaderVariant::Simple,
             backdrop_copy: None,
@@ -661,6 +679,8 @@ impl<'a> Lowering<'a> {
             #[expect(clippy::cast_possible_truncation)]
             seg_start: self.frame.instances.len() as u32,
         });
+        // A masked clip can span passes; the new pass binds its texture.
+        self.set_mask(self.mask_key);
     }
 
     fn finish_pass(&mut self) {
@@ -736,6 +756,38 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// Sets the current clip and the open range's bound mask texture.
+    /// `mask_key`/`mask_pending` derive from the clip, so the per-instance
+    /// path only reads scalars.
+    fn set_clip(&mut self, clip: Option<DeviceClip>) {
+        self.clip = clip;
+        let mask = clip.and_then(|c| c.mask);
+        self.mask_key = match mask {
+            Some(ClipMask::Texture(_, key)) => Some(key),
+            _ => None,
+        };
+        self.mask_pending = match mask {
+            Some(ClipMask::Pending(_, p)) => Some(p),
+            _ => None,
+        };
+        self.set_mask(self.mask_key);
+    }
+
+    /// Starts a new draw range when the bound mask texture changes.
+    #[expect(
+        clippy::inline_always,
+        reason = "a compare on the hot push_instance path"
+    )]
+    #[inline(always)]
+    fn set_mask(&mut self, mask: Option<u64>) {
+        if self.frame.open.as_ref().is_some_and(|o| o.mask != mask) {
+            self.end_segment();
+            if let Some(open) = &mut self.frame.open {
+                open.mask = mask;
+            }
+        }
+    }
+
     /// Starts a new draw range when the shader variant changes.
     fn set_variant(&mut self, variant: ShaderVariant) {
         if self
@@ -761,7 +813,7 @@ impl<'a> Lowering<'a> {
     fn push_instance(&mut self, inst: &Instance) {
         self.set_variant(variant_of(inst));
         self.frame.instances.push(*inst);
-        if let Some(ClipMask::Pending(_, pending)) = self.clip.and_then(|c| c.mask) {
+        if let Some(pending) = self.mask_pending {
             self.mask_patches
                 .push((self.frame.instances.len() as u32 - 1, pending));
         }
@@ -802,7 +854,7 @@ impl<'a> Lowering<'a> {
         self.depth += 1;
         let scratch = self.depth - 1;
         let outer_clip = self.clip;
-        self.clip = inner_clip;
+        self.set_clip(inner_clip);
         // Nested isolations split this scratch's open pass into segments;
         // every segment at this depth needs the region.
         let passes_start = self.frame.passes.len();
@@ -811,7 +863,7 @@ impl<'a> Lowering<'a> {
         body(self, glyphs)?;
         self.finish_pass();
         self.depth -= 1;
-        self.clip = outer_clip;
+        self.set_clip(outer_clip);
         let outer_target = if self.depth == 0 {
             Target::Surface
         } else {
@@ -905,7 +957,7 @@ impl<'a> Lowering<'a> {
         self.cell_patches.truncate(patches.0);
         self.mask_patches.truncate(patches.1);
         self.depth = depth;
-        self.clip = clip;
+        self.set_clip(clip);
         self.transform = transform;
         result?;
         Ok(false)
@@ -1019,9 +1071,15 @@ impl<'a> Lowering<'a> {
                 inst.clip.aspect = cell.size[0];
                 inst.clip.exponent = cell.size[1];
                 inst.meta[3] |= FLAG_HAS_MASK << 24;
-                if let ClipMask::Cell(cell) = mask {
-                    inst.uv[2] = cell.atlas[0];
-                    inst.uv[3] = cell.atlas[1];
+                match mask {
+                    ClipMask::Cell(cell) => {
+                        inst.uv[2] = cell.atlas[0];
+                        inst.uv[3] = cell.atlas[1];
+                    }
+                    ClipMask::Texture(..) => {
+                        inst.meta[3] |= FLAG_MASK_TEXTURE << 24;
+                    }
+                    ClipMask::Pending(..) => {}
                 }
             }
         }
@@ -1090,9 +1148,9 @@ impl<'a> Lowering<'a> {
         }
         match self.clip {
             None => {
-                self.clip = Some(clip);
+                self.set_clip(Some(clip));
                 body(self, glyphs)?;
-                self.clip = None;
+                self.set_clip(None);
                 Ok(())
             }
             // The current clip is masked: only an aligned rect merges
@@ -1101,9 +1159,9 @@ impl<'a> Lowering<'a> {
                 if clip.mask.is_none()
                     && let (Some(cr), Some(dr)) = (cur.aligned_rect, clip.aligned_rect)
                 {
-                    self.clip = Some(merged_rect(cr, dr, cur.mask));
+                    self.set_clip(Some(merged_rect(cr, dr, cur.mask)));
                     body(self, glyphs)?;
-                    self.clip = Some(cur);
+                    self.set_clip(Some(cur));
                     return Ok(());
                 }
                 self.isolate(
@@ -1119,26 +1177,26 @@ impl<'a> Lowering<'a> {
                 // A new masked clip merges with an aligned rect clip (or
                 // attaches to the current clip's analytic shape).
                 (Some(mask), Some(cr), Some(dr)) => {
-                    self.clip = Some(merged_rect(cr, dr, Some(mask)));
+                    self.set_clip(Some(merged_rect(cr, dr, Some(mask))));
                     body(self, glyphs)?;
-                    self.clip = Some(cur);
+                    self.set_clip(Some(cur));
                     Ok(())
                 }
                 (Some(mask), _, _) => {
-                    self.clip = Some(DeviceClip {
+                    self.set_clip(Some(DeviceClip {
                         inv: cur.inv,
                         shape: cur.shape,
                         aligned_rect: cur.aligned_rect,
                         mask: Some(mask),
-                    });
+                    }));
                     body(self, glyphs)?;
-                    self.clip = Some(cur);
+                    self.set_clip(Some(cur));
                     Ok(())
                 }
                 (None, Some(cr), Some(dr)) => {
-                    self.clip = Some(merged_rect(cr, dr, None));
+                    self.set_clip(Some(merged_rect(cr, dr, None)));
                     body(self, glyphs)?;
-                    self.clip = Some(cur);
+                    self.set_clip(Some(cur));
                     Ok(())
                 }
                 _ => self.isolate(
@@ -1389,9 +1447,10 @@ impl<'a> Lowering<'a> {
         self.set_image(None);
         let snapshot = self.frame.snapshot();
         let first_patch = self.cell_patches.len();
-        let clip = self.clip.take();
+        let clip = self.clip;
+        self.set_clip(None);
         let result = self.realize_leaf(op, cover, cache, storage, glyphs, source);
-        self.clip = clip;
+        self.set_clip(clip);
         result?;
         self.frame.restore(snapshot);
         self.cell_patches.truncate(first_patch);
@@ -2064,7 +2123,7 @@ impl<'a> Lowering<'a> {
             ];
             inst.uv[..2].copy_from_slice(&uv);
         }
-        if let Some(ClipMask::Pending(_, pending)) = self.clip.and_then(|c| c.mask) {
+        if let Some(pending) = self.mask_pending {
             self.mask_patches.extend(
                 (first..self.frame.instances.len())
                     .map(|i| (u32::try_from(i).expect("instance index fits u32"), pending)),
@@ -2072,12 +2131,18 @@ impl<'a> Lowering<'a> {
         }
     }
 
-    /// A clip with a `Path` shape: the coverage rasterized into one atlas
-    /// cell multiplies every instance drawn under it. The mask is cached
-    /// like a path draw: replays cost no rasterization or atlas cell.
+    /// A clip with a `Path` shape: the coverage rasterized into an atlas
+    /// cell — or, when it exceeds `Atlas::MASK_TEXTURE_TEXELS` or the
+    /// atlas cap, a dedicated texture — multiplies every instance drawn
+    /// under it. The mask is cached like a path draw: replays cost no
+    /// rasterization or storage.
     #[expect(clippy::cast_possible_truncation)]
     #[expect(clippy::cast_sign_loss)]
     #[expect(clippy::cast_precision_loss)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "atlas and texture storage share the lookup tail"
+    )]
     fn with_path_clip(
         &mut self,
         elements: &[PathEl],
@@ -2094,6 +2159,18 @@ impl<'a> Lowering<'a> {
                 .or_else(|| glyphs.atlas.mask(pl.key_exact()))
             {
                 break 'stored ClipMask::Cell(*mask);
+            }
+            if let Some(mask) = glyphs
+                .atlas
+                .mask_texture(pl.key)
+                .or_else(|| glyphs.atlas.mask_texture(pl.key_exact()))
+            {
+                let key = if glyphs.atlas.mask_texture(pl.key).is_some() {
+                    pl.key
+                } else {
+                    pl.key_exact()
+                };
+                break 'stored ClipMask::Texture(*mask, key);
             }
             let device = pl.raster * BezPath::from_vec(elements.to_vec());
             let (segments, bbox) = path::flatten_segments(&device, path::FLATTEN);
@@ -2123,15 +2200,16 @@ impl<'a> Lowering<'a> {
             if let Some(mask) = glyphs.atlas.mask(key) {
                 break 'stored ClipMask::Cell(*mask);
             }
-            if !glyphs.atlas.can_ever_fit(w, h) {
-                return Err(RenderError::Unsupported(names::PATH_CLIP_TOO_LARGE));
+            if let Some(mask) = glyphs.atlas.mask_texture(key) {
+                break 'stored ClipMask::Texture(*mask, key);
             }
             let mask = MaskCell {
                 device: [
                     f32_f64(coverage.x - pl.offset.x),
                     f32_f64(coverage.y - pl.offset.y),
                 ],
-                // Filled by `Atlas::store_mask` on the render thread.
+                // Filled by `Atlas::store_mask` on the render thread; a
+                // texture mask's stays `[0, 0]`.
                 atlas: [0.0, 0.0],
                 size: [w as f32, h as f32],
                 rect: [
@@ -2141,15 +2219,29 @@ impl<'a> Lowering<'a> {
                     f32_f64(coverage.y + f64::from(h) - pl.offset.y),
                 ],
             };
-            let pending = u32::try_from(self.pending.len()).expect("pending count fits u32");
-            self.pending.push(PendingRaster::Mask {
-                key,
-                mask,
-                w,
-                h,
-                texels,
-            });
-            ClipMask::Pending(mask, pending)
+            if glyphs.atlas.mask_in_atlas(w, h) {
+                let pending = u32::try_from(self.pending.len()).expect("pending count fits u32");
+                self.pending.push(PendingRaster::Mask {
+                    key,
+                    mask,
+                    w,
+                    h,
+                    texels,
+                });
+                ClipMask::Pending(mask, pending)
+            } else {
+                if !glyphs.atlas.mask_texture_fits(w, h) {
+                    return Err(RenderError::Unsupported(names::PATH_CLIP_TOO_LARGE));
+                }
+                self.pending.push(PendingRaster::MaskTexture {
+                    key,
+                    mask,
+                    w,
+                    h,
+                    texels,
+                });
+                ClipMask::Texture(mask, key)
+            }
         };
         // Stored mask rects are relative to the placement offset.
         let stored = stored.translated(pl.offset.x, pl.offset.y);

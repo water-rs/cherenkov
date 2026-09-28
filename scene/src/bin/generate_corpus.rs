@@ -858,6 +858,130 @@ fn run() -> Result<(), SceneError> {
         });
     });
 
+    // Large path clips: at 320×320 the rasterized mask exceeds the glyph
+    // atlas's mask budget and lives on its own texture.
+
+    corpus.scene("clip-path-full-surface", 320, 320, white, |l| {
+        // A rounded frame with an inward notch cut from its bottom edge.
+        let mut frame = BezPath::new();
+        frame.move_to((20.0, 20.0));
+        frame.line_to((300.0, 20.0));
+        frame.quad_to((312.0, 20.0), (312.0, 32.0));
+        frame.line_to((312.0, 288.0));
+        frame.quad_to((312.0, 300.0), (300.0, 300.0));
+        frame.line_to((220.0, 300.0));
+        frame.quad_to((200.0, 264.0), (180.0, 300.0));
+        frame.line_to((20.0, 300.0));
+        frame.quad_to((8.0, 300.0), (8.0, 288.0));
+        frame.line_to((8.0, 32.0));
+        frame.quad_to((8.0, 20.0), (20.0, 20.0));
+        frame.close_path();
+        l.layer(|a| {
+            a.clip(Shape::Path { path: frame });
+            // Fills overrunning the surface show the clip edge.
+            a.fill(
+                Shape::rect(-40.0, -40.0, 400.0, 200.0),
+                solid(srgb(0.15, 0.45, 0.8)),
+            );
+            a.fill(
+                Shape::rect(-40.0, 120.0, 400.0, 240.0),
+                solid(srgb(0.85, 0.35, 0.15)),
+            );
+        });
+    });
+
+    corpus.scene("clip-path-oversized", 320, 320, white, |l| {
+        // A star whose vertices lie far outside the surface.
+        let mut star = BezPath::new();
+        let c = Point::new(160.0, 160.0);
+        for i in 0..5 {
+            let angle = f64::from(i).mul_add(144.0, -90.0).to_radians();
+            let p = c + Vec2::new(angle.cos() * 240.0, angle.sin() * 240.0);
+            if i == 0 {
+                star.move_to(p);
+            } else {
+                star.line_to(p);
+            }
+        }
+        star.close_path();
+        l.layer(|a| {
+            a.clip(Shape::Path { path: star });
+            a.fill(
+                Shape::rect(-40.0, -40.0, 400.0, 200.0),
+                solid(srgb(0.2, 0.7, 0.4)),
+            );
+            a.fill(
+                Shape::rect(-40.0, 120.0, 400.0, 240.0),
+                solid(srgb(0.55, 0.2, 0.7)),
+            );
+        });
+    });
+
+    corpus.scene("clip-path-nested", 320, 320, white, |l| {
+        // Outer: a blob of arcs covering most of the surface.
+        let mut blob = BezPath::new();
+        blob.move_to((160.0, 16.0));
+        blob.curve_to((300.0, 16.0), (304.0, 140.0), (304.0, 170.0));
+        blob.curve_to((304.0, 304.0), (220.0, 304.0), (160.0, 304.0));
+        blob.curve_to((40.0, 304.0), (16.0, 220.0), (16.0, 160.0));
+        blob.curve_to((16.0, 60.0), (60.0, 16.0), (160.0, 16.0));
+        blob.close_path();
+        // Inner: a rotated square.
+        let mut diamond = BezPath::new();
+        diamond.move_to((160.0, 56.0));
+        diamond.line_to((264.0, 160.0));
+        diamond.line_to((160.0, 264.0));
+        diamond.line_to((56.0, 160.0));
+        diamond.close_path();
+        l.layer(|a| {
+            a.clip(Shape::Path { path: blob });
+            a.fill(
+                Shape::rect(-20.0, -20.0, 360.0, 360.0),
+                solid(srgb(0.15, 0.5, 0.75)),
+            );
+            a.layer(|b| {
+                b.clip(Shape::Path { path: diamond });
+                b.fill(
+                    Shape::rect(-20.0, -20.0, 360.0, 360.0),
+                    solid(srgb(0.85, 0.55, 0.15)),
+                );
+                b.layer(|c| {
+                    c.clip(Shape::rect(120.0, 120.0, 80.0, 80.0));
+                    c.fill(
+                        Shape::rect(-20.0, -20.0, 360.0, 360.0),
+                        solid(srgb(0.75, 0.15, 0.35)),
+                    );
+                });
+            });
+        });
+    });
+
+    corpus.scene("clip-path-transform", 320, 320, white, |l| {
+        let mut leaf = BezPath::new();
+        leaf.move_to((40.0, 160.0));
+        leaf.curve_to((40.0, 40.0), (160.0, 40.0), (160.0, 40.0));
+        leaf.curve_to((280.0, 40.0), (280.0, 160.0), (160.0, 280.0));
+        leaf.curve_to((100.0, 280.0), (40.0, 220.0), (40.0, 160.0));
+        leaf.close_path();
+        l.layer(|a| {
+            a.transform(
+                Affine::translate((160.0, 160.0))
+                    * Affine::rotate(0.3)
+                    * Affine::scale(1.4)
+                    * Affine::translate((-160.0, -160.0)),
+            );
+            a.clip(Shape::Path { path: leaf });
+            a.fill(
+                Shape::rect(-60.0, -60.0, 440.0, 220.0),
+                solid(srgb(0.3, 0.35, 0.85)),
+            );
+            a.fill(
+                Shape::rect(-60.0, 140.0, 440.0, 260.0),
+                solid(srgb(0.25, 0.7, 0.55)),
+            );
+        });
+    });
+
     corpus.scene("group-opacity", 128, 128, white, |l| {
         l.fill(
             Shape::rect(0.0, 0.0, 128.0, 128.0),

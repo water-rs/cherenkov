@@ -209,6 +209,20 @@ impl MaskCell {
     }
 }
 
+/// Masks larger than this many texels — or that the atlas cannot hold —
+/// get their own `R8Unorm` texture instead of an atlas cell.
+pub const MASK_TEXTURE_TEXELS: u64 = 256 * 256;
+
+/// A path-clip mask on its own texture, bound at group-1 binding 3.
+struct MaskTexture {
+    /// The mask data; `cell.atlas` stays `[0, 0]` (unused).
+    cell: MaskCell,
+    _texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    /// `w` × `h`, the texture's GPU bytes.
+    bytes: u64,
+}
+
 /// One shelf of the packer: a row of cells sharing a height class.
 struct Shelf {
     y: u32,
@@ -232,6 +246,18 @@ pub struct Atlas {
     paths: rustc_hash::FxHashMap<u64, PathEmit>,
     /// Rasterized path-clip masks, keyed by content hash.
     masks: rustc_hash::FxHashMap<u64, MaskCell>,
+    /// Path-clip masks too large for the atlas, on their own textures,
+    /// keyed by content hash.
+    mask_textures: rustc_hash::FxHashMap<u64, MaskTexture>,
+    /// The largest edge the device accepts for a 2D texture.
+    texture_limit: u32,
+    /// GPU bytes held by `mask_textures`.
+    mask_texture_bytes: u64,
+    /// Bumped on every `mask_textures` change so stale bind groups are
+    /// rebuilt.
+    mask_texture_gen: u64,
+    /// The GPU byte budget for `mask_textures` (`budget / 16`).
+    mask_budget: u64,
     /// Sum of cell texels, an approximation of the CPU cache size.
     cpu_bytes: u64,
 }
@@ -260,6 +286,11 @@ impl Atlas {
             map: rustc_hash::FxHashMap::default(),
             paths: rustc_hash::FxHashMap::default(),
             masks: rustc_hash::FxHashMap::default(),
+            mask_textures: rustc_hash::FxHashMap::default(),
+            texture_limit: device.limits().max_texture_dimension_2d,
+            mask_texture_bytes: 0,
+            mask_texture_gen: 0,
+            mask_budget: budget / 16,
             cpu_bytes: 0,
         }
     }
@@ -397,6 +428,132 @@ impl Atlas {
     /// Whether a `w` × `h` cell fits in an empty atlas at the cap.
     pub const fn can_ever_fit(&self, w: u32, h: u32) -> bool {
         w + 2 * PAD <= self.cap && (h + 2 * PAD).div_ceil(8) * 8 <= self.cap
+    }
+
+    /// Whether a `w` × `h` mask stays in the atlas: small enough and a
+    /// cell could ever be allocated for it.
+    pub fn mask_in_atlas(&self, w: u32, h: u32) -> bool {
+        u64::from(w) * u64::from(h) <= MASK_TEXTURE_TEXELS && self.can_ever_fit(w, h)
+    }
+
+    /// Whether a `w` × `h` mask fits on a dedicated texture.
+    pub const fn mask_texture_fits(&self, w: u32, h: u32) -> bool {
+        w <= self.texture_limit && h <= self.texture_limit
+    }
+
+    /// A cached mask texture's cell.
+    pub fn mask_texture(&self, key: u64) -> Option<&MaskCell> {
+        self.mask_textures.get(&key).map(|t| &t.cell)
+    }
+
+    /// A cached mask texture's view, bound at group-1 binding 3.
+    pub fn mask_texture_view(&self, key: u64) -> Option<&wgpu::TextureView> {
+        self.mask_textures.get(&key).map(|t| &t.view)
+    }
+
+    /// Stores a mask on its own `w` × `h` `R8Unorm` texture, uploading
+    /// `texels`. Idempotent on `key`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the pending raster record's fields, passed through"
+    )]
+    pub fn store_mask_texture(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        key: u64,
+        mut cell: MaskCell,
+        w: u32,
+        h: u32,
+        texels: &[u8],
+    ) {
+        if self.mask_textures.contains_key(&key) {
+            return;
+        }
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("clip mask"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            texels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(w),
+                rows_per_image: Some(h),
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        cell.atlas = [0.0, 0.0];
+        let bytes = u64::from(w) * u64::from(h);
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.mask_textures.insert(
+            key,
+            MaskTexture {
+                cell,
+                _texture: texture,
+                view,
+                bytes,
+            },
+        );
+        self.mask_texture_bytes += bytes;
+        self.cpu_bytes += bytes;
+        self.mask_texture_gen = self
+            .mask_texture_gen
+            .checked_add(1)
+            .expect("mask texture generation overflow");
+    }
+
+    /// Increments whenever `mask_textures` changes.
+    pub const fn mask_texture_generation(&self) -> u64 {
+        self.mask_texture_gen
+    }
+
+    /// GPU bytes held by mask textures.
+    pub const fn mask_texture_bytes(&self) -> u64 {
+        self.mask_texture_bytes
+    }
+
+    /// Whether `mask_textures` exceeds its budget.
+    pub const fn mask_textures_over_budget(&self) -> bool {
+        self.mask_texture_bytes > self.mask_budget
+    }
+
+    /// Drops every mask texture whose key `live` rejects. Frames and
+    /// bind groups referencing a kept texture stay valid.
+    pub fn evict_mask_textures(&mut self, live: impl Fn(u64) -> bool) {
+        let freed: u64 = self
+            .mask_textures
+            .extract_if(|key, _| !live(*key))
+            .map(|(_, t)| t.bytes)
+            .sum();
+        if freed > 0 {
+            self.mask_texture_bytes = self.mask_texture_bytes.saturating_sub(freed);
+            self.cpu_bytes = self.cpu_bytes.saturating_sub(freed);
+            self.mask_texture_gen = self
+                .mask_texture_gen
+                .checked_add(1)
+                .expect("mask texture generation overflow");
+        }
     }
 
     /// Stores a rasterized glyph cell under `key`, uploading its texels.
@@ -644,6 +801,20 @@ pub enum PendingRaster {
         /// Cell width.
         w: u32,
         /// Cell height.
+        h: u32,
+        /// `w` × `h` coverage texels.
+        texels: Vec<u8>,
+    },
+    /// A path-clip mask too large for the atlas, stored on its own
+    /// texture and bound at group-1 binding 3.
+    MaskTexture {
+        /// The content-hash key.
+        key: u64,
+        /// The mask; `atlas` stays `[0, 0]`.
+        mask: MaskCell,
+        /// Texture width.
+        w: u32,
+        /// Texture height.
         h: u32,
         /// `w` × `h` coverage texels.
         texels: Vec<u8>,
@@ -1149,5 +1320,18 @@ mod tests {
             "duplicate mask resolves to the stored cell"
         );
         assert_eq!(parallel.mask_origin(0xdead), Some(stored));
+    }
+
+    /// Masks over `MASK_TEXTURE_TEXELS` leave the atlas for a dedicated
+    /// texture.
+    #[test]
+    fn mask_in_atlas_bounds() {
+        let Some((device, _queue)) = device_and_queue() else {
+            return;
+        };
+        let atlas = Atlas::new(&device, u64::MAX);
+        assert!(atlas.mask_in_atlas(200, 200));
+        assert!(!atlas.mask_in_atlas(300, 300));
+        assert!(atlas.mask_texture_fits(4096, 4096));
     }
 }

@@ -618,6 +618,17 @@ fn main() -> ExitCode {
     }
 }
 
+/// The text-page body: 38 lines cycling through the shaped scripts.
+fn text_page_body(l: &mut LayerBuilder, shaped: &[Vec<GlyphRun>]) {
+    let pitch = 54.0;
+    for (i, runs) in (0u8..38).map(|i| (i, &shaped[usize::from(i) % shaped.len()])) {
+        let y = 56.0 + f64::from(i) * pitch;
+        for run in runs {
+            l.glyphs(offset_run(run, 24.0 - f64::from(TEXT_PAD), y));
+        }
+    }
+}
+
 /// The map-like page: ~2,000 stroked and filled paths — short segments,
 /// closed polygons and curved outlines distributed over the viewport.
 #[expect(
@@ -2501,7 +2512,7 @@ fn run() -> Result<(), SceneError> {
             |l| {
                 text_page_body(l, &shaped);
             },
-            blobs.clone(),
+            blobs,
         );
     }
 
@@ -2526,8 +2537,8 @@ fn run() -> Result<(), SceneError> {
         let blobs = font_blobs(&ctx, &shaped.iter().map(Vec::as_slice).collect::<Vec<_>>());
         perf.scene_with_blobs(
             "text-pan",
-            pw as u32,
-            ph as u32,
+            pw,
+            ph,
             white,
             |l| {
                 l.layer(|pan| {
@@ -2547,16 +2558,6 @@ fn run() -> Result<(), SceneError> {
             },
             blobs,
         );
-    }
-
-    fn text_page_body(l: &mut LayerBuilder, shaped: &[Vec<GlyphRun>]) {
-        let pitch = 54.0;
-        for (i, runs) in (0u8..38).map(|i| (i, &shaped[usize::from(i) % shaped.len()])) {
-            let y = 56.0 + f64::from(i) * pitch;
-            for run in runs {
-                l.glyphs(offset_run(run, 24.0 - f64::from(TEXT_PAD), y));
-            }
-        }
     }
 
     // Map-like page: ~2,000 stroked and filled paths — short segments,

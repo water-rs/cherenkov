@@ -2875,11 +2875,17 @@ impl GpuRenderer {
                     Target::Scratch(_) => 1,
                 };
                 let backdrop = surf.backdrop[slot].as_ref().expect("grown above");
+                // The copy region is recorded in device space; a scratch
+                // target stores its contents offset by its pass region.
                 encoder.copy_texture_to_texture(
                     wgpu::TexelCopyTextureInfo {
                         texture,
                         mip_level: 0,
-                        origin: wgpu::Origin3d { x: bx, y: by, z: 0 },
+                        origin: wgpu::Origin3d {
+                            x: bx.saturating_sub(pass.region[0]),
+                            y: by.saturating_sub(pass.region[1]),
+                            z: 0,
+                        },
                         aspect: wgpu::TextureAspect::All,
                     },
                     wgpu::TexelCopyTextureInfo {

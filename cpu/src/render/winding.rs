@@ -108,7 +108,10 @@ pub fn resolve(
                 .then_with(|| a.x_at(yb).total_cmp(&b.x_at(yb)))
         });
         // Any order change inside the band shows up as an adjacent
-        // inversion at the band's bottom; split at its crossing y.
+        // inversion at the band's bottom; split at the earliest valid
+        // crossing y. A pair whose crossing sits on the boundary (a
+        // tie) or that is ~parallel yields no split and does not stop
+        // the scan — a later pair may still cross inside.
         let mut split = None;
         for pair in active.windows(2) {
             let (p, q) = (pair[0], pair[1]);
@@ -116,10 +119,9 @@ pub fn resolve(
                 // p.x0 + p.slope*(y-p.y0) == q.x0 + q.slope*(y-q.y0)
                 let yc = q.slope.mul_add(q.y0, p.slope.mul_add(-p.y0, p.x0) - q.x0)
                     / (q.slope - p.slope);
-                if yc > ya + EPS && yc < yb - EPS {
+                if yc > ya + EPS && yc < yb - EPS && split.is_none_or(|s| yc < s) {
                     split = Some(yc);
                 }
-                break;
             }
         }
         if let Some(yc) = split {
@@ -268,5 +270,26 @@ mod tests {
             cov[4 + 1]
         );
         assert!((cov[0] - 1.0).abs() < 1e-5, "ring pixel (0,0) = {}", cov[0]);
+    }
+
+    #[test]
+    fn a_later_crossing_still_splits_the_band() {
+        // The first inverted pair (0,0)-(4,4) vs (1e-10,0)-(-4,4) crosses
+        // at y≈5e-11 — on the band's top boundary, a tie, no valid split.
+        // A scan that stops at that pair would walk (5,0)-(4,4) and
+        // (6,0)-(3,4) while they cross inside at y=2.
+        let segs = vec![
+            (0.0f32, 0.0, 4.0, 4.0),
+            (1e-10, 0.0, -4.0, 4.0),
+            (5.0, 0.0, 4.0, 4.0),
+            (6.0, 0.0, 3.0, 4.0),
+        ];
+        let resolved = resolve(&segs, FillRule::NonZero).expect("crossing present");
+        assert!(
+            resolved
+                .iter()
+                .any(|e| (e.1 - 2.0).abs() < 1e-6 || (e.3 - 2.0).abs() < 1e-6),
+            "no edge boundary at the y=2 crossing: {resolved:?}"
+        );
     }
 }

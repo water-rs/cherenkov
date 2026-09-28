@@ -6,6 +6,8 @@ use super::paint::{PaintData, paint_data};
 use crate::names;
 use cherenkov::kurbo::Affine;
 use cherenkov::{BlendMode, BlendSpace, Command, GlyphRun, RenderError, Shadow, ShapeData};
+use skrifa::MetadataProvider as _;
+use skrifa::raw::TableProvider as _;
 use skrifa::raw::types::F2Dot14;
 
 use super::font::Font;
@@ -217,9 +219,6 @@ impl Lowerer<'_> {
         let mut colr_ctx: Option<(skrifa::FontRef<'_>, f64)> = None;
         let mut colr_checked = false;
         for glyph in &run.glyphs {
-            if glyph.transform.is_some() {
-                return Err(RenderError::Unsupported(names::GLYPH_TRANSFORM));
-            }
             if !colr_checked {
                 colr_checked = true;
                 let font_ref = skrifa::FontRef::from_index(&font.data.data, font.data.index)
@@ -255,16 +254,45 @@ impl Lowerer<'_> {
                     });
                 }
                 let picture = super::colr::glyph_picture(font, glyph.id, &run.coords, paint)?;
-                // `translate(x, y) * scale_non_uniform(size/upem,
+                // `translate(x, y) * transform * scale_non_uniform(size/upem,
                 // -size/upem)` places the font-space picture at the
                 // glyph's origin.
                 let s = f64::from(run.size) / upem;
                 let place = Affine::translate((f64::from(glyph.x), f64::from(glyph.y)))
+                    * super::glyph::checked_transform(glyph)?
                     * Affine::scale_non_uniform(s, -s);
                 cherenkov::lowering::append(picture.display_list(), ambient * place, self, ops)?;
                 continue;
             }
-            pending.push(*glyph);
+            if glyph.transform.is_some() {
+                if !pending.is_empty() {
+                    ops.push(Op::Glyphs {
+                        local: ambient,
+                        run: GlyphRun {
+                            font: run.font,
+                            size: run.size,
+                            coords: run.coords.clone(),
+                            glyphs: std::mem::take(&mut pending),
+                            style: run.style.clone(),
+                        },
+                        paint: paint_data(paint, Affine::IDENTITY, self.images)?,
+                    });
+                }
+                self.fill_glyphs(
+                    ambient,
+                    &GlyphRun {
+                        font: run.font,
+                        size: run.size,
+                        coords: run.coords.clone(),
+                        glyphs: vec![*glyph],
+                        style: run.style.clone(),
+                    },
+                    paint,
+                    ops,
+                )?;
+            } else {
+                pending.push(*glyph);
+            }
         }
         if !pending.is_empty() {
             ops.push(Op::Glyphs {

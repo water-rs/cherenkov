@@ -329,3 +329,86 @@ fn plus_lighter_saturates_alpha_not_colour() {
         "colour adds unclamped: {pixel:?}"
     );
 }
+
+/// A destructive child of the surface root composites against the surface
+/// clear colour — the scene root is not isolated, as in the oracle. `DestIn`
+/// keeps the backdrop where the source covers it and zeroes the rest
+/// (transparent, not the clear colour); Clear empties the surface; Src
+/// writes the source verbatim.
+#[test]
+fn destructive_child_of_root_clears_the_surface_clear_colour() {
+    const GREY: WorkingColor = WorkingColor::new([0.5, 0.5, 0.5, 1.0]);
+    for (mode, left, right) in [
+        (BlendMode::DestIn, RED, WorkingColor::new([0.0; 4])),
+        (
+            BlendMode::Clear,
+            WorkingColor::new([0.0; 4]),
+            WorkingColor::new([0.0; 4]),
+        ),
+        (BlendMode::Src, BLUE, WorkingColor::new([0.0; 4])),
+    ] {
+        let engine = Engine::<Raster>::new(RasterConfig::default()).expect("engine");
+        let surface = engine
+            .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF32))
+            .expect("surface");
+        surface.clear_color(GREY);
+        let cutout = surface.layer();
+        surface.update(|tx| {
+            tx[surface.root()].content(surface.record(|c| {
+                c.fill(Rect::new(0.0, 0.0, 8.0, 8.0), RED);
+            }));
+            tx[surface.root()].push(&cutout);
+            tx[&cutout].blend(mode).content(surface.record(|c| {
+                c.fill(Rect::new(0.0, 0.0, 4.0, 8.0), BLUE);
+            }));
+        });
+        engine.render(FrameTime::now()).expect("render");
+        let pixels = surface.readback().expect("pixels").pixels;
+        let pixel = |x: usize, y: usize| pixels[y * 8 + x];
+        for (x, expected) in [(1usize, left), (6usize, right)] {
+            let px = pixel(x, 3);
+            for (got, want) in px.iter().zip(expected.components) {
+                assert!(
+                    (*got - want).abs() < 1e-5,
+                    "{mode:?} x={x}: {px:?} != {expected:?}"
+                );
+            }
+        }
+    }
+}
+
+/// The same destructive child under a real intermediate layer stays
+/// isolated: the `DestIn` cuts the pass's own content, and the cleared
+/// region reads back as the surface clear colour through the composite.
+#[test]
+fn destructive_child_of_an_intermediate_layer_stays_isolated() {
+    const GREY: WorkingColor = WorkingColor::new([0.5, 0.5, 0.5, 1.0]);
+    let engine = Engine::<Raster>::new(RasterConfig::default()).expect("engine");
+    let surface = engine
+        .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF32))
+        .expect("surface");
+    surface.clear_color(GREY);
+    let pass = surface.layer();
+    let cutout = surface.layer();
+    surface.update(|tx| {
+        tx[surface.root()].push(&pass);
+        tx[&pass].content(surface.record(|c| {
+            c.fill(Rect::new(0.0, 0.0, 8.0, 8.0), RED);
+        }));
+        tx[&pass].push(&cutout);
+        tx[&cutout]
+            .blend(BlendMode::DestIn)
+            .content(surface.record(|c| {
+                c.fill(Rect::new(0.0, 0.0, 4.0, 8.0), WorkingColor::WHITE);
+            }));
+    });
+    engine.render(FrameTime::now()).expect("render");
+    let pixels = surface.readback().expect("pixels").pixels;
+    let pixel = |x: usize, y: usize| pixels[y * 8 + x];
+    for (x, expected) in [(1usize, RED), (6usize, GREY)] {
+        let px = pixel(x, 3);
+        for (got, want) in px.iter().zip(expected.components) {
+            assert!((*got - want).abs() < 1e-5, "x={x}: {px:?} != {expected:?}");
+        }
+    }
+}

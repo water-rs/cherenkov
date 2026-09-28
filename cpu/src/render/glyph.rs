@@ -3,13 +3,13 @@
 
 //! The glyph mask cache and mask rasterization.
 
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, OnceLock};
 
 use cherenkov::GlyphRun;
 use cherenkov::kurbo::{Affine, PathEl, Point, Vec2};
+use rustc_hash::FxHashMap;
 use skrifa::MetadataProvider;
 use skrifa::outline::{DrawSettings, OutlinePen};
 use skrifa::raw::TableProvider;
@@ -59,7 +59,7 @@ pub type GlyphSlot = Arc<OnceLock<Arc<GlyphMask>>>;
 /// CPU budget.
 #[derive(Default)]
 pub struct GlyphCache {
-    map: HashMap<GlyphKey, Arc<GlyphMask>>,
+    map: FxHashMap<GlyphKey, Arc<GlyphMask>>,
     bytes: u64,
     budget: u64,
 }
@@ -68,7 +68,7 @@ impl GlyphCache {
     /// An empty cache bounded by `budget` bytes.
     pub fn new(budget: u64) -> Self {
         Self {
-            map: HashMap::new(),
+            map: FxHashMap::default(),
             bytes: 0,
             budget,
         }

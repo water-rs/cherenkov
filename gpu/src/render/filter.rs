@@ -8,7 +8,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use cherenkov::RenderError;
 use filtrate::{
@@ -230,14 +230,14 @@ impl Entry {
 }
 
 pub struct Registry {
-    entries: HashMap<FilterKey, Entry>,
+    entries: FxHashMap<FilterKey, Entry>,
     host: Option<crate::interop::RedrawCallback>,
 }
 
 impl Registry {
     pub fn new(host: Option<crate::interop::RedrawCallback>) -> Self {
         Self {
-            entries: HashMap::new(),
+            entries: FxHashMap::default(),
             host,
         }
     }
@@ -291,7 +291,7 @@ impl Registry {
             .sum()
     }
 
-    pub fn set_active(&self, uses: &HashSet<FilterKey>) {
+    pub fn set_active(&self, uses: &FxHashSet<FilterKey>) {
         for (id, entry) in &self.entries {
             entry.active.store(uses.contains(id), Ordering::Release);
         }

@@ -5,8 +5,9 @@
 //! instanced-quad passes.
 
 use cherenkov::lowering::Realization;
-use std::collections::HashMap;
 use std::ops::Range;
+
+use rustc_hash::FxHashMap;
 
 use super::prepared::{ClipShape, Op, Outline, PaintData, ResolvedPaint, box_shape};
 use cherenkov::kurbo::{self, Affine, BezPath, PathEl, Point, Rect, Vec2};
@@ -570,14 +571,14 @@ pub struct GlyphContext<'a> {
     pub atlas: &'a Atlas,
     /// Registered fonts — a per-worker snapshot, so reads and the COLR
     /// cache stay lock-free.
-    pub fonts: &'a HashMap<u64, FontData>,
+    pub fonts: &'a FxHashMap<u64, FontData>,
     /// Registered images, for dimension lookup during lowering.
-    pub images: &'a HashMap<u64, GpuImage>,
+    pub images: &'a FxHashMap<u64, GpuImage>,
     /// Decoded bitmap glyph textures.
-    pub bitmaps: &'a HashMap<super::bitmap::BitmapKey, super::GpuBitmap>,
-    pub content: &'a HashMap<LayerId, super::gpu_content::Slot>,
+    pub bitmaps: &'a FxHashMap<super::bitmap::BitmapKey, super::GpuBitmap>,
+    pub content: &'a FxHashMap<LayerId, super::gpu_content::Slot>,
     /// Retained external frames, for the emitted quad's plane size.
-    pub external: &'a HashMap<LayerId, super::external::Slot>,
+    pub external: &'a FxHashMap<LayerId, super::external::Slot>,
 }
 
 /// One surface's lowering output: the raster counts plus every deferred
@@ -622,7 +623,7 @@ struct BackdropPlan {
     /// The capture rect in device pixels.
     region: [u32; 4],
     /// Each member layer's device-space clip bounds.
-    members: HashMap<LayerId, Rect>,
+    members: FxHashMap<LayerId, Rect>,
 }
 
 /// The lowering walk state for one surface frame.
@@ -657,9 +658,9 @@ pub struct Lowering<'a> {
     pub commands_lowered: u32,
     pub layers_composed: u32,
     /// Backdrop groups planned before lowering.
-    backdrops: HashMap<u64, BackdropPlan>,
+    backdrops: FxHashMap<u64, BackdropPlan>,
     /// The `FilterKey` of each filtered group's capture chain.
-    backdrop_filters: HashMap<u64, FilterKey>,
+    backdrop_filters: FxHashMap<u64, FilterKey>,
     /// Set when a capture ran inside the current isolation: the enclosing
     /// scratch must then cover the full surface so its texel origin is
     /// `(0, 0)` for the capture's composite.
@@ -693,8 +694,8 @@ impl<'a> Lowering<'a> {
             pending: Vec::new(),
             commands_lowered: 0,
             layers_composed: 0,
-            backdrops: HashMap::new(),
-            backdrop_filters: HashMap::new(),
+            backdrops: FxHashMap::default(),
+            backdrop_filters: FxHashMap::default(),
             capture_isolation: false,
             clip_scratches: Vec::new(),
             semantic_target: Target::Surface,
@@ -734,7 +735,7 @@ impl<'a> Lowering<'a> {
     fn plan_backdrops(
         &mut self,
         tree: &SurfaceTree,
-        groups: &HashMap<u64, BackdropGroupInfo>,
+        groups: &FxHashMap<u64, BackdropGroupInfo>,
     ) -> Result<(), RenderError> {
         self.plan_layer(tree.root(), tree, groups, Affine::IDENTITY)?;
         for (gid, plan) in &mut self.backdrops {
@@ -783,7 +784,7 @@ impl<'a> Lowering<'a> {
         &mut self,
         id: LayerId,
         tree: &SurfaceTree,
-        groups: &HashMap<u64, BackdropGroupInfo>,
+        groups: &FxHashMap<u64, BackdropGroupInfo>,
         parent: Affine,
     ) -> Result<(), RenderError> {
         let node = tree.layer(id);
@@ -803,7 +804,7 @@ impl<'a> Lowering<'a> {
                 first: id,
                 union: member,
                 region: [0; 4],
-                members: HashMap::new(),
+                members: FxHashMap::default(),
             });
             plan.union = plan.union.union(member);
             plan.members.insert(id, member);
@@ -817,10 +818,10 @@ impl<'a> Lowering<'a> {
     pub fn run(
         &mut self,
         tree: &SurfaceTree,
-        caches: &mut HashMap<LayerId, ContentData>,
+        caches: &mut FxHashMap<LayerId, ContentData>,
         clear: WorkingColor,
         glyphs: &GlyphContext<'_>,
-        groups: &HashMap<u64, BackdropGroupInfo>,
+        groups: &FxHashMap<u64, BackdropGroupInfo>,
     ) -> Result<(), RenderError> {
         for content in caches.values_mut() {
             self.commands_lowered += content.retained.prepare(&mut super::prepared::Lowerer {
@@ -1638,7 +1639,7 @@ impl<'a> Lowering<'a> {
         &mut self,
         id: LayerId,
         tree: &SurfaceTree,
-        caches: &mut HashMap<LayerId, ContentData>,
+        caches: &mut FxHashMap<LayerId, ContentData>,
         glyphs: &GlyphContext<'_>,
     ) -> Result<(), RenderError> {
         let node = tree.layer(id);
@@ -1733,7 +1734,7 @@ impl<'a> Lowering<'a> {
         id: LayerId,
         node: &cherenkov::LayerNode,
         tree: &SurfaceTree,
-        caches: &mut HashMap<LayerId, ContentData>,
+        caches: &mut FxHashMap<LayerId, ContentData>,
         glyphs: &GlyphContext<'_>,
     ) -> Result<(), RenderError> {
         if let Some(content) = caches.get_mut(&id) {
@@ -3353,9 +3354,9 @@ mod tests {
             return;
         };
         let atlas = Atlas::new(&device, u64::MAX);
-        let fonts = HashMap::new();
-        let images = HashMap::new();
-        let bitmaps = HashMap::new();
+        let fonts = FxHashMap::default();
+        let images = FxHashMap::default();
+        let bitmaps = FxHashMap::default();
         let mut frame = Frame::default();
         let mut lowering = Lowering::new(&mut frame, (64, 64));
         lowering.begin_pass(Target::Surface, None);
@@ -3364,8 +3365,8 @@ mod tests {
             fonts: &fonts,
             images: &images,
             bitmaps: &bitmaps,
-            content: &HashMap::new(),
-            external: &HashMap::new(),
+            content: &FxHashMap::default(),
+            external: &FxHashMap::default(),
         };
         let prefix = cherenkov::Command::Fill {
             shape: ShapeData::Rect(Rect::new(0.0, 0.0, 2.0, 2.0)),
@@ -3442,16 +3443,16 @@ mod tests {
             return;
         };
         let atlas = Atlas::new(&device, u64::MAX);
-        let fonts = HashMap::new();
-        let images = HashMap::new();
-        let bitmaps = HashMap::new();
+        let fonts = FxHashMap::default();
+        let images = FxHashMap::default();
+        let bitmaps = FxHashMap::default();
         let glyphs = GlyphContext {
             atlas: &atlas,
             fonts: &fonts,
             images: &images,
             bitmaps: &bitmaps,
-            content: &HashMap::new(),
-            external: &HashMap::new(),
+            content: &FxHashMap::default(),
+            external: &FxHashMap::default(),
         };
         let mut frame = Frame::default();
         let mut lowering = Lowering::new(&mut frame, (64, 64));
@@ -3511,16 +3512,16 @@ mod tests {
             return;
         };
         let atlas = Atlas::new(&device, u64::MAX);
-        let fonts = HashMap::new();
-        let images = HashMap::new();
-        let bitmaps = HashMap::new();
+        let fonts = FxHashMap::default();
+        let images = FxHashMap::default();
+        let bitmaps = FxHashMap::default();
         let glyphs = GlyphContext {
             atlas: &atlas,
             fonts: &fonts,
             images: &images,
             bitmaps: &bitmaps,
-            content: &HashMap::new(),
-            external: &HashMap::new(),
+            content: &FxHashMap::default(),
+            external: &FxHashMap::default(),
         };
         let clip = DeviceClip {
             inv: Affine::translate(Vec2::new(-20.0, -20.0)),
@@ -3618,16 +3619,16 @@ mod tests {
             return;
         };
         let atlas = Atlas::new(&device, u64::MAX);
-        let fonts = HashMap::new();
-        let images = HashMap::new();
-        let bitmaps = HashMap::new();
+        let fonts = FxHashMap::default();
+        let images = FxHashMap::default();
+        let bitmaps = FxHashMap::default();
         let glyphs = GlyphContext {
             atlas: &atlas,
             fonts: &fonts,
             images: &images,
             bitmaps: &bitmaps,
-            content: &HashMap::new(),
-            external: &HashMap::new(),
+            content: &FxHashMap::default(),
+            external: &FxHashMap::default(),
         };
         // Half extents [20, 5]: a spread of -20 inverts both.
         let bar = ShapeData::Rect(kurbo::Rect::new(20.0, 20.0, 60.0, 30.0));

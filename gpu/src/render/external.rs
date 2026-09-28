@@ -7,7 +7,7 @@
 //! device: dropping the slot — replacement, detach, surface or engine
 //! teardown — retires the lease, nothing copies them.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use crate::interop::{
     ChromaOffset, ExternalFrame, FramePlanes, Primaries, RgbAlpha, Transfer, YuvMatrix, YuvRange,
@@ -322,7 +322,7 @@ pub struct Slot {
     /// The baked [`Params`], written once at install.
     params: wgpu::Buffer,
     /// Group-1 binds cached per mask texture key (`u64::MAX` = no mask).
-    binds: HashMap<u64, wgpu::BindGroup>,
+    binds: FxHashMap<u64, wgpu::BindGroup>,
     /// The mask-texture generation `binds` was built under; a change clears
     /// the cache so a re-created mask texture rebinds.
     binds_gen: u64,
@@ -363,7 +363,7 @@ impl Slot {
             uv,
             rgb,
             params: buffer,
-            binds: HashMap::new(),
+            binds: FxHashMap::default(),
             binds_gen: 0,
         }
     }

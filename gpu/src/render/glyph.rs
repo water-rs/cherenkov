@@ -3,10 +3,11 @@
 
 //! The glyph atlas and glyph-run lowering.
 
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+
+use rustc_hash::FxHashMap;
 
 use kurbo::{Affine, PathEl, Vec2};
 use skrifa::MetadataProvider;
@@ -38,7 +39,7 @@ pub struct FontData {
     /// paint hash)` — content is size-independent, so it is keyed without
     /// the placement. Interior mutability, not shared: parallel lowering
     /// works on a per-thread snapshot.
-    pub colr: std::cell::RefCell<HashMap<(u32, u64, u64), cherenkov::Picture>>,
+    pub colr: std::cell::RefCell<FxHashMap<(u32, u64, u64), cherenkov::Picture>>,
 }
 
 impl FontData {
@@ -1529,8 +1530,6 @@ impl Atlas {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-
     #[test]
     fn a_run_key_keeps_exact_identity_at_each_glyph_position() {
         let mut run = cherenkov::GlyphRun {
@@ -1648,7 +1647,7 @@ mod tests {
             has_colr: false,
             has_bitmap: false,
             bitmap: None,
-            colr: std::cell::RefCell::new(HashMap::new()),
+            colr: std::cell::RefCell::new(FxHashMap::default()),
         };
         let key = |glyph: u32| GlyphKey {
             font: 7,

@@ -5,8 +5,10 @@
 //! call as an [`Event`] on a channel, so tests and the cross-backend
 //! behaviour suite can assert what the front end committed.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::mpsc::Sender;
+
+use rustc_hash::FxHashMap;
 
 use kurbo::{Affine, Vec2};
 
@@ -117,7 +119,7 @@ pub struct NullRenderer {
     fonts: HashSet<FontId>,
     images: HashSet<ImageId>,
     shaders: HashSet<ShaderId>,
-    pictures: HashMap<(SurfaceId, LayerId), Picture>,
+    pictures: FxHashMap<(SurfaceId, LayerId), Picture>,
 }
 
 impl NullRenderer {
@@ -129,7 +131,7 @@ impl NullRenderer {
             fonts: HashSet::new(),
             images: HashSet::new(),
             shaders: HashSet::new(),
-            pictures: HashMap::new(),
+            pictures: FxHashMap::default(),
         }
     }
 }

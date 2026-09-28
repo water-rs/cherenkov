@@ -143,8 +143,10 @@ jobs:
       # skia-safe's prebuilt Linux binaries link the system freetype and
       # fontconfig, which the runner does not ship; cherenkov-gpu's build
       # script needs spirv-tools for its precompiled shaders (issue #57).
+      # The cherenkov adapter tests render on lavapipe, which needs the
+      # Vulkan loader and Mesa drivers.
       - name: Skia link dependencies
-        run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev libfreetype-dev spirv-tools
+        run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev libfreetype-dev spirv-tools mesa-vulkan-drivers libvulkan1
       # The bench adapters are all feature-gated, so the default-feature
       # clippy in `check` never compiles them — lint them here, on the
       # dependency graph this job already warms.
@@ -158,6 +160,9 @@ jobs:
         run: |
           cargo hack clippy --locked -p cherenkov-bench --each-feature \
             --exclude-features skia-metal --all-targets -- -D warnings
+      - uses: taiki-e/install-action@nextest
+      - name: Bench adapter tests (cherenkov, cherenkov-cpu)
+        run: cargo nextest run --locked -p cherenkov-bench --features cherenkov,cherenkov-cpu --no-tests=pass
       - run: cargo build --locked --release -p cherenkov-bench --features vello-cpu,skia
       - name: Render the corpus on CPU adapters
         run: |

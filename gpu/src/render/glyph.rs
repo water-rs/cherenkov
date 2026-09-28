@@ -95,7 +95,7 @@ impl Hash for GlyphKey {
 }
 
 impl GlyphKey {
-    /// Change just the glyph and quantized position; run identity stays exact.
+    /// Change just the glyph and subpixel position; run identity stays exact.
     pub fn at(mut self, glyph: u32, subpixel: (f32, f32)) -> Self {
         self.glyph = glyph;
         self.subpixel = u64::from(subpixel.0.to_bits()) | (u64::from(subpixel.1.to_bits()) << 32);

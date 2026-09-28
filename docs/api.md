@@ -13,7 +13,7 @@ Sections marked **Proposal** are not yet agreed; everything else records a decis
 - **Invisible optimizations are verified invisible.** Layer caching and damage tracking must produce bit-identical output when disabled. This is exact by construction, not by tolerance:
   - Canonical f16 rounding and materialization points are part of the semantics, so a cached and an uncached render round at the same places.
   - Scroll offsets and integer layer translations snap to device pixels as part of the semantics.
-  - While a layer's transform, component or scroll track is animating, its content's device translation is placed on the ¼-device-pixel grid (round to nearest), so a cached coverage emission is reused across the animation instead of re-rasterizing every frame. The frame a track settles — and every static frame — is placed exactly.
+  - While a layer's transform, component or scroll track is animating, its content's device translation — glyph runs included — is placed on the ¼-device-pixel grid (round to nearest), so a cached coverage emission is reused across the animation instead of re-rasterizing every frame. The frame a track settles — and every static frame — is placed exactly, glyph subpixel translation included.
   - Content under a fractional transform is re-rasterized rather than resampled from a cache. Promotion to system-compositor planes is compared against in-engine composition with a perceptual tolerance.
 - **No runtime fallback.** A backend is chosen deliberately, at build time or once at process start by capability. A failure is an error.
 

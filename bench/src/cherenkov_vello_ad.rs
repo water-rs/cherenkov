@@ -540,7 +540,7 @@ fn unsupported_feature(u: &str) -> Feature {
         "group-filter" | "filter" => Feature::Opacity,
         "image" => Feature::Image,
         "shadow" => Feature::Shadow,
-        "glyph-transform" => Feature::Glyphs,
+        "glyph-transform" => Feature::GlyphTransform,
         _ => Feature::Fill,
     }
 }
@@ -798,7 +798,7 @@ fn glyph_run(
                 id: g.id,
                 x: g.x,
                 y: g.y,
-                transform: None,
+                transform: g.transform,
             })
             .collect(),
         style: run

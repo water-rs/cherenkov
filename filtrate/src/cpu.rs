@@ -483,9 +483,9 @@ fn rgb_to_hsl(rgb: [f32; 3]) -> [f32; 3] {
     }
     let delta = max - min;
     let saturation = if lightness > 0.5 {
-        delta / (max + min)
-    } else {
         delta / (2.0 - max - min)
+    } else {
+        delta / (max + min)
     };
     let hue = if max == rgb[0] {
         (rgb[1] - rgb[2]) / delta + if rgb[1] < rgb[2] { 6.0 } else { 0.0 }
@@ -538,4 +538,37 @@ fn hsl_to_rgb(hsl: [f32; 3]) -> [f32; 3] {
         hue_to_rgb(p, q, hsl[0]),
         hue_to_rgb(p, q, hsl[0] - 1.0 / 3.0),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{hsl_to_rgb, rgb_to_hsl};
+
+    #[test]
+    fn hsl_saturation_uses_the_lightness_branch_and_round_trips() {
+        let light = [0.9, 0.6, 0.5];
+        let light_hsl = rgb_to_hsl(light);
+        assert!(
+            (light_hsl[1] - 0.4 / 0.6).abs() < 1.0e-6,
+            "unexpected light saturation: {}",
+            light_hsl[1]
+        );
+
+        let dark_hsl = rgb_to_hsl([0.4, 0.2, 0.1]);
+        assert!(
+            (dark_hsl[1] - 0.3 / 0.5).abs() < 1.0e-6,
+            "unexpected dark saturation: {}",
+            dark_hsl[1]
+        );
+
+        let round_trip = hsl_to_rgb(light_hsl);
+        for channel in 0..3 {
+            assert!(
+                (round_trip[channel] - light[channel]).abs() < 1.0e-6,
+                "channel {channel}: expected {}, got {}",
+                light[channel],
+                round_trip[channel]
+            );
+        }
+    }
 }

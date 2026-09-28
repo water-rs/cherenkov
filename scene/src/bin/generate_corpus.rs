@@ -1861,13 +1861,13 @@ fn run() -> Result<(), SceneError> {
         l.layer(|outer| {
             outer.filter(LayerFilter::GaussianBlur { sigma: 3.0 });
             outer.fill(
-                Shape::rect(8.0, 8.0, 56.0, 88.0),
+                Shape::rect(8.0, 8.0, 48.0, 80.0),
                 solid(Color::new(ColorSpace::DisplayP3, [0.0, 0.85, 0.3, 1.0])),
             );
             outer.layer(|cutout| {
                 cutout.blend(BlendMode::DestOut);
                 cutout.fill(
-                    Shape::rect(20.0, 30.0, 44.0, 66.0),
+                    Shape::rect(20.0, 30.0, 24.0, 36.0),
                     solid(srgb(1.0, 1.0, 1.0)),
                 );
             });
@@ -1878,18 +1878,18 @@ fn run() -> Result<(), SceneError> {
         l.layer(|outer| {
             outer.filter(LayerFilter::GaussianBlur { sigma: 3.0 });
             outer.fill(
-                Shape::rect(4.0, 4.0, 60.0, 92.0),
+                Shape::rect(4.0, 4.0, 56.0, 88.0),
                 solid(Color::new(ColorSpace::LinearSrgb, [2.0, 0.3, 0.1, 1.0])),
             );
             outer.layer(|inner| {
                 inner.fill(
-                    Shape::rect(12.0, 20.0, 52.0, 76.0),
+                    Shape::rect(12.0, 20.0, 40.0, 56.0),
                     solid(srgb(0.12, 0.32, 0.9)),
                 );
                 inner.layer(|cutout| {
                     cutout.blend(BlendMode::DestOut);
                     cutout.fill(
-                        Shape::rect(24.0, 36.0, 40.0, 60.0),
+                        Shape::rect(24.0, 36.0, 16.0, 24.0),
                         solid(srgb(1.0, 1.0, 1.0)),
                     );
                 });

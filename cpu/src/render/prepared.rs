@@ -6,7 +6,6 @@
 //! or expand pictures again.
 
 use super::paint::{PaintData, paint_data};
-use crate::names;
 use cherenkov::kurbo::Affine;
 use cherenkov::{
     BlendMode, BlendSpace, Command, FontData, GlyphRun, RenderError, Shadow, ShapeData,

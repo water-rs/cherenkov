@@ -3136,8 +3136,8 @@ fn push_effect_stops(stops: &mut Vec<Stop>, effect: &cherenkov::BackdropEffect) 
     };
     match effect {
         cherenkov::BackdropEffect::Color(matrix) => {
-            for row in matrix.0.chunks_exact(4) {
-                push(stops, [row[0], row[1], row[2], row[3]]);
+            for row in matrix.0.as_chunks::<4>().0 {
+                push(stops, *row);
             }
             (EFFECT_COLOR, 3)
         }

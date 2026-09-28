@@ -346,7 +346,7 @@ pub struct GpuRenderer {
     /// variant 0/1/2 = simple/shadow/full fragment shader.
     pipelines: [[[wgpu::RenderPipeline; 3]; 2]; 2],
     /// Registered backdrop effect shaders, by raw id, one Full-variant
-    /// SrcOver pipeline per target format (`[surface, scratch]`),
+    /// `SrcOver` pipeline per target format (`[surface, scratch]`),
     /// compiled at registration.
     backdrop_shaders: FxHashMap<u64, [wgpu::RenderPipeline; 2]>,
     /// The configured isolation texture format.
@@ -1132,11 +1132,7 @@ pub fn texel_bytes(format: wgpu::TextureFormat) -> u64 {
 ///
 /// # Errors
 /// Returns initialization and pipeline validation errors from the backend.
-#[expect(
-    clippy::too_many_lines,
-    clippy::needless_pass_by_value,
-    reason = "moved into the render thread"
-)]
+#[expect(clippy::too_many_lines, reason = "moved into the render thread")]
 #[cfg(not(target_arch = "wasm32"))]
 pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
     let _diag_guard = diag::Guard::scope(config.alloc_diag.as_ref());
@@ -2823,6 +2819,9 @@ impl GpuRenderer {
         id: cherenkov::BackdropShaderId,
         source: &cherenkov::BackdropShaderSource,
     ) -> Result<(), ResourceError> {
+        // The scope covers module creation: invalid WGSL reports at
+        // module use, and `create_pipeline` scopes only itself.
+        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let module = self
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -2841,7 +2840,13 @@ impl GpuRenderer {
             )
             .map_err(|e| ResourceError::Shader(e.to_string()))
         };
-        let pipelines = [make(TARGET_FORMAT)?, make(self.scratch_format)?];
+        let surface = make(TARGET_FORMAT);
+        let scratch = make(self.scratch_format);
+        let scope_error = pollster::block_on(scope.pop());
+        let pipelines = [surface?, scratch?];
+        if let Some(error) = scope_error {
+            return Err(ResourceError::Shader(format!("{error}")));
+        }
         self.backdrop_shaders.insert(id.raw(), pipelines);
         Ok(())
     }
@@ -2857,6 +2862,7 @@ impl GpuRenderer {
         id: cherenkov::BackdropShaderId,
         source: &cherenkov::BackdropShaderSource,
     ) -> Result<(), ResourceError> {
+        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let module = self
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -2887,6 +2893,9 @@ impl GpuRenderer {
             .await
             .map_err(|e| ResourceError::Shader(e.to_string()))?,
         ];
+        if let Some(error) = scope.pop().await {
+            return Err(ResourceError::Shader(format!("{error}")));
+        }
         self.backdrop_shaders.insert(id.raw(), pipelines);
         Ok(())
     }

@@ -1164,6 +1164,53 @@ mod tests {
         let _ = engine.memory();
         balance::assert_balanced(&rx);
     }
+
+    #[test]
+    fn retired_live_content_does_not_update_or_wake() {
+        use crate::{Draw, WorkingColor};
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let (engine, rx) = engine();
+        let surface = engine
+            .surface(crate::Offscreen::new(
+                (8, 8),
+                crate::OffscreenFormat::LinearF16,
+            ))
+            .unwrap();
+        let layer = surface.layer();
+        let color = nami::binding(WorkingColor::WHITE);
+        surface.update(|tx| {
+            tx[&layer].content(
+                surface.record(|r| r.fill(kurbo::Rect::new(0., 0., 8., 8.), color.clone())),
+            );
+        });
+        engine.render(FrameTime::now()).unwrap();
+        let _ = frames(&rx);
+
+        let count = Rc::new(Cell::new(0));
+        let wakes = Rc::clone(&count);
+        engine.set_waker(move || wakes.set(wakes.get() + 1));
+        surface.update(|tx| {
+            tx[&layer].record(|r| {
+                r.fill(kurbo::Rect::new(0., 0., 8., 8.), WorkingColor::BLACK);
+            });
+        });
+        engine.render(FrameTime::now()).unwrap();
+        let _ = frames(&rx);
+
+        let before = count.get();
+        color.set(WorkingColor::BLACK);
+        assert_eq!(
+            count.get(),
+            before,
+            "retired content cannot wake the engine"
+        );
+
+        engine.render(FrameTime::now()).unwrap();
+        let record = frames(&rx).pop().expect("frame");
+        assert!(!record.changed, "retired content cannot queue updates");
+    }
 }
 
 /// Retained-lowering equivalence checks for first-party backends.

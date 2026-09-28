@@ -518,6 +518,13 @@ Deferred GPU atlas writes patch both the frame instances and retained cache
 addresses before submission. Critical memory pressure releases retained device
 output as well as the glyph caches.
 
+Both backends route flattened path edges through `lowering::resolve_winding`
+before signed-area accumulation: overlapping windings are resolved to boundary
+edges whose winding is 0 or 1 everywhere, drawn under `NonZero`, so the
+accumulator stays exact on self-overlapping outlines (stroke joins and caps,
+self-intersecting fills). `None` leaves non-overlapping paths untouched, so
+scenes without overlap lower identically to before.
+
 The CPU and GPU `dirty` integration tests run the same deterministic randomized
 slot updates and require exact readback bits against full lowering after every
 frame. The sequence includes nested scopes, glyph-count changes, animated layer

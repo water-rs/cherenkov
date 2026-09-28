@@ -107,6 +107,15 @@ pub struct Scene {
     pub working_space: WorkingSpace,
     /// The colour the scene is cleared to before drawing.
     pub clear: Color,
+    /// The display headroom the scene asks to be presented at — the
+    /// `render --present` corpus passes it to the oracle's presentation
+    /// functions and announces it on the surface's `Display`. `1.0` (the
+    /// default) is SDR and stays out of `scene.json`.
+    #[serde(
+        default = "Scene::default_present_headroom",
+        skip_serializing_if = "Scene::is_default_present_headroom"
+    )]
+    pub present_headroom: f64,
     /// The features this scene uses.
     pub features: BTreeSet<Feature>,
     /// The root layer.
@@ -122,9 +131,25 @@ impl Scene {
             height,
             working_space: WorkingSpace::LinearDisplayP3,
             clear,
+            present_headroom: Self::default_present_headroom(),
             features: BTreeSet::new(),
             root: Layer::default(),
         }
+    }
+
+    /// The default presentation headroom: SDR.
+    pub(crate) const fn default_present_headroom() -> f64 {
+        1.0
+    }
+
+    /// Serde helper: the default headroom is left out of `scene.json`.
+    #[expect(
+        clippy::trivially_copy_pass_by_ref,
+        clippy::float_cmp,
+        reason = "serde's skip_serializing_if takes a reference; the default test is exact equality"
+    )]
+    pub(crate) fn is_default_present_headroom(headroom: &f64) -> bool {
+        *headroom == Self::default_present_headroom()
     }
 
     /// Recompute `self.features` from the layer tree. Called by builders;

@@ -351,6 +351,7 @@ dependencies = [
  "cherenkov-vello",
  "clap",
  "glifo",
+ "half",
  "kurbo",
  "libc",
  "nami",

@@ -147,6 +147,36 @@ fn scene_save_load() {
 }
 
 #[test]
+fn present_headroom_roundtrip() {
+    let dir = std::env::temp_dir().join(format!(
+        "cherenkov-scene-headroom-test-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // The default stays out of the JSON, so existing scenes are
+    // byte-identical.
+    let scene = Scene::builder(8, 8).build();
+    let json = serde_json::to_string_pretty(&scene).unwrap();
+    assert!(!json.contains("present_headroom"), "{json}");
+    scene.save(&dir).unwrap();
+    assert_eq!(Scene::load(&dir).unwrap(), scene);
+
+    // A declared headroom serializes and loads back.
+    let scene = Scene::builder(8, 8).present_headroom(4.0).build();
+    let json = serde_json::to_string_pretty(&scene).unwrap();
+    assert!(json.contains("\"present_headroom\": 4.0"), "{json}");
+    scene.save(&dir).unwrap();
+    assert_eq!(Scene::load(&dir).unwrap(), scene);
+
+    // A file carrying the field parses without a `Scene::load` too.
+    let parsed: Scene = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed, scene);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn item_untagged() {
     let layer_json = r#"{"items":[]}"#;
     let layer: cherenkov_scene::Layer = serde_json::from_str(layer_json).unwrap();

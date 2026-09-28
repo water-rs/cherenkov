@@ -23,6 +23,9 @@ pub struct RenderReport {
     pub width: u32,
     /// Scene pixel size.
     pub height: u32,
+    /// The presentation this render went through (`render --present`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub present: Option<PresentInfo>,
     /// Metrics against the oracle reference.
     pub metrics: Metrics,
     /// What the adapter issued.
@@ -31,6 +34,15 @@ pub struct RenderReport {
     pub memory: MemoryReport,
     /// Device/thermal metadata at render time.
     pub device: DeviceInfo,
+}
+
+/// The presentation a `render --present` run went through.
+#[derive(Clone, Debug, Serialize)]
+pub struct PresentInfo {
+    /// The output kind (`srgb-hw`, `srgb-shader`, `linear-p3`).
+    pub kind: &'static str,
+    /// The scene's `present_headroom` the reference was presented at.
+    pub headroom: f64,
 }
 
 /// One measured frame: raw samples, not percentiles.

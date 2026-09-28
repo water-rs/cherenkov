@@ -1622,6 +1622,8 @@ impl Renderer for GpuRenderer {
         MemoryUsage {
             gpu: cherenkov::Bytes(gpu + self.filters.gpu_bytes()),
             cpu: cherenkov::Bytes(self.atlas.cpu_bytes()),
+            backdrop_captures: cherenkov::Bytes(0),
+            backdrop_capture_format: None,
         }
     }
 

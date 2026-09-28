@@ -21,11 +21,13 @@ use nami_core::watcher::Context;
 
 use crate::animation::Animation;
 use crate::backend::{Backend, Display, SurfaceInfo};
-use crate::capability::{ExternalFrames, GpuContent};
+use crate::capability::{Backdrop, BackdropChain, ExternalFrames, GpuContent};
 use crate::engine::Waker;
 use crate::error::{RenderError, SurfaceError};
 use crate::frame::Readback;
-use crate::message::{ChangeSet, ContentOp, LayerId, LayerOp, Message, Op, Prop, SurfaceId};
+use crate::message::{
+    BackdropId, ChangeSet, ContentOp, LayerId, LayerOp, Message, Op, Prop, SurfaceId,
+};
 use crate::record::{Content, Live};
 use crate::shape::{Shape, ShapeData};
 use crate::style::{BlendMode, FilterId};
@@ -63,6 +65,8 @@ pub struct Shared<B: Backend> {
     clear: Option<WorkingColor>,
     /// Layer id allocator (0 is the root).
     next_layer: Cell<u64>,
+    /// Backdrop group id allocator.
+    next_backdrop: Cell<u64>,
     /// Live property subscriptions, keyed by layer and property. Binding a
     /// property replaces its previous subscription; dropping a layer drops
     /// them all.
@@ -90,6 +94,7 @@ impl<B: Backend> Shared<B> {
             contents: HashMap::new(),
             clear: None,
             next_layer: Cell::new(1),
+            next_backdrop: Cell::new(1),
             bindings: HashMap::new(),
             waker,
             display: Cell::new(Display::default()),
@@ -300,6 +305,7 @@ enum EditOp<B: Backend> {
     Clip(Option<ShapeData>),
     Blend(BlendMode),
     Filter(Option<FilterId>),
+    Backdrop(Option<BackdropId>),
     Content(LayerContent<B>),
     Push(LayerId),
     Insert(usize, LayerId),
@@ -531,6 +537,19 @@ impl<B: Backend> LayerEdit<B> {
     /// Clears the layer's filter.
     pub fn clear_filter(&mut self) -> &mut Self {
         self.ops.push(EditOp::Filter(None));
+        self
+    }
+
+    /// Makes the layer a member of a backdrop group: it composites the
+    /// group's capture as the bottom-most draw inside its clip.
+    pub fn backdrop(&mut self, sample: crate::BackdropSample) -> &mut Self {
+        self.ops.push(EditOp::Backdrop(Some(sample.group)));
+        self
+    }
+
+    /// Clears the layer's backdrop group membership.
+    pub fn clear_backdrop(&mut self) -> &mut Self {
+        self.ops.push(EditOp::Backdrop(None));
         self
     }
 
@@ -825,6 +844,9 @@ impl<B: Backend> Surface<B> {
                     EditOp::Clip(clip) => ops.push(Op::Layer(LayerOp::Clip(id, clip))),
                     EditOp::Blend(blend) => ops.push(Op::Layer(LayerOp::Blend(id, blend))),
                     EditOp::Filter(filter) => ops.push(Op::Layer(LayerOp::Filter(id, filter))),
+                    EditOp::Backdrop(backdrop) => {
+                        ops.push(Op::Layer(LayerOp::Backdrop(id, backdrop)));
+                    }
                     EditOp::Content(LayerContent::Content(content)) => {
                         // A fresh `Content` replaces the previous one whole
                         // (its first `take_change` is a `Replace`).
@@ -919,5 +941,49 @@ impl<B: Backend> Surface<B> {
 impl<B: Backend> Drop for Surface<B> {
     fn drop(&mut self) {
         let _ = self.tx.send(Message::DestroySurface { id: self.id });
+    }
+}
+
+impl<B: Backdrop> Surface<B> {
+    /// Allocates a group id and queues its registration with `op`.
+    fn new_backdrop_group(
+        &self,
+        op: impl FnOnce(&mut B::Renderer, SurfaceId, BackdropId) + Send + 'static,
+    ) -> crate::BackdropGroup {
+        let id = BackdropId::new(self.shared.borrow().next_backdrop.get());
+        self.shared
+            .borrow_mut()
+            .next_backdrop
+            .set(id.raw() + 1);
+        let surface = self.id;
+        let _ = self.tx.send(Message::Resource(Box::new(move |r| {
+            op(r, surface, id);
+        })));
+        let tx = self.tx.clone();
+        crate::BackdropGroup::new(id, move || {
+            let _ = tx.send(Message::Resource(Box::new(move |r| {
+                B::remove_backdrop_group(r, surface, id);
+            })));
+        })
+    }
+
+    /// Creates a backdrop group on this surface whose members sample the
+    /// unfiltered backdrop.
+    #[must_use]
+    pub fn backdrop_group_unfiltered(&self) -> crate::BackdropGroup {
+        self.new_backdrop_group(B::add_backdrop_group)
+    }
+
+    /// Creates a backdrop group whose capture runs through `filter` once;
+    /// members share the result.
+    #[must_use]
+    pub fn backdrop_group<K, F>(&self, filter: F) -> crate::BackdropGroup
+    where
+        K: filtrate_core::kind::Kind,
+        F: BackdropChain<K> + crate::RenderTransfer,
+    {
+        self.new_backdrop_group(move |r, surface, id| {
+            B::add_filtered_backdrop_group(r, surface, id, filter);
+        })
     }
 }

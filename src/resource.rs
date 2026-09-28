@@ -9,6 +9,7 @@ use std::sync::Arc;
 use crate::ShaderId;
 use crate::glyph::FontId;
 use crate::image::Format;
+use crate::message::BackdropId;
 use crate::paint::ImageId;
 use crate::style::FilterId;
 
@@ -208,4 +209,40 @@ impl Filter {
     pub fn id(&self) -> FilterId {
         self.inner.id
     }
+}
+
+/// A backdrop group: one capture and one spatial filter chain shared by
+/// its members. `!Send`; dropping it unregisters the group, and a member
+/// still sampling it makes the frame fail.
+#[derive(Debug)]
+pub struct BackdropGroup {
+    inner: Rc<Inner<BackdropId>>,
+}
+
+impl BackdropGroup {
+    pub(crate) fn new(id: BackdropId, on_drop: impl FnOnce() + 'static) -> Self {
+        Self {
+            inner: handle(id, on_drop),
+        }
+    }
+
+    /// The group's identifier.
+    #[must_use]
+    pub fn id(&self) -> BackdropId {
+        self.inner.id
+    }
+
+    /// A sample of this group for [`LayerEdit::backdrop`](crate::LayerEdit::backdrop).
+    #[must_use]
+    pub fn sample(&self) -> BackdropSample {
+        BackdropSample { group: self.id() }
+    }
+}
+
+/// A sample of a [`BackdropGroup`], attached to a layer by
+/// [`LayerEdit::backdrop`](crate::LayerEdit::backdrop).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BackdropSample {
+    /// The sampled group.
+    pub(crate) group: BackdropId,
 }

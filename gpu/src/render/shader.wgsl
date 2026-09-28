@@ -175,8 +175,34 @@ fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
     return out;
 }
 
+// Second-order signed distance from `q` (corner-local, both components
+// > 0, in the same units as `r`) to the Lamé quarter curve
+// (q.x/r.x)^n + (q.y/r.y)^n = 1, with n >= 2. Three Newton projections
+// along the implicit gradient land a point `c` on the curve within
+// O(d²κ) of the foot point; the distance is then measured along the
+// curve normal at `c`, which is second-order accurate. Returns
+// (d, unit normal in q space, radius of curvature at c).
+fn lame_corner(q: vec2<f32>, r: vec2<f32>, n: f32) -> vec4<f32> {
+    var c = q;
+    for (var i = 0; i < 3; i++) {
+        let u = max(c / r, vec2<f32>(0.0));
+        let f = pow(u.x, n) + pow(u.y, n) - 1.0;
+        let grad = n * pow(max(u, vec2<f32>(1e-6)), vec2<f32>(n - 1.0)) / r;
+        c = max(c - f * grad / max(dot(grad, grad), 1e-12), vec2<f32>(0.0));
+    }
+    let u = max(c / r, vec2<f32>(1e-6));
+    let g1 = n * pow(u, vec2<f32>(n - 1.0)) / r;           // f_x, f_y
+    let g2 = n * (n - 1.0) * pow(u, vec2<f32>(n - 2.0)) / (r * r); // f_xx, f_yy
+    let len = max(length(g1), 1e-12);
+    let normal = g1 / len;
+    let d = dot(q - c, normal);
+    // Implicit-curve curvature with f_xy = 0: (f_xx f_y² + f_yy f_x²)/|∇f|³.
+    let kappa = (g2.x * g1.y * g1.y + g2.y * g1.x * g1.x) / (len * len * len);
+    return vec4<f32>(d, normal, 1.0 / max(kappa, 1e-6));
+}
+
 // Signed distance from `p` to the rounded box `s`. Exact for straight edges
-// and circular corners; first-order (Newton) for elliptical and Lamé corners.
+// and circular corners; second-order for elliptical and Lamé corners.
 fn sdf(s: Shape, p: vec2<f32>) -> f32 {
     let right = p.x > 0.0;
     let bottom = p.y > 0.0;
@@ -194,18 +220,13 @@ fn sdf(s: Shape, p: vec2<f32>) -> f32 {
     let q = a + vec2<f32>(rx, ry);
     if q.x > 0.0 && q.y > 0.0 {
         let n = s.exponent;
-        let u = q / vec2<f32>(rx, ry);
-        if abs(n - 2.0) < 1e-4 {
+        if abs(n - 2.0) < 1e-4 && abs(s.aspect - 1.0) < 1e-4 {
+            let u = q / vec2<f32>(rx, ry);
             let g = length(u);
             let grad = length(u / vec2<f32>(rx, ry)) / max(g, 1e-6);
             return (g - 1.0) / max(grad, 1e-6);
         }
-        let f = pow(u.x, n) + pow(u.y, n);
-        let g = pow(f, 1.0 / n);
-        // d/dq of f^(1/n) = f^(1/n - 1) * (u^(n-1) / r)
-        let scale = pow(f, 1.0 / n - 1.0);
-        let grad = scale * length(vec2<f32>(pow(u.x, n - 1.0) / rx, pow(u.y, n - 1.0) / ry));
-        return (g - 1.0) / max(grad, 1e-6);
+        return lame_corner(q, vec2<f32>(rx, ry), n).x;
     }
     return max(a.x, a.y);
 }
@@ -231,17 +252,16 @@ fn device_grad_scale(m: array<vec4<f32>, 2>) -> f32 {
     return abs(select(1.0 / det, 0.0, abs(det) < 1e-12));
 }
 
-// Local-space gradient of the signed distance to `s` at `p`, by central
-// differences. Derivative builtins are not used: they are unreliable in the
+// Local-space gradient of the signed distance to `s` at `p`, closed form.
+// Derivative builtins are not used: they are unreliable in the
 // helper lanes along the quad's triangle seam.
 fn sdf_grad(s: Shape, p: vec2<f32>) -> vec4<f32> {
-    // Closed form for sharp and circular/elliptical corners: the unit
-    // gradient of the box distance, mirrored back out of the abs() fold.
-    // z = local boundary radius of curvature on a circular arc, 0.0 on
-    // straight edges; w = 1.0 where the distance is not a half-plane
-    // (sharp-corner exterior wedge) or only first-order (elliptical
-    // corners, the finite-difference branch).
-    if abs(s.exponent - 2.0) < 1e-4 || !(s.radii.x > 0.0 || s.radii.y > 0.0 || s.radii.z > 0.0 || s.radii.w > 0.0) {
+    // Closed form for every shape: the unit gradient of the box distance,
+    // mirrored back out of the abs() fold. z = local boundary radius of
+    // curvature on a circular, elliptical or Lamé arc, 0.0 on straight
+    // edges; w = 1.0 only where the distance is not a half-plane (the
+    // sharp-corner exterior wedge).
+    {
         let sgn = select(vec2<f32>(-1.0), vec2<f32>(1.0), p >= vec2<f32>(0.0));
         let right = p.x > 0.0;
         let bottom = p.y > 0.0;
@@ -263,11 +283,12 @@ fn sdf_grad(s: Shape, p: vec2<f32>) -> vec4<f32> {
         } else {
             let q = a + vec2<f32>(rx, ry);
             if q.x > 0.0 && q.y > 0.0 {
-                let v = q / vec2<f32>(rx * rx, ry * ry);
-                if abs(s.aspect - 1.0) > 1e-4 {
-                    g = vec4<f32>(v / max(length(v), 1e-12), 0.0, 1.0);
-                } else {
+                if abs(s.exponent - 2.0) < 1e-4 && abs(s.aspect - 1.0) < 1e-4 {
+                    let v = q / vec2<f32>(rx * rx, ry * ry);
                     g = vec4<f32>(v / max(length(v), 1e-12), rx, 0.0);
+                } else {
+                    let l = lame_corner(q, vec2<f32>(rx, ry), s.exponent);
+                    g = vec4<f32>(l.yz, l.w, 0.0);
                 }
             } else {
                 g = vec4<f32>(select(vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), a.x > a.y), 0.0, 0.0);
@@ -275,15 +296,6 @@ fn sdf_grad(s: Shape, p: vec2<f32>) -> vec4<f32> {
         }
         return vec4<f32>(sgn * g.xy, g.zw);
     }
-    const E: f32 = 0.05;
-    return vec4<f32>(
-        vec2<f32>(
-            sdf(s, p + vec2<f32>(E, 0.0)) - sdf(s, p - vec2<f32>(E, 0.0)),
-            sdf(s, p + vec2<f32>(0.0, E)) - sdf(s, p - vec2<f32>(0.0, E)),
-        ) / (2.0 * E),
-        0.0,
-        1.0,
-    );
 }
 
 // Area coverage of the axis-aligned half-plane `d <= 0` where `d`

@@ -1,8 +1,9 @@
 //! Stage-1 lowering: a display list becomes a device-independent op
 //! stream, patchable in place along [`cherenkov::Dirty`] ranges.
 
-use std::collections::HashMap;
 use std::sync::Arc;
+
+use rustc_hash::FxHashMap;
 
 use cherenkov::kurbo::{Affine, Line, PathEl, Rect};
 use cherenkov::{
@@ -310,7 +311,7 @@ fn paint_data(
     paint: &Paint,
     to_local: Affine,
     stops: &mut Vec<Stop>,
-    images: &HashMap<u64, GpuImage>,
+    images: &FxHashMap<u64, GpuImage>,
 ) -> Result<PaintData, RenderError> {
     let mut data = PaintData {
         kind: PAINT_SOLID,
@@ -452,7 +453,7 @@ fn mesh_paint(
 fn resolve(
     paint: &Paint,
     to_local: Affine,
-    images: &HashMap<u64, GpuImage>,
+    images: &FxHashMap<u64, GpuImage>,
 ) -> Result<ResolvedPaint, RenderError> {
     if let Paint::Solid(color) = paint {
         return Ok(ResolvedPaint::Solid(color.components));
@@ -465,7 +466,7 @@ fn resolve(
 fn resolve_resources(
     paint: &Paint,
     to_local: Affine,
-    images: &HashMap<u64, GpuImage>,
+    images: &FxHashMap<u64, GpuImage>,
 ) -> Result<ResolvedPaint, RenderError> {
     if let Paint::Transformed(_) = paint {
         return resolve_transformed(paint, to_local, images);
@@ -486,7 +487,7 @@ fn resolve_resources(
 fn resolve_transformed(
     mut paint: &Paint,
     to_local: Affine,
-    images: &HashMap<u64, GpuImage>,
+    images: &FxHashMap<u64, GpuImage>,
 ) -> Result<ResolvedPaint, RenderError> {
     let mut transform = Affine::IDENTITY;
     while let Paint::Transformed(mapped) = paint {
@@ -768,9 +769,9 @@ pub struct Lowerer<'a> {
     /// COLR cache writes committed after parallel preparation.
     pub pending: &'a mut Vec<super::glyph::PendingRaster>,
     /// Fonts for colour glyph expansion.
-    pub fonts: &'a HashMap<u64, FontData>,
+    pub fonts: &'a FxHashMap<u64, FontData>,
     /// Images for resolving image paint dimensions.
-    pub images: &'a HashMap<u64, GpuImage>,
+    pub images: &'a FxHashMap<u64, GpuImage>,
 }
 
 impl cherenkov::lowering::Compiler for Lowerer<'_> {

@@ -13,6 +13,7 @@ use skrifa::raw::TableProvider as _;
 use skrifa::raw::types::F2Dot14;
 
 use super::font::Font;
+use rustc_hash::FxHashMap;
 
 /// A retained draw or paired composition scope.
 pub enum Op {
@@ -82,9 +83,9 @@ impl cherenkov::lowering::Operation for Op {
 /// Resolve CPU paints while retaining content-space geometry. `fonts` is
 /// mutable: lowering builds the `COLRv1` node trees the frame uses.
 pub struct Lowerer<'a> {
-    pub images: &'a std::collections::HashMap<u64, std::sync::Arc<super::image::CpuImage>>,
-    pub fonts: &'a mut std::collections::HashMap<u64, Font>,
-    pub bitmap_fonts: &'a std::collections::HashMap<u64, std::sync::Arc<super::bitmap::BitmapFont>>,
+    pub images: &'a FxHashMap<u64, std::sync::Arc<super::image::CpuImage>>,
+    pub fonts: &'a mut FxHashMap<u64, Font>,
+    pub bitmap_fonts: &'a FxHashMap<u64, std::sync::Arc<super::bitmap::BitmapFont>>,
 }
 
 impl cherenkov::lowering::Compiler for Lowerer<'_> {

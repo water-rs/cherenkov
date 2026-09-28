@@ -1,11 +1,11 @@
 //! Registered font state: the shared [`FontData`] plus the `COLRv1`
 //! node-tree cache.
 
-use std::collections::HashMap;
 use std::mem::size_of_val;
 use std::sync::Arc;
 
 use cherenkov::FontData;
+use rustc_hash::FxHashMap;
 
 use super::colr::Node;
 
@@ -32,7 +32,7 @@ pub struct Font {
     /// Foreground-independent `COLRv1` node trees, per `(glyph, coords)`.
     /// Written only during single-threaded lowering; the raster phase
     /// reads the shared [`Node`] trees through `Arc` handles.
-    pub colr: HashMap<ColrKey, Arc<[Node]>>,
+    pub colr: FxHashMap<ColrKey, Arc<[Node]>>,
 }
 
 impl Font {

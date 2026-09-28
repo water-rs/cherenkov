@@ -1,7 +1,8 @@
 //! Shader registration and retained shader-paint textures.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+
+use rustc_hash::FxHashMap;
 
 use cherenkov::{RenderError, ResourceError, ShaderSource};
 use std::sync::Arc;
@@ -30,7 +31,7 @@ pub struct Texture {
 
 #[derive(Default)]
 pub struct Registry {
-    entries: HashMap<u64, Entry>,
+    entries: FxHashMap<u64, Entry>,
     registered: bool,
 }
 
@@ -191,7 +192,7 @@ impl Registry {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         key: &Arc<Key>,
-        textures: &mut HashMap<Arc<Key>, Texture>,
+        textures: &mut FxHashMap<Arc<Key>, Texture>,
         time: f32,
     ) -> Result<(), RenderError> {
         let pipeline = self

@@ -1,6 +1,6 @@
 //! Window presentation: blits a surface's f16 target onto its swapchain.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use cherenkov::{RenderError, SurfaceError};
 
@@ -112,7 +112,7 @@ pub struct Presenter {
     layout: wgpu::BindGroupLayout,
     pipeline_layout: wgpu::PipelineLayout,
     sampler: wgpu::Sampler,
-    pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
+    pipelines: FxHashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
     /// `{ encode, alpha, headroom, pad }`: see `Present` in
     /// `present.wgsl`. Written per call — the headroom follows the
     /// display every frame (#97).
@@ -151,7 +151,7 @@ impl Presenter {
             layout,
             pipeline_layout,
             sampler,
-            pipelines: HashMap::new(),
+            pipelines: FxHashMap::default(),
             uniform,
         }
     }

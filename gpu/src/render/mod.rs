@@ -20,10 +20,12 @@ mod shadow;
 mod upload;
 
 use cherenkov::Instant;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
+
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{GpuConfig, GpuInfo, GpuTarget, ScratchFormat, TimestampSupport, names};
 use bitmap::BitmapKey;
@@ -161,12 +163,12 @@ struct SurfaceState {
     /// format, index 1 the scratch format.
     backdrop: [Option<ScratchTarget>; 2],
     /// Backdrop groups registered on this surface by raw id.
-    backdrop_groups: HashMap<u64, BackdropGroupState>,
-    layers: HashMap<LayerId, ContentData>,
-    content: HashMap<LayerId, gpu_content::Slot>,
+    backdrop_groups: FxHashMap<u64, BackdropGroupState>,
+    layers: FxHashMap<LayerId, ContentData>,
+    content: FxHashMap<LayerId, gpu_content::Slot>,
     /// Retained external frames by layer (`cherenkov::ExternalFrames`).
-    external: HashMap<LayerId, external::Slot>,
-    shader_textures: HashMap<std::sync::Arc<paint::Key>, paint::Texture>,
+    external: FxHashMap<LayerId, external::Slot>,
+    shader_textures: FxHashMap<std::sync::Arc<paint::Key>, paint::Texture>,
     frame: LoweredFrame,
     /// This frame's offsets into the shared buffers: instances and globals
     /// (256-byte slots) are laid out surface by surface so one upload covers
@@ -179,7 +181,7 @@ struct SurfaceState {
     /// Group-1 bind groups keyed by `(source, backdrop, image,
     /// mask texture)`, reused across frames while `binds1_stamp` is
     /// current.
-    binds1: HashMap<Bind1Key, wgpu::BindGroup>,
+    binds1: FxHashMap<Bind1Key, wgpu::BindGroup>,
     /// The `(bind_gen, images_gen, mask_texture_gen)` triple `binds1` was
     /// built under.
     binds1_stamp: (u64, u64, u64),
@@ -196,7 +198,7 @@ struct BackdropGroupState {
 
 impl SurfaceState {
     /// The `BackdropGroupInfo` map lowering needs for this surface.
-    fn backdrop_info(&self, filters: &mut filter::Registry) -> HashMap<u64, BackdropGroupInfo> {
+    fn backdrop_info(&self, filters: &mut filter::Registry) -> FxHashMap<u64, BackdropGroupInfo> {
         self.backdrop_groups
             .iter()
             .map(|(g, state)| {
@@ -373,11 +375,11 @@ pub struct GpuRenderer {
     /// `[format index]` external pipelines: 0 = surface, 1 = scratch —
     /// `None` until the first external draw prepares them.
     external_pipes: [Option<wgpu::RenderPipeline>; 2],
-    surfaces: HashMap<SurfaceId, SurfaceState>,
-    fonts: HashMap<u64, FontData>,
+    surfaces: FxHashMap<SurfaceId, SurfaceState>,
+    fonts: FxHashMap<u64, FontData>,
     /// Registered images.
-    images: HashMap<u64, GpuImage>,
-    bitmaps: HashMap<BitmapKey, GpuBitmap>,
+    images: FxHashMap<u64, GpuImage>,
+    bitmaps: FxHashMap<BitmapKey, GpuBitmap>,
     /// Bumped on every `images` insert/remove — every cached group-1
     /// bind group samples an image view, so an image change rebuilds them.
     images_gen: u64,
@@ -1289,10 +1291,10 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             atlas,
             commit_writes: Vec::new(),
             pending_origins: Vec::new(),
-            surfaces: HashMap::new(),
-            fonts: HashMap::new(),
-            images: HashMap::new(),
-            bitmaps: HashMap::new(),
+            surfaces: FxHashMap::default(),
+            fonts: FxHashMap::default(),
+            images: FxHashMap::default(),
+            bitmaps: FxHashMap::default(),
             images_gen: 0,
             timestamps,
             query_set,
@@ -1502,10 +1504,10 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
         atlas,
         commit_writes: Vec::new(),
         pending_origins: Vec::new(),
-        surfaces: HashMap::new(),
-        fonts: HashMap::new(),
-        images: HashMap::new(),
-        bitmaps: HashMap::new(),
+        surfaces: FxHashMap::default(),
+        fonts: FxHashMap::default(),
+        images: FxHashMap::default(),
+        bitmaps: FxHashMap::default(),
         images_gen: 0,
         timestamps,
         query_set,
@@ -1628,16 +1630,16 @@ impl Renderer for GpuRenderer {
                 view,
                 scratch: Vec::new(),
                 backdrop: [None, None],
-                backdrop_groups: HashMap::new(),
-                layers: HashMap::new(),
-                content: HashMap::new(),
-                external: HashMap::new(),
-                shader_textures: HashMap::new(),
+                backdrop_groups: FxHashMap::default(),
+                layers: FxHashMap::default(),
+                content: FxHashMap::default(),
+                external: FxHashMap::default(),
+                shader_textures: FxHashMap::default(),
                 frame: LoweredFrame::default(),
                 inst_base: 0,
                 globals_base: 0,
                 bind_gen: 0,
-                binds1: HashMap::new(),
+                binds1: FxHashMap::default(),
                 binds1_stamp: (u64::MAX, u64::MAX, u64::MAX),
             },
         );
@@ -1792,7 +1794,7 @@ impl Renderer for GpuRenderer {
                 has_colr,
                 has_bitmap: bitmap.is_some(),
                 bitmap,
-                colr: std::cell::RefCell::new(HashMap::new()),
+                colr: std::cell::RefCell::new(FxHashMap::default()),
             },
         );
         Ok(())
@@ -2812,7 +2814,7 @@ impl GpuRenderer {
     fn render_shaders(&mut self, id: SurfaceId, elapsed: f32) -> Result<(), RenderError> {
         let surface = self.surfaces.get_mut(&id).expect("registered surface");
         if self.shaders.has_registrations() {
-            let keys: std::collections::HashSet<_> = surface
+            let keys: FxHashSet<_> = surface
                 .frame
                 .passes
                 .iter()
@@ -3080,7 +3082,7 @@ impl GpuRenderer {
         let mut cleared = false;
         let mut grew = false;
         loop {
-            let group_maps: Vec<HashMap<u64, BackdropGroupInfo>> = pending
+            let group_maps: Vec<FxHashMap<u64, BackdropGroupInfo>> = pending
                 .iter()
                 .map(|surf| surf.backdrop_info(&mut self.filters))
                 .collect();
@@ -3088,7 +3090,7 @@ impl GpuRenderer {
                 let (atlas, images, bitmaps) = (&self.atlas, &self.images, &self.bitmaps);
                 // `FontData`'s COLR cache is a `RefCell` — !Sync — so
                 // each worker moves in its own snapshot built here.
-                let snapshots: Vec<HashMap<u64, FontData>> = pending
+                let snapshots: Vec<FxHashMap<u64, FontData>> = pending
                     .iter()
                     .map(|_| {
                         self.fonts
@@ -3176,7 +3178,7 @@ impl GpuRenderer {
         let mut cleared = false;
         let mut grew = false;
         loop {
-            let group_maps: Vec<HashMap<u64, BackdropGroupInfo>> = pending
+            let group_maps: Vec<FxHashMap<u64, BackdropGroupInfo>> = pending
                 .iter()
                 .map(|surf| surf.backdrop_info(&mut self.filters))
                 .collect();
@@ -3234,10 +3236,10 @@ impl GpuRenderer {
         surf: &mut SurfaceState,
         frame: &SurfaceFrame<'_>,
         atlas: &Atlas,
-        fonts: &HashMap<u64, FontData>,
-        images: &HashMap<u64, GpuImage>,
-        bitmaps: &HashMap<BitmapKey, GpuBitmap>,
-        groups: &HashMap<u64, BackdropGroupInfo>,
+        fonts: &FxHashMap<u64, FontData>,
+        images: &FxHashMap<u64, GpuImage>,
+        bitmaps: &FxHashMap<BitmapKey, GpuBitmap>,
+        groups: &FxHashMap<u64, BackdropGroupInfo>,
     ) -> Result<Lowered, RenderError> {
         surf.frame.reset();
         // Lowering borrows `layers` immutably while mutating `frame`;
@@ -3278,7 +3280,7 @@ impl GpuRenderer {
         if !self.atlas.mask_textures_over_budget() {
             return;
         }
-        let live: rustc_hash::FxHashSet<u64> = self
+        let live: FxHashSet<u64> = self
             .surfaces
             .values()
             .flat_map(|surf| surf.frame.passes.iter())

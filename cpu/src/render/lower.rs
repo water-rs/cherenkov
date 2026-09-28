@@ -4,8 +4,9 @@
 mod silhouette;
 
 use cherenkov::lowering::Realization;
-use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use cherenkov::kurbo::{Affine, BezPath, PathEl, Point, Rect};
 use cherenkov::{BlendMode, FillRule, FrameId, GlyphRun, GlyphStyle, ShapeData};
@@ -259,7 +260,7 @@ struct BackdropPlan {
     filter: Option<FrameFilter>,
     /// Each member layer's device-space clip bounds and innermost
     /// enclosing filter scope.
-    members: HashMap<LayerId, (Rect, Option<LayerId>)>,
+    members: FxHashMap<LayerId, (Rect, Option<LayerId>)>,
     /// The innermost filter scope the capture item lands in.
     scope: Option<LayerId>,
 }
@@ -269,14 +270,14 @@ pub struct Lowering<'a, 'b> {
     items: &'a mut Vec<Item>,
     filters: Option<&'a mut Registry>,
     frame: FrameId,
-    used_filters: HashSet<u64>,
+    used_filters: FxHashSet<u64>,
     /// Backdrop groups referenced by members this frame.
-    used_groups: HashSet<u64>,
+    used_groups: FxHashSet<u64>,
     /// Glyph mask requests emitted during the walk.
     pub glyphs: Vec<GlyphReq>,
     pub glyphs_rasterized: u32,
-    fonts: &'b mut HashMap<u64, super::font::Font>,
-    bitmap_fonts: &'b HashMap<u64, Arc<super::bitmap::BitmapFont>>,
+    fonts: &'b mut FxHashMap<u64, super::font::Font>,
+    bitmap_fonts: &'b FxHashMap<u64, Arc<super::bitmap::BitmapFont>>,
     bitmap_cache: &'b mut super::bitmap::BitmapCache,
     width: usize,
     height: usize,
@@ -289,11 +290,11 @@ pub struct Lowering<'a, 'b> {
     /// opacity is 1 and its blend is `Normal`), in emission order.
     iso_kinds: Vec<bool>,
     /// Backdrop groups planned before lowering, by group id.
-    backdrops: HashMap<u64, BackdropPlan>,
+    backdrops: FxHashMap<u64, BackdropPlan>,
     /// The apron rows each filtered layer's scope needs beyond its own
     /// footprint, by layer: a scope that directly contains captures grows
     /// to cover their `apron + reach`.
-    scope_aprons: HashMap<LayerId, usize>,
+    scope_aprons: FxHashMap<LayerId, usize>,
     /// Source commands resolved this frame.
     pub commands_lowered: u32,
     /// Content layers composed this frame.
@@ -487,16 +488,16 @@ impl<'a, 'b> Lowering<'a, 'b> {
         size: (u32, u32),
         filters: Option<&'a mut Registry>,
         frame: FrameId,
-        fonts: &'b mut HashMap<u64, super::font::Font>,
-        bitmap_fonts: &'b HashMap<u64, Arc<super::bitmap::BitmapFont>>,
+        fonts: &'b mut FxHashMap<u64, super::font::Font>,
+        bitmap_fonts: &'b FxHashMap<u64, Arc<super::bitmap::BitmapFont>>,
         bitmap_cache: &'b mut super::bitmap::BitmapCache,
     ) -> Self {
         Self {
             items,
             filters,
             frame,
-            used_filters: HashSet::new(),
-            used_groups: HashSet::new(),
+            used_filters: FxHashSet::default(),
+            used_groups: FxHashSet::default(),
             glyphs: Vec::new(),
             glyphs_rasterized: 0,
             fonts,
@@ -508,8 +509,8 @@ impl<'a, 'b> Lowering<'a, 'b> {
             animating: false,
             clip: None,
             iso_kinds: Vec::new(),
-            backdrops: HashMap::new(),
-            scope_aprons: HashMap::new(),
+            backdrops: FxHashMap::default(),
+            scope_aprons: FxHashMap::default(),
             commands_lowered: 0,
             layers_composed: 0,
         }
@@ -523,8 +524,8 @@ impl<'a, 'b> Lowering<'a, 'b> {
         &mut self,
         surface: SurfaceId,
         tree: &SurfaceTree,
-        caches: &mut HashMap<LayerId, ContentData>,
-        images: &HashMap<u64, Arc<super::image::CpuImage>>,
+        caches: &mut FxHashMap<LayerId, ContentData>,
+        images: &FxHashMap<u64, Arc<super::image::CpuImage>>,
     ) -> Result<(), RenderError> {
         let mut lowerer = super::prepared::Lowerer {
             images,
@@ -544,12 +545,12 @@ impl<'a, 'b> Lowering<'a, 'b> {
         self.layer(tree.root(), tree, caches)
     }
 
-    pub fn take_used_filters(&mut self) -> HashSet<u64> {
+    pub fn take_used_filters(&mut self) -> FxHashSet<u64> {
         std::mem::take(&mut self.used_filters)
     }
 
     /// The backdrop groups members referenced this frame.
-    pub fn take_used_groups(&mut self) -> HashSet<u64> {
+    pub fn take_used_groups(&mut self) -> FxHashSet<u64> {
         std::mem::take(&mut self.used_groups)
     }
 
@@ -565,7 +566,7 @@ impl<'a, 'b> Lowering<'a, 'b> {
         &mut self,
         id: LayerId,
         tree: &SurfaceTree,
-        groups: &mut HashMap<u64, super::filter::PreparedBackdrop>,
+        groups: &mut FxHashMap<u64, super::filter::PreparedBackdrop>,
         filters: &mut Registry,
         surface: SurfaceId,
         parent: Affine,
@@ -606,7 +607,7 @@ impl<'a, 'b> Lowering<'a, 'b> {
                 apron: 0,
                 reach: 0,
                 filter: prepared.filter.clone(),
-                members: HashMap::new(),
+                members: FxHashMap::default(),
                 scope: scopes.last().copied(),
             });
             plan.union = plan.union.union(member);
@@ -648,7 +649,7 @@ impl<'a, 'b> Lowering<'a, 'b> {
         surface: SurfaceId,
         filters: &mut Registry,
     ) -> Result<(), RenderError> {
-        let mut groups = HashMap::new();
+        let mut groups = FxHashMap::default();
         self.plan_layer(
             tree.root(),
             tree,
@@ -693,7 +694,7 @@ impl<'a, 'b> Lowering<'a, 'b> {
         // The apron a scope needs around each band — its own filter's
         // footprint, or `capture apron + reach` for scopes a capture
         // lands directly in.
-        let mut aprons: HashMap<LayerId, usize> = HashMap::new();
+        let mut aprons: FxHashMap<LayerId, usize> = FxHashMap::default();
         for plan in self.backdrops.values() {
             for &scope in plan
                 .members
@@ -957,7 +958,7 @@ impl<'a, 'b> Lowering<'a, 'b> {
         &mut self,
         id: LayerId,
         tree: &SurfaceTree,
-        caches: &mut HashMap<LayerId, ContentData>,
+        caches: &mut FxHashMap<LayerId, ContentData>,
     ) -> Result<(), RenderError> {
         let node = tree.layer(id);
         let backdrop = node.backdrop.map(BackdropId::raw);
@@ -1066,7 +1067,7 @@ impl<'a, 'b> Lowering<'a, 'b> {
         id: LayerId,
         node: &cherenkov::LayerNode,
         tree: &SurfaceTree,
-        caches: &mut HashMap<LayerId, ContentData>,
+        caches: &mut FxHashMap<LayerId, ContentData>,
     ) -> Result<(), RenderError> {
         if let Some(content) = caches.get_mut(&id) {
             let (ops, emissions) = content.prepared();

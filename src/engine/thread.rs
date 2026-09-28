@@ -2,10 +2,11 @@
 //! [`SurfaceTree`] per surface, applies commits, samples animations at the
 //! frame time, renders, and answers with [`Next`] and the [`FrameStats`].
 
-use std::collections::HashMap;
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
+
+use rustc_hash::FxHashMap;
 
 use crate::WorkingColor;
 use crate::backend::{Backend, Display, Frame, Redraw, Renderer, SurfaceFrame};
@@ -41,7 +42,7 @@ pub fn run<B: Backend>(
         }
     };
     let _ = init_reply.send(Ok(info));
-    let mut surfaces: HashMap<SurfaceId, SurfaceState> = HashMap::new();
+    let mut surfaces: FxHashMap<SurfaceId, SurfaceState> = FxHashMap::default();
     let mut next_frame = 0u64;
     while let Ok(message) = rx.recv() {
         match message {
@@ -173,7 +174,7 @@ fn commit<B: Backend>(
 #[cfg(not(target_arch = "wasm32"))]
 fn render<B: Backend>(
     renderer: &mut B::Renderer,
-    surfaces: &mut HashMap<SurfaceId, SurfaceState>,
+    surfaces: &mut FxHashMap<SurfaceId, SurfaceState>,
     id: FrameId,
     time: crate::Instant,
     commits: &mut [(SurfaceId, ChangeSet<B>)],
@@ -239,7 +240,7 @@ fn render<B: Backend>(
 )]
 async fn render_local<B: Backend>(
     renderer: &mut B::Renderer,
-    surfaces: &mut HashMap<SurfaceId, SurfaceState>,
+    surfaces: &mut FxHashMap<SurfaceId, SurfaceState>,
     id: FrameId,
     time: crate::Instant,
     commits: &mut [(SurfaceId, ChangeSet<B>)],
@@ -366,7 +367,7 @@ pub(super) async fn local<B: Backend>(
     let (renderer, info) = B::init(config).await?;
     let state = Rc::new(RefCell::new(Some(LocalState::<B> {
         renderer,
-        surfaces: HashMap::new(),
+        surfaces: FxHashMap::default(),
         next_frame: 0,
     })));
     let tx = crate::local::Sender::new(move |message| {
@@ -384,7 +385,7 @@ pub(super) async fn local<B: Backend>(
 #[cfg(target_arch = "wasm32")]
 struct LocalState<B: Backend> {
     renderer: B::Renderer,
-    surfaces: HashMap<SurfaceId, SurfaceState>,
+    surfaces: FxHashMap<SurfaceId, SurfaceState>,
     next_frame: u64,
 }
 #[cfg(target_arch = "wasm32")]

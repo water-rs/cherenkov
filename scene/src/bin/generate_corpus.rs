@@ -624,6 +624,23 @@ fn run() -> Result<(), SceneError> {
         );
     });
 
+    corpus.scene("path-curved-transform", 128, 128, white, |l| {
+        l.layer(|a| {
+            a.transform(
+                Affine::translate((64.3, 63.8))
+                    * Affine::rotate(0.3)
+                    * Affine::scale(0.85)
+                    * Affine::translate((-64.0, -64.0)),
+            );
+            a.fill(
+                Shape::Path {
+                    path: curved_path(),
+                },
+                solid(srgb(0.3, 0.2, 0.7)),
+            );
+        });
+    });
+
     corpus.scene("path-self-intersect", 128, 128, white, |l| {
         l.fill(
             Shape::Path {

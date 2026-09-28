@@ -2305,88 +2305,118 @@ fn run() -> Result<(), SceneError> {
 
     // Map-like page: ~2,000 stroked and filled paths — short segments,
     // closed polygons and curved outlines distributed over the viewport.
-    {
-        perf.scene("map", pw as u32, ph as u32, srgb(0.93, 0.95, 0.90), |l| {
-            let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
-            let palette = [
-                srgb(0.45, 0.60, 0.45),
-                srgb(0.55, 0.50, 0.38),
-                srgb(0.40, 0.55, 0.65),
-                srgb(0.70, 0.55, 0.45),
-                srgb(0.50, 0.45, 0.60),
-            ];
-            let thin = StrokeStyle {
-                start_cap: kurbo::Cap::Round,
-                end_cap: kurbo::Cap::Round,
-                ..StrokeStyle::default()
-            };
-            for i in 0..2000 {
-                let (x, y) = (rng.f64() * pw, rng.f64() * ph);
-                let color = palette[rng.below(palette.len())];
-                match i % 4 {
-                    // Polyline segment.
-                    0 => {
-                        let (dx, dy) = (rng.f64() * 90.0 - 45.0, rng.f64() * 90.0 - 45.0);
-                        l.stroke(
-                            Shape::Line(Line::new((x, y), (x + dx, y + dy))),
-                            StrokeStyle {
-                                width: 0.5 + rng.f64() * 4.0,
-                                ..thin.clone()
-                            },
-                            solid(color),
-                        );
-                    }
-                    // Closed polygon (park/parcel fill).
-                    1 => {
-                        let r = 8.0 + rng.f64() * 48.0;
-                        let sides = 3 + rng.below(5);
-                        let mut p = BezPath::new();
-                        for v in 0..sides {
-                            #[expect(
-                                clippy::cast_precision_loss,
-                                reason = "vertex index is below 8"
-                            )]
-                            let a = (v as f64) * std::f64::consts::TAU / (sides as f64);
-                            let pt = (x + r * a.cos(), y + r * a.sin());
-                            if v == 0 {
-                                p.move_to(pt);
-                            } else {
-                                p.line_to(pt);
-                            }
+    fn map_body(l: &mut LayerBuilder, pw: f64, ph: f64) {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let palette = [
+            srgb(0.45, 0.60, 0.45),
+            srgb(0.55, 0.50, 0.38),
+            srgb(0.40, 0.55, 0.65),
+            srgb(0.70, 0.55, 0.45),
+            srgb(0.50, 0.45, 0.60),
+        ];
+        let thin = StrokeStyle {
+            start_cap: kurbo::Cap::Round,
+            end_cap: kurbo::Cap::Round,
+            ..StrokeStyle::default()
+        };
+        for i in 0..2000 {
+            let (x, y) = (rng.f64() * pw, rng.f64() * ph);
+            let color = palette[rng.below(palette.len())];
+            match i % 4 {
+                // Polyline segment.
+                0 => {
+                    let (dx, dy) = (rng.f64() * 90.0 - 45.0, rng.f64() * 90.0 - 45.0);
+                    l.stroke(
+                        Shape::Line(Line::new((x, y), (x + dx, y + dy))),
+                        StrokeStyle {
+                            width: 0.5 + rng.f64() * 4.0,
+                            ..thin.clone()
+                        },
+                        solid(color),
+                    );
+                }
+                // Closed polygon (park/parcel fill).
+                1 => {
+                    let r = 8.0 + rng.f64() * 48.0;
+                    let sides = 3 + rng.below(5);
+                    let mut p = BezPath::new();
+                    for v in 0..sides {
+                        #[expect(clippy::cast_precision_loss, reason = "vertex index is below 8")]
+                        let a = (v as f64) * std::f64::consts::TAU / (sides as f64);
+                        let pt = (x + r * a.cos(), y + r * a.sin());
+                        if v == 0 {
+                            p.move_to(pt);
+                        } else {
+                            p.line_to(pt);
                         }
-                        p.close_path();
-                        l.fill(Shape::Path { path: p }, solid(color));
                     }
-                    // Open polyline of 3-6 points (road/river line).
-                    2 => {
-                        let mut p = BezPath::new();
-                        let (mut cx, mut cy) = (x, y);
-                        p.move_to((cx, cy));
-                        for _ in 0..2 + rng.below(4) {
-                            cx += rng.f64() * 120.0 - 60.0;
-                            cy += rng.f64() * 60.0 - 30.0;
-                            p.line_to((cx, cy));
-                        }
-                        l.stroke(
-                            Shape::Path { path: p },
-                            StrokeStyle {
-                                width: 1.0 + rng.f64() * 5.0,
-                                ..thin.clone()
-                            },
-                            solid(color),
-                        );
+                    p.close_path();
+                    l.fill(Shape::Path { path: p }, solid(color));
+                }
+                // Open polyline of 3-6 points (road/river line).
+                2 => {
+                    let mut p = BezPath::new();
+                    let (mut cx, mut cy) = (x, y);
+                    p.move_to((cx, cy));
+                    for _ in 0..2 + rng.below(4) {
+                        cx += rng.f64() * 120.0 - 60.0;
+                        cy += rng.f64() * 60.0 - 30.0;
+                        p.line_to((cx, cy));
                     }
-                    // Curved closed path (lake/contour).
-                    _ => {
-                        let (rx, ry) = (10.0 + rng.f64() * 60.0, 6.0 + rng.f64() * 40.0);
-                        l.fill(
-                            Shape::Ellipse(Ellipse::new((x, y), (rx, ry), 0.0)),
-                            solid(color),
-                        );
-                    }
+                    l.stroke(
+                        Shape::Path { path: p },
+                        StrokeStyle {
+                            width: 1.0 + rng.f64() * 5.0,
+                            ..thin.clone()
+                        },
+                        solid(color),
+                    );
+                }
+                // Curved closed path (lake/contour).
+                _ => {
+                    let (rx, ry) = (10.0 + rng.f64() * 60.0, 6.0 + rng.f64() * 40.0);
+                    l.fill(
+                        Shape::Ellipse(Ellipse::new((x, y), (rx, ry), 0.0)),
+                        solid(color),
+                    );
                 }
             }
+        }
+    }
+
+    {
+        perf.scene("map", pw as u32, ph as u32, srgb(0.93, 0.95, 0.90), |l| {
+            map_body(l, pw, ph);
         });
+    }
+
+    // The map under a smooth pan: a fractional offset per frame for 4 s,
+    // then at rest at identity (= the map scene itself). Exercises the
+    // path cache's behaviour when the translation's fraction changes
+    // every frame.
+    {
+        perf.scene(
+            "map-pan",
+            pw as u32,
+            ph as u32,
+            srgb(0.93, 0.95, 0.90),
+            |l| {
+                l.layer(|pan| {
+                    pan.transform(Affine::IDENTITY);
+                    pan.motion(Motion::Transform {
+                        from: Affine::translate((-281.7, -209.3)),
+                        animation: MotionAnimation::Curve {
+                            duration_ms: 4000,
+                            x1: 0.25,
+                            y1: 0.25,
+                            x2: 0.75,
+                            y2: 0.75,
+                        },
+                    });
+                    map_body(pan, pw, ph);
+                });
+            },
+        );
     }
 
     // Chart page: a 2,000-point line chart, a bar chart, axes and labels.

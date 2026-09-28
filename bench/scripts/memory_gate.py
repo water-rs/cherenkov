@@ -744,10 +744,22 @@ def main() -> int:
                     if base_reading is None:
                         continue
                     if "unavailable" in base_reading or "unavailable" in head_reading:
-                        problems.append(
-                            f"{name} unavailable: "
-                            f"{base_reading.get('unavailable') or head_reading.get('unavailable')}"
-                        )
+                        if "unavailable" in base_reading and "unavailable" in head_reading:
+                            # Equally unavailable on both sides — an
+                            # engine with no such counter is correct,
+                            # not a failure (e.g. cherenkov-cpu has no
+                            # wgpu allocator to report).
+                            delta_parts.append(
+                                f"{name} unavailable: "
+                                f"{base_reading['unavailable']}"
+                            )
+                        else:
+                            # A required measurement the other side
+                            # produces is not a pass (#169 A5).
+                            problems.append(
+                                f"{name} unavailable: "
+                                f"{base_reading.get('unavailable') or head_reading.get('unavailable')}"
+                            )
                         continue
                     fields = sorted(set(base_reading) | set(head_reading))
                     deltas = []

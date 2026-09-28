@@ -112,6 +112,22 @@ impl TextContext {
             families.insert(spec.subset_file, name.to_string());
             blobs.insert(hash, bytes);
         }
+        for file in corpus::TEST_FONTS {
+            let bytes = std::fs::read(fonts_dir.join(*file))?;
+            let hash = ResourceHash::of(&bytes);
+            let registered = fcx
+                .collection
+                .register_fonts(Blob::new(Arc::new(bytes.clone())), None);
+            let (family_id, _) = registered
+                .first()
+                .unwrap_or_else(|| panic!("font {file} registered no family"));
+            let name = fcx
+                .collection
+                .family_name(*family_id)
+                .unwrap_or_else(|| panic!("font {file} has no family name"));
+            families.insert(*file, name.to_string());
+            blobs.insert(hash, bytes);
+        }
         Ok(Self {
             fcx,
             lcx: LayoutContext::new(),
@@ -969,6 +985,161 @@ fn run() -> Result<(), SceneError> {
                 for run in &runs {
                     l.glyphs(run.clone());
                 }
+            },
+            blobs,
+        );
+    }
+
+    // ---- COLR test-font scenes ----------------------------------------------
+    //
+    // `CherenkovColrTest.ttf` (in `corpus::TEST_FONTS`) puts predictable
+    // COLRv1 paints on PUA codepoints; these scenes exercise transformed
+    // brushes, composite modes, clips, foreground brushes and a COLR v0
+    // record. The foreground paint is evaluated in font units, like the
+    // GPU and oracle backends bake it.
+    let colr_font = "CherenkovColrTest.ttf";
+
+    {
+        let text: String = (0xe000u32..=0xe008)
+            .map(|c| char::from_u32(c).unwrap())
+            .collect();
+        let runs = ctx.shape(colr_font, &text, 60.0, FontWeight::NORMAL, &solid(dark));
+        let blobs = font_blobs(&ctx, &[&runs]);
+        corpus.scene_with_blobs(
+            "colr-gradient-transform",
+            320,
+            200,
+            white,
+            |l| {
+                for run in &runs {
+                    l.glyphs(run.clone());
+                }
+            },
+            blobs,
+        );
+    }
+
+    {
+        let text: String = (0xe100u32..=0xe11b)
+            .map(|c| char::from_u32(c).unwrap())
+            .collect();
+        let runs = ctx.shape(colr_font, &text, 34.0, FontWeight::NORMAL, &solid(dark));
+        let blobs = font_blobs(&ctx, &[&runs]);
+        corpus.scene_with_blobs(
+            "colr-composite",
+            320,
+            160,
+            white,
+            |l| {
+                for run in &runs {
+                    l.glyphs(run.clone());
+                }
+            },
+            blobs,
+        );
+    }
+
+    {
+        let text = "\u{e200}\u{e201}\u{e400}\u{e500}\u{e600}";
+        let runs = ctx.shape(colr_font, text, 56.0, FontWeight::NORMAL, &solid(dark));
+        let blobs = font_blobs(&ctx, &[&runs]);
+        corpus.scene_with_blobs(
+            "colr-clip-nested",
+            320,
+            96,
+            white,
+            |l| {
+                for run in &runs {
+                    l.glyphs(run.clone());
+                }
+            },
+            blobs,
+        );
+    }
+
+    {
+        // The run paint is a gradient in font units: a horizontal
+        // red→blue ramp across the em.
+        let fg = Paint::Linear(LinearGradient {
+            start: Point::new(0.0, 450.0),
+            end: Point::new(1000.0, 450.0),
+            stops: stops2(),
+            extend: Extend::Pad,
+            interpolation: ColorSpace::Srgb,
+        });
+        let text = "\u{e300}\u{e301}\u{e302}\u{e303}";
+        let runs = ctx.shape(colr_font, text, 64.0, FontWeight::NORMAL, &fg);
+        let blobs = font_blobs(&ctx, &[&runs]);
+        corpus.scene_with_blobs(
+            "colr-foreground-gradient",
+            320,
+            80,
+            white,
+            |l| {
+                for run in &runs {
+                    l.glyphs(run.clone());
+                }
+            },
+            blobs,
+        );
+    }
+
+    {
+        // The run paint is the 8x8 checker image at 8 font units per
+        // tile: glyph U+E301 carries COLR alpha 0.4 over an image
+        // foreground, so it must read as 40% of the image scene.
+        let fg = Paint::Image(ImagePaint {
+            image: ResourceHash::of(&checker),
+            transform: Affine::scale(8.0),
+            extend_x: Extend::Repeat,
+            extend_y: Extend::Repeat,
+            sampling: Sampling::Bilinear,
+        });
+        let text = "\u{e300}\u{e301}";
+        let runs = ctx.shape(colr_font, text, 64.0, FontWeight::NORMAL, &fg);
+        let mut blobs = font_blobs(&ctx, &[&runs]);
+        blobs.push(checker.clone());
+        corpus.scene_with_blobs(
+            "colr-foreground-image",
+            320,
+            80,
+            white,
+            |l| {
+                for run in &runs {
+                    l.glyphs(run.clone());
+                }
+            },
+            blobs,
+        );
+    }
+
+    {
+        // A whole-run affine over the Nabla COLR text.
+        let runs = ctx.shape(
+            "Nabla.ttf",
+            corpus::COLR,
+            64.0,
+            FontWeight::NORMAL,
+            &solid(dark),
+        );
+        let blobs = font_blobs(&ctx, &[&runs]);
+        corpus.scene_with_blobs(
+            "colr-run-transform",
+            320,
+            160,
+            white,
+            |l| {
+                l.layer(|a| {
+                    a.transform(
+                        Affine::translate((40.0, 120.0))
+                            * Affine::rotate(-0.35)
+                            * Affine::skew(0.3, 0.0)
+                            * Affine::scale_non_uniform(1.2, 0.8),
+                    );
+                    for run in &runs {
+                        a.glyphs(run.clone());
+                    }
+                });
             },
             blobs,
         );

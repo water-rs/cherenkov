@@ -1,0 +1,112 @@
+{
+  "width": 320,
+  "height": 80,
+  "working_space": "linear-display-p3",
+  "clear": {
+    "space": "srgb",
+    "components": [
+      0.95,
+      0.95,
+      0.95,
+      1.0
+    ]
+  },
+  "features": [
+    {
+      "feature": "linear-gradient"
+    },
+    {
+      "feature": "glyphs"
+    },
+    {
+      "feature": "interpolation-space",
+      "value": "srgb"
+    }
+  ],
+  "root": {
+    "transform": [
+      1.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0
+    ],
+    "opacity": 1.0,
+    "blend": "normal",
+    "items": [
+      {
+        "draw": {
+          "glyphs": {
+            "font": "3bf0d895b69dcc4cf6f52c721847ff85e4e22d3604e1e4db2967269d07d9fb6c",
+            "font_index": 0,
+            "size": 64.0,
+            "normalized_coords": [],
+            "glyphs": [
+              {
+                "id": 45,
+                "x": 12.0,
+                "y": 69.600006
+              },
+              {
+                "id": 46,
+                "x": 76.0,
+                "y": 69.600006
+              },
+              {
+                "id": 47,
+                "x": 140.0,
+                "y": 69.600006
+              },
+              {
+                "id": 48,
+                "x": 204.0,
+                "y": 69.600006
+              }
+            ],
+            "paint": {
+              "linear": {
+                "start": {
+                  "x": 0.0,
+                  "y": 450.0
+                },
+                "end": {
+                  "x": 1000.0,
+                  "y": 450.0
+                },
+                "stops": [
+                  {
+                    "offset": 0.0,
+                    "color": {
+                      "space": "srgb",
+                      "components": [
+                        1.0,
+                        0.0,
+                        0.0,
+                        1.0
+                      ]
+                    }
+                  },
+                  {
+                    "offset": 1.0,
+                    "color": {
+                      "space": "srgb",
+                      "components": [
+                        0.0,
+                        0.0,
+                        1.0,
+                        1.0
+                      ]
+                    }
+                  }
+                ],
+                "extend": "pad",
+                "interpolation": "srgb"
+              }
+            }
+          }
+        }
+      }
+    ]
+  }
+}

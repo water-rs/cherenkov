@@ -330,6 +330,7 @@ dependencies = [
  "color",
  "filtrate-core",
  "kurbo",
+ "libm",
  "nami",
  "nami-core",
  "serde",

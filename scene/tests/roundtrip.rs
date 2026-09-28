@@ -160,18 +160,18 @@ fn present_headroom_roundtrip() {
     let json = serde_json::to_string_pretty(&scene).unwrap();
     assert!(!json.contains("present_headroom"), "{json}");
     scene.save(&dir).unwrap();
-    assert_eq!(Scene::load(&dir).unwrap().present_headroom, 1.0);
+    assert_eq!(Scene::load(&dir).unwrap(), scene);
 
     // A declared headroom serializes and loads back.
     let scene = Scene::builder(8, 8).present_headroom(4.0).build();
     let json = serde_json::to_string_pretty(&scene).unwrap();
     assert!(json.contains("\"present_headroom\": 4.0"), "{json}");
     scene.save(&dir).unwrap();
-    assert_eq!(Scene::load(&dir).unwrap().present_headroom, 4.0);
+    assert_eq!(Scene::load(&dir).unwrap(), scene);
 
     // A file carrying the field parses without a `Scene::load` too.
     let parsed: Scene = serde_json::from_str(&json).unwrap();
-    assert_eq!(parsed.present_headroom, 4.0);
+    assert_eq!(parsed, scene);
 
     let _ = std::fs::remove_dir_all(&dir);
 }

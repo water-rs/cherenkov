@@ -243,7 +243,8 @@ jobs:
           assert measured, 'no metrics JSON produced'
           for f in files:
               d = json.load(open(f))
-              assert d.get('present'), f'{f} lacks the presentation record'
+              # An unsupported scene is presented nowhere; it names the missing feature instead.
+              assert d.get('present') or d.get('unsupported'), f'{f} lacks the presentation record'
           print(f'{len(files)} presentation reports ({len(measured)} measured)')
           PY
 

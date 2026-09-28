@@ -1408,8 +1408,11 @@ impl Engine for Cherenkov {
                     Some(textures.try_recv().map_err(|e| {
                         BenchError::Engine(format!("cherenkov texture target: {e}"))
                     })?);
-                present.destination =
-                    Some(present_target(&self.shared_device.device, size, present.kind));
+                present.destination = Some(present_target(
+                    &self.shared_device.device,
+                    size,
+                    present.kind,
+                ));
                 surface
             }
             None => self

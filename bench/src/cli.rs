@@ -574,6 +574,14 @@ fn scene_dirs(scene: Option<&Path>, corpus: Option<&Path>) -> Result<Vec<PathBuf
     Ok(dirs)
 }
 
+/// The per-scene `render` report file name; `present` kinds carry the kind
+/// in the name so they do not collide with the normal corpus.
+fn render_report_name(engine: &str, present: Option<crate::PresentKind>, dir: &Path) -> String {
+    let scene = dir.file_name().unwrap_or_default().to_string_lossy();
+    let kind = present.map_or_else(String::new, |k| format!("{}-", k.name()));
+    format!("render-{engine}-{kind}{scene}.json")
+}
+
 /// Rendered image + heatmap, written next to the metrics JSON.
 struct RenderOutput {
     /// The metrics report.
@@ -594,7 +602,8 @@ fn render_scene(
     let blobs = convert::load_blobs(&scene, dir)?;
     let renderer = Renderer::new(scene.width as usize, scene.height as usize);
     // With `--present` the reference is the oracle's `f64` image through
-    // the matching presentation function, lifted back into the working
+    // the matching presentation function — quantized to the destination's
+    // unorm-8 storage for the sRGB kinds — lifted back into the working
     // space where the output was encoded.
     let reference = match present {
         None => renderer.render(&scene, dir)?,
@@ -612,10 +621,14 @@ fn render_scene(
             let working = match kind {
                 crate::PresentKind::LinearP3 => presented,
                 crate::PresentKind::SrgbHw | crate::PresentKind::SrgbShader => {
+                    // The ideal presented image is what the u8 destination
+                    // stores: quantize the encoded channels so the metric
+                    // measures the pass, not the format's floor.
+                    let quantized = cherenkov_oracle::present::quantize_unorm8(&presented);
                     cherenkov_oracle::Image {
-                        width: presented.width,
-                        height: presented.height,
-                        pixels: presented
+                        width: quantized.width,
+                        height: quantized.height,
+                        pixels: quantized
                             .pixels
                             .iter()
                             .map(|&p| cherenkov_oracle::present::presented_srgb_to_working(p))

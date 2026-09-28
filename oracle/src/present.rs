@@ -55,6 +55,26 @@ pub fn present_linear_p3(headroom: f64, image: &Image) -> Image {
     image.clone()
 }
 
+/// Quantizes a presented image to the unorm-8 steps a destination texture
+/// stores.
+///
+/// `round(c * 255) / 255` per channel — the value an ideal presenter
+/// stores. Comparing a read-back u8 output against the quantized reference
+/// removes the format's quantization floor from the metric, so what remains
+/// is the presentation pass's own error.
+#[must_use]
+pub fn quantize_unorm8(image: &Image) -> Image {
+    Image {
+        width: image.width,
+        height: image.height,
+        pixels: image
+            .pixels
+            .iter()
+            .map(|p| p.map(|c| (c * 255.0).round() / 255.0))
+            .collect(),
+    }
+}
+
 /// Lifts one premultiplied encoded-sRGB presented pixel back into the
 /// working space.
 ///
@@ -156,6 +176,18 @@ mod tests {
         );
         // Transparent pixels present as transparent black.
         assert_close(px(&present_srgb(1.0, &img([0.0, 0.0, 0.0, 0.0]))), [0.0; 4]);
+    }
+
+    #[test]
+    fn unorm8_quantization_rounds_to_store() {
+        // Round-to-nearest on the unorm-8 grid: what the destination
+        // format stores.
+        let image = img([0.4_f64 / 255.0, 0.6 / 255.0, 0.5, 1.0]);
+        let q = px(&quantize_unorm8(&image));
+        assert_eq!(q[0].to_bits(), 0.0f64.to_bits());
+        assert_eq!(q[1].to_bits(), (1.0_f64 / 255.0).to_bits());
+        assert_eq!(q[2].to_bits(), (128.0_f64 / 255.0).to_bits());
+        assert_eq!(q[3].to_bits(), 1.0f64.to_bits());
     }
 
     #[test]

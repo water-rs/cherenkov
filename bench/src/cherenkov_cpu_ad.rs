@@ -20,10 +20,11 @@ use cherenkov_cpu::{Raster, RasterConfig};
 use cherenkov_oracle::color::to_working;
 use cherenkov_oracle::present::presented_srgb_to_working;
 use cherenkov_scene::{
-    BlendMode, ColorSpace, Draw as SceneDraw, Extend, Feature, GlyphRun as SceneGlyphRun,
-    ImageColorSpace, ImageEncoding, Item, Layer as SceneLayer, Paint as ScenePaint, ResourceHash,
-    Shape,
+    BlendMode, ColorSpace, Draw as SceneDraw, Extend, Feature, FilterBlend,
+    GlyphRun as SceneGlyphRun, ImageColorSpace, ImageEncoding, Item, Layer as SceneLayer,
+    LayerFilter, Paint as ScenePaint, ResourceHash, Shape,
 };
+use filtrate::{FilterExt, FilterImage, filters};
 use kurbo::{Affine, BezPath, Circle, Ellipse, Line, Rect, RoundedRect, Vec2};
 
 use crate::convert::{self, Blobs};
@@ -381,6 +382,8 @@ struct PrepLayer {
     opacity: f64,
     /// Blend onto the parent.
     blend: cherenkov::BlendMode,
+    /// Registered layer filter.
+    filter: Option<cherenkov::Filter>,
     /// Scroll offset applied to content and children.
     scroll_offset: Vec2,
     /// The layer's own content — only when every draw precedes every child.
@@ -419,6 +422,8 @@ pub struct Cherenkov {
     fonts: HashMap<(ResourceHash, u32), cherenkov::Font>,
     images: HashMap<(ResourceHash, ImageEncoding), cherenkov::ImageId>,
     image_handles: Vec<ImageHandle>,
+    /// Registered filters referenced by prepared layers.
+    filter_handles: Vec<cherenkov::Filter>,
     /// Layers holding recorded content, in draw order.
     content_layers: Vec<ContentLayer>,
     /// Whether any layer carries a `motion`.
@@ -467,6 +472,7 @@ fn cherenkov_features() -> Vec<Feature> {
         Feature::ExtendNone,
         Feature::Clip,
         Feature::Opacity,
+        Feature::Filter,
         Feature::Shadow,
         Feature::Glyphs,
         Feature::FontVariations,
@@ -533,7 +539,7 @@ fn unsupported_feature(u: &str) -> Feature {
         "sweep-gradient" => Feature::SweepGradient,
         "mesh-gradient" | "image" | "shader-paint" => Feature::Image,
         "blend-mode" | "blend-space" | "backdrop" => Feature::Blend(BlendMode::Normal),
-        "filter" => Feature::Opacity,
+        "filter" => Feature::Filter,
         "glyph-stroke" | "color-font" => Feature::Glyphs,
         "glyph-transform" => Feature::GlyphTransform,
         "shadow" => Feature::Shadow,
@@ -950,10 +956,70 @@ fn register_images(
     Ok(())
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "scene filter parameters use f64; filtrate parameters use f32"
+)]
+fn register_filter(
+    engine: &CpuEngine<Raster>,
+    filter: &LayerFilter,
+    blobs: &Blobs,
+) -> Result<cherenkov::Filter, BenchError> {
+    Ok(match filter {
+        LayerFilter::ColorMatrix { matrix } => {
+            engine.filter(filters::ColorMatrix(matrix.map(|value| value as f32)))
+        }
+        LayerFilter::ColorMatrixChain { first, second } => engine.filter(
+            filters::ColorMatrix(first.map(|value| value as f32))
+                .then(filters::ColorMatrix(second.map(|value| value as f32))),
+        ),
+        LayerFilter::GaussianBlur { sigma } => engine.filter(filters::GaussianBlur(*sigma as f32)),
+        LayerFilter::BoxBlur { radius } => engine.filter(filters::Blur(*radius as f32)),
+        LayerFilter::BlendImage {
+            image,
+            amount,
+            mode,
+        } => {
+            let blob = blobs
+                .get(image)
+                .ok_or(cherenkov_scene::SceneError::MissingResource(*image))?;
+            let (width, height, rgba) = cherenkov_oracle::image::decode_png_rgba8(blob)
+                .map_err(|e| BenchError::Engine(format!("cherenkov filter image decode: {e}")))?;
+            engine.filter(filters::BlendWithImage {
+                image: FilterImage::from_rgba8(width, height, rgba),
+                amount: *amount as f32,
+                mode: filter_blend(*mode),
+            })
+        }
+    })
+}
+
+const fn filter_blend(mode: FilterBlend) -> filters::BlendMode {
+    match mode {
+        FilterBlend::Normal => filters::BlendMode::Normal,
+        FilterBlend::Multiply => filters::BlendMode::Multiply,
+        FilterBlend::Screen => filters::BlendMode::Screen,
+        FilterBlend::Overlay => filters::BlendMode::Overlay,
+        FilterBlend::Darken => filters::BlendMode::Darken,
+        FilterBlend::Lighten => filters::BlendMode::Lighten,
+        FilterBlend::SoftLight => filters::BlendMode::SoftLight,
+        FilterBlend::HardLight => filters::BlendMode::HardLight,
+        FilterBlend::Difference => filters::BlendMode::Difference,
+        FilterBlend::Exclusion => filters::BlendMode::Exclusion,
+        FilterBlend::ColorDodge => filters::BlendMode::ColorDodge,
+        FilterBlend::ColorBurn => filters::BlendMode::ColorBurn,
+        FilterBlend::Hue => filters::BlendMode::Hue,
+        FilterBlend::Saturation => filters::BlendMode::Saturation,
+        FilterBlend::Color => filters::BlendMode::Color,
+        FilterBlend::Luminosity => filters::BlendMode::Luminosity,
+    }
+}
+
 /// Lowers a scene layer: one engine layer per scene layer, plus one per
 /// draw run that must interleave with child layers.
 fn prep_layer(
     layer: &SceneLayer,
+    engine: &CpuEngine<Raster>,
     fonts: &HashMap<(ResourceHash, u32), cherenkov::Font>,
     images: &HashMap<(ResourceHash, ImageEncoding), cherenkov::ImageId>,
     blobs: &Blobs,
@@ -975,6 +1041,11 @@ fn prep_layer(
             .map(|s| shape_kind(s, cherenkov::FillRule::NonZero)),
         opacity: layer.opacity,
         blend: engine_blend(layer.blend),
+        filter: layer
+            .filter
+            .as_deref()
+            .map(|filter| register_filter(engine, filter, blobs))
+            .transpose()?,
         own: ContentRun {
             ops: Vec::new(),
             live: Vec::new(),
@@ -997,7 +1068,7 @@ fn prep_layer(
                     }
                 }
                 Item::Layer(l) => prep.items.push(PrepItem::Layer(Box::new(prep_layer(
-                    l, fonts, images, blobs,
+                    l, engine, fonts, images, blobs,
                 )?))),
             }
         }
@@ -1027,7 +1098,7 @@ fn prep_layer(
                         )));
                     }
                     prep.items.push(PrepItem::Layer(Box::new(prep_layer(
-                        l, fonts, images, blobs,
+                        l, engine, fonts, images, blobs,
                     )?)));
                 }
             }
@@ -1092,6 +1163,7 @@ fn build_layer(
     parent: Option<&CpuLayer>,
     prep: PrepLayer,
     content_layers: &mut Vec<ContentLayer>,
+    filter_handles: &mut Vec<cherenkov::Filter>,
 ) {
     let owned = parent.map(|_| surface.layer());
     let layer = owned.as_ref().unwrap_or_else(|| surface.root());
@@ -1101,6 +1173,9 @@ fn build_layer(
         edit.scroll_offset(prep.scroll_offset);
         edit.opacity(prep.opacity as f32);
         edit.blend(prep.blend);
+        if let Some(filter) = &prep.filter {
+            edit.filter(filter);
+        }
         if let Some(clip) = &prep.clip {
             clip_shape(edit, clip);
         }
@@ -1120,8 +1195,13 @@ fn build_layer(
                     motion: None,
                 });
             }
-            PrepItem::Layer(p) => build_layer(surface, tx, Some(layer), *p, content_layers),
+            PrepItem::Layer(p) => {
+                build_layer(surface, tx, Some(layer), *p, content_layers, filter_handles);
+            }
         }
+    }
+    if let Some(filter) = prep.filter {
+        filter_handles.push(filter);
     }
     content_layers.push(ContentLayer {
         layer: owned,
@@ -1177,6 +1257,7 @@ impl Cherenkov {
             fonts: HashMap::new(),
             images: HashMap::new(),
             image_handles: Vec::new(),
+            filter_handles: Vec::new(),
             content_layers: Vec::new(),
             has_motion: false,
             motion_committed: false,
@@ -1229,17 +1310,32 @@ impl Engine for Cherenkov {
             &input.scene.root,
             input.blobs,
         )?;
-        let prep = prep_layer(&input.scene.root, &self.fonts, &self.images, input.blobs)?;
+        let prep = prep_layer(
+            &input.scene.root,
+            &self.engine,
+            &self.fonts,
+            &self.images,
+            input.blobs,
+        )?;
         self.content_layers.clear();
         let mut content_layers = Vec::new();
+        let mut filter_handles = Vec::new();
         surface.update(|tx| {
-            build_layer(&surface, tx, None, prep, &mut content_layers);
+            build_layer(
+                &surface,
+                tx,
+                None,
+                prep,
+                &mut content_layers,
+                &mut filter_handles,
+            );
         });
         self.has_motion = content_layers.iter().any(|c| c.motion.is_some());
         self.motion_committed = false;
         self.has_live = content_layers.iter().any(|c| !c.live.is_empty());
         self.frame = 0;
         self.content_layers = content_layers;
+        self.filter_handles = filter_handles;
         self.surface = Some(surface);
         Ok(())
     }

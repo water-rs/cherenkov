@@ -26,7 +26,7 @@ cherenkov-vello = ["dep:cherenkov", "dep:cherenkov-vello", "dep:wgpu", "dep:ash"
 skia = ["dep:skia-safe", "dep:ash", "dep:skia-bindings", "skia-safe/vulkan", "skia-safe/ganesh"]
 skia-metal = ["dep:skia-safe", "dep:objc2", "dep:objc2-metal", "dep:skia-bindings", "skia-safe/metal", "skia-safe/graphite"]
 cherenkov = ["dep:cherenkov", "dep:cherenkov-gpu", "dep:wgpu", "dep:ash", "dep:half", "dep:filtrate"]
-cherenkov-cpu = ["dep:cherenkov", "dep:cherenkov-cpu"]
+cherenkov-cpu = ["dep:cherenkov", "dep:cherenkov-cpu", "dep:filtrate"]
 
 [dependencies]
 cherenkov = { path = "..", optional = true }

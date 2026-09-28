@@ -19,7 +19,6 @@ mod paint;
 mod prepared;
 pub mod present;
 mod raster;
-mod winding;
 
 use std::collections::HashMap;
 

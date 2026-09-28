@@ -1250,6 +1250,8 @@ impl<'a> Lowering<'a> {
                 if node.filter.is_some()
                     || node.opacity < 1.0
                     || node.blend != cherenkov::BlendMode::Normal
+                    // The root already renders into the surface target.
+                    || (id != tree.root() && node.blends_within())
                 {
                     let inner = s.clip;
                     s.isolate(

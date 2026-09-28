@@ -447,7 +447,11 @@ impl<'a> Lowering<'a> {
         let content_space = saved * node.content_transform();
         let result = self.with_clip(node.clip.as_ref(), |s| {
             s.transform = content_space;
-            if node.opacity < 1.0 || node.blend != BlendMode::Normal {
+            if node.opacity < 1.0
+                || node.blend != BlendMode::Normal
+                // The root already renders into the surface target.
+                || (id != tree.root() && node.blends_within())
+            {
                 let outer = s.clip.clone();
                 s.isolate(
                     node.opacity,

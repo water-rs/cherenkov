@@ -253,8 +253,7 @@ impl Entry {
         }
         // Stale sizes go first so the lookup below cannot pick them up
         // and the cap stays a bound on live sizes only.
-        self.io
-            .retain(|(_, targets)| targets.last_used >= sequence);
+        self.io.retain(|(_, targets)| targets.last_used >= sequence);
         self.io
             .iter()
             .position(|(io_size, _)| *io_size == size)

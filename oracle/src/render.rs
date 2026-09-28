@@ -345,20 +345,19 @@ impl Renderer {
         // it the destination is untouched, and the clip edge is antialiased
         // between the backdrop and the blended result. Unclipped it covers
         // the whole parent.
-        let clip_cov: Option<Vec<f64>> =
-            if Self::is_destructive(mode) && !child_clips.is_empty() {
-                let mut segs = child_clips[0].clone();
-                for c in &child_clips[1..] {
-                    segs = intersect_edges(&segs, FillRule::NonZero, c);
-                }
-                let mut cov = Coverage::new(self.width, self.height);
-                for &s in &segs {
-                    cov.add_line(s.0, s.1, s.2, s.3);
-                }
-                Some(cov.finish(FillRule::NonZero))
-            } else {
-                None
-            };
+        let clip_cov: Option<Vec<f64>> = if Self::is_destructive(mode) && !child_clips.is_empty() {
+            let mut segs = child_clips[0].clone();
+            for c in &child_clips[1..] {
+                segs = intersect_edges(&segs, FillRule::NonZero, c);
+            }
+            let mut cov = Coverage::new(self.width, self.height);
+            for &s in &segs {
+                cov.add_line(s.0, s.1, s.2, s.3);
+            }
+            Some(cov.finish(FillRule::NonZero))
+        } else {
+            None
+        };
 
         for (i, (dst, &src)) in top(chain).pixels.iter_mut().zip(&sub.pixels).enumerate() {
             let s = src.map(|v| v * opacity);

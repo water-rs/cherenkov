@@ -277,8 +277,8 @@ fn two_members_share_one_capture() -> Result<(), Box<dyn std::error::Error>> {
 /// composited over it — the member sees what painted earlier inside the
 /// layer and nothing painted after it on the surface.
 #[test]
-fn member_inside_blended_descendant_layer_sees_the_layer_contents(
-) -> Result<(), Box<dyn std::error::Error>> {
+fn member_inside_blended_descendant_layer_sees_the_layer_contents()
+-> Result<(), Box<dyn std::error::Error>> {
     let engine = Engine::<Gpu>::new(GpuConfig::default())?;
     let surface = engine.surface(Offscreen::new((32, 32), OffscreenFormat::LinearF16))?;
     let group = surface.backdrop_group_unfiltered();

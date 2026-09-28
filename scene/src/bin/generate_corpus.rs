@@ -855,7 +855,34 @@ impl Corpus {
         f: impl FnOnce(&mut LayerBuilder),
         blobs: Vec<Vec<u8>>,
     ) {
-        let mut builder = Scene::builder(w, h).clear(clear);
+        self.scene_headroom_blobs(name, w, h, clear, 1.0, f, blobs);
+    }
+
+    /// `w`x`h` scene via `f` that asks `render --present` to tone-map to
+    /// the display `headroom` (`Scene::present_headroom`, #97).
+    fn scene_headroom(
+        &mut self,
+        name: impl Into<String>,
+        w: u32,
+        h: u32,
+        clear: Color,
+        headroom: f64,
+        f: impl FnOnce(&mut LayerBuilder),
+    ) {
+        self.scene_headroom_blobs(name, w, h, clear, headroom, f, Vec::new());
+    }
+
+    fn scene_headroom_blobs(
+        &mut self,
+        name: impl Into<String>,
+        w: u32,
+        h: u32,
+        clear: Color,
+        headroom: f64,
+        f: impl FnOnce(&mut LayerBuilder),
+        blobs: Vec<Vec<u8>>,
+    ) {
+        let mut builder = Scene::builder(w, h).clear(clear).present_headroom(headroom);
         {
             let mut root = builder.root();
             f(&mut root);
@@ -2407,6 +2434,98 @@ fn run() -> Result<(), SceneError> {
         },
         vec![f16_img.clone()],
     );
+
+    // HDR presentation scenes for the #97 tone map: identical content at
+    // declared display headrooms 1, 2 and 4 — an 0..8x SDR-white ramp, nine
+    // saturated P3 highlight swatches, and the f16 radial HDR image.
+    for (hname, headroom) in [("h1", 1.0_f64), ("h2", 2.0), ("h4", 4.0)] {
+        corpus.scene_headroom(
+            format!("hdr-gradient-{hname}"),
+            128,
+            128,
+            white,
+            headroom,
+            |l| {
+                for (top, to) in [
+                    (8.0, hdr(8.0, 8.0, 8.0)),
+                    (48.0, hdr(8.0, 0.0, 0.0)),
+                    (88.0, hdr(8.0, 3.0, 0.3)),
+                ] {
+                    l.fill(
+                        Shape::rect(8.0, top, 112.0, 32.0),
+                        Paint::Linear(LinearGradient {
+                            start: Point::new(8.0, 0.0),
+                            end: Point::new(120.0, 0.0),
+                            stops: vec![
+                                GradientStop {
+                                    offset: 0.0,
+                                    color: hdr(0.0, 0.0, 0.0),
+                                },
+                                GradientStop {
+                                    offset: 1.0,
+                                    color: to,
+                                },
+                            ],
+                            extend: Extend::Pad,
+                            interpolation: ColorSpace::LinearP3,
+                        }),
+                    );
+                }
+            },
+        );
+        corpus.scene_headroom(
+            format!("hdr-p3-highlights-{hname}"),
+            96,
+            96,
+            white,
+            headroom,
+            |l| {
+                l.fill(
+                    Shape::rect(0.0, 0.0, 96.0, 96.0),
+                    solid(hdr(0.02, 0.02, 0.04)),
+                );
+                for (i, swatch) in [
+                    hdr(4.0, 0.0, 0.0),
+                    hdr(0.0, 4.0, 0.0),
+                    hdr(0.0, 0.0, 4.0),
+                    hdr(4.0, 4.0, 0.0),
+                    hdr(0.0, 4.0, 4.0),
+                    hdr(4.0, 0.0, 4.0),
+                    hdr(4.0, 2.0, 0.5),
+                    hdr(8.0, 4.0, 1.0),
+                    hdr(8.0, 8.0, 8.0),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let x = 4.0 + 32.0 * f64::from(u32::try_from(i % 3).unwrap());
+                    let y = 4.0 + 32.0 * f64::from(u32::try_from(i / 3).unwrap());
+                    l.fill(Shape::rect(x, y, 28.0, 28.0), solid(swatch));
+                }
+            },
+        );
+        corpus.scene_headroom_blobs(
+            format!("hdr-image-f16-{hname}"),
+            128,
+            128,
+            white,
+            headroom,
+            |l| {
+                l.fill(
+                    Shape::rect(8.0, 8.0, 112.0, 112.0),
+                    Paint::Image(ImagePaint {
+                        image: ResourceHash::of(&f16_img),
+                        encoding: f16_encoding,
+                        transform: Affine::translate((8.0, 8.0)) * Affine::scale(3.5),
+                        extend_x: Extend::Pad,
+                        extend_y: Extend::Pad,
+                        sampling: Sampling::Bilinear,
+                    }),
+                );
+            },
+            vec![f16_img.clone()],
+        );
+    }
 
     // Blend modes over P3 and HDR content, same geometry as `blend-*`.
     for mode in BlendMode::ALL {

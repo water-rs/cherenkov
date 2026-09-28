@@ -353,9 +353,87 @@ fn coverage_dir(d: f32, v: vec2<f32>, scale: f32, ramp: bool, radius: f32) -> f3
     return area;
 }
 
+// Exact area of the unit device pixel (the square of side 1 centred on
+// the fragment) inside the two half-planes `a.x + scale·dot(v1, u) <= 0`
+// and `a.y + scale·dot(v2, u) <= 0`, `u` the device offset from the pixel
+// centre. Sutherland–Hodgman: clip the 4-vertex square against line 1,
+// then line 2, and take the shoelace area. Where a sharp corner (the two
+// folded edges meeting at a point) lies inside the pixel, neither
+// half-plane's linear ramp nor the exterior Euclidean ramp is the truth:
+// the truth is the area inside both.
+fn corner_coverage(a: vec2<f32>, v1: vec2<f32>, v2: vec2<f32>, scale: f32) -> f32 {
+    var poly = array<vec2<f32>, 8>(
+        vec2<f32>(-0.5, -0.5),
+        vec2<f32>(0.5, -0.5),
+        vec2<f32>(0.5, 0.5),
+        vec2<f32>(-0.5, 0.5),
+        vec2<f32>(0.0, 0.0),
+        vec2<f32>(0.0, 0.0),
+        vec2<f32>(0.0, 0.0),
+        vec2<f32>(0.0, 0.0),
+    );
+    var n = 4u;
+    for (var c = 0u; c < 2u; c = c + 1u) {
+        let v = select(v1, v2, c == 1u);
+        let off = select(a.x, a.y, c == 1u);
+        var clipped: array<vec2<f32>, 8>;
+        var m_out = 0u;
+        var prev = poly[n - 1u];
+        var pd = off + scale * dot(v, prev);
+        for (var i = 0u; i < n; i = i + 1u) {
+            let cur = poly[i];
+            let cd = off + scale * dot(v, cur);
+            if (cd <= 0.0) != (pd <= 0.0) {
+                let t = pd / (pd - cd);
+                clipped[m_out] = prev + t * (cur - prev);
+                m_out = m_out + 1u;
+            }
+            if cd <= 0.0 {
+                clipped[m_out] = cur;
+                m_out = m_out + 1u;
+            }
+            prev = cur;
+            pd = cd;
+        }
+        n = m_out;
+        poly = clipped;
+    }
+    var area = 0.0;
+    for (var i = 0u; i < n; i = i + 1u) {
+        let j = select(i + 1u, 0u, i + 1u == n);
+        area = area + poly[i].x * poly[j].y - poly[j].x * poly[i].y;
+    }
+    return clamp(abs(area) * 0.5, 0.0, 1.0);
+}
+
 // Coverage of the shape `s` at local point `p`, `m` mapping local to device.
 fn shape_coverage(s: Shape, p: vec2<f32>, m: array<vec4<f32>, 2>) -> f32 {
     let g = sdf_grad(s, p);
+    // A sharp corner inside this pixel: the exact area inside both
+    // half-planes. `a`, `sgn`, and the quadrant radius mirror `sdf_grad`;
+    // the strict `<` keeps a corner exactly on a pixel boundary on the
+    // old path.
+    let sgn = select(vec2<f32>(-1.0), vec2<f32>(1.0), p >= vec2<f32>(0.0));
+    let right = p.x > 0.0;
+    let bottom = p.y > 0.0;
+    let r = select(
+        select(s.radii.x, s.radii.w, bottom),
+        select(s.radii.y, s.radii.z, bottom),
+        right,
+    );
+    let rx = max(r, 0.0);
+    let ry = rx * s.aspect;
+    let a = abs(p) - s.half;
+    if rx <= 0.0 || ry <= 0.0 {
+        let scale = device_grad_scale(m);
+        let v1 = device_grad_vec(m, vec2<f32>(sgn.x, 0.0));
+        let v2 = device_grad_vec(m, vec2<f32>(0.0, sgn.y));
+        let h1 = 0.5 * scale * (abs(v1.x) + abs(v1.y));
+        let h2 = 0.5 * scale * (abs(v2.x) + abs(v2.y));
+        if abs(a.x) < h1 && abs(a.y) < h2 {
+            return corner_coverage(a, v1, v2, scale);
+        }
+    }
     return coverage_dir(
         sdf(s, p),
         device_grad_vec(m, g.xy),

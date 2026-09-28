@@ -35,6 +35,7 @@ const INTERP_SRGB: u32 = 1u;
 const FLAG_HAS_CLIP: u32 = 1u;
 const FLAG_HAS_INNER: u32 = 2u;
 const FLAG_HAS_MASK: u32 = 4u;      // clip coverage x atlas mask cell
+const FLAG_MASK_TEXTURE: u32 = 8u;  // mask sampled from `mask_tex`, not the atlas
 
 // The Rust side prepends `const VARIANT: u32 = <n>u;` when building each
 // module; the file stays compilable standalone.
@@ -104,6 +105,8 @@ struct Globals {
 // The blend backdrop: a copy of the target's region, sampled like `source`.
 @group(1) @binding(1) var backdrop: texture_2d<f32>;
 @group(1) @binding(2) var image_tex: texture_2d<f32>;
+// A clip mask too large for the atlas, on its own R8Unorm texture.
+@group(1) @binding(3) var mask_tex: texture_2d<f32>;
 
 struct VsOut {
     @builtin(position) position: vec4<f32>,
@@ -768,7 +771,13 @@ fn fs_full(in: VsOut) -> vec4<f32> {
         let mp = floor(in.pixel) - in.params.zw;
         let msize = vec2<f32>(instances[i].clip.aspect, instances[i].clip.exponent);
         let inside = all(mp >= vec2<f32>(0.0)) && all(mp < msize);
-        cov *= select(0.0, textureLoad(atlas, vec2<i32>(mp) + vec2<i32>(instances[i].uv.zw), 0).r, inside);
+        var m: f32;
+        if (flags & FLAG_MASK_TEXTURE) != 0u {
+            m = textureLoad(mask_tex, vec2<i32>(mp), 0).r;
+        } else {
+            m = textureLoad(atlas, vec2<i32>(mp) + vec2<i32>(instances[i].uv.zw), 0).r;
+        }
+        cov *= select(0.0, m, inside);
     }
     cov = clamp(cov, 0.0, 1.0) * in.params.y;
     // A blended composite carries its mode in meta_.w bits 16-23: sample the

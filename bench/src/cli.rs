@@ -12,6 +12,16 @@
 //!   running flat out; `--energy` brackets the window with the
 //!   platform's power meter (Android ODPM rails, root via `su -c`;
 //!   macOS `sudo -n powermetrics`) and reports joules per frame.
+//!   `--native WxH` renders into a `W`×`H` surface — the device's own
+//!   resolution — with the scene drawn under the uniform scale
+//!   `W / scene_width`, like a device pixel ratio.
+//! - `capacity --engine E [--engine E2 ...] --corpus scenes/perf
+//!   --budget-ms 8.333 --out-dir DIR` sweeps each perf scene's load:
+//!   the draw list is repeated `k` times (`transform::repeated`),
+//!   doubling `k` per interleaved engine round until p99 frame time
+//!   exceeds the budget, then binary-searching the largest `k` within
+//!   it. The report records each engine's max sustained `k`, the p99
+//!   at `k` and at `k + 1`.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -24,11 +34,13 @@ use std::time::{Duration, Instant};
 use crate::convert;
 use crate::memory::{MemoryReport, MemorySnapshot, SampleDetail};
 use crate::report::{
-    CpuUse, FrameSample, MeasureReport, Pacing, PassPercentiles, Percentiles, PhasePercentiles,
-    Placement, RenderReport, UnsupportedReport, percentiles,
+    CapacityProbe, CapacityReport, CapacityResult, CpuUse, FrameSample, MeasureReport,
+    NativeResolution, Pacing, PassPercentiles, Percentiles, PhasePercentiles, Placement,
+    RenderReport, UnsupportedReport, percentiles,
 };
 use crate::{
-    BenchError, EncodeInput, Engine, affinity, conditions, create_engine, energy, engine_names,
+    BenchError, DeviceInfo, EncodeInput, Engine, affinity, conditions, create_engine, energy,
+    engine_names, transform,
 };
 use cherenkov_oracle::{F32Image, Renderer, metrics};
 use cherenkov_scene::Scene;
@@ -106,6 +118,62 @@ enum Sub {
         /// reporting nothing.
         #[arg(long)]
         energy: bool,
+        /// Render at the device's native resolution instead of the
+        /// scene's own size: the engine draws into a `WxH` surface —
+        /// the value a device host's window supplies, given here for an
+        /// offscreen run — with the scene under the uniform scale
+        /// `W / scene_width`, like a device pixel ratio. Pair with
+        /// `--rate` to pace at the panel's refresh (e.g. `--native
+        /// 2752x2064 --rate 120` for an iPad Pro).
+        #[arg(long, value_name = "WxH")]
+        native: Option<String>,
+    },
+    /// Sweep scene load to find each engine's sustained capacity.
+    ///
+    /// The draw list is repeated `k` times, doubling `k` until a probe's
+    /// p99 frame time exceeds `--budget-ms`, then binary-searching the
+    /// largest `k` that stays within it. Every probe is one interleaved
+    /// round across the given engines, in `--engine` order, with the
+    /// same warmup and frame counts as `measure`.
+    Capacity {
+        /// Adapter key; repeat for each engine in the round.
+        #[arg(long, required = true)]
+        engine: Vec<String>,
+        /// One scene directory.
+        #[arg(long, conflicts_with = "corpus", required_unless_present = "corpus")]
+        scene: Option<PathBuf>,
+        /// Corpus directory — typically `scenes/perf`.
+        #[arg(long)]
+        corpus: Option<PathBuf>,
+        /// Measured frame count per probe (after warmup).
+        #[arg(long, default_value_t = 60)]
+        frames: u32,
+        /// Warmup frames discarded before each probe's measurement.
+        #[arg(long, default_value_t = 5)]
+        warmup: u32,
+        /// Frame-time budget in milliseconds a probe must satisfy: the
+        /// 120 fps budget is 8.333 ms at p99.
+        #[arg(long, default_value_t = 8.333)]
+        budget_ms: f64,
+        /// Largest repetition factor probed; an engine still within
+        /// budget at `max_k` is reported saturated rather than swept
+        /// further.
+        #[arg(long, default_value_t = 1024)]
+        max_k: u32,
+        /// Report JSON path (with `--scene`).
+        #[arg(long, conflicts_with = "out_dir", required_unless_present = "out_dir")]
+        out: Option<PathBuf>,
+        /// Output directory (with `--corpus`).
+        #[arg(long)]
+        out_dir: Option<PathBuf>,
+        /// Pin the measurement to these CPUs (see `measure --cpu`);
+        /// Linux and Android only.
+        #[arg(long, value_name = "LIST")]
+        cpu: Option<String>,
+        /// Probe at a `WxH` native surface size rather than the scene's
+        /// own (see `measure --native`).
+        #[arg(long, value_name = "WxH")]
+        native: Option<String>,
     },
     /// List compiled-in adapter keys.
     Engines,
@@ -200,52 +268,13 @@ fn run(cli: Cli) -> Result<(), BenchError> {
             corpus,
             out,
             out_dir,
-        } => {
-            let mut engine = create_engine(&engine)?;
-            let idle_memory = MemorySnapshot::capture(engine.memory(), SampleDetail::Full);
-            for dir in scene_dirs(scene.as_deref(), corpus.as_deref())? {
-                let out_path = match (&out, &out_dir) {
-                    (Some(o), None) => o.clone(),
-                    (None, Some(d)) => d.join(format!(
-                        "render-{}-{}.json",
-                        engine.info().name,
-                        dir.file_name().unwrap_or_default().to_string_lossy()
-                    )),
-                    _ => return Err(BenchError::Engine("--out or --out-dir required".into())),
-                };
-                match render_scene(&mut *engine, &dir, idle_memory.clone()) {
-                    Ok(rendered) => {
-                        write_render(&rendered, &out_path)?;
-                        tracing::info!(
-                            scene = %dir.display(),
-                            flip_mean = rendered.report.metrics.flip_mean,
-                            flip_max = rendered.report.metrics.flip_max,
-                            max_local_error = rendered.report.metrics.max_local_error,
-                            out = %out_path.display(),
-                            "render"
-                        );
-                    }
-                    Err(BenchError::Unsupported { feature, api, .. }) => {
-                        write_unsupported(
-                            &*engine,
-                            &dir,
-                            feature.clone(),
-                            api,
-                            idle_memory.clone(),
-                            &out_path,
-                        )?;
-                        tracing::warn!(
-                            scene = %dir.display(),
-                            ?feature,
-                            out = %out_path.display(),
-                            "unsupported"
-                        );
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-            Ok(())
-        }
+        } => render_cmd(
+            &engine,
+            scene.as_deref(),
+            corpus.as_deref(),
+            out.as_deref(),
+            out_dir.as_deref(),
+        ),
         Sub::Measure {
             engine,
             scene,
@@ -257,6 +286,7 @@ fn run(cli: Cli) -> Result<(), BenchError> {
             cpu,
             rate,
             energy,
+            native,
         } => measure_cmd(
             &engine,
             MeasureOpts {
@@ -269,6 +299,34 @@ fn run(cli: Cli) -> Result<(), BenchError> {
                 cpu: cpu.as_deref(),
                 rate,
                 energy,
+                native: native.as_deref(),
+            },
+        ),
+        Sub::Capacity {
+            engine,
+            scene,
+            corpus,
+            frames,
+            warmup,
+            budget_ms,
+            max_k,
+            out,
+            out_dir,
+            cpu,
+            native,
+        } => capacity_cmd(
+            &engine,
+            CapacityOpts {
+                scene: scene.as_deref(),
+                corpus: corpus.as_deref(),
+                frames,
+                warmup,
+                budget_ms,
+                max_k,
+                out: out.as_deref(),
+                out_dir: out_dir.as_deref(),
+                cpu: cpu.as_deref(),
+                native: native.as_deref(),
             },
         ),
     }
@@ -286,6 +344,84 @@ struct MeasureOpts<'a> {
     cpu: Option<&'a str>,
     rate: Option<f64>,
     energy: bool,
+    native: Option<&'a str>,
+}
+
+/// The `render` subcommand: every scene in the corpus, or the one
+/// `--scene`, against the oracle.
+fn render_cmd(
+    engine: &str,
+    scene: Option<&Path>,
+    corpus: Option<&Path>,
+    out: Option<&Path>,
+    out_dir: Option<&Path>,
+) -> Result<(), BenchError> {
+    let mut engine = create_engine(engine)?;
+    let idle_memory = MemorySnapshot::capture(engine.memory(), SampleDetail::Full);
+    for dir in scene_dirs(scene, corpus)? {
+        let out_path = match (out, out_dir) {
+            (Some(o), None) => o.to_path_buf(),
+            (None, Some(d)) => d.join(format!(
+                "render-{}-{}.json",
+                engine.info().name,
+                dir.file_name().unwrap_or_default().to_string_lossy()
+            )),
+            _ => return Err(BenchError::Engine("--out or --out-dir required".into())),
+        };
+        match render_scene(&mut *engine, &dir, idle_memory.clone()) {
+            Ok(rendered) => {
+                write_render(&rendered, &out_path)?;
+                tracing::info!(
+                    scene = %dir.display(),
+                    flip_mean = rendered.report.metrics.flip_mean,
+                    flip_max = rendered.report.metrics.flip_max,
+                    max_local_error = rendered.report.metrics.max_local_error,
+                    out = %out_path.display(),
+                    "render"
+                );
+            }
+            Err(BenchError::Unsupported { feature, api, .. }) => {
+                write_unsupported(
+                    &*engine,
+                    &dir,
+                    feature.clone(),
+                    api,
+                    idle_memory.clone(),
+                    &out_path,
+                )?;
+                tracing::warn!(
+                    scene = %dir.display(),
+                    ?feature,
+                    out = %out_path.display(),
+                    "unsupported"
+                );
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// A `--native` value: the `WxH` surface a device host's window would
+/// report, given on the command line for an offscreen run.
+fn parse_native(arg: Option<&str>) -> Result<Option<(u32, u32)>, BenchError> {
+    let Some(arg) = arg else { return Ok(None) };
+    let Some((w, h)) = arg.split_once(['x', 'X']) else {
+        return Err(BenchError::Engine(format!(
+            "--native wants a WxH size like 2752x2064, got {arg:?}"
+        )));
+    };
+    let (Ok(w), Ok(h)) = (w.parse::<u32>(), h.parse::<u32>()) else {
+        return Err(BenchError::Engine(format!(
+            "--native wants a WxH size like 2752x2064, got {arg:?}"
+        )));
+    };
+    if w == 0 || h == 0 {
+        return Err(BenchError::Engine(format!(
+            "--native wants a non-zero WxH size, got {arg:?}"
+        )));
+    }
+    Ok(Some((w, h)))
 }
 
 fn measure_cmd(engine: &str, opts: MeasureOpts<'_>) -> Result<(), BenchError> {
@@ -312,6 +448,7 @@ fn measure_cmd(engine: &str, opts: MeasureOpts<'_>) -> Result<(), BenchError> {
             );
         }
     }
+    let native = parse_native(opts.native)?;
     let pinned = opts.cpu.map(affinity::parse_cpu_list).transpose()?;
     if let Some(cpus) = &pinned {
         // Pin before the adapter is created so every thread it spawns
@@ -340,6 +477,7 @@ fn measure_cmd(engine: &str, opts: MeasureOpts<'_>) -> Result<(), BenchError> {
                 rate: opts.rate,
                 measure_energy: opts.energy,
                 idle_memory: idle_memory.clone(),
+                native,
             },
         ) {
             Ok(report) => {
@@ -633,6 +771,28 @@ struct MeasureSceneOptions<'a> {
     rate: Option<f64>,
     measure_energy: bool,
     idle_memory: MemorySnapshot,
+    native: Option<(u32, u32)>,
+}
+
+/// Loads `dir`'s scene, retargeted to `native` when given. Returns the
+/// scene the engines see and the report's `native` record.
+fn load_scene(
+    dir: &Path,
+    native: Option<(u32, u32)>,
+) -> Result<(Scene, Option<NativeResolution>), BenchError> {
+    let scene = Scene::load(dir)?;
+    let Some((w, h)) = native else {
+        return Ok((scene, None));
+    };
+    let (scene, scale) = transform::at_native(&scene, w, h);
+    Ok((
+        scene,
+        Some(NativeResolution {
+            width: w,
+            height: h,
+            scale,
+        }),
+    ))
 }
 
 fn measure_scene(
@@ -647,8 +807,9 @@ fn measure_scene(
         rate,
         measure_energy,
         idle_memory,
+        native,
     } = options;
-    let scene = Scene::load(dir)?;
+    let (scene, native) = load_scene(dir, native)?;
     let blobs = convert::load_blobs(&scene, dir)?;
     let input = EncodeInput {
         scene: &scene,
@@ -720,6 +881,7 @@ fn measure_scene(
             .into_owned(),
         width: scene.width,
         height: scene.height,
+        native,
         prepare_seconds,
         warmup_frames: warmup,
         samples,
@@ -811,6 +973,270 @@ fn phase_percentiles(samples: &[FrameSample]) -> Vec<PhasePercentiles> {
             }
         })
         .collect()
+}
+
+/// The `capacity` subcommand's fields, borrowed to avoid cloning paths.
+#[derive(Clone, Copy)]
+struct CapacityOpts<'a> {
+    scene: Option<&'a Path>,
+    corpus: Option<&'a Path>,
+    frames: u32,
+    warmup: u32,
+    budget_ms: f64,
+    max_k: u32,
+    out: Option<&'a Path>,
+    out_dir: Option<&'a Path>,
+    cpu: Option<&'a str>,
+    native: Option<&'a str>,
+}
+
+/// One engine's sweep state on one scene.
+///
+/// The doubling phase grows `lo` — the largest repetition factor whose
+/// probe stayed within budget — from 1 until a probe lands over budget,
+/// recording that factor as `hi`. The binary phase then halves the
+/// `(lo, hi)` gap until they are adjacent: `lo` is the max sustained k
+/// and `hi = lo + 1` the first over-budget level.
+#[derive(Default)]
+struct Sweep {
+    /// Largest probed `k` within budget; `0` until one fits.
+    lo: u32,
+    /// Smallest probed `k` over budget.
+    hi: Option<u32>,
+    /// Every probe, in the order it ran.
+    probes: Vec<CapacityProbe>,
+    /// The feature that stopped the sweep before its first probe.
+    unsupported: Option<(cherenkov_scene::Feature, Option<&'static str>)>,
+    /// Prepare and per-frame snapshots across every probe, in run order.
+    memory_samples: Vec<MemorySnapshot>,
+    /// The sweep converged or saturated — or never ran (unsupported).
+    done: bool,
+}
+
+impl Sweep {
+    /// The next repetition factor to probe: `1`, then doubling `lo`
+    /// (capped at `max_k`), then the midpoint of `(lo, hi)`. `None` when
+    /// the sweep is finished.
+    fn next_k(&self, max_k: u32) -> Option<u32> {
+        if self.done {
+            return None;
+        }
+        if let Some(hi) = self.hi {
+            let mid = self.lo + (hi - self.lo) / 2;
+            return (mid > self.lo).then_some(mid);
+        }
+        if self.lo == 0 && self.probes.is_empty() {
+            return Some(1);
+        }
+        let next = self.lo.saturating_mul(2).min(max_k);
+        (next > self.lo).then_some(next)
+    }
+
+    /// Records a probe's p99 and the bound it moved. The sweep is done
+    /// once `lo` and `hi` sit adjacent.
+    fn record(&mut self, k: u32, p99_seconds: f64, budget_seconds: f64) {
+        self.probes.push(CapacityProbe { k, p99_seconds });
+        if p99_seconds <= budget_seconds {
+            self.lo = k;
+        } else {
+            self.hi = Some(self.hi.map_or(k, |h| h.min(k)));
+        }
+        if let Some(hi) = self.hi {
+            self.done = hi.saturating_sub(self.lo) <= 1;
+        }
+    }
+}
+
+/// A sample's frame seconds for the capacity budget: the measuring
+/// thread's wall time (encode + submit), raised to the GPU time where
+/// the backend reports it — a pipelined renderer's sustained rate is
+/// limited by its slowest stage.
+fn frame_seconds(s: &FrameSample) -> f64 {
+    let cpu = s.encode_seconds + s.submit_seconds;
+    s.gpu_seconds.map_or(cpu, |gpu| cpu.max(gpu))
+}
+
+/// One capacity probe: prepare `scene` (already at factor `k`) and run
+/// the same warmup + measured frame loop `measure` runs, flat out.
+/// Returns the p99 frame seconds and the probe's memory snapshots.
+fn probe_once(
+    engine: &mut dyn Engine,
+    scene: &Scene,
+    blobs: &convert::Blobs,
+    frames: u32,
+    warmup: u32,
+) -> Result<(f64, Vec<MemorySnapshot>), BenchError> {
+    let input = EncodeInput { scene, blobs };
+    engine.prepare(&input)?;
+    let prepare_memory = MemorySnapshot::capture(engine.memory(), SampleDetail::Full);
+    let window = run_frames(engine, &input, frames, warmup, None, Duration::ZERO, false)?;
+    let mut memory = Vec::with_capacity(window.memory_samples.len() + 1);
+    memory.push(prepare_memory);
+    memory.extend(window.memory_samples.iter().cloned());
+    let times: Vec<f64> = window.samples.iter().map(frame_seconds).collect();
+    let p99 = percentiles(&times).map(|p| p[2]).ok_or_else(|| {
+        BenchError::Engine("capacity: --frames 0 leaves nothing to measure".into())
+    })?;
+    Ok((p99, memory))
+}
+
+fn capacity_cmd(engines: &[String], opts: CapacityOpts<'_>) -> Result<(), BenchError> {
+    if !(opts.budget_ms.is_finite() && opts.budget_ms > 0.0) {
+        return Err(BenchError::Engine(format!(
+            "--budget-ms must be a positive, finite ms value, got {}",
+            opts.budget_ms
+        )));
+    }
+    if opts.frames == 0 {
+        return Err(BenchError::Engine(
+            "capacity: --frames must be at least 1 for a p99".into(),
+        ));
+    }
+    if opts.max_k == 0 {
+        return Err(BenchError::Engine("--max-k must be at least 1".into()));
+    }
+    let native = parse_native(opts.native)?;
+    let pinned = opts.cpu.map(affinity::parse_cpu_list).transpose()?;
+    if let Some(cpus) = &pinned {
+        affinity::pin_current_thread(cpus)?;
+    }
+    // Engines persist across scenes and probes — like `measure`, which
+    // runs a whole corpus on one instance — while each scene's sweep
+    // state resets.
+    let mut engines = engines
+        .iter()
+        .map(|name| create_engine(name))
+        .collect::<Result<Vec<_>, _>>()?;
+    // The engines' idle baseline, captured once before any scene
+    // prepares — the same snapshot `measure` records per engine.
+    let idle_memory: Vec<MemorySnapshot> = engines
+        .iter()
+        .map(|e| MemorySnapshot::capture(e.memory(), SampleDetail::Full))
+        .collect();
+    for dir in scene_dirs(opts.scene, opts.corpus)? {
+        let out_path = match (opts.out, opts.out_dir) {
+            (Some(o), None) => o.to_path_buf(),
+            (None, Some(d)) => d.join(format!(
+                "capacity-{}.json",
+                dir.file_name().unwrap_or_default().to_string_lossy()
+            )),
+            _ => return Err(BenchError::Engine("--out or --out-dir required".into())),
+        };
+        let report = sweep_scene(&mut engines, &dir, &opts, native, &idle_memory)?;
+        write_json(&report, &out_path)?;
+        for result in &report.results {
+            tracing::info!(
+                scene = %dir.display(),
+                engine = result.engine,
+                max_k = result.max_k,
+                p99_seconds = ?result.p99_seconds,
+                p99_seconds_next = ?result.p99_seconds_next,
+                out = %out_path.display(),
+                "capacity"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Sweeps one scene: interleaved rounds across `engines` — each active
+/// engine probes its own next `k` once per round, in `--engine` order —
+/// until every sweep converges or saturates.
+fn sweep_scene(
+    engines: &mut [Box<dyn Engine>],
+    dir: &Path,
+    opts: &CapacityOpts<'_>,
+    native: Option<(u32, u32)>,
+    idle_memory: &[MemorySnapshot],
+) -> Result<CapacityReport, BenchError> {
+    let (base_scene, native_report) = load_scene(dir, native)?;
+    // Blobs key on content hashes that `repeated` leaves untouched.
+    let blobs = convert::load_blobs(&base_scene, dir)?;
+    let budget_seconds = opts.budget_ms / 1000.0;
+    let mut sweeps: Vec<Sweep> = engines.iter().map(|_| Sweep::default()).collect();
+    loop {
+        let mut active = false;
+        for (engine, sweep) in engines.iter_mut().zip(sweeps.iter_mut()) {
+            let Some(k) = sweep.next_k(opts.max_k) else {
+                sweep.done = true;
+                continue;
+            };
+            active = true;
+            let scene = transform::repeated(&base_scene, k);
+            match probe_once(&mut **engine, &scene, &blobs, opts.frames, opts.warmup) {
+                Ok((p99, memory)) => {
+                    sweep.memory_samples.extend(memory);
+                    sweep.record(k, p99, budget_seconds);
+                    tracing::info!(
+                        scene = %dir.display(),
+                        engine = engine.info().name,
+                        k,
+                        p99_seconds = p99,
+                        "probe"
+                    );
+                }
+                Err(BenchError::Unsupported { feature, api, .. }) => {
+                    sweep.unsupported = Some((feature.clone(), api));
+                    sweep.done = true;
+                    tracing::warn!(
+                        scene = %dir.display(),
+                        engine = engine.info().name,
+                        ?feature,
+                        "unsupported"
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        if !active {
+            break;
+        }
+    }
+    let results = engines
+        .iter()
+        .zip(sweeps.iter())
+        .zip(idle_memory.iter())
+        .map(|((engine, sweep), idle)| {
+            let (unsupported, missing_api) = sweep
+                .unsupported
+                .clone()
+                .map_or((None, None), |(f, api)| (Some(f), api));
+            CapacityResult {
+                engine: engine.info().name,
+                info: engine.info().clone(),
+                unsupported,
+                missing_api,
+                max_k: sweep.lo,
+                p99_seconds: sweep
+                    .probes
+                    .iter()
+                    .find(|p| p.k == sweep.lo)
+                    .map(|p| p.p99_seconds),
+                p99_seconds_next: sweep
+                    .probes
+                    .iter()
+                    .find(|p| p.k == sweep.lo + 1)
+                    .map(|p| p.p99_seconds),
+                probes: sweep.probes.clone(),
+                memory: MemoryReport::new(idle.clone(), &sweep.memory_samples),
+            }
+        })
+        .collect();
+    Ok(CapacityReport {
+        scene: dir
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
+        budget_ms: opts.budget_ms,
+        frames: opts.frames,
+        warmup: opts.warmup,
+        native: native_report,
+        results,
+        device: engines
+            .first()
+            .map_or_else(DeviceInfo::default, |e| e.device()),
+    })
 }
 
 /// Record a scene the adapter cannot execute faithfully.

@@ -448,6 +448,8 @@ pub struct Cherenkov {
     /// `--present` mode: the presentation kind `submit` applies to the
     /// readback before handing pixels over.
     present: Option<PresentKind>,
+    /// The scene's declared display headroom for `submit`'s presentation.
+    headroom: f32,
 }
 
 /// The features this slice executes faithfully.
@@ -1329,6 +1331,7 @@ impl Cherenkov {
             timings: Timings::default(),
             counters: Counters::default(),
             present: None,
+            headroom: 1.0,
         })
     }
 }
@@ -1346,6 +1349,13 @@ impl Engine for Cherenkov {
         convert::check_features(Self::NAME, input.scene, &cherenkov_features(), missing_api)?;
         // sRGB presentation reads the native f32 framebuffer; the
         // linear-P3 destination stores f16, modelled by the f16 readback.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "Display::headroom is f32 at the engine boundary"
+        )]
+        {
+            self.headroom = input.scene.present_headroom as f32;
+        }
         let format = match self.present {
             Some(PresentKind::SrgbHw | PresentKind::SrgbShader) => OffscreenFormat::LinearF32,
             Some(PresentKind::LinearP3) => OffscreenFormat::LinearF16,
@@ -1502,7 +1512,7 @@ impl Engine for Cherenkov {
                 // the comparison — the same interchange the GPU adapter
                 // uses on its presented texture.
                 Some(PresentKind::SrgbHw | PresentKind::SrgbShader) => {
-                    cherenkov_cpu::present_srgb8(&rb.pixels)
+                    cherenkov_cpu::present_srgb8(self.headroom, &rb.pixels)
                         .as_chunks::<4>()
                         .0
                         .iter()
@@ -1513,8 +1523,12 @@ impl Engine for Cherenkov {
                         })
                         .collect()
                 }
-                // Extended linear Display P3 passes through verbatim.
-                Some(PresentKind::LinearP3) | None => rb.pixels,
+                // Extended linear Display P3 tone-maps to the display
+                // headroom, like the GPU's `LinearP3` destination.
+                Some(PresentKind::LinearP3) => {
+                    cherenkov_cpu::present_linear_p3(self.headroom, &rb.pixels)
+                }
+                None => rb.pixels,
             };
             Some(cherenkov_oracle::F32Image {
                 width: rb.width,

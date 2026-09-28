@@ -1,13 +1,14 @@
 //! Presentation of the working-space framebuffer into an sRGB bitmap —
 //! the CPU twin of `gpu/src/render/present.wgsl` (#96): unpremultiply,
-//! the P3 → sRGB matrix, the analytic `OKLab` gamut map, the sRGB
-//! transfer, re-premultiply, then unorm-8. In-gamut pixels produce the
-//! pre-#96 convert-and-clamp bytes exactly; out-of-gamut pixels keep
-//! their hue and land on the sRGB boundary.
+//! the P3 → sRGB matrix, the headroom tone map (#97), the analytic
+//! `OKLab` gamut map, the sRGB transfer, re-premultiply, then unorm-8.
+//! In-gamut pixels produce the pre-#96 convert-and-clamp bytes exactly;
+//! out-of-gamut pixels keep their hue and land on the sRGB boundary.
 //!
 //! `f32` throughout, one `OKLab` cusp solve and one Halley refinement per
 //! out-of-gamut pixel — the same fixed-cost structure the shader runs.
-//! `oracle/src/gamut.rs` is the `f64` reference of the same algorithm.
+//! `oracle/src/gamut.rs` is the `f64` reference of the same algorithm, and
+//! `oracle/src/tone.rs` the `f64` reference of the tone map.
 
 /// Linear Display P3 → linear sRGB — the Bradford-adapted D65 matrix of
 /// `present.wgsl`, in `f32`.
@@ -276,23 +277,50 @@ fn delta_e_ok(a: [f32; 3], b: [f32; 3]) -> f32 {
     d0.mul_add(d0, d1.mul_add(d1, d2 * d2)).sqrt()
 }
 
+/// The presentation tone-map shoulder (`f32` twin of `oracle::tone`) —
+/// identity on `[0, 1]`, then highlights compress smoothly towards the
+/// headroom `h`.
+fn tone(x: f32, h: f32) -> f32 {
+    if x <= 1.0 {
+        return x;
+    }
+    let d = (h - 1.0).max(0.0);
+    let t = x - 1.0;
+    1.0 + d * (1.0 - d / t.mul_add(1.0, d))
+}
+
+/// One pixel's tone map (#97): scale every channel by the shoulder's
+/// value at the maximum channel — a per-pixel scalar, so hue and
+/// saturation are preserved. `max ≤ 1` returns the input bit-for-bit.
+fn tone_map(headroom: f32, rgb: [f32; 3]) -> [f32; 3] {
+    let m = rgb[0].max(rgb[1]).max(rgb[2]);
+    if m.partial_cmp(&1.0) != Some(std::cmp::Ordering::Greater) {
+        return rgb;
+    }
+    let s = tone(m, headroom) / m;
+    [rgb[0] * s, rgb[1] * s, rgb[2] * s]
+}
+
 /// Presents premultiplied working-space pixels to encoded premultiplied
 /// sRGB bytes.
 ///
 /// The `present.wgsl` `srgb-shader` path under `OutputAlpha::Premultiplied`,
 /// ending in the unorm-8 store an sRGB destination produces. Alpha is
-/// stored linearly, as `Rgba8*` formats do.
+/// stored linearly, as `Rgba8*` formats do. `headroom` is the display's
+/// headroom; an sRGB destination's representable ceiling caps the
+/// tone-map target at `1`.
 #[must_use]
 #[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     reason = "gamut-mapped channels are in [0,1]; the unorm-8 store rounds"
 )]
-pub fn present_srgb8(pixels: &[[f32; 4]]) -> Vec<u8> {
+pub fn present_srgb8(headroom: f32, pixels: &[[f32; 4]]) -> Vec<u8> {
+    let target = headroom.min(1.0);
     let mut out = Vec::with_capacity(pixels.len() * 4);
     for &[r, g, b, a] in pixels {
         let straight = if a > 0.0 {
-            [r / a, g / a, b / a]
+            tone_map(target, [r / a, g / a, b / a])
         } else {
             [0.0; 3]
         };
@@ -303,4 +331,31 @@ pub fn present_srgb8(pixels: &[[f32; 4]]) -> Vec<u8> {
         out.push((a.clamp(0.0, 1.0) * 255.0).round() as u8);
     }
     out
+}
+
+/// Presents premultiplied working-space pixels to an extended linear
+/// Display P3 host buffer (#97).
+///
+/// The CPU twin of `present.wgsl`'s `OutputColor::LinearDisplayP3` path:
+/// unpremultiply, tone-map to the display `headroom`, re-premultiply.
+#[must_use]
+pub fn present_linear_p3(headroom: f32, pixels: &[[f32; 4]]) -> Vec<[f32; 4]> {
+    pixels
+        .iter()
+        .map(|&[r, g, b, a]| {
+            // The tone map scales straight rgb by a scalar, so premultiplied
+            // channels scale by the same factor directly — no divide and
+            // re-multiply round trip, and a pixel whose straight channels
+            // are all ≤ 1 returns bit-for-bit (SDR identity).
+            if a.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
+                return [0.0, 0.0, 0.0, a];
+            }
+            let m = r.max(g).max(b) / a;
+            if m.partial_cmp(&1.0) != Some(std::cmp::Ordering::Greater) {
+                return [r, g, b, a];
+            }
+            let s = tone(m, headroom) / m;
+            [r * s, g * s, b * s, a]
+        })
+        .collect()
 }

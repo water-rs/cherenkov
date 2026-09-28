@@ -498,6 +498,8 @@ struct Present {
     source: Option<wgpu::Texture>,
     /// The kind's destination texture, sized to the prepared scene.
     destination: Option<wgpu::Texture>,
+    /// The scene's declared display headroom for `read`'s present pass.
+    headroom: f32,
 }
 
 /// The destination texture format of a `--present` kind.
@@ -660,6 +662,7 @@ impl Present {
                     PresentKind::LinearP3 => OutputColor::LinearDisplayP3,
                 },
                 alpha: OutputAlpha::Premultiplied,
+                headroom: self.headroom,
             },
         );
         let packed = read_texture(
@@ -1578,6 +1581,7 @@ impl Engine for Cherenkov {
             presenter: Presenter::new(&self.shared_device.device, delivery),
             source: None,
             destination: None,
+            headroom: 1.0,
         }));
         Ok(())
     }
@@ -1612,9 +1616,10 @@ impl Engine for Cherenkov {
                 .surface(Offscreen::new(size, OffscreenFormat::LinearF16))
                 .map_err(|e| BenchError::Gpu(format!("cherenkov surface: {e}")))?,
         };
-        if self.present.is_some() {
+        if let Some(present) = self.present.as_deref_mut() {
             // Announce the scene's declared headroom as a host display
-            // would; the present pass does not read it yet (#97).
+            // would; the present pass reads it every frame (#97).
+            present.headroom = input.scene.present_headroom as f32;
             let _ = surface.display(cherenkov::Display {
                 headroom: input.scene.present_headroom as f32,
                 ..cherenkov::Display::default()

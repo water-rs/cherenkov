@@ -112,8 +112,10 @@ pub struct Presenter {
     pipeline_layout: wgpu::PipelineLayout,
     sampler: wgpu::Sampler,
     pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
-    /// Indexed by `encode * 3 + alpha`: see `Present` in `present.wgsl`.
-    uniforms: [wgpu::Buffer; 9],
+    /// `{ encode, alpha, headroom, pad }`: see `Present` in
+    /// `present.wgsl`. Written per call — the headroom follows the
+    /// display every frame (#97).
+    uniform: wgpu::Buffer,
 }
 
 impl Presenter {
@@ -136,36 +138,19 @@ impl Presenter {
             min_filter: wgpu::FilterMode::Nearest,
             ..wgpu::SamplerDescriptor::default()
         });
-        let uniform = |encode: u32, alpha: u32| {
-            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("present uniform"),
-                size: 16,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: true,
-            });
-            buffer.slice(..).get_mapped_range_mut().copy_from_slice(
-                &[encode.to_ne_bytes(), alpha.to_ne_bytes(), [0; 4], [0; 4]].concat(),
-            );
-            buffer.unmap();
-            buffer
-        };
+        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("present uniform"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         Self {
             module,
             layout,
             pipeline_layout,
             sampler,
             pipelines: HashMap::new(),
-            uniforms: [
-                uniform(0, 0),
-                uniform(0, 1),
-                uniform(0, 2),
-                uniform(1, 0),
-                uniform(1, 1),
-                uniform(1, 2),
-                uniform(2, 0),
-                uniform(2, 1),
-                uniform(2, 2),
-            ],
+            uniform,
         }
     }
 
@@ -203,7 +188,9 @@ impl Presenter {
         })
     }
 
-    /// Blits `source` onto the window's next swapchain image and presents it.
+    /// Blits `source` onto the window's next swapchain image and presents
+    /// it. `headroom` is the display's declared HDR headroom for this
+    /// frame.
     ///
     /// # Errors
     /// [`RenderError`] when the swapchain image cannot be acquired.
@@ -213,6 +200,7 @@ impl Presenter {
         queue: &wgpu::Queue,
         window: &WindowSurface,
         source: &wgpu::TextureView,
+        headroom: f32,
     ) -> Result<bool, RenderError> {
         let Some(frame) = window.acquire(device)? else {
             return Ok(false);
@@ -234,6 +222,7 @@ impl Presenter {
                 texture: &frame.texture,
                 color: OutputColor::Srgb,
                 alpha,
+                headroom,
             },
         );
         frame.present();
@@ -277,6 +266,7 @@ impl Presenter {
             texture: target,
             color,
             alpha,
+            headroom,
         } = output;
         let format = target.format();
         assert!(
@@ -284,15 +274,27 @@ impl Presenter {
             "linear Display P3 output requires a non-sRGB texture format"
         );
         let view = target.create_view(&wgpu::TextureViewDescriptor::default());
-        let encode = match color {
-            OutputColor::Srgb => usize::from(!format.is_srgb()),
+        let encode: u32 = match color {
+            OutputColor::Srgb => u32::from(!format.is_srgb()),
             OutputColor::LinearDisplayP3 => 2,
         };
-        let alpha = match alpha {
+        let alpha: u32 = match alpha {
             OutputAlpha::Opaque => 0,
             OutputAlpha::Premultiplied => 1,
             OutputAlpha::Straight => 2,
         };
+        let headroom = headroom.max(0.0);
+        queue.write_buffer(
+            &self.uniform,
+            0,
+            &[
+                encode.to_ne_bytes(),
+                alpha.to_ne_bytes(),
+                headroom.to_bits().to_ne_bytes(),
+                [0; 4],
+            ]
+            .concat(),
+        );
         let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("present"),
             layout: &self.layout,
@@ -307,7 +309,7 @@ impl Presenter {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: self.uniforms[encode * 3 + alpha].as_entire_binding(),
+                    resource: self.uniform.as_entire_binding(),
                 },
             ],
         });
@@ -370,4 +372,8 @@ pub struct TextureOutput<'a> {
     pub color: OutputColor,
     /// Destination alpha convention.
     pub alpha: OutputAlpha,
+    /// The display's HDR headroom the destination reaches: SDR content is
+    /// `1.0`. Values above `1` roll off smoothly towards it (#97); a headroom
+    /// change applies to the next call, not to the content.
+    pub headroom: f32,
 }

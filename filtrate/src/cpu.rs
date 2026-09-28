@@ -481,7 +481,7 @@ fn blend_hsl(
 fn rgb_to_hsl(rgb: [f32; 3]) -> [f32; 3] {
     let max = rgb[0].max(rgb[1]).max(rgb[2]);
     let min = rgb[0].min(rgb[1]).min(rgb[2]);
-    let lightness = (max + min) * 0.5;
+    let lightness = f32::midpoint(max, min);
     if max == min {
         return [0.0, 0.0, lightness];
     }

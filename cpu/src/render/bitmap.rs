@@ -70,7 +70,7 @@ impl BitmapFont {
         let largest_ppem = self.strikes.last().expect("bitmap font has strikes").0;
         self.strikes
             .iter()
-            .find(|(ppem, _)| *ppem == largest_ppem)
+            .find(|(ppem, _)| ppem.to_bits() == largest_ppem.to_bits())
             .expect("largest bitmap strike exists")
             .1
     }
@@ -385,7 +385,7 @@ fn decode_png(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), RenderError> {
             .iter()
             .flat_map(|pixel| [pixel[0], pixel[0], pixel[0], pixel[1]])
             .collect(),
-        other => {
+        other @ png::ColorType::Indexed => {
             return Err(RenderError::Font(format!(
                 "bitmap PNG has unexpected color type {other:?}"
             )));

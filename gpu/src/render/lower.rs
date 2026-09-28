@@ -2189,6 +2189,10 @@ impl<'a> Lowering<'a> {
         reason = "preserve dev inlining of common leaf realization as capabilities grow"
     )]
     #[inline(always)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the existing realization match handles all retained operation variants"
+    )]
     fn realize(
         &mut self,
         op: &Op,
@@ -2323,6 +2327,10 @@ impl<'a> Lowering<'a> {
 
     #[cold]
     #[inline(never)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "bitmap glyph decoding and image-instance emission form one cold path"
+    )]
     fn bitmap_glyph(
         &mut self,
         local: Affine,
@@ -2392,10 +2400,10 @@ impl<'a> Lowering<'a> {
             (em, width, height)
         };
         let rect = Rect::new(
-            f64::from(origin[0]) + f64::from(size) * em.x0,
-            f64::from(origin[1]) + f64::from(size) * em.y0,
-            f64::from(origin[0]) + f64::from(size) * em.x1,
-            f64::from(origin[1]) + f64::from(size) * em.y1,
+            f64::from(size).mul_add(em.x0, f64::from(origin[0])),
+            f64::from(size).mul_add(em.y0, f64::from(origin[1])),
+            f64::from(size).mul_add(em.x1, f64::from(origin[0])),
+            f64::from(size).mul_add(em.y1, f64::from(origin[1])),
         );
         if rect.width() <= 0.0 || rect.height() <= 0.0 {
             return Ok(());
@@ -2420,13 +2428,19 @@ impl<'a> Lowering<'a> {
                 rect.width() / f64::from(width),
                 rect.height() / f64::from(height),
             );
-        let [a, b, c, d, e, f] = (boxed.extra.inverse() * bitmap_transform)
+        let [x_scale, y_skew, x_skew, y_scale, x_translate, y_translate] = (boxed.extra.inverse()
+            * bitmap_transform)
             .inverse()
             .as_coeffs();
-        inst.grad = [f32_f64(a), f32_f64(b), f32_f64(c), f32_f64(d)];
+        inst.grad = [
+            f32_f64(x_scale),
+            f32_f64(y_skew),
+            f32_f64(x_skew),
+            f32_f64(y_scale),
+        ];
         inst.grad2 = [
-            f32_f64(e),
-            f32_f64(f),
+            f32_f64(x_translate),
+            f32_f64(y_translate),
             f32_f64(f64::from(width)),
             f32_f64(f64::from(height)),
         ];

@@ -105,7 +105,7 @@ pub fn box_params(shape: &Shape) -> Option<(BoxShape, Affine)> {
     Some((boxed, extra))
 }
 
-fn clamped_radii(radii: kurbo::RoundedRectRadii, half: [f64; 2]) -> [f64; 4] {
+const fn clamped_radii(radii: kurbo::RoundedRectRadii, half: [f64; 2]) -> [f64; 4] {
     let limit = half[0].min(half[1]);
     [
         radii.top_left.clamp(0.0, limit),
@@ -131,6 +131,7 @@ fn corner_radii(s: &BoxShape, p: [f64; 2]) -> (f64, [f64; 2]) {
 
 /// Signed distance to `s` at box-local `p` (negative inside), a literal
 /// port of the WGSL `sdf`.
+#[allow(clippy::many_single_char_names)] // names mirror the WGSL `sdf`
 pub fn sdf(s: &BoxShape, p: [f64; 2]) -> f64 {
     let (rx, [_, ry]) = corner_radii(s, p);
     let a = [p[0].abs() - s.half[0], p[1].abs() - s.half[1]];
@@ -159,7 +160,9 @@ pub fn sdf(s: &BoxShape, p: [f64; 2]) -> f64 {
 /// Local-space gradient of the signed distance to `s` at `p`, a literal
 /// port of the WGSL `sdf_grad`: closed form for sharp and
 /// circular/elliptical corners, central differences (E = 0.05) otherwise.
+#[allow(clippy::many_single_char_names)] // names mirror the WGSL `sdf_grad`
 pub fn sdf_grad(s: &BoxShape, p: [f64; 2]) -> [f64; 2] {
+    const E: f64 = 0.05;
     let analytic = (s.exponent - 2.0).abs() < 1e-4 || s.radii.iter().all(|r| *r <= 0.0);
     if analytic {
         let sgn = [
@@ -191,7 +194,6 @@ pub fn sdf_grad(s: &BoxShape, p: [f64; 2]) -> [f64; 2] {
         };
         return [sgn[0] * g[0], sgn[1] * g[1]];
     }
-    const E: f64 = 0.05;
     [
         (sdf(s, [p[0] + E, p[1]]) - sdf(s, [p[0] - E, p[1]])) / (2.0 * E),
         (sdf(s, [p[0], p[1] + E]) - sdf(s, [p[0], p[1] - E])) / (2.0 * E),
@@ -202,12 +204,13 @@ pub fn sdf_grad(s: &BoxShape, p: [f64; 2]) -> [f64; 2] {
 /// point `p`, the same math the WGSL clip-coverage block uses: `clip_inv`
 /// maps device to box-local, `dg = clip_invᵀ · g`, `d = sdf / |dg|`,
 /// `n = dg / |dg|`. `clip_inv` is `inverse(transform * extra)`.
+#[allow(clippy::many_single_char_names)] // a/b/c/d name the affine coefficients
 pub fn distance_and_normal(s: &BoxShape, clip_inv: &Affine, p: [f64; 2]) -> (f64, [f64; 2]) {
     let pc = *clip_inv * kurbo::Point::new(p[0], p[1]);
     let pc = [pc.x, pc.y];
     let g = sdf_grad(s, pc);
     let [a, b, c, d, _, _] = clip_inv.as_coeffs();
-    let dg = [a * g[0] + b * g[1], c * g[0] + d * g[1]];
+    let dg = [a.mul_add(g[0], b * g[1]), c.mul_add(g[0], d * g[1])];
     let len = dg[0].hypot(dg[1]).max(1e-6);
     (sdf(s, pc) / len, [dg[0] / len, dg[1] / len])
 }
@@ -218,6 +221,13 @@ pub fn distance_and_normal(s: &BoxShape, clip_inv: &Affine, p: [f64; 2]) -> (f64
 /// full canvas (origin `(0,0)`, size the canvas); the GPU captures the
 /// group's bounded region — both regions contain every point a member's
 /// reach can sample, so the clamp is a no-op on both sides.
+#[allow(clippy::many_single_char_names)] // names mirror the WGSL `backdrop_sample`
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    reason = "texel coordinates are clamped into the capture before indexing"
+)]
 pub fn bilinear(capture: &[[f64; 4]], width: usize, height: usize, q: [f64; 2]) -> [f64; 4] {
     let (w, h) = (width as f64, height as f64);
     let f = [
@@ -233,10 +243,10 @@ pub fn bilinear(capture: &[[f64; 4]], width: usize, height: usize, q: [f64; 2]) 
     let c11 = capture[hi[1] * width + hi[0]];
     let mix = |c0: [f64; 4], c1: [f64; 4], t: f64| {
         [
-            c0[0] + (c1[0] - c0[0]) * t,
-            c0[1] + (c1[1] - c0[1]) * t,
-            c0[2] + (c1[2] - c0[2]) * t,
-            c0[3] + (c1[3] - c0[3]) * t,
+            (c1[0] - c0[0]).mul_add(t, c0[0]),
+            (c1[1] - c0[1]).mul_add(t, c0[1]),
+            (c1[2] - c0[2]).mul_add(t, c0[2]),
+            (c1[3] - c0[3]).mul_add(t, c0[3]),
         ]
     };
     mix(mix(c00, c10, t[0]), mix(c01, c11, t[0]), t[1])
@@ -300,6 +310,7 @@ mod tests {
         assert!((sdf(&s, [9.0, 0.0]) - -1.0).abs() < 1e-9);
     }
 
+    #[expect(clippy::float_cmp, reason = "axis-aligned gradients are exact")]
     #[test]
     fn gradient_points_outward() {
         let s = rect_shape(20.0, 10.0);
@@ -312,15 +323,16 @@ mod tests {
         assert!((n[0] + 1.0).abs() < 1e-9 && n[1].abs() < 1e-9);
     }
 
+    #[expect(clippy::float_cmp, reason = "texel-centre samples are exact")]
     #[test]
     fn bilinear_at_texel_centres_is_the_texel() {
         let px: Vec<[f64; 4]> = (0..16)
-            .map(|i| [i as f64, (i * 3) as f64, 0.5, 1.0])
+            .map(|i| [f64::from(i), f64::from(i * 3), 0.5, 1.0])
             .collect();
-        for y in 0..4 {
-            for x in 0..4 {
-                let v = bilinear(&px, 4, 4, [x as f64 + 0.5, y as f64 + 0.5]);
-                assert_eq!(v, px[y * 4 + x]);
+        for y in 0..4u32 {
+            for x in 0..4u32 {
+                let v = bilinear(&px, 4, 4, [f64::from(x) + 0.5, f64::from(y) + 0.5]);
+                assert_eq!(v, px[y as usize * 4 + x as usize]);
             }
         }
         // Off-centre mixes the neighbours.

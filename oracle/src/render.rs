@@ -740,6 +740,12 @@ impl Renderer {
 /// per-member effect's sample of the filtered capture, before coverage and
 /// opacity. `sdf_clip` is the member clip's box shape and device →
 /// box-local inverse, `Some` whenever the effect reads the clip's SDF.
+#[allow(clippy::many_single_char_names)] // p/q/c/t/d/n name points and pixel values
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "pixel-centre coordinates index the capture after clamping"
+)]
 fn sample_backdrop(
     layer: &Layer,
     capture: &[[f64; 4]],
@@ -761,9 +767,18 @@ fn sample_backdrop(
             // column is a bias that scales with alpha; alpha passes through.
             let c = crate::sdf::bilinear(capture, width, height, p);
             [
-                matrix[0] * c[0] + matrix[1] * c[1] + matrix[2] * c[2] + matrix[3] * c[3],
-                matrix[4] * c[0] + matrix[5] * c[1] + matrix[6] * c[2] + matrix[7] * c[3],
-                matrix[8] * c[0] + matrix[9] * c[1] + matrix[10] * c[2] + matrix[11] * c[3],
+                matrix[0].mul_add(
+                    c[0],
+                    matrix[1].mul_add(c[1], matrix[2].mul_add(c[2], matrix[3] * c[3])),
+                ),
+                matrix[4].mul_add(
+                    c[0],
+                    matrix[5].mul_add(c[1], matrix[6].mul_add(c[2], matrix[7] * c[3])),
+                ),
+                matrix[8].mul_add(
+                    c[0],
+                    matrix[9].mul_add(c[1], matrix[10].mul_add(c[2], matrix[11] * c[3])),
+                ),
                 c[3],
             ]
         }
@@ -772,8 +787,8 @@ fn sample_backdrop(
             let (d, n) = crate::sdf::distance_and_normal(shape, clip_inv, p);
             let t = (1.0 + d / depth).clamp(0.0, 1.0);
             let q = [
-                p[0] - n[0] * strength * t * t,
-                p[1] - n[1] * strength * t * t,
+                (-n[0] * strength).mul_add(t * t, p[0]),
+                (-n[1] * strength).mul_add(t * t, p[1]),
             ];
             crate::sdf::bilinear(capture, width, height, q)
         }
@@ -787,9 +802,9 @@ fn sample_backdrop(
             let t = (1.0 + d / rim_w).clamp(0.0, 1.0);
             let mut c = crate::sdf::bilinear(capture, width, height, p);
             let k = color[3] * gain * t * t;
-            c[0] += color[0] * k;
-            c[1] += color[1] * k;
-            c[2] += color[2] * k;
+            c[0] = color[0].mul_add(k, c[0]);
+            c[1] = color[1].mul_add(k, c[1]);
+            c[2] = color[2].mul_add(k, c[2]);
             c
         }
     }

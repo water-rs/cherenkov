@@ -14,7 +14,8 @@
 //! - **Items** composite source-over in order; a child layer renders into a
 //!   fresh canvas (with the layer clip in force), then composits onto the
 //!   parent with the layer's opacity and blend mode (W3C Compositing and
-//!   Blending Level 1).
+//!   Blending Level 1). A destructive Porter-Duff blend applies within the
+//!   layer's clip, or over the whole parent when there is no clip.
 //! - **Shadows** are the shape's exact coverage — clip-intersected, then
 //!   offset — convolved with a Gaussian in `f64`, filled with the colour.
 //!   Offsetting the edges before integration is exact because convolution
@@ -183,16 +184,56 @@ impl Renderer {
         let mut sub = Canvas::new(canvas.width, canvas.height, [0.0; 4]);
         self.render_items(&child.items, content_tf, &child_clips, &mut sub, resources)?;
 
+        // A destructive operator is bounded by the effective clip: outside
+        // it the destination is untouched, and the clip edge is antialiased
+        // between the backdrop and the blended result. Unclipped it covers
+        // the whole parent.
+        let clip_cov: Option<Vec<f64>> =
+            if Self::is_destructive(child.blend) && !child_clips.is_empty() {
+                let mut segs = child_clips[0].clone();
+                for c in &child_clips[1..] {
+                    segs = intersect_edges(&segs, FillRule::NonZero, c);
+                }
+                let mut cov = Coverage::new(self.width, self.height);
+                for &s in &segs {
+                    cov.add_line(s.0, s.1, s.2, s.3);
+                }
+                Some(cov.finish(FillRule::NonZero))
+            } else {
+                None
+            };
+
         let opacity = child.opacity;
-        for (dst, &src) in canvas.pixels.iter_mut().zip(&sub.pixels) {
+        for (i, (dst, &src)) in canvas.pixels.iter_mut().zip(&sub.pixels).enumerate() {
             let s = src.map(|v| v * opacity);
             *dst = if child.blend == BlendMode::Normal {
                 src_over(*dst, s)
             } else {
-                blend(child.blend, *dst, s)
+                let b = blend(child.blend, *dst, s);
+                match clip_cov.as_ref().map(|v| v[i]) {
+                    Some(c) if c >= 1.0 => b,
+                    Some(c) if c <= 0.0 => *dst,
+                    Some(c) => std::array::from_fn(|ch| c.mul_add(b[ch] - dst[ch], dst[ch])),
+                    None => b,
+                }
             };
         }
         Ok(())
+    }
+
+    /// Porter-Duff operators where a transparent source changes the
+    /// destination: the composite is bounded by the effective clip (or the
+    /// whole parent when unclipped).
+    const fn is_destructive(blend: BlendMode) -> bool {
+        matches!(
+            blend,
+            BlendMode::Clear
+                | BlendMode::Src
+                | BlendMode::SrcIn
+                | BlendMode::SrcOut
+                | BlendMode::DestIn
+                | BlendMode::DestAtop
+        )
     }
 
     /// Exact coverage of `shape` under `tf`, clipped by every clip set.

@@ -263,10 +263,22 @@ impl Registry {
         );
     }
 
-    pub fn remove(&mut self, id: FilterKey) {
-        if let Some(entry) = self.entries.remove(&id) {
-            entry.active.store(false, Ordering::Release);
-        }
+    /// Removes an entry; returns the GPU bytes its retired
+    /// input/output targets held (for the allocation diagnostic).
+    pub fn remove(&mut self, id: FilterKey) -> u64 {
+        let Some(entry) = self.entries.remove(&id) else {
+            return 0;
+        };
+        entry.active.store(false, Ordering::Release);
+        [entry.input, entry.output]
+            .into_iter()
+            .flatten()
+            .map(|(texture, _)| {
+                u64::from(texture.width())
+                    * u64::from(texture.height())
+                    * super::texel_bytes(texture.format())
+            })
+            .sum()
     }
 
     pub fn set_active(&self, uses: &HashSet<FilterKey>) {
@@ -279,6 +291,23 @@ impl Registry {
         self.entries
             .get(&id)
             .is_some_and(|entry| entry.again || entry.dirty.load(Ordering::Acquire))
+    }
+
+    /// Drops every entry's input/output targets — grow-only caches the
+    /// renderer releases explicitly outside the hot frame path (#169 A4).
+    /// Returns the freed bytes for diagnostics.
+    pub(super) fn trim(&mut self) -> u64 {
+        let mut bytes = 0;
+        for entry in self.entries.values_mut() {
+            for slot in [&mut entry.input, &mut entry.output] {
+                if let Some((texture, _)) = slot.take() {
+                    bytes += u64::from(texture.width())
+                        * u64::from(texture.height())
+                        * super::texel_bytes(texture.format());
+                }
+            }
+        }
+        bytes
     }
 
     pub fn gpu_bytes(&self) -> u64 {
@@ -352,6 +381,9 @@ impl Registry {
         }
         let format = scratch.texture.format();
         entry.check_setup(id, context, format)?;
+        // `EffectInput::{width,height}` names the input texture's exact
+        // size, so unlike scratch a filter target resizes with its frame
+        // region — `trim` releases them outside the hot path (#169 A4).
         if entry
             .input
             .as_ref()

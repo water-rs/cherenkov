@@ -100,7 +100,7 @@
             0.0,
             1.0,
             0.0,
-            30.0
+            24.0
           ],
           "opacity": 1.0,
           "blend": "normal",
@@ -164,7 +164,7 @@
             0.0,
             1.0,
             0.0,
-            68.0
+            58.0
           ],
           "opacity": 1.0,
           "blend": "normal",
@@ -228,7 +228,7 @@
             0.0,
             1.0,
             0.0,
-            126.0
+            112.0
           ],
           "opacity": 1.0,
           "blend": "normal",
@@ -270,39 +270,6 @@
                   }
                 }
               }
-            },
-            {
-              "draw": {
-                "glyphs": {
-                  "font": "7a192bbeea37cd3aab73046d2220b94fffbbc8ddd4c0337aff58ac5a098b8650",
-                  "font_index": 0,
-                  "size": 72.0,
-                  "normalized_coords": [],
-                  "glyphs": [
-                    {
-                      "id": 4,
-                      "x": 12.0,
-                      "y": 163.17188
-                    },
-                    {
-                      "id": 5,
-                      "x": 101.64844,
-                      "y": 163.17188
-                    }
-                  ],
-                  "paint": {
-                    "solid": {
-                      "space": "srgb",
-                      "components": [
-                        0.1,
-                        0.1,
-                        0.12,
-                        1.0
-                      ]
-                    }
-                  }
-                }
-              }
             }
           ]
         }
@@ -315,7 +282,7 @@
             0.0,
             1.0,
             0.0,
-            220.0
+            204.0
           ],
           "opacity": 1.0,
           "blend": "normal",
@@ -325,41 +292,18 @@
                 "glyphs": {
                   "font": "7a192bbeea37cd3aab73046d2220b94fffbbc8ddd4c0337aff58ac5a098b8650",
                   "font_index": 0,
-                  "size": 120.0,
+                  "size": 104.0,
                   "normalized_coords": [],
                   "glyphs": [
                     {
                       "id": 5,
                       "x": 12.0,
-                      "y": 123.328125
-                    }
-                  ],
-                  "paint": {
-                    "solid": {
-                      "space": "srgb",
-                      "components": [
-                        0.1,
-                        0.1,
-                        0.12,
-                        1.0
-                      ]
-                    }
-                  }
-                }
-              }
-            },
-            {
-              "draw": {
-                "glyphs": {
-                  "font": "7a192bbeea37cd3aab73046d2220b94fffbbc8ddd4c0337aff58ac5a098b8650",
-                  "font_index": 0,
-                  "size": 120.0,
-                  "normalized_coords": [],
-                  "glyphs": [
+                      "y": 108.484375
+                    },
                     {
                       "id": 4,
-                      "x": 12.0,
-                      "y": 263.95312
+                      "x": 141.49219,
+                      "y": 108.484375
                     }
                   ],
                   "paint": {

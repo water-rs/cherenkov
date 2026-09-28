@@ -53,8 +53,8 @@ pub use crate::animation::{
 };
 pub use crate::backend::{Backend, Display, Frame, Redraw, Renderer, SurfaceFrame, SurfaceInfo};
 pub use crate::capability::{
-    Backdrop, BackdropChain, Effects, ExternalFrames, Filters, GpuContent, HdrOutput, Planes,
-    Runs, ShaderPaint as ShaderPaintCapability, ShaderSource, Uploads,
+    Backdrop, BackdropChain, Effects, ExternalFrames, Filters, GpuContent, HdrOutput, Planes, Runs,
+    ShaderPaint as ShaderPaintCapability, ShaderSource, Uploads,
 };
 pub use crate::color::{
     Color, ColorSpace, DisplayP3, DynColor, LinearDisplayP3, LinearSrgb, Rec2020, Srgb,

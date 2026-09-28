@@ -732,6 +732,46 @@ fn map_body(l: &mut LayerBuilder, pw: f64, ph: f64) {
     }
 }
 
+/// Shared background: saturated shapes and a diagonal gradient so the
+/// sampled backdrop is visibly different from a flat fill.
+fn backdrop_background(l: &mut LayerBuilder) {
+    l.fill(
+        Shape::rect(0.0, 0.0, 256.0, 256.0),
+        Paint::Linear(LinearGradient {
+            start: Point::new(0.0, 0.0),
+            end: Point::new(256.0, 256.0),
+            stops: vec![
+                GradientStop {
+                    offset: 0.0,
+                    color: srgb(0.15, 0.20, 0.55),
+                },
+                GradientStop {
+                    offset: 1.0,
+                    color: srgb(0.85, 0.35, 0.15),
+                },
+            ],
+            extend: Extend::Pad,
+            interpolation: ColorSpace::Srgb,
+        }),
+    );
+    l.fill(
+        Shape::circle(64.0, 72.0, 52.0),
+        solid(srgb(0.85, 0.15, 0.20)),
+    );
+    l.fill(
+        Shape::circle(196.0, 60.0, 40.0),
+        solid(srgb(0.10, 0.60, 0.85)),
+    );
+    l.fill(
+        Shape::rect(40.0, 150.0, 176.0, 82.0),
+        solid(srgb(0.90, 0.65, 0.10)),
+    );
+    l.fill(
+        Shape::Ellipse(Ellipse::new((160.0, 150.0), (70.0, 46.0), 0.0)),
+        solid(srgb(0.40, 0.18, 0.75)),
+    );
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "a linear sequence of independent scene builders; it reads top to bottom"
@@ -3007,46 +3047,6 @@ fn run() -> Result<(), SceneError> {
 
     // ---- Backdrop groups ---------------------------------------------------
 
-    // Shared background: saturated shapes and a diagonal gradient so the
-    // sampled backdrop is visibly different from a flat fill.
-    fn backdrop_background(l: &mut LayerBuilder) {
-        l.fill(
-            Shape::rect(0.0, 0.0, 256.0, 256.0),
-            Paint::Linear(LinearGradient {
-                start: Point::new(0.0, 0.0),
-                end: Point::new(256.0, 256.0),
-                stops: vec![
-                    GradientStop {
-                        offset: 0.0,
-                        color: srgb(0.15, 0.20, 0.55),
-                    },
-                    GradientStop {
-                        offset: 1.0,
-                        color: srgb(0.85, 0.35, 0.15),
-                    },
-                ],
-                extend: Extend::Pad,
-                interpolation: ColorSpace::Srgb,
-            }),
-        );
-        l.fill(
-            Shape::circle(64.0, 72.0, 52.0),
-            solid(srgb(0.85, 0.15, 0.20)),
-        );
-        l.fill(
-            Shape::circle(196.0, 60.0, 40.0),
-            solid(srgb(0.10, 0.60, 0.85)),
-        );
-        l.fill(
-            Shape::rect(40.0, 150.0, 176.0, 82.0),
-            solid(srgb(0.90, 0.65, 0.10)),
-        );
-        l.fill(
-            Shape::Ellipse(Ellipse::new((160.0, 150.0), (70.0, 46.0), 0.0)),
-            solid(srgb(0.40, 0.18, 0.75)),
-        );
-    }
-
     corpus.scene_setup("backdrop-plain", 256, 256, white, |b| {
         b.backdrop_group(1, Vec::new());
         let l = &mut b.root();
@@ -3076,7 +3076,7 @@ fn run() -> Result<(), SceneError> {
         backdrop_background(l);
         l.layer(|m| {
             let clip = Shape::RoundedRect(RoundedRect::new(24.0, 24.0, 140.0, 92.0, 14.0));
-            m.clip(clip.clone());
+            m.clip(clip);
             m.backdrop(1);
             m.fill(
                 Shape::rect(26.0, 26.0, 112.0, 64.0),
@@ -3085,7 +3085,7 @@ fn run() -> Result<(), SceneError> {
         });
         l.layer(|m| {
             let clip = Shape::RoundedRect(RoundedRect::new(140.0, 176.0, 232.0, 216.0, 20.0));
-            m.clip(clip.clone());
+            m.clip(clip);
             m.backdrop(1);
             m.fill(
                 Shape::rect(142.0, 178.0, 88.0, 36.0),

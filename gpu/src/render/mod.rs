@@ -335,6 +335,10 @@ pub struct GpuRenderer {
     /// The globals buffer size `bind0` was built against.
     bound_globals_size: u64,
     atlas: Atlas,
+    /// Per-commit cell writes, rebuilt in place each frame.
+    commit_writes: Vec<glyph::CellWrite>,
+    /// Per-surface pending origins, rebuilt in place each apply.
+    pending_origins: Vec<PendingOrigin>,
     /// A dummy 1×1 view for unused group-1 slots.
     dummy_view: wgpu::TextureView,
     surfaces: HashMap<SurfaceId, SurfaceState>,
@@ -1171,6 +1175,8 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             bound_stop_size: 32 * 16,
             bound_globals_size: 16,
             atlas,
+            commit_writes: Vec::new(),
+            pending_origins: Vec::new(),
             surfaces: HashMap::new(),
             fonts: HashMap::new(),
             images: HashMap::new(),
@@ -3075,7 +3081,8 @@ impl GpuRenderer {
             }
         }
         let bounds = self.atlas.shelf_bounds();
-        let mut writes = Vec::new();
+        let mut writes = std::mem::take(&mut self.commit_writes);
+        writes.clear();
         for (surf, result) in pending.iter_mut().zip(results.iter_mut()) {
             let Ok(lowered) = result else {
                 continue;
@@ -3094,6 +3101,7 @@ impl GpuRenderer {
         }
         self.atlas
             .upload_committed(&self.device, &self.queue, &bounds, &writes);
+        self.commit_writes = writes;
         Commit::Done
     }
 
@@ -3108,7 +3116,8 @@ impl GpuRenderer {
         writes: &mut Vec<glyph::CellWrite>,
     ) -> Result<(), RenderError> {
         let pending = std::mem::take(&mut lowered.pending);
-        let mut origins = Vec::with_capacity(pending.len());
+        let mut origins = std::mem::take(&mut self.pending_origins);
+        origins.clear();
         for raster in pending {
             origins.push(self.apply_raster(raster, writes)?);
         }
@@ -3138,6 +3147,7 @@ impl GpuRenderer {
             };
             surf.frame.instances[inst as usize].uv[2..].copy_from_slice(origin);
         }
+        self.pending_origins = origins;
         Ok(())
     }
 

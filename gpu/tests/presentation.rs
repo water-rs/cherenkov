@@ -4,18 +4,35 @@ use cherenkov::{Engine, FrameTime, WorkingColor};
 use cherenkov_gpu::{
     Gpu, GpuConfig,
     interop::{
-        OutputAlpha, OutputColor, Presenter, SharedDevice, TextureOutput, TextureTarget, wgpu,
+        OutputAlpha, OutputColor, Presenter, SharedDevice, TextureOutput, TextureTarget,
+        shader_delivery, wgpu,
     },
 };
+
+/// An adapter/device pair usable as a `SharedDevice`: passthrough backends
+/// need `PASSTHROUGH_SHADERS`, which the engine requires for its precompiled
+/// fixed shaders (issue #57).
+fn shared_device()
+-> Result<(wgpu::Instance, wgpu::Adapter, wgpu::Device, wgpu::Queue), Box<dyn std::error::Error>> {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let adapter =
+        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?;
+    let required_features = match adapter.get_info().backend {
+        wgpu::Backend::Vulkan | wgpu::Backend::Metal => wgpu::Features::PASSTHROUGH_SHADERS,
+        _ => wgpu::Features::empty(),
+    };
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        required_features,
+        ..wgpu::DeviceDescriptor::default()
+    }))?;
+    Ok((instance, adapter, device, queue))
+}
 
 #[test]
 fn exported_texture_preserves_hdr_and_updates_after_resize()
 -> Result<(), Box<dyn std::error::Error>> {
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-    let adapter =
-        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?;
-    let (device, queue) =
-        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))?;
+    let (instance, adapter, device, queue) = shared_device()?;
+    let backend = adapter.get_info().backend;
     let engine = Engine::<Gpu>::new(GpuConfig {
         device: Some(SharedDevice {
             instance,
@@ -33,7 +50,8 @@ fn exported_texture_preserves_hdr_and_updates_after_resize()
     let destination = engine.surface(target)?;
     let output = destinations.try_recv()?;
     engine.render(FrameTime::now())?;
-    let mut presenter = Presenter::new(&device);
+    let delivery = shader_delivery(backend, &device)?;
+    let mut presenter = Presenter::new(&device, delivery);
     presenter.texture(
         &device,
         &queue,
@@ -89,11 +107,8 @@ fn exported_texture_preserves_hdr_and_updates_after_resize()
 #[test]
 fn hardware_and_shader_srgb_store_the_same_premultiplied_bytes()
 -> Result<(), Box<dyn std::error::Error>> {
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-    let adapter =
-        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?;
-    let (device, queue) =
-        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))?;
+    let (instance, adapter, device, queue) = shared_device()?;
+    let backend = adapter.get_info().backend;
     let engine = Engine::<Gpu>::new(GpuConfig {
         device: Some(SharedDevice {
             instance,
@@ -107,7 +122,8 @@ fn hardware_and_shader_srgb_store_the_same_premultiplied_bytes()
     let surface = engine.surface(target)?;
     let source = textures.recv()?;
     let view = source.create_view(&wgpu::TextureViewDescriptor::default());
-    let mut presenter = Presenter::new(&device);
+    let delivery = shader_delivery(backend, &device)?;
+    let mut presenter = Presenter::new(&device, delivery);
     let outputs = [
         wgpu::TextureFormat::Rgba8Unorm,
         wgpu::TextureFormat::Rgba8UnormSrgb,

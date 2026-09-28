@@ -424,7 +424,7 @@ impl<'a> Lowering<'a> {
         tree: &SurfaceTree,
         caches: &mut HashMap<LayerId, ContentData>,
         images: &HashMap<u64, Arc<super::image::CpuImage>>,
-        fonts: &HashMap<u64, cherenkov::FontData>,
+        fonts: &HashMap<u64, super::font::Font>,
     ) -> Result<(), RenderError> {
         for content in caches.values_mut() {
             self.commands_lowered +=

@@ -42,10 +42,15 @@ source-over arithmetic is preserved exactly.
 The source branch also attempted a different coverage compiler, SIMD band
 storage, exact general shadows and COLR support. Their review decisions are in
 [cpu-port-review.md](cpu-port-review.md). This port does not silently accept
-unsupported shader/filter paints or color font formats.
-COLR's approximate brush transforms, black foreground substitution and debug
-string hash cache are not imported. Those rejected parts require separate
-correct implementations; they are not fallback paths in this backend.
+unsupported shader/filter paints. COLRv0/v1 colour
+glyphs are native: each glyph's paint graph is cached as a
+foreground-independent node tree under a structural (glyph, coords) key,
+then expanded into ordinary fills, clips and groups at the glyph's
+placement. Brush transforms are exact — gradient geometry keeps its own
+paint transform instead of a sqrt(det) approximation — and a foreground
+brush whose paint carries no alpha channel (image, mesh, shader) keeps its
+COLR alpha as group opacity. Bitmap-only colour fonts (CBDT/sbix without
+outlines) remain unsupported.
 
 Opt-in diagnostics use RUST_LOG=cherenkov_cpu::profile=debug. lower_ns covers
 retained lowering, glyph_ns mask resolution, and shade_ns framebuffer clearing

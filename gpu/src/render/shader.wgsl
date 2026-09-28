@@ -261,41 +261,39 @@ fn sdf_grad(s: Shape, p: vec2<f32>) -> vec4<f32> {
     // curvature on a circular, elliptical or Lamé arc, 0.0 on straight
     // edges; w = 1.0 only where the distance is not a half-plane (the
     // sharp-corner exterior wedge).
-    {
-        let sgn = select(vec2<f32>(-1.0), vec2<f32>(1.0), p >= vec2<f32>(0.0));
-        let right = p.x > 0.0;
-        let bottom = p.y > 0.0;
-        let r = select(
-            select(s.radii.x, s.radii.w, bottom),
-            select(s.radii.y, s.radii.z, bottom),
-            right,
-        );
-        let rx = max(r, 0.0);
-        let ry = rx * s.aspect;
-        let a = abs(p) - s.half;
-        var g: vec4<f32>;
-        if rx <= 0.0 || ry <= 0.0 {
-            if a.x > 0.0 && a.y > 0.0 {
-                g = vec4<f32>(a / length(a), 0.0, 1.0);
+    let sgn = select(vec2<f32>(-1.0), vec2<f32>(1.0), p >= vec2<f32>(0.0));
+    let right = p.x > 0.0;
+    let bottom = p.y > 0.0;
+    let r = select(
+        select(s.radii.x, s.radii.w, bottom),
+        select(s.radii.y, s.radii.z, bottom),
+        right,
+    );
+    let rx = max(r, 0.0);
+    let ry = rx * s.aspect;
+    let a = abs(p) - s.half;
+    var g: vec4<f32>;
+    if rx <= 0.0 || ry <= 0.0 {
+        if a.x > 0.0 && a.y > 0.0 {
+            g = vec4<f32>(a / length(a), 0.0, 1.0);
+        } else {
+            g = vec4<f32>(select(vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), a.x > a.y), 0.0, 0.0);
+        }
+    } else {
+        let q = a + vec2<f32>(rx, ry);
+        if q.x > 0.0 && q.y > 0.0 {
+            if abs(s.exponent - 2.0) < 1e-4 && abs(s.aspect - 1.0) < 1e-4 {
+                let v = q / vec2<f32>(rx * rx, ry * ry);
+                g = vec4<f32>(v / max(length(v), 1e-12), rx, 0.0);
             } else {
-                g = vec4<f32>(select(vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), a.x > a.y), 0.0, 0.0);
+                let l = lame_corner(q, vec2<f32>(rx, ry), s.exponent);
+                g = vec4<f32>(l.yz, l.w, 0.0);
             }
         } else {
-            let q = a + vec2<f32>(rx, ry);
-            if q.x > 0.0 && q.y > 0.0 {
-                if abs(s.exponent - 2.0) < 1e-4 && abs(s.aspect - 1.0) < 1e-4 {
-                    let v = q / vec2<f32>(rx * rx, ry * ry);
-                    g = vec4<f32>(v / max(length(v), 1e-12), rx, 0.0);
-                } else {
-                    let l = lame_corner(q, vec2<f32>(rx, ry), s.exponent);
-                    g = vec4<f32>(l.yz, l.w, 0.0);
-                }
-            } else {
-                g = vec4<f32>(select(vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), a.x > a.y), 0.0, 0.0);
-            }
+            g = vec4<f32>(select(vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), a.x > a.y), 0.0, 0.0);
         }
-        return vec4<f32>(sgn * g.xy, g.zw);
     }
+    return vec4<f32>(sgn * g.xy, g.zw);
 }
 
 // Area coverage of the axis-aligned half-plane `d <= 0` where `d`

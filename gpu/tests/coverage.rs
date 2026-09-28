@@ -211,9 +211,6 @@ fn elliptical_and_lame_rims_get_their_exact_area() -> Result<(), Box<dyn std::er
                     continue;
                 }
                 let exact = supersample(x, y, inside.as_ref());
-                if (exact - 0.5).abs() > 0.499 {
-                    continue; // fully in/out: skip saturated pixels
-                }
                 let err = (alpha(x, y) - exact).abs();
                 if err > max_err {
                     max_err = err;

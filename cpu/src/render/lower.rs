@@ -8,7 +8,7 @@ use std::sync::Arc;
 use cherenkov::kurbo::{Affine, BezPath, PathEl, Point, Rect};
 use cherenkov::{BlendMode, FillRule, FrameId, GlyphRun, GlyphStyle, ShapeData};
 
-use cherenkov::{LayerId, RenderError, SurfaceTree};
+use cherenkov::{BackdropId, LayerId, RenderError, SurfaceId, SurfaceTree};
 
 use super::filter::{Erased, Registry};
 use super::prepared::Op;
@@ -120,6 +120,54 @@ pub enum Item {
         /// The clip in force at the pop.
         clip: Option<ClipRef>,
     },
+    /// Capture the rows a backdrop group's members can sample: flatten
+    /// the trailing `flatten` clip-only isolation levels over the nearest
+    /// semantic level's contents and run the group's chain on the copy.
+    /// Boxed: a capture is rare and large — it must not grow `Item`.
+    Capture(Box<CaptureItem>),
+    /// Sample a group's captured backdrop as a member's bottom-most
+    /// content, inside the member's clip, over `bounds`.
+    Sample {
+        /// The group's renderer key (`BackdropId::raw()`).
+        group: u64,
+        /// The sampled rect: member ∩ region, in device pixels.
+        bounds: IRect,
+        /// The clip in force at the member.
+        clip: Option<ClipRef>,
+        /// What the sample becomes once composited.
+        effect: SampleEffect,
+    },
+}
+
+/// The capture item's payload, boxed inside [`Item::Capture`].
+#[derive(Clone)]
+pub struct CaptureItem {
+    /// The group's renderer key (`BackdropId::raw()`).
+    pub group: u64,
+    /// The capture rect in device pixels (`union ⊕ apron`, clamped to
+    /// the surface).
+    pub region: IRect,
+    /// The members' union rows, clamped to the surface.
+    pub union: IRect,
+    /// The apron rows the chain reads past the sampled rows.
+    pub apron: usize,
+    /// Extra rows around each band the capture covers: the deepest
+    /// enclosing filter-scope apron over the group's members.
+    pub reach: usize,
+    /// The prepared chain, when the group is filtered.
+    pub filter: Option<FrameFilter>,
+    /// Clip-only isolation levels on the stack flattened over the
+    /// nearest semantic level.
+    pub flatten: usize,
+}
+
+/// How a backdrop sample composites into the member's layer. Only the
+/// plain sample exists so far; the variant is the seam for a sampled
+/// effect (#116).
+#[derive(Clone, Copy, Debug)]
+pub enum SampleEffect {
+    /// Composite the captured rows unchanged under the member clip.
+    None,
 }
 
 pub(super) type FrameFilter = (Arc<dyn Erased + Send + Sync>, Arc<[f32]>);
@@ -180,12 +228,39 @@ pub struct GlyphReq {
     pub slot: crate::render::glyph::GlyphSlot,
 }
 
+/// The plan for one backdrop group: the capture point (its first member
+/// in paint order), the capture rect and every member's device bounds for
+/// its sampling composite.
+struct BackdropPlan {
+    /// The first member layer in paint order — its entry emits the capture.
+    first: LayerId,
+    /// The union of members' clip bounds before the footprint apron.
+    union: Rect,
+    /// The union's device rows, clamped to the surface.
+    union_rows: (usize, usize),
+    /// The capture rect in device pixels.
+    region: IRect,
+    /// The chain's apron in rows around the sampled rows.
+    apron: usize,
+    /// Extra rows around each band the capture must cover.
+    reach: usize,
+    /// The prepared chain, when the group is filtered.
+    filter: Option<FrameFilter>,
+    /// Each member layer's device-space clip bounds and innermost
+    /// enclosing filter scope.
+    members: HashMap<LayerId, (Rect, Option<LayerId>)>,
+    /// The innermost filter scope the capture item lands in.
+    scope: Option<LayerId>,
+}
+
 /// The lowering walk state for one surface frame.
 pub struct Lowering<'a> {
     items: &'a mut Vec<Item>,
     filters: Option<&'a mut Registry>,
     frame: FrameId,
     used_filters: HashSet<u64>,
+    /// Backdrop groups referenced by members this frame.
+    used_groups: HashSet<u64>,
     /// Glyph mask requests emitted during the walk.
     pub glyphs: Vec<GlyphReq>,
     width: usize,
@@ -195,6 +270,15 @@ pub struct Lowering<'a> {
     /// content then snaps its translation to the ¼-pixel grid.
     animating: bool,
     clip: Option<ClipRef>,
+    /// Whether each open isolation level is clip-only (`true` when its
+    /// opacity is 1 and its blend is `Normal`), in emission order.
+    iso_kinds: Vec<bool>,
+    /// Backdrop groups planned before lowering, by group id.
+    backdrops: HashMap<u64, BackdropPlan>,
+    /// The apron rows each filtered layer's scope needs beyond its own
+    /// footprint, by layer: a scope that directly contains captures grows
+    /// to cover their `apron + reach`.
+    scope_aprons: HashMap<LayerId, usize>,
     /// Source commands resolved this frame.
     pub commands_lowered: u32,
     /// Content layers composed this frame.
@@ -336,6 +420,32 @@ fn device_rect(t: Affine, r: Rect) -> Rect {
     )
 }
 
+/// The device-space bounding box of `clip` under `transform` — the shape
+/// the merged clip machinery would clip against, any transform. A shape
+/// with no path (`Line`) has no bounds.
+fn clip_device_bounds(transform: Affine, clip: &ShapeData) -> Rect {
+    use kurbo::Shape as _;
+    let Some((path, _)) = shape_path(clip, FLATTEN_TOL) else {
+        return Rect::ZERO;
+    };
+    let local = path.bounding_box();
+    let corners = [
+        Point::new(local.x0, local.y0),
+        Point::new(local.x1, local.y0),
+        Point::new(local.x0, local.y1),
+        Point::new(local.x1, local.y1),
+    ]
+    .map(|p| transform * p);
+    let (mut min, mut max) = (corners[0], corners[0]);
+    for p in &corners[1..] {
+        min.x = min.x.min(p.x);
+        min.y = min.y.min(p.y);
+        max.x = max.x.max(p.x);
+        max.y = max.y.max(p.y);
+    }
+    Rect::new(min.x, min.y, max.x, max.y)
+}
+
 /// Whether all four edges of `r` are within `1e-6` of integers.
 fn integer_edges(r: Rect) -> Option<IRect> {
     let close = |v: f64| (v - v.round()).abs() <= 1e-6;
@@ -368,12 +478,16 @@ impl<'a> Lowering<'a> {
             filters,
             frame,
             used_filters: HashSet::new(),
+            used_groups: HashSet::new(),
             glyphs: Vec::new(),
             width: size.0 as usize,
             height: size.1 as usize,
             transform: Affine::IDENTITY,
             animating: false,
             clip: None,
+            iso_kinds: Vec::new(),
+            backdrops: HashMap::new(),
+            scope_aprons: HashMap::new(),
             commands_lowered: 0,
             layers_composed: 0,
         }
@@ -385,6 +499,7 @@ impl<'a> Lowering<'a> {
     /// is mutable: lowering fills each font's `COLRv1` node-tree cache.
     pub fn run(
         &mut self,
+        surface: SurfaceId,
         tree: &SurfaceTree,
         caches: &mut HashMap<LayerId, ContentData>,
         images: &HashMap<u64, Arc<super::image::CpuImage>>,
@@ -394,11 +509,259 @@ impl<'a> Lowering<'a> {
         for content in caches.values_mut() {
             self.commands_lowered += content.prepare(&mut lowerer)?;
         }
+        // The registry borrow must leave `self` for the planning walk.
+        let mut filters = self.filters.take();
+        let planned = filters.as_deref_mut().map_or(Ok(()), |registry| {
+            self.plan_backdrops(tree, surface, registry)
+        });
+        self.filters = filters;
+        planned?;
         self.layer(tree.root(), tree, caches)
     }
 
     pub fn take_used_filters(&mut self) -> HashSet<u64> {
         std::mem::take(&mut self.used_filters)
+    }
+
+    /// The backdrop groups members referenced this frame.
+    pub fn take_used_groups(&mut self) -> HashSet<u64> {
+        std::mem::take(&mut self.used_groups)
+    }
+
+    /// One layer of the backdrop planning walk, mirroring `layer`'s
+    /// transform math: the clip sits in `parent * node.transform` space,
+    /// children in `parent * node.content_transform()` space. `scopes`
+    /// holds the enclosing filtered layers, innermost last.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the walk threads both trees and the scope stack"
+    )]
+    fn plan_layer(
+        &mut self,
+        id: LayerId,
+        tree: &SurfaceTree,
+        groups: &mut HashMap<u64, super::filter::PreparedBackdrop>,
+        filters: &mut Registry,
+        surface: SurfaceId,
+        parent: Affine,
+        scopes: &mut Vec<LayerId>,
+    ) -> Result<(), RenderError> {
+        let node = tree.layer(id);
+        if let Some(gid) = node.backdrop {
+            let g = gid.raw();
+            self.used_groups.insert(g);
+            let prepared = match groups.entry(g) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(filters.prepare_backdrop(surface, gid, self.frame).map_err(
+                        |error| match error {
+                            RenderError::Render(_) => RenderError::Render(format!(
+                                "layer {id:?} samples unknown backdrop group {gid:?}"
+                            )),
+                            other => other,
+                        },
+                    )?)
+                }
+            };
+            let clip = node
+                .clip
+                .as_ref()
+                .ok_or(RenderError::Unsupported(names::BACKDROP_UNCLIPPED))?;
+            let member = clip_device_bounds(parent * node.transform, clip);
+            let plan = self.backdrops.entry(g).or_insert_with(|| BackdropPlan {
+                first: id,
+                union: member,
+                union_rows: (0, 0),
+                region: IRect {
+                    x0: 0,
+                    y0: 0,
+                    x1: 0,
+                    y1: 0,
+                },
+                apron: 0,
+                reach: 0,
+                filter: prepared.filter.clone(),
+                members: HashMap::new(),
+                scope: scopes.last().copied(),
+            });
+            plan.union = plan.union.union(member);
+            plan.members.insert(id, (member, scopes.last().copied()));
+        }
+        let children = parent * node.content_transform();
+        if node.filter.is_some() {
+            scopes.push(id);
+        }
+        for child in &node.children {
+            self.plan_layer(*child, tree, groups, filters, surface, children, scopes)?;
+        }
+        if node.filter.is_some() {
+            scopes.pop();
+        }
+        Ok(())
+    }
+
+    /// Plans every backdrop group: a paint-order walk collecting each
+    /// member's device-space clip bounds, then the capture region — the
+    /// union inflated by the chain footprint's apron, intersected with
+    /// the surface and rounded outward to integer pixels.
+    ///
+    /// A member inside a filter scope samples rows within that scope's
+    /// window (`band ± apron`); each group's `reach` is the deepest such
+    /// apron over its members, and a scope directly containing a capture
+    /// grows its apron to `apron + reach` so the capture's window fits.
+    /// Both bounds are monotone in each other and capped at the surface
+    /// height, so the fixed point is found by iteration.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss,
+        reason = "footprints are non-negative and bounded by the surface height"
+    )]
+    fn plan_backdrops(
+        &mut self,
+        tree: &SurfaceTree,
+        surface: SurfaceId,
+        filters: &mut Registry,
+    ) -> Result<(), RenderError> {
+        let mut groups = HashMap::new();
+        self.plan_layer(
+            tree.root(),
+            tree,
+            &mut groups,
+            filters,
+            surface,
+            Affine::IDENTITY,
+            &mut Vec::new(),
+        )?;
+        if self.backdrops.is_empty() {
+            return Ok(());
+        }
+        let h = self.height;
+        for (gid, plan) in &mut self.backdrops {
+            let footprint = groups[gid].footprint;
+            if footprint.extent.partial_cmp(&0.5) != Some(std::cmp::Ordering::Less) {
+                return Err(RenderError::Unsupported(names::BACKDROP_FOOTPRINT));
+            }
+            let (uw, uh) = (plan.union.width(), plan.union.height());
+            let y0 = plan.union.y0.floor().max(0.0) as usize;
+            let y1 = (plan.union.y1.ceil().min(h as f64) as usize).max(y0);
+            plan.union_rows = (y0, y1.min(h));
+            if uw.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater)
+                || uh.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater)
+            {
+                continue;
+            }
+            let a = (f64::from(footprint.extent).mul_add(uw.max(uh), f64::from(footprint.pixels))
+                / 2.0f64.mul_add(-f64::from(footprint.extent), 1.0))
+            .ceil();
+            let region = IRect {
+                x0: (plan.union.x0 - a).floor().max(0.0) as i32,
+                y0: (plan.union.y0 - a).floor().max(0.0) as i32,
+                x1: (plan.union.x1 + a).ceil().min(self.width as f64) as i32,
+                y1: (plan.union.y1 + a).ceil().min(h as f64) as i32,
+            };
+            plan.apron = a.min(h as f64) as usize;
+            if region.x0 < region.x1 && region.y0 < region.y1 {
+                plan.region = region;
+            }
+        }
+        // The apron a scope needs around each band — its own filter's
+        // footprint, or `capture apron + reach` for scopes a capture
+        // lands directly in.
+        let mut aprons: HashMap<LayerId, usize> = HashMap::new();
+        for plan in self.backdrops.values() {
+            for &scope in plan
+                .members
+                .values()
+                .filter_map(|(_, s)| s.as_ref())
+                .chain(plan.scope.iter())
+            {
+                if let std::collections::hash_map::Entry::Vacant(e) = aprons.entry(scope) {
+                    let node = tree.layer(scope);
+                    let filter = node.filter.expect("a scope is a filtered layer");
+                    let (_, _, footprint) = filters.prepare(filter, self.frame, (self.width, h))?;
+                    if !footprint.is_finite() || footprint < 0.0 {
+                        return Err(RenderError::Render(format!(
+                            "filter {} has invalid CPU footprint {footprint}",
+                            filter.raw()
+                        )));
+                    }
+                    e.insert(if footprint >= h as f32 {
+                        h
+                    } else {
+                        footprint.ceil() as usize
+                    });
+                }
+            }
+        }
+        loop {
+            let mut changed = false;
+            for plan in self.backdrops.values_mut() {
+                let reach = plan
+                    .members
+                    .values()
+                    .filter_map(|(_, s)| s.map(|s| aprons[&s]))
+                    .fold(0, usize::max);
+                changed |= reach != plan.reach;
+                plan.reach = reach;
+            }
+            for plan in self.backdrops.values() {
+                if let Some(scope) = plan.scope {
+                    let needed = (plan.apron + plan.reach).min(h);
+                    let apron = aprons.get_mut(&scope).expect("capture scope registered");
+                    if *apron < needed {
+                        *apron = needed;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        self.scope_aprons = aprons;
+        Ok(())
+    }
+
+    /// Emits the member's `Sample` item, covering `member ∩ region` under
+    /// the clip in force.
+    fn emit_backdrop_sample(&mut self, gid: u64, member: LayerId) {
+        let Some(plan) = self.backdrops.get(&gid) else {
+            return;
+        };
+        if plan.region.x0 >= plan.region.x1 || plan.region.y0 >= plan.region.y1 {
+            return;
+        }
+        let Some(&(bounds, _)) = plan.members.get(&member) else {
+            return;
+        };
+        let region = Rect::new(
+            f64::from(plan.region.x0),
+            f64::from(plan.region.y0),
+            f64::from(plan.region.x1),
+            f64::from(plan.region.y1),
+        );
+        let bounds = bounds.intersect(region);
+        if bounds.width() <= 0.0 || bounds.height() <= 0.0 {
+            return;
+        }
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_possible_wrap,
+            reason = "bounds are finite and inside the surface"
+        )]
+        let bounds = IRect {
+            x0: (bounds.x0.floor() as i32).clamp(0, self.width as i32),
+            y0: (bounds.y0.floor() as i32).clamp(0, self.height as i32),
+            x1: (bounds.x1.ceil() as i32).clamp(0, self.width as i32),
+            y1: (bounds.y1.ceil() as i32).clamp(0, self.height as i32),
+        };
+        self.items.push(Item::Sample {
+            group: gid,
+            bounds,
+            clip: self.clip.clone(),
+            effect: SampleEffect::None,
+        });
     }
 
     /// The coverage a clip contributes at `(px, py)`.
@@ -489,8 +852,11 @@ impl<'a> Lowering<'a> {
         body: impl FnOnce(&mut Self) -> Result<(), RenderError>,
     ) -> Result<(), RenderError> {
         let saved = std::mem::replace(&mut self.clip, inner_clip);
+        self.iso_kinds
+            .push(opacity >= 1.0 && blend.0 == BlendMode::Normal);
         self.items.push(Item::PushIsolate);
         let result = body(self);
+        self.iso_kinds.pop();
         self.clip = saved;
         self.items.push(Item::PopIsolate {
             opacity,
@@ -507,6 +873,7 @@ impl<'a> Lowering<'a> {
         blend: (BlendMode, cherenkov::BlendSpace),
         clip: Option<ClipRef>,
         body: impl FnOnce(&mut Self) -> Result<(), RenderError>,
+        scope: Option<LayerId>,
     ) -> Result<(), RenderError> {
         let (filter, params, footprint) = self
             .filters
@@ -525,15 +892,26 @@ impl<'a> Lowering<'a> {
             clippy::cast_precision_loss,
             reason = "the nonnegative footprint is compared with the bounded surface height first"
         )]
-        let apron = if footprint >= self.height as f32 {
+        let footprint_apron = if footprint >= self.height as f32 {
             self.height
         } else {
             footprint.ceil() as usize
         };
+        // A scope containing a backdrop capture grows to cover the
+        // capture's apron and reach, so its window always holds the rows
+        // the capture reads.
+        let apron = scope
+            .and_then(|id| self.scope_aprons.get(&id).copied())
+            .unwrap_or(0)
+            .max(footprint_apron);
         self.used_filters.insert(id.raw());
         let push = self.items.len();
         self.items.push(Item::PushFilter { end: 0, apron });
+        // The scope's nested run gets a fresh isolation stack; the kinds
+        // stack mirrors it.
+        let saved_kinds = std::mem::take(&mut self.iso_kinds);
         let result = body(self);
+        self.iso_kinds = saved_kinds;
         let end = u32::try_from(self.items.len())
             .map_err(|_| RenderError::Render(format!("filter {} scope is too large", id.raw())))?;
         self.items[push] = Item::PushFilter { end, apron };
@@ -557,9 +935,7 @@ impl<'a> Lowering<'a> {
         caches: &mut HashMap<LayerId, ContentData>,
     ) -> Result<(), RenderError> {
         let node = tree.layer(id);
-        if node.backdrop.is_some() {
-            return Err(RenderError::Unsupported(names::BACKDROP));
-        }
+        let backdrop = node.backdrop.map(BackdropId::raw);
         let saved = self.transform;
         let saved_animating = self.animating;
         self.animating |= node.animating();
@@ -569,9 +945,54 @@ impl<'a> Lowering<'a> {
             self.transform = cherenkov::snap_animating(self.transform);
             content_space = cherenkov::snap_animating(content_space);
         }
+        if let Some(gid) = backdrop
+            && let Some(plan) = self.backdrops.get(&gid)
+            && plan.first == id
+            && plan.region.x0 < plan.region.x1
+            && plan.region.y0 < plan.region.y1
+        {
+            let region = plan.region;
+            let union_rows = plan.union_rows;
+            let apron = plan.apron;
+            let reach = plan.reach;
+            let filter = plan.filter.clone();
+            let flatten = self.iso_kinds.iter().rev().take_while(|&&k| k).count();
+            self.items.push(Item::Capture(Box::new(CaptureItem {
+                group: gid,
+                region,
+                union: IRect {
+                    x0: 0,
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        clippy::cast_possible_wrap,
+                        reason = "union rows lie inside the surface"
+                    )]
+                    y0: union_rows.0 as i32,
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        clippy::cast_possible_wrap,
+                        reason = "surface width is small"
+                    )]
+                    x1: self.width as i32,
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        clippy::cast_possible_wrap,
+                        reason = "union rows lie inside the surface"
+                    )]
+                    y1: union_rows.1 as i32,
+                },
+                apron,
+                reach,
+                filter,
+                flatten,
+            })));
+        }
         let outer = self.clip.clone();
         let result = self.with_clip(node.clip.as_ref(), |s| {
             s.transform = content_space;
+            if let Some(gid) = backdrop {
+                s.emit_backdrop_sample(gid, id);
+            }
             if let Some(filter) = node.filter {
                 let clip = s.clip.clone();
                 s.filter_isolate(
@@ -580,6 +1001,7 @@ impl<'a> Lowering<'a> {
                     (node.blend, cherenkov::BlendSpace::Linear),
                     clip,
                     |s| s.layer_items(id, node, tree, caches),
+                    Some(id),
                 )
             } else if node.opacity < 1.0
                 || node.blend != BlendMode::Normal
@@ -665,10 +1087,17 @@ impl<'a> Lowering<'a> {
                 } => {
                     let clip = self.clip.clone();
                     if let Some(filter) = filter {
-                        self.filter_isolate(*filter, *opacity, (*blend, *space), clip, |s| {
-                            changed |= s.ops(ops, emissions, i + 1, *end as usize)?;
-                            Ok(())
-                        })?;
+                        self.filter_isolate(
+                            *filter,
+                            *opacity,
+                            (*blend, *space),
+                            clip,
+                            |s| {
+                                changed |= s.ops(ops, emissions, i + 1, *end as usize)?;
+                                Ok(())
+                            },
+                            None,
+                        )?;
                     } else {
                         self.isolate(*opacity, (*blend, *space), clip.clone(), clip, |s| {
                             changed |= s.ops(ops, emissions, i + 1, *end as usize)?;

@@ -21,9 +21,9 @@ mod raster;
 use std::collections::HashMap;
 
 use cherenkov::{
-    ContentOp, EngineError, FontData, FontId, Frame, FrameStats, ImageId, ImageUpload, LayerId,
-    MemoryUsage, Pressure, Readback, Redraw, RenderError, Renderer, ResourceError, SurfaceError,
-    SurfaceId, SurfaceInfo,
+    BackdropId, ContentOp, EngineError, FontData, FontId, Frame, FrameStats, ImageId, ImageUpload,
+    LayerId, MemoryUsage, Pressure, Readback, Redraw, RenderError, Renderer, ResourceError,
+    SurfaceError, SurfaceId, SurfaceInfo,
 };
 use lower::{ContentData, Item, Lowering};
 
@@ -59,6 +59,12 @@ struct SurfaceState {
     /// front end's [`cherenkov::SurfaceTree`].
     layers: HashMap<LayerId, ContentData>,
     filters: Vec<u64>,
+    /// Backdrop groups referenced by the last frame, by group id.
+    groups: Vec<u64>,
+    /// The largest live pixel-buffer bytes in any band that ran a
+    /// backdrop capture last frame (window, isolation stack and capture
+    /// buffers). 0 when no capture ran.
+    backdrop_capture_peak: u64,
 }
 
 impl SurfaceState {
@@ -212,6 +218,8 @@ impl Renderer for RasterRenderer {
                 refresh,
                 layers: HashMap::new(),
                 filters: Vec::new(),
+                groups: Vec::new(),
+                backdrop_capture_peak: 0,
             },
         );
         Ok(SurfaceInfo {
@@ -414,11 +422,19 @@ impl Renderer for RasterRenderer {
             colr = categories.colr,
             "memory usage",
         );
+        // Backdrop captures are transient: the reported value is the
+        // peak live pixel-buffer bytes of the last frame's capture bands,
+        // in premultiplied `f32` (`linear-f32`).
+        let backdrop_captures: u64 = self
+            .surfaces
+            .values()
+            .map(|surface| surface.backdrop_capture_peak)
+            .sum();
         MemoryUsage {
             gpu: cherenkov::Bytes(0),
             cpu: cherenkov::Bytes(categories.total()),
-            backdrop_captures: cherenkov::Bytes(0),
-            backdrop_capture_format: None,
+            backdrop_captures: cherenkov::Bytes(backdrop_captures),
+            backdrop_capture_format: (backdrop_captures > 0).then_some("linear-f32"),
         }
     }
 
@@ -451,6 +467,10 @@ impl RasterRenderer {
                     .filters
                     .iter()
                     .any(|id| self.filters.wants_redraw(*id))
+                    || surface
+                        .groups
+                        .iter()
+                        .any(|id| self.filters.wants_redraw_group(sf.id, BackdropId::new(*id)))
             });
             if sf.changed || filter_changed {
                 stats.frame = Some(frame.id);
@@ -462,17 +482,32 @@ impl RasterRenderer {
             .values()
             .flat_map(|surface| surface.filters.iter().copied())
             .collect();
-        self.filters.set_active(&used);
-        self.filters.finish_frame(&used);
+        let used_groups: std::collections::HashSet<(u64, u64)> = self
+            .surfaces
+            .iter()
+            .flat_map(|(surface, state)| {
+                state
+                    .groups
+                    .iter()
+                    .map(move |group| (surface.raw(), *group))
+            })
+            .collect();
+        self.filters.set_active(&used, &used_groups);
+        self.filters.finish_frame(&used, &used_groups);
         let rate = self
             .surfaces
-            .values()
-            .filter(|surface| {
+            .iter()
+            .filter(|(id, surface)| {
                 surface
                     .filters
                     .iter()
-                    .any(|id| self.filters.wants_redraw(*id))
+                    .any(|fid| self.filters.wants_redraw(*fid))
+                    || surface
+                        .groups
+                        .iter()
+                        .any(|gid| self.filters.wants_redraw_group(**id, BackdropId::new(*gid)))
             })
+            .map(|(_, surface)| surface)
             .fold(None, |rate: Option<cherenkov::RefreshRange>, surface| {
                 Some(rate.map_or_else(
                     || surface.refresh.clone(),
@@ -509,11 +544,12 @@ impl RasterRenderer {
             };
             let mut caches = std::mem::take(&mut surf.layers);
             let mut lowering = Lowering::new(&mut items, surf.size, Some(&mut self.filters), frame);
-            let result = lowering.run(sf.tree, &mut caches, &self.images, &mut self.fonts);
+            let result = lowering.run(id, sf.tree, &mut caches, &self.images, &mut self.fonts);
             stats.commands_lowered += lowering.commands_lowered;
             stats.layers_composed += lowering.layers_composed;
             glyph_reqs = std::mem::take(&mut lowering.glyphs);
             surf.filters = lowering.take_used_filters().into_iter().collect();
+            surf.groups = lowering.take_used_groups().into_iter().collect();
             surf.layers = caches;
             result
         };
@@ -528,15 +564,27 @@ impl RasterRenderer {
         let [r, g, b, a] = sf.clear.components;
         let clear = [r * a, g * a, b * a, a];
         let pool = &self.pool;
+        let peak = std::sync::atomic::AtomicU64::new(0);
+        let has_backdrop = !surf.groups.is_empty();
         let (draws, edges) = match &mut surf.output {
-            Output::F32(fb) => pool.install(|| raster::render_bands(&items, clear, fb, w, h))?,
-            Output::F16(out) => {
-                pool.install(|| raster::render_bands_f16(&items, clear, out, w, h))?
-            }
-            Output::Stream { format, sink, emit } => {
-                raster::render_bands_stream(&items, clear, (w, h), emit, *format, sink.as_mut())?
-            }
+            Output::F32(fb) => pool.install(|| {
+                raster::render_bands(&items, clear, fb, w, h, Some(&peak), has_backdrop)
+            })?,
+            Output::F16(out) => pool.install(|| {
+                raster::render_bands_f16(&items, clear, out, w, h, Some(&peak), has_backdrop)
+            })?,
+            Output::Stream { format, sink, emit } => raster::render_bands_stream(
+                &items,
+                clear,
+                (w, h),
+                emit,
+                *format,
+                sink.as_mut(),
+                Some(&peak),
+                has_backdrop,
+            )?,
         };
+        surf.backdrop_capture_peak = peak.load(std::sync::atomic::Ordering::Relaxed);
         if let (Some(start), Some(lowered), Some(resolved)) = (start, lowered_at, resolved_at) {
             tracing::debug!(target: "cherenkov_cpu::profile",
                 lower_ns = lowered.duration_since(start).as_nanos(),

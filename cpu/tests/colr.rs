@@ -5,7 +5,7 @@
 use cherenkov::kurbo::{Affine, Rect};
 use cherenkov::{
     Draw, Engine, Extend, FontSource, FrameTime, Glyph, GlyphRun, GlyphStyle, ImageData,
-    ImagePattern, Offscreen, OffscreenFormat, RenderError, Rgba8, Sampling, WorkingColor,
+    ImagePattern, Offscreen, OffscreenFormat, Rgba8, Sampling, WorkingColor,
 };
 use cherenkov_cpu::{Raster, RasterConfig};
 use nami::Binding;
@@ -34,7 +34,7 @@ const fn run(font: cherenkov::FontId, glyphs: Vec<Glyph>) -> GlyphRun {
     }
 }
 
-fn centre(pixels: &[[f32; 4]], width: usize, x: usize, y: usize) -> [f32; 4] {
+const fn centre(pixels: &[[f32; 4]], width: usize, x: usize, y: usize) -> [f32; 4] {
     pixels[y * width + x]
 }
 
@@ -162,31 +162,42 @@ fn image_foreground_alpha_scales_group_opacity() {
 }
 
 #[test]
-fn per_glyph_transform_is_unsupported() {
+fn per_glyph_transform_rotates_colr_glyph() {
     let engine = Engine::<Raster>::new(RasterConfig::default()).expect("engine");
     let font = colr_font(&engine);
     let surface = engine
         .surface(Offscreen::new((96, 72), OffscreenFormat::LinearF32))
         .expect("surface");
-    let content = surface.record(|c| {
-        c.glyphs(
-            run(
-                font.id(),
-                vec![Glyph {
-                    id: G_E300,
-                    x: 8.0,
-                    y: 64.0,
-                    transform: Some(Affine::rotate(0.2)),
-                }],
-            ),
-            WorkingColor::BLACK,
-        );
-    });
-    surface.update(|tx| {
-        tx[surface.root()].content(content);
-    });
-    match engine.render(FrameTime::now()) {
-        Err(RenderError::Unsupported(name)) => assert_eq!(name, "glyph-transform"),
-        other => panic!("expected Unsupported(glyph-transform), got {other:?}"),
-    }
+    let render = |transform| {
+        let content = surface.record(|c| {
+            c.fill(Rect::new(0.0, 0.0, 96.0, 72.0), WorkingColor::WHITE);
+            c.glyphs(
+                run(
+                    font.id(),
+                    vec![Glyph {
+                        id: G_E300,
+                        x: 32.0,
+                        y: 64.0,
+                        transform,
+                    }],
+                ),
+                WorkingColor::BLACK,
+            );
+        });
+        surface.update(|tx| {
+            tx[surface.root()].content(content);
+        });
+        engine.render(FrameTime::now()).expect("render");
+        surface.readback().expect("pixels").pixels
+    };
+    let plain = render(None);
+    let rotated = render(Some(Affine::rotate(0.2)));
+    assert!(
+        rotated.iter().any(|pixel| pixel[0] < 1.0),
+        "rotated COLR glyph should render non-empty pixels"
+    );
+    assert_ne!(
+        plain, rotated,
+        "the per-glyph transform should change the rendered COLR glyph"
+    );
 }

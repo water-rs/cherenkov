@@ -16,8 +16,6 @@ pub const FILTER: &str = "filter";
 pub const BACKDROP: &str = "backdrop";
 /// A stroked glyph run.
 pub const GLYPH_STROKE: &str = "glyph-stroke";
-/// A per-glyph transform.
-pub const GLYPH_TRANSFORM: &str = "glyph-transform";
 /// A colour font construct this backend cannot render: a bitmap-only
 /// font (CBDT/sbix without outlines) or an unmapped COLR paint.
 pub const COLOR_FONT: &str = "color-font";

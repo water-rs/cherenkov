@@ -809,7 +809,7 @@ const PACING_TOLERANCE: Duration = Duration::from_millis(1);
 /// frames only: the measured window holds pacing, encode, submit and
 /// GPU-timing attribution and nothing else — on Android a capture
 /// walks `/proc/self/smaps_rollup` and a full snapshot spawns `dumpsys
-/// meminfo`, which would tax the pacing and energy it brackets (#162).
+/// gpu --gpumem`, which would tax the pacing and energy it brackets (#162).
 fn run_frames(
     engine: &mut dyn Engine,
     input: &EncodeInput<'_>,

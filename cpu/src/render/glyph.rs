@@ -28,8 +28,8 @@ pub struct GlyphKey {
     glyph: u32,
     /// `(size * 64).round()` — 1/64th-pixel size granularity.
     size_bits: u32,
-    /// Quantized subpixel position: `(fx * 4) | ((fy * 4) << 4)`.
-    subpixel: u8,
+    /// Exact subpixel position: `f32` bits of `fx` | `f32` bits of `fy`.
+    subpixel: u64,
     /// f32 bits of the device transform's 2x2.
     matrix: [u32; 4],
     /// Hash of the run's variation coordinates.
@@ -231,7 +231,7 @@ pub fn stroke_outlines(
 #[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
-    reason = "size and subpixel fractions are small non-negative values"
+    reason = "size is a small non-negative value"
 )]
 pub fn glyph_key(run: &GlyphRun, glyph: u32, subpixel: (f32, f32), transform: Affine) -> GlyphKey {
     let mut hasher = DefaultHasher::new();
@@ -241,7 +241,7 @@ pub fn glyph_key(run: &GlyphRun, glyph: u32, subpixel: (f32, f32), transform: Af
         font: run.font.raw(),
         glyph,
         size_bits: (run.size * 64.0).round() as u32,
-        subpixel: ((subpixel.0 * 4.0) as u8) | (((subpixel.1 * 4.0) as u8) << 4),
+        subpixel: u64::from(subpixel.0.to_bits()) | (u64::from(subpixel.1.to_bits()) << 32),
         matrix: [
             (a as f32).to_bits(),
             (b as f32).to_bits(),

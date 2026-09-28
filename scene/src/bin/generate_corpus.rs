@@ -1984,6 +1984,29 @@ fn run() -> Result<(), SceneError> {
         });
     }
 
+    corpus.scene("filter-gaussian-blur-small-sigma", 128, 128, white, |l| {
+        l.layer(|group| {
+            group.filter(LayerFilter::GaussianBlur { sigma: 0.6 });
+            filter_blur_content(group, &FILTER_COLORS_P3);
+        });
+    });
+
+    corpus.scene(
+        "filter-gaussian-blur-hdr-highlights",
+        128,
+        128,
+        Color::new(ColorSpace::LinearP3, [0.01, 0.012, 0.02, 1.0]),
+        |l| {
+            l.layer(|group| {
+                group.filter(LayerFilter::GaussianBlur { sigma: 12.0 });
+                group.fill(
+                    Shape::rect(58.0, 58.0, 12.0, 12.0),
+                    solid(Color::new(ColorSpace::LinearP3, [6.0, 5.0, 4.0, 1.0])),
+                );
+            });
+        },
+    );
+
     let image = filter_image_png();
     let image_hash = ResourceHash::of(&image);
     for (name, amount, mode) in [

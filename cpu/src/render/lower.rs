@@ -1317,6 +1317,7 @@ impl<'a> Lowering<'a> {
                 Rect::from_center_size(c.center, (c.radius * 2.0, c.radius * 2.0)),
                 [c.radius; 4],
             ),
+            ShapeData::Line(_) => return Err(RenderError::Unsupported(names::SHADOW)),
             _ => return self.silhouette(shape, shadow),
         };
         if !axis_aligned(self.transform) {

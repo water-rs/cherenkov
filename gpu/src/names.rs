@@ -6,6 +6,8 @@
 
 /// A general path.
 pub const PATH: &str = "path";
+/// A shape without a fillable silhouette casts no shadow.
+pub const SHADOW: &str = "shadow";
 /// A user shader paint.
 pub const SHADER: &str = "shader-paint";
 /// A backdrop group member without a clip.

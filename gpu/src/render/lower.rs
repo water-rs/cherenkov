@@ -1753,7 +1753,7 @@ impl<'a> Lowering<'a> {
             path::hash_stroke(shape, stroke, tol),
             rule,
             || {
-                let path = path::shape_path(shape, tol).expect("supported stroke shape");
+                let path = path::shape_path(shape, tol);
                 kurbo::stroke(path, stroke, &kurbo::StrokeOpts::default(), tol)
             },
             paint,

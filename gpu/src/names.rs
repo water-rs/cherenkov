@@ -6,24 +6,10 @@
 
 /// A general path.
 pub const PATH: &str = "path";
-/// An image draw or image paint.
-#[expect(
-    dead_code,
-    reason = "vocabulary reserved for lower paths landing later"
-)]
-pub const IMAGE: &str = "image";
 /// A user shader paint.
 pub const SHADER: &str = "shader-paint";
-/// A blend mode other than normal.
-#[expect(
-    dead_code,
-    reason = "blend modes are supported; the name is kept for parity"
-)]
-pub const BLEND: &str = "blend-mode";
 /// A backdrop group.
 pub const BACKDROP: &str = "backdrop";
-/// A stroke join or cap combination with no analytic form.
-pub const STROKE_JOIN: &str = "stroke-join";
 /// A colour font (COLR, CBDT or sbix).
 pub const COLOR_FONT: &str = "color-font";
 /// A blend space other than linear.

@@ -253,6 +253,302 @@ fn a_clip_overhanging_the_left_edge_masks_its_interior() -> Result<(), Box<dyn s
     Ok(())
 }
 
+/// A self-intersecting 5-point star centred on a 320×320 surface; its
+/// coverage bbox exceeds `MASK_TEXTURE_TEXELS`, so the mask lives on a
+/// dedicated texture.
+fn large_star() -> BezPath {
+    let mut path = BezPath::new();
+    let c = Point::new(160.0, 160.0);
+    for i in 0..5 {
+        let angle = f64::from(i).mul_add(144.0, -90.0).to_radians();
+        let p = c + cherenkov::kurbo::Vec2::new(angle.cos() * 150.0, angle.sin() * 150.0);
+        if i == 0 {
+            path.move_to(p);
+        } else {
+            path.line_to(p);
+        }
+    }
+    path.close_path();
+    path
+}
+
+fn engine() -> Result<Option<Engine<Gpu>>, Box<dyn std::error::Error>> {
+    match Engine::<Gpu>::new(GpuConfig::default()) {
+        Ok(engine) => Ok(Some(engine)),
+        Err(EngineError::Backend(_)) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn big_surface(
+    engine: &Engine<Gpu>,
+) -> Result<(cherenkov::Surface<Gpu>, cherenkov::Layer), Box<dyn std::error::Error>> {
+    sized_surface(engine, (320, 320))
+}
+
+fn sized_surface(
+    engine: &Engine<Gpu>,
+    size: (u32, u32),
+) -> Result<(cherenkov::Surface<Gpu>, cherenkov::Layer), Box<dyn std::error::Error>> {
+    let surface = engine.surface(Offscreen::new(size, OffscreenFormat::LinearF16))?;
+    surface.clear_color(CLEAR);
+    let layer = surface.layer();
+    surface.update(|tx| {
+        tx[surface.root()].push(&layer);
+    });
+    Ok((surface, layer))
+}
+
+/// A clip mask too big for the atlas rasterizes to its own texture and
+/// still multiplies every instance under it.
+#[test]
+fn a_large_path_clip_masks_content() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(engine) = engine()? else {
+        return Ok(());
+    };
+    let (surface, layer) = big_surface(&engine)?;
+    surface.update(|tx| {
+        tx[&layer].content(surface.record(|c| {
+            c.fill(cherenkov::kurbo::Rect::new(0.0, 0.0, 320.0, 320.0), RED);
+        }));
+    });
+    engine.render(cherenkov::FrameTime::now())?;
+    let unmasked = engine.memory().gpu.0;
+    surface.update(|tx| {
+        tx[&layer].content(surface.record(|c| {
+            c.clip(large_star(), |c| {
+                c.fill(cherenkov::kurbo::Rect::new(0.0, 0.0, 320.0, 320.0), RED);
+            });
+        }));
+    });
+    engine.render(cherenkov::FrameTime::now())?;
+    assert_eq!(engine.stats().paths_rasterized, 1);
+    // The ~285×272 mask (over 65536 texels) lives on its own texture.
+    assert!(
+        engine.memory().gpu.0 >= unmasked + 70000,
+        "gpu {} vs {}",
+        engine.memory().gpu.0,
+        unmasked
+    );
+    let readback = surface.readback()?;
+    // Deep inside the top arm the star covers.
+    let [r, ..] = px(&readback, 160, 60);
+    assert!(r > 0.9, "arm: {r}");
+    // The corner is outside the star.
+    let [r, g, b, a] = px(&readback, 5, 5);
+    assert!(
+        r < 0.05 && g < 0.05 && b < 0.05 && a > 0.99,
+        "corner: {r} {g} {b} {a}"
+    );
+    // Along an edge a pixel is partially covered.
+    let partial = readback.pixels.iter().any(|p| p[0] > 0.1 && p[0] < 0.9);
+    assert!(partial, "no partially covered edge pixel");
+    Ok(())
+}
+
+/// The texture mask is cached: an identical second frame rasterizes
+/// nothing.
+#[test]
+fn a_large_path_clip_is_cached_across_frames() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(engine) = engine()? else {
+        return Ok(());
+    };
+    let (surface, layer) = big_surface(&engine)?;
+    let draw = |c: &mut cherenkov::Recorder| {
+        c.clip(large_star(), |c| {
+            c.fill(cherenkov::kurbo::Rect::new(0.0, 0.0, 320.0, 320.0), RED);
+        });
+    };
+    surface.update(|tx| {
+        tx[&layer].content(surface.record(draw));
+    });
+    engine.render(cherenkov::FrameTime::now())?;
+    assert_eq!(engine.stats().paths_rasterized, 1);
+    surface.update(|tx| {
+        tx[&layer].content(surface.record(draw));
+    });
+    engine.render(cherenkov::FrameTime::now())?;
+    assert_eq!(
+        engine.stats().paths_rasterized,
+        0,
+        "mask texture not cached"
+    );
+    let readback = surface.readback()?;
+    let [r, ..] = px(&readback, 160, 60);
+    assert!(r > 0.9, "arm: {r}");
+    Ok(())
+}
+
+/// Vertices far outside the surface still rasterize a valid mask.
+#[test]
+fn a_large_path_clip_larger_than_the_surface() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(engine) = engine()? else {
+        return Ok(());
+    };
+    let (surface, layer) = big_surface(&engine)?;
+    let mut triangle = BezPath::new();
+    triangle.move_to((-200.0, -200.0));
+    triangle.line_to((520.0, -200.0));
+    triangle.line_to((-200.0, 520.0));
+    triangle.close_path();
+    surface.update(|tx| {
+        tx[&layer].content(surface.record(|c| {
+            c.clip(triangle, |c| {
+                c.fill(cherenkov::kurbo::Rect::new(0.0, 0.0, 320.0, 320.0), RED);
+            });
+        }));
+    });
+    engine.render(cherenkov::FrameTime::now())?;
+    let readback = surface.readback()?;
+    let [r, ..] = px(&readback, 60, 60);
+    assert!(r > 0.9, "interior: {r}");
+    // Below the hypotenuse is outside the polygon.
+    let [r, ..] = px(&readback, 300, 300);
+    assert!(r < 0.05, "outside: {r}");
+    Ok(())
+}
+
+/// Two nested large path clips compose: a pixel must be inside both to
+/// show the fill.
+#[test]
+fn nested_large_path_clips_intersect() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(engine) = engine()? else {
+        return Ok(());
+    };
+    let (surface, layer) = big_surface(&engine)?;
+    // Outer: a rectangle covering the left ~270 columns.
+    let mut outer = BezPath::new();
+    outer.move_to((-50.0, -50.0));
+    outer.line_to((270.0, -50.0));
+    outer.line_to((270.0, 370.0));
+    outer.line_to((-50.0, 370.0));
+    outer.close_path();
+    // Inner: a diamond centred on the surface.
+    let mut inner = BezPath::new();
+    inner.move_to((160.0, 10.0));
+    inner.line_to((310.0, 160.0));
+    inner.line_to((160.0, 310.0));
+    inner.line_to((10.0, 160.0));
+    inner.close_path();
+    surface.update(|tx| {
+        tx[&layer].content(surface.record(|c| {
+            c.clip(outer, |c| {
+                c.clip(inner, |c| {
+                    c.fill(cherenkov::kurbo::Rect::new(0.0, 0.0, 320.0, 320.0), RED);
+                });
+            });
+        }));
+    });
+    engine.render(cherenkov::FrameTime::now())?;
+    let readback = surface.readback()?;
+    // Inside both.
+    let [r, ..] = px(&readback, 160, 160);
+    assert!(r > 0.9, "intersection: {r}");
+    // Inside the diamond but right of the outer rect.
+    let [r, ..] = px(&readback, 290, 160);
+    assert!(r < 0.05, "diamond only: {r}");
+    // Inside the outer rect but below the diamond.
+    let [r, ..] = px(&readback, 200, 300);
+    assert!(r < 0.05, "outer only: {r}");
+    Ok(())
+}
+
+/// A transformed layer's large clip still addresses the texture mask in
+/// device space.
+#[test]
+fn a_large_path_clip_under_a_rotation() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(engine) = engine()? else {
+        return Ok(());
+    };
+    let (surface, layer) = big_surface(&engine)?;
+    let center = Point::new(160.0, 160.0);
+    let transform = cherenkov::kurbo::Affine::rotate_about(0.5, center);
+    surface.update(|tx| {
+        tx[&layer].content(surface.record(|c| {
+            c.transform(transform, |c| {
+                c.clip(large_star(), |c| {
+                    c.fill(cherenkov::kurbo::Rect::new(0.0, 0.0, 320.0, 320.0), RED);
+                });
+            });
+        }));
+    });
+    engine.render(cherenkov::FrameTime::now())?;
+    let readback = surface.readback()?;
+    // (160, 60) — inside the top arm — rotates to ~(208, 72).
+    let [r, ..] = px(&readback, 208, 72);
+    assert!(r > 0.9, "rotated arm: {r}");
+    // (248, 39) — between two arms — rotates to ~(296, 96).
+    let [r, ..] = px(&readback, 296, 96);
+    assert!(r < 0.05, "rotated gap: {r}");
+    Ok(())
+}
+
+/// Mask textures over the budget are evicted unless a retained frame
+/// still references them; an evicted mask re-rasterizes.
+#[test]
+fn mask_textures_are_evicted_over_budget() -> Result<(), Box<dyn std::error::Error>> {
+    // One 320×320 mask fits `gpu / 16`; two do not.
+    let config = GpuConfig {
+        budget: cherenkov::Budget {
+            gpu: cherenkov::Bytes::mib(2),
+            ..cherenkov::Budget::default()
+        },
+        ..GpuConfig::default()
+    };
+    let engine = match Engine::<Gpu>::new(config) {
+        Ok(engine) => engine,
+        Err(EngineError::Backend(_)) => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    let (surface, layer) = big_surface(&engine)?;
+    let clip_a = large_star();
+    // A different geometry: same star turned half a point.
+    let mut clip_b = BezPath::new();
+    let c = Point::new(160.0, 160.0);
+    for i in 0..5 {
+        let angle = f64::from(i).mul_add(144.0, -54.0).to_radians();
+        let p = c + cherenkov::kurbo::Vec2::new(angle.cos() * 150.0, angle.sin() * 150.0);
+        if i == 0 {
+            clip_b.move_to(p);
+        } else {
+            clip_b.line_to(p);
+        }
+    }
+    clip_b.close_path();
+    let draw = move |clip: BezPath| {
+        move |c: &mut cherenkov::Recorder| {
+            c.clip(clip, |c| {
+                c.fill(cherenkov::kurbo::Rect::new(0.0, 0.0, 320.0, 320.0), RED);
+            });
+        }
+    };
+    surface.update(|tx| {
+        tx[&layer].content(surface.record(draw(clip_a.clone())));
+    });
+    engine.render(cherenkov::FrameTime::now())?;
+    let one_mask = engine.memory().gpu.0;
+    surface.update(|tx| {
+        tx[&layer].content(surface.record(draw(clip_b)));
+    });
+    engine.render(cherenkov::FrameTime::now())?;
+    // Over budget after storing B, so the unreferenced A is evicted.
+    assert!(engine.memory().gpu.0 <= one_mask, "A not evicted");
+    let rb = surface.readback()?;
+    let [r, ..] = px(&rb, 160, 232);
+    assert!(r > 0.9, "frame 2: {r}");
+    surface.update(|tx| {
+        tx[&layer].content(surface.record(draw(clip_a)));
+    });
+    engine.render(cherenkov::FrameTime::now())?;
+    // A was evicted, so it rasterizes again — and renders correctly.
+    assert_eq!(engine.stats().paths_rasterized, 1);
+    assert!(engine.memory().gpu.0 <= one_mask);
+    let rb = surface.readback()?;
+    let [r, ..] = px(&rb, 160, 60);
+    assert!(r > 0.9, "frame 3: {r}");
+    Ok(())
+}
+
 /// A rect clip merged with a path clip: the mask still applies inside the
 /// intersected rectangle.
 #[test]
@@ -276,5 +572,60 @@ fn a_rect_clip_merges_with_a_path_clip() -> Result<(), Box<dyn std::error::Error
     // Outside the rect even where the star would cover.
     let [r, ..] = px(&readback, 4, 32);
     assert!(r < 0.05, "outside rect: {r}");
+    Ok(())
+}
+
+/// A clip wider than the atlas cap can't take a cell at all; it gets a
+/// dedicated texture.
+#[test]
+fn a_path_clip_wider_than_the_atlas_cap() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(engine) = engine()? else {
+        return Ok(());
+    };
+    let Ok((surface, layer)) = sized_surface(&engine, (4200, 96)) else {
+        // The device can't hold a 4200-wide surface; nothing to test.
+        return Ok(());
+    };
+    // An elongated hexagonal band covering the middle rows.
+    let mut band = BezPath::new();
+    band.move_to((20.0, 48.0));
+    band.line_to((40.0, 10.0));
+    band.line_to((4160.0, 10.0));
+    band.line_to((4180.0, 48.0));
+    band.line_to((4160.0, 86.0));
+    band.line_to((40.0, 86.0));
+    band.close_path();
+    surface.update(|tx| {
+        tx[&layer].content(surface.record(|c| {
+            c.fill(cherenkov::kurbo::Rect::new(0.0, 0.0, 4200.0, 96.0), RED);
+        }));
+    });
+    engine.render(cherenkov::FrameTime::now())?;
+    let unmasked = engine.memory().gpu.0;
+    surface.update(|tx| {
+        tx[&layer].content(surface.record(|c| {
+            c.clip(band, |c| {
+                c.fill(cherenkov::kurbo::Rect::new(0.0, 0.0, 4200.0, 96.0), RED);
+            });
+        }));
+    });
+    engine.render(cherenkov::FrameTime::now())?;
+    assert_eq!(engine.stats().paths_rasterized, 1);
+    // ~4160×76 mask texels on a dedicated texture.
+    assert!(
+        engine.memory().gpu.0 >= unmasked + 300_000,
+        "gpu {} vs {}",
+        engine.memory().gpu.0,
+        unmasked
+    );
+    let readback = surface.readback()?;
+    let [r, ..] = px(&readback, 2100, 48);
+    assert!(r > 0.9, "interior: {r}");
+    // A corner sits outside the band.
+    let [r, g, b, a] = px(&readback, 5, 5);
+    assert!(
+        r < 0.05 && g < 0.05 && b < 0.05 && a > 0.99,
+        "corner: {r} {g} {b} {a}"
+    );
     Ok(())
 }

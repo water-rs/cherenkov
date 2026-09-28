@@ -58,6 +58,9 @@ pub const FLAG_HAS_CLIP: u32 = 1;
 pub const FLAG_HAS_INNER: u32 = 2;
 /// The clip carries a coverage mask sampled from the atlas.
 pub const FLAG_HAS_MASK: u32 = 4;
+/// The clip mask is sampled from the bound mask texture instead of the
+/// atlas.
+pub const FLAG_MASK_TEXTURE: u32 = 8;
 
 /// The shader's blend-mode code for a [`cherenkov::BlendMode`]; `0` keeps the
 /// fixed-function source-over composite. Matches `blend_mode` in the WGSL.

@@ -153,11 +153,13 @@ struct SurfaceState {
     /// Bumped whenever a scratch or backdrop texture is (re)created — a
     /// cached group-1 bind group referencing the old view must rebuild.
     bind_gen: u64,
-    /// Group-1 bind groups keyed by `(source scratch, backdrop, image)`,
-    /// reused across frames while `binds1_stamp` is current.
-    binds1: HashMap<(Option<usize>, bool, Option<lower::ImageSource>), wgpu::BindGroup>,
-    /// The `(bind_gen, images_gen)` pair `binds1` was built under.
-    binds1_stamp: (u64, u64),
+    /// Group-1 bind groups keyed by `(source scratch, backdrop, image,
+    /// mask texture)`, reused across frames while `binds1_stamp` is
+    /// current.
+    binds1: HashMap<Bind1Key, wgpu::BindGroup>,
+    /// The `(bind_gen, images_gen, mask_texture_gen)` triple `binds1` was
+    /// built under.
+    binds1_stamp: (u64, u64, u64),
 }
 
 impl SurfaceState {
@@ -214,6 +216,10 @@ impl SurfaceState {
                 .sum::<u64>()
     }
 }
+
+/// The group-1 bind group key: `(source scratch, backdrop-needed,
+/// image, mask texture)`.
+type Bind1Key = (Option<usize>, bool, Option<lower::ImageSource>, Option<u64>);
 
 /// All render-thread state.
 pub struct GpuRenderer {
@@ -608,8 +614,14 @@ fn create_layouts(device: &wgpu::Device) -> (wgpu::BindGroupLayout, wgpu::BindGr
     });
     let layout1 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("source texture"),
-        // 0: composite source, 1: blend backdrop, 2: image paint.
-        entries: &[texture_entry(0), texture_entry(1), texture_entry(2)],
+        // 0: composite source, 1: blend backdrop, 2: image paint,
+        // 3: clip mask texture.
+        entries: &[
+            texture_entry(0),
+            texture_entry(1),
+            texture_entry(2),
+            texture_entry(3),
+        ],
     });
     (layout0, layout1)
 }
@@ -622,6 +634,7 @@ fn make_bind1(
     source: Option<&wgpu::TextureView>,
     backdrop: Option<&wgpu::TextureView>,
     image: Option<&wgpu::TextureView>,
+    mask: Option<&wgpu::TextureView>,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("source texture"),
@@ -638,6 +651,10 @@ fn make_bind1(
             wgpu::BindGroupEntry {
                 binding: 2,
                 resource: wgpu::BindingResource::TextureView(image.unwrap_or(dummy)),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(mask.unwrap_or(dummy)),
             },
         ],
     })
@@ -1368,7 +1385,7 @@ impl Renderer for GpuRenderer {
                 globals_base: 0,
                 bind_gen: 0,
                 binds1: HashMap::new(),
-                binds1_stamp: (u64::MAX, u64::MAX),
+                binds1_stamp: (u64::MAX, u64::MAX, u64::MAX),
             },
         );
         Ok(SurfaceInfo {
@@ -1651,6 +1668,7 @@ impl Renderer for GpuRenderer {
             + self.stops.size()
             + self.globals.size()
             + self.atlas.gpu_bytes()
+            + self.atlas.mask_texture_bytes()
             + self
                 .surfaces
                 .values()
@@ -1766,6 +1784,7 @@ impl Renderer for GpuRenderer {
                 self.queue_timestamps(2 * self.frame_pass_count, frame.id);
                 stats.phases.stamp_seconds += t.elapsed().as_secs_f64();
             }
+            self.evict_dead_mask_textures();
         }
         result?;
         let present = self.present_windows(frame)?;
@@ -1876,6 +1895,7 @@ impl Renderer for GpuRenderer {
                 self.queue_timestamps(2 * self.frame_pass_count, frame.id);
                 stats.phases.stamp_seconds += t.elapsed().as_secs_f64();
             }
+            self.evict_dead_mask_textures();
         }
         result?;
         let present = self.present_windows(frame)?;
@@ -2478,6 +2498,22 @@ impl GpuRenderer {
         result.map(|()| lowered)
     }
 
+    /// Over budget, drops every mask texture no retained frame references:
+    /// bind groups and frames holding one keep it alive by key.
+    fn evict_dead_mask_textures(&mut self) {
+        if !self.atlas.mask_textures_over_budget() {
+            return;
+        }
+        let live: rustc_hash::FxHashSet<u64> = self
+            .surfaces
+            .values()
+            .flat_map(|surf| surf.frame.passes.iter())
+            .flat_map(|pass| pass.ranges.iter())
+            .filter_map(|range| range.mask)
+            .collect();
+        self.atlas.evict_mask_textures(|key| live.contains(&key));
+    }
+
     #[expect(
         clippy::cast_precision_loss,
         reason = "atlas coordinates fit exactly in f32"
@@ -2556,6 +2592,17 @@ impl GpuRenderer {
                 Ok(PendingOrigin::Mask(
                     self.atlas.mask_origin(key).expect("just stored"),
                 ))
+            }
+            PendingRaster::MaskTexture {
+                key,
+                mask,
+                w,
+                h,
+                texels,
+            } => {
+                self.atlas
+                    .store_mask_texture(&self.device, &self.queue, key, mask, w, h, &texels);
+                Ok(PendingOrigin::None)
             }
             PendingRaster::Colr { font, key, picture } => {
                 if let Some(font) = self.fonts.get_mut(&font) {
@@ -2858,9 +2905,14 @@ impl GpuRenderer {
                 label: Some("frame"),
             });
         // Group-1 bind groups persist across frames, keyed by
-        // (source scratch, backdrop-needed, image); the stamp rebuilds
-        // them when a scratch/backdrop texture or the image set changed.
-        let stamp = (surf.bind_gen, self.images_gen);
+        // (source scratch, backdrop-needed, image, mask texture); the
+        // stamp rebuilds them when a scratch/backdrop texture, the image
+        // set, or the mask textures changed.
+        let stamp = (
+            surf.bind_gen,
+            self.images_gen,
+            self.atlas.mask_texture_generation(),
+        );
         if surf.binds1_stamp != stamp {
             surf.binds1.clear();
             surf.binds1_stamp = stamp;
@@ -2985,7 +3037,12 @@ impl GpuRenderer {
                             [variant_index(pipeline.1)],
                     );
                 }
-                let key = (range.source, scratch_backdrop, range.image.clone());
+                let key = (
+                    range.source,
+                    scratch_backdrop,
+                    range.image.clone(),
+                    range.mask,
+                );
                 let bind = match surf.binds1.entry(key) {
                     std::collections::hash_map::Entry::Occupied(e) => &*e.into_mut(),
                     std::collections::hash_map::Entry::Vacant(e) => {
@@ -3019,6 +3076,11 @@ impl GpuRenderer {
                                         .expect("rendered content")
                                         .view,
                                 ),
+                            }),
+                            range.mask.map(|k| {
+                                self.atlas
+                                    .mask_texture_view(k)
+                                    .expect("mask texture stored before encode")
                             }),
                         ))
                     }

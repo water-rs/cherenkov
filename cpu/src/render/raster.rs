@@ -23,115 +23,45 @@ use cherenkov::OffscreenFormat;
 /// Rows per rasterization band.
 pub const BAND_H: usize = 16;
 
-/// Reusable band working buffers: the shading scratch of band-emitting
-/// output paths, isolation aprons and coverage accumulators. Retained
-/// between frames so the working set is visible to `memory()` and
-/// allocation does not churn per band.
+/// One worker's band working set: the coverage accumulator's storage, the
+/// isolation-stack colour buffers and the emit scratch. Created per rayon
+/// worker for the duration of a parallel pass (`for_each_init`), so buffers
+/// are single-owner and never shared — no locking exists here at all.
 ///
-/// Retention is bounded: at most `limit` buffers of each class — one band's
-/// worth per render worker — regardless of how many were checked out in
-/// parallel. `bytes` reports that bound, so `Engine::memory` stays
-/// deterministic even though the checked-out set varies with scheduling.
-pub struct BandPool {
-    /// `w * band_rows` colour cells.
-    colors: std::sync::Mutex<Vec<Vec<[f32; 4]>>>,
-    /// `(w + 2) * band_rows` coverage cells.
-    coverage: std::sync::Mutex<Vec<Vec<f32>>>,
-    /// Retained buffers per class: one band working set per render worker.
-    limit: usize,
-    /// Largest colour-buffer capacity sized so far (pixels).
-    color_px: std::sync::atomic::AtomicU64,
-    /// Largest coverage-buffer capacity sized so far (cells).
-    cover_px: std::sync::atomic::AtomicU64,
+/// Nothing is retained after a pass: the working set is transient and
+/// bounded by `workers × (one band's colour + coverage)`, which is what the
+/// memory reports describe. Allocation happens per worker per frame rather
+/// than per band.
+pub struct Scratch {
+    /// `(w + 2) * band_rows` coverage cells, reused across bands.
+    coverage: Vec<f32>,
+    /// Free colour buffers, up to `w * band_rows` pixels each.
+    free: Vec<Vec<[f32; 4]>>,
+    /// Isolation-stack colour buffers currently in use.
+    stack: Vec<Vec<[f32; 4]>>,
 }
 
-impl BandPool {
-    /// A pool that retains at most one band buffer of each class per worker.
-    pub fn new(workers: usize) -> Self {
+impl Scratch {
+    /// An empty working set; buffers grow to band size on first use.
+    pub const fn new() -> Self {
         Self {
-            colors: std::sync::Mutex::new(Vec::new()),
-            coverage: std::sync::Mutex::new(Vec::new()),
-            limit: workers,
-            color_px: std::sync::atomic::AtomicU64::new(0),
-            cover_px: std::sync::atomic::AtomicU64::new(0),
+            coverage: Vec::new(),
+            free: Vec::new(),
+            stack: Vec::new(),
         }
     }
 
-    /// A colour buffer of at least `len` pixels.
-    fn take_color(&self, len: usize) -> Vec<[f32; 4]> {
-        let mut buf = self
-            .colors
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .pop()
-            .unwrap_or_default();
+    /// A zeroed colour buffer of `len` pixels, reused where possible.
+    fn take_color(&mut self, len: usize) -> Vec<[f32; 4]> {
+        let mut buf = self.free.pop().unwrap_or_default();
         buf.clear();
         buf.resize(len, [0.0; 4]);
-        self.color_px
-            .fetch_max(buf.capacity() as u64, std::sync::atomic::Ordering::Relaxed);
         buf
     }
 
-    /// Returns a colour buffer for reuse, keeping at most `limit` retained.
-    fn give_color(&self, buf: Vec<[f32; 4]>) {
-        let mut free = self
-            .colors
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if free.len() < self.limit {
-            free.push(buf);
-        }
-    }
-
-    /// A coverage buffer of at least `len` cells.
-    fn take_coverage(&self, len: usize) -> Vec<f32> {
-        let mut buf = self
-            .coverage
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .pop()
-            .unwrap_or_default();
-        buf.clear();
-        buf.resize(len, 0.0);
-        self.cover_px
-            .fetch_max(buf.capacity() as u64, std::sync::atomic::Ordering::Relaxed);
-        buf
-    }
-
-    /// Returns a coverage buffer for reuse, keeping at most `limit` retained.
-    fn give_coverage(&self, buf: Vec<f32>) {
-        let mut free = self
-            .coverage
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if free.len() < self.limit {
-            free.push(buf);
-        }
-    }
-
-    /// The retention bound: `limit` buffers of each class at the largest
-    /// capacity ever sized — one band's colour plus coverage per worker. An
-    /// upper bound on the buffers physically retained; reported instead of
-    /// the live count because the checked-out set — and thus the count
-    /// handed back — varies with worker scheduling.
-    pub fn bytes(&self) -> u64 {
-        let color =
-            self.color_px.load(std::sync::atomic::Ordering::Relaxed) * size_of::<[f32; 4]>() as u64;
-        let coverage =
-            self.cover_px.load(std::sync::atomic::Ordering::Relaxed) * size_of::<f32>() as u64;
-        self.limit as u64 * (color + coverage)
-    }
-
-    /// Drops every retained buffer (`Trim(Critical)`).
-    pub fn clear(&self) {
-        self.colors
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
-        self.coverage
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
+    /// Returns a colour buffer to the freelist.
+    fn give_color(&mut self, buf: Vec<[f32; 4]>) {
+        self.free.push(buf);
     }
 }
 
@@ -413,22 +343,26 @@ fn stats(items: &[Item]) -> (u32, u32) {
 /// starting at device row `y0`.
 ///
 /// The coverage accumulator and the isolation-stack scratch buffers come
-/// from `pool` and return to it, so a band's working set stays band-sized
-/// and is retained for `memory()` rather than churned.
+/// from `scratch` and return to it, so a band's working set stays band-sized
+/// and survives to the next band this worker shades.
 fn shade(
     items: &[Item],
     clear: [f32; 4],
     slice: &mut [[f32; 4]],
     w: usize,
     y0: usize,
-    pool: &BandPool,
+    scratch: &mut Scratch,
 ) {
     let bh = slice.len() / w;
     slice.fill(clear);
-    let mut acc = Accum::with_buffer(w, bh, pool.take_coverage((w + 2) * bh));
+    let mut coverage = std::mem::take(&mut scratch.coverage);
+    coverage.clear();
+    coverage.resize((w + 2) * bh, 0.0);
+    let mut acc = Accum::with_buffer(w, bh, coverage);
     // The isolation stack: `slice` is the bottom. Each entry is a
     // scratch colour buffer of the band.
-    let mut stack: Vec<Vec<[f32; 4]>> = Vec::new();
+    let stack = &mut scratch.stack;
+    let free = &mut scratch.free;
     let mut band = Band { fb: slice, w, y0 };
     for item in items {
         match item {
@@ -439,29 +373,24 @@ fn shade(
                 paint,
                 clip,
             } => {
-                band.draw(
-                    &mut acc,
-                    &mut stack,
-                    edges,
-                    *bbox,
-                    *rule,
-                    paint,
-                    clip.as_ref(),
-                );
+                band.draw(&mut acc, stack, edges, *bbox, *rule, paint, clip.as_ref());
             }
             Item::PushIsolate => {
-                stack.push(pool.take_color(slice_len(band.w, bh)));
+                let mut buf = free.pop().unwrap_or_default();
+                buf.clear();
+                buf.resize(slice_len(band.w, bh), [0.0; 4]);
+                stack.push(buf);
             }
             Item::PopIsolate {
                 opacity,
                 blend,
                 clip,
             } => {
-                let Some(scratch) = stack.pop() else {
+                let Some(isolated) = stack.pop() else {
                     continue;
                 };
-                band.composite_isolate(&scratch, *opacity, *blend, clip.as_ref(), &mut stack);
-                pool.give_color(scratch);
+                band.composite_isolate(&isolated, *opacity, *blend, clip.as_ref(), stack);
+                free.push(isolated);
             }
             Item::Shadow {
                 rbox,
@@ -471,15 +400,7 @@ fn shade(
                 bbox,
                 clip,
             } => {
-                band.shadow(
-                    &mut stack,
-                    rbox,
-                    radii,
-                    *sigma_eff,
-                    color,
-                    *bbox,
-                    clip.as_ref(),
-                );
+                band.shadow(stack, rbox, radii, *sigma_eff, color, *bbox, clip.as_ref());
             }
             Item::Glyph {
                 slot,
@@ -488,14 +409,12 @@ fn shade(
                 paint,
                 clip,
             } => {
-                band.glyph(&mut stack, slot, *x, *y, paint, clip.as_ref());
+                band.glyph(stack, slot, *x, *y, paint, clip.as_ref());
             }
         }
     }
-    for buf in stack {
-        pool.give_color(buf);
-    }
-    pool.give_coverage(acc.into_buffer());
+    scratch.free.append(stack);
+    scratch.coverage = acc.into_buffer();
 }
 
 /// Rasterizes the whole surface's items into `fb` (length `w*h`,
@@ -503,18 +422,16 @@ fn shade(
 ///
 /// Each band owns a coverage accumulator and a stack of scratch colour
 /// buffers for [`Item::PushIsolate`]/[`Item::PopIsolate`], and walks the
-/// item list sequentially.
-pub fn render_bands(
-    items: &[Item],
-    clear: [f32; 4],
-    fb: &mut [[f32; 4]],
-    w: usize,
-    pool: &BandPool,
-) -> (u32, u32) {
+/// item list sequentially. `for_each_init` gives every worker that runs a
+/// band its own [`Scratch`], reused across that worker's bands.
+pub fn render_bands(items: &[Item], clear: [f32; 4], fb: &mut [[f32; 4]], w: usize) -> (u32, u32) {
     let stats = stats(items);
-    fb.par_chunks_mut(BAND_H * w)
-        .enumerate()
-        .for_each(|(band, slice)| shade(items, clear, slice, w, band * BAND_H, pool));
+    fb.par_chunks_mut(BAND_H * w).enumerate().for_each_init(
+        Scratch::new,
+        |scratch, (band, slice)| {
+            shade(items, clear, slice, w, band * BAND_H, scratch);
+        },
+    );
     stats
 }
 
@@ -526,19 +443,19 @@ pub fn render_bands_f16(
     clear: [f32; 4],
     out: &mut [[half::f16; 4]],
     w: usize,
-    pool: &BandPool,
 ) -> (u32, u32) {
     let stats = stats(items);
-    out.par_chunks_mut(BAND_H * w)
-        .enumerate()
-        .for_each(|(band, out_slice)| {
-            let mut scratch = pool.take_color(out_slice.len());
-            shade(items, clear, &mut scratch, w, band * BAND_H, pool);
-            for (dst, src) in out_slice.iter_mut().zip(scratch.iter()) {
+    out.par_chunks_mut(BAND_H * w).enumerate().for_each_init(
+        Scratch::new,
+        |scratch, (band, out_slice)| {
+            let mut band_px = scratch.take_color(out_slice.len());
+            shade(items, clear, &mut band_px, w, band * BAND_H, scratch);
+            for (dst, src) in out_slice.iter_mut().zip(band_px.iter()) {
                 *dst = src.map(half::f16::from_f32);
             }
-            pool.give_color(scratch);
-        });
+            scratch.give_color(band_px);
+        },
+    );
     stats
 }
 
@@ -554,16 +471,16 @@ pub fn render_bands_stream(
     emit: &mut Vec<[half::f16; 4]>,
     format: OffscreenFormat,
     sink: &mut dyn FnMut(BandOut<'_>),
-    pool: &BandPool,
 ) -> (u32, u32) {
     let stats = stats(items);
     let (w, h) = size;
-    let mut scratch = pool.take_color(w * h.min(BAND_H));
+    let mut scratch = Scratch::new();
+    let mut band_px = scratch.take_color(w * h.min(BAND_H));
     let mut y0 = 0;
     while y0 < h {
         let bh = (h - y0).min(BAND_H);
-        let band = &mut scratch[..w * bh];
-        shade(items, clear, band, w, y0, pool);
+        let band = &mut band_px[..w * bh];
+        shade(items, clear, band, w, y0, &mut scratch);
         let y = u32::try_from(y0).unwrap_or(u32::MAX);
         match format {
             OffscreenFormat::LinearF32 => sink(BandOut {
@@ -581,7 +498,6 @@ pub fn render_bands_stream(
         }
         y0 += bh;
     }
-    pool.give_color(scratch);
     stats
 }
 

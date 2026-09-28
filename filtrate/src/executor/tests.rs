@@ -15,11 +15,11 @@ use super::{
     plan::{PassAux, Plan},
 };
 use crate::{
-    AnimatedCallback, AnimatedTarget, AuxSource, ColorFilter, ColorStage, CpuKernel, Effect,
-    EffectContext, EffectFrameTiming, EffectInput, EffectOutput, EffectRenderError,
-    EffectSetupError, Filter, FilterExt, FilterParam, Footprint, ImageVisitor, Interpolator,
-    OperatingSpace, ParamArray, ParamSource, Placed, ShapeInput, ShapeTextures, SpatialFilter,
-    SpatialStage, StageCollector, WatchGuard, WorkingSpace, filters, kind,
+    AnimatedCallback, AnimatedTarget, AuxSource, ColorFilter, ColorStage, CpuFilter, CpuImage,
+    CpuKernel, Effect, EffectContext, EffectFrameTiming, EffectInput, EffectOutput,
+    EffectRenderError, EffectSetupError, Filter, FilterExt, FilterParam, Footprint, ImageVisitor,
+    Interpolator, OperatingSpace, ParamArray, ParamSource, Placed, ShapeInput, ShapeTextures,
+    SpatialFilter, SpatialStage, StageCollector, WatchGuard, WorkingSpace, filters, kind,
 };
 
 // ============================================================================
@@ -1805,6 +1805,251 @@ fn gpu_params_animate_between_frames() {
         "expected the amount settled on its target, got {done}"
     );
     assert!(!executor.redraw_hint());
+}
+
+fn upload_f16(gpu: &TestGpu, size: (u32, u32), pixels: &[[f32; 4]]) -> wgpu::Texture {
+    let bytes: Vec<u8> = pixels
+        .iter()
+        .flat_map(|pixel| {
+            pixel
+                .iter()
+                .flat_map(|channel| half::f16::from_f32(*channel).to_bits().to_le_bytes())
+        })
+        .collect();
+    upload_bytes(gpu, size, wgpu::TextureFormat::Rgba16Float, 8, &bytes)
+}
+
+fn readback_f16_image(gpu: &TestGpu, texture: &wgpu::Texture, size: (u32, u32)) -> Vec<[f32; 4]> {
+    readback_bytes(gpu, texture, size, 8)
+        .chunks_exact(8)
+        .map(|pixel| {
+            std::array::from_fn(|channel| {
+                let offset = channel * 2;
+                half::f16::from_bits(u16::from_le_bytes([pixel[offset], pixel[offset + 1]]))
+                    .to_f32()
+            })
+        })
+        .collect()
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "the deterministic test input uses indices smaller than 391"
+)]
+fn premultiplied_input(size: (usize, usize)) -> Vec<[f32; 4]> {
+    (0..size.0 * size.1)
+        .map(|index| {
+            let alpha = ((index * 29 + 53) % 251) as f32 / 250.0;
+            let channel = |salt| ((index * salt + 17) % 239) as f32 / 238.0 * alpha;
+            [channel(31), channel(43), channel(67), alpha]
+        })
+        .collect()
+}
+
+fn assert_f16_matches_cpu<F: Filter + CpuFilter>(
+    gpu: &TestGpu,
+    filter: F,
+    size: (u32, u32),
+    input: &[[f32; 4]],
+    label: &str,
+) {
+    let params = filter.params();
+    let mut expected = input
+        .iter()
+        .map(|pixel| pixel.map(|channel| half::f16::from_f32(channel).to_f32()))
+        .collect::<Vec<_>>();
+    filter
+        .apply_cpu_image(
+            &params,
+            &WorkingSpace::LINEAR_DISPLAY_P3,
+            &mut CpuImage {
+                pixels: &mut expected,
+                top: 0,
+                size: (
+                    usize::try_from(size.0).expect("width fits usize"),
+                    usize::try_from(size.1).expect("height fits usize"),
+                ),
+            },
+        )
+        .expect("CPU filter should succeed");
+    let input_texture = upload_f16(gpu, size, input);
+    let output = texture_format(
+        gpu,
+        size,
+        wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        wgpu::TextureFormat::Rgba16Float,
+    );
+    let mut executor = Executor::new(filter);
+    setup_format(
+        gpu,
+        &mut executor,
+        wgpu::TextureFormat::Rgba16Float,
+        wgpu::TextureFormat::Rgba16Float,
+    );
+    executor
+        .render(
+            &frame_input_format(
+                gpu,
+                &input_texture,
+                size,
+                Duration::ZERO,
+                ShapeTextures::default(),
+                wgpu::TextureFormat::Rgba16Float,
+            ),
+            &frame_output_format(gpu, &output, size, wgpu::TextureFormat::Rgba16Float),
+        )
+        .expect("f16 filter render should succeed");
+    let actual = readback_f16_image(gpu, &output, size);
+    for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+        for channel in 0..4 {
+            assert!(
+                (actual[channel] - expected[channel]).abs()
+                    <= 2.0e-3 * expected[channel].abs().max(1.0),
+                "{label}, pixel {index}, channel {channel}: GPU {}, CPU {}",
+                actual[channel],
+                expected[channel]
+            );
+        }
+    }
+}
+
+#[test]
+fn cpu_blurs_match_the_wgpu_executor_and_window_aprons() {
+    let gpu = create_test_device();
+    let size = (23_usize, 17_usize);
+    let input = premultiplied_input(size);
+    let gaussian = filters::GaussianBlur(1.7_f32);
+    assert_f16_matches_cpu(&gpu, gaussian, (23, 17), &input, "GaussianBlur");
+    let box_blur = filters::Blur(2.0_f32);
+    assert_f16_matches_cpu(&gpu, box_blur, (23, 17), &input, "Blur");
+
+    assert_window_matches_full(&filters::GaussianBlur(1.0_f32), &input, size, 3);
+    assert_window_matches_full(&filters::Blur(2.0_f32), &input, size, 2);
+}
+
+fn assert_window_matches_full<F: Filter + CpuFilter>(
+    filter: &F,
+    input: &[[f32; 4]],
+    size: (usize, usize),
+    apron: usize,
+) {
+    let params = filter.params();
+    let mut full = input.to_vec();
+    filter
+        .apply_cpu_image(
+            &params,
+            &WorkingSpace::LINEAR_DISPLAY_P3,
+            &mut CpuImage {
+                pixels: &mut full,
+                top: 0,
+                size,
+            },
+        )
+        .expect("full CPU filter should succeed");
+    let (top, bottom) = (2, size.1 - 2);
+    let mut window = input[top * size.0..bottom * size.0].to_vec();
+    filter
+        .apply_cpu_image(
+            &params,
+            &WorkingSpace::LINEAR_DISPLAY_P3,
+            &mut CpuImage {
+                pixels: &mut window,
+                top,
+                size,
+            },
+        )
+        .expect("window CPU filter should succeed");
+    for y in top + apron..bottom - apron {
+        assert_eq!(
+            &full[y * size.0..(y + 1) * size.0],
+            &window[(y - top) * size.0..(y - top + 1) * size.0],
+            "row {y} differs from full-image application"
+        );
+    }
+}
+
+#[test]
+fn cpu_image_blend_modes_match_the_wgpu_executor() {
+    let gpu = create_test_device();
+    let size = (23_usize, 17_usize);
+    let input = premultiplied_input(size);
+    let auxiliary: Vec<u8> = (0..7 * 5 * 4)
+        .map(|index| u8::try_from((index * 37 + 19) % 256).expect("byte is bounded"))
+        .collect();
+    for mode in [
+        filters::BlendMode::Normal,
+        filters::BlendMode::Multiply,
+        filters::BlendMode::Screen,
+        filters::BlendMode::Overlay,
+        filters::BlendMode::Darken,
+        filters::BlendMode::Lighten,
+        filters::BlendMode::SoftLight,
+        filters::BlendMode::HardLight,
+        filters::BlendMode::Difference,
+        filters::BlendMode::Exclusion,
+        filters::BlendMode::ColorDodge,
+        filters::BlendMode::ColorBurn,
+        filters::BlendMode::Hue,
+        filters::BlendMode::Saturation,
+        filters::BlendMode::Color,
+        filters::BlendMode::Luminosity,
+    ] {
+        let filter = filters::BlendWithImage {
+            image: crate::FilterImage::from_rgba8(7, 5, auxiliary.clone()),
+            amount: 0.73_f32,
+            mode,
+        };
+        let label = format!("BlendWithImage::{mode:?}");
+        assert_f16_matches_cpu(&gpu, filter, (23, 17), &input, &label);
+    }
+
+    let auxiliary_f16: Vec<half::f16> = (0..7 * 5 * 4)
+        .map(|index| {
+            let value = u16::try_from((index * 37 + 19) % 256).expect("texel channel is bounded");
+            half::f16::from_f32(f32::from(value) / 256.0)
+        })
+        .collect();
+    let auxiliary_f32: Vec<f32> = (0..7 * 5 * 4)
+        .map(|index| {
+            let value = u16::try_from((index * 37 + 19) % 256).expect("texel channel is bounded");
+            f32::from(value) / 256.0
+        })
+        .collect();
+    for (label, image) in [
+        (
+            "BlendWithImage::Rgba16Float",
+            crate::FilterImage::from_rgba16f(7, 5, &auxiliary_f16),
+        ),
+        (
+            "BlendWithImage::Rgba32Float",
+            crate::FilterImage::from_rgba32f(7, 5, &auxiliary_f32),
+        ),
+    ] {
+        let filter = filters::BlendWithImage {
+            image,
+            amount: 0.73_f32,
+            mode: filters::BlendMode::Multiply,
+        };
+        assert_f16_matches_cpu(&gpu, filter, (23, 17), &input, label);
+    }
+}
+
+#[test]
+fn derived_colour_filters_apply_through_cpu_filter() {
+    let filter = filters::Brightness(0.25_f32);
+    let mut pixels = [[0.2, 0.3, 0.4, 0.5]];
+    filter
+        .apply_cpu_image(
+            &filter.params(),
+            &WorkingSpace::LINEAR_DISPLAY_P3,
+            &mut CpuImage {
+                pixels: &mut pixels,
+                top: 0,
+                size: (1, 1),
+            },
+        )
+        .expect("derived CPU kernel should succeed");
+    assert_eq!(pixels, [[0.325, 0.425, 0.525, 0.5]]);
 }
 
 // ============================================================================

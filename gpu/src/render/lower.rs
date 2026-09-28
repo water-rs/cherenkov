@@ -1167,10 +1167,10 @@ impl<'a> Lowering<'a> {
         mut body: impl FnMut(&mut Self, &GlyphContext<'_>) -> Result<(), RenderError>,
         glyphs: &GlyphContext<'_>,
     ) -> Result<(), RenderError> {
-        if !parameters.sigma.is_finite() || !parameters.spread.is_finite() {
+        if !parameters.spread.is_finite() {
             return Err(RenderError::Render("non-finite shadow parameters".into()));
         }
-        let sigma = parameters.sigma.max(0.0);
+        let sigma = parameters.sigma;
         let transform = self.transform * parameters.transform;
         if !transform.is_finite() || !transform.inverse().is_finite() {
             return Err(RenderError::Render("invalid silhouette transform".into()));

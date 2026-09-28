@@ -1079,6 +1079,7 @@ impl Lowerer<'_> {
         ops: &mut Vec<Op>,
     ) -> Result<(), RenderError> {
         cherenkov::lowering::shadow::check_sigma(shadow.sigma)?;
+        cherenkov::lowering::shadow::check_sigma(shadow.sigma)?;
         let boxed = match shape {
             // A line has no fillable silhouette to capture.
             ShapeData::Line(_) => return Err(RenderError::Unsupported(names::SHADOW)),

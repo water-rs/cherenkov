@@ -1298,6 +1298,7 @@ impl<'a> Lowering<'a> {
         reason = "shadow geometry is f32 and surface sizes fit i32"
     )]
     fn shadow(&mut self, shape: &ShapeData, shadow: &cherenkov::Shadow) -> Result<(), RenderError> {
+        cherenkov::lowering::shadow::check_sigma(shadow.sigma)?;
         // The shape as a centred rect plus per-corner radii, in content
         // space.
         let (rect, radii) = match shape {

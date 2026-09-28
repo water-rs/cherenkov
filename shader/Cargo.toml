@@ -16,8 +16,8 @@ eval = ["dep:half"]
 [dependencies]
 # naga's `Literal::F16` payload; the evaluator reads it.
 half = { version = "2.5", default-features = false, optional = true }
-# The same naga major version wgpu 29 links, so composed modules reach wgpu without conversion.
-naga = { version = "29.0.4", features = ["wgsl-in", "wgsl-out", "msl-out", "spv-out"] }
+# The same naga major version wgpu 30 links, so composed modules reach wgpu without conversion.
+naga = { version = "30.0.1", features = ["wgsl-in", "wgsl-out", "msl-out", "spv-out"] }
 thiserror = "2"
 
 [dev-dependencies]

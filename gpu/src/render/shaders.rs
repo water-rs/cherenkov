@@ -184,6 +184,7 @@ impl ShaderDelivery {
                     device.create_shader_module_passthrough(
                         wgpu::ShaderModuleDescriptorPassthrough {
                             label: Some(label),
+                            entry_points: entry_points(),
                             spirv: Some(words(fixed.spirv)),
                             ..wgpu::ShaderModuleDescriptorPassthrough::default()
                         },
@@ -203,6 +204,7 @@ impl ShaderDelivery {
                     device.create_shader_module_passthrough(
                         wgpu::ShaderModuleDescriptorPassthrough {
                             label: Some(label),
+                            entry_points: entry_points(),
                             metallib: Some(Cow::Borrowed(fixed.metallib)),
                             ..wgpu::ShaderModuleDescriptorPassthrough::default()
                         },
@@ -227,4 +229,19 @@ fn words(spirv: &[u8]) -> Cow<'static, [u32]> {
             .map(|w| u32::from_le_bytes(*w))
             .collect(),
     )
+}
+
+// Every fixed module contains this vertex/fragment pair. Passthrough entry
+// points are explicit in wgpu 30; graphics stages have no workgroup size.
+const fn entry_points() -> Cow<'static, [wgpu::PassthroughShaderEntryPoint<'static>]> {
+    Cow::Borrowed(&[
+        wgpu::PassthroughShaderEntryPoint {
+            name: Cow::Borrowed("vs_main"),
+            workgroup_size: (0, 0, 0),
+        },
+        wgpu::PassthroughShaderEntryPoint {
+            name: Cow::Borrowed("fs_main"),
+            workgroup_size: (0, 0, 0),
+        },
+    ])
 }

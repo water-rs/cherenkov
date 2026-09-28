@@ -347,8 +347,8 @@ impl Uploads<Rgba16F> for Null {}
 ///
 /// ```ignore
 /// cherenkov::behaviour_suite! {
-///     backend: cherenkov_vello::Vello,
-///     config: || cherenkov_vello::VelloConfig::default(),
+///     backend: cherenkov_gpu::Gpu,
+///     config: || cherenkov_gpu::GpuConfig::default(),
 ///     uploads: true,
 /// }
 /// ```

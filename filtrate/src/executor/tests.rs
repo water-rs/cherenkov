@@ -917,6 +917,7 @@ fn create_test_device() -> TestGpu {
         power_preference: wgpu::PowerPreference::HighPerformance,
         compatible_surface: None,
         force_fallback_adapter: false,
+        apply_limit_buckets: false,
     }))
     .expect("filter GPU tests require a high-performance adapter");
     let (device, queue) =
@@ -1063,7 +1064,9 @@ fn readback_bytes(
         .expect("map callback should return a completion result")
         .expect("buffer mapping should succeed");
 
-    let mapped = slice.get_mapped_range();
+    let mapped = slice
+        .get_mapped_range()
+        .expect("buffer range is mapped and not overlapping");
     let mut out = Vec::with_capacity((unpadded_bpr * height) as usize);
     for row in 0..height as usize {
         let start = row * padded_bpr as usize;

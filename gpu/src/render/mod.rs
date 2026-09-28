@@ -588,6 +588,7 @@ async fn create_device(
         .request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: config.power_preference,
             force_fallback_adapter: false,
+            apply_limit_buckets: false,
             compatible_surface: None,
         })
         .await
@@ -2014,7 +2015,9 @@ impl Renderer for GpuRenderer {
         tracing::trace!(?surface, ?submission, "readback submitted");
         let slice = buf.slice(..);
         self.map_read(slice, submission, "the pixel readback")?;
-        let data = slice.get_mapped_range();
+        let data = slice
+            .get_mapped_range()
+            .expect("buffer range is mapped and not overlapping");
         let mut pixels = Vec::with_capacity((w * h) as usize);
         for row in 0..h {
             let start = (row * bytes_per_row) as usize;
@@ -2081,7 +2084,9 @@ impl Renderer for GpuRenderer {
         let slice = buf.slice(..);
         self.map_read(slice, submission, "the pixel readback")
             .await?;
-        let data = slice.get_mapped_range();
+        let data = slice
+            .get_mapped_range()
+            .expect("buffer range is mapped and not overlapping");
         let mut pixels = Vec::with_capacity((w * h) as usize);
         for row in 0..h {
             let start = (row * bytes_per_row) as usize;
@@ -3526,7 +3531,8 @@ impl GpuRenderer {
                 let data = pending
                     .staging
                     .slice(..u64::from(pending.count) * 8)
-                    .get_mapped_range();
+                    .get_mapped_range()
+                    .expect("buffer range is mapped and not overlapping");
                 let ticks: &[u64] = bytemuck::cast_slice(&data);
                 tracing::trace!(
                     frame = pending.frame.get(),

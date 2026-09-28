@@ -358,15 +358,46 @@ fn max_u64<'a>(readings: impl Iterator<Item = &'a Reading<u64>>) -> Reading<u64>
     )
 }
 
-#[cfg(any(
-    feature = "cherenkov",
-    feature = "cherenkov-vello",
-    feature = "vello-classic",
-    feature = "vello-hybrid"
-))]
+#[cfg(feature = "cherenkov")]
 pub(crate) fn wgpu_allocator(
     device: &wgpu::Device,
     backend: wgpu::Backend,
+) -> Reading<AllocatorBytes> {
+    let Some(report) = device.generate_allocator_report() else {
+        return Reading::unavailable(format!(
+            "wgpu backend {backend:?} returns no allocator report"
+        ));
+    };
+    let allocations = match u64::try_from(report.allocations.len()) {
+        Ok(count) => count,
+        Err(error) => {
+            return Reading::unavailable(format!(
+                "wgpu allocation count does not fit in u64: {error}"
+            ));
+        }
+    };
+    let blocks = match u64::try_from(report.blocks.len()) {
+        Ok(count) => count,
+        Err(error) => {
+            return Reading::unavailable(format!(
+                "wgpu allocator block count does not fit in u64: {error}"
+            ));
+        }
+    };
+    Reading::Measured(AllocatorBytes {
+        allocated_bytes: report.total_allocated_bytes,
+        reserved_bytes: report.total_reserved_bytes,
+        allocations,
+        blocks,
+    })
+}
+
+/// The wgpu 29 allocator report for the `vello-classic`/`vello-hybrid`
+/// baselines, whose devices are the pinned fork's wgpu major.
+#[cfg(any(feature = "vello-classic", feature = "vello-hybrid"))]
+pub(crate) fn wgpu29_allocator(
+    device: &wgpu29::Device,
+    backend: wgpu29::Backend,
 ) -> Reading<AllocatorBytes> {
     let Some(report) = device.generate_allocator_report() else {
         return Reading::unavailable(format!(
@@ -407,15 +438,7 @@ pub(crate) fn skia_budget(api: &'static str, bytes: usize) -> Reading<SkiaBudget
     }
 }
 
-#[cfg(all(
-    target_os = "linux",
-    any(
-        feature = "cherenkov",
-        feature = "cherenkov-vello",
-        feature = "vello-classic",
-        feature = "vello-hybrid"
-    )
-))]
+#[cfg(all(target_os = "linux", feature = "cherenkov"))]
 pub(crate) fn wgpu_vk_memory_budget(
     device: &wgpu::Device,
     backend: wgpu::Backend,
@@ -424,6 +447,28 @@ pub(crate) fn wgpu_vk_memory_budget(
     // SAFETY: the guard keeps the HAL device alive while its Vulkan handles
     // are queried; no handle is destroyed or used after the guard drops.
     let Some(hal_device) = (unsafe { device.as_hal::<wgpu::hal::api::Vulkan>() }) else {
+        return Reading::unavailable(format!(
+            "wgpu backend {backend:?} for adapter {adapter_name} is not Vulkan"
+        ));
+    };
+    let instance = hal_device.shared_instance().raw_instance();
+    vk_memory_budget(instance, hal_device.raw_physical_device(), adapter_name)
+}
+
+/// [`wgpu_vk_memory_budget`] for the wgpu 29 devices of the
+/// `vello-classic`/`vello-hybrid` baselines.
+#[cfg(all(
+    target_os = "linux",
+    any(feature = "vello-classic", feature = "vello-hybrid")
+))]
+pub(crate) fn wgpu29_vk_memory_budget(
+    device: &wgpu29::Device,
+    backend: wgpu29::Backend,
+    adapter_name: &str,
+) -> Reading<Vec<VkHeap>> {
+    // SAFETY: the guard keeps the HAL device alive while its Vulkan handles
+    // are queried; no handle is destroyed or used after the guard drops.
+    let Some(hal_device) = (unsafe { device.as_hal::<wgpu29::hal::api::Vulkan>() }) else {
         return Reading::unavailable(format!(
             "wgpu backend {backend:?} for adapter {adapter_name} is not Vulkan"
         ));
@@ -454,7 +499,6 @@ pub(crate) fn ash_vk_memory_budget(
     target_os = "linux",
     any(
         feature = "cherenkov",
-        feature = "cherenkov-vello",
         feature = "vello-classic",
         feature = "vello-hybrid",
         feature = "skia"
@@ -506,16 +550,24 @@ fn vk_memory_budget(
     Reading::Measured(heaps)
 }
 
-#[cfg(any(
-    feature = "cherenkov",
-    feature = "cherenkov-vello",
-    feature = "vello-classic",
-    feature = "vello-hybrid"
-))]
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(not(target_os = "linux"), feature = "cherenkov"))]
 pub(crate) fn wgpu_vk_memory_budget(
     _device: &wgpu::Device,
     _backend: wgpu::Backend,
+    _adapter_name: &str,
+) -> Reading<Vec<VkHeap>> {
+    Reading::unavailable("VK_EXT_memory_budget is sampled only on Linux")
+}
+
+/// [`wgpu_vk_memory_budget`] for the wgpu 29 devices of the
+/// `vello-classic`/`vello-hybrid` baselines.
+#[cfg(all(
+    not(target_os = "linux"),
+    any(feature = "vello-classic", feature = "vello-hybrid")
+))]
+pub(crate) fn wgpu29_vk_memory_budget(
+    _device: &wgpu29::Device,
+    _backend: wgpu29::Backend,
     _adapter_name: &str,
 ) -> Reading<Vec<VkHeap>> {
     Reading::unavailable("VK_EXT_memory_budget is sampled only on Linux")

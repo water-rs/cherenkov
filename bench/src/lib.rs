@@ -39,20 +39,12 @@ pub mod convert;
 pub mod energy;
 pub mod gamut_sweep;
 pub mod memory;
-#[cfg(any(
-    feature = "cherenkov",
-    feature = "cherenkov-cpu",
-    feature = "cherenkov-vello"
-))]
+#[cfg(any(feature = "cherenkov", feature = "cherenkov-cpu"))]
 pub mod motion;
 #[cfg(feature = "cherenkov")]
 pub mod present_cost;
 pub mod report;
-#[cfg(any(
-    feature = "cherenkov",
-    feature = "cherenkov-cpu",
-    feature = "cherenkov-vello"
-))]
+#[cfg(any(feature = "cherenkov", feature = "cherenkov-cpu"))]
 pub mod timing;
 pub mod tone_sweep;
 pub mod transform;
@@ -65,8 +57,6 @@ pub mod vello_like;
 #[cfg(any(feature = "vello-classic", feature = "vello-hybrid"))]
 pub mod wgpu_ctx;
 
-#[cfg(feature = "cherenkov-vello")]
-pub mod cherenkov_vello_ad;
 #[cfg(any(feature = "skia", feature = "skia-metal"))]
 pub mod skia_ad;
 #[cfg(feature = "vello-classic")]
@@ -394,8 +384,6 @@ pub fn engine_names() -> Vec<&'static str> {
         skia_ad::SkiaMtl::NAME,
         #[cfg(feature = "cherenkov")]
         cherenkov_ad::Cherenkov::NAME,
-        #[cfg(feature = "cherenkov-vello")]
-        cherenkov_vello_ad::CherenkovVello::NAME,
         #[cfg(feature = "cherenkov-cpu")]
         cherenkov_cpu_ad::Cherenkov::NAME,
     ]
@@ -427,10 +415,6 @@ pub fn create_engine(name: &str) -> Result<Box<dyn Engine>, BenchError> {
         #[cfg(feature = "cherenkov")]
         cherenkov_ad::Cherenkov::NAME => {
             cherenkov_ad::Cherenkov::new().map(|e| Box::new(e) as Box<dyn Engine>)
-        }
-        #[cfg(feature = "cherenkov-vello")]
-        cherenkov_vello_ad::CherenkovVello::NAME => {
-            cherenkov_vello_ad::CherenkovVello::new().map(|e| Box::new(e) as Box<dyn Engine>)
         }
         #[cfg(feature = "cherenkov-cpu")]
         cherenkov_cpu_ad::Cherenkov::NAME => {

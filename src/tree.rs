@@ -20,8 +20,9 @@ use crate::animation::{
     settled, spring_step,
 };
 use crate::backend::Display;
+use crate::display_list::{Operand, SlotUpdate};
 use crate::frame::RefreshRange;
-use crate::message::{BackdropId, LayerId, LayerOp, Prop};
+use crate::message::{BackdropId, ContentOp, LayerId, LayerOp, Prop};
 use crate::shape::ShapeData;
 use crate::style::{BlendMode, FilterId};
 
@@ -55,6 +56,12 @@ pub struct LayerNode {
     pub backdrop: Option<BackdropId>,
     /// The child layers, in paint order.
     pub children: Vec<LayerId>,
+    /// Counts direct children that blend; each such child isolates itself so
+    /// ancestors above it receive a normal composite.
+    blending_children: u32,
+    /// Content updates conservatively retain this until replacement; extra
+    /// pass-through isolation is output-equivalent.
+    content_blends: bool,
     parent: Option<LayerId>,
     transform_track: Option<Track<Affine>>,
     components: Option<Box<components::Components>>,
@@ -88,6 +95,8 @@ impl LayerNode {
             filter: None,
             backdrop: None,
             children: Vec::new(),
+            blending_children: 0,
+            content_blends: false,
             parent: None,
             transform_track: None,
             components: None,
@@ -103,6 +112,14 @@ impl LayerNode {
     #[must_use]
     pub fn content_transform(&self) -> Affine {
         self.transform * Affine::translate(-self.scroll_offset)
+    }
+
+    /// Whether a child layer, or a group in this layer's own content, composites
+    /// onto this layer with a non-`Normal` blend. Such a layer isolates like a
+    /// group with a blended descendant.
+    #[must_use]
+    pub const fn blends_within(&self) -> bool {
+        self.blending_children > 0 || self.content_blends
     }
 }
 
@@ -234,6 +251,25 @@ impl SurfaceTree {
             .unwrap_or_else(|| panic!("layer {} is not in the tree", id.raw()))
     }
 
+    /// Records whether the layer's content contains a non-`Normal` group.
+    pub(crate) fn note_content(&mut self, id: LayerId, content: Option<&ContentOp>) {
+        let node = self.node_mut(id);
+        match content {
+            Some(ContentOp::Replace(picture) | ContentOp::Picture(picture)) => {
+                node.content_blends = crate::lowering::blends_within(
+                    picture.display_list(),
+                    0..picture.display_list().len(),
+                );
+            }
+            Some(ContentOp::Update(updates)) => {
+                node.content_blends |= updates.iter().any(|SlotUpdate { value, .. }| {
+                    matches!(value, Operand::Group(group) if group.blend != BlendMode::Normal)
+                });
+            }
+            None => node.content_blends = false,
+        }
+    }
+
     /// Every layer in the tree. Order is unspecified.
     pub fn layers(&self) -> impl Iterator<Item = (LayerId, &LayerNode)> + '_ {
         self.nodes
@@ -305,7 +341,23 @@ impl SurfaceTree {
                 set_prop(&mut node.scroll_track, &mut node.scroll_offset, &prop);
             }
             LayerOp::Clip(id, clip) => self.node_mut(id).clip = clip,
-            LayerOp::Blend(id, blend) => self.node_mut(id).blend = blend,
+            LayerOp::Blend(id, blend) => {
+                let node = self.layer(id);
+                let parent = node.parent;
+                let was_blending = node.blend != BlendMode::Normal;
+                let is_blending = blend != BlendMode::Normal;
+                if was_blending != is_blending
+                    && let Some(parent) = parent
+                {
+                    let count = &mut self.node_mut(parent).blending_children;
+                    if is_blending {
+                        *count += 1;
+                    } else {
+                        *count -= 1;
+                    }
+                }
+                self.node_mut(id).blend = blend;
+            }
             LayerOp::Filter(id, filter) => self.node_mut(id).filter = filter,
             LayerOp::Backdrop(id, backdrop) => self.node_mut(id).backdrop = backdrop,
             LayerOp::Content(id, _) => {
@@ -324,8 +376,11 @@ impl SurfaceTree {
                 );
                 self.assert_attachment(parent, child);
                 self.detach(child);
+                let blends = self.layer(child).blend != BlendMode::Normal;
                 self.node_mut(child).parent = Some(parent);
-                self.node_mut(parent).children.push(child);
+                let parent_node = self.node_mut(parent);
+                parent_node.children.push(child);
+                parent_node.blending_children += u32::from(blends);
             }
             LayerOp::Insert {
                 parent,
@@ -339,10 +394,12 @@ impl SurfaceTree {
                 );
                 self.assert_attachment(parent, child);
                 self.detach(child);
+                let blends = self.layer(child).blend != BlendMode::Normal;
                 self.node_mut(child).parent = Some(parent);
                 let node = self.node_mut(parent);
                 let index = index.min(node.children.len());
                 node.children.insert(index, child);
+                node.blending_children += u32::from(blends);
             }
             LayerOp::Detach { parent, child } => {
                 assert_eq!(
@@ -366,7 +423,10 @@ impl SurfaceTree {
 
     fn detach(&mut self, child: LayerId) {
         if let Some(parent) = self.node_mut(child).parent.take() {
-            self.node_mut(parent).children.retain(|c| *c != child);
+            let blends = self.layer(child).blend != BlendMode::Normal;
+            let parent_node = self.node_mut(parent);
+            parent_node.children.retain(|c| *c != child);
+            parent_node.blending_children -= u32::from(blends);
         }
     }
 
@@ -548,6 +608,10 @@ fn snap(offset: Vec2, scale: f64) -> Vec2 {
 #[cfg(test)]
 mod hierarchy_tests {
     use super::*;
+    use crate::display_list::{Operand, Picture, SlotUpdate};
+    use crate::style::Group;
+    use crate::{Draw, WorkingColor};
+    use kurbo::Rect;
 
     fn tree() -> SurfaceTree {
         let mut tree = SurfaceTree::new();
@@ -614,5 +678,164 @@ mod hierarchy_tests {
             [LayerId::new(1), LayerId::new(2)]
         );
         assert!(tree.layer(LayerId::new(3)).children.is_empty());
+    }
+
+    #[test]
+    fn attached_child_blend_changes_are_counted() {
+        let mut tree = SurfaceTree::new();
+        let child = LayerId::new(1);
+        tree.apply(LayerOp::Create(child));
+        tree.apply(LayerOp::Push {
+            parent: tree.root(),
+            child,
+        });
+
+        assert!(!tree.layer(tree.root()).blends_within());
+        tree.apply(LayerOp::Blend(child, BlendMode::DestOut));
+        assert!(tree.layer(tree.root()).blends_within());
+        tree.apply(LayerOp::Blend(child, BlendMode::Normal));
+        assert!(!tree.layer(tree.root()).blends_within());
+    }
+
+    #[test]
+    fn blending_child_count_tracks_push_insert_detach_and_remove() {
+        let mut tree = SurfaceTree::new();
+        let first_parent = LayerId::new(1);
+        let second_parent = LayerId::new(2);
+        let first_child = LayerId::new(3);
+        let second_child = LayerId::new(4);
+        for id in [first_parent, second_parent, first_child, second_child] {
+            tree.apply(LayerOp::Create(id));
+        }
+        for parent in [first_parent, second_parent] {
+            tree.apply(LayerOp::Push {
+                parent: tree.root(),
+                child: parent,
+            });
+        }
+        tree.apply(LayerOp::Blend(first_child, BlendMode::DestOut));
+        tree.apply(LayerOp::Push {
+            parent: first_parent,
+            child: first_child,
+        });
+        assert!(tree.layer(first_parent).blends_within());
+
+        tree.apply(LayerOp::Blend(second_child, BlendMode::Multiply));
+        tree.apply(LayerOp::Insert {
+            parent: first_parent,
+            index: 0,
+            child: second_child,
+        });
+        tree.apply(LayerOp::Detach {
+            parent: first_parent,
+            child: first_child,
+        });
+        assert!(tree.layer(first_parent).blends_within());
+
+        tree.remove(second_child);
+        assert!(!tree.layer(first_parent).blends_within());
+    }
+
+    #[test]
+    fn repushing_a_blending_child_updates_both_parents() {
+        let mut tree = SurfaceTree::new();
+        let first_parent = LayerId::new(1);
+        let second_parent = LayerId::new(2);
+        let child = LayerId::new(3);
+        for id in [first_parent, second_parent, child] {
+            tree.apply(LayerOp::Create(id));
+        }
+        for parent in [first_parent, second_parent] {
+            tree.apply(LayerOp::Push {
+                parent: tree.root(),
+                child: parent,
+            });
+        }
+        tree.apply(LayerOp::Blend(child, BlendMode::DestOut));
+        tree.apply(LayerOp::Push {
+            parent: first_parent,
+            child,
+        });
+        tree.apply(LayerOp::Push {
+            parent: second_parent,
+            child,
+        });
+
+        assert!(!tree.layer(first_parent).blends_within());
+        assert!(tree.layer(second_parent).blends_within());
+    }
+
+    #[test]
+    fn blend_set_before_attachment_is_counted() {
+        let mut tree = SurfaceTree::new();
+        let parent = LayerId::new(1);
+        let child = LayerId::new(2);
+        tree.apply(LayerOp::Create(parent));
+        tree.apply(LayerOp::Create(child));
+        tree.apply(LayerOp::Push {
+            parent: tree.root(),
+            child: parent,
+        });
+        tree.apply(LayerOp::Blend(child, BlendMode::DestOut));
+        assert!(!tree.layer(parent).blends_within());
+
+        tree.apply(LayerOp::Push { parent, child });
+        assert!(tree.layer(parent).blends_within());
+    }
+
+    #[test]
+    fn grandchild_blend_does_not_count_on_grandparent() {
+        let mut tree = SurfaceTree::new();
+        let grandparent = LayerId::new(1);
+        let parent = LayerId::new(2);
+        let grandchild = LayerId::new(3);
+        for id in [grandparent, parent, grandchild] {
+            tree.apply(LayerOp::Create(id));
+        }
+        tree.apply(LayerOp::Push {
+            parent: tree.root(),
+            child: grandparent,
+        });
+        tree.apply(LayerOp::Push {
+            parent: grandparent,
+            child: parent,
+        });
+        tree.apply(LayerOp::Push {
+            parent,
+            child: grandchild,
+        });
+        tree.apply(LayerOp::Blend(grandchild, BlendMode::DestOut));
+
+        assert!(tree.layer(parent).blends_within());
+        assert!(!tree.layer(grandparent).blends_within());
+    }
+
+    #[test]
+    fn content_blends_track_replace_update_and_clear() {
+        let mut tree = SurfaceTree::new();
+        let layer = LayerId::new(1);
+        tree.apply(LayerOp::Create(layer));
+        let picture = Picture::record(|recorder| {
+            recorder.group(Group::new().blend(BlendMode::DestOut), |recorder| {
+                recorder.fill(Rect::new(0.0, 0.0, 1.0, 1.0), WorkingColor::WHITE);
+            });
+        });
+
+        tree.note_content(layer, Some(&ContentOp::Replace(picture.clone())));
+        assert!(tree.layer(layer).blends_within());
+        tree.note_content(layer, Some(&ContentOp::Picture(picture)));
+        assert!(tree.layer(layer).blends_within());
+
+        tree.note_content(
+            layer,
+            Some(&ContentOp::Update(vec![SlotUpdate {
+                command: 0,
+                value: Operand::Group(Group::new()),
+            }])),
+        );
+        assert!(tree.layer(layer).blends_within());
+
+        tree.note_content(layer, None);
+        assert!(!tree.layer(layer).blends_within());
     }
 }

@@ -1,81 +1,81 @@
 {
- "width": 128,
- "height": 128,
- "working_space": "linear-display-p3",
- "clear": {
-  "space": "srgb",
-  "components": [
-   0.95,
-   0.95,
-   0.95,
-   1.0
-  ]
- },
- "present_headroom": 4.0,
- "features": [
-  {
-   "feature": "fill"
+  "width": 128,
+  "height": 128,
+  "working_space": "linear-display-p3",
+  "clear": {
+    "space": "srgb",
+    "components": [
+      0.95,
+      0.95,
+      0.95,
+      1.0
+    ]
   },
-  {
-   "feature": "image-paint"
-  },
-  {
-   "feature": "image-f16"
-  },
-  {
-   "feature": "image-color-space",
-   "value": "linear-p3"
-  }
- ],
- "root": {
-  "transform": [
-   1.0,
-   0.0,
-   0.0,
-   1.0,
-   0.0,
-   0.0
-  ],
-  "opacity": 1.0,
-  "blend": "normal",
-  "items": [
-   {
-    "draw": {
-     "fill": {
-      "shape": {
-       "rect": {
-        "x0": 8.0,
-        "y0": 8.0,
-        "x1": 120.0,
-        "y1": 120.0
-       }
-      },
-      "rule": "non-zero",
-      "paint": {
-       "image": {
-        "image": "d7db71635939042e9cec02146f092aec8c0851ae35b46403d710f40a915d4ce8",
-        "encoding": {
-         "encoding": "rgba16-f",
-         "width": 32,
-         "height": 32,
-         "color_space": "linear-p3"
-        },
-        "transform": [
-         3.5,
-         0.0,
-         0.0,
-         3.5,
-         8.0,
-         8.0
-        ],
-        "extend_x": "pad",
-        "extend_y": "pad",
-        "sampling": "bilinear"
-       }
-      }
-     }
+  "present_headroom": 4.0,
+  "features": [
+    {
+      "feature": "fill"
+    },
+    {
+      "feature": "image-paint"
+    },
+    {
+      "feature": "image-f16"
+    },
+    {
+      "feature": "image-color-space",
+      "value": "linear-p3"
     }
-   }
-  ]
- }
+  ],
+  "root": {
+    "transform": [
+      1.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0
+    ],
+    "opacity": 1.0,
+    "blend": "normal",
+    "items": [
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rect": {
+                "x0": 8.0,
+                "y0": 8.0,
+                "x1": 120.0,
+                "y1": 120.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "image": {
+                "image": "d7db71635939042e9cec02146f092aec8c0851ae35b46403d710f40a915d4ce8",
+                "encoding": {
+                  "encoding": "rgba16-f",
+                  "width": 32,
+                  "height": 32,
+                  "color_space": "linear-p3"
+                },
+                "transform": [
+                  3.5,
+                  0.0,
+                  0.0,
+                  3.5,
+                  8.0,
+                  8.0
+                ],
+                "extend_x": "pad",
+                "extend_y": "pad",
+                "sampling": "bilinear"
+              }
+            }
+          }
+        }
+      }
+    ]
+  }
 }

@@ -1,300 +1,299 @@
 {
- "width": 96,
- "height": 96,
- "working_space": "linear-display-p3",
- "clear": {
-  "space": "srgb",
-  "components": [
-   0.95,
-   0.95,
-   0.95,
-   1.0
-  ]
- },
- "present_headroom": 1.0,
- "features": [
-  {
-   "feature": "fill"
+  "width": 96,
+  "height": 96,
+  "working_space": "linear-display-p3",
+  "clear": {
+    "space": "srgb",
+    "components": [
+      0.95,
+      0.95,
+      0.95,
+      1.0
+    ]
   },
-  {
-   "feature": "hdr-color"
-  },
-  {
-   "feature": "wide-gamut"
-  }
- ],
- "root": {
-  "transform": [
-   1.0,
-   0.0,
-   0.0,
-   1.0,
-   0.0,
-   0.0
+  "features": [
+    {
+      "feature": "fill"
+    },
+    {
+      "feature": "hdr-color"
+    },
+    {
+      "feature": "wide-gamut"
+    }
   ],
-  "opacity": 1.0,
-  "blend": "normal",
-  "items": [
-   {
-    "draw": {
-     "fill": {
-      "shape": {
-       "rect": {
-        "x0": 0,
-        "y0": 0,
-        "x1": 96,
-        "y1": 96
-       }
+  "root": {
+    "transform": [
+      1.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0
+    ],
+    "opacity": 1.0,
+    "blend": "normal",
+    "items": [
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rect": {
+                "x0": 0.0,
+                "y0": 0.0,
+                "x1": 96.0,
+                "y1": 96.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "linear-p3",
+                "components": [
+                  0.02,
+                  0.02,
+                  0.04,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
       },
-      "rule": "non-zero",
-      "paint": {
-       "solid": {
-        "space": "linear-p3",
-        "components": [
-         0.02,
-         0.02,
-         0.04,
-         1.0
-        ]
-       }
-      }
-     }
-    }
-   },
-   {
-    "draw": {
-     "fill": {
-      "shape": {
-       "rect": {
-        "x0": 4,
-        "y0": 4,
-        "x1": 32,
-        "y1": 32
-       }
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rect": {
+                "x0": 4.0,
+                "y0": 4.0,
+                "x1": 32.0,
+                "y1": 32.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "linear-p3",
+                "components": [
+                  4.0,
+                  0.0,
+                  0.0,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
       },
-      "rule": "non-zero",
-      "paint": {
-       "solid": {
-        "space": "linear-p3",
-        "components": [
-         4.0,
-         0.0,
-         0.0,
-         1.0
-        ]
-       }
-      }
-     }
-    }
-   },
-   {
-    "draw": {
-     "fill": {
-      "shape": {
-       "rect": {
-        "x0": 36,
-        "y0": 4,
-        "x1": 64,
-        "y1": 32
-       }
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rect": {
+                "x0": 36.0,
+                "y0": 4.0,
+                "x1": 64.0,
+                "y1": 32.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "linear-p3",
+                "components": [
+                  0.0,
+                  4.0,
+                  0.0,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
       },
-      "rule": "non-zero",
-      "paint": {
-       "solid": {
-        "space": "linear-p3",
-        "components": [
-         0.0,
-         4.0,
-         0.0,
-         1.0
-        ]
-       }
-      }
-     }
-    }
-   },
-   {
-    "draw": {
-     "fill": {
-      "shape": {
-       "rect": {
-        "x0": 68,
-        "y0": 4,
-        "x1": 96,
-        "y1": 32
-       }
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rect": {
+                "x0": 68.0,
+                "y0": 4.0,
+                "x1": 96.0,
+                "y1": 32.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "linear-p3",
+                "components": [
+                  0.0,
+                  0.0,
+                  4.0,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
       },
-      "rule": "non-zero",
-      "paint": {
-       "solid": {
-        "space": "linear-p3",
-        "components": [
-         0.0,
-         0.0,
-         4.0,
-         1.0
-        ]
-       }
-      }
-     }
-    }
-   },
-   {
-    "draw": {
-     "fill": {
-      "shape": {
-       "rect": {
-        "x0": 4,
-        "y0": 36,
-        "x1": 32,
-        "y1": 64
-       }
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rect": {
+                "x0": 4.0,
+                "y0": 36.0,
+                "x1": 32.0,
+                "y1": 64.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "linear-p3",
+                "components": [
+                  4.0,
+                  4.0,
+                  0.0,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
       },
-      "rule": "non-zero",
-      "paint": {
-       "solid": {
-        "space": "linear-p3",
-        "components": [
-         4.0,
-         4.0,
-         0.0,
-         1.0
-        ]
-       }
-      }
-     }
-    }
-   },
-   {
-    "draw": {
-     "fill": {
-      "shape": {
-       "rect": {
-        "x0": 36,
-        "y0": 36,
-        "x1": 64,
-        "y1": 64
-       }
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rect": {
+                "x0": 36.0,
+                "y0": 36.0,
+                "x1": 64.0,
+                "y1": 64.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "linear-p3",
+                "components": [
+                  0.0,
+                  4.0,
+                  4.0,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
       },
-      "rule": "non-zero",
-      "paint": {
-       "solid": {
-        "space": "linear-p3",
-        "components": [
-         0.0,
-         4.0,
-         4.0,
-         1.0
-        ]
-       }
-      }
-     }
-    }
-   },
-   {
-    "draw": {
-     "fill": {
-      "shape": {
-       "rect": {
-        "x0": 68,
-        "y0": 36,
-        "x1": 96,
-        "y1": 64
-       }
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rect": {
+                "x0": 68.0,
+                "y0": 36.0,
+                "x1": 96.0,
+                "y1": 64.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "linear-p3",
+                "components": [
+                  4.0,
+                  0.0,
+                  4.0,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
       },
-      "rule": "non-zero",
-      "paint": {
-       "solid": {
-        "space": "linear-p3",
-        "components": [
-         4.0,
-         0.0,
-         4.0,
-         1.0
-        ]
-       }
-      }
-     }
-    }
-   },
-   {
-    "draw": {
-     "fill": {
-      "shape": {
-       "rect": {
-        "x0": 4,
-        "y0": 68,
-        "x1": 32,
-        "y1": 96
-       }
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rect": {
+                "x0": 4.0,
+                "y0": 68.0,
+                "x1": 32.0,
+                "y1": 96.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "linear-p3",
+                "components": [
+                  4.0,
+                  2.0,
+                  0.5,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
       },
-      "rule": "non-zero",
-      "paint": {
-       "solid": {
-        "space": "linear-p3",
-        "components": [
-         4.0,
-         2.0,
-         0.5,
-         1.0
-        ]
-       }
-      }
-     }
-    }
-   },
-   {
-    "draw": {
-     "fill": {
-      "shape": {
-       "rect": {
-        "x0": 36,
-        "y0": 68,
-        "x1": 64,
-        "y1": 96
-       }
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rect": {
+                "x0": 36.0,
+                "y0": 68.0,
+                "x1": 64.0,
+                "y1": 96.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "linear-p3",
+                "components": [
+                  8.0,
+                  4.0,
+                  1.0,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
       },
-      "rule": "non-zero",
-      "paint": {
-       "solid": {
-        "space": "linear-p3",
-        "components": [
-         8.0,
-         4.0,
-         1.0,
-         1.0
-        ]
-       }
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rect": {
+                "x0": 68.0,
+                "y0": 68.0,
+                "x1": 96.0,
+                "y1": 96.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "linear-p3",
+                "components": [
+                  8.0,
+                  8.0,
+                  8.0,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
       }
-     }
-    }
-   },
-   {
-    "draw": {
-     "fill": {
-      "shape": {
-       "rect": {
-        "x0": 68,
-        "y0": 68,
-        "x1": 96,
-        "y1": 96
-       }
-      },
-      "rule": "non-zero",
-      "paint": {
-       "solid": {
-        "space": "linear-p3",
-        "components": [
-         8.0,
-         8.0,
-         8.0,
-         1.0
-        ]
-       }
-      }
-     }
-    }
-   }
-  ]
- }
+    ]
+  }
 }

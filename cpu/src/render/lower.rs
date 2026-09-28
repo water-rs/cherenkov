@@ -367,7 +367,7 @@ fn flatten_edges(path: BezPath, tol: f64) -> Vec<Edge> {
 /// Resolves overlapping windings: `Some` swaps in boundary edges whose
 /// winding is 0 or 1 everywhere, drawn under `NonZero`. `None` keeps the
 /// original edges and rule untouched.
-fn resolve_edges(edges: Vec<Edge>, rule: FillRule) -> (Vec<Edge>, FillRule) {
+pub fn resolve_edges(edges: Vec<Edge>, rule: FillRule) -> (Vec<Edge>, FillRule) {
     let segments: Vec<(f32, f32, f32, f32)> =
         edges.iter().map(|e| (e.x0, e.y0, e.x1, e.y1)).collect();
     cherenkov::lowering::resolve_winding(&segments, rule).map_or((edges, rule), |resolved| {

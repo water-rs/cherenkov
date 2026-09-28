@@ -17,9 +17,53 @@ use cherenkov::FillRule;
 
 use crate::render::lower::{ClipMask, ClipRef, IRect, Item};
 use crate::render::paint::PaintData;
+use crate::{Band as BandOut, BandPixels};
+use cherenkov::OffscreenFormat;
 
 /// Rows per rasterization band.
 pub const BAND_H: usize = 16;
+
+/// One worker's band working set: the coverage accumulator's storage, the
+/// isolation-stack colour buffers and the emit scratch. Created per rayon
+/// worker for the duration of a parallel pass (`for_each_init`), so buffers
+/// are single-owner and never shared — no locking exists here at all.
+///
+/// Nothing is retained after a pass: the working set is transient and
+/// bounded by `workers × (one band's colour + coverage)`, which is what the
+/// memory reports describe. Allocation happens per worker per frame rather
+/// than per band.
+pub struct Scratch {
+    /// `(w + 2) * band_rows` coverage cells, reused across bands.
+    coverage: Vec<f32>,
+    /// Free colour buffers, up to `w * band_rows` pixels each.
+    free: Vec<Vec<[f32; 4]>>,
+    /// Isolation-stack colour buffers currently in use.
+    stack: Vec<Vec<[f32; 4]>>,
+}
+
+impl Scratch {
+    /// An empty working set; buffers grow to band size on first use.
+    pub const fn new() -> Self {
+        Self {
+            coverage: Vec::new(),
+            free: Vec::new(),
+            stack: Vec::new(),
+        }
+    }
+
+    /// A zeroed colour buffer of `len` pixels, reused where possible.
+    fn take_color(&mut self, len: usize) -> Vec<[f32; 4]> {
+        let mut buf = self.free.pop().unwrap_or_default();
+        buf.clear();
+        buf.resize(len, [0.0; 4]);
+        buf
+    }
+
+    /// Returns a colour buffer to the freelist.
+    fn give_color(&mut self, buf: Vec<[f32; 4]>) {
+        self.free.push(buf);
+    }
+}
 
 /// Sample count of the shadow y-quadrature (the GPU uses the same).
 const SHADOW_N: usize = 16;
@@ -60,13 +104,25 @@ pub struct Accum {
 impl Accum {
     /// A zeroed accumulator of `w` × `h` cells.
     pub fn new(w: usize, h: usize) -> Self {
+        Self::with_buffer(w, h, Vec::new())
+    }
+
+    /// An accumulator of `w` × `h` cells on a reused zeroed buffer.
+    pub fn with_buffer(w: usize, h: usize, mut a: Vec<f32>) -> Self {
+        a.clear();
+        a.resize((w + 2) * h, 0.0);
         Self {
             w,
             h,
-            a: vec![0.0; (w + 2) * h],
+            a,
             cmin: 0,
             cmax: w + 1,
         }
+    }
+
+    /// Releases the cell buffer for pooling.
+    pub fn into_buffer(self) -> Vec<f32> {
+        self.a
     }
 
     /// Restricts the draw window to pixels `x0..x1` (already clamped to
@@ -271,99 +327,9 @@ fn src_over(dst: [f32; 4], src: [f32; 4]) -> [f32; 4] {
     ]
 }
 
-/// Rasterizes the whole surface's items into `fb` (length `w*h`,
-/// premultiplied linear P3), parallel over [`BAND_H`]-row bands.
-///
-/// Each band owns a coverage accumulator and a stack of scratch colour
-/// buffers for [`Item::PushIsolate`]/[`Item::PopIsolate`], and walks the
-/// item list sequentially.
-pub fn render_bands(
-    items: &[Item],
-    _clear: [f32; 4],
-    fb: &mut [[f32; 4]],
-    w: usize,
-    _h: usize,
-) -> (u32, u32) {
+/// `(draws, edges)` stats for an item list.
+fn stats(items: &[Item]) -> (u32, u32) {
     let (mut draws, mut edges) = (0_u32, 0_u32);
-    fb.par_chunks_mut(BAND_H * w)
-        .enumerate()
-        .for_each(|(band, slice)| {
-            let y0 = band * BAND_H;
-            let bh = slice.len() / w;
-            let mut acc = Accum::new(w, bh);
-            // The isolation stack: `slice` is the bottom. Each entry is a
-            // scratch colour buffer of the band.
-            let mut stack: Vec<Vec<[f32; 4]>> = Vec::new();
-            let mut band = Band { fb: slice, w, y0 };
-            for item in items {
-                match item {
-                    Item::Draw {
-                        edges,
-                        bbox,
-                        rule,
-                        paint,
-                        clip,
-                    } => {
-                        band.draw(
-                            &mut acc,
-                            &mut stack,
-                            edges,
-                            *bbox,
-                            *rule,
-                            paint,
-                            clip.as_ref(),
-                        );
-                    }
-                    Item::PushIsolate => {
-                        stack.push(vec![[0.0; 4]; slice_len(band.w, bh)]);
-                    }
-                    Item::PopIsolate {
-                        opacity,
-                        blend,
-                        clip,
-                    } => {
-                        let Some(scratch) = stack.pop() else {
-                            continue;
-                        };
-                        band.composite_isolate(
-                            &scratch,
-                            *opacity,
-                            *blend,
-                            clip.as_ref(),
-                            &mut stack,
-                        );
-                    }
-                    Item::Shadow {
-                        rbox,
-                        radii,
-                        sigma_eff,
-                        color,
-                        bbox,
-                        clip,
-                    } => {
-                        band.shadow(
-                            &mut stack,
-                            rbox,
-                            radii,
-                            *sigma_eff,
-                            color,
-                            *bbox,
-                            clip.as_ref(),
-                        );
-                    }
-                    Item::Glyph {
-                        slot,
-                        x,
-                        y,
-                        paint,
-                        clip,
-                    } => {
-                        band.glyph(&mut stack, slot, *x, *y, paint, clip.as_ref());
-                    }
-                }
-            }
-        });
-    // Counted before the parallel pass.
     for item in items {
         if let Item::Draw { edges: e, .. } = item {
             draws += 1;
@@ -371,6 +337,168 @@ pub fn render_bands(
         }
     }
     (draws, edges)
+}
+
+/// Shades one band of `slice` rows (`w * bh` pixels, cleared first),
+/// starting at device row `y0`.
+///
+/// The coverage accumulator and the isolation-stack scratch buffers come
+/// from `scratch` and return to it, so a band's working set stays band-sized
+/// and survives to the next band this worker shades.
+fn shade(
+    items: &[Item],
+    clear: [f32; 4],
+    slice: &mut [[f32; 4]],
+    w: usize,
+    y0: usize,
+    scratch: &mut Scratch,
+) {
+    let bh = slice.len() / w;
+    slice.fill(clear);
+    let mut coverage = std::mem::take(&mut scratch.coverage);
+    coverage.clear();
+    coverage.resize((w + 2) * bh, 0.0);
+    let mut acc = Accum::with_buffer(w, bh, coverage);
+    // The isolation stack: `slice` is the bottom. Each entry is a
+    // scratch colour buffer of the band.
+    let stack = &mut scratch.stack;
+    let free = &mut scratch.free;
+    let mut band = Band { fb: slice, w, y0 };
+    for item in items {
+        match item {
+            Item::Draw {
+                edges,
+                bbox,
+                rule,
+                paint,
+                clip,
+            } => {
+                band.draw(&mut acc, stack, edges, *bbox, *rule, paint, clip.as_ref());
+            }
+            Item::PushIsolate => {
+                let mut buf = free.pop().unwrap_or_default();
+                buf.clear();
+                buf.resize(slice_len(band.w, bh), [0.0; 4]);
+                stack.push(buf);
+            }
+            Item::PopIsolate {
+                opacity,
+                blend,
+                clip,
+            } => {
+                let Some(isolated) = stack.pop() else {
+                    continue;
+                };
+                band.composite_isolate(&isolated, *opacity, *blend, clip.as_ref(), stack);
+                free.push(isolated);
+            }
+            Item::Shadow {
+                rbox,
+                radii,
+                sigma_eff,
+                color,
+                bbox,
+                clip,
+            } => {
+                band.shadow(stack, rbox, radii, *sigma_eff, color, *bbox, clip.as_ref());
+            }
+            Item::Glyph {
+                slot,
+                x,
+                y,
+                paint,
+                clip,
+            } => {
+                band.glyph(stack, slot, *x, *y, paint, clip.as_ref());
+            }
+        }
+    }
+    scratch.free.append(stack);
+    scratch.coverage = acc.into_buffer();
+}
+
+/// Rasterizes the whole surface's items into `fb` (length `w*h`,
+/// premultiplied linear P3), parallel over [`BAND_H`]-row bands.
+///
+/// Each band owns a coverage accumulator and a stack of scratch colour
+/// buffers for [`Item::PushIsolate`]/[`Item::PopIsolate`], and walks the
+/// item list sequentially. `for_each_init` gives every worker that runs a
+/// band its own [`Scratch`], reused across that worker's bands.
+pub fn render_bands(items: &[Item], clear: [f32; 4], fb: &mut [[f32; 4]], w: usize) -> (u32, u32) {
+    let stats = stats(items);
+    fb.par_chunks_mut(BAND_H * w).enumerate().for_each_init(
+        Scratch::new,
+        |scratch, (band, slice)| {
+            shade(items, clear, slice, w, band * BAND_H, scratch);
+        },
+    );
+    stats
+}
+
+/// Rasterizes into `out` (length `w*h`), converting each finished band to
+/// `f16`, parallel over bands. Shading runs at full `f32`; the store
+/// rounds once, at the same point `LinearF16` readback rounds.
+pub fn render_bands_f16(
+    items: &[Item],
+    clear: [f32; 4],
+    out: &mut [[half::f16; 4]],
+    w: usize,
+) -> (u32, u32) {
+    let stats = stats(items);
+    out.par_chunks_mut(BAND_H * w).enumerate().for_each_init(
+        Scratch::new,
+        |scratch, (band, out_slice)| {
+            let mut band_px = scratch.take_color(out_slice.len());
+            shade(items, clear, &mut band_px, w, band * BAND_H, scratch);
+            for (dst, src) in out_slice.iter_mut().zip(band_px.iter()) {
+                *dst = src.map(half::f16::from_f32);
+            }
+            scratch.give_color(band_px);
+        },
+    );
+    stats
+}
+
+/// Rasterizes band by band in row order, delivering each finished band to
+/// `sink` in the target's format. No full-frame buffer exists: the working
+/// set is one band of scratch plus its apron.
+///
+/// `emit` is the surface's conversion buffer for `LinearF16` output.
+pub fn render_bands_stream(
+    items: &[Item],
+    clear: [f32; 4],
+    size: (usize, usize),
+    emit: &mut Vec<[half::f16; 4]>,
+    format: OffscreenFormat,
+    sink: &mut dyn FnMut(BandOut<'_>),
+) -> (u32, u32) {
+    let stats = stats(items);
+    let (w, h) = size;
+    let mut scratch = Scratch::new();
+    let mut band_px = scratch.take_color(w * h.min(BAND_H));
+    let mut y0 = 0;
+    while y0 < h {
+        let bh = (h - y0).min(BAND_H);
+        let band = &mut band_px[..w * bh];
+        shade(items, clear, band, w, y0, &mut scratch);
+        let y = u32::try_from(y0).unwrap_or(u32::MAX);
+        match format {
+            OffscreenFormat::LinearF32 => sink(BandOut {
+                y,
+                pixels: BandPixels::F32(band),
+            }),
+            OffscreenFormat::LinearF16 => {
+                emit.clear();
+                emit.extend(band.iter().map(|px| px.map(half::f16::from_f32)));
+                sink(BandOut {
+                    y,
+                    pixels: BandPixels::F16(emit.as_slice()),
+                });
+            }
+        }
+        y0 += bh;
+    }
+    stats
 }
 
 const fn slice_len(w: usize, bh: usize) -> usize {

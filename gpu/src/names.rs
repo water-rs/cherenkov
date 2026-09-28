@@ -27,8 +27,6 @@ pub const BLEND: &str = "blend-mode";
 pub const BACKDROP: &str = "backdrop";
 /// A stroke join or cap combination with no analytic form.
 pub const STROKE_JOIN: &str = "stroke-join";
-/// A per-glyph transform.
-pub const GLYPH_TRANSFORM: &str = "glyph-transform";
 /// A colour font (COLR, CBDT or sbix).
 pub const COLOR_FONT: &str = "color-font";
 /// A blend space other than linear.

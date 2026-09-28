@@ -368,7 +368,7 @@ fn sweep_renders_and_remaining_unsupported_features_report_their_names() {
     assert!((f64::from(pixel[0]) - (1.0 - angle)).abs() < 1e-6);
     assert!((f64::from(pixel[2]) - angle).abs() < 1e-6);
     assert_eq!(pixel[3].to_bits(), 1.0_f32.to_bits());
-    // Per-glyph transforms remain explicitly unsupported on a fresh engine.
+    // A rotated glyph renders as outline coverage.
     let engine2 = Engine::<Raster>::new(RasterConfig::default()).expect("engine");
     let data = std::fs::read("../scenes/fonts/NotoSans.ttf").expect("test font");
     let font = engine2
@@ -392,9 +392,15 @@ fn sweep_renders_and_remaining_unsupported_features_report_their_names() {
     surface2.update(|tx| {
         tx[surface2.root()].content(surface2.record(|c| c.glyphs(run.clone(), RED)));
     });
-    let e = engine2
+    engine2
         .render(FrameTime::now())
-        .expect_err("glyph transform unsupported");
-    let msg = format!("{e}");
-    assert!(msg.contains("glyph"), "glyph transform message: {msg}");
+        .expect("glyph transform renders as outline coverage");
+    let area: f64 = surface2
+        .readback()
+        .expect("transformed pixels")
+        .pixels
+        .iter()
+        .map(|p| f64::from(p[3]))
+        .sum();
+    assert!(area > 10.0, "transformed glyph coverage {area}");
 }

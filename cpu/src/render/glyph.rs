@@ -120,6 +120,80 @@ impl GlyphCache {
     }
 }
 
+/// One glyph's unhinted outline in font units, or `None` when the font
+/// has no outline for `id`.
+pub fn outline(
+    outlines: &skrifa::outline::OutlineGlyphCollection<'_>,
+    coords: &[F2Dot14],
+    id: u32,
+) -> Result<Option<kurbo::BezPath>, RenderError> {
+    let Some(glyph) = outlines.get(skrifa::GlyphId::new(id)) else {
+        return Ok(None);
+    };
+    let mut pen = PathPen {
+        path: kurbo::BezPath::new(),
+    };
+    glyph
+        .draw(
+            DrawSettings::unhinted(
+                skrifa::instance::Size::unscaled(),
+                skrifa::instance::LocationRef::new(coords),
+            ),
+            &mut pen,
+        )
+        .map_err(|e| RenderError::Font(format!("glyph {id}: {e}")))?;
+    Ok(Some(pen.path))
+}
+
+/// A per-glyph transform must be finite and invertible.
+pub fn checked_transform(glyph: &cherenkov::Glyph) -> Result<Affine, RenderError> {
+    let t = glyph.transform.unwrap_or(Affine::IDENTITY);
+    if !t.is_finite() || !t.inverse().is_finite() {
+        return Err(RenderError::Render(
+            "glyph transform must be finite and invertible".into(),
+        ));
+    }
+    Ok(t)
+}
+
+/// How a glyph is placed: pure translations fold into the position and
+/// keep the mask-cache path; anything else is realized as outline
+/// coverage.
+pub enum GlyphPlacement {
+    /// The glyph with a pure translation folded into `x`/`y`.
+    Translate(cherenkov::Glyph),
+    /// `translate(x, y) * transform`, applied before the font scale.
+    Outline(Affine),
+}
+
+/// Validates `glyph.transform` and classifies its placement.
+#[expect(clippy::float_cmp, reason = "exact identity coefficients")]
+#[expect(
+    clippy::many_single_char_names,
+    reason = "a/b/c/d/e/f are the conventional affine coefficient names"
+)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "glyph positions are f32 by design"
+)]
+pub fn classify(glyph: &cherenkov::Glyph) -> Result<GlyphPlacement, RenderError> {
+    if glyph.transform.is_none() {
+        return Ok(GlyphPlacement::Translate(*glyph));
+    }
+    let t = checked_transform(glyph)?;
+    let [a, b, c, d, e, f] = t.as_coeffs();
+    if a == 1.0 && b == 0.0 && c == 0.0 && d == 1.0 {
+        let mut glyph = *glyph;
+        glyph.x += e as f32;
+        glyph.y += f as f32;
+        glyph.transform = None;
+        return Ok(GlyphPlacement::Translate(glyph));
+    }
+    Ok(GlyphPlacement::Outline(
+        Affine::translate((f64::from(glyph.x), f64::from(glyph.y))) * t,
+    ))
+}
+
 /// Unhinted outlines in run coordinates for semantic glyph strokes.
 /// Strokes use the font's outline, including on COLR fonts; palette paint
 /// graphs apply only to filled glyphs. Missing outlines are explicit errors.
@@ -141,26 +215,13 @@ pub fn stroke_outlines(
     let outlines = font_ref.outline_glyphs();
     let mut paths = Vec::with_capacity(run.glyphs.len());
     for glyph in &run.glyphs {
-        let outline = outlines
-            .get(skrifa::GlyphId::new(glyph.id))
-            .ok_or_else(|| {
-                RenderError::Font(format!("glyph {} has no stroke outline", glyph.id))
-            })?;
-        let mut pen = PathPen {
-            path: kurbo::BezPath::new(),
-        };
-        outline
-            .draw(
-                DrawSettings::unhinted(
-                    skrifa::instance::Size::unscaled(),
-                    skrifa::instance::LocationRef::new(&coords),
-                ),
-                &mut pen,
-            )
-            .map_err(|e| RenderError::Font(format!("glyph {}: {e}", glyph.id)))?;
+        let path = outline(&outlines, &coords, glyph.id)?.ok_or_else(|| {
+            RenderError::Font(format!("glyph {} has no stroke outline", glyph.id))
+        })?;
         let placement = Affine::translate((f64::from(glyph.x), f64::from(glyph.y)))
+            * checked_transform(glyph)?
             * Affine::scale_non_uniform(scale, -scale);
-        paths.push(placement * pen.path);
+        paths.push(placement * path);
     }
     Ok(paths)
 }

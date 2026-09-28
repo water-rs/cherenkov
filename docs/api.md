@@ -390,6 +390,7 @@ c.glyphs(&GlyphRun {
 - **Font data.** Fonts are memory-mapped and never copied, which matters for Noto CJK-sized fallback chains. On `Banded`, glyph subsets are pre-rasterized into flash at build time.
 - **Variable fonts** take normalized coordinates on the run.
 - **Glyph realization is an experimental axis** (coverage atlas, direct curve evaluation, the path route, or distance fields for validated sizes), decided by the device farm. The CPU exact-area glyph rasterizer is both the correctness reference and the CPU backends' route. COLRv1 glyphs are a paint graph: every realization handles their transforms, gradients and compositing, and cached colour glyphs key on palette and foreground.
+- **Per-glyph transforms** apply about the glyph origin, between the font scale and the glyph position. A pure translation folds into the glyph position and keeps the atlas path; any other transform is realized as outline coverage (the path route) filled with the run paint, never the atlas. A non-finite or non-invertible transform is a render error.
 - **Test coverage.** The correctness corpus (#3) includes Latin, CJK (horizontal and vertical), Arabic, Hebrew, Devanagari, Thai, emoji ZWJ sequences and COLRv1 glyphs.
 
 ## Effects and filters

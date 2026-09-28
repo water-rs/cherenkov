@@ -1280,8 +1280,11 @@ impl Engine for Cherenkov {
     fn counters(&self) -> Counters {
         let mut counters = self.counters.clone();
         let stats = self.engine.stats();
+        let memory = self.engine.memory();
         counters.dispatches = Some(stats.draws);
         counters.passes = Some(stats.passes);
+        counters.memory_gpu_bytes = Some(memory.gpu.0);
+        counters.memory_cpu_bytes = Some(memory.cpu.0);
         counters
     }
 

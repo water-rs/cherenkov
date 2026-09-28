@@ -1,5 +1,6 @@
 //! Engine-owned silhouette morphology and Gaussian convolution on the GPU.
 use cherenkov::RenderError;
+use cherenkov::lowering::shadow as shadow_taps;
 use kurbo::Affine;
 use wgpu::util::DeviceExt;
 
@@ -167,15 +168,17 @@ impl Blur {
                 .as_ref()
                 .is_none_or(|kernel| kernel.key != key)
             {
+                let count_limit = device
+                    .limits()
+                    .max_storage_buffer_binding_size
+                    .saturating_sub(16) as f64
+                    / 16.0;
                 let taps = if slot == 0 {
-                    spread_taps(parameters, device.limits().max_storage_buffer_binding_size)?
+                    shadow_taps::spread_taps([a, b, c, d], parameters.spread, count_limit)?
                 } else {
-                    gaussian_taps(
-                        axis,
-                        parameters.sigma,
-                        device.limits().max_storage_buffer_binding_size,
-                    )?
+                    shadow_taps::gaussian_taps(axis, parameters.sigma, count_limit)?
                 };
+                let taps: Vec<[f32; 4]> = taps.into_iter().map(|[x, y, w]| [x, y, w, 0.]).collect();
                 let count = u32::try_from(taps.len()).map_err(|_| {
                     RenderError::Render("shadow kernel exceeds addressable storage".into())
                 })?;
@@ -246,83 +249,4 @@ impl Blur {
             },
         );
     }
-}
-
-#[expect(clippy::cast_precision_loss, reason = "device byte limits fit f64")]
-fn bounded_count(count: f64, limit: u64) -> Result<usize, RenderError> {
-    if !count.is_finite() || count < 0. || count.mul_add(16., 16.) > limit as f64 {
-        return Err(RenderError::Render(
-            "shadow kernel exceeds device storage limit".into(),
-        ));
-    }
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "validated against device byte limit"
-    )]
-    Ok(count as usize)
-}
-
-#[expect(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    reason = "bounded kernel indices and f32 GPU coefficients"
-)]
-fn gaussian_taps(axis: [f64; 2], sigma: f64, limit: u64) -> Result<Vec<[f32; 4]>, RenderError> {
-    let length = axis[0].hypot(axis[1]);
-    let sigma = sigma * length;
-    if sigma <= 1e-9 {
-        return Ok(vec![[0., 0., 1., 0.]]);
-    }
-    let radius = (6. * sigma).ceil();
-    let count = bounded_count(2.0f64.mul_add(radius, 1.), limit)?;
-    let inv = 1. / (sigma * std::f64::consts::SQRT_2);
-    let mut taps = Vec::with_capacity(count);
-    let mut total = 0.;
-    for i in 0..count {
-        let offset = i as f64 - radius;
-        let weight = 0.5 * (libm::erf((offset + 0.5) * inv) - libm::erf((offset - 0.5) * inv));
-        total += weight;
-        taps.push([
-            (axis[0] / length * offset) as f32,
-            (axis[1] / length * offset) as f32,
-            weight as f32,
-            0.,
-        ]);
-    }
-    for tap in &mut taps {
-        tap[2] /= total as f32;
-    }
-    Ok(taps)
-}
-
-#[expect(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "bounded morphology footprint and f32 GPU coordinates"
-)]
-fn spread_taps(parameters: Parameters, limit: u64) -> Result<Vec<[f32; 4]>, RenderError> {
-    let [a, b, c, d, _, _] = parameters.transform.as_coeffs();
-    let scale = a.hypot(b).max(c.hypot(d)).max(1.);
-    let radius = parameters.spread.abs();
-    let steps = (radius * scale * 2.).ceil().max(1.);
-    let count = bounded_count(2.0f64.mul_add(steps, 1.).powi(2), limit)?;
-    let mut taps = Vec::with_capacity(count);
-    let side = 2.0f64.mul_add(steps, 1.) as usize;
-    for y in 0..side {
-        for x in 0..side {
-            let px = (x as f64 - steps) / steps * radius;
-            let py = (y as f64 - steps) / steps * radius;
-            if px.hypot(py) <= radius {
-                taps.push([
-                    a.mul_add(px, c * py) as f32,
-                    b.mul_add(px, d * py) as f32,
-                    1.,
-                    0.,
-                ]);
-            }
-        }
-    }
-    Ok(taps)
 }

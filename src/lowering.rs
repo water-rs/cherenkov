@@ -6,6 +6,8 @@ use kurbo::Affine;
 
 use crate::{BlendMode, Command, Dirty, DisplayList, FillRule, Group, ShapeData};
 
+pub mod shadow;
+
 /// A backend operation whose scope indices can be relocated during a patch.
 pub trait Operation {
     /// Matching close index for a scope opener.

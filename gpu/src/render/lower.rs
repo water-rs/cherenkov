@@ -1172,10 +1172,8 @@ impl<'a> Lowering<'a> {
         if !transform.is_finite() || !transform.inverse().is_finite() {
             return Err(RenderError::Render("invalid silhouette transform".into()));
         }
-        let [a, b, c, d, _, _] = transform.as_coeffs();
-        let spread = parameters.spread.abs();
-        let px = (spread.mul_add(a.hypot(c), 6.0 * sigma * (a.abs() + c.abs())) + 2.0).ceil();
-        let py = (spread.mul_add(b.hypot(d), 6.0 * sigma * (b.abs() + d.abs())) + 2.0).ceil();
+        let (px, py) =
+            cherenkov::lowering::shadow::capture_padding(transform, sigma, parameters.spread);
         let width = 2.0f64.mul_add(px, f64::from(self.width));
         let height = 2.0f64.mul_add(py, f64::from(self.height));
         if !width.is_finite()

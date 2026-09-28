@@ -298,3 +298,34 @@ fn clipped_blend_layer_scales_source_by_clip_coverage() {
         "clear inside clip"
     );
 }
+
+/// Two overlapping opaque `PlusLighter` layers: coverage saturates at 1,
+/// summed light exceeds 1 and survives in the extended working space (#126).
+#[test]
+fn plus_lighter_saturates_alpha_not_colour() {
+    let engine = Engine::<Raster>::new(RasterConfig::default()).expect("engine");
+    let surface = engine
+        .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF32))
+        .expect("surface");
+    surface.update(|tx| {
+        tx[surface.root()].content(surface.record(|c| {
+            c.fill(
+                Rect::new(0.0, 0.0, 4.0, 8.0),
+                WorkingColor::new([1.5, 0.0, 0.0, 1.0]),
+            );
+            c.group(Group::new().blend(BlendMode::PlusLighter), |c| {
+                c.fill(
+                    Rect::new(2.0, 0.0, 8.0, 8.0),
+                    WorkingColor::new([0.0, 0.0, 1.25, 1.0]),
+                );
+            });
+        }));
+    });
+    engine.render(FrameTime::now()).expect("render");
+    let pixel = surface.readback().expect("pixels").pixels[3];
+    assert!(pixel[3] <= 1.0 + 1e-6, "alpha must saturate: {pixel:?}");
+    assert!(
+        (pixel[0] - 1.5).abs() < 1e-5 && (pixel[2] - 1.25).abs() < 1e-5,
+        "colour adds unclamped: {pixel:?}"
+    );
+}

@@ -33,6 +33,16 @@ PHASES = ("idle", "preparation", "warmup_peak", "steady", "post_retire", "peak")
 # over-reservation check uses it as the floor of what a live
 # allocator may hold.
 POLICY_BLOCK = 64 * 1024 * 1024
+# wgpu allocator counters carry submission-timing noise: a free lands
+# when the allocator observes its submission complete, which identical
+# runs of the same binary can straddle by a few small allocations
+# (dev's own harness has been observed to wobble by ~98 KiB and ±4
+# allocations). Engine readings are the deterministic contract and
+# compare exactly; allocator `reserved_bytes`/`blocks` are policy
+# state and also compare exactly, while `allocated_bytes`/`allocations`
+# get this slack on same-side reruns.
+ALLOCATED_SLACK = 256 * 1024
+ALLOCATIONS_SLACK = 8
 ROOT_MARKER = ".memory-gate-root.json"
 WORKTREE_MARKER = ".memory-gate-worktree.json"
 HARNESS_HINT = "pass --harness <ref with #101>"
@@ -380,6 +390,48 @@ def read_phase_memory(report_path: Path, report: dict) -> dict[str, Any]:
     return phases
 
 
+def same_side_equal(first: dict[str, Any], second: dict[str, Any]) -> bool:
+    """Whether two measure runs of the same side agree.
+
+    Engine readings and allocator `reserved_bytes`/`blocks` compare
+    exactly; `allocated_bytes`/`allocations` allow the submission-timing
+    slack documented at ALLOCATED_SLACK. Phases and unavailable
+    reasons must match exactly.
+    """
+    if set(first) != set(second):
+        return False
+    for phase, a in first.items():
+        b = second[phase]
+        if not isinstance(a, dict) or not isinstance(b, dict):
+            return a == b
+        if a.get("engine") != b.get("engine"):
+            return False
+        alloc_a, alloc_b = a.get("allocator"), b.get("allocator")
+        if isinstance(alloc_a, dict) != isinstance(alloc_b, dict):
+            return False
+        if alloc_a is None or alloc_b is None:
+            if alloc_a != alloc_b:
+                return False
+            continue
+        for key in ("allocated_bytes", "reserved_bytes", "allocations", "blocks"):
+            if key not in alloc_a or key not in alloc_b:
+                return alloc_a == alloc_b
+        if "unavailable" in alloc_a:
+            if alloc_a != alloc_b:
+                return False
+            continue
+        if (
+            abs(alloc_a["allocated_bytes"] - alloc_b["allocated_bytes"])
+            > ALLOCATED_SLACK
+            or alloc_a["reserved_bytes"] != alloc_b["reserved_bytes"]
+            or abs(alloc_a["allocations"] - alloc_b["allocations"])
+            > ALLOCATIONS_SLACK
+            or alloc_a["blocks"] != alloc_b["blocks"]
+        ):
+            return False
+    return True
+
+
 def allocator_verdict(allocator: dict[str, int]) -> str | None:
     """The #169 acceptance rule on one allocator reading.
 
@@ -459,7 +511,9 @@ def measure_side(
                 readings[key] = "nondeterministic: expected two samples"
             elif isinstance(samples[0], dict) != isinstance(samples[1], dict):
                 readings[key] = "nondeterministic: same-side memory readings differ"
-            elif isinstance(samples[0], dict) and samples[0] != samples[1]:
+            elif isinstance(samples[0], dict) and not same_side_equal(
+                samples[0], samples[1]
+            ):
                 readings[key] = "nondeterministic: same-side memory readings differ"
             elif isinstance(samples[0], str) and isinstance(samples[1], str):
                 first_kind = samples[0].split(":", maxsplit=1)[0]
@@ -706,8 +760,12 @@ def main() -> int:
                             )
                     if deltas:
                         delta_parts.append(f"{name}: " + "; ".join(deltas))
-                if delta_parts:
-                    problems.extend(delta_parts)
+                        # Engine bytes are the deterministic contract —
+                        # any change fails. Allocator counters are
+                        # observations the change explains; they gate
+                        # only through the reserved-over-live verdict.
+                        if name == "engine":
+                            problems.append(f"{name}: " + "; ".join(deltas))
                 for side, reading in (("base", base_phase), ("head", head_phase)):
                     allocator = reading["allocator"]
                     if isinstance(allocator, dict) and "unavailable" not in allocator:

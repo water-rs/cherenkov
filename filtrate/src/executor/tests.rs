@@ -1925,7 +1925,7 @@ fn cpu_blurs_match_the_wgpu_executor_and_window_aprons() {
     let box_blur = filters::Blur(2.0_f32);
     assert_f16_matches_cpu(&gpu, box_blur, (23, 17), &input, "Blur");
 
-    assert_window_matches_full(&filters::GaussianBlur(1.0_f32), &input, size, 3);
+    assert_window_matches_full(&filters::GaussianBlur(1.0_f32), &input, size, 4);
     assert_window_matches_full(&filters::Blur(2.0_f32), &input, size, 2);
 }
 

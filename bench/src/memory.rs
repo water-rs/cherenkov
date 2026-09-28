@@ -93,14 +93,14 @@ pub enum ProcessMemory {
         /// `TASK_VM_INFO.phys_footprint` in bytes.
         phys_footprint_bytes: Reading<u64>,
     },
-    /// Android process PSS and graphics allocations.
+    /// Android process PSS and GPU memory.
     Android {
         /// Proportional set size in bytes.
         pss_bytes: Reading<u64>,
-        /// `dumpsys meminfo` Graphics total in bytes.
-        graphics_bytes: Reading<u64>,
-        /// `dumpsys meminfo` GL mtrack PSS in bytes.
-        gl_mtrack_bytes: Reading<u64>,
+        /// `GpuService`'s per-process GPU memory in bytes — the `Proc
+        /// <pid> total:` line of `dumpsys gpu --gpumem`, fed by the
+        /// kernel `gpu_mem_total` tracepoint.
+        gpu_mem_bytes: Reading<u64>,
     },
     /// No process memory source is implemented for this operating system.
     Other {
@@ -321,14 +321,8 @@ fn merge_process<'a>(
                 ProcessMemory::Android { pss_bytes, .. } => Some(pss_bytes),
                 _ => None,
             })),
-            graphics_bytes: max_u64(processes.iter().filter_map(|p| match p {
-                ProcessMemory::Android { graphics_bytes, .. } => Some(graphics_bytes),
-                _ => None,
-            })),
-            gl_mtrack_bytes: max_u64(processes.iter().filter_map(|p| match p {
-                ProcessMemory::Android {
-                    gl_mtrack_bytes, ..
-                } => Some(gl_mtrack_bytes),
+            gpu_mem_bytes: max_u64(processes.iter().filter_map(|p| match p {
+                ProcessMemory::Android { gpu_mem_bytes, .. } => Some(gpu_mem_bytes),
                 _ => None,
             })),
         },
@@ -536,17 +530,15 @@ fn process_memory(vk_memory_budget: &Reading<Vec<VkHeap>>, detail: SampleDetail)
         let pss_bytes = std::fs::read_to_string("/proc/self/smaps_rollup")
             .map_err(|error| format!("could not read /proc/self/smaps_rollup: {error}"))
             .and_then(|status| parse_android_pss(&status));
-        let (graphics_bytes, gl_mtrack_bytes) = match detail {
-            SampleDetail::Full => android_dumpsys_memory(),
+        let gpu_mem_bytes = match detail {
+            SampleDetail::Full => android_gpu_memory(),
             SampleDetail::Frame => {
-                let reason = "dumpsys meminfo sampled at idle, prepare and steady only";
-                (Err(reason.to_string()), Err(reason.to_string()))
+                Err("dumpsys gpu --gpumem sampled at idle, prepare and steady only".to_string())
             }
         };
         ProcessMemory::Android {
             pss_bytes: reading_result(pss_bytes),
-            graphics_bytes: reading_result(graphics_bytes),
-            gl_mtrack_bytes: reading_result(gl_mtrack_bytes),
+            gpu_mem_bytes: reading_result(gpu_mem_bytes),
         }
     }
     #[cfg(target_vendor = "apple")]
@@ -606,94 +598,57 @@ fn parse_kilobytes(text: &str, label: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("{label} value overflows bytes"))
 }
 
+/// `dumpsys gpu --gpumem` prints one `Proc <pid> total: <bytes>` line
+/// per process `GpuService` tracks; find this process's own.
 #[cfg(any(test, target_os = "android"))]
-fn parse_android_dumpsys(dumpsys: &str) -> Result<(u64, u64), String> {
-    let graphics = parse_dumpsys_kilobytes(dumpsys, "Graphics:")
-        .map_err(|error| format!("could not parse Graphics in dumpsys meminfo: {error}"))?;
-    let gl_mtrack = parse_dumpsys_gl_mtrack_kilobytes(dumpsys)
-        .map_err(|error| format!("could not parse GL mtrack in dumpsys meminfo: {error}"))?;
-    Ok((graphics, gl_mtrack))
-}
-
-#[cfg(any(test, target_os = "android"))]
-fn parse_dumpsys_gl_mtrack_kilobytes(text: &str) -> Result<u64, String> {
-    let label = "GL mtrack";
-    let line = text
+fn parse_android_gpumem(gpumem: &str, pid: u32) -> Result<u64, String> {
+    let prefix = format!("Proc {pid} total: ");
+    let rest = gpumem
         .lines()
         .map(str::trim_start)
-        .find(|line| {
-            line.strip_prefix(label)
-                .is_some_and(|rest| rest.chars().next().is_some_and(char::is_whitespace))
-        })
-        .ok_or_else(|| format!("missing {label} row"))?;
-    let value = line[label.len()..]
-        .split_whitespace()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .ok_or_else(|| format!("missing Proc {pid} total row"))?;
+    rest.split_whitespace()
         .next()
-        .ok_or_else(|| format!("missing {label} value"))?
+        .ok_or_else(|| format!("missing Proc {pid} total value"))?
         .parse::<u64>()
-        .map_err(|error| format!("invalid {label} value: {error}"))?;
-    value
-        .checked_mul(1024)
-        .ok_or_else(|| format!("{label} value overflows bytes"))
-}
-
-#[cfg(any(test, target_os = "android"))]
-fn parse_dumpsys_kilobytes(text: &str, label: &str) -> Result<u64, String> {
-    let line = text
-        .lines()
-        .map(str::trim_start)
-        .find(|line| line.starts_with(label))
-        .ok_or_else(|| format!("missing {label} row"))?;
-    let value = line[label.len()..]
-        .split_whitespace()
-        .next()
-        .ok_or_else(|| format!("missing {label} value"))?
-        .parse::<u64>()
-        .map_err(|error| format!("invalid {label} value: {error}"))?;
-    value
-        .checked_mul(1024)
-        .ok_or_else(|| format!("{label} value overflows bytes"))
+        .map_err(|error| format!("invalid Proc {pid} total value: {error}"))
 }
 
 #[cfg(target_os = "android")]
-fn android_dumpsys_memory() -> (Result<u64, String>, Result<u64, String>) {
+fn android_gpu_memory() -> Result<u64, String> {
+    let pid = std::process::id();
     let output = match std::process::Command::new("dumpsys")
-        .args(["meminfo", &std::process::id().to_string()])
+        .args(["gpu", "--gpumem"])
         .output()
     {
         Ok(output) if output.status.success() => output,
         Ok(output) => {
             let error = String::from_utf8_lossy(&output.stderr);
-            let reason = format!(
-                "dumpsys meminfo failed ({}): {}",
+            return Err(format!(
+                "dumpsys gpu --gpumem failed ({}): {}",
                 output.status,
                 error.trim()
-            );
-            return (Err(reason.clone()), Err(reason));
+            ));
         }
         Err(error) => {
-            let reason = format!("could not run dumpsys meminfo: {error}");
-            return (Err(reason.clone()), Err(reason));
+            return Err(format!("could not run dumpsys gpu --gpumem: {error}"));
         }
     };
     let text = String::from_utf8_lossy(&output.stdout);
-    match parse_android_dumpsys(&text) {
-        Ok((graphics, gl_mtrack)) => (Ok(graphics), Ok(gl_mtrack)),
-        // A parse miss is only diagnosable from the output it failed
-        // on — carry the whole call's evidence, untruncated (#162).
-        Err(error) => {
-            let reason = format!(
-                "{error}\n\
-                 dumpsys meminfo exit status: {}\n\
-                 dumpsys meminfo stdout:\n{}\n\
-                 dumpsys meminfo stderr:\n{}",
-                output.status,
-                text,
-                String::from_utf8_lossy(&output.stderr),
-            );
-            (Err(reason.clone()), Err(reason))
-        }
-    }
+    // A parse miss is only diagnosable from the output it failed on —
+    // carry the whole call's evidence, untruncated (#162).
+    parse_android_gpumem(&text, pid).map_err(|error| {
+        format!(
+            "{error}\n\
+             dumpsys gpu --gpumem exit status: {}\n\
+             dumpsys gpu --gpumem stdout:\n{}\n\
+             dumpsys gpu --gpumem stderr:\n{}",
+            output.status,
+            text,
+            String::from_utf8_lossy(&output.stderr),
+        )
+    })
 }
 
 #[cfg(target_vendor = "apple")]
@@ -899,27 +854,15 @@ mod tests {
     }
 
     #[test]
-    fn parses_android_dumpsys_graphics_and_gl_mtrack() {
-        let dumpsys = r"
-** MEMINFO in pid 12345 [com.example.app] **
-                   Pss  Private  Private  SwapPss     Rss
-                 Total    Dirty    Clean    Dirty   Total
-                ------   ------   ------   ------   ------
-     Native Heap     10       10        0        0      10
-      EGL mtrack      7        7        0        0       7
-       GL mtrack  13824    13824        0        0   13824
-
- App Summary
-                       Pss(KB)
-                Java Heap: 10
-                  Graphics: 2048
-              TOTAL PSS: 30000
+    fn parses_android_gpumem_proc_total() {
+        let gpumem = r"
+GPU memory usage (total: 80409000 bytes):
+Proc 26257 total: 73850880
+Proc 31345 total: 6533120
 ";
-        assert_eq!(
-            parse_android_dumpsys(dumpsys).unwrap(),
-            (2048 * 1024, 13824 * 1024)
-        );
-        assert!(parse_android_dumpsys("Graphics: 1 kB\n").is_err());
-        assert!(parse_android_dumpsys("Graphics: 1\nEGL mtrack 2 2 0 0\n").is_err());
+        assert_eq!(parse_android_gpumem(gpumem, 26257).unwrap(), 73_850_880);
+        assert_eq!(parse_android_gpumem(gpumem, 31345).unwrap(), 6_533_120);
+        assert!(parse_android_gpumem(gpumem, 9999).is_err());
+        assert!(parse_android_gpumem(gpumem, 2625).is_err());
     }
 }

@@ -360,7 +360,6 @@ fn max_u64<'a>(readings: impl Iterator<Item = &'a Reading<u64>>) -> Reading<u64>
 
 #[cfg(any(
     feature = "cherenkov",
-    feature = "cherenkov-vello",
     feature = "vello-classic",
     feature = "vello-hybrid"
 ))]
@@ -411,7 +410,6 @@ pub(crate) fn skia_budget(api: &'static str, bytes: usize) -> Reading<SkiaBudget
     target_os = "linux",
     any(
         feature = "cherenkov",
-        feature = "cherenkov-vello",
         feature = "vello-classic",
         feature = "vello-hybrid"
     )
@@ -454,7 +452,6 @@ pub(crate) fn ash_vk_memory_budget(
     target_os = "linux",
     any(
         feature = "cherenkov",
-        feature = "cherenkov-vello",
         feature = "vello-classic",
         feature = "vello-hybrid",
         feature = "skia"
@@ -508,7 +505,6 @@ fn vk_memory_budget(
 
 #[cfg(any(
     feature = "cherenkov",
-    feature = "cherenkov-vello",
     feature = "vello-classic",
     feature = "vello-hybrid"
 ))]

@@ -131,6 +131,23 @@ engine looks like:
          "Documents/out/render-cherenkov-chart.json"]
     ]
 
+`measure --native` and `capacity` run through the same file — the
+argument lists go verbatim to `cherenkov_bench_run`, so every CLI flag
+is reachable. On a device host `--native` carries the window's pixel
+size (the bench renders offscreen), and `--rate` the panel refresh. An
+iPad Pro M4 (2752×2064 at 120 Hz) capacity sweep over the perf corpus:
+
+    [
+        ["capacity", "--engine", "cherenkov", "--engine", "vello-hybrid",
+         "--corpus", "Documents/scenes/perf", "--frames", "120",
+         "--warmup", "10", "--budget-ms", "8.333",
+         "--out-dir", "Documents/out"],
+        ["measure", "--engine", "cherenkov", "--scene",
+         "Documents/scenes/perf/chart", "--native", "2752x2064",
+         "--rate", "120", "--frames", "120", "--warmup", "10",
+         "--out", "Documents/out/measure-cherenkov-chart-native.json"]
+    ]
+
 Launch and keep it in the foreground — iOS forbids GPU work in the
 background. The app disables the idle timer and drops screen brightness
 to 0 for the whole run, then restores both. It first `chdir`s to the

@@ -476,10 +476,10 @@ fn hash_elements_into(hasher: &mut impl Hasher, elements: &[PathEl]) {
 /// A path draw's cache key and placement.
 #[derive(Clone, Copy, Debug)]
 pub struct Placement {
-    /// Cache key: content hash + matrix + quantized subpixel + surface.
+    /// Cache key: content hash + matrix + subpixel translation + surface.
     pub key: u64,
-    /// The transform to rasterize under: the true 2x2 and the translation
-    /// snapped to the 1/4 px grid.
+    /// The transform to rasterize under: the true 2x2 and the translation's
+    /// fractional part.
     pub raster: Affine,
     /// The integer translation the cache's stored rects are relative to.
     pub offset: Vec2,
@@ -502,10 +502,9 @@ impl Placement {
 
 /// Builds the [`Placement`] for a draw under `transform` on a
 /// `surface`-pixel target. The key holds the 2x2, the translation's
-/// fractional part quantized to 1/4 px and the surface size, so identical
-/// geometry at different integer translations replays the same emission.
+/// fractional part and the surface size, so identical geometry at different
+/// integer translations replays the same emission.
 #[expect(clippy::cast_possible_truncation)]
-#[expect(clippy::cast_sign_loss)]
 #[expect(
     clippy::many_single_char_names,
     reason = "a..f are the conventional affine coefficient names"
@@ -514,21 +513,20 @@ pub fn placement(content_hash: u64, transform: Affine, surface: (u32, u32)) -> P
     let [a, b, c, d, e, f] = transform.as_coeffs();
     let ix = e.floor();
     let iy = f.floor();
-    let qx = ((e - ix) * 4.0).floor() / 4.0;
-    let qy = ((f - iy) * 4.0).floor() / 4.0;
-    let mut bytes = [0; 33];
+    let qx = e - ix;
+    let qy = f - iy;
+    let mut bytes = [0; 40];
     bytes[..8].copy_from_slice(&content_hash.to_ne_bytes());
-    for (dst, value) in bytes[8..24]
+    for (dst, value) in bytes[8..32]
         .as_chunks_mut::<4>()
         .0
         .iter_mut()
-        .zip([a, b, c, d])
+        .zip([a, b, c, d, qx, qy])
     {
         *dst = (value as f32).to_bits().to_ne_bytes();
     }
-    bytes[24] = (qx * 4.0) as u8 | (((qy * 4.0) as u8) << 4);
-    bytes[25..29].copy_from_slice(&surface.0.to_ne_bytes());
-    bytes[29..].copy_from_slice(&surface.1.to_ne_bytes());
+    bytes[32..36].copy_from_slice(&surface.0.to_ne_bytes());
+    bytes[36..].copy_from_slice(&surface.1.to_ne_bytes());
     let mut hasher = DefaultHasher::new();
     hasher.write(&bytes);
     let key = hasher.finish();
@@ -542,6 +540,27 @@ pub fn placement(content_hash: u64, transform: Affine, surface: (u32, u32)) -> P
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The translation's fraction is rasterized exactly and hashed as f32
+    /// bits, not snapped to the 1/4 px grid.
+    #[test]
+    fn placement_keeps_the_subpixel_translation() {
+        let p = placement(7, Affine::translate((10.2, 3.7)), (64, 64));
+        let [_, _, _, _, e, f] = p.raster.as_coeffs();
+        assert!((e - 10.2).abs() < 1e-9, "e: {e}");
+        assert!((f - 3.7).abs() < 1e-9, "f: {f}");
+        assert_eq!(p.offset, Vec2::new(10.0, 3.0));
+        // Different fractions hash differently...
+        assert_ne!(
+            p.key,
+            placement(7, Affine::translate((10.0, 3.75)), (64, 64)).key
+        );
+        // ...while an integer-only shift shares the key.
+        assert_eq!(
+            p.key,
+            placement(7, Affine::translate((25.2, 3.7)), (64, 64)).key
+        );
+    }
 
     #[test]
     fn a_left_edge_outside_the_window_still_deposits_coverage() {

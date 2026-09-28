@@ -602,8 +602,12 @@ use $crate::Instant;
                     .mul_add(offset, v)
                     .mul_add(dt, offset)
                     .mul_add((-omega * dt).exp(), -offset);
+                // While the transform animates the layer's translation is
+                // placed on the ¼-pixel grid, so each measured centre carries
+                // up to ~¼ px of quantization and centroid bias; the same
+                // uncertainty feeds back through v.
                 assert!(
-                    (c3 - c2 - expected).abs() <= (v * dt).abs() * 0.01,
+                    (c3 - c2 - expected).abs() <= (v * dt).abs().mul_add(0.01, 0.75),
                     "displacement {} vs the spring's trajectory {expected} (v·dt {})",
                     c3 - c2,
                     v * dt

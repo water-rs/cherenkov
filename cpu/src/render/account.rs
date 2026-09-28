@@ -96,9 +96,7 @@ fn item_bytes(item: &Item) -> u64 {
         }
         Item::Shadow { clip, .. }
         | Item::PopIsolate { clip, .. }
-        | Item::PopFilter { clip, .. } => {
-            clip.as_deref().map_or(0, clip_bytes)
-        }
+        | Item::PopFilter { clip, .. } => clip.as_deref().map_or(0, clip_bytes),
         Item::PushIsolate | Item::PushFilter { .. } => 0,
     }
 }

@@ -460,7 +460,6 @@ pub struct Cherenkov {
     /// Registered images per (blob hash, declared encoding).
     images: HashMap<(ResourceHash, ImageEncoding), cherenkov::ImageId>,
     /// The `Image` handles keeping `images` registered.
-    /// The `Image` handles keeping `images` registered.
     image_handles: Vec<ImageHandle>,
     /// Registered filters referenced by prepared layers.
     filter_handles: Vec<cherenkov::Filter>,

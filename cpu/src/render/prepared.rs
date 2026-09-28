@@ -155,11 +155,16 @@ impl cherenkov::lowering::Compiler for Lowerer<'_> {
             end: 0,
         })
     }
-    fn group(&mut self, group: &cherenkov::Group) -> Result<Option<Op>, RenderError> {
+    fn group(
+        &mut self,
+        group: &cherenkov::Group,
+        isolate: bool,
+    ) -> Result<Option<Op>, RenderError> {
         if group.filter.is_some() {
             return Err(RenderError::Unsupported(names::FILTER));
         }
-        Ok((group.opacity < 1.0
+        Ok((isolate
+            || group.opacity < 1.0
             || group.blend != BlendMode::Normal
             || group.blend_space != BlendSpace::Linear)
             .then_some(Op::BeginIsolate {

@@ -38,6 +38,18 @@ impl Clone for Paint {
     fn clone(&self) -> Self {
         match self {
             Self::Solid(color) => Self::Solid(*color),
+            _ => self.clone_resources(),
+        }
+    }
+}
+
+impl Paint {
+    // Keep owned gradient/mesh/shader cloning out of each inlined solid
+    // recording site. The result and resource ownership remain identical.
+    #[inline(never)]
+    fn clone_resources(&self) -> Self {
+        match self {
+            Self::Solid(color) => Self::Solid(*color),
             Self::Linear(gradient) => Self::Linear(gradient.clone()),
             Self::Radial(gradient) => Self::Radial(gradient.clone()),
             Self::Sweep(gradient) => Self::Sweep(gradient.clone()),

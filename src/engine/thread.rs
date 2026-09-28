@@ -93,13 +93,18 @@ pub fn run<B: Backend>(
             Message::Resource(op) => op(&mut renderer),
             Message::Render {
                 time,
-                commits,
+                mut commits,
                 reply,
             } => {
                 let id = FrameId(next_frame);
                 next_frame += 1;
-                let result = render::<B>(&mut renderer, &mut surfaces, id, time.0, commits);
-                let _ = reply.send(result);
+                let result = render::<B>(&mut renderer, &mut surfaces, id, time.0, &mut commits);
+                let sender = reply.clone();
+                let _ = sender.send(crate::message::RenderReply {
+                    result,
+                    commits,
+                    sender: reply,
+                });
             }
             Message::FinishTimings { reply } => {
                 let _ = reply.send(renderer.finish_timings());
@@ -108,7 +113,11 @@ pub fn run<B: Backend>(
                 let _ = reply.send(renderer.readback(surface));
             }
             Message::Memory { reply } => {
-                let _ = reply.send(renderer.memory());
+                let sender = reply.clone();
+                let _ = sender.send(crate::message::MemoryReply {
+                    usage: renderer.memory(),
+                    sender: reply,
+                });
             }
             Message::Trim(pressure) => renderer.trim(pressure),
             Message::Shutdown => break,
@@ -122,13 +131,13 @@ fn commit<B: Backend>(
     renderer: &mut B::Renderer,
     state: &mut SurfaceState,
     surface: SurfaceId,
-    changes: ChangeSet<B>,
+    changes: &mut ChangeSet<B>,
 ) {
-    if let Some(clear) = changes.clear {
+    if let Some(clear) = changes.clear.take() {
         state.clear = clear;
         state.changed = true;
     }
-    for op in changes.ops {
+    for op in changes.ops.drain(..) {
         match op {
             Op::Layer(LayerOp::Remove(layer)) => {
                 for removed in state.tree.remove(layer) {
@@ -161,15 +170,16 @@ fn render<B: Backend>(
     surfaces: &mut HashMap<SurfaceId, SurfaceState>,
     id: FrameId,
     time: crate::Instant,
-    commits: Vec<(SurfaceId, ChangeSet<B>)>,
+    commits: &mut [(SurfaceId, ChangeSet<B>)],
 ) -> Result<(Next, FrameStats), RenderError> {
-    for (surface, changes) in commits {
-        match surfaces.get_mut(&surface) {
-            Some(state) => commit(renderer, state, surface, changes),
+    for (surface, changes) in commits.iter_mut() {
+        if let Some(state) = surfaces.get_mut(surface) {
+            commit(renderer, state, *surface, changes);
+        } else {
             // A dropped surface may still have queued ops: legal, ignore.
-            None => {
-                tracing::trace!(surface = surface.raw(), "commit for unknown surface");
-            }
+            tracing::trace!(surface = surface.raw(), "commit for unknown surface");
+            changes.clear = None;
+            changes.ops.clear();
         }
     }
     let mut frames: Vec<SurfaceFrame<'_>> = Vec::with_capacity(surfaces.len());
@@ -226,15 +236,16 @@ async fn render_local<B: Backend>(
     surfaces: &mut HashMap<SurfaceId, SurfaceState>,
     id: FrameId,
     time: crate::Instant,
-    commits: Vec<(SurfaceId, ChangeSet<B>)>,
+    commits: &mut [(SurfaceId, ChangeSet<B>)],
 ) -> Result<(Next, FrameStats), RenderError> {
-    for (surface, changes) in commits {
-        match surfaces.get_mut(&surface) {
-            Some(state) => commit(renderer, state, surface, changes),
+    for (surface, changes) in commits.iter_mut() {
+        if let Some(state) = surfaces.get_mut(surface) {
+            commit(renderer, state, *surface, changes);
+        } else {
             // A dropped surface may still have queued ops: legal, ignore.
-            None => {
-                tracing::trace!(surface = surface.raw(), "commit for unknown surface");
-            }
+            tracing::trace!(surface = surface.raw(), "commit for unknown surface");
+            changes.clear = None;
+            changes.ops.clear();
         }
     }
     let mut frames: Vec<SurfaceFrame<'_>> = Vec::with_capacity(surfaces.len());
@@ -373,13 +384,13 @@ impl<B: Backend> LocalState<B> {
             Message::AsyncResource(op) => op(renderer).await,
             Message::Render {
                 time,
-                commits,
+                mut commits,
                 reply,
             } => {
                 let id = FrameId(*next_frame);
                 *next_frame += 1;
-                let result = render_local::<B>(renderer, surfaces, id, time.0, commits).await;
-                let _ = reply.send(result);
+                let result = render_local::<B>(renderer, surfaces, id, time.0, &mut commits).await;
+                let _ = reply.send(crate::message::RenderReply { result, commits });
             }
             Message::FinishTimings { reply } => {
                 let _ = reply.send(renderer.finish_timings().await);
@@ -388,7 +399,9 @@ impl<B: Backend> LocalState<B> {
                 let _ = reply.send(renderer.readback(surface).await);
             }
             Message::Memory { reply } => {
-                let _ = reply.send(renderer.memory());
+                let _ = reply.send(crate::message::MemoryReply {
+                    usage: renderer.memory(),
+                });
             }
             Message::Trim(pressure) => renderer.trim(pressure),
             Message::Shutdown => return false,

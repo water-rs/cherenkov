@@ -42,7 +42,7 @@ source-over arithmetic is preserved exactly.
 The source branch also attempted a different coverage compiler, SIMD band
 storage, exact general shadows and COLR support. Their review decisions are in
 [cpu-port-review.md](cpu-port-review.md). This port does not silently accept
-unsupported shader/filter paints, per-glyph transforms or color font formats.
+unsupported shader/filter paints or color font formats.
 COLR's approximate brush transforms, black foreground substitution and debug
 string hash cache are not imported. Those rejected parts require separate
 correct implementations; they are not fallback paths in this backend.

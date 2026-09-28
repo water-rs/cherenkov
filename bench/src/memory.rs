@@ -618,9 +618,31 @@ fn parse_kilobytes(text: &str, label: &str) -> Result<u64, String> {
 fn parse_android_dumpsys(dumpsys: &str) -> Result<(u64, u64), String> {
     let graphics = parse_dumpsys_kilobytes(dumpsys, "Graphics:")
         .map_err(|error| format!("could not parse Graphics in dumpsys meminfo: {error}"))?;
-    let gl_mtrack = parse_dumpsys_kilobytes(dumpsys, "GL mtrack:")
+    let gl_mtrack = parse_dumpsys_gl_mtrack_kilobytes(dumpsys)
         .map_err(|error| format!("could not parse GL mtrack in dumpsys meminfo: {error}"))?;
     Ok((graphics, gl_mtrack))
+}
+
+#[cfg(any(test, target_os = "android"))]
+fn parse_dumpsys_gl_mtrack_kilobytes(text: &str) -> Result<u64, String> {
+    let label = "GL mtrack";
+    let line = text
+        .lines()
+        .map(str::trim_start)
+        .find(|line| {
+            line.strip_prefix(label)
+                .is_some_and(|rest| rest.chars().next().is_some_and(char::is_whitespace))
+        })
+        .ok_or_else(|| format!("missing {label} row"))?;
+    let value = line[label.len()..]
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| format!("missing {label} value"))?
+        .parse::<u64>()
+        .map_err(|error| format!("invalid {label} value: {error}"))?;
+    value
+        .checked_mul(1024)
+        .ok_or_else(|| format!("{label} value overflows bytes"))
 }
 
 #[cfg(any(test, target_os = "android"))]
@@ -670,7 +692,7 @@ fn android_dumpsys_memory() -> (Result<u64, String>, Result<u64, String>) {
 }
 
 #[cfg(target_vendor = "apple")]
-#[allow(deprecated)]
+#[expect(deprecated, reason = "libc says to use the `mach2` crate instead")]
 fn apple_phys_footprint() -> Reading<u64> {
     use std::mem::size_of;
 
@@ -873,16 +895,26 @@ mod tests {
 
     #[test]
     fn parses_android_dumpsys_graphics_and_gl_mtrack() {
-        let dumpsys = "\
-            App Summary\n\
-                       Pss(KB)\n\
-                    Java Heap: 10\n\
-                    Graphics: 20\n\
-                    GL mtrack: 30 30 0 0\n";
+        let dumpsys = r#"
+** MEMINFO in pid 12345 [com.example.app] **
+                   Pss  Private  Private  SwapPss     Rss
+                 Total    Dirty    Clean    Dirty   Total
+                ------   ------   ------   ------   ------
+     Native Heap     10       10        0        0      10
+      EGL mtrack      7        7        0        0       7
+       GL mtrack  13824    13824        0        0   13824
+
+ App Summary
+                       Pss(KB)
+                Java Heap: 10
+                  Graphics: 2048
+              TOTAL PSS: 30000
+"#;
         assert_eq!(
             parse_android_dumpsys(dumpsys).unwrap(),
-            (20 * 1024, 30 * 1024)
+            (2048 * 1024, 13824 * 1024)
         );
         assert!(parse_android_dumpsys("Graphics: 1 kB\n").is_err());
+        assert!(parse_android_dumpsys("Graphics: 1\nEGL mtrack 2 2 0 0\n").is_err());
     }
 }

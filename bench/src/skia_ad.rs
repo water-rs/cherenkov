@@ -1665,13 +1665,14 @@ mod graphite_metal {
 
         fn memory(&self) -> AdapterMemory {
             let native: &skia_bindings::skgpu_graphite_Context = PointerWrapper::inner(&self.ctx);
+            let budgeted_bytes = {
+                // SAFETY: the context is alive and currentBudgetedBytes is a const getter.
+                unsafe { native.currentBudgetedBytes() }
+            };
             AdapterMemory {
                 engine: Reading::unavailable("Skia Graphite does not expose engine memory"),
                 wgpu_allocator: Reading::unavailable("Skia Graphite does not use wgpu"),
-                skia_budgeted: skia_budget("graphite", unsafe {
-                    // SAFETY: the context is alive and currentBudgetedBytes is a const getter.
-                    native.currentBudgetedBytes()
-                }),
+                skia_budgeted: skia_budget("graphite", budgeted_bytes),
                 vk_memory_budget: Reading::unavailable("Skia Graphite uses Metal, not Vulkan"),
             }
         }

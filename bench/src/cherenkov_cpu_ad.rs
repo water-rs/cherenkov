@@ -406,6 +406,9 @@ struct ContentLayer {
     live: Vec<LiveRun>,
     /// The layer's one-time motion, committed on the first encode.
     motion: Option<LayerMotion>,
+    /// The previous recording's command count, seeding the next
+    /// recording's display-list capacity.
+    content_len: usize,
 }
 
 impl ContentLayer {
@@ -1207,6 +1210,7 @@ fn build_layer(
                     ops: run.ops,
                     live: run.live,
                     motion: None,
+                    content_len: 0,
                 });
             }
             PrepItem::Layer(p) => {
@@ -1230,6 +1234,7 @@ fn build_layer(
         ops: prep.own.ops,
         live: prep.own.live,
         motion: prep.motion,
+        content_len: 0,
     });
 }
 
@@ -1429,10 +1434,10 @@ impl Engine for Cherenkov {
         if first_frame || !(self.has_motion || self.has_live) {
             let contents: Vec<(usize, cherenkov::Content)> = self
                 .content_layers
-                .iter()
+                .iter_mut()
                 .enumerate()
                 .map(|(i, cl)| {
-                    let content = surface.record(|c| {
+                    let content = cherenkov::Content::record_with_capacity(cl.content_len, |c| {
                         for (index, op) in cl.ops.iter().enumerate() {
                             match cl.live.iter().find(|live| live.index == index) {
                                 Some(live) => record_live(c, op, &live.bindings),
@@ -1440,6 +1445,7 @@ impl Engine for Cherenkov {
                             }
                         }
                     });
+                    cl.content_len = content.len();
                     (i, content)
                 })
                 .collect();

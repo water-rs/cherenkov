@@ -46,6 +46,8 @@ pub enum GlyphError {
     Paint(String),
     /// A composite mode outside the W3C-16 set was encountered.
     UnsupportedCompositeMode(String),
+    /// A per-glyph transform is non-finite or non-invertible.
+    Transform,
 }
 
 impl std::fmt::Display for GlyphError {
@@ -56,6 +58,7 @@ impl std::fmt::Display for GlyphError {
             Self::NoOutline(id) => write!(f, "glyph {id} has no outline"),
             Self::Paint(e) => write!(f, "COLR paint error: {e}"),
             Self::UnsupportedCompositeMode(m) => write!(f, "unsupported COLR composite mode {m}"),
+            Self::Transform => write!(f, "glyph transform must be finite and invertible"),
         }
     }
 }
@@ -551,6 +554,10 @@ fn node_to_item(node: Node, place: Affine, scene_rect: Rect) -> Item {
 /// # Errors
 /// `GlyphError` on font parse failures, missing outlines or paint-graph
 /// errors; `crate::SceneError` on missing font resources.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the three per-glyph branches share one placement"
+)]
 pub fn items_for_glyph_run(
     run: &GlyphRun,
     resources: &mut Resources,
@@ -594,8 +601,13 @@ pub fn items_for_glyph_run(
     for g in &run.glyphs {
         let gid_u16 = u16::try_from(g.id).map_err(|_| GlyphError::GlyphId(g.id))?;
         let gid = GlyphId::from(gid_u16);
-        let place =
-            Affine::translate((f64::from(g.x), f64::from(g.y))) * Affine::scale_non_uniform(s, -s);
+        let t = g.transform.unwrap_or(Affine::IDENTITY);
+        if !t.is_finite() || !t.inverse().is_finite() {
+            return Err(GlyphError::Transform);
+        }
+        let place = Affine::translate((f64::from(g.x), f64::from(g.y)))
+            * t
+            * Affine::scale_non_uniform(s, -s);
 
         if let Some(stroke) = &run.stroke {
             let pen = BezPen(outline_path(&font, gid_u16, &coords)?);

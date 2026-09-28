@@ -45,7 +45,7 @@ enum ShapeKind {
     Ellipse(Ellipse),
     Line(Line),
     /// A general path plus the fill rule it records under.
-    Path(BezPath, cherenkov::FillRule),
+    Path(BezPath, cherenkov::ShapeData),
 }
 
 /// One recording step of a content layer, resolved in `prepare`.
@@ -124,10 +124,16 @@ impl LiveShape {
             ShapeKind::Circle(s) => Self::Circle(*s),
             ShapeKind::Ellipse(s) => Self::Ellipse(*s),
             ShapeKind::Line(s) => Self::Line(*s),
-            ShapeKind::Path(path, rule) => Self::Path {
-                path: path.clone(),
-                rule: *rule,
-            },
+            ShapeKind::Path(path, data) => {
+                let rule = match data {
+                    cherenkov::ShapeData::Path { rule, .. } => *rule,
+                    _ => unreachable!(),
+                };
+                Self::Path {
+                    path: path.clone(),
+                    rule,
+                }
+            }
         }
     }
 }
@@ -407,9 +413,6 @@ struct ContentLayer {
     live: Vec<LiveRun>,
     /// The layer's one-time motion, committed on the first encode.
     motion: Option<LayerMotion>,
-    /// The previous recording's command count, seeding the next
-    /// recording's display-list capacity.
-    content_len: usize,
 }
 
 impl ContentLayer {
@@ -698,7 +701,12 @@ fn shape_kind(shape: &Shape, rule: cherenkov::FillRule) -> ShapeKind {
         Shape::Circle(c) => ShapeKind::Circle(*c),
         Shape::Ellipse(e) => ShapeKind::Ellipse(*e),
         Shape::Line(l) => ShapeKind::Line(*l),
-        Shape::Path { path } => ShapeKind::Path(path.clone(), rule),
+        Shape::Path { path } => {
+            let cherenkov::ShapeData::Path { elements, .. } = cherenkov::ShapeData::of(path) else {
+                unreachable!()
+            };
+            ShapeKind::Path(path.clone(), cherenkov::ShapeData::Path { elements, rule })
+        }
     }
 }
 
@@ -1216,7 +1224,6 @@ fn build_layer(
                     ops: run.ops,
                     live: run.live,
                     motion: None,
-                    content_len: 0,
                 });
             }
             PrepItem::Layer(p) => {
@@ -1240,7 +1247,6 @@ fn build_layer(
         ops: prep.own.ops,
         live: prep.own.live,
         motion: prep.motion,
-        content_len: 0,
     });
 }
 
@@ -1446,12 +1452,9 @@ impl Engine for Cherenkov {
         // only set live bindings and advance the clock. Static scenes keep
         // re-recording each frame so their numbers stay comparable.
         if first_frame || !(self.has_motion || self.has_live) {
-            let contents: Vec<(usize, cherenkov::Content)> = self
-                .content_layers
-                .iter_mut()
-                .enumerate()
-                .map(|(i, cl)| {
-                    let content = cherenkov::Content::record_with_capacity(cl.content_len, |c| {
+            surface.update(|tx| {
+                for cl in &self.content_layers {
+                    tx[cl.handle(surface)].record(|c| {
                         for (index, op) in cl.ops.iter().enumerate() {
                             match cl.live.iter().find(|live| live.index == index) {
                                 Some(live) => record_live(c, op, &live.bindings),
@@ -1459,13 +1462,6 @@ impl Engine for Cherenkov {
                             }
                         }
                     });
-                    cl.content_len = content.len();
-                    (i, content)
-                })
-                .collect();
-            surface.update(|tx| {
-                for (i, content) in contents {
-                    tx[self.content_layers[i].handle(surface)].content(content);
                 }
             });
         } else {
@@ -1624,14 +1620,7 @@ fn record_op(c: &mut cherenkov::Recorder, op: &Op) {
             ShapeKind::Circle(s) => c.fill(Fixed(*s), Fixed(paint.clone())),
             ShapeKind::Ellipse(s) => c.fill(Fixed(*s), Fixed(paint.clone())),
             ShapeKind::Line(s) => c.fill(Fixed(*s), Fixed(paint.clone())),
-            ShapeKind::Path(p, rule) => match rule {
-                cherenkov::FillRule::EvenOdd => {
-                    c.fill(Fixed(cherenkov::EvenOdd(p.clone())), Fixed(paint.clone()));
-                }
-                cherenkov::FillRule::NonZero => {
-                    c.fill(Fixed(p.clone()), Fixed(paint.clone()));
-                }
-            },
+            ShapeKind::Path(_, data) => c.fill(Fixed(data.clone()), Fixed(paint.clone())),
         },
         Op::Stroke {
             shape,
@@ -1652,8 +1641,8 @@ fn record_op(c: &mut cherenkov::Recorder, op: &Op) {
                 c.stroke(Fixed(*s), Fixed(stroke.clone()), Fixed(paint.clone()));
             }
             ShapeKind::Line(s) => c.stroke(Fixed(*s), Fixed(stroke.clone()), Fixed(paint.clone())),
-            ShapeKind::Path(p, _) => c.stroke(
-                Fixed(p.clone()),
+            ShapeKind::Path(_, data) => c.stroke(
+                Fixed(data.clone()),
                 Fixed(stroke.clone()),
                 Fixed(paint.clone()),
             ),
@@ -1665,8 +1654,8 @@ fn record_op(c: &mut cherenkov::Recorder, op: &Op) {
             ShapeKind::Circle(s) => c.shadow(Fixed(*s), Fixed(*shadow)),
             ShapeKind::Ellipse(s) => c.shadow(Fixed(*s), Fixed(*shadow)),
             ShapeKind::Line(s) => c.shadow(Fixed(*s), Fixed(*shadow)),
-            ShapeKind::Path(p, _) => {
-                c.shadow(Fixed(p.clone()), Fixed(*shadow));
+            ShapeKind::Path(_, data) => {
+                c.shadow(Fixed(data.clone()), Fixed(*shadow));
             }
         },
         Op::Glyphs { run, paint } => c.glyphs(Fixed(run.clone()), Fixed(paint.clone())),

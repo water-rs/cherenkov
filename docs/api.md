@@ -49,7 +49,7 @@ On the native Android backend, the host picks `Gpu` or `Raster` once at process 
 ## Threading
 
 - **UI thread: the single state machine.** Layers, backdrop groups, transactions, live recording and nami subscriptions live here, and all of them are `!Send`.
-- **Render thread: sole owner of GPU state.** A commit sends an owned change set over a channel.
+- **Render thread: sole owner of GPU state.** A commit sends an owned change set over a channel. The native UI-to-render channel is bounded at 64 messages; the UI thread waits when it is full.
 - **Parallelism over immutable data only.** Recorded `Picture`s are `Send`. Flattening, strip generation and glyph rasterization are data-parallel over owned data.
 - **No locks anywhere in the engine.**
 
@@ -286,6 +286,8 @@ let icon: Picture = Picture::record(|c: &mut StaticRecorder| { /* … */ });
 let content: Content = surface.record(|c: &mut Recorder| { /* … */ });
 ```
 
+- **Layer recording.** `tx[&layer].record(...)` replaces the content and reuses its retired recording storage once the render thread releases it.
+
 Both implement one drawing trait. A generic associated type decides what a parameter accepts:
 
 ```rust
@@ -343,6 +345,7 @@ impl Shape for ContinuousRect { /* Semantic::Continuous */ }
 // kurbo::Ellipse by type and gives it Semantic::Ellipse; no separate oval type.
 ```
 
+- `ShapeData::Path` stores its elements in an `Arc` slice, so cloning the shape shares path storage.
 - `ContinuousRect::to_path(tolerance)` expands its Lamé corners to a `BezPath` of line segments within `tolerance`; smoothing 0 gives circular-arc corners.
 - **Custom shapes are open.** `waterui-shape` merges here, and Lyon is removed.
 - **The semantic vocabulary is closed.** It is the set of fast paths. Besides the shapes above, it includes `Border` (a stroked rounded or continuous rectangle of a given width) and `InnerShadow`. These are the most common UI elements after the rounded rectangle, and otherwise they would fall to the general path route.
@@ -397,6 +400,7 @@ c.glyphs(&GlyphRun {
 }, paint);                        // paint is a separate parameter, so it can be bound to a signal
 ```
 
+- `GlyphRun.glyphs` and `GlyphRun.coords` are `Arc` slices; cloning a run shares both.
 - **Large scripts.** CJK text can touch thousands of distinct glyphs per screen.
   - The glyph atlas is budgeted and evicts least-recently-used pages.
   - Subpixel positions are quantized.

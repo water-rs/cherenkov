@@ -280,8 +280,9 @@ impl BackdropSample {
     }
 }
 
-/// A backdrop effect shader registered with an engine
-/// ([`Engine::backdrop_shader`](crate::Engine::backdrop_shader)).
+/// A backdrop effect shader registered with an engine.
+///
+/// Made by [`Engine::backdrop_shader`](crate::Engine::backdrop_shader).
 /// Dropping the last clone unregisters it; a member still sampling it
 /// makes the frame fail.
 #[derive(Debug)]

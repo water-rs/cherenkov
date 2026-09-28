@@ -390,6 +390,10 @@ pub(crate) fn wgpu_allocator(
     device: &wgpu::Device,
     backend: wgpu::Backend,
 ) -> Reading<AllocatorBytes> {
+    // Frees land when their submission completes; quiesce the device so
+    // the report reflects the settled allocator state, not submission
+    // timing (#169 A5: same-side samples must be deterministic).
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
     let Some(report) = device.generate_allocator_report() else {
         return Reading::unavailable(format!(
             "wgpu backend {backend:?} returns no allocator report"

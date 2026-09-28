@@ -644,9 +644,10 @@ fn record_node(node: &Node, fg: &Foreground<'_>, c: &mut StaticRecorder) {
 /// Build or fetch the glyph's node tree, then record it as a font-space
 /// [`Picture`] with `foreground` as the run's paint (the COLR `0xFFFF`
 /// brush). The tree caches per `(glyph, coords)`; `foreground` is baked
-/// into the picture at record time.
+/// into the picture at record time. Called from lowering, which holds
+/// the only mutable font access.
 pub fn glyph_picture(
-    font: &Font,
+    font: &mut Font,
     glyph_id: u32,
     coords: &[i16],
     foreground: &Paint,
@@ -667,29 +668,26 @@ pub fn glyph_picture(
 }
 
 /// The glyph's node tree, built once per `(glyph, coords)` key.
-fn glyph_nodes(font: &Font, glyph_id: u32, coords: &[i16]) -> Result<Arc<[Node]>, RenderError> {
+fn glyph_nodes(font: &mut Font, glyph_id: u32, coords: &[i16]) -> Result<Arc<[Node]>, RenderError> {
     let key = ColrKey {
         glyph: glyph_id,
         coords: coords.into(),
     };
-    {
-        let mut cache = font
-            .colr
-            .lock()
-            .map_err(|_| RenderError::Font("COLR cache poisoned".into()))?;
-        if let Some(nodes) = cache.get(&key) {
-            return Ok(nodes.clone());
-        }
-        let nodes: Arc<[Node]> = build_nodes(font, glyph_id, coords)?.into();
-        cache.insert(key, nodes.clone());
-        drop(cache);
-        Ok(nodes)
+    if let Some(nodes) = font.colr.get(&key) {
+        return Ok(nodes.clone());
     }
+    let nodes: Arc<[Node]> = build_nodes(&font.data, glyph_id, coords)?.into();
+    font.colr.insert(key, nodes.clone());
+    Ok(nodes)
 }
 
 /// Walk the glyph's `COLRv1` paint graph into a node tree.
-fn build_nodes(font: &Font, glyph_id: u32, coords: &[i16]) -> Result<Vec<Node>, RenderError> {
-    let font_ref = skrifa::FontRef::from_index(&font.data.data, font.data.index)
+fn build_nodes(
+    font: &cherenkov::FontData,
+    glyph_id: u32,
+    coords: &[i16],
+) -> Result<Vec<Node>, RenderError> {
+    let font_ref = skrifa::FontRef::from_index(&font.data, font.index)
         .map_err(|e| RenderError::Font(format!("{e}")))?;
     let location: Vec<F2Dot14> = coords.iter().map(|c| F2Dot14::from_bits(*c)).collect();
     let gid = GlyphId::new(glyph_id);
@@ -735,17 +733,17 @@ mod tests {
                 index: 0,
             },
             has_colr: true,
-            colr: std::sync::Mutex::new(std::collections::HashMap::new()),
+            colr: std::collections::HashMap::new(),
         }
     }
 
-    fn e300() -> u32 {
+    fn glyph_id(codepoint: char) -> u32 {
         let data = std::fs::read("../scenes/fonts/CherenkovColrTest.ttf").expect("test font");
         skrifa::FontRef::new(&data)
             .expect("parse")
             .charmap()
-            .map('\u{E300}')
-            .expect("E300 mapped")
+            .map(codepoint)
+            .expect("colour glyph mapped")
             .to_u32()
     }
 
@@ -753,12 +751,32 @@ mod tests {
     /// entries, and identical inputs share one node tree.
     #[test]
     fn the_colr_cache_key_is_structural() {
-        let font = test_font();
-        let gid = e300();
-        let a = glyph_nodes(&font, gid, &[0]).expect("first");
-        let b = glyph_nodes(&font, gid, &[1]).expect("second");
+        let mut font = test_font();
+        let gid = glyph_id('\u{E300}');
+        let a = glyph_nodes(&mut font, gid, &[0]).expect("first");
+        let b = glyph_nodes(&mut font, gid, &[1]).expect("second");
         assert!(!Arc::ptr_eq(&a, &b), "coords [0] and [1] are distinct keys");
-        let c = glyph_nodes(&font, gid, &[0]).expect("third");
+        let c = glyph_nodes(&mut font, gid, &[0]).expect("third");
         assert!(Arc::ptr_eq(&a, &c), "identical inputs share the tree");
+    }
+
+    /// Lowering the same colour glyph twice reuses its node tree, and a
+    /// different colour glyph gets a tree of its own.
+    #[test]
+    fn lowered_colr_glyphs_share_only_identical_graphs() {
+        let mut font = test_font();
+        let e300 = glyph_id('\u{E300}');
+        let e301 = glyph_id('\u{E301}');
+        let a = glyph_nodes(&mut font, e300, &[]).expect("first lower");
+        let b = glyph_nodes(&mut font, e300, &[]).expect("second lower");
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "a glyph lowered twice reuses its graph"
+        );
+        let other = glyph_nodes(&mut font, e301, &[]).expect("other glyph");
+        assert!(
+            !Arc::ptr_eq(&a, &other),
+            "distinct colour glyphs do not collide"
+        );
     }
 }

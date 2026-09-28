@@ -335,17 +335,18 @@ impl<'a> Lowering<'a> {
 
     /// Lowers a surface's sampled [`SurfaceTree`]. `caches` holds each
     /// layer's render-side content; the clear colour is applied by the
-    /// rasterizer, so the lowering emits only the layers' items.
+    /// rasterizer, so the lowering emits only the layers' items. `fonts`
+    /// is mutable: lowering fills each font's `COLRv1` node-tree cache.
     pub fn run(
         &mut self,
         tree: &SurfaceTree,
         caches: &mut HashMap<LayerId, ContentData>,
         images: &HashMap<u64, Arc<super::image::CpuImage>>,
-        fonts: &HashMap<u64, super::font::Font>,
+        fonts: &mut HashMap<u64, super::font::Font>,
     ) -> Result<(), RenderError> {
+        let mut lowerer = super::prepared::Lowerer { images, fonts };
         for content in caches.values_mut() {
-            self.commands_lowered +=
-                content.prepare(&mut super::prepared::Lowerer { images, fonts })?;
+            self.commands_lowered += content.prepare(&mut lowerer)?;
         }
         self.layer(tree.root(), tree, caches)
     }

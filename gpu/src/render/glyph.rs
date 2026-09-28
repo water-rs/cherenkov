@@ -223,6 +223,7 @@ struct MaskTexture {
 }
 
 /// One shelf of the packer: a row of cells sharing a height class.
+#[derive(Clone)]
 struct Shelf {
     y: u32,
     h: u32,
@@ -390,62 +391,179 @@ impl Atlas {
         self.masks.insert(key, mask);
     }
 
-    /// Uploads `w` × `h` coverage texels into the cell at `(x, y)`.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the device and queue plus the pending raster record's fields"
-    )]
-    pub fn write(
+    /// Per-shelf write cursors ahead of a commit batch;
+    /// [`Self::upload_committed`] diffs them against the final shelves
+    /// to find each contiguous newly allocated region.
+    pub fn shelf_bounds(&self) -> Vec<u32> {
+        self.shelves.iter().map(|s| s.x).collect()
+    }
+
+    /// Uploads one commit batch: a single `write_texture` per
+    /// contiguous newly allocated shelf region. Cells between the new
+    /// ones keep their old texels — the regions cover only newly
+    /// claimed spans — and no full-size CPU shadow of the atlas is
+    /// kept to assemble them (#169 A3).
+    pub fn upload_committed(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        x: u32,
-        y: u32,
-        w: u32,
-        h: u32,
-        texels: &[u8],
+        bounds: &[u32],
+        cells: &[CellWrite],
     ) {
-        // `write_texture` needs rows padded to 256 bytes.
-        let pitch = w.div_ceil(256) * 256;
-        let mut staging = vec![0u8; (pitch * h) as usize];
-        for (row, line) in texels.chunks_exact(w as usize).enumerate() {
-            staging[row * pitch as usize..row * pitch as usize + w as usize].copy_from_slice(line);
+        let mut buckets: Vec<Vec<&CellWrite>> = vec![Vec::new(); self.shelves.len()];
+        for cell in cells {
+            buckets[cell.shelf].push(cell);
         }
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d { x, y, z: 0 },
-                aspect: wgpu::TextureAspect::All,
-            },
-            &staging,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(pitch),
-                rows_per_image: Some(h),
-            },
-            wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-        );
-        crate::diag::upload(
-            device,
-            "glyph atlas",
-            u64::from(w) * u64::from(h),
-            Some((x, y, w, h)),
-        );
+        for (i, shelf) in self.shelves.iter().enumerate() {
+            let x0 = bounds.get(i).copied().unwrap_or(0);
+            if x0 >= shelf.x {
+                continue;
+            }
+            let (w, h) = (shelf.x - x0, shelf.h);
+            let mut data = vec![0u8; (w * h) as usize];
+            for cell in &buckets[i] {
+                let xo = (cell.x - x0) as usize;
+                let yo = (cell.y - shelf.y) as usize;
+                for (row, line) in cell.texels.chunks_exact(cell.w as usize).enumerate() {
+                    let dst = (yo + row) * w as usize + xo;
+                    data[dst..dst + cell.w as usize].copy_from_slice(line);
+                }
+                crate::diag::atlas_cell(device, (cell.x, cell.y, cell.w, cell.h));
+            }
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: x0,
+                        y: shelf.y,
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &data,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(w),
+                    rows_per_image: Some(h),
+                },
+                wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+            );
+            crate::diag::upload(
+                device,
+                "glyph atlas",
+                u64::from(w) * u64::from(h),
+                Some((x0, shelf.y, w, h)),
+            );
+        }
+    }
+
+    /// The placement decision a pending batch's dry run supports
+    /// (#169 A3): whether the live shelves take every cell, or the
+    /// atlas must grow once to a target edge, or be recycled empty.
+    pub fn plan(&self, rasters: &[&PendingRaster]) -> AtlasPlan {
+        let mut cells = Vec::new();
+        self.batch_cells(rasters, &mut cells);
+        let mut shelves = self.shelves.clone();
+        if cells
+            .iter()
+            .all(|&(w, h)| alloc_on(&mut shelves, self.size, w, h).is_some())
+        {
+            return AtlasPlan::Fits;
+        }
+        // Placement failed. A grow or clear drops every cached cell, so
+        // the re-lowered batch places all of them: size the grow target
+        // once, for cached and pending cells together.
+        let mut all = self.cached_cells();
+        all.extend_from_slice(&cells);
+        let mut size = self.size;
+        while size < self.cap {
+            size = (size * 2).min(self.cap);
+            let mut shelves = Vec::new();
+            if all
+                .iter()
+                .all(|&(w, h)| alloc_on(&mut shelves, size, w, h).is_some())
+            {
+                return AtlasPlan::Grow(size);
+            }
+        }
+        AtlasPlan::Recycle
+    }
+
+    /// Cells `rasters` still need beyond the live caches, in commit
+    /// order. Keys repeated inside the batch resolve to the first
+    /// store, exactly as the commit's cache inserts do.
+    fn batch_cells(&self, rasters: &[&PendingRaster], cells: &mut Vec<(u32, u32)>) {
+        let mut glyphs = rustc_hash::FxHashSet::default();
+        let mut paths = rustc_hash::FxHashSet::default();
+        let mut masks = rustc_hash::FxHashSet::default();
+        for raster in rasters {
+            match raster {
+                PendingRaster::Glyph { key, w, h, .. } => {
+                    if self.get(key).is_some() || !glyphs.insert(*key) {
+                        continue;
+                    }
+                    if *w > 0 {
+                        cells.push((*w, *h));
+                    }
+                }
+                PendingRaster::Path {
+                    key, cells: texels, ..
+                } => {
+                    if self.paths.contains_key(key) || !paths.insert(*key) {
+                        continue;
+                    }
+                    cells.extend(texels.iter().map(|&(w, h, _)| (w, h)));
+                }
+                PendingRaster::Mask { key, w, h, .. } => {
+                    if self.masks.contains_key(key) || !masks.insert(*key) {
+                        continue;
+                    }
+                    cells.push((*w, *h));
+                }
+                PendingRaster::MaskTexture { .. } | PendingRaster::Colr { .. } => {}
+            }
+        }
+    }
+
+    /// `(w, h)` of every cell the caches currently hold — what the
+    /// re-lowered batch places again after a grow or clear.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "cell rects and mask sizes are small positive floats"
+    )]
+    fn cached_cells(&self) -> Vec<(u32, u32)> {
+        let mut cells = Vec::with_capacity(self.map.len());
+        for entry in self.map.values() {
+            if entry.w > 0 {
+                cells.push((u32::from(entry.w), u32::from(entry.h)));
+            }
+        }
+        for emit in self.paths.values() {
+            for cell in &emit.cells {
+                cells.push((
+                    (cell.rect[2] - cell.rect[0]).round().max(0.0) as u32,
+                    (cell.rect[3] - cell.rect[1]).round().max(0.0) as u32,
+                ));
+            }
+        }
+        for mask in self.masks.values() {
+            cells.push((
+                mask.size[0].ceil().max(0.0) as u32,
+                mask.size[1].ceil().max(0.0) as u32,
+            ));
+        }
+        cells
     }
 
     /// The atlas edge in texels.
     pub const fn size(&self) -> u32 {
         self.size
-    }
-
-    /// The largest atlas edge the budget allows.
-    pub const fn cap(&self) -> u32 {
-        self.cap
     }
 
     /// Whether a `w` × `h` cell fits in an empty atlas at the cap.
@@ -599,18 +717,14 @@ impl Atlas {
         }
     }
 
-    /// Stores a rasterized glyph cell under `key`, uploading its texels.
-    /// The caller's `x`/`y` patch targets the returned origin. `None`
-    /// when the atlas is full; the caller grows/clears and retries.
+    /// Single-cell commit for tests: [`Self::place_glyph`] plus an
+    /// immediate shelf-region upload. `None` when the atlas is full.
+    #[cfg(test)]
     #[expect(
         clippy::too_many_arguments,
         reason = "the pending raster record's fields, passed through"
     )]
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "atlas cells fit u16: the atlas is at most 64kpx per axis"
-    )]
-    pub fn store_glyph(
+    fn store_glyph(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -621,16 +735,47 @@ impl Atlas {
         h: u32,
         texels: &[u8],
     ) -> Option<(u32, u32)> {
+        let bounds = self.shelf_bounds();
+        let mut uploads = Vec::new();
+        let hit = self.get(&key).is_some();
+        let out = self.place_glyph(key, left, top, w, h, texels.to_vec(), &mut uploads);
+        self.upload_committed(device, queue, &bounds, &uploads);
+        if !hit && w == 0 {
+            crate::diag::atlas_cell(device, (0, 0, 0, 0));
+        }
+        out
+    }
+
+    /// The [`Self::store_glyph`] placement half: registers `key`'s cell
+    /// without uploading. On a miss the texels move into `writes` for
+    /// the batch's shelf-region uploads (#169 A3). `None` when the
+    /// cell does not fit — the caller plans first.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the pending raster record's fields, passed through"
+    )]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "atlas cells fit u16: the atlas is at most 64kpx per axis"
+    )]
+    pub fn place_glyph(
+        &mut self,
+        key: GlyphKey,
+        left: i32,
+        top: i32,
+        w: u32,
+        h: u32,
+        texels: Vec<u8>,
+        writes: &mut Vec<CellWrite>,
+    ) -> Option<(u32, u32)> {
         if let Some(entry) = self.get(&key) {
             return Some((u32::from(entry.x), u32::from(entry.y)));
         }
         if w == 0 {
             self.map.insert(key, Entry::default());
-            crate::diag::atlas_cell(device, (0, 0, 0, 0));
             return Some((0, 0));
         }
-        let (cx, cy) = self.alloc(w, h)?;
-        self.write(device, queue, cx, cy, w, h, texels);
+        let (cx, cy, slot) = self.alloc(w, h)?;
         self.cpu_bytes += u64::from(w) * u64::from(h);
         let entry = Entry {
             x: cx as u16,
@@ -641,65 +786,107 @@ impl Atlas {
             top,
         };
         self.map.insert(key, entry);
+        writes.push(CellWrite {
+            shelf: slot,
+            x: cx,
+            y: cy,
+            w,
+            h,
+            texels,
+        });
         Some((cx, cy))
     }
 
-    /// Stores a path emission, allocating each cell and uploading its
-    /// texels in emission order. `None` when the atlas is full; `emit`
-    /// is only inserted once every cell allocated.
+    /// The [`Self::store_path`] placement half: allocates each cell and
+    /// patches its origin without uploading; texels move into `writes`
+    /// (#169 A3). `None` when a cell does not fit — the caller plans
+    /// first.
     #[expect(
         clippy::cast_possible_truncation,
         reason = "atlas cells fit u16: the atlas is at most 64kpx per axis"
     )]
-    pub fn store_path(
+    pub fn place_path(
         &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
         key: u64,
         emit: PathEmit,
-        cells: &[CellTexels],
+        cells: Vec<CellTexels>,
+        writes: &mut Vec<CellWrite>,
     ) -> Option<()> {
         if self.paths.contains_key(&key) {
             return Some(());
         }
         let mut emit = emit;
         for (cell, (w, h, texels)) in emit.cells.iter_mut().zip(cells) {
-            let (cx, cy) = self.alloc(*w, *h)?;
-            self.write(device, queue, cx, cy, *w, *h, texels);
+            let (cx, cy, slot) = self.alloc(w, h)?;
             cell.x = cx as u16;
             cell.y = cy as u16;
+            writes.push(CellWrite {
+                shelf: slot,
+                x: cx,
+                y: cy,
+                w,
+                h,
+                texels,
+            });
         }
         self.insert_path(key, emit);
         Some(())
     }
 
-    /// Stores a path-clip mask, setting `mask.atlas` to the cell origin.
-    /// `None` when the atlas is full.
+    /// Single-cell commit for tests: [`Self::place_mask`] plus an
+    /// immediate shelf-region upload. `None` when the atlas is full.
+    #[cfg(test)]
     #[expect(
         clippy::too_many_arguments,
         reason = "the device and queue plus the pending raster record's fields"
     )]
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "atlas coords are well within f32"
-    )]
-    pub fn store_mask(
+    fn store_mask(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         key: u64,
-        mut mask: MaskCell,
+        mask: MaskCell,
         w: u32,
         h: u32,
         texels: &[u8],
     ) -> Option<()> {
+        let bounds = self.shelf_bounds();
+        let mut uploads = Vec::new();
+        let out = self.place_mask(key, mask, w, h, texels.to_vec(), &mut uploads);
+        self.upload_committed(device, queue, &bounds, &uploads);
+        out
+    }
+
+    /// The [`Self::store_mask`] placement half: allocates the cell and
+    /// sets `mask.atlas` without uploading; texels move into `writes`
+    /// (#169 A3). `None` when the cell does not fit.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "atlas coords are well within f32"
+    )]
+    pub fn place_mask(
+        &mut self,
+        key: u64,
+        mut mask: MaskCell,
+        w: u32,
+        h: u32,
+        texels: Vec<u8>,
+        writes: &mut Vec<CellWrite>,
+    ) -> Option<()> {
         if self.masks.contains_key(&key) {
             return Some(());
         }
-        let (cx, cy) = self.alloc(w, h)?;
-        self.write(device, queue, cx, cy, w, h, texels);
+        let (cx, cy, slot) = self.alloc(w, h)?;
         mask.atlas = [cx as f32, cy as f32];
         self.insert_mask(key, mask);
+        writes.push(CellWrite {
+            shelf: slot,
+            x: cx,
+            y: cy,
+            w,
+            h,
+            texels,
+        });
         Some(())
     }
 
@@ -718,9 +905,11 @@ impl Atlas {
         self.masks.get(&key).map(|m| m.atlas)
     }
 
-    /// Doubles the atlas up to the cap, dropping every cached entry.
-    pub fn grow(&mut self, device: &wgpu::Device) {
-        let size = (self.size * 2).min(self.cap);
+    /// Grows the atlas to `size` (clamped to the cap), dropping every
+    /// cached entry. `#169 A3` passes the dry-run target, so a batch is
+    /// grown once instead of doubling until it happens to fit.
+    pub fn grow_to(&mut self, device: &wgpu::Device, size: u32) {
+        let size = size.min(self.cap);
         if size == self.size {
             return;
         }
@@ -742,31 +931,39 @@ impl Atlas {
     }
 
     /// Reserves a `w` × `h` cell, or `None` when it does not fit. Never
-    /// evicts: growth and clearing are the caller's decision.
-    pub(crate) fn alloc(&mut self, w: u32, h: u32) -> Option<(u32, u32)> {
-        // Shelf height classes are multiples of 8.
-        let class = (h + 2 * PAD).div_ceil(8) * 8;
-        for shelf in &mut self.shelves {
-            if shelf.h == class && shelf.x + w + 2 * PAD <= self.size {
-                let x = shelf.x + PAD;
-                shelf.x += w + 2 * PAD;
-                return Some((x, shelf.y + PAD));
-            }
-        }
-        let top = self.shelves.last().map_or(0, |s| s.y + s.h);
-        // A new shelf also needs the cell's width: a cell wider than the
-        // atlas must fail here so the caller grows (or clears) instead of
-        // writing past the texture edge.
-        if w + 2 * PAD <= self.size && top + class <= self.size {
-            self.shelves.push(Shelf {
-                y: top,
-                h: class,
-                x: w + 2 * PAD,
-            });
-            return Some((PAD, top + PAD));
-        }
-        None
+    /// evicts: growth and clearing are the caller's decision. Returns
+    /// the cell origin and its shelf index.
+    pub(crate) fn alloc(&mut self, w: u32, h: u32) -> Option<(u32, u32, usize)> {
+        alloc_on(&mut self.shelves, self.size, w, h)
     }
+}
+
+/// `Atlas::alloc` against an explicit shelf list and atlas edge. The
+/// dry-run side of a transactional batch clones `shelves` and calls
+/// this instead (#169 A3).
+fn alloc_on(shelves: &mut Vec<Shelf>, size: u32, w: u32, h: u32) -> Option<(u32, u32, usize)> {
+    // Shelf height classes are multiples of 8.
+    let class = (h + 2 * PAD).div_ceil(8) * 8;
+    for (i, shelf) in shelves.iter_mut().enumerate() {
+        if shelf.h == class && shelf.x + w + 2 * PAD <= size {
+            let x = shelf.x + PAD;
+            shelf.x += w + 2 * PAD;
+            return Some((x, shelf.y + PAD, i));
+        }
+    }
+    let top = shelves.last().map_or(0, |s| s.y + s.h);
+    // A new shelf also needs the cell's width: a cell wider than the
+    // atlas must fail here so the caller grows (or clears) instead of
+    // writing past the texture edge.
+    if w + 2 * PAD <= size && top + class <= size {
+        shelves.push(Shelf {
+            y: top,
+            h: class,
+            x: w + 2 * PAD,
+        });
+        return Some((PAD, top + PAD, shelves.len() - 1));
+    }
+    None
 }
 
 /// An [`OutlinePen`] collecting a glyph outline into a `kurbo::BezPath`.
@@ -819,6 +1016,35 @@ struct CellRaster {
 
 /// One path cell's raster pending its atlas origin: `(w, h, texels)`.
 pub type CellTexels = (u32, u32, Vec<u8>);
+
+/// A committed cell's texels, uploaded with its shelf's newly
+/// allocated region rather than on its own (#169 A3).
+pub struct CellWrite {
+    /// Shelf index [`Atlas::alloc`] placed the cell on.
+    pub shelf: usize,
+    /// Cell texel origin.
+    pub x: u32,
+    /// Cell texel origin.
+    pub y: u32,
+    /// Cell width in texels.
+    pub w: u32,
+    /// Cell height in texels.
+    pub h: u32,
+    /// `w` × `h` coverage texels.
+    pub texels: Vec<u8>,
+}
+
+/// The batch placement decision [`Atlas::plan`] reaches (#169 A3).
+pub enum AtlasPlan {
+    /// Every pending cell fits on the live shelves.
+    Fits,
+    /// The batch does not fit; growing once to this edge holds every
+    /// cached and pending cell after re-lowering.
+    Grow(u32),
+    /// Not even the cap holds the batch's cells: clear and retry on an
+    /// empty atlas.
+    Recycle,
+}
 
 /// Work deferred to the render thread by a parallel lowering: every
 /// atlas write and COLR cache update a surface wanted, in lowering

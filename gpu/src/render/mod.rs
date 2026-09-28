@@ -361,6 +361,17 @@ pub struct GpuRenderer {
 }
 
 /// Atlas origins produced by one deferred raster.
+/// The batch commit's outcome for `lower_all`'s retry loop (#169 A3).
+enum Commit {
+    /// Every surface's pending rasters committed; a surface that could
+    /// not be placed got `AtlasExhausted` in its result.
+    Done,
+    /// Grow the atlas once to this edge and re-lower.
+    Grow(u32),
+    /// Clear the atlas and re-lower; the next plan verdict is final.
+    Recycle,
+}
+
 enum PendingOrigin {
     /// Cell origins: one for a glyph, one per cell for a path emission.
     Cells(Vec<(u32, u32)>),
@@ -2707,7 +2718,8 @@ impl GpuRenderer {
         frames: &[&SurfaceFrame<'_>],
     ) -> Vec<Result<Lowered, RenderError>> {
         let mut cleared = false;
-        'batch: loop {
+        let mut grew = false;
+        loop {
             let group_maps: Vec<HashMap<u64, BackdropGroupInfo>> = pending
                 .iter()
                 .map(|surf| surf.backdrop_info(&mut self.filters))
@@ -2758,48 +2770,37 @@ impl GpuRenderer {
                     })
                     .collect()
             };
-            // Commit every surface's pending rasters serially, in dirty
-            // order.
-            for (surf, result) in pending.iter_mut().zip(results.iter_mut()) {
-                let Ok(lowered) = result else {
-                    continue;
-                };
-                match self.apply_pending(surf, lowered) {
-                    Ok(()) => {}
-                    Err(RenderError::AtlasFull) => {
-                        if self.atlas.size() < self.atlas.cap() {
-                            self.atlas.grow(&self.device);
-                            tracing::debug!(
-                                size = self.atlas.size(),
-                                generation = self.atlas.generation(),
-                                "atlas grown"
-                            );
-                        } else if cleared {
-                            *result = Err(RenderError::AtlasExhausted);
-                            break 'batch results;
-                        } else {
-                            self.atlas.clear();
-                            cleared = true;
-                            tracing::debug!(size = self.atlas.size(), "atlas cleared");
-                        }
-                        // Growing or clearing emptied the atlas: every
-                        // hit any lowering took is now a miss, so lower
-                        // the whole batch again.
-                        diag::event(
-                            &self.device,
-                            diag::EventKind::Phase {
-                                name: "atlas retry",
-                            },
-                        );
-                        continue 'batch;
-                    }
-                    Err(e) => {
-                        *result = Err(e);
-                        break 'batch results;
-                    }
+            // The batch's pending rasters commit transactionally
+            // (#169 A3): a dry run decides fit / grow once / recycle
+            // before any placement or upload happens, so a failed
+            // placement never enqueues uploads into an atlas the same
+            // preparation abandons.
+            match self.commit_rasters(pending, &mut results, cleared, grew) {
+                Commit::Done => break results,
+                Commit::Grow(size) => {
+                    self.atlas.grow_to(&self.device, size);
+                    grew = true;
+                    tracing::debug!(
+                        size = self.atlas.size(),
+                        generation = self.atlas.generation(),
+                        "atlas grown"
+                    );
+                }
+                Commit::Recycle => {
+                    self.atlas.clear();
+                    cleared = true;
+                    tracing::debug!(size = self.atlas.size(), "atlas cleared");
                 }
             }
-            break results;
+            // Growing or clearing emptied the atlas: every hit any
+            // lowering took is now a miss, so lower the whole batch
+            // again.
+            diag::event(
+                &self.device,
+                diag::EventKind::Phase {
+                    name: "atlas retry",
+                },
+            );
         }
     }
 
@@ -2810,7 +2811,8 @@ impl GpuRenderer {
         frames: &[&SurfaceFrame<'_>],
     ) -> Vec<Result<Lowered, RenderError>> {
         let mut cleared = false;
-        'batch: loop {
+        let mut grew = false;
+        loop {
             let group_maps: Vec<HashMap<u64, BackdropGroupInfo>> = pending
                 .iter()
                 .map(|surf| surf.backdrop_info(&mut self.filters))
@@ -2823,48 +2825,37 @@ impl GpuRenderer {
                     Self::lower_content(surf, frame, &self.atlas, &self.fonts, &self.images, groups)
                 })
                 .collect();
-            // Commit every surface's pending rasters serially, in dirty
-            // order.
-            for (surf, result) in pending.iter_mut().zip(results.iter_mut()) {
-                let Ok(lowered) = result else {
-                    continue;
-                };
-                match self.apply_pending(surf, lowered) {
-                    Ok(()) => {}
-                    Err(RenderError::AtlasFull) => {
-                        if self.atlas.size() < self.atlas.cap() {
-                            self.atlas.grow(&self.device);
-                            tracing::debug!(
-                                size = self.atlas.size(),
-                                generation = self.atlas.generation(),
-                                "atlas grown"
-                            );
-                        } else if cleared {
-                            *result = Err(RenderError::AtlasExhausted);
-                            break 'batch results;
-                        } else {
-                            self.atlas.clear();
-                            cleared = true;
-                            tracing::debug!(size = self.atlas.size(), "atlas cleared");
-                        }
-                        // Growing or clearing emptied the atlas: every
-                        // hit any lowering took is now a miss, so lower
-                        // the whole batch again.
-                        diag::event(
-                            &self.device,
-                            diag::EventKind::Phase {
-                                name: "atlas retry",
-                            },
-                        );
-                        continue 'batch;
-                    }
-                    Err(e) => {
-                        *result = Err(e);
-                        break 'batch results;
-                    }
+            // The batch's pending rasters commit transactionally
+            // (#169 A3): a dry run decides fit / grow once / recycle
+            // before any placement or upload happens, so a failed
+            // placement never enqueues uploads into an atlas the same
+            // preparation abandons.
+            match self.commit_rasters(pending, &mut results, cleared, grew) {
+                Commit::Done => break results,
+                Commit::Grow(size) => {
+                    self.atlas.grow_to(&self.device, size);
+                    grew = true;
+                    tracing::debug!(
+                        size = self.atlas.size(),
+                        generation = self.atlas.generation(),
+                        "atlas grown"
+                    );
+                }
+                Commit::Recycle => {
+                    self.atlas.clear();
+                    cleared = true;
+                    tracing::debug!(size = self.atlas.size(), "atlas cleared");
                 }
             }
-            break results;
+            // Growing or clearing emptied the atlas: every hit any
+            // lowering took is now a miss, so lower the whole batch
+            // again.
+            diag::event(
+                &self.device,
+                diag::EventKind::Phase {
+                    name: "atlas retry",
+                },
+            );
         }
     }
 
@@ -2922,6 +2913,59 @@ impl GpuRenderer {
             .evict_mask_textures(&self.device, |key| live.contains(&key));
     }
 
+    /// Commits every surface's pending rasters transactionally
+    /// (#169 A3). First [`Atlas::plan`] dry-runs all placements
+    /// against shelf metadata alone; only a `Fits` verdict — or the
+    /// last attempt after recycling — commits for real. The upload
+    /// then batches the committed cells into one `write_texture` per
+    /// newly allocated shelf region.
+    fn commit_rasters(
+        &mut self,
+        pending: &mut [SurfaceState],
+        results: &mut [Result<Lowered, RenderError>],
+        cleared: bool,
+        grew: bool,
+    ) -> Commit {
+        let rasters: Vec<&glyph::PendingRaster> = results
+            .iter()
+            .filter_map(|r| r.as_ref().ok())
+            .flat_map(|l| l.pending.iter())
+            .collect();
+        match self.atlas.plan(&rasters) {
+            glyph::AtlasPlan::Fits => {}
+            glyph::AtlasPlan::Grow(size) if !grew => return Commit::Grow(size),
+            glyph::AtlasPlan::Grow(_) | glyph::AtlasPlan::Recycle => {
+                if !cleared {
+                    return Commit::Recycle;
+                }
+                // Final attempt on the emptied atlas: commit the
+                // fitting prefix and exhaust the first surface whose
+                // raster does not place.
+            }
+        }
+        let bounds = self.atlas.shelf_bounds();
+        let mut writes = Vec::new();
+        for (surf, result) in pending.iter_mut().zip(results.iter_mut()) {
+            let Ok(lowered) = result else {
+                continue;
+            };
+            match self.apply_pending(surf, lowered, &mut writes) {
+                Ok(()) => {}
+                Err(RenderError::AtlasFull) => {
+                    *result = Err(RenderError::AtlasExhausted);
+                    break;
+                }
+                Err(e) => {
+                    *result = Err(e);
+                    break;
+                }
+            }
+        }
+        self.atlas
+            .upload_committed(&self.device, &self.queue, &bounds, &writes);
+        Commit::Done
+    }
+
     #[expect(
         clippy::cast_precision_loss,
         reason = "atlas coordinates fit exactly in f32"
@@ -2930,11 +2974,12 @@ impl GpuRenderer {
         &mut self,
         surf: &mut SurfaceState,
         lowered: &mut Lowered,
+        writes: &mut Vec<glyph::CellWrite>,
     ) -> Result<(), RenderError> {
         let pending = std::mem::take(&mut lowered.pending);
         let mut origins = Vec::with_capacity(pending.len());
         for raster in pending {
-            origins.push(self.apply_raster(raster)?);
+            origins.push(self.apply_raster(raster, writes)?);
         }
         let cell_origin = |p: u32, c: u32| {
             let PendingOrigin::Cells(cells) = &origins[p as usize] else {
@@ -2965,7 +3010,11 @@ impl GpuRenderer {
         Ok(())
     }
 
-    fn apply_raster(&mut self, raster: PendingRaster) -> Result<PendingOrigin, RenderError> {
+    fn apply_raster(
+        &mut self,
+        raster: PendingRaster,
+        writes: &mut Vec<glyph::CellWrite>,
+    ) -> Result<PendingOrigin, RenderError> {
         match raster {
             PendingRaster::Glyph {
                 key,
@@ -2974,14 +3023,21 @@ impl GpuRenderer {
                 w,
                 h,
                 texels,
-            } => self
-                .atlas
-                .store_glyph(&self.device, &self.queue, key, left, top, w, h, &texels)
-                .map(|(x, y)| PendingOrigin::Cells(vec![(x, y)]))
-                .ok_or(RenderError::AtlasFull),
+            } => {
+                let hit = self.atlas.get(&key).is_some();
+                let out = self
+                    .atlas
+                    .place_glyph(key, left, top, w, h, texels, writes)
+                    .map(|(x, y)| PendingOrigin::Cells(vec![(x, y)]))
+                    .ok_or(RenderError::AtlasFull)?;
+                if !hit && w == 0 {
+                    diag::atlas_cell(&self.device, (0, 0, 0, 0));
+                }
+                Ok(out)
+            }
             PendingRaster::Path { key, emit, cells } => {
                 self.atlas
-                    .store_path(&self.device, &self.queue, key, emit, &cells)
+                    .place_path(key, emit, cells, writes)
                     .ok_or(RenderError::AtlasFull)?;
                 Ok(PendingOrigin::Cells(
                     self.atlas.path_origins(key).expect("just stored"),
@@ -2995,7 +3051,7 @@ impl GpuRenderer {
                 texels,
             } => {
                 self.atlas
-                    .store_mask(&self.device, &self.queue, key, mask, w, h, &texels)
+                    .place_mask(key, mask, w, h, texels, writes)
                     .ok_or(RenderError::AtlasFull)?;
                 Ok(PendingOrigin::Mask(
                     self.atlas.mask_origin(key).expect("just stored"),

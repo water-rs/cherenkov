@@ -634,6 +634,14 @@ fn front_paint(
             mesh.points().to_vec(),
             mesh.colors().iter().map(working).collect(),
         )
+        .interpolation(match mesh.interpolation_mode() {
+            cherenkov_scene::MeshColorInterpolation::Linear => {
+                cherenkov::MeshColorInterpolation::Linear
+            }
+            cherenkov_scene::MeshColorInterpolation::Smoothstep => {
+                cherenkov::MeshColorInterpolation::Smoothstep
+            }
+        })
         .into(),
         ScenePaint::Solid(c) => cherenkov::Paint::Solid(working(c)),
         ScenePaint::Linear(g) => cherenkov::Paint::Linear(cherenkov::LinearGradient {

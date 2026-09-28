@@ -280,6 +280,29 @@ gradient_builders!(LinearGradient, Linear);
 gradient_builders!(RadialGradient, Radial);
 gradient_builders!(SweepGradient, Sweep);
 
+/// The weights used to interpolate mesh vertex colours in premultiplied
+/// linear Display P3. Geometry and patch ownership are unchanged.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MeshColorInterpolation {
+    /// Bilinear colour weights, matching the existing mesh contract.
+    #[default]
+    Linear,
+    /// Apply `t*t*(3-2*t)` independently to each patch coordinate before
+    /// interpolating colours. Endpoint derivatives are zero.
+    Smoothstep,
+}
+
+impl MeshColorInterpolation {
+    #[allow(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "serde skip_serializing_if requires a borrowed value"
+    )]
+    const fn is_linear(&self) -> bool {
+        matches!(self, Self::Linear)
+    }
+}
+
 /// A mesh gradient's fields before its grid is validated: the form it
 /// deserializes from, so that captured scenes cannot bypass the invariants.
 #[derive(Deserialize)]
@@ -288,6 +311,8 @@ struct MeshGradientData {
     rows: u32,
     points: Vec<Point>,
     colors: Vec<WorkingColor>,
+    #[serde(default, skip_serializing_if = "MeshColorInterpolation::is_linear")]
+    interpolation: MeshColorInterpolation,
 }
 
 /// Why a mesh gradient's grid is malformed.
@@ -325,6 +350,7 @@ impl TryFrom<MeshGradientData> for MeshGradient {
             rows,
             points,
             colors,
+            interpolation,
         } = data;
         if columns == 0 || rows == 0 {
             return Err(MeshGradientError::Empty { columns, rows });
@@ -349,6 +375,7 @@ impl TryFrom<MeshGradientData> for MeshGradient {
             rows,
             points,
             colors,
+            interpolation,
         })
     }
 }
@@ -362,6 +389,8 @@ pub struct MeshGradient {
     rows: u32,
     points: Vec<Point>,
     colors: Vec<WorkingColor>,
+    #[serde(default, skip_serializing_if = "MeshColorInterpolation::is_linear")]
+    interpolation: MeshColorInterpolation,
 }
 
 impl MeshGradient {
@@ -379,8 +408,22 @@ impl MeshGradient {
             rows,
             points,
             colors,
+            interpolation: MeshColorInterpolation::Linear,
         })
         .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Selects the colour weights without changing the mesh geometry.
+    #[must_use]
+    pub const fn interpolation(mut self, mode: MeshColorInterpolation) -> Self {
+        self.interpolation = mode;
+        self
+    }
+
+    /// The selected colour interpolation mode.
+    #[must_use]
+    pub const fn interpolation_mode(&self) -> MeshColorInterpolation {
+        self.interpolation
     }
 
     /// Patches per row.
@@ -534,8 +577,36 @@ mod mesh_overflow_tests {
             rows: u32::MAX,
             points: vec![],
             colors: vec![],
+            interpolation: super::MeshColorInterpolation::Linear,
         })
         .expect_err("unaddressable grid");
         assert_eq!(error, super::MeshGradientError::GridOverflow);
+    }
+}
+
+#[cfg(test)]
+mod mesh_interpolation_tests {
+    use super::*;
+    #[test]
+    fn old_captures_default_to_linear_and_new_modes_round_trip() {
+        let original = MeshGradient::new(
+            1,
+            1,
+            vec![
+                Point::ZERO,
+                Point::new(1., 0.),
+                Point::new(0., 1.),
+                Point::new(1., 1.),
+            ],
+            vec![WorkingColor::WHITE; 4],
+        );
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(!json.contains("interpolation"));
+        let decoded: MeshGradient = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.interpolation_mode(), MeshColorInterpolation::Linear);
+        let smooth = original.interpolation(MeshColorInterpolation::Smoothstep);
+        let json = serde_json::to_string(&smooth).unwrap();
+        assert!(json.contains("smoothstep"));
+        assert_eq!(serde_json::from_str::<MeshGradient>(&json).unwrap(), smooth);
     }
 }

@@ -5,7 +5,7 @@
 //!
 //! Each grid cell is a bilinear patch, in row-major
 //! order, with corners 00, 10, 01, 11. Geometry and premultiplied linear-P3
-//! colour use the same bilinear weights. Outside all patches is transparent.
+//! colour use bilinear or smoothstep weights. Outside all patches is transparent.
 //! Overlapping patches use the last patch; folded patches use the inverse
 //! with greatest v, then greatest u. Collapsed, zero-Jacobian samples are
 //! transparent. These ownership rules select one paint value, not a stack
@@ -84,6 +84,7 @@ struct Patch {
 pub struct Mesh {
     inverse: Affine,
     patches: Arc<[Patch]>,
+    interpolation: cherenkov::MeshColorInterpolation,
 }
 
 impl Mesh {
@@ -114,6 +115,7 @@ impl Mesh {
         Self {
             inverse,
             patches: patches.into(),
+            interpolation: mesh.interpolation_mode(),
         }
     }
 
@@ -122,6 +124,7 @@ impl Mesh {
         Self {
             inverse: self.inverse * inverse,
             patches: Arc::clone(&self.patches),
+            interpolation: self.interpolation,
         }
     }
 
@@ -141,6 +144,12 @@ impl Mesh {
                 continue;
             }
             if let Some((u, v)) = coordinates(patch.corners, point) {
+                let (u, v) = match self.interpolation {
+                    cherenkov::MeshColorInterpolation::Linear => (u, v),
+                    cherenkov::MeshColorInterpolation::Smoothstep => {
+                        (u * u * u.mul_add(-2.0, 3.0), v * v * v.mul_add(-2.0, 3.0))
+                    }
+                };
                 let mut out = [0.0; 4];
                 for (channel, value) in out.iter_mut().enumerate() {
                     let top = u.mul_add(

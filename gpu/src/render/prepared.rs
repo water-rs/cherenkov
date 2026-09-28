@@ -363,7 +363,12 @@ fn mesh_paint(
     stops: &mut Vec<Stop>,
 ) -> Result<PaintData, RenderError> {
     let mut data = PaintData {
-        kind: PAINT_MESH,
+        kind: PAINT_MESH
+            | if mesh.interpolation_mode() == cherenkov::MeshColorInterpolation::Smoothstep {
+                super::instance::PAINT_MESH_SMOOTH
+            } else {
+                0
+            },
         ..PaintData::default()
     };
     data.first_stop = u32::try_from(stops.len())

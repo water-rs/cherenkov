@@ -193,6 +193,7 @@ fn hash_paint(hasher: &mut impl Hasher, paint: &Paint) {
             g.interpolation.hash(hasher);
         }
         Paint::Mesh(g) => {
+            g.interpolation_mode().hash(hasher);
             g.columns().hash(hasher);
             g.rows().hash(hasher);
             for p in g.points() {
@@ -713,5 +714,33 @@ mod tests {
             h(&image(1, Sampling::Linear)),
             h(&image(1, Sampling::Nearest))
         );
+    }
+}
+
+#[cfg(test)]
+mod mesh_interpolation_key_tests {
+    use super::*;
+    #[test]
+    fn foreground_mesh_mode_is_part_of_color_glyph_identity() {
+        use std::hash::Hasher;
+        let linear = cherenkov::MeshGradient::new(
+            1,
+            1,
+            vec![
+                kurbo::Point::ZERO,
+                kurbo::Point::new(1., 0.),
+                kurbo::Point::new(0., 1.),
+                kurbo::Point::new(1., 1.),
+            ],
+            vec![cherenkov::WorkingColor::WHITE; 4],
+        );
+        let smooth = linear
+            .clone()
+            .interpolation(cherenkov::MeshColorInterpolation::Smoothstep);
+        let mut a = std::collections::hash_map::DefaultHasher::new();
+        let mut b = std::collections::hash_map::DefaultHasher::new();
+        hash_paint(&mut a, &Paint::Mesh(linear));
+        hash_paint(&mut b, &Paint::Mesh(smooth));
+        assert_ne!(a.finish(), b.finish());
     }
 }

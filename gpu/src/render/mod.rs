@@ -1367,6 +1367,8 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
         bound_stop_size: 32 * 16,
         bound_globals_size: 16,
         atlas,
+        commit_writes: Vec::new(),
+        pending_origins: Vec::new(),
         surfaces: HashMap::new(),
         fonts: HashMap::new(),
         images: HashMap::new(),

@@ -66,6 +66,8 @@ pub enum Feature {
     Glyphs,
     /// Glyph runs drawn with a stroke style.
     GlyphStroke,
+    /// Per-glyph transforms.
+    GlyphTransform,
     /// Variable-font normalized coordinates.
     FontVariations,
     /// Any colour channel above `1.0`.
@@ -365,6 +367,9 @@ fn collect_layer_features(layer: &Layer, f: &mut BTreeSet<Feature>) {
                         if !stroke.dash_pattern.is_empty() {
                             f.insert(Feature::StrokeDash);
                         }
+                    }
+                    if run.glyphs.iter().any(|g| g.transform.is_some()) {
+                        f.insert(Feature::GlyphTransform);
                     }
                     if !run.normalized_coords.is_empty() {
                         f.insert(Feature::FontVariations);

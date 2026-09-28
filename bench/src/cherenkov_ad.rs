@@ -470,6 +470,7 @@ fn cherenkov_features() -> Vec<Feature> {
         Feature::Shadow,
         Feature::Glyphs,
         Feature::GlyphStroke,
+        Feature::GlyphTransform,
         Feature::FontVariations,
         Feature::Scroll,
         Feature::Animation,
@@ -551,7 +552,8 @@ fn unsupported_feature(u: &str) -> Feature {
         "image" => Feature::Image,
         "stroke-dash" => Feature::StrokeDash,
         "stroke-join" => Feature::Stroke,
-        "glyph-stroke" | "glyph-transform" | "color-font" => Feature::Glyphs,
+        "glyph-stroke" | "color-font" => Feature::Glyphs,
+        "glyph-transform" => Feature::GlyphTransform,
         "shadow" => Feature::Shadow,
         _ => Feature::Fill,
     }
@@ -780,7 +782,7 @@ fn glyph_run(
                 id: g.id,
                 x: g.x,
                 y: g.y,
-                transform: None,
+                transform: g.transform,
             })
             .collect(),
         style: run

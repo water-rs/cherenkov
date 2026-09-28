@@ -15,10 +15,10 @@ use cherenkov_scene::kurbo::{
     Affine, BezPath, Ellipse, Line, Point, Rect, RoundedRect, RoundedRectRadii, Vec2,
 };
 use cherenkov_scene::{
-    BlendMode, Color, ColorSpace, Draw, Extend, FillRule, Glyph, GlyphRun, GradientStop,
-    ImageColorSpace, ImageEncoding, ImagePaint, LayerBuilder, LinearGradient, Live, Motion,
-    MotionAnimation, NormalizedCoord, Paint, RadialGradient, ResourceHash, Sampling, Scene,
-    SceneError, Shape, StrokeStyle, SweepGradient,
+    BackdropFilter, BlendMode, Color, ColorSpace, Draw, Extend, FillRule, Glyph, GlyphRun,
+    GradientStop, ImageColorSpace, ImageEncoding, ImagePaint, LayerBuilder, LinearGradient, Live,
+    Motion, MotionAnimation, NormalizedCoord, Paint, RadialGradient, ResourceHash, Sampling, Scene,
+    SceneBuilder, SceneError, Shape, StrokeStyle, SweepGradient,
 };
 use fontique::FontWeight;
 use parley::{
@@ -577,6 +577,26 @@ impl Corpus {
         self.scene_with_blobs(name, w, h, clear, f, Vec::new());
     }
 
+    /// Like [`Corpus::scene`] but `f` gets the whole builder — for scenes
+    /// that declare scene-level state such as backdrop groups.
+    fn scene_setup(
+        &mut self,
+        name: impl Into<String>,
+        w: u32,
+        h: u32,
+        clear: Color,
+        f: impl FnOnce(&mut SceneBuilder),
+    ) {
+        let mut builder = Scene::builder(w, h).clear(clear);
+        f(&mut builder);
+        let scene = builder.build();
+        self.entries.push(Entry {
+            name: name.into(),
+            scene,
+            blobs: Vec::new(),
+        });
+    }
+
     fn scene_with_blobs(
         &mut self,
         name: impl Into<String>,
@@ -710,6 +730,46 @@ fn map_body(l: &mut LayerBuilder, pw: f64, ph: f64) {
             }
         }
     }
+}
+
+/// Shared background: saturated shapes and a diagonal gradient so the
+/// sampled backdrop is visibly different from a flat fill.
+fn backdrop_background(l: &mut LayerBuilder) {
+    l.fill(
+        Shape::rect(0.0, 0.0, 256.0, 256.0),
+        Paint::Linear(LinearGradient {
+            start: Point::new(0.0, 0.0),
+            end: Point::new(256.0, 256.0),
+            stops: vec![
+                GradientStop {
+                    offset: 0.0,
+                    color: srgb(0.15, 0.20, 0.55),
+                },
+                GradientStop {
+                    offset: 1.0,
+                    color: srgb(0.85, 0.35, 0.15),
+                },
+            ],
+            extend: Extend::Pad,
+            interpolation: ColorSpace::Srgb,
+        }),
+    );
+    l.fill(
+        Shape::circle(64.0, 72.0, 52.0),
+        solid(srgb(0.85, 0.15, 0.20)),
+    );
+    l.fill(
+        Shape::circle(196.0, 60.0, 40.0),
+        solid(srgb(0.10, 0.60, 0.85)),
+    );
+    l.fill(
+        Shape::rect(40.0, 150.0, 176.0, 82.0),
+        solid(srgb(0.90, 0.65, 0.10)),
+    );
+    l.fill(
+        Shape::Ellipse(Ellipse::new((160.0, 150.0), (70.0, 46.0), 0.0)),
+        solid(srgb(0.40, 0.18, 0.75)),
+    );
 }
 
 #[expect(
@@ -2984,6 +3044,196 @@ fn run() -> Result<(), SceneError> {
             blobs,
         );
     }
+
+    // ---- Backdrop groups ---------------------------------------------------
+
+    corpus.scene_setup("backdrop-plain", 256, 256, white, |b| {
+        b.backdrop_group(1, Vec::new());
+        let l = &mut b.root();
+        backdrop_background(l);
+        l.layer(|m| {
+            let clip = Shape::RoundedRect(RoundedRect::new(56.0, 56.0, 200.0, 200.0, 20.0));
+            m.clip(clip.clone());
+            m.backdrop(1);
+            m.fill(
+                Shape::rect(58.0, 58.0, 140.0, 140.0),
+                solid(srgba(1.0, 1.0, 1.0, 0.4)),
+            );
+            m.stroke(
+                clip,
+                StrokeStyle {
+                    width: 2.0,
+                    ..StrokeStyle::default()
+                },
+                solid(srgb(1.0, 1.0, 1.0)),
+            );
+        });
+    });
+
+    corpus.scene_setup("backdrop-blur", 256, 256, white, |b| {
+        b.backdrop_group(1, vec![BackdropFilter::GaussianBlur { sigma: 6.0 }]);
+        let l = &mut b.root();
+        backdrop_background(l);
+        l.layer(|m| {
+            let clip = Shape::RoundedRect(RoundedRect::new(24.0, 24.0, 140.0, 92.0, 14.0));
+            m.clip(clip);
+            m.backdrop(1);
+            m.fill(
+                Shape::rect(26.0, 26.0, 112.0, 64.0),
+                solid(srgba(1.0, 1.0, 1.0, 0.25)),
+            );
+        });
+        l.layer(|m| {
+            let clip = Shape::RoundedRect(RoundedRect::new(140.0, 176.0, 232.0, 216.0, 20.0));
+            m.clip(clip);
+            m.backdrop(1);
+            m.fill(
+                Shape::rect(142.0, 178.0, 88.0, 36.0),
+                solid(srgba(1.0, 1.0, 1.0, 0.25)),
+            );
+        });
+    });
+
+    corpus.scene_setup("backdrop-nested", 256, 256, white, |b| {
+        b.backdrop_group(1, vec![BackdropFilter::GaussianBlur { sigma: 8.0 }]);
+        b.backdrop_group(2, vec![BackdropFilter::GaussianBlur { sigma: 3.0 }]);
+        let l = &mut b.root();
+        backdrop_background(l);
+        l.layer(|a| {
+            let clip = Shape::RoundedRect(RoundedRect::new(24.0, 24.0, 232.0, 232.0, 24.0));
+            a.clip(clip);
+            a.backdrop(1);
+            a.fill(
+                Shape::rect(26.0, 26.0, 204.0, 204.0),
+                solid(srgba(1.0, 1.0, 1.0, 0.15)),
+            );
+            // A member of group B inside A's member: B's capture includes
+            // A's sample.
+            a.layer(|m| {
+                let clip = Shape::RoundedRect(RoundedRect::new(44.0, 44.0, 140.0, 140.0, 16.0));
+                m.clip(clip);
+                m.backdrop(2);
+                m.fill(
+                    Shape::rect(46.0, 46.0, 92.0, 92.0),
+                    solid(srgba(1.0, 1.0, 1.0, 0.3)),
+                );
+            });
+            // A second B member, sibling of the first: it shares B's
+            // capture (taken at the first member's paint point).
+            a.layer(|m| {
+                let clip = Shape::RoundedRect(RoundedRect::new(120.0, 120.0, 212.0, 212.0, 16.0));
+                m.clip(clip);
+                m.backdrop(2);
+                m.fill(
+                    Shape::rect(122.0, 122.0, 88.0, 88.0),
+                    solid(srgba(0.0, 0.0, 0.0, 0.2)),
+                );
+            });
+        });
+    });
+
+    corpus.scene_setup("backdrop-transform", 256, 256, white, |b| {
+        // A saturation-boost colour matrix on premultiplied colour
+        // (luminance-preserving, s = 1.6).
+        let s = 1.6;
+        let (l0, l1, l2) = (0.2126, 0.7152, 0.0722);
+        b.backdrop_group(
+            1,
+            vec![BackdropFilter::ColorMatrix {
+                matrix: [
+                    l0 * (1.0 - s) + s,
+                    l1 * (1.0 - s),
+                    l2 * (1.0 - s),
+                    0.0,
+                    l0 * (1.0 - s),
+                    l1 * (1.0 - s) + s,
+                    l2 * (1.0 - s),
+                    0.0,
+                    l0 * (1.0 - s),
+                    l1 * (1.0 - s),
+                    l2 * (1.0 - s) + s,
+                    0.0,
+                ],
+            }],
+        );
+        b.backdrop_group(2, vec![BackdropFilter::GaussianBlur { sigma: 4.0 }]);
+        let l = &mut b.root();
+        backdrop_background(l);
+        l.layer(|m| {
+            m.transform(
+                Affine::translate(Vec2::new(128.0, 128.0))
+                    * Affine::rotate(17.0f64.to_radians())
+                    * Affine::scale(1.2),
+            );
+            m.clip(Shape::rect(-44.0, -44.0, 88.0, 88.0));
+            m.backdrop(1);
+            m.fill(
+                Shape::rect(-42.0, -42.0, 84.0, 84.0),
+                solid(srgba(1.0, 1.0, 1.0, 0.3)),
+            );
+        });
+        // A blurred member inside a scrolled parent: the member's clip
+        // rides the parent's content transform.
+        l.layer(|p| {
+            p.scroll_offset(Vec2::new(12.0, 20.0));
+            p.layer(|m| {
+                let clip = Shape::RoundedRect(RoundedRect::new(40.0, 60.0, 150.0, 120.0, 12.0));
+                m.clip(clip);
+                m.backdrop(2);
+                m.fill(
+                    Shape::rect(42.0, 62.0, 106.0, 56.0),
+                    solid(srgba(1.0, 1.0, 1.0, 0.25)),
+                );
+            });
+        });
+    });
+
+    corpus.scene_setup("backdrop-hdr", 256, 256, white, |b| {
+        b.backdrop_group(1, vec![BackdropFilter::GaussianBlur { sigma: 5.0 }]);
+        let l = &mut b.root();
+        // A gradient base plus HDR peaks: 16x white in P3, a P3 green
+        // outside sRGB, and a Rec. 2020 accent.
+        l.fill(
+            Shape::rect(0.0, 0.0, 256.0, 256.0),
+            Paint::Linear(LinearGradient {
+                start: Point::new(0.0, 0.0),
+                end: Point::new(256.0, 256.0),
+                stops: vec![
+                    GradientStop {
+                        offset: 0.0,
+                        color: Color::new(ColorSpace::DisplayP3, [0.05, 0.10, 0.30, 1.0]),
+                    },
+                    GradientStop {
+                        offset: 1.0,
+                        color: Color::new(ColorSpace::DisplayP3, [0.45, 0.12, 0.05, 1.0]),
+                    },
+                ],
+                extend: Extend::Pad,
+                interpolation: ColorSpace::LinearP3,
+            }),
+        );
+        l.fill(
+            Shape::rect(24.0, 24.0, 104.0, 104.0),
+            solid(Color::new(ColorSpace::DisplayP3, [16.0, 16.0, 16.0, 1.0])),
+        );
+        l.fill(
+            Shape::circle(196.0, 76.0, 56.0),
+            solid(Color::new(ColorSpace::DisplayP3, [0.0, 1.0, 0.1, 1.0])),
+        );
+        l.fill(
+            Shape::rect(60.0, 160.0, 172.0, 64.0),
+            solid(Color::new(ColorSpace::Rec2020, [0.9, 0.15, 0.6, 1.0])),
+        );
+        l.layer(|m| {
+            let clip = Shape::RoundedRect(RoundedRect::new(40.0, 40.0, 216.0, 216.0, 28.0));
+            m.clip(clip);
+            m.backdrop(1);
+            m.fill(
+                Shape::rect(42.0, 42.0, 172.0, 172.0),
+                solid(srgba(1.0, 1.0, 1.0, 0.1)),
+            );
+        });
+    });
 
     // ---- Write out ---------------------------------------------------------
 

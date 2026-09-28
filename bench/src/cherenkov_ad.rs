@@ -24,10 +24,11 @@ use cherenkov_gpu::{Gpu, GpuConfig, ScratchFormat};
 use cherenkov_oracle::color::to_working;
 use cherenkov_oracle::present::presented_srgb_to_working;
 use cherenkov_scene::{
-    BlendMode, ColorSpace, Draw as SceneDraw, Extend, Feature, GlyphRun as SceneGlyphRun,
-    ImageColorSpace, ImageEncoding, Item, Layer as SceneLayer, Paint as ScenePaint, ResourceHash,
-    Shape,
+    BackdropFilter, BlendMode, ColorSpace, Draw as SceneDraw, Extend, Feature,
+    GlyphRun as SceneGlyphRun, ImageColorSpace, ImageEncoding, Item, Layer as SceneLayer,
+    Paint as ScenePaint, ResourceHash, Shape,
 };
+use filtrate::FilterExt;
 use kurbo::{Affine, BezPath, Circle, Ellipse, Line, Rect, RoundedRect, Vec2};
 
 use crate::convert::{self, Blobs};
@@ -415,6 +416,8 @@ struct PrepLayer {
     own: ContentRun,
     /// Ordered children.
     items: Vec<PrepItem>,
+    /// The backdrop group this layer samples, if any.
+    backdrop: Option<u32>,
     /// The layer's one-time motion.
     motion: Option<LayerMotion>,
 }
@@ -459,6 +462,9 @@ pub struct Cherenkov {
     has_motion: bool,
     /// Whether the motion commits have been sent (first encode).
     motion_committed: bool,
+    /// The backdrop groups created in `prepare`, alive while the surface
+    /// is (dropping one fails frames that still sample it).
+    backdrop_groups: HashMap<u32, cherenkov::BackdropGroup>,
     /// Whether any content layer carries live items.
     has_live: bool,
     /// Encode frames since `prepare` (`frames[n % len]` for live items).
@@ -701,6 +707,9 @@ fn cherenkov_features() -> Vec<Feature> {
         Feature::ImageColorSpace(ImageColorSpace::LinearP3),
         Feature::ImageColorSpace(ImageColorSpace::LinearSrgb),
         Feature::ImageF16,
+        Feature::Backdrop,
+        Feature::BackdropBlur,
+        Feature::BackdropColorMatrix,
         // `sRGB` maps to `SrgbEncoded`; `linear-p3` and `linear-srgb` are
         // both linear interpolation, which is the working space already.
         Feature::InterpolationSpace(ColorSpace::Srgb),
@@ -769,6 +778,7 @@ fn unsupported_feature(u: &str) -> Feature {
         "glyph-stroke" | "color-font" => Feature::Glyphs,
         "glyph-transform" => Feature::GlyphTransform,
         "shadow" => Feature::Shadow,
+        "backdrop-unclipped" | "backdrop-footprint" => Feature::Backdrop,
         _ => Feature::Fill,
     }
 }
@@ -1201,6 +1211,7 @@ fn prep_layer(
             live: Vec::new(),
         },
         items: Vec::new(),
+        backdrop: layer.backdrop,
         motion: layer
             .motion
             .as_ref()
@@ -1315,6 +1326,7 @@ fn build_layer(
     tx: &mut Transaction<'_, Gpu>,
     parent: Option<&GpuLayer>,
     prep: PrepLayer,
+    groups: &HashMap<u32, cherenkov::BackdropGroup>,
     content_layers: &mut Vec<ContentLayer>,
 ) {
     let owned = parent.map(|_| surface.layer());
@@ -1327,6 +1339,9 @@ fn build_layer(
         edit.blend(prep.blend);
         if let Some(clip) = &prep.clip {
             clip_shape(edit, clip);
+        }
+        if let Some(id) = prep.backdrop {
+            edit.backdrop(groups[&id].sample());
         }
     }
     if let Some(parent) = parent {
@@ -1345,7 +1360,9 @@ fn build_layer(
                     motion: None,
                 });
             }
-            PrepItem::Layer(p) => build_layer(surface, tx, Some(layer), *p, content_layers),
+            PrepItem::Layer(p) => {
+                build_layer(surface, tx, Some(layer), *p, groups, content_layers);
+            }
         }
     }
     content_layers.push(ContentLayer {
@@ -1355,6 +1372,43 @@ fn build_layer(
         last_len: 0,
         motion: prep.motion,
     });
+}
+
+/// Creates the engine backdrop group for a scene group. The chain type is
+/// static, so the combinations this adapter builds are a blur alone, a
+/// colour matrix alone, and a blur then a colour matrix (the shapes the
+/// corpus uses); anything else is reported unsupported rather than
+/// approximated.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "filter parameters are f32 at the engine boundary"
+)]
+fn backdrop_group(
+    surface: &Surface<Gpu>,
+    group: &cherenkov_scene::BackdropGroup,
+) -> Result<cherenkov::BackdropGroup, BenchError> {
+    use filtrate::filters::{ColorMatrix, GaussianBlur};
+    let unsupported = || BenchError::Unsupported {
+        engine: Cherenkov::NAME,
+        feature: Feature::Backdrop,
+        api: Some("backdrop filter chain shape is not built"),
+    };
+    Ok(match group.filters.as_slice() {
+        [] => surface.backdrop_group_unfiltered(),
+        [BackdropFilter::GaussianBlur { sigma }] => {
+            surface.backdrop_group(GaussianBlur(*sigma as f32))
+        }
+        [BackdropFilter::ColorMatrix { matrix }] => {
+            surface.backdrop_group(ColorMatrix(matrix.map(|v| v as f32)))
+        }
+        [
+            BackdropFilter::GaussianBlur { sigma },
+            BackdropFilter::ColorMatrix { matrix },
+        ] => surface.backdrop_group(
+            GaussianBlur(*sigma as f32).then(ColorMatrix(matrix.map(|v| v as f32))),
+        ),
+        _ => return Err(unsupported()),
+    })
 }
 
 impl Cherenkov {
@@ -1402,6 +1456,7 @@ impl Cherenkov {
             images: HashMap::new(),
             image_handles: Vec::new(),
             content_layers: Vec::new(),
+            backdrop_groups: HashMap::new(),
             has_motion: false,
             motion_committed: false,
             has_live: false,
@@ -1494,10 +1549,23 @@ impl Engine for Cherenkov {
         )?;
         let prep = prep_layer(&input.scene.root, &self.fonts, &self.images, input.blobs)?;
         self.content_layers.clear();
+        self.backdrop_groups.clear();
+        let mut backdrop_groups = HashMap::new();
+        for group in &input.scene.backdrop_groups {
+            backdrop_groups.insert(group.id, backdrop_group(&surface, group)?);
+        }
         let mut content_layers = Vec::new();
         surface.update(|tx| {
-            build_layer(&surface, tx, None, prep, &mut content_layers);
+            build_layer(
+                &surface,
+                tx,
+                None,
+                prep,
+                &backdrop_groups,
+                &mut content_layers,
+            );
         });
+        self.backdrop_groups = backdrop_groups;
         self.has_motion = content_layers.iter().any(|c| c.motion.is_some());
         self.motion_committed = false;
         self.has_live = content_layers.iter().any(|c| !c.live.is_empty());
@@ -1624,6 +1692,8 @@ impl Engine for Cherenkov {
         counters.passes = Some(stats.passes);
         counters.memory_gpu_bytes = Some(memory.gpu.0);
         counters.memory_cpu_bytes = Some(memory.cpu.0);
+        counters.memory_backdrop_capture_bytes = Some(memory.backdrop_captures.0);
+        counters.memory_backdrop_capture_format = memory.backdrop_capture_format;
         counters
     }
 
@@ -1649,6 +1719,7 @@ impl Engine for Cherenkov {
             engine: Reading::Measured(EngineBytes {
                 cpu_bytes: usage.cpu.0,
                 gpu_bytes: usage.gpu.0,
+                backdrop_capture_bytes: usage.backdrop_captures.0,
             }),
             wgpu_allocator: wgpu_allocator(&self.shared_device.device, adapter_info.backend),
             skia_budgeted: Reading::unavailable("not a Skia adapter"),

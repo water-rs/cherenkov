@@ -8,8 +8,10 @@
 pub const PATH: &str = "path";
 /// A user shader paint.
 pub const SHADER: &str = "shader-paint";
-/// A backdrop group.
-pub const BACKDROP: &str = "backdrop";
+/// A backdrop group member without a clip.
+pub const BACKDROP_UNCLIPPED: &str = "backdrop-unclipped";
+/// A backdrop filter footprint too large to bound.
+pub const BACKDROP_FOOTPRINT: &str = "backdrop-footprint";
 /// A colour font (COLR, CBDT or sbix).
 pub const COLOR_FONT: &str = "color-font";
 /// A blend space other than linear.

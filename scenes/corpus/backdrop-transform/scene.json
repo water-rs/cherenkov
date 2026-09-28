@@ -1,0 +1,387 @@
+{
+  "width": 256,
+  "height": 256,
+  "working_space": "linear-display-p3",
+  "clear": {
+    "space": "srgb",
+    "components": [
+      0.95,
+      0.95,
+      0.95,
+      1.0
+    ]
+  },
+  "features": [
+    {
+      "feature": "fill"
+    },
+    {
+      "feature": "linear-gradient"
+    },
+    {
+      "feature": "clip"
+    },
+    {
+      "feature": "scroll"
+    },
+    {
+      "feature": "interpolation-space",
+      "value": "srgb"
+    },
+    {
+      "feature": "backdrop"
+    },
+    {
+      "feature": "backdrop-blur"
+    },
+    {
+      "feature": "backdrop-color-matrix"
+    }
+  ],
+  "backdrop_groups": [
+    {
+      "id": 1,
+      "filters": [
+        {
+          "filter": "color-matrix",
+          "value": {
+            "matrix": [
+              1.47244,
+              -0.42912000000000006,
+              -0.043320000000000004,
+              0.0,
+              -0.12756000000000003,
+              1.17088,
+              -0.043320000000000004,
+              0.0,
+              -0.12756000000000003,
+              -0.42912000000000006,
+              1.55668,
+              0.0
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "filters": [
+        {
+          "filter": "gaussian-blur",
+          "value": {
+            "sigma": 4.0
+          }
+        }
+      ]
+    }
+  ],
+  "root": {
+    "transform": [
+      1.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0
+    ],
+    "opacity": 1.0,
+    "blend": "normal",
+    "items": [
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rect": {
+                "x0": 0.0,
+                "y0": 0.0,
+                "x1": 256.0,
+                "y1": 256.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "linear": {
+                "start": {
+                  "x": 0.0,
+                  "y": 0.0
+                },
+                "end": {
+                  "x": 256.0,
+                  "y": 256.0
+                },
+                "stops": [
+                  {
+                    "offset": 0.0,
+                    "color": {
+                      "space": "srgb",
+                      "components": [
+                        0.15,
+                        0.2,
+                        0.55,
+                        1.0
+                      ]
+                    }
+                  },
+                  {
+                    "offset": 1.0,
+                    "color": {
+                      "space": "srgb",
+                      "components": [
+                        0.85,
+                        0.35,
+                        0.15,
+                        1.0
+                      ]
+                    }
+                  }
+                ],
+                "extend": "pad",
+                "interpolation": "srgb"
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "circle": {
+                "center": {
+                  "x": 64.0,
+                  "y": 72.0
+                },
+                "radius": 52.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.85,
+                  0.15,
+                  0.2,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "circle": {
+                "center": {
+                  "x": 196.0,
+                  "y": 60.0
+                },
+                "radius": 40.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.1,
+                  0.6,
+                  0.85,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rect": {
+                "x0": 40.0,
+                "y0": 150.0,
+                "x1": 216.0,
+                "y1": 232.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.9,
+                  0.65,
+                  0.1,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "ellipse": {
+                "inner": [
+                  70.0,
+                  0.0,
+                  0.0,
+                  46.0,
+                  160.0,
+                  150.0
+                ]
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  0.4,
+                  0.18,
+                  0.75,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "layer": {
+          "transform": [
+            1.1475657071556424,
+            0.3508460456672841,
+            -0.3508460456672841,
+            1.1475657071556424,
+            128.0,
+            128.0
+          ],
+          "clip": {
+            "rect": {
+              "x0": -44.0,
+              "y0": -44.0,
+              "x1": 44.0,
+              "y1": 44.0
+            }
+          },
+          "opacity": 1.0,
+          "blend": "normal",
+          "backdrop": 1,
+          "items": [
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rect": {
+                      "x0": -42.0,
+                      "y0": -42.0,
+                      "x1": 42.0,
+                      "y1": 42.0
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "solid": {
+                      "space": "srgb",
+                      "components": [
+                        1.0,
+                        1.0,
+                        1.0,
+                        0.3
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      {
+        "layer": {
+          "transform": [
+            1.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0
+          ],
+          "opacity": 1.0,
+          "blend": "normal",
+          "scroll_offset": {
+            "x": 12.0,
+            "y": 20.0
+          },
+          "items": [
+            {
+              "layer": {
+                "transform": [
+                  1.0,
+                  0.0,
+                  0.0,
+                  1.0,
+                  0.0,
+                  0.0
+                ],
+                "clip": {
+                  "rounded-rect": {
+                    "rect": {
+                      "x0": 40.0,
+                      "y0": 60.0,
+                      "x1": 150.0,
+                      "y1": 120.0
+                    },
+                    "radii": {
+                      "top_left": 12.0,
+                      "top_right": 12.0,
+                      "bottom_right": 12.0,
+                      "bottom_left": 12.0
+                    }
+                  }
+                },
+                "opacity": 1.0,
+                "blend": "normal",
+                "backdrop": 2,
+                "items": [
+                  {
+                    "draw": {
+                      "fill": {
+                        "shape": {
+                          "rect": {
+                            "x0": 42.0,
+                            "y0": 62.0,
+                            "x1": 148.0,
+                            "y1": 118.0
+                          }
+                        },
+                        "rule": "non-zero",
+                        "paint": {
+                          "solid": {
+                            "space": "srgb",
+                            "components": [
+                              1.0,
+                              1.0,
+                              1.0,
+                              0.25
+                            ]
+                          }
+                        }
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

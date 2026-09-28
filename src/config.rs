@@ -48,4 +48,9 @@ pub struct MemoryUsage {
     pub gpu: Bytes,
     /// CPU-side cache bytes.
     pub cpu: Bytes,
+    /// Backdrop-group capture textures, in bytes; included in `gpu`.
+    pub backdrop_captures: Bytes,
+    /// Texture format of the backdrop captures (`"rgba16float"` normally),
+    /// `None` while none is allocated.
+    pub backdrop_capture_format: Option<&'static str>,
 }

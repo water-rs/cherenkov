@@ -29,8 +29,8 @@ use cherenkov::{
 };
 use glyph::{Atlas, FontData, PendingRaster};
 use lower::{
-    ContentData, Frame as LoweredFrame, GlyphContext, Lowered, Lowering, PipelineKind,
-    ShaderVariant, Target,
+    BackdropGroupInfo, ContentData, Frame as LoweredFrame, GlyphContext, Lowered, Lowering,
+    PipelineKind, ShaderVariant, Source, Target,
 };
 
 /// The surface target format: premultiplied linear Display P3.
@@ -140,6 +140,8 @@ struct SurfaceState {
     /// Backdrop copies for blend composites: index 0 matches the surface
     /// format, index 1 the scratch format.
     backdrop: [Option<ScratchTarget>; 2],
+    /// Backdrop groups registered on this surface by raw id.
+    backdrop_groups: HashMap<u64, BackdropGroupState>,
     layers: HashMap<LayerId, ContentData>,
     content: HashMap<LayerId, gpu_content::Slot>,
     shader_textures: HashMap<std::sync::Arc<paint::Key>, paint::Texture>,
@@ -152,7 +154,7 @@ struct SurfaceState {
     /// Bumped whenever a scratch or backdrop texture is (re)created — a
     /// cached group-1 bind group referencing the old view must rebuild.
     bind_gen: u64,
-    /// Group-1 bind groups keyed by `(source scratch, backdrop, image,
+    /// Group-1 bind groups keyed by `(source, backdrop, image,
     /// mask texture)`, reused across frames while `binds1_stamp` is
     /// current.
     binds1: HashMap<Bind1Key, wgpu::BindGroup>,
@@ -161,7 +163,53 @@ struct SurfaceState {
     binds1_stamp: (u64, u64, u64),
 }
 
+/// A registered backdrop group: its optional capture filter and the
+/// capture texture, exactly sized to each frame's region.
+struct BackdropGroupState {
+    /// The group's filter chain key, when registered with a filter.
+    filter: Option<filter::FilterKey>,
+    /// The capture texture, `None` until a frame samples the group.
+    capture: Option<ScratchTarget>,
+}
+
 impl SurfaceState {
+    /// The `BackdropGroupInfo` map lowering needs for this surface.
+    fn backdrop_info(&self, filters: &mut filter::Registry) -> HashMap<u64, BackdropGroupInfo> {
+        self.backdrop_groups
+            .iter()
+            .map(|(g, state)| {
+                (
+                    *g,
+                    BackdropGroupInfo {
+                        filter: state.filter,
+                        footprint: state
+                            .filter
+                            .map_or(Some(filtrate_core::Footprint::ZERO), |key| {
+                                filters.footprint_bound(key)
+                            }),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Bytes held by this surface's backdrop captures.
+    fn backdrop_bytes(&self) -> u64 {
+        self.backdrop_groups
+            .values()
+            .filter_map(|g| g.capture.as_ref())
+            .map(|c| {
+                u64::from(c.width)
+                    * u64::from(c.height)
+                    * if c.texture.format() == wgpu::TextureFormat::Rgba16Float {
+                        8
+                    } else {
+                        4
+                    }
+            })
+            .sum()
+    }
+
     fn content_wants_redraw(&self) -> bool {
         !self.content.is_empty()
             && self.frame.content.iter().any(|id| {
@@ -213,12 +261,18 @@ impl SurfaceState {
                 .filter_map(|slot| slot.image.as_ref())
                 .map(|image| u64::from(image.width) * u64::from(image.height) * 8)
                 .sum::<u64>()
+            + self.backdrop_bytes()
     }
 }
 
-/// The group-1 bind group key: `(source scratch, backdrop-needed,
+/// The group-1 bind group key: `(source, backdrop-needed,
 /// image, mask texture)`.
-type Bind1Key = (Option<usize>, bool, Option<lower::ImageSource>, Option<u64>);
+type Bind1Key = (
+    Option<lower::Source>,
+    bool,
+    Option<lower::ImageSource>,
+    Option<u64>,
+);
 
 /// All render-thread state.
 pub struct GpuRenderer {
@@ -1376,6 +1430,7 @@ impl Renderer for GpuRenderer {
                 view,
                 scratch: Vec::new(),
                 backdrop: [None, None],
+                backdrop_groups: HashMap::new(),
                 layers: HashMap::new(),
                 content: HashMap::new(),
                 shader_textures: HashMap::new(),
@@ -1619,9 +1674,23 @@ impl Renderer for GpuRenderer {
                 .values()
                 .map(|i| u64::from(i.width) * u64::from(i.height) * 8)
                 .sum::<u64>();
+        let captures = self
+            .surfaces
+            .values()
+            .map(SurfaceState::backdrop_bytes)
+            .sum();
+        let capture_format = self
+            .surfaces
+            .values()
+            .flat_map(|surf| surf.backdrop_groups.values())
+            .filter_map(|g| g.capture.as_ref())
+            .map(|c| format_name(c.texture.format()))
+            .next();
         MemoryUsage {
             gpu: cherenkov::Bytes(gpu + self.filters.gpu_bytes()),
             cpu: cherenkov::Bytes(self.atlas.cpu_bytes()),
+            backdrop_captures: cherenkov::Bytes(captures),
+            backdrop_capture_format: capture_format,
         }
     }
 
@@ -2058,10 +2127,48 @@ impl GpuRenderer {
         self.filters.set_active(&active);
     }
     pub(crate) fn add_filter(&mut self, id: cherenkov::FilterId, source: Box<dyn filter::Source>) {
-        self.filters.add(id.raw(), source);
+        self.filters.add(filter::FilterKey::Layer(id.raw()), source);
     }
     pub(crate) fn remove_filter(&mut self, id: cherenkov::FilterId) {
-        self.filters.remove(id.raw());
+        self.filters.remove(filter::FilterKey::Layer(id.raw()));
+    }
+    pub(crate) fn add_backdrop_group(
+        &mut self,
+        surface: SurfaceId,
+        id: cherenkov::BackdropId,
+        source: Option<Box<dyn filter::Source>>,
+    ) {
+        let Some(surf) = self.surfaces.get_mut(&surface) else {
+            return;
+        };
+        let filter = source.map(|source| {
+            let key = filter::FilterKey::Backdrop {
+                surface: surface.raw(),
+                group: id.raw(),
+            };
+            self.filters.add(key, source);
+            key
+        });
+        surf.backdrop_groups.insert(
+            id.raw(),
+            BackdropGroupState {
+                filter,
+                capture: None,
+            },
+        );
+    }
+    pub(crate) fn remove_backdrop_group(&mut self, surface: SurfaceId, id: cherenkov::BackdropId) {
+        let Some(surf) = self.surfaces.get_mut(&surface) else {
+            return;
+        };
+        if let Some(state) = surf.backdrop_groups.remove(&id.raw()) {
+            if let Some(key) = state.filter {
+                self.filters.remove(key);
+            }
+            if state.capture.is_some() {
+                surf.bind_gen += 1;
+            }
+        }
     }
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn add_shader(
@@ -2274,6 +2381,10 @@ impl GpuRenderer {
     ) -> Vec<Result<Lowered, RenderError>> {
         let mut cleared = false;
         'batch: loop {
+            let group_maps: Vec<HashMap<u64, BackdropGroupInfo>> = pending
+                .iter()
+                .map(|surf| surf.backdrop_info(&mut self.filters))
+                .collect();
             let mut results: Vec<Result<Lowered, RenderError>> = if pending.len() > 1 {
                 let (atlas, images) = (&self.atlas, &self.images);
                 // `FontData`'s COLR cache is a `RefCell` — !Sync — so
@@ -2292,8 +2403,11 @@ impl GpuRenderer {
                         .iter_mut()
                         .zip(snapshots)
                         .zip(frames)
-                        .map(|((surf, fonts), frame)| {
-                            s.spawn(move || Self::lower_content(surf, frame, atlas, &fonts, images))
+                        .zip(&group_maps)
+                        .map(|(((surf, fonts), frame), groups)| {
+                            s.spawn(move || {
+                                Self::lower_content(surf, frame, atlas, &fonts, images, groups)
+                            })
                         })
                         .collect::<Vec<_>>()
                         .into_iter()
@@ -2304,8 +2418,16 @@ impl GpuRenderer {
                 pending
                     .iter_mut()
                     .zip(frames)
-                    .map(|(surf, frame)| {
-                        Self::lower_content(surf, frame, &self.atlas, &self.fonts, &self.images)
+                    .zip(&group_maps)
+                    .map(|((surf, frame), groups)| {
+                        Self::lower_content(
+                            surf,
+                            frame,
+                            &self.atlas,
+                            &self.fonts,
+                            &self.images,
+                            groups,
+                        )
                     })
                     .collect()
             };
@@ -2356,11 +2478,16 @@ impl GpuRenderer {
     ) -> Vec<Result<Lowered, RenderError>> {
         let mut cleared = false;
         'batch: loop {
+            let group_maps: Vec<HashMap<u64, BackdropGroupInfo>> = pending
+                .iter()
+                .map(|surf| surf.backdrop_info(&mut self.filters))
+                .collect();
             let mut results: Vec<Result<Lowered, RenderError>> = pending
                 .iter_mut()
                 .zip(frames)
-                .map(|(surf, frame)| {
-                    Self::lower_content(surf, frame, &self.atlas, &self.fonts, &self.images)
+                .zip(&group_maps)
+                .map(|((surf, frame), groups)| {
+                    Self::lower_content(surf, frame, &self.atlas, &self.fonts, &self.images, groups)
                 })
                 .collect();
             // Commit every surface's pending rasters serially, in dirty
@@ -2408,6 +2535,7 @@ impl GpuRenderer {
         atlas: &Atlas,
         fonts: &HashMap<u64, FontData>,
         images: &HashMap<u64, GpuImage>,
+        groups: &HashMap<u64, BackdropGroupInfo>,
     ) -> Result<Lowered, RenderError> {
         surf.frame.reset();
         // Lowering borrows `layers` immutably while mutating `frame`;
@@ -2422,7 +2550,7 @@ impl GpuRenderer {
                 content: &surf.content,
             };
             let mut lowering = Lowering::new(&mut surf.frame, surf.size);
-            let result = lowering.run(frame.tree, &mut layers, frame.clear, &glyphs);
+            let result = lowering.run(frame.tree, &mut layers, frame.clear, &glyphs, groups);
             lowered.commands = lowering.commands_lowered;
             lowered.layers = lowering.layers_composed;
             lowered.glyphs = lowering.glyphs_rasterized();
@@ -2596,7 +2724,7 @@ impl GpuRenderer {
             .iter()
             .filter_map(|p| match p.target {
                 Target::Scratch(i) => Some(i + 1),
-                Target::Surface => None,
+                Target::Surface | Target::Backdrop(_) => None,
             })
             .max()
             .unwrap_or(0);
@@ -2641,6 +2769,51 @@ impl GpuRenderer {
             }
             surf.bind_gen += 1;
         }
+        // Backdrop-group captures are exactly their pass's region, in the
+        // format of the target the capture copies from, and sampled by
+        // later passes.
+        for pass in &surf.frame.passes {
+            let Some(capture) = pass.capture else {
+                continue;
+            };
+            let (w, h) = (pass.region[2], pass.region[3]);
+            let format = match capture.copy_from {
+                Target::Surface => TARGET_FORMAT,
+                Target::Scratch(_) => self.scratch_format,
+                Target::Backdrop(_) => {
+                    return Err(RenderError::Render(format!(
+                        "backdrop group {} copies from a capture",
+                        capture.group
+                    )));
+                }
+            };
+            let Some(group_state) = surf.backdrop_groups.get_mut(&capture.group) else {
+                return Err(RenderError::Render(format!(
+                    "backdrop group {} was not registered",
+                    capture.group
+                )));
+            };
+            if group_state
+                .capture
+                .as_ref()
+                .is_none_or(|c| (c.width, c.height) != (w, h) || c.texture.format() != format)
+            {
+                let (texture, view) = create_target(
+                    &self.device,
+                    "backdrop capture",
+                    (w, h),
+                    TARGET_USAGES | wgpu::TextureUsages::COPY_DST,
+                    format,
+                );
+                group_state.capture = Some(ScratchTarget {
+                    texture,
+                    view,
+                    width: w,
+                    height: h,
+                });
+                surf.bind_gen += 1;
+            }
+        }
         // Backdrop textures for blend composites, sized like the scratch
         // pool to the largest region copied this frame.
         let mut backdrop_max = [(0u32, 0u32); 2];
@@ -2649,6 +2822,11 @@ impl GpuRenderer {
                 let slot = match pass.target {
                     Target::Surface => 0,
                     Target::Scratch(_) => 1,
+                    Target::Backdrop(_) => {
+                        return Err(RenderError::Render(
+                            "a blend backdrop copy on a capture pass".into(),
+                        ));
+                    }
                 };
                 backdrop_max[slot].0 = backdrop_max[slot].0.max(r[2]);
                 backdrop_max[slot].1 = backdrop_max[slot].1.max(r[3]);
@@ -2861,13 +3039,65 @@ impl GpuRenderer {
             let (view, texture) = match pass.target {
                 Target::Surface => (&surf.view, &surf.target),
                 Target::Scratch(i) => (&surf.scratch[i].view, &surf.scratch[i].texture),
+                Target::Backdrop(g) => {
+                    let capture = surf.backdrop_groups[&g]
+                        .capture
+                        .as_ref()
+                        .expect("capture grown above");
+                    (&capture.view, &capture.texture)
+                }
             };
+            // A backdrop-group capture first copies `pass.region` out of
+            // its `copy_from` target into the group's capture texture.
+            if let Some(capture) = pass.capture {
+                let (src, sx, sy) = match capture.copy_from {
+                    Target::Surface => (&surf.target, 0, 0),
+                    Target::Scratch(k) => (&surf.scratch[k].texture, 0, 0),
+                    Target::Backdrop(g) => {
+                        let capture = surf.backdrop_groups[&g]
+                            .capture
+                            .as_ref()
+                            .expect("capture grown above");
+                        (&capture.texture, 0, 0)
+                    }
+                };
+                debug_assert!(pass.region[0] + pass.region[2] <= src.width());
+                debug_assert!(pass.region[1] + pass.region[3] <= src.height());
+                encoder.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: src,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d {
+                            x: pass.region[0].saturating_sub(sx),
+                            y: pass.region[1].saturating_sub(sy),
+                            z: 0,
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d {
+                        width: pass.region[2],
+                        height: pass.region[3],
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
             // A blend pass reads the target's prior contents from a copy;
             // the copy must complete before the pass starts.
             if let Some([bx, by, bw, bh]) = pass.backdrop_copy {
                 let slot = match pass.target {
                     Target::Surface => 0,
                     Target::Scratch(_) => 1,
+                    Target::Backdrop(_) => {
+                        return Err(RenderError::Render(
+                            "a blend backdrop copy on a capture pass".into(),
+                        ));
+                    }
                 };
                 let backdrop = surf.backdrop[slot].as_ref().expect("grown above");
                 // The copy region is recorded in device space; a scratch
@@ -2922,13 +3152,11 @@ impl GpuRenderer {
                     name: match pass.target {
                         Target::Surface => "surface".to_string(),
                         Target::Scratch(i) => format!("scratch{i}"),
+                        Target::Backdrop(g) => format!("backdrop{g}"),
                     },
                     width: pass.region[2],
                     height: pass.region[3],
-                    format: format_name(match pass.target {
-                        Target::Surface => TARGET_FORMAT,
-                        Target::Scratch(_) => self.scratch_format,
-                    }),
+                    format: format_name(texture.format()),
                 });
             }
             let scratch_backdrop = pass.backdrop_copy.is_some();
@@ -2948,15 +3176,12 @@ impl GpuRenderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            let format_i = match pass.target {
-                Target::Surface => 0,
-                Target::Scratch(_) => 1,
-            };
+            let format_i = usize::from(texture.format() != TARGET_FORMAT);
             render_pass.set_pipeline(&self.pipelines[format_i][0][0]);
-            // Scratch passes cover only their region; the surface pass the
-            // whole target. `in.device` stays in true device space via the
-            // per-pass Globals origin.
-            if let Target::Scratch(_) = pass.target {
+            // Region-targeted passes cover only their region; the surface
+            // pass the whole target. `in.device` stays in true device
+            // space via the per-pass Globals origin.
+            if !matches!(pass.target, Target::Surface) {
                 render_pass.set_viewport(
                     0.0,
                     0.0,
@@ -2996,7 +3221,7 @@ impl GpuRenderer {
                         let backdrop = if scratch_backdrop {
                             let slot = match pass.target {
                                 Target::Surface => 0,
-                                Target::Scratch(_) => 1,
+                                Target::Scratch(_) | Target::Backdrop(_) => 1,
                             };
                             surf.backdrop[slot].as_ref().map(|b| &b.view)
                         } else {
@@ -3006,7 +3231,16 @@ impl GpuRenderer {
                             &self.device,
                             &self.layout1,
                             &self.dummy_view,
-                            range.source.map(|i| &surf.scratch[i].view),
+                            range.source.map(|s| match s {
+                                Source::Scratch(i) => &surf.scratch[i].view,
+                                Source::Backdrop(g) => {
+                                    &surf.backdrop_groups[&g]
+                                        .capture
+                                        .as_ref()
+                                        .expect("capture grown above")
+                                        .view
+                                }
+                            }),
                             backdrop,
                             range.image.as_ref().and_then(|source| match source {
                                 lower::ImageSource::Registered(id) => {
@@ -3039,8 +3273,17 @@ impl GpuRenderer {
             }
             drop(render_pass);
             if let Some((_, filter)) = surf.frame.filters.iter().find(|(pass, _)| *pass == i) {
-                let Target::Scratch(depth) = pass.target else {
-                    unreachable!("filter captures scratch");
+                let capture = match pass.target {
+                    Target::Scratch(depth) => &surf.scratch[depth],
+                    Target::Backdrop(g) => surf.backdrop_groups[&g]
+                        .capture
+                        .as_ref()
+                        .expect("capture grown above"),
+                    Target::Surface => {
+                        return Err(RenderError::Render(format!(
+                            "filter {filter:?} registered on a surface pass"
+                        )));
+                    }
                 };
                 self.filters.apply(
                     *filter,
@@ -3050,7 +3293,7 @@ impl GpuRenderer {
                         input_format: TARGET_FORMAT,
                         output_format: TARGET_FORMAT,
                     },
-                    &surf.scratch[depth],
+                    capture,
                     (pass.region[2], pass.region[3]),
                     timing,
                     &mut encoder,
@@ -3500,10 +3743,17 @@ impl GpuRenderer {
             .filters
             .iter()
             .map(|(pass, id)| {
-                let Target::Scratch(depth) = surface.frame.passes[*pass].target else {
-                    unreachable!("filter captures scratch")
+                let format = match surface.frame.passes[*pass].target {
+                    Target::Scratch(depth) => surface.scratch[depth].texture.format(),
+                    Target::Backdrop(g) => surface.backdrop_groups[&g]
+                        .capture
+                        .as_ref()
+                        .expect("capture grown above")
+                        .texture
+                        .format(),
+                    Target::Surface => TARGET_FORMAT,
                 };
-                (*id, surface.scratch[depth].texture.format())
+                (*id, format)
             })
             .collect();
         for (id, format) in uses {

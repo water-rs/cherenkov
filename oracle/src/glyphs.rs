@@ -596,6 +596,7 @@ fn node_to_item(node: Node, place: Affine, scene_rect: Rect) -> Item {
             clip: clip.map(|p| Shape::Path { path: place * p }),
             opacity: f64::from(opacity),
             blend,
+            backdrop: None,
             scroll_offset: kurbo::Vec2::ZERO,
             motion: None,
             live: Vec::new(),

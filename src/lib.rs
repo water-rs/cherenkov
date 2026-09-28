@@ -53,7 +53,7 @@ pub use crate::animation::{
 };
 pub use crate::backend::{Backend, Display, Frame, Redraw, Renderer, SurfaceFrame, SurfaceInfo};
 pub use crate::capability::{
-    Backdrop, Effects, ExternalFrames, Filters, GpuContent, HdrOutput, Planes, Runs,
+    Backdrop, BackdropChain, Effects, ExternalFrames, Filters, GpuContent, HdrOutput, Planes, Runs,
     ShaderPaint as ShaderPaintCapability, ShaderSource, Uploads,
 };
 pub use crate::color::{
@@ -82,7 +82,7 @@ pub use crate::paint::{
     ShaderId, ShaderPaint, SweepGradient, TransformedPaint,
 };
 pub use crate::record::{Content, ContentChange, Draw, Fixed, Live, Recorder, StaticRecorder};
-pub use crate::resource::{Filter, Font, FontSource, Image, Shader};
+pub use crate::resource::{BackdropGroup, BackdropSample, Filter, Font, FontSource, Image, Shader};
 pub use crate::shape::{
     ContinuousRect, EvenOdd, FillRule, PATH_TOLERANCE, PathRef, Semantic, Shape, ShapeData,
 };

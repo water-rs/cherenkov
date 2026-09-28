@@ -92,6 +92,14 @@ impl<F: Filter> Executor<F> {
         next
     }
 
+    /// The parameters' largest magnitudes over their running animations,
+    /// after the changes received so far — the values [`Self::footprint`]
+    /// evaluates `footprint_of` at.
+    #[must_use]
+    pub fn param_bounds(&mut self) -> F::Params {
+        F::Params::read_from(&self.animator.magnitude_bounds())
+    }
+
     /// The largest distance, in pixels, between an output pixel and any
     /// input texel it reads, for every value the parameters take until
     /// their running animations complete.

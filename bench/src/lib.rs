@@ -170,6 +170,13 @@ pub struct Counters {
     /// `Engine::memory()` CPU bytes at the end of the run, where the adapter
     /// exposes it; `None` for other engines.
     pub memory_cpu_bytes: Option<u64>,
+    /// `Engine::memory()` backdrop-group capture bytes at the end of the
+    /// run; `None` for other engines.
+    pub memory_backdrop_capture_bytes: Option<u64>,
+    /// `Engine::memory()` backdrop-capture texture format at the end of the
+    /// run (`null` while no capture is allocated); `None` for other
+    /// engines.
+    pub memory_backdrop_capture_format: Option<&'static str>,
 }
 
 /// Device and thermal metadata captured at measure time.

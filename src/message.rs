@@ -70,9 +70,8 @@ impl LayerId {
     }
 }
 
-/// Identifier of a backdrop group. No backend implements
-/// [`Backdrop`](crate::Backdrop) yet; the group API lands with the first
-/// backend that does.
+/// Identifier of a backdrop group, allocated per surface by
+/// [`Surface::backdrop_group`](crate::Surface::backdrop_group).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct BackdropId(u64);
 
@@ -157,9 +156,7 @@ pub enum LayerOp {
     Blend(LayerId, BlendMode),
     /// Set or clear the filter.
     Filter(LayerId, Option<FilterId>),
-    /// Set or clear the backdrop group. Part of the wire format; the
-    /// front-end setter lands with the first [`Backdrop`](crate::Backdrop)
-    /// backend.
+    /// Set or clear the backdrop group.
     Backdrop(LayerId, Option<BackdropId>),
     /// Set the layer content, or clear it.
     Content(LayerId, Option<ContentOp>),

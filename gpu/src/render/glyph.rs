@@ -266,6 +266,13 @@ pub struct Atlas {
     /// Upload assembly scratch for [`Self::upload_committed`]: the span
     /// buffer is rebuilt in place each commit instead of reallocated.
     upload_scratch: Vec<u8>,
+    /// Per-plan scratch: the dedupe sets, pending cell list and cached
+    /// cell list are rebuilt in place instead of allocated per call.
+    dedupe_glyphs: rustc_hash::FxHashSet<GlyphKey>,
+    dedupe_paths: rustc_hash::FxHashSet<u64>,
+    dedupe_masks: rustc_hash::FxHashSet<u64>,
+    plan_cells: Vec<(u32, u32)>,
+    plan_all: Vec<(u32, u32)>,
 }
 
 impl Atlas {
@@ -304,6 +311,11 @@ impl Atlas {
             mask_budget: budget / 16,
             cpu_bytes: 0,
             upload_scratch: Vec::new(),
+            dedupe_glyphs: rustc_hash::FxHashSet::default(),
+            dedupe_paths: rustc_hash::FxHashSet::default(),
+            dedupe_masks: rustc_hash::FxHashSet::default(),
+            plan_cells: Vec::new(),
+            plan_all: Vec::new(),
         }
     }
 
@@ -488,11 +500,11 @@ impl Atlas {
     /// The placement decision a pending batch's dry run supports
     /// (#169 A3): whether the live shelves take every cell, or the
     /// atlas must grow once to a target edge, or be recycled empty.
-    pub fn plan(&self, rasters: &[&PendingRaster]) -> AtlasPlan {
-        let mut cells = Vec::new();
-        self.batch_cells(rasters, &mut cells);
+    pub fn plan(&mut self, rasters: &[&PendingRaster]) -> AtlasPlan {
+        self.batch_cells(rasters);
         let mut shelves = self.shelves.clone();
-        if cells
+        if self
+            .plan_cells
             .iter()
             .all(|&(w, h)| alloc_on(&mut shelves, self.size, w, h).is_some())
         {
@@ -501,13 +513,14 @@ impl Atlas {
         // Placement failed. A grow or clear drops every cached cell, so
         // the re-lowered batch places all of them: size the grow target
         // once, for cached and pending cells together.
-        let mut all = self.cached_cells();
-        all.extend_from_slice(&cells);
+        self.cached_cells();
+        self.plan_all.extend_from_slice(&self.plan_cells);
         let mut size = self.size;
         while size < self.cap {
             size = (size * 2).min(self.cap);
             let mut shelves = Vec::new();
-            if all
+            if self
+                .plan_all
                 .iter()
                 .all(|&(w, h)| alloc_on(&mut shelves, size, w, h).is_some())
             {
@@ -518,35 +531,38 @@ impl Atlas {
     }
 
     /// Cells `rasters` still need beyond the live caches, in commit
-    /// order. Keys repeated inside the batch resolve to the first
-    /// store, exactly as the commit's cache inserts do.
-    fn batch_cells(&self, rasters: &[&PendingRaster], cells: &mut Vec<(u32, u32)>) {
-        let mut glyphs = rustc_hash::FxHashSet::default();
-        let mut paths = rustc_hash::FxHashSet::default();
-        let mut masks = rustc_hash::FxHashSet::default();
+    /// order, pooled into `plan_cells`. Keys repeated inside the batch
+    /// resolve to the first store, exactly as the commit's cache
+    /// inserts do.
+    fn batch_cells(&mut self, rasters: &[&PendingRaster]) {
+        self.dedupe_glyphs.clear();
+        self.dedupe_paths.clear();
+        self.dedupe_masks.clear();
+        self.plan_cells.clear();
         for raster in rasters {
             match raster {
                 PendingRaster::Glyph { key, w, h, .. } => {
-                    if self.get(key).is_some() || !glyphs.insert(*key) {
+                    if self.get(key).is_some() || !self.dedupe_glyphs.insert(*key) {
                         continue;
                     }
                     if *w > 0 {
-                        cells.push((*w, *h));
+                        self.plan_cells.push((*w, *h));
                     }
                 }
                 PendingRaster::Path {
                     key, cells: texels, ..
                 } => {
-                    if self.paths.contains_key(key) || !paths.insert(*key) {
+                    if self.paths.contains_key(key) || !self.dedupe_paths.insert(*key) {
                         continue;
                     }
-                    cells.extend(texels.iter().map(|&(w, h, _)| (w, h)));
+                    self.plan_cells
+                        .extend(texels.iter().map(|&(w, h, _)| (w, h)));
                 }
                 PendingRaster::Mask { key, w, h, .. } => {
-                    if self.masks.contains_key(key) || !masks.insert(*key) {
+                    if self.masks.contains_key(key) || !self.dedupe_masks.insert(*key) {
                         continue;
                     }
-                    cells.push((*w, *h));
+                    self.plan_cells.push((*w, *h));
                 }
                 PendingRaster::MaskTexture { .. } | PendingRaster::Colr { .. } => {}
             }
@@ -560,28 +576,27 @@ impl Atlas {
         clippy::cast_sign_loss,
         reason = "cell rects and mask sizes are small positive floats"
     )]
-    fn cached_cells(&self) -> Vec<(u32, u32)> {
-        let mut cells = Vec::with_capacity(self.map.len());
+    fn cached_cells(&mut self) {
+        self.plan_all.clear();
         for entry in self.map.values() {
             if entry.w > 0 {
-                cells.push((u32::from(entry.w), u32::from(entry.h)));
+                self.plan_all.push((u32::from(entry.w), u32::from(entry.h)));
             }
         }
         for emit in self.paths.values() {
             for cell in &emit.cells {
-                cells.push((
+                self.plan_all.push((
                     (cell.rect[2] - cell.rect[0]).round().max(0.0) as u32,
                     (cell.rect[3] - cell.rect[1]).round().max(0.0) as u32,
                 ));
             }
         }
         for mask in self.masks.values() {
-            cells.push((
+            self.plan_all.push((
                 mask.size[0].ceil().max(0.0) as u32,
                 mask.size[1].ceil().max(0.0) as u32,
             ));
         }
-        cells
     }
 
     /// The atlas edge in texels.

@@ -3154,8 +3154,8 @@ fn run() -> Result<(), SceneError> {
             (14.0, corpus::BITMAP_EMOJI),
             (24.0, corpus::BITMAP_EMOJI),
             (40.0, corpus::BITMAP_EMOJI),
-            (72.0, corpus::BITMAP_EMOJI),
-            (120.0, "\u{1F600}\u{2764}"),
+            (72.0, "\u{2615}\u{26A0}\u{26A1}"),
+            (104.0, "\u{1F600}\u{2764}"),
         ];
         let rows: Vec<Vec<GlyphRun>> = specs
             .iter()
@@ -3168,7 +3168,7 @@ fn run() -> Result<(), SceneError> {
             360,
             bitmap_white,
             |l| {
-                for (runs, y) in rows.iter().zip([0.0, 30.0, 68.0, 126.0, 220.0]) {
+                for (runs, y) in rows.iter().zip([0.0, 24.0, 58.0, 112.0, 204.0]) {
                     l.layer(|row| {
                         row.transform(Affine::translate((0.0, y)));
                         for run in runs {
@@ -3202,7 +3202,7 @@ fn run() -> Result<(), SceneError> {
         let blobs = font_blobs(&ctx, &[&first, &second]);
         corpus.scene_with_blobs(
             name,
-            360,
+            400,
             280,
             bitmap_white,
             |l| {
@@ -3210,7 +3210,7 @@ fn run() -> Result<(), SceneError> {
                     rotated.transform(
                         Affine::translate((40.0, 30.0))
                             * Affine::rotate(15_f64.to_radians())
-                            * Affine::scale_non_uniform(1.5, 0.8),
+                            * Affine::scale_non_uniform(1.2, 0.8),
                     );
                     for run in &first {
                         rotated.glyphs(run.clone());

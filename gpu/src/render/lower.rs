@@ -20,8 +20,8 @@ use crate::render::filter::FilterKey;
 use crate::render::glyph::{self, Atlas, FontData, MaskCell, PathEmit, PendingRaster, glyph_key};
 use crate::render::instance::{
     FLAG_HAS_CLIP, FLAG_HAS_INNER, FLAG_HAS_MASK, FLAG_MASK_TEXTURE, Globals, Instance, KIND_FILL,
-    KIND_GLYPH, KIND_SHADOW, KIND_SPAN, KIND_STROKE_DIST, KIND_STROKE_OFFSET, PAINT_SOLID,
-    PAINT_TEXTURE, Shape, Stop, affine, blend_code,
+    KIND_GLYPH, KIND_SHADOW, KIND_SPAN, KIND_STROKE_DIST, KIND_STROKE_OFFSET, PAINT_IMAGE,
+    PAINT_SOLID, PAINT_TEXTURE, Shape, Stop, affine, blend_code,
 };
 use crate::render::path;
 
@@ -72,6 +72,7 @@ pub enum ShaderVariant {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ImageSource {
     Registered(u64),
+    Bitmap(super::bitmap::BitmapKey),
     Content(LayerId),
     Shader(std::sync::Arc<super::paint::Key>),
     /// A retained external frame bound to `LayerId`: the range draws the
@@ -564,6 +565,8 @@ pub struct GlyphContext<'a> {
     pub fonts: &'a HashMap<u64, FontData>,
     /// Registered images, for dimension lookup during lowering.
     pub images: &'a HashMap<u64, GpuImage>,
+    /// Decoded bitmap glyph textures.
+    pub bitmaps: &'a HashMap<super::bitmap::BitmapKey, super::GpuBitmap>,
     pub content: &'a HashMap<LayerId, super::gpu_content::Slot>,
     /// Retained external frames, for the emitted quad's plane size.
     pub external: &'a HashMap<LayerId, super::external::Slot>,
@@ -2285,6 +2288,13 @@ impl<'a> Lowering<'a> {
                 self.transform *= *local;
                 self.glyph_run(run.get(source), paint, glyphs)?;
             }
+            Op::BitmapGlyph {
+                local,
+                font,
+                glyph,
+                origin,
+                size,
+            } => self.bitmap_glyph(*local, *font, *glyph, *origin, *size, glyphs)?,
             _ => unreachable!("scope is composed, never realized as a leaf"),
         }
         Ok(())
@@ -2309,6 +2319,121 @@ impl<'a> Lowering<'a> {
             paint,
             glyphs,
         )
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn bitmap_glyph(
+        &mut self,
+        local: Affine,
+        font_id: u64,
+        glyph_id: u32,
+        origin: [f32; 2],
+        size: f32,
+        glyphs: &GlyphContext<'_>,
+    ) -> Result<(), RenderError> {
+        let font = glyphs
+            .fonts
+            .get(&font_id)
+            .ok_or_else(|| RenderError::Font(format!("unregistered font {font_id}")))?;
+        let bitmap_font = font
+            .bitmap
+            .as_ref()
+            .ok_or_else(|| RenderError::Font("bitmap glyph has no bitmap font".into()))?;
+        let transform = self.transform * local;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "bitmap strike metadata uses f32 ppem"
+        )]
+        let device_ppem = (f64::from(size) * path::sigma_max(transform)) as f32;
+        let strike = bitmap_font.select(device_ppem);
+        let key = super::bitmap::BitmapKey {
+            font: font_id,
+            strike,
+            glyph: glyph_id,
+        };
+        let (em, width, height) = if let Some(bitmap) = glyphs.bitmaps.get(&key) {
+            (bitmap.em, bitmap.image.width, bitmap.image.height)
+        } else if let Some((em, width, height)) = self.pending.iter().find_map(|raster| {
+            let PendingRaster::Bitmap {
+                key: pending_key,
+                em,
+                width,
+                height,
+                ..
+            } = raster
+            else {
+                return None;
+            };
+            (*pending_key == key).then_some((*em, *width, *height))
+        }) {
+            (em, width, height)
+        } else {
+            let Some(decoded) =
+                super::bitmap::decode(&font.data, font.index, bitmap_font, strike, glyph_id)?
+            else {
+                return Ok(());
+            };
+            let em = decoded.em;
+            let (width, height) = (decoded.width, decoded.height);
+            let texels = super::image_texels(
+                &decoded.rgba,
+                cherenkov::ImageColorSpace::Srgb,
+                decoded.premultiplied,
+            );
+            self.pending.push(PendingRaster::Bitmap {
+                key,
+                em,
+                width,
+                height,
+                texels,
+            });
+            self.glyphs += 1;
+            (em, width, height)
+        };
+        let rect = Rect::new(
+            f64::from(origin[0]) + f64::from(size) * em.x0,
+            f64::from(origin[1]) + f64::from(size) * em.y0,
+            f64::from(origin[0]) + f64::from(size) * em.x1,
+            f64::from(origin[1]) + f64::from(size) * em.y1,
+        );
+        if rect.width() <= 0.0 || rect.height() <= 0.0 {
+            return Ok(());
+        }
+        let Some(boxed) = box_shape(&ShapeData::Rect(rect))? else {
+            return Ok(());
+        };
+        let to_device = transform * boxed.extra;
+        let margin = self.margin(transform);
+        let bounds = boxed.bounds.inflate(margin, margin);
+        let mut inst = self.base(KIND_FILL, affine(to_device));
+        inst.bounds = [
+            f32_f64(bounds.x0),
+            f32_f64(bounds.y0),
+            f32_f64(bounds.x1),
+            f32_f64(bounds.y1),
+        ];
+        inst.shape = boxed.shape;
+        inst.meta[1] = PAINT_IMAGE;
+        let bitmap_transform = Affine::translate((rect.x0, rect.y0))
+            * Affine::scale_non_uniform(
+                rect.width() / f64::from(width),
+                rect.height() / f64::from(height),
+            );
+        let [a, b, c, d, e, f] = (boxed.extra.inverse() * bitmap_transform)
+            .inverse()
+            .as_coeffs();
+        inst.grad = [f32_f64(a), f32_f64(b), f32_f64(c), f32_f64(d)];
+        inst.grad2 = [
+            f32_f64(e),
+            f32_f64(f),
+            f32_f64(f64::from(width)),
+            f32_f64(f64::from(height)),
+        ];
+        inst.meta[3] |= super::instance::EXTEND_PAD | (super::instance::EXTEND_PAD << 4) | (1 << 8);
+        self.set_image(Some(ImageSource::Bitmap(key)));
+        self.push_shaped(inst, to_device, boxed.bounds, margin);
+        Ok(())
     }
 
     /// A following opaque box hides a rectangle inside each pair of its corner rows.
@@ -3208,6 +3333,7 @@ mod tests {
         let atlas = Atlas::new(&device, u64::MAX);
         let fonts = HashMap::new();
         let images = HashMap::new();
+        let bitmaps = HashMap::new();
         let mut frame = Frame::default();
         let mut lowering = Lowering::new(&mut frame, (64, 64));
         lowering.begin_pass(Target::Surface, None);
@@ -3215,6 +3341,7 @@ mod tests {
             atlas: &atlas,
             fonts: &fonts,
             images: &images,
+            bitmaps: &bitmaps,
             content: &HashMap::new(),
             external: &HashMap::new(),
         };
@@ -3295,10 +3422,12 @@ mod tests {
         let atlas = Atlas::new(&device, u64::MAX);
         let fonts = HashMap::new();
         let images = HashMap::new();
+        let bitmaps = HashMap::new();
         let glyphs = GlyphContext {
             atlas: &atlas,
             fonts: &fonts,
             images: &images,
+            bitmaps: &bitmaps,
             content: &HashMap::new(),
             external: &HashMap::new(),
         };
@@ -3362,10 +3491,12 @@ mod tests {
         let atlas = Atlas::new(&device, u64::MAX);
         let fonts = HashMap::new();
         let images = HashMap::new();
+        let bitmaps = HashMap::new();
         let glyphs = GlyphContext {
             atlas: &atlas,
             fonts: &fonts,
             images: &images,
+            bitmaps: &bitmaps,
             content: &HashMap::new(),
             external: &HashMap::new(),
         };
@@ -3467,10 +3598,12 @@ mod tests {
         let atlas = Atlas::new(&device, u64::MAX);
         let fonts = HashMap::new();
         let images = HashMap::new();
+        let bitmaps = HashMap::new();
         let glyphs = GlyphContext {
             atlas: &atlas,
             fonts: &fonts,
             images: &images,
+            bitmaps: &bitmaps,
             content: &HashMap::new(),
             external: &HashMap::new(),
         };

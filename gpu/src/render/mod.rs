@@ -1,6 +1,7 @@
 //! The render thread: sole owner of GPU state.
 
 mod bindings;
+mod bitmap;
 mod colr;
 pub mod diag;
 mod external;
@@ -25,6 +26,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use crate::{GpuConfig, GpuInfo, GpuTarget, ScratchFormat, TimestampSupport, names};
+use bitmap::BitmapKey;
 use cherenkov::{
     ContentOp, EngineError, FontData as EngineFontData, FontId, Frame, FrameId, FrameStats,
     FrameTiming, ImageId, ImageUpload, LayerId, MemoryUsage, PassTiming, Pressure, Readback,
@@ -134,6 +136,11 @@ pub struct GpuImage {
     pub width: u32,
     /// Height in texels.
     pub height: u32,
+}
+
+pub(super) struct GpuBitmap {
+    pub(super) image: GpuImage,
+    pub(super) em: kurbo::Rect,
 }
 
 /// One surface's GPU-side state.
@@ -370,6 +377,7 @@ pub struct GpuRenderer {
     fonts: HashMap<u64, FontData>,
     /// Registered images.
     images: HashMap<u64, GpuImage>,
+    bitmaps: HashMap<BitmapKey, GpuBitmap>,
     /// Bumped on every `images` insert/remove — every cached group-1
     /// bind group samples an image view, so an image change rebuilds them.
     images_gen: u64,
@@ -1282,6 +1290,7 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             surfaces: HashMap::new(),
             fonts: HashMap::new(),
             images: HashMap::new(),
+            bitmaps: HashMap::new(),
             images_gen: 0,
             timestamps,
             query_set,
@@ -1493,6 +1502,7 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
         surfaces: HashMap::new(),
         fonts: HashMap::new(),
         images: HashMap::new(),
+        bitmaps: HashMap::new(),
         images_gen: 0,
         timestamps,
         query_set,
@@ -1525,24 +1535,23 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
     ))
 }
 
-/// Validates font data with `skrifa`, rejecting bitmap-only colour fonts.
+/// Validates font data and detects native colour-glyph formats.
 ///
-/// `COLR` fonts render through the colour-glyph lowering; fonts carrying
-/// `CBDT`/`CBLC` or `sbix` bitmaps without outline glyphs cannot
-/// rasterize.
-fn validate_font(data: &[u8], index: u32) -> Result<bool, ResourceError> {
-    use skrifa::MetadataProvider as _;
+/// `COLR` fonts render through the colour-glyph lowering; supported sbix and
+/// CBDT/CBLC glyphs are decoded as images at realization.
+fn validate_font(
+    data: &[u8],
+    index: u32,
+) -> Result<(bool, Option<Arc<bitmap::BitmapFont>>), ResourceError> {
     use skrifa::raw::TableProvider as _;
     let font = skrifa::FontRef::from_index(data, index)
         .map_err(|e| ResourceError::Font(format!("{e}")))?;
-    if font.outline_glyphs().iter().next().is_none()
-        && [skrifa::Tag::new(b"CBDT"), skrifa::Tag::new(b"sbix")]
-            .iter()
-            .any(|tag| font.data_for_tag(*tag).is_some())
-    {
+    if font.data_for_tag(skrifa::Tag::new(b"SVG ")).is_some() {
         return Err(ResourceError::Unsupported(names::COLOR_FONT));
     }
-    Ok(font.colr().is_ok())
+    let has_colr = font.colr().is_ok();
+    let bitmap = bitmap::BitmapFont::detect(data, index)?.map(Arc::new);
+    Ok((has_colr, bitmap))
 }
 
 impl Renderer for GpuRenderer {
@@ -1770,13 +1779,14 @@ impl Renderer for GpuRenderer {
     }
 
     fn add_font(&mut self, id: FontId, font: EngineFontData) -> Result<(), ResourceError> {
-        let has_colr = validate_font(&font.data, font.index)?;
+        let (has_colr, bitmap) = validate_font(&font.data, font.index)?;
         self.fonts.insert(
             id.raw(),
             FontData {
                 data: font.data,
                 index: font.index,
                 has_colr,
+                bitmap,
                 colr: std::cell::RefCell::new(HashMap::new()),
             },
         );
@@ -1785,6 +1795,8 @@ impl Renderer for GpuRenderer {
 
     fn remove_font(&mut self, id: FontId) {
         self.fonts.remove(&id.raw());
+        self.bitmaps.retain(|key, _| key.font != id.raw());
+        self.images_gen += 1;
         for surface in self.surfaces.values_mut() {
             for content in surface.layers.values_mut() {
                 content.invalidate();
@@ -2031,6 +2043,8 @@ impl Renderer for GpuRenderer {
             return;
         }
         self.atlas.clear();
+        self.bitmaps.clear();
+        self.images_gen += 1;
         for font in self.fonts.values() {
             font.colr.borrow_mut().clear();
         }
@@ -2121,6 +2135,11 @@ impl Renderer for GpuRenderer {
                 .images
                 .values()
                 .map(|i| u64::from(i.width) * u64::from(i.height) * 8)
+                .sum::<u64>()
+            + self
+                .bitmaps
+                .values()
+                .map(|bitmap| u64::from(bitmap.image.width) * u64::from(bitmap.image.height) * 8)
                 .sum::<u64>();
         let captures = self
             .surfaces
@@ -3057,7 +3076,7 @@ impl GpuRenderer {
                 .map(|surf| surf.backdrop_info(&mut self.filters))
                 .collect();
             let mut results: Vec<Result<Lowered, RenderError>> = if pending.len() > 1 {
-                let (atlas, images) = (&self.atlas, &self.images);
+                let (atlas, images, bitmaps) = (&self.atlas, &self.images, &self.bitmaps);
                 // `FontData`'s COLR cache is a `RefCell` — !Sync — so
                 // each worker moves in its own snapshot built here.
                 let snapshots: Vec<HashMap<u64, FontData>> = pending
@@ -3077,7 +3096,9 @@ impl GpuRenderer {
                         .zip(&group_maps)
                         .map(|(((surf, fonts), frame), groups)| {
                             s.spawn(move || {
-                                Self::lower_content(surf, frame, atlas, &fonts, images, groups)
+                                Self::lower_content(
+                                    surf, frame, atlas, &fonts, images, bitmaps, groups,
+                                )
                             })
                         })
                         .collect::<Vec<_>>()
@@ -3097,6 +3118,7 @@ impl GpuRenderer {
                             &self.atlas,
                             &self.fonts,
                             &self.images,
+                            &self.bitmaps,
                             groups,
                         )
                     })
@@ -3154,7 +3176,15 @@ impl GpuRenderer {
                 .zip(frames)
                 .zip(&group_maps)
                 .map(|((surf, frame), groups)| {
-                    Self::lower_content(surf, frame, &self.atlas, &self.fonts, &self.images, groups)
+                    Self::lower_content(
+                        surf,
+                        frame,
+                        &self.atlas,
+                        &self.fonts,
+                        &self.images,
+                        &self.bitmaps,
+                        groups,
+                    )
                 })
                 .collect();
             // The batch's pending rasters commit transactionally
@@ -3197,6 +3227,7 @@ impl GpuRenderer {
         atlas: &Atlas,
         fonts: &HashMap<u64, FontData>,
         images: &HashMap<u64, GpuImage>,
+        bitmaps: &HashMap<BitmapKey, GpuBitmap>,
         groups: &HashMap<u64, BackdropGroupInfo>,
     ) -> Result<Lowered, RenderError> {
         surf.frame.reset();
@@ -3209,6 +3240,7 @@ impl GpuRenderer {
                 atlas,
                 fonts,
                 images,
+                bitmaps,
                 content: &surf.content,
                 external: &surf.external,
             };
@@ -3428,6 +3460,26 @@ impl GpuRenderer {
             PendingRaster::Colr { font, key, picture } => {
                 if let Some(font) = self.fonts.get_mut(&font) {
                     font.colr.borrow_mut().entry(key).or_insert(picture);
+                }
+                Ok(PendingOrigin::None)
+            }
+            PendingRaster::Bitmap {
+                key,
+                em,
+                width,
+                height,
+                texels,
+            } => {
+                if !self.bitmaps.contains_key(&key) {
+                    let image = create_gpu_image(
+                        &self.device,
+                        &self.queue,
+                        "bitmap glyph",
+                        width,
+                        height,
+                        &texels,
+                    );
+                    self.bitmaps.insert(key, GpuBitmap { image, em });
                 }
                 Ok(PendingOrigin::None)
             }
@@ -4256,6 +4308,9 @@ impl GpuRenderer {
                                 lower::ImageSource::Registered(id) => {
                                     self.images.get(id).map(|image| &image.view)
                                 }
+                                lower::ImageSource::Bitmap(key) => {
+                                    self.bitmaps.get(key).map(|bitmap| &bitmap.image.view)
+                                }
                                 lower::ImageSource::Shader(key) => {
                                     Some(&surf.shader_textures[key].image.view)
                                 }
@@ -4790,6 +4845,104 @@ fn image_texels_f16(image: &ImageUpload) -> Result<Vec<u8>, ResourceError> {
         }
     }
     Ok(data)
+}
+
+fn image_texels(
+    pixels: &[u8],
+    color_space: cherenkov::ImageColorSpace,
+    premultiplied: bool,
+) -> Vec<u8> {
+    let mut data = Vec::with_capacity(pixels.len() * 2);
+    for px in pixels.as_chunks::<4>().0 {
+        let a = f64::from(px[3]) / 255.0;
+        let decode = |v: u8| {
+            if premultiplied && a > 0.0 {
+                ((f64::from(v) / 255.0) / a).min(1.0)
+            } else {
+                f64::from(v) / 255.0
+            }
+        };
+        let lin = match color_space {
+            cherenkov::ImageColorSpace::LinearSrgb | cherenkov::ImageColorSpace::LinearP3 => {
+                [decode(px[0]), decode(px[1]), decode(px[2])]
+            }
+            _ => [
+                srgb_decode_u8_f64(decode(px[0])),
+                srgb_decode_u8_f64(decode(px[1])),
+                srgb_decode_u8_f64(decode(px[2])),
+            ],
+        };
+        let lin_p3 = match color_space {
+            cherenkov::ImageColorSpace::Srgb | cherenkov::ImageColorSpace::LinearSrgb => {
+                let [x, y, z] = [
+                    SRGB_TO_XYZ[0][2].mul_add(
+                        lin[2],
+                        SRGB_TO_XYZ[0][1].mul_add(lin[1], SRGB_TO_XYZ[0][0] * lin[0]),
+                    ),
+                    SRGB_TO_XYZ[1][2].mul_add(
+                        lin[2],
+                        SRGB_TO_XYZ[1][1].mul_add(lin[1], SRGB_TO_XYZ[1][0] * lin[0]),
+                    ),
+                    SRGB_TO_XYZ[2][2].mul_add(
+                        lin[2],
+                        SRGB_TO_XYZ[2][1].mul_add(lin[1], SRGB_TO_XYZ[2][0] * lin[0]),
+                    ),
+                ];
+                [
+                    XYZ_TO_P3[0][2].mul_add(z, XYZ_TO_P3[0][1].mul_add(y, XYZ_TO_P3[0][0] * x)),
+                    XYZ_TO_P3[1][2].mul_add(z, XYZ_TO_P3[1][1].mul_add(y, XYZ_TO_P3[1][0] * x)),
+                    XYZ_TO_P3[2][2].mul_add(z, XYZ_TO_P3[2][1].mul_add(y, XYZ_TO_P3[2][0] * x)),
+                ]
+            }
+            cherenkov::ImageColorSpace::DisplayP3 | cherenkov::ImageColorSpace::LinearP3 => lin,
+        };
+        for v in [a * lin_p3[0], a * lin_p3[1], a * lin_p3[2], a] {
+            data.extend_from_slice(&half::f16::from_f64(v).to_le_bytes());
+        }
+    }
+    data
+}
+
+fn create_gpu_image(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &'static str,
+    width: u32,
+    height: u32,
+    texels: &[u8],
+) -> GpuImage {
+    let (texture, view) = create_target(
+        device,
+        label,
+        (width, height),
+        wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        TARGET_FORMAT,
+    );
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        texels,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(width * 8),
+            rows_per_image: Some(height),
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    GpuImage {
+        texture,
+        view,
+        width,
+        height,
+    }
 }
 
 fn srgb_decode_u8_f64(v: f64) -> f64 {

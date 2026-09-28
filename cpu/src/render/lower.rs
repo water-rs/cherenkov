@@ -1461,10 +1461,10 @@ impl<'a, 'b> Lowering<'a, 'b> {
                 .expect("inserted bitmap is present in the cache")
         };
         let rect = Rect::new(
-            f64::from(origin[0]) + f64::from(size) * bitmap.em.x0,
-            f64::from(origin[1]) + f64::from(size) * bitmap.em.y0,
-            f64::from(origin[0]) + f64::from(size) * bitmap.em.x1,
-            f64::from(origin[1]) + f64::from(size) * bitmap.em.y1,
+            f64::from(size).mul_add(bitmap.em.x0, f64::from(origin[0])),
+            f64::from(size).mul_add(bitmap.em.y0, f64::from(origin[1])),
+            f64::from(size).mul_add(bitmap.em.x1, f64::from(origin[0])),
+            f64::from(size).mul_add(bitmap.em.y1, f64::from(origin[1])),
         );
         let image_transform = Affine::translate((rect.x0, rect.y0))
             * Affine::scale_non_uniform(

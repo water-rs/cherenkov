@@ -141,7 +141,7 @@ pub struct GpuImage {
     pub height: u32,
 }
 
-pub(super) struct GpuBitmap {
+pub struct GpuBitmap {
     pub(super) image: GpuImage,
     pub(super) em: kurbo::Rect,
 }

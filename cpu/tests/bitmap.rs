@@ -101,31 +101,31 @@ fn image_source(
     let BitmapData::Png(png_bytes) = &glyph.data else {
         panic!("fixture uses PNG payloads");
     };
-    let mut decoder = png::Decoder::new(std::io::Cursor::new(png_bytes.as_ref()));
-    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
-    let mut reader = decoder.read_info().expect("PNG");
-    let mut decoded = vec![0; reader.output_buffer_size().expect("PNG output size")];
-    let info = reader.next_frame(&mut decoded).expect("PNG frame");
-    decoded.truncate(info.buffer_size());
+    let mut png_decoder = png::Decoder::new(std::io::Cursor::new(png_bytes));
+    png_decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut png_reader = png_decoder.read_info().expect("PNG");
+    let mut rgba_bytes = vec![0; png_reader.output_buffer_size().expect("PNG output size")];
+    let info = png_reader.next_frame(&mut rgba_bytes).expect("PNG frame");
+    rgba_bytes.truncate(info.buffer_size());
     let rgba = match info.color_type {
-        png::ColorType::Rgba => decoded,
-        png::ColorType::Rgb => decoded
+        png::ColorType::Rgba => rgba_bytes,
+        png::ColorType::Rgb => rgba_bytes
             .as_chunks::<3>()
             .0
             .iter()
             .flat_map(|pixel| [pixel[0], pixel[1], pixel[2], 255])
             .collect(),
-        png::ColorType::Grayscale => decoded
+        png::ColorType::Grayscale => rgba_bytes
             .iter()
             .flat_map(|&gray| [gray, gray, gray, 255])
             .collect(),
-        png::ColorType::GrayscaleAlpha => decoded
+        png::ColorType::GrayscaleAlpha => rgba_bytes
             .as_chunks::<2>()
             .0
             .iter()
             .flat_map(|pixel| [pixel[0], pixel[0], pixel[0], pixel[1]])
             .collect(),
-        other => panic!("unexpected fixture PNG format {other:?}"),
+        other @ png::ColorType::Indexed => panic!("unexpected fixture PNG format {other:?}"),
     };
     let upem = f64::from(font.head().expect("head").units_per_em());
     let x0 = f64::from(glyph.bearing_x) / upem
@@ -139,10 +139,10 @@ fn image_source(
         Origin::BottomLeft => (-y - height, -y),
     };
     let rect = Rect::new(
-        24.0 + f64::from(size) * x0,
-        112.0 + f64::from(size) * y0,
-        24.0 + f64::from(size) * (x0 + width),
-        112.0 + f64::from(size) * y1,
+        f64::from(size).mul_add(x0, 24.0),
+        f64::from(size).mul_add(y0, 112.0),
+        f64::from(size).mul_add(x0 + width, 24.0),
+        f64::from(size).mul_add(y1, 112.0),
     );
     (
         ImageData::<Rgba8>::new(glyph.width, glyph.height, rgba)
@@ -152,6 +152,10 @@ fn image_source(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one helper checks equivalence across font, strike, size, and transform"
+)]
 fn equivalent(
     engine: &Engine<Raster>,
     font: &cherenkov::Font,

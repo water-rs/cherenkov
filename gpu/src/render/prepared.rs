@@ -1249,6 +1249,10 @@ impl Lowerer<'_> {
         });
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "COLR and bitmap glyph handling share run ordering and flush logic"
+    )]
     fn color_glyph_run(
         &mut self,
         ambient: Affine,

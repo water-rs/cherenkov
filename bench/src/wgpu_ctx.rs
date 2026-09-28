@@ -246,6 +246,9 @@ impl Target {
 ///
 /// # Errors
 /// [`BenchError::Gpu`] on buffer map failure.
+///
+/// # Panics
+/// Panics if a successfully mapped buffer cannot provide its mapped range.
 pub fn readback(gpu: &Gpu, target: &Target) -> Result<F32Image, BenchError> {
     let bytes_per_row = (target.width * 4).div_ceil(256) * 256;
     let buf = gpu.device.create_buffer(&BufferDescriptor {
@@ -434,6 +437,9 @@ pub fn drain_and_stamp(gpu: &Gpu, index: u32) -> Result<(), BenchError> {
 ///
 /// # Errors
 /// [`BenchError::Gpu`] on buffer map failure.
+///
+/// # Panics
+/// Panics if a successfully mapped buffer cannot provide its mapped range.
 #[expect(
     clippy::cast_precision_loss,
     reason = "a tick delta of a timed frame fits f64 mantissa"

@@ -409,17 +409,16 @@ impl Renderer for RasterRenderer {
         categories.glyphs = self.glyph_cache.bytes();
         categories.images = self.images.values().map(|image| image.bytes()).sum();
         categories.colr = self.fonts.values().map(font::Font::colr_bytes).sum();
-        if std::env::var_os("CHERENKOV_CPU_MEMORY").is_some() {
-            eprintln!(
-                "cherenkov-cpu memory: output={} bands={} retained={} images={} glyphs={} colr={}",
-                categories.output,
-                categories.bands,
-                categories.retained,
-                categories.images,
-                categories.glyphs,
-                categories.colr,
-            );
-        }
+        tracing::debug!(
+            target: "cherenkov_cpu::memory",
+            output = categories.output,
+            bands = categories.bands,
+            retained = categories.retained,
+            images = categories.images,
+            glyphs = categories.glyphs,
+            colr = categories.colr,
+            "memory usage",
+        );
         MemoryUsage {
             gpu: cherenkov::Bytes(0),
             cpu: cherenkov::Bytes(categories.total()),

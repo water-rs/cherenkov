@@ -9,11 +9,19 @@ contract; the per-decision log is issue #2.
 ## Correctness
 
 - **The oracle is the reference.** The corpus (`scenes/corpus`) is rendered
-  against the independent f64 oracle. The original 83 scenes keep bit-identical
+  against the independent f64 oracle. Every scene on dev keeps bit-identical
   metrics and PNG bytes across every change that is not meant to change pixels.
   A change that intends to change pixels (for example #71) must be no worse
   than dev against the oracle on every scene, and better overall.
 - **Every new capability gets corpus scenes** on each backend that claims it.
+- **Wide gamut and HDR are part of correctness.** The working space is
+  extended linear Display P3, and every feature family is tested with P3-only
+  colours and with values above SDR white (#99). Metrics compare in P3 and
+  never clip gamut or range away before measuring. What a user sees goes
+  through the presentation pass (gamut mapping, tone mapping to the display
+  headroom, extended output), and that pass is measured against the oracle
+  too (#100). An engine or target that cannot carry the colours is reported
+  as unsupported, never compared on a clipped image.
 - **Visual review is done by eye.** Images are reviewed by looking at them,
   never by pixel-count, brightness or dominant-colour heuristics.
 - **Fail fast.** An unsupported case returns an explicit `Unsupported` error,
@@ -39,8 +47,14 @@ contract; the per-decision log is issue #2.
   interleaved A/B rounds with per-round results: the Apple M1, the iPad Pro M4
   (Metal) and the Pixel 9 Pro (Vulkan). The iPad's GPU clock is bimodal with
   device state.
-- **Memory is a first-class cost.** A cache or retained structure has to pay
-  for its memory in measured time or energy.
+- **Memory is a first-class cost, measured like time.** A cache or retained
+  structure has to pay for its memory in measured time or energy. Every
+  change reports the steady-state `Engine::memory()` (GPU and CPU) of the five
+  perf scenes against dev; it is deterministic, so any increase is explained
+  in the pull request. Cross-engine comparisons include memory: engine-reported
+  GPU bytes and the process footprint (`phys_footprint` on Apple, PSS plus
+  graphics memory on Android), steady and peak (#101). A scene is not won if it
+  is won by spending more memory.
 
 ## Platform
 

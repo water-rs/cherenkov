@@ -463,7 +463,7 @@ impl Renderer {
                 None | Some(cherenkov_scene::BackdropEffectSpec::ColorMatrix { .. }) => None,
                 Some(_) => Some(
                     crate::sdf::box_params(clip)
-                        .map(|(shape, extra)| (shape, (tf * extra).inverse()))
+                        .map(|(shape, extra)| (shape, tf * extra))
                         .ok_or_else(|| {
                             RenderError::Backdrop("backdrop-effect-sdf-path".to_string())
                         })?,
@@ -735,7 +735,7 @@ impl Renderer {
 
 /// The member's backdrop composite at device pixel centre `p`: the
 /// per-member effect's sample of the filtered capture, before coverage and
-/// opacity. `sdf_clip` is the member clip's box shape and device →
+/// opacity. `sdf_clip` is the member clip's box shape and box →
 /// box-local inverse, `Some` whenever the effect reads the clip's SDF.
 #[allow(clippy::many_single_char_names)] // p/q/c/t/d/n name points and pixel values
 #[expect(
@@ -780,8 +780,8 @@ fn sample_backdrop(
             ]
         }
         Some(E::Refraction { depth, strength }) => {
-            let (shape, clip_inv) = sdf_clip.expect("SDF effects carry a box clip");
-            let (d, n) = crate::sdf::distance_and_normal(shape, clip_inv, p);
+            let (shape, clip_tf) = sdf_clip.expect("SDF effects carry a box clip");
+            let (d, n) = crate::sdf::distance_and_normal(shape, clip_tf, p);
             let t = (1.0 + d / depth).clamp(0.0, 1.0);
             let q = [
                 (-n[0] * strength).mul_add(t * t, p[0]),
@@ -794,8 +794,8 @@ fn sample_backdrop(
             color,
             gain,
         }) => {
-            let (shape, clip_inv) = sdf_clip.expect("SDF effects carry a box clip");
-            let (d, _) = crate::sdf::distance_and_normal(shape, clip_inv, p);
+            let (shape, clip_tf) = sdf_clip.expect("SDF effects carry a box clip");
+            let (d, _) = crate::sdf::distance_and_normal(shape, clip_tf, p);
             let t = (1.0 + d / rim_w).clamp(0.0, 1.0);
             let mut c = crate::sdf::bilinear(capture, width, height, p);
             let k = color[3] * gain * t * t;

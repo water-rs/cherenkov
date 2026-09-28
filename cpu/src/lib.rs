@@ -150,6 +150,8 @@ pub enum BandPixels<'a> {
     F16(&'a [[half::f16; 4]]),
 }
 
+pub use render::present::present_srgb8;
+
 /// The CPU raster backend: renders the shared front end's layer trees
 /// band by band on a rayon pool.
 #[derive(Clone, Copy, Debug, Default)]

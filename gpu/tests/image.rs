@@ -205,3 +205,66 @@ fn an_image_pattern_with_extend_none_is_transparent() -> Result<(), Box<dyn std:
     assert_eq!(px(8, 8), [0.0; 4], "outside the image must be clear");
     Ok(())
 }
+
+/// f16 texel bytes for one pixel.
+fn f16_px(px: [f32; 4]) -> [u8; 8] {
+    let mut out = [0u8; 8];
+    for (i, v) in px.iter().enumerate() {
+        out[2 * i..2 * i + 2].copy_from_slice(&half::f16::from_f32(*v).to_le_bytes());
+    }
+    out
+}
+
+/// The premultiplied linear-P3 value of a linear-sRGB f16 texel, as uploaded.
+fn linear_srgb_to_p3_premul(c: [f32; 4]) -> [f32; 4] {
+    let p3 = mat_vec(&XYZ_TO_P3, mat_vec(&SRGB_TO_XYZ, [c[0], c[1], c[2]]));
+    [p3[0] * c[3], p3[1] * c[3], p3[2] * c[3], c[3]]
+}
+
+/// An `Rgba16F` upload survives with HDR and P3-only channels intact:
+/// 8x red, a half-alpha teal, a P3-only red and the premultiplied form.
+#[test]
+fn an_f16_image_keeps_hdr_and_wide_gamut() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(engine) = engine() else {
+        return Ok(());
+    };
+    // An 8x-red in linear sRGB (HDR through the primaries' matrix) and a
+    // straight-alpha teal above SDR white.
+    let mut data = Vec::new();
+    data.extend_from_slice(&f16_px([8.0, 0.0, 0.0, 1.0]));
+    data.extend_from_slice(&f16_px([0.0, 2.0, 0.25, 0.5]));
+    let hdr = engine.image(
+        ImageData::<cherenkov::Rgba16F>::new(2, 1, data)
+            .unwrap()
+            .color_space(ImageColorSpace::LinearSrgb),
+    )?;
+    // Pure P3 red — a colour the sRGB gamut cannot express.
+    let p3 = engine.image(
+        ImageData::<cherenkov::Rgba16F>::new(1, 1, f16_px([1.0, 0.0, 0.0, 1.0]))
+            .unwrap()
+            .color_space(ImageColorSpace::LinearP3),
+    )?;
+    // Premultiplied [4,0,0,0.5] is the same texel as straight [8,0,0,0.5].
+    let premul = engine.image(
+        ImageData::<cherenkov::Rgba16F>::new(1, 1, f16_px([4.0, 0.0, 0.0, 0.5]))
+            .unwrap()
+            .color_space(ImageColorSpace::LinearSrgb)
+            .premultiplied(),
+    )?;
+    let surface = engine.surface(Offscreen::new((8, 2), OffscreenFormat::LinearF16))?;
+    surface.update(|tx| {
+        tx[surface.root()].content(surface.record(|c| {
+            c.image(hdr.id(), Rect::new(0., 0., 4., 2.), Sampling::Nearest);
+            c.image(p3.id(), Rect::new(4., 0., 6., 2.), Sampling::Nearest);
+            c.image(premul.id(), Rect::new(6., 0., 8., 2.), Sampling::Nearest);
+        }));
+    });
+    engine.render(cherenkov::FrameTime::now())?;
+    let rb = surface.readback()?;
+    let px = |x: u32, y: u32| rb.pixels[(y * rb.width + x) as usize];
+    close_px(px(0, 0), linear_srgb_to_p3_premul([8.0, 0.0, 0.0, 1.0]));
+    close_px(px(2, 0), linear_srgb_to_p3_premul([0.0, 2.0, 0.25, 0.5]));
+    close_px(px(4, 0), [1.0, 0.0, 0.0, 1.0]);
+    close_px(px(6, 0), linear_srgb_to_p3_premul([8.0, 0.0, 0.0, 0.5]));
+    Ok(())
+}

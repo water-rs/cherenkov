@@ -5,6 +5,7 @@
 mod account;
 mod blend;
 mod colr;
+mod filter;
 mod font;
 mod glyph;
 mod image;
@@ -53,9 +54,11 @@ struct SurfaceState {
     /// Where finished pixels land; only `Offscreen` targets retain a
     /// full-frame buffer, in the format the host asked for.
     output: Output,
+    refresh: cherenkov::RefreshRange,
     /// Per-layer content caches; the sampled layer state lives in the
     /// front end's [`cherenkov::SurfaceTree`].
     layers: HashMap<LayerId, ContentData>,
+    filters: Vec<u64>,
 }
 
 impl SurfaceState {
@@ -82,6 +85,7 @@ impl SurfaceState {
 pub struct RasterRenderer {
     pool: rayon::ThreadPool,
     surfaces: HashMap<SurfaceId, SurfaceState>,
+    pub(super) filters: filter::Registry,
     fonts: HashMap<u64, font::Font>,
     images: HashMap<u64, Arc<CpuImage>>,
     image_budget: u64,
@@ -94,10 +98,6 @@ pub struct RasterRenderer {
 ///
 /// # Errors
 /// [`EngineError::Backend`] when the pool cannot be built.
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "the contract moves the config onto the render thread"
-)]
 pub fn init(config: RasterConfig) -> Result<(RasterRenderer, RasterInfo), EngineError> {
     let builder = rayon::ThreadPoolBuilder::new()
         .num_threads(config.threads.unwrap_or(0))
@@ -114,6 +114,7 @@ pub fn init(config: RasterConfig) -> Result<(RasterRenderer, RasterInfo), Engine
                 RasterRenderer {
                     pool,
                     surfaces: HashMap::new(),
+                    filters: filter::Registry::new(config.redraw),
                     fonts: HashMap::new(),
                     images: HashMap::new(),
                     image_budget: config.budget.cpu.0,
@@ -167,33 +168,34 @@ impl Renderer for RasterRenderer {
         id: SurfaceId,
         target: RasterTarget,
     ) -> Result<SurfaceInfo, SurfaceError> {
-        let (size, output, readable) = match target {
+        let (size, output, readable, refresh) = match target {
             RasterTarget::Offscreen(offscreen) => {
-                let pixels = (offscreen.size.0 * offscreen.size.1) as usize;
+                let (size, refresh) = (offscreen.size, offscreen.refresh);
+                let pixels = (size.0 * size.1) as usize;
                 let output = match offscreen.format {
                     cherenkov::OffscreenFormat::LinearF32 => Output::F32(vec![[0.0; 4]; pixels]),
                     cherenkov::OffscreenFormat::LinearF16 => {
                         Output::F16(vec![[half::f16::ZERO; 4]; pixels])
                     }
                 };
-                (offscreen.size, output, true)
+                (size, output, true, refresh)
             }
-            RasterTarget::Bands(bands) => (
-                bands.size,
-                Output::Stream {
+            RasterTarget::Bands(bands) => {
+                let (size, format) = (bands.size, bands.format);
+                let output = Output::Stream {
                     format: bands.format,
                     sink: bands.sink,
                     // Exactly one band's worth for f16 emission, so
                     // `memory()` is stable. f32 streams borrow the scratch.
-                    emit: match bands.format {
+                    emit: match format {
                         cherenkov::OffscreenFormat::LinearF16 => Vec::with_capacity(
-                            bands.size.0 as usize * raster::BAND_H.min(bands.size.1 as usize),
+                            size.0 as usize * raster::BAND_H.min(size.1 as usize),
                         ),
                         cherenkov::OffscreenFormat::LinearF32 => Vec::new(),
                     },
-                },
-                false,
-            ),
+                };
+                (size, output, false, cherenkov::DEFAULT_REFRESH)
+            }
         };
         if size.0 > MAX_SURFACE || size.1 > MAX_SURFACE {
             return Err(SurfaceError::TooLarge {
@@ -207,7 +209,9 @@ impl Renderer for RasterRenderer {
             SurfaceState {
                 size,
                 output,
+                refresh,
                 layers: HashMap::new(),
+                filters: Vec::new(),
             },
         );
         Ok(SurfaceInfo {
@@ -323,12 +327,7 @@ impl Renderer for RasterRenderer {
     /// Lowers and rasterizes every changed surface.
     #[cfg(not(target_arch = "wasm32"))]
     fn render(&mut self, frame: &Frame<'_>, stats: &mut FrameStats) -> Result<Redraw, RenderError> {
-        for sf in frame.surfaces.iter().filter(|sf| sf.changed) {
-            stats.frame = Some(frame.id);
-            self.render_surface(sf, stats)?;
-        }
-        // No backend-side redraw sources in this slice.
-        Ok(Redraw::None)
+        self.render_frame(frame, stats)
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -337,12 +336,7 @@ impl Renderer for RasterRenderer {
         frame: &Frame<'_>,
         stats: &mut FrameStats,
     ) -> Result<Redraw, RenderError> {
-        for sf in frame.surfaces.iter().filter(|sf| sf.changed) {
-            stats.frame = Some(frame.id);
-            self.render_surface(sf, stats)?;
-        }
-        // No backend-side redraw sources in this slice.
-        Ok(Redraw::None)
+        self.render_frame(frame, stats)
     }
 
     /// Materializes a surface's output buffer into `Readback` pixels.
@@ -445,6 +439,52 @@ impl Renderer for RasterRenderer {
 }
 
 impl RasterRenderer {
+    fn render_frame(
+        &mut self,
+        frame: &Frame<'_>,
+        stats: &mut FrameStats,
+    ) -> Result<Redraw, RenderError> {
+        self.filters.begin_frame(frame.id, frame.time);
+        for sf in frame.surfaces {
+            let filter_changed = self.surfaces.get(&sf.id).is_some_and(|surface| {
+                surface
+                    .filters
+                    .iter()
+                    .any(|id| self.filters.wants_redraw(*id))
+            });
+            if sf.changed || filter_changed {
+                stats.frame = Some(frame.id);
+                self.render_surface(sf, frame.id, stats)?;
+            }
+        }
+        let used: std::collections::HashSet<u64> = self
+            .surfaces
+            .values()
+            .flat_map(|surface| surface.filters.iter().copied())
+            .collect();
+        self.filters.set_active(&used);
+        self.filters.finish_frame(&used);
+        let rate = self
+            .surfaces
+            .values()
+            .filter(|surface| {
+                surface
+                    .filters
+                    .iter()
+                    .any(|id| self.filters.wants_redraw(*id))
+            })
+            .fold(None, |rate: Option<cherenkov::RefreshRange>, surface| {
+                Some(rate.map_or_else(
+                    || surface.refresh.clone(),
+                    |rate| {
+                        (*rate.start()).min(*surface.refresh.start())
+                            ..=(*rate.end()).max(*surface.refresh.end())
+                    },
+                ))
+            });
+        Ok(rate.map_or(Redraw::None, |rate| Redraw::Wanted { rate }))
+    }
+
     /// Lowers and rasterizes one surface's frame.
     #[expect(
         clippy::many_single_char_names,
@@ -453,6 +493,7 @@ impl RasterRenderer {
     fn render_surface(
         &mut self,
         sf: &cherenkov::SurfaceFrame<'_>,
+        frame: cherenkov::FrameId,
         stats: &mut FrameStats,
     ) -> Result<(), RenderError> {
         let profile = tracing::enabled!(target: "cherenkov_cpu::profile", tracing::Level::DEBUG);
@@ -467,11 +508,12 @@ impl RasterRenderer {
                 return Ok(());
             };
             let mut caches = std::mem::take(&mut surf.layers);
-            let mut lowering = Lowering::new(&mut items, surf.size);
+            let mut lowering = Lowering::new(&mut items, surf.size, Some(&mut self.filters), frame);
             let result = lowering.run(sf.tree, &mut caches, &self.images, &mut self.fonts);
             stats.commands_lowered += lowering.commands_lowered;
             stats.layers_composed += lowering.layers_composed;
             glyph_reqs = std::mem::take(&mut lowering.glyphs);
+            surf.filters = lowering.take_used_filters().into_iter().collect();
             surf.layers = caches;
             result
         };
@@ -487,10 +529,12 @@ impl RasterRenderer {
         let clear = [r * a, g * a, b * a, a];
         let pool = &self.pool;
         let (draws, edges) = match &mut surf.output {
-            Output::F32(fb) => pool.install(|| raster::render_bands(&items, clear, fb, w)),
-            Output::F16(out) => pool.install(|| raster::render_bands_f16(&items, clear, out, w)),
+            Output::F32(fb) => pool.install(|| raster::render_bands(&items, clear, fb, w, h))?,
+            Output::F16(out) => {
+                pool.install(|| raster::render_bands_f16(&items, clear, out, w, h))?
+            }
             Output::Stream { format, sink, emit } => {
-                raster::render_bands_stream(&items, clear, (w, h), emit, *format, sink.as_mut())
+                raster::render_bands_stream(&items, clear, (w, h), emit, *format, sink.as_mut())?
             }
         };
         if let (Some(start), Some(lowered), Some(resolved)) = (start, lowered_at, resolved_at) {

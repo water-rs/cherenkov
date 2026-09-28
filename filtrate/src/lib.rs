@@ -75,9 +75,10 @@ pub use effect::{
 pub use executor::Executor;
 pub use filtrate_core::{
     AnimatedCallback, AnimatedTarget, AnimationTrack, AuxData, AuxFormat, AuxImage, AuxSource,
-    Chain, ColorFilter, ColorStage, CpuKernel, Filter, FilterExt, FilterParam, Footprint,
-    ImageVisitor, Interpolator, OperatingSpace, ParamArray, ParamSource, Placed, ShapeInput,
-    SignalVisitor, SpatialFilter, SpatialStage, StageCollector, WatchGuard, WorkingSpace, kind,
+    Chain, ColorFilter, ColorStage, CpuFilter, CpuFilterError, CpuImage, CpuKernel, Filter,
+    FilterExt, FilterParam, Footprint, ImageVisitor, Interpolator, OperatingSpace, ParamArray,
+    ParamSource, Placed, ShapeInput, SignalVisitor, SpatialFilter, SpatialStage, StageCollector,
+    WatchGuard, WorkingSpace, kind,
 };
 
 /// Procedural derive that generates a single-stage filter: the [`Filter`]

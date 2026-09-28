@@ -44,7 +44,8 @@
 use std::collections::HashMap;
 
 use cherenkov_scene::{
-    BackdropFilter, BackdropGroup, BlendMode, Draw, FillRule, Item, Layer, Paint, Scene, Shape,
+    BackdropFilter, BackdropGroup, BlendMode, Draw, FillRule, Item, Layer, LayerFilter, Paint,
+    Scene, Shape,
 };
 use kurbo::{Affine, Point, Rect};
 
@@ -116,7 +117,8 @@ impl Canvas {
 /// One compositing level: a canvas plus the opacity and blend mode it
 /// composites into the level below it with. `semantic` marks the canvases
 /// a backdrop capture sees as its compositing target: the surface canvas
-/// and every layer isolated for `opacity < 1` or a non-Normal blend.
+/// and every layer isolated for a filter, `opacity < 1` or a non-Normal
+/// blend.
 struct Level {
     canvas: Canvas,
     opacity: f64,
@@ -322,7 +324,19 @@ impl Renderer {
         let content_tf = tf * Affine::translate((-child.scroll_offset.x, -child.scroll_offset.y));
 
         let (w, h) = (top(chain).width, top(chain).height);
-        let semantic = child.opacity < 1.0 || child.blend != BlendMode::Normal;
+        // A member that is itself filtered draws its backdrop sample into
+        // the enclosing canvas first: `layer` in gpu/src/render/lower.rs
+        // emits the sample to the current target before and outside the
+        // layer's isolation, so the layer's filter covers the member's
+        // items but never the sample.
+        if child.filter.is_some() && child.backdrop.is_some() {
+            self.backdrop_sample(child, tf, clips, top(chain), backdrops)?;
+        }
+        // A filtered layer is a semantic isolation too: a backdrop capture
+        // inside it reads this canvas, matching `isolate` in
+        // gpu/src/render/lower.rs.
+        let semantic =
+            child.filter.is_some() || child.opacity < 1.0 || child.blend != BlendMode::Normal;
         chain.push(Level {
             canvas: Canvas::new(w, h, [0.0; 4]),
             opacity: child.opacity,
@@ -340,11 +354,32 @@ impl Renderer {
             backdrops,
         )?;
         let Level {
-            canvas: sub,
+            canvas: mut sub,
             opacity,
             blend: mode,
             ..
         } = chain.pop().expect("the child level is pushed above");
+        if let Some(filter) = child.filter.as_deref() {
+            let texels = match filter {
+                LayerFilter::BlendImage { image, .. } => {
+                    Some(resources.texels(*image).map_err(RenderError::Resource)?)
+                }
+                _ => None,
+            };
+            crate::filter::apply(filter, texels, &mut sub.pixels, sub.width, sub.height);
+            // The layer clip masks the filter's output, not only its input.
+            if !child_clips.is_empty() {
+                let mask = self.shape_coverage(
+                    &Shape::Rect(self.scene_rect),
+                    FillRule::NonZero,
+                    Affine::IDENTITY,
+                    &child_clips,
+                );
+                for (px, m) in sub.pixels.iter_mut().zip(mask) {
+                    *px = px.map(|v| v * m);
+                }
+            }
+        }
 
         // A destructive operator is bounded by the effective clip: outside
         // it the destination is untouched, and the clip edge is antialiased
@@ -396,6 +431,39 @@ impl Renderer {
         )
     }
 
+    /// Draw the member's shared group capture into `canvas` under the
+    /// member clip's exact coverage, source-over. `clips` is the enclosing
+    /// clip stack; the member's own clip is the sampled shape.
+    ///
+    /// # Errors
+    /// `RenderError::Backdrop` when the member has no clip.
+    fn backdrop_sample(
+        &self,
+        child: &Layer,
+        tf: Affine,
+        clips: &[Vec<Segment>],
+        canvas: &mut Canvas,
+        backdrops: &Backdrops<'_>,
+    ) -> Result<(), RenderError> {
+        let gid = child.backdrop.expect("callers check backdrop membership");
+        let clip = child.clip.as_ref().ok_or_else(|| {
+            RenderError::Backdrop(format!("backdrop group {gid} member layer has no clip"))
+        })?;
+        let coverage = self.shape_coverage(clip, FillRule::NonZero, tf, clips);
+        if let Some(capture) = backdrops.captures.get(&gid) {
+            for (dst, (&c, &src)) in canvas
+                .pixels
+                .iter_mut()
+                .zip(coverage.iter().zip(&capture.pixels))
+            {
+                if c > 0.0 {
+                    *dst = src_over(*dst, src.map(|v| v * c));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// A child's body: the backdrop sample under the member's clip (its
     /// bottom-most content), then its items. `tf` is the child's transform
     /// in scene space, `clips` the enclosing clip stack without the child's
@@ -417,22 +485,17 @@ impl Renderer {
         backdrops: &mut Backdrops<'_>,
     ) -> Result<(), RenderError> {
         if let Some(gid) = child.backdrop {
-            let clip = child.clip.as_ref().ok_or_else(|| {
-                RenderError::Backdrop(format!("backdrop group {gid} member layer has no clip"))
-            })?;
             // The capture was taken when this member (or an earlier one)
-            // was reached; sample it under the member clip's coverage.
-            let coverage = self.shape_coverage(clip, FillRule::NonZero, tf, clips);
-            if let Some(capture) = backdrops.captures.get(&gid) {
-                for (dst, (&c, &src)) in top(target)
-                    .pixels
-                    .iter_mut()
-                    .zip(coverage.iter().zip(&capture.pixels))
-                {
-                    if c > 0.0 {
-                        *dst = src_over(*dst, src.map(|v| v * c));
-                    }
-                }
+            // was reached; sample it under the member clip's coverage as
+            // the layer's bottom-most content. A filtered member already
+            // drew its sample into the enclosing canvas — its isolation
+            // does not cover the sample — so only the clip check applies.
+            if child.filter.is_none() {
+                self.backdrop_sample(child, tf, clips, top(target), backdrops)?;
+            } else if child.clip.is_none() {
+                return Err(RenderError::Backdrop(format!(
+                    "backdrop group {gid} member layer has no clip"
+                )));
             }
         }
         self.render_items(

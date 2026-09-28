@@ -1,6 +1,6 @@
-// Blends the input with an auxiliary image (`aux0`, sampled at the same uv)
-// through one of sixteen blend operators, then mixes by `amount`. The
-// operators work on the texel values as sampled.
+// The operators take the input's unpremultiplied colour and the texel as
+// sampled. The result is re-premultiplied by the input's alpha, which is
+// kept; transparent input passes through unchanged.
 //
 // `mode` selects the operator: 0 normal, 1 multiply, 2 screen, 3 overlay,
 // 4 darken, 5 lighten, 6 soft light, 7 hard light, 8 difference,
@@ -92,6 +92,11 @@ fn blend_color(base: vec3<f32>, top: vec3<f32>, mode: u32) -> vec3<f32> {
 fn apply(input: texture_2d<f32>, input_point_sampler: sampler, uv: vec2<f32>, size: vec2<f32>, params: Params, aux0: texture_2d<f32>) -> vec4<f32> {
     let base = textureSampleLevel(input, input_point_sampler, uv, 0.0);
     let top = texel_at(aux0, uv);
-    let blended = blend_color(base.rgb, top.rgb, u32(params.mode + 0.5));
-    return vec4<f32>(mix(base.rgb, blended, clamp(params.amount, 0.0, 1.0)), base.a);
+    let colour = select(vec3<f32>(0.0), base.rgb / base.a, base.a > 0.0);
+    let blended = blend_color(colour, top.rgb, u32(params.mode + 0.5));
+    return select(
+        base,
+        vec4<f32>(mix(colour, blended, clamp(params.amount, 0.0, 1.0)) * base.a, base.a),
+        base.a > 0.0,
+    );
 }

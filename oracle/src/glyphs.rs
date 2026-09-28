@@ -597,6 +597,7 @@ fn node_to_item(node: Node, place: Affine, scene_rect: Rect) -> Item {
             opacity: f64::from(opacity),
             blend,
             backdrop: None,
+            filter: None,
             scroll_offset: kurbo::Vec2::ZERO,
             motion: None,
             live: Vec::new(),

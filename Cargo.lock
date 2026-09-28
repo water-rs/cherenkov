@@ -351,6 +351,7 @@ dependencies = [
  "cherenkov-scene",
  "cherenkov-vello",
  "clap",
+ "filtrate",
  "glifo",
  "half",
  "kurbo",

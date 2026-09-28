@@ -210,24 +210,35 @@ fn sdf(s: Shape, p: vec2<f32>) -> f32 {
     return max(a.x, a.y);
 }
 
-// Length in device pixels of the local-space gradient `g` of a signed
-// distance, for the local -> device affine `m` (J^-T g).
-fn device_grad(m: array<vec4<f32>, 2>, g: vec2<f32>) -> f32 {
+// Device-space gradient of a signed distance, for the local -> device
+// affine `m` (J^-T g), before its length is scaled into per-pixel change.
+fn device_grad_vec(m: array<vec4<f32>, 2>, g: vec2<f32>) -> vec2<f32> {
+    let a = m[0].x;
+    let b = m[0].y;
+    let c = m[0].z;
+    let d = m[0].w;
+    return vec2<f32>(d * g.x - b * g.y, -c * g.x + a * g.y);
+}
+
+// Per-device-pixel scale for a gradient returned by `device_grad_vec`:
+// |det^-1| of the affine's linear part.
+fn device_grad_scale(m: array<vec4<f32>, 2>) -> f32 {
     let a = m[0].x;
     let b = m[0].y;
     let c = m[0].z;
     let d = m[0].w;
     let det = a * d - b * c;
-    let inv_det = select(1.0 / det, 0.0, abs(det) < 1e-12);
-    return max(length(vec2<f32>(d * g.x - b * g.y, -c * g.x + a * g.y)) * abs(inv_det), 1e-6);
+    return abs(select(1.0 / det, 0.0, abs(det) < 1e-12));
 }
 
 // Local-space gradient of the signed distance to `s` at `p`, by central
 // differences. Derivative builtins are not used: they are unreliable in the
 // helper lanes along the quad's triangle seam.
-fn sdf_grad(s: Shape, p: vec2<f32>) -> vec2<f32> {
+fn sdf_grad(s: Shape, p: vec2<f32>) -> vec3<f32> {
     // Closed form for sharp and circular/elliptical corners: the unit
     // gradient of the box distance, mirrored back out of the abs() fold.
+    // z = 1.0 in a sharp corner's exterior wedge, where the distance is
+    // to a corner point rather than a half-plane.
     if abs(s.exponent - 2.0) < 1e-4 || !(s.radii.x > 0.0 || s.radii.y > 0.0 || s.radii.z > 0.0 || s.radii.w > 0.0) {
         let sgn = select(vec2<f32>(-1.0), vec2<f32>(1.0), p >= vec2<f32>(0.0));
         let right = p.x > 0.0;
@@ -240,40 +251,81 @@ fn sdf_grad(s: Shape, p: vec2<f32>) -> vec2<f32> {
         let rx = max(r, 0.0);
         let ry = rx * s.aspect;
         let a = abs(p) - s.half;
-        var g: vec2<f32>;
+        var g: vec3<f32>;
         if rx <= 0.0 || ry <= 0.0 {
             if a.x > 0.0 && a.y > 0.0 {
-                g = a / length(a);
+                g = vec3<f32>(a / length(a), 1.0);
             } else {
-                g = select(vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), a.x > a.y);
+                g = vec3<f32>(select(vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), a.x > a.y), 0.0);
             }
         } else {
             let q = a + vec2<f32>(rx, ry);
             if q.x > 0.0 && q.y > 0.0 {
                 let v = q / vec2<f32>(rx * rx, ry * ry);
-                g = v / max(length(v), 1e-12);
+                g = vec3<f32>(v / max(length(v), 1e-12), 0.0);
             } else {
-                g = select(vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), a.x > a.y);
+                g = vec3<f32>(select(vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), a.x > a.y), 0.0);
             }
         }
-        return sgn * g;
+        return vec3<f32>(sgn * g.xy, g.z);
     }
     const E: f32 = 0.05;
-    return vec2<f32>(
-        sdf(s, p + vec2<f32>(E, 0.0)) - sdf(s, p - vec2<f32>(E, 0.0)),
-        sdf(s, p + vec2<f32>(0.0, E)) - sdf(s, p - vec2<f32>(0.0, E)),
-    ) / (2.0 * E);
+    return vec3<f32>(
+        vec2<f32>(
+            sdf(s, p + vec2<f32>(E, 0.0)) - sdf(s, p - vec2<f32>(E, 0.0)),
+            sdf(s, p + vec2<f32>(0.0, E)) - sdf(s, p - vec2<f32>(0.0, E)),
+        ) / (2.0 * E),
+        0.0,
+    );
 }
 
-// Area coverage of the half-plane `d <= 0` where `d` changes by `g` per
-// device pixel; exact for straight edges under any affine.
+// Area coverage of the axis-aligned half-plane `d <= 0` where `d`
+// changes by `g` per device pixel.
 fn coverage(d: f32, g: f32) -> f32 {
     return clamp(0.5 - d / g, 0.0, 1.0);
 }
 
+// Area of the unit pixel inside the half-plane `d <= 0`, with `v` the
+// device-space gradient of `d` scaled by `scale` (g = |v|·scale per pixel).
+// Exact for straight edges at any angle; `ramp` forces the axis-aligned
+// linear ramp (sharp-corner wedges, where the distance is not a half-plane).
+fn coverage_dir(d: f32, v: vec2<f32>, scale: f32, ramp: bool) -> f32 {
+    let len = length(v);
+    let g = max(len * scale, 1e-6);
+    let ax = abs(v.x);
+    let ay = abs(v.y);
+    let b = min(ax, ay);
+    if ramp || b <= 1e-6 * len {
+        return coverage(d, g);
+    }
+    let a = max(ax, ay) / len;
+    let bn = b / len;
+    let t = -d / g;
+    let h = 0.5 * (a + bn);
+    let k = 0.5 * (a - bn);
+    if t >= h {
+        return 1.0;
+    }
+    if t <= -h {
+        return 0.0;
+    }
+    if abs(t) <= k {
+        return 0.5 + t / a;
+    }
+    let e = h - abs(t);
+    let tail = e * e / (2.0 * a * bn);
+    return select(tail, 1.0 - tail, t > 0.0);
+}
+
 // Coverage of the shape `s` at local point `p`, `m` mapping local to device.
 fn shape_coverage(s: Shape, p: vec2<f32>, m: array<vec4<f32>, 2>) -> f32 {
-    return coverage(sdf(s, p), device_grad(m, sdf_grad(s, p)));
+    let g = sdf_grad(s, p);
+    return coverage_dir(
+        sdf(s, p),
+        device_grad_vec(m, g.xy),
+        device_grad_scale(m),
+        g.z > 0.0,
+    );
 }
 
 // Abramowitz & Stegun 7.1.26, |error| < 1.5e-7.
@@ -734,9 +786,12 @@ fn fs_full(in: VsOut) -> vec4<f32> {
         }
         case KIND_STROKE_DIST: {
             let d = sdf(s, in.local);
-            let g = device_grad(m, sdf_grad(s, in.local));
+            let g = sdf_grad(s, in.local);
+            let v = device_grad_vec(m, g.xy);
+            let scale = device_grad_scale(m);
+            let ramp = g.z > 0.0;
             let hw = in.params.x;
-            cov = coverage(d - hw, g) - coverage(d + hw, g);
+            cov = coverage_dir(d - hw, v, scale, ramp) - coverage_dir(d + hw, v, scale, ramp);
         }
         case KIND_SHADOW: {
             let sigma = in.params.x;
@@ -763,7 +818,7 @@ fn fs_full(in: VsOut) -> vec4<f32> {
         let g = sdf_grad(instances[i].clip, pc);
         let ci = instances[i].clip_inv;
         let dg = vec2<f32>(ci[0].x * g.x + ci[0].y * g.y, ci[0].z * g.x + ci[0].w * g.y);
-        cov *= coverage(sdf(instances[i].clip, pc), max(length(dg), 1e-6));
+        cov *= coverage_dir(sdf(instances[i].clip, pc), dg, 1.0, g.z > 0.0);
     }
     if (flags & FLAG_HAS_MASK) != 0u {
         // Mask texel for this device pixel; texels outside the cell

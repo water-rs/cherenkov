@@ -59,6 +59,38 @@ impl<B: Backend> std::fmt::Debug for Engine<B> {
     }
 }
 
+/// The ownership of a registration while its request is in flight (#150).
+///
+/// Constructed before the backend request is enqueued, so dropping the
+/// registration future — before the backend processed it, after it
+/// committed, or after the reply — still releases what was committed.
+/// `adopt` moves the release into the resource handle's drop; `disarm`
+/// is the backend-rejected path, where nothing exists to release.
+struct Registration {
+    release: Option<Box<dyn FnOnce()>>,
+}
+
+impl Registration {
+    /// Moves the release into the adopted handle's `on_drop`.
+    fn adopt(&mut self) -> impl FnOnce() + 'static {
+        self.release.take().expect("registration adopted once")
+    }
+
+    /// The backend rejected the request: nothing was ever committed, so
+    /// no removal is enqueued.
+    fn disarm(&mut self) {
+        self.release = None;
+    }
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            release();
+        }
+    }
+}
+
 impl<B: Backend> Engine<B> {
     /// Initializes the backend and its serial executor on the current JS thread.
     /// Await this future from the browser event loop; do not block on it.
@@ -173,14 +205,29 @@ impl<B: Backend> Engine<B> {
             data: source.data,
             index: source.index,
         };
+        let committed = Rc::new(Cell::new(false));
+        let mut registration = self.registration({
+            let committed = Rc::clone(&committed);
+            Box::new(move |r: &mut B::Renderer| {
+                if committed.get() {
+                    r.remove_font(id);
+                }
+            })
+        });
         (self.release)(Box::new(move |r: &mut B::Renderer| {
-            let _ = reply.send(r.add_font(id, data));
+            let result = r.add_font(id, data);
+            committed.set(result.is_ok());
+            let _ = reply.send(result);
         }));
-        rx.recv().await.map_err(|_| ResourceError::Lost)??;
-        let release = Rc::clone(&self.release);
-        Ok(Font::new(id, move || {
-            release(Box::new(move |r: &mut B::Renderer| r.remove_font(id)));
-        }))
+        match rx.recv().await {
+            Ok(Ok(())) => Ok(Font::new(id, registration.adopt())),
+            // The backend rejected the data: nothing exists to release.
+            Ok(Err(error)) => {
+                registration.disarm();
+                Err(error)
+            }
+            Err(_) => Err(ResourceError::Lost),
+        }
     }
 
     /// Registers an image.
@@ -199,14 +246,28 @@ impl<B: Backend> Engine<B> {
         let id = ImageId::new(Self::alloc(&self.next_image));
         let (reply, rx) = crate::local::channel();
         let upload = image.into_upload();
+        let committed = Rc::new(Cell::new(false));
+        let mut registration = self.registration({
+            let committed = Rc::clone(&committed);
+            Box::new(move |r: &mut B::Renderer| {
+                if committed.get() {
+                    r.remove_image(id);
+                }
+            })
+        });
         (self.release)(Box::new(move |r: &mut B::Renderer| {
-            let _ = reply.send(r.add_image(id, upload));
+            let result = r.add_image(id, upload);
+            committed.set(result.is_ok());
+            let _ = reply.send(result);
         }));
-        rx.recv().await.map_err(|_| ResourceError::Lost)??;
-        let release = Rc::clone(&self.release);
-        Ok(Image::new(id, move || {
-            release(Box::new(move |r: &mut B::Renderer| r.remove_image(id)));
-        }))
+        match rx.recv().await {
+            Ok(Ok(())) => Ok(Image::new(id, registration.adopt())),
+            Ok(Err(error)) => {
+                registration.disarm();
+                Err(error)
+            }
+            Err(_) => Err(ResourceError::Lost),
+        }
     }
 
     /// Creates a surface over `target`: an [`Offscreen`](crate::Offscreen)
@@ -218,6 +279,14 @@ impl<B: Backend> Engine<B> {
     pub async fn surface(&self, target: impl Into<B::Target>) -> Result<Surface<B>, SurfaceError> {
         let id = SurfaceId::new(Self::alloc(&self.next_surface));
         let (reply, rx) = crate::local::channel();
+        // The guard owns the surface id from the enqueue on: dropping the
+        // future still destroys what `create_surface` committed (#150).
+        let tx = self.tx.clone();
+        let mut registration = Registration {
+            release: Some(Box::new(move || {
+                let _ = tx.send(Message::DestroySurface { id });
+            })),
+        };
         self.tx
             .send(Message::CreateSurface {
                 id,
@@ -225,12 +294,21 @@ impl<B: Backend> Engine<B> {
                 reply,
             })
             .map_err(|_| SurfaceError::Lost)?;
-        let info = rx.recv().await.map_err(|_| SurfaceError::Lost)??;
-        let surface = Surface::new(id, info, self.tx.clone(), Rc::clone(&self.waker));
-        self.surfaces
-            .borrow_mut()
-            .push(Rc::downgrade(&surface.shared));
-        Ok(surface)
+        match rx.recv().await {
+            Ok(Ok(info)) => {
+                registration.disarm();
+                let surface = Surface::new(id, info, self.tx.clone(), Rc::clone(&self.waker));
+                self.surfaces
+                    .borrow_mut()
+                    .push(Rc::downgrade(&surface.shared));
+                Ok(surface)
+            }
+            Ok(Err(error)) => {
+                registration.disarm();
+                Err(error)
+            }
+            Err(_) => Err(SurfaceError::Lost),
+        }
     }
 
     /// The number of surfaces still alive, for leak testing.
@@ -276,6 +354,17 @@ impl<B: Backend> Engine<B> {
         Ok(next)
     }
 
+    /// A [`Registration`] owning `remove`: the queued removal runs only
+    /// when the add op committed (#150), so a registration dropped while
+    /// its add was still queued still frees it, and a rejected add frees
+    /// nothing.
+    fn registration(&self, remove: ResOp<B>) -> Registration {
+        let release = Rc::clone(&self.release);
+        Registration {
+            release: Some(Box::new(move || release(remove))),
+        }
+    }
+
     fn on_drop(
         &self,
         op: impl FnOnce(&mut B::Renderer) + crate::RenderTransfer + 'static,
@@ -295,18 +384,32 @@ impl<B: ShaderPaint> Engine<B> {
     pub async fn shader(&self, source: ShaderSource) -> Result<Shader, ResourceError> {
         let id = ShaderId::new(Self::alloc(&self.next_shader));
         let (reply, rx) = crate::local::channel();
+        let committed = Rc::new(Cell::new(false));
+        let mut registration = self.registration({
+            let committed = Rc::clone(&committed);
+            Box::new(move |r: &mut B::Renderer| {
+                if committed.get() {
+                    B::remove_shader(r, id);
+                }
+            })
+        });
         self.tx
             .send(Message::AsyncResource(Box::new(move |r| {
                 Box::pin(async move {
-                    let _ = reply.send(B::add_shader(r, id, source).await);
+                    let result = B::add_shader(r, id, source).await;
+                    committed.set(result.is_ok());
+                    let _ = reply.send(result);
                 })
             })))
             .map_err(|_| ResourceError::Lost)?;
-        rx.recv().await.map_err(|_| ResourceError::Lost)??;
-        Ok(Shader::new(
-            id,
-            self.on_drop(move |r| B::remove_shader(r, id)),
-        ))
+        match rx.recv().await {
+            Ok(Ok(())) => Ok(Shader::new(id, registration.adopt())),
+            Ok(Err(error)) => {
+                registration.disarm();
+                Err(error)
+            }
+            Err(_) => Err(ResourceError::Lost),
+        }
     }
 }
 

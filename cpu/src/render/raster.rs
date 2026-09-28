@@ -714,18 +714,26 @@ impl Band<'_> {
             if blend == (cherenkov::BlendMode::Normal, cherenkov::BlendSpace::Linear) {
                 let s = src.map(|v| v * opacity * cc);
                 dst[i] = src_over(dst[i], s);
-            } else if cc > 0.0 {
-                let source = src.map(|value| value * opacity);
-                let result = super::blend::in_space(blend.0, blend.1, dst[i], source);
+            } else if super::blend::is_destructive(blend.0) {
                 // The clip limits the composite operation, including Clear
                 // and DestIn; multiplying only source alpha is not equivalent.
-                dst[i] = if cc >= 1.0 {
-                    result
-                } else {
-                    std::array::from_fn(|channel| {
-                        cc.mul_add(result[channel] - dst[i][channel], dst[i][channel])
-                    })
-                };
+                if cc > 0.0 {
+                    let source = src.map(|value| value * opacity);
+                    let result = super::blend::in_space(blend.0, blend.1, dst[i], source);
+                    dst[i] = if cc >= 1.0 {
+                        result
+                    } else {
+                        std::array::from_fn(|channel| {
+                            cc.mul_add(result[channel] - dst[i][channel], dst[i][channel])
+                        })
+                    };
+                }
+            } else if cc > 0.0 {
+                // Every other operator leaves the destination unchanged
+                // for a transparent source, so the clip coverage scales the
+                // source instead of bounding the whole composite.
+                let s = src.map(|v| v * opacity * cc);
+                dst[i] = super::blend::in_space(blend.0, blend.1, dst[i], s);
             }
         }
     }

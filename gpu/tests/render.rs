@@ -105,17 +105,42 @@ fn a_path_shadow_renders() -> Result<(), Box<dyn std::error::Error>> {
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|c| {
             c.shadow(
-                path,
+                path.clone(),
                 cherenkov::Shadow::new(4.0, WorkingColor::new([0., 0., 0., 1.])),
             );
         }));
     });
     engine.render(cherenkov::FrameTime::now())?;
     let readback = surface.readback()?;
-    let [_, _, _, interior] = readback.pixels[(30 * readback.width + 30) as usize];
-    let [_, _, _, corner] = readback.pixels[(63 * readback.width + 63) as usize];
-    assert!(interior > 0.5, "interior alpha: {interior}");
-    assert!(corner < 0.01, "far corner alpha: {corner}");
+    let mut scene = cherenkov_scene::Scene::new(
+        64,
+        64,
+        cherenkov_scene::Color::new(cherenkov_scene::ColorSpace::LinearP3, [0.; 4]),
+    );
+    scene
+        .root
+        .items
+        .push(cherenkov_scene::Item::Draw(cherenkov_scene::Draw::Shadow {
+            shape: cherenkov_scene::Shape::Path { path },
+            blur_sigma: 4.0,
+            offset: [0.0; 2],
+            color: cherenkov_scene::Color::new(
+                cherenkov_scene::ColorSpace::LinearP3,
+                [0., 0., 0., 1.],
+            ),
+        }));
+    let expected =
+        cherenkov_oracle::Renderer::new(64, 64).render(&scene, std::path::Path::new("."))?;
+    // Compare the whole premultiplied image, including the blur fringe and
+    // transparent exterior, against independent f64 coverage/convolution.
+    for (index, (actual, expected)) in readback.pixels.iter().zip(expected.pixels).enumerate() {
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert!(
+                (actual - expected).abs() < 0.005,
+                "pixel {index}: {actual} != oracle {expected}"
+            );
+        }
+    }
     Ok(())
 }
 

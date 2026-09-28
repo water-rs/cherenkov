@@ -1083,6 +1083,9 @@ impl Lowerer<'_> {
             _ => box_shape(shape)?,
         };
         let Some(boxed) = boxed.filter(|boxed| shape_is_offsettable(boxed.shape)) else {
+            if !shadow.offset.x.is_finite() || !shadow.offset.y.is_finite() {
+                return Err(RenderError::Render("non-finite shadow offset".into()));
+            }
             let start = ops.len();
             ops.push(Op::BeginShadow {
                 parameters: super::shadow::Parameters {

@@ -16,10 +16,16 @@
 //!   parent with the layer's opacity and blend mode (W3C Compositing and
 //!   Blending Level 1). A destructive Porter-Duff blend applies within the
 //!   layer's clip, or over the whole parent when there is no clip.
-//! - **Shadows** are the shape's exact coverage — clip-intersected, then
-//!   offset — convolved with a Gaussian in `f64`, filled with the colour.
-//!   Offsetting the edges before integration is exact because convolution
-//!   commutes with translation.
+//! - **Shadows** convolve the shape's exact coverage with a Gaussian in
+//!   `f64` and fill it with the colour. Axis-aligned rectangles, rounded
+//!   rectangles and circles without clips keep the legacy analytic
+//!   reference: the offset shape's unclipped coverage blurred separably
+//!   on the viewport grid. Every other shape or placement uses the
+//!   general silhouette reference: coverage captured on a canvas padded
+//!   by a six-sigma halo — off-viewport coverage still contributes —
+//!   blurred with the shape-space covariance, the enclosing clip applied
+//!   to the completed shadow. Offsetting the edges before integration is
+//!   exact because convolution commutes with translation.
 //! - **Strokes** expand with `kurbo`'s stroker; glyph outlines come from
 //!   `skrifa`, unhinted ([`crate::glyphs`]).
 //!

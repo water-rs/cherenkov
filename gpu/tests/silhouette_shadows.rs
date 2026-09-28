@@ -7,3 +7,8 @@ mod common;
 fn live_shadows_keep_offscreen_contributors_and_outer_clips() {
     common::retained_and_padded::<cherenkov_gpu::Gpu>(cherenkov_gpu::GpuConfig::default());
 }
+
+#[test]
+fn invalid_silhouette_inputs_fail_explicitly() {
+    common::invalid::<cherenkov_gpu::Gpu>(cherenkov_gpu::GpuConfig::default);
+}

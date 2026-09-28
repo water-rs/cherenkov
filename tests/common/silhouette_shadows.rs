@@ -77,3 +77,35 @@ pub fn retained_and_padded<B: Backend>(config: B::Config) {
         assert_eq!(engine.stats().commands_lowered, 0);
     }
 }
+
+/// Invalid placements and parameters are errors, not empty silhouettes.
+pub fn invalid<B: Backend>(mut config: impl FnMut() -> B::Config) {
+    for (transform, spec) in [
+        (Affine::scale(0.0), Shadow::new(3.0, WorkingColor::BLACK)),
+        (
+            Affine::translate((f64::INFINITY, 0.0)),
+            Shadow::new(3.0, WorkingColor::BLACK),
+        ),
+        (Affine::IDENTITY, Shadow::new(f64::NAN, WorkingColor::BLACK)),
+        (
+            Affine::IDENTITY,
+            Shadow::new(3.0, WorkingColor::BLACK).offset((f64::NAN, 0.0)),
+        ),
+    ] {
+        let engine = Engine::<B>::new(config()).expect("engine");
+        let surface = engine
+            .surface(Offscreen::new((16, 16), OffscreenFormat::LinearF16))
+            .expect("surface");
+        surface.update(|tx| {
+            tx[surface.root()].content(surface.record(|r| {
+                r.transform(transform, |r| {
+                    r.shadow(silhouette(), spec);
+                });
+            }));
+        });
+        assert!(
+            engine.render(FrameTime::now()).is_err(),
+            "invalid silhouette input must fail"
+        );
+    }
+}

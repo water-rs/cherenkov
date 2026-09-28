@@ -408,6 +408,7 @@ dependencies = [
  "bytemuck",
  "cherenkov",
  "cherenkov-oracle",
+ "cherenkov-scene",
  "filtrate",
  "filtrate-core",
  "futures-channel",

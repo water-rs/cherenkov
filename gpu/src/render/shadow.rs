@@ -170,6 +170,10 @@ impl Blur {
                 .as_ref()
                 .is_none_or(|kernel| kernel.key != key)
             {
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "storage limits stay far below 2^53 bytes"
+                )]
                 let count_limit = device
                     .limits()
                     .max_storage_buffer_binding_size

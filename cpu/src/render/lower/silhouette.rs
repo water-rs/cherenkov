@@ -111,6 +111,12 @@ impl Lowering<'_> {
     }
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    reason = "sampling finite capture coordinates with explicit bounds checks"
+)]
 fn sample(src: &[f32], size: (usize, usize), x: f32, y: f32) -> f32 {
     let (left, top) = (x.floor(), y.floor());
     let (fx, fy) = (x - left, y - top);

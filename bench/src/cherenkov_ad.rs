@@ -28,9 +28,8 @@ use cherenkov_oracle::color::to_working;
 use cherenkov_oracle::present::presented_srgb_to_working;
 use cherenkov_scene::{
     BackdropEffectSpec, BackdropFilter, BlendMode, ColorSpace, Draw as SceneDraw, Extend, Feature,
-    FilterBlend,
-    GlyphRun as SceneGlyphRun, ImageColorSpace, ImageEncoding, Item, Layer as SceneLayer,
-    LayerFilter, Paint as ScenePaint, ResourceHash, Shape,
+    FilterBlend, GlyphRun as SceneGlyphRun, ImageColorSpace, ImageEncoding, Item,
+    Layer as SceneLayer, LayerFilter, Paint as ScenePaint, ResourceHash, Shape,
 };
 use filtrate::{FilterExt, FilterImage, filters};
 use kurbo::{Affine, BezPath, Circle, Ellipse, Line, Rect, RoundedRect, Vec2};
@@ -1514,7 +1513,6 @@ fn build_layer(
                     filter_handles,
                 );
             }
-
         }
     }
     if let Some(filter) = prep.filter {

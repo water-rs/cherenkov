@@ -247,7 +247,23 @@ def counter_engine_memory(
         or gpu_bytes < 0
     ):
         raise GateError(f"{report_path} has invalid CPU/GPU engine memory counters")
-    return {"measured": {"cpu_bytes": cpu_bytes, "gpu_bytes": gpu_bytes}}
+    measured = {"cpu_bytes": cpu_bytes, "gpu_bytes": gpu_bytes}
+    # `backdrop_capture_bytes` is optional: binaries predating its
+    # introduction do not serialize it, and adapters without backdrop
+    # groups may leave it out.
+    if "memory_backdrop_capture_bytes" in counters:
+        captures = counters["memory_backdrop_capture_bytes"]
+        if captures is not None:
+            if (
+                not isinstance(captures, int)
+                or isinstance(captures, bool)
+                or captures < 0
+            ):
+                raise GateError(
+                    f"{report_path} has an invalid backdrop capture counter"
+                )
+            measured["backdrop_capture_bytes"] = captures
+    return {"measured": measured}
 
 
 def read_engine_memory(report_path: Path) -> dict[str, Any]:
@@ -285,13 +301,31 @@ def read_engine_memory(report_path: Path) -> dict[str, Any]:
         ):
             raise GateError(f"{report_path} has invalid CPU/GPU engine bytes")
         engine_memory = {"measured": {"cpu_bytes": cpu_bytes, "gpu_bytes": gpu_bytes}}
+        captures = measured.get("backdrop_capture_bytes")
+        if captures is not None:
+            if (
+                not isinstance(captures, int)
+                or isinstance(captures, bool)
+                or captures < 0
+            ):
+                raise GateError(
+                    f"{report_path} has invalid backdrop capture bytes"
+                )
+            engine_memory["measured"]["backdrop_capture_bytes"] = captures
 
     counters = counter_engine_memory(report_path, report)
-    if counters is not None and counters != engine_memory:
-        raise GateError(
-            f"{report_path} has inconsistent memory readings: "
-            f"memory.steady.engine={engine_memory}, counters={counters}"
-        )
+    if counters is not None:
+        # Compare only the keys present on both sides: optional fields like
+        # `backdrop_capture_bytes` may be absent from one of them.
+        shared = set(counters["measured"]) & set(engine_memory["measured"])
+        if any(
+            counters["measured"][key] != engine_memory["measured"][key]
+            for key in shared
+        ):
+            raise GateError(
+                f"{report_path} has inconsistent memory readings: "
+                f"memory.steady.engine={engine_memory}, counters={counters}"
+            )
     return engine_memory
 
 
@@ -373,7 +407,7 @@ def format_bytes(value: int | None) -> str:
 def markdown_table(
     base_ref: str,
     head_ref: str,
-    rows: list[tuple[str, str, str, str, str, str, str]],
+    rows: list[tuple[str, str, str, str, str, str, str, str, str]],
 ) -> str:
     lines = [
         "# Engine memory landing gate",
@@ -381,14 +415,24 @@ def markdown_table(
         f"- Base: `{base_ref}`",
         f"- Head: `{head_ref}`",
         "",
-        "| Scene | Engine | Base CPU (B) | Base GPU (B) | Head CPU (B) | Head GPU (B) | Delta |",
-        "|---|---|---:|---:|---:|---:|---|",
+        "| Scene | Engine | Base CPU (B) | Base GPU (B) | Base backdrop capture (B) | Head CPU (B) | Head GPU (B) | Head backdrop capture (B) | Delta |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---|",
     ]
-    for scene, engine, base_cpu, base_gpu, head_cpu, head_gpu, delta in rows:
+    for (
+        scene,
+        engine,
+        base_cpu,
+        base_gpu,
+        base_captures,
+        head_cpu,
+        head_gpu,
+        head_captures,
+        delta,
+    ) in rows:
         delta = delta.replace("|", "\\|")
         lines.append(
-            f"| {scene} | {engine} | {base_cpu} | {base_gpu} | "
-            f"{head_cpu} | {head_gpu} | {delta} |"
+            f"| {scene} | {engine} | {base_cpu} | {base_gpu} | {base_captures} | "
+            f"{head_cpu} | {head_gpu} | {head_captures} | {delta} |"
         )
     lines.append("")
     return "\n".join(lines)
@@ -476,7 +520,7 @@ def main() -> int:
                     value for value in (base_value, head_value) if isinstance(value, str)
                 )
                 rows.append(
-                    (scene, engine, "—", "—", "—", "—", f"ERROR: {error}")
+                    (scene, engine, "—", "—", "—", "—", "—", "—", f"ERROR: {error}")
                 )
                 continue
 
@@ -487,14 +531,23 @@ def main() -> int:
             delta = f"CPU {cpu_delta:+,} B; GPU {gpu_delta:+,} B"
             if cpu_delta or gpu_delta:
                 failed = True
+            base_captures = base_bytes.get("backdrop_capture_bytes")
+            head_captures = head_bytes.get("backdrop_capture_bytes")
+            if base_captures is not None and head_captures is not None:
+                captures_delta = head_captures - base_captures
+                delta += f"; captures {captures_delta:+,} B"
+                if captures_delta:
+                    failed = True
             rows.append(
                 (
                     scene,
                     engine,
                     format_bytes(base_bytes["cpu_bytes"]),
                     format_bytes(base_bytes["gpu_bytes"]),
+                    format_bytes(base_captures),
                     format_bytes(head_bytes["cpu_bytes"]),
                     format_bytes(head_bytes["gpu_bytes"]),
+                    format_bytes(head_captures),
                     delta,
                 )
             )

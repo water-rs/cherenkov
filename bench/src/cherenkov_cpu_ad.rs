@@ -1394,6 +1394,7 @@ impl Engine for Cherenkov {
             engine: Reading::Measured(EngineBytes {
                 cpu_bytes: usage.cpu.0,
                 gpu_bytes: usage.gpu.0,
+                backdrop_capture_bytes: 0,
             }),
             wgpu_allocator: Reading::unavailable("cherenkov-cpu has no wgpu allocator"),
             skia_budgeted: Reading::unavailable("cherenkov-cpu has no Skia budget"),

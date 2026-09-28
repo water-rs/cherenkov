@@ -27,6 +27,8 @@ pub struct EngineBytes {
     pub cpu_bytes: u64,
     /// Bytes reported for engine-owned GPU resources.
     pub gpu_bytes: u64,
+    /// Bytes of backdrop-group capture textures; included in `gpu_bytes`.
+    pub backdrop_capture_bytes: u64,
 }
 
 /// Wgpu allocator totals.
@@ -187,6 +189,7 @@ fn merge_engine<'a>(
 ) -> Reading<EngineBytes> {
     let mut cpu_bytes = None;
     let mut gpu_bytes = None;
+    let mut backdrop_capture_bytes = None;
     let mut reasons = Vec::new();
     for reading in readings {
         match reading {
@@ -195,6 +198,11 @@ fn merge_engine<'a>(
                     Some(cpu_bytes.map_or(value.cpu_bytes, |n: u64| n.max(value.cpu_bytes)));
                 gpu_bytes =
                     Some(gpu_bytes.map_or(value.gpu_bytes, |n: u64| n.max(value.gpu_bytes)));
+                backdrop_capture_bytes = Some(
+                    backdrop_capture_bytes.map_or(value.backdrop_capture_bytes, |n: u64| {
+                        n.max(value.backdrop_capture_bytes)
+                    }),
+                );
             }
             Reading::Unavailable(reason) => reasons.push(reason.clone()),
         }
@@ -203,6 +211,7 @@ fn merge_engine<'a>(
         (Some(cpu_bytes), Some(gpu_bytes)) => Reading::Measured(EngineBytes {
             cpu_bytes,
             gpu_bytes,
+            backdrop_capture_bytes: backdrop_capture_bytes.unwrap_or(0),
         }),
         _ => Reading::Unavailable(
             reasons
@@ -741,6 +750,7 @@ mod tests {
             Reading::Measured(EngineBytes {
                 cpu_bytes: 8,
                 gpu_bytes: 11,
+                backdrop_capture_bytes: 3,
             }),
             Reading::Measured(vec![VkHeap {
                 heap: 0,
@@ -753,6 +763,7 @@ mod tests {
             Reading::Measured(EngineBytes {
                 cpu_bytes: 6,
                 gpu_bytes: 15,
+                backdrop_capture_bytes: 7,
             }),
             Reading::Measured(vec![VkHeap {
                 heap: 0,
@@ -786,6 +797,7 @@ mod tests {
             Reading::Measured(EngineBytes {
                 cpu_bytes: 8,
                 gpu_bytes: 15,
+                backdrop_capture_bytes: 7,
             })
         );
         assert_eq!(

@@ -1692,8 +1692,8 @@ impl Engine for Cherenkov {
         counters.passes = Some(stats.passes);
         counters.memory_gpu_bytes = Some(memory.gpu.0);
         counters.memory_cpu_bytes = Some(memory.cpu.0);
-        counters.memory_backdrop_captures = Some(memory.backdrop_captures.0);
-        counters.memory_backdrop_capture_format = memory.backdrop_capture_format.map(str::to_owned);
+        counters.memory_backdrop_capture_bytes = Some(memory.backdrop_captures.0);
+        counters.memory_backdrop_capture_format = memory.backdrop_capture_format;
         counters
     }
 
@@ -1719,6 +1719,7 @@ impl Engine for Cherenkov {
             engine: Reading::Measured(EngineBytes {
                 cpu_bytes: usage.cpu.0,
                 gpu_bytes: usage.gpu.0,
+                backdrop_capture_bytes: usage.backdrop_captures.0,
             }),
             wgpu_allocator: wgpu_allocator(&self.shared_device.device, adapter_info.backend),
             skia_budgeted: Reading::unavailable("not a Skia adapter"),

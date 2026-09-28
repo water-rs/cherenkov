@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 
 use super::prepared::{ClipShape, Op, Outline, PaintData, ResolvedPaint, box_shape};
-use cherenkov::kurbo::{Affine, BezPath, PathEl, Point, Rect, Vec2};
+use cherenkov::kurbo::{self, Affine, BezPath, PathEl, Point, Rect, Vec2};
 use cherenkov::{FillRule, GlyphRun, ShapeData, WorkingColor};
 
 use cherenkov::RenderError;
@@ -18,6 +18,7 @@ use crate::names;
 use cherenkov::{LayerId, SurfaceTree};
 
 use crate::render::GpuImage;
+use crate::render::filter::FilterKey;
 
 use crate::render::glyph::{self, Atlas, FontData, MaskCell, PathEmit, PendingRaster, glyph_key};
 use crate::render::instance::{
@@ -34,6 +35,17 @@ pub enum Target {
     Surface,
     /// Scratch texture at this isolation depth index.
     Scratch(usize),
+    /// A backdrop group's capture texture (the group's raw id).
+    Backdrop(u64),
+}
+
+/// The texture a draw range samples at bind group 1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Source {
+    /// Scratch texture at this isolation depth index.
+    Scratch(usize),
+    /// A backdrop group's capture texture.
+    Backdrop(u64),
 }
 
 /// The blend pipeline a draw range uses.
@@ -70,8 +82,8 @@ pub enum ImageSource {
 /// One draw call's instance range and bound source texture.
 #[derive(Clone, Debug)]
 pub struct DrawRange {
-    /// The scratch texture bound as group 1, `None` for the dummy texture.
-    pub source: Option<usize>,
+    /// The source texture bound as group 1, `None` for the dummy texture.
+    pub source: Option<Source>,
     /// The image texture bound for `PAINT_IMAGE` instances.
     pub image: Option<ImageSource>,
     /// The mask texture bound at group-1 binding 3, by key.
@@ -100,6 +112,20 @@ pub struct Pass {
     /// When set, the target's region is copied into the backdrop texture
     /// before this pass begins — the blend composite reads it explicitly.
     pub backdrop_copy: Option<[u32; 4]>,
+    /// When set, `region` is copied from `copy_from` into the group's
+    /// capture texture before this pass draws — only on
+    /// [`Target::Backdrop`] passes.
+    pub capture: Option<Capture>,
+}
+
+/// A backdrop capture's copy source, on a [`Target::Backdrop`] pass.
+#[derive(Clone, Copy, Debug)]
+pub struct Capture {
+    /// The group's raw id.
+    pub group: u64,
+    /// The nearest semantic isolation's target: [`Target::Surface`] or a
+    /// [`Target::Scratch`] whose region is guaranteed the full surface.
+    pub copy_from: Target,
 }
 
 /// A lowered frame.
@@ -112,7 +138,7 @@ pub struct Frame {
     /// Passes in submission order.
     pub passes: Vec<Pass>,
     pub content: Vec<LayerId>,
-    pub filters: Vec<(usize, u64)>,
+    pub filters: Vec<(usize, FilterKey)>,
     open: Option<OpenPass>,
 }
 
@@ -120,13 +146,14 @@ pub struct Frame {
 struct OpenPass {
     target: Target,
     clear: Option<[f32; 4]>,
-    source: Option<usize>,
+    source: Option<Source>,
     image: Option<ImageSource>,
     /// The mask texture bound at group-1 binding 3, by key.
     mask: Option<u64>,
     pipeline: PipelineKind,
     variant: ShaderVariant,
     backdrop_copy: Option<[u32; 4]>,
+    capture: Option<Capture>,
     ranges: Vec<DrawRange>,
     seg_start: u32,
 }
@@ -534,6 +561,30 @@ pub struct Lowered {
     pub mask_patches: Vec<(u32, u32)>,
 }
 
+/// What the renderer knows about one backdrop group this frame.
+#[derive(Clone, Copy, Debug)]
+pub struct BackdropGroupInfo {
+    /// The registered filter chain's key, when the group is filtered.
+    pub filter: Option<FilterKey>,
+    /// The filter chain's footprint bound; `None` only when the registry
+    /// lost the entry (an internal error a sampled group reports).
+    pub footprint: Option<filtrate_core::Footprint>,
+}
+
+/// The plan for one backdrop group: the capture point (its first member
+/// in paint order), the capture rect and every member's device bounds for
+/// its sampling composite.
+struct BackdropPlan {
+    /// The first member layer in paint order — its entry emits the capture.
+    first: LayerId,
+    /// The union of members' clip bounds before the footprint apron.
+    union: Rect,
+    /// The capture rect in device pixels.
+    region: [u32; 4],
+    /// Each member layer's device-space clip bounds.
+    members: HashMap<LayerId, Rect>,
+}
+
 /// The lowering walk state for one surface frame.
 pub struct Lowering<'a> {
     frame: &'a mut Frame,
@@ -565,12 +616,25 @@ pub struct Lowering<'a> {
     pub(crate) pending: Vec<PendingRaster>,
     pub commands_lowered: u32,
     pub layers_composed: u32,
+    /// Backdrop groups planned before lowering.
+    backdrops: HashMap<u64, BackdropPlan>,
+    /// The `FilterKey` of each filtered group's capture chain.
+    backdrop_filters: HashMap<u64, FilterKey>,
+    /// Set when a capture ran inside the current isolation: the enclosing
+    /// scratch must then cover the full surface so its texel origin is
+    /// `(0, 0)` for the capture's composite.
+    capture_isolation: bool,
+    /// Clip-only scratch depths opened since the last semantic isolation,
+    /// outer first.
+    clip_scratches: Vec<usize>,
+    /// The nearest semantic isolation's target the capture copies from.
+    semantic_target: Target,
 }
 
 impl<'a> Lowering<'a> {
     /// Starts a lowering into `frame` for a `width` × `height` surface.
     #[expect(clippy::cast_precision_loss, reason = "surface sizes fit f32")]
-    pub const fn new(frame: &'a mut Frame, size: (u32, u32)) -> Self {
+    pub fn new(frame: &'a mut Frame, size: (u32, u32)) -> Self {
         Self {
             frame,
             width: size.0 as f32,
@@ -589,6 +653,11 @@ impl<'a> Lowering<'a> {
             pending: Vec::new(),
             commands_lowered: 0,
             layers_composed: 0,
+            backdrops: HashMap::new(),
+            backdrop_filters: HashMap::new(),
+            capture_isolation: false,
+            clip_scratches: Vec::new(),
+            semantic_target: Target::Surface,
         }
     }
 
@@ -618,12 +687,100 @@ impl<'a> Lowering<'a> {
 
     /// Lowers a surface's sampled [`SurfaceTree`] and its clear colour
     /// into the frame. `caches` holds each layer's render-side content.
+    /// Plans every backdrop group: paint-order walk collecting each
+    /// member's device-space clip bounds, then the capture region — the
+    /// union inflated by the filter footprint's apron, intersected with
+    /// the surface and rounded outward to integer pixels.
+    fn plan_backdrops(
+        &mut self,
+        tree: &SurfaceTree,
+        groups: &HashMap<u64, BackdropGroupInfo>,
+    ) -> Result<(), RenderError> {
+        self.plan_layer(tree.root(), tree, groups, Affine::IDENTITY)?;
+        for (gid, plan) in &mut self.backdrops {
+            let footprint = groups
+                .get(gid)
+                .and_then(|info| info.footprint)
+                .ok_or_else(|| {
+                    RenderError::Render(format!("backdrop group {gid} has no footprint bound"))
+                })?;
+            if footprint.extent.partial_cmp(&0.5) != Some(std::cmp::Ordering::Less) {
+                return Err(RenderError::Unsupported(names::BACKDROP_FOOTPRINT));
+            }
+            let (uw, uh) = (plan.union.width(), plan.union.height());
+            if uw.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater)
+                || uh.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater)
+            {
+                plan.region = [0; 4];
+                continue;
+            }
+            let a = (f64::from(footprint.extent).mul_add(uw.max(uh), f64::from(footprint.pixels))
+                / 2.0f64.mul_add(-f64::from(footprint.extent), 1.0))
+            .ceil();
+            let x0 = (plan.union.x0 - a).floor().max(0.0);
+            let y0 = (plan.union.y0 - a).floor().max(0.0);
+            let x1 = (plan.union.x1 + a).ceil().min(f64::from(self.width));
+            let y1 = (plan.union.y1 + a).ceil().min(f64::from(self.height));
+            plan.region = if x1 <= x0 || y1 <= y0 {
+                [0; 4]
+            } else {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "region coordinates are finite, non-negative and below the surface size"
+                )]
+                let region = [x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32];
+                region
+            };
+        }
+        Ok(())
+    }
+
+    /// One layer of the planning walk, mirroring `layer`'s transform
+    /// math: the clip sits in `parent * node.transform` space, children in
+    /// `parent * node.content_transform()` space.
+    fn plan_layer(
+        &mut self,
+        id: LayerId,
+        tree: &SurfaceTree,
+        groups: &HashMap<u64, BackdropGroupInfo>,
+        parent: Affine,
+    ) -> Result<(), RenderError> {
+        let node = tree.layer(id);
+        if let Some(gid) = node.backdrop {
+            let g = gid.raw();
+            if !groups.contains_key(&g) {
+                return Err(RenderError::Render(format!(
+                    "layer {id:?} samples unknown backdrop group {gid:?}"
+                )));
+            }
+            let clip = node
+                .clip
+                .as_ref()
+                .ok_or(RenderError::Unsupported(names::BACKDROP_UNCLIPPED))?;
+            let member = clip_device_bounds(parent * node.transform, clip)?;
+            let plan = self.backdrops.entry(g).or_insert_with(|| BackdropPlan {
+                first: id,
+                union: member,
+                region: [0; 4],
+                members: HashMap::new(),
+            });
+            plan.union = plan.union.union(member);
+            plan.members.insert(id, member);
+        }
+        for child in &node.children {
+            self.plan_layer(*child, tree, groups, parent * node.content_transform())?;
+        }
+        Ok(())
+    }
+
     pub fn run(
         &mut self,
         tree: &SurfaceTree,
         caches: &mut HashMap<LayerId, ContentData>,
         clear: WorkingColor,
         glyphs: &GlyphContext<'_>,
+        groups: &HashMap<u64, BackdropGroupInfo>,
     ) -> Result<(), RenderError> {
         for content in caches.values_mut() {
             self.commands_lowered += content.retained.prepare(&mut super::prepared::Lowerer {
@@ -632,6 +789,11 @@ impl<'a> Lowering<'a> {
                 pending: &mut self.pending,
             })?;
         }
+        self.backdrop_filters = groups
+            .iter()
+            .filter_map(|(g, info)| info.filter.map(|key| (*g, key)))
+            .collect();
+        self.plan_backdrops(tree, groups)?;
         let [r, g, b, a] = clear.components;
         self.begin_pass(Target::Surface, Some([r * a, g * a, b * a, a]));
         self.layer(tree.root(), tree, caches, glyphs)?;
@@ -682,6 +844,7 @@ impl<'a> Lowering<'a> {
             pipeline: PipelineKind::SrcOver,
             variant: ShaderVariant::Simple,
             backdrop_copy: None,
+            capture: None,
             ranges: Vec::new(),
             #[expect(clippy::cast_possible_truncation)]
             seg_start: self.frame.instances.len() as u32,
@@ -712,6 +875,11 @@ impl<'a> Lowering<'a> {
                 // Scratch regions are tightened in `isolate` once the
                 // pass's instance bboxes are known.
                 Target::Scratch(_) => [0, 0, 0, 0],
+                // A capture pass covers its planned region.
+                Target::Backdrop(g) => self
+                    .backdrops
+                    .get(&g)
+                    .map_or([0, 0, 0, 0], |plan| plan.region),
             };
             self.frame.passes.push(Pass {
                 target: open.target,
@@ -719,12 +887,13 @@ impl<'a> Lowering<'a> {
                 ranges: open.ranges,
                 region,
                 backdrop_copy: open.backdrop_copy,
+                capture: open.capture,
             });
         }
     }
 
     /// Starts a new draw range when `source` changes.
-    fn set_source(&mut self, source: Option<usize>) {
+    fn set_source(&mut self, source: Option<Source>) {
         if self.frame.open.as_ref().is_some_and(|o| o.source != source) {
             self.end_segment();
             if let Some(open) = &mut self.frame.open {
@@ -867,10 +1036,29 @@ impl<'a> Lowering<'a> {
         let passes_start = self.frame.passes.len();
         self.begin_pass(Target::Scratch(scratch), Some([0.0; 4]));
         let inst_start = self.frame.instances.len();
+        // Backdrop captures inside the body sample the nearest *semantic*
+        // isolation's target; clip-only scratches between it and the
+        // member compose over the capture. Opacity, blend and filter
+        // isolations change what the member sees; clip-only ones do not.
+        let semantic = filter.is_some() || opacity < 1.0 || blend != cherenkov::BlendMode::Normal;
+        let saved_capture = self.capture_isolation;
+        let saved_target = self.semantic_target;
+        let saved_scratches = std::mem::take(&mut self.clip_scratches);
+        self.capture_isolation = false;
+        if semantic {
+            self.semantic_target = Target::Scratch(scratch);
+        } else {
+            self.clip_scratches.clone_from(&saved_scratches);
+            self.clip_scratches.push(scratch);
+        }
         body(self, glyphs)?;
         self.finish_pass();
         self.depth -= 1;
         self.set_clip(outer_clip);
+        let inner_capture = self.capture_isolation;
+        self.capture_isolation = saved_capture || inner_capture;
+        self.semantic_target = saved_target;
+        self.clip_scratches = saved_scratches;
         let outer_target = if self.depth == 0 {
             Target::Surface
         } else {
@@ -879,7 +1067,11 @@ impl<'a> Lowering<'a> {
         let region = if let Some(filter) = filter {
             self.frame
                 .filters
-                .push((self.frame.passes.len() - 1, filter.raw()));
+                .push((self.frame.passes.len() - 1, FilterKey::Layer(filter.raw())));
+            [0, 0, self.width as u32, self.height as u32]
+        } else if inner_capture {
+            // A capture inside reads this scratch at texel origin (0, 0):
+            // its region must cover the whole surface.
             [0, 0, self.width as u32, self.height as u32]
         } else if is_destructive(blend) {
             clip_region(
@@ -895,6 +1087,9 @@ impl<'a> Lowering<'a> {
             )
         };
         if region[2] == 0 || region[3] == 0 {
+            // A capture inside forces the full-surface region, so this
+            // depth is never empty when one ran.
+            debug_assert!(!inner_capture);
             // Nothing visible in the scratch: drop this depth's segment
             // passes and the composite entirely.
             for i in (passes_start..self.frame.passes.len()).rev() {
@@ -934,7 +1129,9 @@ impl<'a> Lowering<'a> {
         if is_destructive(blend) {
             self.set_clip(inner_clip.or(outer_clip));
         }
-        self.emit_composite(scratch, opacity, region, blend);
+        #[expect(clippy::cast_precision_loss, reason = "region fits the surface")]
+        let origin = [region[0] as f32, region[1] as f32];
+        self.emit_composite(Source::Scratch(scratch), origin, opacity, region, blend);
         if is_destructive(blend) {
             self.set_clip(outer_clip);
         }
@@ -957,6 +1154,7 @@ impl<'a> Lowering<'a> {
         let depth = self.depth;
         let clip = self.clip;
         let transform = self.transform;
+        let capture = self.capture_isolation;
         let result = body(self, glyphs);
         let new = &self.frame.instances[snap.instances..];
         if result.is_ok() && self.frame.passes.len() == snap.passes && bboxes_disjoint(new) {
@@ -980,6 +1178,7 @@ impl<'a> Lowering<'a> {
         self.depth = depth;
         self.set_clip(clip);
         self.transform = transform;
+        self.capture_isolation = capture;
         result?;
         Ok(false)
     }
@@ -1019,19 +1218,111 @@ impl<'a> Lowering<'a> {
                 ranges: open.ranges,
                 region,
                 backdrop_copy: None,
+                capture: None,
             });
         }
         self.begin_pass(outer_target, None);
         if region[2] != 0 && region[3] != 0 {
-            self.emit_composite(self.depth, opacity, region, cherenkov::BlendMode::Normal);
+            #[expect(clippy::cast_precision_loss, reason = "region fits the surface")]
+            let origin = [region[0] as f32, region[1] as f32];
+            self.emit_composite(
+                Source::Scratch(self.depth),
+                origin,
+                opacity,
+                region,
+                cherenkov::BlendMode::Normal,
+            );
         }
     }
 
-    /// Emits the composite quad for `scratch` onto the current target,
-    /// covering `region` (`x, y, w, h` device pixels).
+    /// Emits the group's capture pass at the first member's paint-order
+    /// position: `region` is copied from the semantic target, then every
+    /// clip-only scratch opened since it composes over that copy.
+    fn emit_capture(&mut self, gid: u64) {
+        let region = self.backdrops[&gid].region;
+        let copy_from = self.semantic_target;
+        let current = if self.depth == 0 {
+            Target::Surface
+        } else {
+            Target::Scratch(self.depth - 1)
+        };
+        self.begin_pass(Target::Backdrop(gid), None);
+        if let Some(open) = &mut self.frame.open {
+            open.capture = Some(Capture {
+                group: gid,
+                copy_from,
+            });
+        }
+        let scratches = std::mem::take(&mut self.clip_scratches);
+        for &k in &scratches {
+            // Clip-only scratches cover the full surface (see `isolate`),
+            // so their texel origin is (0, 0).
+            self.emit_composite(
+                Source::Scratch(k),
+                [0.0, 0.0],
+                1.0,
+                region,
+                cherenkov::BlendMode::Normal,
+            );
+        }
+        self.clip_scratches = scratches;
+        self.finish_pass();
+        let pass = self.frame.passes.len() - 1;
+        if let Some(key) = self.backdrop_filters.get(&gid) {
+            self.frame.filters.push((pass, *key));
+        }
+        self.begin_pass(current, None);
+        self.capture_isolation = true;
+    }
+
+    /// Emits a member's composite of the shared capture as the
+    /// bottom-most draw inside its clip, covering `member ∩ region`.
+    #[expect(clippy::cast_precision_loss, reason = "region fits the surface")]
+    fn emit_backdrop_sample(&mut self, gid: u64, member: LayerId) {
+        let Some(plan) = self.backdrops.get(&gid) else {
+            return;
+        };
+        let region = plan.region;
+        if region[2] == 0 || region[3] == 0 {
+            return;
+        }
+        let Some(&bounds) = plan.members.get(&member) else {
+            return;
+        };
+        let (rx, ry) = (region[0] as f32, region[1] as f32);
+        let bounds = bounds.intersect(Rect::new(
+            f64::from(region[0]),
+            f64::from(region[1]),
+            f64::from(region[0] + region[2]),
+            f64::from(region[1] + region[3]),
+        ));
+        if bounds.width() <= 0.0 || bounds.height() <= 0.0 {
+            return;
+        }
+        let mut inst = self.base(KIND_SPAN, affine(Affine::IDENTITY));
+        inst.bounds = [
+            f32_f64(bounds.x0),
+            f32_f64(bounds.y0),
+            f32_f64(bounds.x1),
+            f32_f64(bounds.y1),
+        ];
+        inst.meta[1] = PAINT_TEXTURE;
+        inst.params[1] = 1.0;
+        // `grad.xy` carries the capture region's texel origin.
+        inst.grad[0] = rx;
+        inst.grad[1] = ry;
+        self.set_source(Some(Source::Backdrop(gid)));
+        self.push_instance(&inst);
+        self.set_source(None);
+    }
+
+    /// Emits the composite quad sampling `source` at texel origin
+    /// `origin` onto the current target, covering `region`
+    /// (`x, y, w, h` device pixels).
     fn emit_composite(
         &mut self,
-        scratch: usize,
+        source: Source,
+        origin: [f32; 2],
         opacity: f32,
         region: [u32; 4],
         blend: cherenkov::BlendMode,
@@ -1052,15 +1343,15 @@ impl<'a> Lowering<'a> {
         inst.bounds = [rx, ry, rx + rw, ry + rh];
         inst.meta[1] = PAINT_TEXTURE;
         inst.params[1] = opacity;
-        // `grad.xy` carries the scratch region's texel origin.
-        inst.grad[0] = rx;
-        inst.grad[1] = ry;
+        // `grad.xy` carries the sampled texture's texel origin.
+        inst.grad[0] = origin[0];
+        inst.grad[1] = origin[1];
         let code = blend_code(blend);
         if code != 0 {
             inst.meta[3] |= code << 16;
             self.set_pipeline(PipelineKind::Replace);
         }
-        self.set_source(Some(scratch));
+        self.set_source(Some(source));
         self.push_instance(&inst);
         self.set_source(None);
         if code != 0 {
@@ -1244,9 +1535,7 @@ impl<'a> Lowering<'a> {
         glyphs: &GlyphContext<'_>,
     ) -> Result<(), RenderError> {
         let node = tree.layer(id);
-        if node.backdrop.is_some() {
-            return Err(RenderError::Unsupported(names::BACKDROP));
-        }
+        let backdrop = node.backdrop.map(cherenkov::BackdropId::raw);
         let saved = self.transform;
         let saved_animating = self.animating;
         self.animating |= node.animating();
@@ -1261,7 +1550,27 @@ impl<'a> Lowering<'a> {
             || node.blend != cherenkov::BlendMode::Normal
             // The root already renders into the surface target.
             || (id != tree.root() && node.blends_within());
+        if let Some(gid) = backdrop {
+            let plan = &self.backdrops[&gid];
+            if plan.first == id && plan.region[2] != 0 && plan.region[3] != 0 {
+                self.emit_capture(gid);
+            }
+        }
         let result = if isolates && node.filter.is_none() && !is_destructive(node.blend) {
+            // The member's sample draws to the current target under the
+            // member clip, before and outside the layer's own isolation,
+            // unaffected by the layer's opacity or blend.
+            if let Some(gid) = backdrop {
+                self.with_clip(
+                    node.clip.as_ref(),
+                    |s, _glyphs| {
+                        s.transform = content_space;
+                        s.emit_backdrop_sample(gid, id);
+                        Ok(())
+                    },
+                    glyphs,
+                )?;
+            }
             // The layer clip applies inside the scratch only; the composite
             // runs under the clip in force outside the layer.
             self.isolate(
@@ -1286,6 +1595,9 @@ impl<'a> Lowering<'a> {
                 node.clip.as_ref(),
                 |s, glyphs| {
                     s.transform = content_space;
+                    if let Some(gid) = backdrop {
+                        s.emit_backdrop_sample(gid, id);
+                    }
                     if isolates {
                         let inner = s.clip;
                         s.isolate(
@@ -2454,6 +2766,38 @@ impl<'a> Lowering<'a> {
 fn axis_aligned(transform: Affine) -> bool {
     let [c0, c1, c2, c3, _, _] = transform.as_coeffs();
     (c1 == 0.0 && c2 == 0.0) || (c0 == 0.0 && c3 == 0.0)
+}
+
+/// The device-space bounding box of `clip` under `transform` — the shape
+/// the merged clip machinery would clip against, any transform.
+fn clip_device_bounds(transform: Affine, clip: &ShapeData) -> Result<Rect, RenderError> {
+    let (local, extra) = match clip {
+        ShapeData::Rect(r) => (*r, Affine::IDENTITY),
+        ShapeData::Path { elements, .. } => {
+            let path = elements.iter().copied().collect::<BezPath>();
+            (kurbo::Shape::bounding_box(&path), Affine::IDENTITY)
+        }
+        _ => match box_shape(clip)? {
+            Some(boxed) => (boxed.bounds, boxed.extra),
+            None => return Ok(Rect::ZERO),
+        },
+    };
+    let t = transform * extra;
+    let corners = [
+        Point::new(local.x0, local.y0),
+        Point::new(local.x1, local.y0),
+        Point::new(local.x0, local.y1),
+        Point::new(local.x1, local.y1),
+    ]
+    .map(|p| t * p);
+    let (mut min, mut max) = (corners[0], corners[0]);
+    for p in &corners[1..] {
+        min.x = min.x.min(p.x);
+        min.y = min.y.min(p.y);
+        max.x = max.x.max(p.x);
+        max.y = max.y.max(p.y);
+    }
+    Ok(Rect::new(min.x, min.y, max.x, max.y))
 }
 
 /// The device-space rectangle of a rect under an axis-aligned transform.

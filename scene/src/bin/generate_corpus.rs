@@ -1004,9 +1004,10 @@ fn run() -> Result<(), SceneError> {
 
     {
         let text: String = (0xe000u32..=0xe008)
-            .map(|c| char::from_u32(c).unwrap())
-            .collect();
-        let runs = ctx.shape(colr_font, &text, 60.0, FontWeight::NORMAL, &solid(dark));
+            .map(|c| char::from_u32(c).unwrap().to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let runs = ctx.shape(colr_font, &text, 56.0, FontWeight::NORMAL, &solid(dark));
         let blobs = font_blobs(&ctx, &[&runs]);
         corpus.scene_with_blobs(
             "colr-gradient-transform",
@@ -1024,14 +1025,15 @@ fn run() -> Result<(), SceneError> {
 
     {
         let text: String = (0xe100u32..=0xe11b)
-            .map(|c| char::from_u32(c).unwrap())
-            .collect();
-        let runs = ctx.shape(colr_font, &text, 34.0, FontWeight::NORMAL, &solid(dark));
+            .map(|c| char::from_u32(c).unwrap().to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let runs = ctx.shape(colr_font, &text, 30.0, FontWeight::NORMAL, &solid(dark));
         let blobs = font_blobs(&ctx, &[&runs]);
         corpus.scene_with_blobs(
             "colr-composite",
             320,
-            160,
+            150,
             white,
             |l| {
                 for run in &runs {
@@ -1043,13 +1045,13 @@ fn run() -> Result<(), SceneError> {
     }
 
     {
-        let text = "\u{e200}\u{e201}\u{e400}\u{e500}\u{e600}";
-        let runs = ctx.shape(colr_font, text, 56.0, FontWeight::NORMAL, &solid(dark));
+        let text = "\u{e200} \u{e201} \u{e400} \u{e500} \u{e600}";
+        let runs = ctx.shape(colr_font, text, 44.0, FontWeight::NORMAL, &solid(dark));
         let blobs = font_blobs(&ctx, &[&runs]);
         corpus.scene_with_blobs(
             "colr-clip-nested",
             320,
-            96,
+            64,
             white,
             |l| {
                 for run in &runs {
@@ -1070,8 +1072,8 @@ fn run() -> Result<(), SceneError> {
             extend: Extend::Pad,
             interpolation: ColorSpace::Srgb,
         });
-        let text = "\u{e300}\u{e301}\u{e302}\u{e303}";
-        let runs = ctx.shape(colr_font, text, 64.0, FontWeight::NORMAL, &fg);
+        let text = "\u{e300} \u{e301} \u{e302} \u{e303}";
+        let runs = ctx.shape(colr_font, text, 52.0, FontWeight::NORMAL, &fg);
         let blobs = font_blobs(&ctx, &[&runs]);
         corpus.scene_with_blobs(
             "colr-foreground-gradient",
@@ -1098,8 +1100,8 @@ fn run() -> Result<(), SceneError> {
             extend_y: Extend::Repeat,
             sampling: Sampling::Bilinear,
         });
-        let text = "\u{e300}\u{e301}";
-        let runs = ctx.shape(colr_font, text, 64.0, FontWeight::NORMAL, &fg);
+        let text = "\u{e300} \u{e301}";
+        let runs = ctx.shape(colr_font, text, 52.0, FontWeight::NORMAL, &fg);
         let mut blobs = font_blobs(&ctx, &[&runs]);
         blobs.push(checker.clone());
         corpus.scene_with_blobs(
@@ -1134,7 +1136,7 @@ fn run() -> Result<(), SceneError> {
             |l| {
                 l.layer(|a| {
                     a.transform(
-                        Affine::translate((40.0, 120.0))
+                        Affine::translate((70.0, 95.0))
                             * Affine::rotate(-0.35)
                             * Affine::skew(0.3, 0.0)
                             * Affine::scale_non_uniform(1.2, 0.8),

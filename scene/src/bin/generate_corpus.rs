@@ -1136,6 +1136,59 @@ fn refraction_member(
     });
 }
 
+// A phone-shaped scene: busy backdrop, one blurred group, a top bar
+// and a bottom bar far enough apart to take two capture regions.
+fn bars_background(l: &mut LayerBuilder, tile: impl Fn(u32) -> Color) {
+    l.fill(
+        Shape::rect(0.0, 0.0, 1024.0, 2216.0),
+        Paint::Linear(LinearGradient {
+            start: Point::new(0.0, 0.0),
+            end: Point::new(1024.0, 2216.0),
+            stops: vec![
+                GradientStop {
+                    offset: 0.0,
+                    color: srgb(0.08, 0.12, 0.35),
+                },
+                GradientStop {
+                    offset: 1.0,
+                    color: srgb(0.60, 0.20, 0.30),
+                },
+            ],
+            extend: Extend::Pad,
+            interpolation: ColorSpace::Srgb,
+        }),
+    );
+    for i in 0..40u32 {
+        let (tx, ty) = (i % 5, i / 5);
+        let x0 = f64::from(tx) * 196.0;
+        let y0 = f64::from(ty) * 258.0;
+        let (x0, y0) = (x0 + 32.0, y0 + 160.0);
+        if i % 3 == 0 {
+            l.fill(Shape::circle(x0 + 64.0, y0 + 64.0, 60.0), solid(tile(i)));
+        } else {
+            l.fill(
+                Shape::RoundedRect(RoundedRect::new(x0, y0, x0 + 128.0, y0 + 128.0, 20.0)),
+                solid(tile(i)),
+            );
+        }
+    }
+}
+
+fn bars(l: &mut LayerBuilder) {
+    l.layer(|m| {
+        m.clip(Shape::RoundedRect(RoundedRect::new(
+            0.0, 16.0, 1024.0, 112.0, 24.0,
+        )));
+        m.backdrop(1);
+    });
+    l.layer(|m| {
+        m.clip(Shape::RoundedRect(RoundedRect::new(
+            0.0, 2088.0, 1024.0, 2216.0, 24.0,
+        )));
+        m.backdrop(1);
+    });
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "a linear sequence of independent scene builders; it reads top to bottom"
@@ -4599,58 +4652,6 @@ fn run() -> Result<(), SceneError> {
     });
 
     // ---- Sparse capture (#117) ----------------------------------------------
-
-    // A phone-shaped scene: busy backdrop, one blurred group, a top bar
-    // and a bottom bar far enough apart to take two capture regions.
-    fn bars_background(l: &mut LayerBuilder, tile: impl Fn(u32) -> Color) {
-        l.fill(
-            Shape::rect(0.0, 0.0, 1024.0, 2216.0),
-            Paint::Linear(LinearGradient {
-                start: Point::new(0.0, 0.0),
-                end: Point::new(1024.0, 2216.0),
-                stops: vec![
-                    GradientStop {
-                        offset: 0.0,
-                        color: srgb(0.08, 0.12, 0.35),
-                    },
-                    GradientStop {
-                        offset: 1.0,
-                        color: srgb(0.60, 0.20, 0.30),
-                    },
-                ],
-                extend: Extend::Pad,
-                interpolation: ColorSpace::Srgb,
-            }),
-        );
-        for i in 0..40u32 {
-            let (tx, ty) = (i % 5, i / 5);
-            let x0 = 32.0 + f64::from(tx) * 196.0;
-            let y0 = 160.0 + f64::from(ty) * 258.0;
-            if i % 3 == 0 {
-                l.fill(Shape::circle(x0 + 64.0, y0 + 64.0, 60.0), solid(tile(i)));
-            } else {
-                l.fill(
-                    Shape::RoundedRect(RoundedRect::new(x0, y0, x0 + 128.0, y0 + 128.0, 20.0)),
-                    solid(tile(i)),
-                );
-            }
-        }
-    }
-
-    fn bars(l: &mut LayerBuilder) {
-        l.layer(|m| {
-            m.clip(Shape::RoundedRect(RoundedRect::new(
-                0.0, 16.0, 1024.0, 112.0, 24.0,
-            )));
-            m.backdrop(1);
-        });
-        l.layer(|m| {
-            m.clip(Shape::RoundedRect(RoundedRect::new(
-                0.0, 2088.0, 1024.0, 2216.0, 24.0,
-            )));
-            m.backdrop(1);
-        });
-    }
 
     corpus.scene_setup("backdrop-bars", 1024, 2216, white, |b| {
         b.backdrop_group(1, vec![BackdropFilter::GaussianBlur { sigma: 8.0 }]);

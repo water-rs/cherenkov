@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::mem::size_of_val;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use cherenkov::FontData;
 
@@ -30,9 +30,9 @@ pub struct Font {
     /// Validated once at registration; plain runs do not reparse tables.
     pub has_colr: bool,
     /// Foreground-independent `COLRv1` node trees, per `(glyph, coords)`.
-    /// A `Mutex`, not a `RefCell`: `resolve_glyphs` borrows the font map
-    /// inside the rayon pool.
-    pub colr: Mutex<HashMap<ColrKey, Arc<[Node]>>>,
+    /// Written only during single-threaded lowering; the raster phase
+    /// reads the shared [`Node`] trees through `Arc` handles.
+    pub colr: HashMap<ColrKey, Arc<[Node]>>,
 }
 
 impl Font {
@@ -60,11 +60,9 @@ impl Font {
             }
             bytes
         }
-        self.colr.lock().map_or(0, |cache| {
-            cache
-                .values()
-                .map(|nodes| nodes.iter().map(node_bytes).sum::<u64>())
-                .sum()
-        })
+        self.colr
+            .values()
+            .map(|nodes| nodes.iter().map(node_bytes).sum::<u64>())
+            .sum()
     }
 }

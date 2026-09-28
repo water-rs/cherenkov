@@ -85,16 +85,25 @@ pub fn resolve(
     let mut ys: Vec<f64> = segs.iter().flat_map(|s| [s.y0, s.y1]).collect();
     ys.sort_by(f64::total_cmp);
     ys.dedup();
+    segs.sort_by(|a, b| a.y0.total_cmp(&b.y0));
 
     let mut out: Vec<(f64, f64, f64, f64)> = Vec::new();
     let mut overlap = false;
+    // `next` admits segments as the sweep reaches their top; `active`
+    // retires them once they end at or above the band's top. No segment
+    // endpoint ever lies strictly inside a band — inserted split points
+    // don't change admission — so the incremental set matches a fresh
+    // `y0 <= ya && y1 >= yb` scan every band.
+    let mut next = 0usize;
+    let mut active: Vec<&Seg> = Vec::new();
     let mut band = 0usize;
     while band + 1 < ys.len() {
         let (ya, yb) = (ys[band], ys[band + 1]);
-        let mut active: Vec<&Seg> = segs
-            .iter()
-            .filter(|s| s.y0 <= ya + EPS && s.y1 >= yb - EPS)
-            .collect();
+        while next < segs.len() && segs[next].y0 <= ya + EPS {
+            active.push(&segs[next]);
+            next += 1;
+        }
+        active.retain(|s| s.y1 > ya + EPS);
         if active.is_empty() {
             band += 1;
             continue;

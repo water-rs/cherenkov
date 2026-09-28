@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    BlendMode, Color, ColorSpace, Draw, Extend, ImageEncoding, Item, Layer, Paint, ResourceHash,
-    SceneError, Shape,
+    BackdropFilter, BackdropGroup, BlendMode, Color, ColorSpace, Draw, Extend, ImageEncoding, Item,
+    Layer, Paint, ResourceHash, SceneError, Shape,
 };
 
 /// The file name of the serialized scene inside a scene directory.
@@ -86,6 +86,12 @@ pub enum Feature {
     /// that cannot interpolate in a declared space must report it instead of
     /// silently remapping.
     InterpolationSpace(ColorSpace),
+    /// A layer sampling a backdrop group.
+    Backdrop,
+    /// A backdrop group whose capture runs through a Gaussian blur.
+    BackdropBlur,
+    /// A backdrop group whose capture runs through a colour matrix.
+    BackdropColorMatrix,
 }
 
 /// The scene's working space. Only linear Display P3 exists today; the enum
@@ -121,6 +127,9 @@ pub struct Scene {
     pub present_headroom: f64,
     /// The features this scene uses.
     pub features: BTreeSet<Feature>,
+    /// The backdrop groups member layers sample (`Layer::backdrop`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backdrop_groups: Vec<BackdropGroup>,
     /// The root layer.
     pub root: Layer,
 }
@@ -136,6 +145,7 @@ impl Scene {
             clear,
             present_headroom: Self::default_present_headroom(),
             features: BTreeSet::new(),
+            backdrop_groups: Vec::new(),
             root: Layer::default(),
         }
     }
@@ -165,6 +175,18 @@ impl Scene {
         if self.clear.is_wide_gamut() {
             f.insert(Feature::WideGamut);
         }
+        for group in &self.backdrop_groups {
+            for filter in &group.filters {
+                match filter {
+                    BackdropFilter::GaussianBlur { .. } => {
+                        f.insert(Feature::BackdropBlur);
+                    }
+                    BackdropFilter::ColorMatrix { .. } => {
+                        f.insert(Feature::BackdropColorMatrix);
+                    }
+                }
+            }
+        }
         collect_layer_features(&self.root, &mut f);
         self.features = f;
     }
@@ -189,7 +211,29 @@ impl Scene {
                 computed: scene.features.iter().cloned().collect(),
             });
         }
+        scene.validate_backdrops()?;
         Ok(scene)
+    }
+
+    /// Every layer's `backdrop` must name a declared group and carry a clip.
+    fn validate_backdrops(&self) -> Result<(), SceneError> {
+        fn walk(layer: &Layer, groups: &[BackdropGroup]) -> Result<(), SceneError> {
+            if let Some(id) = layer.backdrop {
+                if layer.clip.is_none() {
+                    return Err(SceneError::BackdropMemberUnclipped(id));
+                }
+                if !groups.iter().any(|g| g.id == id) {
+                    return Err(SceneError::UnknownBackdropGroup(id));
+                }
+            }
+            for item in &layer.items {
+                if let Item::Layer(l) = item {
+                    walk(l, groups)?;
+                }
+            }
+            Ok(())
+        }
+        walk(&self.root, &self.backdrop_groups)
     }
 
     /// Write `scene.json` into `dir` (creating it), without touching
@@ -412,6 +456,9 @@ fn collect_layer_features(layer: &Layer, f: &mut BTreeSet<Feature>) {
     }
     if layer.motion.is_some() {
         f.insert(Feature::Animation);
+    }
+    if layer.backdrop.is_some() {
+        f.insert(Feature::Backdrop);
     }
     for item in &layer.items {
         match item {

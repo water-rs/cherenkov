@@ -373,6 +373,8 @@ struct PrepLayer {
     clip: Option<ShapeKind>,
     /// Group opacity.
     opacity: f64,
+    /// Blend onto the parent.
+    blend: cherenkov::BlendMode,
     /// Scroll offset applied to content and children.
     scroll_offset: Vec2,
     /// The layer's own content — only when every draw precedes every child.
@@ -470,6 +472,40 @@ const fn missing_api(f: &Feature) -> Option<&'static str> {
     match f {
         Feature::InterpolationSpace(_) => Some("only srgb / linear interpolation in this slice"),
         _ => None,
+    }
+}
+
+/// The front-end blend mode matching a scene mode one-for-one by name.
+const fn engine_blend(m: BlendMode) -> cherenkov::BlendMode {
+    match m {
+        BlendMode::Normal => cherenkov::BlendMode::Normal,
+        BlendMode::Multiply => cherenkov::BlendMode::Multiply,
+        BlendMode::Screen => cherenkov::BlendMode::Screen,
+        BlendMode::Overlay => cherenkov::BlendMode::Overlay,
+        BlendMode::Darken => cherenkov::BlendMode::Darken,
+        BlendMode::Lighten => cherenkov::BlendMode::Lighten,
+        BlendMode::ColorDodge => cherenkov::BlendMode::ColorDodge,
+        BlendMode::ColorBurn => cherenkov::BlendMode::ColorBurn,
+        BlendMode::HardLight => cherenkov::BlendMode::HardLight,
+        BlendMode::SoftLight => cherenkov::BlendMode::SoftLight,
+        BlendMode::Difference => cherenkov::BlendMode::Difference,
+        BlendMode::Exclusion => cherenkov::BlendMode::Exclusion,
+        BlendMode::Hue => cherenkov::BlendMode::Hue,
+        BlendMode::Saturation => cherenkov::BlendMode::Saturation,
+        BlendMode::Color => cherenkov::BlendMode::Color,
+        BlendMode::Luminosity => cherenkov::BlendMode::Luminosity,
+        BlendMode::Clear => cherenkov::BlendMode::Clear,
+        BlendMode::Src => cherenkov::BlendMode::Src,
+        BlendMode::Dst => cherenkov::BlendMode::Dst,
+        BlendMode::DestOver => cherenkov::BlendMode::DestOver,
+        BlendMode::SrcIn => cherenkov::BlendMode::SrcIn,
+        BlendMode::DestIn => cherenkov::BlendMode::DestIn,
+        BlendMode::SrcOut => cherenkov::BlendMode::SrcOut,
+        BlendMode::DestOut => cherenkov::BlendMode::DestOut,
+        BlendMode::SrcAtop => cherenkov::BlendMode::SrcAtop,
+        BlendMode::DestAtop => cherenkov::BlendMode::DestAtop,
+        BlendMode::Xor => cherenkov::BlendMode::Xor,
+        BlendMode::PlusLighter => cherenkov::BlendMode::PlusLighter,
     }
 }
 
@@ -888,6 +924,7 @@ fn prep_layer(
             .as_ref()
             .map(|s| shape_kind(s, cherenkov::FillRule::NonZero)),
         opacity: layer.opacity,
+        blend: engine_blend(layer.blend),
         own: ContentRun {
             ops: Vec::new(),
             live: Vec::new(),
@@ -1010,6 +1047,7 @@ fn build_layer(
         edit.transform(prep.transform);
         edit.scroll_offset(prep.scroll_offset);
         edit.opacity(prep.opacity as f32);
+        edit.blend(prep.blend);
         if let Some(clip) = &prep.clip {
             clip_shape(edit, clip);
         }

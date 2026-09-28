@@ -180,6 +180,24 @@ fn metrics_detect_error() {
     assert_eq!(m2.flip_mean, 0.0);
 }
 
+/// The metric pipeline runs in Display P3 primaries: two linear-P3 colours
+/// that both land on negative sRGB red (clamped to the same sRGB colour by
+/// an sRGB-primary pipeline) must still measure as different.
+#[test]
+fn p3_colours_outside_srgb_are_distinguished() {
+    let mk = |r: f32| cherenkov_oracle::F32Image {
+        width: W,
+        height: H,
+        pixels: vec![[r, 1.0, 0.0, 1.0]; (W * H) as usize],
+    };
+    let reference = mk(0.0);
+    let test = mk(0.12);
+    let (m, _) = metrics::compare(&reference, &test);
+    assert!(m.flip_mean > 0.0, "P3-only difference measured zero");
+    assert!(m.flip_max > 0.0, "P3-only difference measured zero");
+    assert!(!m.hdr);
+}
+
 fn encode_png(
     color: png::ColorType,
     depth: png::BitDepth,

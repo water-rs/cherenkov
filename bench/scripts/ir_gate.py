@@ -8,10 +8,12 @@ instrumentation is switched on and the bench resumes. `--dump-before` and
 root on its thread. The k-th dump after a root returns is sample k; sample 2
 is the gate's "second steady frame" and sample 3 its stability check.
 
-Per sample it reports the root's inclusive Ir, the allocator's share of it
-(the inclusive cost of every call from non-allocator code into the allocator:
-the Rust allocator shims and the libc malloc family), the allocator-excluded
-Ir (the difference), and the number of alloc, realloc and dealloc calls.
+Per sample it reports the root's inclusive Ir; the allocator's share of it
+(the inclusive cost of every call from other code into the Rust allocator
+shims and the libc malloc family) with the number of alloc, realloc and
+dealloc calls; the libc memory primitives' share (memcpy, memmove, memset,
+memcmp, bcmp), whose Ir depends on buffer addresses the allocator chooses,
+with their call count; and the Rust Ir: inclusive Ir minus both shares.
 
   ir_gate.py profile --binary B --tag T --scene S --repo R --out O
   ir_gate.py batch   --binary B --tag T --repo R --out O
@@ -31,6 +33,7 @@ ALLOC = re.compile(r"(___rust_(alloc|dealloc|realloc|alloc_zeroed)|___rdl_(alloc
 KIND = [(re.compile(r"(___rust_alloc|___rust_alloc_zeroed|^malloc|^calloc|^posix_memalign|^aligned_alloc|^memalign|^valloc|^pvalloc)('\d+)?$"), 'allocs'),
         (re.compile(r"(___rust_realloc|^realloc)('\d+)?$"), 'reallocs'),
         (re.compile(r"(___rust_dealloc|^free)('\d+)?$"), 'deallocs')]
+MEM = re.compile(r"^(__)?(memcpy|memmove|mempcpy|memset|memcmp|bcmp)(_\w+)?('\d+)?$")
 LIBC = ctypes.CDLL(None, use_errno=True)
 
 
@@ -90,6 +93,8 @@ def measure(path, symbol):
     ir = sum(c for (a, b), c in edge.items() if b == root)
     assert ncalls == 1 and ir > 0, (path, ncalls, ir)
     is_alloc = lambda k: bool(ALLOC.search(names.get(k, '')))
+    is_mem = lambda k: bool(MEM.search(names.get(k, '')))
+    excluded = lambda k: is_alloc(k) or is_mem(k)
     kids = collections.defaultdict(set)
     for a, b in edge:
         kids[a].add(b)
@@ -97,16 +102,20 @@ def measure(path, symbol):
     while stack:
         f = stack.pop()
         if f not in inside:
-            inside.add(f); stack += [g for g in kids[f] if not is_alloc(g)]
-    alloc_ir = 0; counts = collections.Counter({k: 0 for _, k in KIND})
+            inside.add(f); stack += [g for g in kids[f] if not excluded(g)]
+    alloc_ir = mem_ir = mem_calls = 0; counts = collections.Counter({k: 0 for _, k in KIND})
     for (a, b), cost in edge.items():
-        if a in inside and is_alloc(b) and not is_alloc(a):
+        if a not in inside or excluded(a):
+            continue
+        if is_alloc(b):
             alloc_ir += cost
             for pattern, kind in KIND:
                 if pattern.search(names[b]):
                     counts[kind] += calls[(a, b)]
-    return {'path': str(path), 'ir': ir, 'alloc_ir': alloc_ir, 'rust_ir': ir - alloc_ir,
-            'outside_ir': total - ir if total is not None else None, **counts}
+        elif is_mem(b):
+            mem_ir += cost; mem_calls += calls[(a, b)]
+    return {'path': str(path), 'ir': ir, 'alloc_ir': alloc_ir, 'mem_ir': mem_ir, 'mem_calls': mem_calls,
+            'rust_ir': ir - alloc_ir - mem_ir, 'outside_ir': total - ir if total is not None else None, **counts}
 
 
 def dump_files(out, prefix, number):
@@ -201,7 +210,7 @@ def profile(binary, tag, scene, repo, out, pause_at, warmup):
         result[phase] = {'root': symbol, 'first': samples[0], 'second': second, 'third': third,
                          'third_delta_percent': 100 * (third['rust_ir'] / second['rust_ir'] - 1)}
         print(tag, scene, phase, 'SECOND', second['ir'], 'rust', second['rust_ir'], 'allocs', second['allocs'],
-              'reallocs', second['reallocs'], 'deallocs', second['deallocs'], 'THIRD rust', third['rust_ir'], flush=True)
+              'reallocs', second['reallocs'], 'deallocs', second['deallocs'], 'mem', second['mem_calls'], 'THIRD rust', third['rust_ir'], flush=True)
     pathlib.Path(str(prefix) + '.result.json').write_text(json.dumps(result, indent=2) + '\n')
     return result
 
@@ -228,14 +237,14 @@ def batch(args):
         for line in pool.map(task, SCENES):
             print(line, flush=True)
     lines = [f'# Ir at the second steady frame: `{args.tag}`', '',
-             f'Instrumentation on at frame {args.pause_at}; sample 2 of each root. Rust Ir excludes the allocator.', '',
-             '| Scene | Phase | Ir | Allocator Ir | Rust Ir | allocs | reallocs | deallocs | Rust Ir 2nd → 3rd |',
-             '|---|---|---:|---:|---:|---:|---:|---:|---:|']
+             f'Instrumentation on at frame {args.pause_at}; sample 2 of each root. Rust Ir excludes the allocator and the libc memory primitives.', '',
+             '| Scene | Phase | Ir | Allocator Ir | Mem Ir | Rust Ir | allocs | reallocs | deallocs | mem calls | Rust Ir 2nd → 3rd |',
+             '|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|']
     for scene in SCENES:
         d = load(args.out, args.tag, scene)
         for phase in ROOTS:
             s, t = d[phase]['second'], d[phase]['third']
-            lines.append(f"| {scene} | {phase} | {s['ir']:,} | {s['alloc_ir']:,} | {s['rust_ir']:,} | {s['allocs']} | {s['reallocs']} | {s['deallocs']} | "
+            lines.append(f"| {scene} | {phase} | {s['ir']:,} | {s['alloc_ir']:,} | {s['mem_ir']:,} | {s['rust_ir']:,} | {s['allocs']} | {s['reallocs']} | {s['deallocs']} | {s['mem_calls']} | "
                          f"{t['rust_ir']:,} ({d[phase]['third_delta_percent']:+.3f}%) |")
     report = '\n'.join(lines) + '\n'
     (out / f'{args.tag}-ir.md').write_text(report); print(report)
@@ -243,17 +252,17 @@ def batch(args):
 
 def compare(args):
     lines = [f'# Rust Ir and allocator calls: `{args.base}` → `{args.head}`', '',
-             'Second steady frame. Fails when Rust Ir rises more than 1% or any allocator call count rises.', '',
-             '| Scene | Phase | Rust Ir base | Rust Ir head | Δ | allocs | reallocs | deallocs | |', '|---|---|---:|---:|---:|---:|---:|---:|---|']
+             'Second steady frame. Fails when Rust Ir rises more than 1% or any allocator or memory-primitive call count rises.', '',
+             '| Scene | Phase | Rust Ir base | Rust Ir head | Δ | allocs | reallocs | deallocs | mem calls | |', '|---|---|---:|---:|---:|---:|---:|---:|---:|---|']
     failed = False
     for scene in SCENES:
         a, b = load(args.out, args.base, scene), load(args.out, args.head, scene)
         for phase in ROOTS:
             x, y = a[phase]['second'], b[phase]['second']
             delta = 100 * (y['rust_ir'] / x['rust_ir'] - 1)
-            ok = delta <= 1 and all(y[k] <= x[k] for _, k in KIND)
+            ok = delta <= 1 and all(y[k] <= x[k] for k in ('allocs', 'reallocs', 'deallocs', 'mem_calls'))
             failed |= not ok
-            counts = [f"{x[k]} → {y[k]}" for k in ('allocs', 'reallocs', 'deallocs')]
+            counts = [f"{x[k]} → {y[k]}" for k in ('allocs', 'reallocs', 'deallocs', 'mem_calls')]
             lines.append(f"| {scene} | {phase} | {x['rust_ir']:,} | {y['rust_ir']:,} | {delta:+.3f}% | {' | '.join(counts)} | {'ok' if ok else 'FAIL'} |")
     print('\n'.join(lines))
     return 1 if failed else 0
@@ -265,11 +274,13 @@ def same(args):
         ds = [load(args.out, tag, scene) for tag in args.tags]
         assert len({d['sha256'] for d in ds}) == 1, (scene, 'different binaries')
         for phase in ROOTS:
-            rust = [d[phase]['second']['rust_ir'] for d in ds]; total = [d[phase]['second']['ir'] for d in ds]
-            ok = len(set(rust)) == 1
-            if phase == 'encode':
-                failed |= not ok
-            print(f"{scene:10s} {phase:6s} rust {rust} {'identical' if ok else 'DIFFERENT'}; inclusive {total}")
+            second = [d[phase]['second'] for d in ds]
+            rust = [s['rust_ir'] for s in second]
+            count = [(s['allocs'], s['reallocs'], s['deallocs'], s['mem_calls']) for s in second]
+            ok = len(set(rust)) == 1 and len(set(count)) == 1
+            failed |= not ok
+            print(f"{scene:10s} {phase:6s} rust {rust} calls {count[0] if len(set(count)) == 1 else count} "
+                  f"{'identical' if ok else 'DIFFERENT'}; inclusive {[s['ir'] for s in second]}")
     return 1 if failed else 0
 
 

@@ -42,8 +42,10 @@ contract; the per-decision log is issue #2.
   counts:** Ir for `lower` and `encode` at the second steady frame of the five
   perf scenes, sampled by frame index (`bench/scripts/ir_gate.py`, which runs
   `measure --pause-at`). The gated Ir excludes the allocator (calls into the
-  Rust allocator shims and the libc malloc family): at most +1% per scene
-  against dev, and alloc, realloc and dealloc calls per frame must not rise.
+  Rust allocator shims and the libc malloc family) and the libc memory
+  primitives (memcpy, memmove, memset, memcmp, bcmp), whose Ir depends on
+  buffer addresses: at most +1% per scene against dev, and alloc, realloc,
+  dealloc and memory-primitive calls per frame must not rise.
   Wall-clock time on a shared cloud VM is not evidence: identical binaries
   drifted by up to ±80% there.
 - **Wall-clock time and energy come only from quiet real devices**, in

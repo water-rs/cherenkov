@@ -2078,6 +2078,90 @@ fn derived_colour_filters_apply_through_cpu_filter() {
     assert_eq!(pixels, [[0.325, 0.425, 0.525, 0.5]]);
 }
 
+/// Parameter values that change every frame must not accumulate one
+/// uniform buffer per frame: a stale buffer — one no encode of the
+/// current sequence has bound — is rewritten in place.
+#[test]
+fn gpu_params_rewrite_buffers_across_frames() {
+    let gpu = create_test_device();
+    let amount = ScriptedParam::constant(0.0);
+    let amount_callback = amount.callback.clone();
+    let mut executor = Executor::new(filters::ToneCurve {
+        shadows: ScriptedParam::constant(0.0),
+        midtones: ScriptedParam::constant(0.0),
+        highlights: ScriptedParam::constant(0.0),
+        gamma: ScriptedParam::constant(1.0),
+        amount,
+    });
+    setup(&gpu, &mut executor);
+
+    let size = (16, 16);
+    let rgba = test_pixels(size.0 * size.1);
+    let input = upload(&gpu, size, &rgba);
+    let values = [0.2_f32, 0.6, 1.0];
+    for (frame, value) in values.iter().enumerate() {
+        ScriptedParam::fire(
+            &amount_callback,
+            AnimatedTarget {
+                value: *value,
+                interpolator: None,
+            },
+        );
+        let output = texture(
+            &gpu,
+            size,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        executor
+            .encode_render(
+                &EffectInput {
+                    timing: EffectFrameTiming::new(
+                        Duration::ZERO,
+                        Duration::ZERO,
+                        frame as u64 + 1,
+                    ),
+                    ..frame_input(&gpu, &input, size, Duration::ZERO, ShapeTextures::default())
+                },
+                &frame_output(&gpu, &output, size),
+                &mut encoder,
+            )
+            .expect("encode should succeed");
+        gpu.queue.submit([encoder.finish()]);
+        // A fresh executor rendering the same value is the reference.
+        let want = run(
+            &gpu,
+            filters::ToneCurve {
+                shadows: ScriptedParam::constant(0.0),
+                midtones: ScriptedParam::constant(0.0),
+                highlights: ScriptedParam::constant(0.0),
+                gamma: ScriptedParam::constant(1.0),
+                amount: ScriptedParam::constant(*value),
+            },
+            size,
+            &rgba,
+            ShapeTextures::default(),
+        );
+        assert_rgba8_close(
+            &readback_rgba8_image(&gpu, &output, size),
+            &want,
+            1,
+            "animated frame",
+        );
+    }
+    let buffers: usize = executor
+        .gpu
+        .as_ref()
+        .expect("executor set up")
+        .passes
+        .iter()
+        .map(|pass| pass.params.len())
+        .sum();
+    assert_eq!(buffers, 1, "changing params must reuse the stale buffer");
+}
+
 // ============================================================================
 // Gallery
 // ============================================================================

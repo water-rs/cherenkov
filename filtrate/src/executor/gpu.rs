@@ -26,15 +26,20 @@ const VERTEX_SHADER: &str = include_str!("../shaders/fullscreen.wgsl");
 
 /// One pass's pipeline and uniform block.
 #[derive(Debug)]
-struct GpuPass {
+pub(super) struct GpuPass {
     plan: PassPlan,
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
     /// Uniform buffers, keyed by the exact words they hold: a queue write
     /// lands before the encoder submits, so two encodes of one effect in a
-    /// frame must not share a buffer. Capped; a recorded bind group keeps
-    /// its buffer alive, so evicting the oldest entry is safe.
-    params: Vec<(Vec<u32>, wgpu::Buffer)>,
+    /// frame must not share a buffer. The third member is the frame
+    /// sequence that last bound the entry: a miss may rewrite only a
+    /// buffer no encode of the current sequence has bound — an earlier
+    /// sequence's encoder is submitted before the next sequence encodes,
+    /// the same assumption a bare `write_buffer` made. Capped; a recorded
+    /// bind group keeps its buffer alive, so evicting the oldest entry is
+    /// safe.
+    pub(super) params: Vec<(Vec<u32>, wgpu::Buffer, u64)>,
     uses_space: bool,
 }
 
@@ -86,7 +91,7 @@ struct Shared {
 /// Everything setup produced for one device and pair of formats.
 #[derive(Debug)]
 pub(super) struct Gpu {
-    passes: Vec<GpuPass>,
+    pub(super) passes: Vec<GpuPass>,
     /// The intermediate slot pass `n` writes, for every pass but the last,
     /// which writes the output.
     slot_of: Vec<usize>,
@@ -297,7 +302,7 @@ impl Gpu {
         let last = self.passes.len() - 1;
         for (index, pass) in self.passes.iter_mut().enumerate() {
             let params = pass
-                .params_index(input.device, values, size)
+                .params_index(input.device, input.queue, values, size, sequence)
                 .map(|index| &pass.params[index].1);
 
             let bind_group = pass.bind_group(index, input, &self.shared, slots, slot_of, params)?;
@@ -472,8 +477,10 @@ impl GpuPass {
     fn params_index(
         &mut self,
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         values: &[f32],
         size: (u32, u32),
+        sequence: u64,
     ) -> Option<usize> {
         const MAX_PARAM_BUFFERS: usize = 16;
         if self.plan.segment.uniform.size == 0 {
@@ -491,7 +498,27 @@ impl GpuPass {
                 words[first + component] = values[slot.param + component].to_bits();
             }
         }
-        if let Some(index) = self.params.iter().position(|(cached, _)| *cached == words) {
+        if let Some(index) = self
+            .params
+            .iter()
+            .position(|(cached, _, _)| *cached == words)
+        {
+            self.params[index].2 = sequence;
+            return Some(index);
+        }
+        // A miss may rewrite a buffer no encode of this sequence has
+        // bound: the stalest one.
+        if let Some((index, _)) = self
+            .params
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, _, last_used))| *last_used < sequence)
+            .min_by_key(|(_, (_, _, last_used))| *last_used)
+        {
+            let entry = &mut self.params[index];
+            queue.write_buffer(&entry.1, 0, bytemuck::cast_slice(&words));
+            entry.0 = words;
+            entry.2 = sequence;
             return Some(index);
         }
         if self.params.len() == MAX_PARAM_BUFFERS {
@@ -500,7 +527,7 @@ impl GpuPass {
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("filtrate pass parameters"),
             size: u64::from(self.plan.segment.uniform.size),
-            usage: wgpu::BufferUsages::UNIFORM,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: true,
         });
         buffer
@@ -509,7 +536,7 @@ impl GpuPass {
             .expect("buffer range is mapped and not overlapping")
             .copy_from_slice(bytemuck::cast_slice(&words));
         buffer.unmap();
-        self.params.push((words, buffer));
+        self.params.push((words, buffer, sequence));
         Some(self.params.len() - 1)
     }
 }

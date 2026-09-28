@@ -229,8 +229,7 @@ fn elliptical_and_lame_rims_get_their_exact_area() -> Result<(), Box<dyn std::er
 /// centre of pixel (14, 14) covers one quarter of it (0.25); the same
 /// corner as a stroke's inner hole covers three quarters (0.75).
 #[test]
-fn a_sharp_corner_inside_a_pixel_gets_its_exact_area(
-) -> Result<(), Box<dyn std::error::Error>> {
+fn a_sharp_corner_inside_a_pixel_gets_its_exact_area() -> Result<(), Box<dyn std::error::Error>> {
     let Some(engine) = engine() else {
         return Ok(());
     };

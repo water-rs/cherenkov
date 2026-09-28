@@ -527,6 +527,51 @@ impl Renderer {
         cov.finish(rule)
     }
 
+    /// The general silhouette reference: capture outside the viewport, blur
+    /// with shape-space covariance, and apply the enclosing clip afterwards.
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "corpus shapes and surface dimensions are finite and small"
+    )]
+    fn silhouette_coverage(
+        &self,
+        shape: &Shape,
+        sigma: f64,
+        offset: [f64; 2],
+        tf: Affine,
+        clips: &[Vec<Segment>],
+    ) -> Vec<f64> {
+        let [a, b, c, d, _, _] = tf.as_coeffs();
+        let px = (6.0 * sigma).mul_add(a.hypot(c), 2.0).ceil().max(0.0) as usize;
+        let py = (6.0 * sigma).mul_add(b.hypot(d), 2.0).ceil().max(0.0) as usize;
+        let (width, height) = (self.width + 2 * px, self.height + 2 * py);
+        let renderer = Self::new(width, height);
+        let place = Affine::translate((px as f64, py as f64))
+            * tf
+            * Affine::translate((offset[0], offset[1]));
+        let coverage = renderer.shape_coverage(shape, FillRule::NonZero, place, &[]);
+        let blurred = crate::shadow::affine_blur(&coverage, width, height, sigma, [a, b, c, d]);
+        let clip = (!clips.is_empty()).then(|| {
+            self.shape_coverage(
+                &Shape::Rect(self.scene_rect),
+                FillRule::NonZero,
+                Affine::IDENTITY,
+                clips,
+            )
+        });
+        let mut out = Vec::with_capacity(self.width * self.height);
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let value = blurred[(y + py) * width + x + px]
+                    * clip.as_ref().map_or(1.0, |c| c[y * self.width + x]);
+                out.push(value);
+            }
+        }
+        out
+    }
+
     /// Composite `paint` over `canvas`, multiplied by `coverage`; the paint
     /// is sampled at pixel centres in the items' user space (`inv_tf`).
     /// # Errors
@@ -603,8 +648,18 @@ impl Renderer {
                 // Exact: shift the shape edges by the offset before coverage,
                 // then blur (convolution commutes with translation).
                 let tf_off = tf * Affine::translate((offset[0], offset[1]));
-                let coverage = self.shape_coverage(shape, FillRule::NonZero, tf_off, clips);
-                let blurred = gaussian_blur(&coverage, self.width, self.height, *blur_sigma);
+                let blurred = if matches!(
+                    shape,
+                    Shape::Rect(_) | Shape::RoundedRect(_) | Shape::Circle(_)
+                ) && tf.as_coeffs()[..4] == [1.0, 0.0, 0.0, 1.0]
+                    && clips.is_empty()
+                {
+                    // Preserve the established separable reference's exact arithmetic.
+                    let coverage = self.shape_coverage(shape, FillRule::NonZero, tf_off, clips);
+                    gaussian_blur(&coverage, self.width, self.height, *blur_sigma)
+                } else {
+                    self.silhouette_coverage(shape, *blur_sigma, *offset, tf, clips)
+                };
                 let src = to_working(color);
                 for (px, &c) in top(chain).pixels.iter_mut().zip(&blurred) {
                     if c > 0.0 {

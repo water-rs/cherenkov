@@ -16,7 +16,5 @@ pub const BACKDROP_FOOTPRINT: &str = "backdrop-footprint";
 pub const COLOR_FONT: &str = "color-font";
 /// A blend space other than linear.
 pub const BLEND_SPACE: &str = "blend-space";
-/// A shadow from a shape without a rounded-box form.
-pub const SHADOW: &str = "shadow";
 /// A path clip whose rasterized mask does not fit the atlas.
 pub const PATH_CLIP_TOO_LARGE: &str = "path-clip-too-large";

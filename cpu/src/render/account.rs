@@ -88,7 +88,7 @@ fn item_bytes(item: &Item) -> u64 {
                 + paint_data_bytes(paint)
                 + clip.as_deref().map_or(0, clip_bytes)
         }
-        Item::Glyph { paint, clip, .. } => {
+        Item::Glyph { paint, clip, .. } | Item::Silhouette { paint, clip, .. } => {
             paint_data_bytes(paint) + clip.as_deref().map_or(0, clip_bytes)
         }
         Item::Shadow { clip, .. }

@@ -136,6 +136,7 @@ pub struct Frame {
     pub passes: Vec<Pass>,
     pub content: Vec<LayerId>,
     pub filters: Vec<(usize, FilterKey)>,
+    pub shadows: Vec<(usize, super::shadow::Parameters)>,
     open: Option<OpenPass>,
 }
 
@@ -162,6 +163,7 @@ struct FrameSnapshot {
     stops: usize,
     passes: usize,
     filters: usize,
+    shadows: usize,
     open: Option<OpenPass>,
 }
 
@@ -173,6 +175,7 @@ impl Frame {
             stops: self.stops.len(),
             passes: self.passes.len(),
             filters: self.filters.len(),
+            shadows: self.shadows.len(),
             open: self.open.clone(),
         }
     }
@@ -183,7 +186,27 @@ impl Frame {
         self.stops.truncate(snap.stops);
         self.passes.truncate(snap.passes);
         self.filters.truncate(snap.filters);
+        self.shadows.truncate(snap.shadows);
         self.open = snap.open;
+    }
+
+    /// Removes pass `i` and shifts the pass indexes recorded in `shadows`
+    /// and `filters` down past it.
+    fn remove_pass(&mut self, i: usize) {
+        fn shift<T>(indexed: &mut Vec<(usize, T)>, removed: usize) {
+            indexed.retain_mut(|(pass, _)| {
+                if *pass == removed {
+                    return false;
+                }
+                if *pass > removed {
+                    *pass -= 1;
+                }
+                true
+            });
+        }
+        self.passes.remove(i);
+        shift(&mut self.shadows, i);
+        shift(&mut self.filters, i);
     }
 }
 
@@ -195,6 +218,7 @@ impl Frame {
         self.passes.clear();
         self.content.clear();
         self.filters.clear();
+        self.shadows.clear();
         self.open = None;
     }
 }
@@ -1091,16 +1115,7 @@ impl<'a> Lowering<'a> {
             // passes and the composite entirely.
             for i in (passes_start..self.frame.passes.len()).rev() {
                 if self.frame.passes[i].target == Target::Scratch(scratch) {
-                    self.frame.passes.remove(i);
-                    self.frame.filters.retain_mut(|(pass, _)| {
-                        if *pass == i {
-                            return false;
-                        }
-                        if *pass > i {
-                            *pass -= 1;
-                        }
-                        true
-                    });
+                    self.frame.remove_pass(i);
                 }
             }
             self.begin_pass(outer_target, None);
@@ -1132,6 +1147,80 @@ impl<'a> Lowering<'a> {
         if is_destructive(blend) {
             self.set_clip(outer_clip);
         }
+        Ok(())
+    }
+
+    /// Capture a silhouette in padded device coordinates, convolve it, then
+    /// apply the outer clip. Padding retains off-surface contributors.
+    #[inline(never)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "finite nonnegative capture extents checked before conversion"
+    )]
+    fn silhouette_scope(
+        &mut self,
+        parameters: super::shadow::Parameters,
+        mut body: impl FnMut(&mut Self, &GlyphContext<'_>) -> Result<(), RenderError>,
+        glyphs: &GlyphContext<'_>,
+    ) -> Result<(), RenderError> {
+        if !parameters.sigma.is_finite() || !parameters.spread.is_finite() {
+            return Err(RenderError::Render("non-finite shadow parameters".into()));
+        }
+        let sigma = parameters.sigma.max(0.0);
+        let transform = self.transform * parameters.transform;
+        let [a, b, c, d, _, _] = transform.as_coeffs();
+        let spread = parameters.spread.abs();
+        let px = (spread.mul_add(a.hypot(c), 6.0 * sigma * (a.abs() + c.abs())) + 2.0).ceil();
+        let py = (spread.mul_add(b.hypot(d), 6.0 * sigma * (b.abs() + d.abs())) + 2.0).ceil();
+        let width = 2.0f64.mul_add(px, f64::from(self.width));
+        let height = 2.0f64.mul_add(py, f64::from(self.height));
+        if !width.is_finite()
+            || !height.is_finite()
+            || width > f64::from(u32::MAX)
+            || height > f64::from(u32::MAX)
+        {
+            return Err(RenderError::Render(
+                "shadow capture exceeds addressable extent".into(),
+            ));
+        }
+        let saved = (self.transform, self.width, self.height, self.clip);
+        self.finish_pass();
+        self.depth += 1;
+        let scratch = self.depth - 1;
+        self.transform = Affine::translate((px, py)) * self.transform;
+        self.width = width as f32;
+        self.height = height as f32;
+        self.clip = None;
+        self.begin_pass(Target::Scratch(scratch), Some([0.0; 4]));
+        body(self, glyphs)?;
+        self.finish_pass();
+        let pass = self.frame.passes.len() - 1;
+        self.frame.passes[pass].region = [0, 0, width as u32, height as u32];
+        self.frame.shadows.push((
+            pass,
+            super::shadow::Parameters {
+                transform,
+                ..parameters
+            },
+        ));
+        (self.transform, self.width, self.height, self.clip) = saved;
+        self.depth -= 1;
+        self.begin_pass(
+            if self.depth == 0 {
+                Target::Surface
+            } else {
+                Target::Scratch(self.depth - 1)
+            },
+            None,
+        );
+        let mut instance = self.base(KIND_SPAN, affine(Affine::IDENTITY));
+        instance.bounds = [0.0, 0.0, self.width, self.height];
+        instance.meta[1] = PAINT_TEXTURE;
+        instance.grad[0] = -(px as f32);
+        instance.grad[1] = -(py as f32);
+        self.set_source(Some(Source::Scratch(scratch)));
+        self.push_instance(&instance);
         Ok(())
     }
 
@@ -1724,6 +1813,18 @@ impl<'a> Lowering<'a> {
                         *filter,
                         *opacity,
                         *blend,
+                        |s, g| {
+                            changed |=
+                                s.ops(source, ops, emissions, storage, i + 1..*end as usize, g)?;
+                            Ok(())
+                        },
+                        glyphs,
+                    )?;
+                    i = *end as usize;
+                }
+                Op::BeginShadow { parameters, end } => {
+                    self.silhouette_scope(
+                        *parameters,
                         |s, g| {
                             changed |=
                                 s.ops(source, ops, emissions, storage, i + 1..*end as usize, g)?;

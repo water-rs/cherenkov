@@ -401,7 +401,7 @@ impl Renderer for RasterRenderer {
             categories.retained += surface
                 .layers
                 .values()
-                .map(account::content_bytes)
+                .map(|content| account::content_bytes(content) + lower::silhouette_bytes(content))
                 .sum::<u64>();
         }
         categories.bands = self

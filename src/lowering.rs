@@ -459,6 +459,13 @@ impl<O: Operation, E> Content<O, E> {
         )
     }
 
+    /// Retained device realizations, including invalid entries awaiting replacement.
+    /// Backends use this read-only view for residency accounting without preparing content.
+    #[must_use]
+    pub fn realizations(&self) -> &[Realization<E>] {
+        &self.emissions
+    }
+
     /// Release device coverage without re-lowering content on the next frame.
     pub fn trim(&mut self) {
         self.emissions

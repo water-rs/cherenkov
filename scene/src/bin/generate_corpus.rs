@@ -48,6 +48,16 @@ const fn solid(c: Color) -> Paint {
     Paint::Solid(c)
 }
 
+/// A colour in the linear Display P3 working space (wide gamut).
+const fn p3(r: f32, g: f32, b: f32) -> Color {
+    Color::new(ColorSpace::LinearP3, [r, g, b, 1.0])
+}
+
+/// An HDR colour in the linear Display P3 working space (channels > 1).
+const fn hdr(r: f32, g: f32, b: f32) -> Color {
+    Color::new(ColorSpace::LinearP3, [r, g, b, 1.0])
+}
+
 fn stops2() -> Vec<GradientStop> {
     vec![
         GradientStop {
@@ -204,19 +214,65 @@ impl TextContext {
     }
 }
 
+/// A 96×96 clipped destructive-layer scene: gradient backdrop, then a
+/// rounded-rect clipped layer blending a circle gradient with `mode`.
+fn blend_clip_scene(
+    corpus: &mut Corpus,
+    name: String,
+    mode: BlendMode,
+    backdrop: [Color; 2],
+    content: [Color; 2],
+    interpolation: ColorSpace,
+) {
+    corpus.scene(name, 96, 96, srgb(0.7, 0.5, 0.2), |l| {
+        l.fill(
+            Shape::rect(0.0, 0.0, 96.0, 96.0),
+            Paint::Linear(LinearGradient {
+                start: Point::new(0.0, 0.0),
+                end: Point::new(96.0, 96.0),
+                stops: vec![
+                    GradientStop {
+                        offset: 0.0,
+                        color: backdrop[0],
+                    },
+                    GradientStop {
+                        offset: 1.0,
+                        color: backdrop[1],
+                    },
+                ],
+                extend: Extend::Pad,
+                interpolation,
+            }),
+        );
+        l.layer(|a| {
+            a.clip(Shape::rounded_rect(16.0, 16.0, 64.0, 64.0, 14.0));
+            a.blend(mode);
+            a.fill(
+                Shape::circle(48.0, 48.0, 24.0),
+                Paint::Linear(LinearGradient {
+                    start: Point::new(24.0, 24.0),
+                    end: Point::new(72.0, 72.0),
+                    stops: vec![
+                        GradientStop {
+                            offset: 0.0,
+                            color: content[0],
+                        },
+                        GradientStop {
+                            offset: 1.0,
+                            color: content[1],
+                        },
+                    ],
+                    extend: Extend::Pad,
+                    interpolation,
+                }),
+            );
+        });
+    });
+}
+
 /// The font blob a [`GlyphRun`] was shaped from.
 fn font_blob<'a>(ctx: &'a TextContext, run: &'a GlyphRun) -> &'a Vec<u8> {
     &ctx.blobs[&run.font]
-}
-
-/// A colour in the linear Display P3 working space (wide gamut).
-const fn p3(r: f32, g: f32, b: f32) -> Color {
-    Color::new(ColorSpace::LinearP3, [r, g, b, 1.0])
-}
-
-/// An HDR colour in the linear Display P3 working space (channels > 1).
-const fn hdr(r: f32, g: f32, b: f32) -> Color {
-    Color::new(ColorSpace::LinearP3, [r, g, b, 1.0])
 }
 
 fn encode_png_rgba(width: u32, height: u32, pixels: &[u8]) -> Vec<u8> {
@@ -1142,6 +1198,45 @@ fn run() -> Result<(), SceneError> {
                 );
             });
         });
+    }
+
+    // Clipped destructive layers: the operator is bounded by the rounded
+    // clip rect, so the backdrop survives outside it. Three operators and
+    // three palettes (sRGB, wide-gamut P3, HDR).
+    for (mname, mode) in [
+        ("clear", BlendMode::Clear),
+        ("src", BlendMode::Src),
+        ("dest-in", BlendMode::DestIn),
+    ] {
+        for (suffix, backdrop, content, interpolation) in [
+            (
+                "",
+                [srgb(0.9, 0.5, 0.1), srgb(0.1, 0.3, 0.8)],
+                [srgb(0.2, 0.9, 0.4), srgb(0.9, 0.2, 0.6)],
+                ColorSpace::Srgb,
+            ),
+            (
+                "-p3",
+                [p3(1.0, 0.0, 0.6), p3(0.0, 1.0, 1.0)],
+                [p3(0.0, 1.0, 0.0), p3(1.0, 0.0, 0.0)],
+                ColorSpace::LinearP3,
+            ),
+            (
+                "-hdr",
+                [hdr(16.0, 2.0, 0.5), hdr(0.0, 8.0, 16.0)],
+                [hdr(4.0, 16.0, 1.0), hdr(16.0, 16.0, 16.0)],
+                ColorSpace::LinearP3,
+            ),
+        ] {
+            blend_clip_scene(
+                &mut corpus,
+                format!("blend-{mname}-clip{suffix}"),
+                mode,
+                backdrop,
+                content,
+                interpolation,
+            );
+        }
     }
 
     // ---- Shadows ------------------------------------------------------------

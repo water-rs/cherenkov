@@ -3231,6 +3231,79 @@ fn run() -> Result<(), SceneError> {
     }
 
     {
+        let sbix_transforms = [
+            Affine::rotate(20_f64.to_radians()),
+            Affine::skew(0.35, 0.0),
+            Affine::skew(0.0, -0.25),
+            Affine::scale_non_uniform(1.4, 0.8),
+            Affine::rotate((-15_f64).to_radians())
+                * Affine::skew(0.2, -0.12)
+                * Affine::scale_non_uniform(0.8, 1.25),
+        ];
+        let cbdt_transforms = [
+            Affine::rotate((-20_f64).to_radians()),
+            Affine::skew(-0.25, 0.15),
+            Affine::scale_non_uniform(0.7, 1.3),
+            Affine::rotate(45_f64.to_radians()),
+            Affine::rotate(12_f64.to_radians())
+                * Affine::skew(0.18, 0.08)
+                * Affine::scale_non_uniform(1.15, 0.9),
+        ];
+        let mut sbix = ctx.shape(
+            "CherenkovSbixTest.ttf",
+            corpus::BITMAP_EMOJI,
+            24.0,
+            FontWeight::NORMAL,
+            &solid(dark),
+        );
+        let mut cbdt = ctx.shape(
+            "NotoColorEmojiSubset.ttf",
+            corpus::BITMAP_EMOJI,
+            40.0,
+            FontWeight::NORMAL,
+            &solid(dark),
+        );
+        let mut index = 0;
+        for run in &mut sbix {
+            for glyph in &mut run.glyphs {
+                glyph.transform = Some(sbix_transforms[index]);
+                index += 1;
+            }
+        }
+        assert_eq!(index, sbix_transforms.len());
+        index = 0;
+        for run in &mut cbdt {
+            for glyph in &mut run.glyphs {
+                glyph.transform = Some(cbdt_transforms[index]);
+                index += 1;
+            }
+        }
+        assert_eq!(index, cbdt_transforms.len());
+        let blobs = font_blobs(&ctx, &[&sbix, &cbdt]);
+        corpus.scene_with_blobs(
+            "text-bitmap-glyph-transform",
+            440,
+            300,
+            bitmap_white,
+            |l| {
+                l.layer(|row| {
+                    row.transform(Affine::translate((100.0, 90.0)));
+                    for run in &sbix {
+                        row.glyphs(run.clone());
+                    }
+                });
+                l.layer(|row| {
+                    row.transform(Affine::translate((40.0, 225.0)));
+                    for run in &cbdt {
+                        row.glyphs(run.clone());
+                    }
+                });
+            },
+            blobs,
+        );
+    }
+
+    {
         let coffee = ctx.shape(
             "NotoSans.ttf",
             "Coffee ",

@@ -22,6 +22,7 @@ use cherenkov_scene::{
 use kurbo::{Affine, BezPath, Circle, Ellipse, Line, Rect, RoundedRect, Vec2};
 
 use crate::convert::{self, Blobs};
+use crate::memory::{AdapterMemory, EngineBytes, Reading};
 use crate::motion::{Clock, LayerMotion};
 use crate::timing::Timings;
 use crate::{BenchError, Counters, DeviceInfo, EncodeInput, Engine, EngineInfo, Submit};
@@ -1219,6 +1220,19 @@ impl Engine for Cherenkov {
             target_format: Some("f32 RGBA framebuffer".to_string()),
             cpu: info.cpu.clone().or_else(crate::cpu_model),
             thermal_celsius: crate::thermal_celsius(),
+        }
+    }
+
+    fn memory(&self) -> AdapterMemory {
+        let usage = self.engine.memory();
+        AdapterMemory {
+            engine: Reading::Measured(EngineBytes {
+                cpu_bytes: usage.cpu.0,
+                gpu_bytes: usage.gpu.0,
+            }),
+            wgpu_allocator: Reading::unavailable("cherenkov-cpu has no wgpu allocator"),
+            skia_budgeted: Reading::unavailable("cherenkov-cpu has no Skia budget"),
+            vk_memory_budget: Reading::unavailable("cherenkov-cpu has no Vulkan device"),
         }
     }
 }

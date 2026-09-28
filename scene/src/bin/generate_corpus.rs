@@ -619,7 +619,8 @@ fn main() -> ExitCode {
 fn text_page_body(l: &mut LayerBuilder, shaped: &[Vec<GlyphRun>]) {
     let pitch = 54.0;
     for (i, runs) in (0u8..38).map(|i| (i, &shaped[usize::from(i) % shaped.len()])) {
-        let y = 56.0 + f64::from(i) * pitch;
+        // Exact either way: i < 38 and pitch = 54 are small integers.
+        let y = f64::from(i).mul_add(pitch, 56.0);
         for run in runs {
             l.glyphs(offset_run(run, 24.0 - f64::from(TEXT_PAD), y));
         }

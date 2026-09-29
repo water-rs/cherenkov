@@ -89,9 +89,9 @@ struct Reply<T> {
 
 /// A single reply from the local render executor.
 pub struct ReplySender<T>(Rc<RefCell<Reply<T>>>);
-pub(crate) struct Receiver<T>(Rc<RefCell<Reply<T>>>);
+pub struct Receiver<T>(Rc<RefCell<Reply<T>>>);
 
-pub(crate) fn channel<T>() -> (ReplySender<T>, Receiver<T>) {
+pub fn channel<T>() -> (ReplySender<T>, Receiver<T>) {
     let shared = Rc::new(RefCell::new(Reply {
         value: None,
         closed: false,
@@ -131,6 +131,10 @@ impl<T> Drop for ReplySender<T> {
 }
 
 impl<T> Receiver<T> {
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
     pub(crate) async fn recv(self) -> Result<T, RecvError> {
         self.await
     }

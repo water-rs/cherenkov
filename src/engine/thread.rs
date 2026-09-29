@@ -217,6 +217,10 @@ fn render<B: Backend>(
     Ok((next, stats))
 }
 #[cfg(target_arch = "wasm32")]
+#[expect(
+    clippy::future_not_send,
+    reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+)]
 async fn render_local<B: Backend>(
     renderer: &mut B::Renderer,
     surfaces: &mut HashMap<SurfaceId, SurfaceState>,
@@ -312,6 +316,10 @@ struct LocalState<B: Backend> {
 }
 #[cfg(target_arch = "wasm32")]
 impl<B: Backend> LocalState<B> {
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
     async fn apply(&mut self, message: Message<B>) -> bool {
         let Self {
             renderer,

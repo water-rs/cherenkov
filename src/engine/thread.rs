@@ -13,9 +13,11 @@ use rustc_hash::FxHashMap;
 
 use crate::WorkingColor;
 use crate::backend::{Backend, Display, Frame, Redraw, Renderer, SurfaceFrame};
-use crate::error::{EngineError, RenderError};
+use crate::error::{EngineError, RenderError, ResourceError};
 use crate::frame::{FrameId, FrameStats, Next};
+use crate::image::ImageUpload;
 use crate::message::{ChangeSet, LayerOp, Message, Op, SurfaceId};
+use crate::paint::ImageId;
 use crate::tree::SurfaceTree;
 
 /// One surface's render-thread state.
@@ -92,6 +94,9 @@ pub fn run<B: Backend>(
                 }
             }
             Message::Resource(op) => op(&mut renderer),
+            Message::ReplaceImage { id, image, reply } => {
+                let _ = reply.send(replace_image::<B>(&mut renderer, &mut surfaces, id, image));
+            }
             Message::Render {
                 time,
                 mut commits,
@@ -124,6 +129,27 @@ pub fn run<B: Backend>(
             Message::Shutdown => break,
         }
     }
+}
+
+/// Replaces image `id`'s pixels and marks changed only the surfaces whose
+/// content samples the image; the next render redraws those with the new
+/// pixels and leaves every other surface's skip intact. Returns whether any
+/// surface was marked, which is when the host needs a frame.
+fn replace_image<B: Backend>(
+    renderer: &mut B::Renderer,
+    surfaces: &mut FxHashMap<SurfaceId, SurfaceState>,
+    id: ImageId,
+    image: ImageUpload,
+) -> Result<bool, ResourceError> {
+    renderer.replace_image(id, image)?;
+    let mut marked = false;
+    for (surface, state) in surfaces {
+        if renderer.samples_image(*surface, id) {
+            state.changed = true;
+            marked = true;
+        }
+    }
+    Ok(marked)
 }
 
 /// Applies one surface's committed change set into its tree, forwarding
@@ -447,6 +473,9 @@ impl<B: Backend> LocalState<B> {
                 }
             }
             Message::Resource(op) => op(renderer),
+            Message::ReplaceImage { id, image, reply } => {
+                let _ = reply.send(replace_image::<B>(renderer, surfaces, id, image));
+            }
             Message::AsyncResource(op) => op(renderer).await,
             Message::Render {
                 time,

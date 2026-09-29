@@ -350,6 +350,24 @@ impl DisplayList {
         bytes
     }
 
+    /// Whether any command, including those of nested pictures, samples
+    /// image `id`: an image draw, or an image paint of a fill, stroke or
+    /// glyph run.
+    pub(crate) fn references_image(&self, id: ImageId) -> bool {
+        self.commands.iter().any(|command| match command {
+            Command::Fill { paint, .. }
+            | Command::Stroke { paint, .. }
+            | Command::Glyphs { paint, .. } => paint.references_image(id),
+            Command::Image { image, .. } => *image == id,
+            Command::Picture { picture, .. } => picture.display_list().references_image(id),
+            Command::Shadow { .. }
+            | Command::BeginClip { .. }
+            | Command::BeginTransform { .. }
+            | Command::BeginGroup { .. }
+            | Command::End => false,
+        })
+    }
+
     /// Number of commands.
     #[must_use]
     pub const fn len(&self) -> usize {

@@ -386,6 +386,28 @@ impl<O: Operation, E> Content<O, E> {
         self.emissions.clear();
     }
 
+    /// Whether the current source commands, slot updates applied and nested
+    /// pictures included, sample image `id`.
+    #[must_use]
+    pub fn references_image(&self, id: crate::ImageId) -> bool {
+        self.list.display_list().references_image(id)
+    }
+
+    /// Discard compiled resource references after image `id`'s pixels were
+    /// replaced behind the same id. Lowering resolves an image's dimensions,
+    /// and on some backends its storage, into the retained operations, so
+    /// content that samples `id` is lowered again. Content with pending slot
+    /// updates is discarded too: its operations were compiled from operands
+    /// the updates have since replaced, and those may still reference `id`.
+    /// Returns whether anything was discarded.
+    pub fn invalidate_image(&mut self, id: crate::ImageId) -> bool {
+        let stale = self.lowered.is_some() && (!self.dirty.is_empty() || self.references_image(id));
+        if stale {
+            self.invalidate();
+        }
+        stale
+    }
+
     /// Accumulate every commit arriving before the next render.
     ///
     /// # Panics

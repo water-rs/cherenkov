@@ -100,6 +100,22 @@ pub trait Renderer: 'static {
     /// [`ResourceError`] when the upload cannot be used.
     fn add_image(&mut self, id: ImageId, image: ImageUpload) -> Result<(), ResourceError>;
 
+    /// Replaces a registered image's pixels behind the same id: every
+    /// recording naming `id` samples the new pixels from the next render
+    /// on. Same dimensions reuse the backing storage; different dimensions
+    /// reallocate it and refresh every cache that referenced the old one.
+    /// After a replacement the render loop marks changed exactly the
+    /// surfaces for which [`Renderer::samples_image`] answers true.
+    ///
+    /// # Errors
+    /// [`ResourceError`] when the upload cannot be used; the image keeps
+    /// its previous pixels.
+    fn replace_image(&mut self, id: ImageId, image: ImageUpload) -> Result<(), ResourceError>;
+
+    /// Whether any layer content on `surface`, with its slot updates
+    /// applied and nested pictures included, samples image `id`.
+    fn samples_image(&self, surface: SurfaceId, id: ImageId) -> bool;
+
     /// Unregisters an image.
     fn remove_image(&mut self, id: ImageId);
 

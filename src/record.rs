@@ -242,7 +242,7 @@ impl<T> Watch<T> {
                     let value = convert(context.into_value());
                     let from = std::mem::replace(&mut *last.borrow_mut(), value.clone());
                     match animation {
-                        Some(animation) => state.animate(*command, from, value, animation),
+                        Some(animation) => state.animate(*command, &from, value, animation),
                         None => state.snap(SlotUpdate {
                             command: *command,
                             value,
@@ -383,7 +383,7 @@ impl LiveState {
     /// # Panics
     /// Panics on a `Decay` animation, the same invariant `scroll_offset`'s
     /// siblings hold.
-    fn animate(&self, command: u32, from: Operand, target: Operand, animation: Animation) {
+    fn animate(&self, command: u32, from: &Operand, target: Operand, animation: Animation) {
         assert!(
             !matches!(animation, Animation::Decay(_)),
             "Decay is only legal on scroll_offset"
@@ -393,12 +393,11 @@ impl LiveState {
             operand: target.kind(),
         };
         let mut tracks = self.tracks.borrow_mut();
-        let mut tracked = match tracks.get_mut(&slot) {
-            // A running track retargets, keeping the last sampled position
-            // and velocity when the new target keeps the lane layout.
-            Some(track) => track.retarget(target.clone(), animation),
-            None => false,
-        };
+        // A running track retargets, keeping the last sampled position and
+        // velocity when the new target keeps the lane layout.
+        let mut tracked = tracks
+            .get_mut(&slot)
+            .is_some_and(|track| track.retarget(target.clone(), animation));
         if !tracked && let Some(from) = from.anim_lanes(&target) {
             tracks.insert(slot, OperandTrack::new(from, target.clone(), animation));
             tracked = true;
@@ -869,7 +868,7 @@ impl Content {
     /// operand updates [`take_change`](Self::take_change) drains. Returns
     /// `true` while animations still run — the surface needs another frame
     /// to keep them moving.
-    pub(crate) fn sample(&mut self, time: Instant) -> bool {
+    pub(crate) fn sample(&self, time: Instant) -> bool {
         self.live.sample(time)
     }
 

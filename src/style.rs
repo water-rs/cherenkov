@@ -207,6 +207,10 @@ impl crate::animation::AnimLanes for Shadow {
         Some(lanes.into_boxed_slice())
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "f64 lanes quantize to f32 shadow colour"
+    )]
     fn with_lanes(&self, lanes: &[f64]) -> Self {
         Self {
             sigma: lanes[0],
@@ -230,6 +234,10 @@ impl crate::animation::AnimLanes for Group {
             .then(|| Box::new([f64::from(self.opacity)]) as Box<[f64]>)
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "f64 lanes quantize to f32 opacity"
+    )]
     fn with_lanes(&self, lanes: &[f64]) -> Self {
         Self {
             opacity: lanes[0] as f32,

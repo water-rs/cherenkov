@@ -577,7 +577,7 @@ pub const fn rubber_band_spring() -> Spring {
 /// both endpoints must decompose into the same lane layout — same variant,
 /// same stop count, same path verbs. `None` marks a pair that cannot
 /// interpolate; the change then snaps like an un-animated one.
-pub(crate) trait AnimLanes: Sized {
+pub trait AnimLanes: Sized {
     /// `self`'s lanes under `target`'s layout; `None` when the endpoints
     /// cannot interpolate.
     fn anim_lanes(&self, target: &Self) -> Option<Box<[f64]>>;
@@ -642,7 +642,7 @@ impl AnimLanes for Stroke {
 /// of the layer tree's `Track` on the render side. The endpoints are kept
 /// as lanes; the displayed operand rebuilds from the target's layout each
 /// frame.
-pub(crate) struct OperandTrack {
+pub struct OperandTrack {
     /// The lanes the track started from (its retarget snapshot).
     from: Box<[f64]>,
     /// The lane velocities the track started with.
@@ -656,10 +656,13 @@ pub(crate) struct OperandTrack {
     /// The time the track started; `None` until the first sample, so a
     /// track committed between frames starts at its presentation time.
     start: Option<Instant>,
-    /// The last sampled `(time, position, velocity)`, for retarget
-    /// continuity.
-    last: Option<(Instant, Box<[f64]>, Box<[f64]>)>,
+    /// The last sampled state, for retarget continuity.
+    last: Option<Sampled>,
 }
+
+/// A track's sample state: `(time, position, velocity)` — the anchor a
+/// retarget continues from.
+type Sampled = (Instant, Box<[f64]>, Box<[f64]>);
 
 impl OperandTrack {
     /// A track from `from`'s lanes to `target` with zero velocity.
@@ -745,7 +748,7 @@ impl OperandTrack {
                 }
                 // A settled spring reports its target exactly.
                 if settled {
-                    pos = self.target_lanes.clone();
+                    pos.clone_from(&self.target_lanes);
                     vel.iter_mut().for_each(|v| *v = 0.0);
                     running = false;
                 }

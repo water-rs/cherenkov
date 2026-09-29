@@ -77,6 +77,10 @@ fn lane_point(lanes: &[f64]) -> Point {
     Point::new(lanes[0], lanes[1])
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "f64 lanes quantize to f32 colour components"
+)]
 fn lane_color(lanes: &[f64]) -> WorkingColor {
     WorkingColor::new([
         lanes[0] as f32,
@@ -86,6 +90,10 @@ fn lane_color(lanes: &[f64]) -> WorkingColor {
     ])
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "f64 lanes quantize to f32 stop offsets"
+)]
 fn lane_stops(lanes: &[f64]) -> Vec<ColorStop> {
     lanes
         .chunks_exact(5)
@@ -173,6 +181,10 @@ impl AnimLanes for Paint {
         Some(lanes.into_boxed_slice())
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "f64 lanes quantize to f32 paint fields"
+    )]
     fn with_lanes(&self, lanes: &[f64]) -> Self {
         match self {
             Self::Solid(_) => Self::Solid(lane_color(lanes)),

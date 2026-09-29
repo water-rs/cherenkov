@@ -3619,7 +3619,7 @@ fn run() -> Result<(), SceneError> {
             ));
             let item = panel.item_count();
             panel.fill(
-                shape.clone(),
+                shape,
                 Paint::Linear(LinearGradient {
                     start: Point::new(24.0, 64.0),
                     end: Point::new(232.0, 200.0),

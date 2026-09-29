@@ -58,6 +58,7 @@ pub struct Engine<B: Backend> {
     next_image: Cell<u64>,
     next_shader: Cell<u64>,
     next_filter: Cell<u64>,
+    next_backdrop_shader: Cell<u64>,
     thread: Option<std::thread::JoinHandle<()>>,
     /// The type-erased `Message::Resource` sender resource drops use.
     release: Rc<dyn Fn(ResOp<B>)>,
@@ -107,6 +108,7 @@ impl<B: Backend> Engine<B> {
             next_image: Cell::new(1),
             next_shader: Cell::new(1),
             next_filter: Cell::new(1),
+            next_backdrop_shader: Cell::new(1),
             thread: Some(render_thread),
             release: Rc::new(move |op: ResOp<B>| {
                 let _ = release_tx.send(Message::Resource(op));
@@ -368,6 +370,38 @@ impl<B: ShaderPaint> Engine<B> {
         Ok(Shader::new(
             id,
             self.on_drop(move |r| B::remove_shader(r, id)),
+        ))
+    }
+}
+
+impl<B: crate::BackdropShaders> Engine<B> {
+    /// Registers a backdrop effect shader, blocking until the render
+    /// thread has compiled and validated it.
+    ///
+    /// # Errors
+    /// [`ResourceError::Shader`] when the source fails validation, its
+    /// `reach` is not a finite non-negative number, or pipeline creation
+    /// fails; [`ResourceError::Lost`] when the render thread is gone.
+    pub fn backdrop_shader(
+        &self,
+        source: crate::BackdropShaderSource,
+    ) -> Result<crate::BackdropShader, ResourceError> {
+        if !(source.reach.is_finite() && source.reach >= 0.0) {
+            return Err(ResourceError::Shader(
+                "backdrop shader reach must be a finite non-negative number".into(),
+            ));
+        }
+        let id = crate::BackdropShaderId::new(Self::alloc(&self.next_backdrop_shader));
+        let reach = source.reach;
+        let (reply, rx) = std::sync::mpsc::channel();
+        (self.release)(Box::new(move |r: &mut B::Renderer| {
+            let _ = reply.send(B::add_backdrop_shader(r, id, source));
+        }));
+        rx.recv().map_err(|_| ResourceError::Lost)??;
+        Ok(crate::BackdropShader::new(
+            id,
+            reach,
+            self.on_drop(move |r| B::remove_backdrop_shader(r, id)),
         ))
     }
 }

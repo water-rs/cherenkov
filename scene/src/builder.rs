@@ -93,6 +93,7 @@ impl SceneBuilder {
         fn opacity(opacity: f64);
         fn blend(blend: BlendMode);
         fn backdrop(group: u32);
+        fn backdrop_effect(effect: crate::BackdropEffectSpec);
         fn fill(shape: Shape, paint: Paint);
         fn fill_rule(shape: Shape, rule: FillRule, paint: Paint);
         fn stroke(shape: Shape, stroke: StrokeStyle, paint: Paint);
@@ -144,6 +145,13 @@ impl LayerBuilder<'_> {
     /// Set the filter applied to the layer's isolated content.
     pub fn filter(&mut self, filter: LayerFilter) -> &mut Self {
         self.layer.filter = Some(Box::new(filter));
+        self
+    }
+
+    /// Set the layer's per-member [`crate::BackdropEffectSpec`] on its
+    /// backdrop composite.
+    pub const fn backdrop_effect(&mut self, effect: crate::BackdropEffectSpec) -> &mut Self {
+        self.layer.backdrop_effect = Some(effect);
         self
     }
 

@@ -459,12 +459,16 @@ Requires the `Backdrop` capability for an unfiltered group; `surface.backdrop_gr
 
 ```rust
 let glass: BackdropGroup = surface.backdrop_group(Blur::new(24.0).then(Saturation(1.8))); // SpatialFilter
-tx[&toolbar].backdrop(glass.sample(refraction.clone()));
-tx[&tab_bar].backdrop(glass.sample(refraction));
+tx[&toolbar].backdrop(glass.sample_with(Refraction { depth: 8.0, strength: 12.0 }));
+tx[&tab_bar].backdrop(glass.sample()); // plain bilinear sample of the shared capture
 ```
 
 - **One capture per group.** A group owns one capture and one spatial filter chain. Each member applies its own per-element effect on the shared result: a colour filter, a shader, or a filter that takes shape input. So there is one capture and one blur per group, whatever the number of members.
-- **Handle rules.** `BackdropGroup` is an RAII, `!Send` handle.
+- **Member effects.** `sample_with(effect)` accepts `Color` (a 3×4 premultiplied matrix), `Refraction { depth, strength }` (edge-following displacement), `Rim { width, color, gain }` (an additive rim light inside the member edge), or a `BackdropShaderEffect` from a registered `BackdropShader`'s `effect(uniforms)`. `sample()` stays the plain unshifted sample. An effect's sampling reach grows the group's capture region around the member; `Color` and `Rim` reach is zero.
+- **Effect shaders.** `engine.backdrop_shader(BackdropShaderSource::wgsl(src).reach(px))` registers a `backdrop_effect(p, sdf, normal, size, params)` fragment — `p` is the member pixel in device space, `sdf`/`normal` the member clip's signed distance and outward normal, `size` the member's device size — which samples the shared capture through `backdrop_sample(q)`. `BackdropShader` is an RAII handle; a member still sampling a dropped shader fails the frame.
+- **Capability.** Custom shaders sit behind `BackdropShaders: Backdrop` (`add_backdrop_shader`/`remove_backdrop_shader`), the same trait-per-capability shape as `Filters`/`Runs<F>`: a backend that cannot run user fragment code does not implement the trait. `Engine<B>` binds shaders only where `B: BackdropShaders`. `Color`, `Refraction` and `Rim` are built-in effects on `Backdrop` itself — no extra bound.
+- **Backends.** The GPU backend implements all four effects; the CPU backend implements `Color`, `Refraction` and `Rim`, and rejects a `Shader` member effect with `Unsupported("backdrop-shader")`.
+- **Handle rules.** `BackdropGroup` is an RAII, `!Send` handle. A refraction, rim or shader effect on a member whose clip is a path or mask — anything without an analytic SDF — fails with `Unsupported("backdrop-effect-sdf-path")`; `Color` works on any member.
 
 ## External content
 

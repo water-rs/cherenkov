@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{BlendMode, Draw, ResourceHash, Shape};
+use crate::{BackdropEffectSpec, BlendMode, Draw, ResourceHash, Shape};
 use kurbo::{Affine, Rect, Vec2};
 
 /// One item in a layer's ordered item list: a child layer or a draw command.
@@ -50,6 +50,11 @@ pub struct Layer {
     /// before `opacity` and `blend`; the layer clip masks its output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<Box<LayerFilter>>,
+    /// The per-member effect applied to the backdrop composite
+    /// ([`crate::BackdropEffectSpec`]). Only meaningful with `backdrop`;
+    /// `None` is the plain bilinear sample.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backdrop_effect: Option<BackdropEffectSpec>,
     /// The layer's scroll offset: content and children are translated by
     /// `-scroll_offset` inside the layer's clip; `transform` is untouched.
     /// Zero (the default) draws them untranslated.
@@ -254,6 +259,7 @@ impl Default for Layer {
             blend: BlendMode::Normal,
             backdrop: None,
             filter: None,
+            backdrop_effect: None,
             scroll_offset: Vec2::ZERO,
             motion: None,
             items: Vec::new(),

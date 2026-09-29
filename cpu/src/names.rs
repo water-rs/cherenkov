@@ -16,6 +16,11 @@ pub const FILTER_GPU_IMAGE: &str = "filter-gpu-image";
 pub const BACKDROP_UNCLIPPED: &str = "backdrop-unclipped";
 /// A backdrop group whose filter footprint cannot be bounded.
 pub const BACKDROP_FOOTPRINT: &str = "backdrop-footprint";
+/// A per-member backdrop effect that reads the clip's signed distance
+/// on a clip without an analytic boundary (`Path`/`Line`).
+pub const BACKDROP_EFFECT_SDF_PATH: &str = "backdrop-effect-sdf-path";
+/// A backdrop effect shader — a GPU-only capability.
+pub const BACKDROP_SHADER: &str = "backdrop-shader";
 /// A stroked glyph run.
 pub const GLYPH_STROKE: &str = "glyph-stroke";
 /// A colour font construct this backend cannot render: a bitmap-only

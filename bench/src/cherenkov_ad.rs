@@ -27,9 +27,9 @@ use cherenkov_gpu::{Gpu, GpuConfig, ScratchFormat};
 use cherenkov_oracle::color::to_working;
 use cherenkov_oracle::present::presented_srgb_to_working;
 use cherenkov_scene::{
-    BackdropFilter, BlendMode, ColorSpace, Draw as SceneDraw, Extend, Feature, FilterBlend,
-    GlyphRun as SceneGlyphRun, ImageColorSpace, ImageEncoding, Item, Layer as SceneLayer,
-    LayerFilter, Paint as ScenePaint, ResourceHash, Shape,
+    BackdropEffectSpec, BackdropFilter, BlendMode, ColorSpace, Draw as SceneDraw, Extend, Feature,
+    FilterBlend, GlyphRun as SceneGlyphRun, ImageColorSpace, ImageEncoding, Item,
+    Layer as SceneLayer, LayerFilter, Paint as ScenePaint, ResourceHash, Shape,
 };
 use filtrate::{FilterExt, FilterImage, filters};
 use kurbo::{Affine, BezPath, Circle, Ellipse, Line, Rect, RoundedRect, Vec2};
@@ -426,6 +426,8 @@ struct PrepLayer {
     items: Vec<PrepItem>,
     /// The backdrop group this layer samples, if any.
     backdrop: Option<u32>,
+    /// The member's per-member backdrop effect, if any.
+    backdrop_effect: Option<BackdropEffectSpec>,
     /// The layer's one-time motion.
     motion: Option<LayerMotion>,
 }
@@ -726,6 +728,7 @@ fn cherenkov_features() -> Vec<Feature> {
         Feature::Backdrop,
         Feature::BackdropBlur,
         Feature::BackdropColorMatrix,
+        Feature::BackdropEffect,
         // `sRGB` maps to `SrgbEncoded`; `linear-p3` and `linear-srgb` are
         // both linear interpolation, which is the working space already.
         Feature::InterpolationSpace(ColorSpace::Srgb),
@@ -795,7 +798,10 @@ fn unsupported_feature(u: &str) -> Feature {
         "glyph-stroke" | "color-font" => Feature::Glyphs,
         "glyph-transform" => Feature::GlyphTransform,
         "shadow" => Feature::Shadow,
-        "backdrop-unclipped" | "backdrop-footprint" => Feature::Backdrop,
+        "backdrop-unclipped"
+        | "backdrop-footprint"
+        | "backdrop-effect-sdf-path"
+        | "backdrop-shader" => Feature::Backdrop,
         _ => Feature::Fill,
     }
 }
@@ -1308,6 +1314,7 @@ fn prep_layer(
         },
         items: Vec::new(),
         backdrop: layer.backdrop,
+        backdrop_effect: layer.backdrop_effect.clone(),
         motion: layer
             .motion
             .as_ref()
@@ -1441,7 +1448,36 @@ fn build_layer(
             clip_shape(edit, clip);
         }
         if let Some(id) = prep.backdrop {
-            edit.backdrop(groups[&id].sample());
+            let group = &groups[&id];
+            match &prep.backdrop_effect {
+                None => {
+                    edit.backdrop(group.sample());
+                }
+                Some(spec) => {
+                    use BackdropEffectSpec as S;
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "effect parameters are f32 at the engine boundary"
+                    )]
+                    let effect: cherenkov::BackdropEffect = match spec {
+                        S::ColorMatrix { matrix } => {
+                            cherenkov::ColorMatrix(matrix.map(|v| v as f32)).into()
+                        }
+                        S::Refraction { depth, strength } => cherenkov::Refraction {
+                            depth: *depth as f32,
+                            strength: *strength as f32,
+                        }
+                        .into(),
+                        S::RimLight { width, color, gain } => cherenkov::Rim {
+                            width: *width as f32,
+                            color: color.map(|v| v as f32),
+                            gain: *gain as f32,
+                        }
+                        .into(),
+                    };
+                    edit.backdrop(group.sample_with(effect));
+                }
+            }
         }
     }
     if let Some(parent) = parent {

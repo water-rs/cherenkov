@@ -58,6 +58,8 @@ pub enum PipelineKind {
     /// Write the fragment result unblended; blended composites do their
     /// compositing in the shader.
     Replace,
+    /// A registered backdrop effect shader's pipeline (its raw id).
+    Effect(u64),
 }
 
 /// The specialised fragment pipeline a range draws with.
@@ -788,11 +790,12 @@ impl<'a> Lowering<'a> {
         parent: Affine,
     ) -> Result<(), RenderError> {
         let node = tree.layer(id);
-        if let Some(gid) = node.backdrop {
-            let g = gid.raw();
+        if let Some(sample) = &node.backdrop {
+            let g = sample.group().raw();
             if !groups.contains_key(&g) {
                 return Err(RenderError::Render(format!(
-                    "layer {id:?} samples unknown backdrop group {gid:?}"
+                    "layer {id:?} samples unknown backdrop group {:?}",
+                    sample.group()
                 )));
             }
             let clip = node
@@ -800,13 +803,20 @@ impl<'a> Lowering<'a> {
                 .as_ref()
                 .ok_or(RenderError::Unsupported(names::BACKDROP_UNCLIPPED))?;
             let member = clip_device_bounds(parent * node.transform, clip)?;
+            let reach = sample.effect().map(effect_reach).transpose()?;
+            // The capture region covers every member's reach; the member's
+            // own bounds stay uninflated for its composite and size input.
+            let footprint = member.inflate(
+                f64::from(reach.unwrap_or(0.0)),
+                f64::from(reach.unwrap_or(0.0)),
+            );
             let plan = self.backdrops.entry(g).or_insert_with(|| BackdropPlan {
                 first: id,
-                union: member,
+                union: footprint,
                 region: [0; 4],
                 members: FxHashMap::default(),
             });
-            plan.union = plan.union.union(member);
+            plan.union = plan.union.union(footprint);
             plan.members.insert(id, member);
         }
         for child in &node.children {
@@ -1385,27 +1395,40 @@ impl<'a> Lowering<'a> {
 
     /// Emits a member's composite of the shared capture as the
     /// bottom-most draw inside its clip, covering `member ∩ region`.
+    /// Members without an effect keep the plain `PAINT_TEXTURE` sample;
+    /// an effect turns the instance into `PAINT_BACKDROP` with its kind
+    /// and parameter stops packed in `meta[3]`'s low bits.
     #[expect(clippy::cast_precision_loss, reason = "region fits the surface")]
-    fn emit_backdrop_sample(&mut self, gid: u64, member: LayerId) {
+    fn emit_backdrop_sample(
+        &mut self,
+        gid: u64,
+        member: LayerId,
+        effect: Option<&cherenkov::BackdropEffect>,
+    ) -> Result<(), RenderError> {
         let Some(plan) = self.backdrops.get(&gid) else {
-            return;
+            return Ok(());
         };
         let region = plan.region;
         if region[2] == 0 || region[3] == 0 {
-            return;
+            return Ok(());
         }
-        let Some(&bounds) = plan.members.get(&member) else {
-            return;
+        let Some(&member_bounds) = plan.members.get(&member) else {
+            return Ok(());
         };
-        let (rx, ry) = (region[0] as f32, region[1] as f32);
-        let bounds = bounds.intersect(Rect::new(
+        let (rx, ry, rw, rh) = (
+            region[0] as f32,
+            region[1] as f32,
+            region[2] as f32,
+            region[3] as f32,
+        );
+        let bounds = member_bounds.intersect(Rect::new(
             f64::from(region[0]),
             f64::from(region[1]),
             f64::from(region[0] + region[2]),
             f64::from(region[1] + region[3]),
         ));
         if bounds.width() <= 0.0 || bounds.height() <= 0.0 {
-            return;
+            return Ok(());
         }
         let mut inst = self.base(KIND_SPAN, affine(Affine::IDENTITY));
         inst.bounds = [
@@ -1419,9 +1442,39 @@ impl<'a> Lowering<'a> {
         // `grad.xy` carries the capture region's texel origin.
         inst.grad[0] = rx;
         inst.grad[1] = ry;
+        let mut pipeline = PipelineKind::SrcOver;
+        if let Some(effect) = effect {
+            // Refraction and shader effects evaluate the member clip's
+            // SDF; a path/mask clip has no analytic shape to read.
+            if !matches!(effect, cherenkov::BackdropEffect::Color(_))
+                && self.clip.is_none_or(|c| c.mask.is_some())
+            {
+                return Err(RenderError::Unsupported(names::BACKDROP_EFFECT_SDF_PATH));
+            }
+            #[expect(clippy::cast_possible_truncation, reason = "stop counts fit u32")]
+            let first = self.frame.stops.len() as u32;
+            let (kind, count) = push_effect_stops(&mut self.frame.stops, effect);
+            inst.meta[1] = super::instance::PAINT_BACKDROP;
+            inst.meta[2] = first;
+            inst.meta[3] |= kind | (count << 8);
+            // `grad2.zw` is the member's device size for effect shaders:
+            // the unclipped bounds, not the visible intersection.
+            inst.grad2 = [
+                rw,
+                rh,
+                f32_f64(member_bounds.width()),
+                f32_f64(member_bounds.height()),
+            ];
+            if let cherenkov::BackdropEffect::Shader(s) = effect {
+                pipeline = PipelineKind::Effect(s.shader.raw());
+            }
+        }
         self.set_source(Some(Source::Backdrop(gid)));
+        self.set_pipeline(pipeline);
         self.push_instance(&inst);
+        self.set_pipeline(PipelineKind::SrcOver);
         self.set_source(None);
+        Ok(())
     }
 
     /// Emits the composite quad sampling `source` at texel origin
@@ -1643,7 +1696,7 @@ impl<'a> Lowering<'a> {
         glyphs: &GlyphContext<'_>,
     ) -> Result<(), RenderError> {
         let node = tree.layer(id);
-        let backdrop = node.backdrop.map(cherenkov::BackdropId::raw);
+        let backdrop = node.backdrop.clone();
         let saved = self.transform;
         let saved_animating = self.animating;
         self.animating |= node.animating();
@@ -1658,7 +1711,8 @@ impl<'a> Lowering<'a> {
             || node.blend != cherenkov::BlendMode::Normal
             // The root already renders into the surface target.
             || (id != tree.root() && node.blends_within());
-        if let Some(gid) = backdrop {
+        if let Some(sample) = &backdrop {
+            let gid = sample.group().raw();
             let plan = &self.backdrops[&gid];
             if plan.first == id && plan.region[2] != 0 && plan.region[3] != 0 {
                 self.emit_capture(gid);
@@ -1668,13 +1722,12 @@ impl<'a> Lowering<'a> {
             // The member's sample draws to the current target under the
             // member clip, before and outside the layer's own isolation,
             // unaffected by the layer's opacity or blend.
-            if let Some(gid) = backdrop {
+            if let Some(sample) = &backdrop {
                 self.with_clip(
                     node.clip.as_ref(),
                     |s, _glyphs| {
                         s.transform = content_space;
-                        s.emit_backdrop_sample(gid, id);
-                        Ok(())
+                        s.emit_backdrop_sample(sample.group().raw(), id, sample.effect())
                     },
                     glyphs,
                 )?;
@@ -1703,8 +1756,8 @@ impl<'a> Lowering<'a> {
                 node.clip.as_ref(),
                 |s, glyphs| {
                     s.transform = content_space;
-                    if let Some(gid) = backdrop {
-                        s.emit_backdrop_sample(gid, id);
+                    if let Some(sample) = &backdrop {
+                        s.emit_backdrop_sample(sample.group().raw(), id, sample.effect())?;
                     }
                     if isolates {
                         let inner = s.clip;
@@ -3035,6 +3088,101 @@ impl<'a> Lowering<'a> {
             }
         }
         Ok(())
+    }
+}
+
+/// Validates a member effect and returns its sampling reach in device
+/// pixels — how far beyond the member bounds its samples can land.
+/// Invalid parameters fail like other invalid input: an explicit
+/// [`RenderError::Render`].
+fn effect_reach(effect: &cherenkov::BackdropEffect) -> Result<f32, RenderError> {
+    match effect {
+        cherenkov::BackdropEffect::Color(matrix) => {
+            if matrix.0.iter().all(|v| v.is_finite()) {
+                Ok(0.0)
+            } else {
+                Err(RenderError::Render(
+                    "backdrop colour effect has a non-finite matrix entry".into(),
+                ))
+            }
+        }
+        cherenkov::BackdropEffect::Refraction(r) => {
+            if r.depth.is_finite() && r.depth > 0.0 && r.strength.is_finite() && r.strength >= 0.0 {
+                Ok(r.strength)
+            } else {
+                Err(RenderError::Render(
+                    "backdrop refraction needs depth > 0 and strength >= 0, finite".into(),
+                ))
+            }
+        }
+        cherenkov::BackdropEffect::Rim(r) => {
+            if r.width.is_finite()
+                && r.width > 0.0
+                && r.gain.is_finite()
+                && r.color.iter().all(|v| v.is_finite())
+            {
+                Ok(0.0)
+            } else {
+                Err(RenderError::Render(
+                    "backdrop rim needs width > 0 and a finite colour and gain".into(),
+                ))
+            }
+        }
+        cherenkov::BackdropEffect::Shader(s) => {
+            if s.uniforms.len() <= 64
+                && s.uniforms.iter().all(|v| v.is_finite())
+                && effect.reach().is_finite()
+            {
+                Ok(effect.reach())
+            } else {
+                Err(RenderError::Render(
+                    "backdrop shader effect needs at most 64 finite uniforms".into(),
+                ))
+            }
+        }
+    }
+}
+
+/// Pushes a member effect's parameters into `stops` and returns its
+/// `(kind, stop count)`: `Color` packs three row stops (the row's
+/// `[r, g, b, bias]` in `color`), `Refraction` one stop (`depth`,
+/// `strength` in `color.xy`), `Rim` two stops (`(width, r, g, b)` and
+/// `(a, gain)`), `Shader` the uniforms packed four per stop, zero-filled.
+fn push_effect_stops(stops: &mut Vec<Stop>, effect: &cherenkov::BackdropEffect) -> (u32, u32) {
+    use super::instance::{EFFECT_COLOR, EFFECT_REFRACTION, EFFECT_RIM, EFFECT_SHADER};
+    let push = |stops: &mut Vec<Stop>, v: [f32; 4]| {
+        stops.push(Stop {
+            color: v,
+            offset: 0.0,
+            pad: [0.0; 3],
+        });
+    };
+    match effect {
+        cherenkov::BackdropEffect::Color(matrix) => {
+            for row in matrix.0.as_chunks::<4>().0 {
+                push(stops, *row);
+            }
+            (EFFECT_COLOR, 3)
+        }
+        cherenkov::BackdropEffect::Refraction(r) => {
+            push(stops, [r.depth, r.strength, 0.0, 0.0]);
+            (EFFECT_REFRACTION, 1)
+        }
+        cherenkov::BackdropEffect::Rim(r) => {
+            push(stops, [r.width, r.color[0], r.color[1], r.color[2]]);
+            push(stops, [r.color[3], r.gain, 0.0, 0.0]);
+            (EFFECT_RIM, 2)
+        }
+        cherenkov::BackdropEffect::Shader(s) => {
+            let mut count = 0;
+            for chunk in s.uniforms.chunks(4) {
+                let mut v = [0.0; 4];
+                v[..chunk.len()].copy_from_slice(chunk);
+                push(stops, v);
+                count += 1;
+            }
+            (EFFECT_SHADER, count)
+        }
     }
 }
 

@@ -41,3 +41,44 @@ pub enum BackdropFilter {
         matrix: [f64; 12],
     },
 }
+
+/// A member layer's per-member effect on its backdrop composite
+/// ([`crate::Layer::backdrop_effect`]).
+///
+/// The effect samples the group's filtered capture inside the member's
+/// clip; `ColorMatrix` needs only the member's own pixel, while
+/// `Refraction` and `RimLight` read the clip's signed distance and are
+/// unsupported on a path clip (`backdrop-effect-sdf-path`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "effect", content = "value", rename_all = "kebab-case")]
+pub enum BackdropEffectSpec {
+    /// A 3×4 colour matrix on the premultiplied sampled pixel, the same
+    /// layout as [`BackdropFilter::ColorMatrix`].
+    ColorMatrix {
+        /// The 12 coefficients, row-major.
+        matrix: [f64; 12],
+    },
+    /// Edge-following refraction: the sample point pulls inward along the
+    /// clip's unit outward normal by `strength · t²` where
+    /// `t = clamp(1 + d / depth, 0, 1)` and `d` is the signed distance to
+    /// the clip edge (negative inside).
+    Refraction {
+        /// How deep inside the clip the displacement fades out, in pixels.
+        depth: f64,
+        /// The maximum displacement at the edge, in pixels.
+        strength: f64,
+    },
+    /// A highlight inside the clip's rim: `c = sample(p)`,
+    /// `t = clamp(1 + d / width, 0, 1)` and
+    /// `c.rgb += color.rgb · color.a · gain · t²`, alpha unchanged.
+    RimLight {
+        /// The rim's width inside the clip edge, in pixels.
+        width: f64,
+        /// The highlight colour, straight-alpha linear Display P3 (the
+        /// scene's working space).
+        color: [f64; 4],
+        /// The highlight's gain; values above 1 push the rim above SDR
+        /// white.
+        gain: f64,
+    },
+}

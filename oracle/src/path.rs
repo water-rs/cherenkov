@@ -148,6 +148,14 @@ pub fn transformed(polylines: &[Polyline], affine: Affine) -> Vec<Polyline> {
 }
 
 /// All directed edges of `polylines` as `(x0, y0, x1, y1)` segments.
+///
+/// Fill semantics close every subpath implicitly (the PostScript
+/// convention, also used by the engine rasterizers): the last vertex
+/// connects back to the first whether or not the path carried an explicit
+/// `ClosePath`. This matters for curve-approximated paths whose final
+/// point lands a rounding ulp short of the start — without the implicit
+/// edge the boundary is an open contour and winding-based tests misjudge
+/// the scanlines that fall in the gap.
 #[must_use]
 pub fn edges(polylines: &[Polyline]) -> Vec<(f64, f64, f64, f64)> {
     let mut out = Vec::new();
@@ -155,7 +163,7 @@ pub fn edges(polylines: &[Polyline]) -> Vec<(f64, f64, f64, f64)> {
         for w in pl.points.windows(2) {
             out.push((w[0].0, w[0].1, w[1].0, w[1].1));
         }
-        if pl.closed && pl.points.len() > 1 {
+        if pl.points.len() > 1 {
             let p0 = pl.points[pl.points.len() - 1];
             let p1 = pl.points[0];
             out.push((p0.0, p0.1, p1.0, p1.1));

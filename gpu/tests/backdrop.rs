@@ -391,3 +391,282 @@ fn member_sample_is_not_attenuated_by_layer_opacity() -> Result<(), Box<dyn std:
     assert_pixel(pixel(&half, 7, 7), pixel(&full, 7, 7), 1e-3);
     Ok(())
 }
+
+#[test]
+fn colour_effect_tints_the_sampled_capture() -> Result<(), Box<dyn std::error::Error>> {
+    let engine = Engine::<Gpu>::new(GpuConfig::default())?;
+    let surface = engine.surface(Offscreen::new((32, 32), OffscreenFormat::LinearF16))?;
+    let group = surface.backdrop_group_unfiltered();
+    let member = surface.layer();
+    surface.update(|tx| {
+        tx[surface.root()].content(surface.record(|r| {
+            r.fill(
+                Rect::new(0.0, 0.0, 32.0, 32.0),
+                WorkingColor::new([1.0, 0.0, 0.0, 1.0]),
+            );
+        }));
+        tx[surface.root()].push(&member);
+        // rows: r' = r, g' = 0.5 (bias x alpha), b' = 0, alpha passes.
+        tx[&member]
+            .clip(Rect::new(8.0, 8.0, 24.0, 24.0))
+            .backdrop(group.sample_with(cherenkov::ColorMatrix([
+                1.0, 0.0, 0.0, 0.0, //
+                0.0, 0.0, 0.0, 0.5, //
+                0.0, 0.0, 0.0, 0.0,
+            ])));
+    });
+    engine.render(FrameTime::now())?;
+    let readback = surface.readback()?;
+    assert_pixel(pixel(&readback, 16, 16), [1.0, 0.5, 0.0, 1.0], 1e-3);
+    // Outside the member clip the surface is untouched.
+    assert_pixel(pixel(&readback, 4, 4), [1.0, 0.0, 0.0, 1.0], 1e-3);
+    Ok(())
+}
+
+#[test]
+fn refraction_displaces_edge_samples_but_not_the_centre() -> Result<(), Box<dyn std::error::Error>>
+{
+    let engine = Engine::<Gpu>::new(GpuConfig::default())?;
+    let surface = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
+    let group = surface.backdrop_group_unfiltered();
+    let member = surface.layer();
+    surface.update(|tx| {
+        tx[surface.root()].content(surface.record(|r| {
+            r.fill(
+                Rect::new(0.0, 0.0, 32.0, 64.0),
+                WorkingColor::new([1.0, 0.0, 0.0, 1.0]),
+            );
+            r.fill(
+                Rect::new(32.0, 0.0, 64.0, 64.0),
+                WorkingColor::new([0.0, 0.0, 1.0, 1.0]),
+            );
+        }));
+        tx[surface.root()].push(&member);
+        tx[&member]
+            .clip(Rect::new(8.0, 8.0, 56.0, 56.0))
+            .backdrop(group.sample_with(cherenkov::Refraction {
+                depth: 8.0,
+                strength: 40.0,
+            }));
+    });
+    engine.render(FrameTime::now())?;
+    let readback = surface.readback()?;
+    // At the member's left edge the sample point pulls inward along the
+    // normal by up to `strength` pixels: still red (x + 20 < 32 stays in
+    // the red half, so probe near the blue/red boundary instead).
+    // Near the right edge the normal points +x and the sample lands up to
+    // `strength` px to the left of the edge — into the red half.
+    assert_pixel(pixel(&readback, 54, 32), [1.0, 0.0, 0.0, 1.0], 1e-3);
+    // The centre is past `depth` from every edge: the unshifted sample.
+    assert_pixel(pixel(&readback, 32, 32), [0.0, 0.0, 1.0, 1.0], 1e-3);
+    assert_pixel(pixel(&readback, 20, 32), [1.0, 0.0, 0.0, 1.0], 1e-3);
+    Ok(())
+}
+
+#[test]
+fn shader_effect_lights_the_rim() -> Result<(), Box<dyn std::error::Error>> {
+    let engine = Engine::<Gpu>::new(GpuConfig::default())?;
+    let shader = engine.backdrop_shader(cherenkov::BackdropShaderSource::wgsl(
+        "fn backdrop_effect(p: vec2<f32>, sdf: f32, normal: vec2<f32>, size: vec2<f32>, params: array<vec4<f32>, 16>) -> vec4<f32> {
+            let rim = clamp(1.0 + sdf / 4.0, 0.0, 1.0);
+            return vec4<f32>(backdrop_sample(p).rgb * (1.0 + params[0].x * rim), backdrop_sample(p).a);
+        }",
+    ))?;
+    let surface = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
+    let group = surface.backdrop_group_unfiltered();
+    let member = surface.layer();
+    surface.update(|tx| {
+        tx[surface.root()].content(surface.record(|r| {
+            r.fill(
+                Rect::new(0.0, 0.0, 64.0, 64.0),
+                WorkingColor::new([1.0, 0.0, 0.0, 1.0]),
+            );
+        }));
+        tx[surface.root()].push(&member);
+        tx[&member]
+            .clip(Rect::new(8.0, 8.0, 56.0, 56.0))
+            .backdrop(group.sample_with(shader.effect(vec![3.0])));
+    });
+    engine.render(FrameTime::now())?;
+    let readback = surface.readback()?;
+    // A pixel inside the 4 px rim is multiplied by 1 + 3*rim > 1.
+    let lit = pixel(&readback, 10, 32);
+    assert!(lit[0] > 1.5, "rim pixel {lit:?}");
+    // The centre keeps the plain sample.
+    assert_pixel(pixel(&readback, 32, 32), [1.0, 0.0, 0.0, 1.0], 1e-3);
+    Ok(())
+}
+
+#[test]
+fn shader_effect_size_is_the_unclipped_member_size() -> Result<(), Box<dyn std::error::Error>> {
+    let engine = Engine::<Gpu>::new(GpuConfig::default())?;
+    let shader = engine.backdrop_shader(cherenkov::BackdropShaderSource::wgsl(
+        "fn backdrop_effect(p: vec2<f32>, sdf: f32, normal: vec2<f32>, size: vec2<f32>, params: array<vec4<f32>, 16>) -> vec4<f32> {
+            return vec4<f32>(size.x / 256.0, size.y / 256.0, 0.0, 1.0);
+        }",
+    ))?;
+    let surface = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
+    let group = surface.backdrop_group_unfiltered();
+    let member = surface.layer();
+    surface.update(|tx| {
+        tx[surface.root()].content(surface.record(|r| {
+            r.fill(
+                Rect::new(0.0, 0.0, 64.0, 64.0),
+                WorkingColor::new([1.0, 0.0, 0.0, 1.0]),
+            );
+        }));
+        tx[surface.root()].push(&member);
+        // The member clip runs 32 px off the left of the surface: its
+        // device bounds are 64x16, only half of it visible.
+        tx[&member]
+            .clip(Rect::new(-32.0, 0.0, 32.0, 16.0))
+            .backdrop(group.sample_with(shader.effect(Vec::new())));
+    });
+    engine.render(FrameTime::now())?;
+    let readback = surface.readback()?;
+    // `size` reports the member's 64x16 device bounds, not the 32x16
+    // intersection with the capture region.
+    assert_pixel(pixel(&readback, 8, 8), [0.25, 0.0625, 0.0, 1.0], 1e-3);
+    Ok(())
+}
+
+#[test]
+fn invalid_backdrop_shader_source_is_a_shader_error() {
+    let engine = Engine::<Gpu>::new(GpuConfig::default()).expect("engine");
+    let result = engine.backdrop_shader(cherenkov::BackdropShaderSource::wgsl(
+        "fn backdrop_effect(p: vec2<f32> {",
+    ));
+    assert!(
+        matches!(result, Err(cherenkov::ResourceError::Shader(_))),
+        "unexpected result {result:?}"
+    );
+}
+
+#[test]
+fn refraction_on_a_path_clip_is_unsupported() -> Result<(), Box<dyn std::error::Error>> {
+    let engine = Engine::<Gpu>::new(GpuConfig::default())?;
+    let surface = engine.surface(Offscreen::new((32, 32), OffscreenFormat::LinearF16))?;
+    let group = surface.backdrop_group_unfiltered();
+    let member = surface.layer();
+    surface.update(|tx| {
+        tx[surface.root()].push(&member);
+        tx[&member]
+            .clip(cherenkov::ShapeData::Path {
+                elements: vec![
+                    cherenkov::kurbo::PathEl::MoveTo((8.0, 8.0).into()),
+                    cherenkov::kurbo::PathEl::LineTo((24.0, 8.0).into()),
+                    cherenkov::kurbo::PathEl::LineTo((24.0, 24.0).into()),
+                    cherenkov::kurbo::PathEl::ClosePath,
+                ]
+                .into(),
+                rule: cherenkov::FillRule::NonZero,
+            })
+            .backdrop(group.sample_with(cherenkov::Refraction {
+                depth: 4.0,
+                strength: 4.0,
+            }));
+    });
+    let result = engine.render(FrameTime::now());
+    assert!(
+        matches!(
+            result,
+            Err(cherenkov::RenderError::Unsupported(name)) if name == "backdrop-effect-sdf-path"
+        ),
+        "unexpected result {result:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn dropped_backdrop_shader_fails_the_frame() -> Result<(), Box<dyn std::error::Error>> {
+    let engine = Engine::<Gpu>::new(GpuConfig::default())?;
+    let surface = engine.surface(Offscreen::new((32, 32), OffscreenFormat::LinearF16))?;
+    let group = surface.backdrop_group_unfiltered();
+    let member = surface.layer();
+    {
+        let shader = engine.backdrop_shader(cherenkov::BackdropShaderSource::wgsl(
+            "fn backdrop_effect(p: vec2<f32>, sdf: f32, normal: vec2<f32>, size: vec2<f32>, params: array<vec4<f32>, 16>) -> vec4<f32> {
+                return backdrop_sample(p);
+            }",
+        ))?;
+        surface.update(|tx| {
+            tx[surface.root()].push(&member);
+            tx[&member]
+                .clip(Rect::new(8.0, 8.0, 24.0, 24.0))
+                .backdrop(group.sample_with(shader.effect(vec![])));
+        });
+    }
+    let result = engine.render(FrameTime::now());
+    assert!(
+        matches!(result, Err(cherenkov::RenderError::Render(_))),
+        "unexpected result {result:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn effect_members_do_not_duplicate_the_capture() -> Result<(), Box<dyn std::error::Error>> {
+    let engine = Engine::<Gpu>::new(GpuConfig::default())?;
+    let surface = engine.surface(Offscreen::new((32, 32), OffscreenFormat::LinearF16))?;
+    let group = surface.backdrop_group_unfiltered();
+    let tint = cherenkov::ColorMatrix([
+        1.0, 0.0, 0.0, 0.0, //
+        0.0, 1.0, 0.0, 0.0, //
+        0.0, 0.0, 1.0, 0.0,
+    ]);
+    let members: Vec<_> = (0..3).map(|_| surface.layer()).collect();
+    surface.update(|tx| {
+        tx[surface.root()].content(surface.record(|r| {
+            r.fill(
+                Rect::new(0.0, 0.0, 32.0, 32.0),
+                WorkingColor::new([0.0, 1.0, 0.0, 1.0]),
+            );
+        }));
+        for member in &members {
+            tx[surface.root()].push(member);
+            tx[member]
+                .clip(Rect::new(4.0, 4.0, 20.0, 20.0))
+                .backdrop(group.sample_with(tint));
+        }
+    });
+    engine.render(FrameTime::now())?;
+    let memory = engine.memory();
+    // Three members over the same 16x16 union sample one shared capture.
+    assert_eq!(memory.backdrop_captures, Bytes(16 * 16 * 8));
+    assert_eq!(memory.backdrop_capture_format, Some("rgba16float"));
+    Ok(())
+}
+
+#[test]
+fn a_shaders_reach_grows_the_capture_region() -> Result<(), Box<dyn std::error::Error>> {
+    let engine = Engine::<Gpu>::new(GpuConfig::default())?;
+    let shader = engine.backdrop_shader(
+        cherenkov::BackdropShaderSource::wgsl(
+            "fn backdrop_effect(p: vec2<f32>, sdf: f32, normal: vec2<f32>, size: vec2<f32>, params: array<vec4<f32>, 16>) -> vec4<f32> {
+                return backdrop_sample(p);
+            }",
+        )
+        .reach(8.0),
+    )?;
+    let surface = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
+    let group = surface.backdrop_group_unfiltered();
+    let member = surface.layer();
+    surface.update(|tx| {
+        tx[surface.root()].content(surface.record(|r| {
+            r.fill(
+                Rect::new(0.0, 0.0, 64.0, 64.0),
+                WorkingColor::new([1.0, 0.0, 0.0, 1.0]),
+            );
+        }));
+        tx[surface.root()].push(&member);
+        tx[&member]
+            .clip(Rect::new(16.0, 16.0, 48.0, 48.0))
+            .backdrop(group.sample_with(shader.effect(vec![])));
+    });
+    engine.render(FrameTime::now())?;
+    let memory = engine.memory();
+    // The 32x32 member union grows by the 8 px reach on every side.
+    assert_eq!(memory.backdrop_captures, Bytes(48 * 48 * 8));
+    assert_eq!(memory.backdrop_capture_format, Some("rgba16float"));
+    Ok(())
+}

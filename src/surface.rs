@@ -347,7 +347,7 @@ enum EditOp<B: Backend> {
     Clip(Option<ShapeData>),
     Blend(BlendMode),
     Filter(Option<FilterId>),
-    Backdrop(Option<BackdropId>),
+    Backdrop(Option<crate::BackdropSample>),
     Content(LayerContent<B>),
     Push(LayerId),
     Insert(usize, LayerId),
@@ -583,9 +583,11 @@ impl<B: Backend> LayerEdit<B> {
     }
 
     /// Makes the layer a member of a backdrop group: it composites the
-    /// group's capture as the bottom-most draw inside its clip.
+    /// group's capture as the bottom-most draw inside its clip. A sample
+    /// made with [`BackdropGroup::sample_with`](crate::BackdropGroup::sample_with)
+    /// carries a per-member effect evaluated in the member's composite.
     pub fn backdrop(&mut self, sample: crate::BackdropSample) -> &mut Self {
-        self.ops.push(EditOp::Backdrop(Some(sample.group)));
+        self.ops.push(EditOp::Backdrop(Some(sample)));
         self
     }
 

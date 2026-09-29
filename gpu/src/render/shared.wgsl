@@ -20,6 +20,12 @@ const PAINT_TEXTURE: u32 = 3u;      // composite: sample the bound texture at th
 const PAINT_SWEEP: u32 = 4u;
 const PAINT_IMAGE: u32 = 5u;
 const PAINT_MESH: u32 = 6u;
+const PAINT_BACKDROP: u32 = 7u;   // member composite with a per-member effect
+
+const EFFECT_COLOR: u32 = 1u;
+const EFFECT_REFRACTION: u32 = 2u;
+const EFFECT_SHADER: u32 = 3u;
+const EFFECT_RIM: u32 = 4u;
 
 const EXTEND_PAD: u32 = 0u;
 const EXTEND_REPEAT: u32 = 1u;

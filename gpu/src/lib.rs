@@ -281,6 +281,22 @@ impl cherenkov::GpuContent for Gpu {
     }
 }
 
+// External frames (#165): retained producer planes sampled in place — no
+// copy, no raster path — decoded and converted into the working space in
+// the external fragment pipeline; see `render::external` and
+// `render::external.wgsl`.
+impl cherenkov::ExternalFrames for Gpu {
+    type Frame = interop::ExternalFrame;
+    fn set_external_frame(
+        r: &mut Self::Renderer,
+        surface: cherenkov::SurfaceId,
+        layer: cherenkov::LayerId,
+        frame: Self::Frame,
+    ) {
+        r.set_external_frame(surface, layer, frame);
+    }
+}
+
 impl cherenkov::ShaderPaintCapability for Gpu {
     #[cfg(not(target_arch = "wasm32"))]
     fn add_shader(

@@ -79,6 +79,10 @@ pub trait Renderer: 'static {
     fn add_font(&mut self, id: FontId, font: FontData) -> Result<(), ResourceError>;
     fn remove_font(&mut self, id: FontId);
     fn add_image(&mut self, id: ImageId, image: ImageUpload) -> Result<(), ResourceError>;
+    /// New pixels behind the same id; the render loop then marks changed the surfaces `samples_image` names.
+    fn replace_image(&mut self, id: ImageId, image: ImageUpload) -> Result<(), ResourceError>;
+    /// Whether any layer content on `surface`, slot updates applied, samples image `id`.
+    fn samples_image(&self, surface: SurfaceId, id: ImageId) -> bool;
     fn remove_image(&mut self, id: ImageId);
 
     /// Replaces or updates a layer's recorded content (`Content` / `Picture`), or clears it.
@@ -118,7 +122,7 @@ pub trait Renderer: 'static {
   ```
 
   The clip applies in the layer's own space (`transform`); content and children are drawn in `content_transform()`, so scrolling moves them inside the clip and never re-records anything. `changed` is true when a property op, a content op or an animation step touched the surface since the last render; the backend renders exactly those surfaces.
-- **One wake-up per frame.** `Surface::update`, layer drops and bound-signal changes only queue owned ops on the UI thread. `Engine::render(time)` drains every surface's queue into one `Message::Render { time, commits, reply }` and blocks on the reply, so the render thread wakes once per frame and applies the commits, samples the animations at `time`, renders, and answers with `Next` and the `FrameStats`. Surface creation, readback, `memory()` and capability registrations that can fail (shader compilation) are request/reply messages; everything else is fire-and-forget.
+- **One wake-up per frame.** `Surface::update`, layer drops and bound-signal changes only queue owned ops on the UI thread. `Engine::render(time)` drains every surface's queue into one `Message::Render { time, commits, reply }` and blocks on the reply, so the render thread wakes once per frame and applies the commits, samples the animations at `time`, renders, and answers with `Next` and the `FrameStats`. Surface creation, readback, `memory()`, image replacement and capability registrations that can fail (shader compilation) are request/reply messages; everything else is fire-and-forget.
 - **Capabilities carry their render-side hooks.** A capability trait is not a marker: it declares the function the render loop calls, so a backend without the capability has no code path to reach, and no default or stub exists.
 
   ```rust
@@ -144,7 +148,7 @@ pub trait Renderer: 'static {
   ```
 
   The `Engine`/`Transaction` methods bounded by these traits (`engine.shader`, `engine.filter`, `engine.gpu_content`, `tx[&l].content(gpu)`, `engine.image::<Astc4x4>`) wrap the hook into an owned `FnOnce(&mut B::Renderer) + Send` op that travels in the commit with the layer ops, in order. The `Renderer` core trait therefore has no shader, filter or GPU-content methods at all.
-- **Resource lifetime.** Handles (`Font`, `Image<F>`, `Shader`, `Filter`) are `Clone` over an `Rc`; the last drop queues the `remove_*` op, which reaches the backend in the next frame's commit. The backend frees the GPU copy there (deferred to after in-flight frames where the API needs it).
+- **Resource lifetime.** Handles (`Font`, `Image<F>`, `Shader`, `Filter`) are `Clone` over an `Rc`; the last drop queues the `remove_*` op, which reaches the backend in the next frame's commit. The backend frees the GPU copy there (deferred to after in-flight frames where the API needs it). The same `Rc` carries the ops a kind queues while it lives: an `Image<F>` queues `replace_image` through it (see Resources).
 - **Errors.** `init` failures surface from `Engine::new` as `EngineError`. Surface creation errors are returned from `engine.surface`. Render errors fail that `render` call. Resource validation that needs the device (shader compilation, image format support) is a reply; validation that does not (font parsing, byte lengths) happens on the UI thread before any message is sent.
 
 ## Engine
@@ -175,10 +179,15 @@ Resources are RAII handles: they are `Clone`, and the GPU memory is released, de
 let font: Font = engine.font(FontSource::mapped(path)?)?;          // memory-mapped; never copied
 let photo: Image<Astc4x4> = engine.image(encoded_astc, ImageDesc::new(DisplayP3)).await?;
 let hdr: Image<Rgba16F> = engine.image(decoded, ImageDesc::new(Rec2020Pq).hdr(meta)).await?;
+hdr.replace(ImageData::<Rgba16F>::new(width, height, next_frame)?)?;  // same id, new pixels
 let shader: ShaderPaintHandle = engine.shader_paint(wgsl_source)?; // compiled here, GPU only
 ```
 
 - **`Image<F>`.** `F` is the storage format: `Rgba8`, `Rgba16F`, `Astc4x4`, `Etc2Rgba`, `Bc7`, and panel formats for `Banded`. Only uncompressed formats have `update(region, pixels)`. Compressed formats are uploaded as-is, and compression is an explicit step (`engine.compress::<Astc4x4>(image)`), never implicit.
+- **Replacing pixels.** `image.replace(data)` swaps an image's pixels behind the same `ImageId`, for content whose picture changes over time: animated images, decoder-backed frames, a reactive image view. Every recording that names the id keeps drawing it and shows the new pixels on the next frame, without re-recording. The replacement is a `Message::ReplaceImage` request/reply, ordered with frames on the render thread, so no frame samples a partly written image. It blocks until the backend has applied it (on wasm32 it is an `async fn`) and returns the errors of `engine.image`: `ResourceError::Image` when the backend rejects the data, which leaves the previous pixels in place, and `ResourceError::Lost` when the render thread is gone. The render loop then asks the backend which surfaces' content samples the image (`Renderer::samples_image`, answered from the retained display lists with slot updates applied and nested pictures included) and marks only those changed, so every other surface keeps its skip; the engine's waker fires only when at least one surface was marked. An animated image replaced at 30–60 Hz therefore redraws the surfaces that show it and nothing else.
+  - The same dimensions reuse the backing storage: `queue.write_texture` into the existing texture on the GPU backend, which leaves every bind group valid; an in-place decode on the CPU backend, once the retained paint operands that shared the pixels are discarded.
+  - Different dimensions reallocate the storage behind the same id. The GPU backend retires the bind groups that bound the old texture view. Both backends lower again the retained content that samples the image, because lowering resolves the image's dimensions into its paints.
+  - Dropping the last handle after a replacement queues `remove_image` as before.
 - **Colour metadata.** Every image carries its colour space and optional HDR metadata. `ImageColorSpace` is `Srgb`, `DisplayP3`, `LinearSrgb` or `LinearP3`; `LinearP3` is the working space and decodes as the identity. Conversion into the working space happens when the image is sampled.
 
 ## Surfaces and output

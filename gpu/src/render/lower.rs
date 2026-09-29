@@ -413,6 +413,19 @@ impl ContentData {
         self.storage = EmissionStorage::default();
     }
 
+    /// Whether the content samples image `id`.
+    pub fn references_image(&self, id: cherenkov::ImageId) -> bool {
+        self.retained.references_image(id)
+    }
+
+    /// Discards the lowering of content that samples image `id`, whose
+    /// dimensions changed behind the same id.
+    pub fn invalidate_image(&mut self, id: cherenkov::ImageId) {
+        if self.retained.invalidate_image(id) {
+            self.storage = EmissionStorage::default();
+        }
+    }
+
     pub fn trim(&mut self) {
         self.retained.trim();
         self.storage = EmissionStorage::default();

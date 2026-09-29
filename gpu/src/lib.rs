@@ -244,6 +244,10 @@ impl Backend for Gpu {
     }
 
     #[cfg(target_arch = "wasm32")]
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
     async fn init(config: GpuConfig) -> Result<(Self::Renderer, Self::Info), EngineError> {
         render::init(config).await
     }
@@ -305,6 +309,10 @@ impl cherenkov::ShaderPaintCapability for Gpu {
     }
 
     #[cfg(target_arch = "wasm32")]
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
     async fn add_shader(
         r: &mut Self::Renderer,
         id: cherenkov::ShaderId,

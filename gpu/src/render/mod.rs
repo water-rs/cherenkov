@@ -628,6 +628,10 @@ impl crate::interop::SharedDevice {
 }
 
 #[cfg(target_arch = "wasm32")]
+#[expect(
+    clippy::future_not_send,
+    reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+)]
 async fn create_device(
     config: &GpuConfig,
 ) -> Result<(wgpu::Instance, wgpu::Adapter, wgpu::Device, wgpu::Queue), EngineError> {
@@ -932,6 +936,10 @@ fn create_pipeline(
 }
 
 #[cfg(target_arch = "wasm32")]
+#[expect(
+    clippy::future_not_send,
+    reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+)]
 async fn create_pipeline(
     device: &wgpu::Device,
     config: &GpuConfig,
@@ -1308,6 +1316,14 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
 }
 
 #[cfg(target_arch = "wasm32")]
+#[expect(
+    clippy::future_not_send,
+    reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "adapter and device requests plus pipeline setup form one linear sequence"
+)]
 pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
     let _diag_guard = diag::Guard::scope(config.alloc_diag.as_ref());
     let (instance, adapter, device, queue) = create_device(&config).await?;
@@ -2137,6 +2153,10 @@ impl Renderer for GpuRenderer {
     }
 
     #[cfg(target_arch = "wasm32")]
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
     async fn render(
         &mut self,
         frame: &Frame<'_>,
@@ -2183,6 +2203,10 @@ impl Renderer for GpuRenderer {
     }
 
     #[cfg(target_arch = "wasm32")]
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
     async fn finish_timings(&mut self) -> Result<Vec<FrameTiming>, RenderError> {
         let _diag_guard = diag::Guard::scope(self.diag.as_ref());
         // Tooling may wait; the frame path only polls. First complete draws
@@ -2298,6 +2322,10 @@ impl Renderer for GpuRenderer {
     }
 
     #[cfg(target_arch = "wasm32")]
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
     async fn readback(&mut self, surface: SurfaceId) -> Result<Readback, RenderError> {
         let _diag_guard = diag::Guard::scope(self.diag.as_ref());
         let Some(state) = self.surfaces.get(&surface) else {
@@ -2386,6 +2414,10 @@ impl Renderer for GpuRenderer {
 
 impl GpuRenderer {
     #[cfg(target_arch = "wasm32")]
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
     #[expect(
         clippy::too_many_lines,
         reason = "the frame pipeline: lowers, uploads, encodes and presents in one pass"
@@ -2727,6 +2759,10 @@ impl GpuRenderer {
     }
 
     #[cfg(target_arch = "wasm32")]
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
     pub(crate) async fn add_shader(
         &mut self,
         id: cherenkov::ShaderId,
@@ -2807,6 +2843,10 @@ impl GpuRenderer {
     }
 
     #[cfg(target_arch = "wasm32")]
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
     async fn render_producers(
         &mut self,
         sf: &SurfaceFrame<'_>,
@@ -3843,6 +3883,10 @@ impl GpuRenderer {
     /// Stages the frame's uploads; time spent waiting for a staging slot
     /// the GPU has not finished copying out of goes to `wait_seconds`.
     #[cfg(target_arch = "wasm32")]
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
     async fn upload_frame(
         &mut self,
         dirty: &[&SurfaceFrame<'_>],
@@ -4357,6 +4401,10 @@ impl GpuRenderer {
     }
 
     #[cfg(target_arch = "wasm32")]
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
     async fn wait(
         &self,
         _submission: wgpu::SubmissionIndex,
@@ -4393,6 +4441,10 @@ impl GpuRenderer {
     }
 
     #[cfg(target_arch = "wasm32")]
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
     async fn map_read(
         &self,
         slice: wgpu::BufferSlice<'_>,
@@ -4743,6 +4795,10 @@ fn srgb_decode_u8_f64(v: f64) -> f64 {
 
 /// A browser completion with the same configured timeout as native waits.
 #[cfg(target_arch = "wasm32")]
+#[expect(
+    clippy::future_not_send,
+    reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+)]
 async fn browser_wait<T>(
     rx: futures_channel::oneshot::Receiver<T>,
     timeout: std::time::Duration,
@@ -4764,6 +4820,10 @@ async fn browser_wait<T>(
 
 #[cfg(target_arch = "wasm32")]
 impl GpuRenderer {
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
     async fn prepare_filters(&mut self, surface: SurfaceId) -> Result<(), RenderError> {
         let surface = &self.surfaces[&surface];
         let uses: Vec<_> = surface

@@ -214,6 +214,13 @@ impl Registry {
                 super::TARGET_USAGES,
                 super::TARGET_FORMAT,
             );
+            crate::diag::create(
+                device,
+                "shader paint",
+                u64::from(key.size.0)
+                    * u64::from(key.size.1)
+                    * super::texel_bytes(super::TARGET_FORMAT),
+            );
             let globals = uniform_buffer(device, 16);
             let parameters = uniform_buffer(device, 256);
             let bindings = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -291,10 +298,12 @@ const fn uniform_binding(binding: u32, size: u64) -> wgpu::BindGroupLayoutEntry 
 }
 
 fn uniform_buffer(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
-    device.create_buffer(&wgpu::BufferDescriptor {
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("shader paint uniforms"),
         size,
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
-    })
+    });
+    crate::diag::create(device, "shader paint uniforms", size);
+    buffer
 }

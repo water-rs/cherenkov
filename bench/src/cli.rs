@@ -153,6 +153,38 @@ enum Sub {
         #[arg(long, value_name = "WxH")]
         native: Option<String>,
     },
+    /// Record the #169 allocation-event diagnostic for one scene.
+    ///
+    /// Runs the scene through the `cherenkov` adapter with
+    /// `GpuConfig::alloc_diag` installed and writes every allocation,
+    /// growth, upload and submission boundary — with the wgpu
+    /// allocator's state at each — as JSON Lines to `--out`.
+    /// Diagnostics only: the per-event allocator snapshot is expensive,
+    /// so this mode never joins timed or energy runs.
+    AllocDiag {
+        /// One scene directory.
+        #[arg(long)]
+        scene: PathBuf,
+        /// Measured frame count (after warmup).
+        #[arg(long, default_value_t = 60)]
+        frames: u32,
+        /// Warmup frames discarded before measuring.
+        #[arg(long, default_value_t = 5)]
+        warmup: u32,
+        /// JSON Lines report path.
+        #[arg(long)]
+        out: PathBuf,
+        /// Render at the device's native resolution (`WxH`; see
+        /// `measure --native`).
+        #[arg(long, value_name = "WxH")]
+        native: Option<String>,
+        /// Pace the frames to this rate in Hz (see `measure --rate`).
+        #[arg(long, value_name = "HZ")]
+        rate: Option<f64>,
+        /// Pin the run to these CPUs (see `measure --cpu`).
+        #[arg(long, value_name = "LIST")]
+        cpu: Option<String>,
+    },
     /// Sweep scene load to find each engine's sustained capacity.
     ///
     /// The draw list is repeated `k` times, doubling `k` until a probe's
@@ -326,6 +358,10 @@ pub unsafe extern "C" fn cherenkov_bench_run(argc: c_int, argv: *const *const c_
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_args(&args))).unwrap_or(101)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one match arm per subcommand; the run dispatch table"
+)]
 fn run(cli: Cli) -> Result<(), BenchError> {
     match cli.cmd {
         Sub::Engines => {
@@ -375,6 +411,23 @@ fn run(cli: Cli) -> Result<(), BenchError> {
                 energy,
                 native: native.as_deref(),
             },
+        ),
+        Sub::AllocDiag {
+            scene,
+            frames,
+            warmup,
+            out,
+            native,
+            rate,
+            cpu,
+        } => alloc_diag_cmd(
+            &scene,
+            frames,
+            warmup,
+            native.as_deref(),
+            rate,
+            cpu.as_deref(),
+            &out,
         ),
         Sub::Capacity {
             engine,
@@ -452,6 +505,120 @@ fn present_cost_cmd(
 ) -> Result<(), BenchError> {
     Err(BenchError::Engine(
         "present-cost needs the `cherenkov` adapter feature".into(),
+    ))
+}
+
+/// The `alloc-diag` subcommand: a fresh-process allocation event trace
+/// for issue #169, at the issue's resolution and pacing.
+#[cfg(feature = "cherenkov")]
+fn alloc_diag_cmd(
+    dir: &Path,
+    frames: u32,
+    warmup: u32,
+    native: Option<&str>,
+    rate: Option<f64>,
+    cpu: Option<&str>,
+    out: &Path,
+) -> Result<(), BenchError> {
+    let native = parse_native(native)?;
+    if let Some(rate) = rate {
+        if !(rate.is_finite() && rate > 0.0) {
+            return Err(BenchError::Engine(format!(
+                "--rate must be a positive, finite Hz value, got {rate}"
+            )));
+        }
+        pacing(rate, frames)?;
+    }
+    if let Some(cpus) = cpu.map(affinity::parse_cpu_list).transpose()? {
+        affinity::pin_current_thread(&cpus)?;
+    }
+    let sink = cherenkov_gpu::diag::Sink::new();
+    let mut engine = crate::cherenkov_ad::Cherenkov::with_alloc_diag(sink.clone())?;
+    let (scene, _native) = load_scene(dir, native)?;
+    let blobs = convert::load_blobs(&scene, dir)?;
+    let input = EncodeInput {
+        scene: &scene,
+        blobs: &blobs,
+    };
+    engine.prepare(&input)?;
+    let (period, window_hint) = match rate {
+        Some(hz) => pacing(hz, frames).map(|(p, w)| (Some(p), w))?,
+        None => (None, Duration::from_secs(30)),
+    };
+    run_frames(
+        &mut engine,
+        &input,
+        frames,
+        warmup,
+        period,
+        window_hint,
+        false,
+    )?;
+    engine.alloc_diag_teardown();
+    drop(engine);
+    // #169 A5: the allocation-event high-water observation. Frame-boundary
+    // snapshots can miss the event that caused a permanently retained
+    // block, so this scans the per-event snapshots, not the lifecycle.
+    let events = sink.take();
+    let count = cherenkov_gpu::diag::write_events(&events, out)
+        .map_err(|e| BenchError::Engine(format!("writing {}: {e}", out.display())))?;
+    let mut allocated = 0u64;
+    let mut reserved = 0u64;
+    let mut blocks = 0u64;
+    let mut retired_in_flight = 0u64;
+    let mut staging = 0u64;
+    let mut first_two_block_seq = None;
+    for event in &events {
+        allocated = allocated.max(event.alloc.allocated);
+        reserved = reserved.max(event.alloc.reserved);
+        blocks = blocks.max(event.alloc.blocks);
+        retired_in_flight = retired_in_flight.max(event.retired_in_flight);
+        staging = staging.max(event.alloc.staging.1);
+        if event.alloc.blocks >= 2 && first_two_block_seq.is_none() {
+            first_two_block_seq = Some(event.seq);
+        }
+    }
+    let summary = serde_json::json!({
+        "high_water": {
+            "allocated_bytes": allocated,
+            "reserved_bytes": reserved,
+            "blocks": blocks,
+            "retired_in_flight_bytes": retired_in_flight,
+            "staging_bytes": staging,
+            "first_two_block_seq": first_two_block_seq,
+            "events": events.len(),
+        }
+    });
+    {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(out)
+            .map_err(|e| BenchError::Engine(format!("appending to {}: {e}", out.display())))?;
+        writeln!(file, "{summary}")
+            .map_err(|e| BenchError::Engine(format!("writing {}: {e}", out.display())))?;
+    }
+    println!("alloc-diag high water: {summary}");
+    tracing::info!(
+        events = count,
+        out = %out.display(),
+        "alloc-diag"
+    );
+    Ok(())
+}
+
+#[cfg(not(feature = "cherenkov"))]
+fn alloc_diag_cmd(
+    _scene: &Path,
+    _frames: u32,
+    _warmup: u32,
+    _native: Option<&str>,
+    _rate: Option<f64>,
+    _cpu: Option<&str>,
+    _out: &Path,
+) -> Result<(), BenchError> {
+    Err(BenchError::Engine(
+        "alloc-diag needs the `cherenkov` adapter feature".into(),
     ))
 }
 
@@ -759,6 +926,13 @@ fn render_scene(
     engine.encode(&input)?;
     let submit = engine.submit(0, true)?;
     let steady_memory = MemorySnapshot::capture(engine.memory(), SampleDetail::Full);
+    // Counters embed a memory snapshot; take them at steady state,
+    // before retirement shrinks what the engine reports.
+    let counters = engine.counters();
+    // #169 A5: the post-retirement observation follows the engine's
+    // explicit retirement pass, after the window and its submission.
+    engine.trim()?;
+    let post_retire_memory = MemorySnapshot::capture(engine.memory(), SampleDetail::Full);
     let test = submit
         .image
         .ok_or_else(|| BenchError::Engine("adapter returned no image".into()))?;
@@ -779,8 +953,12 @@ fn render_scene(
                 headroom: scene.present_headroom,
             }),
             metrics: metrics_v,
-            counters: engine.counters(),
-            memory: MemoryReport::new(idle_memory, &[prepare_memory, steady_memory]),
+            counters,
+            memory: MemoryReport::new(
+                idle_memory,
+                &[prepare_memory, steady_memory],
+                Some(post_retire_memory),
+            ),
             device: engine.device(),
         },
         image: test,
@@ -973,6 +1151,26 @@ fn load_scene(
     ))
 }
 
+/// The run's pacing summary, when a rate was requested: requested Hz,
+/// achieved Hz over the measured window and missed deadlines.
+fn pacing_report(
+    requested_hz: f64,
+    frames: u32,
+    missed_deadlines: u32,
+    window_seconds: f64,
+) -> Pacing {
+    Pacing {
+        requested_hz,
+        achieved_hz: if window_seconds > 0.0 {
+            f64::from(frames) / window_seconds
+        } else {
+            0.0
+        },
+        missed_deadlines,
+        window_seconds,
+    }
+}
+
 fn measure_scene(
     engine: &mut dyn Engine,
     dir: &Path,
@@ -1027,19 +1225,16 @@ fn measure_scene(
     // The steady snapshot lands after the pacing window and the meter
     // close, so its capture is never charged to a measured frame.
     let steady_memory = MemorySnapshot::capture(engine.memory(), SampleDetail::Full);
+    // Counters embed a memory snapshot; take them at steady state,
+    // before retirement shrinks what the engine reports.
+    let counters = engine.counters();
+    // #169 A5: retire, then take the post-retirement observation.
+    engine.trim()?;
+    let post_retire_memory = MemorySnapshot::capture(engine.memory(), SampleDetail::Full);
     let memory_samples = memory_samples(prepare_memory, &window.memory_samples, steady_memory);
     let missed_deadlines = window.missed_deadlines;
     let samples = window.samples;
-    let pacing = rate.map(|requested_hz| Pacing {
-        requested_hz,
-        achieved_hz: if window_seconds > 0.0 {
-            f64::from(frames) / window_seconds
-        } else {
-            0.0
-        },
-        missed_deadlines,
-        window_seconds,
-    });
+    let pacing = rate.map(|hz| pacing_report(hz, frames, missed_deadlines, window_seconds));
     let conditions = conditions::collect(
         energy_outcome
             .as_ref()
@@ -1076,8 +1271,8 @@ fn measure_scene(
         pacing,
         energy: energy_outcome.map(|o| o.report),
         conditions,
-        counters: engine.counters(),
-        memory: MemoryReport::new(idle_memory, &memory_samples),
+        counters,
+        memory: MemoryReport::new(idle_memory, &memory_samples, Some(post_retire_memory)),
         device: engine.device(),
     })
 }
@@ -1415,7 +1610,7 @@ fn sweep_scene(
                     .find(|p| p.k == sweep.lo + 1)
                     .map(|p| p.p99_seconds),
                 probes: sweep.probes.clone(),
-                memory: MemoryReport::new(idle.clone(), &sweep.memory_samples),
+                memory: MemoryReport::new(idle.clone(), &sweep.memory_samples, None),
             }
         })
         .collect();

@@ -95,6 +95,13 @@ impl Slot {
                 super::TARGET_USAGES,
                 super::TARGET_FORMAT,
             );
+            crate::diag::create(
+                device,
+                "GPU content",
+                u64::from(self.size.0)
+                    * u64::from(self.size.1)
+                    * super::texel_bytes(super::TARGET_FORMAT),
+            );
             super::GpuImage {
                 texture,
                 view,
@@ -166,6 +173,13 @@ impl Slot {
                 self.size,
                 super::TARGET_USAGES,
                 super::TARGET_FORMAT,
+            );
+            crate::diag::create(
+                device,
+                "GPU content",
+                u64::from(self.size.0)
+                    * u64::from(self.size.1)
+                    * super::texel_bytes(super::TARGET_FORMAT),
             );
             super::GpuImage {
                 texture,

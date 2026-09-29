@@ -358,6 +358,18 @@ pub trait Engine {
     fn finish_gpu(&mut self) -> Result<Vec<GpuSample>, BenchError> {
         Ok(Vec::new())
     }
+    /// Explicitly retires what the backend can release outside a frame
+    /// (scratch targets, backdrops, caches) and returns once the
+    /// retirement is processed. The report's post-retirement snapshot
+    /// follows this call; a backend with no retirement step still
+    /// reports what it holds afterwards — that is a finding, not an
+    /// error.
+    ///
+    /// # Errors
+    /// [`BenchError`] on engine or GPU failure.
+    fn trim(&mut self) -> Result<(), BenchError> {
+        Ok(())
+    }
     /// Counters describing what [`Engine::encode`] issued.
     fn counters(&self) -> Counters;
     /// Memory sources the adapter can report at this point in the run.

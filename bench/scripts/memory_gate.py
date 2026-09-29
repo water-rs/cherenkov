@@ -24,6 +24,25 @@ from typing import Any
 
 SCENES = ("map", "chart", "text-page", "ui-list", "effects")
 DEFAULT_ENGINES = ("cherenkov", "cherenkov-cpu")
+# Lifecycle snapshots compared per scene, in report order (#169 A5).
+# Older reports lack `preparation`, `warmup_peak` and `post_retire`; a
+# phase present on only one side is a schema change and does not
+# compare. `peak` stays: it is the merged high-water snapshot.
+PHASES = ("idle", "preparation", "warmup_peak", "steady", "post_retire", "peak")
+# One Performance-policy allocator block (#169 A5): the gate's
+# over-reservation check uses it as the floor of what a live
+# allocator may hold.
+POLICY_BLOCK = 64 * 1024 * 1024
+# wgpu allocator counters carry submission-timing noise: a free lands
+# when the allocator observes its submission complete, which identical
+# runs of the same binary can straddle by a few small allocations
+# (dev's own harness has been observed to wobble by ~98 KiB and ±4
+# allocations). Engine readings are the deterministic contract and
+# compare exactly; allocator `reserved_bytes`/`blocks` are policy
+# state and also compare exactly, while `allocated_bytes`/`allocations`
+# get this slack on same-side reruns.
+ALLOCATED_SLACK = 256 * 1024
+ALLOCATIONS_SLACK = 8
 ROOT_MARKER = ".memory-gate-root.json"
 WORKTREE_MARKER = ".memory-gate-worktree.json"
 HARNESS_HINT = "pass --harness <ref with #101>"
@@ -266,67 +285,171 @@ def counter_engine_memory(
     return {"measured": measured}
 
 
-def read_engine_memory(report_path: Path) -> dict[str, Any]:
-    try:
-        report = json.loads(report_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise GateError(f"could not read report {report_path}: {error}") from error
-    if not isinstance(report, dict):
-        raise GateError(f"{report_path} has no memory report; {HARNESS_HINT}")
+def read_reading(node: Any, path: Path, name: str) -> dict[str, Any] | str | None:
+    """One `Reading<T>`: `{"measured": {...}}`, `{"unavailable": reason}`,
+    or `None` when the report does not carry the reading at all."""
+    if not isinstance(node, dict):
+        return None
+    if "unavailable" in node:
+        return {"unavailable": node["unavailable"]}
+    measured = node.get("measured")
+    if not isinstance(measured, dict):
+        raise GateError(f"{path} has an invalid {name} reading")
+    return measured
+
+
+def read_phase_memory(report_path: Path, report: dict) -> dict[str, Any]:
+    """Per-phase engine and wgpu-allocator readings of one report.
+
+    Returns `{phase: {"engine": {...}, "allocator": {...}}}` — engine
+    entries keep the `{cpu_bytes, gpu_bytes[, backdrop_capture_bytes]}`
+    shape; allocator entries keep `{allocated_bytes, reserved_bytes,
+    allocations, blocks}`. A required reading that reports `unavailable`
+    fails the gate through `unavailable:` — it is not a pass (#169 A5).
+    """
     memory = report.get("memory")
     if not isinstance(memory, dict):
         counters = counter_engine_memory(report_path, report)
         if counters is not None:
-            return counters
+            return {"steady": {"engine": counters["measured"], "allocator": None}}
         raise GateError(f"{report_path} has no memory report; {HARNESS_HINT}")
-    steady = memory.get("steady")
-    engine = steady.get("engine") if isinstance(steady, dict) else None
-    if not isinstance(engine, dict):
-        raise GateError(f"{report_path} has no steady engine memory reading")
-    if "unavailable" in engine:
-        engine_memory = {"unavailable": engine["unavailable"]}
-    else:
-        measured = engine.get("measured")
-        if not isinstance(measured, dict):
-            raise GateError(f"{report_path} has an invalid steady engine memory reading")
-        cpu_bytes = measured.get("cpu_bytes")
-        gpu_bytes = measured.get("gpu_bytes")
-        if (
-            not isinstance(cpu_bytes, int)
-            or isinstance(cpu_bytes, bool)
-            or not isinstance(gpu_bytes, int)
-            or isinstance(gpu_bytes, bool)
-            or cpu_bytes < 0
-            or gpu_bytes < 0
-        ):
-            raise GateError(f"{report_path} has invalid CPU/GPU engine bytes")
-        engine_memory = {"measured": {"cpu_bytes": cpu_bytes, "gpu_bytes": gpu_bytes}}
-        captures = measured.get("backdrop_capture_bytes")
-        if captures is not None:
-            if (
-                not isinstance(captures, int)
-                or isinstance(captures, bool)
-                or captures < 0
-            ):
-                raise GateError(
-                    f"{report_path} has invalid backdrop capture bytes"
-                )
-            engine_memory["measured"]["backdrop_capture_bytes"] = captures
-
+    phases: dict[str, Any] = {}
+    for phase in PHASES:
+        snapshot = memory.get(phase)
+        if snapshot is None:
+            continue
+        if not isinstance(snapshot, dict):
+            raise GateError(f"{report_path} has an invalid {phase} memory snapshot")
+        entry: dict[str, Any] = {"engine": None, "allocator": None}
+        engine = read_reading(snapshot.get("engine"), report_path, f"{phase} engine")
+        if engine is not None:
+            if "unavailable" in engine:
+                entry["engine"] = engine
+            else:
+                cpu_bytes = engine.get("cpu_bytes")
+                gpu_bytes = engine.get("gpu_bytes")
+                if (
+                    not isinstance(cpu_bytes, int)
+                    or isinstance(cpu_bytes, bool)
+                    or not isinstance(gpu_bytes, int)
+                    or isinstance(gpu_bytes, bool)
+                    or cpu_bytes < 0
+                    or gpu_bytes < 0
+                ):
+                    raise GateError(f"{report_path} has invalid {phase} CPU/GPU engine bytes")
+                measured = {"cpu_bytes": cpu_bytes, "gpu_bytes": gpu_bytes}
+                captures = engine.get("backdrop_capture_bytes")
+                if captures is not None:
+                    if (
+                        not isinstance(captures, int)
+                        or isinstance(captures, bool)
+                        or captures < 0
+                    ):
+                        raise GateError(
+                            f"{report_path} has invalid {phase} backdrop capture bytes"
+                        )
+                    measured["backdrop_capture_bytes"] = captures
+                entry["engine"] = measured
+        allocator = read_reading(
+            snapshot.get("wgpu_allocator"), report_path, f"{phase} wgpu allocator"
+        )
+        if allocator is not None:
+            if "unavailable" in allocator:
+                entry["allocator"] = allocator
+            else:
+                fields = {}
+                for key in ("allocated_bytes", "reserved_bytes", "allocations", "blocks"):
+                    value = allocator.get(key)
+                    if (
+                        not isinstance(value, int)
+                        or isinstance(value, bool)
+                        or value < 0
+                    ):
+                        raise GateError(
+                            f"{report_path} has invalid {phase} allocator {key}"
+                        )
+                    fields[key] = value
+                entry["allocator"] = fields
+        phases[phase] = entry
+    if not phases:
+        raise GateError(f"{report_path} has no memory snapshot")
     counters = counter_engine_memory(report_path, report)
     if counters is not None:
-        # Compare only the keys present on both sides: optional fields like
-        # `backdrop_capture_bytes` may be absent from one of them.
-        shared = set(counters["measured"]) & set(engine_memory["measured"])
-        if any(
-            counters["measured"][key] != engine_memory["measured"][key]
-            for key in shared
+        steady = phases.get("steady", {}).get("engine")
+        if isinstance(steady, dict) and "unavailable" not in steady:
+            # Compare only the keys present on both sides: optional fields
+            # like `backdrop_capture_bytes` may be absent from one of them.
+            shared = set(counters["measured"]) & set(steady)
+            if any(
+                counters["measured"][key] != steady[key] for key in shared
+            ):
+                raise GateError(
+                    f"{report_path} has inconsistent memory readings: "
+                    f"memory.steady.engine={steady}, counters={counters}"
+                )
+    return phases
+
+
+def same_side_equal(first: dict[str, Any], second: dict[str, Any]) -> bool:
+    """Whether two measure runs of the same side agree.
+
+    Engine readings and allocator `reserved_bytes`/`blocks` compare
+    exactly; `allocated_bytes`/`allocations` allow the submission-timing
+    slack documented at ALLOCATED_SLACK. Phases and unavailable
+    reasons must match exactly.
+    """
+    if set(first) != set(second):
+        return False
+    for phase, a in first.items():
+        b = second[phase]
+        if not isinstance(a, dict) or not isinstance(b, dict):
+            return a == b
+        if a.get("engine") != b.get("engine"):
+            return False
+        alloc_a, alloc_b = a.get("allocator"), b.get("allocator")
+        if isinstance(alloc_a, dict) != isinstance(alloc_b, dict):
+            return False
+        if alloc_a is None or alloc_b is None:
+            if alloc_a != alloc_b:
+                return False
+            continue
+        for key in ("allocated_bytes", "reserved_bytes", "allocations", "blocks"):
+            if key not in alloc_a or key not in alloc_b:
+                return alloc_a == alloc_b
+        if "unavailable" in alloc_a:
+            if alloc_a != alloc_b:
+                return False
+            continue
+        if (
+            abs(alloc_a["allocated_bytes"] - alloc_b["allocated_bytes"])
+            > ALLOCATED_SLACK
+            or alloc_a["reserved_bytes"] != alloc_b["reserved_bytes"]
+            or abs(alloc_a["allocations"] - alloc_b["allocations"])
+            > ALLOCATIONS_SLACK
+            or alloc_a["blocks"] != alloc_b["blocks"]
         ):
-            raise GateError(
-                f"{report_path} has inconsistent memory readings: "
-                f"memory.steady.engine={engine_memory}, counters={counters}"
-            )
-    return engine_memory
+            return False
+    return True
+
+
+def allocator_verdict(allocator: dict[str, int]) -> str | None:
+    """The #169 acceptance rule on one allocator reading.
+
+    Reserved storage may hold roughly one Performance-policy block of
+    slack over what is live; a report that reserves far more than its
+    simultaneously-live requirement (roughly 38 MiB allocated over
+    192 MiB reserved) fails. Block *count* alone never fails — a policy
+    that emits several small blocks keeps a reserved total near
+    `allocated` and passes.
+    """
+    allocated = allocator["allocated_bytes"]
+    reserved = allocator["reserved_bytes"]
+    if reserved > 2 * max(allocated, POLICY_BLOCK):
+        return (
+            f"over-reserved: {reserved:,} B reserved over "
+            f"{allocated:,} B live in {allocator['blocks']} block(s)"
+        )
+    return None
 
 
 def measure_side(
@@ -372,7 +495,15 @@ def measure_side(
                     )
                     continue
                 try:
-                    samples.append(read_engine_memory(report_path))
+                    report = json.loads(report_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as error:
+                    samples.append(f"report error: could not read {report_path}: {error}")
+                    continue
+                if not isinstance(report, dict):
+                    samples.append(f"report error: {report_path} has no memory report")
+                    continue
+                try:
+                    samples.append(read_phase_memory(report_path, report))
                 except GateError as error:
                     samples.append(f"report error: {error}")
             key = (scene, engine)
@@ -380,7 +511,9 @@ def measure_side(
                 readings[key] = "nondeterministic: expected two samples"
             elif isinstance(samples[0], dict) != isinstance(samples[1], dict):
                 readings[key] = "nondeterministic: same-side memory readings differ"
-            elif isinstance(samples[0], dict) and samples[0] != samples[1]:
+            elif isinstance(samples[0], dict) and not same_side_equal(
+                samples[0], samples[1]
+            ):
                 readings[key] = "nondeterministic: same-side memory readings differ"
             elif isinstance(samples[0], str) and isinstance(samples[1], str):
                 first_kind = samples[0].split(":", maxsplit=1)[0]
@@ -415,33 +548,82 @@ def markdown_table(
         f"- Base: `{base_ref}`",
         f"- Head: `{head_ref}`",
         "",
-        "| Scene | Engine | Base CPU (B) | Base GPU (B) | Base backdrop capture (B) | Head CPU (B) | Head GPU (B) | Head backdrop capture (B) | Delta |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---|",
+        "| Scene | Engine | Phase | Base CPU (B) | Base GPU (B) | Head CPU (B) | Head GPU (B) | Base reserved (B) | Delta |",
+        "|---|---|---|---:|---:|---:|---:|---:|---|",
     ]
     for (
         scene,
         engine,
+        phase,
         base_cpu,
         base_gpu,
-        base_captures,
         head_cpu,
         head_gpu,
-        head_captures,
+        base_reserved,
         delta,
     ) in rows:
         delta = delta.replace("|", "\\|")
         lines.append(
-            f"| {scene} | {engine} | {base_cpu} | {base_gpu} | {base_captures} | "
-            f"{head_cpu} | {head_gpu} | {head_captures} | {delta} |"
+            f"| {scene} | {engine} | {phase} | {base_cpu} | {base_gpu} | "
+            f"{head_cpu} | {head_gpu} | {base_reserved} | {delta} |"
         )
     lines.append("")
     return "\n".join(lines)
 
 
+def self_test() -> int:
+    """The #169 gate fixture: roughly 38 MiB allocated over 192 MiB
+    reserved in 2 blocks must fail even when `Engine::memory()` is
+    unchanged, and several small blocks must not be rejected for their
+    count alone."""
+    mib = 1024 * 1024
+    fixture = {
+        "allocated_bytes": int(37.6 * mib),
+        "reserved_bytes": 192 * mib,
+        "allocations": 300,
+        "blocks": 2,
+    }
+    small_blocks = {
+        "allocated_bytes": 150 * mib,
+        "reserved_bytes": 160 * mib,
+        "allocations": 4000,
+        "blocks": 6,
+    }
+    sane = {
+        "allocated_bytes": int(41.5 * mib),
+        "reserved_bytes": 64 * mib,
+        "allocations": 200,
+        "blocks": 1,
+    }
+    failures = []
+    verdict = allocator_verdict(fixture)
+    if verdict is None:
+        failures.append("fixture 37.6MiB/192MiB/2-block did not fail")
+    else:
+        print(f"fixture 37.6MiB/192MiB/2 blocks: FAIL (as required): {verdict}")
+    if allocator_verdict(small_blocks) is not None:
+        failures.append("small-block reading was rejected on count alone")
+    else:
+        print("fixture 150MiB/160MiB/6 blocks: pass (small blocks allowed)")
+    if allocator_verdict(sane) is not None:
+        failures.append("one-64MiB-block reading was rejected")
+    else:
+        print("fixture 41.5MiB/64MiB/1 block: pass")
+    for failure in failures:
+        print(f"self-test failure: {failure}")
+    print(f"exit code: {1 if failures else 0}")
+    return 1 if failures else 0
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--base", required=True, help="base git ref")
-    parser.add_argument("--head", required=True, help="head git ref")
+    parser.add_argument("--base", help="base git ref")
+    parser.add_argument("--head", help="head git ref")
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="run the #169 fixture check and exit",
+    )
     parser.add_argument(
         "--harness",
         help="ref with #101 bench sources to overlay onto the base worktree",
@@ -451,7 +633,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--warmup", type=int, default=30)
     parser.add_argument("--frames", type=int, default=30)
-    parser.add_argument("--out", required=True, type=Path, help="report output directory")
+    parser.add_argument("--out", type=Path, help="report output directory")
     parser.add_argument(
         "--work", type=Path, default=Path("/home/ubuntu/memory-gate")
     )
@@ -460,6 +642,12 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.self_test:
+        return self_test()
+    if not args.base or not args.head:
+        raise GateError("--base and --head are required")
+    if args.out is None:
+        raise GateError("--out is required")
     if args.warmup < 0 or args.frames <= 0:
         raise GateError("--warmup must be nonnegative and --frames must be positive")
     engines = tuple(
@@ -524,33 +712,99 @@ def main() -> int:
                 )
                 continue
 
-            base_bytes = base_value["measured"]
-            head_bytes = head_value["measured"]
-            cpu_delta = head_bytes["cpu_bytes"] - base_bytes["cpu_bytes"]
-            gpu_delta = head_bytes["gpu_bytes"] - base_bytes["gpu_bytes"]
-            delta = f"CPU {cpu_delta:+,} B; GPU {gpu_delta:+,} B"
-            if cpu_delta or gpu_delta:
-                failed = True
-            base_captures = base_bytes.get("backdrop_capture_bytes")
-            head_captures = head_bytes.get("backdrop_capture_bytes")
-            if base_captures is not None and head_captures is not None:
-                captures_delta = head_captures - base_captures
-                delta += f"; captures {captures_delta:+,} B"
-                if captures_delta:
+            base_phases = base_value
+            head_phases = head_value
+            for phase in PHASES:
+                base_phase = base_phases.get(phase)
+                head_phase = head_phases.get(phase)
+                if base_phase is None and head_phase is None:
+                    continue
+                if base_phase is None or head_phase is None:
+                    # A phase present on only one side is a schema delta,
+                    # not a regression — report it without failing.
+                    side = "base" if base_phase is None else "head"
+                    rows.append(
+                        (scene, engine, phase, "—", "—", "—", "—", "—",
+                         f"{phase} absent on {side}")
+                    )
+                    continue
+                problems = []
+                delta_parts = []
+                for name in ("engine", "allocator"):
+                    base_reading = base_phase[name]
+                    head_reading = head_phase[name]
+                    if isinstance(base_reading, dict) != isinstance(head_reading, dict):
+                        if base_reading is None or head_reading is None:
+                            continue
+                        problems.append(
+                            f"{name}: one side unavailable "
+                            f"({base_reading or head_reading})"
+                        )
+                        continue
+                    if base_reading is None:
+                        continue
+                    if "unavailable" in base_reading or "unavailable" in head_reading:
+                        if "unavailable" in base_reading and "unavailable" in head_reading:
+                            # Equally unavailable on both sides — an
+                            # engine with no such counter is correct,
+                            # not a failure (e.g. cherenkov-cpu has no
+                            # wgpu allocator to report).
+                            delta_parts.append(
+                                f"{name} unavailable: "
+                                f"{base_reading['unavailable']}"
+                            )
+                        else:
+                            # A required measurement the other side
+                            # produces is not a pass (#169 A5).
+                            problems.append(
+                                f"{name} unavailable: "
+                                f"{base_reading.get('unavailable') or head_reading.get('unavailable')}"
+                            )
+                        continue
+                    fields = sorted(set(base_reading) | set(head_reading))
+                    deltas = []
+                    for field in fields:
+                        before = base_reading.get(field)
+                        after = head_reading.get(field)
+                        if before != after:
+                            deltas.append(
+                                f"{field} {format_bytes(before)} -> {format_bytes(after)}"
+                            )
+                    if deltas:
+                        delta_parts.append(f"{name}: " + "; ".join(deltas))
+                        # Engine bytes are the deterministic contract —
+                        # any change fails. Allocator counters are
+                        # observations the change explains; they gate
+                        # only through the reserved-over-live verdict.
+                        if name == "engine":
+                            problems.append(f"{name}: " + "; ".join(deltas))
+                for side, reading in (("base", base_phase), ("head", head_phase)):
+                    allocator = reading["allocator"]
+                    if isinstance(allocator, dict) and "unavailable" not in allocator:
+                        verdict = allocator_verdict(allocator)
+                        if verdict is not None:
+                            problems.append(f"{side} {phase}: {verdict}")
+                if problems:
                     failed = True
-            rows.append(
-                (
-                    scene,
-                    engine,
-                    format_bytes(base_bytes["cpu_bytes"]),
-                    format_bytes(base_bytes["gpu_bytes"]),
-                    format_bytes(base_captures),
-                    format_bytes(head_bytes["cpu_bytes"]),
-                    format_bytes(head_bytes["gpu_bytes"]),
-                    format_bytes(head_captures),
-                    delta,
+                engine_base = base_phase["engine"] or {}
+                engine_head = head_phase["engine"] or {}
+                rows.append(
+                    (
+                        scene,
+                        engine,
+                        phase,
+                        format_bytes(engine_base.get("cpu_bytes")),
+                        format_bytes(engine_base.get("gpu_bytes")),
+                        format_bytes(engine_head.get("cpu_bytes")),
+                        format_bytes(engine_head.get("gpu_bytes")),
+                        format_bytes(
+                            (base_phase["allocator"] or {}).get("reserved_bytes")
+                            if isinstance(base_phase["allocator"], dict)
+                            else None
+                        ),
+                        "; ".join(problems) if problems else "match",
+                    )
                 )
-            )
 
     table_path = out / "memory-gate.md"
     table = markdown_table(args.base, args.head, rows)

@@ -11,12 +11,13 @@ all Extend modes), sweep gradients and premultiplied linear-P3 bilinear meshes.
 Direct images use the same paint sampler. Uploads honor sRGB, Display-P3 and
 linear-sRGB metadata and encoded premultiplied alpha. Decoding happens once at
 registration. Image handles invalidate prepared references when removed.
-Registered images and cached glyph masks share Budget::cpu; active frame data
-and framebuffers remain separate, non-evictable allocations. MemoryUsage keeps
-dev's accounting model: framebuffers, registered pixels and cached masks, not
-complete process/retained-operation heap accounting. Duplicate masks
-do not inflate byte accounting. Oversized masks render in their current frame
-without being retained in the cache.
+Registered images, cached glyph masks and decoded bitmap glyphs share
+Budget::cpu; active frame data and framebuffers remain separate, non-evictable
+allocations. MemoryUsage keeps dev's accounting model: framebuffers,
+registered pixels and cached masks/bitmaps, not complete process/retained-
+operation heap accounting. Duplicate masks do not inflate byte accounting.
+Oversized masks render in their current frame without being retained in the
+cache.
 
 Sweep angles are finite radians. Nonpositive spans wrap into (0, 2π]; positive
 spans retain their extent, matching the existing sweep domain. Nonfinite or
@@ -32,6 +33,13 @@ paint coordinates remain run coordinates. Existing filled-glyph behavior stays
 unchanged. #68 paint-to-shape transforms apply to all these paints. Image
 pattern mappings compose in f64 before sampling, preventing nearest-neighbor
 boundary changes from separately rounded transforms.
+
+Bitmap-only sbix and CBDT/CBLC fonts are decoded as image glyphs on the render
+thread. Per-glyph transforms compose as `translate(x,y) * t * scale(size)` on
+the em-space image rectangle, and strike selection uses run size multiplied by
+the largest singular value of `CTM * translate(x,y) * t`. Missing glyphs in
+the selected strike draw nothing. Bitmap-font strokes, COLR and SVG colour
+fonts remain unsupported.
 
 Group and layer blends use the existing public BlendMode vocabulary. Groups
 also support BlendSpace::SrgbEncoded. Opacity applies before conversion and
@@ -49,8 +57,9 @@ then expanded into ordinary fills, clips and groups at the glyph's
 placement. Brush transforms are exact — gradient geometry keeps its own
 paint transform instead of a sqrt(det) approximation — and a foreground
 brush whose paint carries no alpha channel (image, mesh, shader) keeps its
-COLR alpha as group opacity. Bitmap-only colour fonts (CBDT/sbix without
-outlines) remain unsupported.
+COLR alpha as group opacity. For fonts with both COLR and bitmap strikes,
+COLR glyphs take precedence and other glyphs use the selected bitmap strike.
+SVG colour fonts and non-PNG/BGRA bitmap formats remain unsupported.
 
 Opt-in diagnostics use RUST_LOG=cherenkov_cpu::profile=debug. lower_ns covers
 retained lowering, glyph_ns mask resolution, and shade_ns framebuffer clearing

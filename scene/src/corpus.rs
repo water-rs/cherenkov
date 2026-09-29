@@ -50,6 +50,10 @@ pub const THAI: &str = "สวัสดีชาวโลก ๑๒๓";
 pub const EMOJI: &str = "😀🎨🚀❤";
 /// `COLRv1` sample text (Nabla).
 pub const COLR: &str = "AZ9";
+/// Bitmap colour fonts used by the bitmap-rendering scenes.
+pub const BITMAP_FONTS: &[&str] = &["NotoColorEmojiSubset.ttf", "CherenkovSbixTest.ttf"];
+/// Emoji covered by the CBDT and sbix fixtures.
+pub const BITMAP_EMOJI: &str = "\u{2615}\u{26A0}\u{26A1}\u{2764}\u{1F600}";
 
 /// The corpus fonts. All are OFL-licensed; `scenes/fonts/OFL.txt` is the
 /// shared licence file kept next to them.

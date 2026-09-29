@@ -19,17 +19,21 @@
 //! spec's use of CSS images semantics; [`ColorSpace::Srgb`] is used as the
 //! interpolation space.
 
+use crate::color::{linear_srgb_to_linear_p3, srgb_decode};
 use cherenkov_scene::{
-    BlendMode, Color, ColorSpace, Draw, Extend, FillRule, GlyphRun, GradientStop, Item, Layer,
-    LinearGradient, Paint, RadialGradient, Shape, SweepGradient,
+    BlendMode, Color, ColorSpace, Draw, Extend, FillRule, GlyphRun, GradientStop, ImageEncoding,
+    Item, Layer, LinearGradient, Paint, RadialGradient, ResourceHash, Sampling, Shape,
+    SweepGradient,
 };
 use kurbo::{Affine, BezPath, Point, Rect, Shape as _};
 use read_fonts::types::BoundingBox;
 use skrifa::{
     GlyphId, MetadataProvider,
+    bitmap::{BitmapData, BitmapFormat, BitmapGlyph, BitmapStrikes, Origin},
     color::{Brush, ColorPainter, ColorStop},
     instance::{LocationRef, NormalizedCoord as F2Dot14Coord, Size},
     outline::{DrawSettings, OutlinePen},
+    raw::TableProvider,
 };
 
 use crate::resources::Resources;
@@ -49,6 +53,8 @@ pub enum GlyphError {
     UnsupportedCompositeMode(String),
     /// A per-glyph transform is non-finite or non-invertible.
     Transform,
+    /// A bitmap-font feature or graphic format is unsupported.
+    UnsupportedBitmap(String),
 }
 
 impl std::fmt::Display for GlyphError {
@@ -60,6 +66,7 @@ impl std::fmt::Display for GlyphError {
             Self::Paint(e) => write!(f, "COLR paint error: {e}"),
             Self::UnsupportedCompositeMode(m) => write!(f, "unsupported COLR composite mode {m}"),
             Self::Transform => write!(f, "glyph transform must be finite and invertible"),
+            Self::UnsupportedBitmap(feature) => write!(f, "unsupported bitmap font {feature}"),
         }
     }
 }
@@ -612,6 +619,279 @@ fn node_to_item(node: Node, place: Affine, scene_rect: Rect) -> Item {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BitmapKind {
+    Sbix,
+    Cbdt,
+}
+
+struct BitmapFont {
+    kind: BitmapKind,
+    strikes: Box<[(f32, u16)]>,
+}
+
+impl BitmapFont {
+    fn detect(font: &skrifa::FontRef<'_>) -> Result<Option<Self>, GlyphError> {
+        use skrifa::raw::TableProvider as _;
+        let (kind, format) = if font.data_for_tag(skrifa::Tag::new(b"sbix")).is_some() {
+            font.sbix()
+                .map_err(|error| GlyphError::Font(error.to_string()))?;
+            (BitmapKind::Sbix, BitmapFormat::Sbix)
+        } else if font.data_for_tag(skrifa::Tag::new(b"CBDT")).is_some() {
+            font.cblc()
+                .map_err(|error| GlyphError::Font(error.to_string()))?;
+            font.cbdt()
+                .map_err(|error| GlyphError::Font(error.to_string()))?;
+            (BitmapKind::Cbdt, BitmapFormat::Cbdt)
+        } else {
+            return Ok(None);
+        };
+        let strikes = BitmapStrikes::with_format(font, format)
+            .ok_or_else(|| GlyphError::Font("invalid bitmap strike tables".into()))?;
+        if strikes.is_empty() {
+            return Err(GlyphError::Font("bitmap font has no strikes".into()));
+        }
+        let mut sizes = Vec::with_capacity(strikes.len());
+        for (index, strike) in strikes.iter().enumerate() {
+            let index = u16::try_from(index)
+                .map_err(|_| GlyphError::Font("too many bitmap strikes".into()))?;
+            sizes.push((strike.ppem(), index));
+        }
+        sizes.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        Ok(Some(Self {
+            kind,
+            strikes: sizes.into_boxed_slice(),
+        }))
+    }
+
+    fn select(&self, device_ppem: f32) -> u16 {
+        if !device_ppem.is_finite() || device_ppem <= 0.0 {
+            return self.largest_strike();
+        }
+        self.strikes
+            .iter()
+            .copied()
+            .find(|(ppem, _)| *ppem >= device_ppem)
+            .map_or_else(|| self.largest_strike(), |(_, index)| index)
+    }
+
+    fn largest_strike(&self) -> u16 {
+        let largest_ppem = self.strikes.last().expect("bitmap font has strikes").0;
+        self.strikes
+            .iter()
+            .find(|(ppem, _)| ppem.to_bits() == largest_ppem.to_bits())
+            .expect("largest bitmap strike exists")
+            .1
+    }
+}
+
+struct DecodedBitmap {
+    image: crate::image::Image,
+    hash: ResourceHash,
+    em: Rect,
+}
+
+fn decode_bitmap(
+    font: &skrifa::FontRef<'_>,
+    bitmap_font: &BitmapFont,
+    strike_index: u16,
+    glyph_id: u16,
+) -> Result<Option<DecodedBitmap>, GlyphError> {
+    use skrifa::raw::TableProvider as _;
+    let gid = GlyphId::from(glyph_id);
+    let format = match bitmap_font.kind {
+        BitmapKind::Sbix => BitmapFormat::Sbix,
+        BitmapKind::Cbdt => BitmapFormat::Cbdt,
+    };
+    let strikes = BitmapStrikes::with_format(font, format)
+        .ok_or_else(|| GlyphError::Font("invalid bitmap strike tables".into()))?;
+    let strike = strikes
+        .get(usize::from(strike_index))
+        .ok_or_else(|| GlyphError::Font(format!("bitmap strike {strike_index} is missing")))?;
+    let glyph = if let Some(glyph) = strike.get(gid) {
+        glyph
+    } else {
+        match bitmap_font.kind {
+            BitmapKind::Sbix => {
+                let sbix = font
+                    .sbix()
+                    .map_err(|error| GlyphError::Font(error.to_string()))?;
+                let raw_strike = sbix
+                    .strikes()
+                    .get(usize::from(strike_index))
+                    .map_err(|error| GlyphError::Font(error.to_string()))?;
+                let raw = match raw_strike.glyph_data(gid) {
+                    Ok(Some(raw)) => raw,
+                    Ok(None) | Err(skrifa::raw::ReadError::OutOfBounds) => return Ok(None),
+                    Err(error) => return Err(GlyphError::Font(error.to_string())),
+                };
+                if raw.graphic_type() == skrifa::Tag::new(b"dupe") {
+                    let target = raw
+                        .data()
+                        .get(..2)
+                        .ok_or_else(|| GlyphError::Font("invalid sbix dupe glyph data".into()))?;
+                    let target = u16::from_be_bytes([target[0], target[1]]);
+                    let target_id = GlyphId::from(target);
+                    let target_raw = match raw_strike.glyph_data(target_id) {
+                        Ok(Some(target_raw)) => target_raw,
+                        Ok(None) | Err(skrifa::raw::ReadError::OutOfBounds) => {
+                            return Err(GlyphError::Font("sbix dupe target is absent".into()));
+                        }
+                        Err(error) => return Err(GlyphError::Font(error.to_string())),
+                    };
+                    if target_raw.graphic_type() == skrifa::Tag::new(b"dupe") {
+                        return Err(GlyphError::Font("sbix dupe points to another dupe".into()));
+                    }
+                    if target_raw.graphic_type() != skrifa::Tag::new(b"png ") {
+                        return Err(GlyphError::UnsupportedBitmap(format!(
+                            "graphic type {:?}",
+                            target_raw.graphic_type()
+                        )));
+                    }
+                    strike.get(target_id).ok_or_else(|| {
+                        GlyphError::Font("invalid sbix dupe target glyph metrics".into())
+                    })?
+                } else if raw.graphic_type() == skrifa::Tag::new(b"png ") {
+                    return Err(GlyphError::Font("invalid sbix PNG glyph metrics".into()));
+                } else {
+                    return Err(GlyphError::UnsupportedBitmap(format!(
+                        "graphic type {:?}",
+                        raw.graphic_type()
+                    )));
+                }
+            }
+            BitmapKind::Cbdt => {
+                let cblc = font
+                    .cblc()
+                    .map_err(|error| GlyphError::Font(error.to_string()))?;
+                let size = cblc
+                    .bitmap_sizes()
+                    .get(usize::from(strike_index))
+                    .copied()
+                    .ok_or_else(|| {
+                        GlyphError::Font(format!("bitmap strike {strike_index} is missing"))
+                    })?;
+                if size.location(cblc.offset_data(), gid).is_err() {
+                    return Ok(None);
+                }
+                return Err(GlyphError::UnsupportedBitmap(
+                    "CBDT glyph data format".into(),
+                ));
+            }
+        }
+    };
+    decode_bitmap_glyph(font, &glyph)
+}
+
+fn decode_bitmap_glyph(
+    font: &skrifa::FontRef<'_>,
+    glyph: &BitmapGlyph<'_>,
+) -> Result<Option<DecodedBitmap>, GlyphError> {
+    if glyph.width == 0 || glyph.height == 0 {
+        return Ok(None);
+    }
+    let (rgba, premultiplied, raw) = match &glyph.data {
+        BitmapData::Png(bytes) => {
+            let (width, height, rgba) = crate::image::decode_png_rgba8(bytes)
+                .map_err(|error| GlyphError::Font(format!("bitmap PNG: {error}")))?;
+            if width != glyph.width || height != glyph.height {
+                return Err(GlyphError::Font(
+                    "bitmap glyph image disagrees with its metrics".into(),
+                ));
+            }
+            (rgba, false, bytes)
+        }
+        BitmapData::Bgra(bytes) => {
+            let expected = usize::try_from(glyph.width)
+                .ok()
+                .and_then(|width| {
+                    usize::try_from(glyph.height)
+                        .ok()
+                        .and_then(|height| width.checked_mul(height))
+                })
+                .and_then(|pixels| pixels.checked_mul(4));
+            if expected != Some(bytes.len()) {
+                return Err(GlyphError::Font(
+                    "bitmap glyph image disagrees with its metrics".into(),
+                ));
+            }
+            (
+                bytes
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .flat_map(|pixel| [pixel[2], pixel[1], pixel[0], pixel[3]])
+                    .collect(),
+                true,
+                bytes,
+            )
+        }
+        BitmapData::Mask(_) => {
+            return Err(GlyphError::UnsupportedBitmap("mask data".into()));
+        }
+    };
+    let upem = font
+        .head()
+        .map_err(|error| GlyphError::Font(error.to_string()))?
+        .units_per_em();
+    if upem == 0 || glyph.ppem_x <= 0.0 || glyph.ppem_y <= 0.0 {
+        return Err(GlyphError::Font("invalid bitmap glyph metrics".into()));
+    }
+    let x0 = f64::from(glyph.bearing_x) / f64::from(upem)
+        + f64::from(glyph.inner_bearing_x) / f64::from(glyph.ppem_x);
+    let y = f64::from(glyph.bearing_y) / f64::from(upem)
+        + f64::from(glyph.inner_bearing_y) / f64::from(glyph.ppem_y);
+    let width = f64::from(glyph.width) / f64::from(glyph.ppem_x);
+    let height = f64::from(glyph.height) / f64::from(glyph.ppem_y);
+    let (y0, y1) = match glyph.placement_origin {
+        Origin::TopLeft => (-y, -y + height),
+        Origin::BottomLeft => (-y - height, -y),
+    };
+    let image = bitmap_image(glyph.width, glyph.height, &rgba, premultiplied);
+    Ok(Some(DecodedBitmap {
+        image,
+        hash: ResourceHash::of(raw),
+        em: Rect::new(x0, y0, x0 + width, y1),
+    }))
+}
+
+fn bitmap_image(width: u32, height: u32, rgba: &[u8], premultiplied: bool) -> crate::image::Image {
+    let mut pixels = Vec::with_capacity(rgba.len() / 4);
+    for px in rgba.as_chunks::<4>().0 {
+        let alpha = f64::from(px[3]) / 255.0;
+        if alpha == 0.0 {
+            pixels.push([0.0; 4]);
+            continue;
+        }
+        let linear = std::array::from_fn(|channel| {
+            let encoded = f64::from(px[channel]) / 255.0;
+            srgb_decode(if premultiplied {
+                (encoded / alpha).min(1.0)
+            } else {
+                encoded
+            })
+        });
+        let p3 = linear_srgb_to_linear_p3(linear);
+        pixels.push([alpha * p3[0], alpha * p3[1], alpha * p3[2], alpha]);
+    }
+    crate::image::Image {
+        width: usize::try_from(width).expect("bitmap width fits usize"),
+        height: usize::try_from(height).expect("bitmap height fits usize"),
+        pixels,
+    }
+}
+
+#[expect(
+    clippy::many_single_char_names,
+    reason = "affine coefficients and eigenvalue formula use standard notation"
+)]
+fn sigma_max(transform: Affine) -> f64 {
+    let [a, b, c, d, ..] = transform.as_coeffs();
+    let p = a.mul_add(a, b * b) + c.mul_add(c, d * d);
+    let det = a.mul_add(d, -(b * c));
+    p.midpoint(p.mul_add(p, -4.0 * det * det).sqrt()).sqrt()
+}
+
 /// Expand a [`GlyphRun`] into scene [`Item`]s.
 ///
 /// Each glyph is drawn at `Size::unscaled()` (font units, **unhinted**) under
@@ -623,24 +903,38 @@ fn node_to_item(node: Node, place: Affine, scene_rect: Rect) -> Item {
 /// errors; `crate::SceneError` on missing font resources.
 #[expect(
     clippy::too_many_lines,
-    reason = "the three per-glyph branches share one placement"
+    reason = "outline, COLR and transformed bitmap glyph realization share run setup and precedence"
 )]
 pub fn items_for_glyph_run(
     run: &GlyphRun,
+    transform: Affine,
     resources: &mut Resources,
     scene_rect: Rect,
 ) -> Result<Vec<Item>, GlyphError> {
     let data = resources
         .font(run.font)
+        .map_err(|e| GlyphError::Font(e.to_string()))?
+        .clone();
+    let font = skrifa::FontRef::from_index(&data, run.font_index)
         .map_err(|e| GlyphError::Font(e.to_string()))?;
-    let font = skrifa::FontRef::from_index(data, run.font_index)
-        .map_err(|e| GlyphError::Font(e.to_string()))?;
+    if font.data_for_tag(skrifa::Tag::new(b"SVG ")).is_some() {
+        return Err(GlyphError::UnsupportedBitmap("SVG color font".into()));
+    }
+    let bitmap_font = BitmapFont::detect(&font)?;
+    if bitmap_font.is_some() && run.stroke.is_some() {
+        return Err(GlyphError::UnsupportedBitmap("glyph-stroke".into()));
+    }
     let metrics = font.metrics(Size::unscaled(), LocationRef::default());
     let upem = f64::from(metrics.units_per_em);
     if upem <= 0.0 {
         return Err(GlyphError::Font("zero units_per_em".into()));
     }
     let s = f64::from(run.size) / upem;
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "strike selection uses the font's f32 ppem metadata"
+    )]
+    let device_ppem = (f64::from(run.size) * sigma_max(transform)) as f32;
 
     let coords: Vec<F2Dot14Coord> = run
         .normalized_coords
@@ -728,6 +1022,73 @@ pub fn items_for_glyph_run(
                     .into_iter()
                     .map(|n| node_to_item(n, place, scene_rect)),
             );
+        } else if let Some(bitmap_font) = &bitmap_font {
+            let strike = if g.transform.is_none() {
+                bitmap_font.select(device_ppem)
+            } else {
+                let bitmap_place = Affine::translate((f64::from(g.x), f64::from(g.y))) * t;
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "strike selection uses the font's f32 ppem metadata"
+                )]
+                let ppem = (f64::from(run.size) * sigma_max(transform * bitmap_place)) as f32;
+                bitmap_font.select(ppem)
+            };
+            let Some(bitmap) = decode_bitmap(&font, bitmap_font, strike, gid_u16)? else {
+                // Bitmap strikes are per-glyph alternates: a glyph with no
+                // bitmap in the strike keeps its outline, and a glyph with
+                // neither raises `NoOutline` below.
+                let pen = BezPen(outline_path(&font, gid_u16, &coords)?);
+                if !pen.0.elements().is_empty() {
+                    items.push(Item::Draw(Draw::Fill {
+                        shape: Shape::Path {
+                            path: place * pen.0,
+                        },
+                        rule: FillRule::NonZero,
+                        paint: run.paint.clone(),
+                    }));
+                }
+                continue;
+            };
+            resources.insert_image(bitmap.hash, bitmap.image);
+            if g.transform.is_none() {
+                let dst = Rect::new(
+                    f64::from(run.size).mul_add(bitmap.em.x0, f64::from(g.x)),
+                    f64::from(run.size).mul_add(bitmap.em.y0, f64::from(g.y)),
+                    f64::from(run.size).mul_add(bitmap.em.x1, f64::from(g.x)),
+                    f64::from(run.size).mul_add(bitmap.em.y1, f64::from(g.y)),
+                );
+                items.push(Item::Draw(Draw::Image {
+                    image: bitmap.hash,
+                    encoding: ImageEncoding::default(),
+                    dst,
+                    sampling: Sampling::Bilinear,
+                }));
+            } else {
+                let dst = Rect::new(
+                    f64::from(run.size) * bitmap.em.x0,
+                    f64::from(run.size) * bitmap.em.y0,
+                    f64::from(run.size) * bitmap.em.x1,
+                    f64::from(run.size) * bitmap.em.y1,
+                );
+                items.push(Item::Layer(Layer {
+                    transform: Affine::translate((f64::from(g.x), f64::from(g.y))) * t,
+                    clip: None,
+                    opacity: 1.0,
+                    blend: BlendMode::Normal,
+                    backdrop: None,
+                    filter: None,
+                    scroll_offset: kurbo::Vec2::ZERO,
+                    motion: None,
+                    items: vec![Item::Draw(Draw::Image {
+                        image: bitmap.hash,
+                        encoding: ImageEncoding::default(),
+                        dst,
+                        sampling: Sampling::Bilinear,
+                    })],
+                    live: Vec::new(),
+                }));
+            }
         } else {
             let pen = BezPen(outline_path(&font, gid_u16, &coords)?);
             if pen.0.elements().is_empty() {
@@ -763,4 +1124,177 @@ fn outline_path(
         )
         .map_err(|error| GlyphError::Font(error.to_string()))?;
     Ok(pen.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cherenkov_scene::{Color, Glyph, GlyphRun, Scene};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const SBIX: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../scenes/fonts/CherenkovSbixTest.ttf"
+    ));
+    const CBDT: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../scenes/fonts/NotoColorEmojiSubset.ttf"
+    ));
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
+    fn run(font: ResourceHash, glyph: u32) -> GlyphRun {
+        GlyphRun {
+            font,
+            font_index: 0,
+            size: 20.0,
+            normalized_coords: Vec::new(),
+            glyphs: vec![Glyph {
+                id: glyph,
+                x: 12.0,
+                y: 40.0,
+                transform: None,
+            }],
+            stroke: None,
+            paint: Paint::Solid(Color {
+                space: ColorSpace::Srgb,
+                components: [1.0, 0.0, 0.0, 1.0],
+            }),
+        }
+    }
+
+    #[test]
+    fn largest_strike_ties_use_the_lowest_table_index() {
+        let font = BitmapFont {
+            kind: BitmapKind::Sbix,
+            strikes: vec![(32.0, 0), (32.0, 2), (96.0, 1), (96.0, 3)].into_boxed_slice(),
+        };
+        assert_eq!(font.select(97.0), 1);
+        assert_eq!(font.select(f32::NAN), 1);
+    }
+
+    fn sbix_resources() -> (std::path::PathBuf, Resources, ResourceHash, u32) {
+        let dir = std::env::temp_dir().join(format!(
+            "cherenkov-oracle-bitmap-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        let hash = Scene::store_resource(&dir, SBIX).expect("store font");
+        let font = skrifa::FontRef::from_index(SBIX, 0).expect("font");
+        let glyph = font.charmap().map('😀').expect("emoji glyph").to_u32();
+        (dir.clone(), Resources::new(dir), hash, glyph)
+    }
+
+    fn image_draw(items: &[Item]) -> ResourceHash {
+        match items {
+            [Item::Draw(Draw::Image { image, .. })] => *image,
+            [Item::Layer(layer)] => match layer.items.as_slice() {
+                [Item::Draw(Draw::Image { image, .. })] => *image,
+                other => panic!("expected one transformed bitmap image, got {other:?}"),
+            },
+            other => panic!("expected one bitmap image, got {other:?}"),
+        }
+    }
+
+    /// Outline-less bitmap fonts are real (the Android CBDT emoji fonts
+    /// carry no `glyf`/`loca`): a glyph with a strike renders through the
+    /// bitmap path, and a glyph with neither a bitmap nor an outline is a
+    /// hard `NoOutline` error — never silently dropped.
+    #[test]
+    fn outline_less_fonts_render_by_bitmap_or_hard_error() {
+        for (bytes, label) in [(SBIX, "sbix"), (CBDT, "cbdt")] {
+            let dir = std::env::temp_dir().join(format!(
+                "cherenkov-oracle-{label}-{}-{}",
+                std::process::id(),
+                NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+            ));
+            let hash = Scene::store_resource(&dir, bytes).expect("store font");
+            let mut resources = Resources::new(dir.clone());
+            let font = skrifa::FontRef::from_index(bytes, 0).expect("font");
+            let glyph = font.charmap().map('😀').expect("emoji glyph").to_u32();
+            let items = items_for_glyph_run(
+                &run(hash, glyph),
+                Affine::IDENTITY,
+                &mut resources,
+                Rect::new(0.0, 0.0, 320.0, 200.0),
+            );
+            let items = items.unwrap_or_else(|e| panic!("{label} strike glyph: {e}"));
+            let _ = image_draw(&items);
+            let missing = items_for_glyph_run(
+                &run(hash, u32::from(u16::MAX)),
+                Affine::IDENTITY,
+                &mut resources,
+                Rect::new(0.0, 0.0, 320.0, 200.0),
+            );
+            assert!(
+                matches!(missing, Err(GlyphError::NoOutline(u16::MAX))),
+                "{label} glyph with neither bitmap nor outline must error, got {missing:?}"
+            );
+            std::fs::remove_dir_all(dir).expect("remove temp resources");
+        }
+    }
+
+    #[test]
+    fn transform_scale_changes_the_selected_sbix_strike() {
+        let (dir, mut resources, hash, glyph) = sbix_resources();
+        let run = run(hash, glyph);
+        let rect = Rect::new(0.0, 0.0, 320.0, 200.0);
+        let small = items_for_glyph_run(&run, Affine::IDENTITY, &mut resources, rect)
+            .expect("identity transform");
+        let small_hash = image_draw(&small);
+        let mut scaled_run = run.clone();
+        scaled_run.glyphs[0].transform = Some(Affine::scale(2.0));
+        let large = items_for_glyph_run(&scaled_run, Affine::IDENTITY, &mut resources, rect)
+            .expect("per-glyph scale");
+        let large_hash = image_draw(&large);
+        assert_ne!(small_hash, large_hash);
+        let mut size_40_run = run.clone();
+        size_40_run.size = 40.0;
+        let size_40 = items_for_glyph_run(&size_40_run, Affine::IDENTITY, &mut resources, rect)
+            .expect("size-40 run");
+        assert_eq!(large_hash, image_draw(&size_40));
+        let small_dims = {
+            let image = resources
+                .image(small_hash, ImageEncoding::default())
+                .expect("small image");
+            (image.width, image.height)
+        };
+        let large_dims = {
+            let image = resources
+                .image(large_hash, ImageEncoding::default())
+                .expect("large image");
+            (image.width, image.height)
+        };
+        assert_eq!(small_dims, (40, 38));
+        assert_eq!(large_dims, (120, 113));
+        std::fs::remove_dir_all(dir).expect("remove temp resources");
+    }
+
+    #[test]
+    fn non_invertible_bitmap_glyph_transform_is_an_error() {
+        let (dir, mut resources, hash, glyph) = sbix_resources();
+        let mut run = run(hash, glyph);
+        run.glyphs[0].transform = Some(Affine::scale_non_uniform(0.0, 1.0));
+        assert!(matches!(
+            items_for_glyph_run(
+                &run,
+                Affine::IDENTITY,
+                &mut resources,
+                Rect::new(0.0, 0.0, 320.0, 200.0)
+            ),
+            Err(GlyphError::Transform)
+        ));
+        std::fs::remove_dir_all(dir).expect("remove temp resources");
+    }
+
+    /// A glyph absent from the strike is not silently dropped: with no
+    /// outline either, it is a hard `NoOutline` error.
+    #[test]
+    fn absent_notdef_bitmap_without_outline_is_an_error() {
+        let (dir, mut resources, hash, _) = sbix_resources();
+        assert!(matches!(
+            items_for_glyph_run(&run(hash, 0), Affine::IDENTITY, &mut resources, Rect::ZERO),
+            Err(GlyphError::NoOutline(0))
+        ));
+        std::fs::remove_dir_all(dir).expect("remove temp resources");
+    }
 }

@@ -227,6 +227,24 @@ impl TextContext {
             families.insert(*file, name.to_string());
             blobs.insert(hash, bytes);
         }
+        for file in corpus::BITMAP_FONTS {
+            let path = fonts_dir.join(file);
+            let bytes = std::fs::read(&path)?;
+            let hash = ResourceHash::of(&bytes);
+            let registered = fcx
+                .collection
+                .register_fonts(Blob::new(Arc::new(bytes.clone())), None);
+            let (family_id, _) = registered
+                .first()
+                .unwrap_or_else(|| panic!("font {file} registered no family"));
+            let family_id = *family_id;
+            let name = fcx
+                .collection
+                .family_name(family_id)
+                .unwrap_or_else(|| panic!("font {file} has no family name"));
+            families.insert(file, name.to_string());
+            blobs.insert(hash, bytes);
+        }
         Ok(Self {
             fcx,
             lcx: LayoutContext::new(),
@@ -3100,6 +3118,278 @@ fn run() -> Result<(), SceneError> {
                 blobs,
             );
         }
+    }
+
+    // ---- Bitmap colour fonts -----------------------------------------------
+
+    let bitmap_white = srgb(1.0, 1.0, 1.0);
+    for (file, name) in [
+        ("NotoColorEmojiSubset.ttf", "text-cbdt"),
+        ("CherenkovSbixTest.ttf", "text-sbix"),
+    ] {
+        let runs = ctx.shape(
+            file,
+            corpus::BITMAP_EMOJI,
+            48.0,
+            FontWeight::NORMAL,
+            &solid(dark),
+        );
+        let blobs = font_blobs(&ctx, &[&runs]);
+        corpus.scene_with_blobs(
+            name,
+            320,
+            160,
+            bitmap_white,
+            |l| {
+                for run in &runs {
+                    l.glyphs(run.clone());
+                }
+            },
+            blobs,
+        );
+    }
+
+    for (file, name) in [
+        ("NotoColorEmojiSubset.ttf", "text-cbdt-sizes"),
+        ("CherenkovSbixTest.ttf", "text-sbix-sizes"),
+    ] {
+        let specs = [
+            (14.0, corpus::BITMAP_EMOJI),
+            (24.0, corpus::BITMAP_EMOJI),
+            (40.0, corpus::BITMAP_EMOJI),
+            (72.0, "\u{2615}\u{26A0}\u{26A1}"),
+            (104.0, "\u{1F600}\u{2764}"),
+        ];
+        let rows: Vec<Vec<GlyphRun>> = specs
+            .iter()
+            .map(|(size, text)| ctx.shape(file, text, *size, FontWeight::NORMAL, &solid(dark)))
+            .collect();
+        let blobs = font_blobs(&ctx, &rows.iter().map(Vec::as_slice).collect::<Vec<_>>());
+        corpus.scene_with_blobs(
+            name,
+            480,
+            360,
+            bitmap_white,
+            |l| {
+                for (runs, y) in rows.iter().zip([0.0, 24.0, 58.0, 112.0, 204.0]) {
+                    l.layer(|row| {
+                        row.transform(Affine::translate((0.0, y)));
+                        for run in runs {
+                            row.glyphs(run.clone());
+                        }
+                    });
+                }
+            },
+            blobs,
+        );
+    }
+
+    for (file, name) in [
+        ("NotoColorEmojiSubset.ttf", "text-cbdt-transform"),
+        ("CherenkovSbixTest.ttf", "text-sbix-transform"),
+    ] {
+        let first = ctx.shape(
+            file,
+            corpus::BITMAP_EMOJI,
+            40.0,
+            FontWeight::NORMAL,
+            &solid(dark),
+        );
+        let second = ctx.shape(
+            file,
+            "\u{1F600}\u{2764}",
+            72.0,
+            FontWeight::NORMAL,
+            &solid(dark),
+        );
+        let blobs = font_blobs(&ctx, &[&first, &second]);
+        corpus.scene_with_blobs(
+            name,
+            400,
+            280,
+            bitmap_white,
+            |l| {
+                l.layer(|rotated| {
+                    rotated.transform(
+                        Affine::translate((40.0, 30.0))
+                            * Affine::rotate(15_f64.to_radians())
+                            * Affine::scale_non_uniform(1.2, 0.8),
+                    );
+                    for run in &first {
+                        rotated.glyphs(run.clone());
+                    }
+                });
+                l.layer(|scaled| {
+                    scaled.transform(Affine::translate((60.0, 200.0)) * Affine::scale(0.5));
+                    for run in &second {
+                        scaled.glyphs(run.clone());
+                    }
+                });
+            },
+            blobs,
+        );
+    }
+
+    {
+        let sbix_transforms = [
+            Affine::rotate(20_f64.to_radians()),
+            Affine::skew(0.35, 0.0),
+            Affine::skew(0.0, -0.25),
+            Affine::scale_non_uniform(1.4, 0.8),
+            Affine::rotate((-15_f64).to_radians())
+                * Affine::skew(0.2, -0.12)
+                * Affine::scale_non_uniform(0.8, 1.25),
+        ];
+        let cbdt_transforms = [
+            Affine::rotate((-20_f64).to_radians()),
+            Affine::skew(-0.25, 0.15),
+            Affine::scale_non_uniform(0.7, 1.3),
+            Affine::rotate(45_f64.to_radians()),
+            Affine::rotate(12_f64.to_radians())
+                * Affine::skew(0.18, 0.08)
+                * Affine::scale_non_uniform(1.15, 0.9),
+        ];
+        let mut sbix = ctx.shape(
+            "CherenkovSbixTest.ttf",
+            corpus::BITMAP_EMOJI,
+            24.0,
+            FontWeight::NORMAL,
+            &solid(dark),
+        );
+        let mut cbdt = ctx.shape(
+            "NotoColorEmojiSubset.ttf",
+            corpus::BITMAP_EMOJI,
+            40.0,
+            FontWeight::NORMAL,
+            &solid(dark),
+        );
+        let mut index = 0;
+        for run in &mut sbix {
+            for glyph in &mut run.glyphs {
+                #[expect(clippy::cast_precision_loss, reason = "glyph count is small")]
+                let x = 70.113 + index as f32 * 69.0;
+                glyph.x = x;
+                glyph.transform = Some(sbix_transforms[index]);
+                index += 1;
+            }
+        }
+        assert_eq!(index, sbix_transforms.len());
+        index = 0;
+        for run in &mut cbdt {
+            for glyph in &mut run.glyphs {
+                #[expect(clippy::cast_precision_loss, reason = "glyph count is small")]
+                let x = 46.214 + index as f32 * 76.0;
+                glyph.x = x;
+                glyph.transform = Some(cbdt_transforms[index]);
+                index += 1;
+            }
+        }
+        assert_eq!(index, cbdt_transforms.len());
+        let blobs = font_blobs(&ctx, &[&sbix, &cbdt]);
+        corpus.scene_with_blobs(
+            "text-bitmap-glyph-transform",
+            440,
+            195,
+            bitmap_white,
+            |l| {
+                l.layer(|row| {
+                    row.transform(Affine::translate((0.0, 15.439)));
+                    for run in &sbix {
+                        row.glyphs(run.clone());
+                    }
+                });
+                l.layer(|row| {
+                    row.transform(Affine::translate((0.0, 88.392)));
+                    for run in &cbdt {
+                        row.glyphs(run.clone());
+                    }
+                });
+            },
+            blobs,
+        );
+    }
+
+    for (suffix, paint) in [
+        ("", solid(dark)),
+        ("-p3", solid(p3(0.0, 1.0, 0.0))),
+        ("-hdr", solid(hdr(16.0, 2.0, 0.5))),
+    ] {
+        let coffee = ctx.shape("NotoSans.ttf", "Coffee ", 32.0, FontWeight::NORMAL, &paint);
+        let cbdt = ctx.shape(
+            "NotoColorEmojiSubset.ttf",
+            corpus::BITMAP_EMOJI,
+            32.0,
+            FontWeight::NORMAL,
+            &paint,
+        );
+        let warning = ctx.shape("NotoSans.ttf", "Warning ", 32.0, FontWeight::NORMAL, &paint);
+        let sbix = ctx.shape(
+            "CherenkovSbixTest.ttf",
+            corpus::BITMAP_EMOJI,
+            32.0,
+            FontWeight::NORMAL,
+            &paint,
+        );
+        let overlap = ctx.shape(
+            "NotoColorEmojiSubset.ttf",
+            corpus::BITMAP_EMOJI,
+            40.0,
+            FontWeight::NORMAL,
+            &paint,
+        );
+        let latin = ctx.shape(
+            "NotoSans.ttf",
+            "overlapping text",
+            24.0,
+            FontWeight::NORMAL,
+            &paint,
+        );
+        let blobs = font_blobs(&ctx, &[&coffee, &cbdt, &warning, &sbix, &overlap, &latin]);
+        corpus.scene_with_blobs(
+            format!("text-bitmap-mixed{suffix}"),
+            480,
+            240,
+            bitmap_white,
+            |l| {
+                l.layer(|line| {
+                    line.transform(Affine::translate((0.0, 0.0)));
+                    for run in &coffee {
+                        line.glyphs(run.clone());
+                    }
+                });
+                l.layer(|line| {
+                    line.transform(Affine::translate((140.0, 0.0)));
+                    for run in &cbdt {
+                        line.glyphs(run.clone());
+                    }
+                });
+                l.layer(|line| {
+                    line.transform(Affine::translate((0.0, 62.0)));
+                    for run in &warning {
+                        line.glyphs(run.clone());
+                    }
+                });
+                l.layer(|line| {
+                    line.transform(Affine::translate((160.0, 62.0)));
+                    for run in &sbix {
+                        line.glyphs(run.clone());
+                    }
+                });
+                l.layer(|line| {
+                    line.transform(Affine::translate((0.0, 122.0)));
+                    for run in &overlap {
+                        line.glyphs(run.clone());
+                    }
+                });
+                l.layer(|line| {
+                    line.transform(Affine::translate((108.0, 136.0)));
+                    for run in &latin {
+                        line.glyphs(run.clone());
+                    }
+                });
+            },
+            blobs,
+        );
     }
 
     // ---- Motion and scrolling ----------------------------------------------

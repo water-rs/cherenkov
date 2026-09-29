@@ -16,6 +16,7 @@ pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
 kurbo = "0.13"
 skrifa = "0.44"
+png = "0.18"
 half = "2"
 thiserror = "2"
 tracing = "0.1"

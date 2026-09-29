@@ -677,7 +677,7 @@ impl Renderer {
                 }
             }
             Draw::Glyphs(run) => {
-                let items = glyphs::items_for_glyph_run(run, resources, self.scene_rect)?;
+                let items = glyphs::items_for_glyph_run(run, tf, resources, self.scene_rect)?;
                 self.render_items(&items, tf, clips, chain, resources, backdrops)?;
             }
             Draw::Image {

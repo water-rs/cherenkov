@@ -733,6 +733,7 @@ mod tests {
                 index: 0,
             },
             has_colr: true,
+            has_bitmap: false,
             colr: std::collections::HashMap::new(),
         }
     }

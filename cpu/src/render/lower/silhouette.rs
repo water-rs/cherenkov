@@ -9,7 +9,7 @@ use cherenkov::{RenderError, Shadow, ShapeData};
 use kurbo::Affine;
 use std::sync::{Arc, OnceLock};
 
-impl Lowering<'_> {
+impl Lowering<'_, '_> {
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,

@@ -17,6 +17,8 @@ pub const SHADER: &str = "shader-paint";
 pub const BACKDROP_UNCLIPPED: &str = "backdrop-unclipped";
 /// A backdrop filter footprint too large to bound.
 pub const BACKDROP_FOOTPRINT: &str = "backdrop-footprint";
+/// A stroked bitmap glyph run.
+pub const GLYPH_STROKE: &str = "glyph-stroke";
 /// A colour font (COLR, CBDT or sbix).
 pub const COLOR_FONT: &str = "color-font";
 /// A blend space other than linear.

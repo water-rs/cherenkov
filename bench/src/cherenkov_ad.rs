@@ -1067,7 +1067,9 @@ fn register_fonts(
                         ResourceError::Unsupported("color-font") => BenchError::Unsupported {
                             engine: Cherenkov::NAME,
                             feature: Feature::Glyphs,
-                            api: Some("colour fonts (COLR/CBDT/sbix) are outside the first slice"),
+                            api: Some(
+                                "SVG colour fonts and non-PNG/BGRA bitmap formats are unsupported",
+                            ),
                         },
                         e => BenchError::Engine(format!("cherenkov font: {e}")),
                     })?;

@@ -28,12 +28,20 @@ pub struct Categories {
     pub glyphs: u64,
     /// `COLRv1` node-tree caches.
     pub colr: u64,
+    /// Decoded bitmap glyph images.
+    pub bitmaps: u64,
 }
 
 impl Categories {
     /// The total `MemoryUsage::cpu` figure.
     pub const fn total(&self) -> u64 {
-        self.output + self.bands + self.retained + self.images + self.glyphs + self.colr
+        self.output
+            + self.bands
+            + self.retained
+            + self.images
+            + self.glyphs
+            + self.colr
+            + self.bitmaps
     }
 }
 

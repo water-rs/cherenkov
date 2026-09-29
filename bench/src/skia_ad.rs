@@ -595,9 +595,17 @@ fn sk_font(engine: &'static str, blobs: &Blobs, run: &GlyphRun) -> Result<Font, 
     let bytes = blob(blobs, run.font)?;
     let data = Data::new_copy(bytes.as_slice());
     let fm = FontMgr::new();
-    let tf = fm
-        .new_from_data(data, run.font_index)
-        .ok_or_else(|| BenchError::Engine(format!("{engine}: font not parsed")))?;
+    let tf = fm.new_from_data(data, run.font_index).ok_or({
+        // `newFromData` delegates to the platform font service; on some
+        // platforms it rejects bitmap-only fonts that carry no outline
+        // tables, which is an unsupported case for this adapter, not an
+        // engine error.
+        BenchError::Unsupported {
+            engine,
+            feature: Feature::Glyphs,
+            api: Some("platform typeface creation requires glyph outlines"),
+        }
+    })?;
     let tf = if run.normalized_coords.is_empty() {
         tf
     } else {

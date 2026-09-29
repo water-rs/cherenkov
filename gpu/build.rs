@@ -105,7 +105,9 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let shader_path = manifest.join("src/render/shader.wgsl");
     let present_path = manifest.join("src/render/present.wgsl");
-    for path in [&shader_path, &present_path] {
+    let shared_path = manifest.join("src/render/shared.wgsl");
+    let external_path = manifest.join("src/render/external.wgsl");
+    for path in [&shader_path, &present_path, &shared_path, &external_path] {
         println!("cargo::rerun-if-changed={}", path.display());
     }
     println!(
@@ -113,17 +115,22 @@ fn main() {
         manifest.join("src/render/bindings.rs").display()
     );
 
+    let shared = std::fs::read_to_string(&shared_path)
+        .unwrap_or_else(|e| panic!("{}: {e}", shared_path.display()));
     let shader = std::fs::read_to_string(&shader_path)
         .unwrap_or_else(|e| panic!("{}: {e}", shader_path.display()));
     let present = std::fs::read_to_string(&present_path)
         .unwrap_or_else(|e| panic!("{}: {e}", present_path.display()));
+    let external = std::fs::read_to_string(&external_path)
+        .unwrap_or_else(|e| panic!("{}: {e}", external_path.display()));
 
-    // The three VARIANT specializations of shader.wgsl plus present.wgsl —
-    // the fixed module set `render` creates at init.
+    // The three VARIANT specializations of shader.wgsl plus present.wgsl
+    // and external.wgsl — the fixed module set `render` creates at init.
+    // The engine and external modules share the `shared.wgsl` prelude.
     let mut specs: Vec<Spec> = (0..3u32)
         .map(|variant| Spec {
             name: format!("engine{variant}"),
-            source: format!("const VARIANT: u32 = {variant}u;\n{shader}"),
+            source: format!("const VARIANT: u32 = {variant}u;\n{shared}\n{shader}"),
             groups: bindings::ENGINE_GROUPS,
         })
         .collect();
@@ -131,6 +138,11 @@ fn main() {
         name: "present".into(),
         source: present,
         groups: bindings::PRESENT_GROUPS,
+    });
+    specs.push(Spec {
+        name: "external".into(),
+        source: format!("{shared}\n{external}"),
+        groups: bindings::EXTERNAL_GROUPS,
     });
 
     // wasm builds embed no passthrough artifacts, so the toolchain the

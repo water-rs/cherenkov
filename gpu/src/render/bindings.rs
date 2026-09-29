@@ -34,6 +34,9 @@ pub enum Kind {
     StorageRead,
     /// A sampled `texture_2d<f32>`.
     Texture,
+    /// A sampled `texture_2d<u32>` (external frame planes are code-bearing
+    /// uint textures the shader decodes itself).
+    TextureUint,
     /// A filtering sampler.
     Sampler,
 }
@@ -90,6 +93,16 @@ impl Entry {
         }
     }
 
+    const fn texture_uint(binding: u32) -> Self {
+        Self {
+            binding,
+            stages: FRAGMENT,
+            kind: Kind::TextureUint,
+            dynamic_offset: false,
+            min_size: 0,
+        }
+    }
+
     const fn sampler(binding: u32) -> Self {
         Self {
             binding,
@@ -128,6 +141,24 @@ pub const PRESENT_GROUP0: &[Entry] = &[
     Entry::uniform(2, FRAGMENT, false, 0),
 ];
 
+/// `min_size` of the external-frame params uniform
+/// (`render::external::Params`, 192 bytes). Duplicated here because
+/// `build.rs` shares this table and cannot see the render module.
+pub const EXTERNAL_PARAMS_SIZE: u64 = 192;
+
+/// Group 1 of the external-frame pipelines (`external.wgsl`): the frame's
+/// planes, the clip mask texture, and the per-frame params.
+///
+/// YUV frames bind their luma and chroma planes at 0–1 and the f32 dummy at
+/// 2; RGB frames bind the uint dummy at 0–1 and their plane at 2.
+pub const EXTERNAL_GROUP1: &[Entry] = &[
+    Entry::texture_uint(0),
+    Entry::texture_uint(1),
+    Entry::texture(2),
+    Entry::texture(3),
+    Entry::uniform(4, FRAGMENT, false, EXTERNAL_PARAMS_SIZE),
+];
+
 /// The engine pipelines' two groups, in declaration order.
 ///
 /// Used by `build.rs`; the crate addresses the groups directly.
@@ -138,6 +169,13 @@ pub const ENGINE_GROUPS: &[&[Entry]] = &[ENGINE_GROUP0, ENGINE_GROUP1];
 /// Used by `build.rs`; the crate addresses the group directly.
 #[allow(dead_code)]
 pub const PRESENT_GROUPS: &[&[Entry]] = &[PRESENT_GROUP0];
+
+/// The external-frame pipelines' two groups, in declaration order: the
+/// shared engine group 0 followed by `EXTERNAL_GROUP1`.
+///
+/// Used by `build.rs`; the crate addresses the groups directly.
+#[allow(dead_code)]
+pub const EXTERNAL_GROUPS: &[&[Entry]] = &[ENGINE_GROUP0, EXTERNAL_GROUP1];
 
 /// One resource's Metal argument slots.
 ///
@@ -193,7 +231,7 @@ pub fn metal_plan(groups: &[&[Entry]], stage: u8) -> StagePlan {
                     target.buffer = Some(buffers);
                     buffers += 1;
                 }
-                Kind::Texture => {
+                Kind::Texture | Kind::TextureUint => {
                     target.texture = Some(textures);
                     textures += 1;
                 }

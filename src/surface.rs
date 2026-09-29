@@ -923,6 +923,10 @@ impl<B: Backend> Surface<B> {
     /// # Errors
     /// Returns `NotReadable`, a readback error, or `Thread` if the executor stopped.
     #[cfg(target_arch = "wasm32")]
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
     pub async fn readback(&self) -> Result<Readback, RenderError> {
         if !self.readable {
             return Err(RenderError::NotReadable);

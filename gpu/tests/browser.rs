@@ -28,6 +28,10 @@ impl Drop for LocalProducer {
 }
 
 impl GpuContent for LocalProducer {
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
     async fn setup(&mut self, context: &wgpu::Context<'_>) {
         assert_eq!(context.device, &self.device, "supplied device identity");
         assert_eq!(context.device.features(), self.device.features());
@@ -57,6 +61,10 @@ impl GpuContent for LocalProducer {
 }
 
 #[wasm_bindgen_test(async)]
+#[expect(
+    clippy::future_not_send,
+    reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+)]
 async fn local_producers_share_device_and_preserve_wakes_during_await() {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter = instance
@@ -101,7 +109,7 @@ async fn local_producers_share_device_and_preserve_wakes_during_await() {
             drops: drops.clone(),
             device,
             during_setup: Some(Box::new(move || {
-                color.set(WorkingColor::new([0., 1., 0., 1.]))
+                color.set(WorkingColor::new([0., 1., 0., 1.]));
             })),
         },
         || {},
@@ -145,6 +153,10 @@ async fn local_producers_share_device_and_preserve_wakes_during_await() {
 }
 
 #[wasm_bindgen_test(async)]
+#[expect(
+    clippy::future_not_send,
+    reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+)]
 async fn shader_validation_yields_and_returns_errors() {
     let engine = Engine::<Gpu>::new(GpuConfig::default())
         .await
@@ -168,7 +180,7 @@ async fn shader_validation_yields_and_returns_errors() {
                     shader: shader.id(),
                     uniforms: vec![],
                 },
-            )
+            );
         }));
     });
     assert_eq!(
@@ -191,6 +203,10 @@ impl filtrate::Effect for YieldingEffect {
     fn set_redraw_callback(&mut self, callback: filtrate::EffectRedrawCallback) {
         self.callback = Some(callback);
     }
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
     async fn setup(&mut self, _: &filtrate::EffectContext<'_>) -> filtrate::EffectSetupResult {
         gloo_timers::future::TimeoutFuture::new(0).await;
         self.callback.as_ref().expect("redraw installed")();
@@ -217,6 +233,10 @@ impl filtrate::Effect for YieldingEffect {
 }
 
 #[wasm_bindgen_test(async)]
+#[expect(
+    clippy::future_not_send,
+    reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+)]
 async fn filters_keep_redraw_requests_made_during_async_setup() {
     let engine = Engine::<Gpu>::new(GpuConfig::default())
         .await
@@ -254,6 +274,10 @@ async fn filters_keep_redraw_requests_made_during_async_setup() {
 }
 
 #[wasm_bindgen_test(async)]
+#[expect(
+    clippy::future_not_send,
+    reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+)]
 async fn browser_incremental_matches_full_lowering() {
     use cherenkov::Backend;
     let (mut renderer, _) = Gpu::init(GpuConfig::default())

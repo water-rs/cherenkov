@@ -337,6 +337,13 @@ impl Gpu {
 }
 
 impl GpuPass {
+    #[cfg_attr(
+        target_arch = "wasm32",
+        expect(
+            clippy::future_not_send,
+            reason = "the wasm32 WebGPU device is !Send; the executor's futures run on the page's event loop"
+        )
+    )]
     async fn new(
         device: &wgpu::Device,
         vertex: &wgpu::ShaderModule,
@@ -732,6 +739,13 @@ pub(super) fn filterable(format: wgpu::TextureFormat, features: wgpu::Features) 
 }
 
 /// Fails setup when the device cannot render to the intermediates.
+#[cfg_attr(
+    target_arch = "wasm32",
+    expect(
+        clippy::future_not_send,
+        reason = "the wasm32 WebGPU device is !Send; the executor's futures run on the page's event loop"
+    )
+)]
 async fn probe_intermediate_format(device: &wgpu::Device) -> Result<(), EffectSetupError> {
     let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
     drop(intermediate_texture(device, (1, 1)));

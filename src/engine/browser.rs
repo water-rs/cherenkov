@@ -143,6 +143,10 @@ impl<B: Backend> Engine<B> {
     /// [`RenderError::Timeout`] when the GPU does not finish in time,
     /// [`RenderError::Readback`] when a timing buffer cannot be read, and
     /// [`RenderError::Thread`] when the render thread is gone.
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
     pub async fn finish_timings(&self) -> Result<Vec<FrameTiming>, RenderError> {
         let (reply, rx) = crate::local::channel();
         self.tx
@@ -157,6 +161,10 @@ impl<B: Backend> Engine<B> {
     /// Panics if the reply channel drops without answering, which cannot
     /// happen while the render thread is alive.
     #[must_use]
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
     pub async fn memory(&self) -> MemoryUsage {
         let (reply, rx) = crate::local::channel();
         if self.tx.send(Message::Memory { reply }).is_err() {
@@ -195,6 +203,10 @@ impl<B: Backend> Engine<B> {
     /// # Errors
     /// [`ResourceError::Font`] for empty data or a backend-side parse
     /// failure, [`ResourceError::Lost`] when the render thread is gone.
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
     pub async fn font(&self, source: FontSource) -> Result<Font, ResourceError> {
         if source.data.is_empty() {
             return Err(ResourceError::Font("empty font data".into()));
@@ -239,6 +251,10 @@ impl<B: Backend> Engine<B> {
     /// # Errors
     /// [`ResourceError::Image`] when the backend rejects the upload,
     /// [`ResourceError::Lost`] when the render thread is gone.
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
     pub async fn image<F: Format>(&self, image: ImageData<F>) -> Result<Image<F>, ResourceError>
     where
         B: Uploads<F>,
@@ -276,6 +292,10 @@ impl<B: Backend> Engine<B> {
     /// # Errors
     /// [`SurfaceError`] when the backend cannot draw the target, or
     /// [`SurfaceError::Lost`] when the render thread is gone.
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
     pub async fn surface(&self, target: impl Into<B::Target>) -> Result<Surface<B>, SurfaceError> {
         let id = SurfaceId::new(Self::alloc(&self.next_surface));
         let (reply, rx) = crate::local::channel();
@@ -326,6 +346,10 @@ impl<B: Backend> Engine<B> {
     /// # Errors
     /// [`RenderError`] fails this call; a surface that failed to render is
     /// left in its previous state.
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
     pub async fn render(&self, time: FrameTime) -> Result<Next, RenderError> {
         let mut commits: Vec<(SurfaceId, ChangeSet<B>)> = Vec::new();
         self.surfaces.borrow_mut().retain(|weak| {
@@ -381,6 +405,10 @@ impl<B: ShaderPaint> Engine<B> {
     /// [`ResourceError::Shader`] when the source fails validation or
     /// pipeline creation, [`ResourceError::Lost`] when the render thread is
     /// gone.
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
     pub async fn shader(&self, source: ShaderSource) -> Result<Shader, ResourceError> {
         let id = ShaderId::new(Self::alloc(&self.next_shader));
         let (reply, rx) = crate::local::channel();

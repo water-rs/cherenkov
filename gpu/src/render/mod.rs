@@ -17,6 +17,7 @@ pub mod present;
 mod raster;
 pub mod shaders;
 mod shadow;
+mod upload;
 
 use cherenkov::Instant;
 use std::collections::{HashMap, VecDeque};
@@ -334,10 +335,12 @@ pub struct GpuRenderer {
     pending_queries: VecDeque<PendingQueries>,
     /// Last draw submission of the current frame.
     frame_submission: Option<wgpu::SubmissionIndex>,
+    /// Staging ring for the frame-wide instance, stop and globals uploads.
+    uploads: upload::Uploads,
     query_buffer: Option<wgpu::Buffer>,
-    /// A spare staging buffer recycled between frames; `None` while a
-    /// frame's resolve owns one.
-    query_staging: Option<wgpu::Buffer>,
+    /// Readback buffers recycled between frames; a frame's resolve owns
+    /// one until its samples are read.
+    query_staging: Vec<wgpu::Buffer>,
     /// Capacity of one frame's query range; pass `i` writes `base + 2i`
     /// at its start and `base + 2i + 1` at its end. GPU time runs from the
     /// first pass's start to the last pass's end: pass boundaries are the
@@ -434,45 +437,23 @@ struct PassMeta {
     format: &'static str,
 }
 
-/// Recreates `old` at `size` bytes, preserving the first `preserve` bytes
-/// of its contents. Earlier dirty surfaces write their slices before a
-/// later surface grows a shared buffer; dropping the old buffer would lose
-/// those uploads, so the used prefix is copied over in a separate
-/// submission — queue order guarantees the earlier `write_buffer`s landed
-/// in `old` first. `usage` must include `COPY_SRC` and `COPY_DST`.
-fn grow_preserving(
+/// Recreates a frame-wide buffer at `size` bytes. Its contents need not
+/// survive: every dirty surface's slice is copied in from the upload ring
+/// at the start of the frame's first submission, after all growth.
+fn grow_buffer(
     device: &wgpu::Device,
-    queue: &wgpu::Queue,
     label: &'static str,
     old: &wgpu::Buffer,
     size: u64,
     usage: wgpu::BufferUsages,
-    preserve: u64,
 ) -> wgpu::Buffer {
-    let new = device.create_buffer(&wgpu::BufferDescriptor {
+    tracing::debug!(label, from = old.size(), to = size, "buffer grown");
+    device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
         size,
         usage,
         mapped_at_creation: false,
-    });
-    if preserve > 0 {
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("buffer grow"),
-        });
-        encoder.copy_buffer_to_buffer(old, 0, &new, 0, preserve);
-        let submission = queue.submit([encoder.finish()]);
-        tracing::debug!(
-            label,
-            from = old.size(),
-            to = size,
-            preserve,
-            ?submission,
-            "buffer grown"
-        );
-    } else {
-        tracing::debug!(label, from = old.size(), to = size, "buffer grown");
-    }
-    new
+    })
 }
 
 /// Creates an adapter plus device. Fails when no adapter allows the target
@@ -1147,8 +1128,9 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             query_pool,
             pending_queries: VecDeque::new(),
             frame_submission: None,
+            uploads: upload::Uploads::default(),
             query_buffer,
-            query_staging: None,
+            query_staging: Vec::new(),
             query_capacity,
             pending_timestamps: VecDeque::new(),
             frame_pass_count: 0,
@@ -1332,8 +1314,9 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
         query_pool,
         pending_queries: VecDeque::new(),
         frame_submission: None,
+        uploads: upload::Uploads::default(),
         query_buffer,
-        query_staging: None,
+        query_staging: Vec::new(),
         query_capacity,
         pending_timestamps: VecDeque::new(),
         frame_pass_count: 0,
@@ -1628,6 +1611,7 @@ impl Renderer for GpuRenderer {
             surf.frame.stops.shrink_to_fit();
             surf.frame.passes.shrink_to_fit();
         }
+        self.uploads = upload::Uploads::default();
         self.instances = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("instances"),
             size: 272 * 16,
@@ -1669,6 +1653,7 @@ impl Renderer for GpuRenderer {
 
     fn memory(&self) -> MemoryUsage {
         let gpu = self.instances.size()
+            + self.uploads.gpu_bytes()
             + self.stops.size()
             + self.globals.size()
             + self.atlas.gpu_bytes()
@@ -1766,7 +1751,10 @@ impl Renderer for GpuRenderer {
                 globals_base += u32::try_from(surf.frame.passes.len()).unwrap_or(u32::MAX);
             }
         }
-        stats.phases.lower_seconds = t_lower.elapsed().as_secs_f64();
+        let wait = stats.phases.wait_seconds;
+        result = result.and_then(|()| self.upload_frame(&dirty, stats));
+        stats.phases.lower_seconds =
+            t_lower.elapsed().as_secs_f64() - (stats.phases.wait_seconds - wait);
         tracing::debug!(
             surfaces = dirty.len(),
             lower_ms = stats.phases.lower_seconds * 1e3,
@@ -1876,7 +1864,12 @@ impl Renderer for GpuRenderer {
                 globals_base += u32::try_from(surf.frame.passes.len()).unwrap_or(u32::MAX);
             }
         }
-        stats.phases.lower_seconds = t_lower.elapsed().as_secs_f64();
+        let wait = stats.phases.wait_seconds;
+        if result.is_ok() {
+            result = self.upload_frame(&dirty, stats).await;
+        }
+        stats.phases.lower_seconds =
+            t_lower.elapsed().as_secs_f64() - (stats.phases.wait_seconds - wait);
         tracing::debug!(
             surfaces = dirty.len(),
             lower_ms = stats.phases.lower_seconds * 1e3,
@@ -2701,8 +2694,7 @@ impl GpuRenderer {
 
     #[expect(
         clippy::too_many_lines,
-        clippy::cast_precision_loss,
-        reason = "pixel sizes are well within f32"
+        reason = "one surface's frame application and buffer growth"
     )]
     fn lower_surface(
         &mut self,
@@ -2905,41 +2897,29 @@ impl GpuRenderer {
         let inst_offset = u64::from(inst_base) * std::mem::size_of::<instance::Instance>() as u64;
         if !inst_bytes.is_empty() && inst_offset + inst_bytes.len() as u64 > self.instances.size() {
             let size = (inst_offset + inst_bytes.len() as u64).next_power_of_two();
-            self.instances = grow_preserving(
+            self.instances = grow_buffer(
                 &self.device,
-                &self.queue,
                 "instances",
                 &self.instances,
                 size,
                 wgpu::BufferUsages::STORAGE
                     | wgpu::BufferUsages::COPY_DST
                     | wgpu::BufferUsages::COPY_SRC,
-                inst_offset,
             );
-        }
-        if !inst_bytes.is_empty() {
-            self.queue
-                .write_buffer(&self.instances, inst_offset, inst_bytes);
         }
         let stop_bytes = bytemuck::cast_slice::<instance::Stop, u8>(&surf.frame.stops);
         let stop_offset = u64::from(stop_base) * std::mem::size_of::<instance::Stop>() as u64;
         if !stop_bytes.is_empty() && stop_offset + stop_bytes.len() as u64 > self.stops.size() {
             let size = (stop_offset + stop_bytes.len() as u64).next_power_of_two();
-            self.stops = grow_preserving(
+            self.stops = grow_buffer(
                 &self.device,
-                &self.queue,
                 "stops",
                 &self.stops,
                 size,
                 wgpu::BufferUsages::STORAGE
                     | wgpu::BufferUsages::COPY_DST
                     | wgpu::BufferUsages::COPY_SRC,
-                stop_offset,
             );
-        }
-        if !stop_bytes.is_empty() {
-            self.queue
-                .write_buffer(&self.stops, stop_offset, stop_bytes);
         }
         {
             let atlas = &self.atlas;
@@ -2960,27 +2940,14 @@ impl GpuRenderer {
         let needed = (u64::from(globals_base) + surf.frame.passes.len().max(1) as u64) * 256;
         if needed > self.globals.size() {
             let size = needed.next_power_of_two();
-            self.globals = grow_preserving(
+            self.globals = grow_buffer(
                 &self.device,
-                &self.queue,
                 "globals",
                 &self.globals,
                 size,
                 wgpu::BufferUsages::UNIFORM
                     | wgpu::BufferUsages::COPY_DST
                     | wgpu::BufferUsages::COPY_SRC,
-                u64::from(globals_base) * 256,
-            );
-        }
-        for (i, pass) in surf.frame.passes.iter().enumerate() {
-            let g = lower::globals(
-                [pass.region[2] as f32, pass.region[3] as f32],
-                [pass.region[0] as f32, pass.region[1] as f32],
-            );
-            self.queue.write_buffer(
-                &self.globals,
-                (u64::from(globals_base) + i as u64) * 256,
-                bytemuck::bytes_of(&g),
             );
         }
         // Buffers grown above leave `bind0` stale; rebuild when capacity
@@ -3004,6 +2971,127 @@ impl GpuRenderer {
             self.bound_globals_size = self.globals.size();
         }
 
+        Ok(())
+    }
+
+    /// The frame's upload size and copies: every dirty surface's instances,
+    /// stops and 256-byte globals entries, laid out in the staging slot in
+    /// the order they occupy the frame-wide buffers from offset 0.
+    fn upload_layout(&self, dirty: &[&SurfaceFrame<'_>]) -> (u64, Vec<upload::Copy>) {
+        let (mut instances, mut stops, mut passes) = (0u64, 0u64, 0u64);
+        for surf in dirty.iter().filter_map(|sf| self.surfaces.get(&sf.id)) {
+            instances += surf.frame.instances.len() as u64;
+            stops += surf.frame.stops.len() as u64;
+            passes += surf.frame.passes.len() as u64;
+        }
+        let sizes = [
+            (
+                upload::Dest::Instances,
+                instances * std::mem::size_of::<instance::Instance>() as u64,
+            ),
+            (
+                upload::Dest::Stops,
+                stops * std::mem::size_of::<instance::Stop>() as u64,
+            ),
+            (upload::Dest::Globals, passes * 256),
+        ];
+        let mut src = 0;
+        let mut copies = Vec::new();
+        for (dest, size) in sizes {
+            if size > 0 {
+                copies.push(upload::Copy {
+                    dest,
+                    src,
+                    dst: 0,
+                    size,
+                });
+                src += size;
+            }
+        }
+        (src, copies)
+    }
+
+    /// Fills the acquired staging slot with this frame's uploads.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "pixel sizes are well within f32"
+    )]
+    fn write_uploads(&mut self, dirty: &[&SurfaceFrame<'_>], size: u64, copies: &[upload::Copy]) {
+        let surfaces: Vec<&SurfaceState> = dirty
+            .iter()
+            .filter_map(|sf| self.surfaces.get(&sf.id))
+            .collect();
+        self.uploads.write(size, copies, |bytes| {
+            let mut at = 0;
+            let mut put = |data: &[u8]| {
+                bytes.slice(at..at + data.len()).copy_from_slice(data);
+                at += data.len();
+            };
+            for surf in &surfaces {
+                put(bytemuck::cast_slice(&surf.frame.instances));
+            }
+            for surf in &surfaces {
+                put(bytemuck::cast_slice(&surf.frame.stops));
+            }
+            let mut entry = [0u8; 256];
+            for surf in &surfaces {
+                for pass in &surf.frame.passes {
+                    let g = lower::globals(
+                        [pass.region[2] as f32, pass.region[3] as f32],
+                        [pass.region[0] as f32, pass.region[1] as f32],
+                    );
+                    let g = bytemuck::bytes_of(&g);
+                    entry[..g.len()].copy_from_slice(g);
+                    put(&entry);
+                }
+            }
+        });
+    }
+
+    /// Stages the frame's uploads; time spent waiting for a staging slot
+    /// the GPU has not finished copying out of goes to `wait_seconds`.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn upload_frame(
+        &mut self,
+        dirty: &[&SurfaceFrame<'_>],
+        stats: &mut FrameStats,
+    ) -> Result<(), RenderError> {
+        let (size, copies) = self.upload_layout(dirty);
+        if size == 0 {
+            return Ok(());
+        }
+        if let upload::Acquire::Wait(submission) = self.uploads.acquire(&self.device, size)? {
+            let start = Instant::now();
+            self.wait(submission, "upload staging")?;
+            stats.phases.wait_seconds += start.elapsed().as_secs_f64();
+            self.uploads.check_mapped()?;
+        }
+        self.write_uploads(dirty, size, &copies);
+        Ok(())
+    }
+
+    /// Stages the frame's uploads; time spent waiting for a staging slot
+    /// the GPU has not finished copying out of goes to `wait_seconds`.
+    #[cfg(target_arch = "wasm32")]
+    async fn upload_frame(
+        &mut self,
+        dirty: &[&SurfaceFrame<'_>],
+        stats: &mut FrameStats,
+    ) -> Result<(), RenderError> {
+        let (size, copies) = self.upload_layout(dirty);
+        if size == 0 {
+            return Ok(());
+        }
+        if let upload::Acquire::Wait(submission) = self.uploads.acquire(&self.device, size)? {
+            tracing::trace!(?submission, "awaiting the upload slot's map");
+            let start = Instant::now();
+            if let Some(mapped) = self.uploads.take_mapped() {
+                browser_wait(mapped, self.wait_timeout, "upload staging").await?;
+            }
+            stats.phases.wait_seconds += start.elapsed().as_secs_f64();
+            self.uploads.check_mapped()?;
+        }
+        self.write_uploads(dirty, size, &copies);
         Ok(())
     }
 
@@ -3047,6 +3135,19 @@ impl GpuRenderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame"),
             });
+        // The frame's first submission carries every dirty surface's
+        // uploads ahead of its passes.
+        let uploads = self.uploads.take_copies();
+        if let Some((staging, copies)) = &uploads {
+            for copy in copies {
+                let dest = match copy.dest {
+                    upload::Dest::Instances => &self.instances,
+                    upload::Dest::Stops => &self.stops,
+                    upload::Dest::Globals => &self.globals,
+                };
+                encoder.copy_buffer_to_buffer(staging, copy.src, dest, copy.dst, copy.size);
+            }
+        }
         // Group-1 bind groups persist across frames, keyed by
         // (source scratch, backdrop-needed, image, mask texture); the
         // stamp rebuilds them when a scratch/backdrop texture, the image
@@ -3340,6 +3441,9 @@ impl GpuRenderer {
             }
         }
         let submission = self.queue.submit([encoder.finish()]);
+        if uploads.is_some() {
+            self.uploads.submitted(submission.clone());
+        }
         self.frame_submission = Some(submission.clone());
         tracing::trace!(
             surface = ?id,
@@ -3503,15 +3607,15 @@ impl GpuRenderer {
 
     fn timestamp_staging(&mut self) -> wgpu::Buffer {
         let size = u64::from(self.query_capacity) * 8;
-        match self.query_staging.take() {
-            Some(buffer) if buffer.size() >= size => buffer,
-            _ => self.device.create_buffer(&wgpu::BufferDescriptor {
+        self.query_staging.retain(|buffer| buffer.size() >= size);
+        self.query_staging.pop().unwrap_or_else(|| {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("timestamp staging"),
                 size,
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
-            }),
-        }
+            })
+        })
     }
 
     /// Reads back every pending frame's resolved timestamps whose copy
@@ -3612,7 +3716,7 @@ impl GpuRenderer {
                 ));
             }
             if pending.staging.size() >= u64::from(self.query_capacity) * 8 {
-                self.query_staging = Some(pending.staging);
+                self.query_staging.push(pending.staging);
             }
         }
         timings

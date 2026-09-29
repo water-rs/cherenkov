@@ -22,6 +22,13 @@ tracing = "0.1"
 rustc-hash = "2"
 libm = "0.2"
 
+# Retained external frames: IOSurface/CVPixelBuffer import and
+# MTLSharedEvent waits on the shared device and queue (#165).
+[target.'cfg(target_vendor = "apple")'.dependencies]
+objc2 = "0.6"
+objc2-metal = { version = "0.3", features = ["objc2-io-surface"] }
+objc2-io-surface = "0.3"
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 futures-channel = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }

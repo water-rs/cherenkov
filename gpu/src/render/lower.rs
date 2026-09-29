@@ -77,6 +77,9 @@ pub enum ImageSource {
     Registered(u64),
     Content(LayerId),
     Shader(std::sync::Arc<super::paint::Key>),
+    /// A retained external frame bound to `LayerId`: the range draws the
+    /// external pipeline against that layer's slot bind, not `image_tex`.
+    External(LayerId),
 }
 
 /// One draw call's instance range and bound source texture.
@@ -138,6 +141,8 @@ pub struct Frame {
     /// Passes in submission order.
     pub passes: Vec<Pass>,
     pub content: Vec<LayerId>,
+    /// External-frame layers composed this frame, in paint order.
+    pub external: Vec<LayerId>,
     pub filters: Vec<(usize, FilterKey)>,
     pub shadows: Vec<(usize, super::shadow::Parameters)>,
     open: Option<OpenPass>,
@@ -220,6 +225,7 @@ impl Frame {
         self.stops.clear();
         self.passes.clear();
         self.content.clear();
+        self.external.clear();
         self.filters.clear();
         self.shadows.clear();
         self.open = None;
@@ -562,6 +568,8 @@ pub struct GlyphContext<'a> {
     /// Registered images, for dimension lookup during lowering.
     pub images: &'a HashMap<u64, GpuImage>,
     pub content: &'a HashMap<LayerId, super::gpu_content::Slot>,
+    /// Retained external frames, for the emitted quad's plane size.
+    pub external: &'a HashMap<LayerId, super::external::Slot>,
 }
 
 /// One surface's lowering output: the raster counts plus every deferred
@@ -1755,6 +1763,25 @@ impl<'a> Lowering<'a> {
                     super::instance::EXTEND_PAD | (super::instance::EXTEND_PAD << 4) | (1 << 8);
                 self.set_image(Some(ImageSource::Content(id)));
                 self.push_shaped(inst, transform, boxed.bounds, margin);
+            }
+        }
+        if let Some(slot) = glyphs.external.get(&id) {
+            self.frame.external.push(id);
+            let bounds = Rect::new(0.0, 0.0, f64::from(slot.size.0), f64::from(slot.size.1));
+            if let Some(boxed) = box_shape(&ShapeData::Rect(bounds))? {
+                let transform = self.transform * boxed.extra;
+                let mut inst = self.base(KIND_FILL, affine(transform));
+                let margin = self.margin(self.transform);
+                let b = boxed.bounds.inflate(margin, margin);
+                inst.bounds = [f32_f64(b.x0), f32_f64(b.y0), f32_f64(b.x1), f32_f64(b.y1)];
+                inst.shape = boxed.shape;
+                // `in.local` is the frame's pixel coordinate: the luma
+                // sample position verbatim.
+                self.set_image(Some(ImageSource::External(id)));
+                self.push_shaped(inst, transform, boxed.bounds, margin);
+                // The external draw is its own range: following siblings
+                // must not join it, so the bound image returns to none.
+                self.set_image(None);
             }
         }
         for child in &node.children {
@@ -3192,6 +3219,7 @@ mod tests {
             fonts: &fonts,
             images: &images,
             content: &HashMap::new(),
+            external: &HashMap::new(),
         };
         let prefix = cherenkov::Command::Fill {
             shape: ShapeData::Rect(Rect::new(0.0, 0.0, 2.0, 2.0)),
@@ -3275,6 +3303,7 @@ mod tests {
             fonts: &fonts,
             images: &images,
             content: &HashMap::new(),
+            external: &HashMap::new(),
         };
         let mut frame = Frame::default();
         let mut lowering = Lowering::new(&mut frame, (64, 64));
@@ -3341,6 +3370,7 @@ mod tests {
             fonts: &fonts,
             images: &images,
             content: &HashMap::new(),
+            external: &HashMap::new(),
         };
         let clip = DeviceClip {
             inv: Affine::translate(Vec2::new(-20.0, -20.0)),
@@ -3445,6 +3475,7 @@ mod tests {
             fonts: &fonts,
             images: &images,
             content: &HashMap::new(),
+            external: &HashMap::new(),
         };
         // Half extents [20, 5]: a spread of -20 inverts both.
         let bar = ShapeData::Rect(kurbo::Rect::new(20.0, 20.0, 60.0, 30.0));

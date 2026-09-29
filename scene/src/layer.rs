@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{BackdropEffectSpec, BlendMode, BlendSpace, Draw, ResourceHash, Shape};
+use crate::{BackdropEffectSpec, BlendMode, BlendSpace, Draw, Paint, ResourceHash, Shape};
 use kurbo::{Affine, Rect, Vec2};
 
 /// One item in a layer's ordered item list: a child layer, a group of draws
@@ -251,6 +251,19 @@ pub enum Motion {
         deceleration: f64,
         /// Optional rubber-band bounds.
         bounds: Option<Rect>,
+    },
+    /// The paint operand of draw item `item` starts at `from` and animates
+    /// to the item's recorded paint — the recorded-content counterpart of
+    /// the layer motions above. `None` on an engine that does not animate
+    /// recorded operands.
+    Paint {
+        /// Index into `items`; the entry must be an `Item::Draw` carrying a
+        /// paint operand (`fill`, `stroke` or `glyphs`).
+        item: usize,
+        /// The paint the operand starts at.
+        from: Paint,
+        /// How it moves to the item's static paint.
+        animation: MotionAnimation,
     },
 }
 

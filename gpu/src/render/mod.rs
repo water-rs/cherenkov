@@ -3544,17 +3544,26 @@ impl GpuRenderer {
                         keys.insert(*key);
                     }
                 }
-                for key in keys {
-                    if let Some(epoch) = self.atlas.live_epoch(key) {
-                        emission.refs.push((key, epoch));
+                if !keys.is_empty() {
+                    // Refs must stay contiguous: re-pack this emission's
+                    // range at the storage tail with the resolved keys.
+                    let first = content.storage.refs.len();
+                    content
+                        .storage
+                        .refs
+                        .extend_from_within(emission.refs.clone());
+                    for key in keys {
+                        if let Some(epoch) = self.atlas.live_epoch(key) {
+                            content.storage.refs.push((key, epoch));
+                        }
                     }
+                    emission.refs = first..content.storage.refs.len();
                 }
                 // Restamp only when every reference survived this
                 // commit's evictions; a stale emission must keep an
                 // older clock so its next hit check walks the refs
                 // and re-lowers (#119).
-                if emission
-                    .refs
+                if content.storage.refs[emission.refs.clone()]
                     .iter()
                     .all(|&(k, ep)| self.atlas.live_epoch(k) == Some(ep))
                 {

@@ -448,6 +448,9 @@ pub struct EmissionStorage {
     covers: Vec<Cover>,
     pub(crate) instances: Vec<RetainedInstance>,
     stops: Vec<Stop>,
+    /// `(live key, epoch)` atlas references every retained emission
+    /// samples, addressed by `Emission::refs` ranges.
+    pub(crate) refs: Vec<(u64, u64)>,
 }
 
 impl EmissionStorage {
@@ -456,21 +459,23 @@ impl EmissionStorage {
         if self.templates.is_empty() {
             return;
         }
-        let (instances, stops, templates, covers) = emissions
+        let (instances, stops, templates, covers, refs) = emissions
             .iter()
             .filter_map(|e| e.data.as_ref())
-            .fold((0, 0, 0, 0), |(i, s, t, c), e| {
+            .fold((0, 0, 0, 0, 0), |(i, s, t, c, r), e| {
                 (
                     i + e.instances.len(),
                     s + e.stops.len(),
                     t + 1,
                     c + usize::from(e.cover.is_some()),
+                    r + e.refs.len(),
                 )
             });
         if self.instances.len() <= instances * 2
             && self.stops.len() <= stops * 2
             && self.templates.len() <= templates * 2
             && self.covers.len() <= covers * 2
+            && self.refs.len() <= refs * 2
         {
             return;
         }
@@ -479,6 +484,7 @@ impl EmissionStorage {
             covers: Vec::with_capacity(covers),
             instances: Vec::with_capacity(instances),
             stops: Vec::with_capacity(stops),
+            refs: Vec::with_capacity(refs),
         };
         for e in emissions.iter_mut().filter_map(|e| e.data.as_mut()) {
             storage.templates.push(self.templates[e.template]);
@@ -497,6 +503,9 @@ impl EmissionStorage {
                 .stops
                 .extend_from_slice(&self.stops[e.stops.clone()]);
             e.stops = first..storage.stops.len();
+            let first = storage.refs.len();
+            storage.refs.extend_from_slice(&self.refs[e.refs.clone()]);
+            e.refs = first..storage.refs.len();
         }
         *self = storage;
     }
@@ -573,11 +582,11 @@ impl RetainedInstance {
 /// Per-operation device output under its sampled placement.
 pub struct Emission {
     pub(crate) pending_cells: Vec<(u32, u32, u32)>,
-    /// `(live key, epoch)` of every atlas admission the retained
-    /// instances sample — re-verified whenever the atlas's eviction
-    /// clock moved, so a reclaimed cell re-lowers instead of sampling
-    /// stale texels (#119).
-    pub(crate) refs: Vec<(u64, u64)>,
+    /// Range into `EmissionStorage::refs` holding the `(live key, epoch)`
+    /// of every atlas admission the retained instances sample — re-verified
+    /// whenever the atlas's eviction clock moved, so a reclaimed cell
+    /// re-lowers instead of sampling stale texels (#119).
+    pub(crate) refs: Range<usize>,
     /// The atlas eviction clock at last verification.
     pub(crate) clock: u64,
     template: usize,
@@ -596,12 +605,11 @@ impl Emission {
     /// same admission. Between commits that evicted nothing the stored
     /// `clock` short-circuits the walk; after an eviction each ref's
     /// epoch must still match — a re-admitted entry never does.
-    fn atlas_live(&mut self, atlas: &Atlas) -> bool {
+    fn atlas_live(&mut self, atlas: &Atlas, refs: &[(u64, u64)]) -> bool {
         if self.clock == atlas.clock() {
             return true;
         }
-        if self
-            .refs
+        if refs
             .iter()
             .all(|&(key, epoch)| atlas.live_epoch(key) == Some(epoch))
         {
@@ -2328,14 +2336,14 @@ impl<'a> Lowering<'a> {
                     && e.transform == self.transform
                     && e.size.map(f32::to_bits) == [self.width, self.height].map(f32::to_bits)
                     && e.generation == glyphs.atlas.generation()
-                    && e.atlas_live(glyphs.atlas)
+                    && e.atlas_live(glyphs.atlas, &storage.refs[e.refs.clone()])
             });
         cache.valid = true;
         if hit {
             if let Some(e) = cache.data.as_ref() {
                 // Pin the shelves the retained instances sample so this
                 // commit cannot evict them (#119).
-                for &(key, _) in &e.refs {
+                for &(key, _) in &storage.refs[e.refs.clone()] {
                     if let Some(slots) = glyphs.atlas.slots_of(key) {
                         self.touches.extend_from_slice(slots);
                     }
@@ -2438,12 +2446,18 @@ impl<'a> Lowering<'a> {
         storage
             .stops
             .extend_from_slice(&self.frame.stops[first_stop..]);
+        let emission_refs = {
+            let first = storage.refs.len();
+            storage.refs.extend_from_slice(&self.refs[first_ref..]);
+            self.refs.truncate(first_ref);
+            first..storage.refs.len()
+        };
         cache.data = Some(Emission {
             pending_cells: self.cell_patches[first_patch..]
                 .iter()
                 .map(|&(i, p, c)| (i - instance_base, p, c))
                 .collect(),
-            refs: self.refs.drain(first_ref..).collect(),
+            refs: emission_refs,
             clock: glyphs.atlas.clock(),
             template,
             cover: cover.map(|cover| {

@@ -2975,6 +2975,13 @@ impl GpuRenderer {
 
     /// Builds the external-frame group-1 layout and both format pipelines
     /// on the first surface draw that samples an external slot.
+    #[cfg_attr(
+        target_arch = "wasm32",
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "browser WebGPU reports pipeline errors asynchronously, so only the native error scope can fail here"
+        )
+    )]
     fn ensure_external(&mut self) -> Result<(), RenderError> {
         if self.ext_layout.is_some() {
             return Ok(());

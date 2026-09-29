@@ -1380,16 +1380,25 @@ impl Engine for Cherenkov {
             surface.update(|tx| {
                 for cl in &self.content_layers {
                     tx[cl.handle(surface)].record(|c| {
-                        for (index, op) in cl.ops.iter().enumerate() {
-                            match cl.live.iter().find(|live| live.index == index) {
-                                Some(live) => record_live(c, op, &live.bindings),
-                                // Static content pays nothing for motions
-                                // the layer does not carry.
-                                None if cl.motions.is_empty() => record_op(c, op),
-                                None => {
-                                    match cl.motions.iter().find(|motion| motion.index == index) {
-                                        Some(motion) => record_motion(c, op, motion),
-                                        None => record_op(c, op),
+                        // Static content pays nothing for motions
+                        // the layer does not carry.
+                        if cl.motions.is_empty() {
+                            for (index, op) in cl.ops.iter().enumerate() {
+                                match cl.live.iter().find(|live| live.index == index) {
+                                    Some(live) => record_live(c, op, &live.bindings),
+                                    None => record_op(c, op),
+                                }
+                            }
+                        } else {
+                            for (index, op) in cl.ops.iter().enumerate() {
+                                match cl.live.iter().find(|live| live.index == index) {
+                                    Some(live) => record_live(c, op, &live.bindings),
+                                    None => {
+                                        match cl.motions.iter().find(|motion| motion.index == index)
+                                        {
+                                            Some(motion) => record_motion(c, op, motion),
+                                            None => record_op(c, op),
+                                        }
                                     }
                                 }
                             }

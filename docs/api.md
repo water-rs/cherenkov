@@ -36,7 +36,7 @@ Capabilities are traits implemented by backend types, so using a missing capabil
 | `Filters`, `Runs<F>` for a filter `F`, `Effects` | every filter | filters with a CPU kernel |
 | `Backdrop`, `BackdropRuns<K, F>` for a backdrop chain `F` | every chain | chains with a CPU kernel |
 | `HdrOutput` | tone-mapped extended output | |
-| `ExternalFrames`, `Planes` | | |
+| `ExternalFrames`, `Planes` | external frames | |
 
 Targets beyond the current rows: `Gpu` is meant to accept every image format and grow `ExternalFrames` and `Planes` (system-compositor promotion); `Raster` targets `Uploads<Rgba8>` and `Filters`/`Runs<F>` for filters with a CPU kernel; a `Banded<P>` microcontroller backend (banded output, panel formats, flash-resident assets) targets panel-format uploads and CPU-kernel filters.
 
@@ -466,9 +466,11 @@ tx[&tab_bar].backdrop(glass.sample(refraction));
 ## External content
 
 ```rust
-// Video and web views: zero-copy frames, promoted to hardware overlays when eligible.
-tx[&player].content(ExternalFrame::apple(io_surface).color(ColorInfo::rec2020_pq()).hdr(meta));
-tx[&player].content(ExternalFrame::android(hardware_buffer).dataspace(dataspace));
+// Video and web views: retained planes sampled in place on the shared
+// device, promoted to hardware overlays when eligible.
+let frame = ExternalFrame::yuv(luma, chroma, FrameColor::BT2020_PQ)?
+    .sync(FrameSync::Metal { event, value });
+tx[&player].content(engine.external_frame(frame));
 
 // Custom GPU pipelines (particles): GPU backend only.
 impl GpuContent for Particles {

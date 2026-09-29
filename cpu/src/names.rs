@@ -19,6 +19,5 @@ pub const GLYPH_STROKE: &str = "glyph-stroke";
 /// font (CBDT/sbix without outlines) or an unmapped COLR paint.
 pub const COLOR_FONT: &str = "color-font";
 
-/// A shadow from a shape without a rounded-box form (in this slice,
-/// every shadow).
+/// A shape without a fillable silhouette casts no shadow.
 pub const SHADOW: &str = "shadow";

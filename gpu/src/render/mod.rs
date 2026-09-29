@@ -13,6 +13,7 @@ mod prepared;
 pub mod present;
 mod raster;
 pub mod shaders;
+mod shadow;
 
 use cherenkov::Instant;
 use std::collections::{HashMap, VecDeque};
@@ -284,6 +285,7 @@ pub struct GpuRenderer {
     shader_delivery: shaders::ShaderDelivery,
     shaders: paint::Registry,
     filters: filter::Registry,
+    shadow_blur: shadow::Blur,
     last_frame: Option<Instant>,
     origin: Option<Instant>,
     device: wgpu::Device,
@@ -1112,6 +1114,7 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             shader_delivery,
             shaders: paint::Registry::default(),
             filters: filter::Registry::new(config.redraw.clone()),
+            shadow_blur: shadow::Blur::new(&device, scratch_format),
             last_frame: None,
             origin: None,
             max_texture: device.limits().max_texture_dimension_2d,
@@ -1296,6 +1299,7 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
         shader_delivery,
         shaders: paint::Registry::default(),
         filters: filter::Registry::new(config.redraw.clone()),
+        shadow_blur: shadow::Blur::new(&device, scratch_format),
         last_frame: None,
         origin: None,
         max_texture: device.limits().max_texture_dimension_2d,
@@ -1598,6 +1602,7 @@ impl Renderer for GpuRenderer {
     }
 
     fn trim(&mut self, pressure: Pressure) {
+        self.shadow_blur.trim();
         for surf in self.surfaces.values_mut() {
             surf.scratch.clear();
             surf.backdrop = [None, None];
@@ -1688,7 +1693,7 @@ impl Renderer for GpuRenderer {
             .map(|c| format_name(c.texture.format()))
             .next();
         MemoryUsage {
-            gpu: cherenkov::Bytes(gpu + self.filters.gpu_bytes()),
+            gpu: cherenkov::Bytes(gpu + self.filters.gpu_bytes() + self.shadow_blur.gpu_bytes()),
             cpu: cherenkov::Bytes(self.atlas.cpu_bytes()),
             backdrop_captures: cherenkov::Bytes(captures),
             backdrop_capture_format: capture_format,
@@ -2759,6 +2764,13 @@ impl GpuRenderer {
             {
                 continue;
             }
+            if nw > self.device.limits().max_texture_dimension_2d
+                || nh > self.device.limits().max_texture_dimension_2d
+            {
+                return Err(RenderError::Render(
+                    "isolation capture exceeds device texture extent".into(),
+                ));
+            }
             let (texture, view) = create_target(
                 &self.device,
                 "isolation scratch",
@@ -3282,6 +3294,20 @@ impl GpuRenderer {
                 );
             }
             drop(render_pass);
+            if let Some((_, parameters)) = surf.frame.shadows.iter().find(|(pass, _)| *pass == i) {
+                let Target::Scratch(depth) = pass.target else {
+                    unreachable!("shadow captures scratch")
+                };
+                self.shadow_blur.apply(
+                    &self.device,
+                    &mut encoder,
+                    &surf.scratch[depth],
+                    (pass.region[2], pass.region[3]),
+                    *parameters,
+                )?;
+                stats.passes +=
+                    u32::from(parameters.spread != 0.0) + 2 * u32::from(parameters.sigma > 0.0);
+            }
             if let Some((_, filter)) = surf.frame.filters.iter().find(|(pass, _)| *pass == i) {
                 let capture = match pass.target {
                     Target::Scratch(depth) => &surf.scratch[depth],

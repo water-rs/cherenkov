@@ -491,6 +491,40 @@ impl DisplayList {
         Dirty::from_unsorted(dirty)
     }
 
+    /// The operand `kind` currently recorded on command `index` — the
+    /// value an animated change starts from. `None` when the index is out
+    /// of range or the command has no such operand.
+    pub(crate) fn operand(&self, index: u32, kind: OperandKind) -> Option<Operand> {
+        let target = self.commands.get(index as usize)?;
+        Some(match (target, kind) {
+            (
+                Command::Fill { shape, .. }
+                | Command::Stroke { shape, .. }
+                | Command::Shadow { shape, .. }
+                | Command::BeginClip { shape, .. },
+                OperandKind::Shape,
+            ) => Operand::Shape(shape.clone()),
+            (
+                Command::Fill { paint, .. }
+                | Command::Stroke { paint, .. }
+                | Command::Glyphs { paint, .. },
+                OperandKind::Paint,
+            ) => Operand::Paint(paint.clone()),
+            (Command::Stroke { stroke, .. }, OperandKind::Stroke) => {
+                Operand::Stroke(stroke.clone())
+            }
+            (Command::Glyphs { run, .. }, OperandKind::Run) => Operand::Run(run.clone()),
+            (Command::Shadow { shadow, .. }, OperandKind::Shadow) => Operand::Shadow(*shadow),
+            (Command::Image { dst, .. }, OperandKind::Rect) => Operand::Rect(*dst),
+            (
+                Command::Picture { transform, .. } | Command::BeginTransform { transform, .. },
+                OperandKind::Transform,
+            ) => Operand::Transform(*transform),
+            (Command::BeginGroup { group, .. }, OperandKind::Group) => Operand::Group(*group),
+            _ => return None,
+        })
+    }
+
     pub(crate) fn push(&mut self, command: Command) -> u32 {
         let index = u32::try_from(self.commands.len())
             .expect("a display list holds at most u32::MAX commands");

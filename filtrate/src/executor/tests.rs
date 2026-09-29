@@ -2078,6 +2078,90 @@ fn derived_colour_filters_apply_through_cpu_filter() {
     assert_eq!(pixels, [[0.325, 0.425, 0.525, 0.5]]);
 }
 
+/// Parameter values that change every frame must not accumulate one
+/// uniform buffer per frame: a stale buffer — one no encode of the
+/// current sequence has bound — is rewritten in place.
+#[test]
+fn gpu_params_rewrite_buffers_across_frames() {
+    let gpu = create_test_device();
+    let amount = ScriptedParam::constant(0.0);
+    let amount_callback = amount.callback.clone();
+    let mut executor = Executor::new(filters::ToneCurve {
+        shadows: ScriptedParam::constant(0.0),
+        midtones: ScriptedParam::constant(0.0),
+        highlights: ScriptedParam::constant(0.0),
+        gamma: ScriptedParam::constant(1.0),
+        amount,
+    });
+    setup(&gpu, &mut executor);
+
+    let size = (16, 16);
+    let rgba = test_pixels(size.0 * size.1);
+    let input = upload(&gpu, size, &rgba);
+    let values = [0.2_f32, 0.6, 1.0];
+    for (frame, value) in values.iter().enumerate() {
+        ScriptedParam::fire(
+            &amount_callback,
+            AnimatedTarget {
+                value: *value,
+                interpolator: None,
+            },
+        );
+        let output = texture(
+            &gpu,
+            size,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        executor
+            .encode_render(
+                &EffectInput {
+                    timing: EffectFrameTiming::new(
+                        Duration::ZERO,
+                        Duration::ZERO,
+                        frame as u64 + 1,
+                    ),
+                    ..frame_input(&gpu, &input, size, Duration::ZERO, ShapeTextures::default())
+                },
+                &frame_output(&gpu, &output, size),
+                &mut encoder,
+            )
+            .expect("encode should succeed");
+        gpu.queue.submit([encoder.finish()]);
+        // A fresh executor rendering the same value is the reference.
+        let want = run(
+            &gpu,
+            filters::ToneCurve {
+                shadows: ScriptedParam::constant(0.0),
+                midtones: ScriptedParam::constant(0.0),
+                highlights: ScriptedParam::constant(0.0),
+                gamma: ScriptedParam::constant(1.0),
+                amount: ScriptedParam::constant(*value),
+            },
+            size,
+            &rgba,
+            ShapeTextures::default(),
+        );
+        assert_rgba8_close(
+            &readback_rgba8_image(&gpu, &output, size),
+            &want,
+            1,
+            "animated frame",
+        );
+    }
+    let buffers: usize = executor
+        .gpu
+        .as_ref()
+        .expect("executor set up")
+        .passes
+        .iter()
+        .map(|pass| pass.params.len())
+        .sum();
+    assert_eq!(buffers, 1, "changing params must reuse the stale buffer");
+}
+
 // ============================================================================
 // Gallery
 // ============================================================================
@@ -2269,5 +2353,186 @@ fn gpu_export_filter_gallery_images() {
             amount: 0.6_f32,
             mode: BlendMode::Overlay,
         }
+    );
+}
+
+/// Two encodes of one effect at different sizes in a single encoder must
+/// stay independent: parameters used to be a queue write into one buffer,
+/// so both recorded passes ran with the last encode's `size`.
+#[test]
+fn gpu_one_effect_two_sizes_one_encoder() {
+    use filters::GaussianBlur;
+    let gpu = create_test_device();
+    let mut executor = Executor::new(GaussianBlur(8.0_f32));
+    setup(&gpu, &mut executor);
+    let size_a = (64, 64);
+    let size_b = (64, 32);
+    let rgba_a = test_pixels(size_a.0 * size_a.1);
+    let rgba_b = test_pixels(size_b.0 * size_b.1);
+    let input_a = upload(&gpu, size_a, &rgba_a);
+    let input_b = upload(&gpu, size_b, &rgba_b);
+    let output_a = texture(
+        &gpu,
+        size_a,
+        wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+    );
+    let output_b = texture(
+        &gpu,
+        size_b,
+        wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+    );
+    let mut encoder = gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("two-size encode"),
+        });
+    executor
+        .encode_render(
+            &frame_input(
+                &gpu,
+                &input_a,
+                size_a,
+                Duration::ZERO,
+                ShapeTextures::default(),
+            ),
+            &frame_output(&gpu, &output_a, size_a),
+            &mut encoder,
+        )
+        .expect("first encode should succeed");
+    executor
+        .encode_render(
+            &frame_input(
+                &gpu,
+                &input_b,
+                size_b,
+                Duration::ZERO,
+                ShapeTextures::default(),
+            ),
+            &frame_output(&gpu, &output_b, size_b),
+            &mut encoder,
+        )
+        .expect("second encode should succeed");
+    gpu.queue.submit([encoder.finish()]);
+    // References: the same effect, one encode per submission.
+    let want_a = run(
+        &gpu,
+        GaussianBlur(8.0_f32),
+        size_a,
+        &rgba_a,
+        ShapeTextures::default(),
+    );
+    let want_b = run(
+        &gpu,
+        GaussianBlur(8.0_f32),
+        size_b,
+        &rgba_b,
+        ShapeTextures::default(),
+    );
+    assert_rgba8_close(
+        &readback_rgba8_image(&gpu, &output_a, size_a),
+        &want_a,
+        0,
+        "first encode",
+    );
+    assert_rgba8_close(
+        &readback_rgba8_image(&gpu, &output_b, size_b),
+        &want_b,
+        0,
+        "second encode",
+    );
+}
+
+/// Intermediate slots for a size a frame does not encode against are
+/// dropped; sizes encoded in the same frame all stay.
+#[test]
+fn gpu_intermediates_evicted_when_size_unused() {
+    use filters::GaussianBlur;
+    fn encode<F: Filter>(
+        gpu: &TestGpu,
+        executor: &mut Executor<F>,
+        size: (u32, u32),
+        sequence: u64,
+    ) {
+        let input = upload(gpu, size, &test_pixels(size.0 * size.1));
+        let output = texture(
+            gpu,
+            size,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        executor
+            .encode_render(
+                &EffectInput {
+                    timing: EffectFrameTiming::new(Duration::ZERO, Duration::ZERO, sequence),
+                    ..frame_input(gpu, &input, size, Duration::ZERO, ShapeTextures::default())
+                },
+                &frame_output(gpu, &output, size),
+                &mut encoder,
+            )
+            .expect("encode should succeed");
+        gpu.queue.submit([encoder.finish()]);
+    }
+    fn sizes<F: Filter>(executor: &Executor<F>) -> Vec<(u32, u32)> {
+        executor
+            .gpu
+            .as_ref()
+            .expect("executor set up")
+            .intermediates
+            .iter()
+            .map(|intermediates| intermediates.size)
+            .collect()
+    }
+    fn slots_of<F: Filter>(executor: &Executor<F>, size: (u32, u32)) -> wgpu::TextureView {
+        executor
+            .gpu
+            .as_ref()
+            .expect("executor set up")
+            .intermediates
+            .iter()
+            .find(|intermediates| intermediates.size == size)
+            .expect("size's intermediates exist")
+            .views[0]
+            .clone()
+    }
+    let gpu = create_test_device();
+    let mut executor = Executor::new(GaussianBlur(4.0_f32));
+    setup(&gpu, &mut executor);
+    let size_a = (64, 64);
+    let size_b = (64, 32);
+    encode(&gpu, &mut executor, size_a, 1);
+    assert_eq!(sizes(&executor), vec![size_a]);
+    // A size the previous frame used is still live.
+    encode(&gpu, &mut executor, size_b, 2);
+    let mut got = sizes(&executor);
+    got.sort_unstable();
+    assert_eq!(got, vec![size_b, size_a]);
+    // A size unused for a whole frame is dropped.
+    encode(&gpu, &mut executor, size_b, 3);
+    assert_eq!(sizes(&executor), vec![size_b]);
+
+    // Steady state with two sizes alternating every frame: both sizes'
+    // intermediates stay allocated and are reused, not dropped and
+    // reallocated on each encode.
+    encode(&gpu, &mut executor, size_a, 4);
+    encode(&gpu, &mut executor, size_b, 4);
+    assert_eq!(sizes(&executor).len(), 2);
+    let frame4 = (slots_of(&executor, size_a), slots_of(&executor, size_b));
+    encode(&gpu, &mut executor, size_a, 5);
+    encode(&gpu, &mut executor, size_b, 5);
+    assert_eq!(sizes(&executor).len(), 2);
+    let frame5 = (slots_of(&executor, size_a), slots_of(&executor, size_b));
+    encode(&gpu, &mut executor, size_a, 6);
+    encode(&gpu, &mut executor, size_b, 6);
+    assert_eq!(sizes(&executor).len(), 2);
+    let frame6 = (slots_of(&executor, size_a), slots_of(&executor, size_b));
+    assert!(
+        frame4.0 == frame5.0 && frame5.0 == frame6.0,
+        "size A encoded every frame must keep its intermediates"
+    );
+    assert!(
+        frame4.1 == frame5.1 && frame5.1 == frame6.1,
+        "size B encoded every frame must keep its intermediates"
     );
 }

@@ -9,6 +9,8 @@ use kurbo::Affine;
 
 use crate::{BlendMode, Command, Dirty, DisplayList, FillRule, Group, ShapeData};
 
+pub mod shadow;
+
 /// A backend operation whose scope indices can be relocated during a patch.
 pub trait Operation {
     /// Matching close index for a scope opener.
@@ -460,6 +462,13 @@ impl<O: Operation, E> Content<O, E> {
             &mut self.emissions,
             self.list.display_list(),
         )
+    }
+
+    /// Retained device realizations, including invalid entries awaiting replacement.
+    /// Backends use this read-only view for residency accounting without preparing content.
+    #[must_use]
+    pub fn realizations(&self) -> &[Realization<E>] {
+        &self.emissions
     }
 
     /// Release device coverage without re-lowering content on the next frame.

@@ -1,0 +1,98 @@
+{
+  "width": 128,
+  "height": 128,
+  "working_space": "linear-display-p3",
+  "clear": {
+    "space": "srgb",
+    "components": [
+      0.95,
+      0.95,
+      0.95,
+      1.0
+    ]
+  },
+  "features": [
+    {
+      "feature": "fill"
+    },
+    {
+      "feature": "shadow"
+    }
+  ],
+  "root": {
+    "transform": [
+      1.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0
+    ],
+    "opacity": 1.0,
+    "blend": "normal",
+    "items": [
+      {
+        "draw": {
+          "shadow": {
+            "shape": {
+              "ellipse": {
+                "inner": [
+                  40.0,
+                  0.0,
+                  0.0,
+                  24.0,
+                  48.0,
+                  48.0
+                ]
+              }
+            },
+            "blur_sigma": 3.0,
+            "offset": [
+              7.0,
+              8.0
+            ],
+            "color": {
+              "space": "srgb",
+              "components": [
+                0.1,
+                0.25,
+                0.6,
+                0.8
+              ]
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "ellipse": {
+                "inner": [
+                  40.0,
+                  0.0,
+                  0.0,
+                  24.0,
+                  48.0,
+                  48.0
+                ]
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "srgb",
+                "components": [
+                  1.0,
+                  0.65,
+                  0.15,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      }
+    ]
+  }
+}

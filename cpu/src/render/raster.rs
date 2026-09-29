@@ -430,7 +430,11 @@ fn src_over(dst: [f32; 4], src: [f32; 4]) -> [f32; 4] {
 /// `(draws, edges)` stats for an item list.
 fn stats(items: &[Item]) -> (u32, u32) {
     let (mut draws, mut edges) = (0_u32, 0_u32);
+
     for item in items {
+        if matches!(item, Item::Silhouette { .. }) {
+            draws += 1;
+        }
         if let Item::Draw { edges: e, .. } = item {
             draws += 1;
             edges += u32::try_from(e.len()).unwrap_or(u32::MAX);
@@ -934,6 +938,9 @@ fn run(
                 bbox,
                 clip,
             } => band.shadow(stack, rbox, radii, *sigma_eff, color, *bbox, clip.as_ref()),
+            Item::Silhouette { slot, paint, clip } => {
+                band.glyph(stack, slot, 0, 0, paint, clip.as_ref());
+            }
             Item::Glyph {
                 slot,
                 x,

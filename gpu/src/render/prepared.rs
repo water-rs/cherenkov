@@ -714,6 +714,13 @@ pub enum Op {
         /// Op index of the matching `End` op.
         end: u32,
     },
+    /// A captured silhouette with local blur and morphology parameters.
+    BeginShadow {
+        /// Content-space parameters, composed with sampled layer placement.
+        parameters: super::shadow::Parameters,
+        /// End of the generated silhouette draw.
+        end: u32,
+    },
     /// Close the innermost clip or isolate scope.
     End,
 }
@@ -721,7 +728,9 @@ pub enum Op {
 impl cherenkov::lowering::Operation for Op {
     fn end_mut(&mut self) -> Option<&mut u32> {
         match self {
-            Self::BeginClip { end, .. } | Self::BeginIsolate { end, .. } => Some(end),
+            Self::BeginClip { end, .. }
+            | Self::BeginIsolate { end, .. }
+            | Self::BeginShadow { end, .. } => Some(end),
             _ => None,
         }
     }
@@ -781,7 +790,7 @@ impl cherenkov::lowering::Compiler for Lowerer<'_> {
                 stroke,
                 paint,
             } => self.stroke(ambient, shape, stroke, paint, ops, source),
-            Command::Shadow { shape, shadow } => Self::shadow(ambient, shape, shadow, ops),
+            Command::Shadow { shape, shadow } => self.shadow(ambient, shape, shadow, ops),
             Command::Glyphs { run, paint } => self.glyph_run(ambient, run, paint, ops, source),
             Command::Image {
                 image,
@@ -1063,17 +1072,49 @@ impl Lowerer<'_> {
 
     /// `Shadow`: a Gaussian-blurred rounded box, offset and spread.
     fn shadow(
+        &self,
         ambient: Affine,
         shape: &ShapeData,
         shadow: &cherenkov::Shadow,
         ops: &mut Vec<Op>,
     ) -> Result<(), RenderError> {
-        let Some(boxed) = box_shape(shape)? else {
+        cherenkov::lowering::shadow::check_sigma(shadow.sigma)?;
+        cherenkov::lowering::shadow::check_sigma(shadow.sigma)?;
+        let boxed = match shape {
+            // A line has no fillable silhouette to capture.
+            ShapeData::Line(_) => return Err(RenderError::Unsupported(names::SHADOW)),
+            ShapeData::Path { .. } => None,
+            _ => box_shape(shape)?,
+        };
+        let Some(boxed) = boxed.filter(|boxed| shape_is_offsettable(boxed.shape)) else {
+            if !shadow.offset.x.is_finite() || !shadow.offset.y.is_finite() {
+                return Err(RenderError::Render("non-finite shadow offset".into()));
+            }
+            let start = ops.len();
+            ops.push(Op::BeginShadow {
+                parameters: super::shadow::Parameters {
+                    transform: ambient,
+                    sigma: shadow.sigma,
+                    spread: shadow.spread,
+                },
+                end: 0,
+            });
+            self.fill(
+                ambient * Affine::translate(shadow.offset),
+                shape,
+                &Paint::Solid(shadow.color),
+                ops,
+                None,
+            )?;
+            let end = u32::try_from(ops.len())
+                .map_err(|_| RenderError::Render("shadow operation count exceeds u32".into()))?;
+            let Op::BeginShadow { end: paired, .. } = &mut ops[start] else {
+                unreachable!()
+            };
+            *paired = end;
+            ops.push(Op::End);
             return Ok(());
         };
-        if !shape_is_offsettable(boxed.shape) {
-            return Err(RenderError::Unsupported(names::SHADOW));
-        }
         let mut s = boxed.shape;
         let spread = f32_f64(shadow.spread);
         for h in &mut s.half {

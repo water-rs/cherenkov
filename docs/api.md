@@ -655,3 +655,23 @@ of gradient colour-space interpolation. CPU, GPU and the f64 oracle implement
 both modes. Captured meshes without a setting deserialize as Linear; Linear
 is omitted when serializing, preserving old captures. Live mesh operands may
 switch modes while preserving unrelated retained commands and device output.
+
+### Arbitrary silhouette shadows (#76)
+
+`shadow(shape, Shadow)` accepts the same filled silhouette as `fill`, including
+paths, ellipses and continuous corners. Offset, spread and Gaussian sigma are in
+shape units, before the enclosing affine. Positive spread grows coverage with a
+local disk; negative spread erodes it. The blur follows both affine axes, so a
+nonuniform scale or skew also changes its covariance. The enclosing clip applies
+to the completed shadow. Off-viewport shape coverage can contribute visible blur.
+
+The GPU convolution pipeline is created with the renderer. Its intermediate
+texture and kernels allocate only when needed; memory pressure drops those
+allocations while preserving the pipeline, so drawing never compiles it.
+
+GPU convolution stays on the GPU after native coverage capture. CPU convolution
+uses the CPU renderer's coverage. Both retain prepared content and device output;
+changing a live shadow patches its command, while unrelated commands are reused.
+Existing analytic rounded-box shadows keep their established arithmetic. General
+captures include a six-sigma halo and are bounded by backend address/texture limits;
+an unrepresentable capture is an error, never an alternate rendering path.

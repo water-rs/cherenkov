@@ -66,3 +66,88 @@ pub fn gaussian_blur(src: &[f64], width: usize, height: usize, sigma: f64) -> Ve
     }
     out
 }
+
+/// Independent covariance convolution.
+///
+/// The kernel integrates the transformed Gaussian over each device pixel using
+/// tensor Gauss-Legendre quadrature. Source coverage has transparent padding;
+/// no viewport edge is replicated.
+#[must_use]
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    reason = "finite corpus dimensions and bounded kernel coordinates"
+)]
+pub fn affine_blur(
+    src: &[f64],
+    width: usize,
+    height: usize,
+    sigma: f64,
+    matrix: [f64; 4],
+) -> Vec<f64> {
+    if sigma <= 1e-9 {
+        return src.to_vec();
+    }
+    let [ma, mb, mc, md] = matrix;
+    let xx = mc.mul_add(mc, ma * ma) * sigma * sigma;
+    let yy = md.mul_add(md, mb * mb) * sigma * sigma;
+    let xy = mc.mul_add(md, ma * mb) * sigma * sigma;
+    let det = xy.mul_add(-xy, xx * yy);
+    if det <= 0.0 {
+        return vec![0.0; src.len()];
+    }
+    let rx = (6.0 * xx.sqrt()).ceil() as i32;
+    let ry = (6.0 * yy.sqrt()).ceil() as i32;
+    let points: [f64; 4] = [
+        -0.861_136_311_594_052_6,
+        -0.339_981_043_584_856_3,
+        0.339_981_043_584_856_3,
+        0.861_136_311_594_052_6,
+    ];
+    let weights: [f64; 4] = [
+        0.347_854_845_137_453_8,
+        0.652_145_154_862_546_1,
+        0.652_145_154_862_546_1,
+        0.347_854_845_137_453_8,
+    ];
+    let mut kernel = Vec::new();
+    let mut total = 0.0;
+    for dy in -ry..=ry {
+        for dx in -rx..=rx {
+            let mut weight = 0.0;
+            for (u, wu) in points.into_iter().zip(weights) {
+                for (v, wv) in points.into_iter().zip(weights) {
+                    let px = u.mul_add(0.5, f64::from(dx));
+                    let py = v.mul_add(0.5, f64::from(dy));
+                    weight = (wu * wv).mul_add(
+                        (-0.5 * (xx * py).mul_add(py, (2.0 * xy * px).mul_add(-py, yy * px * px))
+                            / det)
+                            .exp(),
+                        weight,
+                    );
+                }
+            }
+            total += weight;
+            kernel.push((dx, dy, weight));
+        }
+    }
+    for (_, _, weight) in &mut kernel {
+        *weight /= total;
+    }
+    let mut out = vec![0.0; src.len()];
+    for y in 0..height {
+        for x in 0..width {
+            let mut value = 0.0;
+            for &(dx, dy, weight) in &kernel {
+                let sx = x as i64 + i64::from(dx);
+                let sy = y as i64 + i64::from(dy);
+                if sx >= 0 && sy >= 0 && sx < width as i64 && sy < height as i64 {
+                    value = weight.mul_add(src[sy as usize * width + sx as usize], value);
+                }
+            }
+            out[y * width + x] = value;
+        }
+    }
+    out
+}

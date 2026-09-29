@@ -4,6 +4,8 @@
 //! Lowering: a surface's layer tree and display lists become one flat list
 //! of rasterization [`Item`]s in device space.
 
+mod silhouette;
+
 use cherenkov::lowering::Realization;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -92,6 +94,15 @@ pub enum Item {
         /// The paint evaluator.
         paint: PaintData,
         /// The clip in force.
+        clip: Option<ClipRef>,
+    },
+    /// Owned convolved silhouette coverage in surface coordinates.
+    Silhouette {
+        /// Completed immutable coverage, retained with its command.
+        slot: crate::render::glyph::GlyphSlot,
+        /// Premultiplied shadow colour.
+        paint: PaintData,
+        /// Clip applied after convolution.
         clip: Option<ClipRef>,
     },
     /// Start a fresh transparent scratch layer.
@@ -1278,7 +1289,7 @@ impl<'a> Lowering<'a> {
     ///
     /// Only shapes whose corners are circular under the transform —
     /// `Rect`, `RoundedRect`, `Circle` — under an axis-aligned
-    /// transform; everything else reports an unsupported `shadow` error.
+    /// transform; other silhouettes use coverage convolution.
     /// Radii are handled per corner (the closed form works per corner).
     #[expect(
         clippy::cast_possible_truncation,
@@ -1287,6 +1298,7 @@ impl<'a> Lowering<'a> {
         reason = "shadow geometry is f32 and surface sizes fit i32"
     )]
     fn shadow(&mut self, shape: &ShapeData, shadow: &cherenkov::Shadow) -> Result<(), RenderError> {
+        cherenkov::lowering::shadow::check_sigma(shadow.sigma)?;
         // The shape as a centred rect plus per-corner radii, in content
         // space.
         let (rect, radii) = match shape {
@@ -1309,10 +1321,11 @@ impl<'a> Lowering<'a> {
                 Rect::from_center_size(c.center, (c.radius * 2.0, c.radius * 2.0)),
                 [c.radius; 4],
             ),
-            _ => return Err(RenderError::Unsupported(names::SHADOW)),
+            ShapeData::Line(_) => return Err(RenderError::Unsupported(names::SHADOW)),
+            _ => return self.silhouette(shape, shadow),
         };
         if !axis_aligned(self.transform) {
-            return Err(RenderError::Unsupported(names::SHADOW));
+            return self.silhouette(shape, shadow);
         }
         let [a, b, c, d, _, _] = self.transform.as_coeffs();
         let (sx, sy) = (a.hypot(b), c.hypot(d));
@@ -1415,4 +1428,29 @@ impl<'a> Lowering<'a> {
         }
         Ok(())
     }
+}
+
+/// Heap residency of completed silhouette coverage owned by this content.
+pub fn silhouette_bytes(content: &ContentData) -> u64 {
+    content
+        .realizations()
+        .iter()
+        .filter_map(|entry| entry.data.as_ref())
+        .map(|emission| {
+            let Emission::Draw(data) = emission else {
+                return 0;
+            };
+            data.output
+                .iter()
+                .filter_map(|item| {
+                    let Item::Silhouette { slot, .. } = item else {
+                        return None;
+                    };
+                    slot.get().map(|mask| {
+                        u64::try_from(mask.cov.capacity() * size_of::<f32>()).unwrap_or(u64::MAX)
+                    })
+                })
+                .sum::<u64>()
+        })
+        .sum()
 }

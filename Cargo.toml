@@ -15,6 +15,7 @@ web-time = "1"
 color = { version = "0.3.3", features = ["serde"] }
 filtrate-core = { path = "filtrate/core" }
 kurbo = { version = "0.13.1", features = ["serde"] }
+libm = "0.2"
 nami-core = { version = "0.3.3", features = ["kurbo"] }
 serde = { version = "1", features = ["derive", "rc"] }
 thiserror = "2"

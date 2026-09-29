@@ -29,14 +29,53 @@ struct Fixed {
     spirv: &'static [u8],
     /// The `xcrun metallib` output, present only in Apple builds.
     metallib: &'static [u8],
+    /// The module's graphics entry points, declared explicitly for
+    /// passthrough creation in wgpu 30.
+    entries: &'static [wgpu::PassthroughShaderEntryPoint<'static>],
 }
 
+/// `vs_main` + `fs_main`, the engine and present modules' entry points.
+const VS_FS_MAIN: &[wgpu::PassthroughShaderEntryPoint<'static>] = &[
+    wgpu::PassthroughShaderEntryPoint {
+        name: Cow::Borrowed("vs_main"),
+        workgroup_size: (0, 0, 0),
+    },
+    wgpu::PassthroughShaderEntryPoint {
+        name: Cow::Borrowed("fs_main"),
+        workgroup_size: (0, 0, 0),
+    },
+];
+
+/// `vs_main` + `fs_external`, the external module's entry points.
+const VS_FS_EXTERNAL: &[wgpu::PassthroughShaderEntryPoint<'static>] = &[
+    wgpu::PassthroughShaderEntryPoint {
+        name: Cow::Borrowed("vs_main"),
+        workgroup_size: (0, 0, 0),
+    },
+    wgpu::PassthroughShaderEntryPoint {
+        name: Cow::Borrowed("fs_external"),
+        workgroup_size: (0, 0, 0),
+    },
+];
+
 /// The `VARIANT = 0` specialization of `shader.wgsl` (simple).
-const ENGINE_WGSL0: &str = concat!("const VARIANT: u32 = 0u;\n", include_str!("shader.wgsl"));
+const ENGINE_WGSL0: &str = concat!(
+    "const VARIANT: u32 = 0u;\n",
+    include_str!("shared.wgsl"),
+    include_str!("shader.wgsl")
+);
 /// The `VARIANT = 1` specialization (shadow).
-const ENGINE_WGSL1: &str = concat!("const VARIANT: u32 = 1u;\n", include_str!("shader.wgsl"));
+const ENGINE_WGSL1: &str = concat!(
+    "const VARIANT: u32 = 1u;\n",
+    include_str!("shared.wgsl"),
+    include_str!("shader.wgsl")
+);
 /// The `VARIANT = 2` specialization (full).
-const ENGINE_WGSL2: &str = concat!("const VARIANT: u32 = 2u;\n", include_str!("shader.wgsl"));
+const ENGINE_WGSL2: &str = concat!(
+    "const VARIANT: u32 = 2u;\n",
+    include_str!("shared.wgsl"),
+    include_str!("shader.wgsl")
+);
 
 // The passthrough artifacts are embedded only where they can be loaded:
 // wasm keeps WGSL, and `.metallib` files exist only in Apple builds
@@ -54,6 +93,10 @@ const ENGINE_SPV: [&[u8]; 3] = [&[], &[], &[]];
 const PRESENT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/present.spv"));
 #[cfg(target_arch = "wasm32")]
 const PRESENT_SPV: &[u8] = &[];
+#[cfg(not(target_arch = "wasm32"))]
+const EXTERNAL_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/external.spv"));
+#[cfg(target_arch = "wasm32")]
+const EXTERNAL_SPV: &[u8] = &[];
 #[cfg(target_vendor = "apple")]
 const ENGINE_METALLIB: [&[u8]; 3] = [
     include_bytes!(concat!(env!("OUT_DIR"), "/engine0.metallib")),
@@ -66,6 +109,10 @@ const ENGINE_METALLIB: [&[u8]; 3] = [&[], &[], &[]];
 const PRESENT_METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/present.metallib"));
 #[cfg(not(target_vendor = "apple"))]
 const PRESENT_METALLIB: &[u8] = &[];
+#[cfg(target_vendor = "apple")]
+const EXTERNAL_METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/external.metallib"));
+#[cfg(not(target_vendor = "apple"))]
+const EXTERNAL_METALLIB: &[u8] = &[];
 
 /// The three `VARIANT` specializations of `shader.wgsl`, indexed by
 /// `variant_index`.
@@ -74,16 +121,19 @@ const ENGINE: [Fixed; 3] = [
         wgsl: ENGINE_WGSL0,
         spirv: ENGINE_SPV[0],
         metallib: ENGINE_METALLIB[0],
+        entries: VS_FS_MAIN,
     },
     Fixed {
         wgsl: ENGINE_WGSL1,
         spirv: ENGINE_SPV[1],
         metallib: ENGINE_METALLIB[1],
+        entries: VS_FS_MAIN,
     },
     Fixed {
         wgsl: ENGINE_WGSL2,
         spirv: ENGINE_SPV[2],
         metallib: ENGINE_METALLIB[2],
+        entries: VS_FS_MAIN,
     },
 ];
 
@@ -92,6 +142,15 @@ const PRESENT: Fixed = Fixed {
     wgsl: include_str!("present.wgsl"),
     spirv: PRESENT_SPV,
     metallib: PRESENT_METALLIB,
+    entries: VS_FS_MAIN,
+};
+
+/// `shared.wgsl` plus `external.wgsl`, the external-frame module.
+const EXTERNAL: Fixed = Fixed {
+    wgsl: concat!(include_str!("shared.wgsl"), include_str!("external.wgsl")),
+    spirv: EXTERNAL_SPV,
+    metallib: EXTERNAL_METALLIB,
+    entries: VS_FS_EXTERNAL,
 };
 
 /// How the fixed engine modules reach the device — a property of the
@@ -152,6 +211,12 @@ impl ShaderDelivery {
         self.module(device, "present", &PRESENT)
     }
 
+    /// The external-frame module.
+    #[must_use]
+    pub fn external_module(self, device: &wgpu::Device) -> wgpu::ShaderModule {
+        self.module(device, "cherenkov external", &EXTERNAL)
+    }
+
     fn module(
         self,
         device: &wgpu::Device,
@@ -184,7 +249,7 @@ impl ShaderDelivery {
                     device.create_shader_module_passthrough(
                         wgpu::ShaderModuleDescriptorPassthrough {
                             label: Some(label),
-                            entry_points: entry_points(),
+                            entry_points: Cow::Borrowed(fixed.entries),
                             spirv: Some(words(fixed.spirv)),
                             ..wgpu::ShaderModuleDescriptorPassthrough::default()
                         },
@@ -204,7 +269,7 @@ impl ShaderDelivery {
                     device.create_shader_module_passthrough(
                         wgpu::ShaderModuleDescriptorPassthrough {
                             label: Some(label),
-                            entry_points: entry_points(),
+                            entry_points: Cow::Borrowed(fixed.entries),
                             metallib: Some(Cow::Borrowed(fixed.metallib)),
                             ..wgpu::ShaderModuleDescriptorPassthrough::default()
                         },
@@ -229,19 +294,4 @@ fn words(spirv: &[u8]) -> Cow<'static, [u32]> {
             .map(|w| u32::from_le_bytes(*w))
             .collect(),
     )
-}
-
-// Every fixed module contains this vertex/fragment pair. Passthrough entry
-// points are explicit in wgpu 30; graphics stages have no workgroup size.
-const fn entry_points() -> Cow<'static, [wgpu::PassthroughShaderEntryPoint<'static>]> {
-    Cow::Borrowed(&[
-        wgpu::PassthroughShaderEntryPoint {
-            name: Cow::Borrowed("vs_main"),
-            workgroup_size: (0, 0, 0),
-        },
-        wgpu::PassthroughShaderEntryPoint {
-            name: Cow::Borrowed("fs_main"),
-            workgroup_size: (0, 0, 0),
-        },
-    ])
 }

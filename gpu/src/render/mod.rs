@@ -3,6 +3,7 @@
 mod bindings;
 mod colr;
 pub mod diag;
+mod external;
 pub mod filter;
 mod glyph;
 mod gpu_content;
@@ -35,6 +36,15 @@ use lower::{
     BackdropGroupInfo, ContentData, Frame as LoweredFrame, GlyphContext, Lowered, Lowering,
     PipelineKind, ShaderVariant, Source, Target,
 };
+
+/// The pipeline bound for a pass range: engine pipelines and the external
+/// frame pipeline are mutually exclusive, so an engine range always rebinds
+/// after an external one and vice versa.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Bound {
+    Engine(PipelineKind, ShaderVariant),
+    External,
+}
 
 /// The surface target format: premultiplied linear Display P3.
 const TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
@@ -147,6 +157,8 @@ struct SurfaceState {
     backdrop_groups: HashMap<u64, BackdropGroupState>,
     layers: HashMap<LayerId, ContentData>,
     content: HashMap<LayerId, gpu_content::Slot>,
+    /// Retained external frames by layer (`cherenkov::ExternalFrames`).
+    external: HashMap<LayerId, external::Slot>,
     shader_textures: HashMap<std::sync::Arc<paint::Key>, paint::Texture>,
     frame: LoweredFrame,
     /// This frame's offsets into the shared buffers: instances and globals
@@ -264,6 +276,11 @@ impl SurfaceState {
                 .filter_map(|slot| slot.image.as_ref())
                 .map(|image| u64::from(image.width) * u64::from(image.height) * 8)
                 .sum::<u64>()
+            + self
+                .external
+                .values()
+                .map(|_| external::Slot::GPU_BYTES)
+                .sum::<u64>()
             + self.backdrop_bytes()
     }
 }
@@ -341,6 +358,14 @@ pub struct GpuRenderer {
     pending_origins: Vec<PendingOrigin>,
     /// A dummy 1×1 view for unused group-1 slots.
     dummy_view: wgpu::TextureView,
+    /// A dummy 1×1 `u32` view for unused external-frame plane slots.
+    dummy_uint_view: wgpu::TextureView,
+    /// The external-frame group-1 layout, `None` until a surface first
+    /// draws an external frame.
+    ext_layout: Option<wgpu::BindGroupLayout>,
+    /// `[format index]` external pipelines: 0 = surface, 1 = scratch —
+    /// `None` until the first external draw prepares them.
+    external_pipes: [Option<wgpu::RenderPipeline>; 2],
     surfaces: HashMap<SurfaceId, SurfaceState>,
     fonts: HashMap<u64, FontData>,
     /// Registered images.
@@ -705,6 +730,11 @@ pub fn layout_entries(entries: &[bindings::Entry]) -> Vec<wgpu::BindGroupLayoutE
                     view_dimension: wgpu::TextureViewDimension::D2,
                     multisampled: false,
                 },
+                bindings::Kind::TextureUint => wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Uint,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
                 bindings::Kind::Sampler => {
                     wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)
                 }
@@ -986,6 +1016,59 @@ async fn create_pipeline(
     Ok(pipeline)
 }
 
+/// One instanced-quad pipeline from `external.wgsl` for `format`:
+/// source-over only — an external frame composites like any image.
+fn create_external_pipeline(
+    device: &wgpu::Device,
+    layout0: &wgpu::BindGroupLayout,
+    layout1: &wgpu::BindGroupLayout,
+    module: &wgpu::ShaderModule,
+    format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("cherenkov external"),
+        bind_group_layouts: &[Some(layout0), Some(layout1)],
+        immediate_size: 0,
+    });
+    let component = wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::One,
+        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+        operation: wgpu::BlendOperation::Add,
+    };
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("cherenkov external"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module,
+            entry_point: Some("vs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module,
+            entry_point: Some("fs_external"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState {
+                    color: component,
+                    alpha: component,
+                }),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            ..wgpu::PrimitiveState::default()
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
 /// A `w` × `h` texture in `format`.
 fn create_target(
     device: &wgpu::Device,
@@ -1118,6 +1201,14 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             TARGET_FORMAT,
         );
         diag::create(&device, "dummy source", 8);
+        let (_, dummy_uint_view) = create_target(
+            &device,
+            "dummy uint source",
+            (1, 1),
+            wgpu::TextureUsages::TEXTURE_BINDING,
+            wgpu::TextureFormat::R8Uint,
+        );
+        diag::create(&device, "dummy uint source", 1);
         let timestamps =
             config.timestamps && device.features().contains(wgpu::Features::TIMESTAMP_QUERY);
         let (query_set, query_buffer) = if timestamps {
@@ -1170,6 +1261,9 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             stops,
             bind0,
             dummy_view,
+            dummy_uint_view,
+            ext_layout: None,
+            external_pipes: [None, None],
             bound_atlas: 0,
             bound_instance_size: 272 * 16,
             bound_stop_size: 32 * 16,
@@ -1310,6 +1404,14 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
         TARGET_FORMAT,
     );
     diag::create(&device, "dummy source", 8);
+    let (_, dummy_uint_view) = create_target(
+        &device,
+        "dummy uint source",
+        (1, 1),
+        wgpu::TextureUsages::TEXTURE_BINDING,
+        wgpu::TextureFormat::R8Uint,
+    );
+    diag::create(&device, "dummy uint source", 1);
     let timestamps =
         config.timestamps && device.features().contains(wgpu::Features::TIMESTAMP_QUERY);
     let (query_set, query_buffer) = if timestamps {
@@ -1362,6 +1464,9 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
         stops,
         bind0,
         dummy_view,
+        dummy_uint_view,
+        ext_layout: None,
+        external_pipes: [None, None],
         bound_atlas: 0,
         bound_instance_size: 272 * 16,
         bound_stop_size: 32 * 16,
@@ -1497,6 +1602,7 @@ impl Renderer for GpuRenderer {
                 backdrop_groups: HashMap::new(),
                 layers: HashMap::new(),
                 content: HashMap::new(),
+                external: HashMap::new(),
                 shader_textures: HashMap::new(),
                 frame: LoweredFrame::default(),
                 inst_base: 0,
@@ -1680,6 +1786,7 @@ impl Renderer for GpuRenderer {
             diag::bind_groups_dropped(&self.device, state.binds1.len() as u64, "content change");
             state.binds1.clear();
         }
+        state.external.remove(&layer);
         match content {
             Some(ContentOp::Replace(list)) => {
                 if let Some(content) = state.layers.get_mut(&layer) {
@@ -1708,6 +1815,7 @@ impl Renderer for GpuRenderer {
         let _diag_guard = diag::Guard::scope(self.diag.as_ref());
         if let Some(state) = self.surfaces.get_mut(&surface) {
             state.layers.remove(&layer);
+            state.external.remove(&layer);
             if state.content.remove(&layer).is_some() {
                 diag::bind_groups_dropped(
                     &self.device,
@@ -2768,11 +2876,31 @@ impl GpuRenderer {
         let _diag_guard = diag::Guard::scope(self.diag.as_ref());
         let state = self.surfaces.get_mut(&surface).expect("GPU surface exists");
         state.layers.remove(&layer);
+        state.external.remove(&layer);
         state
             .content
             .insert(layer, gpu_content::Slot::new(content, size));
         diag::bind_groups_dropped(&self.device, state.binds1.len() as u64, "content change");
         state.binds1.clear();
+    }
+
+    /// Installs a retained external frame on `layer` (`cherenkov::ExternalFrames`).
+    ///
+    /// The planes are sampled where the frame lands; nothing is copied or
+    /// rasterized. Any recorded or GPU content on `layer` is dropped — a
+    /// layer has one content kind at a time.
+    pub(crate) fn set_external_frame(
+        &mut self,
+        surface: SurfaceId,
+        layer: LayerId,
+        frame: crate::interop::ExternalFrame,
+    ) {
+        let state = self.surfaces.get_mut(&surface).expect("GPU surface exists");
+        state.layers.remove(&layer);
+        state.content.remove(&layer);
+        state
+            .external
+            .insert(layer, external::Slot::new(&self.device, &self.queue, frame));
     }
 
     pub(crate) fn resize_gpu_content(
@@ -2800,6 +2928,42 @@ impl GpuRenderer {
             "content resize",
             |key| key.2 == Some(lower::ImageSource::Content(layer)),
         );
+    }
+
+    /// Builds the external-frame group-1 layout and both format pipelines
+    /// on the first surface draw that samples an external slot.
+    fn ensure_external(&mut self) -> Result<(), RenderError> {
+        if self.ext_layout.is_some() {
+            return Ok(());
+        }
+        let ext_layout = self
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("cherenkov external 1"),
+                entries: &layout_entries(bindings::EXTERNAL_GROUP1),
+            });
+        let module = self.shader_delivery.external_module(&self.device);
+        // Error scopes resolve asynchronously; only the native path pops
+        // synchronously. A failure here is an engine bug, so the wasm path
+        // reports through the uncaptured-error handler instead.
+        #[cfg(not(target_arch = "wasm32"))]
+        let error_scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let formats = [TARGET_FORMAT, self.scratch_format];
+        for (pipe, format) in self.external_pipes.iter_mut().zip(formats) {
+            *pipe = Some(create_external_pipeline(
+                &self.device,
+                &self.layout0,
+                &ext_layout,
+                &module,
+                format,
+            ));
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(error) = pollster::block_on(error_scope.pop()) {
+            return Err(RenderError::Render(format!("external pipeline: {error}")));
+        }
+        self.ext_layout = Some(ext_layout);
+        Ok(())
     }
 
     fn present_windows(&mut self, frame: &Frame<'_>) -> Result<Redraw, RenderError> {
@@ -2999,6 +3163,7 @@ impl GpuRenderer {
                 fonts,
                 images,
                 content: &surf.content,
+                external: &surf.external,
             };
             let mut lowering = Lowering::new(&mut surf.frame, surf.size);
             let result = lowering.run(frame.tree, &mut layers, frame.clear, &glyphs, groups);
@@ -3014,6 +3179,8 @@ impl GpuRenderer {
         surf.layers = layers;
         surf.frame.content.sort_unstable_by_key(|id| id.raw());
         surf.frame.content.dedup();
+        surf.frame.external.sort_unstable_by_key(|id| id.raw());
+        surf.frame.external.dedup();
         result.map(|()| lowered)
     }
 
@@ -3710,6 +3877,18 @@ impl GpuRenderer {
         timing: filtrate::EffectFrameTiming,
         stats: &mut FrameStats,
     ) -> Result<(), RenderError> {
+        // External pipelines stay lazy until a surface first samples an
+        // external frame; the scan stays on the (unchanged) surface state.
+        let needs_external = self.surfaces.get(&id).is_some_and(|surf| {
+            surf.frame
+                .passes
+                .iter()
+                .flat_map(|pass| &pass.ranges)
+                .any(|range| matches!(range.image, Some(lower::ImageSource::External(_))))
+        });
+        if needs_external {
+            self.ensure_external()?;
+        }
         let Some(surf) = self.surfaces.get_mut(&id) else {
             return Ok(());
         };
@@ -3932,16 +4111,60 @@ impl GpuRenderer {
             // stride), which matches `surf.frame.passes` ordering.
             let offset = pass_index * 256;
             render_pass.set_bind_group(0, &self.bind0, &[offset]);
-            let mut pipeline = (PipelineKind::SrcOver, ShaderVariant::Simple);
+            // External ranges bind a slot's group-1 over the external
+            // pipeline; an engine range after one must rebind its pipeline.
+            let mut pipeline = Bound::Engine(PipelineKind::SrcOver, ShaderVariant::Simple);
             for range in &pass.ranges {
                 stats.draws += 1;
-                let want = (range.pipeline, range.variant);
+                if let Some(lower::ImageSource::External(layer)) = &range.image {
+                    if pipeline != Bound::External {
+                        pipeline = Bound::External;
+                        stats.pipeline_switches += 1;
+                        let Some(pipe) = &self.external_pipes[format_i] else {
+                            return Err(RenderError::Render("external pipeline unbuilt".into()));
+                        };
+                        render_pass.set_pipeline(pipe);
+                    }
+                    let Some(ext_layout) = &self.ext_layout else {
+                        return Err(RenderError::Render("external layout unbuilt".into()));
+                    };
+                    let Some(slot) = surf.external.get_mut(layer) else {
+                        return Err(RenderError::Render(format!(
+                            "no external frame on layer {layer:?}"
+                        )));
+                    };
+                    let bind = slot.bind(
+                        &self.device,
+                        ext_layout,
+                        external::MaskBinding {
+                            key: range.mask,
+                            view: range.mask.map(|key| {
+                                self.atlas
+                                    .mask_texture_view(key)
+                                    .expect("mask texture stored before encode")
+                            }),
+                            generation: self.atlas.mask_texture_generation(),
+                        },
+                        &self.dummy_view,
+                        &self.dummy_uint_view,
+                    );
+                    render_pass.set_bind_group(1, bind, &[]);
+                    render_pass.draw(
+                        0..6,
+                        (inst_base + range.instances.start)..(inst_base + range.instances.end),
+                    );
+                    continue;
+                }
+                let want = Bound::Engine(range.pipeline, range.variant);
                 if want != pipeline {
                     pipeline = want;
                     stats.pipeline_switches += 1;
+                    let Bound::Engine(kind, variant) = pipeline else {
+                        unreachable!("engine want")
+                    };
                     render_pass.set_pipeline(
-                        &self.pipelines[format_i][usize::from(pipeline.0 == PipelineKind::Replace)]
-                            [variant_index(pipeline.1)],
+                        &self.pipelines[format_i][usize::from(kind == PipelineKind::Replace)]
+                            [variant_index(variant)],
                     );
                 }
                 let key = (
@@ -3992,6 +4215,9 @@ impl GpuRenderer {
                                         .expect("rendered content")
                                         .view,
                                 ),
+                                lower::ImageSource::External(_) => {
+                                    unreachable!("external ranges draw with the external pipeline")
+                                }
                             }),
                             range.mask.map(|k| {
                                 self.atlas
@@ -4048,6 +4274,31 @@ impl GpuRenderer {
                     timing,
                     &mut encoder,
                 )?;
+            }
+        }
+        // Producer sync: each external frame's `wait` event becomes a
+        // raw Metal command buffer committed ahead of the frame's, so the
+        // GPU blocks in-queue — no CPU wait and no copy. Commit order on
+        // the queue orders the wait before wgpu's own command buffer.
+        #[cfg(target_vendor = "apple")]
+        {
+            use objc2_metal::{MTLCommandBuffer as _, MTLCommandQueue as _};
+            for layer in &surf.frame.external {
+                let Some(crate::interop::FrameSync::Metal { event, value }) = surf
+                    .external
+                    .get(layer)
+                    .and_then(|slot| slot.frame.wait.as_ref())
+                else {
+                    continue;
+                };
+                let hal_queue = unsafe { self.queue.as_hal::<wgpu::hal::metal::Api>() }
+                    .expect("the engine queue is Metal");
+                let buffer = hal_queue
+                    .as_raw()
+                    .commandBuffer()
+                    .expect("Metal command buffer");
+                buffer.encodeWaitForEvent_value(event.as_ref(), *value);
+                buffer.commit();
             }
         }
         let submission = self.queue.submit([encoder.finish()]);

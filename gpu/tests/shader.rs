@@ -6,13 +6,15 @@ use naga::valid::{Capabilities, ValidationFlags, Validator};
 use naga::{Module, front::wgsl};
 
 const SHADER: &str = include_str!("../src/render/shader.wgsl");
+const SHARED: &str = include_str!("../src/render/shared.wgsl");
 
 /// The oldest Metal language version wgpu selects on a supported macOS
 /// (10.13 → 2.0), which is where `instance_id` and friends became legal.
 const MSL_VERSION: (u8, u8) = (2, 0);
 
 fn composed(variant: u32) -> (Module, naga::valid::ModuleInfo) {
-    let source = format!("const VARIANT: u32 = {variant}u;\n{SHADER}");
+    // The engine module is `shared.wgsl` then `shader.wgsl`, as in build.rs.
+    let source = format!("const VARIANT: u32 = {variant}u;\n{SHARED}\n{SHADER}");
     let module = wgsl::parse_str(&source).unwrap_or_else(|e| panic!("variant {variant}: {e}"));
     let info = Validator::new(ValidationFlags::all(), Capabilities::empty())
         .validate(&module)

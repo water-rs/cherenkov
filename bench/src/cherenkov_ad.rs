@@ -1652,6 +1652,9 @@ impl Engine for Cherenkov {
                         for (index, op) in cl.ops.iter().enumerate() {
                             match cl.live.iter().find(|live| live.index == index) {
                                 Some(live) => record_live(c, op, &live.bindings),
+                                // Static content pays nothing for motions
+                                // the layer does not carry.
+                                None if cl.motions.is_empty() => record_op(c, op),
                                 None => {
                                     match cl.motions.iter().find(|motion| motion.index == index) {
                                         Some(motion) => record_motion(c, op, motion),

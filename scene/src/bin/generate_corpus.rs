@@ -1114,6 +1114,53 @@ fn run() -> Result<(), SceneError> {
         });
     }
 
+    // Sharp (r = 0) corners on fractional pixel boundaries: the corner's
+    // pixel gets the exact intersection area of the two folded
+    // half-planes. Four axis-aligned rects put their corners at .25/.5/.75
+    // offsets; the last rect is rotated 30° so the same corner has an
+    // oblique gradient.
+    for (name, c0, c1, c2, c3, c4) in [
+        (
+            "fill-sharp-subpixel",
+            srgb(0.85, 0.25, 0.35),
+            srgb(0.2, 0.45, 0.85),
+            srgb(0.25, 0.6, 0.35),
+            srgb(0.75, 0.45, 0.15),
+            srgb(0.5, 0.25, 0.65),
+        ),
+        (
+            "fill-sharp-subpixel-p3",
+            p3(1.0, 0.0, 0.6),
+            p3(0.0, 0.4, 1.0),
+            p3(0.0, 0.9, 0.3),
+            p3(1.0, 0.5, 0.0),
+            p3(0.6, 0.0, 1.0),
+        ),
+        (
+            "fill-sharp-subpixel-hdr",
+            hdr(8.0, 0.0, 4.0),
+            hdr(0.0, 8.0, 16.0),
+            hdr(0.0, 10.0, 2.0),
+            hdr(12.0, 6.0, 0.0),
+            hdr(10.0, 0.0, 16.0),
+        ),
+    ] {
+        corpus.scene(name, 128, 128, white, |l| {
+            l.fill(Shape::rect(12.25, 12.5, 44.25, 44.5), solid(c0));
+            l.fill(Shape::rect(68.75, 16.25, 100.75, 48.25), solid(c1));
+            l.fill(Shape::rect(16.5, 76.75, 48.5, 108.75), solid(c2));
+            l.fill(Shape::rect(80.25, 68.5, 112.25, 100.5), solid(c3));
+            l.layer(|a| {
+                a.transform(
+                    Affine::translate((64.0, 64.0))
+                        * Affine::rotate(std::f64::consts::FRAC_PI_6)
+                        * Affine::translate((-64.0, -64.0)),
+                );
+                a.fill(Shape::rect(48.25, 48.5, 80.25, 80.5), solid(c4));
+            });
+        });
+    }
+
     corpus.scene("circle", 96, 96, white, |l| {
         l.fill(Shape::circle(48.0, 48.0, 36.0), solid(srgb(0.1, 0.3, 0.8)));
         l.fill(

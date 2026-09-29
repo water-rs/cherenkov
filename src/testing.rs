@@ -147,6 +147,7 @@ impl Backend for Null {
     }
 
     #[cfg(target_arch = "wasm32")]
+    #[allow(unknown_lints)]
     #[expect(
         clippy::unused_async_trait_impl,
         reason = "the wasm32 `Backend::init` is async because real backends await the browser; the null backend answers synchronously"
@@ -295,6 +296,7 @@ impl Renderer for NullRenderer {
     }
 
     #[cfg(target_arch = "wasm32")]
+    #[allow(unknown_lints)]
     #[expect(
         clippy::unused_async_trait_impl,
         reason = "the wasm32 `Renderer::render` is async because real backends await the browser; the null backend answers synchronously"
@@ -336,6 +338,7 @@ impl Renderer for NullRenderer {
     }
 
     #[cfg(target_arch = "wasm32")]
+    #[allow(unknown_lints)]
     #[expect(
         clippy::unused_async_trait_impl,
         reason = "the wasm32 `Renderer::readback` is async because real backends await the browser; the null backend answers synchronously"
@@ -372,6 +375,7 @@ impl ShaderPaint for Null {
     }
 
     #[cfg(target_arch = "wasm32")]
+    #[allow(unknown_lints)]
     #[expect(
         clippy::unused_async_trait_impl,
         reason = "the wasm32 `ShaderPaint::add_shader` is async because real backends await the browser; the null backend answers synchronously"

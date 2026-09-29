@@ -192,6 +192,13 @@ struct Entry {
 }
 
 impl Entry {
+    #[cfg_attr(
+        target_arch = "wasm32",
+        expect(
+            clippy::needless_pass_by_ref_mut,
+            reason = "wasm32 only reads the pre-prepared setup; native builds need &mut for lazy setup"
+        )
+    )]
     fn check_setup(
         &mut self,
         id: FilterKey,
@@ -485,6 +492,10 @@ impl Drop for Registry {
 
 #[cfg(target_arch = "wasm32")]
 impl Registry {
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
     pub(super) async fn prepare(
         &mut self,
         id: FilterKey,

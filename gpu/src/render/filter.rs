@@ -266,10 +266,22 @@ impl Registry {
         );
     }
 
-    pub fn remove(&mut self, id: FilterKey) {
-        if let Some(entry) = self.entries.remove(&id) {
-            entry.active.store(false, Ordering::Release);
-        }
+    /// Removes an entry; returns the GPU bytes its retired
+    /// input/output targets held (for the allocation diagnostic).
+    pub fn remove(&mut self, id: FilterKey) -> u64 {
+        let Some(entry) = self.entries.remove(&id) else {
+            return 0;
+        };
+        entry.active.store(false, Ordering::Release);
+        [entry.input, entry.output]
+            .into_iter()
+            .flatten()
+            .map(|(texture, _)| {
+                u64::from(texture.width())
+                    * u64::from(texture.height())
+                    * super::texel_bytes(texture.format())
+            })
+            .sum()
     }
 
     pub fn set_active(&self, uses: &HashSet<FilterKey>) {
@@ -282,6 +294,23 @@ impl Registry {
         self.entries
             .get(&id)
             .is_some_and(|entry| entry.again || entry.dirty.load(Ordering::Acquire))
+    }
+
+    /// Drops every entry's input/output targets — grow-only caches the
+    /// renderer releases explicitly outside the hot frame path (#169 A4).
+    /// Returns the freed bytes for diagnostics.
+    pub(super) fn trim(&mut self) -> u64 {
+        let mut bytes = 0;
+        for entry in self.entries.values_mut() {
+            for slot in [&mut entry.input, &mut entry.output] {
+                if let Some((texture, _)) = slot.take() {
+                    bytes += u64::from(texture.width())
+                        * u64::from(texture.height())
+                        * super::texel_bytes(texture.format());
+                }
+            }
+        }
+        bytes
     }
 
     pub fn gpu_bytes(&self) -> u64 {
@@ -309,6 +338,10 @@ impl Registry {
             .and_then(|entry| entry.effect.footprint_bound())
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one entry's wait, capacity check, target allocation and dispatch in sequence"
+    )]
     pub(super) fn apply(
         &mut self,
         id: FilterKey,
@@ -351,11 +384,19 @@ impl Registry {
         }
         let format = scratch.texture.format();
         entry.check_setup(id, context, format)?;
+        // `EffectInput::{width,height}` names the input texture's exact
+        // size, so unlike scratch a filter target resizes with its frame
+        // region — `trim` releases them outside the hot path (#169 A4).
         if entry
             .input
             .as_ref()
             .is_none_or(|(texture, _)| (texture.width(), texture.height()) != size)
         {
+            let old = entry.input.as_ref().map_or(0, |(texture, _)| {
+                u64::from(texture.width())
+                    * u64::from(texture.height())
+                    * super::texel_bytes(texture.format())
+            });
             entry.input = Some(super::create_target(
                 device,
                 "filter input",
@@ -370,6 +411,24 @@ impl Registry {
                 super::TARGET_USAGES,
                 format,
             ));
+            crate::diag::grow(
+                device,
+                "filter input",
+                crate::diag::Class::Target,
+                old,
+                u64::from(size.0) * u64::from(size.1) * super::texel_bytes(format),
+                0,
+                true,
+            );
+            crate::diag::grow(
+                device,
+                "filter output",
+                crate::diag::Class::Target,
+                old,
+                u64::from(size.0) * u64::from(size.1) * super::texel_bytes(format),
+                0,
+                true,
+            );
         }
         let (input_texture, input_view) = entry.input.as_ref().expect("input allocated");
         let (output_texture, output_view) = entry.output.as_ref().expect("output allocated");

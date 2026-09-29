@@ -148,6 +148,7 @@ impl Presenter {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        crate::diag::create(device, "present uniform", 16);
         Self {
             module,
             layout,
@@ -342,6 +343,7 @@ impl Presenter {
             pass.draw(0..3, 0..1);
         }
         queue.submit([encoder.finish()]);
+        crate::diag::submit(device, queue, "present");
     }
 }
 

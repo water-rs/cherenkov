@@ -26,12 +26,20 @@ const VERTEX_SHADER: &str = include_str!("../shaders/fullscreen.wgsl");
 
 /// One pass's pipeline and uniform block.
 #[derive(Debug)]
-struct GpuPass {
+pub(super) struct GpuPass {
     plan: PassPlan,
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
-    /// The uniform buffer and the words last written to it.
-    params: Option<(wgpu::Buffer, Vec<u32>)>,
+    /// Uniform buffers, keyed by the exact words they hold: a queue write
+    /// lands before the encoder submits, so two encodes of one effect in a
+    /// frame must not share a buffer. The third member is the frame
+    /// sequence that last bound the entry: a miss may rewrite only a
+    /// buffer no encode of the current sequence has bound — an earlier
+    /// sequence's encoder is submitted before the next sequence encodes,
+    /// the same assumption a bare `write_buffer` made. Capped; a recorded
+    /// bind group keeps its buffer alive, so evicting the oldest entry is
+    /// safe.
+    pub(super) params: Vec<(Vec<u32>, wgpu::Buffer, u64)>,
     uses_space: bool,
 }
 
@@ -62,9 +70,12 @@ impl Image {
 
 /// The intermediate slots for one input size.
 #[derive(Debug)]
-struct Intermediates {
-    size: (u32, u32),
-    views: Vec<wgpu::TextureView>,
+pub(super) struct Intermediates {
+    pub(super) size: (u32, u32),
+    /// The frame sequence that last encoded through these slots; a size
+    /// unused for a whole frame is dropped rather than retained.
+    pub(super) last_used: u64,
+    pub(super) views: Vec<wgpu::TextureView>,
 }
 
 /// Bindings every pass may read.
@@ -80,13 +91,15 @@ struct Shared {
 /// Everything setup produced for one device and pair of formats.
 #[derive(Debug)]
 pub(super) struct Gpu {
-    passes: Vec<GpuPass>,
+    pub(super) passes: Vec<GpuPass>,
     /// The intermediate slot pass `n` writes, for every pass but the last,
     /// which writes the output.
     slot_of: Vec<usize>,
     slot_count: usize,
     shared: Shared,
-    intermediates: Option<Intermediates>,
+    /// Intermediate slots per input size, capped; a frame can encode one
+    /// effect against several sizes (backdrop capture regions).
+    pub(super) intermediates: Vec<Intermediates>,
     input_format: wgpu::TextureFormat,
     output_format: wgpu::TextureFormat,
 }
@@ -207,7 +220,7 @@ impl Gpu {
                 space,
                 images,
             },
-            intermediates: None,
+            intermediates: Vec::new(),
             input_format: ctx.input_format,
             output_format: ctx.output_format,
         })
@@ -251,21 +264,48 @@ impl Gpu {
                 shape_view(input, shape)?;
             }
         }
-        if self
+        let sequence = input.timing.sequence();
+        // A used size is live this frame: mark it before stale sizes are
+        // dropped so steady state reuses its slots.
+        if let Some(index) = self
             .intermediates
-            .as_ref()
-            .is_none_or(|intermediates| intermediates.size != size)
+            .iter()
+            .position(|intermediates| intermediates.size == size)
         {
-            self.intermediates = Some(Intermediates::new(input.device, size, self.slot_count));
+            self.intermediates[index].last_used = sequence;
         }
+        // Keep every size this or the previous frame used: a frame that
+        // encodes several sizes would otherwise drop the sizes encoded
+        // before this call and reallocate them on the next frame.
+        self.intermediates
+            .retain(|intermediates| intermediates.last_used.saturating_add(1) >= sequence);
+        let intermediates_index = self
+            .intermediates
+            .iter()
+            .position(|intermediates| intermediates.size == size)
+            .unwrap_or_else(|| {
+                const MAX_INTERMEDIATE_SETS: usize = 4;
+                if self.intermediates.len() == MAX_INTERMEDIATE_SETS {
+                    self.intermediates.remove(0);
+                }
+                self.intermediates.push(Intermediates::new(
+                    input.device,
+                    size,
+                    self.slot_count,
+                    sequence,
+                ));
+                self.intermediates.len() - 1
+            });
 
-        let slots = &self.intermediates.as_ref().expect("created above").views;
+        let slots = &self.intermediates[intermediates_index].views;
         let slot_of = &self.slot_of;
         let last = self.passes.len() - 1;
         for (index, pass) in self.passes.iter_mut().enumerate() {
-            pass.write_params(input.queue, values, size);
+            let params = pass
+                .params_index(input.device, input.queue, values, size, sequence)
+                .map(|index| &pass.params[index].1);
 
-            let bind_group = pass.bind_group(index, input, &self.shared, slots, slot_of)?;
+            let bind_group = pass.bind_group(index, input, &self.shared, slots, slot_of, params)?;
 
             let target = if index == last {
                 &output.view
@@ -356,26 +396,18 @@ impl GpuPass {
             });
         }
 
-        let params = (plan.segment.uniform.size > 0).then(|| {
-            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("filtrate pass parameters"),
-                size: u64::from(plan.segment.uniform.size),
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            (buffer, Vec::new())
-        });
         let uses_space = plan.segment.args.contains(&SegmentArg::WorkingSpace);
         Ok(Self {
             plan,
             pipeline,
             layout,
-            params,
+            params: Vec::new(),
             uses_space,
         })
     }
 
-    /// Binds the pass's inputs for one frame.
+    /// Binds the pass's inputs for one frame. `params` is the uniform
+    /// buffer `params_buffer` selected for this encode.
     fn bind_group(
         &self,
         index: usize,
@@ -383,6 +415,7 @@ impl GpuPass {
         shared: &Shared,
         slots: &[wgpu::TextureView],
         slot_of: &[usize],
+        params: Option<&wgpu::Buffer>,
     ) -> Result<wgpu::BindGroup, EffectRenderError> {
         let mut entries = alloc::vec![wgpu::BindGroupEntry {
             binding: binding::INPUT,
@@ -397,7 +430,7 @@ impl GpuPass {
                 }),
             });
         }
-        if let Some((buffer, _)) = &self.params {
+        if let Some(buffer) = params {
             entries.push(wgpu::BindGroupEntry {
                 binding: binding::PARAMS,
                 resource: buffer.as_entire_binding(),
@@ -432,17 +465,27 @@ impl GpuPass {
         }))
     }
 
-    /// Writes the pass's uniform block from `values` when it changed.
-    /// `size` is the pass input's extent in pixels — the `size` member of a
-    /// spatial segment's block.
+    /// The uniform buffer holding this encode's `values` and `size` — the
+    /// `size` member of a spatial segment's block. Cached by exact words so
+    /// two encodes in one frame keep independent parameters (a queue write
+    /// would land before the encoder submits and leak into both passes).
+    /// `None` when the segment has no uniform block.
     #[expect(
         clippy::cast_precision_loss,
         reason = "image extents fit f32 exactly (well below 2^24 pixels)"
     )]
-    fn write_params(&mut self, queue: &wgpu::Queue, values: &[f32], size: (u32, u32)) {
-        let Some((buffer, last)) = &mut self.params else {
-            return;
-        };
+    fn params_index(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        values: &[f32],
+        size: (u32, u32),
+        sequence: u64,
+    ) -> Option<usize> {
+        const MAX_PARAM_BUFFERS: usize = 16;
+        if self.plan.segment.uniform.size == 0 {
+            return None;
+        }
         let mut words = alloc::vec![0u32; self.plan.segment.uniform.size as usize / 4];
         if let Some(offset) = self.plan.segment.uniform.input_size {
             let first = offset as usize / 4;
@@ -455,10 +498,46 @@ impl GpuPass {
                 words[first + component] = values[slot.param + component].to_bits();
             }
         }
-        if *last != words {
-            queue.write_buffer(buffer, 0, bytemuck::cast_slice(&words));
-            *last = words;
+        if let Some(index) = self
+            .params
+            .iter()
+            .position(|(cached, _, _)| *cached == words)
+        {
+            self.params[index].2 = sequence;
+            return Some(index);
         }
+        // A miss may rewrite a buffer no encode of this sequence has
+        // bound: the stalest one.
+        if let Some((index, _)) = self
+            .params
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, _, last_used))| *last_used < sequence)
+            .min_by_key(|(_, (_, _, last_used))| *last_used)
+        {
+            let entry = &mut self.params[index];
+            queue.write_buffer(&entry.1, 0, bytemuck::cast_slice(&words));
+            entry.0 = words;
+            entry.2 = sequence;
+            return Some(index);
+        }
+        if self.params.len() == MAX_PARAM_BUFFERS {
+            self.params.remove(0);
+        }
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("filtrate pass parameters"),
+            size: u64::from(self.plan.segment.uniform.size),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: true,
+        });
+        buffer
+            .slice(..)
+            .get_mapped_range_mut()
+            .expect("buffer range is mapped and not overlapping")
+            .copy_from_slice(bytemuck::cast_slice(&words));
+        buffer.unmap();
+        self.params.push((words, buffer, sequence));
+        Some(self.params.len() - 1)
     }
 }
 
@@ -561,9 +640,10 @@ fn assign_slots(passes: &[PassPlan]) -> (Vec<usize>, usize) {
 }
 
 impl Intermediates {
-    fn new(device: &wgpu::Device, size: (u32, u32), count: usize) -> Self {
+    fn new(device: &wgpu::Device, size: (u32, u32), count: usize, last_used: u64) -> Self {
         Self {
             size,
+            last_used,
             views: (0..count)
                 .map(|_| {
                     intermediate_texture(device, size)

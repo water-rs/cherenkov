@@ -573,6 +573,13 @@ impl RetainedInstance {
 /// Per-operation device output under its sampled placement.
 pub struct Emission {
     pub(crate) pending_cells: Vec<(u32, u32, u32)>,
+    /// `(live key, epoch)` of every atlas admission the retained
+    /// instances sample — re-verified whenever the atlas's eviction
+    /// clock moved, so a reclaimed cell re-lowers instead of sampling
+    /// stale texels (#119).
+    pub(crate) refs: Vec<(u64, u64)>,
+    /// The atlas eviction clock at last verification.
+    pub(crate) clock: u64,
     template: usize,
     // Only shadows carry an occlusion key; ordinary leaves keep a small index.
     cover: Option<usize>,
@@ -582,6 +589,27 @@ pub struct Emission {
     pub(crate) instances: Range<usize>,
     stops: Range<usize>,
     image: Option<ImageSource>,
+}
+
+impl Emission {
+    /// Whether every atlas cell the retained UVs reference is still the
+    /// same admission. Between commits that evicted nothing the stored
+    /// `clock` short-circuits the walk; after an eviction each ref's
+    /// epoch must still match — a re-admitted entry never does.
+    fn atlas_live(&mut self, atlas: &Atlas) -> bool {
+        if self.clock == atlas.clock() {
+            return true;
+        }
+        if self
+            .refs
+            .iter()
+            .all(|&(key, epoch)| atlas.live_epoch(key) == Some(epoch))
+        {
+            self.clock = atlas.clock();
+            return true;
+        }
+        false
+    }
 }
 
 /// GPU resources the lowering needs to emit glyph instances.
@@ -621,6 +649,9 @@ pub struct Lowered {
     pub cell_patches: Vec<(u32, u32, u32)>,
     /// `uv.zw` patches: `(instance, pending index)`.
     pub mask_patches: Vec<(u32, u32)>,
+    /// Shelves the lowering's cache hits live on — the commit marks
+    /// them before planning so no placement evicts them (#119).
+    pub touches: Vec<u32>,
 }
 
 /// What the renderer knows about one backdrop group this frame.
@@ -774,6 +805,11 @@ pub struct Lowering<'a> {
     /// `(instance, pending)` pairs whose `uv.zw` are set when the render
     /// thread stores the pending clip mask.
     pub(crate) mask_patches: Vec<(u32, u32)>,
+    /// `(live key, epoch)` references the next emission's retained
+    /// instances depend on; `realize_leaf` moves the tail into it.
+    pub(crate) refs: Vec<(u64, u64)>,
+    /// Shelves hit since the last reset, for the commit's pin marks.
+    pub(crate) touches: Vec<u32>,
     /// The open range's bound mask texture key; `None` for the dummy view.
     /// Kept in sync with `clip` by `set_clip`.
     mask_key: Option<u64>,
@@ -827,6 +863,8 @@ impl<'a> Lowering<'a> {
             paths: 0,
             cell_patches: Vec::new(),
             mask_patches: Vec::new(),
+            refs: Vec::new(),
+            touches: Vec::new(),
             pending: Vec::new(),
             commands_lowered: 0,
             layers_composed: 0,
@@ -2285,14 +2323,24 @@ impl<'a> Lowering<'a> {
     ) -> Result<bool, RenderError> {
         let cover = self.shadow_cover(op, next);
         let hit = cache.valid
-            && cache.data.as_ref().is_some_and(|e| {
+            && cache.data.as_mut().is_some_and(|e| {
                 e.cover.map(|index| storage.covers[index]) == cover
                     && e.transform == self.transform
                     && e.size.map(f32::to_bits) == [self.width, self.height].map(f32::to_bits)
                     && e.generation == glyphs.atlas.generation()
+                    && e.atlas_live(glyphs.atlas)
             });
         cache.valid = true;
         if hit {
+            if let Some(e) = cache.data.as_ref() {
+                // Pin the shelves the retained instances sample so this
+                // commit cannot evict them (#119).
+                for &(key, _) in &e.refs {
+                    if let Some(slots) = glyphs.atlas.slots_of(key) {
+                        self.touches.extend_from_slice(slots);
+                    }
+                }
+            }
             self.compose(
                 cache.data.as_ref().expect("a hit has data"),
                 storage,
@@ -2351,6 +2399,7 @@ impl<'a> Lowering<'a> {
         let first_instance = self.frame.instances.len();
         let first_stop = self.frame.stops.len();
         let first_patch = self.cell_patches.len();
+        let first_ref = self.refs.len();
         // `realize` composes path and glyph ops' local transforms into
         // `self.transform`; the leaf's placement is restored with the clip.
         let transform = self.transform;
@@ -2394,6 +2443,8 @@ impl<'a> Lowering<'a> {
                 .iter()
                 .map(|&(i, p, c)| (i - instance_base, p, c))
                 .collect(),
+            refs: self.refs.drain(first_ref..).collect(),
+            clock: glyphs.atlas.clock(),
             template,
             cover: cover.map(|cover| {
                 storage.covers.push(cover);
@@ -3015,11 +3066,26 @@ impl<'a> Lowering<'a> {
         } else {
             (None, None)
         };
-        if let Some(emit) = glyphs
+        let hit = glyphs
             .atlas
             .path(pl.key)
-            .or_else(|| glyphs.atlas.path(pl.key_exact()))
-        {
+            .map(|emit| (pl.key, emit))
+            .or_else(|| {
+                glyphs
+                    .atlas
+                    .path(pl.key_exact())
+                    .map(|emit| (pl.key_exact(), emit))
+            });
+        if let Some((key, emit)) = hit {
+            // Pin the shelves the emission's cells live on and reference
+            // the admission, so an eviction between lowers re-lowers the
+            // leaf instead of sampling stale texels (#119).
+            self.touches.extend(emit.cells.iter().map(|c| c.slot));
+            let epoch = glyphs
+                .atlas
+                .live_epoch(key)
+                .expect("a path hit is a live admission");
+            self.refs.push((key, epoch));
             self.replay(emit, None, pl.offset, paint, shader_data.as_ref());
             return Ok(());
         }
@@ -3169,6 +3235,10 @@ impl<'a> Lowering<'a> {
                 .mask(pl.key)
                 .or_else(|| glyphs.atlas.mask(pl.key_exact()))
             {
+                // The mask is re-read through `apply_clip` each frame;
+                // the touch keeps its shelf live, no reference needed
+                // (#119).
+                self.touches.push(mask.slot);
                 break 'stored ClipMask::Cell(*mask);
             }
             if let Some(mask) = glyphs
@@ -3209,6 +3279,7 @@ impl<'a> Lowering<'a> {
                 pl.key
             };
             if let Some(mask) = glyphs.atlas.mask(key) {
+                self.touches.push(mask.slot);
                 break 'stored ClipMask::Cell(*mask);
             }
             if let Some(mask) = glyphs.atlas.mask_texture(key) {
@@ -3229,6 +3300,8 @@ impl<'a> Lowering<'a> {
                     f32_f64(coverage.x + f64::from(w) - pl.offset.x),
                     f32_f64(coverage.y + f64::from(h) - pl.offset.y),
                 ],
+                // Filled by `Atlas::place_mask` on the render thread.
+                slot: 0,
             };
             if glyphs.atlas.mask_in_atlas(w, h) {
                 let pending = u32::try_from(self.pending.len()).expect("pending count fits u32");
@@ -3290,10 +3363,11 @@ impl<'a> Lowering<'a> {
             let x = origin.x.floor();
             let y = origin.y.floor();
             let fraction = (f32_f64(origin.x - x), f32_f64(origin.y - y));
+            let key = key.at(glyph.id, fraction);
             let (entry, pending) = glyph::entry(
                 glyphs.atlas,
                 font,
-                key.at(glyph.id, fraction),
+                key,
                 glyph.id,
                 run.size,
                 fraction,
@@ -3304,6 +3378,12 @@ impl<'a> Lowering<'a> {
             self.glyphs += u32::from(pending.is_some());
             if entry.w == 0 || entry.h == 0 {
                 continue;
+            }
+            if pending.is_none() {
+                // Pin the shelf and reference the admission so an
+                // eviction re-lowers the leaf (#119).
+                self.touches.push(entry.slot);
+                self.refs.push((glyph::live_hash(&key), entry.epoch));
             }
             let rect = Rect::from_origin_size(
                 (x + f64::from(entry.left), y + f64::from(entry.top)),
@@ -3383,6 +3463,10 @@ impl<'a> Lowering<'a> {
             self.glyphs += u32::from(pending.is_some());
             if entry.w == 0 || entry.h == 0 {
                 continue;
+            }
+            if pending.is_none() {
+                self.touches.push(entry.slot);
+                self.refs.push((glyph::live_hash(&key), entry.epoch));
             }
             let mut inst = *template.get_or_insert_with(|| {
                 let mut inst = self.base(KIND_GLYPH, affine(self.transform));

@@ -441,13 +441,13 @@ enum Commit {
     Done,
     /// Grow the atlas once to this edge and re-lower.
     Grow(u32),
-    /// Clear the atlas and re-lower; the next plan verdict is final.
-    Recycle,
 }
 
 enum PendingOrigin {
-    /// Cell origins: one for a glyph, one per cell for a path emission.
-    Cells(Vec<(u32, u32)>),
+    /// Cell origins — one for a glyph, one per cell for a path
+    /// emission — and the live key they were admitted under, so
+    /// patched emissions can reference the admission (#119).
+    Cells(Vec<(u32, u32)>, u64),
     /// A clip mask's cell origin.
     Mask([f32; 2]),
     /// A COLR cache insert; no instance patch.
@@ -3194,7 +3194,6 @@ impl GpuRenderer {
         pending: &mut [SurfaceState],
         frames: &[&SurfaceFrame<'_>],
     ) -> Vec<Result<Lowered, RenderError>> {
-        let mut cleared = false;
         let mut grew = false;
         loop {
             let group_maps: Vec<FxHashMap<u64, BackdropGroupInfo>> = pending
@@ -3255,7 +3254,7 @@ impl GpuRenderer {
             // before any placement or upload happens, so a failed
             // placement never enqueues uploads into an atlas the same
             // preparation abandons.
-            match self.commit_rasters(pending, &mut results, cleared, grew) {
+            match self.commit_rasters(pending, &mut results, grew) {
                 Commit::Done => break results,
                 Commit::Grow(size) => {
                     self.atlas.grow_to(&self.device, size);
@@ -3266,15 +3265,9 @@ impl GpuRenderer {
                         "atlas grown"
                     );
                 }
-                Commit::Recycle => {
-                    self.atlas.clear();
-                    cleared = true;
-                    tracing::debug!(size = self.atlas.size(), "atlas cleared");
-                }
             }
-            // Growing or clearing emptied the atlas: every hit any
-            // lowering took is now a miss, so lower the whole batch
-            // again.
+            // Growing emptied the atlas: every hit any lowering took is
+            // now a miss, so lower the whole batch again.
             diag::event(
                 &self.device,
                 diag::EventKind::Phase {
@@ -3290,7 +3283,6 @@ impl GpuRenderer {
         pending: &mut [SurfaceState],
         frames: &[&SurfaceFrame<'_>],
     ) -> Vec<Result<Lowered, RenderError>> {
-        let mut cleared = false;
         let mut grew = false;
         loop {
             let group_maps: Vec<FxHashMap<u64, BackdropGroupInfo>> = pending
@@ -3318,7 +3310,7 @@ impl GpuRenderer {
             // before any placement or upload happens, so a failed
             // placement never enqueues uploads into an atlas the same
             // preparation abandons.
-            match self.commit_rasters(pending, &mut results, cleared, grew) {
+            match self.commit_rasters(pending, &mut results, grew) {
                 Commit::Done => break results,
                 Commit::Grow(size) => {
                     self.atlas.grow_to(&self.device, size);
@@ -3329,15 +3321,9 @@ impl GpuRenderer {
                         "atlas grown"
                     );
                 }
-                Commit::Recycle => {
-                    self.atlas.clear();
-                    cleared = true;
-                    tracing::debug!(size = self.atlas.size(), "atlas cleared");
-                }
             }
-            // Growing or clearing emptied the atlas: every hit any
-            // lowering took is now a miss, so lower the whole batch
-            // again.
+            // Growing emptied the atlas: every hit any lowering took is
+            // now a miss, so lower the whole batch again.
             diag::event(
                 &self.device,
                 diag::EventKind::Phase {
@@ -3379,6 +3365,7 @@ impl GpuRenderer {
             lowered.cell_patches = std::mem::take(&mut lowering.cell_patches);
             lowered.mask_patches = std::mem::take(&mut lowering.mask_patches);
             lowered.pending = std::mem::take(&mut lowering.pending);
+            lowered.touches = std::mem::take(&mut lowering.touches);
             result
         };
         surf.layers = layers;
@@ -3425,36 +3412,51 @@ impl GpuRenderer {
     }
 
     /// Commits every surface's pending rasters transactionally
-    /// (#169 A3). First [`Atlas::plan`] dry-runs all placements
-    /// against shelf metadata alone; only a `Fits` verdict — or the
-    /// last attempt after recycling — commits for real. The upload
-    /// then batches the committed cells into one `write_texture` per
-    /// newly allocated shelf region.
+    /// (#169 A3). The shelves this lowering's hits live on are marked
+    /// first so no placement can evict them; [`Atlas::plan`] then
+    /// dry-runs all placements against shelf metadata alone; only a
+    /// `Fits` verdict — or the last attempt after a grow — commits for
+    /// real. When even an emptied atlas cannot hold the batch the
+    /// commit runs evicting instead of clearing: cold shelves are
+    /// reclaimed in place, so surviving entries — and the retained
+    /// emissions referencing them — stay valid (#119). The upload
+    /// batches the committed cells into one `write_texture` per newly
+    /// allocated shelf region.
     fn commit_rasters(
         &mut self,
         pending: &mut [SurfaceState],
         results: &mut [Result<Lowered, RenderError>],
-        cleared: bool,
         grew: bool,
     ) -> Commit {
+        let touches: Vec<u32> = results
+            .iter()
+            .filter_map(|r| r.as_ref().ok())
+            .flat_map(|l| l.touches.iter().copied())
+            .collect();
+        self.atlas.begin_commit(&touches);
         let rasters: Vec<&glyph::PendingRaster> = results
             .iter()
             .filter_map(|r| r.as_ref().ok())
             .flat_map(|l| l.pending.iter())
             .collect();
-        match self.atlas.plan(&rasters) {
-            glyph::AtlasPlan::Fits => {}
+        let n_cells: usize = rasters.iter().map(|r| r.cell_count()).sum();
+        let plan_dbg = match self.atlas.plan(&rasters) {
+            glyph::AtlasPlan::Fits => "fits",
             glyph::AtlasPlan::Grow(size) if !grew => return Commit::Grow(size),
-            glyph::AtlasPlan::Grow(_) | glyph::AtlasPlan::Recycle => {
-                if !cleared {
-                    return Commit::Recycle;
-                }
-                // Final attempt on the emptied atlas: commit the
-                // fitting prefix and exhaust the first surface whose
-                // raster does not place.
+            glyph::AtlasPlan::FitsEviction => {
+                self.atlas.enable_evicting();
+                "fits-eviction"
             }
-        }
-        let bounds = self.atlas.shelf_bounds();
+            glyph::AtlasPlan::Grow(_) | glyph::AtlasPlan::Recycle => {
+                // Bounded in-place eviction makes room instead of a
+                // wholesale clear: the commit below reclaims shelves
+                // nothing touched until the batch places or nothing
+                // untouchable remains, then exhausts the first surface
+                // whose raster still does not fit (#119).
+                self.atlas.enable_evicting();
+                "exhaust-candidate"
+            }
+        };
         let mut writes = std::mem::take(&mut self.commit_writes);
         writes.clear();
         for (surf, result) in pending.iter_mut().zip(results.iter_mut()) {
@@ -3473,8 +3475,30 @@ impl GpuRenderer {
                 }
             }
         }
+        let evicted = self.atlas.take_evicted();
+        tracing::debug!(
+            evictions = evicted.len(),
+            evicted_bytes = evicted.iter().map(|e| e.0).sum::<u64>(),
+            plan = ?plan_dbg,
+            pending_cells = n_cells,
+            touches = touches.len(),
+            occupancy = ?self.atlas.occupancy(),
+            "atlas commit"
+        );
+        for (bytes, used_in_latest_submit) in evicted {
+            diag::retire(
+                &self.device,
+                diag::RetireArgs {
+                    label: "glyph atlas",
+                    class: diag::Class::Atlas,
+                    bytes,
+                    used_in_latest_submit,
+                    reason: "atlas evict",
+                },
+            );
+        }
         self.atlas
-            .upload_committed(&self.device, &self.queue, &bounds, &writes);
+            .upload_committed(&self.device, &self.queue, &writes);
         self.commit_writes = writes;
         Commit::Done
     }
@@ -3496,7 +3520,7 @@ impl GpuRenderer {
             origins.push(self.apply_raster(raster, writes)?);
         }
         let cell_origin = |p: u32, c: u32| {
-            let PendingOrigin::Cells(cells) = &origins[p as usize] else {
+            let PendingOrigin::Cells(cells, _) = &origins[p as usize] else {
                 unreachable!("cell patch must reference cell raster");
             };
             let (x, y) = cells[c as usize];
@@ -3509,9 +3533,32 @@ impl GpuRenderer {
         for content in surf.layers.values_mut() {
             let (_, emissions) = content.retained.prepared();
             for emission in emissions.iter_mut().filter_map(|e| e.data.as_mut()) {
+                // The cells this frame's patches resolved to are the
+                // emission's atlas references; dedupe by live key so a
+                // path's cells append one entry, not one per cell.
+                let mut keys: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::default();
                 for (inst, p, c) in emission.pending_cells.drain(..) {
                     content.storage.instances[emission.instances.start + inst as usize].uv[..2]
                         .copy_from_slice(&cell_origin(p, c));
+                    if let PendingOrigin::Cells(_, key) = &origins[p as usize] {
+                        keys.insert(*key);
+                    }
+                }
+                for key in keys {
+                    if let Some(epoch) = self.atlas.live_epoch(key) {
+                        emission.refs.push((key, epoch));
+                    }
+                }
+                // Restamp only when every reference survived this
+                // commit's evictions; a stale emission must keep an
+                // older clock so its next hit check walks the refs
+                // and re-lowers (#119).
+                if emission
+                    .refs
+                    .iter()
+                    .all(|&(k, ep)| self.atlas.live_epoch(k) == Some(ep))
+                {
+                    emission.clock = self.atlas.clock();
                 }
             }
         }
@@ -3540,10 +3587,11 @@ impl GpuRenderer {
                 texels,
             } => {
                 let hit = self.atlas.get(&key).is_some();
+                let hk = glyph::live_hash(&key);
                 let out = self
                     .atlas
                     .place_glyph(key, left, top, w, h, texels, writes)
-                    .map(|(x, y)| PendingOrigin::Cells(vec![(x, y)]))
+                    .map(|(x, y)| PendingOrigin::Cells(vec![(x, y)], hk))
                     .ok_or(RenderError::AtlasFull)?;
                 if !hit && w == 0 {
                     diag::atlas_cell(&self.device, (0, 0, 0, 0));
@@ -3556,6 +3604,7 @@ impl GpuRenderer {
                     .ok_or(RenderError::AtlasFull)?;
                 Ok(PendingOrigin::Cells(
                     self.atlas.path_origins(key).expect("just stored"),
+                    key,
                 ))
             }
             PendingRaster::Mask {

@@ -1,7 +1,7 @@
 //! The glyph atlas and glyph-run lowering.
 
 use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
@@ -122,6 +122,11 @@ pub struct Entry {
     pub left: i32,
     /// Offset of the cell's top edge from the glyph's integer device origin.
     pub top: i32,
+    /// Shelf the cell lives on, for [`Atlas::begin_commit`] touches.
+    pub slot: u32,
+    /// Admission epoch — the live-map value at store time. A lookup whose
+    /// entry was evicted and re-admitted fails this comparison.
+    pub epoch: u64,
 }
 
 /// One atlas cell emitted by the path rasterizer: a device-space quad
@@ -134,6 +139,8 @@ pub struct PathCell {
     pub x: u16,
     /// Atlas texel origin.
     pub y: u16,
+    /// Shelf the cell lives on, for [`Atlas::begin_commit`] touches.
+    pub slot: u32,
 }
 
 /// What a cached path draw replays: full-coverage spans and atlas cells,
@@ -144,6 +151,8 @@ pub struct PathEmit {
     pub spans: Vec<[f32; 4]>,
     /// Partial-coverage atlas cells.
     pub cells: Vec<PathCell>,
+    /// Admission epoch — the live-map value at store time.
+    pub epoch: u64,
 }
 
 impl PathEmit {
@@ -172,8 +181,10 @@ impl PathEmit {
                     rect: shift(c.rect).map(|v| v as f32),
                     x: c.x,
                     y: c.y,
+                    slot: c.slot,
                 })
                 .collect(),
+            epoch: self.epoch,
         }
     }
 }
@@ -190,6 +201,8 @@ pub struct MaskCell {
     /// The mask's device-space bounding rect `(x0, y0, x1, y1)` — the
     /// clip's analytic shape shrinks to it.
     pub rect: [f32; 4],
+    /// Shelf the cell lives on, for [`Atlas::begin_commit`] touches.
+    pub slot: u32,
 }
 
 impl MaskCell {
@@ -211,6 +224,7 @@ impl MaskCell {
                 (f64::from(self.rect[2]) + dx) as f32,
                 (f64::from(self.rect[3]) + dy) as f32,
             ],
+            slot: self.slot,
         }
     }
 }
@@ -229,12 +243,63 @@ struct MaskTexture {
     bytes: u64,
 }
 
-/// One shelf of the packer: a row of cells sharing a height class.
+/// One shelf of the packer: a row of cells sharing a height class. A
+/// shelf is also the eviction slot: reclaiming frees the whole row.
 #[derive(Clone)]
 struct Shelf {
     y: u32,
     h: u32,
     x: u32,
+    /// `x` at the start of the current commit — the upload region's left
+    /// edge; `0` for a shelf opened or reclaimed inside the commit.
+    base: u32,
+    /// Commit ordinal of the last hit or allocation (`Atlas::tick`).
+    last_used: u64,
+    /// Commits this shelf has served since its (re)admission; `0` marks
+    /// the probationary segment of the eviction order.
+    hits: u32,
+    /// A dead shelf's band sits in `vacant` until reclaimed.
+    live: bool,
+}
+
+/// The shelf layout plus reclaim bookkeeping — the part of [`Atlas`] a
+/// plan dry-run clones to simulate placements without touching the
+/// live caches.
+#[derive(Clone)]
+struct Layout {
+    shelves: Vec<Shelf>,
+    /// Dead shelf indices, their bands reclaimable by a same-or-smaller
+    /// height class.
+    vacant: Vec<u32>,
+    /// Virgin-space watermark: bands are laid consecutively from y = 0.
+    top: u32,
+}
+
+/// Approximate per-admission CPU bookkeeping the live map, slot keys and
+/// the wider [`Entry`] add — folded into `cpu_bytes` so the cache pays
+/// for the retained structure it needs (#119).
+const LIVE_ENTRY_BYTES: u64 = 120;
+
+/// A live admission's bookkeeping: which cache map holds the entry and,
+/// for glyphs, the full key needed to remove it.
+struct LiveEntry {
+    /// Admission token, unique per insert. Stale references carry an
+    /// older epoch and fail the lookup.
+    epoch: u64,
+    /// The shelves the admission's cells occupy, for the commit's pin
+    /// marks on a lowering hit.
+    slots: Box<[u32]>,
+    kind: LiveKind,
+}
+
+/// Which cache a live key indexes.
+enum LiveKind {
+    /// `map`, keyed by the full `GlyphKey`.
+    Glyph(GlyphKey),
+    /// `paths`, keyed by the live key itself.
+    Path,
+    /// `masks`, keyed by the live key itself.
+    Mask,
 }
 
 /// The `R8Unorm` coverage atlas.
@@ -247,7 +312,27 @@ pub struct Atlas {
     /// Bumped whenever the texture is recreated, so stale bind groups are
     /// rebuilt.
     generation: u64,
-    shelves: Vec<Shelf>,
+    /// Cell placement: live and dead shelves plus the virgin watermark.
+    layout: Layout,
+    /// Live-key hashes per shelf, parallel to `layout.shelves`: the keys
+    /// an eviction of that shelf must drop from the caches.
+    slot_keys: Vec<rustc_hash::FxHashSet<u64>>,
+    /// Admission epochs by live key — the oracle retained emissions check
+    /// their baked UVs against, and the index evictions clean through.
+    live: rustc_hash::FxHashMap<u64, LiveEntry>,
+    /// Next admission epoch; monotonic so a re-admitted key never matches
+    /// a reference taken before its eviction.
+    next_epoch: u64,
+    /// Eviction counter; bumped per reclaimed shelf so emissions check
+    /// their references once per evicting commit, not once per hit.
+    clock: u64,
+    /// Commit ordinal; marks `last_used` for pins and the eviction order.
+    tick: u64,
+    /// Whether `alloc` may evict cold shelves: set for the commit of a
+    /// batch that did not fit (`AtlasPlan::Recycle`), off otherwise.
+    evicting: bool,
+    /// Bytes evicted this commit, drained by the caller for diagnostics.
+    evicted: Vec<(u64, bool)>,
     map: rustc_hash::FxHashMap<GlyphKey, Entry>,
     /// Rasterized path emissions, keyed by content hash.
     paths: rustc_hash::FxHashMap<u64, PathEmit>,
@@ -309,7 +394,18 @@ impl Atlas {
             size: ATLAS_START,
             cap,
             generation: 0,
-            shelves: Vec::new(),
+            layout: Layout {
+                shelves: Vec::new(),
+                vacant: Vec::new(),
+                top: 0,
+            },
+            slot_keys: Vec::new(),
+            live: rustc_hash::FxHashMap::default(),
+            next_epoch: 0,
+            clock: 0,
+            tick: 0,
+            evicting: false,
+            evicted: Vec::new(),
             map: rustc_hash::FxHashMap::default(),
             paths: rustc_hash::FxHashMap::default(),
             masks: rustc_hash::FxHashMap::default(),
@@ -371,15 +467,25 @@ impl Atlas {
     }
 
     /// Drops every cached glyph of `font`. The freed texels stay claimed
-    /// in the shelf layout until the next [`Self::grow`] or
-    /// [`Self::clear`]; path and mask cells are font-independent and stay.
+    /// in the shelf layout until eviction or a grow reclaims them; path
+    /// and mask cells are font-independent and stay.
     pub fn remove_font(&mut self, font: u64) {
-        let freed: u64 = self
+        let dropped: Vec<(u64, u64, usize)> = self
             .map
             .extract_if(|key, _| key.font == font)
-            .map(|(_, entry)| u64::from(entry.w) * u64::from(entry.h))
-            .sum();
-        self.cpu_bytes = self.cpu_bytes.saturating_sub(freed);
+            .map(|(key, entry)| {
+                (
+                    live_hash(&key),
+                    u64::from(entry.w) * u64::from(entry.h),
+                    usize::try_from(entry.slot).expect("shelf count fits usize"),
+                )
+            })
+            .collect();
+        for (hk, bytes, slot) in dropped {
+            self.live.remove(&hk);
+            self.slot_keys[slot].remove(&hk);
+            self.cpu_bytes = self.cpu_bytes.saturating_sub(bytes + LIVE_ENTRY_BYTES);
+        }
     }
 
     /// Clears every entry without freeing the texture.
@@ -391,7 +497,13 @@ impl Atlas {
         self.map.clear();
         self.paths.clear();
         self.masks.clear();
-        self.shelves.clear();
+        self.layout.shelves.clear();
+        self.layout.vacant.clear();
+        self.layout.top = 0;
+        self.slot_keys.clear();
+        self.live.clear();
+        self.evicting = false;
+        self.evicted.clear();
         self.cpu_bytes = 0;
     }
 
@@ -402,7 +514,7 @@ impl Atlas {
 
     /// Caches a path emission.
     pub fn insert_path(&mut self, key: u64, emit: PathEmit) {
-        self.cpu_bytes += (emit.spans.len() * 16 + emit.cells.len() * 24) as u64;
+        self.cpu_bytes += (emit.spans.len() * 16 + emit.cells.len() * 24) as u64 + LIVE_ENTRY_BYTES;
         self.paths.insert(key, emit);
     }
 
@@ -418,33 +530,26 @@ impl Atlas {
         reason = "cell sizes are small positive floats"
     )]
     pub fn insert_mask(&mut self, key: u64, mask: MaskCell) {
-        self.cpu_bytes += (mask.size[0] * mask.size[1]) as u64;
+        self.cpu_bytes += (mask.size[0] * mask.size[1]) as u64 + LIVE_ENTRY_BYTES;
         self.masks.insert(key, mask);
-    }
-
-    /// Per-shelf write cursors ahead of a commit batch;
-    /// [`Self::upload_committed`] diffs them against the final shelves
-    /// to find each contiguous newly allocated region.
-    pub fn shelf_bounds(&self) -> Vec<u32> {
-        self.shelves.iter().map(|s| s.x).collect()
     }
 
     /// Uploads one commit batch: a single `write_texture` per
     /// contiguous newly allocated shelf region. Cells between the new
     /// ones keep their old texels — the regions cover only newly
     /// claimed spans — and no full-size CPU shadow of the atlas is
-    /// kept to assemble them (#169 A3).
+    /// kept to assemble them (#169 A3). Each shelf's `base` marks where
+    /// the commit started writing.
     pub fn upload_committed(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        bounds: &[u32],
         cells: &[CellWrite],
     ) {
         if cells.is_empty() {
             return;
         }
-        let n = self.shelves.len();
+        let n = self.layout.shelves.len();
         self.bucket_counts.clear();
         self.bucket_counts.resize(n, 0);
         for cell in cells {
@@ -464,9 +569,9 @@ impl Atlas {
                 u32::try_from(idx).expect("upload batch fits u32");
             self.bucket_next[slot] += 1;
         }
-        for (i, shelf) in self.shelves.iter().enumerate() {
-            let x0 = bounds.get(i).copied().unwrap_or(0);
-            if x0 >= shelf.x {
+        for (i, shelf) in self.layout.shelves.iter().enumerate() {
+            let x0 = shelf.base;
+            if !shelf.live || x0 >= shelf.x {
                 continue;
             }
             let (w, h) = (shelf.x - x0, shelf.h);
@@ -535,31 +640,53 @@ impl Atlas {
     }
 
     /// The placement decision a pending batch's dry run supports
-    /// (#169 A3): whether the live shelves take every cell, or the
-    /// atlas must grow once to a target edge, or be recycled empty.
+    /// (#169 A3): whether the shelves take every cell as-is, or bounded
+    /// eviction of untouched shelves places them (#119), or the atlas
+    /// must grow once to a target edge, or the batch exceeds even the
+    /// emptied atlas. The dry run simulates the same eviction the
+    /// commit applies, so a `FitsEviction` verdict guarantees the
+    /// evicting commit succeeds and `Grow` means the batch genuinely
+    /// needs more texels than the atlas holds.
     pub fn plan(&mut self, rasters: &[&PendingRaster]) -> AtlasPlan {
         self.batch_cells(rasters);
-        let mut shelves = self.shelves.clone();
-        if self
-            .plan_cells
-            .iter()
-            .all(|&(w, h)| alloc_on(&mut shelves, self.size, w, h).is_some())
-        {
-            return AtlasPlan::Fits;
+        let mut probe = self.layout.clone();
+        let mut evicted = false;
+        let fits = self.plan_cells.iter().all(|&(w, h)| {
+            loop {
+                if alloc_on(&mut probe, self.size, self.tick, w, h).is_some() {
+                    break true;
+                }
+                if evict_layout(&mut probe, self.tick).is_none() {
+                    break false;
+                }
+                evicted = true;
+            }
+        });
+        if fits {
+            return if evicted {
+                AtlasPlan::FitsEviction
+            } else {
+                AtlasPlan::Fits
+            };
         }
-        // Placement failed. A grow or clear drops every cached cell, so
-        // the re-lowered batch places all of them: size the grow target
-        // once, for cached and pending cells together.
+        // Placement failed even with every untouchable shelf gone. A
+        // grow drops every cached cell, so the re-lowered batch places
+        // all of them: size the grow target once, for cached and
+        // pending cells together.
         self.cached_cells();
         self.plan_all.extend_from_slice(&self.plan_cells);
         let mut size = self.size;
         while size < self.cap {
             size = (size * 2).min(self.cap);
-            let mut shelves = Vec::new();
+            let mut probe = Layout {
+                shelves: Vec::new(),
+                vacant: Vec::new(),
+                top: 0,
+            };
             if self
                 .plan_all
                 .iter()
-                .all(|&(w, h)| alloc_on(&mut shelves, size, w, h).is_some())
+                .all(|&(w, h)| alloc_on(&mut probe, size, self.tick, w, h).is_some())
             {
                 return AtlasPlan::Grow(size);
             }
@@ -641,6 +768,15 @@ impl Atlas {
     /// The atlas edge in texels.
     pub const fn size(&self) -> u32 {
         self.size
+    }
+
+    /// `(live shelves, virgin top, vacant bands)` for diagnostics.
+    pub fn occupancy(&self) -> (usize, u32, usize) {
+        (
+            self.layout.shelves.iter().filter(|s| s.live).count(),
+            self.layout.top,
+            self.layout.vacant.len(),
+        )
     }
 
     /// Whether a `w` × `h` cell fits in an empty atlas at the cap.
@@ -812,11 +948,11 @@ impl Atlas {
         h: u32,
         texels: &[u8],
     ) -> Option<(u32, u32)> {
-        let bounds = self.shelf_bounds();
         let mut uploads = Vec::new();
         let hit = self.get(&key).is_some();
+        self.begin_commit(&[]);
         let out = self.place_glyph(key, left, top, w, h, texels.to_vec(), &mut uploads);
-        self.upload_committed(device, queue, &bounds, &uploads);
+        self.upload_committed(device, queue, &uploads);
         if !hit && w == 0 {
             crate::diag::atlas_cell(device, (0, 0, 0, 0));
         }
@@ -846,14 +982,18 @@ impl Atlas {
         writes: &mut Vec<CellWrite>,
     ) -> Option<(u32, u32)> {
         if let Some(entry) = self.get(&key) {
-            return Some((u32::from(entry.x), u32::from(entry.y)));
+            let (x, y, slot) = (u32::from(entry.x), u32::from(entry.y), entry.slot);
+            self.touch(slot);
+            return Some((x, y));
         }
         if w == 0 {
             self.map.insert(key, Entry::default());
             return Some((0, 0));
         }
         let (cx, cy, slot) = self.alloc(w, h)?;
-        self.cpu_bytes += u64::from(w) * u64::from(h);
+        self.cpu_bytes += u64::from(w) * u64::from(h) + LIVE_ENTRY_BYTES;
+        let epoch = self.next_epoch;
+        self.next_epoch += 1;
         let entry = Entry {
             x: cx as u16,
             y: cy as u16,
@@ -861,8 +1001,20 @@ impl Atlas {
             h: h as u16,
             left,
             top,
+            slot: slot as u32,
+            epoch,
         };
+        let hk = live_hash(&key);
         self.map.insert(key, entry);
+        self.live.insert(
+            hk,
+            LiveEntry {
+                epoch,
+                slots: Box::new([slot as u32]),
+                kind: LiveKind::Glyph(key),
+            },
+        );
+        self.slot_keys[slot].insert(hk);
         writes.push(CellWrite {
             shelf: slot,
             x: cx,
@@ -889,14 +1041,27 @@ impl Atlas {
         cells: Vec<CellTexels>,
         writes: &mut Vec<CellWrite>,
     ) -> Option<()> {
-        if self.paths.contains_key(&key) {
+        if let Some(emit) = self.paths.get(&key) {
+            let slots: Vec<u32> = emit.cells.iter().map(|c| c.slot).collect();
+            for slot in slots {
+                self.touch(slot);
+            }
             return Some(());
         }
         let mut emit = emit;
+        let epoch = self.next_epoch;
+        self.next_epoch += 1;
+        emit.epoch = epoch;
+        let mut slots: Vec<u32> = Vec::new();
         for (cell, (w, h, texels)) in emit.cells.iter_mut().zip(cells) {
             let (cx, cy, slot) = self.alloc(w, h)?;
             cell.x = cx as u16;
             cell.y = cy as u16;
+            cell.slot = slot as u32;
+            self.slot_keys[slot].insert(key);
+            if !slots.contains(&(slot as u32)) {
+                slots.push(slot as u32);
+            }
             writes.push(CellWrite {
                 shelf: slot,
                 x: cx,
@@ -906,6 +1071,14 @@ impl Atlas {
                 texels,
             });
         }
+        self.live.insert(
+            key,
+            LiveEntry {
+                epoch,
+                slots: slots.into_boxed_slice(),
+                kind: LiveKind::Path,
+            },
+        );
         self.insert_path(key, emit);
         Some(())
     }
@@ -927,10 +1100,10 @@ impl Atlas {
         h: u32,
         texels: &[u8],
     ) -> Option<()> {
-        let bounds = self.shelf_bounds();
         let mut uploads = Vec::new();
+        self.begin_commit(&[]);
         let out = self.place_mask(key, mask, w, h, texels.to_vec(), &mut uploads);
-        self.upload_committed(device, queue, &bounds, &uploads);
+        self.upload_committed(device, queue, &uploads);
         out
     }
 
@@ -950,11 +1123,25 @@ impl Atlas {
         texels: Vec<u8>,
         writes: &mut Vec<CellWrite>,
     ) -> Option<()> {
-        if self.masks.contains_key(&key) {
+        if let Some(mask) = self.masks.get(&key) {
+            let slot = mask.slot;
+            self.touch(slot);
             return Some(());
         }
         let (cx, cy, slot) = self.alloc(w, h)?;
         mask.atlas = [cx as f32, cy as f32];
+        mask.slot = u32::try_from(slot).expect("shelf count fits u32");
+        let epoch = self.next_epoch;
+        self.next_epoch += 1;
+        self.live.insert(
+            key,
+            LiveEntry {
+                epoch,
+                slots: Box::new([u32::try_from(slot).expect("shelf count fits u32")]),
+                kind: LiveKind::Mask,
+            },
+        );
+        self.slot_keys[slot].insert(key);
         self.insert_mask(key, mask);
         writes.push(CellWrite {
             shelf: slot,
@@ -1007,40 +1194,300 @@ impl Atlas {
         self.clear();
     }
 
-    /// Reserves a `w` × `h` cell, or `None` when it does not fit. Never
-    /// evicts: growth and clearing are the caller's decision. Returns
-    /// the cell origin and its shelf index.
+    /// Starts a commit batch: advances the commit ordinal, marks every
+    /// shelf `touches` hit during lowering as live this commit so it is
+    /// never a victim, and freezes each live shelf's `x` as `base` for
+    /// [`Self::upload_committed`]'s region diffing.
+    pub fn begin_commit(&mut self, touches: &[u32]) {
+        self.tick += 1;
+        self.evicting = false;
+        self.evicted.clear();
+        for &idx in touches {
+            let row = &mut self.layout.shelves[usize::try_from(idx).expect("shelf index")];
+            // One mark per slot per commit.
+            if row.last_used < self.tick {
+                row.last_used = self.tick;
+                row.hits = row.hits.saturating_add(1);
+            }
+        }
+        for shelf in &mut self.layout.shelves {
+            if shelf.live {
+                shelf.base = shelf.x;
+            }
+        }
+    }
+
+    /// The eviction clock: retained emissions compare it cheaply and
+    /// re-verify their references only after it moved.
+    pub const fn clock(&self) -> u64 {
+        self.clock
+    }
+
+    /// Whether `key` is admitted and — if so — which epoch it carries.
+    /// An emission's stored epoch must match exactly, so a re-admitted
+    /// entry never satisfies a reference taken before its eviction.
+    pub fn live_epoch(&self, key: u64) -> Option<u64> {
+        self.live.get(&key).map(|e| e.epoch)
+    }
+
+    /// The shelves `key`'s cells occupy — the pin marks a lowering's
+    /// cache hits leave for the commit.
+    pub fn slots_of(&self, key: u64) -> Option<&[u32]> {
+        self.live.get(&key).map(|e| e.slots.as_ref())
+    }
+
+    /// Lets [`Self::alloc`] reclaim the coldest shelves: set by the
+    /// commit when the plan's dry run needed eviction — or exhausted
+    /// the layout — so in-place eviction, not a wholesale clear, makes
+    /// room (#119).
+    pub const fn enable_evicting(&mut self) {
+        self.evicting = true;
+    }
+
+    /// Bytes this commit's evictions reclaimed, paired with whether the
+    /// shelf had served the previous commit — the caller reports them
+    /// through `diag::retire` and clears the list itself.
+    pub fn take_evicted(&mut self) -> Vec<(u64, bool)> {
+        std::mem::take(&mut self.evicted)
+    }
+
+    /// Marks `slot` used by the current commit — a hit mid-commit or a
+    /// fresh allocation — so the same commit cannot evict it.
+    fn touch(&mut self, slot: u32) {
+        let row = &mut self.layout.shelves[usize::try_from(slot).expect("shelf index")];
+        if row.last_used < self.tick {
+            row.last_used = self.tick;
+            row.hits = row.hits.saturating_add(1);
+        }
+    }
+
+    /// Evicts the coldest shelf the current commit may touch: the least
+    /// recently used of the probationary segment (`hits == 0`) if any,
+    /// else the LRU of the protected segment. `false` when nothing is
+    /// evictable — every shelf was touched this commit or the layout is
+    /// empty.
+    fn evict_one(&mut self) -> bool {
+        let Some(slot) = evict_layout(&mut self.layout, self.tick) else {
+            return false;
+        };
+        let served_recently = self.layout.shelves[slot].last_used + 1 == self.tick;
+        let mut bytes = 0u64;
+        for hk in std::mem::take(&mut self.slot_keys[slot]) {
+            let Some(live) = self.live.remove(&hk) else {
+                continue;
+            };
+            match live.kind {
+                LiveKind::Glyph(key) => {
+                    if let Some(entry) = self.map.remove(&key) {
+                        bytes += u64::from(entry.w) * u64::from(entry.h) + LIVE_ENTRY_BYTES;
+                    }
+                }
+                LiveKind::Path => {
+                    if let Some(emit) = self.paths.remove(&hk) {
+                        bytes += (emit.spans.len() * 16 + emit.cells.len() * 24) as u64
+                            + LIVE_ENTRY_BYTES;
+                    }
+                }
+                LiveKind::Mask => {
+                    if let Some(mask) = self.masks.remove(&hk) {
+                        #[expect(
+                            clippy::cast_possible_truncation,
+                            clippy::cast_sign_loss,
+                            reason = "cell sizes are small positive floats"
+                        )]
+                        {
+                            bytes += (mask.size[0] * mask.size[1]) as u64 + LIVE_ENTRY_BYTES;
+                        }
+                    }
+                }
+            }
+        }
+        self.cpu_bytes = self.cpu_bytes.saturating_sub(bytes);
+        self.clock += 1;
+        self.evicted.push((bytes, served_recently));
+        true
+    }
+
+    /// Places a `w` × `h` cell: a live shelf of its height class first,
+    /// then a dead band, then virgin space — and, when the commit is
+    /// evicting, a cold shelf reclaimed in place. Returns the texel
+    /// origin and the shelf (eviction slot) index.
     pub(crate) fn alloc(&mut self, w: u32, h: u32) -> Option<(u32, u32, usize)> {
-        alloc_on(&mut self.shelves, self.size, w, h)
+        loop {
+            if let Some((x, y, slot)) = alloc_on(&mut self.layout, self.size, self.tick, w, h) {
+                while self.slot_keys.len() < self.layout.shelves.len() {
+                    self.slot_keys.push(rustc_hash::FxHashSet::default());
+                }
+                return Some((x, y, slot));
+            }
+            if !self.evicting || !self.evict_one() {
+                return None;
+            }
+        }
     }
 }
 
-/// `Atlas::alloc` against an explicit shelf list and atlas edge. The
-/// dry-run side of a transactional batch clones `shelves` and calls
-/// this instead (#169 A3).
-fn alloc_on(shelves: &mut Vec<Shelf>, size: u32, w: u32, h: u32) -> Option<(u32, u32, usize)> {
+/// The shelf `tick` may evict, picked the way [`Atlas::evict_one`]
+/// picks: the least recently used of the probationary segment
+/// (`hits == 0`) if any, else the LRU of the protected segment. Marks
+/// it dead and hands its band to `vacant`. `None` when every shelf was
+/// touched this commit or the layout is empty. `Atlas::plan`'s dry run
+/// shares this so the verdict matches what the commit would do (#119).
+fn evict_layout(layout: &mut Layout, tick: u64) -> Option<usize> {
+    let slot = layout
+        .shelves
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.live && s.last_used < tick)
+        .min_by_key(|(_, s)| (u8::from(s.hits > 0), s.last_used))
+        .map(|(i, _)| i)?;
+    layout.shelves[slot].live = false;
+    free_band(layout, slot);
+    Some(slot)
+}
+
+/// Returns the dead band at `slot` to `vacant` — coalesced. Evicting
+/// many small shelves one by one would otherwise leave the free space
+/// fragmented by height class: a tall cell can only reclaim a band at
+/// least as tall, so dead bands merge with vertically adjacent dead
+/// bands, and a merged band that reaches the layout's frontier hands
+/// its rows back to `top` as virgin space instead (#119). The
+/// invariant maintained here — no two `vacant` bands are ever
+/// vertically adjacent — is what makes the merge bounded. The merged
+/// band keeps `slot`'s index; merged-away slots stay dead with
+/// `h == 0` and are never reused.
+fn free_band(layout: &mut Layout, slot: usize) {
+    debug_assert!(!layout.shelves[slot].live);
+    let mut slot = slot;
+    loop {
+        let mut y = layout.shelves[slot].y;
+        let mut h = layout.shelves[slot].h;
+        // Fold in every dead band vertically adjacent to this one;
+        // the invariant limits it to two, but rerunning the scan is
+        // cheap at this `vacant` size.
+        let mut merged = true;
+        while merged {
+            merged = false;
+            for i in 0..layout.vacant.len() {
+                let other = usize::try_from(layout.vacant[i]).expect("shelf index");
+                let (oy, oh) = (layout.shelves[other].y, layout.shelves[other].h);
+                if oy + oh == y || oy == y + h {
+                    y = y.min(oy);
+                    h += oh;
+                    layout.shelves[other].h = 0;
+                    layout.vacant.swap_remove(i);
+                    merged = true;
+                    break;
+                }
+            }
+        }
+        if y + h != layout.top {
+            layout.shelves[slot].y = y;
+            layout.shelves[slot].h = h;
+            layout
+                .vacant
+                .push(u32::try_from(slot).expect("shelf count fits u32"));
+            return;
+        }
+        // Reaching the frontier recycles the band as virgin rows; the
+        // slot joins the dead `h == 0` ghost set. The new top may
+        // already abut another dead band — fold that one the same way.
+        layout.shelves[slot].h = 0;
+        layout.top = y;
+        let Some(back) = layout.vacant.iter().position(|&i| {
+            let s = &layout.shelves[usize::try_from(i).expect("shelf index")];
+            s.y + s.h == layout.top
+        }) else {
+            return;
+        };
+        slot = usize::try_from(layout.vacant.swap_remove(back)).expect("shelf index");
+    }
+}
+
+/// `Atlas::alloc` against an explicit layout and atlas edge — never
+/// evicts. The dry-run side of a transactional batch clones `layout`
+/// and calls this instead (#169 A3); the real side reaches it through
+/// `Atlas::alloc`'s eviction loop.
+fn alloc_on(
+    layout: &mut Layout,
+    size: u32,
+    tick: u64,
+    w: u32,
+    h: u32,
+) -> Option<(u32, u32, usize)> {
     // Shelf height classes are multiples of 8.
     let class = (h + 2 * PAD).div_ceil(8) * 8;
-    for (i, shelf) in shelves.iter_mut().enumerate() {
-        if shelf.h == class && shelf.x + w + 2 * PAD <= size {
+    for (i, shelf) in layout.shelves.iter_mut().enumerate() {
+        if shelf.live && shelf.h == class && shelf.x + w + 2 * PAD <= size {
             let x = shelf.x + PAD;
             shelf.x += w + 2 * PAD;
+            // Allocations pin (`last_used`) so the same commit cannot
+            // evict the shelf; only a cache hit promotes (`hits`).
+            shelf.last_used = shelf.last_used.max(tick);
             return Some((x, shelf.y + PAD, i));
         }
     }
-    let top = shelves.last().map_or(0, |s| s.y + s.h);
+    // A dead band takes the cell when it is tall enough — the smallest
+    // that fits, so large bands survive for larger classes; the
+    // remainder splits off as a smaller dead band.
+    let best = layout
+        .vacant
+        .iter()
+        .enumerate()
+        .map(|(pos, &i)| (pos, usize::try_from(i).expect("shelf index")))
+        .filter(|&(_, i)| layout.shelves[i].h >= class)
+        .min_by_key(|&(_, i)| layout.shelves[i].h)
+        .map(|(pos, _)| pos);
+    if let Some(pos) = best {
+        let slot = usize::try_from(layout.vacant.swap_remove(pos)).expect("shelf index");
+        if layout.shelves[slot].h > class {
+            let rest = layout.shelves[slot].h - class;
+            let y = layout.shelves[slot].y + class;
+            layout.shelves.push(Shelf {
+                y,
+                h: rest,
+                x: 0,
+                base: 0,
+                last_used: 0,
+                hits: 0,
+                live: false,
+            });
+            let phantom = layout.shelves.len() - 1;
+            free_band(layout, phantom);
+        }
+        let shelf = &mut layout.shelves[slot];
+        shelf.h = class;
+        shelf.x = w + 2 * PAD;
+        shelf.base = 0;
+        shelf.last_used = tick;
+        shelf.hits = 0;
+        shelf.live = true;
+        return Some((PAD, shelf.y + PAD, slot));
+    }
     // A new shelf also needs the cell's width: a cell wider than the
-    // atlas must fail here so the caller grows (or clears) instead of
+    // atlas must fail here so the caller grows (or reclaims) instead of
     // writing past the texture edge.
-    if w + 2 * PAD <= size && top + class <= size {
-        shelves.push(Shelf {
-            y: top,
+    if w + 2 * PAD <= size && layout.top + class <= size {
+        let i = layout.shelves.len();
+        layout.shelves.push(Shelf {
+            y: layout.top,
             h: class,
             x: w + 2 * PAD,
+            base: 0,
+            last_used: tick,
+            hits: 0,
+            live: true,
         });
-        return Some((PAD, top + PAD, shelves.len() - 1));
+        layout.top += class;
+        return Some((PAD, layout.top - class + PAD, i));
     }
     None
+}
+
+/// The `live`/`slot_keys` hash of a glyph key: the maps index glyph
+/// admissions by the same hash eviction bookkeeping does.
+pub fn live_hash(key: &GlyphKey) -> u64 {
+    rustc_hash::FxBuildHasher.hash_one(key)
 }
 
 /// An [`OutlinePen`] collecting a glyph outline into a `kurbo::BezPath`.
@@ -1115,12 +1562,27 @@ pub struct CellWrite {
 pub enum AtlasPlan {
     /// Every pending cell fits on the live shelves.
     Fits,
+    /// Every pending cell fits only once bounded eviction reclaims the
+    /// shelves nothing touched this commit (#119); commit evicting.
+    FitsEviction,
     /// The batch does not fit; growing once to this edge holds every
     /// cached and pending cell after re-lowering.
     Grow(u32),
-    /// Not even the cap holds the batch's cells: clear and retry on an
-    /// empty atlas.
+    /// Not even the cap holds the batch's cells: the commit evicts what
+    /// it can and reports the first surface that still overflows.
     Recycle,
+}
+
+impl PendingRaster {
+    /// Cells this raster will place — its atlas footprint in cell
+    /// count for diagnostics.
+    pub fn cell_count(&self) -> usize {
+        match self {
+            Self::Glyph { w, .. } | Self::Mask { w, .. } => usize::from(*w > 0),
+            Self::Path { cells, .. } => cells.len(),
+            Self::MaskTexture { .. } | Self::Colr { .. } | Self::Bitmap { .. } => 0,
+        }
+    }
 }
 
 /// Work deferred to the render thread by a parallel lowering: every
@@ -1258,6 +1720,8 @@ pub fn entry(
             h: h as u16,
             left,
             top,
+            slot: 0,
+            epoch: 0,
         },
         Some(idx),
     ))
@@ -1695,6 +2159,7 @@ mod tests {
             atlas: [0.0, 0.0],
             size: [2.0, 2.0],
             rect: [0.0, 0.0, 2.0, 2.0],
+            slot: 0,
         };
         assert!(
             parallel
@@ -1722,5 +2187,91 @@ mod tests {
         assert!(atlas.mask_in_atlas(200, 200));
         assert!(!atlas.mask_in_atlas(300, 300));
         assert!(atlas.mask_texture_fits(4096, 4096));
+    }
+
+    /// An evicting commit reclaims the coldest untouched shelf and drops
+    /// its entries; shelves the lowering's hits sit on survive (#119).
+    #[test]
+    fn evicting_commit_reclaims_cold_shelves() {
+        let Some((device, queue)) = device_and_queue() else {
+            return;
+        };
+        let mut atlas = Atlas::new(&device, u64::MAX);
+        atlas.size = 64;
+        let key = |glyph: u32| GlyphKey {
+            font: 7,
+            glyph,
+            size_bits: (16.0f32 * 64.0).to_bits(),
+            subpixel: 0,
+            matrix: [
+                1.0f32.to_bits(),
+                0.0f32.to_bits(),
+                0.0f32.to_bits(),
+                1.0f32.to_bits(),
+            ],
+            coords_hash: 0,
+        };
+        let (key_a, key_b, key_c, key_e) = (key(1), key(2), key(3), key(5));
+        // A class-8 shelf, a packed class-16 shelf, a class-24 shelf and
+        // a second class-16 shelf take `top` to the atlas edge.
+        assert!(
+            atlas
+                .store_glyph(&device, &queue, key_a, 0, 0, 4, 4, &[0; 16])
+                .is_some()
+        );
+        assert!(
+            atlas
+                .store_glyph(&device, &queue, key_b, 0, 0, 60, 10, &[0; 600])
+                .is_some()
+        );
+        assert!(
+            atlas
+                .store_glyph(&device, &queue, key_c, 0, 0, 4, 20, &[0; 80])
+                .is_some()
+        );
+        assert!(
+            atlas
+                .store_glyph(&device, &queue, key_e, 0, 0, 60, 10, &[0; 600])
+                .is_some()
+        );
+        assert_eq!(atlas.layout.top, 64, "the layout is full");
+        let [slot_a, slot_c, slot_e] = [
+            atlas.get(&key_a).expect("a").slot,
+            atlas.get(&key_c).expect("c").slot,
+            atlas.get(&key_e).expect("e").slot,
+        ];
+        let epoch_a = atlas.live_epoch(live_hash(&key_a));
+        assert!(epoch_a.is_some());
+        // Commit 2: the hits pin A, C and E; B's shelf is untouched. A
+        // class-16 cell cannot fit live or virgin space, so eviction
+        // must reclaim B's band rather than any pinned shelf.
+        atlas.begin_commit(&[slot_a, slot_c, slot_e]);
+        atlas.enable_evicting();
+        let mut writes = Vec::new();
+        let key_d = key(4);
+        assert!(
+            atlas
+                .place_glyph(key_d, 0, 0, 60, 10, vec![0; 600], &mut writes)
+                .is_some(),
+            "eviction must reclaim B's class-16 band"
+        );
+        assert!(
+            atlas.get(&key_b).is_none(),
+            "the cold shelf's entry is gone"
+        );
+        assert!(atlas.live_epoch(live_hash(&key_b)).is_none());
+        assert!(atlas.slots_of(live_hash(&key_b)).is_none());
+        assert!(atlas.slots_of(live_hash(&key_d)).is_some());
+        assert!(
+            atlas.get(&key_a).is_some()
+                && atlas.get(&key_c).is_some()
+                && atlas.get(&key_e).is_some(),
+            "touched shelves keep their entries"
+        );
+        assert_eq!(
+            atlas.live_epoch(live_hash(&key_a)),
+            epoch_a,
+            "a surviving admission keeps its epoch"
+        );
     }
 }

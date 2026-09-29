@@ -2,7 +2,7 @@
 //! commit sends to the render thread.
 
 use std::any::Any;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::mem::{needs_drop, size_of};
 use std::rc::{Rc, Weak};
@@ -339,6 +339,9 @@ pub struct LiveState {
     animates: RefCell<Vec<Animate>>,
     /// A running animation per operand slot.
     tracks: RefCell<HashMap<Slot, OperandTrack>>,
+    /// Set while queued animates or running tracks make
+    /// [`LiveState::sample`] worth its borrows.
+    needs_sample: Cell<bool>,
     guards: RefCell<Vec<Box<dyn Any>>>,
     waker: RefCell<Weak<crate::engine::Waker>>,
 }
@@ -381,6 +384,7 @@ impl LiveState {
         self.animates
             .borrow_mut()
             .push((command, target, animation));
+        self.needs_sample.set(true);
         self.wake();
     }
 
@@ -388,10 +392,16 @@ impl LiveState {
     /// queued animate on the slot drops.
     fn snap(&self, update: SlotUpdate) {
         let slot = update.slot();
-        self.tracks.borrow_mut().remove(&slot);
-        self.animates.borrow_mut().retain(|(command, target, _)| {
+        let mut tracks = self.tracks.borrow_mut();
+        tracks.remove(&slot);
+        let mut animates = self.animates.borrow_mut();
+        animates.retain(|(command, target, _)| {
             *command != slot.command || target.kind() != slot.operand
         });
+        self.needs_sample
+            .set(!tracks.is_empty() || !animates.is_empty());
+        drop(animates);
+        drop(tracks);
         self.push(update);
     }
 
@@ -402,6 +412,9 @@ impl LiveState {
     /// recorded operand when none arrived. Returns `true` while tracks
     /// still run.
     fn sample(&self, time: Instant, list: &DisplayList) -> bool {
+        if !self.needs_sample.get() {
+            return false;
+        }
         let animates = self.animates.take();
         if !animates.is_empty() {
             let mut tracks = self.tracks.borrow_mut();
@@ -447,6 +460,7 @@ impl LiveState {
         }
         let mut tracks = self.tracks.borrow_mut();
         if tracks.is_empty() {
+            self.needs_sample.set(false);
             return false;
         }
         let mut pending = self.pending.borrow_mut();
@@ -463,6 +477,7 @@ impl LiveState {
             }
             running
         });
+        self.needs_sample.set(!tracks.is_empty());
         animating
     }
 }

@@ -12,6 +12,8 @@
 //!   running flat out; `--energy` brackets the window with the
 //!   platform's power meter (Android ODPM rails, root via `su -c`;
 //!   macOS `sudo -n powermetrics`) and reports joules per frame.
+//!   `--pause-at FRAME` pauses before the zero-based encode frame
+//!   (warmup included) until one line is read from stdin.
 //!   `--native WxH` renders into a `W`×`H` surface — the device's own
 //!   resolution — with the scene drawn under the uniform scale
 //!   `W / scene_width`, like a device pixel ratio.
@@ -27,7 +29,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 #[cfg(unix)]
 use std::ffi::{CStr, OsStr, c_char, c_int};
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -120,6 +122,10 @@ enum Sub {
         /// Warmup frames discarded before measuring.
         #[arg(long, default_value_t = 5)]
         warmup: u32,
+        /// Pause before this zero-based encode frame (warmup included)
+        /// until one line is read from stdin.
+        #[arg(long, value_name = "FRAME")]
+        pause_at: Option<u32>,
         /// Report JSON path (with `--scene`).
         #[arg(long, conflicts_with = "out_dir", required_unless_present = "out_dir")]
         out: Option<PathBuf>,
@@ -391,6 +397,7 @@ fn run(cli: Cli) -> Result<(), BenchError> {
             corpus,
             frames,
             warmup,
+            pause_at,
             out,
             out_dir,
             cpu,
@@ -404,6 +411,7 @@ fn run(cli: Cli) -> Result<(), BenchError> {
                 corpus: corpus.as_deref(),
                 frames,
                 warmup,
+                pause_at,
                 out: out.as_deref(),
                 out_dir: out_dir.as_deref(),
                 cpu: cpu.as_deref(),
@@ -550,9 +558,12 @@ fn alloc_diag_cmd(
         &input,
         frames,
         warmup,
-        period,
-        window_hint,
-        false,
+        FrameLoopOptions {
+            pause_at: None,
+            period,
+            window_hint,
+            measure_energy: false,
+        },
     )?;
     engine.alloc_diag_teardown();
     drop(engine);
@@ -629,6 +640,7 @@ struct MeasureOpts<'a> {
     corpus: Option<&'a Path>,
     frames: u32,
     warmup: u32,
+    pause_at: Option<u32>,
     out: Option<&'a Path>,
     out_dir: Option<&'a Path>,
     cpu: Option<&'a str>,
@@ -763,6 +775,7 @@ fn measure_cmd(engine: &str, opts: MeasureOpts<'_>) -> Result<(), BenchError> {
             MeasureSceneOptions {
                 frames: opts.frames,
                 warmup: opts.warmup,
+                pause_at: opts.pause_at,
                 pinned: pinned.as_deref(),
                 rate: opts.rate,
                 measure_energy: opts.energy,
@@ -1001,6 +1014,14 @@ struct Window {
 /// missed — scheduler overshoot under a millisecond is noise.
 const PACING_TOLERANCE: Duration = Duration::from_millis(1);
 
+#[derive(Clone, Copy)]
+struct FrameLoopOptions {
+    pause_at: Option<u32>,
+    period: Option<Duration>,
+    window_hint: Duration,
+    measure_energy: bool,
+}
+
 /// The warmup + measured frame loop.
 ///
 /// With `--rate` each measured frame starts on `start + n / rate` —
@@ -1015,10 +1036,14 @@ fn run_frames(
     input: &EncodeInput<'_>,
     frames: u32,
     warmup: u32,
-    period: Option<Duration>,
-    window_hint: Duration,
-    measure_energy: bool,
+    options: FrameLoopOptions,
 ) -> Result<Window, BenchError> {
+    let FrameLoopOptions {
+        pause_at,
+        period,
+        window_hint,
+        measure_energy,
+    } = options;
     let mut meter = None;
     let mut start = Instant::now();
     let mut missed_deadlines = 0u32;
@@ -1054,6 +1079,9 @@ fn run_frames(
         }
         let cpu_start = affinity::current_cpu();
         let t0 = Instant::now();
+        if pause_at == Some(frame) {
+            pause_before_frame(frame)?;
+        }
         engine.encode(input)?;
         let t1 = Instant::now();
         let submit = engine.submit(u64::from(frame), false)?;
@@ -1074,7 +1102,7 @@ fn run_frames(
                 cpu_end,
                 migrated: matches!((cpu_start, cpu_end), (Some(a), Some(b)) if a != b),
                 passes: Vec::new(),
-                phases: submit.phases,
+                phases: submit.phases.map(phase_samples).unwrap_or_default(),
             });
         }
         attribute_gpu(&mut samples, warmup, submit.gpu);
@@ -1087,6 +1115,47 @@ fn run_frames(
         start,
         missed_deadlines,
     })
+}
+
+/// The render-thread phase timings of one frame as named samples.
+fn phase_samples(phases: crate::Phases) -> Vec<crate::PhaseSample> {
+    [
+        ("lower", phases.lower),
+        ("encode", phases.encode),
+        ("stamp", phases.stamp),
+        ("wait", phases.wait),
+    ]
+    .into_iter()
+    .map(|(name, seconds)| crate::PhaseSample {
+        name: name.to_string(),
+        seconds,
+    })
+    .collect()
+}
+
+fn pause_before_frame(frame: u32) -> Result<(), BenchError> {
+    let stdout = std::io::stdout();
+    let mut stdout_lock = stdout.lock();
+    writeln!(stdout_lock, "cherenkov-bench: paused before frame {frame}")?;
+    stdout_lock.flush()?;
+    drop(stdout_lock);
+    let stdin = std::io::stdin();
+    let mut stdin = stdin.lock();
+    let mut byte = [0];
+    loop {
+        match stdin.read(&mut byte)? {
+            0 => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "stdin closed before resuming measure",
+                )
+                .into());
+            }
+            _ if byte[0] == b'\n' => break,
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Stores each GPU timing on the measured sample of the frame it times;
@@ -1123,6 +1192,7 @@ fn pacing(rate: f64, frames: u32) -> Result<(Duration, Duration), BenchError> {
 struct MeasureSceneOptions<'a> {
     frames: u32,
     warmup: u32,
+    pause_at: Option<u32>,
     pinned: Option<&'a [u32]>,
     rate: Option<f64>,
     measure_energy: bool,
@@ -1179,6 +1249,7 @@ fn measure_scene(
     let MeasureSceneOptions {
         frames,
         warmup,
+        pause_at,
         pinned,
         rate,
         measure_energy,
@@ -1212,9 +1283,12 @@ fn measure_scene(
         &input,
         frames,
         warmup,
-        period,
-        window_hint,
-        measure_energy,
+        FrameLoopOptions {
+            pause_at,
+            period,
+            window_hint,
+            measure_energy,
+        },
     )?;
     let window_end = Instant::now();
     let window_seconds = window_end.duration_since(window.start).as_secs_f64();
@@ -1241,11 +1315,7 @@ fn measure_scene(
             .and_then(|o| o.thermal_pressure.clone()),
     );
     let placement = measure_placement(pinned, heterogeneous, prepare_cpu, &samples);
-    let enc: Vec<f64> = samples.iter().map(|s| s.encode_seconds).collect();
-    let sub: Vec<f64> = samples.iter().map(|s| s.submit_seconds).collect();
-    let gpu: Vec<f64> = samples.iter().filter_map(|s| s.gpu_seconds).collect();
-    let passes = pass_percentiles(&samples);
-    let phases = phase_percentiles(&samples);
+    let percentiles = frame_percentiles(&samples);
     Ok(MeasureReport {
         engine: engine.info().name,
         info: engine.info().clone(),
@@ -1261,13 +1331,7 @@ fn measure_scene(
         warmup_frames: warmup,
         samples,
         placement,
-        percentiles: Percentiles {
-            encode_seconds: percentiles(&enc).unwrap_or([0.0; 3]),
-            submit_seconds: percentiles(&sub).unwrap_or([0.0; 3]),
-            gpu_seconds: percentiles(&gpu),
-            passes,
-            phases,
-        },
+        percentiles,
         pacing,
         energy: energy_outcome.map(|o| o.report),
         conditions,
@@ -1290,6 +1354,19 @@ fn memory_samples(
     samples.extend(warmup.iter().cloned());
     samples.push(steady);
     samples
+}
+
+fn frame_percentiles(samples: &[FrameSample]) -> Percentiles {
+    let enc: Vec<f64> = samples.iter().map(|s| s.encode_seconds).collect();
+    let sub: Vec<f64> = samples.iter().map(|s| s.submit_seconds).collect();
+    let gpu: Vec<f64> = samples.iter().filter_map(|s| s.gpu_seconds).collect();
+    Percentiles {
+        encode_seconds: percentiles(&enc).unwrap_or([0.0; 3]),
+        submit_seconds: percentiles(&sub).unwrap_or([0.0; 3]),
+        gpu_seconds: percentiles(&gpu),
+        passes: pass_percentiles(samples),
+        phases: phase_percentiles(samples),
+    }
 }
 
 fn measure_placement(
@@ -1462,7 +1539,18 @@ fn probe_once(
     let input = EncodeInput { scene, blobs };
     engine.prepare(&input)?;
     let prepare_memory = MemorySnapshot::capture(engine.memory(), SampleDetail::Full);
-    let window = run_frames(engine, &input, frames, warmup, None, Duration::ZERO, false)?;
+    let window = run_frames(
+        engine,
+        &input,
+        frames,
+        warmup,
+        FrameLoopOptions {
+            pause_at: None,
+            period: None,
+            window_hint: Duration::ZERO,
+            measure_energy: false,
+        },
+    )?;
     let steady_memory = MemorySnapshot::capture(engine.memory(), SampleDetail::Full);
     let memory = memory_samples(prepare_memory, &window.memory_samples, steady_memory);
     let times: Vec<f64> = window.samples.iter().map(frame_seconds).collect();

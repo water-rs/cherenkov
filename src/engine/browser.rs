@@ -18,7 +18,7 @@ use crate::error::{EngineError, RenderError, ResourceError, SurfaceError};
 use crate::frame::{FrameStats, FrameTime, FrameTiming, Next};
 use crate::glyph::FontId;
 use crate::image::{Format, ImageData};
-use crate::message::{ChangeSet, FontData, Message, ResOp, SurfaceId};
+use crate::message::{ChangeSet, FontData, Message, RenderReply, ResOp, SurfaceId};
 use crate::paint::ImageId;
 use crate::resource::{Filter, Font, FontSource, Image, Shader};
 use crate::style::FilterId;
@@ -38,6 +38,7 @@ pub struct Engine<B: Backend> {
     tx: Sender<Message<B>>,
     info: B::Info,
     stats: RefCell<FrameStats>,
+    commits: RefCell<Vec<(SurfaceId, ChangeSet<B>)>>,
     /// The live surfaces' shared queues, drained into one `Render` message
     /// per frame.
     surfaces: RefCell<Vec<std::rc::Weak<RefCell<Shared<B>>>>>,
@@ -105,6 +106,7 @@ impl<B: Backend> Engine<B> {
             tx,
             info,
             stats: RefCell::new(FrameStats::default()),
+            commits: RefCell::new(Vec::new()),
             surfaces: RefCell::new(Vec::new()),
             next_surface: Cell::new(0),
             next_font: Cell::new(1),
@@ -125,19 +127,18 @@ impl<B: Backend> Engine<B> {
         &self.info
     }
 
-    /// Statistics of the last [`Engine::render`]. A backend whose GPU
-    /// timestamps resolve after its submit reports earlier frames'
-    /// timings here, once the GPU has caught up.
+    /// Statistics of the last [`Engine::render`]. GPU timings are kept by
+    /// the render thread and returned by [`Engine::finish_timings`] instead.
     #[must_use]
     pub fn stats(&self) -> FrameStats {
         self.stats.borrow().clone()
     }
 
-    /// Waits for every submitted frame whose timing no render has reported
-    /// yet, and returns those timings, oldest first — the end of a
-    /// measured window, where the last frames are still on the GPU. Awaits
-    /// completion without blocking JavaScript; intended for tooling. Empty when the backend reports no
-    /// GPU timing or has nothing outstanding.
+    /// Returns all GPU timings accumulated since the previous call,
+    /// oldest first. Awaits frames still in flight without blocking
+    /// JavaScript, so this marks the end of a measured window and belongs
+    /// to tooling, never to a frame path. Empty when the backend reports
+    /// no GPU timing or has nothing outstanding.
     ///
     /// # Errors
     /// [`RenderError::Timeout`] when the GPU does not finish in time,
@@ -170,7 +171,9 @@ impl<B: Backend> Engine<B> {
         if self.tx.send(Message::Memory { reply }).is_err() {
             return MemoryUsage::default();
         }
-        rx.recv().await.unwrap_or_default()
+        rx.recv()
+            .await
+            .map_or_else(|_| MemoryUsage::default(), |reply| reply.usage)
     }
 
     /// Reports system memory pressure. `Critical` drops every cache.
@@ -351,7 +354,8 @@ impl<B: Backend> Engine<B> {
         reason = "the browser engine is single-threaded and its futures run on the page's event loop"
     )]
     pub async fn render(&self, time: FrameTime) -> Result<Next, RenderError> {
-        let mut commits: Vec<(SurfaceId, ChangeSet<B>)> = Vec::new();
+        let mut commits = std::mem::take(&mut *self.commits.borrow_mut());
+        commits.clear();
         self.surfaces.borrow_mut().retain(|weak| {
             let Some(shared) = weak.upgrade() else {
                 return false;
@@ -365,7 +369,7 @@ impl<B: Backend> Engine<B> {
         // Re-arm before yielding: a signal fired during browser work must
         // request the next frame, even if the current frame returns Idle.
         self.waker.arm();
-        let (reply, rx) = crate::local::channel();
+        let (reply, rx) = crate::local::channel::<RenderReply<B>>();
         self.tx
             .send(Message::Render {
                 time,
@@ -373,7 +377,11 @@ impl<B: Backend> Engine<B> {
                 reply,
             })
             .map_err(|_| RenderError::Thread)?;
-        let (next, stats) = rx.recv().await.map_err(|_| RenderError::Thread)??;
+        let mut reply = rx.recv().await.map_err(|_| RenderError::Thread)?;
+        self.recycle_commits(&mut reply.commits);
+        reply.commits.clear();
+        *self.commits.borrow_mut() = reply.commits;
+        let (next, stats) = reply.result?;
         *self.stats.borrow_mut() = stats;
         Ok(next)
     }
@@ -386,6 +394,22 @@ impl<B: Backend> Engine<B> {
         let release = Rc::clone(&self.release);
         Registration {
             release: Some(Box::new(move || release(remove))),
+        }
+    }
+
+    fn recycle_commits(&self, commits: &mut [(SurfaceId, ChangeSet<B>)]) {
+        let surfaces = self.surfaces.borrow();
+        for (id, changes) in commits {
+            let Some(shared) = surfaces
+                .iter()
+                .filter_map(std::rc::Weak::upgrade)
+                .find(|shared| shared.borrow().id == *id)
+            else {
+                continue;
+            };
+            shared
+                .borrow_mut()
+                .recycle(std::mem::take(&mut changes.ops), &mut changes.recycled);
         }
     }
 

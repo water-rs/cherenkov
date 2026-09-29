@@ -330,6 +330,10 @@ impl DisplayList {
         }
     }
 
+    pub(crate) fn clear(&mut self) {
+        self.commands.clear();
+    }
+
     /// The commands.
     #[must_use]
     pub fn commands(&self) -> &[Command] {
@@ -466,6 +470,22 @@ impl Picture {
         Self(Arc::new(list))
     }
 
+    pub(crate) fn take_unique_list(&mut self) -> Option<DisplayList> {
+        Arc::get_mut(&mut self.0).map(std::mem::take)
+    }
+
+    pub(crate) fn put_unique_list(&mut self, list: DisplayList) {
+        *Arc::get_mut(&mut self.0).expect("picture must be unique") = list;
+    }
+
+    pub(crate) fn clear_unique(&mut self) -> bool {
+        let Some(list) = Arc::get_mut(&mut self.0) else {
+            return false;
+        };
+        list.clear();
+        true
+    }
+
     /// The recorded commands.
     #[must_use]
     pub fn display_list(&self) -> &DisplayList {
@@ -488,7 +508,7 @@ impl Picture {
 mod tests {
     use serde_json::json;
 
-    use super::{Command, Dirty, DisplayList, Operand, ScopeError, SlotUpdate};
+    use super::{Command, Dirty, DisplayList, Operand, Picture, ScopeError, SlotUpdate};
     use crate::glyph::{FontId, Glyph, GlyphRun, GlyphStyle};
     use crate::paint::Paint;
 
@@ -496,13 +516,14 @@ mod tests {
         GlyphRun {
             font: FontId::new(0),
             size: 12.0,
-            coords: Vec::new(),
+            coords: Vec::new().into(),
             glyphs: vec![Glyph {
                 id,
                 x: 0.0,
                 y: 0.0,
                 transform: None,
-            }],
+            }]
+            .into(),
             style: GlyphStyle::Fill,
         }
     }
@@ -574,5 +595,21 @@ mod tests {
             unmatched.contains(&ScopeError::UnmatchedEnd { index: 0 }.to_string()),
             "{unmatched}"
         );
+    }
+
+    #[test]
+    fn clearing_a_unique_picture_keeps_its_command_buffer() {
+        let mut list = DisplayList::with_capacity(2);
+        list.push(Command::End);
+        let mut picture = Picture::new(list);
+        let shared = picture.clone();
+        let pointer = picture.display_list().commands().as_ptr();
+
+        assert!(!picture.clear_unique());
+        assert_eq!(shared.display_list().len(), 1);
+        drop(shared);
+        assert!(picture.clear_unique());
+        assert!(picture.display_list().is_empty());
+        assert_eq!(picture.display_list().commands().as_ptr(), pointer);
     }
 }

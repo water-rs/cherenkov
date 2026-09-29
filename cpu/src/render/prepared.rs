@@ -13,6 +13,7 @@ use skrifa::raw::TableProvider as _;
 use skrifa::raw::types::F2Dot14;
 
 use super::font::Font;
+use rustc_hash::FxHashMap;
 
 /// A retained draw or paired composition scope.
 pub enum Op {
@@ -82,9 +83,9 @@ impl cherenkov::lowering::Operation for Op {
 /// Resolve CPU paints while retaining content-space geometry. `fonts` is
 /// mutable: lowering builds the `COLRv1` node trees the frame uses.
 pub struct Lowerer<'a> {
-    pub images: &'a std::collections::HashMap<u64, std::sync::Arc<super::image::CpuImage>>,
-    pub fonts: &'a mut std::collections::HashMap<u64, Font>,
-    pub bitmap_fonts: &'a std::collections::HashMap<u64, std::sync::Arc<super::bitmap::BitmapFont>>,
+    pub images: &'a FxHashMap<u64, std::sync::Arc<super::image::CpuImage>>,
+    pub fonts: &'a mut FxHashMap<u64, Font>,
+    pub bitmap_fonts: &'a FxHashMap<u64, std::sync::Arc<super::bitmap::BitmapFont>>,
 }
 
 impl cherenkov::lowering::Compiler for Lowerer<'_> {
@@ -237,7 +238,7 @@ impl Lowerer<'_> {
         let mut colr_checked = false;
         let has_bitmap = self.bitmap_fonts.contains_key(&run.font.raw());
         let mut bitmap_paint_checked = false;
-        for glyph in &run.glyphs {
+        for glyph in run.glyphs.iter() {
             if !colr_checked {
                 colr_checked = true;
                 colr_ctx = Self::color_font_context(font_data)?;
@@ -258,7 +259,7 @@ impl Lowerer<'_> {
                             font: run.font,
                             size: run.size,
                             coords: run.coords.clone(),
-                            glyphs: std::mem::take(&mut pending),
+                            glyphs: std::mem::take(&mut pending).into(),
                             style: run.style.clone(),
                         },
                         paint: paint_data(paint, Affine::IDENTITY, self.images)?,
@@ -294,7 +295,7 @@ impl Lowerer<'_> {
                             font: run.font,
                             size: run.size,
                             coords: run.coords.clone(),
-                            glyphs: std::mem::take(&mut pending),
+                            glyphs: std::mem::take(&mut pending).into(),
                             style: run.style.clone(),
                         },
                         paint: paint_data(paint, Affine::IDENTITY, self.images)?,
@@ -306,7 +307,7 @@ impl Lowerer<'_> {
                         font: run.font,
                         size: run.size,
                         coords: run.coords.clone(),
-                        glyphs: vec![*glyph],
+                        glyphs: vec![*glyph].into(),
                         style: run.style.clone(),
                     },
                     paint,
@@ -323,7 +324,7 @@ impl Lowerer<'_> {
                     font: run.font,
                     size: run.size,
                     coords: run.coords.clone(),
-                    glyphs: pending,
+                    glyphs: pending.into(),
                     style: run.style.clone(),
                 },
                 paint: paint_data(paint, Affine::IDENTITY, self.images)?,
@@ -392,7 +393,7 @@ impl Lowerer<'_> {
             ops.push(Op::Stroke {
                 local: ambient,
                 shape: ShapeData::Path {
-                    elements: path.into_elements(),
+                    elements: path.into_elements().into(),
                     rule: cherenkov::FillRule::NonZero,
                 },
                 stroke: stroke.clone(),
@@ -432,7 +433,7 @@ impl Lowerer<'_> {
         let outlines = font_ref.outline_glyphs();
         let paint = paint_data(paint, Affine::IDENTITY, self.images)?;
         let mut pending: Vec<cherenkov::Glyph> = Vec::new();
-        for glyph in &run.glyphs {
+        for glyph in run.glyphs.iter() {
             let place = match super::glyph::classify(glyph)? {
                 super::glyph::GlyphPlacement::Translate(g) => {
                     pending.push(g);
@@ -456,7 +457,7 @@ impl Lowerer<'_> {
                         font: run.font,
                         size: run.size,
                         coords: run.coords.clone(),
-                        glyphs: std::mem::take(&mut pending),
+                        glyphs: std::mem::take(&mut pending).into(),
                         style: run.style.clone(),
                     },
                     paint: paint.clone(),
@@ -465,7 +466,7 @@ impl Lowerer<'_> {
             ops.push(Op::Fill {
                 local: ambient,
                 shape: ShapeData::Path {
-                    elements: (place * font_scale * path).into_elements(),
+                    elements: (place * font_scale * path).into_elements().into(),
                     rule: cherenkov::FillRule::NonZero,
                 },
                 paint: paint.clone(),
@@ -478,7 +479,7 @@ impl Lowerer<'_> {
                     font: run.font,
                     size: run.size,
                     coords: run.coords.clone(),
-                    glyphs: pending,
+                    glyphs: pending.into(),
                     style: run.style.clone(),
                 },
                 paint,

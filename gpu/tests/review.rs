@@ -36,7 +36,8 @@ fn text_runs(font: cherenkov::FontId, count: u32, size: f32) -> Vec<GlyphRun> {
     (0..count.div_ceil(FONT_GLYPHS))
         .map(|cycle| {
             let size = (cycle as f32).mul_add(2.0, size);
-            let glyphs = (cycle * FONT_GLYPHS..(cycle * FONT_GLYPHS + FONT_GLYPHS).min(count))
+            let glyphs: Vec<_> = (cycle * FONT_GLYPHS
+                ..(cycle * FONT_GLYPHS + FONT_GLYPHS).min(count))
                 .map(|i| cherenkov::Glyph {
                     id: 1 + i % FONT_GLYPHS,
                     x: (i % 32) as f32 * (size * 0.8),
@@ -47,8 +48,8 @@ fn text_runs(font: cherenkov::FontId, count: u32, size: f32) -> Vec<GlyphRun> {
             GlyphRun {
                 font,
                 size,
-                coords: Vec::new(),
-                glyphs,
+                coords: Vec::new().into(),
+                glyphs: glyphs.into(),
                 style: cherenkov::GlyphStyle::Fill,
             }
         })
@@ -313,11 +314,10 @@ fn dropping_a_font_frees_its_renderer_state() -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
-/// Timestamp queries resolve after the submitting render returns — it
-/// never waits for GPU idle — and each frame's timing is reported once,
-/// tagged with that frame, by a later render or by `finish_timings`.
+/// Timestamp queries accumulate on the renderer and are returned once,
+/// oldest first, by `finish_timings`.
 #[test]
-fn timestamps_resolve_a_frame_late() -> Result<(), Box<dyn std::error::Error>> {
+fn finish_timings_returns_every_drawn_frame_once() -> Result<(), Box<dyn std::error::Error>> {
     let Some(engine) = engine(GpuConfig {
         timestamps: true,
         ..GpuConfig::default()
@@ -330,32 +330,26 @@ fn timestamps_resolve_a_frame_late() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let surface = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
-    surface.update(|tx| {
-        tx[surface.root()].content(surface.record(|c| {
-            c.fill(
-                Rect::new(0.0, 0.0, 64.0, 64.0),
-                WorkingColor::new([1.0, 0.0, 0.0, 1.0]),
-            );
-        }));
-    });
-    engine.render(cherenkov::FrameTime::now())?;
-    let first = engine.stats();
-    let frame = first.frame.expect("a drawing render submits");
-    assert!(
-        first.timings.is_empty(),
-        "a submitting frame returns before its queries resolve"
-    );
-    // A render with nothing dirty submits nothing, and may or may not
-    // find the first frame finished; `finish_timings` waits for the rest.
+    let mut submitted = Vec::new();
+    for frame in 0..3u8 {
+        let color = [f32::from(frame) / 3.0, 0.0, 0.0, 1.0];
+        surface.update(|tx| {
+            tx[surface.root()].content(surface.record(|c| {
+                c.fill(Rect::new(0.0, 0.0, 64.0, 64.0), WorkingColor::new(color));
+            }));
+        });
+        engine.render(cherenkov::FrameTime::now())?;
+        submitted.push(engine.stats().frame.expect("a drawing render submits"));
+    }
+    // An idle render has no frame id and cannot contribute another timing.
     engine.render(cherenkov::FrameTime::now())?;
     let second = engine.stats();
     assert_eq!(second.frame, None, "nothing dirty, nothing submitted");
-    let mut timings = second.timings;
-    timings.extend(engine.finish_timings()?);
+    let timings = engine.finish_timings()?;
     assert_eq!(
         timings.iter().map(|t| t.frame).collect::<Vec<_>>(),
-        [frame],
-        "the frame is timed exactly once"
+        submitted,
+        "every drawn frame is timed exactly once in increasing order"
     );
     assert!(timings[0].gpu_seconds.is_some());
     assert!(
@@ -369,8 +363,8 @@ fn timestamps_resolve_a_frame_late() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// With timestamps disabled a render reports no timing — and never
-/// allocates the per-pass metadata only the timestamp path consumes.
+/// With timestamps disabled `finish_timings` reports no timing — and the
+/// render never allocates per-pass metadata only the timestamp path consumes.
 #[test]
 fn timestamps_off_reports_no_passes() -> Result<(), Box<dyn std::error::Error>> {
     let Some(engine) = engine(GpuConfig::default()) else {
@@ -388,7 +382,6 @@ fn timestamps_off_reports_no_passes() -> Result<(), Box<dyn std::error::Error>> 
     engine.render(cherenkov::FrameTime::now())?;
     let stats = engine.stats();
     assert!(stats.frame.is_some());
-    assert!(stats.timings.is_empty());
     assert!(engine.finish_timings()?.is_empty());
     Ok(())
 }

@@ -20,10 +20,12 @@ mod shadow;
 mod upload;
 
 use cherenkov::Instant;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
+
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{GpuConfig, GpuInfo, GpuTarget, ScratchFormat, TimestampSupport, names};
 use bitmap::BitmapKey;
@@ -161,12 +163,12 @@ struct SurfaceState {
     /// format, index 1 the scratch format.
     backdrop: [Option<ScratchTarget>; 2],
     /// Backdrop groups registered on this surface by raw id.
-    backdrop_groups: HashMap<u64, BackdropGroupState>,
-    layers: HashMap<LayerId, ContentData>,
-    content: HashMap<LayerId, gpu_content::Slot>,
+    backdrop_groups: FxHashMap<u64, BackdropGroupState>,
+    layers: FxHashMap<LayerId, ContentData>,
+    content: FxHashMap<LayerId, gpu_content::Slot>,
     /// Retained external frames by layer (`cherenkov::ExternalFrames`).
-    external: HashMap<LayerId, external::Slot>,
-    shader_textures: HashMap<std::sync::Arc<paint::Key>, paint::Texture>,
+    external: FxHashMap<LayerId, external::Slot>,
+    shader_textures: FxHashMap<std::sync::Arc<paint::Key>, paint::Texture>,
     frame: LoweredFrame,
     /// This frame's offsets into the shared buffers: instances and globals
     /// (256-byte slots) are laid out surface by surface so one upload covers
@@ -179,7 +181,7 @@ struct SurfaceState {
     /// Group-1 bind groups keyed by `(source, backdrop, image,
     /// mask texture)`, reused across frames while `binds1_stamp` is
     /// current.
-    binds1: HashMap<Bind1Key, wgpu::BindGroup>,
+    binds1: FxHashMap<Bind1Key, wgpu::BindGroup>,
     /// The `(bind_gen, images_gen, mask_texture_gen)` triple `binds1` was
     /// built under.
     binds1_stamp: (u64, u64, u64),
@@ -196,7 +198,7 @@ struct BackdropGroupState {
 
 impl SurfaceState {
     /// The `BackdropGroupInfo` map lowering needs for this surface.
-    fn backdrop_info(&self, filters: &mut filter::Registry) -> HashMap<u64, BackdropGroupInfo> {
+    fn backdrop_info(&self, filters: &mut filter::Registry) -> FxHashMap<u64, BackdropGroupInfo> {
         self.backdrop_groups
             .iter()
             .map(|(g, state)| {
@@ -373,11 +375,11 @@ pub struct GpuRenderer {
     /// `[format index]` external pipelines: 0 = surface, 1 = scratch —
     /// `None` until the first external draw prepares them.
     external_pipes: [Option<wgpu::RenderPipeline>; 2],
-    surfaces: HashMap<SurfaceId, SurfaceState>,
-    fonts: HashMap<u64, FontData>,
+    surfaces: FxHashMap<SurfaceId, SurfaceState>,
+    fonts: FxHashMap<u64, FontData>,
     /// Registered images.
-    images: HashMap<u64, GpuImage>,
-    bitmaps: HashMap<BitmapKey, GpuBitmap>,
+    images: FxHashMap<u64, GpuImage>,
+    bitmaps: FxHashMap<BitmapKey, GpuBitmap>,
     /// Bumped on every `images` insert/remove — every cached group-1
     /// bind group samples an image view, so an image change rebuilds them.
     images_gen: u64,
@@ -407,6 +409,8 @@ pub struct GpuRenderer {
     /// Frames whose timestamp resolve was submitted but whose staging
     /// buffer is not mapped yet — read on a later call, in order.
     pending_timestamps: VecDeque<PendingTimestamps>,
+    /// Resolved timings retained until `finish_timings`.
+    timings: Vec<FrameTiming>,
     /// Passes encoded this frame, for the per-pass report.
     frame_pass_count: u32,
     /// `(name, width, height, format)` of each encoded pass this frame.
@@ -1287,10 +1291,10 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             atlas,
             commit_writes: Vec::new(),
             pending_origins: Vec::new(),
-            surfaces: HashMap::new(),
-            fonts: HashMap::new(),
-            images: HashMap::new(),
-            bitmaps: HashMap::new(),
+            surfaces: FxHashMap::default(),
+            fonts: FxHashMap::default(),
+            images: FxHashMap::default(),
+            bitmaps: FxHashMap::default(),
             images_gen: 0,
             timestamps,
             query_set,
@@ -1303,6 +1307,7 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             query_staging: Vec::new(),
             query_capacity,
             pending_timestamps: VecDeque::new(),
+            timings: Vec::new(),
             frame_pass_count: 0,
             pass_meta: Vec::new(),
             wait_timeout: config.wait_timeout,
@@ -1499,10 +1504,10 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
         atlas,
         commit_writes: Vec::new(),
         pending_origins: Vec::new(),
-        surfaces: HashMap::new(),
-        fonts: HashMap::new(),
-        images: HashMap::new(),
-        bitmaps: HashMap::new(),
+        surfaces: FxHashMap::default(),
+        fonts: FxHashMap::default(),
+        images: FxHashMap::default(),
+        bitmaps: FxHashMap::default(),
         images_gen: 0,
         timestamps,
         query_set,
@@ -1515,6 +1520,7 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
         query_staging: Vec::new(),
         query_capacity,
         pending_timestamps: VecDeque::new(),
+        timings: Vec::new(),
         frame_pass_count: 0,
         pass_meta: Vec::new(),
         wait_timeout: config.wait_timeout,
@@ -1624,16 +1630,16 @@ impl Renderer for GpuRenderer {
                 view,
                 scratch: Vec::new(),
                 backdrop: [None, None],
-                backdrop_groups: HashMap::new(),
-                layers: HashMap::new(),
-                content: HashMap::new(),
-                external: HashMap::new(),
-                shader_textures: HashMap::new(),
+                backdrop_groups: FxHashMap::default(),
+                layers: FxHashMap::default(),
+                content: FxHashMap::default(),
+                external: FxHashMap::default(),
+                shader_textures: FxHashMap::default(),
                 frame: LoweredFrame::default(),
                 inst_base: 0,
                 globals_base: 0,
                 bind_gen: 0,
-                binds1: HashMap::new(),
+                binds1: FxHashMap::default(),
                 binds1_stamp: (u64::MAX, u64::MAX, u64::MAX),
             },
         );
@@ -1788,7 +1794,7 @@ impl Renderer for GpuRenderer {
                 has_colr,
                 has_bitmap: bitmap.is_some(),
                 bitmap,
-                colr: std::cell::RefCell::new(HashMap::new()),
+                colr: std::cell::RefCell::new(FxHashMap::default()),
             },
         );
         Ok(())
@@ -1806,11 +1812,14 @@ impl Renderer for GpuRenderer {
         self.atlas.remove_font(id.raw());
     }
 
-    fn set_content(&mut self, surface: SurfaceId, layer: LayerId, content: Option<ContentOp>) {
+    fn set_content(
+        &mut self,
+        surface: SurfaceId,
+        layer: LayerId,
+        content: Option<ContentOp>,
+    ) -> Option<cherenkov::Picture> {
         let _diag_guard = diag::Guard::scope(self.diag.as_ref());
-        let Some(state) = self.surfaces.get_mut(&surface) else {
-            return;
-        };
+        let state = self.surfaces.get_mut(&surface)?;
         if state.content.remove(&layer).is_some() {
             diag::bind_groups_dropped(&self.device, state.binds1.len() as u64, "content change");
             state.binds1.clear();
@@ -1819,9 +1828,10 @@ impl Renderer for GpuRenderer {
         match content {
             Some(ContentOp::Replace(list)) => {
                 if let Some(content) = state.layers.get_mut(&layer) {
-                    content.replace(list);
+                    Some(content.replace(list))
                 } else {
                     state.layers.insert(layer, ContentData::new(list));
+                    None
                 }
             }
             Some(ContentOp::Update(updates)) => {
@@ -1830,13 +1840,13 @@ impl Renderer for GpuRenderer {
                     .get_mut(&layer)
                     .expect("slot update targets a layer without content")
                     .update(updates);
+                None
             }
-            Some(ContentOp::Picture(picture)) => {
-                state.layers.insert(layer, ContentData::picture(picture));
-            }
-            None => {
-                state.layers.remove(&layer);
-            }
+            Some(ContentOp::Picture(picture)) => state
+                .layers
+                .insert(layer, ContentData::picture(picture))
+                .map(ContentData::into_picture),
+            None => state.layers.remove(&layer).map(ContentData::into_picture),
         }
     }
 
@@ -2200,7 +2210,7 @@ impl Renderer for GpuRenderer {
         if let Some(last) = self.pending_queries.back().map(|p| p.submission.clone()) {
             self.wait(last, "timestamp draws")?;
         }
-        let mut timings = self.drain_timestamps();
+        self.drain_timestamps();
         if !self.pending_queries.is_empty() {
             return Err(RenderError::Readback(
                 "timestamp draws: the completion callback did not run after the wait".into(),
@@ -2211,10 +2221,10 @@ impl Renderer for GpuRenderer {
                 pending.request_map();
             }
             self.wait(last, "timestamp resolve")?;
-            timings.extend(self.drain_timestamps());
+            self.drain_timestamps();
         }
         if self.pending_timestamps.is_empty() {
-            Ok(timings)
+            Ok(std::mem::take(&mut self.timings))
         } else {
             Err(RenderError::Readback(
                 "timestamp resolve: the map callback did not run after the wait".into(),
@@ -2234,7 +2244,7 @@ impl Renderer for GpuRenderer {
         if let Some(last) = self.pending_queries.back().map(|p| p.submission.clone()) {
             self.wait(last, "timestamp draws").await?;
         }
-        let mut timings = self.drain_timestamps();
+        self.drain_timestamps();
         if !self.pending_queries.is_empty() {
             return Err(RenderError::Readback(
                 "timestamp draws: the completion callback did not run after the wait".into(),
@@ -2245,10 +2255,10 @@ impl Renderer for GpuRenderer {
                 pending.request_map();
             }
             self.wait(last, "timestamp resolve").await?;
-            timings.extend(self.drain_timestamps());
+            self.drain_timestamps();
         }
         if self.pending_timestamps.is_empty() {
-            Ok(timings)
+            Ok(std::mem::take(&mut self.timings))
         } else {
             Err(RenderError::Readback(
                 "timestamp resolve: the map callback did not run after the wait".into(),
@@ -2448,7 +2458,7 @@ impl GpuRenderer {
         stats: &mut FrameStats,
     ) -> Result<Redraw, RenderError> {
         let origin = *self.origin.get_or_insert(frame.time.0);
-        stats.timings = self.drain_timestamps();
+        self.drain_timestamps();
         let dirty: Vec<_> = frame
             .surfaces
             .iter()
@@ -2573,7 +2583,7 @@ impl GpuRenderer {
         stats: &mut FrameStats,
     ) -> Result<Redraw, RenderError> {
         let origin = *self.origin.get_or_insert(frame.time.0);
-        stats.timings = self.drain_timestamps();
+        self.drain_timestamps();
         let dirty: Vec<_> = frame
             .surfaces
             .iter()
@@ -2804,7 +2814,7 @@ impl GpuRenderer {
     fn render_shaders(&mut self, id: SurfaceId, elapsed: f32) -> Result<(), RenderError> {
         let surface = self.surfaces.get_mut(&id).expect("registered surface");
         if self.shaders.has_registrations() {
-            let keys: std::collections::HashSet<_> = surface
+            let keys: FxHashSet<_> = surface
                 .frame
                 .passes
                 .iter()
@@ -3072,7 +3082,7 @@ impl GpuRenderer {
         let mut cleared = false;
         let mut grew = false;
         loop {
-            let group_maps: Vec<HashMap<u64, BackdropGroupInfo>> = pending
+            let group_maps: Vec<FxHashMap<u64, BackdropGroupInfo>> = pending
                 .iter()
                 .map(|surf| surf.backdrop_info(&mut self.filters))
                 .collect();
@@ -3080,7 +3090,7 @@ impl GpuRenderer {
                 let (atlas, images, bitmaps) = (&self.atlas, &self.images, &self.bitmaps);
                 // `FontData`'s COLR cache is a `RefCell` — !Sync — so
                 // each worker moves in its own snapshot built here.
-                let snapshots: Vec<HashMap<u64, FontData>> = pending
+                let snapshots: Vec<FxHashMap<u64, FontData>> = pending
                     .iter()
                     .map(|_| {
                         self.fonts
@@ -3168,7 +3178,7 @@ impl GpuRenderer {
         let mut cleared = false;
         let mut grew = false;
         loop {
-            let group_maps: Vec<HashMap<u64, BackdropGroupInfo>> = pending
+            let group_maps: Vec<FxHashMap<u64, BackdropGroupInfo>> = pending
                 .iter()
                 .map(|surf| surf.backdrop_info(&mut self.filters))
                 .collect();
@@ -3226,10 +3236,10 @@ impl GpuRenderer {
         surf: &mut SurfaceState,
         frame: &SurfaceFrame<'_>,
         atlas: &Atlas,
-        fonts: &HashMap<u64, FontData>,
-        images: &HashMap<u64, GpuImage>,
-        bitmaps: &HashMap<BitmapKey, GpuBitmap>,
-        groups: &HashMap<u64, BackdropGroupInfo>,
+        fonts: &FxHashMap<u64, FontData>,
+        images: &FxHashMap<u64, GpuImage>,
+        bitmaps: &FxHashMap<BitmapKey, GpuBitmap>,
+        groups: &FxHashMap<u64, BackdropGroupInfo>,
     ) -> Result<Lowered, RenderError> {
         surf.frame.reset();
         // Lowering borrows `layers` immutably while mutating `frame`;
@@ -3270,7 +3280,7 @@ impl GpuRenderer {
         if !self.atlas.mask_textures_over_budget() {
             return;
         }
-        let live: rustc_hash::FxHashSet<u64> = self
+        let live: FxHashSet<u64> = self
             .surfaces
             .values()
             .flat_map(|surf| surf.frame.passes.iter())
@@ -4602,7 +4612,7 @@ impl GpuRenderer {
     /// Reads back every pending frame's resolved timestamps whose copy
     /// has landed, oldest first — submissions complete in order, so the
     /// first unfinished one ends the drain. Never blocks.
-    fn drain_timestamps(&mut self) -> Vec<FrameTiming> {
+    fn drain_timestamps(&mut self) {
         if !self.pending_queries.is_empty() {
             // Poll dispatches completion callbacks; it never waits for GPU idle.
             let _ = self.device.poll(wgpu::PollType::Poll);
@@ -4617,7 +4627,6 @@ impl GpuRenderer {
             }
         }
         let period = f64::from(self.queue.get_timestamp_period());
-        let mut timings = Vec::new();
         while let Some(pending) = self.pending_timestamps.front_mut() {
             pending.request_map();
             diag::map(
@@ -4694,7 +4703,7 @@ impl GpuRenderer {
                 gpu_ms = timing.gpu_seconds.map(|s| s * 1e3),
                 "frame timed"
             );
-            timings.push(timing);
+            self.timings.push(timing);
             pending.staging.unmap();
             if pending.query_capacity >= self.query_capacity {
                 self.query_pool.push((
@@ -4707,7 +4716,6 @@ impl GpuRenderer {
                 self.query_staging.push(pending.staging);
             }
         }
-        timings
     }
 
     /// Acquires a frame's queries and grows the resolve buffer if needed.

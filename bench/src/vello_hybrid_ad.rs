@@ -341,7 +341,7 @@ impl Engine for VelloHybrid {
         Ok(Submit {
             image,
             gpu: GpuSample::whole_frame(frame, gpu_seconds),
-            phases: Vec::new(),
+            phases: None,
         })
     }
 

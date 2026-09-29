@@ -1,12 +1,12 @@
 //! The glyph mask cache and mask rasterization.
 
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, OnceLock};
 
 use cherenkov::GlyphRun;
 use cherenkov::kurbo::{Affine, PathEl, Point, Vec2};
+use rustc_hash::FxHashMap;
 use skrifa::MetadataProvider;
 use skrifa::outline::{DrawSettings, OutlinePen};
 use skrifa::raw::TableProvider;
@@ -56,7 +56,7 @@ pub type GlyphSlot = Arc<OnceLock<Arc<GlyphMask>>>;
 /// CPU budget.
 #[derive(Default)]
 pub struct GlyphCache {
-    map: HashMap<GlyphKey, Arc<GlyphMask>>,
+    map: FxHashMap<GlyphKey, Arc<GlyphMask>>,
     bytes: u64,
     budget: u64,
 }
@@ -65,7 +65,7 @@ impl GlyphCache {
     /// An empty cache bounded by `budget` bytes.
     pub fn new(budget: u64) -> Self {
         Self {
-            map: HashMap::new(),
+            map: FxHashMap::default(),
             bytes: 0,
             budget,
         }
@@ -211,7 +211,7 @@ pub fn stroke_outlines(
     let coords: Vec<F2Dot14> = run.coords.iter().map(|c| F2Dot14::from_bits(*c)).collect();
     let outlines = font_ref.outline_glyphs();
     let mut paths = Vec::with_capacity(run.glyphs.len());
-    for glyph in &run.glyphs {
+    for glyph in run.glyphs.iter() {
         let path = outline(&outlines, &coords, glyph.id)?.ok_or_else(|| {
             RenderError::Font(format!("glyph {} has no stroke outline", glyph.id))
         })?;
@@ -418,8 +418,8 @@ mod budget_tests {
         let run = GlyphRun {
             font: cherenkov::FontId::new(1),
             size: 12.0,
-            coords: vec![],
-            glyphs: vec![],
+            coords: Vec::new().into(),
+            glyphs: Vec::new().into(),
             style: cherenkov::GlyphStyle::Fill,
         };
         let key = glyph_key(&run, 1, (0.0, 0.0), Affine::IDENTITY);

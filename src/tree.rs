@@ -8,7 +8,7 @@
 mod components;
 
 use crate::Instant;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use kurbo::{Affine, Vec2};
 
@@ -31,7 +31,7 @@ pub const RATE_SLOW: RefreshRange = 30..=60;
 
 /// A surface's layer tree on the render thread.
 pub struct SurfaceTree {
-    nodes: HashMap<u64, LayerNode>,
+    nodes: FxHashMap<u64, LayerNode>,
     root: LayerId,
 }
 
@@ -236,7 +236,7 @@ impl SurfaceTree {
     /// An empty tree holding only its root layer (`LayerId(0)`).
     #[must_use]
     pub fn new() -> Self {
-        let mut nodes = HashMap::new();
+        let mut nodes = FxHashMap::default();
         nodes.insert(0, LayerNode::new());
         Self {
             nodes,

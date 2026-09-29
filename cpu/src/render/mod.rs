@@ -19,7 +19,7 @@ mod prepared;
 pub mod present;
 mod raster;
 
-use std::collections::HashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use cherenkov::{
     BackdropId, ContentOp, EngineError, FontData, FontId, Frame, FrameStats, ImageId, ImageUpload,
@@ -58,7 +58,7 @@ struct SurfaceState {
     refresh: cherenkov::RefreshRange,
     /// Per-layer content caches; the sampled layer state lives in the
     /// front end's [`cherenkov::SurfaceTree`].
-    layers: HashMap<LayerId, ContentData>,
+    layers: FxHashMap<LayerId, ContentData>,
     filters: Vec<u64>,
     /// Backdrop groups referenced by the last frame, by group id.
     groups: Vec<u64>,
@@ -91,11 +91,11 @@ impl SurfaceState {
 /// [`Renderer`] implementation.
 pub struct RasterRenderer {
     pool: rayon::ThreadPool,
-    surfaces: HashMap<SurfaceId, SurfaceState>,
+    surfaces: FxHashMap<SurfaceId, SurfaceState>,
     pub(super) filters: filter::Registry,
-    fonts: HashMap<u64, font::Font>,
-    bitmap_fonts: HashMap<u64, Arc<bitmap::BitmapFont>>,
-    images: HashMap<u64, Arc<CpuImage>>,
+    fonts: FxHashMap<u64, font::Font>,
+    bitmap_fonts: FxHashMap<u64, Arc<bitmap::BitmapFont>>,
+    images: FxHashMap<u64, Arc<CpuImage>>,
     image_budget: u64,
     /// The glyph mask cache, bounded by `Budget::cpu`.
     glyph_cache: glyph::GlyphCache,
@@ -123,11 +123,11 @@ pub fn init(config: RasterConfig) -> Result<(RasterRenderer, RasterInfo), Engine
             (
                 RasterRenderer {
                     pool,
-                    surfaces: HashMap::new(),
+                    surfaces: FxHashMap::default(),
                     filters: filter::Registry::new(config.redraw),
-                    fonts: HashMap::new(),
-                    bitmap_fonts: HashMap::new(),
-                    images: HashMap::new(),
+                    fonts: FxHashMap::default(),
+                    bitmap_fonts: FxHashMap::default(),
+                    images: FxHashMap::default(),
                     image_budget: config.budget.cpu.0,
                     glyph_cache: glyph::GlyphCache::new(config.budget.cpu.0),
                     bitmap_cache: bitmap::BitmapCache::new(config.budget.cpu.0),
@@ -215,7 +215,7 @@ impl Renderer for RasterRenderer {
                 size,
                 output,
                 refresh,
-                layers: HashMap::new(),
+                layers: FxHashMap::default(),
                 filters: Vec::new(),
                 groups: Vec::new(),
                 backdrop_capture_peak: 0,
@@ -266,7 +266,7 @@ impl Renderer for RasterRenderer {
                 data: font,
                 has_colr,
                 has_bitmap,
-                colr: HashMap::new(),
+                colr: FxHashMap::default(),
             },
         );
         Ok(())
@@ -308,27 +308,34 @@ impl Renderer for RasterRenderer {
         }
     }
 
-    fn set_content(&mut self, surface: SurfaceId, layer: LayerId, content: Option<ContentOp>) {
-        let Some(state) = self.surfaces.get_mut(&surface) else {
-            return;
-        };
+    fn set_content(
+        &mut self,
+        surface: SurfaceId,
+        layer: LayerId,
+        content: Option<ContentOp>,
+    ) -> Option<cherenkov::Picture> {
+        let state = self.surfaces.get_mut(&surface)?;
         match content {
-            Some(ContentOp::Replace(list)) => {
-                state.layers.insert(layer, ContentData::new(list));
-            }
+            Some(ContentOp::Replace(list)) => state
+                .layers
+                .insert(layer, ContentData::new(list))
+                .map(cherenkov::lowering::Content::into_picture),
             Some(ContentOp::Update(updates)) => {
                 state
                     .layers
                     .get_mut(&layer)
                     .expect("slot update targets a layer without content")
                     .update(updates);
+                None
             }
-            Some(ContentOp::Picture(picture)) => {
-                state.layers.insert(layer, ContentData::picture(picture));
-            }
-            None => {
-                state.layers.remove(&layer);
-            }
+            Some(ContentOp::Picture(picture)) => state
+                .layers
+                .insert(layer, ContentData::picture(picture))
+                .map(cherenkov::lowering::Content::into_picture),
+            None => state
+                .layers
+                .remove(&layer)
+                .map(cherenkov::lowering::Content::into_picture),
         }
     }
 
@@ -486,12 +493,12 @@ impl RasterRenderer {
                 self.render_surface(sf, frame.id, stats)?;
             }
         }
-        let used: std::collections::HashSet<u64> = self
+        let used: FxHashSet<u64> = self
             .surfaces
             .values()
             .flat_map(|surface| surface.filters.iter().copied())
             .collect();
-        let used_groups: std::collections::HashSet<(u64, u64)> = self
+        let used_groups: FxHashSet<(u64, u64)> = self
             .surfaces
             .iter()
             .flat_map(|(surface, state)| {

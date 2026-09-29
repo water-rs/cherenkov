@@ -40,9 +40,14 @@ contract; the per-decision log is issue #2.
   renderer can fit the budget in theory.
 - **CPU-side changes are accepted on deterministic Callgrind instruction
   counts:** Ir for `lower` and `encode` at the second steady frame of the five
-  perf scenes (the #43 harness), at most +1% per scene against dev. Wall-clock
-  time on a shared cloud VM is not evidence: identical binaries drifted by up
-  to ±80% there.
+  perf scenes, sampled by frame index (`bench/scripts/ir_gate.py`, which runs
+  `measure --pause-at`). The gated Ir excludes the allocator (calls into the
+  Rust allocator shims and the libc malloc family) and the libc memory
+  primitives (memcpy, memmove, memset, memcmp, bcmp), whose Ir depends on
+  buffer addresses: at most +1% per scene against dev, and alloc, realloc,
+  dealloc and memory-primitive calls per frame must not rise.
+  Wall-clock time on a shared cloud VM is not evidence: identical binaries
+  drifted by up to ±80% there.
 - **Wall-clock time and energy come only from quiet real devices**, in
   interleaved A/B rounds with per-round results: the Apple M1, the iPad Pro M4
   (Metal) and the Pixel 9 Pro (Vulkan). The iPad's GPU clock is bimodal with

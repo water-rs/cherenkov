@@ -322,7 +322,7 @@ impl<T: 'static, S: Signal<Output = T>> From<S> for Live<T> {
 
 /// State shared between a [`Content`] and the watchers of its signals.
 #[derive(Default)]
-struct LiveState {
+pub struct LiveState {
     pending: RefCell<Vec<SlotUpdate>>,
     guards: RefCell<Vec<Box<dyn Any>>>,
     waker: RefCell<Weak<crate::engine::Waker>>,
@@ -349,6 +349,7 @@ impl LiveState {
 pub struct Recorder {
     list: DisplayList,
     live: Rc<LiveState>,
+    picture: Option<Picture>,
 }
 
 impl std::fmt::Debug for Recorder {
@@ -373,6 +374,7 @@ impl Recorder {
         Self {
             list: DisplayList::default(),
             live: Rc::default(),
+            picture: None,
         }
     }
 
@@ -382,8 +384,15 @@ impl Recorder {
     #[inline]
     pub fn finish(mut self) -> Content {
         self.list.trim_spare();
+        let picture = match self.picture.take() {
+            Some(mut picture) => {
+                picture.put_unique_list(self.list);
+                picture
+            }
+            None => Picture::new(self.list),
+        };
         Content {
-            picture: Picture::new(self.list),
+            picture,
             live: self.live,
             sent: false,
         }
@@ -547,12 +556,20 @@ impl Draw for Recorder {
 /// Content recorded on the UI thread. It owns the subscriptions of the signals
 /// it was recorded with, and turns their changes into [`ContentChange`]s.
 ///
+/// Replaced picture storage can return after the render thread releases it.
+///
 /// `Content` is not `Send`: its signals live on the UI thread. What crosses to
 /// the render thread is the owned [`ContentChange`].
 pub struct Content {
     picture: Picture,
     live: Rc<LiveState>,
     sent: bool,
+}
+
+#[derive(Default)]
+pub struct ContentSpare {
+    pub(crate) picture: Option<Picture>,
+    pub(crate) live: Option<Rc<LiveState>>,
 }
 
 impl std::fmt::Debug for Content {
@@ -571,6 +588,49 @@ impl Content {
         Self::record_with_capacity(0, body)
     }
 
+    pub(crate) fn record_reusing(
+        mut spare: ContentSpare,
+        body: impl FnOnce(&mut Recorder),
+    ) -> Self {
+        let (picture, list) = spare.picture.take().map_or_else(
+            || (None, DisplayList::default()),
+            |mut picture| {
+                picture.take_unique_list().map_or_else(
+                    || (None, DisplayList::default()),
+                    |mut list| {
+                        list.clear();
+                        (Some(picture), list)
+                    },
+                )
+            },
+        );
+        let mut live = spare.live.take().unwrap_or_default();
+        let live = if Rc::get_mut(&mut live).is_some() {
+            live
+        } else {
+            Rc::new(LiveState::default())
+        };
+        let mut recorder = Recorder {
+            list,
+            live,
+            picture,
+        };
+        body(&mut recorder);
+        recorder.finish()
+    }
+
+    pub(crate) fn retire(self) -> ContentSpare {
+        let Self { picture, live, .. } = self;
+        live.guards.borrow_mut().clear();
+        live.pending.borrow_mut().clear();
+        *live.waker.borrow_mut() = Weak::new();
+        drop(picture);
+        ContentSpare {
+            picture: None,
+            live: Some(live),
+        }
+    }
+
     /// Like [`record`](Self::record), reserving room for `capacity` commands —
     /// pass the previous recording's [`len`](Self::len) when re-recording the
     /// same content.
@@ -579,6 +639,7 @@ impl Content {
         let mut recorder = Recorder {
             list: DisplayList::with_capacity(capacity),
             live: Rc::default(),
+            picture: None,
         };
         body(&mut recorder);
         recorder.list.trim_spare();
@@ -710,6 +771,7 @@ mod tests {
             kurbo::PathEl::MoveTo((0.0, 0.0).into()),
             kurbo::PathEl::LineTo((1.0, 1.0).into()),
         ];
+        let elements: std::sync::Arc<[kurbo::PathEl]> = elements.into();
         let pointer = elements.as_ptr();
         let shape = ShapeData::Path {
             elements,
@@ -730,17 +792,28 @@ mod tests {
     }
 
     #[test]
+    fn shared_retired_picture_falls_back_to_fresh_storage() {
+        let mut content = Content::record(|_| {});
+        let pointer = std::ptr::from_ref(content.picture.display_list());
+        let held = content.take_change();
+        let reused = Content::record_reusing(content.retire(), |_| {});
+        assert_ne!(std::ptr::from_ref(reused.picture.display_list()), pointer);
+        drop(held);
+    }
+
+    #[test]
     fn fixed_glyph_runs_move_their_storage_into_the_command() {
         let run = GlyphRun {
             font: crate::FontId::new(0),
             size: 12.0,
-            coords: vec![123],
+            coords: vec![123].into(),
             glyphs: vec![crate::Glyph {
                 id: 7,
                 x: 0.0,
                 y: 0.0,
                 transform: None,
-            }],
+            }]
+            .into(),
             style: crate::GlyphStyle::Fill,
         };
         let glyphs = run.glyphs.as_ptr();

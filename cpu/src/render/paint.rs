@@ -4,6 +4,7 @@
 
 use cherenkov::kurbo::Affine;
 use cherenkov::{ColorStop, Extend, Interpolation, Paint};
+use rustc_hash::FxHashMap;
 
 use cherenkov::RenderError;
 
@@ -269,7 +270,7 @@ fn sample_image(
 pub fn paint_data(
     paint: &Paint,
     inv: Affine,
-    images: &std::collections::HashMap<u64, std::sync::Arc<super::image::CpuImage>>,
+    images: &FxHashMap<u64, std::sync::Arc<super::image::CpuImage>>,
 ) -> Result<PaintData, RenderError> {
     Ok(match paint {
         Paint::Transformed(_) => {
@@ -337,7 +338,7 @@ pub fn paint_data(
 fn extra_paint(
     paint: &Paint,
     inv: Affine,
-    images: &std::collections::HashMap<u64, std::sync::Arc<super::image::CpuImage>>,
+    images: &FxHashMap<u64, std::sync::Arc<super::image::CpuImage>>,
 ) -> Result<PaintData, RenderError> {
     Ok(match paint {
         Paint::Sweep(gradient) => {

@@ -27,13 +27,14 @@ fn a_glyph_keeps_its_path_clip_mask_when_composed() {
     let run = GlyphRun {
         font: font.id(),
         size: 32.,
-        coords: Vec::new(),
+        coords: Vec::new().into(),
         glyphs: vec![Glyph {
             id: 36,
             x: 8.,
             y: 40.,
             transform: None,
-        }],
+        }]
+        .into(),
         style: GlyphStyle::Fill,
     };
     let surface = engine

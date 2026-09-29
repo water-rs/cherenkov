@@ -6,7 +6,12 @@
 use crate::local::ReplySender as Sender;
 use std::sync::Arc;
 #[cfg(not(target_arch = "wasm32"))]
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Sender, SyncSender};
+
+#[cfg(target_arch = "wasm32")]
+pub type FrameReplySender<T> = Sender<T>;
+#[cfg(not(target_arch = "wasm32"))]
+pub type FrameReplySender<T> = SyncSender<T>;
 
 use kurbo::{Affine, Vec2};
 
@@ -201,6 +206,30 @@ pub struct ChangeSet<B: Backend> {
     pub clear: Option<WorkingColor>,
     /// The ops, in order.
     pub ops: Vec<Op<B>>,
+    /// Replaced pictures, cleared on the render thread, whose storage returns to the UI thread.
+    pub recycled: Vec<(LayerId, Picture)>,
+}
+
+/// The render result and drained buffers returned to the UI thread.
+pub struct RenderReply<B: Backend> {
+    /// The result of rendering the frame.
+    pub result: Result<(Next, FrameStats), RenderError>,
+    /// The drained commits, including their reusable empty op vectors.
+    pub commits: Vec<(SurfaceId, ChangeSet<B>)>,
+    /// The persistent reply sender, returned so a disconnected render thread
+    /// releases the receiver.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub sender: FrameReplySender<Self>,
+}
+
+/// Memory usage and its persistent reply sender.
+pub struct MemoryReply {
+    /// The engine's current usage.
+    pub usage: MemoryUsage,
+    /// The persistent reply sender, returned so a disconnected render thread
+    /// releases the receiver.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub sender: FrameReplySender<Self>,
 }
 
 /// A message to the render thread.
@@ -247,8 +276,8 @@ pub enum Message<B: Backend> {
         time: FrameTime,
         /// The surfaces' queued change sets, one entry per dirty surface.
         commits: Vec<(SurfaceId, ChangeSet<B>)>,
-        /// What the next frame needs and this frame's stats.
-        reply: Sender<Result<(Next, FrameStats), RenderError>>,
+        /// The render result and the buffers returned to the UI thread.
+        reply: FrameReplySender<RenderReply<B>>,
     },
     /// Wait for every outstanding frame timing and return it.
     FinishTimings {
@@ -265,7 +294,7 @@ pub enum Message<B: Backend> {
     /// Report memory usage.
     Memory {
         /// The usage.
-        reply: Sender<MemoryUsage>,
+        reply: FrameReplySender<MemoryReply>,
     },
     /// System memory pressure.
     Trim(Pressure),

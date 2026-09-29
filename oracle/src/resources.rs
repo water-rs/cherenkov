@@ -34,6 +34,13 @@ impl Resources {
         Scene::resource(&self.dir, hash)
     }
 
+    /// Adds an already-decoded image, preserving an existing content entry.
+    pub fn insert_image(&mut self, hash: ResourceHash, image: Image) {
+        self.images
+            .entry((hash, cherenkov_scene::ImageEncoding::default()))
+            .or_insert(image);
+    }
+
     /// The decoded image for `hash` under `encoding`, decoding on first use.
     ///
     /// `Png` blobs carry encoded 8-bit data (`Srgb` primaries, or `DisplayP3`

@@ -500,6 +500,18 @@ fn radial_t(px: f32, py: f32, centres: [f32; 4], radii: [f32; 2]) -> f32 {
 }
 
 impl PaintData {
+    pub fn bitmap(image: std::sync::Arc<super::image::CpuImage>, transform: Affine) -> Self {
+        let mapping = transform.inverse();
+        Self::Image(Box::new(ImagePaintData {
+            mapping,
+            inv: affine_f32(mapping),
+            image,
+            extend_x: Extend::Pad,
+            extend_y: Extend::Pad,
+            sampling: cherenkov::Sampling::Linear,
+        }))
+    }
+
     /// Apply sampled device placement without resolving or copying gradient stops.
     pub fn transformed(&self, transform: Affine) -> Self {
         let mut paint = self.clone();

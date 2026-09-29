@@ -689,6 +689,19 @@ pub enum Op {
         /// The resolved paint (identity local space).
         paint: ResolvedPaint,
     },
+    /// A size-independent bitmap glyph realized at device scale.
+    BitmapGlyph {
+        /// The content transform at the glyph's origin.
+        local: Affine,
+        /// The registered font identity.
+        font: u64,
+        /// The glyph index.
+        glyph: u32,
+        /// The glyph origin in run coordinates.
+        origin: [f32; 2],
+        /// The run size.
+        size: f32,
+    },
     /// Open a clip scope.
     BeginClip {
         /// The ambient transform (the clip's own `extra` is inside
@@ -1154,7 +1167,10 @@ impl Lowerer<'_> {
             .get(&run.font.raw())
             .ok_or_else(|| RenderError::Font(format!("unregistered font {:?}", run.font)))?;
         let resolved = resolve(paint, Affine::IDENTITY, self.images)?;
-        if !font.has_colr && !run.glyphs.iter().any(|glyph| glyph.transform.is_some()) {
+        if !font.has_colr
+            && !font.has_bitmap
+            && !run.glyphs.iter().any(|glyph| glyph.transform.is_some())
+        {
             if !run.glyphs.is_empty() {
                 ops.push(Op::Glyphs {
                     local: ambient,
@@ -1187,6 +1203,9 @@ impl Lowerer<'_> {
             .fonts
             .get(&run.font.raw())
             .ok_or_else(|| RenderError::Font(format!("unregistered font {:?}", run.font)))?;
+        if font.has_bitmap {
+            return Err(RenderError::Unsupported(names::GLYPH_STROKE));
+        }
         for path in super::glyph::stroke_outlines(font, run)? {
             self.stroke(
                 ambient,
@@ -1227,6 +1246,7 @@ impl Lowerer<'_> {
         });
     }
 
+    #[inline(never)]
     fn color_glyph_run(
         &mut self,
         ambient: Affine,
@@ -1253,6 +1273,7 @@ impl Lowerer<'_> {
         let outlines = font_ref.outline_glyphs();
         let color_glyphs =
             (font.has_colr && font_ref.colr().is_ok()).then(|| font_ref.color_glyphs());
+        let bitmap = font.has_bitmap;
         let mut pending: Vec<cherenkov::Glyph> = Vec::new();
         for glyph in &run.glyphs {
             if let Some(color_glyphs) = color_glyphs.as_ref()
@@ -1284,6 +1305,20 @@ impl Lowerer<'_> {
                     &mut lowerer,
                     ops,
                 )?;
+                continue;
+            }
+            if bitmap {
+                let (local, origin) = match super::glyph::classify(glyph)? {
+                    super::glyph::GlyphPlacement::Translate(glyph) => (ambient, [glyph.x, glyph.y]),
+                    super::glyph::GlyphPlacement::Outline(place) => (ambient * place, [0.0, 0.0]),
+                };
+                ops.push(Op::BitmapGlyph {
+                    local,
+                    font: run.font.raw(),
+                    glyph: glyph.id,
+                    origin,
+                    size: run.size,
+                });
                 continue;
             }
             let place = match super::glyph::classify(glyph)? {

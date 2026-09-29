@@ -3,6 +3,7 @@
 //! or expand pictures again.
 
 use super::paint::{PaintData, paint_data};
+use crate::names;
 use cherenkov::kurbo::Affine;
 use cherenkov::{
     BlendMode, BlendSpace, Command, FontData, GlyphRun, RenderError, Shadow, ShapeData,
@@ -40,6 +41,13 @@ pub enum Op {
         run: GlyphRun,
         paint: PaintData,
     },
+    BitmapGlyph {
+        local: Affine,
+        font: u64,
+        glyph: u32,
+        origin: [f32; 2],
+        size: f32,
+    },
     /// Open a clip in its content space.
     BeginClip {
         local: Affine,
@@ -76,6 +84,7 @@ impl cherenkov::lowering::Operation for Op {
 pub struct Lowerer<'a> {
     pub images: &'a std::collections::HashMap<u64, std::sync::Arc<super::image::CpuImage>>,
     pub fonts: &'a mut std::collections::HashMap<u64, Font>,
+    pub bitmap_fonts: &'a std::collections::HashMap<u64, std::sync::Arc<super::bitmap::BitmapFont>>,
 }
 
 impl cherenkov::lowering::Compiler for Lowerer<'_> {
@@ -89,6 +98,9 @@ impl cherenkov::lowering::Compiler for Lowerer<'_> {
     ) -> Result<(), RenderError> {
         if let Command::Glyphs { run, paint } = command {
             if let cherenkov::GlyphStyle::Stroke(stroke) = &run.style {
+                if self.bitmap_fonts.contains_key(&run.font.raw()) {
+                    return Err(RenderError::Unsupported(names::GLYPH_STROKE));
+                }
                 self.stroke_glyphs(ambient, run, stroke, paint, ops)?;
             } else {
                 self.glyph_run(ambient, run, paint, ops)?;
@@ -191,7 +203,7 @@ impl Lowerer<'_> {
             .fonts
             .get(&run.font.raw())
             .ok_or_else(|| RenderError::Font(format!("unregistered font {:?}", run.font)))?;
-        if font.has_colr {
+        if font.has_colr || font.has_bitmap {
             return self.color_glyph_run(ambient, run, paint, &font.data.clone(), ops);
         }
         if run.glyphs.iter().any(|glyph| glyph.transform.is_some()) {
@@ -223,18 +235,12 @@ impl Lowerer<'_> {
         let mut pending: Vec<cherenkov::Glyph> = Vec::new();
         let mut colr_ctx: Option<(skrifa::FontRef<'_>, f64)> = None;
         let mut colr_checked = false;
+        let has_bitmap = self.bitmap_fonts.contains_key(&run.font.raw());
+        let mut bitmap_paint_checked = false;
         for glyph in &run.glyphs {
             if !colr_checked {
                 colr_checked = true;
-                let font_ref = skrifa::FontRef::from_index(&font_data.data, font_data.index)
-                    .map_err(|e| RenderError::Font(format!("{e}")))?;
-                if font_ref.colr().is_ok() {
-                    let upem = font_ref
-                        .head()
-                        .map_err(|e| RenderError::Font(format!("head: {e}")))?
-                        .units_per_em();
-                    colr_ctx = Some((font_ref, f64::from(upem)));
-                }
+                colr_ctx = Self::color_font_context(font_data)?;
             }
             if let Some((font_ref, upem)) = colr_ctx.as_ref()
                 && font_ref
@@ -274,6 +280,10 @@ impl Lowerer<'_> {
                     * super::glyph::checked_transform(glyph)?
                     * Affine::scale_non_uniform(s, -s);
                 cherenkov::lowering::append(picture.display_list(), ambient * place, self, ops)?;
+                continue;
+            }
+            if has_bitmap {
+                self.bitmap_glyph(ambient, run, paint, glyph, &mut bitmap_paint_checked, ops)?;
                 continue;
             }
             if glyph.transform.is_some() {
@@ -319,6 +329,49 @@ impl Lowerer<'_> {
                 paint: paint_data(paint, Affine::IDENTITY, self.images)?,
             });
         }
+        Ok(())
+    }
+
+    fn color_font_context(
+        font_data: &FontData,
+    ) -> Result<Option<(skrifa::FontRef<'_>, f64)>, RenderError> {
+        let font_ref = skrifa::FontRef::from_index(&font_data.data, font_data.index)
+            .map_err(|e| RenderError::Font(format!("{e}")))?;
+        if font_ref.colr().is_ok() {
+            let upem = font_ref
+                .head()
+                .map_err(|e| RenderError::Font(format!("head: {e}")))?
+                .units_per_em();
+            Ok(Some((font_ref, f64::from(upem))))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn bitmap_glyph(
+        &self,
+        ambient: Affine,
+        run: &GlyphRun,
+        paint: &cherenkov::Paint,
+        glyph: &cherenkov::Glyph,
+        paint_checked: &mut bool,
+        ops: &mut Vec<Op>,
+    ) -> Result<(), RenderError> {
+        if !*paint_checked {
+            let _ = paint_data(paint, Affine::IDENTITY, self.images)?;
+            *paint_checked = true;
+        }
+        let (local, origin) = match super::glyph::classify(glyph)? {
+            super::glyph::GlyphPlacement::Translate(glyph) => (ambient, [glyph.x, glyph.y]),
+            super::glyph::GlyphPlacement::Outline(place) => (ambient * place, [0.0, 0.0]),
+        };
+        ops.push(Op::BitmapGlyph {
+            local,
+            font: run.font.raw(),
+            glyph: glyph.id,
+            origin,
+            size: run.size,
+        });
         Ok(())
     }
 

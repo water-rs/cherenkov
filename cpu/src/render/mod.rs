@@ -3,6 +3,7 @@
 //! end's render loop.
 
 mod account;
+mod bitmap;
 mod blend;
 mod colr;
 mod filter;
@@ -27,7 +28,7 @@ use cherenkov::{
 };
 use lower::{ContentData, Item, Lowering};
 
-use crate::{Band, RasterConfig, RasterInfo, RasterTarget, names};
+use crate::{Band, RasterConfig, RasterInfo, RasterTarget};
 
 /// The largest surface dimension the CPU framebuffer supports.
 const MAX_SURFACE: u32 = 16384;
@@ -93,10 +94,13 @@ pub struct RasterRenderer {
     surfaces: HashMap<SurfaceId, SurfaceState>,
     pub(super) filters: filter::Registry,
     fonts: HashMap<u64, font::Font>,
+    bitmap_fonts: HashMap<u64, Arc<bitmap::BitmapFont>>,
     images: HashMap<u64, Arc<CpuImage>>,
     image_budget: u64,
     /// The glyph mask cache, bounded by `Budget::cpu`.
     glyph_cache: glyph::GlyphCache,
+    /// Decoded colour-font bitmaps, bounded by `Budget::cpu`.
+    bitmap_cache: bitmap::BitmapCache,
 }
 
 /// Runs on the render thread once: builds the worker pool, returning the
@@ -122,9 +126,11 @@ pub fn init(config: RasterConfig) -> Result<(RasterRenderer, RasterInfo), Engine
                     surfaces: HashMap::new(),
                     filters: filter::Registry::new(config.redraw),
                     fonts: HashMap::new(),
+                    bitmap_fonts: HashMap::new(),
                     images: HashMap::new(),
                     image_budget: config.budget.cpu.0,
                     glyph_cache: glyph::GlyphCache::new(config.budget.cpu.0),
+                    bitmap_cache: bitmap::BitmapCache::new(config.budget.cpu.0),
                 },
                 info,
             )
@@ -146,24 +152,17 @@ fn cpu_model() -> Option<String> {
     None
 }
 
-/// Validates font data with `skrifa`, rejecting bitmap-only colour fonts.
-///
-/// `COLR` fonts render through the colour-glyph lowering; fonts carrying
-/// `CBDT`/`CBLC` or `sbix` bitmaps without outline glyphs cannot
-/// rasterize.
-fn validate_font(data: &[u8], index: u32) -> Result<bool, ResourceError> {
-    use skrifa::MetadataProvider as _;
+/// Validates font data and detects colour-glyph sources.
+fn validate_font(
+    data: &[u8],
+    index: u32,
+) -> Result<(bool, Option<Arc<bitmap::BitmapFont>>), ResourceError> {
     use skrifa::raw::TableProvider as _;
     let font = skrifa::FontRef::from_index(data, index)
         .map_err(|e| ResourceError::Font(format!("{e}")))?;
-    if font.outline_glyphs().iter().next().is_none()
-        && [skrifa::Tag::new(b"CBDT"), skrifa::Tag::new(b"sbix")]
-            .iter()
-            .any(|tag| font.data_for_tag(*tag).is_some())
-    {
-        return Err(ResourceError::Unsupported(names::COLOR_FONT));
-    }
-    Ok(font.colr().is_ok())
+    let has_colr = font.colr().is_ok();
+    let bitmap = bitmap::BitmapFont::detect(data, index)?.map(Arc::new);
+    Ok((has_colr, bitmap))
 }
 
 impl Renderer for RasterRenderer {
@@ -254,12 +253,19 @@ impl Renderer for RasterRenderer {
     }
 
     fn add_font(&mut self, id: FontId, font: FontData) -> Result<(), ResourceError> {
-        let has_colr = validate_font(&font.data, font.index)?;
+        let (has_colr, bitmap) = validate_font(&font.data, font.index)?;
+        let has_bitmap = bitmap.is_some();
+        if let Some(bitmap) = bitmap {
+            self.bitmap_fonts.insert(id.raw(), bitmap);
+        } else {
+            self.bitmap_fonts.remove(&id.raw());
+        }
         self.fonts.insert(
             id.raw(),
             font::Font {
                 data: font,
                 has_colr,
+                has_bitmap,
                 colr: HashMap::new(),
             },
         );
@@ -268,6 +274,9 @@ impl Renderer for RasterRenderer {
 
     fn remove_font(&mut self, id: FontId) {
         self.fonts.remove(&id.raw());
+        self.bitmap_fonts.remove(&id.raw());
+        self.bitmap_cache.remove_font(id.raw());
+        self.refresh_cache_budgets();
         for surface in self.surfaces.values_mut() {
             for content in surface.layers.values_mut() {
                 content.invalidate();
@@ -284,17 +293,14 @@ impl Renderer for RasterRenderer {
             return Err(ResourceError::Image("CPU image budget exhausted".into()));
         }
         let decoded = Arc::new(CpuImage::decode(&image)?);
-        self.glyph_cache
-            .set_budget(self.image_budget.saturating_sub(resident + decoded.bytes()));
         self.images.insert(id.raw(), decoded);
+        self.refresh_cache_budgets();
         Ok(())
     }
 
     fn remove_image(&mut self, id: ImageId) {
         self.images.remove(&id.raw());
-        let resident: u64 = self.images.values().map(|image| image.bytes()).sum();
-        self.glyph_cache
-            .set_budget(self.image_budget.saturating_sub(resident));
+        self.refresh_cache_budgets();
         for surface in self.surfaces.values_mut() {
             for content in surface.layers.values_mut() {
                 content.invalidate();
@@ -412,6 +418,7 @@ impl Renderer for RasterRenderer {
         categories.glyphs = self.glyph_cache.bytes();
         categories.images = self.images.values().map(|image| image.bytes()).sum();
         categories.colr = self.fonts.values().map(font::Font::colr_bytes).sum();
+        categories.bitmaps = self.bitmap_cache.bytes();
         tracing::debug!(
             target: "cherenkov_cpu::memory",
             output = categories.output,
@@ -420,6 +427,7 @@ impl Renderer for RasterRenderer {
             images = categories.images,
             glyphs = categories.glyphs,
             colr = categories.colr,
+            bitmaps = categories.bitmaps,
             "memory usage",
         );
         // Backdrop captures are transient: the reported value is the
@@ -445,6 +453,7 @@ impl Renderer for RasterRenderer {
             }
             self.fonts.shrink_to_fit();
             self.glyph_cache.clear();
+            self.bitmap_cache.clear();
             for surface in self.surfaces.values_mut() {
                 for content in surface.layers.values_mut() {
                     content.trim();
@@ -520,6 +529,14 @@ impl RasterRenderer {
         Ok(rate.map_or(Redraw::None, |rate| Redraw::Wanted { rate }))
     }
 
+    fn refresh_cache_budgets(&mut self) {
+        let resident: u64 = self.images.values().map(|image| image.bytes()).sum();
+        let available = self.image_budget.saturating_sub(resident);
+        self.bitmap_cache
+            .set_budget(available.saturating_sub(self.glyph_cache.bytes()));
+        self.glyph_cache
+            .set_budget(available.saturating_sub(self.bitmap_cache.bytes()));
+    }
     /// Lowers and rasterizes one surface's frame.
     #[expect(
         clippy::many_single_char_names,
@@ -536,6 +553,7 @@ impl RasterRenderer {
         let id = sf.id;
         let mut items: Vec<Item> = Vec::new();
         let glyph_reqs;
+        let glyphs_rasterized;
         // Lowering borrows the layer caches; the surface borrow ends
         // before glyph resolution touches `self.fonts`/`self.glyph_cache`.
         let lowered = {
@@ -543,8 +561,18 @@ impl RasterRenderer {
                 return Ok(());
             };
             let mut caches = std::mem::take(&mut surf.layers);
-            let mut lowering = Lowering::new(&mut items, surf.size, Some(&mut self.filters), frame);
-            let result = lowering.run(id, sf.tree, &mut caches, &self.images, &mut self.fonts);
+            let mut lowering = Lowering::new(
+                &mut items,
+                surf.size,
+                Some(&mut self.filters),
+                frame,
+                &mut self.fonts,
+                &self.bitmap_fonts,
+                &mut self.bitmap_cache,
+            );
+            let result = lowering.run(id, sf.tree, &mut caches, &self.images);
+            glyphs_rasterized = lowering.glyphs_rasterized;
+            stats.glyphs_rasterized += glyphs_rasterized;
             stats.commands_lowered += lowering.commands_lowered;
             stats.layers_composed += lowering.layers_composed;
             glyph_reqs = std::mem::take(&mut lowering.glyphs);
@@ -554,6 +582,9 @@ impl RasterRenderer {
             result
         };
         lowered?;
+        if glyphs_rasterized > 0 {
+            self.refresh_cache_budgets();
+        }
         let lowered_at = start.map(|_| cherenkov::Instant::now());
         self.resolve_glyphs(&glyph_reqs)?;
         let resolved_at = start.map(|_| cherenkov::Instant::now());

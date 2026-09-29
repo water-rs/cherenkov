@@ -27,6 +27,10 @@ pub struct FontData {
     pub index: u32,
     /// Validated once at registration; plain runs do not reparse font tables.
     pub has_colr: bool,
+    /// Resolved once at registration like `has_colr`: `bitmap` is `Some`.
+    pub has_bitmap: bool,
+    /// Bitmap strike sizes validated at registration.
+    pub bitmap: Option<Arc<super::bitmap::BitmapFont>>,
     /// Built font-space `COLRv1` pictures, per `(glyph id, coords hash,
     /// paint hash)` — content is size-independent, so it is keyed without
     /// the placement. Interior mutability, not shared: parallel lowering
@@ -43,6 +47,8 @@ impl FontData {
             data: self.data.clone(),
             index: self.index,
             has_colr: self.has_colr,
+            has_bitmap: self.has_bitmap,
+            bitmap: self.bitmap.clone(),
             colr: std::cell::RefCell::new(self.colr.borrow().clone()),
         }
     }
@@ -594,7 +600,9 @@ impl Atlas {
                     }
                     self.plan_cells.push((*w, *h));
                 }
-                PendingRaster::MaskTexture { .. } | PendingRaster::Colr { .. } => {}
+                PendingRaster::MaskTexture { .. }
+                | PendingRaster::Colr { .. }
+                | PendingRaster::Bitmap { .. } => {}
             }
         }
     }
@@ -1186,6 +1194,19 @@ pub enum PendingRaster {
         /// The built picture.
         picture: cherenkov::Picture,
     },
+    /// A decoded bitmap glyph pending texture insertion.
+    Bitmap {
+        /// Exact font, strike, and glyph identity.
+        key: super::bitmap::BitmapKey,
+        /// Placement in em-space.
+        em: kurbo::Rect,
+        /// Bitmap width.
+        width: u32,
+        /// Bitmap height.
+        height: u32,
+        /// Premultiplied linear-P3 f16 texels.
+        texels: Vec<u8>,
+    },
 }
 
 /// The glyph's atlas cell. On a cache hit the entry is returned with
@@ -1622,6 +1643,8 @@ mod tests {
                 .into(),
             index: 0,
             has_colr: false,
+            has_bitmap: false,
+            bitmap: None,
             colr: std::cell::RefCell::new(HashMap::new()),
         };
         let key = |glyph: u32| GlyphKey {

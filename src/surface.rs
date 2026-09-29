@@ -124,14 +124,22 @@ impl<B: Backend> Shared<B> {
         self.waker.wake();
     }
 
-    /// Drains pending ops and live content changes into a change set.
-    /// Returns `None` when nothing changed.
-    pub fn take_changes(&mut self) -> Option<ChangeSet<B>> {
+    /// Samples running operand animations at `time`, then drains pending
+    /// ops and live content changes into a change set. Returns `None` when
+    /// nothing changed.
+    pub fn take_changes(&mut self, time: crate::Instant) -> Option<ChangeSet<B>> {
         let mut ops = std::mem::take(&mut self.spare_ops);
         let recycled = std::mem::take(&mut self.spare_recycled);
         ops.append(&mut self.pending);
+        let mut animating = false;
         for (id, slot) in &mut self.contents {
-            if let Some(change) = slot.content.as_mut().and_then(Content::take_change) {
+            let Some(content) = slot.content.as_mut() else {
+                continue;
+            };
+            // The sample queues the operands' per-frame values, so
+            // `take_change` emits them like signal updates.
+            animating |= content.sample(time);
+            if let Some(change) = content.take_change() {
                 ops.push(Op::Layer(LayerOp::Content(
                     *id,
                     Some(match change {
@@ -147,6 +155,7 @@ impl<B: Backend> Shared<B> {
                 clear,
                 ops,
                 recycled,
+                animating,
             })
         } else {
             self.spare_ops = ops;

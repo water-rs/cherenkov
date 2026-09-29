@@ -7,6 +7,7 @@ use std::sync::Arc;
 use kurbo::{Affine, Rect, Stroke};
 use serde::{Deserialize, Serialize};
 
+use crate::animation::AnimLanes;
 use crate::glyph::GlyphRun;
 use crate::paint::{ImageId, Paint, Sampling};
 use crate::shape::ShapeData;
@@ -129,6 +130,37 @@ pub enum Operand {
     Rect(Rect),
     /// A glyph run.
     Run(GlyphRun),
+}
+
+impl AnimLanes for Operand {
+    fn anim_lanes(&self, target: &Self) -> Option<Box<[f64]>> {
+        match (self, target) {
+            (Self::Shape(from), Self::Shape(to)) => from.anim_lanes(to),
+            (Self::Paint(from), Self::Paint(to)) => from.anim_lanes(to),
+            (Self::Stroke(from), Self::Stroke(to)) => from.anim_lanes(to),
+            (Self::Shadow(from), Self::Shadow(to)) => from.anim_lanes(to),
+            (Self::Rect(from), Self::Rect(to)) => from.anim_lanes(to),
+            (Self::Transform(from), Self::Transform(to)) => from.anim_lanes(to),
+            (Self::Group(from), Self::Group(to)) => from.anim_lanes(to),
+            // A glyph run and a variant change have no lane decomposition:
+            // the update snaps.
+            _ => None,
+        }
+    }
+
+    fn with_lanes(&self, lanes: &[f64]) -> Self {
+        match self {
+            Self::Shape(shape) => Self::Shape(shape.with_lanes(lanes)),
+            Self::Paint(paint) => Self::Paint(paint.with_lanes(lanes)),
+            Self::Stroke(stroke) => Self::Stroke(stroke.with_lanes(lanes)),
+            Self::Shadow(shadow) => Self::Shadow(shadow.with_lanes(lanes)),
+            Self::Rect(rect) => Self::Rect(rect.with_lanes(lanes)),
+            Self::Transform(transform) => Self::Transform(transform.with_lanes(lanes)),
+            Self::Group(group) => Self::Group(group.with_lanes(lanes)),
+            // No lane decomposition, so a run never gets here.
+            Self::Run(run) => Self::Run(run.clone()),
+        }
+    }
 }
 
 impl Operand {

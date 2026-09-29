@@ -904,6 +904,75 @@ use $crate::Instant;
             }
 
             #[test]
+            fn a_recorded_operand_animates_between_paints() {
+                let Some(engine) = engine() else { return };
+                let surface = surface(&engine);
+                let layer = surface.layer();
+                let red = WorkingColor::new([1.0, 0.0, 0.0, 1.0]);
+                let green = WorkingColor::new([0.0, 1.0, 0.0, 1.0]);
+                let blue = WorkingColor::new([0.0, 0.0, 1.0, 1.0]);
+                let animated = ::nami::binding(red);
+                let snapped = ::nami::binding(red);
+                let content = surface.record(|c| {
+                    c.fill(
+                        Rect::new(8.0, 8.0, 24.0, 56.0),
+                        animated.clone().with(Animation::from(Curve::linear(
+                            Duration::from_millis(400),
+                        ))),
+                    );
+                    c.fill(Rect::new(64.0, 8.0, 80.0, 56.0), snapped.clone());
+                });
+                surface.update(|tx| {
+                    tx[surface.root()].push(&layer);
+                    tx[&layer].content(content);
+                });
+                let t0 = Instant::now();
+                render_at(&engine, t0);
+
+                // The commit frame samples at dt = 0 — the animated operand
+                // still shows `from` while the plain change snaps.
+                animated.set(green);
+                snapped.set(blue);
+                let next = render_at(&engine, t0 + TICK);
+                let rb = surface.readback().expect("readback");
+                let start = rb.pixels[(16 * rb.width + 16) as usize];
+                assert!(start[0] > 0.95, "the operand starts at {start:?}");
+                let snapped_px = rb.pixels[(16 * rb.width + 72) as usize];
+                assert!(
+                    snapped_px[2] > 0.95,
+                    "the un-animated change snapped: {snapped_px:?}"
+                );
+                assert!(matches!(next, Next::At { .. }), "{next:?}");
+
+                // Mid-flight the colour is strictly between the endpoints,
+                // and only the animated command re-lowers per frame.
+                let next = render_at(&engine, t0 + TICK * 25);
+                assert_eq!(
+                    engine.stats().commands_lowered,
+                    1,
+                    "a running operand animation re-lowers only its own command"
+                );
+                let rb = surface.readback().expect("readback");
+                let mid = rb.pixels[(16 * rb.width + 16) as usize];
+                assert!(mid[0] < 0.95 && mid[1] > 0.05, "mid-flight {mid:?}");
+                assert!(matches!(next, Next::At { .. }), "{next:?}");
+
+                // Retargeting mid-flight keeps animating from the sampled
+                // position: the colour lands on the new target and idles.
+                animated.set(blue);
+                let mut t = t0 + TICK * 25;
+                for _ in 0..2000 {
+                    if render_at(&engine, t) == Next::Idle {
+                        break;
+                    }
+                    t += TICK;
+                }
+                let rb = surface.readback().expect("readback");
+                let end = rb.pixels[(16 * rb.width + 16) as usize];
+                assert!(end[2] > 0.95 && end[0] < 0.05, "settled at {end:?}");
+            }
+
+            #[test]
             fn next_schedules_the_frame_rate() {
                 let Some(engine) = engine() else { return };
                 let surface = surface(&engine);

@@ -199,4 +199,43 @@ impl Default for Group {
     }
 }
 
+impl crate::animation::AnimLanes for Shadow {
+    fn anim_lanes(&self, _target: &Self) -> Option<Box<[f64]>> {
+        let mut lanes = Vec::with_capacity(8);
+        lanes.extend([self.sigma, self.offset.x, self.offset.y, self.spread]);
+        lanes.extend(self.color.components.iter().map(|&c| f64::from(c)));
+        Some(lanes.into_boxed_slice())
+    }
+
+    fn with_lanes(&self, lanes: &[f64]) -> Self {
+        Self {
+            sigma: lanes[0],
+            offset: Vec2::new(lanes[1], lanes[2]),
+            spread: lanes[3],
+            color: WorkingColor::new([
+                lanes[4] as f32,
+                lanes[5] as f32,
+                lanes[6] as f32,
+                lanes[7] as f32,
+            ]),
+        }
+    }
+}
+
+impl crate::animation::AnimLanes for Group {
+    fn anim_lanes(&self, target: &Self) -> Option<Box<[f64]>> {
+        (self.blend == target.blend
+            && self.blend_space == target.blend_space
+            && self.filter == target.filter)
+            .then(|| Box::new([f64::from(self.opacity)]) as Box<[f64]>)
+    }
+
+    fn with_lanes(&self, lanes: &[f64]) -> Self {
+        Self {
+            opacity: lanes[0] as f32,
+            ..*self
+        }
+    }
+}
+
 nami_core::impl_constant!(Shadow, Group);

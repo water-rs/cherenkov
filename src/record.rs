@@ -3,6 +3,7 @@
 
 use std::any::Any;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::mem::{needs_drop, size_of};
 use std::rc::{Rc, Weak};
 
@@ -10,7 +11,9 @@ use kurbo::{Affine, Rect, Stroke};
 use nami_core::Signal;
 use serde::{Deserialize, Serialize};
 
-use crate::display_list::{Command, DisplayList, Operand, Picture, SlotUpdate};
+use crate::Instant;
+use crate::animation::{AnimLanes, Animation, OperandTrack};
+use crate::display_list::{Command, DisplayList, Operand, Picture, Slot, SlotUpdate};
 use crate::glyph::GlyphRun;
 use crate::paint::{ImageId, Paint, Sampling};
 use crate::shape::Shape;
@@ -209,6 +212,9 @@ enum Destination<T> {
         state: Weak<LiveState>,
         command: u32,
         convert: fn(T) -> Operand,
+        /// The operand the slot last received: an animated change starts
+        /// from it.
+        last: RefCell<Operand>,
     },
     Binding(Box<dyn Fn(nami_core::watcher::Context<T>)>),
 }
@@ -226,12 +232,22 @@ impl<T> Watch<T> {
                 state,
                 command,
                 convert,
+                last,
             } => {
                 if let Some(state) = state.upgrade() {
-                    state.push(SlotUpdate {
-                        command: *command,
-                        value: convert(context.into_value()),
-                    });
+                    // The `Context` metadata carries the animation a bound
+                    // signal was set under, exactly like a layer property's
+                    // binding op does.
+                    let animation = context.metadata().try_get::<Animation>();
+                    let value = convert(context.into_value());
+                    let from = std::mem::replace(&mut *last.borrow_mut(), value.clone());
+                    match animation {
+                        Some(animation) => state.animate(*command, from, value, animation),
+                        None => state.snap(SlotUpdate {
+                            command: *command,
+                            value,
+                        }),
+                    }
                 }
             }
             Destination::Binding(callback) => callback(context),
@@ -268,6 +284,17 @@ impl<S: Signal> Subscription<S::Output> for SignalSubscription<S> {
 }
 
 impl<T> Subscribe<T> {
+    /// Whether the value reports later changes — constants do not, and a
+    /// constant operand keeps its zero-copy move into the command.
+    #[expect(
+        clippy::inline_always,
+        reason = "expose the concrete subscription to the recorder's call site"
+    )]
+    #[inline(always)]
+    pub(crate) fn is_live(&self) -> bool {
+        self.0.is_some()
+    }
+
     #[expect(
         clippy::inline_always,
         reason = "expose the concrete subscription to the recorder's call site"
@@ -324,6 +351,8 @@ impl<T: 'static, S: Signal<Output = T>> From<S> for Live<T> {
 #[derive(Default)]
 pub struct LiveState {
     pending: RefCell<Vec<SlotUpdate>>,
+    /// A running animation per operand slot.
+    tracks: RefCell<HashMap<Slot, OperandTrack>>,
     guards: RefCell<Vec<Box<dyn Any>>>,
     waker: RefCell<Weak<crate::engine::Waker>>,
 }
@@ -337,10 +366,84 @@ impl LiveState {
             None => pending.push(update),
         }
         drop(pending);
+        self.wake();
+    }
+
+    fn wake(&self) {
         let waker = self.waker.borrow().upgrade();
         if let Some(waker) = waker {
             waker.wake();
         }
+    }
+
+    /// A change whose `Context` carried an `Animation`: starts or retargets
+    /// the slot's track. Endpoints sharing no lane decomposition snap the
+    /// change like an un-animated one.
+    ///
+    /// # Panics
+    /// Panics on a `Decay` animation, the same invariant `scroll_offset`'s
+    /// siblings hold.
+    fn animate(&self, command: u32, from: Operand, target: Operand, animation: Animation) {
+        assert!(
+            !matches!(animation, Animation::Decay(_)),
+            "Decay is only legal on scroll_offset"
+        );
+        let slot = Slot {
+            command,
+            operand: target.kind(),
+        };
+        let mut tracks = self.tracks.borrow_mut();
+        let mut tracked = match tracks.get_mut(&slot) {
+            // A running track retargets, keeping the last sampled position
+            // and velocity when the new target keeps the lane layout.
+            Some(track) => track.retarget(target.clone(), animation),
+            None => false,
+        };
+        if !tracked && let Some(from) = from.anim_lanes(&target) {
+            tracks.insert(slot, OperandTrack::new(from, target.clone(), animation));
+            tracked = true;
+        }
+        drop(tracks);
+        if tracked {
+            self.wake();
+        } else {
+            self.snap(SlotUpdate {
+                command,
+                value: target,
+            });
+        }
+    }
+
+    /// A change without an `Animation`: the value snaps and any track on
+    /// the slot drops.
+    fn snap(&self, update: SlotUpdate) {
+        self.tracks.borrow_mut().remove(&update.slot());
+        self.push(update);
+    }
+
+    /// Samples every running operand track at `time`, queuing the operand
+    /// updates the next [`Content::take_change`] drains. Returns `true`
+    /// while tracks still run.
+    fn sample(&self, time: Instant) -> bool {
+        let mut tracks = self.tracks.borrow_mut();
+        if tracks.is_empty() {
+            return false;
+        }
+        let mut pending = self.pending.borrow_mut();
+        let mut animating = false;
+        tracks.retain(|slot, track| {
+            let (value, running) = track.sample(time);
+            animating |= running;
+            match pending.iter_mut().find(|queued| queued.slot() == *slot) {
+                Some(queued) => queued.value = value,
+                None => pending.push(SlotUpdate {
+                    command: slot.command,
+                    value,
+                }),
+            }
+            running
+        });
+        animating
     }
 }
 
@@ -399,7 +502,9 @@ impl Recorder {
     }
 
     /// Subscribes to a value's later changes, which update operand `convert`
-    /// produces on command `command`.
+    /// produces on command `command`. `recorded` is the operand the recording
+    /// carries — `Some` exactly when `subscribe` is live — the value an
+    /// animated change starts from.
     #[expect(
         clippy::inline_always,
         reason = "expose constant signal subscriptions to call-site dead code elimination"
@@ -410,12 +515,17 @@ impl Recorder {
         subscribe: Subscribe<T>,
         command: u32,
         convert: fn(T) -> Operand,
+        recorded: Option<Operand>,
     ) {
+        let Some(recorded) = recorded else {
+            return;
+        };
         let guard = subscribe.start(Watch {
             destination: Destination::Slot {
                 state: Rc::downgrade(&self.live),
                 command,
                 convert,
+                last: RefCell::new(recorded),
             },
         });
         if let Some(guard) = guard {
@@ -437,14 +547,27 @@ impl Draw for Recorder {
         paint: impl Into<Live<P>>,
     ) {
         let (shape, paint) = (shape.into(), paint.into());
+        let shape_data = shape.value.into_data();
+        let paint_data: Paint = paint.value.into();
+        let shape_recorded = shape
+            .subscribe
+            .is_live()
+            .then(|| Operand::Shape(shape_data.clone()));
+        let paint_recorded = paint
+            .subscribe
+            .is_live()
+            .then(|| Operand::Paint(paint_data.clone()));
         let command = self.list.push(Command::Fill {
-            shape: shape.value.into_data(),
-            paint: paint.value.into(),
+            shape: shape_data,
+            paint: paint_data,
         });
-        self.subscribe(shape.subscribe, command, |shape: S| {
-            Operand::Shape(shape.into_data())
-        });
-        self.subscribe(paint.subscribe, command, paint_operand::<P>);
+        self.subscribe(
+            shape.subscribe,
+            command,
+            |shape: S| Operand::Shape(shape.into_data()),
+            shape_recorded,
+        );
+        self.subscribe(paint.subscribe, command, paint_operand::<P>, paint_recorded);
     }
 
     fn stroke<S: Shape, P: Into<Paint> + 'static>(
@@ -454,28 +577,57 @@ impl Draw for Recorder {
         paint: impl Into<Live<P>>,
     ) {
         let (shape, stroke, paint) = (shape.into(), stroke.into(), paint.into());
+        let shape_data = shape.value.into_data();
+        let paint_data: Paint = paint.value.into();
+        let shape_recorded = shape
+            .subscribe
+            .is_live()
+            .then(|| Operand::Shape(shape_data.clone()));
+        let stroke_recorded = stroke
+            .subscribe
+            .is_live()
+            .then(|| Operand::Stroke(stroke.value.clone()));
+        let paint_recorded = paint
+            .subscribe
+            .is_live()
+            .then(|| Operand::Paint(paint_data.clone()));
         let command = self.list.push(Command::Stroke {
-            shape: shape.value.into_data(),
+            shape: shape_data,
             stroke: stroke.value,
-            paint: paint.value.into(),
+            paint: paint_data,
         });
-        self.subscribe(shape.subscribe, command, |shape: S| {
-            Operand::Shape(shape.into_data())
-        });
-        self.subscribe(stroke.subscribe, command, Operand::Stroke);
-        self.subscribe(paint.subscribe, command, paint_operand::<P>);
+        self.subscribe(
+            shape.subscribe,
+            command,
+            |shape: S| Operand::Shape(shape.into_data()),
+            shape_recorded,
+        );
+        self.subscribe(stroke.subscribe, command, Operand::Stroke, stroke_recorded);
+        self.subscribe(paint.subscribe, command, paint_operand::<P>, paint_recorded);
     }
 
     fn shadow<S: Shape>(&mut self, shape: impl Into<Live<S>>, shadow: impl Into<Live<Shadow>>) {
         let (shape, shadow) = (shape.into(), shadow.into());
+        let shape_data = shape.value.into_data();
+        let shape_recorded = shape
+            .subscribe
+            .is_live()
+            .then(|| Operand::Shape(shape_data.clone()));
+        let shadow_recorded = shadow
+            .subscribe
+            .is_live()
+            .then(|| Operand::Shadow(shadow.value));
         let command = self.list.push(Command::Shadow {
-            shape: shape.value.into_data(),
+            shape: shape_data,
             shadow: shadow.value,
         });
-        self.subscribe(shape.subscribe, command, |shape: S| {
-            Operand::Shape(shape.into_data())
-        });
-        self.subscribe(shadow.subscribe, command, Operand::Shadow);
+        self.subscribe(
+            shape.subscribe,
+            command,
+            |shape: S| Operand::Shape(shape.into_data()),
+            shape_recorded,
+        );
+        self.subscribe(shadow.subscribe, command, Operand::Shadow, shadow_recorded);
     }
 
     #[expect(
@@ -490,64 +642,94 @@ impl Draw for Recorder {
     ) {
         let run = run.into();
         let paint = paint.into();
+        let paint_data: Paint = paint.value.into();
+        let run_recorded = run
+            .subscribe
+            .is_live()
+            .then(|| Operand::Run(run.value.clone()));
+        let paint_recorded = paint
+            .subscribe
+            .is_live()
+            .then(|| Operand::Paint(paint_data.clone()));
         let command = self.list.push(Command::Glyphs {
             run: run.value,
-            paint: paint.value.into(),
+            paint: paint_data,
         });
-        self.subscribe(run.subscribe, command, Operand::Run);
-        self.subscribe(paint.subscribe, command, paint_operand::<P>);
+        self.subscribe(run.subscribe, command, Operand::Run, run_recorded);
+        self.subscribe(paint.subscribe, command, paint_operand::<P>, paint_recorded);
     }
 
     fn image(&mut self, image: ImageId, dst: impl Into<Live<Rect>>, sampling: Sampling) {
         let dst = dst.into();
+        let recorded = dst.subscribe.is_live().then(|| Operand::Rect(dst.value));
         let command = self.list.push(Command::Image {
             image,
             dst: dst.value,
             sampling,
         });
-        self.subscribe(dst.subscribe, command, Operand::Rect);
+        self.subscribe(dst.subscribe, command, Operand::Rect, recorded);
     }
 
     fn picture(&mut self, picture: &Picture, transform: impl Into<Live<Affine>>) {
         let transform = transform.into();
+        let recorded = transform
+            .subscribe
+            .is_live()
+            .then(|| Operand::Transform(transform.value));
         let command = self.list.push(Command::Picture {
             picture: picture.clone(),
             transform: transform.value,
         });
-        self.subscribe(transform.subscribe, command, Operand::Transform);
+        self.subscribe(transform.subscribe, command, Operand::Transform, recorded);
     }
 
     fn clip<S: Shape>(&mut self, shape: impl Into<Live<S>>, body: impl FnOnce(&mut Self)) {
         let shape = shape.into();
+        let shape_data = shape.value.into_data();
+        let recorded = shape
+            .subscribe
+            .is_live()
+            .then(|| Operand::Shape(shape_data.clone()));
         let begin = self.list.push(Command::BeginClip {
-            shape: shape.value.into_data(),
+            shape: shape_data,
             end: 0,
         });
-        self.subscribe(shape.subscribe, begin, |shape: S| {
-            Operand::Shape(shape.into_data())
-        });
+        self.subscribe(
+            shape.subscribe,
+            begin,
+            |shape: S| Operand::Shape(shape.into_data()),
+            recorded,
+        );
         body(self);
         self.list.end(begin);
     }
 
     fn transform(&mut self, transform: impl Into<Live<Affine>>, body: impl FnOnce(&mut Self)) {
         let transform = transform.into();
+        let recorded = transform
+            .subscribe
+            .is_live()
+            .then(|| Operand::Transform(transform.value));
         let begin = self.list.push(Command::BeginTransform {
             transform: transform.value,
             end: 0,
         });
-        self.subscribe(transform.subscribe, begin, Operand::Transform);
+        self.subscribe(transform.subscribe, begin, Operand::Transform, recorded);
         body(self);
         self.list.end(begin);
     }
 
     fn group(&mut self, group: impl Into<Live<Group>>, body: impl FnOnce(&mut Self)) {
         let group = group.into();
+        let recorded = group
+            .subscribe
+            .is_live()
+            .then(|| Operand::Group(group.value));
         let begin = self.list.push(Command::BeginGroup {
             group: group.value,
             end: 0,
         });
-        self.subscribe(group.subscribe, begin, Operand::Group);
+        self.subscribe(group.subscribe, begin, Operand::Group, recorded);
         body(self);
         self.list.end(begin);
     }
@@ -683,6 +865,14 @@ impl Content {
         self.picture.display_list().is_empty()
     }
 
+    /// Samples every running operand animation at `time`, queueing the
+    /// operand updates [`take_change`](Self::take_change) drains. Returns
+    /// `true` while animations still run — the surface needs another frame
+    /// to keep them moving.
+    pub(crate) fn sample(&mut self, time: Instant) -> bool {
+        self.live.sample(time)
+    }
+
     /// The change to send at the next commit, if any. The first call sends the
     /// whole display list; later calls send only the slots whose signals
     /// changed.
@@ -733,6 +923,7 @@ mod tests {
     use super::*;
     use crate::color::{Color, Srgb};
     use crate::shape::ShapeData;
+    use crate::{Curve, WorkingColor};
 
     fn red() -> Color<Srgb> {
         Color::new([1., 0., 0., 1.])
@@ -936,6 +1127,141 @@ mod tests {
         assert_eq!(
             updates[0].value,
             Operand::Shape(ShapeData::Circle(Circle::new((0., 0.), 3.)))
+        );
+    }
+
+    #[test]
+    fn an_animated_operand_steps_into_take_change() {
+        let colour = binding(WorkingColor::new([1., 0., 0., 1.]));
+        let mut content = Content::record(|c| {
+            c.fill(
+                Rect::new(0., 0., 10., 10.),
+                colour.clone().with(Animation::from(Curve::linear(
+                    std::time::Duration::from_millis(400),
+                ))),
+            );
+        });
+        let Some(ContentChange::Replace(_)) = content.take_change() else {
+            panic!("the first commit sends the whole list");
+        };
+
+        // The change itself queues nothing: the first sample emits the
+        // start value, so the commit frame still shows `from`.
+        colour.set(WorkingColor::new([0., 1., 0., 1.]));
+        assert_eq!(content.take_change(), None, "the change defers to sampling");
+        let start = Instant::now();
+        assert!(content.sample(start), "the track is running");
+        let Some(ContentChange::Update(updates)) = content.take_change() else {
+            panic!("the first sample sends an update");
+        };
+        assert_eq!(
+            updates[0].value,
+            Operand::Paint(Paint::Solid(WorkingColor::new([1., 0., 0., 1.])))
+        );
+
+        // Half-way the sampled paint is the endpoints' midpoint.
+        assert!(content.sample(start + std::time::Duration::from_millis(200)));
+        let Some(ContentChange::Update(updates)) = content.take_change() else {
+            panic!("a mid-flight sample sends an update");
+        };
+        let Operand::Paint(Paint::Solid(mid)) = &updates[0].value else {
+            panic!("the fill's paint operand");
+        };
+        assert!((mid.components[1] - 0.5).abs() < 0.01, "mid {mid:?}");
+
+        // The settling sample reports the target exactly and stops running.
+        assert!(!content.sample(start + std::time::Duration::from_millis(400)));
+        let Some(ContentChange::Update(updates)) = content.take_change() else {
+            panic!("the settling sample sends an update");
+        };
+        assert_eq!(
+            updates[0].value,
+            Operand::Paint(Paint::Solid(WorkingColor::new([0., 1., 0., 1.])))
+        );
+        assert_eq!(
+            content.take_change(),
+            None,
+            "a settled track queues nothing"
+        );
+    }
+
+    #[test]
+    fn a_retargeted_operand_animates_from_its_sampled_position() {
+        let colour = binding(WorkingColor::new([1., 0., 0., 1.]));
+        let mut content = Content::record(|c| {
+            c.fill(
+                Rect::new(0., 0., 10., 10.),
+                colour.clone().with(Animation::from(Curve::linear(
+                    std::time::Duration::from_millis(400),
+                ))),
+            );
+        });
+        let _ = content.take_change();
+        let start = Instant::now();
+
+        colour.set(WorkingColor::new([0., 1., 0., 1.]));
+        assert!(content.sample(start + std::time::Duration::from_millis(200)));
+        let Some(ContentChange::Update(updates)) = content.take_change() else {
+            panic!("the mid-flight sample sends an update");
+        };
+        let Operand::Paint(Paint::Solid(mid)) = updates[0].value.clone() else {
+            panic!("the fill's paint operand");
+        };
+
+        // The retarget's first sample still holds the position it left at.
+        colour.set(WorkingColor::new([0., 0., 1., 1.]));
+        assert!(content.sample(start + std::time::Duration::from_millis(208)));
+        let Some(ContentChange::Update(updates)) = content.take_change() else {
+            panic!("the retarget's first sample sends an update");
+        };
+        assert_eq!(
+            updates[0].value,
+            Operand::Paint(Paint::Solid(mid)),
+            "the retarget starts where the previous track was"
+        );
+
+        // It settles on the new target, not the interrupted one.
+        let mut t = start + std::time::Duration::from_millis(208);
+        while content.sample(t) {
+            t += std::time::Duration::from_millis(16);
+        }
+        let Some(ContentChange::Update(updates)) = content.take_change() else {
+            panic!("the settling sample sends an update");
+        };
+        assert_eq!(
+            updates[0].value,
+            Operand::Paint(Paint::Solid(WorkingColor::new([0., 0., 1., 1.])))
+        );
+    }
+
+    #[test]
+    fn an_animated_change_without_shared_lanes_snaps() {
+        let paint = binding(Paint::Solid(WorkingColor::new([1., 0., 0., 1.])));
+        let mut content = Content::record(|c| {
+            c.fill(
+                Rect::new(0., 0., 10., 10.),
+                paint.clone().with(Animation::from(Curve::linear(
+                    std::time::Duration::from_millis(400),
+                ))),
+            );
+        });
+        let _ = content.take_change();
+
+        // A Solid fill cannot interpolate into a gradient: the change lands
+        // like an un-animated one instead of inventing lanes.
+        let gradient = Paint::Linear(
+            crate::paint::LinearGradient::new((0., 0.), (10., 0.))
+                .stop(0., WorkingColor::new([1., 0., 0., 1.]))
+                .stop(1., WorkingColor::new([0., 0., 1., 1.])),
+        );
+        paint.set(gradient.clone());
+        let Some(ContentChange::Update(updates)) = content.take_change() else {
+            panic!("the snap sends an update");
+        };
+        assert_eq!(updates[0].value, Operand::Paint(gradient));
+        assert!(
+            !content.sample(Instant::now()),
+            "a snapped change starts no track"
         );
     }
 

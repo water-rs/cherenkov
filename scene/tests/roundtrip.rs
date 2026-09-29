@@ -304,3 +304,116 @@ fn image_encodings_roundtrip() {
     }
     assert!(ImageEncoding::default().validate().is_ok());
 }
+
+#[test]
+fn backdrop_effect_specs_roundtrip() {
+    use cherenkov_scene::{BackdropEffectSpec, BackdropFilter, SceneError};
+    let specs = [
+        BackdropEffectSpec::ColorMatrix {
+            matrix: [
+                1.1, 0.0, 0.0, 0.05, 0.0, 0.95, 0.0, 0.02, 0.0, 0.0, 0.8, 0.0,
+            ],
+        },
+        BackdropEffectSpec::Refraction {
+            depth: 12.0,
+            strength: 6.0,
+        },
+        BackdropEffectSpec::RimLight {
+            width: 10.0,
+            color: [1.0, 0.9, 0.7, 1.0],
+            gain: 4.0,
+        },
+    ];
+    let dir = std::env::temp_dir().join(format!("cherenkov-scene-fx-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for (i, spec) in specs.iter().enumerate() {
+        // The spec itself serializes tagged like BackdropFilter.
+        let json = serde_json::to_string(spec).unwrap();
+        let back: BackdropEffectSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(*spec, back);
+
+        let mut b = Scene::builder(64, 64);
+        b.backdrop_group(1, vec![BackdropFilter::GaussianBlur { sigma: 4.0 }]);
+        b.root().layer(|m| {
+            m.clip(Shape::rect(8.0, 8.0, 56.0, 56.0));
+            m.backdrop(1);
+            m.backdrop_effect(spec.clone());
+        });
+        let scene = b.build();
+        assert!(scene.features.contains(&Feature::BackdropEffect));
+        let scene_dir = dir.join(format!("s{i}"));
+        scene.save(&scene_dir).unwrap();
+        let loaded = Scene::load(&scene_dir).unwrap();
+        assert_eq!(scene, loaded);
+    }
+
+    // A member without an effect keeps `backdrop_effect` out of the JSON.
+    let mut b = Scene::builder(64, 64);
+    b.backdrop_group(1, Vec::new());
+    b.root().layer(|m| {
+        m.clip(Shape::rect(8.0, 8.0, 56.0, 56.0));
+        m.backdrop(1);
+    });
+    let scene = b.build();
+    assert!(
+        !serde_json::to_string(&scene)
+            .unwrap()
+            .contains("backdrop_effect")
+    );
+
+    // Effect without a group.
+    let mut b = Scene::builder(64, 64);
+    b.root().layer(|m| {
+        m.clip(Shape::rect(8.0, 8.0, 56.0, 56.0));
+        m.backdrop_effect(BackdropEffectSpec::Refraction {
+            depth: 4.0,
+            strength: 4.0,
+        });
+    });
+    let scene_dir = dir.join("no-group");
+    b.build().save(&scene_dir).unwrap();
+    assert!(matches!(
+        Scene::load(&scene_dir),
+        Err(SceneError::BackdropEffectWithoutGroup)
+    ));
+
+    // Out-of-range parameters.
+    // (Non-finite matrix/parameter values cannot be expressed in JSON
+    //  anyway — serde emits `null` — so these exercise only ranges.)
+    for bad in [
+        BackdropEffectSpec::Refraction {
+            depth: 0.0,
+            strength: 1.0,
+        },
+        BackdropEffectSpec::Refraction {
+            depth: 4.0,
+            strength: -1.0,
+        },
+        BackdropEffectSpec::RimLight {
+            width: 0.0,
+            color: [1.0, 1.0, 1.0, 1.0],
+            gain: 1.0,
+        },
+        BackdropEffectSpec::RimLight {
+            width: 4.0,
+            color: [1.0, 1.0, 1.0, 1.0],
+            gain: -1.0,
+        },
+    ] {
+        let mut b = Scene::builder(64, 64);
+        b.backdrop_group(1, Vec::new());
+        b.root().layer(|m| {
+            m.clip(Shape::rect(8.0, 8.0, 56.0, 56.0));
+            m.backdrop(1);
+            m.backdrop_effect(bad.clone());
+        });
+        let scene_dir = dir.join(format!("bad-{}", dir.read_dir().unwrap().count()));
+        b.build().save(&scene_dir).unwrap();
+        let result = Scene::load(&scene_dir);
+        assert!(
+            matches!(result, Err(SceneError::InvalidBackdropEffect(_))),
+            "{bad:?} must be rejected, got {result:?}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -605,6 +605,7 @@ fn node_to_item(node: Node, place: Affine, scene_rect: Rect) -> Item {
             blend,
             backdrop: None,
             filter: None,
+            backdrop_effect: None,
             scroll_offset: kurbo::Vec2::ZERO,
             motion: None,
             live: Vec::new(),
@@ -1075,6 +1076,7 @@ pub fn items_for_glyph_run(
                     blend: BlendMode::Normal,
                     backdrop: None,
                     filter: None,
+                    backdrop_effect: None,
                     scroll_offset: kurbo::Vec2::ZERO,
                     motion: None,
                     items: vec![Item::Draw(Draw::Image {

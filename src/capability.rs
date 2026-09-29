@@ -13,7 +13,7 @@ use crate::ShaderId;
 use crate::backend::Backend;
 use crate::error::ResourceError;
 use crate::image::Format;
-use crate::message::{BackdropId, LayerId, SurfaceId};
+use crate::message::{BackdropId, BackdropShaderId, LayerId, SurfaceId};
 use crate::style::FilterId;
 
 /// The backend draws user WGSL shader paints.
@@ -150,6 +150,40 @@ pub trait BackdropRuns<K: filtrate_core::kind::Kind, F: BackdropChain<K> + crate
         id: BackdropId,
         filter: F,
     );
+}
+
+/// The backend compiles per-member backdrop effect shaders
+/// (`Engine::backdrop_shader`).
+pub trait BackdropShaders: Backdrop {
+    /// Registers a backdrop effect shader on the render thread, compiled
+    /// for the composite contract; the pipeline is built here, never at
+    /// draw time.
+    ///
+    /// # Errors
+    /// [`ResourceError::Shader`] when the source fails validation or
+    /// pipeline creation.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn add_backdrop_shader(
+        r: &mut Self::Renderer,
+        id: BackdropShaderId,
+        source: crate::BackdropShaderSource,
+    ) -> Result<(), ResourceError>;
+
+    /// Validates backdrop effect shader registration without blocking the
+    /// JS event loop.
+    ///
+    /// # Errors
+    /// Returns shader validation errors.
+    #[cfg(target_arch = "wasm32")]
+    fn add_backdrop_shader(
+        r: &mut Self::Renderer,
+        id: BackdropShaderId,
+        source: crate::BackdropShaderSource,
+    ) -> impl core::future::Future<Output = Result<(), ResourceError>>;
+
+    /// Unregisters a backdrop effect shader; frames that still sample it
+    /// fail.
+    fn remove_backdrop_shader(r: &mut Self::Renderer, id: BackdropShaderId);
 }
 
 /// The backend produces HDR output.

@@ -16,6 +16,9 @@ pub const BACKDROP_UNCLIPPED: &str = "backdrop-unclipped";
 pub const BACKDROP_FOOTPRINT: &str = "backdrop-footprint";
 /// A stroked bitmap glyph run.
 pub const GLYPH_STROKE: &str = "glyph-stroke";
+/// The unsupported feature: a refraction or shader backdrop effect on a
+/// member whose clip has no analytic shape (a path/mask clip).
+pub const BACKDROP_EFFECT_SDF_PATH: &str = "backdrop-effect-sdf-path";
 /// A colour font (COLR, CBDT or sbix).
 pub const COLOR_FONT: &str = "color-font";
 /// A blend space other than linear.

@@ -1,0 +1,231 @@
+{
+  "width": 256,
+  "height": 256,
+  "working_space": "linear-display-p3",
+  "clear": {
+    "space": "srgb",
+    "components": [
+      0.95,
+      0.95,
+      0.95,
+      1.0
+    ]
+  },
+  "features": [
+    {
+      "feature": "fill"
+    },
+    {
+      "feature": "clip"
+    },
+    {
+      "feature": "wide-gamut"
+    },
+    {
+      "feature": "backdrop"
+    },
+    {
+      "feature": "backdrop-blur"
+    },
+    {
+      "feature": "backdrop-effect"
+    }
+  ],
+  "backdrop_groups": [
+    {
+      "id": 1,
+      "filters": [
+        {
+          "filter": "gaussian-blur",
+          "value": {
+            "sigma": 8.0
+          }
+        }
+      ]
+    }
+  ],
+  "root": {
+    "transform": [
+      1.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0
+    ],
+    "opacity": 1.0,
+    "blend": "normal",
+    "items": [
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rect": {
+                "x0": 0.0,
+                "y0": 0.0,
+                "x1": 256.0,
+                "y1": 256.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "linear-p3",
+                "components": [
+                  0.0,
+                  0.35,
+                  0.6,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "circle": {
+                "center": {
+                  "x": 128.0,
+                  "y": 128.0
+                },
+                "radius": 72.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "linear-p3",
+                "components": [
+                  1.0,
+                  0.0,
+                  0.0,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "circle": {
+                "center": {
+                  "x": 64.0,
+                  "y": 208.0
+                },
+                "radius": 32.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "linear-p3",
+                "components": [
+                  0.0,
+                  0.9,
+                  0.4,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "layer": {
+          "transform": [
+            1.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0
+          ],
+          "clip": {
+            "rounded-rect": {
+              "rect": {
+                "x0": 32.0,
+                "y0": 48.0,
+                "x1": 224.0,
+                "y1": 176.0
+              },
+              "radii": {
+                "top_left": 20.0,
+                "top_right": 20.0,
+                "bottom_right": 20.0,
+                "bottom_left": 20.0
+              }
+            }
+          },
+          "opacity": 1.0,
+          "blend": "normal",
+          "backdrop": 1,
+          "backdrop_effect": {
+            "effect": "rim-light",
+            "value": {
+              "width": 10.0,
+              "color": [
+                0.0,
+                1.0,
+                0.0,
+                1.0
+              ],
+              "gain": 1.0
+            }
+          },
+          "items": []
+        }
+      },
+      {
+        "layer": {
+          "transform": [
+            1.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0
+          ],
+          "clip": {
+            "rounded-rect": {
+              "rect": {
+                "x0": 80.0,
+                "y0": 160.0,
+                "x1": 240.0,
+                "y1": 240.0
+              },
+              "radii": {
+                "top_left": 24.0,
+                "top_right": 24.0,
+                "bottom_right": 24.0,
+                "bottom_left": 24.0
+              }
+            }
+          },
+          "opacity": 1.0,
+          "blend": "normal",
+          "backdrop": 1,
+          "backdrop_effect": {
+            "effect": "rim-light",
+            "value": {
+              "width": 10.0,
+              "color": [
+                0.0,
+                1.0,
+                0.0,
+                1.0
+              ],
+              "gain": 1.0
+            }
+          },
+          "items": []
+        }
+      }
+    ]
+  }
+}

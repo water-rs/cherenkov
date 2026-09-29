@@ -155,11 +155,14 @@ impl Scene {
     }
 
     /// Serde helper: the default headroom is left out of `scene.json`.
-    #[expect(
-        clippy::trivially_copy_pass_by_ref,
-        clippy::float_cmp,
-        reason = "serde's skip_serializing_if takes a reference; the default test is exact equality"
+    #[cfg_attr(
+        not(target_arch = "wasm32"),
+        expect(
+            clippy::trivially_copy_pass_by_ref,
+            reason = "serde's skip_serializing_if takes a reference"
+        )
     )]
+    #[expect(clippy::float_cmp, reason = "the default test is exact equality")]
     pub(crate) fn is_default_present_headroom(headroom: &f64) -> bool {
         *headroom == Self::default_present_headroom()
     }

@@ -141,6 +141,10 @@ impl Backend for Null {
     }
 
     #[cfg(target_arch = "wasm32")]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the wasm32 `Backend::init` is async because real backends await the browser; the null backend answers synchronously"
+    )]
     async fn init(config: NullConfig) -> Result<(NullRenderer, NullInfo), EngineError> {
         Ok((NullRenderer::new(config), ()))
     }
@@ -245,6 +249,10 @@ impl Renderer for NullRenderer {
     }
 
     #[cfg(target_arch = "wasm32")]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the wasm32 `Renderer::render` is async because real backends await the browser; the null backend answers synchronously"
+    )]
     async fn render(
         &mut self,
         frame: &Frame<'_>,
@@ -282,6 +290,10 @@ impl Renderer for NullRenderer {
     }
 
     #[cfg(target_arch = "wasm32")]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the wasm32 `Renderer::readback` is async because real backends await the browser; the null backend answers synchronously"
+    )]
     async fn readback(&mut self, surface: SurfaceId) -> Result<Readback, RenderError> {
         let _ = surface;
         Ok(Readback {
@@ -314,6 +326,10 @@ impl ShaderPaint for Null {
     }
 
     #[cfg(target_arch = "wasm32")]
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the wasm32 `ShaderPaint::add_shader` is async because real backends await the browser; the null backend answers synchronously"
+    )]
     async fn add_shader(
         r: &mut NullRenderer,
         id: ShaderId,

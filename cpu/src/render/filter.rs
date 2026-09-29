@@ -1,6 +1,7 @@
 // Copyright 2026 the Cherenkov Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::time::Duration;
 use std::{
     collections::VecDeque,
@@ -146,10 +147,10 @@ impl SignalVisitor for WatcherInstaller<'_> {
 
 #[derive(Default)]
 pub struct Registry {
-    entries: std::collections::HashMap<u64, Entry>,
+    entries: FxHashMap<u64, Entry>,
     /// Backdrop groups by `(surface, group)`; `None` is an unfiltered
     /// group's registration marker.
-    backdrops: std::collections::HashMap<(u64, u64), Option<Entry>>,
+    backdrops: FxHashMap<(u64, u64), Option<Entry>>,
     redraw: Option<RedrawCallback>,
     last_frame: Option<(FrameId, cherenkov::Instant)>,
     delta: Duration,
@@ -331,11 +332,7 @@ impl Registry {
     }
 
     /// Marks filters and backdrop chains not sampled this frame inactive.
-    pub(super) fn set_active(
-        &self,
-        used: &std::collections::HashSet<u64>,
-        used_groups: &std::collections::HashSet<(u64, u64)>,
-    ) {
+    pub(super) fn set_active(&self, used: &FxHashSet<u64>, used_groups: &FxHashSet<(u64, u64)>) {
         for (id, entry) in &self.entries {
             entry.active.store(used.contains(id), Ordering::Release);
         }
@@ -363,8 +360,8 @@ impl Registry {
 
     pub(super) fn finish_frame(
         &mut self,
-        used: &std::collections::HashSet<u64>,
-        used_groups: &std::collections::HashSet<(u64, u64)>,
+        used: &FxHashSet<u64>,
+        used_groups: &FxHashSet<(u64, u64)>,
     ) {
         for id in used {
             if let Some(entry) = self.entries.get_mut(id) {

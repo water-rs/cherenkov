@@ -329,13 +329,14 @@ fn a_glyph_run_renders_and_the_second_frame_hits_the_cache() {
     let run = GlyphRun {
         font: font.id(),
         size: 32.0,
-        coords: Vec::new(),
+        coords: Vec::new().into(),
         glyphs: vec![Glyph {
             id: 36, // 'A' in most Latin fonts
             x: 8.0,
             y: 40.0,
             transform: None,
-        }],
+        }]
+        .into(),
         style: cherenkov::GlyphStyle::Fill,
     };
     let px = render_f32(&engine, 64, 64, |c| c.glyphs(run.clone(), RED));
@@ -377,13 +378,14 @@ fn sweep_renders_and_remaining_unsupported_features_report_their_names() {
     let run = GlyphRun {
         font: font.id(),
         size: 32.0,
-        coords: Vec::new(),
+        coords: Vec::new().into(),
         glyphs: vec![Glyph {
             id: 36,
             x: 8.0,
             y: 40.0,
             transform: Some(Affine::rotate(0.5)),
-        }],
+        }]
+        .into(),
         style: cherenkov::GlyphStyle::Fill,
     };
     let surface2 = engine2

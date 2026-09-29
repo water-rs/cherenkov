@@ -734,7 +734,7 @@ mod tests {
             },
             has_colr: true,
             has_bitmap: false,
-            colr: std::collections::HashMap::new(),
+            colr: rustc_hash::FxHashMap::default(),
         }
     }
 

@@ -45,15 +45,25 @@ fn glyph_run(font: FontId, id: u32, size: f32) -> GlyphRun {
     GlyphRun {
         font,
         size,
-        coords: Vec::new(),
+        coords: Vec::new().into(),
         glyphs: vec![Glyph {
             id,
             x: 24.0,
             y: 112.0,
             transform: None,
-        }],
+        }]
+        .into(),
         style: GlyphStyle::Fill,
     }
+}
+
+/// The single glyph of a [`GlyphRun`], mutable: `Arc::make_mut` clones
+/// the shared storage first when the run was already cloned into a
+/// binding.
+fn glyph_mut(run: &mut GlyphRun) -> &mut Glyph {
+    std::sync::Arc::make_mut(&mut run.glyphs)
+        .first_mut()
+        .expect("one-glyph run")
 }
 
 fn unregistered_image_error(bytes: &[u8], character: char) -> Option<String> {
@@ -174,7 +184,7 @@ fn equivalent(
     let (image_data, rect) = image_source(bytes, format, gid, ppem, size);
     let image = engine.image(image_data).expect("reference image");
     let mut run = glyph_run(font.id(), gid, size);
-    run.glyphs[0].transform = glyph_transform;
+    glyph_mut(&mut run).transform = glyph_transform;
     let placement = Affine::translate((24.0, 112.0)) * glyph_transform.unwrap_or(Affine::IDENTITY);
     let actual = engine
         .surface(Offscreen::new((320, 220), OffscreenFormat::LinearF16))
@@ -354,9 +364,9 @@ fn bitmap_cache_reuses_transformed_glyphs_and_uses_font_identity() {
     let second_font = engine.font(FontSource::bytes(bytes)).expect("second font");
     let transform = Affine::rotate(0.2) * Affine::scale_non_uniform(1.2, 0.8);
     let mut first_run = glyph_run(first_font.id(), small, 48.0);
-    first_run.glyphs[0].transform = Some(transform);
+    glyph_mut(&mut first_run).transform = Some(transform);
     let mut second_run = glyph_run(second_font.id(), small, 48.0);
-    second_run.glyphs[0].transform = Some(transform);
+    glyph_mut(&mut second_run).transform = Some(transform);
     let first = nami::Binding::container(first_run);
     let second = nami::Binding::container(second_run);
     let surface = engine
@@ -375,8 +385,8 @@ fn bitmap_cache_reuses_transformed_glyphs_and_uses_font_identity() {
     assert_eq!(engine.stats().glyphs_rasterized, 0);
 
     let mut changed = glyph_run(first_font.id(), large, 48.0);
-    changed.glyphs[0].x = 100.0;
-    changed.glyphs[0].transform = Some(transform);
+    glyph_mut(&mut changed).x = 100.0;
+    glyph_mut(&mut changed).transform = Some(transform);
     first.set(changed);
     engine.render(FrameTime::now()).expect("dirty glyph");
     assert_eq!(engine.stats().glyphs_rasterized, 1);
@@ -430,7 +440,7 @@ fn bitmap_cache_reuses_unchanged_glyphs_and_uses_font_identity() {
     assert_eq!(engine.stats().glyphs_rasterized, 0);
 
     let mut changed = glyph_run(first_font.id(), large, 48.0);
-    changed.glyphs[0].x = 100.0;
+    glyph_mut(&mut changed).x = 100.0;
     first.set(changed);
     engine.render(FrameTime::now()).expect("dirty glyph");
     assert_eq!(engine.stats().glyphs_rasterized, 1);
@@ -485,8 +495,8 @@ fn missing_notdef_is_empty_and_bitmap_transforms_validate_and_strokes_are_unsupp
             .all(|pixel| pixel[3].to_bits() == 0)
     );
 
-    missing.glyphs[0].id = glyph_id(&std::fs::read(CBDT_PATH).expect("CBDT fixture"), '😀');
-    missing.glyphs[0].transform = Some(Affine::scale_non_uniform(0.0, 1.0));
+    glyph_mut(&mut missing).id = glyph_id(&std::fs::read(CBDT_PATH).expect("CBDT fixture"), '😀');
+    glyph_mut(&mut missing).transform = Some(Affine::scale_non_uniform(0.0, 1.0));
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|c| {
             c.glyphs(missing.clone(), WorkingColor::WHITE);
@@ -498,7 +508,7 @@ fn missing_notdef_is_empty_and_bitmap_transforms_validate_and_strokes_are_unsupp
             if message == "glyph transform must be finite and invertible"
     ));
 
-    missing.glyphs[0].transform = Some(Affine::rotate(0.2));
+    glyph_mut(&mut missing).transform = Some(Affine::rotate(0.2));
     missing.style = GlyphStyle::Stroke(cherenkov::kurbo::Stroke::new(1.0));
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|c| {
@@ -537,8 +547,8 @@ fn render_static_bitmap(
         tx[surface.root()].push(&layer);
     });
     let mut run = glyph_run(font, glyph, 48.0);
-    run.glyphs[0].x = 10.0;
-    run.glyphs[0].y = 56.0;
+    glyph_mut(&mut run).x = 10.0;
+    glyph_mut(&mut run).y = 56.0;
     surface.update(|tx| {
         tx[&layer]
             .transform(transform)
@@ -573,8 +583,8 @@ fn an_animating_layer_places_bitmap_glyphs_on_the_quarter_pixel_grid()
         tx[surface.root()].push(&layer);
     });
     let mut run = glyph_run(font.id(), glyph, 48.0);
-    run.glyphs[0].x = 10.0;
-    run.glyphs[0].y = 56.0;
+    glyph_mut(&mut run).x = 10.0;
+    glyph_mut(&mut run).y = 56.0;
     surface.update(|tx| {
         tx[&layer].content(surface.record(|c| c.glyphs(run, WorkingColor::WHITE)));
     });

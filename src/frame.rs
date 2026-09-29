@@ -73,10 +73,10 @@ impl FrameId {
 
 /// The GPU time of one submitted frame, read from its timestamp queries.
 ///
-/// A backend whose queries resolve after the GPU finishes reports it in
-/// [`FrameStats::timings`] of a later [`Engine::render`](crate::Engine::render)
-/// or from [`Engine::finish_timings`](crate::Engine::finish_timings), so
-/// rendering never waits for GPU idle.
+/// GPU timings accumulate on the renderer and are returned only by
+/// [`Engine::finish_timings`](crate::Engine::finish_timings), oldest first.
+/// This tooling call waits for frames still on the GPU; rendering never
+/// waits for GPU idle.
 #[derive(Clone, Debug)]
 pub struct FrameTiming {
     /// The frame measured.
@@ -130,11 +130,6 @@ pub struct FrameStats {
     /// This render's frame, when it drew any surface; `None` when no
     /// surface had changed.
     pub frame: Option<FrameId>,
-    /// Every frame whose GPU timing became available during this render,
-    /// oldest first: this frame's own for a backend that times
-    /// synchronously, earlier frames' for one whose queries resolve
-    /// later. Empty when GPU timing is disabled or unsupported.
-    pub timings: Vec<FrameTiming>,
     /// CPU time spent in each render phase.
     pub phases: Phases,
     /// Render passes recorded (`render_to_texture` and effect passes).

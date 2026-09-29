@@ -15,7 +15,7 @@
 //! difference this backend documents.
 
 use rayon::prelude::*;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::ops::Range;
 
 use cherenkov::FillRule;
@@ -80,7 +80,7 @@ struct Capture {
 }
 
 /// This band's captures by backdrop group id.
-type Captures = HashMap<u64, Capture>;
+type Captures = FxHashMap<u64, Capture>;
 
 /// Per-band state shared across the recursive `run` calls.
 struct FrameCtx<'a> {
@@ -132,7 +132,7 @@ impl Scratch {
                 coverage: Vec::new(),
                 meter: Meter::default(),
             },
-            captures: Captures::new(),
+            captures: Captures::default(),
         }
     }
 }

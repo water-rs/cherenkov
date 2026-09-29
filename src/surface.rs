@@ -12,15 +12,15 @@
 use crate::local::Sender;
 use std::any::Any;
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::ops::{Index, IndexMut};
 use std::rc::Rc;
 #[cfg(not(target_arch = "wasm32"))]
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::SyncSender as Sender;
 
 use kurbo::{Affine, Vec2};
 use nami_core::watcher::Context;
+use rustc_hash::FxHashMap;
 
 use crate::animation::Animation;
 use crate::backend::{Backend, Display, SurfaceInfo};
@@ -31,7 +31,7 @@ use crate::frame::Readback;
 use crate::message::{
     BackdropId, ChangeSet, ContentOp, LayerId, LayerOp, Message, Op, Prop, SurfaceId,
 };
-use crate::record::{Content, Live};
+use crate::record::{Content, ContentSpare, Live};
 use crate::shape::{Shape, ShapeData};
 use crate::style::{BlendMode, FilterId};
 use crate::{ContentChange, Picture, WorkingColor};
@@ -62,8 +62,15 @@ pub struct Shared<B: Backend> {
     /// Ops queued outside transactions (layer creates and drops, bound
     /// signal changes) plus queued transaction ops.
     pending: Vec<Op<B>>,
-    /// Live contents per layer.
-    contents: HashMap<LayerId, Content>,
+    /// Reusable frame-handoff op buffer.
+    spare_ops: Vec<Op<B>>,
+    /// Reusable frame-handoff recycled-picture buffer.
+    spare_recycled: Vec<(LayerId, Picture)>,
+    /// Reusable transaction edit buffers.
+    edit_buffer: Vec<(LayerId, LayerEdit<B>)>,
+    edit_ops: Vec<Vec<EditOp<B>>>,
+    /// Content and reusable storage per layer.
+    contents: FxHashMap<LayerId, ContentSlot>,
     /// Pending clear colour.
     clear: Option<WorkingColor>,
     /// Layer id allocator (0 is the root).
@@ -73,11 +80,17 @@ pub struct Shared<B: Backend> {
     /// Live property subscriptions, keyed by layer and property. Binding a
     /// property replaces its previous subscription; dropping a layer drops
     /// them all.
-    bindings: HashMap<(u64, PropKind), Box<dyn Any>>,
+    bindings: FxHashMap<(u64, PropKind), Box<dyn Any>>,
     /// The engine wake-up, fired when an op is queued outside a frame.
     waker: Rc<Waker>,
     /// The last display properties announced to the render thread.
     display: Cell<Display>,
+}
+
+#[derive(Default)]
+struct ContentSlot {
+    content: Option<Content>,
+    spare: ContentSpare,
 }
 
 impl<B: Backend> std::fmt::Debug for Shared<B> {
@@ -94,11 +107,15 @@ impl<B: Backend> Shared<B> {
         Self {
             id,
             pending: Vec::new(),
-            contents: HashMap::new(),
+            spare_ops: Vec::new(),
+            spare_recycled: Vec::new(),
+            edit_buffer: Vec::new(),
+            edit_ops: Vec::new(),
+            contents: FxHashMap::default(),
             clear: None,
             next_layer: Cell::new(1),
             next_backdrop: Cell::new(1),
-            bindings: HashMap::new(),
+            bindings: FxHashMap::default(),
             waker,
             display: Cell::new(Display::default()),
         }
@@ -113,9 +130,11 @@ impl<B: Backend> Shared<B> {
     /// Drains pending ops and live content changes into a change set.
     /// Returns `None` when nothing changed.
     pub fn take_changes(&mut self) -> Option<ChangeSet<B>> {
-        let mut ops = std::mem::take(&mut self.pending);
-        for (id, content) in &mut self.contents {
-            if let Some(change) = content.take_change() {
+        let mut ops = std::mem::take(&mut self.spare_ops);
+        let recycled = std::mem::take(&mut self.spare_recycled);
+        ops.append(&mut self.pending);
+        for (id, slot) in &mut self.contents {
+            if let Some(change) = slot.content.as_mut().and_then(Content::take_change) {
                 ops.push(Op::Layer(LayerOp::Content(
                     *id,
                     Some(match change {
@@ -126,7 +145,27 @@ impl<B: Backend> Shared<B> {
             }
         }
         let clear = self.clear.take();
-        (clear.is_some() || !ops.is_empty()).then_some(ChangeSet { clear, ops })
+        if clear.is_some() || !ops.is_empty() || !recycled.is_empty() {
+            Some(ChangeSet {
+                clear,
+                ops,
+                recycled,
+            })
+        } else {
+            self.spare_ops = ops;
+            self.spare_recycled = recycled;
+            None
+        }
+    }
+
+    pub(crate) fn recycle(&mut self, ops: Vec<Op<B>>, recycled: &mut Vec<(LayerId, Picture)>) {
+        self.spare_ops = ops;
+        for (layer, picture) in recycled.drain(..) {
+            if let Some(slot) = self.contents.get_mut(&layer) {
+                slot.spare.picture = Some(picture);
+            }
+        }
+        self.spare_recycled = std::mem::take(recycled);
     }
 
     /// Binds `subscribe` so changes queue `op(layer, value, animation)` and
@@ -562,6 +601,18 @@ impl<B: Backend> LayerEdit<B> {
         self
     }
 
+    /// Records content, reusing picture storage returned by the render thread.
+    pub fn record(&mut self, body: impl FnOnce(&mut crate::Recorder)) -> &mut Self {
+        let spare = {
+            let mut shared = self.shared.borrow_mut();
+            std::mem::take(&mut shared.contents.entry(self.layer).or_default().spare)
+        };
+        self.ops.push(EditOp::Content(LayerContent::Content(
+            Content::record_reusing(spare, body),
+        )));
+        self
+    }
+
     /// Clears the content.
     pub fn clear_content(&mut self) -> &mut Self {
         self.ops.push(EditOp::Content(LayerContent::None));
@@ -622,6 +673,7 @@ impl<B: Backend> LayerEdit<B> {
 /// the [`LayerEdit`] accumulating that layer's changes.
 pub struct Transaction<'a, B: Backend> {
     edits: Vec<(LayerId, LayerEdit<B>)>,
+    edit_ops: Vec<Vec<EditOp<B>>>,
     shared: &'a Rc<RefCell<Shared<B>>>,
     /// The transaction-wide animation (`Surface::update_animated`).
     animation: Option<Animation>,
@@ -638,7 +690,7 @@ impl<B: Backend> Transaction<'_, B> {
             self.edits.push((
                 id,
                 LayerEdit {
-                    ops: Vec::new(),
+                    ops: self.edit_ops.pop().unwrap_or_default(),
                     layer: id,
                     shared: Rc::clone(self.shared),
                     default_animation: self.animation,
@@ -811,13 +863,22 @@ impl<B: Backend> Surface<B> {
         self.run_transaction(Some(animation.into()), body);
     }
 
+    #[expect(clippy::too_many_lines, reason = "one edit-op dispatch per design")]
     fn run_transaction(
         &self,
         animation: Option<Animation>,
         body: impl FnOnce(&mut Transaction<'_, B>),
     ) {
+        let (edits, edit_ops) = {
+            let mut shared = self.shared.borrow_mut();
+            (
+                std::mem::take(&mut shared.edit_buffer),
+                std::mem::take(&mut shared.edit_ops),
+            )
+        };
         let mut tx = Transaction {
-            edits: Vec::new(),
+            edits,
+            edit_ops,
             shared: &self.shared,
             animation,
             _surface: PhantomData,
@@ -828,73 +889,91 @@ impl<B: Backend> Surface<B> {
         // changes) come first.
         let pending = std::mem::take(&mut shared.pending);
         let mut ops = pending;
-        for (id, edit) in tx.edits {
-            for op in edit.ops {
+        for (id, edit) in &mut tx.edits {
+            for op in edit.ops.drain(..) {
                 match op {
-                    EditOp::Transform(prop) => ops.push(Op::Layer(LayerOp::Transform(id, prop))),
+                    EditOp::Transform(prop) => {
+                        ops.push(Op::Layer(LayerOp::Transform(*id, prop)));
+                    }
                     EditOp::Translation(prop) => {
-                        ops.push(Op::Layer(LayerOp::Translation(id, prop)));
+                        ops.push(Op::Layer(LayerOp::Translation(*id, prop)));
                     }
-                    EditOp::Rotation(prop) => ops.push(Op::Layer(LayerOp::Rotation(id, prop))),
-                    EditOp::Scale(prop) => ops.push(Op::Layer(LayerOp::Scale(id, prop))),
-                    EditOp::Skew(prop) => ops.push(Op::Layer(LayerOp::Skew(id, prop))),
-                    EditOp::Pivot(prop) => ops.push(Op::Layer(LayerOp::Pivot(id, prop))),
+                    EditOp::Rotation(prop) => {
+                        ops.push(Op::Layer(LayerOp::Rotation(*id, prop)));
+                    }
+                    EditOp::Scale(prop) => ops.push(Op::Layer(LayerOp::Scale(*id, prop))),
+                    EditOp::Skew(prop) => ops.push(Op::Layer(LayerOp::Skew(*id, prop))),
+                    EditOp::Pivot(prop) => ops.push(Op::Layer(LayerOp::Pivot(*id, prop))),
 
-                    EditOp::Opacity(prop) => ops.push(Op::Layer(LayerOp::Opacity(id, prop))),
-                    EditOp::ScrollOffset(prop) => {
-                        ops.push(Op::Layer(LayerOp::ScrollOffset(id, prop)));
+                    EditOp::Opacity(prop) => {
+                        ops.push(Op::Layer(LayerOp::Opacity(*id, prop)));
                     }
-                    EditOp::Clip(clip) => ops.push(Op::Layer(LayerOp::Clip(id, clip))),
-                    EditOp::Blend(blend) => ops.push(Op::Layer(LayerOp::Blend(id, blend))),
-                    EditOp::Filter(filter) => ops.push(Op::Layer(LayerOp::Filter(id, filter))),
+                    EditOp::ScrollOffset(prop) => {
+                        ops.push(Op::Layer(LayerOp::ScrollOffset(*id, prop)));
+                    }
+                    EditOp::Clip(clip) => ops.push(Op::Layer(LayerOp::Clip(*id, clip))),
+                    EditOp::Blend(blend) => ops.push(Op::Layer(LayerOp::Blend(*id, blend))),
+                    EditOp::Filter(filter) => ops.push(Op::Layer(LayerOp::Filter(*id, filter))),
                     EditOp::Backdrop(backdrop) => {
-                        ops.push(Op::Layer(LayerOp::Backdrop(id, backdrop)));
+                        ops.push(Op::Layer(LayerOp::Backdrop(*id, backdrop)));
                     }
                     EditOp::Content(LayerContent::Content(content)) => {
                         // A fresh `Content` replaces the previous one whole
                         // (its first `take_change` is a `Replace`).
-                        content.attach_waker(&shared.waker);
-                        shared.contents.insert(id, content);
-                        let stored = shared.contents.get_mut(&id).expect("just inserted");
+                        let waker = Rc::clone(&shared.waker);
+                        let slot = shared.contents.entry(*id).or_default();
+                        if let Some(previous) = slot.content.replace(content) {
+                            slot.spare.live = previous.retire().live;
+                        }
+                        let stored = slot.content.as_mut().expect("just inserted");
+                        stored.attach_waker(&waker);
                         if let Some(change) = stored.take_change() {
                             let content_op = match change {
                                 ContentChange::Replace(list) => ContentOp::Replace(list),
                                 ContentChange::Update(updates) => ContentOp::Update(updates),
                             };
-                            ops.push(Op::Layer(LayerOp::Content(id, Some(content_op))));
+                            ops.push(Op::Layer(LayerOp::Content(*id, Some(content_op))));
                         }
                     }
                     EditOp::Content(LayerContent::Picture(picture)) => {
-                        shared.contents.remove(&id);
+                        shared.contents.remove(id);
                         ops.push(Op::Layer(LayerOp::Content(
-                            id,
+                            *id,
                             Some(ContentOp::Picture(picture)),
                         )));
                     }
                     EditOp::Content(LayerContent::Install(install)) => {
-                        shared.contents.remove(&id);
+                        shared.contents.remove(id);
                         let surface = self.id;
+                        let layer = *id;
                         ops.push(Op::Install(Box::new(move |r| {
-                            install(r, surface, id);
+                            install(r, surface, layer);
                         })));
                     }
                     EditOp::Content(LayerContent::None) => {
-                        shared.contents.remove(&id);
-                        ops.push(Op::Layer(LayerOp::Content(id, None)));
+                        shared.contents.remove(id);
+                        ops.push(Op::Layer(LayerOp::Content(*id, None)));
                     }
-                    EditOp::Push(child) => ops.push(Op::Layer(LayerOp::Push { parent: id, child })),
+                    EditOp::Push(child) => {
+                        ops.push(Op::Layer(LayerOp::Push { parent: *id, child }));
+                    }
                     EditOp::Insert(index, child) => ops.push(Op::Layer(LayerOp::Insert {
-                        parent: id,
+                        parent: *id,
                         index,
                         child,
                     })),
                     EditOp::Detach(child) => {
-                        ops.push(Op::Layer(LayerOp::Detach { parent: id, child }));
+                        ops.push(Op::Layer(LayerOp::Detach { parent: *id, child }));
                     }
                 }
             }
         }
         shared.pending = ops;
+        for (_, edit) in tx.edits.drain(..) {
+            tx.edit_ops.push(edit.ops);
+        }
+        shared.edit_buffer = tx.edits;
+        shared.edit_ops = tx.edit_ops;
         shared.waker.wake();
     }
 
@@ -990,5 +1069,55 @@ impl<B: Backdrop> Surface<B> {
         self.new_backdrop_group(move |r, surface, id| {
             B::add_filtered_backdrop_group(r, surface, id, filter);
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+    use std::sync::mpsc;
+
+    use crate::testing::{Null, NullConfig};
+    use crate::{Engine, FrameTime, Offscreen, OffscreenFormat};
+
+    #[test]
+    fn layer_record_reuses_picture_storage_every_other_frame() {
+        let (events, _receiver) = mpsc::channel();
+        let engine = Engine::<Null>::new(NullConfig {
+            events,
+            reject: HashSet::new(),
+        })
+        .expect("init");
+        let surface = engine
+            .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))
+            .expect("surface");
+        let layer = surface.layer();
+        let mut pointers = Vec::new();
+
+        for _ in 0..7 {
+            surface.update(|tx| {
+                tx[&layer].record(|_| {});
+            });
+            engine.render(FrameTime::now()).expect("render");
+            let mut shared = surface.shared.borrow_mut();
+            let content = shared
+                .contents
+                .get_mut(&layer.id())
+                .expect("recorded content");
+            pointers.push(std::ptr::from_ref(
+                content
+                    .content
+                    .as_mut()
+                    .expect("recorded content")
+                    .snapshot(),
+            ));
+        }
+
+        assert_eq!(pointers[0], pointers[2]);
+        assert_eq!(pointers[1], pointers[3]);
+        assert_eq!(pointers[2], pointers[4]);
+        assert_eq!(pointers[3], pointers[5]);
+        assert_eq!(pointers[4], pointers[6]);
+        assert_ne!(pointers[0], pointers[1]);
     }
 }

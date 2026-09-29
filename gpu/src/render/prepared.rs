@@ -4,8 +4,9 @@
 //! Stage-1 lowering: a display list becomes a device-independent op
 //! stream, patchable in place along [`cherenkov::Dirty`] ranges.
 
-use std::collections::HashMap;
 use std::sync::Arc;
+
+use rustc_hash::FxHashMap;
 
 use cherenkov::kurbo::{Affine, Line, PathEl, Rect};
 use cherenkov::{
@@ -313,7 +314,7 @@ fn paint_data(
     paint: &Paint,
     to_local: Affine,
     stops: &mut Vec<Stop>,
-    images: &HashMap<u64, GpuImage>,
+    images: &FxHashMap<u64, GpuImage>,
 ) -> Result<PaintData, RenderError> {
     let mut data = PaintData {
         kind: PAINT_SOLID,
@@ -455,7 +456,7 @@ fn mesh_paint(
 fn resolve(
     paint: &Paint,
     to_local: Affine,
-    images: &HashMap<u64, GpuImage>,
+    images: &FxHashMap<u64, GpuImage>,
 ) -> Result<ResolvedPaint, RenderError> {
     if let Paint::Solid(color) = paint {
         return Ok(ResolvedPaint::Solid(color.components));
@@ -468,7 +469,7 @@ fn resolve(
 fn resolve_resources(
     paint: &Paint,
     to_local: Affine,
-    images: &HashMap<u64, GpuImage>,
+    images: &FxHashMap<u64, GpuImage>,
 ) -> Result<ResolvedPaint, RenderError> {
     if let Paint::Transformed(_) = paint {
         return resolve_transformed(paint, to_local, images);
@@ -489,7 +490,7 @@ fn resolve_resources(
 fn resolve_transformed(
     mut paint: &Paint,
     to_local: Affine,
-    images: &HashMap<u64, GpuImage>,
+    images: &FxHashMap<u64, GpuImage>,
 ) -> Result<ResolvedPaint, RenderError> {
     let mut transform = Affine::IDENTITY;
     while let Paint::Transformed(mapped) = paint {
@@ -607,7 +608,7 @@ pub enum GlyphSource {
 }
 
 impl GlyphSource {
-    const fn len(&self) -> usize {
+    fn len(&self) -> usize {
         match self {
             Self::Run(run) => run.glyphs.len(),
             Self::Command { count, .. } => *count,
@@ -771,9 +772,9 @@ pub struct Lowerer<'a> {
     /// COLR cache writes committed after parallel preparation.
     pub pending: &'a mut Vec<super::glyph::PendingRaster>,
     /// Fonts for colour glyph expansion.
-    pub fonts: &'a HashMap<u64, FontData>,
+    pub fonts: &'a FxHashMap<u64, FontData>,
     /// Images for resolving image paint dimensions.
-    pub images: &'a HashMap<u64, GpuImage>,
+    pub images: &'a FxHashMap<u64, GpuImage>,
 }
 
 impl cherenkov::lowering::Compiler for Lowerer<'_> {
@@ -862,7 +863,7 @@ impl Lowerer<'_> {
                 rule: *rule,
                 outline: source.map_or_else(
                     || Outline::Fill {
-                        elements: Arc::from(elements.as_slice()),
+                        elements: Arc::clone(elements),
                         content: path::hash_elements(elements, fill_tag(*rule)),
                     },
                     |command| Outline::Source {
@@ -1213,7 +1214,7 @@ impl Lowerer<'_> {
             self.stroke(
                 ambient,
                 &ShapeData::Path {
-                    elements: path.into_elements(),
+                    elements: path.into_elements().into(),
                     rule: FillRule::NonZero,
                 },
                 style,
@@ -1242,7 +1243,7 @@ impl Lowerer<'_> {
                 font: run.font,
                 size: run.size,
                 coords: run.coords.clone(),
-                glyphs: std::mem::take(pending),
+                glyphs: std::mem::take(pending).into(),
                 style: run.style.clone(),
             }),
             paint,
@@ -1278,7 +1279,7 @@ impl Lowerer<'_> {
             (font.has_colr && font_ref.colr().is_ok()).then(|| font_ref.color_glyphs());
         let bitmap = font.has_bitmap;
         let mut pending: Vec<cherenkov::Glyph> = Vec::new();
-        for glyph in &run.glyphs {
+        for glyph in run.glyphs.iter() {
             if let Some(color_glyphs) = color_glyphs.as_ref()
                 && color_glyphs.get(skrifa::GlyphId::new(glyph.id)).is_some()
             {
@@ -1344,7 +1345,7 @@ impl Lowerer<'_> {
             self.fill(
                 ambient,
                 &ShapeData::Path {
-                    elements: (place * font_scale * path).into_elements(),
+                    elements: (place * font_scale * path).into_elements().into(),
                     rule: FillRule::NonZero,
                 },
                 paint,
@@ -1361,7 +1362,7 @@ impl Lowerer<'_> {
 fn clip_shape(shape: &ShapeData) -> Result<ClipShape, RenderError> {
     if let ShapeData::Path { elements, rule } = shape {
         return Ok(ClipShape::Path {
-            elements: Arc::from(elements.as_slice()),
+            elements: Arc::clone(elements),
             rule: *rule,
         });
     }

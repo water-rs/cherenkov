@@ -5,10 +5,11 @@
 //! [`SurfaceTree`] per surface, applies commits, samples animations at the
 //! frame time, renders, and answers with [`Next`] and the [`FrameStats`].
 
-use std::collections::HashMap;
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
+
+use rustc_hash::FxHashMap;
 
 use crate::WorkingColor;
 use crate::backend::{Backend, Display, Frame, Redraw, Renderer, SurfaceFrame};
@@ -44,7 +45,7 @@ pub fn run<B: Backend>(
         }
     };
     let _ = init_reply.send(Ok(info));
-    let mut surfaces: HashMap<SurfaceId, SurfaceState> = HashMap::new();
+    let mut surfaces: FxHashMap<SurfaceId, SurfaceState> = FxHashMap::default();
     let mut next_frame = 0u64;
     while let Ok(message) = rx.recv() {
         match message {
@@ -93,13 +94,18 @@ pub fn run<B: Backend>(
             Message::Resource(op) => op(&mut renderer),
             Message::Render {
                 time,
-                commits,
+                mut commits,
                 reply,
             } => {
                 let id = FrameId(next_frame);
                 next_frame += 1;
-                let result = render::<B>(&mut renderer, &mut surfaces, id, time.0, commits);
-                let _ = reply.send(result);
+                let result = render::<B>(&mut renderer, &mut surfaces, id, time.0, &mut commits);
+                let sender = reply.clone();
+                let _ = sender.send(crate::message::RenderReply {
+                    result,
+                    commits,
+                    sender: reply,
+                });
             }
             Message::FinishTimings { reply } => {
                 let _ = reply.send(renderer.finish_timings());
@@ -108,7 +114,11 @@ pub fn run<B: Backend>(
                 let _ = reply.send(renderer.readback(surface));
             }
             Message::Memory { reply } => {
-                let _ = reply.send(renderer.memory());
+                let sender = reply.clone();
+                let _ = sender.send(crate::message::MemoryReply {
+                    usage: renderer.memory(),
+                    sender: reply,
+                });
             }
             Message::Trim(pressure) => renderer.trim(pressure),
             Message::Shutdown => break,
@@ -122,13 +132,18 @@ fn commit<B: Backend>(
     renderer: &mut B::Renderer,
     state: &mut SurfaceState,
     surface: SurfaceId,
-    changes: ChangeSet<B>,
+    changes: &mut ChangeSet<B>,
 ) {
-    if let Some(clear) = changes.clear {
+    let ChangeSet {
+        clear,
+        ops,
+        recycled,
+    } = changes;
+    if let Some(clear) = clear.take() {
         state.clear = clear;
         state.changed = true;
     }
-    for op in changes.ops {
+    for op in ops.drain(..) {
         match op {
             Op::Layer(LayerOp::Remove(layer)) => {
                 for removed in state.tree.remove(layer) {
@@ -139,7 +154,11 @@ fn commit<B: Backend>(
             Op::Layer(LayerOp::Content(layer, content)) => {
                 state.tree.apply(LayerOp::Content(layer, None));
                 state.tree.note_content(layer, content.as_ref());
-                renderer.set_content(surface, layer, content);
+                if let Some(mut old) = renderer.set_content(surface, layer, content)
+                    && old.clear_unique()
+                {
+                    recycled.push((layer, old));
+                }
                 state.changed = true;
             }
             Op::Layer(op) => {
@@ -158,18 +177,19 @@ fn commit<B: Backend>(
 #[cfg(not(target_arch = "wasm32"))]
 fn render<B: Backend>(
     renderer: &mut B::Renderer,
-    surfaces: &mut HashMap<SurfaceId, SurfaceState>,
+    surfaces: &mut FxHashMap<SurfaceId, SurfaceState>,
     id: FrameId,
     time: crate::Instant,
-    commits: Vec<(SurfaceId, ChangeSet<B>)>,
+    commits: &mut [(SurfaceId, ChangeSet<B>)],
 ) -> Result<(Next, FrameStats), RenderError> {
-    for (surface, changes) in commits {
-        match surfaces.get_mut(&surface) {
-            Some(state) => commit(renderer, state, surface, changes),
+    for (surface, changes) in commits.iter_mut() {
+        if let Some(state) = surfaces.get_mut(surface) {
+            commit(renderer, state, *surface, changes);
+        } else {
             // A dropped surface may still have queued ops: legal, ignore.
-            None => {
-                tracing::trace!(surface = surface.raw(), "commit for unknown surface");
-            }
+            tracing::trace!(surface = surface.raw(), "commit for unknown surface");
+            changes.clear = None;
+            changes.ops.clear();
         }
     }
     let mut frames: Vec<SurfaceFrame<'_>> = Vec::with_capacity(surfaces.len());
@@ -223,18 +243,19 @@ fn render<B: Backend>(
 )]
 async fn render_local<B: Backend>(
     renderer: &mut B::Renderer,
-    surfaces: &mut HashMap<SurfaceId, SurfaceState>,
+    surfaces: &mut FxHashMap<SurfaceId, SurfaceState>,
     id: FrameId,
     time: crate::Instant,
-    commits: Vec<(SurfaceId, ChangeSet<B>)>,
+    commits: &mut [(SurfaceId, ChangeSet<B>)],
 ) -> Result<(Next, FrameStats), RenderError> {
-    for (surface, changes) in commits {
-        match surfaces.get_mut(&surface) {
-            Some(state) => commit(renderer, state, surface, changes),
+    for (surface, changes) in commits.iter_mut() {
+        if let Some(state) = surfaces.get_mut(surface) {
+            commit(renderer, state, *surface, changes);
+        } else {
             // A dropped surface may still have queued ops: legal, ignore.
-            None => {
-                tracing::trace!(surface = surface.raw(), "commit for unknown surface");
-            }
+            tracing::trace!(surface = surface.raw(), "commit for unknown surface");
+            changes.clear = None;
+            changes.ops.clear();
         }
     }
     let mut frames: Vec<SurfaceFrame<'_>> = Vec::with_capacity(surfaces.len());
@@ -284,6 +305,62 @@ async fn render_local<B: Backend>(
     Ok((next, stats))
 }
 
+#[cfg(all(test, feature = "testing", not(target_arch = "wasm32")))]
+mod tests {
+    use super::{SurfaceState, commit};
+    use crate::WorkingColor;
+    use crate::backend::{Backend, Display};
+    use crate::display_list::{Command, DisplayList, Picture};
+    use crate::message::{ChangeSet, ContentOp, LayerId, LayerOp, Op, SurfaceId};
+    use crate::testing::{Null, NullConfig};
+    use crate::tree::SurfaceTree;
+
+    #[test]
+    fn caller_shared_picture_is_not_recycled() {
+        let (events, _receiver) = std::sync::mpsc::channel();
+        let (mut renderer, ()) = <Null as Backend>::init(NullConfig {
+            events,
+            reject: std::collections::HashSet::new(),
+        })
+        .expect("null backend");
+        let surface = SurfaceId::new(1);
+        let layer = LayerId::new(0);
+        let mut list = DisplayList::with_capacity(1);
+        list.push(Command::End);
+        let caller_picture = Picture::new(list);
+        let mut state = SurfaceState {
+            tree: SurfaceTree::new(),
+            size: (1, 1),
+            display: Display::default(),
+            clear: WorkingColor::TRANSPARENT,
+            changed: false,
+        };
+
+        let mut first = ChangeSet::<Null> {
+            clear: None,
+            ops: vec![Op::Layer(LayerOp::Content(
+                layer,
+                Some(ContentOp::Picture(caller_picture.clone())),
+            ))],
+            recycled: Vec::new(),
+        };
+        commit(&mut renderer, &mut state, surface, &mut first);
+        let mut second = ChangeSet::<Null> {
+            clear: None,
+            ops: vec![Op::Layer(LayerOp::Content(
+                layer,
+                Some(ContentOp::Picture(Picture::new(DisplayList::default()))),
+            ))],
+            recycled: Vec::new(),
+        };
+
+        commit(&mut renderer, &mut state, surface, &mut second);
+
+        assert!(second.recycled.is_empty());
+        assert_eq!(caller_picture.display_list().len(), 1);
+    }
+}
+
 #[cfg(target_arch = "wasm32")]
 pub(super) async fn local<B: Backend>(
     config: B::Config,
@@ -293,7 +370,7 @@ pub(super) async fn local<B: Backend>(
     let (renderer, info) = B::init(config).await?;
     let state = Rc::new(RefCell::new(Some(LocalState::<B> {
         renderer,
-        surfaces: HashMap::new(),
+        surfaces: FxHashMap::default(),
         next_frame: 0,
     })));
     let tx = crate::local::Sender::new(move |message| {
@@ -311,7 +388,7 @@ pub(super) async fn local<B: Backend>(
 #[cfg(target_arch = "wasm32")]
 struct LocalState<B: Backend> {
     renderer: B::Renderer,
-    surfaces: HashMap<SurfaceId, SurfaceState>,
+    surfaces: FxHashMap<SurfaceId, SurfaceState>,
     next_frame: u64,
 }
 #[cfg(target_arch = "wasm32")]
@@ -373,13 +450,13 @@ impl<B: Backend> LocalState<B> {
             Message::AsyncResource(op) => op(renderer).await,
             Message::Render {
                 time,
-                commits,
+                mut commits,
                 reply,
             } => {
                 let id = FrameId(*next_frame);
                 *next_frame += 1;
-                let result = render_local::<B>(renderer, surfaces, id, time.0, commits).await;
-                let _ = reply.send(result);
+                let result = render_local::<B>(renderer, surfaces, id, time.0, &mut commits).await;
+                let _ = reply.send(crate::message::RenderReply { result, commits });
             }
             Message::FinishTimings { reply } => {
                 let _ = reply.send(renderer.finish_timings().await);
@@ -388,7 +465,9 @@ impl<B: Backend> LocalState<B> {
                 let _ = reply.send(renderer.readback(surface).await);
             }
             Message::Memory { reply } => {
-                let _ = reply.send(renderer.memory());
+                let _ = reply.send(crate::message::MemoryReply {
+                    usage: renderer.memory(),
+                });
             }
             Message::Trim(pressure) => renderer.trim(pressure),
             Message::Shutdown => return false,

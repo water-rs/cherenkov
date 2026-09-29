@@ -245,14 +245,13 @@ fn many_timed_frames(engine: &Engine<Gpu>) -> Result<(), Box<dyn std::error::Err
     ))?))?;
     let surface = engine.surface(Offscreen::new((256, 256), OffscreenFormat::LinearF16))?;
     let mut submitted = Vec::new();
-    let mut timings = Vec::new();
     for frame in 0..60u32 {
         // A different glyph size each frame keeps rasterising new atlas
         // entries so the atlas grows and eventually clears.
         let run = cherenkov::GlyphRun {
             font: font.id(),
             size: 12.0 + f32::from(u16::try_from(frame)?),
-            coords: Vec::new(),
+            coords: Vec::new().into(),
             glyphs: (0..40u16)
                 .map(|i| cherenkov::Glyph {
                     id: 1 + (u32::from(i) + frame) % 60,
@@ -260,7 +259,8 @@ fn many_timed_frames(engine: &Engine<Gpu>) -> Result<(), Box<dyn std::error::Err
                     y: 40.0 + f32::from(i / 10) * 50.0,
                     transform: None,
                 })
-                .collect(),
+                .collect::<Vec<_>>()
+                .into(),
             style: cherenkov::GlyphStyle::Fill,
         };
         surface.update(|tx| {
@@ -281,20 +281,18 @@ fn many_timed_frames(engine: &Engine<Gpu>) -> Result<(), Box<dyn std::error::Err
         let stats = engine.stats();
         assert!(stats.passes > 0, "frame {frame} drew nothing: {stats:?}");
         submitted.push((stats.frame.expect("a drawing render submits"), stats.passes));
-        timings.extend(stats.timings);
     }
-    timings.extend(engine.finish_timings()?);
+    let timings = engine.finish_timings()?;
     assert!(
         engine.finish_timings()?.is_empty(),
         "timings are consumed once"
     );
     assert_eq!(engine.render(cherenkov::FrameTime::now())?, Next::Idle);
     let idle = engine.stats();
-    assert!(idle.frame.is_none() && idle.timings.is_empty(), "{idle:?}");
+    assert!(idle.frame.is_none(), "{idle:?}");
     if timed {
-        // Resolves land a frame or more late, but every submitted frame's
-        // timing arrives exactly once, in order, tagged with its frame,
-        // and spans that frame's passes.
+        // Every submitted frame's timing arrives exactly once, in order,
+        // tagged with its frame, and spans that frame's passes.
         assert_eq!(
             timings.iter().map(|t| t.frame).collect::<Vec<_>>(),
             submitted.iter().map(|(f, _)| *f).collect::<Vec<_>>(),
@@ -446,13 +444,14 @@ fn variants_split_ranges_but_not_pixels() -> Result<(), Box<dyn std::error::Erro
     let run = cherenkov::GlyphRun {
         font: font.id(),
         size: 24.0,
-        coords: Vec::new(),
+        coords: Vec::new().into(),
         glyphs: vec![cherenkov::Glyph {
             id: 1,
             x: 32.0,
             y: 88.0,
             transform: None,
-        }],
+        }]
+        .into(),
         style: cherenkov::GlyphStyle::Fill,
     };
     surface.update(|tx| {

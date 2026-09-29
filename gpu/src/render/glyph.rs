@@ -3,10 +3,11 @@
 
 //! The glyph atlas and glyph-run lowering.
 
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+
+use rustc_hash::FxHashMap;
 
 use kurbo::{Affine, PathEl, Vec2};
 use skrifa::MetadataProvider;
@@ -38,7 +39,7 @@ pub struct FontData {
     /// paint hash)` — content is size-independent, so it is keyed without
     /// the placement. Interior mutability, not shared: parallel lowering
     /// works on a per-thread snapshot.
-    pub colr: std::cell::RefCell<HashMap<(u32, u64, u64), cherenkov::Picture>>,
+    pub colr: std::cell::RefCell<FxHashMap<(u32, u64, u64), cherenkov::Picture>>,
 }
 
 impl FontData {
@@ -1480,7 +1481,7 @@ pub fn stroke_outlines(
     let coords: Vec<F2Dot14> = run.coords.iter().map(|c| F2Dot14::from_bits(*c)).collect();
     let outlines = font_ref.outline_glyphs();
     let mut paths = Vec::with_capacity(run.glyphs.len());
-    for glyph in &run.glyphs {
+    for glyph in run.glyphs.iter() {
         let path = outline(&outlines, &coords, glyph.id)?.ok_or_else(|| {
             RenderError::Font(format!("glyph {} has no stroke outline", glyph.id))
         })?;
@@ -1529,19 +1530,17 @@ impl Atlas {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-
     #[test]
     fn a_run_key_keeps_exact_identity_at_each_glyph_position() {
         let mut run = cherenkov::GlyphRun {
             font: cherenkov::FontId::new(91),
             size: 19.25,
-            coords: vec![],
-            glyphs: vec![],
+            coords: Vec::new().into(),
+            glyphs: Vec::new().into(),
             style: cherenkov::GlyphStyle::Fill,
         };
         for coords in [vec![], vec![0], vec![i16::MIN, 123, i16::MAX]] {
-            run.coords = coords;
+            run.coords = coords.into();
             for transform in [
                 Affine::IDENTITY,
                 Affine::new([1.5, -0.0, 0.25, 2.0, 7.0, -8.0]),
@@ -1648,7 +1647,7 @@ mod tests {
             has_colr: false,
             has_bitmap: false,
             bitmap: None,
-            colr: std::cell::RefCell::new(HashMap::new()),
+            colr: std::cell::RefCell::new(FxHashMap::default()),
         };
         let key = |glyph: u32| GlyphKey {
             font: 7,

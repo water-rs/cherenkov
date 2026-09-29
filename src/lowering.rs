@@ -352,9 +352,9 @@ impl<O: Operation, E> Content<O, E> {
     }
 
     /// Replace all source commands while keeping the lowering buffers available.
-    pub fn replace(&mut self, list: crate::Picture) {
+    pub fn replace(&mut self, list: crate::Picture) -> crate::Picture {
         self.live = true;
-        self.list = list;
+        let previous = std::mem::replace(&mut self.list, list);
         self.dirty = Dirty::default();
         self.emissions.clear();
         if let Some(lowered) = &mut self.lowered {
@@ -362,6 +362,13 @@ impl<O: Operation, E> Content<O, E> {
             lowered.spans.clear();
         }
         self.rebuild = true;
+        previous
+    }
+
+    /// Extract the retained source picture.
+    #[must_use]
+    pub fn into_picture(self) -> crate::Picture {
+        self.list
     }
 
     /// Retain immutable picture content, which cannot accept slot updates.
@@ -916,5 +923,32 @@ mod tests {
                 .any(|e| (e.1 - 42.7206).abs() < 1e-3 || (e.3 - 42.7206).abs() < 1e-3),
             "no edge boundary at the y≈42.72 crossing: {resolved:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod content_tests {
+    use super::{Content, Operation};
+
+    struct TestOp;
+
+    impl Operation for TestOp {
+        fn end_mut(&mut self) -> Option<&mut u32> {
+            None
+        }
+
+        fn same_structure(&self, _other: &Self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn replacement_returns_the_previous_picture() {
+        let previous = crate::Picture::new(crate::DisplayList::default());
+        let replacement = crate::Picture::new(crate::DisplayList::with_capacity(2));
+        let mut content = Content::<TestOp, ()>::new(previous.clone());
+
+        assert_eq!(content.replace(replacement.clone()), previous);
+        assert_eq!(content.into_picture(), replacement);
     }
 }

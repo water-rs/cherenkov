@@ -2,6 +2,7 @@
 
 use kurbo::{Affine, Stroke};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// A font registered with the engine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -53,11 +54,48 @@ pub struct GlyphRun {
     /// Size in the drawing's units per em.
     pub size: f32,
     /// Normalized variation coordinates, in `F2Dot14`.
-    pub coords: Vec<i16>,
+    pub coords: Arc<[i16]>,
     /// The glyphs.
-    pub glyphs: Vec<Glyph>,
+    pub glyphs: Arc<[Glyph]>,
     /// Fill or stroke.
     pub style: GlyphStyle,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FontId, Glyph, GlyphRun, GlyphStyle};
+
+    fn run() -> GlyphRun {
+        GlyphRun {
+            font: FontId::new(7),
+            size: 18.0,
+            coords: vec![-123, 456].into(),
+            glyphs: vec![Glyph {
+                id: 36,
+                x: 1.5,
+                y: 2.5,
+                transform: None,
+            }]
+            .into(),
+            style: GlyphStyle::Fill,
+        }
+    }
+
+    #[test]
+    fn clones_share_glyph_and_coordinate_storage() {
+        let run = run();
+        let cloned = run.clone();
+        assert_eq!(run.coords.as_ptr(), cloned.coords.as_ptr());
+        assert_eq!(run.glyphs.as_ptr(), cloned.glyphs.as_ptr());
+    }
+
+    #[test]
+    fn serde_round_trips_shared_slices() {
+        let run = run();
+        let encoded = serde_json::to_string(&run).expect("serialize glyph run");
+        let decoded: GlyphRun = serde_json::from_str(&encoded).expect("deserialize glyph run");
+        assert_eq!(decoded, run);
+    }
 }
 
 nami_core::impl_constant!(GlyphRun, GlyphStyle);

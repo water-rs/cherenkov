@@ -4,9 +4,9 @@
 //! Bitmap font strike selection and glyph decoding.
 
 use kurbo::Rect;
+use rustc_hash::FxHashMap;
 use skrifa::bitmap::{BitmapData, BitmapFormat, BitmapGlyph, BitmapStrikes, Origin};
 use skrifa::raw::TableProvider;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::image::CpuImage;
@@ -102,7 +102,7 @@ pub struct CpuBitmap {
 
 #[derive(Default)]
 pub struct BitmapCache {
-    map: HashMap<BitmapKey, Arc<CpuBitmap>>,
+    map: FxHashMap<BitmapKey, Arc<CpuBitmap>>,
     bytes: u64,
     budget: u64,
 }
@@ -110,7 +110,7 @@ pub struct BitmapCache {
 impl BitmapCache {
     pub fn new(budget: u64) -> Self {
         Self {
-            map: HashMap::new(),
+            map: FxHashMap::default(),
             bytes: 0,
             budget,
         }

@@ -30,12 +30,12 @@ const fn glyph(x: f32, y: f32, transform: Option<Affine>) -> Glyph {
     }
 }
 
-const fn run(font: cherenkov::FontId, glyphs: Vec<Glyph>, style: GlyphStyle) -> GlyphRun {
+fn run(font: cherenkov::FontId, glyphs: Vec<Glyph>, style: GlyphStyle) -> GlyphRun {
     GlyphRun {
         font,
         size: 38.0,
-        coords: Vec::new(),
-        glyphs,
+        coords: Vec::new().into(),
+        glyphs: glyphs.into(),
         style,
     }
 }
@@ -123,7 +123,9 @@ fn rotated_glyph_renders_outline_coverage() {
 
     // Back to `None`: the op count shrinks, forcing a rebuild that must
     // reproduce the untransformed frame exactly.
-    transformed.glyphs[1].transform = None;
+    let mut glyphs = transformed.glyphs.to_vec();
+    glyphs[1].transform = None;
+    transformed.glyphs = glyphs.into();
     value.set(transformed);
     engine.render(FrameTime::now()).expect("restored render");
     assert_eq!(plain_pixels, pixels(&surface));

@@ -23,6 +23,7 @@ pub trait RenderTransfer {}
 #[cfg(target_arch = "wasm32")]
 impl<T: ?Sized> RenderTransfer for T {}
 
+use crate::Picture;
 use crate::config::{MemoryUsage, Pressure};
 use crate::error::{EngineError, RenderError, ResourceError, SurfaceError};
 use crate::frame::{FrameId, FrameStats, FrameTime, FrameTiming, Readback};
@@ -102,8 +103,15 @@ pub trait Renderer: 'static {
     /// Unregisters an image.
     fn remove_image(&mut self, id: ImageId);
 
-    /// Replaces or updates a layer's recorded content, or clears it.
-    fn set_content(&mut self, surface: SurfaceId, layer: LayerId, content: Option<ContentOp>);
+    /// Replaces or updates a layer's content, or clears it. Returns the
+    /// previous picture when replaced or cleared, and `None` for updates or
+    /// when the layer held no picture.
+    fn set_content(
+        &mut self,
+        surface: SurfaceId,
+        layer: LayerId,
+        content: Option<ContentOp>,
+    ) -> Option<Picture>;
 
     /// The layer is gone: drop every cache keyed on it.
     fn remove_layer(&mut self, surface: SurfaceId, layer: LayerId);
@@ -128,10 +136,11 @@ pub trait Renderer: 'static {
         stats: &mut FrameStats,
     ) -> impl core::future::Future<Output = Result<Redraw, RenderError>>;
 
-    /// Waits for the GPU to finish every submitted frame whose timing no
-    /// render has reported yet, and returns those timings, oldest first.
-    /// A backend that times frames synchronously, or not at all, has
-    /// nothing outstanding.
+    /// Returns all GPU timings accumulated since the previous call,
+    /// oldest first. Timings stay on the renderer rather than being
+    /// returned by `render`; this tooling call waits for frames still on
+    /// the GPU. A backend that times frames synchronously, or not at all,
+    /// may have nothing outstanding.
     ///
     /// # Errors
     /// [`RenderError::Timeout`] when the GPU does not finish in time,
@@ -141,7 +150,9 @@ pub trait Renderer: 'static {
         Ok(Vec::new())
     }
 
-    /// Awaits outstanding GPU timing readbacks without blocking JavaScript.
+    /// Awaits outstanding GPU timing readbacks without blocking JavaScript
+    /// and returns all accumulated timings, oldest first. Render calls
+    /// never return GPU timings.
     ///
     /// # Errors
     /// Returns a timeout or readback error.

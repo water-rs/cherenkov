@@ -17,6 +17,7 @@ filtrate-core = { path = "filtrate/core" }
 kurbo = { version = "0.13.1", features = ["serde"] }
 libm = "0.2"
 nami-core = { version = "0.3.3", features = ["kurbo"] }
+rustc-hash = "2"
 serde = { version = "1", features = ["derive", "rc"] }
 thiserror = "2"
 tracing = "0.1"

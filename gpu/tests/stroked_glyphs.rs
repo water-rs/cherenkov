@@ -23,7 +23,7 @@ fn live_stroke_changes_match_cold_coverage_without_relowering_static_content() {
     let mut run = GlyphRun {
         font: font.id(),
         size: 38.0,
-        coords: Vec::new(),
+        coords: Vec::new().into(),
         glyphs: vec![
             Glyph {
                 id: 36,
@@ -37,7 +37,8 @@ fn live_stroke_changes_match_cold_coverage_without_relowering_static_content() {
                 y: 52.5,
                 transform: None,
             },
-        ],
+        ]
+        .into(),
         style: GlyphStyle::Stroke(Stroke::new(1.0)),
     };
     let value = Binding::container(run.clone());

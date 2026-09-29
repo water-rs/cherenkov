@@ -111,19 +111,18 @@ fn item_bytes(item: &Item) -> u64 {
 }
 
 /// Heap bytes of a shape's path elements.
-const fn shape_bytes(shape: &cherenkov::ShapeData) -> u64 {
+fn shape_bytes(shape: &cherenkov::ShapeData) -> u64 {
     match shape {
         cherenkov::ShapeData::Path { elements, .. } => {
-            (elements.capacity() * size_of::<PathEl>()) as u64
+            (elements.len() * size_of::<PathEl>()) as u64
         }
         _ => 0,
     }
 }
 
 /// Heap bytes of a glyph run's positioned glyphs and coordinates.
-const fn glyph_run_bytes(run: &cherenkov::GlyphRun) -> u64 {
-    (run.glyphs.capacity() * size_of::<cherenkov::Glyph>()
-        + run.coords.capacity() * size_of::<i16>()) as u64
+fn glyph_run_bytes(run: &cherenkov::GlyphRun) -> u64 {
+    (run.glyphs.len() * size_of::<cherenkov::Glyph>() + run.coords.len() * size_of::<i16>()) as u64
 }
 
 /// Heap bytes of a front-end paint's own allocations.

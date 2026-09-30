@@ -528,6 +528,48 @@ tx[&sparks].content(GpuContentHandle::new(Particles::new()));
 - **Custom GPU content composites like any other layer:** it can be clipped, filtered, animated and used as a backdrop source.
 - **The map records `Content`, not `GpuContent`.** Each tile is a frozen `Picture` and the camera is the layer transform, so pinch-zoom and fling run in the engine. Tessellation is refreshed at the new zoom level once the gesture settles.
 
+### Importing a foreign texture
+
+Each backend wraps a foreign texture once, in place, into a `wgpu::Texture`
+ready for `ExternalFrame::rgb` (or a YUV role it accepts): no pixel upload,
+no copy, no conversion texture.
+
+```rust
+// Metal (apple): an MTLTexture — typically IOSurface- or CVPixelBuffer-
+// backed — wraps through wgpu-hal; the caller keeps ownership and lifetime.
+let plane = unsafe {
+    interop::metal::import_texture(&device, mtl_texture, format)
+};
+
+// WebGPU (wasm32): a foreign GPUTexture wraps through
+// Device::create_texture_from_webgpu_handle after a reflected contract
+// check and a submission probe.
+let plane = interop::web::import_texture(&device, &queue, interop::web::WebTexture {
+    texture: gpu_texture,   // the producer's GPUTexture handle
+    device: gpu_device,     // the GPUDevice that created it (identity token)
+    release: interop::web::WebTextureLease::new(move || pool.retire(id)),
+}).await?;
+```
+
+- **`interop::metal::import_texture` is `unsafe`.** The `MTLTexture` must be
+  live on the same `MTLDevice` the engine wraps (or its peer group), `format`
+  must be byte-compatible with its pixel format, and the texture must stay
+  alive and unwritten — except by the producer — for as long as a frame
+  referencing it can be in flight.
+- **`interop::web::import_texture` validates the provider contract** by
+  reflection — an actual `GPUTexture` (a `GPUExternalTexture` is
+  `InvalidWebTexture::NotATexture`), the owning-device token
+  (`DeviceMismatch`), `rgba8unorm`/`bgra8unorm`/`rgba16float`, single-sample
+  2D, one mip, `TEXTURE_BINDING` (`Contract(InvalidFrame)`) — and by a
+  submission probe that catches destroyed or cross-device textures
+  (`Unusable`). The lease's release hook runs exactly once: at rejection,
+  or when the wrapper's last clone is dropped — slot replacement, detach,
+  surface or engine teardown.
+- **A transient handle cannot be detected.** A context's current canvas
+  texture satisfies every check but is recycled by the browser; it is
+  excluded by the provider contract — immutable contents and guaranteed
+  lifetime through retained and in-flight use — and must not be offered.
+
 ## Damage (invisible)
 
 - **Damage is computed from the change set,** at three levels:

@@ -9,7 +9,7 @@ use rustc_hash::FxHashMap;
 
 use kurbo::{Affine, Vec2};
 
-use crate::backend::{Backend, Frame, Redraw, Renderer, SurfaceInfo};
+use crate::backend::{Backend, Display, Frame, Redraw, Renderer, SurfaceInfo};
 use crate::capability::{ShaderPaint, ShaderSource};
 use crate::config::MemoryUsage;
 use crate::error::{EngineError, RenderError, ResourceError, SurfaceError};
@@ -60,6 +60,15 @@ pub struct FrameRecord {
     pub surface: SurfaceId,
     /// The frame's `changed` flag for this surface.
     pub changed: bool,
+    /// The frame's `present_pending` flag for this surface: a display
+    /// change re-presents without touching content (#98).
+    pub present_pending: bool,
+    /// The frame's `display_moved` flag for this surface: the host's
+    /// display-move announcement, which re-enumerates output
+    /// negotiation (#98).
+    pub display_moved: bool,
+    /// The display state the frame presented with.
+    pub display: Display,
     /// Every layer's sampled state.
     pub layers: Vec<LayerSample>,
 }
@@ -77,6 +86,27 @@ pub struct LayerSample {
     pub scroll_offset: Vec2,
     /// The layer's children, in paint order.
     pub children: Vec<LayerId>,
+}
+
+/// A surface target for the [`Null`] backend.
+///
+/// An [`Offscreen`] buffer or a window-like presenting target, so
+/// presentation semantics — a `Display` update marking `present_pending`
+/// — are testable without a real window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NullTarget {
+    /// An offscreen buffer; `Display` updates never mark presentation.
+    Offscreen(Offscreen),
+    /// A window-like target: it reports presenting, so `Display` updates
+    /// mark `SurfaceFrame::present_pending` exactly as a real swapchain
+    /// target does.
+    Window(Offscreen),
+}
+
+impl From<Offscreen> for NullTarget {
+    fn from(target: Offscreen) -> Self {
+        Self::Offscreen(target)
+    }
 }
 
 /// A backend that draws nothing and reports every call. The `Config`
@@ -158,7 +188,7 @@ impl NullRenderer {
 impl Backend for Null {
     type Config = NullConfig;
     type Info = NullInfo;
-    type Target = Offscreen;
+    type Target = NullTarget;
     type Renderer = NullRenderer;
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -175,14 +205,18 @@ impl Backend for Null {
 }
 
 impl Renderer for NullRenderer {
-    type Target = Offscreen;
+    type Target = NullTarget;
     type Font = FontData;
 
     fn create_surface(
         &mut self,
         id: SurfaceId,
-        target: Offscreen,
+        target: NullTarget,
     ) -> Result<SurfaceInfo, SurfaceError> {
+        let (target, presents) = match &target {
+            NullTarget::Offscreen(target) => (target, false),
+            NullTarget::Window(target) => (target, true),
+        };
         if target.size.0 == 0 || target.size.1 == 0 {
             return Err(SurfaceError::ZeroSize);
         }
@@ -195,6 +229,7 @@ impl Renderer for NullRenderer {
             max_dimension: u32::MAX,
             size: target.size,
             readable: true,
+            presents,
         })
     }
 
@@ -320,6 +355,9 @@ impl Renderer for NullRenderer {
             let _ = self.events.send(Event::Frame(FrameRecord {
                 surface: surface.id,
                 changed: surface.changed,
+                present_pending: surface.present_pending,
+                display_moved: surface.display_moved,
+                display: surface.display,
                 layers,
             }));
         }
@@ -348,6 +386,9 @@ impl Renderer for NullRenderer {
             let _ = self.events.send(Event::Frame(FrameRecord {
                 surface: surface.id,
                 changed: surface.changed,
+                present_pending: surface.present_pending,
+                display_moved: surface.display_moved,
+                display: surface.display,
                 layers,
             }));
         }
@@ -1815,6 +1856,185 @@ mod tests {
         engine.render(FrameTime::now()).unwrap();
         let record = frames(&rx).pop().expect("frame");
         assert!(!record.changed, "retired content cannot queue updates");
+    }
+
+    /// A `Surface::display` update on a surface that does not present
+    /// never marks `present_pending`, while a window-like target in the
+    /// same engine does: headroom and pending-present state belong only
+    /// to surfaces that present (#98). Before the confinement, a display
+    /// update on an `Offscreen` surface left `present_pending` set,
+    /// which a presenting backend consumed as an unhandled case.
+    #[test]
+    fn display_updates_mark_present_only_on_presenting_surfaces() {
+        use crate::Display;
+
+        let (engine, rx) = engine();
+        let offscreen = engine
+            .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))
+            .expect("offscreen surface");
+        let window = engine
+            .surface(NullTarget::Window(Offscreen::new(
+                (8, 8),
+                OffscreenFormat::LinearF16,
+            )))
+            .expect("window-like surface");
+        engine.render(FrameTime::now()).expect("render");
+        let _ = frames(&rx);
+
+        offscreen
+            .display(Display {
+                scale: 1.0,
+                headroom: 4.0,
+            })
+            .expect("display");
+        window
+            .display(Display {
+                scale: 1.0,
+                headroom: 4.0,
+            })
+            .expect("display");
+        engine.render(FrameTime::now()).expect("render");
+        let records = frames(&rx);
+        let offscreen_record = records
+            .iter()
+            .find(|record| record.surface == offscreen.id())
+            .expect("offscreen frame record");
+        let window_record = records
+            .iter()
+            .find(|record| record.surface == window.id())
+            .expect("window frame record");
+        assert!(
+            !offscreen_record.present_pending,
+            "a non-presenting surface cannot be pending a present"
+        );
+        assert!(
+            window_record.present_pending,
+            "a presenting surface is pending after a headroom update"
+        );
+        // The display value itself lands on both: only the pending
+        // present is confined.
+        assert_eq!(
+            offscreen_record.display.headroom.to_bits(),
+            4.0f32.to_bits()
+        );
+        assert_eq!(window_record.display.headroom.to_bits(), 4.0f32.to_bits());
+    }
+
+    /// A headroom-only `Surface::display` sequence (4 → 2 → 1 → 4, the
+    /// corpus's headroom sequence) marks `present_pending` on every frame
+    /// — never `changed`, so no scene re-generation or local-cache work —
+    /// and reaches the backend with the new headroom. A scale change
+    /// still marks `changed` (#98 C4).
+    #[test]
+    fn headroom_updates_present_without_regenerating_content() {
+        use crate::{Display, Draw, WorkingColor};
+
+        let (engine, rx) = engine();
+        let surface = engine
+            .surface(NullTarget::Window(Offscreen::new(
+                (8, 8),
+                OffscreenFormat::LinearF16,
+            )))
+            .expect("surface");
+        let layer = surface.layer();
+        let content =
+            surface.record(|c| c.fill(kurbo::Rect::new(0., 0., 8., 8.), WorkingColor::WHITE));
+        surface.update(|tx| {
+            tx[surface.root()].push(&layer);
+            tx[&layer].content(content);
+        });
+        engine.render(FrameTime::now()).expect("render");
+        let _ = frames(&rx);
+
+        for headroom in [4.0f32, 2.0, 1.0, 4.0] {
+            surface
+                .display(Display {
+                    scale: 1.0,
+                    headroom,
+                })
+                .expect("display");
+            engine.render(FrameTime::now()).expect("render");
+            let record = frames(&rx).pop().expect("frame record");
+            assert!(
+                !record.changed,
+                "a headroom-only update must not mark changed at headroom {headroom}"
+            );
+            assert!(
+                record.present_pending,
+                "a headroom update must mark presentation pending at headroom {headroom}"
+            );
+            assert_eq!(
+                record.display.headroom.to_bits(),
+                headroom.to_bits(),
+                "the frame must carry the new headroom"
+            );
+            let stats = engine.stats();
+            assert_eq!(
+                stats.commands_lowered, 0,
+                "a headroom-only update regenerates no scene content"
+            );
+        }
+
+        surface
+            .display(Display {
+                scale: 2.0,
+                headroom: 4.0,
+            })
+            .expect("display");
+        engine.render(FrameTime::now()).expect("render");
+        let record = frames(&rx).pop().expect("frame record");
+        assert!(
+            record.changed && record.present_pending,
+            "a scale change is content, not presentation-only"
+        );
+    }
+
+    /// `Surface::display_moved` rides to the frame as `display_moved`
+    /// and marks a present on a presenting surface; a headroom-only
+    /// `display` update never sets it, and the flag is consumed by one
+    /// frame (#98).
+    #[test]
+    fn display_moves_reach_the_frame_once() {
+        use crate::Display;
+
+        let (engine, rx) = engine();
+        let surface = engine
+            .surface(NullTarget::Window(Offscreen::new(
+                (8, 8),
+                OffscreenFormat::LinearF16,
+            )))
+            .expect("surface");
+        engine.render(FrameTime::now()).expect("render");
+        let _ = frames(&rx);
+
+        surface.display_moved().expect("display move");
+        engine.render(FrameTime::now()).expect("render");
+        let record = frames(&rx).pop().expect("frame record");
+        assert!(
+            record.display_moved && record.present_pending,
+            "a display move re-enumerates and presents"
+        );
+
+        engine.render(FrameTime::now()).expect("render");
+        let record = frames(&rx).pop().expect("frame record");
+        assert!(
+            !record.display_moved,
+            "the move flag is consumed by one frame"
+        );
+
+        surface
+            .display(Display {
+                scale: 1.0,
+                headroom: 3.0,
+            })
+            .expect("display");
+        engine.render(FrameTime::now()).expect("render");
+        let record = frames(&rx).pop().expect("frame record");
+        assert!(
+            !record.display_moved,
+            "a headroom-only update never moves the display"
+        );
+        assert!(record.present_pending);
     }
 }
 

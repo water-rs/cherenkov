@@ -95,6 +95,8 @@ pub enum Feature {
     BackdropColorMatrix,
     /// A member layer carries a per-member backdrop sampling effect.
     BackdropEffect,
+    /// A layer with a projective pose.
+    Projective,
 }
 
 /// The scene's working space. Only linear Display P3 exists today; the enum
@@ -218,7 +220,41 @@ impl Scene {
             });
         }
         scene.validate_backdrops()?;
+        scene.validate_projections()?;
         Ok(scene)
+    }
+
+    /// The scene root is never projective (it is the surface), a tilt
+    /// motion needs a projection to animate, and a rotation motion's
+    /// affine base recovery does not apply to a projective pose.
+    fn validate_projections(&self) -> Result<(), SceneError> {
+        fn walk(layer: &Layer) -> Result<(), SceneError> {
+            match (&layer.motion, &layer.projection) {
+                (Some(crate::Motion::Tilt { .. }), None) => {
+                    return Err(SceneError::InvalidProjection(
+                        "a tilt motion needs a projection",
+                    ));
+                }
+                (Some(crate::Motion::Rotation { .. }), Some(_)) => {
+                    return Err(SceneError::InvalidProjection(
+                        "a rotation motion on a projective layer",
+                    ));
+                }
+                _ => {}
+            }
+            for item in &layer.items {
+                if let Item::Layer(l) = item {
+                    walk(l)?;
+                }
+            }
+            Ok(())
+        }
+        if self.root.projection.is_some() {
+            return Err(SceneError::InvalidProjection(
+                "the scene root is projective",
+            ));
+        }
+        walk(&self.root)
     }
 
     /// Every layer's `backdrop` must name a declared group and carry a clip.
@@ -611,6 +647,9 @@ fn collect_layer_features(layer: &Layer, f: &mut BTreeSet<Feature>) {
     }
     if layer.backdrop_effect.is_some() {
         f.insert(Feature::BackdropEffect);
+    }
+    if layer.projection.is_some() {
+        f.insert(Feature::Projective);
     }
     for item in &layer.items {
         match item {

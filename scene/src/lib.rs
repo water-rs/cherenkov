@@ -37,6 +37,7 @@ pub use draw::{
 pub use error::SceneError;
 pub use layer::{
     FilterBlend, Group, GroupItem, Item, Layer, LayerFilter, Live, Motion, MotionAnimation,
+    Projection,
 };
 pub use scene::{Feature, Scene, WorkingSpace};
 pub use shape::{ContinuousRect, Shape};

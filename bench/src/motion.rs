@@ -9,8 +9,49 @@
 
 use std::time::{Duration, Instant};
 
-use cherenkov::{Animation, Backend, Curve, Decay, FrameTime, Layer, Spring, Surface};
-use cherenkov_scene::{Motion, MotionAnimation};
+use cherenkov::{
+    Animation, Curve, Decay, FrameTime, Layer, LayerEdit, Projective, ProjectiveLayers, Spring,
+    Surface,
+};
+use cherenkov_scene::{Motion, MotionAnimation, Projection};
+
+use crate::BenchError;
+
+/// A scene [`Projection`] in front-end types.
+pub struct LayerProjection {
+    /// The projection base.
+    projection: Projective,
+    /// The settled tilt.
+    tilt: Vec2,
+    /// The Z translation.
+    depth: f64,
+    /// The pivot the pose is centred on.
+    pivot: Vec2,
+}
+
+impl LayerProjection {
+    /// Translates a scene projection.
+    ///
+    /// # Errors
+    /// [`BenchError::Engine`] when the matrix is not a valid transform.
+    pub fn from_scene(projection: &Projection) -> Result<Self, BenchError> {
+        Ok(Self {
+            projection: Projective::from_rows(projection.matrix)
+                .map_err(|e| BenchError::Engine(format!("cherenkov: projection: {e}")))?,
+            tilt: projection.tilt,
+            depth: projection.depth,
+            pivot: projection.pivot,
+        })
+    }
+
+    /// Sets the projective pose on `edit`, after its affine `transform`.
+    pub fn apply<B: ProjectiveLayers>(&self, edit: &mut LayerEdit<B>) {
+        edit.pivot(self.pivot)
+            .projection(self.projection)
+            .tilt(self.tilt)
+            .depth(self.depth);
+    }
+}
 use kurbo::{Affine, Vec2};
 
 /// A scene [`Motion`] translated into front-end animation types.
@@ -37,6 +78,15 @@ pub enum LayerMotion {
         /// How it moves.
         animation: Animation,
     },
+    /// The projection's `tilt` animates `from` → `to` under `animation`.
+    Tilt {
+        /// The start tilt.
+        from: Vec2,
+        /// The static (settled) tilt.
+        to: Vec2,
+        /// How it moves.
+        animation: Animation,
+    },
     /// `scroll_offset` decays from `from` under `decay`; a decay starts
     /// at the committed value and travels `velocity / deceleration`, so
     /// the generator arranges `from + v/k` to be the static offset.
@@ -49,11 +99,16 @@ pub enum LayerMotion {
 }
 
 impl LayerMotion {
-    /// Translates a scene `motion`, given the layer's static `transform`.
-    /// The static `scroll_offset` is unused: a decay commits its `from`
-    /// state and comes to rest at `from + velocity / deceleration`.
+    /// Translates a scene `motion`, given the layer's static `transform`
+    /// and `projection`. The static `scroll_offset` is unused: a decay
+    /// commits its `from` state and comes to rest at `from + velocity /
+    /// deceleration`.
+    ///
+    /// # Panics
+    /// On a tilt motion without a projection, which scene validation
+    /// rejects.
     #[must_use]
-    pub fn from_scene(motion: &Motion, transform: Affine) -> Self {
+    pub fn from_scene(motion: &Motion, transform: Affine, projection: Option<&Projection>) -> Self {
         match motion {
             Motion::Rotation {
                 from,
@@ -75,6 +130,13 @@ impl LayerMotion {
                 to: transform,
                 animation: motion_animation(*animation),
             },
+            Motion::Tilt { from, animation } => Self::Tilt {
+                from: *from,
+                to: projection
+                    .expect("a validated tilt motion has a projection")
+                    .tilt,
+                animation: motion_animation(*animation),
+            },
             Motion::Scroll {
                 from,
                 velocity,
@@ -93,7 +155,7 @@ impl LayerMotion {
 
     /// Commits the motion on `layer`: the plain `from` set followed by the
     /// animated commit to the static value.
-    pub fn apply<B: Backend>(&self, surface: &Surface<B>, layer: &Layer) {
+    pub fn apply<B: ProjectiveLayers>(&self, surface: &Surface<B>, layer: &Layer) {
         match self {
             Self::Rotation {
                 base,
@@ -119,6 +181,18 @@ impl LayerMotion {
                 });
                 surface.update_animated(*animation, |tx| {
                     tx[layer].transform(*to);
+                });
+            }
+            Self::Tilt {
+                from,
+                to,
+                animation,
+            } => {
+                surface.update(|tx| {
+                    tx[layer].tilt(*from);
+                });
+                surface.update_animated(*animation, |tx| {
+                    tx[layer].tilt(*to);
                 });
             }
             Self::Scroll { from, decay } => {

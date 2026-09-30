@@ -35,6 +35,7 @@ pub mod metrics;
 pub mod paint;
 pub mod path;
 pub mod present;
+pub mod projective;
 pub mod render;
 pub mod resources;
 mod sdf;

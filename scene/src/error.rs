@@ -29,6 +29,11 @@ pub enum SceneError {
     /// A `backdrop_effect` parameter is non-finite or out of range.
     #[error("invalid backdrop effect: {0}")]
     InvalidBackdropEffect(&'static str),
+    /// A `projection` or a `Motion::Tilt` is misplaced: on the scene root,
+    /// a tilt motion without a projection, or a rotation motion on a
+    /// projective layer.
+    #[error("invalid projection: {0}")]
+    InvalidProjection(&'static str),
     /// The `features` set stored in `scene.json` does not match the features
     /// recomputed from the layer tree.
     #[error("stored features {declared:?} do not match recomputed {computed:?}")]

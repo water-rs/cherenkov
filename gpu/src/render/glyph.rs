@@ -1200,10 +1200,11 @@ impl Atlas {
         }
     }
 
-    /// The eviction clock: retained emissions compare it cheaply and
-    /// re-verify their references only after it moved.
-    pub const fn clock(&self) -> u64 {
-        self.clock
+    /// Identity an emission can compare in one load: texture generation
+    /// (grow/recycle) in the high half, eviction clock in the low — any
+    /// atlas change invalidating retained UVs moves it (#119).
+    pub const fn live_stamp(&self) -> u64 {
+        (self.generation << 32) | (self.clock & 0xFFFF_FFFF)
     }
 
     /// The epoch of the band occupying `slot` — compared with the

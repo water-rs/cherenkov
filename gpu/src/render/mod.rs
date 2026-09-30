@@ -3428,11 +3428,20 @@ impl GpuRenderer {
         results: &mut [Result<Lowered, RenderError>],
         grew: bool,
     ) -> Commit {
-        let touches: Vec<u32> = results
+        let mut touches: Vec<u32> = results
             .iter()
             .filter_map(|r| r.as_ref().ok())
             .flat_map(|l| l.touches.iter().copied())
             .collect();
+        // Replay pins arrive as `refs` ranges on each layer's storage;
+        // resolve them into the slots the commit must not evict (#119).
+        for surf in pending.iter_mut() {
+            for content in surf.layers.values_mut() {
+                for range in content.storage.touched.drain(..) {
+                    touches.extend(content.storage.refs[range].iter().map(|&(slot, _)| slot));
+                }
+            }
+        }
         self.atlas.begin_commit(&touches);
         let rasters: Vec<&glyph::PendingRaster> = results
             .iter()
@@ -3546,14 +3555,12 @@ impl GpuRenderer {
                         slots.extend(bands.iter().copied());
                     }
                 }
-                if let Some((start, len)) = emission.touch.take() {
-                    slots.extend(
-                        lowered.touches[start as usize..start as usize + len as usize]
-                            .iter()
-                            .copied(),
-                    );
-                }
-                if !slots.is_empty() {
+                if emission.live_stamp == lower::LIVE_PENDING {
+                    // `refs` still addresses the frame's touches: fold
+                    // those slots in, then swap the range for resolved
+                    // `(slot, band epoch)` pairs — always, even empty,
+                    // or it keeps addressing `touches` (#119).
+                    slots.extend(lowered.touches[emission.refs.clone()].iter().copied());
                     let first = content.storage.refs.len();
                     for slot in slots {
                         content
@@ -3565,13 +3572,13 @@ impl GpuRenderer {
                 }
                 // Restamp only when every reference survived this
                 // commit's evictions; a stale emission must keep an
-                // older clock so its next hit check walks the refs
+                // older stamp so its next hit check walks the refs
                 // and re-lowers (#119).
                 if content.storage.refs[emission.refs.clone()]
                     .iter()
                     .all(|&(s, ep)| self.atlas.shelf_epoch(s) == ep)
                 {
-                    emission.clock = self.atlas.clock();
+                    emission.live_stamp = self.atlas.live_stamp();
                 }
             }
         }

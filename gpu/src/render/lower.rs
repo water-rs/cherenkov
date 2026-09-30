@@ -451,6 +451,9 @@ pub struct EmissionStorage {
     /// `(shelf slot, band epoch)` atlas references every retained
     /// emission samples, addressed by `Emission::refs` ranges.
     pub(crate) refs: Vec<(u32, u64)>,
+    /// `refs` ranges of emissions replayed this frame; the commit pins
+    /// their bands against eviction, then drains (#119).
+    pub(crate) touched: Vec<Range<usize>>,
 }
 
 impl EmissionStorage {
@@ -485,6 +488,7 @@ impl EmissionStorage {
             instances: Vec::with_capacity(instances),
             stops: Vec::with_capacity(stops),
             refs: Vec::with_capacity(refs),
+            touched: Vec::new(),
         };
         for e in emissions.iter_mut().filter_map(|e| e.data.as_mut()) {
             storage.templates.push(self.templates[e.template]);
@@ -579,25 +583,30 @@ impl RetainedInstance {
     }
 }
 
+/// `Emission::live_stamp` while its `refs` still indexes
+/// `Lowering::touches` instead of `EmissionStorage::refs` — the commit
+/// that resolves it stamps the emission; a commit abandoned partway
+/// (grow or exhaust) leaves it, so the next hit check re-lowers (#119).
+pub const LIVE_PENDING: u64 = u64::MAX;
+
 /// Per-operation device output under its sampled placement.
 pub struct Emission {
     pub(crate) pending_cells: Vec<(u32, u32, u32)>,
-    /// Range into `EmissionStorage::refs` holding the `(shelf slot, band
-    /// epoch)` of every atlas band the retained instances sample —
-    /// re-verified whenever the atlas's eviction clock moved, so a
-    /// reclaimed band re-lowers instead of sampling stale texels (#119).
+    /// Resolved: range into `EmissionStorage::refs` holding the
+    /// `(shelf slot, band epoch)` of every atlas band the retained
+    /// instances sample. While `live_stamp == LIVE_PENDING` it instead
+    /// addresses the frame's `Lowering::touches` slots, which the
+    /// commit swaps for resolved pairs (#119).
     pub(crate) refs: Range<usize>,
-    /// The emission's slice of the frame's `Lowering::touches`, resolved
-    /// into `refs` by the commit; `None` once resolved (#119).
-    pub(crate) touch: Option<(u32, u32)>,
-    /// The atlas eviction clock at last verification.
-    pub(crate) clock: u64,
+    /// Atlas texture generation and eviction clock at last verification
+    /// — one compare on the hit fast path; `LIVE_PENDING` while the
+    /// commit that resolves `refs` has not landed (#119).
+    pub(crate) live_stamp: u64,
     template: usize,
     // Only shadows carry an occlusion key; ordinary leaves keep a small index.
     cover: Option<usize>,
     transform: Affine,
     size: [f32; 2],
-    generation: u64,
     pub(crate) instances: Range<usize>,
     stops: Range<usize>,
     image: Option<ImageSource>,
@@ -606,22 +615,20 @@ pub struct Emission {
 impl Emission {
     /// Whether every atlas band the retained UVs reference is still the
     /// band they were baked against. Between commits that evicted
-    /// nothing the stored `clock` short-circuits the walk; after an
-    /// eviction each referenced band's epoch must still match.
+    /// nothing the stored `live_stamp` short-circuits the walk; after
+    /// an eviction each referenced band's epoch must still match.
     fn atlas_live(&mut self, atlas: &Atlas, refs: &[(u32, u64)]) -> bool {
-        // An unresolved touch range means the commit that would fill
-        // `refs` was abandoned (grow or exhaust): never trust it.
-        if self.touch.is_some() {
-            return false;
-        }
-        if self.clock == atlas.clock() {
+        if self.live_stamp == atlas.live_stamp() {
             return true;
+        }
+        if self.live_stamp == LIVE_PENDING {
+            return false;
         }
         if refs
             .iter()
             .all(|&(slot, epoch)| atlas.shelf_epoch(slot) == epoch)
         {
-            self.clock = atlas.clock();
+            self.live_stamp = atlas.live_stamp();
             return true;
         }
         false
@@ -2341,16 +2348,18 @@ impl<'a> Lowering<'a> {
                 e.cover.map(|index| storage.covers[index]) == cover
                     && e.transform == self.transform
                     && e.size.map(f32::to_bits) == [self.width, self.height].map(f32::to_bits)
-                    && e.generation == glyphs.atlas.generation()
-                    && e.atlas_live(glyphs.atlas, &storage.refs[e.refs.clone()])
+                    && (e.live_stamp == glyphs.atlas.live_stamp()
+                        || (e.live_stamp != LIVE_PENDING
+                            && e.atlas_live(glyphs.atlas, &storage.refs[e.refs.clone()])))
             });
         cache.valid = true;
         if hit {
             if let Some(e) = cache.data.as_ref() {
                 // Pin the shelves the retained instances sample so this
-                // commit cannot evict them (#119).
-                for &(slot, _) in &storage.refs[e.refs.clone()] {
-                    self.touches.push(slot);
+                // commit cannot evict them; the commit resolves the
+                // range into slots (#119).
+                if !e.refs.is_empty() {
+                    storage.touched.push(e.refs.clone());
                 }
             }
             self.compose(
@@ -2455,12 +2464,11 @@ impl<'a> Lowering<'a> {
                 .iter()
                 .map(|&(i, p, c)| (i - instance_base, p, c))
                 .collect(),
-            refs: 0..0,
-            touch: Some((
-                u32::try_from(first_touch).expect("touch count fits u32"),
-                u32::try_from(self.touches.len() - first_touch).expect("touch count fits u32"),
-            )),
-            clock: glyphs.atlas.clock(),
+            // Unresolved until the commit lands: `refs` addresses
+            // `touches` slots until `apply_pending` swaps in the
+            // `(slot, band epoch)` pairs (#119).
+            refs: first_touch..self.touches.len(),
+            live_stamp: LIVE_PENDING,
             template,
             cover: cover.map(|cover| {
                 storage.covers.push(cover);
@@ -2468,7 +2476,6 @@ impl<'a> Lowering<'a> {
             }),
             transform,
             size: [self.width, self.height],
-            generation: glyphs.atlas.generation(),
             instances: retained_instance..storage.instances.len(),
             stops: retained_stop..storage.stops.len(),
             image: self

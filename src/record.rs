@@ -335,10 +335,10 @@ impl<T: 'static, S: Signal<Output = T>> From<S> for Live<T> {
 #[derive(Default)]
 pub struct LiveState {
     pending: RefCell<Vec<SlotUpdate>>,
-    /// Animated changes not yet sampled into tracks.
-    animates: RefCell<Vec<Animate>>,
-    /// A running animation per operand slot.
-    tracks: RefCell<HashMap<Slot, OperandTrack>>,
+    /// Queued animated changes and running tracks. `None` until the
+    /// first animated change, so a static `LiveState` costs one
+    /// `Option` to build and drop, not a `HashMap`.
+    anim: Cell<Option<Box<AnimState>>>,
     /// Set while queued animates or running tracks make
     /// [`LiveState::sample`] worth its borrows. `pub(crate)` so the
     /// surface drain can probe it as a plain cell read — `sample` is a
@@ -351,6 +351,16 @@ pub struct LiveState {
 /// A change carrying an `Animation`, queued until the next
 /// [`LiveState::sample`] resolves the operand it animates from.
 type Animate = (u32, Operand, Animation);
+
+/// The animated-operand machinery of a [`LiveState`], present only
+/// while a change is queued or a track runs.
+#[derive(Default)]
+struct AnimState {
+    /// Animated changes not yet sampled into tracks.
+    animates: Vec<Animate>,
+    /// A running animation per operand slot.
+    tracks: HashMap<Slot, OperandTrack>,
+}
 
 impl LiveState {
     fn push(&self, update: SlotUpdate) {
@@ -383,9 +393,9 @@ impl LiveState {
             !matches!(animation, Animation::Decay(_)),
             "Decay is only legal on scroll_offset"
         );
-        self.animates
-            .borrow_mut()
-            .push((command, target, animation));
+        let mut anim = self.anim.take().unwrap_or_default();
+        anim.animates.push((command, target, animation));
+        self.anim.set(Some(anim));
         self.needs_sample.set(true);
         self.wake();
     }
@@ -394,16 +404,17 @@ impl LiveState {
     /// queued animate on the slot drops.
     fn snap(&self, update: SlotUpdate) {
         let slot = update.slot();
-        let mut tracks = self.tracks.borrow_mut();
-        tracks.remove(&slot);
-        let mut animates = self.animates.borrow_mut();
-        animates.retain(|(command, target, _)| {
-            *command != slot.command || target.kind() != slot.operand
-        });
-        self.needs_sample
-            .set(!tracks.is_empty() || !animates.is_empty());
-        drop(animates);
-        drop(tracks);
+        if let Some(mut anim) = self.anim.take() {
+            anim.tracks.remove(&slot);
+            anim.animates.retain(|(command, target, _)| {
+                *command != slot.command || target.kind() != slot.operand
+            });
+            let needed = !anim.tracks.is_empty() || !anim.animates.is_empty();
+            if needed {
+                self.anim.set(Some(anim));
+            }
+            self.needs_sample.set(needed);
+        }
         self.push(update);
     }
 
@@ -417,9 +428,12 @@ impl LiveState {
         if !self.needs_sample.get() {
             return false;
         }
-        let animates = self.animates.take();
+        let Some(mut anim) = self.anim.take() else {
+            self.needs_sample.set(false);
+            return false;
+        };
+        let animates = std::mem::take(&mut anim.animates);
         if !animates.is_empty() {
-            let mut tracks = self.tracks.borrow_mut();
             let mut pending = self.pending.borrow_mut();
             for (command, target, animation) in animates {
                 let slot = Slot {
@@ -429,7 +443,8 @@ impl LiveState {
                 // A running track retargets, keeping the last sampled
                 // position and velocity when the new target keeps the lane
                 // layout.
-                if tracks
+                if anim
+                    .tracks
                     .get_mut(&slot)
                     .is_some_and(|track| track.retarget(target.clone(), animation))
                 {
@@ -444,7 +459,8 @@ impl LiveState {
                     );
                 match from.and_then(|from| from.anim_lanes(&target)) {
                     Some(from) => {
-                        tracks.insert(slot, OperandTrack::new(from, target, animation));
+                        anim.tracks
+                            .insert(slot, OperandTrack::new(from, target, animation));
                     }
                     // Endpoints sharing no lane decomposition snap the
                     // change like an un-animated one.
@@ -458,16 +474,14 @@ impl LiveState {
                 }
             }
             drop(pending);
-            drop(tracks);
         }
-        let mut tracks = self.tracks.borrow_mut();
-        if tracks.is_empty() {
+        if anim.tracks.is_empty() {
             self.needs_sample.set(false);
             return false;
         }
         let mut pending = self.pending.borrow_mut();
         let mut animating = false;
-        tracks.retain(|slot, track| {
+        anim.tracks.retain(|slot, track| {
             let (value, running) = track.sample(time);
             animating |= running;
             match pending.iter_mut().find(|queued| queued.slot() == *slot) {
@@ -479,7 +493,11 @@ impl LiveState {
             }
             running
         });
-        self.needs_sample.set(!tracks.is_empty());
+        let running = !anim.tracks.is_empty();
+        if running {
+            self.anim.set(Some(anim));
+        }
+        self.needs_sample.set(running);
         animating
     }
 }

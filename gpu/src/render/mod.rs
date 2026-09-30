@@ -971,6 +971,8 @@ fn split_encoder(encoder: &mut wgpu::CommandEncoder, device: &wgpu::Device) -> w
     .finish()
 }
 
+/// `view`'s `VkImageView`.
+#[cfg(all(unix, not(target_vendor = "apple")))]
 fn raw_vk_view(view: &wgpu::TextureView) -> ash::vk::ImageView {
     let hal = unsafe { view.as_hal::<wgpu::hal::vulkan::Api>() };
     unsafe { hal.expect("vulkan").raw_handle() }

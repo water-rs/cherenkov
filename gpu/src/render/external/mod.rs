@@ -382,6 +382,7 @@ impl Slot {
 
     /// Creates the views and the params buffer for a frame.
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, frame: ExternalFrame) -> Self {
+        #[cfg(all(unix, not(target_vendor = "apple")))]
         let mut native = None;
         let (y, uv, rgb, size) = match &frame.planes {
             FramePlanes::Yuv { y, uv } => (

@@ -16,6 +16,8 @@
 //! - foreign queue-family transfer: unavailable
 //! - external-format combined-sampler path: unavailable
 
+#![cfg(all(unix, not(target_vendor = "apple")))]
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 

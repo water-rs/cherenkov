@@ -3337,6 +3337,9 @@ impl GpuRenderer {
         }
     }
 
+    // `#[inline(never)]` keeps a symbol for the Callgrind gate's root lookup
+    // (`bench/scripts/ir_gate.py`).
+    #[inline(never)]
     fn lower_content(
         surf: &mut SurfaceState,
         frame: &SurfaceFrame<'_>,
@@ -3370,7 +3373,6 @@ impl GpuRenderer {
             lowered.cell_patches = std::mem::take(&mut lowering.cell_patches);
             lowered.mask_patches = std::mem::take(&mut lowering.mask_patches);
             lowered.pending = std::mem::take(&mut lowering.pending);
-            lowered.touches = std::mem::take(&mut lowering.touches);
             result
         };
         surf.layers = layers;
@@ -3453,7 +3455,7 @@ impl GpuRenderer {
         } else {
             let mut touches = std::mem::take(&mut self.commit_touches);
             touches.clear();
-            touches_len = self.replay_pins(pending, results, &mut touches);
+            touches_len = self.replay_pins(pending, &mut touches);
             self.atlas.begin_commit(&touches);
             touches.clear();
             self.commit_touches = touches;
@@ -3542,50 +3544,60 @@ impl GpuRenderer {
         Commit::Done
     }
 
-    /// The shelf slots the commit must pin: the `Lowering::touches`
-    /// this batch recorded — `TOUCH_RANGE` entries decode through the
-    /// `emit_slots` arena — plus the bands of every retained emission
-    /// verified live this frame. `ARENA_REFS` emissions address
-    /// `emit_slots` directly; the rest resolve through their
-    /// `(slot, epoch)` pairs (#119).
-    fn replay_pins(
-        &self,
-        pending: &mut [SurfaceState],
-        results: &[Result<Lowered, RenderError>],
-        touches: &mut Vec<u32>,
-    ) -> usize {
-        for lowered in results.iter().filter_map(|r| r.as_ref().ok()) {
-            for &t in &lowered.touches {
-                if t & lower::TOUCH_RANGE != 0 {
-                    let start = ((t & !lower::TOUCH_RANGE) >> 10) as usize;
-                    let len = (t & 1023) as usize;
-                    touches.extend_from_slice(self.atlas.emit_slot_arena(start..start + len));
-                } else {
-                    touches.push(t);
-                }
-            }
-        }
-        // An emission whose stamp matches the atlas verified live this
-        // frame — either on the fast path or by re-walking its refs —
-        // so its bands are the replay pins the commit must not evict.
-        let stamp = self.atlas.live_stamp();
+    /// The shelf slots the commit must pin: the shelves each new
+    /// emission's glyph instances sample plus the clip masks bound
+    /// through `uv[2..3]` — all recovered from stored UVs, so the
+    /// lowering records no slot list (#119).
+    fn replay_pins(&self, pending: &mut [SurfaceState], touches: &mut Vec<u32>) -> usize {
         for surf in pending.iter_mut() {
             for content in surf.layers.values_mut() {
                 let (_, emissions) = content.retained.prepared();
-                for e in emissions.iter().filter_map(|e| e.data.as_ref()) {
-                    if e.is_arena_refs() {
-                        touches.extend_from_slice(self.atlas.emit_slot_arena(e.refs_range()));
-                    } else if e.live_stamp == stamp {
-                        touches.extend(
-                            content.storage.refs[e.refs_range()]
-                                .iter()
-                                .map(|&(slot, _)| slot),
-                        );
-                    }
+                for emission in emissions.iter().filter_map(|e| e.data.as_ref()) {
+                    Self::for_each_glyph_shelf(
+                        &self.atlas,
+                        &content.storage.instances[emission.instances.clone()],
+                        |slot| touches.push(slot),
+                    );
+                }
+            }
+            // Clip masks bound through `uv[2..3]` pin the same way: the
+            // frame's masked instances recover their shelf from the
+            // stored atlas coordinates (#119).
+            for inst in &surf.frame.instances {
+                let flags = inst.meta[3] >> 24;
+                if flags & instance::FLAG_HAS_MASK != 0
+                    && flags & instance::FLAG_MASK_TEXTURE == 0
+                    && let Some(slot) = self.atlas.shelf_at(inst.uv[2], inst.uv[3])
+                {
+                    touches.push(slot);
                 }
             }
         }
+        // Pins stay frame-scoped: only the shelves this frame's
+        // emissions and masks sample are marked. Bands a retained
+        // emission sampled in an earlier frame are deliberately left
+        // unpinned: evicting them is what keeps the atlas bounded, and
+        // the emission's stale check re-lowers it if it displays again
+        // (#119).
         touches.len()
+    }
+
+    /// The shelves `instances`' glyph quads sample, recovered from their
+    /// stored UVs — the leaf records no per-cell slot at emit time, so
+    /// the commit derives them here instead (#119).
+    fn for_each_glyph_shelf(
+        atlas: &Atlas,
+        instances: &[lower::RetainedInstance],
+        mut f: impl FnMut(u32),
+    ) {
+        let mut hint = None;
+        for inst in instances {
+            if inst.kind == instance::KIND_GLYPH
+                && let Some(slot) = atlas.shelf_at_hint(inst.uv[0], inst.uv[1], &mut hint)
+            {
+                f(slot);
+            }
+        }
     }
 
     /// Drops one surface's retained emissions: unapplied pending cells
@@ -3635,10 +3647,6 @@ impl GpuRenderer {
             let (x, y) = cells[c as usize];
             [x as f32, y as f32]
         };
-        for (inst, p, c) in lowered.cell_patches.drain(..) {
-            let [x, y] = cell_origin(p, c);
-            surf.frame.instances[inst as usize].uv[..2].copy_from_slice(&[x, y]);
-        }
         for content in surf.layers.values_mut() {
             let (_, emissions) = content.retained.prepared();
             for emission in emissions.iter_mut().filter_map(|e| e.data.as_mut()) {
@@ -3649,24 +3657,19 @@ impl GpuRenderer {
                 // harmless (epoch checks are idempotent and pin marks
                 // dedupe themselves), so the fold writes directly — no
                 // per-emission set allocation (#119).
-                // An emission carrying cell patches joins its placed
-                // cells' bands to its eagerly-written pairs as one
-                // contiguous extent: the existing pairs move to the
-                // storage tail and each cell's band pairs append
-                // (#119).
-                if !emission.pending_cells.is_empty() {
-                    let resolve = !emission.is_arena_refs();
+                // Deferred `refs` resolve here: the frame's touched
+                // slots and each placed cell's bands join as one
+                // contiguous `(slot, epoch)` extent at the storage
+                // tail (#119).
+                if emission.refs & lower::DEFERRED_REFS != 0 || !emission.pending_cells_empty() {
                     let first = content.storage.refs.len();
-                    if resolve {
-                        content
-                            .storage
-                            .refs
-                            .extend_from_within(emission.refs_range());
-                    }
-                    for (inst, p, c) in emission.pending_cells.drain(..) {
-                        content.storage.instances[emission.instances.start + inst as usize].uv[..2]
+                    for i in emission.pending_cells() {
+                        let (inst, p, c) = lowered.cell_patches[i];
+                        let local = inst - emission.cell_inst_base();
+                        content.storage.instances[emission.instances.start + local as usize].uv
+                            [..2]
                             .copy_from_slice(&cell_origin(p, c));
-                        if resolve && let PendingOrigin::Cells(_, bands) = &origins[p as usize] {
+                        if let PendingOrigin::Cells(_, bands) = &origins[p as usize] {
                             content.storage.refs.extend(
                                 bands
                                     .iter()
@@ -3674,28 +3677,38 @@ impl GpuRenderer {
                             );
                         }
                     }
-                    if resolve {
-                        emission.refs =
-                            lower::Emission::pack_refs(first, content.storage.refs.len() - first);
-                    }
+                    // Glyph cells record no slot at emit time: the shelf
+                    // each stored UV samples is recovered here instead
+                    // (#119).
+                    Self::for_each_glyph_shelf(
+                        &self.atlas,
+                        &content.storage.instances[emission.instances.clone()],
+                        |slot| {
+                            content
+                                .storage
+                                .refs
+                                .push((slot, self.atlas.shelf_epoch(slot)))
+                        },
+                    );
+                    emission.clear_pending_cells();
+                    emission.refs =
+                        lower::Emission::pack_refs(first, content.storage.refs.len() - first);
                 }
                 // Restamp only when every reference survived this
                 // commit's evictions; a stale emission must keep an
                 // older stamp so its next hit check walks the refs
-                // and re-lowers. `ARENA_REFS` emissions survive when
-                // their live key does — evicting a shelf drops every
-                // key on it (#119).
-                let live = if emission.is_arena_refs() {
-                    self.atlas.live_alive(emission.live_stamp)
-                } else {
-                    content.storage.refs[emission.refs_range()]
-                        .iter()
-                        .all(|&(s, ep)| self.atlas.shelf_epoch(s) == ep)
-                };
-                if live && !emission.is_arena_refs() {
+                // and re-lowers (#119).
+                let live = content.storage.refs[emission.refs_range()]
+                    .iter()
+                    .all(|&(s, ep)| self.atlas.shelf_epoch(s) == ep);
+                if live {
                     emission.live_stamp = self.atlas.live_stamp();
                 }
             }
+        }
+        for (inst, p, c) in lowered.cell_patches.drain(..) {
+            let [x, y] = cell_origin(p, c);
+            surf.frame.instances[inst as usize].uv[..2].copy_from_slice(&[x, y]);
         }
         for (inst, p) in lowered.mask_patches.drain(..) {
             let PendingOrigin::Mask(origin) = &origins[p as usize] else {

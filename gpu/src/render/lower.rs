@@ -399,6 +399,10 @@ impl ContentData {
         self.storage.stops.clear();
         self.storage.templates.clear();
         self.storage.covers.clear();
+        // The emissions these ranges served are gone with the picture —
+        // clear them too or orphaned entries outlive every compaction
+        // check (#119).
+        self.storage.refs.clear();
         previous
     }
 
@@ -503,9 +507,9 @@ impl EmissionStorage {
                 .stops
                 .extend_from_slice(&self.stops[e.stops.clone()]);
             e.stops = first..storage.stops.len();
-            if e.is_arena_refs() {
-                // `refs` already addresses the shared `emit_slots`
-                // arena — nothing to move (#119).
+            if e.refs & DEFERRED_REFS != 0 {
+                // A deferred `refs` has no pairs yet — nothing moves
+                // (#119).
             } else {
                 let first = storage.refs.len();
                 storage.refs.extend_from_slice(&self.refs[e.refs_range()]);
@@ -569,7 +573,7 @@ impl InstanceTemplate {
 pub struct RetainedInstance {
     bounds: [f32; 4],
     pub(crate) uv: [f32; 2],
-    kind: u32,
+    pub(crate) kind: u32,
     first_stop: u32,
 }
 
@@ -584,35 +588,33 @@ impl RetainedInstance {
     }
 }
 
-/// `TOUCH_RANGE` marks a `touches` entry that packs an `emit_slots`
-/// range — `TOUCH_RANGE | start << 10 | len` — instead of carrying a
-/// shelf slot itself: one push pins a replayed path emission's whole
-/// band set (#119).
-pub const TOUCH_RANGE: u32 = 1 << 31;
-
-/// `refs` flag: the range addresses `Atlas::emit_slots` — a cached
-/// `PathEmit`'s own shelf list — not `EmissionStorage::refs`. A replayed
-/// emission's bands are exactly those slots, so a hit records no
-/// touches and resolves no pairs; its liveness is the emission's live
-/// key, since evicting a shelf drops every key on it (#119).
-pub const ARENA_REFS: u64 = 1 << 63;
+/// `refs` flag: the emission's `(slot, epoch)` pairs are not folded
+/// yet — the commit derives them at apply from the stored UVs and the
+/// rasterized origins instead of a per-cell slot list the leaf would
+/// have to record. The flag is only meaningful for the lowering's own
+/// commit, so a stale check on an emission that still carries it
+/// always misses (#119).
+pub const DEFERRED_REFS: u64 = 1 << 62;
 
 /// Per-operation device output under its sampled placement.
 pub struct Emission {
-    pub(crate) pending_cells: Vec<(u32, u32, u32)>,
-    /// Resolved: `(start << 32 | len)` range into `EmissionStorage::refs`
+    /// `(instance, pending raster, cell)` patch range in the producing
+    /// frame's `Lowering::cell_patches` — `inst_base << 32 | start <<
+    /// 11 | len`, verbatim frame indices resolved at apply and never
+    /// carried past it, where `inst_base` is the first frame instance
+    /// slot the leaf occupied so apply and a same-frame recompose can
+    /// recover storage-local indices without copying the patch list
+    /// (#119).
+    pub(crate) pending_cells: u64,
+    /// `(start << 32 | len)` range into `EmissionStorage::refs`
     /// holding the `(shelf slot, band epoch)` of every atlas band the
-    /// retained instances sample. With `ARENA_REFS` set it addresses
-    /// `Atlas::emit_slots` instead (#119).
+    /// retained instances sample. `DEFERRED_REFS` marks an emission
+    /// whose pairs the commit folds at apply (#119).
     pub(crate) refs: u64,
     /// Atlas texture generation and eviction clock at last verification
     /// — one compare on the hit fast path, written at realize time so a
-    /// not-yet-applied emission can hit while its commit is in flight.
-    /// With `ARENA_REFS` set this instead holds the `live` key the
-    /// replayed emission was found under: its survival is the whole
-    /// band set's liveness, since evicting a shelf drops every key on
-    /// it. A key colliding with a stamp value is the accepted 2^-64
-    /// hash-collision class of the `live` map's own keys (#119).
+    /// not-yet-applied emission can hit while its commit is in flight
+    /// (#119).
     pub(crate) live_stamp: u64,
     template: usize,
     // Only shadows carry an occlusion key; ordinary leaves keep a small index.
@@ -634,10 +636,6 @@ impl Emission {
         if self.live_stamp == stamp {
             return true;
         }
-        if self.is_arena_refs() {
-            // `live_stamp` is the key — never restamp it.
-            return atlas.live_alive(self.live_stamp);
-        }
         if refs
             .iter()
             .all(|&(slot, epoch)| atlas.shelf_epoch(slot) == epoch)
@@ -654,30 +652,27 @@ impl Emission {
     #[cold]
     #[inline(never)]
     fn stale_live(&mut self, atlas: &Atlas, storage: &EmissionStorage) -> bool {
-        if self.is_arena_refs() {
-            // `refs` addresses `emit_slots`, not `storage.refs`; the
-            // live key in `live_stamp` is the whole liveness test.
-            return atlas.live_alive(self.live_stamp);
+        if self.refs & DEFERRED_REFS != 0 {
+            // Deferred pairs exist only until the producing frame's
+            // commit — they can make no epoch claims outside it (#119).
+            return false;
         }
         self.atlas_live(atlas, &storage.refs[self.refs_range()])
     }
 
     /// `start << 32 | len` packing for `refs`; `start` stays under
-    /// `2^31`, leaving the top bit for `ARENA_REFS`.
+    /// `2^30`, leaving the top bits for `DEFERRED_REFS`.
     pub(crate) const fn pack_refs(start: usize, len: usize) -> u64 {
-        debug_assert!(start < (1 << 31), "refs start must leave ARENA_REFS free");
+        debug_assert!(
+            start < (1 << 30),
+            "refs start must leave the flag bits free"
+        );
         ((start as u64) << 32) | len as u64
-    }
-
-    /// Whether `refs` addresses `Atlas::emit_slots` rather than
-    /// `EmissionStorage::refs` (#119).
-    pub(crate) const fn is_arena_refs(&self) -> bool {
-        self.refs & ARENA_REFS != 0
     }
 
     /// The `refs` field decoded back to a usable range.
     pub(crate) const fn refs_range(&self) -> Range<usize> {
-        let packed = self.refs & !ARENA_REFS;
+        let packed = self.refs & !DEFERRED_REFS;
         (packed >> 32) as usize..(packed >> 32) as usize + (packed & 0xFFFF_FFFF) as usize
     }
 
@@ -685,6 +680,37 @@ impl Emission {
     #[allow(dead_code)]
     pub(crate) const fn refs_len(&self) -> usize {
         (self.refs & 0xFFFF_FFFF) as usize
+    }
+
+    /// The emission's patch range in the producing frame's
+    /// `Lowering::cell_patches`, unpacked from `pending_cells` (#119).
+    pub(crate) const fn pending_cells(&self) -> Range<usize> {
+        let start = ((self.pending_cells >> 11) & 0x1F_FFFF) as usize;
+        start..start + (self.pending_cells & 0x7FF) as usize
+    }
+
+    /// Whether the emission carries no pending cell patches.
+    pub(crate) const fn pending_cells_empty(&self) -> bool {
+        self.pending_cells.trailing_zeros() >= 11
+    }
+
+    /// Frame instance index the pending-cell entries are relative to
+    /// (#119).
+    pub(crate) const fn cell_inst_base(&self) -> u32 {
+        (self.pending_cells >> 32) as u32
+    }
+
+    /// Pack `pending_cells` from the producing leaf's cell range and
+    /// its frame instance base (#119).
+    pub(crate) const fn pack_pending_cells(inst_base: u32, start: usize, len: usize) -> u64 {
+        debug_assert!(start < (1 << 21), "cell patch count fits 21 bits");
+        debug_assert!(len <= 0x7FF, "cells per leaf fit 11 bits");
+        ((inst_base as u64) << 32) | ((start as u64) << 11) | len as u64
+    }
+
+    /// Clear the pending-cell extent after the commit applied it (#119).
+    pub(crate) const fn clear_pending_cells(&mut self) {
+        self.pending_cells = 0;
     }
 }
 
@@ -729,9 +755,6 @@ pub struct Lowered {
     pub cell_patches: Vec<(u32, u32, u32)>,
     /// `uv.zw` patches: `(instance, pending index)`.
     pub mask_patches: Vec<(u32, u32)>,
-    /// Shelves the lowering's cache hits live on — the commit marks
-    /// them before planning so no placement evicts them (#119).
-    pub touches: Vec<u32>,
 }
 
 /// What the renderer knows about one backdrop group this frame.
@@ -885,16 +908,6 @@ pub struct Lowering<'a> {
     /// `(instance, pending)` pairs whose `uv.zw` are set when the render
     /// thread stores the pending clip mask.
     pub(crate) mask_patches: Vec<(u32, u32)>,
-    /// Shelves hit since the last reset, for the commit's pin marks.
-    /// The commit also resolves each emission's slice — recorded as
-    /// `Emission::refs` — into its `(slot, epoch)` pairs (#119).
-    pub(crate) touches: Vec<u32>,
-    /// Set by `realize`'s path-emission hit: the emission's `refs`
-    /// value (`ARENA_REFS` range into `emit_slots`) and the live key
-    /// found, so the leaf's `Emission` records them instead of pushing
-    /// touches; zero when no hit recorded (#119).
-    hit_refs: u64,
-    hit_key: u64,
 
     /// The open range's bound mask texture key; `None` for the dummy view.
     /// Kept in sync with `clip` by `set_clip`.
@@ -949,12 +962,6 @@ impl<'a> Lowering<'a> {
             paths: 0,
             cell_patches: Vec::new(),
             mask_patches: Vec::new(),
-            // Path and glyph hits push a handful of entries per leaf;
-            // a path-heavy surface records thousands — pre-grow past
-            // the amortization point (#119).
-            touches: Vec::with_capacity(1024),
-            hit_refs: 0,
-            hit_key: 0,
             pending: Vec::new(),
             commands_lowered: 0,
             layers_composed: 0,
@@ -981,16 +988,6 @@ impl<'a> Lowering<'a> {
         let value = aa_margin(transform);
         self.margin = Some((linear, value));
         value
-    }
-
-    /// Records `slot` for the commit's pin marks and the emission's
-    /// refs fold; consecutive cells of a run usually share a shelf, so
-    /// dedupe the tail (#119).
-    #[inline]
-    fn touch(&mut self, slot: u32) {
-        if self.touches.last().copied() != Some(slot) {
-            self.touches.push(slot);
-        }
     }
 
     /// Glyphs rasterized during this lowering.
@@ -2489,8 +2486,6 @@ impl<'a> Lowering<'a> {
         let first_instance = self.frame.instances.len();
         let first_stop = self.frame.stops.len();
         let first_patch = self.cell_patches.len();
-        let first_touch = self.touches.len();
-        self.hit_refs = 0;
         // `realize` composes path and glyph ops' local transforms into
         // `self.transform`; the leaf's placement is restored with the clip.
         let transform = self.transform;
@@ -2529,49 +2524,22 @@ impl<'a> Lowering<'a> {
         storage
             .stops
             .extend_from_slice(&self.frame.stops[first_stop..]);
-        let pending_cells = if first_patch == self.cell_patches.len() {
-            Vec::new()
-        } else {
-            self.cell_patches[first_patch..]
-                .iter()
-                .map(|&(i, p, c)| (i - instance_base, p, c))
-                .collect()
-        };
-        let ref_first = storage.refs.len();
-        if self.hit_refs == 0 {
-            // `(slot, band epoch)` pairs resolve eagerly: the atlas is
-            // immutable for the whole lowering, so the sampled epochs
-            // are final until this commit's evictions — `refs` is a
-            // real pair range from birth and a not-yet-applied
-            // emission can hit while its commit is in flight (#119).
-            for &t in &self.touches[first_touch..] {
-                if t & TOUCH_RANGE != 0 {
-                    let start = ((t & !TOUCH_RANGE) >> 10) as usize;
-                    let len = (t & 1023) as usize;
-                    storage.refs.extend(
-                        glyphs
-                            .atlas
-                            .emit_slot_arena(start..start + len)
-                            .iter()
-                            .map(|&slot| (slot, glyphs.atlas.shelf_epoch(slot))),
-                    );
-                } else {
-                    storage.refs.push((t, glyphs.atlas.shelf_epoch(t)));
-                }
-            }
-        }
         cache.data = Some(Emission {
-            pending_cells,
-            refs: if self.hit_refs != 0 {
-                self.hit_refs
+            pending_cells: if first_patch == self.cell_patches.len() {
+                0
             } else {
-                Emission::pack_refs(ref_first, storage.refs.len() - ref_first)
+                Emission::pack_pending_cells(
+                    instance_base,
+                    first_patch,
+                    self.cell_patches.len() - first_patch,
+                )
             },
-            live_stamp: if self.hit_refs != 0 {
-                self.hit_key
-            } else {
-                glyphs.live_stamp
-            },
+            // `refs` pairs are derived at apply — deferred, so the
+            // leaf check's stamp compare needs nothing extra for a
+            // pending emission to hit inside its own frame, and a
+            // leftover can never claim liveness in a later one (#119).
+            refs: DEFERRED_REFS,
+            live_stamp: glyphs.live_stamp,
             template,
             cover: cover.map(|cover| {
                 storage.covers.push(cover);
@@ -2612,12 +2580,20 @@ impl<'a> Lowering<'a> {
             Self::apply_clip(&mut inst, clip);
             self.push_instance(&inst);
         }
-        self.cell_patches.extend(
-            emission
-                .pending_cells
-                .iter()
-                .map(|&(i, p, c)| (i + instance_base, p, c)),
-        );
+        // The producing leaf's own patches already sit in
+        // `cell_patches` verbatim; only a recompose at a different
+        // instance base re-emits them, rebased onto the new slots.
+        if !emission.pending_cells_empty() && emission.cell_inst_base() != instance_base {
+            let first = self.cell_patches.len();
+            self.cell_patches
+                .extend_from_within(emission.pending_cells());
+            for entry in &mut self.cell_patches[first..] {
+                entry.0 = entry
+                    .0
+                    .wrapping_sub(emission.cell_inst_base())
+                    .wrapping_add(instance_base);
+            }
+        }
     }
 
     #[expect(
@@ -3195,21 +3171,8 @@ impl<'a> Lowering<'a> {
         let hit = glyphs
             .atlas
             .path(pl.key)
-            .map(|emit| (pl.key, emit))
-            .or_else(|| {
-                glyphs
-                    .atlas
-                    .path(pl.key_exact())
-                    .map(|emit| (pl.key_exact(), emit))
-            });
-        if let Some((key, emit)) = hit {
-            // The emission's `emit_slots` range is its whole band set —
-            // record it (with the live key found under) instead of
-            // pushing touches; the commit marks the same shelves through
-            // `ARENA_REFS` and the emission's liveness is the key's
-            // survival (#119).
-            self.hit_refs = ARENA_REFS | Emission::pack_refs(emit.slots.start, emit.slots.len());
-            self.hit_key = key;
+            .or_else(|| glyphs.atlas.path(pl.key_exact()));
+        if let Some(emit) = hit {
             self.replay(emit, None, pl.offset, paint, shader_data.as_ref());
             return Ok(());
         }
@@ -3224,15 +3187,11 @@ impl<'a> Lowering<'a> {
                 rule,
             ) else {
                 // Missing the surface at this offset says nothing about
-                // other offsets: cache the empty emission only under the
-                // exact key.
-                let pending = u32::try_from(self.pending.len()).expect("pending count fits u32");
-                self.pending.push(PendingRaster::Path {
-                    key: pl.key_exact(),
-                    emit: PathEmit::default(),
-                    cells: Vec::new(),
-                });
-                break 'stored (PathEmit::default(), Some(pending));
+                // other offsets — and an empty emission carries no bands,
+                // so it could never be pinned or replayed later either.
+                // Store nothing: an exact-key insert would never hit again
+                // and could not be evicted for want of a slot (#119).
+                break 'stored (PathEmit::default(), None);
             };
             self.paths += 1;
             let (emit, cells) = path::emit(&coverage)?;
@@ -3360,9 +3319,8 @@ impl<'a> Lowering<'a> {
                 .or_else(|| glyphs.atlas.mask(pl.key_exact()))
             {
                 // The mask is re-read through `apply_clip` each frame;
-                // the touch keeps its shelf live, no reference needed
-                // (#119).
-                self.touch(mask.slot);
+                // its `uv[2..3]` atlas coordinates let the commit's pins
+                // recover the shelf — no slot recorded here (#119).
                 break 'stored ClipMask::Cell(*mask);
             }
             if let Some(mask) = glyphs
@@ -3403,7 +3361,6 @@ impl<'a> Lowering<'a> {
                 pl.key
             };
             if let Some(mask) = glyphs.atlas.mask(key) {
-                self.touch(mask.slot);
                 break 'stored ClipMask::Cell(*mask);
             }
             if let Some(mask) = glyphs.atlas.mask_texture(key) {
@@ -3503,11 +3460,6 @@ impl<'a> Lowering<'a> {
             if entry.w == 0 || entry.h == 0 {
                 continue;
             }
-            if pending.is_none() {
-                // Pin the shelf so this commit cannot evict the cell
-                // the emission's UVs now sample (#119).
-                self.touch(entry.slot);
-            }
             let rect = Rect::from_origin_size(
                 (x + f64::from(entry.left), y + f64::from(entry.top)),
                 (f64::from(entry.w), f64::from(entry.h)),
@@ -3586,9 +3538,6 @@ impl<'a> Lowering<'a> {
             self.glyphs += u32::from(pending.is_some());
             if entry.w == 0 || entry.h == 0 {
                 continue;
-            }
-            if pending.is_none() {
-                self.touch(entry.slot);
             }
             let mut inst = *template.get_or_insert_with(|| {
                 let mut inst = self.base(KIND_GLYPH, affine(self.transform));

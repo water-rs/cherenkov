@@ -1280,11 +1280,60 @@ impl Atlas {
         self.layout.shelves[usize::try_from(slot).expect("shelf index")].epoch
     }
 
-    /// Whether `key`'s admission is still live — evicting a shelf drops
-    /// every key on it, so a replayed emission whose `refs` are
-    /// `ARENA_REFS` stays valid exactly while its key does (#119).
-    pub fn live_alive(&self, key: u64) -> bool {
-        self.live.contains_key(&key)
+    /// The shelf whose band run owns the atlas pixel `(x, y)` — shelves are
+    /// laid consecutively from `y = 0`, so the row is found by binary
+    /// search; the pixel must also sit inside the shelf's used run (`x <
+    /// shelf.x`). Recovers a stored instance UV's band without the leaf
+    /// recording the slot at emit time (#119).
+    pub fn shelf_at(&self, x: f32, y: f32) -> Option<u32> {
+        if !x.is_finite() || !y.is_finite() || y < 0.0 {
+            return None;
+        }
+        let y = y as u32;
+        let x = x as u32;
+        let idx = self
+            .layout
+            .shelves
+            .partition_point(|shelf| shelf.y + shelf.h <= y);
+        let shelf = self.layout.shelves.get(idx)?;
+        if shelf.live && shelf.y <= y && x < shelf.x {
+            u32::try_from(idx).ok()
+        } else {
+            None
+        }
+    }
+
+    /// [`Self::shelf_at`] over many points, like a leaf's emission:
+    /// consecutive cells usually sit on the same shelf, so `hint`
+    /// carries the last hit's slot and skips the search while the
+    /// point still lands in that band (#119).
+    pub fn shelf_at_hint(&self, x: f32, y: f32, hint: &mut Option<u32>) -> Option<u32> {
+        if !x.is_finite() || !y.is_finite() || y < 0.0 {
+            return None;
+        }
+        let y = y as u32;
+        let x = x as u32;
+        if let Some(slot) = *hint
+            && let Some(shelf) = self.layout.shelves.get(slot as usize)
+            && shelf.live
+            && shelf.y <= y
+            && y < shelf.y + shelf.h
+            && x < shelf.x
+        {
+            return Some(slot);
+        }
+        let idx = self
+            .layout
+            .shelves
+            .partition_point(|shelf| shelf.y + shelf.h <= y);
+        let slot = self
+            .layout
+            .shelves
+            .get(idx)
+            .filter(|shelf| shelf.live && shelf.y <= y && x < shelf.x)
+            .and_then(|_| u32::try_from(idx).ok());
+        *hint = slot;
+        slot
     }
 
     /// Lets [`Self::alloc`] reclaim the coldest shelves: set by the

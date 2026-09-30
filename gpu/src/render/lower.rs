@@ -903,10 +903,12 @@ pub struct Lowering<'a> {
     /// The commit also resolves each emission's slice — recorded as
     /// `Emission::refs` — into its `(slot, epoch)` pairs (#119).
     pub(crate) touches: Vec<u32>,
-    /// Set by `realize`'s path-emission hit: the live key found and the
-    /// emission's `emit_slots` range, so the leaf's `Emission` records
-    /// `ARENA_REFS` instead of pushing touches (#119).
-    hit_arena: Option<(u64, Range<usize>)>,
+    /// Set by `realize`'s path-emission hit: the emission's `refs`
+    /// value (`ARENA_REFS` range into `emit_slots`) and the live key
+    /// found, so the leaf's `Emission` records them instead of pushing
+    /// touches; zero when no hit recorded (#119).
+    hit_refs: u64,
+    hit_key: u64,
 
     /// The open range's bound mask texture key; `None` for the dummy view.
     /// Kept in sync with `clip` by `set_clip`.
@@ -965,7 +967,8 @@ impl<'a> Lowering<'a> {
             // a path-heavy surface records thousands — pre-grow past
             // the amortization point (#119).
             touches: Vec::with_capacity(1024),
-            hit_arena: None,
+            hit_refs: 0,
+            hit_key: 0,
             pending: Vec::new(),
             commands_lowered: 0,
             layers_composed: 0,
@@ -2501,7 +2504,7 @@ impl<'a> Lowering<'a> {
         let first_stop = self.frame.stops.len();
         let first_patch = self.cell_patches.len();
         let first_touch = self.touches.len();
-        self.hit_arena = None;
+        self.hit_refs = 0;
         // `realize` composes path and glyph ops' local transforms into
         // `self.transform`; the leaf's placement is restored with the clip.
         let transform = self.transform;
@@ -2540,23 +2543,28 @@ impl<'a> Lowering<'a> {
         storage
             .stops
             .extend_from_slice(&self.frame.stops[first_stop..]);
-        let hit_arena = self.hit_arena.take();
-        cache.data = Some(Emission {
-            pending_cells: self.cell_patches[first_patch..]
+        let pending_cells = if first_patch == self.cell_patches.len() {
+            Vec::new()
+        } else {
+            self.cell_patches[first_patch..]
                 .iter()
                 .map(|&(i, p, c)| (i - instance_base, p, c))
-                .collect(),
+                .collect()
+        };
+        cache.data = Some(Emission {
+            pending_cells,
             // Unresolved until the commit lands: `refs` addresses
             // `touches` slots until `apply_pending` swaps in the
             // `(slot, band epoch)` pairs — unless a path-emission hit
             // recorded its atlas `emit_slots` range, which needs no
             // resolution (#119).
-            refs: match hit_arena {
-                Some((_, ref slots)) => ARENA_REFS | Emission::pack_refs(slots.start, slots.len()),
-                None => Emission::pack_refs(first_touch, self.touches.len() - first_touch),
+            refs: if self.hit_refs != 0 {
+                self.hit_refs
+            } else {
+                Emission::pack_refs(first_touch, self.touches.len() - first_touch)
             },
             live_stamp: LIVE_PENDING,
-            live_key: hit_arena.map_or(0, |(key, _)| key),
+            live_key: self.hit_key,
             template,
             cover: cover.map(|cover| {
                 storage.covers.push(cover);
@@ -3193,7 +3201,8 @@ impl<'a> Lowering<'a> {
             // pushing touches; the commit marks the same shelves through
             // `ARENA_REFS` and the emission's liveness is the key's
             // survival (#119).
-            self.hit_arena = Some((key, emit.slots.clone()));
+            self.hit_refs = ARENA_REFS | Emission::pack_refs(emit.slots.start, emit.slots.len());
+            self.hit_key = key;
             self.replay(emit, None, pl.offset, paint, shader_data.as_ref());
             return Ok(());
         }

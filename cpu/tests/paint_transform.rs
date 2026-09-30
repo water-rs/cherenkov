@@ -1,4 +1,5 @@
 //! Independent paint coordinates on the cpu backend.
+#![cfg(not(target_arch = "wasm32"))]
 #[path = "../../tests/support/paint_transform.rs"]
 mod common;
 

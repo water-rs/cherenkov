@@ -1,5 +1,6 @@
 //! Exact retained/full equivalence on the CPU raster backend.
 
+#![cfg(not(target_arch = "wasm32"))]
 use cherenkov::Backend;
 
 #[test]

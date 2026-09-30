@@ -91,6 +91,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --locked -p filtrate --target wasm32-unknown-unknown --all-features -- -D warnings
       - run: cargo clippy --locked -p cherenkov-gpu --lib --test browser --target wasm32-unknown-unknown -- -D warnings
+      - run: cargo clippy --locked -p cherenkov-cpu --all-targets --target wasm32-unknown-unknown -- -D warnings
 
   msrv:
     name: MSRV

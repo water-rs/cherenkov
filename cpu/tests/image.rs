@@ -1,5 +1,6 @@
 //! Shared-front-end image uploads, retained destinations and alpha metadata.
 
+#![cfg(not(target_arch = "wasm32"))]
 #![expect(
     clippy::excessive_precision,
     clippy::suboptimal_flops,

@@ -1,5 +1,6 @@
 //! CPU filter execution and rendering tests.
 
+#![cfg(not(target_arch = "wasm32"))]
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},

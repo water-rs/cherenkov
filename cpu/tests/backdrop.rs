@@ -1,5 +1,6 @@
 //! Backdrop groups on the CPU backend: captures scheduled into bands.
 
+#![cfg(not(target_arch = "wasm32"))]
 use std::sync::mpsc;
 
 use cherenkov::kurbo::{Rect, RoundedRect};

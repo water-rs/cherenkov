@@ -1,5 +1,6 @@
 //! Native bitmap colour-font rendering and cache behavior.
 
+#![cfg(not(target_arch = "wasm32"))]
 use cherenkov::kurbo::{Affine, Rect, Stroke};
 use cherenkov::{
     Draw, Engine, Extend, FontId, FontSource, FrameTime, Glyph, GlyphRun, GlyphStyle,

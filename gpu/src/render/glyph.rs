@@ -1296,10 +1296,7 @@ impl Atlas {
         }
         let y = y as u32;
         let x = x as u32;
-        let idx = self
-            .layout
-            .shelves
-            .partition_point(|s| s.y + s.h <= y);
+        let idx = self.layout.shelves.partition_point(|s| s.y + s.h <= y);
         let band = self.layout.shelves.get(idx)?;
         if band.live && band.y <= y && x < band.x {
             u32::try_from(idx).ok()
@@ -1332,10 +1329,7 @@ impl Atlas {
         {
             return Some(slot);
         }
-        let idx = self
-            .layout
-            .shelves
-            .partition_point(|s| s.y + s.h <= y);
+        let idx = self.layout.shelves.partition_point(|s| s.y + s.h <= y);
         let slot = self
             .layout
             .shelves

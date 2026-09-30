@@ -468,7 +468,7 @@ impl EmissionStorage {
                     s + e.stops.len(),
                     t + 1,
                     c + usize::from(e.cover.is_some()),
-                    r + e.refs.len(),
+                    r + e.refs_len(),
                 )
             });
         if self.instances.len() <= instances * 2
@@ -506,11 +506,11 @@ impl EmissionStorage {
             if e.live_stamp == LIVE_PENDING {
                 // `refs` still addresses the frame's `touches`: keep
                 // the emission pending and drop the range (#119).
-                e.refs = 0..0;
+                e.refs = 0;
             } else {
                 let first = storage.refs.len();
-                storage.refs.extend_from_slice(&self.refs[e.refs.clone()]);
-                e.refs = first..storage.refs.len();
+                storage.refs.extend_from_slice(&self.refs[e.refs_range()]);
+                e.refs = Emission::pack_refs(first, storage.refs.len() - first);
             }
         }
         *self = storage;
@@ -607,12 +607,12 @@ pub const LIVE_PENDING: u64 = u64::MAX;
 /// Per-operation device output under its sampled placement.
 pub struct Emission {
     pub(crate) pending_cells: Vec<(u32, u32, u32)>,
-    /// Resolved: range into `EmissionStorage::refs` holding the
-    /// `(shelf slot, band epoch)` of every atlas band the retained
-    /// instances sample. While `live_stamp == LIVE_PENDING` it instead
-    /// addresses the frame's `Lowering::touches` slots, which the
-    /// commit swaps for resolved pairs (#119).
-    pub(crate) refs: Range<usize>,
+    /// Resolved: `(start << 32 | len)` range into `EmissionStorage::refs`
+    /// holding the `(shelf slot, band epoch)` of every atlas band the
+    /// retained instances sample. While `live_stamp == LIVE_PENDING` it
+    /// instead addresses the frame's `Lowering::touches` slots, which
+    /// the commit swaps for resolved pairs (#119).
+    pub(crate) refs: u64,
     /// Atlas texture generation and eviction clock at last verification
     /// — one compare on the hit fast path; `LIVE_PENDING` while the
     /// commit that resolves `refs` has not landed (#119).
@@ -657,7 +657,23 @@ impl Emission {
     #[cold]
     #[inline(never)]
     fn stale_live(&mut self, atlas: &Atlas, storage: &EmissionStorage) -> bool {
-        self.live_stamp != LIVE_PENDING && self.atlas_live(atlas, &storage.refs[self.refs.clone()])
+        self.live_stamp != LIVE_PENDING && self.atlas_live(atlas, &storage.refs[self.refs_range()])
+    }
+
+    /// `start << 32 | len` packing for `refs`.
+    pub(crate) const fn pack_refs(start: usize, len: usize) -> u64 {
+        ((start as u64) << 32) | len as u64
+    }
+
+    /// The `refs` field decoded back to a usable range.
+    pub(crate) const fn refs_range(&self) -> Range<usize> {
+        (self.refs >> 32) as usize..(self.refs >> 32) as usize + (self.refs & 0xFFFF_FFFF) as usize
+    }
+
+    /// Length of the `refs` range, for memory accounting.
+    #[allow(dead_code)]
+    pub(crate) const fn refs_len(&self) -> usize {
+        (self.refs & 0xFFFF_FFFF) as usize
     }
 }
 
@@ -2501,7 +2517,7 @@ impl<'a> Lowering<'a> {
             // Unresolved until the commit lands: `refs` addresses
             // `touches` slots until `apply_pending` swaps in the
             // `(slot, band epoch)` pairs (#119).
-            refs: first_touch..self.touches.len(),
+            refs: Emission::pack_refs(first_touch, self.touches.len() - first_touch),
             live_stamp: LIVE_PENDING,
             template,
             cover: cover.map(|cover| {

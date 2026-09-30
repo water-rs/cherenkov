@@ -699,6 +699,21 @@ impl Atlas {
         AtlasPlan::Recycle
     }
 
+    /// Whether every pending cell places as-is, with no eviction —
+    /// the cheap pre-check the commit runs before deriving replay
+    /// pins: a frame whose batch fits strictly needs no pin at all,
+    /// and an empty batch skips even the layout clone (#119).
+    pub fn fits_strict(&mut self, rasters: &[&PendingRaster]) -> bool {
+        self.batch_cells(rasters);
+        if self.plan_cells.is_empty() {
+            return true;
+        }
+        let mut probe = self.layout.clone();
+        self.plan_cells
+            .iter()
+            .all(|&(w, h)| alloc_on(&mut probe, self.size, self.tick, w, h).is_some())
+    }
+
     /// Cells `rasters` still need beyond the live caches, in commit
     /// order, pooled into `plan_cells`. Keys repeated inside the batch
     /// resolve to the first store, exactly as the commit's cache

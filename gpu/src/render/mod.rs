@@ -373,6 +373,8 @@ pub struct GpuRenderer {
     commit_writes: Vec<glyph::CellWrite>,
     /// Per-surface pending origins, rebuilt in place each apply.
     pending_origins: Vec<PendingOrigin>,
+    /// Replay-pin slots, reused across evicting commits (#119).
+    commit_touches: Vec<u32>,
     /// A dummy 1×1 view for unused group-1 slots.
     dummy_view: wgpu::TextureView,
     /// A dummy 1×1 `u32` view for unused external-frame plane slots.
@@ -1299,6 +1301,7 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             atlas,
             commit_writes: Vec::new(),
             pending_origins: Vec::new(),
+            commit_touches: Vec::new(),
             surfaces: FxHashMap::default(),
             fonts: FxHashMap::default(),
             images: FxHashMap::default(),
@@ -1515,6 +1518,7 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
         atlas,
         commit_writes: Vec::new(),
         pending_origins: Vec::new(),
+        commit_touches: Vec::new(),
         surfaces: FxHashMap::default(),
         fonts: FxHashMap::default(),
         images: FxHashMap::default(),
@@ -3423,67 +3427,82 @@ impl GpuRenderer {
     /// emissions referencing them — stay valid (#119). The upload
     /// batches the committed cells into one `write_texture` per newly
     /// allocated shelf region.
+    // `never` so Callgrind can attribute the commit path's inclusive
+    // cost — the one-per-frame call boundary is free evidence (#119).
+    #[inline(never)]
     fn commit_rasters(
         &mut self,
         pending: &mut [SurfaceState],
         results: &mut [Result<Lowered, RenderError>],
         grew: bool,
     ) -> Commit {
-        let mut touches: Vec<u32> = Vec::new();
-        for lowered in results.iter().filter_map(|r| r.as_ref().ok()) {
-            for &t in &lowered.touches {
-                if t & lower::TOUCH_RANGE != 0 {
-                    let start = ((t & !lower::TOUCH_RANGE) >> 10) as usize;
-                    let len = (t & 1023) as usize;
-                    touches.extend_from_slice(self.atlas.emit_slot_arena(start..start + len));
-                } else {
-                    touches.push(t);
-                }
-            }
-        }
-        // An emission whose stamp matches the atlas verified live this
-        // frame — either on the fast path or by re-walking its refs —
-        // so its bands are the replay pins the commit must not evict
-        // (#119).
-        let stamp = self.atlas.live_stamp();
-        for surf in pending.iter_mut() {
-            for content in surf.layers.values_mut() {
-                let (_, emissions) = content.retained.prepared();
-                for e in emissions.iter().filter_map(|e| e.data.as_ref()) {
-                    if e.live_stamp == stamp {
-                        touches.extend(
-                            content.storage.refs[e.refs.clone()]
-                                .iter()
-                                .map(|&(slot, _)| slot),
-                        );
-                    }
-                }
-            }
-        }
-        self.atlas.begin_commit(&touches);
         let rasters: Vec<&glyph::PendingRaster> = results
             .iter()
             .filter_map(|r| r.as_ref().ok())
             .flat_map(|l| l.pending.iter())
             .collect();
         let n_cells: usize = rasters.iter().map(|r| r.cell_count()).sum();
-        let plan_dbg = match self.atlas.plan(&rasters) {
-            glyph::AtlasPlan::Fits => "fits",
-            glyph::AtlasPlan::Grow(size) if !grew => return Commit::Grow(size),
-            glyph::AtlasPlan::FitsEviction => {
-                self.atlas.enable_evicting();
-                "fits-eviction"
+        // A frame whose batch places strictly needs no replay pins and
+        // no eviction, so no emission scan and no touch decoding runs —
+        // the commit's work scales with what changed, not what stays
+        // retained (#119).
+        let mut touches_len = 0usize;
+        let plan_dbg = if self.atlas.fits_strict(&rasters) {
+            self.atlas.begin_commit(&[]);
+            "fits"
+        } else {
+            let mut touches = std::mem::take(&mut self.commit_touches);
+            touches.clear();
+            for lowered in results.iter().filter_map(|r| r.as_ref().ok()) {
+                for &t in &lowered.touches {
+                    if t & lower::TOUCH_RANGE != 0 {
+                        let start = ((t & !lower::TOUCH_RANGE) >> 10) as usize;
+                        let len = (t & 1023) as usize;
+                        touches.extend_from_slice(self.atlas.emit_slot_arena(start..start + len));
+                    } else {
+                        touches.push(t);
+                    }
+                }
             }
-            glyph::AtlasPlan::Grow(_) | glyph::AtlasPlan::Recycle => {
-                // Bounded in-place eviction makes room instead of a
-                // wholesale clear: the commit below reclaims shelves
-                // nothing touched until the batch places or nothing
-                // untouchable remains, then exhausts the first surface
-                // whose raster still does not fit (#119).
-                self.atlas.enable_evicting();
-                "exhaust-candidate"
+            // An emission whose stamp matches the atlas verified live
+            // this frame — either on the fast path or by re-walking its
+            // refs — so its bands are the replay pins the commit must
+            // not evict (#119).
+            let stamp = self.atlas.live_stamp();
+            for surf in pending.iter_mut() {
+                for content in surf.layers.values_mut() {
+                    let (_, emissions) = content.retained.prepared();
+                    for e in emissions.iter().filter_map(|e| e.data.as_ref()) {
+                        if e.live_stamp == stamp {
+                            touches.extend(
+                                content.storage.refs[e.refs_range()]
+                                    .iter()
+                                    .map(|&(slot, _)| slot),
+                            );
+                        }
+                    }
+                }
+            }
+            touches_len = touches.len();
+            self.atlas.begin_commit(&touches);
+            touches.clear();
+            self.commit_touches = touches;
+            match self.atlas.plan(&rasters) {
+                glyph::AtlasPlan::Fits | glyph::AtlasPlan::FitsEviction => "fits-eviction",
+                glyph::AtlasPlan::Grow(size) if !grew => return Commit::Grow(size),
+                glyph::AtlasPlan::Grow(_) | glyph::AtlasPlan::Recycle => {
+                    // Bounded in-place eviction makes room instead of a
+                    // wholesale clear: the commit below reclaims shelves
+                    // nothing touched until the batch places or nothing
+                    // untouchable remains, then exhausts the first surface
+                    // whose raster still does not fit (#119).
+                    "exhaust-candidate"
+                }
             }
         };
+        if plan_dbg != "fits" {
+            self.atlas.enable_evicting();
+        }
         let mut writes = std::mem::take(&mut self.commit_writes);
         writes.clear();
         for (surf, result) in pending.iter_mut().zip(results.iter_mut()) {
@@ -3508,7 +3527,7 @@ impl GpuRenderer {
             evicted_bytes = evicted.iter().map(|e| e.0).sum::<u64>(),
             plan = ?plan_dbg,
             pending_cells = n_cells,
-            touches = touches.len(),
+            touches = touches_len,
             occupancy = ?self.atlas.occupancy(),
             "atlas commit"
         );
@@ -3563,49 +3582,50 @@ impl GpuRenderer {
                 // The emission's atlas references are the shelves it
                 // touched while lowering plus the bands its deferred
                 // rasters resolved to — recorded as `(slot, band epoch)`
-                // pairs, deduplicated and contiguous at the storage
-                // tail (#119).
-                let mut slots: rustc_hash::FxHashSet<u32> = rustc_hash::FxHashSet::default();
+                // pairs contiguous at the storage tail. Duplicates are
+                // harmless (epoch checks are idempotent and pin marks
+                // dedupe themselves), so the fold writes directly — no
+                // per-emission set allocation (#119).
+                let pending = emission.live_stamp == lower::LIVE_PENDING;
+                let first = content.storage.refs.len();
                 for (inst, p, c) in emission.pending_cells.drain(..) {
                     content.storage.instances[emission.instances.start + inst as usize].uv[..2]
                         .copy_from_slice(&cell_origin(p, c));
-                    if let PendingOrigin::Cells(_, bands) = &origins[p as usize] {
-                        slots.extend(bands.iter().copied());
+                    if pending && let PendingOrigin::Cells(_, bands) = &origins[p as usize] {
+                        content.storage.refs.extend(
+                            bands
+                                .iter()
+                                .map(|&slot| (slot, self.atlas.shelf_epoch(slot))),
+                        );
                     }
                 }
-                if emission.live_stamp == lower::LIVE_PENDING {
+                if pending {
                     // `refs` still addresses the frame's touches: fold
                     // those slots in, then swap the range for resolved
                     // `(slot, band epoch)` pairs — always, even empty,
                     // or it keeps addressing `touches` (#119).
-                    for &t in &lowered.touches[emission.refs.clone()] {
+                    for &t in &lowered.touches[emission.refs_range()] {
                         if t & lower::TOUCH_RANGE != 0 {
                             let start = ((t & !lower::TOUCH_RANGE) >> 10) as usize;
                             let len = (t & 1023) as usize;
-                            slots.extend(
+                            content.storage.refs.extend(
                                 self.atlas
                                     .emit_slot_arena(start..start + len)
                                     .iter()
-                                    .copied(),
+                                    .map(|&slot| (slot, self.atlas.shelf_epoch(slot))),
                             );
                         } else {
-                            slots.insert(t);
+                            content.storage.refs.push((t, self.atlas.shelf_epoch(t)));
                         }
                     }
-                    let first = content.storage.refs.len();
-                    for slot in slots {
-                        content
-                            .storage
-                            .refs
-                            .push((slot, self.atlas.shelf_epoch(slot)));
-                    }
-                    emission.refs = first..content.storage.refs.len();
+                    emission.refs =
+                        lower::Emission::pack_refs(first, content.storage.refs.len() - first);
                 }
                 // Restamp only when every reference survived this
                 // commit's evictions; a stale emission must keep an
                 // older stamp so its next hit check walks the refs
                 // and re-lowers (#119).
-                if content.storage.refs[emission.refs.clone()]
+                if content.storage.refs[emission.refs_range()]
                     .iter()
                     .all(|&(s, ep)| self.atlas.shelf_epoch(s) == ep)
                 {

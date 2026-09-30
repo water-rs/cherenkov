@@ -448,9 +448,9 @@ pub struct EmissionStorage {
     covers: Vec<Cover>,
     pub(crate) instances: Vec<RetainedInstance>,
     stops: Vec<Stop>,
-    /// `(live key, epoch)` atlas references every retained emission
-    /// samples, addressed by `Emission::refs` ranges.
-    pub(crate) refs: Vec<(u64, u64)>,
+    /// `(shelf slot, band epoch)` atlas references every retained
+    /// emission samples, addressed by `Emission::refs` ranges.
+    pub(crate) refs: Vec<(u32, u64)>,
 }
 
 impl EmissionStorage {
@@ -582,11 +582,14 @@ impl RetainedInstance {
 /// Per-operation device output under its sampled placement.
 pub struct Emission {
     pub(crate) pending_cells: Vec<(u32, u32, u32)>,
-    /// Range into `EmissionStorage::refs` holding the `(live key, epoch)`
-    /// of every atlas admission the retained instances sample — re-verified
-    /// whenever the atlas's eviction clock moved, so a reclaimed cell
-    /// re-lowers instead of sampling stale texels (#119).
+    /// Range into `EmissionStorage::refs` holding the `(shelf slot, band
+    /// epoch)` of every atlas band the retained instances sample —
+    /// re-verified whenever the atlas's eviction clock moved, so a
+    /// reclaimed band re-lowers instead of sampling stale texels (#119).
     pub(crate) refs: Range<usize>,
+    /// The emission's slice of the frame's `Lowering::touches`, resolved
+    /// into `refs` by the commit; `None` once resolved (#119).
+    pub(crate) touch: Option<(u32, u32)>,
     /// The atlas eviction clock at last verification.
     pub(crate) clock: u64,
     template: usize,
@@ -601,17 +604,22 @@ pub struct Emission {
 }
 
 impl Emission {
-    /// Whether every atlas cell the retained UVs reference is still the
-    /// same admission. Between commits that evicted nothing the stored
-    /// `clock` short-circuits the walk; after an eviction each ref's
-    /// epoch must still match — a re-admitted entry never does.
-    fn atlas_live(&mut self, atlas: &Atlas, refs: &[(u64, u64)]) -> bool {
+    /// Whether every atlas band the retained UVs reference is still the
+    /// band they were baked against. Between commits that evicted
+    /// nothing the stored `clock` short-circuits the walk; after an
+    /// eviction each referenced band's epoch must still match.
+    fn atlas_live(&mut self, atlas: &Atlas, refs: &[(u32, u64)]) -> bool {
+        // An unresolved touch range means the commit that would fill
+        // `refs` was abandoned (grow or exhaust): never trust it.
+        if self.touch.is_some() {
+            return false;
+        }
         if self.clock == atlas.clock() {
             return true;
         }
         if refs
             .iter()
-            .all(|&(key, epoch)| atlas.live_epoch(key) == Some(epoch))
+            .all(|&(slot, epoch)| atlas.shelf_epoch(slot) == epoch)
         {
             self.clock = atlas.clock();
             return true;
@@ -813,10 +821,9 @@ pub struct Lowering<'a> {
     /// `(instance, pending)` pairs whose `uv.zw` are set when the render
     /// thread stores the pending clip mask.
     pub(crate) mask_patches: Vec<(u32, u32)>,
-    /// `(live key, epoch)` references the next emission's retained
-    /// instances depend on; `realize_leaf` moves the tail into it.
-    pub(crate) refs: Vec<(u64, u64)>,
     /// Shelves hit since the last reset, for the commit's pin marks.
+    /// The commit also resolves each emission's slice — recorded as
+    /// `Emission::touch` — into its `refs` (#119).
     pub(crate) touches: Vec<u32>,
     /// The open range's bound mask texture key; `None` for the dummy view.
     /// Kept in sync with `clip` by `set_clip`.
@@ -871,7 +878,6 @@ impl<'a> Lowering<'a> {
             paths: 0,
             cell_patches: Vec::new(),
             mask_patches: Vec::new(),
-            refs: Vec::new(),
             touches: Vec::new(),
             pending: Vec::new(),
             commands_lowered: 0,
@@ -2343,10 +2349,8 @@ impl<'a> Lowering<'a> {
             if let Some(e) = cache.data.as_ref() {
                 // Pin the shelves the retained instances sample so this
                 // commit cannot evict them (#119).
-                for &(key, _) in &storage.refs[e.refs.clone()] {
-                    if let Some(slots) = glyphs.atlas.slots_of(key) {
-                        self.touches.extend_from_slice(slots);
-                    }
+                for &(slot, _) in &storage.refs[e.refs.clone()] {
+                    self.touches.push(slot);
                 }
             }
             self.compose(
@@ -2407,7 +2411,7 @@ impl<'a> Lowering<'a> {
         let first_instance = self.frame.instances.len();
         let first_stop = self.frame.stops.len();
         let first_patch = self.cell_patches.len();
-        let first_ref = self.refs.len();
+        let first_touch = self.touches.len();
         // `realize` composes path and glyph ops' local transforms into
         // `self.transform`; the leaf's placement is restored with the clip.
         let transform = self.transform;
@@ -2446,18 +2450,16 @@ impl<'a> Lowering<'a> {
         storage
             .stops
             .extend_from_slice(&self.frame.stops[first_stop..]);
-        let emission_refs = {
-            let first = storage.refs.len();
-            storage.refs.extend_from_slice(&self.refs[first_ref..]);
-            self.refs.truncate(first_ref);
-            first..storage.refs.len()
-        };
         cache.data = Some(Emission {
             pending_cells: self.cell_patches[first_patch..]
                 .iter()
                 .map(|&(i, p, c)| (i - instance_base, p, c))
                 .collect(),
-            refs: emission_refs,
+            refs: 0..0,
+            touch: Some((
+                u32::try_from(first_touch).expect("touch count fits u32"),
+                u32::try_from(self.touches.len() - first_touch).expect("touch count fits u32"),
+            )),
             clock: glyphs.atlas.clock(),
             template,
             cover: cover.map(|cover| {
@@ -3083,23 +3085,13 @@ impl<'a> Lowering<'a> {
         let hit = glyphs
             .atlas
             .path(pl.key)
-            .map(|emit| (pl.key, emit))
-            .or_else(|| {
-                glyphs
-                    .atlas
-                    .path(pl.key_exact())
-                    .map(|emit| (pl.key_exact(), emit))
-            });
-        if let Some((key, emit)) = hit {
-            // Pin the shelves the emission's cells live on and reference
-            // the admission, so an eviction between lowers re-lowers the
-            // leaf instead of sampling stale texels (#119).
-            self.touches.extend(emit.cells.iter().map(|c| c.slot));
-            let epoch = glyphs
-                .atlas
-                .live_epoch(key)
-                .expect("a path hit is a live admission");
-            self.refs.push((key, epoch));
+            .or_else(|| glyphs.atlas.path(pl.key_exact()));
+        if let Some(emit) = hit {
+            // Pin the shelves the emission's cells live on so this
+            // commit cannot evict them; the emission's refs — resolved
+            // from the same slot set — detect a reclaim between lowers
+            // and re-lower the leaf (#119).
+            self.touches.extend_from_slice(&emit.slots);
             self.replay(emit, None, pl.offset, paint, shader_data.as_ref());
             return Ok(());
         }
@@ -3394,10 +3386,9 @@ impl<'a> Lowering<'a> {
                 continue;
             }
             if pending.is_none() {
-                // Pin the shelf and reference the admission so an
-                // eviction re-lowers the leaf (#119).
+                // Pin the shelf so this commit cannot evict the cell
+                // the emission's UVs now sample (#119).
                 self.touches.push(entry.slot);
-                self.refs.push((glyph::live_hash(&key), entry.epoch));
             }
             let rect = Rect::from_origin_size(
                 (x + f64::from(entry.left), y + f64::from(entry.top)),
@@ -3480,7 +3471,6 @@ impl<'a> Lowering<'a> {
             }
             if pending.is_none() {
                 self.touches.push(entry.slot);
-                self.refs.push((glyph::live_hash(&key), entry.epoch));
             }
             let mut inst = *template.get_or_insert_with(|| {
                 let mut inst = self.base(KIND_GLYPH, affine(self.transform));

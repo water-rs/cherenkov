@@ -36,21 +36,35 @@ granularity (plan-of-record candidate C; A and B landed via #186).
   reaching the layout frontier hands its rows back to `top` as virgin
   space. The vacant set stays pairwise non-adjacent, which bounds the
   merge scan.
-- Eviction does not touch `generation`. Surviving emissions stay live;
-  only the victim's keys lose their `live_epoch`.
+- Eviction does not touch `generation`. Surviving emissions stay live.
 
-## Correctness: epochs and per-leaf refs
+## Correctness: shelf epochs and per-leaf refs
 
-A baked cell index is valid only while its atlas entry survives, so
-every emission records `(key, epoch)` refs for the admissions it drew
-from (`Emission.refs`, `clock` for a fast all-live check). Evicting a
-key and later re-admitting it under a different origin bumps `epoch`,
-so a replayed emission that referenced the old entry fails
-`live_epoch == epoch` and re-lowers instead of sampling stale texels.
-Hits mark the shelves a frame still uses through `Lowering.touches`,
-applied once by `begin_commit` — deferred because lowering runs in
-parallel against an immutable `&Atlas`. Mask cells contribute touches
-but no refs: their atlas UV is rewritten per frame by `apply_clip`.
+A baked cell index is valid only while its band still occupies the same
+atlas slot, so every emission that drew atlas cells records `(slot,
+epoch)` pairs — `Emission.refs` into the shared `EmissionStorage.refs`
+arena — one per band it used. `Shelf.epoch` comes from `Layout.
+next_epoch` and is bumped on every band admission (vacant reuse, top
+carve, phantom split) and on every band death (`free_band`), so a slot
+re-used by a different band always reports a different epoch. Liveness
+(`Emission::atlas_live`) is a fast `clock` check when the atlas is
+untouched, otherwise a direct-index `shelf_epoch(slot) == epoch` compare
+per ref — no hash lookups.
+
+Ref collection stays out of the measured `lower` interval. Lowering is
+parallel against an immutable `&Atlas`, so a leaf records only the shelf
+slots it touches into `Lowering.touches` (hit pins and raster
+admissions alike) and each realized `Emission` keeps a `(start, len)`
+range into that scratch — `Emission.touch`. The commit's
+`apply_pending` resolves the touch range plus the bands its raster
+actually landed in (`PendingOrigin::Cells`) into the `(slot, epoch)`
+pairs and appends them to `storage.refs`. An emission whose resolving
+commit was abandoned (`Grow` or `AtlasExhausted`) still carries an
+unresolved `touch` and never verifies live — `apply_pending` is the
+only place `touch` clears.
+
+Mask cells take part in the same touches → refs path, so they are
+covered by the epoch check too.
 
 ## Residual behavior
 

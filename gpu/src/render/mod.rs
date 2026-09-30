@@ -445,9 +445,9 @@ enum Commit {
 
 enum PendingOrigin {
     /// Cell origins — one for a glyph, one per cell for a path
-    /// emission — and the live key they were admitted under, so
-    /// patched emissions can reference the admission (#119).
-    Cells(Vec<(u32, u32)>, u64),
+    /// emission — and the shelves the admission's cells live on, so
+    /// patched emissions can reference the bands (#119).
+    Cells(Vec<(u32, u32)>, Vec<u32>),
     /// A clip mask's cell origin.
     Mask([f32; 2]),
     /// A COLR cache insert; no instance patch.
@@ -3533,29 +3533,33 @@ impl GpuRenderer {
         for content in surf.layers.values_mut() {
             let (_, emissions) = content.retained.prepared();
             for emission in emissions.iter_mut().filter_map(|e| e.data.as_mut()) {
-                // The cells this frame's patches resolved to are the
-                // emission's atlas references; dedupe by live key so a
-                // path's cells append one entry, not one per cell.
-                let mut keys: rustc_hash::FxHashSet<u64> = rustc_hash::FxHashSet::default();
+                // The emission's atlas references are the shelves it
+                // touched while lowering plus the bands its deferred
+                // rasters resolved to — recorded as `(slot, band epoch)`
+                // pairs, deduplicated and contiguous at the storage
+                // tail (#119).
+                let mut slots: rustc_hash::FxHashSet<u32> = rustc_hash::FxHashSet::default();
                 for (inst, p, c) in emission.pending_cells.drain(..) {
                     content.storage.instances[emission.instances.start + inst as usize].uv[..2]
                         .copy_from_slice(&cell_origin(p, c));
-                    if let PendingOrigin::Cells(_, key) = &origins[p as usize] {
-                        keys.insert(*key);
+                    if let PendingOrigin::Cells(_, bands) = &origins[p as usize] {
+                        slots.extend(bands.iter().copied());
                     }
                 }
-                if !keys.is_empty() {
-                    // Refs must stay contiguous: re-pack this emission's
-                    // range at the storage tail with the resolved keys.
+                if let Some((start, len)) = emission.touch.take() {
+                    slots.extend(
+                        lowered.touches[start as usize..start as usize + len as usize]
+                            .iter()
+                            .copied(),
+                    );
+                }
+                if !slots.is_empty() {
                     let first = content.storage.refs.len();
-                    content
-                        .storage
-                        .refs
-                        .extend_from_within(emission.refs.clone());
-                    for key in keys {
-                        if let Some(epoch) = self.atlas.live_epoch(key) {
-                            content.storage.refs.push((key, epoch));
-                        }
+                    for slot in slots {
+                        content
+                            .storage
+                            .refs
+                            .push((slot, self.atlas.shelf_epoch(slot)));
                     }
                     emission.refs = first..content.storage.refs.len();
                 }
@@ -3565,7 +3569,7 @@ impl GpuRenderer {
                 // and re-lowers (#119).
                 if content.storage.refs[emission.refs.clone()]
                     .iter()
-                    .all(|&(k, ep)| self.atlas.live_epoch(k) == Some(ep))
+                    .all(|&(s, ep)| self.atlas.shelf_epoch(s) == ep)
                 {
                     emission.clock = self.atlas.clock();
                 }
@@ -3596,11 +3600,15 @@ impl GpuRenderer {
                 texels,
             } => {
                 let hit = self.atlas.get(&key).is_some();
-                let hk = glyph::live_hash(&key);
                 let out = self
                     .atlas
                     .place_glyph(key, left, top, w, h, texels, writes)
-                    .map(|(x, y)| PendingOrigin::Cells(vec![(x, y)], hk))
+                    .map(|(x, y)| {
+                        PendingOrigin::Cells(
+                            vec![(x, y)],
+                            vec![self.atlas.get(&key).expect("just stored").slot],
+                        )
+                    })
                     .ok_or(RenderError::AtlasFull)?;
                 if !hit && w == 0 {
                     diag::atlas_cell(&self.device, (0, 0, 0, 0));
@@ -3613,7 +3621,7 @@ impl GpuRenderer {
                     .ok_or(RenderError::AtlasFull)?;
                 Ok(PendingOrigin::Cells(
                     self.atlas.path_origins(key).expect("just stored"),
-                    key,
+                    self.atlas.path(key).expect("just stored").slots.to_vec(),
                 ))
             }
             PendingRaster::Mask {

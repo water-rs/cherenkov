@@ -124,9 +124,6 @@ pub struct Entry {
     pub top: i32,
     /// Shelf the cell lives on, for [`Atlas::begin_commit`] touches.
     pub slot: u32,
-    /// Admission epoch — the live-map value at store time. A lookup whose
-    /// entry was evicted and re-admitted fails this comparison.
-    pub epoch: u64,
 }
 
 /// One atlas cell emitted by the path rasterizer: a device-space quad
@@ -151,8 +148,9 @@ pub struct PathEmit {
     pub spans: Vec<[f32; 4]>,
     /// Partial-coverage atlas cells.
     pub cells: Vec<PathCell>,
-    /// Admission epoch — the live-map value at store time.
-    pub epoch: u64,
+    /// Shelves the cells live on — deduplicated at admission so a hit
+    /// pins them without a live-map lookup.
+    pub slots: Box<[u32]>,
 }
 
 impl PathEmit {
@@ -184,7 +182,7 @@ impl PathEmit {
                     slot: c.slot,
                 })
                 .collect(),
-            epoch: self.epoch,
+            slots: self.slots.clone(),
         }
     }
 }
@@ -260,6 +258,10 @@ struct Shelf {
     hits: u32,
     /// A dead shelf's band sits in `vacant` until reclaimed.
     live: bool,
+    /// Band epoch — bumped when a band is admitted on this slot and when
+    /// it dies, so an emission's stored `(slot, epoch)` reference fails
+    /// once the band it sampled is gone (#119).
+    epoch: u64,
 }
 
 /// The shelf layout plus reclaim bookkeeping — the part of [`Atlas`] a
@@ -273,6 +275,9 @@ struct Layout {
     vacant: Vec<u32>,
     /// Virgin-space watermark: bands are laid consecutively from y = 0.
     top: u32,
+    /// Next band epoch — monotonic, so a band's epoch changes whenever
+    /// the band occupying a slot changes (#119).
+    next_epoch: u64,
 }
 
 /// Approximate per-admission CPU bookkeeping the live map, slot keys and
@@ -283,12 +288,6 @@ const LIVE_ENTRY_BYTES: u64 = 120;
 /// A live admission's bookkeeping: which cache map holds the entry and,
 /// for glyphs, the full key needed to remove it.
 struct LiveEntry {
-    /// Admission token, unique per insert. Stale references carry an
-    /// older epoch and fail the lookup.
-    epoch: u64,
-    /// The shelves the admission's cells occupy, for the commit's pin
-    /// marks on a lowering hit.
-    slots: Box<[u32]>,
     kind: LiveKind,
 }
 
@@ -317,12 +316,8 @@ pub struct Atlas {
     /// Live-key hashes per shelf, parallel to `layout.shelves`: the keys
     /// an eviction of that shelf must drop from the caches.
     slot_keys: Vec<rustc_hash::FxHashSet<u64>>,
-    /// Admission epochs by live key — the oracle retained emissions check
-    /// their baked UVs against, and the index evictions clean through.
+    /// Live admissions by live key — the index evictions clean through.
     live: rustc_hash::FxHashMap<u64, LiveEntry>,
-    /// Next admission epoch; monotonic so a re-admitted key never matches
-    /// a reference taken before its eviction.
-    next_epoch: u64,
     /// Eviction counter; bumped per reclaimed shelf so emissions check
     /// their references once per evicting commit, not once per hit.
     clock: u64,
@@ -398,10 +393,10 @@ impl Atlas {
                 shelves: Vec::new(),
                 vacant: Vec::new(),
                 top: 0,
+                next_epoch: 0,
             },
             slot_keys: Vec::new(),
             live: rustc_hash::FxHashMap::default(),
-            next_epoch: 0,
             clock: 0,
             tick: 0,
             evicting: false,
@@ -682,6 +677,7 @@ impl Atlas {
                 shelves: Vec::new(),
                 vacant: Vec::new(),
                 top: 0,
+                next_epoch: 0,
             };
             if self
                 .plan_all
@@ -992,8 +988,7 @@ impl Atlas {
         }
         let (cx, cy, slot) = self.alloc(w, h)?;
         self.cpu_bytes += u64::from(w) * u64::from(h) + LIVE_ENTRY_BYTES;
-        let epoch = self.next_epoch;
-        self.next_epoch += 1;
+        let hk = live_hash(&key);
         let entry = Entry {
             x: cx as u16,
             y: cy as u16,
@@ -1002,15 +997,11 @@ impl Atlas {
             left,
             top,
             slot: slot as u32,
-            epoch,
         };
-        let hk = live_hash(&key);
         self.map.insert(key, entry);
         self.live.insert(
             hk,
             LiveEntry {
-                epoch,
-                slots: Box::new([slot as u32]),
                 kind: LiveKind::Glyph(key),
             },
         );
@@ -1049,9 +1040,6 @@ impl Atlas {
             return Some(());
         }
         let mut emit = emit;
-        let epoch = self.next_epoch;
-        self.next_epoch += 1;
-        emit.epoch = epoch;
         let mut slots: Vec<u32> = Vec::new();
         for (cell, (w, h, texels)) in emit.cells.iter_mut().zip(cells) {
             let (cx, cy, slot) = self.alloc(w, h)?;
@@ -1071,11 +1059,10 @@ impl Atlas {
                 texels,
             });
         }
+        emit.slots = slots.into_boxed_slice();
         self.live.insert(
             key,
             LiveEntry {
-                epoch,
-                slots: slots.into_boxed_slice(),
                 kind: LiveKind::Path,
             },
         );
@@ -1131,13 +1118,9 @@ impl Atlas {
         let (cx, cy, slot) = self.alloc(w, h)?;
         mask.atlas = [cx as f32, cy as f32];
         mask.slot = u32::try_from(slot).expect("shelf count fits u32");
-        let epoch = self.next_epoch;
-        self.next_epoch += 1;
         self.live.insert(
             key,
             LiveEntry {
-                epoch,
-                slots: Box::new([u32::try_from(slot).expect("shelf count fits u32")]),
                 kind: LiveKind::Mask,
             },
         );
@@ -1223,17 +1206,10 @@ impl Atlas {
         self.clock
     }
 
-    /// Whether `key` is admitted and — if so — which epoch it carries.
-    /// An emission's stored epoch must match exactly, so a re-admitted
-    /// entry never satisfies a reference taken before its eviction.
-    pub fn live_epoch(&self, key: u64) -> Option<u64> {
-        self.live.get(&key).map(|e| e.epoch)
-    }
-
-    /// The shelves `key`'s cells occupy — the pin marks a lowering's
-    /// cache hits leave for the commit.
-    pub fn slots_of(&self, key: u64) -> Option<&[u32]> {
-        self.live.get(&key).map(|e| e.slots.as_ref())
+    /// The epoch of the band occupying `slot` — compared with the
+    /// `(slot, epoch)` references retained emissions hold.
+    pub fn shelf_epoch(&self, slot: u32) -> u64 {
+        self.layout.shelves[usize::try_from(slot).expect("shelf index")].epoch
     }
 
     /// Lets [`Self::alloc`] reclaim the coldest shelves: set by the
@@ -1358,6 +1334,8 @@ fn evict_layout(layout: &mut Layout, tick: u64) -> Option<usize> {
 /// `h == 0` and are never reused.
 fn free_band(layout: &mut Layout, slot: usize) {
     debug_assert!(!layout.shelves[slot].live);
+    layout.shelves[slot].epoch = layout.next_epoch;
+    layout.next_epoch += 1;
     let mut slot = slot;
     loop {
         let mut y = layout.shelves[slot].y;
@@ -1451,7 +1429,9 @@ fn alloc_on(
                 last_used: 0,
                 hits: 0,
                 live: false,
+                epoch: layout.next_epoch,
             });
+            layout.next_epoch += 1;
             let phantom = layout.shelves.len() - 1;
             free_band(layout, phantom);
         }
@@ -1462,6 +1442,8 @@ fn alloc_on(
         shelf.last_used = tick;
         shelf.hits = 0;
         shelf.live = true;
+        shelf.epoch = layout.next_epoch;
+        layout.next_epoch += 1;
         return Some((PAD, shelf.y + PAD, slot));
     }
     // A new shelf also needs the cell's width: a cell wider than the
@@ -1477,7 +1459,9 @@ fn alloc_on(
             last_used: tick,
             hits: 0,
             live: true,
+            epoch: layout.next_epoch,
         });
+        layout.next_epoch += 1;
         layout.top += class;
         return Some((PAD, layout.top - class + PAD, i));
     }
@@ -1721,7 +1705,6 @@ pub fn entry(
             left,
             top,
             slot: 0,
-            epoch: 0,
         },
         Some(idx),
     ))
@@ -2235,13 +2218,14 @@ mod tests {
                 .is_some()
         );
         assert_eq!(atlas.layout.top, 64, "the layout is full");
-        let [slot_a, slot_c, slot_e] = [
+        let [slot_a, slot_b, slot_c, slot_e] = [
             atlas.get(&key_a).expect("a").slot,
+            atlas.get(&key_b).expect("b").slot,
             atlas.get(&key_c).expect("c").slot,
             atlas.get(&key_e).expect("e").slot,
         ];
-        let epoch_a = atlas.live_epoch(live_hash(&key_a));
-        assert!(epoch_a.is_some());
+        let epoch_a = atlas.shelf_epoch(slot_a);
+        let epoch_b = atlas.shelf_epoch(slot_b);
         // Commit 2: the hits pin A, C and E; B's shelf is untouched. A
         // class-16 cell cannot fit live or virgin space, so eviction
         // must reclaim B's band rather than any pinned shelf.
@@ -2259,9 +2243,11 @@ mod tests {
             atlas.get(&key_b).is_none(),
             "the cold shelf's entry is gone"
         );
-        assert!(atlas.live_epoch(live_hash(&key_b)).is_none());
-        assert!(atlas.slots_of(live_hash(&key_b)).is_none());
-        assert!(atlas.slots_of(live_hash(&key_d)).is_some());
+        assert_ne!(
+            atlas.shelf_epoch(slot_b),
+            epoch_b,
+            "a dead band's epoch moves so stale references fail"
+        );
         assert!(
             atlas.get(&key_a).is_some()
                 && atlas.get(&key_c).is_some()
@@ -2269,9 +2255,9 @@ mod tests {
             "touched shelves keep their entries"
         );
         assert_eq!(
-            atlas.live_epoch(live_hash(&key_a)),
+            atlas.shelf_epoch(slot_a),
             epoch_a,
-            "a surviving admission keeps its epoch"
+            "a surviving band keeps its epoch"
         );
     }
 }

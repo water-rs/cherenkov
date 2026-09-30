@@ -94,7 +94,7 @@ pub struct OutputSelection {
     pub reported_headroom: Option<f32>,
     /// The headroom the destination can carry: `1` for the SDR spaces,
     /// `REFERENCE_WHITE_NITS`-calibrated ceilings for PQ and HLG,
-    /// unbounded (`f32::INFINITY`) for the extended spaces.
+    /// unbounded (`f32::MAX`) for the extended spaces.
     pub tone_map_ceiling: f32,
     /// The SDR-white calibration in nits (BT.2408).
     pub reference_white_nits: f32,

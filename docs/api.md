@@ -114,7 +114,8 @@ pub trait Renderer: 'static {
   ```rust
   pub struct Frame<'a> { pub id: FrameId, pub time: FrameTime, pub surfaces: &'a [SurfaceFrame<'a>] }
   pub struct SurfaceFrame<'a> { pub id: SurfaceId, pub size: (u32, u32), pub display: Display,
-                                pub clear: WorkingColor, pub changed: bool, pub tree: &'a SurfaceTree }
+                                pub clear: WorkingColor, pub changed: bool, pub present_pending: bool,
+                                pub display_moved: bool, pub tree: &'a SurfaceTree }
   impl SurfaceTree { pub fn root(&self) -> LayerId; pub fn layer(&self, id: LayerId) -> &LayerNode; }
   pub struct LayerNode { /* sampled for this frame: */ pub transform: Affine, pub opacity: f32,
                          pub scroll_offset: Vec2, pub clip: Option<ShapeData>, pub blend: BlendMode,
@@ -230,7 +231,8 @@ let panel = engine.surface(Bands::new(size, OffscreenFormat::LinearF16, |band| d
 
 - **System-compositor parents.** Targets that expose one (`CALayer`, `SurfaceControl`, a DirectComposition visual, a Wayland subsurface) let the engine build **planes**. Most layers are composited inside the engine onto one plane. Eligible layers are promoted automatically to their own system layers: video frames, custom GPU content and large stable layers. A layer is not promoted when it is under a backdrop, uses a non-default blend or has a clip the system cannot express. Hardware overlay budgets also limit promotion.
 - **Many small surfaces are first-class.** A native backend embeds one surface per self-drawn component, and a list may hold dozens. All surfaces share the engine's pipelines, atlases and caches. Creating and dropping one is cheap. All dirty surfaces render in one submission per frame.
-- **Display properties.** Headroom and scale belong to the display, so the host sets them when they change: `surface.display(Display { headroom, scale })`. Presentation reads `headroom` every frame — a headroom change takes effect on the next frame and never re-lowers or re-records content.
+- **Display properties.** Headroom and scale belong to the display, so the host sets them when they change: `surface.display(Display { headroom, scale })`. Presentation reads `headroom` every frame — a headroom change takes effect on the next frame and never re-lowers or re-records content. A move to another display is announced separately as `surface.display_moved()` — a move between numerically identical displays is invisible in `Display`'s values — and it rides the next frame as `SurfaceFrame::display_moved` so a presenting backend re-enumerates the surface's capabilities where a headroom-only update never does (#98).
+- **Window output is negotiated, never defaulted.** A window surface selects its swapchain format and colour space from the surface's advertised format/colour-space pairs through wgpu 30's surface colour-space API — an extended-range pair where offered, a wide-gamut SDR pair, else tone-mapped sRGB — and reports the choice and its reason in `OutputSelection`; a silent sRGB fallback does not exist (#98). `WindowTarget::require_color_space` pins a required `wgpu::SurfaceColorSpace`: a surface that cannot advertise it fails creation with `UnsupportedTarget` rather than substituting. `WindowTarget::output_probe` hands the host a `DisplayProbe` — sampled on the main thread on Apple — whose `tone_map_headroom` feeds `Display::headroom` for live EDR and whose `selection()` answers what a hypothetical move would negotiate. The current negotiation is readable at `WindowSurface::selection`.
 
 ## Frame driving
 

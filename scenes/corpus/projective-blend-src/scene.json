@@ -1,0 +1,266 @@
+{
+  "width": 256,
+  "height": 192,
+  "working_space": "linear-display-p3",
+  "clear": {
+    "space": "srgb",
+    "components": [
+      0.86,
+      0.88,
+      0.92,
+      1.0
+    ]
+  },
+  "features": [
+    {
+      "feature": "fill"
+    },
+    {
+      "feature": "linear-gradient"
+    },
+    {
+      "feature": "blend",
+      "value": "src"
+    },
+    {
+      "feature": "clip"
+    },
+    {
+      "feature": "interpolation-space",
+      "value": "linear-p3"
+    },
+    {
+      "feature": "projective"
+    }
+  ],
+  "root": {
+    "transform": [
+      1.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0
+    ],
+    "opacity": 1.0,
+    "blend": "normal",
+    "items": [
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rect": {
+                "x0": 0.0,
+                "y0": 0.0,
+                "x1": 256.0,
+                "y1": 192.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "linear": {
+                "start": {
+                  "x": 0.0,
+                  "y": 0.0
+                },
+                "end": {
+                  "x": 256.0,
+                  "y": 192.0
+                },
+                "stops": [
+                  {
+                    "offset": 0.0,
+                    "color": {
+                      "space": "srgb",
+                      "components": [
+                        0.95,
+                        0.9,
+                        0.3,
+                        1.0
+                      ]
+                    }
+                  },
+                  {
+                    "offset": 1.0,
+                    "color": {
+                      "space": "srgb",
+                      "components": [
+                        0.3,
+                        0.8,
+                        0.9,
+                        1.0
+                      ]
+                    }
+                  }
+                ],
+                "extend": "pad",
+                "interpolation": "linear-p3"
+              }
+            }
+          }
+        }
+      },
+      {
+        "layer": {
+          "transform": [
+            1.0,
+            0.0,
+            0.0,
+            1.0,
+            48.0,
+            32.0
+          ],
+          "clip": {
+            "rounded-rect": {
+              "rect": {
+                "x0": 0.0,
+                "y0": 0.0,
+                "x1": 160.0,
+                "y1": 128.0
+              },
+              "radii": {
+                "top_left": 16.0,
+                "top_right": 16.0,
+                "bottom_right": 16.0,
+                "bottom_left": 16.0
+              }
+            }
+          },
+          "opacity": 1.0,
+          "blend": "src",
+          "projection": {
+            "matrix": [
+              [
+                1.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              [
+                0.0,
+                1.0,
+                0.0,
+                0.0
+              ],
+              [
+                0.0,
+                0.0,
+                1.0,
+                0.0
+              ],
+              [
+                0.0,
+                0.0,
+                -0.0033333333333333335,
+                1.0
+              ]
+            ],
+            "tilt": {
+              "x": 0.45,
+              "y": -0.6
+            },
+            "pivot": {
+              "x": 80.0,
+              "y": 64.0
+            }
+          },
+          "items": [
+            {
+              "layer": {
+                "transform": [
+                  1.0,
+                  0.0,
+                  0.0,
+                  1.0,
+                  0.0,
+                  0.0
+                ],
+                "opacity": 1.0,
+                "blend": "normal",
+                "items": [
+                  {
+                    "draw": {
+                      "fill": {
+                        "shape": {
+                          "circle": {
+                            "center": {
+                              "x": 60.0,
+                              "y": 60.0
+                            },
+                            "radius": 44.0
+                          }
+                        },
+                        "rule": "non-zero",
+                        "paint": {
+                          "solid": {
+                            "space": "srgb",
+                            "components": [
+                              0.9,
+                              0.6,
+                              0.1,
+                              0.8
+                            ]
+                          }
+                        }
+                      }
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "layer": {
+                "transform": [
+                  1.0,
+                  0.0,
+                  0.0,
+                  1.0,
+                  0.0,
+                  0.0
+                ],
+                "opacity": 1.0,
+                "blend": "normal",
+                "items": [
+                  {
+                    "draw": {
+                      "fill": {
+                        "shape": {
+                          "rounded-rect": {
+                            "rect": {
+                              "x0": 70.0,
+                              "y0": 40.0,
+                              "x1": 140.0,
+                              "y1": 100.0
+                            },
+                            "radii": {
+                              "top_left": 8.0,
+                              "top_right": 8.0,
+                              "bottom_right": 8.0,
+                              "bottom_left": 8.0
+                            }
+                          }
+                        },
+                        "rule": "non-zero",
+                        "paint": {
+                          "solid": {
+                            "space": "srgb",
+                            "components": [
+                              0.1,
+                              0.6,
+                              0.9,
+                              0.5
+                            ]
+                          }
+                        }
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

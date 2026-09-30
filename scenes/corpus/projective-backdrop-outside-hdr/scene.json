@@ -1,0 +1,680 @@
+{
+  "width": 256,
+  "height": 192,
+  "working_space": "linear-display-p3",
+  "clear": {
+    "space": "srgb",
+    "components": [
+      0.86,
+      0.88,
+      0.92,
+      1.0
+    ]
+  },
+  "features": [
+    {
+      "feature": "fill"
+    },
+    {
+      "feature": "clip"
+    },
+    {
+      "feature": "hdr-color"
+    },
+    {
+      "feature": "wide-gamut"
+    },
+    {
+      "feature": "backdrop"
+    },
+    {
+      "feature": "backdrop-blur"
+    },
+    {
+      "feature": "projective"
+    }
+  ],
+  "backdrop_groups": [
+    {
+      "id": 1,
+      "filters": [
+        {
+          "filter": "gaussian-blur",
+          "value": {
+            "sigma": 4.0
+          }
+        }
+      ]
+    }
+  ],
+  "root": {
+    "transform": [
+      1.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0
+    ],
+    "opacity": 1.0,
+    "blend": "normal",
+    "items": [
+      {
+        "layer": {
+          "transform": [
+            1.0,
+            0.0,
+            0.0,
+            1.0,
+            24.0,
+            24.0
+          ],
+          "clip": {
+            "rect": {
+              "x0": 0.0,
+              "y0": 0.0,
+              "x1": 208.0,
+              "y1": 144.0
+            }
+          },
+          "opacity": 1.0,
+          "blend": "normal",
+          "projection": {
+            "matrix": [
+              [
+                1.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              [
+                0.0,
+                1.0,
+                0.0,
+                0.0
+              ],
+              [
+                0.0,
+                0.0,
+                1.0,
+                0.0
+              ],
+              [
+                0.0,
+                0.0,
+                -0.002777777777777778,
+                1.0
+              ]
+            ],
+            "tilt": {
+              "x": 0.6,
+              "y": 0.0
+            },
+            "pivot": {
+              "x": 104.0,
+              "y": 72.0
+            }
+          },
+          "items": [
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rect": {
+                      "x0": 0.0,
+                      "y0": 0.0,
+                      "x1": 16.0,
+                      "y1": 256.0
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "solid": {
+                      "space": "linear-p3",
+                      "components": [
+                        3.0,
+                        0.8,
+                        0.2,
+                        1.0
+                      ]
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rect": {
+                      "x0": 16.0,
+                      "y0": 0.0,
+                      "x1": 48.0,
+                      "y1": 256.0
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "solid": {
+                      "space": "linear-p3",
+                      "components": [
+                        0.0,
+                        0.7,
+                        0.9,
+                        1.0
+                      ]
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rect": {
+                      "x0": 32.0,
+                      "y0": 0.0,
+                      "x1": 80.0,
+                      "y1": 256.0
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "solid": {
+                      "space": "linear-p3",
+                      "components": [
+                        3.0,
+                        0.8,
+                        0.2,
+                        1.0
+                      ]
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rect": {
+                      "x0": 48.0,
+                      "y0": 0.0,
+                      "x1": 112.0,
+                      "y1": 256.0
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "solid": {
+                      "space": "linear-p3",
+                      "components": [
+                        0.0,
+                        0.7,
+                        0.9,
+                        1.0
+                      ]
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rect": {
+                      "x0": 64.0,
+                      "y0": 0.0,
+                      "x1": 144.0,
+                      "y1": 256.0
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "solid": {
+                      "space": "linear-p3",
+                      "components": [
+                        3.0,
+                        0.8,
+                        0.2,
+                        1.0
+                      ]
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rect": {
+                      "x0": 80.0,
+                      "y0": 0.0,
+                      "x1": 176.0,
+                      "y1": 256.0
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "solid": {
+                      "space": "linear-p3",
+                      "components": [
+                        0.0,
+                        0.7,
+                        0.9,
+                        1.0
+                      ]
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rect": {
+                      "x0": 96.0,
+                      "y0": 0.0,
+                      "x1": 208.0,
+                      "y1": 256.0
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "solid": {
+                      "space": "linear-p3",
+                      "components": [
+                        3.0,
+                        0.8,
+                        0.2,
+                        1.0
+                      ]
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rect": {
+                      "x0": 112.0,
+                      "y0": 0.0,
+                      "x1": 240.0,
+                      "y1": 256.0
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "solid": {
+                      "space": "linear-p3",
+                      "components": [
+                        0.0,
+                        0.7,
+                        0.9,
+                        1.0
+                      ]
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rect": {
+                      "x0": 128.0,
+                      "y0": 0.0,
+                      "x1": 272.0,
+                      "y1": 256.0
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "solid": {
+                      "space": "linear-p3",
+                      "components": [
+                        3.0,
+                        0.8,
+                        0.2,
+                        1.0
+                      ]
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rect": {
+                      "x0": 144.0,
+                      "y0": 0.0,
+                      "x1": 304.0,
+                      "y1": 256.0
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "solid": {
+                      "space": "linear-p3",
+                      "components": [
+                        0.0,
+                        0.7,
+                        0.9,
+                        1.0
+                      ]
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rect": {
+                      "x0": 160.0,
+                      "y0": 0.0,
+                      "x1": 336.0,
+                      "y1": 256.0
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "solid": {
+                      "space": "linear-p3",
+                      "components": [
+                        3.0,
+                        0.8,
+                        0.2,
+                        1.0
+                      ]
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rect": {
+                      "x0": 176.0,
+                      "y0": 0.0,
+                      "x1": 368.0,
+                      "y1": 256.0
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "solid": {
+                      "space": "linear-p3",
+                      "components": [
+                        0.0,
+                        0.7,
+                        0.9,
+                        1.0
+                      ]
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rect": {
+                      "x0": 192.0,
+                      "y0": 0.0,
+                      "x1": 400.0,
+                      "y1": 256.0
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "solid": {
+                      "space": "linear-p3",
+                      "components": [
+                        3.0,
+                        0.8,
+                        0.2,
+                        1.0
+                      ]
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rect": {
+                      "x0": 208.0,
+                      "y0": 0.0,
+                      "x1": 432.0,
+                      "y1": 256.0
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "solid": {
+                      "space": "linear-p3",
+                      "components": [
+                        0.0,
+                        0.7,
+                        0.9,
+                        1.0
+                      ]
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rect": {
+                      "x0": 224.0,
+                      "y0": 0.0,
+                      "x1": 464.0,
+                      "y1": 256.0
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "solid": {
+                      "space": "linear-p3",
+                      "components": [
+                        3.0,
+                        0.8,
+                        0.2,
+                        1.0
+                      ]
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rect": {
+                      "x0": 240.0,
+                      "y0": 0.0,
+                      "x1": 496.0,
+                      "y1": 256.0
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "solid": {
+                      "space": "linear-p3",
+                      "components": [
+                        0.0,
+                        0.7,
+                        0.9,
+                        1.0
+                      ]
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "circle": {
+                      "center": {
+                        "x": 64.0,
+                        "y": 200.0
+                      },
+                      "radius": 36.0
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "solid": {
+                      "space": "linear-p3",
+                      "components": [
+                        0.4,
+                        2.5,
+                        0.6,
+                        1.0
+                      ]
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "circle": {
+                      "center": {
+                        "x": 192.0,
+                        "y": 56.0
+                      },
+                      "radius": 28.0
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "solid": {
+                      "space": "linear-p3",
+                      "components": [
+                        0.9,
+                        0.0,
+                        0.4,
+                        1.0
+                      ]
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "circle": {
+                      "center": {
+                        "x": 224.0,
+                        "y": 224.0
+                      },
+                      "radius": 24.0
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "solid": {
+                      "space": "srgb",
+                      "components": [
+                        0.9,
+                        0.9,
+                        0.2,
+                        1.0
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      {
+        "layer": {
+          "transform": [
+            1.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0
+          ],
+          "clip": {
+            "rounded-rect": {
+              "rect": {
+                "x0": 64.0,
+                "y0": 96.0,
+                "x1": 192.0,
+                "y1": 168.0
+              },
+              "radii": {
+                "top_left": 20.0,
+                "top_right": 20.0,
+                "bottom_right": 20.0,
+                "bottom_left": 20.0
+              }
+            }
+          },
+          "opacity": 1.0,
+          "blend": "normal",
+          "backdrop": 1,
+          "items": [
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rect": {
+                      "x0": 64.0,
+                      "y0": 96.0,
+                      "x1": 192.0,
+                      "y1": 168.0
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "solid": {
+                      "space": "srgb",
+                      "components": [
+                        1.0,
+                        1.0,
+                        1.0,
+                        0.2
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

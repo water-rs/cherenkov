@@ -35,11 +35,8 @@ mod dmabuf;
 mod sync;
 mod ycbcr;
 
-pub use dmabuf::create_pool;
-pub use sync::{
-    Generation, Lease, PendingAcquire, PendingWait, Release, State, Views, cancel_staged,
-    drain_releases, mark_submitted, stage_acquire, submit_waits,
-};
+pub use sync::{Generation, PendingAcquire, PendingWait, State, cancel_staged, stage_acquire};
+pub use sync::{Release, drain_destroys, drain_releases, mark_owned, mark_submitted, submit_waits};
 
 /// `QueueFamily` the producer released the image on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,10 +76,11 @@ pub enum Wait {
         fd: OwnedFd,
     },
     /// A Linux sync fd / Android fence payload, imported as a one-shot
-    /// binary semaphore. The fd's ownership stays with the caller; the
-    /// engine reads it, never closes it.
+    /// binary semaphore. The fd is consumed into a binary semaphore at
+    /// first use; the engine takes ownership of it — the same contract as
+    /// `OpaqueFd` (`vkImportSemaphoreFdKHR` takes the fd on success).
     SyncFd {
-        /// The producer's fence fd; dup'ed onto the semaphore, never closed.
+        /// The payload descriptor; owned and closed by the engine.
         fd: OwnedFd,
     },
     /// A host-owned `VkSemaphore` (as `u64`) of timeline kind, waited on at
@@ -395,12 +393,17 @@ pub struct Caps {
 ///
 /// `wgpu-hal` already enables the FD external-memory, dma-buf modifier,
 /// DRM modifier and timeline-semaphore extensions when the physical device
-/// offers them; the callback adds the YCbCr conversion extension and — on
-/// Android — the hardware-buffer import extension, plus the feature bit
-/// wgpu leaves off.
+/// offers them; the callback adds the YCbCr conversion and
+/// semaphore-fd extensions and — on Android — the hardware-buffer import
+/// extension, plus the feature bit wgpu leaves off. The design's release
+/// fences are semaphores exported as `SYNC_FD`, so no
+/// `VK_KHR_external_fence_fd` device extension is needed.
 pub fn extra_device_extensions() -> Vec<&'static CStr> {
     #[allow(unused_mut)]
-    let mut exts = vec![ash::khr::sampler_ycbcr_conversion::NAME];
+    let mut exts = vec![
+        ash::khr::sampler_ycbcr_conversion::NAME,
+        ash::khr::external_semaphore_fd::NAME,
+    ];
     #[cfg(target_os = "android")]
     exts.push(ash::android::external_memory_android_hardware_buffer::NAME);
     exts
@@ -448,6 +451,9 @@ pub struct Vk {
     pub queue_family: u32,
     /// The retire queue render-thread flushes drain.
     pub pending_release: Arc<Mutex<Vec<Release>>>,
+    /// Cache objects evicted by bound enforcement, destroyed on the next
+    /// submission-completion callback.
+    pub pending_destroy: Arc<Mutex<Vec<sync::DestroyItem>>>,
 }
 
 /// The per-`VkDevice` context shared between host-side imports and the
@@ -493,8 +499,8 @@ impl Shared {
             ycbcr: caps
                 .sampler_ycbcr_conversion
                 .then(|| ash::khr::sampler_ycbcr_conversion::Device::new(&instance, &device)),
-            external_semaphore_fd: caps
-                .external_semaphore_opaque_fd
+            external_semaphore_fd: (caps.external_semaphore_opaque_fd
+                || caps.external_semaphore_sync_fd)
                 .then(|| ash::khr::external_semaphore_fd::Device::new(&instance, &device)),
             #[cfg(target_os = "android")]
             ahb: caps.external_memory_android_hardware_buffer.then(|| {
@@ -504,6 +510,7 @@ impl Shared {
             }),
             queue_family,
             pending_release: Arc::new(Mutex::new(Vec::new())),
+            pending_destroy: Arc::new(Mutex::new(Vec::new())),
             device,
         };
         Ok(Self {
@@ -606,6 +613,9 @@ fn probe(
         external_memory_android_hardware_buffer: has(
             ash::android::external_memory_android_hardware_buffer::NAME,
         ),
+        // `VK_QUEUE_FAMILY_FOREIGN_EXT` is defined by the platform's
+        // AHardwareBuffer contract itself — usable on Android without the
+        // extension being requested.
         queue_family_foreign: has(ash::ext::queue_family_foreign::NAME)
             || cfg!(target_os = "android"),
     }
@@ -643,8 +653,8 @@ pub struct Native {
     pub conv_layouts: FxHashMap<vk::DescriptorSetLayout, vk::PipelineLayout>,
     /// The pool the renderer's single `set0` descriptor set allocates from.
     pub desc_pool0: vk::DescriptorPool,
-    /// The cached `set0` descriptor set and the handles it was built from
-    /// (`globals`, `instances`, `stops`, atlas view).
+    /// The renderer's single `set0` descriptor set, allocated once and
+    /// rewritten in place when the buffer/view identities change.
     pub set0_set: vk::DescriptorSet,
     /// Buffer/view handles `set0_set` was last written for.
     pub set0_key: Option<(u64, u64, u64, u64)>,
@@ -658,13 +668,18 @@ pub struct Native {
     pub dummy_memory: vk::DeviceMemory,
     /// Render passes keyed by target format.
     pub render_passes: FxHashMap<vk::Format, vk::RenderPass>,
-    /// Framebuffers keyed by (render pass, target view, extent).
-    pub framebuffers: FxHashMap<(u64, u64, u32, u32), vk::Framebuffer>,
+    /// Framebuffers keyed by (render pass, target view, extent, target
+    /// generation) — the generation invalidates entries when the surface
+    /// re-creates the view a recycled handle could alias.
+    pub framebuffers: FxHashMap<(u64, u64, u32, u32, u64), vk::Framebuffer>,
     /// Pipelines keyed by (layout kind, target format).
     pub pipelines: FxHashMap<PipeKey, vk::Pipeline>,
     /// Generations staged for acquisition in the encoder currently being
     /// built; the submit registers their waits and finalises states.
     pub staged: Vec<sync::PendingAcquire>,
+    /// State records of generations whose consuming submission was
+    /// accepted; the completion callback promotes them to `OwnedForRead`.
+    pub acquiring: Vec<Arc<std::sync::Mutex<sync::State>>>,
     /// Releases ready to submit on this submission.
     pub releases: Vec<Release>,
 }
@@ -828,11 +843,15 @@ impl Native {
             framebuffers: FxHashMap::default(),
             pipelines: FxHashMap::default(),
             staged: Vec::new(),
+            acquiring: Vec::new(),
             releases: Vec::new(),
         })
     }
 
     /// Destroys every cached object; called at renderer teardown.
+    ///
+    /// # Panics
+    /// On a poisoned deferred-destroy queue.
     pub fn destroy(&mut self) {
         let dev = &self.shared.vk.device;
         unsafe {
@@ -841,6 +860,16 @@ impl Native {
             }
             for (_, fb) in self.framebuffers.drain() {
                 dev.destroy_framebuffer(fb, None);
+            }
+            for item in self
+                .shared
+                .vk
+                .pending_destroy
+                .lock()
+                .expect("pending destroy")
+                .drain(..)
+            {
+                item.destroy(dev);
             }
             for (_, rp) in self.render_passes.drain() {
                 dev.destroy_render_pass(rp, None);
@@ -995,18 +1024,28 @@ pub struct OpDraw {
     pub instance_count: u32,
     /// The clip-mask view (`None` binds the dummy).
     pub mask: Option<vk::ImageView>,
+    /// The atlas mask-texture generation at encode time — part of the
+    /// set-1 cache key so a re-created mask texture rebinds.
+    pub mask_gen: u64,
     /// The frame's params uniform buffer.
     pub params: vk::Buffer,
 }
 
 /// Writes a `set-1` descriptor for `generation` under `mask`, allocating from the
-/// generation's pool.
+/// generation's pool. The cache key is `(mask view, mask generation)` so a
+/// re-created mask texture — whose raw handle a driver may recycle —
+/// misses and rebinds; the map is bounded at the pool's `max_sets`, with
+/// evicted sets freed once the referencing submissions complete.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the bounded cache check, allocate and write are one object"
+)]
 pub fn write_set1(
     native: &Native,
     generation: &Arc<Generation>,
     mask: Option<vk::ImageView>,
     params: vk::Buffer,
-    mask_key: u64,
+    mask_key: (u64, u64),
 ) -> Result<vk::DescriptorSet, NativeError> {
     if let Some(&set) = generation.sets.lock().expect("frame sets").get(&mask_key) {
         return Ok(set);
@@ -1072,6 +1111,23 @@ pub fn write_set1(
     let alloc = vk::DescriptorSetAllocateInfo::default()
         .descriptor_pool(pool)
         .set_layouts(&layouts);
+    // Bounded like the conversion cache: a generation's pool is
+    // `max_sets(16)`, so the whole map is retired into the
+    // deferred-free queue once the cap is reached — the evicted sets may
+    // still be referenced by in-flight submissions and are freed on the
+    // next completion callback, before the pool itself is destroyed at
+    // release completion.
+    if generation.sets.lock().expect("frame sets").len() >= 16 {
+        let mut pending = native
+            .shared
+            .vk
+            .pending_destroy
+            .lock()
+            .expect("pending destroy");
+        for (_, evicted) in generation.sets.lock().expect("frame sets").drain() {
+            pending.push(sync::DestroyItem::DescriptorSet { pool, set: evicted });
+        }
+    }
     let sets = unsafe { dev.allocate_descriptor_sets(&alloc) }.map_err(NativeError::from)?;
     let set = sets[0];
     let image_writes: Vec<vk::WriteDescriptorSet> = writes
@@ -1167,15 +1223,19 @@ impl Native {
         Ok(rp)
     }
 
-    /// The framebuffer for (`view`, `extent`) on the `format` render pass.
+    /// The framebuffer for (`view`, `extent`) on the `format` render
+    /// pass. `view_gen` is the surface's bind generation — a re-created
+    /// target view (whose raw handle a driver may recycle) keys a fresh
+    /// entry instead of hitting a stale one.
     fn framebuffer(
         &mut self,
         format: vk::Format,
         view: vk::ImageView,
         extent: (u32, u32),
+        view_gen: u64,
     ) -> Result<vk::Framebuffer, NativeError> {
         let rp = self.render_pass(format)?;
-        let key = (rp.as_raw(), view.as_raw(), extent.0, extent.1);
+        let key = (rp.as_raw(), view.as_raw(), extent.0, extent.1, view_gen);
         if let Some(&fb) = self.framebuffers.get(&key) {
             return Ok(fb);
         }
@@ -1191,6 +1251,21 @@ impl Native {
             )
         }
         .map_err(NativeError::from)?;
+        // Bounded like the conversion cache: past the cap, every entry is
+        // retired into the deferred-destroy queue — the objects may still
+        // be referenced by in-flight submissions, so destruction lands on
+        // the next completion callback.
+        if self.framebuffers.len() >= 32 {
+            let mut pending = self
+                .shared
+                .vk
+                .pending_destroy
+                .lock()
+                .expect("pending destroy");
+            for (_, evicted) in self.framebuffers.drain() {
+                pending.push(sync::DestroyItem::Framebuffer(evicted));
+            }
+        }
         self.framebuffers.insert(key, fb);
         Ok(fb)
     }
@@ -1311,15 +1386,20 @@ impl Native {
             return Ok(self.set0_set);
         }
         let dev = &self.shared.vk.device;
-        let sets = unsafe {
-            dev.allocate_descriptor_sets(
-                &vk::DescriptorSetAllocateInfo::default()
-                    .descriptor_pool(self.desc_pool0)
-                    .set_layouts(std::slice::from_ref(&self.set0)),
-            )
+        if self.set0_set.is_null() {
+            // One-time allocation: the pool is `max_sets(1)` because this
+            // set is rewritten in place, never reallocated.
+            let sets = unsafe {
+                dev.allocate_descriptor_sets(
+                    &vk::DescriptorSetAllocateInfo::default()
+                        .descriptor_pool(self.desc_pool0)
+                        .set_layouts(std::slice::from_ref(&self.set0)),
+                )
+            }
+            .map_err(NativeError::from)?;
+            self.set0_set = sets[0];
         }
-        .map_err(NativeError::from)?;
-        let set = sets[0];
+        let set = self.set0_set;
         let infos = [
             vk::DescriptorBufferInfo {
                 buffer: globals,
@@ -1369,7 +1449,6 @@ impl Native {
                 &[],
             );
         }
-        self.set0_set = set;
         self.set0_key = Some(key);
         Ok(set)
     }
@@ -1402,6 +1481,7 @@ impl Native {
         set0: vk::DescriptorSet,
         draws: &[OpDraw],
         dynamic_offset: u32,
+        view_gen: u64,
     ) -> Result<(), NativeError> {
         // `dev` clones cheaply (a handle): holding it across the cache
         // lookups below keeps them borrowable on `self`.
@@ -1416,7 +1496,7 @@ impl Native {
         self.staged.extend(staged);
 
         let render_pass = self.render_pass(format)?;
-        let framebuffer = self.framebuffer(format, view, extent)?;
+        let framebuffer = self.framebuffer(format, view, extent, view_gen)?;
         unsafe {
             dev.cmd_begin_render_pass(
                 cb,
@@ -1471,7 +1551,10 @@ impl Native {
             };
             let pipeline = self.pipeline(pipe_key)?;
             let layout = self.pipeline_layout(&draw.generation);
-            let mask_key = draw.mask.map_or(u64::MAX, ash::vk::Handle::as_raw);
+            let mask_key = (
+                draw.mask.map_or(u64::MAX, ash::vk::Handle::as_raw),
+                draw.mask_gen,
+            );
             let set1 = write_set1(self, &draw.generation, draw.mask, draw.params, mask_key)?;
             unsafe {
                 dev.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pipeline);
@@ -1490,3 +1573,6 @@ impl Native {
         Ok(())
     }
 }
+
+#[cfg(all(test, unix, not(target_vendor = "apple")))]
+mod lavapipe;

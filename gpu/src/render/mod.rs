@@ -971,6 +971,8 @@ fn split_encoder(encoder: &mut wgpu::CommandEncoder, device: &wgpu::Device) -> w
     .finish()
 }
 
+/// `view`'s `VkImageView`.
+#[cfg(all(unix, not(target_vendor = "apple")))]
 fn raw_vk_view(view: &wgpu::TextureView) -> ash::vk::ImageView {
     let hal = unsafe { view.as_hal::<wgpu::hal::vulkan::Api>() };
     unsafe { hal.expect("vulkan").raw_handle() }
@@ -4877,6 +4879,7 @@ impl GpuRenderer {
                                         .expect("mask texture stored before encode"),
                                 )
                             }),
+                            mask_gen: self.atlas.mask_texture_generation(),
                             params: raw_vk_buffer(slot.params_buffer()),
                         });
                         end += 1;
@@ -4914,19 +4917,31 @@ impl GpuRenderer {
                                 set0,
                                 &draws,
                                 offset,
+                                surf.bind_gen,
                             )
                         })
                     }
                     .map_err(|e| RenderError::Render(e.to_string()))?;
                     buffers.push(op.finish());
-                    // Reopen the wgpu pass loading what was written.
+                    // The end sample belongs on the LAST reopened segment:
+                    // a pass with a later native op still coming must not
+                    // write it here.
+                    let more_native = pass.ranges[end..].iter().any(|range| {
+                        matches!(&range.image, Some(lower::ImageSource::External(layer))
+                            if surf
+                                .external
+                                .get(layer)
+                                .and_then(|slot| slot.native_frame())
+                                .is_some())
+                    });
                     let reopen_writes =
                         self.query_set
                             .as_ref()
                             .map(|qs| wgpu::RenderPassTimestampWrites {
                                 query_set: qs,
                                 beginning_of_pass_write_index: None,
-                                end_of_pass_write_index: Some(self.query_base + 2 * pass_index + 1),
+                                end_of_pass_write_index: (!more_native)
+                                    .then_some(self.query_base + 2 * pass_index + 1),
                             });
                     render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("pass"),
@@ -5225,14 +5240,40 @@ impl GpuRenderer {
             }
             #[cfg(all(unix, not(target_vendor = "apple")))]
             if let Some(native) = self.native.as_mut()
+                && !native.acquiring.is_empty()
+            {
+                // The consuming submission is accepted; states promote to
+                // `OwnedForRead` when the queue reports it complete.
+                let acquired = std::mem::take(&mut native.acquiring);
+                self.queue
+                    .on_submitted_work_done(move || external::vulkan::mark_owned(acquired));
+            }
+            #[cfg(all(unix, not(target_vendor = "apple")))]
+            if let Some(native) = self.native.as_mut() {
+                // Bounded-cache evictions are destroyed once every
+                // submission that could still reference them completes.
+                let destroys = external::vulkan::drain_destroys(native);
+                if !destroys.is_empty() {
+                    let device = native.shared.vk.device.clone();
+                    self.queue.on_submitted_work_done(move || {
+                        for item in destroys {
+                            unsafe { item.destroy(&device) };
+                        }
+                    });
+                }
+            }
+            #[cfg(all(unix, not(target_vendor = "apple")))]
+            if let Some(native) = self.native.as_mut()
                 && !native.releases.is_empty()
             {
                 // The release submission is accepted: exportable fences
-                // open, and destruction runs when the queue reports the
+                // are exported now — while their signal is still pending
+                // — and destruction runs when the queue reports the
                 // submission complete — never a CPU wait.
                 let shared = native.shared.clone();
                 let releases = std::mem::take(&mut native.releases);
                 for release in &releases {
+                    release.export_fence(&shared);
                     if let Some(flag) = &release.submitted_flag {
                         flag.store(true, std::sync::atomic::Ordering::Release);
                     }
@@ -5422,6 +5463,9 @@ impl GpuRenderer {
         }
         let shared = native.shared.clone();
         for release in &releases {
+            // Same ordering as the frame submit path: export while the
+            // release signal is still pending, before destruction.
+            release.export_fence(&shared);
             if let Some(flag) = &release.submitted_flag {
                 flag.store(true, std::sync::atomic::Ordering::Release);
             }
@@ -5435,6 +5479,15 @@ impl GpuRenderer {
                 release.destroy(&shared);
             }
         });
+        let destroys = external::vulkan::drain_destroys(native);
+        if !destroys.is_empty() {
+            let device = native.shared.vk.device.clone();
+            self.queue.on_submitted_work_done(move || {
+                for item in destroys {
+                    unsafe { item.destroy(&device) };
+                }
+            });
+        }
     }
 
     /// Encodes the resolve only once the frame's samples are complete.

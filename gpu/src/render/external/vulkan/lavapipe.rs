@@ -22,16 +22,17 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use ash::vk;
 use ash::vk::Handle as _;
 use cherenkov::{Engine, FrameTime, Next};
-use cherenkov_gpu::{
-    Gpu, GpuConfig,
-    interop::{
-        ExternalFrame, FrameColor, OutputAlpha, OutputColor, Presenter, SharedDevice,
-        TextureOutput, TextureTarget,
-        vulkan::{self, NativeError},
-        wgpu,
-    },
-};
 use rustc_hash::FxHashMap;
+
+use crate::interop::{
+    ExternalFrame, FrameColor, OutputAlpha, OutputColor, Presenter, SharedDevice, TextureOutput,
+    TextureTarget,
+};
+use crate::render::external::{
+    self,
+    vulkan::{self, NativeError, dmabuf},
+};
+use crate::{Gpu, GpuConfig};
 
 /// A `SharedDevice` on the Vulkan backend plus the native import device,
 /// or `None` when no Vulkan adapter exists (every test skips in that case).
@@ -383,17 +384,17 @@ fn nv12_generation(
     wait: Option<vulkan::Wait>,
     release: Option<vulkan::ReleaseSync>,
 ) -> Arc<vulkan::Generation> {
-    let pool = Some(vulkan::create_pool(&device.shared, false).expect("pool"));
+    let pool = Some(dmabuf::create_pool(&device.shared, false).expect("pool"));
     Arc::new(vulkan::Generation {
         shared: device.shared.clone(),
         size: extent,
         color: FrameColor::BT709_VIDEO,
-        alpha: cherenkov_gpu::interop::RgbAlpha::Opaque,
+        alpha: crate::interop::RgbAlpha::Opaque,
         repr: vulkan::Repr::Planes {
-            kind: vulkan::KIND_NV12,
+            kind: external::KIND_NV12,
         },
         image: nv12.image,
-        views: vulkan::Views::Planes {
+        views: vulkan::sync::Views::Planes {
             y: nv12.y,
             uv: nv12.uv,
         },
@@ -410,9 +411,10 @@ fn nv12_generation(
         resolved_wait: std::sync::Mutex::new(None),
         release_sync: std::sync::Mutex::new(release),
         fence_semaphore: std::sync::Mutex::new(None),
+        fence_fd: None,
         release_submitted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         leases: AtomicUsize::new(0),
-        parts: std::sync::Mutex::new(Some(vulkan::Release {
+        parts: std::sync::Mutex::new(Some(vulkan::sync::Release {
             image: nv12.image,
             pool,
             views: vec![nv12.y, nv12.uv],
@@ -427,7 +429,8 @@ fn nv12_generation(
             producer_layout: nv12.layout,
             producer_family: nv12.family,
             aspects: vk::ImageAspectFlags::COLOR,
-            lease: vulkan::Lease::None,
+            lease: vulkan::sync::Lease::None,
+            fence_fd: None,
         })),
     })
 }
@@ -662,7 +665,7 @@ fn rgb_generation(
     };
     // `RESOURCE` is wgpu-hal's GENERAL-layout state for color images —
     // the image's actual state at wrap time, never UNINITIALIZED.
-    let pool = Some(vulkan::create_pool(&device.shared, false).expect("pool"));
+    let pool = Some(dmabuf::create_pool(&device.shared, false).expect("pool"));
     let wrap = unsafe {
         shared
             .device
@@ -689,12 +692,12 @@ fn rgb_generation(
         shared: device.shared.clone(),
         size: extent,
         color: FrameColor::BT709_VIDEO,
-        alpha: cherenkov_gpu::interop::RgbAlpha::Opaque,
+        alpha: crate::interop::RgbAlpha::Opaque,
         repr: vulkan::Repr::Rgb {
             format: wgpu::TextureFormat::Rgba8Unorm,
         },
         image: rgb.image,
-        views: vulkan::Views::Wrapped,
+        views: vulkan::sync::Views::Wrapped,
         conv: None,
         rgb_wrap: Some(wrap),
         bytes: 0,
@@ -708,9 +711,10 @@ fn rgb_generation(
         resolved_wait: std::sync::Mutex::new(None),
         release_sync: std::sync::Mutex::new(release),
         fence_semaphore: std::sync::Mutex::new(None),
+        fence_fd: None,
         release_submitted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         leases: AtomicUsize::new(0),
-        parts: std::sync::Mutex::new(Some(vulkan::Release {
+        parts: std::sync::Mutex::new(Some(vulkan::sync::Release {
             image: rgb.image,
             pool,
             views: vec![],
@@ -725,7 +729,8 @@ fn rgb_generation(
             producer_layout: rgb.layout,
             producer_family: rgb.family,
             aspects: vk::ImageAspectFlags::COLOR,
-            lease: vulkan::Lease::None,
+            lease: vulkan::sync::Lease::None,
+            fence_fd: None,
         })),
     })
 }
@@ -745,7 +750,7 @@ fn read_pixels(
     let destination = engine.surface(target)?;
     let destination_texture = destinations.try_recv()?;
     let delivery =
-        cherenkov_gpu::interop::shader_delivery(shared.adapter.get_info().backend, &shared.device)?;
+        crate::interop::shader_delivery(shared.adapter.get_info().backend, &shared.device)?;
     let mut presenter = Presenter::new(&shared.device, delivery);
     presenter.texture(
         &shared.device,
@@ -787,7 +792,7 @@ fn capability_record_and_honest_failures() {
             sync: None,
             release: None,
             color: FrameColor::BT709_VIDEO,
-            alpha: cherenkov_gpu::interop::RgbAlpha::Opaque,
+            alpha: crate::interop::RgbAlpha::Opaque,
         };
         let result = device.import(vulkan::FrameSource::DmaBuf(Box::new(desc)));
         assert!(
@@ -903,7 +908,7 @@ fn shared_acquisition_state_dedup_and_retention() {
     })
     .expect("native frame");
     let engine = Engine::<Gpu>::new(GpuConfig {
-        device: Some(shared),
+        device: Some(shared.clone()),
         ..GpuConfig::default()
     })
     .expect("engine");
@@ -922,9 +927,14 @@ fn shared_acquisition_state_dedup_and_retention() {
             .content(hb);
     });
     // Both attachments share one generation record: the first render
-    // acquires once, the state machine lands OwnedForRead, and every later
-    // render is a plain retained draw.
+    // acquires once, and every later render is a plain retained draw.
     render_twice(&engine);
+    // The submission-completion callback lands OwnedForRead; it fires on
+    // a device poll, which a render alone does not guarantee.
+    let _ = shared.device.poll(wgpu::PollType::Wait {
+        submission_index: None,
+        timeout: Some(std::time::Duration::from_secs(5)),
+    });
     assert_eq!(
         *generation.state.lock().expect("state"),
         vulkan::State::OwnedForRead
@@ -1004,8 +1014,23 @@ fn delayed_timeline_signal_stays_on_gpu() {
         }),
     );
     let external = ExternalFrame::native(vulkan::Frame { generation }).expect("native frame");
-    // The producer signals the wait point on the host — delayed — while
-    // the consuming submission has already been accepted.
+    let engine = Engine::<Gpu>::new(GpuConfig {
+        device: Some(shared),
+        ..GpuConfig::default()
+    })
+    .expect("engine");
+    let (target, _) = TextureTarget::new((16, 16));
+    let surface = engine.surface(target).expect("surface");
+    let layer = surface.layer();
+    let handle = engine.external_frame(external);
+    surface.update(|tx| {
+        tx[surface.root()].push(&layer);
+        tx[&layer].content(handle);
+    });
+    // The producer signals the wait point on the host — delayed — only
+    // once setup has finished, so the semaphore is genuinely unsigned
+    // when the measured render runs; a CPU-waiting engine would block
+    // the full delay here.
     let signaller = std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(200));
         // `dev` moved; unsafe send through the raw device handle.
@@ -1020,19 +1045,6 @@ fn delayed_timeline_signal_stays_on_gpu() {
                 .expect("signal");
             dev.0.destroy_semaphore(semaphore, None);
         }
-    });
-    let engine = Engine::<Gpu>::new(GpuConfig {
-        device: Some(shared),
-        ..GpuConfig::default()
-    })
-    .expect("engine");
-    let (target, _) = TextureTarget::new((16, 16));
-    let surface = engine.surface(target).expect("surface");
-    let layer = surface.layer();
-    let handle = engine.external_frame(external);
-    surface.update(|tx| {
-        tx[surface.root()].push(&layer);
-        tx[&layer].content(handle);
     });
     let start = std::time::Instant::now();
     assert!(matches!(engine.render(FrameTime::now()), Ok(Next::Idle)));
@@ -1088,13 +1100,19 @@ fn binary_state_machine_acquired_once() {
     if let Some(pending) = staged {
         native.staged.push(pending);
     }
-    // The consuming submission is accepted: owned reads, staged drained.
+    // The consuming submission is accepted: the generation is submitted,
+    // not yet owned — the queue's completion callback promotes it.
     vulkan::mark_submitted(&mut native);
+    assert_eq!(
+        *generation.state.lock().expect("state"),
+        vulkan::State::AcquisitionSubmitted
+    );
+    assert!(native.staged.is_empty());
+    vulkan::mark_owned(std::mem::take(&mut native.acquiring));
     assert_eq!(
         *generation.state.lock().expect("state"),
         vulkan::State::OwnedForRead
     );
-    assert!(native.staged.is_empty());
     // The binary-state machine consumes the wait once: a later retained
     // draw on the same ordered queue stages nothing and does not wait.
     let restaged = unsafe { vulkan::stage_acquire(&generation, cb) }.expect("restage");
@@ -1176,8 +1194,27 @@ fn plan_cancellation_restores_the_frame() {
     };
     // A timeline wait survives cancellation: the resolved payload returns
     // to the generation, and a later plan stages it again.
-    let generation = rgb_generation(&shared, &device, rgb, (8, 8), None, None);
     let (dev, _, family) = raw(&shared);
+    let semaphore = unsafe {
+        let mut type_info =
+            vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE);
+        dev.create_semaphore(
+            &vk::SemaphoreCreateInfo::default().push_next(&mut type_info),
+            None,
+        )
+    }
+    .expect("timeline semaphore");
+    let generation = rgb_generation(
+        &shared,
+        &device,
+        rgb,
+        (8, 8),
+        Some(vulkan::Wait::Timeline {
+            semaphore: semaphore.as_raw(),
+            value: 1,
+        }),
+        None,
+    );
     // Stage an acquire into a scratch context through the engine's own
     // path: `stage_acquire` is the unit a cancelled encode unwinds. The
     // barrier is recorded into a real buffer the submission never sees.
@@ -1214,4 +1251,17 @@ fn plan_cancellation_restores_the_frame() {
         vulkan::State::Registered,
         "a cancelled plan leaves the frame unacquired"
     );
+    // The resolved wait went back to the generation — same semaphore,
+    // same point — and the next plan re-stages it instead of importing
+    // a fresh one.
+    let guard = generation.resolved_wait.lock().expect("resolved wait");
+    let (restored_semaphore, restored_value, restored_owned) = {
+        let p = guard.as_ref().expect("restored payload");
+        (p.semaphore, p.value, p.owned)
+    };
+    drop(guard);
+    assert_eq!(restored_semaphore, semaphore);
+    assert_eq!(restored_value, Some(1));
+    assert!(!restored_owned);
+    unsafe { dev.destroy_semaphore(semaphore, None) };
 }

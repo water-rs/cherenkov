@@ -151,6 +151,7 @@ const EXTERNAL_SPV: &[u8] = &[];
 #[cfg(not(target_arch = "wasm32"))]
 pub const EXTERNAL_NATIVE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/external_native.spv"));
 #[cfg(target_arch = "wasm32")]
+#[expect(dead_code, reason = "the native Vulkan path is cfg'd out on wasm")]
 pub const EXTERNAL_NATIVE: &[u8] = &[];
 #[cfg(target_vendor = "apple")]
 const ENGINE_METALLIB: [&[u8]; 3] = [

@@ -114,14 +114,15 @@ fn import_inner(
     );
     if external {
         let expect = |got: u32, want: u32, what: &'static str| {
-            if got != 0 && got != want {
-                Err(NativeError::Unsupported(what))
-            } else {
+            if got == want {
                 Ok(())
+            } else {
+                Err(NativeError::Unsupported(what))
             }
         };
-        // `0` (`UNDEFINED`/unspecified) in a suggestion is informational;
-        // any concrete value must equal the frame's declared contract.
+        // The suggested values are the driver's concrete decode contract —
+        // `0` here is a real value (`RGB_IDENTITY`/`FULL`/`COSITED_EVEN`),
+        // not "unspecified", so it is compared like every other.
         expect(
             suggested.0.as_raw().cast_unsigned(),
             model.as_raw().cast_unsigned(),
@@ -412,6 +413,9 @@ fn bind_and_finish(
             resolved_wait: std::sync::Mutex::new(None),
             release_sync: std::sync::Mutex::new(desc.release.take()),
             fence_semaphore: std::sync::Mutex::new(fence_semaphore),
+            fence_fd: fence_semaphore
+                .is_some()
+                .then(|| Arc::new(std::sync::Mutex::new(sync::FenceFd::Pending))),
             release_submitted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             leases: std::sync::atomic::AtomicUsize::new(0),
             parts: std::sync::Mutex::new(Some(sync::Release {
@@ -423,6 +427,7 @@ fn bind_and_finish(
                 semaphores: Vec::new(),
                 sync_payload: None,
                 fence_semaphore: None,
+                fence_fd: None,
                 submitted_flag: None,
                 state: None,
                 acquired: false,

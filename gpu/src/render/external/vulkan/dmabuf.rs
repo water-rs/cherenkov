@@ -146,6 +146,10 @@ pub fn create_pool(shared: &Shared, combined: bool) -> Result<vk::DescriptorPool
     unsafe {
         shared.vk.device.create_descriptor_pool(
             &vk::DescriptorPoolCreateInfo::default()
+                // Individual frees feed the bounded set-1 cache's
+                // eviction path; the pool destroy at release frees the
+                // rest.
+                .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
                 .max_sets(16)
                 .pool_sizes(&sizes),
             None,
@@ -592,6 +596,9 @@ fn finish(
             resolved_wait: std::sync::Mutex::new(None),
             release_sync: std::sync::Mutex::new(desc.release),
             fence_semaphore: std::sync::Mutex::new(fence_semaphore),
+            fence_fd: fence_semaphore
+                .is_some()
+                .then(|| Arc::new(std::sync::Mutex::new(sync::FenceFd::Pending))),
             release_submitted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             leases: std::sync::atomic::AtomicUsize::new(0),
             parts: std::sync::Mutex::new(Some(sync::Release {
@@ -603,6 +610,7 @@ fn finish(
                 semaphores: Vec::new(),
                 sync_payload: None,
                 fence_semaphore: None,
+                fence_fd: None,
                 submitted_flag: None,
                 state: None,
                 acquired: false,

@@ -40,6 +40,52 @@ pub enum State {
     Released,
 }
 
+/// The one-shot `SYNC_FD` export slot a `ReleaseSync::FenceFd` release
+/// fills once its submission is accepted — while the fence semaphore's
+/// signal is still pending — and `Generation::release_fd` takes from.
+#[derive(Debug)]
+pub enum FenceFd {
+    /// The release submission has not been accepted yet.
+    Pending,
+    /// The exported fence fd, taken by exactly one caller.
+    Ready(OwnedFd),
+    /// The export call itself failed; the payload is the `VkResult` code.
+    Failed(i32),
+    /// A caller already took the fd (or consumed the failure).
+    Taken,
+}
+
+/// An object evicted from a bounded encode cache, destroyed once the
+/// submission it was encoded for — or any later one — completes.
+pub enum DestroyItem {
+    /// A `VkFramebuffer` evicted from `Native::framebuffers`.
+    Framebuffer(vk::Framebuffer),
+    /// A set-1 descriptor evicted from `Generation::sets`.
+    DescriptorSet {
+        /// The pool the set allocates from.
+        pool: vk::DescriptorPool,
+        /// The set being freed.
+        set: vk::DescriptorSet,
+    },
+}
+
+impl DestroyItem {
+    /// Destroys the object on `dev`.
+    ///
+    /// # Safety
+    /// `dev` must be the device the object was created on, and the object
+    /// must no longer be referenced by executing or pending work.
+    pub unsafe fn destroy(&self, dev: &ash::Device) {
+        match *self {
+            Self::Framebuffer(fb) => unsafe { dev.destroy_framebuffer(fb, None) },
+            Self::DescriptorSet { pool, set } => unsafe {
+                dev.free_descriptor_sets(pool, &[set])
+                    .expect("freeing a pooled set cannot fail");
+            },
+        }
+    }
+}
+
 /// A wait payload resolved to its `VkSemaphore` form, ready for
 /// `add_wait_semaphore` at submit time.
 pub struct PendingWait {
@@ -139,8 +185,12 @@ pub struct Release {
     /// How the release submission acknowledges the producer.
     pub sync_payload: Option<ReleaseSync>,
     /// The `FenceFd` export semaphore, signalled by the release submission
-    /// and exported by [`Generation::release_fd`].
+    /// and exported by [`Release::export_fence`].
     pub fence_semaphore: Option<vk::Semaphore>,
+    /// The cell `export_fence` fills at submit-acceptance; shared with the
+    /// generation so `release_fd` can hand the fd out after the
+    /// generation's `Arc` has unwound.
+    pub fence_fd: Option<Arc<std::sync::Mutex<FenceFd>>>,
     /// Set when the release submission is accepted; `release_fd` exports
     /// only after this. Shared with the generation's flag.
     pub submitted_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
@@ -216,6 +266,35 @@ impl Release {
             None => {}
         }
         out
+    }
+
+    /// Exports the `SYNC_FD` fence into the cell `release_fd` reads. Runs
+    /// at submit-acceptance — the semaphore's signal is still pending —
+    /// before the completion callback destroys the semaphore.
+    ///
+    /// # Panics
+    /// On a poisoned export cell.
+    pub fn export_fence(&self, shared: &Shared) {
+        let (Some(semaphore), Some(cell)) = (self.fence_semaphore, self.fence_fd.as_ref()) else {
+            return;
+        };
+        let result = unsafe {
+            shared
+                .vk
+                .external_semaphore_fd
+                .as_ref()
+                .expect("sync-fd export checked at import")
+                .get_semaphore_fd(
+                    &vk::SemaphoreGetFdInfoKHR::default()
+                        .semaphore(semaphore)
+                        .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD),
+                )
+        };
+        *cell.lock().expect("fence fd cell") = match result {
+            // SAFETY: `get_semaphore_fd` returned a new fd owned by the caller.
+            Ok(fd) => FenceFd::Ready(unsafe { OwnedFd::from_raw_fd(fd) }),
+            Err(err) => FenceFd::Failed(err.as_raw()),
+        };
     }
 
     /// Destroys the objects in dependency order. Runs once the release
@@ -295,8 +374,10 @@ pub struct Generation {
     pub aspects: vk::ImageAspectFlags,
     /// The pool this generation's set-1 descriptors allocate from.
     pub pool: Option<vk::DescriptorPool>,
-    /// Set-1 descriptors cached per mask texture key.
-    pub sets: std::sync::Mutex<FxHashMap<u64, vk::DescriptorSet>>,
+    /// Set-1 descriptors cached per `(mask view, mask generation)` — the
+    /// generation number invalidates entries when the atlas re-creates a
+    /// mask texture whose handle a driver could recycle.
+    pub sets: std::sync::Mutex<FxHashMap<(u64, u64), vk::DescriptorSet>>,
     /// The shared acquisition state.
     pub state: Arc<std::sync::Mutex<State>>,
     /// The un-imported producer wait descriptor, taken at first use.
@@ -306,8 +387,13 @@ pub struct Generation {
     pub resolved_wait: std::sync::Mutex<Option<PendingWait>>,
     /// The producer's release mechanism.
     pub release_sync: std::sync::Mutex<Option<ReleaseSync>>,
-    /// The `FenceFd` export semaphore, created at import when requested.
+    /// The `FenceFd` export semaphore, created at import when requested
+    /// and moved into the `Release` parts at retirement — the release path
+    /// owns the export, not the generation.
     pub fence_semaphore: std::sync::Mutex<Option<vk::Semaphore>>,
+    /// The export cell `Release::export_fence` fills at submit-acceptance
+    /// and `release_fd` takes from. `Some` only for `FenceFd` frames.
+    pub fence_fd: Option<Arc<std::sync::Mutex<FenceFd>>>,
     /// True once the release submission has been accepted; shared with
     /// the `Release` parts so the submit path can set it.
     pub release_submitted: Arc<std::sync::atomic::AtomicBool>,
@@ -318,6 +404,22 @@ pub struct Generation {
     pub leases: std::sync::atomic::AtomicUsize,
     /// The destroy-time object set, moved out at retirement.
     pub parts: std::sync::Mutex<Option<Release>>,
+}
+
+impl Generation {
+    /// The generation's current acquisition state.
+    ///
+    /// # Panics
+    /// On a poisoned state mutex.
+    pub fn state(&self) -> State {
+        *self.state.lock().expect("generation state")
+    }
+
+    /// Engine-side references currently held (slot installs).
+    #[must_use]
+    pub fn lease_count(&self) -> usize {
+        self.leases.load(std::sync::atomic::Ordering::Acquire)
+    }
 }
 
 impl Generation {
@@ -398,9 +500,16 @@ impl Generation {
                         .expect("checked above")
                         .import_semaphore_fd(&info)
                 };
-                if let Err(err) = res {
-                    unsafe { dev.destroy_semaphore(semaphore, None) };
-                    return Err(err.into());
+                match res {
+                    Ok(()) => {
+                        // The driver consumed the fd — same contract as
+                        // `OpaqueFd`.
+                        let _ = fd.into_raw_fd();
+                    }
+                    Err(err) => {
+                        unsafe { dev.destroy_semaphore(semaphore, None) };
+                        return Err(err.into());
+                    }
                 }
                 PendingWait {
                     semaphore,
@@ -509,6 +618,7 @@ impl Generation {
             );
             release.sync_payload = self.release_sync.lock().expect("release sync").take();
             release.fence_semaphore = self.fence_semaphore.lock().expect("fence semaphore").take();
+            release.fence_fd.clone_from(&self.fence_fd);
             release.submitted_flag = Some(Arc::clone(&self.release_submitted));
             release.state = Some(Arc::clone(&self.state));
             for (_, set) in self.sets.lock().expect("frame sets").drain() {
@@ -533,44 +643,44 @@ impl Drop for Generation {
 }
 
 impl Generation {
-    /// Exports the `FenceFd` release payload. The spec requires the export
-    /// to run while the semaphore still has a pending signal, so the call
-    /// is valid from the accepted release submission until it executes.
+    /// Takes the `FenceFd` release payload the release path exported at
+    /// submit-acceptance. The returned fd signals when the release
+    /// submission's pending signal executes on the GPU; exactly one caller
+    /// can take it.
     ///
     /// # Errors
     /// [`NativeError::Unready`] before the release submission is accepted;
-    /// [`NativeError::Unsupported`] when the frame has no fence release or
-    /// the driver cannot export it.
+    /// [`NativeError::Unsupported`] when the frame has no `FenceFd`
+    /// release mechanism; [`NativeError::Vulkan`] when the driver's export
+    /// failed; [`NativeError::Invalid`] on a second take.
     ///
     /// # Panics
-    /// On a poisoned semaphore mutex.
-    #[allow(clippy::significant_drop_tightening)]
+    /// On a poisoned export cell.
     pub fn release_fd(&self) -> Result<OwnedFd, NativeError> {
-        if !self
-            .release_submitted
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            return Err(NativeError::Unready);
-        }
-        let guard = self.fence_semaphore.lock().expect("fence semaphore");
-        let Some(&semaphore) = guard.as_ref() else {
+        let Some(cell) = &self.fence_fd else {
             return Err(NativeError::Unsupported("frame has no fence release"));
         };
-        let fd = unsafe {
-            self.shared
-                .vk
-                .external_semaphore_fd
-                .as_ref()
-                .expect("sync-fd support checked at import")
-                .get_semaphore_fd(
-                    &vk::SemaphoreGetFdInfoKHR::default()
-                        .semaphore(semaphore)
-                        .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD),
-                )
-        }
-        .map_err(NativeError::from)?;
-        // SAFETY: `get_semaphore_fd` returned a new fd owned by the caller.
-        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+        let mut cell = cell.lock().expect("fence fd cell");
+        let result = match std::mem::replace(&mut *cell, FenceFd::Taken) {
+            FenceFd::Ready(fd) => Ok(fd),
+            FenceFd::Failed(code) => Err(NativeError::Vulkan(code)),
+            FenceFd::Taken => Err(NativeError::Invalid("release fence already taken")),
+            FenceFd::Pending => {
+                *cell = FenceFd::Pending;
+                if self
+                    .release_submitted
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    Err(NativeError::Invalid(
+                        "release submission accepted without a fence export",
+                    ))
+                } else {
+                    Err(NativeError::Unready)
+                }
+            }
+        };
+        drop(cell);
+        result
     }
 }
 
@@ -624,8 +734,11 @@ pub fn submit_waits(native: &Native, queue: &wgpu::hal::vulkan::Queue) {
 }
 
 /// Finalises staged generations after the consuming submission is
-/// accepted: binary waits are consumed once for the generation; timeline
-/// waits may legally repeat but are unnecessary on the ordered queue.
+/// accepted: binary waits are consumed once for the generation, and each
+/// staged generation's state record lands in `native.acquiring` so the
+/// submission-completion callback can promote it to `OwnedForRead`.
+/// Timeline waits may legally repeat but are unnecessary on the ordered
+/// queue.
 ///
 /// # Panics
 /// On a poisoned state or parts mutex.
@@ -650,7 +763,24 @@ pub fn mark_submitted(native: &mut Native) {
             }
         }
         let mut state = pending.generation.state.lock().expect("generation state");
-        if *state == State::AcquisitionPlanned || *state == State::AcquisitionSubmitted {
+        if *state == State::AcquisitionPlanned {
+            *state = State::AcquisitionSubmitted;
+        }
+        drop(state);
+        native.acquiring.push(Arc::clone(&pending.generation.state));
+    }
+}
+
+/// Promotes generations whose consuming submission just completed from
+/// `AcquisitionSubmitted` to `OwnedForRead`. Runs on the queue's
+/// completion callback.
+///
+/// # Panics
+/// On a poisoned state mutex.
+pub fn mark_owned(states: Vec<Arc<std::sync::Mutex<State>>>) {
+    for state in states {
+        let mut state = state.lock().expect("generation state");
+        if *state == State::AcquisitionSubmitted {
             *state = State::OwnedForRead;
         }
     }
@@ -696,6 +826,24 @@ pub fn drain_releases(native: &Native) -> Vec<Release> {
         .pending_release
         .lock()
         .expect("pending release")
+        .drain(..)
+        .collect()
+}
+
+/// Drains the deferred-destroy queue of evicted cache objects. The submit
+/// path hands them to `queue.on_submitted_work_done`, where destruction
+/// provably cannot race in-flight references.
+///
+/// # Panics
+/// On a poisoned destroy-queue mutex.
+#[must_use]
+pub fn drain_destroys(native: &Native) -> Vec<DestroyItem> {
+    native
+        .shared
+        .vk
+        .pending_destroy
+        .lock()
+        .expect("pending destroy")
         .drain(..)
         .collect()
 }

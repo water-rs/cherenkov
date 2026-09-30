@@ -2,6 +2,7 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{BuildHasher, Hash, Hasher};
+use std::ops::Range;
 use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
@@ -149,8 +150,10 @@ pub struct PathEmit {
     /// Partial-coverage atlas cells.
     pub cells: Vec<PathCell>,
     /// Shelves the cells live on — deduplicated at admission so a hit
-    /// pins them without a live-map lookup.
-    pub slots: Box<[u32]>,
+    /// pins them without a live-map lookup. A range into the atlas's
+    /// `emit_slots` arena, which outlives this record so a replay pin
+    /// stays meaningful after an eviction.
+    pub slots: Range<usize>,
 }
 
 impl PathEmit {
@@ -331,6 +334,10 @@ pub struct Atlas {
     map: rustc_hash::FxHashMap<GlyphKey, Entry>,
     /// Rasterized path emissions, keyed by content hash.
     paths: rustc_hash::FxHashMap<u64, PathEmit>,
+    /// Append-only slot lists the `PathEmit::slots` ranges address.
+    /// Entries outlive their emission record so a lowered leaf's slot
+    /// ranges stay readable through the commit that admits them.
+    emit_slots: Vec<u32>,
     /// Rasterized path-clip masks, keyed by content hash.
     masks: rustc_hash::FxHashMap<u64, MaskCell>,
     /// Path-clip masks too large for the atlas, on their own textures,
@@ -403,6 +410,7 @@ impl Atlas {
             evicted: Vec::new(),
             map: rustc_hash::FxHashMap::default(),
             paths: rustc_hash::FxHashMap::default(),
+            emit_slots: Vec::new(),
             masks: rustc_hash::FxHashMap::default(),
             mask_textures: rustc_hash::FxHashMap::default(),
             texture_limit: device.limits().max_texture_dimension_2d,
@@ -491,6 +499,7 @@ impl Atlas {
             .expect("atlas generation overflow");
         self.map.clear();
         self.paths.clear();
+        self.emit_slots.clear();
         self.masks.clear();
         self.layout.shelves.clear();
         self.layout.vacant.clear();
@@ -1059,7 +1068,8 @@ impl Atlas {
                 texels,
             });
         }
-        emit.slots = slots.into_boxed_slice();
+        emit.slots = self.emit_slots.len()..self.emit_slots.len() + slots.len();
+        self.emit_slots.extend_from_slice(&slots);
         self.live.insert(
             key,
             LiveEntry {
@@ -1135,6 +1145,11 @@ impl Atlas {
             texels,
         });
         Some(())
+    }
+
+    /// The deduplicated shelf slots a `PathEmit::slots` range addresses.
+    pub fn emit_slot_arena(&self, range: Range<usize>) -> &[u32] {
+        &self.emit_slots[range]
     }
 
     /// Every cell origin of the cached emission for `key`, in order.

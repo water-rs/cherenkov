@@ -56,11 +56,17 @@ on success.
 
 Ref collection stays out of the measured `lower` interval. Lowering is
 parallel against an immutable `&Atlas`, so a leaf records only the shelf
-slots it touches into `Lowering.touches` (hit pins and raster
-admissions alike) and each realized `Emission` carries the `LIVE_PENDING`
-stamp while its `refs` range still addresses that scratch instead of
-`storage.refs`. The commit's `apply_pending` folds the touch range plus
-the bands its raster actually landed in (`PendingOrigin::Cells`) into
+slots it touches into `Lowering.touches` (glyph and mask admissions,
+consecutive-shelf deduped) and, per replayed path emission, one
+`TOUCH_RANGE`-flagged index into `Lowering.touched_ranges` —
+`PathEmit::slots` is a range into the atlas's append-only `emit_slots`
+arena, so a replay pin costs one push instead of copying the whole
+slot list, and stays readable even if the record is evicted between lower
+and commit. Each realized `Emission` carries the `LIVE_PENDING`
+stamp while its `refs` range still addresses `touches` instead of
+`storage.refs`. The commit's `apply_pending` folds the touch slots —
+decoding flagged indices to their arena ranges — plus the bands its
+raster actually landed in (`PendingOrigin::Cells`) into
 `(slot, epoch)` pairs, swaps `refs` to them, and stamps the emission.
 An emission whose resolving commit was abandoned (`Grow` or
 `AtlasExhausted`) keeps `LIVE_PENDING` and never verifies live, so the

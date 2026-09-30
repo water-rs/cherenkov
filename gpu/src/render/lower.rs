@@ -504,8 +504,8 @@ impl EmissionStorage {
                 .extend_from_slice(&self.stops[e.stops.clone()]);
             e.stops = first..storage.stops.len();
             if e.live_stamp == LIVE_PENDING {
-                // `refs` still addresses the frame's touches: keep the
-                // emission pending and drop the range (#119).
+                // `refs` still addresses the frame's `touches`: keep
+                // the emission pending and drop the range (#119).
                 e.refs = 0..0;
             } else {
                 let first = storage.refs.len();
@@ -585,6 +585,19 @@ impl RetainedInstance {
     }
 }
 
+/// `TOUCH_RANGE` marks a `touches` entry that packs an `emit_slots`
+/// range — `TOUCH_RANGE | start << 10 | len` — instead of carrying a
+/// shelf slot itself: one push pins a replayed path emission's whole
+/// band set (#119).
+pub const TOUCH_RANGE: u32 = 1 << 31;
+
+/// Start and length bounds of a `TOUCH_RANGE` packing. The emit-slots
+/// arena only grows, so an out-of-bounds start falls back to plain
+/// per-slot pushes.
+const TOUCH_PACK_MAX_START: usize = 1 << 21;
+/// One emission spans far fewer shelves than this bound.
+const TOUCH_PACK_MAX_LEN: usize = 1 << 10;
+
 /// `Emission::live_stamp` while its `refs` still indexes
 /// `Lowering::touches` instead of `EmissionStorage::refs` — the commit
 /// that resolves it stamps the emission; a commit abandoned partway
@@ -635,6 +648,16 @@ impl Emission {
             return true;
         }
         false
+    }
+
+    /// Cold arm of the leaf hit check: the stored stamp differs, so
+    /// the emission is either still pending or evictions may have
+    /// reclaimed a referenced band. Kept out of line so the hit path
+    /// never pays for resolving `refs`.
+    #[cold]
+    #[inline(never)]
+    fn stale_live(&mut self, atlas: &Atlas, storage: &EmissionStorage) -> bool {
+        self.live_stamp != LIVE_PENDING && self.atlas_live(atlas, &storage.refs[self.refs.clone()])
     }
 }
 
@@ -837,8 +860,9 @@ pub struct Lowering<'a> {
     pub(crate) mask_patches: Vec<(u32, u32)>,
     /// Shelves hit since the last reset, for the commit's pin marks.
     /// The commit also resolves each emission's slice — recorded as
-    /// `Emission::touch` — into its `refs` (#119).
+    /// `Emission::refs` — into its `(slot, epoch)` pairs (#119).
     pub(crate) touches: Vec<u32>,
+
     /// The open range's bound mask texture key; `None` for the dummy view.
     /// Kept in sync with `clip` by `set_clip`.
     mask_key: Option<u64>,
@@ -892,7 +916,10 @@ impl<'a> Lowering<'a> {
             paths: 0,
             cell_patches: Vec::new(),
             mask_patches: Vec::new(),
-            touches: Vec::new(),
+            // Path and glyph hits push a handful of entries per leaf;
+            // a path-heavy surface records thousands — pre-grow past
+            // the amortization point (#119).
+            touches: Vec::with_capacity(1024),
             pending: Vec::new(),
             commands_lowered: 0,
             layers_composed: 0,
@@ -919,6 +946,16 @@ impl<'a> Lowering<'a> {
         let value = aa_margin(transform);
         self.margin = Some((linear, value));
         value
+    }
+
+    /// Records `slot` for the commit's pin marks and the emission's
+    /// refs fold; consecutive cells of a run usually share a shelf, so
+    /// dedupe the tail (#119).
+    #[inline]
+    fn touch(&mut self, slot: u32) {
+        if self.touches.last().copied() != Some(slot) {
+            self.touches.push(slot);
+        }
     }
 
     /// Glyphs rasterized during this lowering.
@@ -2355,9 +2392,7 @@ impl<'a> Lowering<'a> {
                 e.cover.map(|index| storage.covers[index]) == cover
                     && e.transform == self.transform
                     && e.size.map(f32::to_bits) == [self.width, self.height].map(f32::to_bits)
-                    && (e.live_stamp == glyphs.live_stamp
-                        || (e.live_stamp != LIVE_PENDING
-                            && e.atlas_live(glyphs.atlas, &storage.refs[e.refs.clone()])))
+                    && (e.live_stamp == glyphs.live_stamp || e.stale_live(glyphs.atlas, storage))
             });
         cache.valid = true;
         if hit {
@@ -3096,8 +3131,16 @@ impl<'a> Lowering<'a> {
             // Pin the shelves the emission's cells live on so this
             // commit cannot evict them; the emission's refs — resolved
             // from the same slot set — detect a reclaim between lowers
-            // and re-lower the leaf (#119).
-            self.touches.extend_from_slice(&emit.slots);
+            // and re-lower the leaf. One packed push stands in for the
+            // whole slot list (#119).
+            if emit.slots.start < TOUCH_PACK_MAX_START && emit.slots.len() < TOUCH_PACK_MAX_LEN {
+                let packed = u32::try_from(emit.slots.start).expect("packed start checked") << 10
+                    | u32::try_from(emit.slots.len()).expect("packed len checked");
+                self.touches.push(TOUCH_RANGE | packed);
+            } else {
+                self.touches
+                    .extend_from_slice(glyphs.atlas.emit_slot_arena(emit.slots.clone()));
+            }
             self.replay(emit, None, pl.offset, paint, shader_data.as_ref());
             return Ok(());
         }
@@ -3250,7 +3293,7 @@ impl<'a> Lowering<'a> {
                 // The mask is re-read through `apply_clip` each frame;
                 // the touch keeps its shelf live, no reference needed
                 // (#119).
-                self.touches.push(mask.slot);
+                self.touch(mask.slot);
                 break 'stored ClipMask::Cell(*mask);
             }
             if let Some(mask) = glyphs
@@ -3291,7 +3334,7 @@ impl<'a> Lowering<'a> {
                 pl.key
             };
             if let Some(mask) = glyphs.atlas.mask(key) {
-                self.touches.push(mask.slot);
+                self.touch(mask.slot);
                 break 'stored ClipMask::Cell(*mask);
             }
             if let Some(mask) = glyphs.atlas.mask_texture(key) {
@@ -3394,7 +3437,7 @@ impl<'a> Lowering<'a> {
             if pending.is_none() {
                 // Pin the shelf so this commit cannot evict the cell
                 // the emission's UVs now sample (#119).
-                self.touches.push(entry.slot);
+                self.touch(entry.slot);
             }
             let rect = Rect::from_origin_size(
                 (x + f64::from(entry.left), y + f64::from(entry.top)),
@@ -3476,7 +3519,7 @@ impl<'a> Lowering<'a> {
                 continue;
             }
             if pending.is_none() {
-                self.touches.push(entry.slot);
+                self.touch(entry.slot);
             }
             let mut inst = *template.get_or_insert_with(|| {
                 let mut inst = self.base(KIND_GLYPH, affine(self.transform));

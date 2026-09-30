@@ -3429,11 +3429,18 @@ impl GpuRenderer {
         results: &mut [Result<Lowered, RenderError>],
         grew: bool,
     ) -> Commit {
-        let mut touches: Vec<u32> = results
-            .iter()
-            .filter_map(|r| r.as_ref().ok())
-            .flat_map(|l| l.touches.iter().copied())
-            .collect();
+        let mut touches: Vec<u32> = Vec::new();
+        for lowered in results.iter().filter_map(|r| r.as_ref().ok()) {
+            for &t in &lowered.touches {
+                if t & lower::TOUCH_RANGE != 0 {
+                    let start = ((t & !lower::TOUCH_RANGE) >> 10) as usize;
+                    let len = (t & 1023) as usize;
+                    touches.extend_from_slice(self.atlas.emit_slot_arena(start..start + len));
+                } else {
+                    touches.push(t);
+                }
+            }
+        }
         // An emission whose stamp matches the atlas verified live this
         // frame — either on the fast path or by re-walking its refs —
         // so its bands are the replay pins the commit must not evict
@@ -3571,7 +3578,20 @@ impl GpuRenderer {
                     // those slots in, then swap the range for resolved
                     // `(slot, band epoch)` pairs — always, even empty,
                     // or it keeps addressing `touches` (#119).
-                    slots.extend(lowered.touches[emission.refs.clone()].iter().copied());
+                    for &t in &lowered.touches[emission.refs.clone()] {
+                        if t & lower::TOUCH_RANGE != 0 {
+                            let start = ((t & !lower::TOUCH_RANGE) >> 10) as usize;
+                            let len = (t & 1023) as usize;
+                            slots.extend(
+                                self.atlas
+                                    .emit_slot_arena(start..start + len)
+                                    .iter()
+                                    .copied(),
+                            );
+                        } else {
+                            slots.insert(t);
+                        }
+                    }
                     let first = content.storage.refs.len();
                     for slot in slots {
                         content
@@ -3639,7 +3659,9 @@ impl GpuRenderer {
                     .ok_or(RenderError::AtlasFull)?;
                 Ok(PendingOrigin::Cells(
                     self.atlas.path_origins(key).expect("just stored"),
-                    self.atlas.path(key).expect("just stored").slots.to_vec(),
+                    self.atlas
+                        .emit_slot_arena(self.atlas.path(key).expect("just stored").slots.clone())
+                        .to_vec(),
                 ))
             }
             PendingRaster::Mask {

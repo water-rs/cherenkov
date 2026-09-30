@@ -2,20 +2,22 @@
 //! [`SurfaceTree`] per surface, applies commits, samples animations at the
 //! frame time, renders, and answers with [`Next`] and the [`FrameStats`].
 
+use std::sync::Arc;
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
 use rustc_hash::FxHashMap;
 
-use crate::WorkingColor;
-use crate::backend::{Backend, Display, Frame, Redraw, Renderer, SurfaceFrame};
-use crate::error::{EngineError, RenderError, ResourceError};
+use crate::backend::{Backend, Display, Frame, Redraw, Renderer, SurfaceFrame, SurfaceInfo};
+use crate::error::{EngineError, RenderError, ResourceError, SurfaceError};
 use crate::frame::{FrameId, FrameStats, Next};
 use crate::image::ImageUpload;
-use crate::message::{ChangeSet, LayerOp, Message, Op, SurfaceId};
+use crate::message::{BackdropShaderId, ChangeSet, LayerOp, Message, Op, ResOp, SurfaceId};
 use crate::paint::ImageId;
+use crate::resource::ResourceId;
 use crate::tree::SurfaceTree;
+use crate::{BackdropEffect, WorkingColor};
 
 /// One surface's render-thread state.
 struct SurfaceState {
@@ -26,6 +28,95 @@ struct SurfaceState {
     /// Whether a property op, a content op or an animation step touched the
     /// surface since the last render.
     changed: bool,
+}
+
+/// A rejection the backend reported after the resource's handle was
+/// returned.
+struct Rejection {
+    reason: Arc<ResourceError>,
+    /// Whether the backend still holds the resource: true after a rejected
+    /// image replacement, which keeps the previous pixels, false after a
+    /// rejected registration, which committed nothing.
+    held: bool,
+}
+
+/// The resources the backend rejected. A render that draws one fails with
+/// [`RenderError::Rejected`]; the record lives until a replacement
+/// succeeds or the resource is released.
+#[derive(Default)]
+struct Rejections(FxHashMap<ResourceId, Rejection>);
+
+impl Rejections {
+    /// Records the outcome of registering `resource`.
+    fn register(&mut self, resource: ResourceId, result: Result<(), ResourceError>) {
+        if let Err(reason) = result {
+            tracing::debug!(%resource, %reason, "backend rejected a registration");
+            self.0.insert(
+                resource,
+                Rejection {
+                    reason: Arc::new(reason),
+                    held: false,
+                },
+            );
+        }
+    }
+
+    /// Releases `resource`: runs the backend's removal unless the backend
+    /// never committed the resource.
+    fn release<B: Backend>(
+        &mut self,
+        renderer: &mut B::Renderer,
+        resource: ResourceId,
+        remove: ResOp<B>,
+    ) {
+        if self
+            .0
+            .remove(&resource)
+            .is_none_or(|rejection| rejection.held)
+        {
+            remove(renderer);
+        }
+    }
+
+    /// Fails when a surface that changed since the last render draws a
+    /// rejected resource. An unchanged surface cannot: a rejected
+    /// registration's id reaches content only in a commit, and a rejected
+    /// replacement marks every surface sampling the image changed.
+    fn check<R: Renderer>(
+        &self,
+        renderer: &R,
+        surfaces: &FxHashMap<SurfaceId, SurfaceState>,
+    ) -> Result<(), RenderError> {
+        if self.0.is_empty() {
+            return Ok(());
+        }
+        for (surface, state) in surfaces.iter().filter(|(_, state)| state.changed) {
+            for (resource, rejection) in &self.0 {
+                let drawn = match *resource {
+                    ResourceId::BackdropShader(id) => samples_backdrop_shader(&state.tree, id),
+                    resource => renderer.samples(*surface, resource),
+                };
+                if drawn {
+                    return Err(RenderError::Rejected {
+                        resource: *resource,
+                        reason: Arc::clone(&rejection.reason),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Whether a layer of `tree` samples its backdrop through backdrop shader
+/// `id`.
+fn samples_backdrop_shader(tree: &SurfaceTree, id: BackdropShaderId) -> bool {
+    tree.layers().any(|(_, node)| {
+        matches!(
+            node.backdrop.as_ref().and_then(crate::BackdropSample::effect),
+            Some(BackdropEffect::Shader(effect)) if effect.shader == id
+        )
+    })
 }
 
 /// The render loop: runs on the `"cherenkov-render"` thread until
@@ -45,54 +136,34 @@ pub fn run<B: Backend>(
     };
     let _ = init_reply.send(Ok(info));
     let mut surfaces: FxHashMap<SurfaceId, SurfaceState> = FxHashMap::default();
+    let mut rejections = Rejections::default();
     let mut next_frame = 0u64;
     while let Ok(message) = rx.recv() {
         match message {
             Message::CreateSurface { id, target, reply } => {
-                let result = renderer.create_surface(id, target);
-                if let Ok(info) = &result {
-                    surfaces.insert(
-                        id,
-                        SurfaceState {
-                            tree: SurfaceTree::new(),
-                            size: info.size,
-                            display: Display::default(),
-                            clear: WorkingColor::TRANSPARENT,
-                            changed: true,
-                        },
-                    );
-                }
-                let _ = reply.send(result);
+                let _ = reply.send(create_surface::<B>(
+                    &mut renderer,
+                    &mut surfaces,
+                    id,
+                    target,
+                ));
             }
             Message::ResizeSurface { id, size } => {
-                renderer.resize_surface(id, size);
-                if let Some(state) = surfaces.get_mut(&id) {
-                    state.size = size;
-                    state.changed = true;
-                } else {
-                    tracing::trace!(surface = id.raw(), "resize of unknown surface");
-                }
+                resize_surface::<B>(&mut renderer, &mut surfaces, id, size);
             }
             Message::DestroySurface { id } => {
-                if surfaces.remove(&id).is_some() {
-                    renderer.destroy_surface(id);
-                } else {
-                    // Nothing was committed — a dropped `Engine::surface`
-                    // future whose create failed may still send this (#150).
-                    tracing::trace!(surface = id.raw(), "destroy of unknown surface");
-                }
+                destroy_surface::<B>(&mut renderer, &mut surfaces, id);
             }
-            Message::Display { id, display } => {
-                if let Some(state) = surfaces.get_mut(&id) {
-                    state.display = display;
-                    state.changed = true;
-                } else {
-                    tracing::trace!(surface = id.raw(), "display of unknown surface");
-                }
-            }
+            Message::Display { id, display } => set_display(&mut surfaces, id, display),
             Message::Resource(op) => op(&mut renderer),
-            Message::ReplaceImage { id, image, reply } => {
-                let _ = reply.send(replace_image::<B>(&mut renderer, &mut surfaces, id, image));
+            Message::Register { resource, op } => {
+                rejections.register(resource, op(&mut renderer));
+            }
+            Message::Release { resource, op } => {
+                rejections.release::<B>(&mut renderer, resource, op);
+            }
+            Message::ReplaceImage { id, image } => {
+                replace_image::<B>(&mut renderer, &mut surfaces, &mut rejections, id, image);
             }
             Message::Render {
                 time,
@@ -101,7 +172,14 @@ pub fn run<B: Backend>(
             } => {
                 let id = FrameId(next_frame);
                 next_frame += 1;
-                let result = render::<B>(&mut renderer, &mut surfaces, id, time.0, &mut commits);
+                let result = render::<B>(
+                    &mut renderer,
+                    &mut surfaces,
+                    &rejections,
+                    id,
+                    time.0,
+                    &mut commits,
+                );
                 let sender = reply.clone();
                 let _ = sender.send(crate::message::RenderReply {
                     result,
@@ -128,25 +206,107 @@ pub fn run<B: Backend>(
     }
 }
 
+/// Creates surface `id`'s render-side state and its layer tree.
+fn create_surface<B: Backend>(
+    renderer: &mut B::Renderer,
+    surfaces: &mut FxHashMap<SurfaceId, SurfaceState>,
+    id: SurfaceId,
+    target: B::Target,
+) -> Result<SurfaceInfo, SurfaceError> {
+    let info = renderer.create_surface(id, target)?;
+    surfaces.insert(
+        id,
+        SurfaceState {
+            tree: SurfaceTree::new(),
+            size: info.size,
+            display: Display::default(),
+            clear: WorkingColor::TRANSPARENT,
+            changed: true,
+        },
+    );
+    Ok(info)
+}
+
+fn resize_surface<B: Backend>(
+    renderer: &mut B::Renderer,
+    surfaces: &mut FxHashMap<SurfaceId, SurfaceState>,
+    id: SurfaceId,
+    size: (u32, u32),
+) {
+    renderer.resize_surface(id, size);
+    if let Some(state) = surfaces.get_mut(&id) {
+        state.size = size;
+        state.changed = true;
+    } else {
+        tracing::trace!(surface = id.raw(), "resize of unknown surface");
+    }
+}
+
+fn destroy_surface<B: Backend>(
+    renderer: &mut B::Renderer,
+    surfaces: &mut FxHashMap<SurfaceId, SurfaceState>,
+    id: SurfaceId,
+) {
+    if surfaces.remove(&id).is_some() {
+        renderer.destroy_surface(id);
+    } else {
+        // Nothing was committed — a dropped `Engine::surface` future whose
+        // create failed may still send this (#150).
+        tracing::trace!(surface = id.raw(), "destroy of unknown surface");
+    }
+}
+
+fn set_display(surfaces: &mut FxHashMap<SurfaceId, SurfaceState>, id: SurfaceId, display: Display) {
+    if let Some(state) = surfaces.get_mut(&id) {
+        state.display = display;
+        state.changed = true;
+    } else {
+        tracing::trace!(surface = id.raw(), "display of unknown surface");
+    }
+}
+
 /// Replaces image `id`'s pixels and marks changed only the surfaces whose
 /// content samples the image; the next render redraws those with the new
-/// pixels and leaves every other surface's skip intact. Returns whether any
-/// surface was marked, which is when the host needs a frame.
+/// pixels and leaves every other surface's skip intact. An image whose
+/// registration was rejected is registered with the new pixels instead. A
+/// rejection is recorded, and the marked surfaces then fail their render.
 fn replace_image<B: Backend>(
     renderer: &mut B::Renderer,
     surfaces: &mut FxHashMap<SurfaceId, SurfaceState>,
+    rejections: &mut Rejections,
     id: ImageId,
     image: ImageUpload,
-) -> Result<bool, ResourceError> {
-    renderer.replace_image(id, image)?;
-    let mut marked = false;
-    for (surface, state) in surfaces {
-        if renderer.samples_image(*surface, id) {
-            state.changed = true;
-            marked = true;
+) {
+    let resource = ResourceId::Image(id);
+    let held = rejections
+        .0
+        .get(&resource)
+        .is_none_or(|rejection| rejection.held);
+    let result = if held {
+        renderer.replace_image(id, image)
+    } else {
+        renderer.add_image(id, image)
+    };
+    match result {
+        Ok(()) => {
+            rejections.0.remove(&resource);
+        }
+        Err(reason) => {
+            tracing::debug!(%resource, %reason, "backend rejected an image replacement");
+            rejections.0.insert(
+                resource,
+                Rejection {
+                    reason: Arc::new(reason),
+                    held,
+                },
+            );
         }
     }
-    Ok(marked)
+    for (surface, state) in surfaces {
+        if renderer.samples(*surface, resource) {
+            state.changed = true;
+        }
+    }
 }
 
 /// Applies one surface's committed change set into its tree, forwarding
@@ -201,6 +361,7 @@ fn commit<B: Backend>(
 fn render<B: Backend>(
     renderer: &mut B::Renderer,
     surfaces: &mut FxHashMap<SurfaceId, SurfaceState>,
+    rejections: &Rejections,
     id: FrameId,
     time: crate::Instant,
     commits: &mut [(SurfaceId, ChangeSet<B>)],
@@ -215,6 +376,7 @@ fn render<B: Backend>(
             changes.ops.clear();
         }
     }
+    rejections.check(renderer, surfaces)?;
     let mut frames: Vec<SurfaceFrame<'_>> = Vec::with_capacity(surfaces.len());
     // The fast class wins when any surface needs it.
     let mut rate = None;
@@ -267,6 +429,7 @@ fn render<B: Backend>(
 async fn render_local<B: Backend>(
     renderer: &mut B::Renderer,
     surfaces: &mut FxHashMap<SurfaceId, SurfaceState>,
+    rejections: &Rejections,
     id: FrameId,
     time: crate::Instant,
     commits: &mut [(SurfaceId, ChangeSet<B>)],
@@ -281,6 +444,7 @@ async fn render_local<B: Backend>(
             changes.ops.clear();
         }
     }
+    rejections.check(renderer, surfaces)?;
     let mut frames: Vec<SurfaceFrame<'_>> = Vec::with_capacity(surfaces.len());
     // The fast class wins when any surface needs it.
     let mut rate = None;
@@ -394,6 +558,7 @@ pub(super) async fn local<B: Backend>(
     let state = Rc::new(RefCell::new(Some(LocalState::<B> {
         renderer,
         surfaces: FxHashMap::default(),
+        rejections: Rejections::default(),
         next_frame: 0,
     })));
     let tx = crate::local::Sender::new(move |message| {
@@ -412,6 +577,7 @@ pub(super) async fn local<B: Backend>(
 struct LocalState<B: Backend> {
     renderer: B::Renderer,
     surfaces: FxHashMap<SurfaceId, SurfaceState>,
+    rejections: Rejections,
     next_frame: u64,
 }
 #[cfg(target_arch = "wasm32")]
@@ -424,56 +590,29 @@ impl<B: Backend> LocalState<B> {
         let Self {
             renderer,
             surfaces,
+            rejections,
             next_frame,
         } = self;
         match message {
             Message::CreateSurface { id, target, reply } => {
-                let result = renderer.create_surface(id, target);
-                if let Ok(info) = &result {
-                    surfaces.insert(
-                        id,
-                        SurfaceState {
-                            tree: SurfaceTree::new(),
-                            size: info.size,
-                            display: Display::default(),
-                            clear: WorkingColor::TRANSPARENT,
-                            changed: true,
-                        },
-                    );
-                }
-                let _ = reply.send(result);
+                let _ = reply.send(create_surface::<B>(renderer, surfaces, id, target));
             }
             Message::ResizeSurface { id, size } => {
-                renderer.resize_surface(id, size);
-                if let Some(state) = surfaces.get_mut(&id) {
-                    state.size = size;
-                    state.changed = true;
-                } else {
-                    tracing::trace!(surface = id.raw(), "resize of unknown surface");
-                }
+                resize_surface::<B>(renderer, surfaces, id, size);
             }
-            Message::DestroySurface { id } => {
-                if surfaces.remove(&id).is_some() {
-                    renderer.destroy_surface(id);
-                } else {
-                    // Nothing was committed — a dropped `Engine::surface`
-                    // future whose create failed may still send this (#150).
-                    tracing::trace!(surface = id.raw(), "destroy of unknown surface");
-                }
-            }
-            Message::Display { id, display } => {
-                if let Some(state) = surfaces.get_mut(&id) {
-                    state.display = display;
-                    state.changed = true;
-                } else {
-                    tracing::trace!(surface = id.raw(), "display of unknown surface");
-                }
-            }
+            Message::DestroySurface { id } => destroy_surface::<B>(renderer, surfaces, id),
+            Message::Display { id, display } => set_display(surfaces, id, display),
             Message::Resource(op) => op(renderer),
-            Message::ReplaceImage { id, image, reply } => {
-                let _ = reply.send(replace_image::<B>(renderer, surfaces, id, image));
+            Message::Register { resource, op } => {
+                let result = op(renderer).await;
+                rejections.register(resource, result);
             }
-            Message::AsyncResource(op) => op(renderer).await,
+            Message::Release { resource, op } => {
+                rejections.release::<B>(renderer, resource, op);
+            }
+            Message::ReplaceImage { id, image } => {
+                replace_image::<B>(renderer, surfaces, rejections, id, image);
+            }
             Message::Render {
                 time,
                 mut commits,
@@ -481,7 +620,9 @@ impl<B: Backend> LocalState<B> {
             } => {
                 let id = FrameId(*next_frame);
                 *next_frame += 1;
-                let result = render_local::<B>(renderer, surfaces, id, time.0, &mut commits).await;
+                let result =
+                    render_local::<B>(renderer, surfaces, rejections, id, time.0, &mut commits)
+                        .await;
                 let _ = reply.send(crate::message::RenderReply { result, commits });
             }
             Message::FinishTimings { reply } => {

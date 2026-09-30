@@ -18,6 +18,7 @@ use crate::glyph::FontId;
 use crate::image::{ImageUpload, Rgba8, Rgba16F};
 use crate::message::{ContentOp, FontData, LayerId, SurfaceId};
 use crate::paint::{ImageId, ShaderId};
+use crate::resource::ResourceId;
 use crate::{Offscreen, Picture, Pressure, Uploads};
 
 /// A render-thread event [`Null`] reports.
@@ -97,8 +98,6 @@ pub struct NullConfig {
 pub enum NullReject {
     /// `create_surface` returns [`SurfaceError::UnsupportedTarget`].
     Surface,
-    /// `add_font` returns [`ResourceError::Font`].
-    Font,
     /// `add_image` returns [`ResourceError::Image`].
     Image,
     /// `add_shader` returns [`ResourceError::Shader`].
@@ -158,6 +157,7 @@ impl Backend for Null {
 
 impl Renderer for NullRenderer {
     type Target = Offscreen;
+    type Font = FontData;
 
     fn create_surface(
         &mut self,
@@ -190,13 +190,14 @@ impl Renderer for NullRenderer {
         }
     }
 
-    fn add_font(&mut self, id: FontId, _font: FontData) -> Result<(), ResourceError> {
-        if self.reject.contains(&NullReject::Font) {
-            return Err(ResourceError::Font("injected rejection".into()));
-        }
+    /// `Null` draws no glyphs, so any data is a font.
+    fn prepare_font(font: FontData) -> Result<FontData, ResourceError> {
+        Ok(font)
+    }
+
+    fn add_font(&mut self, id: FontId, _font: FontData) {
         self.fonts.insert(id);
         let _ = self.events.send(Event::AddFont(id));
-        Ok(())
     }
 
     fn remove_font(&mut self, id: FontId) {
@@ -226,9 +227,9 @@ impl Renderer for NullRenderer {
         Ok(())
     }
 
-    fn samples_image(&self, surface: SurfaceId, id: ImageId) -> bool {
+    fn samples(&self, surface: SurfaceId, resource: ResourceId) -> bool {
         self.pictures.iter().any(|((owner, _), picture)| {
-            *owner == surface && picture.display_list().references_image(id)
+            *owner == surface && picture.display_list().references(resource)
         })
     }
 
@@ -357,6 +358,11 @@ impl Renderer for NullRenderer {
 }
 
 impl ShaderPaint for Null {
+    /// `Null` compiles nothing, so any source is valid.
+    fn validate_shader(_source: &ShaderSource) -> Result<(), ResourceError> {
+        Ok(())
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     fn add_shader(
         r: &mut NullRenderer,
@@ -1130,8 +1136,9 @@ mod tests {
 
     /// `Image::replace` reaches the renderer with the new dimensions, marks
     /// changed only the surface whose content draws the image and wakes the
-    /// host once; replacing an image nothing draws marks nothing and does
-    /// not wake. The last drop after a replacement still removes the image.
+    /// host once between two renders; replacing an image nothing draws
+    /// marks nothing. The last drop after a replacement still removes the
+    /// image.
     #[test]
     fn image_replacement_redraws_and_still_releases() {
         use std::cell::Cell;
@@ -1187,18 +1194,14 @@ mod tests {
         image
             .replace(ImageData::<Rgba8>::new(2, 3, vec![0u8; 24]).expect("image data"))
             .expect("replace");
-        assert_eq!(
-            wakes.get(),
-            1,
-            "a replacement of a drawn image wakes the host once"
-        );
+        assert_eq!(wakes.get(), 1, "a replacement wakes the host");
         unused
             .replace(ImageData::<Rgba8>::new(2, 2, vec![0u8; 16]).expect("image data"))
             .expect("replace");
         assert_eq!(
             wakes.get(),
             1,
-            "a replacement nothing draws does not wake the host"
+            "the host is woken at most once between two renders"
         );
         engine.render(FrameTime::now()).expect("render");
         let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
@@ -1318,11 +1321,10 @@ mod tests {
         );
     }
 
-    /// A completed registration releases its backend resource when the
-    /// handle drops — the only cancellation window a synchronous engine
-    /// has. The async executor's windows are covered by `wasm_tests`.
+    /// A registration releases its backend resource when the handle drops,
+    /// including a handle dropped before the backend ran its registration.
     #[test]
-    fn completed_registrations_release_on_drop() {
+    fn registrations_release_on_drop() {
         let (engine, rx) = engine();
         let font = engine.font(FontSource::bytes(vec![0u8; 8])).expect("font");
         let image = engine
@@ -1347,37 +1349,94 @@ mod tests {
     /// ever existed to release.
     #[test]
     fn rejected_registrations_enqueue_no_removal() {
-        let reject = HashSet::from([
-            NullReject::Surface,
-            NullReject::Font,
-            NullReject::Image,
-            NullReject::Shader,
-        ]);
+        let reject = HashSet::from([NullReject::Surface, NullReject::Image, NullReject::Shader]);
         let (engine, rx) = engine_rejecting(reject);
-        assert!(
-            engine.font(FontSource::bytes(vec![0u8; 8])).is_err(),
-            "font"
-        );
-        assert!(
-            engine
-                .image(ImageData::<Rgba8>::new(1, 1, vec![0u8; 4]).expect("image data"))
-                .is_err(),
-            "image"
-        );
-        assert!(
-            engine
-                .shader(ShaderSource::wgsl("@fragment fn f() { }"))
-                .is_err(),
-            "shader"
-        );
+        let image = engine
+            .image(ImageData::<Rgba8>::new(1, 1, vec![0u8; 4]).expect("image data"))
+            .expect("the image is queued");
+        let shader = engine
+            .shader(ShaderSource::wgsl("@fragment fn f() { }"))
+            .expect("the shader is queued");
         assert!(
             engine
                 .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))
                 .is_err(),
             "surface"
         );
+        drop(image);
+        drop(shader);
         let _ = engine.memory();
         balance::assert_balanced(&rx);
+    }
+
+    /// An upload the backend rejects after its handle was returned fails
+    /// every render that draws it, naming the resource and the backend's
+    /// reason; renders that do not draw it succeed.
+    #[test]
+    fn a_backend_rejected_upload_fails_the_render_that_draws_it() {
+        use crate::{Draw as _, RenderError, ResourceId, Sampling, ShaderPaint};
+
+        let (engine, _rx) =
+            engine_rejecting(HashSet::from([NullReject::Image, NullReject::Shader]));
+        let image = engine
+            .image(ImageData::<Rgba8>::new(1, 1, vec![0u8; 4]).expect("image data"))
+            .expect("the image is queued");
+        let shader = engine
+            .shader(ShaderSource::wgsl("@fragment fn f() { }"))
+            .expect("the shader is queued");
+        let surface = engine
+            .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))
+            .expect("surface");
+        let rect = kurbo::Rect::new(0., 0., 8., 8.);
+        engine
+            .render(FrameTime::now())
+            .expect("a render drawing neither resource succeeds");
+
+        let assert_rejected =
+            |expected: ResourceId, reason: &str| match engine.render(FrameTime::now()) {
+                Err(RenderError::Rejected {
+                    resource,
+                    reason: actual,
+                }) => {
+                    assert_eq!(resource, expected);
+                    assert_eq!(actual.to_string(), reason);
+                }
+                other => panic!("{expected} drawn: {other:?}"),
+            };
+        surface.update(|tx| {
+            tx[surface.root()].record(|c| c.image(image.id(), rect, Sampling::Nearest));
+        });
+        assert_rejected(ResourceId::Image(image.id()), "image: injected rejection");
+        assert_rejected(ResourceId::Image(image.id()), "image: injected rejection");
+        // A replacement of a rejected image registers it anew; the backend
+        // rejects that too.
+        image
+            .replace(ImageData::<Rgba8>::new(2, 2, vec![0u8; 16]).expect("image data"))
+            .expect("the replacement is queued");
+        assert_rejected(ResourceId::Image(image.id()), "image: injected rejection");
+
+        surface.update(|tx| {
+            tx[surface.root()].record(|c| {
+                c.fill(
+                    rect,
+                    ShaderPaint {
+                        shader: shader.id(),
+                        uniforms: vec![],
+                    },
+                );
+            });
+        });
+        assert_rejected(
+            ResourceId::Shader(shader.id()),
+            "shader: injected rejection",
+        );
+
+        surface.update(|tx| {
+            tx[surface.root()].record(|c| c.fill(rect, crate::WorkingColor::WHITE));
+        });
+        engine
+            .render(FrameTime::now())
+            .expect("content that no longer draws a rejected resource renders");
     }
 
     #[test]
@@ -1431,10 +1490,12 @@ mod tests {
 /// Retained-lowering equivalence checks for first-party backends.
 pub mod incremental;
 
-/// The async executor's registration windows (#150): a registration
-/// future owns the backend id from the moment the request is enqueued, so
-/// dropping it at any point still releases what the backend committed.
-/// Run under the Node `wasm-bindgen-test-runner` (or a browser):
+/// The browser executor's registration lifetimes (#150). Resource
+/// registration is synchronous and queued in order, so its handle owns the
+/// id from the start; surface creation is a future that owns its id from
+/// the moment the request is enqueued, so dropping it at any point still
+/// destroys what the backend committed. Run under the Node
+/// `wasm-bindgen-test-runner` (or a browser):
 ///
 /// ```console
 /// CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
@@ -1443,6 +1504,7 @@ pub mod incremental;
 /// ```
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
+    use std::collections::HashSet;
     use std::fmt::Debug;
     use std::future::Future;
     use std::pin::Pin;
@@ -1455,11 +1517,12 @@ mod wasm_tests {
     use super::{Event, Null, NullConfig, NullReject};
     use crate::image::ImageData;
     use crate::resource::FontSource;
-    use crate::{Engine, Offscreen, OffscreenFormat, Rgba8, ShaderSource};
+    use crate::{
+        Draw as _, Engine, FrameTime, Offscreen, OffscreenFormat, RenderError, ResourceId, Rgba8,
+        Sampling, ShaderPaint, ShaderSource,
+    };
 
-    async fn engine(
-        reject: std::collections::HashSet<NullReject>,
-    ) -> (Engine<Null>, Receiver<Event>) {
+    async fn engine(reject: HashSet<NullReject>) -> (Engine<Null>, Receiver<Event>) {
         let (tx, rx) = std::sync::mpsc::channel();
         let engine = Engine::<Null>::new(NullConfig { events: tx, reject })
             .await
@@ -1467,108 +1530,110 @@ mod wasm_tests {
         (engine, rx)
     }
 
-    /// Runs the registration future until it has enqueued its request and
-    /// is parked on the reply.
-    fn enqueued<F: Future>(registration: Pin<&mut F>) {
+    /// Runs the creation future until it has enqueued its request and is
+    /// parked on the reply.
+    fn enqueued<F: Future>(creation: Pin<&mut F>) {
         assert!(
-            registration
+            creation
                 .poll(&mut Context::from_waker(Waker::noop()))
                 .is_pending(),
-            "registration returned before its reply await"
+            "creation returned before its reply await"
         );
     }
 
     /// Everything enqueued before this call has been applied: the
     /// `Memory` reply lands after them in the serial executor.
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
     async fn flush(engine: &Engine<Null>) {
         let _ = engine.memory().await;
     }
 
     /// Window (a): dropped after enqueue, before the backend ran.
-    async fn drop_after_enqueue<F, O, E>(engine: &Engine<Null>, register: F)
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
+    async fn drop_after_enqueue<F, O, E>(engine: &Engine<Null>, create: F)
     where
         F: Future<Output = Result<O, E>>,
         E: Debug,
     {
-        let mut registration = Box::pin(register);
-        enqueued(registration.as_mut());
-        drop(registration);
+        let mut creation = Box::pin(create);
+        enqueued(creation.as_mut());
+        drop(creation);
         flush(engine).await;
     }
 
     /// Window (b): dropped after the backend committed, before the reply
     /// was adopted. The first `flush` returns once the commit is done.
-    async fn drop_after_commit<F, O, E>(engine: &Engine<Null>, register: F)
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
+    async fn drop_after_commit<F, O, E>(engine: &Engine<Null>, create: F)
     where
         F: Future<Output = Result<O, E>>,
         E: Debug,
     {
-        let mut registration = Box::pin(register);
-        enqueued(registration.as_mut());
+        let mut creation = Box::pin(create);
+        enqueued(creation.as_mut());
         flush(engine).await;
-        drop(registration);
+        drop(creation);
         flush(engine).await;
     }
 
     /// Window (c): the reply was adopted and the handle dropped.
-    async fn drop_after_reply<F, O, E>(engine: &Engine<Null>, register: F)
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
+    async fn drop_after_reply<F, O, E>(engine: &Engine<Null>, create: F)
     where
         F: Future<Output = Result<O, E>>,
         E: Debug,
     {
-        drop(register.await.expect("registration"));
+        drop(create.await.expect("creation"));
         flush(engine).await;
     }
 
-    /// Every window, for one registration kind.
-    async fn all_windows<O, E>(
-        engine: &Engine<Null>,
-        register: impl for<'a> Fn(&'a Engine<Null>) -> Pin<Box<dyn Future<Output = Result<O, E>> + 'a>>,
-    ) where
-        E: Debug,
-    {
-        drop_after_enqueue(engine, register(engine)).await;
-        drop_after_commit(engine, register(engine)).await;
-        drop_after_reply(engine, register(engine)).await;
-    }
-
     #[wasm_bindgen_test]
-    async fn dropped_font_registration_still_releases_it() {
-        let (engine, rx) = engine(Default::default()).await;
-        all_windows(&engine, |engine| {
-            Box::pin(engine.font(FontSource::bytes(vec![0u8; 8])))
-        })
-        .await;
-        balance::assert_balanced(&rx);
-    }
-
-    #[wasm_bindgen_test]
-    async fn dropped_image_registration_still_releases_it() {
-        let (engine, rx) = engine(Default::default()).await;
-        all_windows(&engine, |engine| {
-            Box::pin(engine.image(ImageData::<Rgba8>::new(1, 1, vec![0u8; 4]).expect("image data")))
-        })
-        .await;
-        balance::assert_balanced(&rx);
-    }
-
-    #[wasm_bindgen_test]
-    async fn dropped_shader_registration_still_releases_it() {
-        let (engine, rx) = engine(Default::default()).await;
-        all_windows(&engine, |engine| {
-            Box::pin(engine.shader(ShaderSource::wgsl("@fragment fn f() { }")))
-        })
-        .await;
-        balance::assert_balanced(&rx);
-    }
-
-    #[wasm_bindgen_test]
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
     async fn dropped_surface_creation_still_destroys_it() {
-        let (engine, rx) = engine(Default::default()).await;
-        all_windows(&engine, |engine| {
-            Box::pin(engine.surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16)))
-        })
-        .await;
+        let (engine, rx) = engine(HashSet::default()).await;
+        let create = || engine.surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16));
+        drop_after_enqueue(&engine, create()).await;
+        drop_after_commit(&engine, create()).await;
+        drop_after_reply(&engine, create()).await;
+        balance::assert_balanced(&rx);
+    }
+
+    /// A registration releases its backend resource when the handle
+    /// drops, including a handle dropped before the executor ran its
+    /// registration.
+    #[wasm_bindgen_test]
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
+    async fn registrations_release_on_drop() {
+        let (engine, rx) = engine(HashSet::default()).await;
+        let font = engine.font(FontSource::bytes(vec![0u8; 8])).expect("font");
+        let image = engine
+            .image(ImageData::<Rgba8>::new(1, 1, vec![0u8; 4]).expect("image data"))
+            .expect("image");
+        let shader = engine
+            .shader(ShaderSource::wgsl("@fragment fn f() { }"))
+            .expect("shader");
+        drop(font);
+        drop(image);
+        drop(shader);
+        flush(&engine).await;
         balance::assert_balanced(&rx);
     }
 
@@ -1576,32 +1641,19 @@ mod wasm_tests {
     /// resource never existed — whether the caller awaited the error or
     /// dropped the future on the way.
     #[wasm_bindgen_test]
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
     async fn rejected_registrations_enqueue_no_removal() {
-        let reject = std::collections::HashSet::from([
-            NullReject::Surface,
-            NullReject::Font,
-            NullReject::Image,
-            NullReject::Shader,
-        ]);
+        let reject = HashSet::from([NullReject::Surface, NullReject::Image, NullReject::Shader]);
         let (engine, rx) = engine(reject).await;
-        assert!(
-            engine.font(FontSource::bytes(vec![0u8; 8])).await.is_err(),
-            "font"
-        );
-        assert!(
-            engine
-                .image(ImageData::<Rgba8>::new(1, 1, vec![0u8; 4]).expect("image data"))
-                .await
-                .is_err(),
-            "image"
-        );
-        assert!(
-            engine
-                .shader(ShaderSource::wgsl("@fragment fn f() { }"))
-                .await
-                .is_err(),
-            "shader"
-        );
+        let image = engine
+            .image(ImageData::<Rgba8>::new(1, 1, vec![0u8; 4]).expect("image data"))
+            .expect("the image is queued");
+        let shader = engine
+            .shader(ShaderSource::wgsl("@fragment fn f() { }"))
+            .expect("the shader is queued");
         assert!(
             engine
                 .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))
@@ -1609,14 +1661,68 @@ mod wasm_tests {
                 .is_err(),
             "surface"
         );
-        // Dropped before the rejected reply: the enqueued removal finds
-        // no committed resource and reports nothing.
+        drop(image);
+        drop(shader);
+        // Dropped before the rejected reply: the enqueued destruction finds
+        // no committed surface and reports nothing.
         drop_after_enqueue(
             &engine,
-            engine.image(ImageData::<Rgba8>::new(1, 1, vec![0u8; 4]).expect("image data")),
+            engine.surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16)),
         )
         .await;
         flush(&engine).await;
         balance::assert_balanced(&rx);
+    }
+
+    /// An upload the backend rejects after its handle was returned fails
+    /// the render that draws it, naming the resource and the backend's
+    /// reason. Registration and recording happen with no await between.
+    #[wasm_bindgen_test]
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
+    async fn a_backend_rejected_upload_fails_the_render_that_draws_it() {
+        let reject = HashSet::from([NullReject::Image, NullReject::Shader]);
+        let (engine, _rx) = engine(reject).await;
+        let surface = engine
+            .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))
+            .await
+            .expect("surface");
+        let rect = kurbo::Rect::new(0., 0., 8., 8.);
+        let image = engine
+            .image(ImageData::<Rgba8>::new(1, 1, vec![0u8; 4]).expect("image data"))
+            .expect("the image is queued");
+        surface.update(|tx| {
+            tx[surface.root()].record(|c| c.image(image.id(), rect, Sampling::Nearest));
+        });
+        match engine.render(FrameTime::now()).await {
+            Err(RenderError::Rejected { resource, reason }) => {
+                assert_eq!(resource, ResourceId::Image(image.id()));
+                assert_eq!(reason.to_string(), "image: injected rejection");
+            }
+            other => panic!("rejected image drawn: {other:?}"),
+        }
+        let shader = engine
+            .shader(ShaderSource::wgsl("@fragment fn f() { }"))
+            .expect("the shader is queued");
+        surface.update(|tx| {
+            tx[surface.root()].record(|c| {
+                c.fill(
+                    rect,
+                    ShaderPaint {
+                        shader: shader.id(),
+                        uniforms: vec![],
+                    },
+                );
+            });
+        });
+        match engine.render(FrameTime::now()).await {
+            Err(RenderError::Rejected { resource, reason }) => {
+                assert_eq!(resource, ResourceId::Shader(shader.id()));
+                assert_eq!(reason.to_string(), "shader: injected rejection");
+            }
+            other => panic!("rejected shader drawn: {other:?}"),
+        }
     }
 }

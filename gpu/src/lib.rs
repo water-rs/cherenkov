@@ -301,6 +301,10 @@ impl cherenkov::ExternalFrames for Gpu {
 }
 
 impl cherenkov::ShaderPaintCapability for Gpu {
+    fn validate_shader(source: &cherenkov::ShaderSource) -> Result<(), cherenkov::ResourceError> {
+        render::GpuRenderer::validate_shader(source)
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     fn add_shader(
         r: &mut Self::Renderer,
@@ -381,6 +385,12 @@ where
     }
 }
 impl cherenkov::BackdropShaders for Gpu {
+    fn validate_backdrop_shader(
+        source: &cherenkov::BackdropShaderSource,
+    ) -> Result<(), cherenkov::ResourceError> {
+        render::GpuRenderer::validate_backdrop_shader(source)
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     fn add_backdrop_shader(
         r: &mut Self::Renderer,

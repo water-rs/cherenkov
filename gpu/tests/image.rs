@@ -268,3 +268,43 @@ fn an_f16_image_keeps_hdr_and_wide_gamut() -> Result<(), Box<dyn std::error::Err
     close_px(px(6, 0), linear_srgb_to_p3_premul([8.0, 0.0, 0.0, 0.5]));
     Ok(())
 }
+
+/// An image larger than the device's texture limit is a rejection only the
+/// backend can detect: registration returns the handle, and the render
+/// that draws the image fails naming it and the backend's reason.
+#[test]
+fn an_image_beyond_the_texture_limit_fails_the_render_that_draws_it()
+-> Result<(), Box<dyn std::error::Error>> {
+    let shared = match cherenkov_gpu::interop::SharedDevice::create(&GpuConfig::default()) {
+        Ok(shared) => shared,
+        Err(EngineError::Backend(_)) => return Ok(()),
+        Err(e) => panic!("device creation failed: {e}"),
+    };
+    let width = shared.device.limits().max_texture_dimension_2d + 1;
+    let engine = Engine::<Gpu>::new(GpuConfig {
+        device: Some(shared),
+        ..GpuConfig::default()
+    })?;
+    let surface = engine.surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))?;
+    let image = engine.image(ImageData::<Rgba8>::new(
+        width,
+        1,
+        vec![255; width as usize * 4],
+    )?)?;
+    surface.update(|tx| {
+        tx[surface.root()].record(|c| {
+            c.image(image.id(), Rect::new(0.0, 0.0, 8.0, 8.0), Sampling::Nearest);
+        });
+    });
+    match engine.render(cherenkov::FrameTime::now()) {
+        Err(cherenkov::RenderError::Rejected { resource, reason }) => {
+            assert_eq!(resource, cherenkov::ResourceId::Image(image.id()));
+            assert!(
+                matches!(*reason, cherenkov::ResourceError::Image(_)),
+                "{reason}"
+            );
+        }
+        other => panic!("an oversized image was drawn: {other:?}"),
+    }
+    Ok(())
+}

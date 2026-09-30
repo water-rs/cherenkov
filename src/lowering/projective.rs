@@ -13,7 +13,7 @@
 
 use kurbo::{Affine, Rect};
 
-use crate::{LayerId, Projective, RenderError, SurfaceTree};
+use crate::{FillRule, LayerId, Projective, RenderError, ShapeData, SurfaceTree};
 
 /// Feature name: a projective layer without a clip has no finite local
 /// source domain.
@@ -385,6 +385,22 @@ pub fn project_outline(
         out.close_path();
     }
     out
+}
+
+/// A destructive blend's operator domain in the parent raster.
+///
+/// The projective layer clip `clip` is flattened to `tolerance` layer
+/// units and projected by `h` into `viewport` (see [`project_outline`]),
+/// keeping its fill rule. `None` for a clip without area (a line).
+#[must_use]
+pub fn project_clip(
+    h: &Homography,
+    clip: &ShapeData,
+    tolerance: f64,
+    viewport: Rect,
+) -> Option<(kurbo::BezPath, FillRule)> {
+    let (path, rule) = super::shape_outline(clip, tolerance)?;
+    Some((project_outline(h, &path, tolerance, viewport), rule))
 }
 
 /// The largest singular value of the row-major 2×2 `m`.

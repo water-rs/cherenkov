@@ -75,6 +75,17 @@ impl<B: ProjectiveLayers> Scene<B> {
     }
 }
 
+/// The backend's own rendering of the clear colour alone, in its storage
+/// precision: what an untouched pixel reads back as.
+fn clear_pixel<B: ProjectiveLayers>(config: B::Config) -> [f32; 4] {
+    let mut scene = Scene::<B>::new(config, |e| {
+        e.content(Picture::record(|_| {}));
+    });
+    let pixels = scene.render().expect("clear");
+    assert!(pixels.iter().all(|px| bits(*px) == bits(pixels[0])));
+    pixels[0]
+}
+
 /// A pixel's exact bits, for exact comparisons.
 fn bits(px: [f32; 4]) -> [u32; 4] {
     px.map(f32::to_bits)
@@ -112,7 +123,7 @@ pub fn identity_matches_affine<B: ProjectiveLayers>(config: impl Fn() -> B::Conf
 /// A card entirely behind the viewer, or seen exactly edge-on, draws
 /// nothing: the surface keeps its clear colour bit for bit.
 pub fn hidden_and_edge_on_contribute_nothing<B: ProjectiveLayers>(config: impl Fn() -> B::Config) {
-    let clear = CLEAR.components;
+    let clear = clear_pixel::<B>(config());
     for (what, edit) in [
         (
             "behind",
@@ -220,11 +231,12 @@ pub fn destructive_blend_keeps_its_operator_domain<B: ProjectiveLayers>(
     let p = projected.render().expect("projected");
     let a = affine.render().expect("affine");
     close(&p, &a, 2e-3, "destructive identity");
+    let clear = clear_pixel::<B>(config());
     let at = |x: usize, y: usize| p[y * SIZE.0 as usize + x];
     // Inside the clip, below the content: cleared by the operator.
     assert_eq!(bits(at(20, 44)), bits([0.0; 4]));
     // Outside the clip: the parent is untouched.
-    assert_eq!(bits(at(4, 4)), bits(CLEAR.components));
+    assert_eq!(bits(at(4, 4)), bits(clear));
 }
 
 /// An invalid composed pose, and a projective layer without a clip, are
@@ -305,6 +317,7 @@ pub fn horizon_crossing_excludes_the_back_half_space<B: ProjectiveLayers>(
         .tilt(tilt);
     });
     let pixels = scene.render().expect("horizon");
+    let clear = clear_pixel::<B>(config());
     // The pose, composed here from public constructors:
     // translate(16 + 16) · perspective · Ry(tilt.y) · Rx(tilt.x) ·
     // translate(−16).
@@ -356,10 +369,10 @@ pub fn horizon_crossing_excludes_the_back_half_space<B: ProjectiveLayers>(
             back += 1;
             assert_eq!(
                 bits(*px),
-                bits(CLEAR.components),
+                bits(clear),
                 "pixel {d:?} samples the back half-space"
             );
-        } else if w > 0.0 && inside && bits(*px) != bits(CLEAR.components) {
+        } else if w > 0.0 && inside && bits(*px) != bits(clear) {
             front += 1;
         }
     }

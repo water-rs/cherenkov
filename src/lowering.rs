@@ -9,6 +9,24 @@ use crate::{BlendMode, Command, Dirty, DisplayList, FillRule, Group, ShapeData};
 pub mod projective;
 pub mod shadow;
 
+/// `shape`'s outline flattened to `tolerance` where it is curved, with its
+/// fill rule; `None` for a shape without area (a line).
+#[must_use]
+pub fn shape_outline(shape: &ShapeData, tolerance: f64) -> Option<(kurbo::BezPath, FillRule)> {
+    use kurbo::Shape as _;
+    match shape {
+        ShapeData::Rect(r) => Some((r.to_path(tolerance), FillRule::NonZero)),
+        ShapeData::RoundedRect(r) => Some((r.to_path(tolerance), FillRule::NonZero)),
+        ShapeData::Continuous(c) => Some((c.to_path(tolerance), FillRule::NonZero)),
+        ShapeData::Circle(c) => Some((c.to_path(tolerance), FillRule::NonZero)),
+        ShapeData::Ellipse(e) => Some((e.to_path(tolerance), FillRule::NonZero)),
+        ShapeData::Line(_) => None,
+        ShapeData::Path { elements, rule } => {
+            Some((kurbo::BezPath::from_vec(elements.to_vec()), *rule))
+        }
+    }
+}
+
 /// A backend operation whose scope indices can be relocated during a patch.
 pub trait Operation {
     /// Matching close index for a scope opener.

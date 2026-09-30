@@ -107,7 +107,18 @@ fn main() {
     let present_path = manifest.join("src/render/present.wgsl");
     let shared_path = manifest.join("src/render/shared.wgsl");
     let external_path = manifest.join("src/render/external.wgsl");
-    for path in [&shader_path, &present_path, &shared_path, &external_path] {
+    let blend_path = manifest.join("src/render/blend.wgsl");
+    let projective_path = manifest.join("src/render/projective.wgsl");
+    let mip_path = manifest.join("src/render/mip.wgsl");
+    for path in [
+        &shader_path,
+        &present_path,
+        &shared_path,
+        &external_path,
+        &blend_path,
+        &projective_path,
+        &mip_path,
+    ] {
         println!("cargo::rerun-if-changed={}", path.display());
     }
     println!(
@@ -123,14 +134,22 @@ fn main() {
         .unwrap_or_else(|e| panic!("{}: {e}", present_path.display()));
     let external = std::fs::read_to_string(&external_path)
         .unwrap_or_else(|e| panic!("{}: {e}", external_path.display()));
+    let blend = std::fs::read_to_string(&blend_path)
+        .unwrap_or_else(|e| panic!("{}: {e}", blend_path.display()));
+    let projective = std::fs::read_to_string(&projective_path)
+        .unwrap_or_else(|e| panic!("{}: {e}", projective_path.display()));
+    let mip = std::fs::read_to_string(&mip_path)
+        .unwrap_or_else(|e| panic!("{}: {e}", mip_path.display()));
 
-    // The three VARIANT specializations of shader.wgsl plus present.wgsl
-    // and external.wgsl — the fixed module set `render` creates at init.
-    // The engine and external modules share the `shared.wgsl` prelude.
+    // The three VARIANT specializations of shader.wgsl plus present.wgsl,
+    // external.wgsl, projective.wgsl and mip.wgsl — the fixed module set
+    // `render` creates. The engine, external and projective modules share
+    // the `shared.wgsl` prelude; the engine and projective tails share the
+    // `blend.wgsl` compositing helpers.
     let mut specs: Vec<Spec> = (0..3u32)
         .map(|variant| Spec {
             name: format!("engine{variant}"),
-            source: format!("const VARIANT: u32 = {variant}u;\n{shared}\n{shader}"),
+            source: format!("const VARIANT: u32 = {variant}u;\n{shared}\n{shader}\n{blend}"),
             groups: bindings::ENGINE_GROUPS,
         })
         .collect();
@@ -143,6 +162,16 @@ fn main() {
         name: "external".into(),
         source: format!("{shared}\n{external}"),
         groups: bindings::EXTERNAL_GROUPS,
+    });
+    specs.push(Spec {
+        name: "projective".into(),
+        source: format!("{shared}\n{blend}\n{projective}"),
+        groups: bindings::PROJECTIVE_GROUPS,
+    });
+    specs.push(Spec {
+        name: "mip".into(),
+        source: mip,
+        groups: bindings::MIP_GROUPS,
     });
 
     // wasm builds embed no passthrough artifacts, so the toolchain the

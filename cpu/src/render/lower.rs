@@ -3,7 +3,7 @@
 
 mod silhouette;
 
-use cherenkov::lowering::Realization;
+use cherenkov::lowering::{Realization, shape_outline};
 use std::sync::Arc;
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -463,7 +463,7 @@ fn member_effect(
         | ShapeData::RoundedRect(_)
         | ShapeData::Continuous(_)
         | ShapeData::Circle(_)
-        | ShapeData::Ellipse(_) => shape_path(clip, FLATTEN_TOL / sm),
+        | ShapeData::Ellipse(_) => shape_outline(clip, FLATTEN_TOL / sm),
         _ => None,
     }
     .ok_or(RenderError::Unsupported(names::BACKDROP_EFFECT_SDF_PATH))?;
@@ -472,21 +472,6 @@ fn member_effect(
         SampleEffect::Sdf(SdfEffect { edges, kind }),
         f64::from(effect.reach()),
     ))
-}
-
-/// A `ShapeData` as a kurbo path in content space, plus its fill rule.
-/// `Line` fills draw nothing.
-fn shape_path(shape: &ShapeData, tol: f64) -> Option<(BezPath, FillRule)> {
-    use kurbo::Shape as _;
-    match shape {
-        ShapeData::Rect(r) => Some((r.to_path(tol), FillRule::NonZero)),
-        ShapeData::RoundedRect(r) => Some((r.to_path(tol), FillRule::NonZero)),
-        ShapeData::Continuous(c) => Some((c.to_path(tol), FillRule::NonZero)),
-        ShapeData::Circle(c) => Some((c.to_path(tol), FillRule::NonZero)),
-        ShapeData::Ellipse(e) => Some((e.to_path(tol), FillRule::NonZero)),
-        ShapeData::Line(_) => None,
-        ShapeData::Path { elements, rule } => Some((BezPath::from_vec(elements.to_vec()), *rule)),
-    }
 }
 
 /// The path's flattened boundary edges, implicit-close applied.
@@ -609,7 +594,7 @@ fn device_rect(t: Affine, r: Rect) -> Rect {
 /// with no path (`Line`) has no bounds.
 fn clip_device_bounds(transform: Affine, clip: &ShapeData) -> Rect {
     use kurbo::Shape as _;
-    let Some((path, _)) = shape_path(clip, FLATTEN_TOL) else {
+    let Some((path, _)) = shape_outline(clip, FLATTEN_TOL) else {
         return Rect::ZERO;
     };
     let local = path.bounding_box();
@@ -1062,7 +1047,7 @@ impl<'a, 'b> Lowering<'a, 'b> {
         let (w, h) = (self.width, self.height);
         let sm = sigma_max(self.transform).max(1e-12);
         let tol_u = FLATTEN_TOL / sm;
-        let (path, rule) = shape_path(shape, tol_u)?;
+        let (path, rule) = shape_outline(shape, tol_u)?;
         let edges = flatten_edges(self.transform * path, FLATTEN_TOL);
         let (edges, rule) = resolve_edges(edges, rule);
         let mut mask = coverage_mask(&edges, rule, w, h);
@@ -1366,23 +1351,22 @@ impl<'a, 'b> Lowering<'a, 'b> {
                 .clip
                 .as_ref()
                 .expect("a planned projective layer has a clip");
-            let tolerance = FLATTEN_TOL / placed.density;
-            let (path, _) = shape_path(clip, tolerance).ok_or_else(|| {
-                RenderError::Render(format!("projective layer {id:?} clip has no outline"))
-            })?;
             #[expect(clippy::cast_precision_loss, reason = "raster sizes fit f64")]
             let viewport =
                 Rect::new(0.0, 0.0, self.width as f64, self.height as f64).inflate(1.0, 1.0);
-            let device = cherenkov::lowering::projective::project_outline(
+            let (device, rule) = cherenkov::lowering::projective::project_clip(
                 &placed.to_parent,
-                &path,
-                tolerance,
+                clip,
+                FLATTEN_TOL / placed.density,
                 viewport,
-            );
+            )
+            .ok_or_else(|| {
+                RenderError::Render(format!("projective layer {id:?} clip has no outline"))
+            })?;
             let saved = std::mem::replace(&mut self.transform, Affine::IDENTITY);
             let clip = self.make_clip(&ShapeData::Path {
                 elements: device.elements().into(),
-                rule: FillRule::NonZero,
+                rule,
             });
             self.transform = saved;
             // A projected clip with no area bounds the operator to nothing.
@@ -1604,7 +1588,7 @@ impl<'a, 'b> Lowering<'a, 'b> {
     fn fill(&mut self, shape: &ShapeData, paint: &PaintData) {
         let sm = sigma_max(self.transform).max(1e-12);
         let tol_u = FLATTEN_TOL / sm;
-        let Some((path, rule)) = shape_path(shape, tol_u) else {
+        let Some((path, rule)) = shape_outline(shape, tol_u) else {
             return;
         };
         let edges = flatten_edges(self.transform * path, FLATTEN_TOL);
@@ -1639,7 +1623,7 @@ impl<'a, 'b> Lowering<'a, 'b> {
                 p
             }
             shape => {
-                let Some((path, _)) = shape_path(shape, tol_u) else {
+                let Some((path, _)) = shape_outline(shape, tol_u) else {
                     return;
                 };
                 path

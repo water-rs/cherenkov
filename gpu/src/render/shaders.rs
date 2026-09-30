@@ -58,23 +58,41 @@ const VS_FS_EXTERNAL: &[wgpu::PassthroughShaderEntryPoint<'static>] = &[
     },
 ];
 
+/// `vs_main` + `fs_projective`, the projective composite's entry points.
+const VS_FS_PROJECTIVE: &[wgpu::PassthroughShaderEntryPoint<'static>] = &[
+    wgpu::PassthroughShaderEntryPoint {
+        name: Cow::Borrowed("vs_main"),
+        workgroup_size: (0, 0, 0),
+    },
+    wgpu::PassthroughShaderEntryPoint {
+        name: Cow::Borrowed("fs_projective"),
+        workgroup_size: (0, 0, 0),
+    },
+];
+
 /// The `VARIANT = 0` specialization of `shader.wgsl` (simple).
 const ENGINE_WGSL0: &str = concat!(
     "const VARIANT: u32 = 0u;\n",
     include_str!("shared.wgsl"),
-    include_str!("shader.wgsl")
+    include_str!("shader.wgsl"),
+    "\n",
+    include_str!("blend.wgsl")
 );
 /// The `VARIANT = 1` specialization (shadow).
 const ENGINE_WGSL1: &str = concat!(
     "const VARIANT: u32 = 1u;\n",
     include_str!("shared.wgsl"),
-    include_str!("shader.wgsl")
+    include_str!("shader.wgsl"),
+    "\n",
+    include_str!("blend.wgsl")
 );
 /// The `VARIANT = 2` specialization (full).
 const ENGINE_WGSL2: &str = concat!(
     "const VARIANT: u32 = 2u;\n",
     include_str!("shared.wgsl"),
-    include_str!("shader.wgsl")
+    include_str!("shader.wgsl"),
+    "\n",
+    include_str!("blend.wgsl")
 );
 
 /// The effect-module text for a user `backdrop_effect` source.
@@ -120,6 +138,14 @@ const PRESENT_SPV: &[u8] = &[];
 const EXTERNAL_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/external.spv"));
 #[cfg(target_arch = "wasm32")]
 const EXTERNAL_SPV: &[u8] = &[];
+#[cfg(not(target_arch = "wasm32"))]
+const PROJECTIVE_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/projective.spv"));
+#[cfg(target_arch = "wasm32")]
+const PROJECTIVE_SPV: &[u8] = &[];
+#[cfg(not(target_arch = "wasm32"))]
+const MIP_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mip.spv"));
+#[cfg(target_arch = "wasm32")]
+const MIP_SPV: &[u8] = &[];
 #[cfg(target_vendor = "apple")]
 const ENGINE_METALLIB: [&[u8]; 3] = [
     include_bytes!(concat!(env!("OUT_DIR"), "/engine0.metallib")),
@@ -136,6 +162,14 @@ const PRESENT_METALLIB: &[u8] = &[];
 const EXTERNAL_METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/external.metallib"));
 #[cfg(not(target_vendor = "apple"))]
 const EXTERNAL_METALLIB: &[u8] = &[];
+#[cfg(target_vendor = "apple")]
+const PROJECTIVE_METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/projective.metallib"));
+#[cfg(not(target_vendor = "apple"))]
+const PROJECTIVE_METALLIB: &[u8] = &[];
+#[cfg(target_vendor = "apple")]
+const MIP_METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mip.metallib"));
+#[cfg(not(target_vendor = "apple"))]
+const MIP_METALLIB: &[u8] = &[];
 
 /// The three `VARIANT` specializations of `shader.wgsl`, indexed by
 /// `variant_index`.
@@ -174,6 +208,29 @@ const EXTERNAL: Fixed = Fixed {
     spirv: EXTERNAL_SPV,
     metallib: EXTERNAL_METALLIB,
     entries: VS_FS_EXTERNAL,
+};
+
+/// `shared.wgsl`, `blend.wgsl` and `projective.wgsl`, the projective
+/// composite module (#84).
+const PROJECTIVE: Fixed = Fixed {
+    wgsl: concat!(
+        include_str!("shared.wgsl"),
+        "\n",
+        include_str!("blend.wgsl"),
+        "\n",
+        include_str!("projective.wgsl")
+    ),
+    spirv: PROJECTIVE_SPV,
+    metallib: PROJECTIVE_METALLIB,
+    entries: VS_FS_PROJECTIVE,
+};
+
+/// `mip.wgsl`, the projective local image's mip level module (#84).
+const MIP: Fixed = Fixed {
+    wgsl: include_str!("mip.wgsl"),
+    spirv: MIP_SPV,
+    metallib: MIP_METALLIB,
+    entries: VS_FS_MAIN,
 };
 
 /// How the fixed engine modules reach the device — a property of the
@@ -238,6 +295,18 @@ impl ShaderDelivery {
     #[must_use]
     pub fn external_module(self, device: &wgpu::Device) -> wgpu::ShaderModule {
         self.module(device, "cherenkov external", &EXTERNAL)
+    }
+
+    /// The projective composite module.
+    #[must_use]
+    pub fn projective_module(self, device: &wgpu::Device) -> wgpu::ShaderModule {
+        self.module(device, "cherenkov projective", &PROJECTIVE)
+    }
+
+    /// The projective mip level module.
+    #[must_use]
+    pub fn mip_module(self, device: &wgpu::Device) -> wgpu::ShaderModule {
+        self.module(device, "cherenkov mip", &MIP)
     }
 
     fn module(

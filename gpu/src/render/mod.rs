@@ -3687,7 +3687,7 @@ impl GpuRenderer {
                             content
                                 .storage
                                 .refs
-                                .push((slot, self.atlas.shelf_epoch(slot)))
+                                .push((slot, self.atlas.shelf_epoch(slot)));
                         },
                     );
                     emission.clear_pending_cells();

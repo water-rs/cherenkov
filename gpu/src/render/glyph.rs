@@ -1285,6 +1285,11 @@ impl Atlas {
     /// search; the pixel must also sit inside the shelf's used run (`x <
     /// shelf.x`). Recovers a stored instance UV's band without the leaf
     /// recording the slot at emit time (#119).
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "atlas pixels fit u32"
+    )]
     pub fn shelf_at(&self, x: f32, y: f32) -> Option<u32> {
         if !x.is_finite() || !y.is_finite() || y < 0.0 {
             return None;
@@ -1294,9 +1299,9 @@ impl Atlas {
         let idx = self
             .layout
             .shelves
-            .partition_point(|shelf| shelf.y + shelf.h <= y);
-        let shelf = self.layout.shelves.get(idx)?;
-        if shelf.live && shelf.y <= y && x < shelf.x {
+            .partition_point(|s| s.y + s.h <= y);
+        let band = self.layout.shelves.get(idx)?;
+        if band.live && band.y <= y && x < band.x {
             u32::try_from(idx).ok()
         } else {
             None
@@ -1307,6 +1312,11 @@ impl Atlas {
     /// consecutive cells usually sit on the same shelf, so `hint`
     /// carries the last hit's slot and skips the search while the
     /// point still lands in that band (#119).
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "atlas pixels fit u32"
+    )]
     pub fn shelf_at_hint(&self, x: f32, y: f32, hint: &mut Option<u32>) -> Option<u32> {
         if !x.is_finite() || !y.is_finite() || y < 0.0 {
             return None;
@@ -1325,12 +1335,12 @@ impl Atlas {
         let idx = self
             .layout
             .shelves
-            .partition_point(|shelf| shelf.y + shelf.h <= y);
+            .partition_point(|s| s.y + s.h <= y);
         let slot = self
             .layout
             .shelves
             .get(idx)
-            .filter(|shelf| shelf.live && shelf.y <= y && x < shelf.x)
+            .filter(|band| band.live && band.y <= y && x < band.x)
             .and_then(|_| u32::try_from(idx).ok());
         *hint = slot;
         slot

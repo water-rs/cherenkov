@@ -73,7 +73,7 @@ fn stop_lanes(stops: &[ColorStop], lanes: &mut Vec<f64>) {
     }
 }
 
-fn lane_point(lanes: &[f64]) -> Point {
+const fn lane_point(lanes: &[f64]) -> Point {
     Point::new(lanes[0], lanes[1])
 }
 
@@ -81,7 +81,7 @@ fn lane_point(lanes: &[f64]) -> Point {
     clippy::cast_possible_truncation,
     reason = "f64 lanes quantize to f32 colour components"
 )]
-fn lane_color(lanes: &[f64]) -> WorkingColor {
+const fn lane_color(lanes: &[f64]) -> WorkingColor {
     WorkingColor::new([
         lanes[0] as f32,
         lanes[1] as f32,
@@ -96,7 +96,9 @@ fn lane_color(lanes: &[f64]) -> WorkingColor {
 )]
 fn lane_stops(lanes: &[f64]) -> Vec<ColorStop> {
     lanes
-        .chunks_exact(5)
+        .as_chunks::<5>()
+        .0
+        .iter()
         .map(|stop| ColorStop {
             offset: stop[0] as f32,
             color: lane_color(&stop[1..]),
@@ -215,7 +217,7 @@ impl AnimLanes for Paint {
                 for (point, lanes) in mesh
                     .points
                     .iter_mut()
-                    .zip(lanes[..point_lanes].chunks_exact(2))
+                    .zip(lanes[..point_lanes].as_chunks::<2>().0.iter())
                 {
                     point.x = lanes[0];
                     point.y = lanes[1];
@@ -223,7 +225,7 @@ impl AnimLanes for Paint {
                 for (color, lanes) in mesh
                     .colors
                     .iter_mut()
-                    .zip(lanes[point_lanes..].chunks_exact(4))
+                    .zip(lanes[point_lanes..].as_chunks::<4>().0.iter())
                 {
                     color.components = [
                         lanes[0] as f32,

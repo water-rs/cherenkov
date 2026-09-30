@@ -394,10 +394,9 @@ impl Scene {
                 Draw::Image { encoding, .. } => encoding.validate(),
                 Draw::Fill { paint, .. }
                 | Draw::Stroke { paint, .. }
-                | Draw::Glyphs(crate::GlyphRun { paint, .. }) => match paint_encoding(paint) {
-                    Some(encoding) => encoding.validate(),
-                    None => Ok(()),
-                },
+                | Draw::Glyphs(crate::GlyphRun { paint, .. }) => {
+                    paint_encoding(paint).map_or(Ok(()), super::draw::ImageEncoding::validate)
+                }
                 Draw::Shadow { .. } => Ok(()),
             }
         }

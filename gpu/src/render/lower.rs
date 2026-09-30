@@ -1275,7 +1275,10 @@ impl<'a> Lowering<'a> {
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
-        reason = "surface size is a small positive float"
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "surface size is a small positive float; an isolate carries the
+        clip, style and pixel-space state of one scope"
     )]
     // Keep isolation's speculative buffers off the ordinary drawing walk's stack.
     #[inline(never)]
@@ -1810,7 +1813,7 @@ impl<'a> Lowering<'a> {
             .frame
             .open
             .as_ref()
-            .map_or(self.current_space(), |open| open.space);
+            .map_or_else(|| self.current_space(), |open| open.space);
         let cross = src_space != dst_space;
         if cross {
             inst.meta[3] |= FLAG_BLEND_SRC << 24;

@@ -297,6 +297,18 @@ mod tests {
             .map(|item| match item {
                 Item::Draw(_) => 1,
                 Item::Layer(l) => draw_count(l),
+                Item::Group(g) => group_count(g),
+            })
+            .sum()
+    }
+
+    fn group_count(group: &cherenkov_scene::Group) -> usize {
+        group
+            .items
+            .iter()
+            .map(|item| match item {
+                cherenkov_scene::GroupItem::Draw(_) => 1,
+                cherenkov_scene::GroupItem::Group(g) => group_count(g),
             })
             .sum()
     }
@@ -377,7 +389,7 @@ mod tests {
         let mut scene = scene_with(vec![fill(0.0), fill(40.0)]);
         let frames = vec![match &scene.root.items[1] {
             Item::Draw(d) => d.clone(),
-            Item::Layer(_) => unreachable!(),
+            Item::Layer(_) | Item::Group(_) => unreachable!(),
         }];
         scene.root.live.push(Live { item: 1, frames });
         let out = repeated(&scene, 3);

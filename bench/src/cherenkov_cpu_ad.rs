@@ -89,7 +89,7 @@ enum Op {
         /// The group properties.
         group: cherenkov::Group,
         /// The member ops.
-        ops: Vec<Op>,
+        ops: Vec<Self>,
     },
 }
 

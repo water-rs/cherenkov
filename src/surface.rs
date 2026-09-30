@@ -137,8 +137,11 @@ impl<B: Backend> Shared<B> {
                 continue;
             };
             // The sample queues the operands' per-frame values, so
-            // `take_change` emits them like signal updates.
-            animating |= content.sample(time);
+            // `take_change` emits them like signal updates. The cell read
+            // keeps a static content at a field probe, not a call.
+            if content.live.needs_sample.get() && content.sample(time) {
+                animating = true;
+            }
             if let Some(change) = content.take_change() {
                 ops.push(Op::Layer(LayerOp::Content(
                     *id,

@@ -340,8 +340,10 @@ pub struct LiveState {
     /// A running animation per operand slot.
     tracks: RefCell<HashMap<Slot, OperandTrack>>,
     /// Set while queued animates or running tracks make
-    /// [`LiveState::sample`] worth its borrows.
-    needs_sample: Cell<bool>,
+    /// [`LiveState::sample`] worth its borrows. `pub(crate)` so the
+    /// surface drain can probe it as a plain cell read — `sample` is a
+    /// real call on every static content otherwise.
+    pub(crate) needs_sample: Cell<bool>,
     guards: RefCell<Vec<Box<dyn Any>>>,
     waker: RefCell<Weak<crate::engine::Waker>>,
 }
@@ -707,7 +709,7 @@ impl Draw for Recorder {
 /// the render thread is the owned [`ContentChange`].
 pub struct Content {
     picture: Picture,
-    live: Rc<LiveState>,
+    pub(crate) live: Rc<LiveState>,
     sent: bool,
 }
 

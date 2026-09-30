@@ -2057,6 +2057,59 @@ mod wasm_tests {
         }
     }
 
+    /// Dropping the only surface whose installed content draws a released
+    /// resource carries out its pending release, after the surface is
+    /// destroyed (#199).
+    #[wasm_bindgen_test]
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
+    async fn pending_releases_run_when_the_surface_drops() {
+        let (engine, rx) = engine(HashSet::default()).await;
+        let surface = engine
+            .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))
+            .await
+            .expect("surface");
+        let image = engine
+            .image(ImageData::<Rgba8>::new(1, 1, vec![0u8; 4]).expect("image data"))
+            .expect("image");
+        surface.update(|tx| {
+            tx[surface.root()].record(|c| {
+                c.image(
+                    image.id(),
+                    kurbo::Rect::new(0., 0., 8., 8.),
+                    Sampling::Nearest,
+                );
+            });
+        });
+        engine.render(FrameTime::now()).await.expect("render");
+        drop(image);
+        engine.render(FrameTime::now()).await.expect("render");
+        drop(surface);
+        engine.render(FrameTime::now()).await.expect("render");
+        let events: Vec<Event> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let destroyed = events
+            .iter()
+            .position(|e| matches!(e, Event::DestroySurface(_)))
+            .unwrap_or_else(|| panic!("no surface destruction in {events:?}"));
+        let freed = events
+            .iter()
+            .position(|e| matches!(e, Event::RemoveImage(_)))
+            .unwrap_or_else(|| panic!("no image removal in {events:?}"));
+        assert!(
+            destroyed < freed,
+            "the image outlives the surface that drew it: {events:?}"
+        );
+        let (mut commits, mut releases) = balance::transitions(&events);
+        commits.sort();
+        releases.sort();
+        assert_eq!(
+            commits, releases,
+            "unbalanced registration events: {events:?}"
+        );
+    }
+
     /// A released resource that installed content still draws stays
     /// registered: the render that still draws it succeeds (`Null` panics
     /// on a frame drawing a removed resource). The release is carried out

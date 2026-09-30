@@ -809,10 +809,17 @@ impl Content {
 
     pub(crate) fn retire(self) -> ContentSpare {
         let Self { picture, live, .. } = self;
+        // Watchers only exist while the content carried signals; a
+        // signal-free recording never attached the sampling flag, and
+        // its sampling state needs no reset.
+        if !live.guards.borrow().is_empty() {
+            live.detach_animated();
+            live.anim.set(None);
+            live.needs_sample.set(false);
+        }
         live.guards.borrow_mut().clear();
         live.pending.borrow_mut().clear();
         *live.waker.borrow_mut() = Weak::new();
-        live.detach_animated();
         drop(picture);
         ContentSpare {
             picture: None,

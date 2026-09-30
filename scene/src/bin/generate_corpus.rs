@@ -1139,6 +1139,59 @@ fn refraction_member(
     });
 }
 
+// A phone-shaped scene: busy backdrop, one blurred group, a top bar
+// and a bottom bar far enough apart to take two capture regions.
+fn bars_background(l: &mut LayerBuilder, tile: impl Fn(u32) -> Color) {
+    l.fill(
+        Shape::rect(0.0, 0.0, 1024.0, 2216.0),
+        Paint::Linear(LinearGradient {
+            start: Point::new(0.0, 0.0),
+            end: Point::new(1024.0, 2216.0),
+            stops: vec![
+                GradientStop {
+                    offset: 0.0,
+                    color: srgb(0.08, 0.12, 0.35),
+                },
+                GradientStop {
+                    offset: 1.0,
+                    color: srgb(0.60, 0.20, 0.30),
+                },
+            ],
+            extend: Extend::Pad,
+            interpolation: ColorSpace::Srgb,
+        }),
+    );
+    for i in 0..40u32 {
+        let (tx, ty) = (i % 5, i / 5);
+        let x0 = f64::from(tx) * 196.0;
+        let y0 = f64::from(ty) * 258.0;
+        let (x0, y0) = (x0 + 32.0, y0 + 160.0);
+        if i % 3 == 0 {
+            l.fill(Shape::circle(x0 + 64.0, y0 + 64.0, 60.0), solid(tile(i)));
+        } else {
+            l.fill(
+                Shape::RoundedRect(RoundedRect::new(x0, y0, x0 + 128.0, y0 + 128.0, 20.0)),
+                solid(tile(i)),
+            );
+        }
+    }
+}
+
+fn bars(l: &mut LayerBuilder) {
+    l.layer(|m| {
+        m.clip(Shape::RoundedRect(RoundedRect::new(
+            0.0, 16.0, 1024.0, 112.0, 24.0,
+        )));
+        m.backdrop(1);
+    });
+    l.layer(|m| {
+        m.clip(Shape::RoundedRect(RoundedRect::new(
+            0.0, 2088.0, 1024.0, 2216.0, 24.0,
+        )));
+        m.backdrop(1);
+    });
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "a linear sequence of independent scene builders; it reads top to bottom"
@@ -4599,6 +4652,89 @@ fn run() -> Result<(), SceneError> {
                 ],
             });
         });
+    });
+
+    // ---- Sparse capture (#117) ----------------------------------------------
+
+    corpus.scene_setup("backdrop-bars", 1024, 2216, white, |b| {
+        b.backdrop_group(1, vec![BackdropFilter::GaussianBlur { sigma: 8.0 }]);
+        let l = &mut b.root();
+        let palette = [
+            srgb(0.90, 0.25, 0.20),
+            srgb(0.20, 0.70, 0.35),
+            srgb(0.15, 0.40, 0.95),
+            srgb(0.95, 0.70, 0.10),
+            srgb(0.60, 0.15, 0.80),
+        ];
+        bars_background(l, |i| palette[(i as usize) % palette.len()]);
+        bars(l);
+    });
+
+    corpus.scene_setup("backdrop-bars-p3", 1024, 2216, white, |b| {
+        b.backdrop_group(1, vec![BackdropFilter::GaussianBlur { sigma: 8.0 }]);
+        let l = &mut b.root();
+        let palette = [
+            p3(1.0, 0.0, 0.0),
+            p3(0.0, 1.0, 0.0),
+            p3(0.0, 0.9, 0.4),
+            p3(0.9, 0.6, 0.0),
+            p3(0.4, 0.0, 1.0),
+        ];
+        bars_background(l, |i| palette[(i as usize) % palette.len()]);
+        bars(l);
+    });
+
+    // One group, five members: an overlapping pair, a nearly-touching
+    // pair inside the apron (helped by the Refraction member's reach)
+    // and one far corner member. The empty space between the pairs
+    // costs more than the merge overhead, so the group resolves to
+    // three regions: each pair and the corner.
+    corpus.scene_setup("backdrop-sparse-mixed", 512, 512, white, |b| {
+        b.backdrop_group(1, vec![BackdropFilter::GaussianBlur { sigma: 4.0 }]);
+        let l = &mut b.root();
+        l.fill(
+            Shape::rect(0.0, 0.0, 256.0, 512.0),
+            solid(srgb(0.85, 0.30, 0.15)),
+        );
+        l.fill(
+            Shape::rect(256.0, 0.0, 512.0, 512.0),
+            solid(srgb(0.10, 0.35, 0.85)),
+        );
+        l.fill(
+            Shape::circle(128.0, 256.0, 96.0),
+            solid(srgb(0.20, 0.75, 0.40)),
+        );
+        l.fill(
+            Shape::circle(384.0, 384.0, 80.0),
+            solid(srgb(0.90, 0.70, 0.10)),
+        );
+        let member = |l: &mut LayerBuilder, rect: [f64; 4], effect: Option<BackdropEffectSpec>| {
+            l.layer(|m| {
+                m.clip(Shape::RoundedRect(RoundedRect::new(
+                    rect[0], rect[1], rect[2], rect[3], 12.0,
+                )));
+                m.backdrop(1);
+                if let Some(effect) = effect {
+                    m.backdrop_effect(effect);
+                }
+            });
+        };
+        // Overlapping pair.
+        member(l, [24.0, 24.0, 96.0, 96.0], None);
+        member(l, [64.0, 64.0, 136.0, 136.0], None);
+        // Nearly touching (10 px gap inside the σ=4 apron), one with a
+        // Refraction reach that widens its aproned rect.
+        member(l, [280.0, 24.0, 380.0, 124.0], None);
+        member(
+            l,
+            [390.0, 24.0, 490.0, 124.0],
+            Some(BackdropEffectSpec::Refraction {
+                depth: 10.0,
+                strength: 8.0,
+            }),
+        );
+        // Far corner: stays a separate region.
+        member(l, [440.0, 428.0, 508.0, 508.0], None);
     });
 
     // ---- Write out ---------------------------------------------------------

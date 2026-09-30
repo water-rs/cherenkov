@@ -35,9 +35,10 @@ mod dmabuf;
 mod sync;
 mod ycbcr;
 
+pub use dmabuf::create_pool;
 pub use sync::{
-    Generation, Release, State, cancel_staged, drain_releases, mark_submitted, stage_acquire,
-    submit_waits,
+    Generation, Lease, PendingAcquire, PendingWait, Release, State, Views, cancel_staged,
+    drain_releases, mark_submitted, stage_acquire, submit_waits,
 };
 
 /// `QueueFamily` the producer released the image on.
@@ -625,6 +626,7 @@ fn shared_registry() -> &'static Mutex<FxHashMap<usize, Weak<Shared>>> {
 /// the encode path caches — shader module, set-0/set-1 layouts, render
 /// passes, pipelines and framebuffers.
 pub struct Native {
+    /// The per-device context.
     pub shared: Arc<Shared>,
     /// `external_native.spv`, loaded as a raw `VkShaderModule` exposing
     /// `vs_main`, `fs_external` and `fs_external_format`.
@@ -648,9 +650,11 @@ pub struct Native {
     pub set0_key: Option<(u64, u64, u64, u64)>,
     /// Dummy `texture_2d<f32>` sampled view for bindings the active shader
     /// path declares but does not use.
+    /// The 1x1 `R8Unorm` view unused sampled bindings point at.
     pub dummy_f32: vk::ImageView,
     /// The image the dummy view points at.
     pub dummy_image: vk::Image,
+    /// The dummy image's memory.
     pub dummy_memory: vk::DeviceMemory,
     /// Render passes keyed by target format.
     pub render_passes: FxHashMap<vk::Format, vk::RenderPass>,
@@ -681,6 +685,12 @@ impl Native {
     /// The module, layouts and the dummy view are created once; everything
     /// else is lazily keyed caches. On failure any partially created objects
     /// are destroyed before returning.
+    ///
+    /// # Errors
+    /// [`NativeError`] when any Vulkan object fails creation.
+    ///
+    /// # Panics
+    /// When the build-time `external_native.spv` is malformed.
     #[expect(
         clippy::too_many_lines,
         reason = "pipeline layout, dummy objects and render state share one"
@@ -1103,6 +1113,9 @@ pub fn write_set1(
 
 impl Native {
     /// The pipeline layout a generation's draws bind.
+    ///
+    /// # Panics
+    /// When an external-format generation lacks its conversion.
     pub fn pipeline_layout(&mut self, generation: &Generation) -> vk::PipelineLayout {
         match generation.repr {
             Repr::Planes { .. } => self.pipe_uv,
@@ -1275,6 +1288,12 @@ impl Native {
 
     /// The `set0` descriptor set for the engine buffers, rebuilt when any
     /// buffer or the atlas view changes identity.
+    ///
+    /// # Errors
+    /// [`NativeError`] when allocation or the writes fail.
+    ///
+    /// # Panics
+    /// On a poisoned descriptor-pool mutex.
     pub fn set0_set(
         &mut self,
         globals: vk::Buffer,
@@ -1360,9 +1379,15 @@ impl Native {
     /// `set0` is the descriptor set `set0_set` returned for the current
     /// engine buffers.
     ///
+    /// # Errors
+    /// [`NativeError`] when a draw's set or pipeline cannot be produced.
+    ///
     /// # Safety
     /// `cb` must be a recording `VkCommandBuffer` on the shared device, with
     /// no open render pass.
+    ///
+    /// # Panics
+    /// When an external-format generation lacks its conversion.
     #[expect(
         clippy::too_many_arguments,
         clippy::cast_precision_loss,

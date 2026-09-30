@@ -118,9 +118,14 @@ fn support_checked(
 }
 
 /// The descriptor pool a native-bound generation allocates its set-1
-/// descriptors from. For external-format conversions the combined sampler
-/// carries the conversion's descriptor requirements — the pool sizes for
+/// descriptors from.
+///
+/// For external-format conversions the combined sampler carries the
+/// conversion's descriptor requirements — the pool sizes for
 /// `COMBINED_IMAGE_SAMPLER` accordingly.
+///
+/// # Errors
+/// [`NativeError`] when pool creation fails.
 pub fn create_pool(shared: &Shared, combined: bool) -> Result<vk::DescriptorPool, NativeError> {
     let mut sizes = vec![
         vk::DescriptorPoolSize {

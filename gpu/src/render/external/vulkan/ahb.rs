@@ -26,12 +26,12 @@ use super::{
 
 /// Imports `desc`, consuming it, as one frame generation.
 pub fn import(shared: &Arc<Shared>, desc: Ahb) -> Result<Frame, NativeError> {
-    let Some(ahb_ext) = shared.vk.ahb.as_ref() else {
+    if shared.vk.ahb.is_none() {
         return Err(NativeError::Unsupported(
             "VK_ANDROID_external_memory_android_hardware_buffer is not enabled",
         ));
-    };
-    let buffer = desc.buffer as *mut ndk_sys::AHardwareBuffer;
+    }
+    let buffer = desc.buffer.cast::<ndk_sys::AHardwareBuffer>();
     if buffer.is_null() {
         return Err(NativeError::Invalid("null AHardwareBuffer"));
     }
@@ -44,6 +44,7 @@ pub fn import(shared: &Arc<Shared>, desc: Ahb) -> Result<Frame, NativeError> {
     result
 }
 
+#[expect(clippy::too_many_lines)]
 fn import_inner(
     shared: &Arc<Shared>,
     desc: Ahb,
@@ -59,7 +60,7 @@ fn import_inner(
         rfu0: 0,
         rfu1: 0,
     };
-    unsafe { ndk_sys::AHardwareBuffer_describe(buffer, &mut ahb_desc) };
+    unsafe { ndk_sys::AHardwareBuffer_describe(buffer, &raw mut ahb_desc) };
     if ahb_desc.width == 0 || ahb_desc.height == 0 || ahb_desc.layers != 1 {
         return Err(NativeError::Invalid("buffer must be a single-layer frame"));
     }
@@ -73,17 +74,32 @@ fn import_inner(
     let ahb_loader = shared.vk.ahb.as_ref().expect("checked at import");
     unsafe { ahb_loader.get_android_hardware_buffer_properties(buffer as *const _, &mut props) }
         .map_err(NativeError::from)?;
-    if props.memory_type_bits == 0 {
+    // The chained query borrows `format_props` through `props`; lift every
+    // reported field into a local so the image-create chain can borrow
+    // `format_props`-derived values freely below.
+    let allocation_size = props.allocation_size;
+    let memory_type_bits = props.memory_type_bits;
+    let vk_format = format_props.format;
+    let external_id = format_props.external_format;
+    let format_features = format_props.format_features;
+    let required_mapping = format_props.sampler_ycbcr_conversion_components;
+    let suggested = (
+        format_props.suggested_ycbcr_model,
+        format_props.suggested_ycbcr_range,
+        format_props.suggested_x_chroma_offset,
+        format_props.suggested_y_chroma_offset,
+    );
+    if memory_type_bits == 0 {
         return Err(NativeError::Invalid("no compatible memory type"));
     }
 
-    let external = format_props.format == vk::Format::UNDEFINED;
+    let external = vk_format == vk::Format::UNDEFINED;
     if external && !shared.caps.sampler_ycbcr_conversion {
         return Err(NativeError::Unsupported(
             "external-format buffers need sampler_ycbcr_conversion",
         ));
     }
-    if external && format_props.external_format == 0 {
+    if external && external_id == 0 {
         return Err(NativeError::Invalid("external buffer reports no format"));
     }
 
@@ -97,7 +113,6 @@ fn import_inner(
         chroma_location(desc.color.chroma_siting.y),
     );
     if external {
-        let suggested = format_props;
         let expect = |got: u32, want: u32, what: &'static str| {
             if got != 0 && got != want {
                 Err(NativeError::Unsupported(what))
@@ -108,50 +123,46 @@ fn import_inner(
         // `0` (`UNDEFINED`/unspecified) in a suggestion is informational;
         // any concrete value must equal the frame's declared contract.
         expect(
-            suggested.suggested_ycbcr_model.as_raw() as u32,
-            model.as_raw() as u32,
+            suggested.0.as_raw().cast_unsigned(),
+            model.as_raw().cast_unsigned(),
             "driver's YCbCr model is not the frame's declared matrix",
         )?;
         expect(
-            suggested.suggested_ycbcr_range.as_raw() as u32,
-            range.as_raw() as u32,
+            suggested.1.as_raw().cast_unsigned(),
+            range.as_raw().cast_unsigned(),
             "driver's YCbCr range is not the frame's declared range",
         )?;
         expect(
-            suggested.suggested_x_chroma_offset.as_raw() as u32,
-            chroma_x.as_raw() as u32,
+            suggested.2.as_raw().cast_unsigned(),
+            chroma_x.as_raw().cast_unsigned(),
             "driver's chroma siting is not the frame's declared siting",
         )?;
         expect(
-            suggested.suggested_y_chroma_offset.as_raw() as u32,
-            chroma_y.as_raw() as u32,
+            suggested.3.as_raw().cast_unsigned(),
+            chroma_y.as_raw().cast_unsigned(),
             "driver's chroma siting is not the frame's declared siting",
         )?;
         // Cosited siting needs the format feature.
         if (desc.color.chroma_siting.x == crate::interop::ChromaOffset::Cosited
             || desc.color.chroma_siting.y == crate::interop::ChromaOffset::Cosited)
-            && !format_props
-                .format_features
-                .contains(vk::FormatFeatureFlags::COSITED_CHROMA_SAMPLES)
+            && !format_features.contains(vk::FormatFeatureFlags::COSITED_CHROMA_SAMPLES)
         {
             return Err(NativeError::Unsupported(
                 "cosited chroma is not a feature of this buffer's format",
             ));
         }
-        // The conversion's component mapping is the driver's required one.
-        let _required_mapping = format_props.sampler_ycbcr_conversion_components;
     }
 
     let dev = &shared.vk.device;
     let mut ext_format = vk::ExternalFormatANDROID::default();
     if external {
-        ext_format = ext_format.external_format(format_props.external_format);
+        ext_format = ext_format.external_format(external_id);
     }
     let mut external_info = vk::ExternalMemoryImageCreateInfo::default()
         .handle_types(vk::ExternalMemoryHandleTypeFlags::ANDROID_HARDWARE_BUFFER_ANDROID);
     let mut create_info = vk::ImageCreateInfo::default()
         .image_type(vk::ImageType::TYPE_2D)
-        .format(format_props.format)
+        .format(vk_format)
         .extent(vk::Extent3D {
             width: ahb_desc.width,
             height: ahb_desc.height,
@@ -173,10 +184,15 @@ fn import_inner(
         shared,
         image,
         buffer,
-        &desc,
+        desc,
         ahb_desc,
-        props,
-        format_props,
+        AhbReport {
+            allocation_size,
+            memory_type_bits,
+            vk_format,
+            external_id,
+            required_mapping,
+        },
         external,
     );
     match result {
@@ -188,19 +204,29 @@ fn import_inner(
     }
 }
 
+/// The fields `get_android_hardware_buffer_properties` reported,
+/// detached from the chained query structs.
+#[derive(Clone, Copy)]
+struct AhbReport {
+    allocation_size: u64,
+    memory_type_bits: u32,
+    vk_format: vk::Format,
+    external_id: u64,
+    required_mapping: vk::ComponentMapping,
+}
+
 /// Imports the buffer's memory and finishes the generation record.
+#[expect(clippy::too_many_lines)]
 fn bind_and_finish(
     shared: &Arc<Shared>,
     image: vk::Image,
     buffer: *mut ndk_sys::AHardwareBuffer,
-    desc: &Ahb,
+    mut desc: Ahb,
     ahb_desc: ndk_sys::AHardwareBuffer_Desc,
-    props: vk::AndroidHardwareBufferPropertiesANDROID<'_>,
-    format_props: vk::AndroidHardwareBufferFormatPropertiesANDROID<'_>,
+    report: AhbReport,
     external: bool,
 ) -> Result<Frame, NativeError> {
     let dev = &shared.vk.device;
-    let ahb_loader = shared.vk.ahb.as_ref().expect("checked at import");
 
     let mut dedicated = vk::MemoryDedicatedRequirements::default();
     let info = vk::ImageMemoryRequirementsInfo2::default().image(image);
@@ -208,11 +234,14 @@ fn bind_and_finish(
     unsafe { dev.get_image_memory_requirements2(&info, &mut reqs2) };
     let reqs = reqs2.memory_requirements;
 
-    let mut import_ahb = vk::ImportAndroidHardwareBufferInfo::default().buffer(buffer);
+    let mut import_ahb =
+        vk::ImportAndroidHardwareBufferInfoANDROID::default().buffer(buffer.cast());
     let mut dedicated_alloc = vk::MemoryDedicatedAllocateInfo::default().image(image);
     let mut alloc = vk::MemoryAllocateInfo::default()
-        .allocation_size(props.allocation_size)
-        .memory_type_index(props.memory_type_bits.trailing_zeros())
+        .allocation_size(report.allocation_size)
+        // The import must honour both the buffer's and the image's type
+        // mask; an empty intersection cannot satisfy the import.
+        .memory_type_index((report.memory_type_bits & reqs.memory_type_bits).trailing_zeros())
         .push_next(&mut import_ahb);
     // Dedicated-allocation requirements are part of the import contract.
     if dedicated.requires_dedicated_allocation == vk::TRUE
@@ -220,10 +249,7 @@ fn bind_and_finish(
     {
         alloc = alloc.push_next(&mut dedicated_alloc);
     }
-    let memory = match unsafe { dev.allocate_memory(&alloc, None) } {
-        Ok(mem) => mem,
-        Err(err) => return Err(err.into()),
-    };
+    let memory = unsafe { dev.allocate_memory(&alloc, None) }?;
     if let Err(err) = unsafe { dev.bind_image_memory(image, memory, 0) } {
         unsafe { dev.free_memory(memory, None) };
         return Err(err.into());
@@ -235,11 +261,11 @@ fn bind_and_finish(
         // carrying it, and the immutable combined-sampler layout.
         let key = ycbcr::ConvKey {
             format: vk::Format::UNDEFINED,
-            external_format: format_props.external_format,
+            external_format: report.external_id,
             model: required_model(&desc.color),
             range: required_range(&desc.color),
             mapping: {
-                let m = format_props.sampler_ycbcr_conversion_components;
+                let m = report.required_mapping;
                 [m.r, m.g, m.b, m.a]
             },
             chroma_x: chroma_location(desc.color.chroma_siting.x),
@@ -269,7 +295,7 @@ fn bind_and_finish(
         let pool = create_pool(shared, true)?;
         (
             super::Repr::ExternalFormat {
-                id: format_props.external_format,
+                id: report.external_id,
             },
             sync::Views::ExternalFormat { view },
             Some(conv),
@@ -281,7 +307,7 @@ fn bind_and_finish(
         // A known-format buffer: RGBA8/RGBA16F single-plane buffers wrap
         // as wgpu textures; any other known Vulkan format is outside the
         // frame contract.
-        let wgpu_format = vk_format_of(format_props.format);
+        let wgpu_format = vk_format_of(report.vk_format);
         match wgpu_format {
             Some(wgpu_format) => {
                 let texture = unsafe {
@@ -375,7 +401,7 @@ fn bind_and_finish(
             views,
             conv,
             rgb_wrap,
-            bytes: props.allocation_size,
+            bytes: report.allocation_size,
             producer_layout: vk::ImageLayout::UNDEFINED,
             producer_family: QueueFamily::Foreign,
             aspects: vk::ImageAspectFlags::COLOR,
@@ -392,7 +418,7 @@ fn bind_and_finish(
                 image,
                 pool,
                 views: view_handles,
-                conv,
+                conv: None,
                 memory: vec![memory],
                 semaphores: Vec::new(),
                 sync_payload: None,
@@ -411,7 +437,7 @@ fn bind_and_finish(
 
 /// The `wgpu` format for a known-format AHB, when it maps to a single RGB
 /// plane the frame contract accepts.
-fn vk_format_of(format: vk::Format) -> Option<wgpu::TextureFormat> {
+const fn vk_format_of(format: vk::Format) -> Option<wgpu::TextureFormat> {
     Some(match format {
         vk::Format::R8G8B8A8_UNORM => wgpu::TextureFormat::Rgba8Unorm,
         vk::Format::B8G8R8A8_UNORM => wgpu::TextureFormat::Bgra8Unorm,

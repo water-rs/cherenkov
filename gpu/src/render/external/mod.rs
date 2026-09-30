@@ -19,7 +19,9 @@ pub mod vulkan;
 
 /// External frame kinds, mirrored by `external.wgsl`.
 const KIND_RGB: u32 = 0;
+/// Params kind byte: 8-bit two-plane 4:2:0 (NV12 semantics).
 pub const KIND_NV12: u32 = 1;
+/// Params kind byte: 16-bit padded two-plane 4:2:0 (P010 semantics).
 pub const KIND_P010: u32 = 2;
 
 /// `Params::info.w` bit: swap the R and B samples of an RGB plane

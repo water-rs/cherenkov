@@ -43,6 +43,7 @@ pub enum State {
 /// A wait payload resolved to its `VkSemaphore` form, ready for
 /// `add_wait_semaphore` at submit time.
 pub struct PendingWait {
+    /// The semaphore the consuming submission waits on.
     pub semaphore: vk::Semaphore,
     /// `Some(value)` waits a timeline payload; `None` a binary one.
     pub value: Option<u64>,
@@ -52,6 +53,7 @@ pub struct PendingWait {
 
 /// One generation staged for acquisition in the encoder being built.
 pub struct PendingAcquire {
+    /// The generation being acquired.
     pub generation: Arc<Generation>,
     /// The resolved wait, registered on the queue at submit.
     pub wait: Option<PendingWait>,
@@ -61,12 +63,20 @@ pub struct PendingAcquire {
 #[derive(Clone, Copy)]
 pub enum Views {
     /// `fs_external`: integer plane views (`y`, `uv`).
-    Planes { y: vk::ImageView, uv: vk::ImageView },
+    Planes {
+        /// The luma plane's integer view.
+        y: vk::ImageView,
+        /// The interleaved chroma plane's integer view.
+        uv: vk::ImageView,
+    },
     /// `fs_external_format`: the conversion-carrying sampled view.
     /// `Repr::ExternalFormat` — the conversion-attached image view.
     /// Constructed only on Android, read by `write_set1` everywhere.
     #[allow(dead_code)]
-    ExternalFormat { view: vk::ImageView },
+    ExternalFormat {
+        /// The conversion-attached image view.
+        view: vk::ImageView,
+    },
     /// `Repr::Rgb` wraps the plane as a `wgpu::Texture`; nothing native.
     Wrapped,
 }
@@ -112,14 +122,19 @@ impl Drop for Lease {
 /// Everything the release submission and the eventual destroy need,
 /// packaged at the point the last retained owner drops.
 pub struct Release {
+    /// The imported image the release barrier unwinds.
     pub image: vk::Image,
     /// Destroy order: descriptor sets (via the pool), then views, then the
     /// conversion's sampler/conversion/layout, then the image, memory, and
     /// finally the semaphore payloads and producer lease.
     pub pool: Option<vk::DescriptorPool>,
+    /// The image views the generation created.
     pub views: Vec<vk::ImageView>,
+    /// The shared conversion object, when this generation held the last ref.
     pub conv: Option<Arc<ycbcr::Conv>>,
+    /// Imported allocations to free.
     pub memory: Vec<vk::DeviceMemory>,
+    /// Semaphores the engine imported or created for this frame.
     pub semaphores: Vec<vk::Semaphore>,
     /// How the release submission acknowledges the producer.
     pub sync_payload: Option<ReleaseSync>,
@@ -136,9 +151,13 @@ pub struct Release {
     /// Whether the acquisition barrier ran — the release barrier only
     /// unwinds state the acquire established.
     pub acquired: bool,
+    /// The layout the release barrier transitions back to.
     pub producer_layout: vk::ImageLayout,
+    /// The family the release barrier hands ownership to.
     pub producer_family: QueueFamily,
+    /// The aspects the release barrier covers.
     pub aspects: vk::ImageAspectFlags,
+    /// The producer lease, dropped after every object built on it.
     pub lease: Lease,
 }
 
@@ -182,6 +201,7 @@ impl Release {
 
     /// The semaphores the release submission must signal — the release
     /// sync's payload plus, for `FenceFd`, the export semaphore itself.
+    #[must_use]
     pub fn signals(&self) -> Vec<(vk::Semaphore, Option<u64>)> {
         let mut out = Vec::new();
         match &self.sync_payload {
@@ -201,6 +221,9 @@ impl Release {
     /// Destroys the objects in dependency order. Runs once the release
     /// submission has completed, on whichever thread observed completion —
     /// always the render thread in practice, which serializes device calls.
+    ///
+    /// # Panics
+    /// On a poisoned state mutex.
     pub fn destroy(self, shared: &Shared) {
         let dev = &shared.vk.device;
         unsafe {
@@ -244,6 +267,7 @@ impl Release {
 /// One imported frame generation — the shared acquisition record every
 /// layer attachment deduplicates against.
 pub struct Generation {
+    /// The per-device context this generation was imported on.
     pub shared: Arc<Shared>,
     /// Pixel extent of the frame.
     pub size: (u32, u32),
@@ -319,6 +343,9 @@ impl Generation {
                 owned: false,
             },
             Wait::OpaqueFd { fd } => {
+                if self.shared.vk.external_semaphore_fd.is_none() {
+                    return Err(NativeError::Unsupported("OPAQUE_FD semaphore import"));
+                }
                 let semaphore =
                     unsafe { dev.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }
                         .map_err(NativeError::from)?;
@@ -332,7 +359,7 @@ impl Generation {
                         .vk
                         .external_semaphore_fd
                         .as_ref()
-                        .expect("opaque-fd support checked at import")
+                        .expect("checked above")
                         .import_semaphore_fd(&info)
                 };
                 match res {
@@ -352,6 +379,9 @@ impl Generation {
                 }
             }
             Wait::SyncFd { fd } => {
+                if self.shared.vk.external_semaphore_fd.is_none() {
+                    return Err(NativeError::Unsupported("SYNC_FD semaphore import"));
+                }
                 let semaphore =
                     unsafe { dev.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }
                         .map_err(NativeError::from)?;
@@ -365,7 +395,7 @@ impl Generation {
                         .vk
                         .external_semaphore_fd
                         .as_ref()
-                        .expect("sync-fd support checked at import")
+                        .expect("checked above")
                         .import_semaphore_fd(&info)
                 };
                 if let Err(err) = res {
@@ -384,8 +414,15 @@ impl Generation {
 
     /// Records the acquire barrier into `cb` and returns the staged wait.
     ///
+    /// # Errors
+    /// [`NativeError`] when the frame is retiring or its wait payload is
+    /// unexpressible on this device.
+    ///
     /// # Safety
     /// `cb` must be a recording `VkCommandBuffer` on the shared device.
+    ///
+    /// # Panics
+    /// On a poisoned state mutex.
     #[allow(clippy::significant_drop_tightening)]
     pub unsafe fn acquire(
         self: &Arc<Self>,
@@ -499,6 +536,14 @@ impl Generation {
     /// Exports the `FenceFd` release payload. The spec requires the export
     /// to run while the semaphore still has a pending signal, so the call
     /// is valid from the accepted release submission until it executes.
+    ///
+    /// # Errors
+    /// [`NativeError::Unready`] before the release submission is accepted;
+    /// [`NativeError::Unsupported`] when the frame has no fence release or
+    /// the driver cannot export it.
+    ///
+    /// # Panics
+    /// On a poisoned semaphore mutex.
     #[allow(clippy::significant_drop_tightening)]
     pub fn release_fd(&self) -> Result<OwnedFd, NativeError> {
         if !self
@@ -532,8 +577,14 @@ impl Generation {
 /// Stages `generation`'s acquisition into the encoder: records the barrier and
 /// returns the pending-wait entry to stage.
 ///
+/// # Errors
+/// [`NativeError`] propagated from [`Generation::acquire`].
+///
 /// # Safety
 /// `cb` must be a recording `VkCommandBuffer` on the shared device.
+///
+/// # Panics
+/// On a poisoned state mutex.
 pub unsafe fn stage_acquire(
     generation: &Arc<Generation>,
     cb: vk::CommandBuffer,
@@ -575,6 +626,9 @@ pub fn submit_waits(native: &Native, queue: &wgpu::hal::vulkan::Queue) {
 /// Finalises staged generations after the consuming submission is
 /// accepted: binary waits are consumed once for the generation; timeline
 /// waits may legally repeat but are unnecessary on the ordered queue.
+///
+/// # Panics
+/// On a poisoned state or parts mutex.
 pub fn mark_submitted(native: &mut Native) {
     for pending in native.staged.drain(..) {
         if let Some(wait) = pending.wait
@@ -604,6 +658,9 @@ pub fn mark_submitted(native: &mut Native) {
 
 /// Cancels an unsubmitted plan: frames go back to unacquired and staged
 /// queue waits are dropped — nothing was registered on the queue yet.
+///
+/// # Panics
+/// On a poisoned state or wait mutex.
 pub fn cancel_staged(native: &mut Native) {
     for pending in native.staged.drain(..) {
         let mut state = pending.generation.state.lock().expect("generation state");
@@ -623,10 +680,15 @@ pub fn cancel_staged(native: &mut Native) {
     }
 }
 
-/// Drains the retire queue into release submissions. Called before each
-/// submission so an idle engine still processes a pending retirement the
-/// next time anything is submitted; the renderer calls it from
-/// `flush_releases` with a fresh encoder.
+/// Drains the retire queue into release submissions.
+///
+/// Called before each submission so an idle engine still processes a
+/// pending retirement the next time anything is submitted; the renderer
+/// calls it from `flush_releases` with a fresh encoder.
+///
+/// # Panics
+/// On a poisoned release-queue mutex.
+#[must_use]
 pub fn drain_releases(native: &Native) -> Vec<Release> {
     native
         .shared

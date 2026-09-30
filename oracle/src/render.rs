@@ -387,7 +387,10 @@ impl Renderer {
     /// the parent's. Clip-only levels are not semantic isolations — a
     /// backdrop capture looks through them to the nearest `opacity < 1` or
     /// `blend != Normal` level (see `flattened`).
-    #[allow(clippy::many_single_char_names)] // w/h/dst/s/b/c name geometry and pixel values
+    #[expect(
+        clippy::many_single_char_names,
+        reason = "w/h/dst/s/b/c name geometry and pixel values"
+    )]
     fn render_child_layer(
         &self,
         child: &Layer,
@@ -517,7 +520,6 @@ impl Renderer {
     /// below with `opacity` and `blend`. A fully transparent group
     /// (`opacity` 1, `Normal`, `Linear`) shares the enclosing level's
     /// space and passes through.
-    #[allow(clippy::many_single_char_names)] // dst/s name pixel values
     fn render_group(
         &self,
         group: &cherenkov_scene::Group,

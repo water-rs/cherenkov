@@ -70,22 +70,31 @@ slots it touches into `Lowering.touches` (glyph and mask admissions,
 consecutive-shelf deduped). A replayed path emission records no touch
 at all: its band set is already the atlas's — `emit.slots`, a range in
 the `emit_slots` arena — so the leaf stores `refs = ARENA_REFS |
-(start << 32 | len)` plus the `live` key the lookup hit, and nothing
-else. The emission's liveness is the key's survival: evicting a shelf
-drops every key on it, so `live` still containing the key means every
-band the replay drew is intact — a stale check is one hash lookup, no
-pairs to write or walk. Other emissions keep the touches path: each
-realized `Emission` carries the `LIVE_PENDING` stamp while its `refs`
-still addresses `touches` instead of `storage.refs`. The commit's
-`apply_pending` folds the touch slots — decoding flagged entries to
-their arena ranges — plus the bands its raster actually landed in
-(`PendingOrigin::Cells`) into `(slot, epoch)` pairs at the storage
-tail, no set in between, swaps `refs` to them, and stamps the emission.
-`ARENA_REFS` emissions resolve identically — they stamp when their
-live key survives the commit — with nothing to write. An emission
-whose resolving commit was abandoned (`Grow` or `AtlasExhausted`)
-keeps `LIVE_PENDING` and never verifies live, so the next hit check
-re-lowers it.
+(start << 32 | len)` and nothing else, with the `live` key the lookup
+hit riding in `live_stamp` (the field is dual-purpose: a stamp for
+pair-referenced emissions, the key for arena-referenced ones — a key
+colliding with a stamp value is the accepted 2^-64 hash-collision
+class of the `live` map's own keys). The emission's liveness is the
+key's survival: evicting a shelf drops every key on it, so `live`
+still containing the key means every band the replay drew is intact —
+a stale check is one hash lookup, no pairs to write or walk. Other
+emissions resolve eagerly: the atlas is immutable for the whole
+lowering, so the leaf folds its touched slots into `(slot, epoch)`
+pairs at realize time and `refs` is a real pair range from birth —
+`live_stamp` is a real watermark too, so a not-yet-applied emission
+can hit while its commit is in flight (a leaf re-checked after a
+shared emission landed finds it already stamped). At apply,
+`apply_pending` moves those pairs and each placed cell's band pairs
+to the storage tail as one contiguous extent. `ARENA_REFS` emissions
+verify identically — when their live key survives the commit they
+keep the key in place of a stamp — with nothing to write.
+
+`pending_cells` stays the one frame-scoped field: its pending-raster
+indexes are only meaningful for the commit that applies them. Every
+path that skips apply — a `Grow` early return, an apply abandoned on
+`AtlasExhausted`, or a lowering that returned `Err` — discards that
+surface's retained emissions (`discard_surface`), so stale pending
+cells can never compose into a later frame.
 
 Mask cells take part in the same touches → refs path, so they are
 covered by the epoch check too.
@@ -103,6 +112,11 @@ is never handed out until the next commit begins.
 because a batch that cannot fit even after evicting everything cold is
 a real failure the caller must see, not a silent re-lower. `Grow`
 still doubles the atlas once per renderer (generation bumps there, as
-on dev). Under a continuous pan the steady state is self-cleaning: the
-frame's misses are the coldest shelves, so the next commit reclaims
-exactly the band the previous frame's churn left behind.
+on dev). `scenes/perf/map-pan` pans a linear two device pixels per
+frame: the integer step keeps every path's `Placement` key stable, so
+a retained `PathEmit` is re-found through `Atlas::path` and replayed
+instead of re-rasterized — the case the issue names. Under a pan whose
+step is not integer the subpixel fraction changes each frame, keys do
+not recur, and the steady state is instead self-cleaning: the frame's
+misses are the coldest shelves, so the next commit reclaims exactly the
+band the previous frame's churn left behind.

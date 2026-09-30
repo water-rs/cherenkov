@@ -506,10 +506,6 @@ impl EmissionStorage {
             if e.is_arena_refs() {
                 // `refs` already addresses the shared `emit_slots`
                 // arena — nothing to move (#119).
-            } else if e.live_stamp == LIVE_PENDING {
-                // `refs` still addresses the frame's `touches`: keep
-                // the emission pending and drop the range (#119).
-                e.refs = 0;
             } else {
                 let first = storage.refs.len();
                 storage.refs.extend_from_slice(&self.refs[e.refs_range()]);
@@ -601,30 +597,22 @@ pub const TOUCH_RANGE: u32 = 1 << 31;
 /// key, since evicting a shelf drops every key on it (#119).
 pub const ARENA_REFS: u64 = 1 << 63;
 
-/// `Emission::live_stamp` while its `refs` still indexes
-/// `Lowering::touches` instead of `EmissionStorage::refs` — the commit
-/// that resolves it stamps the emission; a commit abandoned partway
-/// (grow or exhaust) leaves it, so the next hit check re-lowers (#119).
-pub const LIVE_PENDING: u64 = u64::MAX;
-
 /// Per-operation device output under its sampled placement.
 pub struct Emission {
     pub(crate) pending_cells: Vec<(u32, u32, u32)>,
     /// Resolved: `(start << 32 | len)` range into `EmissionStorage::refs`
     /// holding the `(shelf slot, band epoch)` of every atlas band the
     /// retained instances sample. With `ARENA_REFS` set it addresses
-    /// `Atlas::emit_slots` instead; while `live_stamp == LIVE_PENDING`
-    /// and the flag is clear it addresses the frame's `Lowering::touches`
-    /// slots, which the commit swaps for resolved pairs (#119).
+    /// `Atlas::emit_slots` instead (#119).
     pub(crate) refs: u64,
     /// Atlas texture generation and eviction clock at last verification
-    /// — one compare on the hit fast path; `LIVE_PENDING` while the
-    /// commit that resolves `refs` has not landed. With `ARENA_REFS`
-    /// set this instead holds the `live` key the replayed emission was
-    /// found under: its survival is the whole band set's liveness,
-    /// since evicting a shelf drops every key on it. A key colliding
-    /// with a stamp value is the accepted 2^-64 hash-collision class
-    /// of the `live` map's own keys (#119).
+    /// — one compare on the hit fast path, written at realize time so a
+    /// not-yet-applied emission can hit while its commit is in flight.
+    /// With `ARENA_REFS` set this instead holds the `live` key the
+    /// replayed emission was found under: its survival is the whole
+    /// band set's liveness, since evicting a shelf drops every key on
+    /// it. A key colliding with a stamp value is the accepted 2^-64
+    /// hash-collision class of the `live` map's own keys (#119).
     pub(crate) live_stamp: u64,
     template: usize,
     // Only shadows carry an occlusion key; ordinary leaves keep a small index.
@@ -650,9 +638,6 @@ impl Emission {
             // `live_stamp` is the key — never restamp it.
             return atlas.live_alive(self.live_stamp);
         }
-        if self.live_stamp == LIVE_PENDING {
-            return false;
-        }
         if refs
             .iter()
             .all(|&(slot, epoch)| atlas.shelf_epoch(slot) == epoch)
@@ -664,14 +649,17 @@ impl Emission {
     }
 
     /// Cold arm of the leaf hit check: the stored stamp differs, so
-    /// the emission is either still pending or evictions may have
-    /// reclaimed a referenced band. Kept out of line so the hit path
-    /// never pays for resolving `refs`.
+    /// evictions may have reclaimed a referenced band. Kept out of
+    /// line so the hit path never pays for resolving `refs`.
     #[cold]
     #[inline(never)]
     fn stale_live(&mut self, atlas: &Atlas, storage: &EmissionStorage) -> bool {
-        (self.is_arena_refs() || self.live_stamp != LIVE_PENDING)
-            && self.atlas_live(atlas, &storage.refs[self.refs_range()])
+        if self.is_arena_refs() {
+            // `refs` addresses `emit_slots`, not `storage.refs`; the
+            // live key in `live_stamp` is the whole liveness test.
+            return atlas.live_alive(self.live_stamp);
+        }
+        self.atlas_live(atlas, &storage.refs[self.refs_range()])
     }
 
     /// `start << 32 | len` packing for `refs`; `start` stays under
@@ -2549,22 +2537,40 @@ impl<'a> Lowering<'a> {
                 .map(|&(i, p, c)| (i - instance_base, p, c))
                 .collect()
         };
+        let ref_first = storage.refs.len();
+        if self.hit_refs == 0 {
+            // `(slot, band epoch)` pairs resolve eagerly: the atlas is
+            // immutable for the whole lowering, so the sampled epochs
+            // are final until this commit's evictions — `refs` is a
+            // real pair range from birth and a not-yet-applied
+            // emission can hit while its commit is in flight (#119).
+            for &t in &self.touches[first_touch..] {
+                if t & TOUCH_RANGE != 0 {
+                    let start = ((t & !TOUCH_RANGE) >> 10) as usize;
+                    let len = (t & 1023) as usize;
+                    storage.refs.extend(
+                        glyphs
+                            .atlas
+                            .emit_slot_arena(start..start + len)
+                            .iter()
+                            .map(|&slot| (slot, glyphs.atlas.shelf_epoch(slot))),
+                    );
+                } else {
+                    storage.refs.push((t, glyphs.atlas.shelf_epoch(t)));
+                }
+            }
+        }
         cache.data = Some(Emission {
             pending_cells,
-            // Unresolved until the commit lands: `refs` addresses
-            // `touches` slots until `apply_pending` swaps in the
-            // `(slot, band epoch)` pairs — unless a path-emission hit
-            // recorded its atlas `emit_slots` range, which needs no
-            // resolution (#119).
             refs: if self.hit_refs != 0 {
                 self.hit_refs
             } else {
-                Emission::pack_refs(first_touch, self.touches.len() - first_touch)
+                Emission::pack_refs(ref_first, storage.refs.len() - ref_first)
             },
             live_stamp: if self.hit_refs != 0 {
                 self.hit_key
             } else {
-                LIVE_PENDING
+                glyphs.live_stamp
             },
             template,
             cover: cover.map(|cover| {

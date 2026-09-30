@@ -3453,47 +3453,23 @@ impl GpuRenderer {
         } else {
             let mut touches = std::mem::take(&mut self.commit_touches);
             touches.clear();
-            for lowered in results.iter().filter_map(|r| r.as_ref().ok()) {
-                for &t in &lowered.touches {
-                    if t & lower::TOUCH_RANGE != 0 {
-                        let start = ((t & !lower::TOUCH_RANGE) >> 10) as usize;
-                        let len = (t & 1023) as usize;
-                        touches.extend_from_slice(self.atlas.emit_slot_arena(start..start + len));
-                    } else {
-                        touches.push(t);
-                    }
-                }
-            }
-            // An emission whose stamp matches the atlas verified live
-            // this frame — either on the fast path or by re-walking its
-            // refs — so its bands are the replay pins the commit must
-            // not evict. `ARENA_REFS` emissions address the atlas's
-            // `emit_slots` directly; the rest resolve through their
-            // `(slot, epoch)` pairs (#119).
-            let stamp = self.atlas.live_stamp();
-            for surf in pending.iter_mut() {
-                for content in surf.layers.values_mut() {
-                    let (_, emissions) = content.retained.prepared();
-                    for e in emissions.iter().filter_map(|e| e.data.as_ref()) {
-                        if e.is_arena_refs() {
-                            touches.extend_from_slice(self.atlas.emit_slot_arena(e.refs_range()));
-                        } else if e.live_stamp == stamp {
-                            touches.extend(
-                                content.storage.refs[e.refs_range()]
-                                    .iter()
-                                    .map(|&(slot, _)| slot),
-                            );
-                        }
-                    }
-                }
-            }
-            touches_len = touches.len();
+            touches_len = self.replay_pins(pending, results, &mut touches);
             self.atlas.begin_commit(&touches);
             touches.clear();
             self.commit_touches = touches;
             match self.atlas.plan(&rasters) {
                 glyph::AtlasPlan::Fits | glyph::AtlasPlan::FitsEviction => "fits-eviction",
-                glyph::AtlasPlan::Grow(size) if !grew => return Commit::Grow(size),
+                glyph::AtlasPlan::Grow(size) if !grew => {
+                    // The grow discards the atlas and re-lowers, so
+                    // every retained emission is dead anyway — but the
+                    // pending cells recorded this round index a raster
+                    // list that never applied, and must not survive
+                    // into the retry's hits (#119).
+                    for surf in pending.iter_mut() {
+                        Self::discard_surface(surf);
+                    }
+                    return Commit::Grow(size);
+                }
                 glyph::AtlasPlan::Grow(_) | glyph::AtlasPlan::Recycle => {
                     // Bounded in-place eviction makes room instead of a
                     // wholesale clear: the commit below reclaims shelves
@@ -3509,21 +3485,34 @@ impl GpuRenderer {
         }
         let mut writes = std::mem::take(&mut self.commit_writes);
         writes.clear();
-        for (surf, result) in pending.iter_mut().zip(results.iter_mut()) {
-            let Ok(lowered) = result else {
-                continue;
-            };
-            match self.apply_pending(surf, lowered, &mut writes) {
-                Ok(()) => {}
-                Err(RenderError::AtlasFull) => {
-                    *result = Err(RenderError::AtlasExhausted);
-                    break;
-                }
-                Err(e) => {
-                    *result = Err(e);
-                    break;
-                }
+        let mut failed = None;
+        for (i, (surf, result)) in pending.iter_mut().zip(results.iter_mut()).enumerate() {
+            match result {
+                // A failed lowering leaves whatever retained mutations
+                // its leaves already made — pending cells indexing a
+                // raster list that never applies. Those emissions must
+                // not survive to hit next frame (#119).
+                Err(_) => Self::discard_surface(surf),
+                Ok(lowered) => match self.apply_pending(surf, lowered, &mut writes) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        *result = Err(match e {
+                            RenderError::AtlasFull => RenderError::AtlasExhausted,
+                            other => other,
+                        });
+                        failed = Some(i);
+                        break;
+                    }
+                },
             }
+        }
+        // An apply that stopped midway leaves the pending cells of
+        // every unapplied surface pointing at rasters that never
+        // landed — drop their retained emissions wholesale so the
+        // next frame re-lowers rather than composes unplaced cells
+        // (#119).
+        if let Some(i) = failed {
+            Self::discard_unapplied(&mut pending[i..], &mut results[i..]);
         }
         let evicted = self.atlas.take_evicted();
         tracing::debug!(
@@ -3551,6 +3540,76 @@ impl GpuRenderer {
             .upload_committed(&self.device, &self.queue, &writes);
         self.commit_writes = writes;
         Commit::Done
+    }
+
+    /// The shelf slots the commit must pin: the `Lowering::touches`
+    /// this batch recorded — `TOUCH_RANGE` entries decode through the
+    /// `emit_slots` arena — plus the bands of every retained emission
+    /// verified live this frame. `ARENA_REFS` emissions address
+    /// `emit_slots` directly; the rest resolve through their
+    /// `(slot, epoch)` pairs (#119).
+    fn replay_pins(
+        &self,
+        pending: &mut [SurfaceState],
+        results: &[Result<Lowered, RenderError>],
+        touches: &mut Vec<u32>,
+    ) -> usize {
+        for lowered in results.iter().filter_map(|r| r.as_ref().ok()) {
+            for &t in &lowered.touches {
+                if t & lower::TOUCH_RANGE != 0 {
+                    let start = ((t & !lower::TOUCH_RANGE) >> 10) as usize;
+                    let len = (t & 1023) as usize;
+                    touches.extend_from_slice(self.atlas.emit_slot_arena(start..start + len));
+                } else {
+                    touches.push(t);
+                }
+            }
+        }
+        // An emission whose stamp matches the atlas verified live this
+        // frame — either on the fast path or by re-walking its refs —
+        // so its bands are the replay pins the commit must not evict.
+        let stamp = self.atlas.live_stamp();
+        for surf in pending.iter_mut() {
+            for content in surf.layers.values_mut() {
+                let (_, emissions) = content.retained.prepared();
+                for e in emissions.iter().filter_map(|e| e.data.as_ref()) {
+                    if e.is_arena_refs() {
+                        touches.extend_from_slice(self.atlas.emit_slot_arena(e.refs_range()));
+                    } else if e.live_stamp == stamp {
+                        touches.extend(
+                            content.storage.refs[e.refs_range()]
+                                .iter()
+                                .map(|&(slot, _)| slot),
+                        );
+                    }
+                }
+            }
+        }
+        touches.len()
+    }
+
+    /// Drops one surface's retained emissions: unapplied pending cells
+    /// index a raster list that never landed, so nothing they recorded
+    /// may hit next frame (#119).
+    fn discard_surface(surf: &mut SurfaceState) {
+        for content in surf.layers.values_mut() {
+            content.invalidate();
+        }
+    }
+
+    /// [`Self::discard_surface`] for every surface at `from` onward and
+    /// marks the still-`Ok` results [`RenderError::AtlasExhausted`]
+    /// (#119).
+    fn discard_unapplied(
+        pending: &mut [SurfaceState],
+        results: &mut [Result<Lowered, RenderError>],
+    ) {
+        for (surf, result) in pending.iter_mut().zip(results.iter_mut()) {
+            Self::discard_surface(surf);
+            if result.is_ok() {
+                *result = Err(RenderError::AtlasExhausted);
+            }
+        }
     }
 
     #[expect(
@@ -3590,40 +3649,35 @@ impl GpuRenderer {
                 // harmless (epoch checks are idempotent and pin marks
                 // dedupe themselves), so the fold writes directly — no
                 // per-emission set allocation (#119).
-                let pending = emission.live_stamp == lower::LIVE_PENDING;
-                let first = content.storage.refs.len();
-                for (inst, p, c) in emission.pending_cells.drain(..) {
-                    content.storage.instances[emission.instances.start + inst as usize].uv[..2]
-                        .copy_from_slice(&cell_origin(p, c));
-                    if pending && let PendingOrigin::Cells(_, bands) = &origins[p as usize] {
-                        content.storage.refs.extend(
-                            bands
-                                .iter()
-                                .map(|&slot| (slot, self.atlas.shelf_epoch(slot))),
-                        );
+                // An emission carrying cell patches joins its placed
+                // cells' bands to its eagerly-written pairs as one
+                // contiguous extent: the existing pairs move to the
+                // storage tail and each cell's band pairs append
+                // (#119).
+                if !emission.pending_cells.is_empty() {
+                    let resolve = !emission.is_arena_refs();
+                    let first = content.storage.refs.len();
+                    if resolve {
+                        content
+                            .storage
+                            .refs
+                            .extend_from_within(emission.refs_range());
                     }
-                }
-                if pending && !emission.is_arena_refs() {
-                    // `refs` still addresses the frame's touches: fold
-                    // those slots in, then swap the range for resolved
-                    // `(slot, band epoch)` pairs — always, even empty,
-                    // or it keeps addressing `touches` (#119).
-                    for &t in &lowered.touches[emission.refs_range()] {
-                        if t & lower::TOUCH_RANGE != 0 {
-                            let start = ((t & !lower::TOUCH_RANGE) >> 10) as usize;
-                            let len = (t & 1023) as usize;
+                    for (inst, p, c) in emission.pending_cells.drain(..) {
+                        content.storage.instances[emission.instances.start + inst as usize].uv[..2]
+                            .copy_from_slice(&cell_origin(p, c));
+                        if resolve && let PendingOrigin::Cells(_, bands) = &origins[p as usize] {
                             content.storage.refs.extend(
-                                self.atlas
-                                    .emit_slot_arena(start..start + len)
+                                bands
                                     .iter()
                                     .map(|&slot| (slot, self.atlas.shelf_epoch(slot))),
                             );
-                        } else {
-                            content.storage.refs.push((t, self.atlas.shelf_epoch(t)));
                         }
                     }
-                    emission.refs =
-                        lower::Emission::pack_refs(first, content.storage.refs.len() - first);
+                    if resolve {
+                        emission.refs =
+                            lower::Emission::pack_refs(first, content.storage.refs.len() - first);
+                    }
                 }
                 // Restamp only when every reference survived this
                 // commit's evictions; a stale emission must keep an

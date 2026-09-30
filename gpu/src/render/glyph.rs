@@ -1018,6 +1018,8 @@ impl Atlas {
     ) -> Option<(u32, u32)> {
         if let Some(entry) = self.get(&key) {
             let (x, y, slot) = (u32::from(entry.x), u32::from(entry.y), entry.slot);
+            // A pending raster can hit a cold entry the lowering never
+            // pinned — keep it out of this commit's eviction set (#119).
             self.touch(slot);
             return Some((x, y));
         }
@@ -1072,6 +1074,8 @@ impl Atlas {
         writes: &mut Vec<CellWrite>,
     ) -> Option<()> {
         if let Some(emit) = self.paths.get(&key) {
+            // Same: the hit's bands may be cold — pin them or a later
+            // eviction this commit reclaims them (#119).
             let slots: Vec<u32> = emit.cells.iter().map(|c| c.slot).collect();
             for slot in slots {
                 self.touch(slot);
@@ -1150,6 +1154,7 @@ impl Atlas {
         writes: &mut Vec<CellWrite>,
     ) -> Option<()> {
         if let Some(mask) = self.masks.get(&key) {
+            // Same: pin the slot so this commit cannot evict it (#119).
             let slot = mask.slot;
             self.touch(slot);
             return Some(());

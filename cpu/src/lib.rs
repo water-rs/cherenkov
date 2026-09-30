@@ -252,7 +252,14 @@ impl Backend for Raster {
     }
 
     #[cfg(target_arch = "wasm32")]
-    async fn init(config: RasterConfig) -> Result<(Self::Renderer, Self::Info), EngineError> {
-        render::init(config)
+    fn init(
+        config: RasterConfig,
+    ) -> impl core::future::Future<Output = Result<(Self::Renderer, Self::Info), EngineError>> {
+        let mut config = Some(config);
+        core::future::poll_fn(move |_| {
+            core::task::Poll::Ready(render::init(
+                config.take().expect("init future is only polled once"),
+            ))
+        })
     }
 }

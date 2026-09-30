@@ -402,12 +402,12 @@ impl Renderer for RasterRenderer {
     }
 
     #[cfg(target_arch = "wasm32")]
-    async fn render(
+    fn render(
         &mut self,
         frame: &Frame<'_>,
         stats: &mut FrameStats,
-    ) -> Result<Redraw, RenderError> {
-        self.render_frame(frame, stats)
+    ) -> impl core::future::Future<Output = Result<Redraw, RenderError>> {
+        core::future::ready(self.render_frame(frame, stats))
     }
 
     /// Materializes a surface's output buffer into `Readback` pixels.
@@ -435,24 +435,27 @@ impl Renderer for RasterRenderer {
     }
 
     #[cfg(target_arch = "wasm32")]
-    async fn readback(&mut self, surface: SurfaceId) -> Result<Readback, RenderError> {
+    fn readback(
+        &mut self,
+        surface: SurfaceId,
+    ) -> impl core::future::Future<Output = Result<Readback, RenderError>> {
         let Some(state) = self.surfaces.get(&surface) else {
-            return Err(RenderError::Readback("unknown surface".into()));
+            return core::future::ready(Err(RenderError::Readback("unknown surface".into())));
         };
         let pixels = match &state.output {
             Output::F32(fb) => fb.clone(),
             Output::F16(fb) => fb.iter().map(|px| px.map(half::f16::to_f32)).collect(),
             Output::Stream { .. } => {
-                return Err(RenderError::Readback(
+                return core::future::ready(Err(RenderError::Readback(
                     "band-streaming surfaces are not readable".into(),
-                ));
+                )));
             }
         };
-        Ok(Readback {
+        core::future::ready(Ok(Readback {
             width: state.size.0,
             height: state.size.1,
             pixels,
-        })
+        }))
     }
 
     /// Memory usage across output targets, band working buffers, retained

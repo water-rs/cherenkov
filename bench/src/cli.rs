@@ -69,15 +69,6 @@ pub(crate) enum PresentPattern {
     Mixed,
 }
 
-/// `present-cost --encode` choices; see [`crate::present_cost`].
-#[derive(Clone, Copy, Debug, clap::ValueEnum)]
-pub(crate) enum PresentEncode {
-    /// `Rgba8UnormSrgb` destination; hardware applies the transfer.
-    SrgbHw,
-    /// `Rgba8Unorm` destination; the shader applies the transfer.
-    SrgbShader,
-}
-
 #[derive(Subcommand)]
 enum Sub {
     /// Render scene(s) and report correctness metrics vs the oracle.
@@ -239,10 +230,11 @@ enum Sub {
         native: Option<String>,
     },
     /// Time the presentation pass alone — one `Presenter::texture_timed`
-    /// call per frame into an offscreen sRGB texture, bracketed by
-    /// pass-boundary GPU timestamps (#96). Requires the `cherenkov`
-    /// feature. On the M1 and iPad this is the gamut-map cost evidence;
-    /// on a shared VM it is a sanity check only.
+    /// call per frame into an offscreen texture of the `--present`
+    /// kind's format, bracketed by pass-boundary GPU timestamps (#96).
+    /// Requires the `cherenkov` feature. On the M1 and iPad this is the
+    /// gamut-map and encode cost evidence; on a shared VM it is a
+    /// sanity check only.
     PresentCost {
         /// Destination size, `WxH` — the iPad-class 2752x2064 by default.
         #[arg(long, default_value = "2752x2064", value_name = "WxH")]
@@ -257,9 +249,10 @@ enum Sub {
         /// in-gamut.
         #[arg(long, value_enum, default_value = "oog")]
         pattern: PresentPattern,
-        /// Encode path timed: hardware sRGB transfer or the shader one.
-        #[arg(long, value_enum, default_value = "srgb-hw")]
-        encode: PresentEncode,
+        /// Presentation output kind timed — the same kinds as
+        /// `render --present` (#98 added the wide-gamut and HDR kinds).
+        #[arg(long, value_enum, default_value = "srgb-hw", alias = "encode")]
+        present: crate::PresentKind,
         /// Display headroom presented to (#97). Above 1 exercises the
         /// tone-map shoulder on the `oog` pattern's HDR channels.
         #[arg(long, default_value_t = 4.0)]
@@ -469,7 +462,7 @@ fn run(cli: Cli) -> Result<(), BenchError> {
             frames,
             warmup,
             pattern,
-            encode,
+            present,
             headroom,
             out,
         } => present_cost_cmd(
@@ -477,7 +470,7 @@ fn run(cli: Cli) -> Result<(), BenchError> {
             frames,
             warmup,
             pattern,
-            encode,
+            present,
             headroom,
             &out,
         ),
@@ -493,12 +486,12 @@ fn present_cost_cmd(
     frames: u32,
     warmup: u32,
     pattern: PresentPattern,
-    encode: PresentEncode,
+    present: crate::PresentKind,
     headroom: f32,
     out: &Path,
 ) -> Result<(), BenchError> {
     let size = parse_native(Some(size))?.expect("size is required");
-    crate::present_cost::run(size, frames, warmup, pattern, encode, headroom, out)
+    crate::present_cost::run(size, frames, warmup, pattern, present, headroom, out)
 }
 
 #[cfg(not(feature = "cherenkov"))]
@@ -507,7 +500,7 @@ fn present_cost_cmd(
     _frames: u32,
     _warmup: u32,
     _pattern: PresentPattern,
-    _encode: PresentEncode,
+    _present: crate::PresentKind,
     _headroom: f32,
     _out: &Path,
 ) -> Result<(), BenchError> {

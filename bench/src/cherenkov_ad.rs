@@ -547,7 +547,7 @@ struct Present {
 }
 
 /// The destination texture format of a `--present` kind.
-const fn present_format(kind: PresentKind) -> wgpu::TextureFormat {
+pub(crate) const fn present_format(kind: PresentKind) -> wgpu::TextureFormat {
     match kind {
         PresentKind::SrgbHw | PresentKind::DisplayP3Hw => wgpu::TextureFormat::Rgba8UnormSrgb,
         PresentKind::SrgbShader | PresentKind::DisplayP3Shader => wgpu::TextureFormat::Rgba8Unorm,
@@ -573,6 +573,20 @@ const fn present_texel_size(kind: PresentKind) -> u32 {
         | PresentKind::ExtendedP3
         | PresentKind::Pq
         | PresentKind::Hlg => 8,
+    }
+}
+
+/// The [`TextureOutput::color`] of a `--present` kind.
+pub(crate) const fn present_color(kind: PresentKind) -> OutputColor {
+    match kind {
+        PresentKind::SrgbHw | PresentKind::SrgbShader => OutputColor::Srgb,
+        PresentKind::LinearP3 => OutputColor::LinearDisplayP3,
+        PresentKind::DisplayP3Hw | PresentKind::DisplayP3Shader => OutputColor::DisplayP3,
+        PresentKind::Scrgb => OutputColor::ExtendedSrgbLinear,
+        PresentKind::ExtendedSrgb => OutputColor::ExtendedSrgb,
+        PresentKind::ExtendedP3 => OutputColor::ExtendedDisplayP3,
+        PresentKind::Pq => OutputColor::Bt2100Pq,
+        PresentKind::Hlg => OutputColor::Bt2100Hlg,
     }
 }
 
@@ -761,18 +775,7 @@ impl Present {
             &source.create_view(&wgpu::TextureViewDescriptor::default()),
             TextureOutput {
                 texture: destination,
-                color: match self.kind {
-                    PresentKind::SrgbHw | PresentKind::SrgbShader => OutputColor::Srgb,
-                    PresentKind::LinearP3 => OutputColor::LinearDisplayP3,
-                    PresentKind::DisplayP3Hw | PresentKind::DisplayP3Shader => {
-                        OutputColor::DisplayP3
-                    }
-                    PresentKind::Scrgb => OutputColor::ExtendedSrgbLinear,
-                    PresentKind::ExtendedSrgb => OutputColor::ExtendedSrgb,
-                    PresentKind::ExtendedP3 => OutputColor::ExtendedDisplayP3,
-                    PresentKind::Pq => OutputColor::Bt2100Pq,
-                    PresentKind::Hlg => OutputColor::Bt2100Hlg,
-                },
+                color: present_color(self.kind),
                 alpha: OutputAlpha::Premultiplied,
                 headroom: self.headroom,
             },

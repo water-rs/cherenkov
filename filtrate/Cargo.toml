@@ -1,6 +1,6 @@
 [package]
 name = "filtrate"
-version = "0.2.1"
+version = "0.3.0"
 edition.workspace = true
 rust-version = "1.95"
 authors = ["Lexo Liu"]
@@ -44,11 +44,11 @@ webgl = ["wgpu/webgl"]
 
 [dependencies]
 bytemuck = "1"
-cherenkov-shader = { version = "0.0.0", path = "../shader" }
-filtrate-core = { version = "0.2.0", path = "core" }
+cherenkov-shader = { version = "0.0.1", path = "../shader" }
+filtrate-core = { version = "0.3.0", path = "core" }
 # f16 aux images; no_std-capable, already in the tree through naga.
 half = { version = "2.5", default-features = false }
-filtrate-derive = { version = "0.1.0", path = "derive" }
+filtrate-derive = { version = "0.2.0", path = "derive" }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 thiserror = "2.0.19"
 tracing = "0.1.44"
@@ -65,7 +65,7 @@ web-time = "1"
 [dev-dependencies]
 # The evaluator runs snippets on the CPU to cross-check the CPU kernels and
 # the linearity of `LINEAR` filters.
-cherenkov-shader = { version = "0.0.0", path = "../shader", features = ["eval"] }
+cherenkov-shader = { version = "0.0.1", path = "../shader", features = ["eval"] }
 divan = "0.1"
 pollster = "1.0"
 

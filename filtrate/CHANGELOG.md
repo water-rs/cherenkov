@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/water-rs/cherenkov/compare/v0.2.1...v0.3.0) - 2026-09-30
+
+### Added
+
+- *(filtrate)* CPU image kernels for blurs and image blends
+- *(core)* backdrop group API and Backdrop capability
+- *(filtrate,shader)* [**breaking**] image size in the spatial ABI, WGSL libraries, size-relative footprints
+- *(filtrate)* [**breaking**] function-form stages composed by cherenkov-shader ([#13](https://github.com/water-rs/cherenkov/pull/13))
+
+### Fixed
+
+- *(filtrate,scene)* scope wasm32-only lint expects to wasm32
+- *(filtrate)* keep the intermediates of every size the previous frame used
+- *(filtrate)* per-params uniform buffers so multiple encodes per frame stay independent
+- *(filtrate)* integrate pixel-integrated Gaussian blur weights
+- *(filtrate)* satisfy clippy 1.98.1 midpoint and as_chunks lints
+- *(filtrate)* blend images with unpremultiplied colour
+- *(filtrate)* HSL saturation for lightness above one half
+- *(core)* restore param_bounds and platform Send bound
+- *(filtrate)* rotate hue with the CSS/SVG hue-rotate matrix
+
+### Other
+
+- *(filtrate)* rewrite parameter buffers no encode of the frame binds
+- *(filtrate)* drop intermediates for sizes a frame no longer uses
+- *(filtrate)* two sizes in one encoder stay independent
+- upgrade the engine stack to wgpu 30
+- assert image blend transparency exactly
+- join the filtrate crates to the workspace
+- import filtrate with its history
+
 ### Changed
 
 - **Breaking:** stages are functions for the shared composer,

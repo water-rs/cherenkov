@@ -84,11 +84,18 @@ frame-scoped.
 
 `pending_cells` packs the producing leaf's `(inst_base << 32 |
 start << 11 | len)` — verbatim frame indices into the producing
-frame's `Lowering::cell_patches` — resolved at apply into
+frame's `Lowering::emission_patches` — resolved at apply into
 storage-local uv patches and cleared there, never carried past the
-commit. A same-frame recompose rebases the copied entries by
-`wrapping_sub/add` on the packed instance base. Every path that skips
-apply — a `Grow` early return, an apply abandoned on
+commit. `emission_patches` is produce-scoped and append-only: the
+emit sites write it beside `cell_patches`, and the frame-scoped
+rollbacks (`realize_clipped_leaf`, `try_passthrough`) truncate
+`cell_patches` but never this list, so an emission produced inside a
+rolled-back scope keeps a valid range — `pending_cells` always
+belongs to the lowering that filled the list. A same-frame recompose
+re-emits frame patches from it, rebased by `wrapping_sub/add` on the
+packed instance base — unconditionally, since a clipped recompose
+lands on the same base with its originals already truncated. Every
+path that skips apply — a `Grow` early return, an apply abandoned on
 `AtlasExhausted`, or a lowering that returned `Err` — discards that
 surface's retained emissions (`discard_surface`), so stale pending
 cells can never compose into a later frame. Off-surface paths store
@@ -114,11 +121,12 @@ is never handed out until the next commit begins.
 because a batch that cannot fit even after evicting everything cold is
 a real failure the caller must see, not a silent re-lower. `Grow`
 still doubles the atlas once per renderer (generation bumps there, as
-on dev). `scenes/perf/map-pan` pans a linear two device pixels per
-frame: the integer step keeps every path's `Placement` key stable, so
-a retained `PathEmit` is re-found through `Atlas::path` and replayed
-instead of re-rasterized — the case the issue names. Under a pan whose
-step is not integer the subpixel fraction changes each frame, keys do
-not recur, and the steady state is instead self-cleaning: the frame's
-misses are the coldest shelves, so the next commit reclaims exactly the
-band the previous frame's churn left behind.
+on dev). `scenes/perf/map-pan` pans the map by a fractional
+ease-in-out offset over 4 s: every frame's fraction is a new
+`path::placement` key, so each moving frame produces the raster churn
+the commit must fit — without the eviction design the atlas would
+still clear about every third moving frame and re-rasterize ~85% of
+paths. A retained `PathEmit` is re-found through `Atlas::path` and
+replayed instead of re-rasterized — the case the issue names — while
+the frame's misses are the coldest shelves, so the next commit
+reclaims exactly the band the previous frame's churn left behind.

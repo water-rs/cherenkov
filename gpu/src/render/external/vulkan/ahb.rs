@@ -430,7 +430,9 @@ fn bind_and_finish(
                 producer_family: QueueFamily::Foreign,
                 aspects: vk::ImageAspectFlags::COLOR,
                 lease: sync::Lease::Ahb(buffer),
+                release_fence: None,
             })),
+            release_fence: Arc::new(std::sync::Mutex::new(None)),
         }),
     })
 }

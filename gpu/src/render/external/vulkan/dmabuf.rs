@@ -610,7 +610,9 @@ fn finish(
                 producer_family: desc.producer_family,
                 aspects,
                 lease,
+                release_fence: None,
             })),
+            release_fence: Arc::new(std::sync::Mutex::new(None)),
         }),
     })
 }

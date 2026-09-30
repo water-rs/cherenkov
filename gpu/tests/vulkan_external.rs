@@ -430,7 +430,9 @@ fn nv12_generation(
             producer_family: nv12.family,
             aspects: vk::ImageAspectFlags::COLOR,
             lease: vulkan::Lease::None,
+            release_fence: None,
         })),
+        release_fence: Arc::new(std::sync::Mutex::new(None)),
     })
 }
 
@@ -728,7 +730,9 @@ fn rgb_generation(
             producer_family: rgb.family,
             aspects: vk::ImageAspectFlags::COLOR,
             lease: vulkan::Lease::None,
+            release_fence: None,
         })),
+        release_fence: Arc::new(std::sync::Mutex::new(None)),
     })
 }
 

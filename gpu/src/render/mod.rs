@@ -5233,15 +5233,9 @@ impl GpuRenderer {
                 // open, and destruction runs when the queue reports the
                 // submission complete — never a CPU wait.
                 let shared = native.shared.clone();
-                let releases = std::mem::take(&mut native.releases);
-                for release in &releases {
-                    if let Some(flag) = &release.submitted_flag {
-                        flag.store(true, std::sync::atomic::Ordering::Release);
-                    }
-                    if let Some(state) = &release.state {
-                        *state.lock().expect("generation state") =
-                            external::vulkan::State::ReleaseSubmitted;
-                    }
+                let mut releases = std::mem::take(&mut native.releases);
+                for release in &mut releases {
+                    release.submitted(&shared);
                 }
                 self.queue.on_submitted_work_done(move || {
                     for release in releases {
@@ -5393,7 +5387,7 @@ impl GpuRenderer {
         let Some(native) = self.native.as_mut() else {
             return;
         };
-        let releases = external::vulkan::drain_releases(native);
+        let mut releases = external::vulkan::drain_releases(native);
         if releases.is_empty() {
             return;
         }
@@ -5423,14 +5417,8 @@ impl GpuRenderer {
             self.queue.submit([encoder.finish()]);
         }
         let shared = native.shared.clone();
-        for release in &releases {
-            if let Some(flag) = &release.submitted_flag {
-                flag.store(true, std::sync::atomic::Ordering::Release);
-            }
-            if let Some(state) = &release.state {
-                *state.lock().expect("generation state") =
-                    external::vulkan::State::ReleaseSubmitted;
-            }
+        for release in &mut releases {
+            release.submitted(&shared);
         }
         self.queue.on_submitted_work_done(move || {
             for release in releases {

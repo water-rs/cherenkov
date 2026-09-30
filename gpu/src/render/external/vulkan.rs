@@ -79,10 +79,10 @@ pub enum Wait {
         fd: OwnedFd,
     },
     /// A Linux sync fd / Android fence payload, imported as a one-shot
-    /// binary semaphore. The fd's ownership stays with the caller; the
-    /// engine reads it, never closes it.
+    /// binary semaphore. The engine takes ownership of the fd: a successful
+    /// import hands it to the driver.
     SyncFd {
-        /// The producer's fence fd; dup'ed onto the semaphore, never closed.
+        /// The producer's fence fd.
         fd: OwnedFd,
     },
     /// A host-owned `VkSemaphore` (as `u64`) of timeline kind, waited on at
@@ -407,7 +407,7 @@ pub fn extra_device_extensions() -> Vec<&'static CStr> {
 }
 
 /// Why a native import or frame operation failed.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum NativeError {
     /// The capability record cannot express the requested contract.
@@ -493,8 +493,8 @@ impl Shared {
             ycbcr: caps
                 .sampler_ycbcr_conversion
                 .then(|| ash::khr::sampler_ycbcr_conversion::Device::new(&instance, &device)),
-            external_semaphore_fd: caps
-                .external_semaphore_opaque_fd
+            external_semaphore_fd: (caps.external_semaphore_opaque_fd
+                || caps.external_semaphore_sync_fd)
                 .then(|| ash::khr::external_semaphore_fd::Device::new(&instance, &device)),
             #[cfg(target_os = "android")]
             ahb: caps.external_memory_android_hardware_buffer.then(|| {

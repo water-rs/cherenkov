@@ -159,7 +159,14 @@ pub struct Release {
     pub aspects: vk::ImageAspectFlags,
     /// The producer lease, dropped after every object built on it.
     pub lease: Lease,
+    /// Where [`Self::submitted`] leaves the producer's release fence for
+    /// [`Generation::release_fd`]; shared with the generation.
+    pub release_fence: Option<ReleaseFence>,
 }
+
+/// The producer's `FenceFd` release payload, exported once the release
+/// submission is accepted.
+pub type ReleaseFence = Arc<std::sync::Mutex<Option<Result<OwnedFd, NativeError>>>>;
 
 impl Release {
     /// Records the release barrier — sampling layout back to the producer's
@@ -216,6 +223,46 @@ impl Release {
             None => {}
         }
         out
+    }
+
+    /// The release submission was accepted: exports the `FenceFd` payload
+    /// while its signal is pending and advances the generation to
+    /// `ReleaseSubmitted`.
+    ///
+    /// # Panics
+    /// On a poisoned state or fence mutex.
+    pub fn submitted(&mut self, shared: &Shared) {
+        if let Some(slot) = &self.release_fence {
+            let fence = self.export_fence(shared);
+            *slot.lock().expect("release fence") = Some(fence);
+        }
+        if let Some(flag) = &self.submitted_flag {
+            flag.store(true, std::sync::atomic::Ordering::Release);
+        }
+        if let Some(state) = &self.state {
+            *state.lock().expect("generation state") = State::ReleaseSubmitted;
+        }
+    }
+
+    fn export_fence(&self, shared: &Shared) -> Result<OwnedFd, NativeError> {
+        let semaphore = self
+            .fence_semaphore
+            .ok_or(NativeError::Unsupported("frame has no fence release"))?;
+        let fd = unsafe {
+            shared
+                .vk
+                .external_semaphore_fd
+                .as_ref()
+                .expect("sync-fd support checked at import")
+                .get_semaphore_fd(
+                    &vk::SemaphoreGetFdInfoKHR::default()
+                        .semaphore(semaphore)
+                        .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD),
+                )
+        }
+        .map_err(NativeError::from)?;
+        // SAFETY: `get_semaphore_fd` returned a new fd owned by the caller.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 
     /// Destroys the objects in dependency order. Runs once the release
@@ -318,6 +365,9 @@ pub struct Generation {
     pub leases: std::sync::atomic::AtomicUsize,
     /// The destroy-time object set, moved out at retirement.
     pub parts: std::sync::Mutex<Option<Release>>,
+    /// The producer's release fence, exported when the release submission
+    /// is accepted.
+    pub release_fence: ReleaseFence,
 }
 
 impl Generation {
@@ -378,36 +428,11 @@ impl Generation {
                     owned: true,
                 }
             }
-            Wait::SyncFd { fd } => {
-                if self.shared.vk.external_semaphore_fd.is_none() {
-                    return Err(NativeError::Unsupported("SYNC_FD semaphore import"));
-                }
-                let semaphore =
-                    unsafe { dev.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }
-                        .map_err(NativeError::from)?;
-                let info = vk::ImportSemaphoreFdInfoKHR::default()
-                    .semaphore(semaphore)
-                    .flags(vk::SemaphoreImportFlags::TEMPORARY)
-                    .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD)
-                    .fd(fd.as_raw_fd());
-                let res = unsafe {
-                    self.shared
-                        .vk
-                        .external_semaphore_fd
-                        .as_ref()
-                        .expect("checked above")
-                        .import_semaphore_fd(&info)
-                };
-                if let Err(err) = res {
-                    unsafe { dev.destroy_semaphore(semaphore, None) };
-                    return Err(err.into());
-                }
-                PendingWait {
-                    semaphore,
-                    value: None,
-                    owned: true,
-                }
-            }
+            Wait::SyncFd { fd } => PendingWait {
+                semaphore: import_sync_fd(&self.shared, fd)?,
+                value: None,
+                owned: true,
+            },
         };
         Ok(Some(pending))
     }
@@ -510,6 +535,7 @@ impl Generation {
             release.sync_payload = self.release_sync.lock().expect("release sync").take();
             release.fence_semaphore = self.fence_semaphore.lock().expect("fence semaphore").take();
             release.submitted_flag = Some(Arc::clone(&self.release_submitted));
+            release.release_fence = Some(Arc::clone(&self.release_fence));
             release.state = Some(Arc::clone(&self.state));
             for (_, set) in self.sets.lock().expect("frame sets").drain() {
                 // Sets are freed with the pool; the map drain is bookkeeping.
@@ -533,18 +559,16 @@ impl Drop for Generation {
 }
 
 impl Generation {
-    /// Exports the `FenceFd` release payload. The spec requires the export
-    /// to run while the semaphore still has a pending signal, so the call
-    /// is valid from the accepted release submission until it executes.
+    /// The `FenceFd` release payload: signalled once the release submission
+    /// executes. Each call returns a new descriptor.
     ///
     /// # Errors
     /// [`NativeError::Unready`] before the release submission is accepted;
-    /// [`NativeError::Unsupported`] when the frame has no fence release or
-    /// the driver cannot export it.
+    /// [`NativeError::Unsupported`] when the frame has no fence release, and
+    /// the export's own error when the driver could not export it.
     ///
     /// # Panics
-    /// On a poisoned semaphore mutex.
-    #[allow(clippy::significant_drop_tightening)]
+    /// On a poisoned fence mutex.
     pub fn release_fd(&self) -> Result<OwnedFd, NativeError> {
         if !self
             .release_submitted
@@ -552,25 +576,41 @@ impl Generation {
         {
             return Err(NativeError::Unready);
         }
-        let guard = self.fence_semaphore.lock().expect("fence semaphore");
-        let Some(&semaphore) = guard.as_ref() else {
-            return Err(NativeError::Unsupported("frame has no fence release"));
-        };
-        let fd = unsafe {
-            self.shared
-                .vk
-                .external_semaphore_fd
-                .as_ref()
-                .expect("sync-fd support checked at import")
-                .get_semaphore_fd(
-                    &vk::SemaphoreGetFdInfoKHR::default()
-                        .semaphore(semaphore)
-                        .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD),
-                )
+        match &*self.release_fence.lock().expect("release fence") {
+            None => Err(NativeError::Unsupported("frame has no fence release")),
+            Some(Ok(fd)) => fd
+                .try_clone()
+                .map_err(|_| NativeError::Invalid("the release fence cannot be duplicated")),
+            Some(Err(err)) => Err(err.clone()),
         }
+    }
+}
+
+/// Imports a sync fence into a new binary semaphore, temporarily. A
+/// successful import hands the descriptor to the driver; on failure it
+/// closes with `fd`.
+fn import_sync_fd(shared: &Shared, fd: OwnedFd) -> Result<vk::Semaphore, NativeError> {
+    let Some(loader) = shared.vk.external_semaphore_fd.as_ref() else {
+        return Err(NativeError::Unsupported("SYNC_FD semaphore import"));
+    };
+    let dev = &shared.vk.device;
+    let semaphore = unsafe { dev.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }
         .map_err(NativeError::from)?;
-        // SAFETY: `get_semaphore_fd` returned a new fd owned by the caller.
-        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    let info = vk::ImportSemaphoreFdInfoKHR::default()
+        .semaphore(semaphore)
+        .flags(vk::SemaphoreImportFlags::TEMPORARY)
+        .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD)
+        .fd(fd.as_raw_fd());
+    match unsafe { loader.import_semaphore_fd(&info) } {
+        Ok(()) => {
+            // The driver owns the descriptor now.
+            let _ = fd.into_raw_fd();
+            Ok(semaphore)
+        }
+        Err(err) => {
+            unsafe { dev.destroy_semaphore(semaphore, None) };
+            Err(err.into())
+        }
     }
 }
 

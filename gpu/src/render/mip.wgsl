@@ -1,10 +1,10 @@
 // One mip level of a projective layer's local image (#84): the area
 // average of the previous level in premultiplied extended linear Display
-// P3, never clamped. Each level is `ceil(previous / 2)` texels per axis
-// and spans the same source extent, so destination texel `i` covers the
-// source interval `[i·s, (i+1)·s)`, `s = previous / current`: a 2×2 box
-// for even sizes, area-overlap weights over up to three texels per axis
-// for odd ones.
+// P3, never clamped. Each level is `max(1, floor(previous / 2))` texels
+// per axis — the hardware chain — and spans the same source extent, so
+// destination texel `i` covers the source interval `[i·s, (i+1)·s)`,
+// `s = previous / current ∈ [2, 3]`: a 2×2 box for even sizes,
+// area-overlap weights over up to three texels per axis for odd ones.
 
 @group(0) @binding(0) var previous: texture_2d<f32>;
 
@@ -26,7 +26,7 @@ fn overlap(i: f32, j: f32, s: f32) -> f32 {
 @fragment
 fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let src = vec2<f32>(textureDimensions(previous));
-    let dst = ceil(src * 0.5);
+    let dst = max(floor(src * 0.5), vec2<f32>(1.0));
     let s = src / dst;
     let i = floor(position.xy);
     let first = floor(i * s);

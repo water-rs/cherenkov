@@ -287,9 +287,11 @@ mod tests {
 
     #[test]
     fn odd_levels_average_by_area_overlap_without_dropping_edges() {
-        let base: Vec<[f32; 4]> = [0.0, 1.0, 2.0].map(|v| [v, 0.0, 0.0, 1.0]).to_vec();
-        let image = ProjectedImage::build(&base, (3, 1));
-        // 3 → 2: [0, 1.5) and [1.5, 3).
+        let base: Vec<[f32; 4]> = [0.0, 1.0, 2.0, 3.0, 4.0]
+            .map(|v| [v, 0.0, 0.0, 1.0])
+            .to_vec();
+        let image = ProjectedImage::build(&base, (5, 1));
+        // 5 → 2: [0, 2.5) and [2.5, 5); the middle texel splits evenly.
         let l1: Vec<f32> = image.levels[1]
             .texels
             .iter()
@@ -297,10 +299,11 @@ mod tests {
             .collect();
         assert_eq!(
             l1,
-            [(0.0 + 0.5) / 1.5, (0.5 + 2.0) / 1.5].map(|v: f32| f16::from_f32(v).to_f32())
+            [(0.0 + 1.0 + 1.0) / 2.5, (1.0 + 3.0 + 4.0) / 2.5]
+                .map(|v: f32| f16::from_f32(v).to_f32())
         );
         let l2 = image.levels[2].texels[0][0].to_f32();
-        assert!((l2 - 1.0).abs() < 1e-3, "{l2}");
+        assert!((l2 - 2.0).abs() < 1e-3, "{l2}");
     }
 
     #[test]

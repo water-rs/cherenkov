@@ -29,6 +29,10 @@
 
 // The largest tap count of the anisotropic filter.
 const MAX_TAPS: f32 = 16.0;
+// How far the anisotropy ratio may exceed an integer and still take that
+// many taps (`TAP_SLACK` in `lowering::projective`): rounding must not turn
+// an isotropic footprint into two taps.
+const TAP_SLACK: f32 = 1.0 / 256.0;
 
 // The weight of a bilinear footprint at level coordinate `u` (texel
 // centres at n + 0.5) that falls on texels inside `0..n`.
@@ -92,7 +96,7 @@ fn projected(i: u32, pixel: vec2<f32>) -> vec4<f32> {
     let angle = select(0.5 * atan2(2.0 * xy, xx - yy), 0.0, root == 0.0);
     let e = vec2<f32>(cos(angle), sin(angle));
     let b_eff = max(max(1.0, b), a / MAX_TAPS);
-    let taps = clamp(ceil(a / b_eff), 1.0, MAX_TAPS);
+    let taps = clamp(ceil(a / b_eff - TAP_SLACK), 1.0, MAX_TAPS);
     let step = e * (a / taps);
     let top = f32(textureNumLevels(image) - 1u);
     let lod = clamp(log2(b_eff), 0.0, top);

@@ -34,6 +34,15 @@ const MAX_LEAVES: usize = 64;
 /// The largest number of taps the anisotropic filter integrates.
 pub const MAX_TAPS: u32 = 16;
 
+/// How far `a / b_eff` may exceed an integer and still take that many taps.
+///
+/// It is the reconstruction's precision, 1/256. Rounding in
+/// the homography makes an isotropic footprint's ratio `1 + ε`, and
+/// `ceil` would turn that noise into a second tap along an arbitrary
+/// direction; spacing the taps up to `1 + 1/256` times `b_eff` apart is
+/// below that precision.
+pub const TAP_SLACK: f64 = 1.0 / 256.0;
+
 /// Resource limits a backend admits for one local image.
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
@@ -169,14 +178,15 @@ fn image_bytes(levels: &[(u32, u32)]) -> u64 {
 }
 
 /// Every mip level size from `size` down to `1 × 1`: each dimension is
-/// `ceil(previous / 2)`, and every level spans the same source extent.
+/// `max(1, floor(previous / 2))` — the hardware mip chain's sizes — and
+/// every level spans the same source extent.
 #[must_use]
 pub fn mip_levels(size: (u32, u32)) -> Vec<(u32, u32)> {
     let mut levels = vec![size];
     let (mut w, mut h) = size;
     while (w, h) != (1, 1) {
-        w = w.div_ceil(2);
-        h = h.div_ceil(2);
+        w = (w / 2).max(1);
+        h = (h / 2).max(1);
         levels.push((w, h));
     }
     levels
@@ -703,7 +713,8 @@ pub struct Footprint {
 ///
 /// With the inverse map's Jacobian singular values `a ≥ b` and major-axis
 /// direction `e`: `b_eff = max(1, b, a/16)`, `lod = log2(b_eff)`,
-/// `N = clamp(ceil(a / b_eff), 1, 16)`, and the `N` equal-weight taps sit
+/// `N = clamp(ceil(a / b_eff − 1/256), 1, 16)` (see [`TAP_SLACK`]), and
+/// the `N` equal-weight taps sit
 /// at the centres of `N` equal parts of the length-`a` major axis.
 #[must_use]
 pub fn footprint(inverse: &Homography, d: [f64; 2]) -> Option<Footprint> {
@@ -729,7 +740,9 @@ pub fn footprint_at(inverse: &Homography, q: [f64; 3]) -> Option<Footprint> {
         clippy::cast_sign_loss,
         reason = "the ratio is clamped to 1..=16"
     )]
-    let taps = (a / b_eff).ceil().clamp(1.0, f64::from(MAX_TAPS)) as u32;
+    let taps = (a / b_eff - TAP_SLACK)
+        .ceil()
+        .clamp(1.0, f64::from(MAX_TAPS)) as u32;
     let step = a / f64::from(taps);
     Some(Footprint {
         center,
@@ -784,8 +797,10 @@ mod tests {
 
     #[test]
     fn mip_levels_halve_up_to_one_texel_and_count_bytes_exactly() {
-        assert_eq!(mip_levels((5, 2)), [(5, 2), (3, 1), (2, 1), (1, 1)]);
-        assert_eq!(image_bytes(&mip_levels((5, 2))), 8 * (10 + 3 + 2 + 1));
+        assert_eq!(mip_levels((5, 2)), [(5, 2), (2, 1), (1, 1)]);
+        assert_eq!(image_bytes(&mip_levels((5, 2))), 8 * (10 + 2 + 1));
+        // As many levels as the hardware chain: floor(log2(257)) + 1.
+        assert_eq!(mip_levels((257, 3)).len(), 9);
         // The plan's scale example: 640×400 plus its chain is ≈ 2.60 MiB.
         let bytes = image_bytes(&mip_levels((640, 400)));
         #[expect(clippy::cast_precision_loss, reason = "a test figure")]
@@ -903,5 +918,15 @@ mod tests {
         let f = footprint(&inv, [0.0, 0.0]).unwrap();
         assert_eq!(f.taps, 16);
         assert!((f.lod - 2.0).abs() < 1e-12);
+        // Rounding noise on an isotropic map stays one tap; a real 1%
+        // anisotropy takes two.
+        let noisy = Homography([
+            [1.095, 0.0, 3.0],
+            [3.4e-17, 1.095, 3.0],
+            [5.3e-19, 0.0, 1.0],
+        ]);
+        assert_eq!(footprint(&noisy, [140.5, 125.5]).unwrap().taps, 1);
+        let inv = Homography::affine(Affine::scale_non_uniform(1.01, 1.0));
+        assert_eq!(footprint(&inv, [0.0, 0.0]).unwrap().taps, 2);
     }
 }

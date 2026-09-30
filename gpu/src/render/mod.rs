@@ -3467,13 +3467,17 @@ impl GpuRenderer {
             // An emission whose stamp matches the atlas verified live
             // this frame — either on the fast path or by re-walking its
             // refs — so its bands are the replay pins the commit must
-            // not evict (#119).
+            // not evict. `ARENA_REFS` emissions address the atlas's
+            // `emit_slots` directly; the rest resolve through their
+            // `(slot, epoch)` pairs (#119).
             let stamp = self.atlas.live_stamp();
             for surf in pending.iter_mut() {
                 for content in surf.layers.values_mut() {
                     let (_, emissions) = content.retained.prepared();
                     for e in emissions.iter().filter_map(|e| e.data.as_ref()) {
-                        if e.live_stamp == stamp {
+                        if e.is_arena_refs() {
+                            touches.extend_from_slice(self.atlas.emit_slot_arena(e.refs_range()));
+                        } else if e.live_stamp == stamp {
                             touches.extend(
                                 content.storage.refs[e.refs_range()]
                                     .iter()
@@ -3599,7 +3603,7 @@ impl GpuRenderer {
                         );
                     }
                 }
-                if pending {
+                if pending && !emission.is_arena_refs() {
                     // `refs` still addresses the frame's touches: fold
                     // those slots in, then swap the range for resolved
                     // `(slot, band epoch)` pairs — always, even empty,
@@ -3624,11 +3628,17 @@ impl GpuRenderer {
                 // Restamp only when every reference survived this
                 // commit's evictions; a stale emission must keep an
                 // older stamp so its next hit check walks the refs
-                // and re-lowers (#119).
-                if content.storage.refs[emission.refs_range()]
-                    .iter()
-                    .all(|&(s, ep)| self.atlas.shelf_epoch(s) == ep)
-                {
+                // and re-lowers. `ARENA_REFS` emissions survive when
+                // their live key does — evicting a shelf drops every
+                // key on it (#119).
+                let live = if emission.is_arena_refs() {
+                    self.atlas.live_alive(emission.live_key)
+                } else {
+                    content.storage.refs[emission.refs_range()]
+                        .iter()
+                        .all(|&(s, ep)| self.atlas.shelf_epoch(s) == ep)
+                };
+                if live {
                     emission.live_stamp = self.atlas.live_stamp();
                 }
             }

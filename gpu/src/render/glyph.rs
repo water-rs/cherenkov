@@ -1275,6 +1275,13 @@ impl Atlas {
         self.layout.shelves[usize::try_from(slot).expect("shelf index")].epoch
     }
 
+    /// Whether `key`'s admission is still live — evicting a shelf drops
+    /// every key on it, so a replayed emission whose `refs` are
+    /// `ARENA_REFS` stays valid exactly while its key does (#119).
+    pub fn live_alive(&self, key: u64) -> bool {
+        self.live.contains_key(&key)
+    }
+
     /// Lets [`Self::alloc`] reclaim the coldest shelves: set by the
     /// commit when the plan's dry run needed eviction — or exhausted
     /// the layout — so in-place eviction, not a wholesale clear, makes

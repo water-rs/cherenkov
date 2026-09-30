@@ -23,6 +23,15 @@ granularity (plan-of-record candidate C; A and B landed via #186).
   batch on a cloned layout — strict allocation first, then simulated
   eviction — and returns `Fits`, `FitsEviction`, `Grow(size)` or
   `Recycle` exactly matching what the commit would do.
+- The commit's work scales with what changed, not what is retained.
+  `fits_strict` dry-runs the batch alone first; a strictly-fitting
+  frame goes straight to `begin_commit(&[])` — no emission scan, no
+  pin derivation, no eviction. Only a batch that cannot place strictly
+  decodes `touches`, scans live-verified emissions for their band
+  lists and plans with eviction enabled. The scan's buffers
+  (`commit_touches`, `commit_writes`, the dedupe sets and plan cells)
+  live on the renderer and are rebuilt in place, so the steady commit
+  allocates nothing.
 - A commit that needs room calls `enable_evicting`, then `alloc` falls
   through live-fit → vacant best-fit → virgin top → `evict_one`. The
   victim is the coldest shelf by segmented LRU: probationary
@@ -42,8 +51,9 @@ granularity (plan-of-record candidate C; A and B landed via #186).
 
 A baked cell index is valid only while its band still occupies the same
 atlas slot, so every emission that drew atlas cells records `(slot,
-epoch)` pairs — `Emission.refs` into the shared `EmissionStorage.refs`
-arena — one per band it used. `Shelf.epoch` comes from `Layout.
+epoch)` pairs — `Emission.refs`, one packed `u64` (`start << 32 | len`)
+addressing the shared `EmissionStorage.refs` arena — one per band it
+used. `Shelf.epoch` comes from `Layout.
 next_epoch` and is bumped on every band admission (vacant reuse, top
 carve, phantom split) and on every band death (`free_band`), so a slot
 re-used by a different band always reports a different epoch. Liveness
@@ -57,23 +67,34 @@ on success.
 Ref collection stays out of the measured `lower` interval. Lowering is
 parallel against an immutable `&Atlas`, so a leaf records only the shelf
 slots it touches into `Lowering.touches` (glyph and mask admissions,
-consecutive-shelf deduped) and, per replayed path emission, one
-`TOUCH_RANGE`-flagged index into `Lowering.touched_ranges` —
-`PathEmit::slots` is a range into the atlas's append-only `emit_slots`
-arena, so a replay pin costs one push instead of copying the whole
-slot list, and stays readable even if the record is evicted between lower
-and commit. Each realized `Emission` carries the `LIVE_PENDING`
-stamp while its `refs` range still addresses `touches` instead of
-`storage.refs`. The commit's `apply_pending` folds the touch slots —
-decoding flagged indices to their arena ranges — plus the bands its
-raster actually landed in (`PendingOrigin::Cells`) into
-`(slot, epoch)` pairs, swaps `refs` to them, and stamps the emission.
-An emission whose resolving commit was abandoned (`Grow` or
-`AtlasExhausted`) keeps `LIVE_PENDING` and never verifies live, so the
-next hit check re-lowers it.
+consecutive-shelf deduped). A replayed path emission records no touch
+at all: its band set is already the atlas's — `emit.slots`, a range in
+the `emit_slots` arena — so the leaf stores `refs = ARENA_REFS |
+(start << 32 | len)` plus the `live` key the lookup hit, and nothing
+else. The emission's liveness is the key's survival: evicting a shelf
+drops every key on it, so `live` still containing the key means every
+band the replay drew is intact — a stale check is one hash lookup, no
+pairs to write or walk. Other emissions keep the touches path: each
+realized `Emission` carries the `LIVE_PENDING` stamp while its `refs`
+still addresses `touches` instead of `storage.refs`. The commit's
+`apply_pending` folds the touch slots — decoding flagged entries to
+their arena ranges — plus the bands its raster actually landed in
+(`PendingOrigin::Cells`) into `(slot, epoch)` pairs at the storage
+tail, no set in between, swaps `refs` to them, and stamps the emission.
+`ARENA_REFS` emissions resolve identically — they stamp when their
+live key survives the commit — with nothing to write. An emission
+whose resolving commit was abandoned (`Grow` or `AtlasExhausted`)
+keeps `LIVE_PENDING` and never verifies live, so the next hit check
+re-lowers it.
 
 Mask cells take part in the same touches → refs path, so they are
 covered by the epoch check too.
+
+`emit_slots` ranges of evicted emissions are recycled: `evict_one`
+pushes the range onto `slot_dead`, `begin_commit` promotes it to
+`slot_holes`, and admission reuses a hole before growing the arena —
+same-commit readers keep addressing it correctly because a freed range
+is never handed out until the next commit begins.
 
 ## Residual behavior
 

@@ -503,7 +503,10 @@ impl EmissionStorage {
                 .stops
                 .extend_from_slice(&self.stops[e.stops.clone()]);
             e.stops = first..storage.stops.len();
-            if e.live_stamp == LIVE_PENDING {
+            if e.is_arena_refs() {
+                // `refs` already addresses the shared `emit_slots`
+                // arena — nothing to move (#119).
+            } else if e.live_stamp == LIVE_PENDING {
                 // `refs` still addresses the frame's `touches`: keep
                 // the emission pending and drop the range (#119).
                 e.refs = 0;
@@ -591,12 +594,12 @@ impl RetainedInstance {
 /// band set (#119).
 pub const TOUCH_RANGE: u32 = 1 << 31;
 
-/// Start and length bounds of a `TOUCH_RANGE` packing. The emit-slots
-/// arena only grows, so an out-of-bounds start falls back to plain
-/// per-slot pushes.
-const TOUCH_PACK_MAX_START: usize = 1 << 21;
-/// One emission spans far fewer shelves than this bound.
-const TOUCH_PACK_MAX_LEN: usize = 1 << 10;
+/// `refs` flag: the range addresses `Atlas::emit_slots` — a cached
+/// `PathEmit`'s own shelf list — not `EmissionStorage::refs`. A replayed
+/// emission's bands are exactly those slots, so a hit records no
+/// touches and resolves no pairs; its liveness is the emission's live
+/// key, since evicting a shelf drops every key on it (#119).
+pub const ARENA_REFS: u64 = 1 << 63;
 
 /// `Emission::live_stamp` while its `refs` still indexes
 /// `Lowering::touches` instead of `EmissionStorage::refs` — the commit
@@ -609,14 +612,20 @@ pub struct Emission {
     pub(crate) pending_cells: Vec<(u32, u32, u32)>,
     /// Resolved: `(start << 32 | len)` range into `EmissionStorage::refs`
     /// holding the `(shelf slot, band epoch)` of every atlas band the
-    /// retained instances sample. While `live_stamp == LIVE_PENDING` it
-    /// instead addresses the frame's `Lowering::touches` slots, which
-    /// the commit swaps for resolved pairs (#119).
+    /// retained instances sample. With `ARENA_REFS` set it addresses
+    /// `Atlas::emit_slots` instead; while `live_stamp == LIVE_PENDING`
+    /// and the flag is clear it addresses the frame's `Lowering::touches`
+    /// slots, which the commit swaps for resolved pairs (#119).
     pub(crate) refs: u64,
     /// Atlas texture generation and eviction clock at last verification
     /// — one compare on the hit fast path; `LIVE_PENDING` while the
     /// commit that resolves `refs` has not landed (#119).
     pub(crate) live_stamp: u64,
+    /// The `live` key the replayed emission was found under — its
+    /// survival is the whole band set's liveness, since evicting a
+    /// shelf drops every key on it. Zero when `refs` is not
+    /// `ARENA_REFS` (#119).
+    pub(crate) live_key: u64,
     template: usize,
     // Only shadows carry an occlusion key; ordinary leaves keep a small index.
     cover: Option<usize>,
@@ -640,6 +649,13 @@ impl Emission {
         if self.live_stamp == LIVE_PENDING {
             return false;
         }
+        if self.is_arena_refs() {
+            if atlas.live_alive(self.live_key) {
+                self.live_stamp = stamp;
+                return true;
+            }
+            return false;
+        }
         if refs
             .iter()
             .all(|&(slot, epoch)| atlas.shelf_epoch(slot) == epoch)
@@ -660,14 +676,23 @@ impl Emission {
         self.live_stamp != LIVE_PENDING && self.atlas_live(atlas, &storage.refs[self.refs_range()])
     }
 
-    /// `start << 32 | len` packing for `refs`.
+    /// `start << 32 | len` packing for `refs`; `start` stays under
+    /// `2^31`, leaving the top bit for `ARENA_REFS`.
     pub(crate) const fn pack_refs(start: usize, len: usize) -> u64 {
+        debug_assert!(start < (1 << 31), "refs start must leave ARENA_REFS free");
         ((start as u64) << 32) | len as u64
+    }
+
+    /// Whether `refs` addresses `Atlas::emit_slots` rather than
+    /// `EmissionStorage::refs` (#119).
+    pub(crate) const fn is_arena_refs(&self) -> bool {
+        self.refs & ARENA_REFS != 0
     }
 
     /// The `refs` field decoded back to a usable range.
     pub(crate) const fn refs_range(&self) -> Range<usize> {
-        (self.refs >> 32) as usize..(self.refs >> 32) as usize + (self.refs & 0xFFFF_FFFF) as usize
+        let packed = self.refs & !ARENA_REFS;
+        (packed >> 32) as usize..(packed >> 32) as usize + (packed & 0xFFFF_FFFF) as usize
     }
 
     /// Length of the `refs` range, for memory accounting.
@@ -878,6 +903,10 @@ pub struct Lowering<'a> {
     /// The commit also resolves each emission's slice — recorded as
     /// `Emission::refs` — into its `(slot, epoch)` pairs (#119).
     pub(crate) touches: Vec<u32>,
+    /// Set by `realize`'s path-emission hit: the live key found and the
+    /// emission's `emit_slots` range, so the leaf's `Emission` records
+    /// `ARENA_REFS` instead of pushing touches (#119).
+    hit_arena: Option<(u64, Range<usize>)>,
 
     /// The open range's bound mask texture key; `None` for the dummy view.
     /// Kept in sync with `clip` by `set_clip`.
@@ -936,6 +965,7 @@ impl<'a> Lowering<'a> {
             // a path-heavy surface records thousands — pre-grow past
             // the amortization point (#119).
             touches: Vec::with_capacity(1024),
+            hit_arena: None,
             pending: Vec::new(),
             commands_lowered: 0,
             layers_composed: 0,
@@ -2471,6 +2501,7 @@ impl<'a> Lowering<'a> {
         let first_stop = self.frame.stops.len();
         let first_patch = self.cell_patches.len();
         let first_touch = self.touches.len();
+        self.hit_arena = None;
         // `realize` composes path and glyph ops' local transforms into
         // `self.transform`; the leaf's placement is restored with the clip.
         let transform = self.transform;
@@ -2509,6 +2540,7 @@ impl<'a> Lowering<'a> {
         storage
             .stops
             .extend_from_slice(&self.frame.stops[first_stop..]);
+        let hit_arena = self.hit_arena.take();
         cache.data = Some(Emission {
             pending_cells: self.cell_patches[first_patch..]
                 .iter()
@@ -2516,9 +2548,15 @@ impl<'a> Lowering<'a> {
                 .collect(),
             // Unresolved until the commit lands: `refs` addresses
             // `touches` slots until `apply_pending` swaps in the
-            // `(slot, band epoch)` pairs (#119).
-            refs: Emission::pack_refs(first_touch, self.touches.len() - first_touch),
+            // `(slot, band epoch)` pairs — unless a path-emission hit
+            // recorded its atlas `emit_slots` range, which needs no
+            // resolution (#119).
+            refs: match hit_arena {
+                Some((_, ref slots)) => ARENA_REFS | Emission::pack_refs(slots.start, slots.len()),
+                None => Emission::pack_refs(first_touch, self.touches.len() - first_touch),
+            },
             live_stamp: LIVE_PENDING,
+            live_key: hit_arena.map_or(0, |(key, _)| key),
             template,
             cover: cover.map(|cover| {
                 storage.covers.push(cover);
@@ -3142,21 +3180,20 @@ impl<'a> Lowering<'a> {
         let hit = glyphs
             .atlas
             .path(pl.key)
-            .or_else(|| glyphs.atlas.path(pl.key_exact()));
-        if let Some(emit) = hit {
-            // Pin the shelves the emission's cells live on so this
-            // commit cannot evict them; the emission's refs — resolved
-            // from the same slot set — detect a reclaim between lowers
-            // and re-lower the leaf. One packed push stands in for the
-            // whole slot list (#119).
-            if emit.slots.start < TOUCH_PACK_MAX_START && emit.slots.len() < TOUCH_PACK_MAX_LEN {
-                let packed = u32::try_from(emit.slots.start).expect("packed start checked") << 10
-                    | u32::try_from(emit.slots.len()).expect("packed len checked");
-                self.touches.push(TOUCH_RANGE | packed);
-            } else {
-                self.touches
-                    .extend_from_slice(glyphs.atlas.emit_slot_arena(emit.slots.clone()));
-            }
+            .map(|emit| (pl.key, emit))
+            .or_else(|| {
+                glyphs
+                    .atlas
+                    .path(pl.key_exact())
+                    .map(|emit| (pl.key_exact(), emit))
+            });
+        if let Some((key, emit)) = hit {
+            // The emission's `emit_slots` range is its whole band set —
+            // record it (with the live key found under) instead of
+            // pushing touches; the commit marks the same shelves through
+            // `ARENA_REFS` and the emission's liveness is the key's
+            // survival (#119).
+            self.hit_arena = Some((key, emit.slots.clone()));
             self.replay(emit, None, pl.offset, paint, shader_data.as_ref());
             return Ok(());
         }

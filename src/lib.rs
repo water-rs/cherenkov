@@ -33,6 +33,7 @@ mod local;
 pub mod lowering;
 mod message;
 mod paint;
+mod projective;
 mod record;
 mod resource;
 mod shape;
@@ -58,8 +59,8 @@ pub use crate::backdrop::{
 pub use crate::backend::{Backend, Display, Frame, Redraw, Renderer, SurfaceFrame, SurfaceInfo};
 pub use crate::capability::{
     Backdrop, BackdropChain, BackdropRuns, BackdropShaders, Effects, ExternalFrames, Filters,
-    GpuContent, HdrOutput, Planes, Runs, ShaderPaint as ShaderPaintCapability, ShaderSource,
-    Uploads,
+    GpuContent, HdrOutput, Planes, ProjectiveLayers, Runs, ShaderPaint as ShaderPaintCapability,
+    ShaderSource, Uploads,
 };
 pub use crate::color::{
     Color, ColorSpace, DisplayP3, DynColor, LinearDisplayP3, LinearSrgb, Rec2020, Srgb,
@@ -88,6 +89,7 @@ pub use crate::paint::{
     MeshColorInterpolation, MeshGradient, MeshGradientError, Paint, RadialGradient, Sampling,
     ShaderId, ShaderPaint, SweepGradient, TransformedPaint,
 };
+pub use crate::projective::{Projective, ProjectiveError};
 pub use crate::record::{Content, ContentChange, Draw, Fixed, Live, Recorder, StaticRecorder};
 pub use crate::resource::{
     BackdropGroup, BackdropSample, BackdropShader, Filter, Font, FontSource, Image, Shader,

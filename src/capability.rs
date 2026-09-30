@@ -189,6 +189,14 @@ pub trait BackdropShaders: Backdrop {
 /// The backend produces HDR output.
 pub trait HdrOutput: Backend {}
 
+/// The backend composes projective layers (`LayerEdit::projection`).
+///
+/// It renders a projective layer's subtree into a bounded
+/// layer-local image and projects that image during composition. A
+/// banded backend that cannot hold the bounded local image does not
+/// implement it.
+pub trait ProjectiveLayers: Backend {}
+
 /// The backend presents on multiple hardware planes.
 pub trait Planes: Backend {}
 

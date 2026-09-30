@@ -6,9 +6,9 @@
 //! functions in the destination's stored units.
 
 use cherenkov_gpu::interop::{
-    OutputAlpha, OutputColor, Presenter, TextureOutput, shader_delivery, wgpu,
+    shader_delivery, wgpu, OutputAlpha, OutputColor, Presenter, TextureOutput,
 };
-use cherenkov_oracle::{Image, present};
+use cherenkov_oracle::{present, Image};
 
 /// The corpus pixels every encoding presents (premultiplied linear
 /// Display P3).
@@ -98,7 +98,8 @@ fn oracle_present(color: OutputColor, headroom: f64, pixels: &[[f32; 4]]) -> Ima
         pixels: pixels.iter().map(|p| p.map(f64::from)).collect(),
     };
     match color {
-        OutputColor::Srgb | OutputColor::DisplayP3 => present::present_display_p3(headroom, &image),
+        OutputColor::Srgb => present::present_srgb(headroom, &image),
+        OutputColor::DisplayP3 => present::present_display_p3(headroom, &image),
         OutputColor::LinearDisplayP3 => present::present_linear_p3(headroom, &image),
         OutputColor::ExtendedSrgbLinear => present::present_extended_srgb_linear(headroom, &image),
         OutputColor::ExtendedSrgb => present::present_extended_srgb(headroom, &image),
@@ -231,8 +232,11 @@ fn every_output_encoding_matches_the_oracle() -> Result<(), Box<dyn std::error::
     let (adapter, device, queue) = shared_device()?;
     let source = f16_texture(&device, &queue, &pixels);
     let headroom = 2.0f32;
-    // (format, color) — every present-pass encoding.
-    let cases: [(wgpu::TextureFormat, OutputColor); 7] = [
+    // (format, color) — every present-pass encoding. `Srgb` covers both
+    // the hardware (`*Srgb` format) and software (plain unorm) encoders.
+    let cases: [(wgpu::TextureFormat, OutputColor); 9] = [
+        (wgpu::TextureFormat::Rgba8Unorm, OutputColor::Srgb),
+        (wgpu::TextureFormat::Rgba8UnormSrgb, OutputColor::Srgb),
         (wgpu::TextureFormat::Rgba8Unorm, OutputColor::DisplayP3),
         (wgpu::TextureFormat::Rgba8UnormSrgb, OutputColor::DisplayP3),
         (
@@ -262,6 +266,189 @@ fn every_output_encoding_matches_the_oracle() -> Result<(), Box<dyn std::error::
         let want = oracle_present(color, f64::from(headroom), &pixels);
         for (i, (g, w)) in got.iter().zip(&want.pixels).enumerate() {
             assert_close(color, i, pixels[i], *g, *w);
+        }
+    }
+    Ok(())
+}
+
+/// Exact stored values at canonical inputs: SDR white's encoding, the
+/// 0.18 midtone a transfer-coefficient slip once escaped through
+/// `assert_close`'s tolerance, an HDR neutral, and a negative extended
+/// component. Each is compared to the oracle's `present_*` value at
+/// headroom 2 within the destination's own quantization — ±1 LSB for
+/// unorm-8, ~2⁻¹¹ relative for f16 — so a subtle curve error cannot
+/// hide in the broad relative tolerance (#98).
+#[test]
+fn output_encodings_pin_known_values() -> Result<(), Box<dyn std::error::Error>> {
+    let pixels = pixels();
+    let (adapter, device, queue) = shared_device()?;
+    let source = f16_texture(&device, &queue, &pixels);
+    let headroom = 2.0f32;
+    let f16 = wgpu::TextureFormat::Rgba16Float;
+    let srgb_018 = [
+        0.4613561295004416,
+        0.46135611874302207,
+        0.4613561295004416,
+        1.0,
+    ];
+    let display_p3_018 = [
+        0.4613561295004416,
+        0.4613561295004416,
+        0.4613561295004416,
+        1.0,
+    ];
+    // (format, color, [(pixel, stored value, per-channel tolerance)])
+    let cases: [(wgpu::TextureFormat, OutputColor, &[(usize, [f64; 4], f64)]); 11] = [
+        (
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            OutputColor::Srgb,
+            &[
+                (1, srgb_018, 0.0045),
+                (2, [1.0, 0.999999978020833, 1.0, 1.0], 0.0045),
+            ],
+        ),
+        (
+            wgpu::TextureFormat::Rgba8Unorm,
+            OutputColor::Srgb,
+            &[(1, srgb_018, 0.0045)],
+        ),
+        (
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            OutputColor::DisplayP3,
+            &[(1, display_p3_018, 0.0045)],
+        ),
+        (
+            wgpu::TextureFormat::Rgba8Unorm,
+            OutputColor::DisplayP3,
+            &[(1, display_p3_018, 0.0045)],
+        ),
+        (
+            f16,
+            OutputColor::LinearDisplayP3,
+            &[
+                (2, [1.0, 1.0, 1.0, 1.0], 0.0015),
+                (3, [1.5, 1.5, 1.5, 1.0], 0.0025),
+            ],
+        ),
+        (
+            f16,
+            OutputColor::ExtendedSrgbLinear,
+            &[(10, [-0.41870515, 0.5315426875, 0.6245555225, 1.0], 0.001)],
+        ),
+        (
+            f16,
+            OutputColor::ExtendedSrgb,
+            &[(
+                3,
+                [
+                    1.194176534680845,
+                    1.1941765086563334,
+                    1.194176534680845,
+                    1.0,
+                ],
+                0.002,
+            )],
+        ),
+        (
+            f16,
+            OutputColor::ExtendedDisplayP3,
+            &[(
+                3,
+                [
+                    1.1941765346808448,
+                    1.1941765346808448,
+                    1.1941765346808448,
+                    1.0,
+                ],
+                0.002,
+            )],
+        ),
+        (
+            f16,
+            OutputColor::Bt2100Pq,
+            &[
+                (
+                    1,
+                    [
+                        0.4108967520368048,
+                        0.41089675201328807,
+                        0.4108967520344222,
+                        1.0,
+                    ],
+                    0.0006,
+                ),
+                (
+                    2,
+                    [
+                        0.5806888810360986,
+                        0.5806888810094688,
+                        0.5806888810334064,
+                        1.0,
+                    ],
+                    0.0006,
+                ),
+            ],
+        ),
+        (
+            f16,
+            OutputColor::Bt2100Hlg,
+            &[
+                (
+                    1,
+                    [
+                        0.43622865180496784,
+                        0.43622865174941278,
+                        0.4362286517993555,
+                        1.0,
+                    ],
+                    0.0006,
+                ),
+                (
+                    2,
+                    [
+                        0.7498773650996855,
+                        0.7498773650496535,
+                        0.7498773650946312,
+                        1.0,
+                    ],
+                    0.0006,
+                ),
+            ],
+        ),
+        (
+            f16,
+            OutputColor::ExtendedSrgb,
+            &[(
+                10,
+                [
+                    -0.6790307477367112,
+                    0.7557619425892186,
+                    0.8121090753408577,
+                    1.0,
+                ],
+                0.001,
+            )],
+        ),
+    ];
+    for (format, color, anchors) in cases {
+        let got = present_gpu(
+            &adapter,
+            &device,
+            &queue,
+            &source,
+            format,
+            color,
+            OutputAlpha::Premultiplied,
+            headroom,
+            &pixels,
+        )?;
+        for (pixel, want, tol) in anchors {
+            for (c, (g, w)) in got[*pixel].iter().zip(want.iter()).enumerate() {
+                assert!(
+                    (g - w).abs() <= *tol,
+                    "{color:?} pixel {pixel} channel {c}: shader {g} vs pinned {w}"
+                );
+            }
         }
     }
     Ok(())

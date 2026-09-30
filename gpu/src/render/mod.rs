@@ -3200,14 +3200,18 @@ impl GpuRenderer {
             // (`SurfaceInfo::presents`), so a pending present implies a
             // window here.
             surface.present_pending |= sf.present_pending;
-            // A display change re-runs the window's output negotiation;
-            // it reconfigures only when the selected pair moves.
-            if sf.display != surface.display {
-                surface.display = sf.display;
-                if let Some(window) = &mut surface.window {
-                    window.reselect(&self.adapter, &self.device);
-                    surface.present_pending = true;
-                }
+            // A display move or a scale change re-runs the window's
+            // output negotiation; it reconfigures only when the selected
+            // pair moves. A headroom-only update never re-enumerates —
+            // the host announces a move with `Surface::display_moved`,
+            // since a move to a numerically identical display is
+            // invisible in `Display`'s values (#98).
+            let renegotiate =
+                sf.display_moved || sf.display.scale.to_bits() != surface.display.scale.to_bits();
+            surface.display = sf.display;
+            if renegotiate && let Some(window) = &mut surface.window {
+                window.reselect(&self.adapter, &self.device);
+                surface.present_pending = true;
             }
             if surface.present_pending {
                 let window = surface.window.as_ref().expect("pending window");

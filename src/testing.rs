@@ -63,6 +63,10 @@ pub struct FrameRecord {
     /// The frame's `present_pending` flag for this surface: a display
     /// change re-presents without touching content (#98).
     pub present_pending: bool,
+    /// The frame's `display_moved` flag for this surface: the host's
+    /// display-move announcement, which re-enumerates output
+    /// negotiation (#98).
+    pub display_moved: bool,
     /// The display state the frame presented with.
     pub display: Display,
     /// Every layer's sampled state.
@@ -352,6 +356,7 @@ impl Renderer for NullRenderer {
                 surface: surface.id,
                 changed: surface.changed,
                 present_pending: surface.present_pending,
+                display_moved: surface.display_moved,
                 display: surface.display,
                 layers,
             }));
@@ -382,6 +387,7 @@ impl Renderer for NullRenderer {
                 surface: surface.id,
                 changed: surface.changed,
                 present_pending: surface.present_pending,
+                display_moved: surface.display_moved,
                 display: surface.display,
                 layers,
             }));
@@ -1981,6 +1987,54 @@ mod tests {
             record.changed && record.present_pending,
             "a scale change is content, not presentation-only"
         );
+    }
+
+    /// `Surface::display_moved` rides to the frame as `display_moved`
+    /// and marks a present on a presenting surface; a headroom-only
+    /// `display` update never sets it, and the flag is consumed by one
+    /// frame (#98).
+    #[test]
+    fn display_moves_reach_the_frame_once() {
+        use crate::Display;
+
+        let (engine, rx) = engine();
+        let surface = engine
+            .surface(NullTarget::Window(Offscreen::new(
+                (8, 8),
+                OffscreenFormat::LinearF16,
+            )))
+            .expect("surface");
+        engine.render(FrameTime::now()).expect("render");
+        let _ = frames(&rx);
+
+        surface.display_moved().expect("display move");
+        engine.render(FrameTime::now()).expect("render");
+        let record = frames(&rx).pop().expect("frame record");
+        assert!(
+            record.display_moved && record.present_pending,
+            "a display move re-enumerates and presents"
+        );
+
+        engine.render(FrameTime::now()).expect("render");
+        let record = frames(&rx).pop().expect("frame record");
+        assert!(
+            !record.display_moved,
+            "the move flag is consumed by one frame"
+        );
+
+        surface
+            .display(Display {
+                scale: 1.0,
+                headroom: 3.0,
+            })
+            .expect("display");
+        engine.render(FrameTime::now()).expect("render");
+        let record = frames(&rx).pop().expect("frame record");
+        assert!(
+            !record.display_moved,
+            "a headroom-only update never moves the display"
+        );
+        assert!(record.present_pending);
     }
 }
 

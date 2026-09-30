@@ -854,6 +854,24 @@ impl<B: Backend> Surface<B> {
         Ok(())
     }
 
+    /// Announces the surface moved to another display: the next frame
+    /// carries [`SurfaceFrame::display_moved`] and a presenting backend
+    /// re-enumerates the surface's output capabilities (#98). Hosts call
+    /// this from the platform's display-change notification —
+    /// `NSWindowDidChangeScreenNotification`, a winit monitor change, an
+    /// Android display change — because a move to a numerically
+    /// identical display is invisible in [`Display`]'s values.
+    ///
+    /// [`SurfaceFrame::display_moved`]: crate::backend::SurfaceFrame::display_moved
+    ///
+    /// # Errors
+    /// [`SurfaceError::Lost`] when the render thread is gone.
+    pub fn display_moved(&self) -> Result<(), SurfaceError> {
+        self.tx
+            .send(Message::DisplayMoved { id: self.id })
+            .map_err(|_| SurfaceError::Lost)
+    }
+
     /// The clear colour, queued into the pending change set. Defaults to
     /// transparent.
     pub fn clear_color(&self, color: WorkingColor) {

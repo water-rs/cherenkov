@@ -276,6 +276,14 @@ pub struct SurfaceFrame<'a> {
     /// false — a headroom update reaches the swapchain without touching the
     /// layer tree or any content cache (#98).
     pub present_pending: bool,
+    /// Whether the host announced the surface moved to another display
+    /// since the previous frame ([`Surface::display_moved`]). A presenting
+    /// backend re-enumerates the surface's capabilities on it — a
+    /// headroom-only [`Display`] update never triggers re-enumeration
+    /// (#98).
+    ///
+    /// [`Surface::display_moved`]: crate::Surface::display_moved
+    pub display_moved: bool,
     /// The sampled layer tree.
     pub tree: &'a SurfaceTree,
 }

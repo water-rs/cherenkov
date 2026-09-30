@@ -298,6 +298,12 @@ pub enum Message<B: Backend> {
         /// The new display properties.
         display: Display,
     },
+    /// Announce the surface moved to another display: the next frame
+    /// carries `display_moved` and re-runs output negotiation (#98).
+    DisplayMoved {
+        /// The surface id.
+        id: SurfaceId,
+    },
     /// An opaque render-thread operation that cannot fail: font, filter
     /// and effect registration and removal, capability hooks.
     Resource(ResOp<B>),

@@ -48,6 +48,9 @@ struct SurfaceState {
     changed: bool,
     /// Whether the surface presents, and whether a present is pending (#98).
     presentation: Presentation,
+    /// Whether the host announced the surface moved to another display
+    /// since the previous frame — the frame's `display_moved` (#98).
+    display_moved: bool,
     /// Whether the surface's recorded contents still run operand animations
     /// on the UI thread. The tracks live there; they need the next frame's
     /// sample at the fast rate class.
@@ -320,6 +323,7 @@ pub fn run<B: Backend>(
                 destroy_surface::<B>(&mut renderer, &mut surfaces, &mut resources, id);
             }
             Message::Display { id, display } => set_display(&mut surfaces, id, display),
+            Message::DisplayMoved { id } => set_display_moved(&mut surfaces, id),
             Message::Resource(op) => op(&mut renderer),
             Message::Register { resource, op } => {
                 resources.register(resource, op(&mut renderer));
@@ -392,6 +396,7 @@ fn create_surface<B: Backend>(
             } else {
                 Presentation::Retained
             },
+            display_moved: false,
             content_animating: false,
         },
     );
@@ -443,6 +448,18 @@ fn set_display(surfaces: &mut FxHashMap<SurfaceId, SurfaceState>, id: SurfaceId,
         }
     } else {
         tracing::trace!(surface = id.raw(), "display of unknown surface");
+    }
+}
+
+fn set_display_moved(surfaces: &mut FxHashMap<SurfaceId, SurfaceState>, id: SurfaceId) {
+    if let Some(state) = surfaces.get_mut(&id) {
+        // A move re-enumerates output negotiation, where a headroom-only
+        // `Display` update never does — and presents, since a
+        // reconfigured swapchain must be shown (#98).
+        state.display_moved = true;
+        state.mark_present();
+    } else {
+        tracing::trace!(surface = id.raw(), "display move of unknown surface");
     }
 }
 
@@ -605,6 +622,7 @@ fn render<B: Backend>(
             clear: state.clear,
             changed,
             present_pending: state.present_pending(),
+            display_moved: state.display_moved,
             tree: &state.tree,
         });
     }
@@ -619,6 +637,7 @@ fn render<B: Backend>(
     )?;
     for state in surfaces.values_mut() {
         state.changed = false;
+        state.display_moved = false;
         state.presented();
     }
     if let Redraw::Wanted { rate: backend_rate } = redraw {
@@ -672,6 +691,7 @@ async fn render_local<B: Backend>(
             clear: state.clear,
             changed,
             present_pending: state.present_pending(),
+            display_moved: state.display_moved,
             tree: &state.tree,
         });
     }
@@ -688,6 +708,7 @@ async fn render_local<B: Backend>(
         .await?;
     for state in surfaces.values_mut() {
         state.changed = false;
+        state.display_moved = false;
         state.presented();
     }
     if let Redraw::Wanted { rate: backend_rate } = redraw {
@@ -733,6 +754,7 @@ mod tests {
             clear: WorkingColor::TRANSPARENT,
             changed: false,
             presentation: Presentation::Retained,
+            display_moved: false,
             content_animating: false,
         };
 
@@ -819,6 +841,7 @@ impl<B: Backend> LocalState<B> {
                 destroy_surface::<B>(renderer, surfaces, resources, id);
             }
             Message::Display { id, display } => set_display(surfaces, id, display),
+            Message::DisplayMoved { id } => set_display_moved(surfaces, id),
             Message::Resource(op) => op(renderer),
             Message::Register { resource, op } => {
                 let result = op(renderer).await;

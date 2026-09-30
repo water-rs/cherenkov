@@ -107,9 +107,11 @@ pub enum NullReject {
 /// `Null`'s provenance: nothing to report.
 pub type NullInfo = ();
 
-/// The `Null` render-thread state. Registration and removal events are
-/// reported only for committed transitions — a `remove_*` for an id the
-/// backend never added is a no-op, as in a real backend.
+/// The `Null` render-thread state, with strict removal.
+///
+/// A `remove_*` or `destroy_surface` for an id the backend does not hold
+/// panics on the render thread, so a spurious removal fails the test that
+/// caused it instead of passing as a no-op.
 pub struct NullRenderer {
     events: Sender<Event>,
     reject: HashSet<NullReject>,
@@ -184,10 +186,13 @@ impl Renderer for NullRenderer {
     }
 
     fn destroy_surface(&mut self, id: SurfaceId) {
+        assert!(
+            self.surfaces.remove(&id),
+            "destruction of unknown surface {}",
+            id.raw()
+        );
         self.pictures.retain(|(surface, _), _| *surface != id);
-        if self.surfaces.remove(&id) {
-            let _ = self.events.send(Event::DestroySurface(id));
-        }
+        let _ = self.events.send(Event::DestroySurface(id));
     }
 
     /// `Null` draws no glyphs, so any data is a font.
@@ -201,9 +206,12 @@ impl Renderer for NullRenderer {
     }
 
     fn remove_font(&mut self, id: FontId) {
-        if self.fonts.remove(&id) {
-            let _ = self.events.send(Event::RemoveFont(id));
-        }
+        assert!(
+            self.fonts.remove(&id),
+            "removal of unregistered font {}",
+            id.raw()
+        );
+        let _ = self.events.send(Event::RemoveFont(id));
     }
 
     fn add_image(&mut self, id: ImageId, _image: ImageUpload) -> Result<(), ResourceError> {
@@ -234,9 +242,12 @@ impl Renderer for NullRenderer {
     }
 
     fn remove_image(&mut self, id: ImageId) {
-        if self.images.remove(&id) {
-            let _ = self.events.send(Event::RemoveImage(id));
-        }
+        assert!(
+            self.images.remove(&id),
+            "removal of unregistered image {}",
+            id.raw()
+        );
+        let _ = self.events.send(Event::RemoveImage(id));
     }
 
     fn set_content(
@@ -396,9 +407,12 @@ impl ShaderPaint for Null {
     }
 
     fn remove_shader(r: &mut NullRenderer, id: ShaderId) {
-        if r.shaders.remove(&id) {
-            let _ = r.events.send(Event::RemoveShader(id));
-        }
+        assert!(
+            r.shaders.remove(&id),
+            "removal of unregistered shader {}",
+            id.raw()
+        );
+        let _ = r.events.send(Event::RemoveShader(id));
     }
 }
 
@@ -1365,7 +1379,12 @@ mod tests {
         );
         drop(image);
         drop(shader);
-        let _ = engine.memory();
+        // The render is applied after both releases, and fails when a
+        // strict `Null` removal of the never-added resources panicked the
+        // render thread.
+        engine
+            .render(FrameTime::now())
+            .expect("no removal reached the backend");
         balance::assert_balanced(&rx);
     }
 

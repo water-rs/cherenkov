@@ -6,9 +6,9 @@
 //! functions in the destination's stored units.
 
 use cherenkov_gpu::interop::{
-    shader_delivery, wgpu, OutputAlpha, OutputColor, Presenter, TextureOutput,
+    OutputAlpha, OutputColor, Presenter, TextureOutput, shader_delivery, wgpu,
 };
-use cherenkov_oracle::{present, Image};
+use cherenkov_oracle::{Image, present};
 
 /// The corpus pixels every encoding presents (premultiplied linear
 /// Display P3).
@@ -271,166 +271,174 @@ fn every_output_encoding_matches_the_oracle() -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
-/// Exact stored values at canonical inputs: SDR white's encoding, the
-/// 0.18 midtone a transfer-coefficient slip once escaped through
-/// `assert_close`'s tolerance, an HDR neutral, and a negative extended
-/// component. Each is compared to the oracle's `present_*` value at
-/// headroom 2 within the destination's own quantization — ±1 LSB for
-/// unorm-8, ~2⁻¹¹ relative for f16 — so a subtle curve error cannot
-/// hide in the broad relative tolerance (#98).
+/// One pinned anchor: `(pixel, stored value, per-channel tolerance)`.
+type Anchor = (usize, [f64; 4], f64);
+/// One pinned case: `(format, color, anchors)`.
+type PinnedCase = (wgpu::TextureFormat, OutputColor, &'static [Anchor]);
+
+/// The oracle's exact stored values at headroom 2 for canonical inputs:
+/// SDR white's encoding, the 0.18 midtone a transfer-coefficient slip
+/// once escaped `assert_close`'s tolerance through, an HDR neutral, and
+/// a negative extended component (#98).
+const SRGB_018: [f64; 4] = [
+    0.461_356_129_500_441_6,
+    0.461_356_118_743_022_07,
+    0.461_356_129_500_441_6,
+    1.0,
+];
+/// `DisplayP3` at 0.18 — same OETF, exact P3 primaries.
+const DISPLAY_P3_018: [f64; 4] = [
+    0.461_356_129_500_441_6,
+    0.461_356_129_500_441_6,
+    0.461_356_129_500_441_6,
+    1.0,
+];
+const PINNED: [PinnedCase; 10] = [
+    (
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        OutputColor::Srgb,
+        &[
+            (1, SRGB_018, 0.0045),
+            (2, [1.0, 0.999_999_978_020_833, 1.0, 1.0], 0.0045),
+        ],
+    ),
+    (
+        wgpu::TextureFormat::Rgba8Unorm,
+        OutputColor::Srgb,
+        &[(1, SRGB_018, 0.0045)],
+    ),
+    (
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+        OutputColor::DisplayP3,
+        &[(1, DISPLAY_P3_018, 0.0045)],
+    ),
+    (
+        wgpu::TextureFormat::Rgba8Unorm,
+        OutputColor::DisplayP3,
+        &[(1, DISPLAY_P3_018, 0.0045)],
+    ),
+    (
+        wgpu::TextureFormat::Rgba16Float,
+        OutputColor::LinearDisplayP3,
+        &[
+            (2, [1.0, 1.0, 1.0, 1.0], 0.0015),
+            (3, [1.5, 1.5, 1.5, 1.0], 0.0025),
+        ],
+    ),
+    (
+        wgpu::TextureFormat::Rgba16Float,
+        OutputColor::ExtendedSrgbLinear,
+        &[(
+            10,
+            [-0.418_705_15, 0.531_542_687_5, 0.624_555_522_5, 1.0],
+            0.001,
+        )],
+    ),
+    (
+        wgpu::TextureFormat::Rgba16Float,
+        OutputColor::ExtendedSrgb,
+        &[
+            (
+                3,
+                [
+                    1.194_176_534_680_845,
+                    1.194_176_508_656_333_4,
+                    1.194_176_534_680_845,
+                    1.0,
+                ],
+                0.002,
+            ),
+            (
+                10,
+                [
+                    -0.679_030_747_736_711_2,
+                    0.755_761_942_589_218_6,
+                    0.812_109_075_340_857_7,
+                    1.0,
+                ],
+                0.001,
+            ),
+        ],
+    ),
+    (
+        wgpu::TextureFormat::Rgba16Float,
+        OutputColor::ExtendedDisplayP3,
+        &[(
+            3,
+            [
+                1.194_176_534_680_844_8,
+                1.194_176_534_680_844_8,
+                1.194_176_534_680_844_8,
+                1.0,
+            ],
+            0.002,
+        )],
+    ),
+    (
+        wgpu::TextureFormat::Rgba16Float,
+        OutputColor::Bt2100Pq,
+        &[
+            (
+                1,
+                [
+                    0.410_896_752_036_804_8,
+                    0.410_896_752_013_288_07,
+                    0.410_896_752_034_422_2,
+                    1.0,
+                ],
+                0.0006,
+            ),
+            (
+                2,
+                [
+                    0.580_688_881_036_098_6,
+                    0.580_688_881_009_468_8,
+                    0.580_688_881_033_406_4,
+                    1.0,
+                ],
+                0.0006,
+            ),
+        ],
+    ),
+    (
+        wgpu::TextureFormat::Rgba16Float,
+        OutputColor::Bt2100Hlg,
+        &[
+            (
+                1,
+                [
+                    0.436_228_651_804_967_84,
+                    0.436_228_651_749_412_8,
+                    0.436_228_651_799_355_5,
+                    1.0,
+                ],
+                0.0006,
+            ),
+            (
+                2,
+                [
+                    0.749_877_365_099_685_5,
+                    0.749_877_365_049_653_5,
+                    0.749_877_365_094_631_2,
+                    1.0,
+                ],
+                0.0006,
+            ),
+        ],
+    ),
+];
+
+/// Each pinned stored value is compared to the oracle's `present_*`
+/// value at headroom 2 within the destination's own quantization —
+/// ±1 LSB for unorm-8, ~2⁻¹¹ relative for f16 — so a subtle transfer
+/// -curve error cannot hide in the broad relative tolerance (#98).
 #[test]
 fn output_encodings_pin_known_values() -> Result<(), Box<dyn std::error::Error>> {
     let pixels = pixels();
     let (adapter, device, queue) = shared_device()?;
     let source = f16_texture(&device, &queue, &pixels);
     let headroom = 2.0f32;
-    let f16 = wgpu::TextureFormat::Rgba16Float;
-    let srgb_018 = [
-        0.4613561295004416,
-        0.46135611874302207,
-        0.4613561295004416,
-        1.0,
-    ];
-    let display_p3_018 = [
-        0.4613561295004416,
-        0.4613561295004416,
-        0.4613561295004416,
-        1.0,
-    ];
-    // (format, color, [(pixel, stored value, per-channel tolerance)])
-    let cases: [(wgpu::TextureFormat, OutputColor, &[(usize, [f64; 4], f64)]); 11] = [
-        (
-            wgpu::TextureFormat::Rgba8UnormSrgb,
-            OutputColor::Srgb,
-            &[
-                (1, srgb_018, 0.0045),
-                (2, [1.0, 0.999999978020833, 1.0, 1.0], 0.0045),
-            ],
-        ),
-        (
-            wgpu::TextureFormat::Rgba8Unorm,
-            OutputColor::Srgb,
-            &[(1, srgb_018, 0.0045)],
-        ),
-        (
-            wgpu::TextureFormat::Rgba8UnormSrgb,
-            OutputColor::DisplayP3,
-            &[(1, display_p3_018, 0.0045)],
-        ),
-        (
-            wgpu::TextureFormat::Rgba8Unorm,
-            OutputColor::DisplayP3,
-            &[(1, display_p3_018, 0.0045)],
-        ),
-        (
-            f16,
-            OutputColor::LinearDisplayP3,
-            &[
-                (2, [1.0, 1.0, 1.0, 1.0], 0.0015),
-                (3, [1.5, 1.5, 1.5, 1.0], 0.0025),
-            ],
-        ),
-        (
-            f16,
-            OutputColor::ExtendedSrgbLinear,
-            &[(10, [-0.41870515, 0.5315426875, 0.6245555225, 1.0], 0.001)],
-        ),
-        (
-            f16,
-            OutputColor::ExtendedSrgb,
-            &[(
-                3,
-                [
-                    1.194176534680845,
-                    1.1941765086563334,
-                    1.194176534680845,
-                    1.0,
-                ],
-                0.002,
-            )],
-        ),
-        (
-            f16,
-            OutputColor::ExtendedDisplayP3,
-            &[(
-                3,
-                [
-                    1.1941765346808448,
-                    1.1941765346808448,
-                    1.1941765346808448,
-                    1.0,
-                ],
-                0.002,
-            )],
-        ),
-        (
-            f16,
-            OutputColor::Bt2100Pq,
-            &[
-                (
-                    1,
-                    [
-                        0.4108967520368048,
-                        0.41089675201328807,
-                        0.4108967520344222,
-                        1.0,
-                    ],
-                    0.0006,
-                ),
-                (
-                    2,
-                    [
-                        0.5806888810360986,
-                        0.5806888810094688,
-                        0.5806888810334064,
-                        1.0,
-                    ],
-                    0.0006,
-                ),
-            ],
-        ),
-        (
-            f16,
-            OutputColor::Bt2100Hlg,
-            &[
-                (
-                    1,
-                    [
-                        0.43622865180496784,
-                        0.43622865174941278,
-                        0.4362286517993555,
-                        1.0,
-                    ],
-                    0.0006,
-                ),
-                (
-                    2,
-                    [
-                        0.7498773650996855,
-                        0.7498773650496535,
-                        0.7498773650946312,
-                        1.0,
-                    ],
-                    0.0006,
-                ),
-            ],
-        ),
-        (
-            f16,
-            OutputColor::ExtendedSrgb,
-            &[(
-                10,
-                [
-                    -0.6790307477367112,
-                    0.7557619425892186,
-                    0.8121090753408577,
-                    1.0,
-                ],
-                0.001,
-            )],
-        ),
-    ];
-    for (format, color, anchors) in cases {
+    for (format, color, anchors) in PINNED {
         let got = present_gpu(
             &adapter,
             &device,

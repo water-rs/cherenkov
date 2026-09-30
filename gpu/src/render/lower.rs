@@ -36,8 +36,8 @@ pub enum Target {
     Surface,
     /// Scratch texture at this isolation depth index.
     Scratch(usize),
-    /// A backdrop group's capture texture (the group's raw id).
-    Backdrop(u64),
+    /// A backdrop group's capture texture for this region index.
+    Backdrop { group: u64, region: u32 },
 }
 
 /// The texture a draw range samples at bind group 1.
@@ -45,8 +45,8 @@ pub enum Target {
 pub enum Source {
     /// Scratch texture at this isolation depth index.
     Scratch(usize),
-    /// A backdrop group's capture texture.
-    Backdrop(u64),
+    /// A backdrop group's capture texture for this region index.
+    Backdrop { group: u64, region: u32 },
 }
 
 /// The blend pipeline a draw range uses.
@@ -130,6 +130,8 @@ pub struct Pass {
 pub struct Capture {
     /// The group's raw id.
     pub group: u64,
+    /// The capture's index in the group's region list.
+    pub region: u32,
     /// The nearest semantic isolation's target: [`Target::Surface`] or a
     /// [`Target::Scratch`] whose region is guaranteed the full surface.
     pub copy_from: Target,
@@ -614,18 +616,123 @@ pub struct BackdropGroupInfo {
     pub footprint: Option<filtrate_core::Footprint>,
 }
 
+/// The per-region capture overhead in captured pixels: a separated pair
+/// merges only while its bounding box wastes fewer pixels than this.
+/// Measured on lavapipe (#117): frame GPU time fits
+/// `c + a·regions + b·pixels` with `a` indistinguishable from zero
+/// (at most ~123 px of work at σ = 8), so the threshold is that bound
+/// rounded up to a power of two.
+const OVERHEAD_PX: u64 = 128;
+
+/// Groups with more members than this use one union region: the O(n²)
+/// clustering pass is bounded, and the union is always a correct answer.
+const MAX_CLUSTER_MEMBERS: usize = 64;
+
+/// One cluster's bounding box and the member indices (into the caller's
+/// rect list) it contains.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Cluster {
+    /// The cluster's axis-aligned bounding box (`x, y, w, h`).
+    pub bbox: [u32; 4],
+    /// Indices into the input rect list, in input order.
+    pub members: Vec<u32>,
+}
+
+fn area(r: [u32; 4]) -> u64 {
+    u64::from(r[2]) * u64::from(r[3])
+}
+
+fn bbox(a: [u32; 4], b: [u32; 4]) -> [u32; 4] {
+    let x0 = a[0].min(b[0]);
+    let y0 = a[1].min(b[1]);
+    let x1 = (a[0] + a[2]).max(b[0] + b[2]);
+    let y1 = (a[1] + a[3]).max(b[1] + b[3]);
+    [x0, y0, x1 - x0, y1 - y0]
+}
+
+/// Clusters aproned member rects into capture regions: agglomerative
+/// merge on `cost(cluster) = area(bbox) + overhead`, always taking the
+/// lowest-waste pair while `waste < overhead` — overlapping or touching
+/// rects (waste ≤ 0) always merge. Deterministic: ties break on the
+/// lowest first index. `rects` is in member paint order.
+fn cluster(rects: &[[u32; 4]], overhead: u64) -> Vec<Cluster> {
+    if rects.len() > MAX_CLUSTER_MEMBERS {
+        let mut u = rects[0];
+        for &r in &rects[1..] {
+            u = bbox(u, r);
+        }
+        return vec![Cluster {
+            bbox: u,
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "member count is bounded by the caller's layer count"
+            )]
+            members: (0..rects.len() as u32).collect(),
+        }];
+    }
+    let mut clusters: Vec<Cluster> = rects
+        .iter()
+        .enumerate()
+        .map(|(i, &r)| Cluster {
+            bbox: r,
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "member count is bounded by the caller's layer count"
+            )]
+            members: vec![i as u32],
+        })
+        .collect();
+    loop {
+        let mut best: Option<(u64, usize, usize)> = None;
+        for i in 0..clusters.len() {
+            for j in (i + 1)..clusters.len() {
+                let u = bbox(clusters[i].bbox, clusters[j].bbox);
+                // Signed waste would need care at u64 bounds; saturating
+                // keeps `waste < overhead` correct (waste < 0 merges).
+                let waste = area(u).saturating_sub(area(clusters[i].bbox) + area(clusters[j].bbox));
+                // Overlapping or touching rects merge unconditionally;
+                // a bbox area comparison cannot see an L-shaped overlap.
+                let [a, b] = [clusters[i].bbox, clusters[j].bbox];
+                let touch = a[0] <= b[0] + b[2]
+                    && b[0] <= a[0] + a[2]
+                    && a[1] <= b[1] + b[3]
+                    && b[1] <= a[1] + a[3];
+                if touch {
+                    if best.is_none() {
+                        best = Some((0, i, j));
+                    }
+                } else if waste < overhead && best.is_none_or(|(w, _, _)| waste < w) {
+                    best = Some((waste, i, j));
+                }
+            }
+        }
+        let Some((_, i, j)) = best else {
+            break;
+        };
+        let mut merged = clusters.remove(j);
+        let a = &mut clusters[i];
+        a.bbox = bbox(a.bbox, merged.bbox);
+        a.members.append(&mut merged.members);
+    }
+    clusters
+}
+
 /// The plan for one backdrop group: the capture point (its first member
-/// in paint order), the capture rect and every member's device bounds for
-/// its sampling composite.
+/// in paint order), the clustered capture regions and every member's
+/// device bounds for its sampling composite.
 struct BackdropPlan {
     /// The first member layer in paint order — its entry emits the capture.
     first: LayerId,
     /// The union of members' clip bounds before the footprint apron.
     union: Rect,
-    /// The capture rect in device pixels.
-    region: [u32; 4],
-    /// Each member layer's device-space clip bounds.
-    members: FxHashMap<LayerId, Rect>,
+    /// Each member's aproned rect (`A_i`) in paint order — the
+    /// clustering input.
+    aproned: Vec<(LayerId, Rect)>,
+    /// The capture regions in device pixels, one per cluster; the
+    /// single-region case is exactly the union rect of the old plan.
+    regions: Vec<[u32; 4]>,
+    /// Each member layer's device-space clip bounds and region index.
+    members: FxHashMap<LayerId, (Rect, u32)>,
 }
 
 /// The lowering walk state for one surface frame.
@@ -731,15 +838,38 @@ impl<'a> Lowering<'a> {
     /// Lowers a surface's sampled [`SurfaceTree`] and its clear colour
     /// into the frame. `caches` holds each layer's render-side content.
     /// Plans every backdrop group: paint-order walk collecting each
-    /// member's device-space clip bounds, then the capture region — the
-    /// union inflated by the filter footprint's apron, intersected with
-    /// the surface and rounded outward to integer pixels.
+    /// member's device-space clip bounds, then the capture regions — each
+    /// member's aproned rect `A_i` (bounds ∪ reach, inflated by the filter
+    /// footprint's apron) integer-rounded and clipped to the surface,
+    /// clustered by the `cluster` cost model into one or more regions.
+    /// A group that ends up with one region produces exactly the union
+    /// rect this planning always made.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "region coordinates are finite, non-negative and below the surface size"
+    )]
     fn plan_backdrops(
         &mut self,
         tree: &SurfaceTree,
         groups: &FxHashMap<u64, BackdropGroupInfo>,
     ) -> Result<(), RenderError> {
         self.plan_layer(tree.root(), tree, groups, Affine::IDENTITY)?;
+        let (w, h) = (f64::from(self.width), f64::from(self.height));
+        // A member's aproned rect in integer pixels, `None` when it is
+        // empty or clipped fully off the surface.
+        let aproned = |r: Rect, a: f64| -> Option<[u32; 4]> {
+            let x0 = (r.x0 - a).floor().max(0.0);
+            let y0 = (r.y0 - a).floor().max(0.0);
+            let x1 = (r.x1 + a).ceil().min(w);
+            let y1 = (r.y1 + a).ceil().min(h);
+            (x1 > x0 && y1 > y0).then_some([
+                x0 as u32,
+                y0 as u32,
+                (x1 - x0) as u32,
+                (y1 - y0) as u32,
+            ])
+        };
         for (gid, plan) in &mut self.backdrops {
             let footprint = groups
                 .get(gid)
@@ -754,27 +884,48 @@ impl<'a> Lowering<'a> {
             if uw.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater)
                 || uh.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater)
             {
-                plan.region = [0; 4];
+                plan.regions = Vec::new();
+                continue;
+            }
+            // Relative-extent filters make the apron depend on the region
+            // size, so per-cluster regions are not guaranteed identical:
+            // they stay a single union region (a rule, not an error).
+            if footprint.extent > 0.0 {
+                let a = (f64::from(footprint.extent)
+                    .mul_add(uw.max(uh), f64::from(footprint.pixels))
+                    / 2.0f64.mul_add(-f64::from(footprint.extent), 1.0))
+                .ceil();
+                plan.regions = aproned(plan.union, a).into_iter().collect();
+                for (i, _) in &plan.aproned {
+                    plan.members.entry(*i).and_modify(|e| e.1 = 0);
+                }
                 continue;
             }
             let a = (f64::from(footprint.extent).mul_add(uw.max(uh), f64::from(footprint.pixels))
                 / 2.0f64.mul_add(-f64::from(footprint.extent), 1.0))
             .ceil();
-            let x0 = (plan.union.x0 - a).floor().max(0.0);
-            let y0 = (plan.union.y0 - a).floor().max(0.0);
-            let x1 = (plan.union.x1 + a).ceil().min(f64::from(self.width));
-            let y1 = (plan.union.y1 + a).ceil().min(f64::from(self.height));
-            plan.region = if x1 <= x0 || y1 <= y0 {
-                [0; 4]
-            } else {
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    clippy::cast_sign_loss,
-                    reason = "region coordinates are finite, non-negative and below the surface size"
-                )]
-                let region = [x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32];
-                region
-            };
+            // Integer aproned rects per member, in paint order. Members
+            // fully outside the surface take no region index.
+            let rects: Vec<(LayerId, Option<[u32; 4]>)> = plan
+                .aproned
+                .iter()
+                .map(|(id, r)| (*id, aproned(*r, a)))
+                .collect();
+            let have: Vec<usize> = (0..rects.len()).filter(|&i| rects[i].1.is_some()).collect();
+            let clusters = cluster(
+                &have
+                    .iter()
+                    .map(|&i| rects[i].1.unwrap())
+                    .collect::<Vec<_>>(),
+                OVERHEAD_PX,
+            );
+            plan.regions = clusters.iter().map(|c| c.bbox).collect();
+            for (r, c) in clusters.iter().enumerate() {
+                for &m in &c.members {
+                    let id = rects[have[m as usize]].0;
+                    plan.members.entry(id).and_modify(|e| e.1 = r as u32);
+                }
+            }
         }
         Ok(())
     }
@@ -813,11 +964,13 @@ impl<'a> Lowering<'a> {
             let plan = self.backdrops.entry(g).or_insert_with(|| BackdropPlan {
                 first: id,
                 union: footprint,
-                region: [0; 4],
+                aproned: Vec::new(),
+                regions: Vec::new(),
                 members: FxHashMap::default(),
             });
             plan.union = plan.union.union(footprint);
-            plan.members.insert(id, member);
+            plan.aproned.push((id, footprint));
+            plan.members.insert(id, (member, 0));
         }
         for child in &node.children {
             self.plan_layer(*child, tree, groups, parent * node.content_transform())?;
@@ -927,10 +1080,15 @@ impl<'a> Lowering<'a> {
                 // pass's instance bboxes are known.
                 Target::Scratch(_) => [0, 0, 0, 0],
                 // A capture pass covers its planned region.
-                Target::Backdrop(g) => self
+                Target::Backdrop {
+                    group: g,
+                    region: r,
+                } => self
                     .backdrops
                     .get(&g)
-                    .map_or([0, 0, 0, 0], |plan| plan.region),
+                    .and_then(|plan| plan.regions.get(r as usize))
+                    .copied()
+                    .unwrap_or([0, 0, 0, 0]),
             };
             self.frame.passes.push(Pass {
                 target: open.target,
@@ -1353,41 +1511,53 @@ impl<'a> Lowering<'a> {
         }
     }
 
-    /// Emits the group's capture pass at the first member's paint-order
-    /// position: `region` is copied from the semantic target, then every
-    /// clip-only scratch opened since it composes over that copy.
+    /// Emits the group's capture passes at the first member's paint-order
+    /// position — one per region: `region` is copied from the semantic
+    /// target, then every clip-only scratch opened since it composes over
+    /// that copy.
     fn emit_capture(&mut self, gid: u64) {
-        let region = self.backdrops[&gid].region;
+        let regions = self.backdrops[&gid].regions.clone();
         let copy_from = self.semantic_target;
         let current = if self.depth == 0 {
             Target::Surface
         } else {
             Target::Scratch(self.depth - 1)
         };
-        self.begin_pass(Target::Backdrop(gid), None);
-        if let Some(open) = &mut self.frame.open {
-            open.capture = Some(Capture {
-                group: gid,
-                copy_from,
-            });
-        }
-        let scratches = std::mem::take(&mut self.clip_scratches);
-        for &k in &scratches {
-            // Clip-only scratches cover the full surface (see `isolate`),
-            // so their texel origin is (0, 0).
-            self.emit_composite(
-                Source::Scratch(k),
-                [0.0, 0.0],
-                1.0,
-                region,
-                cherenkov::BlendMode::Normal,
+        for (r, region) in regions.iter().enumerate() {
+            #[expect(clippy::cast_possible_truncation, reason = "regions fit u32")]
+            let r = r as u32;
+            self.begin_pass(
+                Target::Backdrop {
+                    group: gid,
+                    region: r,
+                },
+                None,
             );
-        }
-        self.clip_scratches = scratches;
-        self.finish_pass();
-        let pass = self.frame.passes.len() - 1;
-        if let Some(key) = self.backdrop_filters.get(&gid) {
-            self.frame.filters.push((pass, *key));
+            if let Some(open) = &mut self.frame.open {
+                open.capture = Some(Capture {
+                    group: gid,
+                    region: r,
+                    copy_from,
+                });
+            }
+            let scratches = std::mem::take(&mut self.clip_scratches);
+            for &k in &scratches {
+                // Clip-only scratches cover the full surface (see
+                // `isolate`), so their texel origin is (0, 0).
+                self.emit_composite(
+                    Source::Scratch(k),
+                    [0.0, 0.0],
+                    1.0,
+                    *region,
+                    cherenkov::BlendMode::Normal,
+                );
+            }
+            self.clip_scratches = scratches;
+            self.finish_pass();
+            let pass = self.frame.passes.len() - 1;
+            if let Some(key) = self.backdrop_filters.get(&gid) {
+                self.frame.filters.push((pass, *key));
+            }
         }
         self.begin_pass(current, None);
         self.capture_isolation = true;
@@ -1408,13 +1578,15 @@ impl<'a> Lowering<'a> {
         let Some(plan) = self.backdrops.get(&gid) else {
             return Ok(());
         };
-        let region = plan.region;
+        let Some(&(member_bounds, r)) = plan.members.get(&member) else {
+            return Ok(());
+        };
+        let Some(&region) = plan.regions.get(r as usize) else {
+            return Ok(());
+        };
         if region[2] == 0 || region[3] == 0 {
             return Ok(());
         }
-        let Some(&member_bounds) = plan.members.get(&member) else {
-            return Ok(());
-        };
         let (rx, ry, rw, rh) = (
             region[0] as f32,
             region[1] as f32,
@@ -1469,7 +1641,10 @@ impl<'a> Lowering<'a> {
                 pipeline = PipelineKind::Effect(s.shader.raw());
             }
         }
-        self.set_source(Some(Source::Backdrop(gid)));
+        self.set_source(Some(Source::Backdrop {
+            group: gid,
+            region: r,
+        }));
         self.set_pipeline(pipeline);
         self.push_instance(&inst);
         self.set_pipeline(PipelineKind::SrcOver);
@@ -1714,7 +1889,7 @@ impl<'a> Lowering<'a> {
         if let Some(sample) = &backdrop {
             let gid = sample.group().raw();
             let plan = &self.backdrops[&gid];
-            if plan.first == id && plan.region[2] != 0 && plan.region[3] != 0 {
+            if plan.first == id && !plan.regions.is_empty() {
                 self.emit_capture(gid);
             }
         }
@@ -3904,5 +4079,97 @@ mod tests {
             - area(c.wide.intersect(b).intersect(c.tall.intersect(b)));
         let total: f64 = strips.iter().map(|r| area(*r)).sum();
         assert_eq!(total, area(b) - covered);
+    }
+
+    fn sorted(clusters: Vec<Cluster>) -> Vec<([u32; 4], Vec<u32>)> {
+        let mut out: Vec<_> = clusters
+            .into_iter()
+            .map(|c| {
+                let mut members = c.members;
+                members.sort_unstable();
+                (c.bbox, members)
+            })
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    #[test]
+    fn cluster_overlapping_rects_always_merge() {
+        let rects = [[0, 0, 10, 10], [5, 5, 10, 10], [8, 2, 4, 4]];
+        let merged = sorted(cluster(&rects, 0));
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].0, [0, 0, 15, 15]);
+        assert_eq!(merged[0].1, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn cluster_touching_rects_always_merge() {
+        let rects = [[0, 0, 10, 10], [10, 0, 10, 10]];
+        let merged = cluster(&rects, 0);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].bbox, [0, 0, 20, 10]);
+    }
+
+    #[test]
+    fn cluster_far_rects_stay_apart() {
+        let rects = [[0, 0, 10, 10], [1000, 1000, 10, 10]];
+        assert_eq!(cluster(&rects, OVERHEAD_PX).len(), 2);
+    }
+
+    #[test]
+    fn cluster_waste_gate_is_strictly_less() {
+        // Two 10x10 rects 10px apart: bbox 30x10 = 300, waste = 100.
+        let rects = [[0, 0, 10, 10], [20, 0, 10, 10]];
+        assert_eq!(cluster(&rects, 100).len(), 2);
+        let merged = cluster(&rects, 101);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].bbox, [0, 0, 30, 10]);
+    }
+
+    #[test]
+    fn cluster_is_order_independent() {
+        let rects = [
+            [0, 0, 10, 10],
+            [500, 0, 10, 10],
+            [4, 4, 10, 10],
+            [504, 4, 10, 10],
+            [2000, 2000, 5, 5],
+        ];
+        let mut rev = rects;
+        rev.reverse();
+        let a = sorted(cluster(&rects, 50));
+        let b = sorted(cluster(&rev, 50));
+        let mut b_sorted = b;
+        for (_, members) in &mut b_sorted {
+            for m in members.iter_mut() {
+                #[expect(clippy::cast_possible_truncation, reason = "test member count")]
+                let n = rects.len() as u32;
+                *m = n - 1 - *m;
+            }
+            members.sort_unstable();
+        }
+        b_sorted.sort_unstable();
+        assert_eq!(a, b_sorted);
+    }
+
+    #[test]
+    fn cluster_member_cap_forces_union() {
+        #[expect(clippy::cast_possible_truncation, reason = "the member cap fits u32")]
+        let rects: Vec<[u32; 4]> = (0..=MAX_CLUSTER_MEMBERS as u32)
+            .map(|i| [i * 10_000, 0, 10, 10])
+            .collect();
+        let merged = cluster(&rects, 0);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].members.len(), MAX_CLUSTER_MEMBERS + 1);
+    }
+
+    #[test]
+    fn cluster_chain_merges_through_bridges() {
+        // a--b overlap, then ab--c merges within overhead (waste 50).
+        let rects = [[0, 0, 10, 10], [5, 0, 10, 10], [20, 0, 10, 10]];
+        let merged = cluster(&rects, 60);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].bbox, [0, 0, 30, 10]);
     }
 }

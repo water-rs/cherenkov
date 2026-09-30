@@ -670,3 +670,126 @@ fn a_shaders_reach_grows_the_capture_region() -> Result<(), Box<dyn std::error::
     assert_eq!(memory.backdrop_capture_format, Some("rgba16float"));
     Ok(())
 }
+
+/// Two members far enough apart take two capture regions; the pixels
+/// inside each are identical to one single-member group each (#117).
+#[expect(clippy::float_cmp, reason = "regions must be byte-identical")]
+#[test]
+fn far_members_take_two_regions() -> Result<(), Box<dyn std::error::Error>> {
+    #[expect(clippy::type_complexity, reason = "test helper")]
+    fn render_bars(
+        two_groups: bool,
+    ) -> Result<
+        (
+            Engine<Gpu>,
+            cherenkov::Surface<Gpu>,
+            cherenkov::Readback,
+            cherenkov::BackdropGroup,
+            Option<cherenkov::BackdropGroup>,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let engine = Engine::<Gpu>::new(GpuConfig::default())?;
+        let surface = engine.surface(Offscreen::new((512, 512), OffscreenFormat::LinearF16))?;
+        let group_a = surface.backdrop_group_unfiltered();
+        let group_b = two_groups.then(|| surface.backdrop_group_unfiltered());
+        let top = surface.layer();
+        let bottom = surface.layer();
+        surface.update(|tx| {
+            tx[surface.root()].content(surface.record(|r| {
+                r.fill(
+                    Rect::new(0.0, 0.0, 512.0, 512.0),
+                    WorkingColor::new([0.0, 1.0, 0.0, 1.0]),
+                );
+            }));
+            tx[surface.root()].push(&top).push(&bottom);
+            tx[&top]
+                .clip(Rect::new(0.0, 0.0, 512.0, 96.0))
+                .backdrop(group_a.sample());
+            tx[&bottom]
+                .clip(Rect::new(0.0, 416.0, 512.0, 512.0))
+                .backdrop(group_b.as_ref().unwrap_or(&group_a).sample());
+        });
+        engine.render(FrameTime::now())?;
+        let readback = surface.readback()?;
+        Ok((engine, surface, readback, group_a, group_b))
+    }
+
+    let (engine_a, _surface_a, readback_a, _group_a, _group_ba) = render_bars(false)?;
+    // Two regions: 512x96 + 512x96 texels at 8 bytes.
+    assert_eq!(engine_a.memory().backdrop_captures, Bytes(2 * 512 * 96 * 8));
+    let (engine_b, _surface_b, readback_b, _group_c, _group_d) = render_bars(true)?;
+    assert_eq!(engine_b.memory().backdrop_captures, Bytes(2 * 512 * 96 * 8));
+    // Inside both bars the pixels are byte-identical between the
+    // two-region one-group render and the two single-member groups.
+    for y in (0..96).chain(416..512) {
+        for x in 0..512 {
+            assert_eq!(
+                pixel(&readback_a, x, y),
+                pixel(&readback_b, x, y),
+                "pixel {x},{y} differs"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A member's effect reach inflates its aproned rect, so two members
+/// whose raw bounds are apart merge into one region once `A_i` overlaps.
+#[test]
+fn reach_merges_aproned_rects() -> Result<(), Box<dyn std::error::Error>> {
+    let engine = Engine::<Gpu>::new(GpuConfig::default())?;
+    let surface = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
+    let group = surface.backdrop_group_unfiltered();
+    let a = surface.layer();
+    let b = surface.layer();
+    surface.update(|tx| {
+        tx[surface.root()].push(&a).push(&b);
+        // a: 4..12 x 4..12, A = raw 8x8.
+        tx[&a]
+            .clip(Rect::new(4.0, 4.0, 12.0, 12.0))
+            .backdrop(group.sample());
+        // b: 16..24 x 4..12 raw (no touch: 12 < 16); reach 8 inflates it
+        // to 8..32 x -4..20, which overlaps a's A.
+        tx[&b]
+            .clip(Rect::new(16.0, 4.0, 24.0, 12.0))
+            .backdrop(group.sample_with(cherenkov::Refraction {
+                depth: 4.0,
+                strength: 8.0,
+            }));
+    });
+    engine.render(FrameTime::now())?;
+    // One merged region: A_a is [4,4,8,8]; A_b is b's bounds inflated by
+    // the 8 px reach (8..32 x -4..20), clipped to [8,0,24,20]. They
+    // overlap, so the union region is [4,0,28,20] = 560 texels — not the
+    // 64+480 of two separate regions.
+    assert_eq!(engine.memory().backdrop_captures, Bytes(28 * 20 * 8));
+    Ok(())
+}
+
+/// Removing a member drops its region and the capture bytes shrink.
+#[test]
+fn removing_a_member_drops_its_region() -> Result<(), Box<dyn std::error::Error>> {
+    let engine = Engine::<Gpu>::new(GpuConfig::default())?;
+    let surface = engine.surface(Offscreen::new((512, 512), OffscreenFormat::LinearF16))?;
+    let group = surface.backdrop_group_unfiltered();
+    let top = surface.layer();
+    let bottom = surface.layer();
+    surface.update(|tx| {
+        tx[surface.root()].push(&top).push(&bottom);
+        tx[&top]
+            .clip(Rect::new(0.0, 0.0, 512.0, 96.0))
+            .backdrop(group.sample());
+        tx[&bottom]
+            .clip(Rect::new(0.0, 416.0, 512.0, 512.0))
+            .backdrop(group.sample());
+    });
+    engine.render(FrameTime::now())?;
+    assert_eq!(engine.memory().backdrop_captures, Bytes(2 * 512 * 96 * 8));
+    surface.update(|tx| {
+        tx[surface.root()].remove(&bottom);
+    });
+    engine.render(FrameTime::now())?;
+    assert_eq!(engine.memory().backdrop_captures, Bytes(512 * 96 * 8));
+    Ok(())
+}

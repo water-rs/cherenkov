@@ -3632,13 +3632,13 @@ impl GpuRenderer {
                 // their live key does — evicting a shelf drops every
                 // key on it (#119).
                 let live = if emission.is_arena_refs() {
-                    self.atlas.live_alive(emission.live_key)
+                    self.atlas.live_alive(emission.live_stamp)
                 } else {
                     content.storage.refs[emission.refs_range()]
                         .iter()
                         .all(|&(s, ep)| self.atlas.shelf_epoch(s) == ep)
                 };
-                if live {
+                if live && !emission.is_arena_refs() {
                     emission.live_stamp = self.atlas.live_stamp();
                 }
             }

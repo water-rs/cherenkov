@@ -619,13 +619,13 @@ pub struct Emission {
     pub(crate) refs: u64,
     /// Atlas texture generation and eviction clock at last verification
     /// — one compare on the hit fast path; `LIVE_PENDING` while the
-    /// commit that resolves `refs` has not landed (#119).
+    /// commit that resolves `refs` has not landed. With `ARENA_REFS`
+    /// set this instead holds the `live` key the replayed emission was
+    /// found under: its survival is the whole band set's liveness,
+    /// since evicting a shelf drops every key on it. A key colliding
+    /// with a stamp value is the accepted 2^-64 hash-collision class
+    /// of the `live` map's own keys (#119).
     pub(crate) live_stamp: u64,
-    /// The `live` key the replayed emission was found under — its
-    /// survival is the whole band set's liveness, since evicting a
-    /// shelf drops every key on it. Zero when `refs` is not
-    /// `ARENA_REFS` (#119).
-    pub(crate) live_key: u64,
     template: usize,
     // Only shadows carry an occlusion key; ordinary leaves keep a small index.
     cover: Option<usize>,
@@ -646,14 +646,11 @@ impl Emission {
         if self.live_stamp == stamp {
             return true;
         }
-        if self.live_stamp == LIVE_PENDING {
-            return false;
-        }
         if self.is_arena_refs() {
-            if atlas.live_alive(self.live_key) {
-                self.live_stamp = stamp;
-                return true;
-            }
+            // `live_stamp` is the key — never restamp it.
+            return atlas.live_alive(self.live_stamp);
+        }
+        if self.live_stamp == LIVE_PENDING {
             return false;
         }
         if refs
@@ -673,7 +670,8 @@ impl Emission {
     #[cold]
     #[inline(never)]
     fn stale_live(&mut self, atlas: &Atlas, storage: &EmissionStorage) -> bool {
-        self.live_stamp != LIVE_PENDING && self.atlas_live(atlas, &storage.refs[self.refs_range()])
+        (self.is_arena_refs() || self.live_stamp != LIVE_PENDING)
+            && self.atlas_live(atlas, &storage.refs[self.refs_range()])
     }
 
     /// `start << 32 | len` packing for `refs`; `start` stays under
@@ -2563,8 +2561,11 @@ impl<'a> Lowering<'a> {
             } else {
                 Emission::pack_refs(first_touch, self.touches.len() - first_touch)
             },
-            live_stamp: LIVE_PENDING,
-            live_key: self.hit_key,
+            live_stamp: if self.hit_refs != 0 {
+                self.hit_key
+            } else {
+                LIVE_PENDING
+            },
             template,
             cover: cover.map(|cover| {
                 storage.covers.push(cover);

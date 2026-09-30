@@ -549,17 +549,30 @@ struct Present {
 /// The destination texture format of a `--present` kind.
 const fn present_format(kind: PresentKind) -> wgpu::TextureFormat {
     match kind {
-        PresentKind::SrgbHw => wgpu::TextureFormat::Rgba8UnormSrgb,
-        PresentKind::SrgbShader => wgpu::TextureFormat::Rgba8Unorm,
-        PresentKind::LinearP3 => wgpu::TextureFormat::Rgba16Float,
+        PresentKind::SrgbHw | PresentKind::DisplayP3Hw => wgpu::TextureFormat::Rgba8UnormSrgb,
+        PresentKind::SrgbShader | PresentKind::DisplayP3Shader => wgpu::TextureFormat::Rgba8Unorm,
+        PresentKind::LinearP3
+        | PresentKind::Scrgb
+        | PresentKind::ExtendedSrgb
+        | PresentKind::ExtendedP3
+        | PresentKind::Pq
+        | PresentKind::Hlg => wgpu::TextureFormat::Rgba16Float,
     }
 }
 
 /// Bytes per pixel of a kind's destination texture.
 const fn present_texel_size(kind: PresentKind) -> u32 {
     match kind {
-        PresentKind::SrgbHw | PresentKind::SrgbShader => 4,
-        PresentKind::LinearP3 => 8,
+        PresentKind::SrgbHw
+        | PresentKind::SrgbShader
+        | PresentKind::DisplayP3Hw
+        | PresentKind::DisplayP3Shader => 4,
+        PresentKind::LinearP3
+        | PresentKind::Scrgb
+        | PresentKind::ExtendedSrgb
+        | PresentKind::ExtendedP3
+        | PresentKind::Pq
+        | PresentKind::Hlg => 8,
     }
 }
 
@@ -672,12 +685,56 @@ fn presented_pixels(
                 pixels.push([p3[0] as f32, p3[1] as f32, p3[2] as f32, p3[3] as f32]);
             }
         }
-        PresentKind::LinearP3 => {
+        PresentKind::DisplayP3Hw | PresentKind::DisplayP3Shader => {
+            for texel in packed.as_chunks::<4>().0 {
+                let encoded = texel.map(|v| f64::from(v) / 255.0);
+                let p3 = cherenkov_oracle::present::presented_display_p3_to_working(encoded);
+                pixels.push([p3[0] as f32, p3[1] as f32, p3[2] as f32, p3[3] as f32]);
+            }
+        }
+        PresentKind::LinearP3
+        | PresentKind::Scrgb
+        | PresentKind::ExtendedSrgb
+        | PresentKind::ExtendedP3
+        | PresentKind::Pq
+        | PresentKind::Hlg => {
             for texel in packed.as_chunks::<8>().0 {
                 let mut p = [0.0; 4];
                 for (c, b) in p.iter_mut().zip(texel.as_chunks::<2>().0) {
                     *c = half::f16::from_bits(u16::from_le_bytes(*b)).to_f32();
                 }
+                let p = match kind {
+                    PresentKind::LinearP3 => p,
+                    PresentKind::Scrgb => {
+                        cherenkov_oracle::present::presented_extended_srgb_to_working(
+                            false,
+                            p.map(f64::from),
+                        )
+                        .map(|c| c as f32)
+                    }
+                    PresentKind::ExtendedSrgb => {
+                        cherenkov_oracle::present::presented_extended_srgb_to_working(
+                            true,
+                            p.map(f64::from),
+                        )
+                        .map(|c| c as f32)
+                    }
+                    PresentKind::ExtendedP3 => {
+                        cherenkov_oracle::present::presented_extended_p3_to_working(
+                            p.map(f64::from),
+                        )
+                        .map(|c| c as f32)
+                    }
+                    PresentKind::Pq => {
+                        cherenkov_oracle::present::presented_pq_to_working(p.map(f64::from))
+                            .map(|c| c as f32)
+                    }
+                    PresentKind::Hlg => {
+                        cherenkov_oracle::present::presented_hlg_to_working(p.map(f64::from))
+                            .map(|c| c as f32)
+                    }
+                    _ => unreachable!("matched above"),
+                };
                 pixels.push(p);
             }
         }
@@ -707,6 +764,14 @@ impl Present {
                 color: match self.kind {
                     PresentKind::SrgbHw | PresentKind::SrgbShader => OutputColor::Srgb,
                     PresentKind::LinearP3 => OutputColor::LinearDisplayP3,
+                    PresentKind::DisplayP3Hw | PresentKind::DisplayP3Shader => {
+                        OutputColor::DisplayP3
+                    }
+                    PresentKind::Scrgb => OutputColor::ExtendedSrgbLinear,
+                    PresentKind::ExtendedSrgb => OutputColor::ExtendedSrgb,
+                    PresentKind::ExtendedP3 => OutputColor::ExtendedDisplayP3,
+                    PresentKind::Pq => OutputColor::Bt2100Pq,
+                    PresentKind::Hlg => OutputColor::Bt2100Hlg,
                 },
                 alpha: OutputAlpha::Premultiplied,
                 headroom: self.headroom,

@@ -28,6 +28,10 @@ struct SurfaceState {
     /// Whether a property op, a content op or an animation step touched the
     /// surface since the last render.
     changed: bool,
+    /// Whether the surface's window should present without new content —
+    /// a headroom update reaches the swapchain without touching the layer
+    /// tree or any content cache (#98).
+    present_pending: bool,
     /// Whether the surface's recorded contents still run operand animations
     /// on the UI thread. The tracks live there; they need the next frame's
     /// sample at the fast rate class.
@@ -342,6 +346,7 @@ fn create_surface<B: Backend>(
             display: Display::default(),
             clear: WorkingColor::TRANSPARENT,
             changed: true,
+            present_pending: false,
             content_animating: false,
         },
     );
@@ -383,8 +388,13 @@ fn destroy_surface<B: Backend>(
 
 fn set_display(surfaces: &mut FxHashMap<SurfaceId, SurfaceState>, id: SurfaceId, display: Display) {
     if let Some(state) = surfaces.get_mut(&id) {
-        state.display = display;
-        state.changed = true;
+        if state.display != display {
+            // A scale change reshapes the content; a headroom-only update
+            // re-presents without touching it (#98).
+            state.changed |= state.display.scale.to_bits() != display.scale.to_bits();
+            state.present_pending = true;
+            state.display = display;
+        }
     } else {
         tracing::trace!(surface = id.raw(), "display of unknown surface");
     }
@@ -548,6 +558,7 @@ fn render<B: Backend>(
             display: state.display,
             clear: state.clear,
             changed,
+            present_pending: state.present_pending,
             tree: &state.tree,
         });
     }
@@ -562,6 +573,7 @@ fn render<B: Backend>(
     )?;
     for state in surfaces.values_mut() {
         state.changed = false;
+        state.present_pending = false;
     }
     if let Redraw::Wanted { rate: backend_rate } = redraw {
         rate = Some(rate.map_or_else(
@@ -613,6 +625,7 @@ async fn render_local<B: Backend>(
             display: state.display,
             clear: state.clear,
             changed,
+            present_pending: state.present_pending,
             tree: &state.tree,
         });
     }
@@ -629,6 +642,7 @@ async fn render_local<B: Backend>(
         .await?;
     for state in surfaces.values_mut() {
         state.changed = false;
+        state.present_pending = false;
     }
     if let Redraw::Wanted { rate: backend_rate } = redraw {
         rate = Some(rate.map_or_else(
@@ -672,6 +686,7 @@ mod tests {
             display: Display::default(),
             clear: WorkingColor::TRANSPARENT,
             changed: false,
+            present_pending: false,
             content_animating: false,
         };
 

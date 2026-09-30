@@ -293,6 +293,25 @@ pub enum PresentKind {
     /// `Rgba16Float` extended linear Display P3
     /// (`OutputColor::LinearDisplayP3`).
     LinearP3,
+    /// Display P3 SDR on an sRGB texture format — hardware transfer,
+    /// P3 destination gamut (#98).
+    DisplayP3Hw,
+    /// Display P3 SDR on `Rgba8Unorm`; `present.wgsl` applies the
+    /// transfer (#98).
+    DisplayP3Shader,
+    /// `Rgba16Float` extended linear sRGB — scRGB
+    /// (`OutputColor::ExtendedSrgbLinear`, #98).
+    Scrgb,
+    /// `Rgba16Float` encoded extended sRGB
+    /// (`OutputColor::ExtendedSrgb`, #98).
+    ExtendedSrgb,
+    /// `Rgba16Float` encoded extended Display P3
+    /// (`OutputColor::ExtendedDisplayP3`, #98).
+    ExtendedP3,
+    /// `Rgba16Float` BT.2100 PQ signal (`OutputColor::Bt2100Pq`, #98).
+    Pq,
+    /// `Rgba16Float` BT.2100 HLG signal (`OutputColor::Bt2100Hlg`, #98).
+    Hlg,
 }
 
 impl PresentKind {
@@ -303,6 +322,13 @@ impl PresentKind {
             Self::SrgbHw => "srgb-hw",
             Self::SrgbShader => "srgb-shader",
             Self::LinearP3 => "linear-p3",
+            Self::DisplayP3Hw => "display-p3-hw",
+            Self::DisplayP3Shader => "display-p3-shader",
+            Self::Scrgb => "scrgb",
+            Self::ExtendedSrgb => "extended-srgb",
+            Self::ExtendedP3 => "extended-p3",
+            Self::Pq => "pq",
+            Self::Hlg => "hlg",
         }
     }
 }

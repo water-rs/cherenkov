@@ -267,6 +267,10 @@ pub struct SurfaceFrame<'a> {
     /// Whether a property op, a content op or an animation step touched the
     /// surface since the last render.
     pub changed: bool,
+    /// Whether the window should present this frame even when `changed` is
+    /// false — a headroom update reaches the swapchain without touching the
+    /// layer tree or any content cache (#98).
+    pub present_pending: bool,
     /// The sampled layer tree.
     pub tree: &'a SurfaceTree,
 }

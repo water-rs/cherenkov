@@ -152,6 +152,9 @@ struct SurfaceState {
     textures: Option<std::sync::mpsc::Sender<wgpu::Texture>>,
     refresh: cherenkov::RefreshRange,
     present_pending: bool,
+    /// The last display properties the frame carried — a change triggers
+    /// the window's output re-selection (#98).
+    display: cherenkov::Display,
     size: (u32, u32),
     /// The scratch texture format (set at creation).
     scratch_format: wgpu::TextureFormat,
@@ -1604,6 +1607,8 @@ impl Renderer for GpuRenderer {
                     window.handle,
                     size,
                     window.transparent,
+                    window.required_color_space,
+                    window.probe,
                 )?;
                 self.presenter.get_or_insert_with(|| {
                     present::Presenter::new(&self.device, self.shader_delivery)
@@ -1633,6 +1638,7 @@ impl Renderer for GpuRenderer {
                 textures,
                 refresh,
                 present_pending: false,
+                display: cherenkov::Display::default(),
                 size,
                 scratch_format: self.scratch_format,
                 target,
@@ -3186,6 +3192,18 @@ impl GpuRenderer {
         let mut redraw = None::<cherenkov::RefreshRange>;
         for sf in frame.surfaces {
             let surface = self.surfaces.get_mut(&sf.id).expect("registered surface");
+            // A headroom-only frame asks for a present without lowering
+            // new content (#98).
+            surface.present_pending |= sf.present_pending;
+            // A display change re-runs the window's output negotiation;
+            // it reconfigures only when the selected pair moves.
+            if sf.display != surface.display {
+                surface.display = sf.display;
+                if let Some(window) = &mut surface.window {
+                    window.reselect(&self.adapter, &self.device);
+                    surface.present_pending = true;
+                }
+            }
             if surface.present_pending {
                 let window = surface.window.as_ref().expect("pending window");
                 surface.present_pending = !presenter.present(

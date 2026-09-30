@@ -599,11 +599,14 @@ pub const DEFERRED_REFS: u64 = 1 << 62;
 /// Per-operation device output under its sampled placement.
 pub struct Emission {
     /// `(instance, pending raster, cell)` patch range in the producing
-    /// frame's `Lowering::cell_patches` — `inst_base << 32 | start <<
-    /// 11 | len`, verbatim frame indices resolved at apply and never
+    /// frame's `Lowering::emission_patches` — `inst_base << 32 | start
+    /// << 11 | len`, verbatim frame indices resolved at apply and never
     /// carried past it, where `inst_base` is the first frame instance
     /// slot the leaf occupied so apply and a same-frame recompose can
-    /// recover storage-local indices without copying the patch list
+    /// recover storage-local indices without copying the patch list.
+    /// The range indexes `emission_patches`, not `cell_patches`: frame
+    /// rollbacks truncate the latter but never the former, so a leaf
+    /// produced inside a rolled-back speculation keeps a valid range
     /// (#119).
     pub(crate) pending_cells: u64,
     /// `(start << 32 | len)` range into `EmissionStorage::refs`
@@ -683,7 +686,8 @@ impl Emission {
     }
 
     /// The emission's patch range in the producing frame's
-    /// `Lowering::cell_patches`, unpacked from `pending_cells` (#119).
+    /// `Lowering::emission_patches`, unpacked from `pending_cells`
+    /// (#119).
     pub(crate) const fn pending_cells(&self) -> Range<usize> {
         let start = ((self.pending_cells >> 11) & 0x1F_FFFF) as usize;
         start..start + (self.pending_cells & 0x7FF) as usize
@@ -753,6 +757,10 @@ pub struct Lowered {
     pub pending: Vec<PendingRaster>,
     /// `uv.xy` patches: `(instance, pending index, cell index)`.
     pub cell_patches: Vec<(u32, u32, u32)>,
+    /// The producing emission's view of the same triples, indexed by
+    /// `Emission::pending_cells` — survives the frame rollbacks that
+    /// truncate `cell_patches` (#119).
+    pub emission_patches: Vec<(u32, u32, u32)>,
     /// `uv.zw` patches: `(instance, pending index)`.
     pub mask_patches: Vec<(u32, u32)>,
 }
@@ -903,8 +911,15 @@ pub struct Lowering<'a> {
     glyphs: u32,
     paths: u32,
     /// `(instance, pending, cell)` triples whose `uv.xy` are set when the
-    /// render thread stores the pending path's cells.
+    /// render thread stores the pending path's cells — frame-scoped:
+    /// entries name frame instance slots and die with them on rollbacks.
     pub(crate) cell_patches: Vec<(u32, u32, u32)>,
+    /// The same triples keyed to the emission that produced them — the
+    /// list `Emission::pending_cells` ranges index. Frame rollbacks
+    /// truncate `cell_patches` but leave this intact, so a pending
+    /// emission produced inside a rolled-back scope can still resolve
+    /// its cell origins at apply (#119).
+    pub(crate) emission_patches: Vec<(u32, u32, u32)>,
     /// `(instance, pending)` pairs whose `uv.zw` are set when the render
     /// thread stores the pending clip mask.
     pub(crate) mask_patches: Vec<(u32, u32)>,
@@ -961,6 +976,7 @@ impl<'a> Lowering<'a> {
             glyphs: 0,
             paths: 0,
             cell_patches: Vec::new(),
+            emission_patches: Vec::new(),
             mask_patches: Vec::new(),
             pending: Vec::new(),
             commands_lowered: 0,
@@ -2485,7 +2501,7 @@ impl<'a> Lowering<'a> {
         self.set_image(None);
         let first_instance = self.frame.instances.len();
         let first_stop = self.frame.stops.len();
-        let first_patch = self.cell_patches.len();
+        let first_epatch = self.emission_patches.len();
         // `realize` composes path and glyph ops' local transforms into
         // `self.transform`; the leaf's placement is restored with the clip.
         let transform = self.transform;
@@ -2525,13 +2541,13 @@ impl<'a> Lowering<'a> {
             .stops
             .extend_from_slice(&self.frame.stops[first_stop..]);
         cache.data = Some(Emission {
-            pending_cells: if first_patch == self.cell_patches.len() {
+            pending_cells: if first_epatch == self.emission_patches.len() {
                 0
             } else {
                 Emission::pack_pending_cells(
                     instance_base,
-                    first_patch,
-                    self.cell_patches.len() - first_patch,
+                    first_epatch,
+                    self.emission_patches.len() - first_epatch,
                 )
             },
             // `refs` pairs are derived at apply — deferred, so the
@@ -2580,18 +2596,16 @@ impl<'a> Lowering<'a> {
             Self::apply_clip(&mut inst, clip);
             self.push_instance(&inst);
         }
-        // The producing leaf's own patches already sit in
-        // `cell_patches` verbatim; only a recompose at a different
-        // instance base re-emits them, rebased onto the new slots.
-        if !emission.pending_cells_empty() && emission.cell_inst_base() != instance_base {
-            let first = self.cell_patches.len();
-            self.cell_patches
-                .extend_from_within(emission.pending_cells());
-            for entry in &mut self.cell_patches[first..] {
-                entry.0 = entry
-                    .0
+        // The producing leaf's frame patches may be gone — rollbacks
+        // truncate `cell_patches` — so recomposes re-emit them from
+        // `emission_patches`, rebased onto the new instance slots.
+        if !emission.pending_cells_empty() {
+            for i in emission.pending_cells() {
+                let (inst, pending, cell) = self.emission_patches[i];
+                let inst = inst
                     .wrapping_sub(emission.cell_inst_base())
                     .wrapping_add(instance_base);
+                self.cell_patches.push((inst, pending, cell));
             }
         }
     }
@@ -3250,13 +3264,15 @@ impl<'a> Lowering<'a> {
             offset,
         );
         if let Some(pending) = pending {
-            self.cell_patches.extend((0..emit.cells.len()).map(|i| {
-                (
+            for i in 0..emit.cells.len() {
+                let patch = (
                     u32::try_from(first + i).expect("instance index fits u32"),
                     pending,
                     u32::try_from(i).expect("cell index fits u32"),
-                )
-            }));
+                );
+                self.emission_patches.push(patch);
+                self.cell_patches.push(patch);
+            }
         }
     }
 
@@ -3490,11 +3506,13 @@ impl<'a> Lowering<'a> {
             inst.uv = [f32::from(entry.x), f32::from(entry.y), 0.0, 0.0];
             self.push_instance(&inst);
             if let Some(pending) = pending {
-                self.cell_patches.push((
+                let patch = (
                     u32::try_from(self.frame.instances.len() - 1).expect("instance count fits u32"),
                     pending,
                     0,
-                ));
+                );
+                self.emission_patches.push(patch);
+                self.cell_patches.push(patch);
             }
         }
         Ok(())
@@ -3556,9 +3574,13 @@ impl<'a> Lowering<'a> {
             inst.uv = [f32::from(entry.x), f32::from(entry.y), 0.0, 0.0];
             self.push_instance(&inst);
             if let Some(pending) = pending {
-                let inst =
-                    u32::try_from(self.frame.instances.len() - 1).expect("instance count fits u32");
-                self.cell_patches.push((inst, pending, 0));
+                let patch = (
+                    u32::try_from(self.frame.instances.len() - 1).expect("instance count fits u32"),
+                    pending,
+                    0,
+                );
+                self.emission_patches.push(patch);
+                self.cell_patches.push(patch);
             }
         }
         Ok(())

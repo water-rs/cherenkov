@@ -3371,6 +3371,7 @@ impl GpuRenderer {
             lowered.glyphs = lowering.glyphs_rasterized();
             lowered.paths = lowering.paths_rasterized();
             lowered.cell_patches = std::mem::take(&mut lowering.cell_patches);
+            lowered.emission_patches = std::mem::take(&mut lowering.emission_patches);
             lowered.mask_patches = std::mem::take(&mut lowering.mask_patches);
             lowered.pending = std::mem::take(&mut lowering.pending);
             result
@@ -3664,7 +3665,7 @@ impl GpuRenderer {
                 if emission.refs & lower::DEFERRED_REFS != 0 || !emission.pending_cells_empty() {
                     let first = content.storage.refs.len();
                     for i in emission.pending_cells() {
-                        let (inst, p, c) = lowered.cell_patches[i];
+                        let (inst, p, c) = lowered.emission_patches[i];
                         let local = inst - emission.cell_inst_base();
                         content.storage.instances[emission.instances.start + local as usize].uv
                             [..2]

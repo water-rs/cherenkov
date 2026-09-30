@@ -1671,6 +1671,60 @@ mod tests {
         );
     }
 
+    /// Content installed after the handle dropped that names a pending
+    /// resource keeps it alive: a kept recording on a second surface still
+    /// draws the image after the first surface stops drawing it, and the
+    /// removal lands only once the second surface stops too (#199).
+    #[test]
+    fn a_kept_recording_keeps_a_pending_resource_alive() {
+        use crate::{Draw as _, Sampling, WorkingColor};
+
+        let (engine, rx) = engine();
+        let first = engine
+            .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))
+            .expect("surface");
+        let second = engine
+            .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))
+            .expect("surface");
+        let image = engine
+            .image(ImageData::<Rgba8>::new(1, 1, vec![0u8; 4]).expect("image data"))
+            .expect("image");
+        let rect = kurbo::Rect::new(0., 0., 8., 8.);
+        first.update(|tx| {
+            tx[first.root()].record(|c| c.image(image.id(), rect, Sampling::Nearest));
+        });
+        let kept = second.record(|c| c.image(image.id(), rect, Sampling::Nearest));
+        engine.render(FrameTime::now()).expect("render");
+        drop(image);
+        engine.render(FrameTime::now()).expect("render");
+        second.update(|tx| {
+            tx[second.root()].content(kept);
+        });
+        engine.render(FrameTime::now()).expect("render");
+        first.update(|tx| {
+            tx[first.root()].record(|c| c.fill(rect, WorkingColor::WHITE));
+        });
+        engine
+            .render(FrameTime::now())
+            .expect("the second surface still draws the image");
+        let removed = |events: &[Event]| events.iter().any(|e| matches!(e, Event::RemoveImage(_)));
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            !removed(&events),
+            "the image was removed while the second surface draws it: {events:?}"
+        );
+
+        second.update(|tx| {
+            tx[second.root()].record(|c| c.fill(rect, WorkingColor::WHITE));
+        });
+        engine.render(FrameTime::now()).expect("render");
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            removed(&events),
+            "no image removal once no surface draws it: {events:?}"
+        );
+    }
+
     /// Dropping the only surface whose installed content draws a released
     /// resource carries out its pending release (#199).
     #[test]

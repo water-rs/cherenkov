@@ -33,8 +33,8 @@ fn pixels() -> Vec<[f32; 4]> {
     ]
 }
 
-fn shared_device()
--> Result<(wgpu::Adapter, wgpu::Device, wgpu::Queue), Box<dyn std::error::Error>> {
+fn shared_device() -> Result<(wgpu::Adapter, wgpu::Device, wgpu::Queue), Box<dyn std::error::Error>>
+{
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter =
         pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?;
@@ -95,17 +95,12 @@ fn oracle_present(color: OutputColor, headroom: f64, pixels: &[[f32; 4]]) -> Ima
     let image = Image {
         width: pixels.len(),
         height: 1,
-        pixels: pixels
-            .iter()
-            .map(|p| p.map(|c| f64::from(c)))
-            .collect(),
+        pixels: pixels.iter().map(|p| p.map(|c| f64::from(c))).collect(),
     };
     match color {
         OutputColor::Srgb | OutputColor::DisplayP3 => present::present_display_p3(headroom, &image),
         OutputColor::LinearDisplayP3 => present::present_linear_p3(headroom, &image),
-        OutputColor::ExtendedSrgbLinear => {
-            present::present_extended_srgb_linear(headroom, &image)
-        }
+        OutputColor::ExtendedSrgbLinear => present::present_extended_srgb_linear(headroom, &image),
         OutputColor::ExtendedSrgb => present::present_extended_srgb(headroom, &image),
         OutputColor::ExtendedDisplayP3 => present::present_extended_display_p3(headroom, &image),
         OutputColor::Bt2100Pq => present::present_pq(headroom, &image),
@@ -142,7 +137,8 @@ fn present_gpu(
         view_formats: &[],
     });
     let source_view = source.create_view(&wgpu::TextureViewDescriptor::default());
-    let mut presenter = Presenter::new(device, shader_delivery(adapter.get_info().backend, device)?);
+    let mut presenter =
+        Presenter::new(device, shader_delivery(adapter.get_info().backend, device)?);
     presenter.texture(
         device,
         queue,
@@ -235,8 +231,14 @@ fn every_output_encoding_matches_the_oracle() -> Result<(), Box<dyn std::error::
     let cases: [(wgpu::TextureFormat, OutputColor); 7] = [
         (wgpu::TextureFormat::Rgba8Unorm, OutputColor::DisplayP3),
         (wgpu::TextureFormat::Rgba8UnormSrgb, OutputColor::DisplayP3),
-        (wgpu::TextureFormat::Rgba16Float, OutputColor::LinearDisplayP3),
-        (wgpu::TextureFormat::Rgba16Float, OutputColor::ExtendedSrgbLinear),
+        (
+            wgpu::TextureFormat::Rgba16Float,
+            OutputColor::LinearDisplayP3,
+        ),
+        (
+            wgpu::TextureFormat::Rgba16Float,
+            OutputColor::ExtendedSrgbLinear,
+        ),
         (wgpu::TextureFormat::Rgba16Float, OutputColor::ExtendedSrgb),
         (wgpu::TextureFormat::Rgba16Float, OutputColor::Bt2100Pq),
         (wgpu::TextureFormat::Rgba16Float, OutputColor::Bt2100Hlg),
@@ -283,11 +285,7 @@ fn extended_p3_encodes_signed_not_raw_linear() -> Result<(), Box<dyn std::error:
         headroom,
         &pixels,
     )?;
-    let want = oracle_present(
-        OutputColor::ExtendedDisplayP3,
-        f64::from(headroom),
-        &pixels,
-    );
+    let want = oracle_present(OutputColor::ExtendedDisplayP3, f64::from(headroom), &pixels);
     for (i, (g, w)) in got.iter().zip(&want.pixels).enumerate() {
         assert_close(OutputColor::ExtendedDisplayP3, i, pixels[i], *g, *w);
     }

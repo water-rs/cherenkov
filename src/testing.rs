@@ -1833,7 +1833,7 @@ mod tests {
     /// still marks `changed` (#98 C4).
     #[test]
     fn headroom_updates_present_without_regenerating_content() {
-        use crate::{Draw, Display, WorkingColor};
+        use crate::{Display, Draw, WorkingColor};
 
         let (engine, rx) = engine();
         let surface = engine

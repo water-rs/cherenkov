@@ -1,5 +1,6 @@
 //! COLR colour glyph expansion, foreground resolution and unsupported
 //! per-glyph transforms.
+#![cfg(not(target_arch = "wasm32"))]
 use cherenkov::kurbo::{Affine, Rect};
 use cherenkov::{
     Draw, Engine, Extend, FontSource, FrameTime, Glyph, GlyphRun, GlyphStyle, ImageData,

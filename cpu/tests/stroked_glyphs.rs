@@ -1,4 +1,5 @@
 //! Stroke cache identity and retained updates.
+#![cfg(not(target_arch = "wasm32"))]
 use cherenkov::kurbo::{Affine, Cap, Join, Rect, Stroke};
 use cherenkov::{
     Draw, Engine, FontSource, FrameTime, Glyph, GlyphRun, GlyphStyle, Offscreen, OffscreenFormat,

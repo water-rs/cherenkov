@@ -1,6 +1,7 @@
 //! Raster smoke tests: exact-area coverage, readback formats, fill rules,
 //! transform and group isolation.
 
+#![cfg(not(target_arch = "wasm32"))]
 use cherenkov::kurbo::{Affine, BezPath, Line, Rect};
 use cherenkov::{
     Draw, EvenOdd, Extend, Glyph, GlyphRun, Group, Interpolation, LinearGradient, Paint,

@@ -1,4 +1,5 @@
 //! Component transforms reuse recorded content on the cpu backend.
+#![cfg(not(target_arch = "wasm32"))]
 #[path = "../../tests/common/component_animation.rs"]
 mod common;
 

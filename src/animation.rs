@@ -9,7 +9,10 @@
 
 use std::time::Duration;
 
-use kurbo::{Affine, Point, Rect, Vec2};
+use kurbo::{Affine, Point, Rect, Stroke, Vec2};
+
+use crate::Instant;
+use crate::display_list::Operand;
 
 /// Per-lane storage for an [`Animatable`] value.
 ///
@@ -565,6 +568,212 @@ pub const fn rubber_band_spring() -> Spring {
     Spring {
         response: 0.4,
         damping: 1.0,
+    }
+}
+
+/// Lane decomposition for an [`Operand`] recorded into content.
+///
+/// An animated operand interpolates lane-wise, like a layer property:
+/// both endpoints must decompose into the same lane layout — same variant,
+/// same stop count, same path verbs. `None` marks a pair that cannot
+/// interpolate; the change then snaps like an un-animated one.
+pub trait AnimLanes: Sized {
+    /// `self`'s lanes under `target`'s layout; `None` when the endpoints
+    /// cannot interpolate.
+    fn anim_lanes(&self, target: &Self) -> Option<Box<[f64]>>;
+
+    /// `self` rebuilt with its lanes replaced by `lanes`.
+    ///
+    /// `lanes` must come from an [`AnimLanes::anim_lanes`] call against the
+    /// same layout: implementations index it unchecked.
+    fn with_lanes(&self, lanes: &[f64]) -> Self;
+}
+
+impl AnimLanes for Affine {
+    fn anim_lanes(&self, _target: &Self) -> Option<Box<[f64]>> {
+        Some(self.as_coeffs().into())
+    }
+
+    fn with_lanes(&self, lanes: &[f64]) -> Self {
+        let mut coeffs = [0.0; 6];
+        coeffs.copy_from_slice(&lanes[..6]);
+        Self::new(coeffs)
+    }
+}
+
+impl AnimLanes for Rect {
+    fn anim_lanes(&self, _target: &Self) -> Option<Box<[f64]>> {
+        Some([self.x0, self.y0, self.x1, self.y1].into())
+    }
+
+    fn with_lanes(&self, lanes: &[f64]) -> Self {
+        Self::new(lanes[0], lanes[1], lanes[2], lanes[3])
+    }
+}
+
+impl AnimLanes for Stroke {
+    fn anim_lanes(&self, target: &Self) -> Option<Box<[f64]>> {
+        (self.join == target.join
+            && self.start_cap == target.start_cap
+            && self.end_cap == target.end_cap
+            && self.dash_pattern.len() == target.dash_pattern.len())
+        .then(|| {
+            let mut lanes = Vec::with_capacity(3 + self.dash_pattern.len());
+            lanes.extend([self.width, self.miter_limit, self.dash_offset]);
+            lanes.extend(self.dash_pattern.iter().copied());
+            lanes.into_boxed_slice()
+        })
+    }
+
+    fn with_lanes(&self, lanes: &[f64]) -> Self {
+        let mut stroke = self.clone();
+        stroke.width = lanes[0];
+        stroke.miter_limit = lanes[1];
+        stroke.dash_offset = lanes[2];
+        stroke.dash_pattern = lanes[3..3 + self.dash_pattern.len()]
+            .iter()
+            .copied()
+            .collect();
+        stroke
+    }
+}
+
+/// One running animation on a recorded operand, the operand counterpart
+/// of the layer tree's `Track` on the render side. The endpoints are kept
+/// as lanes; the displayed operand rebuilds from the target's layout each
+/// frame.
+pub struct OperandTrack {
+    /// The lanes the track started from (its retarget snapshot).
+    from: Box<[f64]>,
+    /// The lane velocities the track started with.
+    velocity: Box<[f64]>,
+    /// `target`'s lanes.
+    target_lanes: Box<[f64]>,
+    /// The operand the track moves toward; its layout rebuilds each sample.
+    target: Operand,
+    /// The animation driving the track.
+    animation: Animation,
+    /// The time the track started; `None` until the first sample, so a
+    /// track committed between frames starts at its presentation time.
+    start: Option<Instant>,
+    /// The last sampled state, for retarget continuity.
+    last: Option<Sampled>,
+}
+
+/// A track's sample state: `(time, position, velocity)` — the anchor a
+/// retarget continues from.
+type Sampled = (Instant, Box<[f64]>, Box<[f64]>);
+
+impl OperandTrack {
+    /// A track from `from`'s lanes to `target` with zero velocity.
+    ///
+    /// # Panics
+    /// Panics on a `Decay` animation: like a layer property other than
+    /// `scroll_offset`, an operand never takes one.
+    pub(crate) fn new(from: Box<[f64]>, target: Operand, animation: Animation) -> Self {
+        assert!(
+            !matches!(animation, Animation::Decay(_)),
+            "a recorded operand never takes a Decay"
+        );
+        let target_lanes = target
+            .anim_lanes(&target)
+            .expect("a track's target has lanes by construction");
+        assert_eq!(from.len(), target_lanes.len());
+        Self {
+            velocity: vec![0.0; from.len()].into_boxed_slice(),
+            from,
+            target_lanes,
+            target,
+            animation,
+            start: None,
+            last: None,
+        }
+    }
+
+    /// Retargets the track to `target` under `animation`, keeping the last
+    /// sampled position and velocity like a layer track does. `false` when
+    /// the new target's lane layout differs from the running track's.
+    ///
+    /// # Panics
+    /// Panics on a `Decay` animation, like [`OperandTrack::new`].
+    pub(crate) fn retarget(&mut self, target: Operand, animation: Animation) -> bool {
+        assert!(
+            !matches!(animation, Animation::Decay(_)),
+            "a recorded operand never takes a Decay"
+        );
+        let Some(target_lanes) = target.anim_lanes(&target) else {
+            return false;
+        };
+        let (from, velocity) = self.last.take().map_or_else(
+            || (self.from.clone(), self.velocity.clone()),
+            |(_, pos, vel)| (pos, vel),
+        );
+        if from.len() != target_lanes.len() {
+            return false;
+        }
+        self.from = from;
+        self.velocity = velocity;
+        self.target_lanes = target_lanes;
+        self.target = target;
+        self.animation = animation;
+        self.start = None;
+        self.last = None;
+        true
+    }
+
+    /// Evaluates the track at `time`: the sampled operand and whether the
+    /// track still runs.
+    pub(crate) fn sample(&mut self, time: Instant) -> (Operand, bool) {
+        let start = *self.start.get_or_insert(time);
+        let dt = time.duration_since(start).as_secs_f64();
+        let n = self.from.len();
+        let mut pos = vec![0.0; n].into_boxed_slice();
+        let mut vel = vec![0.0; n].into_boxed_slice();
+        let mut running = true;
+        match &self.animation {
+            Animation::Spring(spring) => {
+                let w0 = 2.0 * std::f64::consts::PI / spring.response;
+                let mut settled = true;
+                for i in 0..n {
+                    let (x, v) = spring_lane(
+                        self.from[i] - self.target_lanes[i],
+                        self.velocity[i],
+                        w0,
+                        spring.damping,
+                        dt,
+                    );
+                    pos[i] = self.target_lanes[i] + x;
+                    vel[i] = v;
+                    settled &= (pos[i] - self.target_lanes[i]).abs() < 1e-3 && vel[i].abs() < 1e-3;
+                }
+                // A settled spring reports its target exactly.
+                if settled {
+                    pos.clone_from(&self.target_lanes);
+                    vel.iter_mut().for_each(|v| *v = 0.0);
+                    running = false;
+                }
+            }
+            Animation::Curve(curve) => {
+                let duration = curve.duration.as_secs_f64();
+                let t01 = if duration <= 0.0 { 1.0 } else { dt / duration };
+                let value = curve_value(curve, t01);
+                let slope = if duration <= 0.0 {
+                    0.0
+                } else {
+                    curve_slope(curve, t01) / duration
+                };
+                for i in 0..n {
+                    let delta = self.target_lanes[i] - self.from[i];
+                    pos[i] = delta.mul_add(value, self.from[i]);
+                    vel[i] = delta * slope;
+                }
+                running = t01 < 1.0;
+            }
+            Animation::Decay(_) => unreachable!("a recorded operand never takes a Decay"),
+        }
+        let operand = self.target.with_lanes(&pos);
+        self.last = Some((time, pos, vel));
+        (operand, running)
     }
 }
 

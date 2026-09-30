@@ -315,6 +315,133 @@ impl ShapeData {
     }
 }
 
+fn push_point(lanes: &mut Vec<f64>, point: Point) {
+    lanes.extend([point.x, point.y]);
+}
+
+fn push_el(lanes: &mut Vec<f64>, el: &PathEl) {
+    match el {
+        PathEl::MoveTo(p) | PathEl::LineTo(p) => push_point(lanes, *p),
+        PathEl::QuadTo(a, b) => {
+            push_point(lanes, *a);
+            push_point(lanes, *b);
+        }
+        PathEl::CurveTo(a, b, c) => {
+            push_point(lanes, *a);
+            push_point(lanes, *b);
+            push_point(lanes, *c);
+        }
+        PathEl::ClosePath => {}
+    }
+}
+
+/// Whether two paths carry the same verb sequence — the lane layout a
+/// `Path` needs to interpolate.
+fn same_verbs(from: &[PathEl], to: &[PathEl]) -> bool {
+    from.len() == to.len()
+        && from
+            .iter()
+            .zip(to)
+            .all(|(a, b)| std::mem::discriminant(a) == std::mem::discriminant(b))
+}
+
+impl crate::animation::AnimLanes for ShapeData {
+    fn anim_lanes(&self, target: &Self) -> Option<Box<[f64]>> {
+        let mut lanes = Vec::new();
+        match (self, target) {
+            (Self::Rect(from), Self::Rect(_)) => {
+                lanes.extend([from.x0, from.y0, from.x1, from.y1]);
+            }
+            (Self::RoundedRect(from), Self::RoundedRect(_)) => {
+                let (rect, radii) = (from.rect(), from.radii());
+                lanes.extend([rect.x0, rect.y0, rect.x1, rect.y1]);
+                lanes.extend([
+                    radii.top_left,
+                    radii.top_right,
+                    radii.bottom_right,
+                    radii.bottom_left,
+                ]);
+            }
+            (Self::Continuous(from), Self::Continuous(_)) => {
+                lanes.extend([from.rect.x0, from.rect.y0, from.rect.x1, from.rect.y1]);
+                lanes.extend([
+                    from.radii.top_left,
+                    from.radii.top_right,
+                    from.radii.bottom_right,
+                    from.radii.bottom_left,
+                    from.smoothing,
+                ]);
+            }
+            (Self::Circle(from), Self::Circle(_)) => {
+                lanes.extend([from.center.x, from.center.y, from.radius]);
+            }
+            (Self::Ellipse(from), Self::Ellipse(_)) => {
+                let (center, radii) = (from.center(), from.radii());
+                lanes.extend([center.x, center.y, radii.x, radii.y]);
+            }
+            (Self::Line(from), Self::Line(_)) => {
+                lanes.extend([from.p0.x, from.p0.y, from.p1.x, from.p1.y]);
+            }
+            (
+                Self::Path { elements, rule },
+                Self::Path {
+                    elements: to_elements,
+                    rule: to_rule,
+                },
+            ) if rule == to_rule && same_verbs(elements, to_elements) => {
+                for el in elements.iter() {
+                    push_el(&mut lanes, el);
+                }
+            }
+            _ => return None,
+        }
+        Some(lanes.into_boxed_slice())
+    }
+
+    fn with_lanes(&self, lanes: &[f64]) -> Self {
+        match self {
+            Self::Rect(_) => Self::Rect(Rect::new(lanes[0], lanes[1], lanes[2], lanes[3])),
+            Self::RoundedRect(_) => Self::RoundedRect(RoundedRect::from_rect(
+                Rect::new(lanes[0], lanes[1], lanes[2], lanes[3]),
+                RoundedRectRadii::new(lanes[4], lanes[5], lanes[6], lanes[7]),
+            )),
+            Self::Continuous(_) => Self::Continuous(ContinuousRect {
+                rect: Rect::new(lanes[0], lanes[1], lanes[2], lanes[3]),
+                radii: RoundedRectRadii::new(lanes[4], lanes[5], lanes[6], lanes[7]),
+                smoothing: lanes[8],
+            }),
+            Self::Circle(_) => Self::Circle(Circle::new(Point::new(lanes[0], lanes[1]), lanes[2])),
+            Self::Ellipse(ellipse) => Self::Ellipse(Ellipse::new(
+                Point::new(lanes[0], lanes[1]),
+                (lanes[2], lanes[3]),
+                ellipse.rotation(),
+            )),
+            Self::Line(_) => Self::Line(Line::new(
+                Point::new(lanes[0], lanes[1]),
+                Point::new(lanes[2], lanes[3]),
+            )),
+            Self::Path { elements, rule } => {
+                let mut lanes = lanes.iter().copied();
+                let mut point = || Point::new(lanes.next().unwrap(), lanes.next().unwrap());
+                let elements = elements
+                    .iter()
+                    .map(|el| match el {
+                        PathEl::MoveTo(_) => PathEl::MoveTo(point()),
+                        PathEl::LineTo(_) => PathEl::LineTo(point()),
+                        PathEl::QuadTo(..) => PathEl::QuadTo(point(), point()),
+                        PathEl::CurveTo(..) => PathEl::CurveTo(point(), point(), point()),
+                        PathEl::ClosePath => PathEl::ClosePath,
+                    })
+                    .collect();
+                Self::Path {
+                    elements,
+                    rule: *rule,
+                }
+            }
+        }
+    }
+}
+
 impl Shape for ShapeData {
     fn semantic(&self) -> Semantic<'_> {
         match self {

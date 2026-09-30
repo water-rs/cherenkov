@@ -1,4 +1,5 @@
 //! Analytic mesh sampling and retained operands.
+#![cfg(not(target_arch = "wasm32"))]
 use cherenkov::kurbo::{Affine, Point, Rect};
 use cherenkov::{
     Draw, Engine, FrameTime, MeshGradient, Offscreen, OffscreenFormat, Picture, WorkingColor,

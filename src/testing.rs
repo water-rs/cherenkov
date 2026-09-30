@@ -84,6 +84,27 @@ pub struct LayerSample {
     pub children: Vec<LayerId>,
 }
 
+/// A surface target for the [`Null`] backend.
+///
+/// An [`Offscreen`] buffer or a window-like presenting target, so
+/// presentation semantics — a `Display` update marking `present_pending`
+/// — are testable without a real window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NullTarget {
+    /// An offscreen buffer; `Display` updates never mark presentation.
+    Offscreen(Offscreen),
+    /// A window-like target: it reports presenting, so `Display` updates
+    /// mark `SurfaceFrame::present_pending` exactly as a real swapchain
+    /// target does.
+    Window(Offscreen),
+}
+
+impl From<Offscreen> for NullTarget {
+    fn from(target: Offscreen) -> Self {
+        Self::Offscreen(target)
+    }
+}
+
 /// A backend that draws nothing and reports every call. The `Config`
 /// carries the test's probe channel.
 #[derive(Clone, Copy, Debug, Default)]
@@ -163,7 +184,7 @@ impl NullRenderer {
 impl Backend for Null {
     type Config = NullConfig;
     type Info = NullInfo;
-    type Target = Offscreen;
+    type Target = NullTarget;
     type Renderer = NullRenderer;
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -180,14 +201,18 @@ impl Backend for Null {
 }
 
 impl Renderer for NullRenderer {
-    type Target = Offscreen;
+    type Target = NullTarget;
     type Font = FontData;
 
     fn create_surface(
         &mut self,
         id: SurfaceId,
-        target: Offscreen,
+        target: NullTarget,
     ) -> Result<SurfaceInfo, SurfaceError> {
+        let (target, presents) = match &target {
+            NullTarget::Offscreen(target) => (target, false),
+            NullTarget::Window(target) => (target, true),
+        };
         if target.size.0 == 0 || target.size.1 == 0 {
             return Err(SurfaceError::ZeroSize);
         }
@@ -200,6 +225,7 @@ impl Renderer for NullRenderer {
             max_dimension: u32::MAX,
             size: target.size,
             readable: true,
+            presents,
         })
     }
 
@@ -1826,6 +1852,68 @@ mod tests {
         assert!(!record.changed, "retired content cannot queue updates");
     }
 
+    /// A `Surface::display` update on a surface that does not present
+    /// never marks `present_pending`, while a window-like target in the
+    /// same engine does: headroom and pending-present state belong only
+    /// to surfaces that present (#98). Before the confinement, a display
+    /// update on an `Offscreen` surface left `present_pending` set,
+    /// which a presenting backend consumed as an unhandled case.
+    #[test]
+    fn display_updates_mark_present_only_on_presenting_surfaces() {
+        use crate::Display;
+
+        let (engine, rx) = engine();
+        let offscreen = engine
+            .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))
+            .expect("offscreen surface");
+        let window = engine
+            .surface(NullTarget::Window(Offscreen::new(
+                (8, 8),
+                OffscreenFormat::LinearF16,
+            )))
+            .expect("window-like surface");
+        engine.render(FrameTime::now()).expect("render");
+        let _ = frames(&rx);
+
+        offscreen
+            .display(Display {
+                scale: 1.0,
+                headroom: 4.0,
+            })
+            .expect("display");
+        window
+            .display(Display {
+                scale: 1.0,
+                headroom: 4.0,
+            })
+            .expect("display");
+        engine.render(FrameTime::now()).expect("render");
+        let records = frames(&rx);
+        let offscreen_record = records
+            .iter()
+            .find(|record| record.surface == offscreen.id())
+            .expect("offscreen frame record");
+        let window_record = records
+            .iter()
+            .find(|record| record.surface == window.id())
+            .expect("window frame record");
+        assert!(
+            !offscreen_record.present_pending,
+            "a non-presenting surface cannot be pending a present"
+        );
+        assert!(
+            window_record.present_pending,
+            "a presenting surface is pending after a headroom update"
+        );
+        // The display value itself lands on both: only the pending
+        // present is confined.
+        assert_eq!(
+            offscreen_record.display.headroom.to_bits(),
+            4.0f32.to_bits()
+        );
+        assert_eq!(window_record.display.headroom.to_bits(), 4.0f32.to_bits());
+    }
+
     /// A headroom-only `Surface::display` sequence (4 → 2 → 1 → 4, the
     /// corpus's headroom sequence) marks `present_pending` on every frame
     /// — never `changed`, so no scene re-generation or local-cache work —
@@ -1837,7 +1925,10 @@ mod tests {
 
         let (engine, rx) = engine();
         let surface = engine
-            .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))
+            .surface(NullTarget::Window(Offscreen::new(
+                (8, 8),
+                OffscreenFormat::LinearF16,
+            )))
             .expect("surface");
         let layer = surface.layer();
         let content =

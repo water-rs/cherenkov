@@ -1616,6 +1616,7 @@ impl Renderer for GpuRenderer {
                 (Some(surface), None, window.refresh)
             }
         };
+        let presents = window.is_some();
         let (target, view) = create_target(
             &self.device,
             "surface target",
@@ -1663,6 +1664,7 @@ impl Renderer for GpuRenderer {
             max_dimension: self.max_texture,
             size,
             readable: true,
+            presents,
         })
     }
 
@@ -3193,7 +3195,10 @@ impl GpuRenderer {
         for sf in frame.surfaces {
             let surface = self.surfaces.get_mut(&sf.id).expect("registered surface");
             // A headroom-only frame asks for a present without lowering
-            // new content (#98).
+            // new content (#98). The front end marks `present_pending`
+            // only on surfaces it reported as presenting
+            // (`SurfaceInfo::presents`), so a pending present implies a
+            // window here.
             surface.present_pending |= sf.present_pending;
             // A display change re-runs the window's output negotiation;
             // it reconfigures only when the selected pair moves.

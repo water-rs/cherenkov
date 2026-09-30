@@ -228,6 +228,11 @@ pub struct SurfaceInfo {
     pub size: (u32, u32),
     /// Whether [`Renderer::readback`] works on the surface.
     pub readable: bool,
+    /// Whether the surface presents to a display — a window with a
+    /// swapchain. Only a presenting surface carries pending-presentation
+    /// state: a [`Display`] update on any other target never marks a
+    /// frame for presentation.
+    pub presents: bool,
 }
 
 /// Whether a backend wants another frame after the current one.

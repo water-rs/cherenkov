@@ -837,7 +837,9 @@ impl<B: Backend> Surface<B> {
     }
 
     /// Announces the display's properties (scale and HDR headroom) to the
-    /// surface.
+    /// surface. On a surface whose backend presents (a window), the update
+    /// marks the next frame for presentation; on a retained target it
+    /// still lands but never marks a present (#98).
     ///
     /// # Errors
     /// [`SurfaceError::Lost`] when the render thread is gone.

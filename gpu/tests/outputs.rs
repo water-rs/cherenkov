@@ -95,7 +95,7 @@ fn oracle_present(color: OutputColor, headroom: f64, pixels: &[[f32; 4]]) -> Ima
     let image = Image {
         width: pixels.len(),
         height: 1,
-        pixels: pixels.iter().map(|p| p.map(|c| f64::from(c))).collect(),
+        pixels: pixels.iter().map(|p| p.map(f64::from)).collect(),
     };
     match color {
         OutputColor::Srgb | OutputColor::DisplayP3 => present::present_display_p3(headroom, &image),
@@ -110,6 +110,10 @@ fn oracle_present(color: OutputColor, headroom: f64, pixels: &[[f32; 4]]) -> Ima
 
 /// Runs the present pass over `pixels` into `format`/`color`/`alpha` and
 /// returns the stored values as f64.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one helper runs the whole pass: device triple, source, output shape and the corpus row"
+)]
 fn present_gpu(
     adapter: &wgpu::Adapter,
     device: &wgpu::Device,
@@ -211,7 +215,7 @@ fn present_gpu(
 /// the f64 oracle.
 fn assert_close(color: OutputColor, pixel: usize, p: [f32; 4], got: [f64; 4], want: [f64; 4]) {
     for c in 0..4 {
-        let tol = 0.008 + 0.02 * want[c].abs();
+        let tol = 0.02f64.mul_add(want[c].abs(), 0.008);
         assert!(
             (got[c] - want[c]).abs() <= tol,
             "{color:?} pixel {pixel} {p:?} channel {c}: shader {} vs oracle {}",

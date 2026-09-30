@@ -601,7 +601,7 @@ fn stats(items: &[Item]) -> (u32, u32) {
     let (mut draws, mut edges) = (0_u32, 0_u32);
 
     for item in items {
-        if matches!(item, Item::Silhouette { .. }) {
+        if matches!(item, Item::Silhouette { .. } | Item::Project(_)) {
             draws += 1;
         }
         if let Item::Draw { edges: e, .. } = item {
@@ -1136,6 +1136,7 @@ fn run(
                 bbox,
                 clip,
             } => band.shadow(stack, rbox, radii, *sigma_eff, color, *bbox, clip.as_ref()),
+            Item::Project(item) => band.project(stack, item),
             Item::Silhouette { slot, paint, clip } => {
                 band.glyph(stack, slot, 0, 0, paint, clip.as_ref());
             }
@@ -1643,6 +1644,38 @@ impl Band<'_> {
                     .map(|v| v * cov * cc);
                 let (dst, space) = top(&mut *self.fb, self.space, stack.as_mut_slice());
                 dst[y * self.w + x] = src_over(dst[y * self.w + x], member(src, space));
+            }
+        }
+    }
+
+    /// Composites a projected local image over its parent-raster bounds.
+    /// Each scanline starts the inverse homography's numerators and
+    /// denominator at its first pixel centre and steps them across x; only
+    /// the division is per sample.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "pixel indices are far below 2^53"
+    )]
+    fn project(&mut self, stack: &mut [Plane], item: &super::lower::ProjectItem) {
+        let bh = self.fb.len() / self.w;
+        let [x0, y0, x1, y1] = item.placed.bounds.map(|v| v as usize);
+        let (x1, y_lo, y_hi) = (x1.min(self.w), y0.max(self.y0), y1.min(self.y0 + bh));
+        let inverse = &item.placed.inverse;
+        let step = [inverse.0[0][0], inverse.0[1][0], inverse.0[2][0]];
+        for py in y_lo..y_hi {
+            let mut q = inverse.map(x0 as f64 + 0.5, py as f64 + 0.5);
+            for px in x0..x1 {
+                let here = q;
+                q = [q[0] + step[0], q[1] + step[1], q[2] + step[2]];
+                let cc = clip_cov(item.clip.as_ref(), self.w, px, py);
+                if cc <= 0.0 {
+                    continue;
+                }
+                let sample = item.placed.image.sample(inverse, here);
+                let src = sample.map(|v| v * item.opacity * cc);
+                let (dst, space) = top(&mut *self.fb, self.space, stack);
+                let i = (py - self.y0) * self.w + px;
+                dst[i] = src_over(dst[i], member(src, space));
             }
         }
     }

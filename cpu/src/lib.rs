@@ -183,6 +183,7 @@ pub use render::present::{present_linear_p3, present_srgb8};
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Raster;
 
+impl cherenkov::ProjectiveLayers for Raster {}
 impl cherenkov::Uploads<cherenkov::Rgba8> for Raster {}
 impl cherenkov::Uploads<cherenkov::Rgba16F> for Raster {}
 

@@ -148,6 +148,9 @@ pub enum Item {
     /// semantic level's contents and run the group's chain on the copy.
     /// Boxed: a capture is rare and large — it must not grow `Item`.
     Capture(Box<CaptureItem>),
+    /// Composite a projective layer's local image, projected into this
+    /// raster through the anisotropic filter. Boxed: rare and large.
+    Project(Box<ProjectItem>),
     /// Sample a group's captured backdrop as a member's bottom-most
     /// content, inside the member's clip, over `bounds`.
     Sample {
@@ -160,6 +163,18 @@ pub enum Item {
         /// What the sample becomes once composited.
         effect: SampleEffect,
     },
+}
+
+/// A projected composite's payload, boxed inside [`Item::Project`].
+#[derive(Clone)]
+pub struct ProjectItem {
+    /// The local image and its placement.
+    pub placed: crate::render::projective::Placed,
+    /// The opacity multiplier.
+    pub opacity: f32,
+    /// The ancestor clip in force; the layer's own clip is already in the
+    /// local image.
+    pub clip: Option<ClipRef>,
 }
 
 /// The capture item's payload, boxed inside [`Item::Capture`].
@@ -362,6 +377,12 @@ pub struct Lowering<'a, 'b> {
     pub commands_lowered: u32,
     /// Content layers composed this frame.
     pub layers_composed: u32,
+    /// The layer this lowering starts at: the tree root for a surface, or
+    /// a projective layer rendering its local image, with the transform
+    /// that replaces its placement (layer space to texels).
+    local: Option<(LayerId, Affine)>,
+    /// Projective layers' images placed in this raster, by layer.
+    projected: FxHashMap<LayerId, crate::render::projective::Placed>,
 }
 
 /// The largest singular value of `t`'s linear part — the worst-case factor
@@ -661,6 +682,48 @@ impl<'a, 'b> Lowering<'a, 'b> {
             scope_aprons: FxHashMap::default(),
             commands_lowered: 0,
             layers_composed: 0,
+            local: None,
+            projected: FxHashMap::default(),
+        }
+    }
+
+    /// Renders the local image of projective layer `root` under
+    /// `transform` (layer space to texels) instead of the surface, and
+    /// places nested projective layers' images from `projected`. Without
+    /// a call, the lowering renders the surface from the tree root.
+    pub fn project(
+        &mut self,
+        local: Option<(LayerId, Affine)>,
+        projected: FxHashMap<LayerId, crate::render::projective::Placed>,
+    ) {
+        self.local = local;
+        self.projected = projected;
+    }
+
+    /// The layer the walk starts at.
+    fn start(&self, tree: &SurfaceTree) -> LayerId {
+        self.local.map_or_else(|| tree.root(), |(id, _)| id)
+    }
+
+    /// Whether `id` composes by projection into this raster: projective,
+    /// and not the layer whose local image this lowering renders.
+    fn projects(&self, id: LayerId, tree: &SurfaceTree) -> bool {
+        self.local.is_none_or(|(root, _)| root != id) && tree.projective_pose(id).is_some()
+    }
+
+    /// `(transform, content transform)` of `node` under `parent`: the
+    /// local root renders under its texel transform, never its pose.
+    fn placement(
+        &self,
+        id: LayerId,
+        node: &cherenkov::LayerNode,
+        parent: Affine,
+    ) -> (Affine, Affine) {
+        match self.local {
+            Some((root, local)) if root == id => {
+                (local, local * Affine::translate(-node.scroll_offset))
+            }
+            _ => (parent * node.transform, parent * node.content_transform()),
         }
     }
 
@@ -690,7 +753,7 @@ impl<'a, 'b> Lowering<'a, 'b> {
         });
         self.filters = filters;
         planned?;
-        self.layer(tree.root(), tree, caches)
+        self.layer(self.start(tree), tree, caches)
     }
 
     pub fn take_used_filters(&mut self) -> FxHashSet<u64> {
@@ -721,6 +784,11 @@ impl<'a, 'b> Lowering<'a, 'b> {
         scopes: &mut Vec<LayerId>,
     ) -> Result<(), RenderError> {
         let node = tree.layer(id);
+        if self.projects(id, tree) {
+            // Its members plan in its own local lowering.
+            return Ok(());
+        }
+        let (transform, children) = self.placement(id, node, parent);
         if let Some(sample) = &node.backdrop {
             let gid = sample.group();
             let g = gid.raw();
@@ -742,7 +810,6 @@ impl<'a, 'b> Lowering<'a, 'b> {
                 .clip
                 .as_ref()
                 .ok_or(RenderError::Unsupported(names::BACKDROP_UNCLIPPED))?;
-            let transform = parent * node.transform;
             let member = clip_device_bounds(transform, clip);
             let (effect, reach) = member_effect(sample.effect(), clip, transform)?;
             let member = member.inflate(reach, reach);
@@ -772,7 +839,6 @@ impl<'a, 'b> Lowering<'a, 'b> {
                 },
             );
         }
-        let children = parent * node.content_transform();
         if node.filter.is_some() {
             scopes.push(id);
         }
@@ -810,7 +876,7 @@ impl<'a, 'b> Lowering<'a, 'b> {
     ) -> Result<(), RenderError> {
         let mut groups = FxHashMap::default();
         self.plan_layer(
-            tree.root(),
+            self.start(tree),
             tree,
             &mut groups,
             filters,
@@ -1150,18 +1216,84 @@ impl<'a, 'b> Lowering<'a, 'b> {
         caches: &mut FxHashMap<LayerId, ContentData>,
     ) -> Result<(), RenderError> {
         let node = tree.layer(id);
+        if self.projects(id, tree) {
+            return self.projected_layer(id, node);
+        }
+        let local_root = self.local.is_some_and(|(root, _)| root == id);
+        let (opacity, blend) = if local_root {
+            // Outer opacity and blend apply when the image composes.
+            (1.0, BlendMode::Normal)
+        } else {
+            (node.opacity, node.blend)
+        };
         let backdrop = node.backdrop.as_ref().map(|sample| sample.group().raw());
         let saved = self.transform;
         let saved_animating = self.animating;
-        self.animating |= node.animating();
-        self.transform = saved * node.transform;
-        let mut content_space = saved * node.content_transform();
+        if !local_root {
+            self.animating |= node.animating();
+        }
+        let (transform, mut content_space) = self.placement(id, node, saved);
+        self.transform = transform;
         if self.animating {
             self.transform = cherenkov::snap_animating(self.transform);
             content_space = cherenkov::snap_animating(content_space);
         }
-        if let Some(gid) = backdrop
-            && let Some(plan) = self.backdrops.get(&gid)
+        if let Some(gid) = backdrop {
+            self.emit_capture(gid, id);
+        }
+        let outer = self.clip.clone();
+        let result = self.with_clip(node.clip.as_ref(), |s| {
+            s.transform = content_space;
+            if let Some(gid) = backdrop {
+                s.emit_backdrop_sample(gid, id);
+            }
+            if let Some(filter) = node.filter {
+                let clip = s.clip.clone();
+                s.filter_isolate(
+                    filter,
+                    opacity,
+                    (blend, cherenkov::BlendSpace::Linear),
+                    clip,
+                    |s| s.layer_items(id, node, tree, caches),
+                    Some(id),
+                )
+            } else if opacity < 1.0
+                || blend != BlendMode::Normal
+                // The root already renders into the surface target, and a
+                // local root into its image.
+                || (id != s.start(tree) && node.blends_within())
+            {
+                // The composite's clip: for destructive operators the
+                // operator applies over the layer's effective clip, so the
+                // combined clip is the bound; for every other mode a
+                // transparent source leaves the destination unchanged, so
+                // the clip in force before the layer's own clip suffices —
+                // the layer clip's coverage is already on the content.
+                let composite_clip = if crate::render::blend::is_destructive(blend) {
+                    s.clip.clone()
+                } else {
+                    outer.clone()
+                };
+                s.isolate(
+                    opacity,
+                    (blend, cherenkov::BlendSpace::Linear),
+                    s.clip.clone(),
+                    composite_clip,
+                    |s| s.layer_items(id, node, tree, caches),
+                )
+            } else {
+                s.layer_items(id, node, tree, caches)
+            }
+        });
+        self.transform = saved;
+        self.animating = saved_animating;
+        result
+    }
+
+    /// Emits group `gid`'s capture when `id` is its first member in paint
+    /// order and its region is non-empty.
+    fn emit_capture(&mut self, gid: u64, id: LayerId) {
+        if let Some(plan) = self.backdrops.get(&gid)
             && plan.first == id
             && plan.region.x0 < plan.region.x1
             && plan.region.y0 < plan.region.y1
@@ -1202,52 +1334,77 @@ impl<'a, 'b> Lowering<'a, 'b> {
                 flatten,
             })));
         }
+    }
+
+    /// A projective layer composes its completed local image: the image
+    /// already carries the layer's content, clip and filter, so the
+    /// projected sample is drawn under the ancestor clip only, and the
+    /// layer's opacity and blend apply once. A destructive blend keeps its
+    /// operator domain: the ancestor clip intersected with the projected
+    /// layer clip, never the image's alpha.
+    fn projected_layer(
+        &mut self,
+        id: LayerId,
+        node: &cherenkov::LayerNode,
+    ) -> Result<(), RenderError> {
+        let Some(placed) = self.projected.get(&id).cloned() else {
+            // No area this frame: behind the viewer, edge-on or off the
+            // raster.
+            return Ok(());
+        };
         let outer = self.clip.clone();
-        let result = self.with_clip(node.clip.as_ref(), |s| {
-            s.transform = content_space;
-            if let Some(gid) = backdrop {
-                s.emit_backdrop_sample(gid, id);
-            }
-            if let Some(filter) = node.filter {
-                let clip = s.clip.clone();
-                s.filter_isolate(
-                    filter,
-                    node.opacity,
-                    (node.blend, cherenkov::BlendSpace::Linear),
-                    clip,
-                    |s| s.layer_items(id, node, tree, caches),
-                    Some(id),
-                )
-            } else if node.opacity < 1.0
-                || node.blend != BlendMode::Normal
-                // The root already renders into the surface target.
-                || (id != tree.root() && node.blends_within())
-            {
-                // The composite's clip: for destructive operators the
-                // operator applies over the layer's effective clip, so the
-                // combined clip is the bound; for every other mode a
-                // transparent source leaves the destination unchanged, so
-                // the clip in force before the layer's own clip suffices —
-                // the layer clip's coverage is already on the content.
-                let composite_clip = if crate::render::blend::is_destructive(node.blend) {
-                    s.clip.clone()
-                } else {
-                    outer.clone()
-                };
-                s.isolate(
-                    node.opacity,
-                    (node.blend, cherenkov::BlendSpace::Linear),
-                    s.clip.clone(),
-                    composite_clip,
-                    |s| s.layer_items(id, node, tree, caches),
-                )
-            } else {
-                s.layer_items(id, node, tree, caches)
-            }
-        });
-        self.transform = saved;
-        self.animating = saved_animating;
-        result
+        if node.blend == BlendMode::Normal {
+            self.items.push(Item::Project(Box::new(ProjectItem {
+                placed,
+                opacity: node.opacity,
+                clip: outer,
+            })));
+            return Ok(());
+        }
+        let composite_clip = if crate::render::blend::is_destructive(node.blend) {
+            let clip = node
+                .clip
+                .as_ref()
+                .expect("a planned projective layer has a clip");
+            let tolerance = FLATTEN_TOL / placed.density;
+            let (path, _) = shape_path(clip, tolerance).ok_or_else(|| {
+                RenderError::Render(format!("projective layer {id:?} clip has no outline"))
+            })?;
+            #[expect(clippy::cast_precision_loss, reason = "raster sizes fit f64")]
+            let viewport =
+                Rect::new(0.0, 0.0, self.width as f64, self.height as f64).inflate(1.0, 1.0);
+            let device = cherenkov::lowering::projective::project_outline(
+                &placed.to_parent,
+                &path,
+                tolerance,
+                viewport,
+            );
+            let saved = std::mem::replace(&mut self.transform, Affine::IDENTITY);
+            let clip = self.make_clip(&ShapeData::Path {
+                elements: device.elements().into(),
+                rule: FillRule::NonZero,
+            });
+            self.transform = saved;
+            // A projected clip with no area bounds the operator to nothing.
+            let Some(clip) = clip else { return Ok(()) };
+            Some(clip)
+        } else {
+            outer.clone()
+        };
+        self.isolate(
+            node.opacity,
+            (node.blend, cherenkov::BlendSpace::Linear),
+            outer.clone(),
+            composite_clip,
+            |s| {
+                s.items.push(Item::Project(Box::new(ProjectItem {
+                    placed,
+                    opacity: 1.0,
+                    clip: outer,
+                })));
+                Ok(())
+            },
+        )
     }
 
     /// Content first, then children — the engine's layer ordering.

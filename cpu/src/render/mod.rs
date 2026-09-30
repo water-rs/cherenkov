@@ -17,6 +17,7 @@ mod lower;
 mod paint;
 mod prepared;
 pub mod present;
+mod projective;
 mod raster;
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -66,6 +67,9 @@ struct SurfaceState {
     /// backdrop capture last frame (window, isolation stack and capture
     /// buffers). 0 when no capture ran.
     backdrop_capture_peak: u64,
+    /// Projective layers' realized local images, by layer, one per
+    /// density bucket.
+    projective: FxHashMap<LayerId, Vec<projective::Entry>>,
 }
 
 impl SurfaceState {
@@ -101,6 +105,11 @@ pub struct RasterRenderer {
     glyph_cache: glyph::GlyphCache,
     /// Decoded colour-font bitmaps, bounded by `Budget::cpu`.
     bitmap_cache: bitmap::BitmapCache,
+    /// Bumped whenever registered image pixels change: projective images
+    /// realized before sample stale pixels.
+    image_epoch: u64,
+    /// Counts rendered frames; the projective cache's recency clock.
+    frame_count: u64,
 }
 
 /// Runs on the render thread once: builds the worker pool, returning the
@@ -131,6 +140,8 @@ pub fn init(config: RasterConfig) -> Result<(RasterRenderer, RasterInfo), Engine
                     image_budget: config.budget.cpu.0,
                     glyph_cache: glyph::GlyphCache::new(config.budget.cpu.0),
                     bitmap_cache: bitmap::BitmapCache::new(config.budget.cpu.0),
+                    image_epoch: 0,
+                    frame_count: 0,
                 },
                 info,
             )
@@ -219,6 +230,7 @@ impl Renderer for RasterRenderer {
                 filters: Vec::new(),
                 groups: Vec::new(),
                 backdrop_capture_peak: 0,
+                projective: FxHashMap::default(),
             },
         );
         Ok(SurfaceInfo {
@@ -319,6 +331,7 @@ impl Renderer for RasterRenderer {
         };
         // Retained paint operands share the pixels and lowering resolved
         // the dimensions: content sampling the image is lowered again.
+        self.image_epoch += 1;
         for surface in self.surfaces.values_mut() {
             for content in surface.layers.values_mut() {
                 let _ = content.invalidate_image(id);
@@ -350,6 +363,7 @@ impl Renderer for RasterRenderer {
 
     fn remove_image(&mut self, id: ImageId) {
         self.images.remove(&id.raw());
+        self.image_epoch += 1;
         self.refresh_cache_budgets();
         for surface in self.surfaces.values_mut() {
             for content in surface.layers.values_mut() {
@@ -392,6 +406,7 @@ impl Renderer for RasterRenderer {
     fn remove_layer(&mut self, surface: SurfaceId, layer: LayerId) {
         if let Some(state) = self.surfaces.get_mut(&surface) {
             state.layers.remove(&layer);
+            state.projective.remove(&layer);
         }
     }
 
@@ -476,6 +491,7 @@ impl Renderer for RasterRenderer {
         categories.images = self.images.values().map(|image| image.bytes()).sum();
         categories.colr = self.fonts.values().map(font::Font::colr_bytes).sum();
         categories.bitmaps = self.bitmap_cache.bytes();
+        categories.projective = self.projective_bytes();
         tracing::debug!(
             target: "cherenkov_cpu::memory",
             output = categories.output,
@@ -485,6 +501,7 @@ impl Renderer for RasterRenderer {
             glyphs = categories.glyphs,
             colr = categories.colr,
             bitmaps = categories.bitmaps,
+            projective = categories.projective,
             "memory usage",
         );
         // Backdrop captures are transient: the reported value is the
@@ -515,6 +532,7 @@ impl Renderer for RasterRenderer {
                 for content in surface.layers.values_mut() {
                     content.trim();
                 }
+                surface.projective.clear();
             }
         }
     }
@@ -527,6 +545,7 @@ impl RasterRenderer {
         stats: &mut FrameStats,
     ) -> Result<Redraw, RenderError> {
         self.filters.begin_frame(frame.id, frame.time);
+        self.frame_count += 1;
         for sf in frame.surfaces {
             let filter_changed = self.surfaces.get(&sf.id).is_some_and(|surface| {
                 surface
@@ -558,6 +577,7 @@ impl RasterRenderer {
                     .map(move |group| (surface.raw(), *group))
             })
             .collect();
+        self.evict_projective();
         self.filters.set_active(&used, &used_groups);
         self.filters.finish_frame(&used, &used_groups);
         let rate = self
@@ -587,7 +607,8 @@ impl RasterRenderer {
     }
 
     fn refresh_cache_budgets(&mut self) {
-        let resident: u64 = self.images.values().map(|image| image.bytes()).sum();
+        let resident: u64 =
+            self.images.values().map(|image| image.bytes()).sum::<u64>() + self.projective_bytes();
         let available = self.image_budget.saturating_sub(resident);
         self.bitmap_cache
             .set_budget(available.saturating_sub(self.glyph_cache.bytes()));
@@ -608,42 +629,25 @@ impl RasterRenderer {
         let profile = tracing::enabled!(target: "cherenkov_cpu::profile", tracing::Level::DEBUG);
         let start = profile.then(cherenkov::Instant::now);
         let id = sf.id;
-        let mut items: Vec<Item> = Vec::new();
-        let glyph_reqs;
-        let glyphs_rasterized;
-        // Lowering borrows the layer caches; the surface borrow ends
-        // before glyph resolution touches `self.fonts`/`self.glyph_cache`.
-        let lowered = {
-            let Some(surf) = self.surfaces.get_mut(&id) else {
-                return Ok(());
-            };
-            let mut caches = std::mem::take(&mut surf.layers);
-            let mut lowering = Lowering::new(
-                &mut items,
-                surf.size,
-                Some(&mut self.filters),
-                frame,
-                &mut self.fonts,
-                &self.bitmap_fonts,
-                &mut self.bitmap_cache,
-            );
-            let result = lowering.run(id, sf.tree, &mut caches, &self.images);
-            glyphs_rasterized = lowering.glyphs_rasterized;
-            stats.glyphs_rasterized += glyphs_rasterized;
-            stats.commands_lowered += lowering.commands_lowered;
-            stats.layers_composed += lowering.layers_composed;
-            glyph_reqs = std::mem::take(&mut lowering.glyphs);
-            surf.filters = lowering.take_used_filters().into_iter().collect();
-            surf.groups = lowering.take_used_groups().into_iter().collect();
-            surf.layers = caches;
-            result
+        let size = match self.surfaces.get(&id) {
+            Some(surf) => surf.size,
+            None => return Ok(()),
         };
-        lowered?;
-        if glyphs_rasterized > 0 {
-            self.refresh_cache_budgets();
+        let (projected, mut used) = self.realize_projective(sf, frame, stats)?;
+        let mut items: Vec<Item> = Vec::new();
+        let (glyph_reqs, lowered_at) = self.lower_items(
+            sf,
+            &mut items,
+            size,
+            frame,
+            stats,
+            (None, projected),
+            &mut used,
+        )?;
+        if let Some(surf) = self.surfaces.get_mut(&id) {
+            surf.filters = used.filters.into_iter().collect();
+            surf.groups = used.groups.into_iter().collect();
         }
-        let lowered_at = start.map(|_| cherenkov::Instant::now());
-        self.resolve_glyphs(&glyph_reqs)?;
         let resolved_at = start.map(|_| cherenkov::Instant::now());
         let Some(surf) = self.surfaces.get_mut(&id) else {
             return Ok(());
@@ -678,12 +682,238 @@ impl RasterRenderer {
                 lower_ns = lowered.duration_since(start).as_nanos(),
                 glyph_ns = resolved.duration_since(lowered).as_nanos(),
                 shade_ns = resolved.elapsed().as_nanos(),
-                items = items.len(), glyphs = glyph_reqs.len(), "raster phases");
+                items = items.len(), glyphs = glyph_reqs, "raster phases");
         }
         stats.draws += draws;
         stats.instances += edges;
         stats.passes += u32::try_from(h.div_ceil(raster::BAND_H)).unwrap_or(u32::MAX);
         Ok(())
+    }
+
+    /// Lowers the tree into `items` for a raster of `size` — the surface,
+    /// or with `local` a projective layer's local image — placing nested
+    /// projective images from `projected`, then fills every glyph slot the
+    /// items read. Returns the glyph request count and the instant
+    /// lowering finished, before glyph resolution; the filters and
+    /// backdrop groups the items use are added to `used`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one lowering's inputs travel together"
+    )]
+    fn lower_items(
+        &mut self,
+        sf: &cherenkov::SurfaceFrame<'_>,
+        items: &mut Vec<Item>,
+        size: (u32, u32),
+        frame: cherenkov::FrameId,
+        stats: &mut FrameStats,
+        (local, projected): (
+            Option<(LayerId, cherenkov::kurbo::Affine)>,
+            FxHashMap<LayerId, projective::Placed>,
+        ),
+        used: &mut projective::Used,
+    ) -> Result<(usize, Option<cherenkov::Instant>), RenderError> {
+        let id = sf.id;
+        let glyph_reqs;
+        let glyphs_rasterized;
+        // Lowering borrows the layer caches; the surface borrow ends
+        // before glyph resolution touches `self.fonts`/`self.glyph_cache`.
+        let lowered = {
+            let Some(surf) = self.surfaces.get_mut(&id) else {
+                return Ok((0, None));
+            };
+            let mut caches = std::mem::take(&mut surf.layers);
+            let mut lowering = Lowering::new(
+                items,
+                size,
+                Some(&mut self.filters),
+                frame,
+                &mut self.fonts,
+                &self.bitmap_fonts,
+                &mut self.bitmap_cache,
+            );
+            lowering.project(local, projected);
+            let result = lowering.run(id, sf.tree, &mut caches, &self.images);
+            glyphs_rasterized = lowering.glyphs_rasterized;
+            stats.glyphs_rasterized += glyphs_rasterized;
+            stats.commands_lowered += lowering.commands_lowered;
+            stats.layers_composed += lowering.layers_composed;
+            glyph_reqs = std::mem::take(&mut lowering.glyphs);
+            used.absorb(lowering.take_used_filters(), lowering.take_used_groups());
+            surf.layers = caches;
+            result
+        };
+        lowered?;
+        if glyphs_rasterized > 0 {
+            self.refresh_cache_budgets();
+        }
+        let lowered_at = tracing::enabled!(target: "cherenkov_cpu::profile", tracing::Level::DEBUG)
+            .then(cherenkov::Instant::now);
+        self.resolve_glyphs(&glyph_reqs)?;
+        Ok((glyph_reqs.len(), lowered_at))
+    }
+
+    /// Realizes every visible projective layer's local image, innermost
+    /// first, reusing a retained image whose content stamp, density,
+    /// layout and image epoch match and whose filters are not animating.
+    /// Returns the images placed directly in the surface, and the filters
+    /// and groups the local images use.
+    fn realize_projective(
+        &mut self,
+        sf: &cherenkov::SurfaceFrame<'_>,
+        frame: cherenkov::FrameId,
+        stats: &mut FrameStats,
+    ) -> Result<(FxHashMap<LayerId, projective::Placed>, projective::Used), RenderError> {
+        let mut used = projective::Used::default();
+        let Some(size) = self.surfaces.get(&sf.id).map(|surf| surf.size) else {
+            return Ok((FxHashMap::default(), used));
+        };
+        let limits = cherenkov::lowering::projective::Limits {
+            max_dimension: MAX_SURFACE,
+            max_bytes: self.image_budget,
+        };
+        let plans = cherenkov::lowering::projective::plan(sf.tree, size, limits)?;
+        let mut placed: FxHashMap<Option<LayerId>, FxHashMap<LayerId, projective::Placed>> =
+            FxHashMap::default();
+        let mut required = 0_u64;
+        for plan in plans {
+            let Some(layout) = plan.image else { continue };
+            let nested = placed.remove(&Some(plan.layer)).unwrap_or_default();
+            let key =
+                projective::Key::new(&layout, sf.tree.content_stamp(plan.layer), self.image_epoch);
+            let filters = &self.filters;
+            let hit = self.surfaces.get_mut(&sf.id).and_then(|surf| {
+                surf.projective.get_mut(&plan.layer).and_then(|entries| {
+                    entries.iter_mut().find(|entry| {
+                        entry.key == key
+                            && !entry.filters.iter().any(|f| filters.wants_redraw(*f))
+                            && !entry
+                                .groups
+                                .iter()
+                                .any(|g| filters.wants_redraw_group(sf.id, BackdropId::new(*g)))
+                    })
+                })
+            });
+            let image = if let Some(entry) = hit {
+                entry.last_used = self.frame_count;
+                used.filters.extend(entry.filters.iter().copied());
+                used.groups.extend(entry.groups.iter().copied());
+                Arc::clone(&entry.image)
+            } else {
+                let mut local_used = projective::Used::default();
+                let mut items = Vec::new();
+                self.lower_items(
+                    sf,
+                    &mut items,
+                    layout.size,
+                    frame,
+                    stats,
+                    (Some((plan.layer, layout.local_to_texel)), nested),
+                    &mut local_used,
+                )?;
+                let (w, h) = (layout.size.0 as usize, layout.size.1 as usize);
+                let mut base = vec![[0.0_f32; 4]; w * h];
+                let has_backdrop = !local_used.groups.is_empty();
+                let (draws, edges) = self.pool.install(|| {
+                    raster::render_bands(&items, [0.0; 4], &mut base, w, h, None, has_backdrop)
+                })?;
+                stats.draws += draws;
+                stats.instances += edges;
+                stats.passes += u32::try_from(h.div_ceil(raster::BAND_H)).unwrap_or(u32::MAX);
+                let image = Arc::new(projective::ProjectedImage::build(&base, layout.size));
+                stats.projective_realized += 1;
+                let entry = projective::Entry {
+                    key,
+                    image: Arc::clone(&image),
+                    filters: local_used.filters.iter().copied().collect(),
+                    groups: local_used.groups.iter().copied().collect(),
+                    last_used: self.frame_count,
+                };
+                used.absorb(local_used.filters, local_used.groups);
+                if let Some(surf) = self.surfaces.get_mut(&sf.id) {
+                    let entries = surf.projective.entry(plan.layer).or_default();
+                    entries.retain(|e| e.key.density.to_bits() != entry.key.density.to_bits());
+                    entries.push(entry);
+                }
+                image
+            };
+            required += image.bytes();
+            if required > self.image_budget {
+                return Err(RenderError::ProjectiveUnsupported {
+                    layer: plan.layer,
+                    reason: format!(
+                        "the frame's projective images need {required} bytes; the CPU budget admits {}",
+                        self.image_budget
+                    ),
+                });
+            }
+            stats.projective_composed += 1;
+            placed.entry(plan.parent).or_default().insert(
+                plan.layer,
+                projective::Placed {
+                    image,
+                    inverse: layout.inverse,
+                    bounds: layout.bounds,
+                    to_parent: layout.to_parent,
+                    density: layout.density,
+                },
+            );
+        }
+        Ok((placed.remove(&None).unwrap_or_default(), used))
+    }
+
+    /// Bytes of every retained projective image.
+    fn projective_bytes(&self) -> u64 {
+        self.surfaces
+            .values()
+            .flat_map(|surf| surf.projective.values().flatten())
+            .map(|entry| entry.image.bytes())
+            .sum()
+    }
+
+    /// Evicts least-recently-used projective images not used this frame
+    /// until everything fits the CPU budget; images the frame used are
+    /// required and never evicted.
+    fn evict_projective(&mut self) {
+        let others = self.images.values().map(|image| image.bytes()).sum::<u64>()
+            + self.glyph_cache.bytes()
+            + self.bitmap_cache.bytes();
+        let mut total = self.projective_bytes() + others;
+        if total <= self.image_budget {
+            return;
+        }
+        let mut optional: Vec<(u64, SurfaceId, LayerId, f64)> = self
+            .surfaces
+            .iter()
+            .flat_map(|(sid, surf)| {
+                surf.projective.iter().flat_map(move |(layer, entries)| {
+                    entries
+                        .iter()
+                        .map(move |e| (e.last_used, *sid, *layer, e.key.density))
+                })
+            })
+            .filter(|(last, ..)| *last != self.frame_count)
+            .collect();
+        optional.sort_unstable_by_key(|(last, ..)| *last);
+        for (_, sid, layer, density) in optional {
+            if total <= self.image_budget {
+                break;
+            }
+            let Some(entries) = self
+                .surfaces
+                .get_mut(&sid)
+                .and_then(|surf| surf.projective.get_mut(&layer))
+            else {
+                continue;
+            };
+            entries.retain(|e| {
+                let evict = e.key.density.to_bits() == density.to_bits();
+                if evict {
+                    total -= e.image.bytes();
+                }
+                !evict
+            });
+        }
     }
 
     /// Fills every glyph request's slot: cache hits resolve directly;

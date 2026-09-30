@@ -55,6 +55,11 @@ wasm-bindgen-test = "0.3"
 # the naga version wgpu 30 links.
 naga = { version = "30.0.1", features = ["wgsl-in", "spv-out", "msl-out"] }
 
+[target.'cfg(all(unix, not(target_vendor = "apple")))'.dev-dependencies]
+# Raw Vulkan access for external-frame import tests on lavapipe (#166).
+ash = "0.38"
+libc = "0.2"
+
 [dev-dependencies]
 cherenkov-oracle = { path = "../oracle" }
 naga = { version = "30.0.1", features = ["wgsl-in", "spv-out", "msl-out", "hlsl-out"] }

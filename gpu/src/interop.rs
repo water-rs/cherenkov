@@ -689,9 +689,14 @@ impl ExternalFrame {
 pub mod vulkan {
     #[cfg(target_os = "android")]
     pub use crate::render::external::vulkan::Ahb;
-    pub use crate::render::external::vulkan::{
-        Caps, Device, DmaBuf, DmaBufPlane, Frame, FrameSource, NativeError, QueueFamily,
-        ReleaseSync, Repr, Wait,
+    pub use crate::render::external::{
+        KIND_NV12, KIND_P010,
+        vulkan::{
+            Caps, Device, DmaBuf, DmaBufPlane, Frame, FrameSource, Generation, Lease, Native,
+            NativeError, PendingAcquire, PendingWait, QueueFamily, Release, ReleaseSync, Repr,
+            State, Views, Wait, cancel_staged, create_pool, drain_releases, mark_submitted,
+            stage_acquire, submit_waits,
+        },
     };
 }
 

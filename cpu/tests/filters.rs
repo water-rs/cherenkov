@@ -479,6 +479,75 @@ fn animated_parameters_rerender_and_request_frames() {
     assert!((settled[0] - 0.9).abs() < 1.0e-6);
 }
 
+/// A hidden surface's animated filter wakes no host and asks for no frame
+/// (#204); the parameter changes made while hidden are drawn by the first
+/// frame after the surface is shown.
+#[test]
+fn a_hidden_surface_s_animated_filter_wakes_nothing() {
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let wake_count = Arc::clone(&wakes);
+    let engine = Engine::<Raster>::new(RasterConfig {
+        redraw: Some(RedrawCallback::new(move || {
+            wake_count.fetch_add(1, Ordering::Relaxed);
+        })),
+        ..RasterConfig::default()
+    })
+    .expect("engine");
+    let surface = engine
+        .surface(Offscreen::new((4, 4), OffscreenFormat::LinearF32))
+        .expect("surface");
+    let (parameter, installed) = ScriptedParam::new(0.0);
+    let mut callback = None;
+    let filter = engine.filter(filters::Brightness(parameter));
+    surface.update(|tx| {
+        tx[surface.root()]
+            .filter(&filter)
+            .content(surface.record(|r| {
+                r.fill(
+                    Rect::new(0.0, 0.0, 4.0, 4.0),
+                    WorkingColor::new([0.1, 0.1, 0.1, 1.0]),
+                );
+            }));
+    });
+    let start = Instant::now();
+    engine.render(FrameTime::at(start)).expect("initial frame");
+
+    surface
+        .visibility(cherenkov::Visibility::Hidden)
+        .expect("hide");
+    fire(
+        &installed,
+        &mut callback,
+        0.8,
+        Some(Box::new(LinearRamp(Duration::from_millis(100)))),
+    );
+    assert_eq!(
+        wakes.load(Ordering::Relaxed),
+        0,
+        "a hidden surface's filter wakes no host"
+    );
+    let other = engine
+        .surface(Offscreen::new((4, 4), OffscreenFormat::LinearF32))
+        .expect("other surface");
+    assert_eq!(
+        engine
+            .render(FrameTime::at(start + Duration::from_millis(10)))
+            .expect("frame of the other surface"),
+        Next::Idle,
+        "a hidden surface's filter animation asks for no frame"
+    );
+
+    surface
+        .visibility(cherenkov::Visibility::Visible)
+        .expect("show");
+    engine
+        .render(FrameTime::at(start + Duration::from_millis(500)))
+        .expect("show frame");
+    let shown = surface.readback().expect("readback").pixels[2 * 4 + 2];
+    assert!((shown[0] - 0.9).abs() < 1.0e-6, "shown pixel: {shown:?}");
+    drop(other);
+}
+
 struct GpuOnlyImage;
 
 impl AuxImage for GpuOnlyImage {

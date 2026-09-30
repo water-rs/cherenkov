@@ -364,6 +364,41 @@ fn record_motion(c: &mut cherenkov::Recorder, op: &Op, motion: &PaintMotion) {
     }
 }
 
+/// Records `ops` with `live` slot bindings — identical to dev's record
+/// loop, reached by scenes that carry no motions.
+#[expect(
+    clippy::inline_always,
+    reason = "the record closure must keep dev's per-op call-free codegen"
+)]
+#[inline(always)]
+fn record_ops_static(c: &mut cherenkov::Recorder, ops: &[Op], live: &[LiveRun]) {
+    for (index, op) in ops.iter().enumerate() {
+        match live.iter().find(|live| live.index == index) {
+            Some(live) => record_live(c, op, &live.bindings),
+            None => record_op(c, op),
+        }
+    }
+}
+
+/// Records `ops` with `live` slot bindings and `motions` animated paint
+/// bindings, reached only on scenes that carry motions.
+#[expect(
+    clippy::inline_always,
+    reason = "the record closure must keep dev's per-op call-free codegen"
+)]
+#[inline(always)]
+fn record_ops(c: &mut cherenkov::Recorder, ops: &[Op], live: &[LiveRun], motions: &[PaintMotion]) {
+    for (index, op) in ops.iter().enumerate() {
+        match live.iter().find(|live| live.index == index) {
+            Some(live) => record_live(c, op, &live.bindings),
+            None => match motions.iter().find(|motion| motion.index == index) {
+                Some(motion) => record_motion(c, op, motion),
+                None => record_op(c, op),
+            },
+        }
+    }
+}
+
 /// A maximal run of draw items, drawn as one layer's content.
 struct ContentRun {
     /// The recorded ops.
@@ -1384,32 +1419,17 @@ impl Engine for Cherenkov {
         // re-recording each frame so their numbers stay comparable.
         if first_frame || !(self.has_motion || self.has_live) {
             surface.update(|tx| {
-                for cl in &self.content_layers {
-                    tx[cl.handle(surface)].record(|c| {
-                        // Static content pays nothing for motions
-                        // the layer does not carry.
-                        if cl.motions.is_empty() {
-                            for (index, op) in cl.ops.iter().enumerate() {
-                                match cl.live.iter().find(|live| live.index == index) {
-                                    Some(live) => record_live(c, op, &live.bindings),
-                                    None => record_op(c, op),
-                                }
-                            }
-                        } else {
-                            for (index, op) in cl.ops.iter().enumerate() {
-                                match cl.live.iter().find(|live| live.index == index) {
-                                    Some(live) => record_live(c, op, &live.bindings),
-                                    None => {
-                                        match cl.motions.iter().find(|motion| motion.index == index)
-                                        {
-                                            Some(motion) => record_motion(c, op, motion),
-                                            None => record_op(c, op),
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    });
+                if self.has_motion {
+                    for cl in &self.content_layers {
+                        tx[cl.handle(surface)]
+                            .record(|c| record_ops(c, &cl.ops, &cl.live, &cl.motions));
+                    }
+                } else {
+                    for cl in &self.content_layers {
+                        // A motionless scene's record keeps the dev shape:
+                        // no motions reach it at all.
+                        tx[cl.handle(surface)].record(|c| record_ops_static(c, &cl.ops, &cl.live));
+                    }
                 }
             });
             // A paint motion starts once the content carrying its binding

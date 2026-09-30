@@ -318,6 +318,14 @@ pub enum FramePlanes {
         /// How the plane's alpha channel composes.
         alpha: RgbAlpha,
     },
+    /// A frame imported natively on Vulkan — its planes are bound in the
+    /// engine's Vulkan external-frame operation rather than as ordinary
+    /// `wgpu` textures.
+    ///
+    /// Import through [`vulkan::Device`]; install through
+    /// [`ExternalFrame::native`].
+    #[cfg(all(unix, not(target_vendor = "apple")))]
+    Native(vulkan::Frame),
 }
 
 /// How a [`FramePlanes::Rgb`] plane's alpha composes.
@@ -640,6 +648,25 @@ impl ExternalFrame {
         })
     }
 
+    /// A frame imported natively on the engine's Vulkan device.
+    ///
+    /// `frame` must come from a [`vulkan::Device`] created over the same
+    /// `SharedDevice` the engine runs on; a frame imported on another
+    /// `VkDevice` composes against a queue it was not acquired on and is
+    /// rejected.
+    ///
+    /// # Errors
+    /// [`InvalidFrame`] when the frame's colour levels are invalid.
+    #[cfg(all(unix, not(target_vendor = "apple")))]
+    pub fn native(frame: vulkan::Frame) -> Result<Self, InvalidFrame> {
+        check_color(&frame.generation.color)?;
+        Ok(Self {
+            color: frame.generation.color,
+            planes: FramePlanes::Native(frame),
+            wait: None,
+        })
+    }
+
     /// Orders the sampled planes behind a GPU-side sync.
     ///
     /// The wait runs on the GPU inside the submission that reads the planes.
@@ -650,6 +677,22 @@ impl ExternalFrame {
         self.wait = Some(sync);
         self
     }
+}
+
+/// Native external-frame import on Vulkan (issue #166).
+///
+/// [`Device`] imports a producer [`FrameSource`] — a Linux [`DmaBuf`] or an
+/// Android `AHardwareBuffer` — as a [`Frame`] on the engine's shared
+/// `VkDevice`, synchronised through a Vulkan semaphore on the GPU. Install
+/// the frame on a layer through [`ExternalFrame::native`].
+#[cfg(all(unix, not(target_vendor = "apple")))]
+pub mod vulkan {
+    #[cfg(target_os = "android")]
+    pub use crate::render::external::vulkan::Ahb;
+    pub use crate::render::external::vulkan::{
+        Caps, Device, DmaBuf, DmaBufPlane, Frame, FrameSource, NativeError, QueueFamily,
+        ReleaseSync, Repr, Wait,
+    };
 }
 
 /// Apple interop: importing Metal resources onto the shared device.

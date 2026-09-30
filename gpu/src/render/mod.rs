@@ -4,7 +4,7 @@ mod bindings;
 mod bitmap;
 mod colr;
 pub mod diag;
-mod external;
+pub mod external;
 pub mod filter;
 mod glyph;
 mod gpu_content;
@@ -385,6 +385,15 @@ pub struct GpuRenderer {
     /// `[format index]` external pipelines: 0 = surface, 1 = scratch —
     /// `None` until the first external draw prepares them.
     external_pipes: [Option<wgpu::RenderPipeline>; 2],
+    /// The Vulkan native external-frame context (issue #166): descriptors,
+    /// render passes and pipelines for multiplanar and external-format
+    /// frames, built at init when the device is Vulkan.
+    #[cfg(all(unix, not(target_vendor = "apple")))]
+    native: Option<external::vulkan::Native>,
+    /// Serializes "stage queue waits → submit" so an unrelated submission
+    /// cannot consume a staged producer semaphore wait (#166).
+    #[cfg(all(unix, not(target_vendor = "apple")))]
+    submit_lock: std::sync::Mutex<()>,
     surfaces: FxHashMap<SurfaceId, SurfaceState>,
     fonts: FxHashMap<u64, FontData>,
     /// Registered images.
@@ -614,13 +623,26 @@ fn create_device(
     if config.pipeline_cache.is_some() && supported.contains(wgpu::Features::PIPELINE_CACHE) {
         required |= wgpu::Features::PIPELINE_CACHE;
     }
+    let limits = wgpu::Limits::default().or_worse_values_from(&adapter.limits());
+    // On Vulkan, device creation is where external-memory, semaphore and
+    // YCbCr capabilities are enabled — the `open_with_callback` hook adds
+    // the extensions/features wgpu does not request, preserving every
+    // requirement wgpu does (#166). A non-Vulkan adapter falls through to
+    // `request_device` unchanged.
+    #[cfg(all(unix, not(target_vendor = "apple")))]
+    if info.backend == wgpu::Backend::Vulkan {
+        match create_vulkan_device(&adapter, required, &limits) {
+            Ok((device, queue)) => {
+                tracing::info!(features = ?device.features(), "device");
+                return Ok((instance, adapter, device, queue));
+            }
+            Err(err) => return Err(err),
+        }
+    }
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("cherenkov-gpu"),
         required_features: required,
-        // Clamp the portable defaults to what the adapter reports:
-        // iOS Metal offers 15 inter-stage varyings (60 components)
-        // where `Limits::default` asks for 16.
-        required_limits: wgpu::Limits::default().or_worse_values_from(&adapter.limits()),
+        required_limits: limits,
         experimental_features: wgpu::ExperimentalFeatures::disabled(),
         memory_hints: wgpu::MemoryHints::Performance,
         trace: wgpu::Trace::Off,
@@ -628,6 +650,68 @@ fn create_device(
     .map_err(|e| EngineError::Backend(format!("{e}")))?;
     tracing::info!(features = ?device.features(), "device");
     Ok((instance, adapter, device, queue))
+}
+
+/// `create_device`'s Vulkan branch (issue #166): opens the device through
+/// `open_with_callback` so the external-frame extensions and the YCbCr
+/// sampler-conversion feature bit are enabled at creation — first import
+/// would be too late — then hands the opened device back through
+/// `create_device_from_hal` with wgpu's requirements intact.
+#[cfg(all(unix, not(target_vendor = "apple"), not(target_arch = "wasm32")))]
+fn create_vulkan_device(
+    adapter: &wgpu::Adapter,
+    features: wgpu::Features,
+    limits: &wgpu::Limits,
+) -> Result<(wgpu::Device, wgpu::Queue), EngineError> {
+    use external::vulkan;
+    let Some(hal_adapter) = (unsafe { adapter.as_hal::<wgpu::hal::vulkan::Api>() }) else {
+        return Err(EngineError::Backend("adapter is not Vulkan".into()));
+    };
+    let extensions = vulkan::extra_device_extensions();
+    // The YCbCr conversion feature is keyed to its extension's presence.
+    let ycbcr = hal_adapter
+        .physical_device_capabilities()
+        .supports_extension(ash::khr::sampler_ycbcr_conversion::NAME);
+    let ycbcr_features = ash::vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default()
+        .sampler_ycbcr_conversion(true);
+    let callback: Option<Box<wgpu::hal::vulkan::CreateDeviceCallback<'_>>> =
+        if ycbcr || !extensions.is_empty() {
+            Some(Box::new(
+                move |args: wgpu::hal::vulkan::CreateDeviceCallbackArgs<'_, '_, '_>| {
+                    for ext in &extensions {
+                        if !args.extensions.contains(ext) {
+                            args.extensions.push(ext);
+                        }
+                    }
+                    if ycbcr {
+                        args.create_info.p_next =
+                            core::ptr::from_ref(&ycbcr_features).cast::<core::ffi::c_void>();
+                    }
+                },
+            ))
+        } else {
+            None
+        };
+    let opened = unsafe {
+        hal_adapter.open_with_callback(features, limits, &wgpu::MemoryHints::Performance, callback)
+    }
+    .map_err(|e| EngineError::Backend(format!("vulkan device creation: {e}")))?;
+    drop(hal_adapter);
+    let (device, queue) = unsafe {
+        adapter.create_device_from_hal::<wgpu::hal::vulkan::Api>(
+            opened,
+            &wgpu::DeviceDescriptor {
+                label: Some("cherenkov-gpu"),
+                required_features: features,
+                required_limits: limits.clone(),
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                memory_hints: wgpu::MemoryHints::Performance,
+                trace: wgpu::Trace::Off,
+            },
+        )
+    }
+    .map_err(|e| EngineError::Backend(format!("vulkan device from hal: {e}")))?;
+    Ok((device, queue))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -860,6 +944,25 @@ fn make_bind0(
         ],
     })
 }
+
+/// `view`'s `VkImageView` — the descriptor-set write operand for the
+/// native operation (#166).
+#[cfg(all(unix, not(target_vendor = "apple")))]
+fn raw_vk_view(view: &wgpu::TextureView) -> ash::vk::ImageView {
+    let hal = unsafe { view.as_hal::<wgpu::hal::vulkan::Api>() };
+    unsafe { hal.expect("vulkan").raw_handle() }
+}
+
+/// `buffer`'s `VkBuffer`.
+#[cfg(all(unix, not(target_vendor = "apple")))]
+fn raw_vk_buffer(buffer: &wgpu::Buffer) -> ash::vk::Buffer {
+    let hal = unsafe { buffer.as_hal::<wgpu::hal::vulkan::Api>() };
+    unsafe { hal.expect("vulkan").raw_handle() }
+}
+
+/// `format` as its `vk::Format`, queried through the hal adapter.
+#[cfg(all(unix, not(target_vendor = "apple")))]
+impl GpuRenderer {}
 
 /// The closed pipeline set: instanced-quad pipelines from `shader.wgsl`,
 /// specialised per fragment variant.
@@ -1268,6 +1371,24 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
                 .map(|slot| (set.clone(), slot * 2, 2))
                 .collect()
         });
+        #[cfg(all(unix, not(target_vendor = "apple")))]
+        let native = {
+            let shared_device = crate::interop::SharedDevice {
+                instance: instance.clone(),
+                adapter: adapter.clone(),
+                device: device.clone(),
+                queue: queue.clone(),
+            };
+            match external::vulkan::shared_for(&shared_device)
+                .and_then(external::vulkan::Native::new)
+            {
+                Ok(native) => Some(native),
+                Err(error) => {
+                    tracing::warn!(%error, "vulkan external-frame import unavailable");
+                    None
+                }
+            }
+        };
         let renderer = GpuRenderer {
             instance,
             adapter,
@@ -1294,6 +1415,10 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             dummy_uint_view,
             ext_layout: None,
             external_pipes: [None, None],
+            #[cfg(all(unix, not(target_vendor = "apple")))]
+            native,
+            #[cfg(all(unix, not(target_vendor = "apple")))]
+            submit_lock: std::sync::Mutex::new(()),
             bound_atlas: 0,
             bound_instance_size: 272 * 16,
             bound_stop_size: 32 * 16,
@@ -2603,6 +2728,8 @@ impl GpuRenderer {
     ) -> Result<Redraw, RenderError> {
         let origin = *self.origin.get_or_insert(frame.time.0);
         self.drain_timestamps();
+        #[cfg(all(unix, not(target_vendor = "apple")))]
+        self.flush_native_releases();
         let dirty: Vec<_> = frame
             .surfaces
             .iter()
@@ -2733,13 +2860,13 @@ impl GpuRenderer {
             .collect();
         self.filters.set_active(&active);
     }
-    pub(crate) fn add_filter(&mut self, id: cherenkov::FilterId, source: Box<dyn filter::Source>) {
+    pub fn add_filter(&mut self, id: cherenkov::FilterId, source: Box<dyn filter::Source>) {
         self.filters.add(filter::FilterKey::Layer(id.raw()), source);
     }
-    pub(crate) fn remove_filter(&mut self, id: cherenkov::FilterId) {
+    pub fn remove_filter(&mut self, id: cherenkov::FilterId) {
         self.filters.remove(filter::FilterKey::Layer(id.raw()));
     }
-    pub(crate) fn add_backdrop_group(
+    pub fn add_backdrop_group(
         &mut self,
         surface: SurfaceId,
         id: cherenkov::BackdropId,
@@ -2764,7 +2891,7 @@ impl GpuRenderer {
             },
         );
     }
-    pub(crate) fn remove_backdrop_group(&mut self, surface: SurfaceId, id: cherenkov::BackdropId) {
+    pub fn remove_backdrop_group(&mut self, surface: SurfaceId, id: cherenkov::BackdropId) {
         let Some(surf) = self.surfaces.get_mut(&surface) else {
             return;
         };
@@ -2811,7 +2938,7 @@ impl GpuRenderer {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn add_shader(
+    pub fn add_shader(
         &mut self,
         id: cherenkov::ShaderId,
         source: &cherenkov::ShaderSource,
@@ -2825,7 +2952,7 @@ impl GpuRenderer {
         clippy::future_not_send,
         reason = "the browser engine is single-threaded and its futures run on the page's event loop"
     )]
-    pub(crate) async fn add_shader(
+    pub async fn add_shader(
         &mut self,
         id: cherenkov::ShaderId,
         source: &cherenkov::ShaderSource,
@@ -2839,7 +2966,7 @@ impl GpuRenderer {
     /// stub sits between two `// backdrop-effect-stub` marker lines, so
     /// removal is a plain string split.
     #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn add_backdrop_shader(
+    pub fn add_backdrop_shader(
         &mut self,
         id: cherenkov::BackdropShaderId,
         source: &cherenkov::BackdropShaderSource,
@@ -2884,7 +3011,7 @@ impl GpuRenderer {
         clippy::future_not_send,
         reason = "the browser engine is single-threaded and its futures run on the page's event loop"
     )]
-    pub(crate) async fn add_backdrop_shader(
+    pub async fn add_backdrop_shader(
         &mut self,
         id: cherenkov::BackdropShaderId,
         source: &cherenkov::BackdropShaderSource,
@@ -2933,11 +3060,11 @@ impl GpuRenderer {
 
     /// Frees a backdrop effect shader's pipelines. A member that still
     /// samples it fails at encode with a render error.
-    pub(crate) fn remove_backdrop_shader(&mut self, id: cherenkov::BackdropShaderId) {
+    pub fn remove_backdrop_shader(&mut self, id: cherenkov::BackdropShaderId) {
         self.backdrop_shaders.remove(&id.raw());
     }
 
-    pub(crate) fn remove_shader(&mut self, id: cherenkov::ShaderId) {
+    pub fn remove_shader(&mut self, id: cherenkov::ShaderId) {
         let _diag_guard = diag::Guard::scope(self.diag.as_ref());
         self.shaders.remove(id.raw());
         for surface in self.surfaces.values_mut() {
@@ -3072,7 +3199,7 @@ impl GpuRenderer {
         rate.map_or(Redraw::None, |rate| Redraw::Wanted { rate })
     }
 
-    pub(crate) fn set_gpu_content(
+    pub fn set_gpu_content(
         &mut self,
         surface: SurfaceId,
         layer: LayerId,
@@ -3095,7 +3222,7 @@ impl GpuRenderer {
     /// The planes are sampled where the frame lands; nothing is copied or
     /// rasterized. Any recorded or GPU content on `layer` is dropped — a
     /// layer has one content kind at a time.
-    pub(crate) fn set_external_frame(
+    pub fn set_external_frame(
         &mut self,
         surface: SurfaceId,
         layer: LayerId,
@@ -3109,12 +3236,7 @@ impl GpuRenderer {
             .insert(layer, external::Slot::new(&self.device, &self.queue, frame));
     }
 
-    pub(crate) fn resize_gpu_content(
-        &mut self,
-        surface: SurfaceId,
-        layer: LayerId,
-        size: (u32, u32),
-    ) {
+    pub fn resize_gpu_content(&mut self, surface: SurfaceId, layer: LayerId, size: (u32, u32)) {
         let _diag_guard = diag::Guard::scope(self.diag.as_ref());
         let state = self.surfaces.get_mut(&surface).expect("GPU surface exists");
         state
@@ -4375,6 +4497,12 @@ impl GpuRenderer {
     ) -> Result<(), RenderError> {
         // External pipelines stay lazy until a surface first samples an
         // external frame; the scan stays on the (unchanged) surface state.
+        // A previous failed encode may have left acquisitions staged;
+        // drop them so this encode's submission can't consume them.
+        #[cfg(all(unix, not(target_vendor = "apple")))]
+        if let Some(native) = self.native.as_mut() {
+            external::vulkan::cancel_staged(native);
+        }
         let needs_external = self.surfaces.get(&id).is_some_and(|surf| {
             surf.frame
                 .passes
@@ -4385,6 +4513,14 @@ impl GpuRenderer {
         if needs_external {
             self.ensure_external()?;
         }
+        // The hal adapter handle is bound before `surf` borrows the
+        // renderer: the native pass maps target formats through it inside
+        // the encode loop (#166).
+        #[cfg(all(unix, not(target_vendor = "apple")))]
+        let hal_adapter = self
+            .native
+            .is_some()
+            .then(|| unsafe { self.adapter.as_hal::<wgpu::hal::vulkan::Api>() }.expect("vulkan"));
         let Some(surf) = self.surfaces.get_mut(&id) else {
             return Ok(());
         };
@@ -4542,13 +4678,30 @@ impl GpuRenderer {
             };
             let pass_index = self.frame_pass_count;
             self.frame_pass_count += 1;
+            // A pass containing native external ops splits at each op; its
+            // beginning sample lands on the first segment and its end
+            // sample on the last (reopened) segment, so the recorded GPU
+            // time spans the native composition too.
+            #[cfg(all(unix, not(target_vendor = "apple")))]
+            let native_run = self.native.is_some()
+                && pass.ranges.iter().any(|range| {
+                    matches!(&range.image, Some(lower::ImageSource::External(layer))
+                        if surf
+                            .external
+                            .get(layer)
+                            .and_then(|slot| slot.native_frame())
+                            .is_some())
+                });
+            #[cfg(not(all(unix, not(target_vendor = "apple"))))]
+            let native_run = false;
             let timestamp_writes =
                 self.query_set
                     .as_ref()
                     .map(|qs| wgpu::RenderPassTimestampWrites {
                         query_set: qs,
                         beginning_of_pass_write_index: Some(self.query_base + 2 * pass_index),
-                        end_of_pass_write_index: Some(self.query_base + 2 * pass_index + 1),
+                        end_of_pass_write_index: (!native_run)
+                            .then_some(self.query_base + 2 * pass_index + 1),
                     });
             // Only the timestamp path reads `pass_meta`; skip the
             // allocation when timing is off.
@@ -4567,6 +4720,45 @@ impl GpuRenderer {
                 });
             }
             let scratch_backdrop = pass.backdrop_copy.is_some();
+            // First-use acquisition (#166): for every native generation this
+            // pass samples — `Planes`/`ExternalFormat` bound in the native
+            // op and `Rgb` bound through wgpu — record the acquire barrier
+            // and stage its wait before the pass opens. `stage_acquire`
+            // deduplicates generations already staged or owned.
+            #[cfg(all(unix, not(target_vendor = "apple")))]
+            if self.native.is_some() {
+                let gens: Vec<std::sync::Arc<external::vulkan::Generation>> = pass
+                    .ranges
+                    .iter()
+                    .filter_map(|range| match &range.image {
+                        Some(lower::ImageSource::External(layer)) => {
+                            surf.external.get(layer).and_then(|slot| {
+                                slot.vulkan_frame().map(|frame| frame.generation.clone())
+                            })
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if !gens.is_empty()
+                    && let Some(native) = self.native.as_mut()
+                {
+                    unsafe {
+                        encoder.as_hal_mut::<wgpu::hal::vulkan::Api, _, _>(|hal| {
+                            let hal = hal.expect("vulkan encoder");
+                            let cb = hal.raw_handle();
+                            for generation in &gens {
+                                if let Some(pending) =
+                                    external::vulkan::stage_acquire(generation, cb)?
+                                {
+                                    native.staged.push(pending);
+                                }
+                            }
+                            Ok::<(), external::vulkan::NativeError>(())
+                        })
+                    }
+                    .map_err(|e| RenderError::Render(e.to_string()))?;
+                }
+            }
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -4606,8 +4798,125 @@ impl GpuRenderer {
             // External ranges bind a slot's group-1 over the external
             // pipeline; an engine range after one must rebind its pipeline.
             let mut pipeline = Bound::Engine(PipelineKind::SrcOver, ShaderVariant::Simple);
-            for range in &pass.ranges {
+            let mut ri = 0usize;
+            while ri < pass.ranges.len() {
+                let range = &pass.ranges[ri];
                 stats.draws += 1;
+                // A `Planes`/`ExternalFormat` generation draws in the Vulkan
+                // native operation: end the wgpu pass, record the native
+                // composition into the same target, then reopen the wgpu
+                // pass with a Load (#166). `Rgb` generations stay on the
+                // ordinary external path below.
+                #[cfg(all(unix, not(target_vendor = "apple")))]
+                if let Some(lower::ImageSource::External(layer)) = &range.image
+                    && self.native.is_some()
+                    && surf
+                        .external
+                        .get(layer)
+                        .and_then(|slot| slot.native_frame())
+                        .is_some()
+                {
+                    drop(render_pass);
+                    let mut draws = Vec::new();
+                    let mut end = ri;
+                    while end < pass.ranges.len() {
+                        let Some(lower::ImageSource::External(l)) = &pass.ranges[end].image else {
+                            break;
+                        };
+                        let Some(frame) = surf.external.get(l).and_then(|slot| slot.native_frame())
+                        else {
+                            break;
+                        };
+                        let slot = surf.external.get(l).expect("slot checked");
+                        draws.push(external::vulkan::OpDraw {
+                            generation: frame.generation.clone(),
+                            first_instance: inst_base + pass.ranges[end].instances.start,
+                            instance_count: pass.ranges[end].instances.end
+                                - pass.ranges[end].instances.start,
+                            mask: pass.ranges[end].mask.map(|key| {
+                                raw_vk_view(
+                                    self.atlas
+                                        .mask_texture_view(key)
+                                        .expect("mask texture stored before encode"),
+                                )
+                            }),
+                            params: raw_vk_buffer(slot.params_buffer()),
+                        });
+                        end += 1;
+                    }
+                    stats.draws += u32::try_from(draws.len() - 1).unwrap_or(u32::MAX);
+                    stats.passes += 1;
+                    let vk_format = hal_adapter
+                        .as_ref()
+                        .expect("native run implies vulkan")
+                        .texture_format_as_raw(texture.format());
+                    let native = self.native.as_mut().expect("checked");
+                    let set0 = native
+                        .set0_set(
+                            raw_vk_buffer(&self.globals),
+                            raw_vk_buffer(&self.instances),
+                            raw_vk_buffer(&self.stops),
+                            raw_vk_view(self.atlas.view()),
+                        )
+                        .map_err(|e| RenderError::Render(e.to_string()))?;
+                    unsafe {
+                        encoder.as_hal_mut::<wgpu::hal::vulkan::Api, _, _>(|hal| {
+                            let hal = hal.expect("vulkan encoder");
+                            let cb = hal.raw_handle();
+                            native.record(
+                                cb,
+                                raw_vk_view(view),
+                                (texture.width(), texture.height()),
+                                vk_format,
+                                set0,
+                                &draws,
+                                offset,
+                            )
+                        })
+                    }
+                    .map_err(|e| RenderError::Render(e.to_string()))?;
+                    // Reopen the wgpu pass loading what was written.
+                    let reopen_writes =
+                        self.query_set
+                            .as_ref()
+                            .map(|qs| wgpu::RenderPassTimestampWrites {
+                                query_set: qs,
+                                beginning_of_pass_write_index: None,
+                                end_of_pass_write_index: Some(self.query_base + 2 * pass_index + 1),
+                            });
+                    render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: reopen_writes,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    render_pass.set_pipeline(&self.pipelines[format_i][0][0]);
+                    if !matches!(pass.target, Target::Surface) {
+                        render_pass.set_viewport(
+                            0.0,
+                            0.0,
+                            pass.region[2] as f32,
+                            pass.region[3] as f32,
+                            0.0,
+                            1.0,
+                        );
+                        render_pass.set_scissor_rect(0, 0, pass.region[2], pass.region[3]);
+                    }
+                    render_pass.set_bind_group(0, &self.bind0, &[offset]);
+                    pipeline = Bound::Engine(PipelineKind::SrcOver, ShaderVariant::Simple);
+                    ri = end;
+                    continue;
+                }
                 if let Some(lower::ImageSource::External(layer)) = &range.image {
                     if pipeline != Bound::External {
                         pipeline = Bound::External;
@@ -4645,6 +4954,7 @@ impl GpuRenderer {
                         0..6,
                         (inst_base + range.instances.start)..(inst_base + range.instances.end),
                     );
+                    ri += 1;
                     continue;
                 }
                 let want = Bound::Engine(range.pipeline, range.variant);
@@ -4749,6 +5059,7 @@ impl GpuRenderer {
                     0..6,
                     (inst_base + range.instances.start)..(inst_base + range.instances.end),
                 );
+                ri += 1;
             }
             drop(render_pass);
             if let Some((_, parameters)) = surf.frame.shadows.iter().find(|(pass, _)| *pass == i) {
@@ -4817,7 +5128,75 @@ impl GpuRenderer {
                 buffer.commit();
             }
         }
-        let submission = self.queue.submit([encoder.finish()]);
+        // Retired generations' release barriers join this encoder; their
+        // signal semaphores and the staged producer waits register on the
+        // queue immediately before the consuming submission, under the
+        // submit guard (#166).
+        #[cfg(all(unix, not(target_vendor = "apple")))]
+        if let Some(native) = self.native.as_mut() {
+            let releases = external::vulkan::drain_releases(native);
+            if !releases.is_empty() {
+                unsafe {
+                    encoder.as_hal_mut::<wgpu::hal::vulkan::Api, _, _>(|hal| {
+                        let hal = hal.expect("vulkan encoder");
+                        let cb = hal.raw_handle();
+                        for release in &releases {
+                            release.encode_barrier(&native.shared, cb);
+                        }
+                    });
+                }
+                native.releases = releases;
+            }
+        }
+        let submission = {
+            #[cfg(all(unix, not(target_vendor = "apple")))]
+            let _submit = self.submit_lock.lock().expect("submit guard");
+            #[cfg(all(unix, not(target_vendor = "apple")))]
+            if let Some(native) = self.native.as_mut()
+                && (!native.staged.is_empty() || !native.releases.is_empty())
+            {
+                let hal_queue =
+                    unsafe { self.queue.as_hal::<wgpu::hal::vulkan::Api>() }.expect("vulkan queue");
+                external::vulkan::submit_waits(native, &hal_queue);
+                for release in &native.releases {
+                    for (semaphore, value) in release.signals() {
+                        hal_queue.add_signal_semaphore(semaphore, value);
+                    }
+                }
+            }
+            let submission = self.queue.submit([encoder.finish()]);
+            #[cfg(all(unix, not(target_vendor = "apple")))]
+            if let Some(native) = self.native.as_mut()
+                && !native.staged.is_empty()
+            {
+                external::vulkan::mark_submitted(native);
+            }
+            #[cfg(all(unix, not(target_vendor = "apple")))]
+            if let Some(native) = self.native.as_mut()
+                && !native.releases.is_empty()
+            {
+                // The release submission is accepted: exportable fences
+                // open, and destruction runs when the queue reports the
+                // submission complete — never a CPU wait.
+                let shared = native.shared.clone();
+                let releases = std::mem::take(&mut native.releases);
+                for release in &releases {
+                    if let Some(flag) = &release.submitted_flag {
+                        flag.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                    if let Some(state) = &release.state {
+                        *state.lock().expect("generation state") =
+                            external::vulkan::State::ReleaseSubmitted;
+                    }
+                }
+                self.queue.on_submitted_work_done(move || {
+                    for release in releases {
+                        release.destroy(&shared);
+                    }
+                });
+            }
+            submission
+        };
         if uploads.is_some() {
             self.uploads.submitted(submission.clone());
         }
@@ -4950,6 +5329,59 @@ impl GpuRenderer {
             count,
             meta: std::mem::take(&mut self.pass_meta),
             complete,
+        });
+    }
+
+    /// Submits a pending external-frame retirement even when nothing else
+    /// is being drawn — an idle engine still releases the lease (#166).
+    #[cfg(all(unix, not(target_vendor = "apple")))]
+    fn flush_native_releases(&mut self) {
+        let Some(native) = self.native.as_mut() else {
+            return;
+        };
+        let releases = external::vulkan::drain_releases(native);
+        if releases.is_empty() {
+            return;
+        }
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("external frame release"),
+            });
+        unsafe {
+            encoder.as_hal_mut::<wgpu::hal::vulkan::Api, _, _>(|hal| {
+                let hal = hal.expect("vulkan encoder");
+                let cb = hal.raw_handle();
+                for release in &releases {
+                    release.encode_barrier(&native.shared, cb);
+                }
+            });
+        }
+        {
+            let _submit = self.submit_lock.lock().expect("submit guard");
+            let hal_queue =
+                unsafe { self.queue.as_hal::<wgpu::hal::vulkan::Api>() }.expect("vulkan queue");
+            for release in &releases {
+                for (semaphore, value) in release.signals() {
+                    hal_queue.add_signal_semaphore(semaphore, value);
+                }
+            }
+            self.queue.submit([encoder.finish()]);
+        }
+        let shared = native.shared.clone();
+        for release in &releases {
+            if let Some(flag) = &release.submitted_flag {
+                flag.store(true, std::sync::atomic::Ordering::Release);
+            }
+            if let Some(state) = &release.state {
+                *state.lock().expect("generation state") =
+                    external::vulkan::State::ReleaseSubmitted;
+            }
+        }
+        self.queue.on_submitted_work_done(move || {
+            for release in releases {
+                release.destroy(&shared);
+            }
         });
     }
 

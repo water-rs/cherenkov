@@ -13,10 +13,14 @@ use crate::interop::{
     ChromaOffset, ExternalFrame, FramePlanes, Primaries, RgbAlpha, Transfer, YuvMatrix, YuvRange,
 };
 
+/// Native external-frame import on Vulkan (issue #166).
+#[cfg(all(unix, not(target_vendor = "apple")))]
+pub mod vulkan;
+
 /// External frame kinds, mirrored by `external.wgsl`.
 const KIND_RGB: u32 = 0;
-const KIND_NV12: u32 = 1;
-const KIND_P010: u32 = 2;
+pub const KIND_NV12: u32 = 1;
+pub const KIND_P010: u32 = 2;
 
 /// `Params::info.w` bit: swap the R and B samples of an RGB plane
 /// (`Bgra8Unorm`).
@@ -194,6 +198,41 @@ fn plane_contract(frame: &ExternalFrame) -> (u32, u32, u32, wgpu::Extent3d, wgpu
             };
             (KIND_RGB, alpha, bgr, plane.size(), plane.size())
         }
+        #[cfg(all(unix, not(target_vendor = "apple")))]
+        FramePlanes::Native(frame) => {
+            let size = wgpu::Extent3d {
+                width: frame.size().0,
+                height: frame.size().1,
+                depth_or_array_layers: 1,
+            };
+            let chroma = wgpu::Extent3d {
+                width: size.width.div_ceil(2),
+                height: size.height.div_ceil(2),
+                depth_or_array_layers: 1,
+            };
+            match frame.repr() {
+                vulkan::Repr::Rgb { format } => {
+                    let bgr = if format == wgpu::TextureFormat::Bgra8Unorm {
+                        FLAG_BGR
+                    } else {
+                        0
+                    };
+                    let alpha = match frame.generation.alpha {
+                        RgbAlpha::Opaque => 0,
+                        RgbAlpha::Straight => 1,
+                        RgbAlpha::Premultiplied => 2,
+                    };
+                    (KIND_RGB, alpha, bgr, size, size)
+                }
+                vulkan::Repr::Planes { kind } => {
+                    let shift = if kind == KIND_P010 { FLAG_SHIFT6 } else { 0 };
+                    (kind, 0, shift, size, chroma)
+                }
+                // The sampler conversion yields encoded `R'G'B'`; the
+                // shader decodes it like an opaque RGB plane.
+                vulkan::Repr::ExternalFormat { .. } => (KIND_RGB, 0, 0, size, size),
+            }
+        }
     }
 }
 
@@ -313,6 +352,12 @@ pub struct Slot {
     /// The emitted quad's size in layer-local space: the luma or RGB plane
     /// dimensions.
     pub size: (u32, u32),
+    /// The native generation on Vulkan — `Some` for `FramePlanes::Native`
+    /// slots. A `Repr::Rgb` generation still draws on the ordinary external
+    /// pipeline through `rgb`; multiplanar and external-format generations
+    /// draw in the Vulkan native operation.
+    #[cfg(all(unix, not(target_vendor = "apple")))]
+    native: Option<vulkan::Frame>,
     /// The luma plane view for YUV frames.
     y: Option<wgpu::TextureView>,
     /// The interleaved chroma plane view for YUV frames.
@@ -335,6 +380,7 @@ impl Slot {
 
     /// Creates the views and the params buffer for a frame.
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, frame: ExternalFrame) -> Self {
+        let mut native = None;
         let (y, uv, rgb, size) = match &frame.planes {
             FramePlanes::Yuv { y, uv } => (
                 Some(y.create_view(&wgpu::TextureViewDescriptor::default())),
@@ -348,6 +394,25 @@ impl Slot {
                 Some(plane.create_view(&wgpu::TextureViewDescriptor::default())),
                 (plane.size().width, plane.size().height),
             ),
+            #[cfg(all(unix, not(target_vendor = "apple")))]
+            FramePlanes::Native(frame) => {
+                // An RGB-repr generation samples its wgpu-wrapped plane
+                // through the ordinary path; the others bind natively.
+                let rgb = match frame.repr() {
+                    vulkan::Repr::Rgb { .. } => frame
+                        .generation
+                        .rgb_wrap
+                        .as_ref()
+                        .map(|t| t.create_view(&wgpu::TextureViewDescriptor::default())),
+                    _ => None,
+                };
+                // The engine-side lease: `vulkan_frame` clones held by the
+                // producer don't count, so dropping this slot's clone is
+                // the retirement the release submission waits on.
+                frame.lease();
+                native = Some(frame.clone());
+                (None, None, rgb, frame.size())
+            }
         };
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("external frame params"),
@@ -359,6 +424,8 @@ impl Slot {
         Self {
             frame,
             size,
+            #[cfg(all(unix, not(target_vendor = "apple")))]
+            native,
             y,
             uv,
             rgb,
@@ -366,6 +433,31 @@ impl Slot {
             binds: FxHashMap::default(),
             binds_gen: 0,
         }
+    }
+
+    /// The native generation when the slot draws in the Vulkan native
+    /// operation (`Planes` and `ExternalFormat` representations). An
+    /// RGB-repr native frame binds its wrapped plane on the ordinary
+    /// pipeline and returns `None`.
+    #[cfg(all(unix, not(target_vendor = "apple")))]
+    pub fn native_frame(&self) -> Option<&vulkan::Frame> {
+        self.native
+            .as_ref()
+            .filter(|&frame| !matches!(frame.repr(), vulkan::Repr::Rgb { .. }))
+    }
+
+    /// The native generation on ANY representation — including `Rgb`,
+    /// which still needs the acquire barrier and producer wait staged
+    /// before its first wgpu use.
+    #[cfg(all(unix, not(target_vendor = "apple")))]
+    pub const fn vulkan_frame(&self) -> Option<&vulkan::Frame> {
+        self.native.as_ref()
+    }
+
+    /// The params uniform the native operation binds per draw.
+    #[cfg(all(unix, not(target_vendor = "apple")))]
+    pub const fn params_buffer(&self) -> &wgpu::Buffer {
+        &self.params
     }
 
     /// The group-1 bind for a draw under `mask`.
@@ -422,5 +514,16 @@ impl Slot {
                 ],
             })
         })
+    }
+}
+
+/// Dropping the slot ends the engine-side lease on the native frame; the
+/// last such lease schedules the producer release (#166).
+#[cfg(all(unix, not(target_vendor = "apple")))]
+impl Drop for Slot {
+    fn drop(&mut self) {
+        if let Some(frame) = &self.native {
+            frame.unlease();
+        }
     }
 }

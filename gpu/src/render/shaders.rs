@@ -144,6 +144,14 @@ const PRESENT_SPV: &[u8] = &[];
 const EXTERNAL_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/external.spv"));
 #[cfg(target_arch = "wasm32")]
 const EXTERNAL_SPV: &[u8] = &[];
+/// `external_native.spv` — the Vulkan native module: `vs_main`,
+/// `fs_external` and `fs_external_format`, with the external-format pair
+/// merged into a combined sampled image by the build's restricted
+/// lowering.
+#[cfg(not(target_arch = "wasm32"))]
+pub const EXTERNAL_NATIVE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/external_native.spv"));
+#[cfg(target_arch = "wasm32")]
+pub const EXTERNAL_NATIVE: &[u8] = &[];
 #[cfg(target_vendor = "apple")]
 const ENGINE_METALLIB: [&[u8]; 3] = [
     include_bytes!(concat!(env!("OUT_DIR"), "/engine0.metallib")),

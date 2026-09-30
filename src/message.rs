@@ -23,8 +23,10 @@ use crate::animation::Animation;
 use crate::backend::{Backend, Display, SurfaceInfo};
 use crate::config::{MemoryUsage, Pressure};
 use crate::display_list::{Picture, SlotUpdate};
-use crate::error::{RenderError, SurfaceError};
+use crate::error::{RenderError, ResourceError, SurfaceError};
 use crate::frame::{FrameStats, FrameTime, FrameTiming, Next, Readback};
+use crate::image::ImageUpload;
+use crate::paint::ImageId;
 use crate::shape::ShapeData;
 use crate::style::{BlendMode, FilterId};
 
@@ -289,6 +291,17 @@ pub enum Message<B: Backend> {
     /// removal, capability hooks. Reply-carrying operations capture their
     /// `Sender` in the closure.
     Resource(ResOp<B>),
+    /// Replace a registered image's pixels behind the same id, then mark
+    /// changed every surface whose content samples the image.
+    ReplaceImage {
+        /// The image.
+        id: ImageId,
+        /// The new pixels.
+        image: ImageUpload,
+        /// Result of the replacement: whether any surface was marked
+        /// changed, which is when the host needs a frame to show it.
+        reply: Sender<Result<bool, ResourceError>>,
+    },
     /// Browser operation awaiting local device work.
     #[cfg(target_arch = "wasm32")]
     AsyncResource(AsyncResOp<B>),

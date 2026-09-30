@@ -39,6 +39,8 @@ pub enum Event {
     RemoveFont(FontId),
     /// `add_image` ran.
     AddImage(ImageId),
+    /// `replace_image` ran, with the new dimensions.
+    ReplaceImage(ImageId, (u32, u32)),
     /// `remove_image` ran.
     RemoveImage(ImageId),
     /// `add_shader` ran.
@@ -215,6 +217,24 @@ impl Renderer for NullRenderer {
         Ok(())
     }
 
+    fn replace_image(&mut self, id: ImageId, image: ImageUpload) -> Result<(), ResourceError> {
+        assert!(
+            self.images.contains(&id),
+            "replace of unregistered image {}",
+            id.raw()
+        );
+        let _ = self
+            .events
+            .send(Event::ReplaceImage(id, (image.width, image.height)));
+        Ok(())
+    }
+
+    fn samples_image(&self, surface: SurfaceId, id: ImageId) -> bool {
+        self.pictures.iter().any(|((owner, _), picture)| {
+            *owner == surface && picture.display_list().references_image(id)
+        })
+    }
+
     fn remove_image(&mut self, id: ImageId) {
         if self.images.remove(&id) {
             let _ = self.events.send(Event::RemoveImage(id));
@@ -231,7 +251,14 @@ impl Renderer for NullRenderer {
             Some(ContentOp::Replace(picture) | ContentOp::Picture(picture)) => {
                 self.pictures.insert((surface, layer), picture)
             }
-            Some(ContentOp::Update(_)) => None,
+            Some(ContentOp::Update(updates)) => {
+                let _ = self
+                    .pictures
+                    .get_mut(&(surface, layer))
+                    .expect("slot update targets a layer without content")
+                    .apply(updates);
+                None
+            }
             None => self.pictures.remove(&(surface, layer)),
         };
         let _ = self.events.send(Event::SetContent(surface, layer));
@@ -391,22 +418,22 @@ impl Uploads<Rgba16F> for Null {}
 /// }
 /// ```
 ///
-/// `uploads` gates the image-lifetime test on backends implementing
-/// `Uploads<Rgba8>`. GPU backends need the driver environment set by the
-/// caller (on this box, lavapipe via `VK_ICD_FILENAMES`/`WGPU_BACKEND`).
+/// `uploads` gates the image-lifetime and image-replacement tests on
+/// backends implementing `Uploads<Rgba8>`. GPU backends need the driver
+/// environment set by the caller (on this box, lavapipe via `VK_ICD_FILENAMES`/`WGPU_BACKEND`).
 /// Available with the `testing` feature.
 #[cfg(feature = "testing")]
 #[macro_export]
 macro_rules! behaviour_suite {
     { backend: $backend:ty, config: $config:expr, uploads: true $(,)? } => {
         $crate::behaviour_suite! { @impl $backend, $config }
-        /// Image-lifetime checks for backends implementing
-        /// `Uploads<Rgba8>`.
+        /// Image-lifetime and image-replacement checks for backends
+        /// implementing `Uploads<Rgba8>`.
         mod behaviour_suite_uploads {
             use std::time::Duration;
 use $crate::Instant;
 
-            use $crate::{Draw as _, Engine, FrameTime, ImageData, Layer, Offscreen, OffscreenFormat, Readback, Rgba8, Surface, WorkingColor};
+            use $crate::{Draw as _, Engine, FrameTime, ImageData, Layer, Offscreen, OffscreenFormat, Readback, Rgba8, Sampling, Surface, WorkingColor};
             use $crate::kurbo::{Affine, Rect, Vec2};
 
             /// The backend under test.
@@ -445,6 +472,69 @@ use $crate::Instant;
                     .expect("render");
                 let after = engine.memory().gpu.0 + engine.memory().cpu.0;
                 assert!(after < with_image, "memory {after} >= {with_image}");
+            }
+
+            /// A `width` × `height` image of one opaque texel.
+            fn solid(width: u32, height: u32, texel: [u8; 4]) -> ImageData<Rgba8> {
+                let data = texel.repeat(width as usize * height as usize);
+                ImageData::<Rgba8>::new(width, height, data).expect("image data")
+            }
+
+            /// The centre pixel, premultiplied linear P3.
+            fn centre(readback: &Readback) -> [f32; 4] {
+                readback.pixels[(readback.height / 2 * readback.width + readback.width / 2) as usize]
+            }
+
+            /// Records `Draw::image` once over a red 16×16 image and renders
+            /// frame A; replaces the image with a blue `width` × `height`
+            /// one and renders frame B without re-recording. Then drops
+            /// the drawing layer and the last image handle: the replaced
+            /// image is still removed and its memory freed.
+            fn replace_redraws_the_recorded_image(width: u32, height: u32) {
+                const RED: [u8; 4] = [255, 0, 0, 255];
+                const BLUE: [u8; 4] = [0, 0, 255, 255];
+                let Some(engine) = engine() else { return };
+                let surface = engine
+                    .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))
+                    .expect("surface");
+                let t0 = Instant::now();
+                let image = engine.image(solid(16, 16, RED)).expect("image");
+                let layer = surface.layer();
+                let content = surface.record(|c| {
+                    c.image(image.id(), Rect::new(0.0, 0.0, 64.0, 64.0), Sampling::Nearest);
+                });
+                surface.update(|tx| {
+                    tx[surface.root()].push(&layer);
+                    tx[&layer].content(content);
+                });
+                engine.render(FrameTime::at(t0)).expect("render");
+                let a = centre(&surface.readback().expect("readback"));
+                assert!(a[0] > 0.5 && a[2] < 0.1, "frame A {a:?} is not the red image");
+
+                image.replace(solid(width, height, BLUE)).expect("replace");
+                engine.render(FrameTime::at(t0 + TICK)).expect("render");
+                let b = centre(&surface.readback().expect("readback"));
+                assert!(b[2] > 0.5 && b[0] < 0.1, "frame B {b:?} is not the blue replacement");
+
+                drop(layer);
+                engine.render(FrameTime::at(t0 + TICK * 2)).expect("render");
+                let with_image = engine.memory().gpu.0 + engine.memory().cpu.0;
+                drop(image);
+                engine.render(FrameTime::at(t0 + TICK * 3)).expect("render");
+                let after = engine.memory().gpu.0 + engine.memory().cpu.0;
+                assert!(after < with_image, "memory {after} >= {with_image}");
+            }
+
+            /// A same-size replacement reuses the storage behind the id.
+            #[test]
+            fn a_same_size_replacement_redraws_the_recorded_image() {
+                replace_redraws_the_recorded_image(16, 16);
+            }
+
+            /// A resized replacement reallocates behind the same id.
+            #[test]
+            fn a_resized_replacement_redraws_the_recorded_image() {
+                replace_redraws_the_recorded_image(8, 32);
             }
         }
     };
@@ -1037,6 +1127,115 @@ mod tests {
         let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert!(
             events.iter().any(|e| matches!(e, Event::RemoveImage(_))),
+            "no RemoveImage in {events:?}"
+        );
+    }
+
+    /// `Image::replace` reaches the renderer with the new dimensions, marks
+    /// changed only the surface whose content draws the image and wakes the
+    /// host once; replacing an image nothing draws marks nothing and does
+    /// not wake. The last drop after a replacement still removes the image.
+    #[test]
+    fn image_replacement_redraws_and_still_releases() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        use crate::{Draw as _, Sampling, WorkingColor};
+
+        let (engine, rx) = engine();
+        let drawing = engine
+            .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))
+            .expect("surface");
+        let other = engine
+            .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))
+            .expect("surface");
+        let image = engine
+            .image(ImageData::<Rgba8>::new(1, 1, vec![0u8; 4]).expect("image data"))
+            .expect("image");
+        let unused = engine
+            .image(ImageData::<Rgba8>::new(1, 1, vec![0u8; 4]).expect("image data"))
+            .expect("image");
+        let image_layer = drawing.layer();
+        let content = drawing.record(|c| {
+            c.image(
+                image.id(),
+                kurbo::Rect::new(0., 0., 8., 8.),
+                Sampling::Nearest,
+            );
+        });
+        drawing.update(|tx| {
+            tx[drawing.root()].push(&image_layer);
+            tx[&image_layer].content(content);
+        });
+        let fill_layer = other.layer();
+        let content =
+            other.record(|c| c.fill(kurbo::Rect::new(0., 0., 8., 8.), WorkingColor::WHITE));
+        other.update(|tx| {
+            tx[other.root()].push(&fill_layer);
+            tx[&fill_layer].content(content);
+        });
+        engine.render(FrameTime::now()).expect("render");
+        engine.render(FrameTime::now()).expect("render");
+        let settled = frames(&rx);
+        assert!(
+            settled.iter().rev().take(2).all(|record| !record.changed),
+            "nothing changed since the first render: {settled:?}"
+        );
+
+        let wakes = Rc::new(Cell::new(0u32));
+        engine.set_waker({
+            let wakes = Rc::clone(&wakes);
+            move || wakes.set(wakes.get() + 1)
+        });
+        image
+            .replace(ImageData::<Rgba8>::new(2, 3, vec![0u8; 24]).expect("image data"))
+            .expect("replace");
+        assert_eq!(
+            wakes.get(),
+            1,
+            "a replacement of a drawn image wakes the host once"
+        );
+        unused
+            .replace(ImageData::<Rgba8>::new(2, 2, vec![0u8; 16]).expect("image data"))
+            .expect("replace");
+        assert_eq!(
+            wakes.get(),
+            1,
+            "a replacement nothing draws does not wake the host"
+        );
+        engine.render(FrameTime::now()).expect("render");
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::ReplaceImage(id, (2, 3)) if *id == image.id())),
+            "no ReplaceImage in {events:?}"
+        );
+        let changed = |surface| {
+            events.iter().find_map(|e| match e {
+                Event::Frame(record) if record.surface == surface => Some(record.changed),
+                _ => None,
+            })
+        };
+        assert_eq!(
+            changed(drawing.id()),
+            Some(true),
+            "the surface drawing the image was not marked changed: {events:?}"
+        );
+        assert_eq!(
+            changed(other.id()),
+            Some(false),
+            "a surface not drawing the image was marked changed: {events:?}"
+        );
+
+        let id = image.id();
+        drop(image);
+        engine.render(FrameTime::now()).expect("render");
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::RemoveImage(removed) if *removed == id)),
             "no RemoveImage in {events:?}"
         );
     }

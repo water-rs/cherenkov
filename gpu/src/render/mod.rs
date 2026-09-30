@@ -1880,82 +1880,80 @@ impl Renderer for GpuRenderer {
     }
 
     fn add_image(&mut self, id: ImageId, image: ImageUpload) -> Result<(), ResourceError> {
-        let (width, height) = (image.width, image.height);
-        let (texture, view) = create_target(
-            &self.device,
-            "image",
-            (width, height),
-            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            TARGET_FORMAT,
-        );
         let data = image_texels_f16(&image)?;
-        diag::create(
+        let image = upload_image(
             &self.device,
-            "image",
-            u64::from(width) * u64::from(height) * texel_bytes(TARGET_FORMAT),
-        );
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
+            &self.queue,
+            (image.width, image.height),
             &data,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(width * 8),
-                rows_per_image: Some(height),
-            },
-            wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
         );
-        diag::upload(
-            &self.device,
-            "image",
-            data.len() as u64,
-            Some((0, 0, width, height)),
-        );
-        let replaced = self.images.insert(
-            id.raw(),
-            GpuImage {
-                texture,
-                view,
-                width,
-                height,
-            },
-        );
+        self.images.insert(id.raw(), image);
         self.images_gen += 1;
-        if let Some(old) = replaced {
-            diag::retire(
+        Ok(())
+    }
+
+    fn replace_image(&mut self, id: ImageId, image: ImageUpload) -> Result<(), ResourceError> {
+        let _diag_guard = diag::Guard::scope(self.diag.as_ref());
+        let data = image_texels_f16(&image)?;
+        let size = (image.width, image.height);
+        let current = self
+            .images
+            .get(&id.raw())
+            .expect("replace targets a registered image");
+        if (current.width, current.height) == size {
+            // The copy is queued ahead of the next submission, after every
+            // frame already submitted, so no frame samples a partly
+            // written texture. The view is unchanged: bind groups and
+            // lowered paints stay valid.
+            write_image(&self.device, &self.queue, &current.texture, size, &data);
+            return Ok(());
+        }
+        let replacement = upload_image(&self.device, &self.queue, size, &data);
+        let old = self
+            .images
+            .insert(id.raw(), replacement)
+            .expect("replace targets a registered image");
+        self.images_gen += 1;
+        diag::retire(
+            &self.device,
+            diag::RetireArgs {
+                label: "image",
+                class: diag::Class::Image,
+                bytes: u64::from(old.width) * u64::from(old.height) * 8,
+                used_in_latest_submit: true,
+                reason: "replace_image",
+            },
+        );
+        // #169 A4: bind groups created against the replaced view are
+        // stale — `Registered(id)` now binds the new texture; submitted
+        // encoders keep the old one until completion. Lowering resolved
+        // the old dimensions into the image's paints, so content sampling
+        // it is lowered again.
+        let images_gen = self.images_gen;
+        let mask_gen = self.atlas.mask_texture_generation();
+        for surf in self.surfaces.values_mut() {
+            retire_binds1(
+                surf,
                 &self.device,
-                diag::RetireArgs {
-                    label: "image",
-                    class: diag::Class::Image,
-                    bytes: u64::from(old.width) * u64::from(old.height) * 8,
-                    used_in_latest_submit: true,
-                    reason: "add_image",
-                },
+                images_gen,
+                mask_gen,
+                "image replaced",
+                |key| key.2 == Some(lower::ImageSource::Registered(id.raw())),
             );
-            // #169 A4: bind groups created against the replaced view are
-            // stale — `Registered(id)` now binds the new texture.
-            let images_gen = self.images_gen;
-            let mask_gen = self.atlas.mask_texture_generation();
-            for surf in self.surfaces.values_mut() {
-                retire_binds1(
-                    surf,
-                    &self.device,
-                    images_gen,
-                    mask_gen,
-                    "image replaced",
-                    |key| key.2 == Some(lower::ImageSource::Registered(id.raw())),
-                );
+            for content in surf.layers.values_mut() {
+                content.invalidate_image(id);
             }
         }
         Ok(())
+    }
+
+    fn samples_image(&self, surface: SurfaceId, id: ImageId) -> bool {
+        self.surfaces.get(&surface).is_some_and(|state| {
+            state
+                .layers
+                .values()
+                .any(|content| content.references_image(id))
+        })
     }
 
     fn remove_image(&mut self, id: ImageId) {
@@ -4935,6 +4933,72 @@ impl GpuRenderer {
         }
     }
 }
+
+/// A registered image's texture of `size`, holding `data` (f16 texels
+/// from [`image_texels_f16`]).
+fn upload_image(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    (width, height): (u32, u32),
+    data: &[u8],
+) -> GpuImage {
+    let (texture, view) = create_target(
+        device,
+        "image",
+        (width, height),
+        wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        TARGET_FORMAT,
+    );
+    diag::create(
+        device,
+        "image",
+        u64::from(width) * u64::from(height) * texel_bytes(TARGET_FORMAT),
+    );
+    write_image(device, queue, &texture, (width, height), data);
+    GpuImage {
+        texture,
+        view,
+        width,
+        height,
+    }
+}
+
+/// Writes `data` (f16 texels from [`image_texels_f16`]) over the whole of
+/// an image texture of `size`.
+fn write_image(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    (width, height): (u32, u32),
+    data: &[u8],
+) {
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        data,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(width * 8),
+            rows_per_image: Some(height),
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    diag::upload(
+        device,
+        "image",
+        data.len() as u64,
+        Some((0, 0, width, height)),
+    );
+}
+
 /// `Rgba8` or `Rgba16F` upload bytes -> premultiplied linear-P3 f16 texels,
 /// the working texel format of [`GpuImage`].
 ///

@@ -301,6 +301,56 @@ impl Renderer for RasterRenderer {
         Ok(())
     }
 
+    fn replace_image(&mut self, id: ImageId, image: ImageUpload) -> Result<(), ResourceError> {
+        let current = self
+            .images
+            .get(&id.raw())
+            .expect("replace targets a registered image");
+        let resized = if (current.width, current.height) == (image.width, image.height) {
+            CpuImage::validate(&image)?;
+            None
+        } else {
+            let resident =
+                self.images.values().map(|image| image.bytes()).sum::<u64>() - current.bytes();
+            let required = u64::from(image.width)
+                .checked_mul(u64::from(image.height))
+                .and_then(|count| count.checked_mul(16));
+            if required.is_none_or(|bytes| bytes > self.image_budget.saturating_sub(resident)) {
+                return Err(ResourceError::Image("CPU image budget exhausted".into()));
+            }
+            Some(Arc::new(CpuImage::decode(&image)?))
+        };
+        // Retained paint operands share the pixels and lowering resolved
+        // the dimensions: content sampling the image is lowered again.
+        for surface in self.surfaces.values_mut() {
+            for content in surface.layers.values_mut() {
+                let _ = content.invalidate_image(id);
+            }
+        }
+        let slot = self
+            .images
+            .get_mut(&id.raw())
+            .expect("replace targets a registered image");
+        if let Some(resized) = resized {
+            *slot = resized;
+            self.refresh_cache_budgets();
+        } else {
+            Arc::get_mut(slot)
+                .expect("discarded content released every operand sharing the image")
+                .overwrite(&image);
+        }
+        Ok(())
+    }
+
+    fn samples_image(&self, surface: SurfaceId, id: ImageId) -> bool {
+        self.surfaces.get(&surface).is_some_and(|state| {
+            state
+                .layers
+                .values()
+                .any(|content| content.references_image(id))
+        })
+    }
+
     fn remove_image(&mut self, id: ImageId) {
         self.images.remove(&id.raw());
         self.refresh_cache_budgets();

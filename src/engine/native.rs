@@ -23,7 +23,7 @@ use crate::glyph::FontId;
 use crate::image::{Format, ImageData};
 use crate::message::{ChangeSet, FontData, MemoryReply, Message, RenderReply, ResOp, SurfaceId};
 use crate::paint::ImageId;
-use crate::resource::{Filter, Font, FontSource, Image, Shader};
+use crate::resource::{Filter, Font, FontSource, Image, ReplaceImage, Shader};
 use crate::style::FilterId;
 use crate::surface::{ExternalFrameHandle, GpuContentHandle, Shared, Surface};
 
@@ -62,6 +62,8 @@ pub struct Engine<B: Backend> {
     thread: Option<std::thread::JoinHandle<()>>,
     /// The type-erased `Message::Resource` sender resource drops use.
     release: Rc<dyn Fn(ResOp<B>)>,
+    /// The `Message::ReplaceImage` round trip every image handle shares.
+    replace_image: ReplaceImage,
     waker: Rc<Waker>,
     // `!Send`: the engine lives on the UI thread.
     _not_send: PhantomData<Rc<()>>,
@@ -93,6 +95,22 @@ impl<B: Backend> Engine<B> {
             .recv()
             .map_err(|_| EngineError::Thread("render thread died during init".into()))??;
         let release_tx = tx.clone();
+        let waker = Rc::new(Waker::new());
+        let replace_image = {
+            let tx = tx.clone();
+            let waker = Rc::clone(&waker);
+            Rc::new(move |id, image| {
+                let (reply, rx) = std::sync::mpsc::channel();
+                tx.send(Message::ReplaceImage { id, image, reply })
+                    .map_err(|_| ResourceError::Lost)?;
+                // A surface drawing the image was marked changed: a host
+                // paused after `Next::Idle` needs a frame to show it.
+                if rx.recv().map_err(|_| ResourceError::Lost)?? {
+                    waker.wake();
+                }
+                Ok(())
+            }) as ReplaceImage
+        };
         Ok(Self {
             tx,
             info,
@@ -113,7 +131,8 @@ impl<B: Backend> Engine<B> {
             release: Rc::new(move |op: ResOp<B>| {
                 let _ = release_tx.send(Message::Resource(op));
             }),
-            waker: Rc::new(Waker::new()),
+            replace_image,
+            waker,
             _not_send: PhantomData,
         })
     }
@@ -221,7 +240,8 @@ impl<B: Backend> Engine<B> {
         }))
     }
 
-    /// Registers an image.
+    /// Registers an image. [`Image::replace`] later swaps its pixels
+    /// behind the same id.
     ///
     /// `image` is validated by [`ImageData::new`] before it is passed here;
     /// the backend may still reject it (format conversion failure), so the
@@ -242,7 +262,7 @@ impl<B: Backend> Engine<B> {
         }));
         rx.recv().map_err(|_| ResourceError::Lost)??;
         let release = Rc::clone(&self.release);
-        Ok(Image::new(id, move || {
+        Ok(Image::new(id, Rc::clone(&self.replace_image), move || {
             release(Box::new(move |r: &mut B::Renderer| r.remove_image(id)));
         }))
     }

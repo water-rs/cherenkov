@@ -3,15 +3,16 @@
 
 //! Resource handles: [`Font`], [`Image`], [`Shader`] and [`Filter`] are
 //! `Clone` over an `Rc`; the last drop queues the `remove_*` op on the
-//! render thread.
+//! render thread. An [`Image`] also queues in-place pixel replacements.
 
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::ShaderId;
+use crate::error::ResourceError;
 use crate::glyph::FontId;
-use crate::image::Format;
+use crate::image::{Format, ImageData, ImageUpload};
 use crate::message::BackdropId;
 use crate::paint::ImageId;
 use crate::style::FilterId;
@@ -61,14 +62,31 @@ impl FontSource {
     }
 }
 
+/// Queues a replacement of an image's pixels on the render thread and
+/// answers with the backend's result.
+#[cfg(not(target_arch = "wasm32"))]
+pub type ReplaceImage = Rc<dyn Fn(ImageId, ImageUpload) -> Result<(), ResourceError>>;
+/// Queues a replacement of an image's pixels on the local executor and
+/// resolves with the backend's result.
+#[cfg(target_arch = "wasm32")]
+pub type ReplaceImage = Rc<
+    dyn Fn(
+        ImageId,
+        ImageUpload,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ResourceError>>>>,
+>;
+
 /// The shared state of a resource handle: the last `Rc` drop runs
-/// `on_drop`, which queues the resource's `remove_*` op.
-struct Inner<I> {
+/// `on_drop`, which queues the resource's `remove_*` op. `ops` carries the
+/// render-thread operations a kind queues while it lives (an image's
+/// replacement); kinds without any use `()`.
+struct Inner<I, O = ()> {
     id: I,
+    ops: O,
     on_drop: Option<Box<dyn FnOnce()>>,
 }
 
-impl<I> std::fmt::Debug for Inner<I>
+impl<I, O> std::fmt::Debug for Inner<I, O>
 where
     I: std::fmt::Debug,
 {
@@ -79,7 +97,7 @@ where
     }
 }
 
-impl<I> Drop for Inner<I> {
+impl<I, O> Drop for Inner<I, O> {
     fn drop(&mut self) {
         if let Some(on_drop) = self.on_drop.take() {
             on_drop();
@@ -88,8 +106,13 @@ impl<I> Drop for Inner<I> {
 }
 
 fn handle<I>(id: I, on_drop: impl FnOnce() + 'static) -> Rc<Inner<I>> {
+    handle_with(id, (), on_drop)
+}
+
+fn handle_with<I, O>(id: I, ops: O, on_drop: impl FnOnce() + 'static) -> Rc<Inner<I, O>> {
     Rc::new(Inner {
         id,
+        ops,
         on_drop: Some(Box::new(on_drop)),
     })
 }
@@ -124,10 +147,11 @@ impl Font {
 }
 
 /// An image registered with an engine, typed by its storage [`Format`].
-/// Dropping the last clone unregisters the image.
+/// [`Image::replace`] swaps its pixels behind the same id. Dropping the last
+/// clone unregisters the image.
 #[derive(Debug)]
 pub struct Image<F: Format> {
-    inner: Rc<Inner<ImageId>>,
+    inner: Rc<Inner<ImageId, ReplaceImage>>,
     format: std::marker::PhantomData<F>,
 }
 
@@ -141,9 +165,13 @@ impl<F: Format> Clone for Image<F> {
 }
 
 impl<F: Format> Image<F> {
-    pub(crate) fn new(id: ImageId, on_drop: impl FnOnce() + 'static) -> Self {
+    pub(crate) fn new(
+        id: ImageId,
+        replace: ReplaceImage,
+        on_drop: impl FnOnce() + 'static,
+    ) -> Self {
         Self {
-            inner: handle(id, on_drop),
+            inner: handle_with(id, replace, on_drop),
             format: std::marker::PhantomData,
         }
     }
@@ -152,6 +180,56 @@ impl<F: Format> Image<F> {
     #[must_use]
     pub fn id(&self) -> ImageId {
         self.inner.id
+    }
+
+    /// Replaces the image's pixels in place, blocking until the render
+    /// thread has applied the replacement.
+    ///
+    /// The id is unchanged, so every recording that names this image draws
+    /// the new pixels from the next frame on, without re-recording. The
+    /// replacement is ordered with frames on the render thread, so no frame
+    /// samples a partly written image. The same dimensions reuse the
+    /// backing storage; different dimensions reallocate it behind the same
+    /// id. The next render redraws the surfaces whose content draws this
+    /// image, and the engine's waker fires when there is at least one.
+    ///
+    /// `image` is validated by [`ImageData::new`]; the backend may still
+    /// reject it, as it may in [`Engine::image`](crate::Engine::image).
+    ///
+    /// # Errors
+    /// [`ResourceError::Image`] when the backend rejects the data (the image
+    /// keeps its previous pixels), [`ResourceError::Lost`] when the render
+    /// thread is gone.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn replace(&self, image: ImageData<F>) -> Result<(), ResourceError> {
+        (self.inner.ops)(self.inner.id, image.into_upload())
+    }
+
+    /// Replaces the image's pixels in place, resolving once the local
+    /// executor has applied the replacement.
+    ///
+    /// The id is unchanged, so every recording that names this image draws
+    /// the new pixels from the next frame on, without re-recording. The
+    /// replacement is ordered with frames on the executor, so no frame
+    /// samples a partly written image. The same dimensions reuse the
+    /// backing storage; different dimensions reallocate it behind the same
+    /// id. The next render redraws the surfaces whose content draws this
+    /// image, and the engine's waker fires when there is at least one.
+    ///
+    /// `image` is validated by [`ImageData::new`]; the backend may still
+    /// reject it, as it may in [`Engine::image`](crate::Engine::image).
+    ///
+    /// # Errors
+    /// [`ResourceError::Image`] when the backend rejects the data (the image
+    /// keeps its previous pixels), [`ResourceError::Lost`] when the executor
+    /// is gone.
+    #[cfg(target_arch = "wasm32")]
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
+    pub async fn replace(&self, image: ImageData<F>) -> Result<(), ResourceError> {
+        (self.inner.ops)(self.inner.id, image.into_upload()).await
     }
 }
 

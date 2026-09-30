@@ -109,6 +109,20 @@ impl Paint {
         }
         Self::Transformed(TransformedPaint::new(self, transform))
     }
+
+    /// Whether this paint samples image `id`.
+    pub(crate) fn references_image(&self, id: ImageId) -> bool {
+        match self {
+            Self::Image(pattern) => pattern.image == id,
+            Self::Transformed(transformed) => transformed.paint.references_image(id),
+            Self::Solid(_)
+            | Self::Linear(_)
+            | Self::Radial(_)
+            | Self::Sweep(_)
+            | Self::Mesh(_)
+            | Self::Shader(_) => false,
+        }
+    }
 }
 
 /// One colour stop of a gradient.

@@ -1,6 +1,8 @@
 //! Resource handles: [`Font`], [`Image`], [`Shader`] and [`Filter`] are
-//! `Clone` over an `Rc`; the last drop queues the `remove_*` op on the
-//! render thread. An [`Image`] also queues in-place pixel replacements.
+//! `Clone` over an `Rc`; the last drop queues the release on the render
+//! thread. A font, image, shader or backdrop shader is freed there once no
+//! surface's installed content draws it. An [`Image`] also queues in-place
+//! pixel replacements.
 
 use std::path::Path;
 use std::rc::Rc;
@@ -63,15 +65,19 @@ impl FontSource {
 /// message the engine sends.
 pub type ReplaceImage = Rc<dyn Fn(ImageId, ImageUpload) -> Result<(), ResourceError>>;
 
-/// A resource whose registration the backend may reject after the handle
-/// was returned: the id a failed [`RenderError::Rejected`] names.
+/// A registered resource that installed content or a layer can draw.
 ///
-/// Fonts are absent: every check a font needs runs before
-/// [`Engine::font`](crate::Engine::font) returns.
+/// The render loop frees a released resource only once no surface draws
+/// it, and a [`RenderError::Rejected`] names the resource the backend
+/// rejected after its handle was returned. That is never a font: every
+/// check a font needs runs before [`Engine::font`](crate::Engine::font)
+/// returns.
 ///
 /// [`RenderError::Rejected`]: crate::RenderError::Rejected
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ResourceId {
+    /// A font from [`Engine::font`](crate::Engine::font).
+    Font(FontId),
     /// An image from [`Engine::image`](crate::Engine::image).
     Image(ImageId),
     /// A shader from [`Engine::shader`](crate::Engine::shader).
@@ -84,6 +90,7 @@ pub enum ResourceId {
 impl std::fmt::Display for ResourceId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Font(id) => write!(f, "font {}", id.raw()),
             Self::Image(id) => write!(f, "image {}", id.raw()),
             Self::Shader(id) => write!(f, "shader {}", id.raw()),
             Self::BackdropShader(id) => write!(f, "backdrop shader {}", id.raw()),
@@ -133,7 +140,7 @@ fn handle_with<I, O>(id: I, ops: O, on_drop: impl FnOnce() + 'static) -> Rc<Inne
 }
 
 /// A font registered with an engine. Dropping the last clone unregisters
-/// the font.
+/// the font once no installed content draws it.
 #[derive(Debug)]
 pub struct Font {
     inner: Rc<Inner<FontId>>,
@@ -162,8 +169,9 @@ impl Font {
 }
 
 /// An image registered with an engine, typed by its storage [`Format`].
+///
 /// [`Image::replace`] swaps its pixels behind the same id. Dropping the last
-/// clone unregisters the image.
+/// clone unregisters the image once no installed content draws it.
 #[derive(Debug)]
 pub struct Image<F: Format> {
     inner: Rc<Inner<ImageId, ReplaceImage>>,
@@ -223,7 +231,7 @@ impl<F: Format> Image<F> {
 }
 
 /// A shader registered with an engine. Dropping the last clone unregisters
-/// the shader.
+/// the shader once no installed content draws it.
 #[derive(Debug)]
 pub struct Shader {
     inner: Rc<Inner<ShaderId>>,
@@ -350,8 +358,7 @@ impl BackdropSample {
 /// A backdrop effect shader registered with an engine.
 ///
 /// Made by [`Engine::backdrop_shader`](crate::Engine::backdrop_shader).
-/// Dropping the last clone unregisters it; a member still sampling it
-/// makes the frame fail.
+/// Dropping the last clone unregisters it once no layer samples it.
 #[derive(Debug)]
 pub struct BackdropShader {
     inner: Rc<Inner<crate::message::BackdropShaderId>>,

@@ -97,7 +97,7 @@ pub trait Renderer: 'static {
     /// Registers a font [`Renderer::prepare_font`] validated.
     fn add_font(&mut self, id: FontId, font: Self::Font);
 
-    /// Unregisters a font.
+    /// Unregisters a font no installed content draws any more.
     fn remove_font(&mut self, id: FontId);
 
     /// Registers an image. A rejection fails every later render that
@@ -121,12 +121,16 @@ pub trait Renderer: 'static {
     fn replace_image(&mut self, id: ImageId, image: ImageUpload) -> Result<(), ResourceError>;
 
     /// Whether any layer content on `surface`, with its slot updates
-    /// applied and nested pictures included, samples `resource`: an image
-    /// or a shader. Content never names a backdrop shader; the render loop
-    /// finds those in the layer tree.
+    /// applied and nested pictures included, samples `resource`: a font,
+    /// an image or a shader. Content never names a backdrop shader; the
+    /// render loop finds those in the layer tree.
+    ///
+    /// The render loop frees a released resource only once this answers
+    /// false for every surface, so content installed on a surface never
+    /// names a resource its `remove_*` already ran for.
     fn samples(&self, surface: SurfaceId, resource: ResourceId) -> bool;
 
-    /// Unregisters an image.
+    /// Unregisters an image no installed content draws any more.
     fn remove_image(&mut self, id: ImageId);
 
     /// Replaces or updates a layer's content, or clears it. Returns the

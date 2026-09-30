@@ -85,7 +85,8 @@ pub trait Renderer: 'static {
     fn add_image(&mut self, id: ImageId, image: ImageUpload) -> Result<(), ResourceError>;
     /// New pixels behind the same id; the render loop then marks changed the surfaces `samples` names.
     fn replace_image(&mut self, id: ImageId, image: ImageUpload) -> Result<(), ResourceError>;
-    /// Whether any layer content on `surface`, slot updates applied, samples `resource` (an image or a shader).
+    /// Whether any layer content on `surface`, slot updates applied, samples `resource` (a font, an image or a shader).
+    /// The render loop runs a resource's `remove_*` only once this is false for every surface.
     fn samples(&self, surface: SurfaceId, resource: ResourceId) -> bool;
     fn remove_image(&mut self, id: ImageId);
 
@@ -154,7 +155,7 @@ pub trait Renderer: 'static {
   ```
 
   The `Engine`/`Transaction` methods bounded by these traits (`engine.shader`, `engine.filter`, `engine.gpu_content`, `tx[&l].content(gpu)`, `engine.image::<Astc4x4>`) wrap the hook into an owned `FnOnce(&mut B::Renderer) + Send` op that travels in the commit with the layer ops, in order. The `Renderer` core trait therefore has no shader, filter or GPU-content methods at all.
-- **Resource lifetime.** Handles (`Font`, `Image<F>`, `Shader`, `Filter`) are `Clone` over an `Rc`; the last drop queues the `remove_*` op, which reaches the backend in the next frame's commit. The backend frees the GPU copy there (deferred to after in-flight frames where the API needs it). The same `Rc` carries the ops a kind queues while it lives: an `Image<F>` queues `replace_image` through it (see Resources).
+- **Resource lifetime.** Handles (`Font`, `Image<F>`, `Shader`, `BackdropShader`, `Filter`) are `Clone` over an `Rc`; the last drop queues the release, ordered with every render. For a font, image, shader or backdrop shader the render loop, not the host, owns the invariant that a resource is freed only once no surface's installed content draws it (see Resources). The backend frees the GPU copy when the release is carried out (deferred to after in-flight frames where the API needs it). The same `Rc` carries the ops a kind queues while it lives: an `Image<F>` queues `replace_image` through it.
 - **Errors.** `init` failures surface from `Engine::new` as `EngineError`. Surface creation errors are returned from `engine.surface`. Render errors fail that `render` call. Resource validation that does not need the device (font parsing, byte lengths, shader validation) runs on the UI thread before any message is sent and returns `ResourceError`; a rejection only the backend can detect fails the renders that draw the resource with `RenderError::Rejected` (see Resources).
 
 ## Engine
@@ -179,7 +180,7 @@ let usage: MemoryUsage = engine.memory();
 
 ## Resources
 
-Resources are RAII handles: they are `Clone`, and the GPU memory is released, deferred, when the last handle drops.
+Resources are RAII handles: they are `Clone`, and the GPU memory is released, deferred, once the last handle has dropped and no installed content draws the resource.
 
 ```rust
 let font: Font = engine.font(FontSource::mapped(path)?)?;          // memory-mapped; never copied
@@ -199,13 +200,20 @@ let shader: Shader = engine.shader(ShaderSource::wgsl(fragment))?;  // validated
   - A shader's composed module passes naga validation and defines its entry point (`ShaderPaint::validate_shader`, `BackdropShaders::validate_backdrop_shader`).
   - An `Err` from these calls is either that validation or `ResourceError::Lost` (the render thread or executor is gone).
 
-  The queued operation runs ahead of every later render on the render thread or the browser's serial executor. A rejection only the backend can detect (an image over the device's texture limit or the CPU image budget, a pipeline the device cannot create) never passes silently: the render loop records it against the resource, and every render that draws the resource fails with `RenderError::Rejected { resource: ResourceId, reason }`, naming the resource and the backend's reason, until an image replacement succeeds or the last handle drops. The check costs nothing while no rejection is recorded, and afterwards visits only the surfaces that changed since the last render: a rejected id reaches content only through a commit, and a rejected replacement marks every surface sampling the image changed. There is no fallback drawing. Dropping the last handle of a rejected resource enqueues no backend removal, since the backend never committed it.
+  The queued operation runs ahead of every later render on the render thread or the browser's serial executor. A rejection only the backend can detect (an image over the device's texture limit or the CPU image budget, a pipeline the device cannot create) never passes silently: the render loop records it against the resource, and every render that draws the resource fails with `RenderError::Rejected { resource: ResourceId, reason }`, naming the resource and the backend's reason, until an image replacement succeeds or the resource is freed. The check costs nothing while no rejection is recorded, and afterwards visits only the surfaces that changed since the last render: a rejected id reaches content only through a commit, and a rejected replacement marks every surface sampling the image changed. There is no fallback drawing. Dropping the last handle of a rejected resource enqueues no backend removal, since the backend never committed it.
 
+- **Releasing.** Dropping the last handle of a font, image, shader or backdrop shader never frees what installed content still draws. The host may drop a handle as soon as the content it records next stops naming the resource, whether or not that content is installed yet; a render issued before the install still draws the resource.
+  - The release asks every surface whether its installed content draws the resource: `Renderer::samples` for fonts, images and shaders, the layer tree for backdrop shaders. When none does, the backend's `remove_*` runs at once.
+  - Otherwise the release is pending, and the render loop remembers which surfaces still draw the resource. After a render's commits are applied, and before its frame, each surface that changed is asked again; a surface's destruction drops it from the set. When the set is empty the removal runs, ahead of the frame that no longer draws the resource. A content replacement, a cleared content, a layer removal and a backdrop change all reach the loop as commits.
+  - Content that names a pending resource again, such as a kept recording installed a second time, keeps the resource alive in the same way. Content installed after the removal ran names a resource the backend no longer has: lowering fails that render with an error naming the resource, and no backend draws a substitute.
+  - Ids are allocated once per engine and never reused, so a pending id cannot name another resource.
+  - A rejected resource's record lives until the release is carried out, so a surface that still draws it keeps failing with `RenderError::Rejected`; a rejected registration's removal is skipped because the backend never committed it.
+  - The bookkeeping lives in the render loop shared by the native render thread and the browser executor, so both targets behave identically.
 - **`Image<F>`.** `F` is the storage format: `Rgba8`, `Rgba16F`, `Astc4x4`, `Etc2Rgba`, `Bc7`, and panel formats for `Banded`. Only uncompressed formats have `update(region, pixels)`. Compressed formats are uploaded as-is, and compression is an explicit step (`engine.compress::<Astc4x4>(image)`), never implicit.
 - **Replacing pixels.** `image.replace(data)` swaps an image's pixels behind the same `ImageId`, for content whose picture changes over time: animated images, decoder-backed frames, a reactive image view. Every recording that names the id keeps drawing it and shows the new pixels on the next frame, without re-recording. The replacement is a fire-and-forget `Message::ReplaceImage`, ordered with frames on the render thread, so no frame samples a partly written image, and it fires the engine's waker so a paused host renders the new pixels. It follows the registration model: `ResourceError::Lost` when the render thread is gone is its only error, and a rejection only the backend can detect leaves the previous pixels in place and fails the renders that draw the image with `RenderError::Rejected` until a later replacement succeeds. Replacing an image whose registration was rejected registers it anew. The render loop then asks the backend which surfaces' content samples the image (`Renderer::samples`, answered from the retained display lists with slot updates applied and nested pictures included) and marks only those changed, so every other surface keeps its skip. An animated image replaced at 30–60 Hz therefore redraws the surfaces that show it and nothing else.
   - The same dimensions reuse the backing storage: `queue.write_texture` into the existing texture on the GPU backend, which leaves every bind group valid; an in-place decode on the CPU backend, once the retained paint operands that shared the pixels are discarded.
   - Different dimensions reallocate the storage behind the same id. The GPU backend retires the bind groups that bound the old texture view. Both backends lower again the retained content that samples the image, because lowering resolves the image's dimensions into its paints.
-  - Dropping the last handle after a replacement queues `remove_image` as before.
+  - Dropping the last handle after a replacement releases the image as before.
 - **Colour metadata.** Every image carries its colour space and optional HDR metadata. `ImageColorSpace` is `Srgb`, `DisplayP3`, `LinearSrgb` or `LinearP3`; `LinearP3` is the working space and decodes as the identity. Conversion into the working space happens when the image is sampled.
 
 ## Surfaces and output

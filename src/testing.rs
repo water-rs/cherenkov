@@ -111,7 +111,8 @@ pub type NullInfo = ();
 ///
 /// A `remove_*` or `destroy_surface` for an id the backend does not hold
 /// panics on the render thread, so a spurious removal fails the test that
-/// caused it instead of passing as a no-op.
+/// caused it instead of passing as a no-op. So does a render while
+/// installed content draws a resource the backend already removed.
 pub struct NullRenderer {
     events: Sender<Event>,
     reject: HashSet<NullReject>,
@@ -120,6 +121,8 @@ pub struct NullRenderer {
     images: HashSet<ImageId>,
     shaders: HashSet<ShaderId>,
     pictures: FxHashMap<(SurfaceId, LayerId), Picture>,
+    /// Every resource removed so far; ids are never reused.
+    removed: HashSet<ResourceId>,
 }
 
 impl NullRenderer {
@@ -132,6 +135,22 @@ impl NullRenderer {
             images: HashSet::new(),
             shaders: HashSet::new(),
             pictures: FxHashMap::default(),
+            removed: HashSet::new(),
+        }
+    }
+
+    /// Panics when a surface's installed content draws a removed resource:
+    /// the render loop frees a resource only once no installed content
+    /// draws it.
+    fn assert_draws_no_removed(&self, frame: &Frame<'_>) {
+        for surface in frame.surfaces {
+            for resource in &self.removed {
+                assert!(
+                    !self.samples(surface.id, *resource),
+                    "surface {} draws {resource} after its removal",
+                    surface.id.raw()
+                );
+            }
         }
     }
 }
@@ -211,6 +230,7 @@ impl Renderer for NullRenderer {
             "removal of unregistered font {}",
             id.raw()
         );
+        self.removed.insert(ResourceId::Font(id));
         let _ = self.events.send(Event::RemoveFont(id));
     }
 
@@ -247,6 +267,7 @@ impl Renderer for NullRenderer {
             "removal of unregistered image {}",
             id.raw()
         );
+        self.removed.insert(ResourceId::Image(id));
         let _ = self.events.send(Event::RemoveImage(id));
     }
 
@@ -285,6 +306,7 @@ impl Renderer for NullRenderer {
         frame: &Frame<'_>,
         _stats: &mut crate::FrameStats,
     ) -> Result<Redraw, RenderError> {
+        self.assert_draws_no_removed(frame);
         for surface in frame.surfaces {
             let layers = surface
                 .tree
@@ -316,6 +338,7 @@ impl Renderer for NullRenderer {
         frame: &Frame<'_>,
         _stats: &mut crate::FrameStats,
     ) -> Result<Redraw, RenderError> {
+        self.assert_draws_no_removed(frame);
         for surface in frame.surfaces {
             let layers = surface
                 .tree
@@ -412,6 +435,7 @@ impl ShaderPaint for Null {
             "removal of unregistered shader {}",
             id.raw()
         );
+        r.removed.insert(ResourceId::Shader(id));
         let _ = r.events.send(Event::RemoveShader(id));
     }
 }
@@ -1151,8 +1175,8 @@ mod tests {
     /// `Image::replace` reaches the renderer with the new dimensions, marks
     /// changed only the surface whose content draws the image and wakes the
     /// host once between two renders; replacing an image nothing draws
-    /// marks nothing. The last drop after a replacement still removes the
-    /// image.
+    /// marks nothing. After the last drop the image is removed once the
+    /// content stops drawing it.
     #[test]
     fn image_replacement_redraws_and_still_releases() {
         use std::cell::Cell;
@@ -1244,6 +1268,10 @@ mod tests {
 
         let id = image.id();
         drop(image);
+        drawing.update(|tx| {
+            tx[&image_layer]
+                .record(|c| c.fill(kurbo::Rect::new(0., 0., 8., 8.), WorkingColor::WHITE));
+        });
         engine.render(FrameTime::now()).expect("render");
         let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert!(
@@ -1458,6 +1486,178 @@ mod tests {
             .expect("content that no longer draws a rejected resource renders");
     }
 
+    /// The position of the first event matching `f`.
+    fn position(events: &[Event], f: impl Fn(&Event) -> bool) -> Option<usize> {
+        events.iter().position(f)
+    }
+
+    /// A one-glyph run in `font`.
+    fn one_glyph(font: FontId) -> crate::glyph::GlyphRun {
+        use crate::glyph::{Glyph, GlyphRun, GlyphStyle};
+        GlyphRun {
+            font,
+            size: 8.0,
+            coords: std::sync::Arc::new([]),
+            glyphs: std::sync::Arc::new([Glyph {
+                id: 1,
+                x: 0.0,
+                y: 8.0,
+                transform: None,
+            }]),
+            style: GlyphStyle::Fill,
+        }
+    }
+
+    /// A released resource that installed content still draws stays
+    /// registered, and the render before the content changes draws it
+    /// (`Null` panics on a frame drawing a removed resource). The commit
+    /// that stops drawing it frees it before that commit's frame, and a
+    /// layer removal frees what only that layer drew (#199).
+    #[test]
+    fn a_release_waits_for_installed_content() {
+        use crate::{Draw as _, Sampling, ShaderPaint, WorkingColor};
+
+        let (engine, rx) = engine();
+        let surface = engine
+            .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))
+            .expect("surface");
+        let font = engine.font(FontSource::bytes(vec![0u8; 8])).expect("font");
+        let image = engine
+            .image(ImageData::<Rgba8>::new(1, 1, vec![0u8; 4]).expect("image data"))
+            .expect("image");
+        let shader = engine
+            .shader(ShaderSource::wgsl("@fragment fn f() { }"))
+            .expect("shader");
+        let (font_id, image_id, shader_id) = (font.id(), image.id(), shader.id());
+        let rect = kurbo::Rect::new(0., 0., 8., 8.);
+        let text = surface.layer();
+        surface.update(|tx| {
+            tx[surface.root()].push(&text);
+            tx[surface.root()].record(|c| {
+                c.image(image.id(), rect, Sampling::Nearest);
+                c.fill(
+                    rect,
+                    ShaderPaint {
+                        shader: shader.id(),
+                        uniforms: vec![],
+                    },
+                );
+            });
+            tx[&text].record(|c| c.glyphs(one_glyph(font.id()), WorkingColor::WHITE));
+        });
+        engine.render(FrameTime::now()).expect("render");
+        drop(font);
+        drop(image);
+        drop(shader);
+        engine
+            .render(FrameTime::now())
+            .expect("the installed content still draws the released resources");
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                Event::RemoveFont(_) | Event::RemoveImage(_) | Event::RemoveShader(_)
+            )),
+            "a resource installed content draws was removed: {events:?}"
+        );
+
+        surface.update(|tx| {
+            tx[surface.root()].record(|c| c.fill(rect, WorkingColor::WHITE));
+        });
+        engine.render(FrameTime::now()).expect("render");
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let installed = position(&events, |e| matches!(e, Event::SetContent(..)))
+            .expect("the new content was installed");
+        let frame = position(&events, |e| matches!(e, Event::Frame(_))).expect("frame");
+        for (removal, name) in [
+            (
+                position(
+                    &events,
+                    |e| matches!(e, Event::RemoveImage(id) if *id == image_id),
+                ),
+                "image",
+            ),
+            (
+                position(
+                    &events,
+                    |e| matches!(e, Event::RemoveShader(id) if *id == shader_id),
+                ),
+                "shader",
+            ),
+        ] {
+            let removal = removal.unwrap_or_else(|| panic!("no {name} removal in {events:?}"));
+            assert!(
+                installed < removal && removal < frame,
+                "the {name} is removed between installing the content that stopped drawing it and that frame: {events:?}"
+            );
+        }
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::RemoveFont(_))),
+            "the font the text layer still draws was removed: {events:?}"
+        );
+
+        drop(text);
+        engine.render(FrameTime::now()).expect("render");
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let removed = position(&events, |e| matches!(e, Event::RemoveLayer(..)))
+            .expect("the text layer was removed");
+        let freed = position(
+            &events,
+            |e| matches!(e, Event::RemoveFont(id) if *id == font_id),
+        )
+        .unwrap_or_else(|| panic!("no font removal in {events:?}"));
+        let frame = position(&events, |e| matches!(e, Event::Frame(_))).expect("frame");
+        assert!(
+            removed < freed && freed < frame,
+            "the font is removed with the layer that drew it, before the frame: {events:?}"
+        );
+    }
+
+    /// Dropping the only surface whose installed content draws a released
+    /// resource carries out its pending release (#199).
+    #[test]
+    fn pending_releases_run_when_the_surface_drops() {
+        use crate::{Draw as _, Sampling};
+
+        let (engine, rx) = engine();
+        let surface = engine
+            .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))
+            .expect("surface");
+        let image = engine
+            .image(ImageData::<Rgba8>::new(1, 1, vec![0u8; 4]).expect("image data"))
+            .expect("image");
+        surface.update(|tx| {
+            tx[surface.root()].record(|c| {
+                c.image(
+                    image.id(),
+                    kurbo::Rect::new(0., 0., 8., 8.),
+                    Sampling::Nearest,
+                );
+            });
+        });
+        engine.render(FrameTime::now()).expect("render");
+        drop(image);
+        engine.render(FrameTime::now()).expect("render");
+        drop(surface);
+        engine.render(FrameTime::now()).expect("render");
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let destroyed = position(&events, |e| matches!(e, Event::DestroySurface(_)))
+            .unwrap_or_else(|| panic!("no surface destruction in {events:?}"));
+        let freed = position(&events, |e| matches!(e, Event::RemoveImage(_)))
+            .unwrap_or_else(|| panic!("no image removal in {events:?}"));
+        assert!(
+            destroyed < freed,
+            "the image outlives the surface that drew it: {events:?}"
+        );
+        let (mut commits, mut releases) = balance::transitions(&events);
+        commits.sort();
+        releases.sort();
+        assert_eq!(
+            commits, releases,
+            "unbalanced registration events: {events:?}"
+        );
+    }
+
     #[test]
     fn retired_live_content_does_not_update_or_wake() {
         use crate::{Draw, WorkingColor};
@@ -1538,7 +1738,7 @@ mod wasm_tests {
     use crate::resource::FontSource;
     use crate::{
         Draw as _, Engine, FrameTime, Offscreen, OffscreenFormat, RenderError, ResourceId, Rgba8,
-        Sampling, ShaderPaint, ShaderSource,
+        Sampling, ShaderPaint, ShaderSource, WorkingColor,
     };
 
     async fn engine(reject: HashSet<NullReject>) -> (Engine<Null>, Receiver<Event>) {
@@ -1743,5 +1943,81 @@ mod wasm_tests {
             }
             other => panic!("rejected shader drawn: {other:?}"),
         }
+    }
+
+    /// A released resource that installed content still draws stays
+    /// registered: the render that still draws it succeeds (`Null` panics
+    /// on a frame drawing a removed resource). The release is carried out
+    /// when the content stops drawing it, or when the only surface drawing
+    /// it drops (#199).
+    #[wasm_bindgen_test]
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
+    async fn a_release_waits_for_installed_content() {
+        let (engine, rx) = engine(HashSet::default()).await;
+        let surface = engine
+            .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))
+            .await
+            .expect("surface");
+        let other = engine
+            .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))
+            .await
+            .expect("surface");
+        let rect = kurbo::Rect::new(0., 0., 8., 8.);
+        let image = engine
+            .image(ImageData::<Rgba8>::new(1, 1, vec![0u8; 4]).expect("image data"))
+            .expect("image");
+        let shader = engine
+            .shader(ShaderSource::wgsl("@fragment fn f() { }"))
+            .expect("shader");
+        surface.update(|tx| {
+            tx[surface.root()].record(|c| c.image(image.id(), rect, Sampling::Nearest));
+        });
+        other.update(|tx| {
+            tx[other.root()].record(|c| {
+                c.fill(
+                    rect,
+                    ShaderPaint {
+                        shader: shader.id(),
+                        uniforms: vec![],
+                    },
+                );
+            });
+        });
+        engine.render(FrameTime::now()).await.expect("render");
+        drop(image);
+        drop(shader);
+        engine
+            .render(FrameTime::now())
+            .await
+            .expect("the installed content still draws the released resources");
+        let removals = || {
+            let events: Vec<Event> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+            (
+                events.iter().any(|e| matches!(e, Event::RemoveImage(_))),
+                events.iter().any(|e| matches!(e, Event::RemoveShader(_))),
+            )
+        };
+        assert_eq!(removals(), (false, false), "nothing is freed while drawn");
+
+        surface.update(|tx| {
+            tx[surface.root()].record(|c| c.fill(rect, WorkingColor::WHITE));
+        });
+        engine.render(FrameTime::now()).await.expect("render");
+        assert_eq!(
+            removals(),
+            (true, false),
+            "the image is freed with the content that drew it"
+        );
+
+        drop(other);
+        flush(&engine).await;
+        assert_eq!(
+            removals(),
+            (false, true),
+            "the shader is freed with the surface that drew it"
+        );
     }
 }

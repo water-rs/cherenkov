@@ -147,8 +147,10 @@ impl Backend for Null {
     }
 
     #[cfg(target_arch = "wasm32")]
-    async fn init(config: NullConfig) -> Result<(NullRenderer, NullInfo), EngineError> {
-        Ok((NullRenderer::new(config), ()))
+    fn init(
+        config: NullConfig,
+    ) -> impl core::future::Future<Output = Result<(NullRenderer, NullInfo), EngineError>> {
+        core::future::ready(Ok((NullRenderer::new(config), ())))
     }
 }
 
@@ -291,11 +293,11 @@ impl Renderer for NullRenderer {
     }
 
     #[cfg(target_arch = "wasm32")]
-    async fn render(
+    fn render(
         &mut self,
         frame: &Frame<'_>,
         _stats: &mut crate::FrameStats,
-    ) -> Result<Redraw, RenderError> {
+    ) -> impl core::future::Future<Output = Result<Redraw, RenderError>> {
         for surface in frame.surfaces {
             let layers = surface
                 .tree
@@ -314,7 +316,7 @@ impl Renderer for NullRenderer {
                 layers,
             }));
         }
-        Ok(Redraw::None)
+        core::future::ready(Ok(Redraw::None))
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -328,13 +330,16 @@ impl Renderer for NullRenderer {
     }
 
     #[cfg(target_arch = "wasm32")]
-    async fn readback(&mut self, surface: SurfaceId) -> Result<Readback, RenderError> {
+    fn readback(
+        &mut self,
+        surface: SurfaceId,
+    ) -> impl core::future::Future<Output = Result<Readback, RenderError>> {
         let _ = surface;
-        Ok(Readback {
+        core::future::ready(Ok(Readback {
             width: 0,
             height: 0,
             pixels: Vec::new(),
-        })
+        }))
     }
 
     fn memory(&self) -> MemoryUsage {
@@ -360,17 +365,17 @@ impl ShaderPaint for Null {
     }
 
     #[cfg(target_arch = "wasm32")]
-    async fn add_shader(
+    fn add_shader(
         r: &mut NullRenderer,
         id: ShaderId,
         _source: ShaderSource,
-    ) -> Result<(), ResourceError> {
+    ) -> impl core::future::Future<Output = Result<(), ResourceError>> {
         if r.reject.contains(&NullReject::Shader) {
-            return Err(ResourceError::Shader("injected rejection".into()));
+            return core::future::ready(Err(ResourceError::Shader("injected rejection".into())));
         }
         r.shaders.insert(id);
         let _ = r.events.send(Event::AddShader(id));
-        Ok(())
+        core::future::ready(Ok(()))
     }
 
     fn remove_shader(r: &mut NullRenderer, id: ShaderId) {

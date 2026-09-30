@@ -914,6 +914,9 @@ impl<B: Backend> Surface<B> {
         // changes) come first.
         let pending = std::mem::take(&mut shared.pending);
         let mut ops = pending;
+        // Cloned once per transaction: installed contents attach the
+        // sampling flag to their `LiveState`s.
+        let animated = Rc::clone(&shared.animated);
         for (id, edit) in &mut tx.edits {
             for op in edit.ops.drain(..) {
                 match op {
@@ -946,7 +949,6 @@ impl<B: Backend> Surface<B> {
                         // A fresh `Content` replaces the previous one whole
                         // (its first `take_change` is a `Replace`).
                         let waker = Rc::clone(&shared.waker);
-                        let animated = Rc::clone(&shared.animated);
                         let slot = shared.contents.entry(*id).or_default();
                         if let Some(previous) = slot.content.replace(content) {
                             slot.spare.live = previous.retire().live;

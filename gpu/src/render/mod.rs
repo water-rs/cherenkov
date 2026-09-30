@@ -373,6 +373,8 @@ pub struct GpuRenderer {
     commit_writes: Vec<glyph::CellWrite>,
     /// Per-surface pending origins, rebuilt in place each apply.
     pending_origins: Vec<PendingOrigin>,
+    /// Replay-pin slots, reused across evicting commits (#119).
+    commit_touches: Vec<u32>,
     /// A dummy 1×1 view for unused group-1 slots.
     dummy_view: wgpu::TextureView,
     /// A dummy 1×1 `u32` view for unused external-frame plane slots.
@@ -441,13 +443,13 @@ enum Commit {
     Done,
     /// Grow the atlas once to this edge and re-lower.
     Grow(u32),
-    /// Clear the atlas and re-lower; the next plan verdict is final.
-    Recycle,
 }
 
 enum PendingOrigin {
-    /// Cell origins: one for a glyph, one per cell for a path emission.
-    Cells(Vec<(u32, u32)>),
+    /// Cell origins — one for a glyph, one per cell for a path
+    /// emission — and the shelves the admission's cells live on, so
+    /// patched emissions can reference the bands (#119).
+    Cells(Vec<(u32, u32)>, Vec<u32>),
     /// A clip mask's cell origin.
     Mask([f32; 2]),
     /// A COLR cache insert; no instance patch.
@@ -1299,6 +1301,7 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             atlas,
             commit_writes: Vec::new(),
             pending_origins: Vec::new(),
+            commit_touches: Vec::new(),
             surfaces: FxHashMap::default(),
             fonts: FxHashMap::default(),
             images: FxHashMap::default(),
@@ -1515,6 +1518,7 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
         atlas,
         commit_writes: Vec::new(),
         pending_origins: Vec::new(),
+        commit_touches: Vec::new(),
         surfaces: FxHashMap::default(),
         fonts: FxHashMap::default(),
         images: FxHashMap::default(),
@@ -3194,7 +3198,6 @@ impl GpuRenderer {
         pending: &mut [SurfaceState],
         frames: &[&SurfaceFrame<'_>],
     ) -> Vec<Result<Lowered, RenderError>> {
-        let mut cleared = false;
         let mut grew = false;
         loop {
             let group_maps: Vec<FxHashMap<u64, BackdropGroupInfo>> = pending
@@ -3255,7 +3258,7 @@ impl GpuRenderer {
             // before any placement or upload happens, so a failed
             // placement never enqueues uploads into an atlas the same
             // preparation abandons.
-            match self.commit_rasters(pending, &mut results, cleared, grew) {
+            match self.commit_rasters(pending, &mut results, grew) {
                 Commit::Done => break results,
                 Commit::Grow(size) => {
                     self.atlas.grow_to(&self.device, size);
@@ -3266,15 +3269,9 @@ impl GpuRenderer {
                         "atlas grown"
                     );
                 }
-                Commit::Recycle => {
-                    self.atlas.clear();
-                    cleared = true;
-                    tracing::debug!(size = self.atlas.size(), "atlas cleared");
-                }
             }
-            // Growing or clearing emptied the atlas: every hit any
-            // lowering took is now a miss, so lower the whole batch
-            // again.
+            // Growing emptied the atlas: every hit any lowering took is
+            // now a miss, so lower the whole batch again.
             diag::event(
                 &self.device,
                 diag::EventKind::Phase {
@@ -3290,7 +3287,6 @@ impl GpuRenderer {
         pending: &mut [SurfaceState],
         frames: &[&SurfaceFrame<'_>],
     ) -> Vec<Result<Lowered, RenderError>> {
-        let mut cleared = false;
         let mut grew = false;
         loop {
             let group_maps: Vec<FxHashMap<u64, BackdropGroupInfo>> = pending
@@ -3318,7 +3314,7 @@ impl GpuRenderer {
             // before any placement or upload happens, so a failed
             // placement never enqueues uploads into an atlas the same
             // preparation abandons.
-            match self.commit_rasters(pending, &mut results, cleared, grew) {
+            match self.commit_rasters(pending, &mut results, grew) {
                 Commit::Done => break results,
                 Commit::Grow(size) => {
                     self.atlas.grow_to(&self.device, size);
@@ -3329,15 +3325,9 @@ impl GpuRenderer {
                         "atlas grown"
                     );
                 }
-                Commit::Recycle => {
-                    self.atlas.clear();
-                    cleared = true;
-                    tracing::debug!(size = self.atlas.size(), "atlas cleared");
-                }
             }
-            // Growing or clearing emptied the atlas: every hit any
-            // lowering took is now a miss, so lower the whole batch
-            // again.
+            // Growing emptied the atlas: every hit any lowering took is
+            // now a miss, so lower the whole batch again.
             diag::event(
                 &self.device,
                 diag::EventKind::Phase {
@@ -3347,6 +3337,9 @@ impl GpuRenderer {
         }
     }
 
+    // `#[inline(never)]` keeps a symbol for the Callgrind gate's root lookup
+    // (`bench/scripts/ir_gate.py`).
+    #[inline(never)]
     fn lower_content(
         surf: &mut SurfaceState,
         frame: &SurfaceFrame<'_>,
@@ -3364,6 +3357,7 @@ impl GpuRenderer {
         let result = {
             let glyphs = GlyphContext {
                 atlas,
+                live_stamp: atlas.live_stamp(),
                 fonts,
                 images,
                 bitmaps,
@@ -3377,6 +3371,7 @@ impl GpuRenderer {
             lowered.glyphs = lowering.glyphs_rasterized();
             lowered.paths = lowering.paths_rasterized();
             lowered.cell_patches = std::mem::take(&mut lowering.cell_patches);
+            lowered.emission_patches = std::mem::take(&mut lowering.emission_patches);
             lowered.mask_patches = std::mem::take(&mut lowering.mask_patches);
             lowered.pending = std::mem::take(&mut lowering.pending);
             result
@@ -3425,16 +3420,23 @@ impl GpuRenderer {
     }
 
     /// Commits every surface's pending rasters transactionally
-    /// (#169 A3). First [`Atlas::plan`] dry-runs all placements
-    /// against shelf metadata alone; only a `Fits` verdict — or the
-    /// last attempt after recycling — commits for real. The upload
-    /// then batches the committed cells into one `write_texture` per
-    /// newly allocated shelf region.
+    /// (#169 A3). The shelves this lowering's hits live on are marked
+    /// first so no placement can evict them; [`Atlas::plan`] then
+    /// dry-runs all placements against shelf metadata alone; only a
+    /// `Fits` verdict — or the last attempt after a grow — commits for
+    /// real. When even an emptied atlas cannot hold the batch the
+    /// commit runs evicting instead of clearing: cold shelves are
+    /// reclaimed in place, so surviving entries — and the retained
+    /// emissions referencing them — stay valid (#119). The upload
+    /// batches the committed cells into one `write_texture` per newly
+    /// allocated shelf region.
+    // `never` so Callgrind can attribute the commit path's inclusive
+    // cost — the one-per-frame call boundary is free evidence (#119).
+    #[inline(never)]
     fn commit_rasters(
         &mut self,
         pending: &mut [SurfaceState],
         results: &mut [Result<Lowered, RenderError>],
-        cleared: bool,
         grew: bool,
     ) -> Commit {
         let rasters: Vec<&glyph::PendingRaster> = results
@@ -3442,41 +3444,185 @@ impl GpuRenderer {
             .filter_map(|r| r.as_ref().ok())
             .flat_map(|l| l.pending.iter())
             .collect();
-        match self.atlas.plan(&rasters) {
-            glyph::AtlasPlan::Fits => {}
-            glyph::AtlasPlan::Grow(size) if !grew => return Commit::Grow(size),
-            glyph::AtlasPlan::Grow(_) | glyph::AtlasPlan::Recycle => {
-                if !cleared {
-                    return Commit::Recycle;
+        let n_cells: usize = rasters.iter().map(|r| r.cell_count()).sum();
+        // A frame whose batch places strictly needs no replay pins and
+        // no eviction, so no emission scan and no touch decoding runs —
+        // the commit's work scales with what changed, not what stays
+        // retained (#119).
+        let mut touches_len = 0usize;
+        let plan_dbg = if self.atlas.fits_strict(&rasters) {
+            self.atlas.begin_commit(&[]);
+            "fits"
+        } else {
+            let mut touches = std::mem::take(&mut self.commit_touches);
+            touches.clear();
+            touches_len = self.replay_pins(pending, &mut touches);
+            self.atlas.begin_commit(&touches);
+            touches.clear();
+            self.commit_touches = touches;
+            match self.atlas.plan(&rasters) {
+                glyph::AtlasPlan::Fits | glyph::AtlasPlan::FitsEviction => "fits-eviction",
+                glyph::AtlasPlan::Grow(size) if !grew => {
+                    // The grow discards the atlas and re-lowers, so
+                    // every retained emission is dead anyway — but the
+                    // pending cells recorded this round index a raster
+                    // list that never applied, and must not survive
+                    // into the retry's hits (#119).
+                    for surf in pending.iter_mut() {
+                        Self::discard_surface(surf);
+                    }
+                    return Commit::Grow(size);
                 }
-                // Final attempt on the emptied atlas: commit the
-                // fitting prefix and exhaust the first surface whose
-                // raster does not place.
+                glyph::AtlasPlan::Grow(_) | glyph::AtlasPlan::Recycle => {
+                    // Bounded in-place eviction makes room instead of a
+                    // wholesale clear: the commit below reclaims shelves
+                    // nothing touched until the batch places or nothing
+                    // untouchable remains, then exhausts the first surface
+                    // whose raster still does not fit (#119).
+                    "exhaust-candidate"
+                }
             }
+        };
+        if plan_dbg != "fits" {
+            self.atlas.enable_evicting();
         }
-        let bounds = self.atlas.shelf_bounds();
         let mut writes = std::mem::take(&mut self.commit_writes);
         writes.clear();
-        for (surf, result) in pending.iter_mut().zip(results.iter_mut()) {
-            let Ok(lowered) = result else {
-                continue;
-            };
-            match self.apply_pending(surf, lowered, &mut writes) {
-                Ok(()) => {}
-                Err(RenderError::AtlasFull) => {
-                    *result = Err(RenderError::AtlasExhausted);
-                    break;
+        let mut failed = None;
+        for (i, (surf, result)) in pending.iter_mut().zip(results.iter_mut()).enumerate() {
+            match result {
+                // A failed lowering leaves whatever retained mutations
+                // its leaves already made — pending cells indexing a
+                // raster list that never applies. Those emissions must
+                // not survive to hit next frame (#119).
+                Err(_) => Self::discard_surface(surf),
+                Ok(lowered) => match self.apply_pending(surf, lowered, &mut writes) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        *result = Err(match e {
+                            RenderError::AtlasFull => RenderError::AtlasExhausted,
+                            other => other,
+                        });
+                        failed = Some(i);
+                        break;
+                    }
+                },
+            }
+        }
+        // An apply that stopped midway leaves the pending cells of
+        // every unapplied surface pointing at rasters that never
+        // landed — drop their retained emissions wholesale so the
+        // next frame re-lowers rather than composes unplaced cells
+        // (#119).
+        if let Some(i) = failed {
+            Self::discard_unapplied(&mut pending[i..], &mut results[i..]);
+        }
+        let evicted = self.atlas.take_evicted();
+        tracing::debug!(
+            evictions = evicted.len(),
+            evicted_bytes = evicted.iter().map(|e| e.0).sum::<u64>(),
+            plan = ?plan_dbg,
+            pending_cells = n_cells,
+            touches = touches_len,
+            occupancy = ?self.atlas.occupancy(),
+            "atlas commit"
+        );
+        for (bytes, used_in_latest_submit) in evicted {
+            diag::retire(
+                &self.device,
+                diag::RetireArgs {
+                    label: "glyph atlas",
+                    class: diag::Class::Atlas,
+                    bytes,
+                    used_in_latest_submit,
+                    reason: "atlas evict",
+                },
+            );
+        }
+        self.atlas
+            .upload_committed(&self.device, &self.queue, &writes);
+        self.commit_writes = writes;
+        Commit::Done
+    }
+
+    /// The shelf slots the commit must pin: the shelves each new
+    /// emission's glyph instances sample plus the clip masks bound
+    /// through `uv[2..3]` — all recovered from stored UVs, so the
+    /// lowering records no slot list (#119).
+    fn replay_pins(&self, pending: &mut [SurfaceState], touches: &mut Vec<u32>) -> usize {
+        for surf in pending.iter_mut() {
+            for content in surf.layers.values_mut() {
+                let (_, emissions) = content.retained.prepared();
+                for emission in emissions.iter().filter_map(|e| e.data.as_ref()) {
+                    Self::for_each_glyph_shelf(
+                        &self.atlas,
+                        &content.storage.instances[emission.instances.clone()],
+                        |slot| touches.push(slot),
+                    );
                 }
-                Err(e) => {
-                    *result = Err(e);
-                    break;
+            }
+            // Clip masks bound through `uv[2..3]` pin the same way: the
+            // frame's masked instances recover their shelf from the
+            // stored atlas coordinates (#119).
+            for inst in &surf.frame.instances {
+                let flags = inst.meta[3] >> 24;
+                if flags & instance::FLAG_HAS_MASK != 0
+                    && flags & instance::FLAG_MASK_TEXTURE == 0
+                    && let Some(slot) = self.atlas.shelf_at(inst.uv[2], inst.uv[3])
+                {
+                    touches.push(slot);
                 }
             }
         }
-        self.atlas
-            .upload_committed(&self.device, &self.queue, &bounds, &writes);
-        self.commit_writes = writes;
-        Commit::Done
+        // Pins stay frame-scoped: only the shelves this frame's
+        // emissions and masks sample are marked. Bands a retained
+        // emission sampled in an earlier frame are deliberately left
+        // unpinned: evicting them is what keeps the atlas bounded, and
+        // the emission's stale check re-lowers it if it displays again
+        // (#119).
+        touches.len()
+    }
+
+    /// The shelves `instances`' glyph quads sample, recovered from their
+    /// stored UVs — the leaf records no per-cell slot at emit time, so
+    /// the commit derives them here instead (#119).
+    fn for_each_glyph_shelf(
+        atlas: &Atlas,
+        instances: &[lower::RetainedInstance],
+        mut f: impl FnMut(u32),
+    ) {
+        let mut hint = None;
+        for inst in instances {
+            if inst.kind == instance::KIND_GLYPH
+                && let Some(slot) = atlas.shelf_at_hint(inst.uv[0], inst.uv[1], &mut hint)
+            {
+                f(slot);
+            }
+        }
+    }
+
+    /// Drops one surface's retained emissions: unapplied pending cells
+    /// index a raster list that never landed, so nothing they recorded
+    /// may hit next frame (#119).
+    fn discard_surface(surf: &mut SurfaceState) {
+        for content in surf.layers.values_mut() {
+            content.invalidate();
+        }
+    }
+
+    /// [`Self::discard_surface`] for every surface at `from` onward and
+    /// marks the still-`Ok` results [`RenderError::AtlasExhausted`]
+    /// (#119).
+    fn discard_unapplied(
+        pending: &mut [SurfaceState],
+        results: &mut [Result<Lowered, RenderError>],
+    ) {
+        for (surf, result) in pending.iter_mut().zip(results.iter_mut()) {
+            Self::discard_surface(surf);
+            if result.is_ok() {
+                *result = Err(RenderError::AtlasExhausted);
+            }
+        }
     }
 
     #[expect(
@@ -3496,24 +3642,74 @@ impl GpuRenderer {
             origins.push(self.apply_raster(raster, writes)?);
         }
         let cell_origin = |p: u32, c: u32| {
-            let PendingOrigin::Cells(cells) = &origins[p as usize] else {
+            let PendingOrigin::Cells(cells, _) = &origins[p as usize] else {
                 unreachable!("cell patch must reference cell raster");
             };
             let (x, y) = cells[c as usize];
             [x as f32, y as f32]
         };
-        for (inst, p, c) in lowered.cell_patches.drain(..) {
-            let [x, y] = cell_origin(p, c);
-            surf.frame.instances[inst as usize].uv[..2].copy_from_slice(&[x, y]);
-        }
         for content in surf.layers.values_mut() {
             let (_, emissions) = content.retained.prepared();
             for emission in emissions.iter_mut().filter_map(|e| e.data.as_mut()) {
-                for (inst, p, c) in emission.pending_cells.drain(..) {
-                    content.storage.instances[emission.instances.start + inst as usize].uv[..2]
-                        .copy_from_slice(&cell_origin(p, c));
+                // The emission's atlas references are the shelves it
+                // touched while lowering plus the bands its deferred
+                // rasters resolved to — recorded as `(slot, band epoch)`
+                // pairs contiguous at the storage tail. Duplicates are
+                // harmless (epoch checks are idempotent and pin marks
+                // dedupe themselves), so the fold writes directly — no
+                // per-emission set allocation (#119).
+                // Deferred `refs` resolve here: the frame's touched
+                // slots and each placed cell's bands join as one
+                // contiguous `(slot, epoch)` extent at the storage
+                // tail (#119).
+                if emission.refs & lower::DEFERRED_REFS != 0 || !emission.pending_cells_empty() {
+                    let first = content.storage.refs.len();
+                    for i in emission.pending_cells() {
+                        let (inst, p, c) = lowered.emission_patches[i];
+                        let local = inst - emission.cell_inst_base();
+                        content.storage.instances[emission.instances.start + local as usize].uv
+                            [..2]
+                            .copy_from_slice(&cell_origin(p, c));
+                        if let PendingOrigin::Cells(_, bands) = &origins[p as usize] {
+                            content.storage.refs.extend(
+                                bands
+                                    .iter()
+                                    .map(|&slot| (slot, self.atlas.shelf_epoch(slot))),
+                            );
+                        }
+                    }
+                    // Glyph cells record no slot at emit time: the shelf
+                    // each stored UV samples is recovered here instead
+                    // (#119).
+                    Self::for_each_glyph_shelf(
+                        &self.atlas,
+                        &content.storage.instances[emission.instances.clone()],
+                        |slot| {
+                            content
+                                .storage
+                                .refs
+                                .push((slot, self.atlas.shelf_epoch(slot)));
+                        },
+                    );
+                    emission.clear_pending_cells();
+                    emission.refs =
+                        lower::Emission::pack_refs(first, content.storage.refs.len() - first);
+                }
+                // Restamp only when every reference survived this
+                // commit's evictions; a stale emission must keep an
+                // older stamp so its next hit check walks the refs
+                // and re-lowers (#119).
+                let live = content.storage.refs[emission.refs_range()]
+                    .iter()
+                    .all(|&(s, ep)| self.atlas.shelf_epoch(s) == ep);
+                if live {
+                    emission.live_stamp = self.atlas.live_stamp();
                 }
             }
+        }
+        for (inst, p, c) in lowered.cell_patches.drain(..) {
+            let [x, y] = cell_origin(p, c);
+            surf.frame.instances[inst as usize].uv[..2].copy_from_slice(&[x, y]);
         }
         for (inst, p) in lowered.mask_patches.drain(..) {
             let PendingOrigin::Mask(origin) = &origins[p as usize] else {
@@ -3543,7 +3739,12 @@ impl GpuRenderer {
                 let out = self
                     .atlas
                     .place_glyph(key, left, top, w, h, texels, writes)
-                    .map(|(x, y)| PendingOrigin::Cells(vec![(x, y)]))
+                    .map(|(x, y)| {
+                        PendingOrigin::Cells(
+                            vec![(x, y)],
+                            vec![self.atlas.get(&key).expect("just stored").slot],
+                        )
+                    })
                     .ok_or(RenderError::AtlasFull)?;
                 if !hit && w == 0 {
                     diag::atlas_cell(&self.device, (0, 0, 0, 0));
@@ -3556,6 +3757,9 @@ impl GpuRenderer {
                     .ok_or(RenderError::AtlasFull)?;
                 Ok(PendingOrigin::Cells(
                     self.atlas.path_origins(key).expect("just stored"),
+                    self.atlas
+                        .emit_slot_arena(self.atlas.path(key).expect("just stored").slots.clone())
+                        .to_vec(),
                 ))
             }
             PendingRaster::Mask {

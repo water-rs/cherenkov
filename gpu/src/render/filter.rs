@@ -184,8 +184,18 @@ struct Entry {
     setup: Option<Result<(), String>>,
     #[cfg(target_arch = "wasm32")]
     setup_pending_frame: bool,
-    input: Option<(wgpu::Texture, wgpu::TextureView)>,
-    output: Option<(wgpu::Texture, wgpu::TextureView)>,
+    /// Input/output targets per size, capped; a frame can apply one filter
+    /// to several region sizes (#117 sparse backdrop captures).
+    io: Vec<((u32, u32), FilterTargets)>,
+}
+
+/// The input and output targets of one size.
+struct FilterTargets {
+    input: (wgpu::Texture, wgpu::TextureView),
+    output: (wgpu::Texture, wgpu::TextureView),
+    /// The frame sequence that last applied through these targets; a size
+    /// unused for a whole frame is dropped rather than retained.
+    last_used: u64,
 }
 
 impl Entry {
@@ -223,6 +233,87 @@ impl Entry {
             .as_ref()
             .copied()
             .map_err(|error| RenderError::Render(format!("filter {id:?} setup: {error}")))
+    }
+
+    /// The index of `size`'s input/output targets, allocating on first use.
+    fn targets_index(
+        &mut self,
+        device: &wgpu::Device,
+        size: (u32, u32),
+        format: wgpu::TextureFormat,
+        sequence: u64,
+    ) -> usize {
+        // A used size is live this frame: mark it before stale sizes are
+        // dropped so steady state reuses its targets.
+        if let Some(index) = self.io.iter().position(|(io_size, _)| *io_size == size) {
+            self.io[index].1.last_used = sequence;
+        }
+        // Stale sizes go first so the lookup below cannot pick them up
+        // and the cap stays a bound on live sizes only. A size stays live
+        // through the frame after its last use: a frame encoding several
+        // region sizes would otherwise drop the earlier ones and
+        // reallocate them on the next frame.
+        self.io
+            .retain(|(_, targets)| targets.last_used.saturating_add(1) >= sequence);
+        self.io
+            .iter()
+            .position(|(io_size, _)| *io_size == size)
+            .unwrap_or_else(|| {
+                const MAX_FILTER_TARGET_SIZES: usize = 4;
+                if self.io.len() == MAX_FILTER_TARGET_SIZES {
+                    let evicted = self.io.remove(0).1;
+                    for (label, (texture, _)) in [
+                        ("filter input", evicted.input),
+                        ("filter output", evicted.output),
+                    ] {
+                        crate::diag::retire(
+                            device,
+                            crate::diag::RetireArgs {
+                                label,
+                                class: crate::diag::Class::Target,
+                                bytes: u64::from(texture.width())
+                                    * u64::from(texture.height())
+                                    * super::texel_bytes(texture.format()),
+                                used_in_latest_submit: true,
+                                reason: "filter size eviction",
+                            },
+                        );
+                    }
+                }
+                self.io.push((
+                    size,
+                    FilterTargets {
+                        input: super::create_target(
+                            device,
+                            "filter input",
+                            size,
+                            super::TARGET_USAGES,
+                            format,
+                        ),
+                        output: super::create_target(
+                            device,
+                            "filter output",
+                            size,
+                            super::TARGET_USAGES,
+                            format,
+                        ),
+                        last_used: sequence,
+                    },
+                ));
+                let created = u64::from(size.0) * u64::from(size.1) * super::texel_bytes(format);
+                for label in ["filter input", "filter output"] {
+                    crate::diag::grow(
+                        device,
+                        label,
+                        crate::diag::Class::Target,
+                        0,
+                        created,
+                        0,
+                        true,
+                    );
+                }
+                self.io.len() - 1
+            })
     }
 }
 
@@ -264,8 +355,7 @@ impl Registry {
                 setup: None,
                 #[cfg(target_arch = "wasm32")]
                 setup_pending_frame: false,
-                input: None,
-                output: None,
+                io: Vec::new(),
             },
         );
     }
@@ -277,10 +367,11 @@ impl Registry {
             return 0;
         };
         entry.active.store(false, Ordering::Release);
-        [entry.input, entry.output]
-            .into_iter()
-            .flatten()
-            .map(|(texture, _)| {
+        entry
+            .io
+            .iter()
+            .flat_map(|(_, targets)| [&targets.input.0, &targets.output.0])
+            .map(|texture| {
                 u64::from(texture.width())
                     * u64::from(texture.height())
                     * super::texel_bytes(texture.format())
@@ -306,8 +397,8 @@ impl Registry {
     pub(super) fn trim(&mut self) -> u64 {
         let mut bytes = 0;
         for entry in self.entries.values_mut() {
-            for slot in [&mut entry.input, &mut entry.output] {
-                if let Some((texture, _)) = slot.take() {
+            for (_, targets) in std::mem::take(&mut entry.io) {
+                for texture in [targets.input.0, targets.output.0] {
                     bytes += u64::from(texture.width())
                         * u64::from(texture.height())
                         * super::texel_bytes(texture.format());
@@ -320,9 +411,9 @@ impl Registry {
     pub fn gpu_bytes(&self) -> u64 {
         self.entries
             .values()
-            .flat_map(|entry| [entry.input.as_ref(), entry.output.as_ref()])
-            .flatten()
-            .map(|(texture, _)| {
+            .flat_map(|entry| entry.io.iter())
+            .flat_map(|(_, targets)| [&targets.input.0, &targets.output.0])
+            .map(|texture| {
                 u64::from(texture.width())
                     * u64::from(texture.height())
                     * if texture.format() == wgpu::TextureFormat::Rgba16Float {
@@ -342,10 +433,6 @@ impl Registry {
             .and_then(|entry| entry.effect.footprint_bound())
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one entry's wait, capacity check, target allocation and dispatch in sequence"
-    )]
     pub(super) fn apply(
         &mut self,
         id: FilterKey,
@@ -388,54 +475,10 @@ impl Registry {
         }
         let format = scratch.texture.format();
         entry.check_setup(id, context, format)?;
-        // `EffectInput::{width,height}` names the input texture's exact
-        // size, so unlike scratch a filter target resizes with its frame
-        // region — `trim` releases them outside the hot path (#169 A4).
-        if entry
-            .input
-            .as_ref()
-            .is_none_or(|(texture, _)| (texture.width(), texture.height()) != size)
-        {
-            let old = entry.input.as_ref().map_or(0, |(texture, _)| {
-                u64::from(texture.width())
-                    * u64::from(texture.height())
-                    * super::texel_bytes(texture.format())
-            });
-            entry.input = Some(super::create_target(
-                device,
-                "filter input",
-                size,
-                super::TARGET_USAGES,
-                format,
-            ));
-            entry.output = Some(super::create_target(
-                device,
-                "filter output",
-                size,
-                super::TARGET_USAGES,
-                format,
-            ));
-            crate::diag::grow(
-                device,
-                "filter input",
-                crate::diag::Class::Target,
-                old,
-                u64::from(size.0) * u64::from(size.1) * super::texel_bytes(format),
-                0,
-                true,
-            );
-            crate::diag::grow(
-                device,
-                "filter output",
-                crate::diag::Class::Target,
-                old,
-                u64::from(size.0) * u64::from(size.1) * super::texel_bytes(format),
-                0,
-                true,
-            );
-        }
-        let (input_texture, input_view) = entry.input.as_ref().expect("input allocated");
-        let (output_texture, output_view) = entry.output.as_ref().expect("output allocated");
+        let targets_index = entry.targets_index(device, size, format, timing.sequence());
+        let targets = &entry.io[targets_index].1;
+        let (input_texture, input_view) = &targets.input;
+        let (output_texture, output_view) = &targets.output;
         let extent = wgpu::Extent3d {
             width: size.0,
             height: size.1,
@@ -520,5 +563,77 @@ impl Registry {
             .as_ref()
             .copied()
             .map_err(|error| RenderError::Render(format!("filter {id:?} setup: {error}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use filtrate::filters::GaussianBlur;
+
+    /// An adapter plus device, or `None` where no GPU exists.
+    fn device_and_queue() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::all(),
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let adapter = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()))
+            .into_iter()
+            .next()?;
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()
+    }
+
+    fn entry() -> Entry {
+        Entry {
+            effect: Box::new(filtrate::Executor::new(GaussianBlur(2.0_f32))),
+            dirty: Arc::new(AtomicBool::new(false)),
+            active: Arc::new(AtomicBool::new(false)),
+            again: false,
+            sequence: None,
+            setup: None,
+            io: Vec::new(),
+        }
+    }
+
+    /// A size the previous frame used stays live; a size unused for a
+    /// whole frame is dropped. Steady state with two alternating sizes
+    /// keeps both sets of targets instead of reallocating one per frame.
+    #[test]
+    fn targets_index_keeps_the_previous_frame_sizes() {
+        let Some((device, _queue)) = device_and_queue() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let format = wgpu::TextureFormat::Rgba16Float;
+        let size_a = (64, 64);
+        let size_b = (64, 32);
+        let mut entry = entry();
+        entry.targets_index(&device, size_a, format, 1);
+        entry.targets_index(&device, size_b, format, 1);
+        entry.targets_index(&device, size_a, format, 2);
+        assert!(
+            entry.io.iter().any(|(size, _)| *size == size_b),
+            "a size the previous frame used is still live"
+        );
+        let index = entry.targets_index(&device, size_b, format, 2);
+        let input_b = entry.io[index].1.input.0.clone();
+        assert!(
+            input_b
+                == entry
+                    .io
+                    .iter()
+                    .find(|(size, _)| *size == size_b)
+                    .expect("size B targets")
+                    .1
+                    .input
+                    .0,
+            "size B's targets are reused, not reallocated"
+        );
+        entry.targets_index(&device, size_a, format, 3);
+        entry.targets_index(&device, size_a, format, 4);
+        assert!(
+            !entry.io.iter().any(|(size, _)| *size == size_b),
+            "a size unused for a whole frame is dropped"
+        );
     }
 }

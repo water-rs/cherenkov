@@ -1,5 +1,7 @@
 //! Shared command-span bookkeeping for retained backend lowering.
 
+use std::cmp::{Ordering, Reverse};
+use std::collections::BinaryHeap;
 use std::ops::Range;
 
 use kurbo::Affine;
@@ -553,6 +555,32 @@ impl Seg {
     }
 }
 
+/// A band split point pending consumption, ordered by `f64::total_cmp`.
+/// Only finite values are ever pushed: a crossing is inserted strictly
+/// inside its band.
+#[derive(Clone, Copy, Debug)]
+struct Split(f64);
+
+impl PartialEq for Split {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for Split {}
+
+impl PartialOrd for Split {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Split {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
 /// Winding resolution before signed-area accumulation.
 ///
 /// The area accumulator reads each pixel's net winding: overlapping
@@ -638,9 +666,29 @@ pub fn resolve_winding(
     // buffers swap so no band allocates.
     let mut prev_open: Vec<(usize, bool, f64, f64)> = Vec::with_capacity(segs.len());
     let mut open: Vec<(usize, bool, f64, f64)> = Vec::new();
+    // Band tops and bottoms: `cursor` walks the sorted endpoint list while
+    // `pending` holds split points found inside bands. Every split a band
+    // detects is strictly inside it, hence smaller than every boundary
+    // still to come, so the next band bottom is always the smaller of the
+    // two heads — the same sequence `ys.insert(band + 1, yc)` produced,
+    // without an O(n) shift and re-run per insertion (issue #210). A band
+    // bottom is consumed only once the band emits (or is skipped empty):
+    // a split re-runs the band with the new, smaller boundary and the
+    // deferred bottom becomes a later band's bottom, exactly as the
+    // insertion left it. `band` counts processed bands for the `runs`
+    // continuation check below; a band rerun after a split does not count.
+    let mut pending = BinaryHeap::<Reverse<Split>>::new();
+    let mut cursor = 1usize;
     let mut band = 0usize;
-    while band + 1 < ys.len() {
-        let (ya, yb) = (ys[band], ys[band + 1]);
+    let mut ya = ys[0];
+    loop {
+        let (yb, from_pending) = match pending.peek() {
+            Some(&Reverse(Split(yc))) if ys.get(cursor).is_none_or(|&base| yc < base) => (yc, true),
+            _ => match ys.get(cursor) {
+                Some(&base) => (base, false),
+                None => break,
+            },
+        };
         while next < segs.len() && segs[next].y0 <= ya + EPS {
             active.push(next);
             next += 1;
@@ -648,7 +696,13 @@ pub fn resolve_winding(
         active.retain(|&i| segs[i].y1 > ya + EPS);
         if active.is_empty() {
             prev_open.clear();
+            if from_pending {
+                pending.pop();
+            } else {
+                cursor += 1;
+            }
             band += 1;
+            ya = yb;
             continue;
         }
         // Order at the band's midpoint: segments that meet at a vertex
@@ -680,9 +734,16 @@ pub fn resolve_winding(
             }
         }
         if let Some(yc) = split {
-            ys.insert(band + 1, yc);
+            pending.push(Reverse(Split(yc)));
             overlap = true;
             continue;
+        }
+        // Consume the boundary the band ends at: it stays in `pending`
+        // while the band is split so the sweep revisits it in order.
+        if from_pending {
+            pending.pop();
+        } else {
+            cursor += 1;
         }
         let mut w = 0.0f64;
         let mut inside = false;
@@ -749,6 +810,7 @@ pub fn resolve_winding(
             overlap = true;
         }
         band += 1;
+        ya = yb;
     }
     if !overlap {
         return None;

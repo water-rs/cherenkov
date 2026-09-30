@@ -667,11 +667,13 @@ fn create_vulkan_device(
     let Some(hal_adapter) = (unsafe { adapter.as_hal::<wgpu::hal::vulkan::Api>() }) else {
         return Err(EngineError::Backend("adapter is not Vulkan".into()));
     };
-    let extensions = vulkan::extra_device_extensions();
+    let caps = hal_adapter.physical_device_capabilities();
+    let extensions: Vec<&'static core::ffi::CStr> = vulkan::extra_device_extensions()
+        .into_iter()
+        .filter(|ext| caps.supports_extension(ext))
+        .collect();
     // The YCbCr conversion feature is keyed to its extension's presence.
-    let ycbcr = hal_adapter
-        .physical_device_capabilities()
-        .supports_extension(ash::khr::sampler_ycbcr_conversion::NAME);
+    let ycbcr = caps.supports_extension(ash::khr::sampler_ycbcr_conversion::NAME);
     let ycbcr_features = ash::vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default()
         .sampler_ycbcr_conversion(true);
     let callback: Option<Box<wgpu::hal::vulkan::CreateDeviceCallback<'_>>> =
@@ -948,6 +950,21 @@ fn make_bind0(
 /// `view`'s `VkImageView` — the descriptor-set write operand for the
 /// native operation (#166).
 #[cfg(all(unix, not(target_vendor = "apple")))]
+/// Finishes `encoder` into a command buffer and replaces it with a fresh
+/// one: wgpu forbids mixing its encoding API with raw `as_hal_mut` access
+/// on a single encoder, so native work is spliced between finished wgpu
+/// buffers inside the one ordered submission.
+#[cfg(all(unix, not(target_vendor = "apple")))]
+fn split_encoder(encoder: &mut wgpu::CommandEncoder, device: &wgpu::Device) -> wgpu::CommandBuffer {
+    std::mem::replace(
+        encoder,
+        device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("frame"),
+        }),
+    )
+    .finish()
+}
+
 fn raw_vk_view(view: &wgpu::TextureView) -> ash::vk::ImageView {
     let hal = unsafe { view.as_hal::<wgpu::hal::vulkan::Api>() };
     unsafe { hal.expect("vulkan").raw_handle() }
@@ -4547,6 +4564,13 @@ impl GpuRenderer {
             self.bound_globals_size = self.globals.size();
         }
         let inst_base = surf.inst_base;
+        // wgpu forbids mixing its encoding API with raw `as_hal_mut`
+        // access on one encoder, so every native command buffer — the
+        // first-use acquire barriers, the external-frame composition op
+        // and the release barriers — is recorded on a dedicated raw
+        // encoder and spliced between finished wgpu buffers; queue order
+        // inside the single submission preserves the intended sequence.
+        let mut buffers: Vec<wgpu::CommandBuffer> = Vec::new();
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -4742,8 +4766,14 @@ impl GpuRenderer {
                 if !gens.is_empty()
                     && let Some(native) = self.native.as_mut()
                 {
+                    buffers.push(split_encoder(&mut encoder, &self.device));
+                    let mut acquire =
+                        self.device
+                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("acquire"),
+                            });
                     unsafe {
-                        encoder.as_hal_mut::<wgpu::hal::vulkan::Api, _, _>(|hal| {
+                        acquire.as_hal_mut::<wgpu::hal::vulkan::Api, _, _>(|hal| {
                             let hal = hal.expect("vulkan encoder");
                             let cb = hal.raw_handle();
                             for generation in &gens {
@@ -4757,6 +4787,7 @@ impl GpuRenderer {
                         })
                     }
                     .map_err(|e| RenderError::Render(e.to_string()))?;
+                    buffers.push(acquire.finish());
                 }
             }
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -4859,8 +4890,14 @@ impl GpuRenderer {
                             raw_vk_view(self.atlas.view()),
                         )
                         .map_err(|e| RenderError::Render(e.to_string()))?;
+                    buffers.push(split_encoder(&mut encoder, &self.device));
+                    let mut op =
+                        self.device
+                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("external"),
+                            });
                     unsafe {
-                        encoder.as_hal_mut::<wgpu::hal::vulkan::Api, _, _>(|hal| {
+                        op.as_hal_mut::<wgpu::hal::vulkan::Api, _, _>(|hal| {
                             let hal = hal.expect("vulkan encoder");
                             let cb = hal.raw_handle();
                             native.record(
@@ -4875,6 +4912,7 @@ impl GpuRenderer {
                         })
                     }
                     .map_err(|e| RenderError::Render(e.to_string()))?;
+                    buffers.push(op.finish());
                     // Reopen the wgpu pass loading what was written.
                     let reopen_writes =
                         self.query_set
@@ -5136,8 +5174,14 @@ impl GpuRenderer {
         if let Some(native) = self.native.as_mut() {
             let releases = external::vulkan::drain_releases(native);
             if !releases.is_empty() {
+                buffers.push(split_encoder(&mut encoder, &self.device));
+                let mut release_cb =
+                    self.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("release"),
+                        });
                 unsafe {
-                    encoder.as_hal_mut::<wgpu::hal::vulkan::Api, _, _>(|hal| {
+                    release_cb.as_hal_mut::<wgpu::hal::vulkan::Api, _, _>(|hal| {
                         let hal = hal.expect("vulkan encoder");
                         let cb = hal.raw_handle();
                         for release in &releases {
@@ -5145,6 +5189,7 @@ impl GpuRenderer {
                         }
                     });
                 }
+                buffers.push(release_cb.finish());
                 native.releases = releases;
             }
         }
@@ -5164,7 +5209,8 @@ impl GpuRenderer {
                     }
                 }
             }
-            let submission = self.queue.submit([encoder.finish()]);
+            buffers.push(encoder.finish());
+            let submission = self.queue.submit(buffers);
             #[cfg(all(unix, not(target_vendor = "apple")))]
             if let Some(native) = self.native.as_mut()
                 && !native.staged.is_empty()

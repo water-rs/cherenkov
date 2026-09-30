@@ -76,6 +76,9 @@ pub trait Renderer: 'static {
     fn create_surface(&mut self, id: SurfaceId, target: Self::Target) -> Result<SurfaceInfo, SurfaceError>;
     fn resize_surface(&mut self, id: SurfaceId, size: (u32, u32));
     fn destroy_surface(&mut self, id: SurfaceId);
+    /// A hidden surface is left out of every `Frame`; its sources (GPU content, filter
+    /// effects) stop waking the host and keep their requests for the frame after it is shown.
+    fn set_visibility(&mut self, id: SurfaceId, visibility: Visibility);
 
     /// Runs on the caller thread, before anything is queued: every check a font needs.
     fn prepare_font(font: FontData) -> Result<Self::Font, ResourceError>;
@@ -127,8 +130,8 @@ pub trait Renderer: 'static {
                    pub fn animating(&self) -> bool; }
   ```
 
-  The clip applies in the layer's own space (`transform`); content and children are drawn in `content_transform()`, so scrolling moves them inside the clip and never re-records anything. `changed` is true when a property op, a content op or an animation step touched the surface since the last render; the backend renders exactly those surfaces.
-- **One wake-up per frame.** `Surface::update`, layer drops and bound-signal changes only queue owned ops on the UI thread. `Engine::render(time)` drains every surface's queue into one `Message::Render { time, commits, reply }` and blocks on the reply, so the render thread wakes once per frame and applies the commits, samples the animations at `time`, renders, and answers with `Next` and the `FrameStats`. Surface creation, readback, `memory()` and `finish_timings()` are request/reply messages; everything else, resource registration and image replacement included, is fire-and-forget and ordered with the renders (see Resources).
+  The clip applies in the layer's own space (`transform`); content and children are drawn in `content_transform()`, so scrolling moves them inside the clip and never re-records anything. `Frame::surfaces` holds the visible surfaces only. `changed` is true when a property op, a content op or an animation step touched the surface since the last render, or the surface was shown since; the backend renders exactly those surfaces.
+- **One wake-up per frame.** `Surface::update`, layer drops and bound-signal changes only queue owned ops on the UI thread. `Engine::render(time)` drains every surface's queue into one `Message::Render { time, commits, reply }` and blocks on the reply, so the render thread wakes once per frame and applies the commits, samples the animations at `time`, renders, and answers with `Next` and the `FrameStats`. Surface creation, visibility changes, readback, `memory()` and `finish_timings()` are request/reply messages; everything else, resource registration and image replacement included, is fire-and-forget and ordered with the renders (see Resources).
 - **Capabilities carry their render-side hooks.** A capability trait is not a marker: it declares the function the render loop calls, so a backend without the capability has no code path to reach, and no default or stub exists.
 
   ```rust
@@ -176,7 +179,7 @@ let usage: MemoryUsage = engine.memory();
 - `Engine` is `!Send` and lives on the UI thread. It spawns and owns the render thread; dropping it sends `Shutdown` and joins the thread.
 - `engine.info()` is the backend's provenance (`B::Info`); `engine.stats()` the last frame's `FrameStats`.
 - **Frame timing.** The render loop numbers every render with a `FrameId` (`Frame::id`), and a backend that draws reports it in `FrameStats::frame`. Every GPU timing is a `FrameTiming` tagged with the frame it measures; the render thread retains them and returns them only from `engine.finish_timings()`, oldest first. They accumulate until that call, which waits for frames still on the GPU; use it at the end of a measured window, never on the frame path. Timestamps (off by default in `GpuConfig`) are for tooling that calls `finish_timings()` at the end of its window.
-- **Waking the host.** Changes made outside a frame (a `surface.update`, a layer drop, a bound signal firing) are queued, not sent. When the display link is paused after `Next::Idle`, the host must learn that a frame is needed: `engine.set_waker(|| link.request_now())` registers a UI-thread callback that the engine calls at most once between two `render`s, the first time something is queued. No callback means the host renders on its own schedule.
+- **Waking the host.** Changes made outside a frame (a `surface.update`, a layer drop, a bound signal firing) are queued, not sent. When the display link is paused after `Next::Idle`, the host must learn that a frame is needed: `engine.set_waker(|| link.request_now())` registers a UI-thread callback that the engine calls at most once between two `render`s, the first time something is queued on a visible surface. A change on a hidden surface calls nothing (see Hidden surfaces). No callback means the host renders on its own schedule.
 
 ## Resources
 
@@ -210,7 +213,7 @@ let shader: Shader = engine.shader(ShaderSource::wgsl(fragment))?;  // validated
   - A rejected resource's record lives until the release is carried out, so a surface that still draws it keeps failing with `RenderError::Rejected`; a rejected registration's removal is skipped because the backend never committed it.
   - The bookkeeping lives in the render loop shared by the native render thread and the browser executor, so both targets behave identically.
 - **`Image<F>`.** `F` is the storage format: `Rgba8`, `Rgba16F`, `Astc4x4`, `Etc2Rgba`, `Bc7`, and panel formats for `Banded`. Only uncompressed formats have `update(region, pixels)`. Compressed formats are uploaded as-is, and compression is an explicit step (`engine.compress::<Astc4x4>(image)`), never implicit.
-- **Replacing pixels.** `image.replace(data)` swaps an image's pixels behind the same `ImageId`, for content whose picture changes over time: animated images, decoder-backed frames, a reactive image view. Every recording that names the id keeps drawing it and shows the new pixels on the next frame, without re-recording. The replacement is a fire-and-forget `Message::ReplaceImage`, ordered with frames on the render thread, so no frame samples a partly written image, and it fires the engine's waker so a paused host renders the new pixels. It follows the registration model: `ResourceError::Lost` when the render thread is gone is its only error, and a rejection only the backend can detect leaves the previous pixels in place and fails the renders that draw the image with `RenderError::Rejected` until a later replacement succeeds. Replacing an image whose registration was rejected registers it anew. The render loop then asks the backend which surfaces' content samples the image (`Renderer::samples`, answered from the retained display lists with slot updates applied and nested pictures included) and marks only those changed, so every other surface keeps its skip. An animated image replaced at 30–60 Hz therefore redraws the surfaces that show it and nothing else.
+- **Replacing pixels.** `image.replace(data)` swaps an image's pixels behind the same `ImageId`, for content whose picture changes over time: animated images, decoder-backed frames, a reactive image view. Every recording that names the id keeps drawing it and shows the new pixels on the next frame, without re-recording. The replacement is a fire-and-forget `Message::ReplaceImage`, ordered with frames on the render thread, so no frame samples a partly written image, and it fires the engine's waker so a paused host renders the new pixels (unless every surface is hidden). It follows the registration model: `ResourceError::Lost` when the render thread is gone is its only error, and a rejection only the backend can detect leaves the previous pixels in place and fails the renders that draw the image with `RenderError::Rejected` until a later replacement succeeds. Replacing an image whose registration was rejected registers it anew. The render loop then asks the backend which surfaces' content samples the image (`Renderer::samples`, answered from the retained display lists with slot updates applied and nested pictures included) and marks only those changed, so every other surface keeps its skip. An animated image replaced at 30–60 Hz therefore redraws the surfaces that show it and nothing else.
   - The same dimensions reuse the backing storage: `queue.write_texture` into the existing texture on the GPU backend, which leaves every bind group valid; an in-place decode on the CPU backend, once the retained paint operands that shared the pixels are discarded.
   - Different dimensions reallocate the storage behind the same id. The GPU backend retires the bind groups that bound the old texture view. Both backends lower again the retained content that samples the image, because lowering resolves the image's dimensions into its paints.
   - Dropping the last handle after a replacement releases the image as before.
@@ -231,6 +234,24 @@ let panel = engine.surface(Bands::new(size, OffscreenFormat::LinearF16, |band| d
 - **System-compositor parents.** Targets that expose one (`CALayer`, `SurfaceControl`, a DirectComposition visual, a Wayland subsurface) let the engine build **planes**. Most layers are composited inside the engine onto one plane. Eligible layers are promoted automatically to their own system layers: video frames, custom GPU content and large stable layers. A layer is not promoted when it is under a backdrop, uses a non-default blend or has a clip the system cannot express. Hardware overlay budgets also limit promotion.
 - **Many small surfaces are first-class.** A native backend embeds one surface per self-drawn component, and a list may hold dozens. All surfaces share the engine's pipelines, atlases and caches. Creating and dropping one is cheap. All dirty surfaces render in one submission per frame.
 - **Display properties.** Headroom and scale belong to the display, so the host sets them when they change: `surface.display(Display { headroom, scale })`. Presentation reads `headroom` every frame — a headroom change takes effect on the next frame and never re-lowers or re-records content.
+
+### Hidden surfaces
+
+A surface the user cannot see costs no rendering work (#203, #204). The host reports visibility from the platform's public signal (`NSWindow.occlusionState`, the `UIScene` activation state, Activity `onStart`/`onStop` and the `SurfaceHolder` callbacks, `WM_SIZE`/`SIZE_MINIMIZED` and DWM cloaking, withheld Wayland frame callbacks, `_NET_WM_STATE_HIDDEN`, `document.visibilityState`, winit's `WindowEvent::Occluded`):
+
+```rust
+surface.visibility(Visibility::Hidden)?;   // minimized, occluded, backgrounded, detached
+surface.visibility(Visibility::Visible)?;  // wakes the host once; the next frame draws it
+```
+
+- **One setter, like `display`.** `Surface::visibility(Visibility)` fails only with `SurfaceError::Lost`. `Visibility` is `Visible` (a new surface's state) or `Hidden`. Setting the current visibility again does nothing. It returns once the render loop and the backend have applied the change (a request/reply, blocking on native and awaited on wasm32 like `surface`), so no GPU content producer running on another thread can wake the host after `visibility(Hidden)` has returned.
+- **While hidden, nothing on the surface asks for a frame.** Its animation tracks and live operands are not sampled, and add nothing to `Next`. Its transactions, layer drops, bound signals, live operand writes and GPU-content or external-frame installs do not call the waker. The backend leaves it out of `Redraw` and stops its GPU content producers (`RedrawHandle::request_redraw`) and filter effects from waking the host; their requests stay pending.
+- **State keeps flowing.** Changes on a hidden surface are accepted and queued as usual. A render of another surface drains and applies them on the render thread, and a resource release they make pending is carried out as for any surface. The first frame after it is shown draws the current state.
+- **Rejections wait for the frame that draws.** A hidden surface whose content draws a resource the backend rejected fails no other surface's render; the first frame after it is shown fails with `RenderError::Rejected`, as any frame drawing the resource does.
+- **No frame draws a hidden surface.** `Frame::surfaces` leaves it out, so nothing is encoded, submitted or presented for it and its GPU content is not pulled. When every live surface is hidden, `engine.render` fails with `RenderError::Hidden` and applies nothing: a host renders nothing while hidden, and a render it had already scheduled is refused rather than silently doing nothing.
+- **Showing requests exactly one frame.** `Visibility::Visible` wakes the host once (when every surface was hidden, the waker is re-armed so this wake always reaches the host), and the next frame draws the surface whether or not it changed. Animations sample that frame's time: a track in flight jumps to where it is now, with no catch-up of the missed frames. A track committed while hidden starts on that frame, as every track starts on the first frame that samples it.
+- **Idle means blocked (macOS App Nap).** With every surface hidden the host sends nothing, so the native render thread waits in its untimed channel `recv` and the browser executor has no queued work; neither arms a timer, polls or waits with a timeout. Nothing in the engine takes an `NSProcessInfo` activity or a power assertion.
+- **Shared by both targets.** The visibility bookkeeping lives in the render loop shared by the native render thread and the browser executor.
 
 ## Frame driving
 
@@ -603,8 +624,8 @@ Browser lowering currently runs on that same thread; no GPU-bearing payload is
 sent to workers. Any future worker protocol must consist only of owned `Send`
 CPU data, never resource tables or JavaScript handles.
 
-On wasm32 `Engine::new`, `surface`, `render`, `memory`, `finish_timings`, and
-`Surface::readback` are asynchronous: they wait on the device. Hosts await these
+On wasm32 `Engine::new`, `surface`, `render`, `memory`, `finish_timings`,
+`Surface::readback` and `Surface::visibility` are asynchronous: they wait on the device. Hosts await these
 methods from their event loop. Resource registration (`font`, `image`,
 `shader`, `backdrop_shader`, `Image::replace`), recording, edits, resource drops
 and signal notifications are synchronous with the native signatures and enqueue

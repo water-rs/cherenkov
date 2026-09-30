@@ -86,6 +86,13 @@ pub trait Renderer: 'static {
     /// Destroys a surface's render-side state.
     fn destroy_surface(&mut self, id: SurfaceId);
 
+    /// Hides or shows a surface. A hidden surface is left out of every
+    /// [`Frame`], and nothing on it may ask for a frame or wake the host:
+    /// the backend stops its sources (custom GPU content, filter effects)
+    /// from waking the host and leaves it out of [`Redraw`], and keeps
+    /// their pending requests for the first frame after it is shown.
+    fn set_visibility(&mut self, id: SurfaceId, visibility: Visibility);
+
     /// Validates font data on the caller thread, before anything is
     /// queued, and prepares it for [`Renderer::add_font`]. Every check a
     /// font needs runs here, so registration cannot fail later.
@@ -243,14 +250,15 @@ pub enum Redraw {
     },
 }
 
-/// One frame's render input: every live surface with its sampled tree.
+/// One frame's render input: every visible surface with its sampled tree.
 pub struct Frame<'a> {
     /// The render's id; a backend that draws any surface reports it in
     /// [`FrameStats::frame`] and tags the frame's [`FrameTiming`] with it.
     pub id: FrameId,
     /// The frame's presentation time.
     pub time: FrameTime,
-    /// The surfaces to consider; render those with `changed` set.
+    /// The visible surfaces; render those with `changed` set. A hidden
+    /// surface is left out.
     pub surfaces: &'a [SurfaceFrame<'a>],
 }
 
@@ -265,10 +273,23 @@ pub struct SurfaceFrame<'a> {
     /// The clear colour.
     pub clear: WorkingColor,
     /// Whether a property op, a content op or an animation step touched the
-    /// surface since the last render.
+    /// surface since the last render, or the surface was shown since.
     pub changed: bool,
     /// The sampled layer tree.
     pub tree: &'a SurfaceTree,
+}
+
+/// Whether a surface is on screen, set by the host with
+/// [`Surface::visibility`](crate::Surface::visibility).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Visibility {
+    /// The surface is drawn: the state of a new surface.
+    Visible,
+    /// The window or view is minimized, fully occluded, in the background
+    /// or detached from its window, or the document is hidden. Nothing on
+    /// the surface asks for a frame; its state changes are applied and
+    /// drawn by the first frame after it is shown.
+    Hidden,
 }
 
 /// The properties of the display a surface presents on. Headroom and scale

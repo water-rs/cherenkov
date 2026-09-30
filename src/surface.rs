@@ -20,9 +20,9 @@ use nami_core::watcher::Context;
 use rustc_hash::FxHashMap;
 
 use crate::animation::Animation;
-use crate::backend::{Backend, Display, SurfaceInfo};
+use crate::backend::{Backend, Display, SurfaceInfo, Visibility};
 use crate::capability::{Backdrop, BackdropChain, BackdropRuns, ExternalFrames, GpuContent};
-use crate::engine::Waker;
+use crate::engine::{SurfaceWaker, Waker};
 use crate::error::{RenderError, SurfaceError};
 use crate::frame::Readback;
 use crate::message::{
@@ -78,8 +78,10 @@ pub struct Shared<B: Backend> {
     /// property replaces its previous subscription; dropping a layer drops
     /// them all.
     bindings: FxHashMap<(u64, PropKind), Box<dyn Any>>,
-    /// The engine wake-up, fired when an op is queued outside a frame.
-    waker: Rc<Waker>,
+    /// The surface's gate on the engine wake-up, fired when an op is
+    /// queued outside a frame; it passes nothing while the surface is
+    /// hidden.
+    waker: Rc<SurfaceWaker>,
     /// The last display properties announced to the render thread.
     display: Cell<Display>,
     /// Set by installed contents' `LiveState`s the moment an animated
@@ -104,7 +106,7 @@ impl<B: Backend> std::fmt::Debug for Shared<B> {
 }
 
 impl<B: Backend> Shared<B> {
-    fn new(id: SurfaceId, waker: Rc<Waker>) -> Self {
+    fn new(id: SurfaceId, waker: Rc<SurfaceWaker>) -> Self {
         Self {
             id,
             pending: Vec::new(),
@@ -129,9 +131,16 @@ impl<B: Backend> Shared<B> {
         self.waker.wake();
     }
 
+    /// Whether the surface is hidden.
+    pub(crate) fn hidden(&self) -> bool {
+        self.waker.visibility() == Visibility::Hidden
+    }
+
     /// Samples running operand animations at `time`, then drains pending
     /// ops and live content changes into a change set. Returns `None` when
-    /// nothing changed.
+    /// nothing changed. A hidden surface's operand animations are not
+    /// sampled: they resume at the time of the first frame after it is
+    /// shown, with no catch-up.
     pub fn take_changes(&mut self, time: crate::Instant) -> Option<ChangeSet<B>> {
         let mut ops = std::mem::take(&mut self.spare_ops);
         let recycled = std::mem::take(&mut self.spare_recycled);
@@ -140,7 +149,7 @@ impl<B: Backend> Shared<B> {
         // `animated` is poked by a content's `LiveState` the moment an
         // animated operand arrives, so a surface that never saw one
         // skips the per-content sampling probes entirely.
-        let sampling = self.animated.get();
+        let sampling = self.animated.get() && !self.hidden();
         for (id, slot) in &mut self.contents {
             let Some(content) = slot.content.as_mut() else {
                 continue;
@@ -770,6 +779,7 @@ impl<B: Backend> std::fmt::Debug for Surface<B> {
 impl<B: Backend> Surface<B> {
     /// Builds the UI-thread handle once `CreateSurface` succeeded.
     pub fn new(id: SurfaceId, info: SurfaceInfo, tx: Sender<Message<B>>, waker: Rc<Waker>) -> Self {
+        let waker = Rc::new(SurfaceWaker::new(waker));
         let shared = Rc::new(RefCell::new(Shared::new(id, waker)));
         let owner: Rc<dyn LayerOwner> = Rc::clone(&shared) as Rc<dyn LayerOwner>;
         Self {
@@ -849,6 +859,87 @@ impl<B: Backend> Surface<B> {
             })
             .map_err(|_| SurfaceError::Lost)?;
         self.shared.borrow().display.set(display);
+        Ok(())
+    }
+
+    /// Hides or shows the surface. Hosts call this from the platform's
+    /// visibility signal: a minimized, fully occluded, backgrounded or
+    /// detached window or view, or a hidden document, is hidden.
+    ///
+    /// While the surface is hidden:
+    /// - nothing on it asks for a frame: animation tracks, live operands,
+    ///   transactions and custom GPU content or external frames wake no
+    ///   host, and it adds nothing to [`Next`](crate::Next);
+    /// - transactions, bound signals and live operand writes are still
+    ///   accepted, and a render of another surface applies them, so the
+    ///   first frame after it is shown draws the current state;
+    /// - no frame draws or presents it; once every surface is hidden,
+    ///   [`Engine::render`](crate::Engine::render) fails with
+    ///   [`RenderError::Hidden`].
+    ///
+    /// Showing it wakes the host once, and the next frame draws it with
+    /// every animation sampled at that frame's time: a track in flight
+    /// jumps to where it is then, with no catch-up. Setting the current
+    /// visibility again does nothing.
+    ///
+    /// Returns once the render loop has applied the change, so no GPU
+    /// content producer of a hidden surface wakes the host afterwards; it
+    /// waits for a frame in progress.
+    ///
+    /// # Errors
+    /// [`SurfaceError::Lost`] when the render thread is gone.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn visibility(&self, visibility: Visibility) -> Result<(), SurfaceError> {
+        // Not borrowed across the wake: the host's callback may use the
+        // surface.
+        let waker = Rc::clone(&self.shared.borrow().waker);
+        if waker.visibility() == visibility {
+            return Ok(());
+        }
+        let (reply, rx) = std::sync::mpsc::channel();
+        self.tx
+            .send(Message::Visibility {
+                id: self.id,
+                visibility,
+                reply,
+            })
+            .map_err(|_| SurfaceError::Lost)?;
+        rx.recv().map_err(|_| SurfaceError::Lost)?;
+        // After the render loop applied it, so a woken host's render finds
+        // the surface shown.
+        waker.set_visibility(visibility);
+        Ok(())
+    }
+
+    /// Hides or shows the surface, yielding until the browser executor has
+    /// applied the change. See the native `visibility` for the contract.
+    ///
+    /// # Errors
+    /// [`SurfaceError::Lost`] when the executor is gone.
+    #[cfg(target_arch = "wasm32")]
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
+    pub async fn visibility(&self, visibility: Visibility) -> Result<(), SurfaceError> {
+        // Not borrowed across the wake: the host's callback may use the
+        // surface.
+        let waker = Rc::clone(&self.shared.borrow().waker);
+        if waker.visibility() == visibility {
+            return Ok(());
+        }
+        let (reply, rx) = crate::local::channel();
+        self.tx
+            .send(Message::Visibility {
+                id: self.id,
+                visibility,
+                reply,
+            })
+            .map_err(|_| SurfaceError::Lost)?;
+        rx.recv().await.map_err(|_| SurfaceError::Lost)?;
+        // After the executor applied it, so a woken host's render finds the
+        // surface shown.
+        waker.set_visibility(visibility);
         Ok(())
     }
 
@@ -1054,6 +1145,7 @@ impl<B: Backend> Surface<B> {
 
 impl<B: Backend> Drop for Surface<B> {
     fn drop(&mut self) {
+        self.shared.borrow().waker.retire();
         let _ = self.tx.send(Message::DestroySurface { id: self.id });
     }
 }

@@ -33,7 +33,7 @@ use cherenkov::{
     ContentOp, EngineError, FontData as EngineFontData, FontId, Frame, FrameId, FrameStats,
     FrameTiming, ImageId, ImageUpload, LayerId, MemoryUsage, PassTiming, Pressure, Readback,
     Redraw, RenderError, Renderer, ResourceError, ResourceId, SurfaceError, SurfaceFrame,
-    SurfaceId, SurfaceInfo,
+    SurfaceId, SurfaceInfo, Visibility,
 };
 use glyph::{Atlas, FontData, PendingRaster, PreparedFont};
 use lower::{
@@ -186,6 +186,9 @@ struct SurfaceState {
     /// The `(bind_gen, images_gen, mask_texture_gen)` triple `binds1` was
     /// built under.
     binds1_stamp: (u64, u64, u64),
+    /// A hidden surface's GPU content and filters wake no host and ask for
+    /// no frame; their requests wait for the first frame after it is shown.
+    hidden: bool,
 }
 
 /// A registered backdrop group: its optional capture filter and the
@@ -1650,6 +1653,7 @@ impl Renderer for GpuRenderer {
                 bind_gen: 0,
                 binds1: FxHashMap::default(),
                 binds1_stamp: (u64::MAX, u64::MAX, u64::MAX),
+                hidden: false,
             },
         );
         diag::set_surface(None);
@@ -1790,6 +1794,19 @@ impl Renderer for GpuRenderer {
         }
         diag::set_surface(None);
         self.surfaces.remove(&id);
+        self.update_filter_activity();
+    }
+
+    fn set_visibility(&mut self, id: SurfaceId, visibility: Visibility) {
+        let Some(surface) = self.surfaces.get_mut(&id) else {
+            return;
+        };
+        surface.hidden = visibility == Visibility::Hidden;
+        // A hidden surface's producers keep their requests (`dirty`) for
+        // the first frame after it is shown, without waking the host.
+        for (layer, slot) in &surface.content {
+            slot.set_active(!surface.hidden && surface.frame.content.contains(layer));
+        }
         self.update_filter_activity();
     }
 
@@ -2725,10 +2742,12 @@ impl GpuRenderer {
         timing
     }
 
+    /// Only the visible surfaces' filters may wake the host.
     fn update_filter_activity(&self) {
         let active = self
             .surfaces
             .values()
+            .filter(|surface| !surface.hidden)
             .flat_map(|surface| surface.frame.filters.iter().map(|(_, id)| *id))
             .collect();
         self.filters.set_active(&active);
@@ -3048,7 +3067,7 @@ impl GpuRenderer {
             Redraw::None => None,
             Redraw::Wanted { rate } => Some(rate),
         };
-        for surface in self.surfaces.values() {
+        for surface in self.surfaces.values().filter(|surface| !surface.hidden) {
             if surface
                 .frame
                 .filters

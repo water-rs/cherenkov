@@ -55,7 +55,9 @@ pub use crate::animation::{
 pub use crate::backdrop::{
     BackdropEffect, BackdropShaderEffect, BackdropShaderSource, ColorMatrix, Refraction, Rim,
 };
-pub use crate::backend::{Backend, Display, Frame, Redraw, Renderer, SurfaceFrame, SurfaceInfo};
+pub use crate::backend::{
+    Backend, Display, Frame, Redraw, Renderer, SurfaceFrame, SurfaceInfo, Visibility,
+};
 pub use crate::capability::{
     Backdrop, BackdropChain, BackdropRuns, BackdropShaders, Effects, ExternalFrames, Filters,
     GpuContent, HdrOutput, Planes, Runs, ShaderPaint as ShaderPaintCapability, ShaderSource,

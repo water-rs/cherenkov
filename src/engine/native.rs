@@ -198,7 +198,9 @@ impl<B: Backend> Engine<B> {
     /// bound signal firing) are queued, not sent. When the display link is
     /// paused after `Next::Idle`, the host must learn that a frame is
     /// needed: the engine calls `f` at most once between two
-    /// [`Engine::render`]s, the first time something is queued.
+    /// [`Engine::render`]s, the first time something is queued on a
+    /// visible surface or a surface is shown. A change on a hidden surface
+    /// calls nothing.
     pub fn set_waker(&self, f: impl Fn() + 'static) {
         *self.waker.callback.borrow_mut() = Some(Box::new(f));
     }
@@ -301,10 +303,19 @@ impl<B: Backend> Engine<B> {
     /// the render thread has applied the queued commits, sampled the
     /// animations and rendered.
     ///
+    /// Hidden surfaces are left out of the frame: their queued changes are
+    /// applied, and they are drawn by the first frame after they are shown
+    /// (see [`Surface::visibility`]).
+    ///
     /// # Errors
-    /// [`RenderError`] fails this call; a surface that failed to render is
-    /// left in its previous state.
+    /// [`RenderError::Hidden`] when every live surface is hidden: nothing
+    /// is applied or drawn, and the engine wakes the host once a surface
+    /// is shown. Any other [`RenderError`] fails this call; a surface that
+    /// failed to render is left in its previous state.
     pub fn render(&self, time: FrameTime) -> Result<Next, RenderError> {
+        if self.waker.all_hidden() {
+            return Err(RenderError::Hidden);
+        }
         let Some(reply_sender) = self.render_reply.borrow_mut().take() else {
             return Err(RenderError::Thread);
         };

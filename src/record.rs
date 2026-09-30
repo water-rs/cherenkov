@@ -349,7 +349,7 @@ pub struct LiveState {
     /// skip per-content probes. Detached when the content retires.
     surface_animated: RefCell<Option<Rc<Cell<bool>>>>,
     guards: RefCell<Vec<Box<dyn Any>>>,
-    waker: RefCell<Weak<crate::engine::Waker>>,
+    waker: RefCell<Weak<crate::engine::SurfaceWaker>>,
 }
 
 /// A change carrying an `Animation`, queued until the next
@@ -848,7 +848,11 @@ impl Content {
 
     /// Connect installed live operands to the owning surface's host callback
     /// and sampling flag.
-    pub(crate) fn attach_waker(&self, waker: &Rc<crate::engine::Waker>, flag: &Rc<Cell<bool>>) {
+    pub(crate) fn attach_waker(
+        &self,
+        waker: &Rc<crate::engine::SurfaceWaker>,
+        flag: &Rc<Cell<bool>>,
+    ) {
         // Constant recordings need no callback or weak-count traffic.
         if !self.live.guards.borrow().is_empty() {
             *self.live.waker.borrow_mut() = Rc::downgrade(waker);

@@ -9,9 +9,11 @@ use std::time::Duration;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::backend::{Backend, Display, Frame, Redraw, Renderer, SurfaceFrame, SurfaceInfo};
+use crate::backend::{
+    Backend, Display, Frame, Redraw, Renderer, SurfaceFrame, SurfaceInfo, Visibility,
+};
 use crate::error::{EngineError, RenderError, ResourceError, SurfaceError};
-use crate::frame::{FrameId, FrameStats, Next};
+use crate::frame::{FrameId, FrameStats, Next, RefreshRange};
 use crate::image::ImageUpload;
 use crate::message::{BackdropShaderId, ChangeSet, LayerOp, Message, Op, ResOp, SurfaceId};
 use crate::paint::ImageId;
@@ -28,6 +30,9 @@ struct SurfaceState {
     /// Whether a property op, a content op or an animation step touched the
     /// surface since the last render.
     changed: bool,
+    /// A hidden surface is left out of every frame: its tree is neither
+    /// sampled nor drawn, and it asks for no frame.
+    visibility: Visibility,
     /// Whether the surface's recorded contents still run operand animations
     /// on the UI thread. The tracks live there; they need the next frame's
     /// sample at the fast rate class.
@@ -171,10 +176,12 @@ impl<B: Backend> Resources<B> {
         }
     }
 
-    /// Fails when a surface that changed since the last render draws a
-    /// rejected resource. An unchanged surface cannot: a rejected
+    /// Fails when a visible surface that changed since the last render
+    /// draws a rejected resource. An unchanged surface cannot: a rejected
     /// registration's id reaches content only in a commit, and a rejected
-    /// replacement marks every surface sampling the image changed.
+    /// replacement marks every surface sampling the image changed. A
+    /// hidden surface is not drawn, so it fails no render; showing it marks
+    /// it changed, so the first frame after it is shown makes this check.
     fn check(
         &self,
         renderer: &B::Renderer,
@@ -183,7 +190,10 @@ impl<B: Backend> Resources<B> {
         if self.rejections.is_empty() {
             return Ok(());
         }
-        for (surface, state) in surfaces.iter().filter(|(_, state)| state.changed) {
+        for (surface, state) in surfaces
+            .iter()
+            .filter(|(_, state)| state.changed && state.visibility == Visibility::Visible)
+        {
             for (resource, rejection) in &self.rejections {
                 if draws(renderer, *surface, state, *resource) {
                     return Err(RenderError::Rejected {
@@ -258,6 +268,9 @@ pub fn run<B: Backend>(
     let mut surfaces: FxHashMap<SurfaceId, SurfaceState> = FxHashMap::default();
     let mut resources = Resources::<B>::default();
     let mut next_frame = 0u64;
+    // The loop's only wait: an untimed `recv`. With every surface hidden
+    // the host sends nothing, so the thread stays blocked here with no
+    // timeout, poll or timer to wake it (macOS App Nap, #203).
     while let Ok(message) = rx.recv() {
         match message {
             Message::CreateSurface { id, target, reply } => {
@@ -275,6 +288,14 @@ pub fn run<B: Backend>(
                 destroy_surface::<B>(&mut renderer, &mut surfaces, &mut resources, id);
             }
             Message::Display { id, display } => set_display(&mut surfaces, id, display),
+            Message::Visibility {
+                id,
+                visibility,
+                reply,
+            } => {
+                set_visibility(&mut renderer, &mut surfaces, id, visibility);
+                let _ = reply.send(());
+            }
             Message::Resource(op) => op(&mut renderer),
             Message::Register { resource, op } => {
                 resources.register(resource, op(&mut renderer));
@@ -343,6 +364,7 @@ fn create_surface<B: Backend>(
             clear: WorkingColor::TRANSPARENT,
             changed: true,
             content_animating: false,
+            visibility: Visibility::Visible,
         },
     );
     Ok(info)
@@ -379,6 +401,26 @@ fn destroy_surface<B: Backend>(
         // create failed may still send this (#150).
         tracing::trace!(surface = id.raw(), "destroy of unknown surface");
     }
+}
+
+/// Hides or shows surface `id`. A shown surface is drawn by the next
+/// frame whether or not anything changed while it was hidden: its target
+/// may hold nothing current.
+fn set_visibility<R: Renderer>(
+    renderer: &mut R,
+    surfaces: &mut FxHashMap<SurfaceId, SurfaceState>,
+    id: SurfaceId,
+    visibility: Visibility,
+) {
+    let Some(state) = surfaces.get_mut(&id) else {
+        tracing::trace!(surface = id.raw(), "visibility of unknown surface");
+        return;
+    };
+    state.visibility = visibility;
+    if visibility == Visibility::Visible {
+        state.changed = true;
+    }
+    renderer.set_visibility(id, visibility);
 }
 
 fn set_display(surfaces: &mut FxHashMap<SurfaceId, SurfaceState>, id: SurfaceId, display: Display) {
@@ -513,21 +555,21 @@ fn apply_commits<B: Backend>(
     resources.check(renderer, surfaces)
 }
 
-/// One frame: apply every commit, sample, render, answer.
-#[cfg(not(target_arch = "wasm32"))]
-fn render<B: Backend>(
-    renderer: &mut B::Renderer,
-    surfaces: &mut FxHashMap<SurfaceId, SurfaceState>,
-    resources: &mut Resources<B>,
-    id: FrameId,
+/// Samples every visible surface's tree at `time` into `frames`, and
+/// returns the rate class its running animations need. A hidden surface is
+/// left out: its tracks are not sampled, so the first frame after it is
+/// shown samples them at that frame's time.
+fn sample_visible<'a>(
+    surfaces: &'a mut FxHashMap<SurfaceId, SurfaceState>,
     time: crate::Instant,
-    commits: &mut [(SurfaceId, ChangeSet<B>)],
-) -> Result<(Next, FrameStats), RenderError> {
-    apply_commits(renderer, surfaces, resources, commits)?;
-    let mut frames: Vec<SurfaceFrame<'_>> = Vec::with_capacity(surfaces.len());
+    frames: &mut Vec<SurfaceFrame<'a>>,
+) -> Option<RefreshRange> {
     // The fast class wins when any surface needs it.
     let mut rate = None;
-    for (id, state) in &mut *surfaces {
+    for (id, state) in surfaces {
+        if state.visibility == Visibility::Hidden {
+            continue;
+        }
         let sampling = state.tree.sample(time, state.display);
         let changed = state.changed || sampling.stepped;
         // Operand animations run on the UI thread and are springs or
@@ -551,15 +593,17 @@ fn render<B: Backend>(
             tree: &state.tree,
         });
     }
-    let mut stats = FrameStats::default();
-    let redraw = renderer.render(
-        &Frame {
-            id,
-            time: crate::frame::FrameTime(time),
-            surfaces: &frames,
-        },
-        &mut stats,
-    )?;
+    rate
+}
+
+/// Marks every surface current and answers when the next frame is needed.
+/// A hidden surface is marked changed again when it is shown.
+fn finish_frame(
+    surfaces: &mut FxHashMap<SurfaceId, SurfaceState>,
+    mut rate: Option<RefreshRange>,
+    redraw: Redraw,
+    time: crate::Instant,
+) -> Next {
     for state in surfaces.values_mut() {
         state.changed = false;
     }
@@ -569,11 +613,35 @@ fn render<B: Backend>(
             |r| (*r.start()).min(*backend_rate.start())..=(*r.end()).max(*backend_rate.end()),
         ));
     }
-    let next = rate.map_or(Next::Idle, |rate| Next::At {
+    rate.map_or(Next::Idle, |rate| Next::At {
         time: time + Duration::from_secs_f64(1.0 / f64::from(*rate.end())),
         rate,
-    });
-    Ok((next, stats))
+    })
+}
+
+/// One frame: apply every commit, sample, render, answer.
+#[cfg(not(target_arch = "wasm32"))]
+fn render<B: Backend>(
+    renderer: &mut B::Renderer,
+    surfaces: &mut FxHashMap<SurfaceId, SurfaceState>,
+    resources: &mut Resources<B>,
+    id: FrameId,
+    time: crate::Instant,
+    commits: &mut [(SurfaceId, ChangeSet<B>)],
+) -> Result<(Next, FrameStats), RenderError> {
+    apply_commits(renderer, surfaces, resources, commits)?;
+    let mut frames: Vec<SurfaceFrame<'_>> = Vec::with_capacity(surfaces.len());
+    let rate = sample_visible(surfaces, time, &mut frames);
+    let mut stats = FrameStats::default();
+    let redraw = renderer.render(
+        &Frame {
+            id,
+            time: crate::frame::FrameTime(time),
+            surfaces: &frames,
+        },
+        &mut stats,
+    )?;
+    Ok((finish_frame(surfaces, rate, redraw, time), stats))
 }
 #[cfg(target_arch = "wasm32")]
 #[expect(
@@ -590,32 +658,7 @@ async fn render_local<B: Backend>(
 ) -> Result<(Next, FrameStats), RenderError> {
     apply_commits(renderer, surfaces, resources, commits)?;
     let mut frames: Vec<SurfaceFrame<'_>> = Vec::with_capacity(surfaces.len());
-    // The fast class wins when any surface needs it.
-    let mut rate = None;
-    for (id, state) in &mut *surfaces {
-        let sampling = state.tree.sample(time, state.display);
-        let changed = state.changed || sampling.stepped;
-        // Operand animations run on the UI thread and are springs or
-        // curves only: they always need the fast class.
-        let running = if state.content_animating {
-            Some(crate::tree::RATE_FAST)
-        } else {
-            sampling.rate
-        };
-        match running {
-            Some(r) if r == crate::tree::RATE_FAST => rate = Some(crate::tree::RATE_FAST),
-            Some(r) => rate = rate.or(Some(r)),
-            None => {}
-        }
-        frames.push(SurfaceFrame {
-            id: *id,
-            size: state.size,
-            display: state.display,
-            clear: state.clear,
-            changed,
-            tree: &state.tree,
-        });
-    }
+    let rate = sample_visible(surfaces, time, &mut frames);
     let mut stats = FrameStats::default();
     let redraw = renderer
         .render(
@@ -627,20 +670,7 @@ async fn render_local<B: Backend>(
             &mut stats,
         )
         .await?;
-    for state in surfaces.values_mut() {
-        state.changed = false;
-    }
-    if let Redraw::Wanted { rate: backend_rate } = redraw {
-        rate = Some(rate.map_or_else(
-            || backend_rate.clone(),
-            |r| (*r.start()).min(*backend_rate.start())..=(*r.end()).max(*backend_rate.end()),
-        ));
-    }
-    let next = rate.map_or(Next::Idle, |rate| Next::At {
-        time: time + Duration::from_secs_f64(1.0 / f64::from(*rate.end())),
-        rate,
-    });
-    Ok((next, stats))
+    Ok((finish_frame(surfaces, rate, redraw, time), stats))
 }
 
 #[cfg(all(test, feature = "testing", not(target_arch = "wasm32")))]
@@ -673,6 +703,7 @@ mod tests {
             clear: WorkingColor::TRANSPARENT,
             changed: false,
             content_animating: false,
+            visibility: super::Visibility::Visible,
         };
 
         let mut first = ChangeSet::<Null> {
@@ -758,6 +789,14 @@ impl<B: Backend> LocalState<B> {
                 destroy_surface::<B>(renderer, surfaces, resources, id);
             }
             Message::Display { id, display } => set_display(surfaces, id, display),
+            Message::Visibility {
+                id,
+                visibility,
+                reply,
+            } => {
+                set_visibility(renderer, surfaces, id, visibility);
+                let _ = reply.send(());
+            }
             Message::Resource(op) => op(renderer),
             Message::Register { resource, op } => {
                 let result = op(renderer).await;

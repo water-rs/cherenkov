@@ -9,7 +9,7 @@ use rustc_hash::FxHashMap;
 
 use kurbo::{Affine, Vec2};
 
-use crate::backend::{Backend, Frame, Redraw, Renderer, SurfaceInfo};
+use crate::backend::{Backend, Frame, Redraw, Renderer, SurfaceInfo, Visibility};
 use crate::capability::{ShaderPaint, ShaderSource};
 use crate::config::MemoryUsage;
 use crate::error::{EngineError, RenderError, ResourceError, SurfaceError};
@@ -31,6 +31,8 @@ pub enum Event {
     ResizeSurface(SurfaceId, (u32, u32)),
     /// `destroy_surface` ran.
     DestroySurface(SurfaceId),
+    /// `set_visibility` ran.
+    Visibility(SurfaceId, Visibility),
     /// `add_font` ran.
     AddFont(FontId),
     /// `remove_font` ran.
@@ -210,6 +212,15 @@ impl Renderer for NullRenderer {
         );
         self.pictures.retain(|(surface, _), _| *surface != id);
         let _ = self.events.send(Event::DestroySurface(id));
+    }
+
+    fn set_visibility(&mut self, id: SurfaceId, visibility: Visibility) {
+        assert!(
+            self.surfaces.contains(&id),
+            "visibility of unknown surface {}",
+            id.raw()
+        );
+        let _ = self.events.send(Event::Visibility(id, visibility));
     }
 
     /// `Null` draws no glyphs, so any data is a font.

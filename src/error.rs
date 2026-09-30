@@ -105,6 +105,11 @@ pub enum RenderError {
     /// The render thread failed or stopped.
     #[error("render thread stopped")]
     Thread,
+    /// Every live surface is hidden, so a render has nothing to draw. A
+    /// host renders again once a surface is shown; the engine wakes it
+    /// then.
+    #[error("every surface is hidden")]
+    Hidden,
     /// The surface's pixels cannot be read back (window surfaces).
     #[error("the surface is not readable")]
     NotReadable,

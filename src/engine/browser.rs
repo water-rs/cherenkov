@@ -202,7 +202,9 @@ impl<B: Backend> Engine<B> {
     /// bound signal firing) are queued, not sent. When the display link is
     /// paused after `Next::Idle`, the host must learn that a frame is
     /// needed: the engine calls `f` at most once between two
-    /// [`Engine::render`]s, the first time something is queued.
+    /// [`Engine::render`]s, the first time something is queued on a
+    /// visible surface or a surface is shown. A change on a hidden surface
+    /// calls nothing.
     pub fn set_waker(&self, f: impl Fn() + 'static) {
         *self.waker.callback.borrow_mut() = Some(Box::new(f));
     }
@@ -328,14 +330,23 @@ impl<B: Backend> Engine<B> {
     /// Browser work yields to the event loop. Mutations while awaiting this call
     /// belong to the next frame and still wake the host.
     ///
+    /// Hidden surfaces are left out of the frame: their queued changes are
+    /// applied, and they are drawn by the first frame after they are shown
+    /// (see [`Surface::visibility`]).
+    ///
     /// # Errors
-    /// [`RenderError`] fails this call; a surface that failed to render is
-    /// left in its previous state.
+    /// [`RenderError::Hidden`] when every live surface is hidden: nothing
+    /// is applied or drawn, and the engine wakes the host once a surface
+    /// is shown. Any other [`RenderError`] fails this call; a surface that
+    /// failed to render is left in its previous state.
     #[expect(
         clippy::future_not_send,
         reason = "the browser engine is single-threaded and its futures run on the page's event loop"
     )]
     pub async fn render(&self, time: FrameTime) -> Result<Next, RenderError> {
+        if self.waker.all_hidden() {
+            return Err(RenderError::Hidden);
+        }
         let mut commits = std::mem::take(&mut *self.commits.borrow_mut());
         commits.clear();
         self.surfaces.borrow_mut().retain(|weak| {

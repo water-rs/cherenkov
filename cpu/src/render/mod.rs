@@ -24,7 +24,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use cherenkov::{
     BackdropId, ContentOp, EngineError, FontData, FontId, Frame, FrameStats, ImageId, ImageUpload,
     LayerId, MemoryUsage, Pressure, Readback, Redraw, RenderError, Renderer, ResourceError,
-    ResourceId, SurfaceError, SurfaceId, SurfaceInfo,
+    ResourceId, SurfaceError, SurfaceId, SurfaceInfo, Visibility,
 };
 use lower::{ContentData, Item, Lowering};
 
@@ -66,6 +66,9 @@ struct SurfaceState {
     /// backdrop capture last frame (window, isolation stack and capture
     /// buffers). 0 when no capture ran.
     backdrop_capture_peak: u64,
+    /// A hidden surface's filters and backdrop chains wake no host and
+    /// ask for no frame.
+    hidden: bool,
 }
 
 impl SurfaceState {
@@ -207,6 +210,7 @@ impl Renderer for RasterRenderer {
                 filters: Vec::new(),
                 groups: Vec::new(),
                 backdrop_capture_peak: 0,
+                hidden: false,
             },
         );
         Ok(SurfaceInfo {
@@ -238,6 +242,15 @@ impl Renderer for RasterRenderer {
 
     fn destroy_surface(&mut self, id: SurfaceId) {
         self.surfaces.remove(&id);
+    }
+
+    fn set_visibility(&mut self, id: SurfaceId, visibility: Visibility) {
+        let Some(state) = self.surfaces.get_mut(&id) else {
+            return;
+        };
+        state.hidden = visibility == Visibility::Hidden;
+        let (used, used_groups) = self.used_filters();
+        self.filters.set_active(&used, &used_groups);
     }
 
     /// Validates font data and detects colour-glyph sources.
@@ -556,35 +569,21 @@ impl RasterRenderer {
                 self.render_surface(sf, frame.id, stats)?;
             }
         }
-        let used: FxHashSet<u64> = self
-            .surfaces
-            .values()
-            .flat_map(|surface| surface.filters.iter().copied())
-            .collect();
-        let used_groups: FxHashSet<(u64, u64)> = self
-            .surfaces
-            .iter()
-            .flat_map(|(surface, state)| {
-                state
-                    .groups
-                    .iter()
-                    .map(move |group| (surface.raw(), *group))
-            })
-            .collect();
+        let (used, used_groups) = self.used_filters();
         self.filters.set_active(&used, &used_groups);
         self.filters.finish_frame(&used, &used_groups);
         let rate = self
             .surfaces
             .iter()
             .filter(|(id, surface)| {
-                surface
-                    .filters
-                    .iter()
-                    .any(|fid| self.filters.wants_redraw(*fid))
-                    || surface
-                        .groups
+                !surface.hidden
+                    && (surface
+                        .filters
                         .iter()
-                        .any(|gid| self.filters.wants_redraw_group(**id, BackdropId::new(*gid)))
+                        .any(|fid| self.filters.wants_redraw(*fid))
+                        || surface.groups.iter().any(|gid| {
+                            self.filters.wants_redraw_group(**id, BackdropId::new(*gid))
+                        }))
             })
             .map(|(_, surface)| surface)
             .fold(None, |rate: Option<cherenkov::RefreshRange>, surface| {
@@ -597,6 +596,24 @@ impl RasterRenderer {
                 ))
             });
         Ok(rate.map_or(Redraw::None, |rate| Redraw::Wanted { rate }))
+    }
+
+    /// The filters and backdrop chains the visible surfaces sample: the
+    /// ones allowed to wake the host.
+    fn used_filters(&self) -> (FxHashSet<u64>, FxHashSet<(u64, u64)>) {
+        let visible = || self.surfaces.iter().filter(|(_, state)| !state.hidden);
+        let used = visible()
+            .flat_map(|(_, surface)| surface.filters.iter().copied())
+            .collect();
+        let used_groups = visible()
+            .flat_map(|(surface, state)| {
+                state
+                    .groups
+                    .iter()
+                    .map(move |group| (surface.raw(), *group))
+            })
+            .collect();
+        (used, used_groups)
     }
 
     fn refresh_cache_budgets(&mut self) {

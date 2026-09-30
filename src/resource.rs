@@ -214,7 +214,8 @@ impl<F: Format> Image<F> {
     /// frame samples a partly written image. The same dimensions reuse the
     /// backing storage; different dimensions reallocate it behind the same
     /// id. The next render redraws the surfaces whose content draws this
-    /// image, and the engine's waker fires to request that render.
+    /// image, and the engine's waker fires to request that render unless
+    /// every surface is hidden.
     ///
     /// `image` is validated by [`ImageData::new`]. A rejection only the
     /// backend can detect keeps the previous pixels and fails every render

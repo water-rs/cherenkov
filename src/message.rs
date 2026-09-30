@@ -17,7 +17,7 @@ use kurbo::{Affine, Vec2};
 
 use crate::WorkingColor;
 use crate::animation::Animation;
-use crate::backend::{Backend, Display, SurfaceInfo};
+use crate::backend::{Backend, Display, SurfaceInfo, Visibility};
 use crate::config::{MemoryUsage, Pressure};
 use crate::display_list::{Picture, SlotUpdate};
 use crate::error::{RenderError, ResourceError, SurfaceError};
@@ -297,6 +297,16 @@ pub enum Message<B: Backend> {
         id: SurfaceId,
         /// The new display properties.
         display: Display,
+    },
+    /// Hide or show a surface; answered once the render loop and the
+    /// backend have applied it.
+    Visibility {
+        /// The surface id.
+        id: SurfaceId,
+        /// Whether it is drawn.
+        visibility: Visibility,
+        /// Answered when applied.
+        reply: Sender<()>,
     },
     /// An opaque render-thread operation that cannot fail: font, filter
     /// and effect registration and removal, capability hooks.

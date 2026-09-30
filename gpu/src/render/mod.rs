@@ -12,6 +12,7 @@ mod instance;
 mod lower;
 mod paint;
 mod path;
+mod planes;
 mod prepared;
 pub mod present;
 mod raster;
@@ -149,6 +150,17 @@ pub struct GpuBitmap {
 /// One surface's GPU-side state.
 struct SurfaceState {
     window: Option<present::WindowSurface>,
+    /// Whether the target exposes a system-compositor parent, so eligible
+    /// layers are promoted onto planes (`GpuRenderer::planes`).
+    promotes: bool,
+    /// This frame's promotion decision; empty unless `promotes`.
+    plan: planes::Plan,
+    /// Engine parts above the first (`target` is part 0): one per promoted
+    /// plane with layers painted above it, at the surface size.
+    parts: Vec<(wgpu::Texture, wgpu::TextureView)>,
+    /// Counts external frames installed on this surface; each slot keeps
+    /// the count at its install, so a plane knows when its frame changed.
+    frames_installed: u64,
     textures: Option<std::sync::mpsc::Sender<wgpu::Texture>>,
     refresh: cherenkov::RefreshRange,
     present_pending: bool,
@@ -200,6 +212,17 @@ struct BackdropGroupState {
 }
 
 impl SurfaceState {
+    /// Engine part `n`'s texture: `target` for part 0.
+    fn part(&self, n: u32) -> (&wgpu::TextureView, &wgpu::Texture) {
+        match n {
+            0 => (&self.view, &self.target),
+            n => {
+                let (texture, view) = &self.parts[n as usize - 1];
+                (view, texture)
+            }
+        }
+    }
+
     /// The `BackdropGroupInfo` map lowering needs for this surface.
     fn backdrop_info(&self, filters: &mut filter::Registry) -> FxHashMap<u64, BackdropGroupInfo> {
         self.backdrop_groups
@@ -279,7 +302,7 @@ impl SurfaceState {
                 u64::from(texture.image.width) * u64::from(texture.image.height) * 8 + 272
             })
             .sum::<u64>();
-        surface_bytes
+        surface_bytes * (1 + self.parts.len() as u64)
             + scratch_bytes
             + backdrop_bytes
             + shader_bytes
@@ -334,6 +357,14 @@ pub struct GpuRenderer {
     instance: wgpu::Instance,
     adapter: wgpu::Adapter,
     presenter: Option<present::Presenter>,
+    /// The plane realization of every surface whose target exposes a
+    /// system-compositor parent. Platform objects stay on the render
+    /// thread, outside the surface states lowering moves to its workers.
+    #[expect(
+        clippy::zero_sized_map_values,
+        reason = "no platform realization is wired yet, so the map stays empty"
+    )]
+    planes: FxHashMap<SurfaceId, planes::Platform>,
     /// How the fixed modules reach this device (`shaders.rs`): SPIR-V,
     /// metallib, or WGSL — decided once at init by the adapter backend.
     shader_delivery: shaders::ShaderDelivery,
@@ -1272,6 +1303,11 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             instance,
             adapter,
             presenter: None,
+            #[expect(
+                clippy::zero_sized_map_values,
+                reason = "no platform realization is wired yet, so the map stays empty"
+            )]
+            planes: FxHashMap::default(),
             shader_delivery,
             shaders: paint::Registry::default(),
             backdrop_shaders: FxHashMap::default(),
@@ -1489,6 +1525,11 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
         instance,
         adapter,
         presenter: None,
+        #[expect(
+            clippy::zero_sized_map_values,
+            reason = "no platform realization is wired yet, so the map stays empty"
+        )]
+        planes: FxHashMap::default(),
         shader_delivery,
         shaders: paint::Registry::default(),
         backdrop_shaders: FxHashMap::default(),
@@ -1630,6 +1671,10 @@ impl Renderer for GpuRenderer {
             id,
             SurfaceState {
                 window,
+                promotes: false,
+                plan: planes::Plan::default(),
+                parts: Vec::new(),
+                frames_installed: 0,
                 textures,
                 refresh,
                 present_pending: false,
@@ -1724,6 +1769,18 @@ impl Renderer for GpuRenderer {
         state.size = size;
         state.target = target;
         state.view = view;
+        for part in &mut state.parts {
+            *part = create_target(
+                &self.device,
+                "engine part",
+                size,
+                TARGET_USAGES,
+                TARGET_FORMAT,
+            );
+        }
+        if let Some(system) = self.planes.get_mut(&id) {
+            planes::SystemPlanes::resize(system, size);
+        }
         state.scratch.clear();
         state.backdrop = [None, None];
         state.binds1.clear();
@@ -1746,7 +1803,8 @@ impl Renderer for GpuRenderer {
             diag::set_surface(Some(id.raw()));
             let target_bytes = u64::from(state.size.0)
                 * u64::from(state.size.1)
-                * texel_bytes(state.target.format());
+                * texel_bytes(state.target.format())
+                * (1 + state.parts.len() as u64);
             let scratch_bytes: u64 = state
                 .scratch
                 .iter()
@@ -1790,6 +1848,7 @@ impl Renderer for GpuRenderer {
         }
         diag::set_surface(None);
         self.surfaces.remove(&id);
+        self.planes.remove(&id);
         self.update_filter_activity();
     }
 
@@ -2573,7 +2632,7 @@ impl GpuRenderer {
                     break;
                 }
                 let surface = self.surfaces.get_mut(&sf.id).expect("rendered surface");
-                surface.present_pending = surface.window.is_some();
+                surface.present_pending = surface.window.is_some() || surface.promotes;
             }
             stats.phases.encode_seconds = t.elapsed().as_secs_f64();
             stats.frame = Some(frame.id);
@@ -2695,7 +2754,7 @@ impl GpuRenderer {
                     break;
                 }
                 let surface = self.surfaces.get_mut(&sf.id).expect("rendered surface");
-                surface.present_pending = surface.window.is_some();
+                surface.present_pending = surface.window.is_some() || surface.promotes;
             }
             stats.phases.encode_seconds = t.elapsed().as_secs_f64();
             stats.frame = Some(frame.id);
@@ -3104,9 +3163,18 @@ impl GpuRenderer {
         let state = self.surfaces.get_mut(&surface).expect("GPU surface exists");
         state.layers.remove(&layer);
         state.content.remove(&layer);
-        state
-            .external
-            .insert(layer, external::Slot::new(&self.device, &self.queue, frame));
+        state.frames_installed += 1;
+        let on_plane = state.promotes && <planes::Platform as planes::Compositor>::shows(&frame);
+        state.external.insert(
+            layer,
+            external::Slot::new(
+                &self.device,
+                &self.queue,
+                frame,
+                state.frames_installed,
+                on_plane,
+            ),
+        );
     }
 
     pub(crate) fn resize_gpu_content(
@@ -3187,14 +3255,53 @@ impl GpuRenderer {
         for sf in frame.surfaces {
             let surface = self.surfaces.get_mut(&sf.id).expect("registered surface");
             if surface.present_pending {
-                let window = surface.window.as_ref().expect("pending window");
-                surface.present_pending = !presenter.present(
-                    &self.device,
-                    &self.queue,
-                    window,
-                    &surface.view,
-                    sf.display.headroom,
-                )?;
+                surface.present_pending = !match self.planes.get_mut(&sf.id) {
+                    Some(system) => {
+                        let parts: Vec<_> = (0..surface.plan.parts())
+                            .map(|n| planes::Part {
+                                view: match n {
+                                    0 => &surface.view,
+                                    n => &surface.parts[n - 1].1,
+                                },
+                            })
+                            .collect();
+                        let external = &surface.external;
+                        let stack: Vec<_> = surface
+                            .plan
+                            .planes
+                            .iter()
+                            .map(|placement| {
+                                let slot = &external[&placement.layer];
+                                planes::Plane {
+                                    placement,
+                                    content: planes::PlaneContent::Frame {
+                                        frame: &slot.frame,
+                                        generation: slot.generation,
+                                    },
+                                }
+                            })
+                            .collect();
+                        planes::SystemPlanes::compose(
+                            system,
+                            planes::Composition {
+                                device: &self.device,
+                                queue: &self.queue,
+                                presenter,
+                                size: surface.size,
+                                display: sf.display,
+                                parts: &parts,
+                                planes: &stack,
+                            },
+                        )?
+                    }
+                    None => presenter.present(
+                        &self.device,
+                        &self.queue,
+                        surface.window.as_ref().expect("pending window"),
+                        &surface.view,
+                        sf.display.headroom,
+                    )?,
+                };
                 if surface.present_pending {
                     redraw = Some(redraw.map_or_else(
                         || surface.refresh.clone(),
@@ -3367,6 +3474,18 @@ impl GpuRenderer {
         groups: &FxHashMap<u64, BackdropGroupInfo>,
     ) -> Result<Lowered, RenderError> {
         surf.frame.reset();
+        surf.plan = if surf.promotes {
+            let candidates = surf
+                .external
+                .iter()
+                .filter(|(_, slot)| slot.on_plane)
+                .map(|(layer, slot)| (*layer, slot.size))
+                .collect();
+            planes::plan::<planes::Platform>(frame.tree, &candidates)
+        } else {
+            planes::Plan::default()
+        };
+        let promoted = surf.plan.planes.iter().map(|p| p.layer).collect();
         // Lowering borrows `layers` immutably while mutating `frame`;
         // taking the map out keeps the two borrows disjoint.
         let mut layers = std::mem::take(&mut surf.layers);
@@ -3382,7 +3501,14 @@ impl GpuRenderer {
                 external: &surf.external,
             };
             let mut lowering = Lowering::new(&mut surf.frame, surf.size);
-            let result = lowering.run(frame.tree, &mut layers, frame.clear, &glyphs, groups);
+            let result = lowering.run(
+                frame.tree,
+                &mut layers,
+                frame.clear,
+                &glyphs,
+                groups,
+                promoted,
+            );
             lowered.commands = lowering.commands_lowered;
             lowered.layers = lowering.layers_composed;
             lowered.glyphs = lowering.glyphs_rasterized();
@@ -3862,13 +3988,41 @@ impl GpuRenderer {
         let Some(surf) = self.surfaces.get_mut(&id) else {
             return Ok(());
         };
+        // One engine texture per part above the first, as the plan split
+        // the surface.
+        let parts = surf.plan.parts() - 1;
+        let part_bytes =
+            u64::from(surf.size.0) * u64::from(surf.size.1) * texel_bytes(TARGET_FORMAT);
+        while surf.parts.len() < parts {
+            surf.parts.push(create_target(
+                &self.device,
+                "engine part",
+                surf.size,
+                TARGET_USAGES,
+                TARGET_FORMAT,
+            ));
+            diag::create(&self.device, "engine part", part_bytes);
+        }
+        if surf.parts.len() > parts {
+            diag::retire(
+                &self.device,
+                diag::RetireArgs {
+                    label: "engine part",
+                    class: diag::Class::Target,
+                    bytes: part_bytes * (surf.parts.len() - parts) as u64,
+                    used_in_latest_submit: true,
+                    reason: "plan",
+                },
+            );
+            surf.parts.truncate(parts);
+        }
         let max_scratch = surf
             .frame
             .passes
             .iter()
             .filter_map(|p| match p.target {
                 Target::Scratch(i) => Some(i + 1),
-                Target::Surface | Target::Backdrop { .. } => None,
+                Target::Part(_) | Target::Backdrop { .. } => None,
             })
             .max()
             .unwrap_or(0);
@@ -3951,7 +4105,7 @@ impl GpuRenderer {
             };
             let (w, h) = (pass.region[2], pass.region[3]);
             let format = match capture.copy_from {
-                Target::Surface => TARGET_FORMAT,
+                Target::Part(_) => TARGET_FORMAT,
                 Target::Scratch(_) => self.scratch_format,
                 Target::Backdrop { .. } => {
                     return Err(RenderError::Render(format!(
@@ -4073,7 +4227,7 @@ impl GpuRenderer {
         for pass in &surf.frame.passes {
             if let Some(r) = pass.backdrop_copy {
                 let slot = match pass.target {
-                    Target::Surface => 0,
+                    Target::Part(_) => 0,
                     Target::Scratch(_) => 1,
                     Target::Backdrop { .. } => {
                         return Err(RenderError::Render(
@@ -4448,7 +4602,7 @@ impl GpuRenderer {
         }
         for (i, pass) in surf.frame.passes.iter().enumerate() {
             let (view, texture) = match pass.target {
-                Target::Surface => (&surf.view, &surf.target),
+                Target::Part(n) => surf.part(n),
                 Target::Scratch(i) => (&surf.scratch[i].view, &surf.scratch[i].texture),
                 Target::Backdrop { group, region } => {
                     let capture = &surf.backdrop_groups[&group].captures[region as usize];
@@ -4459,7 +4613,7 @@ impl GpuRenderer {
             // its `copy_from` target into the group's capture texture.
             if let Some(capture) = pass.capture {
                 let (src, sx, sy) = match capture.copy_from {
-                    Target::Surface => (&surf.target, 0, 0),
+                    Target::Part(n) => (surf.part(n).1, 0, 0),
                     Target::Scratch(k) => (&surf.scratch[k].texture, 0, 0),
                     Target::Backdrop { group, region } => {
                         let capture = &surf.backdrop_groups[&group].captures[region as usize];
@@ -4496,7 +4650,7 @@ impl GpuRenderer {
             // the copy must complete before the pass starts.
             if let Some([bx, by, bw, bh]) = pass.backdrop_copy {
                 let slot = match pass.target {
-                    Target::Surface => 0,
+                    Target::Part(_) => 0,
                     Target::Scratch(_) => 1,
                     Target::Backdrop { .. } => {
                         return Err(RenderError::Render(
@@ -4555,7 +4709,8 @@ impl GpuRenderer {
             if self.timestamps {
                 self.pass_meta.push(PassMeta {
                     name: match pass.target {
-                        Target::Surface => "surface".to_string(),
+                        Target::Part(0) => "surface".to_string(),
+                        Target::Part(n) => format!("part{n}"),
                         Target::Scratch(i) => format!("scratch{i}"),
                         Target::Backdrop { group, region } => {
                             format!("backdrop{group}.{region}")
@@ -4588,7 +4743,7 @@ impl GpuRenderer {
             // Region-targeted passes cover only their region; the surface
             // pass the whole target. `in.device` stays in true device
             // space via the per-pass Globals origin.
-            if !matches!(pass.target, Target::Surface) {
+            if !matches!(pass.target, Target::Part(_)) {
                 render_pass.set_viewport(
                     0.0,
                     0.0,
@@ -4683,7 +4838,7 @@ impl GpuRenderer {
                         stats.bind_groups_created += 1;
                         let backdrop = if scratch_backdrop {
                             let slot = match pass.target {
-                                Target::Surface => 0,
+                                Target::Part(_) => 0,
                                 Target::Scratch(_) | Target::Backdrop { .. } => 1,
                             };
                             surf.backdrop[slot].as_ref().map(|b| &b.view)
@@ -4771,7 +4926,7 @@ impl GpuRenderer {
                     Target::Backdrop { group, region } => {
                         &surf.backdrop_groups[&group].captures[region as usize]
                     }
-                    Target::Surface => {
+                    Target::Part(_) => {
                         return Err(RenderError::Render(format!(
                             "filter {filter:?} registered on a surface pass"
                         )));
@@ -5471,7 +5626,7 @@ impl GpuRenderer {
                         [region as usize]
                         .texture
                         .format(),
-                    Target::Surface => TARGET_FORMAT,
+                    Target::Part(_) => TARGET_FORMAT,
                 };
                 (*id, format)
             })

@@ -2,6 +2,9 @@
 //! call as an [`Event`] on a channel, so tests and the cross-backend
 //! behaviour suite can assert what the front end committed.
 
+/// The committed layer op a [`SurfaceTree`](crate::SurfaceTree) applies, for
+/// tests that build a sampled tree without an engine.
+pub use crate::message::LayerOp;
 use std::collections::HashSet;
 use std::sync::mpsc::Sender;
 

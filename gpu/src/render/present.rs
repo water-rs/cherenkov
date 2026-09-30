@@ -911,3 +911,366 @@ pub struct TextureOutput<'a> {
     /// target never exceeds what the destination carries (#98).
     pub headroom: f32,
 }
+
+#[cfg(test)]
+mod tests {
+    use wgpu::{
+        Backend, CompositeAlphaMode, SurfaceCapabilities, SurfaceColorSpace as Cs,
+        SurfaceColorSpaces as Spaces, SurfaceFormatCapabilities, TextureFormat as F, TextureUsages,
+    };
+
+    use super::{
+        DestinationPrimaries, OutputColor, SelectionReason, TransferEncoding, select_output,
+    };
+
+    /// A synthetic surface: `fc` is the (format, colour spaces) list, in
+    /// surface preference order; `auto` is what `formats` reports (the
+    /// Auto-usable subset, in the same order).
+    fn surface(
+        fc: &[(F, Spaces)],
+        auto: &[F],
+        alpha_modes: Vec<CompositeAlphaMode>,
+    ) -> SurfaceCapabilities {
+        SurfaceCapabilities {
+            formats: auto.to_vec(),
+            format_capabilities: fc
+                .iter()
+                .map(|&(format, color_spaces)| SurfaceFormatCapabilities {
+                    format,
+                    color_spaces,
+                })
+                .collect(),
+            present_modes: vec![wgpu::PresentMode::Fifo],
+            alpha_modes,
+            usages: TextureUsages::RENDER_ATTACHMENT,
+        }
+    }
+
+    fn opaque() -> Vec<CompositeAlphaMode> {
+        vec![CompositeAlphaMode::Opaque]
+    }
+
+    #[test]
+    fn metal_prefers_rgba16f_extended_display_p3() {
+        let caps = surface(
+            &[
+                (F::Bgra8UnormSrgb, Spaces::SRGB),
+                (
+                    F::Rgba16Float,
+                    Spaces::EXTENDED_DISPLAY_P3 | Spaces::EXTENDED_SRGB_LINEAR,
+                ),
+            ],
+            &[F::Bgra8UnormSrgb, F::Rgba16Float],
+            opaque(),
+        );
+        let sel = select_output(&caps, Backend::Metal, false, None).unwrap();
+        assert_eq!(sel.format, F::Rgba16Float);
+        assert_eq!(sel.color_space, Cs::ExtendedDisplayP3);
+        assert_eq!(sel.primaries, DestinationPrimaries::DisplayP3);
+        assert_eq!(sel.transfer, TransferEncoding::ExtendedSrgb);
+        assert_eq!(sel.reason, SelectionReason::PreferredHdr);
+        assert_eq!(sel.tone_map_ceiling.to_bits(), f32::MAX.to_bits());
+    }
+
+    #[test]
+    fn selection_pairs_formats_with_their_advertised_spaces_only() {
+        // Rgba16Float carries only extended spaces; Bgra8UnormSrgb only
+        // sRGB. A Cartesian product of the two lists would fabricate
+        // Rgba16Float+sRGB or Bgra8+P3 pairs the surface never advertised.
+        let caps = surface(
+            &[
+                (F::Bgra8UnormSrgb, Spaces::SRGB),
+                (F::Rgba16Float, Spaces::EXTENDED_SRGB_LINEAR),
+            ],
+            &[F::Bgra8UnormSrgb],
+            opaque(),
+        );
+        let sel = select_output(&caps, Backend::Metal, false, None).unwrap();
+        assert_eq!(
+            (sel.format, sel.color_space),
+            (F::Rgba16Float, Cs::ExtendedSrgbLinear)
+        );
+    }
+
+    #[test]
+    fn formats_absent_from_formats_reach_their_explicit_colour_space() {
+        // wgpu excludes explicit-opt-in formats from `formats`; a format
+        // advertised only under a non-Auto space is still selectable.
+        let caps = surface(
+            &[
+                (F::Bgra8UnormSrgb, Spaces::SRGB),
+                (F::Rgba16Float, Spaces::BT2100_PQ),
+            ],
+            &[F::Bgra8UnormSrgb],
+            opaque(),
+        );
+        let sel = select_output(&caps, Backend::Vulkan, false, None).unwrap();
+        assert_eq!(
+            (sel.format, sel.color_space),
+            (F::Rgba16Float, Cs::Bt2100Pq)
+        );
+        assert_eq!(sel.reason, SelectionReason::PreferredHdr);
+        assert!((sel.tone_map_ceiling - 10000.0 / 203.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn vulkan_prefers_extended_linear_over_pq() {
+        let caps = surface(
+            &[
+                (F::Bgra8UnormSrgb, Spaces::SRGB),
+                (
+                    F::Rgba16Float,
+                    Spaces::EXTENDED_SRGB_LINEAR | Spaces::BT2100_PQ,
+                ),
+                (F::Rgb10a2Unorm, Spaces::BT2100_PQ),
+            ],
+            &[F::Bgra8UnormSrgb, F::Rgba16Float],
+            opaque(),
+        );
+        let sel = select_output(&caps, Backend::Vulkan, false, None).unwrap();
+        assert_eq!(
+            (sel.format, sel.color_space),
+            (F::Rgba16Float, Cs::ExtendedSrgbLinear)
+        );
+    }
+
+    #[test]
+    fn vulkan_ten_bit_pq_wins_over_software_hdr() {
+        let caps = surface(
+            &[
+                (F::Bgra8UnormSrgb, Spaces::SRGB),
+                (F::Rgba16Float, Spaces::BT2100_PQ),
+                (F::Rgb10a2Unorm, Spaces::BT2100_PQ),
+            ],
+            &[F::Bgra8UnormSrgb, F::Rgba16Float, F::Rgb10a2Unorm],
+            opaque(),
+        );
+        let sel = select_output(&caps, Backend::Dx12, false, None).unwrap();
+        assert_eq!(
+            (sel.format, sel.color_space),
+            (F::Rgb10a2Unorm, Cs::Bt2100Pq)
+        );
+        assert_eq!(sel.primaries, DestinationPrimaries::Bt2100);
+        assert_eq!(sel.transfer, TransferEncoding::Pq);
+    }
+
+    #[test]
+    fn a_p3_only_surface_selects_wide_gamut_sdr() {
+        let caps = surface(
+            &[(F::Bgra8Unorm, Spaces::DISPLAY_P3)],
+            &[F::Bgra8Unorm],
+            opaque(),
+        );
+        let sel = select_output(&caps, Backend::Metal, false, None).unwrap();
+        assert_eq!(sel.color_space, Cs::DisplayP3);
+        assert_eq!(sel.reason, SelectionReason::WideGamutSdr);
+        assert_eq!(sel.primaries, DestinationPrimaries::DisplayP3);
+        assert_eq!(sel.transfer, TransferEncoding::Srgb);
+        assert_eq!(sel.tone_map_ceiling.to_bits(), 1.0f32.to_bits());
+    }
+
+    #[test]
+    fn an_srgb_only_surface_reports_sdr_explicitly() {
+        let caps = surface(
+            &[(F::Bgra8UnormSrgb, Spaces::SRGB)],
+            &[F::Bgra8UnormSrgb],
+            opaque(),
+        );
+        for backend in [Backend::Metal, Backend::Vulkan, Backend::Dx12] {
+            let sel = select_output(&caps, backend, false, None).unwrap();
+            assert_eq!(sel.color_space, Cs::Srgb);
+            assert_eq!(sel.reason, SelectionReason::Sdr, "{backend:?}");
+        }
+    }
+
+    #[test]
+    fn a_surface_without_explicit_spaces_uses_the_legacy_pair() {
+        // A backend that reports formats but no format_capabilities:
+        // the historical formats.first() + Auto configuration.
+        let caps = surface(&[], &[F::Bgra8UnormSrgb], opaque());
+        let sel = select_output(&caps, Backend::Metal, false, None).unwrap();
+        assert_eq!((sel.format, sel.color_space), (F::Bgra8UnormSrgb, Cs::Auto));
+        assert_eq!(sel.reason, SelectionReason::Sdr);
+    }
+
+    #[test]
+    fn an_empty_surface_is_unsupported() {
+        let caps = surface(&[], &[], opaque());
+        assert!(matches!(
+            select_output(&caps, Backend::Metal, false, None),
+            Err(cherenkov::SurfaceError::UnsupportedTarget(_))
+        ));
+    }
+
+    #[test]
+    fn a_required_colour_space_is_honoured() {
+        let caps = surface(
+            &[
+                (F::Bgra8UnormSrgb, Spaces::SRGB),
+                (
+                    F::Rgba16Float,
+                    Spaces::EXTENDED_DISPLAY_P3 | Spaces::BT2100_HLG,
+                ),
+            ],
+            &[F::Bgra8UnormSrgb, F::Rgba16Float],
+            opaque(),
+        );
+        let sel = select_output(&caps, Backend::Metal, false, Some(Cs::Bt2100Hlg)).unwrap();
+        assert_eq!(
+            (sel.format, sel.color_space),
+            (F::Rgba16Float, Cs::Bt2100Hlg)
+        );
+        assert_eq!(sel.reason, SelectionReason::Required);
+        assert_eq!(sel.transfer, TransferEncoding::Hlg);
+        assert!((sel.tone_map_ceiling - 1000.0 / 203.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn an_unadvertised_required_space_is_unsupported() {
+        let caps = surface(
+            &[(F::Bgra8UnormSrgb, Spaces::SRGB)],
+            &[F::Bgra8UnormSrgb],
+            opaque(),
+        );
+        for space in [Cs::Bt2100Pq, Cs::Bt2100Hlg, Cs::ExtendedDisplayP3] {
+            assert!(
+                matches!(
+                    select_output(&caps, Backend::Metal, false, Some(space)),
+                    Err(cherenkov::SurfaceError::UnsupportedTarget(_))
+                ),
+                "{space:?} must not be silently substituted"
+            );
+        }
+    }
+
+    #[test]
+    fn a_required_space_falls_back_to_the_surfaces_format_order() {
+        // The required space advertised on formats outside the preferred
+        // order still resolves — first advertised format for that space.
+        let caps = surface(
+            &[
+                (F::Bgra8Unorm, Spaces::DISPLAY_P3),
+                (F::Rgba8Unorm, Spaces::DISPLAY_P3),
+            ],
+            &[F::Bgra8Unorm],
+            opaque(),
+        );
+        let sel = select_output(&caps, Backend::Metal, false, Some(Cs::DisplayP3)).unwrap();
+        assert_eq!(sel.format, F::Bgra8Unorm);
+    }
+
+    #[test]
+    fn effective_headroom_clamps_to_the_destinations_range() {
+        let caps = surface(
+            &[
+                (F::Bgra8UnormSrgb, Spaces::SRGB),
+                (F::Rgba16Float, Spaces::EXTENDED_DISPLAY_P3),
+            ],
+            &[F::Bgra8UnormSrgb, F::Rgba16Float],
+            opaque(),
+        );
+        let sel = select_output(&caps, Backend::Metal, false, None).unwrap();
+        assert_eq!(sel.effective_headroom(4.0).to_bits(), 4.0f32.to_bits());
+        assert_eq!(sel.effective_headroom(0.0).to_bits(), 0.0f32.to_bits());
+
+        let sdr_caps = surface(
+            &[(F::Bgra8UnormSrgb, Spaces::SRGB)],
+            &[F::Bgra8UnormSrgb],
+            opaque(),
+        );
+        let sdr = select_output(&sdr_caps, Backend::Metal, false, None).unwrap();
+        assert_eq!(sdr.effective_headroom(8.0).to_bits(), 1.0f32.to_bits());
+
+        let pq_caps = surface(
+            &[
+                (F::Bgra8UnormSrgb, Spaces::SRGB),
+                (F::Rgba16Float, Spaces::BT2100_PQ),
+            ],
+            &[F::Bgra8UnormSrgb, F::Rgba16Float],
+            opaque(),
+        );
+        let pq = select_output(&pq_caps, Backend::Vulkan, false, None).unwrap();
+        assert!((pq.effective_headroom(1e6) - 10000.0 / 203.0).abs() < 1e-3);
+        assert_eq!(pq.effective_headroom(2.0).to_bits(), 2.0f32.to_bits());
+    }
+
+    #[test]
+    fn headroom_is_unknown_until_the_probe_reports() {
+        // `reported_headroom` stays None out of select_output — the live
+        // value arrives through the DisplayProbe or a non-Metal
+        // display_hdr_info read; unknown is never guessed as SDR.
+        let caps = surface(
+            &[(F::Rgba16Float, Spaces::EXTENDED_DISPLAY_P3)],
+            &[F::Rgba16Float],
+            opaque(),
+        );
+        let sel = select_output(&caps, Backend::Metal, false, None).unwrap();
+        assert!(sel.reported_headroom.is_none());
+    }
+
+    #[test]
+    fn a_transparent_window_needs_a_transparency_alpha_mode() {
+        let premul = surface(
+            &[
+                (F::Bgra8UnormSrgb, Spaces::SRGB),
+                (F::Rgba16Float, Spaces::EXTENDED_DISPLAY_P3),
+            ],
+            &[F::Bgra8UnormSrgb, F::Rgba16Float],
+            vec![
+                CompositeAlphaMode::Opaque,
+                CompositeAlphaMode::PreMultiplied,
+            ],
+        );
+        let sel = select_output(&premul, Backend::Metal, true, None).unwrap();
+        assert_eq!(sel.alpha_mode, CompositeAlphaMode::PreMultiplied);
+
+        let postmul = surface(
+            &[(F::Bgra8UnormSrgb, Spaces::SRGB)],
+            &[F::Bgra8UnormSrgb],
+            vec![
+                CompositeAlphaMode::Opaque,
+                CompositeAlphaMode::PostMultiplied,
+            ],
+        );
+        let sel = select_output(&postmul, Backend::Metal, true, None).unwrap();
+        assert_eq!(sel.alpha_mode, CompositeAlphaMode::PostMultiplied);
+
+        let opaque_only = surface(
+            &[(F::Bgra8UnormSrgb, Spaces::SRGB)],
+            &[F::Bgra8UnormSrgb],
+            vec![CompositeAlphaMode::Opaque],
+        );
+        assert!(matches!(
+            select_output(&opaque_only, Backend::Metal, true, None),
+            Err(cherenkov::SurfaceError::UnsupportedTarget(_))
+        ));
+    }
+
+    #[test]
+    fn an_opaque_window_prefers_opaque_alpha() {
+        let caps = surface(
+            &[(F::Bgra8UnormSrgb, Spaces::SRGB)],
+            &[F::Bgra8UnormSrgb],
+            vec![
+                CompositeAlphaMode::PreMultiplied,
+                CompositeAlphaMode::Opaque,
+            ],
+        );
+        let sel = select_output(&caps, Backend::Metal, false, None).unwrap();
+        assert_eq!(sel.alpha_mode, CompositeAlphaMode::Opaque);
+    }
+
+    #[test]
+    fn extended_p3_is_not_raw_linear_p3() {
+        // An ExtendedDisplayP3 surface gets the signed extended transfer
+        // — writing the retained linear-P3 values raw would be wrong.
+        let caps = surface(
+            &[(F::Rgba16Float, Spaces::EXTENDED_DISPLAY_P3)],
+            &[],
+            opaque(),
+        );
+        let sel = select_output(&caps, Backend::Metal, false, None).unwrap();
+        assert_eq!(sel.transfer, TransferEncoding::ExtendedSrgb);
+        assert!(matches!(sel.output_color(), OutputColor::ExtendedDisplayP3));
+    }
+}

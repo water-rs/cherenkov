@@ -230,6 +230,10 @@ pub struct ChangeSet<B: Backend> {
     pub ops: Vec<Op<B>>,
     /// Replaced pictures, cleared on the render thread, whose storage returns to the UI thread.
     pub recycled: Vec<(LayerId, Picture)>,
+    /// Whether recorded-content operands still animate: their tracks live
+    /// on the UI thread and need the next frame's sample, at the fast rate
+    /// class like a spring or curve on a layer.
+    pub animating: bool,
 }
 
 /// The render result and drained buffers returned to the UI thread.

@@ -71,6 +71,14 @@ pub const FLAG_HAS_MASK: u32 = 4;
 /// The clip mask is sampled from the bound mask texture instead of the
 /// atlas.
 pub const FLAG_MASK_TEXTURE: u32 = 8;
+/// A `PAINT_TEXTURE` source stores sRGB-encoded premultiplied pixels
+/// (the pass's declared [`cherenkov::BlendSpace::SrgbEncoded`] space)
+/// rather than linear ones; without it the texture is linear.
+pub const FLAG_TEX_SRGB: u32 = 0x10;
+/// A `PAINT_TEXTURE` composite blends in the source texture's space:
+/// the destination converts into it, the result converts back. Set when
+/// the isolated plane's storage space differs from the pass's.
+pub const FLAG_BLEND_SRC: u32 = 0x20;
 
 /// The shader's blend-mode code for a [`cherenkov::BlendMode`]; `0` keeps the
 /// fixed-function source-over composite. Matches `blend_mode` in the WGSL.
@@ -220,6 +228,10 @@ pub struct Globals {
     pub size: [f32; 2],
     /// Device-space origin of the target region.
     pub origin: [f32; 2],
+    /// The space the pass's target stores: `0` linear, `1` sRGB-encoded.
+    pub space: u32,
+    /// Padding to the uniform alignment.
+    pub pad: u32,
 }
 
 /// Converts a kurbo affine into the shader's `[a, b, c, d, e, f, 0, 0]`.
@@ -242,6 +254,6 @@ mod tests {
         assert_eq!(size_of::<Instance>(), 272);
         assert_eq!(size_of::<Shape>(), 32);
         assert_eq!(size_of::<Stop>(), 32);
-        assert_eq!(size_of::<Globals>(), 16);
+        assert_eq!(size_of::<Globals>(), 24);
     }
 }

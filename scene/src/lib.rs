@@ -29,13 +29,15 @@ pub use backdrop::{BackdropEffectSpec, BackdropFilter, BackdropGroup};
 pub use builder::{LayerBuilder, SceneBuilder};
 pub use color::{Color, ColorSpace};
 pub use draw::{
-    BlendMode, Draw, Extend, FillRule, Glyph, GlyphRun, GradientStop, ImageColorSpace,
+    BlendMode, BlendSpace, Draw, Extend, FillRule, Glyph, GlyphRun, GradientStop, ImageColorSpace,
     ImageEncoding, ImagePaint, LinearGradient, MeshColorInterpolation, MeshGradient,
     MeshGradientError, NormalizedCoord, Paint, RadialGradient, Sampling, StrokeStyle,
     SweepGradient,
 };
 pub use error::SceneError;
-pub use layer::{FilterBlend, Item, Layer, LayerFilter, Live, Motion, MotionAnimation};
+pub use layer::{
+    FilterBlend, Group, GroupItem, Item, Layer, LayerFilter, Live, Motion, MotionAnimation,
+};
 pub use scene::{Feature, Scene, WorkingSpace};
 pub use shape::{ContinuousRect, Shape};
 

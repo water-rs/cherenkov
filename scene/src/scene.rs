@@ -50,6 +50,8 @@ pub enum Feature {
     ImagePaint,
     /// A non-trivial blend mode (the payload is the mode).
     Blend(BlendMode),
+    /// A group compositing in a non-linear space (the payload is the space).
+    BlendSpace(crate::BlendSpace),
     /// Layer clips.
     Clip,
     /// A non-zero `scroll_offset` on a layer.
@@ -338,6 +340,29 @@ impl Scene {
     }
 }
 
+fn collect_draw_resource_refs(draw: &Draw, out: &mut Vec<ResourceHash>) {
+    match draw {
+        Draw::Glyphs(run) => {
+            out.push(run.font);
+            collect_paint_resources(&run.paint, out);
+        }
+        Draw::Image { image, .. } => out.push(*image),
+        Draw::Fill { paint, .. } | Draw::Stroke { paint, .. } => {
+            collect_paint_resources(paint, out);
+        }
+        Draw::Shadow { .. } => {}
+    }
+}
+
+fn collect_group_resource_refs(group: &crate::Group, out: &mut Vec<ResourceHash>) {
+    for item in &group.items {
+        match item {
+            crate::GroupItem::Draw(d) => collect_draw_resource_refs(d, out),
+            crate::GroupItem::Group(g) => collect_group_resource_refs(g, out),
+        }
+    }
+}
+
 fn collect_resource_refs(layer: &Layer, out: &mut Vec<ResourceHash>) {
     if let Some(crate::LayerFilter::BlendImage { image, .. }) = layer.filter.as_deref() {
         out.push(*image);
@@ -345,15 +370,8 @@ fn collect_resource_refs(layer: &Layer, out: &mut Vec<ResourceHash>) {
     for item in &layer.items {
         match item {
             Item::Layer(l) => collect_resource_refs(l, out),
-            Item::Draw(Draw::Glyphs(run)) => {
-                out.push(run.font);
-                collect_paint_resources(&run.paint, out);
-            }
-            Item::Draw(Draw::Image { image, .. }) => out.push(*image),
-            Item::Draw(Draw::Fill { paint, .. } | Draw::Stroke { paint, .. }) => {
-                collect_paint_resources(paint, out);
-            }
-            Item::Draw(Draw::Shadow { .. }) => {}
+            Item::Draw(d) => collect_draw_resource_refs(d, out),
+            Item::Group(g) => collect_group_resource_refs(g, out),
         }
     }
 }
@@ -371,21 +389,32 @@ impl Scene {
                 _ => None,
             }
         }
+        fn draw_encoding(draw: &Draw) -> Result<(), SceneError> {
+            match draw {
+                Draw::Image { encoding, .. } => encoding.validate(),
+                Draw::Fill { paint, .. }
+                | Draw::Stroke { paint, .. }
+                | Draw::Glyphs(crate::GlyphRun { paint, .. }) => {
+                    paint_encoding(paint).map_or(Ok(()), super::draw::ImageEncoding::validate)
+                }
+                Draw::Shadow { .. } => Ok(()),
+            }
+        }
+        fn visit_group(item_group: &crate::Group) -> Result<(), SceneError> {
+            for item in &item_group.items {
+                match item {
+                    crate::GroupItem::Draw(d) => draw_encoding(d)?,
+                    crate::GroupItem::Group(g) => visit_group(g)?,
+                }
+            }
+            Ok(())
+        }
         fn visit(layer: &Layer) -> Result<(), SceneError> {
             for item in &layer.items {
                 match item {
                     Item::Layer(l) => visit(l)?,
-                    Item::Draw(d) => match d {
-                        Draw::Image { encoding, .. } => encoding.validate()?,
-                        Draw::Fill { paint, .. }
-                        | Draw::Stroke { paint, .. }
-                        | Draw::Glyphs(crate::GlyphRun { paint, .. }) => {
-                            if let Some(encoding) = paint_encoding(paint) {
-                                encoding.validate()?;
-                            }
-                        }
-                        Draw::Shadow { .. } => {}
-                    },
+                    Item::Draw(d) => draw_encoding(d)?,
+                    Item::Group(g) => visit_group(g)?,
                 }
             }
             Ok(())
@@ -490,6 +519,74 @@ fn collect_shape_features(shape: &Shape, f: &mut BTreeSet<Feature>) {
     }
 }
 
+fn collect_draw_features(draw: &Draw, f: &mut BTreeSet<Feature>) {
+    match draw {
+        Draw::Fill { shape, rule, paint } => {
+            f.insert(Feature::Fill);
+            if *rule == crate::FillRule::EvenOdd {
+                f.insert(Feature::EvenOdd);
+            }
+            collect_shape_features(shape, f);
+            collect_paint_features(paint, f);
+        }
+        Draw::Stroke {
+            shape,
+            stroke,
+            paint,
+        } => {
+            f.insert(Feature::Stroke);
+            if !stroke.dash_pattern.is_empty() {
+                f.insert(Feature::StrokeDash);
+            }
+            collect_shape_features(shape, f);
+            collect_paint_features(paint, f);
+        }
+        Draw::Shadow { shape, color, .. } => {
+            f.insert(Feature::Shadow);
+            collect_shape_features(shape, f);
+            collect_color_features(color, f);
+        }
+        Draw::Glyphs(run) => {
+            f.insert(Feature::Glyphs);
+            if let Some(stroke) = &run.stroke {
+                f.insert(Feature::GlyphStroke);
+                if !stroke.dash_pattern.is_empty() {
+                    f.insert(Feature::StrokeDash);
+                }
+            }
+            if run.glyphs.iter().any(|g| g.transform.is_some()) {
+                f.insert(Feature::GlyphTransform);
+            }
+            if !run.normalized_coords.is_empty() {
+                f.insert(Feature::FontVariations);
+            }
+            collect_paint_features(&run.paint, f);
+        }
+        Draw::Image { encoding, .. } => {
+            f.insert(Feature::Image);
+            collect_encoding_features(encoding, f);
+        }
+    }
+}
+
+fn collect_group_features(group: &crate::Group, f: &mut BTreeSet<Feature>) {
+    if group.opacity < 1.0 {
+        f.insert(Feature::Opacity);
+    }
+    if group.blend != BlendMode::Normal {
+        f.insert(Feature::Blend(group.blend));
+    }
+    if group.blend_space != crate::BlendSpace::Linear {
+        f.insert(Feature::BlendSpace(group.blend_space));
+    }
+    for item in &group.items {
+        match item {
+            crate::GroupItem::Draw(d) => collect_draw_features(d, f),
+            crate::GroupItem::Group(g) => collect_group_features(g, f),
+        }
+    }
+}
+
 fn collect_layer_features(layer: &Layer, f: &mut BTreeSet<Feature>) {
     if layer.clip.is_some() {
         f.insert(Feature::Clip);
@@ -518,53 +615,8 @@ fn collect_layer_features(layer: &Layer, f: &mut BTreeSet<Feature>) {
     for item in &layer.items {
         match item {
             Item::Layer(l) => collect_layer_features(l, f),
-            Item::Draw(d) => match d {
-                Draw::Fill { shape, rule, paint } => {
-                    f.insert(Feature::Fill);
-                    if *rule == crate::FillRule::EvenOdd {
-                        f.insert(Feature::EvenOdd);
-                    }
-                    collect_shape_features(shape, f);
-                    collect_paint_features(paint, f);
-                }
-                Draw::Stroke {
-                    shape,
-                    stroke,
-                    paint,
-                } => {
-                    f.insert(Feature::Stroke);
-                    if !stroke.dash_pattern.is_empty() {
-                        f.insert(Feature::StrokeDash);
-                    }
-                    collect_shape_features(shape, f);
-                    collect_paint_features(paint, f);
-                }
-                Draw::Shadow { shape, color, .. } => {
-                    f.insert(Feature::Shadow);
-                    collect_shape_features(shape, f);
-                    collect_color_features(color, f);
-                }
-                Draw::Glyphs(run) => {
-                    f.insert(Feature::Glyphs);
-                    if let Some(stroke) = &run.stroke {
-                        f.insert(Feature::GlyphStroke);
-                        if !stroke.dash_pattern.is_empty() {
-                            f.insert(Feature::StrokeDash);
-                        }
-                    }
-                    if run.glyphs.iter().any(|g| g.transform.is_some()) {
-                        f.insert(Feature::GlyphTransform);
-                    }
-                    if !run.normalized_coords.is_empty() {
-                        f.insert(Feature::FontVariations);
-                    }
-                    collect_paint_features(&run.paint, f);
-                }
-                Draw::Image { encoding, .. } => {
-                    f.insert(Feature::Image);
-                    collect_encoding_features(encoding, f);
-                }
-            },
+            Item::Draw(d) => collect_draw_features(d, f),
+            Item::Group(g) => collect_group_features(g, f),
         }
     }
 }

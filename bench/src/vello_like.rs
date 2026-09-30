@@ -364,6 +364,15 @@ fn lower_layer<B>(
             Item::Draw(d) => {
                 lower_draw(lowered, d, content_tf, prepared, engine, paint_fn, image_fn)?;
             }
+            // Unreachable: scenes declaring `blend-space` fail the feature
+            // check; a group with no declared feature needs no support.
+            Item::Group(_) => {
+                return Err(BenchError::Unsupported {
+                    engine,
+                    feature: Feature::BlendSpace(cherenkov_scene::BlendSpace::SrgbEncoded),
+                    api: Some("vello: scoped group compositing"),
+                });
+            }
         }
     }
     if grouped {

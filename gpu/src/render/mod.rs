@@ -835,12 +835,12 @@ fn make_bind0(
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
-                // One 16-byte Globals window; the dynamic offset selects
+                // One 24-byte Globals window; the dynamic offset selects
                 // the pass's slot inside the buffer.
                 resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                     buffer: globals,
                     offset: 0,
-                    size: wgpu::BufferSize::new(16),
+                    size: wgpu::BufferSize::new(24),
                 }),
             },
             wgpu::BindGroupEntry {
@@ -1198,7 +1198,8 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
         ];
         let globals = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("globals"),
-            size: 16,
+            // One 256-byte stride slot: a single pass's Globals entry.
+            size: 256,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -1294,7 +1295,7 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             bound_atlas: 0,
             bound_instance_size: 272 * 16,
             bound_stop_size: 32 * 16,
-            bound_globals_size: 16,
+            bound_globals_size: 256,
             atlas,
             commit_writes: Vec::new(),
             pending_origins: Vec::new(),
@@ -1413,7 +1414,8 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
     ];
     let globals = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("globals"),
-        size: 16,
+        // One 256-byte stride slot: a single pass's Globals entry.
+        size: 256,
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -1509,7 +1511,7 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
         bound_atlas: 0,
         bound_instance_size: 272 * 16,
         bound_stop_size: 32 * 16,
-        bound_globals_size: 16,
+        bound_globals_size: 256,
         atlas,
         commit_writes: Vec::new(),
         pending_origins: Vec::new(),
@@ -2117,7 +2119,8 @@ impl Renderer for GpuRenderer {
         });
         self.globals = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("globals"),
-            size: 16,
+            // One 256-byte stride slot: a single pass's Globals entry.
+            size: 256,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -4075,6 +4078,7 @@ impl GpuRenderer {
                     let g = lower::globals(
                         [pass.region[2] as f32, pass.region[3] as f32],
                         [pass.region[0] as f32, pass.region[1] as f32],
+                        pass.space,
                     );
                     let g = bytemuck::bytes_of(&g);
                     entry[..g.len()].copy_from_slice(g);

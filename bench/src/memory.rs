@@ -462,7 +462,10 @@ pub(crate) fn wgpu29_allocator(
     })
 }
 
-#[cfg(any(feature = "skia", all(feature = "skia-metal", target_vendor = "apple")))]
+#[cfg(any(
+    all(feature = "skia", any(target_os = "linux", target_os = "android")),
+    all(feature = "skia-metal", target_vendor = "apple")
+))]
 pub(crate) fn skia_budget(api: &'static str, bytes: usize) -> Reading<SkiaBudget> {
     match u64::try_from(bytes) {
         Ok(bytes) => Reading::Measured(SkiaBudget { api, bytes }),
@@ -520,7 +523,7 @@ pub(crate) fn ash_vk_memory_budget(
     vk_memory_budget(instance, physical_device, adapter_name)
 }
 
-#[cfg(all(not(target_os = "linux"), feature = "skia"))]
+#[cfg(all(target_os = "android", feature = "skia"))]
 pub(crate) fn ash_vk_memory_budget(
     _instance: &ash::Instance,
     _physical_device: ash::vk::PhysicalDevice,

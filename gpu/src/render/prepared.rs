@@ -713,13 +713,17 @@ pub enum Op {
         /// Op index of the matching `End` op.
         end: u32,
     },
-    /// Open an isolation scope (`BeginGroup` with opacity < 1 or a
-    /// non-normal blend).
+    /// Open an isolation scope (`BeginGroup` with opacity < 1, a
+    /// non-normal blend or a non-linear blend space).
     BeginIsolate {
         /// The group opacity.
         opacity: f32,
         /// The group blend mode.
         blend: BlendMode,
+        /// The group's declared compositing space: members composite
+        /// with each other in it, then the group blends onto the
+        /// backdrop in it.
+        space: BlendSpace,
         /// Filter over the captured group.
         filter: Option<cherenkov::FilterId>,
         /// Op index of the matching `End` op.
@@ -752,9 +756,18 @@ impl cherenkov::lowering::Operation for Op {
             {
                 return false;
             }
-            (Self::BeginIsolate { blend: a, .. }, Self::BeginIsolate { blend: b, .. })
-                if a != b =>
-            {
+            (
+                Self::BeginIsolate {
+                    blend: a,
+                    space: sa,
+                    ..
+                },
+                Self::BeginIsolate {
+                    blend: b,
+                    space: sb,
+                    ..
+                },
+            ) if a != b || sa != sb => {
                 return false;
             }
             _ => {}
@@ -823,16 +836,15 @@ impl cherenkov::lowering::Compiler for Lowerer<'_> {
         group: &cherenkov::Group,
         isolate: bool,
     ) -> Result<Option<Op>, RenderError> {
-        if group.blend_space != BlendSpace::Linear {
-            return Err(RenderError::Unsupported(names::BLEND_SPACE));
-        }
         Ok((isolate
             || group.filter.is_some()
             || group.opacity < 1.0
-            || group.blend != BlendMode::Normal)
+            || group.blend != BlendMode::Normal
+            || group.blend_space != BlendSpace::Linear)
             .then_some(Op::BeginIsolate {
                 opacity: group.opacity,
                 blend: group.blend,
+                space: group.blend_space,
                 filter: group.filter,
                 end: 0,
             }))

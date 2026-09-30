@@ -117,13 +117,6 @@ fn srgb_encode(c: vec3<f32>) -> vec3<f32> {
     return select(hi, lo, c <= vec3<f32>(0.0031308));
 }
 
-// Linear sRGB -> linear Display P3 (column-major constructor: columns).
-const SRGB_TO_P3 = mat3x3<f32>(
-    vec3<f32>(0.8224621, 0.0331941, 0.0170827),
-    vec3<f32>(0.1775380, 0.9668058, 0.0723974),
-    vec3<f32>(0.0, 0.0, 0.9105199),
-);
-
 // Returns false when EXTEND_NONE leaves t outside [0,1] — the caller
 // returns transparent. NaN fails the range test and is also rejected.
 fn extend_ok(t: f32, mode: u32) -> bool {
@@ -521,7 +514,7 @@ fn fs_simple(in: VsOut) -> vec4<f32> {
         }
     }
     cov = clamp(cov, 0.0, 1.0) * in.params.y;
-    return vec4<f32>(in.color.rgb * in.color.a, in.color.a) * cov;
+    return move_space(vec4<f32>(in.color.rgb * in.color.a, in.color.a) * cov, SPACE_LINEAR, globals.space);
 }
 
 // The shadow kernel plus the same opacity/solid-colour tail.
@@ -536,7 +529,7 @@ fn fs_shadow(in: VsOut) -> vec4<f32> {
         cov = shadow(s, in.local, sigma);
     }
     cov = clamp(cov, 0.0, 1.0) * in.params.y;
-    return vec4<f32>(in.color.rgb * in.color.a, in.color.a) * cov;
+    return move_space(vec4<f32>(in.color.rgb * in.color.a, in.color.a) * cov, SPACE_LINEAR, globals.space);
 }
 
 fn fs_full(in: VsOut) -> vec4<f32> {
@@ -590,29 +583,43 @@ fn fs_full(in: VsOut) -> vec4<f32> {
     // the backdrop and the blended result.
     let inside_cov = clamp(cov, 0.0, 1.0);
     cov = inside_cov * in.params.y;
-    // A blended composite carries its mode in meta_.w bits 16-23: sample the
-    // source and backdrop, blend, and write the composited result verbatim
-    // (the pass runs the Replace pipeline).
+    // A PAINT_TEXTURE instance samples a target texture: a plain member
+    // sample (mode 0, no FLAG_BLEND_SRC) converts the texel into the
+    // pass's space and blends over by fixed function; a composite blends
+    // in the source texture's space — the mode in meta_.w bits 16-23,
+    // Normal when FLAG_BLEND_SRC only marks a space crossing — reading
+    // the backdrop explicitly (the pass runs the Replace pipeline).
     if in.meta_.y == PAINT_TEXTURE {
         let mode = (in.meta_.w >> 16u) & 0xffu;
-        if mode != 0u {
-            let coord = vec2<i32>(floor(in.pixel - instances[i].grad.xy));
-            if blend_is_destructive(mode) {
-                // Destructive operators composite over the whole region: a
-                // transparent source still writes over the backdrop.
-                let cs = textureLoad(source, coord, 0) * in.params.y;
-                let cb = textureLoad(backdrop, coord, 0);
-                return mix(cb, blend_color(mode, cb, cs), inside_cov);
-            }
-            let cs = textureLoad(source, coord, 0) * cov;
-            let cb = textureLoad(backdrop, coord, 0);
-            return blend_color(mode, cb, cs);
+        let tspace = select(SPACE_LINEAR, SPACE_SRGB, (flags & FLAG_TEX_SRGB) != 0u);
+        let coord = vec2<i32>(floor(in.pixel - instances[i].grad.xy));
+        if mode == 0u && (flags & FLAG_BLEND_SRC) == 0u {
+            return move_space(textureLoad(source, coord, 0), tspace, globals.space) * cov;
         }
+        let cb = textureLoad(backdrop, coord, 0);
+        if blend_is_destructive(mode) {
+            // Destructive operators composite over the whole region: a
+            // transparent source still writes over the backdrop.
+            let cs = textureLoad(source, coord, 0) * in.params.y;
+            return mix(cb, composite_space(mode, tspace, cb, cs), inside_cov);
+        }
+        let cs = textureLoad(source, coord, 0) * cov;
+        return composite_space(mode, tspace, cb, cs);
     }
     if in.meta_.y == PAINT_BACKDROP {
-        return paint_backdrop(i, in.pixel) * cov;
+        // The bound capture stores its own space (FLAG_TEX_SRGB): the
+        // effect evaluates on it and the result lands in globals.space.
+        let tspace = select(SPACE_LINEAR, SPACE_SRGB, (flags & FLAG_TEX_SRGB) != 0u);
+        return move_space(paint_backdrop(i, in.pixel) * cov, tspace, globals.space);
     }
-    return paint(i, in.meta_, in.color, in.local, in.pixel) * cov;
+    return move_space(paint(i, in.meta_, in.color, in.local, in.pixel) * cov, SPACE_LINEAR, globals.space);
+}
+
+// The isolated-plane composite: the source texel is already in blend
+// space `s`; the backdrop converts in and the blended result converts
+// back to the pass's storage space.
+fn composite_space(mode: u32, s: u32, cb: vec4<f32>, cs: vec4<f32>) -> vec4<f32> {
+    return move_space(blend_color(mode, move_space(cb, globals.space, s), cs), s, globals.space);
 }
 
 // W3C Compositing and Blending Level 1, a literal port of

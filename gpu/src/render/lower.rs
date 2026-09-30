@@ -20,9 +20,9 @@ use crate::render::filter::FilterKey;
 
 use crate::render::glyph::{self, Atlas, FontData, MaskCell, PathEmit, PendingRaster, glyph_key};
 use crate::render::instance::{
-    FLAG_HAS_CLIP, FLAG_HAS_INNER, FLAG_HAS_MASK, FLAG_MASK_TEXTURE, Globals, Instance, KIND_FILL,
-    KIND_GLYPH, KIND_SHADOW, KIND_SPAN, KIND_STROKE_DIST, KIND_STROKE_OFFSET, PAINT_IMAGE,
-    PAINT_SOLID, PAINT_TEXTURE, Shape, Stop, affine, blend_code,
+    FLAG_BLEND_SRC, FLAG_HAS_CLIP, FLAG_HAS_INNER, FLAG_HAS_MASK, FLAG_MASK_TEXTURE, FLAG_TEX_SRGB,
+    Globals, Instance, KIND_FILL, KIND_GLYPH, KIND_SHADOW, KIND_SPAN, KIND_STROKE_DIST,
+    KIND_STROKE_OFFSET, PAINT_IMAGE, PAINT_SOLID, PAINT_TEXTURE, Shape, Stop, affine, blend_code,
 };
 use crate::render::path;
 
@@ -109,6 +109,11 @@ pub struct Pass {
     pub clear: Option<[f32; 4]>,
     /// Draw calls.
     pub ranges: Vec<DrawRange>,
+    /// The space the target's premultiplied pixels are stored in: the
+    /// pass writes and blends in it. `Linear` everywhere except an
+    /// isolate scratch for a declared [`cherenkov::BlendSpace::SrgbEncoded`]
+    /// group, or a capture of one.
+    pub space: cherenkov::BlendSpace,
     /// Device-space `(x, y, w, h)` of the target this pass covers: the
     /// whole surface for [`Target::Surface`], the tight union bbox of its
     /// content for [`Target::Scratch`].
@@ -155,6 +160,8 @@ pub struct Frame {
 struct OpenPass {
     target: Target,
     clear: Option<[f32; 4]>,
+    /// The target's storage space, resolved when the pass opened.
+    space: cherenkov::BlendSpace,
     source: Option<Source>,
     image: Option<ImageSource>,
     /// The mask texture bound at group-1 binding 3, by key.
@@ -789,6 +796,16 @@ pub struct Lowering<'a> {
     clip_scratches: Vec<usize>,
     /// The nearest semantic isolation's target the capture copies from.
     semantic_target: Target,
+    /// The storage space of the enclosing level, innermost last; the
+    /// surface renders in `Linear` (the implicit base).
+    space_stack: Vec<cherenkov::BlendSpace>,
+    /// The storage space of each scratch target by depth index: a
+    /// semantic isolate's declared space, a clip-only level's parent
+    /// space, or the opening level's for shadow and capture scopes.
+    scratch_space: Vec<cherenkov::BlendSpace>,
+    /// Each backdrop capture texture's storage space (the semantic
+    /// target it copies), by group id.
+    capture_space: FxHashMap<u64, cherenkov::BlendSpace>,
 }
 
 impl<'a> Lowering<'a> {
@@ -818,6 +835,9 @@ impl<'a> Lowering<'a> {
             capture_isolation: false,
             clip_scratches: Vec::new(),
             semantic_target: Target::Surface,
+            space_stack: Vec::new(),
+            scratch_space: Vec::new(),
+            capture_space: FxHashMap::default(),
         }
     }
 
@@ -1047,11 +1067,39 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// The storage space of `target`: scratch and capture textures keep
+    /// the space recorded when their level or group opened.
+    fn target_space(&self, target: Target) -> cherenkov::BlendSpace {
+        match target {
+            Target::Surface => cherenkov::BlendSpace::Linear,
+            Target::Scratch(k) => self
+                .scratch_space
+                .get(k)
+                .copied()
+                .unwrap_or(cherenkov::BlendSpace::Linear),
+            Target::Backdrop { group, .. } => self
+                .capture_space
+                .get(&group)
+                .copied()
+                .unwrap_or(cherenkov::BlendSpace::Linear),
+        }
+    }
+
+    /// The storage space of the level currently being drawn into.
+    fn current_space(&self) -> cherenkov::BlendSpace {
+        self.space_stack
+            .last()
+            .copied()
+            .unwrap_or(cherenkov::BlendSpace::Linear)
+    }
+
     fn begin_pass(&mut self, target: Target, clear: Option<[f32; 4]>) {
         self.finish_pass();
+        let space = self.target_space(target);
         self.frame.open = Some(OpenPass {
             target,
             clear,
+            space,
             source: None,
             image: None,
             mask: None,
@@ -1105,6 +1153,7 @@ impl<'a> Lowering<'a> {
                 clear: open.clear,
                 ranges: open.ranges,
                 region,
+                space: open.space,
                 backdrop_copy: open.backdrop_copy,
                 capture: open.capture,
             });
@@ -1226,7 +1275,10 @@ impl<'a> Lowering<'a> {
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
-        reason = "surface size is a small positive float"
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "surface size is a small positive float; an isolate carries the
+        clip, style and pixel-space state of one scope"
     )]
     // Keep isolation's speculative buffers off the ordinary drawing walk's stack.
     #[inline(never)]
@@ -1236,12 +1288,14 @@ impl<'a> Lowering<'a> {
         filter: Option<cherenkov::FilterId>,
         opacity: f32,
         blend: cherenkov::BlendMode,
+        space: cherenkov::BlendSpace,
         mut body: impl FnMut(&mut Self, &GlyphContext<'_>) -> Result<(), RenderError>,
         glyphs: &GlyphContext<'_>,
     ) -> Result<(), RenderError> {
         if filter.is_none()
             && opacity < 1.0
             && blend == cherenkov::BlendMode::Normal
+            && space == self.current_space()
             && self.try_passthrough(opacity, inner_clip.is_none(), &mut body, glyphs)?
         {
             return Ok(());
@@ -1253,13 +1307,29 @@ impl<'a> Lowering<'a> {
         // Nested isolations split this scratch's open pass into segments;
         // every segment at this depth needs the region.
         let passes_start = self.frame.passes.len();
-        self.begin_pass(Target::Scratch(scratch), Some([0.0; 4]));
-        let inst_start = self.frame.instances.len();
         // Backdrop captures inside the body sample the nearest *semantic*
         // isolation's target; clip-only scratches between it and the
-        // member compose over the capture. Opacity, blend and filter
-        // isolations change what the member sees; clip-only ones do not.
-        let semantic = filter.is_some() || opacity < 1.0 || blend != cherenkov::BlendMode::Normal;
+        // member compose over the capture. Opacity, blend, space and
+        // filter isolations change what the member sees; clip-only ones
+        // do not.
+        let semantic = filter.is_some()
+            || opacity < 1.0
+            || blend != cherenkov::BlendMode::Normal
+            || space != cherenkov::BlendSpace::Linear;
+        // Members composite in the declared space; a clip-only level
+        // shares the space it merges back into.
+        let storage = if semantic {
+            space
+        } else {
+            self.current_space()
+        };
+        if self.scratch_space.len() <= scratch {
+            self.scratch_space
+                .resize(scratch + 1, cherenkov::BlendSpace::Linear);
+        }
+        self.scratch_space[scratch] = storage;
+        self.begin_pass(Target::Scratch(scratch), Some([0.0; 4]));
+        let inst_start = self.frame.instances.len();
         let saved_capture = self.capture_isolation;
         let saved_target = self.semantic_target;
         let saved_scratches = std::mem::take(&mut self.clip_scratches);
@@ -1270,7 +1340,9 @@ impl<'a> Lowering<'a> {
             self.clip_scratches.clone_from(&saved_scratches);
             self.clip_scratches.push(scratch);
         }
+        self.space_stack.push(storage);
         body(self, glyphs)?;
+        self.space_stack.pop();
         self.finish_pass();
         self.depth -= 1;
         self.set_clip(outer_clip);
@@ -1325,9 +1397,11 @@ impl<'a> Lowering<'a> {
             }
         }
         self.begin_pass(outer_target, None);
-        if blend != cherenkov::BlendMode::Normal {
-            // The blend composite samples the backdrop explicitly: the
-            // target's current contents are copied aside before this pass.
+        let dst_space = self.current_space();
+        if blend != cherenkov::BlendMode::Normal || storage != dst_space {
+            // A blended or cross-space composite samples the backdrop
+            // explicitly: the target's current contents are copied aside
+            // before this pass.
             if let Some(open) = &mut self.frame.open {
                 open.backdrop_copy = Some(region);
             }
@@ -1341,7 +1415,14 @@ impl<'a> Lowering<'a> {
         }
         #[expect(clippy::cast_precision_loss, reason = "region fits the surface")]
         let origin = [region[0] as f32, region[1] as f32];
-        self.emit_composite(Source::Scratch(scratch), origin, opacity, region, blend);
+        self.emit_composite(
+            Source::Scratch(scratch),
+            origin,
+            opacity,
+            region,
+            blend,
+            storage,
+        );
         if is_destructive(blend) {
             self.set_clip(outer_clip);
         }
@@ -1391,6 +1472,13 @@ impl<'a> Lowering<'a> {
         self.width = width as f32;
         self.height = height as f32;
         self.clip = None;
+        // The silhouette stores the enclosing level's space — it is
+        // member content, not an isolation.
+        if self.scratch_space.len() <= scratch {
+            self.scratch_space
+                .resize(scratch + 1, cherenkov::BlendSpace::Linear);
+        }
+        self.scratch_space[scratch] = self.current_space();
         self.begin_pass(Target::Scratch(scratch), Some([0.0; 4]));
         body(self, glyphs)?;
         self.finish_pass();
@@ -1418,6 +1506,9 @@ impl<'a> Lowering<'a> {
         instance.meta[1] = PAINT_TEXTURE;
         instance.grad[0] = -(px as f32);
         instance.grad[1] = -(py as f32);
+        if self.scratch_space[scratch] == cherenkov::BlendSpace::SrgbEncoded {
+            instance.meta[3] |= FLAG_TEX_SRGB << 24;
+        }
         self.set_source(Some(Source::Scratch(scratch)));
         self.push_instance(&instance);
         self.set_source(None);
@@ -1498,11 +1589,19 @@ impl<'a> Lowering<'a> {
             self.height as u32,
         );
         if region[2] != 0 && region[3] != 0 {
+            // The promoted pass stores the parent's space: the batch's
+            // members drew as if into the enclosing level.
+            if self.scratch_space.len() <= self.depth {
+                self.scratch_space
+                    .resize(self.depth + 1, cherenkov::BlendSpace::Linear);
+            }
+            self.scratch_space[self.depth] = open.space;
             self.frame.passes.push(Pass {
                 target: Target::Scratch(self.depth),
                 clear: Some([0.0; 4]),
                 ranges: open.ranges,
                 region,
+                space: open.space,
                 backdrop_copy: None,
                 capture: None,
             });
@@ -1517,6 +1616,7 @@ impl<'a> Lowering<'a> {
                 opacity,
                 region,
                 cherenkov::BlendMode::Normal,
+                open.space,
             );
         }
     }
@@ -1533,6 +1633,9 @@ impl<'a> Lowering<'a> {
         } else {
             Target::Scratch(self.depth - 1)
         };
+        // The capture texture stores the semantic target's space: the
+        // copies and the clip-only composites over it all stay in it.
+        self.capture_space.insert(gid, self.target_space(copy_from));
         for (r, region) in regions.iter().enumerate() {
             #[expect(clippy::cast_possible_truncation, reason = "regions fit u32")]
             let r = r as u32;
@@ -1560,6 +1663,7 @@ impl<'a> Lowering<'a> {
                     1.0,
                     *region,
                     cherenkov::BlendMode::Normal,
+                    self.target_space(copy_from),
                 );
             }
             self.clip_scratches = scratches;
@@ -1651,6 +1755,9 @@ impl<'a> Lowering<'a> {
                 pipeline = PipelineKind::Effect(s.shader.raw());
             }
         }
+        if self.capture_space.get(&gid).copied() == Some(cherenkov::BlendSpace::SrgbEncoded) {
+            inst.meta[3] |= FLAG_TEX_SRGB << 24;
+        }
         self.set_source(Some(Source::Backdrop {
             group: gid,
             region: r,
@@ -1664,7 +1771,10 @@ impl<'a> Lowering<'a> {
 
     /// Emits the composite quad sampling `source` at texel origin
     /// `origin` onto the current target, covering `region`
-    /// (`x, y, w, h` device pixels).
+    /// (`x, y, w, h` device pixels). `src_space` is the space the source
+    /// texture stores; the composite blends in it, so a source stored
+    /// unlike the current target forces the explicit-composite pipeline
+    /// even under `Normal`.
     fn emit_composite(
         &mut self,
         source: Source,
@@ -1672,6 +1782,7 @@ impl<'a> Lowering<'a> {
         opacity: f32,
         region: [u32; 4],
         blend: cherenkov::BlendMode,
+        src_space: cherenkov::BlendSpace,
     ) {
         #[expect(clippy::cast_precision_loss, reason = "region fits the surface")]
         let (rx, ry, rw, rh) = (
@@ -1692,15 +1803,30 @@ impl<'a> Lowering<'a> {
         // `grad.xy` carries the sampled texture's texel origin.
         inst.grad[0] = origin[0];
         inst.grad[1] = origin[1];
+        if src_space == cherenkov::BlendSpace::SrgbEncoded {
+            inst.meta[3] |= FLAG_TEX_SRGB << 24;
+        }
+        // The composite blends in the source level's space; a mismatch
+        // with the pass's storage needs the explicit-composite pipeline
+        // (the destination converts in and the result back).
+        let dst_space = self
+            .frame
+            .open
+            .as_ref()
+            .map_or_else(|| self.current_space(), |open| open.space);
+        let cross = src_space != dst_space;
+        if cross {
+            inst.meta[3] |= FLAG_BLEND_SRC << 24;
+        }
         let code = blend_code(blend);
-        if code != 0 {
+        if code != 0 || cross {
             inst.meta[3] |= code << 16;
             self.set_pipeline(PipelineKind::Replace);
         }
         self.set_source(Some(source));
         self.push_instance(&inst);
         self.set_source(None);
-        if code != 0 {
+        if code != 0 || cross {
             self.set_pipeline(PipelineKind::SrcOver);
         }
     }
@@ -1827,6 +1953,7 @@ impl<'a> Lowering<'a> {
                     None,
                     1.0,
                     cherenkov::BlendMode::Normal,
+                    cherenkov::BlendSpace::Linear,
                     body,
                     glyphs,
                 )
@@ -1862,6 +1989,7 @@ impl<'a> Lowering<'a> {
                     None,
                     1.0,
                     cherenkov::BlendMode::Normal,
+                    cherenkov::BlendSpace::Linear,
                     body,
                     glyphs,
                 ),
@@ -1924,6 +2052,9 @@ impl<'a> Lowering<'a> {
                 None,
                 node.opacity,
                 node.blend,
+                // Layers declare no space; their isolation composites
+                // in the enclosing level's linear storage.
+                cherenkov::BlendSpace::Linear,
                 |s, glyphs| {
                     s.with_clip(
                         node.clip.as_ref(),
@@ -1951,6 +2082,7 @@ impl<'a> Lowering<'a> {
                             node.filter,
                             node.opacity,
                             node.blend,
+                            cherenkov::BlendSpace::Linear,
                             |s, glyphs| s.layer_items(id, node, tree, caches, glyphs),
                             glyphs,
                         )
@@ -2084,6 +2216,7 @@ impl<'a> Lowering<'a> {
                 Op::BeginIsolate {
                     opacity,
                     blend,
+                    space,
                     filter,
                     end,
                 } => {
@@ -2092,6 +2225,7 @@ impl<'a> Lowering<'a> {
                         *filter,
                         *opacity,
                         *blend,
+                        *space,
                         |s, g| {
                             changed |=
                                 s.ops(source, ops, emissions, storage, i + 1..*end as usize, g)?;
@@ -3421,9 +3555,18 @@ fn device_rect(t: Affine, r: Rect) -> Rect {
 }
 
 /// The globals uniform for one pass: `size` is the target region's pixel
-/// size and `origin` its device-space origin.
-pub const fn globals(size: [f32; 2], origin: [f32; 2]) -> Globals {
-    Globals { size, origin }
+/// size, `origin` its device-space origin and `space` the space its
+/// premultiplied pixels are stored in.
+pub const fn globals(size: [f32; 2], origin: [f32; 2], space: cherenkov::BlendSpace) -> Globals {
+    Globals {
+        size,
+        origin,
+        space: match space {
+            cherenkov::BlendSpace::Linear => 0,
+            cherenkov::BlendSpace::SrgbEncoded => 1,
+        },
+        pad: 0,
+    }
 }
 
 /// An instance's device-space bounds: `bounds` transformed by `affine`,
@@ -3715,6 +3858,7 @@ mod tests {
                 None,
                 0.5,
                 cherenkov::BlendMode::Normal,
+                cherenkov::BlendSpace::Linear,
                 |s, g| {
                     calls += 1;
                     draw(
@@ -3796,6 +3940,7 @@ mod tests {
                 None,
                 1.0,
                 cherenkov::BlendMode::Clear,
+                cherenkov::BlendSpace::Linear,
                 |s, g| one_rect_body(s, g),
                 &glyphs,
             )
@@ -3806,6 +3951,7 @@ mod tests {
                 None,
                 1.0,
                 cherenkov::BlendMode::Multiply,
+                cherenkov::BlendSpace::Linear,
                 |s, g| one_rect_body(s, g),
                 &glyphs,
             )
@@ -3871,6 +4017,7 @@ mod tests {
                 None,
                 1.0,
                 cherenkov::BlendMode::DestAtop,
+                cherenkov::BlendSpace::Linear,
                 |s, g| one_rect_body(s, g),
                 &glyphs,
             )

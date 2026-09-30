@@ -1,9 +1,10 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{BackdropEffectSpec, BlendMode, Draw, ResourceHash, Shape};
+use crate::{BackdropEffectSpec, BlendMode, BlendSpace, Draw, ResourceHash, Shape};
 use kurbo::{Affine, Rect, Vec2};
 
-/// One item in a layer's ordered item list: a child layer or a draw command.
+/// One item in a layer's ordered item list: a child layer, a group of draws
+/// or a draw command.
 ///
 /// Serialized externally tagged (`{"draw": ..}` / `{"layer": ..}`): internally
 /// and untagged serde representations cannot nest enums within the buffered
@@ -15,6 +16,49 @@ pub enum Item {
     Draw(Draw),
     /// A child layer.
     Layer(Layer),
+    /// An isolated group of draws.
+    Group(Group),
+}
+
+/// One item in a [`Group`]'s ordered member list: a draw or a nested group.
+/// A group has no child layers — it scopes draw commands only, like the
+/// display-list group it maps to.
+///
+/// Serialized externally tagged, like [`Item`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GroupItem {
+    /// A draw command.
+    Draw(Draw),
+    /// A nested group.
+    Group(Group),
+}
+
+/// An isolated group of draws, the display-list `group`: members composite
+/// with each other in `blend_space`, then the group composites onto the
+/// enclosing level with `opacity` and `blend`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Group {
+    /// Ordered members.
+    #[serde(default)]
+    pub items: Vec<GroupItem>,
+    /// Group opacity, `0.0..=1.0`. `1.0` (the default) leaves alpha unchanged.
+    #[serde(default = "Group::default_opacity")]
+    pub opacity: f64,
+    /// The blend mode used when compositing onto the parent.
+    #[serde(default)]
+    pub blend: BlendMode,
+    /// The space the group blends and its members composite in: `linear`
+    /// (the default) composites premultiplied linear values; `srgb-encoded`
+    /// composites sRGB-encoded values.
+    #[serde(default)]
+    pub blend_space: BlendSpace,
+}
+
+impl Group {
+    const fn default_opacity() -> f64 {
+        1.0
+    }
 }
 
 /// A layer of the scene tree.

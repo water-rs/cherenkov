@@ -40,7 +40,7 @@ pub struct Scratch {
     /// `(w + 2) * band_rows` coverage cells, reused across bands.
     coverage: Vec<f32>,
     /// Isolation-stack colour buffers currently in use.
-    stack: Vec<Vec<[f32; 4]>>,
+    stack: Vec<Plane>,
     buffers: Buffers,
     /// This band's captured backdrops, by group id.
     captures: Captures,
@@ -64,6 +64,14 @@ struct Meter {
     captured: bool,
 }
 
+/// One isolation level's pixels: premultiplied in `space`.
+struct Plane {
+    /// The level's pixels.
+    buf: Vec<[f32; 4]>,
+    /// The level's storage space.
+    space: cherenkov::BlendSpace,
+}
+
 /// The rows one group's captured backdrop holds this band.
 struct Capture {
     /// `w × rows` premultiplied pixels starting at `y0`.
@@ -76,6 +84,8 @@ struct Capture {
     x0: usize,
     /// Row stride (the capture region's width).
     w: usize,
+    /// The space the captured rows are stored in.
+    space: cherenkov::BlendSpace,
 }
 
 /// This band's captures by backdrop group id.
@@ -409,10 +419,17 @@ fn clip_cov(clip: Option<&ClipRef>, w: usize, px: usize, py: usize) -> f32 {
     }
 }
 
-/// The buffer at the top of the isolation stack, or the band's
-/// framebuffer slice.
-fn top<'a>(fb: &'a mut [[f32; 4]], stack: &'a mut [Vec<[f32; 4]>]) -> &'a mut [[f32; 4]] {
-    stack.last_mut().map_or(fb, Vec::as_mut_slice)
+/// The buffer at the top of the isolation stack — or the band's
+/// framebuffer slice when the stack is empty — and the space its pixels
+/// are stored in.
+fn top<'a>(
+    fb: &'a mut [[f32; 4]],
+    fb_space: cherenkov::BlendSpace,
+    stack: &'a mut [Plane],
+) -> (&'a mut [[f32; 4]], cherenkov::BlendSpace) {
+    stack.last_mut().map_or((fb, fb_space), |plane| {
+        (plane.buf.as_mut_slice(), plane.space)
+    })
 }
 
 /// `src_over` composite of premultiplied `src` onto `dst`.
@@ -541,6 +558,44 @@ fn capture_sample(capture: &Capture, x: f32, y: f32) -> [f32; 4] {
     mix(mix(c00, c10, tx), mix(c01, c11, tx), ty)
 }
 
+/// Convert a premultiplied pixel between linear and sRGB-encoded
+/// storage (`convert_pixel` in `paint.rs`).
+fn move_space(px: [f32; 4], from: cherenkov::BlendSpace, to: cherenkov::BlendSpace) -> [f32; 4] {
+    if from == to {
+        px
+    } else {
+        super::paint::convert_pixel(px, to == cherenkov::BlendSpace::SrgbEncoded)
+    }
+}
+
+/// A member draw's linear premultiplied source in the level's storage
+/// space: members composite with each other in the level's space.
+fn member(px: [f32; 4], space: cherenkov::BlendSpace) -> [f32; 4] {
+    move_space(px, cherenkov::BlendSpace::Linear, space)
+}
+
+/// Composite `src` onto `dst` blending in `space`: each operand converts
+/// from its storage space, the blend applies, and the result lands back
+/// in the destination's storage space.
+fn composite(
+    mode: cherenkov::BlendMode,
+    space: cherenkov::BlendSpace,
+    dst_space: cherenkov::BlendSpace,
+    src_space: cherenkov::BlendSpace,
+    dst: [f32; 4],
+    src: [f32; 4],
+) -> [f32; 4] {
+    move_space(
+        super::blend::blend(
+            mode,
+            move_space(dst, dst_space, space),
+            move_space(src, src_space, space),
+        ),
+        space,
+        dst_space,
+    )
+}
+
 /// `(draws, edges)` stats for an item list.
 fn stats(items: &[Item]) -> (u32, u32) {
     let (mut draws, mut edges) = (0_u32, 0_u32);
@@ -638,8 +693,8 @@ fn shade(
     } else {
         shade_plain(items, slice, w, surface, h, coverage, scratch)
     };
-    for buf in scratch.stack.drain(..) {
-        scratch.buffers.give_color(buf);
+    for plane in scratch.stack.drain(..) {
+        scratch.buffers.give_color(plane.buf);
     }
     if scratch.buffers.meter.captured
         && let Some(peak) = peak
@@ -664,7 +719,12 @@ fn shade_plain(
 ) -> Result<(), cherenkov::RenderError> {
     let (y0, y1) = surface;
     let mut acc = Accum::with_buffer(w, y1 - y0, coverage);
-    let mut band = Band { fb: slice, w, y0 };
+    let mut band = Band {
+        fb: slice,
+        w,
+        y0,
+        space: cherenkov::BlendSpace::Linear,
+    };
     let result = run(
         items,
         0..items.len(),
@@ -724,6 +784,7 @@ fn shade_windowed(
         fb: &mut window,
         w,
         y0: win0,
+        space: cherenkov::BlendSpace::Linear,
     };
     let first_pass = run(
         items,
@@ -743,10 +804,12 @@ fn shade_windowed(
         // and each live isolation buffer shrinks to band size.
         let first = (y0 - win0) * w;
         slice.copy_from_slice(&window[first..first + w * bh]);
-        for buf in &mut scratch.stack {
+        for plane in &mut scratch.stack {
             let mut cropped = scratch.buffers.take_color(w * bh);
-            cropped.copy_from_slice(&buf[first..first + w * bh]);
-            scratch.buffers.give_color(std::mem::replace(buf, cropped));
+            cropped.copy_from_slice(&plane.buf[first..first + w * bh]);
+            scratch
+                .buffers
+                .give_color(std::mem::replace(&mut plane.buf, cropped));
         }
     }
     scratch.buffers.give_color(window);
@@ -755,7 +818,12 @@ fn shade_windowed(
         return Err(error);
     }
     let mut acc = Accum::with_buffer(w, bh, acc.into_buffer());
-    let mut band = Band { fb: slice, w, y0 };
+    let mut band = Band {
+        fb: slice,
+        w,
+        y0,
+        space: cherenkov::BlendSpace::Linear,
+    };
     let result = run(
         items,
         last + 1..items.len(),
@@ -921,7 +989,7 @@ fn run(
     range: Range<usize>,
     band: &mut Band<'_>,
     acc: &mut Accum,
-    stack: &mut Vec<Vec<[f32; 4]>>,
+    stack: &mut Vec<Plane>,
     buffers: &mut Buffers,
     ctx: &mut FrameCtx<'_>,
 ) -> Result<(), cherenkov::RenderError> {
@@ -937,20 +1005,30 @@ fn run(
                 paint,
                 clip,
             } => band.draw(acc, stack, edges, *bbox, *rule, paint, clip.as_ref()),
-            Item::PushIsolate => stack.push(buffers.take_color(slice_len(band.w, bh))),
+            Item::PushIsolate { space } => stack.push(Plane {
+                buf: buffers.take_color(slice_len(band.w, bh)),
+                space: *space,
+            }),
             Item::PopIsolate {
                 opacity,
                 blend,
                 clip,
             } => {
-                let Some(scratch) = stack.pop() else {
+                let Some(plane) = stack.pop() else {
                     i += 1;
                     continue;
                 };
-                band.composite_isolate(&scratch, *opacity, *blend, clip.as_ref(), stack);
-                buffers.give_color(scratch);
+                band.composite_isolate(
+                    &plane.buf,
+                    plane.space,
+                    *opacity,
+                    *blend,
+                    clip.as_ref(),
+                    stack,
+                );
+                buffers.give_color(plane.buf);
             }
-            Item::PushFilter { end, apron } => {
+            Item::PushFilter { end, apron, space } => {
                 let scope_end = usize::try_from(*end)
                     .map_err(|_| cherenkov::RenderError::Render("invalid filter scope".into()))?;
                 if scope_end <= i || scope_end >= range.end {
@@ -979,6 +1057,7 @@ fn run(
                         fb: &mut window,
                         w: band.w,
                         y0: top,
+                        space: *space,
                     };
                     let mut filter_acc = Accum::with_buffer(band.w, bottom - top, coverage);
                     let mut filter_stack = Vec::new();
@@ -991,8 +1070,8 @@ fn run(
                         buffers,
                         ctx,
                     );
-                    for buf in filter_stack {
-                        buffers.give_color(buf);
+                    for plane in filter_stack {
+                        buffers.give_color(plane.buf);
                     }
                     buffers.give_coverage(filter_acc.into_buffer());
                     result
@@ -1007,7 +1086,7 @@ fn run(
                 }
                 let first = (band.y0 - top) * band.w;
                 let central = &window[first..first + band.fb.len()];
-                band.composite_isolate(central, *opacity, *blend, clip.as_ref(), stack);
+                band.composite_isolate(central, *space, *opacity, *blend, clip.as_ref(), stack);
                 buffers.give_color(window);
                 i = scope_end;
             }
@@ -1102,7 +1181,7 @@ fn apply_filter(
 )]
 fn capture_band(
     band: &Band<'_>,
-    stack: &[Vec<[f32; 4]>],
+    stack: &[Plane],
     buffers: &mut Buffers,
     ctx: &mut FrameCtx<'_>,
     group: u64,
@@ -1140,10 +1219,21 @@ fn capture_band(
     }
     let mut canvas = buffers.take_color(rw * rows);
     let base = stack.len() - flatten;
+    // The flattened clip-only levels share the semantic level's storage
+    // space, so the capture copies and composites in it raw.
+    let space = if base == 0 {
+        band.space
+    } else {
+        stack[base - 1].space
+    };
     {
         // The nearest semantic level: the framebuffer when every live
         // level is clip-only, else the level below the flattened ones.
-        let src: &[[f32; 4]] = if base == 0 { band.fb } else { &stack[base - 1] };
+        let src: &[[f32; 4]] = if base == 0 {
+            band.fb
+        } else {
+            &stack[base - 1].buf
+        };
         for row in win0..win1 {
             let dst = &mut canvas[(row - win0) * rw..(row - win0) * rw + rw];
             dst.copy_from_slice(&src[(row - band.y0) * w + rx0..(row - band.y0) * w + rx0 + rw]);
@@ -1155,7 +1245,7 @@ fn capture_band(
         for row in win0..win1 {
             for px in 0..rw {
                 let dst = &mut canvas[(row - win0) * rw + px];
-                *dst = src_over(*dst, level[(row - band.y0) * w + rx0 + px]);
+                *dst = src_over(*dst, level.buf[(row - band.y0) * w + rx0 + px]);
             }
         }
     }
@@ -1175,6 +1265,7 @@ fn capture_band(
             rows: kept_rows,
             x0: rx0,
             w: rw,
+            space,
         },
     );
     Ok(())
@@ -1188,6 +1279,9 @@ struct Band<'a> {
     w: usize,
     /// Device y of the band's first row.
     y0: usize,
+    /// The space the framebuffer stores (`Linear` for the surface, the
+    /// scope's declared space inside a filtered scope).
+    space: cherenkov::BlendSpace,
 }
 
 impl Band<'_> {
@@ -1200,7 +1294,7 @@ impl Band<'_> {
     fn draw(
         &mut self,
         acc: &mut Accum,
-        stack: &mut Vec<Vec<[f32; 4]>>,
+        stack: &mut Vec<Plane>,
         edges: &[Edge],
         bbox: crate::render::lower::IRect,
         rule: FillRule,
@@ -1249,8 +1343,8 @@ impl Band<'_> {
                 let src = paint
                     .eval(x as f32 + 0.5, py as f32 + 0.5)
                     .map(|v| v * cov * cc);
-                let dst = top(&mut *self.fb, stack.as_mut_slice());
-                dst[y * self.w + x] = src_over(dst[y * self.w + x], src);
+                let (dst, space) = top(&mut *self.fb, self.space, stack.as_mut_slice());
+                dst[y * self.w + x] = src_over(dst[y * self.w + x], member(src, space));
             });
         }
     }
@@ -1270,7 +1364,7 @@ impl Band<'_> {
     )]
     fn shadow(
         &mut self,
-        stack: &mut Vec<Vec<[f32; 4]>>,
+        stack: &mut Vec<Plane>,
         rbox: &[f32; 4],
         radii: &[f32; 4],
         sigma_eff: f32,
@@ -1370,7 +1464,7 @@ impl Band<'_> {
             if n == 0 || s <= 0.0 {
                 continue;
             }
-            let dst = top(&mut *self.fb, stack.as_mut_slice());
+            let (dst, space) = top(&mut *self.fb, self.space, stack.as_mut_slice());
             if flat {
                 // Separable: `cov = x_term[px] * s` across the row.
                 let t = x_term.get_or_insert_with(|| {
@@ -1392,7 +1486,7 @@ impl Band<'_> {
                         continue;
                     }
                     let src = color.map(|v| v * cov.clamp(0.0, 1.0) * cc);
-                    dst[y * self.w + x] = src_over(dst[y * self.w + x], src);
+                    dst[y * self.w + x] = src_over(dst[y * self.w + x], member(src, space));
                 }
                 continue;
             }
@@ -1405,7 +1499,7 @@ impl Band<'_> {
             let x_in_hi = usize::try_from((cx + xrm - margin + 0.5).floor() as i32 + 1)
                 .unwrap_or(0)
                 .clamp(x_in_lo, cx_hi);
-            let dst = top(&mut *self.fb, stack.as_mut_slice());
+            let (dst, space) = top(&mut *self.fb, self.space, stack.as_mut_slice());
             let edge = |dst: &mut [[f32; 4]], f: usize, t: usize| {
                 for x in f..t {
                     let px = x as f32 + 0.5 - cx;
@@ -1424,7 +1518,7 @@ impl Band<'_> {
                         continue;
                     }
                     let src = color.map(|v| v * cov.clamp(0.0, 1.0) * cc);
-                    dst[y * self.w + x] = src_over(dst[y * self.w + x], src);
+                    dst[y * self.w + x] = src_over(dst[y * self.w + x], member(src, space));
                 }
             };
             edge(&mut *dst, cx_lo, x_in_lo);
@@ -1434,7 +1528,7 @@ impl Band<'_> {
                     continue;
                 }
                 let src = color.map(|v| v * s.clamp(0.0, 1.0) * cc);
-                dst[y * self.w + x] = src_over(dst[y * self.w + x], src);
+                dst[y * self.w + x] = src_over(dst[y * self.w + x], member(src, space));
             }
             edge(&mut *dst, x_in_hi, cx_hi);
         }
@@ -1451,7 +1545,7 @@ impl Band<'_> {
         bounds: IRect,
         clip: Option<&ClipRef>,
         effect: &SampleEffect,
-        stack: &mut [Vec<[f32; 4]>],
+        stack: &mut [Plane],
     ) {
         let bh = self.fb.len() / self.w;
         let y_lo = usize::try_from(bounds.y0)
@@ -1473,7 +1567,7 @@ impl Band<'_> {
         if y_lo >= y_hi || x_lo >= x_hi {
             return;
         }
-        let dst = top(&mut *self.fb, stack);
+        let (dst, space) = top(&mut *self.fb, self.space, stack);
         for py in y_lo..y_hi {
             let row = (py - self.y0) * self.w;
             let crow = (py - capture.y0) * capture.w;
@@ -1488,7 +1582,7 @@ impl Band<'_> {
                     SampleEffect::Sdf(sdf) => sdf_sample(capture, sdf, px, py, crow),
                 };
                 let src = c.map(|v| v * cc);
-                dst[row + px] = src_over(dst[row + px], src);
+                dst[row + px] = src_over(dst[row + px], move_space(src, capture.space, space));
             }
         }
     }
@@ -1503,7 +1597,7 @@ impl Band<'_> {
     )]
     fn glyph(
         &mut self,
-        stack: &mut Vec<Vec<[f32; 4]>>,
+        stack: &mut Vec<Plane>,
         slot: &std::sync::OnceLock<std::sync::Arc<crate::render::glyph::GlyphMask>>,
         ox: i32,
         oy: i32,
@@ -1547,27 +1641,31 @@ impl Band<'_> {
                 let src = paint
                     .eval(x as f32 + 0.5, py as f32 + 0.5)
                     .map(|v| v * cov * cc);
-                let dst = top(&mut *self.fb, stack.as_mut_slice());
-                dst[y * self.w + x] = src_over(dst[y * self.w + x], src);
+                let (dst, space) = top(&mut *self.fb, self.space, stack.as_mut_slice());
+                dst[y * self.w + x] = src_over(dst[y * self.w + x], member(src, space));
             }
         }
     }
 
-    /// Composites the popped isolation buffer onto the buffer below.
+    /// Composites the popped isolation buffer onto the buffer below:
+    /// the blend runs in the popped level's storage space (`src_space`),
+    /// which is its declared `blend_space` for a semantic level or the
+    /// parent's for a clip-only one — members already composited in it.
     fn composite_isolate(
         &mut self,
         scratch: &[[f32; 4]],
+        src_space: cherenkov::BlendSpace,
         opacity: f32,
         blend: (cherenkov::BlendMode, cherenkov::BlendSpace),
         clip: Option<&ClipRef>,
-        stack: &mut Vec<Vec<[f32; 4]>>,
+        stack: &mut Vec<Plane>,
     ) {
-        let dst = top(&mut *self.fb, stack.as_mut_slice());
+        let (dst, dst_space) = top(&mut *self.fb, self.space, stack.as_mut_slice());
         for (i, &src) in scratch.iter().enumerate() {
             let px = i % self.w;
             let py = self.y0 + i / self.w;
             let cc = clip_cov(clip, self.w, px, py);
-            if blend == (cherenkov::BlendMode::Normal, cherenkov::BlendSpace::Linear) {
+            if blend.0 == cherenkov::BlendMode::Normal && src_space == dst_space {
                 let s = src.map(|v| v * opacity * cc);
                 dst[i] = src_over(dst[i], s);
             } else if super::blend::is_destructive(blend.0) {
@@ -1575,7 +1673,8 @@ impl Band<'_> {
                 // and DestIn; multiplying only source alpha is not equivalent.
                 if cc > 0.0 {
                     let source = src.map(|value| value * opacity);
-                    let result = super::blend::in_space(blend.0, blend.1, dst[i], source);
+                    let result =
+                        composite(blend.0, src_space, dst_space, src_space, dst[i], source);
                     dst[i] = if cc >= 1.0 {
                         result
                     } else {
@@ -1589,7 +1688,7 @@ impl Band<'_> {
                 // for a transparent source, so the clip coverage scales the
                 // source instead of bounding the whole composite.
                 let s = src.map(|v| v * opacity * cc);
-                dst[i] = super::blend::in_space(blend.0, blend.1, dst[i], s);
+                dst[i] = composite(blend.0, src_space, dst_space, src_space, dst[i], s);
             }
         }
     }

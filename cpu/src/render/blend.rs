@@ -207,27 +207,6 @@ pub fn blend(mode: BlendMode, cb: [f32; 4], cs: [f32; 4]) -> [f32; 4] {
     out
 }
 
-/// Resolve a group in its selected compositing space and return linear P3.
-pub fn in_space(
-    mode: BlendMode,
-    space: cherenkov::BlendSpace,
-    backdrop: [f32; 4],
-    source: [f32; 4],
-) -> [f32; 4] {
-    use super::paint::convert_pixel;
-    if space == cherenkov::BlendSpace::Linear {
-        return blend(mode, backdrop, source);
-    }
-    convert_pixel(
-        blend(
-            mode,
-            convert_pixel(backdrop, true),
-            convert_pixel(source, true),
-        ),
-        false,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -173,7 +173,8 @@ impl Group {
         Self { blend, ..self }
     }
 
-    /// Sets the blend space.
+    /// Sets the blend space: members composite with each other in this
+    /// space, and the group composites onto its backdrop in it.
     #[must_use]
     pub const fn blend_space(self, blend_space: BlendSpace) -> Self {
         Self {

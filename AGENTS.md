@@ -85,3 +85,6 @@ contract; the per-decision log is issue #2.
   wholesale; each commit gets a recorded verdict.
 - **Measurements say what they cover.** Every report names both builds by
   commit and states what each measured interval includes.
+- **Source files carry no copyright or license header.** The license is stated
+  by the LICENSE files and each crate's `license` field; a new file starts with
+  its code or its module documentation.

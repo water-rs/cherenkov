@@ -759,9 +759,11 @@ pub mod web {
     /// implementation keeps alive while they execute.
     ///
     /// Sources that cannot meet that contract are rejected, never copied: a
-    /// `GPUExternalTexture`, a transient handle such as a context's current
-    /// canvas texture, or a producer that cannot promise immutable storage
-    /// for the lease period.
+    /// `GPUExternalTexture`, or a producer that cannot promise immutable
+    /// storage for the lease period. Transient handles such as a context's
+    /// current canvas texture cannot be detected — they satisfy every
+    /// reflected check — so they are excluded by the contract and must not
+    /// be offered.
     pub struct WebTexture {
         /// The producer's `GPUTexture` handle.
         pub texture: webgpu::GpuTexture,

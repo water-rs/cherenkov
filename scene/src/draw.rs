@@ -121,6 +121,19 @@ impl BlendMode {
     ];
 }
 
+/// The space a [`crate::Group`] blends and its members composite in.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum BlendSpace {
+    /// Premultiplied linear working-space values.
+    #[default]
+    Linear,
+    /// sRGB-encoded values, for web compatibility.
+    SrgbEncoded,
+}
+
 /// Edge behaviour of a gradient or image pattern outside its domain.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]

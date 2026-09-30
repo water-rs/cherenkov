@@ -287,32 +287,54 @@ fn visit(p: &mut Prepared, layer: &Layer, blobs: &Blobs) -> Result<(), BenchErro
     for item in &layer.items {
         match item {
             Item::Layer(l) => visit(p, l, blobs)?,
-            Item::Draw(d) => match d {
-                Draw::Glyphs(run) => {
-                    let bytes = blobs
-                        .get(&run.font)
-                        .ok_or(cherenkov_scene::SceneError::MissingResource(run.font))?;
-                    p.fonts
-                        .entry((run.font, run.font_index))
-                        .or_insert_with(|| {
-                            FontData::new(Blob::new(Arc::new(bytes.clone())), run.font_index)
-                        });
-                    let coords = coord_bits(bytes, &run.normalized_coords);
-                    let entry = p.coords.entry(run.font).or_default();
-                    if entry.iter().all(|(cs, _)| cs != &run.normalized_coords) {
-                        entry.push((run.normalized_coords.clone(), coords));
-                    }
-                }
-                Draw::Fill { paint, .. } | Draw::Stroke { paint, .. } => {
-                    if let Some(ip) = image_paint(paint) {
-                        p.decode(ip.image, blobs)?;
-                    }
-                }
-                Draw::Shadow { .. } => {}
-                Draw::Image { image, .. } => {
-                    p.decode(*image, blobs)?;
-                }
-            },
+            Item::Group(g) => visit_group(p, g, blobs)?,
+            Item::Draw(d) => visit_draw(p, d, blobs)?,
+        }
+    }
+    Ok(())
+}
+
+/// [`visit`] over a group's member list (draws and nested groups only).
+fn visit_group(
+    p: &mut Prepared,
+    group: &cherenkov_scene::Group,
+    blobs: &Blobs,
+) -> Result<(), BenchError> {
+    for item in &group.items {
+        match item {
+            cherenkov_scene::GroupItem::Draw(d) => visit_draw(p, d, blobs)?,
+            cherenkov_scene::GroupItem::Group(g) => visit_group(p, g, blobs)?,
+        }
+    }
+    Ok(())
+}
+
+/// One draw's fonts and image payloads, registered into `p`.
+fn visit_draw(p: &mut Prepared, d: &Draw, blobs: &Blobs) -> Result<(), BenchError> {
+    match d {
+        Draw::Glyphs(run) => {
+            let bytes = blobs
+                .get(&run.font)
+                .ok_or(cherenkov_scene::SceneError::MissingResource(run.font))?;
+            p.fonts
+                .entry((run.font, run.font_index))
+                .or_insert_with(|| {
+                    FontData::new(Blob::new(Arc::new(bytes.clone())), run.font_index)
+                });
+            let coords = coord_bits(bytes, &run.normalized_coords);
+            let entry = p.coords.entry(run.font).or_default();
+            if entry.iter().all(|(cs, _)| cs != &run.normalized_coords) {
+                entry.push((run.normalized_coords.clone(), coords));
+            }
+        }
+        Draw::Fill { paint, .. } | Draw::Stroke { paint, .. } => {
+            if let Some(ip) = image_paint(paint) {
+                p.decode(ip.image, blobs)?;
+            }
+        }
+        Draw::Shadow { .. } => {}
+        Draw::Image { image, .. } => {
+            p.decode(*image, blobs)?;
         }
     }
     Ok(())
@@ -331,16 +353,27 @@ pub fn image_paint(paint: &Paint) -> Option<&ImagePaint> {
 /// Image hashes referenced by `Paint::Image` inside glyph-run paints
 /// (the draw walk above only inspects top-level paints).
 fn paint_images(scene: &Scene) -> Vec<ResourceHash> {
+    fn visit_draw(d: &Draw, out: &mut Vec<ResourceHash>) {
+        if let Draw::Glyphs(run) = d
+            && let Some(ip) = image_paint(&run.paint)
+        {
+            out.push(ip.image);
+        }
+    }
+    fn visit_group(group: &cherenkov_scene::Group, out: &mut Vec<ResourceHash>) {
+        for item in &group.items {
+            match item {
+                cherenkov_scene::GroupItem::Draw(d) => visit_draw(d, out),
+                cherenkov_scene::GroupItem::Group(g) => visit_group(g, out),
+            }
+        }
+    }
     fn visit(layer: &Layer, out: &mut Vec<ResourceHash>) {
         for item in &layer.items {
             match item {
                 Item::Layer(l) => visit(l, out),
-                Item::Draw(Draw::Glyphs(run)) => {
-                    if let Some(ip) = image_paint(&run.paint) {
-                        out.push(ip.image);
-                    }
-                }
-                Item::Draw(_) => {}
+                Item::Draw(d) => visit_draw(d, out),
+                Item::Group(g) => visit_group(g, out),
             }
         }
     }
@@ -910,6 +943,17 @@ pub fn count_layer(layer: &Layer, counters: &mut Counters) {
                 | Draw::Glyphs(_)
                 | Draw::Image { .. },
             ) => counters.draw_commands += 1,
+            Item::Group(g) => count_group(g, counters),
+        }
+    }
+}
+
+/// [`count_layer`] over a group's member list.
+fn count_group(group: &cherenkov_scene::Group, counters: &mut Counters) {
+    for item in &group.items {
+        match item {
+            cherenkov_scene::GroupItem::Draw(_) => counters.draw_commands += 1,
+            cherenkov_scene::GroupItem::Group(g) => count_group(g, counters),
         }
     }
 }

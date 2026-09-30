@@ -17,9 +17,10 @@ use cherenkov_cpu::{Raster, RasterConfig};
 use cherenkov_oracle::color::to_working;
 use cherenkov_oracle::present::presented_srgb_to_working;
 use cherenkov_scene::{
-    BackdropEffectSpec, BackdropFilter, BlendMode, ColorSpace, Draw as SceneDraw, Extend, Feature,
-    FilterBlend, GlyphRun as SceneGlyphRun, ImageColorSpace, ImageEncoding, Item,
-    Layer as SceneLayer, LayerFilter, Paint as ScenePaint, ResourceHash, Shape,
+    BackdropEffectSpec, BackdropFilter, BlendMode, BlendSpace, ColorSpace, Draw as SceneDraw,
+    Extend, Feature, FilterBlend, GlyphRun as SceneGlyphRun, GroupItem, ImageColorSpace,
+    ImageEncoding, Item, Layer as SceneLayer, LayerFilter, Paint as ScenePaint, ResourceHash,
+    Shape,
 };
 use filtrate::{FilterExt, FilterImage, filters};
 use kurbo::{Affine, BezPath, Circle, Ellipse, Line, Rect, RoundedRect, Vec2};
@@ -82,6 +83,13 @@ enum Op {
         run: cherenkov::GlyphRun,
         /// The paint.
         paint: cherenkov::Paint,
+    },
+    /// `Item::Group` — a `c.group` scope.
+    Group {
+        /// The group properties.
+        group: cherenkov::Group,
+        /// The member ops.
+        ops: Vec<Op>,
     },
 }
 
@@ -158,7 +166,7 @@ fn shape_op(op: &Op) -> Option<LiveShape> {
         Op::Fill { shape, .. } | Op::Stroke { shape, .. } | Op::Shadow { shape, .. } => {
             Some(LiveShape::of(shape))
         }
-        Op::Glyphs { .. } | Op::Image { .. } => None,
+        Op::Glyphs { .. } | Op::Image { .. } | Op::Group { .. } => None,
     }
 }
 
@@ -168,7 +176,7 @@ fn paint_op(op: &Op) -> Option<cherenkov::Paint> {
         Op::Fill { paint, .. } | Op::Stroke { paint, .. } | Op::Glyphs { paint, .. } => {
             Some(paint.clone())
         }
-        Op::Shadow { .. } | Op::Image { .. } => None,
+        Op::Shadow { .. } | Op::Image { .. } | Op::Group { .. } => None,
     }
 }
 
@@ -356,6 +364,12 @@ fn record_live(c: &mut cherenkov::Recorder, op: &Op, bindings: &LiveBindings) {
             live_or_const(bindings.run.as_ref(), run),
             live_or_const(bindings.paint.as_ref(), paint),
         ),
+        // Groups never target a live entry; members record plainly.
+        Op::Group { group, ops } => c.group(Fixed(*group), |c| {
+            for op in ops {
+                record_op(c, op);
+            }
+        }),
     }
 }
 
@@ -502,6 +516,8 @@ fn cherenkov_features() -> Vec<Feature> {
         Feature::InterpolationSpace(ColorSpace::Srgb),
         Feature::InterpolationSpace(ColorSpace::LinearP3),
         Feature::InterpolationSpace(ColorSpace::LinearSrgb),
+        Feature::BlendSpace(BlendSpace::Linear),
+        Feature::BlendSpace(BlendSpace::SrgbEncoded),
     ]
     .into_iter()
     .chain(BlendMode::ALL.into_iter().map(Feature::Blend))
@@ -555,7 +571,8 @@ fn unsupported_feature(u: &str) -> Feature {
     match u {
         "sweep-gradient" => Feature::SweepGradient,
         "mesh-gradient" | "image" | "shader-paint" => Feature::Image,
-        "blend-mode" | "blend-space" => Feature::Blend(BlendMode::Normal),
+        "blend-mode" => Feature::Blend(BlendMode::Normal),
+        "blend-space" => Feature::BlendSpace(BlendSpace::SrgbEncoded),
         "backdrop-unclipped"
         | "backdrop-footprint"
         | "backdrop-effect-sdf-path"
@@ -788,6 +805,36 @@ fn op(
     })
 }
 
+/// A scene group → one scoped [`Op::Group`] of member ops.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "group opacity is f32 at the engine boundary"
+)]
+fn group_op(
+    group: &cherenkov_scene::Group,
+    fonts: &HashMap<(ResourceHash, u32), cherenkov::Font>,
+    images: &HashMap<(ResourceHash, ImageEncoding), cherenkov::ImageId>,
+    blobs: &Blobs,
+) -> Result<Op, BenchError> {
+    let mut ops = Vec::with_capacity(group.items.len());
+    for item in &group.items {
+        ops.push(match item {
+            GroupItem::Draw(d) => op(d, fonts, images, blobs)?,
+            GroupItem::Group(inner) => group_op(inner, fonts, images, blobs)?,
+        });
+    }
+    Ok(Op::Group {
+        group: cherenkov::Group::new()
+            .opacity(group.opacity as f32)
+            .blend(engine_blend(group.blend))
+            .blend_space(match group.blend_space {
+                BlendSpace::Linear => cherenkov::BlendSpace::Linear,
+                BlendSpace::SrgbEncoded => cherenkov::BlendSpace::SrgbEncoded,
+            }),
+        ops,
+    })
+}
+
 /// A scene glyph run → a front-end run with the registered font and the
 /// resolved `F2Dot14` coordinates.
 fn glyph_run(
@@ -836,6 +883,7 @@ fn register_fonts(
     for item in &layer.items {
         match item {
             Item::Layer(l) => register_fonts(fonts, engine, l, blobs)?,
+            Item::Group(g) => register_group_fonts(fonts, engine, g, blobs)?,
             Item::Draw(SceneDraw::Glyphs(run)) => {
                 if fonts.contains_key(&(run.font, run.font_index)) {
                     continue;
@@ -858,6 +906,43 @@ fn register_fonts(
                 fonts.insert((run.font, run.font_index), font);
             }
             Item::Draw(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// [`register_fonts`] over a group's member list.
+fn register_group_fonts(
+    fonts: &mut HashMap<(ResourceHash, u32), cherenkov::Font>,
+    engine: &CpuEngine<Raster>,
+    group: &cherenkov_scene::Group,
+    blobs: &Blobs,
+) -> Result<(), BenchError> {
+    for item in &group.items {
+        match item {
+            GroupItem::Group(g) => register_group_fonts(fonts, engine, g, blobs)?,
+            GroupItem::Draw(SceneDraw::Glyphs(run)) => {
+                if fonts.contains_key(&(run.font, run.font_index)) {
+                    continue;
+                }
+                let blob = blobs
+                    .get(&run.font)
+                    .ok_or(cherenkov_scene::SceneError::MissingResource(run.font))?;
+                let font = engine
+                    .font(cherenkov::FontSource::bytes(blob.clone()).with_index(run.font_index))
+                    .map_err(|e| match e {
+                        ResourceError::Unsupported("color-font") => BenchError::Unsupported {
+                            engine: Cherenkov::NAME,
+                            feature: Feature::Glyphs,
+                            api: Some(
+                                "SVG colour fonts and non-PNG/BGRA bitmap formats are unsupported",
+                            ),
+                        },
+                        e => BenchError::Engine(format!("cherenkov font: {e}")),
+                    })?;
+                fonts.insert((run.font, run.font_index), font);
+            }
+            GroupItem::Draw(_) => {}
         }
     }
     Ok(())
@@ -965,12 +1050,44 @@ fn register_images(
     for item in &layer.items {
         match item {
             Item::Layer(l) => register_images(images, handles, engine, l, blobs)?,
+            Item::Group(g) => register_group_images(images, handles, engine, g, blobs)?,
             Item::Draw(SceneDraw::Image {
                 image, encoding, ..
             }) => {
                 register_image(images, handles, engine, image, *encoding, blobs)?;
             }
             Item::Draw(d) => {
+                let paint = match d {
+                    SceneDraw::Fill { paint, .. } | SceneDraw::Stroke { paint, .. } => Some(paint),
+                    SceneDraw::Glyphs(run) => Some(&run.paint),
+                    _ => None,
+                };
+                if let Some(p) = paint.and_then(crate::convert::image_paint) {
+                    register_image(images, handles, engine, &p.image, p.encoding, blobs)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// [`register_images`] over a group's member list.
+fn register_group_images(
+    images: &mut HashMap<(ResourceHash, ImageEncoding), cherenkov::ImageId>,
+    handles: &mut Vec<ImageHandle>,
+    engine: &CpuEngine<Raster>,
+    group: &cherenkov_scene::Group,
+    blobs: &Blobs,
+) -> Result<(), BenchError> {
+    for item in &group.items {
+        match item {
+            GroupItem::Group(g) => register_group_images(images, handles, engine, g, blobs)?,
+            GroupItem::Draw(SceneDraw::Image {
+                image, encoding, ..
+            }) => {
+                register_image(images, handles, engine, image, *encoding, blobs)?;
+            }
+            GroupItem::Draw(d) => {
                 let paint = match d {
                     SceneDraw::Fill { paint, .. } | SceneDraw::Stroke { paint, .. } => Some(paint),
                     SceneDraw::Glyphs(run) => Some(&run.paint),
@@ -1055,8 +1172,12 @@ fn prep_layer(
 ) -> Result<PrepLayer, BenchError> {
     // The engine draws a layer's content before its children, so the draws
     // are the layer's own content only when every draw precedes every child.
+    // A group is recorded content like a draw: it scopes inside the layer.
     let first_child = layer.items.iter().position(|i| matches!(i, Item::Layer(_)));
-    let last_draw = layer.items.iter().rposition(|i| matches!(i, Item::Draw(_)));
+    let last_draw = layer
+        .items
+        .iter()
+        .rposition(|i| matches!(i, Item::Draw(_) | Item::Group(_)));
     let own = match (first_child, last_draw) {
         (None, _) | (Some(_), None) => true,
         (Some(f), Some(l)) => l < f,
@@ -1098,6 +1219,9 @@ fn prep_layer(
                         prep.own.live.push(live);
                     }
                 }
+                Item::Group(g) => {
+                    prep.own.ops.push(group_op(g, fonts, images, blobs)?);
+                }
                 Item::Layer(l) => prep.items.push(PrepItem::Layer(Box::new(prep_layer(
                     l, engine, fonts, images, blobs,
                 )?))),
@@ -1117,6 +1241,9 @@ fn prep_layer(
                     {
                         run.live.push(live);
                     }
+                }
+                Item::Group(g) => {
+                    run.ops.push(group_op(g, fonts, images, blobs)?);
                 }
                 Item::Layer(l) => {
                     if !run.ops.is_empty() {
@@ -1692,5 +1819,10 @@ fn record_op(c: &mut cherenkov::Recorder, op: &Op) {
             }
         },
         Op::Glyphs { run, paint } => c.glyphs(Fixed(run.clone()), Fixed(paint.clone())),
+        Op::Group { group, ops } => c.group(Fixed(*group), |c| {
+            for op in ops {
+                record_op(c, op);
+            }
+        }),
     }
 }

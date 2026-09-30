@@ -81,7 +81,26 @@ fn translated_item(item: &Item, d: Vec2) -> Item {
             layer.transform = Affine::translate(d) * layer.transform;
             Item::Layer(layer)
         }
+        Item::Group(group) => Item::Group(translated_group(group, d)),
     }
+}
+
+/// A group shifted by `d`: member draws translate; nested groups recurse.
+fn translated_group(group: &cherenkov_scene::Group, d: Vec2) -> cherenkov_scene::Group {
+    let mut group = group.clone();
+    group.items = group
+        .items
+        .into_iter()
+        .map(|item| match item {
+            cherenkov_scene::GroupItem::Draw(draw) => {
+                cherenkov_scene::GroupItem::Draw(translate_draw(&draw, d))
+            }
+            cherenkov_scene::GroupItem::Group(g) => {
+                cherenkov_scene::GroupItem::Group(translated_group(&g, d))
+            }
+        })
+        .collect();
+    group
 }
 
 /// A draw command shifted by `d`, paint included so a copy looks like a

@@ -226,6 +226,15 @@ fn encode_layer(
                 counters.draw_commands += 1;
                 encode_draw(cmds, blobs, d, engine)?;
             }
+            // Unreachable: scenes declaring `blend-space` fail the feature
+            // check; a group with no declared feature needs no support.
+            Item::Group(_) => {
+                return Err(BenchError::Unsupported {
+                    engine,
+                    feature: Feature::BlendSpace(cherenkov_scene::BlendSpace::SrgbEncoded),
+                    api: Some("skia: scoped group compositing"),
+                });
+            }
         }
     }
     if grouped {

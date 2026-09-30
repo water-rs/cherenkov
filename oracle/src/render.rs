@@ -50,14 +50,14 @@
 use std::collections::HashMap;
 
 use cherenkov_scene::{
-    BackdropFilter, BackdropGroup, BlendMode, Draw, FillRule, Item, Layer, LayerFilter, Paint,
-    Scene, Shape,
+    BackdropFilter, BackdropGroup, BlendMode, BlendSpace, Draw, FillRule, GroupItem, Item, Layer,
+    LayerFilter, Paint, Scene, Shape,
 };
 use kurbo::{Affine, Point, Rect};
 
 use crate::blend::{blend, src_over};
 use crate::clip::{Segment, intersect_edges};
-use crate::color::to_working;
+use crate::color::{linear_p3_to_linear_srgb, linear_srgb_to_linear_p3, to_working};
 use crate::coverage::Coverage;
 use crate::glyphs;
 use crate::image::{F32Image, Image};
@@ -102,12 +102,78 @@ impl From<cherenkov_scene::SceneError> for RenderError {
     }
 }
 
-/// Premultiplied linear-P3 `f64` pixels.
+/// Premultiplied `f64` pixels in the canvas's storage space: premultiplied
+/// linear Display P3 unless the level declared sRGB-encoded compositing.
 #[derive(Clone)]
 struct Canvas {
     pixels: Vec<[f64; 4]>,
     width: usize,
     height: usize,
+}
+
+/// `srgb_encode` preserving sign, like the backends' `convert_pixel`.
+fn srgb_encode_signed(c: f64) -> f64 {
+    if c.abs() <= 0.003_130_8 {
+        c * 12.92
+    } else {
+        (1.055f64.mul_add(c.abs().powf(1.0 / 2.4), -0.055)).copysign(c)
+    }
+}
+
+/// `srgb_decode` preserving sign, like the backends' `convert_pixel`.
+fn srgb_decode_signed(c: f64) -> f64 {
+    if c.abs() <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c.abs() + 0.055) / 1.055).powf(2.4).copysign(c)
+    }
+}
+
+/// Convert a premultiplied pixel between linear Display P3 and encoded
+/// sRGB: `cpu/src/render/paint.rs::convert_pixel` in `f64`.
+fn convert_pixel(pixel: [f64; 4], encode: bool) -> [f64; 4] {
+    let alpha = pixel[3];
+    if alpha == 0.0 {
+        return [0.0; 4];
+    }
+    let straight = [pixel[0] / alpha, pixel[1] / alpha, pixel[2] / alpha];
+    let converted = if encode {
+        linear_p3_to_linear_srgb(straight).map(srgb_encode_signed)
+    } else {
+        linear_srgb_to_linear_p3(straight.map(srgb_decode_signed))
+    };
+    [
+        converted[0] * alpha,
+        converted[1] * alpha,
+        converted[2] * alpha,
+        alpha,
+    ]
+}
+
+/// Move a premultiplied pixel between storage spaces.
+fn move_space(pixel: [f64; 4], from: BlendSpace, to: BlendSpace) -> [f64; 4] {
+    if from == to {
+        pixel
+    } else {
+        convert_pixel(pixel, to == BlendSpace::SrgbEncoded)
+    }
+}
+
+/// Composite `src` onto `dst` blending in `blend` space: both operands are
+/// converted from their storage spaces into `blend`, the blend applies,
+/// and the result lands back in the destination's space. Matches
+/// `cpu/src/render/blend.rs::in_space` generalized to stored-space levels.
+fn composite_pixel(
+    mode: BlendMode,
+    blend_space: BlendSpace,
+    dst_space: BlendSpace,
+    src_space: BlendSpace,
+    dst: [f64; 4],
+    src: [f64; 4],
+) -> [f64; 4] {
+    let b = move_space(dst, dst_space, blend_space);
+    let s = move_space(src, src_space, blend_space);
+    move_space(blend(mode, b, s), blend_space, dst_space)
 }
 
 impl Canvas {
@@ -124,11 +190,14 @@ impl Canvas {
 /// composites into the level below it with. `semantic` marks the canvases
 /// a backdrop capture sees as its compositing target: the surface canvas
 /// and every layer isolated for a filter, `opacity < 1` or a non-Normal
-/// blend.
+/// blend. `space` is the canvas's storage space — an isolated level's own
+/// `blend_space`, or the enclosing level's for a transparent (clip-only)
+/// level, which inherits the space it composites into.
 struct Level {
     canvas: Canvas,
     opacity: f64,
     blend: BlendMode,
+    space: BlendSpace,
     semantic: bool,
 }
 
@@ -161,10 +230,11 @@ fn flattened(chain: &[Level]) -> Canvas {
 }
 
 /// Backdrop-group render state: the scene's declared groups plus each
-/// group's filtered capture, taken at its first member's paint point.
+/// group's filtered capture — the canvas's pixels and the space they were
+/// captured in — taken at its first member's paint point.
 struct Backdrops<'a> {
     groups: &'a [BackdropGroup],
-    captures: HashMap<u32, Canvas>,
+    captures: HashMap<u32, (BlendSpace, Canvas)>,
 }
 
 impl Backdrops<'_> {
@@ -236,6 +306,7 @@ impl Renderer {
             canvas: Canvas::new(self.width, self.height, clear),
             opacity: 1.0,
             blend: BlendMode::Normal,
+            space: BlendSpace::Linear,
             semantic: true,
         }];
         let mut backdrops = Backdrops {
@@ -289,13 +360,20 @@ impl Renderer {
                         // member sits inside — filtered once and shared by
                         // all members.
                         let group = backdrops.group(gid)?;
+                        let space = chain
+                            .iter()
+                            .rposition(|level| level.semantic)
+                            .map_or(BlendSpace::Linear, |i| chain[i].space);
                         let mut capture = flattened(chain);
                         for filter in &group.filters {
                             apply_backdrop_filter(&mut capture, filter);
                         }
-                        backdrops.captures.entry(gid).or_insert(capture);
+                        backdrops.captures.entry(gid).or_insert((space, capture));
                     }
                     self.render_child_layer(child, tf, clips, chain, resources, backdrops)?;
+                }
+                Item::Group(group) => {
+                    self.render_group(group, tf, clips, chain, resources, backdrops)?;
                 }
             }
         }
@@ -336,17 +414,26 @@ impl Renderer {
         // layer's isolation, so the layer's filter covers the member's
         // items but never the sample.
         if child.filter.is_some() && child.backdrop.is_some() {
-            self.backdrop_sample(child, tf, clips, top(chain), backdrops)?;
+            let space = chain.last().map_or(BlendSpace::Linear, |l| l.space);
+            self.backdrop_sample(child, tf, clips, top(chain), space, backdrops)?;
         }
         // A filtered layer is a semantic isolation too: a backdrop capture
         // inside it reads this canvas, matching `isolate` in
         // gpu/src/render/lower.rs.
         let semantic =
             child.filter.is_some() || child.opacity < 1.0 || child.blend != BlendMode::Normal;
+        // A transparent level shares the space it composites into; an
+        // isolated level stores its declared space (layers always linear).
+        let parent_space = chain.last().map_or(BlendSpace::Linear, |l| l.space);
         chain.push(Level {
             canvas: Canvas::new(w, h, [0.0; 4]),
             opacity: child.opacity,
             blend: child.blend,
+            space: if semantic {
+                BlendSpace::Linear
+            } else {
+                parent_space
+            },
             semantic,
         });
         self.render_layer_body(
@@ -363,6 +450,7 @@ impl Renderer {
             canvas: mut sub,
             opacity,
             blend: mode,
+            space,
             ..
         } = chain.pop().expect("the child level is pushed above");
         if let Some(filter) = child.filter.as_deref() {
@@ -405,18 +493,81 @@ impl Renderer {
             None
         };
 
+        let dst_space = chain.last().map_or(BlendSpace::Linear, |l| l.space);
         for (i, (dst, &src)) in top(chain).pixels.iter_mut().zip(&sub.pixels).enumerate() {
             let s = src.map(|v| v * opacity);
-            *dst = if mode == BlendMode::Normal {
+            *dst = if mode == BlendMode::Normal && space == dst_space {
                 src_over(*dst, s)
             } else {
-                let b = blend(mode, *dst, s);
+                let b = composite_pixel(mode, space, dst_space, space, *dst, s);
                 match clip_cov.as_ref().map(|v| v[i]) {
                     Some(c) if c >= 1.0 => b,
                     Some(c) if c <= 0.0 => *dst,
                     Some(c) => std::array::from_fn(|ch| c.mul_add(b[ch] - dst[ch], dst[ch])),
                     None => b,
                 }
+            };
+        }
+        Ok(())
+    }
+
+    /// A display-list group: members composite with each other in the
+    /// group's `blend_space` (the level's canvas stores premultiplied
+    /// values in that space), then the group composites onto the level
+    /// below with `opacity` and `blend`. A fully transparent group
+    /// (`opacity` 1, `Normal`, `Linear`) shares the enclosing level's
+    /// space and passes through.
+    #[allow(clippy::many_single_char_names)] // dst/s name pixel values
+    fn render_group(
+        &self,
+        group: &cherenkov_scene::Group,
+        tf: Affine,
+        clips: &[Vec<Segment>],
+        chain: &mut Vec<Level>,
+        resources: &mut Resources,
+        backdrops: &mut Backdrops<'_>,
+    ) -> Result<(), RenderError> {
+        let parent_space = chain.last().map_or(BlendSpace::Linear, |l| l.space);
+        let semantic = group.opacity < 1.0
+            || group.blend != BlendMode::Normal
+            || group.blend_space != BlendSpace::Linear;
+        let space = if semantic {
+            group.blend_space
+        } else {
+            parent_space
+        };
+        let (w, h) = (top(chain).width, top(chain).height);
+        chain.push(Level {
+            canvas: Canvas::new(w, h, [0.0; 4]),
+            opacity: group.opacity,
+            blend: group.blend,
+            space,
+            semantic,
+        });
+        for item in &group.items {
+            match item {
+                GroupItem::Draw(draw) => {
+                    self.render_draw(draw, tf, clips, chain, resources, backdrops)?;
+                }
+                GroupItem::Group(inner) => {
+                    self.render_group(inner, tf, clips, chain, resources, backdrops)?;
+                }
+            }
+        }
+        let Level {
+            canvas: sub,
+            opacity,
+            blend: mode,
+            space,
+            ..
+        } = chain.pop().expect("the group level is pushed above");
+        let dst_space = chain.last().map_or(BlendSpace::Linear, |l| l.space);
+        for (dst, &src) in top(chain).pixels.iter_mut().zip(&sub.pixels) {
+            let s = src.map(|v| v * opacity);
+            *dst = if mode == BlendMode::Normal && space == dst_space {
+                src_over(*dst, s)
+            } else {
+                composite_pixel(mode, space, dst_space, space, *dst, s)
             };
         }
         Ok(())
@@ -449,6 +600,7 @@ impl Renderer {
         tf: Affine,
         clips: &[Vec<Segment>],
         canvas: &mut Canvas,
+        space: BlendSpace,
         backdrops: &Backdrops<'_>,
     ) -> Result<(), RenderError> {
         let gid = child.backdrop.expect("callers check backdrop membership");
@@ -456,7 +608,7 @@ impl Renderer {
             RenderError::Backdrop(format!("backdrop group {gid} member layer has no clip"))
         })?;
         let coverage = self.shape_coverage(clip, FillRule::NonZero, tf, clips);
-        if let Some(capture) = backdrops.captures.get(&gid) {
+        if let Some((cap_space, capture)) = backdrops.captures.get(&gid) {
             // SDF effects need the member clip's analytic box (the GPU
             // errors the same name for a mask or path clip).
             let sdf_clip = match &child.backdrop_effect {
@@ -487,7 +639,7 @@ impl Renderer {
                     [(i % w) as f64 + 0.5, (i / w) as f64 + 0.5],
                     sdf_clip.as_ref(),
                 );
-                *dst = src_over(*dst, src.map(|v| v * c));
+                *dst = src_over(*dst, move_space(src.map(|v| v * c), *cap_space, space));
             }
         }
         Ok(())
@@ -520,7 +672,8 @@ impl Renderer {
             // drew its sample into the enclosing canvas — its isolation
             // does not cover the sample — so only the clip check applies.
             if child.filter.is_none() {
-                self.backdrop_sample(child, tf, clips, top(target), backdrops)?;
+                let space = target.last().map_or(BlendSpace::Linear, |l| l.space);
+                self.backdrop_sample(child, tf, clips, top(target), space, backdrops)?;
             } else if child.clip.is_none() {
                 return Err(RenderError::Backdrop(format!(
                     "backdrop group {gid} member layer has no clip"
@@ -607,6 +760,7 @@ impl Renderer {
     /// `RenderError` on missing resources.
     fn composite_paint(
         canvas: &mut Canvas,
+        space: BlendSpace,
         coverage: &[f64],
         paint: &Paint,
         inv_tf: Affine,
@@ -624,7 +778,12 @@ impl Renderer {
                     continue;
                 }
                 let p = inv_tf * Point::new(px as f64 + 0.5, py as f64 + 0.5);
-                let src = eval_paint(paint, p, resources)?.map(|v| v * c);
+                // A member draw lands in the level's storage space.
+                let src = move_space(
+                    eval_paint(paint, p, resources)?.map(|v| v * c),
+                    BlendSpace::Linear,
+                    space,
+                );
                 let idx = py * w + px;
                 canvas.pixels[idx] = src_over(canvas.pixels[idx], src);
             }
@@ -650,7 +809,8 @@ impl Renderer {
         match draw {
             Draw::Fill { shape, rule, paint } => {
                 let coverage = self.shape_coverage(shape, *rule, tf, clips);
-                Self::composite_paint(top(chain), &coverage, paint, inv_tf, resources)?;
+                let space = chain.last().map_or(BlendSpace::Linear, |l| l.space);
+                Self::composite_paint(top(chain), space, &coverage, paint, inv_tf, resources)?;
             }
             Draw::Stroke {
                 shape,
@@ -666,7 +826,8 @@ impl Renderer {
                     cov.add_line(s.0, s.1, s.2, s.3);
                 }
                 let coverage = cov.finish(FillRule::NonZero);
-                Self::composite_paint(top(chain), &coverage, paint, inv_tf, resources)?;
+                let space = chain.last().map_or(BlendSpace::Linear, |l| l.space);
+                Self::composite_paint(top(chain), space, &coverage, paint, inv_tf, resources)?;
             }
             Draw::Shadow {
                 shape,
@@ -690,9 +851,13 @@ impl Renderer {
                     self.silhouette_coverage(shape, *blur_sigma, *offset, tf, clips)
                 };
                 let src = to_working(color);
+                let space = chain.last().map_or(BlendSpace::Linear, |l| l.space);
                 for (px, &c) in top(chain).pixels.iter_mut().zip(&blurred) {
                     if c > 0.0 {
-                        *px = src_over(*px, src.map(|v| v * c));
+                        *px = src_over(
+                            *px,
+                            move_space(src.map(|v| v * c), BlendSpace::Linear, space),
+                        );
                     }
                 }
             }
@@ -724,7 +889,11 @@ impl Renderer {
                         let v = (p.y - dst.y0) / dh * img.height as f64;
                         let src = sample_image(&img, u, v, *sampling).map(|x| x * c);
                         let idx = py * w + px;
-                        top(chain).pixels[idx] = src_over(top(chain).pixels[idx], src);
+                        let space = chain.last().map_or(BlendSpace::Linear, |l| l.space);
+                        top(chain).pixels[idx] = src_over(
+                            top(chain).pixels[idx],
+                            move_space(src, BlendSpace::Linear, space),
+                        );
                     }
                 }
             }

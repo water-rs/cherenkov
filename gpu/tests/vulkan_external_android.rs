@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! cargo ndk --target aarch64-linux-android --platform 30 \
-//!     test -p cherenkov-gpu --test vulkan_external_android --no-run
+//!     build -p cherenkov-gpu --test vulkan_external_android
 //! BIN=$(ls -t target/aarch64-linux-android/debug/deps/vulkan_external_android-* | head -1)
 //! adb push "$BIN" /data/local/tmp/vulkan_external_android
 //! adb shell 'cd /data/local/tmp && LD_LIBRARY_PATH=/data/local/tmp \
@@ -21,7 +21,8 @@ use std::time::{Duration, Instant};
 
 use ash::vk;
 use ash::vk::Handle as _;
-use cherenkov::{Engine, FrameTime, Next};
+use cherenkov::kurbo::{BezPath, Rect};
+use cherenkov::{Draw, Engine, FrameTime, Next, WorkingColor};
 use cherenkov_gpu::{
     Gpu, GpuConfig,
     interop::{
@@ -514,7 +515,9 @@ fn producer_fence_and_delayed_signal_stay_on_gpu() {
         .import(FrameSource::Ahb(Box::new(vulkan::Ahb {
             buffer: buffer.cast(),
             // The real producer fence: a sync_file fd signalling on the
-            // GPU once the producer's submit completes.
+            // GPU once the producer's submit completes. The import takes
+            // ownership of the fd it is given, so the fence's own fd is
+            // duplicated — `fence.fire` still needs it below.
             sync: Some(vulkan::Wait::SyncFd {
                 fd: unsafe { OwnedFd::from_raw_fd(libc::dup(fence.fd.as_raw_fd())) },
             }),
@@ -526,9 +529,6 @@ fn producer_fence_and_delayed_signal_stay_on_gpu() {
             alpha: RgbAlpha::Opaque,
         })))
         .expect("fenced AHB import");
-    // The fence completes 200 ms from now; the consuming submission must
-    // return immediately — a CPU wait would block the whole delay.
-    fence.fire(queue, family, 200);
     let engine = Engine::<Gpu>::new(GpuConfig {
         device: Some(shared),
         ..GpuConfig::default()
@@ -542,6 +542,10 @@ fn producer_fence_and_delayed_signal_stay_on_gpu() {
         tx[surface.root()].push(&layer);
         tx[&layer].content(handle);
     });
+    // The fence completes 200 ms from now — armed only after setup, so
+    // the consuming submission faces a genuinely unsigned fence and
+    // must return immediately; a CPU wait would block the whole delay.
+    fence.fire(queue, family, 200);
     let start = Instant::now();
     assert!(matches!(engine.render(FrameTime::now()), Ok(Next::Idle)));
     assert!(
@@ -587,13 +591,7 @@ fn two_layers_replace_retire_and_release_fence() {
     for _ in 0..3 {
         assert!(matches!(engine.render(FrameTime::now()), Ok(Next::Idle)));
     }
-    assert_eq!(
-        frame
-            .generation
-            .leases
-            .load(std::sync::atomic::Ordering::Relaxed),
-        2
-    );
+    assert_eq!(frame.generation.lease_count(), 2);
     // Replace one attachment, then drop the other — the last retire
     // submits the release and exports the fence.
     surface.update(|tx| {
@@ -617,6 +615,99 @@ fn two_layers_replace_retire_and_release_fence() {
     };
     let rc = unsafe { libc::poll(&raw mut pfd, 1, 2000) };
     assert_eq!(rc, 1, "release fence did not signal");
+}
+
+#[test]
+fn native_op_survives_engine_buffer_and_atlas_regrowth() {
+    let (shared, device) = setup();
+    let buffer = make_ahb_rgb(16, 16, [0xe0, 0x40, 0x20, 0xff]);
+    let frame = device
+        .import(FrameSource::Ahb(Box::new(vulkan::Ahb {
+            buffer: buffer.cast(),
+            sync: None,
+            release: None,
+            color: FrameColor::SRGB,
+            alpha: RgbAlpha::Opaque,
+        })))
+        .expect("AHB import");
+    let engine = Engine::<Gpu>::new(GpuConfig {
+        device: Some(shared.clone()),
+        ..GpuConfig::default()
+    })
+    .expect("engine");
+    let (target, textures) = TextureTarget::new((16, 16));
+    let surface = engine.surface(target).expect("surface");
+    let output = textures.try_recv().expect("output texture");
+    let layer = surface.layer();
+    let handle = engine.external_frame(ExternalFrame::native(frame).expect("external"));
+    surface.update(|tx| {
+        tx[surface.root()].push(&layer);
+        tx[&layer].content(handle);
+    });
+    assert!(matches!(engine.render(FrameTime::now()), Ok(Next::Idle)));
+    // Regrow the engine's per-draw buffers: enough fills to exceed the
+    // initial instance/stops sizing replaces the globals, instances and
+    // stops buffers the native op's shared set 0 keys on, so the cached
+    // set is rewritten, never allocated a second time.
+    let fills = surface.layer();
+    surface.update(|tx| {
+        // Beneath the external layer: detach, append fills, re-attach.
+        tx[surface.root()].remove(&layer);
+        tx[surface.root()].push(&fills);
+        tx[surface.root()].push(&layer);
+        tx[&fills].content(surface.record(|r| {
+            for i in 0..40 {
+                r.fill(
+                    Rect::new(
+                        f64::from(i) * 0.2,
+                        0.0,
+                        f64::from(i).mul_add(0.2, 1.0),
+                        16.0,
+                    ),
+                    WorkingColor::new([0.1, 0.2, 0.3, 1.0]),
+                );
+            }
+        }));
+    });
+    assert!(matches!(engine.render(FrameTime::now()), Ok(Next::Idle)));
+    let pixels = read_pixels(&engine, &shared, &output).expect("readback after regrow");
+    let pixel = pixels[8 * 16 + 8];
+    assert!(
+        pixel[0] > 0.5 && pixel[3] > 0.99,
+        "native op after buffer regrow: {pixel:?}"
+    );
+    // Regrow the atlas: fresh path cells past the starting allocation
+    // replace the mask texture the per-generation set-1 keys on — the
+    // generation-number invalidation must catch the recycled view.
+    surface.update(|tx| {
+        tx[&fills].content(surface.record(|r| {
+            for i in 0..144u32 {
+                let mut path = BezPath::new();
+                let cx = 0.5 + f64::from(i % 8);
+                let cy = 0.5 + f64::from(i / 8);
+                for point in 0..5u32 {
+                    let angle = f64::from(point)
+                        .mul_add(144.0 + f64::from(i), -90.0)
+                        .to_radians();
+                    let p = (angle.cos().mul_add(0.4, cx), angle.sin().mul_add(0.4, cy));
+                    if point == 0 {
+                        path.move_to(p);
+                    } else {
+                        path.line_to(p);
+                    }
+                }
+                path.close_path();
+                r.fill(path, WorkingColor::new([0.8, 0.3, 0.1, 1.0]));
+            }
+        }));
+    });
+    assert!(matches!(engine.render(FrameTime::now()), Ok(Next::Idle)));
+    let pixels = read_pixels(&engine, &shared, &output).expect("readback after atlas grow");
+    let pixel = pixels[8 * 16 + 8];
+    assert!(
+        pixel[0] > 0.5 && pixel[3] > 0.99,
+        "native op after atlas regrow: {pixel:?}"
+    );
 }
 
 #[test]
@@ -713,7 +804,7 @@ fn cancellation_and_teardown() {
     vulkan::cancel_staged(&mut native);
     unsafe { dev.destroy_command_pool(pool, None) };
     assert_eq!(
-        *generation.state.lock().expect("state"),
+        generation.state(),
         vulkan::State::Registered,
         "a cancelled plan leaves the frame unacquired"
     );

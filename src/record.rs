@@ -344,6 +344,10 @@ pub struct LiveState {
     /// surface drain can probe it as a plain cell read — `sample` is a
     /// real call on every static content otherwise.
     pub(crate) needs_sample: Cell<bool>,
+    /// The installing surface's "a content may be sampling" flag,
+    /// poked by [`LiveState::animate`] so a fully static surface can
+    /// skip per-content probes. Detached when the content retires.
+    surface_animated: RefCell<Option<Rc<Cell<bool>>>>,
     guards: RefCell<Vec<Box<dyn Any>>>,
     waker: RefCell<Weak<crate::engine::Waker>>,
 }
@@ -397,6 +401,9 @@ impl LiveState {
         anim.animates.push((command, target, animation));
         self.anim.set(Some(anim));
         self.needs_sample.set(true);
+        if let Some(flag) = self.surface_animated.borrow().as_ref() {
+            flag.set(true);
+        }
         self.wake();
     }
 
@@ -499,6 +506,22 @@ impl LiveState {
         }
         self.needs_sample.set(running);
         animating
+    }
+
+    /// Attaches the owning surface's sampling flag: `animate` pokes it
+    /// once set, and a state that already needs sampling sets it
+    /// immediately so nothing queues behind an install.
+    fn attach_animated(&self, flag: &Rc<Cell<bool>>) {
+        if self.needs_sample.get() {
+            flag.set(true);
+        }
+        *self.surface_animated.borrow_mut() = Some(Rc::clone(flag));
+    }
+
+    /// Detaches the surface's sampling flag when the content retires
+    /// into a spare, whose next install may live on another surface.
+    fn detach_animated(&self) {
+        *self.surface_animated.borrow_mut() = None;
     }
 }
 
@@ -789,6 +812,7 @@ impl Content {
         live.guards.borrow_mut().clear();
         live.pending.borrow_mut().clear();
         *live.waker.borrow_mut() = Weak::new();
+        live.detach_animated();
         drop(picture);
         ContentSpare {
             picture: None,
@@ -815,11 +839,13 @@ impl Content {
         }
     }
 
-    /// Connect installed live operands to the owning surface's host callback.
-    pub(crate) fn attach_waker(&self, waker: &Rc<crate::engine::Waker>) {
+    /// Connect installed live operands to the owning surface's host callback
+    /// and sampling flag.
+    pub(crate) fn attach_waker(&self, waker: &Rc<crate::engine::Waker>, flag: &Rc<Cell<bool>>) {
         // Constant recordings need no callback or weak-count traffic.
         if !self.live.guards.borrow().is_empty() {
             *self.live.waker.borrow_mut() = Rc::downgrade(waker);
+            self.live.attach_animated(flag);
         }
     }
 

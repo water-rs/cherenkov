@@ -82,6 +82,10 @@ pub struct Shared<B: Backend> {
     waker: Rc<Waker>,
     /// The last display properties announced to the render thread.
     display: Cell<Display>,
+    /// Set by installed contents' `LiveState`s the moment an animated
+    /// operand arrives, so [`Shared::take_changes`] skips per-content
+    /// sampling probes on surfaces that never saw one.
+    animated: Rc<Cell<bool>>,
 }
 
 #[derive(Default)]
@@ -115,6 +119,7 @@ impl<B: Backend> Shared<B> {
             bindings: FxHashMap::default(),
             waker,
             display: Cell::new(Display::default()),
+            animated: Rc::new(Cell::new(false)),
         }
     }
 
@@ -132,6 +137,10 @@ impl<B: Backend> Shared<B> {
         let recycled = std::mem::take(&mut self.spare_recycled);
         ops.append(&mut self.pending);
         let mut animating = false;
+        // `animated` is poked by a content's `LiveState` the moment an
+        // animated operand arrives, so a surface that never saw one
+        // skips the per-content sampling probes entirely.
+        let sampling = self.animated.get();
         for (id, slot) in &mut self.contents {
             let Some(content) = slot.content.as_mut() else {
                 continue;
@@ -139,7 +148,7 @@ impl<B: Backend> Shared<B> {
             // The sample queues the operands' per-frame values, so
             // `take_change` emits them like signal updates. The cell read
             // keeps a static content at a field probe, not a call.
-            if content.live.needs_sample.get() && content.sample(time) {
+            if sampling && content.live.needs_sample.get() && content.sample(time) {
                 animating = true;
             }
             if let Some(change) = content.take_change() {
@@ -153,6 +162,11 @@ impl<B: Backend> Shared<B> {
             }
         }
         let clear = self.clear.take();
+        if sampling && !animating {
+            // Nothing sampled this pass: the flag stays down until an
+            // `animate` pokes it up again.
+            self.animated.set(false);
+        }
         if clear.is_some() || !ops.is_empty() || !recycled.is_empty() {
             Some(ChangeSet {
                 clear,
@@ -932,12 +946,13 @@ impl<B: Backend> Surface<B> {
                         // A fresh `Content` replaces the previous one whole
                         // (its first `take_change` is a `Replace`).
                         let waker = Rc::clone(&shared.waker);
+                        let animated = Rc::clone(&shared.animated);
                         let slot = shared.contents.entry(*id).or_default();
                         if let Some(previous) = slot.content.replace(content) {
                             slot.spare.live = previous.retire().live;
                         }
                         let stored = slot.content.as_mut().expect("just inserted");
-                        stored.attach_waker(&waker);
+                        stored.attach_waker(&waker, &animated);
                         if let Some(change) = stored.take_change() {
                             let content_op = match change {
                                 ContentChange::Replace(list) => ContentOp::Replace(list),

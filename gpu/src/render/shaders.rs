@@ -109,6 +109,12 @@ pub fn backdrop_effect_text(user: &str) -> Cow<'static, str> {
 pub fn validate_wgsl(text: &str) -> Result<naga::Module, ResourceError> {
     let module = naga::front::wgsl::parse_str(text)
         .map_err(|error| ResourceError::Shader(error.emit_to_string(text)))?;
+    // The engine's floor, not the device's capabilities: a user shader has
+    // to run on every device the engine supports, so a construct that only
+    // a host-supplied `SharedDevice` with extra features could compile is
+    // rejected here, identically on every device. What depends on the
+    // actual device (limits, the driver's compiler) is left to pipeline
+    // creation on the render thread, which reports it as a rejection.
     naga::valid::Validator::new(
         naga::valid::ValidationFlags::all(),
         naga::valid::Capabilities::default(),

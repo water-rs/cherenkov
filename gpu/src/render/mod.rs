@@ -674,10 +674,17 @@ fn create_vulkan_device(
         .collect();
     // The YCbCr conversion feature is keyed to its extension's presence.
     let ycbcr = caps.supports_extension(ash::khr::sampler_ycbcr_conversion::NAME);
-    let ycbcr_features = ash::vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default()
-        .sampler_ycbcr_conversion(true);
+    // `create_info.p_next` points at this struct until `vkCreateDevice`
+    // runs inside `open_with_callback`; the `FnOnce` callback is dropped
+    // before that call, so the struct is boxed in this scope instead of
+    // being captured by the closure.
+    let ycbcr_features = Box::new(
+        ash::vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default()
+            .sampler_ycbcr_conversion(true),
+    );
     let callback: Option<Box<wgpu::hal::vulkan::CreateDeviceCallback<'_>>> =
         if ycbcr || !extensions.is_empty() {
+            let ycbcr_ptr = core::ptr::from_ref(&*ycbcr_features).cast::<core::ffi::c_void>();
             Some(Box::new(
                 move |args: wgpu::hal::vulkan::CreateDeviceCallbackArgs<'_, '_, '_>| {
                     for ext in &extensions {
@@ -686,8 +693,7 @@ fn create_vulkan_device(
                         }
                     }
                     if ycbcr {
-                        args.create_info.p_next =
-                            core::ptr::from_ref(&ycbcr_features).cast::<core::ffi::c_void>();
+                        args.create_info.p_next = ycbcr_ptr;
                     }
                 },
             ))

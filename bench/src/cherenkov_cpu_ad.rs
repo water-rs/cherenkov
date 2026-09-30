@@ -18,14 +18,14 @@ use cherenkov_oracle::present::presented_srgb_to_working;
 use cherenkov_scene::{
     BackdropEffectSpec, BackdropFilter, BlendMode, BlendSpace, ColorSpace, Draw as SceneDraw,
     Feature, FilterBlend, GroupItem, ImageColorSpace, ImageEncoding, Item, Layer as SceneLayer,
-    LayerFilter, ResourceHash,
+    LayerFilter, Motion, ResourceHash,
 };
 use filtrate::{FilterExt, FilterImage, filters};
 use kurbo::{Affine, BezPath, Circle, Ellipse, Line, Rect, RoundedRect, Vec2};
 
 use crate::convert::{self, Blobs, Op, ShapeKind, engine_blend, group_op, op, shape_kind, working};
 use crate::memory::{AdapterMemory, EngineBytes, Reading};
-use crate::motion::{Clock, LayerMotion};
+use crate::motion::{Clock, LayerMotion, motion_animation};
 use crate::timing::Timings;
 use crate::{
     BenchError, Counters, DeviceInfo, EncodeInput, Engine, EngineInfo, GpuSample, PresentKind,
@@ -256,6 +256,20 @@ impl LiveRun {
     }
 }
 
+/// One `Motion::Paint` target inside a content run: the draw's paint
+/// operand records against `binding`, and setting it to `target` once the
+/// content is installed animates the operand `from` → `target`.
+struct PaintMotion {
+    /// Op index inside the owning content run.
+    index: usize,
+    /// The paint operand's binding, at `from` until the first `set`.
+    binding: nami::Binding<cherenkov::Paint>,
+    /// The item's static paint — where the operand settles.
+    target: cherenkov::Paint,
+    /// How `from` moves to `target`.
+    animation: cherenkov::Animation,
+}
+
 /// The operand a live op records: the binding when the operand varies
 /// across frames, a constant otherwise.
 fn live_or_const<T: Clone + 'static>(
@@ -270,6 +284,11 @@ fn live_or_const<T: Clone + 'static>(
 
 /// Records `op` like [`record_op`], but with slot bindings for the
 /// operands that vary across its frames.
+#[expect(
+    clippy::inline_always,
+    reason = "the record closure must keep dev's per-op call-free codegen"
+)]
+#[inline(always)]
 fn record_live(c: &mut cherenkov::Recorder, op: &Op, bindings: &LiveBindings) {
     match op {
         Op::Image {
@@ -316,12 +335,78 @@ fn record_live(c: &mut cherenkov::Recorder, op: &Op, bindings: &LiveBindings) {
     }
 }
 
+/// Records `op` like [`record_op`], but with `motion`'s animated binding
+/// for its paint operand. The op is always a paint-carrying draw —
+/// `prep` rejects a `Motion::Paint` on a paint-less draw.
+#[inline(always)]
+fn record_motion(c: &mut cherenkov::Recorder, op: &Op, motion: &PaintMotion) {
+    use nami::SignalExt as _;
+    let paint: cherenkov::Live<cherenkov::Paint> =
+        motion.binding.clone().with(motion.animation).into();
+    match op {
+        Op::Fill { shape, rule, .. } => {
+            c.fill(
+                nami::constant(LiveShape::of(shape, front_rule(*rule))),
+                paint,
+            );
+        }
+        Op::Stroke { shape, stroke, .. } => {
+            c.stroke(
+                nami::constant(LiveShape::of(shape, cherenkov::FillRule::NonZero)),
+                nami::constant(stroke.clone()),
+                paint,
+            );
+        }
+        Op::Glyphs { run, .. } => c.glyphs(nami::constant(run.clone()), paint),
+        Op::Image { .. } | Op::Shadow { .. } | Op::Group { .. } => {
+            unreachable!("a paint motion only ever binds a paint operand")
+        }
+    }
+}
+
+/// Records `ops` with `live` slot bindings — identical to dev's record
+/// loop, reached by scenes that carry no motions.
+#[expect(
+    clippy::inline_always,
+    reason = "the record closure must keep dev's per-op call-free codegen"
+)]
+#[inline(always)]
+fn record_ops_static(c: &mut cherenkov::Recorder, ops: &[Op], live: &[LiveRun]) {
+    for (index, op) in ops.iter().enumerate() {
+        match live.iter().find(|live| live.index == index) {
+            Some(live) => record_live(c, op, &live.bindings),
+            None => record_op(c, op),
+        }
+    }
+}
+
+/// Records `ops` with `live` slot bindings and `motions` animated paint
+/// bindings, reached only on scenes that carry motions.
+#[expect(
+    clippy::inline_always,
+    reason = "the record closure must keep dev's per-op call-free codegen"
+)]
+#[inline(always)]
+fn record_ops(c: &mut cherenkov::Recorder, ops: &[Op], live: &[LiveRun], motions: &[PaintMotion]) {
+    for (index, op) in ops.iter().enumerate() {
+        match live.iter().find(|live| live.index == index) {
+            Some(live) => record_live(c, op, &live.bindings),
+            None => match motions.iter().find(|motion| motion.index == index) {
+                Some(motion) => record_motion(c, op, motion),
+                None => record_op(c, op),
+            },
+        }
+    }
+}
+
 /// A maximal run of draw items, drawn as one layer's content.
 struct ContentRun {
     /// The recorded ops.
     ops: Vec<Op>,
     /// Live items inside the run.
     live: Vec<LiveRun>,
+    /// Paint motions inside the run.
+    motions: Vec<PaintMotion>,
 }
 
 /// A prepared child item: a draw-item run wrapped in its own layer, or a
@@ -367,6 +452,8 @@ struct ContentLayer {
     ops: Vec<Op>,
     /// Live items inside `ops`.
     live: Vec<LiveRun>,
+    /// Paint motions inside `ops`, started once the content installs.
+    motions: Vec<PaintMotion>,
     /// The layer's one-time motion, committed on the first encode.
     motion: Option<LayerMotion>,
 }
@@ -854,54 +941,37 @@ fn prep_layer(
         own: ContentRun {
             ops: Vec::new(),
             live: Vec::new(),
+            motions: Vec::new(),
         },
         items: Vec::new(),
-        motion: layer
-            .motion
-            .as_ref()
-            .map(|m| LayerMotion::from_scene(m, layer.transform)),
+        // A `Motion::Paint` animates a content operand, not a layer
+        // property — `paint_motion` binds it inside the content run.
+        motion: match &layer.motion {
+            Some(Motion::Paint { .. }) => None,
+            motion => motion
+                .as_ref()
+                .map(|m| LayerMotion::from_scene(m, layer.transform)),
+        },
         backdrop: layer.backdrop,
         backdrop_effect: layer.backdrop_effect.clone(),
     };
     if own {
         for (index, item) in layer.items.iter().enumerate() {
             match item {
-                Item::Draw(d) => {
-                    prep.own.ops.push(op(d, fonts, images, blobs, &FRONT)?);
-                    if let Some(live) =
-                        live_run(layer, index, prep.own.ops.len() - 1, fonts, images, blobs)?
-                    {
-                        prep.own.live.push(live);
-                    }
-                }
-                Item::Group(g) => {
-                    prep.own
-                        .ops
-                        .push(group_op(g, fonts, images, blobs, &FRONT)?);
-                }
                 Item::Layer(l) => prep.items.push(PrepItem::Layer(Box::new(prep_layer(
                     l, engine, fonts, images, blobs,
                 )?))),
+                _ => prep_run_item(&mut prep.own, layer, index, item, fonts, images, blobs)?,
             }
         }
     } else {
         let mut run = ContentRun {
             ops: Vec::new(),
             live: Vec::new(),
+            motions: Vec::new(),
         };
         for (index, item) in layer.items.iter().enumerate() {
             match item {
-                Item::Draw(d) => {
-                    run.ops.push(op(d, fonts, images, blobs, &FRONT)?);
-                    if let Some(live) =
-                        live_run(layer, index, run.ops.len() - 1, fonts, images, blobs)?
-                    {
-                        run.live.push(live);
-                    }
-                }
-                Item::Group(g) => {
-                    run.ops.push(group_op(g, fonts, images, blobs, &FRONT)?);
-                }
                 Item::Layer(l) => {
                     if !run.ops.is_empty() {
                         prep.items.push(PrepItem::Content(std::mem::replace(
@@ -909,6 +979,7 @@ fn prep_layer(
                             ContentRun {
                                 ops: Vec::new(),
                                 live: Vec::new(),
+                                motions: Vec::new(),
                             },
                         )));
                     }
@@ -916,6 +987,7 @@ fn prep_layer(
                         l, engine, fonts, images, blobs,
                     )?)));
                 }
+                _ => prep_run_item(&mut run, layer, index, item, fonts, images, blobs)?,
             }
         }
         if !run.ops.is_empty() {
@@ -923,6 +995,77 @@ fn prep_layer(
         }
     }
     Ok(prep)
+}
+
+/// Prepares a draw-or-group item of `layer` into `run`: pushes its op and
+/// records any live entry or paint motion that targets it.
+fn prep_run_item(
+    run: &mut ContentRun,
+    layer: &SceneLayer,
+    index: usize,
+    item: &Item,
+    fonts: &HashMap<(ResourceHash, u32), cherenkov::Font>,
+    images: &HashMap<(ResourceHash, ImageEncoding), cherenkov::ImageId>,
+    blobs: &Blobs,
+) -> Result<(), BenchError> {
+    match item {
+        Item::Draw(d) => {
+            run.ops.push(op(d, fonts, images, blobs, &FRONT)?);
+            let position = run.ops.len() - 1;
+            if let Some(live) = live_run(layer, index, position, fonts, images, blobs)? {
+                run.live.push(live);
+            }
+            if let Some(motion) = paint_motion(layer, index, position, &run.ops[position], images)?
+            {
+                run.motions.push(motion);
+            }
+        }
+        Item::Group(g) => {
+            run.ops.push(group_op(g, fonts, images, blobs, &FRONT)?);
+        }
+        Item::Layer(_) => unreachable!("layers are never run items"),
+    }
+    Ok(())
+}
+
+/// Resolves a `Motion::Paint` targeting item `index` into a
+/// [`PaintMotion`] at `position` inside its content run. `None` when the
+/// layer's motion is not a paint motion on this item. Errors when the
+/// draw has no paint operand or is already a live item.
+fn paint_motion(
+    layer: &SceneLayer,
+    index: usize,
+    position: usize,
+    op: &Op,
+    images: &HashMap<(ResourceHash, ImageEncoding), cherenkov::ImageId>,
+) -> Result<Option<PaintMotion>, BenchError> {
+    let Some(Motion::Paint {
+        item,
+        from,
+        animation,
+    }) = &layer.motion
+    else {
+        return Ok(None);
+    };
+    if *item != index {
+        return Ok(None);
+    }
+    if layer.live.iter().any(|live| live.item == index) {
+        return Err(BenchError::Engine(
+            "cherenkov: a live entry and a paint motion target one draw".into(),
+        ));
+    }
+    let Some(target) = paint_op(op) else {
+        return Err(BenchError::Engine(
+            "cherenkov: a paint motion targets a draw without a paint".into(),
+        ));
+    };
+    Ok(Some(PaintMotion {
+        index: position,
+        binding: nami::binding(convert::front_paint(from.as_ref(), images, &FRONT)?),
+        target,
+        animation: motion_animation(*animation),
+    }))
 }
 
 /// Resolves a scene `live` entry targeting item `index` into a [`LiveRun`]
@@ -1040,6 +1183,7 @@ fn build_layer(
                     layer: Some(child),
                     ops: run.ops,
                     live: run.live,
+                    motions: run.motions,
                     motion: None,
                 });
             }
@@ -1063,6 +1207,7 @@ fn build_layer(
         layer: owned,
         ops: prep.own.ops,
         live: prep.own.live,
+        motions: prep.own.motions,
         motion: prep.motion,
     });
 }
@@ -1241,7 +1386,9 @@ impl Engine for Cherenkov {
             );
         });
         self.backdrop_groups = backdrop_groups;
-        self.has_motion = content_layers.iter().any(|c| c.motion.is_some());
+        self.has_motion = content_layers
+            .iter()
+            .any(|c| c.motion.is_some() || !c.motions.is_empty());
         self.motion_committed = false;
         self.has_live = content_layers.iter().any(|c| !c.live.is_empty());
         self.frame = 0;
@@ -1272,17 +1419,29 @@ impl Engine for Cherenkov {
         // re-recording each frame so their numbers stay comparable.
         if first_frame || !(self.has_motion || self.has_live) {
             surface.update(|tx| {
-                for cl in &self.content_layers {
-                    tx[cl.handle(surface)].record(|c| {
-                        for (index, op) in cl.ops.iter().enumerate() {
-                            match cl.live.iter().find(|live| live.index == index) {
-                                Some(live) => record_live(c, op, &live.bindings),
-                                None => record_op(c, op),
-                            }
-                        }
-                    });
+                if self.has_motion {
+                    for cl in &self.content_layers {
+                        tx[cl.handle(surface)]
+                            .record(|c| record_ops(c, &cl.ops, &cl.live, &cl.motions));
+                    }
+                } else {
+                    for cl in &self.content_layers {
+                        // A motionless scene's record keeps the dev shape:
+                        // no motions reach it at all.
+                        tx[cl.handle(surface)].record(|c| record_ops_static(c, &cl.ops, &cl.live));
+                    }
                 }
             });
+            // A paint motion starts once the content carrying its binding
+            // is installed: the `set` lands the animated commit, and the
+            // first sample shows `from`.
+            if first_frame {
+                for cl in &self.content_layers {
+                    for motion in &cl.motions {
+                        motion.binding.set(motion.target.clone());
+                    }
+                }
+            }
         } else {
             for cl in &mut self.content_layers {
                 for live in &mut cl.live {
@@ -1421,6 +1580,11 @@ impl Engine for Cherenkov {
 }
 
 /// Records one [`Op`] into a recorder — the per-frame engine calls.
+#[expect(
+    clippy::inline_always,
+    reason = "the record closure must keep dev's per-op call-free codegen"
+)]
+#[inline(always)]
 fn record_op(c: &mut cherenkov::Recorder, op: &Op) {
     match op {
         Op::Image {

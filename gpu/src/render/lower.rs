@@ -399,6 +399,10 @@ impl ContentData {
         self.storage.stops.clear();
         self.storage.templates.clear();
         self.storage.covers.clear();
+        // The emissions these ranges served are gone with the picture —
+        // clear them too or orphaned entries outlive every compaction
+        // check (#119).
+        self.storage.refs.clear();
         previous
     }
 
@@ -448,6 +452,9 @@ pub struct EmissionStorage {
     covers: Vec<Cover>,
     pub(crate) instances: Vec<RetainedInstance>,
     stops: Vec<Stop>,
+    /// `(shelf slot, band epoch)` atlas references every retained
+    /// emission samples, addressed by `Emission::refs` ranges.
+    pub(crate) refs: Vec<(u32, u64)>,
 }
 
 impl EmissionStorage {
@@ -456,21 +463,23 @@ impl EmissionStorage {
         if self.templates.is_empty() {
             return;
         }
-        let (instances, stops, templates, covers) = emissions
+        let (instances, stops, templates, covers, refs) = emissions
             .iter()
             .filter_map(|e| e.data.as_ref())
-            .fold((0, 0, 0, 0), |(i, s, t, c), e| {
+            .fold((0, 0, 0, 0, 0), |(i, s, t, c, r), e| {
                 (
                     i + e.instances.len(),
                     s + e.stops.len(),
                     t + 1,
                     c + usize::from(e.cover.is_some()),
+                    r + e.refs_len(),
                 )
             });
         if self.instances.len() <= instances * 2
             && self.stops.len() <= stops * 2
             && self.templates.len() <= templates * 2
             && self.covers.len() <= covers * 2
+            && self.refs.len() <= refs * 2
         {
             return;
         }
@@ -479,6 +488,7 @@ impl EmissionStorage {
             covers: Vec::with_capacity(covers),
             instances: Vec::with_capacity(instances),
             stops: Vec::with_capacity(stops),
+            refs: Vec::with_capacity(refs),
         };
         for e in emissions.iter_mut().filter_map(|e| e.data.as_mut()) {
             storage.templates.push(self.templates[e.template]);
@@ -497,6 +507,14 @@ impl EmissionStorage {
                 .stops
                 .extend_from_slice(&self.stops[e.stops.clone()]);
             e.stops = first..storage.stops.len();
+            if e.refs & DEFERRED_REFS != 0 {
+                // A deferred `refs` has no pairs yet — nothing moves
+                // (#119).
+            } else {
+                let first = storage.refs.len();
+                storage.refs.extend_from_slice(&self.refs[e.refs_range()]);
+                e.refs = Emission::pack_refs(first, storage.refs.len() - first);
+            }
         }
         *self = storage;
     }
@@ -555,7 +573,7 @@ impl InstanceTemplate {
 pub struct RetainedInstance {
     bounds: [f32; 4],
     pub(crate) uv: [f32; 2],
-    kind: u32,
+    pub(crate) kind: u32,
     first_stop: u32,
 }
 
@@ -570,18 +588,134 @@ impl RetainedInstance {
     }
 }
 
+/// `refs` flag: the emission's `(slot, epoch)` pairs are not folded
+/// yet — the commit derives them at apply from the stored UVs and the
+/// rasterized origins instead of a per-cell slot list the leaf would
+/// have to record. The flag is only meaningful for the lowering's own
+/// commit, so a stale check on an emission that still carries it
+/// always misses (#119).
+pub const DEFERRED_REFS: u64 = 1 << 62;
+
 /// Per-operation device output under its sampled placement.
 pub struct Emission {
-    pub(crate) pending_cells: Vec<(u32, u32, u32)>,
+    /// `(instance, pending raster, cell)` patch range in the producing
+    /// frame's `Lowering::emission_patches` — `inst_base << 32 | start
+    /// << 11 | len`, verbatim frame indices resolved at apply and never
+    /// carried past it, where `inst_base` is the first frame instance
+    /// slot the leaf occupied so apply and a same-frame recompose can
+    /// recover storage-local indices without copying the patch list.
+    /// The range indexes `emission_patches`, not `cell_patches`: frame
+    /// rollbacks truncate the latter but never the former, so a leaf
+    /// produced inside a rolled-back speculation keeps a valid range
+    /// (#119).
+    pub(crate) pending_cells: u64,
+    /// `(start << 32 | len)` range into `EmissionStorage::refs`
+    /// holding the `(shelf slot, band epoch)` of every atlas band the
+    /// retained instances sample. `DEFERRED_REFS` marks an emission
+    /// whose pairs the commit folds at apply (#119).
+    pub(crate) refs: u64,
+    /// Atlas texture generation and eviction clock at last verification
+    /// — one compare on the hit fast path, written at realize time so a
+    /// not-yet-applied emission can hit while its commit is in flight
+    /// (#119).
+    pub(crate) live_stamp: u64,
     template: usize,
     // Only shadows carry an occlusion key; ordinary leaves keep a small index.
     cover: Option<usize>,
     transform: Affine,
     size: [f32; 2],
-    generation: u64,
     pub(crate) instances: Range<usize>,
     stops: Range<usize>,
     image: Option<ImageSource>,
+}
+
+impl Emission {
+    /// Whether every atlas band the retained UVs reference is still the
+    /// band they were baked against. Between commits that evicted
+    /// nothing the stored `live_stamp` short-circuits the walk; after
+    /// an eviction each referenced band's epoch must still match.
+    fn atlas_live(&mut self, atlas: &Atlas, refs: &[(u32, u64)]) -> bool {
+        let stamp = atlas.live_stamp();
+        if self.live_stamp == stamp {
+            return true;
+        }
+        if refs
+            .iter()
+            .all(|&(slot, epoch)| atlas.shelf_epoch(slot) == epoch)
+        {
+            self.live_stamp = stamp;
+            return true;
+        }
+        false
+    }
+
+    /// Cold arm of the leaf hit check: the stored stamp differs, so
+    /// evictions may have reclaimed a referenced band. Kept out of
+    /// line so the hit path never pays for resolving `refs`.
+    #[cold]
+    #[inline(never)]
+    fn stale_live(&mut self, atlas: &Atlas, storage: &EmissionStorage) -> bool {
+        if self.refs & DEFERRED_REFS != 0 {
+            // Deferred pairs exist only until the producing frame's
+            // commit — they can make no epoch claims outside it (#119).
+            return false;
+        }
+        self.atlas_live(atlas, &storage.refs[self.refs_range()])
+    }
+
+    /// `start << 32 | len` packing for `refs`; `start` stays under
+    /// `2^30`, leaving the top bits for `DEFERRED_REFS`.
+    pub(crate) const fn pack_refs(start: usize, len: usize) -> u64 {
+        debug_assert!(
+            start < (1 << 30),
+            "refs start must leave the flag bits free"
+        );
+        ((start as u64) << 32) | len as u64
+    }
+
+    /// The `refs` field decoded back to a usable range.
+    pub(crate) const fn refs_range(&self) -> Range<usize> {
+        let packed = self.refs & !DEFERRED_REFS;
+        (packed >> 32) as usize..(packed >> 32) as usize + (packed & 0xFFFF_FFFF) as usize
+    }
+
+    /// Length of the `refs` range, for memory accounting.
+    #[allow(dead_code)]
+    pub(crate) const fn refs_len(&self) -> usize {
+        (self.refs & 0xFFFF_FFFF) as usize
+    }
+
+    /// The emission's patch range in the producing frame's
+    /// `Lowering::emission_patches`, unpacked from `pending_cells`
+    /// (#119).
+    pub(crate) const fn pending_cells(&self) -> Range<usize> {
+        let start = ((self.pending_cells >> 11) & 0x1F_FFFF) as usize;
+        start..start + (self.pending_cells & 0x7FF) as usize
+    }
+
+    /// Whether the emission carries no pending cell patches.
+    pub(crate) const fn pending_cells_empty(&self) -> bool {
+        self.pending_cells.trailing_zeros() >= 11
+    }
+
+    /// Frame instance index the pending-cell entries are relative to
+    /// (#119).
+    pub(crate) const fn cell_inst_base(&self) -> u32 {
+        (self.pending_cells >> 32) as u32
+    }
+
+    /// Pack `pending_cells` from the producing leaf's cell range and
+    /// its frame instance base (#119).
+    pub(crate) const fn pack_pending_cells(inst_base: u32, start: usize, len: usize) -> u64 {
+        debug_assert!(start < (1 << 21), "cell patch count fits 21 bits");
+        debug_assert!(len <= 0x7FF, "cells per leaf fit 11 bits");
+        ((inst_base as u64) << 32) | ((start as u64) << 11) | len as u64
+    }
+
+    /// Clear the pending-cell extent after the commit applied it (#119).
+    pub(crate) const fn clear_pending_cells(&mut self) {
+        self.pending_cells = 0;
+    }
 }
 
 /// GPU resources the lowering needs to emit glyph instances.
@@ -590,6 +724,10 @@ pub struct GlyphContext<'a> {
     /// [`PendingRaster`]s on the `Lowering`, applied serially on the
     /// render thread.
     pub atlas: &'a Atlas,
+    /// `atlas.live_stamp()` captured once — the atlas is immutable for
+    /// the whole lowering, so emissions compare against one value
+    /// instead of repacking generation and clock per check (#119).
+    pub live_stamp: u64,
     /// Registered fonts — a per-worker snapshot, so reads and the COLR
     /// cache stay lock-free.
     pub fonts: &'a FxHashMap<u64, FontData>,
@@ -619,6 +757,10 @@ pub struct Lowered {
     pub pending: Vec<PendingRaster>,
     /// `uv.xy` patches: `(instance, pending index, cell index)`.
     pub cell_patches: Vec<(u32, u32, u32)>,
+    /// The producing emission's view of the same triples, indexed by
+    /// `Emission::pending_cells` — survives the frame rollbacks that
+    /// truncate `cell_patches` (#119).
+    pub emission_patches: Vec<(u32, u32, u32)>,
     /// `uv.zw` patches: `(instance, pending index)`.
     pub mask_patches: Vec<(u32, u32)>,
 }
@@ -769,11 +911,19 @@ pub struct Lowering<'a> {
     glyphs: u32,
     paths: u32,
     /// `(instance, pending, cell)` triples whose `uv.xy` are set when the
-    /// render thread stores the pending path's cells.
+    /// render thread stores the pending path's cells — frame-scoped:
+    /// entries name frame instance slots and die with them on rollbacks.
     pub(crate) cell_patches: Vec<(u32, u32, u32)>,
+    /// The same triples keyed to the emission that produced them — the
+    /// list `Emission::pending_cells` ranges index. Frame rollbacks
+    /// truncate `cell_patches` but leave this intact, so a pending
+    /// emission produced inside a rolled-back scope can still resolve
+    /// its cell origins at apply (#119).
+    pub(crate) emission_patches: Vec<(u32, u32, u32)>,
     /// `(instance, pending)` pairs whose `uv.zw` are set when the render
     /// thread stores the pending clip mask.
     pub(crate) mask_patches: Vec<(u32, u32)>,
+
     /// The open range's bound mask texture key; `None` for the dummy view.
     /// Kept in sync with `clip` by `set_clip`.
     mask_key: Option<u64>,
@@ -826,6 +976,7 @@ impl<'a> Lowering<'a> {
             glyphs: 0,
             paths: 0,
             cell_patches: Vec::new(),
+            emission_patches: Vec::new(),
             mask_patches: Vec::new(),
             pending: Vec::new(),
             commands_lowered: 0,
@@ -2285,11 +2436,11 @@ impl<'a> Lowering<'a> {
     ) -> Result<bool, RenderError> {
         let cover = self.shadow_cover(op, next);
         let hit = cache.valid
-            && cache.data.as_ref().is_some_and(|e| {
+            && cache.data.as_mut().is_some_and(|e| {
                 e.cover.map(|index| storage.covers[index]) == cover
                     && e.transform == self.transform
                     && e.size.map(f32::to_bits) == [self.width, self.height].map(f32::to_bits)
-                    && e.generation == glyphs.atlas.generation()
+                    && (e.live_stamp == glyphs.live_stamp || e.stale_live(glyphs.atlas, storage))
             });
         cache.valid = true;
         if hit {
@@ -2350,7 +2501,7 @@ impl<'a> Lowering<'a> {
         self.set_image(None);
         let first_instance = self.frame.instances.len();
         let first_stop = self.frame.stops.len();
-        let first_patch = self.cell_patches.len();
+        let first_epatch = self.emission_patches.len();
         // `realize` composes path and glyph ops' local transforms into
         // `self.transform`; the leaf's placement is restored with the clip.
         let transform = self.transform;
@@ -2390,10 +2541,21 @@ impl<'a> Lowering<'a> {
             .stops
             .extend_from_slice(&self.frame.stops[first_stop..]);
         cache.data = Some(Emission {
-            pending_cells: self.cell_patches[first_patch..]
-                .iter()
-                .map(|&(i, p, c)| (i - instance_base, p, c))
-                .collect(),
+            pending_cells: if first_epatch == self.emission_patches.len() {
+                0
+            } else {
+                Emission::pack_pending_cells(
+                    instance_base,
+                    first_epatch,
+                    self.emission_patches.len() - first_epatch,
+                )
+            },
+            // `refs` pairs are derived at apply — deferred, so the
+            // leaf check's stamp compare needs nothing extra for a
+            // pending emission to hit inside its own frame, and a
+            // leftover can never claim liveness in a later one (#119).
+            refs: DEFERRED_REFS,
+            live_stamp: glyphs.live_stamp,
             template,
             cover: cover.map(|cover| {
                 storage.covers.push(cover);
@@ -2401,7 +2563,6 @@ impl<'a> Lowering<'a> {
             }),
             transform,
             size: [self.width, self.height],
-            generation: glyphs.atlas.generation(),
             instances: retained_instance..storage.instances.len(),
             stops: retained_stop..storage.stops.len(),
             image: self
@@ -2435,12 +2596,18 @@ impl<'a> Lowering<'a> {
             Self::apply_clip(&mut inst, clip);
             self.push_instance(&inst);
         }
-        self.cell_patches.extend(
-            emission
-                .pending_cells
-                .iter()
-                .map(|&(i, p, c)| (i + instance_base, p, c)),
-        );
+        // The producing leaf's frame patches may be gone — rollbacks
+        // truncate `cell_patches` — so recomposes re-emit them from
+        // `emission_patches`, rebased onto the new instance slots.
+        if !emission.pending_cells_empty() {
+            for i in emission.pending_cells() {
+                let (inst, pending, cell) = self.emission_patches[i];
+                let inst = inst
+                    .wrapping_sub(emission.cell_inst_base())
+                    .wrapping_add(instance_base);
+                self.cell_patches.push((inst, pending, cell));
+            }
+        }
     }
 
     #[expect(
@@ -3015,11 +3182,11 @@ impl<'a> Lowering<'a> {
         } else {
             (None, None)
         };
-        if let Some(emit) = glyphs
+        let hit = glyphs
             .atlas
             .path(pl.key)
-            .or_else(|| glyphs.atlas.path(pl.key_exact()))
-        {
+            .or_else(|| glyphs.atlas.path(pl.key_exact()));
+        if let Some(emit) = hit {
             self.replay(emit, None, pl.offset, paint, shader_data.as_ref());
             return Ok(());
         }
@@ -3034,15 +3201,11 @@ impl<'a> Lowering<'a> {
                 rule,
             ) else {
                 // Missing the surface at this offset says nothing about
-                // other offsets: cache the empty emission only under the
-                // exact key.
-                let pending = u32::try_from(self.pending.len()).expect("pending count fits u32");
-                self.pending.push(PendingRaster::Path {
-                    key: pl.key_exact(),
-                    emit: PathEmit::default(),
-                    cells: Vec::new(),
-                });
-                break 'stored (PathEmit::default(), Some(pending));
+                // other offsets — and an empty emission carries no bands,
+                // so it could never be pinned or replayed later either.
+                // Store nothing: an exact-key insert would never hit again
+                // and could not be evicted for want of a slot (#119).
+                break 'stored (PathEmit::default(), None);
             };
             self.paths += 1;
             let (emit, cells) = path::emit(&coverage)?;
@@ -3101,13 +3264,15 @@ impl<'a> Lowering<'a> {
             offset,
         );
         if let Some(pending) = pending {
-            self.cell_patches.extend((0..emit.cells.len()).map(|i| {
-                (
+            for i in 0..emit.cells.len() {
+                let patch = (
                     u32::try_from(first + i).expect("instance index fits u32"),
                     pending,
                     u32::try_from(i).expect("cell index fits u32"),
-                )
-            }));
+                );
+                self.emission_patches.push(patch);
+                self.cell_patches.push(patch);
+            }
         }
     }
 
@@ -3169,6 +3334,9 @@ impl<'a> Lowering<'a> {
                 .mask(pl.key)
                 .or_else(|| glyphs.atlas.mask(pl.key_exact()))
             {
+                // The mask is re-read through `apply_clip` each frame;
+                // its `uv[2..3]` atlas coordinates let the commit's pins
+                // recover the shelf — no slot recorded here (#119).
                 break 'stored ClipMask::Cell(*mask);
             }
             if let Some(mask) = glyphs
@@ -3229,6 +3397,8 @@ impl<'a> Lowering<'a> {
                     f32_f64(coverage.x + f64::from(w) - pl.offset.x),
                     f32_f64(coverage.y + f64::from(h) - pl.offset.y),
                 ],
+                // Filled by `Atlas::place_mask` on the render thread.
+                slot: 0,
             };
             if glyphs.atlas.mask_in_atlas(w, h) {
                 let pending = u32::try_from(self.pending.len()).expect("pending count fits u32");
@@ -3290,10 +3460,11 @@ impl<'a> Lowering<'a> {
             let x = origin.x.floor();
             let y = origin.y.floor();
             let fraction = (f32_f64(origin.x - x), f32_f64(origin.y - y));
+            let key = key.at(glyph.id, fraction);
             let (entry, pending) = glyph::entry(
                 glyphs.atlas,
                 font,
-                key.at(glyph.id, fraction),
+                key,
                 glyph.id,
                 run.size,
                 fraction,
@@ -3335,11 +3506,13 @@ impl<'a> Lowering<'a> {
             inst.uv = [f32::from(entry.x), f32::from(entry.y), 0.0, 0.0];
             self.push_instance(&inst);
             if let Some(pending) = pending {
-                self.cell_patches.push((
+                let patch = (
                     u32::try_from(self.frame.instances.len() - 1).expect("instance count fits u32"),
                     pending,
                     0,
-                ));
+                );
+                self.emission_patches.push(patch);
+                self.cell_patches.push(patch);
             }
         }
         Ok(())
@@ -3401,9 +3574,13 @@ impl<'a> Lowering<'a> {
             inst.uv = [f32::from(entry.x), f32::from(entry.y), 0.0, 0.0];
             self.push_instance(&inst);
             if let Some(pending) = pending {
-                let inst =
-                    u32::try_from(self.frame.instances.len() - 1).expect("instance count fits u32");
-                self.cell_patches.push((inst, pending, 0));
+                let patch = (
+                    u32::try_from(self.frame.instances.len() - 1).expect("instance count fits u32"),
+                    pending,
+                    0,
+                );
+                self.emission_patches.push(patch);
+                self.cell_patches.push(patch);
             }
         }
         Ok(())
@@ -3838,6 +4015,7 @@ mod tests {
         lowering.begin_pass(Target::Surface, None);
         let glyphs = GlyphContext {
             atlas: &atlas,
+            live_stamp: atlas.live_stamp(),
             fonts: &fonts,
             images: &images,
             bitmaps: &bitmaps,
@@ -3925,6 +4103,7 @@ mod tests {
         let bitmaps = FxHashMap::default();
         let glyphs = GlyphContext {
             atlas: &atlas,
+            live_stamp: atlas.live_stamp(),
             fonts: &fonts,
             images: &images,
             bitmaps: &bitmaps,
@@ -3996,6 +4175,7 @@ mod tests {
         let bitmaps = FxHashMap::default();
         let glyphs = GlyphContext {
             atlas: &atlas,
+            live_stamp: atlas.live_stamp(),
             fonts: &fonts,
             images: &images,
             bitmaps: &bitmaps,
@@ -4104,6 +4284,7 @@ mod tests {
         let bitmaps = FxHashMap::default();
         let glyphs = GlyphContext {
             atlas: &atlas,
+            live_stamp: atlas.live_stamp(),
             fonts: &fonts,
             images: &images,
             bitmaps: &bitmaps,

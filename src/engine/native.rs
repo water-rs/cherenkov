@@ -312,7 +312,7 @@ impl<B: Backend> Engine<B> {
                 return false;
             };
             let mut shared_mut = shared.borrow_mut();
-            if let Some(changes) = shared_mut.take_changes() {
+            if let Some(changes) = shared_mut.take_changes(time.0) {
                 commits.push((shared_mut.id, changes));
             }
             true

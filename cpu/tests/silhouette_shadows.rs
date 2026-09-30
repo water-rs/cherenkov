@@ -1,4 +1,5 @@
 //! General silhouette convolution.
+#![cfg(not(target_arch = "wasm32"))]
 #[path = "../../tests/common/silhouette_shadows.rs"]
 mod common;
 #[test]

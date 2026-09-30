@@ -1,4 +1,5 @@
 //! Mesh colour weight selection on this backend.
+#![cfg(not(target_arch = "wasm32"))]
 #[path = "../../tests/common/mesh_interpolation.rs"]
 mod common;
 #[test]

@@ -1,4 +1,5 @@
 //! Sweep domain normalization must terminate and preserve continuation.
+#![cfg(not(target_arch = "wasm32"))]
 use cherenkov::kurbo::{Affine, Rect};
 use cherenkov::{
     Draw, Engine, Extend, FrameTime, Offscreen, OffscreenFormat, Paint, SweepGradient, WorkingColor,

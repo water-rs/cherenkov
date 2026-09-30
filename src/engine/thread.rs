@@ -28,6 +28,10 @@ struct SurfaceState {
     /// Whether a property op, a content op or an animation step touched the
     /// surface since the last render.
     changed: bool,
+    /// Whether the surface's recorded contents still run operand animations
+    /// on the UI thread. The tracks live there; they need the next frame's
+    /// sample at the fast rate class.
+    content_animating: bool,
 }
 
 /// A rejection the backend reported after the resource's handle was
@@ -222,6 +226,7 @@ fn create_surface<B: Backend>(
             display: Display::default(),
             clear: WorkingColor::TRANSPARENT,
             changed: true,
+            content_animating: false,
         },
     );
     Ok(info)
@@ -321,11 +326,13 @@ fn commit<B: Backend>(
         clear,
         ops,
         recycled,
+        animating,
     } = changes;
     if let Some(clear) = clear.take() {
         state.clear = clear;
         state.changed = true;
     }
+    state.content_animating = *animating;
     for op in ops.drain(..) {
         match op {
             Op::Layer(LayerOp::Remove(layer)) => {
@@ -383,7 +390,14 @@ fn render<B: Backend>(
     for (id, state) in &mut *surfaces {
         let sampling = state.tree.sample(time, state.display);
         let changed = state.changed || sampling.stepped;
-        match sampling.rate {
+        // Operand animations run on the UI thread and are springs or
+        // curves only: they always need the fast class.
+        let running = if state.content_animating {
+            Some(crate::tree::RATE_FAST)
+        } else {
+            sampling.rate
+        };
+        match running {
             Some(r) if r == crate::tree::RATE_FAST => rate = Some(crate::tree::RATE_FAST),
             Some(r) => rate = rate.or(Some(r)),
             None => {}
@@ -451,7 +465,14 @@ async fn render_local<B: Backend>(
     for (id, state) in &mut *surfaces {
         let sampling = state.tree.sample(time, state.display);
         let changed = state.changed || sampling.stepped;
-        match sampling.rate {
+        // Operand animations run on the UI thread and are springs or
+        // curves only: they always need the fast class.
+        let running = if state.content_animating {
+            Some(crate::tree::RATE_FAST)
+        } else {
+            sampling.rate
+        };
+        match running {
             Some(r) if r == crate::tree::RATE_FAST => rate = Some(crate::tree::RATE_FAST),
             Some(r) => rate = rate.or(Some(r)),
             None => {}
@@ -521,6 +542,7 @@ mod tests {
             display: Display::default(),
             clear: WorkingColor::TRANSPARENT,
             changed: false,
+            content_animating: false,
         };
 
         let mut first = ChangeSet::<Null> {
@@ -530,6 +552,7 @@ mod tests {
                 Some(ContentOp::Picture(caller_picture.clone())),
             ))],
             recycled: Vec::new(),
+            animating: false,
         };
         commit(&mut renderer, &mut state, surface, &mut first);
         let mut second = ChangeSet::<Null> {
@@ -539,6 +562,7 @@ mod tests {
                 Some(ContentOp::Picture(Picture::new(DisplayList::default()))),
             ))],
             recycled: Vec::new(),
+            animating: false,
         };
 
         commit(&mut renderer, &mut state, surface, &mut second);

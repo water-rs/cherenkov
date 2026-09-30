@@ -1,4 +1,5 @@
 //! Group compositing is clipped as an operation, including destination modes.
+#![cfg(not(target_arch = "wasm32"))]
 use cherenkov::kurbo::Rect;
 use cherenkov::{
     BlendMode, BlendSpace, Color, Draw, Engine, FrameTime, Group, Offscreen, OffscreenFormat, Srgb,

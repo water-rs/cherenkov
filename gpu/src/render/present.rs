@@ -7,8 +7,6 @@
 //! per frame through [`Display`](cherenkov::Display)'s `headroom` and is
 //! clamped to what the destination can carry.
 
-use std::sync::Arc;
-
 use rustc_hash::FxHashMap;
 
 use cherenkov::{RenderError, SurfaceError};
@@ -375,6 +373,16 @@ pub fn select_output(
     })
 }
 
+/// The surface handle shared between a window's swapchain and its
+/// [`DisplayProbe`]: `Arc` where the probe can be sampled on another
+/// thread, `Rc` on wasm32, where the surface is DOM-bound and the engine
+/// is single-threaded — `wgpu::Surface` is `!Send`/`!Sync` there.
+#[cfg(not(target_arch = "wasm32"))]
+type SharedSurface = std::sync::Arc<wgpu::Surface<'static>>;
+/// The wasm32 shared surface handle: single-threaded, so `Rc`.
+#[cfg(target_arch = "wasm32")]
+type SharedSurface = std::rc::Rc<wgpu::Surface<'static>>;
+
 /// A main-thread handle to a window surface's live display state (#98).
 ///
 /// wgpu's `Surface::display_hdr_info` must run on the main thread on
@@ -385,7 +393,7 @@ pub fn select_output(
 /// tick) and feeds the result back through
 /// [`Surface::display`](cherenkov::Surface::display).
 pub struct DisplayProbe {
-    surface: Arc<wgpu::Surface<'static>>,
+    surface: SharedSurface,
     adapter: wgpu::Adapter,
     backend: wgpu::Backend,
     transparent: bool,
@@ -433,7 +441,7 @@ impl core::fmt::Debug for DisplayProbe {
 
 /// A window's swapchain and its configuration.
 pub struct WindowSurface {
-    surface: Arc<wgpu::Surface<'static>>,
+    surface: SharedSurface,
     config: wgpu::SurfaceConfiguration,
     /// The negotiated output — changes only when a re-selection finds a
     /// different advertised pair (#98).
@@ -469,7 +477,7 @@ impl WindowSurface {
         required: Option<wgpu::SurfaceColorSpace>,
         probe: Option<std::sync::mpsc::Sender<DisplayProbe>>,
     ) -> Result<Self, SurfaceError> {
-        let surface = Arc::new(
+        let surface = SharedSurface::new(
             instance
                 .create_surface(wgpu::SurfaceTarget::Window(handle))
                 .map_err(|e| SurfaceError::UnsupportedTarget(format!("window surface: {e}")))?,
@@ -503,7 +511,7 @@ impl WindowSurface {
         );
         if let Some(probe) = probe {
             let _ = probe.send(DisplayProbe {
-                surface: Arc::clone(&surface),
+                surface: SharedSurface::clone(&surface),
                 adapter: adapter.clone(),
                 backend,
                 transparent,

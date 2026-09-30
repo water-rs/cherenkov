@@ -307,6 +307,11 @@ fn live_or_const<T: Clone + 'static>(
 
 /// Records `op` like [`record_op`], but with slot bindings for the
 /// operands that vary across its frames.
+#[expect(
+    clippy::inline_always,
+    reason = "the record closure must keep dev's per-op call-free codegen"
+)]
+#[inline(always)]
 fn record_live(c: &mut cherenkov::Recorder, op: &Op, bindings: &LiveBindings) {
     match op {
         Op::Fill { shape, rule, paint } => c.fill(
@@ -356,6 +361,7 @@ fn record_live(c: &mut cherenkov::Recorder, op: &Op, bindings: &LiveBindings) {
 /// Records `op` like [`record_op`], but with `motion`'s animated binding
 /// for its paint operand. The op is always a paint-carrying draw —
 /// `prep` rejects a `Motion::Paint` on a paint-less draw.
+#[inline(always)]
 fn record_motion(c: &mut cherenkov::Recorder, op: &Op, motion: &PaintMotion) {
     use nami::SignalExt as _;
     let paint: cherenkov::Live<cherenkov::Paint> =
@@ -1802,6 +1808,11 @@ impl Engine for Cherenkov {
 }
 
 /// Records one [`Op`] into a recorder — the per-frame engine calls.
+#[expect(
+    clippy::inline_always,
+    reason = "the record closure must keep dev's per-op call-free codegen"
+)]
+#[inline(always)]
 fn record_op(c: &mut cherenkov::Recorder, op: &Op) {
     match op {
         Op::Fill { shape, paint, .. } => match shape {

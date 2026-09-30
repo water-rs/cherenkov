@@ -3350,6 +3350,7 @@ impl GpuRenderer {
         let result = {
             let glyphs = GlyphContext {
                 atlas,
+                live_stamp: atlas.live_stamp(),
                 fonts,
                 images,
                 bitmaps,
@@ -3433,12 +3434,22 @@ impl GpuRenderer {
             .filter_map(|r| r.as_ref().ok())
             .flat_map(|l| l.touches.iter().copied())
             .collect();
-        // Replay pins arrive as `refs` ranges on each layer's storage;
-        // resolve them into the slots the commit must not evict (#119).
+        // An emission whose stamp matches the atlas verified live this
+        // frame — either on the fast path or by re-walking its refs —
+        // so its bands are the replay pins the commit must not evict
+        // (#119).
+        let stamp = self.atlas.live_stamp();
         for surf in pending.iter_mut() {
             for content in surf.layers.values_mut() {
-                for range in content.storage.touched.drain(..) {
-                    touches.extend(content.storage.refs[range].iter().map(|&(slot, _)| slot));
+                let (_, emissions) = content.retained.prepared();
+                for e in emissions.iter().filter_map(|e| e.data.as_ref()) {
+                    if e.live_stamp == stamp {
+                        touches.extend(
+                            content.storage.refs[e.refs.clone()]
+                                .iter()
+                                .map(|&(slot, _)| slot),
+                        );
+                    }
                 }
             }
         }

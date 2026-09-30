@@ -451,9 +451,6 @@ pub struct EmissionStorage {
     /// `(shelf slot, band epoch)` atlas references every retained
     /// emission samples, addressed by `Emission::refs` ranges.
     pub(crate) refs: Vec<(u32, u64)>,
-    /// `refs` ranges of emissions replayed this frame; the commit pins
-    /// their bands against eviction, then drains (#119).
-    pub(crate) touched: Vec<Range<usize>>,
 }
 
 impl EmissionStorage {
@@ -488,7 +485,6 @@ impl EmissionStorage {
             instances: Vec::with_capacity(instances),
             stops: Vec::with_capacity(stops),
             refs: Vec::with_capacity(refs),
-            touched: Vec::new(),
         };
         for e in emissions.iter_mut().filter_map(|e| e.data.as_mut()) {
             storage.templates.push(self.templates[e.template]);
@@ -507,9 +503,15 @@ impl EmissionStorage {
                 .stops
                 .extend_from_slice(&self.stops[e.stops.clone()]);
             e.stops = first..storage.stops.len();
-            let first = storage.refs.len();
-            storage.refs.extend_from_slice(&self.refs[e.refs.clone()]);
-            e.refs = first..storage.refs.len();
+            if e.live_stamp == LIVE_PENDING {
+                // `refs` still addresses the frame's touches: keep the
+                // emission pending and drop the range (#119).
+                e.refs = 0..0;
+            } else {
+                let first = storage.refs.len();
+                storage.refs.extend_from_slice(&self.refs[e.refs.clone()]);
+                e.refs = first..storage.refs.len();
+            }
         }
         *self = storage;
     }
@@ -618,7 +620,8 @@ impl Emission {
     /// nothing the stored `live_stamp` short-circuits the walk; after
     /// an eviction each referenced band's epoch must still match.
     fn atlas_live(&mut self, atlas: &Atlas, refs: &[(u32, u64)]) -> bool {
-        if self.live_stamp == atlas.live_stamp() {
+        let stamp = atlas.live_stamp();
+        if self.live_stamp == stamp {
             return true;
         }
         if self.live_stamp == LIVE_PENDING {
@@ -628,7 +631,7 @@ impl Emission {
             .iter()
             .all(|&(slot, epoch)| atlas.shelf_epoch(slot) == epoch)
         {
-            self.live_stamp = atlas.live_stamp();
+            self.live_stamp = stamp;
             return true;
         }
         false
@@ -641,6 +644,10 @@ pub struct GlyphContext<'a> {
     /// [`PendingRaster`]s on the `Lowering`, applied serially on the
     /// render thread.
     pub atlas: &'a Atlas,
+    /// `atlas.live_stamp()` captured once — the atlas is immutable for
+    /// the whole lowering, so emissions compare against one value
+    /// instead of repacking generation and clock per check (#119).
+    pub live_stamp: u64,
     /// Registered fonts — a per-worker snapshot, so reads and the COLR
     /// cache stay lock-free.
     pub fonts: &'a FxHashMap<u64, FontData>,
@@ -2348,20 +2355,12 @@ impl<'a> Lowering<'a> {
                 e.cover.map(|index| storage.covers[index]) == cover
                     && e.transform == self.transform
                     && e.size.map(f32::to_bits) == [self.width, self.height].map(f32::to_bits)
-                    && (e.live_stamp == glyphs.atlas.live_stamp()
+                    && (e.live_stamp == glyphs.live_stamp
                         || (e.live_stamp != LIVE_PENDING
                             && e.atlas_live(glyphs.atlas, &storage.refs[e.refs.clone()])))
             });
         cache.valid = true;
         if hit {
-            if let Some(e) = cache.data.as_ref() {
-                // Pin the shelves the retained instances sample so this
-                // commit cannot evict them; the commit resolves the
-                // range into slots (#119).
-                if !e.refs.is_empty() {
-                    storage.touched.push(e.refs.clone());
-                }
-            }
             self.compose(
                 cache.data.as_ref().expect("a hit has data"),
                 storage,
@@ -3933,6 +3932,7 @@ mod tests {
         lowering.begin_pass(Target::Surface, None);
         let glyphs = GlyphContext {
             atlas: &atlas,
+            live_stamp: atlas.live_stamp(),
             fonts: &fonts,
             images: &images,
             bitmaps: &bitmaps,
@@ -4020,6 +4020,7 @@ mod tests {
         let bitmaps = FxHashMap::default();
         let glyphs = GlyphContext {
             atlas: &atlas,
+            live_stamp: atlas.live_stamp(),
             fonts: &fonts,
             images: &images,
             bitmaps: &bitmaps,
@@ -4091,6 +4092,7 @@ mod tests {
         let bitmaps = FxHashMap::default();
         let glyphs = GlyphContext {
             atlas: &atlas,
+            live_stamp: atlas.live_stamp(),
             fonts: &fonts,
             images: &images,
             bitmaps: &bitmaps,
@@ -4199,6 +4201,7 @@ mod tests {
         let bitmaps = FxHashMap::default();
         let glyphs = GlyphContext {
             atlas: &atlas,
+            live_stamp: atlas.live_stamp(),
             fonts: &fonts,
             images: &images,
             bitmaps: &bitmaps,

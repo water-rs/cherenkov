@@ -21,7 +21,5 @@ pub const GLYPH_STROKE: &str = "glyph-stroke";
 pub const BACKDROP_EFFECT_SDF_PATH: &str = "backdrop-effect-sdf-path";
 /// A colour font (COLR, CBDT or sbix).
 pub const COLOR_FONT: &str = "color-font";
-/// A blend space other than linear.
-pub const BLEND_SPACE: &str = "blend-space";
 /// A path clip whose rasterized mask does not fit the atlas.
 pub const PATH_CLIP_TOO_LARGE: &str = "path-clip-too-large";

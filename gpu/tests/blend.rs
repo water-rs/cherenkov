@@ -3,7 +3,10 @@
 #![expect(clippy::float_cmp, reason = "clear pixels are exact")]
 
 use cherenkov::kurbo::{Point, Rect};
-use cherenkov::{BlendMode, ColorStop, Draw, Extend, Group, Interpolation, Paint, WorkingColor};
+use cherenkov::{
+    BlendMode, BlendSpace, Color, ColorStop, Draw, Extend, Group, Interpolation, Paint, Srgb,
+    WorkingColor,
+};
 use cherenkov::{Engine, EngineError, Offscreen, OffscreenFormat};
 use cherenkov_gpu::{Gpu, GpuConfig};
 
@@ -532,6 +535,38 @@ fn destructive_child_of_an_intermediate_layer_stays_isolated()
         for (got, want) in px.iter().zip(expected.components) {
             assert!((*got - want).abs() < 0.02, "x={x}: {px:?} != {expected:?}");
         }
+    }
+    Ok(())
+}
+
+/// 50% sRGB blue over sRGB red inside an sRGB-encoded group composites in
+/// the encoded space: the readback is the encoded mix [0.5, 0, 0.5], not
+/// the linear-space one (~[0.735, 0, 0.735]).
+#[test]
+fn srgb_encoded_members_composite_in_the_encoded_space() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(engine) = engine() else {
+        return Ok(());
+    };
+    let surface = engine.surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))?;
+    let red = Color::<Srgb>::new([1.0, 0.0, 0.0, 1.0]).to_working();
+    let blue = Color::<Srgb>::new([0.0, 0.0, 1.0, 0.5]).to_working();
+    surface.update(|tx| {
+        tx[surface.root()].content(surface.record(|c| {
+            c.group(Group::new().blend_space(BlendSpace::SrgbEncoded), |c| {
+                c.fill(Rect::new(0.0, 0.0, 8.0, 8.0), red);
+                c.fill(Rect::new(0.0, 0.0, 8.0, 8.0), blue);
+            });
+        }));
+    });
+    engine.render(cherenkov::FrameTime::now())?;
+    let pixels = surface.readback()?.pixels;
+    let expected = Color::<Srgb>::new([0.5, 0.0, 0.5, 1.0]).to_working();
+    for (got, want) in pixels[0].iter().zip(expected.components) {
+        assert!(
+            (*got - want).abs() < 0.02,
+            "{:?} != {expected:?}",
+            pixels[0]
+        );
     }
     Ok(())
 }

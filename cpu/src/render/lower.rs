@@ -103,8 +103,15 @@ pub enum Item {
         /// Clip applied after convolution.
         clip: Option<ClipRef>,
     },
-    /// Start a fresh transparent scratch layer.
-    PushIsolate,
+    /// Start a fresh transparent scratch layer. The level stores
+    /// premultiplied pixels in `space`: the isolate's declared
+    /// `blend_space` when it composites semantically, or the enclosing
+    /// level's space when it is clip-only — a transparent level shares
+    /// the space it merges back into.
+    PushIsolate {
+        /// The level's storage space.
+        space: cherenkov::BlendSpace,
+    },
     /// Composite the scratch layer onto what lies below it.
     PopIsolate {
         /// The opacity multiplier.
@@ -120,6 +127,10 @@ pub enum Item {
         end: u32,
         /// Rows of apron above and below each band.
         apron: usize,
+        /// The scope's storage space: the isolate's declared
+        /// `blend_space` — members composite in it before the filter
+        /// sees the result.
+        space: cherenkov::BlendSpace,
     },
     /// Filter and composite the current scratch window.
     PopFilter {
@@ -335,8 +346,12 @@ pub struct Lowering<'a, 'b> {
     animating: bool,
     clip: Option<ClipRef>,
     /// Whether each open isolation level is clip-only (`true` when its
-    /// opacity is 1 and its blend is `Normal`), in emission order.
+    /// opacity is 1 and its blend is `Normal` in the linear space), in
+    /// emission order.
     iso_kinds: Vec<bool>,
+    /// The storage space of each open isolation level, in emission
+    /// order, parallel to [`Lowering::iso_kinds`].
+    iso_spaces: Vec<cherenkov::BlendSpace>,
     /// Backdrop groups planned before lowering, by group id.
     backdrops: FxHashMap<u64, BackdropPlan>,
     /// The apron rows each filtered layer's scope needs beyond its own
@@ -641,6 +656,7 @@ impl<'a, 'b> Lowering<'a, 'b> {
             animating: false,
             clip: None,
             iso_kinds: Vec::new(),
+            iso_spaces: Vec::new(),
             backdrops: FxHashMap::default(),
             scope_aprons: FxHashMap::default(),
             commands_lowered: 0,
@@ -1022,11 +1038,28 @@ impl<'a, 'b> Lowering<'a, 'b> {
         body: impl FnOnce(&mut Self) -> Result<(), RenderError>,
     ) -> Result<(), RenderError> {
         let saved = std::mem::replace(&mut self.clip, inner_clip);
-        self.iso_kinds
-            .push(opacity >= 1.0 && blend.0 == BlendMode::Normal);
-        self.items.push(Item::PushIsolate);
+        // A non-linear-space isolate changes pixels even when fully
+        // transparent and normally blended: it is semantic, never
+        // clip-only.
+        let clip_only = opacity >= 1.0
+            && blend.0 == BlendMode::Normal
+            && blend.1 == cherenkov::BlendSpace::Linear;
+        // Members composite in the declared space; a clip-only level
+        // shares the space it merges back into.
+        let space = if clip_only {
+            self.iso_spaces
+                .last()
+                .copied()
+                .unwrap_or(cherenkov::BlendSpace::Linear)
+        } else {
+            blend.1
+        };
+        self.iso_kinds.push(clip_only);
+        self.iso_spaces.push(space);
+        self.items.push(Item::PushIsolate { space });
         let result = body(self);
         self.iso_kinds.pop();
+        self.iso_spaces.pop();
         self.clip = saved;
         self.items.push(Item::PopIsolate {
             opacity,
@@ -1076,15 +1109,27 @@ impl<'a, 'b> Lowering<'a, 'b> {
             .max(footprint_apron);
         self.used_filters.insert(id.raw());
         let push = self.items.len();
-        self.items.push(Item::PushFilter { end: 0, apron });
+        // The scope stores its declared space: members composite in it
+        // and the filter sees the result.
+        self.items.push(Item::PushFilter {
+            end: 0,
+            apron,
+            space: blend.1,
+        });
         // The scope's nested run gets a fresh isolation stack; the kinds
-        // stack mirrors it.
+        // and spaces stacks mirror it, seeded at the scope's own space.
         let saved_kinds = std::mem::take(&mut self.iso_kinds);
+        let saved_spaces = std::mem::replace(&mut self.iso_spaces, vec![blend.1]);
         let result = body(self);
         self.iso_kinds = saved_kinds;
+        self.iso_spaces = saved_spaces;
         let end = u32::try_from(self.items.len())
             .map_err(|_| RenderError::Render(format!("filter {} scope is too large", id.raw())))?;
-        self.items[push] = Item::PushFilter { end, apron };
+        self.items[push] = Item::PushFilter {
+            end,
+            apron,
+            space: blend.1,
+        };
         self.items.push(Item::PopFilter {
             filter: (filter, params),
             opacity,

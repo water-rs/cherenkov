@@ -182,5 +182,5 @@ fn fs_external(in: VsOut) -> @location(0) vec4<f32> {
             color = vec4<f32>(rgb, alpha);
         }
     }
-    return color * cov;
+    return move_space(color * cov, SPACE_LINEAR, globals.space);
 }

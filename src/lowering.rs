@@ -555,6 +555,218 @@ impl Seg {
     }
 }
 
+/// Crossing ordinate of the pair `(p, q)` evaluated in operand order.
+/// The expression is not symmetric in its operands, so an event is
+/// always evaluated in the pair's current `active` order — the order
+/// the old per-band midpoint sort would produce, which is the operand
+/// order its crossing scan used.
+fn xing_y(p: &Seg, q: &Seg) -> f64 {
+    // p.x0 + p.slope*(y-p.y0) == q.x0 + q.slope*(y-q.y0)
+    q.slope.mul_add(q.y0, p.slope.mul_add(-p.y0, p.x0) - q.x0) / (q.slope - p.slope)
+}
+
+/// Bound on the distance between a pair event's stored ordinate and the
+/// true crossing, given `m_glob` — the maximum intermediate magnitude
+/// over all segments. It grows with `|appr|` more slowly than `appr`
+/// itself, so a heap head beyond a target plus this bound ends the
+/// scan: nothing after it can reach the target either.
+fn xing_err(appr: f64, m_glob: f64) -> f64 {
+    (m_glob + appr.abs()) * (64.0 * f64::EPSILON)
+}
+
+/// Crossing ordinate of the pair adjacent in `active` order `(p, q)`,
+/// pushed as a pending event. Below a pair's crossing the smaller-slope
+/// segment sits left, so a pair stored `(p, q)` with `sp.slope < sq.slope`
+/// is in post-cross orientation and also gets a `posts` entry: a later
+/// band whose midpoint drops below the crossing may have to revert it.
+/// Events carry a `det` flag: only a pair whose slopes differ by more
+/// than `EPS` can produce a band split (the old scan skipped the rest),
+/// but every non-parallel pair still changes order when its crossing
+/// passes, so near-parallel pairs get order events without the flag.
+/// Exactly parallel pairs never cross: their per-band order comes from
+/// the midpoint keys alone — rounding makes coincident pairs flip
+/// arbitrarily — and they go on `eqs` to be re-checked each band.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "segment counts stay under u32"
+)]
+fn push_xing(
+    xings: &mut BinaryHeap<Reverse<(Split, u32, u32, u8)>>,
+    posts: &mut BinaryHeap<(Split, u32, u32)>,
+    eqs: &mut Vec<(u32, u32)>,
+    segs: &[Seg],
+    p: usize,
+    q: usize,
+) {
+    let (sp, sq) = (&segs[p], &segs[q]);
+    let ds = sp.slope - sq.slope;
+    if ds == 0.0 {
+        eqs.push((p as u32, q as u32));
+        return;
+    }
+    let appr = xing_y(sp, sq);
+    if !appr.is_finite() {
+        return;
+    }
+    let det = u8::from(ds.abs() > EPS);
+    xings.push(Reverse((Split(appr), p as u32, q as u32, det)));
+    if sp.slope < sq.slope {
+        posts.push((Split(appr), p as u32, q as u32));
+    }
+}
+
+/// Whether the pair — adjacent left-to-right as `(l, r)` — sorts
+/// `(r, l)` at `ym`: the exact comparison the old midpoint sort
+/// applied.
+#[expect(
+    clippy::float_cmp,
+    reason = "exact key equality mirrors the sort's total_cmp tie-break"
+)]
+fn post_cross_at(l: &Seg, r: &Seg, ym: f64) -> bool {
+    let (xl, xr) = (l.x_at(ym), r.x_at(ym));
+    xr.total_cmp(&xl) == Ordering::Less
+        || (xr == xl && r.slope.total_cmp(&l.slope) == Ordering::Less)
+}
+
+/// Fix `active`'s inversions against the order at `ym`, which is the
+/// order the old per-band sort produced. `xings` carries an event for
+/// every pair adjacent in list order, keyed by the crossing ordinate
+/// evaluated in that order; popping while an entry could still reach
+/// `ym` covers every pair that must invert here. A live `(l, r)` pair
+/// inverted at `ym` swaps in place; the swap leaves the pair ordered
+/// `(r, l)` with the same crossing still ahead — its own re-queue plus
+/// a `posts` entry let a later band with a lower midpoint revert it,
+/// and the new outer neighbours get their own events. Entries that are
+/// no longer adjacent are stale and dropped. `posts` is a max-heap of
+/// swapped pairs: a band whose `ym` sits below a swapped pair's
+/// crossing needs the pair reverted to pre-cross order, so entries
+/// above `ym` are popped and un-swapped when their ordering at `ym`
+/// says so.
+#[expect(
+    clippy::too_many_arguments,
+    clippy::cast_possible_truncation,
+    clippy::ptr_arg,
+    reason = "the sweep state is one borrow; segment counts stay under u32; eqs grows by push"
+)]
+fn drain_xings(
+    xings: &mut BinaryHeap<Reverse<(Split, u32, u32, u8)>>,
+    posts: &mut BinaryHeap<(Split, u32, u32)>,
+    eqs: &mut Vec<(u32, u32)>,
+    segs: &[Seg],
+    active: &mut Vec<usize>,
+    pos: &mut [usize],
+    ym: f64,
+    m_glob: f64,
+) {
+    // Alternate the passes until none moves anything: a forward swap
+    // can join a pair that must revert, and a revert can join a pair
+    // that must swap — the cascades settle the list into the exact
+    // order the old sort produced at `ym`.
+    loop {
+        let mut moved = false;
+        let mut requeue: Vec<Reverse<(Split, u32, u32, u8)>> = Vec::new();
+        while let Some(&Reverse((Split(appr), l, r, det))) = xings.peek() {
+            if appr - xing_err(appr, m_glob) > ym {
+                break;
+            }
+            xings.pop();
+            let (l, r) = (l as usize, r as usize);
+            let (pl, pr) = (pos[l], pos[r]);
+            if pl.checked_add(1) != Some(pr) {
+                continue;
+            }
+            if post_cross_at(&segs[l], &segs[r], ym) {
+                moved = true;
+                active.swap(pl, pr);
+                pos[l] = pr;
+                pos[r] = pl;
+                if pl > 0 {
+                    push_xing(xings, posts, eqs, segs, active[pl - 1], r);
+                }
+                let back = xing_y(&segs[r], &segs[l]);
+                xings.push(Reverse((Split(back), r as u32, l as u32, det)));
+                posts.push((Split(back), r as u32, l as u32));
+                if pr + 1 < active.len() {
+                    push_xing(xings, posts, eqs, segs, l, active[pr + 1]);
+                }
+            } else {
+                requeue.push(Reverse((Split(appr), l as u32, r as u32, det)));
+            }
+        }
+        for e in requeue {
+            xings.push(e);
+        }
+        // Bands can revisit a lower `ym` after a split, reverting pairs
+        // swapped or joined into post-cross order at a higher one: pop
+        // every such pair whose crossing is below this `ym` and
+        // un-swap the ones still out of order.
+        let mut repost: Vec<(Split, u32, u32)> = Vec::new();
+        while let Some(&(Split(appr), b, a)) = posts.peek() {
+            if appr <= ym + xing_err(appr, m_glob) {
+                break;
+            }
+            posts.pop();
+            let (b, a) = (b as usize, a as usize);
+            let (pb, pa) = (pos[b], pos[a]);
+            if pb.checked_add(1) != Some(pa) {
+                continue;
+            }
+            if post_cross_at(&segs[b], &segs[a], ym) {
+                moved = true;
+                active.swap(pb, pa);
+                pos[b] = pa;
+                pos[a] = pb;
+                if pb > 0 {
+                    push_xing(xings, posts, eqs, segs, active[pb - 1], a);
+                }
+                push_xing(xings, posts, eqs, segs, a, b);
+                if pa + 1 < active.len() {
+                    push_xing(xings, posts, eqs, segs, b, active[pa + 1]);
+                }
+            } else {
+                repost.push((Split(appr), b as u32, a as u32));
+            }
+        }
+        for e in repost {
+            posts.push(e);
+        }
+        // Exactly-parallel pairs have no crossing to key an event on,
+        // yet the old sort re-evaluated their midpoint keys every band
+        // — coincident pairs flip on rounding noise — so each still-
+        // adjacent one is re-checked against the order at `ym` here.
+        let mut i = 0;
+        while i < eqs.len() {
+            let (e0, e1) = (eqs[i].0 as usize, eqs[i].1 as usize);
+            let (p0, p1) = (pos[e0], pos[e1]);
+            let (l, r, pl, pr) = if p0.checked_add(1) == Some(p1) {
+                (e0, e1, p0, p1)
+            } else if p1.checked_add(1) == Some(p0) {
+                (e1, e0, p1, p0)
+            } else {
+                eqs.swap_remove(i);
+                continue;
+            };
+            if post_cross_at(&segs[l], &segs[r], ym) {
+                moved = true;
+                active.swap(pl, pr);
+                pos[l] = pr;
+                pos[r] = pl;
+                eqs[i] = (r as u32, l as u32);
+                if pl > 0 {
+                    push_xing(xings, posts, eqs, segs, active[pl - 1], r);
+                }
+                if pr + 1 < active.len() {
+                    push_xing(xings, posts, eqs, segs, l, active[pr + 1]);
+                }
+            }
+            i += 1;
+        }
+        if !moved {
+            break;
+        }
+    }
+}
+
 /// A band split point pending consumption, ordered by `f64::total_cmp`.
 /// Only finite values are ever pushed: a crossing is inserted strictly
 /// inside its band.
@@ -599,7 +811,8 @@ impl Ord for Split {
 #[expect(
     clippy::too_many_lines,
     clippy::cast_possible_truncation,
-    reason = "one sweep per design; emitted coordinates fit f32"
+    clippy::float_cmp,
+    reason = "one sweep per design; emitted coordinates fit f32; key equality mirrors the sort"
 )]
 pub fn resolve_winding(
     segments: &[(f32, f32, f32, f32)],
@@ -644,13 +857,32 @@ pub fn resolve_winding(
 
     let mut out: Vec<(f64, f64, f64, f64)> = Vec::with_capacity(segs.len());
     let mut overlap = false;
-    // `next` admits segments as the sweep reaches their top; `active`
-    // retires them once they end at or above the band's top. No segment
-    // endpoint ever lies strictly inside a band — inserted split points
-    // don't change admission — so the incremental set matches a fresh
-    // `y0 <= ya && y1 >= yb` scan every band.
+    // `next` admits segments as the sweep reaches their top. `active`
+    // holds the live segments in left-to-right order just below the
+    // current band's top — the same order the old per-band midpoint sort
+    // produced, maintained incrementally instead of re-sorted every
+    // band: a new segment is inserted at its position at the band top,
+    // retirement removes in place, and order changes happen only at the
+    // crossings the sweep detects (an adjacent pair swaps). `pos` maps a
+    // segment to its slot in `active` (`usize::MAX` once retired).
+    // `retire` pops segments ending at or above the band top and
+    // `xings` carries the crossing ordinate of every adjacent pair,
+    // computed once when the pair forms — the earliest in-band crossing
+    // is then the heap head rather than a full rescan, and pairs whose
+    // crossing reaches the band top swap back into order.
     let mut next = 0usize;
     let mut active: Vec<usize> = Vec::with_capacity(segs.len());
+    let mut pos: Vec<usize> = vec![usize::MAX; segs.len()];
+    let mut retire = BinaryHeap::<Reverse<(Split, u32)>>::new();
+    let mut xings = BinaryHeap::<Reverse<(Split, u32, u32, u8)>>::new();
+    // Swapped pairs awaiting possible reversion when a later band's
+    // midpoint sits below their crossing; max-heap keyed by the
+    // ordinate in swapped order.
+    let mut posts = BinaryHeap::<(Split, u32, u32)>::new();
+    // Adjacent pairs with exactly equal slopes: no crossing exists to
+    // key an event on, but the old sort still ordered them by their
+    // midpoint keys each band, so they are re-checked per band.
+    let mut eqs: Vec<(u32, u32)> = Vec::new();
     // Per-segment open boundary run: (index into `out`, orientation,
     // emitting band). A segment that is a boundary again in the very
     // next band with the same orientation extends its emitted edge
@@ -681,6 +913,13 @@ pub fn resolve_winding(
     let mut cursor = 1usize;
     let mut band = 0usize;
     let mut ya = ys[0];
+    // A single operand-order bound for every pair event: the stored
+    // heap ordinate sits within `xing_err` of the scan-order value for
+    // any pair, so heads with ordinates beyond a target plus this bound
+    // can never win and the pops below stop there.
+    let m_glob = segs
+        .iter()
+        .fold(0.0f64, |m, s| m.max((s.slope * s.y0).abs()).max(s.x0.abs()));
     loop {
         let (yb, from_pending) = match pending.peek() {
             Some(&Reverse(Split(yc))) if ys.get(cursor).is_none_or(|&base| yc < base) => (yc, true),
@@ -689,11 +928,67 @@ pub fn resolve_winding(
                 None => break,
             },
         };
+        let ym = ya.midpoint(yb);
+        // Bring the carried-over list into the order the old sort
+        // produced at this band's midpoint first, so the binary-search
+        // admission below inserts on a sorted list.
+        drain_xings(
+            &mut xings,
+            &mut posts,
+            &mut eqs,
+            &segs,
+            &mut active,
+            &mut pos,
+            ym,
+            m_glob,
+        );
         while next < segs.len() && segs[next].y0 <= ya + EPS {
-            active.push(next);
+            let i = next;
             next += 1;
+            retire.push(Reverse((Split(segs[i].y1), i as u32)));
+            // Insert at the segment's position at the band's midpoint:
+            // the position the old sort produced. A tie on x goes by
+            // slope, and equal keys land after existing and
+            // already-admitted members, matching the stable sort.
+            let (xi, si) = (segs[i].x_at(ym), segs[i].slope);
+            let at = active.partition_point(|&j| {
+                let xj = segs[j].x_at(ym);
+                xj < xi || (xj == xi && segs[j].slope <= si)
+            });
+            active.insert(at, i);
+            for k in at..active.len() {
+                pos[active[k]] = k;
+            }
+            if at > 0 {
+                push_xing(&mut xings, &mut posts, &mut eqs, &segs, active[at - 1], i);
+            }
+            if at + 1 < active.len() {
+                push_xing(&mut xings, &mut posts, &mut eqs, &segs, i, active[at + 1]);
+            }
         }
-        active.retain(|&i| segs[i].y1 > ya + EPS);
+        while let Some(&Reverse((Split(y1), i))) = retire.peek() {
+            if y1 > ya + EPS {
+                break;
+            }
+            retire.pop();
+            let i = i as usize;
+            let at = pos[i];
+            pos[i] = usize::MAX;
+            active.remove(at);
+            for k in at..active.len() {
+                pos[active[k]] = k;
+            }
+            if at > 0 && at < active.len() {
+                push_xing(
+                    &mut xings,
+                    &mut posts,
+                    &mut eqs,
+                    &segs,
+                    active[at - 1],
+                    active[at],
+                );
+            }
+        }
         if active.is_empty() {
             prev_open.clear();
             if from_pending {
@@ -705,33 +1000,43 @@ pub fn resolve_winding(
             ya = yb;
             continue;
         }
-        // Order at the band's midpoint: segments that meet at a vertex
-        // on ya or yb are separated at ym, so boundary ties cannot hide
-        // a crossing. If two non-adjacent segments p < r cross at yc
-        // inside the band, the segment q between them at ym must have
-        // swapped with p or r somewhere between ym and yc, so an
-        // adjacent pair also crosses strictly inside — checking only
-        // adjacent pairs is complete. Genuinely coincident segments
-        // never cross and give the same regions in any order.
-        let ym = ya.midpoint(yb);
-        active.sort_by(|a, b| {
-            segs[*a]
-                .x_at(ym)
-                .total_cmp(&segs[*b].x_at(ym))
-                .then_with(|| segs[*a].slope.total_cmp(&segs[*b].slope))
-        });
+        // Pairs joined by admissions and retirements can also be
+        // inverted at `ym`: a removal joins two segments whose crossing
+        // is already above it, so swap those into order too.
+        drain_xings(
+            &mut xings,
+            &mut posts,
+            &mut eqs,
+            &segs,
+            &mut active,
+            &mut pos,
+            ym,
+            m_glob,
+        );
         // Split at the smallest crossing strictly inside the band.
+        // `active` is now exactly the order the old midpoint sort
+        // produced, so the adjacent-pair set and each crossing's
+        // operand order match the old scan — the heap head is the
+        // minimum without re-scoring.
         let mut split = None;
-        for pair in active.windows(2) {
-            let (p, q) = (&segs[pair[0]], &segs[pair[1]]);
-            if (p.slope - q.slope).abs() > EPS {
-                // p.x0 + p.slope*(y-p.y0) == q.x0 + q.slope*(y-q.y0)
-                let yc = q.slope.mul_add(q.y0, p.slope.mul_add(-p.y0, p.x0) - q.x0)
-                    / (q.slope - p.slope);
-                if yc > ya + EPS && yc < yb - EPS && split.is_none_or(|s| yc < s) {
-                    split = Some(yc);
-                }
+        let mut keep: Vec<Reverse<(Split, u32, u32, u8)>> = Vec::new();
+        while let Some(&Reverse((Split(appr), l, r, det))) = xings.peek() {
+            if appr >= yb - EPS {
+                break;
             }
+            xings.pop();
+            let (l, r) = (l as usize, r as usize);
+            if pos[l].checked_add(1) != Some(pos[r]) {
+                continue;
+            }
+            keep.push(Reverse((Split(appr), l as u32, r as u32, det)));
+            if det != 0 && appr > ya + EPS {
+                split = Some(appr);
+                break;
+            }
+        }
+        for e in keep {
+            xings.push(e);
         }
         if let Some(yc) = split {
             pending.push(Reverse(Split(yc)));

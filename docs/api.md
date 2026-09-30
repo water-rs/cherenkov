@@ -60,9 +60,9 @@ The `cherenkov` crate owns the whole front end and the render thread's loop. A b
 ```rust
 /// The render-thread contract. Implemented by a zero-sized marker type (`Gpu`, `Raster`).
 pub trait Backend: Sized + 'static {
-    type Config: Send + 'static;                         // GpuConfig, RasterConfig
+    type Config: RenderTransfer + 'static;               // GpuConfig, RasterConfig
     type Info: Clone + Send + 'static;                   // GpuInfo, RasterInfo: provenance for reports
-    type Target: From<Offscreen> + Send + 'static;       // Offscreen or an interop window target
+    type Target: From<Offscreen> + RenderTransfer + 'static; // Offscreen or an interop window target
     type Renderer: Renderer;                             // the render-thread state; never leaves that thread
 
     /// Runs on the render thread, once. Creates the device or worker pool.
@@ -72,7 +72,7 @@ pub trait Backend: Sized + 'static {
 /// Everything the render loop asks of a backend. Every method runs on the render thread.
 pub trait Renderer: 'static {
     type Target;
-    type Font: Send + 'static;                           // a font validated by `prepare_font`
+    type Font: RenderTransfer + 'static;                 // a font validated by `prepare_font`
     fn create_surface(&mut self, id: SurfaceId, target: Self::Target) -> Result<SurfaceInfo, SurfaceError>;
     fn resize_surface(&mut self, id: SurfaceId, size: (u32, u32));
     fn destroy_surface(&mut self, id: SurfaceId);
@@ -90,7 +90,8 @@ pub trait Renderer: 'static {
     fn remove_image(&mut self, id: ImageId);
 
     /// Replaces or updates a layer's recorded content (`Content` / `Picture`), or clears it.
-    fn set_content(&mut self, surface: SurfaceId, layer: LayerId, content: Option<ContentOp>);
+    /// Returns the previous picture when replaced or cleared, for the UI thread to recycle.
+    fn set_content(&mut self, surface: SurfaceId, layer: LayerId, content: Option<ContentOp>) -> Option<Picture>;
     /// The layer is gone: drop every cache keyed on it.
     fn remove_layer(&mut self, surface: SurfaceId, layer: LayerId);
 
@@ -182,10 +183,14 @@ Resources are RAII handles: they are `Clone`, and the GPU memory is released, de
 
 ```rust
 let font: Font = engine.font(FontSource::mapped(path)?)?;          // memory-mapped; never copied
-let photo: Image<Astc4x4> = engine.image(encoded_astc, ImageDesc::new(DisplayP3))?;
-let hdr: Image<Rgba16F> = engine.image(decoded, ImageDesc::new(Rec2020Pq).hdr(meta))?;
+let photo: Image<Astc4x4> = engine.image(
+    ImageData::<Astc4x4>::new(width, height, encoded_astc)?.color_space(ImageColorSpace::DisplayP3),
+)?;
+let hdr: Image<Rgba16F> = engine.image(
+    ImageData::<Rgba16F>::new(width, height, decoded)?.color_space(ImageColorSpace::LinearP3),
+)?;
 hdr.replace(ImageData::<Rgba16F>::new(width, height, next_frame)?)?;  // same id, new pixels
-let shader: ShaderPaintHandle = engine.shader_paint(wgsl_source)?; // validated here, GPU only
+let shader: Shader = engine.shader(ShaderSource::wgsl(fragment))?;  // validated here, GPU only
 ```
 
 - **One registration model, on every target.** `engine.font`, `engine.image`, `engine.shader`, `engine.backdrop_shader` and `image.replace` are synchronous on native and on wasm32, with the same signatures, so a recording pass can register a resource and draw it in the same frame without awaiting anything. Each call validates on the calling thread what needs no device, allocates the id, queues the backend operation and returns:

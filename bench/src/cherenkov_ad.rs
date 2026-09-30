@@ -389,6 +389,11 @@ fn record_motion(c: &mut cherenkov::Recorder, op: &Op, motion: &PaintMotion) {
 
 /// Records `ops` with `live` slot bindings — identical to dev's record
 /// loop, reached by scenes that carry no motions.
+#[expect(
+    clippy::inline_always,
+    reason = "the record closure must keep dev's per-op call-free codegen"
+)]
+#[inline(always)]
 fn record_ops_static(c: &mut cherenkov::Recorder, ops: &[Op], live: &[LiveRun]) {
     for (index, op) in ops.iter().enumerate() {
         match live.iter().find(|live| live.index == index) {
@@ -400,6 +405,11 @@ fn record_ops_static(c: &mut cherenkov::Recorder, ops: &[Op], live: &[LiveRun]) 
 
 /// Records `ops` with `live` slot bindings and `motions` animated paint
 /// bindings, reached only on scenes that carry motions.
+#[expect(
+    clippy::inline_always,
+    reason = "the record closure must keep dev's per-op call-free codegen"
+)]
+#[inline(always)]
 fn record_ops(c: &mut cherenkov::Recorder, ops: &[Op], live: &[LiveRun], motions: &[PaintMotion]) {
     for (index, op) in ops.iter().enumerate() {
         match live.iter().find(|live| live.index == index) {

@@ -334,10 +334,19 @@ pub struct Atlas {
     map: rustc_hash::FxHashMap<GlyphKey, Entry>,
     /// Rasterized path emissions, keyed by content hash.
     paths: rustc_hash::FxHashMap<u64, PathEmit>,
-    /// Append-only slot lists the `PathEmit::slots` ranges address.
-    /// Entries outlive their emission record so a lowered leaf's slot
-    /// ranges stay readable through the commit that admits them.
+    /// Slot lists the `PathEmit::slots` ranges address. Entries
+    /// outlive their emission record so a lowered leaf's slot ranges
+    /// stay readable through the commit that admits them; a range an
+    /// evicted emission leaves is recycled through `slot_dead` →
+    /// `slot_holes` rather than dropped, since same-commit readers
+    /// may still address it (#119).
     emit_slots: Vec<u32>,
+    /// `emit_slots` ranges an evicting commit may hand to a new
+    /// emission — dead before this commit started.
+    slot_holes: Vec<Range<usize>>,
+    /// `emit_slots` ranges this commit's evictions released;
+    /// promoted to `slot_holes` at the next `begin_commit`.
+    slot_dead: Vec<Range<usize>>,
     /// Rasterized path-clip masks, keyed by content hash.
     masks: rustc_hash::FxHashMap<u64, MaskCell>,
     /// Path-clip masks too large for the atlas, on their own textures,
@@ -411,6 +420,8 @@ impl Atlas {
             map: rustc_hash::FxHashMap::default(),
             paths: rustc_hash::FxHashMap::default(),
             emit_slots: Vec::new(),
+            slot_holes: Vec::new(),
+            slot_dead: Vec::new(),
             masks: rustc_hash::FxHashMap::default(),
             mask_textures: rustc_hash::FxHashMap::default(),
             texture_limit: device.limits().max_texture_dimension_2d,
@@ -500,6 +511,8 @@ impl Atlas {
         self.map.clear();
         self.paths.clear();
         self.emit_slots.clear();
+        self.slot_holes.clear();
+        self.slot_dead.clear();
         self.masks.clear();
         self.layout.shelves.clear();
         self.layout.vacant.clear();
@@ -518,7 +531,9 @@ impl Atlas {
 
     /// Caches a path emission.
     pub fn insert_path(&mut self, key: u64, emit: PathEmit) {
-        self.cpu_bytes += (emit.spans.len() * 16 + emit.cells.len() * 24) as u64 + LIVE_ENTRY_BYTES;
+        self.cpu_bytes += (emit.spans.len() * 16 + emit.cells.len() * 24 + emit.slots.len() * 4)
+            as u64
+            + LIVE_ENTRY_BYTES;
         self.paths.insert(key, emit);
     }
 
@@ -1083,8 +1098,7 @@ impl Atlas {
                 texels,
             });
         }
-        emit.slots = self.emit_slots.len()..self.emit_slots.len() + slots.len();
-        self.emit_slots.extend_from_slice(&slots);
+        emit.slots = self.alloc_emit_slots(&slots);
         self.live.insert(
             key,
             LiveEntry {
@@ -1162,6 +1176,23 @@ impl Atlas {
         Some(())
     }
 
+    /// Reserves `slots` in the `emit_slots` arena — a dead range
+    /// first, the tail otherwise (#119).
+    fn alloc_emit_slots(&mut self, slots: &[u32]) -> Range<usize> {
+        if let Some(pos) = self.slot_holes.iter().position(|r| r.len() >= slots.len()) {
+            let hole = self.slot_holes.swap_remove(pos);
+            let range = hole.start..hole.start + slots.len();
+            self.emit_slots[range.clone()].copy_from_slice(slots);
+            if hole.end > range.end {
+                self.slot_holes.push(range.end..hole.end);
+            }
+            return range;
+        }
+        let start = self.emit_slots.len();
+        self.emit_slots.extend_from_slice(slots);
+        start..self.emit_slots.len()
+    }
+
     /// The deduplicated shelf slots a `PathEmit::slots` range addresses.
     pub fn emit_slot_arena(&self, range: Range<usize>) -> &[u32] {
         &self.emit_slots[range]
@@ -1212,6 +1243,7 @@ impl Atlas {
     /// never a victim, and freezes each live shelf's `x` as `base` for
     /// [`Self::upload_committed`]'s region diffing.
     pub fn begin_commit(&mut self, touches: &[u32]) {
+        self.slot_holes.append(&mut self.slot_dead);
         self.tick += 1;
         self.evicting = false;
         self.evicted.clear();
@@ -1291,7 +1323,10 @@ impl Atlas {
                 }
                 LiveKind::Path => {
                     if let Some(emit) = self.paths.remove(&hk) {
-                        bytes += (emit.spans.len() * 16 + emit.cells.len() * 24) as u64
+                        self.slot_dead.push(emit.slots.clone());
+                        bytes += (emit.spans.len() * 16
+                            + emit.cells.len() * 24
+                            + emit.slots.len() * 4) as u64
                             + LIVE_ENTRY_BYTES;
                     }
                 }

@@ -39,6 +39,28 @@ pub struct FontData {
     pub colr: std::cell::RefCell<FxHashMap<(u32, u64, u64), cherenkov::Picture>>,
 }
 
+/// A font validated on the caller thread by `Renderer::prepare_font`:
+/// everything registration needs, so `add_font` cannot fail.
+pub struct PreparedFont {
+    pub data: Arc<[u8]>,
+    pub index: u32,
+    pub has_colr: bool,
+    pub bitmap: Option<Arc<super::bitmap::BitmapFont>>,
+}
+
+impl From<PreparedFont> for FontData {
+    fn from(font: PreparedFont) -> Self {
+        Self {
+            data: font.data,
+            index: font.index,
+            has_colr: font.has_colr,
+            has_bitmap: font.bitmap.is_some(),
+            bitmap: font.bitmap,
+            colr: std::cell::RefCell::new(FxHashMap::default()),
+        }
+    }
+}
+
 impl FontData {
     /// A per-thread copy: shares the font bytes, clones the COLR cache.
     /// Workers each own one so `colr` can stay a plain `RefCell`.

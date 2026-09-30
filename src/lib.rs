@@ -90,7 +90,8 @@ pub use crate::paint::{
 };
 pub use crate::record::{Content, ContentChange, Draw, Fixed, Live, Recorder, StaticRecorder};
 pub use crate::resource::{
-    BackdropGroup, BackdropSample, BackdropShader, Filter, Font, FontSource, Image, Shader,
+    BackdropGroup, BackdropSample, BackdropShader, Filter, Font, FontSource, Image, ResourceId,
+    Shader,
 };
 pub use crate::shape::{
     ContinuousRect, EvenOdd, FillRule, PATH_TOLERANCE, PathRef, Semantic, Shape, ShapeData,

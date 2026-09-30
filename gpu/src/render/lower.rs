@@ -422,9 +422,9 @@ impl ContentData {
         self.storage = EmissionStorage::default();
     }
 
-    /// Whether the content samples image `id`.
-    pub fn references_image(&self, id: cherenkov::ImageId) -> bool {
-        self.retained.references_image(id)
+    /// Whether the content samples `resource`.
+    pub fn references(&self, resource: cherenkov::ResourceId) -> bool {
+        self.retained.references(resource)
     }
 
     /// Discards the lowering of content that samples image `id`, whose

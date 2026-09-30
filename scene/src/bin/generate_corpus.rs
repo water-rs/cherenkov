@@ -3585,7 +3585,7 @@ fn run() -> Result<(), SceneError> {
             card.fill(Shape::RoundedRect(rect), solid(srgb(0.35, 0.55, 0.62)));
             card.motion(Motion::Paint {
                 item: body,
-                from: solid(srgb(0.92, 0.35, 0.30)),
+                from: Box::new(solid(srgb(0.92, 0.35, 0.30))),
                 animation: MotionAnimation::Spring {
                     response: 0.5,
                     damping: 1.0,
@@ -3639,7 +3639,7 @@ fn run() -> Result<(), SceneError> {
             );
             panel.motion(Motion::Paint {
                 item,
-                from: Paint::Linear(LinearGradient {
+                from: Box::new(Paint::Linear(LinearGradient {
                     start: Point::new(24.0, 24.0),
                     end: Point::new(24.0, 200.0),
                     stops: vec![
@@ -3654,7 +3654,7 @@ fn run() -> Result<(), SceneError> {
                     ],
                     extend: Extend::Pad,
                     interpolation: ColorSpace::Srgb,
-                }),
+                })),
                 animation: MotionAnimation::Curve {
                     duration_ms: 400,
                     x1: 0.42,

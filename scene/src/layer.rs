@@ -260,8 +260,9 @@ pub enum Motion {
         /// Index into `items`; the entry must be an `Item::Draw` carrying a
         /// paint operand (`fill`, `stroke` or `glyphs`).
         item: usize,
-        /// The paint the operand starts at.
-        from: Paint,
+        /// The paint the operand starts at. Boxed like
+        /// [`Paint::Transformed`]'s inner paint to keep `Motion` small.
+        from: Box<Paint>,
         /// How it moves to the item's static paint.
         animation: MotionAnimation,
     },

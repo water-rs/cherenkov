@@ -1234,7 +1234,7 @@ fn paint_motion(
     };
     Ok(Some(PaintMotion {
         index: position,
-        binding: nami::binding(convert::front_paint(from, images, &FRONT)?),
+        binding: nami::binding(convert::front_paint(from.as_ref(), images, &FRONT)?),
         target,
         animation: motion_animation(*animation),
     }))

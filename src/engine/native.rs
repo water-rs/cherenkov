@@ -230,7 +230,10 @@ impl<B: Backend> Engine<B> {
                 r.add_font(id, font);
             })))
             .map_err(|_| ResourceError::Lost)?;
-        Ok(Font::new(id, self.on_drop(move |r| r.remove_font(id))))
+        Ok(Font::new(
+            id,
+            self.on_release(ResourceId::Font(id), move |r| r.remove_font(id)),
+        ))
     }
 
     /// Registers an image. [`Image::replace`] later swaps its pixels
@@ -374,8 +377,9 @@ impl<B: Backend> Engine<B> {
         move || post(Message::Resource(Box::new(op)))
     }
 
-    /// The drop of a resource queued with [`Engine::register`]: `remove`
-    /// runs only when the backend holds the resource.
+    /// The drop of a registered resource's last handle: the render loop
+    /// runs `remove` once no surface's installed content draws the
+    /// resource, and only when the backend holds it.
     fn on_release(
         &self,
         resource: ResourceId,

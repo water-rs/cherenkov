@@ -790,3 +790,60 @@ fn removing_a_member_drops_its_region() -> Result<(), Box<dyn std::error::Error>
     assert_eq!(engine.memory().backdrop_captures, Bytes(512 * 96 * 8));
     Ok(())
 }
+
+/// A backdrop shader whose last handle drops while a member still samples
+/// it stays registered: the next redraw still runs its effect. Clearing the
+/// member's effect carries out the release, so a kept effect value naming
+/// the shader afterwards fails the frame (#199).
+#[test]
+fn a_released_backdrop_shader_stays_while_a_member_samples_it()
+-> Result<(), Box<dyn std::error::Error>> {
+    let engine = Engine::<Gpu>::new(GpuConfig::default())?;
+    let shader = engine.backdrop_shader(cherenkov::BackdropShaderSource::wgsl(
+        "fn backdrop_effect(p: vec2<f32>, sdf: f32, normal: vec2<f32>, size: vec2<f32>, params: array<vec4<f32>, 16>) -> vec4<f32> {
+            let rim = clamp(1.0 + sdf / 4.0, 0.0, 1.0);
+            return vec4<f32>(backdrop_sample(p).rgb * (1.0 + params[0].x * rim), backdrop_sample(p).a);
+        }",
+    ))?;
+    let effect = shader.effect(vec![3.0]);
+    let surface = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
+    let group = surface.backdrop_group_unfiltered();
+    let member = surface.layer();
+    let fill = |color: [f32; 4]| {
+        surface.update(|tx| {
+            tx[surface.root()].content(surface.record(|r| {
+                r.fill(Rect::new(0.0, 0.0, 64.0, 64.0), WorkingColor::new(color));
+            }));
+        });
+    };
+    fill([1.0, 0.0, 0.0, 1.0]);
+    surface.update(|tx| {
+        tx[surface.root()].push(&member);
+        tx[&member]
+            .clip(Rect::new(8.0, 8.0, 56.0, 56.0))
+            .backdrop(group.sample_with(effect.clone()));
+    });
+    engine.render(FrameTime::now())?;
+    drop(shader);
+    // A new backdrop colour redraws the member through the released shader.
+    fill([0.0, 1.0, 0.0, 1.0]);
+    engine.render(FrameTime::now())?;
+    let readback = surface.readback()?;
+    let lit = pixel(&readback, 10, 32);
+    assert!(lit[1] > 1.5, "rim pixel {lit:?}");
+    assert_pixel(pixel(&readback, 32, 32), [0.0, 1.0, 0.0, 1.0], 1e-3);
+
+    surface.update(|tx| {
+        tx[&member].backdrop(group.sample());
+    });
+    engine.render(FrameTime::now())?;
+    surface.update(|tx| {
+        tx[&member].backdrop(group.sample_with(effect));
+    });
+    let result = engine.render(FrameTime::now());
+    assert!(
+        matches!(&result, Err(cherenkov::RenderError::Render(message)) if message.contains("is not registered")),
+        "a member sampling the freed shader: {result:?}"
+    );
+    Ok(())
+}

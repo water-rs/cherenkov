@@ -4702,9 +4702,23 @@ impl GpuRenderer {
                             }),
                             backdrop,
                             range.image.as_ref().and_then(|source| match source {
-                                lower::ImageSource::Registered(id) => {
-                                    self.images.get(id).map(|image| &image.view)
-                                }
+                                // Lowering resolved this range against a
+                                // registered image, and the render loop frees
+                                // an image only once no installed content
+                                // draws it (#199): a range naming a missing
+                                // image is an engine defect, never drawn
+                                // with a substitute.
+                                lower::ImageSource::Registered(id) => Some(
+                                    &self
+                                        .images
+                                        .get(id)
+                                        .unwrap_or_else(|| {
+                                            panic!(
+                                                "a lowered range samples image {id}, which is not registered"
+                                            )
+                                        })
+                                        .view,
+                                ),
                                 lower::ImageSource::Bitmap(key) => {
                                     self.bitmaps.get(key).map(|bitmap| &bitmap.image.view)
                                 }

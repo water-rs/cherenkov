@@ -48,7 +48,7 @@ pub trait ShaderPaint: Backend {
         id: ShaderId,
         source: ShaderSource,
     ) -> impl core::future::Future<Output = Result<(), ResourceError>>;
-    /// Unregisters a shader.
+    /// Unregisters a shader no installed content draws any more.
     fn remove_shader(r: &mut Self::Renderer, id: ShaderId);
 }
 
@@ -201,8 +201,7 @@ pub trait BackdropShaders: Backdrop {
         source: crate::BackdropShaderSource,
     ) -> impl core::future::Future<Output = Result<(), ResourceError>>;
 
-    /// Unregisters a backdrop effect shader; frames that still sample it
-    /// fail.
+    /// Unregisters a backdrop effect shader no layer samples any more.
     fn remove_backdrop_shader(r: &mut Self::Renderer, id: BackdropShaderId);
 }
 

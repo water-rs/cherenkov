@@ -384,14 +384,17 @@ impl DisplayList {
     }
 
     /// Whether any command, including those of nested pictures, samples
-    /// `resource`: an image draw, or an image or shader paint of a fill,
-    /// stroke or glyph run. Content never names a backdrop shader; layers
-    /// sample those through the tree.
+    /// `resource`: a glyph run's font, an image draw, or an image or shader
+    /// paint of a fill, stroke or glyph run. Content never names a backdrop
+    /// shader; layers sample those through the tree.
     pub(crate) fn references(&self, resource: ResourceId) -> bool {
         self.commands.iter().any(|command| match command {
-            Command::Fill { paint, .. }
-            | Command::Stroke { paint, .. }
-            | Command::Glyphs { paint, .. } => paint.references(resource),
+            Command::Fill { paint, .. } | Command::Stroke { paint, .. } => {
+                paint.references(resource)
+            }
+            Command::Glyphs { run, paint } => {
+                resource == ResourceId::Font(run.font) || paint.references(resource)
+            }
             Command::Image { image, .. } => resource == ResourceId::Image(*image),
             Command::Picture { picture, .. } => picture.display_list().references(resource),
             Command::Shadow { .. }

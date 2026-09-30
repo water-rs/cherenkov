@@ -9,7 +9,7 @@ use rustc_hash::FxHashMap;
 
 use kurbo::{Affine, Vec2};
 
-use crate::backend::{Backend, Frame, Redraw, Renderer, SurfaceInfo};
+use crate::backend::{Backend, Display, Frame, Redraw, Renderer, SurfaceInfo};
 use crate::capability::{ShaderPaint, ShaderSource};
 use crate::config::MemoryUsage;
 use crate::error::{EngineError, RenderError, ResourceError, SurfaceError};
@@ -60,6 +60,11 @@ pub struct FrameRecord {
     pub surface: SurfaceId,
     /// The frame's `changed` flag for this surface.
     pub changed: bool,
+    /// The frame's `present_pending` flag for this surface: a display
+    /// change re-presents without touching content (#98).
+    pub present_pending: bool,
+    /// The display state the frame presented with.
+    pub display: Display,
     /// Every layer's sampled state.
     pub layers: Vec<LayerSample>,
 }
@@ -320,6 +325,8 @@ impl Renderer for NullRenderer {
             let _ = self.events.send(Event::Frame(FrameRecord {
                 surface: surface.id,
                 changed: surface.changed,
+                present_pending: surface.present_pending,
+                display: surface.display,
                 layers,
             }));
         }
@@ -348,6 +355,8 @@ impl Renderer for NullRenderer {
             let _ = self.events.send(Event::Frame(FrameRecord {
                 surface: surface.id,
                 changed: surface.changed,
+                present_pending: surface.present_pending,
+                display: surface.display,
                 layers,
             }));
         }
@@ -1815,6 +1824,72 @@ mod tests {
         engine.render(FrameTime::now()).unwrap();
         let record = frames(&rx).pop().expect("frame");
         assert!(!record.changed, "retired content cannot queue updates");
+    }
+
+    /// A headroom-only `Surface::display` sequence (4 → 2 → 1 → 4, the
+    /// corpus's headroom sequence) marks `present_pending` on every frame
+    /// — never `changed`, so no scene re-generation or local-cache work —
+    /// and reaches the backend with the new headroom. A scale change
+    /// still marks `changed` (#98 C4).
+    #[test]
+    fn headroom_updates_present_without_regenerating_content() {
+        use crate::{Draw, Display, WorkingColor};
+
+        let (engine, rx) = engine();
+        let surface = engine
+            .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))
+            .expect("surface");
+        let layer = surface.layer();
+        let content =
+            surface.record(|c| c.fill(kurbo::Rect::new(0., 0., 8., 8.), WorkingColor::WHITE));
+        surface.update(|tx| {
+            tx[surface.root()].push(&layer);
+            tx[&layer].content(content);
+        });
+        engine.render(FrameTime::now()).expect("render");
+        let _ = frames(&rx);
+
+        for headroom in [4.0f32, 2.0, 1.0, 4.0] {
+            surface
+                .display(Display {
+                    scale: 1.0,
+                    headroom,
+                })
+                .expect("display");
+            engine.render(FrameTime::now()).expect("render");
+            let record = frames(&rx).pop().expect("frame record");
+            assert!(
+                !record.changed,
+                "a headroom-only update must not mark changed at headroom {headroom}"
+            );
+            assert!(
+                record.present_pending,
+                "a headroom update must mark presentation pending at headroom {headroom}"
+            );
+            assert_eq!(
+                record.display.headroom.to_bits(),
+                headroom.to_bits(),
+                "the frame must carry the new headroom"
+            );
+            let stats = engine.stats();
+            assert_eq!(
+                stats.commands_lowered, 0,
+                "a headroom-only update regenerates no scene content"
+            );
+        }
+
+        surface
+            .display(Display {
+                scale: 2.0,
+                headroom: 4.0,
+            })
+            .expect("display");
+        engine.render(FrameTime::now()).expect("render");
+        let record = frames(&rx).pop().expect("frame record");
+        assert!(
+            record.changed && record.present_pending,
+            "a scale change is content, not presentation-only"
+        );
     }
 }
 

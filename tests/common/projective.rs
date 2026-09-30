@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 
 use cherenkov::kurbo::{Affine, Circle, Rect, Vec2};
 use cherenkov::{
-    BlendMode, Draw, Engine, FrameTime, Layer, Offscreen, OffscreenFormat, Picture, Projective,
-    ProjectiveLayers, RenderError, Surface, WorkingColor,
+    Backdrop, BlendMode, Draw, Engine, FrameTime, Layer, Offscreen, OffscreenFormat, Picture,
+    Projective, ProjectiveLayers, RenderError, Surface, WorkingColor,
 };
 
 const SIZE: (u32, u32) = (64, 64);
@@ -259,6 +259,64 @@ pub fn invalid_poses_are_errors<B: ProjectiveLayers>(config: impl Fn() -> B::Con
         unclipped.render(),
         Err(RenderError::Unsupported(
             cherenkov::lowering::projective::UNCLIPPED
+        ))
+    ));
+}
+
+/// A visible image beyond the backend's dimension limit or byte budget is
+/// an explicit error naming the required size, never a capped density.
+pub fn limits_are_explicit_errors<B: ProjectiveLayers>(config: impl Fn() -> B::Config) {
+    for (clip, what) in [
+        (Rect::new(0.0, 0.0, 40_000.0, 32.0), "dimension limit"),
+        (Rect::new(0.0, 0.0, 8_000.0, 8_000.0), "are admitted"),
+    ] {
+        let mut scene = Scene::<B>::new(config(), |e| {
+            e.clip(clip).projection(Projective::IDENTITY);
+        });
+        match scene.render() {
+            Err(RenderError::ProjectiveUnsupported { reason, .. }) => {
+                assert!(reason.contains(what), "{what}: {reason}");
+            }
+            other => panic!("{what}: expected ProjectiveUnsupported, got {other:?}"),
+        }
+    }
+}
+
+/// A projective layer cannot be a backdrop member, and one backdrop group
+/// cannot span the surface and a projective layer's local space: both are
+/// explicit `Unsupported` errors.
+pub fn backdrop_spaces_are_checked<B: ProjectiveLayers + Backdrop>(config: impl Fn() -> B::Config) {
+    let mut member = Scene::<B>::new(config(), |_| {});
+    let group = member.surface.backdrop_group_unfiltered();
+    member.edit(|e| {
+        e.projection(Projective::IDENTITY).backdrop(group.sample());
+    });
+    assert!(matches!(
+        member.render(),
+        Err(RenderError::Unsupported(
+            cherenkov::lowering::projective::BACKDROP_MEMBER
+        ))
+    ));
+
+    let mut spanning = Scene::<B>::new(config(), |e| {
+        e.projection(Projective::IDENTITY);
+    });
+    let group = spanning.surface.backdrop_group_unfiltered();
+    let (inside, outside) = (spanning.surface.layer(), spanning.surface.layer());
+    spanning.surface.update(|tx| {
+        tx[&spanning.layer].push(&inside);
+        tx[&inside]
+            .clip(Rect::new(0.0, 0.0, 8.0, 8.0))
+            .backdrop(group.sample());
+        tx[spanning.surface.root()].push(&outside);
+        tx[&outside]
+            .clip(Rect::new(0.0, 0.0, 8.0, 8.0))
+            .backdrop(group.sample());
+    });
+    assert!(matches!(
+        spanning.render(),
+        Err(RenderError::Unsupported(
+            cherenkov::lowering::projective::BACKDROP_CROSS_SPACE
         ))
     ));
 }

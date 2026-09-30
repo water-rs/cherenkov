@@ -51,3 +51,13 @@ fn horizon_crossing_excludes_the_back_half_space() {
         cherenkov_gpu::GpuConfig::default,
     );
 }
+
+#[test]
+fn limits_are_explicit_errors() {
+    common::limits_are_explicit_errors::<cherenkov_gpu::Gpu>(cherenkov_gpu::GpuConfig::default);
+}
+
+#[test]
+fn backdrop_spaces_are_checked() {
+    common::backdrop_spaces_are_checked::<cherenkov_gpu::Gpu>(cherenkov_gpu::GpuConfig::default);
+}

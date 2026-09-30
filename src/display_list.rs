@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::animation::AnimLanes;
 use crate::glyph::GlyphRun;
 use crate::paint::{ImageId, Paint, Sampling};
+use crate::resource::ResourceId;
 use crate::shape::ShapeData;
 use crate::style::{Group, Shadow};
 
@@ -383,15 +384,16 @@ impl DisplayList {
     }
 
     /// Whether any command, including those of nested pictures, samples
-    /// image `id`: an image draw, or an image paint of a fill, stroke or
-    /// glyph run.
-    pub(crate) fn references_image(&self, id: ImageId) -> bool {
+    /// `resource`: an image draw, or an image or shader paint of a fill,
+    /// stroke or glyph run. Content never names a backdrop shader; layers
+    /// sample those through the tree.
+    pub(crate) fn references(&self, resource: ResourceId) -> bool {
         self.commands.iter().any(|command| match command {
             Command::Fill { paint, .. }
             | Command::Stroke { paint, .. }
-            | Command::Glyphs { paint, .. } => paint.references_image(id),
-            Command::Image { image, .. } => *image == id,
-            Command::Picture { picture, .. } => picture.display_list().references_image(id),
+            | Command::Glyphs { paint, .. } => paint.references(resource),
+            Command::Image { image, .. } => resource == ResourceId::Image(*image),
+            Command::Picture { picture, .. } => picture.display_list().references(resource),
             Command::Shadow { .. }
             | Command::BeginClip { .. }
             | Command::BeginTransform { .. }

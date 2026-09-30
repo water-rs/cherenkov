@@ -21,6 +21,88 @@ struct Entry {
     animated: bool,
 }
 
+impl Entry {
+    /// Creates the module and pipeline of a user shader paint. Errors are
+    /// reported through the caller's validation scope.
+    fn new(device: &wgpu::Device, source: &ShaderSource) -> Self {
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("shader paint"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Owned(module_text(source))),
+        });
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("shader paint"),
+            entries: &[uniform_binding(0, 16), uniform_binding(1, 256)],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("shader paint"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("shader paint"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some(FRAGMENT_ENTRY),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: super::TARGET_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        Self {
+            pipeline,
+            layout,
+            animated: source.animated,
+        }
+    }
+}
+
+/// The fragment entry point a user shader paint defines.
+const FRAGMENT_ENTRY: &str = "main";
+
+/// The module a user shader paint compiles to: the colour and paint
+/// preludes, then the user's fragment source.
+fn module_text(source: &ShaderSource) -> String {
+    format!(
+        "{}\n{}\n{}",
+        include_str!("color.wgsl"),
+        include_str!("paint.wgsl"),
+        source.source
+    )
+}
+
+/// Validates a user shader paint on the caller thread: the composed module
+/// parses, passes naga validation and defines the fragment entry point.
+pub fn validate(source: &ShaderSource) -> Result<(), ResourceError> {
+    let text = module_text(source);
+    let module = super::shaders::validate_wgsl(&text)?;
+    if module
+        .entry_points
+        .iter()
+        .any(|entry| entry.stage == naga::ShaderStage::Fragment && entry.name == FRAGMENT_ENTRY)
+    {
+        Ok(())
+    } else {
+        Err(ResourceError::Shader(format!(
+            "the shader paint does not define its fragment entry point `{FRAGMENT_ENTRY}`"
+        )))
+    }
+}
+
 pub struct Texture {
     pub image: super::GpuImage,
     globals: wgpu::Buffer,
@@ -39,6 +121,8 @@ impl Registry {
     pub const fn has_registrations(&self) -> bool {
         self.registered
     }
+    /// Registers shader `id` from a source [`validate`] accepted. The
+    /// validation scope covers module and pipeline creation.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn add(
         &mut self,
@@ -46,66 +130,17 @@ impl Registry {
         id: u64,
         source: &ShaderSource,
     ) -> Result<(), ResourceError> {
-        let source_text = format!(
-            "{}\n{}\n{}",
-            include_str!("color.wgsl"),
-            include_str!("paint.wgsl"),
-            source.source
-        );
         let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("shader paint"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Owned(source_text)),
-        });
-        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("shader paint"),
-            entries: &[uniform_binding(0, 16), uniform_binding(1, 256)],
-        });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("shader paint"),
-            bind_group_layouts: &[Some(&layout)],
-            immediate_size: 0,
-        });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("shader paint"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &module,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &module,
-                entry_point: Some("main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: super::TARGET_FORMAT,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        let entry = Entry::new(device, source);
         if let Some(error) = pollster::block_on(scope.pop()) {
             return Err(ResourceError::Shader(error.to_string()));
         }
-        self.registered = true;
-        self.entries.insert(
-            id,
-            Entry {
-                pipeline,
-                layout,
-                animated: source.animated,
-            },
-        );
+        self.insert(id, entry);
         Ok(())
     }
 
+    /// The browser variant of [`Registry::add`], awaiting the validation
+    /// scope without blocking the JS event loop.
     #[cfg(target_arch = "wasm32")]
     #[expect(
         clippy::future_not_send,
@@ -117,64 +152,18 @@ impl Registry {
         id: u64,
         source: &ShaderSource,
     ) -> Result<(), ResourceError> {
-        let source_text = format!(
-            "{}\n{}\n{}",
-            include_str!("color.wgsl"),
-            include_str!("paint.wgsl"),
-            source.source
-        );
         let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("shader paint"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Owned(source_text)),
-        });
-        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("shader paint"),
-            entries: &[uniform_binding(0, 16), uniform_binding(1, 256)],
-        });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("shader paint"),
-            bind_group_layouts: &[Some(&layout)],
-            immediate_size: 0,
-        });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("shader paint"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &module,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &module,
-                entry_point: Some("main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: super::TARGET_FORMAT,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        let entry = Entry::new(device, source);
         if let Some(error) = scope.pop().await {
             return Err(ResourceError::Shader(error.to_string()));
         }
-        self.registered = true;
-        self.entries.insert(
-            id,
-            Entry {
-                pipeline,
-                layout,
-                animated: source.animated,
-            },
-        );
+        self.insert(id, entry);
         Ok(())
+    }
+
+    fn insert(&mut self, id: u64, entry: Entry) {
+        self.registered = true;
+        self.entries.insert(id, entry);
     }
 
     pub fn remove(&mut self, id: u64) {

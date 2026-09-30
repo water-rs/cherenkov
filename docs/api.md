@@ -60,9 +60,9 @@ The `cherenkov` crate owns the whole front end and the render thread's loop. A b
 ```rust
 /// The render-thread contract. Implemented by a zero-sized marker type (`Gpu`, `Raster`).
 pub trait Backend: Sized + 'static {
-    type Config: Send + 'static;                         // GpuConfig, RasterConfig
+    type Config: RenderTransfer + 'static;               // GpuConfig, RasterConfig
     type Info: Clone + Send + 'static;                   // GpuInfo, RasterInfo: provenance for reports
-    type Target: From<Offscreen> + Send + 'static;       // Offscreen or an interop window target
+    type Target: From<Offscreen> + RenderTransfer + 'static; // Offscreen or an interop window target
     type Renderer: Renderer;                             // the render-thread state; never leaves that thread
 
     /// Runs on the render thread, once. Creates the device or worker pool.
@@ -72,21 +72,26 @@ pub trait Backend: Sized + 'static {
 /// Everything the render loop asks of a backend. Every method runs on the render thread.
 pub trait Renderer: 'static {
     type Target;
+    type Font: RenderTransfer + 'static;                 // a font validated by `prepare_font`
     fn create_surface(&mut self, id: SurfaceId, target: Self::Target) -> Result<SurfaceInfo, SurfaceError>;
     fn resize_surface(&mut self, id: SurfaceId, size: (u32, u32));
     fn destroy_surface(&mut self, id: SurfaceId);
 
-    fn add_font(&mut self, id: FontId, font: FontData) -> Result<(), ResourceError>;
+    /// Runs on the caller thread, before anything is queued: every check a font needs.
+    fn prepare_font(font: FontData) -> Result<Self::Font, ResourceError>;
+    fn add_font(&mut self, id: FontId, font: Self::Font);
     fn remove_font(&mut self, id: FontId);
+    /// A rejection fails every render that draws the image (`RenderError::Rejected`).
     fn add_image(&mut self, id: ImageId, image: ImageUpload) -> Result<(), ResourceError>;
-    /// New pixels behind the same id; the render loop then marks changed the surfaces `samples_image` names.
+    /// New pixels behind the same id; the render loop then marks changed the surfaces `samples` names.
     fn replace_image(&mut self, id: ImageId, image: ImageUpload) -> Result<(), ResourceError>;
-    /// Whether any layer content on `surface`, slot updates applied, samples image `id`.
-    fn samples_image(&self, surface: SurfaceId, id: ImageId) -> bool;
+    /// Whether any layer content on `surface`, slot updates applied, samples `resource` (an image or a shader).
+    fn samples(&self, surface: SurfaceId, resource: ResourceId) -> bool;
     fn remove_image(&mut self, id: ImageId);
 
     /// Replaces or updates a layer's recorded content (`Content` / `Picture`), or clears it.
-    fn set_content(&mut self, surface: SurfaceId, layer: LayerId, content: Option<ContentOp>);
+    /// Returns the previous picture when replaced or cleared, for the UI thread to recycle.
+    fn set_content(&mut self, surface: SurfaceId, layer: LayerId, content: Option<ContentOp>) -> Option<Picture>;
     /// The layer is gone: drop every cache keyed on it.
     fn remove_layer(&mut self, surface: SurfaceId, layer: LayerId);
 
@@ -122,11 +127,12 @@ pub trait Renderer: 'static {
   ```
 
   The clip applies in the layer's own space (`transform`); content and children are drawn in `content_transform()`, so scrolling moves them inside the clip and never re-records anything. `changed` is true when a property op, a content op or an animation step touched the surface since the last render; the backend renders exactly those surfaces.
-- **One wake-up per frame.** `Surface::update`, layer drops and bound-signal changes only queue owned ops on the UI thread. `Engine::render(time)` drains every surface's queue into one `Message::Render { time, commits, reply }` and blocks on the reply, so the render thread wakes once per frame and applies the commits, samples the animations at `time`, renders, and answers with `Next` and the `FrameStats`. Surface creation, readback, `memory()`, image replacement and capability registrations that can fail (shader compilation) are request/reply messages; everything else is fire-and-forget.
+- **One wake-up per frame.** `Surface::update`, layer drops and bound-signal changes only queue owned ops on the UI thread. `Engine::render(time)` drains every surface's queue into one `Message::Render { time, commits, reply }` and blocks on the reply, so the render thread wakes once per frame and applies the commits, samples the animations at `time`, renders, and answers with `Next` and the `FrameStats`. Surface creation, readback, `memory()` and `finish_timings()` are request/reply messages; everything else, resource registration and image replacement included, is fire-and-forget and ordered with the renders (see Resources).
 - **Capabilities carry their render-side hooks.** A capability trait is not a marker: it declares the function the render loop calls, so a backend without the capability has no code path to reach, and no default or stub exists.
 
   ```rust
   pub trait ShaderPaint: Backend {
+      fn validate_shader(source: &ShaderSource) -> Result<(), ResourceError>;  // caller thread: naga validation
       fn add_shader(r: &mut Self::Renderer, id: ShaderId, source: ShaderSource) -> Result<(), ResourceError>;
       fn remove_shader(r: &mut Self::Renderer, id: ShaderId);
   }
@@ -149,7 +155,7 @@ pub trait Renderer: 'static {
 
   The `Engine`/`Transaction` methods bounded by these traits (`engine.shader`, `engine.filter`, `engine.gpu_content`, `tx[&l].content(gpu)`, `engine.image::<Astc4x4>`) wrap the hook into an owned `FnOnce(&mut B::Renderer) + Send` op that travels in the commit with the layer ops, in order. The `Renderer` core trait therefore has no shader, filter or GPU-content methods at all.
 - **Resource lifetime.** Handles (`Font`, `Image<F>`, `Shader`, `Filter`) are `Clone` over an `Rc`; the last drop queues the `remove_*` op, which reaches the backend in the next frame's commit. The backend frees the GPU copy there (deferred to after in-flight frames where the API needs it). The same `Rc` carries the ops a kind queues while it lives: an `Image<F>` queues `replace_image` through it (see Resources).
-- **Errors.** `init` failures surface from `Engine::new` as `EngineError`. Surface creation errors are returned from `engine.surface`. Render errors fail that `render` call. Resource validation that needs the device (shader compilation, image format support) is a reply; validation that does not (font parsing, byte lengths) happens on the UI thread before any message is sent.
+- **Errors.** `init` failures surface from `Engine::new` as `EngineError`. Surface creation errors are returned from `engine.surface`. Render errors fail that `render` call. Resource validation that does not need the device (font parsing, byte lengths, shader validation) runs on the UI thread before any message is sent and returns `ResourceError`; a rejection only the backend can detect fails the renders that draw the resource with `RenderError::Rejected` (see Resources).
 
 ## Engine
 
@@ -177,14 +183,26 @@ Resources are RAII handles: they are `Clone`, and the GPU memory is released, de
 
 ```rust
 let font: Font = engine.font(FontSource::mapped(path)?)?;          // memory-mapped; never copied
-let photo: Image<Astc4x4> = engine.image(encoded_astc, ImageDesc::new(DisplayP3)).await?;
-let hdr: Image<Rgba16F> = engine.image(decoded, ImageDesc::new(Rec2020Pq).hdr(meta)).await?;
+let photo: Image<Astc4x4> = engine.image(
+    ImageData::<Astc4x4>::new(width, height, encoded_astc)?.color_space(ImageColorSpace::DisplayP3),
+)?;
+let hdr: Image<Rgba16F> = engine.image(
+    ImageData::<Rgba16F>::new(width, height, decoded)?.color_space(ImageColorSpace::LinearP3),
+)?;
 hdr.replace(ImageData::<Rgba16F>::new(width, height, next_frame)?)?;  // same id, new pixels
-let shader: ShaderPaintHandle = engine.shader_paint(wgsl_source)?; // compiled here, GPU only
+let shader: Shader = engine.shader(ShaderSource::wgsl(fragment))?;  // validated here, GPU only
 ```
 
+- **One registration model, on every target.** `engine.font`, `engine.image`, `engine.shader`, `engine.backdrop_shader` and `image.replace` are synchronous on native and on wasm32, with the same signatures, so a recording pass can register a resource and draw it in the same frame without awaiting anything. Each call validates on the calling thread what needs no device, allocates the id, queues the backend operation and returns:
+  - A font is parsed and prepared by the backend's `Renderer::prepare_font` (an unsupported colour-font format is `ResourceError::Unsupported`); `add_font` then cannot fail, so a font has no later rejection.
+  - `ImageData` was validated by `ImageData::new`.
+  - A shader's composed module passes naga validation and defines its entry point (`ShaderPaint::validate_shader`, `BackdropShaders::validate_backdrop_shader`).
+  - An `Err` from these calls is either that validation or `ResourceError::Lost` (the render thread or executor is gone).
+
+  The queued operation runs ahead of every later render on the render thread or the browser's serial executor. A rejection only the backend can detect (an image over the device's texture limit or the CPU image budget, a pipeline the device cannot create) never passes silently: the render loop records it against the resource, and every render that draws the resource fails with `RenderError::Rejected { resource: ResourceId, reason }`, naming the resource and the backend's reason, until an image replacement succeeds or the last handle drops. The check costs nothing while no rejection is recorded, and afterwards visits only the surfaces that changed since the last render: a rejected id reaches content only through a commit, and a rejected replacement marks every surface sampling the image changed. There is no fallback drawing. Dropping the last handle of a rejected resource enqueues no backend removal, since the backend never committed it.
+
 - **`Image<F>`.** `F` is the storage format: `Rgba8`, `Rgba16F`, `Astc4x4`, `Etc2Rgba`, `Bc7`, and panel formats for `Banded`. Only uncompressed formats have `update(region, pixels)`. Compressed formats are uploaded as-is, and compression is an explicit step (`engine.compress::<Astc4x4>(image)`), never implicit.
-- **Replacing pixels.** `image.replace(data)` swaps an image's pixels behind the same `ImageId`, for content whose picture changes over time: animated images, decoder-backed frames, a reactive image view. Every recording that names the id keeps drawing it and shows the new pixels on the next frame, without re-recording. The replacement is a `Message::ReplaceImage` request/reply, ordered with frames on the render thread, so no frame samples a partly written image. It blocks until the backend has applied it (on wasm32 it is an `async fn`) and returns the errors of `engine.image`: `ResourceError::Image` when the backend rejects the data, which leaves the previous pixels in place, and `ResourceError::Lost` when the render thread is gone. The render loop then asks the backend which surfaces' content samples the image (`Renderer::samples_image`, answered from the retained display lists with slot updates applied and nested pictures included) and marks only those changed, so every other surface keeps its skip; the engine's waker fires only when at least one surface was marked. An animated image replaced at 30–60 Hz therefore redraws the surfaces that show it and nothing else.
+- **Replacing pixels.** `image.replace(data)` swaps an image's pixels behind the same `ImageId`, for content whose picture changes over time: animated images, decoder-backed frames, a reactive image view. Every recording that names the id keeps drawing it and shows the new pixels on the next frame, without re-recording. The replacement is a fire-and-forget `Message::ReplaceImage`, ordered with frames on the render thread, so no frame samples a partly written image, and it fires the engine's waker so a paused host renders the new pixels. It follows the registration model: `ResourceError::Lost` when the render thread is gone is its only error, and a rejection only the backend can detect leaves the previous pixels in place and fails the renders that draw the image with `RenderError::Rejected` until a later replacement succeeds. Replacing an image whose registration was rejected registers it anew. The render loop then asks the backend which surfaces' content samples the image (`Renderer::samples`, answered from the retained display lists with slot updates applied and nested pictures included) and marks only those changed, so every other surface keeps its skip. An animated image replaced at 30–60 Hz therefore redraws the surfaces that show it and nothing else.
   - The same dimensions reuse the backing storage: `queue.write_texture` into the existing texture on the GPU backend, which leaves every bind group valid; an in-place decode on the CPU backend, once the retained paint operands that shared the pixels are discarded.
   - Different dimensions reallocate the storage behind the same id. The GPU backend retires the bind groups that bound the old texture view. Both backends lower again the retained content that samples the image, because lowering resolves the image's dimensions into its paints.
   - Dropping the last handle after a replacement queues `remove_image` as before.
@@ -475,7 +493,7 @@ tx[&tab_bar].backdrop(glass.sample()); // plain bilinear sample of the shared ca
 - **One capture chain per group, stored per region.** A group owns one spatial filter chain; its capture may be stored as several disjoint regions rather than one bounding rect. Each member's bounds inflated by the filter's apron (and the member's effect reach) is integer-rounded; aproned rects that overlap or touch always merge, and farther ones merge whenever the empty space between them costs less than one capture pass's fixed overhead — distant members therefore do not capture and blur the empty space between them. A group whose filter footprint is relative to the region size (nonzero `extent`) keeps a single union region, since per-region sizes would change the result. Each member applies its own per-element effect on the shared result: a colour filter, a shader, or a filter that takes shape input. So there is one chain — and typically one region — per group, whatever the number of members.
 - **Member effects.** `sample_with(effect)` accepts `Color` (a 3×4 premultiplied matrix), `Refraction { depth, strength }` (edge-following displacement), `Rim { width, color, gain }` (an additive rim light inside the member edge), or a `BackdropShaderEffect` from a registered `BackdropShader`'s `effect(uniforms)`. `sample()` stays the plain unshifted sample. An effect's sampling reach grows the group's capture region around the member; `Color` and `Rim` reach is zero.
 - **Effect shaders.** `engine.backdrop_shader(BackdropShaderSource::wgsl(src).reach(px))` registers a `backdrop_effect(p, sdf, normal, size, params)` fragment — `p` is the member pixel in device space, `sdf`/`normal` the member clip's signed distance and outward normal, `size` the member's device size — which samples the shared capture through `backdrop_sample(q)`. `BackdropShader` is an RAII handle; a member still sampling a dropped shader fails the frame.
-- **Capability.** Custom shaders sit behind `BackdropShaders: Backdrop` (`add_backdrop_shader`/`remove_backdrop_shader`), the same trait-per-capability shape as `Filters`/`Runs<F>`: a backend that cannot run user fragment code does not implement the trait. `Engine<B>` binds shaders only where `B: BackdropShaders`. `Color`, `Refraction` and `Rim` are built-in effects on `Backdrop` itself — no extra bound.
+- **Capability.** Custom shaders sit behind `BackdropShaders: Backdrop` (`validate_backdrop_shader` on the caller thread, `add_backdrop_shader`/`remove_backdrop_shader` on the render thread), the same trait-per-capability shape as `Filters`/`Runs<F>`: a backend that cannot run user fragment code does not implement the trait. `Engine<B>` binds shaders only where `B: BackdropShaders`. `Color`, `Refraction` and `Rim` are built-in effects on `Backdrop` itself — no extra bound.
 - **Backends.** The GPU backend implements all four effects; the CPU backend implements `Color`, `Refraction` and `Rim`, and rejects a `Shader` member effect with `Unsupported("backdrop-shader")`.
 - **Handle rules.** `BackdropGroup` is an RAII, `!Send` handle. A refraction, rim or shader effect on a member whose clip is a path or mask — anything without an analytic SDF — fails with `Unsupported("backdrop-effect-sdf-path")`; `Color` works on any member.
 
@@ -577,21 +595,22 @@ Browser lowering currently runs on that same thread; no GPU-bearing payload is
 sent to workers. Any future worker protocol must consist only of owned `Send`
 CPU data, never resource tables or JavaScript handles.
 
-On wasm32 `Engine::new`, `font`, `image`, `shader`, `surface`, `render`, `memory`,
-`finish_timings`, and `Surface::readback` are asynchronous. Hosts await these
-methods from their event loop. Recording, edits, resource drops and signal
-notifications remain synchronous and enqueue ordered work. An operation already
-enqueued completes even if its reply future is dropped. The registration
-futures own their backend id from the moment the request is enqueued, so
-dropping `font`, `image`, `shader` or `surface` before the reply still releases
-the allocation once the backend commits it; a rejected request releases
+On wasm32 `Engine::new`, `surface`, `render`, `memory`, `finish_timings`, and
+`Surface::readback` are asynchronous: they wait on the device. Hosts await these
+methods from their event loop. Resource registration (`font`, `image`,
+`shader`, `backdrop_shader`, `Image::replace`), recording, edits, resource drops
+and signal notifications are synchronous with the native signatures and enqueue
+ordered work (see Resources). An operation already enqueued completes even if
+its reply future is dropped. The `surface` future owns its backend id from the
+moment the request is enqueued, so dropping it before the reply still destroys
+the surface once the backend commits it; a rejected request destroys
 nothing. Engine drop enqueues
 shutdown after preceding operations; remaining handles become disconnected.
 Host notifications arriving during an awaited render request the next frame.
 Hosts serialize frame requests and continue honoring `Next` and the wake callback.
 
 `GpuConfig::device` preserves the supplied adapter/device/queue on both targets,
-including all enabled features. Browser initialization, shader validation,
+including all enabled features. Browser initialization, shader pipeline creation,
 producer/filter setup, texture readback and timing completion yield to browser
 promises rather than block on channels or device polling. `cherenkov::Instant`
 uses the browser performance clock on wasm32 and is `std::time::Instant` on
@@ -623,7 +642,8 @@ The `wasm-bindgen-test-runner` binary version must match the crate's
 WebGPU available (for headless runs, `--enable-unsafe-webgpu` plus a working
 rasterizer such as `--use-angle=swiftshader`). The suite covers `!Send`
 producers on the owning JS thread, `SharedDevice` reuse across engines,
-asynchronous shader validation and filter setup, host wakes requested while a
+a font, an image and a shader registered and drawn in one frame with no await
+between, shader validation before queueing, asynchronous filter setup, host wakes requested while a
 render is awaiting browser work, and incremental lowering matching full
 lowering pixel-for-pixel.
 

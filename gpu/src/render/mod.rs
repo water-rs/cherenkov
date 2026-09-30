@@ -32,10 +32,10 @@ use bitmap::BitmapKey;
 use cherenkov::{
     ContentOp, EngineError, FontData as EngineFontData, FontId, Frame, FrameId, FrameStats,
     FrameTiming, ImageId, ImageUpload, LayerId, MemoryUsage, PassTiming, Pressure, Readback,
-    Redraw, RenderError, Renderer, ResourceError, SurfaceError, SurfaceFrame, SurfaceId,
-    SurfaceInfo,
+    Redraw, RenderError, Renderer, ResourceError, ResourceId, SurfaceError, SurfaceFrame,
+    SurfaceId, SurfaceInfo,
 };
-use glyph::{Atlas, FontData, PendingRaster};
+use glyph::{Atlas, FontData, PendingRaster, PreparedFont};
 use lower::{
     BackdropGroupInfo, ContentData, Frame as LoweredFrame, GlyphContext, Lowered, Lowering,
     PipelineKind, ShaderVariant, Source, Target,
@@ -1557,27 +1557,20 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
     ))
 }
 
-/// Validates font data and detects native colour-glyph formats.
-///
-/// `COLR` fonts render through the colour-glyph lowering; supported sbix and
-/// CBDT/CBLC glyphs are decoded as images at realization.
-fn validate_font(
-    data: &[u8],
-    index: u32,
-) -> Result<(bool, Option<Arc<bitmap::BitmapFont>>), ResourceError> {
-    use skrifa::raw::TableProvider as _;
-    let font = skrifa::FontRef::from_index(data, index)
-        .map_err(|e| ResourceError::Font(format!("{e}")))?;
-    if font.data_for_tag(skrifa::Tag::new(b"SVG ")).is_some() {
-        return Err(ResourceError::Unsupported(names::COLOR_FONT));
+/// Rejects an image the device cannot hold as one texture.
+fn check_image_size(image: &ImageUpload, max: u32) -> Result<(), ResourceError> {
+    if image.width > max || image.height > max {
+        return Err(ResourceError::Image(format!(
+            "{}x{} exceeds the maximum texture size {max}",
+            image.width, image.height
+        )));
     }
-    let has_colr = font.colr().is_ok();
-    let bitmap = bitmap::BitmapFont::detect(data, index)?.map(Arc::new);
-    Ok((has_colr, bitmap))
+    Ok(())
 }
 
 impl Renderer for GpuRenderer {
     type Target = GpuTarget;
+    type Font = PreparedFont;
     fn create_surface(
         &mut self,
         id: SurfaceId,
@@ -1800,20 +1793,29 @@ impl Renderer for GpuRenderer {
         self.update_filter_activity();
     }
 
-    fn add_font(&mut self, id: FontId, font: EngineFontData) -> Result<(), ResourceError> {
-        let (has_colr, bitmap) = validate_font(&font.data, font.index)?;
-        self.fonts.insert(
-            id.raw(),
-            FontData {
-                data: font.data,
-                index: font.index,
-                has_colr,
-                has_bitmap: bitmap.is_some(),
-                bitmap,
-                colr: std::cell::RefCell::new(FxHashMap::default()),
-            },
-        );
-        Ok(())
+    /// Validates font data and detects native colour-glyph formats.
+    ///
+    /// `COLR` fonts render through the colour-glyph lowering; supported
+    /// sbix and CBDT/CBLC glyphs are decoded as images at realization.
+    fn prepare_font(font: EngineFontData) -> Result<PreparedFont, ResourceError> {
+        use skrifa::raw::TableProvider as _;
+        let parsed = skrifa::FontRef::from_index(&font.data, font.index)
+            .map_err(|e| ResourceError::Font(format!("{e}")))?;
+        if parsed.data_for_tag(skrifa::Tag::new(b"SVG ")).is_some() {
+            return Err(ResourceError::Unsupported(names::COLOR_FONT));
+        }
+        let has_colr = parsed.colr().is_ok();
+        let bitmap = bitmap::BitmapFont::detect(&font.data, font.index)?.map(Arc::new);
+        Ok(PreparedFont {
+            data: font.data,
+            index: font.index,
+            has_colr,
+            bitmap,
+        })
+    }
+
+    fn add_font(&mut self, id: FontId, font: PreparedFont) {
+        self.fonts.insert(id.raw(), font.into());
     }
 
     fn remove_font(&mut self, id: FontId) {
@@ -1883,6 +1885,7 @@ impl Renderer for GpuRenderer {
     }
 
     fn add_image(&mut self, id: ImageId, image: ImageUpload) -> Result<(), ResourceError> {
+        check_image_size(&image, self.max_texture)?;
         let data = image_texels_f16(&image)?;
         let image = upload_image(
             &self.device,
@@ -1897,6 +1900,7 @@ impl Renderer for GpuRenderer {
 
     fn replace_image(&mut self, id: ImageId, image: ImageUpload) -> Result<(), ResourceError> {
         let _diag_guard = diag::Guard::scope(self.diag.as_ref());
+        check_image_size(&image, self.max_texture)?;
         let data = image_texels_f16(&image)?;
         let size = (image.width, image.height);
         let current = self
@@ -1950,12 +1954,12 @@ impl Renderer for GpuRenderer {
         Ok(())
     }
 
-    fn samples_image(&self, surface: SurfaceId, id: ImageId) -> bool {
+    fn samples(&self, surface: SurfaceId, resource: ResourceId) -> bool {
         self.surfaces.get(&surface).is_some_and(|state| {
             state
                 .layers
                 .values()
-                .any(|content| content.references_image(id))
+                .any(|content| content.references(resource))
         })
     }
 
@@ -2793,6 +2797,19 @@ impl GpuRenderer {
             }
         }
     }
+    /// Validates a user shader paint on the caller thread.
+    pub(crate) fn validate_shader(source: &cherenkov::ShaderSource) -> Result<(), ResourceError> {
+        paint::validate(source)
+    }
+
+    /// Validates a backdrop effect shader on the caller thread: the stock
+    /// module with the user's `backdrop_effect` parses and validates.
+    pub(crate) fn validate_backdrop_shader(
+        source: &cherenkov::BackdropShaderSource,
+    ) -> Result<(), ResourceError> {
+        shaders::validate_wgsl(&backdrop_effect_text(&source.source)).map(drop)
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn add_shader(
         &mut self,

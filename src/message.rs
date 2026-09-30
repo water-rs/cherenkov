@@ -24,6 +24,7 @@ use crate::error::{RenderError, ResourceError, SurfaceError};
 use crate::frame::{FrameStats, FrameTime, FrameTiming, Next, Readback};
 use crate::image::ImageUpload;
 use crate::paint::ImageId;
+use crate::resource::ResourceId;
 use crate::shape::ShapeData;
 use crate::style::{BlendMode, FilterId};
 
@@ -33,12 +34,21 @@ pub type ResOp<B> = Box<dyn FnOnce(&mut <B as Backend>::Renderer) + Send>;
 /// A resource operation that stays on the creating JS thread.
 #[cfg(target_arch = "wasm32")]
 pub type ResOp<B> = Box<dyn FnOnce(&mut <B as Backend>::Renderer)>;
+/// A registration the backend may reject: the render loop records the
+/// rejection against the resource.
+#[cfg(not(target_arch = "wasm32"))]
+pub type RegisterOp<B> =
+    Box<dyn FnOnce(&mut <B as Backend>::Renderer) -> Result<(), ResourceError> + Send>;
+/// A registration the backend may reject, awaiting browser work on the
+/// owning JS thread: the render loop records the rejection against the
+/// resource.
 #[cfg(target_arch = "wasm32")]
-/// An asynchronous resource operation on the owning JS thread.
-pub type AsyncResOp<B> = Box<
+pub type RegisterOp<B> = Box<
     dyn for<'a> FnOnce(
         &'a mut <B as Backend>::Renderer,
-    ) -> core::pin::Pin<Box<dyn core::future::Future<Output = ()> + 'a>>,
+    ) -> core::pin::Pin<
+        Box<dyn core::future::Future<Output = Result<(), ResourceError>> + 'a>,
+    >,
 >;
 
 /// Identifier of a surface.
@@ -288,24 +298,37 @@ pub enum Message<B: Backend> {
         /// The new display properties.
         display: Display,
     },
-    /// An opaque render-thread operation: resource registration and
-    /// removal, capability hooks. Reply-carrying operations capture their
-    /// `Sender` in the closure.
+    /// An opaque render-thread operation that cannot fail: font, filter
+    /// and effect registration and removal, capability hooks.
     Resource(ResOp<B>),
+    /// Register a resource the backend may reject. A rejection is recorded
+    /// against `resource`, and every render that draws it fails with
+    /// [`RenderError::Rejected`].
+    Register {
+        /// The resource being registered.
+        resource: ResourceId,
+        /// The backend's registration.
+        op: RegisterOp<B>,
+    },
+    /// Release a resource registered with [`Message::Register`]. `op`, the
+    /// backend's removal, runs only when the backend holds the resource: a
+    /// rejected registration committed nothing.
+    Release {
+        /// The resource being released.
+        resource: ResourceId,
+        /// The backend's removal.
+        op: ResOp<B>,
+    },
     /// Replace a registered image's pixels behind the same id, then mark
-    /// changed every surface whose content samples the image.
+    /// changed every surface whose content samples the image. A rejection
+    /// is recorded against the image, as for [`Message::Register`]; the
+    /// next successful replacement clears it.
     ReplaceImage {
         /// The image.
         id: ImageId,
         /// The new pixels.
         image: ImageUpload,
-        /// Result of the replacement: whether any surface was marked
-        /// changed, which is when the host needs a frame to show it.
-        reply: Sender<Result<bool, ResourceError>>,
     },
-    /// Browser operation awaiting local device work.
-    #[cfg(target_arch = "wasm32")]
-    AsyncResource(AsyncResOp<B>),
     /// Render every dirty surface for the frame at `time`, applying every
     /// surface's queued change set first.
     Render {

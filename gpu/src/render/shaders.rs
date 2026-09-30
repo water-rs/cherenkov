@@ -19,7 +19,7 @@
 
 use std::borrow::Cow;
 
-use cherenkov::EngineError;
+use cherenkov::{EngineError, ResourceError};
 
 /// One fixed module's source and precompiled artifacts.
 struct Fixed {
@@ -98,6 +98,30 @@ pub fn backdrop_effect_text(user: &str) -> Cow<'static, str> {
         .split_once(MARK)
         .expect("the backdrop-effect stub has a closing marker");
     format!("{head}{tail}\n{user}").into()
+}
+
+/// Parses and validates WGSL `text` on the caller thread, with the
+/// capabilities of a core WebGPU device. Errors carry naga's diagnostic
+/// against the text.
+///
+/// # Errors
+/// [`ResourceError::Shader`] when the text fails to parse or validate.
+pub fn validate_wgsl(text: &str) -> Result<naga::Module, ResourceError> {
+    let module = naga::front::wgsl::parse_str(text)
+        .map_err(|error| ResourceError::Shader(error.emit_to_string(text)))?;
+    // The engine's floor, not the device's capabilities: a user shader has
+    // to run on every device the engine supports, so a construct that only
+    // a host-supplied `SharedDevice` with extra features could compile is
+    // rejected here, identically on every device. What depends on the
+    // actual device (limits, the driver's compiler) is left to pipeline
+    // creation on the render thread, which reports it as a rejection.
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::default(),
+    )
+    .validate(&module)
+    .map_err(|error| ResourceError::Shader(error.emit_to_string(text)))?;
+    Ok(module)
 }
 
 // The passthrough artifacts are embedded only where they can be loaded:

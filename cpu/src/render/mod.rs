@@ -24,7 +24,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use cherenkov::{
     BackdropId, ContentOp, EngineError, FontData, FontId, Frame, FrameStats, ImageId, ImageUpload,
     LayerId, MemoryUsage, Pressure, Readback, Redraw, RenderError, Renderer, ResourceError,
-    SurfaceError, SurfaceId, SurfaceInfo,
+    ResourceId, SurfaceError, SurfaceId, SurfaceInfo,
 };
 use lower::{ContentData, Item, Lowering};
 
@@ -152,21 +152,9 @@ fn cpu_model() -> Option<String> {
     None
 }
 
-/// Validates font data and detects colour-glyph sources.
-fn validate_font(
-    data: &[u8],
-    index: u32,
-) -> Result<(bool, Option<Arc<bitmap::BitmapFont>>), ResourceError> {
-    use skrifa::raw::TableProvider as _;
-    let font = skrifa::FontRef::from_index(data, index)
-        .map_err(|e| ResourceError::Font(format!("{e}")))?;
-    let has_colr = font.colr().is_ok();
-    let bitmap = bitmap::BitmapFont::detect(data, index)?.map(Arc::new);
-    Ok((has_colr, bitmap))
-}
-
 impl Renderer for RasterRenderer {
     type Target = RasterTarget;
+    type Font = font::PreparedFont;
 
     fn create_surface(
         &mut self,
@@ -252,10 +240,23 @@ impl Renderer for RasterRenderer {
         self.surfaces.remove(&id);
     }
 
-    fn add_font(&mut self, id: FontId, font: FontData) -> Result<(), ResourceError> {
-        let (has_colr, bitmap) = validate_font(&font.data, font.index)?;
-        let has_bitmap = bitmap.is_some();
-        if let Some(bitmap) = bitmap {
+    /// Validates font data and detects colour-glyph sources.
+    fn prepare_font(font: FontData) -> Result<font::PreparedFont, ResourceError> {
+        use skrifa::raw::TableProvider as _;
+        let parsed = skrifa::FontRef::from_index(&font.data, font.index)
+            .map_err(|e| ResourceError::Font(format!("{e}")))?;
+        let has_colr = parsed.colr().is_ok();
+        let bitmap = bitmap::BitmapFont::detect(&font.data, font.index)?.map(Arc::new);
+        Ok(font::PreparedFont {
+            data: font,
+            has_colr,
+            bitmap,
+        })
+    }
+
+    fn add_font(&mut self, id: FontId, font: font::PreparedFont) {
+        let has_bitmap = font.bitmap.is_some();
+        if let Some(bitmap) = font.bitmap {
             self.bitmap_fonts.insert(id.raw(), bitmap);
         } else {
             self.bitmap_fonts.remove(&id.raw());
@@ -263,13 +264,12 @@ impl Renderer for RasterRenderer {
         self.fonts.insert(
             id.raw(),
             font::Font {
-                data: font,
-                has_colr,
+                data: font.data,
+                has_colr: font.has_colr,
                 has_bitmap,
                 colr: FxHashMap::default(),
             },
         );
-        Ok(())
     }
 
     fn remove_font(&mut self, id: FontId) {
@@ -332,19 +332,29 @@ impl Renderer for RasterRenderer {
             *slot = resized;
             self.refresh_cache_budgets();
         } else {
+            // Discarding the content above released every retained operand
+            // sharing the pixels. An operand that survived is an engine
+            // defect; it is reported as this replacement's rejection, which
+            // keeps the previous pixels and fails the renders that draw the
+            // image, instead of panicking the render thread.
             Arc::get_mut(slot)
-                .expect("discarded content released every operand sharing the image")
+                .ok_or_else(|| {
+                    ResourceError::Image(format!(
+                        "image {} is still shared by retained paint operands after its content was discarded",
+                        id.raw()
+                    ))
+                })?
                 .overwrite(&image);
         }
         Ok(())
     }
 
-    fn samples_image(&self, surface: SurfaceId, id: ImageId) -> bool {
+    fn samples(&self, surface: SurfaceId, resource: ResourceId) -> bool {
         self.surfaces.get(&surface).is_some_and(|state| {
             state
                 .layers
                 .values()
-                .any(|content| content.references_image(id))
+                .any(|content| content.references(resource))
         })
     }
 

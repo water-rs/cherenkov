@@ -332,8 +332,18 @@ impl Renderer for RasterRenderer {
             *slot = resized;
             self.refresh_cache_budgets();
         } else {
+            // Discarding the content above released every retained operand
+            // sharing the pixels. An operand that survived is an engine
+            // defect; it is reported as this replacement's rejection, which
+            // keeps the previous pixels and fails the renders that draw the
+            // image, instead of panicking the render thread.
             Arc::get_mut(slot)
-                .expect("discarded content released every operand sharing the image")
+                .ok_or_else(|| {
+                    ResourceError::Image(format!(
+                        "image {} is still shared by retained paint operands after its content was discarded",
+                        id.raw()
+                    ))
+                })?
                 .overwrite(&image);
         }
         Ok(())

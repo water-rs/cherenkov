@@ -144,6 +144,7 @@ pub trait Renderer: 'static {
       fn add_filtered_backdrop_group(r: &mut Self::Renderer, surface: SurfaceId, id: BackdropId, filter: F);
   }
   pub trait HdrOutput: Backend {}
+  pub trait ProjectiveLayers: Backend {}      // `projection`, `tilt`, `depth` (docs/projective.md)
   pub trait Planes: Backend {}
   ```
 
@@ -266,7 +267,7 @@ surface.update_animated(Spring::smooth(), |tx| {
 
 - **Sampling.** A track holds the start value, the target, the animation and the time it started. `Spring` is the closed-form damped oscillator per lane (`Affine` has six lanes, `Vec2` two, `f32` one), from the start value with the start velocity; it settles when every lane is within `1e-3` of the target and slower than `1e-3` per second. `Curve` is `start + (target − start) · y(x⁻¹(t / duration))`, clamped to the endpoints. Sampling never touches recorded content: the backend draws the same fragments under a new `transform`, `opacity` or `scroll_offset`.
 - **Retargeting.** A new value for a property with a running track starts a new track from the value *and velocity* the old track had at the last sampled frame, so a spring retargeted mid-flight is continuous in position and velocity, and a curve restarts from its current value. A change without an animation snaps and drops the track.
-- **Animatable properties** are `transform`, `opacity` and `scroll_offset`. `.animation(...)` on any other property, or `Decay` on anything but `scroll_offset`, is an invariant violation and panics.
+- **Animatable properties** are `transform`, `opacity`, `scroll_offset`, the #77 components, and the projective `tilt` and `depth`. `.animation(...)` on any other property, or `Decay` on anything but `scroll_offset`, is an invariant violation and panics.
 - **Out-of-process handoff.** On promoted layers, `transform` and `opacity` animations are handed to Core Animation (Apple) or DirectComposition (Windows) whenever the curve maps exactly: springs map to `CASpringAnimation`, and Bézier curves map to `CAMediaTimingFunction`. Everything else, and everything on Android, is engine-driven.
 
 ## Scrolling
@@ -656,6 +657,43 @@ This is a layer capability rather than animation metadata on a recorded
 matrix operand: components can bind directly to signals without a host tree
 walk or re-encoding. Backend lowering sees only the sampled affine matrix.
 Layers using only the existing matrix allocate no component storage.
+
+### Projective layers (#84)
+
+`Projective` is a checked 4×4 `f64` homogeneous transform on column
+vectors, with positive Z toward the viewer. On backends with the
+`ProjectiveLayers` capability (`Gpu`, `Raster`), `LayerEdit` gains four
+methods:
+
+- `projection(Live<Projective>)`: the base matrix; never animated;
+- `tilt(Live<Vec2>)`: X/Y rotation in radians;
+- `depth(Live<f64>)`: Z translation;
+- `clear_projection()`.
+
+The complete pose composes #77's order around them:
+
+```text
+transform · T(translation + pivot) · projection · T(0, 0, depth)
+  · Rz(rotation) · Ry(tilt.y) · Rx(tilt.x) · skew · scale · T(−pivot)
+```
+
+Tilt and depth are component tracks with unwrapped angles and
+velocity-preserving retargeting. The raw matrix is replaced, never
+interpolated. A projective layer is a flattening boundary. Its subtree
+renders into a clip-bounded, layer-local RGBA16F image at a conservative
+power-of-two density, with a full area-average mip chain. The image is
+projected with a bounded 16-tap anisotropic trilinear filter when the
+layer composes into its parent, where opacity and blend apply once.
+Clipping happens in homogeneous coordinates against `W > 0` and the
+viewport, before division.
+
+Local images are retained without the outer pose, so a matrix-only frame
+realizes nothing. Invalid poses are `RenderError::ProjectivePose`, and
+images beyond the dimension or byte limits are
+`RenderError::ProjectiveUnsupported`. An unclipped layer, a projective
+backdrop member, or a backdrop group spanning composition spaces is
+`RenderError::Unsupported`. The full contract is
+[`docs/projective.md`](projective.md).
 
 ### Mesh colour interpolation (#79)
 

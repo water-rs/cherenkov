@@ -263,6 +263,18 @@ struct Plane {
     shown: Option<Properties>,
 }
 
+/// A `refresh` update validated against its plane and recorded in the
+/// transaction — staged until the transaction holds every update, so an
+/// error mid-way leaves `promoted` untouched (#90).
+struct Update {
+    layer: LayerId,
+    generation: u64,
+    /// The frame to lease and install — `None` keeps the plane's current
+    /// one (its generation already matches).
+    frame: Option<vulkan::Frame>,
+    properties: Properties,
+}
+
 /// An engine surface realized as child surface controls of the host's
 /// parent.
 pub struct Planes {
@@ -279,6 +291,9 @@ pub struct Planes {
     parts: Vec<Part>,
     /// The planes showing promoted frames, by layer.
     promoted: FxHashMap<LayerId, Plane>,
+    /// `refresh`'s validated updates, staged while its transaction is
+    /// built and drained once it is — the buffer is reused across calls.
+    updates: Vec<Update>,
     /// Buffers of removed parts and previous sizes, dropped once released.
     retiring: Vec<Buffer>,
     next_buffer: u64,
@@ -335,6 +350,7 @@ impl Planes {
             submit_lock,
             parts: Vec::new(),
             promoted: FxHashMap::default(),
+            updates: Vec::new(),
             retiring: Vec::new(),
             next_buffer: 0,
             signal,
@@ -724,13 +740,21 @@ impl Planes {
     /// shown buffer in place — no buffer is acquired, no submission runs
     /// and no fence is exported (#90).
     ///
+    /// Every update is validated and recorded in the transaction before
+    /// any bookkeeping moves, so an error leaves `promoted` describing
+    /// the last applied transaction.
+    ///
     /// # Errors
     /// [`RenderError`] when a promoted layer's buffer a plane cannot show,
     /// or a refresh names a plane that is not showing.
     fn refresh(&mut self, frames: &[crate::render::planes::Plane<'_>]) -> Result<(), RenderError> {
         self.collect_releases();
+        // Validate every update and build the transaction before any
+        // bookkeeping moves (as `present` does through `stack`): an error
+        // leaves `promoted` describing the last applied transaction and
+        // drops no staged release.
+        self.updates.clear();
         let mut transaction = Transaction::new();
-        let mut pending: Vec<Pending> = Vec::new();
         for update in frames {
             let layer = update.placement.layer;
             let PlaneContent::Frame { frame, generation } = &update.content;
@@ -738,22 +762,11 @@ impl Planes {
                 return Err(cannot_show(layer, &Ineligible::NotABuffer));
             };
             let contract = contract(native).map_err(|e| cannot_show(layer, &e))?;
-            let Some(plane) = self.promoted.get_mut(&layer) else {
+            let Some(plane) = self.promoted.get(&layer) else {
                 return Err(RenderError::Render(format!(
                     "layer {layer:?}'s frame changed while no plane shows it"
                 )));
             };
-            if plane.generation != *generation {
-                native.lease();
-                plane.generation = *generation;
-                let previous = std::mem::replace(&mut plane.frame, native.clone());
-                set_frame(&mut transaction, &plane.surface, native, dup_fence)?;
-                pending.push(Pending {
-                    surface: plane.surface.as_ptr(),
-                    what: Replaced::Frame(previous),
-                    removed: None,
-                });
-            }
             // The committed plan pins the placement, z-order and alpha;
             // only the new frame's contract can move a property. `shown`
             // is `None` only when a previous present failed mid-
@@ -764,6 +777,12 @@ impl Planes {
                     "layer {layer:?}'s plane never showed a frame"
                 )));
             };
+            let frame = if plane.generation == *generation {
+                None
+            } else {
+                set_frame(&mut transaction, &plane.surface, native, dup_fence)?;
+                Some(native.clone())
+            };
             properties.opaque = contract.opaque;
             properties.dataspace = contract.dataspace;
             properties.hdr = contract.hdr;
@@ -772,7 +791,30 @@ impl Planes {
             for &op in &self.ops {
                 transaction.set(&plane.surface, op);
             }
-            plane.shown = Some(properties);
+            self.updates.push(Update {
+                layer,
+                generation: *generation,
+                frame,
+                properties,
+            });
+        }
+        let mut pending = Vec::with_capacity(self.updates.len());
+        for update in self.updates.drain(..) {
+            let plane = self
+                .promoted
+                .get_mut(&update.layer)
+                .expect("validated above");
+            if let Some(frame) = update.frame {
+                frame.lease();
+                plane.generation = update.generation;
+                let previous = std::mem::replace(&mut plane.frame, frame);
+                pending.push(Pending {
+                    surface: plane.surface.as_ptr(),
+                    what: Replaced::Frame(previous),
+                    removed: None,
+                });
+            }
+            plane.shown = Some(update.properties);
         }
         Self::apply(transaction, &self.release, pending);
         Ok(())

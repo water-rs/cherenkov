@@ -18,10 +18,6 @@ fn tmp() -> std::path::PathBuf {
     std::env::temp_dir().join("cherenkov-oracle-tests")
 }
 
-#[expect(
-    clippy::float_cmp,
-    reason = "exact equality is the assertion under test"
-)]
 #[test]
 fn self_comparison_is_perfect() {
     let mut b = Scene::builder(W, H);
@@ -37,10 +33,6 @@ fn self_comparison_is_perfect() {
     assert_eq!(m.max_local_error, 0.0);
 }
 
-#[expect(
-    clippy::float_cmp,
-    reason = "exact equality is the assertion under test"
-)]
 #[expect(
     clippy::cast_possible_truncation,
     reason = "comparing f32 channels against f64 constants"
@@ -71,10 +63,6 @@ fn solid_rect_fills_pixel_centres() {
 /// A clip `x < 9.75` over a shape `x ∈ [9.25, 16)` yields exact coverage
 /// 0.5 in pixel column 9; multiplying the independent coverages
 /// (0.75 × 0.75) would give 0.5625. This test locks in the geometric rule.
-#[expect(
-    clippy::float_cmp,
-    reason = "exact equality is the assertion under test"
-)]
 #[test]
 fn clip_is_geometric_intersection() {
     let mut b = Scene::builder(W, H).clear(Color::new(
@@ -111,10 +99,6 @@ fn clip_is_geometric_intersection() {
 /// Regression for a 24×16 px leak: the unsealed tip let the geometric
 /// clip drop the fill's inside piece, and the open contour read as
 /// covered to the left of the clip.
-#[expect(
-    clippy::float_cmp,
-    reason = "zero alpha outside the clip is the assertion under test"
-)]
 #[test]
 fn ellipse_clip_writes_nothing_outside_the_tip() {
     const W: usize = 144;
@@ -203,10 +187,6 @@ fn linear_gradient_at_pixel_centre() {
     assert!(r15 > r0);
 }
 
-#[expect(
-    clippy::float_cmp,
-    reason = "exact equality is the assertion under test"
-)]
 #[test]
 fn metrics_detect_error() {
     let mut b = Scene::builder(W, H);
@@ -563,10 +543,6 @@ fn coverage_rotated_squares_exact() {
 /// texel's outer half (`u ∈ [0, 0.5)`) collapses onto the edge texel
 /// exactly — it must not blend with the *interior* neighbour under a
 /// flipped weight.
-#[expect(
-    clippy::float_cmp,
-    reason = "exact equality is the assertion under test"
-)]
 #[test]
 fn bilinear_clamps_at_edges() {
     use cherenkov_oracle::paint::sample_image;

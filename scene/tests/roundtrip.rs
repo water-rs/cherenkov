@@ -180,7 +180,7 @@ fn present_headroom_roundtrip() {
 fn item_untagged() {
     let layer_json = r#"{"items":[]}"#;
     let layer: cherenkov_scene::Layer = serde_json::from_str(layer_json).unwrap();
-    assert!(layer.items.is_empty());
+    assert_eq!(layer.items, []);
     let item_layer: Item = serde_json::from_str(r#"{"layer":{"items":[]}}"#).unwrap();
     assert!(matches!(item_layer, Item::Layer(_)));
     let item_draw: Item = serde_json::from_str(

@@ -252,9 +252,9 @@ fn sample_image(
             let (c00, c10, c01, c11) = (at(x0, y0), at(x1, y0), at(x0, y1), at(x1, y1));
             let mut out = [0.0; 4];
             for i in 0..4 {
-                let top = c00[i] + tx * (c10[i] - c00[i]);
-                let bot = c01[i] + tx * (c11[i] - c01[i]);
-                out[i] = top + ty * (bot - top);
+                let top = tx.mul_add(c10[i] - c00[i], c00[i]);
+                let bot = tx.mul_add(c11[i] - c01[i], c01[i]);
+                out[i] = ty.mul_add(bot - top, top);
             }
             out
         }
@@ -576,7 +576,7 @@ impl PaintData {
                 interpolation,
             } => {
                 let (px, py) = apply(*inv, dx, dy);
-                let (sx, sy, ex, ey) = (end_points[0], end_points[1], end_points[2], end_points[3]);
+                let (sx, sy, ex, ey) = (*end_points).into();
                 let (ddx, ddy) = (ex - sx, ey - sy);
                 let len2 = ddy.mul_add(ddy, ddx * ddx);
                 let t = if len2 == 0.0 {

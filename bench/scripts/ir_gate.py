@@ -20,7 +20,13 @@ with their call count; and the Rust Ir: inclusive Ir minus both shares.
   ir_gate.py compare --out O BASE HEAD      # the +1% / no-more-calls rule
   ir_gate.py same    --out O TAG TAG [TAG]  # identical Ir across re-profiles
 
-For Lavapipe it sets VK_ICD_FILENAMES, XDG_RUNTIME_DIR and RUST_LOG.
+For Lavapipe it sets VK_ICD_FILENAMES, XDG_RUNTIME_DIR and RUST_LOG, and it
+builds and enables VK_LAYER_CHERENKOV_no_raster (ir_no_raster.c), a global
+instance layer that no-ops the GPU-work vkCmd* entry points under Callgrind:
+lavapipe rasterization dominates the profile wall time but every vkCmd* call
+sits outside the measured lower/encode roots, so skipping it cannot change
+the counted Ir. NODEVICE_SELECT disables the MESA device_select layer, whose
+teardown crashes when another instance layer sits in front of it.
 """
 import argparse, collections, concurrent.futures, ctypes, hashlib, json, os, pathlib, re, selectors, struct, subprocess, sys
 
@@ -132,8 +138,23 @@ def profile(binary, tag, scene, repo, out, pause_at, warmup):
         hits = [line.split()[-1] for line in symbols if line.split()[-1].endswith(suffix) and crate in line]
         assert len(hits) == 1, (tag, phase, hits)
         roots[phase] = hits[0]
+    layer_dir = out / 'vk_layer'
+    layer_dir.mkdir(exist_ok=True)
+    source = pathlib.Path(__file__).with_name('ir_no_raster.c')
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()[:16]
+    library = layer_dir / f'libVkLayerCherenkovNoRaster-{digest}.so'
+    tmp = layer_dir / f'{library.name}.{os.getpid()}.tmp'
+    subprocess.run(['cc', '-shared', '-fPIC', '-O2', '-o', str(tmp), str(source)], check=True)
+    os.replace(tmp, library)
+    manifest = layer_dir / 'VkLayer_cherenkov_no_raster.json'
+    manifest.write_text(json.dumps({
+        'file_format_version': '1.0.0',
+        'layer': {'name': 'VK_LAYER_CHERENKOV_no_raster', 'type': 'GLOBAL', 'library_path': str(library),
+                  'api_version': '1.3.0', 'implementation_version': '1',
+                  'description': 'No-op GPU-work vkCmd* entry points (gate only)'}}, indent=1) + '\n')
     env = os.environ.copy()
-    env.update(VK_ICD_FILENAMES='/usr/share/vulkan/icd.d/lvp_icd.x86_64.json', XDG_RUNTIME_DIR='/tmp/runtime-ubuntu', RUST_LOG='error')
+    env.update(VK_ICD_FILENAMES='/usr/share/vulkan/icd.d/lvp_icd.x86_64.json', XDG_RUNTIME_DIR='/tmp/runtime-ubuntu', RUST_LOG='error',
+               VK_LAYER_PATH=str(layer_dir), VK_INSTANCE_LAYERS='VK_LAYER_CHERENKOV_no_raster', NODEVICE_SELECT='1')
     os.makedirs(env['XDG_RUNTIME_DIR'], exist_ok=True)
     dumps = [f'--dump-{when}={sym}' for sym in roots.values() for when in ('before', 'after')]
     command = ['valgrind', '--tool=callgrind', '--instr-atstart=no', '--separate-threads=yes', *dumps,

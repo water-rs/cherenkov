@@ -4219,7 +4219,7 @@ fn clip_region(clip: Option<DeviceClip>, width: u32, height: u32) -> [u32; 4] {
         );
     }
     let inv = clip.inv.inverse();
-    let (hx, hy) = (clip.shape.half[0], clip.shape.half[1]);
+    let (hx, hy) = clip.shape.half.into();
     let mut min = [f32::INFINITY; 2];
     let mut max = [f32::NEG_INFINITY; 2];
     for (x, y) in [(hx, hy), (-hx, hy), (hx, -hy), (-hx, -hy)] {
@@ -4409,7 +4409,6 @@ mod tests {
     /// A destructive blend composites over the whole clip (or parent),
     /// not the tight region of the layer's content.
     #[test]
-    #[expect(clippy::float_cmp, reason = "integer regions compare exactly")]
     fn destructive_composite_covers_the_whole_parent() {
         let Some((device, _queue)) = device_and_queue() else {
             return;
@@ -4481,7 +4480,6 @@ mod tests {
     /// A clipped destructive composite covers the padded clip rect and
     /// carries the clip on the composite instance.
     #[test]
-    #[expect(clippy::float_cmp, reason = "integer regions compare exactly")]
     fn destructive_composite_is_bounded_by_the_clip() {
         let Some((device, _queue)) = device_and_queue() else {
             return;
@@ -4672,11 +4670,7 @@ mod tests {
         strips.iter().all(|r| r.intersect(b) == *r)
     }
 
-    #[expect(
-        clippy::float_cmp,
-        clippy::suboptimal_flops,
-        reason = "integer-valued geometry is exact"
-    )]
+    #[expect(clippy::suboptimal_flops, reason = "integer-valued geometry is exact")]
     #[test]
     fn cover_strips_full_cover() {
         let b = Rect::new(-20.0, -20.0, 20.0, 20.0);
@@ -4692,7 +4686,6 @@ mod tests {
         assert_eq!(total, 1600.0 - (30.0 * 10.0 + 10.0 * 30.0 - 10.0 * 10.0));
     }
 
-    #[expect(clippy::float_cmp, reason = "integer-valued geometry is exact")]
     #[test]
     fn cover_strips_one_empty_box() {
         let b = Rect::new(-20.0, -20.0, 20.0, 20.0);
@@ -4719,7 +4712,6 @@ mod tests {
         assert_eq!(strips, vec![b]);
     }
 
-    #[expect(clippy::float_cmp, reason = "integer-valued geometry is exact")]
     #[test]
     fn cover_strips_clips_to_b() {
         let b = Rect::new(-20.0, -20.0, 20.0, 20.0);

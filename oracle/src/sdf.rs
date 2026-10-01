@@ -163,7 +163,7 @@ fn arc_normal(arc: &(f64, f64, f64, [f64; 2], [f64; 2]), theta: f64) -> [f64; 2]
 /// The box boundary as four straight segments plus four corner arcs, in
 /// box-local space. Zero radii degenerate an arc to the corner point.
 fn boundary_pieces(s: &BoxShape) -> Vec<Piece> {
-    let (hx, hy) = (s.half[0], s.half[1]);
+    let (hx, hy) = s.half.into();
     // Arc centre and its two edge endpoints per corner.
     let mut arcs = Vec::with_capacity(4);
     for (i, (sx, sy)) in CORNERS.iter().enumerate() {
@@ -521,7 +521,6 @@ mod tests {
     use super::*;
     use kurbo::RoundedRect;
 
-    #[expect(clippy::float_cmp, reason = "texel-centre samples are exact")]
     #[test]
     fn bilinear_at_texel_centres_is_the_texel() {
         let px: Vec<[f64; 4]> = (0..16)
@@ -638,7 +637,7 @@ mod tests {
     fn boundary_cloud(s: &BoxShape, device_from_box: &Affine) -> Vec<[f64; 2]> {
         const ARC_SAMPLES: u32 = 50_000;
         const EDGE_SAMPLES: u32 = 1_000;
-        let (hx, hy) = (s.half[0], s.half[1]);
+        let (hx, hy) = s.half.into();
         // Each arc's corner data: quadrant signs, centre, radii.
         let arc_of = |i: usize| {
             let (sx, sy) = CORNERS[i];
@@ -647,7 +646,7 @@ mod tests {
                 sx,
                 sy,
                 s.exponent,
-                [sx * (hx - rx), sy * (hy - rx * s.aspect)],
+                [sx * (hx - rx), sy * rx.mul_add(-s.aspect, hy)],
                 [rx, rx * s.aspect],
             )
         };

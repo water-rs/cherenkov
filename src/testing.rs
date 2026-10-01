@@ -1466,19 +1466,11 @@ mod tests {
         image
             .replace(ImageData::<Rgba8>::new(2, 3, vec![0u8; 24]).expect("image data"))
             .expect("replace");
-        assert_eq!(
-            wakes.load(Ordering::Relaxed),
-            1,
-            "a replacement wakes the host"
-        );
+        assert_eq!(wakes.load(Ordering::Relaxed), 1, "a replacement wakes the host");
         unused
             .replace(ImageData::<Rgba8>::new(2, 2, vec![0u8; 16]).expect("image data"))
             .expect("replace");
-        assert_eq!(
-            wakes.load(Ordering::Relaxed),
-            1,
-            "the host is woken at most once between two renders"
-        );
+        assert_eq!(wakes.load(Ordering::Relaxed), 1, "at most one wake before a render");
         engine.render(FrameTime::now()).expect("render");
         let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert!(

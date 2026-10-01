@@ -780,7 +780,7 @@ mod tests {
 
         commit(&mut renderer, &mut state, surface, &mut second);
 
-        assert!(second.recycled.is_empty());
+        assert_eq!(second.recycled, []);
         assert_eq!(caller_picture.display_list().len(), 1);
     }
 }

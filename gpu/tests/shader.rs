@@ -51,7 +51,7 @@ fn every_variant_emits_spirv() {
         writer
             .write(&module, &info, None, &None, &mut words)
             .unwrap_or_else(|e| panic!("variant {variant}: spv: {e}"));
-        assert!(!words.is_empty());
+        assert_ne!(words, []);
     }
 }
 }
@@ -67,7 +67,7 @@ fn every_variant_emits_hlsl() {
         writer
             .write(&module, &info, None)
             .unwrap_or_else(|e| panic!("variant {variant}: hlsl: {e}"));
-        assert!(!out.is_empty());
+        assert_ne!(out, "");
     }
 }
 }
@@ -99,7 +99,7 @@ fn effect_emits(name: &str, module: &Module, info: &naga::valid::ModuleInfo) {
     writer
         .write(module, info, None, &None, &mut words)
         .unwrap_or_else(|e| panic!("{name}: spv: {e}"));
-    assert!(!words.is_empty());
+    assert_ne!(words, []);
     let options = hlsl::Options::default();
     let mut out = String::new();
     let pipeline_options = hlsl::PipelineOptions::default();
@@ -107,7 +107,7 @@ fn effect_emits(name: &str, module: &Module, info: &naga::valid::ModuleInfo) {
     hlsl_writer
         .write(module, info, None)
         .unwrap_or_else(|e| panic!("{name}: hlsl: {e}"));
-    assert!(!out.is_empty());
+    assert_ne!(out, "");
 }
 
 split_test! {

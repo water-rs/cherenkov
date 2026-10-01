@@ -734,7 +734,10 @@ fn star_path(cx: f64, cy: f64, r0: f64, r1: f64) -> BezPath {
     for i in 0..10 {
         let angle = f64::from(i) * std::f64::consts::TAU / 10.0 - std::f64::consts::FRAC_PI_2;
         let r = if i % 2 == 0 { r1 } else { r0 };
-        let pt = (cx + r * libm::cos(angle), cy + r * libm::sin(angle));
+        let pt = (
+            r.mul_add(libm::cos(angle), cx),
+            r.mul_add(libm::sin(angle), cy),
+        );
         if i == 0 {
             p.move_to(pt);
         } else {
@@ -1764,7 +1767,7 @@ fn lot_subpath(path: &mut BezPath, lot: &MapLot) {
                 let rr = if vi % 2 == 0 { r } else { r * 0.4 };
                 let angle = f64::from(vi)
                     .mul_add(std::f64::consts::TAU / 10.0, -std::f64::consts::FRAC_PI_2);
-                let pt = (cx + rr * angle.cos(), cy + rr * angle.sin());
+                let pt = (rr.mul_add(angle.cos(), cx), rr.mul_add(angle.sin(), cy));
                 if vi == 0 {
                     path.move_to(pt);
                 } else {

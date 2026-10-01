@@ -176,10 +176,6 @@ mod tests {
 
     /// A `LinearP3` upload is the working space already: no transfer
     /// function and no primaries matrix — the byte value passes through.
-    #[expect(
-        clippy::float_cmp,
-        reason = "255/255 decodes to exactly 1.0 — an exact assertion"
-    )]
     #[test]
     fn linear_p3_upload_decodes_as_identity() {
         let image = ImageUpload {

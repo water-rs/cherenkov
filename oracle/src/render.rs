@@ -53,7 +53,7 @@ use cherenkov_scene::{
     BackdropFilter, BackdropGroup, BlendMode, BlendSpace, Draw, FillRule, GroupItem, Item, Layer,
     LayerFilter, Paint, Scene, Shape,
 };
-use kurbo::{Affine, Point, Rect};
+use kurbo::{Affine, Point, Rect, Vec2};
 
 use crate::blend::{blend, src_over};
 use crate::clip::{Segment, intersect_edges};
@@ -947,7 +947,7 @@ impl Renderer {
         let renderer = Self::new(width, height);
         let place = Affine::translate((px as f64, py as f64))
             * tf
-            * Affine::translate((offset[0], offset[1]));
+            * Affine::translate(Vec2::new(offset[0], offset[1]));
         let coverage = renderer.shape_coverage(shape, FillRule::NonZero, place, &[]);
         let blurred = crate::shadow::affine_blur(&coverage, width, height, sigma, [a, b, c, d]);
         let clip = (!clips.is_empty()).then(|| {
@@ -1052,7 +1052,7 @@ impl Renderer {
             } => {
                 // Exact: shift the shape edges by the offset before coverage,
                 // then blur (convolution commutes with translation).
-                let tf_off = tf * Affine::translate((offset[0], offset[1]));
+                let tf_off = tf * Affine::translate(Vec2::new(offset[0], offset[1]));
                 let blurred = if matches!(
                     shape,
                     Shape::Rect(_) | Shape::RoundedRect(_) | Shape::Circle(_)

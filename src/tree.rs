@@ -944,7 +944,7 @@ mod hierarchy_tests {
             tree.remove(LayerId::new(1)),
             [LayerId::new(1), LayerId::new(2)]
         );
-        assert!(tree.layer(LayerId::new(3)).children.is_empty());
+        assert_eq!(tree.layer(LayerId::new(3)).children, []);
     }
 
     #[test]

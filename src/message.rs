@@ -182,6 +182,14 @@ pub enum LayerOp {
     Skew(LayerId, Prop<Vec2>),
     /// Sets the local pivot for rotation, skew and scale; initially zero.
     Pivot(LayerId, Prop<Vec2>),
+    /// Sets the projection base of a projective layer; never animated.
+    Projection(LayerId, crate::Projective),
+    /// Sets the X/Y depth-rotation angles in radians; initially zero.
+    Tilt(LayerId, Prop<Vec2>),
+    /// Sets the translation along Z; initially zero.
+    Depth(LayerId, Prop<f64>),
+    /// Removes projection, tilt and depth; the layer is affine again.
+    ClearProjection(LayerId),
     /// Set the opacity.
     Opacity(LayerId, Prop<f32>),
     /// Set the scroll offset.

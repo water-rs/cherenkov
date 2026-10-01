@@ -101,6 +101,11 @@ pub struct Layer {
     /// Zero (the default) draws them untranslated.
     #[serde(default, skip_serializing_if = "vec2_is_zero")]
     pub scroll_offset: Vec2,
+    /// A projective pose (#84): the layer is flattened into a layer-local
+    /// image that is projected when it composes onto its parent. `None`
+    /// (the default) keeps the layer affine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection: Option<Box<Projection>>,
     /// One-time motion for this layer: an animation or decay that runs
     /// from its `from` state and comes to rest at the layer's static
     /// properties. Engines that cannot animate report it unsupported and
@@ -117,6 +122,68 @@ pub struct Layer {
     /// others render frame 0.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub live: Vec<Live>,
+}
+
+/// A layer's projective pose. With column vectors, the layer's
+/// local-to-parent map is
+///
+/// `embed(transform) · T(pivot) · matrix · T(0, 0, depth) · Ry(tilt.y) ·
+/// Rx(tilt.x) · T(−pivot)`,
+///
+/// evaluated on the `z = 0` plane: a point `(x, y)` maps to `(X/W, Y/W)`
+/// and is visible only where `W > 0`. A projective layer must carry a
+/// clip, whose bounds are its finite local source domain. It is a
+/// flattening boundary: its content, clip, filter and children render in
+/// its own local space (filter parameters in local raster pixels), and
+/// the completed image is projected with the layer's opacity and blend.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Projection {
+    /// The projection base: a 4×4 row-major matrix on column vectors,
+    /// positive Z toward the viewer. Identity by default.
+    #[serde(default = "Projection::identity")]
+    pub matrix: [[f64; 4]; 4],
+    /// Rotation about X (`tilt.x`) then Y (`tilt.y`), radians.
+    #[serde(default, skip_serializing_if = "vec2_is_zero")]
+    pub tilt: Vec2,
+    /// Translation along Z, layer units.
+    #[serde(default, skip_serializing_if = "f64_is_zero")]
+    pub depth: f64,
+    /// The local point the projection, tilt and depth are centred on.
+    #[serde(default, skip_serializing_if = "vec2_is_zero")]
+    pub pivot: Vec2,
+}
+
+impl Projection {
+    /// The identity matrix.
+    #[must_use]
+    pub const fn identity() -> [[f64; 4]; 4] {
+        [
+            [1., 0., 0., 0.],
+            [0., 1., 0., 0.],
+            [0., 0., 1., 0.],
+            [0., 0., 0., 1.],
+        ]
+    }
+
+    /// A perspective camera at `distance` in front of the `z = 0` plane:
+    /// `w = 1 − z / distance`.
+    #[must_use]
+    pub const fn perspective(distance: f64) -> [[f64; 4]; 4] {
+        let mut rows = Self::identity();
+        rows[3][2] = -1.0 / distance;
+        rows
+    }
+}
+
+impl Default for Projection {
+    fn default() -> Self {
+        Self {
+            matrix: Self::identity(),
+            tilt: Vec2::ZERO,
+            depth: 0.0,
+            pivot: Vec2::ZERO,
+        }
+    }
 }
 
 /// A filtrate filter on a layer's isolated content, in premultiplied
@@ -238,6 +305,15 @@ pub enum Motion {
         /// How it moves to the static `transform`.
         animation: MotionAnimation,
     },
+    /// The projection's `tilt` starts at `from` and animates to the
+    /// layer's static `projection.tilt`, preserving winding. The layer
+    /// must carry a `projection`.
+    Tilt {
+        /// The tilt the layer starts at, radians.
+        from: Vec2,
+        /// How it moves to the static tilt.
+        animation: MotionAnimation,
+    },
     /// `scroll_offset` starts at `from` and decays with `velocity`
     /// (deceleration per second), optionally rubber-banding to `bounds`.
     /// It must come to rest at the layer's static `scroll_offset` (the
@@ -299,6 +375,18 @@ fn vec2_is_zero(v: &Vec2) -> bool {
     *v == Vec2::ZERO
 }
 
+/// Serde helper: a zero `depth` is left out of the JSON.
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    expect(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "serde's skip_serializing_if passes a reference"
+    )
+)]
+fn f64_is_zero(v: &f64) -> bool {
+    *v == 0.0
+}
+
 impl Layer {
     const fn default_opacity() -> f64 {
         1.0
@@ -316,6 +404,7 @@ impl Default for Layer {
             filter: None,
             backdrop_effect: None,
             scroll_offset: Vec2::ZERO,
+            projection: None,
             motion: None,
             items: Vec::new(),
             live: Vec::new(),

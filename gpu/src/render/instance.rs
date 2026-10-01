@@ -36,6 +36,11 @@ pub const PAINT_MESH: u32 = 6;
 /// of the bound capture, then the effect from `meta[3]`'s low bits.
 pub const PAINT_BACKDROP: u32 = 7;
 
+/// A projective composite (#84): drawn only by the projective pipeline,
+/// which samples the layer's local image through the inverse homography
+/// in the three stop rows at `first_stop`.
+pub const PAINT_PROJECTIVE: u32 = 8;
+
 /// Effect kinds packed into `meta[3]`'s low byte of a `PAINT_BACKDROP`
 /// instance (`param stop count << 8`, flags still `<< 24`).
 pub const EFFECT_COLOR: u32 = 1;

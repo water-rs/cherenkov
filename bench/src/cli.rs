@@ -306,6 +306,18 @@ enum Sub {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Render projective scenes in the oracle with the specified model and
+    /// with two successively refined quality references, and report the
+    /// model's distance from the finest reference and the references'
+    /// convergence (#84). No engine — pure oracle `f64` math.
+    ProjectiveQuality {
+        /// Scene directories.
+        #[arg(long = "scene", required = true)]
+        scenes: Vec<PathBuf>,
+        /// Report text path; stdout when omitted.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// List compiled-in adapter keys.
     Engines,
 }
@@ -511,6 +523,9 @@ fn run(cli: Cli) -> Result<(), BenchError> {
         ),
         Sub::GamutSweep { out } => crate::gamut_sweep::run(out.as_deref()),
         Sub::ToneSweep { out } => crate::tone_sweep::run(out.as_deref()),
+        Sub::ProjectiveQuality { scenes, out } => {
+            crate::projective_quality::run(&scenes, out.as_deref())
+        }
     }
 }
 

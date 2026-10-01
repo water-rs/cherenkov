@@ -21,8 +21,8 @@ use cherenkov_scene::{
     BackdropEffectSpec, BackdropFilter, BlendMode, Color, ColorSpace, Draw, Extend, FillRule,
     FilterBlend, Glyph, GlyphRun, GradientStop, ImageColorSpace, ImageEncoding, ImagePaint,
     LayerBuilder, LayerFilter, LinearGradient, Live, Motion, MotionAnimation, NormalizedCoord,
-    Paint, RadialGradient, ResourceHash, Sampling, Scene, SceneBuilder, SceneError, Shape,
-    StrokeStyle, SweepGradient,
+    Paint, Projection, RadialGradient, ResourceHash, Sampling, Scene, SceneBuilder, SceneError,
+    Shape, StrokeStyle, SweepGradient,
 };
 use fontique::FontWeight;
 use parley::{
@@ -986,6 +986,563 @@ impl Corpus {
             blobs,
         });
     }
+}
+
+/// The colours of one projective card variant (SDR, P3-only or HDR).
+struct CardColors {
+    face: Color,
+    ink: Color,
+    accent: Color,
+    line: Color,
+}
+
+/// Text on a projective card: Latin, CJK and Arabic lines, shaped once.
+struct CardText {
+    runs: Vec<GlyphRun>,
+    blobs: Vec<Vec<u8>>,
+}
+
+impl CardText {
+    fn new(ctx: &mut TextContext, ink: &Paint) -> Self {
+        let lines = [
+            ("NotoSans.ttf", corpus::LATIN, 13.0, 0.0),
+            ("NotoSansSC.ttf", corpus::CJK, 16.0, 36.0),
+            ("NotoSansArabic.ttf", corpus::ARABIC, 16.0, 60.0),
+        ];
+        let mut runs = Vec::new();
+        for (file, text, size, dy) in lines {
+            for run in ctx.shape(file, text, size, FontWeight::NORMAL, ink) {
+                runs.push(offset_run(&run, 0.0, dy));
+            }
+        }
+        let blobs = font_blobs(ctx, &[&runs]);
+        Self { runs, blobs }
+    }
+}
+
+/// A 256×128 local card at the origin, clipped to a rounded rect: a face,
+/// text in three scripts, one-pixel strokes, a rounded badge and an image.
+fn projective_card(l: &mut LayerBuilder, text: &CardText, image: ResourceHash, c: &CardColors) {
+    l.clip(Shape::rounded_rect(0.0, 0.0, 256.0, 128.0, 14.0));
+    l.fill(Shape::rect(0.0, 0.0, 256.0, 128.0), solid(c.face));
+    for run in &text.runs {
+        l.glyphs(offset_run(run, 4.0, 2.0));
+    }
+    for i in 0..6 {
+        let y = 0.5_f64.mul_add(1.0, f64::from(i).mul_add(5.0, 96.0));
+        l.stroke(
+            Shape::Line(Line::new((12.0, y), (150.0, y))),
+            StrokeStyle {
+                width: 1.0,
+                ..StrokeStyle::default()
+            },
+            solid(c.line),
+        );
+    }
+    l.fill(
+        Shape::rounded_rect(168.0, 88.0, 72.0, 28.0, 10.0),
+        solid(c.accent),
+    );
+    l.image(
+        image,
+        Rect::new(196.0, 14.0, 244.0, 62.0),
+        Sampling::Bilinear,
+    );
+}
+
+/// A perspective card placed with its local origin at `(x, y)` and tilted
+/// about its centre.
+fn card_projection(tilt: Vec2, distance: f64) -> Projection {
+    Projection {
+        matrix: Projection::perspective(distance),
+        tilt,
+        pivot: Vec2::new(128.0, 64.0),
+        ..Projection::default()
+    }
+}
+
+/// A `size`×`size` one-texel checkerboard of `a` and `b`.
+fn fine_checker_png(size: u8, a: [u8; 4], b: [u8; 4]) -> Vec<u8> {
+    let mut px = Vec::with_capacity(usize::from(size) * usize::from(size) * 4);
+    for y in 0..size {
+        for x in 0..size {
+            px.extend_from_slice(if (x + y) % 2 == 0 { &a } else { &b });
+        }
+    }
+    encode_png_rgba(u32::from(size), u32::from(size), &px)
+}
+
+/// The two-stop linear gradient from `a` at `start` to `b` at `end`.
+fn linear2(start: Point, end: Point, a: Color, b: Color) -> Paint {
+    Paint::Linear(LinearGradient {
+        start,
+        end,
+        stops: vec![
+            GradientStop {
+                offset: 0.0,
+                color: a,
+            },
+            GradientStop {
+                offset: 1.0,
+                color: b,
+            },
+        ],
+        extend: Extend::Pad,
+        interpolation: ColorSpace::LinearP3,
+    })
+}
+
+/// Projective layers (#84): cards rotated in depth with text, thin paths,
+/// rounded geometry and an image; flips; the horizon; nesting; blends;
+/// backdrops; and minification.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one scene family per block, in the corpus's usual style"
+)]
+fn projective_scenes(corpus: &mut Corpus, ctx: &mut TextContext) {
+    use std::f64::consts::{PI, TAU};
+    let sdr = CardColors {
+        face: srgb(0.97, 0.96, 0.92),
+        ink: srgb(0.1, 0.1, 0.14),
+        accent: srgb(0.85, 0.3, 0.2),
+        line: srgb(0.2, 0.35, 0.8),
+    };
+    let wide = CardColors {
+        face: p3(0.95, 0.97, 0.9),
+        ink: p3(0.05, 0.3, 0.05),
+        accent: p3(0.0, 0.85, 0.2),
+        line: p3(0.9, 0.0, 0.3),
+    };
+    let bright = CardColors {
+        face: srgb(0.9, 0.9, 0.95),
+        ink: srgb(0.05, 0.05, 0.1),
+        accent: hdr(4.0, 1.2, 0.3),
+        line: hdr(0.5, 1.5, 6.0),
+    };
+    let checker = checker_png();
+    let backdrop = srgb(0.86, 0.88, 0.92);
+    let texts = [
+        CardText::new(ctx, &solid(sdr.ink)),
+        CardText::new(ctx, &solid(wide.ink)),
+        CardText::new(ctx, &solid(bright.ink)),
+    ];
+    let with_image = |text: &CardText| {
+        let mut blobs = text.blobs.clone();
+        blobs.push(checker.clone());
+        blobs
+    };
+
+    // Tilt about the vertical axis through the card centre, perspective
+    // at 480 units.
+    for degrees in [0_u32, 30, 60, 80, 89] {
+        let tilt = Vec2::new(0.0, f64::from(degrees).to_radians());
+        corpus.scene_with_blobs(
+            format!("projective-card-{degrees:02}"),
+            320,
+            192,
+            backdrop,
+            |l| {
+                l.layer(|card| {
+                    card.transform(Affine::translate((32.0, 32.0)));
+                    card.projection(card_projection(tilt, 480.0));
+                    projective_card(card, &texts[0], ResourceHash::of(&checker), &sdr);
+                });
+            },
+            with_image(&texts[0]),
+        );
+    }
+    for (suffix, colors, text) in [("p3", &wide, &texts[1]), ("hdr", &bright, &texts[2])] {
+        corpus.scene_with_blobs(
+            format!("projective-card-60-{suffix}"),
+            320,
+            192,
+            backdrop,
+            |l| {
+                l.layer(|card| {
+                    card.transform(Affine::translate((32.0, 32.0)));
+                    card.projection(card_projection(Vec2::new(0.35, 60_f64.to_radians()), 480.0));
+                    projective_card(card, text, ResourceHash::of(&checker), colors);
+                });
+            },
+            with_image(text),
+        );
+    }
+
+    // A full turn about a non-central pivot on a spring, pushed back in
+    // depth: the settled frame shows the front face again.
+    corpus.scene_with_blobs(
+        "projective-flip",
+        320,
+        192,
+        backdrop,
+        |l| {
+            l.layer(|card| {
+                card.transform(Affine::translate((32.0, 32.0)));
+                card.projection(Projection {
+                    matrix: Projection::perspective(420.0),
+                    tilt: Vec2::new(0.0, TAU),
+                    depth: -40.0,
+                    pivot: Vec2::new(64.0, 64.0),
+                });
+                card.motion(Motion::Tilt {
+                    from: Vec2::ZERO,
+                    animation: MotionAnimation::Spring {
+                        response: 0.4,
+                        damping: 0.8,
+                    },
+                });
+                projective_card(card, &texts[0], ResourceHash::of(&checker), &sdr);
+            });
+        },
+        with_image(&texts[0]),
+    );
+    // A curve-timed tilt that crosses density buckets, settling showing the
+    // back face (turned half way, both sides are drawn).
+    corpus.scene_with_blobs(
+        "projective-flip-back",
+        320,
+        192,
+        backdrop,
+        |l| {
+            l.layer(|card| {
+                card.transform(Affine::translate((32.0, 32.0)));
+                card.projection(Projection {
+                    matrix: Projection::perspective(300.0),
+                    tilt: Vec2::new(0.2, PI - 0.3),
+                    depth: 30.0,
+                    pivot: Vec2::new(128.0, 64.0),
+                });
+                card.motion(Motion::Tilt {
+                    from: Vec2::new(0.0, 0.0),
+                    animation: MotionAnimation::Curve {
+                        duration_ms: 250,
+                        x1: 0.25,
+                        y1: 0.1,
+                        x2: 0.25,
+                        y2: 1.0,
+                    },
+                });
+                projective_card(card, &texts[0], ResourceHash::of(&checker), &sdr);
+            });
+        },
+        with_image(&texts[0]),
+    );
+
+    // The horizon: a tall plane leaning back under a close camera. Its far
+    // part recedes toward the horizon line and its near part crosses
+    // W = 0 (`y > 328`) and passes behind the viewer, where it contributes
+    // nothing. The rescaled variant multiplies the matrix by a positive
+    // factor and must render identically.
+    let floor = |l: &mut LayerBuilder| {
+        let extent = Rect::new(0.0, -600.0, 320.0, 520.0);
+        l.clip(Shape::Rect(extent));
+        l.fill(
+            Shape::Rect(extent),
+            linear2(
+                Point::new(0.0, -600.0),
+                Point::new(0.0, 520.0),
+                srgb(0.2, 0.3, 0.7),
+                srgb(0.95, 0.8, 0.3),
+            ),
+        );
+        for i in 0..11 {
+            let x = f64::from(i) * 32.0;
+            l.stroke(
+                Shape::Line(Line::new((x, -600.0), (x, 520.0))),
+                StrokeStyle {
+                    width: 2.0,
+                    ..StrokeStyle::default()
+                },
+                solid(srgb(0.1, 0.1, 0.1)),
+            );
+        }
+        for i in 0..35 {
+            let y = f64::from(i).mul_add(32.0, -600.0);
+            l.fill(
+                Shape::rect(0.0, y, 320.0, 3.0),
+                solid(srgb(0.95, 0.95, 0.95)),
+            );
+        }
+    };
+    for (name, scale) in [
+        ("projective-horizon", 1.0),
+        ("projective-horizon-rescaled", 4.0),
+    ] {
+        corpus.scene(name, 320, 192, backdrop, |l| {
+            l.layer(|plane| {
+                plane.transform(Affine::translate((0.0, -8.0)));
+                plane.projection(Projection {
+                    matrix: Projection::perspective(160.0).map(|row| row.map(|v| v * scale)),
+                    tilt: Vec2::new(1.25, 0.0),
+                    pivot: Vec2::new(160.0, 160.0),
+                    ..Projection::default()
+                });
+                floor(plane);
+            });
+        });
+    }
+    // Behind the viewer: every visible W is negative, nothing is drawn.
+    corpus.scene("projective-horizon-behind", 128, 96, backdrop, |l| {
+        l.layer(|plane| {
+            plane.projection(Projection {
+                matrix: Projection::perspective(100.0),
+                depth: 150.0,
+                ..Projection::default()
+            });
+            floor(plane);
+        });
+    });
+    // An edge exactly on W = 0: W = 1 − (y − 32)/128 vanishes at y = 160,
+    // the clip's bottom edge.
+    corpus.scene("projective-horizon-edge", 256, 256, backdrop, |l| {
+        l.layer(|plane| {
+            let mut matrix = Projection::identity();
+            matrix[3][1] = -1.0 / 128.0;
+            plane.projection(Projection {
+                matrix,
+                pivot: Vec2::new(128.0, 32.0),
+                ..Projection::default()
+            });
+            plane.clip(Shape::rect(96.0, 32.0, 64.0, 128.0));
+            plane.fill(
+                Shape::rect(96.0, 32.0, 64.0, 128.0),
+                linear2(
+                    Point::new(0.0, 32.0),
+                    Point::new(0.0, 160.0),
+                    srgb(0.9, 0.2, 0.2),
+                    srgb(0.2, 0.2, 0.9),
+                ),
+            );
+            for i in 0..8 {
+                let y = f64::from(i).mul_add(16.0, 34.0);
+                plane.fill(Shape::rect(96.0, y, 64.0, 4.0), solid(srgb(1.0, 1.0, 1.0)));
+            }
+        });
+    });
+
+    // Nesting flattens at each projective layer: the child's tilt is baked
+    // into the parent's local image, its opacity composites there, and the
+    // parent's blur runs over the flattened child before the parent tilts.
+    corpus.scene_with_blobs(
+        "projective-nested",
+        320,
+        224,
+        backdrop,
+        |l| {
+            l.layer(|parent| {
+                parent.transform(Affine::translate((32.0, 24.0)));
+                parent.projection(Projection {
+                    matrix: Projection::perspective(500.0),
+                    tilt: Vec2::new(0.5, 0.0),
+                    pivot: Vec2::new(128.0, 88.0),
+                    ..Projection::default()
+                });
+                parent.clip(Shape::rounded_rect(0.0, 0.0, 256.0, 176.0, 12.0));
+                parent.fill(
+                    Shape::rect(0.0, 0.0, 256.0, 176.0),
+                    solid(srgb(0.3, 0.32, 0.4)),
+                );
+                parent.layer(|child| {
+                    child.transform(Affine::translate((24.0, 40.0)) * Affine::scale(0.75));
+                    child.opacity(0.75);
+                    child.projection(card_projection(Vec2::new(0.0, 0.9), 360.0));
+                    projective_card(child, &texts[0], ResourceHash::of(&checker), &sdr);
+                });
+            });
+        },
+        with_image(&texts[0]),
+    );
+    corpus.scene_with_blobs(
+        "projective-nested-filter",
+        320,
+        224,
+        backdrop,
+        |l| {
+            l.layer(|parent| {
+                parent.transform(Affine::translate((32.0, 24.0)));
+                parent.filter(LayerFilter::GaussianBlur { sigma: 1.5 });
+                parent.projection(Projection {
+                    matrix: Projection::perspective(500.0),
+                    tilt: Vec2::new(-0.4, 0.3),
+                    pivot: Vec2::new(128.0, 88.0),
+                    ..Projection::default()
+                });
+                parent.clip(Shape::rect(0.0, 0.0, 256.0, 176.0));
+                parent.fill(
+                    Shape::rect(0.0, 0.0, 256.0, 176.0),
+                    solid(srgb(0.25, 0.5, 0.45)),
+                );
+                parent.layer(|child| {
+                    child.transform(Affine::translate((24.0, 40.0)) * Affine::scale(0.75));
+                    child.projection(card_projection(Vec2::new(0.6, 0.0), 300.0));
+                    projective_card(child, &texts[0], ResourceHash::of(&checker), &sdr);
+                });
+            });
+        },
+        with_image(&texts[0]),
+    );
+
+    // Blends: translucent overlapping children flatten first, then the
+    // layer multiplies onto the gradient behind it; a destructive `src`
+    // blend clears its whole projected clip, including where its content
+    // is transparent.
+    let blend_ground = |l: &mut LayerBuilder, a: Color, b: Color| {
+        l.fill(
+            Shape::rect(0.0, 0.0, 256.0, 192.0),
+            linear2(Point::new(0.0, 0.0), Point::new(256.0, 192.0), a, b),
+        );
+    };
+    for (name, mode, colors) in [
+        (
+            "projective-blend-multiply",
+            BlendMode::Multiply,
+            [srgba(0.9, 0.2, 0.2, 0.6), srgba(0.2, 0.3, 0.9, 0.6)],
+        ),
+        (
+            "projective-blend-multiply-p3",
+            BlendMode::Multiply,
+            [p3(0.0, 0.9, 0.1), p3(0.95, 0.0, 0.5)],
+        ),
+        (
+            "projective-blend-src",
+            BlendMode::Src,
+            [srgba(0.9, 0.6, 0.1, 0.8), srgba(0.1, 0.6, 0.9, 0.5)],
+        ),
+    ] {
+        corpus.scene(name, 256, 192, backdrop, |l| {
+            blend_ground(l, srgb(0.95, 0.9, 0.3), srgb(0.3, 0.8, 0.9));
+            l.layer(|layer| {
+                layer.transform(Affine::translate((48.0, 32.0)));
+                layer.blend(mode);
+                layer.projection(Projection {
+                    matrix: Projection::perspective(300.0),
+                    tilt: Vec2::new(0.45, -0.6),
+                    pivot: Vec2::new(80.0, 64.0),
+                    ..Projection::default()
+                });
+                layer.clip(Shape::rounded_rect(0.0, 0.0, 160.0, 128.0, 16.0));
+                layer.layer(|a| {
+                    a.fill(Shape::circle(60.0, 60.0, 44.0), solid(colors[0]));
+                });
+                layer.layer(|b| {
+                    b.fill(
+                        Shape::rounded_rect(70.0, 40.0, 70.0, 60.0, 8.0),
+                        solid(colors[1]),
+                    );
+                });
+            });
+        });
+    }
+
+    // Backdrops: a group captured inside a projected card samples the
+    // card's local image; a group outside samples the surface, the
+    // projected card included.
+    corpus.scene_setup("projective-backdrop-inside", 256, 192, backdrop, |b| {
+        b.backdrop_group(1, vec![BackdropFilter::GaussianBlur { sigma: 3.0 }]);
+        let l = &mut b.root();
+        l.layer(|card| {
+            card.transform(Affine::translate((24.0, 24.0)));
+            card.projection(Projection {
+                matrix: Projection::perspective(360.0),
+                tilt: Vec2::new(0.0, 0.7),
+                pivot: Vec2::new(104.0, 72.0),
+                ..Projection::default()
+            });
+            card.clip(Shape::rect(0.0, 0.0, 208.0, 144.0));
+            backdrop_background(card);
+            card.layer(|m| {
+                m.clip(Shape::rounded_rect(32.0, 32.0, 144.0, 80.0, 16.0));
+                m.backdrop(1);
+                m.fill(
+                    Shape::rect(32.0, 32.0, 144.0, 80.0),
+                    solid(srgba(1.0, 1.0, 1.0, 0.3)),
+                );
+            });
+        });
+    });
+    corpus.scene_setup("projective-backdrop-outside-hdr", 256, 192, backdrop, |b| {
+        b.backdrop_group(1, vec![BackdropFilter::GaussianBlur { sigma: 4.0 }]);
+        let l = &mut b.root();
+        l.layer(|card| {
+            card.transform(Affine::translate((24.0, 24.0)));
+            card.projection(Projection {
+                matrix: Projection::perspective(360.0),
+                tilt: Vec2::new(0.6, 0.0),
+                pivot: Vec2::new(104.0, 72.0),
+                ..Projection::default()
+            });
+            card.clip(Shape::rect(0.0, 0.0, 208.0, 144.0));
+            stripes(
+                card,
+                hdr(3.0, 0.8, 0.2),
+                p3(0.0, 0.7, 0.9),
+                [hdr(0.4, 2.5, 0.6), p3(0.9, 0.0, 0.4), srgb(0.9, 0.9, 0.2)],
+            );
+        });
+        l.layer(|m| {
+            m.clip(Shape::rounded_rect(64.0, 96.0, 128.0, 72.0, 20.0));
+            m.backdrop(1);
+            m.fill(
+                Shape::rect(64.0, 96.0, 128.0, 72.0),
+                solid(srgba(1.0, 1.0, 1.0, 0.2)),
+            );
+        });
+    });
+
+    // Minification at high anisotropy: a one-texel checkerboard, one-pixel
+    // strokes and small text on a plane seen at a grazing angle.
+    let fine = fine_checker_png(64, [250, 250, 250, 255], [20, 20, 30, 255]);
+    let small = ctx.shape(
+        "NotoSans.ttf",
+        corpus::LATIN,
+        9.0,
+        FontWeight::NORMAL,
+        &solid(sdr.ink),
+    );
+    let mut blobs = font_blobs(ctx, &[&small]);
+    blobs.push(fine.clone());
+    corpus.scene_with_blobs(
+        "projective-minification",
+        256,
+        192,
+        backdrop,
+        |l| {
+            l.layer(|plane| {
+                plane.transform(Affine::translate((0.0, 40.0)));
+                plane.projection(Projection {
+                    matrix: Projection::perspective(260.0),
+                    tilt: Vec2::new(1.35, 0.25),
+                    pivot: Vec2::new(128.0, 64.0),
+                    ..Projection::default()
+                });
+                plane.clip(Shape::rect(0.0, 0.0, 256.0, 128.0));
+                plane.fill(
+                    Shape::rect(0.0, 0.0, 256.0, 128.0),
+                    solid(srgb(1.0, 1.0, 1.0)),
+                );
+                plane.image(
+                    ResourceHash::of(&fine),
+                    Rect::new(0.0, 0.0, 64.0, 64.0),
+                    Sampling::Nearest,
+                );
+                for i in 0..24 {
+                    let x = f64::from(i).mul_add(8.0, 68.5);
+                    plane.stroke(
+                        Shape::Line(Line::new((x, 0.0), (x, 128.0))),
+                        StrokeStyle {
+                            width: 1.0,
+                            ..StrokeStyle::default()
+                        },
+                        solid(srgb(0.1, 0.2, 0.6)),
+                    );
+                }
+                for run in &small {
+                    plane.glyphs(offset_run(run, 0.0, 70.0));
+                }
+            });
+        },
+        blobs,
+    );
 }
 
 fn main() -> ExitCode {
@@ -5288,6 +5845,10 @@ fn run() -> Result<(), SceneError> {
     // ---- Scenes committed before the generator covered them ----------
 
     authored::add(&mut corpus, &mut ctx)?;
+
+    // ---- Projective layers (#84) -------------------------------------------
+
+    projective_scenes(&mut corpus, &mut ctx);
 
     // ---- Write out ---------------------------------------------------------
 

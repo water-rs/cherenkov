@@ -43,6 +43,26 @@ impl Components {
             * Affine::translate(-self.pivot)
     }
 
+    /// The component values a projective pose composes, with the base.
+    pub(super) const fn pose(
+        &self,
+        projection: crate::Projective,
+        tilt: Vec2,
+        depth: f64,
+    ) -> crate::projective::Pose {
+        crate::projective::Pose {
+            base: self.base,
+            translation: self.translation,
+            pivot: self.pivot,
+            rotation: self.rotation,
+            skew: self.skew,
+            scale: self.scale,
+            projection,
+            tilt,
+            depth,
+        }
+    }
+
     pub(super) fn sample(&mut self, time: Instant) -> (bool, bool) {
         let steps = [
             sample(&mut self.translation_track, &mut self.translation, time),
@@ -55,7 +75,7 @@ impl Components {
     }
 }
 
-fn sample<T: Animatable>(
+pub(super) fn sample<T: Animatable>(
     track: &mut Option<Track<T>>,
     value: &mut T,
     time: Instant,

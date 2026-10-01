@@ -32,7 +32,7 @@ use kurbo::{Affine, BezPath, Circle, Ellipse, Line, Rect, RoundedRect, Vec2};
 
 use crate::convert::{self, Blobs, Op, ShapeKind, engine_blend, group_op, op, shape_kind, working};
 use crate::memory::{AdapterMemory, EngineBytes, Reading, wgpu_allocator, wgpu_vk_memory_budget};
-use crate::motion::{Clock, LayerMotion, motion_animation};
+use crate::motion::{Clock, LayerMotion, LayerProjection, motion_animation};
 use crate::timing::Timings;
 use crate::{
     BenchError, Counters, DeviceInfo, EncodeInput, Engine, EngineInfo, GpuSample, PresentKind,
@@ -463,6 +463,8 @@ struct PrepLayer {
     backdrop: Option<u32>,
     /// The member's per-member backdrop effect, if any.
     backdrop_effect: Option<BackdropEffectSpec>,
+    /// The layer's projective pose.
+    projection: Option<LayerProjection>,
     /// The layer's one-time motion.
     motion: Option<LayerMotion>,
 }
@@ -834,6 +836,7 @@ fn cherenkov_features() -> Vec<Feature> {
         Feature::BackdropBlur,
         Feature::BackdropColorMatrix,
         Feature::BackdropEffect,
+        Feature::Projective,
         // `sRGB` maps to `SrgbEncoded`; `linear-p3` and `linear-srgb` are
         // both linear interpolation, which is the working space already.
         Feature::InterpolationSpace(ColorSpace::Srgb),
@@ -866,6 +869,9 @@ fn unsupported_feature(u: &str) -> Feature {
         | "backdrop-effect-sdf-path"
         | "backdrop-shader" => Feature::Backdrop,
         "blend-space" => Feature::BlendSpace(BlendSpace::SrgbEncoded),
+        "projective-unclipped"
+        | "projective-backdrop-member"
+        | "projective-backdrop-cross-space" => Feature::Projective,
         _ => Feature::Fill,
     }
 }
@@ -1233,8 +1239,13 @@ fn prep_layer(
             Some(Motion::Paint { .. }) => None,
             motion => motion
                 .as_ref()
-                .map(|m| LayerMotion::from_scene(m, layer.transform)),
+                .map(|m| LayerMotion::from_scene(m, layer.transform, layer.projection.as_deref())),
         },
+        projection: layer
+            .projection
+            .as_deref()
+            .map(LayerProjection::from_scene)
+            .transpose()?,
     };
     if own {
         for (index, item) in layer.items.iter().enumerate() {
@@ -1413,6 +1424,9 @@ fn build_layer(
     {
         let edit = &mut tx[layer];
         edit.transform(prep.transform);
+        if let Some(projection) = &prep.projection {
+            projection.apply(edit);
+        }
         edit.scroll_offset(prep.scroll_offset);
         edit.opacity(prep.opacity as f32);
         edit.blend(prep.blend);

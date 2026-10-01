@@ -287,12 +287,15 @@ impl Run {
             for video in &self.videos {
                 let layer = video.layer.id().raw();
                 logcat::line(&format!(
-                    "scenario={} frame={} layer=LayerId({}) decision={} fences={}",
+                    "scenario={} frame={} layer=LayerId({}) decision={} fences={} fill={}ms import={}ms stalls={}",
                     self.scenario.name(),
                     video.producer.produced,
                     layer,
                     self.decisions.decision(layer),
                     video.producer.signalled,
+                    video.producer.fill_ms,
+                    video.producer.import_ms,
+                    video.producer.stalls,
                 ));
             }
         }

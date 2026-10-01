@@ -4,6 +4,7 @@
 
 use std::os::fd::AsRawFd;
 use std::os::fd::OwnedFd;
+use std::time::Instant;
 
 use ash::vk::{self, Handle as _};
 use cherenkov_gpu::interop::RgbAlpha;
@@ -33,6 +34,12 @@ pub struct Pool {
     semaphore: Option<vk::Semaphore>,
     ash: ash::Device,
     stalled: bool,
+    /// Milliseconds the last `ahb::fill` (lock, write, unlock) took.
+    pub fill_ms: u64,
+    /// Milliseconds the last `FrameSource::Ahb` import took.
+    pub import_ms: u64,
+    /// `produce` calls that found every buffer in flight.
+    pub stalls: u64,
 }
 
 struct Slot {
@@ -97,6 +104,9 @@ impl Pool {
             semaphore,
             ash,
             stalled: false,
+            fill_ms: 0,
+            import_ms: 0,
+            stalls: 0,
         })
     }
 
@@ -105,6 +115,7 @@ impl Pool {
     pub fn produce(&mut self) -> Option<Frame> {
         self.drain();
         let Some(slot) = self.slots.iter_mut().find(|slot| slot.flight.is_none()) else {
+            self.stalls += 1;
             if !self.stalled {
                 self.stalled = true;
                 logcat::warn("producer stalled: every AHB is still in flight");
@@ -112,11 +123,14 @@ impl Pool {
             return None;
         };
         self.stalled = false;
+        let t = Instant::now();
         unsafe { ahb::fill(self.spec.format, slot.ahb, self.produced) };
+        self.fill_ms = u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX);
         let sync = self.semaphore.map(|semaphore| Wait::Timeline {
             semaphore: semaphore.as_raw(),
             value: 1,
         });
+        let t = Instant::now();
         let frame = self.device.import(FrameSource::Ahb(Box::new(Ahb {
             buffer: slot.ahb.cast(),
             sync,
@@ -125,6 +139,7 @@ impl Pool {
             alpha: RgbAlpha::Opaque,
             hdr: self.spec.hdr,
         })));
+        self.import_ms = u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX);
         match frame {
             Ok(frame) => {
                 self.produced += 1;

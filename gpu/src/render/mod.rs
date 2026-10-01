@@ -3199,10 +3199,16 @@ impl GpuRenderer {
         id: SurfaceId,
         target: crate::interop::android::SurfaceControlTarget,
     ) -> Result<cherenkov::RefreshRange, SurfaceError> {
+        // The context is built on first need (#170); a surface-control
+        // target needs it now — planes import frame buffers natively.
+        self.ensure_native();
         let native = self.native.as_ref().ok_or_else(|| {
-            SurfaceError::UnsupportedTarget(
-                "surface control: the device has no Vulkan external-memory support".into(),
-            )
+            SurfaceError::UnsupportedTarget(format!(
+                "surface control: {}",
+                self.native_error
+                    .as_deref()
+                    .unwrap_or("the device has no Vulkan external-memory support")
+            ))
         })?;
         let system = surface_control::planes::Planes::new(
             native.shared.clone(),
@@ -3999,19 +4005,31 @@ impl GpuRenderer {
             tracing::warn!(%error, "external-frame preparation failed at registration");
         }
         #[cfg(all(unix, not(target_vendor = "apple")))]
-        if needs_native && self.native.is_none() && self.native_error.is_none() {
-            let shared = crate::interop::SharedDevice {
-                instance: self.instance.clone(),
-                adapter: self.adapter.clone(),
-                device: self.device.clone(),
-                queue: self.queue.clone(),
-            };
-            match external::vulkan::shared_for(&shared).and_then(external::vulkan::Native::new) {
-                Ok(native) => self.native = Some(native),
-                Err(error) => {
-                    tracing::warn!(%error, "vulkan external-frame context unavailable");
-                    self.native_error = Some(error.to_string());
-                }
+        if needs_native {
+            self.ensure_native();
+        }
+    }
+
+    /// Builds the Vulkan native external-frame context on first need — a
+    /// `FramePlanes::Native` registration or a surface-control target
+    /// (#170). A failure is recorded once; [`Self::native_missing`]
+    /// reports it from then on.
+    #[cfg(all(unix, not(target_vendor = "apple")))]
+    fn ensure_native(&mut self) {
+        if self.native.is_some() || self.native_error.is_some() {
+            return;
+        }
+        let shared = crate::interop::SharedDevice {
+            instance: self.instance.clone(),
+            adapter: self.adapter.clone(),
+            device: self.device.clone(),
+            queue: self.queue.clone(),
+        };
+        match external::vulkan::shared_for(&shared).and_then(external::vulkan::Native::new) {
+            Ok(native) => self.native = Some(native),
+            Err(error) => {
+                tracing::warn!(%error, "vulkan external-frame context unavailable");
+                self.native_error = Some(error.to_string());
             }
         }
     }

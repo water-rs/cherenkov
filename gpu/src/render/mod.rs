@@ -1825,28 +1825,29 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
             pipelines(scratch_format, true).await?,
         ],
     ];
-    let (opaque, partial) = futures_util::future::try_join(
-        create_pipeline(
-            &device,
-            &config,
-            &layout0,
-            &layout1,
-            &modules[0],
-            TARGET_FORMAT,
-            CoveragePass::Opaque,
-        ),
-        create_pipeline(
-            &device,
-            &config,
-            &layout0,
-            &layout1,
-            &modules[0],
-            TARGET_FORMAT,
-            CoveragePass::Partial,
-        ),
-    )
-    .await?;
-    let coverage_pipelines = [opaque, partial];
+    let coverage_pipelines = <[_; 2]>::from(
+        futures_util::future::try_join(
+            create_pipeline(
+                &device,
+                &config,
+                &layout0,
+                &layout1,
+                &modules[0],
+                TARGET_FORMAT,
+                CoveragePass::Opaque,
+            ),
+            create_pipeline(
+                &device,
+                &config,
+                &layout0,
+                &layout1,
+                &modules[0],
+                TARGET_FORMAT,
+                CoveragePass::Partial,
+            ),
+        )
+        .await?,
+    );
     let globals = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("globals"),
         // One 256-byte stride slot: a single pass's Globals entry.

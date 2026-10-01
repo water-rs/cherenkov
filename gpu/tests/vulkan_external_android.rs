@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use ash::vk;
 use ash::vk::Handle as _;
 use cherenkov::kurbo::{BezPath, Rect};
-use cherenkov::{Draw, Engine, FrameTime, Next, WorkingColor};
+use cherenkov::{Draw, Engine, FrameTime, Layer, Next, Surface, WorkingColor};
 use cherenkov_gpu::{
     Gpu, GpuConfig,
     interop::{
@@ -411,6 +411,32 @@ impl ProducerFence {
             fence,
         });
     }
+
+    /// Whether the producer's submitted work is still executing — a
+    /// non-blocking `vkGetFenceStatus` probe; `fire` must have run first.
+    fn pending(&self) -> bool {
+        let fence = {
+            let work = self.work.lock().expect("producer work");
+            work.as_ref().expect("producer submitted").fence
+        };
+        matches!(unsafe { self.dev.get_fence_status(fence) }, Ok(false))
+    }
+
+    /// Blocks until the producer's work retires and returns the wait's
+    /// duration — the remaining fill time after `render` returned.
+    fn wait_fill(&self) -> Duration {
+        let fence = {
+            let work = self.work.lock().expect("producer work");
+            work.as_ref().expect("producer submitted").fence
+        };
+        let start = Instant::now();
+        unsafe {
+            self.dev
+                .wait_for_fences(&[fence], true, 30_000_000_000)
+                .expect("producer fill wait");
+        }
+        start.elapsed()
+    }
 }
 
 impl Drop for ProducerFence {
@@ -589,33 +615,34 @@ fn ahb_yuv_external_format_decodes_neutral() {
     );
 }
 
-#[test]
-fn producer_fence_and_delayed_signal_stay_on_gpu() {
-    let (shared, device) = setup();
-    let (dev, queue, family) = raw(&shared);
-    let _ = dev;
-    let fence = ProducerFence::new(&device);
-    // The fence completes only when 512 32-MiB fills retire on the GPU —
-    // submitted before the import so the SYNC_FD export finds a pending
-    // kernel-side signal, but still unsigned when the engine consumes it.
-    fence.fire(queue, family, 512);
-    let buffer = make_ahb_rgb(16, 16, [0x20, 0x90, 0x30, 0xff]);
+/// Imports `buffer` as an external frame with `sync`/`release` and
+/// attaches it to `layer`; the AHB acquire reference stays the caller's.
+fn ahb_on(
+    engine: &Engine<Gpu>,
+    device: &vulkan::Device,
+    surface: &Surface<Gpu>,
+    layer: &Layer,
+    buffer: *mut ndk_sys::AHardwareBuffer,
+    sync: Option<vulkan::Wait>,
+    release: Option<vulkan::ReleaseSync>,
+) {
     let frame = device
         .import(FrameSource::Ahb(Box::new(vulkan::Ahb {
             buffer: buffer.cast(),
-            // The real producer fence: a sync_file fd signalling on the
-            // GPU once the producer's submit completes. The import takes
-            // ownership of the fd it is given — `fence.fd()` returns a
-            // duplicate so the fence keeps its own reference.
-            sync: Some(vulkan::Wait::SyncFd { fd: fence.fd() }),
-            release: Some(vulkan::ReleaseSync::Timeline {
-                semaphore: fence.timeline.as_raw(),
-                value: 2,
-            }),
+            sync,
+            release,
             color: FrameColor::SRGB,
             alpha: RgbAlpha::Opaque,
         })))
-        .expect("fenced AHB import");
+        .expect("AHB import");
+    let handle = engine.external_frame(ExternalFrame::native(frame).expect("external"));
+    surface.update(|tx| {
+        tx[layer].content(handle);
+    });
+}
+
+/// An engine with a surface and one layer pushed at its root.
+fn scene(shared: SharedDevice) -> (Engine<Gpu>, Surface<Gpu>, Layer) {
     let engine = Engine::<Gpu>::new(GpuConfig {
         device: Some(shared),
         ..GpuConfig::default()
@@ -624,20 +651,107 @@ fn producer_fence_and_delayed_signal_stay_on_gpu() {
     let (target, _) = TextureTarget::new((16, 16));
     let surface = engine.surface(target).expect("surface");
     let layer = surface.layer();
-    let handle = engine.external_frame(ExternalFrame::native(frame).expect("external"));
     surface.update(|tx| {
         tx[surface.root()].push(&layer);
-        tx[&layer].content(handle);
     });
-    // The fence is still unsigned: the consuming submission must return
-    // immediately — a CPU wait would block for the whole delay.
+    (engine, surface, layer)
+}
+
+/// Renders once and returns the duration.
+fn timed_render(engine: &Engine<Gpu>) -> Duration {
     let start = Instant::now();
     assert!(matches!(engine.render(FrameTime::now()), Ok(Next::Idle)));
-    assert!(
-        start.elapsed() < Duration::from_millis(100),
-        "submission CPU-waited on the producer fence: {:?}",
-        start.elapsed()
+    start.elapsed()
+}
+
+/// The engine waits on a still-running producer's `sync_file` without
+/// blocking the host. `FILLS` 32-MiB fills keep the producer busy well
+/// past the render budget; the measured fill time is printed for the
+/// device run.
+#[test]
+fn producer_fence_and_delayed_signal_stay_on_gpu() {
+    const FILLS: u32 = 1024;
+    let (shared, device) = setup();
+    let (_dev, queue, family) = raw(&shared);
+    let buffer = make_ahb_rgb(16, 16, [0x20, 0x90, 0x30, 0xff]);
+
+    // Diagnostic, no assertion: is a cold first render the ~450 ms the
+    // last device run reported, or a real fence wait? Two fresh engines,
+    // the same AHB — one unfenced, one fenced-and-pending — each timed on
+    // its first render. A fenced cold render near the unfenced one means
+    // cold-start cost; longer by about the fill duration means a real
+    // host-side wait in the engine.
+    let (engine_u, surface_u, layer_u) = scene(shared.clone());
+    ahb_on(&engine_u, &device, &surface_u, &layer_u, buffer, None, None);
+    let cold_unfenced = timed_render(&engine_u);
+
+    let fence_cold = ProducerFence::new(&device);
+    fence_cold.fire(queue, family, FILLS);
+    let (engine, surface, layer) = scene(shared);
+    ahb_on(
+        &engine,
+        &device,
+        &surface,
+        &layer,
+        buffer,
+        Some(vulkan::Wait::SyncFd {
+            fd: fence_cold.fd(),
+        }),
+        Some(vulkan::ReleaseSync::Timeline {
+            semaphore: fence_cold.timeline.as_raw(),
+            value: 2,
+        }),
     );
+    let cold_fenced = timed_render(&engine);
+    eprintln!(
+        "cold first render: unfenced {cold_unfenced:?}, fenced {cold_fenced:?} \
+         (producer pending: {})",
+        fence_cold.pending()
+    );
+
+    // The assertion: warm this engine with an unfenced frame through the
+    // same surface and layer so every pipeline the fenced render needs
+    // exists, then attach a second pending fence and time only that
+    // render.
+    ahb_on(&engine, &device, &surface, &layer, buffer, None, None);
+    timed_render(&engine);
+
+    let fence_warm = ProducerFence::new(&device);
+    fence_warm.fire(queue, family, FILLS);
+    ahb_on(
+        &engine,
+        &device,
+        &surface,
+        &layer,
+        buffer,
+        Some(vulkan::Wait::SyncFd {
+            fd: fence_warm.fd(),
+        }),
+        Some(vulkan::ReleaseSync::Timeline {
+            semaphore: fence_warm.timeline.as_raw(),
+            value: 2,
+        }),
+    );
+    let elapsed = timed_render(&engine);
+    // The fence must still be pending when `render` returns — otherwise a
+    // fast render proves nothing about where the wait ran.
+    assert!(
+        fence_warm.pending(),
+        "producer fills retired before the warmed render returned"
+    );
+    assert!(
+        elapsed < Duration::from_millis(100),
+        "submission CPU-waited on the producer fence: {elapsed:?}"
+    );
+    let remaining = fence_warm.wait_fill();
+    eprintln!(
+        "warmed fenced render: {elapsed:?}; producer fill needed \
+         {remaining:?} more after render returned"
+    );
+    // The fences' timelines serve as release payloads, so the fences
+    // must outlive the engines that signal them.
+    drop(engine);
+    drop(engine_u);
 }
 
 #[test]

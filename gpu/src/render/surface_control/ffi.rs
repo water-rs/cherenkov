@@ -295,7 +295,13 @@ impl Transaction {
                     },
                 ),
                 Op::Dataspace(dataspace) => {
-                    ASurfaceTransaction_setBufferDataSpace(t, sc, data_space(dataspace));
+                    let space = data_space(dataspace);
+                    tracing::info!(
+                        target: "cherenkov::planes",
+                        dataspace = %format_args!("0x{:08x}", space.0),
+                        "plane dataspace"
+                    );
+                    ASurfaceTransaction_setBufferDataSpace(t, sc, space);
                 }
                 Op::Hdr(hdr) => set_hdr(t, sc, hdr),
             }

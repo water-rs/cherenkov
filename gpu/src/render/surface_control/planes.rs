@@ -128,6 +128,12 @@ fn contract(frame: &vulkan::Frame) -> Result<Contract, Ineligible> {
     })
 }
 
+/// The reason `frame`'s buffer cannot be shown on a plane, if any —
+/// `contract`'s diagnostic half for reporting.
+pub fn ineligible(frame: &vulkan::Frame) -> Option<Ineligible> {
+    contract(frame).err()
+}
+
 /// The stack `composition` describes, bottom first, with each promoted
 /// frame's plane properties.
 ///

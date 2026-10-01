@@ -3661,6 +3661,21 @@ impl GpuRenderer {
         state.interop += 1;
         state.frames_installed += 1;
         let on_plane = state.promotes && <planes::Platform as planes::Compositor>::shows(&frame);
+        #[cfg(target_os = "android")]
+        if state.promotes {
+            let reason = if on_plane {
+                None
+            } else {
+                Some(match &frame.planes {
+                    crate::interop::FramePlanes::Native(native) => {
+                        surface_control::planes::ineligible(native)
+                            .unwrap_or(surface_control::planes::Ineligible::NotABuffer)
+                    }
+                    _ => surface_control::planes::Ineligible::NotABuffer,
+                })
+            };
+            tracing::debug!(target: "cherenkov::planes", layer = ?layer, reason = ?reason, "external frame eligibility");
+        }
         state.external.insert(
             layer,
             external::Slot::new(
@@ -4239,6 +4254,14 @@ impl GpuRenderer {
         } else {
             planes::Plan::default()
         };
+        if surf.promotes {
+            for plane in &surf.plan.planes {
+                tracing::debug!(target: "cherenkov::planes", layer = ?plane.layer, decision = "promoted", "plane decision");
+            }
+            for (layer, why) in &surf.plan.rejected {
+                tracing::debug!(target: "cherenkov::planes", layer = ?layer, decision = ?why, "plane decision");
+            }
+        }
         let promoted = surf.plan.planes.iter().map(|p| p.layer).collect();
         // Lowering borrows `layers` immutably while mutating `frame`;
         // taking the map out keeps the two borrows disjoint.

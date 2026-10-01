@@ -5,6 +5,9 @@
 //! `scenes/corpus/<name>/` as a `scene.json` plus a `resources/` directory of
 //! BLAKE3-addressed blobs (fonts, images).
 
+#[path = "generate_corpus/authored.rs"]
+mod authored;
+
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::ExitCode;
@@ -28,6 +31,19 @@ use parley::{
 };
 use read_fonts::types::F2Dot14;
 use skrifa::MetadataProvider;
+
+/// `kurbo::Affine::rotate` evaluated with `libm` so the sine/cosine
+/// coefficients cannot drift one ulp between host libms.
+fn rotate(th: f64) -> Affine {
+    let (s, c) = libm::sincos(th);
+    Affine::new([c, s, -s, c, 0.0, 0.0])
+}
+
+/// `kurbo::Affine::rotate_about` over [`rotate`].
+fn rotate_about(th: f64, center: impl Into<Point>) -> Affine {
+    let center = center.into().to_vec2();
+    Affine::translate(center) * rotate(th) * Affine::translate(-center)
+}
 
 /// Padding around text scenes so ascenders/descenders stay inside.
 const TEXT_PAD: f32 = 12.0;
@@ -497,7 +513,7 @@ fn p3_png(width: u32, height: u32) -> Vec<u8> {
                 let enc = if c <= 0.003_130_8 {
                     c * 12.92
                 } else {
-                    1.055 * c.powf(1.0 / 2.4) - 0.055
+                    1.055 * libm::powf(c, 1.0 / 2.4) - 0.055
                 };
                 #[expect(
                     clippy::cast_possible_truncation,
@@ -718,7 +734,7 @@ fn star_path(cx: f64, cy: f64, r0: f64, r1: f64) -> BezPath {
     for i in 0..10 {
         let angle = f64::from(i) * std::f64::consts::TAU / 10.0 - std::f64::consts::FRAC_PI_2;
         let r = if i % 2 == 0 { r1 } else { r0 };
-        let pt = (cx + r * angle.cos(), cy + r * angle.sin());
+        let pt = (cx + r * libm::cos(angle), cy + r * libm::sin(angle));
         if i == 0 {
             p.move_to(pt);
         } else {
@@ -841,7 +857,13 @@ fn write_corpus(out: &Path, corpus: &Corpus) -> Result<(), SceneError> {
     std::fs::create_dir_all(out)?;
     for entry in &corpus.entries {
         let dir = out.join(&entry.name);
-        entry.scene.save(&dir)?;
+        match &entry.body {
+            EntryBody::Scene(scene) => scene.save(&dir)?,
+            EntryBody::Json(text) => {
+                std::fs::create_dir_all(&dir)?;
+                std::fs::write(dir.join("scene.json"), text)?;
+            }
+        }
         for blob in &entry.blobs {
             Scene::store_resource(&dir, blob)?;
         }
@@ -852,8 +874,16 @@ fn write_corpus(out: &Path, corpus: &Corpus) -> Result<(), SceneError> {
 /// One emitted scene plus the blobs its `resources/` needs.
 struct Entry {
     name: String,
-    scene: Scene,
+    body: EntryBody,
     blobs: Vec<Vec<u8>>,
+}
+
+/// How an entry's `scene.json` is produced: the typed builder, or text
+/// laid out byte-for-byte the way the hand-committed scenes were written
+/// (see `authored`).
+enum EntryBody {
+    Scene(Box<Scene>),
+    Json(String),
 }
 
 struct Corpus {
@@ -894,8 +924,18 @@ impl Corpus {
         let scene = builder.build();
         self.entries.push(Entry {
             name: name.into(),
-            scene,
+            body: EntryBody::Scene(Box::new(scene)),
             blobs: Vec::new(),
+        });
+    }
+
+    /// Queue a scene whose `scene.json` is already rendered text (the
+    /// hand-authored scenes in `authored`).
+    fn push_json(&mut self, name: &str, text: String, blobs: Vec<Vec<u8>>) {
+        self.entries.push(Entry {
+            name: name.to_string(),
+            body: EntryBody::Json(text),
+            blobs,
         });
     }
 
@@ -942,7 +982,7 @@ impl Corpus {
         let scene = builder.build();
         self.entries.push(Entry {
             name: name.into(),
-            scene,
+            body: EntryBody::Scene(Box::new(scene)),
             blobs,
         });
     }
@@ -1019,7 +1059,7 @@ fn map_body(l: &mut LayerBuilder, pw: f64, ph: f64) {
                 for vi in 0..sides {
                     #[expect(clippy::cast_precision_loss, reason = "vertex index is below 8")]
                     let angle = (vi as f64) * std::f64::consts::TAU / (sides as f64);
-                    let pt = (x + radius * angle.cos(), y + radius * angle.sin());
+                    let pt = (x + radius * libm::cos(angle), y + radius * libm::sin(angle));
                     if vi == 0 {
                         path.move_to(pt);
                     } else {
@@ -1527,7 +1567,7 @@ fn run() -> Result<(), SceneError> {
             l.layer(|a| {
                 a.transform(
                     Affine::translate((64.0, 64.0))
-                        * Affine::rotate(std::f64::consts::FRAC_PI_6)
+                        * rotate(std::f64::consts::FRAC_PI_6)
                         * Affine::translate((-64.0, -64.0)),
                 );
                 a.fill(Shape::rect(48.25, 48.5, 80.25, 80.5), solid(c4));
@@ -1563,7 +1603,7 @@ fn run() -> Result<(), SceneError> {
         l.layer(|a| {
             a.transform(
                 Affine::translate((64.3, 63.8))
-                    * Affine::rotate(0.3)
+                    * rotate(0.3)
                     * Affine::scale(0.85)
                     * Affine::translate((-64.0, -64.0)),
             );
@@ -1966,7 +2006,7 @@ fn run() -> Result<(), SceneError> {
 
     corpus.scene("clip-transform", 128, 128, white, |l| {
         l.layer(|a| {
-            a.transform(Affine::rotate(0.4) * Affine::translate((-20.0, -10.0)));
+            a.transform(rotate(0.4) * Affine::translate((-20.0, -10.0)));
             a.clip(Shape::rounded_rect(16.0, 16.0, 96.0, 96.0, 12.0));
             a.fill(
                 Shape::rect(0.0, 0.0, 160.0, 160.0),
@@ -2013,7 +2053,7 @@ fn run() -> Result<(), SceneError> {
         let c = Point::new(160.0, 160.0);
         for i in 0..5 {
             let angle = f64::from(i).mul_add(144.0, -90.0).to_radians();
-            let p = c + Vec2::new(angle.cos() * 240.0, angle.sin() * 240.0);
+            let p = c + Vec2::new(libm::cos(angle) * 240.0, libm::sin(angle) * 240.0);
             if i == 0 {
                 star.move_to(p);
             } else {
@@ -2083,7 +2123,7 @@ fn run() -> Result<(), SceneError> {
         l.layer(|a| {
             a.transform(
                 Affine::translate((160.0, 160.0))
-                    * Affine::rotate(0.3)
+                    * rotate(0.3)
                     * Affine::scale(1.4)
                     * Affine::translate((-160.0, -160.0)),
             );
@@ -2182,7 +2222,7 @@ fn run() -> Result<(), SceneError> {
 
     corpus.scene("transform-rotate", 128, 128, white, |l| {
         l.layer(|a| {
-            a.transform(Affine::rotate_about(0.6, Point::new(64.0, 64.0)));
+            a.transform(rotate_about(0.6, Point::new(64.0, 64.0)));
             a.fill(
                 Shape::rounded_rect(24.0, 40.0, 80.0, 48.0, 10.0),
                 solid(srgb(0.5, 0.2, 0.6)),
@@ -3019,7 +3059,7 @@ fn run() -> Result<(), SceneError> {
                 solid(Color::new(ColorSpace::LinearP3, [0.2, 0.4, 1.0, 0.75])),
             );
             l.layer(|m| {
-                m.transform(Affine::rotate_about(0.4, Point::new(76.0, 72.0)));
+                m.transform(rotate_about(0.4, Point::new(76.0, 72.0)));
                 m.fill(
                     Shape::rect(60.0, 56.0, 92.0, 88.0),
                     solid(Color::new(ColorSpace::LinearP3, [2.0, 1.4, 0.4, 0.6])),
@@ -3523,7 +3563,7 @@ fn run() -> Result<(), SceneError> {
                 l.layer(|a| {
                     a.transform(
                         Affine::translate((70.0, 95.0))
-                            * Affine::rotate(-0.35)
+                            * rotate(-0.35)
                             * Affine::skew(0.3, 0.0)
                             * Affine::scale_non_uniform(1.2, 0.8),
                     );
@@ -3664,7 +3704,7 @@ fn run() -> Result<(), SceneError> {
                 l.layer(|rotated| {
                     rotated.transform(
                         Affine::translate((40.0, 30.0))
-                            * Affine::rotate(15_f64.to_radians())
+                            * rotate(15_f64.to_radians())
                             * Affine::scale_non_uniform(1.2, 0.8),
                     );
                     for run in &first {
@@ -3684,20 +3724,20 @@ fn run() -> Result<(), SceneError> {
 
     {
         let sbix_transforms = [
-            Affine::rotate(20_f64.to_radians()),
+            rotate(20_f64.to_radians()),
             Affine::skew(0.35, 0.0),
             Affine::skew(0.0, -0.25),
             Affine::scale_non_uniform(1.4, 0.8),
-            Affine::rotate((-15_f64).to_radians())
+            rotate((-15_f64).to_radians())
                 * Affine::skew(0.2, -0.12)
                 * Affine::scale_non_uniform(0.8, 1.25),
         ];
         let cbdt_transforms = [
-            Affine::rotate((-20_f64).to_radians()),
+            rotate((-20_f64).to_radians()),
             Affine::skew(-0.25, 0.15),
             Affine::scale_non_uniform(0.7, 1.3),
-            Affine::rotate(45_f64.to_radians()),
-            Affine::rotate(12_f64.to_radians())
+            rotate(45_f64.to_radians()),
+            rotate(12_f64.to_radians())
                 * Affine::skew(0.18, 0.08)
                 * Affine::scale_non_uniform(1.15, 0.9),
         ];
@@ -4387,8 +4427,8 @@ fn run() -> Result<(), SceneError> {
                     let x = 80.0 + f64::from(i) * (920.0 / 1999.0);
                     let t = f64::from(i) * 0.01;
                     let y = 750.0
-                        - 320.0 * (0.5 + 0.3 * t.sin() + 0.2 * (3.1 * t).cos())
-                        - 40.0 * (t * 17.3).sin();
+                        - 320.0 * (0.5 + 0.3 * libm::sin(t) + 0.2 * libm::cos(3.1 * t))
+                        - 40.0 * libm::sin(t * 17.3);
                     if i == 0 {
                         line.move_to((x, y));
                     } else {
@@ -4409,7 +4449,7 @@ fn run() -> Result<(), SceneError> {
                 // Bar chart: 44 bars.
                 let bw = (920.0 - 40.0 * 8.0) / 44.0;
                 for i in 0u8..44 {
-                    let h = 120.0 + 380.0 * (f64::from(i) * 0.37).sin().mul_add(0.5, 0.5);
+                    let h = 120.0 + 380.0 * libm::sin(f64::from(i) * 0.37).mul_add(0.5, 0.5);
                     let x = 90.0 + f64::from(i) * (bw + 8.0);
                     l.fill(
                         Shape::Rect(Rect::new(x, 2050.0 - h, x + bw, 2050.0)),
@@ -4795,7 +4835,7 @@ fn run() -> Result<(), SceneError> {
         l.layer(|m| {
             m.transform(
                 Affine::translate(Vec2::new(128.0, 128.0))
-                    * Affine::rotate(17.0f64.to_radians())
+                    * rotate(17.0f64.to_radians())
                     * Affine::scale(1.2),
             );
             m.clip(Shape::rect(-44.0, -44.0, 88.0, 88.0));
@@ -5244,6 +5284,10 @@ fn run() -> Result<(), SceneError> {
             blobs,
         );
     }
+
+    // ---- Scenes committed before the generator covered them ----------
+
+    authored::add(&mut corpus, &mut ctx)?;
 
     // ---- Write out ---------------------------------------------------------
 

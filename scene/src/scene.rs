@@ -290,7 +290,7 @@ impl Scene {
     /// # Errors
     /// Returns [`SceneError`] on I/O or JSON failures.
     pub fn save(&self, dir: &Path) -> Result<(), SceneError> {
-        std::fs::create_dir_all(dir.join(RESOURCES_DIR))?;
+        std::fs::create_dir_all(dir)?;
         let mut text = serde_json::to_string_pretty(self)?;
         text.push('\n');
         std::fs::write(dir.join(SCENE_FILE), text)?;

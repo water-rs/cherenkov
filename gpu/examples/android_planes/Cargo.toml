@@ -36,6 +36,8 @@ nami-core = { git = "https://github.com/water-rs/nami", rev = "6908aac816de14ee5
 [dependencies]
 cherenkov = { path = "../../.." }
 cherenkov-gpu = { path = "../.." }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std", "fmt"] }
 
 [dev-dependencies]
 wgpu = "30.0.1"
@@ -48,5 +50,3 @@ libc = "0.2"
 ndk = { version = "0.9", default-features = false, features = ["api-level-30", "sync"] }
 ndk-sys = "0.6"
 skrifa = "0.44"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std", "fmt"] }

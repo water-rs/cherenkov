@@ -8,10 +8,8 @@ pub mod scenario;
 mod ahb;
 #[cfg(target_os = "android")]
 mod app;
-#[cfg(target_os = "android")]
 mod logcat;
-#[cfg(target_os = "android")]
-mod observe;
+pub mod observe;
 #[cfg(target_os = "android")]
 mod producer;
 #[cfg(target_os = "android")]

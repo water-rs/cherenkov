@@ -12,7 +12,7 @@ use std::fmt::{Debug, Write as _};
 use std::sync::{Arc, Mutex};
 
 use tracing::field::{Field, Visit};
-use tracing::{Event, Level, Metadata, Subscriber};
+use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::{Context, SubscriberExt};
 use tracing_subscriber::util::SubscriberInitExt;
@@ -36,6 +36,9 @@ struct Inner {
 
 impl Decisions {
     /// The current decision string for `layer`'s heartbeat.
+    ///
+    /// # Panics
+    /// If the `Decisions` mutex is poisoned.
     #[must_use]
     pub fn decision(&self, layer: u64) -> String {
         let inner = self.inner.lock().expect("decisions lock");
@@ -154,14 +157,19 @@ fn unquote(debug: &str) -> String {
 /// A `Layer::on_event` writes directly rather than going through a
 /// `fmt::Layer` and its `MakeWriter`: that path produced no output on
 /// device while this `on_event` channel (which `Capture` also uses) does.
+/// The selection lives in `on_event`, not `enabled` — a plain layer's
+/// `enabled` gates the callsite for the *whole* registry, so returning
+/// `false` for a DEBUG callsite dropped the `plane decision` events
+/// before `Capture` could see them (only a `Filtered` wrapper defers
+/// the check per layer via `Interest::sometimes`).
 struct Forward;
 
 impl<S: Subscriber> Layer<S> for Forward {
-    fn enabled(&self, meta: &Metadata<'_>, _ctx: Context<'_, S>) -> bool {
-        meta.target().starts_with("cherenkov") && *meta.level() <= Level::INFO
-    }
-
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+        let meta = event.metadata();
+        if !meta.target().starts_with("cherenkov") || *meta.level() > Level::INFO {
+            return;
+        }
         let mut fields = Fields::default();
         event.record(&mut fields);
         let mut text = String::new();

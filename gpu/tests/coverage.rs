@@ -5,6 +5,36 @@ use cherenkov::{__engine_fn as split_fn, __engine_test as split_test, __engine_w
 use cherenkov::{Draw, Engine, EngineError, Offscreen, OffscreenFormat, WorkingColor};
 use cherenkov_gpu::{Gpu, GpuConfig};
 
+split_test! {
+/// Opaque interiors occlude earlier translucent paint, while later paint
+/// still composites in order. Extended P3 values must survive both phases.
+fn opaque_interiors_preserve_translucent_painter_order() -> Result<(), Box<dyn std::error::Error>> {
+    let engine = wait!(Engine::<Gpu>::new(GpuConfig::default()))?;
+    let surface = wait!(engine.surface(Offscreen::new((32, 32), OffscreenFormat::LinearF16)))?;
+    surface.update(|tx| {
+        tx[surface.root()].content(surface.record(|c| {
+            c.fill(Rect::new(0.0, 0.0, 32.0, 32.0), WorkingColor::new([1.5, 0.25, 0.0, 1.0]));
+            c.fill(Rect::new(0.0, 0.0, 32.0, 32.0), WorkingColor::new([0.0, 0.5, 0.0, 0.5]));
+            c.fill(cherenkov::kurbo::Circle::new((16.0, 16.0), 8.0), WorkingColor::new([0.0, 0.0, 2.0, 1.0]));
+            c.fill(Rect::new(16.0, 0.0, 32.0, 32.0), WorkingColor::new([1.0, 1.0, 0.0, 0.25]));
+        }));
+    });
+    wait!(engine.render(cherenkov::FrameTime::now()))?;
+    let pixels = wait!(surface.readback())?.pixels;
+    for (x, y, expected) in [
+        (4, 4, [0.75, 0.375, 0.0, 1.0]),
+        (12, 16, [0.0, 0.0, 2.0, 1.0]),
+        (20, 16, [0.25, 0.25, 1.5, 1.0]),
+        (28, 4, [0.8125, 0.53125, 0.0, 1.0]),
+    ] {
+        for (actual, expected) in pixels[y * 32 + x].iter().zip(expected) {
+            assert!((actual - expected).abs() < 0.001, "pixel {x},{y}: {actual} != {expected}");
+        }
+    }
+    Ok(())
+}
+}
+
 split_fn! {
 /// An engine, or `None` when no adapter exists.
 fn engine() -> Option<Engine<Gpu>> {

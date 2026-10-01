@@ -235,7 +235,8 @@ pub fn emit(coverage: &Coverage) -> Result<(PathEmit, Vec<CellTexels>), RenderEr
                      x: usize,
                      y: usize,
                      w: usize,
-                     h: usize|
+                     h: usize,
+                     interior: std::ops::Range<usize>|
      -> Result<(), RenderError> {
         let (Ok(w32), Ok(h32)) = (u32::try_from(w), u32::try_from(h)) else {
             return Err(RenderError::AtlasFull);
@@ -256,11 +257,22 @@ pub fn emit(coverage: &Coverage) -> Result<(PathEmit, Vec<CellTexels>), RenderEr
             y: 0,
             // Filled by `Atlas::place_path` on the render thread.
             slot: 0,
+            interior: u32::from(u16::try_from(interior.start).map_err(|_| RenderError::AtlasFull)?)
+                | (u32::from(u16::try_from(interior.end).map_err(|_| RenderError::AtlasFull)?)
+                    << 16),
         });
         Ok(())
     };
     if coverage.w as f64 <= SMALL_BBOX && coverage.h as f64 <= SMALL_BBOX {
-        make_cell(&mut out.cells, &mut rasters, 0, 0, coverage.w, coverage.h)?;
+        make_cell(
+            &mut out.cells,
+            &mut rasters,
+            0,
+            0,
+            coverage.w,
+            coverage.h,
+            0..0,
+        )?;
         return Ok((out, rasters));
     }
     for sy in (0..coverage.h).step_by(STRIP_H) {
@@ -285,10 +297,31 @@ pub fn emit(coverage: &Coverage) -> Result<(PathEmit, Vec<CellTexels>), RenderEr
                     (coverage.y + (sy + sh) as f64) as f32,
                 ]);
             } else {
-                while x < coverage.w && class[x] != 0 {
+                while x < coverage.w && class[x] == 2 {
                     x += 1;
                 }
-                make_cell(&mut out.cells, &mut rasters, start, sy, x - start, sh)?;
+                let full_start = x;
+                while x < coverage.w && class[x] == 1 {
+                    x += 1;
+                }
+                let full_end = x;
+                while x < coverage.w && class[x] == 2 {
+                    x += 1;
+                }
+                let interior = if full_start == full_end {
+                    0..0
+                } else {
+                    full_start - start..full_end - start
+                };
+                make_cell(
+                    &mut out.cells,
+                    &mut rasters,
+                    start,
+                    sy,
+                    x - start,
+                    sh,
+                    interior,
+                )?;
             }
         }
     }
@@ -751,6 +784,12 @@ mod tests {
         let (emitted, _) = emit(&cov(&[(0, 3)], &[(3 + g, 12 + g)], 40, 4)).unwrap();
         assert_eq!(emitted.cells.len(), 1);
         assert_eq!(emitted.spans.len(), 1);
+        // Adjacent partial edges must not consume the full interior run.
+        let (emitted, rasters) = emit(&cov(&[(0, 3), (20, 23)], &[(3, 20)], 40, 4)).unwrap();
+        assert_eq!(emitted.spans.len(), 0);
+        assert_eq!(emitted.cells.len(), 1);
+        assert_eq!(emitted.cells[0].interior, 3 | (20 << 16));
+        assert_eq!(rasters[0].0, 23);
     }
 }
 

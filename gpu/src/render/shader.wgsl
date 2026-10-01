@@ -1,6 +1,9 @@
-// Cherenkov GPU slice: one instanced quad pipeline for every primitive family.
+// Cherenkov GPU slice: instanced coverage geometry for every primitive family.
 //
-// Every instance is a quad. The vertex shader places it; the fragment shader
+// The painter path uses quads. Eligible solid passes first write opaque
+// interiors (rectangles or inscribed octagons) with depth, then replay the
+// original quads in painter order with depth tests and source-over blending.
+// The vertex shader places the geometry; the fragment shader
 // computes analytic coverage (an SDF, a Gaussian-blurred rounded box, or an
 // atlas texel), multiplies by the instance's clip coverage and opacity, and
 // evaluates the paint at the pixel centre in the instance's local space. The
@@ -488,7 +491,7 @@ fn paint_backdrop(i: u32, pixel: vec2<f32>) -> vec4<f32> {
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     if VARIANT == VARIANT_SIMPLE {
-        return fs_simple(in);
+        return fs_simple(in, false);
     }
     if VARIANT == VARIANT_SHADOW {
         return fs_shadow(in);
@@ -498,7 +501,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
 // Solid fill/span/glyph coverage: no clip, mask, inner, or paint()
 // evaluation, and no `instances` reads at all.
-fn fs_simple(in: VsOut) -> vec4<f32> {
+fn fs_simple(in: VsOut, classified: bool) -> vec4<f32> {
     let s = Shape(in.shape_a.xy, in.shape_a.z, in.shape_a.w, in.shape_radii);
     let m = array<vec4<f32>, 2>(in.affine0, in.affine1);
     var cov: f32;
@@ -511,11 +514,112 @@ fn fs_simple(in: VsOut) -> vec4<f32> {
             cov = 1.0;
         }
         default: {
-            cov = shape_coverage(s, in.local, m);
+            if classified && in.affine1.w > 0.0 {
+                let r = vec2<f32>(s.half.x, s.half.x * s.aspect);
+                let u = abs(in.local) / r;
+                let rr = dot(u, u);
+                if rr < in.affine1.z {
+                    cov = 1.0;
+                } else if rr > in.affine1.w {
+                    cov = 0.0;
+                } else {
+                    cov = shape_coverage(s, in.local, m);
+                }
+            } else {
+                cov = shape_coverage(s, in.local, m);
+            }
         }
     }
     cov = clamp(cov, 0.0, 1.0) * in.params.y;
     return move_space(vec4<f32>(in.color.rgb * in.color.a, in.color.a) * cov, SPACE_LINEAR, globals.space);
+}
+
+// Retained path spans already describe full coverage. Their opacity is
+// uniform over the primitive, so the vertex stage can select them without
+// fragment discard (which would prevent early hidden-surface removal).
+fn opaque_span(inst: Instance) -> bool {
+    return inst.meta_.x == KIND_SPAN && inst.color.a * inst.params.y == 1.0;
+}
+
+@vertex
+fn vs_opaque(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VsOut {
+    var inst = instances[ii];
+    var ellipse = false;
+    var ellipse_half = vec2<f32>(0.0);
+    if inst.meta_.x == KIND_REGION {
+        let x = inst.bounds.x;
+        inst.bounds.x = x + f32(inst.meta_.z & 0xffffu);
+        inst.bounds.z = x + f32(inst.meta_.z >> 16u);
+    }
+    if inst.meta_.x == KIND_FILL {
+        let m = inst.affine[0];
+        let det = abs(m.x * m.w - m.y * m.z);
+        let margin = vec2<f32>(abs(m.w) + abs(m.z), abs(m.y) + abs(m.x)) / det;
+        let s = inst.shape;
+        ellipse = s.exponent == 2.0 && all(s.radii == vec4<f32>(s.half.x));
+        ellipse_half = s.half * max(1.0 - length(margin / s.half), 0.0);
+        let radius = max(max(s.radii.x, s.radii.y), max(s.radii.z, s.radii.w));
+        // The rectangle inscribed in the circular corners is inside every
+        // supported Lamé corner (exponent >= 2). Inset one complete device
+        // pixel on each local axis, beyond the analytic AA support.
+        let half = s.half - radius * (1.0 - sqrt(0.5)) * vec2<f32>(1.0, s.aspect) - margin;
+        inst.bounds = vec4<f32>(max(inst.bounds.xy, -half), min(inst.bounds.zw, half));
+    }
+    let corner = array<u32, 4>(0u, 1u, 2u, 5u)[min(vi, 3u)];
+    var out = instance_vertex(corner, ii, inst);
+    if ellipse {
+        let d = sqrt(0.5);
+        let polygon = array<vec2<f32>, 8>(
+            vec2<f32>(1.0, 0.0), vec2<f32>(d, d),
+            vec2<f32>(0.0, 1.0), vec2<f32>(-d, d),
+            vec2<f32>(-1.0, 0.0), vec2<f32>(-d, -d),
+            vec2<f32>(0.0, -1.0), vec2<f32>(d, -d),
+        );
+        let index = array<u32, 8>(0u, 1u, 7u, 2u, 6u, 3u, 5u, 4u)[vi];
+        let p = polygon[index] * max(ellipse_half, vec2<f32>(0.0));
+        let ndc = (apply(inst.affine, p) - globals.origin) / globals.size * 2.0 - 1.0;
+        out.position = vec4<f32>(ndc.x, -ndc.y, 0.0, 1.0);
+    }
+    // Each index selects a distinct positive f32 depth starting at 0.125.
+    // Even the largest u32 storage binding holds fewer than 2^24 of our
+    // 272-byte instances, keeping every depth below 0.5 and in range.
+    out.position.z = bitcast<f32>(0x3e000000u + ii);
+    if inst.color.a * inst.params.y != 1.0
+        || (inst.meta_.x != KIND_SPAN && inst.meta_.x != KIND_FILL && inst.meta_.x != KIND_REGION)
+        || any(inst.bounds.xy >= inst.bounds.zw) {
+        out.position = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    }
+    return out;
+}
+
+@vertex
+fn vs_partial(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VsOut {
+    var out = quad_vertex(array<u32, 4>(0u, 1u, 2u, 5u)[vi], ii);
+    out.position.z = bitcast<f32>(0x3e000000u + ii);
+    let inst = instances[ii];
+    let s = inst.shape;
+    if inst.meta_.x == KIND_FILL && s.exponent == 2.0 && all(s.radii == vec4<f32>(s.half.x)) {
+        let m = inst.affine[0];
+        let r = vec2<f32>(s.half.x, s.half.x * s.aspect);
+        let h = 0.5 * device_grad_scale(inst.affine) * vec2<f32>(abs(m.w) + abs(m.z), abs(m.y) + abs(m.x));
+        let margin = length(h) / min(r.x, r.y);
+        out.affine1.z = max(1.0 - margin, 0.0) * max(1.0 - margin, 0.0);
+        out.affine1.w = (1.0 + margin) * (1.0 + margin);
+    }
+    if opaque_span(instances[ii]) {
+        out.position = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    }
+    return out;
+}
+
+@fragment
+fn fs_opaque(in: VsOut) -> @location(0) vec4<f32> {
+    return move_space(vec4<f32>(in.color.rgb, 1.0), SPACE_LINEAR, globals.space);
+}
+
+@fragment
+fn fs_partial(in: VsOut) -> @location(0) vec4<f32> {
+    return fs_simple(in, true);
 }
 
 // The shadow kernel plus the same opacity/solid-colour tail.

@@ -12,6 +12,7 @@ const KIND_STROKE_DIST: u32 = 2u;   // coverage(d - hw) - coverage(d + hw)
 const KIND_SHADOW: u32 = 3u;        // Gaussian-blurred rounded box
 const KIND_GLYPH: u32 = 4u;         // coverage from the glyph atlas
 const KIND_SPAN: u32 = 5u;          // a full-coverage device-space run
+const KIND_REGION: u32 = 6u;        // atlas cell with a retained full interval
 
 const PAINT_SOLID: u32 = 0u;
 const PAINT_LINEAR: u32 = 1u;
@@ -148,14 +149,21 @@ fn apply_inverse(m: array<vec4<f32>, 2>, p: vec2<f32>) -> vec2<f32> {
 
 @vertex
 fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VsOut {
-    let inst = instances[ii];
+    return quad_vertex(vi, ii);
+}
+
+fn quad_vertex(vi: u32, ii: u32) -> VsOut {
+    return instance_vertex(vi, ii, instances[ii]);
+}
+
+fn instance_vertex(vi: u32, ii: u32, inst: Instance) -> VsOut {
     // Two triangles: 0 1 2, 2 1 3 over the corners (x0,y0) (x1,y0) (x0,y1) (x1,y1).
     let corner = array<u32, 6>(0u, 1u, 2u, 2u, 1u, 3u)[vi];
     let sx = f32(corner & 1u);
     let sy = f32(corner >> 1u);
     let p = vec2<f32>(mix(inst.bounds.x, inst.bounds.z, sx), mix(inst.bounds.y, inst.bounds.w, sy));
     var out: VsOut;
-    if inst.meta_.x == KIND_GLYPH || inst.meta_.x == KIND_SPAN {
+    if inst.meta_.x >= KIND_GLYPH {
         out.pixel = p;
         out.local = apply_inverse(inst.affine, p);
     } else {
@@ -168,6 +176,9 @@ fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
     // Hoist the constants every fragment reads into flat varyings so the
     // fragment shader only touches `instances` for kind-specific fields.
     out.meta_ = inst.meta_;
+    // Region metadata belongs to the opaque vertex stage. Sampled coverage
+    // uses the original atlas-cell fragment path for both cell kinds.
+    out.meta_.x = select(inst.meta_.x, KIND_GLYPH, inst.meta_.x == KIND_REGION);
     out.color = inst.color;
     out.params = inst.params;
     out.shape_a = vec4<f32>(inst.shape.half, inst.shape.aspect, inst.shape.exponent);

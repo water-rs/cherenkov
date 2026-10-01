@@ -12,6 +12,7 @@ const KIND_STROKE_DIST: u32 = 2u;   // coverage(d - hw) - coverage(d + hw)
 const KIND_SHADOW: u32 = 3u;        // Gaussian-blurred rounded box
 const KIND_GLYPH: u32 = 4u;         // coverage from the glyph atlas
 const KIND_SPAN: u32 = 5u;          // a full-coverage device-space run
+const KIND_REGION: u32 = 6u;        // atlas cell with a retained full interval
 
 const PAINT_SOLID: u32 = 0u;
 const PAINT_LINEAR: u32 = 1u;
@@ -148,14 +149,21 @@ fn apply_inverse(m: array<vec4<f32>, 2>, p: vec2<f32>) -> vec2<f32> {
 
 @vertex
 fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VsOut {
-    let inst = instances[ii];
+    return quad_vertex(vi, ii);
+}
+
+fn quad_vertex(vi: u32, ii: u32) -> VsOut {
+    return instance_vertex(vi, ii, instances[ii]);
+}
+
+fn instance_vertex(vi: u32, ii: u32, inst: Instance) -> VsOut {
     // Two triangles: 0 1 2, 2 1 3 over the corners (x0,y0) (x1,y0) (x0,y1) (x1,y1).
     let corner = array<u32, 6>(0u, 1u, 2u, 2u, 1u, 3u)[vi];
     let sx = f32(corner & 1u);
     let sy = f32(corner >> 1u);
     let p = vec2<f32>(mix(inst.bounds.x, inst.bounds.z, sx), mix(inst.bounds.y, inst.bounds.w, sy));
     var out: VsOut;
-    if inst.meta_.x == KIND_GLYPH || inst.meta_.x == KIND_SPAN {
+    if inst.meta_.x >= KIND_GLYPH {
         out.pixel = p;
         out.local = apply_inverse(inst.affine, p);
     } else {
@@ -168,6 +176,9 @@ fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
     // Hoist the constants every fragment reads into flat varyings so the
     // fragment shader only touches `instances` for kind-specific fields.
     out.meta_ = inst.meta_;
+    // Region metadata belongs to the opaque vertex stage. Sampled coverage
+    // uses the original atlas-cell fragment path for both cell kinds.
+    out.meta_.x = select(inst.meta_.x, KIND_GLYPH, inst.meta_.x == KIND_REGION);
     out.color = inst.color;
     out.params = inst.params;
     out.shape_a = vec4<f32>(inst.shape.half, inst.shape.aspect, inst.shape.exponent);
@@ -204,9 +215,15 @@ fn lame_corner(q: vec2<f32>, r: vec2<f32>, n: f32) -> vec4<f32> {
     return vec4<f32>(d, normal, 1.0 / max(kappa, 1e-6));
 }
 
-// Signed distance from `p` to the rounded box `s`. Exact for straight edges
-// and circular corners; second-order for elliptical and Lamé corners.
-fn sdf(s: Shape, p: vec2<f32>) -> f32 {
+// Distance and differential geometry evaluated at the same local point.
+// In particular, a Lamé corner needs only one Newton projection.
+struct DistanceSample {
+    distance: f32,
+    gradient: vec4<f32>,
+}
+
+fn sdf_sample(s: Shape, p: vec2<f32>) -> DistanceSample {
+    let sgn = select(vec2<f32>(-1.0), vec2<f32>(1.0), p >= vec2<f32>(0.0));
     let right = p.x > 0.0;
     let bottom = p.y > 0.0;
     let r = select(
@@ -218,20 +235,31 @@ fn sdf(s: Shape, p: vec2<f32>) -> f32 {
     let ry = rx * s.aspect;
     let a = abs(p) - s.half;
     if rx <= 0.0 || ry <= 0.0 {
-        return length(max(a, vec2<f32>(0.0))) + min(max(a.x, a.y), 0.0);
+        let d = length(max(a, vec2<f32>(0.0))) + min(max(a.x, a.y), 0.0);
+        var g: vec4<f32>;
+        if a.x > 0.0 && a.y > 0.0 {
+            g = vec4<f32>(a / length(a), 0.0, 1.0);
+        } else {
+            g = vec4<f32>(select(vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), a.x > a.y), 0.0, 0.0);
+        }
+        return DistanceSample(d, vec4<f32>(sgn * g.xy, g.zw));
     }
     let q = a + vec2<f32>(rx, ry);
     if q.x > 0.0 && q.y > 0.0 {
-        let n = s.exponent;
-        if abs(n - 2.0) < 1e-4 && abs(s.aspect - 1.0) < 1e-4 {
+        if abs(s.exponent - 2.0) < 1e-4 && abs(s.aspect - 1.0) < 1e-4 {
             let u = q / vec2<f32>(rx, ry);
-            let g = length(u);
-            let grad = length(u / vec2<f32>(rx, ry)) / max(g, 1e-6);
-            return (g - 1.0) / max(grad, 1e-6);
+            let len = length(u);
+            let grad = length(u / vec2<f32>(rx, ry)) / max(len, 1e-6);
+            let d = (len - 1.0) / max(grad, 1e-6);
+            let v = q / vec2<f32>(rx * rx, ry * ry);
+            let normal = v / max(length(v), 1e-12);
+            return DistanceSample(d, vec4<f32>(sgn * normal, rx, 0.0));
         }
-        return lame_corner(q, vec2<f32>(rx, ry), n).x;
+        let l = lame_corner(q, vec2<f32>(rx, ry), s.exponent);
+        return DistanceSample(l.x, vec4<f32>(sgn * l.yz, l.w, 0.0));
     }
-    return max(a.x, a.y);
+    let g = select(vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), a.x > a.y);
+    return DistanceSample(max(a.x, a.y), vec4<f32>(sgn * g, 0.0, 0.0));
 }
 
 // Device-space gradient of a signed distance, for the local -> device
@@ -253,50 +281,6 @@ fn device_grad_scale(m: array<vec4<f32>, 2>) -> f32 {
     let d = m[0].w;
     let det = a * d - b * c;
     return abs(select(1.0 / det, 0.0, abs(det) < 1e-12));
-}
-
-// Local-space gradient of the signed distance to `s` at `p`, closed form.
-// Derivative builtins are not used: they are unreliable in the
-// helper lanes along the quad's triangle seam.
-fn sdf_grad(s: Shape, p: vec2<f32>) -> vec4<f32> {
-    // Closed form for every shape: the unit gradient of the box distance,
-    // mirrored back out of the abs() fold. z = local boundary radius of
-    // curvature on a circular, elliptical or Lamé arc, 0.0 on straight
-    // edges; w = 1.0 only where the distance is not a half-plane (the
-    // sharp-corner exterior wedge).
-    let sgn = select(vec2<f32>(-1.0), vec2<f32>(1.0), p >= vec2<f32>(0.0));
-    let right = p.x > 0.0;
-    let bottom = p.y > 0.0;
-    let r = select(
-        select(s.radii.x, s.radii.w, bottom),
-        select(s.radii.y, s.radii.z, bottom),
-        right,
-    );
-    let rx = max(r, 0.0);
-    let ry = rx * s.aspect;
-    let a = abs(p) - s.half;
-    var g: vec4<f32>;
-    if rx <= 0.0 || ry <= 0.0 {
-        if a.x > 0.0 && a.y > 0.0 {
-            g = vec4<f32>(a / length(a), 0.0, 1.0);
-        } else {
-            g = vec4<f32>(select(vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), a.x > a.y), 0.0, 0.0);
-        }
-    } else {
-        let q = a + vec2<f32>(rx, ry);
-        if q.x > 0.0 && q.y > 0.0 {
-            if abs(s.exponent - 2.0) < 1e-4 && abs(s.aspect - 1.0) < 1e-4 {
-                let v = q / vec2<f32>(rx * rx, ry * ry);
-                g = vec4<f32>(v / max(length(v), 1e-12), rx, 0.0);
-            } else {
-                let l = lame_corner(q, vec2<f32>(rx, ry), s.exponent);
-                g = vec4<f32>(l.yz, l.w, 0.0);
-            }
-        } else {
-            g = vec4<f32>(select(vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), a.x > a.y), 0.0, 0.0);
-        }
-    }
-    return vec4<f32>(sgn * g.xy, g.zw);
 }
 
 // Area coverage of the axis-aligned half-plane `d <= 0` where `d`
@@ -364,56 +348,80 @@ fn coverage_dir(d: f32, v: vec2<f32>, scale: f32, ramp: bool, radius: f32) -> f3
 // folded edges meeting at a point) lies inside the pixel, neither
 // half-plane's linear ramp nor the exterior Euclidean ramp is the truth:
 // the truth is the area inside both.
+struct PolygonArea {
+    first: vec2<f32>,
+    previous: vec2<f32>,
+    area: f32,
+    count: u32,
+}
+
+fn append_area(state: PolygonArea, p: vec2<f32>) -> PolygonArea {
+    var next = state;
+    if state.count == 0u {
+        next.first = p;
+    } else {
+        next.area = state.area + state.previous.x * p.y - p.x * state.previous.y;
+    }
+    next.previous = p;
+    next.count = state.count + 1u;
+    return next;
+}
+
 fn corner_coverage(a: vec2<f32>, v1: vec2<f32>, v2: vec2<f32>, scale: f32) -> f32 {
-    var poly = array<vec2<f32>, 8>(
+    let square = array<vec2<f32>, 4>(
         vec2<f32>(-0.5, -0.5),
         vec2<f32>(0.5, -0.5),
         vec2<f32>(0.5, 0.5),
         vec2<f32>(-0.5, 0.5),
-        vec2<f32>(0.0, 0.0),
-        vec2<f32>(0.0, 0.0),
-        vec2<f32>(0.0, 0.0),
-        vec2<f32>(0.0, 0.0),
     );
-    var n = 4u;
-    for (var c = 0u; c < 2u; c = c + 1u) {
-        let v = select(v1, v2, c == 1u);
-        let off = select(a.x, a.y, c == 1u);
-        var clipped: array<vec2<f32>, 8>;
-        var m_out = 0u;
-        var prev = poly[n - 1u];
-        var pd = off + scale * dot(v, prev);
-        for (var i = 0u; i < n; i = i + 1u) {
-            let cur = poly[i];
-            let cd = off + scale * dot(v, cur);
-            if (cd <= 0.0) != (pd <= 0.0) {
-                let t = pd / (pd - cd);
-                clipped[m_out] = prev + t * (cur - prev);
-                m_out = m_out + 1u;
-            }
-            if cd <= 0.0 {
-                clipped[m_out] = cur;
-                m_out = m_out + 1u;
-            }
-            prev = cur;
-            pd = cd;
+    // One half-plane adds at most one vertex to a convex square.
+    var clipped: array<vec2<f32>, 5>;
+    var n = 0u;
+    var previous = square[3];
+    var previous_distance = a.x + scale * dot(v1, previous);
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        let p = square[i];
+        let distance = a.x + scale * dot(v1, p);
+        if (distance <= 0.0) != (previous_distance <= 0.0) {
+            let t = previous_distance / (previous_distance - distance);
+            clipped[n] = previous + t * (p - previous);
+            n = n + 1u;
         }
-        n = m_out;
-        poly = clipped;
+        if distance <= 0.0 {
+            clipped[n] = p;
+            n = n + 1u;
+        }
+        previous = p;
+        previous_distance = distance;
     }
-    var area = 0.0;
+    // Stream the second clip straight into the shoelace sum. This visits
+    // the same vertices in the same order without a second polygon array.
+    var area = PolygonArea(vec2<f32>(0.0), vec2<f32>(0.0), 0.0, 0u);
+    previous = clipped[n - 1u];
+    previous_distance = a.y + scale * dot(v2, previous);
     for (var i = 0u; i < n; i = i + 1u) {
-        let j = select(i + 1u, 0u, i + 1u == n);
-        area = area + poly[i].x * poly[j].y - poly[j].x * poly[i].y;
+        let p = clipped[i];
+        let distance = a.y + scale * dot(v2, p);
+        if (distance <= 0.0) != (previous_distance <= 0.0) {
+            let t = previous_distance / (previous_distance - distance);
+            area = append_area(area, previous + t * (p - previous));
+        }
+        if distance <= 0.0 {
+            area = append_area(area, p);
+        }
+        previous = p;
+        previous_distance = distance;
     }
-    return clamp(abs(area) * 0.5, 0.0, 1.0);
+    let sum = area.area + area.previous.x * area.first.y - area.first.x * area.previous.y;
+    return clamp(abs(sum) * 0.5, 0.0, 1.0);
 }
 
 // Coverage of the shape `s` at local point `p`, `m` mapping local to device.
 fn shape_coverage(s: Shape, p: vec2<f32>, m: array<vec4<f32>, 2>) -> f32 {
-    let g = sdf_grad(s, p);
+    let sample = sdf_sample(s, p);
+    let g = sample.gradient;
     // A sharp corner inside this pixel: the exact area inside both
-    // half-planes. `a`, `sgn`, and the quadrant radius mirror `sdf_grad`;
+    // half-planes. `a`, `sgn`, and the quadrant radius mirror `sdf_sample`;
     // the strict `<` keeps a corner exactly on a pixel boundary on the
     // old path.
     let sgn = select(vec2<f32>(-1.0), vec2<f32>(1.0), p >= vec2<f32>(0.0));
@@ -438,7 +446,7 @@ fn shape_coverage(s: Shape, p: vec2<f32>, m: array<vec4<f32>, 2>) -> f32 {
         }
     }
     return coverage_dir(
-        sdf(s, p),
+        sample.distance,
         device_grad_vec(m, g.xy),
         device_grad_scale(m),
         g.w > 0.0,
@@ -456,10 +464,11 @@ fn clip_mask_coverage(in: VsOut) -> f32 {
     if (flags & FLAG_HAS_CLIP) != 0u {
         // `clip_inv` maps device to clip-local: J^-T is its transpose.
         let pc = apply(instances[i].clip_inv, in.pixel);
-        let g = sdf_grad(instances[i].clip, pc);
+        let sample = sdf_sample(instances[i].clip, pc);
+        let g = sample.gradient;
         let ci = instances[i].clip_inv;
         let dg = vec2<f32>(ci[0].x * g.x + ci[0].y * g.y, ci[0].z * g.x + ci[0].w * g.y);
-        cov = coverage_dir(sdf(instances[i].clip, pc), dg, 1.0, g.w > 0.0, g.z);
+        cov = coverage_dir(sample.distance, dg, 1.0, g.w > 0.0, g.z);
     }
     if (flags & FLAG_HAS_MASK) != 0u {
         // Mask texel for this device pixel; texels outside the cell

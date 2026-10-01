@@ -46,6 +46,33 @@ const VS_FS_MAIN: &[wgpu::PassthroughShaderEntryPoint<'static>] = &[
     },
 ];
 
+const ENGINE_ENTRIES: &[wgpu::PassthroughShaderEntryPoint<'static>] = &[
+    wgpu::PassthroughShaderEntryPoint {
+        name: Cow::Borrowed("vs_main"),
+        workgroup_size: (0, 0, 0),
+    },
+    wgpu::PassthroughShaderEntryPoint {
+        name: Cow::Borrowed("fs_main"),
+        workgroup_size: (0, 0, 0),
+    },
+    wgpu::PassthroughShaderEntryPoint {
+        name: Cow::Borrowed("vs_opaque"),
+        workgroup_size: (0, 0, 0),
+    },
+    wgpu::PassthroughShaderEntryPoint {
+        name: Cow::Borrowed("fs_opaque"),
+        workgroup_size: (0, 0, 0),
+    },
+    wgpu::PassthroughShaderEntryPoint {
+        name: Cow::Borrowed("vs_partial"),
+        workgroup_size: (0, 0, 0),
+    },
+    wgpu::PassthroughShaderEntryPoint {
+        name: Cow::Borrowed("fs_partial"),
+        workgroup_size: (0, 0, 0),
+    },
+];
+
 /// `vs_main` + `fs_external`, the external module's entry points.
 const VS_FS_EXTERNAL: &[wgpu::PassthroughShaderEntryPoint<'static>] = &[
     wgpu::PassthroughShaderEntryPoint {
@@ -208,19 +235,19 @@ const ENGINE: [Fixed; 3] = [
         wgsl: ENGINE_WGSL0,
         spirv: ENGINE_SPV[0],
         metallib: ENGINE_METALLIB[0],
-        entries: VS_FS_MAIN,
+        entries: ENGINE_ENTRIES,
     },
     Fixed {
         wgsl: ENGINE_WGSL1,
         spirv: ENGINE_SPV[1],
         metallib: ENGINE_METALLIB[1],
-        entries: VS_FS_MAIN,
+        entries: ENGINE_ENTRIES,
     },
     Fixed {
         wgsl: ENGINE_WGSL2,
         spirv: ENGINE_SPV[2],
         metallib: ENGINE_METALLIB[2],
-        entries: VS_FS_MAIN,
+        entries: ENGINE_ENTRIES,
     },
 ];
 

@@ -5,6 +5,7 @@
 //! pixmap's premultiplied rgba8, decoded to the suite working space.
 
 use std::collections::BTreeSet;
+use std::time::Instant;
 
 use cherenkov_scene::Feature;
 use vello_common::paint::PaintType;
@@ -247,8 +248,11 @@ impl Engine for VelloCpu {
             .ok_or_else(|| BenchError::Engine("vello-cpu: submit before encode".into()))?;
         // Always rasterize — `measure` must execute the real render even
         // without readback (`ctx.flush()` alone only drains the dispatcher).
+        let render_at = Instant::now();
         let mut pixmap = Pixmap::new(ctx.width(), ctx.height());
         ctx.render(PixmapMut::from(&mut pixmap), &mut self.res);
+        let render_seconds = render_at.elapsed().as_secs_f64();
+        let readback_at = Instant::now();
         let image = readback.then(|| {
             let rgba8: &[u8] = bytemuck::cast_slice(pixmap.data());
             crate::convert::rgba8_to_working(
@@ -261,6 +265,8 @@ impl Engine for VelloCpu {
             image,
             gpu: Vec::new(),
             phases: None,
+            render_seconds: Some(render_seconds),
+            readback_seconds: readback.then(|| readback_at.elapsed().as_secs_f64()),
         })
     }
 

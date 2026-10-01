@@ -31,10 +31,14 @@ use rustc_hash::FxHashMap;
 use crate::interop::{ChromaOffset, FrameColor, RgbAlpha};
 
 mod ahb;
+#[cfg(test)]
+mod attachment;
+pub mod device;
 mod dmabuf;
 mod sync;
 mod ycbcr;
 
+pub use device::AttachmentAccess;
 pub use sync::{Generation, PendingAcquire, PendingWait, State, cancel_staged, stage_acquire};
 pub use sync::{Release, drain_destroys, drain_releases, mark_owned, mark_submitted, submit_waits};
 
@@ -361,6 +365,8 @@ impl Device {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct Caps {
+    /// Native pixel-local composition features enabled at device creation.
+    pub attachment_access: AttachmentAccess,
     /// `VK_KHR_external_memory` + `VK_KHR_external_memory_fd`.
     pub external_memory_fd: bool,
     /// `VK_EXT_external_memory_dma_buf`.
@@ -552,11 +558,7 @@ fn probe(
     let mut features2 = vk::PhysicalDeviceFeatures2::default();
     let mut timeline = vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
     let mut ycbcr = vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default();
-    let mut buf_addr = vk::PhysicalDeviceVulkan12Features::default();
-    features2 = features2
-        .push_next(&mut timeline)
-        .push_next(&mut ycbcr)
-        .push_next(&mut buf_addr);
+    features2 = features2.push_next(&mut timeline).push_next(&mut ycbcr);
     unsafe {
         instance.get_physical_device_features2(physical_device, &mut features2);
     }
@@ -599,6 +601,7 @@ fn probe(
     }
 
     Caps {
+        attachment_access: device::attachment_access(device, instance, physical_device),
         external_memory_fd: has(ash::khr::external_memory_fd::NAME),
         external_memory_dma_buf: has(ash::ext::external_memory_dma_buf::NAME),
         external_semaphore_opaque_fd: opaque_fd,

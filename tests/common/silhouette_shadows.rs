@@ -82,6 +82,9 @@ pub fn retained_and_padded<B: Backend>(config: B::Config) {
 split_fn! {
 /// Invalid placements and parameters are errors, not empty silhouettes.
 pub fn invalid<B: Backend>(mut config: impl FnMut() -> B::Config) {
+    // One engine for all cases: each case gets a fresh surface, and the
+    // validation errors asserted below leave the engine usable.
+    let engine = wait!(Engine::<B>::new(config())).expect("engine");
     for (transform, spec) in [
         (Affine::scale(0.0), Shadow::new(3.0, WorkingColor::BLACK)),
         (
@@ -94,7 +97,6 @@ pub fn invalid<B: Backend>(mut config: impl FnMut() -> B::Config) {
             Shadow::new(3.0, WorkingColor::BLACK).offset((f64::NAN, 0.0)),
         ),
     ] {
-        let engine = wait!(Engine::<B>::new(config())).expect("engine");
         let surface = wait!(engine
             .surface(Offscreen::new((16, 16), OffscreenFormat::LinearF16)))
             .expect("surface");

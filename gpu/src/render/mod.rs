@@ -685,7 +685,7 @@ fn create_device(
         required_features: required,
         required_limits: limits,
         experimental_features: wgpu::ExperimentalFeatures::disabled(),
-        memory_hints: wgpu::MemoryHints::Performance,
+        memory_hints: memory_hints(),
         trace: wgpu::Trace::Off,
     }))
     .map_err(|e| EngineError::Backend(format!("{e}")))?;
@@ -742,10 +742,9 @@ fn create_vulkan_device(
         } else {
             None
         };
-    let opened = unsafe {
-        hal_adapter.open_with_callback(features, limits, &wgpu::MemoryHints::Performance, callback)
-    }
-    .map_err(|e| EngineError::Backend(format!("vulkan device creation: {e}")))?;
+    let hints = memory_hints();
+    let opened = unsafe { hal_adapter.open_with_callback(features, limits, &hints, callback) }
+        .map_err(|e| EngineError::Backend(format!("vulkan device creation: {e}")))?;
     drop(hal_adapter);
     let (device, queue) = unsafe {
         adapter.create_device_from_hal::<wgpu::hal::vulkan::Api>(
@@ -755,7 +754,7 @@ fn create_vulkan_device(
                 required_features: features,
                 required_limits: limits.clone(),
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
-                memory_hints: wgpu::MemoryHints::Performance,
+                memory_hints: hints,
                 trace: wgpu::Trace::Off,
             },
         )
@@ -883,7 +882,7 @@ async fn create_device(
             // where `Limits::default` asks for 16.
             required_limits: wgpu::Limits::default().or_worse_values_from(&adapter.limits()),
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
-            memory_hints: wgpu::MemoryHints::Performance,
+            memory_hints: memory_hints(),
             trace: wgpu::Trace::Off,
         })
         .await
@@ -1072,12 +1071,48 @@ const fn variant_index(variant: ShaderVariant) -> usize {
     }
 }
 
-/// #170 B3's pipeline policy: whether the deduplicated core set is built
-/// at creation (`CoreEager`) or each cell at the first draw that needs it
-/// (`CoreDemand`). wasm is always eager — its pipeline creation is async
-/// and cannot run inside the synchronous encode loop.
+/// #170 B3's measured choice: whether the deduplicated core pipeline set
+/// is built at creation (`CoreEager`) or each cell at the first draw that
+/// needs it (`CoreDemand`). `CHERENKOV_CORE_PIPELINES=demand` overrides
+/// the default for the selection runs only — the shipped policy lands as
+/// a constant once the Pixel A/B lands. wasm is always eager: its
+/// pipeline creation is async and cannot run inside the encode loop.
+#[cfg(not(target_arch = "wasm32"))]
+fn core_pipelines_eager() -> bool {
+    std::env::var_os("CHERENKOV_CORE_PIPELINES").is_none_or(|v| v != "demand")
+}
+
+/// The device allocator's memory-hints policy — #170 B4 selects the
+/// checked-in value by measured reservation. `CHERENKOV_MEMORY_HINTS`
+/// overrides it for the selection runs only: `performance`,
+/// `memory-usage`, `manual-4-16`, `manual-8-32`, `manual-16-32` (MiB
+/// block-size floor and cap — suballocation policy, not a total budget).
+#[cfg(not(target_arch = "wasm32"))]
+fn memory_hints() -> wgpu::MemoryHints {
+    const MIB: u64 = 1024 * 1024;
+    match std::env::var("CHERENKOV_MEMORY_HINTS").ok().as_deref() {
+        Some("memory-usage") => wgpu::MemoryHints::MemoryUsage,
+        Some("manual-4-16") => wgpu::MemoryHints::Manual {
+            suballocated_device_memory_block_size: 4 * MIB..16 * MIB,
+        },
+        Some("manual-8-32") => wgpu::MemoryHints::Manual {
+            suballocated_device_memory_block_size: 8 * MIB..32 * MIB,
+        },
+        Some("manual-16-32") => wgpu::MemoryHints::Manual {
+            suballocated_device_memory_block_size: 16 * MIB..32 * MIB,
+        },
+        _ => wgpu::MemoryHints::Performance,
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
 const fn core_pipelines_eager() -> bool {
     true
+}
+
+#[cfg(target_arch = "wasm32")]
+const fn memory_hints() -> wgpu::MemoryHints {
+    wgpu::MemoryHints::Performance
 }
 
 /// The pipeline layout every core and backdrop pipeline shares, over

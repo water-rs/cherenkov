@@ -27,6 +27,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use rustc_hash::{FxHashMap, FxHashSet};
+use wgpu::util::DeviceExt;
 
 use crate::{GpuConfig, GpuInfo, GpuTarget, ScratchFormat, TimestampSupport, names};
 use bitmap::BitmapKey;
@@ -64,8 +65,8 @@ enum CoveragePass {
 impl CoveragePass {
     const fn topology(self) -> wgpu::PrimitiveTopology {
         match self {
-            Self::Painter(_) => wgpu::PrimitiveTopology::TriangleList,
-            Self::Opaque | Self::Partial => wgpu::PrimitiveTopology::TriangleStrip,
+            Self::Painter(_) | Self::Partial => wgpu::PrimitiveTopology::TriangleList,
+            Self::Opaque => wgpu::PrimitiveTopology::TriangleStrip,
         }
     }
     const fn vertex(self) -> &'static str {
@@ -565,6 +566,8 @@ pub struct GpuRenderer {
     globals: wgpu::Buffer,
     instances: wgpu::Buffer,
     stops: wgpu::Buffer,
+    /// `{0, 1, 2, 2, 1, 3}` — see `quad_index_buffer`.
+    quad_indices: wgpu::Buffer,
     bind0: wgpu::BindGroup,
     /// The atlas generation `bind0` was built against.
     bound_atlas: u64,
@@ -1481,6 +1484,17 @@ pub fn texel_bytes(format: wgpu::TextureFormat) -> u64 {
     u64::from(format.block_copy_size(None).unwrap_or(0))
 }
 
+/// `{0, 1, 2, 2, 1, 3}`: the coverage partial pass's indexed draw replays
+/// the painter path's ordered triangles while the vertex shader runs once
+/// per corner.
+fn quad_index_buffer(device: &wgpu::Device) -> wgpu::Buffer {
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("quad indices"),
+        contents: bytemuck::cast_slice(&[0u16, 1, 2, 2, 1, 3]),
+        usage: wgpu::BufferUsages::INDEX,
+    })
+}
+
 /// Creates GPU state on the shared engine render thread.
 ///
 /// # Errors
@@ -1585,6 +1599,7 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let quad_indices = quad_index_buffer(&device);
         diag::create(&device, "globals", globals.size());
         diag::create(&device, "instances", instances.size());
         diag::create(&device, "stops", stops.size());
@@ -1676,6 +1691,7 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             globals,
             instances,
             stops,
+            quad_indices,
             bind0,
             dummy_view,
             dummy_uint_view,
@@ -1850,6 +1866,7 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
+    let quad_indices = quad_index_buffer(&device);
     diag::create(&device, "globals", globals.size());
     diag::create(&device, "instances", instances.size());
     diag::create(&device, "stops", stops.size());
@@ -1923,6 +1940,7 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
         globals,
         instances,
         stops,
+        quad_indices,
         bind0,
         dummy_view,
         dummy_uint_view,
@@ -5651,6 +5669,8 @@ impl GpuRenderer {
                     stats.draws += 1;
                 }
                 render_pass.set_pipeline(&self.coverage_pipelines[1]);
+                render_pass
+                    .set_index_buffer(self.quad_indices.slice(..), wgpu::IndexFormat::Uint16);
                 stats.pipeline_switches += 2;
             } else {
                 render_pass.set_pipeline(&self.pipelines[format_i][0][0]);
@@ -5990,10 +6010,21 @@ impl GpuRenderer {
                     }
                 };
                 render_pass.set_bind_group(1, bind, &[]);
-                render_pass.draw(
-                    0..if coverage_order { 4 } else { 6 },
-                    (inst_base + range.instances.start)..(inst_base + range.instances.end),
-                );
+                if coverage_order {
+                    // Four vertex shader runs per quad, but the indices
+                    // submit the painter path's exact ordered triangles —
+                    // required for bit-identical rasterization.
+                    render_pass.draw_indexed(
+                        0..6,
+                        0,
+                        (inst_base + range.instances.start)..(inst_base + range.instances.end),
+                    );
+                } else {
+                    render_pass.draw(
+                        0..6,
+                        (inst_base + range.instances.start)..(inst_base + range.instances.end),
+                    );
+                }
                 ri += 1;
             }
             drop(render_pass);

@@ -2859,6 +2859,7 @@ mod tests {
                         x: 0,
                         y: 0,
                         slot: 0,
+                        interior: 0,
                     })
                     .collect(),
                 ..PathEmit::default()
@@ -2907,6 +2908,7 @@ mod tests {
                         x: 0,
                         y: 0,
                         slot: 0,
+                        interior: 0,
                     })
                     .collect(),
                 ..PathEmit::default()

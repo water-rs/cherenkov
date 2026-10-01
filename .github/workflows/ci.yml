@@ -354,10 +354,24 @@ jobs:
           echo "ANDROID_NDK_HOME=$HOME/android-ndk-r27d" >> "$GITHUB_ENV"
       # cherenkov-gpu's build script optimizes precompiled SPIR-V with
       # spirv-opt and checks it with spirv-val (issue #57).
-      - run: sudo apt-get update && sudo apt-get install -y spirv-tools
+      # spirv-tools for the build script; fontconfig for the scene
+      # generator's font stack.
+      - run: sudo apt-get update && sudo apt-get install -y spirv-tools libfontconfig1-dev
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-ndk
+      - uses: astral-sh/setup-uv@v10
+      - uses: actions/cache@v4
+        with:
+          path: scenes/fonts/_full
+          key: scenes-fonts-${{ hashFiles('scenes/fonts/tools/fetch-fonts.py') }}
+      # The device test links cherenkov's `testing` feature, which embeds
+      # generated fonts, so it needs the tree.
+      - name: Generate the scene tree
+        run: |
+          set -euo pipefail
+          uv run --python 3.12 --with-requirements scenes/fonts/tools/requirements.txt \
+            python scenes/tools/generate.py
       - name: Build cherenkov-bench for aarch64-linux-android
         run: |
           cargo ndk --target aarch64-linux-android --platform 30 \

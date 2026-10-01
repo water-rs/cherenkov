@@ -15,9 +15,8 @@ contract; the per-decision log is issue #2.
   than dev against the oracle on every scene, and better overall.
 - **The scene tree is generated, not committed.** `scenes/corpus`,
   `scenes/perf` and `scenes/fonts` are produced by
-  `python3 scenes/tools/generate.py` (its Python steps need
-  `python3 -m pip install -r scenes/fonts/tools/requirements.txt`) and
-  checked out clean per machine. Nothing under them is edited by hand:
+  `uv run --python 3.12 --with-requirements scenes/fonts/tools/requirements.txt python scenes/tools/generate.py`
+  and checked out clean per machine. Nothing under them is edited by hand:
   a scene change lands in `generate-corpus` (or the font tools), never
   in the output, and the generated tree is the same bytes on every host.
   The upstream font inputs under `scenes/fonts/_full/` are fetched by

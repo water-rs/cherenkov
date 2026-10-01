@@ -516,6 +516,47 @@ impl FrameColor {
     };
 }
 
+/// Static HDR metadata a producer attaches to a frame.
+///
+/// The engine's own composition decodes a frame from its [`FrameColor`]
+/// alone; this metadata travels with a frame promoted to a system
+/// compositor plane, where the system's tone mapping reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct HdrMetadata {
+    /// SMPTE ST 2086 mastering display colour volume.
+    pub mastering: Option<MasteringDisplay>,
+    /// CTA-861.3 content light levels.
+    pub content_light: Option<ContentLight>,
+}
+
+/// SMPTE ST 2086 mastering display colour volume: CIE 1931 xy
+/// chromaticities of the mastering display's primaries and white point, and
+/// its luminance range in nits.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MasteringDisplay {
+    /// The red primary's `[x, y]`.
+    pub red: [f32; 2],
+    /// The green primary's `[x, y]`.
+    pub green: [f32; 2],
+    /// The blue primary's `[x, y]`.
+    pub blue: [f32; 2],
+    /// The white point's `[x, y]`.
+    pub white: [f32; 2],
+    /// Peak luminance in nits.
+    pub max_luminance: f32,
+    /// Minimum luminance in nits.
+    pub min_luminance: f32,
+}
+
+/// CTA-861.3 content light levels, in nits.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ContentLight {
+    /// Maximum content light level (`MaxCLL`).
+    pub max_content: f32,
+    /// Maximum frame-average light level (`MaxFALL`).
+    pub max_frame_average: f32,
+}
+
 /// A GPU-side wait an [`ExternalFrame`] is ordered behind.
 ///
 /// The engine encodes the wait on the queue inside the submission that
@@ -705,6 +746,77 @@ pub mod vulkan {
         PendingAcquire, PendingWait, QueueFamily, ReleaseSync, Repr, State, Wait, cancel_staged,
         stage_acquire,
     };
+}
+
+/// Android interop: presenting on system compositor planes (#90).
+#[cfg(target_os = "android")]
+pub mod android {
+    pub use crate::render::surface_control::ffi::{ASurfaceControl, CreateFailed, SurfaceControl};
+
+    /// A surface realized as child surface controls of a host's parent
+    /// surface control.
+    ///
+    /// The engine's own content is presented on plane buffers the engine
+    /// renders into, and eligible external frames are promoted to planes of
+    /// their own; every plane of a frame changes in one transaction. The
+    /// parent's coordinate space is the surface's device pixel space, with
+    /// its origin at the surface's top-left corner. Requires a Vulkan device
+    /// with `AHardwareBuffer` import and sync-fence export.
+    #[derive(Debug)]
+    pub struct SurfaceControlTarget {
+        pub(crate) parent: SurfaceControl,
+        pub(crate) size: (u32, u32),
+        pub(crate) transparent: bool,
+        pub(crate) refresh: cherenkov::RefreshRange,
+    }
+
+    impl SurfaceControlTarget {
+        /// Presents under `parent` at `size` device pixels.
+        #[must_use]
+        pub const fn new(parent: SurfaceControl, size: (u32, u32)) -> Self {
+            Self {
+                parent,
+                size,
+                transparent: false,
+                refresh: cherenkov::DEFAULT_REFRESH,
+            }
+        }
+
+        /// Lets the host's content show through transparent pixels: the
+        /// bottom plane blends premultiplied instead of being opaque.
+        #[must_use]
+        pub const fn transparent(mut self, transparent: bool) -> Self {
+            self.transparent = transparent;
+            self
+        }
+
+        /// Sets the refresh range for backend animation and presentation
+        /// retries.
+        ///
+        /// # Panics
+        /// When the range is empty or includes zero.
+        #[must_use]
+        pub fn rate(mut self, rate: cherenkov::RefreshRange) -> Self {
+            assert!(
+                *rate.start() > 0 && !rate.is_empty(),
+                "refresh range must be positive and ordered"
+            );
+            self.refresh = rate;
+            self
+        }
+
+        /// The size the planes are allocated at.
+        #[must_use]
+        pub const fn size(&self) -> (u32, u32) {
+            self.size
+        }
+    }
+
+    impl From<SurfaceControlTarget> for crate::GpuTarget {
+        fn from(target: SurfaceControlTarget) -> Self {
+            Self::SurfaceControl(target)
+        }
+    }
 }
 
 /// Apple interop: importing Metal resources onto the shared device.

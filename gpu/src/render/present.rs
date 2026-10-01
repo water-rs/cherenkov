@@ -681,13 +681,7 @@ impl Presenter {
             min_filter: wgpu::FilterMode::Nearest,
             ..wgpu::SamplerDescriptor::default()
         });
-        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("present uniform"),
-            size: 16,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        crate::diag::create(device, "present uniform", 16);
+        let uniform = Self::uniform(device);
         Self {
             module,
             layout,
@@ -812,16 +806,41 @@ impl Presenter {
         output: TextureOutput<'_>,
         timestamps: Option<wgpu::RenderPassTimestampWrites<'_>>,
     ) {
-        let TextureOutput {
-            texture: target,
-            color,
-            alpha,
-            headroom,
-        } = output;
-        let format = target.format();
+        queue.write_buffer(&self.uniform, 0, &Self::uniform_bytes(&output));
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("present"),
+        });
+        let uniform = self.uniform.clone();
+        self.encode(device, &mut encoder, source, output, &uniform, timestamps);
+        queue.submit([encoder.finish()]);
+        crate::diag::submit(device, queue, "present");
+    }
+
+    /// A 16-byte uniform buffer for [`Self::encode`], written with
+    /// [`Self::uniform_bytes`] before the submission that reads it. Several
+    /// blits in one submission each need their own.
+    #[must_use]
+    pub(crate) fn uniform(device: &wgpu::Device) -> wgpu::Buffer {
+        crate::diag::create(device, "present uniform", 16);
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("present uniform"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+    }
+
+    /// The uniform contents a blit into `output` reads: `{ encode, alpha,
+    /// headroom, pad }`, see `Present` in `present.wgsl`.
+    ///
+    /// # Panics
+    /// If linear Display P3 output is requested for an sRGB texture format.
+    #[must_use]
+    pub(crate) fn uniform_bytes(output: &TextureOutput<'_>) -> [u8; 16] {
+        let format = output.texture.format();
         assert!(
             !matches!(
-                color,
+                output.color,
                 OutputColor::LinearDisplayP3
                     | OutputColor::ExtendedSrgbLinear
                     | OutputColor::ExtendedSrgb
@@ -829,11 +848,10 @@ impl Presenter {
             ) || !format.is_srgb(),
             "extended output requires a non-sRGB texture format"
         );
-        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
         // The `present.wgsl` `encode` codes: 0/1 sRGB SDR (hw/sw),
         // 2 linear P3, 3/4 Display P3 SDR (sw/hw), 5 scRGB linear,
         // 6 extended sRGB, 7 extended P3, 8 PQ, 9 HLG.
-        let encode: u32 = match color {
+        let encode: u32 = match output.color {
             OutputColor::Srgb => u32::from(!format.is_srgb()),
             OutputColor::LinearDisplayP3 => 2,
             OutputColor::DisplayP3 => 3 + u32::from(format.is_srgb()),
@@ -843,14 +861,14 @@ impl Presenter {
             OutputColor::Bt2100Pq => 8,
             OutputColor::Bt2100Hlg => 9,
         };
-        let alpha: u32 = match alpha {
+        let alpha: u32 = match output.alpha {
             OutputAlpha::Opaque => 0,
             OutputAlpha::Premultiplied => 1,
             OutputAlpha::Straight => 2,
         };
         // The effective headroom: the display's, clamped to what this
         // destination's transfer encodes (#98).
-        let ceiling = match color {
+        let ceiling = match output.color {
             OutputColor::Srgb | OutputColor::DisplayP3 => 1.0,
             OutputColor::Bt2100Pq => PQ_HEADROOM,
             OutputColor::Bt2100Hlg => HLG_HEADROOM,
@@ -859,18 +877,32 @@ impl Presenter {
             | OutputColor::ExtendedSrgb
             | OutputColor::ExtendedDisplayP3 => f32::MAX,
         };
-        let headroom = headroom.max(0.0).min(ceiling);
-        queue.write_buffer(
-            &self.uniform,
-            0,
-            &[
-                encode.to_ne_bytes(),
-                alpha.to_ne_bytes(),
-                headroom.to_bits().to_ne_bytes(),
-                [0; 4],
-            ]
-            .concat(),
-        );
+        let headroom = output.headroom.max(0.0).min(ceiling);
+        let mut bytes = [0; 16];
+        bytes[0..4].copy_from_slice(&encode.to_ne_bytes());
+        bytes[4..8].copy_from_slice(&alpha.to_ne_bytes());
+        bytes[8..12].copy_from_slice(&headroom.to_bits().to_ne_bytes());
+        bytes
+    }
+
+    /// Records the blit of `source` into `output.texture` into `encoder`,
+    /// reading `uniform`, whose contents the caller wrote with
+    /// [`Self::uniform_bytes`] for this output.
+    ///
+    /// # Panics
+    /// If the textures violate wgpu's attachment and sampling requirements.
+    pub(crate) fn encode(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        source: &wgpu::TextureView,
+        output: TextureOutput<'_>,
+        uniform: &wgpu::Buffer,
+        timestamps: Option<wgpu::RenderPassTimestampWrites<'_>>,
+    ) {
+        let target = output.texture;
+        let format = target.format();
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
         let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("present"),
             layout: &self.layout,
@@ -885,36 +917,29 @@ impl Presenter {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: self.uniform.as_entire_binding(),
+                    resource: uniform.as_entire_binding(),
                 },
             ],
         });
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("present"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: timestamps,
+            occlusion_query_set: None,
+            multiview_mask: None,
         });
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("present"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: timestamps,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(self.pipeline(device, format));
-            pass.set_bind_group(0, &bind, &[]);
-            pass.draw(0..3, 0..1);
-        }
-        queue.submit([encoder.finish()]);
-        crate::diag::submit(device, queue, "present");
+        pass.set_pipeline(self.pipeline(device, format));
+        pass.set_bind_group(0, &bind, &[]);
+        pass.draw(0..3, 0..1);
     }
 }
 

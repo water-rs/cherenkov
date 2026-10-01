@@ -209,6 +209,9 @@ pub struct Release {
     pub aspects: vk::ImageAspectFlags,
     /// The producer lease, dropped after every object built on it.
     pub lease: Lease,
+    /// Release fences of the system compositor planes that showed the
+    /// frame, merged into the producer's release fence (#90).
+    pub plane_fences: Vec<OwnedFd>,
 }
 
 impl Release {
@@ -270,12 +273,14 @@ impl Release {
 
     /// Exports the `SYNC_FD` fence into the cell `release_fd` reads. Runs
     /// at submit-acceptance — the semaphore's signal is still pending —
-    /// before the completion callback destroys the semaphore.
+    /// before the completion callback destroys the semaphore. On Android
+    /// the system compositor's plane release fences are merged in, so the
+    /// producer reuses the buffer only once every reader has let go.
     ///
     /// # Panics
     /// On a poisoned export cell.
-    pub fn export_fence(&self, shared: &Shared) {
-        let (Some(semaphore), Some(cell)) = (self.fence_semaphore, self.fence_fd.as_ref()) else {
+    pub fn export_fence(&mut self, shared: &Shared) {
+        let (Some(semaphore), Some(cell)) = (self.fence_semaphore, self.fence_fd.clone()) else {
             return;
         };
         let result = unsafe {
@@ -290,11 +295,18 @@ impl Release {
                         .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD),
                 )
         };
-        *cell.lock().expect("fence fd cell") = match result {
+        let exported = match result {
             // SAFETY: `get_semaphore_fd` returned a new fd owned by the caller.
-            Ok(fd) => FenceFd::Ready(unsafe { OwnedFd::from_raw_fd(fd) }),
+            Ok(fd) => {
+                let fence = unsafe { OwnedFd::from_raw_fd(fd) };
+                FenceFd::Ready(merge_plane_fences(
+                    std::mem::take(&mut self.plane_fences),
+                    fence,
+                ))
+            }
             Err(err) => FenceFd::Failed(err.as_raw()),
         };
+        *cell.lock().expect("fence fd cell") = exported;
     }
 
     /// Destroys the objects in dependency order. Runs once the release
@@ -340,6 +352,23 @@ impl Release {
         }
         // The producer lease drops after every Vulkan object built on it.
         drop(self.lease);
+    }
+}
+
+/// Merges system-compositor plane release fences into the producer's
+/// exported fence. On other platforms a plane list is never filled.
+fn merge_plane_fences(planes: Vec<OwnedFd>, fence: OwnedFd) -> OwnedFd {
+    #[cfg(not(target_os = "android"))]
+    {
+        drop(planes);
+        fence
+    }
+    #[cfg(target_os = "android")]
+    {
+        use std::os::fd::AsFd as _;
+        planes.into_iter().fold(fence, |merged, plane| {
+            ndk::sync::sync_merge(c"cherenkov release", merged.as_fd(), plane.as_fd())
+        })
     }
 }
 
@@ -404,6 +433,39 @@ pub struct Generation {
     pub leases: std::sync::atomic::AtomicUsize,
     /// The destroy-time object set, moved out at retirement.
     pub parts: std::sync::Mutex<Option<Release>>,
+    /// What a system compositor plane needs to show the buffer directly;
+    /// `None` for sources a plane cannot take.
+    #[cfg(target_os = "android")]
+    pub plane: Option<PlaneSource>,
+    /// Release fences delivered by the planes that showed this frame, moved
+    /// into the release at retirement.
+    pub plane_fences: std::sync::Mutex<Vec<OwnedFd>>,
+}
+
+/// An Android buffer as a system compositor plane takes it (#90).
+#[cfg(target_os = "android")]
+pub struct PlaneSource {
+    /// The buffer, kept alive by the generation's producer lease.
+    pub buffer: std::ptr::NonNull<ndk_sys::AHardwareBuffer>,
+    /// The fence the plane's transaction hands the system compositor.
+    pub acquire: PlaneAcquire,
+    /// Whether the buffer was allocated for hardware overlays
+    /// (`AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY`); without it the system
+    /// composites the plane on its GPU, which saves nothing.
+    pub overlay: bool,
+    /// Static HDR metadata for the system's tone mapping.
+    pub hdr: crate::interop::HdrMetadata,
+}
+
+/// How a plane orders its read behind the producer.
+#[cfg(target_os = "android")]
+pub enum PlaneAcquire {
+    /// The producer's work is complete at import.
+    Ready,
+    /// A sync fence; each transaction receives a duplicate.
+    Fence(OwnedFd),
+    /// A Vulkan semaphore payload no system compositor can wait on.
+    Semaphore,
 }
 
 impl Generation {
@@ -595,6 +657,16 @@ impl Generation {
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 
+    /// Records the fence a system compositor plane releases this frame's
+    /// buffer on; the producer's release fence merges it. Deliver it before
+    /// the plane's lease ends.
+    ///
+    /// # Panics
+    /// On a poisoned plane-fence mutex.
+    pub fn add_plane_release(&self, fence: OwnedFd) {
+        self.plane_fences.lock().expect("plane fences").push(fence);
+    }
+
     /// Drops one engine-side reference; the last one retires the frame.
     pub fn unlease(&self) {
         if self
@@ -625,6 +697,8 @@ impl Generation {
             release.sync_payload = self.release_sync.lock().expect("release sync").take();
             release.fence_semaphore = self.fence_semaphore.lock().expect("fence semaphore").take();
             release.fence_fd.clone_from(&self.fence_fd);
+            release.plane_fences =
+                std::mem::take(&mut *self.plane_fences.lock().expect("plane fences"));
             release.submitted_flag = Some(Arc::clone(&self.release_submitted));
             release.state = Some(Arc::clone(&self.state));
             for (_, set) in self.sets.lock().expect("frame sets").drain() {
@@ -650,9 +724,10 @@ impl Drop for Generation {
 
 impl Generation {
     /// Takes the `FenceFd` release payload the release path exported at
-    /// submit-acceptance. The returned fd signals when the release
-    /// submission's pending signal executes on the GPU; exactly one caller
-    /// can take it.
+    /// submit-acceptance. The returned fd signals when the producer may
+    /// reuse the buffer: the release submission's pending signal has
+    /// executed, and every system compositor plane that showed the frame
+    /// has released it. Exactly one caller can take it.
     ///
     /// # Errors
     /// [`NativeError::Unready`] before the release submission is accepted;
@@ -687,6 +762,43 @@ impl Generation {
         };
         drop(cell);
         result
+    }
+}
+
+/// Imports a sync fence into a new binary semaphore, temporarily. A
+/// successful import hands the descriptor to the driver; on failure it
+/// closes with `fd`.
+///
+/// # Errors
+/// [`NativeError::Unsupported`] when sync-fd import is absent;
+/// [`NativeError`] from semaphore creation or the driver's import.
+#[cfg(target_os = "android")]
+pub fn import_sync_fd(shared: &Shared, fd: OwnedFd) -> Result<vk::Semaphore, NativeError> {
+    let Some(loader) = shared.vk.external_semaphore_fd.as_ref() else {
+        return Err(NativeError::Unsupported("SYNC_FD semaphore import"));
+    };
+    let dev = &shared.vk.device;
+    // The imported handle type must be declared at creation
+    // (VUID-VkImportSemaphoreFdInfoKHR-handleType-01133).
+    let mut export = vk::ExportSemaphoreCreateInfo::default()
+        .handle_types(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+    let info = vk::SemaphoreCreateInfo::default().push_next(&mut export);
+    let semaphore = unsafe { dev.create_semaphore(&info, None) }.map_err(NativeError::from)?;
+    let info = vk::ImportSemaphoreFdInfoKHR::default()
+        .semaphore(semaphore)
+        .flags(vk::SemaphoreImportFlags::TEMPORARY)
+        .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD)
+        .fd(fd.as_raw_fd());
+    match unsafe { loader.import_semaphore_fd(&info) } {
+        Ok(()) => {
+            // The driver owns the descriptor now.
+            let _ = fd.into_raw_fd();
+            Ok(semaphore)
+        }
+        Err(err) => {
+            unsafe { dev.destroy_semaphore(semaphore, None) };
+            Err(err.into())
+        }
     }
 }
 

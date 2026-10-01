@@ -123,7 +123,7 @@ impl Level {
     /// and children.
     #[must_use]
     #[cfg_attr(
-        not(test),
+        not(any(test, target_os = "android")),
         expect(
             dead_code,
             reason = "a flattened placement, for realizations without nested layers"
@@ -152,7 +152,7 @@ impl Placement {
     /// transform.
     #[must_use]
     #[cfg_attr(
-        not(test),
+        not(any(test, target_os = "android")),
         expect(
             dead_code,
             reason = "a flattened placement, for realizations without nested layers"
@@ -379,7 +379,7 @@ fn paint_order(tree: &SurfaceTree) -> Vec<Visit> {
 /// The content a plane shows.
 #[derive(Debug)]
 #[cfg_attr(
-    not(target_vendor = "apple"),
+    not(any(target_vendor = "apple", target_os = "android")),
     expect(
         dead_code,
         reason = "read by the platform realizations of `SystemPlanes`"
@@ -399,7 +399,7 @@ pub enum PlaneContent<'a> {
 /// One promoted plane of a [`Composition`].
 #[derive(Debug)]
 #[cfg_attr(
-    not(target_vendor = "apple"),
+    not(any(target_vendor = "apple", target_os = "android")),
     expect(
         dead_code,
         reason = "read by the platform realizations of `SystemPlanes`"
@@ -416,7 +416,7 @@ pub struct Plane<'a> {
 /// the surface size.
 #[derive(Debug)]
 #[cfg_attr(
-    not(target_vendor = "apple"),
+    not(any(target_vendor = "apple", target_os = "android")),
     expect(
         dead_code,
         reason = "read by the platform realizations of `SystemPlanes`"
@@ -432,7 +432,7 @@ pub struct Part<'a> {
 /// part above the last plane. Without promoted planes there is exactly one
 /// part, the whole surface.
 #[cfg_attr(
-    not(target_vendor = "apple"),
+    not(any(target_vendor = "apple", target_os = "android")),
     expect(
         dead_code,
         reason = "read by the platform realizations of `SystemPlanes`"
@@ -483,20 +483,23 @@ pub trait SystemPlanes: Compositor {
 #[cfg(target_vendor = "apple")]
 pub mod apple;
 
-/// The realization on this platform.
+/// The realization on this platform: Core Animation layer planes.
 #[cfg(target_vendor = "apple")]
 pub type Platform = apple::LayerPlanes;
+/// The realization on this platform: child surface controls on Android.
+#[cfg(target_os = "android")]
+pub type Platform = super::surface_control::planes::Planes;
 /// The realization on this platform.
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(not(any(target_vendor = "apple", target_os = "android")))]
 pub type Platform = NoPlanes;
 
 /// Stands in for [`SystemPlanes`] on platforms without a realization yet:
 /// no value exists, so a surface there never has planes.
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(not(any(target_vendor = "apple", target_os = "android")))]
 #[derive(Debug)]
 pub enum NoPlanes {}
 
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(not(any(target_vendor = "apple", target_os = "android")))]
 impl Compositor for NoPlanes {
     const BUDGET: usize = 0;
     fn expresses_transform(_: Affine) -> bool {
@@ -510,7 +513,7 @@ impl Compositor for NoPlanes {
     }
 }
 
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(not(any(target_vendor = "apple", target_os = "android")))]
 impl SystemPlanes for NoPlanes {
     fn compose(&mut self, _: Composition<'_>) -> Result<bool, RenderError> {
         unreachable!("no `NoPlanes` value exists")

@@ -19,6 +19,7 @@ mod projective;
 mod raster;
 pub mod shaders;
 mod shadow;
+pub mod surface_control;
 mod upload;
 
 use cherenkov::Instant;
@@ -493,7 +494,7 @@ pub struct GpuRenderer {
     /// system-compositor parent. Platform objects stay on the render
     /// thread, outside the surface states lowering moves to its workers.
     #[cfg_attr(
-        not(target_vendor = "apple"),
+        not(any(target_vendor = "apple", target_os = "android")),
         expect(
             clippy::zero_sized_map_values,
             reason = "no plane realization exists on this platform, so the map stays empty"
@@ -557,9 +558,10 @@ pub struct GpuRenderer {
     #[cfg(all(unix, not(target_vendor = "apple")))]
     native: Option<external::vulkan::Native>,
     /// Serializes "stage queue waits → submit" so an unrelated submission
-    /// cannot consume a staged producer semaphore wait (#166).
+    /// cannot consume a staged producer semaphore wait (#166); shared with
+    /// the plane realizations, which submit with their own waits.
     #[cfg(all(unix, not(target_vendor = "apple")))]
-    submit_lock: std::sync::Mutex<()>,
+    submit_lock: std::sync::Arc<std::sync::Mutex<()>>,
     surfaces: FxHashMap<SurfaceId, SurfaceState>,
     fonts: FxHashMap<u64, FontData>,
     /// Registered images.
@@ -1627,7 +1629,7 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             adapter,
             presenter: None,
             #[cfg_attr(
-                not(target_vendor = "apple"),
+                not(any(target_vendor = "apple", target_os = "android")),
                 expect(
                     clippy::zero_sized_map_values,
                     reason = "no plane realization exists on this platform, so the map stays empty"
@@ -1659,7 +1661,7 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             #[cfg(all(unix, not(target_vendor = "apple")))]
             native,
             #[cfg(all(unix, not(target_vendor = "apple")))]
-            submit_lock: std::sync::Mutex::new(()),
+            submit_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             bound_atlas: 0,
             bound_instance_size: 272 * 16,
             bound_stop_size: 32 * 16,
@@ -1859,7 +1861,7 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
         adapter,
         presenter: None,
         #[cfg_attr(
-            not(target_vendor = "apple"),
+            not(any(target_vendor = "apple", target_os = "android")),
             expect(
                 clippy::zero_sized_map_values,
                 reason = "no plane realization exists on this platform, so the map stays empty"
@@ -1962,6 +1964,8 @@ impl Renderer for GpuRenderer {
             GpuTarget::Offscreen(offscreen) => offscreen.size,
             GpuTarget::Window(window) => window.size,
             GpuTarget::Texture(texture) => texture.size,
+            #[cfg(target_os = "android")]
+            GpuTarget::SurfaceControl(target) => target.size(),
         };
         if size.0 == 0 || size.1 == 0 {
             return Err(SurfaceError::ZeroSize);
@@ -1976,6 +1980,10 @@ impl Renderer for GpuRenderer {
         let (window, textures, refresh, presents) = match target {
             GpuTarget::Offscreen(offscreen) => (None, None, offscreen.refresh, false),
             GpuTarget::Texture(texture) => (None, Some(texture.textures), texture.refresh, false),
+            #[cfg(target_os = "android")]
+            GpuTarget::SurfaceControl(target) => {
+                (None, None, self.surface_control(id, target)?, true)
+            }
             GpuTarget::Window(window) => {
                 let refresh = window.refresh.clone();
                 (self.open_window(id, window, size)?, None, refresh, true)
@@ -2899,6 +2907,30 @@ impl Renderer for GpuRenderer {
 }
 
 impl GpuRenderer {
+    /// Realizes surface `id` under a `SurfaceControlTarget`'s parent and
+    /// returns its refresh range.
+    #[cfg(target_os = "android")]
+    fn surface_control(
+        &mut self,
+        id: SurfaceId,
+        target: crate::interop::android::SurfaceControlTarget,
+    ) -> Result<cherenkov::RefreshRange, SurfaceError> {
+        let native = self.native.as_ref().ok_or_else(|| {
+            SurfaceError::UnsupportedTarget(
+                "surface control: the device has no Vulkan external-memory support".into(),
+            )
+        })?;
+        let system = surface_control::planes::Planes::new(
+            native.shared.clone(),
+            std::sync::Arc::clone(&self.submit_lock),
+            &target,
+        )?;
+        self.planes.insert(id, system);
+        self.presenter
+            .get_or_insert_with(|| present::Presenter::new(&self.device, self.shader_delivery));
+        Ok(target.refresh)
+    }
+
     #[cfg(target_arch = "wasm32")]
     #[expect(
         clippy::future_not_send,
@@ -6162,8 +6194,8 @@ impl GpuRenderer {
                 // — and destruction runs when the queue reports the
                 // submission complete — never a CPU wait.
                 let shared = native.shared.clone();
-                let releases = std::mem::take(&mut native.releases);
-                for release in &releases {
+                let mut releases = std::mem::take(&mut native.releases);
+                for release in &mut releases {
                     release.export_fence(&shared);
                     if let Some(flag) = &release.submitted_flag {
                         flag.store(true, std::sync::atomic::Ordering::Release);
@@ -6322,7 +6354,7 @@ impl GpuRenderer {
     #[cfg(all(unix, not(target_vendor = "apple")))]
     fn flush_native_releases(&mut self) -> Option<wgpu::SubmissionIndex> {
         let native = self.native.as_mut()?;
-        let releases = external::vulkan::drain_releases(native);
+        let mut releases = external::vulkan::drain_releases(native);
         if releases.is_empty() {
             return None;
         }
@@ -6352,7 +6384,7 @@ impl GpuRenderer {
             self.queue.submit([encoder.finish()])
         };
         let shared = native.shared.clone();
-        for release in &releases {
+        for release in &mut releases {
             // Same ordering as the frame submit path: export while the
             // release signal is still pending, before destruction.
             release.export_fence(&shared);

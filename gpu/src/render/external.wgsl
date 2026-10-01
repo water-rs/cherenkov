@@ -71,11 +71,10 @@ fn ext_decode(c: vec3<f32>, transfer: u32) -> vec3<f32> {
             return srgb_decode(c);
         }
         case EXT_T_709: {
-            // BT.601/BT.709 OETF inverse: scene-linear tristimulus.
-            let lo = c / 4.5;
-            let hi = pow(max(c, vec3<f32>(0.0)) * 0.90991810737 + vec3<f32>(0.09008189263),
-                         vec3<f32>(1.0 / 0.45));
-            return select(hi, lo, c < vec3<f32>(0.081));
+            // BT.1886 reference EOTF — a pure 2.4 power, black level 0:
+            // display-referred light with reference white at 1.0. A display
+            // presents BT.709-encoded video through this curve.
+            return pow(max(c, vec3<f32>(0.0)), vec3<f32>(2.4));
         }
         case EXT_T_PQ: {
             // ST 2084 EOTF^-1; the signal domain is [0,1] of 10000 nits.
@@ -139,6 +138,9 @@ fn fs_external(in: VsOut) -> @location(0) vec4<f32> {
     cov *= clip_mask_coverage(in);
     cov = clamp(cov, 0.0, 1.0) * in.params.y;
 
+    // `in.local` is centred on the quad, which spans the frame's pixels:
+    // the frame's pixel coordinate is offset by half its size.
+    let px = in.local + params.dims.xy * 0.5;
     var color: vec4<f32>;
     switch params.info.x {
         case KIND_EXT_NV12, KIND_EXT_P010: {
@@ -146,17 +148,20 @@ fn fs_external(in: VsOut) -> @location(0) vec4<f32> {
             // offset subsampled coordinate: chroma texel j centres at
             // frame position 2j + 0.5 + s, so texel space is
             // `p / 2 + 0.25 - s / 2`.
-            let y4 = ext_texel_u32(ext_y, in.local, params.dims.xy);
+            let y4 = ext_texel_u32(ext_y, px, params.dims.xy);
             let c4 = ext_texel_u32(ext_uv,
-                in.local * 0.5 + vec2<f32>(0.25) - params.site.xy * 0.5,
+                px * 0.5 + vec2<f32>(0.25) - params.site.xy * 0.5,
                 params.dims.zw);
+            // P010 keeps the 10-bit code in the high bits of a 16-bit
+            // word: the read value is the code times 64, and `norm`
+            // expects the code.
             var shift = 1.0;
             if (params.info.w & EXT_FLAG_SHIFT6) != 0u {
                 shift = 64.0;
             }
-            let yn = f32(y4.x) * shift * params.norm.x + params.norm.y;
-            let cbn = f32(c4.x) * shift * params.norm.z + params.norm.w;
-            let crn = f32(c4.y) * shift * params.norm.z + params.norm.w;
+            let yn = f32(y4.x) / shift * params.norm.x + params.norm.y;
+            let cbn = f32(c4.x) / shift * params.norm.z + params.norm.w;
+            let crn = f32(c4.y) / shift * params.norm.z + params.norm.w;
             let encoded = mat3x3<f32>(params.yuv0.xyz, params.yuv1.xyz,
                                       params.yuv2.xyz) * vec3<f32>(yn, cbn, crn);
             let lin = ext_decode(encoded, params.info.y);
@@ -166,7 +171,7 @@ fn fs_external(in: VsOut) -> @location(0) vec4<f32> {
         }
         default: {
             // KIND_EXT_RGB.
-            var c = ext_texel_f32(ext_rgb, in.local, params.dims.xy);
+            var c = ext_texel_f32(ext_rgb, px, params.dims.xy);
             let alpha = select(c.a, 1.0, params.info.z == EXT_ALPHA_OPAQUE);
             var lin = ext_decode(c.rgb, params.info.y);
             lin = ext_hlg(lin);

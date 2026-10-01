@@ -1797,6 +1797,7 @@ impl Engine for Cherenkov {
                 "cherenkov: submit before prepare".into(),
             ));
         }
+        let render_at = std::time::Instant::now();
         self.timings.render_frame(
             &self.engine,
             &mut self.clock,
@@ -1805,6 +1806,8 @@ impl Engine for Cherenkov {
             render_error,
         )?;
         let stats = self.engine.stats();
+        let render_seconds = render_at.elapsed().as_secs_f64();
+        let readback_at = std::time::Instant::now();
         let image = if !readback {
             None
         } else if let Some(present) = self.present.as_deref_mut() {
@@ -1834,6 +1837,8 @@ impl Engine for Cherenkov {
                 stamp: phases.stamp_seconds,
                 wait: phases.wait_seconds,
             }),
+            render_seconds: Some(render_seconds),
+            readback_seconds: readback.then(|| readback_at.elapsed().as_secs_f64()),
         })
     }
 

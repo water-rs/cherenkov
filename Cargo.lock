@@ -462,6 +462,7 @@ dependencies = [
  "fontique",
  "half",
  "kurbo",
+ "libm",
  "parley",
  "png",
  "read-fonts 0.44.0",

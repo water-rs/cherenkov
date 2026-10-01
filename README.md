@@ -14,6 +14,12 @@ The CPU side is data-parallel and SIMD-vectorised, and covered by microbenchmark
 
 ## Status
 
+The scene corpus (`scenes/corpus`), perf scenes (`scenes/perf`) and
+fonts (`scenes/fonts`) are generated, not committed:
+`python3 scenes/tools/generate.py` produces the whole tree
+(`python3 -m pip install -r scenes/fonts/tools/requirements.txt`
+first).
+
 The project is in the design phase and there is nothing to use yet. The public API is designed first, followed by a cross-engine correctness and performance suite that measures Cherenkov against Skia and Vello.
 
 ## License

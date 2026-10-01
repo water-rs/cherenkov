@@ -1,5 +1,9 @@
 //! `cherenkov-bench`: cross-engine correctness and performance runner.
 //!
+//! The corpora (`scenes/corpus`, `scenes/perf`) and fonts
+//! (`scenes/fonts`) are generated, not committed — run
+//! `python3 scenes/tools/generate.py` first.
+//!
 //! - `render --engine E --scene DIR --out FILE` renders one scene against
 //!   the oracle and writes the engine's image, an error heatmap and a
 //!   metrics JSON. `--corpus DIR --out-dir DIR` sweeps a corpus.

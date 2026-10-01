@@ -765,3 +765,70 @@ changing a live shadow patches its command, while unrelated commands are reused.
 Existing analytic rounded-box shadows keep their established arithmetic. General
 captures include a six-sigma halo and are bounded by backend address/texture limits;
 an unrepresentable capture is an error, never an alternate rendering path.
+
+### Vulkan external frames (#166)
+
+`interop::vulkan` imports producer frames — a dmabuf or an Android
+`AHardwareBuffer` — as NV12/P010 plane pairs or single RGB planes on the
+engine's shared `VkDevice` and queue, zero-copy, synchronised on the GPU.
+
+- **`Device::new(&SharedDevice)`** opens the native context for the engine's
+  device and reports `Caps` — the capability record every fd, modifier,
+  conversion and foreign-family claim is checked against. Missing
+  capabilities are `NativeError::Unsupported`, never an emulation.
+- **`Device::import(FrameSource)`** takes a `DmaBuf`/`Ahb` descriptor with
+  `Wait` and `ReleaseSync` contracts and returns a `Frame`.
+- **`Wait::{OpaqueFd, SyncFd, Timeline}`** names the producer fence. fd
+  payloads are consumed into a binary semaphore at first use: the engine
+  takes ownership of the fd (`vkImportSemaphoreFdKHR` takes it on success
+  for every handle type), and the consumer waits on the GPU. A timeline
+  payload carries the host's semaphore and wait point unchanged.
+- **`ReleaseSync::{FenceFd, Timeline}`** names what the engine signals when
+  the last retained owner retires. `FenceFd` exports a `SYNC_FD` once the
+  release submission is accepted — `Frame::release_fd` hands the fence to
+  the producer; before that it is `Unready`, after the frame is already
+  taken it is `Invalid`.
+- **`Frame::{size, repr, imported_bytes, lease, unlease, release_fd}`** is
+  the #165 retained-frame contract unchanged: the engine holds the frame
+  while any layer attachment references it.
+
+Wrap-time state (recorded for #2): `create_texture_from_hal` describes the
+wrapped image as `TextureUses::RESOURCE`, which maps to
+`SHADER_READ_ONLY_OPTIMAL`, while the driver's actual layout at wrap time is
+the producer's (`UNDEFINED`/`GENERAL`). No `TextureUses` combination maps to
+`GENERAL` without also adding storage or copy usage the image does not have,
+so naming the layout honestly would lie about the usage instead. The
+natively recorded acquire barrier lands the real `SHADER_READ_ONLY_OPTIMAL`
+transition before the first wgpu use in the same submission, so the tracked
+state is never observed wrong — the discrepancy is documented rather than
+hidden behind invented usage bits.
+
+`Caps::queue_family_foreign` is true on Android even when
+`VK_EXT_queue_family_foreign` is not enabled: `VK_QUEUE_FAMILY_FOREIGN_EXT`
+is defined by the platform's `AHardwareBuffer` contract itself and is usable
+there without the extension. Elsewhere it reports the enabled extension.
+
+Public surface kept for the standalone Android device-test binary (recorded
+here per the review on L4): `Native` and `Native::new`, `Native::staged`,
+`stage_acquire`/`cancel_staged`, `Generation` with `state()`/`lease_count()`,
+`State`, `PendingAcquire`/`PendingWait`, and `Frame::generation`. Everything
+else on the encode path — `Release`, `Lease`, `Views`, `submit_waits`,
+`mark_submitted`, `drain_releases`, `create_pool`, the framebuffer/set
+caches and `KIND_*` — is `pub(crate)`; the lavapipe suite moved into the
+crate for that reason.
+
+Threading decisions (recorded for #2, L5/L6):
+
+- The renderer itself still takes no locks. The mutexes on `Shared`,
+  `Generation` and `Native` cover producer/host-thread import racing the
+  render thread, staged acquire/replace on one engine, and the
+  `submit_lock` that serializes a staged queue wait into exactly one
+  `vkQueueSubmit`. `unsafe impl Send/Sync` on `Native` covers lease
+  pointers that travel only to the submission-completion callback, never
+  to another worker.
+- Two engines sharing one `SharedDevice` can interleave staged waits —
+  `submit_lock` is per renderer, which is the documented shape of the
+  retained-frame model (one engine per `SharedDevice`).
+- `Ahb` is `!Send` (a raw `AHardwareBuffer` pointer): an
+  `FrameSource::Ahb` descriptor is created and imported on the producer or
+  host thread, while the resulting `Frame` stays `Send`.

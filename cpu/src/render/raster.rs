@@ -178,7 +178,7 @@ impl Buffers {
 const SHADOW_N: usize = 16;
 
 /// A directed edge in device space.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Edge {
     /// Start point.
     pub x0: f32,
@@ -234,15 +234,11 @@ impl Accum {
         self.a
     }
 
-    /// Restricts the draw window to pixels `x0..x1` (already clamped to
-    /// `0..w`): deposits clamp into guard columns `x0..x1 + 1`, so a
-    /// draw only ever pays its own bounding box's width.
     pub fn set_window(&mut self, x0: usize, x1: usize) {
         self.cmin = x0;
         self.cmax = (x1 + 1).min(self.w + 1);
     }
 
-    /// Zeros the window's columns for band rows `y_lo..y_hi`.
     pub fn clear_range(&mut self, y_lo: usize, y_hi: usize) {
         for y in y_lo..y_hi.min(self.h) {
             let row = y * (self.w + 2);
@@ -1004,7 +1000,9 @@ fn run(
                 rule,
                 paint,
                 clip,
-            } => band.draw(acc, stack, edges, *bbox, *rule, paint, clip.as_ref()),
+            } => {
+                band.draw(acc, stack, edges, *bbox, *rule, paint, clip.as_ref());
+            }
             Item::PushIsolate { space } => stack.push(Plane {
                 buf: buffers.take_color(slice_len(band.w, bh)),
                 space: *space,

@@ -13,6 +13,7 @@ use cherenkov::{BlendMode, FillRule, FrameId, GlyphRun, GlyphStyle, ShapeData};
 
 use cherenkov::{LayerId, RenderError, SurfaceId, SurfaceTree};
 
+use super::coverage::{Operand, rasterize};
 use super::filter::{Erased, Registry};
 use super::prepared::Op;
 use crate::names;
@@ -547,8 +548,6 @@ pub fn resolve_edges(edges: Vec<Edge>, rule: FillRule) -> (Vec<Edge>, FillRule) 
     })
 }
 
-/// The bounding box of `edges` as an integer rect intersected with the
-/// surface.
 #[expect(
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
@@ -1050,7 +1049,20 @@ impl<'a, 'b> Lowering<'a, 'b> {
         let (path, rule) = shape_outline(shape, tol_u)?;
         let edges = flatten_edges(self.transform * path, FLATTEN_TOL);
         let (edges, rule) = resolve_edges(edges, rule);
-        let mut mask = coverage_mask(&edges, rule, w, h);
+        let sparse = rasterize(
+            &[Operand {
+                edges: edges.into(),
+                rule,
+            }],
+            w,
+            h,
+        );
+        let mut mask = Vec::with_capacity(w * h);
+        for y in 0..h {
+            for x in 0..w {
+                mask.push(sparse.at(x, y));
+            }
+        }
         if let Some(current) = &self.clip {
             for (i, m) in mask.iter_mut().enumerate() {
                 let (px, py) = (i % w, i / w);

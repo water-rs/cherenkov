@@ -1100,6 +1100,235 @@ fn map_body(l: &mut LayerBuilder, pw: f64, ph: f64) {
     }
 }
 
+/// The dense city-map frame of #211: a 1600×1200 Positron-style view —
+/// water along the west edge, parkland, a street grid crossed by
+/// diagonal avenues, building footprints and street labels — whose live
+/// coverage exceeds one atlas page.
+///
+/// Deterministic: the `Rng` stream is seeded, so the scene is identical
+/// on every run. Element and segment counts stay bounded because the
+/// oracle is O(segments × pixels); the wide diagonal avenues carry the
+/// coverage past the 4096² cap with few segments.
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "the suggested mul_add rewrites alter serialized float bytes; corpus scenes are pinned"
+)]
+#[expect(clippy::too_many_lines, reason = "the scene is a flat element list")]
+fn dense_map_body(l: &mut LayerBuilder, labels: &[Vec<GlyphRun>]) {
+    const W: f64 = 1600.0;
+    const H: f64 = 1200.0;
+    let mut rng = Rng(0x9D15_5EED_5EED_5EED);
+
+    let water = srgb(0.76, 0.86, 0.91);
+    let park_fill = srgb(0.76, 0.87, 0.70);
+    let facade = srgb(0.83, 0.81, 0.77);
+    let facade_line = srgb(0.66, 0.64, 0.60);
+    let road = srgb(0.99, 0.99, 0.98);
+    let alley = srgb(0.88, 0.88, 0.85);
+
+    let round = StrokeStyle {
+        start_cap: kurbo::Cap::Round,
+        end_cap: kurbo::Cap::Round,
+        ..StrokeStyle::default()
+    };
+
+    // Water: the west river, a wavy filled strip.
+    let mut river = BezPath::new();
+    river.move_to((0.0, 0.0));
+    for i in 0..=12u32 {
+        let y = f64::from(i) * (H / 12.0);
+        river.line_to((160.0 + rng.f64() * 80.0, y));
+    }
+    river.line_to((0.0, H));
+    river.close_path();
+    l.fill(Shape::Path { path: river }, solid(water));
+
+    // Parkland: an irregular green polygon mid-north.
+    let mut park = BezPath::new();
+    let park_corners = [
+        (620.0, 70.0),
+        (1140.0, 90.0),
+        (1160.0, 260.0),
+        (1100.0, 430.0),
+        (640.0, 410.0),
+        (600.0, 240.0),
+    ];
+    for (i, (px, py)) in park_corners.iter().enumerate() {
+        let (jx, jy) = (rng.f64() * 16.0 - 8.0, rng.f64() * 16.0 - 8.0);
+        if i == 0 {
+            park.move_to((px + jx, py + jy));
+        } else {
+            park.line_to((px + jx, py + jy));
+        }
+    }
+    park.close_path();
+    l.fill(Shape::Path { path: park }, solid(park_fill));
+
+    // Streets: horizontal lines with slight jitter, light carriageways.
+    for s in 0..15u32 {
+        let y = 130.0 + f64::from(s) * 70.0 + rng.f64() * 10.0;
+        let mut street = BezPath::new();
+        street.move_to((190.0, y));
+        for k in 1..4u32 {
+            street.line_to((190.0 + f64::from(k) * 460.0, y + rng.f64() * 12.0 - 6.0));
+        }
+        l.stroke(
+            Shape::Path { path: street },
+            StrokeStyle {
+                width: 2.5 + rng.f64() * 3.0,
+                ..round.clone()
+            },
+            solid(road),
+        );
+    }
+
+    // Avenues: verticals, wider than the streets.
+    for a in 0..12u32 {
+        let x = 230.0 + f64::from(a) * 112.0 + rng.f64() * 12.0;
+        let mut ave = BezPath::new();
+        ave.move_to((x, 20.0));
+        for k in 1..4u32 {
+            ave.line_to((x + rng.f64() * 16.0 - 8.0, 20.0 + f64::from(k) * 390.0));
+        }
+        l.stroke(
+            Shape::Path { path: ave },
+            StrokeStyle {
+                width: 5.0 + rng.f64() * 5.0,
+                ..round.clone()
+            },
+            solid(road),
+        );
+    }
+
+    // Diagonal avenues, in both directions.
+    for d in 0..8u32 {
+        let x0 = 200.0 + f64::from(d) * 160.0 + rng.f64() * 30.0;
+        let (w_run, rise) = (650.0 + rng.f64() * 350.0, 1050.0 + rng.f64() * 120.0);
+        let mut ave = BezPath::new();
+        ave.move_to((x0, H));
+        ave.line_to((x0 + w_run * 0.55, H - rise * 0.45 + rng.f64() * 40.0 - 20.0));
+        ave.line_to((x0 + w_run, H - rise));
+        l.stroke(
+            Shape::Path { path: ave },
+            StrokeStyle {
+                width: 8.0 + rng.f64() * 6.0,
+                ..round.clone()
+            },
+            solid(road),
+        );
+    }
+    for d in 0..4u32 {
+        let x0 = 260.0 + f64::from(d) * 280.0 + rng.f64() * 40.0;
+        let (w_run, rise) = (550.0 + rng.f64() * 300.0, 980.0 + rng.f64() * 140.0);
+        let mut ave = BezPath::new();
+        ave.move_to((x0 + w_run, H));
+        ave.line_to((x0 + w_run * 0.45, H - rise * 0.5 + rng.f64() * 40.0 - 20.0));
+        ave.line_to((x0, H - rise));
+        l.stroke(
+            Shape::Path { path: ave },
+            StrokeStyle {
+                width: 6.0 + rng.f64() * 5.0,
+                ..round.clone()
+            },
+            solid(road),
+        );
+    }
+
+    // Boulevards: long wide strokes sweeping across the frame at shallow
+    // angles, like the arterials a dense map style layers under the
+    // street grid. Their coverage is what pushes the frame past one
+    // atlas page: each strip cell spans hundreds of columns.
+    for _ in 0..32u32 {
+        let x0 = rng.f64() * W * 0.4;
+        let y0 = 80.0 + rng.f64() * (H - 160.0);
+        let run_x = 1200.0 + rng.f64() * 420.0;
+        let rise = run_x * (0.24 + rng.f64() * 0.24) * if rng.below(2) == 0 { 1.0 } else { -1.0 };
+        let mut exp = BezPath::new();
+        exp.move_to((x0 - rng.f64() * 300.0, y0));
+        exp.line_to((x0 + run_x * 0.5, y0 + rise * 0.5 + rng.f64() * 40.0 - 20.0));
+        exp.line_to((x0 + run_x, y0 + rise));
+        l.stroke(
+            Shape::Path { path: exp },
+            StrokeStyle {
+                width: 14.0 + rng.f64() * 10.0,
+                ..round.clone()
+            },
+            solid(road),
+        );
+    }
+
+    // Side streets: short connecting strokes inside the grid.
+    for _ in 0..120u32 {
+        let x = 250.0 + rng.f64() * 1260.0;
+        let y = 140.0 + rng.f64() * 1000.0;
+        let mut a = BezPath::new();
+        a.move_to((x, y));
+        a.line_to((x + rng.f64() * 400.0 - 200.0, y + rng.f64() * 200.0 - 100.0));
+        l.stroke(
+            Shape::Path { path: a },
+            StrokeStyle {
+                width: 2.5 + rng.f64() * 4.0,
+                ..round.clone()
+            },
+            solid(alley),
+        );
+    }
+
+    // Buildings: filled polygon footprints with thin stroked outlines,
+    // packed into the blocks the streets and avenues leave.
+    for s in 0..14u32 {
+        let by = 138.0 + f64::from(s) * 72.0;
+        for a in 0..10u32 {
+            let bx = 238.0 + f64::from(a) * 130.0;
+            for _ in 0..=rng.below(2) {
+                let bw = 8.0 + rng.f64() * 30.0;
+                let bh = 6.0 + rng.f64() * 20.0;
+                let bx0 = bx + rng.f64() * 40.0;
+                let by0 = by + rng.f64() * 18.0;
+                if bx0 + bw > 1520.0 || by0 + bh > 1140.0 {
+                    continue;
+                }
+                let sides = 4 + rng.below(3);
+                let mut b = BezPath::new();
+                for v in 0..sides {
+                    let px =
+                        bx0 + if v == 1 || v == 2 { bw } else { 0.0 } + (rng.f64() * 4.0 - 2.0);
+                    let py = by0 + if v < 2 { 0.0 } else { bh } + (rng.f64() * 4.0 - 2.0);
+                    if v == 0 {
+                        b.move_to((px, py));
+                    } else {
+                        b.line_to((px, py));
+                    }
+                }
+                b.close_path();
+                let shape = Shape::Path { path: b };
+                l.fill(shape.clone(), solid(facade));
+                l.stroke(
+                    shape,
+                    StrokeStyle {
+                        width: 0.8,
+                        ..round.clone()
+                    },
+                    solid(facade_line),
+                );
+            }
+        }
+    }
+
+    // Street and place labels, the text a map frame carries.
+    for (i, runs) in labels.iter().enumerate() {
+        let lx = (f64::from(u32::try_from(i).expect("labels fit u32")) * 137.0) % 1180.0
+            + 240.0
+            + rng.f64() * 60.0;
+        let ly = (f64::from(u32::try_from(i).expect("labels fit u32")) * 211.0) % 960.0
+            + 140.0
+            + rng.f64() * 40.0;
+        for run in runs {
+            l.glyphs(offset_run(run, lx, ly));
+        }
+    }
+}
+
 /// Shared background: saturated shapes and a diagonal gradient so the
 /// sampled backdrop is visibly different from a flat fill.
 fn backdrop_background(l: &mut LayerBuilder) {
@@ -5019,6 +5248,42 @@ fn run() -> Result<(), SceneError> {
         // Far corner: stays a separate region.
         member(l, [440.0, 428.0, 508.0, 508.0], None);
     });
+
+    // The #211 dense city map: a 1600×1200 frame whose live coverage
+    // exceeds one atlas page. Its output is generated — never committed.
+    {
+        const LABELS: &[&str] = &[
+            "1 AV",
+            "2 AV",
+            "LEXINGTON AV",
+            "PARK AV",
+            "5 AV",
+            "6 AV",
+            "7 AV",
+            "BROADWAY",
+            "W 14 ST",
+            "W 23 ST",
+            "W 34 ST",
+            "W 42 ST",
+            "W 57 ST",
+            "W 72 ST",
+            "HOUSTON ST",
+            "CANAL ST",
+        ];
+        let shaped: Vec<Vec<GlyphRun>> = LABELS
+            .iter()
+            .map(|t| ctx.shape("NotoSans.ttf", t, 12.0, FontWeight::NORMAL, &solid(dark)))
+            .collect();
+        let blobs = font_blobs(&ctx, &shaped.iter().map(Vec::as_slice).collect::<Vec<_>>());
+        corpus.scene_with_blobs(
+            "dense-map",
+            1600,
+            1200,
+            srgb(0.93, 0.94, 0.92),
+            |l| dense_map_body(l, &shaped),
+            blobs,
+        );
+    }
 
     // ---- Scenes committed before the generator covered them ----------
 

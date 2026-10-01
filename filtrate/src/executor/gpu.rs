@@ -11,6 +11,7 @@ use filtrate_core::{AuxFormat, AuxImage, Filter, ImageVisitor, ShapeInput, Worki
 use super::{
     entry::{self, ENTRY_POINT, binding},
     plan::{PassAux, PassPlan, Plan},
+    uniforms::UniformBuffers,
 };
 use crate::{
     aux_image::TextureImage,
@@ -30,16 +31,9 @@ pub(super) struct GpuPass {
     plan: PassPlan,
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
-    /// Uniform buffers, keyed by the exact words they hold: a queue write
-    /// lands before the encoder submits, so two encodes of one effect in a
-    /// frame must not share a buffer. The third member is the frame
-    /// sequence that last bound the entry: a miss may rewrite only a
-    /// buffer no encode of the current sequence has bound — an earlier
-    /// sequence's encoder is submitted before the next sequence encodes,
-    /// the same assumption a bare `write_buffer` made. Capped; a recorded
-    /// bind group keeps its buffer alive, so evicting the oldest entry is
-    /// safe.
-    pub(super) params: Vec<(Vec<u32>, wgpu::Buffer, u64)>,
+    /// The segment's uniform buffers, one per distinct block an encode of
+    /// the current frame bound (see [`UniformBuffers`]).
+    pub(super) params: UniformBuffers,
     uses_space: bool,
 }
 
@@ -303,7 +297,7 @@ impl Gpu {
         for (index, pass) in self.passes.iter_mut().enumerate() {
             let params = pass
                 .params_index(input.device, input.queue, values, size, sequence)
-                .map(|index| &pass.params[index].1);
+                .map(|index| pass.params.buffer(index));
 
             let bind_group = pass.bind_group(index, input, &self.shared, slots, slot_of, params)?;
 
@@ -408,13 +402,13 @@ impl GpuPass {
             plan,
             pipeline,
             layout,
-            params: Vec::new(),
+            params: UniformBuffers::new("filtrate pass parameters"),
             uses_space,
         })
     }
 
     /// Binds the pass's inputs for one frame. `params` is the uniform
-    /// buffer `params_buffer` selected for this encode.
+    /// buffer [`Self::params_index`] selected for this encode.
     fn bind_group(
         &self,
         index: usize,
@@ -473,10 +467,8 @@ impl GpuPass {
     }
 
     /// The uniform buffer holding this encode's `values` and `size` — the
-    /// `size` member of a spatial segment's block. Cached by exact words so
-    /// two encodes in one frame keep independent parameters (a queue write
-    /// would land before the encoder submits and leak into both passes).
-    /// `None` when the segment has no uniform block.
+    /// `size` member of a spatial segment's block — as an index into
+    /// [`Self::params`]. `None` when the segment has no uniform block.
     #[expect(
         clippy::cast_precision_loss,
         reason = "image extents fit f32 exactly (well below 2^24 pixels)"
@@ -489,7 +481,6 @@ impl GpuPass {
         size: (u32, u32),
         sequence: u64,
     ) -> Option<usize> {
-        const MAX_PARAM_BUFFERS: usize = 16;
         if self.plan.segment.uniform.size == 0 {
             return None;
         }
@@ -505,46 +496,7 @@ impl GpuPass {
                 words[first + component] = values[slot.param + component].to_bits();
             }
         }
-        if let Some(index) = self
-            .params
-            .iter()
-            .position(|(cached, _, _)| *cached == words)
-        {
-            self.params[index].2 = sequence;
-            return Some(index);
-        }
-        // A miss may rewrite a buffer no encode of this sequence has
-        // bound: the stalest one.
-        if let Some((index, _)) = self
-            .params
-            .iter()
-            .enumerate()
-            .filter(|(_, (_, _, last_used))| *last_used < sequence)
-            .min_by_key(|(_, (_, _, last_used))| *last_used)
-        {
-            let entry = &mut self.params[index];
-            queue.write_buffer(&entry.1, 0, bytemuck::cast_slice(&words));
-            entry.0 = words;
-            entry.2 = sequence;
-            return Some(index);
-        }
-        if self.params.len() == MAX_PARAM_BUFFERS {
-            self.params.remove(0);
-        }
-        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("filtrate pass parameters"),
-            size: u64::from(self.plan.segment.uniform.size),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: true,
-        });
-        buffer
-            .slice(..)
-            .get_mapped_range_mut()
-            .expect("buffer range is mapped and not overlapping")
-            .copy_from_slice(bytemuck::cast_slice(&words));
-        buffer.unmap();
-        self.params.push((words, buffer, sequence));
-        Some(self.params.len() - 1)
+        Some(self.params.select(device, queue, words, sequence))
     }
 }
 
@@ -731,7 +683,7 @@ fn check_bound_textures(
 }
 
 /// Whether `format` supports a filtering sampler under `features`.
-pub(super) fn filterable(format: wgpu::TextureFormat, features: wgpu::Features) -> bool {
+pub fn filterable(format: wgpu::TextureFormat, features: wgpu::Features) -> bool {
     format
         .guaranteed_format_features(features)
         .flags
@@ -756,7 +708,9 @@ async fn probe_intermediate_format(device: &wgpu::Device) -> Result<(), EffectSe
     })
 }
 
-fn sampler(device: &wgpu::Device, filter: wgpu::FilterMode) -> wgpu::Sampler {
+/// A clamp-to-edge sampler of the input with `filter` for magnification and
+/// minification.
+pub fn sampler(device: &wgpu::Device, filter: wgpu::FilterMode) -> wgpu::Sampler {
     device.create_sampler(&wgpu::SamplerDescriptor {
         label: Some("filtrate input sampler"),
         address_mode_u: wgpu::AddressMode::ClampToEdge,

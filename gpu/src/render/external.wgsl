@@ -71,11 +71,10 @@ fn ext_decode(c: vec3<f32>, transfer: u32) -> vec3<f32> {
             return srgb_decode(c);
         }
         case EXT_T_709: {
-            // BT.601/BT.709 OETF inverse: scene-linear tristimulus.
-            let lo = c / 4.5;
-            let hi = pow(max(c, vec3<f32>(0.0)) * 0.90991810737 + vec3<f32>(0.09008189263),
-                         vec3<f32>(1.0 / 0.45));
-            return select(hi, lo, c < vec3<f32>(0.081));
+            // BT.1886 reference EOTF — a pure 2.4 power, black level 0:
+            // display-referred light with reference white at 1.0. A display
+            // presents BT.709-encoded video through this curve.
+            return pow(max(c, vec3<f32>(0.0)), vec3<f32>(2.4));
         }
         case EXT_T_PQ: {
             // ST 2084 EOTF^-1; the signal domain is [0,1] of 10000 nits.

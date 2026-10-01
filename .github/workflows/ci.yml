@@ -63,6 +63,20 @@ jobs:
         if: runner.os == 'Windows'
         uses: tracel-ai/github-actions/install-dxc@295f2fdbae5271f4f8ad56d634e4ff6a95daafc8
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+        with:
+          path: scenes/fonts/_full
+          # The pin list lives in fetch-fonts.py, so the file is the key.
+          key: scenes-fonts-${{ hashFiles('scenes/fonts/tools/fetch-fonts.py') }}
+      # scenes/{fonts,corpus,perf} are generated, not committed; the
+      # workspace tests read them.
+      - name: Generate the scene tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v python3 >/dev/null 2>&1; then PY=python3; else PY=python; fi
+          "$PY" -m pip install -r scenes/fonts/tools/requirements.txt
+          "$PY" scenes/tools/generate.py
       - if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
@@ -149,6 +163,16 @@ jobs:
       # Vulkan loader and Mesa drivers.
       - name: Skia link dependencies
         run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev libfreetype-dev spirv-tools mesa-vulkan-drivers libvulkan1
+      - uses: actions/cache@v4
+        with:
+          path: scenes/fonts/_full
+          key: scenes-fonts-${{ hashFiles('scenes/fonts/tools/fetch-fonts.py') }}
+      # scenes/{fonts,corpus,perf} are generated, not committed; the
+      # corpus render below and the bench tests read them.
+      - name: Generate the scene tree
+        run: |
+          python3 -m pip install -r scenes/fonts/tools/requirements.txt
+          python3 scenes/tools/generate.py
       # The bench adapters are all feature-gated, so the default-feature
       # clippy in `check` never compiles them — lint them here, on the
       # dependency graph this job already warms.
@@ -201,6 +225,16 @@ jobs:
       # cherenkov-gpu's build script optimizes precompiled SPIR-V with
       # spirv-opt and checks it with spirv-val (issue #57).
       - run: brew install spirv-tools
+      - uses: actions/cache@v4
+        with:
+          path: scenes/fonts/_full
+          key: scenes-fonts-${{ hashFiles('scenes/fonts/tools/fetch-fonts.py') }}
+      # scenes/{fonts,corpus,perf} are generated, not committed; the
+      # corpus render and perf-scene measure below read them.
+      - name: Generate the scene tree
+        run: |
+          python3 -m pip install -r scenes/fonts/tools/requirements.txt
+          python3 scenes/tools/generate.py
       - name: Clippy / Metal adapter features
         run: |
           cargo clippy --locked -p cherenkov-bench --all-targets \

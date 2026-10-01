@@ -163,7 +163,7 @@ unsafe fn chroma_row8(channels: [Channel; 2], row: usize, frame: u64, chroma: [(
     // When the two components sit byte-adjacent at stride 2 (NV12,
     // however many lockPlanes entries describe it), one u16 write covers
     // the pair.
-    let (cb, cr) = (channels[0], channels[1]);
+    let [cb, cr] = channels;
     if cb.pixel_stride == 2
         && cr.pixel_stride == 2
         && cb.row_stride == cr.row_stride
@@ -180,7 +180,7 @@ unsafe fn chroma_row8(channels: [Channel; 2], row: usize, frame: u64, chroma: [(
         return;
     }
     for channel in channels {
-        let value = |pair: (u8, u8)| [pair.0, pair.1][channel.comp];
+        let value = |pair: (u8, u8)| <[u8; 2]>::from(pair)[channel.comp];
         unsafe {
             channel_run(channel, row, 0..CW / 2, value(runs.left));
             channel_run(channel, row, CW / 2..CW, value(runs.right));
@@ -243,7 +243,7 @@ fn strip_row10(frame: u64) -> Vec<u16> {
 fn interleave10(dst: &mut [u16], pair: (u16, u16)) {
     let (samples, _) = dst.as_chunks_mut::<2>();
     for sample in samples {
-        *sample = [pair.0, pair.1];
+        *sample = pair.into();
     }
 }
 

@@ -1447,7 +1447,7 @@ fn float_test_texels(count: u8) -> Vec<[f32; 4]> {
     (0..count)
         .map(|i| {
             let f = f32::from(i) / f32::from(count - 1);
-            [f * 4.0 - 1.0, 1.0 / (f + 1.0), f * f, 0.5 + f]
+            [f.mul_add(4.0, -1.0), 1.0 / (f + 1.0), f * f, 0.5 + f]
         })
         .collect()
 }

@@ -41,7 +41,6 @@ fn engine() -> Option<Engine<Gpu>> {
 }
 
 split_test! {
-#[expect(clippy::float_cmp, reason = "the clear colour is exact")]
 fn a_red_rect_renders_and_reads_back() -> Result<(), Box<dyn std::error::Error>> {
     let Some(engine) = wait!(engine()) else {
         return Ok(());
@@ -288,7 +287,7 @@ fn many_timed_frames(engine: &Engine<Gpu>) -> Result<(), Box<dyn std::error::Err
                 .map(|i| cherenkov::Glyph {
                     id: 1 + (u32::from(i) + frame) % 60,
                     x: f32::from(i % 10) * 24.0,
-                    y: 40.0 + f32::from(i / 10) * 50.0,
+                    y: f32::from(i / 10).mul_add(50.0, 40.0),
                     transform: None,
                 })
                 .collect::<Vec<_>>()
@@ -446,7 +445,6 @@ split_test! {
 /// Per-variant pipelines: a frame with shadow strips, a solid fill, a
 /// clipped gradient fill, and a glyph run must emit ranges for at least
 /// the Simple/Shadow/Full variants — while the pixels stay correct.
-#[expect(clippy::float_cmp, reason = "the solid fill centre is exactly red")]
 fn variants_split_ranges_but_not_pixels() -> Result<(), Box<dyn std::error::Error>> {
     let Some(engine) = wait!(engine()) else {
         return Ok(());

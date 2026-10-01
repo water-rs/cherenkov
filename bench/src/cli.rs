@@ -327,6 +327,18 @@ enum Sub {
         #[arg(long, value_name = "PHASE")]
         stop_after: Option<String>,
     },
+    /// Render projective scenes in the oracle with the specified model and
+    /// with two successively refined quality references, and report the
+    /// model's distance from the finest reference and the references'
+    /// convergence (#84). No engine — pure oracle `f64` math.
+    ProjectiveQuality {
+        /// Scene directories.
+        #[arg(long = "scene", required = true)]
+        scenes: Vec<PathBuf>,
+        /// Report text path; stdout when omitted.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// List compiled-in adapter keys.
     Engines,
 }
@@ -537,6 +549,9 @@ fn run(cli: Cli) -> Result<(), BenchError> {
             cycles,
             stop_after,
         } => creation_cmd(&out, cycles, stop_after.as_deref()),
+        Sub::ProjectiveQuality { scenes, out } => {
+            crate::projective_quality::run(&scenes, out.as_deref())
+        }
     }
 }
 

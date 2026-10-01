@@ -6,6 +6,7 @@
 //! through [`SurfaceFrame`](crate::SurfaceFrame).
 
 mod components;
+mod projective;
 
 use crate::Instant;
 use rustc_hash::FxHashMap;
@@ -33,6 +34,10 @@ pub const RATE_SLOW: RefreshRange = 30..=60;
 pub struct SurfaceTree {
     nodes: FxHashMap<u64, LayerNode>,
     root: LayerId,
+    /// Projective layers' state, by layer. Empty for an affine-only tree.
+    projective: FxHashMap<u64, projective::State>,
+    /// The last change stamp handed out; stamps only grow.
+    clock: u64,
 }
 
 /// One layer's sampled state for the current frame.
@@ -65,6 +70,12 @@ pub struct LayerNode {
     components: Option<Box<components::Components>>,
     opacity_track: Option<Track<f32>>,
     scroll_track: Option<Track<Vec2>>,
+    /// The stamp of the last change to what this layer draws in its own
+    /// space: clip, scroll offset, filter, backdrop, content, children.
+    inner_stamp: u64,
+    /// The stamp of the last change to how it composes into its parent:
+    /// transform, components, projection, opacity, blend.
+    outer_stamp: u64,
 }
 
 impl std::fmt::Debug for LayerNode {
@@ -83,6 +94,19 @@ impl std::fmt::Debug for LayerNode {
 }
 
 impl LayerNode {
+    /// Records a sampled change: `outer` for how the layer composes,
+    /// `inner` for what it draws in its own space.
+    const fn restamp(&mut self, clock: &mut u64, outer: bool, inner: bool) {
+        if outer {
+            *clock += 1;
+            self.outer_stamp = *clock;
+        }
+        if inner {
+            *clock += 1;
+            self.inner_stamp = *clock;
+        }
+    }
+
     fn new() -> Self {
         Self {
             transform: Affine::IDENTITY,
@@ -100,6 +124,8 @@ impl LayerNode {
             components: None,
             opacity_track: None,
             scroll_track: None,
+            inner_stamp: 0,
+            outer_stamp: 0,
         }
     }
 
@@ -242,6 +268,142 @@ impl SurfaceTree {
         Self {
             nodes,
             root: LayerId::new(0),
+            projective: FxHashMap::default(),
+            clock: 0,
+        }
+    }
+
+    /// Whether any layer in the tree is projective. An affine-only tree
+    /// takes the backends' existing affine traversal unchanged.
+    #[must_use]
+    pub fn has_projective(&self) -> bool {
+        !self.projective.is_empty()
+    }
+
+    /// The complete sampled local-to-parent pose of a projective layer
+    /// (its projection composed with its tilt, depth and affine
+    /// components), or `None` for an affine layer. A projective layer's
+    /// placement is this pose; its [`LayerNode::transform`] is not applied
+    /// as well. The pose is validated after composition: an invalid
+    /// composition is an error, never an identity.
+    #[must_use]
+    pub fn projective_pose(
+        &self,
+        id: LayerId,
+    ) -> Option<Result<crate::Projective, crate::ProjectiveError>> {
+        self.projective.get(&id.raw()).map(|state| state.pose)
+    }
+
+    /// A value that changes whenever anything a projective layer's local
+    /// image depends on changes: every property and content of every
+    /// descendant, and the layer's own clip, scroll offset, filter,
+    /// backdrop, content and children. The layer's own pose, opacity and
+    /// blend are excluded: they only change how the image is composed.
+    #[must_use]
+    pub fn content_stamp(&self, id: LayerId) -> u64 {
+        let node = self.layer(id);
+        node.children.iter().fold(node.inner_stamp, |stamp, child| {
+            stamp.max(self.subtree_stamp(*child))
+        })
+    }
+
+    fn subtree_stamp(&self, id: LayerId) -> u64 {
+        let node = self.layer(id);
+        node.children
+            .iter()
+            .fold(node.inner_stamp.max(node.outer_stamp), |stamp, child| {
+                stamp.max(self.subtree_stamp(*child))
+            })
+    }
+
+    fn stamp(&mut self, id: LayerId, inner: bool) {
+        self.clock += 1;
+        let clock = self.clock;
+        let node = self.node_mut(id);
+        if inner {
+            node.inner_stamp = clock;
+        } else {
+            node.outer_stamp = clock;
+        }
+    }
+
+    fn projective_mut(&mut self, id: LayerId) -> &mut projective::State {
+        assert!(
+            self.nodes.contains_key(&id.raw()),
+            "layer {} is not in the tree",
+            id.raw()
+        );
+        self.projective
+            .entry(id.raw())
+            .or_insert_with(projective::State::new)
+    }
+
+    /// Sets `id`'s blend, keeping its parent's blending-child count.
+    fn set_blend(&mut self, id: LayerId, blend: BlendMode) {
+        let node = self.layer(id);
+        let parent = node.parent;
+        let was_blending = node.blend != BlendMode::Normal;
+        let is_blending = blend != BlendMode::Normal;
+        if was_blending != is_blending
+            && let Some(parent) = parent
+        {
+            let count = &mut self.node_mut(parent).blending_children;
+            if is_blending {
+                *count += 1;
+            } else {
+                *count -= 1;
+            }
+        }
+        self.node_mut(id).blend = blend;
+    }
+
+    /// Applies a projection, tilt, depth or clear-projection op.
+    fn apply_projective(&mut self, op: LayerOp) {
+        match op {
+            LayerOp::Projection(id, base) => self.projective_mut(id).set_projection(base),
+            LayerOp::Tilt(id, prop) => self.projective_mut(id).set_tilt(&prop),
+            LayerOp::Depth(id, prop) => self.projective_mut(id).set_depth(&prop),
+            LayerOp::ClearProjection(id) => {
+                assert!(
+                    self.nodes.contains_key(&id.raw()),
+                    "layer {} is not in the tree",
+                    id.raw()
+                );
+                self.projective.remove(&id.raw());
+            }
+            _ => unreachable!("only projective ops reach apply_projective"),
+        }
+    }
+
+    /// Steps every projective layer's tilt and depth tracks and
+    /// recomposes its pose from the freshly sampled affine components.
+    /// Returns `(stepped, still running)`.
+    fn sample_projective(&mut self, time: Instant) -> (bool, bool) {
+        let (mut stepped, mut running) = (false, false);
+        for (id, state) in &mut self.projective {
+            let (step, run) = state.sample(time);
+            stepped |= step;
+            running |= run;
+            let node = self
+                .nodes
+                .get_mut(id)
+                .expect("projective state belongs to a layer in the tree");
+            if step {
+                self.clock += 1;
+                node.outer_stamp = self.clock;
+            }
+            state.refresh(node);
+        }
+        (stepped, running)
+    }
+
+    fn refresh_projective(&mut self, id: LayerId) {
+        if let Some(state) = self.projective.get_mut(&id.raw()) {
+            let node = self
+                .nodes
+                .get(&id.raw())
+                .unwrap_or_else(|| panic!("layer {} is not in the tree", id.raw()));
+            state.refresh(node);
         }
     }
 
@@ -307,6 +469,7 @@ impl SurfaceTree {
                 continue;
             };
             stack.extend(node.children.iter().copied());
+            self.projective.remove(&current.raw());
             removed.push(current);
         }
         removed
@@ -320,6 +483,37 @@ impl SurfaceTree {
     /// violation. Attaching the root or closing a cycle also panics before
     /// mutating the tree.
     pub fn apply(&mut self, op: LayerOp) {
+        let touched = match &op {
+            LayerOp::Create(_) | LayerOp::Remove(_) => None,
+            LayerOp::Transform(id, _)
+            | LayerOp::Translation(id, _)
+            | LayerOp::Rotation(id, _)
+            | LayerOp::Scale(id, _)
+            | LayerOp::Skew(id, _)
+            | LayerOp::Pivot(id, _)
+            | LayerOp::Projection(id, _)
+            | LayerOp::Tilt(id, _)
+            | LayerOp::Depth(id, _)
+            | LayerOp::ClearProjection(id)
+            | LayerOp::Opacity(id, _)
+            | LayerOp::Blend(id, _) => Some((*id, false)),
+            LayerOp::ScrollOffset(id, _)
+            | LayerOp::Clip(id, _)
+            | LayerOp::Filter(id, _)
+            | LayerOp::Backdrop(id, _)
+            | LayerOp::Content(id, _) => Some((*id, true)),
+            LayerOp::Push { parent, .. }
+            | LayerOp::Insert { parent, .. }
+            | LayerOp::Detach { parent, .. } => Some((*parent, true)),
+        };
+        self.apply_op(op);
+        if let Some((id, inner)) = touched {
+            self.stamp(id, inner);
+            self.refresh_projective(id);
+        }
+    }
+
+    fn apply_op(&mut self, op: LayerOp) {
         match op {
             LayerOp::Create(id) => {
                 assert!(
@@ -343,6 +537,10 @@ impl SurfaceTree {
             LayerOp::Scale(id, prop) => self.node_mut(id).set_scale(prop),
             LayerOp::Skew(id, prop) => self.node_mut(id).set_skew(prop),
             LayerOp::Pivot(id, prop) => self.node_mut(id).set_pivot(prop),
+            op @ (LayerOp::Projection(..)
+            | LayerOp::Tilt(..)
+            | LayerOp::Depth(..)
+            | LayerOp::ClearProjection(_)) => self.apply_projective(op),
             LayerOp::Opacity(id, prop) => {
                 let node = self.node_mut(id);
                 set_prop(&mut node.opacity_track, &mut node.opacity, &prop);
@@ -352,23 +550,7 @@ impl SurfaceTree {
                 set_prop(&mut node.scroll_track, &mut node.scroll_offset, &prop);
             }
             LayerOp::Clip(id, clip) => self.node_mut(id).clip = clip,
-            LayerOp::Blend(id, blend) => {
-                let node = self.layer(id);
-                let parent = node.parent;
-                let was_blending = node.blend != BlendMode::Normal;
-                let is_blending = blend != BlendMode::Normal;
-                if was_blending != is_blending
-                    && let Some(parent) = parent
-                {
-                    let count = &mut self.node_mut(parent).blending_children;
-                    if is_blending {
-                        *count += 1;
-                    } else {
-                        *count -= 1;
-                    }
-                }
-                self.node_mut(id).blend = blend;
-            }
+            LayerOp::Blend(id, blend) => self.set_blend(id, blend),
             LayerOp::Filter(id, filter) => self.node_mut(id).filter = filter,
             LayerOp::Backdrop(id, backdrop) => self.node_mut(id).backdrop = backdrop,
             LayerOp::Content(id, _) => {
@@ -434,6 +616,7 @@ impl SurfaceTree {
 
     fn detach(&mut self, child: LayerId) {
         if let Some(parent) = self.node_mut(child).parent.take() {
+            self.stamp(parent, true);
             let blends = self.layer(child).blend != BlendMode::Normal;
             let parent_node = self.node_mut(parent);
             parent_node.children.retain(|c| *c != child);
@@ -455,6 +638,9 @@ impl SurfaceTree {
         let mut fast = false;
         let mut slow = false;
         for node in self.nodes.values_mut() {
+            // Opacity is outer and scroll inner: any running track steps.
+            let mut outer_changed = node.opacity_track.is_some();
+            let inner_changed = node.scroll_track.is_some();
             let mut transform_changed = false;
             if let Some(track) = &mut node.transform_track {
                 stepped = true;
@@ -481,7 +667,9 @@ impl SurfaceTree {
                 if transform_changed || component_step {
                     node.transform = components.matrix();
                 }
+                outer_changed |= component_step;
             }
+            outer_changed |= transform_changed;
             if let Some(track) = &mut node.opacity_track {
                 stepped = true;
                 let (pos, _vel, done) = track.sample(time);
@@ -525,6 +713,7 @@ impl SurfaceTree {
                     node.scroll_track = None;
                 }
             }
+            node.restamp(&mut self.clock, outer_changed, inner_changed);
             // Rate classification of the tracks that remain.
             for running_track in [
                 node.transform_track
@@ -545,6 +734,9 @@ impl SurfaceTree {
                 }
             }
         }
+        let (projective_step, projective_running) = self.sample_projective(time);
+        stepped |= projective_step;
+        fast |= projective_running;
         let rate = if fast {
             Some(RATE_FAST)
         } else if slow {
@@ -752,7 +944,7 @@ mod hierarchy_tests {
             tree.remove(LayerId::new(1)),
             [LayerId::new(1), LayerId::new(2)]
         );
-        assert!(tree.layer(LayerId::new(3)).children.is_empty());
+        assert_eq!(tree.layer(LayerId::new(3)).children, []);
     }
 
     #[test]

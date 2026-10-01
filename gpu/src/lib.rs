@@ -375,6 +375,8 @@ impl Uploads<Rgba16F> for Gpu {}
 // present shader — see `render::present`.
 impl cherenkov::HdrOutput for Gpu {}
 
+impl cherenkov::ProjectiveLayers for Gpu {}
+
 impl cherenkov::GpuContent for Gpu {
     type Content = interop::GpuContentBox;
     fn set_gpu_content(

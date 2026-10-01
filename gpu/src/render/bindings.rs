@@ -159,6 +159,19 @@ pub const EXTERNAL_GROUP1: &[Entry] = &[
     Entry::uniform(4, FRAGMENT, false, EXTERNAL_PARAMS_SIZE),
 ];
 
+/// Group 1 of the projective composite pipelines (`projective.wgsl`): the
+/// layer's local image with its mips, its filtering sampler, the blend
+/// backdrop and the clip mask texture.
+pub const PROJECTIVE_GROUP1: &[Entry] = &[
+    Entry::texture(0),
+    Entry::sampler(1),
+    Entry::texture(2),
+    Entry::texture(3),
+];
+
+/// The mip pipeline's single group (`mip.wgsl`): the previous level.
+pub const MIP_GROUP0: &[Entry] = &[Entry::texture(0)];
+
 /// The engine pipelines' two groups, in declaration order.
 ///
 /// Used by `build.rs`; the crate addresses the groups directly.
@@ -176,6 +189,19 @@ pub const PRESENT_GROUPS: &[&[Entry]] = &[PRESENT_GROUP0];
 /// Used by `build.rs`; the crate addresses the groups directly.
 #[allow(dead_code)]
 pub const EXTERNAL_GROUPS: &[&[Entry]] = &[ENGINE_GROUP0, EXTERNAL_GROUP1];
+
+/// The projective composite pipelines' two groups, in declaration order:
+/// the shared engine group 0 followed by `PROJECTIVE_GROUP1`.
+///
+/// Used by `build.rs`; the crate addresses the groups directly.
+#[allow(dead_code)]
+pub const PROJECTIVE_GROUPS: &[&[Entry]] = &[ENGINE_GROUP0, PROJECTIVE_GROUP1];
+
+/// The mip pipeline's group list.
+///
+/// Used by `build.rs`; the crate addresses the group directly.
+#[allow(dead_code)]
+pub const MIP_GROUPS: &[&[Entry]] = &[MIP_GROUP0];
 
 /// Group 1 of the Vulkan native external-frame module: `EXTERNAL_GROUP1`
 /// plus the designated texture/sampler pair at bindings 5–6 that the

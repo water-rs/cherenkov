@@ -8,14 +8,18 @@ use naga::{Module, front::wgsl};
 
 const SHADER: &str = include_str!("../src/render/shader.wgsl");
 const SHARED: &str = include_str!("../src/render/shared.wgsl");
+const BLEND: &str = include_str!("../src/render/blend.wgsl");
+const PROJECTIVE: &str = include_str!("../src/render/projective.wgsl");
+const MIP: &str = include_str!("../src/render/mip.wgsl");
 
 /// The oldest Metal language version wgpu selects on a supported macOS
 /// (10.13 → 2.0), which is where `instance_id` and friends became legal.
 const MSL_VERSION: (u8, u8) = (2, 0);
 
 fn composed(variant: u32) -> (Module, naga::valid::ModuleInfo) {
-    // The engine module is `shared.wgsl` then `shader.wgsl`, as in build.rs.
-    let source = format!("const VARIANT: u32 = {variant}u;\n{SHARED}\n{SHADER}");
+    // The engine module is `shared.wgsl`, `shader.wgsl` then `blend.wgsl`,
+    // as in build.rs.
+    let source = format!("const VARIANT: u32 = {variant}u;\n{SHARED}\n{SHADER}\n{BLEND}");
     let module = wgsl::parse_str(&source).unwrap_or_else(|e| panic!("variant {variant}: {e}"));
     let info = Validator::new(ValidationFlags::all(), Capabilities::empty())
         .validate(&module)
@@ -47,7 +51,7 @@ fn every_variant_emits_spirv() {
         writer
             .write(&module, &info, None, &None, &mut words)
             .unwrap_or_else(|e| panic!("variant {variant}: spv: {e}"));
-        assert!(!words.is_empty());
+        assert_ne!(words, []);
     }
 }
 }
@@ -63,7 +67,7 @@ fn every_variant_emits_hlsl() {
         writer
             .write(&module, &info, None)
             .unwrap_or_else(|e| panic!("variant {variant}: hlsl: {e}"));
-        assert!(!out.is_empty());
+        assert_ne!(out, "");
     }
 }
 }
@@ -95,7 +99,7 @@ fn effect_emits(name: &str, module: &Module, info: &naga::valid::ModuleInfo) {
     writer
         .write(module, info, None, &None, &mut words)
         .unwrap_or_else(|e| panic!("{name}: spv: {e}"));
-    assert!(!words.is_empty());
+    assert_ne!(words, []);
     let options = hlsl::Options::default();
     let mut out = String::new();
     let pipeline_options = hlsl::PipelineOptions::default();
@@ -103,7 +107,7 @@ fn effect_emits(name: &str, module: &Module, info: &naga::valid::ModuleInfo) {
     hlsl_writer
         .write(module, info, None)
         .unwrap_or_else(|e| panic!("{name}: hlsl: {e}"));
-    assert!(!out.is_empty());
+    assert_ne!(out, "");
 }
 
 split_test! {
@@ -152,6 +156,23 @@ fn backdrop_effect_text_emits() {
     ];
     for (name, user) in CASES {
         let (module, info) = effect_module(name, user);
+        effect_emits(name, &module, &info);
+    }
+}
+}
+
+split_test! {
+/// The projective composite and mip modules (#84) translate through every
+/// naga backend, composed as in build.rs.
+fn projective_modules_emit() {
+    for (name, source) in [
+        ("projective", format!("{SHARED}\n{BLEND}\n{PROJECTIVE}")),
+        ("mip", MIP.to_owned()),
+    ] {
+        let module = wgsl::parse_str(&source).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let info = Validator::new(ValidationFlags::all(), Capabilities::empty())
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("{name}: {e:?}"));
         effect_emits(name, &module, &info);
     }
 }

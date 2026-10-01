@@ -47,6 +47,7 @@ pub mod memory;
 pub mod motion;
 #[cfg(feature = "cherenkov")]
 pub mod present_cost;
+pub mod projective_quality;
 pub mod refcache;
 pub mod report;
 #[cfg(any(feature = "cherenkov", feature = "cherenkov-cpu"))]

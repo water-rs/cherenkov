@@ -189,7 +189,7 @@ impl ContinuousRect {
             let flat = (1..4).all(|k| {
                 let s = f64::from(k) * 0.25;
                 let pm = arc((t1 - t0).mul_add(s, t0));
-                let (cx, cy) = (p0.x + s * (p1.x - p0.x), p0.y + s * (p1.y - p0.y));
+                let (cx, cy) = (s.mul_add(p1.x - p0.x, p0.x), s.mul_add(p1.y - p0.y, p0.y));
                 (pm.x - cx).hypot(pm.y - cy) <= tol
             });
             if flat || depth >= MAX_DEPTH {
@@ -312,6 +312,21 @@ impl ShapeData {
     #[must_use]
     pub fn of(shape: &(impl Shape + ?Sized)) -> Self {
         shape.semantic().into()
+    }
+
+    /// The smallest rectangle containing the shape's area.
+    #[must_use]
+    pub fn bounds(&self) -> Rect {
+        use kurbo::Shape as _;
+        match self {
+            Self::Rect(rect) => *rect,
+            Self::RoundedRect(rounded) => rounded.bounding_box(),
+            Self::Continuous(continuous) => continuous.rect,
+            Self::Circle(circle) => circle.bounding_box(),
+            Self::Ellipse(ellipse) => ellipse.bounding_box(),
+            Self::Line(line) => line.bounding_box(),
+            Self::Path { elements, .. } => (&elements[..]).bounding_box(),
+        }
     }
 }
 

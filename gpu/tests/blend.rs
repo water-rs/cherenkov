@@ -1,7 +1,5 @@
 //! Blend-mode composites against the W3C formulas on lavapipe.
 
-#![expect(clippy::float_cmp, reason = "clear pixels are exact")]
-
 use cherenkov::kurbo::{Point, Rect};
 use cherenkov::{__engine_fn as split_fn, __engine_test as split_test, __engine_wait as wait};
 use cherenkov::{

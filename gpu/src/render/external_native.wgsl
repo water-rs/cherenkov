@@ -30,10 +30,13 @@ fn fs_external_format(in: VsOut) -> @location(0) vec4<f32> {
     cov *= clip_mask_coverage(in);
     cov = clamp(cov, 0.0, 1.0) * in.params.y;
 
+    // `in.local` is centred on the quad, which spans the frame's pixels:
+    // the frame's pixel coordinate is offset by half its size.
+    let px = in.local + params.dims.xy * 0.5;
     // The conversion sampler is NEAREST: sampling at the texel centre the
     // texel contract (`round(pos - 0.5)`, edge-clamped) gives the same
     // sample ext_texel_f32 would. UV = centre / dims in [0, 1].
-    let xy = clamp(round(in.local - vec2<f32>(0.5)), vec2<f32>(0.0),
+    let xy = clamp(round(px - vec2<f32>(0.5)), vec2<f32>(0.0),
                    params.dims.xy - vec2<f32>(1.0));
     let c = textureSample(ext_image, ext_sampler,
                           (xy + vec2<f32>(0.5)) / params.dims.xy);

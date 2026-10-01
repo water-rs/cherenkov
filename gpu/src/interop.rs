@@ -416,7 +416,9 @@ pub enum Transfer {
     Linear,
     /// The sRGB piecewise curve.
     Srgb,
-    /// The BT.709 OETF piecewise curve.
+    /// BT.709-encoded video. Decodes through the BT.1886 reference EOTF —
+    /// a pure 2.4 power with black level 0, display-referred with reference
+    /// white at 1.0 — the curve a display applies to `ITU_R_709_2` content.
     Bt709,
     /// SMPTE ST 2084 perceptual quantizer; decodes to absolute nits.
     Pq,

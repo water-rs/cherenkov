@@ -21,7 +21,9 @@ use rustc_hash::FxHashMap;
 
 use crate::animation::Animation;
 use crate::backend::{Backend, Display, SurfaceInfo};
-use crate::capability::{Backdrop, BackdropChain, BackdropRuns, ExternalFrames, GpuContent};
+use crate::capability::{
+    Backdrop, BackdropChain, BackdropRuns, ExternalFrames, GpuContent, ProjectiveLayers,
+};
 use crate::engine::Waker;
 use crate::error::{RenderError, SurfaceError};
 use crate::frame::Readback;
@@ -42,6 +44,9 @@ enum PropKind {
     Scale,
     Skew,
     Pivot,
+    Projection,
+    Tilt,
+    Depth,
 
     Opacity,
     ScrollOffset,
@@ -225,6 +230,11 @@ impl<B: Backend> Shared<B> {
             shared_mut.bindings.remove(&(layer.raw(), kind));
         }
     }
+
+    /// Drops the subscription bound to `layer`'s `kind`, if any.
+    fn unbind(shared: &Rc<RefCell<Self>>, layer: LayerId, kind: PropKind) {
+        shared.borrow_mut().bindings.remove(&(layer.raw(), kind));
+    }
 }
 
 /// A surface's bookkeeping shared with its [`Layer`] handles.
@@ -364,6 +374,10 @@ enum EditOp<B: Backend> {
     Scale(Prop<Vec2>),
     Skew(Prop<Vec2>),
     Pivot(Prop<Vec2>),
+    Projection(crate::Projective),
+    Tilt(Prop<Vec2>),
+    Depth(Prop<f64>),
+    ClearProjection,
 
     Opacity(Prop<f32>),
     ScrollOffset(Prop<Vec2>),
@@ -407,6 +421,90 @@ impl<B: GpuContent> LayerEdit<B> {
                     B::resize_gpu_content(renderer, surface, layer, size);
                 },
             ))));
+        self
+    }
+}
+
+impl<B: ProjectiveLayers> LayerEdit<B> {
+    /// Makes the layer projective with `value` as its projection base.
+    ///
+    /// A projective layer is a flattening boundary: its content, clip,
+    /// scroll offset, filter and children render into a layer-local image
+    /// with the ordinary affine rasterizers, and that image is projected
+    /// when it composes into its parent, where its opacity and blend apply
+    /// once. The complete pose is `transform · translate(translation +
+    /// pivot) · projection · translate_z(depth) · rotate_z(rotation) ·
+    /// rotate_y(tilt.y) · rotate_x(tilt.x) · skew · scale ·
+    /// translate(−pivot)`, documented in `docs/api.md`. A projective
+    /// layer's local image is bounded by its clip: rendering one without a
+    /// clip is an error.
+    ///
+    /// The raw matrix is not animatable: a new value, bound or set,
+    /// replaces the base, and `.animation(...)` after it panics. Animate
+    /// flips with [`Self::tilt`], [`Self::depth`] and the affine
+    /// components.
+    pub fn projection(&mut self, value: impl Into<Live<crate::Projective>>) -> &mut Self {
+        let live = value.into();
+        self.ops.push(EditOp::Projection(live.value));
+        Shared::bind(
+            &self.shared,
+            self.layer,
+            PropKind::Projection,
+            live.subscribe,
+            |layer, target, _| LayerOp::Projection(layer, target),
+        );
+        self
+    }
+
+    /// Sets the X and Y rotation angles, in radians; initially zero.
+    /// Rotation is about the pivot: positive `x` turns the top edge away
+    /// from the viewer, positive `y` turns the right edge away. Angles
+    /// are unwrapped: a turn from `0` to `2π` makes a full flip, and both
+    /// sides of the layer render. Without [`Self::projection`] the layer
+    /// becomes projective with an identity base (an orthographic depth
+    /// rotation).
+    pub fn tilt(&mut self, value: impl Into<Live<Vec2>>) -> &mut Self {
+        let live = value.into();
+        self.ops.push(EditOp::Tilt(Prop {
+            target: live.value,
+            animation: self.default_animation,
+        }));
+        Shared::bind(
+            &self.shared,
+            self.layer,
+            PropKind::Tilt,
+            live.subscribe,
+            |layer, target, animation| LayerOp::Tilt(layer, Prop { target, animation }),
+        );
+        self
+    }
+
+    /// Sets the translation along Z, in layer-coordinate units; initially
+    /// zero. Positive values move toward the viewer. Like [`Self::tilt`],
+    /// it makes the layer projective.
+    pub fn depth(&mut self, value: impl Into<Live<f64>>) -> &mut Self {
+        let live = value.into();
+        self.ops.push(EditOp::Depth(Prop {
+            target: live.value,
+            animation: self.default_animation,
+        }));
+        Shared::bind(
+            &self.shared,
+            self.layer,
+            PropKind::Depth,
+            live.subscribe,
+            |layer, target, animation| LayerOp::Depth(layer, Prop { target, animation }),
+        );
+        self
+    }
+
+    /// Removes projection, tilt and depth, including their subscriptions
+    /// and animation tracks. Existing affine components are unchanged.
+    pub fn clear_projection(&mut self) -> &mut Self {
+        for kind in [PropKind::Projection, PropKind::Tilt, PropKind::Depth] {
+            Shared::unbind(&self.shared, self.layer, kind);
+        }
+        self.ops.push(EditOp::ClearProjection);
         self
     }
 }
@@ -665,8 +763,8 @@ impl<B: Backend> LayerEdit<B> {
     /// Overrides the animation of the last recorded property op.
     ///
     /// # Panics
-    /// Panics unless the last op was a transform component, `transform`, `opacity` or
-    /// `scroll_offset` — `.animation(...)` on any other property is an
+    /// Panics unless the last op was a transform component, `tilt`,
+    /// `depth`, `transform`, `opacity` or `scroll_offset` — `.animation(...)` on any other property is an
     /// invariant violation — and panics when `animation` is a
     /// [`Decay`](crate::Decay) on anything but `scroll_offset`.
     pub fn animation(&mut self, animation: impl Into<Animation>) -> &mut Self {
@@ -680,12 +778,20 @@ impl<B: Backend> LayerEdit<B> {
             Some(EditOp::Transform(prop)) => prop.animation = Some(animation),
             Some(
                 EditOp::Translation(prop)
+                | EditOp::Tilt(prop)
                 | EditOp::Scale(prop)
                 | EditOp::Skew(prop)
                 | EditOp::Pivot(prop)
                 | EditOp::ScrollOffset(prop),
             ) => prop.animation = Some(animation),
-            Some(EditOp::Rotation(prop)) => prop.animation = Some(animation),
+            Some(EditOp::Rotation(prop) | EditOp::Depth(prop)) => {
+                prop.animation = Some(animation);
+            }
+            Some(EditOp::Projection(_)) => {
+                panic!(
+                    "the projection matrix is not animatable; animate tilt, depth or the components"
+                )
+            }
 
             Some(EditOp::Opacity(prop)) => prop.animation = Some(animation),
             _ => panic!("animation() must follow an animatable layer property"),
@@ -952,6 +1058,14 @@ impl<B: Backend> Surface<B> {
                     EditOp::Scale(prop) => ops.push(Op::Layer(LayerOp::Scale(*id, prop))),
                     EditOp::Skew(prop) => ops.push(Op::Layer(LayerOp::Skew(*id, prop))),
                     EditOp::Pivot(prop) => ops.push(Op::Layer(LayerOp::Pivot(*id, prop))),
+                    EditOp::Projection(base) => {
+                        ops.push(Op::Layer(LayerOp::Projection(*id, base)));
+                    }
+                    EditOp::Tilt(prop) => ops.push(Op::Layer(LayerOp::Tilt(*id, prop))),
+                    EditOp::Depth(prop) => ops.push(Op::Layer(LayerOp::Depth(*id, prop))),
+                    EditOp::ClearProjection => {
+                        ops.push(Op::Layer(LayerOp::ClearProjection(*id)));
+                    }
 
                     EditOp::Opacity(prop) => {
                         ops.push(Op::Layer(LayerOp::Opacity(*id, prop)));

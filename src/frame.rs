@@ -148,6 +148,12 @@ pub struct FrameStats {
     pub commands_lowered: u32,
     /// Layers whose device-space content run was rebuilt rather than reused.
     pub layers_composed: u32,
+    /// Projective layers' local images realized this frame: a local
+    /// rasterization plus a mip build each. Zero on a warm matrix-only
+    /// frame whose density buckets are retained.
+    pub projective_realized: u32,
+    /// Projective layers composed this frame, cached or fresh.
+    pub projective_composed: u32,
 }
 
 /// Decoded pixels of a surface readback: premultiplied linear Display P3,

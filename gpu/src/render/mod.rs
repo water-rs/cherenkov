@@ -269,10 +269,6 @@ struct SurfaceState {
     content: FxHashMap<LayerId, gpu_content::Slot>,
     /// Retained external frames by layer (`cherenkov::ExternalFrames`).
     external: FxHashMap<LayerId, external::Slot>,
-    /// The promoted layers whose new frames this frame presents alone —
-    /// filled when [`planes::frames_only`] admits the frame's whole
-    /// change, so presentation skips every part (#90).
-    plane_frames: FxHashSet<LayerId>,
     shader_textures: FxHashMap<std::sync::Arc<paint::Key>, paint::Texture>,
     frame: LoweredFrame,
     /// This frame's offsets into the shared buffers: instances and globals
@@ -590,6 +586,10 @@ pub struct GpuRenderer {
         )
     )]
     planes: FxHashMap<SurfaceId, planes::Platform>,
+    /// The surfaces this frame admits to a plane-only refresh — cleared
+    /// and refilled at the top of every render, so an admission can never
+    /// outlive the frame that made it (#90).
+    plane_only: Vec<SurfaceId>,
     /// How the fixed modules reach this device (`shaders.rs`): SPIR-V,
     /// metallib, or WGSL — decided once at init by the adapter backend.
     shader_delivery: shaders::ShaderDelivery,
@@ -1943,6 +1943,7 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
                 )
             )]
             planes: FxHashMap::default(),
+            plane_only: Vec::new(),
             shader_delivery,
             shaders: paint::Registry::default(),
             backdrop_shaders: FxHashMap::default(),
@@ -2245,6 +2246,7 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
             )
         )]
         planes: FxHashMap::default(),
+        plane_only: Vec::new(),
         shader_delivery,
         shaders: paint::Registry::default(),
         backdrop_shaders: FxHashMap::default(),
@@ -2444,7 +2446,6 @@ impl Renderer for GpuRenderer {
                 layers: FxHashMap::default(),
                 content: FxHashMap::default(),
                 external: FxHashMap::default(),
-                plane_frames: FxHashSet::default(),
                 shader_textures: FxHashMap::default(),
                 frame: LoweredFrame::default(),
                 inst_base: 0,
@@ -3385,6 +3386,7 @@ impl GpuRenderer {
         let origin = *self.origin.get_or_insert(frame.time.0);
         self.frame_count += 1;
         self.drain_timestamps();
+        self.plane_only.clear();
         let dirty: Vec<_> = frame
             .surfaces
             .iter()
@@ -3393,19 +3395,19 @@ impl GpuRenderer {
         // A surface whose only change is new external frames on layers
         // its committed plan promotes presents them through the planes
         // alone — no lowering, no draws, no part blit (#90). Any other
-        // change takes the full render path.
+        // change takes the full render path. The admission lives in
+        // `self.plane_only`, rebuilt per render, so it can never outlive
+        // the frame that made it.
         let mut dirty_full = Vec::with_capacity(dirty.len());
         for sf in dirty {
-            match self.plane_only_frames(sf) {
-                Some(frames) => {
-                    let surface = self
-                        .surfaces
-                        .get_mut(&sf.id)
-                        .expect("dirty surface must exist");
-                    surface.plane_frames = frames;
-                    surface.present_pending = true;
-                }
-                None => dirty_full.push(sf),
+            if self.plane_only_frames(sf) {
+                self.plane_only.push(sf.id);
+                self.surfaces
+                    .get_mut(&sf.id)
+                    .expect("dirty surface must exist")
+                    .present_pending = true;
+            } else {
+                dirty_full.push(sf);
             }
         }
         let dirty = dirty_full;
@@ -3524,6 +3526,7 @@ impl GpuRenderer {
         self.drain_timestamps();
         #[cfg(all(unix, not(target_vendor = "apple")))]
         self.flush_native_releases();
+        self.plane_only.clear();
         let dirty: Vec<_> = frame
             .surfaces
             .iter()
@@ -3532,19 +3535,19 @@ impl GpuRenderer {
         // A surface whose only change is new external frames on layers
         // its committed plan promotes presents them through the planes
         // alone — no lowering, no draws, no part blit (#90). Any other
-        // change takes the full render path.
+        // change takes the full render path. The admission lives in
+        // `self.plane_only`, rebuilt per render, so it can never outlive
+        // the frame that made it.
         let mut dirty_full = Vec::with_capacity(dirty.len());
         for sf in dirty {
-            match self.plane_only_frames(sf) {
-                Some(frames) => {
-                    let surface = self
-                        .surfaces
-                        .get_mut(&sf.id)
-                        .expect("dirty surface must exist");
-                    surface.plane_frames = frames;
-                    surface.present_pending = true;
-                }
-                None => dirty_full.push(sf),
+            if self.plane_only_frames(sf) {
+                self.plane_only.push(sf.id);
+                self.surfaces
+                    .get_mut(&sf.id)
+                    .expect("dirty surface must exist")
+                    .present_pending = true;
+            } else {
+                dirty_full.push(sf);
             }
         }
         let dirty = dirty_full;
@@ -4520,37 +4523,45 @@ impl GpuRenderer {
             if surface.present_pending {
                 surface.present_pending = !match self.planes.get_mut(&sf.id) {
                     Some(system) => {
-                        if surface.plane_frames.is_empty() {
-                            let parts: Vec<_> = (0..surface.plan.parts())
-                                .map(|n| planes::Part {
-                                    view: match n {
-                                        0 => &surface.view,
-                                        n => &surface.parts[n - 1].1,
+                        // The frame's own `plane_frames` carries the
+                        // update set — admitted by this render's
+                        // `plane_only`, so it cannot be a stale frame's.
+                        let updates = sf
+                            .plane_frames
+                            .filter(|_| self.plane_only.contains(&sf.id));
+                        match updates {
+                            Some(updates) => {
+                                // The frame's only change is new frames on
+                                // these promoted layers: present them
+                                // alone, leaving every part's shown buffer
+                                // in place (#90).
+                                let frames = plane_stack(surface, Some(updates));
+                                planes::SystemPlanes::refresh(system, &frames)?;
+                                true
+                            }
+                            None => {
+                                let parts: Vec<_> = (0..surface.plan.parts())
+                                    .map(|n| planes::Part {
+                                        view: match n {
+                                            0 => &surface.view,
+                                            n => &surface.parts[n - 1].1,
+                                        },
+                                    })
+                                    .collect();
+                                let stack = plane_stack(surface, None);
+                                planes::SystemPlanes::compose(
+                                    system,
+                                    planes::Composition {
+                                        device: &self.device,
+                                        queue: &self.queue,
+                                        presenter,
+                                        size: surface.size,
+                                        display: sf.display,
+                                        parts: &parts,
+                                        planes: &stack,
                                     },
-                                })
-                                .collect();
-                            let stack = plane_stack(surface, None);
-                            planes::SystemPlanes::compose(
-                                system,
-                                planes::Composition {
-                                    device: &self.device,
-                                    queue: &self.queue,
-                                    presenter,
-                                    size: surface.size,
-                                    display: sf.display,
-                                    parts: &parts,
-                                    planes: &stack,
-                                },
-                            )?
-                        } else {
-                            // The frame's only change is new frames on
-                            // these promoted layers: present them alone,
-                            // leaving every part's shown buffer in place
-                            // (#90).
-                            let updates = std::mem::take(&mut surface.plane_frames);
-                            let frames = plane_stack(surface, Some(&updates));
-                            planes::SystemPlanes::refresh(system, &frames)?;
-                            true
+                                )?
+                            }
                         }
                     }
                     None => presenter.present(
@@ -4764,15 +4775,19 @@ impl GpuRenderer {
     /// either side — a deferred or failed compose is still owed — no
     /// display moved, nothing else wants a redraw, and the plan they
     /// would produce is the committed one (`planes::frames_only`).
-    /// `None` sends the frame down the full render path like any other
+    /// `false` sends the frame down the full render path like any other
     /// change (#90).
-    fn plane_only_frames(&self, sf: &SurfaceFrame<'_>) -> Option<FxHashSet<LayerId>> {
+    fn plane_only_frames(&self, sf: &SurfaceFrame<'_>) -> bool {
         if sf.present_pending || sf.display_moved {
-            return None;
+            return false;
         }
-        let frames = sf.plane_frames?;
-        let surface = self.surfaces.get(&sf.id)?;
-        (surface.promotes
+        let Some(frames) = sf.plane_frames else {
+            return false;
+        };
+        let Some(surface) = self.surfaces.get(&sf.id) else {
+            return false;
+        };
+        surface.promotes
             && !surface.present_pending
             && !self.wants_redraw(surface)
             && planes::frames_only::<planes::Platform>(
@@ -4780,8 +4795,7 @@ impl GpuRenderer {
                 sf.tree,
                 &plane_candidates(surface),
                 frames,
-            ))
-        .then(|| frames.clone())
+            )
     }
 
     #[inline(never)]

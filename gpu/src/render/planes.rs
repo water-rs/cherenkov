@@ -123,10 +123,10 @@ impl Level {
     /// and children.
     #[must_use]
     #[cfg_attr(
-        not(test),
+        not(any(test, target_os = "android")),
         expect(
             dead_code,
-            reason = "read by the platform realizations of `SystemPlanes`, none of which this commit wires"
+            reason = "read by the platform realizations of `SystemPlanes`, none of which is wired on this platform"
         )
     )]
     pub fn content_transform(&self) -> Affine {
@@ -152,10 +152,10 @@ impl Placement {
     /// transform.
     #[must_use]
     #[cfg_attr(
-        not(test),
+        not(any(test, target_os = "android")),
         expect(
             dead_code,
-            reason = "read by the platform realizations of `SystemPlanes`, none of which this commit wires"
+            reason = "read by the platform realizations of `SystemPlanes`, none of which is wired on this platform"
         )
     )]
     pub fn content_to_device(&self) -> Affine {
@@ -373,9 +373,12 @@ fn paint_order(tree: &SurfaceTree) -> Vec<Visit> {
 
 /// The content a plane shows.
 #[derive(Debug)]
-#[expect(
-    dead_code,
-    reason = "read by the platform realizations of `SystemPlanes`, none of which this commit wires"
+#[cfg_attr(
+    not(target_os = "android"),
+    expect(
+        dead_code,
+        reason = "read by the platform realizations of `SystemPlanes`, none of which is wired on this platform"
+    )
 )]
 pub enum PlaneContent<'a> {
     /// A retained external frame, handed to the system compositor instead of
@@ -390,9 +393,12 @@ pub enum PlaneContent<'a> {
 
 /// One promoted plane of a [`Composition`].
 #[derive(Debug)]
-#[expect(
-    dead_code,
-    reason = "read by the platform realizations of `SystemPlanes`, none of which this commit wires"
+#[cfg_attr(
+    not(target_os = "android"),
+    expect(
+        dead_code,
+        reason = "read by the platform realizations of `SystemPlanes`, none of which is wired on this platform"
+    )
 )]
 pub struct Plane<'a> {
     /// Where it sits.
@@ -404,9 +410,12 @@ pub struct Plane<'a> {
 /// One engine part of a [`Composition`]: premultiplied linear Display P3 at
 /// the surface size.
 #[derive(Debug)]
-#[expect(
-    dead_code,
-    reason = "read by the platform realizations of `SystemPlanes`, none of which this commit wires"
+#[cfg_attr(
+    not(target_os = "android"),
+    expect(
+        dead_code,
+        reason = "read by the platform realizations of `SystemPlanes`, none of which is wired on this platform"
+    )
 )]
 pub struct Part<'a> {
     /// The engine texture holding the part.
@@ -417,9 +426,12 @@ pub struct Part<'a> {
 /// `parts[1]`, `planes[1]`, … and, when [`Plan::trailing`] holds, a last
 /// part above the last plane. Without promoted planes there is exactly one
 /// part, the whole surface.
-#[expect(
-    dead_code,
-    reason = "read by the platform realizations of `SystemPlanes`, none of which this commit wires"
+#[cfg_attr(
+    not(target_os = "android"),
+    expect(
+        dead_code,
+        reason = "read by the platform realizations of `SystemPlanes`, none of which is wired on this platform"
+    )
 )]
 pub struct Composition<'a> {
     /// The engine's device.
@@ -459,14 +471,20 @@ pub trait SystemPlanes: Compositor {
     fn resize(&mut self, size: (u32, u32));
 }
 
+/// The realization on this platform: child surface controls on Android.
+#[cfg(target_os = "android")]
+pub type Platform = super::surface_control::planes::Planes;
 /// The realization on this platform.
+#[cfg(not(target_os = "android"))]
 pub type Platform = NoPlanes;
 
 /// Stands in for [`SystemPlanes`] on platforms without a realization yet:
 /// no value exists, so a surface there never has planes.
+#[cfg(not(target_os = "android"))]
 #[derive(Debug)]
 pub enum NoPlanes {}
 
+#[cfg(not(target_os = "android"))]
 impl Compositor for NoPlanes {
     const BUDGET: usize = 0;
     fn expresses_transform(_: Affine) -> bool {
@@ -480,6 +498,7 @@ impl Compositor for NoPlanes {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 impl SystemPlanes for NoPlanes {
     fn compose(&mut self, _: Composition<'_>) -> Result<bool, RenderError> {
         unreachable!("no `NoPlanes` value exists")

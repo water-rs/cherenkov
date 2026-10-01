@@ -159,6 +159,9 @@ pub struct Release {
     pub aspects: vk::ImageAspectFlags,
     /// The producer lease, dropped after every object built on it.
     pub lease: Lease,
+    /// Release fences of the system compositor planes that showed the
+    /// frame, merged into the producer's release fence (#90).
+    pub plane_fences: Vec<OwnedFd>,
     /// Where [`Self::submitted`] leaves the producer's release fence for
     /// [`Generation::release_fd`]; shared with the generation.
     pub release_fence: Option<ReleaseFence>,
@@ -226,13 +229,14 @@ impl Release {
     }
 
     /// The release submission was accepted: exports the `FenceFd` payload
-    /// while its signal is pending and advances the generation to
-    /// `ReleaseSubmitted`.
+    /// while its signal is pending, merges the plane release fences into it
+    /// so the producer reuses the buffer only once every reader let go, and
+    /// advances the generation to `ReleaseSubmitted`.
     ///
     /// # Panics
     /// On a poisoned state or fence mutex.
     pub fn submitted(&mut self, shared: &Shared) {
-        if let Some(slot) = &self.release_fence {
+        if let Some(slot) = self.release_fence.clone() {
             let fence = self.export_fence(shared);
             *slot.lock().expect("release fence") = Some(fence);
         }
@@ -244,7 +248,7 @@ impl Release {
         }
     }
 
-    fn export_fence(&self, shared: &Shared) -> Result<OwnedFd, NativeError> {
+    fn export_fence(&mut self, shared: &Shared) -> Result<OwnedFd, NativeError> {
         let semaphore = self
             .fence_semaphore
             .ok_or(NativeError::Unsupported("frame has no fence release"))?;
@@ -262,7 +266,13 @@ impl Release {
         }
         .map_err(NativeError::from)?;
         // SAFETY: `get_semaphore_fd` returned a new fd owned by the caller.
-        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+        let fence = unsafe { OwnedFd::from_raw_fd(fd) };
+        #[cfg(target_os = "android")]
+        let fence = self.plane_fences.drain(..).fold(fence, |merged, plane| {
+            use std::os::fd::AsFd as _;
+            ndk::sync::sync_merge(c"cherenkov release", merged.as_fd(), plane.as_fd())
+        });
+        Ok(fence)
     }
 
     /// Destroys the objects in dependency order. Runs once the release
@@ -368,6 +378,39 @@ pub struct Generation {
     /// The producer's release fence, exported when the release submission
     /// is accepted.
     pub release_fence: ReleaseFence,
+    /// What a system compositor plane needs to show the buffer directly;
+    /// `None` for sources a plane cannot take.
+    #[cfg(target_os = "android")]
+    pub plane: Option<PlaneSource>,
+    /// Release fences delivered by the planes that showed this frame, moved
+    /// into the release at retirement.
+    pub plane_fences: std::sync::Mutex<Vec<OwnedFd>>,
+}
+
+/// An Android buffer as a system compositor plane takes it (#90).
+#[cfg(target_os = "android")]
+pub struct PlaneSource {
+    /// The buffer, kept alive by the generation's producer lease.
+    pub buffer: std::ptr::NonNull<ndk_sys::AHardwareBuffer>,
+    /// The fence the plane's transaction hands the system compositor.
+    pub acquire: PlaneAcquire,
+    /// Whether the buffer was allocated for hardware overlays
+    /// (`AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY`); without it the system
+    /// composites the plane on its GPU, which saves nothing.
+    pub overlay: bool,
+    /// Static HDR metadata for the system's tone mapping.
+    pub hdr: crate::interop::HdrMetadata,
+}
+
+/// How a plane orders its read behind the producer.
+#[cfg(target_os = "android")]
+pub enum PlaneAcquire {
+    /// The producer's work is complete at import.
+    Ready,
+    /// A sync fence; each transaction receives a duplicate.
+    Fence(OwnedFd),
+    /// A Vulkan semaphore payload no system compositor can wait on.
+    Semaphore,
 }
 
 impl Generation {
@@ -505,6 +548,16 @@ impl Generation {
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 
+    /// Records the fence a system compositor plane releases this frame's
+    /// buffer on; the producer's release fence merges it. Deliver it before
+    /// the plane's lease ends.
+    ///
+    /// # Panics
+    /// On a poisoned plane-fence mutex.
+    pub fn add_plane_release(&self, fence: OwnedFd) {
+        self.plane_fences.lock().expect("plane fences").push(fence);
+    }
+
     /// Drops one engine-side reference; the last one retires the frame.
     pub fn unlease(&self) {
         if self
@@ -536,6 +589,8 @@ impl Generation {
             release.fence_semaphore = self.fence_semaphore.lock().expect("fence semaphore").take();
             release.submitted_flag = Some(Arc::clone(&self.release_submitted));
             release.release_fence = Some(Arc::clone(&self.release_fence));
+            release.plane_fences =
+                std::mem::take(&mut *self.plane_fences.lock().expect("plane fences"));
             release.state = Some(Arc::clone(&self.state));
             for (_, set) in self.sets.lock().expect("frame sets").drain() {
                 // Sets are freed with the pool; the map drain is bookkeeping.
@@ -559,8 +614,10 @@ impl Drop for Generation {
 }
 
 impl Generation {
-    /// The `FenceFd` release payload: signalled once the release submission
-    /// executes. Each call returns a new descriptor.
+    /// The `FenceFd` release payload: signalled once the producer may reuse
+    /// the buffer — after the release submission and every system
+    /// compositor plane that showed the frame. Each call returns a new
+    /// descriptor.
     ///
     /// # Errors
     /// [`NativeError::Unready`] before the release submission is accepted;
@@ -589,7 +646,7 @@ impl Generation {
 /// Imports a sync fence into a new binary semaphore, temporarily. A
 /// successful import hands the descriptor to the driver; on failure it
 /// closes with `fd`.
-fn import_sync_fd(shared: &Shared, fd: OwnedFd) -> Result<vk::Semaphore, NativeError> {
+pub fn import_sync_fd(shared: &Shared, fd: OwnedFd) -> Result<vk::Semaphore, NativeError> {
     let Some(loader) = shared.vk.external_semaphore_fd.as_ref() else {
         return Err(NativeError::Unsupported("SYNC_FD semaphore import"));
     };

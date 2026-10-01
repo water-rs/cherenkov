@@ -375,6 +375,22 @@ fn bind_and_finish(
         }
     };
 
+    let plane = super::PlaneSource {
+        buffer: std::ptr::NonNull::new(buffer).expect("checked at import"),
+        acquire: match &desc.sync {
+            None => super::PlaneAcquire::Ready,
+            Some(super::Wait::SyncFd { fd }) => super::PlaneAcquire::Fence(
+                fd.try_clone()
+                    .map_err(|_| NativeError::Invalid("the acquire fence cannot be duplicated"))?,
+            ),
+            Some(_) => super::PlaneAcquire::Semaphore,
+        },
+        overlay: ahb_desc.usage
+            & ndk_sys::AHardwareBuffer_UsageFlags::AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY.0
+            != 0,
+        hdr: desc.hdr,
+    };
+
     let fence_semaphore = match &desc.release {
         Some(super::ReleaseSync::FenceFd) => {
             if !shared.caps.external_semaphore_sync_fd {
@@ -430,8 +446,11 @@ fn bind_and_finish(
                 producer_family: QueueFamily::Foreign,
                 aspects: vk::ImageAspectFlags::COLOR,
                 lease: sync::Lease::Ahb(buffer),
+                plane_fences: Vec::new(),
                 release_fence: None,
             })),
+            plane: Some(plane),
+            plane_fences: std::sync::Mutex::new(Vec::new()),
             release_fence: Arc::new(std::sync::Mutex::new(None)),
         }),
     })

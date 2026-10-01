@@ -430,8 +430,12 @@ fn nv12_generation(
             producer_family: nv12.family,
             aspects: vk::ImageAspectFlags::COLOR,
             lease: vulkan::Lease::None,
+            plane_fences: vec![],
             release_fence: None,
         })),
+        #[cfg(target_os = "android")]
+        plane: None,
+        plane_fences: std::sync::Mutex::new(vec![]),
         release_fence: Arc::new(std::sync::Mutex::new(None)),
     })
 }
@@ -730,8 +734,12 @@ fn rgb_generation(
             producer_family: rgb.family,
             aspects: vk::ImageAspectFlags::COLOR,
             lease: vulkan::Lease::None,
+            plane_fences: vec![],
             release_fence: None,
         })),
+        #[cfg(target_os = "android")]
+        plane: None,
+        plane_fences: std::sync::Mutex::new(vec![]),
         release_fence: Arc::new(std::sync::Mutex::new(None)),
     })
 }

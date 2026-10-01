@@ -18,6 +18,7 @@ pub mod present;
 mod raster;
 pub mod shaders;
 mod shadow;
+pub mod surface_control;
 mod upload;
 
 use cherenkov::Instant;
@@ -367,9 +368,12 @@ pub struct GpuRenderer {
     /// The plane realization of every surface whose target exposes a
     /// system-compositor parent. Platform objects stay on the render
     /// thread, outside the surface states lowering moves to its workers.
-    #[expect(
-        clippy::zero_sized_map_values,
-        reason = "no platform realization is wired yet, so the map stays empty"
+    #[cfg_attr(
+        not(target_os = "android"),
+        expect(
+            clippy::zero_sized_map_values,
+            reason = "no realization is wired on this platform, so the map stays empty"
+        )
     )]
     planes: FxHashMap<SurfaceId, planes::Platform>,
     /// How the fixed modules reach this device (`shaders.rs`): SPIR-V,
@@ -429,9 +433,10 @@ pub struct GpuRenderer {
     #[cfg(all(unix, not(target_vendor = "apple")))]
     native: Option<external::vulkan::Native>,
     /// Serializes "stage queue waits → submit" so an unrelated submission
-    /// cannot consume a staged producer semaphore wait (#166).
+    /// cannot consume a staged producer semaphore wait (#166); shared with
+    /// the plane realizations, which submit with their own waits.
     #[cfg(all(unix, not(target_vendor = "apple")))]
-    submit_lock: std::sync::Mutex<()>,
+    submit_lock: std::sync::Arc<std::sync::Mutex<()>>,
     surfaces: FxHashMap<SurfaceId, SurfaceState>,
     fonts: FxHashMap<u64, FontData>,
     /// Registered images.
@@ -1456,9 +1461,12 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             instance,
             adapter,
             presenter: None,
-            #[expect(
-                clippy::zero_sized_map_values,
-                reason = "no platform realization is wired yet, so the map stays empty"
+            #[cfg_attr(
+                not(target_os = "android"),
+                expect(
+                    clippy::zero_sized_map_values,
+                    reason = "no realization is wired on this platform, so the map stays empty"
+                )
             )]
             planes: FxHashMap::default(),
             shader_delivery,
@@ -1486,7 +1494,7 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             #[cfg(all(unix, not(target_vendor = "apple")))]
             native,
             #[cfg(all(unix, not(target_vendor = "apple")))]
-            submit_lock: std::sync::Mutex::new(()),
+            submit_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
             bound_atlas: 0,
             bound_instance_size: 272 * 16,
             bound_stop_size: 32 * 16,
@@ -1682,9 +1690,12 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
         instance,
         adapter,
         presenter: None,
-        #[expect(
-            clippy::zero_sized_map_values,
-            reason = "no platform realization is wired yet, so the map stays empty"
+        #[cfg_attr(
+            not(target_os = "android"),
+            expect(
+                clippy::zero_sized_map_values,
+                reason = "no realization is wired on this platform, so the map stays empty"
+            )
         )]
         planes: FxHashMap::default(),
         shader_delivery,
@@ -1780,6 +1791,8 @@ impl Renderer for GpuRenderer {
             GpuTarget::Offscreen(offscreen) => offscreen.size,
             GpuTarget::Window(window) => window.size,
             GpuTarget::Texture(texture) => texture.size,
+            #[cfg(target_os = "android")]
+            GpuTarget::SurfaceControl(target) => target.size(),
         };
         if size.0 == 0 || size.1 == 0 {
             return Err(SurfaceError::ZeroSize);
@@ -1794,6 +1807,8 @@ impl Renderer for GpuRenderer {
         let (window, textures, refresh) = match target {
             GpuTarget::Offscreen(offscreen) => (None, None, offscreen.refresh),
             GpuTarget::Texture(texture) => (None, Some(texture.textures), texture.refresh),
+            #[cfg(target_os = "android")]
+            GpuTarget::SurfaceControl(target) => (None, None, self.surface_control(id, target)?),
             GpuTarget::Window(window) => {
                 let surface = present::WindowSurface::new(
                     &self.instance,
@@ -1828,7 +1843,7 @@ impl Renderer for GpuRenderer {
             id,
             SurfaceState {
                 window,
-                promotes: false,
+                promotes: self.planes.contains_key(&id),
                 plan: planes::Plan::default(),
                 parts: Vec::new(),
                 frames_installed: 0,
@@ -2678,6 +2693,30 @@ impl Renderer for GpuRenderer {
 }
 
 impl GpuRenderer {
+    /// Realizes surface `id` under a `SurfaceControlTarget`'s parent and
+    /// returns its refresh range.
+    #[cfg(target_os = "android")]
+    fn surface_control(
+        &mut self,
+        id: SurfaceId,
+        target: crate::interop::android::SurfaceControlTarget,
+    ) -> Result<cherenkov::RefreshRange, SurfaceError> {
+        let native = self.native.as_ref().ok_or_else(|| {
+            SurfaceError::UnsupportedTarget(
+                "surface control: the device has no Vulkan external-memory support".into(),
+            )
+        })?;
+        let system = surface_control::planes::Planes::new(
+            native.shared.clone(),
+            std::sync::Arc::clone(&self.submit_lock),
+            &target,
+        )?;
+        self.planes.insert(id, system);
+        self.presenter
+            .get_or_insert_with(|| present::Presenter::new(&self.device, self.shader_delivery));
+        Ok(target.refresh)
+    }
+
     #[cfg(target_arch = "wasm32")]
     #[expect(
         clippy::future_not_send,

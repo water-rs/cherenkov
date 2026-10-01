@@ -148,6 +148,10 @@ pub enum GpuTarget {
     Window(WindowTarget),
     /// Engine-owned working-space texture shared with a native host.
     Texture(interop::TextureTarget),
+    /// Child surface controls of a host's parent, with system compositor
+    /// planes for eligible layers.
+    #[cfg(target_os = "android")]
+    SurfaceControl(interop::android::SurfaceControlTarget),
 }
 
 /// A window the engine presents on: a raw window handle and the drawable

@@ -40,6 +40,8 @@ pub use sync::{
     Generation, Lease, PendingAcquire, PendingWait, Release, State, Views, cancel_staged,
     drain_releases, mark_submitted, stage_acquire, submit_waits,
 };
+#[cfg(target_os = "android")]
+pub use sync::{PlaneAcquire, PlaneSource, import_sync_fd};
 
 /// `QueueFamily` the producer released the image on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,6 +182,9 @@ pub struct Ahb {
     pub color: FrameColor,
     /// How the RGB plane's alpha composes; ignored for YUV.
     pub alpha: RgbAlpha,
+    /// Static HDR metadata, read when the frame is promoted to a system
+    /// compositor plane.
+    pub hdr: crate::interop::HdrMetadata,
 }
 
 /// A producer frame source the engine imports natively on Vulkan.
@@ -982,6 +987,13 @@ pub const fn chroma_location(offset: ChromaOffset) -> vk::ChromaLocation {
 // raw AHardwareBuffer pointer only travels to the queue-completion thread.
 unsafe impl Send for sync::Lease {}
 unsafe impl Send for sync::Release {}
+#[cfg(target_os = "android")]
+// SAFETY: an `AHardwareBuffer` is reference-counted and its NDK entry points
+// are callable from any thread; a plane source only reads the handle.
+unsafe impl Send for sync::PlaneSource {}
+#[cfg(target_os = "android")]
+// SAFETY: as above.
+unsafe impl Sync for sync::PlaneSource {}
 unsafe impl Send for sync::Generation {}
 unsafe impl Sync for sync::Generation {}
 

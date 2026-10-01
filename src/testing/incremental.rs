@@ -239,19 +239,18 @@ where
     renderer.remove_font(font);
 }
 
-fn register_font(renderer: &mut impl Renderer) -> FontId {
+fn register_font<R: Renderer>(renderer: &mut R) -> FontId {
     let font = FontId::new(1);
-    renderer
-        .add_font(
-            font,
-            FontData {
-                data: include_bytes!("../../scenes/fonts/NotoSans.ttf")
-                    .as_slice()
-                    .into(),
-                index: 0,
-            },
-        )
-        .expect("register font");
+    renderer.add_font(
+        font,
+        R::prepare_font(FontData {
+            data: include_bytes!("../../scenes/fonts/NotoSans.ttf")
+                .as_slice()
+                .into(),
+            index: 0,
+        })
+        .expect("prepare font"),
+    );
     font
 }
 
@@ -289,6 +288,8 @@ fn render<R: Renderer>(
                     display: Display::default(),
                     clear: WorkingColor::new([0.1, 0.2, 0.3, 1.]),
                     changed: true,
+                    present_pending: false,
+                    display_moved: false,
                     tree,
                 }],
             },
@@ -319,6 +320,8 @@ async fn render<R: Renderer>(
                     display: Display::default(),
                     clear: WorkingColor::new([0.1, 0.2, 0.3, 1.]),
                     changed: true,
+                    present_pending: false,
+                    display_moved: false,
                     tree,
                 }],
             },

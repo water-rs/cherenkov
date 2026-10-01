@@ -79,10 +79,12 @@ pub enum EffectSetupError {
         /// The wgpu diagnostic.
         message: String,
     },
-    /// The first pass samples the input through a filtering sampler, but the
-    /// input format is not filterable.
+    /// The effect samples its input through a filtering sampler — the
+    /// executor's first pass, or a [`ShaderEffect`](crate::ShaderEffect)
+    /// that reads `input_sampler` — but the device cannot filter the input
+    /// format.
     #[error(
-        "input format {format:?} is not filterable, but the first stage samples it with filtering"
+        "input format {format:?} is not filterable, but the effect samples its input with a filtering sampler"
     )]
     InputNotFilterable {
         /// The input format.

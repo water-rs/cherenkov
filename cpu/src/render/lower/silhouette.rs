@@ -1,8 +1,9 @@
 //! Coverage convolution for silhouettes without an analytic shadow form.
-use super::{FLATTEN_TOL, Item, Lowering, coverage_mask, flatten_edges, shape_path};
+use super::{FLATTEN_TOL, Item, Lowering, coverage_mask, flatten_edges};
 use crate::names;
 use crate::render::{glyph::GlyphMask, paint::PaintData};
 use cherenkov::lowering::shadow::{capture_padding, gaussian_taps, spread_taps};
+use cherenkov::lowering::shape_outline;
 use cherenkov::{RenderError, Shadow, ShapeData};
 use kurbo::Affine;
 use std::sync::{Arc, OnceLock};
@@ -56,7 +57,7 @@ impl Lowering<'_, '_> {
             .filter(|n| *n <= isize::MAX as usize / 4)
             .ok_or_else(|| RenderError::Render("shadow coverage overflow".into()))?;
         let scale = ma.hypot(mb).max(mc.hypot(md)).max(1e-12);
-        let Some((path, rule)) = shape_path(shape, FLATTEN_TOL / scale) else {
+        let Some((path, rule)) = shape_outline(shape, FLATTEN_TOL / scale) else {
             return Err(RenderError::Unsupported(names::SHADOW));
         };
         let placement = Affine::translate((px as f64, py as f64))

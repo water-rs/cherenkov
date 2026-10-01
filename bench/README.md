@@ -4,6 +4,12 @@ Engine adapters and the render/measure CLI for the Cherenkov cross-engine
 suite. Adapters are feature-gated: `vello-classic`, `vello-hybrid`,
 `vello-cpu`, `skia`, `skia-metal`.
 
+The scene trees every command below reads (`scenes/corpus`, `scenes/perf`)
+and the fonts they shape with (`scenes/fonts`) are generated, not
+committed. Produce them once per checkout with
+`python3 scenes/tools/generate.py` (its Python steps need
+`python3 -m pip install -r scenes/fonts/tools/requirements.txt`).
+
 ## Native resolution
 
 `measure --native WxH` renders into a `W`×`H` surface — the device's own

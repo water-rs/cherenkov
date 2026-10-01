@@ -18,28 +18,37 @@ use crate::style::FilterId;
 
 /// The backend draws user WGSL shader paints.
 pub trait ShaderPaint: Backend {
-    /// Registers a shader on the render thread.
+    /// Validates the source on the caller thread, before anything is
+    /// queued: everything the backend can check without its device.
     ///
     /// # Errors
-    /// [`ResourceError::Shader`] when the source fails validation or
-    /// pipeline creation.
+    /// [`ResourceError::Shader`] when the source fails validation.
+    fn validate_shader(source: &ShaderSource) -> Result<(), ResourceError>;
+    /// Registers a shader [`ShaderPaint::validate_shader`] accepted, on the
+    /// render thread. A rejection fails every later render that draws the
+    /// shader with [`RenderError::Rejected`](crate::RenderError::Rejected).
+    ///
+    /// # Errors
+    /// [`ResourceError::Shader`] when pipeline creation fails.
     #[cfg(not(target_arch = "wasm32"))]
     fn add_shader(
         r: &mut Self::Renderer,
         id: ShaderId,
         source: ShaderSource,
     ) -> Result<(), ResourceError>;
-    /// Validates shader registration without blocking the JS event loop.
+    /// Registers a shader [`ShaderPaint::validate_shader`] accepted, on the
+    /// owning JS thread, awaiting the browser's pipeline creation without
+    /// blocking its event loop.
     ///
     /// # Errors
-    /// Returns shader validation errors.
+    /// [`ResourceError::Shader`] when pipeline creation fails.
     #[cfg(target_arch = "wasm32")]
     fn add_shader(
         r: &mut Self::Renderer,
         id: ShaderId,
         source: ShaderSource,
     ) -> impl core::future::Future<Output = Result<(), ResourceError>>;
-    /// Unregisters a shader.
+    /// Unregisters a shader no installed content draws any more.
     fn remove_shader(r: &mut Self::Renderer, id: ShaderId);
 }
 
@@ -155,13 +164,22 @@ pub trait BackdropRuns<K: filtrate_core::kind::Kind, F: BackdropChain<K> + crate
 /// The backend compiles per-member backdrop effect shaders
 /// (`Engine::backdrop_shader`).
 pub trait BackdropShaders: Backdrop {
-    /// Registers a backdrop effect shader on the render thread, compiled
-    /// for the composite contract; the pipeline is built here, never at
-    /// draw time.
+    /// Validates the source on the caller thread, before anything is
+    /// queued: everything the backend can check without its device.
     ///
     /// # Errors
-    /// [`ResourceError::Shader`] when the source fails validation or
-    /// pipeline creation.
+    /// [`ResourceError::Shader`] when the source fails validation.
+    fn validate_backdrop_shader(source: &crate::BackdropShaderSource) -> Result<(), ResourceError>;
+
+    /// Registers a backdrop effect shader
+    /// [`BackdropShaders::validate_backdrop_shader`] accepted, on the render
+    /// thread, compiled for the composite contract; the pipeline is built
+    /// here, never at draw time. A rejection fails every later render that
+    /// samples the shader with
+    /// [`RenderError::Rejected`](crate::RenderError::Rejected).
+    ///
+    /// # Errors
+    /// [`ResourceError::Shader`] when pipeline creation fails.
     #[cfg(not(target_arch = "wasm32"))]
     fn add_backdrop_shader(
         r: &mut Self::Renderer,
@@ -169,11 +187,13 @@ pub trait BackdropShaders: Backdrop {
         source: crate::BackdropShaderSource,
     ) -> Result<(), ResourceError>;
 
-    /// Validates backdrop effect shader registration without blocking the
-    /// JS event loop.
+    /// Registers a backdrop effect shader
+    /// [`BackdropShaders::validate_backdrop_shader`] accepted, on the owning
+    /// JS thread, awaiting the browser's pipeline creation without blocking
+    /// its event loop.
     ///
     /// # Errors
-    /// Returns shader validation errors.
+    /// [`ResourceError::Shader`] when pipeline creation fails.
     #[cfg(target_arch = "wasm32")]
     fn add_backdrop_shader(
         r: &mut Self::Renderer,
@@ -181,13 +201,20 @@ pub trait BackdropShaders: Backdrop {
         source: crate::BackdropShaderSource,
     ) -> impl core::future::Future<Output = Result<(), ResourceError>>;
 
-    /// Unregisters a backdrop effect shader; frames that still sample it
-    /// fail.
+    /// Unregisters a backdrop effect shader no layer samples any more.
     fn remove_backdrop_shader(r: &mut Self::Renderer, id: BackdropShaderId);
 }
 
 /// The backend produces HDR output.
 pub trait HdrOutput: Backend {}
+
+/// The backend composes projective layers (`LayerEdit::projection`).
+///
+/// It renders a projective layer's subtree into a bounded
+/// layer-local image and projects that image during composition. A
+/// banded backend that cannot hold the bounded local image does not
+/// implement it.
+pub trait ProjectiveLayers: Backend {}
 
 /// The backend presents on multiple hardware planes.
 pub trait Planes: Backend {}

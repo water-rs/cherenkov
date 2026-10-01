@@ -62,7 +62,7 @@ impl Class {
             "clip mask" => Self::MaskTexture,
             "image" => Self::Image,
             "surface target" | "isolation scratch" | "blend backdrop" | "backdrop capture"
-            | "dummy source" | "source texture" => Self::Target,
+            | "dummy source" | "source texture" | "projective image" => Self::Target,
             _ => Self::Other,
         }
     }
@@ -504,6 +504,7 @@ impl Sink {
 }
 
 thread_local! {
+    #[allow(clippy::missing_const_for_thread_local)]
     static ACTIVE: RefCell<Option<Sink>> = const { RefCell::new(None) };
 }
 

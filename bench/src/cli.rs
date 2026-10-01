@@ -1,5 +1,9 @@
 //! `cherenkov-bench`: cross-engine correctness and performance runner.
 //!
+//! The corpora (`scenes/corpus`, `scenes/perf`) and fonts
+//! (`scenes/fonts`) are generated, not committed — run
+//! `python3 scenes/tools/generate.py` first.
+//!
 //! - `render --engine E --scene DIR --out FILE` renders one scene against
 //!   the oracle and writes the engine's image, an error heatmap and a
 //!   metrics JSON. `--corpus DIR --out-dir DIR` sweeps a corpus.
@@ -31,10 +35,12 @@ use std::ffi::OsString;
 use std::ffi::{CStr, OsStr, c_char, c_int};
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::convert;
 use crate::memory::{MemoryReport, MemorySnapshot, SampleDetail};
+use crate::refcache;
 use crate::report::{
     CapacityProbe, CapacityReport, CapacityResult, CpuUse, FrameSample, MeasureReport,
     NativeResolution, Pacing, PassPercentiles, Percentiles, PhasePercentiles, Placement,
@@ -69,15 +75,6 @@ pub(crate) enum PresentPattern {
     Mixed,
 }
 
-/// `present-cost --encode` choices; see [`crate::present_cost`].
-#[derive(Clone, Copy, Debug, clap::ValueEnum)]
-pub(crate) enum PresentEncode {
-    /// `Rgba8UnormSrgb` destination; hardware applies the transfer.
-    SrgbHw,
-    /// `Rgba8Unorm` destination; the shader applies the transfer.
-    SrgbShader,
-}
-
 #[derive(Subcommand)]
 enum Sub {
     /// Render scene(s) and report correctness metrics vs the oracle.
@@ -104,6 +101,28 @@ enum Sub {
         /// fail.
         #[arg(long, value_enum)]
         present: Option<crate::PresentKind>,
+        /// Directory of pre-rendered `<scene>.ref` oracle images (built by
+        /// `cherenkov-bench reference`) to compare against instead of
+        /// re-rendering the `f64` reference in this pass. A file whose
+        /// fingerprint does not match the scene's current inputs fails.
+        #[arg(long, value_name = "DIR")]
+        reference: Option<PathBuf>,
+    },
+    /// Render each scene's `f64` oracle image once into `<scene>.ref`
+    /// files that `render --reference` passes share — the oracle's inputs
+    /// are the scene alone, so the reference need not be recomputed per
+    /// engine or presentation kind. Scenes render in parallel across all
+    /// cores.
+    Reference {
+        /// One scene directory (`scene.json` + `resources/`).
+        #[arg(long, conflicts_with = "corpus", required_unless_present = "corpus")]
+        scene: Option<PathBuf>,
+        /// Corpus directory; every child holding a `scene.json` is cached.
+        #[arg(long)]
+        corpus: Option<PathBuf>,
+        /// Cache directory for the `<scene>.ref` files.
+        #[arg(long)]
+        out_dir: PathBuf,
     },
     /// Measure encode/submit/GPU frame times.
     Measure {
@@ -239,10 +258,11 @@ enum Sub {
         native: Option<String>,
     },
     /// Time the presentation pass alone — one `Presenter::texture_timed`
-    /// call per frame into an offscreen sRGB texture, bracketed by
-    /// pass-boundary GPU timestamps (#96). Requires the `cherenkov`
-    /// feature. On the M1 and iPad this is the gamut-map cost evidence;
-    /// on a shared VM it is a sanity check only.
+    /// call per frame into an offscreen texture of the `--present`
+    /// kind's format, bracketed by pass-boundary GPU timestamps (#96).
+    /// Requires the `cherenkov` feature. On the M1 and iPad this is the
+    /// gamut-map and encode cost evidence; on a shared VM it is a
+    /// sanity check only.
     PresentCost {
         /// Destination size, `WxH` — the iPad-class 2752x2064 by default.
         #[arg(long, default_value = "2752x2064", value_name = "WxH")]
@@ -257,9 +277,10 @@ enum Sub {
         /// in-gamut.
         #[arg(long, value_enum, default_value = "oog")]
         pattern: PresentPattern,
-        /// Encode path timed: hardware sRGB transfer or the shader one.
-        #[arg(long, value_enum, default_value = "srgb-hw")]
-        encode: PresentEncode,
+        /// Presentation output kind timed — the same kinds as
+        /// `render --present` (#98 added the wide-gamut and HDR kinds).
+        #[arg(long, value_enum, default_value = "srgb-hw", alias = "encode")]
+        present: crate::PresentKind,
         /// Display headroom presented to (#97). Above 1 exercises the
         /// tone-map shoulder on the `oog` pattern's HDR channels.
         #[arg(long, default_value_t = 4.0)]
@@ -281,6 +302,18 @@ enum Sub {
     /// plateau onset and hue preservation (#97). No engine — pure oracle
     /// `f64` math.
     ToneSweep {
+        /// Report text path; stdout when omitted.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Render projective scenes in the oracle with the specified model and
+    /// with two successively refined quality references, and report the
+    /// model's distance from the finest reference and the references'
+    /// convergence (#84). No engine — pure oracle `f64` math.
+    ProjectiveQuality {
+        /// Scene directories.
+        #[arg(long = "scene", required = true)]
+        scenes: Vec<PathBuf>,
         /// Report text path; stdout when omitted.
         #[arg(long)]
         out: Option<PathBuf>,
@@ -383,6 +416,7 @@ fn run(cli: Cli) -> Result<(), BenchError> {
             out,
             out_dir,
             present,
+            reference,
         } => render_cmd(
             &engine,
             scene.as_deref(),
@@ -390,7 +424,13 @@ fn run(cli: Cli) -> Result<(), BenchError> {
             out.as_deref(),
             out_dir.as_deref(),
             present,
+            reference.as_deref(),
         ),
+        Sub::Reference {
+            scene,
+            corpus,
+            out_dir,
+        } => reference_cmd(scene.as_deref(), corpus.as_deref(), &out_dir),
         Sub::Measure {
             engine,
             scene,
@@ -469,7 +509,7 @@ fn run(cli: Cli) -> Result<(), BenchError> {
             frames,
             warmup,
             pattern,
-            encode,
+            present,
             headroom,
             out,
         } => present_cost_cmd(
@@ -477,12 +517,15 @@ fn run(cli: Cli) -> Result<(), BenchError> {
             frames,
             warmup,
             pattern,
-            encode,
+            present,
             headroom,
             &out,
         ),
         Sub::GamutSweep { out } => crate::gamut_sweep::run(out.as_deref()),
         Sub::ToneSweep { out } => crate::tone_sweep::run(out.as_deref()),
+        Sub::ProjectiveQuality { scenes, out } => {
+            crate::projective_quality::run(&scenes, out.as_deref())
+        }
     }
 }
 
@@ -493,12 +536,12 @@ fn present_cost_cmd(
     frames: u32,
     warmup: u32,
     pattern: PresentPattern,
-    encode: PresentEncode,
+    present: crate::PresentKind,
     headroom: f32,
     out: &Path,
 ) -> Result<(), BenchError> {
     let size = parse_native(Some(size))?.expect("size is required");
-    crate::present_cost::run(size, frames, warmup, pattern, encode, headroom, out)
+    crate::present_cost::run(size, frames, warmup, pattern, present, headroom, out)
 }
 
 #[cfg(not(feature = "cherenkov"))]
@@ -507,7 +550,7 @@ fn present_cost_cmd(
     _frames: u32,
     _warmup: u32,
     _pattern: PresentPattern,
-    _encode: PresentEncode,
+    _present: crate::PresentKind,
     _headroom: f32,
     _out: &Path,
 ) -> Result<(), BenchError> {
@@ -649,6 +692,47 @@ struct MeasureOpts<'a> {
     native: Option<&'a str>,
 }
 
+/// Wall-clock seconds a `render` scene (or a whole pass) spent in each
+/// phase. `render` and `readback` split `Engine::submit` using the
+/// adapter-reported halves; an adapter that does not split reports its
+/// whole submit under `render`.
+#[derive(Clone, Copy, Debug, Default)]
+struct PhaseTiming {
+    /// `Scene::load` plus the blob reads.
+    load: f64,
+    /// The oracle `f64` render and, under `--present`, the reference's
+    /// presentation of it.
+    reference: f64,
+    /// `Engine::prepare`.
+    prepare: f64,
+    /// `Engine::encode`.
+    encode: f64,
+    /// `Engine::submit` minus its readback half.
+    render: f64,
+    /// `Engine::submit`'s pixel readback.
+    readback: f64,
+    /// `Engine::trim`, the memory snapshots and the counters read.
+    trim: f64,
+    /// `metrics::compare` (FLIP, max local error, heatmap).
+    compare: f64,
+    /// `write_render` / `write_unsupported` (PNGs plus the report JSON).
+    write: f64,
+}
+
+impl std::ops::AddAssign for PhaseTiming {
+    fn add_assign(&mut self, rhs: Self) {
+        self.load += rhs.load;
+        self.reference += rhs.reference;
+        self.prepare += rhs.prepare;
+        self.encode += rhs.encode;
+        self.render += rhs.render;
+        self.readback += rhs.readback;
+        self.trim += rhs.trim;
+        self.compare += rhs.compare;
+        self.write += rhs.write;
+    }
+}
+
 /// The `render` subcommand: every scene in the corpus, or the one
 /// `--scene`, against the oracle.
 fn render_cmd(
@@ -658,31 +742,62 @@ fn render_cmd(
     out: Option<&Path>,
     out_dir: Option<&Path>,
     present: Option<crate::PresentKind>,
+    reference: Option<&Path>,
 ) -> Result<(), BenchError> {
+    let pass_at = Instant::now();
     let mut engine = create_engine(engine)?;
     let idle_memory = MemorySnapshot::capture(engine.memory(), SampleDetail::Full);
     if let Some(kind) = present {
         engine.present(kind)?;
     }
+    let setup_seconds = pass_at.elapsed().as_secs_f64();
+    tracing::info!(
+        engine = engine.info().name,
+        setup_s = setup_seconds,
+        "adapter ready"
+    );
+    let mut totals = PhaseTiming::default();
+    let mut scenes = 0u32;
     for dir in scene_dirs(scene, corpus)? {
+        scenes += 1;
         let out_path = match (out, out_dir) {
             (Some(o), None) => o.to_path_buf(),
             (None, Some(d)) => d.join(render_report_name(engine.info().name, present, &dir)),
             _ => return Err(BenchError::Engine("--out or --out-dir required".into())),
         };
-        match render_scene(&mut *engine, &dir, idle_memory.clone(), present) {
+        let mut t = PhaseTiming::default();
+        match render_scene(
+            &mut *engine,
+            &dir,
+            idle_memory.clone(),
+            present,
+            reference,
+            &mut t,
+        ) {
             Ok(rendered) => {
+                let write_at = Instant::now();
                 write_render(&rendered, &out_path)?;
+                t.write = write_at.elapsed().as_secs_f64();
+                totals += t;
                 tracing::info!(
                     scene = %dir.display(),
                     flip_mean = rendered.report.metrics.flip_mean,
                     flip_max = rendered.report.metrics.flip_max,
                     max_local_error = rendered.report.metrics.max_local_error,
+                    load_s = t.load,
+                    reference_s = t.reference,
+                    prepare_s = t.prepare,
+                    encode_s = t.encode,
+                    render_s = t.render,
+                    readback_s = t.readback,
+                    compare_s = t.compare,
+                    write_s = t.write,
                     out = %out_path.display(),
                     "render"
                 );
             }
             Err(BenchError::Unsupported { feature, api, .. }) => {
+                let write_at = Instant::now();
                 write_unsupported(
                     &*engine,
                     &dir,
@@ -691,9 +806,14 @@ fn render_cmd(
                     idle_memory.clone(),
                     &out_path,
                 )?;
+                t.write = write_at.elapsed().as_secs_f64();
+                totals += t;
                 tracing::warn!(
                     scene = %dir.display(),
                     ?feature,
+                    load_s = t.load,
+                    reference_s = t.reference,
+                    prepare_s = t.prepare,
                     out = %out_path.display(),
                     "unsupported"
                 );
@@ -701,6 +821,100 @@ fn render_cmd(
             Err(e) => return Err(e),
         }
     }
+    tracing::info!(
+        engine = engine.info().name,
+        scenes,
+        wall_s = pass_at.elapsed().as_secs_f64(),
+        load_s = totals.load,
+        reference_s = totals.reference,
+        prepare_s = totals.prepare,
+        encode_s = totals.encode,
+        render_s = totals.render,
+        readback_s = totals.readback,
+        trim_s = totals.trim,
+        compare_s = totals.compare,
+        write_s = totals.write,
+        "render pass totals"
+    );
+    Ok(())
+}
+
+/// The `reference` subcommand: every scene's oracle `f64` image into
+/// `<scene>.ref` files under `--out-dir`, in parallel across the
+/// available cores — the per-scene oracle render is independent.
+fn reference_cmd(
+    scene: Option<&Path>,
+    corpus: Option<&Path>,
+    out_dir: &Path,
+) -> Result<(), BenchError> {
+    let dirs = scene_dirs(scene, corpus)?;
+    let threads = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let pass_at = Instant::now();
+    let next = AtomicUsize::new(0);
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let outcome = std::thread::scope(|s| {
+        let mut handles = Vec::new();
+        for _ in 0..threads.min(dirs.len()) {
+            handles.push(s.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(dir) = dirs.get(i) else {
+                        return Ok(());
+                    };
+                    if let Err(e) = reference_scene(dir, out_dir) {
+                        stop.store(true, Ordering::Relaxed);
+                        return Err(e);
+                    }
+                }
+                Ok(())
+            }));
+        }
+        let mut first_err = None;
+        for h in handles {
+            match h.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
+        }
+        first_err
+    });
+    if let Some(e) = outcome {
+        return Err(e);
+    }
+    tracing::info!(
+        scenes = dirs.len(),
+        threads,
+        wall_s = pass_at.elapsed().as_secs_f64(),
+        "reference pass totals"
+    );
+    Ok(())
+}
+
+/// One scene's oracle `f64` render into `out_dir`'s `<scene>.ref`.
+fn reference_scene(dir: &Path, out_dir: &Path) -> Result<(), BenchError> {
+    let at = Instant::now();
+    let scene = Scene::load(dir)?;
+    let blobs = convert::load_blobs(&scene, dir)?;
+    let image =
+        Renderer::new(scene.width as usize, scene.height as usize).render_image(&scene, dir)?;
+    let scene_json = std::fs::read(dir.join("scene.json"))?;
+    let name = dir.file_name().unwrap_or_default().to_string_lossy();
+    refcache::write(
+        out_dir,
+        &name,
+        refcache::fingerprint(&scene_json, &blobs),
+        &image,
+    )?;
+    tracing::info!(
+        scene = %dir.display(),
+        reference_s = at.elapsed().as_secs_f64(),
+        "reference"
+    );
     Ok(())
 }
 
@@ -883,61 +1097,107 @@ struct RenderOutput {
     heatmap: Vec<u8>,
 }
 
+/// The oracle's f64 image through the matching presentation function,
+/// quantized to the destination's storage and lifted back into the
+/// working space where both sides of the comparison live.
+fn present_image(
+    kind: crate::PresentKind,
+    headroom: f64,
+    image: &cherenkov_oracle::Image,
+) -> cherenkov_oracle::F32Image {
+    use crate::PresentKind as K;
+    let presented = match kind {
+        K::LinearP3 => cherenkov_oracle::present::present_linear_p3(headroom, image),
+        K::SrgbHw | K::SrgbShader => cherenkov_oracle::present::present_srgb(headroom, image),
+        K::DisplayP3Hw | K::DisplayP3Shader => {
+            cherenkov_oracle::present::present_display_p3(headroom, image)
+        }
+        K::Scrgb => cherenkov_oracle::present::present_extended_srgb_linear(headroom, image),
+        K::ExtendedSrgb => cherenkov_oracle::present::present_extended_srgb(headroom, image),
+        K::ExtendedP3 => cherenkov_oracle::present::present_extended_display_p3(headroom, image),
+        K::Pq => cherenkov_oracle::present::present_pq(headroom, image),
+        K::Hlg => cherenkov_oracle::present::present_hlg(headroom, image),
+    };
+    // The ideal presented image is what the destination stores: the
+    // unorm-8 kinds quantize the encoded channels so the metric measures
+    // the pass, not the format's floor.
+    let lift: fn([f64; 4]) -> [f64; 4] = match kind {
+        K::LinearP3 => |p| p,
+        K::SrgbHw | K::SrgbShader => cherenkov_oracle::present::presented_srgb_to_working,
+        K::DisplayP3Hw | K::DisplayP3Shader => {
+            cherenkov_oracle::present::presented_display_p3_to_working
+        }
+        K::Scrgb => |p| cherenkov_oracle::present::presented_extended_srgb_to_working(false, p),
+        K::ExtendedSrgb => {
+            |p| cherenkov_oracle::present::presented_extended_srgb_to_working(true, p)
+        }
+        K::ExtendedP3 => cherenkov_oracle::present::presented_extended_p3_to_working,
+        K::Pq => cherenkov_oracle::present::presented_pq_to_working,
+        K::Hlg => cherenkov_oracle::present::presented_hlg_to_working,
+    };
+    let unorm8 = matches!(
+        kind,
+        K::SrgbHw | K::SrgbShader | K::DisplayP3Hw | K::DisplayP3Shader
+    );
+    let stored = if unorm8 {
+        cherenkov_oracle::present::quantize_unorm8(&presented)
+    } else {
+        presented
+    };
+    let working = cherenkov_oracle::Image {
+        width: stored.width,
+        height: stored.height,
+        pixels: stored.pixels.iter().map(|&p| lift(p)).collect(),
+    };
+    cherenkov_oracle::F32Image::from_f64(&working)
+}
+
 fn render_scene(
     engine: &mut dyn Engine,
     dir: &Path,
     idle_memory: MemorySnapshot,
     present: Option<crate::PresentKind>,
+    reference_dir: Option<&Path>,
+    t: &mut PhaseTiming,
 ) -> Result<RenderOutput, BenchError> {
+    let at = Instant::now();
     let scene = Scene::load(dir)?;
     let blobs = convert::load_blobs(&scene, dir)?;
-    let renderer = Renderer::new(scene.width as usize, scene.height as usize);
-    // With `--present` the reference is the oracle's `f64` image through
-    // the matching presentation function — quantized to the destination's
-    // unorm-8 storage for the sRGB kinds — lifted back into the working
-    // space where the output was encoded.
-    let reference = match present {
-        None => renderer.render(&scene, dir)?,
-        Some(kind) => {
-            let image = renderer.render_image(&scene, dir)?;
-            let headroom = scene.present_headroom;
-            let presented = match kind {
-                crate::PresentKind::LinearP3 => {
-                    cherenkov_oracle::present::present_linear_p3(headroom, &image)
-                }
-                crate::PresentKind::SrgbHw | crate::PresentKind::SrgbShader => {
-                    cherenkov_oracle::present::present_srgb(headroom, &image)
-                }
-            };
-            let working = match kind {
-                crate::PresentKind::LinearP3 => presented,
-                crate::PresentKind::SrgbHw | crate::PresentKind::SrgbShader => {
-                    // The ideal presented image is what the u8 destination
-                    // stores: quantize the encoded channels so the metric
-                    // measures the pass, not the format's floor.
-                    let quantized = cherenkov_oracle::present::quantize_unorm8(&presented);
-                    cherenkov_oracle::Image {
-                        width: quantized.width,
-                        height: quantized.height,
-                        pixels: quantized
-                            .pixels
-                            .iter()
-                            .map(|&p| cherenkov_oracle::present::presented_srgb_to_working(p))
-                            .collect(),
-                    }
-                }
-            };
-            cherenkov_oracle::F32Image::from_f64(&working)
+    t.load = at.elapsed().as_secs_f64();
+    let at = Instant::now();
+    let image = match reference_dir {
+        Some(cache) => refcache::read(
+            cache,
+            &dir.file_name().unwrap_or_default().to_string_lossy(),
+            refcache::fingerprint(&std::fs::read(dir.join("scene.json"))?, &blobs),
+            (scene.width as usize, scene.height as usize),
+        )?,
+        None => {
+            Renderer::new(scene.width as usize, scene.height as usize).render_image(&scene, dir)?
         }
     };
+    let reference = match present {
+        None => F32Image::from_f64(&image),
+        Some(kind) => present_image(kind, scene.present_headroom, &image),
+    };
+    t.reference = at.elapsed().as_secs_f64();
     let input = EncodeInput {
         scene: &scene,
         blobs: &blobs,
     };
+    let at = Instant::now();
     engine.prepare(&input)?;
+    t.prepare = at.elapsed().as_secs_f64();
     let prepare_memory = MemorySnapshot::capture(engine.memory(), SampleDetail::Full);
+    let at = Instant::now();
     engine.encode(&input)?;
+    t.encode = at.elapsed().as_secs_f64();
+    let submit_at = Instant::now();
     let submit = engine.submit(0, true)?;
+    let submit_seconds = submit_at.elapsed().as_secs_f64();
+    t.readback = submit.readback_seconds.unwrap_or(0.0);
+    t.render = submit.render_seconds.unwrap_or(submit_seconds - t.readback);
+    let at = Instant::now();
     let steady_memory = MemorySnapshot::capture(engine.memory(), SampleDetail::Full);
     // Counters embed a memory snapshot; take them at steady state,
     // before retirement shrinks what the engine reports.
@@ -946,10 +1206,13 @@ fn render_scene(
     // explicit retirement pass, after the window and its submission.
     engine.trim()?;
     let post_retire_memory = MemorySnapshot::capture(engine.memory(), SampleDetail::Full);
+    t.trim = at.elapsed().as_secs_f64();
     let test = submit
         .image
         .ok_or_else(|| BenchError::Engine("adapter returned no image".into()))?;
+    let at = Instant::now();
     let (metrics_v, heatmap) = metrics::compare(&reference, &test);
+    t.compare = at.elapsed().as_secs_f64();
     Ok(RenderOutput {
         report: RenderReport {
             engine: engine.info().name,

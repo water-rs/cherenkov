@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::animation::AnimLanes;
 use crate::color::{Color, ColorSpace, DynColor, WorkingColor};
+use crate::resource::ResourceId;
 
 /// What fills a shape or a glyph.
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -305,17 +306,14 @@ impl Paint {
         Self::Transformed(TransformedPaint::new(self, transform))
     }
 
-    /// Whether this paint samples image `id`.
-    pub(crate) fn references_image(&self, id: ImageId) -> bool {
-        match self {
-            Self::Image(pattern) => pattern.image == id,
-            Self::Transformed(transformed) => transformed.paint.references_image(id),
-            Self::Solid(_)
-            | Self::Linear(_)
-            | Self::Radial(_)
-            | Self::Sweep(_)
-            | Self::Mesh(_)
-            | Self::Shader(_) => false,
+    /// Whether this paint samples `resource`: its image pattern's image or
+    /// its shader paint's shader.
+    pub(crate) fn references(&self, resource: ResourceId) -> bool {
+        match (self, resource) {
+            (Self::Image(pattern), ResourceId::Image(id)) => pattern.image == id,
+            (Self::Shader(shader), ResourceId::Shader(id)) => shader.shader == id,
+            (Self::Transformed(transformed), _) => transformed.paint.references(resource),
+            _ => false,
         }
     }
 }

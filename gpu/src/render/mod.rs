@@ -4,7 +4,7 @@ mod bindings;
 mod bitmap;
 mod colr;
 pub mod diag;
-mod external;
+pub mod external;
 pub mod filter;
 mod glyph;
 mod gpu_content;
@@ -14,6 +14,7 @@ mod paint;
 mod path;
 mod prepared;
 pub mod present;
+mod projective;
 mod raster;
 pub mod shaders;
 mod shadow;
@@ -32,10 +33,10 @@ use bitmap::BitmapKey;
 use cherenkov::{
     ContentOp, EngineError, FontData as EngineFontData, FontId, Frame, FrameId, FrameStats,
     FrameTiming, ImageId, ImageUpload, LayerId, MemoryUsage, PassTiming, Pressure, Readback,
-    Redraw, RenderError, Renderer, ResourceError, SurfaceError, SurfaceFrame, SurfaceId,
-    SurfaceInfo,
+    Redraw, RenderError, Renderer, ResourceError, ResourceId, SurfaceError, SurfaceFrame,
+    SurfaceId, SurfaceInfo,
 };
-use glyph::{Atlas, FontData, PendingRaster};
+use glyph::{Atlas, FontData, PendingRaster, PreparedFont};
 use lower::{
     BackdropGroupInfo, ContentData, Frame as LoweredFrame, GlyphContext, Lowered, Lowering,
     PipelineKind, ShaderVariant, Source, Target,
@@ -49,6 +50,8 @@ use shaders::backdrop_effect_text;
 enum Bound {
     Engine(PipelineKind, ShaderVariant),
     External,
+    /// The projective composite, source-over or replace.
+    Projective(bool),
 }
 
 /// The surface target format: premultiplied linear Display P3.
@@ -152,6 +155,9 @@ struct SurfaceState {
     textures: Option<std::sync::mpsc::Sender<wgpu::Texture>>,
     refresh: cherenkov::RefreshRange,
     present_pending: bool,
+    /// The last display properties the frame carried — a change triggers
+    /// the window's output re-selection (#98).
+    display: cherenkov::Display,
     size: (u32, u32),
     /// The scratch texture format (set at creation).
     scratch_format: wgpu::TextureFormat,
@@ -186,6 +192,16 @@ struct SurfaceState {
     /// The `(bind_gen, images_gen, mask_texture_gen)` triple `binds1` was
     /// built under.
     binds1_stamp: (u64, u64, u64),
+    /// Projective layers' retained local images (#84), by layer, one per
+    /// density bucket.
+    projective: FxHashMap<LayerId, Vec<projective::Entry>>,
+    /// The local images this frame renders, allocated before encoding.
+    realized: Vec<projective::Realize>,
+    /// The local images this frame composes.
+    composed: Vec<projective::LocalKey>,
+    /// Bumped whenever GPU content or an external frame is installed or
+    /// resized: local images that sampled one are then stale.
+    interop: u64,
 }
 
 /// A registered backdrop group: its optional capture filter and the
@@ -238,6 +254,57 @@ impl SurfaceState {
             .sum()
     }
 
+    /// Retained local images whose renderer-side inputs changed since
+    /// they were realized: an animating filter, redrawn GPU content, an
+    /// animated shader paint, or a new GPU content or external frame.
+    fn stale_projective(
+        &self,
+        filters: &filter::Registry,
+        shaders: &paint::Registry,
+    ) -> FxHashSet<projective::LocalKey> {
+        self.projective
+            .iter()
+            .flat_map(|(layer, entries)| entries.iter().map(move |e| (*layer, e)))
+            .filter(|(_, e)| {
+                e.deps.interop.is_some_and(|g| g != self.interop)
+                    || e.deps.filters.iter().any(|f| filters.wants_redraw(*f))
+                    || e.deps.images.iter().any(|image| match image {
+                        lower::ImageSource::Content(layer) => self
+                            .content
+                            .get(layer)
+                            .is_none_or(gpu_content::Slot::wants_redraw),
+                        lower::ImageSource::Shader(key) => shaders.animated(key),
+                        _ => false,
+                    })
+            })
+            .map(|(layer, e)| projective::LocalKey {
+                layer,
+                bucket: e.bucket,
+            })
+            .collect()
+    }
+
+    /// Whether a local image the latest frame composed went stale.
+    fn projective_wants_redraw(
+        &self,
+        filters: &filter::Registry,
+        shaders: &paint::Registry,
+    ) -> bool {
+        !self.composed.is_empty() && {
+            let stale = self.stale_projective(filters, shaders);
+            self.composed.iter().any(|key| stale.contains(key))
+        }
+    }
+
+    /// Bytes held by this surface's retained local images.
+    fn projective_bytes(&self) -> u64 {
+        self.projective
+            .values()
+            .flatten()
+            .map(projective::Entry::bytes)
+            .sum()
+    }
+
     fn content_wants_redraw(&self) -> bool {
         !self.content.is_empty()
             && self.frame.content.iter().any(|id| {
@@ -283,6 +350,7 @@ impl SurfaceState {
             + scratch_bytes
             + backdrop_bytes
             + shader_bytes
+            + self.projective_bytes()
             + self
                 .content
                 .values()
@@ -295,6 +363,70 @@ impl SurfaceState {
                 .map(|_| external::Slot::GPU_BYTES)
                 .sum::<u64>()
             + self.backdrop_bytes()
+    }
+}
+
+/// The retained local image `key` names: the frame composes only images
+/// it realized or found current, so a missing one is a lowering bug.
+fn projective_entry(
+    entries: &FxHashMap<LayerId, Vec<projective::Entry>>,
+    key: projective::LocalKey,
+) -> &projective::Entry {
+    entries
+        .get(&key.layer)
+        .and_then(|entries| entries.iter().find(|e| e.bucket == key.bucket))
+        .expect("a composed local image is retained")
+}
+
+/// [`projective_entry`], mutably.
+fn projective_entry_mut(
+    entries: &mut FxHashMap<LayerId, Vec<projective::Entry>>,
+    key: projective::LocalKey,
+) -> &mut projective::Entry {
+    entries
+        .get_mut(&key.layer)
+        .and_then(|entries| entries.iter_mut().find(|e| e.bucket == key.bucket))
+        .expect("a composed local image is retained")
+}
+
+/// Drops the retained local images of `surf` that `dead` selects and
+/// forgets them as composed.
+fn retire_projective(
+    surf: &mut SurfaceState,
+    device: &wgpu::Device,
+    reason: &'static str,
+    dead: impl Fn(LayerId, &projective::Entry) -> bool,
+) {
+    let mut bytes = 0;
+    let mut composed = false;
+    for (layer, entries) in &mut surf.projective {
+        entries.retain(|entry| {
+            if !dead(*layer, entry) {
+                return true;
+            }
+            bytes += entry.bytes();
+            let key = projective::LocalKey {
+                layer: *layer,
+                bucket: entry.bucket,
+            };
+            let before = surf.composed.len();
+            surf.composed.retain(|k| *k != key);
+            composed |= surf.composed.len() != before;
+            false
+        });
+    }
+    surf.projective.retain(|_, entries| !entries.is_empty());
+    if bytes > 0 {
+        diag::retire(
+            device,
+            diag::RetireArgs {
+                label: "projective image",
+                class: diag::Class::Target,
+                bytes,
+                used_in_latest_submit: composed,
+                reason,
+            },
+        );
     }
 }
 
@@ -385,6 +517,15 @@ pub struct GpuRenderer {
     /// `[format index]` external pipelines: 0 = surface, 1 = scratch —
     /// `None` until the first external draw prepares them.
     external_pipes: [Option<wgpu::RenderPipeline>; 2],
+    /// The Vulkan native external-frame context (issue #166): descriptors,
+    /// render passes and pipelines for multiplanar and external-format
+    /// frames, built at init when the device is Vulkan.
+    #[cfg(all(unix, not(target_vendor = "apple")))]
+    native: Option<external::vulkan::Native>,
+    /// Serializes "stage queue waits → submit" so an unrelated submission
+    /// cannot consume a staged producer semaphore wait (#166).
+    #[cfg(all(unix, not(target_vendor = "apple")))]
+    submit_lock: std::sync::Mutex<()>,
     surfaces: FxHashMap<SurfaceId, SurfaceState>,
     fonts: FxHashMap<u64, FontData>,
     /// Registered images.
@@ -393,6 +534,11 @@ pub struct GpuRenderer {
     /// Bumped on every `images` insert/remove — every cached group-1
     /// bind group samples an image view, so an image change rebuilds them.
     images_gen: u64,
+    /// Bumped on every image replacement: the one change to what a
+    /// current local image read that arrives without a tree edit. Adding
+    /// an image changes nothing drawn, and a removal only runs once no
+    /// installed content draws the image (#199), so neither counts.
+    image_replacements: u64,
     timestamps: bool,
     query_set: Option<wgpu::QuerySet>,
     /// First query of the active frame's independent range.
@@ -433,6 +579,20 @@ pub struct GpuRenderer {
     diag: Option<diag::Sink>,
     /// Kept so registered-effect pipelines use the same pipeline cache.
     config: GpuConfig,
+    /// The projective composite and mip pipelines (#84), `None` until a
+    /// frame first composes a projective layer.
+    projective: Option<projective::Pipelines>,
+    /// Counts rendered frames; the projective cache's recency clock.
+    frame_count: u64,
+}
+
+/// The renderer-wide resources a surface's lowering reads.
+#[derive(Clone, Copy)]
+struct GlyphResources<'a> {
+    atlas: &'a Atlas,
+    fonts: &'a FxHashMap<u64, FontData>,
+    images: &'a FxHashMap<u64, GpuImage>,
+    bitmaps: &'a FxHashMap<BitmapKey, GpuBitmap>,
 }
 
 /// Atlas origins produced by one deferred raster.
@@ -441,8 +601,8 @@ enum Commit {
     /// Every surface's pending rasters committed; a surface that could
     /// not be placed got `AtlasExhausted` in its result.
     Done,
-    /// Grow the atlas once to this edge and re-lower.
-    Grow(u32),
+    /// Resize the atlas once to this `(edge, pages)` and re-lower.
+    Resize(u32, u32),
 }
 
 enum PendingOrigin {
@@ -614,13 +774,26 @@ fn create_device(
     if config.pipeline_cache.is_some() && supported.contains(wgpu::Features::PIPELINE_CACHE) {
         required |= wgpu::Features::PIPELINE_CACHE;
     }
+    let limits = wgpu::Limits::default().or_worse_values_from(&adapter.limits());
+    // On Vulkan, device creation is where external-memory, semaphore and
+    // YCbCr capabilities are enabled — the `open_with_callback` hook adds
+    // the extensions/features wgpu does not request, preserving every
+    // requirement wgpu does (#166). A non-Vulkan adapter falls through to
+    // `request_device` unchanged.
+    #[cfg(all(unix, not(target_vendor = "apple")))]
+    if info.backend == wgpu::Backend::Vulkan {
+        match create_vulkan_device(&adapter, required, &limits) {
+            Ok((device, queue)) => {
+                tracing::info!(features = ?device.features(), "device");
+                return Ok((instance, adapter, device, queue));
+            }
+            Err(err) => return Err(err),
+        }
+    }
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("cherenkov-gpu"),
         required_features: required,
-        // Clamp the portable defaults to what the adapter reports:
-        // iOS Metal offers 15 inter-stage varyings (60 components)
-        // where `Limits::default` asks for 16.
-        required_limits: wgpu::Limits::default().or_worse_values_from(&adapter.limits()),
+        required_limits: limits,
         experimental_features: wgpu::ExperimentalFeatures::disabled(),
         memory_hints: wgpu::MemoryHints::Performance,
         trace: wgpu::Trace::Off,
@@ -628,6 +801,76 @@ fn create_device(
     .map_err(|e| EngineError::Backend(format!("{e}")))?;
     tracing::info!(features = ?device.features(), "device");
     Ok((instance, adapter, device, queue))
+}
+
+/// `create_device`'s Vulkan branch (issue #166): opens the device through
+/// `open_with_callback` so the external-frame extensions and the YCbCr
+/// sampler-conversion feature bit are enabled at creation — first import
+/// would be too late — then hands the opened device back through
+/// `create_device_from_hal` with wgpu's requirements intact.
+#[cfg(all(unix, not(target_vendor = "apple"), not(target_arch = "wasm32")))]
+fn create_vulkan_device(
+    adapter: &wgpu::Adapter,
+    features: wgpu::Features,
+    limits: &wgpu::Limits,
+) -> Result<(wgpu::Device, wgpu::Queue), EngineError> {
+    use external::vulkan;
+    let Some(hal_adapter) = (unsafe { adapter.as_hal::<wgpu::hal::vulkan::Api>() }) else {
+        return Err(EngineError::Backend("adapter is not Vulkan".into()));
+    };
+    let caps = hal_adapter.physical_device_capabilities();
+    let extensions: Vec<&'static core::ffi::CStr> = vulkan::extra_device_extensions()
+        .into_iter()
+        .filter(|ext| caps.supports_extension(ext))
+        .collect();
+    // The YCbCr conversion feature is keyed to its extension's presence.
+    let ycbcr = caps.supports_extension(ash::khr::sampler_ycbcr_conversion::NAME);
+    // `create_info.p_next` points at this struct until `vkCreateDevice`
+    // runs inside `open_with_callback`; the `FnOnce` callback is dropped
+    // before that call, so the struct is boxed in this scope instead of
+    // being captured by the closure.
+    let ycbcr_features = Box::new(
+        ash::vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default()
+            .sampler_ycbcr_conversion(true),
+    );
+    let callback: Option<Box<wgpu::hal::vulkan::CreateDeviceCallback<'_>>> =
+        if ycbcr || !extensions.is_empty() {
+            let ycbcr_ptr = core::ptr::from_ref(&*ycbcr_features).cast::<core::ffi::c_void>();
+            Some(Box::new(
+                move |args: wgpu::hal::vulkan::CreateDeviceCallbackArgs<'_, '_, '_>| {
+                    for ext in &extensions {
+                        if !args.extensions.contains(ext) {
+                            args.extensions.push(ext);
+                        }
+                    }
+                    if ycbcr {
+                        args.create_info.p_next = ycbcr_ptr;
+                    }
+                },
+            ))
+        } else {
+            None
+        };
+    let opened = unsafe {
+        hal_adapter.open_with_callback(features, limits, &wgpu::MemoryHints::Performance, callback)
+    }
+    .map_err(|e| EngineError::Backend(format!("vulkan device creation: {e}")))?;
+    drop(hal_adapter);
+    let (device, queue) = unsafe {
+        adapter.create_device_from_hal::<wgpu::hal::vulkan::Api>(
+            opened,
+            &wgpu::DeviceDescriptor {
+                label: Some("cherenkov-gpu"),
+                required_features: features,
+                required_limits: limits.clone(),
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                memory_hints: wgpu::MemoryHints::Performance,
+                trace: wgpu::Trace::Off,
+            },
+        )
+    }
+    .map_err(|e| EngineError::Backend(format!("vulkan device from hal: {e}")))?;
+    Ok((device, queue))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -642,6 +885,29 @@ impl crate::interop::SharedDevice {
     /// creation fails.
     pub fn create(config: &GpuConfig) -> Result<Self, EngineError> {
         let (instance, adapter, device, queue) = create_device(config)?;
+        Ok(Self {
+            instance,
+            adapter,
+            device,
+            queue,
+        })
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[expect(
+    clippy::future_not_send,
+    reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+)]
+impl crate::interop::SharedDevice {
+    /// As the native [`SharedDevice::create`](Self::create), awaited on
+    /// wasm32 so the JS thread is not blocked.
+    ///
+    /// # Errors
+    /// [`EngineError`] when no adapter allows the target format or device
+    /// creation fails.
+    pub async fn create(config: &GpuConfig) -> Result<Self, EngineError> {
+        let (instance, adapter, device, queue) = create_device(config).await?;
         Ok(Self {
             instance,
             adapter,
@@ -860,6 +1126,42 @@ fn make_bind0(
         ],
     })
 }
+
+/// `view`'s `VkImageView` — the descriptor-set write operand for the
+/// native operation (#166).
+#[cfg(all(unix, not(target_vendor = "apple")))]
+/// Finishes `encoder` into a command buffer and replaces it with a fresh
+/// one: wgpu forbids mixing its encoding API with raw `as_hal_mut` access
+/// on a single encoder, so native work is spliced between finished wgpu
+/// buffers inside the one ordered submission.
+#[cfg(all(unix, not(target_vendor = "apple")))]
+fn split_encoder(encoder: &mut wgpu::CommandEncoder, device: &wgpu::Device) -> wgpu::CommandBuffer {
+    std::mem::replace(
+        encoder,
+        device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("frame"),
+        }),
+    )
+    .finish()
+}
+
+/// `view`'s `VkImageView`.
+#[cfg(all(unix, not(target_vendor = "apple")))]
+fn raw_vk_view(view: &wgpu::TextureView) -> ash::vk::ImageView {
+    let hal = unsafe { view.as_hal::<wgpu::hal::vulkan::Api>() };
+    unsafe { hal.expect("vulkan").raw_handle() }
+}
+
+/// `buffer`'s `VkBuffer`.
+#[cfg(all(unix, not(target_vendor = "apple")))]
+fn raw_vk_buffer(buffer: &wgpu::Buffer) -> ash::vk::Buffer {
+    let hal = unsafe { buffer.as_hal::<wgpu::hal::vulkan::Api>() };
+    unsafe { hal.expect("vulkan").raw_handle() }
+}
+
+/// `format` as its `vk::Format`, queried through the hal adapter.
+#[cfg(all(unix, not(target_vendor = "apple")))]
+impl GpuRenderer {}
 
 /// The closed pipeline set: instanced-quad pipelines from `shader.wgsl`,
 /// specialised per fragment variant.
@@ -1268,6 +1570,24 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
                 .map(|slot| (set.clone(), slot * 2, 2))
                 .collect()
         });
+        #[cfg(all(unix, not(target_vendor = "apple")))]
+        let native = {
+            let shared_device = crate::interop::SharedDevice {
+                instance: instance.clone(),
+                adapter: adapter.clone(),
+                device: device.clone(),
+                queue: queue.clone(),
+            };
+            match external::vulkan::shared_for(&shared_device)
+                .and_then(external::vulkan::Native::new)
+            {
+                Ok(native) => Some(native),
+                Err(error) => {
+                    tracing::warn!(%error, "vulkan external-frame import unavailable");
+                    None
+                }
+            }
+        };
         let renderer = GpuRenderer {
             instance,
             adapter,
@@ -1294,6 +1614,10 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             dummy_uint_view,
             ext_layout: None,
             external_pipes: [None, None],
+            #[cfg(all(unix, not(target_vendor = "apple")))]
+            native,
+            #[cfg(all(unix, not(target_vendor = "apple")))]
+            submit_lock: std::sync::Mutex::new(()),
             bound_atlas: 0,
             bound_instance_size: 272 * 16,
             bound_stop_size: 32 * 16,
@@ -1307,6 +1631,7 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             images: FxHashMap::default(),
             bitmaps: FxHashMap::default(),
             images_gen: 0,
+            image_replacements: 0,
             timestamps,
             query_set,
             query_base: 0,
@@ -1324,6 +1649,8 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             wait_timeout: config.wait_timeout,
             diag: config.alloc_diag.clone(),
             config,
+            projective: None,
+            frame_count: 0,
         };
         Ok((
             renderer,
@@ -1524,6 +1851,7 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
         images: FxHashMap::default(),
         bitmaps: FxHashMap::default(),
         images_gen: 0,
+        image_replacements: 0,
         timestamps,
         query_set,
         query_base: 0,
@@ -1541,6 +1869,8 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
         wait_timeout: config.wait_timeout,
         diag: config.alloc_diag.clone(),
         config,
+        projective: None,
+        frame_count: 0,
     };
     Ok((
         renderer,
@@ -1557,27 +1887,20 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
     ))
 }
 
-/// Validates font data and detects native colour-glyph formats.
-///
-/// `COLR` fonts render through the colour-glyph lowering; supported sbix and
-/// CBDT/CBLC glyphs are decoded as images at realization.
-fn validate_font(
-    data: &[u8],
-    index: u32,
-) -> Result<(bool, Option<Arc<bitmap::BitmapFont>>), ResourceError> {
-    use skrifa::raw::TableProvider as _;
-    let font = skrifa::FontRef::from_index(data, index)
-        .map_err(|e| ResourceError::Font(format!("{e}")))?;
-    if font.data_for_tag(skrifa::Tag::new(b"SVG ")).is_some() {
-        return Err(ResourceError::Unsupported(names::COLOR_FONT));
+/// Rejects an image the device cannot hold as one texture.
+fn check_image_size(image: &ImageUpload, max: u32) -> Result<(), ResourceError> {
+    if image.width > max || image.height > max {
+        return Err(ResourceError::Image(format!(
+            "{}x{} exceeds the maximum texture size {max}",
+            image.width, image.height
+        )));
     }
-    let has_colr = font.colr().is_ok();
-    let bitmap = bitmap::BitmapFont::detect(data, index)?.map(Arc::new);
-    Ok((has_colr, bitmap))
+    Ok(())
 }
 
 impl Renderer for GpuRenderer {
     type Target = GpuTarget;
+    type Font = PreparedFont;
     fn create_surface(
         &mut self,
         id: SurfaceId,
@@ -1611,6 +1934,8 @@ impl Renderer for GpuRenderer {
                     window.handle,
                     size,
                     window.transparent,
+                    window.required_color_space,
+                    window.probe,
                 )?;
                 self.presenter.get_or_insert_with(|| {
                     present::Presenter::new(&self.device, self.shader_delivery)
@@ -1618,6 +1943,7 @@ impl Renderer for GpuRenderer {
                 (Some(surface), None, window.refresh)
             }
         };
+        let presents = window.is_some();
         let (target, view) = create_target(
             &self.device,
             "surface target",
@@ -1640,6 +1966,7 @@ impl Renderer for GpuRenderer {
                 textures,
                 refresh,
                 present_pending: false,
+                display: cherenkov::Display::default(),
                 size,
                 scratch_format: self.scratch_format,
                 target,
@@ -1657,6 +1984,10 @@ impl Renderer for GpuRenderer {
                 bind_gen: 0,
                 binds1: FxHashMap::default(),
                 binds1_stamp: (u64::MAX, u64::MAX, u64::MAX),
+                projective: FxHashMap::default(),
+                realized: Vec::new(),
+                composed: Vec::new(),
+                interop: 0,
             },
         );
         diag::set_surface(None);
@@ -1664,6 +1995,7 @@ impl Renderer for GpuRenderer {
             max_dimension: self.max_texture,
             size,
             readable: true,
+            presents,
         })
     }
 
@@ -1780,6 +2112,7 @@ impl Renderer for GpuRenderer {
                 ("isolation scratch", scratch_bytes),
                 ("blend backdrop", backdrop_bytes),
                 ("backdrop capture", capture_bytes),
+                ("projective image", state.projective_bytes()),
             ] {
                 if bytes > 0 {
                     diag::retire(
@@ -1800,20 +2133,29 @@ impl Renderer for GpuRenderer {
         self.update_filter_activity();
     }
 
-    fn add_font(&mut self, id: FontId, font: EngineFontData) -> Result<(), ResourceError> {
-        let (has_colr, bitmap) = validate_font(&font.data, font.index)?;
-        self.fonts.insert(
-            id.raw(),
-            FontData {
-                data: font.data,
-                index: font.index,
-                has_colr,
-                has_bitmap: bitmap.is_some(),
-                bitmap,
-                colr: std::cell::RefCell::new(FxHashMap::default()),
-            },
-        );
-        Ok(())
+    /// Validates font data and detects native colour-glyph formats.
+    ///
+    /// `COLR` fonts render through the colour-glyph lowering; supported
+    /// sbix and CBDT/CBLC glyphs are decoded as images at realization.
+    fn prepare_font(font: EngineFontData) -> Result<PreparedFont, ResourceError> {
+        use skrifa::raw::TableProvider as _;
+        let parsed = skrifa::FontRef::from_index(&font.data, font.index)
+            .map_err(|e| ResourceError::Font(format!("{e}")))?;
+        if parsed.data_for_tag(skrifa::Tag::new(b"SVG ")).is_some() {
+            return Err(ResourceError::Unsupported(names::COLOR_FONT));
+        }
+        let has_colr = parsed.colr().is_ok();
+        let bitmap = bitmap::BitmapFont::detect(&font.data, font.index)?.map(Arc::new);
+        Ok(PreparedFont {
+            data: font.data,
+            index: font.index,
+            has_colr,
+            bitmap,
+        })
+    }
+
+    fn add_font(&mut self, id: FontId, font: PreparedFont) {
+        self.fonts.insert(id.raw(), font.into());
     }
 
     fn remove_font(&mut self, id: FontId) {
@@ -1871,6 +2213,8 @@ impl Renderer for GpuRenderer {
         if let Some(state) = self.surfaces.get_mut(&surface) {
             state.layers.remove(&layer);
             state.external.remove(&layer);
+            state.projective.remove(&layer);
+            state.composed.retain(|key| key.layer != layer);
             if state.content.remove(&layer).is_some() {
                 diag::bind_groups_dropped(
                     &self.device,
@@ -1883,6 +2227,7 @@ impl Renderer for GpuRenderer {
     }
 
     fn add_image(&mut self, id: ImageId, image: ImageUpload) -> Result<(), ResourceError> {
+        check_image_size(&image, self.max_texture)?;
         let data = image_texels_f16(&image)?;
         let image = upload_image(
             &self.device,
@@ -1897,12 +2242,16 @@ impl Renderer for GpuRenderer {
 
     fn replace_image(&mut self, id: ImageId, image: ImageUpload) -> Result<(), ResourceError> {
         let _diag_guard = diag::Guard::scope(self.diag.as_ref());
+        check_image_size(&image, self.max_texture)?;
         let data = image_texels_f16(&image)?;
         let size = (image.width, image.height);
         let current = self
             .images
             .get(&id.raw())
             .expect("replace targets a registered image");
+        // Local images that sampled the previous pixels are no longer
+        // current, whichever path the upload takes.
+        self.image_replacements += 1;
         if (current.width, current.height) == size {
             // The copy is queued ahead of the next submission, after every
             // frame already submitted, so no frame samples a partly
@@ -1950,12 +2299,12 @@ impl Renderer for GpuRenderer {
         Ok(())
     }
 
-    fn samples_image(&self, surface: SurfaceId, id: ImageId) -> bool {
+    fn samples(&self, surface: SurfaceId, resource: ResourceId) -> bool {
         self.surfaces.get(&surface).is_some_and(|state| {
             state
                 .layers
                 .values()
-                .any(|content| content.references_image(id))
+                .any(|content| content.references(resource))
         })
     }
 
@@ -2050,6 +2399,40 @@ impl Renderer for GpuRenderer {
             // The bind groups' views died with the textures.
             surf.binds1.clear();
             surf.bind_gen += 1;
+            // Local images the latest frame did not compose are optional;
+            // under critical pressure every one goes and is realized again
+            // when next drawn.
+            let critical = pressure == Pressure::Critical;
+            if critical {
+                surf.composed.clear();
+            }
+            let composed = &surf.composed;
+            let mut bytes = 0;
+            for (layer, entries) in &mut surf.projective {
+                entries.retain(|e| {
+                    let keep = composed.contains(&projective::LocalKey {
+                        layer: *layer,
+                        bucket: e.bucket,
+                    });
+                    if !keep {
+                        bytes += e.bytes();
+                    }
+                    keep
+                });
+            }
+            surf.projective.retain(|_, entries| !entries.is_empty());
+            if bytes > 0 {
+                diag::retire(
+                    &self.device,
+                    diag::RetireArgs {
+                        label: "projective image",
+                        class: diag::Class::Target,
+                        bytes,
+                        used_in_latest_submit: true,
+                        reason: "trim",
+                    },
+                );
+            }
         }
         let filter_bytes = self.filters.trim();
         if filter_bytes > 0 {
@@ -2473,6 +2856,7 @@ impl GpuRenderer {
         stats: &mut FrameStats,
     ) -> Result<Redraw, RenderError> {
         let origin = *self.origin.get_or_insert(frame.time.0);
+        self.frame_count += 1;
         self.drain_timestamps();
         let dirty: Vec<_> = frame
             .surfaces
@@ -2485,6 +2869,7 @@ impl GpuRenderer {
                         .iter()
                         .any(|(_, id)| self.filters.wants_redraw(*id))
                     || self.surfaces[&sf.id].content_wants_redraw()
+                    || self.surfaces[&sf.id].projective_wants_redraw(&self.filters, &self.shaders)
                     || self.surfaces[&sf.id]
                         .shader_textures
                         .keys()
@@ -2506,6 +2891,8 @@ impl GpuRenderer {
         // an earlier one before it is encoded.
         // Take the states out so the lowering workers own them.
         let t_lower = Instant::now();
+        let inputs: Vec<projective::Inputs> =
+            dirty.iter().map(|sf| self.projective_inputs(sf)).collect();
         let mut pending: Vec<SurfaceState> = dirty
             .iter()
             .map(|id| {
@@ -2515,7 +2902,7 @@ impl GpuRenderer {
             })
             .collect();
         diag::set_phase("lower");
-        let results = self.lower_all(&mut pending, &dirty);
+        let results = self.lower_all(&mut pending, &dirty, &inputs);
         for (id, surf) in dirty.iter().zip(pending) {
             self.surfaces.insert(id.id, surf);
         }
@@ -2568,9 +2955,11 @@ impl GpuRenderer {
                     result = Err(error);
                     break;
                 }
+                self.finish_projective(sf.id);
                 let surface = self.surfaces.get_mut(&sf.id).expect("rendered surface");
                 surface.present_pending = surface.window.is_some();
             }
+            self.evict_projective();
             stats.phases.encode_seconds = t.elapsed().as_secs_f64();
             stats.frame = Some(frame.id);
             if self.timestamps && self.frame_pass_count > 0 {
@@ -2598,7 +2987,10 @@ impl GpuRenderer {
         stats: &mut FrameStats,
     ) -> Result<Redraw, RenderError> {
         let origin = *self.origin.get_or_insert(frame.time.0);
+        self.frame_count += 1;
         self.drain_timestamps();
+        #[cfg(all(unix, not(target_vendor = "apple")))]
+        self.flush_native_releases();
         let dirty: Vec<_> = frame
             .surfaces
             .iter()
@@ -2610,6 +3002,7 @@ impl GpuRenderer {
                         .iter()
                         .any(|(_, id)| self.filters.wants_redraw(*id))
                     || self.surfaces[&sf.id].content_wants_redraw()
+                    || self.surfaces[&sf.id].projective_wants_redraw(&self.filters, &self.shaders)
                     || self.surfaces[&sf.id]
                         .shader_textures
                         .keys()
@@ -2631,6 +3024,8 @@ impl GpuRenderer {
         // an earlier one before it is encoded.
         // Take the states out so the lowering workers own them.
         let t_lower = Instant::now();
+        let inputs: Vec<projective::Inputs> =
+            dirty.iter().map(|sf| self.projective_inputs(sf)).collect();
         let mut pending: Vec<SurfaceState> = dirty
             .iter()
             .map(|id| {
@@ -2640,7 +3035,7 @@ impl GpuRenderer {
             })
             .collect();
         diag::set_phase("lower");
-        let results = self.lower_all(&mut pending, &dirty);
+        let results = self.lower_all(&mut pending, &dirty, &inputs);
         for (id, surf) in dirty.iter().zip(pending) {
             self.surfaces.insert(id.id, surf);
         }
@@ -2690,9 +3085,11 @@ impl GpuRenderer {
                     result = Err(error);
                     break;
                 }
+                self.finish_projective(sf.id);
                 let surface = self.surfaces.get_mut(&sf.id).expect("rendered surface");
                 surface.present_pending = surface.window.is_some();
             }
+            self.evict_projective();
             stats.phases.encode_seconds = t.elapsed().as_secs_f64();
             stats.frame = Some(frame.id);
             if self.timestamps && self.frame_pass_count > 0 {
@@ -2722,20 +3119,32 @@ impl GpuRenderer {
     }
 
     fn update_filter_activity(&self) {
+        // A retained local image keeps the filters its realization ran
+        // active: an animating one must make it stale.
         let active = self
             .surfaces
             .values()
-            .flat_map(|surface| surface.frame.filters.iter().map(|(_, id)| *id))
+            .flat_map(|surface| {
+                surface.frame.filters.iter().map(|(_, id)| *id).chain(
+                    surface.composed.iter().flat_map(|key| {
+                        projective_entry(&surface.projective, *key)
+                            .deps
+                            .filters
+                            .iter()
+                            .copied()
+                    }),
+                )
+            })
             .collect();
         self.filters.set_active(&active);
     }
-    pub(crate) fn add_filter(&mut self, id: cherenkov::FilterId, source: Box<dyn filter::Source>) {
+    pub fn add_filter(&mut self, id: cherenkov::FilterId, source: Box<dyn filter::Source>) {
         self.filters.add(filter::FilterKey::Layer(id.raw()), source);
     }
-    pub(crate) fn remove_filter(&mut self, id: cherenkov::FilterId) {
+    pub fn remove_filter(&mut self, id: cherenkov::FilterId) {
         self.filters.remove(filter::FilterKey::Layer(id.raw()));
     }
-    pub(crate) fn add_backdrop_group(
+    pub fn add_backdrop_group(
         &mut self,
         surface: SurfaceId,
         id: cherenkov::BackdropId,
@@ -2760,7 +3169,7 @@ impl GpuRenderer {
             },
         );
     }
-    pub(crate) fn remove_backdrop_group(&mut self, surface: SurfaceId, id: cherenkov::BackdropId) {
+    pub fn remove_backdrop_group(&mut self, surface: SurfaceId, id: cherenkov::BackdropId) {
         let Some(surf) = self.surfaces.get_mut(&surface) else {
             return;
         };
@@ -2793,8 +3202,21 @@ impl GpuRenderer {
             }
         }
     }
+    /// Validates a user shader paint on the caller thread.
+    pub(crate) fn validate_shader(source: &cherenkov::ShaderSource) -> Result<(), ResourceError> {
+        paint::validate(source)
+    }
+
+    /// Validates a backdrop effect shader on the caller thread: the stock
+    /// module with the user's `backdrop_effect` parses and validates.
+    pub(crate) fn validate_backdrop_shader(
+        source: &cherenkov::BackdropShaderSource,
+    ) -> Result<(), ResourceError> {
+        shaders::validate_wgsl(&backdrop_effect_text(&source.source)).map(drop)
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn add_shader(
+    pub fn add_shader(
         &mut self,
         id: cherenkov::ShaderId,
         source: &cherenkov::ShaderSource,
@@ -2808,7 +3230,7 @@ impl GpuRenderer {
         clippy::future_not_send,
         reason = "the browser engine is single-threaded and its futures run on the page's event loop"
     )]
-    pub(crate) async fn add_shader(
+    pub async fn add_shader(
         &mut self,
         id: cherenkov::ShaderId,
         source: &cherenkov::ShaderSource,
@@ -2822,7 +3244,7 @@ impl GpuRenderer {
     /// stub sits between two `// backdrop-effect-stub` marker lines, so
     /// removal is a plain string split.
     #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn add_backdrop_shader(
+    pub fn add_backdrop_shader(
         &mut self,
         id: cherenkov::BackdropShaderId,
         source: &cherenkov::BackdropShaderSource,
@@ -2867,7 +3289,7 @@ impl GpuRenderer {
         clippy::future_not_send,
         reason = "the browser engine is single-threaded and its futures run on the page's event loop"
     )]
-    pub(crate) async fn add_backdrop_shader(
+    pub async fn add_backdrop_shader(
         &mut self,
         id: cherenkov::BackdropShaderId,
         source: &cherenkov::BackdropShaderSource,
@@ -2916,11 +3338,11 @@ impl GpuRenderer {
 
     /// Frees a backdrop effect shader's pipelines. A member that still
     /// samples it fails at encode with a render error.
-    pub(crate) fn remove_backdrop_shader(&mut self, id: cherenkov::BackdropShaderId) {
+    pub fn remove_backdrop_shader(&mut self, id: cherenkov::BackdropShaderId) {
         self.backdrop_shaders.remove(&id.raw());
     }
 
-    pub(crate) fn remove_shader(&mut self, id: cherenkov::ShaderId) {
+    pub fn remove_shader(&mut self, id: cherenkov::ShaderId) {
         let _diag_guard = diag::Guard::scope(self.diag.as_ref());
         self.shaders.remove(id.raw());
         for surface in self.surfaces.values_mut() {
@@ -2928,6 +3350,14 @@ impl GpuRenderer {
                 .shader_textures
                 .retain(|key, _| key.shader != id.raw());
             surface.binds1.clear();
+            // A retained local image never names a released shader. The
+            // release runs once no installed content draws the shader, so
+            // an image that sampled it is one no frame composes again.
+            retire_projective(surface, &self.device, "shader released", |_, entry| {
+                entry.deps.images.iter().any(|image| {
+                    matches!(image, lower::ImageSource::Shader(key) if key.shader == id.raw())
+                })
+            });
         }
     }
     fn render_shaders(&mut self, id: SurfaceId, elapsed: f32) -> Result<(), RenderError> {
@@ -3055,7 +3485,7 @@ impl GpuRenderer {
         rate.map_or(Redraw::None, |rate| Redraw::Wanted { rate })
     }
 
-    pub(crate) fn set_gpu_content(
+    pub fn set_gpu_content(
         &mut self,
         surface: SurfaceId,
         layer: LayerId,
@@ -3066,6 +3496,7 @@ impl GpuRenderer {
         let state = self.surfaces.get_mut(&surface).expect("GPU surface exists");
         state.layers.remove(&layer);
         state.external.remove(&layer);
+        state.interop += 1;
         state
             .content
             .insert(layer, gpu_content::Slot::new(content, size));
@@ -3078,7 +3509,7 @@ impl GpuRenderer {
     /// The planes are sampled where the frame lands; nothing is copied or
     /// rasterized. Any recorded or GPU content on `layer` is dropped — a
     /// layer has one content kind at a time.
-    pub(crate) fn set_external_frame(
+    pub fn set_external_frame(
         &mut self,
         surface: SurfaceId,
         layer: LayerId,
@@ -3087,19 +3518,16 @@ impl GpuRenderer {
         let state = self.surfaces.get_mut(&surface).expect("GPU surface exists");
         state.layers.remove(&layer);
         state.content.remove(&layer);
+        state.interop += 1;
         state
             .external
             .insert(layer, external::Slot::new(&self.device, &self.queue, frame));
     }
 
-    pub(crate) fn resize_gpu_content(
-        &mut self,
-        surface: SurfaceId,
-        layer: LayerId,
-        size: (u32, u32),
-    ) {
+    pub fn resize_gpu_content(&mut self, surface: SurfaceId, layer: LayerId, size: (u32, u32)) {
         let _diag_guard = diag::Guard::scope(self.diag.as_ref());
         let state = self.surfaces.get_mut(&surface).expect("GPU surface exists");
+        state.interop += 1;
         state
             .content
             .get_mut(&layer)
@@ -3162,6 +3590,228 @@ impl GpuRenderer {
         Ok(())
     }
 
+    /// Builds the projective composite and mip pipelines on the first
+    /// frame that composes a projective layer.
+    #[cfg_attr(
+        target_arch = "wasm32",
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "browser WebGPU reports pipeline errors asynchronously, so only the native error scope can fail here"
+        )
+    )]
+    fn ensure_projective(&mut self) -> Result<(), RenderError> {
+        if self.projective.is_some() {
+            return Ok(());
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        let error_scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let pipelines = projective::Pipelines::new(
+            &self.device,
+            self.shader_delivery,
+            &self.layout0,
+            self.scratch_format,
+        );
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(error) = pollster::block_on(error_scope.pop()) {
+            return Err(RenderError::Render(format!("projective pipeline: {error}")));
+        }
+        self.projective = Some(pipelines);
+        Ok(())
+    }
+
+    /// Bytes of every retained local image.
+    fn projective_bytes(&self) -> u64 {
+        self.surfaces
+            .values()
+            .map(SurfaceState::projective_bytes)
+            .sum()
+    }
+
+    /// The bytes local images may hold: the GPU budget less every other
+    /// resident resource.
+    fn projective_available(&self) -> u64 {
+        let others = self.memory().gpu.0 - self.projective_bytes();
+        self.config.budget.gpu.0.saturating_sub(others)
+    }
+
+    /// What surface `sf`'s lowering needs to plan and reuse local images.
+    /// First drops every retained image no frame can compose again: its
+    /// layer is gone or affine, its content stamp moved on, or an image
+    /// was replaced since. A resource released under #199's deferred
+    /// release is drawn by no installed content, so every image that read
+    /// it is among these: none outlives the frame of its release.
+    fn projective_inputs(&mut self, sf: &SurfaceFrame<'_>) -> projective::Inputs {
+        let replacements = self.image_replacements;
+        let tree = sf.tree;
+        retire_projective(
+            self.surfaces.get_mut(&sf.id).expect("registered surface"),
+            &self.device,
+            "projective content changed",
+            |layer, entry| {
+                tree.projective_pose(layer).is_none()
+                    || !entry
+                        .key
+                        .is_some_and(|key| key.is_current(tree.content_stamp(layer), replacements))
+            },
+        );
+        let surf = &self.surfaces[&sf.id];
+        projective::Inputs {
+            limits: cherenkov::lowering::projective::Limits {
+                max_dimension: self.max_texture,
+                max_bytes: self.projective_available(),
+            },
+            replacements,
+            interop: surf.interop,
+            stale: surf.stale_projective(&self.filters, &self.shaders),
+        }
+    }
+
+    /// Admits and allocates surface `id`'s local images for this frame:
+    /// every image it composes must fit the budget together, and every
+    /// image it realizes gets a texture of its size, reusing the bucket's
+    /// texture when the size is unchanged.
+    fn allocate_projective(
+        &mut self,
+        id: SurfaceId,
+        realize: Vec<projective::Realize>,
+        composed: Vec<projective::LocalKey>,
+    ) -> Result<(), RenderError> {
+        if !composed.is_empty() {
+            self.ensure_projective()?;
+        }
+        let available = self.projective_available();
+        let Some(surf) = self.surfaces.get_mut(&id) else {
+            return Ok(());
+        };
+        let mut required = 0_u64;
+        for key in &composed {
+            required += realize.iter().find(|r| r.key == *key).map_or_else(
+                || projective_entry(&surf.projective, *key).bytes(),
+                |r| {
+                    r.levels
+                        .iter()
+                        .map(|&(w, h)| 8 * u64::from(w) * u64::from(h))
+                        .sum()
+                },
+            );
+            if required > available {
+                return Err(RenderError::ProjectiveUnsupported {
+                    layer: key.layer,
+                    reason: format!(
+                        "the frame's projective images need {required} bytes; the GPU budget admits {available}"
+                    ),
+                });
+            }
+        }
+        for r in &realize {
+            let entries = surf.projective.entry(r.key.layer).or_default();
+            let slot = entries.iter().position(|e| e.bucket == r.key.bucket);
+            if let Some(entry) = slot.map(|i| &mut entries[i])
+                && entry.fits(r.levels[0])
+            {
+                entry.key = None;
+                continue;
+            }
+            let pipelines = self.projective.as_ref().expect("built above");
+            let entry = projective::Entry::new(&self.device, pipelines, r.key.bucket, &r.levels);
+            let bytes = entry.bytes();
+            if let Some(i) = slot {
+                let old = std::mem::replace(&mut entries[i], entry);
+                diag::grow(
+                    &self.device,
+                    "projective image",
+                    diag::Class::Target,
+                    old.bytes(),
+                    bytes,
+                    0,
+                    true,
+                );
+            } else {
+                entries.push(entry);
+                diag::create(&self.device, "projective image", bytes);
+            }
+        }
+        surf.realized = realize;
+        surf.composed = composed;
+        Ok(())
+    }
+
+    /// After surface `id`'s frame encoded: its realized images are current,
+    /// and every image it composed was used this frame.
+    fn finish_projective(&mut self, id: SurfaceId) {
+        let frame = self.frame_count;
+        let Some(surf) = self.surfaces.get_mut(&id) else {
+            return;
+        };
+        for r in std::mem::take(&mut surf.realized) {
+            let entry = projective_entry_mut(&mut surf.projective, r.key);
+            entry.key = Some(r.cache);
+            entry.deps = r.deps;
+        }
+        for key in &surf.composed {
+            projective_entry_mut(&mut surf.projective, *key).last_used = frame;
+        }
+    }
+
+    /// Evicts least-recently-used local images until the retained set fits
+    /// the budget; the images each surface's latest frame composed are
+    /// required and never evicted.
+    fn evict_projective(&mut self) {
+        let available = self.projective_available();
+        let mut total = self.projective_bytes();
+        if total <= available {
+            return;
+        }
+        let mut optional: Vec<(u64, SurfaceId, projective::LocalKey)> = self
+            .surfaces
+            .iter()
+            .flat_map(|(sid, surf)| {
+                surf.projective.iter().flat_map(move |(layer, entries)| {
+                    entries
+                        .iter()
+                        .map(move |e| {
+                            (
+                                e.last_used,
+                                *sid,
+                                projective::LocalKey {
+                                    layer: *layer,
+                                    bucket: e.bucket,
+                                },
+                            )
+                        })
+                        .filter(|(_, _, key)| !surf.composed.contains(key))
+                })
+            })
+            .collect();
+        optional.sort_unstable_by_key(|(last, ..)| *last);
+        for (_, sid, key) in optional {
+            if total <= available {
+                break;
+            }
+            let Some(entries) = self
+                .surfaces
+                .get_mut(&sid)
+                .and_then(|surf| surf.projective.get_mut(&key.layer))
+            else {
+                continue;
+            };
+            if let Some(i) = entries.iter().position(|e| e.bucket == key.bucket) {
+                let entry = entries.swap_remove(i);
+                total -= entry.bytes();
+                diag::retire(
+                    &self.device,
+                    diag::RetireArgs {
+                        label: "projective image",
+                        class: diag::Class::Target,
+                        bytes: entry.bytes(),
+                        used_in_latest_submit: false,
+                        reason: "projective eviction",
+                    },
+                );
+            }
+        }
+    }
+
     fn present_windows(&mut self, frame: &Frame<'_>) -> Result<Redraw, RenderError> {
         let Some(presenter) = &mut self.presenter else {
             return Ok(Redraw::None);
@@ -3169,6 +3819,25 @@ impl GpuRenderer {
         let mut redraw = None::<cherenkov::RefreshRange>;
         for sf in frame.surfaces {
             let surface = self.surfaces.get_mut(&sf.id).expect("registered surface");
+            // A headroom-only frame asks for a present without lowering
+            // new content (#98). The front end marks `present_pending`
+            // only on surfaces it reported as presenting
+            // (`SurfaceInfo::presents`), so a pending present implies a
+            // window here.
+            surface.present_pending |= sf.present_pending;
+            // A display move or a scale change re-runs the window's
+            // output negotiation; it reconfigures only when the selected
+            // pair moves. A headroom-only update never re-enumerates —
+            // the host announces a move with `Surface::display_moved`,
+            // since a move to a numerically identical display is
+            // invisible in `Display`'s values (#98).
+            let renegotiate =
+                sf.display_moved || sf.display.scale.to_bits() != surface.display.scale.to_bits();
+            surface.display = sf.display;
+            if renegotiate && let Some(window) = &mut surface.window {
+                window.reselect(&self.adapter, &self.device);
+                surface.present_pending = true;
+            }
             if surface.present_pending {
                 let window = surface.window.as_ref().expect("pending window");
                 surface.present_pending = !presenter.present(
@@ -3197,6 +3866,7 @@ impl GpuRenderer {
         &mut self,
         pending: &mut [SurfaceState],
         frames: &[&SurfaceFrame<'_>],
+        inputs: &[projective::Inputs],
     ) -> Vec<Result<Lowered, RenderError>> {
         let mut grew = false;
         loop {
@@ -3222,11 +3892,20 @@ impl GpuRenderer {
                         .iter_mut()
                         .zip(snapshots)
                         .zip(frames)
-                        .zip(&group_maps)
-                        .map(|(((surf, fonts), frame), groups)| {
+                        .zip(group_maps.iter().zip(inputs))
+                        .map(|(((surf, fonts), frame), (groups, inputs))| {
                             s.spawn(move || {
                                 Self::lower_content(
-                                    surf, frame, atlas, &fonts, images, bitmaps, groups,
+                                    surf,
+                                    frame,
+                                    GlyphResources {
+                                        atlas,
+                                        fonts: &fonts,
+                                        images,
+                                        bitmaps,
+                                    },
+                                    groups,
+                                    inputs,
                                 )
                             })
                         })
@@ -3239,16 +3918,19 @@ impl GpuRenderer {
                 pending
                     .iter_mut()
                     .zip(frames)
-                    .zip(&group_maps)
-                    .map(|((surf, frame), groups)| {
+                    .zip(group_maps.iter().zip(inputs))
+                    .map(|((surf, frame), (groups, inputs))| {
                         Self::lower_content(
                             surf,
                             frame,
-                            &self.atlas,
-                            &self.fonts,
-                            &self.images,
-                            &self.bitmaps,
+                            GlyphResources {
+                                atlas: &self.atlas,
+                                fonts: &self.fonts,
+                                images: &self.images,
+                                bitmaps: &self.bitmaps,
+                            },
                             groups,
+                            inputs,
                         )
                     })
                     .collect()
@@ -3260,17 +3942,18 @@ impl GpuRenderer {
             // preparation abandons.
             match self.commit_rasters(pending, &mut results, grew) {
                 Commit::Done => break results,
-                Commit::Grow(size) => {
-                    self.atlas.grow_to(&self.device, size);
+                Commit::Resize(size, pages) => {
+                    self.atlas.resize_to(&self.device, size, pages);
                     grew = true;
                     tracing::debug!(
                         size = self.atlas.size(),
+                        pages = self.atlas.pages(),
                         generation = self.atlas.generation(),
-                        "atlas grown"
+                        "atlas resized"
                     );
                 }
             }
-            // Growing emptied the atlas: every hit any lowering took is
+            // Resizing emptied the atlas: every hit any lowering took is
             // now a miss, so lower the whole batch again.
             diag::event(
                 &self.device,
@@ -3286,6 +3969,7 @@ impl GpuRenderer {
         &mut self,
         pending: &mut [SurfaceState],
         frames: &[&SurfaceFrame<'_>],
+        inputs: &[projective::Inputs],
     ) -> Vec<Result<Lowered, RenderError>> {
         let mut grew = false;
         loop {
@@ -3296,16 +3980,19 @@ impl GpuRenderer {
             let mut results: Vec<Result<Lowered, RenderError>> = pending
                 .iter_mut()
                 .zip(frames)
-                .zip(&group_maps)
-                .map(|((surf, frame), groups)| {
+                .zip(group_maps.iter().zip(inputs))
+                .map(|((surf, frame), (groups, inputs))| {
                     Self::lower_content(
                         surf,
                         frame,
-                        &self.atlas,
-                        &self.fonts,
-                        &self.images,
-                        &self.bitmaps,
+                        GlyphResources {
+                            atlas: &self.atlas,
+                            fonts: &self.fonts,
+                            images: &self.images,
+                            bitmaps: &self.bitmaps,
+                        },
                         groups,
+                        inputs,
                     )
                 })
                 .collect();
@@ -3316,13 +4003,14 @@ impl GpuRenderer {
             // preparation abandons.
             match self.commit_rasters(pending, &mut results, grew) {
                 Commit::Done => break results,
-                Commit::Grow(size) => {
-                    self.atlas.grow_to(&self.device, size);
+                Commit::Resize(size, pages) => {
+                    self.atlas.resize_to(&self.device, size, pages);
                     grew = true;
                     tracing::debug!(
                         size = self.atlas.size(),
+                        pages = self.atlas.pages(),
                         generation = self.atlas.generation(),
-                        "atlas grown"
+                        "atlas resized"
                     );
                 }
             }
@@ -3343,11 +4031,9 @@ impl GpuRenderer {
     fn lower_content(
         surf: &mut SurfaceState,
         frame: &SurfaceFrame<'_>,
-        atlas: &Atlas,
-        fonts: &FxHashMap<u64, FontData>,
-        images: &FxHashMap<u64, GpuImage>,
-        bitmaps: &FxHashMap<BitmapKey, GpuBitmap>,
+        resources: GlyphResources<'_>,
         groups: &FxHashMap<u64, BackdropGroupInfo>,
+        inputs: &projective::Inputs,
     ) -> Result<Lowered, RenderError> {
         surf.frame.reset();
         // Lowering borrows `layers` immutably while mutating `frame`;
@@ -3356,16 +4042,33 @@ impl GpuRenderer {
         let mut lowered = Lowered::default();
         let result = {
             let glyphs = GlyphContext {
-                atlas,
-                live_stamp: atlas.live_stamp(),
-                fonts,
-                images,
-                bitmaps,
+                atlas: resources.atlas,
+                live_stamp: resources.atlas.live_stamp(),
+                fonts: resources.fonts,
+                images: resources.images,
+                bitmaps: resources.bitmaps,
                 content: &surf.content,
                 external: &surf.external,
             };
             let mut lowering = Lowering::new(&mut surf.frame, surf.size);
-            let result = lowering.run(frame.tree, &mut layers, frame.clear, &glyphs, groups);
+            let result = lowering.prepare(&mut layers, &glyphs).and_then(|()| {
+                let placed = Self::lower_projective(
+                    &mut lowering,
+                    frame,
+                    &mut layers,
+                    (&glyphs, groups),
+                    (&surf.projective, inputs, surf.size),
+                    &mut lowered,
+                )?;
+                lowering.run(
+                    frame.tree,
+                    &mut layers,
+                    frame.clear,
+                    &glyphs,
+                    groups,
+                    placed,
+                )
+            });
             lowered.commands = lowering.commands_lowered;
             lowered.layers = lowering.layers_composed;
             lowered.glyphs = lowering.glyphs_rasterized();
@@ -3382,6 +4085,75 @@ impl GpuRenderer {
         surf.frame.external.sort_unstable_by_key(|id| id.raw());
         surf.frame.external.dedup();
         result.map(|()| lowered)
+    }
+
+    /// Plans the surface's projective layers and lowers the local image of
+    /// every visible one without a current retained image, innermost
+    /// first, into the frame ahead of the surface walk. Returns the
+    /// placements composed directly into the surface; `lowered` records
+    /// the images realized and composed.
+    fn lower_projective(
+        lowering: &mut Lowering<'_>,
+        frame: &SurfaceFrame<'_>,
+        layers: &mut FxHashMap<LayerId, ContentData>,
+        (glyphs, groups): (&GlyphContext<'_>, &FxHashMap<u64, BackdropGroupInfo>),
+        (retained, inputs, size): (
+            &FxHashMap<LayerId, Vec<projective::Entry>>,
+            &projective::Inputs,
+            (u32, u32),
+        ),
+        lowered: &mut Lowered,
+    ) -> Result<FxHashMap<LayerId, projective::Placement>, RenderError> {
+        let tree = frame.tree;
+        let mut placed: FxHashMap<Option<LayerId>, FxHashMap<LayerId, projective::Placement>> =
+            FxHashMap::default();
+        for plan in cherenkov::lowering::projective::plan(tree, size, inputs.limits)? {
+            let Some(image) = plan.image else { continue };
+            let nested = placed.remove(&Some(plan.layer)).unwrap_or_default();
+            let key = projective::LocalKey {
+                layer: plan.layer,
+                bucket: projective::bucket(image.density),
+            };
+            let cache =
+                projective::Key::new(&image, tree.content_stamp(plan.layer), inputs.replacements);
+            let current = !inputs.stale.contains(&key)
+                && retained.get(&plan.layer).is_some_and(|entries| {
+                    entries
+                        .iter()
+                        .any(|e| e.bucket == key.bucket && e.key == Some(cache))
+                });
+            if !current {
+                let (filters, passes) = (
+                    lowering.frame().filters.len(),
+                    lowering.frame().passes.len(),
+                );
+                lowering.run_local(
+                    tree,
+                    layers,
+                    glyphs,
+                    groups,
+                    (plan.layer, image.local_to_texel, key),
+                    image.size,
+                    nested,
+                )?;
+                let lowered_frame = lowering.frame();
+                let last = lowered_frame.passes.len() - 1;
+                let deps = projective::Deps::of(lowered_frame, filters, passes, inputs.interop);
+                lowering.push_mips(last, key);
+                lowered.realize.push(projective::Realize {
+                    key,
+                    cache,
+                    levels: image.levels.clone(),
+                    deps,
+                });
+            }
+            lowered.composed.push(key);
+            placed
+                .entry(plan.parent)
+                .or_default()
+                .insert(plan.layer, projective::Placement::new(key, &image));
+        }
+        Ok(placed.remove(&None).unwrap_or_default())
     }
 
     /// Over budget, drops every mask texture no retained frame references:
@@ -3450,7 +4222,9 @@ impl GpuRenderer {
         // the commit's work scales with what changed, not what stays
         // retained (#119).
         let mut touches_len = 0usize;
-        let plan_dbg = if self.atlas.fits_strict(&rasters) {
+        // `plan` also decides whether a paged atlas may release pages
+        // (#211), so only a single-page atlas takes the strict path.
+        let plan_dbg = if self.atlas.pages() == 1 && self.atlas.fits_strict(&rasters) {
             self.atlas.begin_commit(&[]);
             "fits"
         } else {
@@ -3462,8 +4236,8 @@ impl GpuRenderer {
             self.commit_touches = touches;
             match self.atlas.plan(&rasters) {
                 glyph::AtlasPlan::Fits | glyph::AtlasPlan::FitsEviction => "fits-eviction",
-                glyph::AtlasPlan::Grow(size) if !grew => {
-                    // The grow discards the atlas and re-lowers, so
+                glyph::AtlasPlan::Resize(size, pages) if !grew => {
+                    // The resize discards the atlas and re-lowers, so
                     // every retained emission is dead anyway — but the
                     // pending cells recorded this round index a raster
                     // list that never applied, and must not survive
@@ -3471,9 +4245,9 @@ impl GpuRenderer {
                     for surf in pending.iter_mut() {
                         Self::discard_surface(surf);
                     }
-                    return Commit::Grow(size);
+                    return Commit::Resize(size, pages);
                 }
-                glyph::AtlasPlan::Grow(_) | glyph::AtlasPlan::Recycle => {
+                glyph::AtlasPlan::Resize(..) | glyph::AtlasPlan::Recycle => {
                     // Bounded in-place eviction makes room instead of a
                     // wholesale clear: the commit below reclaims shelves
                     // nothing touched until the batch places or nothing
@@ -3835,12 +4609,17 @@ impl GpuRenderer {
             paths,
             commands,
             layers,
+            realize,
+            composed,
             ..
         } = lowered?;
         stats.commands_lowered += commands;
         stats.layers_composed += layers;
         stats.glyphs_rasterized += glyphs;
         stats.paths_rasterized += paths;
+        stats.projective_realized += u32::try_from(realize.len()).unwrap_or(u32::MAX);
+        stats.projective_composed += u32::try_from(composed.len()).unwrap_or(u32::MAX);
+        self.allocate_projective(id, realize, composed)?;
         // Scratch textures for the frame's deepest isolation level.
         let Some(surf) = self.surfaces.get_mut(&id) else {
             return Ok(());
@@ -3851,7 +4630,7 @@ impl GpuRenderer {
             .iter()
             .filter_map(|p| match p.target {
                 Target::Scratch(i) => Some(i + 1),
-                Target::Surface | Target::Backdrop { .. } => None,
+                Target::Surface | Target::Backdrop { .. } | Target::Projected(_) => None,
             })
             .max()
             .unwrap_or(0);
@@ -3934,7 +4713,7 @@ impl GpuRenderer {
             };
             let (w, h) = (pass.region[2], pass.region[3]);
             let format = match capture.copy_from {
-                Target::Surface => TARGET_FORMAT,
+                Target::Surface | Target::Projected(_) => TARGET_FORMAT,
                 Target::Scratch(_) => self.scratch_format,
                 Target::Backdrop { .. } => {
                     return Err(RenderError::Render(format!(
@@ -4056,7 +4835,7 @@ impl GpuRenderer {
         for pass in &surf.frame.passes {
             if let Some(r) = pass.backdrop_copy {
                 let slot = match pass.target {
-                    Target::Surface => 0,
+                    Target::Surface | Target::Projected(_) => 0,
                     Target::Scratch(_) => 1,
                     Target::Backdrop { .. } => {
                         return Err(RenderError::Render(
@@ -4358,6 +5137,12 @@ impl GpuRenderer {
     ) -> Result<(), RenderError> {
         // External pipelines stay lazy until a surface first samples an
         // external frame; the scan stays on the (unchanged) surface state.
+        // A previous failed encode may have left acquisitions staged;
+        // drop them so this encode's submission can't consume them.
+        #[cfg(all(unix, not(target_vendor = "apple")))]
+        if let Some(native) = self.native.as_mut() {
+            external::vulkan::cancel_staged(native);
+        }
         let needs_external = self.surfaces.get(&id).is_some_and(|surf| {
             surf.frame
                 .passes
@@ -4368,6 +5153,21 @@ impl GpuRenderer {
         if needs_external {
             self.ensure_external()?;
         }
+        if self
+            .surfaces
+            .get(&id)
+            .is_some_and(|surf| !surf.composed.is_empty())
+        {
+            self.ensure_projective()?;
+        }
+        // The hal adapter handle is bound before `surf` borrows the
+        // renderer: the native pass maps target formats through it inside
+        // the encode loop (#166).
+        #[cfg(all(unix, not(target_vendor = "apple")))]
+        let hal_adapter = self
+            .native
+            .is_some()
+            .then(|| unsafe { self.adapter.as_hal::<wgpu::hal::vulkan::Api>() }.expect("vulkan"));
         let Some(surf) = self.surfaces.get_mut(&id) else {
             return Ok(());
         };
@@ -4394,6 +5194,13 @@ impl GpuRenderer {
             self.bound_globals_size = self.globals.size();
         }
         let inst_base = surf.inst_base;
+        // wgpu forbids mixing its encoding API with raw `as_hal_mut`
+        // access on one encoder, so every native command buffer — the
+        // first-use acquire barriers, the external-frame composition op
+        // and the release barriers — is recorded on a dedicated raw
+        // encoder and spliced between finished wgpu buffers; queue order
+        // inside the single submission preserves the intended sequence.
+        let mut buffers: Vec<wgpu::CommandBuffer> = Vec::new();
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -4429,6 +5236,7 @@ impl GpuRenderer {
             surf.binds1.clear();
             surf.binds1_stamp = stamp;
         }
+        let mask_gen = self.atlas.mask_texture_generation();
         for (i, pass) in surf.frame.passes.iter().enumerate() {
             let (view, texture) = match pass.target {
                 Target::Surface => (&surf.view, &surf.target),
@@ -4437,12 +5245,19 @@ impl GpuRenderer {
                     let capture = &surf.backdrop_groups[&group].captures[region as usize];
                     (&capture.view, &capture.texture)
                 }
+                Target::Projected(key) => {
+                    let entry = projective_entry(&surf.projective, key);
+                    (&entry.levels[0], &entry.texture)
+                }
             };
             // A backdrop-group capture first copies `pass.region` out of
             // its `copy_from` target into the group's capture texture.
             if let Some(capture) = pass.capture {
                 let (src, sx, sy) = match capture.copy_from {
                     Target::Surface => (&surf.target, 0, 0),
+                    Target::Projected(key) => {
+                        (&projective_entry(&surf.projective, key).texture, 0, 0)
+                    }
                     Target::Scratch(k) => (&surf.scratch[k].texture, 0, 0),
                     Target::Backdrop { group, region } => {
                         let capture = &surf.backdrop_groups[&group].captures[region as usize];
@@ -4479,7 +5294,7 @@ impl GpuRenderer {
             // the copy must complete before the pass starts.
             if let Some([bx, by, bw, bh]) = pass.backdrop_copy {
                 let slot = match pass.target {
-                    Target::Surface => 0,
+                    Target::Surface | Target::Projected(_) => 0,
                     Target::Scratch(_) => 1,
                     Target::Backdrop { .. } => {
                         return Err(RenderError::Render(
@@ -4525,13 +5340,30 @@ impl GpuRenderer {
             };
             let pass_index = self.frame_pass_count;
             self.frame_pass_count += 1;
+            // A pass containing native external ops splits at each op; its
+            // beginning sample lands on the first segment and its end
+            // sample on the last (reopened) segment, so the recorded GPU
+            // time spans the native composition too.
+            #[cfg(all(unix, not(target_vendor = "apple")))]
+            let native_run = self.native.is_some()
+                && pass.ranges.iter().any(|range| {
+                    matches!(&range.image, Some(lower::ImageSource::External(layer))
+                        if surf
+                            .external
+                            .get(layer)
+                            .and_then(|slot| slot.native_frame())
+                            .is_some())
+                });
+            #[cfg(not(all(unix, not(target_vendor = "apple"))))]
+            let native_run = false;
             let timestamp_writes =
                 self.query_set
                     .as_ref()
                     .map(|qs| wgpu::RenderPassTimestampWrites {
                         query_set: qs,
                         beginning_of_pass_write_index: Some(self.query_base + 2 * pass_index),
-                        end_of_pass_write_index: Some(self.query_base + 2 * pass_index + 1),
+                        end_of_pass_write_index: (!native_run)
+                            .then_some(self.query_base + 2 * pass_index + 1),
                     });
             // Only the timestamp path reads `pass_meta`; skip the
             // allocation when timing is off.
@@ -4543,6 +5375,9 @@ impl GpuRenderer {
                         Target::Backdrop { group, region } => {
                             format!("backdrop{group}.{region}")
                         }
+                        Target::Projected(key) => {
+                            format!("projected{}.{}", key.layer.raw(), key.bucket)
+                        }
                     },
                     width: pass.region[2],
                     height: pass.region[3],
@@ -4550,6 +5385,52 @@ impl GpuRenderer {
                 });
             }
             let scratch_backdrop = pass.backdrop_copy.is_some();
+            // First-use acquisition (#166): for every native generation this
+            // pass samples — `Planes`/`ExternalFormat` bound in the native
+            // op and `Rgb` bound through wgpu — record the acquire barrier
+            // and stage its wait before the pass opens. `stage_acquire`
+            // deduplicates generations already staged or owned.
+            #[cfg(all(unix, not(target_vendor = "apple")))]
+            if self.native.is_some() {
+                let gens: Vec<std::sync::Arc<external::vulkan::Generation>> = pass
+                    .ranges
+                    .iter()
+                    .filter_map(|range| match &range.image {
+                        Some(lower::ImageSource::External(layer)) => {
+                            surf.external.get(layer).and_then(|slot| {
+                                slot.vulkan_frame().map(|frame| frame.generation.clone())
+                            })
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if !gens.is_empty()
+                    && let Some(native) = self.native.as_mut()
+                {
+                    buffers.push(split_encoder(&mut encoder, &self.device));
+                    let mut acquire =
+                        self.device
+                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("acquire"),
+                            });
+                    unsafe {
+                        acquire.as_hal_mut::<wgpu::hal::vulkan::Api, _, _>(|hal| {
+                            let hal = hal.expect("vulkan encoder");
+                            let cb = hal.raw_handle();
+                            for generation in &gens {
+                                if let Some(pending) =
+                                    external::vulkan::stage_acquire(generation, cb)?
+                                {
+                                    native.staged.push(pending);
+                                }
+                            }
+                            Ok::<(), external::vulkan::NativeError>(())
+                        })
+                    }
+                    .map_err(|e| RenderError::Render(e.to_string()))?;
+                    buffers.push(acquire.finish());
+                }
+            }
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -4567,6 +5448,16 @@ impl GpuRenderer {
                 multiview_mask: None,
             });
             let format_i = usize::from(texture.format() != TARGET_FORMAT);
+            // `view`/`texture` can borrow `surf.projective` (a projected
+            // pass target); the loop's projective draws need
+            // `surf.projective` mutably, so the native op and the reopened
+            // pass use these owned handles and copies instead.
+            #[cfg(all(unix, not(target_vendor = "apple")))]
+            let target_view = view.clone();
+            #[cfg(all(unix, not(target_vendor = "apple")))]
+            let target_format = texture.format();
+            #[cfg(all(unix, not(target_vendor = "apple")))]
+            let target_size = (texture.width(), texture.height());
             render_pass.set_pipeline(&self.pipelines[format_i][0][0]);
             // Region-targeted passes cover only their region; the surface
             // pass the whole target. `in.device` stays in true device
@@ -4589,8 +5480,186 @@ impl GpuRenderer {
             // External ranges bind a slot's group-1 over the external
             // pipeline; an engine range after one must rebind its pipeline.
             let mut pipeline = Bound::Engine(PipelineKind::SrcOver, ShaderVariant::Simple);
-            for range in &pass.ranges {
+            let backdrop_slot = scratch_backdrop.then_some(match pass.target {
+                Target::Surface | Target::Projected(_) => 0,
+                Target::Scratch(_) | Target::Backdrop { .. } => 1,
+            });
+            let mut ri = 0usize;
+            while ri < pass.ranges.len() {
+                let range = &pass.ranges[ri];
                 stats.draws += 1;
+                if let PipelineKind::Projective { replace } = range.pipeline {
+                    let pipes = self
+                        .projective
+                        .as_ref()
+                        .expect("projective pipelines are built before encoding");
+                    if pipeline != Bound::Projective(replace) {
+                        pipeline = Bound::Projective(replace);
+                        stats.pipeline_switches += 1;
+                        render_pass.set_pipeline(&pipes.composite[format_i][usize::from(replace)]);
+                    }
+                    let Some(Source::Projected(key)) = range.source else {
+                        unreachable!("a projective range samples a local image")
+                    };
+                    let backdrop = backdrop_slot
+                        .map(|slot| &surf.backdrop[slot].as_ref().expect("grown above").view);
+                    let mask = range.mask.map(|k| {
+                        self.atlas
+                            .mask_texture_view(k)
+                            .expect("mask texture stored before encode")
+                    });
+                    let entry = projective_entry_mut(&mut surf.projective, key);
+                    let bind = entry.bind(
+                        &self.device,
+                        pipes,
+                        (backdrop_slot, backdrop),
+                        (range.mask, mask),
+                        (surf.bind_gen, mask_gen),
+                        &self.dummy_view,
+                    );
+                    render_pass.set_bind_group(1, bind, &[]);
+                    render_pass.draw(
+                        0..6,
+                        (inst_base + range.instances.start)..(inst_base + range.instances.end),
+                    );
+                    ri += 1;
+                    continue;
+                }
+                // A `Planes`/`ExternalFormat` generation draws in the Vulkan
+                // native operation: end the wgpu pass, record the native
+                // composition into the same target, then reopen the wgpu
+                // pass with a Load (#166). `Rgb` generations stay on the
+                // ordinary external path below.
+                #[cfg(all(unix, not(target_vendor = "apple")))]
+                if let Some(lower::ImageSource::External(layer)) = &range.image
+                    && self.native.is_some()
+                    && surf
+                        .external
+                        .get(layer)
+                        .and_then(|slot| slot.native_frame())
+                        .is_some()
+                {
+                    drop(render_pass);
+                    let mut draws = Vec::new();
+                    let mut end = ri;
+                    while end < pass.ranges.len() {
+                        let Some(lower::ImageSource::External(l)) = &pass.ranges[end].image else {
+                            break;
+                        };
+                        let Some(frame) = surf.external.get(l).and_then(|slot| slot.native_frame())
+                        else {
+                            break;
+                        };
+                        let slot = surf.external.get(l).expect("slot checked");
+                        draws.push(external::vulkan::OpDraw {
+                            generation: frame.generation.clone(),
+                            first_instance: inst_base + pass.ranges[end].instances.start,
+                            instance_count: pass.ranges[end].instances.end
+                                - pass.ranges[end].instances.start,
+                            mask: pass.ranges[end].mask.map(|key| {
+                                raw_vk_view(
+                                    self.atlas
+                                        .mask_texture_view(key)
+                                        .expect("mask texture stored before encode"),
+                                )
+                            }),
+                            mask_gen: self.atlas.mask_texture_generation(),
+                            params: raw_vk_buffer(slot.params_buffer()),
+                        });
+                        end += 1;
+                    }
+                    stats.draws += u32::try_from(draws.len() - 1).unwrap_or(u32::MAX);
+                    stats.passes += 1;
+                    let vk_format = hal_adapter
+                        .as_ref()
+                        .expect("native run implies vulkan")
+                        .texture_format_as_raw(target_format);
+                    let native = self.native.as_mut().expect("checked");
+                    let set0 = native
+                        .set0_set(
+                            raw_vk_buffer(&self.globals),
+                            raw_vk_buffer(&self.instances),
+                            raw_vk_buffer(&self.stops),
+                            raw_vk_view(self.atlas.view()),
+                        )
+                        .map_err(|e| RenderError::Render(e.to_string()))?;
+                    buffers.push(split_encoder(&mut encoder, &self.device));
+                    let mut op =
+                        self.device
+                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("external"),
+                            });
+                    unsafe {
+                        op.as_hal_mut::<wgpu::hal::vulkan::Api, _, _>(|hal| {
+                            let hal = hal.expect("vulkan encoder");
+                            let cb = hal.raw_handle();
+                            native.record(
+                                cb,
+                                raw_vk_view(&target_view),
+                                target_size,
+                                vk_format,
+                                set0,
+                                &draws,
+                                offset,
+                                surf.bind_gen,
+                            )
+                        })
+                    }
+                    .map_err(|e| RenderError::Render(e.to_string()))?;
+                    buffers.push(op.finish());
+                    // The end sample belongs on the LAST reopened segment:
+                    // a pass with a later native op still coming must not
+                    // write it here.
+                    let more_native = pass.ranges[end..].iter().any(|range| {
+                        matches!(&range.image, Some(lower::ImageSource::External(layer))
+                            if surf
+                                .external
+                                .get(layer)
+                                .and_then(|slot| slot.native_frame())
+                                .is_some())
+                    });
+                    let reopen_writes =
+                        self.query_set
+                            .as_ref()
+                            .map(|qs| wgpu::RenderPassTimestampWrites {
+                                query_set: qs,
+                                beginning_of_pass_write_index: None,
+                                end_of_pass_write_index: (!more_native)
+                                    .then_some(self.query_base + 2 * pass_index + 1),
+                            });
+                    render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &target_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: reopen_writes,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    render_pass.set_pipeline(&self.pipelines[format_i][0][0]);
+                    if !matches!(pass.target, Target::Surface) {
+                        render_pass.set_viewport(
+                            0.0,
+                            0.0,
+                            pass.region[2] as f32,
+                            pass.region[3] as f32,
+                            0.0,
+                            1.0,
+                        );
+                        render_pass.set_scissor_rect(0, 0, pass.region[2], pass.region[3]);
+                    }
+                    render_pass.set_bind_group(0, &self.bind0, &[offset]);
+                    pipeline = Bound::Engine(PipelineKind::SrcOver, ShaderVariant::Simple);
+                    ri = end;
+                    continue;
+                }
                 if let Some(lower::ImageSource::External(layer)) = &range.image {
                     if pipeline != Bound::External {
                         pipeline = Bound::External;
@@ -4628,6 +5697,7 @@ impl GpuRenderer {
                         0..6,
                         (inst_base + range.instances.start)..(inst_base + range.instances.end),
                     );
+                    ri += 1;
                     continue;
                 }
                 let want = Bound::Engine(range.pipeline, range.variant);
@@ -4664,15 +5734,8 @@ impl GpuRenderer {
                     std::collections::hash_map::Entry::Occupied(e) => &*e.into_mut(),
                     std::collections::hash_map::Entry::Vacant(e) => {
                         stats.bind_groups_created += 1;
-                        let backdrop = if scratch_backdrop {
-                            let slot = match pass.target {
-                                Target::Surface => 0,
-                                Target::Scratch(_) | Target::Backdrop { .. } => 1,
-                            };
-                            surf.backdrop[slot].as_ref().map(|b| &b.view)
-                        } else {
-                            None
-                        };
+                        let backdrop = backdrop_slot
+                            .and_then(|slot| surf.backdrop[slot].as_ref().map(|b| &b.view));
                         &*e.insert(make_bind1(
                             &self.device,
                             &self.layout1,
@@ -4682,12 +5745,29 @@ impl GpuRenderer {
                                 Source::Backdrop { group, region } => {
                                     &surf.backdrop_groups[&group].captures[region as usize].view
                                 }
+                                Source::Projected(_) => {
+                                    unreachable!("local images draw with the projective pipeline")
+                                }
                             }),
                             backdrop,
                             range.image.as_ref().and_then(|source| match source {
-                                lower::ImageSource::Registered(id) => {
-                                    self.images.get(id).map(|image| &image.view)
-                                }
+                                // Lowering resolved this range against a
+                                // registered image, and the render loop frees
+                                // an image only once no installed content
+                                // draws it (#199): a range naming a missing
+                                // image is an engine defect, never drawn
+                                // with a substitute.
+                                lower::ImageSource::Registered(id) => Some(
+                                    &self
+                                        .images
+                                        .get(id)
+                                        .unwrap_or_else(|| {
+                                            panic!(
+                                                "a lowered range samples image {id}, which is not registered"
+                                            )
+                                        })
+                                        .view,
+                                ),
                                 lower::ImageSource::Bitmap(key) => {
                                     self.bitmaps.get(key).map(|bitmap| &bitmap.image.view)
                                 }
@@ -4718,6 +5798,7 @@ impl GpuRenderer {
                     0..6,
                     (inst_base + range.instances.start)..(inst_base + range.instances.end),
                 );
+                ri += 1;
             }
             drop(render_pass);
             if let Some((_, parameters)) = surf.frame.shadows.iter().find(|(pass, _)| *pass == i) {
@@ -4740,7 +5821,7 @@ impl GpuRenderer {
                     Target::Backdrop { group, region } => {
                         &surf.backdrop_groups[&group].captures[region as usize]
                     }
-                    Target::Surface => {
+                    Target::Surface | Target::Projected(_) => {
                         return Err(RenderError::Render(format!(
                             "filter {filter:?} registered on a surface pass"
                         )));
@@ -4759,6 +5840,15 @@ impl GpuRenderer {
                     timing,
                     &mut encoder,
                 )?;
+            }
+            for (_, key) in surf.frame.mips.iter().filter(|(pass, _)| *pass == i) {
+                let pipes = self
+                    .projective
+                    .as_ref()
+                    .expect("projective pipelines are built before encoding");
+                let entry = projective_entry(&surf.projective, *key);
+                entry.build_mips(&mut encoder, pipes);
+                stats.passes += u32::try_from(entry.mips.len()).unwrap_or(u32::MAX);
             }
         }
         // Producer sync: each external frame's `wait` event becomes a
@@ -4786,7 +5876,109 @@ impl GpuRenderer {
                 buffer.commit();
             }
         }
-        let submission = self.queue.submit([encoder.finish()]);
+        // Retired generations' release barriers join this encoder; their
+        // signal semaphores and the staged producer waits register on the
+        // queue immediately before the consuming submission, under the
+        // submit guard (#166).
+        #[cfg(all(unix, not(target_vendor = "apple")))]
+        if let Some(native) = self.native.as_mut() {
+            let releases = external::vulkan::drain_releases(native);
+            if !releases.is_empty() {
+                buffers.push(split_encoder(&mut encoder, &self.device));
+                let mut release_cb =
+                    self.device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("release"),
+                        });
+                unsafe {
+                    release_cb.as_hal_mut::<wgpu::hal::vulkan::Api, _, _>(|hal| {
+                        let hal = hal.expect("vulkan encoder");
+                        let cb = hal.raw_handle();
+                        for release in &releases {
+                            release.encode_barrier(&native.shared, cb);
+                        }
+                    });
+                }
+                buffers.push(release_cb.finish());
+                native.releases = releases;
+            }
+        }
+        let submission = {
+            #[cfg(all(unix, not(target_vendor = "apple")))]
+            let _submit = self.submit_lock.lock().expect("submit guard");
+            #[cfg(all(unix, not(target_vendor = "apple")))]
+            if let Some(native) = self.native.as_mut()
+                && (!native.staged.is_empty() || !native.releases.is_empty())
+            {
+                let hal_queue =
+                    unsafe { self.queue.as_hal::<wgpu::hal::vulkan::Api>() }.expect("vulkan queue");
+                external::vulkan::submit_waits(native, &hal_queue);
+                for release in &native.releases {
+                    for (semaphore, value) in release.signals() {
+                        hal_queue.add_signal_semaphore(semaphore, value);
+                    }
+                }
+            }
+            buffers.push(encoder.finish());
+            let submission = self.queue.submit(buffers);
+            #[cfg(all(unix, not(target_vendor = "apple")))]
+            if let Some(native) = self.native.as_mut()
+                && !native.staged.is_empty()
+            {
+                external::vulkan::mark_submitted(native);
+            }
+            #[cfg(all(unix, not(target_vendor = "apple")))]
+            if let Some(native) = self.native.as_mut()
+                && !native.acquiring.is_empty()
+            {
+                // The consuming submission is accepted; states promote to
+                // `OwnedForRead` when the queue reports it complete.
+                let acquired = std::mem::take(&mut native.acquiring);
+                self.queue
+                    .on_submitted_work_done(move || external::vulkan::mark_owned(acquired));
+            }
+            #[cfg(all(unix, not(target_vendor = "apple")))]
+            if let Some(native) = self.native.as_mut() {
+                // Bounded-cache evictions are destroyed once every
+                // submission that could still reference them completes.
+                let destroys = external::vulkan::drain_destroys(native);
+                if !destroys.is_empty() {
+                    let device = native.shared.vk.device.clone();
+                    self.queue.on_submitted_work_done(move || {
+                        for item in destroys {
+                            unsafe { item.destroy(&device) };
+                        }
+                    });
+                }
+            }
+            #[cfg(all(unix, not(target_vendor = "apple")))]
+            if let Some(native) = self.native.as_mut()
+                && !native.releases.is_empty()
+            {
+                // The release submission is accepted: exportable fences
+                // are exported now — while their signal is still pending
+                // — and destruction runs when the queue reports the
+                // submission complete — never a CPU wait.
+                let shared = native.shared.clone();
+                let releases = std::mem::take(&mut native.releases);
+                for release in &releases {
+                    release.export_fence(&shared);
+                    if let Some(flag) = &release.submitted_flag {
+                        flag.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                    if let Some(state) = &release.state {
+                        *state.lock().expect("generation state") =
+                            external::vulkan::State::ReleaseSubmitted;
+                    }
+                }
+                self.queue.on_submitted_work_done(move || {
+                    for release in releases {
+                        release.destroy(&shared);
+                    }
+                });
+            }
+            submission
+        };
         if uploads.is_some() {
             self.uploads.submitted(submission.clone());
         }
@@ -4920,6 +6112,71 @@ impl GpuRenderer {
             meta: std::mem::take(&mut self.pass_meta),
             complete,
         });
+    }
+
+    /// Submits a pending external-frame retirement even when nothing else
+    /// is being drawn — an idle engine still releases the lease (#166).
+    /// Returns the release submission when one was made.
+    #[cfg(all(unix, not(target_vendor = "apple")))]
+    fn flush_native_releases(&mut self) -> Option<wgpu::SubmissionIndex> {
+        let native = self.native.as_mut()?;
+        let releases = external::vulkan::drain_releases(native);
+        if releases.is_empty() {
+            return None;
+        }
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("external frame release"),
+            });
+        unsafe {
+            encoder.as_hal_mut::<wgpu::hal::vulkan::Api, _, _>(|hal| {
+                let hal = hal.expect("vulkan encoder");
+                let cb = hal.raw_handle();
+                for release in &releases {
+                    release.encode_barrier(&native.shared, cb);
+                }
+            });
+        }
+        let submission = {
+            let _submit = self.submit_lock.lock().expect("submit guard");
+            let hal_queue =
+                unsafe { self.queue.as_hal::<wgpu::hal::vulkan::Api>() }.expect("vulkan queue");
+            for release in &releases {
+                for (semaphore, value) in release.signals() {
+                    hal_queue.add_signal_semaphore(semaphore, value);
+                }
+            }
+            self.queue.submit([encoder.finish()])
+        };
+        let shared = native.shared.clone();
+        for release in &releases {
+            // Same ordering as the frame submit path: export while the
+            // release signal is still pending, before destruction.
+            release.export_fence(&shared);
+            if let Some(flag) = &release.submitted_flag {
+                flag.store(true, std::sync::atomic::Ordering::Release);
+            }
+            if let Some(state) = &release.state {
+                *state.lock().expect("generation state") =
+                    external::vulkan::State::ReleaseSubmitted;
+            }
+        }
+        self.queue.on_submitted_work_done(move || {
+            for release in releases {
+                release.destroy(&shared);
+            }
+        });
+        let destroys = external::vulkan::drain_destroys(native);
+        if !destroys.is_empty() {
+            let device = native.shared.vk.device.clone();
+            self.queue.on_submitted_work_done(move || {
+                for item in destroys {
+                    unsafe { item.destroy(&device) };
+                }
+            });
+        }
+        Some(submission)
     }
 
     /// Encodes the resolve only once the frame's samples are complete.
@@ -5440,7 +6697,7 @@ impl GpuRenderer {
                         [region as usize]
                         .texture
                         .format(),
-                    Target::Surface => TARGET_FORMAT,
+                    Target::Surface | Target::Projected(_) => TARGET_FORMAT,
                 };
                 (*id, format)
             })
@@ -5459,5 +6716,30 @@ impl GpuRenderer {
                 .await?;
         }
         Ok(())
+    }
+}
+
+/// Engine teardown: surface drops retire the last frame leases into the
+/// device release queue, and a release only becomes safe to destroy once
+/// the release submission completes — `release.destroy` runs on the
+/// submission's completion callback, so shutdown submits the pending
+/// releases and joins the queue once. A CPU wait at teardown is a host
+/// join, not a producer fence wait; the no-CPU-wait contract covers
+/// steady-state submissions only. Without this the imported images,
+/// memories and semaphores — and the driver-held fds behind them — outlive
+/// the engine until device destroy (#166 fd accounting).
+#[cfg(all(unix, not(target_vendor = "apple")))]
+impl Drop for GpuRenderer {
+    fn drop(&mut self) {
+        // Surfaces drop before fields: retire their frame leases while the
+        // native context and queue still live.
+        self.surfaces.clear();
+        if self.native.is_some()
+            && let Some(submission) = self.flush_native_releases()
+        {
+            // Completion callbacks run under the poll; a timeout leaves
+            // the releases queued — the device drop reclaims the objects.
+            drop(self.wait(submission, "external frame teardown"));
+        }
     }
 }

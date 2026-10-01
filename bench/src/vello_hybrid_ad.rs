@@ -9,6 +9,7 @@
 //! [`crate::wgpu_ctx::drain_and_stamp`]).
 
 use std::collections::BTreeSet;
+use std::time::Instant;
 
 use cherenkov_scene::Feature;
 use kurbo::{Affine, BezPath, Rect, Stroke};
@@ -309,6 +310,7 @@ impl Engine for VelloHybrid {
         // the render and would bracket an empty interval. The drain
         // serializes CPU and GPU for the measured frame by design.
         drain_and_stamp(&self.gpu, 0)?;
+        let render_at = Instant::now();
         let mut encoder =
             self.gpu
                 .device
@@ -333,6 +335,8 @@ impl Engine for VelloHybrid {
         self.gpu.queue.submit([encoder.finish()]);
         drain_and_stamp(&self.gpu, 1)?;
         let gpu_seconds = resolve_timestamps(&self.gpu)?;
+        let render_seconds = render_at.elapsed().as_secs_f64();
+        let readback_at = Instant::now();
         let image = if readback_flag {
             Some(readback(&self.gpu, target)?)
         } else {
@@ -342,6 +346,8 @@ impl Engine for VelloHybrid {
             image,
             gpu: GpuSample::whole_frame(frame, gpu_seconds),
             phases: None,
+            render_seconds: Some(render_seconds),
+            readback_seconds: readback_flag.then(|| readback_at.elapsed().as_secs_f64()),
         })
     }
 

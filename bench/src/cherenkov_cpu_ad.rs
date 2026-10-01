@@ -25,7 +25,7 @@ use kurbo::{Affine, BezPath, Circle, Ellipse, Line, Rect, RoundedRect, Vec2};
 
 use crate::convert::{self, Blobs, Op, ShapeKind, engine_blend, group_op, op, shape_kind, working};
 use crate::memory::{AdapterMemory, EngineBytes, Reading};
-use crate::motion::{Clock, LayerMotion, motion_animation};
+use crate::motion::{Clock, LayerMotion, LayerProjection, motion_animation};
 use crate::timing::Timings;
 use crate::{
     BenchError, Counters, DeviceInfo, EncodeInput, Engine, EngineInfo, GpuSample, PresentKind,
@@ -436,6 +436,8 @@ struct PrepLayer {
     own: ContentRun,
     /// Ordered children.
     items: Vec<PrepItem>,
+    /// The layer's projective pose.
+    projection: Option<LayerProjection>,
     /// The layer's one-time motion.
     motion: Option<LayerMotion>,
     /// The backdrop group this layer samples, if any.
@@ -541,6 +543,7 @@ fn cherenkov_features() -> Vec<Feature> {
         Feature::BackdropBlur,
         Feature::BackdropColorMatrix,
         Feature::BackdropEffect,
+        Feature::Projective,
         // `sRGB` maps to `SrgbEncoded`; `linear-p3` and `linear-srgb` are
         // both linear interpolation, which is the working space already.
         Feature::InterpolationSpace(ColorSpace::Srgb),
@@ -561,6 +564,9 @@ fn unsupported_feature(u: &str) -> Feature {
         "mesh-gradient" | "image" | "shader-paint" => Feature::Image,
         "blend-mode" => Feature::Blend(BlendMode::Normal),
         "blend-space" => Feature::BlendSpace(BlendSpace::SrgbEncoded),
+        "projective-unclipped"
+        | "projective-backdrop-member"
+        | "projective-backdrop-cross-space" => Feature::Projective,
         "backdrop-unclipped"
         | "backdrop-footprint"
         | "backdrop-effect-sdf-path"
@@ -950,8 +956,13 @@ fn prep_layer(
             Some(Motion::Paint { .. }) => None,
             motion => motion
                 .as_ref()
-                .map(|m| LayerMotion::from_scene(m, layer.transform)),
+                .map(|m| LayerMotion::from_scene(m, layer.transform, layer.projection.as_deref())),
         },
+        projection: layer
+            .projection
+            .as_deref()
+            .map(LayerProjection::from_scene)
+            .transpose()?,
         backdrop: layer.backdrop,
         backdrop_effect: layer.backdrop_effect.clone(),
     };
@@ -1129,6 +1140,9 @@ fn build_layer(
     {
         let edit = &mut tx[layer];
         edit.transform(prep.transform);
+        if let Some(projection) = &prep.projection {
+            projection.apply(edit);
+        }
         edit.scroll_offset(prep.scroll_offset);
         edit.opacity(prep.opacity as f32);
         edit.blend(prep.blend);
@@ -1336,6 +1350,12 @@ impl Engine for Cherenkov {
         let format = match self.present {
             Some(PresentKind::SrgbHw | PresentKind::SrgbShader) => OffscreenFormat::LinearF32,
             Some(PresentKind::LinearP3) => OffscreenFormat::LinearF16,
+            Some(kind) => {
+                return Err(BenchError::Engine(format!(
+                    "cherenkov-cpu: {} presentation is unsupported",
+                    kind.name()
+                )));
+            }
             None => Self::readback_format(),
         };
         let surface = self
@@ -1456,8 +1476,19 @@ impl Engine for Cherenkov {
 
     /// Puts the adapter into presentation mode: `submit`'s readback is
     /// run through the backend's presentation and lifted back to the
-    /// working space, matching the GPU adapter.
+    /// working space, matching the GPU adapter. The CPU backend presents
+    /// sRGB and extended linear P3 only — the #98 encoded destinations
+    /// are swapchain colour spaces a CPU framebuffer does not model.
     fn present(&mut self, kind: PresentKind) -> Result<(), BenchError> {
+        match kind {
+            PresentKind::SrgbHw | PresentKind::SrgbShader | PresentKind::LinearP3 => {}
+            _ => {
+                return Err(BenchError::Engine(format!(
+                    "cherenkov-cpu: {} presentation is unsupported",
+                    kind.name()
+                )));
+            }
+        }
         self.present = Some(kind);
         Ok(())
     }
@@ -1472,6 +1503,7 @@ impl Engine for Cherenkov {
                 "cherenkov: submit before prepare".into(),
             ));
         }
+        let render_at = std::time::Instant::now();
         self.timings.render_frame(
             &self.engine,
             &mut self.clock,
@@ -1479,6 +1511,8 @@ impl Engine for Cherenkov {
             readback && self.has_motion,
             render_error,
         )?;
+        let render_seconds = render_at.elapsed().as_secs_f64();
+        let readback_at = std::time::Instant::now();
         let image = if readback {
             let rb = self
                 .surface
@@ -1509,6 +1543,12 @@ impl Engine for Cherenkov {
                 Some(PresentKind::LinearP3) => {
                     cherenkov_cpu::present_linear_p3(self.headroom, &rb.pixels)
                 }
+                Some(kind) => {
+                    return Err(BenchError::Engine(format!(
+                        "cherenkov-cpu: {} presentation is unsupported",
+                        kind.name()
+                    )));
+                }
                 None => rb.pixels,
             };
             Some(cherenkov_oracle::F32Image {
@@ -1523,6 +1563,8 @@ impl Engine for Cherenkov {
             image,
             gpu: Vec::new(),
             phases: None,
+            render_seconds: Some(render_seconds),
+            readback_seconds: readback.then(|| readback_at.elapsed().as_secs_f64()),
         })
     }
 

@@ -71,7 +71,7 @@ impl ContinuousRect {
                 let s = f64::from(k) * 0.25;
                 let pm = arc(c, (t1 - t0).mul_add(s, t0));
                 let (cx, cy) = (p0.x + s * (p1.x - p0.x), p0.y + s * (p1.y - p0.y));
-                (pm.x - cx).hypot(pm.y - cy) <= tol
+                libm::hypot(pm.x - cx, pm.y - cy) <= tol
             });
             if flat || depth >= MAX_DEPTH {
                 path.line_to(p1);
@@ -100,7 +100,10 @@ impl ContinuousRect {
         // Point on corner `c`'s Lamé arc at parameter `t ∈ [0, π/2]`.
         let arc = |c: usize, t: f64| -> Point {
             let (cx, cy) = corners[c];
-            let (s, co) = (r * t.sin().powf(e), r * t.cos().powf(e));
+            let (s, co) = (
+                r * libm::pow(libm::sin(t), e),
+                r * libm::pow(libm::cos(t), e),
+            );
             let (dx, dy) = match c {
                 0 => (s, -co),  // TR: from (cx, cy-r) to (cx+r, cy)
                 1 => (co, s),   // BR: from (cx+r, cy) to (cx, cy+r)

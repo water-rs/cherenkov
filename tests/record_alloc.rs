@@ -16,13 +16,27 @@ use cherenkov::{
     OffscreenFormat, ShapeData, WorkingColor,
 };
 
-thread_local! {
-    static TRACKING: Cell<bool> = const { Cell::new(false) };
-    static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
-    static REALLOCATIONS: Cell<usize> = const { Cell::new(0) };
-    static FREES: Cell<usize> = const { Cell::new(0) };
-    static COMMAND_BUFFERS: Cell<([usize; 32], usize)> = const { Cell::new(([0; 32], 0)) };
+#[cfg_attr(
+    target_os = "android",
+    expect(
+        clippy::missing_const_for_thread_local,
+        reason = "rust-clippy#13422: misfires on this target's thread_local expansion"
+    )
+)]
+mod counters {
+    use std::cell::Cell;
+
+    thread_local! {
+        pub(crate) static TRACKING: Cell<bool> = const { Cell::new(false) };
+        pub(crate) static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+        pub(crate) static REALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+        pub(crate) static FREES: Cell<usize> = const { Cell::new(0) };
+        pub(crate) static COMMAND_BUFFERS: Cell<([usize; 32], usize)> =
+            const { Cell::new(([0; 32], 0)) };
+    }
 }
+
+use counters::{ALLOCATIONS, COMMAND_BUFFERS, FREES, REALLOCATIONS, TRACKING};
 
 struct ThreadAllocator;
 

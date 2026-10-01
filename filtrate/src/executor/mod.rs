@@ -13,17 +13,19 @@
 
 extern crate alloc;
 
-mod animation;
+pub mod animation;
 mod entry;
 mod gpu;
 mod plan;
+pub mod uniforms;
 
 #[cfg(test)]
 mod tests;
 
+use alloc::vec::Vec;
 use core::fmt;
 
-use filtrate_core::{Chain, Filter, ParamArray, SpatialFilter};
+use filtrate_core::{Chain, Filter, ParamArray, SpatialFilter, WatchGuard};
 
 use crate::effect::{
     Effect, EffectContext, EffectInput, EffectOutput, EffectRedrawCallback, EffectRenderError,
@@ -31,6 +33,7 @@ use crate::effect::{
 };
 use animation::ParamAnimator;
 use gpu::Gpu;
+pub use gpu::{filterable, sampler};
 
 /// Runs a [`Filter`] on wgpu textures: texture in, texture of the same size
 /// out.
@@ -40,6 +43,9 @@ use gpu::Gpu;
 /// [`Effect::encode_render`] reports whether another frame is needed.
 pub struct Executor<F: Filter> {
     filter: F,
+    /// Parameter watcher subscriptions, dropped before the animator whose
+    /// channel they feed.
+    _watcher_guards: Vec<WatchGuard>,
     animator: ParamAnimator,
     gpu: Option<Gpu>,
     /// Sticky setup error: once set, rendering fails fast.
@@ -62,9 +68,11 @@ impl<F: Filter> Executor<F> {
     pub fn new(filter: F) -> Self {
         let mut targets = alloc::vec![0.0; <F::Params as ParamArray>::LEN];
         filter.params().write_to(&mut targets);
-        let animator = ParamAnimator::new(targets, |installer| filter.visit_signals(installer));
+        let (animator, watcher_guards) =
+            ParamAnimator::new(targets, |installer| filter.visit_signals(installer));
         Self {
             filter,
+            _watcher_guards: watcher_guards,
             animator,
             gpu: None,
             setup_error: None,

@@ -607,6 +607,7 @@ fn node_to_item(node: Node, place: Affine, scene_rect: Rect) -> Item {
             filter: None,
             backdrop_effect: None,
             scroll_offset: kurbo::Vec2::ZERO,
+            projection: None,
             motion: None,
             live: Vec::new(),
             items: children
@@ -1078,6 +1079,7 @@ pub fn items_for_glyph_run(
                     filter: None,
                     backdrop_effect: None,
                     scroll_offset: kurbo::Vec2::ZERO,
+                    projection: None,
                     motion: None,
                     items: vec![Item::Draw(Draw::Image {
                         image: bitmap.hash,

@@ -106,7 +106,9 @@ device:
     xcrun devicectl device install app --device <udid> CherenkovBench.app
 
     # push inputs: an array of argument lists (no program name; argv[0]
-    # is inserted by the app), plus the scene corpus under scenes/.
+    # is inserted by the app), plus the scene corpus under scenes/ —
+    # generated, not committed, so `python3 scenes/tools/generate.py`
+    # first.
     # Documents/ is shared (UIFileSharingEnabled), so Finder's device
     # Files tab or `ifuse --documents dev.cherenkov.bench` also work.
     xcrun devicectl device copy to --device <udid> \

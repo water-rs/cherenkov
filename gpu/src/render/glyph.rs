@@ -40,6 +40,28 @@ pub struct FontData {
     pub colr: std::cell::RefCell<FxHashMap<(u32, u64, u64), cherenkov::Picture>>,
 }
 
+/// A font validated on the caller thread by `Renderer::prepare_font`:
+/// everything registration needs, so `add_font` cannot fail.
+pub struct PreparedFont {
+    pub data: Arc<[u8]>,
+    pub index: u32,
+    pub has_colr: bool,
+    pub bitmap: Option<Arc<super::bitmap::BitmapFont>>,
+}
+
+impl From<PreparedFont> for FontData {
+    fn from(font: PreparedFont) -> Self {
+        Self {
+            data: font.data,
+            index: font.index,
+            has_colr: font.has_colr,
+            has_bitmap: font.bitmap.is_some(),
+            bitmap: font.bitmap,
+            colr: std::cell::RefCell::new(FxHashMap::default()),
+        }
+    }
+}
+
 impl FontData {
     /// A per-thread copy: shares the font bytes, clones the COLR cache.
     /// Workers each own one so `colr` can stay a plain `RefCell`.
@@ -270,14 +292,20 @@ struct Shelf {
 /// The shelf layout plus reclaim bookkeeping — the part of [`Atlas`] a
 /// plan dry-run clones to simulate placements without touching the
 /// live caches.
+///
+/// The atlas is paged (#211): the texture is `size` × `size * pages`,
+/// shelf `y` coordinates are global (`page * size + local`), and `tops`
+/// carries one virgin watermark per page. Bands never span a page
+/// boundary, so dead-band merges and frontier recycling are per-page.
 #[derive(Clone)]
 struct Layout {
     shelves: Vec<Shelf>,
     /// Dead shelf indices, their bands reclaimable by a same-or-smaller
     /// height class.
     vacant: Vec<u32>,
-    /// Virgin-space watermark: bands are laid consecutively from y = 0.
-    top: u32,
+    /// Virgin-space watermark per page: page `p`'s bands are laid
+    /// consecutively from `y = p * size` up to `p * size + tops[p]`.
+    tops: Vec<u32>,
     /// Next band epoch — monotonic, so a band's epoch changes whenever
     /// the band occupying a slot changes (#119).
     next_epoch: u64,
@@ -308,9 +336,12 @@ enum LiveKind {
 pub struct Atlas {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
+    /// Page edge: the texture is `size` × `size * pages`.
     size: u32,
     /// The largest atlas edge the GPU budget allows.
     cap: u32,
+    /// `cap`-square pages the texture carries.
+    pages: u32,
     /// Bumped whenever the texture is recreated, so stale bind groups are
     /// rebuilt.
     generation: u64,
@@ -361,6 +392,8 @@ pub struct Atlas {
     mask_texture_gen: u64,
     /// The GPU byte budget for `mask_textures` (`budget / 16`).
     mask_budget: u64,
+    /// The GPU byte budget the atlas's pages may reach (`budget / 8`).
+    page_budget: u64,
     /// Sum of cell texels, an approximation of the CPU cache size.
     cpu_bytes: u64,
     /// Upload assembly scratch for [`Self::upload_committed`]: the span
@@ -384,12 +417,13 @@ impl Atlas {
     /// A new `ATLAS_START` atlas, capped by the GPU byte budget (one texel
     /// per byte).
     pub fn new(device: &wgpu::Device, budget: u64) -> Self {
-        let (texture, view) = Self::allocate(device, ATLAS_START);
+        let (texture, view) = Self::allocate(device, ATLAS_START, 1);
         crate::diag::create(
             device,
             "glyph atlas",
             u64::from(ATLAS_START) * u64::from(ATLAS_START),
         );
+        let texture_limit = device.limits().max_texture_dimension_2d;
         #[expect(
             clippy::cast_possible_truncation,
             clippy::cast_precision_loss,
@@ -404,13 +438,15 @@ impl Atlas {
             view,
             size: ATLAS_START,
             cap,
+            pages: 1,
             generation: 0,
             layout: Layout {
                 shelves: Vec::new(),
                 vacant: Vec::new(),
-                top: 0,
+                tops: vec![0],
                 next_epoch: 0,
             },
+            page_budget: budget / 8,
             slot_keys: Vec::new(),
             live: rustc_hash::FxHashMap::default(),
             clock: 0,
@@ -424,7 +460,7 @@ impl Atlas {
             slot_dead: Vec::new(),
             masks: rustc_hash::FxHashMap::default(),
             mask_textures: rustc_hash::FxHashMap::default(),
-            texture_limit: device.limits().max_texture_dimension_2d,
+            texture_limit,
             mask_texture_bytes: 0,
             mask_texture_gen: 0,
             mask_budget: budget / 16,
@@ -446,12 +482,16 @@ impl Atlas {
         self.generation
     }
 
-    fn allocate(device: &wgpu::Device, size: u32) -> (wgpu::Texture, wgpu::TextureView) {
+    fn allocate(
+        device: &wgpu::Device,
+        size: u32,
+        pages: u32,
+    ) -> (wgpu::Texture, wgpu::TextureView) {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("glyph atlas"),
             size: wgpu::Extent3d {
                 width: size,
-                height: size,
+                height: size * pages,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -472,7 +512,7 @@ impl Atlas {
 
     /// Atlas byte size on the GPU.
     pub fn gpu_bytes(&self) -> u64 {
-        u64::from(self.size) * u64::from(self.size)
+        u64::from(self.size) * u64::from(self.size) * u64::from(self.pages)
     }
 
     /// Approximate CPU-side cache bytes.
@@ -516,7 +556,8 @@ impl Atlas {
         self.masks.clear();
         self.layout.shelves.clear();
         self.layout.vacant.clear();
-        self.layout.top = 0;
+        self.layout.tops.clear();
+        self.layout.tops.resize(self.pages as usize, 0);
         self.slot_keys.clear();
         self.live.clear();
         self.evicting = false;
@@ -661,11 +702,12 @@ impl Atlas {
     /// The placement decision a pending batch's dry run supports
     /// (#169 A3): whether the shelves take every cell as-is, or bounded
     /// eviction of untouched shelves places them (#119), or the atlas
-    /// must grow once to a target edge, or the batch exceeds even the
-    /// emptied atlas. The dry run simulates the same eviction the
+    /// must resize to a different `(edge, pages)`, or the batch exceeds
+    /// even the emptied atlas. The dry run simulates the same eviction the
     /// commit applies, so a `FitsEviction` verdict guarantees the
-    /// evicting commit succeeds and `Grow` means the batch genuinely
-    /// needs more texels than the atlas holds.
+    /// evicting commit succeeds and `Resize` means the batch's cell set
+    /// needs a different `(edge, pages)` — more pages than a peak frame
+    /// left behind, or fewer once it packs below (#211).
     pub fn plan(&mut self, rasters: &[&PendingRaster]) -> AtlasPlan {
         self.batch_cells(rasters);
         let mut probe = self.layout.clone();
@@ -675,13 +717,58 @@ impl Atlas {
                 if alloc_on(&mut probe, self.size, self.tick, w, h).is_some() {
                     break true;
                 }
-                if evict_layout(&mut probe, self.tick).is_none() {
+                if evict_layout(&mut probe, self.size, self.tick).is_none() {
                     break false;
                 }
                 evicted = true;
             }
         });
         if fits {
+            // A paged atlas outlives the frame that needed its pages:
+            // once the live coverage packs onto fewer, release the rest
+            // — the texture returns to the size the current content
+            // needs instead of holding the peak (#211). Live = the
+            // batch's pending cells plus every cached cell on a shelf
+            // this commit touched; untouched cache is dead weight the
+            // resize drops. The probe packs exactly the cells a
+            // re-lowered commit places, so the verdict transfers.
+            if self.pages > 1 {
+                self.live_cells();
+                // Probe in the same order the grow path below does —
+                // edge doubling on a single page first, pages at the
+                // cap last — so the released atlas lands on the shape a
+                // fresh engine reaches for the same content, not just
+                // any smaller area (#211).
+                let area = u64::from(self.size) * u64::from(self.size) * u64::from(self.pages);
+                let mut candidates: Vec<(u32, u32)> = Vec::new();
+                let mut size = ATLAS_START;
+                while size <= self.size {
+                    if u64::from(size) * u64::from(size) < area {
+                        candidates.push((size, 1));
+                    }
+                    size = size.saturating_mul(2);
+                }
+                for pages in 2..self.pages {
+                    if u64::from(self.cap) * u64::from(self.cap) * u64::from(pages) < area {
+                        candidates.push((self.cap, pages));
+                    }
+                }
+                for (size, pages) in candidates {
+                    let mut probe = Layout {
+                        shelves: Vec::new(),
+                        vacant: Vec::new(),
+                        tops: vec![0; pages as usize],
+                        next_epoch: 0,
+                    };
+                    if self
+                        .plan_all
+                        .iter()
+                        .all(|&(w, h)| alloc_on(&mut probe, size, self.tick, w, h).is_some())
+                    {
+                        return AtlasPlan::Resize(size, pages);
+                    }
+                }
+            }
             return if evicted {
                 AtlasPlan::FitsEviction
             } else {
@@ -689,18 +776,18 @@ impl Atlas {
             };
         }
         // Placement failed even with every untouchable shelf gone. A
-        // grow drops every cached cell, so the re-lowered batch places
-        // all of them: size the grow target once, for cached and
-        // pending cells together.
-        self.cached_cells();
-        self.plan_all.extend_from_slice(&self.plan_cells);
+        // resize drops every cached cell, so the re-lowered batch places
+        // only the live set: the pending cells plus the cached cells
+        // this commit touched. Unreferenced cache would bloat — or
+        // break — the target probe (#211).
+        self.live_cells();
         let mut size = self.size;
         while size < self.cap {
             size = (size * 2).min(self.cap);
             let mut probe = Layout {
                 shelves: Vec::new(),
                 vacant: Vec::new(),
-                top: 0,
+                tops: vec![0],
                 next_epoch: 0,
             };
             if self
@@ -708,10 +795,73 @@ impl Atlas {
                 .iter()
                 .all(|&(w, h)| alloc_on(&mut probe, size, self.tick, w, h).is_some())
             {
-                return AtlasPlan::Grow(size);
+                return AtlasPlan::Resize(size, 1);
+            }
+        }
+        // An edge grow at the cap still packs into a single `cap`-square
+        // page; a frame whose coverage exceeds that appends pages instead
+        // (#211). The fresh-layout probe keeps the resize one-shot: a
+        // re-lowered batch places every cell on blank pages or not at
+        // all.
+        let max_pages = self.max_pages(self.cap);
+        for pages in 2..=max_pages {
+            let mut probe = Layout {
+                shelves: Vec::new(),
+                vacant: Vec::new(),
+                tops: vec![0; pages as usize],
+                next_epoch: 0,
+            };
+            if self
+                .plan_all
+                .iter()
+                .all(|&(w, h)| alloc_on(&mut probe, self.cap, self.tick, w, h).is_some())
+            {
+                return AtlasPlan::Resize(self.cap, pages);
             }
         }
         AtlasPlan::Recycle
+    }
+
+    /// `(w, h)` of every cell a re-lowered commit would place: the
+    /// pending batch's cells (`plan_cells`, already deduped misses)
+    /// plus every cached cell on a shelf touched this commit — the
+    /// cells still referenced by live emissions (#211).
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "cell rects and mask sizes are small positive floats"
+    )]
+    fn live_cells(&mut self) {
+        self.plan_all.clear();
+        self.plan_all.extend_from_slice(&self.plan_cells);
+        let tick = self.tick;
+        let touched = |slot: u32| {
+            let row = &self.layout.shelves[usize::try_from(slot).expect("shelf index")];
+            row.live && row.last_used == tick
+        };
+        for entry in self.map.values() {
+            if entry.w > 0 && touched(entry.slot) {
+                self.plan_all.push((u32::from(entry.w), u32::from(entry.h)));
+            }
+        }
+        for emit in self.paths.values() {
+            for cell in &emit.cells {
+                if touched(cell.slot) {
+                    self.plan_all.push((
+                        (cell.rect[2] - cell.rect[0]).round().max(0.0) as u32,
+                        (cell.rect[3] - cell.rect[1]).round().max(0.0) as u32,
+                    ));
+                }
+            }
+        }
+        for mask in self.masks.values() {
+            if touched(mask.slot) {
+                self.plan_all.push((
+                    mask.size[0].ceil().max(0.0) as u32,
+                    mask.size[1].ceil().max(0.0) as u32,
+                ));
+            }
+        }
     }
 
     /// Whether every pending cell places as-is, with no eviction —
@@ -770,46 +920,21 @@ impl Atlas {
         }
     }
 
-    /// `(w, h)` of every cell the caches currently hold — what the
-    /// re-lowered batch places again after a grow or clear.
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "cell rects and mask sizes are small positive floats"
-    )]
-    fn cached_cells(&mut self) {
-        self.plan_all.clear();
-        for entry in self.map.values() {
-            if entry.w > 0 {
-                self.plan_all.push((u32::from(entry.w), u32::from(entry.h)));
-            }
-        }
-        for emit in self.paths.values() {
-            for cell in &emit.cells {
-                self.plan_all.push((
-                    (cell.rect[2] - cell.rect[0]).round().max(0.0) as u32,
-                    (cell.rect[3] - cell.rect[1]).round().max(0.0) as u32,
-                ));
-            }
-        }
-        for mask in self.masks.values() {
-            self.plan_all.push((
-                mask.size[0].ceil().max(0.0) as u32,
-                mask.size[1].ceil().max(0.0) as u32,
-            ));
-        }
-    }
-
     /// The atlas edge in texels.
     pub const fn size(&self) -> u32 {
         self.size
+    }
+
+    /// Pages the atlas carries — the texture is `size` × `size * pages`.
+    pub const fn pages(&self) -> u32 {
+        self.pages
     }
 
     /// `(live shelves, virgin top, vacant bands)` for diagnostics.
     pub fn occupancy(&self) -> (usize, u32, usize) {
         (
             self.layout.shelves.iter().filter(|s| s.live).count(),
-            self.layout.top,
+            self.layout.tops.iter().sum(),
             self.layout.vacant.len(),
         )
     }
@@ -1218,29 +1343,46 @@ impl Atlas {
         self.masks.get(&key).map(|m| m.atlas)
     }
 
-    /// Grows the atlas to `size` (clamped to the cap), dropping every
-    /// cached entry. `#169 A3` passes the dry-run target, so a batch is
-    /// grown once instead of doubling until it happens to fit.
-    pub fn grow_to(&mut self, device: &wgpu::Device, size: u32) {
+    /// Resizes the atlas to `size` × `pages` pages (edge clamped to the
+    /// cap, page count to [`Self::max_pages`]), dropping every cached
+    /// entry. `#169 A3` passes the dry-run target, so a batch resizes
+    /// once instead of doubling until it happens to fit; a paged atlas
+    /// also shrinks back once a batch's cells pack onto fewer pages
+    /// (#211). Growing in pages keeps the edge — and every cell's x
+    /// bound — unchanged while the texture's y range extends.
+    pub fn resize_to(&mut self, device: &wgpu::Device, size: u32, pages: u32) {
         let size = size.min(self.cap);
-        if size == self.size {
+        let pages = pages.clamp(1, self.max_pages(size));
+        if size == self.size && pages == self.pages {
             return;
         }
-        let old = u64::from(self.size) * u64::from(self.size);
-        let (texture, view) = Self::allocate(device, size);
+        let old = self.gpu_bytes();
+        let (texture, view) = Self::allocate(device, size, pages);
         self.texture = texture;
         self.view = view;
         self.size = size;
+        self.pages = pages;
         crate::diag::grow(
             device,
             "glyph atlas",
             crate::diag::Class::Atlas,
             old,
-            u64::from(size) * u64::from(size),
+            self.gpu_bytes(),
             0,
             true,
         );
         self.clear();
+    }
+
+    /// The most pages an atlas of `size` may carry: the device's 2D
+    /// height limit, the atlas's `budget / 8` byte share, and the `u16`
+    /// texel origins retained admissions store.
+    #[expect(clippy::cast_possible_truncation, reason = "atlas sizes are small")]
+    fn max_pages(&self, size: u32) -> u32 {
+        let page_texels = u64::from(size) * u64::from(size);
+        (self.texture_limit.min(65_536) / size)
+            .min((self.page_budget.max(page_texels) / page_texels) as u32)
+            .max(1)
     }
 
     /// Starts a commit batch: advances the commit ordinal, marks every
@@ -1280,11 +1422,12 @@ impl Atlas {
         self.layout.shelves[usize::try_from(slot).expect("shelf index")].epoch
     }
 
-    /// The shelf whose band run owns the atlas pixel `(x, y)` — shelves are
-    /// laid consecutively from `y = 0`, so the row is found by binary
-    /// search; the pixel must also sit inside the shelf's used run (`x <
-    /// shelf.x`). Recovers a stored instance UV's band without the leaf
-    /// recording the slot at emit time (#119).
+    /// The shelf whose band run owns the atlas pixel `(x, y)` — the
+    /// pixel's page is `(y / size)`, so only that page's bands are
+    /// scanned; the pixel must also sit inside the shelf's used run
+    /// (`x < shelf.x`). Recovers a stored instance UV's band without
+    /// the leaf recording the slot at emit time (#119). Dead bands
+    /// hold no texels a sampler can reference, so only live ones hit.
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
@@ -1294,20 +1437,12 @@ impl Atlas {
         if !x.is_finite() || !y.is_finite() || y < 0.0 {
             return None;
         }
-        let y = y as u32;
-        let x = x as u32;
-        let idx = self.layout.shelves.partition_point(|s| s.y + s.h <= y);
-        let band = self.layout.shelves.get(idx)?;
-        if band.live && band.y <= y && x < band.x {
-            u32::try_from(idx).ok()
-        } else {
-            None
-        }
+        self.shelf_hit(y as u32, x as u32)
     }
 
     /// [`Self::shelf_at`] over many points, like a leaf's emission:
     /// consecutive cells usually sit on the same shelf, so `hint`
-    /// carries the last hit's slot and skips the search while the
+    /// carries the last hit's slot and skips the scan while the
     /// point still lands in that band (#119).
     #[expect(
         clippy::cast_possible_truncation,
@@ -1329,15 +1464,22 @@ impl Atlas {
         {
             return Some(slot);
         }
-        let idx = self.layout.shelves.partition_point(|s| s.y + s.h <= y);
-        let slot = self
-            .layout
-            .shelves
-            .get(idx)
-            .filter(|band| band.live && band.y <= y && x < band.x)
-            .and_then(|_| u32::try_from(idx).ok());
+        let slot = self.shelf_hit(y, x);
         *hint = slot;
         slot
+    }
+
+    /// The live shelf covering texel `(x, y)` in `y`, as a slot index.
+    /// Bands never overlap in y within a page, so the scan hits at
+    /// most once; shelves from dead-band splits sit at any index, so
+    /// the search is a filter rather than a binary search.
+    fn shelf_hit(&self, y: u32, x: u32) -> Option<u32> {
+        let page = y / self.size;
+        self.layout
+            .shelves
+            .iter()
+            .position(|s| s.live && s.y <= y && y < s.y + s.h && s.y / self.size == page && x < s.x)
+            .and_then(|i| u32::try_from(i).ok())
     }
 
     /// Lets [`Self::alloc`] reclaim the coldest shelves: set by the
@@ -1371,7 +1513,7 @@ impl Atlas {
     /// evictable — every shelf was touched this commit or the layout is
     /// empty.
     fn evict_one(&mut self) -> bool {
-        let Some(slot) = evict_layout(&mut self.layout, self.tick) else {
+        let Some(slot) = evict_layout(&mut self.layout, self.size, self.tick) else {
             return false;
         };
         let served_recently = self.layout.shelves[slot].last_used + 1 == self.tick;
@@ -1440,7 +1582,7 @@ impl Atlas {
 /// it dead and hands its band to `vacant`. `None` when every shelf was
 /// touched this commit or the layout is empty. `Atlas::plan`'s dry run
 /// shares this so the verdict matches what the commit would do (#119).
-fn evict_layout(layout: &mut Layout, tick: u64) -> Option<usize> {
+fn evict_layout(layout: &mut Layout, size: u32, tick: u64) -> Option<usize> {
     let slot = layout
         .shelves
         .iter()
@@ -1449,7 +1591,7 @@ fn evict_layout(layout: &mut Layout, tick: u64) -> Option<usize> {
         .min_by_key(|(_, s)| (u8::from(s.hits > 0), s.last_used))
         .map(|(i, _)| i)?;
     layout.shelves[slot].live = false;
-    free_band(layout, slot);
+    free_band(layout, size, slot);
     Some(slot)
 }
 
@@ -1463,7 +1605,7 @@ fn evict_layout(layout: &mut Layout, tick: u64) -> Option<usize> {
 /// vertically adjacent — is what makes the merge bounded. The merged
 /// band keeps `slot`'s index; merged-away slots stay dead with
 /// `h == 0` and are never reused.
-fn free_band(layout: &mut Layout, slot: usize) {
+fn free_band(layout: &mut Layout, size: u32, slot: usize) {
     debug_assert!(!layout.shelves[slot].live);
     layout.shelves[slot].epoch = layout.next_epoch;
     layout.next_epoch += 1;
@@ -1471,6 +1613,8 @@ fn free_band(layout: &mut Layout, slot: usize) {
     loop {
         let mut y = layout.shelves[slot].y;
         let mut h = layout.shelves[slot].h;
+        // A band lives inside one page: merges never cross a page edge.
+        let page = y / size;
         // Fold in every dead band vertically adjacent to this one;
         // the invariant limits it to two, but rerunning the scan is
         // cheap at this `vacant` size.
@@ -1480,7 +1624,7 @@ fn free_band(layout: &mut Layout, slot: usize) {
             for i in 0..layout.vacant.len() {
                 let other = usize::try_from(layout.vacant[i]).expect("shelf index");
                 let (oy, oh) = (layout.shelves[other].y, layout.shelves[other].h);
-                if oy + oh == y || oy == y + h {
+                if (oy + oh == y || oy == y + h) && oy / size == page {
                     y = y.min(oy);
                     h += oh;
                     layout.shelves[other].h = 0;
@@ -1490,7 +1634,8 @@ fn free_band(layout: &mut Layout, slot: usize) {
                 }
             }
         }
-        if y + h != layout.top {
+        let top = &mut layout.tops[page as usize];
+        if y + h != page * size + *top {
             layout.shelves[slot].y = y;
             layout.shelves[slot].h = h;
             layout
@@ -1502,10 +1647,11 @@ fn free_band(layout: &mut Layout, slot: usize) {
         // slot joins the dead `h == 0` ghost set. The new top may
         // already abut another dead band — fold that one the same way.
         layout.shelves[slot].h = 0;
-        layout.top = y;
+        *top = y - page * size;
+        let top = layout.tops[page as usize];
         let Some(back) = layout.vacant.iter().position(|&i| {
             let s = &layout.shelves[usize::try_from(i).expect("shelf index")];
-            s.y + s.h == layout.top
+            s.y / size == page && s.y + s.h == page * size + top
         }) else {
             return;
         };
@@ -1564,7 +1710,7 @@ fn alloc_on(
             });
             layout.next_epoch += 1;
             let phantom = layout.shelves.len() - 1;
-            free_band(layout, phantom);
+            free_band(layout, size, phantom);
         }
         let shelf = &mut layout.shelves[slot];
         shelf.h = class;
@@ -1578,23 +1724,30 @@ fn alloc_on(
         return Some((PAD, shelf.y + PAD, slot));
     }
     // A new shelf also needs the cell's width: a cell wider than the
-    // atlas must fail here so the caller grows (or reclaims) instead of
-    // writing past the texture edge.
-    if w + 2 * PAD <= size && layout.top + class <= size {
-        let i = layout.shelves.len();
-        layout.shelves.push(Shelf {
-            y: layout.top,
-            h: class,
-            x: w + 2 * PAD,
-            base: 0,
-            last_used: tick,
-            hits: 0,
-            live: true,
-            epoch: layout.next_epoch,
-        });
-        layout.next_epoch += 1;
-        layout.top += class;
-        return Some((PAD, layout.top - class + PAD, i));
+    // page edge must fail here so the caller grows (or reclaims)
+    // instead of writing past the texture edge. The virgin scan fills
+    // pages front to back; no room on any page fails the placement.
+    if w + 2 * PAD <= size {
+        for (page, top) in layout.tops.iter_mut().enumerate() {
+            if *top + class > size {
+                continue;
+            }
+            let base = u32::try_from(page).expect("pages fit u32") * size;
+            let i = layout.shelves.len();
+            layout.shelves.push(Shelf {
+                y: base + *top,
+                h: class,
+                x: w + 2 * PAD,
+                base: 0,
+                last_used: tick,
+                hits: 0,
+                live: true,
+                epoch: layout.next_epoch,
+            });
+            layout.next_epoch += 1;
+            *top += class;
+            return Some((PAD, base + *top - class + PAD, i));
+        }
     }
     None
 }
@@ -1680,9 +1833,11 @@ pub enum AtlasPlan {
     /// Every pending cell fits only once bounded eviction reclaims the
     /// shelves nothing touched this commit (#119); commit evicting.
     FitsEviction,
-    /// The batch does not fit; growing once to this edge holds every
-    /// cached and pending cell after re-lowering.
-    Grow(u32),
+    /// The batch's own cell set packs to this `(edge, pages)` — larger
+    /// when it outgrows the atlas, smaller when it releases pages left
+    /// over from a peak frame — which after re-lowering holds every
+    /// cached and pending cell (#211).
+    Resize(u32, u32),
     /// Not even the cap holds the batch's cells: the commit evicts what
     /// it can and reports the first surface that still overflows.
     Recycle,
@@ -2348,7 +2503,11 @@ mod tests {
                 .store_glyph(&device, &queue, key_e, 0, 0, 60, 10, &[0; 600])
                 .is_some()
         );
-        assert_eq!(atlas.layout.top, 64, "the layout is full");
+        assert_eq!(
+            atlas.layout.tops.iter().copied().sum::<u32>(),
+            64,
+            "the layout is full"
+        );
         let [slot_a, slot_b, slot_c, slot_e] = [
             atlas.get(&key_a).expect("a").slot,
             atlas.get(&key_b).expect("b").slot,
@@ -2390,5 +2549,185 @@ mod tests {
             epoch_a,
             "a surviving band keeps its epoch"
         );
+    }
+
+    /// A batch whose cells exceed one `cap` page appends atlas pages
+    /// instead of reporting exhaustion (#211): the fresh-layout grow
+    /// probe places every cell on blank pages, so the admitted cells
+    /// land past `size` in the taller texture and the entries address
+    /// them there.
+    #[test]
+    fn an_over_cap_batch_appends_atlas_pages() {
+        let Some((device, queue)) = device_and_queue() else {
+            return;
+        };
+        // cap 4096 with `budget / 8` holding two pages.
+        let mut atlas = Atlas::new(&device, 256 * 1024 * 1024);
+        if atlas.max_pages(4096) < 2 {
+            return;
+        }
+        let key = |glyph: u32| GlyphKey {
+            font: 7,
+            glyph,
+            size_bits: (16.0f32 * 64.0).to_bits(),
+            subpixel: 0,
+            matrix: [
+                1.0f32.to_bits(),
+                0.0f32.to_bits(),
+                0.0f32.to_bits(),
+                1.0f32.to_bits(),
+            ],
+            coords_hash: 0,
+        };
+        // 512² cells: seven per shelf, seven shelves per page — 49 on
+        // one `cap` page, so the batch of 70 fits only on two.
+        let mut rasters = Vec::new();
+        for glyph in 0..70u32 {
+            rasters.push(PendingRaster::Glyph {
+                key: key(glyph),
+                left: 0,
+                top: 0,
+                w: 512,
+                h: 512,
+                texels: vec![0x80; 512 * 512],
+            });
+        }
+        let refs: Vec<&PendingRaster> = rasters.iter().collect();
+        let AtlasPlan::Resize(size, pages) = atlas.plan(&refs) else {
+            panic!("expected a page grow");
+        };
+        assert_eq!((size, pages), (4096, 2));
+        atlas.resize_to(&device, size, pages);
+        assert_eq!(atlas.pages(), 2);
+        for raster in &rasters {
+            let PendingRaster::Glyph {
+                key,
+                left,
+                top,
+                w,
+                h,
+                texels,
+            } = raster
+            else {
+                unreachable!("glyph pending only")
+            };
+            assert!(
+                atlas
+                    .store_glyph(&device, &queue, *key, *left, *top, *w, *h, texels)
+                    .is_some(),
+                "every cell of a planned batch must store"
+            );
+        }
+        let top_y = rasters
+            .iter()
+            .filter_map(|r| match r {
+                PendingRaster::Glyph { key, .. } => atlas.get(key).map(|e| u32::from(e.y)),
+                _ => None,
+            })
+            .max();
+        assert!(
+            top_y.unwrap_or(0) >= 4096,
+            "cells past the first page address y >= 4096"
+        );
+    }
+
+    /// Once a paged atlas's live batch packs onto fewer pages, `plan`
+    /// returns the smaller target so the peak texture is released
+    /// (#211): the cells a re-lowered commit places — hits and misses
+    /// alike — probe a fresh layout, while a batch still needing every
+    /// page keeps them all.
+    #[test]
+    fn a_smaller_batch_releases_atlas_pages() {
+        let Some((device, queue)) = device_and_queue() else {
+            return;
+        };
+        let mut atlas = Atlas::new(&device, 256 * 1024 * 1024);
+        if atlas.max_pages(4096) < 2 {
+            return;
+        }
+        let key = |glyph: u32| GlyphKey {
+            font: 7,
+            glyph,
+            size_bits: (16.0f32 * 64.0).to_bits(),
+            subpixel: 0,
+            matrix: [
+                1.0f32.to_bits(),
+                0.0f32.to_bits(),
+                0.0f32.to_bits(),
+                1.0f32.to_bits(),
+            ],
+            coords_hash: 0,
+        };
+        let cell = |glyph: u32| PendingRaster::Glyph {
+            key: key(glyph),
+            left: 0,
+            top: 0,
+            w: 512,
+            h: 512,
+            texels: vec![0x80; 512 * 512],
+        };
+        let peak: Vec<PendingRaster> = (0..70u32).map(cell).collect();
+        let refs: Vec<&PendingRaster> = peak.iter().collect();
+        let AtlasPlan::Resize(size, pages) = atlas.plan(&refs) else {
+            panic!("expected a page grow");
+        };
+        atlas.resize_to(&device, size, pages);
+        assert_eq!(atlas.pages(), 2);
+        let bytes_peak = atlas.gpu_bytes();
+
+        // A batch of 40 cells still needs them stored — but packs on
+        // one page, so the second page must be released.
+        let quiet: Vec<PendingRaster> = (100..140u32).map(cell).collect();
+        let refs: Vec<&PendingRaster> = quiet.iter().collect();
+        let AtlasPlan::Resize(size, pages) = atlas.plan(&refs) else {
+            panic!("a smaller batch must shrink the atlas");
+        };
+        assert_eq!((size, pages), (4096, 1));
+        atlas.resize_to(&device, size, pages);
+        assert_eq!(atlas.pages(), 1);
+        assert!(atlas.gpu_bytes() < bytes_peak);
+        for raster in &quiet {
+            let PendingRaster::Glyph {
+                key,
+                left,
+                top,
+                w,
+                h,
+                texels,
+            } = raster
+            else {
+                unreachable!("glyph pending only")
+            };
+            assert!(
+                atlas
+                    .store_glyph(&device, &queue, *key, *left, *top, *w, *h, texels)
+                    .is_some(),
+                "the shrunken atlas still holds the whole batch"
+            );
+        }
+        let max_y = quiet
+            .iter()
+            .filter_map(|r| match r {
+                PendingRaster::Glyph { key, .. } => atlas.get(key).map(|e| u32::from(e.y)),
+                _ => None,
+            })
+            .max();
+        assert!(max_y.unwrap_or(0) < 4096, "no cell lands past page one");
+
+        // A batch whose stored-plus-pending cells still need both pages
+        // keeps them: 40 cached + 50 new = 90, which two pages hold.
+        let peak: Vec<PendingRaster> = (200..250u32).map(cell).collect();
+        let refs: Vec<&PendingRaster> = peak.iter().collect();
+        let AtlasPlan::Resize(size, pages) = atlas.plan(&refs) else {
+            panic!("expected a regrow");
+        };
+        atlas.resize_to(&device, size, pages);
+        assert_eq!(atlas.pages(), 2);
+        let again: Vec<PendingRaster> = (300..340u32).map(cell).collect();
+        let refs: Vec<&PendingRaster> = again.iter().collect();
+        let AtlasPlan::Resize(size, pages) = atlas.plan(&refs) else {
+            panic!("a one-page batch must release the second page");
+        };
+        assert_eq!((size, pages), (4096, 1));
     }
 }

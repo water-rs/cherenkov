@@ -9,19 +9,22 @@
 )]
 
 use cherenkov::kurbo::{Affine, Rect};
+use cherenkov::{__engine_fn as split_fn, __engine_test as split_test, __engine_wait as wait};
 use cherenkov::{Draw, Extend, ImagePattern, Paint, Sampling};
 use cherenkov::{
     Engine, EngineError, Image, ImageColorSpace, ImageData, Offscreen, OffscreenFormat, Rgba8,
 };
 use cherenkov_gpu::{Gpu, GpuConfig};
 
+split_fn! {
 /// An engine, or `None` when no adapter exists.
 fn engine() -> Option<Engine<Gpu>> {
-    match Engine::<Gpu>::new(GpuConfig::default()) {
+    match wait!(Engine::<Gpu>::new(GpuConfig::default())) {
         Ok(engine) => Some(engine),
         Err(EngineError::Backend(_)) => None,
         Err(e) => panic!("engine init failed: {e}"),
     }
+}
 }
 
 /// sRGB→XYZ→P3 with the same constants the render thread uploads with.
@@ -51,6 +54,18 @@ fn mat_vec(m: &[[f32; 3]; 3], v: [f32; 3]) -> [f32; 3] {
         m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
         m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
     ]
+}
+
+split_fn! {
+fn assert_image(surface: &cherenkov::Surface<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
+    let rb = wait!(surface.readback())?;
+    let px = |x: u32, y: u32| rb.pixels[(y * rb.width + x) as usize];
+    close_px(px(16, 16), premul_p3([255, 0, 0, 255]));
+    close_px(px(48, 16), premul_p3([0, 255, 0, 255]));
+    close_px(px(16, 48), premul_p3([0, 0, 255, 255]));
+    close_px(px(48, 48), premul_p3([255, 255, 255, 128]));
+    Ok(())
+}
 }
 
 /// The premultiplied linear-P3 value of an sRGB8 texel, as uploaded.
@@ -90,20 +105,20 @@ fn two_by_two(engine: &Engine<Gpu>) -> Image<Rgba8> {
         .unwrap()
 }
 
-#[test]
+split_test! {
 fn an_image_draws_nearest() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(engine) = engine() else {
+    let Some(engine) = wait!(engine()) else {
         return Ok(());
     };
     let image = two_by_two(&engine);
-    let surface = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
+    let surface = wait!(engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16)))?;
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|c| {
             c.image(image.id(), Rect::new(0., 0., 64., 64.), Sampling::Nearest);
         }));
     });
-    engine.render(cherenkov::FrameTime::now())?;
-    let rb = surface.readback()?;
+    wait!(engine.render(cherenkov::FrameTime::now()))?;
+    let rb = wait!(surface.readback())?;
     let px = |x: u32, y: u32| rb.pixels[(y * rb.width + x) as usize];
     close_px(px(16, 16), premul_p3([255, 0, 0, 255]));
     close_px(px(48, 16), premul_p3([0, 255, 0, 255]));
@@ -111,21 +126,22 @@ fn an_image_draws_nearest() -> Result<(), Box<dyn std::error::Error>> {
     close_px(px(48, 48), premul_p3([255, 255, 255, 128]));
     Ok(())
 }
+}
 
-#[test]
+split_test! {
 fn an_image_interpolates_bilinear() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(engine) = engine() else {
+    let Some(engine) = wait!(engine()) else {
         return Ok(());
     };
     let image = two_by_two(&engine);
-    let surface = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
+    let surface = wait!(engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16)))?;
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|c| {
             c.image(image.id(), Rect::new(0., 0., 64., 64.), Sampling::Linear);
         }));
     });
-    engine.render(cherenkov::FrameTime::now())?;
-    let rb = surface.readback()?;
+    wait!(engine.render(cherenkov::FrameTime::now()))?;
+    let rb = wait!(surface.readback())?;
     // Pixel centre (32,32) sits exactly between the four texels.
     let mut avg = [0f32; 4];
     for c in [
@@ -145,14 +161,15 @@ fn an_image_interpolates_bilinear() -> Result<(), Box<dyn std::error::Error>> {
     }
     Ok(())
 }
+}
 
-#[test]
+split_test! {
 fn an_image_pattern_repeats() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(engine) = engine() else {
+    let Some(engine) = wait!(engine()) else {
         return Ok(());
     };
     let image = two_by_two(&engine);
-    let surface = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
+    let surface = wait!(engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16)))?;
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|c| {
             c.fill(
@@ -167,8 +184,8 @@ fn an_image_pattern_repeats() -> Result<(), Box<dyn std::error::Error>> {
             );
         }));
     });
-    engine.render(cherenkov::FrameTime::now())?;
-    let rb = surface.readback()?;
+    wait!(engine.render(cherenkov::FrameTime::now()))?;
+    let rb = wait!(surface.readback())?;
     let px = |x: u32, y: u32| rb.pixels[(y * rb.width + x) as usize];
     // Identity transform maps image pixels 1:1; texel (0,0) is red and
     // wraps every 2 px — a pixel centre at x≈40.5 lands on texel 0.
@@ -176,14 +193,15 @@ fn an_image_pattern_repeats() -> Result<(), Box<dyn std::error::Error>> {
     close_px(px(41, 1), premul_p3([255, 255, 255, 128]));
     Ok(())
 }
+}
 
-#[test]
+split_test! {
 fn an_image_pattern_with_extend_none_is_transparent() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(engine) = engine() else {
+    let Some(engine) = wait!(engine()) else {
         return Ok(());
     };
     let image = two_by_two(&engine);
-    let surface = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
+    let surface = wait!(engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16)))?;
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|c| {
             c.fill(
@@ -198,12 +216,13 @@ fn an_image_pattern_with_extend_none_is_transparent() -> Result<(), Box<dyn std:
             );
         }));
     });
-    engine.render(cherenkov::FrameTime::now())?;
-    let rb = surface.readback()?;
+    wait!(engine.render(cherenkov::FrameTime::now()))?;
+    let rb = wait!(surface.readback())?;
     let px = |x: u32, y: u32| rb.pixels[(y * rb.width + x) as usize];
     close_px(px(0, 0), premul_p3([255, 0, 0, 255]));
     assert_eq!(px(8, 8), [0.0; 4], "outside the image must be clear");
     Ok(())
+}
 }
 
 /// f16 texel bytes for one pixel.
@@ -221,11 +240,11 @@ fn linear_srgb_to_p3_premul(c: [f32; 4]) -> [f32; 4] {
     [p3[0] * c[3], p3[1] * c[3], p3[2] * c[3], c[3]]
 }
 
+split_test! {
 /// An `Rgba16F` upload survives with HDR and P3-only channels intact:
 /// 8x red, a half-alpha teal, a P3-only red and the premultiplied form.
-#[test]
 fn an_f16_image_keeps_hdr_and_wide_gamut() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(engine) = engine() else {
+    let Some(engine) = wait!(engine()) else {
         return Ok(());
     };
     // An 8x-red in linear sRGB (HDR through the primaries' matrix) and a
@@ -251,7 +270,7 @@ fn an_f16_image_keeps_hdr_and_wide_gamut() -> Result<(), Box<dyn std::error::Err
             .color_space(ImageColorSpace::LinearSrgb)
             .premultiplied(),
     )?;
-    let surface = engine.surface(Offscreen::new((8, 2), OffscreenFormat::LinearF16))?;
+    let surface = wait!(engine.surface(Offscreen::new((8, 2), OffscreenFormat::LinearF16)))?;
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|c| {
             c.image(hdr.id(), Rect::new(0., 0., 4., 2.), Sampling::Nearest);
@@ -259,12 +278,110 @@ fn an_f16_image_keeps_hdr_and_wide_gamut() -> Result<(), Box<dyn std::error::Err
             c.image(premul.id(), Rect::new(6., 0., 8., 2.), Sampling::Nearest);
         }));
     });
-    engine.render(cherenkov::FrameTime::now())?;
-    let rb = surface.readback()?;
+    wait!(engine.render(cherenkov::FrameTime::now()))?;
+    let rb = wait!(surface.readback())?;
     let px = |x: u32, y: u32| rb.pixels[(y * rb.width + x) as usize];
     close_px(px(0, 0), linear_srgb_to_p3_premul([8.0, 0.0, 0.0, 1.0]));
     close_px(px(2, 0), linear_srgb_to_p3_premul([0.0, 2.0, 0.25, 0.5]));
     close_px(px(4, 0), [1.0, 0.0, 0.0, 1.0]);
     close_px(px(6, 0), linear_srgb_to_p3_premul([8.0, 0.0, 0.0, 0.5]));
     Ok(())
+}
+}
+
+split_test! {
+/// An image larger than the device's texture limit is a rejection only the
+/// backend can detect: registration returns the handle, and the render
+/// that draws the image fails naming it and the backend's reason.
+fn an_image_beyond_the_texture_limit_fails_the_render_that_draws_it()
+-> Result<(), Box<dyn std::error::Error>> {
+    let shared = match wait!(cherenkov_gpu::interop::SharedDevice::create(&GpuConfig::default())) {
+        Ok(shared) => shared,
+        Err(EngineError::Backend(_)) => return Ok(()),
+        Err(e) => panic!("device creation failed: {e}"),
+    };
+    let width = shared.device.limits().max_texture_dimension_2d + 1;
+    let engine = wait!(Engine::<Gpu>::new(GpuConfig {
+        device: Some(shared),
+        ..GpuConfig::default()
+    }))?;
+    let surface = wait!(engine.surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16)))?;
+    let image = engine.image(ImageData::<Rgba8>::new(
+        width,
+        1,
+        vec![255; width as usize * 4],
+    )?)?;
+    surface.update(|tx| {
+        tx[surface.root()].record(|c| {
+            c.image(image.id(), Rect::new(0.0, 0.0, 8.0, 8.0), Sampling::Nearest);
+        });
+    });
+    match wait!(engine.render(cherenkov::FrameTime::now())) {
+        Err(cherenkov::RenderError::Rejected { resource, reason }) => {
+            assert_eq!(resource, cherenkov::ResourceId::Image(image.id()));
+            assert!(
+                matches!(*reason, cherenkov::ResourceError::Image(_)),
+                "{reason}"
+            );
+        }
+        other => panic!("an oversized image was drawn: {other:?}"),
+    }
+    Ok(())
+}
+}
+
+split_test! {
+/// An image whose last handle drops between recording the content that
+/// replaces it and installing that content still draws correctly in a
+/// render issued before the install; the render after the install draws
+/// the new content and frees the image (#199).
+fn an_image_released_before_its_replacement_is_installed_still_draws()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(engine) = wait!(engine()) else {
+        return Ok(());
+    };
+    let image = two_by_two(&engine);
+    let surface = wait!(engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16)))?;
+    let pictured = surface.layer();
+    let marker = surface.layer();
+    surface.update(|tx| {
+        tx[surface.root()].push(&pictured);
+        tx[surface.root()].push(&marker);
+        tx[&pictured].record(|c| {
+            c.image(image.id(), Rect::new(0., 0., 64., 64.), Sampling::Nearest);
+        });
+        tx[&marker].record(|c| {
+            c.fill(
+                Rect::new(60., 60., 64., 64.),
+                cherenkov::WorkingColor::BLACK,
+            );
+        });
+    });
+
+    wait!(engine.render(cherenkov::FrameTime::now()))?;
+    wait!(assert_image(&surface))?;
+
+    let replacement = surface.record(|c| {
+        c.fill(Rect::new(0., 0., 64., 64.), cherenkov::WorkingColor::WHITE);
+    });
+    drop(image);
+    // A property change elsewhere redraws the surface while the installed
+    // content still draws the released image.
+    surface.update(|tx| {
+        tx[&marker].opacity(0.5f32);
+    });
+    wait!(engine.render(cherenkov::FrameTime::now()))?;
+    wait!(assert_image(&surface))?;
+
+    surface.update(|tx| {
+        tx[&pictured].content(replacement);
+    });
+    wait!(engine.render(cherenkov::FrameTime::now()))?;
+    let rb = wait!(surface.readback())?;
+    close_px(
+        rb.pixels[(16 * rb.width + 16) as usize],
+        [1.0, 1.0, 1.0, 1.0],
+    );
+    Ok(())
+}
 }

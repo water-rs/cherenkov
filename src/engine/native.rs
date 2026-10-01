@@ -18,9 +18,11 @@ use crate::error::{EngineError, RenderError, ResourceError, SurfaceError};
 use crate::frame::{FrameStats, FrameTime, FrameTiming, Next};
 use crate::glyph::FontId;
 use crate::image::{Format, ImageData};
-use crate::message::{ChangeSet, FontData, MemoryReply, Message, RenderReply, ResOp, SurfaceId};
+use crate::message::{
+    ChangeSet, FontData, MemoryReply, Message, RegisterOp, RenderReply, SurfaceId,
+};
 use crate::paint::ImageId;
-use crate::resource::{Filter, Font, FontSource, Image, ReplaceImage, Shader};
+use crate::resource::{Filter, Font, FontSource, Image, ReplaceImage, ResourceId, Shader};
 use crate::style::FilterId;
 use crate::surface::{ExternalFrameHandle, GpuContentHandle, Shared, Surface};
 
@@ -57,9 +59,10 @@ pub struct Engine<B: Backend> {
     next_filter: Cell<u64>,
     next_backdrop_shader: Cell<u64>,
     thread: Option<std::thread::JoinHandle<()>>,
-    /// The type-erased `Message::Resource` sender resource drops use.
-    release: Rc<dyn Fn(ResOp<B>)>,
-    /// The `Message::ReplaceImage` round trip every image handle shares.
+    /// The type-erased sender resource drops use; a render thread that is
+    /// gone has nothing left to release.
+    post: Rc<dyn Fn(Message<B>)>,
+    /// The `Message::ReplaceImage` sender every image handle shares.
     replace_image: ReplaceImage,
     waker: Rc<Waker>,
     // `!Send`: the engine lives on the UI thread.
@@ -91,20 +94,17 @@ impl<B: Backend> Engine<B> {
         let info = init_rx
             .recv()
             .map_err(|_| EngineError::Thread("render thread died during init".into()))??;
-        let release_tx = tx.clone();
+        let post_tx = tx.clone();
         let waker = Rc::new(Waker::new());
         let replace_image = {
             let tx = tx.clone();
             let waker = Rc::clone(&waker);
             Rc::new(move |id, image| {
-                let (reply, rx) = std::sync::mpsc::channel();
-                tx.send(Message::ReplaceImage { id, image, reply })
+                tx.send(Message::ReplaceImage { id, image })
                     .map_err(|_| ResourceError::Lost)?;
-                // A surface drawing the image was marked changed: a host
-                // paused after `Next::Idle` needs a frame to show it.
-                if rx.recv().map_err(|_| ResourceError::Lost)?? {
-                    waker.wake();
-                }
+                // A host paused after `Next::Idle` needs a frame to show
+                // the new pixels.
+                waker.wake();
                 Ok(())
             }) as ReplaceImage
         };
@@ -125,8 +125,8 @@ impl<B: Backend> Engine<B> {
             next_filter: Cell::new(1),
             next_backdrop_shader: Cell::new(1),
             thread: Some(render_thread),
-            release: Rc::new(move |op: ResOp<B>| {
-                let _ = release_tx.send(Message::Resource(op));
+            post: Rc::new(move |message| {
+                let _ = post_tx.send(message);
             }),
             replace_image,
             waker,
@@ -209,59 +209,60 @@ impl<B: Backend> Engine<B> {
         id
     }
 
-    /// Registers a font.
-    ///
-    /// The data is checked for emptiness on the caller thread; parsing is
-    /// the backend's `add_font`.
+    /// Registers a font. The data is validated here, before anything is
+    /// queued, so the backend cannot reject it later.
     ///
     /// # Errors
-    /// [`ResourceError::Font`] for empty data or a backend-side parse
-    /// failure, [`ResourceError::Lost`] when the render thread is gone.
+    /// [`ResourceError::Font`] for empty or unparseable data,
+    /// [`ResourceError::Unsupported`] for a font format the backend cannot
+    /// draw, [`ResourceError::Lost`] when the render thread is gone.
     pub fn font(&self, source: FontSource) -> Result<Font, ResourceError> {
         if source.data.is_empty() {
             return Err(ResourceError::Font("empty font data".into()));
         }
-        let id = FontId::new(Self::alloc(&self.next_font));
-        let (reply, rx) = std::sync::mpsc::channel();
-        let data = FontData {
+        let font = <B::Renderer as Renderer>::prepare_font(FontData {
             data: source.data,
             index: source.index,
-        };
-        (self.release)(Box::new(move |r: &mut B::Renderer| {
-            let _ = reply.send(r.add_font(id, data));
-        }));
-        rx.recv().map_err(|_| ResourceError::Lost)??;
-        let release = Rc::clone(&self.release);
-        Ok(Font::new(id, move || {
-            release(Box::new(move |r: &mut B::Renderer| r.remove_font(id)));
-        }))
+        })?;
+        let id = FontId::new(Self::alloc(&self.next_font));
+        self.tx
+            .send(Message::Resource(Box::new(move |r: &mut B::Renderer| {
+                r.add_font(id, font);
+            })))
+            .map_err(|_| ResourceError::Lost)?;
+        Ok(Font::new(
+            id,
+            self.on_release(ResourceId::Font(id), move |r| r.remove_font(id)),
+        ))
     }
 
     /// Registers an image. [`Image::replace`] later swaps its pixels
     /// behind the same id.
     ///
-    /// `image` is validated by [`ImageData::new`] before it is passed here;
-    /// the backend may still reject it (format conversion failure), so the
-    /// registration is reply-carrying.
+    /// `image` is validated by [`ImageData::new`] before it is passed here.
+    /// The upload is queued in order with every render and does not wait
+    /// for the backend. A rejection only the backend can detect (a device
+    /// or budget limit) fails every render that draws the image with
+    /// [`RenderError::Rejected`].
     ///
     /// # Errors
-    /// [`ResourceError::Image`] when the backend rejects the upload,
     /// [`ResourceError::Lost`] when the render thread is gone.
     pub fn image<F: Format>(&self, image: ImageData<F>) -> Result<Image<F>, ResourceError>
     where
         B: Uploads<F>,
     {
         let id = ImageId::new(Self::alloc(&self.next_image));
-        let (reply, rx) = std::sync::mpsc::channel();
         let upload = image.into_upload();
-        (self.release)(Box::new(move |r: &mut B::Renderer| {
-            let _ = reply.send(r.add_image(id, upload));
-        }));
-        rx.recv().map_err(|_| ResourceError::Lost)??;
-        let release = Rc::clone(&self.release);
-        Ok(Image::new(id, Rc::clone(&self.replace_image), move || {
-            release(Box::new(move |r: &mut B::Renderer| r.remove_image(id)));
-        }))
+        let resource = ResourceId::Image(id);
+        self.register(
+            resource,
+            Box::new(move |r: &mut B::Renderer| r.add_image(id, upload)),
+        )?;
+        Ok(Image::new(
+            id,
+            Rc::clone(&self.replace_image),
+            self.on_release(resource, move |r| r.remove_image(id)),
+        ))
     }
 
     /// Creates a surface over `target`: an [`Offscreen`](crate::Offscreen)
@@ -360,45 +361,76 @@ impl<B: Backend> Engine<B> {
         }
     }
 
+    /// Queues a registration the backend may reject; the render loop
+    /// records a rejection against `resource`.
+    fn register(&self, resource: ResourceId, op: RegisterOp<B>) -> Result<(), ResourceError> {
+        self.tx
+            .send(Message::Register { resource, op })
+            .map_err(|_| ResourceError::Lost)
+    }
+
     fn on_drop(
         &self,
         op: impl FnOnce(&mut B::Renderer) + Send + 'static,
     ) -> impl FnOnce() + 'static {
-        let release = Rc::clone(&self.release);
-        move || release(Box::new(op))
+        let post = Rc::clone(&self.post);
+        move || post(Message::Resource(Box::new(op)))
+    }
+
+    /// The drop of a registered resource's last handle: the render loop
+    /// runs `remove` once no surface's installed content draws the
+    /// resource, and only when the backend holds it.
+    fn on_release(
+        &self,
+        resource: ResourceId,
+        remove: impl FnOnce(&mut B::Renderer) + Send + 'static,
+    ) -> impl FnOnce() + 'static {
+        let post = Rc::clone(&self.post);
+        move || {
+            post(Message::Release {
+                resource,
+                op: Box::new(remove),
+            });
+        }
     }
 }
 
 impl<B: ShaderPaint> Engine<B> {
-    /// Registers a WGSL shader, blocking until the render thread has
-    /// compiled and validated it.
+    /// Registers a WGSL shader. The source is validated here, before
+    /// anything is queued; pipeline creation is queued in order with every
+    /// render and does not wait for the backend. A pipeline the backend
+    /// cannot create fails every render that draws the shader with
+    /// [`RenderError::Rejected`].
     ///
     /// # Errors
-    /// [`ResourceError::Shader`] when the source fails validation or
-    /// pipeline creation, [`ResourceError::Lost`] when the render thread is
-    /// gone.
+    /// [`ResourceError::Shader`] when the source fails validation,
+    /// [`ResourceError::Lost`] when the render thread is gone.
     pub fn shader(&self, source: ShaderSource) -> Result<Shader, ResourceError> {
+        B::validate_shader(&source)?;
         let id = ShaderId::new(Self::alloc(&self.next_shader));
-        let (reply, rx) = std::sync::mpsc::channel();
-        (self.release)(Box::new(move |r: &mut B::Renderer| {
-            let _ = reply.send(B::add_shader(r, id, source));
-        }));
-        rx.recv().map_err(|_| ResourceError::Lost)??;
+        let resource = ResourceId::Shader(id);
+        self.register(
+            resource,
+            Box::new(move |r: &mut B::Renderer| B::add_shader(r, id, source)),
+        )?;
         Ok(Shader::new(
             id,
-            self.on_drop(move |r| B::remove_shader(r, id)),
+            self.on_release(resource, move |r| B::remove_shader(r, id)),
         ))
     }
 }
 
 impl<B: crate::BackdropShaders> Engine<B> {
-    /// Registers a backdrop effect shader, blocking until the render
-    /// thread has compiled and validated it.
+    /// Registers a backdrop effect shader. The source is validated here,
+    /// before anything is queued; pipeline creation is queued in order
+    /// with every render and does not wait for the backend. A pipeline the
+    /// backend cannot create fails every render that samples the shader
+    /// with [`RenderError::Rejected`].
     ///
     /// # Errors
-    /// [`ResourceError::Shader`] when the source fails validation, its
-    /// `reach` is not a finite non-negative number, or pipeline creation
-    /// fails; [`ResourceError::Lost`] when the render thread is gone.
+    /// [`ResourceError::Shader`] when the source fails validation or its
+    /// `reach` is not a finite non-negative number;
+    /// [`ResourceError::Lost`] when the render thread is gone.
     pub fn backdrop_shader(
         &self,
         source: crate::BackdropShaderSource,
@@ -408,17 +440,18 @@ impl<B: crate::BackdropShaders> Engine<B> {
                 "backdrop shader reach must be a finite non-negative number".into(),
             ));
         }
+        B::validate_backdrop_shader(&source)?;
         let id = crate::BackdropShaderId::new(Self::alloc(&self.next_backdrop_shader));
         let reach = source.reach;
-        let (reply, rx) = std::sync::mpsc::channel();
-        (self.release)(Box::new(move |r: &mut B::Renderer| {
-            let _ = reply.send(B::add_backdrop_shader(r, id, source));
-        }));
-        rx.recv().map_err(|_| ResourceError::Lost)??;
+        let resource = ResourceId::BackdropShader(id);
+        self.register(
+            resource,
+            Box::new(move |r: &mut B::Renderer| B::add_backdrop_shader(r, id, source)),
+        )?;
         Ok(crate::BackdropShader::new(
             id,
             reach,
-            self.on_drop(move |r| B::remove_backdrop_shader(r, id)),
+            self.on_release(resource, move |r| B::remove_backdrop_shader(r, id)),
         ))
     }
 }
@@ -431,9 +464,9 @@ impl<B: Filters> Engine<B> {
         B: Runs<F>,
     {
         let id = FilterId::new(Self::alloc(&self.next_filter));
-        (self.release)(Box::new(move |r: &mut B::Renderer| {
+        (self.post)(Message::Resource(Box::new(move |r: &mut B::Renderer| {
             B::add_filter(r, id, filter);
-        }));
+        })));
         Filter::new(id, self.on_drop(move |r| B::remove_filter(r, id)))
     }
 
@@ -445,9 +478,9 @@ impl<B: Filters> Engine<B> {
     {
         let id = FilterId::new(Self::alloc(&self.next_filter));
         let effect = effect.into();
-        (self.release)(Box::new(move |r: &mut B::Renderer| {
+        (self.post)(Message::Resource(Box::new(move |r: &mut B::Renderer| {
             B::add_effect(r, id, effect);
-        }));
+        })));
         Filter::new(id, self.on_drop(move |r| B::remove_filter(r, id)))
     }
 }

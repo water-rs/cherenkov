@@ -8,7 +8,26 @@ use kurbo::Affine;
 
 use crate::{BlendMode, Command, Dirty, DisplayList, FillRule, Group, ShapeData};
 
+pub mod projective;
 pub mod shadow;
+
+/// `shape`'s outline flattened to `tolerance` where it is curved, with its
+/// fill rule; `None` for a shape without area (a line).
+#[must_use]
+pub fn shape_outline(shape: &ShapeData, tolerance: f64) -> Option<(kurbo::BezPath, FillRule)> {
+    use kurbo::Shape as _;
+    match shape {
+        ShapeData::Rect(r) => Some((r.to_path(tolerance), FillRule::NonZero)),
+        ShapeData::RoundedRect(r) => Some((r.to_path(tolerance), FillRule::NonZero)),
+        ShapeData::Continuous(c) => Some((c.to_path(tolerance), FillRule::NonZero)),
+        ShapeData::Circle(c) => Some((c.to_path(tolerance), FillRule::NonZero)),
+        ShapeData::Ellipse(e) => Some((e.to_path(tolerance), FillRule::NonZero)),
+        ShapeData::Line(_) => None,
+        ShapeData::Path { elements, rule } => {
+            Some((kurbo::BezPath::from_vec(elements.to_vec()), *rule))
+        }
+    }
+}
 
 /// A backend operation whose scope indices can be relocated during a patch.
 pub trait Operation {
@@ -386,10 +405,10 @@ impl<O: Operation, E> Content<O, E> {
     }
 
     /// Whether the current source commands, slot updates applied and nested
-    /// pictures included, sample image `id`.
+    /// pictures included, sample `resource`.
     #[must_use]
-    pub fn references_image(&self, id: crate::ImageId) -> bool {
-        self.list.display_list().references_image(id)
+    pub fn references(&self, resource: crate::ResourceId) -> bool {
+        self.list.display_list().references(resource)
     }
 
     /// Discard compiled resource references after image `id`'s pixels were
@@ -400,7 +419,8 @@ impl<O: Operation, E> Content<O, E> {
     /// the updates have since replaced, and those may still reference `id`.
     /// Returns whether anything was discarded.
     pub fn invalidate_image(&mut self, id: crate::ImageId) -> bool {
-        let stale = self.lowered.is_some() && (!self.dirty.is_empty() || self.references_image(id));
+        let stale = self.lowered.is_some()
+            && (!self.dirty.is_empty() || self.references(crate::ResourceId::Image(id)));
         if stale {
             self.invalidate();
         }

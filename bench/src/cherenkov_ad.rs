@@ -32,7 +32,7 @@ use kurbo::{Affine, BezPath, Circle, Ellipse, Line, Rect, RoundedRect, Vec2};
 
 use crate::convert::{self, Blobs, Op, ShapeKind, engine_blend, group_op, op, shape_kind, working};
 use crate::memory::{AdapterMemory, EngineBytes, Reading, wgpu_allocator, wgpu_vk_memory_budget};
-use crate::motion::{Clock, LayerMotion, motion_animation};
+use crate::motion::{Clock, LayerMotion, LayerProjection, motion_animation};
 use crate::timing::Timings;
 use crate::{
     BenchError, Counters, DeviceInfo, EncodeInput, Engine, EngineInfo, GpuSample, PresentKind,
@@ -463,6 +463,8 @@ struct PrepLayer {
     backdrop: Option<u32>,
     /// The member's per-member backdrop effect, if any.
     backdrop_effect: Option<BackdropEffectSpec>,
+    /// The layer's projective pose.
+    projection: Option<LayerProjection>,
     /// The layer's one-time motion.
     motion: Option<LayerMotion>,
 }
@@ -547,19 +549,46 @@ struct Present {
 }
 
 /// The destination texture format of a `--present` kind.
-const fn present_format(kind: PresentKind) -> wgpu::TextureFormat {
+pub(crate) const fn present_format(kind: PresentKind) -> wgpu::TextureFormat {
     match kind {
-        PresentKind::SrgbHw => wgpu::TextureFormat::Rgba8UnormSrgb,
-        PresentKind::SrgbShader => wgpu::TextureFormat::Rgba8Unorm,
-        PresentKind::LinearP3 => wgpu::TextureFormat::Rgba16Float,
+        PresentKind::SrgbHw | PresentKind::DisplayP3Hw => wgpu::TextureFormat::Rgba8UnormSrgb,
+        PresentKind::SrgbShader | PresentKind::DisplayP3Shader => wgpu::TextureFormat::Rgba8Unorm,
+        PresentKind::LinearP3
+        | PresentKind::Scrgb
+        | PresentKind::ExtendedSrgb
+        | PresentKind::ExtendedP3
+        | PresentKind::Pq
+        | PresentKind::Hlg => wgpu::TextureFormat::Rgba16Float,
     }
 }
 
 /// Bytes per pixel of a kind's destination texture.
 const fn present_texel_size(kind: PresentKind) -> u32 {
     match kind {
-        PresentKind::SrgbHw | PresentKind::SrgbShader => 4,
-        PresentKind::LinearP3 => 8,
+        PresentKind::SrgbHw
+        | PresentKind::SrgbShader
+        | PresentKind::DisplayP3Hw
+        | PresentKind::DisplayP3Shader => 4,
+        PresentKind::LinearP3
+        | PresentKind::Scrgb
+        | PresentKind::ExtendedSrgb
+        | PresentKind::ExtendedP3
+        | PresentKind::Pq
+        | PresentKind::Hlg => 8,
+    }
+}
+
+/// The [`TextureOutput::color`] of a `--present` kind.
+pub(crate) const fn present_color(kind: PresentKind) -> OutputColor {
+    match kind {
+        PresentKind::SrgbHw | PresentKind::SrgbShader => OutputColor::Srgb,
+        PresentKind::LinearP3 => OutputColor::LinearDisplayP3,
+        PresentKind::DisplayP3Hw | PresentKind::DisplayP3Shader => OutputColor::DisplayP3,
+        PresentKind::Scrgb => OutputColor::ExtendedSrgbLinear,
+        PresentKind::ExtendedSrgb => OutputColor::ExtendedSrgb,
+        PresentKind::ExtendedP3 => OutputColor::ExtendedDisplayP3,
+        PresentKind::Pq => OutputColor::Bt2100Pq,
+        PresentKind::Hlg => OutputColor::Bt2100Hlg,
     }
 }
 
@@ -672,12 +701,56 @@ fn presented_pixels(
                 pixels.push([p3[0] as f32, p3[1] as f32, p3[2] as f32, p3[3] as f32]);
             }
         }
-        PresentKind::LinearP3 => {
+        PresentKind::DisplayP3Hw | PresentKind::DisplayP3Shader => {
+            for texel in packed.as_chunks::<4>().0 {
+                let encoded = texel.map(|v| f64::from(v) / 255.0);
+                let p3 = cherenkov_oracle::present::presented_display_p3_to_working(encoded);
+                pixels.push([p3[0] as f32, p3[1] as f32, p3[2] as f32, p3[3] as f32]);
+            }
+        }
+        PresentKind::LinearP3
+        | PresentKind::Scrgb
+        | PresentKind::ExtendedSrgb
+        | PresentKind::ExtendedP3
+        | PresentKind::Pq
+        | PresentKind::Hlg => {
             for texel in packed.as_chunks::<8>().0 {
                 let mut p = [0.0; 4];
                 for (c, b) in p.iter_mut().zip(texel.as_chunks::<2>().0) {
                     *c = half::f16::from_bits(u16::from_le_bytes(*b)).to_f32();
                 }
+                let p = match kind {
+                    PresentKind::LinearP3 => p,
+                    PresentKind::Scrgb => {
+                        cherenkov_oracle::present::presented_extended_srgb_to_working(
+                            false,
+                            p.map(f64::from),
+                        )
+                        .map(|c| c as f32)
+                    }
+                    PresentKind::ExtendedSrgb => {
+                        cherenkov_oracle::present::presented_extended_srgb_to_working(
+                            true,
+                            p.map(f64::from),
+                        )
+                        .map(|c| c as f32)
+                    }
+                    PresentKind::ExtendedP3 => {
+                        cherenkov_oracle::present::presented_extended_p3_to_working(
+                            p.map(f64::from),
+                        )
+                        .map(|c| c as f32)
+                    }
+                    PresentKind::Pq => {
+                        cherenkov_oracle::present::presented_pq_to_working(p.map(f64::from))
+                            .map(|c| c as f32)
+                    }
+                    PresentKind::Hlg => {
+                        cherenkov_oracle::present::presented_hlg_to_working(p.map(f64::from))
+                            .map(|c| c as f32)
+                    }
+                    _ => unreachable!("matched above"),
+                };
                 pixels.push(p);
             }
         }
@@ -704,10 +777,7 @@ impl Present {
             &source.create_view(&wgpu::TextureViewDescriptor::default()),
             TextureOutput {
                 texture: destination,
-                color: match self.kind {
-                    PresentKind::SrgbHw | PresentKind::SrgbShader => OutputColor::Srgb,
-                    PresentKind::LinearP3 => OutputColor::LinearDisplayP3,
-                },
+                color: present_color(self.kind),
                 alpha: OutputAlpha::Premultiplied,
                 headroom: self.headroom,
             },
@@ -766,6 +836,7 @@ fn cherenkov_features() -> Vec<Feature> {
         Feature::BackdropBlur,
         Feature::BackdropColorMatrix,
         Feature::BackdropEffect,
+        Feature::Projective,
         // `sRGB` maps to `SrgbEncoded`; `linear-p3` and `linear-srgb` are
         // both linear interpolation, which is the working space already.
         Feature::InterpolationSpace(ColorSpace::Srgb),
@@ -798,6 +869,9 @@ fn unsupported_feature(u: &str) -> Feature {
         | "backdrop-effect-sdf-path"
         | "backdrop-shader" => Feature::Backdrop,
         "blend-space" => Feature::BlendSpace(BlendSpace::SrgbEncoded),
+        "projective-unclipped"
+        | "projective-backdrop-member"
+        | "projective-backdrop-cross-space" => Feature::Projective,
         _ => Feature::Fill,
     }
 }
@@ -1165,8 +1239,13 @@ fn prep_layer(
             Some(Motion::Paint { .. }) => None,
             motion => motion
                 .as_ref()
-                .map(|m| LayerMotion::from_scene(m, layer.transform)),
+                .map(|m| LayerMotion::from_scene(m, layer.transform, layer.projection.as_deref())),
         },
+        projection: layer
+            .projection
+            .as_deref()
+            .map(LayerProjection::from_scene)
+            .transpose()?,
     };
     if own {
         for (index, item) in layer.items.iter().enumerate() {
@@ -1345,6 +1424,9 @@ fn build_layer(
     {
         let edit = &mut tx[layer];
         edit.transform(prep.transform);
+        if let Some(projection) = &prep.projection {
+            projection.apply(edit);
+        }
         edit.scroll_offset(prep.scroll_offset);
         edit.opacity(prep.opacity as f32);
         edit.blend(prep.blend);
@@ -1729,6 +1811,7 @@ impl Engine for Cherenkov {
                 "cherenkov: submit before prepare".into(),
             ));
         }
+        let render_at = std::time::Instant::now();
         self.timings.render_frame(
             &self.engine,
             &mut self.clock,
@@ -1737,6 +1820,8 @@ impl Engine for Cherenkov {
             render_error,
         )?;
         let stats = self.engine.stats();
+        let render_seconds = render_at.elapsed().as_secs_f64();
+        let readback_at = std::time::Instant::now();
         let image = if !readback {
             None
         } else if let Some(present) = self.present.as_deref_mut() {
@@ -1766,6 +1851,8 @@ impl Engine for Cherenkov {
                 stamp: phases.stamp_seconds,
                 wait: phases.wait_seconds,
             }),
+            render_seconds: Some(render_seconds),
+            readback_seconds: readback.then(|| readback_at.elapsed().as_secs_f64()),
         })
     }
 

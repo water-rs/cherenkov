@@ -597,11 +597,21 @@ fn push_xing(
     segs: &[Seg],
     p: usize,
     q: usize,
+    m_glob: f64,
 ) {
     let (sp, sq) = (&segs[p], &segs[q]);
     let ds = sp.slope - sq.slope;
     if ds == 0.0 {
-        eqs.push((p as u32, q as u32));
+        // Parallel segments keep a constant x offset, so only a pair
+        // whose offset is within rounding distance of zero can ever
+        // flip its midpoint-key order — those go on `eqs` to be
+        // re-checked each band; anything clearly apart keeps its
+        // order permanently and needs no event.
+        let gap = sp.slope.mul_add(sq.y0 - sp.y0, sp.x0 - sq.x0);
+        let bound = (m_glob + gap.abs()) * (256.0 * f64::EPSILON);
+        if gap.abs() <= bound {
+            eqs.push((p as u32, q as u32));
+        }
         return;
     }
     let appr = xing_y(sp, sq);
@@ -611,7 +621,17 @@ fn push_xing(
     let det = u8::from(ds.abs() > EPS);
     xings.push(Reverse((Split(appr), p as u32, q as u32, det)));
     if sp.slope < sq.slope {
-        posts.push((Split(appr), p as u32, q as u32));
+        // Popped once the band's midpoint reaches below the ordinate:
+        // the pair could need reverting to pre-cross order. The stored
+        // threshold is `appr` plus the ordinate's error bound — after
+        // the first check in order, the entry is re-keyed to that `ym`
+        // so only a still-lower band re-examines it.
+        let err = if det != 0 {
+            xing_err(appr, m_glob)
+        } else {
+            (m_glob + appr.abs()) * 1e-6
+        };
+        posts.push((Split(appr + err), p as u32, q as u32));
     }
 }
 
@@ -646,6 +666,7 @@ fn post_cross_at(l: &Seg, r: &Seg, ym: f64) -> bool {
     clippy::too_many_arguments,
     clippy::cast_possible_truncation,
     clippy::ptr_arg,
+    clippy::too_many_lines,
     reason = "the sweep state is one borrow; segment counts stay under u32; eqs grows by push"
 )]
 fn drain_xings(
@@ -655,6 +676,7 @@ fn drain_xings(
     segs: &[Seg],
     active: &mut Vec<usize>,
     pos: &mut [usize],
+    ya: f64,
     ym: f64,
     m_glob: f64,
 ) {
@@ -662,11 +684,20 @@ fn drain_xings(
     // can join a pair that must revert, and a revert can join a pair
     // that must swap — the cascades settle the list into the exact
     // order the old sort produced at `ym`.
+    let mut check_eqs = true;
     loop {
         let mut moved = false;
         let mut requeue: Vec<Reverse<(Split, u32, u32, u8)>> = Vec::new();
         while let Some(&Reverse((Split(appr), l, r, det))) = xings.peek() {
-            if appr - xing_err(appr, m_glob) > ym {
+            // For split-detectable pairs the stored ordinate sits within
+            // `xing_err` of the true crossing; near-parallel pairs get a
+            // wider bound, since the error scales with 1/|slope diff|.
+            let err = if det != 0 {
+                xing_err(appr, m_glob)
+            } else {
+                (m_glob + appr.abs()) * 1e-6
+            };
+            if appr - err > ym {
                 break;
             }
             xings.pop();
@@ -681,15 +712,20 @@ fn drain_xings(
                 pos[l] = pr;
                 pos[r] = pl;
                 if pl > 0 {
-                    push_xing(xings, posts, eqs, segs, active[pl - 1], r);
+                    push_xing(xings, posts, eqs, segs, active[pl - 1], r, m_glob);
                 }
                 let back = xing_y(&segs[r], &segs[l]);
                 xings.push(Reverse((Split(back), r as u32, l as u32, det)));
-                posts.push((Split(back), r as u32, l as u32));
+                posts.push((Split(ym), r as u32, l as u32));
                 if pr + 1 < active.len() {
-                    push_xing(xings, posts, eqs, segs, l, active[pr + 1]);
+                    push_xing(xings, posts, eqs, segs, l, active[pr + 1], m_glob);
                 }
-            } else {
+            } else if segs[l].slope > segs[r].slope || appr > ya {
+                // A pre-cross pair is still waiting on its crossing, and
+                // a crossing at or above `ya` can still split this band
+                // — both stay queued. A post-cross pair already ordered
+                // with its crossing behind the band is done: `posts`
+                // covers any later dip below the crossing.
                 requeue.push(Reverse((Split(appr), l as u32, r as u32, det)));
             }
         }
@@ -700,9 +736,14 @@ fn drain_xings(
         // swapped or joined into post-cross order at a higher one: pop
         // every such pair whose crossing is below this `ym` and
         // un-swap the ones still out of order.
+        // Post-cross entries carry the ordinate below which their pair
+        // needs re-checking — a fresh pair's crossing plus its error
+        // bound, or once verified the `ym` it checked out at — so only
+        // a band dipping below that pops them. A live pair still out
+        // of order un-swaps; a correct one re-keys to this `ym`.
         let mut repost: Vec<(Split, u32, u32)> = Vec::new();
-        while let Some(&(Split(appr), b, a)) = posts.peek() {
-            if appr <= ym + xing_err(appr, m_glob) {
+        while let Some(&(Split(t), b, a)) = posts.peek() {
+            if t <= ym {
                 break;
             }
             posts.pop();
@@ -717,14 +758,14 @@ fn drain_xings(
                 pos[b] = pa;
                 pos[a] = pb;
                 if pb > 0 {
-                    push_xing(xings, posts, eqs, segs, active[pb - 1], a);
+                    push_xing(xings, posts, eqs, segs, active[pb - 1], a, m_glob);
                 }
-                push_xing(xings, posts, eqs, segs, a, b);
+                push_xing(xings, posts, eqs, segs, a, b, m_glob);
                 if pa + 1 < active.len() {
-                    push_xing(xings, posts, eqs, segs, b, active[pa + 1]);
+                    push_xing(xings, posts, eqs, segs, b, active[pa + 1], m_glob);
                 }
             } else {
-                repost.push((Split(appr), b as u32, a as u32));
+                repost.push((Split(ym), b as u32, a as u32));
             }
         }
         for e in repost {
@@ -734,32 +775,39 @@ fn drain_xings(
         // yet the old sort re-evaluated their midpoint keys every band
         // — coincident pairs flip on rounding noise — so each still-
         // adjacent one is re-checked against the order at `ym` here.
-        let mut i = 0;
-        while i < eqs.len() {
-            let (e0, e1) = (eqs[i].0 as usize, eqs[i].1 as usize);
-            let (p0, p1) = (pos[e0], pos[e1]);
-            let (l, r, pl, pr) = if p0.checked_add(1) == Some(p1) {
-                (e0, e1, p0, p1)
-            } else if p1.checked_add(1) == Some(p0) {
-                (e1, e0, p1, p0)
-            } else {
-                eqs.swap_remove(i);
-                continue;
-            };
-            if post_cross_at(&segs[l], &segs[r], ym) {
-                moved = true;
-                active.swap(pl, pr);
-                pos[l] = pr;
-                pos[r] = pl;
-                eqs[i] = (r as u32, l as u32);
-                if pl > 0 {
-                    push_xing(xings, posts, eqs, segs, active[pl - 1], r);
+        // One pass per band suffices — a pair's ordering depends only
+        // on its own two keys — so later iterations rescan only after
+        // the pass itself swapped something.
+        if check_eqs {
+            check_eqs = false;
+            let mut i = 0;
+            while i < eqs.len() {
+                let (e0, e1) = (eqs[i].0 as usize, eqs[i].1 as usize);
+                let (p0, p1) = (pos[e0], pos[e1]);
+                let (l, r, pl, pr) = if p0.checked_add(1) == Some(p1) {
+                    (e0, e1, p0, p1)
+                } else if p1.checked_add(1) == Some(p0) {
+                    (e1, e0, p1, p0)
+                } else {
+                    eqs.swap_remove(i);
+                    continue;
+                };
+                if post_cross_at(&segs[l], &segs[r], ym) {
+                    moved = true;
+                    check_eqs = true;
+                    active.swap(pl, pr);
+                    pos[l] = pr;
+                    pos[r] = pl;
+                    eqs[i] = (r as u32, l as u32);
+                    if pl > 0 {
+                        push_xing(xings, posts, eqs, segs, active[pl - 1], r, m_glob);
+                    }
+                    if pr + 1 < active.len() {
+                        push_xing(xings, posts, eqs, segs, l, active[pr + 1], m_glob);
+                    }
                 }
-                if pr + 1 < active.len() {
-                    push_xing(xings, posts, eqs, segs, l, active[pr + 1]);
-                }
+                i += 1;
             }
-            i += 1;
         }
         if !moved {
             break;
@@ -939,6 +987,7 @@ pub fn resolve_winding(
             &segs,
             &mut active,
             &mut pos,
+            ya,
             ym,
             m_glob,
         );
@@ -960,10 +1009,26 @@ pub fn resolve_winding(
                 pos[active[k]] = k;
             }
             if at > 0 {
-                push_xing(&mut xings, &mut posts, &mut eqs, &segs, active[at - 1], i);
+                push_xing(
+                    &mut xings,
+                    &mut posts,
+                    &mut eqs,
+                    &segs,
+                    active[at - 1],
+                    i,
+                    m_glob,
+                );
             }
             if at + 1 < active.len() {
-                push_xing(&mut xings, &mut posts, &mut eqs, &segs, i, active[at + 1]);
+                push_xing(
+                    &mut xings,
+                    &mut posts,
+                    &mut eqs,
+                    &segs,
+                    i,
+                    active[at + 1],
+                    m_glob,
+                );
             }
         }
         while let Some(&Reverse((Split(y1), i))) = retire.peek() {
@@ -986,6 +1051,7 @@ pub fn resolve_winding(
                     &segs,
                     active[at - 1],
                     active[at],
+                    m_glob,
                 );
             }
         }
@@ -1000,19 +1066,10 @@ pub fn resolve_winding(
             ya = yb;
             continue;
         }
-        // Pairs joined by admissions and retirements can also be
-        // inverted at `ym`: a removal joins two segments whose crossing
-        // is already above it, so swap those into order too.
-        drain_xings(
-            &mut xings,
-            &mut posts,
-            &mut eqs,
-            &segs,
-            &mut active,
-            &mut pos,
-            ym,
-            m_glob,
-        );
+        // After the first drain the carried list is in `ym` order, and
+        // admissions and retirements keep it there — inserts land at
+        // their key position and removals join neighbours that were
+        // already ordered — so no second drain is needed.
         // Split at the smallest crossing strictly inside the band.
         // `active` is now exactly the order the old midpoint sort
         // produced, so the adjacent-pair set and each crossing's

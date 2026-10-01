@@ -30,6 +30,8 @@
 
 pub mod affinity;
 #[cfg(feature = "cherenkov")]
+pub mod capture;
+#[cfg(feature = "cherenkov")]
 pub mod cherenkov_ad;
 #[cfg(feature = "cherenkov-cpu")]
 pub mod cherenkov_cpu_ad;

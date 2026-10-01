@@ -453,8 +453,8 @@ enum Commit {
     /// Every surface's pending rasters committed; a surface that could
     /// not be placed got `AtlasExhausted` in its result.
     Done,
-    /// Grow the atlas once to this edge and re-lower.
-    Grow(u32),
+    /// Resize the atlas once to this `(edge, pages)` and re-lower.
+    Resize(u32, u32),
 }
 
 enum PendingOrigin {
@@ -3474,17 +3474,18 @@ impl GpuRenderer {
             // preparation abandons.
             match self.commit_rasters(pending, &mut results, grew) {
                 Commit::Done => break results,
-                Commit::Grow(size) => {
-                    self.atlas.grow_to(&self.device, size);
+                Commit::Resize(size, pages) => {
+                    self.atlas.resize_to(&self.device, size, pages);
                     grew = true;
                     tracing::debug!(
                         size = self.atlas.size(),
+                        pages = self.atlas.pages(),
                         generation = self.atlas.generation(),
-                        "atlas grown"
+                        "atlas resized"
                     );
                 }
             }
-            // Growing emptied the atlas: every hit any lowering took is
+            // Resizing emptied the atlas: every hit any lowering took is
             // now a miss, so lower the whole batch again.
             diag::event(
                 &self.device,
@@ -3530,13 +3531,14 @@ impl GpuRenderer {
             // preparation abandons.
             match self.commit_rasters(pending, &mut results, grew) {
                 Commit::Done => break results,
-                Commit::Grow(size) => {
-                    self.atlas.grow_to(&self.device, size);
+                Commit::Resize(size, pages) => {
+                    self.atlas.resize_to(&self.device, size, pages);
                     grew = true;
                     tracing::debug!(
                         size = self.atlas.size(),
+                        pages = self.atlas.pages(),
                         generation = self.atlas.generation(),
-                        "atlas grown"
+                        "atlas resized"
                     );
                 }
             }
@@ -3664,7 +3666,9 @@ impl GpuRenderer {
         // the commit's work scales with what changed, not what stays
         // retained (#119).
         let mut touches_len = 0usize;
-        let plan_dbg = if self.atlas.fits_strict(&rasters) {
+        // `plan` also decides whether a paged atlas may release pages
+        // (#211), so only a single-page atlas takes the strict path.
+        let plan_dbg = if self.atlas.pages() == 1 && self.atlas.fits_strict(&rasters) {
             self.atlas.begin_commit(&[]);
             "fits"
         } else {
@@ -3676,8 +3680,8 @@ impl GpuRenderer {
             self.commit_touches = touches;
             match self.atlas.plan(&rasters) {
                 glyph::AtlasPlan::Fits | glyph::AtlasPlan::FitsEviction => "fits-eviction",
-                glyph::AtlasPlan::Grow(size) if !grew => {
-                    // The grow discards the atlas and re-lowers, so
+                glyph::AtlasPlan::Resize(size, pages) if !grew => {
+                    // The resize discards the atlas and re-lowers, so
                     // every retained emission is dead anyway — but the
                     // pending cells recorded this round index a raster
                     // list that never applied, and must not survive
@@ -3685,9 +3689,9 @@ impl GpuRenderer {
                     for surf in pending.iter_mut() {
                         Self::discard_surface(surf);
                     }
-                    return Commit::Grow(size);
+                    return Commit::Resize(size, pages);
                 }
-                glyph::AtlasPlan::Grow(_) | glyph::AtlasPlan::Recycle => {
+                glyph::AtlasPlan::Resize(..) | glyph::AtlasPlan::Recycle => {
                     // Bounded in-place eviction makes room instead of a
                     // wholesale clear: the commit below reclaims shelves
                     // nothing touched until the batch places or nothing

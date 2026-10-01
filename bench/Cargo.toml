@@ -89,3 +89,8 @@ crate-type = ["rlib", "staticlib"]
 [[bin]]
 name = "cherenkov-bench"
 path = "src/bin.rs"
+
+[[bin]]
+name = "cherenkov-import-frame"
+path = "src/bin/import_frame.rs"
+required-features = ["cherenkov"]

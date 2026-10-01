@@ -337,49 +337,72 @@ fn coverage_dir(d: f32, v: vec2<f32>, scale: f32, ramp: bool, radius: f32) -> f3
 // folded edges meeting at a point) lies inside the pixel, neither
 // half-plane's linear ramp nor the exterior Euclidean ramp is the truth:
 // the truth is the area inside both.
+struct PolygonArea {
+    first: vec2<f32>,
+    previous: vec2<f32>,
+    area: f32,
+    count: u32,
+}
+
+fn append_area(state: PolygonArea, p: vec2<f32>) -> PolygonArea {
+    var next = state;
+    if state.count == 0u {
+        next.first = p;
+    } else {
+        next.area = state.area + state.previous.x * p.y - p.x * state.previous.y;
+    }
+    next.previous = p;
+    next.count = state.count + 1u;
+    return next;
+}
+
 fn corner_coverage(a: vec2<f32>, v1: vec2<f32>, v2: vec2<f32>, scale: f32) -> f32 {
-    var poly = array<vec2<f32>, 8>(
+    let square = array<vec2<f32>, 4>(
         vec2<f32>(-0.5, -0.5),
         vec2<f32>(0.5, -0.5),
         vec2<f32>(0.5, 0.5),
         vec2<f32>(-0.5, 0.5),
-        vec2<f32>(0.0, 0.0),
-        vec2<f32>(0.0, 0.0),
-        vec2<f32>(0.0, 0.0),
-        vec2<f32>(0.0, 0.0),
     );
-    var n = 4u;
-    for (var c = 0u; c < 2u; c = c + 1u) {
-        let v = select(v1, v2, c == 1u);
-        let off = select(a.x, a.y, c == 1u);
-        var clipped: array<vec2<f32>, 8>;
-        var m_out = 0u;
-        var prev = poly[n - 1u];
-        var pd = off + scale * dot(v, prev);
-        for (var i = 0u; i < n; i = i + 1u) {
-            let cur = poly[i];
-            let cd = off + scale * dot(v, cur);
-            if (cd <= 0.0) != (pd <= 0.0) {
-                let t = pd / (pd - cd);
-                clipped[m_out] = prev + t * (cur - prev);
-                m_out = m_out + 1u;
-            }
-            if cd <= 0.0 {
-                clipped[m_out] = cur;
-                m_out = m_out + 1u;
-            }
-            prev = cur;
-            pd = cd;
+    // One half-plane adds at most one vertex to a convex square.
+    var clipped: array<vec2<f32>, 5>;
+    var n = 0u;
+    var previous = square[3];
+    var previous_distance = a.x + scale * dot(v1, previous);
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        let p = square[i];
+        let distance = a.x + scale * dot(v1, p);
+        if (distance <= 0.0) != (previous_distance <= 0.0) {
+            let t = previous_distance / (previous_distance - distance);
+            clipped[n] = previous + t * (p - previous);
+            n = n + 1u;
         }
-        n = m_out;
-        poly = clipped;
+        if distance <= 0.0 {
+            clipped[n] = p;
+            n = n + 1u;
+        }
+        previous = p;
+        previous_distance = distance;
     }
-    var area = 0.0;
+    // Stream the second clip straight into the shoelace sum. This visits
+    // the same vertices in the same order without a second polygon array.
+    var area = PolygonArea(vec2<f32>(0.0), vec2<f32>(0.0), 0.0, 0u);
+    previous = clipped[n - 1u];
+    previous_distance = a.y + scale * dot(v2, previous);
     for (var i = 0u; i < n; i = i + 1u) {
-        let j = select(i + 1u, 0u, i + 1u == n);
-        area = area + poly[i].x * poly[j].y - poly[j].x * poly[i].y;
+        let p = clipped[i];
+        let distance = a.y + scale * dot(v2, p);
+        if (distance <= 0.0) != (previous_distance <= 0.0) {
+            let t = previous_distance / (previous_distance - distance);
+            area = append_area(area, previous + t * (p - previous));
+        }
+        if distance <= 0.0 {
+            area = append_area(area, p);
+        }
+        previous = p;
+        previous_distance = distance;
     }
-    return clamp(abs(area) * 0.5, 0.0, 1.0);
+    let sum = area.area + area.previous.x * area.first.y - area.first.x * area.previous.y;
+    return clamp(abs(sum) * 0.5, 0.0, 1.0);
 }
 
 // Coverage of the shape `s` at local point `p`, `m` mapping local to device.

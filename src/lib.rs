@@ -41,7 +41,7 @@ mod style;
 mod surface;
 mod tree;
 
-#[cfg(feature = "testing")]
+#[cfg(any(test, feature = "testing"))]
 pub mod testing;
 
 pub use crate::backend::RenderTransfer;

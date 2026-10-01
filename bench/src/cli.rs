@@ -306,6 +306,27 @@ enum Sub {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Snapshot memory at each engine-creation boundary — the issue-#170
+    /// B1 creation ledger. Requires the `cherenkov` feature.
+    ///
+    /// Rows run process baseline → every creation phase → first surface,
+    /// first submission and first completed frame → teardown; `--cycles`
+    /// repeats create/drop inside one process, and `--stop-after PHASE`
+    /// aborts creation just past a boundary for one-factor ablation.
+    Creation {
+        /// Report JSON path.
+        #[arg(long)]
+        out: PathBuf,
+        /// Create + first frame + drop cycles inside one process.
+        #[arg(long, default_value_t = 1)]
+        cycles: u32,
+        /// Abort creation just past this phase: `instance`, `adapter`,
+        /// `device`, `layouts`, `shader-modules`, `core-pipelines`,
+        /// `buffers`, `atlas`, `bind-groups`, `timestamps`,
+        /// `shadow-blur`, `external-native`, `complete`.
+        #[arg(long, value_name = "PHASE")]
+        stop_after: Option<String>,
+    },
     /// Render projective scenes in the oracle with the specified model and
     /// with two successively refined quality references, and report the
     /// model's distance from the finest reference and the references'
@@ -523,10 +544,34 @@ fn run(cli: Cli) -> Result<(), BenchError> {
         ),
         Sub::GamutSweep { out } => crate::gamut_sweep::run(out.as_deref()),
         Sub::ToneSweep { out } => crate::tone_sweep::run(out.as_deref()),
+        Sub::Creation {
+            out,
+            cycles,
+            stop_after,
+        } => creation_cmd(&out, cycles, stop_after.as_deref()),
         Sub::ProjectiveQuality { scenes, out } => {
             crate::projective_quality::run(&scenes, out.as_deref())
         }
     }
+}
+
+/// The `creation` subcommand, gated on the `cherenkov` adapter feature.
+#[cfg(feature = "cherenkov")]
+fn creation_cmd(out: &Path, cycles: u32, stop_after: Option<&str>) -> Result<(), BenchError> {
+    let phase = stop_after
+        .map(|name| {
+            crate::creation::parse_phase(name)
+                .ok_or_else(|| BenchError::Engine(format!("unknown creation phase {name:?}")))
+        })
+        .transpose()?;
+    crate::creation::run(cycles, phase, out)
+}
+
+#[cfg(not(feature = "cherenkov"))]
+fn creation_cmd(_out: &Path, _cycles: u32, _stop_after: Option<&str>) -> Result<(), BenchError> {
+    Err(BenchError::Engine(
+        "creation needs the `cherenkov` adapter feature".into(),
+    ))
 }
 
 /// `present-cost` needs the GPU adapter's shared device and Presenter.

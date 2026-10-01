@@ -745,10 +745,6 @@ fn rgb_generation(
     })
 }
 
-/// A sendable wrapper for the raw device used by the signal thread.
-struct SendDevice(ash::Device);
-unsafe impl Send for SendDevice {}
-
 /// Presents `texture` into a fresh destination and returns its f32
 /// pixels (the same helper pattern as `host_contracts`).
 fn read_pixels(
@@ -1037,41 +1033,47 @@ fn delayed_timeline_signal_stays_on_gpu() {
         tx[surface.root()].push(&layer);
         tx[&layer].content(handle);
     });
-    // The producer signals the wait point on the host — delayed — only
-    // once setup has finished, so the semaphore is genuinely unsigned
-    // when the measured render runs; a CPU-waiting engine would block
-    // the full delay here.
-    let signaller_dev = SendDevice(dev.clone());
-    let signaller = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        unsafe {
-            signaller_dev
-                .0
-                .signal_semaphore(
-                    &vk::SemaphoreSignalInfo::default()
-                        .semaphore(semaphore)
-                        .value(1),
-                )
-                .expect("signal");
-        }
-    });
-    let start = std::time::Instant::now();
+    // The wait point is genuinely unsignalled when this render runs:
+    // nothing on the host signals it, so a CPU-waiting engine could not
+    // return here at all — and any signal would raise the counter below.
     assert!(matches!(engine.render(FrameTime::now()), Ok(Next::Idle)));
-    let elapsed = start.elapsed();
-    // Submission returned while the producer had not signalled — a CPU
-    // wait would have blocked the 200ms delay; anything under it proves
-    // the wait executes on the GPU.
-    assert!(
-        elapsed < std::time::Duration::from_millis(100),
-        "consuming submission did not CPU-wait for the producer: {elapsed:?}"
+    let counter = unsafe { dev.get_semaphore_counter_value(semaphore) }.expect("semaphore counter");
+    assert_eq!(
+        counter, 0,
+        "engine returned with the wait point already signalled: {counter}"
     );
-    signaller.join().expect("signaller");
-    // The engine's release submission still signals this semaphore as the
-    // frame's release payload: VUID-vkDestroySemaphore-semaphore-01149
-    // forbids destroying it while a queue command references it, so the
-    // destroy waits for the frame's retirement (surface drop) and the
-    // teardown join inside `drop(engine)`.
+    // The producer signals the wait point on the host; the GPU-side wait
+    // in the consuming submission now resolves.
+    unsafe {
+        dev.signal_semaphore(
+            &vk::SemaphoreSignalInfo::default()
+                .semaphore(semaphore)
+                .value(1),
+        )
+        .expect("signal");
+    }
+    // Retiring the frame queues the release submission; the next render
+    // submits it behind the consuming submission on the one queue, so
+    // the semaphore reaching the release point proves the timeline wait
+    // executed on the GPU — without the wait, this point never arrives.
     drop(surface);
+    assert!(matches!(engine.render(FrameTime::now()), Ok(Next::Idle)));
+    let released = unsafe {
+        dev.wait_semaphores(
+            &vk::SemaphoreWaitInfo::default()
+                .semaphores(&[semaphore])
+                .values(&[2]),
+            30_000_000_000,
+        )
+    };
+    assert!(
+        released.is_ok(),
+        "release point never signalled: {released:?}"
+    );
+    // VUID-vkDestroySemaphore-semaphore-01149 forbids destroying the
+    // semaphore while a queue command references it: the wait above
+    // proves the release submission — the last reference — completed,
+    // and `drop(engine)` joins the teardown queue regardless.
     drop(engine);
     unsafe { dev.destroy_semaphore(semaphore, None) };
 }

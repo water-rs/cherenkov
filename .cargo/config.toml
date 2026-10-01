@@ -1,0 +1,6 @@
+# Android 15+ kernels run with 16 KB pages; every aarch64 ELF we ship or
+# run over adb (the android_planes library, cherenkov-bench, and the
+# vulkan_external_android test binary) must have 16 KB-aligned LOAD
+# segments or the loader refuses it with "ELF alignment check failed".
+[target.aarch64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]

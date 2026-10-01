@@ -296,7 +296,7 @@ impl Transaction {
                 ),
                 Op::Dataspace(dataspace) => {
                     let space = data_space(dataspace);
-                    tracing::info!(
+                    tracing::debug!(
                         target: "cherenkov::planes",
                         dataspace = %format_args!("0x{:08x}", space.0),
                         "plane dataspace"

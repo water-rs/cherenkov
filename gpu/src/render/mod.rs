@@ -474,7 +474,9 @@ pub struct GpuRenderer {
     shader_delivery: shaders::ShaderDelivery,
     shaders: paint::Registry,
     filters: filter::Registry,
-    shadow_blur: shadow::Blur,
+    /// The silhouette-morphology pipeline — `None` until a frame actually
+    /// composes a shadow, so shadow-free engines pay nothing (#170).
+    shadow_blur: Option<shadow::Blur>,
     last_frame: Option<Instant>,
     origin: Option<Instant>,
     device: wgpu::Device,
@@ -1745,7 +1747,8 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
                 .map(|slot| (set.clone(), slot * 2, 2))
                 .collect()
         });
-        let shadow_blur = shadow::Blur::new(&device, scratch_format);
+        // The silhouette-blur pipeline is built at the first frame with a
+        // shadow, not here (#170 — shadow-free engines pay for none).
         fire_probe(
             &config,
             CreationPhase::ShadowBlur,
@@ -1775,7 +1778,7 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             shaders: paint::Registry::default(),
             backdrop_shaders: FxHashMap::default(),
             filters: filter::Registry::new(config.redraw.clone()),
-            shadow_blur,
+            shadow_blur: None,
             last_frame: None,
             origin: None,
             max_texture: device.limits().max_texture_dimension_2d,
@@ -2018,7 +2021,8 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
             .map(|slot| (set.clone(), slot * 2, 2))
             .collect()
     });
-    let shadow_blur = shadow::Blur::new(&device, scratch_format);
+    // The silhouette-blur pipeline is built at the first frame with a
+    // shadow, not here (#170 — shadow-free engines pay for none).
     fire_probe(
         &config,
         CreationPhase::ShadowBlur,
@@ -2039,7 +2043,7 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
         shaders: paint::Registry::default(),
         backdrop_shaders: FxHashMap::default(),
         filters: filter::Registry::new(config.redraw.clone()),
-        shadow_blur,
+        shadow_blur: None,
         last_frame: None,
         origin: None,
         max_texture: device.limits().max_texture_dimension_2d,
@@ -2571,7 +2575,9 @@ impl Renderer for GpuRenderer {
     fn trim(&mut self, pressure: Pressure) {
         let _diag_guard = diag::Guard::scope(self.diag.as_ref());
         diag::set_phase("trim");
-        self.shadow_blur.trim();
+        if let Some(blur) = &mut self.shadow_blur {
+            blur.trim();
+        }
         for surf in self.surfaces.values_mut() {
             let scratch_bytes: u64 = surf
                 .scratch
@@ -2784,7 +2790,10 @@ impl Renderer for GpuRenderer {
             .map(|c| format_name(c.texture.format()))
             .next();
         MemoryUsage {
-            gpu: cherenkov::Bytes(gpu + self.filters.gpu_bytes() + self.shadow_blur.gpu_bytes()),
+            gpu: cherenkov::Bytes(
+                gpu + self.filters.gpu_bytes()
+                    + self.shadow_blur.as_ref().map_or(0, shadow::Blur::gpu_bytes),
+            ),
             cpu: cherenkov::Bytes(self.atlas.cpu_bytes()),
             backdrop_captures: cherenkov::Bytes(captures),
             backdrop_capture_format: capture_format,
@@ -6101,13 +6110,17 @@ impl GpuRenderer {
                 let Target::Scratch(depth) = pass.target else {
                     unreachable!("shadow captures scratch")
                 };
-                self.shadow_blur.apply(
-                    &self.device,
-                    &mut encoder,
-                    &surf.scratch[depth],
-                    (pass.region[2], pass.region[3]),
-                    *parameters,
-                )?;
+                // First shadow of the engine's life builds the blur
+                // pipeline here (#170).
+                self.shadow_blur
+                    .get_or_insert_with(|| shadow::Blur::new(&self.device, self.scratch_format))
+                    .apply(
+                        &self.device,
+                        &mut encoder,
+                        &surf.scratch[depth],
+                        (pass.region[2], pass.region[3]),
+                        *parameters,
+                    )?;
                 stats.passes +=
                     u32::from(parameters.spread != 0.0) + 2 * u32::from(parameters.sigma > 0.0);
             }

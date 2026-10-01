@@ -5448,6 +5448,16 @@ impl GpuRenderer {
                 multiview_mask: None,
             });
             let format_i = usize::from(texture.format() != TARGET_FORMAT);
+            // `view`/`texture` can borrow `surf.projective` (a projected
+            // pass target); the loop's projective draws need
+            // `surf.projective` mutably, so the native op and the reopened
+            // pass use these owned handles and copies instead.
+            #[cfg(all(unix, not(target_vendor = "apple")))]
+            let target_view = view.clone();
+            #[cfg(all(unix, not(target_vendor = "apple")))]
+            let target_format = texture.format();
+            #[cfg(all(unix, not(target_vendor = "apple")))]
+            let target_size = (texture.width(), texture.height());
             render_pass.set_pipeline(&self.pipelines[format_i][0][0]);
             // Region-targeted passes cover only their region; the surface
             // pass the whole target. `in.device` stays in true device
@@ -5563,7 +5573,7 @@ impl GpuRenderer {
                     let vk_format = hal_adapter
                         .as_ref()
                         .expect("native run implies vulkan")
-                        .texture_format_as_raw(texture.format());
+                        .texture_format_as_raw(target_format);
                     let native = self.native.as_mut().expect("checked");
                     let set0 = native
                         .set0_set(
@@ -5585,8 +5595,8 @@ impl GpuRenderer {
                             let cb = hal.raw_handle();
                             native.record(
                                 cb,
-                                raw_vk_view(view),
-                                (texture.width(), texture.height()),
+                                raw_vk_view(&target_view),
+                                target_size,
                                 vk_format,
                                 set0,
                                 &draws,
@@ -5620,7 +5630,7 @@ impl GpuRenderer {
                     render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("pass"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view,
+                            view: &target_view,
                             resolve_target: None,
                             ops: wgpu::Operations {
                                 load: wgpu::LoadOp::Load,

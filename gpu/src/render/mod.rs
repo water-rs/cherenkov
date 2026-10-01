@@ -350,14 +350,21 @@ pub struct GpuRenderer {
     origin: Option<Instant>,
     device: wgpu::Device,
     queue: wgpu::Queue,
-    /// `[format index][pipeline kind][shader variant]`:
-    /// format 0 = surface, 1 = scratch; kind 0 = source-over, 1 = replace;
-    /// variant 0/1/2 = simple/shadow/full fragment shader.
-    pipelines: [[[wgpu::RenderPipeline; 3]; 2]; 2],
-    /// Registered backdrop effect shaders, by raw id, one Full-variant
-    /// `SrcOver` pipeline per target format (`[surface, scratch]`),
-    /// compiled at registration.
-    backdrop_shaders: FxHashMap<u64, [wgpu::RenderPipeline; 2]>,
+    /// Core pipelines keyed by target format, blend mode and shader
+    /// variant: `[format][replace][variant]` where the format index is
+    /// `usize::from(format != TARGET_FORMAT)` — when surface and scratch
+    /// share `Rgba16Float`, both draw through slot 0, so identical
+    /// pipelines are built once (#170). A `None` cell is created at first
+    /// use — preparation is measured on the frame that needs it (#170 B3).
+    pipelines: [[[Option<wgpu::RenderPipeline>; 3]; 2]; 2],
+    /// The pipeline layout every core and backdrop pipeline shares.
+    pipeline_layout: wgpu::PipelineLayout,
+    /// The configured pipeline cache, opened once for the whole set.
+    pipeline_cache: Option<wgpu::PipelineCache>,
+    /// Registered backdrop effect shaders, by raw id — one `SrcOver`
+    /// pipeline per distinct target format, same slot indexing as
+    /// `pipelines`, compiled at registration.
+    backdrop_shaders: FxHashMap<u64, [Option<wgpu::RenderPipeline>; 2]>,
     /// The configured isolation texture format.
     scratch_format: wgpu::TextureFormat,
     layout0: wgpu::BindGroupLayout,
@@ -388,14 +395,19 @@ pub struct GpuRenderer {
     /// The external-frame group-1 layout, `None` until a surface first
     /// draws an external frame.
     ext_layout: Option<wgpu::BindGroupLayout>,
-    /// `[format index]` external pipelines: 0 = surface, 1 = scratch —
-    /// `None` until the first external draw prepares them.
+    /// `[format index]` external pipelines — the same slot indexing as
+    /// `pipelines`; `None` until external frames are used (#170: prepared
+    /// at `set_external_frame` registration, never at idle).
     external_pipes: [Option<wgpu::RenderPipeline>; 2],
     /// The Vulkan native external-frame context (issue #166): descriptors,
     /// render passes and pipelines for multiplanar and external-format
-    /// frames, built at init when the device is Vulkan.
+    /// frames, built when the first native frame is registered (#170).
     #[cfg(all(unix, not(target_vendor = "apple")))]
     native: Option<external::vulkan::Native>,
+    /// Why the first `set_external_frame` failed to build the native
+    /// context, so a later native-frame draw can report it.
+    #[cfg(all(unix, not(target_vendor = "apple")))]
+    native_error: Option<String>,
     /// Serializes "stage queue waits → submit" so an unrelated submission
     /// cannot consume a staged producer semaphore wait (#166).
     #[cfg(all(unix, not(target_vendor = "apple")))]
@@ -1060,40 +1072,71 @@ const fn variant_index(variant: ShaderVariant) -> usize {
     }
 }
 
-/// The closed pipeline set: one instanced-quad pipeline from `shader.wgsl`.
-/// When a pipeline cache path is configured and supported, the cache is
-/// loaded beforehand and persisted afterwards, best effort.
+/// #170 B3's pipeline policy: whether the deduplicated core set is built
+/// at creation (`CoreEager`) or each cell at the first draw that needs it
+/// (`CoreDemand`). wasm is always eager — its pipeline creation is async
+/// and cannot run inside the synchronous encode loop.
+const fn core_pipelines_eager() -> bool {
+    true
+}
+
+/// The pipeline layout every core and backdrop pipeline shares, over
+/// bind groups 0 and 1 — one object serves the whole set (#170).
+fn create_pipeline_layout(
+    device: &wgpu::Device,
+    layout0: &wgpu::BindGroupLayout,
+    layout1: &wgpu::BindGroupLayout,
+) -> wgpu::PipelineLayout {
+    device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("cherenkov"),
+        bind_group_layouts: &[Some(layout0), Some(layout1)],
+        immediate_size: 0,
+    })
+}
+
+/// The configured pipeline cache, opened once for the whole pipeline
+/// set — it was previously re-read and re-opened per pipeline (#170).
+fn open_pipeline_cache(device: &wgpu::Device, config: &GpuConfig) -> Option<wgpu::PipelineCache> {
+    let path = config.pipeline_cache.as_ref()?;
+    if !device.features().contains(wgpu::Features::PIPELINE_CACHE) {
+        return None;
+    }
+    let data = std::fs::read(path).ok();
+    // SAFETY: `data` is either a blob previously produced by wgpu or
+    // absent; `fallback: true` keeps us off the unsafe fallback path.
+    Some(unsafe {
+        device.create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
+            label: Some("cherenkov"),
+            data: data.as_deref(),
+            fallback: true,
+        })
+    })
+}
+
+/// Persists the pipeline cache to its configured path, best effort:
+/// future runs start closer to warm; a failed write only means the next
+/// start recompiles.
+fn persist_pipeline_cache(cache: Option<&wgpu::PipelineCache>, config: &GpuConfig) {
+    if let (Some(cache), Some(path)) = (cache, &config.pipeline_cache)
+        && let Some(data) = cache.get_data()
+    {
+        let _ = std::fs::write(path, data);
+    }
+}
+
+/// The closed pipeline set: one instanced-quad pipeline from `shader.wgsl`
+/// on the shared pipeline layout.
 #[cfg(not(target_arch = "wasm32"))]
 fn create_pipeline(
     device: &wgpu::Device,
     config: &GpuConfig,
-    layout0: &wgpu::BindGroupLayout,
-    layout1: &wgpu::BindGroupLayout,
+    layout: &wgpu::PipelineLayout,
+    cache: Option<&wgpu::PipelineCache>,
     module: &wgpu::ShaderModule,
     format: wgpu::TextureFormat,
     replace: bool,
 ) -> Result<wgpu::RenderPipeline, EngineError> {
     let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
-    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("cherenkov"),
-        bind_group_layouts: &[Some(layout0), Some(layout1)],
-        immediate_size: 0,
-    });
-    let cache = config.pipeline_cache.as_ref().and_then(|path| {
-        if !device.features().contains(wgpu::Features::PIPELINE_CACHE) {
-            return None;
-        }
-        let data = std::fs::read(path).ok();
-        // SAFETY: `data` is either a blob previously produced by wgpu or
-        // absent; `fallback: true` keeps us off the unsafe fallback path.
-        Some(unsafe {
-            device.create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
-                label: Some("cherenkov"),
-                data: data.as_deref(),
-                fallback: true,
-            })
-        })
-    });
     // Source-over premultiplied compositing, or `Replace` writing the
     // shader's already-composited result verbatim.
     let component = wgpu::BlendComponent {
@@ -1107,7 +1150,7 @@ fn create_pipeline(
     };
     let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("cherenkov"),
-        layout: Some(&layout),
+        layout: Some(layout),
         vertex: wgpu::VertexState {
             module,
             entry_point: Some("vs_main"),
@@ -1135,16 +1178,12 @@ fn create_pipeline(
         depth_stencil: None,
         multisample: wgpu::MultisampleState::default(),
         multiview_mask: None,
-        cache: cache.as_ref(),
+        cache,
     });
     if let Some(error) = pollster::block_on(error_scope.pop()) {
         return Err(EngineError::Backend(format!("{error}")));
     }
-    if let (Some(cache), Some(path)) = (&cache, &config.pipeline_cache)
-        && let Some(data) = cache.get_data()
-    {
-        let _ = std::fs::write(path, data);
-    }
+    persist_pipeline_cache(cache, config);
     Ok(pipeline)
 }
 
@@ -1156,33 +1195,13 @@ fn create_pipeline(
 async fn create_pipeline(
     device: &wgpu::Device,
     config: &GpuConfig,
-    layout0: &wgpu::BindGroupLayout,
-    layout1: &wgpu::BindGroupLayout,
+    layout: &wgpu::PipelineLayout,
+    cache: Option<&wgpu::PipelineCache>,
     module: &wgpu::ShaderModule,
     format: wgpu::TextureFormat,
     replace: bool,
 ) -> Result<wgpu::RenderPipeline, EngineError> {
     let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
-    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("cherenkov"),
-        bind_group_layouts: &[Some(layout0), Some(layout1)],
-        immediate_size: 0,
-    });
-    let cache = config.pipeline_cache.as_ref().and_then(|path| {
-        if !device.features().contains(wgpu::Features::PIPELINE_CACHE) {
-            return None;
-        }
-        let data = std::fs::read(path).ok();
-        // SAFETY: `data` is either a blob previously produced by wgpu or
-        // absent; `fallback: true` keeps us off the unsafe fallback path.
-        Some(unsafe {
-            device.create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
-                label: Some("cherenkov"),
-                data: data.as_deref(),
-                fallback: true,
-            })
-        })
-    });
     // Source-over premultiplied compositing, or `Replace` writing the
     // shader's already-composited result verbatim.
     let component = wgpu::BlendComponent {
@@ -1196,7 +1215,7 @@ async fn create_pipeline(
     };
     let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("cherenkov"),
-        layout: Some(&layout),
+        layout: Some(layout),
         vertex: wgpu::VertexState {
             module,
             entry_point: Some("vs_main"),
@@ -1224,17 +1243,85 @@ async fn create_pipeline(
         depth_stencil: None,
         multisample: wgpu::MultisampleState::default(),
         multiview_mask: None,
-        cache: cache.as_ref(),
+        cache,
     });
     if let Some(error) = error_scope.pop().await {
         return Err(EngineError::Backend(format!("{error}")));
     }
-    if let (Some(cache), Some(path)) = (&cache, &config.pipeline_cache)
-        && let Some(data) = cache.get_data()
-    {
-        let _ = std::fs::write(path, data);
-    }
+    persist_pipeline_cache(cache, config);
     Ok(pipeline)
+}
+
+/// The objects a demand-created core pipeline needs — field-borrowed out
+/// of `GpuRenderer` so the encode loop's surface borrow composes.
+struct PipelineFactory<'a> {
+    device: &'a wgpu::Device,
+    config: &'a GpuConfig,
+    layout: &'a wgpu::PipelineLayout,
+    cache: Option<&'a wgpu::PipelineCache>,
+    delivery: shaders::ShaderDelivery,
+}
+
+impl PipelineFactory<'_> {
+    /// Creates the `(format, replace, variant)` core pipeline on demand:
+    /// the shader module is built and released around the call — modules
+    /// are not retained once pipelines exist (#170).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn create(
+        &self,
+        format: wgpu::TextureFormat,
+        replace: bool,
+        variant: ShaderVariant,
+    ) -> Result<wgpu::RenderPipeline, RenderError> {
+        let module = self
+            .delivery
+            .engine_module(self.device, variant_index(variant));
+        create_pipeline(
+            self.device,
+            self.config,
+            self.layout,
+            self.cache,
+            &module,
+            format,
+            replace,
+        )
+        .map_err(|error| RenderError::Render(format!("core pipeline: {error}")))
+    }
+
+    /// wasm always prepares the core set eagerly: its pipeline creation
+    /// is async and cannot run inside the synchronous encode loop.
+    #[cfg(target_arch = "wasm32")]
+    fn create(
+        &self,
+        format: wgpu::TextureFormat,
+        replace: bool,
+        variant: ShaderVariant,
+    ) -> Result<wgpu::RenderPipeline, RenderError> {
+        let _ = (format, replace, variant);
+        Err(RenderError::Render(
+            "a core pipeline was not prepared at init".into(),
+        ))
+    }
+}
+
+/// The core pipeline for `(format, replace, variant)` — the format-slot
+/// index `usize::from(format != TARGET_FORMAT)` shares pipelines across
+/// surface and scratch when their formats coincide, and an empty cell is
+/// created at first use so preparation lands inside the frame that needs
+/// it (#170).
+fn core_pipeline<'m>(
+    pipelines: &'m mut [[[Option<wgpu::RenderPipeline>; 3]; 2]; 2],
+    factory: &PipelineFactory<'_>,
+    format: wgpu::TextureFormat,
+    replace: bool,
+    variant: ShaderVariant,
+) -> Result<&'m wgpu::RenderPipeline, RenderError> {
+    let cell = &mut pipelines[usize::from(format != TARGET_FORMAT)][usize::from(replace)]
+        [variant_index(variant)];
+    if cell.is_none() {
+        *cell = Some(factory.create(format, replace, variant)?);
+    }
+    Ok(cell.as_ref().expect("core pipeline ready"))
 }
 
 /// One instanced-quad pipeline from `external.wgsl` for `format`:
@@ -1351,54 +1438,45 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
         // constant-folded dispatch to fs_simple/fs_shadow/fs_full. On Vulkan
         // and Metal these are the embedded passthrough binaries (#57).
         let shader_delivery = shaders::delivery(info.backend, &device)?;
-        let modules = [0usize, 1, 2].map(|v| shader_delivery.engine_module(&device, v));
+        let modules = core_pipelines_eager()
+            .then(|| [0usize, 1, 2].map(|v| shader_delivery.engine_module(&device, v)));
         fire_probe(
             &config,
             CreationPhase::ShaderModules,
             Some(&adapter),
             Some(&device),
         )?;
-        let pipelines = |format: wgpu::TextureFormat, replace: bool| {
-            Ok::<_, EngineError>([
-                create_pipeline(
-                    &device,
-                    &config,
-                    &layout0,
-                    &layout1,
-                    &modules[0],
-                    format,
-                    replace,
-                )?,
-                create_pipeline(
-                    &device,
-                    &config,
-                    &layout0,
-                    &layout1,
-                    &modules[1],
-                    format,
-                    replace,
-                )?,
-                create_pipeline(
-                    &device,
-                    &config,
-                    &layout0,
-                    &layout1,
-                    &modules[2],
-                    format,
-                    replace,
-                )?,
-            ])
-        };
-        let pipelines = [
-            [
-                pipelines(TARGET_FORMAT, false)?,
-                pipelines(TARGET_FORMAT, true)?,
-            ],
-            [
-                pipelines(scratch_format, false)?,
-                pipelines(scratch_format, true)?,
-            ],
-        ];
+        let pipeline_layout = create_pipeline_layout(&device, &layout0, &layout1);
+        let pipeline_cache = open_pipeline_cache(&device, &config);
+        let mut pipelines = std::array::from_fn(|_| {
+            std::array::from_fn(|_| std::array::from_fn(|_| None::<wgpu::RenderPipeline>))
+        });
+        // The closed core set, deduplicated by format slot: when surface
+        // and scratch share `Rgba16Float` every cell lands in slot 0 and
+        // the later iteration's `is_none` skips its duplicates (#170).
+        // CoreDemand leaves the cells empty — `core_pipeline` fills each
+        // at the first draw that needs it (#170 B3).
+        if let Some(modules) = &modules {
+            for format in [TARGET_FORMAT, scratch_format] {
+                let slot = usize::from(format != TARGET_FORMAT);
+                for replace in [false, true] {
+                    for variant in 0usize..3 {
+                        let cell = &mut pipelines[slot][usize::from(replace)][variant];
+                        if cell.is_none() {
+                            *cell = Some(create_pipeline(
+                                &device,
+                                &config,
+                                &pipeline_layout,
+                                pipeline_cache.as_ref(),
+                                &modules[variant],
+                                format,
+                                replace,
+                            )?);
+                        }
+                    }
+                }
+            }
+        }
         fire_probe(
             &config,
             CreationPhase::CorePipelines,
@@ -1501,24 +1579,9 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             Some(&adapter),
             Some(&device),
         )?;
-        #[cfg(all(unix, not(target_vendor = "apple")))]
-        let native = {
-            let shared_device = crate::interop::SharedDevice {
-                instance: instance.clone(),
-                adapter: adapter.clone(),
-                device: device.clone(),
-                queue: queue.clone(),
-            };
-            match external::vulkan::shared_for(&shared_device)
-                .and_then(external::vulkan::Native::new)
-            {
-                Ok(native) => Some(native),
-                Err(error) => {
-                    tracing::warn!(%error, "vulkan external-frame import unavailable");
-                    None
-                }
-            }
-        };
+        // The Vulkan external-frame context is built at the first native
+        // frame's registration, not here (#170 — idle engines pay for no
+        // native descriptors or pipelines).
         fire_probe(
             &config,
             CreationPhase::ExternalNative,
@@ -1546,6 +1609,8 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             device,
             queue,
             pipelines,
+            pipeline_layout,
+            pipeline_cache,
             scratch_format,
             layout0,
             layout1,
@@ -1558,7 +1623,9 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             ext_layout: None,
             external_pipes: [None, None],
             #[cfg(all(unix, not(target_vendor = "apple")))]
-            native,
+            native: None,
+            #[cfg(all(unix, not(target_vendor = "apple")))]
+            native_error: None,
             #[cfg(all(unix, not(target_vendor = "apple")))]
             submit_lock: std::sync::Mutex::new(()),
             bound_atlas: 0,
@@ -1650,50 +1717,36 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
         Some(&adapter),
         Some(&device),
     )?;
-    let pipelines = async |format: wgpu::TextureFormat, replace: bool| {
-        Ok::<_, EngineError>([
-            create_pipeline(
-                &device,
-                &config,
-                &layout0,
-                &layout1,
-                &modules[0],
-                format,
-                replace,
-            )
-            .await?,
-            create_pipeline(
-                &device,
-                &config,
-                &layout0,
-                &layout1,
-                &modules[1],
-                format,
-                replace,
-            )
-            .await?,
-            create_pipeline(
-                &device,
-                &config,
-                &layout0,
-                &layout1,
-                &modules[2],
-                format,
-                replace,
-            )
-            .await?,
-        ])
-    };
-    let pipelines = [
-        [
-            pipelines(TARGET_FORMAT, false).await?,
-            pipelines(TARGET_FORMAT, true).await?,
-        ],
-        [
-            pipelines(scratch_format, false).await?,
-            pipelines(scratch_format, true).await?,
-        ],
-    ];
+    let pipeline_layout = create_pipeline_layout(&device, &layout0, &layout1);
+    let pipeline_cache = open_pipeline_cache(&device, &config);
+    let mut pipelines = std::array::from_fn(|_| {
+        std::array::from_fn(|_| std::array::from_fn(|_| None::<wgpu::RenderPipeline>))
+    });
+    // The closed core set, deduplicated by format slot: when surface and
+    // scratch share `Rgba16Float` every cell lands in slot 0 and the
+    // later iteration's `is_none` skips its duplicates (#170).
+    for format in [TARGET_FORMAT, scratch_format] {
+        let slot = usize::from(format != TARGET_FORMAT);
+        for replace in [false, true] {
+            for variant in 0usize..3 {
+                let cell = &mut pipelines[slot][usize::from(replace)][variant];
+                if cell.is_none() {
+                    *cell = Some(
+                        create_pipeline(
+                            &device,
+                            &config,
+                            &pipeline_layout,
+                            pipeline_cache.as_ref(),
+                            &modules[variant],
+                            format,
+                            replace,
+                        )
+                        .await?,
+                    );
+                }
+            }
+        }
+    }
     fire_probe(
         &config,
         CreationPhase::CorePipelines,
@@ -1817,6 +1870,8 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
         device,
         queue,
         pipelines,
+        pipeline_layout,
+        pipeline_cache,
         scratch_format,
         layout0,
         layout1,
@@ -3181,24 +3236,32 @@ impl GpuRenderer {
             create_pipeline(
                 &self.device,
                 &self.config,
-                &self.layout0,
-                &self.layout1,
+                &self.pipeline_layout,
+                self.pipeline_cache.as_ref(),
                 &module,
                 format,
                 false,
             )
             .map_err(|e| ResourceError::Shader(e.to_string()))
         };
-        let surface = make(TARGET_FORMAT);
-        let scratch = make(self.scratch_format);
+        // One pipeline per distinct target format — equal formats share
+        // the slot-0 pipeline (#170).
+        let mut pipelines = [None, None];
+        for format in [TARGET_FORMAT, self.scratch_format] {
+            let slot = usize::from(format != TARGET_FORMAT);
+            if pipelines[slot].is_none() {
+                pipelines[slot] = Some(make(format));
+            }
+        }
         let scope_error = pollster::block_on(scope.pop());
         // An invalid module reports through the scope and fails the
         // pipelines only as a consequence: surface it first.
         if let Some(error) = scope_error {
             return Err(ResourceError::Shader(format!("{error}")));
         }
-        let pipelines = [surface?, scratch?];
-        self.backdrop_shaders.insert(id.raw(), pipelines);
+        let [surface, scratch] = pipelines;
+        self.backdrop_shaders
+            .insert(id.raw(), [surface.transpose()?, scratch.transpose()?]);
         Ok(())
     }
 
@@ -3220,28 +3283,27 @@ impl GpuRenderer {
                 label: Some("backdrop effect"),
                 source: wgpu::ShaderSource::Wgsl(backdrop_effect_text(&source.source)),
             });
-        let surface = create_pipeline(
-            &self.device,
-            &self.config,
-            &self.layout0,
-            &self.layout1,
-            &module,
-            TARGET_FORMAT,
-            false,
-        )
-        .await
-        .map_err(|e| ResourceError::Shader(e.to_string()));
-        let scratch = create_pipeline(
-            &self.device,
-            &self.config,
-            &self.layout0,
-            &self.layout1,
-            &module,
-            self.scratch_format,
-            false,
-        )
-        .await
-        .map_err(|e| ResourceError::Shader(e.to_string()));
+        // One pipeline per distinct target format — equal formats share
+        // the slot-0 pipeline (#170).
+        let mut pipelines = [None, None];
+        for format in [TARGET_FORMAT, self.scratch_format] {
+            let slot = usize::from(format != TARGET_FORMAT);
+            if pipelines[slot].is_none() {
+                pipelines[slot] = Some(
+                    create_pipeline(
+                        &self.device,
+                        &self.config,
+                        &self.pipeline_layout,
+                        self.pipeline_cache.as_ref(),
+                        &module,
+                        format,
+                        false,
+                    )
+                    .await
+                    .map_err(|e| ResourceError::Shader(e.to_string())),
+                );
+            }
+        }
         // The scope is popped before `?` propagates: an early return must
         // not leak an unbalanced error scope. An invalid module reports
         // through the scope and fails the pipelines only as a
@@ -3250,8 +3312,9 @@ impl GpuRenderer {
         if let Some(error) = scope_error {
             return Err(ResourceError::Shader(format!("{error}")));
         }
-        let pipelines = [surface?, scratch?];
-        self.backdrop_shaders.insert(id.raw(), pipelines);
+        let [surface, scratch] = pipelines;
+        self.backdrop_shaders
+            .insert(id.raw(), [surface.transpose()?, scratch.transpose()?]);
         Ok(())
     }
 
@@ -3425,12 +3488,36 @@ impl GpuRenderer {
         layer: LayerId,
         frame: crate::interop::ExternalFrame,
     ) {
+        // Registration prepares the external-frame family — the layout
+        // and pipelines, and for a native frame the Vulkan context — so
+        // a cold frame's encode does not pay their creation (#170, #165).
+        #[cfg(all(unix, not(target_vendor = "apple")))]
+        let needs_native = matches!(&frame.planes, crate::interop::FramePlanes::Native(_));
         let state = self.surfaces.get_mut(&surface).expect("GPU surface exists");
         state.layers.remove(&layer);
         state.content.remove(&layer);
         state
             .external
             .insert(layer, external::Slot::new(&self.device, &self.queue, frame));
+        if let Err(error) = self.ensure_external() {
+            tracing::warn!(%error, "external-frame preparation failed at registration");
+        }
+        #[cfg(all(unix, not(target_vendor = "apple")))]
+        if needs_native && self.native.is_none() && self.native_error.is_none() {
+            let shared = crate::interop::SharedDevice {
+                instance: self.instance.clone(),
+                adapter: self.adapter.clone(),
+                device: self.device.clone(),
+                queue: self.queue.clone(),
+            };
+            match external::vulkan::shared_for(&shared).and_then(external::vulkan::Native::new) {
+                Ok(native) => self.native = Some(native),
+                Err(error) => {
+                    tracing::warn!(%error, "vulkan external-frame context unavailable");
+                    self.native_error = Some(error.to_string());
+                }
+            }
+        }
     }
 
     pub fn resize_gpu_content(&mut self, surface: SurfaceId, layer: LayerId, size: (u32, u32)) {
@@ -3480,15 +3567,19 @@ impl GpuRenderer {
         // reports through the uncaptured-error handler instead.
         #[cfg(not(target_arch = "wasm32"))]
         let error_scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let formats = [TARGET_FORMAT, self.scratch_format];
-        for (pipe, format) in self.external_pipes.iter_mut().zip(formats) {
-            *pipe = Some(create_external_pipeline(
-                &self.device,
-                &self.layout0,
-                &ext_layout,
-                &module,
-                format,
-            ));
+        // One pipeline per distinct target format — equal formats share
+        // the slot-0 pipeline (#170).
+        for format in [TARGET_FORMAT, self.scratch_format] {
+            let slot = usize::from(format != TARGET_FORMAT);
+            if self.external_pipes[slot].is_none() {
+                self.external_pipes[slot] = Some(create_external_pipeline(
+                    &self.device,
+                    &self.layout0,
+                    &ext_layout,
+                    &module,
+                    format,
+                ));
+            }
         }
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(error) = pollster::block_on(error_scope.pop()) {
@@ -3496,6 +3587,20 @@ impl GpuRenderer {
         }
         self.ext_layout = Some(ext_layout);
         Ok(())
+    }
+
+    /// The error a native-frame draw reports when the Vulkan context is
+    /// absent — carrying the registration-time failure when one was
+    /// recorded (#166, #170).
+    #[cfg(all(unix, not(target_vendor = "apple")))]
+    fn native_missing(&self) -> RenderError {
+        RenderError::Render(self.native_error.as_deref().map_or_else(
+            || {
+                "a native external frame is installed but the Vulkan context is unavailable"
+                    .to_string()
+            },
+            |error| format!("vulkan external-frame context unavailable: {error}"),
+        ))
     }
 
     fn present_windows(&mut self, frame: &Frame<'_>) -> Result<Redraw, RenderError> {
@@ -4809,6 +4914,13 @@ impl GpuRenderer {
             surf.binds1.clear();
             surf.binds1_stamp = stamp;
         }
+        let factory = PipelineFactory {
+            device: &self.device,
+            config: &self.config,
+            layout: &self.pipeline_layout,
+            cache: self.pipeline_cache.as_ref(),
+            delivery: self.shader_delivery,
+        };
         for (i, pass) in surf.frame.passes.iter().enumerate() {
             let (view, texture) = match pass.target {
                 Target::Surface => (&surf.view, &surf.target),
@@ -4951,9 +5063,11 @@ impl GpuRenderer {
             // pass samples — `Planes`/`ExternalFormat` bound in the native
             // op and `Rgb` bound through wgpu — record the acquire barrier
             // and stage its wait before the pass opens. `stage_acquire`
-            // deduplicates generations already staged or owned.
+            // deduplicates generations already staged or owned. The native
+            // context is built at frame registration; a missing one is an
+            // error, not a skip (#170).
             #[cfg(all(unix, not(target_vendor = "apple")))]
-            if self.native.is_some() {
+            {
                 let gens: Vec<std::sync::Arc<external::vulkan::Generation>> = pass
                     .ranges
                     .iter()
@@ -4966,9 +5080,10 @@ impl GpuRenderer {
                         _ => None,
                     })
                     .collect();
-                if !gens.is_empty()
-                    && let Some(native) = self.native.as_mut()
-                {
+                if !gens.is_empty() {
+                    let Some(native) = self.native.as_mut() else {
+                        return Err(self.native_missing());
+                    };
                     buffers.push(split_encoder(&mut encoder, &self.device));
                     let mut acquire =
                         self.device
@@ -5010,7 +5125,13 @@ impl GpuRenderer {
                 multiview_mask: None,
             });
             let format_i = usize::from(texture.format() != TARGET_FORMAT);
-            render_pass.set_pipeline(&self.pipelines[format_i][0][0]);
+            render_pass.set_pipeline(core_pipeline(
+                &mut self.pipelines,
+                &factory,
+                texture.format(),
+                false,
+                ShaderVariant::Simple,
+            )?);
             // Region-targeted passes cover only their region; the surface
             // pass the whole target. `in.device` stays in true device
             // space via the per-pass Globals origin.
@@ -5154,7 +5275,13 @@ impl GpuRenderer {
                         occlusion_query_set: None,
                         multiview_mask: None,
                     });
-                    render_pass.set_pipeline(&self.pipelines[format_i][0][0]);
+                    render_pass.set_pipeline(core_pipeline(
+                        &mut self.pipelines,
+                        &factory,
+                        texture.format(),
+                        false,
+                        ShaderVariant::Simple,
+                    )?);
                     if !matches!(pass.target, Target::Surface) {
                         render_pass.set_viewport(
                             0.0,
@@ -5222,16 +5349,19 @@ impl GpuRenderer {
                         PipelineKind::Effect(id) => self
                             .backdrop_shaders
                             .get(&id)
-                            .map(|p| &p[format_i])
+                            .and_then(|p| p[format_i].as_ref())
                             .ok_or_else(|| {
                                 RenderError::Render(format!(
                                     "backdrop shader {id} is not registered"
                                 ))
                             })?,
-                        kind => {
-                            &self.pipelines[format_i][usize::from(kind == PipelineKind::Replace)]
-                                [variant_index(variant)]
-                        }
+                        kind => core_pipeline(
+                            &mut self.pipelines,
+                            &factory,
+                            texture.format(),
+                            kind == PipelineKind::Replace,
+                            variant,
+                        )?,
                     };
                     render_pass.set_pipeline(pipe);
                 }

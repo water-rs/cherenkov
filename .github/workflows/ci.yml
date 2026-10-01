@@ -72,7 +72,7 @@ jobs:
       # workspace tests read them. The pinned font tools need Python >= 3.10
       # in a writable environment, which runner Pythons are not (too old or
       # externally managed); uv supplies both.
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.2.0
       - name: Generate the scene tree
         shell: bash
         run: |
@@ -108,7 +108,7 @@ jobs:
       # The scene generator's font stack links the system fontconfig.
       - name: Install Linux dependencies
         run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.2.0
       - uses: actions/cache@v4
         with:
           path: scenes/fonts/_full
@@ -188,7 +188,7 @@ jobs:
       # corpus render below and the bench tests read them. The pinned font
       # tools need Python >= 3.10 in a writable environment, which uv
       # supplies (runner Pythons may be externally managed).
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.2.0
       - name: Generate the scene tree
         run: |
           set -euo pipefail
@@ -261,7 +261,7 @@ jobs:
       # corpus render and perf-scene measure below read them. The pinned
       # font tools need Python >= 3.10 in a writable environment, which uv
       # supplies (the runner's Homebrew Python is externally managed).
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.2.0
       - name: Generate the scene tree
         run: |
           set -euo pipefail
@@ -360,7 +360,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-ndk
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.2.0
       - uses: actions/cache@v4
         with:
           path: scenes/fonts/_full

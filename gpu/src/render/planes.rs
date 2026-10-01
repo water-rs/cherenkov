@@ -206,25 +206,63 @@ struct Visit {
     ancestors: Vec<usize>,
 }
 
-/// Decides which of `candidates` (layer to content size) are promoted this
-/// frame on a surface realized by compositor `C`.
-///
-/// Candidates are judged in paint order and the budget goes to the first
-/// eligible ones, so the decision depends only on the tree and the
-/// candidate set.
-#[must_use]
-pub fn plan<C: Compositor>(
+/// Reusable workspace for a plan walk: the paint order (each visit's
+/// ancestor chain keeps the buffer it had last call — `pool` holds the
+/// ones `order` gave back), the traversal stack, and the backdrop/blend
+/// suffix lookups. A renderer owns one so a frame's plan check allocates
+/// nothing steady-state (#90).
+#[derive(Default)]
+pub struct PlanScratch {
+    order: Vec<Visit>,
+    pool: Vec<Vec<usize>>,
+    stack: Vec<(LayerId, usize)>,
+    backdrop_above: Vec<Option<LayerId>>,
+    blend_above: Vec<Option<LayerId>>,
+}
+
+/// Every layer in paint order: a layer's content, then its children —
+/// into `order`, whose per-visit `ancestors` buffers are recycled through
+/// `pool` from the last call.
+fn paint_order<'a>(
     tree: &SurfaceTree,
-    candidates: &FxHashMap<LayerId, (u32, u32)>,
-) -> Plan {
-    if candidates.is_empty() {
-        return Plan::default();
+    order: &'a mut Vec<Visit>,
+    pool: &mut Vec<Vec<usize>>,
+    stack: &mut Vec<(LayerId, usize)>,
+) -> &'a [Visit] {
+    for visit in order.drain(..) {
+        pool.push(visit.ancestors);
     }
-    let order = paint_order(tree);
-    // The first layer at or after each index that samples a backdrop or
-    // blends onto the surface, scanning from the top of the paint order.
-    let mut backdrop_above = vec![None; order.len() + 1];
-    let mut blend_above = vec![None; order.len() + 1];
+    stack.clear();
+    stack.push((tree.root(), usize::MAX));
+    while let Some((id, parent)) = stack.pop() {
+        let index = order.len();
+        let mut ancestors = pool.pop().unwrap_or_default();
+        ancestors.clear();
+        if parent != usize::MAX {
+            ancestors.extend_from_slice(&order[parent].ancestors);
+            ancestors.push(parent);
+        }
+        order.push(Visit { id, ancestors });
+        for &child in tree.layer(id).children.iter().rev() {
+            stack.push((child, index));
+        }
+    }
+    order
+}
+
+/// The first layer at or after each index that samples a backdrop or
+/// blends onto the surface, scanning from the top of the paint order —
+/// index `order.len()` is the empty suffix.
+fn suffixes(
+    tree: &SurfaceTree,
+    order: &[Visit],
+    backdrop_above: &mut Vec<Option<LayerId>>,
+    blend_above: &mut Vec<Option<LayerId>>,
+) {
+    backdrop_above.clear();
+    backdrop_above.resize(order.len() + 1, None);
+    blend_above.clear();
+    blend_above.resize(order.len() + 1, None);
     for (i, visit) in order.iter().enumerate().rev() {
         let node = tree.layer(visit.id);
         backdrop_above[i] = if node.backdrop.is_some() {
@@ -242,26 +280,148 @@ pub fn plan<C: Compositor>(
             blend_above[i + 1]
         };
     }
+}
+
+/// Each candidate's verdict in paint order as its `order` index —
+/// `Err(Budget)` once `C::BUDGET` promotions are taken.
+fn verdicts<'a, C: Compositor>(
+    tree: &'a SurfaceTree,
+    order: &'a [Visit],
+    candidates: &'a FxHashMap<LayerId, (u32, u32)>,
+    backdrop_above: &'a [Option<LayerId>],
+    blend_above: &'a [Option<LayerId>],
+) -> impl Iterator<Item = (usize, Result<(), Ineligible>)> + 'a {
+    let mut promoted = 0;
+    order.iter().enumerate().filter_map(move |(i, visit)| {
+        candidates.get(&visit.id)?;
+        let verdict = judge::<C>(tree, order, i, backdrop_above[i + 1], blend_above[i + 1]);
+        Some((
+            i,
+            match verdict {
+                Ok(()) if promoted >= C::BUDGET => Err(Ineligible::Budget(C::BUDGET)),
+                Ok(()) => {
+                    promoted += 1;
+                    Ok(())
+                }
+                Err(cause) => Err(cause),
+            },
+        ))
+    })
+}
+
+/// Decides which of `candidates` (layer to content size) are promoted this
+/// frame on a surface realized by compositor `C`.
+///
+/// Candidates are judged in paint order and the budget goes to the first
+/// eligible ones, so the decision depends only on the tree and the
+/// candidate set.
+#[must_use]
+pub fn plan<C: Compositor>(
+    tree: &SurfaceTree,
+    candidates: &FxHashMap<LayerId, (u32, u32)>,
+) -> Plan {
+    if candidates.is_empty() {
+        return Plan::default();
+    }
+    let mut scratch = PlanScratch::default();
+    let PlanScratch {
+        order,
+        pool,
+        stack,
+        backdrop_above,
+        blend_above,
+    } = &mut scratch;
+    let order = paint_order(tree, order, pool, stack);
+    suffixes(tree, order, backdrop_above, blend_above);
     let mut plan = Plan::default();
     let mut last = None;
-    for (i, visit) in order.iter().enumerate() {
-        let Some(&size) = candidates.get(&visit.id) else {
-            continue;
-        };
-        let verdict = judge::<C>(tree, &order, i, backdrop_above[i + 1], blend_above[i + 1]);
+    for (i, verdict) in verdicts::<C>(tree, order, candidates, backdrop_above, blend_above) {
         match verdict {
-            Ok(()) if plan.planes.len() >= C::BUDGET => plan
-                .rejected
-                .push((visit.id, Ineligible::Budget(C::BUDGET))),
             Ok(()) => {
                 last = Some(i);
-                plan.planes.push(placement(tree, &order, i, size));
+                plan.planes
+                    .push(placement(tree, order, i, candidates[&order[i].id]));
             }
-            Err(cause) => plan.rejected.push((visit.id, cause)),
+            Err(cause) => plan.rejected.push((order[i].id, cause)),
         }
     }
     plan.trailing = last.is_some_and(|i| i + 1 < order.len());
     plan
+}
+
+/// Whether `order[i]`'s placement for content `size` is `placed` — the
+/// fields `placement` would put in it, compared without building them.
+fn placement_eq(
+    tree: &SurfaceTree,
+    order: &[Visit],
+    i: usize,
+    size: (u32, u32),
+    placed: &Placement,
+) -> bool {
+    let visit = &order[i];
+    placed.layer == visit.id
+        && placed.size == size
+        && placed.opacity == tree.layer(visit.id).opacity
+        && placed.path.len() == visit.ancestors.len() + 1
+        && visit
+            .ancestors
+            .iter()
+            .map(|&a| order[a].id)
+            .chain([visit.id])
+            .zip(&placed.path)
+            .all(|(id, level)| {
+                let node = tree.layer(id);
+                level.layer == id
+                    && level.transform == node.transform
+                    && level.clip == node.clip
+                    && level.scroll == node.scroll_offset
+            })
+}
+
+/// Whether `committed` is the plan the same verdicts would produce over
+/// `tree` and `candidates` — checked without materialising it (#90).
+fn same_plan<C: Compositor>(
+    committed: &Plan,
+    tree: &SurfaceTree,
+    candidates: &FxHashMap<LayerId, (u32, u32)>,
+    scratch: &mut PlanScratch,
+) -> bool {
+    if candidates.is_empty() {
+        return *committed == Plan::default();
+    }
+    let PlanScratch {
+        order,
+        pool,
+        stack,
+        backdrop_above,
+        blend_above,
+    } = scratch;
+    let order = paint_order(tree, order, pool, stack);
+    suffixes(tree, order, backdrop_above, blend_above);
+    let mut planes = committed.planes.iter();
+    let mut rejected = committed.rejected.iter();
+    let mut last = None;
+    for (i, verdict) in verdicts::<C>(tree, order, candidates, backdrop_above, blend_above) {
+        match verdict {
+            Ok(()) => {
+                let Some(placed) = planes.next() else {
+                    return false;
+                };
+                if !placement_eq(tree, order, i, candidates[&order[i].id], placed) {
+                    return false;
+                }
+                last = Some(i);
+            }
+            Err(cause) => {
+                if rejected.next() != Some(&(order[i].id, cause)) {
+                    return false;
+                }
+            }
+        }
+    }
+    planes.next().is_none()
+        && rejected.next().is_none()
+        && last.is_some_and(|i| i + 1 < order.len()) == committed.trailing
 }
 
 /// The eligibility rules for the candidate at `order[i]`, in a fixed order
@@ -359,42 +519,27 @@ fn placement(tree: &SurfaceTree, order: &[Visit], i: usize, size: (u32, u32)) ->
     }
 }
 
-/// Every layer in paint order: a layer's content, then its children.
-fn paint_order(tree: &SurfaceTree) -> Vec<Visit> {
-    let mut order = Vec::new();
-    let mut stack = vec![(tree.root(), Vec::new())];
-    while let Some((id, ancestors)) = stack.pop() {
-        let index = order.len();
-        let children = &tree.layer(id).children;
-        for &child in children.iter().rev() {
-            let mut path = ancestors.clone();
-            path.push(index);
-            stack.push((child, path));
-        }
-        order.push(Visit { id, ancestors });
-    }
-    order
-}
-
 /// Whether a frame whose only committed change is new external frames on
 /// `layers` can present through the planes alone: every changed layer is
-/// promoted by the surface's committed `plan`, and the plan recomputed
-/// over the frame's tree with the fresh `candidates` is the committed
-/// one — a new frame's different size, or a new frame no plane can show,
-/// changes the candidate set and fails the check, keeping those layers on
-/// the full path like any other change (#90).
+/// promoted by the surface's committed `plan`, and the verdicts the
+/// frame's tree and fresh `candidates` produce are the committed ones — a
+/// new frame's different size, or a new frame no plane can show, changes
+/// the candidate set and fails the check, keeping those layers on the
+/// full path like any other change (#90). `scratch` reuses the walk's
+/// buffers across calls, so a steady stream allocates nothing.
 #[must_use]
 pub fn frames_only<C: Compositor>(
     plan: &Plan,
     tree: &SurfaceTree,
     candidates: &FxHashMap<LayerId, (u32, u32)>,
     layers: &FxHashSet<LayerId>,
+    scratch: &mut PlanScratch,
 ) -> bool {
     !layers.is_empty()
         && layers
             .iter()
             .all(|layer| plan.planes.iter().any(|plane| plane.layer == *layer))
-        && self::plan::<C>(tree, candidates) == *plan
+        && same_plan::<C>(plan, tree, candidates, scratch)
 }
 
 /// The content a plane shows.
@@ -503,7 +648,7 @@ pub trait SystemPlanes: Compositor {
     ///
     /// # Errors
     /// A [`RenderError`] naming the cause when the system rejects a plane.
-    fn refresh(&mut self, frames: &[Plane<'_>]) -> Result<(), RenderError>;
+    fn refresh<'a>(&mut self, frames: impl Iterator<Item = Plane<'a>>) -> Result<(), RenderError>;
 
     /// The surface was resized to `size` device pixels.
     fn resize(&mut self, size: (u32, u32));
@@ -551,7 +696,7 @@ impl SystemPlanes for NoPlanes {
     fn compose(&mut self, _: Composition<'_>) -> Result<bool, RenderError> {
         unreachable!("no `NoPlanes` value exists")
     }
-    fn refresh(&mut self, _: &[Plane<'_>]) -> Result<(), RenderError> {
+    fn refresh<'a>(&mut self, _: impl Iterator<Item = Plane<'a>>) -> Result<(), RenderError> {
         unreachable!("no `NoPlanes` value exists")
     }
     fn resize(&mut self, _: (u32, u32)) {

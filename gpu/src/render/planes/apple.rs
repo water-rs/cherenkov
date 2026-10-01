@@ -960,7 +960,7 @@ impl SystemPlanes for LayerPlanes {
     /// # Errors
     /// A [`RenderError`] naming the cause when the system rejects a plane
     /// or a refresh names a layer no plane shows.
-    fn refresh(&mut self, frames: &[Plane<'_>]) -> Result<(), RenderError> {
+    fn refresh<'a>(&mut self, frames: impl Iterator<Item = Plane<'a>>) -> Result<(), RenderError> {
         for update in frames {
             match update.content {
                 PlaneContent::Frame { frame, generation } => {

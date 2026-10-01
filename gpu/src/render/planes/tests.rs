@@ -4,7 +4,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use cherenkov::testing::LayerOp;
 use cherenkov::{BlendMode, FilterId, LayerId, Prop, ShapeData, SurfaceTree};
 
-use super::{Compositor, Ineligible, Level, Plan, frames_only, plan};
+use super::{Compositor, Ineligible, Level, Plan, PlanScratch, frames_only, plan};
 use crate::render::lower::axis_aligned;
 
 /// A compositor that carries axis-aligned transforms and rect or
@@ -288,12 +288,23 @@ fn a_plane_only_frame_presents_through_the_planes_alone() {
     let tree = scene();
     let candidates = video();
     let committed = verdict(&tree).expect("eligible");
+    let mut scratch = PlanScratch::default();
     let video_only: FxHashSet<LayerId> = std::iter::once(VIDEO).collect();
     assert!(frames_only::<Test>(
         &committed,
         &tree,
         &candidates,
-        &video_only
+        &video_only,
+        &mut scratch
+    ));
+    // A second call on the same scratch — the steady-state video path —
+    // agrees.
+    assert!(frames_only::<Test>(
+        &committed,
+        &tree,
+        &candidates,
+        &video_only,
+        &mut scratch
     ));
 
     // A new frame on a layer the plan keeps in the engine is a full
@@ -303,10 +314,17 @@ fn a_plane_only_frame_presents_through_the_planes_alone() {
         &committed,
         &tree,
         &candidates,
-        &in_engine
+        &in_engine,
+        &mut scratch
     ));
     let mixed: FxHashSet<LayerId> = [VIDEO, BELOW].into_iter().collect();
-    assert!(!frames_only::<Test>(&committed, &tree, &candidates, &mixed));
+    assert!(!frames_only::<Test>(
+        &committed,
+        &tree,
+        &candidates,
+        &mixed,
+        &mut scratch
+    ));
 
     // A tree change the recomputed plan sees — the promotion moved —
     // keeps the full path.
@@ -320,7 +338,8 @@ fn a_plane_only_frame_presents_through_the_planes_alone() {
         &committed,
         &moved,
         &candidates,
-        &video_only
+        &video_only,
+        &mut scratch
     ));
 
     // A differently sized frame on the same layer changes its placement.
@@ -329,21 +348,29 @@ fn a_plane_only_frame_presents_through_the_planes_alone() {
         &committed,
         &tree,
         &resized,
-        &video_only
+        &video_only,
+        &mut scratch
     ));
 
     // A first frame on another layer makes it a candidate, which changes
     // the plan — here by adding a second promotion.
     let mut two = video();
     two.insert(BELOW, SIZE);
-    assert!(!frames_only::<Test>(&committed, &tree, &two, &mixed));
+    assert!(!frames_only::<Test>(
+        &committed,
+        &tree,
+        &two,
+        &mixed,
+        &mut scratch
+    ));
 
     // No installs is never a refresh.
     assert!(!frames_only::<Test>(
         &committed,
         &tree,
         &candidates,
-        &FxHashSet::default()
+        &FxHashSet::default(),
+        &mut scratch
     ));
 }
 

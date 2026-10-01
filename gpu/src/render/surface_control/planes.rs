@@ -747,7 +747,10 @@ impl Planes {
     /// # Errors
     /// [`RenderError`] when a promoted layer's buffer a plane cannot show,
     /// or a refresh names a plane that is not showing.
-    fn refresh(&mut self, frames: &[crate::render::planes::Plane<'_>]) -> Result<(), RenderError> {
+    fn refresh<'a>(
+        &mut self,
+        frames: impl Iterator<Item = crate::render::planes::Plane<'a>>,
+    ) -> Result<(), RenderError> {
         self.collect_releases();
         // Validate every update and build the transaction before any
         // bookkeeping moves (as `present` does through `stack`): an error
@@ -871,7 +874,10 @@ impl SystemPlanes for Planes {
         self.present(composition)
     }
 
-    fn refresh(&mut self, frames: &[crate::render::planes::Plane<'_>]) -> Result<(), RenderError> {
+    fn refresh<'a>(
+        &mut self,
+        frames: impl Iterator<Item = crate::render::planes::Plane<'a>>,
+    ) -> Result<(), RenderError> {
         Self::refresh(self, frames)
     }
 

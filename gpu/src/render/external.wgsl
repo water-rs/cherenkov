@@ -139,6 +139,9 @@ fn fs_external(in: VsOut) -> @location(0) vec4<f32> {
     cov *= clip_mask_coverage(in);
     cov = clamp(cov, 0.0, 1.0) * in.params.y;
 
+    // `in.local` is centred on the quad, which spans the frame's pixels:
+    // the frame's pixel coordinate is offset by half its size.
+    let px = in.local + params.dims.xy * 0.5;
     var color: vec4<f32>;
     switch params.info.x {
         case KIND_EXT_NV12, KIND_EXT_P010: {
@@ -146,9 +149,9 @@ fn fs_external(in: VsOut) -> @location(0) vec4<f32> {
             // offset subsampled coordinate: chroma texel j centres at
             // frame position 2j + 0.5 + s, so texel space is
             // `p / 2 + 0.25 - s / 2`.
-            let y4 = ext_texel_u32(ext_y, in.local, params.dims.xy);
+            let y4 = ext_texel_u32(ext_y, px, params.dims.xy);
             let c4 = ext_texel_u32(ext_uv,
-                in.local * 0.5 + vec2<f32>(0.25) - params.site.xy * 0.5,
+                px * 0.5 + vec2<f32>(0.25) - params.site.xy * 0.5,
                 params.dims.zw);
             var shift = 1.0;
             if (params.info.w & EXT_FLAG_SHIFT6) != 0u {
@@ -166,7 +169,7 @@ fn fs_external(in: VsOut) -> @location(0) vec4<f32> {
         }
         default: {
             // KIND_EXT_RGB.
-            var c = ext_texel_f32(ext_rgb, in.local, params.dims.xy);
+            var c = ext_texel_f32(ext_rgb, px, params.dims.xy);
             let alpha = select(c.a, 1.0, params.info.z == EXT_ALPHA_OPAQUE);
             var lin = ext_decode(c.rgb, params.info.y);
             lin = ext_hlg(lin);

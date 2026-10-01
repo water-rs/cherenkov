@@ -215,12 +215,21 @@ jobs:
           cp -R scenes/perf/map out/map-only/map
           RUST_LOG=info,cherenkov_gpu=debug ./target/release/cherenkov-bench measure \
             --engine cherenkov --corpus out/map-only --frames 20 --warmup 5 --out out/measure-metal
+      # #218: the oracle's f64 reference depends only on the scene, so the
+      # six passes below share one parallel render instead of each
+      # recomputing it; `render --reference` verifies the scene inputs
+      # still match the cached file.
+      - name: Render the corpus reference
+        run: |
+          ./target/release/cherenkov-bench reference \
+            --corpus scenes/corpus --out-dir out/reference
       - name: Render the corpus on Metal adapters
         run: |
           set -euo pipefail
           for engine in skia-metal vello-classic vello-hybrid; do
             ./target/release/cherenkov-bench render --engine "$engine" \
-              --corpus scenes/corpus --out-dir "out/$engine"
+              --corpus scenes/corpus --out-dir "out/$engine" \
+              --reference out/reference
           done
           python3 - <<'PY'
           import glob, json
@@ -244,7 +253,8 @@ jobs:
           set -euo pipefail
           for kind in srgb-hw srgb-shader linear-p3; do
             ./target/release/cherenkov-bench render --engine cherenkov \
-              --present "$kind" --corpus scenes/corpus --out-dir "out/present-$kind"
+              --present "$kind" --corpus scenes/corpus \
+              --out-dir "out/present-$kind" --reference out/reference
           done
           python3 - <<'PY'
           import glob, json

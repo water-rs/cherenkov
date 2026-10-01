@@ -45,6 +45,7 @@ pub mod memory;
 pub mod motion;
 #[cfg(feature = "cherenkov")]
 pub mod present_cost;
+pub mod refcache;
 pub mod report;
 #[cfg(any(feature = "cherenkov", feature = "cherenkov-cpu"))]
 pub mod timing;
@@ -274,6 +275,13 @@ pub struct Submit {
     /// Render-thread CPU timings for Cherenkov GPU; `None` when the adapter
     /// does not expose phase timings.
     pub phases: Option<Phases>,
+    /// Wall-clock seconds this call spent rasterizing before any readback
+    /// began (queue drains and timestamp markers included), where the
+    /// adapter separates the two stages; `None` otherwise.
+    pub render_seconds: Option<f64>,
+    /// Wall-clock seconds this call spent reading the pixels back;
+    /// `None` when `readback` was false.
+    pub readback_seconds: Option<f64>,
 }
 
 /// Resources an adapter needs to encode one scene.

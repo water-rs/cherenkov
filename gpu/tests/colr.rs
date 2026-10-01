@@ -1,6 +1,7 @@
 //! `COLRv1` glyphs render through the colour-glyph lowering: palette fills,
 //! clips and blend groups, not the foreground paint alone.
 
+use cherenkov::{__engine_test as split_test, __engine_wait as wait};
 use cherenkov::{Draw, Glyph, GlyphRun, WorkingColor};
 use cherenkov::{Engine, EngineError, FontSource, Offscreen, OffscreenFormat};
 use cherenkov_gpu::{Gpu, GpuConfig};
@@ -42,26 +43,26 @@ fn run(font: cherenkov::FontId) -> GlyphRun {
     }
 }
 
-#[test]
+split_test! {
 fn colr_glyphs_render_their_paint_graph() -> Result<(), Box<dyn std::error::Error>> {
     let Ok(bytes) = std::fs::read(FONT_PATH) else {
         eprintln!("text-colr font not checked out; skipping");
         return Ok(());
     };
-    let engine = match Engine::<Gpu>::new(GpuConfig::default()) {
+    let engine = match wait!(Engine::<Gpu>::new(GpuConfig::default())) {
         Ok(engine) => engine,
         Err(EngineError::Backend(_)) => return Ok(()),
         Err(e) => return Err(e.into()),
     };
     let font = engine.font(FontSource::bytes(bytes))?;
-    let surface = engine.surface(Offscreen::new((320, 160), OffscreenFormat::LinearF16))?;
+    let surface = wait!(engine.surface(Offscreen::new((320, 160), OffscreenFormat::LinearF16)))?;
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|c| {
             c.glyphs(run(font.id()), WorkingColor::new([1.0, 0.0, 0.0, 1.0]));
         }));
     });
-    engine.render(cherenkov::FrameTime::now())?;
-    let rb = surface.readback()?;
+    wait!(engine.render(cherenkov::FrameTime::now()))?;
+    let rb = wait!(surface.readback())?;
     // Count distinct hues: quantize each non-clear pixel's chroma angle.
     let mut hues = std::collections::HashSet::new();
     let mut coloured = 0usize;
@@ -90,4 +91,5 @@ fn colr_glyphs_render_their_paint_graph() -> Result<(), Box<dyn std::error::Erro
         "COLR glyph should use palette colours, not the run paint: hues {hues:?}"
     );
     Ok(())
+}
 }

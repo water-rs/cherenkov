@@ -659,6 +659,29 @@ impl crate::interop::SharedDevice {
     clippy::future_not_send,
     reason = "the browser engine is single-threaded and its futures run on the page's event loop"
 )]
+impl crate::interop::SharedDevice {
+    /// As the native [`SharedDevice::create`](Self::create), awaited on
+    /// wasm32 so the JS thread is not blocked.
+    ///
+    /// # Errors
+    /// [`EngineError`] when no adapter allows the target format or device
+    /// creation fails.
+    pub async fn create(config: &GpuConfig) -> Result<Self, EngineError> {
+        let (instance, adapter, device, queue) = create_device(config).await?;
+        Ok(Self {
+            instance,
+            adapter,
+            device,
+            queue,
+        })
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[expect(
+    clippy::future_not_send,
+    reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+)]
 async fn create_device(
     config: &GpuConfig,
 ) -> Result<(wgpu::Instance, wgpu::Adapter, wgpu::Device, wgpu::Queue), EngineError> {

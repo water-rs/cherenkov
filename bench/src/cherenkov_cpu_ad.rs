@@ -1489,6 +1489,7 @@ impl Engine for Cherenkov {
                 "cherenkov: submit before prepare".into(),
             ));
         }
+        let render_at = std::time::Instant::now();
         self.timings.render_frame(
             &self.engine,
             &mut self.clock,
@@ -1496,6 +1497,8 @@ impl Engine for Cherenkov {
             readback && self.has_motion,
             render_error,
         )?;
+        let render_seconds = render_at.elapsed().as_secs_f64();
+        let readback_at = std::time::Instant::now();
         let image = if readback {
             let rb = self
                 .surface
@@ -1546,6 +1549,8 @@ impl Engine for Cherenkov {
             image,
             gpu: Vec::new(),
             phases: None,
+            render_seconds: Some(render_seconds),
+            readback_seconds: readback.then(|| readback_at.elapsed().as_secs_f64()),
         })
     }
 

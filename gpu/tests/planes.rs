@@ -582,6 +582,13 @@ mod macos {
         fn render(&self) {
             self.engine.render(FrameTime::now()).expect("rendered");
             settle(&self.host());
+            // A layer promotes only once its display layer has been born
+            // on the main queue: the frame that first names its
+            // candidate composites it in-engine while the attach drains,
+            // and the next frame promotes it — the frames a window keeps
+            // producing.
+            self.engine.render(FrameTime::now()).expect("rendered");
+            settle(&self.host());
         }
     }
 

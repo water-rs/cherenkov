@@ -650,6 +650,41 @@ pub trait SystemPlanes: Compositor {
     /// A [`RenderError`] naming the cause when the system rejects a plane.
     fn refresh<'a>(&mut self, frames: impl Iterator<Item = Plane<'a>>) -> Result<(), RenderError>;
 
+    /// Queues whatever realization a candidate still needs — a display
+    /// layer another thread must create — and notes when one first
+    /// becomes able to show a frame, without materializing a set. Runs at
+    /// render admission for every promotion-capable surface, dirty or
+    /// not, so a deferred realization that completes between renders is
+    /// seen on the next one.
+    fn groom(&mut self, candidates: &FxHashMap<LayerId, (u32, u32)>) {
+        let _ = candidates;
+    }
+
+    /// Whether the last [`SystemPlanes::groom`] found a newly ready
+    /// candidate the plan has not been offered: the renderer re-lowers
+    /// the surface so the plan can promote it. `false` for synchronous
+    /// realizations, which offer every candidate at once.
+    fn wants_plan(&self) -> bool {
+        false
+    }
+
+    /// `groom` plus the subset of `candidates` that can show a frame now,
+    /// filled into `ready`, which the caller keeps between calls so a
+    /// prepare allocates nothing steady-state. A platform that realizes
+    /// a plane asynchronously reports a candidate ready only once its
+    /// realization has completed; until then the layer keeps compositing
+    /// in-engine. The default reports every candidate, which suits
+    /// synchronous realizations.
+    fn prepare(
+        &mut self,
+        candidates: &FxHashMap<LayerId, (u32, u32)>,
+        ready: &mut FxHashSet<LayerId>,
+    ) {
+        self.groom(candidates);
+        ready.clear();
+        ready.extend(candidates.keys().copied());
+    }
+
     /// The surface was resized to `size` device pixels.
     fn resize(&mut self, size: (u32, u32));
 

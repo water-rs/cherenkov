@@ -595,6 +595,10 @@ pub struct GpuRenderer {
     plan_scratch: planes::PlanScratch,
     /// The candidate map each promotion check or plan fills and reuses.
     candidates: FxHashMap<LayerId, (u32, u32)>,
+    /// The per-surface ready-candidate sets `ready_planes` fills for the
+    /// frame's lowered batch — kept between renders so a plane prepare
+    /// allocates nothing steady-state.
+    ready_sets: Vec<FxHashSet<LayerId>>,
     /// How the fixed modules reach this device (`shaders.rs`): SPIR-V,
     /// metallib, or WGSL — decided once at init by the adapter backend.
     shader_delivery: shaders::ShaderDelivery,
@@ -1951,6 +1955,7 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             plane_only: Vec::new(),
             plan_scratch: planes::PlanScratch::default(),
             candidates: FxHashMap::default(),
+            ready_sets: Vec::new(),
             shader_delivery,
             shaders: paint::Registry::default(),
             backdrop_shaders: FxHashMap::default(),
@@ -2256,6 +2261,7 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
         plane_only: Vec::new(),
         plan_scratch: planes::PlanScratch::default(),
         candidates: FxHashMap::default(),
+        ready_sets: Vec::new(),
         shader_delivery,
         shaders: paint::Registry::default(),
         backdrop_shaders: FxHashMap::default(),
@@ -3407,6 +3413,30 @@ impl GpuRenderer {
             .iter()
             .filter(|sf| sf.changed || self.wants_redraw(&self.surfaces[&sf.id]))
             .collect();
+        // A candidate whose display layer was born since the surface's
+        // last plan can now promote: `prepare` notices the completed
+        // attach and `wants_plan` says the surface must re-plan.
+        for sf in frame.surfaces.iter() {
+            if dirty.iter().any(|seen| seen.id == sf.id) {
+                continue;
+            }
+            let Some(surface) = self.surfaces.get(&sf.id) else {
+                continue;
+            };
+            if !surface.promotes {
+                continue;
+            }
+            let Some(system) = self.planes.get_mut(&sf.id) else {
+                continue;
+            };
+            planes::SystemPlanes::groom(
+                system,
+                plane_candidates(surface, &mut self.candidates),
+            );
+            if planes::SystemPlanes::wants_plan(system) {
+                dirty.push(sf);
+            }
+        }
         // A surface whose only change is new external frames on layers
         // its committed plan promotes presents them through the planes
         // alone — no lowering, no draws, no part blit (#90). Any other
@@ -3549,6 +3579,30 @@ impl GpuRenderer {
             .iter()
             .filter(|sf| sf.changed || self.wants_redraw(&self.surfaces[&sf.id]))
             .collect();
+        // A candidate whose display layer was born since the surface's
+        // last plan can now promote: `prepare` notices the completed
+        // attach and `wants_plan` says the surface must re-plan.
+        for sf in frame.surfaces.iter() {
+            if dirty.iter().any(|seen| seen.id == sf.id) {
+                continue;
+            }
+            let Some(surface) = self.surfaces.get(&sf.id) else {
+                continue;
+            };
+            if !surface.promotes {
+                continue;
+            }
+            let Some(system) = self.planes.get_mut(&sf.id) else {
+                continue;
+            };
+            planes::SystemPlanes::groom(
+                system,
+                plane_candidates(surface, &mut self.candidates),
+            );
+            if planes::SystemPlanes::wants_plan(system) {
+                dirty.push(sf);
+            }
+        }
         // A surface whose only change is new external frames on layers
         // its committed plan promotes presents them through the planes
         // alone — no lowering, no draws, no part blit (#90). Any other
@@ -4616,6 +4670,7 @@ impl GpuRenderer {
                 .map(|surf| surf.backdrop_info(&mut self.filters))
                 .collect();
             let mut results: Vec<Result<Lowered, RenderError>> = if pending.len() > 1 {
+                self.ready_planes(frames, pending);
                 let (atlas, images, bitmaps) = (&self.atlas, &self.images, &self.bitmaps);
                 // `FontData`'s COLR cache is a `RefCell` — !Sync — so
                 // each worker moves in its own snapshot built here.
@@ -4633,8 +4688,8 @@ impl GpuRenderer {
                         .iter_mut()
                         .zip(snapshots)
                         .zip(frames)
-                        .zip(group_maps.iter().zip(inputs))
-                        .map(|(((surf, fonts), frame), (groups, inputs))| {
+                        .zip(group_maps.iter().zip(inputs).zip(self.ready_sets.iter()))
+                        .map(|(((surf, fonts), frame), ((groups, inputs), ready))| {
                             s.spawn(move || {
                                 Self::lower_content(
                                     surf,
@@ -4647,6 +4702,7 @@ impl GpuRenderer {
                                     },
                                     groups,
                                     inputs,
+                                    ready,
                                 )
                             })
                         })
@@ -4656,11 +4712,12 @@ impl GpuRenderer {
                         .collect()
                 })
             } else {
+                self.ready_planes(frames, pending);
                 pending
                     .iter_mut()
                     .zip(frames)
-                    .zip(group_maps.iter().zip(inputs))
-                    .map(|((surf, frame), (groups, inputs))| {
+                    .zip(group_maps.iter().zip(inputs).zip(self.ready_sets.iter()))
+                    .map(|((surf, frame), ((groups, inputs), ready))| {
                         Self::lower_content(
                             surf,
                             frame,
@@ -4672,6 +4729,7 @@ impl GpuRenderer {
                             },
                             groups,
                             inputs,
+                            ready,
                         )
                     })
                     .collect()
@@ -4718,11 +4776,12 @@ impl GpuRenderer {
                 .iter()
                 .map(|surf| surf.backdrop_info(&mut self.filters))
                 .collect();
+            self.ready_planes(frames, pending);
             let mut results: Vec<Result<Lowered, RenderError>> = pending
                 .iter_mut()
                 .zip(frames)
-                .zip(group_maps.iter().zip(inputs))
-                .map(|((surf, frame), (groups, inputs))| {
+                .zip(group_maps.iter().zip(inputs).zip(self.ready_sets.iter()))
+                .map(|((surf, frame), ((groups, inputs), ready))| {
                     Self::lower_content(
                         surf,
                         frame,
@@ -4734,6 +4793,7 @@ impl GpuRenderer {
                         },
                         groups,
                         inputs,
+                        ready,
                     )
                 })
                 .collect();
@@ -4816,17 +4876,47 @@ impl GpuRenderer {
     }
 
     #[inline(never)]
+    /// Per-surface the candidates whose plane can show a frame now,
+    /// filled into `self.ready_sets` (kept between renders, so the sets
+    /// allocate nothing steady-state): `SystemPlanes::prepare` queues
+    /// each new candidate's realization and reports it ready once done;
+    /// a candidate it does not report keeps compositing in-engine this
+    /// frame.
+    fn ready_planes(&mut self, frames: &[&SurfaceFrame<'_>], pending: &[SurfaceState]) {
+        let mut i = 0;
+        for (sf, surf) in frames.iter().zip(pending.iter()) {
+            if self.ready_sets.len() == i {
+                self.ready_sets.push(FxHashSet::default());
+            }
+            let candidates = plane_candidates(surf, &mut self.candidates);
+            match self.planes.get_mut(&sf.id) {
+                Some(system) => {
+                    planes::SystemPlanes::prepare(system, candidates, &mut self.ready_sets[i])
+                }
+                None => {
+                    let ready = &mut self.ready_sets[i];
+                    ready.clear();
+                    ready.extend(candidates.keys().copied());
+                }
+            }
+            i += 1;
+        }
+    }
+
     fn lower_content(
         surf: &mut SurfaceState,
         frame: &SurfaceFrame<'_>,
         resources: GlyphResources<'_>,
         groups: &FxHashMap<u64, BackdropGroupInfo>,
         inputs: &projective::Inputs,
+        ready: &FxHashSet<LayerId>,
     ) -> Result<Lowered, RenderError> {
         surf.frame.reset();
         let mut candidates = FxHashMap::default();
         surf.plan = if surf.promotes {
-            planes::plan::<planes::Platform>(frame.tree, plane_candidates(surf, &mut candidates))
+            plane_candidates(surf, &mut candidates);
+            candidates.retain(|layer, _| ready.contains(layer));
+            planes::plan::<planes::Platform>(frame.tree, &candidates)
         } else {
             planes::Plan::default()
         };

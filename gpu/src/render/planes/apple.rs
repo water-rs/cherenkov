@@ -28,10 +28,12 @@
 //! and planes change on screen together.
 
 use std::ptr::NonNull;
+use std::sync::{Arc, Mutex};
 
 use kurbo::{Affine, Rect, Vec2};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
+use rustc_hash::{FxHashMap, FxHashSet};
 use objc2_av_foundation::{
     AVLayerVideoGravityResize, AVQueuedSampleBufferRendering, AVQueuedSampleBufferRenderingStatus,
     AVSampleBufferDisplayLayer, AVSampleBufferVideoRenderer,
@@ -172,8 +174,9 @@ struct PlaneLayers {
     /// The pixel-space root of the plane.
     top: Retained<CALayer>,
     levels: Vec<LevelLayers>,
-    display: Retained<AVSampleBufferDisplayLayer>,
-    renderer: Retained<AVSampleBufferVideoRenderer>,
+    /// The display layer and renderer once the main queue has created
+    /// them, and what they owe the plane until then.
+    link: Arc<Mutex<DisplayLink>>,
     /// The generation of the frame last handed to the display layer.
     generation: Option<u64>,
     /// The size of the frame last handed to the display layer.
@@ -214,6 +217,21 @@ pub struct LayerPlanes {
     scale: f64,
     parts: Vec<PartLayer>,
     planes: Vec<PlaneLayers>,
+    /// Candidates whose display layer is being born on the main queue:
+    /// a layer promotes only once its link's `display` exists, so until
+    /// the queued attach runs it keeps compositing in-engine. Entries
+    /// are consumed by `compose`'s `plane_layers` at promotion.
+    pending: FxHashMap<LayerId, Arc<Mutex<DisplayLink>>>,
+    /// Detached layer the pending displays attach to while they are
+    /// born: never added to the tree, so a candidate's not-yet-promoted
+    /// layer composites nothing.
+    staging: Retained<CALayer>,
+    /// Candidates the last `prepare` reported ready: a candidate newly
+    /// ready since then sets `woke`, which `wants_plan` answers once so
+    /// the surface re-plans and promotes it. A candidate the plan then
+    /// rejects stays in `offered` — it does not re-wake every frame.
+    offered: FxHashSet<LayerId>,
+    woke: bool,
     /// Set when parts or planes were added or removed, so the root's
     /// sublayer order is rebuilt.
     restack: bool,
@@ -227,6 +245,113 @@ fn anchored() -> Retained<CALayer> {
     layer.setPosition(CGPoint::new(0.0, 0.0));
     layer.setBounds(CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(0.0, 0.0)));
     layer
+}
+
+/// What the display layer's deferred creation owes its plane.
+///
+/// An `AVSampleBufferDisplayLayer` binds its video queue on the thread
+/// it is created on; created off the main thread that binding can
+/// complete only after the first `enqueueSampleBuffer`, which the queue
+/// then drops without an error. Plane construction runs on the render
+/// thread, so the layer is born on the main queue, where the binding is
+/// up before the first enqueue — asynchronously, since the render
+/// thread may not wait on the UI thread's run loop. Until the link is
+/// up the layer's geometry and newest frame are held here and applied
+/// at attach; the renderer afterwards serves `show()` directly. `dead`
+/// retires a queued attach when the layer is demoted or the surface
+/// torn down before the block ran.
+#[derive(Default)]
+struct DisplayLink {
+    display: Option<Retained<AVSampleBufferDisplayLayer>>,
+    renderer: Option<Retained<AVSampleBufferVideoRenderer>>,
+    bounds: Option<CGRect>,
+    opacity: Option<f32>,
+    sample: Option<CFRetained<CMSampleBuffer>>,
+    dead: bool,
+}
+
+// SAFETY: the objects are touched only under the mutex: the render
+// thread fills the geometry and sample slots, the main queue fills the
+// layer and renderer and drains the sample.
+#[expect(
+    clippy::non_send_fields_in_send_ty,
+    reason = "every field is touched only while the mutex is held"
+)]
+unsafe impl Send for DisplayLink {}
+
+/// Creates a plane's display layer on the main queue and attaches it,
+/// draining the geometry and frame the render thread left in `link`.
+struct DisplayAttach {
+    parent: Retained<CALayer>,
+    link: Arc<Mutex<DisplayLink>>,
+}
+
+// SAFETY: the parent is touched only on the main queue, inside an
+// explicit transaction, where layer mutation is safe; the link is
+// mutex-guarded.
+#[expect(
+    clippy::non_send_fields_in_send_ty,
+    reason = "the layer is touched only on the main queue"
+)]
+unsafe impl Send for DisplayAttach {}
+
+impl DisplayAttach {
+    /// Runs `attach` on the main queue. A display layer created off the
+    /// main thread silently drops its first enqueue — measured on
+    /// paravirtual Metal, 1/30 frames landed when the layer was created
+    /// on a background thread vs 30/30 when created on main — so the
+    /// render thread queues the create+attach rather than waiting on
+    /// the UI thread's run loop, which it must never block on.
+    fn run(self) {
+        if objc2::MainThreadMarker::new().is_some() {
+            self.attach();
+        } else {
+            dispatch2::DispatchQueue::main().exec_async(move || self.attach());
+        }
+    }
+
+    fn attach(self) {
+        let mut link = self.link.lock().expect("link poisoned");
+        if link.dead {
+            // The layer was demoted or the surface torn down while this
+            // block was queued: change nothing.
+            return;
+        }
+        // SAFETY: a new display layer, owned by the plane's tree.
+        let display = unsafe { AVSampleBufferDisplayLayer::new() };
+        display.setAnchorPoint(CGPoint::new(0.0, 0.0));
+        display.setPosition(CGPoint::new(0.0, 0.0));
+        unsafe {
+            display.setVideoGravity(AVLayerVideoGravityResize.expect("AVLayerVideoGravityResize"));
+            // Display sleep is the player's policy, not the compositor's.
+            display.setPreventsDisplaySleepDuringVideoPlayback(false);
+        }
+        {
+            let _tx = Transaction::begin();
+            if let Some(bounds) = link.bounds {
+                display.setBounds(bounds);
+            }
+            if let Some(opacity) = link.opacity {
+                display.setOpacity(opacity);
+            }
+            self.parent.addSublayer(&display);
+        }
+        // The commit above attached the layer; a display layer lays out
+        // its video sublayer correctly only on the main thread (the
+        // `MainLayout` race), and this block is already there.
+        display.setNeedsLayout();
+        display.layoutIfNeeded();
+        // SAFETY: the display layer's own renderer.
+        let renderer = unsafe { display.sampleBufferRenderer() };
+        if let Some(sample) = link.sample.take() {
+            // SAFETY: a display layer's renderer is fed from an
+            // arbitrary queue (its `requestMediaDataWhenReady`
+            // contract).
+            unsafe { renderer.enqueueSampleBuffer(&sample) };
+        }
+        link.display = Some(display);
+        link.renderer = Some(renderer);
+    }
 }
 
 const fn cg_affine(t: Affine) -> CGAffineTransform {
@@ -614,6 +739,10 @@ impl LayerPlanes {
             scale,
             parts: Vec::new(),
             planes: Vec::new(),
+            pending: FxHashMap::default(),
+            staging: CALayer::new(),
+            offered: FxHashSet::default(),
+            woke: false,
             restack: true,
         };
         planes.geometry();
@@ -688,7 +817,27 @@ impl LayerPlanes {
     }
 
     /// Builds the layers for `placement`.
-    fn plane_layers(&self, placement: &Placement) -> PlaneLayers {
+    /// `layer` can show a frame now: a committed plane already shows it,
+    /// or its pending link's display exists — the queued main-queue
+    /// attach has run.
+    fn born(&self, layer: LayerId) -> bool {
+        self.planes.iter().any(|plane| plane.layer == layer)
+            || self
+                .pending
+                .get(&layer)
+                .is_some_and(|link| link.lock().expect("link poisoned").display.is_some())
+    }
+
+    /// Builds the plane's level chain for `placement` and reparents the
+    /// display layer `link` carries — born and staged under `root` by
+    /// [`SystemPlanes::prepare`], or taken over from the plane it
+    /// replaces — under the chain's inner level inside this transaction,
+    /// which is safe from any thread.
+    fn plane_layers(
+        &self,
+        placement: &Placement,
+        link: Arc<Mutex<DisplayLink>>,
+    ) -> PlaneLayers {
         let top = anchored();
         top.setAffineTransform(cg_affine(Affine::scale(1.0 / self.scale)));
         let mut outer: Retained<CALayer> = top.clone();
@@ -706,28 +855,18 @@ impl LayerPlanes {
             outer = scroll.clone();
             levels.push(LevelLayers { node, clip, scroll });
         }
-        // SAFETY: a new display layer, owned by this tree.
-        let display = unsafe { AVSampleBufferDisplayLayer::new() };
-        display.setAnchorPoint(CGPoint::new(0.0, 0.0));
-        display.setPosition(CGPoint::new(0.0, 0.0));
-        unsafe {
-            display.setVideoGravity(AVLayerVideoGravityResize.expect("AVLayerVideoGravityResize"));
-            // Display sleep is the player's policy, not the compositor's.
-            display.setPreventsDisplaySleepDuringVideoPlayback(false);
+        if let Some(display) = &link.lock().expect("link poisoned").display {
+            levels
+                .last()
+                .map_or(&*top, LevelLayers::inner)
+                .addSublayer(display);
         }
-        levels
-            .last()
-            .map_or(&*top, LevelLayers::inner)
-            .addSublayer(&display);
-        // SAFETY: the display layer's own renderer.
-        let renderer = unsafe { display.sampleBufferRenderer() };
         PlaneLayers {
             layer: placement.layer,
             shape: shape(placement),
             top,
             levels,
-            display,
-            renderer,
+            link,
             generation: None,
             shown: None,
         }
@@ -744,15 +883,33 @@ impl LayerPlanes {
     fn show(plane: &PlaneLayers, frame: &ExternalFrame, resized: bool) -> Result<(), RenderError> {
         let buffer = pixel_buffer(frame)?;
         let sample = sample_buffer(&buffer)?;
-        let layout = resized.then(|| MainLayout(plane.display.clone()));
-        let renderer = plane.renderer.clone();
+        let mut link = plane.link.lock().expect("link poisoned");
+        let Some(renderer) = link.renderer.clone() else {
+            // The layer is still being born on the main queue; the
+            // attach hands it the latest frame.
+            link.sample = Some(sample);
+            return Ok(());
+        };
+        drop(link);
+        let layout = if resized {
+            plane
+                .link
+                .lock()
+                .expect("link poisoned")
+                .display
+                .clone()
+                .map(MainLayout)
+        } else {
+            None
+        };
+        let enqueue_renderer = renderer.clone();
         let enqueue = move || {
             {
                 let _tx = Transaction::begin();
                 // SAFETY: a display layer's renderer is fed from an arbitrary
                 // queue (its `requestMediaDataWhenReady` contract); the
                 // sample buffer stays retained here.
-                unsafe { renderer.enqueueSampleBuffer(&sample) };
+                unsafe { enqueue_renderer.enqueueSampleBuffer(&sample) };
             }
             if let Some(layout) = layout {
                 layout.queue();
@@ -779,8 +936,8 @@ impl LayerPlanes {
             }
         }
         // SAFETY: reading the renderer's status.
-        if unsafe { plane.renderer.status() } == AVQueuedSampleBufferRenderingStatus::Failed {
-            let reason = unsafe { plane.renderer.error() }.map_or_else(
+        if unsafe { renderer.status() } == AVQueuedSampleBufferRenderingStatus::Failed {
+            let reason = unsafe { renderer.error() }.map_or_else(
                 || "no error reported".to_owned(),
                 |e| e.localizedDescription().to_string(),
             );
@@ -898,7 +1055,18 @@ impl SystemPlanes for LayerPlanes {
                 built.layer == plane.placement.layer && built.shape == shape(plane.placement)
             });
             if !fits {
-                let built = self.plane_layers(plane.placement);
+                // A re-placed plane keeps its born display layer; a new
+                // one takes over the link `prepare` staged for its
+                // candidate — its display is attached by definition,
+                // since `prepare` admits only born layers.
+                let link = self
+                    .planes
+                    .get(i)
+                    .filter(|old| old.layer == plane.placement.layer)
+                    .map(|old| Arc::clone(&old.link))
+                    .or_else(|| self.pending.remove(&plane.placement.layer))
+                    .expect("a promoted candidate's display layer is born");
+                let built = self.plane_layers(plane.placement, link);
                 if i < self.planes.len() {
                     let old = std::mem::replace(&mut self.planes[i], built);
                     old.top.removeFromSuperlayer();
@@ -920,11 +1088,18 @@ impl SystemPlanes for LayerPlanes {
                 place(level, layers);
             }
             let (w, h) = plane.placement.size;
-            built.display.setBounds(CGRect::new(
+            let bounds = CGRect::new(
                 CGPoint::new(0.0, 0.0),
                 CGSize::new(f64::from(w), f64::from(h)),
-            ));
-            built.display.setOpacity(plane.placement.opacity);
+            );
+            let mut link = built.link.lock().expect("link poisoned");
+            link.bounds = Some(bounds);
+            link.opacity = Some(plane.placement.opacity);
+            if let Some(display) = &link.display {
+                display.setBounds(bounds);
+                display.setOpacity(plane.placement.opacity);
+            }
+            drop(link);
         }
         let mut presented = true;
         for (part, target) in c.parts.iter().zip(&self.parts) {
@@ -950,6 +1125,62 @@ impl SystemPlanes for LayerPlanes {
             }
         }
         Ok(presented)
+    }
+
+
+    fn groom(&mut self, candidates: &FxHashMap<LayerId, (u32, u32)>) {
+        // A candidate that left the eligible set before its attach ran is
+        // dead: the queued block sees `dead` and changes nothing.
+        self.pending.retain(|layer, link| {
+            let keep = candidates.contains_key(layer);
+            if !keep {
+                link.lock().expect("link poisoned").dead = true;
+            }
+            keep
+        });
+        for &layer in candidates.keys() {
+            if self.born(layer) || self.pending.contains_key(&layer) {
+                continue;
+            }
+            let link = Arc::new(Mutex::new(DisplayLink::default()));
+            DisplayAttach {
+                parent: self.staging.clone(),
+                link: Arc::clone(&link),
+            }
+            .run();
+            self.pending.insert(layer, link);
+        }
+        self.offered.retain(|layer| candidates.contains_key(layer));
+        self.woke = false;
+        for &layer in candidates.keys() {
+            if self.born(layer) {
+                if !self.offered.contains(&layer) {
+                    self.woke = true;
+                    self.offered.insert(layer);
+                }
+            } else {
+                self.offered.remove(&layer);
+            }
+        }
+    }
+
+    fn wants_plan(&self) -> bool {
+        self.woke
+    }
+
+    fn prepare(
+        &mut self,
+        candidates: &FxHashMap<LayerId, (u32, u32)>,
+        ready: &mut FxHashSet<LayerId>,
+    ) {
+        self.groom(candidates);
+        ready.clear();
+        ready.extend(
+            candidates
+                .keys()
+                .copied()
+                .filter(|layer| self.born(*layer)),
+        );
     }
 
     /// Hands each promoted layer's new frame to its display layer: the
@@ -1005,6 +1236,11 @@ impl SystemPlanes for LayerPlanes {
 
 impl Drop for LayerPlanes {
     fn drop(&mut self) {
+        // A queued attach that has not run sees `dead` and changes
+        // nothing beyond releasing its link.
+        for (_, link) in self.pending.drain() {
+            link.lock().expect("link poisoned").dead = true;
+        }
         let _tx = Transaction::begin();
         self.root.removeFromSuperlayer();
     }

@@ -1559,10 +1559,16 @@ impl Engine for Cherenkov {
         } else {
             None
         };
+        let phases = self.engine.stats().phases;
         Ok(Submit {
             image,
             gpu: Vec::new(),
-            phases: None,
+            phases: Some(crate::Phases {
+                lower: phases.lower_seconds,
+                encode: phases.encode_seconds,
+                stamp: phases.stamp_seconds,
+                wait: phases.wait_seconds,
+            }),
             render_seconds: Some(render_seconds),
             readback_seconds: readback.then(|| readback_at.elapsed().as_secs_f64()),
         })

@@ -125,3 +125,13 @@ identical affinity and frame counts:
 Use the ICD path and allowed CPU set reported by the measurement host. Alternate
 before/after runs to expose host variation. Compare `encode` and `submit`
 separately: only `submit` contains the render-thread lowering being optimized.
+
+## CPU phase measurements
+
+For `cherenkov-cpu`, the `lower` phase includes device realization and glyph
+preparation; the `encode` phase measures band shading through the final f32 or
+f16 output stores. CPU rendering is synchronous: `encode_seconds +
+submit_seconds` in each frame sample measures the complete adapter frame,
+including front-end recording and render-thread synchronization. Readback is
+excluded from `measure`. Pin workers with `RAYON_NUM_THREADS` and, on Android,
+pin the inherited CPU affinity with `measure --cpu`.

@@ -6077,7 +6077,6 @@ fn run() -> Result<(), SceneError> {
 
     projective_scenes(&mut corpus, &mut ctx);
 
-
     // ---- Stress scenes -----------------------------------------------------
 
     // Issue #210: the merged single-path dense map that drove

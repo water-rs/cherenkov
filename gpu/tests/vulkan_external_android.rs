@@ -17,6 +17,7 @@
 #![cfg(target_os = "android")]
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use ash::vk;
@@ -254,14 +255,22 @@ fn make_ahb_nv12(
 /// the frame's fence payload. `delay_ms` > 0 inserts a host-signalled
 /// timeline semaphore ahead of the binary signal, so the fence completes
 /// only once the delayed host signal lands — all on the GPU.
+///
+/// The spec requires the semaphore to have a *pending* signal — a signal
+/// submitted to a queue — before `SYNC_FD` export transplants it into the
+/// fence; exporting a never-submitted semaphore is invalid use and the
+/// Mali driver answers `ERROR_OUT_OF_HOST_MEMORY`. `fire` therefore
+/// submits first and exports after.
 struct ProducerFence {
-    /// The sync-file fd the frame waits on.
-    fd: OwnedFd,
+    /// The sync-file fd the frame waits on, filled by `fire`.
+    fd: Mutex<Option<OwnedFd>>,
     /// The host-signalled timeline semaphore delaying the producer
     /// (kept alive until `fire`).
     timeline: vk::Semaphore,
     /// The binary semaphore the producer submit signals.
     binary: vk::Semaphore,
+    /// The `VK_KHR_external_semaphore_fd` device-level functions.
+    loader: ash::khr::external_semaphore_fd::Device,
     /// The device that owns both semaphores.
     dev: ash::Device,
 }
@@ -274,7 +283,7 @@ impl ProducerFence {
             .shared
             .vk
             .external_semaphore_fd
-            .as_ref()
+            .clone()
             .expect("sync-fd support checked at setup");
         let binary = unsafe { dev.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }
             .expect("binary semaphore");
@@ -287,25 +296,27 @@ impl ProducerFence {
             )
         }
         .expect("timeline semaphore");
-        let fd = unsafe {
-            loader.get_semaphore_fd(
-                &vk::SemaphoreGetFdInfoKHR::default()
-                    .semaphore(binary)
-                    .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD),
-            )
-        }
-        .expect("sync-fd export");
         Self {
-            fd: unsafe { OwnedFd::from_raw_fd(fd) },
+            fd: Mutex::new(None),
             timeline,
             binary,
+            loader,
             dev,
         }
+    }
+
+    /// The exported sync-file fd; `fire` must have run first.
+    fn fd(&self) -> OwnedFd {
+        let guard = self.fd.lock().expect("fence fd");
+        let fd = guard.as_ref().expect("fence exported by fire");
+        unsafe { OwnedFd::from_raw_fd(libc::dup(fd.as_raw_fd())) }
     }
 
     /// Schedules the producer's signal: a submit that waits on the
     /// host-signalled timeline and then signals the binary payload —
     /// the fence completes `delay_ms` from now, entirely on the GPU.
+    /// The `SYNC_FD` export runs after the submit so the semaphore has a
+    /// pending signal, as the spec requires.
     fn fire(&self, queue: vk::Queue, family: u32, delay_ms: u64) {
         let dev = self.dev.clone();
         let timeline = self.timeline;
@@ -360,6 +371,17 @@ impl ProducerFence {
             )
             .expect("producer submit");
             dev.destroy_command_pool(pool, None);
+            // The signal is pending now: the SYNC_FD export transplants it
+            // into the returned fence.
+            let fd = self
+                .loader
+                .get_semaphore_fd(
+                    &vk::SemaphoreGetFdInfoKHR::default()
+                        .semaphore(binary)
+                        .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD),
+                )
+                .expect("sync-fd export");
+            *self.fd.lock().expect("fence fd") = Some(OwnedFd::from_raw_fd(fd));
         }
     }
 }
@@ -510,17 +532,19 @@ fn producer_fence_and_delayed_signal_stay_on_gpu() {
     let (dev, queue, family) = raw(&shared);
     let _ = dev;
     let fence = ProducerFence::new(&device);
+    // The fence completes 200 ms from now — fired before the import so
+    // the SYNC_FD export finds a pending signal, but the fence itself is
+    // still unsigned when the engine consumes it below.
+    fence.fire(queue, family, 200);
     let buffer = make_ahb_rgb(16, 16, [0x20, 0x90, 0x30, 0xff]);
     let frame = device
         .import(FrameSource::Ahb(Box::new(vulkan::Ahb {
             buffer: buffer.cast(),
             // The real producer fence: a sync_file fd signalling on the
             // GPU once the producer's submit completes. The import takes
-            // ownership of the fd it is given, so the fence's own fd is
-            // duplicated — `fence.fire` still needs it below.
-            sync: Some(vulkan::Wait::SyncFd {
-                fd: unsafe { OwnedFd::from_raw_fd(libc::dup(fence.fd.as_raw_fd())) },
-            }),
+            // ownership of the fd it is given — `fence.fd()` returns a
+            // duplicate so the fence keeps its own reference.
+            sync: Some(vulkan::Wait::SyncFd { fd: fence.fd() }),
             release: Some(vulkan::ReleaseSync::Timeline {
                 semaphore: fence.timeline.as_raw(),
                 value: 2,
@@ -542,10 +566,8 @@ fn producer_fence_and_delayed_signal_stay_on_gpu() {
         tx[surface.root()].push(&layer);
         tx[&layer].content(handle);
     });
-    // The fence completes 200 ms from now — armed only after setup, so
-    // the consuming submission faces a genuinely unsigned fence and
-    // must return immediately; a CPU wait would block the whole delay.
-    fence.fire(queue, family, 200);
+    // The fence is still unsigned: the consuming submission must return
+    // immediately — a CPU wait would block for the whole delay.
     let start = Instant::now();
     assert!(matches!(engine.render(FrameTime::now()), Ok(Next::Idle)));
     assert!(

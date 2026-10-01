@@ -5427,14 +5427,13 @@ impl GpuRenderer {
 
     /// Submits a pending external-frame retirement even when nothing else
     /// is being drawn — an idle engine still releases the lease (#166).
+    /// Returns the release submission when one was made.
     #[cfg(all(unix, not(target_vendor = "apple")))]
-    fn flush_native_releases(&mut self) {
-        let Some(native) = self.native.as_mut() else {
-            return;
-        };
+    fn flush_native_releases(&mut self) -> Option<wgpu::SubmissionIndex> {
+        let native = self.native.as_mut()?;
         let releases = external::vulkan::drain_releases(native);
         if releases.is_empty() {
-            return;
+            return None;
         }
         let mut encoder = self
             .device
@@ -5450,7 +5449,7 @@ impl GpuRenderer {
                 }
             });
         }
-        {
+        let submission = {
             let _submit = self.submit_lock.lock().expect("submit guard");
             let hal_queue =
                 unsafe { self.queue.as_hal::<wgpu::hal::vulkan::Api>() }.expect("vulkan queue");
@@ -5459,8 +5458,8 @@ impl GpuRenderer {
                     hal_queue.add_signal_semaphore(semaphore, value);
                 }
             }
-            self.queue.submit([encoder.finish()]);
-        }
+            self.queue.submit([encoder.finish()])
+        };
         let shared = native.shared.clone();
         for release in &releases {
             // Same ordering as the frame submit path: export while the
@@ -5488,6 +5487,7 @@ impl GpuRenderer {
                 }
             });
         }
+        Some(submission)
     }
 
     /// Encodes the resolve only once the frame's samples are complete.
@@ -6027,5 +6027,30 @@ impl GpuRenderer {
                 .await?;
         }
         Ok(())
+    }
+}
+
+/// Engine teardown: surface drops retire the last frame leases into the
+/// device release queue, and a release only becomes safe to destroy once
+/// the release submission completes — `release.destroy` runs on the
+/// submission's completion callback, so shutdown submits the pending
+/// releases and joins the queue once. A CPU wait at teardown is a host
+/// join, not a producer fence wait; the no-CPU-wait contract covers
+/// steady-state submissions only. Without this the imported images,
+/// memories and semaphores — and the driver-held fds behind them — outlive
+/// the engine until device destroy (#166 fd accounting).
+#[cfg(all(unix, not(target_vendor = "apple")))]
+impl Drop for GpuRenderer {
+    fn drop(&mut self) {
+        // Surfaces drop before fields: retire their frame leases while the
+        // native context and queue still live.
+        self.surfaces.clear();
+        if self.native.is_some()
+            && let Some(submission) = self.flush_native_releases()
+        {
+            // Completion callbacks run under the poll; a timeout leaves
+            // the releases queued — the device drop reclaims the objects.
+            drop(self.wait(submission, "external frame teardown"));
+        }
     }
 }

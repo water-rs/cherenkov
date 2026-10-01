@@ -3,10 +3,11 @@
 //! The buffer is retained for the frame's lease, described through
 //! `AHardwareBuffer_describe`, and its `VkAndroidHardwareBufferProperties`
 //! give the allocation size, memory type bits and — for opaque YCbCr
-//! buffers — the `externalFormat` identifier and the driver-suggested
-//! conversion contract the frame's declared `FrameColor` is validated
-//! against. A suggested model/range the frame's contract does not express
-//! is `Unsupported`, never a silent nearest-match.
+//! buffers — the `externalFormat` identifier and the driver's suggested
+//! conversion parameters. The `suggestedYcbcr*` fields are advisory hints
+//! with no matching `VUID` — the conversion may use the frame's declared
+//! `FrameColor` verbatim; only `samplerYcbcrConversionComponents` and the
+//! `COSITED_CHROMA_SAMPLES` format feature are hard requirements.
 //!
 //! The producer contract is fixed: `VK_QUEUE_FAMILY_FOREIGN_EXT` and no
 //! prior Vulkan layout — the acquire barrier is `UNDEFINED` →
@@ -83,12 +84,6 @@ fn import_inner(
     let external_id = format_props.external_format;
     let format_features = format_props.format_features;
     let required_mapping = format_props.sampler_ycbcr_conversion_components;
-    let suggested = (
-        format_props.suggested_ycbcr_model,
-        format_props.suggested_ycbcr_range,
-        format_props.suggested_x_chroma_offset,
-        format_props.suggested_y_chroma_offset,
-    );
     if memory_type_bits == 0 {
         return Err(NativeError::Invalid("no compatible memory type"));
     }
@@ -103,46 +98,16 @@ fn import_inner(
         return Err(NativeError::Invalid("external buffer reports no format"));
     }
 
-    // The frame's declared colour contract must match the driver's reported
-    // conversion contract exactly — an inexpressible model/range/chroma is
-    // unsupported, not re-sited.
-    let (model, range, chroma_x, chroma_y) = (
-        required_model(&desc.color),
-        required_range(&desc.color),
-        chroma_location(desc.color.chroma_siting.x),
-        chroma_location(desc.color.chroma_siting.y),
-    );
+    // The frame's declared colour contract is the conversion contract —
+    // model, range and chroma siting are applied verbatim. The driver's
+    // `suggestedYcbcr*` values are advisory only (they are what the driver
+    // suggests, not what it requires; a camera or video NV12 buffer often
+    // carries a generic suggestion the frame's declared contract
+    // deliberately differs from). The one capability gate is the format's
+    // own feature set: cosited siting needs `COSITED_CHROMA_SAMPLES`, and
+    // `samplerYcbcrConversionComponents` is checked verbatim when the
+    // conversion is created.
     if external {
-        let expect = |got: u32, want: u32, what: &'static str| {
-            if got == want {
-                Ok(())
-            } else {
-                Err(NativeError::Unsupported(what))
-            }
-        };
-        // The suggested values are the driver's concrete decode contract —
-        // `0` here is a real value (`RGB_IDENTITY`/`FULL`/`COSITED_EVEN`),
-        // not "unspecified", so it is compared like every other.
-        expect(
-            suggested.0.as_raw().cast_unsigned(),
-            model.as_raw().cast_unsigned(),
-            "driver's YCbCr model is not the frame's declared matrix",
-        )?;
-        expect(
-            suggested.1.as_raw().cast_unsigned(),
-            range.as_raw().cast_unsigned(),
-            "driver's YCbCr range is not the frame's declared range",
-        )?;
-        expect(
-            suggested.2.as_raw().cast_unsigned(),
-            chroma_x.as_raw().cast_unsigned(),
-            "driver's chroma siting is not the frame's declared siting",
-        )?;
-        expect(
-            suggested.3.as_raw().cast_unsigned(),
-            chroma_y.as_raw().cast_unsigned(),
-            "driver's chroma siting is not the frame's declared siting",
-        )?;
         // Cosited siting needs the format feature.
         if (desc.color.chroma_siting.x == crate::interop::ChromaOffset::Cosited
             || desc.color.chroma_siting.y == crate::interop::ChromaOffset::Cosited)

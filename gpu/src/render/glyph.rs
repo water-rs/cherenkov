@@ -19,7 +19,7 @@ use cherenkov::RenderError;
 /// Initial atlas edge length.
 const ATLAS_START: u32 = 1024;
 /// Largest atlas edge length.
-const ATLAS_MAX: u32 = 4096;
+const ATLAS_MAX: u32 = 8192;
 /// Texels of padding around each cell.
 const PAD: u32 = 1;
 
@@ -161,6 +161,9 @@ pub struct PathCell {
     pub y: u16,
     /// Shelf the cell lives on, for [`Atlas::begin_commit`] touches.
     pub slot: u32,
+    /// Full columns inside this cell: `start | end << 16`, relative to x0.
+    /// Zero means that the entire cell needs sampled coverage.
+    pub interior: u32,
 }
 
 /// What a cached path draw replays: full-coverage spans and atlas cells,
@@ -205,6 +208,7 @@ impl PathEmit {
                     x: c.x,
                     y: c.y,
                     slot: c.slot,
+                    interior: c.interior,
                 })
                 .collect(),
             slots: self.slots.clone(),
@@ -451,6 +455,7 @@ impl Atlas {
             reason = "atlas sizes are small"
         )]
         let cap = ATLAS_MAX
+            .min(texture_limit)
             .min((budget as f64).sqrt() as u32)
             .max(ATLAS_START);
         Self {
@@ -612,8 +617,9 @@ impl Atlas {
 
     /// Caches a path emission.
     pub fn insert_path(&mut self, key: u64, emit: PathEmit) {
-        self.cpu_bytes += (emit.spans.len() * 16 + emit.cells.len() * 24 + emit.slots.len() * 4)
-            as u64
+        self.cpu_bytes += (emit.spans.len() * 16
+            + emit.cells.len() * size_of::<PathCell>()
+            + emit.slots.len() * 4) as u64
             + LIVE_ENTRY_BYTES;
         self.paths.insert(key, emit);
     }
@@ -748,7 +754,11 @@ impl Atlas {
     /// commit applies, so a `FitsEviction` verdict guarantees the
     /// evicting commit succeeds and `Resize` means the batch's cell set
     /// needs a different `(edge, pages)` — more pages than a peak frame
-    /// left behind, or fewer once it packs below (#211).
+    /// left behind, or fewer once it packs below (#211). A batch that
+    /// packs nowhere still grows when a cell needs a wider edge or the
+    /// batch's shelf footprint fits a bigger shape — in-place eviction
+    /// can never place a cell wider than the live edge (#234); only a
+    /// batch exceeding the largest allowed shape reports exhaustion.
     pub fn plan(&mut self, rasters: &[&PendingRaster]) -> AtlasPlan {
         self.batch_cells(rasters);
         let mut probe = self.layout.clone();
@@ -775,11 +785,9 @@ impl Atlas {
             // re-lowered commit places, so the verdict transfers.
             if self.pages > 1 {
                 self.live_cells();
-                // Probe in the same order the grow path below does —
-                // edge doubling on a single page first, pages at the
-                // cap last — so the released atlas lands on the shape a
-                // fresh engine reaches for the same content, not just
-                // any smaller area (#211).
+                // Probe smallest texture first — so the released atlas
+                // lands on the shape a fresh engine reaches for the same
+                // content, not just any smaller area (#211).
                 let area = u64::from(self.size) * u64::from(self.size) * u64::from(self.pages);
                 let mut candidates: Vec<(u32, u32)> = Vec::new();
                 let mut size = ATLAS_START;
@@ -822,30 +830,8 @@ impl Atlas {
         // this commit touched. Unreferenced cache would bloat — or
         // break — the target probe (#211).
         self.live_cells();
-        let mut size = self.size;
-        while size < self.cap {
-            size = (size * 2).min(self.cap);
-            let mut probe = Layout {
-                shelves: Vec::new(),
-                vacant: Vec::new(),
-                tops: vec![0],
-                next_epoch: 0,
-            };
-            if self
-                .plan_all
-                .iter()
-                .all(|&(w, h)| alloc_on(&mut probe, size, self.tick, w, h).is_some())
-            {
-                return AtlasPlan::Resize(size, 1);
-            }
-        }
-        // An edge grow at the cap still packs into a single `cap`-square
-        // page; a frame whose coverage exceeds that appends pages instead
-        // (#211). The fresh-layout probe keeps the resize one-shot: a
-        // re-lowered batch places every cell on blank pages or not at
-        // all.
-        let max_pages = self.max_pages(self.cap);
-        for pages in 2..=max_pages {
+        let shapes = self.grow_shapes();
+        for &(size, pages) in &shapes {
             let mut probe = Layout {
                 shelves: Vec::new(),
                 vacant: Vec::new(),
@@ -855,12 +841,74 @@ impl Atlas {
             if self
                 .plan_all
                 .iter()
-                .all(|&(w, h)| alloc_on(&mut probe, self.cap, self.tick, w, h).is_some())
+                .all(|&(w, h)| alloc_on(&mut probe, size, self.tick, w, h).is_some())
             {
-                return AtlasPlan::Resize(self.cap, pages);
+                return AtlasPlan::Resize(size, pages);
             }
         }
-        AtlasPlan::Recycle
+        // The batch packs at no shape the device allows — but eviction
+        // on the live atlas only reclaims shelves, it cannot grow the
+        // edge, so a cell wider than the live edge could never place
+        // however much of the batch would fit at a bigger edge (#234).
+        self.partial_grow().unwrap_or(AtlasPlan::Recycle)
+    }
+
+    /// The shape a batch that packs nowhere still grows to (#234): the
+    /// smallest `(edge, pages)` whose capacity holds the batch's real
+    /// shelf footprint — band-quantised heights plus per-cell padding,
+    /// what the shelves actually consume — so the retried commit places
+    /// what fits and reports whatever still overflows. `None` only when
+    /// a cell needs an edge past the cap, the batch exceeds even the
+    /// largest allowed shape, or the live shape is already that shape.
+    fn partial_grow(&self) -> Option<AtlasPlan> {
+        let need_edge = self.plan_all.iter().fold(ATLAS_START, |edge, &(w, h)| {
+            edge.max((w + 2 * PAD).max(band(h)).next_power_of_two())
+        });
+        if need_edge > self.cap {
+            return None;
+        }
+        let footprint: u64 = self
+            .plan_all
+            .iter()
+            .map(|&(w, h)| u64::from(w + 2 * PAD) * u64::from(band(h)))
+            .sum();
+        let mut size = need_edge;
+        loop {
+            let page_texels = u64::from(size) * u64::from(size);
+            let pages = u32::try_from(footprint.div_ceil(page_texels))
+                .unwrap_or(u32::MAX)
+                .max(1);
+            if pages <= self.max_pages(size) {
+                return (size != self.size || pages != self.pages)
+                    .then_some(AtlasPlan::Resize(size, pages));
+            }
+            if size == self.cap {
+                return None;
+            }
+            size = (size * 2).min(self.cap);
+        }
+    }
+
+    /// Every `(edge, pages)` shape larger than the live atlas, cheapest
+    /// first: edge doublings to the cap, each with every page count the
+    /// device and budget allow, plus the extra pages the live edge
+    /// could still grow. A re-lowered batch lands on the smallest
+    /// texture that packs it — a bigger edge before another page only
+    /// when it costs the same capacity or less.
+    fn grow_shapes(&self) -> Vec<(u32, u32)> {
+        let mut shapes = Vec::new();
+        let mut size = self.size;
+        for pages in self.pages + 1..=self.max_pages(self.size) {
+            shapes.push((self.size, pages));
+        }
+        while size < self.cap {
+            size = (size * 2).min(self.cap);
+            for pages in 1..=self.max_pages(size) {
+                shapes.push((size, pages));
+            }
+        }
+        shapes.sort_by_key(|&(size, pages)| u64::from(size) * u64::from(size) * u64::from(pages));
+        shapes
     }
 
     /// `(w, h)` of every cell a re-lowered commit would place: the
@@ -982,7 +1030,7 @@ impl Atlas {
 
     /// Whether a `w` × `h` cell fits in an empty atlas at the cap.
     pub const fn can_ever_fit(&self, w: u32, h: u32) -> bool {
-        w + 2 * PAD <= self.cap && (h + 2 * PAD).div_ceil(8) * 8 <= self.cap
+        w + 2 * PAD <= self.cap && band(h) <= self.cap
     }
 
     /// Whether a `w` × `h` mask stays in the atlas: small enough and a
@@ -1573,7 +1621,7 @@ impl Atlas {
                     if let Some(emit) = self.paths.remove(&hk) {
                         self.slot_dead.push(emit.slots.clone());
                         bytes += (emit.spans.len() * 16
-                            + emit.cells.len() * 24
+                            + emit.cells.len() * size_of::<PathCell>()
                             + emit.slots.len() * 4) as u64
                             + LIVE_ENTRY_BYTES;
                     }
@@ -1700,6 +1748,12 @@ fn free_band(layout: &mut Layout, size: u32, slot: usize) {
     }
 }
 
+/// A cell's shelf band height: cell height plus padding, quantised up
+/// to a multiple of 8 — the rows the cell actually consumes on a shelf.
+const fn band(h: u32) -> u32 {
+    (h + 2 * PAD).div_ceil(8) * 8
+}
+
 /// `Atlas::alloc` against an explicit layout and atlas edge — never
 /// evicts. The dry-run side of a transactional batch clones `layout`
 /// and calls this instead (#169 A3); the real side reaches it through
@@ -1712,7 +1766,7 @@ fn alloc_on(
     h: u32,
 ) -> Option<(u32, u32, usize)> {
     // Shelf height classes are multiples of 8.
-    let class = (h + 2 * PAD).div_ceil(8) * 8;
+    let class = band(h);
     for (i, shelf) in layout.shelves.iter_mut().enumerate() {
         if shelf.live && shelf.h == class && shelf.x + w + 2 * PAD <= size {
             let x = shelf.x + PAD;
@@ -1879,8 +1933,9 @@ pub enum AtlasPlan {
     /// over from a peak frame — which after re-lowering holds every
     /// cached and pending cell (#211).
     Resize(u32, u32),
-    /// Not even the cap holds the batch's cells: the commit evicts what
-    /// it can and reports the first surface that still overflows.
+    /// Even the largest `(edge, pages)` shape cannot hold the batch's
+    /// shelf footprint: the commit evicts what it can and reports the
+    /// first surface that still overflows.
     Recycle,
 }
 
@@ -2770,5 +2825,100 @@ mod tests {
             panic!("a one-page batch must release the second page");
         };
         assert_eq!((size, pages), (4096, 1));
+    }
+
+    /// A batch whose strip cells are wider than the live edge grows the
+    /// atlas even when the whole set packs at no probed shape: `plan`
+    /// returns the shape the cells' real shelf footprint needs rather
+    /// than recycling in place on an edge the cells can never fit
+    /// (#234). Before the fix this returned `Recycle`, and the evicting
+    /// commit failed the first cell wider than the 1024 edge.
+    #[test]
+    fn an_unplaceable_edge_still_grows() {
+        let Some((device, _queue)) = device_and_queue() else {
+            return;
+        };
+        let mut atlas = Atlas::new(&device, 256 * 1024 * 1024);
+        // The batch needs an adapter that pages at 4096 and reaches the
+        // 8192 edge — a smaller `max_texture_dimension_2d` cannot carry
+        // the regression.
+        if atlas.max_pages(4096) < 2 {
+            return;
+        }
+        // 4000 strip cells of 1600×4 — every one wider than the 1024
+        // live edge, and ~51M shelf texels of footprint together: past
+        // every shape up to 4096×2 pages, inside the 8192² page.
+        let count = 4000usize;
+        let (cw, ch) = (1600u32, 4u32);
+        let raster = PendingRaster::Path {
+            key: 1,
+            emit: PathEmit {
+                cells: (0..count)
+                    .map(|_| PathCell {
+                        rect: [0.0, 0.0, 1600.0, 4.0],
+                        x: 0,
+                        y: 0,
+                        slot: 0,
+                        interior: 0,
+                    })
+                    .collect(),
+                ..PathEmit::default()
+            },
+            cells: vec![(cw, ch, vec![0x80; (cw * ch) as usize]); count],
+        };
+        let refs = [&raster];
+        let AtlasPlan::Resize(size, pages) = atlas.plan(&refs) else {
+            panic!("cells wider than the live edge must grow the atlas");
+        };
+        assert!(size >= 2048, "the grown edge must take a 1600-wide cell");
+        atlas.resize_to(&device, size, pages);
+        atlas.begin_commit(&[]);
+        let mut writes = Vec::new();
+        let PendingRaster::Path { key, emit, cells } = raster else {
+            unreachable!("path pending only")
+        };
+        assert!(
+            atlas.place_path(key, emit, cells, &mut writes).is_some(),
+            "every cell of a batch that grew for its edge must place"
+        );
+    }
+
+    /// A batch that genuinely exceeds the largest shape the device
+    /// allows still recycles: the fail-fast `AtlasExhausted` answer for
+    /// a frame bigger than `cap × max_pages` is kept (#234).
+    #[test]
+    fn an_over_capacity_batch_still_recycles() {
+        let Some((device, _queue)) = device_and_queue() else {
+            return;
+        };
+        let mut atlas = Atlas::new(&device, 256 * 1024 * 1024);
+        if atlas.max_pages(4096) < 2 {
+            return;
+        }
+        // 6000 strip cells of 1600×4: ~77M shelf texels, past the
+        // 8192² page the cap allows on this adapter.
+        let count = 6000usize;
+        let (cw, ch) = (1600u32, 4u32);
+        let raster = PendingRaster::Path {
+            key: 1,
+            emit: PathEmit {
+                cells: (0..count)
+                    .map(|_| PathCell {
+                        rect: [0.0, 0.0, 1600.0, 4.0],
+                        x: 0,
+                        y: 0,
+                        slot: 0,
+                        interior: 0,
+                    })
+                    .collect(),
+                ..PathEmit::default()
+            },
+            cells: vec![(cw, ch, vec![0x80; (cw * ch) as usize]); count],
+        };
+        let refs = [&raster];
+        assert!(
+            matches!(atlas.plan(&refs), AtlasPlan::Recycle),
+            "a batch exceeding cap × max_pages must still recycle"
+        );
     }
 }

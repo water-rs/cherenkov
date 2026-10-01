@@ -21,9 +21,9 @@ use crate::render::filter::FilterKey;
 use crate::render::glyph::{self, Atlas, FontData, MaskCell, PathEmit, PendingRaster, glyph_key};
 use crate::render::instance::{
     FLAG_BLEND_SRC, FLAG_HAS_CLIP, FLAG_HAS_INNER, FLAG_HAS_MASK, FLAG_MASK_TEXTURE, FLAG_TEX_SRGB,
-    Globals, Instance, KIND_FILL, KIND_GLYPH, KIND_SHADOW, KIND_SPAN, KIND_STROKE_DIST,
-    KIND_STROKE_OFFSET, PAINT_IMAGE, PAINT_PROJECTIVE, PAINT_SOLID, PAINT_TEXTURE, Shape, Stop,
-    affine, blend_code,
+    Globals, Instance, KIND_FILL, KIND_GLYPH, KIND_REGION, KIND_SHADOW, KIND_SPAN,
+    KIND_STROKE_DIST, KIND_STROKE_OFFSET, PAINT_IMAGE, PAINT_PROJECTIVE, PAINT_SOLID,
+    PAINT_TEXTURE, Shape, Stop, affine, blend_code,
 };
 use crate::render::path;
 use crate::render::projective::{LocalKey, Placement};
@@ -599,7 +599,12 @@ impl RetainedInstance {
         inst.bounds = self.bounds;
         inst.uv[..2].copy_from_slice(&self.uv);
         inst.meta[0] = self.kind;
-        inst.meta[2] = self.first_stop + stop_base;
+        inst.meta[2] = self.first_stop
+            + if self.kind == KIND_REGION {
+                0
+            } else {
+                stop_base
+            };
         inst
     }
 }
@@ -951,6 +956,9 @@ pub struct Lowering<'a> {
     mask_pending: Option<u32>,
     /// Atlas writes and cache updates to commit, in lowering order.
     pub(crate) pending: Vec<PendingRaster>,
+    /// Path identities admitted during this lowering, before atlas commit.
+    /// A second use must replay the admitted layout as well as its texels.
+    pending_paths: FxHashMap<u64, u32>,
     pub commands_lowered: u32,
     pub layers_composed: u32,
     /// Backdrop groups planned before lowering.
@@ -1018,6 +1026,7 @@ impl<'a> Lowering<'a> {
             emission_patches: Vec::new(),
             mask_patches: Vec::new(),
             pending: Vec::new(),
+            pending_paths: FxHashMap::default(),
             commands_lowered: 0,
             layers_composed: 0,
             backdrops: FxHashMap::default(),
@@ -2840,7 +2849,11 @@ impl<'a> Lowering<'a> {
                     bounds: inst.bounds,
                     uv: [inst.uv[0], inst.uv[1]],
                     kind: inst.meta[0],
-                    first_stop: inst.meta[2].saturating_sub(stop_base),
+                    first_stop: if inst.meta[0] == KIND_REGION {
+                        inst.meta[2]
+                    } else {
+                        inst.meta[2].saturating_sub(stop_base)
+                    },
                 };
                 // Keep this invariant checked as new leaf emitters are added. Stop
                 // indices without gradients are unused but preserve their input too.
@@ -2905,10 +2918,35 @@ impl<'a> Lowering<'a> {
         self.set_image(emission.image.clone());
         let instance_base =
             u32::try_from(self.frame.instances.len()).expect("instance count fits u32");
-        for inst in &storage.instances[emission.instances.clone()] {
-            let mut inst = inst.restore(&storage.templates[emission.template], offset);
-            Self::apply_clip(&mut inst, clip);
-            self.push_instance(&inst);
+        let retained = &storage.instances[emission.instances.clone()];
+        if let Some(first) = retained.first() {
+            // A realized leaf shares paint and clip fields. Its varying
+            // kinds (fill/span/cell) all use the same shader specialization.
+            let mut template = first.restore(&storage.templates[emission.template], offset);
+            Self::apply_clip(&mut template, clip);
+            self.set_variant(variant_of(&template));
+            let first = self.frame.instances.len();
+            self.frame
+                .instances
+                .resize(first + retained.len(), template);
+            for (inst, source) in self.frame.instances[first..].iter_mut().zip(retained) {
+                inst.bounds = source.bounds;
+                inst.uv[..2].copy_from_slice(&source.uv);
+                inst.meta[0] = source.kind;
+                inst.meta[2] = source.first_stop
+                    + if source.kind == KIND_REGION {
+                        0
+                    } else {
+                        offset
+                    };
+                debug_assert_eq!(variant_of(inst), variant_of(&template));
+            }
+            if let Some(pending) = self.mask_pending {
+                self.mask_patches.extend(
+                    (first..self.frame.instances.len())
+                        .map(|i| (u32::try_from(i).expect("instance count fits u32"), pending)),
+                );
+            }
         }
         // The producing leaf's frame patches may be gone — rollbacks
         // truncate `cell_patches` — so recomposes re-emit them from
@@ -3504,6 +3542,18 @@ impl<'a> Lowering<'a> {
             self.replay(emit, None, pl.offset, paint, shader_data.as_ref());
             return Ok(());
         }
+        if let Some(&pending) = self
+            .pending_paths
+            .get(&pl.key)
+            .or_else(|| self.pending_paths.get(&pl.key_exact()))
+        {
+            let PendingRaster::Path { emit, .. } = &self.pending[pending as usize] else {
+                unreachable!("pending path identity addresses a path");
+            };
+            let emit = emit.clone();
+            self.replay(&emit, Some(pending), pl.offset, paint, shader_data.as_ref());
+            return Ok(());
+        }
         let (stored, pending) = 'stored: {
             let device =
                 pl.raster * shader_path.unwrap_or_else(|| make.take().expect("path factory")());
@@ -3537,6 +3587,7 @@ impl<'a> Lowering<'a> {
                 emit: stored.clone(),
                 cells,
             });
+            self.pending_paths.insert(key, pending);
             (stored, Some(pending))
         };
         self.replay(&stored, pending, pl.offset, paint, shader_data.as_ref());
@@ -3565,16 +3616,20 @@ impl<'a> Lowering<'a> {
         template.meta[3] |= paint.packed & 0x00ff_ffff;
         self.replay_quads(
             &template,
-            emit.spans.iter().map(|rect| (*rect, [0.0; 2])),
+            emit.spans.iter().map(|rect| (*rect, [0.0; 2], 0)),
             offset,
         );
         template.meta[0] = KIND_GLYPH;
         let first = self.frame.instances.len();
         self.replay_quads(
             &template,
-            emit.cells
-                .iter()
-                .map(|cell| (cell.rect, [f32::from(cell.x), f32::from(cell.y)])),
+            emit.cells.iter().map(|cell| {
+                (
+                    cell.rect,
+                    [f32::from(cell.x), f32::from(cell.y)],
+                    cell.interior,
+                )
+            }),
             offset,
         );
         if let Some(pending) = pending {
@@ -3595,7 +3650,7 @@ impl<'a> Lowering<'a> {
     fn replay_quads(
         &mut self,
         template: &Instance,
-        quads: impl ExactSizeIterator<Item = ([f32; 4], [f32; 2])>,
+        quads: impl ExactSizeIterator<Item = ([f32; 4], [f32; 2], u32)>,
         offset: Vec2,
     ) {
         if quads.len() == 0 {
@@ -3604,7 +3659,7 @@ impl<'a> Lowering<'a> {
         self.set_variant(variant_of(template));
         let first = self.frame.instances.len();
         self.frame.instances.resize(first + quads.len(), *template);
-        for (inst, (rect, uv)) in self.frame.instances[first..].iter_mut().zip(quads) {
+        for (inst, (rect, uv, interior)) in self.frame.instances[first..].iter_mut().zip(quads) {
             inst.bounds = [
                 f32_f64(f64::from(rect[0]) + offset.x),
                 f32_f64(f64::from(rect[1]) + offset.y),
@@ -3612,6 +3667,10 @@ impl<'a> Lowering<'a> {
                 f32_f64(f64::from(rect[3]) + offset.y),
             ];
             inst.uv[..2].copy_from_slice(&uv);
+            if interior != 0 && inst.meta[1] == PAINT_SOLID {
+                inst.meta[0] = KIND_REGION;
+                inst.meta[2] = interior;
+            }
         }
         if let Some(pending) = self.mask_pending {
             self.mask_patches.extend(
@@ -4070,7 +4129,7 @@ pub const fn globals(size: [f32; 2], origin: [f32; 2], space: cherenkov::BlendSp
     reason = "a..f are the conventional affine coefficient names"
 )]
 fn device_bbox(inst: &Instance) -> [f32; 4] {
-    if inst.meta[0] == KIND_GLYPH || inst.meta[0] == KIND_SPAN {
+    if matches!(inst.meta[0], KIND_GLYPH | KIND_SPAN | KIND_REGION) {
         return inst.bounds;
     }
     let [a, b, c, d, e, f, _, _] = inst.affine;

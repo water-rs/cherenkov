@@ -30,17 +30,21 @@ fn card() -> Picture {
 
 const CLIP: Rect = Rect::new(0.0, 0.0, 32.0, 32.0);
 
-struct Scene<B: ProjectiveLayers> {
-    engine: Engine<B>,
+struct Scene<'e, B: ProjectiveLayers> {
+    engine: &'e Engine<B>,
     surface: Surface<B>,
     layer: Layer,
     frame: u64,
     start: Instant,
 }
 
-impl<B: ProjectiveLayers> Scene<B> {
-    fn new(config: B::Config, setup: impl FnOnce(&mut cherenkov::LayerEdit<B>)) -> Self {
-        let engine = Engine::<B>::new(config).expect("backend required");
+impl<'e, B: ProjectiveLayers> Scene<'e, B> {
+    /// One scene per surface setup, all on the caller's engine: engine
+    /// construction (device + core pipelines) dominates these tests'
+    /// runtimes, so a test shares one engine across its scenes. The
+    /// surface carries the scene state — a new `Scene` is a new
+    /// independent scene tree, same as a fresh engine's surface.
+    fn new(engine: &'e Engine<B>, setup: impl FnOnce(&mut cherenkov::LayerEdit<B>)) -> Self {
         let surface = engine
             .surface(Offscreen::new(SIZE, OffscreenFormat::LinearF32))
             .expect("surface");
@@ -78,8 +82,8 @@ impl<B: ProjectiveLayers> Scene<B> {
 
 /// The backend's own rendering of the clear colour alone, in its storage
 /// precision: what an untouched pixel reads back as.
-fn clear_pixel<B: ProjectiveLayers>(config: B::Config) -> [f32; 4] {
-    let mut scene = Scene::<B>::new(config, |e| {
+fn clear_pixel<B: ProjectiveLayers>(engine: &Engine<B>) -> [f32; 4] {
+    let mut scene = Scene::<B>::new(engine, |e| {
         e.content(Picture::record(|_| {}));
     });
     let pixels = scene.render().expect("clear");
@@ -110,10 +114,11 @@ fn close(a: &[[f32; 4]], b: &[[f32; 4]], tolerance: f32, what: &str) {
 /// An identity projection composes exactly like the affine layer, up to
 /// the local image's `f16` storage.
 pub fn identity_matches_affine<B: ProjectiveLayers>(config: impl Fn() -> B::Config) {
-    let mut projected = Scene::<B>::new(config(), |e| {
+    let engine = Engine::<B>::new(config()).expect("backend required");
+    let mut projected = Scene::<B>::new(&engine, |e| {
         e.projection(Projective::IDENTITY);
     });
-    let mut affine = Scene::<B>::new(config(), |_| {});
+    let mut affine = Scene::<B>::new(&engine, |_| {});
     let a = projected.render().expect("projected");
     assert_eq!(projected.engine.stats().projective_realized, 1);
     let b = affine.render().expect("affine");
@@ -124,7 +129,8 @@ pub fn identity_matches_affine<B: ProjectiveLayers>(config: impl Fn() -> B::Conf
 /// A card entirely behind the viewer, or seen exactly edge-on, draws
 /// nothing: the surface keeps its clear colour bit for bit.
 pub fn hidden_and_edge_on_contribute_nothing<B: ProjectiveLayers>(config: impl Fn() -> B::Config) {
-    let clear = clear_pixel::<B>(config());
+    let engine = Engine::<B>::new(config()).expect("backend required");
+    let clear = clear_pixel::<B>(&engine);
     for (what, edit) in [
         (
             "behind",
@@ -143,7 +149,7 @@ pub fn hidden_and_edge_on_contribute_nothing<B: ProjectiveLayers>(config: impl F
             }),
         ),
     ] {
-        let mut scene = Scene::<B>::new(config(), |e| edit(e));
+        let mut scene = Scene::<B>::new(&engine, |e| edit(e));
         let pixels = scene.render().expect(what);
         for (i, px) in pixels.iter().enumerate() {
             assert_eq!(bits(*px), bits(clear), "{what}: pixel {i} changed");
@@ -155,18 +161,19 @@ pub fn hidden_and_edge_on_contribute_nothing<B: ProjectiveLayers>(config: impl F
 /// full turn is the untilted card. There is no backface culling.
 pub fn turns_keep_winding_and_show_both_sides<B: ProjectiveLayers>(config: impl Fn() -> B::Config) {
     let pivot = Vec2::new(16.0, 16.0);
-    let mut flat = Scene::<B>::new(config(), |e| {
+    let engine = Engine::<B>::new(config()).expect("backend required");
+    let mut flat = Scene::<B>::new(&engine, |e| {
         e.pivot(pivot).tilt(Vec2::ZERO);
     });
     let flat = flat.render().expect("flat");
-    let mut full = Scene::<B>::new(config(), |e| {
+    let mut full = Scene::<B>::new(&engine, |e| {
         e.pivot(pivot).tilt(Vec2::new(0.0, TAU));
     });
     close(&full.render().expect("full turn"), &flat, 2e-3, "full turn");
-    let mut half = Scene::<B>::new(config(), |e| {
+    let mut half = Scene::<B>::new(&engine, |e| {
         e.pivot(pivot).tilt(Vec2::new(0.0, PI));
     });
-    let mut mirrored = Scene::<B>::new(config(), |e| {
+    let mut mirrored = Scene::<B>::new(&engine, |e| {
         e.pivot(pivot).scale(Vec2::new(-1.0, 1.0));
     });
     close(
@@ -190,7 +197,8 @@ pub fn cached_and_fresh_realizations_are_identical<B: ProjectiveLayers>(
         }
     };
     let (a, b) = (Vec2::new(0.3, -0.5), Vec2::new(-0.2, 0.7));
-    let mut warm = Scene::<B>::new(config(), pose(a));
+    let engine = Engine::<B>::new(config()).expect("backend required");
+    let mut warm = Scene::<B>::new(&engine, pose(a));
     let first = warm.render().expect("cold");
     assert_eq!(warm.engine.stats().projective_realized, 1);
     warm.edit(pose(b));
@@ -202,7 +210,11 @@ pub fn cached_and_fresh_realizations_are_identical<B: ProjectiveLayers>(
         0,
         "a matrix-only frame reuses the retained realization"
     );
-    let mut fresh = Scene::<B>::new(config(), pose(a));
+    // The fresh side keeps a genuinely fresh engine: the assertion is
+    // that a realization built with no retained state anywhere matches
+    // the warm engine's, so engine-level state must not be shared.
+    let fresh_engine = Engine::<B>::new(config()).expect("backend required");
+    let mut fresh = Scene::<B>::new(&fresh_engine, pose(a));
     let cold = fresh.render().expect("fresh");
     assert_eq!(first, again, "cached realization changed");
     assert_eq!(cold, again, "fresh and cached realizations differ");
@@ -223,16 +235,17 @@ pub fn cached_and_fresh_realizations_are_identical<B: ProjectiveLayers>(
 pub fn destructive_blend_keeps_its_operator_domain<B: ProjectiveLayers>(
     config: impl Fn() -> B::Config,
 ) {
-    let mut projected = Scene::<B>::new(config(), |e| {
+    let engine = Engine::<B>::new(config()).expect("backend required");
+    let mut projected = Scene::<B>::new(&engine, |e| {
         e.projection(Projective::IDENTITY).blend(BlendMode::Src);
     });
-    let mut affine = Scene::<B>::new(config(), |e| {
+    let mut affine = Scene::<B>::new(&engine, |e| {
         e.blend(BlendMode::Src);
     });
     let p = projected.render().expect("projected");
     let a = affine.render().expect("affine");
     close(&p, &a, 2e-3, "destructive identity");
-    let clear = clear_pixel::<B>(config());
+    let clear = clear_pixel::<B>(&engine);
     let at = |x: usize, y: usize| p[y * SIZE.0 as usize + x];
     // Inside the clip, below the content: cleared by the operator.
     assert_eq!(bits(at(20, 44)), bits([0.0; 4]));
@@ -242,8 +255,13 @@ pub fn destructive_blend_keeps_its_operator_domain<B: ProjectiveLayers>(
 
 /// An invalid composed pose, and a projective layer without a clip, are
 /// render errors, never an identity or a transparent layer.
-pub fn invalid_poses_are_errors<B: ProjectiveLayers>(config: impl Fn() -> B::Config) {
-    let mut singular = Scene::<B>::new(config(), |e| {
+pub fn invalid_poses_are_errors<B: ProjectiveLayers>(mut config: impl FnMut() -> B::Config) {
+    // Each scene gets its own engine: a surface that fails to render
+    // keeps its changes and stays live, so a shared engine's next render
+    // would re-fail on the earlier scene's input instead of reaching the
+    // error under test.
+    let singular_engine = Engine::<B>::new(config()).expect("backend required");
+    let mut singular = Scene::<B>::new(&singular_engine, |e| {
         e.tilt(Vec2::new(0.2, 0.0)).scale(Vec2::new(0.0, 1.0));
     });
     assert!(matches!(
@@ -253,7 +271,8 @@ pub fn invalid_poses_are_errors<B: ProjectiveLayers>(config: impl Fn() -> B::Con
             ..
         })
     ));
-    let mut unclipped = Scene::<B>::new(config(), |e| {
+    let unclipped_engine = Engine::<B>::new(config()).expect("backend required");
+    let mut unclipped = Scene::<B>::new(&unclipped_engine, |e| {
         e.clear_clip().tilt(Vec2::new(0.2, 0.0));
     });
     assert!(matches!(
@@ -267,11 +286,12 @@ pub fn invalid_poses_are_errors<B: ProjectiveLayers>(config: impl Fn() -> B::Con
 /// A visible image beyond the backend's dimension limit or byte budget is
 /// an explicit error naming the required size, never a capped density.
 pub fn limits_are_explicit_errors<B: ProjectiveLayers>(config: impl Fn() -> B::Config) {
+    let engine = Engine::<B>::new(config()).expect("backend required");
     for (clip, what) in [
         (Rect::new(0.0, 0.0, 40_000.0, 32.0), "dimension limit"),
         (Rect::new(0.0, 0.0, 8_000.0, 8_000.0), "are admitted"),
     ] {
-        let mut scene = Scene::<B>::new(config(), |e| {
+        let mut scene = Scene::<B>::new(&engine, |e| {
             e.clip(clip).projection(Projective::IDENTITY);
         });
         match scene.render() {
@@ -307,8 +327,9 @@ pub fn image_replacement_reaches_local_images<B: ProjectiveLayers + Uploads<Rgba
                 .projection(Projective::IDENTITY);
         });
     };
-    let mut replaced = Scene::<B>::new(config(), |_| {});
-    let image = replaced.engine.image(solid(red)).expect("image");
+    let engine = Engine::<B>::new(config()).expect("backend required");
+    let mut replaced = Scene::<B>::new(&engine, |_| {});
+    let image = engine.image(solid(red)).expect("image");
     draw(&replaced, image.id());
     let before = replaced.render().expect("red");
     image.replace(solid(green)).expect("replace");
@@ -316,8 +337,8 @@ pub fn image_replacement_reaches_local_images<B: ProjectiveLayers + Uploads<Rgba
     assert_eq!(replaced.engine.stats().projective_realized, 1);
     assert_ne!(after, before, "the local image kept the replaced pixels");
 
-    let mut fresh = Scene::<B>::new(config(), |_| {});
-    let image = fresh.engine.image(solid(green)).expect("image");
+    let mut fresh = Scene::<B>::new(&engine, |_| {});
+    let image = engine.image(solid(green)).expect("image");
     draw(&fresh, image.id());
     assert_eq!(fresh.render().expect("fresh green"), after);
 }
@@ -331,26 +352,20 @@ pub fn image_replacement_reaches_local_images<B: ProjectiveLayers + Uploads<Rgba
 pub fn released_resources_leave_no_local_image<B: ProjectiveLayers + Uploads<Rgba8>>(
     config: impl Fn() -> B::Config,
 ) {
-    let freed = |projective: bool| {
-        let mut scene = Scene::<B>::new(config(), |e| {
+    let freed = |engine: &Engine<B>, projective: bool| {
+        let mut scene = Scene::<B>::new(engine, |e| {
             if projective {
                 e.projection(Projective::IDENTITY);
             }
         });
-        let image = scene
-            .engine
-            .image(solid([230, 20, 20, 255]))
-            .expect("image");
+        let image = engine.image(solid([230, 20, 20, 255])).expect("image");
         let id = image.id();
         scene.edit(|e| {
             e.record(|c| c.image(id, CLIP, Sampling::Nearest));
         });
         scene.render().expect("drawn");
-        assert_eq!(
-            scene.engine.stats().projective_realized,
-            u32::from(projective)
-        );
-        let drawn = resident(&scene.engine);
+        assert_eq!(engine.stats().projective_realized, u32::from(projective));
+        let drawn = resident(engine);
         // The layer moves off the surface, so nothing realizes it again.
         scene.edit(|e| {
             e.content(Picture::record(|_| {}))
@@ -358,15 +373,20 @@ pub fn released_resources_leave_no_local_image<B: ProjectiveLayers + Uploads<Rgb
         });
         drop(image);
         scene.render().expect("released");
-        assert_eq!(scene.engine.stats().projective_realized, 0);
-        drawn - resident(&scene.engine)
+        assert_eq!(engine.stats().projective_realized, 0);
+        drawn - resident(engine)
     };
     let local: u64 = cherenkov::lowering::projective::mip_levels((32, 32))
         .iter()
         .map(|&(w, h)| 8 * u64::from(w) * u64::from(h))
         .sum();
+    // Each run gets its own engine: the asserted difference is bytes
+    // resident on the engine, which must exclude the other run's
+    // surfaces.
+    let projective_engine = Engine::<B>::new(config()).expect("backend required");
+    let affine_engine = Engine::<B>::new(config()).expect("backend required");
     assert_eq!(
-        freed(true) - freed(false),
+        freed(&projective_engine, true) - freed(&affine_engine, false),
         local,
         "the local image that read the released image is freed with it"
     );
@@ -375,8 +395,15 @@ pub fn released_resources_leave_no_local_image<B: ProjectiveLayers + Uploads<Rgb
 /// A projective layer cannot be a backdrop member, and one backdrop group
 /// cannot span the surface and a projective layer's local space: both are
 /// explicit `Unsupported` errors.
-pub fn backdrop_spaces_are_checked<B: ProjectiveLayers + Backdrop>(config: impl Fn() -> B::Config) {
-    let mut member = Scene::<B>::new(config(), |_| {});
+pub fn backdrop_spaces_are_checked<B: ProjectiveLayers + Backdrop>(
+    mut config: impl FnMut() -> B::Config,
+) {
+    // Each scene gets its own engine: a surface that fails to render
+    // keeps its changes and stays live, so a shared engine's next render
+    // would re-fail on the earlier scene's input instead of reaching the
+    // error under test.
+    let member_engine = Engine::<B>::new(config()).expect("backend required");
+    let mut member = Scene::<B>::new(&member_engine, |_| {});
     let group = member.surface.backdrop_group_unfiltered();
     member.edit(|e| {
         e.projection(Projective::IDENTITY).backdrop(group.sample());
@@ -388,7 +415,8 @@ pub fn backdrop_spaces_are_checked<B: ProjectiveLayers + Backdrop>(config: impl 
         ))
     ));
 
-    let mut spanning = Scene::<B>::new(config(), |e| {
+    let spanning_engine = Engine::<B>::new(config()).expect("backend required");
+    let mut spanning = Scene::<B>::new(&spanning_engine, |e| {
         e.projection(Projective::IDENTITY);
     });
     let group = spanning.surface.backdrop_group_unfiltered();
@@ -414,7 +442,8 @@ pub fn backdrop_spaces_are_checked<B: ProjectiveLayers + Backdrop>(config: impl 
 /// A tilt animation keeps the engine awake and reuses the recorded
 /// content; after `clear_projection` the layer is affine again.
 pub fn tilt_animates_and_clears<B: ProjectiveLayers>(config: impl Fn() -> B::Config) {
-    let mut scene = Scene::<B>::new(config(), |e| {
+    let engine = Engine::<B>::new(config()).expect("backend required");
+    let mut scene = Scene::<B>::new(&engine, |e| {
         e.projection(Projective::perspective(200.0).unwrap())
             .pivot(Vec2::new(16.0, 16.0));
     });
@@ -438,7 +467,7 @@ pub fn tilt_animates_and_clears<B: ProjectiveLayers>(config: impl Fn() -> B::Con
     });
     let cleared = scene.render().expect("cleared");
     assert_eq!(scene.engine.stats().projective_composed, 0);
-    let mut affine = Scene::<B>::new(config(), |e| {
+    let mut affine = Scene::<B>::new(&engine, |e| {
         e.pivot(Vec2::new(16.0, 16.0));
     });
     assert_eq!(cleared, affine.render().expect("affine"));
@@ -455,7 +484,8 @@ pub fn horizon_crossing_excludes_the_back_half_space<B: ProjectiveLayers>(
     // meets the plane behind the viewer inside the front part's bounds.
     let (tilt, distance) = (Vec2::new(0.4, 1.0), 10.0);
     let tall = Rect::new(0.0, 0.0, 32.0, 64.0);
-    let mut scene = Scene::<B>::new(config(), |e| {
+    let engine = Engine::<B>::new(config()).expect("backend required");
+    let mut scene = Scene::<B>::new(&engine, |e| {
         e.content(Picture::record(|r| {
             r.fill(tall, WorkingColor::new([0.9, 0.8, 0.1, 1.0]));
         }))
@@ -465,7 +495,7 @@ pub fn horizon_crossing_excludes_the_back_half_space<B: ProjectiveLayers>(
         .tilt(tilt);
     });
     let pixels = scene.render().expect("horizon");
-    let clear = clear_pixel::<B>(config());
+    let clear = clear_pixel::<B>(&engine);
     // The pose, composed here from public constructors:
     // translate(16 + 16) · perspective · Ry(tilt.y) · Rx(tilt.x) ·
     // translate(−16).

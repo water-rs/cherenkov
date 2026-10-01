@@ -353,8 +353,9 @@ split_test! {
 /// attenuated by the layer opacity; the layer's content is (#134).
 fn member_sample_is_not_attenuated_by_layer_opacity() -> Result<(), Box<dyn std::error::Error>> {
     split_fn! {
-fn render(opacity: f32) -> Result<cherenkov::Readback, Box<dyn std::error::Error>> {
-        let engine = wait!(Engine::<Gpu>::new(GpuConfig::default()))?;
+// One engine for both opacities: each render builds its own surface, so
+// the two scenes stay independent while engine construction is shared.
+fn render(engine: &Engine<Gpu>, opacity: f32) -> Result<cherenkov::Readback, Box<dyn std::error::Error>> {
         let surface = wait!(engine.surface(Offscreen::new((32, 32), OffscreenFormat::LinearF16)))?;
         let group = surface.backdrop_group_unfiltered();
         let member = surface.layer();
@@ -384,7 +385,8 @@ fn render(opacity: f32) -> Result<cherenkov::Readback, Box<dyn std::error::Error
     }
     }
 
-    let half = wait!(render(0.5))?;
+    let engine = wait!(Engine::<Gpu>::new(GpuConfig::default()))?;
+    let half = wait!(render(&engine, 0.5))?;
     // Sample-only area (left half of the clip): the red backdrop at full
     // strength, unaffected by the layer's 0.5 opacity.
     assert_pixel(pixel(&half, 10, 16), [1.0, 0.0, 0.0, 1.0], 1e-3);
@@ -394,7 +396,7 @@ fn render(opacity: f32) -> Result<cherenkov::Readback, Box<dyn std::error::Error
     assert_pixel(pixel(&half, 1, 16), [1.0, 0.0, 0.0, 1.0], 1e-3);
     // The clip edge is not squared: a corner pixel's coverage matches the
     // same layer at full opacity.
-    let full = wait!(render(1.0))?;
+    let full = wait!(render(&engine, 1.0))?;
     assert_pixel(pixel(&half, 5, 5), pixel(&full, 5, 5), 1e-3);
     assert_pixel(pixel(&half, 7, 7), pixel(&full, 7, 7), 1e-3);
     Ok(())

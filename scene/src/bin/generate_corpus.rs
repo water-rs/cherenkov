@@ -5,6 +5,9 @@
 //! `scenes/corpus/<name>/` as a `scene.json` plus a `resources/` directory of
 //! BLAKE3-addressed blobs (fonts, images).
 
+#[path = "generate_corpus/authored.rs"]
+mod authored;
+
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::ExitCode;
@@ -841,7 +844,13 @@ fn write_corpus(out: &Path, corpus: &Corpus) -> Result<(), SceneError> {
     std::fs::create_dir_all(out)?;
     for entry in &corpus.entries {
         let dir = out.join(&entry.name);
-        entry.scene.save(&dir)?;
+        match &entry.body {
+            EntryBody::Scene(scene) => scene.save(&dir)?,
+            EntryBody::Json(text) => {
+                std::fs::create_dir_all(&dir)?;
+                std::fs::write(dir.join("scene.json"), text)?;
+            }
+        }
         for blob in &entry.blobs {
             Scene::store_resource(&dir, blob)?;
         }
@@ -852,8 +861,16 @@ fn write_corpus(out: &Path, corpus: &Corpus) -> Result<(), SceneError> {
 /// One emitted scene plus the blobs its `resources/` needs.
 struct Entry {
     name: String,
-    scene: Scene,
+    body: EntryBody,
     blobs: Vec<Vec<u8>>,
+}
+
+/// How an entry's `scene.json` is produced: the typed builder, or text
+/// laid out byte-for-byte the way the hand-committed scenes were written
+/// (see `authored`).
+enum EntryBody {
+    Scene(Box<Scene>),
+    Json(String),
 }
 
 struct Corpus {
@@ -894,8 +911,18 @@ impl Corpus {
         let scene = builder.build();
         self.entries.push(Entry {
             name: name.into(),
-            scene,
+            body: EntryBody::Scene(Box::new(scene)),
             blobs: Vec::new(),
+        });
+    }
+
+    /// Queue a scene whose `scene.json` is already rendered text (the
+    /// hand-authored scenes in `authored`).
+    fn push_json(&mut self, name: &str, text: String, blobs: Vec<Vec<u8>>) {
+        self.entries.push(Entry {
+            name: name.to_string(),
+            body: EntryBody::Json(text),
+            blobs,
         });
     }
 
@@ -942,7 +969,7 @@ impl Corpus {
         let scene = builder.build();
         self.entries.push(Entry {
             name: name.into(),
-            scene,
+            body: EntryBody::Scene(Box::new(scene)),
             blobs,
         });
     }
@@ -4979,6 +5006,10 @@ fn run() -> Result<(), SceneError> {
         // Far corner: stays a separate region.
         member(l, [440.0, 428.0, 508.0, 508.0], None);
     });
+
+    // ---- Scenes committed before the generator covered them ----------
+
+    authored::add(&mut corpus, &mut ctx)?;
 
     // ---- Write out ---------------------------------------------------------
 

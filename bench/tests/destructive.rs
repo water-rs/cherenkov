@@ -54,7 +54,7 @@ fn assert_destructive_scenes(engine: &str) {
         .expect("clock after epoch")
         .as_nanos();
     let base = std::env::temp_dir().join(format!(
-        "cherenkov-bench-destructive-{}-{nonce}",
+        "cherenkov-bench-destructive-{engine}-{}-{nonce}",
         std::process::id()
     ));
     let corpus_dir = base.join("corpus");

@@ -1,6 +1,7 @@
 //! The WGSL source translates through every naga backend wgpu uses, for
 //! each `VARIANT` pipeline, so a Metal or D3D regression shows on Linux.
 
+use cherenkov::__engine_test as split_test;
 use naga::back::{hlsl, msl, spv};
 use naga::valid::{Capabilities, ValidationFlags, Validator};
 use naga::{Module, front::wgsl};
@@ -26,7 +27,7 @@ fn composed(variant: u32) -> (Module, naga::valid::ModuleInfo) {
     (module, info)
 }
 
-#[test]
+split_test! {
 fn every_variant_emits_msl() {
     for variant in 0..3 {
         let (module, info) = composed(variant);
@@ -38,8 +39,9 @@ fn every_variant_emits_msl() {
             .unwrap_or_else(|e| panic!("variant {variant}: msl: {e}"));
     }
 }
+}
 
-#[test]
+split_test! {
 fn every_variant_emits_spirv() {
     for variant in 0..3 {
         let (module, info) = composed(variant);
@@ -52,8 +54,9 @@ fn every_variant_emits_spirv() {
         assert!(!words.is_empty());
     }
 }
+}
 
-#[test]
+split_test! {
 fn every_variant_emits_hlsl() {
     for variant in 0..3 {
         let (module, info) = composed(variant);
@@ -66,6 +69,7 @@ fn every_variant_emits_hlsl() {
             .unwrap_or_else(|e| panic!("variant {variant}: hlsl: {e}"));
         assert!(!out.is_empty());
     }
+}
 }
 
 /// Parses and validates an effect module's text, panicking on the first
@@ -106,11 +110,11 @@ fn effect_emits(name: &str, module: &Module, info: &naga::valid::ModuleInfo) {
     assert!(!out.is_empty());
 }
 
+split_test! {
 /// The registered-effect module parses, validates and translates through
 /// every naga backend — for each built-in effect kind's semantics as a
 /// user source would use them (sample, SDF normal and displacement), and
 /// for a representative `BackdropEffect::Shader` source.
-#[test]
 fn backdrop_effect_text_emits() {
     // Each case is a `fn backdrop_effect` body exercising the member-
     // effect machinery the built-ins rely on.
@@ -155,10 +159,11 @@ fn backdrop_effect_text_emits() {
         effect_emits(name, &module, &info);
     }
 }
+}
 
+split_test! {
 /// The projective composite and mip modules (#84) translate through every
 /// naga backend, composed as in build.rs.
-#[test]
 fn projective_modules_emit() {
     for (name, source) in [
         ("projective", format!("{SHARED}\n{BLEND}\n{PROJECTIVE}")),
@@ -170,4 +175,5 @@ fn projective_modules_emit() {
             .unwrap_or_else(|e| panic!("{name}: {e:?}"));
         effect_emits(name, &module, &info);
     }
+}
 }

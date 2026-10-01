@@ -227,6 +227,8 @@ impl Renderer for RasterRenderer {
             max_dimension: MAX_SURFACE,
             size,
             readable,
+            // The raster backend has no window targets.
+            presents: false,
         })
     }
 

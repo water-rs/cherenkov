@@ -15,7 +15,6 @@ const KIND_EXT_NV12: u32 = 1u;
 const KIND_EXT_P010: u32 = 2u;
 
 // `params.info.w` bits, mirrored by `render::external`.
-const EXT_FLAG_BGR: u32 = 1u;
 const EXT_FLAG_SHIFT6: u32 = 2u;
 
 const EXT_ALPHA_OPAQUE: u32 = 0u;
@@ -168,9 +167,6 @@ fn fs_external(in: VsOut) -> @location(0) vec4<f32> {
         default: {
             // KIND_EXT_RGB.
             var c = ext_texel_f32(ext_rgb, in.local, params.dims.xy);
-            if (params.info.w & EXT_FLAG_BGR) != 0u {
-                c = vec4<f32>(c.b, c.g, c.r, c.a);
-            }
             let alpha = select(c.a, 1.0, params.info.z == EXT_ALPHA_OPAQUE);
             var lin = ext_decode(c.rgb, params.info.y);
             lin = ext_hlg(lin);

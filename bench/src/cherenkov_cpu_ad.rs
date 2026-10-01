@@ -1350,6 +1350,12 @@ impl Engine for Cherenkov {
         let format = match self.present {
             Some(PresentKind::SrgbHw | PresentKind::SrgbShader) => OffscreenFormat::LinearF32,
             Some(PresentKind::LinearP3) => OffscreenFormat::LinearF16,
+            Some(kind) => {
+                return Err(BenchError::Engine(format!(
+                    "cherenkov-cpu: {} presentation is unsupported",
+                    kind.name()
+                )));
+            }
             None => Self::readback_format(),
         };
         let surface = self
@@ -1470,8 +1476,19 @@ impl Engine for Cherenkov {
 
     /// Puts the adapter into presentation mode: `submit`'s readback is
     /// run through the backend's presentation and lifted back to the
-    /// working space, matching the GPU adapter.
+    /// working space, matching the GPU adapter. The CPU backend presents
+    /// sRGB and extended linear P3 only — the #98 encoded destinations
+    /// are swapchain colour spaces a CPU framebuffer does not model.
     fn present(&mut self, kind: PresentKind) -> Result<(), BenchError> {
+        match kind {
+            PresentKind::SrgbHw | PresentKind::SrgbShader | PresentKind::LinearP3 => {}
+            _ => {
+                return Err(BenchError::Engine(format!(
+                    "cherenkov-cpu: {} presentation is unsupported",
+                    kind.name()
+                )));
+            }
+        }
         self.present = Some(kind);
         Ok(())
     }
@@ -1486,6 +1503,7 @@ impl Engine for Cherenkov {
                 "cherenkov: submit before prepare".into(),
             ));
         }
+        let render_at = std::time::Instant::now();
         self.timings.render_frame(
             &self.engine,
             &mut self.clock,
@@ -1493,6 +1511,8 @@ impl Engine for Cherenkov {
             readback && self.has_motion,
             render_error,
         )?;
+        let render_seconds = render_at.elapsed().as_secs_f64();
+        let readback_at = std::time::Instant::now();
         let image = if readback {
             let rb = self
                 .surface
@@ -1523,6 +1543,12 @@ impl Engine for Cherenkov {
                 Some(PresentKind::LinearP3) => {
                     cherenkov_cpu::present_linear_p3(self.headroom, &rb.pixels)
                 }
+                Some(kind) => {
+                    return Err(BenchError::Engine(format!(
+                        "cherenkov-cpu: {} presentation is unsupported",
+                        kind.name()
+                    )));
+                }
                 None => rb.pixels,
             };
             Some(cherenkov_oracle::F32Image {
@@ -1537,6 +1563,8 @@ impl Engine for Cherenkov {
             image,
             gpu: Vec::new(),
             phases: None,
+            render_seconds: Some(render_seconds),
+            readback_seconds: readback.then(|| readback_at.elapsed().as_secs_f64()),
         })
     }
 

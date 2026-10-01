@@ -1,5 +1,9 @@
 //! Shared-device native presentation preserves extended color and resize ownership.
 
+use cherenkov::{
+    __engine_block as block, __engine_fn as split_fn, __engine_test as split_test,
+    __engine_wait as wait,
+};
 use cherenkov::{Engine, FrameTime, WorkingColor};
 use cherenkov_gpu::{
     Gpu, GpuConfig,
@@ -9,6 +13,7 @@ use cherenkov_gpu::{
     },
 };
 
+split_fn! {
 /// An adapter/device pair usable as a `SharedDevice`: passthrough backends
 /// need `PASSTHROUGH_SHADERS`, which the engine requires for its precompiled
 /// fixed shaders (issue #57).
@@ -16,24 +21,25 @@ fn shared_device()
 -> Result<(wgpu::Instance, wgpu::Adapter, wgpu::Device, wgpu::Queue), Box<dyn std::error::Error>> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter =
-        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?;
+        block!(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?;
     let required_features = match adapter.get_info().backend {
         wgpu::Backend::Vulkan | wgpu::Backend::Metal => wgpu::Features::PASSTHROUGH_SHADERS,
         _ => wgpu::Features::empty(),
     };
-    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+    let (device, queue) = block!(adapter.request_device(&wgpu::DeviceDescriptor {
         required_features,
         ..wgpu::DeviceDescriptor::default()
     }))?;
     Ok((instance, adapter, device, queue))
 }
+}
 
-#[test]
+split_test! {
 fn exported_texture_preserves_hdr_and_updates_after_resize()
 -> Result<(), Box<dyn std::error::Error>> {
-    let (instance, adapter, device, queue) = shared_device()?;
+    let (instance, adapter, device, queue) = wait!(shared_device())?;
     let backend = adapter.get_info().backend;
-    let engine = Engine::<Gpu>::new(GpuConfig {
+    let engine = wait!(Engine::<Gpu>::new(GpuConfig {
         device: Some(SharedDevice {
             instance,
             adapter,
@@ -41,15 +47,15 @@ fn exported_texture_preserves_hdr_and_updates_after_resize()
             queue: queue.clone(),
         }),
         ..GpuConfig::default()
-    })?;
+    }))?;
     let (target, textures) = TextureTarget::new((16, 16));
-    let source = engine.surface(target)?;
+    let source = wait!(engine.surface(target))?;
     source.clear_color(WorkingColor::new([4.0, 0.5, 0.0, 0.5]));
     let texture = textures.try_recv()?;
     let (target, destinations) = TextureTarget::new((16, 16));
-    let destination = engine.surface(target)?;
+    let destination = wait!(engine.surface(target))?;
     let output = destinations.try_recv()?;
-    engine.render(FrameTime::now())?;
+    wait!(engine.render(FrameTime::now()))?;
     let delivery = shader_delivery(backend, &device)?;
     let mut presenter = Presenter::new(&device, delivery);
     presenter.texture(
@@ -63,7 +69,7 @@ fn exported_texture_preserves_hdr_and_updates_after_resize()
             headroom: 4.0,
         },
     );
-    let pixel = destination.readback()?.pixels[0];
+    let pixel = wait!(destination.readback())?.pixels[0];
     // The stored texel is premultiplied [2, 0.25, 0, 0.5] — straight
     // (4, 0.5, 0). The tone map compresses it towards headroom 4 by a
     // per-pixel scalar (#97): the HDR channel stays extended (never
@@ -81,7 +87,7 @@ fn exported_texture_preserves_hdr_and_updates_after_resize()
     }
     assert!(pixel[0] > 1.0, "extended output keeps HDR range: {pixel:?}");
     source.clear_color(WorkingColor::new([1.0, 1.0, 1.0, 0.5]));
-    engine.render(FrameTime::now())?;
+    wait!(engine.render(FrameTime::now()))?;
     presenter.texture(
         &device,
         &queue,
@@ -93,7 +99,7 @@ fn exported_texture_preserves_hdr_and_updates_after_resize()
             headroom: 4.0,
         },
     );
-    let pixel = destination.readback()?.pixels[0];
+    let pixel = wait!(destination.readback())?.pixels[0];
     for actual in pixel {
         assert!(
             (actual - 0.5).abs() < 0.001,
@@ -101,7 +107,7 @@ fn exported_texture_preserves_hdr_and_updates_after_resize()
         );
     }
     source.resize((8, 4))?;
-    engine.render(FrameTime::now())?;
+    wait!(engine.render(FrameTime::now()))?;
     let resized = textures.try_recv()?;
     assert_eq!((resized.width(), resized.height()), (8, 4));
     assert_eq!(
@@ -115,13 +121,14 @@ fn exported_texture_preserves_hdr_and_updates_after_resize()
     );
     Ok(())
 }
+}
 
-#[test]
+split_test! {
 fn hardware_and_shader_srgb_store_the_same_premultiplied_bytes()
 -> Result<(), Box<dyn std::error::Error>> {
-    let (instance, adapter, device, queue) = shared_device()?;
+    let (instance, adapter, device, queue) = wait!(shared_device())?;
     let backend = adapter.get_info().backend;
-    let engine = Engine::<Gpu>::new(GpuConfig {
+    let engine = wait!(Engine::<Gpu>::new(GpuConfig {
         device: Some(SharedDevice {
             instance,
             adapter,
@@ -129,9 +136,9 @@ fn hardware_and_shader_srgb_store_the_same_premultiplied_bytes()
             queue: queue.clone(),
         }),
         ..GpuConfig::default()
-    })?;
+    }))?;
     let (target, textures) = TextureTarget::new((1, 1));
-    let surface = engine.surface(target)?;
+    let surface = wait!(engine.surface(target))?;
     let source = textures.recv()?;
     let view = source.create_view(&wgpu::TextureViewDescriptor::default());
     let delivery = shader_delivery(backend, &device)?;
@@ -149,7 +156,7 @@ fn hardware_and_shader_srgb_store_the_same_premultiplied_bytes()
     });
     for alpha in [0.0, 0.25, 0.5, 1.0] {
         surface.clear_color(WorkingColor::new([1.0, 1.0, 1.0, alpha]));
-        engine.render(FrameTime::now())?;
+        wait!(engine.render(FrameTime::now()))?;
         for output in &outputs {
             presenter.texture(
                 &device,
@@ -209,6 +216,7 @@ fn hardware_and_shader_srgb_store_the_same_premultiplied_bytes()
         buffer.unmap();
     }
     Ok(())
+}
 }
 
 fn presentation_target(device: &wgpu::Device, format: wgpu::TextureFormat) -> wgpu::Texture {

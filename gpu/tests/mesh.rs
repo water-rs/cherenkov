@@ -1,5 +1,6 @@
 //! Analytic mesh sampling and retained operands.
 use cherenkov::kurbo::{Affine, Point, Rect};
+use cherenkov::{__engine_test as split_test, __engine_wait as wait};
 use cherenkov::{
     Draw, Engine, FrameTime, MeshGradient, Offscreen, OffscreenFormat, Picture, WorkingColor,
 };
@@ -25,11 +26,11 @@ fn mesh(alpha: f32) -> MeshGradient {
     )
 }
 
-#[test]
+split_test! {
 fn mesh_interpolates_premultiplied_color_and_updates_one_retained_command() {
-    let engine = Engine::<Gpu>::new(GpuConfig::default()).expect("GPU");
-    let surface = engine
-        .surface(Offscreen::new((32, 32), OffscreenFormat::LinearF16))
+    let engine = wait!(Engine::<Gpu>::new(GpuConfig::default())).expect("GPU");
+    let surface = wait!(engine
+        .surface(Offscreen::new((32, 32), OffscreenFormat::LinearF16)))
         .expect("surface");
     let value = Binding::container(mesh(0.25));
     let fixed = Picture::record(|c| {
@@ -42,13 +43,13 @@ fn mesh_interpolates_premultiplied_color_and_updates_one_retained_command() {
     surface.update(|tx| {
         tx[surface.root()].content(content);
     });
-    engine.render(FrameTime::now()).expect("initial mesh");
+    wait!(engine.render(FrameTime::now())).expect("initial mesh");
     assert_eq!(engine.stats().commands_lowered, 2);
     for alpha in [0.25, 0.75, 1.0] {
         value.set(mesh(alpha));
-        engine.render(FrameTime::now()).expect("mesh edit");
+        wait!(engine.render(FrameTime::now())).expect("mesh edit");
         assert_eq!(engine.stats().commands_lowered, 1);
-        let pixels = surface.readback().expect("pixels").pixels;
+        let pixels = wait!(surface.readback()).expect("pixels").pixels;
         let u = 8.5_f32 / 16.0;
         let v = 10.5_f32 / 16.0;
         let expected = [
@@ -65,7 +66,8 @@ fn mesh_interpolates_premultiplied_color_and_updates_one_retained_command() {
             [0; 4],
             "outside the mesh is transparent"
         );
-        engine.render(FrameTime::now()).expect("idle");
+        wait!(engine.render(FrameTime::now())).expect("idle");
         assert_eq!(engine.stats().commands_lowered, 0);
     }
+}
 }

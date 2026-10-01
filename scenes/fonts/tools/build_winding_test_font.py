@@ -87,6 +87,9 @@ def build():
     }
 
     fb = FontBuilder(UPEM, isTTF=True)
+    # Pin the head timestamps so the output is reproducible byte-for-byte.
+    fb.font["head"].created = 3873465583
+    fb.font["head"].modified = 3873465583
     fb.setupGlyphOrder(order)
     fb.setupCharacterMap(cmap)
     fb.setupGlyf(glyphs)

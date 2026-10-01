@@ -1,6 +1,8 @@
 //! Component animation preserves recorded content on both rendering backends.
 
+use cherenkov::Instant;
 use cherenkov::kurbo::{Affine, Circle, Rect, Vec2};
+use cherenkov::{__engine_fn as split_fn, __engine_wait as wait};
 use cherenkov::{
     Animation, Backend, Curve, Draw, Engine, FrameTime, Next, Offscreen, OffscreenFormat, Picture,
     WorkingColor, snap_animating,
@@ -8,16 +10,17 @@ use cherenkov::{
 use nami::SignalExt as _;
 use std::cell::Cell;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+split_fn! {
 /// Compare engine-sampled live rotation to explicitly placed retained content.
 pub fn component_animation<B: Backend>(config: B::Config) {
-    let engine = Engine::<B>::new(config).expect("backend required");
-    let actual = engine
-        .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))
+    let engine = wait!(Engine::<B>::new(config)).expect("backend required");
+    let actual = wait!(engine
+        .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16)))
         .expect("surface");
-    let reference = engine
-        .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))
+    let reference = wait!(engine
+        .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16)))
         .expect("reference");
     let layer = actual.layer();
     let fixed = Picture::record(|r| {
@@ -73,10 +76,10 @@ pub fn component_animation<B: Backend>(config: B::Config) {
         reference.update(|tx| {
             tx[reference.root()].transform(matrix);
         });
-        let next = engine
+        let next = wait!(engine
             .render(FrameTime::at(
                 start + Duration::from_millis(u64::from(step) * 125),
-            ))
+            )))
             .expect("frame");
         assert_eq!(matches!(next, Next::At { .. }), step < 8);
         if step > 0 {
@@ -86,8 +89,8 @@ pub fn component_animation<B: Backend>(config: B::Config) {
                 "animation must reuse the recorded commands"
             );
         }
-        let a = actual.readback().expect("animated");
-        let b = reference.readback().expect("reference");
+        let a = wait!(actual.readback()).expect("animated");
+        let b = wait!(reference.readback()).expect("reference");
         for (index, (a, b)) in a.pixels.iter().zip(b.pixels).enumerate() {
             for (a, b) in a.iter().zip(b) {
                 assert!(
@@ -107,9 +110,11 @@ pub fn component_animation<B: Backend>(config: B::Config) {
         "a signal wakes an idle engine without a transaction"
     );
     drop(layer);
-    signal_drops_with_the_layer(&engine, &angle, &wakes, start);
+    wait!(signal_drops_with_the_layer(&engine, &angle, &wakes, start));
+}
 }
 
+split_fn! {
 /// After a bound layer drops, its signal no longer wakes the engine.
 fn signal_drops_with_the_layer<B: Backend>(
     engine: &Engine<B>,
@@ -117,8 +122,8 @@ fn signal_drops_with_the_layer<B: Backend>(
     wakes: &Cell<usize>,
     start: Instant,
 ) {
-    engine
-        .render(FrameTime::at(start + Duration::from_secs(2)))
+    wait!(engine
+        .render(FrameTime::at(start + Duration::from_secs(2))))
         .expect("remove bound layer");
     let before = wakes.get();
     angle.set(1.);
@@ -127,4 +132,5 @@ fn signal_drops_with_the_layer<B: Backend>(
         before,
         "dropping layer disconnects component bindings"
     );
+}
 }

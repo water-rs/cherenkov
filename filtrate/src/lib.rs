@@ -25,6 +25,8 @@
 //!
 //! - [`filters`]: the built-in filters (`Brightness`, `Blur`, …).
 //! - [`Executor`]: the reference wgpu executor, an [`Effect`].
+//! - [`ShaderEffect`]: an application-supplied WGSL fragment shader run
+//!   over the input, an [`Effect`].
 //! - `shaders/` (not a Rust module): the stages' WGSL snippets, included by
 //!   the filters that use them.
 //!
@@ -65,6 +67,7 @@ mod cpu;
 pub mod effect;
 mod executor;
 pub mod filters;
+pub mod shader_effect;
 
 pub use aux_image::{FilterImage, LutImage, TextureImage};
 pub use effect::{
@@ -80,6 +83,8 @@ pub use filtrate_core::{
     ParamSource, Placed, ShapeInput, SignalVisitor, SpatialFilter, SpatialStage, StageCollector,
     WatchGuard, WorkingSpace, kind,
 };
+
+pub use shader_effect::{SHADER_EFFECT_MAX_PARAMS, ShaderEffect, ShaderEffectError};
 
 /// Procedural derive that generates a single-stage filter: the [`Filter`]
 /// implementation and its kind trait. See `filtrate-derive` for the

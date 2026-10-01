@@ -203,6 +203,31 @@ pub const PROJECTIVE_GROUPS: &[&[Entry]] = &[ENGINE_GROUP0, PROJECTIVE_GROUP1];
 #[allow(dead_code)]
 pub const MIP_GROUPS: &[&[Entry]] = &[MIP_GROUP0];
 
+/// Group 1 of the Vulkan native external-frame module: `EXTERNAL_GROUP1`
+/// plus the designated texture/sampler pair at bindings 5–6 that the
+/// `external_native` build lowering merges into the combined sampled
+/// image at binding 5 (the `VkSamplerYcbcrConversion` sampler).
+///
+/// Used by `build.rs` only — the Vulkan descriptor layout is declared in
+/// `render::external::vulkan` because an immutable sampler cannot be
+/// expressed in this table.
+#[allow(dead_code)]
+pub const NATIVE_EXTERNAL_GROUP1: &[Entry] = &[
+    Entry::texture_uint(0),
+    Entry::texture_uint(1),
+    Entry::texture(2),
+    Entry::texture(3),
+    Entry::uniform(4, FRAGMENT, false, EXTERNAL_PARAMS_SIZE),
+    Entry::texture(5),
+    Entry::sampler(6),
+];
+
+/// The Vulkan native external-frame module's groups.
+///
+/// Used by `build.rs` only.
+#[allow(dead_code)]
+pub const NATIVE_EXTERNAL_GROUPS: &[&[Entry]] = &[ENGINE_GROUP0, NATIVE_EXTERNAL_GROUP1];
+
 /// One resource's Metal argument slots.
 ///
 /// Used by `build.rs` to emit matching MSL.

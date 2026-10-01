@@ -128,6 +128,113 @@ pub fn srgb_encode(c: f64) -> f64 {
     }
 }
 
+/// The sRGB OETF continued beyond `[0, 1]` with odd symmetry through the
+/// origin — the wire format of the `ExtendedSrgb`/`ExtendedDisplayP3`
+/// surface colour spaces (#98).
+#[must_use]
+pub fn srgb_encode_extended(c: f64) -> f64 {
+    let a = c.abs();
+    let e = if a <= 0.003_130_8 {
+        a * 12.92
+    } else {
+        1.055f64.mul_add(a.powf(1.0 / 2.4), -0.055)
+    };
+    c.signum() * e
+}
+
+/// The inverse of [`srgb_encode_extended`] — lifts an encoded
+/// extended-range channel back to linear light.
+#[must_use]
+pub fn srgb_decode_extended(c: f64) -> f64 {
+    let a = c.abs();
+    let e = if a <= 0.04045 {
+        a / 12.92
+    } else {
+        ((a + 0.055) / 1.055).powf(2.4)
+    };
+    c.signum() * e
+}
+
+/// SMPTE ST 2084 (PQ) OETF: luminance normalized to 10 000 nits to the
+/// encoded signal.
+#[must_use]
+pub fn pq_encode(c: f64) -> f64 {
+    let y = c.max(0.0).powf(0.159_301_757_812_5);
+    ((0.835_937_5f64).mul_add(1.0, 18.851_562_5 * y) / (18.687_5f64).mul_add(y, 1.0))
+        .powf(78.843_75)
+}
+
+/// PQ EOTF: the encoded signal to luminance normalized to 10 000 nits.
+#[must_use]
+pub fn pq_decode(c: f64) -> f64 {
+    let e = c.clamp(0.0, 1.0).powf(1.0 / 78.843_75);
+    ((e - 0.835_937_5).max(0.0) / (18.687_5f64).mul_add(-e, 18.851_562_5))
+        .powf(1.0 / 0.159_301_757_812_5)
+}
+
+/// BT.2100 HLG OETF on one channel of a scene signal normalized to the
+/// 1000-nit nominal peak.
+#[must_use]
+pub fn hlg_encode_channel(c: f64) -> f64 {
+    let y = c.max(0.0);
+    if y <= 1.0 / 12.0 {
+        (3.0 * y).sqrt()
+    } else {
+        0.178_832_77f64.mul_add(12.0f64.mul_add(y, -0.284_668_92).ln(), 0.559_910_73)
+    }
+}
+
+/// BT.2100 HLG inverse OETF: the encoded signal back to the scene signal.
+#[must_use]
+pub fn hlg_decode_channel(e: f64) -> f64 {
+    let e = e.clamp(0.0, 1.0);
+    if e <= 0.5 {
+        e * e / 3.0
+    } else {
+        (((e - 0.559_910_73) / 0.178_832_77).exp() + 0.284_668_92) / 12.0
+    }
+}
+
+/// The BT.2100 reference OOTF's inverse.
+///
+/// Display-referred linear BT.2020 (in units of the 1000-nit nominal
+/// peak) to the scene signal the OETF encodes — the system-gamma 1.2
+/// contract shared with `present.wgsl`'s HLG path (#98).
+#[must_use]
+pub fn hlg_inverse_ootf(rgb: [f64; 3]) -> [f64; 3] {
+    let y = 0.059_3f64.mul_add(rgb[2], 0.262_7f64.mul_add(rgb[0], 0.678_0 * rgb[1]));
+    if y <= 0.0 {
+        return [0.0; 3];
+    }
+    rgb.map(|c| c * y.powf(1.0 / 1.2 - 1.0))
+}
+
+/// The BT.2100 reference OOTF: a scene signal to display light, system
+/// gamma 1.2 — for lifting a presented HLG signal back to linear.
+#[must_use]
+pub fn hlg_ootf(rgb: [f64; 3]) -> [f64; 3] {
+    let y = 0.059_3f64.mul_add(rgb[2], 0.262_7f64.mul_add(rgb[0], 0.678_0 * rgb[1]));
+    if y <= 0.0 {
+        return [0.0; 3];
+    }
+    rgb.map(|c| c * y.powf(0.2))
+}
+
+/// Convert a linear Display P3 colour to linear BT.2020 (D65). Values
+/// are not clamped.
+#[must_use]
+pub fn linear_p3_to_linear_bt2020(p3: [f64; 3]) -> [f64; 3] {
+    mat3_mul(&mat3_inv(&REC2020_TO_XYZ), mat3_mul(&P3_TO_XYZ, p3))
+}
+
+/// Convert a linear BT.2020 colour to linear Display P3. Values are not
+/// clamped.
+#[must_use]
+pub fn linear_bt2020_to_linear_p3(bt2020: [f64; 3]) -> [f64; 3] {
+    let (_, rec2020_to_p3, _) = build_matrices();
+    mat3_mul(&rec2020_to_p3, bt2020)
+}
+
 /// Convert one channel of a scene colour to linear light for its declared
 /// colour space's transfer function.
 fn to_linear_channel(space: ColorSpace, c: f64) -> f64 {

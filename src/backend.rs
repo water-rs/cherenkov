@@ -228,6 +228,11 @@ pub struct SurfaceInfo {
     pub size: (u32, u32),
     /// Whether [`Renderer::readback`] works on the surface.
     pub readable: bool,
+    /// Whether the surface presents to a display — a window with a
+    /// swapchain. Only a presenting surface carries pending-presentation
+    /// state: a [`Display`] update on any other target never marks a
+    /// frame for presentation.
+    pub presents: bool,
 }
 
 /// Whether a backend wants another frame after the current one.
@@ -267,6 +272,18 @@ pub struct SurfaceFrame<'a> {
     /// Whether a property op, a content op or an animation step touched the
     /// surface since the last render.
     pub changed: bool,
+    /// Whether the window should present this frame even when `changed` is
+    /// false — a headroom update reaches the swapchain without touching the
+    /// layer tree or any content cache (#98).
+    pub present_pending: bool,
+    /// Whether the host announced the surface moved to another display
+    /// since the previous frame ([`Surface::display_moved`]). A presenting
+    /// backend re-enumerates the surface's capabilities on it — a
+    /// headroom-only [`Display`] update never triggers re-enumeration
+    /// (#98).
+    ///
+    /// [`Surface::display_moved`]: crate::Surface::display_moved
+    pub display_moved: bool,
     /// The sampled layer tree.
     pub tree: &'a SurfaceTree,
 }

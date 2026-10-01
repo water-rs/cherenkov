@@ -30,6 +30,8 @@
 
 pub mod affinity;
 #[cfg(feature = "cherenkov")]
+pub mod capture;
+#[cfg(feature = "cherenkov")]
 pub mod cherenkov_ad;
 #[cfg(feature = "cherenkov-cpu")]
 pub mod cherenkov_cpu_ad;
@@ -44,6 +46,7 @@ pub mod motion;
 #[cfg(feature = "cherenkov")]
 pub mod present_cost;
 pub mod projective_quality;
+pub mod refcache;
 pub mod report;
 #[cfg(any(feature = "cherenkov", feature = "cherenkov-cpu"))]
 pub mod timing;
@@ -273,6 +276,13 @@ pub struct Submit {
     /// Render-thread CPU timings for Cherenkov GPU; `None` when the adapter
     /// does not expose phase timings.
     pub phases: Option<Phases>,
+    /// Wall-clock seconds this call spent rasterizing before any readback
+    /// began (queue drains and timestamp markers included), where the
+    /// adapter separates the two stages; `None` otherwise.
+    pub render_seconds: Option<f64>,
+    /// Wall-clock seconds this call spent reading the pixels back;
+    /// `None` when `readback` was false.
+    pub readback_seconds: Option<f64>,
 }
 
 /// Resources an adapter needs to encode one scene.
@@ -294,6 +304,25 @@ pub enum PresentKind {
     /// `Rgba16Float` extended linear Display P3
     /// (`OutputColor::LinearDisplayP3`).
     LinearP3,
+    /// Display P3 SDR on an sRGB texture format — hardware transfer,
+    /// P3 destination gamut (#98).
+    DisplayP3Hw,
+    /// Display P3 SDR on `Rgba8Unorm`; `present.wgsl` applies the
+    /// transfer (#98).
+    DisplayP3Shader,
+    /// `Rgba16Float` extended linear sRGB — scRGB
+    /// (`OutputColor::ExtendedSrgbLinear`, #98).
+    Scrgb,
+    /// `Rgba16Float` encoded extended sRGB
+    /// (`OutputColor::ExtendedSrgb`, #98).
+    ExtendedSrgb,
+    /// `Rgba16Float` encoded extended Display P3
+    /// (`OutputColor::ExtendedDisplayP3`, #98).
+    ExtendedP3,
+    /// `Rgba16Float` BT.2100 PQ signal (`OutputColor::Bt2100Pq`, #98).
+    Pq,
+    /// `Rgba16Float` BT.2100 HLG signal (`OutputColor::Bt2100Hlg`, #98).
+    Hlg,
 }
 
 impl PresentKind {
@@ -304,6 +333,13 @@ impl PresentKind {
             Self::SrgbHw => "srgb-hw",
             Self::SrgbShader => "srgb-shader",
             Self::LinearP3 => "linear-p3",
+            Self::DisplayP3Hw => "display-p3-hw",
+            Self::DisplayP3Shader => "display-p3-shader",
+            Self::Scrgb => "scrgb",
+            Self::ExtendedSrgb => "extended-srgb",
+            Self::ExtendedP3 => "extended-p3",
+            Self::Pq => "pq",
+            Self::Hlg => "hlg",
         }
     }
 }

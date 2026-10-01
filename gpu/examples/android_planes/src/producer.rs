@@ -30,6 +30,10 @@ pub struct Pool {
     pub produced: u64,
     /// Release fences observed signalled.
     pub signalled: u64,
+    /// The launch's `paused` flag: after the first frame is in flight
+    /// the pool stops producing, leaving a static video frame on the
+    /// layer for the idle-video measurement.
+    paused: bool,
     /// The pre-signalled timeline acquire (`timeline` pools only).
     semaphore: Option<vk::Semaphore>,
     ash: ash::Device,
@@ -60,7 +64,7 @@ impl Pool {
     /// # Errors
     /// When `spec.timeline` is set but the device has no timeline
     /// semaphores, or Vulkan refuses the semaphore.
-    pub fn new(device: &vulkan::Device, spec: Spec) -> Result<Self, String> {
+    pub fn new(device: &vulkan::Device, spec: Spec, paused: bool) -> Result<Self, String> {
         let ash = device.shared.vk.device.clone();
         let semaphore = if spec.timeline {
             if !device.caps().timeline_semaphore {
@@ -99,6 +103,7 @@ impl Pool {
             device: device.clone(),
             spec,
             slots,
+            paused,
             produced: 0,
             signalled: 0,
             semaphore,
@@ -111,8 +116,12 @@ impl Pool {
     }
 
     /// Fills a free buffer, imports it as the next generation and returns
-    /// it for installation. `None` while every buffer is in flight.
+    /// it for installation. `None` while every buffer is in flight, and
+    /// once the first frame is out when the pool is `paused`.
     pub fn produce(&mut self) -> Option<Frame> {
+        if self.paused && self.produced != 0 {
+            return None;
+        }
         self.drain();
         let Some(slot) = self.slots.iter_mut().find(|slot| slot.flight.is_none()) else {
             self.stalls += 1;

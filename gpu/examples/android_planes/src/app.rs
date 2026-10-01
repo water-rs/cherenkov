@@ -30,8 +30,11 @@ const FONT: &str = "/system/fonts/Roboto-Regular.ttf";
 #[unsafe(no_mangle)]
 pub extern "Rust" fn android_main(app: AndroidApp) {
     let decisions = observe::install();
-    let scenario = read_scenario(&app);
-    logcat::line(&format!("scenario={} starting", scenario.name()));
+    let (scenario, paused) = read_launch(&app);
+    logcat::line(&format!(
+        "scenario={} starting paused={paused}",
+        scenario.name()
+    ));
 
     let mut run: Option<Run> = None;
     let mut inset_top: Option<i32> = None;
@@ -73,7 +76,7 @@ pub extern "Rust" fn android_main(app: AndroidApp) {
                 window.height()
             ));
         }
-        let run = run.get_or_insert_with(|| Run::new(&window, scenario, &decisions));
+        let run = run.get_or_insert_with(|| Run::new(&window, scenario, paused, &decisions));
         if resized {
             run.resize(&window);
         }
@@ -88,24 +91,28 @@ pub extern "Rust" fn android_main(app: AndroidApp) {
     logcat::line(&format!("scenario={} exiting", scenario.name()));
 }
 
-/// The intent's `scenario` string extra via JNI; unknown or missing
-/// values run `overlay`.
-fn read_scenario(app: &AndroidApp) -> Scenario {
-    match intent_scenario(app) {
-        Ok(name) => Scenario::parse(name.as_deref().unwrap_or("overlay")),
+/// The intent's launch extras via JNI: the `scenario` string (unknown
+/// or missing values run `overlay`) and `paused` (the producer stops
+/// after the first frame for the idle-video measurement).
+fn read_launch(app: &AndroidApp) -> (Scenario, bool) {
+    match intent_extras(app) {
+        Ok((name, paused)) => (
+            Scenario::parse(name.as_deref().unwrap_or("overlay")),
+            paused,
+        ),
         Err(e) => {
             logcat::warn(&format!(
-                "reading the scenario extra failed ({e}); running overlay"
+                "reading the launch extras failed ({e}); running overlay"
             ));
-            Scenario::Overlay
+            (Scenario::Overlay, false)
         }
     }
 }
 
-fn intent_scenario(app: &AndroidApp) -> Result<Option<String>, String> {
+fn intent_extras(app: &AndroidApp) -> Result<(Option<String>, bool), String> {
     use jni::objects::{JObject, JString, JValue};
     let vm = unsafe { jni::JavaVM::from_raw(app.vm_as_ptr().cast()) };
-    vm.attach_current_thread(|env| -> jni::errors::Result<Option<String>> {
+    vm.attach_current_thread(|env| -> jni::errors::Result<(Option<String>, bool)> {
         // android-activity owns the activity's global ref; hold it
         // through a local ref so this `JObject` only deletes what it
         // created.
@@ -123,22 +130,32 @@ fn intent_scenario(app: &AndroidApp) -> Result<Option<String>, String> {
             )?
             .l()?;
         if intent.is_null() {
-            return Ok(None);
+            return Ok((None, false));
         }
         let key = env.new_string("scenario")?;
         let extra = env
             .call_method(
-                intent,
+                &intent,
                 jni::jni_str!("getStringExtra"),
                 jni::jni_sig!("(Ljava/lang/String;)Ljava/lang/String;"),
                 &[JValue::Object(key.as_ref())],
             )?
             .l()?;
-        if extra.is_null() {
-            return Ok(None);
-        }
-        let string = env.cast_local::<JString>(extra)?;
-        string.try_to_string(env).map(Some)
+        let scenario = if extra.is_null() {
+            None
+        } else {
+            Some(env.cast_local::<JString>(extra)?.try_to_string(env)?)
+        };
+        let key = env.new_string("paused")?;
+        let paused = env
+            .call_method(
+                &intent,
+                jni::jni_str!("getBooleanExtra"),
+                jni::jni_sig!("(Ljava/lang/String;Z)Z"),
+                &[JValue::Object(key.as_ref()), JValue::Bool(false)],
+            )?
+            .z()?;
+        Ok((scenario, paused))
     })
     .map_err(|e| e.to_string())
 }
@@ -173,7 +190,12 @@ struct Video {
 impl Run {
     /// Brings the whole pipeline up: shared Vulkan device, engine, the
     /// surface-control surface and the scenario's layers and producers.
-    fn new(window: &NativeWindow, scenario: Scenario, decisions: &Arc<Decisions>) -> Self {
+    fn new(
+        window: &NativeWindow,
+        scenario: Scenario,
+        paused: bool,
+        decisions: &Arc<Decisions>,
+    ) -> Self {
         logcat::line("creating the shared GPU device");
         let shared = SharedDevice::create(&GpuConfig::default()).expect("shared GPU device");
         let vk = vulkan::Device::new(&shared).expect("vulkan import context");
@@ -211,7 +233,7 @@ impl Run {
             .zip(layers)
             .map(|(spec, layer)| Video {
                 layer,
-                producer: Pool::new(&vk, spec).expect("producer pool"),
+                producer: Pool::new(&vk, spec, paused).expect("producer pool"),
             })
             .collect();
         logcat::line(&format!("{} video layer(s) built", videos.len()));

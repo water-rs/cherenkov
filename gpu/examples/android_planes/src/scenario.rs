@@ -8,8 +8,31 @@ use cherenkov::{Layer, Surface};
 use cherenkov_gpu::Gpu;
 use cherenkov_gpu::interop::{FrameColor, HdrMetadata};
 
-use crate::ahb::Format;
-use crate::producer::Spec;
+/// The buffer formats the harness produces.
+#[derive(Clone, Copy, Debug)]
+pub enum Format {
+    /// `Y8Cb8Cr8_420`: 8-bit NV12 or I420, decoded as BT.709 video range.
+    Nv12,
+    /// `YCbCr_P010`: semi-planar 10-bit in u16s, decoded as BT.2020 PQ.
+    P010,
+}
+
+/// What one video layer produces.
+#[derive(Clone, Copy)]
+pub struct Spec {
+    /// The buffer format.
+    pub format: Format,
+    /// `COMPOSER_OVERLAY` in the AHB usage — required for promotion.
+    pub overlay: bool,
+    /// Acquire through a host-signalled timeline semaphore, which the
+    /// plane contract rejects with `SemaphoreAcquire` — the `in-engine`
+    /// scenario's forcing mechanism.
+    pub timeline: bool,
+    /// The frame's decode contract.
+    pub color: FrameColor,
+    /// Static HDR metadata travelling with a promoted frame.
+    pub hdr: HdrMetadata,
+}
 
 /// One launch-time scenario, from the intent's `scenario` string extra.
 #[derive(Clone, Copy, Debug)]
@@ -113,14 +136,26 @@ impl Scenario {
         }
     }
 
-    /// Builds the scenario's layer tree under `surface`'s root and returns
-    /// the video layers in `videos()` order. The `controls` layer sits on
-    /// top of everything.
-    pub fn build(self, surface: &Surface<Gpu>, controls: cherenkov::Content) -> Vec<Layer> {
+    /// Builds the scenario's layer tree under `surface`'s root. Returns
+    /// `(videos, rest)`: the video layers in `videos()` order plus every
+    /// other live layer (parent layers and `controls`, on top of
+    /// everything). The caller keeps all of them — a dropped handle
+    /// queues its `Remove` ahead of the ops that attach it.
+    pub fn build(
+        self,
+        surface: &Surface<Gpu>,
+        controls: cherenkov::Content,
+    ) -> (Vec<Layer>, Vec<Layer>) {
         let w = f64::from(surface.size().0);
         let h = f64::from(surface.size().1);
         let root = surface.root();
+        // Allocated outside the transaction: every handle has to
+        // outlive the build (dropping one inside queues its `Remove`
+        // ahead of the transaction's `Push` and breaks the committed
+        // op stream — a dead layer kills the render thread).
+        let overlay_controls = surface.layer();
         let mut videos = Vec::new();
+        let mut rest = Vec::new();
         surface.update(|tx| {
             match self {
                 Self::Overlay | Self::Hdr | Self::NoOverlay | Self::InEngine => {
@@ -143,6 +178,7 @@ impl Scenario {
                     tx[&parent].push(&video);
                     tx[root].push(&parent);
                     videos.push(video);
+                    rest.push(parent);
                 }
                 Self::Quarter => {
                     let parent = surface.layer();
@@ -157,6 +193,7 @@ impl Scenario {
                     tx[&parent].push(&video);
                     tx[root].push(&parent);
                     videos.push(video);
+                    rest.push(parent);
                 }
                 Self::Rotated => {
                     let video = surface.layer();
@@ -181,6 +218,7 @@ impl Scenario {
                     tx[&parent].push(&video);
                     tx[root].push(&parent);
                     videos.push(video);
+                    rest.push(parent);
                 }
                 Self::Two => {
                     let first = surface.layer();
@@ -194,10 +232,10 @@ impl Scenario {
                     videos.push(second);
                 }
             }
-            let overlay_controls = surface.layer();
             tx[&overlay_controls].content(controls);
             tx[root].push(&overlay_controls);
         });
-        videos
+        rest.push(overlay_controls);
+        (videos, rest)
     }
 }

@@ -145,12 +145,14 @@ struct Run {
     decisions: Arc<Decisions>,
     scenario: Scenario,
     next_log: Instant,
-    last_render_error: Option<String>,
     /// `false` until the first frame renders — a crash before then is a
     /// device/import problem, not a presentation one.
     logged_first_frame: bool,
     /// `LayerId`s whose first settled verdict was already logged.
     logged_verdicts: Vec<u64>,
+    /// Parent and controls layer handles: keeps their layers alive for
+    /// the run (dropping a live layer queues its `Remove`).
+    _rest: Vec<Layer>,
     _font: Font,
 }
 
@@ -193,7 +195,7 @@ impl Run {
         let controls = controls_content(font.id(), &font_data, scenario);
 
         let specs = scenario.videos();
-        let layers = scenario.build(&surface, controls);
+        let (layers, rest) = scenario.build(&surface, controls);
         assert_eq!(specs.len(), layers.len(), "videos and layers pair");
         let videos: Vec<Video> = specs
             .into_iter()
@@ -212,9 +214,9 @@ impl Run {
             decisions: Arc::clone(decisions),
             scenario,
             next_log: Instant::now(),
-            last_render_error: None,
             logged_first_frame: false,
             logged_verdicts: Vec::new(),
+            _rest: rest,
             _font: font,
         }
     }
@@ -227,7 +229,10 @@ impl Run {
             window.height().cast_unsigned(),
         );
         if let Err(e) = self.surface.resize(size) {
-            logcat::warn(&format!("resize: {e}"));
+            logcat::error(&format!(
+                "resize failed: {e}; render thread is gone, exiting"
+            ));
+            std::process::exit(1);
         }
     }
 
@@ -250,18 +255,17 @@ impl Run {
         });
         match self.engine.render(FrameTime::now()) {
             Ok(_) => {
-                self.last_render_error = None;
                 if !self.logged_first_frame {
                     self.logged_first_frame = true;
                     logcat::line("first engine frame rendered");
                 }
             }
             Err(e) => {
-                let error = e.to_string();
-                if self.last_render_error.as_deref() != Some(error.as_str()) {
-                    logcat::error(&format!("render: {error}"));
-                    self.last_render_error = Some(error);
-                }
+                // A dead render thread leaves the harness logging a
+                // heartbeat while the screen shows nothing — die loudly
+                // instead of looking alive.
+                logcat::error(&format!("render failed: {e}; exiting"));
+                std::process::exit(1);
             }
         }
         for video in &self.videos {

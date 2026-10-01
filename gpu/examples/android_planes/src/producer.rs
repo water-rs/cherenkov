@@ -6,35 +6,19 @@ use std::os::fd::AsRawFd;
 use std::os::fd::OwnedFd;
 
 use ash::vk::{self, Handle as _};
+use cherenkov_gpu::interop::RgbAlpha;
 use cherenkov_gpu::interop::vulkan::{
     self, Ahb, Frame, FrameSource, NativeError, ReleaseSync, Wait,
 };
-use cherenkov_gpu::interop::{FrameColor, HdrMetadata, RgbAlpha};
 use ndk_sys::AHardwareBuffer;
 
-use crate::ahb::{self, Format};
+use crate::ahb;
 use crate::logcat;
+use crate::scenario::Spec;
 
 /// Four buffers cover the engine's plus `SurfaceFlinger`'s release latency
 /// with slack; a deeper stall simply pauses the video.
 const POOL: usize = 4;
-
-/// What one video layer produces.
-#[derive(Clone, Copy)]
-pub struct Spec {
-    /// The buffer format.
-    pub format: Format,
-    /// `COMPOSER_OVERLAY` in the AHB usage — required for promotion.
-    pub overlay: bool,
-    /// Acquire through a host-signalled timeline semaphore, which the
-    /// plane contract rejects with `SemaphoreAcquire` — the `in-engine`
-    /// scenario's forcing mechanism.
-    pub timeline: bool,
-    /// The frame's decode contract.
-    pub color: FrameColor,
-    /// Static HDR metadata travelling with a promoted frame.
-    pub hdr: HdrMetadata,
-}
 
 /// A ring of `AHardwareBuffer`s feeding one video layer.
 pub struct Pool {

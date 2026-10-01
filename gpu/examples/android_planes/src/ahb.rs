@@ -9,6 +9,8 @@ use std::ptr;
 
 use ndk_sys::{AHardwareBuffer, AHardwareBuffer_Desc, AHardwareBuffer_Planes};
 
+use crate::scenario::Format;
+
 /// Width of every video frame.
 pub const WIDTH: u32 = 1920;
 /// Height of every video frame.
@@ -17,15 +19,6 @@ pub const HEIGHT: u32 = 1080;
 const BAR: u32 = 24;
 const STRIP: u32 = 40;
 const CELL: u32 = 24;
-
-/// The buffer formats the harness produces.
-#[derive(Clone, Copy, Debug)]
-pub enum Format {
-    /// `Y8Cb8Cr8_420`: 8-bit NV12 or I420, decoded as BT.709 video range.
-    Nv12,
-    /// `YCbCr_P010`: semi-planar 10-bit in u16s, decoded as BT.2020 PQ.
-    P010,
-}
 
 /// `AHardwareBuffer` usage for a video: GPU-sampled and CPU-written;
 /// `overlay` adds the `COMPOSER_OVERLAY` bit plane promotion requires.

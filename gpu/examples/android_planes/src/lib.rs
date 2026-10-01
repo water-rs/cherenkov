@@ -1,12 +1,17 @@
 //! On-device verification harness for cherenkov's Android
 //! system-compositor planes (issue #90).
 
-#![cfg(target_os = "android")]
+pub mod scenario;
 
+#[cfg(target_os = "android")]
 mod ahb;
+#[cfg(target_os = "android")]
 mod app;
+#[cfg(target_os = "android")]
 mod logcat;
+#[cfg(target_os = "android")]
 mod observe;
+#[cfg(target_os = "android")]
 mod producer;
-mod scenario;
+#[cfg(target_os = "android")]
 mod text;

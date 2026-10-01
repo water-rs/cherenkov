@@ -3,6 +3,7 @@
 #![expect(clippy::float_cmp, reason = "clear pixels are exact")]
 
 use cherenkov::kurbo::{Point, Rect};
+use cherenkov::{__engine_fn as split_fn, __engine_test as split_test, __engine_wait as wait};
 use cherenkov::{
     BlendMode, BlendSpace, Color, ColorStop, Draw, Extend, Group, Interpolation, Paint, Srgb,
     WorkingColor,
@@ -18,15 +19,18 @@ const GREY: WorkingColor = WorkingColor::new([0.5, 0.5, 0.5, 1.0]);
 const HDR_RED: WorkingColor = WorkingColor::new([1.5, 0.0, 0.0, 1.0]);
 const HDR_BLUE: WorkingColor = WorkingColor::new([0.0, 0.0, 1.25, 1.0]);
 
+split_fn! {
 /// An engine, or `None` when no adapter exists.
 fn engine() -> Option<Engine<Gpu>> {
-    match Engine::<Gpu>::new(GpuConfig::default()) {
+    match wait!(Engine::<Gpu>::new(GpuConfig::default())) {
         Ok(engine) => Some(engine),
         Err(EngineError::Backend(_)) => None,
         Err(e) => panic!("engine init failed: {e}"),
     }
 }
+}
 
+split_fn! {
 /// Renders a red backdrop rect and a blue blend-layer rect; returns the
 /// overlap pixel at (24,32) — inside the backdrop only for x < 32 — plus
 /// the pass count.
@@ -34,7 +38,7 @@ fn render_blend(
     engine: &Engine<Gpu>,
     mode: BlendMode,
 ) -> Result<([f32; 4], u32), Box<dyn std::error::Error>> {
-    let surface = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
+    let surface = wait!(engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16)))?;
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|c| {
             c.fill(Rect::new(0., 0., 32., 64.), RED);
@@ -50,20 +54,21 @@ fn render_blend(
             c.fill(Rect::new(16., 0., 64., 64.), BLUE);
         }));
     });
-    engine.render(cherenkov::FrameTime::now())?;
-    let rb = surface.readback()?;
+    wait!(engine.render(cherenkov::FrameTime::now()))?;
+    let rb = wait!(surface.readback())?;
     Ok((
         rb.pixels[(32 * rb.width + 24) as usize],
         engine.stats().passes,
     ))
 }
+}
 
-#[test]
+split_test! {
 fn multiply_blends_the_overlap() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(engine) = engine() else {
+    let Some(engine) = wait!(engine()) else {
         return Ok(());
     };
-    let (px, passes) = render_blend(&engine, BlendMode::Multiply)?;
+    let (px, passes) = wait!(render_blend(&engine, BlendMode::Multiply))?;
     // Opaque red × opaque blue = opaque black.
     for c in &px[..3] {
         assert!(c.abs() < 1e-2, "multiply overlap: {px:?}");
@@ -72,13 +77,14 @@ fn multiply_blends_the_overlap() -> Result<(), Box<dyn std::error::Error>> {
     assert!(passes >= 2, "a blend layer must isolate: passes {passes}");
     Ok(())
 }
+}
 
-#[test]
+split_test! {
 fn screen_blends_the_overlap() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(engine) = engine() else {
+    let Some(engine) = wait!(engine()) else {
         return Ok(());
     };
-    let (px, _) = render_blend(&engine, BlendMode::Screen)?;
+    let (px, _) = wait!(render_blend(&engine, BlendMode::Screen))?;
     // screen(red, blue) = 1-(1-r)(1-b) per channel → (1, 0, 1) magenta.
     let [r, g, b, a] = px;
     assert!(
@@ -87,15 +93,16 @@ fn screen_blends_the_overlap() -> Result<(), Box<dyn std::error::Error>> {
     );
     Ok(())
 }
+}
 
+split_test! {
 /// `DestOut` keeps the backdrop where the source is absent and knocks the
 /// overlap out to clear.
-#[test]
 fn dest_out_knocks_out_the_overlap() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(engine) = engine() else {
+    let Some(engine) = wait!(engine()) else {
         return Ok(());
     };
-    let (overlap, _) = render_blend(&engine, BlendMode::DestOut)?;
+    let (overlap, _) = wait!(render_blend(&engine, BlendMode::DestOut))?;
     for c in overlap {
         assert!(
             c.abs() < 1e-2,
@@ -104,16 +111,17 @@ fn dest_out_knocks_out_the_overlap() -> Result<(), Box<dyn std::error::Error>> {
     }
     Ok(())
 }
+}
 
+split_test! {
 /// Hue sets the backdrop's luminance on the source's hue and saturation:
 /// `SetLum(blue, Lum(red))` = (0.19, 0.19, 1) — the non-separable formula,
 /// not a channel-wise blend.
-#[test]
 fn hue_is_non_separable() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(engine) = engine() else {
+    let Some(engine) = wait!(engine()) else {
         return Ok(());
     };
-    let (px, _) = render_blend(&engine, BlendMode::Hue)?;
+    let (px, _) = wait!(render_blend(&engine, BlendMode::Hue))?;
     let [r, g, b, _a] = px;
     assert!(
         (r - 0.19).abs() < 5e-2 && (g - 0.19).abs() < 5e-2 && (b - 1.0).abs() < 5e-2,
@@ -121,14 +129,15 @@ fn hue_is_non_separable() -> Result<(), Box<dyn std::error::Error>> {
     );
     Ok(())
 }
+}
 
+split_test! {
 /// `Extend::None` gradients are transparent outside the range.
-#[test]
 fn extend_none_is_transparent_outside_the_range() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(engine) = engine() else {
+    let Some(engine) = wait!(engine()) else {
         return Ok(());
     };
-    let surface = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
+    let surface = wait!(engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16)))?;
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|c| {
             c.fill(
@@ -152,22 +161,23 @@ fn extend_none_is_transparent_outside_the_range() -> Result<(), Box<dyn std::err
             );
         }));
     });
-    engine.render(cherenkov::FrameTime::now())?;
-    let rb = surface.readback()?;
+    wait!(engine.render(cherenkov::FrameTime::now()))?;
+    let rb = wait!(surface.readback())?;
     let px = |x: u32, y: u32| rb.pixels[(y * rb.width + x) as usize];
     assert_eq!(px(4, 32), [0.0; 4], "left of range must be clear");
     assert_eq!(px(60, 32), [0.0; 4], "right of range must be clear");
     assert!(px(32, 32)[3] > 0.99, "mid-range must be opaque");
     Ok(())
 }
+}
 
+split_test! {
 /// A full-turn sweep gradient: angle 0 (+x) is the first stop.
-#[test]
 fn a_sweep_gradient_resolves_angles() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(engine) = engine() else {
+    let Some(engine) = wait!(engine()) else {
         return Ok(());
     };
-    let surface = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
+    let surface = wait!(engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16)))?;
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|c| {
             c.fill(
@@ -192,8 +202,8 @@ fn a_sweep_gradient_resolves_angles() -> Result<(), Box<dyn std::error::Error>> 
             );
         }));
     });
-    engine.render(cherenkov::FrameTime::now())?;
-    let rb = surface.readback()?;
+    wait!(engine.render(cherenkov::FrameTime::now()))?;
+    let rb = wait!(surface.readback())?;
     let px = |x: u32, y: u32| rb.pixels[(y * rb.width + x) as usize];
     let right = px(56, 32);
     let top = px(32, 8);
@@ -205,15 +215,16 @@ fn a_sweep_gradient_resolves_angles() -> Result<(), Box<dyn std::error::Error>> 
     assert!(top[2] > 0.6 && top[0] < 0.4, "top is blue-ish: {top:?}");
     Ok(())
 }
+}
 
+split_test! {
 /// A `Normal` group flattens unless a descendant group blends; then it
 /// must isolate, or the descendant's composite would reach the scene.
-#[test]
 fn blended_descendant_isolates_its_normal_group() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(engine) = engine() else {
+    let Some(engine) = wait!(engine()) else {
         return Ok(());
     };
-    let surface = engine.surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))?;
+    let surface = wait!(engine.surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16)))?;
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|c| {
             c.fill(Rect::new(0., 0., 8., 8.), RED);
@@ -225,8 +236,8 @@ fn blended_descendant_isolates_its_normal_group() -> Result<(), Box<dyn std::err
             });
         }));
     });
-    engine.render(cherenkov::FrameTime::now())?;
-    let rb = surface.readback()?;
+    wait!(engine.render(cherenkov::FrameTime::now()))?;
+    let rb = wait!(surface.readback())?;
     // `Clear` zeroes the inner group's whole raster — but only inside the
     // outer group's offscreen, which then composites `Normal` over the red
     // background. Without outer isolation the `Clear` reached the scene
@@ -236,13 +247,14 @@ fn blended_descendant_isolates_its_normal_group() -> Result<(), Box<dyn std::err
     }
     Ok(())
 }
+}
 
-#[test]
+split_test! {
 fn tree_layer_isolates_blended_child_layer() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(engine) = engine() else {
+    let Some(engine) = wait!(engine()) else {
         return Ok(());
     };
-    let surface = engine.surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))?;
+    let surface = wait!(engine.surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16)))?;
     let background = surface.layer();
     let pass = surface.layer();
     let cutout = surface.layer();
@@ -261,8 +273,8 @@ fn tree_layer_isolates_blended_child_layer() -> Result<(), Box<dyn std::error::E
                 c.fill(Rect::new(2.0, 0.0, 6.0, 8.0), WorkingColor::WHITE);
             }));
     });
-    engine.render(cherenkov::FrameTime::now())?;
-    let pixels = surface.readback()?.pixels;
+    wait!(engine.render(cherenkov::FrameTime::now()))?;
+    let pixels = wait!(surface.readback())?.pixels;
     let pixel = |x: usize, y: usize| pixels[y * 8 + x];
     assert_eq!(
         pixel(1, 3).map(f32::to_bits),
@@ -274,13 +286,14 @@ fn tree_layer_isolates_blended_child_layer() -> Result<(), Box<dyn std::error::E
     );
     Ok(())
 }
+}
 
-#[test]
+split_test! {
 fn tree_layer_isolates_blended_content_group() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(engine) = engine() else {
+    let Some(engine) = wait!(engine()) else {
         return Ok(());
     };
-    let surface = engine.surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))?;
+    let surface = wait!(engine.surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16)))?;
     let background = surface.layer();
     let pass = surface.layer();
     surface.update(|tx| {
@@ -295,8 +308,8 @@ fn tree_layer_isolates_blended_content_group() -> Result<(), Box<dyn std::error:
             });
         }));
     });
-    engine.render(cherenkov::FrameTime::now())?;
-    let pixels = surface.readback()?.pixels;
+    wait!(engine.render(cherenkov::FrameTime::now()))?;
+    let pixels = wait!(surface.readback())?.pixels;
     let pixel = |x: usize, y: usize| pixels[y * 8 + x];
     assert_eq!(
         pixel(1, 3).map(f32::to_bits),
@@ -308,13 +321,14 @@ fn tree_layer_isolates_blended_content_group() -> Result<(), Box<dyn std::error:
     );
     Ok(())
 }
+}
 
-#[test]
+split_test! {
 fn nested_tree_layers_isolate_at_the_blending_parent() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(engine) = engine() else {
+    let Some(engine) = wait!(engine()) else {
         return Ok(());
     };
-    let surface = engine.surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))?;
+    let surface = wait!(engine.surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16)))?;
     let background = surface.layer();
     let outer = surface.layer();
     let inner = surface.layer();
@@ -338,8 +352,8 @@ fn nested_tree_layers_isolate_at_the_blending_parent() -> Result<(), Box<dyn std
                 c.fill(Rect::new(2.0, 0.0, 6.0, 8.0), WorkingColor::WHITE);
             }));
     });
-    engine.render(cherenkov::FrameTime::now())?;
-    let pixels = surface.readback()?.pixels;
+    wait!(engine.render(cherenkov::FrameTime::now()))?;
+    let pixels = wait!(surface.readback())?.pixels;
     let pixel = |x: usize, y: usize| pixels[y * 8 + x];
     assert_eq!(
         pixel(1, 3).map(f32::to_bits),
@@ -351,15 +365,16 @@ fn nested_tree_layers_isolate_at_the_blending_parent() -> Result<(), Box<dyn std
     );
     Ok(())
 }
+}
 
+split_test! {
 /// Two overlapping opaque `PlusLighter` layers: coverage saturates at 1,
 /// summed light exceeds 1 and survives in the extended working space (#126).
-#[test]
 fn plus_lighter_saturates_alpha_not_colour() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(engine) = engine() else {
+    let Some(engine) = wait!(engine()) else {
         return Ok(());
     };
-    let surface = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
+    let surface = wait!(engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16)))?;
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|c| {
             c.fill(Rect::new(0., 0., 32., 64.), HDR_RED);
@@ -375,8 +390,8 @@ fn plus_lighter_saturates_alpha_not_colour() -> Result<(), Box<dyn std::error::E
             c.fill(Rect::new(16., 0., 64., 64.), HDR_BLUE);
         }));
     });
-    engine.render(cherenkov::FrameTime::now())?;
-    let px = surface.readback()?.pixels[(32 * 64 + 24) as usize];
+    wait!(engine.render(cherenkov::FrameTime::now()))?;
+    let px = wait!(surface.readback())?.pixels[(32 * 64 + 24) as usize];
     assert!(
         px[3] <= 1.0 + 1e-3,
         "plus-lighter alpha must saturate: {px:?}"
@@ -387,18 +402,19 @@ fn plus_lighter_saturates_alpha_not_colour() -> Result<(), Box<dyn std::error::E
     );
     Ok(())
 }
+}
 
+split_test! {
 /// A clipped blended layer's clip coverage must scale the source once,
 /// not again at the composite: Screen over 0.5 grey at a half-covered
 /// edge is `B(cb, 0.5·cs) = 0.75`, not `c²` = 0.4375. Clear keeps the
 /// lerp-by-clip bound.
-#[test]
 fn clipped_blend_layer_scales_source_by_clip_coverage() -> Result<(), Box<dyn std::error::Error>> {
     const GREY: WorkingColor = WorkingColor::new([0.5, 0.5, 0.5, 1.0]);
-    let Some(engine) = engine() else {
+    let Some(engine) = wait!(engine()) else {
         return Ok(());
     };
-    let surface = engine.surface(Offscreen::new((12, 12), OffscreenFormat::LinearF16))?;
+    let surface = wait!(engine.surface(Offscreen::new((12, 12), OffscreenFormat::LinearF16)))?;
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|c| {
             c.fill(Rect::new(0.0, 0.0, 12.0, 12.0), GREY);
@@ -423,8 +439,8 @@ fn clipped_blend_layer_scales_source_by_clip_coverage() -> Result<(), Box<dyn st
         layers.push(layer);
     }
     assert_eq!(layers.len(), 2);
-    engine.render(cherenkov::FrameTime::now())?;
-    let pixels = surface.readback()?.pixels;
+    wait!(engine.render(cherenkov::FrameTime::now()))?;
+    let pixels = wait!(surface.readback())?.pixels;
     let px = |x: usize, y: usize| pixels[y * 12 + x];
     let approx = |got: [f32; 4], want: [f32; 4], what: &str| {
         for i in 0..4 {
@@ -453,16 +469,17 @@ fn clipped_blend_layer_scales_source_by_clip_coverage() -> Result<(), Box<dyn st
     approx(px(6, 9), [0.0; 4], "clear inside clip");
     Ok(())
 }
+}
 
+split_test! {
 /// A destructive child of the surface root composites against the surface
 /// clear colour — the scene root is not isolated, as in the oracle. `DestIn`
 /// keeps the backdrop where the source covers it and zeroes the rest
 /// (transparent, not the clear colour); Clear empties the surface; Src
 /// writes the source verbatim.
-#[test]
 fn destructive_child_of_root_clears_the_surface_clear_colour()
 -> Result<(), Box<dyn std::error::Error>> {
-    let Some(engine) = engine() else {
+    let Some(engine) = wait!(engine()) else {
         return Ok(());
     };
     for (mode, left, right) in [
@@ -474,7 +491,7 @@ fn destructive_child_of_root_clears_the_surface_clear_colour()
         ),
         (BlendMode::Src, BLUE, WorkingColor::new([0.0; 4])),
     ] {
-        let surface = engine.surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))?;
+        let surface = wait!(engine.surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16)))?;
         surface.clear_color(GREY);
         let cutout = surface.layer();
         surface.update(|tx| {
@@ -486,8 +503,8 @@ fn destructive_child_of_root_clears_the_surface_clear_colour()
                 c.fill(Rect::new(0.0, 0.0, 4.0, 8.0), BLUE);
             }));
         });
-        engine.render(cherenkov::FrameTime::now())?;
-        let pixels = surface.readback()?.pixels;
+        wait!(engine.render(cherenkov::FrameTime::now()))?;
+        let pixels = wait!(surface.readback())?.pixels;
         let pixel = |x: usize, y: usize| pixels[y * 8 + x];
         for (x, expected) in [(1usize, left), (6usize, right)] {
             let px = pixel(x, 3);
@@ -501,17 +518,18 @@ fn destructive_child_of_root_clears_the_surface_clear_colour()
     }
     Ok(())
 }
+}
 
+split_test! {
 /// The same destructive child under a real intermediate layer stays
 /// isolated: the `DestIn` cuts the pass's own content, and the cleared
 /// region reads back as the surface clear colour through the composite.
-#[test]
 fn destructive_child_of_an_intermediate_layer_stays_isolated()
 -> Result<(), Box<dyn std::error::Error>> {
-    let Some(engine) = engine() else {
+    let Some(engine) = wait!(engine()) else {
         return Ok(());
     };
-    let surface = engine.surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))?;
+    let surface = wait!(engine.surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16)))?;
     surface.clear_color(GREY);
     let pass = surface.layer();
     let cutout = surface.layer();
@@ -527,8 +545,8 @@ fn destructive_child_of_an_intermediate_layer_stays_isolated()
                 c.fill(Rect::new(0.0, 0.0, 4.0, 8.0), WorkingColor::WHITE);
             }));
     });
-    engine.render(cherenkov::FrameTime::now())?;
-    let pixels = surface.readback()?.pixels;
+    wait!(engine.render(cherenkov::FrameTime::now()))?;
+    let pixels = wait!(surface.readback())?.pixels;
     let pixel = |x: usize, y: usize| pixels[y * 8 + x];
     for (x, expected) in [(1usize, RED), (6usize, GREY)] {
         let px = pixel(x, 3);
@@ -538,16 +556,17 @@ fn destructive_child_of_an_intermediate_layer_stays_isolated()
     }
     Ok(())
 }
+}
 
+split_test! {
 /// 50% sRGB blue over sRGB red inside an sRGB-encoded group composites in
 /// the encoded space: the readback is the encoded mix [0.5, 0, 0.5], not
 /// the linear-space one (~[0.735, 0, 0.735]).
-#[test]
 fn srgb_encoded_members_composite_in_the_encoded_space() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(engine) = engine() else {
+    let Some(engine) = wait!(engine()) else {
         return Ok(());
     };
-    let surface = engine.surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))?;
+    let surface = wait!(engine.surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16)))?;
     let red = Color::<Srgb>::new([1.0, 0.0, 0.0, 1.0]).to_working();
     let blue = Color::<Srgb>::new([0.0, 0.0, 1.0, 0.5]).to_working();
     surface.update(|tx| {
@@ -558,8 +577,8 @@ fn srgb_encoded_members_composite_in_the_encoded_space() -> Result<(), Box<dyn s
             });
         }));
     });
-    engine.render(cherenkov::FrameTime::now())?;
-    let pixels = surface.readback()?.pixels;
+    wait!(engine.render(cherenkov::FrameTime::now()))?;
+    let pixels = wait!(surface.readback())?.pixels;
     let expected = Color::<Srgb>::new([0.5, 0.0, 0.5, 1.0]).to_working();
     for (got, want) in pixels[0].iter().zip(expected.components) {
         assert!(
@@ -569,4 +588,5 @@ fn srgb_encoded_members_composite_in_the_encoded_space() -> Result<(), Box<dyn s
         );
     }
     Ok(())
+}
 }

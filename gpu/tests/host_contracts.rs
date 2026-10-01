@@ -3,6 +3,10 @@
 //! transparent presentation all through the APIs WaterUI/Hydrolysis use.
 
 use cherenkov::kurbo::Rect;
+use cherenkov::{
+    __engine_block as block, __engine_fn as split_fn, __engine_test as split_test,
+    __engine_wait as wait,
+};
 use cherenkov::{Engine, FrameTime, Next};
 use cherenkov_gpu::{
     Gpu, GpuConfig,
@@ -21,6 +25,7 @@ use std::sync::{
     mpsc,
 };
 
+split_fn! {
 /// An adapter/device pair usable as a `SharedDevice`: passthrough backends
 /// need `PASSTHROUGH_SHADERS`, which the engine requires for its precompiled
 /// fixed shaders (issue #57).
@@ -28,16 +33,17 @@ fn shared_device()
 -> Result<(wgpu::Instance, wgpu::Adapter, wgpu::Device, wgpu::Queue), Box<dyn std::error::Error>> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter =
-        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?;
+        block!(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?;
     let required_features = match adapter.get_info().backend {
         wgpu::Backend::Vulkan | wgpu::Backend::Metal => wgpu::Features::PASSTHROUGH_SHADERS,
         _ => wgpu::Features::empty(),
     };
-    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+    let (device, queue) = block!(adapter.request_device(&wgpu::DeviceDescriptor {
         required_features,
         ..wgpu::DeviceDescriptor::default()
     }))?;
     Ok((instance, adapter, device, queue))
+}
 }
 
 struct Producer {
@@ -54,6 +60,13 @@ impl Drop for Producer {
 }
 
 impl GpuContent for Producer {
+    #[cfg_attr(
+        target_arch = "wasm32",
+        expect(
+            clippy::future_not_send,
+            reason = "the wasm32 harness runs on the single-threaded page event loop"
+        )
+    )]
     async fn setup(&mut self, _: &wgpu::Context<'_>) {
         self.setups.fetch_add(1, Ordering::Relaxed);
     }
@@ -196,6 +209,7 @@ fn nv12_planes(device: &wgpu::Device, queue: &wgpu::Queue) -> (wgpu::Texture, wg
     (y, uv)
 }
 
+split_fn! {
 fn presented_pixels(
     engine: &Engine<Gpu>,
     device: &wgpu::Device,
@@ -204,7 +218,7 @@ fn presented_pixels(
     source: &wgpu::Texture,
 ) -> Result<Vec<[f32; 4]>, Box<dyn std::error::Error>> {
     let (target, destinations) = TextureTarget::new((24, 24));
-    let destination = engine.surface(target)?;
+    let destination = wait!(engine.surface(target))?;
     let destination_texture = destinations.try_recv()?;
     let delivery = cherenkov_gpu::interop::shader_delivery(backend, device)?;
     let mut presenter = Presenter::new(device, delivery);
@@ -219,16 +233,17 @@ fn presented_pixels(
             headroom: 1.0,
         },
     );
-    Ok(destination.readback()?.pixels)
+    Ok(wait!(destination.readback())?.pixels)
+}
 }
 
-#[test]
+split_test! {
 fn host_contracts_at_one_revision() -> Result<(), Box<dyn std::error::Error>> {
-    let (instance, adapter, device, queue) = shared_device()?;
+    let (instance, adapter, device, queue) = wait!(shared_device())?;
     let backend = adapter.get_info().backend;
     let wakes = Arc::new(AtomicUsize::new(0));
     let wake = wakes.clone();
-    let engine = Engine::<Gpu>::new(GpuConfig {
+    let engine = wait!(Engine::<Gpu>::new(GpuConfig {
         device: Some(SharedDevice {
             instance,
             adapter,
@@ -239,12 +254,12 @@ fn host_contracts_at_one_revision() -> Result<(), Box<dyn std::error::Error>> {
             wake.fetch_add(1, Ordering::Relaxed);
         })),
         ..GpuConfig::default()
-    })?;
+    }))?;
 
     // Retained texture output: the host gets a texture now and a notification
     // only when the allocation changes again.
     let (target, textures) = TextureTarget::new((16, 16));
-    let surface = engine.surface(target)?;
+    let surface = wait!(engine.surface(target))?;
     let first_output = textures.try_recv()?;
     assert_eq!((first_output.width(), first_output.height()), (16, 16));
 
@@ -276,7 +291,7 @@ fn host_contracts_at_one_revision() -> Result<(), Box<dyn std::error::Error>> {
             .content(video);
     });
 
-    assert_eq!(engine.render(FrameTime::now())?, Next::Idle);
+    assert_eq!(wait!(engine.render(FrameTime::now()))?, Next::Idle);
     assert_eq!(setups.load(Ordering::Relaxed), 1, "producer setup ran once");
     assert_eq!(frames.load(Ordering::Relaxed), 1);
     assert_eq!(effect_timings.try_iter().count(), 1, "effect group ran");
@@ -284,7 +299,7 @@ fn host_contracts_at_one_revision() -> Result<(), Box<dyn std::error::Error>> {
     // Resize publishes exactly one replacement texture and does not recreate
     // unrelated producers.
     surface.resize((24, 24))?;
-    assert_eq!(engine.render(FrameTime::now())?, Next::Idle);
+    assert_eq!(wait!(engine.render(FrameTime::now()))?, Next::Idle);
     let resized_output = textures.try_recv()?;
     assert_eq!((resized_output.width(), resized_output.height()), (24, 24));
     assert_eq!(
@@ -301,7 +316,7 @@ fn host_contracts_at_one_revision() -> Result<(), Box<dyn std::error::Error>> {
     surface.update(|tx| {
         tx[surface.root()].remove(&producer_layer);
     });
-    assert_eq!(engine.render(FrameTime::now())?, Next::Idle);
+    assert_eq!(wait!(engine.render(FrameTime::now()))?, Next::Idle);
     let before = wakes.load(Ordering::Relaxed);
     send.send(wgpu::Color::BLUE)?;
     redraw.request_redraw();
@@ -310,17 +325,17 @@ fn host_contracts_at_one_revision() -> Result<(), Box<dyn std::error::Error>> {
         before,
         "detached content does not wake host"
     );
-    assert_eq!(engine.render(FrameTime::now())?, Next::Idle);
+    assert_eq!(wait!(engine.render(FrameTime::now()))?, Next::Idle);
     assert_eq!(frames.load(Ordering::Relaxed), 1, "detached producer idle");
 
     // The external frame decoded in place: video grey lands inside its quad.
     drop(producer_layer);
-    assert_eq!(engine.render(FrameTime::now())?, Next::Idle);
+    assert_eq!(wait!(engine.render(FrameTime::now()))?, Next::Idle);
     assert_eq!(drops.load(Ordering::Relaxed), 1, "producer teardown ran");
 
     // Transparent presentation: the retained working texture presents with
     // premultiplied alpha so empty pixels stay transparent for the host.
-    let pixels = presented_pixels(&engine, &device, &queue, backend, &resized_output)?;
+    let pixels = wait!(presented_pixels(&engine, &device, &queue, backend, &resized_output))?;
     let empty = pixels[0];
     assert!(
         empty[3].abs() < 0.001,
@@ -334,4 +349,5 @@ fn host_contracts_at_one_revision() -> Result<(), Box<dyn std::error::Error>> {
         "external video frame decoded in place: {video_pixel:?}"
     );
     Ok(())
+}
 }

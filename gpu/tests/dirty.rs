@@ -1,23 +1,25 @@
 //! Requires a working adapter; CI uses Vulkan lavapipe.
 
 use cherenkov::Backend;
+use cherenkov::{__engine_test as split_test, __engine_wait as wait};
 
-#[test]
+split_test! {
 fn randomized_incremental_matches_full_lowering() {
-    let (mut renderer, _) = cherenkov_gpu::Gpu::init(cherenkov_gpu::GpuConfig::default())
+    let (mut renderer, _) = wait!(cherenkov_gpu::Gpu::init(cherenkov_gpu::GpuConfig::default()))
         .expect("GPU adapter required");
-    cherenkov::testing::incremental::equivalence(&mut renderer);
+    wait!(cherenkov::testing::incremental::equivalence(&mut renderer));
+}
 }
 
+split_test! {
 /// A glyph's atlas coordinates must not overwrite a path clip's atlas origin.
-#[test]
 fn a_glyph_keeps_its_path_clip_mask_when_composed() {
     use cherenkov::kurbo::{Rect, Shape as _};
     use cherenkov::{
         Draw, Engine, FontSource, FrameTime, Glyph, GlyphRun, GlyphStyle, Offscreen,
         OffscreenFormat, WorkingColor,
     };
-    let engine = Engine::<cherenkov_gpu::Gpu>::new(cherenkov_gpu::GpuConfig::default())
+    let engine = wait!(Engine::<cherenkov_gpu::Gpu>::new(cherenkov_gpu::GpuConfig::default()))
         .expect("GPU adapter required");
     let font = engine
         .font(FontSource::bytes(
@@ -37,15 +39,15 @@ fn a_glyph_keeps_its_path_clip_mask_when_composed() {
         .into(),
         style: GlyphStyle::Fill,
     };
-    let surface = engine
-        .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))
+    let surface = wait!(engine
+        .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16)))
         .expect("surface");
     let clip = Rect::new(14., 0., 24., 64.);
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|c| c.glyphs(run.clone(), WorkingColor::WHITE)));
     });
-    engine.render(FrameTime::now()).expect("unclipped render");
-    let unclipped = surface.readback().expect("readback");
+    wait!(engine.render(FrameTime::now())).expect("unclipped render");
+    let unclipped = wait!(surface.readback()).expect("readback");
     assert!(
         unclipped
             .pixels
@@ -60,8 +62,8 @@ fn a_glyph_keeps_its_path_clip_mask_when_composed() {
             surface.record(|c| c.clip(clip.to_path(0.01), |c| c.glyphs(run, WorkingColor::WHITE))),
         );
     });
-    engine.render(FrameTime::now()).expect("path clip render");
-    let masked = surface.readback().expect("readback");
+    wait!(engine.render(FrameTime::now())).expect("path clip render");
+    let masked = wait!(surface.readback()).expect("readback");
     assert!(masked.pixels.iter().any(|p| p[3] > 0.5), "glyph is visible");
     // An integer-edged path mask has exact 0/1 coverage. Crop the unmasked
     // glyph to obtain its reference without involving the analytic SDF's AA.
@@ -77,4 +79,5 @@ fn a_glyph_keeps_its_path_clip_mask_when_composed() {
             "pixel {index}"
         );
     }
+}
 }

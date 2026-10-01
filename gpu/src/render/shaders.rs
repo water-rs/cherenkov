@@ -10,7 +10,9 @@
 //!
 //! Delivery by backend:
 //!
-//! - **Vulkan** gets `spirv-opt -O` SPIR-V.
+//! - **Vulkan** gets `spirv-opt -O` SPIR-V. The `.spv` artifacts exist
+//!   only on the non-Apple, non-wasm targets where wgpu compiles its
+//!   Vulkan backend (issue #241), so SPIR-V is embedded there only.
 //! - **Metal** gets a `.metallib` compiled by `xcrun` during the build.
 //! - **Everything else keeps WGSL** as a backend property, not a fallback:
 //!   wgpu 29 has no GLSL producer to feed GL's passthrough input, DX12
@@ -25,7 +27,10 @@ use cherenkov::{EngineError, ResourceError};
 struct Fixed {
     /// WGSL source — the fallback text and the input `build.rs` compiled.
     wgsl: &'static str,
-    /// `spirv-opt -O` output, as little-endian SPIR-V bytes.
+    /// `spirv-opt -O` output, as little-endian SPIR-V bytes. The field
+    /// exists only where the artifacts do — [`spirv`]'s targets (issue
+    /// #241) — so no build carries a dummy empty slice.
+    #[cfg(all(not(target_arch = "wasm32"), not(target_vendor = "apple")))]
     spirv: &'static [u8],
     /// The `xcrun metallib` output, present only in Apple builds.
     metallib: &'static [u8],
@@ -169,40 +174,43 @@ pub fn validate_wgsl(text: &str) -> Result<naga::Module, ResourceError> {
     Ok(module)
 }
 
-// The passthrough artifacts are embedded only where they can be loaded:
-// wasm keeps WGSL, and `.metallib` files exist only in Apple builds
-// (`build.rs` refuses to produce them otherwise, and a Metal backend cannot
-// appear on a non-Apple build), so the empty slices are unreachable.
-#[cfg(not(target_arch = "wasm32"))]
-const ENGINE_SPV: [&[u8]; 3] = [
-    include_bytes!(concat!(env!("OUT_DIR"), "/engine0.spv")),
-    include_bytes!(concat!(env!("OUT_DIR"), "/engine1.spv")),
-    include_bytes!(concat!(env!("OUT_DIR"), "/engine2.spv")),
-];
-#[cfg(target_arch = "wasm32")]
-const ENGINE_SPV: [&[u8]; 3] = [&[], &[], &[]];
-#[cfg(not(target_arch = "wasm32"))]
-const PRESENT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/present.spv"));
-#[cfg(target_arch = "wasm32")]
-const PRESENT_SPV: &[u8] = &[];
-#[cfg(not(target_arch = "wasm32"))]
-const EXTERNAL_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/external.spv"));
-#[cfg(target_arch = "wasm32")]
-const EXTERNAL_SPV: &[u8] = &[];
-#[cfg(not(target_arch = "wasm32"))]
-const PROJECTIVE_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/projective.spv"));
-#[cfg(target_arch = "wasm32")]
-const PROJECTIVE_SPV: &[u8] = &[];
-#[cfg(not(target_arch = "wasm32"))]
-const MIP_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mip.spv"));
-#[cfg(target_arch = "wasm32")]
-const MIP_SPV: &[u8] = &[];
-/// `external_native.spv` — the Vulkan native module: `vs_main`,
-/// `fs_external` and `fs_external_format`, with the external-format pair
-/// merged into a combined sampled image by the build's restricted
-/// lowering.
-#[cfg(all(unix, not(target_vendor = "apple")))]
-pub const EXTERNAL_NATIVE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/external_native.spv"));
+/// The `.spv` artifacts, embedded only where a Vulkan backend can exist.
+///
+/// wgpu compiles its Vulkan backend on exactly the non-Apple, non-wasm
+/// targets (issue #241): Apple builds load `.metallib`s and wasm keeps
+/// WGSL, so neither produces nor embeds these bytes and `build.rs` never
+/// calls spirv-tools there. The gating expression is the same one
+/// `build.rs::emits_spirv` derives from `CARGO_CFG_TARGET_*`.
+#[cfg(all(not(target_arch = "wasm32"), not(target_vendor = "apple")))]
+pub mod spirv {
+    /// `spirv-opt -O` output for the three `VARIANT` specializations of
+    /// `shader.wgsl`.
+    pub const ENGINE: [&[u8]; 3] = [
+        include_bytes!(concat!(env!("OUT_DIR"), "/engine0.spv")),
+        include_bytes!(concat!(env!("OUT_DIR"), "/engine1.spv")),
+        include_bytes!(concat!(env!("OUT_DIR"), "/engine2.spv")),
+    ];
+    /// `present.wgsl`.
+    pub const PRESENT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/present.spv"));
+    /// `shared.wgsl` plus `external.wgsl`.
+    pub const EXTERNAL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/external.spv"));
+    /// `shared.wgsl`, `blend.wgsl` and `projective.wgsl`.
+    pub const PROJECTIVE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/projective.spv"));
+    /// `mip.wgsl`.
+    pub const MIP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mip.spv"));
+    /// `external_native.spv` — the Vulkan native module: `vs_main`,
+    /// `fs_external` and `fs_external_format`, with the external-format
+    /// pair merged into a combined sampled image by the build's
+    /// restricted lowering. Only `external::vulkan` reads it, which is
+    /// itself unix-only (issue #166).
+    #[cfg(all(unix, not(target_vendor = "apple")))]
+    pub const EXTERNAL_NATIVE: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/external_native.spv"));
+}
+
+// `.metallib` files exist only in Apple builds (`build.rs` refuses to
+// produce them otherwise, and a Metal backend cannot appear on a
+// non-Apple build), so the empty slices are unreachable.
 #[cfg(target_vendor = "apple")]
 const ENGINE_METALLIB: [&[u8]; 3] = [
     include_bytes!(concat!(env!("OUT_DIR"), "/engine0.metallib")),
@@ -233,19 +241,22 @@ const MIP_METALLIB: &[u8] = &[];
 const ENGINE: [Fixed; 3] = [
     Fixed {
         wgsl: ENGINE_WGSL0,
-        spirv: ENGINE_SPV[0],
+        #[cfg(all(not(target_arch = "wasm32"), not(target_vendor = "apple")))]
+        spirv: spirv::ENGINE[0],
         metallib: ENGINE_METALLIB[0],
         entries: ENGINE_ENTRIES,
     },
     Fixed {
         wgsl: ENGINE_WGSL1,
-        spirv: ENGINE_SPV[1],
+        #[cfg(all(not(target_arch = "wasm32"), not(target_vendor = "apple")))]
+        spirv: spirv::ENGINE[1],
         metallib: ENGINE_METALLIB[1],
         entries: ENGINE_ENTRIES,
     },
     Fixed {
         wgsl: ENGINE_WGSL2,
-        spirv: ENGINE_SPV[2],
+        #[cfg(all(not(target_arch = "wasm32"), not(target_vendor = "apple")))]
+        spirv: spirv::ENGINE[2],
         metallib: ENGINE_METALLIB[2],
         entries: ENGINE_ENTRIES,
     },
@@ -254,7 +265,8 @@ const ENGINE: [Fixed; 3] = [
 /// `present.wgsl`, the presenter's module.
 const PRESENT: Fixed = Fixed {
     wgsl: include_str!("present.wgsl"),
-    spirv: PRESENT_SPV,
+    #[cfg(all(not(target_arch = "wasm32"), not(target_vendor = "apple")))]
+    spirv: spirv::PRESENT,
     metallib: PRESENT_METALLIB,
     entries: VS_FS_MAIN,
 };
@@ -262,7 +274,8 @@ const PRESENT: Fixed = Fixed {
 /// `shared.wgsl` plus `external.wgsl`, the external-frame module.
 const EXTERNAL: Fixed = Fixed {
     wgsl: concat!(include_str!("shared.wgsl"), include_str!("external.wgsl")),
-    spirv: EXTERNAL_SPV,
+    #[cfg(all(not(target_arch = "wasm32"), not(target_vendor = "apple")))]
+    spirv: spirv::EXTERNAL,
     metallib: EXTERNAL_METALLIB,
     entries: VS_FS_EXTERNAL,
 };
@@ -277,7 +290,8 @@ const PROJECTIVE: Fixed = Fixed {
         "\n",
         include_str!("projective.wgsl")
     ),
-    spirv: PROJECTIVE_SPV,
+    #[cfg(all(not(target_arch = "wasm32"), not(target_vendor = "apple")))]
+    spirv: spirv::PROJECTIVE,
     metallib: PROJECTIVE_METALLIB,
     entries: VS_FS_PROJECTIVE,
 };
@@ -285,7 +299,8 @@ const PROJECTIVE: Fixed = Fixed {
 /// `mip.wgsl`, the projective local image's mip level module (#84).
 const MIP: Fixed = Fixed {
     wgsl: include_str!("mip.wgsl"),
-    spirv: MIP_SPV,
+    #[cfg(all(not(target_arch = "wasm32"), not(target_vendor = "apple")))]
+    spirv: spirv::MIP,
     metallib: MIP_METALLIB,
     entries: VS_FS_MAIN,
 };
@@ -388,13 +403,14 @@ impl ShaderDelivery {
                 }
             }
             Self::Spirv => {
-                assert!(
-                    !fixed.spirv.is_empty(),
-                    "no SPIR-V artifact is embedded in a wasm build"
-                );
-                // SAFETY: `fixed.spirv` is naga+spirv-opt output embedded at
-                // build time — trusted SPIR-V matching the pipeline layout.
+                // `Backend::Vulkan` exists only where the `.spv` artifacts
+                // do — the `spirv` module's targets (issue #241) — so on
+                // Apple and wasm this arm is unreachable.
+                #[cfg(all(not(target_arch = "wasm32"), not(target_vendor = "apple")))]
                 unsafe {
+                    // SAFETY: `fixed.spirv` is naga+spirv-opt output
+                    // embedded at build time — trusted SPIR-V matching
+                    // the pipeline layout.
                     device.create_shader_module_passthrough(
                         wgpu::ShaderModuleDescriptorPassthrough {
                             label: Some(label),
@@ -404,6 +420,8 @@ impl ShaderDelivery {
                         },
                     )
                 }
+                #[cfg(any(target_arch = "wasm32", target_vendor = "apple"))]
+                unreachable!("wgpu compiles no Vulkan backend on this target")
             }
             Self::Metallib => {
                 assert!(
@@ -431,8 +449,9 @@ impl ShaderDelivery {
 
 /// Decodes the little-endian SPIR-V byte file into words.
 ///
-/// Compiled for wasm too — the `Spirv` arm asserts unreachable there — so
-/// the match arms stay uniform.
+/// Exists only on the `spirv` module's targets: on Apple and wasm the
+/// `Spirv` arm is unreachable and no `.spv` is embedded (issue #241).
+#[cfg(all(not(target_arch = "wasm32"), not(target_vendor = "apple")))]
 fn words(spirv: &[u8]) -> Cow<'static, [u32]> {
     assert_eq!(spirv.len() % 4, 0, "SPIR-V artifact truncated");
     Cow::Owned(

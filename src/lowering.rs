@@ -555,14 +555,6 @@ impl Seg {
     }
 }
 
-/// Inside/outside state of a winding prefix under the fill rule.
-fn inside_at(w: f64, rule: FillRule) -> bool {
-    match rule {
-        FillRule::NonZero => w != 0.0,
-        FillRule::EvenOdd => w.rem_euclid(2.0) > 0.5,
-    }
-}
-
 /// Crossing ordinate of the pair `(p, q)` evaluated in operand order.
 /// The expression is not symmetric in its operands, so an event is
 /// always evaluated in the pair's current `active` order — the order
@@ -660,6 +652,14 @@ fn post_cross_at(l: &Seg, r: &Seg, ym: f64) -> bool {
 /// shift at most this many elements instead of the whole list.
 const CHUNK: usize = 64;
 
+/// Inside/outside state of a winding prefix under the fill rule.
+fn inside_at(w: f64, rule: FillRule) -> bool {
+    match rule {
+        FillRule::NonZero => w != 0.0,
+        FillRule::EvenOdd => w.rem_euclid(2.0) > 0.5,
+    }
+}
+
 /// Chunked order-statistics list of the sweep's live segments.
 /// Keeping the list as fixed-capacity chunks bounds each admission
 /// and retirement to an in-chunk shift, and each chunk caches its
@@ -668,22 +668,32 @@ const CHUNK: usize = 64;
 /// enumerate the ranks where the prefix sits at a boundary level,
 /// without rescanning the list.
 struct Active {
+    /// Chunks in list order. A chunk's `id` is its slot in
+    /// `order_pos`; splitting inserts a chunk without renumbering the
+    /// ids `chunk_of` records.
     chunks: Vec<Chunk>,
-    /// Segment → chunk index while admitted, `usize::MAX` otherwise.
+    /// Segment → chunk id while admitted, `usize::MAX` otherwise.
     chunk_of: Vec<usize>,
-    /// Base rank of each chunk (total element count of earlier
-    /// chunks); rebuilt lazily after structural edits.
-    rb: Vec<u32>,
-    rb_dirty: bool,
+    /// Chunk id → position in `chunks`.
+    order_pos: Vec<u32>,
+    /// Next chunk id to hand out.
+    next_id: u32,
+    /// Fenwick tree over the chunks' (element count, direction sum)
+    /// pairs — `ft[0]` unused; `ft[k]` covers the `lowbit(k)` chunks
+    /// ending at `k`. Point updates are O(log n) so rank queries stay
+    /// cheap through insert/remove without a per-edit rebuild.
+    ft: Vec<(u32, f64)>,
     len: usize,
     /// Empty tombstone chunks kept in place — removing one would
-    /// renumber `chunk_of` for everything after it. Compacted once
+    /// renumber `order_pos` for everything after it. Compacted once
     /// they dominate.
     empty: usize,
 }
 
 #[derive(Default)]
 struct Chunk {
+    /// Stable identifier into `order_pos`.
+    id: u32,
     els: Vec<u32>,
     /// Sum of the elements' winding directions.
     ds: f64,
@@ -698,8 +708,9 @@ impl Active {
         Self {
             chunks: Vec::new(),
             chunk_of: vec![usize::MAX; cap],
-            rb: Vec::new(),
-            rb_dirty: false,
+            order_pos: Vec::new(),
+            next_id: 0,
+            ft: vec![(0, 0.0)],
             len: 0,
             empty: 0,
         }
@@ -718,23 +729,76 @@ impl Active {
         }
     }
 
-    fn ensure_rb(&mut self) {
-        if self.rb_dirty {
-            self.rb.clear();
-            let mut base = 0u32;
-            for ch in &self.chunks {
-                self.rb.push(base);
-                base += u32::try_from(ch.els.len()).expect("a chunk holds at most 2*CHUNK");
-            }
-            self.rb_dirty = false;
+    /// Fenwick point update: add `(dc, dd)` to chunk `pos`.
+    fn fadd(&mut self, pos: usize, dc: i32, dd: f64) {
+        let mut k = pos + 1;
+        while k < self.ft.len() {
+            self.ft[k].0 = self.ft[k].0.wrapping_add_signed(dc);
+            self.ft[k].1 += dd;
+            k += k.isolate_lowest_one();
         }
     }
 
+    /// Fenwick prefix over chunks `0..pos` — element count and
+    /// direction sum of the chunks before `pos`.
+    fn fsum(&self, pos: usize) -> (u32, f64) {
+        let mut k = pos;
+        let (mut c, mut d) = (0u32, 0.0);
+        while k > 0 {
+            c += self.ft[k].0;
+            d += self.ft[k].1;
+            k &= k - 1;
+        }
+        (c, d)
+    }
+
+    /// Number of chunks whose combined length is `<= k` — the index
+    /// of the chunk holding rank `k`.
+    fn flower(&self, k: u32) -> usize {
+        let mut pos = 0usize;
+        let mut k = k;
+        let mut bit = self.ft.len().next_power_of_two() >> 1;
+        while bit > 0 {
+            let next = pos + bit;
+            if next < self.ft.len() && self.ft[next].0 <= k {
+                k -= self.ft[next].0;
+                pos = next;
+            }
+            bit >>= 1;
+        }
+        pos
+    }
+
+    /// Rebuild the Fenwick tree after the `chunks` vec's shape
+    /// changed (chunk insert, removal or compaction).
+    fn rebuild_ft(&mut self) {
+        let n = self.chunks.len();
+        self.ft.clear();
+        self.ft.resize(n + 1, (0, 0.0));
+        for i in 1..=n {
+            let ch = &self.chunks[i - 1];
+            self.ft[i].0 += u32::try_from(ch.els.len()).expect("a chunk holds at most 2*CHUNK");
+            self.ft[i].1 += ch.ds;
+            let j = i + i.isolate_lowest_one();
+            if j <= n {
+                let v = self.ft[i];
+                self.ft[j].0 += v.0;
+                self.ft[j].1 += v.1;
+            }
+        }
+    }
+
+    /// Position of the chunk holding rank `k`, and `k`'s offset in it.
+    fn locate(&self, k: usize) -> (usize, usize) {
+        let c = self.flower(u32::try_from(k).expect("rank fits u32"));
+        let base = self.fsum(c).0;
+        (c, k - base as usize)
+    }
+
     /// Rank of a live segment: chunk base plus its offset inside.
-    fn rank(&mut self, e: u32) -> usize {
-        self.ensure_rb();
-        let c = self.chunk_of[e as usize];
-        self.rb[c] as usize
+    fn rank(&self, e: u32) -> usize {
+        let c = self.order_pos[self.chunk_of[e as usize]] as usize;
+        self.fsum(c).0 as usize
             + self.chunks[c]
                 .els
                 .iter()
@@ -742,21 +806,17 @@ impl Active {
                 .expect("live segment sits in its chunk")
     }
 
-    /// `(chunk, offset)` of a rank.
-    fn locate(&self, mut r: usize) -> (usize, usize) {
-        for (c, ch) in self.chunks.iter().enumerate() {
-            if r < ch.els.len() {
-                return (c, r);
-            }
-            r -= ch.els.len();
-        }
-        (self.chunks.len(), 0)
-    }
-
     /// Segment at a rank.
     fn at(&self, r: usize) -> u32 {
         let (c, o) = self.locate(r);
         self.chunks[c].els[o]
+    }
+
+    /// Allocate a chunk id.
+    const fn new_id(&mut self) -> u32 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
     }
 
     /// First rank whose midpoint key `(x_at(ym), slope)` is not below
@@ -783,8 +843,13 @@ impl Active {
     /// Insert a segment at a rank, splitting an overfull chunk.
     fn insert(&mut self, segs: &[Seg], at: usize, e: u32) {
         if self.chunks.is_empty() {
-            self.chunks.push(Chunk::default());
-            self.rb_dirty = true;
+            let id = self.new_id();
+            self.order_pos.push(0);
+            self.chunks.push(Chunk {
+                id,
+                ..Chunk::default()
+            });
+            self.rebuild_ft();
         }
         let (c, o) = if at >= self.len {
             (
@@ -799,28 +864,39 @@ impl Active {
         }
         self.chunks[c].els.insert(o, e);
         self.len += 1;
-        self.chunk_of[e as usize] = c;
+        self.chunk_of[e as usize] = self.chunks[c].id as usize;
+        self.fadd(c, 1, segs[e as usize].dir);
         if self.chunks[c].els.len() > 2 * CHUNK {
             let tail: Vec<u32> = self.chunks[c].els.split_off(CHUNK);
+            let id = self.new_id();
             self.chunks.insert(
                 c + 1,
                 Chunk {
+                    id,
                     els: tail,
                     ..Chunk::default()
                 },
             );
+            if self.order_pos.len() <= id as usize {
+                self.order_pos.resize(id as usize + 1, 0);
+            }
+            for p in c + 1..self.chunks.len() {
+                self.order_pos[self.chunks[p].id as usize] =
+                    u32::try_from(p).expect("chunk index fits u32");
+            }
             for &x in &self.chunks[c + 1].els {
-                self.chunk_of[x as usize] = c + 1;
+                self.chunk_of[x as usize] = id as usize;
             }
             self.recalc(segs, c + 1);
+            self.recalc(segs, c);
+            self.rebuild_ft();
         }
         self.recalc(segs, c);
-        self.rb_dirty = true;
     }
 
     /// Remove a live segment; tombstones the chunk if it empties.
     fn remove(&mut self, segs: &[Seg], e: u32) {
-        let c = self.chunk_of[e as usize];
+        let c = self.order_pos[self.chunk_of[e as usize]] as usize;
         let o = self.chunks[c]
             .els
             .iter()
@@ -829,6 +905,7 @@ impl Active {
         self.chunks[c].els.remove(o);
         self.len -= 1;
         self.chunk_of[e as usize] = usize::MAX;
+        self.fadd(c, -1, -segs[e as usize].dir);
         if self.chunks[c].els.is_empty() {
             self.empty += 1;
             if self.empty * 4 > self.chunks.len() && self.chunks.len() > 8 {
@@ -837,7 +914,6 @@ impl Active {
             }
         }
         self.recalc(segs, c);
-        self.rb_dirty = true;
     }
 
     /// Rebuild the list from the live elements, dropping tombstones.
@@ -847,11 +923,17 @@ impl Active {
             els.extend_from_slice(&ch.els);
         }
         self.chunks.clear();
+        self.order_pos.clear();
+        self.next_id = 0;
         for (i, part) in els.chunks(CHUNK).enumerate() {
+            let id = self.new_id();
             for &x in part {
-                self.chunk_of[x as usize] = i;
+                self.chunk_of[x as usize] = id as usize;
             }
+            self.order_pos
+                .push(u32::try_from(i).expect("chunk index fits u32"));
             self.chunks.push(Chunk {
+                id,
                 els: part.to_vec(),
                 ..Chunk::default()
             });
@@ -859,7 +941,7 @@ impl Active {
             self.recalc(segs, last);
         }
         self.empty = 0;
-        self.rb_dirty = true;
+        self.rebuild_ft();
     }
 
     /// Swap the adjacent pair at ranks `r`, `r + 1` in place.
@@ -873,58 +955,14 @@ impl Active {
             let y = self.chunks[c1].els[o1];
             self.chunks[c0].els[o0] = y;
             self.chunks[c1].els[o1] = x;
+            self.chunk_of[x as usize] = self.chunks[c1].id as usize;
+            self.chunk_of[y as usize] = self.chunks[c0].id as usize;
+            let d = segs[y as usize].dir - segs[x as usize].dir;
+            self.fadd(c0, 0, d);
+            self.fadd(c1, 0, -d);
             self.recalc(segs, c1);
         }
         self.recalc(segs, c0);
-    }
-
-    /// Winding prefix before rank `k`: sum of the first `k`
-    /// directions — the `w` the old walk carried into element `k`.
-    fn w_at(&self, segs: &[Seg], mut k: usize) -> f64 {
-        let mut w = 0.0;
-        for ch in &self.chunks {
-            if k >= ch.els.len() {
-                w += ch.ds;
-                k -= ch.els.len();
-            } else {
-                for &e in &ch.els[..k] {
-                    w += segs[e as usize].dir;
-                }
-                return w;
-            }
-        }
-        w
-    }
-
-    /// Enumerate positions `j >= from` whose winding prefix —
-    /// `w_at(j)` — sits at `level`. Each chunk's cached prefix range
-    /// prunes ranks that cannot match, so the cost tracks the flips
-    /// an event actually caused instead of the whole list.
-    fn level_positions(&self, segs: &[Seg], from: usize, level: f64, out: &mut Vec<usize>) {
-        let mut base = 0.0f64;
-        let mut r = 0usize;
-        for ch in &self.chunks {
-            let n = ch.els.len();
-            if n > 0 && r + n > from {
-                let lo = base + ch.mn.min(0.0);
-                let hi = base + ch.mx.max(0.0);
-                if level >= lo && level <= hi {
-                    let mut w = base;
-                    for (t, &e) in ch.els.iter().enumerate() {
-                        if r + t >= from && w.to_bits() == level.to_bits() {
-                            out.push(r + t);
-                        }
-                        w += segs[e as usize].dir;
-                    }
-                }
-            }
-            base += ch.ds;
-            r += n;
-        }
-        // The trailing position after the last element.
-        if self.len >= from && base.to_bits() == level.to_bits() {
-            out.push(self.len);
-        }
     }
 
     /// Global min and max winding prefix over all positions.
@@ -978,7 +1016,6 @@ fn drain_xings(
     // can join a pair that must revert, and a revert can join a pair
     // that must swap — the cascades settle the list into the exact
     // order the old sort produced at `ym`. Each swap reports its
-    // lower rank on `swapped` for the emit's dirty set.
     let mut check_eqs = true;
     loop {
         let mut moved = false;
@@ -1213,7 +1250,8 @@ impl Ord for Split {
 #[expect(
     clippy::too_many_lines,
     clippy::cast_possible_truncation,
-    reason = "one sweep per design; emitted coordinates fit f32; key equality mirrors the sort"
+    clippy::float_cmp,
+    reason = "one sweep per design; emitted coordinates fit f32; key equality mirrors the sort; the winding prefix is a sum of unit directions, so its boundary test is an exact comparison"
 )]
 pub fn resolve_winding(
     segments: &[(f32, f32, f32, f32)],
@@ -1283,45 +1321,44 @@ pub fn resolve_winding(
     // key an event on, but the old sort still ordered them by their
     // midpoint keys each band, so they are re-checked per band.
     let mut eqs: Vec<(u32, u32)> = Vec::new();
-    // Per-segment open boundary run: (index into `out`, orientation,
-    // emitting band). A segment that is a boundary again in the very
-    // next band with the same orientation extends its emitted edge
-    // instead of starting a new piece; a run not emitted in a band
-    // fails the `band - 1` test and closes itself. The merged edge is
-    // exactly the union of the per-band pieces of the same line.
-    let mut runs: Vec<Option<(usize, bool, usize)>> = vec![None; segs.len()];
-    // The transition state machine is now event-driven instead of a
-    // per-band rescan: the inside/outside boundary at an edge can
-    // change only where a boundary event touched the list, so
-    // `dirty` collects the ranks each admit, retirement, and swap
-    // could have flipped — an admit shifting the winding level marks
-    // the positions whose prefix sits at the boundary levels {0, -dir}
-    // — and the emit pass re-evaluates only those. `open` maps a live
-    // segment to the piece its transition writes; `open_ord` keeps
-    // the same entries ordered by rank (the old `open` push order),
-    // and `prev_open` is a one-band-lagged replay of the transitions
-    // detected at the previous emitting band, for the cross-segment
-    // collinear merge: (segment, index into `out`, orientation). A
-    // piece's endpoint is written once, when its last live transition
-    // dies — the old code rewrote it every band, which only ever
-    // kept the last write.
-    let mut open: Vec<Option<(usize, bool)>> = vec![None; segs.len()];
-    let mut prev_open: Vec<(u32, usize, bool)> = Vec::new();
-    // Live transitions referencing each `out` piece.
-    let mut live: Vec<u32> = Vec::new();
-    // Transition changes recorded during an emitting band, replayed
-    // into `prev_open` at the next band's top while the list order
-    // still equals the emitting band's: (`true`, seg, piece, orient)
-    // inserts, (`false`, seg, ..) removes.
-    let mut delta: Vec<(bool, u32, usize, bool)> = Vec::new();
-    // Ranks an event could have changed a transition at, ascending.
-    let mut dirty: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
-    // Ranks swapped during `drain_xings`, and scratch for the level
-    // enumeration and for transitions dying on retirement.
+    // Per-segment open boundary run: (index into `out`, orientation)
+    // while `alive` marks it live. A segment that is a boundary again
+    // in the very next band with the same orientation extends its
+    // emitted edge instead of starting a new piece; a run that stops
+    // firing closes itself. The merged edge is exactly the union of
+    // the per-band pieces of the same line.
+    let mut runs: Vec<Option<(usize, bool)>> = vec![None; segs.len()];
+    // The transitions detected at the previous emitting band, kept
+    // for the cross-segment collinear merge: (rank at that band,
+    // segment, index into `out`, orientation). New births insert by
+    // their rank — the ordering the old `open` push order produced —
+    // and deaths remove their entry; a split `continue` leaves the
+    // list untouched since no band was emitted between. The matched
+    // endpoint and slope are recomputed from the segment at match
+    // time: the previous band's bottom is this band's `ya`.
+    // Open transitions of the previous and this emit — (seg, piece,
+    // orient, x at the band's bottom, slope). The last two fields are
+    // what the continuation match tests; caching them keeps each
+    // candidate check to a tuple load and two compares instead of two
+    // `segs` accesses and an `x_at` call.
+    let mut prev_open: Vec<(u32, usize, bool, f64, f64)> = Vec::new();
+    let mut open: Vec<(u32, usize, bool, f64, f64)> = Vec::new();
+    // `prev_open` sorted by endpoint abscissa: the continuation match
+    // window-searches it instead of scanning the whole list — the
+    // winning entry is still the first in emit order among the
+    // verified candidates (its stored index is the emit-order rank).
+    let mut pix: Vec<(f64, f64, bool, usize, u32)> = Vec::new();
+    // Whether each segment's transition is live: a live transition
+    // fires at every band until an event flips it, so `alive`
+    // standing means the run continued through the last band.
+    let mut alive: Vec<bool> = vec![false; segs.len()];
+    // Segments swapped during `drain_xings`, transitions dying this
+    // band — (rank, segment).
     let mut swapped: Vec<u32> = Vec::new();
-    let mut flips: Vec<usize> = Vec::new();
     let mut dead: Vec<(u32, u32)> = Vec::new();
-    let mut emitted_once = false;
+    // Band bottoms by band index, for the deferred piece-end writes,
+    // and the last emitting band's bottom.
+    let mut yb_hist: Vec<f64> = Vec::new();
     let mut last_yb = 0.0;
     // Band tops and bottoms: `cursor` walks the sorted endpoint list while
     // `pending` holds split points found inside bands. Every split a band
@@ -1336,7 +1373,6 @@ pub fn resolve_winding(
     // continuation check below; a band rerun after a split does not count.
     let mut pending = BinaryHeap::<Reverse<Split>>::new();
     let mut cursor = 1usize;
-    let mut band = 0usize;
     let mut ya = ys[0];
     // A single operand-order bound for every pair event: the stored
     // heap ordinate sits within `xing_err` of the scan-order value for
@@ -1354,20 +1390,6 @@ pub fn resolve_winding(
             },
         };
         let ym = ya.midpoint(yb);
-        // Replay the previous emitting band's transition changes into
-        // `prev_open` while the list is still in that band's order, so
-        // the collinear-merge scan below iterates exactly the
-        // candidates the old code's swapped-out `open` held.
-        for &(add, seg, piece, orient) in &delta {
-            if add {
-                let r = active.rank(seg);
-                let at = prev_open.partition_point(|&(s, ..)| active.rank(s) < r);
-                prev_open.insert(at, (seg, piece, orient));
-            } else if let Some(i) = prev_open.iter().position(|&(s, ..)| s == seg) {
-                prev_open.remove(i);
-            }
-        }
-        delta.clear();
         // Bring the carried-over list into the order the old sort
         // produced at this band's midpoint first, so the binary-search
         // admission below inserts on a sorted list.
@@ -1382,9 +1404,6 @@ pub fn resolve_winding(
             m_glob,
             &mut swapped,
         );
-        for &s in &swapped {
-            dirty.insert(s);
-        }
         swapped.clear();
         while next < segs.len() && segs[next].y0 <= ya + EPS {
             let i = next;
@@ -1396,41 +1415,6 @@ pub fn resolve_winding(
             // already-admitted members, matching the stable sort.
             let (xi, si) = (segs[i].x_at(ym), segs[i].slope);
             let at = active.slot(&segs, ym, xi, si);
-            // The insert shifts every suffix prefix by `dir`, flipping
-            // the inside state at positions whose prefix sits at a
-            // rule boundary — for NonZero the levels {0, -dir}; under
-            // EvenOdd every suffix position flips. A flipped position
-            // re-evaluates the transitions at the two elements next to
-            // it; the dirty set holds segment indices, since ranks
-            // shift again under later events this band.
-            match rule {
-                FillRule::NonZero => {
-                    for &lv in &[0.0, -segs[i].dir] {
-                        flips.clear();
-                        active.level_positions(&segs, at, lv, &mut flips);
-                        for &j in &flips {
-                            if j >= 1 {
-                                dirty.insert(active.at(j - 1));
-                            }
-                            if j < active.len {
-                                dirty.insert(active.at(j));
-                            }
-                        }
-                    }
-                }
-                FillRule::EvenOdd => {
-                    for r in at.saturating_sub(1)..active.len {
-                        dirty.insert(active.at(r));
-                    }
-                }
-            }
-            dirty.insert(i as u32);
-            if at >= 1 {
-                dirty.insert(active.at(at - 1));
-            }
-            if at < active.len {
-                dirty.insert(active.at(at));
-            }
             active.insert(&segs, at, i as u32);
             if at > 0 {
                 push_xing(
@@ -1462,35 +1446,10 @@ pub fn resolve_winding(
             retire.pop();
             let i = i as usize;
             let at = active.rank(i as u32);
-            // Removal drops `dir` from every suffix prefix; positions
-            // at {0, dir} flip, so their adjacent transitions re-eval.
-            match rule {
-                FillRule::NonZero => {
-                    for &lv in &[0.0, segs[i].dir] {
-                        flips.clear();
-                        active.level_positions(&segs, at + 1, lv, &mut flips);
-                        for &j in &flips {
-                            dirty.insert(active.at(j - 1));
-                            if j < active.len {
-                                dirty.insert(active.at(j));
-                            }
-                        }
-                    }
-                }
-                FillRule::EvenOdd => {
-                    for r in at.saturating_sub(1)..active.len {
-                        dirty.insert(active.at(r));
-                    }
-                }
-            }
-            if at >= 1 {
-                dirty.insert(active.at(at - 1));
-            }
-            if at + 1 < active.len {
-                dirty.insert(active.at(at + 1));
-            }
-            // The retiring edge's own transition dies with it.
-            if open[i].is_some() {
+            // The retiring edge's own transition dies with it; its
+            // last firing was the previous band.
+            if alive[i] {
+                alive[i] = false;
                 dead.push((at as u32, i as u32));
             }
             active.remove(&segs, i as u32);
@@ -1506,36 +1465,35 @@ pub fn resolve_winding(
                 );
             }
         }
-        if active.len == 0 {
-            prev_open.clear();
-            // Bands can end empty with transitions still queued for
-            // finalization — retirements wrote them into `dead`.
-            dead.sort_by_key(|&(r, _)| r);
-            for &(_, s) in &dead {
-                let i = s as usize;
-                if let Some((piece, orient)) = open[i].take() {
-                    delta.push((false, s, piece, orient));
-                    live[piece] -= 1;
-                    if live[piece] == 0 {
-                        let x = segs[i].x_at(ya);
-                        let piece = &mut out[piece];
-                        if orient {
-                            piece.2 = x;
-                            piece.3 = ya;
-                        } else {
-                            piece.0 = x;
-                            piece.1 = ya;
-                        }
-                    }
+        // Transitions that died on retirement close their pieces in
+        // the rank order they held while firing — each write is the
+        // piece's endpoint at the previous band's bottom.
+        dead.sort_by_key(|&(r, _)| r);
+        for &(_, s) in &dead {
+            let i = s as usize;
+            if let Some((edge, orient)) = runs[i].take() {
+                let y = yb_hist.last().copied().unwrap_or(last_yb);
+                let x = segs[i].x_at(y);
+                let piece = &mut out[edge];
+                if orient {
+                    piece.2 = x;
+                    piece.3 = y;
+                } else {
+                    piece.0 = x;
+                    piece.1 = y;
                 }
             }
-            dead.clear();
+        }
+        dead.clear();
+        if active.len == 0 {
+            prev_open.clear();
+            pix.clear();
+            yb_hist.push(yb);
             if from_pending {
                 pending.pop();
             } else {
                 cursor += 1;
             }
-            band += 1;
             ya = yb;
             continue;
         }
@@ -1583,107 +1541,131 @@ pub fn resolve_winding(
         } else {
             cursor += 1;
         }
-        // Emit pass: evaluate the transitions only at the segments this
-        // band's events flagged — everywhere else the inside/outside
-        // state is unchanged by construction, so an unchanged
-        // transition costs nothing. On the first emitting band every
-        // live segment is evaluated, bootstrapping `open`.
-        if !emitted_once {
-            for r in 0..active.len {
-                dirty.insert(active.at(r));
-            }
-            emitted_once = true;
-        }
-        let mut born: Vec<(u32, bool)> = Vec::new();
-        for &s in &dirty {
-            let i = s as usize;
-            if active.chunk_of[i] == usize::MAX {
-                continue;
-            }
-            let r = active.rank(s);
-            let wb = active.w_at(&segs, r);
-            let (l, rr) = (inside_at(wb, rule), inside_at(wb + segs[i].dir, rule));
-            if l == rr {
-                if open[i].is_some() {
-                    dead.push((r as u32, s));
-                }
-            } else {
-                match open[i] {
-                    Some((piece, orient)) if orient == rr => {
-                        runs[i] = Some((piece, rr, band));
+        // Emit pass: every live element is evaluated once, in rank
+        // order — the same order the old `active` vec walked it in —
+        // carrying the winding prefix `w`. A live transition fires at
+        // every band, so a segment's piece endpoint is written once:
+        // at the band after its last firing — the value the old
+        // per-band writes converged to.
+        let pend = yb_hist.last().copied().unwrap_or(last_yb);
+        let mut w = 0.0;
+        for ch in &active.chunks {
+            for &e in &ch.els {
+                let i = e as usize;
+                let seg = &segs[i];
+                let dir = seg.dir;
+                let (l, now) = match rule {
+                    FillRule::NonZero => {
+                        // w is a sum of unit directions, so the
+                        // boundary test is a direct comparison.
+                        if dir > 0.0 {
+                            (w != 0.0, w != -1.0)
+                        } else {
+                            (w != 0.0, w != 1.0)
+                        }
                     }
-                    Some(_) => {
-                        dead.push((r as u32, s));
-                        born.push((s, rr));
+                    FillRule::EvenOdd => (inside_at(w, rule), inside_at(w + dir, rule)),
+                };
+                w += dir;
+                if l == now {
+                    // No transition here any more: if the run was
+                    // live, it died — its last firing was the
+                    // previous band.
+                    if alive[i] {
+                        alive[i] = false;
+                        dead.push((0, e));
                     }
-                    None => born.push((s, rr)),
+                    continue;
                 }
-            }
-        }
-        dirty.clear();
-        // A dying transition writes its piece's endpoint once, as the
-        // last live band's bottom — the old code rewrote it every
-        // band, keeping only the last. Pieces shared by several
-        // transitions finalize with the highest-rank live one, so the
-        // deaths run in rank order and the last write wins.
-        dead.sort_by_key(|&(r, _)| r);
-        for &(_, s) in &dead {
-            let i = s as usize;
-            if let Some((piece, orient)) = open[i].take() {
-                delta.push((false, s, piece, orient));
-                live[piece] -= 1;
-                if live[piece] == 0 {
-                    let x = segs[i].x_at(ya);
-                    let piece = &mut out[piece];
+                let (xa, xb) = (seg.x_at(ya), seg.x_at(yb));
+                if alive[i]
+                    && let Some((edge, orient)) = runs[i]
+                {
+                    if orient == now {
+                        // Same run keeps firing — its piece was
+                        // already emitted; nothing changes.
+                        open.push((e, edge, orient, xb, seg.slope));
+                        continue;
+                    }
+                    // The orientation flipped: the old run's last
+                    // firing was the previous band — close its piece.
+                    let x = seg.x_at(pend);
+                    let piece = &mut out[edge];
                     if orient {
                         piece.2 = x;
-                        piece.3 = ya;
+                        piece.3 = pend;
                     } else {
                         piece.0 = x;
-                        piece.1 = ya;
+                        piece.1 = pend;
                     }
+                }
+                // A new or re-born transition: continue an open
+                // run from the previous band that ends where this
+                // piece starts and shares its slope — coincident
+                // collinear segments form one boundary line, so
+                // the extension is exact; at a kink the slope
+                // differs and a new edge starts. `pix` is `prev_open`
+                // sorted by endpoint abscissa, so the match window
+                // is a binary-search range instead of a full scan;
+                // among the candidates the lowest stored index is
+                // the first entry in emit order — the same pick the
+                // linear scan made.
+                let tol = EPS * (1.0 + xa.abs());
+                let (xlo, xhi) = (xa - tol, xa + tol);
+                let lo = pix.partition_point(|&(xe, _, _, _, _)| xe < xlo);
+                let hi = pix.partition_point(|&(xe, _, _, _, _)| xe <= xhi);
+                let mut best: Option<(u32, usize)> = None;
+                for &(_, sl, orient, edge, oidx) in &pix[lo..hi] {
+                    if orient == now && (sl - seg.slope).abs() <= EPS {
+                        match best {
+                            Some((b, _)) if b <= oidx => {}
+                            _ => best = Some((oidx, edge)),
+                        }
+                    }
+                }
+                let edge = best.map_or_else(
+                    || {
+                        if now {
+                            out.push((xa, ya, xb, yb));
+                        } else {
+                            out.push((xb, yb, xa, ya));
+                        }
+                        out.len() - 1
+                    },
+                    |(_, edge)| edge,
+                );
+                runs[i] = Some((edge, now));
+                alive[i] = true;
+                open.push((e, edge, now, xb, seg.slope));
+            }
+        }
+        std::mem::swap(&mut open, &mut prev_open);
+        open.clear();
+        pix.clear();
+        pix.extend(
+            prev_open
+                .iter()
+                .enumerate()
+                .map(|(idx, &(_, edge, orient, xe, sl))| (xe, sl, orient, edge, idx as u32)),
+        );
+        pix.sort_by(|a, b| a.0.total_cmp(&b.0));
+        // Dying transitions close their pieces in rank order — the
+        // chunk walk already yielded them that way.
+        for &(_, s) in &dead {
+            let i = s as usize;
+            if let Some((edge, orient)) = runs[i].take() {
+                let x = segs[i].x_at(pend);
+                let piece = &mut out[edge];
+                if orient {
+                    piece.2 = x;
+                    piece.3 = pend;
+                } else {
+                    piece.0 = x;
+                    piece.1 = pend;
                 }
             }
         }
         dead.clear();
-        // Births push their `out` pieces in rank order, the same order
-        // the old walk detected them in.
-        born.sort_by_key(|&(s, _)| active.rank(s));
-        for &(s, now) in &born {
-            let i = s as usize;
-            let seg = &segs[i];
-            let (xa, xb) = (seg.x_at(ya), seg.x_at(yb));
-            // Continue this segment's own open run, or an open run
-            // from the previous band that ends where this piece starts
-            // and shares its slope — coincident collinear segments
-            // form one boundary line, so the extension is exact; at a
-            // kink the slope differs and a new edge starts.
-            let run = match runs[i] {
-                Some((edge, orient, last)) if orient == now && last + 1 == band => Some(edge),
-                _ => prev_open.iter().find_map(|&(s, edge, orient)| {
-                    (orient == now
-                        && (segs[s as usize].x_at(ya) - xa).abs() <= EPS * (1.0 + xa.abs())
-                        && (segs[s as usize].slope - seg.slope).abs() <= EPS)
-                        .then_some(edge)
-                }),
-            };
-            let edge = if let Some(edge) = run {
-                live[edge] += 1;
-                edge
-            } else {
-                if now {
-                    out.push((xa, ya, xb, yb));
-                } else {
-                    out.push((xb, yb, xa, ya));
-                }
-                live.push(1);
-                out.len() - 1
-            };
-            runs[i] = Some((edge, now, band));
-            open[i] = Some((edge, now));
-            delta.push((true, s, edge, now));
-        }
-        born.clear();
         // A winding magnitude above one, or both signs in one band,
         // means regions overlap — only then is rewriting needed.
         let (wmin, wmax) = active.w_minmax();
@@ -1691,16 +1673,19 @@ pub fn resolve_winding(
             overlap = true;
         }
         last_yb = yb;
-        band += 1;
+        yb_hist.push(yb);
         ya = yb;
     }
-    // Pieces still open finalize at the last emitting band's bottom,
-    // highest-rank transition last — the old walk's final writes.
+    // Transitions still live finalize at the last emitting band's
+    // bottom — the old walk's last write — in rank order so the
+    // last-emitted transition wins shared pieces.
     for r in 0..active.len {
         let i = active.at(r) as usize;
-        if let Some((piece, orient)) = open[i] {
+        if alive[i]
+            && let Some((edge, orient)) = runs[i]
+        {
             let x = segs[i].x_at(last_yb);
-            let piece = &mut out[piece];
+            let piece = &mut out[edge];
             if orient {
                 piece.2 = x;
                 piece.3 = last_yb;

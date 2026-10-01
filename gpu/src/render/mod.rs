@@ -1071,48 +1071,29 @@ const fn variant_index(variant: ShaderVariant) -> usize {
     }
 }
 
-/// #170 B3's measured choice: whether the deduplicated core pipeline set
-/// is built at creation (`CoreEager`) or each cell at the first draw that
-/// needs it (`CoreDemand`). `CHERENKOV_CORE_PIPELINES=demand` overrides
-/// the default for the selection runs only — the shipped policy lands as
-/// a constant once the Pixel A/B lands. wasm is always eager: its
-/// pipeline creation is async and cannot run inside the encode loop.
+/// #170's measured pipeline policy (`CoreEager`): the deduplicated core
+/// set is built at creation. The Pixel A/B rejected demand-mode creation:
+/// the first drawn frame's encode phase paid 41–561 ms for the pipelines
+/// it missed (vs 3–16 ms steady). wasm is always eager — it has no demand
+/// call site at all, since its pipeline creation is async and cannot run
+/// inside the synchronous encode loop.
 #[cfg(not(target_arch = "wasm32"))]
-fn core_pipelines_eager() -> bool {
-    std::env::var_os("CHERENKOV_CORE_PIPELINES").is_none_or(|v| v != "demand")
-}
-
-/// The device allocator's memory-hints policy — #170 B4 selects the
-/// checked-in value by measured reservation. `CHERENKOV_MEMORY_HINTS`
-/// overrides it for the selection runs only: `performance`,
-/// `memory-usage`, `manual-4-16`, `manual-8-32`, `manual-16-32` (MiB
-/// block-size floor and cap — suballocation policy, not a total budget).
-#[cfg(not(target_arch = "wasm32"))]
-fn memory_hints() -> wgpu::MemoryHints {
-    const MIB: u64 = 1024 * 1024;
-    match std::env::var("CHERENKOV_MEMORY_HINTS").ok().as_deref() {
-        Some("memory-usage") => wgpu::MemoryHints::MemoryUsage,
-        Some("manual-4-16") => wgpu::MemoryHints::Manual {
-            suballocated_device_memory_block_size: 4 * MIB..16 * MIB,
-        },
-        Some("manual-8-32") => wgpu::MemoryHints::Manual {
-            suballocated_device_memory_block_size: 8 * MIB..32 * MIB,
-        },
-        Some("manual-16-32") => wgpu::MemoryHints::Manual {
-            suballocated_device_memory_block_size: 16 * MIB..32 * MIB,
-        },
-        _ => wgpu::MemoryHints::Performance,
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
 const fn core_pipelines_eager() -> bool {
     true
 }
 
-#[cfg(target_arch = "wasm32")]
+/// The device allocator's suballocation block range — #170's measured
+/// choice. wgpu's `Performance` default reserves a 64 MiB block at the
+/// first allocation (~0.5 MiB of it used), which is the bulk of the
+/// ~74 MiB idle reservation on Mali-G715. 4–16 MiB blocks measure 10.4
+/// MiB idle on the Pixel 9 Pro and the lowest steady reservation of the
+/// policies tried (report-170.md); the cap keeps a large scene's growth
+/// inside a bounded number of blocks (map: five blocks for 53 MiB).
 const fn memory_hints() -> wgpu::MemoryHints {
-    wgpu::MemoryHints::Performance
+    const MIB: u64 = 1024 * 1024;
+    wgpu::MemoryHints::Manual {
+        suballocated_device_memory_block_size: 4 * MIB..16 * MIB,
+    }
 }
 
 /// The pipeline layout every core and backdrop pipeline shares, over
@@ -1332,7 +1313,16 @@ impl PipelineFactory<'_> {
         replace: bool,
         variant: ShaderVariant,
     ) -> Result<wgpu::RenderPipeline, RenderError> {
-        let _ = (format, replace, variant);
+        let _ = (
+            self.device,
+            self.config,
+            self.layout,
+            self.cache,
+            self.delivery,
+            format,
+            replace,
+            variant,
+        );
         Err(RenderError::Render(
             "a core pipeline was not prepared at init".into(),
         ))

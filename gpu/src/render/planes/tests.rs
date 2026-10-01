@@ -95,7 +95,7 @@ fn an_eligible_external_frame_is_promoted_between_two_parts() {
 #[test]
 fn only_candidates_are_promoted() {
     let none = plan::<Test>(&scene(), &FxHashMap::default());
-    assert!(none.planes.is_empty());
+    assert_eq!(none.planes, []);
     assert_eq!(none.parts(), 1);
     let video = plan::<Test>(&scene(), &video());
     assert_eq!(

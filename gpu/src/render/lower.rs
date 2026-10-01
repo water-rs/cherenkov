@@ -4863,7 +4863,9 @@ mod tests {
                 external: &FxHashMap::default(),
             };
             let mut frame = Frame::default();
-            Lowering::new(&mut frame, (32, 32))
+            let mut lowering = Lowering::new(&mut frame, (32, 32));
+            lowering.prepare(&mut caches, &glyphs).expect("prepared");
+            lowering
                 .run(
                     &tree,
                     &mut caches,

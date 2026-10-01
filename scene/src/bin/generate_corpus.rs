@@ -1060,6 +1060,233 @@ fn map_body(l: &mut LayerBuilder, pw: f64, ph: f64) {
     }
 }
 
+/// Issue #210 reproduction: a dense city-map frame at 1600x1200 in the
+/// Positron style — a Manhattan street grid of overlapping filled ribbons,
+/// one merged fill path of ~235k building-footprint elements, and one
+/// stroked path whose outline expands toward ~1M segments. Building lots
+/// that rotate to a star footprint self-intersect. The merged single paths
+/// are what drove `resolve_winding` quadratic; a tile-of-small-paths layout
+/// would not.
+///
+/// Deterministic: fixed seed, no system input. The lots are generated once
+/// into `manhattan_blocks`, so the fill and the stroked outline replay the
+/// exact same footprints.
+const MAP_SEED: u64 = 0x5EED_1057_A1A7_7A11;
+
+/// One city block of building lots, or a park taking the whole block.
+enum MapBlock {
+    /// A park: one soft polygon, `pts` around the block centre.
+    Park([(f64, f64); 9]),
+    /// Packed building lots.
+    Lots(Vec<MapLot>),
+}
+
+/// One building-lot footprint.
+enum MapLot {
+    /// A chamfered rectangle: 8 vertices.
+    Chamfered([(f64, f64); 8]),
+    /// A 10-point star outline, which self-intersects.
+    Star { cx: f64, cy: f64, r: f64 },
+}
+
+/// The deterministic block layout: ~14 avenues x ~15 streets, each block
+/// packed with 12x12 lots on a ~7x5 px cell. A rotating minority of blocks
+/// (~2%) is a park; ~10% of lots is a self-intersecting star.
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "the suggested mul_add rewrites alter serialized float bytes; corpus scenes are pinned"
+)]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "loop counters are small integers; the layout is deterministic"
+)]
+fn manhattan_blocks() -> Vec<MapBlock> {
+    let mut rng = Rng(MAP_SEED ^ 0xB11D);
+    let mut blocks = Vec::new();
+    for bx in 0..14u32 {
+        for by in 0..15u32 {
+            let x0 = f64::from(bx) * 100.0 + 68.0;
+            let y0 = f64::from(by) * 76.0 + 47.0;
+            if rng.below(48) == 0 {
+                let cxm = x0 + 42.0;
+                let cym = y0 + 31.0;
+                let mut pts = [(0.0, 0.0); 9];
+                for (vi, pt) in pts.iter_mut().enumerate() {
+                    let angle = (vi as f64) * std::f64::consts::TAU / 9.0;
+                    let r = 26.0 + rng.f64() * 10.0;
+                    *pt = (cxm + r * angle.cos() * 1.4, cym + r * angle.sin());
+                }
+                blocks.push(MapBlock::Park(pts));
+                continue;
+            }
+            let mut lots = Vec::with_capacity(144);
+            for cx in 0..12u32 {
+                for cy in 0..12u32 {
+                    let fx = x0 + f64::from(cx) * 7.0;
+                    let fy = y0 + f64::from(cy) * 5.15;
+                    let w = 5.0 + rng.f64() * 1.6;
+                    let h = 3.6 + rng.f64() * 1.4;
+                    let c = 0.8 + rng.f64() * 0.7;
+                    lots.push(if rng.below(10) == 0 {
+                        MapLot::Star {
+                            cx: fx + w * 0.5,
+                            cy: fy + h * 0.5,
+                            r: w * 0.7,
+                        }
+                    } else {
+                        MapLot::Chamfered([
+                            (fx + c, fy),
+                            (fx + w - c, fy),
+                            (fx + w, fy + c),
+                            (fx + w, fy + h - c),
+                            (fx + w - c, fy + h),
+                            (fx + c, fy + h),
+                            (fx, fy + h - c),
+                            (fx, fy + c),
+                        ])
+                    });
+                }
+            }
+            blocks.push(MapBlock::Lots(lots));
+        }
+    }
+    blocks
+}
+
+/// Append one lot's subpath (`move_to`, `line_to` x n, `close_path`).
+fn lot_subpath(path: &mut BezPath, lot: &MapLot) {
+    match *lot {
+        MapLot::Chamfered(pts) => {
+            path.move_to(pts[0]);
+            for pt in &pts[1..] {
+                path.line_to(*pt);
+            }
+        }
+        MapLot::Star { cx, cy, r } => {
+            for vi in 0..10u32 {
+                let rr = if vi % 2 == 0 { r } else { r * 0.4 };
+                let angle = f64::from(vi)
+                    .mul_add(std::f64::consts::TAU / 10.0, -std::f64::consts::FRAC_PI_2);
+                let pt = (cx + rr * angle.cos(), cy + rr * angle.sin());
+                if vi == 0 {
+                    path.move_to(pt);
+                } else {
+                    path.line_to(pt);
+                }
+            }
+        }
+    }
+    path.close_path();
+}
+
+/// The scene body: overlapping street fills, the merged building fill,
+/// then the merged stroke of outlines and road centre-lines.
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "the suggested mul_add rewrites alter serialized float bytes; corpus scenes are pinned"
+)]
+fn map_manhattan_body(l: &mut LayerBuilder) {
+    let land = srgb(0.92, 0.93, 0.89);
+    let street = srgb(0.97, 0.97, 0.96);
+    let water = srgb(0.78, 0.86, 0.90);
+    let building = srgb(0.71, 0.72, 0.70);
+    let park = srgb(0.72, 0.80, 0.66);
+    let road_paint = srgb(0.55, 0.57, 0.58);
+
+    // Land mass and the East River along the right edge.
+    l.fill(Shape::rect(0.0, 0.0, 1600.0, 1200.0), solid(land));
+    l.fill(Shape::rect(1500.0, 0.0, 100.0, 1200.0), solid(water));
+
+    // The street grid as overlapping filled ribbons.
+    for i in 0..15u32 {
+        let x = 60.0 + f64::from(i) * 100.0;
+        l.fill(Shape::rect(x - 6.0, 0.0, 12.0, 1200.0), solid(street));
+    }
+    for i in 0..16u32 {
+        let y = 40.0 + f64::from(i) * 76.0;
+        l.fill(Shape::rect(0.0, y - 5.0, 1500.0, 10.0), solid(street));
+    }
+
+    let blocks = manhattan_blocks();
+
+    // The merged building fill: ~30k lots in one path.
+    let mut buildings = BezPath::new();
+    for block in &blocks {
+        if let MapBlock::Lots(lots) = block {
+            for lot in lots {
+                lot_subpath(&mut buildings, lot);
+            }
+        }
+    }
+    l.fill(Shape::Path { path: buildings }, solid(building));
+
+    // Park blocks paint over the lots they replaced.
+    for block in &blocks {
+        if let MapBlock::Park(pts) = block {
+            let mut p = BezPath::new();
+            p.move_to(pts[0]);
+            for pt in &pts[1..] {
+                p.line_to(*pt);
+            }
+            p.close_path();
+            l.fill(Shape::Path { path: p }, solid(park));
+        }
+    }
+
+    // The stroked layer: every building outline plus jittered road
+    // centre-lines, again as one path.
+    let mut stroke = BezPath::new();
+    let mut rng = Rng(MAP_SEED ^ 0x80AD);
+    for block in &blocks {
+        match block {
+            MapBlock::Park(pts) => {
+                // A drive ring around the park's centre.
+                let cxm = pts.iter().map(|p| p.0).sum::<f64>() / 9.0;
+                let cym = pts.iter().map(|p| p.1).sum::<f64>() / 9.0;
+                for vi in 0..40u32 {
+                    let angle = f64::from(vi) * std::f64::consts::TAU / 40.0;
+                    let pt = (cxm + 30.0 * angle.cos(), cym + 24.0 * angle.sin());
+                    if vi == 0 {
+                        stroke.move_to(pt);
+                    } else {
+                        stroke.line_to(pt);
+                    }
+                }
+                stroke.close_path();
+            }
+            MapBlock::Lots(lots) => {
+                for lot in lots {
+                    lot_subpath(&mut stroke, lot);
+                }
+            }
+        }
+    }
+    for i in 0..15u32 {
+        let x = 60.0 + f64::from(i) * 100.0;
+        stroke.move_to((x, 0.0));
+        for k in 0..600u32 {
+            let y = (f64::from(k) + 1.0) * 2.0;
+            stroke.line_to((x + rng.f64() * 2.0 - 1.0, y));
+        }
+    }
+    for i in 0..16u32 {
+        let y = 40.0 + f64::from(i) * 76.0;
+        stroke.move_to((0.0, y));
+        for k in 0..750u32 {
+            let x = (f64::from(k) + 1.0) * 2.0;
+            stroke.line_to((x, y + rng.f64() * 2.0 - 1.0));
+        }
+    }
+    l.stroke(
+        Shape::Path { path: stroke },
+        StrokeStyle {
+            width: 0.8,
+            ..StrokeStyle::default()
+        },
+        solid(road_paint),
+    );
+}
+
 /// Shared background: saturated shapes and a diagonal gradient so the
 /// sampled backdrop is visibly different from a flat fill.
 fn backdrop_background(l: &mut LayerBuilder) {
@@ -4842,6 +5069,14 @@ fn run() -> Result<(), SceneError> {
         );
         // Far corner: stays a separate region.
         member(l, [440.0, 428.0, 508.0, 508.0], None);
+    });
+
+    // ---- Stress scenes -----------------------------------------------------
+
+    // Issue #210: the merged single-path dense map that drove
+    // `resolve_winding` quadratic.
+    corpus.scene("map-manhattan", 1600, 1200, srgb(0.92, 0.93, 0.89), |l| {
+        map_manhattan_body(l);
     });
 
     // ---- Write out ---------------------------------------------------------

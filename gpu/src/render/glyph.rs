@@ -338,7 +338,12 @@ enum LiveKind {
 
 /// The `R8Unorm` coverage atlas.
 pub struct Atlas {
-    texture: wgpu::Texture,
+    /// The atlas texture — `None` until the first committed cell writes
+    /// it; an idle engine holds no coverage storage (#170).
+    texture: Option<wgpu::Texture>,
+    /// The group-0 binding: the atlas view once allocated, otherwise a
+    /// 1×1 `R8Unorm` placeholder — the minimal valid binding for a
+    /// binding the frame's instances never sample (#170).
     view: wgpu::TextureView,
     /// Page edge: the texture is `size` × `size * pages`.
     size: u32,
@@ -420,13 +425,28 @@ pub struct Atlas {
 impl Atlas {
     /// A new `ATLAS_START` atlas, capped by the GPU byte budget (one texel
     /// per byte).
+    ///
+    /// No texture is allocated: coverage storage arrives at the first
+    /// committed cell, and `view` binds a 1×1 placeholder until then
+    /// (#170's "storage absent until the first atlas-backed primitive").
     pub fn new(device: &wgpu::Device, budget: u64) -> Self {
-        let (texture, view) = Self::allocate(device, ATLAS_START, 1);
-        crate::diag::create(
-            device,
-            "glyph atlas",
-            u64::from(ATLAS_START) * u64::from(ATLAS_START),
-        );
+        let view = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("glyph atlas placeholder"),
+                size: wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::R8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        crate::diag::create(device, "glyph atlas placeholder", 1);
         let texture_limit = device.limits().max_texture_dimension_2d;
         #[expect(
             clippy::cast_possible_truncation,
@@ -438,7 +458,7 @@ impl Atlas {
             .min((budget as f64).sqrt() as u32)
             .max(ATLAS_START);
         Self {
-            texture,
+            texture: None,
             view,
             size: ATLAS_START,
             cap,
@@ -509,13 +529,33 @@ impl Atlas {
         (texture, view)
     }
 
-    /// The texture view bound in group 0.
+    /// The texture view bound in group 0 — the placeholder while no
+    /// cell has committed.
     pub const fn view(&self) -> &wgpu::TextureView {
         &self.view
     }
 
-    /// Atlas byte size on the GPU.
+    /// Allocates the atlas texture at the first committed cell. The
+    /// generation bump rebuilds group-0 bindings against the real view.
+    fn ensure_storage(&mut self, device: &wgpu::Device) {
+        if self.texture.is_some() {
+            return;
+        }
+        let (texture, view) = Self::allocate(device, self.size, self.pages);
+        self.texture = Some(texture);
+        self.view = view;
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .expect("atlas generation overflow");
+        crate::diag::create(device, "glyph atlas", self.gpu_bytes());
+    }
+
+    /// Atlas byte size on the GPU — 0 while no cell has committed.
     pub fn gpu_bytes(&self) -> u64 {
+        if self.texture.is_none() {
+            return 0;
+        }
         u64::from(self.size) * u64::from(self.size) * u64::from(self.pages)
     }
 
@@ -614,6 +654,7 @@ impl Atlas {
         if cells.is_empty() {
             return;
         }
+        self.ensure_storage(device);
         let n = self.layout.shelves.len();
         self.bucket_counts.clear();
         self.bucket_counts.resize(n, 0);
@@ -674,7 +715,7 @@ impl Atlas {
             };
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
-                    texture: &self.texture,
+                    texture: self.texture.as_ref().expect("atlas storage allocated"),
                     mip_level: 0,
                     origin: wgpu::Origin3d {
                         x: x0,
@@ -1363,7 +1404,7 @@ impl Atlas {
         }
         let old = self.gpu_bytes();
         let (texture, view) = Self::allocate(device, size, pages);
-        self.texture = texture;
+        self.texture = Some(texture);
         self.view = view;
         self.size = size;
         self.pages = pages;

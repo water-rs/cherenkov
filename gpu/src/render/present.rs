@@ -211,6 +211,12 @@ impl Presenter {
             wgpu::CompositeAlphaMode::PreMultiplied | wgpu::CompositeAlphaMode::Inherit => {
                 OutputAlpha::Premultiplied
             }
+            // Core Animation composites a non-opaque layer's contents as
+            // premultiplied; wgpu's Metal backend offers exactly that mode,
+            // under the name `PostMultiplied`.
+            #[cfg(target_vendor = "apple")]
+            wgpu::CompositeAlphaMode::PostMultiplied => OutputAlpha::Premultiplied,
+            #[cfg(not(target_vendor = "apple"))]
             wgpu::CompositeAlphaMode::PostMultiplied => OutputAlpha::Straight,
             wgpu::CompositeAlphaMode::Auto | wgpu::CompositeAlphaMode::Opaque => {
                 OutputAlpha::Opaque

@@ -75,7 +75,7 @@ fn xyz_to_cielab(xyz: [f64; 3]) -> [f64; 3] {
         *c = if *c > delta_cube {
             c.powf(1.0 / 3.0)
         } else {
-            factor * *c + term
+            factor.mul_add(*c, term)
         };
     }
     [

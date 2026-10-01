@@ -3,7 +3,6 @@
 #![expect(
     clippy::cast_lossless,
     clippy::excessive_precision,
-    clippy::float_cmp,
     clippy::suboptimal_flops,
     reason = "test tolerances and srgb8 conversions"
 )]

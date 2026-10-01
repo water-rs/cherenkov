@@ -642,6 +642,47 @@ struct MeasureOpts<'a> {
     native: Option<&'a str>,
 }
 
+/// Wall-clock seconds a `render` scene (or a whole pass) spent in each
+/// phase. `render` and `readback` split `Engine::submit` using the
+/// adapter-reported halves; an adapter that does not split reports its
+/// whole submit under `render`.
+#[derive(Clone, Copy, Debug, Default)]
+struct PhaseTiming {
+    /// `Scene::load` plus the blob reads.
+    load: f64,
+    /// The oracle `f64` render and, under `--present`, the reference's
+    /// presentation of it.
+    reference: f64,
+    /// `Engine::prepare`.
+    prepare: f64,
+    /// `Engine::encode`.
+    encode: f64,
+    /// `Engine::submit` minus its readback half.
+    render: f64,
+    /// `Engine::submit`'s pixel readback.
+    readback: f64,
+    /// `Engine::trim`, the memory snapshots and the counters read.
+    trim: f64,
+    /// `metrics::compare` (FLIP, max local error, heatmap).
+    compare: f64,
+    /// `write_render` / `write_unsupported` (PNGs plus the report JSON).
+    write: f64,
+}
+
+impl std::ops::AddAssign for PhaseTiming {
+    fn add_assign(&mut self, rhs: Self) {
+        self.load += rhs.load;
+        self.reference += rhs.reference;
+        self.prepare += rhs.prepare;
+        self.encode += rhs.encode;
+        self.render += rhs.render;
+        self.readback += rhs.readback;
+        self.trim += rhs.trim;
+        self.compare += rhs.compare;
+        self.write += rhs.write;
+    }
+}
+
 /// The `render` subcommand: every scene in the corpus, or the one
 /// `--scene`, against the oracle.
 fn render_cmd(
@@ -652,30 +693,53 @@ fn render_cmd(
     out_dir: Option<&Path>,
     present: Option<crate::PresentKind>,
 ) -> Result<(), BenchError> {
+    let pass_at = Instant::now();
     let mut engine = create_engine(engine)?;
     let idle_memory = MemorySnapshot::capture(engine.memory(), SampleDetail::Full);
     if let Some(kind) = present {
         engine.present(kind)?;
     }
+    let setup_seconds = pass_at.elapsed().as_secs_f64();
+    tracing::info!(
+        engine = engine.info().name,
+        setup_s = setup_seconds,
+        "adapter ready"
+    );
+    let mut totals = PhaseTiming::default();
+    let mut scenes = 0u32;
     for dir in scene_dirs(scene, corpus)? {
+        scenes += 1;
         let out_path = match (out, out_dir) {
             (Some(o), None) => o.to_path_buf(),
             (None, Some(d)) => d.join(render_report_name(engine.info().name, present, &dir)),
             _ => return Err(BenchError::Engine("--out or --out-dir required".into())),
         };
-        match render_scene(&mut *engine, &dir, idle_memory.clone(), present) {
+        let mut t = PhaseTiming::default();
+        match render_scene(&mut *engine, &dir, idle_memory.clone(), present, &mut t) {
             Ok(rendered) => {
+                let write_at = Instant::now();
                 write_render(&rendered, &out_path)?;
+                t.write = write_at.elapsed().as_secs_f64();
+                totals += t;
                 tracing::info!(
                     scene = %dir.display(),
                     flip_mean = rendered.report.metrics.flip_mean,
                     flip_max = rendered.report.metrics.flip_max,
                     max_local_error = rendered.report.metrics.max_local_error,
+                    load_s = t.load,
+                    reference_s = t.reference,
+                    prepare_s = t.prepare,
+                    encode_s = t.encode,
+                    render_s = t.render,
+                    readback_s = t.readback,
+                    compare_s = t.compare,
+                    write_s = t.write,
                     out = %out_path.display(),
                     "render"
                 );
             }
             Err(BenchError::Unsupported { feature, api, .. }) => {
+                let write_at = Instant::now();
                 write_unsupported(
                     &*engine,
                     &dir,
@@ -684,9 +748,14 @@ fn render_cmd(
                     idle_memory.clone(),
                     &out_path,
                 )?;
+                t.write = write_at.elapsed().as_secs_f64();
+                totals += t;
                 tracing::warn!(
                     scene = %dir.display(),
                     ?feature,
+                    load_s = t.load,
+                    reference_s = t.reference,
+                    prepare_s = t.prepare,
                     out = %out_path.display(),
                     "unsupported"
                 );
@@ -694,6 +763,21 @@ fn render_cmd(
             Err(e) => return Err(e),
         }
     }
+    tracing::info!(
+        engine = engine.info().name,
+        scenes,
+        wall_s = pass_at.elapsed().as_secs_f64(),
+        load_s = totals.load,
+        reference_s = totals.reference,
+        prepare_s = totals.prepare,
+        encode_s = totals.encode,
+        render_s = totals.render,
+        readback_s = totals.readback,
+        trim_s = totals.trim,
+        compare_s = totals.compare,
+        write_s = totals.write,
+        "render pass totals"
+    );
     Ok(())
 }
 
@@ -939,22 +1023,38 @@ fn render_scene(
     dir: &Path,
     idle_memory: MemorySnapshot,
     present: Option<crate::PresentKind>,
+    t: &mut PhaseTiming,
 ) -> Result<RenderOutput, BenchError> {
+    let at = Instant::now();
     let scene = Scene::load(dir)?;
     let blobs = convert::load_blobs(&scene, dir)?;
+    t.load = at.elapsed().as_secs_f64();
+    let at = Instant::now();
     let renderer = Renderer::new(scene.width as usize, scene.height as usize);
     let reference = match present {
         None => renderer.render(&scene, dir)?,
         Some(kind) => present_reference(kind, &renderer, &scene, dir)?,
     };
+    t.reference = at.elapsed().as_secs_f64();
     let input = EncodeInput {
         scene: &scene,
         blobs: &blobs,
     };
+    let at = Instant::now();
     engine.prepare(&input)?;
+    t.prepare = at.elapsed().as_secs_f64();
     let prepare_memory = MemorySnapshot::capture(engine.memory(), SampleDetail::Full);
+    let at = Instant::now();
     engine.encode(&input)?;
+    t.encode = at.elapsed().as_secs_f64();
+    let submit_at = Instant::now();
     let submit = engine.submit(0, true)?;
+    let submit_seconds = submit_at.elapsed().as_secs_f64();
+    t.readback = submit.readback_seconds.unwrap_or(0.0);
+    t.render = submit
+        .render_seconds
+        .unwrap_or(submit_seconds - t.readback);
+    let at = Instant::now();
     let steady_memory = MemorySnapshot::capture(engine.memory(), SampleDetail::Full);
     // Counters embed a memory snapshot; take them at steady state,
     // before retirement shrinks what the engine reports.
@@ -963,10 +1063,13 @@ fn render_scene(
     // explicit retirement pass, after the window and its submission.
     engine.trim()?;
     let post_retire_memory = MemorySnapshot::capture(engine.memory(), SampleDetail::Full);
+    t.trim = at.elapsed().as_secs_f64();
     let test = submit
         .image
         .ok_or_else(|| BenchError::Engine("adapter returned no image".into()))?;
+    let at = Instant::now();
     let (metrics_v, heatmap) = metrics::compare(&reference, &test);
+    t.compare = at.elapsed().as_secs_f64();
     Ok(RenderOutput {
         report: RenderReport {
             engine: engine.info().name,

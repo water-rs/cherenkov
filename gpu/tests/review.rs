@@ -3,19 +3,22 @@
 //! gradient parameter and the zero-size surface error.
 
 use cherenkov::kurbo::{Point, Rect};
+use cherenkov::{__engine_fn as split_fn, __engine_test as split_test, __engine_wait as wait};
 use cherenkov::{
     Budget, Bytes, Engine, EngineError, Offscreen, OffscreenFormat, RenderError, SurfaceError,
 };
 use cherenkov::{Draw, GlyphRun, WorkingColor};
 use cherenkov_gpu::{Gpu, GpuConfig, TimestampSupport};
 
+split_fn! {
 /// An engine under `config`, or `None` when no adapter exists.
 fn engine(config: GpuConfig) -> Option<Engine<Gpu>> {
-    match Engine::<Gpu>::new(config) {
+    match wait!(Engine::<Gpu>::new(config)) {
         Ok(engine) => Some(engine),
         Err(EngineError::Backend(_)) => None,
         Err(e) => panic!("engine init failed: {e}"),
     }
+}
 }
 
 /// The committed corpus subset of Noto Sans (never a host system font).
@@ -23,6 +26,27 @@ const FONT_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../scenes/fonts/No
 
 /// Glyph ids the subset has outlines for.
 const FONT_GLYPHS: u32 = 200;
+
+split_fn! {
+fn make(
+    engine: &Engine<Gpu>,
+    font: cherenkov::FontId,
+    color: WorkingColor,
+) -> Result<cherenkov::Surface<Gpu>, Box<dyn std::error::Error>> {
+    let surface = wait!(engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16)))?;
+    surface.update(|tx| {
+        tx[surface.root()].content(surface.record(|c| {
+            c.fill(Rect::new(8.0, 8.0, 56.0, 56.0), color);
+            // Shared atlas contention: both surfaces raster the same
+            // glyphs on their own thread.
+            for run in text_runs(font, 96, 10.0) {
+                c.glyphs(run, WorkingColor::WHITE);
+            }
+        }));
+    });
+    Ok(surface)
+}
+}
 
 fn font() -> cherenkov::FontSource {
     cherenkov::FontSource::bytes(std::fs::read(FONT_PATH).expect("scenes/fonts/NotoSans.ttf"))
@@ -56,15 +80,16 @@ fn text_runs(font: cherenkov::FontId, count: u32, size: f32) -> Vec<GlyphRun> {
         .collect()
 }
 
+split_fn! {
 fn render_text(
     config: GpuConfig,
     count: u32,
     size: f32,
 ) -> Option<Result<Vec<[f32; 4]>, RenderError>> {
-    let engine = engine(config)?;
+    let engine = wait!(engine(config))?;
     let font = engine.font(font()).expect("font");
-    let surface = engine
-        .surface(Offscreen::new((512, 512), OffscreenFormat::LinearF16))
+    let surface = wait!(engine
+        .surface(Offscreen::new((512, 512), OffscreenFormat::LinearF16)))
         .expect("surface");
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|c| {
@@ -73,17 +98,16 @@ fn render_text(
             }
         }));
     });
-    Some(
-        engine
-            .render(cherenkov::FrameTime::now())
-            .and_then(|_| surface.readback())
-            .map(|r| r.pixels),
-    )
+    Some(match wait!(engine.render(cherenkov::FrameTime::now())) {
+        Ok(_) => wait!(surface.readback()).map(|r| r.pixels),
+        Err(e) => Err(e),
+    })
+}
 }
 
+split_test! {
 /// A 128-glyph run renders identically whether the atlas can grow or is
 /// capped at its start size; a 2000-glyph live set overflows the cap.
-#[test]
 fn a_full_atlas_grows_then_reports_exhaustion() -> Result<(), Box<dyn std::error::Error>> {
     let tiny = GpuConfig {
         budget: Budget {
@@ -93,8 +117,8 @@ fn a_full_atlas_grows_then_reports_exhaustion() -> Result<(), Box<dyn std::error
         ..GpuConfig::default()
     };
     let (Some(big), Some(small)) = (
-        render_text(GpuConfig::default(), 128, 48.0),
-        render_text(tiny.clone(), 128, 48.0),
+        wait!(render_text(GpuConfig::default(), 128, 48.0)),
+        wait!(render_text(tiny.clone(), 128, 48.0)),
     ) else {
         return Ok(());
     };
@@ -114,7 +138,7 @@ fn a_full_atlas_grows_then_reports_exhaustion() -> Result<(), Box<dyn std::error
         }
     }
     // A live set that does not fit the capped atlas exhausts it.
-    let Some(exhausted) = render_text(tiny, 2000, 48.0) else {
+    let Some(exhausted) = wait!(render_text(tiny, 2000, 48.0)) else {
         return Ok(());
     };
     assert!(
@@ -123,41 +147,44 @@ fn a_full_atlas_grows_then_reports_exhaustion() -> Result<(), Box<dyn std::error
     );
     Ok(())
 }
+}
 
+split_test! {
 /// A clear-colour-only commit marks the surface dirty and re-renders.
-#[test]
 fn a_clear_only_commit_renders() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(engine) = engine(GpuConfig::default()) else {
+    let Some(engine) = wait!(engine(GpuConfig::default())) else {
         return Ok(());
     };
-    let surface = engine.surface(Offscreen::new((16, 16), OffscreenFormat::LinearF16))?;
+    let surface = wait!(engine.surface(Offscreen::new((16, 16), OffscreenFormat::LinearF16)))?;
     surface.clear_color(WorkingColor::new([1.0, 0.0, 0.0, 1.0]));
-    engine.render(cherenkov::FrameTime::now())?;
-    assert!(surface.readback()?.pixels[0][0] > 0.9, "red clear");
+    wait!(engine.render(cherenkov::FrameTime::now()))?;
+    assert!(wait!(surface.readback())?.pixels[0][0] > 0.9, "red clear");
     surface.clear_color(WorkingColor::new([0.0, 0.0, 1.0, 1.0]));
-    engine.render(cherenkov::FrameTime::now())?;
-    let [r, g, b, a] = surface.readback()?.pixels[0];
+    wait!(engine.render(cherenkov::FrameTime::now()))?;
+    let [r, g, b, a] = wait!(surface.readback())?.pixels[0];
     assert!(
         b > 0.9 && r < 0.1 && g < 0.1 && a > 0.9,
         "blue clear: {r} {g} {b} {a}"
     );
     Ok(())
 }
+}
 
+split_test! {
 /// Dropping a surface releases its engine entry and GPU textures.
-#[test]
 fn dropped_surfaces_do_not_leak() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(engine) = engine(GpuConfig::default()) else {
+    let Some(engine) = wait!(engine(GpuConfig::default())) else {
         return Ok(());
     };
-    let before = engine.memory().gpu;
+    let before = wait!(engine.memory()).gpu;
     for _ in 0..200 {
-        drop(engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?);
+        drop(wait!(engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16)))?);
     }
-    engine.render(cherenkov::FrameTime::now())?;
+    wait!(engine.render(cherenkov::FrameTime::now()))?;
     assert_eq!(engine.live_surfaces(), 0, "surfaces still live");
-    assert_eq!(engine.memory().gpu, before, "gpu memory grew");
+    assert_eq!(wait!(engine.memory()).gpu, before, "gpu memory grew");
     Ok(())
+}
 }
 
 /// The oracle's `radial_t`, ported for the cone test.
@@ -212,10 +239,11 @@ fn radial_fill(
     }
 }
 
+split_fn! {
 fn render_radial(gradient: cherenkov::RadialGradient) -> Option<Vec<[f32; 4]>> {
-    let engine = engine(GpuConfig::default())?;
-    let surface = engine
-        .surface(Offscreen::new((128, 128), OffscreenFormat::LinearF16))
+    let engine = wait!(engine(GpuConfig::default()))?;
+    let surface = wait!(engine
+        .surface(Offscreen::new((128, 128), OffscreenFormat::LinearF16)))
         .expect("surface");
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|c| {
@@ -225,14 +253,15 @@ fn render_radial(gradient: cherenkov::RadialGradient) -> Option<Vec<[f32; 4]>> {
             );
         }));
     });
-    engine.render(cherenkov::FrameTime::now()).expect("render");
-    Some(surface.readback().expect("readback").pixels)
+    wait!(engine.render(cherenkov::FrameTime::now())).expect("render");
+    Some(wait!(surface.readback()).expect("readback").pixels)
+}
 }
 
+split_test! {
 /// Coincident circles (c0 == c1, r0 == r1) interpolate on distance / r0.
-#[test]
 fn coincident_circles_interpolate_by_distance() {
-    let Some(pixels) = render_radial(radial_fill((64., 64.), 20., (64., 64.), 20.)) else {
+    let Some(pixels) = wait!(render_radial(radial_fill((64., 64.), 20., (64., 64.), 20.))) else {
         return;
     };
     let at = |x: usize, y: usize| pixels[y * 128 + x];
@@ -244,16 +273,17 @@ fn coincident_circles_interpolate_by_distance() {
     let inside = at(74, 64);
     assert!(inside[0] < 1e-3, "inside pixel: {inside:?}");
 }
+}
 
+split_test! {
 /// A cone where the quadratic's negative-radius branch matters: the shader
 /// follows the oracle, including NaN outside the cone.
-#[test]
 #[expect(clippy::cast_precision_loss)]
 #[expect(clippy::cast_possible_truncation)]
 fn a_cone_gradient_matches_the_oracle() {
     let c0 = (32., 64.);
     let c1 = (72., 64.);
-    let Some(pixels) = render_radial(radial_fill(c0, 0., c1, 30.)) else {
+    let Some(pixels) = wait!(render_radial(radial_fill(c0, 0., c1, 30.))) else {
         return;
     };
     let at = |x: usize, y: usize| pixels[y * 128 + x];
@@ -280,20 +310,21 @@ fn a_cone_gradient_matches_the_oracle() {
         );
     }
 }
+}
 
+split_test! {
 /// Dropping the last `Font` clone frees the renderer's font state once no
 /// installed content draws the font (#199): until then frames that
 /// consult it still draw; afterwards the atlas's glyph cells are purged and
 /// content installed later that names the id fails fast instead of silently
 /// keeping the font alive.
-#[test]
 fn dropping_a_font_frees_its_renderer_state() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(engine) = engine(GpuConfig::default()) else {
+    let Some(engine) = wait!(engine(GpuConfig::default())) else {
         return Ok(());
     };
     let font = engine.font(font())?;
     let font_id = font.id();
-    let surface = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
+    let surface = wait!(engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16)))?;
     let runs = text_runs(font_id, 8, 24.0);
     let text = |surface: &cherenkov::Surface<Gpu>| {
         surface.update(|tx| {
@@ -303,14 +334,14 @@ fn dropping_a_font_frees_its_renderer_state() -> Result<(), Box<dyn std::error::
         });
     };
     text(&surface);
-    engine.render(cherenkov::FrameTime::now())?;
-    assert!(engine.memory().cpu > Bytes(0), "glyph cells cached");
+    wait!(engine.render(cherenkov::FrameTime::now()))?;
+    assert!(wait!(engine.memory()).cpu > Bytes(0), "glyph cells cached");
     drop(font);
     // Dirty the surface so the next frame re-lowers and consults the font.
     surface.clear_color(WorkingColor::new([0.0, 0.0, 0.0, 1.0]));
-    engine.render(cherenkov::FrameTime::now())?;
+    wait!(engine.render(cherenkov::FrameTime::now()))?;
     assert!(
-        engine.memory().cpu > Bytes(0),
+        wait!(engine.memory()).cpu > Bytes(0),
         "the installed content still draws the font"
     );
     surface.update(|tx| {
@@ -318,27 +349,28 @@ fn dropping_a_font_frees_its_renderer_state() -> Result<(), Box<dyn std::error::
             c.fill(Rect::new(0.0, 0.0, 64.0, 64.0), WorkingColor::WHITE);
         }));
     });
-    engine.render(cherenkov::FrameTime::now())?;
-    assert_eq!(engine.memory().cpu, Bytes(0), "font cells released");
+    wait!(engine.render(cherenkov::FrameTime::now()))?;
+    assert_eq!(wait!(engine.memory()).cpu, Bytes(0), "font cells released");
     text(&surface);
     assert!(
         matches!(
-            engine.render(cherenkov::FrameTime::now()),
+            wait!(engine.render(cherenkov::FrameTime::now())),
             Err(RenderError::Font(_))
         ),
         "content installed after the font was freed"
     );
     Ok(())
 }
+}
 
+split_test! {
 /// Timestamp queries accumulate on the renderer and are returned once,
 /// oldest first, by `finish_timings`.
-#[test]
 fn finish_timings_returns_every_drawn_frame_once() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(engine) = engine(GpuConfig {
+    let Some(engine) = wait!(engine(GpuConfig {
         timestamps: true,
         ..GpuConfig::default()
-    }) else {
+    })) else {
         return Ok(());
     };
     // An adapter without timestamp queries (the Apple Paravirtual device
@@ -346,7 +378,7 @@ fn finish_timings_returns_every_drawn_frame_once() -> Result<(), Box<dyn std::er
     if engine.info().timestamps == TimestampSupport::Unsupported {
         return Ok(());
     }
-    let surface = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
+    let surface = wait!(engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16)))?;
     let mut submitted = Vec::new();
     for frame in 0..3u8 {
         let color = [f32::from(frame) / 3.0, 0.0, 0.0, 1.0];
@@ -355,14 +387,14 @@ fn finish_timings_returns_every_drawn_frame_once() -> Result<(), Box<dyn std::er
                 c.fill(Rect::new(0.0, 0.0, 64.0, 64.0), WorkingColor::new(color));
             }));
         });
-        engine.render(cherenkov::FrameTime::now())?;
+        wait!(engine.render(cherenkov::FrameTime::now()))?;
         submitted.push(engine.stats().frame.expect("a drawing render submits"));
     }
     // An idle render has no frame id and cannot contribute another timing.
-    engine.render(cherenkov::FrameTime::now())?;
+    wait!(engine.render(cherenkov::FrameTime::now()))?;
     let second = engine.stats();
     assert_eq!(second.frame, None, "nothing dirty, nothing submitted");
-    let timings = engine.finish_timings()?;
+    let timings = wait!(engine.finish_timings())?;
     assert_eq!(
         timings.iter().map(|t| t.frame).collect::<Vec<_>>(),
         submitted,
@@ -374,20 +406,21 @@ fn finish_timings_returns_every_drawn_frame_once() -> Result<(), Box<dyn std::er
         "per-pass timing survives the deferred resolve"
     );
     assert!(
-        engine.finish_timings()?.is_empty(),
+        wait!(engine.finish_timings())?.is_empty(),
         "nothing is outstanding once every timing is reported"
     );
     Ok(())
 }
+}
 
+split_test! {
 /// With timestamps disabled `finish_timings` reports no timing — and the
 /// render never allocates per-pass metadata only the timestamp path consumes.
-#[test]
 fn timestamps_off_reports_no_passes() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(engine) = engine(GpuConfig::default()) else {
+    let Some(engine) = wait!(engine(GpuConfig::default())) else {
         return Ok(());
     };
-    let surface = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
+    let surface = wait!(engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16)))?;
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|c| {
             c.fill(
@@ -396,22 +429,23 @@ fn timestamps_off_reports_no_passes() -> Result<(), Box<dyn std::error::Error>> 
             );
         }));
     });
-    engine.render(cherenkov::FrameTime::now())?;
+    wait!(engine.render(cherenkov::FrameTime::now()))?;
     let stats = engine.stats();
     assert!(stats.frame.is_some());
-    assert!(engine.finish_timings()?.is_empty());
+    assert!(wait!(engine.finish_timings())?.is_empty());
     Ok(())
 }
+}
 
+split_test! {
 /// Re-rendering an unchanged scene creates no group-1 bind groups: the
 /// second frame binds the views cached under (scratch generation, image
 /// generation) rather than rebuilding them per encode.
-#[test]
 fn bind_groups_are_reused_across_frames() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(engine) = engine(GpuConfig::default()) else {
+    let Some(engine) = wait!(engine(GpuConfig::default())) else {
         return Ok(());
     };
-    let surface = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
+    let surface = wait!(engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16)))?;
     let record = |c: &mut cherenkov::Recorder| {
         c.fill(
             Rect::new(0.0, 0.0, 64.0, 64.0),
@@ -433,7 +467,7 @@ fn bind_groups_are_reused_across_frames() -> Result<(), Box<dyn std::error::Erro
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|c| record(c)));
     });
-    engine.render(cherenkov::FrameTime::now())?;
+    wait!(engine.render(cherenkov::FrameTime::now()))?;
     assert!(
         engine.stats().bind_groups_created > 0,
         "the first frame builds the bind groups"
@@ -441,7 +475,7 @@ fn bind_groups_are_reused_across_frames() -> Result<(), Box<dyn std::error::Erro
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|c| record(c)));
     });
-    engine.render(cherenkov::FrameTime::now())?;
+    wait!(engine.render(cherenkov::FrameTime::now()))?;
     assert_eq!(
         engine.stats().bind_groups_created,
         0,
@@ -449,16 +483,17 @@ fn bind_groups_are_reused_across_frames() -> Result<(), Box<dyn std::error::Erro
     );
     Ok(())
 }
+}
 
+split_test! {
 /// `Pressure::Moderate` evicts scratch/backdrop textures; `Critical`
 /// additionally returns the grow-only shared buffers to baseline —
 /// `Engine::memory` shows the drop.
-#[test]
 fn trim_releases_cached_memory() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(engine) = engine(GpuConfig::default()) else {
+    let Some(engine) = wait!(engine(GpuConfig::default())) else {
         return Ok(());
     };
-    let surface = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
+    let surface = wait!(engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16)))?;
     // Isolated group: forces a scratch pass and grows the instance buffer.
     let scene = |c: &mut cherenkov::Recorder| {
         c.fill(
@@ -477,10 +512,10 @@ fn trim_releases_cached_memory() -> Result<(), Box<dyn std::error::Error>> {
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|c| scene(c)));
     });
-    engine.render(cherenkov::FrameTime::now())?;
-    let before = engine.memory();
+    wait!(engine.render(cherenkov::FrameTime::now()))?;
+    let before = wait!(engine.memory());
     engine.trim(cherenkov::Pressure::Moderate);
-    let moderate = engine.memory();
+    let moderate = wait!(engine.memory());
     assert!(
         moderate.gpu.0 < before.gpu.0,
         "Moderate evicts scratch/backdrop textures: {} → {}",
@@ -491,9 +526,9 @@ fn trim_releases_cached_memory() -> Result<(), Box<dyn std::error::Error>> {
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|c| scene(c)));
     });
-    engine.render(cherenkov::FrameTime::now())?;
+    wait!(engine.render(cherenkov::FrameTime::now()))?;
     engine.trim(cherenkov::Pressure::Critical);
-    let critical = engine.memory();
+    let critical = wait!(engine.memory());
     assert!(
         critical.gpu.0 <= moderate.gpu.0,
         "Critical also frees buffers: {} → {}",
@@ -505,23 +540,24 @@ fn trim_releases_cached_memory() -> Result<(), Box<dyn std::error::Error>> {
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|c| scene(c)));
     });
-    engine.render(cherenkov::FrameTime::now())?;
-    let rb = surface.readback()?;
+    wait!(engine.render(cherenkov::FrameTime::now()))?;
+    let rb = wait!(surface.readback())?;
     assert!(
         rb.pixels[20 * 64 + 30][3] > 0.5,
         "post-trim frame still draws"
     );
     Ok(())
 }
+}
 
+split_test! {
 /// `render` returns `Next::Idle` until animation scheduling exists —
 /// the contract the `Next::At` variant's docs state.
-#[test]
 fn render_returns_idle() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(engine) = engine(GpuConfig::default()) else {
+    let Some(engine) = wait!(engine(GpuConfig::default())) else {
         return Ok(());
     };
-    let surface = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
+    let surface = wait!(engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16)))?;
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|c| {
             c.fill(
@@ -531,55 +567,43 @@ fn render_returns_idle() -> Result<(), Box<dyn std::error::Error>> {
         }));
     });
     assert_eq!(
-        engine.render(cherenkov::FrameTime::now())?,
+        wait!(engine.render(cherenkov::FrameTime::now()))?,
         cherenkov::Next::Idle
     );
     Ok(())
 }
+}
 
+split_test! {
 /// A zero-size surface is rejected synchronously.
-#[test]
 fn a_zero_size_surface_is_an_error() {
-    let Some(engine) = engine(GpuConfig::default()) else {
+    let Some(engine) = wait!(engine(GpuConfig::default())) else {
         return;
     };
     for size in [(0, 64), (64, 0), (0, 0)] {
-        let result = engine.surface(Offscreen::new(size, OffscreenFormat::LinearF16));
+        let result = wait!(engine.surface(Offscreen::new(size, OffscreenFormat::LinearF16)));
         assert!(
             matches!(result, Err(SurfaceError::ZeroSize)),
             "{size:?}: {result:?}"
         );
     }
 }
+}
 
+split_test! {
 /// Two surfaces dirtied in one frame lower on parallel workers — shared
 /// glyph-atlas and font caches included — and each still renders its own
 /// content correctly.
-#[test]
 fn two_dirty_surfaces_lower_in_parallel() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(engine) = engine(GpuConfig::default()) else {
+    let Some(engine) = wait!(engine(GpuConfig::default())) else {
         return Ok(());
     };
     let font = engine.font(font())?;
-    let make = |color: WorkingColor| -> Result<_, Box<dyn std::error::Error>> {
-        let surface = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
-        surface.update(|tx| {
-            tx[surface.root()].content(surface.record(|c| {
-                c.fill(Rect::new(8.0, 8.0, 56.0, 56.0), color);
-                // Shared atlas contention: both surfaces raster the same
-                // glyphs on their own thread.
-                for run in text_runs(font.id(), 96, 10.0) {
-                    c.glyphs(run, WorkingColor::WHITE);
-                }
-            }));
-        });
-        Ok(surface)
-    };
-    let red = make(WorkingColor::new([1.0, 0.0, 0.0, 1.0]))?;
-    let blue = make(WorkingColor::new([0.0, 0.0, 1.0, 1.0]))?;
-    engine.render(cherenkov::FrameTime::now())?;
-    let pa = red.readback()?.pixels;
-    let pb = blue.readback()?.pixels;
+    let red = wait!(make(&engine, font.id(), WorkingColor::new([1.0, 0.0, 0.0, 1.0])))?;
+    let blue = wait!(make(&engine, font.id(), WorkingColor::new([0.0, 0.0, 1.0, 1.0])))?;
+    wait!(engine.render(cherenkov::FrameTime::now()))?;
+    let pa = wait!(red.readback())?.pixels;
+    let pb = wait!(blue.readback())?.pixels;
     // Center pixel of the 8..56 fill rect, row-major.
     let center = 32 * 64 + 32;
     assert!(
@@ -594,15 +618,16 @@ fn two_dirty_surfaces_lower_in_parallel() -> Result<(), Box<dyn std::error::Erro
     );
     Ok(())
 }
+}
 
+split_test! {
 /// Reflecting a symmetric shape must preserve its fractional edge coverage.
-#[test]
 fn reflected_shape_preserves_antialiasing() -> Result<(), Box<dyn std::error::Error>> {
     use cherenkov::kurbo::{Affine, Circle};
 
-    let engine = Engine::<Gpu>::new(GpuConfig::default())?;
-    let normal = engine.surface(Offscreen::new((32, 32), OffscreenFormat::LinearF16))?;
-    let reflected = engine.surface(Offscreen::new((32, 32), OffscreenFormat::LinearF16))?;
+    let engine = wait!(Engine::<Gpu>::new(GpuConfig::default()))?;
+    let normal = wait!(engine.surface(Offscreen::new((32, 32), OffscreenFormat::LinearF16)))?;
+    let reflected = wait!(engine.surface(Offscreen::new((32, 32), OffscreenFormat::LinearF16)))?;
     for (surface, transform) in [
         (&normal, Affine::IDENTITY),
         (&reflected, Affine::new([-1.0, 0.0, 0.0, 1.0, 32.0, 0.0])),
@@ -615,9 +640,9 @@ fn reflected_shape_preserves_antialiasing() -> Result<(), Box<dyn std::error::Er
             }));
         });
     }
-    engine.render(cherenkov::FrameTime::now())?;
-    let normal = normal.readback()?;
-    let reflected = reflected.readback()?;
+    wait!(engine.render(cherenkov::FrameTime::now()))?;
+    let normal = wait!(normal.readback())?;
+    let reflected = wait!(reflected.readback())?;
     assert!(
         normal
             .pixels
@@ -633,4 +658,5 @@ fn reflected_shape_preserves_antialiasing() -> Result<(), Box<dyn std::error::Er
         );
     }
     Ok(())
+}
 }

@@ -1,4 +1,5 @@
 use cherenkov::kurbo::{Affine, Circle, Rect, Stroke};
+use cherenkov::{__engine_fn as split_fn, __engine_wait as wait};
 use cherenkov::{
     Backend, Draw, Engine, FrameTime, Offscreen, OffscreenFormat, Paint, Picture, RadialGradient,
     TransformedPaint, WorkingColor,
@@ -13,13 +14,14 @@ fn gradient() -> Paint {
         .into()
 }
 
+split_fn! {
 pub fn retained<B: Backend>(config: B::Config) {
-    let engine = Engine::<B>::new(config).expect("engine");
-    let retained = engine
-        .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))
+    let engine = wait!(Engine::<B>::new(config)).expect("engine");
+    let retained = wait!(engine
+        .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16)))
         .expect("surface");
-    let full = engine
-        .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))
+    let full = wait!(engine
+        .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16)))
         .expect("surface");
     let stable = Picture::record(|c| c.fill(Rect::new(1.0, 1.0, 4.0, 4.0), WorkingColor::WHITE));
     let source = Arc::new(gradient());
@@ -35,10 +37,10 @@ pub fn retained<B: Backend>(config: B::Config) {
     retained.update(|tx| {
         tx[retained.root()].content(content);
     });
-    engine.render(FrameTime::now()).expect("initial");
+    wait!(engine.render(FrameTime::now())).expect("initial");
     assert_eq!(engine.stats().commands_lowered, 2);
-    let alpha = retained
-        .readback()
+    let alpha = wait!(retained
+        .readback())
         .expect("readback")
         .pixels
         .into_iter()
@@ -50,9 +52,9 @@ pub fn retained<B: Backend>(config: B::Config) {
         Affine::rotate_about(0.7, cherenkov::kurbo::Point::new(32.0, 32.0)),
     ] {
         transform.set(map);
-        engine.render(FrameTime::now()).expect("live transform");
+        wait!(engine.render(FrameTime::now())).expect("live transform");
         assert_eq!(engine.stats().commands_lowered, 1);
-        let a = retained.readback().expect("retained pixels");
+        let a = wait!(retained.readback()).expect("retained pixels");
         assert_eq!(
             alpha,
             a.pixels.iter().map(|p| p[3].to_bits()).collect::<Vec<_>>(),
@@ -68,23 +70,25 @@ pub fn retained<B: Backend>(config: B::Config) {
                 );
             }));
         });
-        engine.render(FrameTime::now()).expect("full lowering");
-        let b = full.readback().expect("full pixels");
+        wait!(engine.render(FrameTime::now())).expect("full lowering");
+        let b = wait!(full.readback()).expect("full pixels");
         for (a, b) in a.pixels.iter().zip(b.pixels) {
             assert_eq!(a.map(f32::to_bits), b.map(f32::to_bits));
         }
-        engine.render(FrameTime::now()).expect("unchanged");
+        wait!(engine.render(FrameTime::now())).expect("unchanged");
         assert_eq!(engine.stats().commands_lowered, 0);
     }
 }
+}
 
+split_fn! {
 pub fn composition<B: Backend>(config: B::Config) {
-    let engine = Engine::<B>::new(config).expect("engine");
-    let a = engine
-        .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))
+    let engine = wait!(Engine::<B>::new(config)).expect("engine");
+    let a = wait!(engine
+        .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16)))
         .expect("surface");
-    let b = engine
-        .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))
+    let b = wait!(engine
+        .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16)))
         .expect("surface");
     let inner = Affine::translate((8.0, -4.0));
     let outer = Affine::scale_non_uniform(1.5, 0.75);
@@ -104,9 +108,9 @@ pub fn composition<B: Backend>(config: B::Config) {
             );
         }));
     });
-    engine.render(FrameTime::now()).expect("composition");
-    let a = a.readback().expect("nested");
-    let b = b.readback().expect("combined");
+    wait!(engine.render(FrameTime::now())).expect("composition");
+    let a = wait!(a.readback()).expect("nested");
+    let b = wait!(b.readback()).expect("combined");
     for (a, b) in a.pixels.iter().zip(&b.pixels) {
         assert_eq!(a.map(f32::to_bits), b.map(f32::to_bits));
     }
@@ -120,11 +124,13 @@ pub fn composition<B: Backend>(config: B::Config) {
         assert!((f64::from(pixel[2]) - t).abs() < 0.002);
     }
 }
+}
 
+split_fn! {
 pub fn invalid<B: Backend>(config: B::Config) {
-    let engine = Engine::<B>::new(config).expect("engine");
-    let surface = engine
-        .surface(Offscreen::new((16, 16), OffscreenFormat::LinearF16))
+    let engine = wait!(Engine::<B>::new(config)).expect("engine");
+    let surface = wait!(engine
+        .surface(Offscreen::new((16, 16), OffscreenFormat::LinearF16)))
         .expect("surface");
     for transform in [
         Affine::scale_non_uniform(0.0, 1.0),
@@ -140,19 +146,21 @@ pub fn invalid<B: Backend>(config: B::Config) {
             }));
         });
         assert!(
-            engine.render(FrameTime::now()).is_err(),
+            wait!(engine.render(FrameTime::now())).is_err(),
             "invalid paint transform was accepted"
         );
     }
 }
+}
 
+split_fn! {
 pub fn identity<B: Backend>(config: B::Config) {
-    let engine = Engine::<B>::new(config).expect("engine");
-    let plain = engine
-        .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))
+    let engine = wait!(Engine::<B>::new(config)).expect("engine");
+    let plain = wait!(engine
+        .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16)))
         .expect("surface");
-    let wrapped = engine
-        .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))
+    let wrapped = wait!(engine
+        .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16)))
         .expect("surface");
     plain.update(|tx| {
         tx[plain.root()].content(plain.record(|c| {
@@ -167,14 +175,15 @@ pub fn identity<B: Backend>(config: B::Config) {
             );
         }));
     });
-    engine.render(FrameTime::now()).expect("identity");
-    for (a, b) in plain
-        .readback()
+    wait!(engine.render(FrameTime::now())).expect("identity");
+    for (a, b) in wait!(plain
+        .readback())
         .expect("plain")
         .pixels
         .into_iter()
-        .zip(wrapped.readback().expect("wrapped").pixels)
+        .zip(wait!(wrapped.readback()).expect("wrapped").pixels)
     {
         assert_eq!(a.map(f32::to_bits), b.map(f32::to_bits));
     }
+}
 }

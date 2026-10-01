@@ -1,5 +1,6 @@
 //! Stroke cache identity and retained updates.
 use cherenkov::kurbo::{Affine, Cap, Join, Rect, Stroke};
+use cherenkov::{__engine_test as split_test, __engine_wait as wait};
 use cherenkov::{
     Draw, Engine, FontSource, FrameTime, Glyph, GlyphRun, GlyphStyle, Offscreen, OffscreenFormat,
     Picture, Pressure, WorkingColor,
@@ -7,16 +8,16 @@ use cherenkov::{
 use cherenkov_gpu::{Gpu, GpuConfig};
 use nami::Binding;
 
-#[test]
+split_test! {
 fn live_stroke_changes_match_cold_coverage_without_relowering_static_content() {
-    let engine = Engine::<Gpu>::new(GpuConfig::default()).expect("GPU engine");
+    let engine = wait!(Engine::<Gpu>::new(GpuConfig::default())).expect("GPU engine");
     let font = engine
         .font(FontSource::bytes(
             std::fs::read("../scenes/fonts/NotoSans.ttf").expect("font"),
         ))
         .expect("registered font");
-    let surface = engine
-        .surface(Offscreen::new((96, 72), OffscreenFormat::LinearF16))
+    let surface = wait!(engine
+        .surface(Offscreen::new((96, 72), OffscreenFormat::LinearF16)))
         .expect("surface");
     let mut run = GlyphRun {
         font: font.id(),
@@ -50,7 +51,7 @@ fn live_stroke_changes_match_cold_coverage_without_relowering_static_content() {
     surface.update(|tx| {
         tx[surface.root()].content(content);
     });
-    engine.render(FrameTime::now()).expect("initial stroke");
+    wait!(engine.render(FrameTime::now())).expect("initial stroke");
     assert_eq!(engine.stats().commands_lowered, 2);
     for style in [
         Stroke::new(3.0).with_join(Join::Round),
@@ -66,20 +67,20 @@ fn live_stroke_changes_match_cold_coverage_without_relowering_static_content() {
     ] {
         run.style = GlyphStyle::Stroke(style);
         value.set(run.clone());
-        engine.render(FrameTime::now()).expect("stroke edit");
+        wait!(engine.render(FrameTime::now())).expect("stroke edit");
         assert_eq!(engine.stats().commands_lowered, 1);
-        let warm = surface.readback().expect("warm pixels");
+        let warm = wait!(surface.readback()).expect("warm pixels");
         engine.trim(Pressure::Critical);
         // Force the frame after trim without replacing retained commands.
         surface.update(|tx| {
             tx[surface.root()].opacity(0.999_f32);
         });
-        engine.render(FrameTime::now()).expect("trimmed frame");
+        wait!(engine.render(FrameTime::now())).expect("trimmed frame");
         surface.update(|tx| {
             tx[surface.root()].opacity(1.0_f32);
         });
-        engine.render(FrameTime::now()).expect("cold coverage");
-        let cold = surface.readback().expect("cold pixels");
+        wait!(engine.render(FrameTime::now())).expect("cold coverage");
+        let cold = wait!(surface.readback()).expect("cold pixels");
         for (warm, cold) in warm.pixels.iter().zip(cold.pixels) {
             assert_eq!(
                 warm.map(f32::to_bits),
@@ -87,7 +88,8 @@ fn live_stroke_changes_match_cold_coverage_without_relowering_static_content() {
                 "stroke cache alias"
             );
         }
-        engine.render(FrameTime::now()).expect("idle");
+        wait!(engine.render(FrameTime::now())).expect("idle");
         assert_eq!(engine.stats().commands_lowered, 0);
     }
+}
 }

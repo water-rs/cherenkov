@@ -2,26 +2,51 @@
 //! available, which CI may not have.
 
 use cherenkov::kurbo::{BezPath, Rect};
+use cherenkov::{__engine_fn as split_fn, __engine_test as split_test, __engine_wait as wait};
 use cherenkov::{Draw, WorkingColor};
 use cherenkov::{Engine, EngineError, Next, Offscreen, OffscreenFormat, RenderError};
 use cherenkov_gpu::{Gpu, GpuConfig};
 
+split_fn! {
+fn render_card(
+    engine: &Engine<Gpu>,
+    alpha: f32,
+) -> Result<cherenkov::Readback, Box<dyn std::error::Error>> {
+    let surface = wait!(engine.surface(Offscreen::new((128, 128), OffscreenFormat::LinearF16)))?;
+    surface.update(|tx| {
+        tx[surface.root()].content(surface.record(|c| {
+            let card = Rect::new(24., 24., 104., 104.);
+            c.shadow(
+                card,
+                cherenkov::Shadow::new(6.0, WorkingColor::new([0., 0., 0., 1.]))
+                    .offset((2., 3.)),
+            );
+            c.fill(card, WorkingColor::new([0.9, 0.3, 0.1, alpha]));
+        }));
+    });
+    wait!(engine.render(cherenkov::FrameTime::now()))?;
+    Ok(wait!(surface.readback())?)
+}
+}
+
+split_fn! {
 /// An engine, or `None` when no adapter exists.
 fn engine() -> Option<Engine<Gpu>> {
-    match Engine::new(GpuConfig::default()) {
+    match wait!(Engine::new(GpuConfig::default())) {
         Ok(engine) => Some(engine),
         Err(EngineError::Backend(_)) => None,
         Err(e) => panic!("engine init failed: {e}"),
     }
 }
+}
 
-#[test]
+split_test! {
 #[expect(clippy::float_cmp, reason = "the clear colour is exact")]
 fn a_red_rect_renders_and_reads_back() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(engine) = engine() else {
+    let Some(engine) = wait!(engine()) else {
         return Ok(());
     };
-    let surface = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
+    let surface = wait!(engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16)))?;
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|c| {
             c.fill(
@@ -30,9 +55,9 @@ fn a_red_rect_renders_and_reads_back() -> Result<(), Box<dyn std::error::Error>>
             );
         }));
     });
-    let next = engine.render(cherenkov::FrameTime::now())?;
+    let next = wait!(engine.render(cherenkov::FrameTime::now()))?;
     assert_eq!(next, Next::Idle);
-    let readback = surface.readback()?;
+    let readback = wait!(surface.readback())?;
     let px = |x: u32, y: u32| readback.pixels[(y * readback.width + x) as usize];
     let [r, g, b, a] = px(32, 32);
     assert!(
@@ -42,16 +67,17 @@ fn a_red_rect_renders_and_reads_back() -> Result<(), Box<dyn std::error::Error>>
     assert_eq!(px(2, 2), [0.0; 4], "corner pixel must be the clear colour");
     Ok(())
 }
+}
 
+split_test! {
 /// Pushing a layer under its own subtree — the surface root under a
 /// descendant included — would close a cycle the lowering recursion
 /// cannot escape; the commit must reject the op.
-#[test]
 fn a_cyclic_layer_tree_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(engine) = engine() else {
+    let Some(engine) = wait!(engine()) else {
         return Ok(());
     };
-    let surface = engine.surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))?;
+    let surface = wait!(engine.surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16)))?;
     let a = surface.layer();
     let b = surface.layer();
     surface.update(|tx| {
@@ -61,18 +87,19 @@ fn a_cyclic_layer_tree_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
     });
     // The shared tree fails before lowering can recurse into the cycle.
     assert!(matches!(
-        engine.render(cherenkov::FrameTime::now()),
+        wait!(engine.render(cherenkov::FrameTime::now())),
         Err(RenderError::Thread)
     ));
     Ok(())
 }
+}
 
-#[test]
+split_test! {
 fn a_path_fill_renders() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(engine) = engine() else {
+    let Some(engine) = wait!(engine()) else {
         return Ok(());
     };
-    let surface = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
+    let surface = wait!(engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16)))?;
     let mut path = BezPath::new();
     path.move_to((4., 4.));
     path.curve_to((20., 60.), (44., 60.), (60., 4.));
@@ -82,19 +109,20 @@ fn a_path_fill_renders() -> Result<(), Box<dyn std::error::Error>> {
             c.fill(path, WorkingColor::new([1., 0., 0., 1.]));
         }));
     });
-    engine.render(cherenkov::FrameTime::now())?;
-    let readback = surface.readback()?;
+    wait!(engine.render(cherenkov::FrameTime::now()))?;
+    let readback = wait!(surface.readback())?;
     let [r, ..] = readback.pixels[(30 * readback.width + 30) as usize];
     assert!(r > 0.5, "interior pixel: {r}");
     Ok(())
 }
+}
 
-#[test]
+split_test! {
 fn a_path_shadow_renders() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(engine) = engine() else {
+    let Some(engine) = wait!(engine()) else {
         return Ok(());
     };
-    let surface = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
+    let surface = wait!(engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16)))?;
     let mut path = BezPath::new();
     path.move_to((4., 4.));
     path.curve_to((20., 60.), (44., 60.), (60., 4.));
@@ -107,8 +135,8 @@ fn a_path_shadow_renders() -> Result<(), Box<dyn std::error::Error>> {
             );
         }));
     });
-    engine.render(cherenkov::FrameTime::now())?;
-    let readback = surface.readback()?;
+    wait!(engine.render(cherenkov::FrameTime::now()))?;
+    let readback = wait!(surface.readback())?;
     let mut scene = cherenkov_scene::Scene::new(
         64,
         64,
@@ -140,18 +168,19 @@ fn a_path_shadow_renders() -> Result<(), Box<dyn std::error::Error>> {
     }
     Ok(())
 }
+}
 
+split_test! {
 /// Two dirty surfaces sharing one frame: the second surface lowers far
 /// more instances than the initial instance buffer holds, forcing a grow
 /// that must preserve the first surface's upload.
-#[test]
 fn an_earlier_surfaces_uploads_survive_a_shared_buffer_grow()
 -> Result<(), Box<dyn std::error::Error>> {
-    let Some(engine) = engine() else {
+    let Some(engine) = wait!(engine()) else {
         return Ok(());
     };
-    let small = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
-    let big = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
+    let small = wait!(engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16)))?;
+    let big = wait!(engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16)))?;
     small.update(|tx| {
         tx[small.root()].content(small.record(|c| {
             c.fill(
@@ -177,15 +206,15 @@ fn an_earlier_surfaces_uploads_survive_a_shared_buffer_grow()
             }
         }));
     });
-    let next = engine.render(cherenkov::FrameTime::now())?;
+    let next = wait!(engine.render(cherenkov::FrameTime::now()))?;
     assert_eq!(next, Next::Idle);
-    let small_rb = small.readback()?;
+    let small_rb = wait!(small.readback())?;
     let [r, g, b, a] = small_rb.pixels[(32 * small_rb.width + 32) as usize];
     assert!(
         (r - 1.0).abs() < 1e-2 && g.abs() < 1e-2 && b.abs() < 1e-2 && (a - 1.0).abs() < 1e-2,
         "first surface's pixel must still be red: {r} {g} {b} {a}"
     );
-    let big_rb = big.readback()?;
+    let big_rb = wait!(big.readback())?;
     let [r, g, b, a] = big_rb.pixels[(4 * big_rb.width + 4) as usize];
     // 0.5-wide rects cover the pixel partially; green is what matters.
     assert!(
@@ -194,53 +223,59 @@ fn an_earlier_surfaces_uploads_survive_a_shared_buffer_grow()
     );
     Ok(())
 }
+}
 
+split_test! {
 /// Sixty timed frames of a text-and-fill scene that grows the atlas and the
 /// shared buffers: every frame must finish within the wait bound, and when
 /// the adapter samples timestamps the whole-frame GPU time must come back
 /// alongside the per-pass ones (pass-boundary timestamps only).
-#[test]
 fn many_timed_frames_complete_with_whole_frame_gpu_time() -> Result<(), Box<dyn std::error::Error>>
 {
-    let Some(engine) = timed_engine(wgpu::Backends::all()) else {
+    let Some(engine) = wait!(timed_engine(wgpu::Backends::all())) else {
         return Ok(());
     };
-    many_timed_frames(&engine)
+    wait!(many_timed_frames(&engine))
+}
 }
 
+split_test! {
 /// The Metal-only counterpart: macOS always has a Metal adapter, so this
 /// fails rather than skips when it is missing. Apple GPUs sample only at
 /// stage boundaries, which the pass-boundary timestamps rely on.
-#[test]
 #[cfg(target_os = "macos")]
 fn metal_times_many_frames_at_pass_boundaries() -> Result<(), Box<dyn std::error::Error>> {
-    let engine = timed_engine(wgpu::Backends::METAL).expect("a Metal adapter");
+    let engine = wait!(timed_engine(wgpu::Backends::METAL)).expect("a Metal adapter");
     assert_eq!(engine.info().backend, "Metal", "{:?}", engine.info());
-    many_timed_frames(&engine)
+    wait!(many_timed_frames(&engine))
+}
 }
 
+split_fn! {
 /// A timestamping engine on `backends` with a short wait bound, or `None`
 /// when they have no adapter.
 fn timed_engine(backends: wgpu::Backends) -> Option<Engine<Gpu>> {
-    match Engine::new(GpuConfig {
+    match wait!(Engine::new(GpuConfig {
         backends,
         timestamps: true,
         wait_timeout: std::time::Duration::from_secs(20),
         ..GpuConfig::default()
-    }) {
+    })) {
         Ok(engine) => Some(engine),
         Err(EngineError::Backend(_)) => None,
         Err(e) => panic!("engine init failed: {e}"),
     }
 }
+}
 
+split_fn! {
 fn many_timed_frames(engine: &Engine<Gpu>) -> Result<(), Box<dyn std::error::Error>> {
     let timed = engine.info().timestamps != cherenkov_gpu::TimestampSupport::Unsupported;
     let font = engine.font(cherenkov::FontSource::bytes(std::fs::read(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../scenes/fonts/NotoSans.ttf"
     ))?))?;
-    let surface = engine.surface(Offscreen::new((256, 256), OffscreenFormat::LinearF16))?;
+    let surface = wait!(engine.surface(Offscreen::new((256, 256), OffscreenFormat::LinearF16)))?;
     let mut submitted = Vec::new();
     for frame in 0..60u32 {
         // A different glyph size each frame keeps rasterising new atlas
@@ -273,18 +308,18 @@ fn many_timed_frames(engine: &Engine<Gpu>) -> Result<(), Box<dyn std::error::Err
                 c.glyphs(run.clone(), WorkingColor::WHITE);
             }));
         });
-        let next = engine.render(cherenkov::FrameTime::now())?;
+        let next = wait!(engine.render(cherenkov::FrameTime::now()))?;
         assert_eq!(next, Next::Idle, "frame {frame}");
         let stats = engine.stats();
         assert!(stats.passes > 0, "frame {frame} drew nothing: {stats:?}");
         submitted.push((stats.frame.expect("a drawing render submits"), stats.passes));
     }
-    let timings = engine.finish_timings()?;
+    let timings = wait!(engine.finish_timings())?;
     assert!(
-        engine.finish_timings()?.is_empty(),
+        wait!(engine.finish_timings())?.is_empty(),
         "timings are consumed once"
     );
-    assert_eq!(engine.render(cherenkov::FrameTime::now())?, Next::Idle);
+    assert_eq!(wait!(engine.render(cherenkov::FrameTime::now()))?, Next::Idle);
     let idle = engine.stats();
     assert!(idle.frame.is_none(), "{idle:?}");
     if timed {
@@ -312,41 +347,26 @@ fn many_timed_frames(engine: &Engine<Gpu>) -> Result<(), Box<dyn std::error::Err
     } else {
         assert!(timings.is_empty());
     }
-    let readback = surface.readback()?;
+    let readback = wait!(surface.readback())?;
     let [r, g, ..] = readback.pixels[(2 * readback.width + 2) as usize];
     assert!(g > 0.5 && r < 0.1, "fills must still render: {r} {g}");
     Ok(())
 }
+}
 
+split_test! {
 /// A `Shadow` immediately followed by an opaque solid fill of the same
 /// shape lowers to up-to-four border quads: the covered interior is
 /// skipped. An opaque card's result must be pixel-identical outside the
 /// card and within fill-alpha error inside, vs the same card whose fill
 /// is alpha 0.999 (which disables the split).
-#[test]
 fn a_shadow_under_an_opaque_fill_loses_only_its_interior() -> Result<(), Box<dyn std::error::Error>>
 {
-    let Some(engine) = engine() else {
+    let Some(engine) = wait!(engine()) else {
         return Ok(());
     };
-    let render_card = |alpha: f32| -> Result<cherenkov::Readback, Box<dyn std::error::Error>> {
-        let surface = engine.surface(Offscreen::new((128, 128), OffscreenFormat::LinearF16))?;
-        surface.update(|tx| {
-            tx[surface.root()].content(surface.record(|c| {
-                let card = Rect::new(24., 24., 104., 104.);
-                c.shadow(
-                    card,
-                    cherenkov::Shadow::new(6.0, WorkingColor::new([0., 0., 0., 1.]))
-                        .offset((2., 3.)),
-                );
-                c.fill(card, WorkingColor::new([0.9, 0.3, 0.1, alpha]));
-            }));
-        });
-        engine.render(cherenkov::FrameTime::now())?;
-        Ok(surface.readback()?)
-    };
-    let split = render_card(1.0)?;
-    let whole = render_card(0.999)?;
+    let split = wait!(render_card(&engine, 1.0))?;
+    let whole = wait!(render_card(&engine, 0.999))?;
     for y in 0..whole.height {
         for x in 0..whole.width {
             let i = (y * whole.width + x) as usize;
@@ -370,16 +390,17 @@ fn a_shadow_under_an_opaque_fill_loses_only_its_interior() -> Result<(), Box<dyn
     }
     Ok(())
 }
+}
 
+split_test! {
 /// A large axis-aligned box fill lowers to one `KIND_SPAN` interior plus
 /// border quads: sampled pixels must equal the analytic gradient, and an
 /// edge pixel must still show partial coverage.
-#[test]
 fn a_large_fill_spans_its_interior() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(engine) = engine() else {
+    let Some(engine) = wait!(engine()) else {
         return Ok(());
     };
-    let surface = engine.surface(Offscreen::new((320, 320), OffscreenFormat::LinearF16))?;
+    let surface = wait!(engine.surface(Offscreen::new((320, 320), OffscreenFormat::LinearF16)))?;
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|c| {
             c.fill(
@@ -390,8 +411,8 @@ fn a_large_fill_spans_its_interior() -> Result<(), Box<dyn std::error::Error>> {
             );
         }));
     });
-    engine.render(cherenkov::FrameTime::now())?;
-    let readback = surface.readback()?;
+    wait!(engine.render(cherenkov::FrameTime::now()))?;
+    let readback = wait!(surface.readback())?;
     let px = |x: u32, y: u32| readback.pixels[(y * readback.width + x) as usize];
     for (px_x, px_y) in [
         (40u32, 160u32),
@@ -419,25 +440,22 @@ fn a_large_fill_spans_its_interior() -> Result<(), Box<dyn std::error::Error>> {
     );
     Ok(())
 }
+}
 
+split_test! {
 /// Per-variant pipelines: a frame with shadow strips, a solid fill, a
 /// clipped gradient fill, and a glyph run must emit ranges for at least
 /// the Simple/Shadow/Full variants — while the pixels stay correct.
-#[test]
 #[expect(clippy::float_cmp, reason = "the solid fill centre is exactly red")]
-#[expect(
-    clippy::many_single_char_names,
-    reason = "pixel channels r/g/b/a and gradient t are conventional"
-)]
 fn variants_split_ranges_but_not_pixels() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(engine) = engine() else {
+    let Some(engine) = wait!(engine()) else {
         return Ok(());
     };
     let font = engine.font(cherenkov::FontSource::bytes(std::fs::read(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../scenes/fonts/NotoSans.ttf"
     ))?))?;
-    let surface = engine.surface(Offscreen::new((128, 96), OffscreenFormat::LinearF16))?;
+    let surface = wait!(engine.surface(Offscreen::new((128, 96), OffscreenFormat::LinearF16)))?;
     let run = cherenkov::GlyphRun {
         font: font.id(),
         size: 24.0,
@@ -470,13 +488,13 @@ fn variants_split_ranges_but_not_pixels() -> Result<(), Box<dyn std::error::Erro
             c.glyphs(run, WorkingColor::WHITE);
         }));
     });
-    engine.render(cherenkov::FrameTime::now())?;
+    wait!(engine.render(cherenkov::FrameTime::now()))?;
     let stats = engine.stats();
     assert!(
         stats.pipeline_switches >= 2 && stats.draws >= 3,
         "expected variant-split ranges: {stats:?}"
     );
-    let readback = surface.readback()?;
+    let readback = wait!(surface.readback())?;
     let px = |x: u32, y: u32| readback.pixels[(y * readback.width + x) as usize];
     assert_eq!(
         px(32, 32),
@@ -498,4 +516,5 @@ fn variants_split_ranges_but_not_pixels() -> Result<(), Box<dyn std::error::Erro
         "inside the fill rect but outside the clip: nothing"
     );
     Ok(())
+}
 }

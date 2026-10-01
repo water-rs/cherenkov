@@ -1,30 +1,33 @@
 //! Shader paints inherit geometry, clipping and engine frame timing.
 
+use cherenkov::Instant;
 use cherenkov::kurbo::{Circle, Rect};
+use cherenkov::{__engine_test as split_test, __engine_wait as wait};
 use cherenkov::{
     Draw, Engine, FrameTime, Next, Offscreen, OffscreenFormat, ResourceError, ShaderPaint,
     ShaderSource,
 };
 use cherenkov_gpu::{Gpu, GpuConfig};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-#[test]
+split_test! {
 fn shader_registration_rejects_invalid_source() -> Result<(), Box<dyn std::error::Error>> {
-    let engine = Engine::<Gpu>::new(GpuConfig::default())?;
+    let engine = wait!(Engine::<Gpu>::new(GpuConfig::default()))?;
     assert!(matches!(
         engine.shader(ShaderSource::wgsl("invalid shader")),
         Err(ResourceError::Shader(_))
     ));
     Ok(())
 }
+}
 
-#[test]
+split_test! {
 fn shader_paint_uses_shape_coverage_and_presentation_time() -> Result<(), Box<dyn std::error::Error>>
 {
-    let engine = Engine::<Gpu>::new(GpuConfig::default())?;
+    let engine = wait!(Engine::<Gpu>::new(GpuConfig::default()))?;
     let shader =
         engine.shader(ShaderSource::wgsl(include_str!("shaders/paint.wgsl")).animated())?;
-    let surface = engine.surface(Offscreen::new((16, 16), OffscreenFormat::LinearF16))?;
+    let surface = wait!(engine.surface(Offscreen::new((16, 16), OffscreenFormat::LinearF16)))?;
     let layer = surface.layer();
     surface.update(|tx| {
         tx[surface.root()].push(&layer);
@@ -42,11 +45,11 @@ fn shader_paint_uses_shape_coverage_and_presentation_time() -> Result<(), Box<dy
     });
     let start = Instant::now();
     assert!(matches!(
-        engine.render(FrameTime::at(start))?,
+        wait!(engine.render(FrameTime::at(start)))?,
         Next::At { .. }
     ));
-    engine.render(FrameTime::at(start + Duration::from_millis(500)))?;
-    let pixels = surface.readback()?.pixels;
+    wait!(engine.render(FrameTime::at(start + Duration::from_millis(500))))?;
+    let pixels = wait!(surface.readback())?.pixels;
     assert!(
         (pixels[8 * 16 + 5][0] - 0.5).abs() < 0.001,
         "time advances without rerecording"
@@ -61,18 +64,19 @@ fn shader_paint_uses_shape_coverage_and_presentation_time() -> Result<(), Box<dy
     );
     drop(layer);
     assert_eq!(
-        engine.render(FrameTime::at(start + Duration::from_secs(1)))?,
+        wait!(engine.render(FrameTime::at(start + Duration::from_secs(1))))?,
         Next::Idle
     );
     Ok(())
 }
+}
 
-#[test]
+split_test! {
 fn producer_color_helpers_match_working_space_and_alpha() -> Result<(), Box<dyn std::error::Error>>
 {
-    let engine = Engine::<Gpu>::new(GpuConfig::default())?;
+    let engine = wait!(Engine::<Gpu>::new(GpuConfig::default()))?;
     let shader = engine.shader(ShaderSource::wgsl(include_str!("shaders/srgb.wgsl")))?;
-    let surface = engine.surface(Offscreen::new((8, 4), OffscreenFormat::LinearF16))?;
+    let surface = wait!(engine.surface(Offscreen::new((8, 4), OffscreenFormat::LinearF16)))?;
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|r| {
             r.fill(
@@ -84,11 +88,11 @@ fn producer_color_helpers_match_working_space_and_alpha() -> Result<(), Box<dyn 
             );
         }));
     });
-    engine.render(FrameTime::now())?;
+    wait!(engine.render(FrameTime::now()))?;
     let expected = cherenkov::WorkingColor::from(cherenkov::Color::<cherenkov::Srgb>::new([
         1.0, 0.5, 0.25, 0.5,
     ]));
-    let pixels = surface.readback()?.pixels;
+    let pixels = wait!(surface.readback())?.pixels;
     for index in [9, 14] {
         let [r, g, b, a] = expected.components;
         for (actual, expected) in pixels[index].into_iter().zip([r * a, g * a, b * a, a]) {
@@ -100,15 +104,16 @@ fn producer_color_helpers_match_working_space_and_alpha() -> Result<(), Box<dyn 
     }
     Ok(())
 }
+}
 
-#[test]
+split_test! {
 fn live_shader_operands_keep_other_cached_texture_uses() -> Result<(), Box<dyn std::error::Error>> {
     use nami::SignalExt as _;
-    let engine = Engine::<Gpu>::new(GpuConfig::default())?;
+    let engine = wait!(Engine::<Gpu>::new(GpuConfig::default()))?;
     let shader = engine.shader(ShaderSource::wgsl(
         "@fragment fn main() -> @location(0) vec4<f32> { return params[0]; }",
     ))?;
-    let surface = engine.surface(Offscreen::new((16, 8), OffscreenFormat::LinearF16))?;
+    let surface = wait!(engine.surface(Offscreen::new((16, 8), OffscreenFormat::LinearF16)))?;
     let value = nami::binding([1.0_f32, 0.0, 0.0, 1.0]);
     let id = shader.id();
     surface.update(|tx| {
@@ -129,23 +134,24 @@ fn live_shader_operands_keep_other_cached_texture_uses() -> Result<(), Box<dyn s
             );
         }));
     });
-    assert_eq!(engine.render(FrameTime::now())?, Next::Idle);
+    assert_eq!(wait!(engine.render(FrameTime::now()))?, Next::Idle);
     value.set([0.0, 1.0, 0.0, 1.0]);
-    assert_eq!(engine.render(FrameTime::now())?, Next::Idle);
+    assert_eq!(wait!(engine.render(FrameTime::now()))?, Next::Idle);
     assert_eq!(engine.stats().commands_lowered, 1);
-    let pixels = surface.readback()?.pixels;
+    let pixels = wait!(surface.readback())?.pixels;
     assert!((pixels[4 * 16 + 4][1] - 1.0).abs() < 0.001);
     assert!((pixels[4 * 16 + 12][2] - 1.0).abs() < 0.001);
-    assert_eq!(engine.render(FrameTime::now())?, Next::Idle);
+    assert_eq!(wait!(engine.render(FrameTime::now()))?, Next::Idle);
     assert_eq!(engine.stats().commands_lowered, 0);
     Ok(())
 }
+}
 
-#[test]
+split_test! {
 fn clipped_paths_keep_full_geometry_shader_coordinates() -> Result<(), Box<dyn std::error::Error>> {
-    let engine = Engine::<Gpu>::new(GpuConfig::default())?;
+    let engine = wait!(Engine::<Gpu>::new(GpuConfig::default()))?;
     let shader = engine.shader(ShaderSource::wgsl("@fragment fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> { return vec4<f32>(uv.x, 0.0, 0.0, 1.0); }"))?;
-    let surface = engine.surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))?;
+    let surface = wait!(engine.surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16)))?;
     let mut path = cherenkov::kurbo::BezPath::new();
     path.move_to((-8.0, 0.0));
     path.line_to((8.0, 0.0));
@@ -163,23 +169,24 @@ fn clipped_paths_keep_full_geometry_shader_coordinates() -> Result<(), Box<dyn s
             );
         }));
     });
-    engine.render(FrameTime::now())?;
-    let pixel = surface.readback()?.pixels[4 * 8 + 4];
+    wait!(engine.render(FrameTime::now()))?;
+    let pixel = wait!(surface.readback())?.pixels[4 * 8 + 4];
     assert!(
         (pixel[0] - 12.5 / 16.0).abs() < 0.003,
         "full-path coordinate: {pixel:?}"
     );
     Ok(())
 }
+}
 
-#[test]
+split_test! {
 fn removed_shader_reports_an_error_instead_of_panicking() -> Result<(), Box<dyn std::error::Error>>
 {
-    let engine = Engine::<Gpu>::new(GpuConfig::default())?;
+    let engine = wait!(Engine::<Gpu>::new(GpuConfig::default()))?;
     let shader = engine.shader(ShaderSource::wgsl(
         "@fragment fn main() -> @location(0) vec4<f32> { return vec4<f32>(1.0); }",
     ))?;
-    let surface = engine.surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))?;
+    let surface = wait!(engine.surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16)))?;
     let id = shader.id();
     drop(shader);
     surface.update(|tx| {
@@ -194,7 +201,7 @@ fn removed_shader_reports_an_error_instead_of_panicking() -> Result<(), Box<dyn 
         }));
     });
     assert!(
-        matches!(engine.render(FrameTime::now()), Err(cherenkov::RenderError::Render(message)) if message.contains("unregistered shader"))
+        matches!(wait!(engine.render(FrameTime::now())), Err(cherenkov::RenderError::Render(message)) if message.contains("unregistered shader"))
     );
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|r| {
@@ -204,18 +211,19 @@ fn removed_shader_reports_an_error_instead_of_panicking() -> Result<(), Box<dyn 
             );
         }));
     });
-    assert_eq!(engine.render(FrameTime::now())?, Next::Idle);
+    assert_eq!(wait!(engine.render(FrameTime::now()))?, Next::Idle);
     Ok(())
 }
+}
 
-#[test]
+split_test! {
 fn shader_strokes_and_degenerate_geometry_keep_ordinary_coverage()
 -> Result<(), Box<dyn std::error::Error>> {
-    let engine = Engine::<Gpu>::new(GpuConfig::default())?;
+    let engine = wait!(Engine::<Gpu>::new(GpuConfig::default()))?;
     let shader = engine.shader(ShaderSource::wgsl(
         "@fragment fn main() -> @location(0) vec4<f32> { return vec4<f32>(1.0); }",
     ))?;
-    let surface = engine.surface(Offscreen::new((16, 16), OffscreenFormat::LinearF16))?;
+    let surface = wait!(engine.surface(Offscreen::new((16, 16), OffscreenFormat::LinearF16)))?;
     for geometry in 0..3 {
         let mut outputs = Vec::new();
         for paint in [
@@ -236,12 +244,12 @@ fn shader_strokes_and_degenerate_geometry_keep_ordinary_coverage()
                     _ => r.fill(cherenkov::kurbo::BezPath::new(), paint),
                 }));
             });
-            engine
-                .render(FrameTime::now())
+            wait!(engine
+                .render(FrameTime::now()))
                 .map_err(|error| format!("geometry {geometry}: {error}"))?;
             outputs.push(
-                surface
-                    .readback()?
+                wait!(surface
+                    .readback())?
                     .pixels
                     .into_iter()
                     .map(|pixel| pixel.map(f32::to_bits))
@@ -252,12 +260,13 @@ fn shader_strokes_and_degenerate_geometry_keep_ordinary_coverage()
     }
     Ok(())
 }
+}
 
-#[test]
+split_test! {
 fn shader_stroke_coordinates_include_the_outline() -> Result<(), Box<dyn std::error::Error>> {
-    let engine = Engine::<Gpu>::new(GpuConfig::default())?;
+    let engine = wait!(Engine::<Gpu>::new(GpuConfig::default()))?;
     let shader = engine.shader(ShaderSource::wgsl("@fragment fn main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> { return vec4<f32>(uv.x, 0.0, 0.0, 1.0); }"))?;
-    let surface = engine.surface(Offscreen::new((16, 16), OffscreenFormat::LinearF16))?;
+    let surface = wait!(engine.surface(Offscreen::new((16, 16), OffscreenFormat::LinearF16)))?;
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|r| {
             r.stroke(
@@ -270,11 +279,12 @@ fn shader_stroke_coordinates_include_the_outline() -> Result<(), Box<dyn std::er
             );
         }));
     });
-    engine.render(FrameTime::now())?;
-    let pixel = surface.readback()?.pixels[8 * 16 + 3];
+    wait!(engine.render(FrameTime::now()))?;
+    let pixel = wait!(surface.readback())?.pixels[8 * 16 + 3];
     assert!(
         (pixel[0] - 1.5 / 12.0).abs() < 0.002,
         "complete stroke coordinates: {pixel:?}"
     );
     Ok(())
+}
 }

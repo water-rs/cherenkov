@@ -16,13 +16,6 @@ use cherenkov::{
     OffscreenFormat, ShapeData, WorkingColor,
 };
 
-#[cfg_attr(
-    target_os = "android",
-    expect(
-        clippy::missing_const_for_thread_local,
-        reason = "rust-clippy#13422: misfires on this target's thread_local expansion"
-    )
-)]
 mod counters {
     use std::cell::Cell;
 

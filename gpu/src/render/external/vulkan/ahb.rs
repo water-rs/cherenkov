@@ -45,7 +45,6 @@ pub fn import(shared: &Arc<Shared>, desc: Ahb) -> Result<Frame, NativeError> {
     result
 }
 
-#[expect(clippy::too_many_lines)]
 fn import_inner(
     shared: &Arc<Shared>,
     desc: Ahb,

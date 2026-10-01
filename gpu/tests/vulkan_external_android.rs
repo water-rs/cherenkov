@@ -220,14 +220,13 @@ struct ProducerWork {
 /// A producer sync chain: a binary semaphore whose `SYNC_FD` export is
 /// the frame's fence payload. `fire` submits real GPU work — a long run
 /// of buffer fills — that signals `binary` when it retires, then exports
-/// the pending signal as a sync_file.
+/// the pending signal as a `sync_file`.
 ///
-/// A sync_file fence can only stand for a signal the driver has handed
-/// to the kernel: a submission held back in the driver behind an
-/// unsignalled wait has no kernel fence yet, and Mali answers its export
-/// with `ERROR_OUT_OF_HOST_MEMORY` — the earlier timeline-waited design
-/// hit exactly that. Real producers (SurfaceFlinger, camera) export fds
-/// of work already executing on the GPU, which is what `fire` does.
+/// `binary` is created with `VkExportSemaphoreCreateInfo` declaring
+/// `SYNC_FD`: `VUID-VkSemaphoreGetFdInfoKHR-handleType-01132` makes the
+/// export invalid without it, and Mali answers that invalid call with
+/// `ERROR_OUT_OF_HOST_MEMORY` — the cause of the earlier failures, not
+/// the submission order.
 struct ProducerFence {
     /// The sync-file fd the frame waits on, filled by `fire`.
     fd: Mutex<Option<OwnedFd>>,
@@ -256,8 +255,39 @@ impl ProducerFence {
             .external_semaphore_fd
             .clone()
             .expect("sync-fd support checked at setup");
-        let binary = unsafe { dev.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }
-            .expect("binary semaphore");
+        // The driver must report a binary SYNC_FD semaphore exportable
+        // before the export in `fire` can succeed.
+        let mut semaphore_type =
+            vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::BINARY);
+        let info = vk::PhysicalDeviceExternalSemaphoreInfo::default()
+            .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD)
+            .push_next(&mut semaphore_type);
+        let mut external = vk::ExternalSemaphoreProperties::default();
+        unsafe {
+            device
+                .shared
+                .instance
+                .get_physical_device_external_semaphore_properties(
+                    device.shared.physical_device,
+                    &info,
+                    &mut external,
+                );
+        };
+        assert!(
+            external
+                .external_semaphore_features
+                .contains(vk::ExternalSemaphoreFeatureFlags::EXPORTABLE),
+            "binary SYNC_FD semaphores are not exportable on this device: {external:?}"
+        );
+        let mut export = vk::ExportSemaphoreCreateInfo::default()
+            .handle_types(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+        let binary = unsafe {
+            dev.create_semaphore(
+                &vk::SemaphoreCreateInfo::default().push_next(&mut export),
+                None,
+            )
+        }
+        .expect("binary semaphore");
         let mut type_info =
             vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE);
         let timeline = unsafe {
@@ -283,7 +313,9 @@ impl ProducerFence {
     fn fd(&self) -> OwnedFd {
         let guard = self.fd.lock().expect("fence fd");
         let fd = guard.as_ref().expect("fence exported by fire");
-        unsafe { OwnedFd::from_raw_fd(libc::dup(fd.as_raw_fd())) }
+        let dup = unsafe { OwnedFd::from_raw_fd(libc::dup(fd.as_raw_fd())) };
+        drop(guard);
+        dup
     }
 
     /// Submits the producer's delay — `FILLS` 32 MiB fills, real work
@@ -292,8 +324,8 @@ impl ProducerFence {
     /// `SYNC_FD`. The fence stays unsignalled until the fills finish,
     /// entirely on the GPU.
     fn fire(&self, queue: vk::Queue, family: u32, fills: u32) {
-        let dev = &self.dev;
         const FILL_BYTES: u64 = 32 * 1024 * 1024;
+        let dev = &self.dev;
         let buffer = unsafe {
             dev.create_buffer(
                 &vk::BufferCreateInfo::default()
@@ -383,7 +415,8 @@ impl ProducerFence {
 
 impl Drop for ProducerFence {
     fn drop(&mut self) {
-        if let Some(work) = self.work.lock().expect("producer work").take() {
+        let work = { self.work.lock().expect("producer work").take() };
+        if let Some(work) = work {
             unsafe {
                 // The delay must retire before its objects are destroyed;
                 // a host-side fence wait is the producer's own wait.
@@ -429,17 +462,21 @@ fn read_pixels(
     Ok(destination.readback()?.pixels)
 }
 
-/// Every open fd in this process, sorted, as `NUMBER -> TARGET`.
+/// Every open fd in this process, sorted, as `NUMBER -> TARGET`; the
+/// directory fd `read_dir` itself holds is excluded from the result.
 fn fd_list() -> Vec<String> {
+    let self_dir = format!("/proc/{}/fd", std::process::id());
     let mut list = std::fs::read_dir("/proc/self/fd")
         .map(|entries| {
             entries
                 .filter_map(Result::ok)
-                .map(|entry| {
-                    let target = std::fs::read_link(entry.path())
-                        .map(|path| path.display().to_string())
-                        .unwrap_or_else(|_| "<unreadable>".to_string());
-                    format!("{} -> {target}", entry.file_name().to_string_lossy())
+                .filter_map(|entry| {
+                    let target = std::fs::read_link(entry.path()).map_or_else(
+                        |_| "<unreadable>".to_string(),
+                        |path| path.display().to_string(),
+                    );
+                    (target != self_dir)
+                        .then(|| format!("{} -> {target}", entry.file_name().to_string_lossy()))
                 })
                 .collect::<Vec<_>>()
         })
@@ -878,9 +915,13 @@ fn cancellation_and_teardown() {
 #[test]
 fn report_counts_and_timings() {
     let (shared, device) = setup();
+    let buffer = make_ahb_rgb(16, 16, [0x44, 0x44, 0x44, 0xff]);
+    // The engine-lifetime baseline: the device and the test's own AHB
+    // reference exist, the engine does not. The closing sample below is
+    // taken in the same state — `after == before` means the engine's
+    // lifetime leaked nothing.
     let before = fd_list();
     let import_start = Instant::now();
-    let buffer = make_ahb_rgb(16, 16, [0x44, 0x44, 0x44, 0xff]);
     let frame = device
         .import(FrameSource::Ahb(Box::new(vulkan::Ahb {
             buffer: buffer.cast(),
@@ -918,7 +959,7 @@ fn report_counts_and_timings() {
         warm.push(t.elapsed().as_secs_f64() * 1e3);
     }
     warm.sort_by(f64::total_cmp);
-    let after = fd_list();
+    let during = fd_list();
     eprintln!("== #166 Pixel report ==");
     eprintln!("import: {import_us}us  bytes: {imported}");
     eprintln!("first render (cold): {cold_ms:.2}ms");
@@ -927,28 +968,23 @@ fn report_counts_and_timings() {
         warm[warm.len() / 2],
         warm[warm.len() - 1]
     );
-    eprintln!("fds: before={} after={}", before.len(), after.len());
-    fd_report("opened by import + renders", &before, &after);
+    eprintln!("fds: before={} during={}", before.len(), during.len());
+    fd_report("opened by import + renders", &before, &during);
     eprintln!("memory: {:?}", engine.memory());
     drop(engine);
-    let dropped = fd_list();
-    eprintln!("fds after drop(engine): {}", dropped.len());
-    fd_report("surviving engine teardown", &before, &dropped);
-    // The test's own references go next: the producer's AHB acquire, the
-    // surface handle's retained frame content, and the import device —
-    // dropping the shared device's last reference runs vkDestroyDevice,
-    // which closes any driver-held fd (gralloc import, syncobj, heap).
-    unsafe { ndk_sys::AHardwareBuffer_release(buffer) };
+    // The surface handle is the test's; dropping it releases its
+    // retained frame content so the sample measures the engine's whole
+    // lifetime against the `before` baseline — the device and the test's
+    // AHB reference stay alive in both.
     drop(surface);
-    drop(device);
-    let released = fd_list();
-    eprintln!("fds after full teardown: {}", released.len());
-    fd_report("after full teardown", &before, &released);
+    let after = fd_list();
+    eprintln!("fds after drop(engine): {}", after.len());
+    fd_report("surviving engine teardown", &before, &after);
     assert_eq!(
-        released.len(),
+        after.len(),
         before.len(),
         "leaked fds: {:?}",
-        released
+        after
             .iter()
             .filter(|fd| !before.contains(fd))
             .collect::<Vec<_>>()

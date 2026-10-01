@@ -1031,19 +1031,18 @@ fn delayed_timeline_signal_stays_on_gpu() {
     // once setup has finished, so the semaphore is genuinely unsigned
     // when the measured render runs; a CPU-waiting engine would block
     // the full delay here.
+    let signaller_dev = SendDevice(dev.clone());
     let signaller = std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(200));
-        // `dev` moved; unsafe send through the raw device handle.
-        let dev = SendDevice(dev);
         unsafe {
-            dev.0
+            signaller_dev
+                .0
                 .signal_semaphore(
                     &vk::SemaphoreSignalInfo::default()
                         .semaphore(semaphore)
                         .value(1),
                 )
                 .expect("signal");
-            dev.0.destroy_semaphore(semaphore, None);
         }
     });
     let start = std::time::Instant::now();
@@ -1057,6 +1056,14 @@ fn delayed_timeline_signal_stays_on_gpu() {
         "consuming submission did not CPU-wait for the producer: {elapsed:?}"
     );
     signaller.join().expect("signaller");
+    // The engine's release submission still signals this semaphore as the
+    // frame's release payload: VUID-vkDestroySemaphore-semaphore-01149
+    // forbids destroying it while a queue command references it, so the
+    // destroy waits for the frame's retirement (surface drop) and the
+    // teardown join inside `drop(engine)`.
+    drop(surface);
+    drop(engine);
+    unsafe { dev.destroy_semaphore(semaphore, None) };
 }
 
 #[test]

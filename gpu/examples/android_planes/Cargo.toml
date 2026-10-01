@@ -37,6 +37,9 @@ nami-core = { git = "https://github.com/water-rs/nami", rev = "6908aac816de14ee5
 cherenkov = { path = "../../.." }
 cherenkov-gpu = { path = "../.." }
 
+[dev-dependencies]
+wgpu = "30.0.1"
+
 [target.'cfg(target_os = "android")'.dependencies]
 android-activity = { version = "0.6", features = ["native-activity"] }
 ash = "0.38"

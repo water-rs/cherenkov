@@ -48,6 +48,7 @@ dependencies = [
  "skrifa",
  "tracing",
  "tracing-subscriber",
+ "wgpu",
 ]
 
 [[package]]

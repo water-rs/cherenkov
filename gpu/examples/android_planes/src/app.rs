@@ -1,0 +1,266 @@
+//! The `NativeActivity` entry point: builds the engine, the
+//! `SurfaceControlTarget`, the video producers and the scenario's layer
+//! tree, then renders and logs the heartbeat until killed.
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use android_activity::{AndroidApp, MainEvent, PollEvent};
+use cherenkov::kurbo::{Affine, Rect};
+use cherenkov::{
+    Color, Content, Draw, Engine, Font, FrameTime, Layer, Srgb, Surface, WorkingColor,
+};
+use cherenkov_gpu::interop::android::{SurfaceControl, SurfaceControlTarget};
+use cherenkov_gpu::interop::{ExternalFrame, SharedDevice, vulkan};
+use cherenkov_gpu::{Gpu, GpuConfig};
+use ndk::native_window::NativeWindow;
+
+use crate::observe::{self, Decisions};
+use crate::producer::Pool;
+use crate::scenario::Scenario;
+use crate::{logcat, text};
+
+const FONT: &str = "/system/fonts/Roboto-Regular.ttf";
+
+/// Invoked by the `NativeActivity` glue once the app thread starts.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "the android-activity glue declares extern \"Rust\" fn android_main(AndroidApp)"
+)]
+#[unsafe(no_mangle)]
+pub extern "Rust" fn android_main(app: AndroidApp) {
+    let decisions = observe::install();
+    let scenario = read_scenario(&app);
+    logcat::line(&format!("scenario={} starting", scenario.name()));
+
+    let mut run: Option<Run> = None;
+    loop {
+        let mut terminated = false;
+        let mut resized = false;
+        let mut destroyed = false;
+        app.poll_events(Some(Duration::ZERO), |event| match event {
+            PollEvent::Main(MainEvent::Destroy) => destroyed = true,
+            PollEvent::Main(MainEvent::TerminateWindow { .. }) => terminated = true,
+            PollEvent::Main(MainEvent::WindowResized { .. }) => resized = true,
+            _ => {}
+        });
+        if destroyed {
+            break;
+        }
+        if terminated {
+            run = None;
+            continue;
+        }
+        let Some(window) = app.native_window() else {
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
+        };
+        let run = run.get_or_insert_with(|| Run::new(&window, scenario, &decisions));
+        if resized {
+            run.resize(&window);
+        }
+        run.frame();
+        std::thread::sleep(Duration::from_millis(8));
+    }
+    logcat::line(&format!("scenario={} exiting", scenario.name()));
+}
+
+/// The intent's `scenario` string extra via JNI; unknown or missing
+/// values run `overlay`.
+fn read_scenario(app: &AndroidApp) -> Scenario {
+    match intent_scenario(app) {
+        Ok(name) => Scenario::parse(name.as_deref().unwrap_or("overlay")),
+        Err(e) => {
+            logcat::warn(&format!(
+                "reading the scenario extra failed ({e}); running overlay"
+            ));
+            Scenario::Overlay
+        }
+    }
+}
+
+fn intent_scenario(app: &AndroidApp) -> Result<Option<String>, String> {
+    use jni::objects::{JObject, JString, JValue};
+    let vm = unsafe { jni::JavaVM::from_raw(app.vm_as_ptr().cast()) };
+    vm.attach_current_thread(|env| -> jni::errors::Result<Option<String>> {
+        // android-activity owns the activity's global ref; hold it
+        // through a local ref so this `JObject` only deletes what it
+        // created.
+        let local = unsafe {
+            let env_raw = env.get_raw();
+            ((**env_raw).v1_2.NewLocalRef)(env_raw, app.activity_as_ptr().cast())
+        };
+        let activity = unsafe { JObject::from_raw(env, local) };
+        let intent = env
+            .call_method(
+                &activity,
+                jni::jni_str!("getIntent"),
+                jni::jni_sig!("()Landroid/content/Intent;"),
+                &[],
+            )?
+            .l()?;
+        if intent.is_null() {
+            return Ok(None);
+        }
+        let key = env.new_string("scenario")?;
+        let extra = env
+            .call_method(
+                intent,
+                jni::jni_str!("getStringExtra"),
+                jni::jni_sig!("(Ljava/lang/String;)Ljava/lang/String;"),
+                &[JValue::Object(key.as_ref())],
+            )?
+            .l()?;
+        if extra.is_null() {
+            return Ok(None);
+        }
+        let string = env.cast_local::<JString>(extra)?;
+        string.try_to_string(env).map(Some)
+    })
+    .map_err(|e| e.to_string())
+}
+
+/// One scenario's running state.
+struct Run {
+    engine: Engine<Gpu>,
+    surface: Surface<Gpu>,
+    videos: Vec<Video>,
+    decisions: Arc<Decisions>,
+    scenario: Scenario,
+    next_log: Instant,
+    last_render_error: Option<String>,
+    _font: Font,
+}
+
+struct Video {
+    layer: Layer,
+    producer: Pool,
+}
+
+impl Run {
+    /// Brings the whole pipeline up: shared Vulkan device, engine, the
+    /// surface-control surface and the scenario's layers and producers.
+    fn new(window: &NativeWindow, scenario: Scenario, decisions: &Arc<Decisions>) -> Self {
+        let shared = SharedDevice::create(&GpuConfig::default()).expect("shared GPU device");
+        let vk = vulkan::Device::new(&shared).expect("vulkan import context");
+        let engine = Engine::<Gpu>::new(GpuConfig {
+            device: Some(shared),
+            ..GpuConfig::default()
+        })
+        .expect("engine");
+
+        let size = (
+            window.width().cast_unsigned(),
+            window.height().cast_unsigned(),
+        );
+        let parent = unsafe { SurfaceControl::from_window(window.ptr(), c"cherenkov harness") }
+            .expect("surface control from window");
+        let surface = engine
+            .surface(SurfaceControlTarget::new(parent, size))
+            .expect("surface-control surface");
+        surface.clear_color(WorkingColor::new([0.01, 0.012, 0.018, 1.0]));
+
+        let font_data = std::fs::read(FONT).expect("Roboto is present on Android");
+        let font = engine
+            .font(cherenkov::FontSource::bytes(font_data.clone()))
+            .expect("font registration");
+        let controls = controls_content(font.id(), &font_data, scenario);
+
+        let specs = scenario.videos();
+        let layers = scenario.build(&surface, controls);
+        assert_eq!(specs.len(), layers.len(), "videos and layers pair");
+        let videos = specs
+            .into_iter()
+            .zip(layers)
+            .map(|(spec, layer)| Video {
+                layer,
+                producer: Pool::new(&vk, spec).expect("producer pool"),
+            })
+            .collect();
+
+        Self {
+            engine,
+            surface,
+            videos,
+            decisions: Arc::clone(decisions),
+            scenario,
+            next_log: Instant::now(),
+            last_render_error: None,
+            _font: font,
+        }
+    }
+
+    /// The window resized: resize the surface (the plane parts reallocate
+    /// on the next frame).
+    fn resize(&self, window: &NativeWindow) {
+        let size = (
+            window.width().cast_unsigned(),
+            window.height().cast_unsigned(),
+        );
+        if let Err(e) = self.surface.resize(size) {
+            logcat::warn(&format!("resize: {e}"));
+        }
+    }
+
+    /// Produces one video generation per layer, renders and emits the
+    /// per-second heartbeat.
+    fn frame(&mut self) {
+        self.surface.update(|tx| {
+            for video in &mut self.videos {
+                let Some(frame) = video.producer.produce() else {
+                    continue;
+                };
+                match ExternalFrame::native(frame) {
+                    Ok(external) => {
+                        let handle = self.engine.external_frame(external);
+                        tx[&video.layer].content(handle);
+                    }
+                    Err(e) => logcat::error(&format!("external frame rejected: {e}")),
+                }
+            }
+        });
+        match self.engine.render(FrameTime::now()) {
+            Ok(_) => self.last_render_error = None,
+            Err(e) => {
+                let error = e.to_string();
+                if self.last_render_error.as_deref() != Some(error.as_str()) {
+                    logcat::error(&format!("render: {error}"));
+                    self.last_render_error = Some(error);
+                }
+            }
+        }
+        let now = Instant::now();
+        if now >= self.next_log {
+            self.next_log = now + Duration::from_secs(1);
+            for video in &self.videos {
+                let layer = video.layer.id().raw();
+                logcat::line(&format!(
+                    "scenario={} frame={} layer=LayerId({}) decision={} fences={}",
+                    self.scenario.name(),
+                    video.producer.produced,
+                    layer,
+                    self.decisions.decision(layer),
+                    video.producer.signalled,
+                ));
+            }
+        }
+    }
+}
+
+/// The engine-composited controls drawn above the video: a translucent
+/// panel and the scenario label.
+fn controls_content(font: cherenkov::FontId, data: &[u8], scenario: Scenario) -> Content {
+    let label = format!("cherenkov planes \u{2014} {}", scenario.name());
+    Content::record(|c| {
+        c.fill(
+            Rect::new(24.0, 24.0, 660.0, 140.0),
+            Color::<Srgb>::new([0.07, 0.09, 0.14, 0.72]),
+        );
+        c.transform(Affine::translate((48.0, 96.0)), |c| {
+            c.glyphs(
+                text::run(font, data, 42.0, &label),
+                Color::<Srgb>::new([0.92, 0.93, 0.97, 1.0]),
+            );
+        });
+    })
+}

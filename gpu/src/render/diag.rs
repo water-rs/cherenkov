@@ -504,7 +504,10 @@ impl Sink {
 }
 
 thread_local! {
-    #[allow(clippy::missing_const_for_thread_local)]
+    #[allow(
+        clippy::missing_const_for_thread_local,
+        reason = "the initializer is already const; false positive on clippy 1.98"
+    )]
     static ACTIVE: RefCell<Option<Sink>> = const { RefCell::new(None) };
 }
 

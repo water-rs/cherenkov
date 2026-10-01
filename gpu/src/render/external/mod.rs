@@ -206,18 +206,15 @@ fn plane_contract(frame: &ExternalFrame) -> (u32, u32, u32, wgpu::Extent3d, wgpu
                 depth_or_array_layers: 1,
             };
             match frame.repr() {
-                vulkan::Repr::Rgb { format } => {
-                    let bgr = if format == wgpu::TextureFormat::Bgra8Unorm {
-                        FLAG_BGR
-                    } else {
-                        0
-                    };
+                vulkan::Repr::Rgb { .. } => {
+                    // A `Bgra8Unorm` plane already presents RGBA-ordered
+                    // samples to textureLoad — no swizzle flag.
                     let alpha = match frame.generation.alpha {
                         RgbAlpha::Opaque => 0,
                         RgbAlpha::Straight => 1,
                         RgbAlpha::Premultiplied => 2,
                     };
-                    (KIND_RGB, alpha, bgr, size, size)
+                    (KIND_RGB, alpha, 0, size, size)
                 }
                 vulkan::Repr::Planes { kind } => {
                     let shift = if kind == KIND_P010 { FLAG_SHIFT6 } else { 0 };

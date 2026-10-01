@@ -4760,10 +4760,12 @@ impl GpuRenderer {
 
     /// The layers whose new frames `sf`'s surface can present through its
     /// planes alone: `Some` when the surface promotes, the frame's only
-    /// committed change is those installs, no present is pending, no
-    /// display moved, nothing else wants a redraw, and the plan they would
-    /// produce is the committed one (`planes::frames_only`). `None` sends
-    /// the frame down the full render path like any other change (#90).
+    /// committed change is those installs, no present is pending on
+    /// either side — a deferred or failed compose is still owed — no
+    /// display moved, nothing else wants a redraw, and the plan they
+    /// would produce is the committed one (`planes::frames_only`).
+    /// `None` sends the frame down the full render path like any other
+    /// change (#90).
     fn plane_only_frames(&self, sf: &SurfaceFrame<'_>) -> Option<FxHashSet<LayerId>> {
         if sf.present_pending || sf.display_moved {
             return None;
@@ -4771,6 +4773,7 @@ impl GpuRenderer {
         let frames = sf.plane_frames?;
         let surface = self.surfaces.get(&sf.id)?;
         (surface.promotes
+            && !surface.present_pending
             && !self.wants_redraw(surface)
             && planes::frames_only::<planes::Platform>(
                 &surface.plan,

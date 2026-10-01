@@ -306,6 +306,10 @@ pub enum LayerContent<B: Backend> {
     /// closure learns the surface and layer it is installed on when the
     /// edit is applied in `update`.
     Install(InstallOp<B>),
+    /// An external frame's install — opaque like [`Install`](Self::Install),
+    /// but lowered to [`Op::ExternalFrame`] so the render loop can tell a
+    /// plane-eligible frame swap from any other change (#90).
+    ExternalFrame(InstallOp<B>),
     /// Nothing.
     None,
 }
@@ -352,7 +356,7 @@ pub struct ExternalFrameHandle<B: ExternalFrames> {
 impl<B: ExternalFrames> From<ExternalFrameHandle<B>> for LayerContent<B> {
     fn from(handle: ExternalFrameHandle<B>) -> Self {
         let frame = handle.frame;
-        Self::Install(Box::new(move |r, surface, layer| {
+        Self::ExternalFrame(Box::new(move |r, surface, layer| {
             B::set_external_frame(r, surface, layer, frame);
         }))
     }
@@ -1111,6 +1115,17 @@ impl<B: Backend> Surface<B> {
                         ops.push(Op::Install(Box::new(move |r| {
                             install(r, surface, layer);
                         })));
+                    }
+                    EditOp::Content(LayerContent::ExternalFrame(install)) => {
+                        shared.contents.remove(id);
+                        let surface = self.id;
+                        let layer = *id;
+                        ops.push(Op::ExternalFrame {
+                            layer,
+                            install: Box::new(move |r| {
+                                install(r, surface, layer);
+                            }),
+                        });
                     }
                     EditOp::Content(LayerContent::None) => {
                         shared.contents.remove(id);

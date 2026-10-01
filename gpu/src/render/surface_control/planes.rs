@@ -134,6 +134,20 @@ pub fn ineligible(frame: &vulkan::Frame) -> Option<Ineligible> {
     contract(frame).err()
 }
 
+/// The error a promoted layer's buffer or placement failure reports.
+fn cannot_show(layer: LayerId, why: &dyn std::fmt::Display) -> RenderError {
+    RenderError::Render(format!(
+        "layer {layer:?} was promoted but a surface control cannot show it: {why}"
+    ))
+}
+
+/// Duplicates a fence file descriptor: a buffer is set with its own fd,
+/// so every acquirer gets a distinct one.
+fn dup_fence(fd: &OwnedFd) -> Result<OwnedFd, RenderError> {
+    fd.try_clone()
+        .map_err(|e| RenderError::Render(format!("duplicate a fence: {e}")))
+}
+
 /// The stack `composition` describes, bottom first, with each promoted
 /// frame's plane properties.
 ///
@@ -141,11 +155,6 @@ pub fn ineligible(frame: &vulkan::Frame) -> Option<Ineligible> {
 /// [`RenderError`] when the plan promoted a layer whose buffer or placement
 /// a plane cannot show.
 fn stack<'a>(composition: &Composition<'a>) -> Result<Vec<Entry<'a>>, RenderError> {
-    let ineligible = |layer: LayerId, why: &dyn std::fmt::Display| {
-        RenderError::Render(format!(
-            "layer {layer:?} was promoted but a surface control cannot show it: {why}"
-        ))
-    };
     let mut entries = Vec::with_capacity(composition.parts.len() + composition.planes.len());
     for slot in plan::stack_order(composition.parts.len(), composition.planes.len()) {
         let plane = match slot {
@@ -158,11 +167,11 @@ fn stack<'a>(composition: &Composition<'a>) -> Result<Vec<Entry<'a>>, RenderErro
         let layer = plane.placement.layer;
         let PlaneContent::Frame { frame, generation } = &plane.content;
         let FramePlanes::Native(native) = &frame.planes else {
-            return Err(ineligible(layer, &Ineligible::NotABuffer));
+            return Err(cannot_show(layer, &Ineligible::NotABuffer));
         };
-        let contract = contract(native).map_err(|e| ineligible(layer, &e))?;
-        let placement =
-            plan::promoted(plane.placement, composition.size).map_err(|e| ineligible(layer, &e))?;
+        let contract = contract(native).map_err(|e| cannot_show(layer, &e))?;
+        let placement = plan::promoted(plane.placement, composition.size)
+            .map_err(|e| cannot_show(layer, &e))?;
         entries.push(Entry::Frame(Promotion {
             layer,
             frame: native,
@@ -563,10 +572,6 @@ impl Planes {
             transaction.set(&self.root, Op::Visible(true));
             self.root_shown = true;
         }
-        let dup = |fd: &OwnedFd| {
-            fd.try_clone()
-                .map_err(|e| RenderError::Render(format!("duplicate a fence: {e}")))
-        };
         let mut part = 0;
         let mut seen = Vec::new();
         for (index, entry) in stack.iter().enumerate() {
@@ -581,7 +586,7 @@ impl Planes {
                         transaction.set_buffer(
                             &this.surface,
                             buffer.ahb.0,
-                            Some(dup(&acquire_fence)?),
+                            Some(dup_fence(&acquire_fence)?),
                         );
                     }
                     if let Some(previous) = this.current.replace(buffer.id) {
@@ -627,7 +632,12 @@ impl Planes {
                                 generation: promotion.generation,
                                 shown: None,
                             });
-                            set_frame(&mut transaction, &plane.surface, promotion.frame, dup)?;
+                            set_frame(
+                                &mut transaction,
+                                &plane.surface,
+                                promotion.frame,
+                                dup_fence,
+                            )?;
                             plane
                         }
                     };
@@ -635,7 +645,7 @@ impl Planes {
                         promotion.frame.lease();
                         plane.generation = promotion.generation;
                         let previous = std::mem::replace(&mut plane.frame, promotion.frame.clone());
-                        set_frame(&mut transaction, &plane.surface, promotion.frame, dup)?;
+                        set_frame(&mut transaction, &plane.surface, promotion.frame, dup_fence)?;
                         pending.push(Pending {
                             surface: plane.surface.as_ptr(),
                             what: Replaced::Frame(previous),
@@ -667,7 +677,16 @@ impl Planes {
             });
         }
 
-        let sender = self.release.clone();
+        Self::apply(transaction, &self.release, pending);
+        Ok(true)
+    }
+
+    /// Applies `transaction`, delivering each `Pending` its release fence
+    /// through the completion: an engine buffer's returns to its part's
+    /// pool, a replaced frame's joins its producer's release before the
+    /// plane's lease on it ends, and a removed surface control is dropped.
+    fn apply(transaction: Transaction, release: &mpsc::Sender<Released>, pending: Vec<Pending>) {
+        let sender = release.clone();
         transaction.apply(move |completion| {
             for Pending {
                 surface,
@@ -697,7 +716,66 @@ impl Planes {
                 drop(removed);
             }
         });
-        Ok(true)
+    }
+
+    /// Presents only `frames`: one transaction that sets each promoted
+    /// layer's new buffer with a duplicate of its acquire fence and any
+    /// property the new frame's contract changes, leaving every part's
+    /// shown buffer in place — no buffer is acquired, no submission runs
+    /// and no fence is exported (#90).
+    ///
+    /// # Errors
+    /// [`RenderError`] when a promoted layer's buffer a plane cannot show,
+    /// or a refresh names a plane that is not showing.
+    fn refresh(&mut self, frames: &[crate::render::planes::Plane<'_>]) -> Result<(), RenderError> {
+        self.collect_releases();
+        let mut transaction = Transaction::new();
+        let mut pending: Vec<Pending> = Vec::new();
+        for update in frames {
+            let layer = update.placement.layer;
+            let PlaneContent::Frame { frame, generation } = &update.content;
+            let FramePlanes::Native(native) = &frame.planes else {
+                return Err(cannot_show(layer, &Ineligible::NotABuffer));
+            };
+            let contract = contract(native).map_err(|e| cannot_show(layer, &e))?;
+            let Some(plane) = self.promoted.get_mut(&layer) else {
+                return Err(RenderError::Render(format!(
+                    "layer {layer:?}'s frame changed while no plane shows it"
+                )));
+            };
+            if plane.generation != *generation {
+                native.lease();
+                plane.generation = *generation;
+                let previous = std::mem::replace(&mut plane.frame, native.clone());
+                set_frame(&mut transaction, &plane.surface, native, dup_fence)?;
+                pending.push(Pending {
+                    surface: plane.surface.as_ptr(),
+                    what: Replaced::Frame(previous),
+                    removed: None,
+                });
+            }
+            // The committed plan pins the placement, z-order and alpha;
+            // only the new frame's contract can move a property. `shown`
+            // is `None` only when a previous present failed mid-
+            // transaction — report it rather than touch the surface
+            // control with half its properties.
+            let Some(mut properties) = plane.shown else {
+                return Err(RenderError::Render(format!(
+                    "layer {layer:?}'s plane never showed a frame"
+                )));
+            };
+            properties.opaque = contract.opaque;
+            properties.dataspace = contract.dataspace;
+            properties.hdr = contract.hdr;
+            self.ops.clear();
+            plan::diff(plane.shown.as_ref(), &properties, &mut self.ops);
+            for &op in &self.ops {
+                transaction.set(&plane.surface, op);
+            }
+            plane.shown = Some(properties);
+        }
+        Self::apply(transaction, &self.release, pending);
+        Ok(())
     }
 
     /// Removes every part and plane from the display; their releases are
@@ -749,6 +827,10 @@ impl Compositor for Planes {
 impl SystemPlanes for Planes {
     fn compose(&mut self, composition: Composition<'_>) -> Result<bool, RenderError> {
         self.present(composition)
+    }
+
+    fn refresh(&mut self, frames: &[crate::render::planes::Plane<'_>]) -> Result<(), RenderError> {
+        Self::refresh(self, frames)
     }
 
     fn resize(&mut self, size: (u32, u32)) {

@@ -13,7 +13,9 @@ use crate::backend::{Backend, Display, Frame, Redraw, Renderer, SurfaceFrame, Su
 use crate::error::{EngineError, RenderError, ResourceError, SurfaceError};
 use crate::frame::{FrameId, FrameStats, Next};
 use crate::image::ImageUpload;
-use crate::message::{BackdropShaderId, ChangeSet, LayerOp, Message, Op, ResOp, SurfaceId};
+use crate::message::{
+    BackdropShaderId, ChangeSet, LayerId, LayerOp, Message, Op, ResOp, SurfaceId,
+};
 use crate::paint::ImageId;
 use crate::resource::ResourceId;
 use crate::tree::SurfaceTree;
@@ -46,6 +48,11 @@ struct SurfaceState {
     /// Whether a property op, a content op or an animation step touched the
     /// surface since the last render.
     changed: bool,
+    /// The layers whose external frame was installed since the last render,
+    /// when those installs are the surface's only change: `Some` collects
+    /// them, and `None` records that something else — a layer op, a clear,
+    /// a resize, a display scale change — changed too (#90).
+    plane_frames: Option<FxHashSet<LayerId>>,
     /// Whether the surface presents, and whether a present is pending (#98).
     presentation: Presentation,
     /// Whether the host announced the surface moved to another display
@@ -391,6 +398,7 @@ fn create_surface<B: Backend>(
             display: Display::default(),
             clear: WorkingColor::TRANSPARENT,
             changed: true,
+            plane_frames: None,
             presentation: if info.presents {
                 Presentation::Presenting { pending: false }
             } else {
@@ -413,6 +421,7 @@ fn resize_surface<B: Backend>(
     if let Some(state) = surfaces.get_mut(&id) {
         state.size = size;
         state.changed = true;
+        state.plane_frames = None;
     } else {
         tracing::trace!(surface = id.raw(), "resize of unknown surface");
     }
@@ -442,7 +451,11 @@ fn set_display(surfaces: &mut FxHashMap<SurfaceId, SurfaceState>, id: SurfaceId,
             // A scale change reshapes the content; a headroom-only update
             // re-presents without touching it (#98). Only a presenting
             // surface can be pending a present.
-            state.changed |= state.display.scale.to_bits() != display.scale.to_bits();
+            let scale_changed = state.display.scale.to_bits() != display.scale.to_bits();
+            state.changed |= scale_changed;
+            if scale_changed {
+                state.plane_frames = None;
+            }
             state.mark_present();
             state.display = display;
         }
@@ -507,6 +520,7 @@ fn replace_image<B: Backend>(
     for (surface, state) in surfaces {
         if renderer.samples(*surface, resource) {
             state.changed = true;
+            state.plane_frames = None;
         }
     }
 }
@@ -528,17 +542,20 @@ fn commit<B: Backend>(
     if let Some(clear) = clear.take() {
         state.clear = clear;
         state.changed = true;
+        state.plane_frames = None;
     }
     state.content_animating = *animating;
     for op in ops.drain(..) {
+        state.changed = true;
         match op {
             Op::Layer(LayerOp::Remove(layer)) => {
+                state.plane_frames = None;
                 for removed in state.tree.remove(layer) {
                     renderer.remove_layer(surface, removed);
                 }
-                state.changed = true;
             }
             Op::Layer(LayerOp::Content(layer, content)) => {
+                state.plane_frames = None;
                 state.tree.apply(LayerOp::Content(layer, None));
                 state.tree.note_content(layer, content.as_ref());
                 if let Some(mut old) = renderer.set_content(surface, layer, content)
@@ -546,15 +563,23 @@ fn commit<B: Backend>(
                 {
                     recycled.push((layer, old));
                 }
-                state.changed = true;
             }
             Op::Layer(op) => {
+                state.plane_frames = None;
                 state.tree.apply(op);
-                state.changed = true;
             }
             Op::Install(install) => {
+                state.plane_frames = None;
                 install(&mut *renderer);
-                state.changed = true;
+            }
+            Op::ExternalFrame { layer, install } => {
+                // A frame swap is a change like any other — `changed`
+                // stays set — but it is also recorded apart, so a backend
+                // with planes can tell a plane-only frame (#90).
+                install(&mut *renderer);
+                if let Some(frames) = &mut state.plane_frames {
+                    frames.insert(layer);
+                }
             }
         }
     }
@@ -621,6 +646,16 @@ fn render<B: Backend>(
             display: state.display,
             clear: state.clear,
             changed,
+            // A stepped animation changed the sampled tree: the frame is
+            // never plane-only, however it was committed.
+            plane_frames: if sampling.stepped {
+                None
+            } else {
+                state
+                    .plane_frames
+                    .as_ref()
+                    .filter(|frames| !frames.is_empty())
+            },
             present_pending: state.present_pending(),
             display_moved: state.display_moved,
             tree: &state.tree,
@@ -637,6 +672,7 @@ fn render<B: Backend>(
     )?;
     for state in surfaces.values_mut() {
         state.changed = false;
+        state.plane_frames = Some(FxHashSet::default());
         state.display_moved = false;
         state.presented();
     }
@@ -690,6 +726,16 @@ async fn render_local<B: Backend>(
             display: state.display,
             clear: state.clear,
             changed,
+            // A stepped animation changed the sampled tree: the frame is
+            // never plane-only, however it was committed.
+            plane_frames: if sampling.stepped {
+                None
+            } else {
+                state
+                    .plane_frames
+                    .as_ref()
+                    .filter(|frames| !frames.is_empty())
+            },
             present_pending: state.present_pending(),
             display_moved: state.display_moved,
             tree: &state.tree,
@@ -708,6 +754,7 @@ async fn render_local<B: Backend>(
         .await?;
     for state in surfaces.values_mut() {
         state.changed = false;
+        state.plane_frames = Some(FxHashSet::default());
         state.display_moved = false;
         state.presented();
     }
@@ -753,6 +800,7 @@ mod tests {
             display: Display::default(),
             clear: WorkingColor::TRANSPARENT,
             changed: false,
+            plane_frames: Some(rustc_hash::FxHashSet::default()),
             presentation: Presentation::Retained,
             display_moved: false,
             content_animating: false,

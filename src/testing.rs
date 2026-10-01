@@ -50,6 +50,8 @@ pub enum Event {
     RemoveShader(ShaderId),
     /// `set_content` ran.
     SetContent(SurfaceId, LayerId),
+    /// `set_external_frame` ran.
+    ExternalFrame(SurfaceId, LayerId),
     /// `remove_layer` ran.
     RemoveLayer(SurfaceId, LayerId),
     /// One rendered surface, in `frame.surfaces` order.
@@ -63,6 +65,10 @@ pub struct FrameRecord {
     pub surface: SurfaceId,
     /// The frame's `changed` flag for this surface.
     pub changed: bool,
+    /// The frame's `plane_frames` for this surface — the layers that got
+    /// a new external frame when those installs were the only change
+    /// (#90), by layer id.
+    pub plane_frames: Option<Vec<LayerId>>,
     /// The frame's `present_pending` flag for this surface: a display
     /// change re-presents without touching content (#98).
     pub present_pending: bool,
@@ -358,6 +364,11 @@ impl Renderer for NullRenderer {
             let _ = self.events.send(Event::Frame(FrameRecord {
                 surface: surface.id,
                 changed: surface.changed,
+                plane_frames: surface.plane_frames.map(|frames| {
+                    let mut frames: Vec<_> = frames.iter().copied().collect();
+                    frames.sort_by_key(|layer| layer.raw());
+                    frames
+                }),
                 present_pending: surface.present_pending,
                 display_moved: surface.display_moved,
                 display: surface.display,
@@ -389,6 +400,11 @@ impl Renderer for NullRenderer {
             let _ = self.events.send(Event::Frame(FrameRecord {
                 surface: surface.id,
                 changed: surface.changed,
+                plane_frames: surface.plane_frames.map(|frames| {
+                    let mut frames: Vec<_> = frames.iter().copied().collect();
+                    frames.sort_by_key(|layer| layer.raw());
+                    frames
+                }),
                 present_pending: surface.present_pending,
                 display_moved: surface.display_moved,
                 display: surface.display,
@@ -475,6 +491,17 @@ impl ShaderPaint for Null {
 
 impl Uploads<Rgba8> for Null {}
 impl Uploads<Rgba16F> for Null {}
+
+/// `Null` retains no frame: the install is reported and the `()` frame
+/// drops. `external_frame`/`content` still exercise the render loop's
+/// plane-eligible change tracking (#90).
+impl crate::ExternalFrames for Null {
+    type Frame = ();
+
+    fn set_external_frame(r: &mut NullRenderer, surface: SurfaceId, layer: LayerId, _frame: ()) {
+        let _ = r.events.send(Event::ExternalFrame(surface, layer));
+    }
+}
 
 /// Evaluates the expression directly on native targets and `.await`s it
 /// on wasm32 — `Engine` calls are synchronous on one and futures on the
@@ -1485,6 +1512,68 @@ mod tests {
                 .any(|e| matches!(e, Event::RemoveImage(removed) if *removed == id)),
             "no RemoveImage in {events:?}"
         );
+    }
+
+    /// A commit that only installs external frames reports the installed
+    /// layers in the frame's `plane_frames`; a commit that changes anything
+    /// else — a layer op, a content op — reports `None` (#90).
+    #[test]
+    fn external_frame_only_commits_fill_plane_frames() {
+        let (engine, rx) = engine();
+        let surface = engine
+            .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))
+            .expect("surface");
+        let video = surface.layer();
+        let above = surface.layer();
+        // Creating and pushing the layers is an ordinary change, so the
+        // frame that also installs the first frame is not plane-only.
+        surface.update(|tx| {
+            tx[surface.root()].push(&video);
+            tx[surface.root()].push(&above);
+            tx[&video].content(engine.external_frame(()));
+        });
+        engine.render(FrameTime::now()).expect("render");
+        let record = frames(&rx).pop().expect("a frame record");
+        assert!(record.changed);
+        assert_eq!(
+            record.plane_frames, None,
+            "a commit with layer ops is not plane-only"
+        );
+
+        // A new frame on the layer alone is the frame's only change.
+        surface.update(|tx| {
+            tx[&video].content(engine.external_frame(()));
+        });
+        engine.render(FrameTime::now()).expect("render");
+        let record = frames(&rx).pop().expect("a frame record");
+        assert!(record.changed);
+        assert_eq!(record.plane_frames, Some(vec![video.id()]));
+
+        // Two layers' new frames commute to one set.
+        surface.update(|tx| {
+            tx[&video].content(engine.external_frame(()));
+            tx[&above].content(engine.external_frame(()));
+        });
+        engine.render(FrameTime::now()).expect("render");
+        let record = frames(&rx).pop().expect("a frame record");
+        assert!(record.changed);
+        assert_eq!(record.plane_frames, Some(vec![video.id(), above.id()]));
+
+        // A frame installed alongside a layer op is an ordinary change.
+        surface.update(|tx| {
+            tx[&video].content(engine.external_frame(()));
+            tx[&above].opacity(0.5f32);
+        });
+        engine.render(FrameTime::now()).expect("render");
+        let record = frames(&rx).pop().expect("a frame record");
+        assert!(record.changed);
+        assert_eq!(record.plane_frames, None);
+
+        // An untouched surface records neither.
+        engine.render(FrameTime::now()).expect("render");
+        let record = frames(&rx).pop().expect("a frame record");
+        assert!(!record.changed);
+        assert_eq!(record.plane_frames, None);
     }
 
     #[test]

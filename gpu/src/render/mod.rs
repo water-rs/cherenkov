@@ -191,6 +191,10 @@ struct SurfaceState {
     content: FxHashMap<LayerId, gpu_content::Slot>,
     /// Retained external frames by layer (`cherenkov::ExternalFrames`).
     external: FxHashMap<LayerId, external::Slot>,
+    /// The promoted layers whose new frames this frame presents alone —
+    /// filled when [`planes::frames_only`] admits the frame's whole
+    /// change, so presentation skips every part (#90).
+    plane_frames: FxHashSet<LayerId>,
     shader_textures: FxHashMap<std::sync::Arc<paint::Key>, paint::Texture>,
     frame: LoweredFrame,
     /// This frame's offsets into the shared buffers: instances and globals
@@ -2178,6 +2182,41 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
     ))
 }
 
+/// The stack entries the surface's committed plan promotes, each with its
+/// installed frame and install generation — optionally only `updates`'s
+/// layers.
+fn plane_stack<'a>(
+    surface: &'a SurfaceState,
+    updates: Option<&FxHashSet<LayerId>>,
+) -> Vec<planes::Plane<'a>> {
+    surface
+        .plan
+        .planes
+        .iter()
+        .filter(|placement| updates.is_none_or(|updates| updates.contains(&placement.layer)))
+        .map(|placement| {
+            let slot = &surface.external[&placement.layer];
+            planes::Plane {
+                placement,
+                content: planes::PlaneContent::Frame {
+                    frame: &slot.frame,
+                    generation: slot.generation,
+                },
+            }
+        })
+        .collect()
+}
+
+/// A surface's promotion candidates: the external-frame layers whose
+/// installed frame a plane can show, each with its content size.
+fn plane_candidates(surf: &SurfaceState) -> FxHashMap<LayerId, (u32, u32)> {
+    surf.external
+        .iter()
+        .filter(|(_, slot)| slot.on_plane)
+        .map(|(layer, slot)| (*layer, slot.size))
+        .collect()
+}
+
 /// Rejects an image the device cannot hold as one texture.
 fn check_image_size(image: &ImageUpload, max: u32) -> Result<(), ResourceError> {
     if image.width > max || image.height > max {
@@ -2266,6 +2305,7 @@ impl Renderer for GpuRenderer {
                 layers: FxHashMap::default(),
                 content: FxHashMap::default(),
                 external: FxHashMap::default(),
+                plane_frames: FxHashSet::default(),
                 shader_textures: FxHashMap::default(),
                 frame: LoweredFrame::default(),
                 inst_base: 0,
@@ -3195,21 +3235,27 @@ impl GpuRenderer {
         let dirty: Vec<_> = frame
             .surfaces
             .iter()
-            .filter(|sf| {
-                sf.changed
-                    || self.surfaces[&sf.id]
-                        .frame
-                        .filters
-                        .iter()
-                        .any(|(_, id)| self.filters.wants_redraw(*id))
-                    || self.surfaces[&sf.id].content_wants_redraw()
-                    || self.surfaces[&sf.id].projective_wants_redraw(&self.filters, &self.shaders)
-                    || self.surfaces[&sf.id]
-                        .shader_textures
-                        .keys()
-                        .any(|key| self.shaders.animated(key))
-            })
+            .filter(|sf| sf.changed || self.wants_redraw(&self.surfaces[&sf.id]))
             .collect();
+        // A surface whose only change is new external frames on layers
+        // its committed plan promotes presents them through the planes
+        // alone — no lowering, no draws, no part blit (#90). Any other
+        // change takes the full render path.
+        let mut dirty_full = Vec::with_capacity(dirty.len());
+        for sf in dirty {
+            match self.plane_only_frames(sf) {
+                Some(frames) => {
+                    let surface = self
+                        .surfaces
+                        .get_mut(&sf.id)
+                        .expect("dirty surface must exist");
+                    surface.plane_frames = frames;
+                    surface.present_pending = true;
+                }
+                None => dirty_full.push(sf),
+            }
+        }
+        let dirty = dirty_full;
         if dirty.is_empty() {
             diag::set_phase("present");
             return self.present_windows(frame);
@@ -3328,21 +3374,27 @@ impl GpuRenderer {
         let dirty: Vec<_> = frame
             .surfaces
             .iter()
-            .filter(|sf| {
-                sf.changed
-                    || self.surfaces[&sf.id]
-                        .frame
-                        .filters
-                        .iter()
-                        .any(|(_, id)| self.filters.wants_redraw(*id))
-                    || self.surfaces[&sf.id].content_wants_redraw()
-                    || self.surfaces[&sf.id].projective_wants_redraw(&self.filters, &self.shaders)
-                    || self.surfaces[&sf.id]
-                        .shader_textures
-                        .keys()
-                        .any(|key| self.shaders.animated(key))
-            })
+            .filter(|sf| sf.changed || self.wants_redraw(&self.surfaces[&sf.id]))
             .collect();
+        // A surface whose only change is new external frames on layers
+        // its committed plan promotes presents them through the planes
+        // alone — no lowering, no draws, no part blit (#90). Any other
+        // change takes the full render path.
+        let mut dirty_full = Vec::with_capacity(dirty.len());
+        for sf in dirty {
+            match self.plane_only_frames(sf) {
+                Some(frames) => {
+                    let surface = self
+                        .surfaces
+                        .get_mut(&sf.id)
+                        .expect("dirty surface must exist");
+                    surface.plane_frames = frames;
+                    surface.present_pending = true;
+                }
+                None => dirty_full.push(sf),
+            }
+        }
+        let dirty = dirty_full;
         if dirty.is_empty() {
             diag::set_phase("present");
             return self.present_windows(frame);
@@ -4303,42 +4355,38 @@ impl GpuRenderer {
             if surface.present_pending {
                 surface.present_pending = !match self.planes.get_mut(&sf.id) {
                     Some(system) => {
-                        let parts: Vec<_> = (0..surface.plan.parts())
-                            .map(|n| planes::Part {
-                                view: match n {
-                                    0 => &surface.view,
-                                    n => &surface.parts[n - 1].1,
-                                },
-                            })
-                            .collect();
-                        let external = &surface.external;
-                        let stack: Vec<_> = surface
-                            .plan
-                            .planes
-                            .iter()
-                            .map(|placement| {
-                                let slot = &external[&placement.layer];
-                                planes::Plane {
-                                    placement,
-                                    content: planes::PlaneContent::Frame {
-                                        frame: &slot.frame,
-                                        generation: slot.generation,
+                        if surface.plane_frames.is_empty() {
+                            let parts: Vec<_> = (0..surface.plan.parts())
+                                .map(|n| planes::Part {
+                                    view: match n {
+                                        0 => &surface.view,
+                                        n => &surface.parts[n - 1].1,
                                     },
-                                }
-                            })
-                            .collect();
-                        planes::SystemPlanes::compose(
-                            system,
-                            planes::Composition {
-                                device: &self.device,
-                                queue: &self.queue,
-                                presenter,
-                                size: surface.size,
-                                display: sf.display,
-                                parts: &parts,
-                                planes: &stack,
-                            },
-                        )?
+                                })
+                                .collect();
+                            let stack = plane_stack(surface, None);
+                            planes::SystemPlanes::compose(
+                                system,
+                                planes::Composition {
+                                    device: &self.device,
+                                    queue: &self.queue,
+                                    presenter,
+                                    size: surface.size,
+                                    display: sf.display,
+                                    parts: &parts,
+                                    planes: &stack,
+                                },
+                            )?
+                        } else {
+                            // The frame's only change is new frames on
+                            // these promoted layers: present them alone,
+                            // leaving every part's shown buffer in place
+                            // (#90).
+                            let updates = std::mem::take(&mut surface.plane_frames);
+                            let frames = plane_stack(surface, Some(&updates));
+                            planes::SystemPlanes::refresh(system, &frames)?;
+                            true
+                        }
                     }
                     None => presenter.present(
                         &self.device,
@@ -4528,6 +4576,46 @@ impl GpuRenderer {
 
     // `#[inline(never)]` keeps a symbol for the Callgrind gate's root lookup
     // (`bench/scripts/ir_gate.py`).
+    /// Whether a surface needs a render for reasons outside the frame's
+    /// commits: an active filter, a producer's new content, a stale
+    /// projective image, or an animated shader texture.
+    fn wants_redraw(&self, surface: &SurfaceState) -> bool {
+        surface
+            .frame
+            .filters
+            .iter()
+            .any(|(_, id)| self.filters.wants_redraw(*id))
+            || surface.content_wants_redraw()
+            || surface.projective_wants_redraw(&self.filters, &self.shaders)
+            || surface
+                .shader_textures
+                .keys()
+                .any(|key| self.shaders.animated(key))
+    }
+
+    /// The layers whose new frames `sf`'s surface can present through its
+    /// planes alone: `Some` when the surface promotes, the frame's only
+    /// committed change is those installs, no present is pending, no
+    /// display moved, nothing else wants a redraw, and the plan they would
+    /// produce is the committed one (`planes::frames_only`). `None` sends
+    /// the frame down the full render path like any other change (#90).
+    fn plane_only_frames(&self, sf: &SurfaceFrame<'_>) -> Option<FxHashSet<LayerId>> {
+        if sf.present_pending || sf.display_moved {
+            return None;
+        }
+        let frames = sf.plane_frames?;
+        let surface = self.surfaces.get(&sf.id)?;
+        (surface.promotes
+            && !self.wants_redraw(surface)
+            && planes::frames_only::<planes::Platform>(
+                &surface.plan,
+                sf.tree,
+                &plane_candidates(surface),
+                frames,
+            ))
+        .then(|| frames.clone())
+    }
+
     #[inline(never)]
     fn lower_content(
         surf: &mut SurfaceState,
@@ -4538,13 +4626,7 @@ impl GpuRenderer {
     ) -> Result<Lowered, RenderError> {
         surf.frame.reset();
         surf.plan = if surf.promotes {
-            let candidates = surf
-                .external
-                .iter()
-                .filter(|(_, slot)| slot.on_plane)
-                .map(|(layer, slot)| (*layer, slot.size))
-                .collect();
-            planes::plan::<planes::Platform>(frame.tree, &candidates)
+            planes::plan::<planes::Platform>(frame.tree, &plane_candidates(surf))
         } else {
             planes::Plan::default()
         };

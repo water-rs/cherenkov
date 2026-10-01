@@ -20,7 +20,7 @@
 //! engine parts and promoted planes a [`Composition`] describes.
 
 use kurbo::{Affine, Vec2};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use cherenkov::{BlendMode, Display, LayerId, RenderError, ShapeData, SurfaceTree};
 
@@ -376,6 +376,27 @@ fn paint_order(tree: &SurfaceTree) -> Vec<Visit> {
     order
 }
 
+/// Whether a frame whose only committed change is new external frames on
+/// `layers` can present through the planes alone: every changed layer is
+/// promoted by the surface's committed `plan`, and the plan recomputed
+/// over the frame's tree with the fresh `candidates` is the committed
+/// one — a new frame's different size, or a new frame no plane can show,
+/// changes the candidate set and fails the check, keeping those layers on
+/// the full path like any other change (#90).
+#[must_use]
+pub fn frames_only<C: Compositor>(
+    plan: &Plan,
+    tree: &SurfaceTree,
+    candidates: &FxHashMap<LayerId, (u32, u32)>,
+    layers: &FxHashSet<LayerId>,
+) -> bool {
+    !layers.is_empty()
+        && layers
+            .iter()
+            .all(|layer| plan.planes.iter().any(|plane| plane.layer == *layer))
+        && self::plan::<C>(tree, candidates) == *plan
+}
+
 /// The content a plane shows.
 #[derive(Debug)]
 #[cfg_attr(
@@ -472,6 +493,18 @@ pub trait SystemPlanes: Compositor {
     /// or a part cannot be presented.
     fn compose(&mut self, composition: Composition<'_>) -> Result<bool, RenderError>;
 
+    /// Presents only the promoted planes' new frames: `frames` carries
+    /// every promoted layer whose frame changed this frame, inside the
+    /// transaction or equivalent atomic update the platform composes, and
+    /// every part's shown buffer stays in place — the engine did no work
+    /// for this frame, so there is nothing to blit and no buffer to
+    /// acquire. Called only for a frame [`frames_only`] admitted, so the
+    /// stack itself is the one `compose` last realized (#90).
+    ///
+    /// # Errors
+    /// A [`RenderError`] naming the cause when the system rejects a plane.
+    fn refresh(&mut self, frames: &[Plane<'_>]) -> Result<(), RenderError>;
+
     /// The surface was resized to `size` device pixels.
     fn resize(&mut self, size: (u32, u32));
 
@@ -516,6 +549,9 @@ impl Compositor for NoPlanes {
 #[cfg(not(any(target_vendor = "apple", target_os = "android")))]
 impl SystemPlanes for NoPlanes {
     fn compose(&mut self, _: Composition<'_>) -> Result<bool, RenderError> {
+        unreachable!("no `NoPlanes` value exists")
+    }
+    fn refresh(&mut self, _: &[Plane<'_>]) -> Result<(), RenderError> {
         unreachable!("no `NoPlanes` value exists")
     }
     fn resize(&mut self, _: (u32, u32)) {

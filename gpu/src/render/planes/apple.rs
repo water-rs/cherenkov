@@ -72,7 +72,7 @@ use objc2_quartz_core::{
 
 use cherenkov::{ContinuousRect, LayerId, RenderError, ShapeData, SurfaceError};
 
-use super::{Composition, Compositor, Level, Placement, PlaneContent, SystemPlanes};
+use super::{Composition, Compositor, Level, Placement, Plane, PlaneContent, SystemPlanes};
 use crate::interop::{
     ChromaOffset, ExternalFrame, FramePlanes, FrameSync, Primaries, RgbAlpha, Transfer, YuvMatrix,
     YuvRange,
@@ -950,6 +950,40 @@ impl SystemPlanes for LayerPlanes {
             }
         }
         Ok(presented)
+    }
+
+    /// Hands each promoted layer's new frame to its display layer: the
+    /// layer tree and geometry are the ones `compose` built for the
+    /// committed plan, and the parts' layers keep their shown buffers —
+    /// nothing here presents or reconfigures them (#90).
+    ///
+    /// # Errors
+    /// A [`RenderError`] naming the cause when the system rejects a plane
+    /// or a refresh names a layer no plane shows.
+    fn refresh(&mut self, frames: &[Plane<'_>]) -> Result<(), RenderError> {
+        for update in frames {
+            match update.content {
+                PlaneContent::Frame { frame, generation } => {
+                    let Some(built) = self
+                        .planes
+                        .iter_mut()
+                        .find(|plane| plane.layer == update.placement.layer)
+                    else {
+                        return Err(RenderError::Render(format!(
+                            "layer {:?}'s frame changed while no plane shows it",
+                            update.placement.layer
+                        )));
+                    };
+                    if built.generation != Some(generation) {
+                        let resized = built.shown != Some(update.placement.size);
+                        Self::show(built, frame, resized)?;
+                        built.generation = Some(generation);
+                        built.shown = Some(update.placement.size);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn resize(&mut self, size: (u32, u32)) {

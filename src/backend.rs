@@ -20,6 +20,8 @@ pub trait RenderTransfer {}
 #[cfg(target_arch = "wasm32")]
 impl<T: ?Sized> RenderTransfer for T {}
 
+use rustc_hash::FxHashSet;
+
 use crate::Picture;
 use crate::config::{MemoryUsage, Pressure};
 use crate::error::{EngineError, RenderError, ResourceError, SurfaceError};
@@ -272,6 +274,13 @@ pub struct SurfaceFrame<'a> {
     /// Whether a property op, a content op or an animation step touched the
     /// surface since the last render.
     pub changed: bool,
+    /// The layers that received a new external frame this frame, when those
+    /// installs are the surface's only change: `Some` with a non-empty set
+    /// only then — `changed` still reports them — and `None` when anything
+    /// else changed or nothing did (#90). A planes-capable backend can
+    /// present the new frames to the layers' system planes without
+    /// re-rendering the surface; every other backend ignores this.
+    pub plane_frames: Option<&'a FxHashSet<LayerId>>,
     /// Whether the window should present this frame even when `changed` is
     /// false — a headroom update reaches the swapchain without touching the
     /// layer tree or any content cache (#98).

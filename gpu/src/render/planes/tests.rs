@@ -1,10 +1,10 @@
 use kurbo::{Affine, Rect, RoundedRect, Vec2};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use cherenkov::testing::LayerOp;
 use cherenkov::{BlendMode, FilterId, LayerId, Prop, ShapeData, SurfaceTree};
 
-use super::{Compositor, Ineligible, Level, Plan, plan};
+use super::{Compositor, Ineligible, Level, Plan, frames_only, plan};
 use crate::render::lower::axis_aligned;
 
 /// A compositor that carries axis-aligned transforms and rect or
@@ -276,6 +276,75 @@ fn the_placement_maps_content_to_device_space() {
         placement.content_to_device(),
         Affine::translate((40.0, 20.0)) * Affine::scale(0.5)
     );
+}
+
+/// The plane-only gate (#90): a frame whose only change is new frames on
+/// layers the committed plan promotes refreshes through the planes alone
+/// — the engine renders nothing for it. A changed layer the plan keeps
+/// in the engine, a moved or reshaped promotion, a new candidate, or no
+/// installs at all takes the full render path.
+#[test]
+fn a_plane_only_frame_presents_through_the_planes_alone() {
+    let tree = scene();
+    let candidates = video();
+    let committed = verdict(&tree).expect("eligible");
+    let video_only: FxHashSet<LayerId> = std::iter::once(VIDEO).collect();
+    assert!(frames_only::<Test>(
+        &committed,
+        &tree,
+        &candidates,
+        &video_only
+    ));
+
+    // A new frame on a layer the plan keeps in the engine is a full
+    // change: not promoted, it cannot reach a plane.
+    let in_engine: FxHashSet<LayerId> = std::iter::once(BELOW).collect();
+    assert!(!frames_only::<Test>(
+        &committed,
+        &tree,
+        &candidates,
+        &in_engine
+    ));
+    let mixed: FxHashSet<LayerId> = [VIDEO, BELOW].into_iter().collect();
+    assert!(!frames_only::<Test>(&committed, &tree, &candidates, &mixed));
+
+    // A tree change the recomputed plan sees — the promotion moved —
+    // keeps the full path.
+    let mut moved = scene();
+    moved.apply(LayerOp::Transform(
+        PARENT,
+        prop(Affine::translate((8.0, 0.0))),
+    ));
+    assert_ne!(plan::<Test>(&moved, &candidates), committed);
+    assert!(!frames_only::<Test>(
+        &committed,
+        &moved,
+        &candidates,
+        &video_only
+    ));
+
+    // A differently sized frame on the same layer changes its placement.
+    let resized: FxHashMap<_, _> = std::iter::once((VIDEO, (640, 360))).collect();
+    assert!(!frames_only::<Test>(
+        &committed,
+        &tree,
+        &resized,
+        &video_only
+    ));
+
+    // A first frame on another layer makes it a candidate, which changes
+    // the plan — here by adding a second promotion.
+    let mut two = video();
+    two.insert(BELOW, SIZE);
+    assert!(!frames_only::<Test>(&committed, &tree, &two, &mixed));
+
+    // No installs is never a refresh.
+    assert!(!frames_only::<Test>(
+        &committed,
+        &tree,
+        &candidates,
+        &FxHashSet::default()
+    ));
 }
 
 /// A backdrop sampled by the frame itself, or anywhere above it, needs the

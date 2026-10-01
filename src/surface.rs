@@ -308,8 +308,9 @@ pub enum LayerContent<B: Backend> {
     Install(InstallOp<B>),
     /// An external frame's install — opaque like [`Install`](Self::Install),
     /// but lowered to [`Op::ExternalFrame`] so the render loop can tell a
-    /// plane-eligible frame swap from any other change (#90).
-    ExternalFrame(InstallOp<B>),
+    /// plane-eligible frame swap from any other change. The payload is
+    /// constructible only inside the crate (#90).
+    ExternalFrame(ExternalFrameInstall<B>),
     /// Nothing.
     None,
 }
@@ -356,9 +357,30 @@ pub struct ExternalFrameHandle<B: ExternalFrames> {
 impl<B: ExternalFrames> From<ExternalFrameHandle<B>> for LayerContent<B> {
     fn from(handle: ExternalFrameHandle<B>) -> Self {
         let frame = handle.frame;
-        Self::ExternalFrame(Box::new(move |r, surface, layer| {
-            B::set_external_frame(r, surface, layer, frame);
-        }))
+        Self::ExternalFrame(ExternalFrameInstall::new(Box::new(
+            move |r, surface, layer| {
+                B::set_external_frame(r, surface, layer, frame);
+            },
+        )))
+    }
+}
+
+/// An external frame's install.
+///
+/// Only [`Engine::external_frame`]'s handle produces one, so a commit
+/// records a layer in `plane_frames` only for a real frame swap — an
+/// arbitrary renderer mutation wrapped in [`LayerContent::Install`]
+/// still takes the full path (#90).
+pub struct ExternalFrameInstall<B: Backend>(InstallOp<B>);
+
+impl<B: Backend> ExternalFrameInstall<B> {
+    pub(crate) fn new(install: InstallOp<B>) -> Self {
+        Self(install)
+    }
+
+    /// Runs the install on the render thread.
+    pub(crate) fn install(self, renderer: &mut B::Renderer, surface: SurfaceId, layer: LayerId) {
+        (self.0)(renderer, surface, layer);
     }
 }
 
@@ -1123,7 +1145,7 @@ impl<B: Backend> Surface<B> {
                         ops.push(Op::ExternalFrame {
                             layer,
                             install: Box::new(move |r| {
-                                install(r, surface, layer);
+                                install.install(r, surface, layer);
                             }),
                         });
                     }

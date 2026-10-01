@@ -153,13 +153,16 @@ fn fs_external(in: VsOut) -> @location(0) vec4<f32> {
             let c4 = ext_texel_u32(ext_uv,
                 px * 0.5 + vec2<f32>(0.25) - params.site.xy * 0.5,
                 params.dims.zw);
+            // P010 keeps the 10-bit code in the high bits of a 16-bit
+            // word: the read value is the code times 64, and `norm`
+            // expects the code.
             var shift = 1.0;
             if (params.info.w & EXT_FLAG_SHIFT6) != 0u {
                 shift = 64.0;
             }
-            let yn = f32(y4.x) * shift * params.norm.x + params.norm.y;
-            let cbn = f32(c4.x) * shift * params.norm.z + params.norm.w;
-            let crn = f32(c4.y) * shift * params.norm.z + params.norm.w;
+            let yn = f32(y4.x) / shift * params.norm.x + params.norm.y;
+            let cbn = f32(c4.x) / shift * params.norm.z + params.norm.w;
+            let crn = f32(c4.y) / shift * params.norm.z + params.norm.w;
             let encoded = mat3x3<f32>(params.yuv0.xyz, params.yuv1.xyz,
                                       params.yuv2.xyz) * vec3<f32>(yn, cbn, crn);
             let lin = ext_decode(encoded, params.info.y);

@@ -144,17 +144,31 @@ impl Default for GpuConfig {
 pub enum GpuTarget {
     /// An offscreen texture.
     Offscreen(Offscreen),
-    /// A native window; retains readable working-space pixels before presentation.
+    /// A native window. On Apple platforms the engine builds system-compositor
+    /// planes under the view's layer and the system composites the surface,
+    /// which is then not readable; elsewhere it presents one swapchain and
+    /// retains readable working-space pixels before presentation.
     Window(WindowTarget),
     /// Engine-owned working-space texture shared with a native host.
     Texture(interop::TextureTarget),
 }
 
 /// A window the engine presents on: a raw window handle and the drawable
-/// size in pixels. The engine renders into its own linear f16 target and
-/// blits it onto the swapchain, so the surface stays readable.
+/// size in pixels.
+///
+/// On Apple platforms the view's backing layer is the system-compositor
+/// parent: eligible layers (video frames) are promoted onto their own system
+/// layers, and the engine's own composition is split into parts presented
+/// through metal layers around them (#90). The system composites the
+/// result, so such a surface is not readable. Elsewhere the engine renders
+/// into its own linear f16 target and blits it onto one swapchain, so the
+/// surface stays readable.
 pub struct WindowTarget {
+    #[cfg(not(target_vendor = "apple"))]
     handle: Box<dyn wgpu::WindowHandle>,
+    /// The view's backing layer, captured on the caller's thread.
+    #[cfg(target_vendor = "apple")]
+    parent: render::planes::apple::Parent,
     size: (u32, u32),
     transparent: bool,
     refresh: cherenkov::RefreshRange,
@@ -163,9 +177,17 @@ pub struct WindowTarget {
 impl WindowTarget {
     /// Wraps `handle` (any `raw-window-handle` window, e.g. an
     /// `Arc<winit::window::Window>`) at `size` device pixels.
+    ///
+    /// # Panics
+    /// On Apple platforms, off the main thread: the view's layer is captured
+    /// here and a view is main-thread state. Also when the handle is
+    /// unavailable or is not an `AppKit` or `UIKit` view there.
     pub fn new(handle: impl wgpu::WindowHandle + 'static, size: (u32, u32)) -> Self {
         Self {
+            #[cfg(not(target_vendor = "apple"))]
             handle: Box::new(handle),
+            #[cfg(target_vendor = "apple")]
+            parent: render::planes::apple::Parent::capture(Box::new(handle)),
             size,
             transparent: false,
             refresh: cherenkov::DEFAULT_REFRESH,
@@ -262,6 +284,11 @@ impl Uploads<Rgba16F> for Gpu {}
 // presentation tone-map to the display's `Display::headroom` in the
 // present shader — see `render::present`.
 impl cherenkov::HdrOutput for Gpu {}
+
+// System-compositor planes (#90): eligible layers of an Apple window surface
+// are promoted to Core Animation layers — see `render::planes`.
+#[cfg(target_vendor = "apple")]
+impl cherenkov::Planes for Gpu {}
 
 impl cherenkov::GpuContent for Gpu {
     type Content = interop::GpuContentBox;

@@ -12,7 +12,7 @@ mod instance;
 mod lower;
 mod paint;
 mod path;
-mod planes;
+pub mod planes;
 mod prepared;
 pub mod present;
 mod raster;
@@ -360,9 +360,12 @@ pub struct GpuRenderer {
     /// The plane realization of every surface whose target exposes a
     /// system-compositor parent. Platform objects stay on the render
     /// thread, outside the surface states lowering moves to its workers.
-    #[expect(
-        clippy::zero_sized_map_values,
-        reason = "no platform realization is wired yet, so the map stays empty"
+    #[cfg_attr(
+        not(target_vendor = "apple"),
+        expect(
+            clippy::zero_sized_map_values,
+            reason = "no plane realization exists on this platform, so the map stays empty"
+        )
     )]
     planes: FxHashMap<SurfaceId, planes::Platform>,
     /// How the fixed modules reach this device (`shaders.rs`): SPIR-V,
@@ -1303,9 +1306,12 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             instance,
             adapter,
             presenter: None,
-            #[expect(
-                clippy::zero_sized_map_values,
-                reason = "no platform realization is wired yet, so the map stays empty"
+            #[cfg_attr(
+                not(target_vendor = "apple"),
+                expect(
+                    clippy::zero_sized_map_values,
+                    reason = "no plane realization exists on this platform, so the map stays empty"
+                )
             )]
             planes: FxHashMap::default(),
             shader_delivery,
@@ -1525,9 +1531,12 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
         instance,
         adapter,
         presenter: None,
-        #[expect(
-            clippy::zero_sized_map_values,
-            reason = "no platform realization is wired yet, so the map stays empty"
+        #[cfg_attr(
+            not(target_vendor = "apple"),
+            expect(
+                clippy::zero_sized_map_values,
+                reason = "no plane realization exists on this platform, so the map stays empty"
+            )
         )]
         planes: FxHashMap::default(),
         shader_delivery,
@@ -1638,20 +1647,11 @@ impl Renderer for GpuRenderer {
             GpuTarget::Offscreen(offscreen) => (None, None, offscreen.refresh),
             GpuTarget::Texture(texture) => (None, Some(texture.textures), texture.refresh),
             GpuTarget::Window(window) => {
-                let surface = present::WindowSurface::new(
-                    &self.instance,
-                    &self.adapter,
-                    &self.device,
-                    window.handle,
-                    size,
-                    window.transparent,
-                )?;
-                self.presenter.get_or_insert_with(|| {
-                    present::Presenter::new(&self.device, self.shader_delivery)
-                });
-                (Some(surface), None, window.refresh)
+                let refresh = window.refresh.clone();
+                (self.open_window(id, window, size)?, None, refresh)
             }
         };
+        let promotes = self.planes.contains_key(&id);
         let (target, view) = create_target(
             &self.device,
             "surface target",
@@ -1671,7 +1671,7 @@ impl Renderer for GpuRenderer {
             id,
             SurfaceState {
                 window,
-                promotes: false,
+                promotes,
                 plan: planes::Plan::default(),
                 parts: Vec::new(),
                 frames_installed: 0,
@@ -1698,10 +1698,12 @@ impl Renderer for GpuRenderer {
             },
         );
         diag::set_surface(None);
+        // The system composites a surface with planes: the engine never
+        // holds its whole image.
         Ok(SurfaceInfo {
             max_dimension: self.max_texture,
             size,
-            readable: true,
+            readable: !promotes,
         })
     }
 
@@ -3129,6 +3131,52 @@ impl GpuRenderer {
             }
         }
         rate.map_or(Redraw::None, |rate| Redraw::Wanted { rate })
+    }
+
+    /// Opens a window target. Apple windows expose the view's layer: the
+    /// engine builds its planes under it and presents its parts there, so
+    /// no single swapchain exists.
+    #[cfg(target_vendor = "apple")]
+    fn open_window(
+        &mut self,
+        id: SurfaceId,
+        window: crate::WindowTarget,
+        size: (u32, u32),
+    ) -> Result<Option<present::WindowSurface>, SurfaceError> {
+        let system = planes::apple::LayerPlanes::new(
+            &self.instance,
+            &self.adapter,
+            &self.device,
+            window.parent,
+            size,
+            window.transparent,
+        )?;
+        self.planes.insert(id, system);
+        self.presenter
+            .get_or_insert_with(|| present::Presenter::new(&self.device, self.shader_delivery));
+        Ok(None)
+    }
+
+    /// Opens a window target: one swapchain the surface's target is blitted
+    /// onto.
+    #[cfg(not(target_vendor = "apple"))]
+    fn open_window(
+        &mut self,
+        _id: SurfaceId,
+        window: crate::WindowTarget,
+        size: (u32, u32),
+    ) -> Result<Option<present::WindowSurface>, SurfaceError> {
+        let surface = present::WindowSurface::new(
+            &self.instance,
+            &self.adapter,
+            &self.device,
+            window.handle,
+            size,
+            window.transparent,
+        )?;
+        self.presenter
+            .get_or_insert_with(|| present::Presenter::new(&self.device, self.shader_delivery));
+        Ok(Some(surface))
     }
 
     pub(crate) fn set_gpu_content(

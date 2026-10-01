@@ -94,9 +94,15 @@ fn an_eligible_external_frame_is_promoted_between_two_parts() {
 /// without one stays in the engine.
 #[test]
 fn only_candidates_are_promoted() {
-    let plan = plan::<Test>(&scene(), &FxHashMap::default());
-    assert!(plan.planes.is_empty());
-    assert_eq!(plan.parts(), 1);
+    let none = plan::<Test>(&scene(), &FxHashMap::default());
+    assert!(none.planes.is_empty());
+    assert_eq!(none.parts(), 1);
+    let video = plan::<Test>(&scene(), &video());
+    assert_eq!(
+        video.planes.iter().map(|p| p.layer).collect::<Vec<_>>(),
+        [VIDEO],
+        "eligible layers without an external frame stay in the engine"
+    );
 }
 
 /// With nothing painted after the plane, no part exists above it.

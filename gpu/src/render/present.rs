@@ -18,6 +18,7 @@ impl WindowSurface {
     /// # Errors
     /// [`SurfaceError::UnsupportedTarget`] when wgpu cannot create or the adapter
     /// cannot present to the window.
+    #[cfg(not(target_vendor = "apple"))]
     pub fn new(
         instance: &wgpu::Instance,
         adapter: &wgpu::Adapter,
@@ -29,6 +30,41 @@ impl WindowSurface {
         let surface = instance
             .create_surface(wgpu::SurfaceTarget::Window(handle))
             .map_err(|e| SurfaceError::UnsupportedTarget(format!("window surface: {e}")))?;
+        Self::configure(surface, adapter, device, size, transparent)
+    }
+
+    /// Creates and configures the swapchain of a metal layer the engine
+    /// owns (a plane surface's part).
+    ///
+    /// # Errors
+    /// [`SurfaceError::UnsupportedTarget`] when wgpu cannot create or the
+    /// adapter cannot present to the layer.
+    #[cfg(target_vendor = "apple")]
+    pub fn from_layer(
+        instance: &wgpu::Instance,
+        adapter: &wgpu::Adapter,
+        device: &wgpu::Device,
+        layer: &objc2_quartz_core::CAMetalLayer,
+        size: (u32, u32),
+        transparent: bool,
+    ) -> Result<Self, SurfaceError> {
+        // SAFETY: the layer is a live `CAMetalLayer`; the surface retains it.
+        let surface = unsafe {
+            instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::CoreAnimationLayer(
+                std::ptr::from_ref(layer).cast_mut().cast(),
+            ))
+        }
+        .map_err(|e| SurfaceError::UnsupportedTarget(format!("metal layer surface: {e}")))?;
+        Self::configure(surface, adapter, device, size, transparent)
+    }
+
+    fn configure(
+        surface: wgpu::Surface<'static>,
+        adapter: &wgpu::Adapter,
+        device: &wgpu::Device,
+        size: (u32, u32),
+        transparent: bool,
+    ) -> Result<Self, SurfaceError> {
         let caps = surface.get_capabilities(adapter);
         let format = caps
             .formats

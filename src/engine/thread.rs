@@ -19,6 +19,24 @@ use crate::resource::ResourceId;
 use crate::tree::SurfaceTree;
 use crate::{BackdropEffect, WorkingColor};
 
+/// Whether a surface's frames can ask the backend to present, and the
+/// pending presentation state when they can. Only a surface the backend
+/// reported as presenting carries the flag — a pending present cannot
+/// exist for an offscreen target (#98).
+enum Presentation {
+    /// The surface retains pixels; there is no swapchain to present to,
+    /// so a `Display` update never marks a present.
+    Retained,
+    /// The surface presents to a display; `pending` asks for a frame even
+    /// without `changed` — a headroom-only `Display` update reaches the
+    /// swapchain without touching the layer tree or any content cache.
+    Presenting {
+        /// Whether the surface's window should present without new
+        /// content.
+        pending: bool,
+    },
+}
+
 /// One surface's render-thread state.
 struct SurfaceState {
     tree: SurfaceTree,
@@ -28,10 +46,40 @@ struct SurfaceState {
     /// Whether a property op, a content op or an animation step touched the
     /// surface since the last render.
     changed: bool,
+    /// Whether the surface presents, and whether a present is pending (#98).
+    presentation: Presentation,
+    /// Whether the host announced the surface moved to another display
+    /// since the previous frame — the frame's `display_moved` (#98).
+    display_moved: bool,
     /// Whether the surface's recorded contents still run operand animations
     /// on the UI thread. The tracks live there; they need the next frame's
     /// sample at the fast rate class.
     content_animating: bool,
+}
+
+impl SurfaceState {
+    /// Whether the frame should ask the backend to present.
+    const fn present_pending(&self) -> bool {
+        matches!(
+            self.presentation,
+            Presentation::Presenting { pending: true }
+        )
+    }
+
+    /// Marks the next frame for presentation; a no-op on a retained
+    /// surface, which cannot hold the flag.
+    const fn mark_present(&mut self) {
+        if let Presentation::Presenting { pending } = &mut self.presentation {
+            *pending = true;
+        }
+    }
+
+    /// Consumes the pending present after a render.
+    const fn presented(&mut self) {
+        if let Presentation::Presenting { pending } = &mut self.presentation {
+            *pending = false;
+        }
+    }
 }
 
 /// A rejection the backend reported after the resource's handle was
@@ -275,6 +323,7 @@ pub fn run<B: Backend>(
                 destroy_surface::<B>(&mut renderer, &mut surfaces, &mut resources, id);
             }
             Message::Display { id, display } => set_display(&mut surfaces, id, display),
+            Message::DisplayMoved { id } => set_display_moved(&mut surfaces, id),
             Message::Resource(op) => op(&mut renderer),
             Message::Register { resource, op } => {
                 resources.register(resource, op(&mut renderer));
@@ -342,6 +391,12 @@ fn create_surface<B: Backend>(
             display: Display::default(),
             clear: WorkingColor::TRANSPARENT,
             changed: true,
+            presentation: if info.presents {
+                Presentation::Presenting { pending: false }
+            } else {
+                Presentation::Retained
+            },
+            display_moved: false,
             content_animating: false,
         },
     );
@@ -383,10 +438,28 @@ fn destroy_surface<B: Backend>(
 
 fn set_display(surfaces: &mut FxHashMap<SurfaceId, SurfaceState>, id: SurfaceId, display: Display) {
     if let Some(state) = surfaces.get_mut(&id) {
-        state.display = display;
-        state.changed = true;
+        if state.display != display {
+            // A scale change reshapes the content; a headroom-only update
+            // re-presents without touching it (#98). Only a presenting
+            // surface can be pending a present.
+            state.changed |= state.display.scale.to_bits() != display.scale.to_bits();
+            state.mark_present();
+            state.display = display;
+        }
     } else {
         tracing::trace!(surface = id.raw(), "display of unknown surface");
+    }
+}
+
+fn set_display_moved(surfaces: &mut FxHashMap<SurfaceId, SurfaceState>, id: SurfaceId) {
+    if let Some(state) = surfaces.get_mut(&id) {
+        // A move re-enumerates output negotiation, where a headroom-only
+        // `Display` update never does — and presents, since a
+        // reconfigured swapchain must be shown (#98).
+        state.display_moved = true;
+        state.mark_present();
+    } else {
+        tracing::trace!(surface = id.raw(), "display move of unknown surface");
     }
 }
 
@@ -548,6 +621,8 @@ fn render<B: Backend>(
             display: state.display,
             clear: state.clear,
             changed,
+            present_pending: state.present_pending(),
+            display_moved: state.display_moved,
             tree: &state.tree,
         });
     }
@@ -562,6 +637,8 @@ fn render<B: Backend>(
     )?;
     for state in surfaces.values_mut() {
         state.changed = false;
+        state.display_moved = false;
+        state.presented();
     }
     if let Redraw::Wanted { rate: backend_rate } = redraw {
         rate = Some(rate.map_or_else(
@@ -613,6 +690,8 @@ async fn render_local<B: Backend>(
             display: state.display,
             clear: state.clear,
             changed,
+            present_pending: state.present_pending(),
+            display_moved: state.display_moved,
             tree: &state.tree,
         });
     }
@@ -629,6 +708,8 @@ async fn render_local<B: Backend>(
         .await?;
     for state in surfaces.values_mut() {
         state.changed = false;
+        state.display_moved = false;
+        state.presented();
     }
     if let Redraw::Wanted { rate: backend_rate } = redraw {
         rate = Some(rate.map_or_else(
@@ -645,7 +726,7 @@ async fn render_local<B: Backend>(
 
 #[cfg(all(test, feature = "testing", not(target_arch = "wasm32")))]
 mod tests {
-    use super::{SurfaceState, commit};
+    use super::{Presentation, SurfaceState, commit};
     use crate::WorkingColor;
     use crate::backend::{Backend, Display};
     use crate::display_list::{Command, DisplayList, Picture};
@@ -672,6 +753,8 @@ mod tests {
             display: Display::default(),
             clear: WorkingColor::TRANSPARENT,
             changed: false,
+            presentation: Presentation::Retained,
+            display_moved: false,
             content_animating: false,
         };
 
@@ -758,6 +841,7 @@ impl<B: Backend> LocalState<B> {
                 destroy_surface::<B>(renderer, surfaces, resources, id);
             }
             Message::Display { id, display } => set_display(surfaces, id, display),
+            Message::DisplayMoved { id } => set_display_moved(surfaces, id),
             Message::Resource(op) => op(renderer),
             Message::Register { resource, op } => {
                 let result = op(renderer).await;

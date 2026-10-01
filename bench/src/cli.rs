@@ -69,15 +69,6 @@ pub(crate) enum PresentPattern {
     Mixed,
 }
 
-/// `present-cost --encode` choices; see [`crate::present_cost`].
-#[derive(Clone, Copy, Debug, clap::ValueEnum)]
-pub(crate) enum PresentEncode {
-    /// `Rgba8UnormSrgb` destination; hardware applies the transfer.
-    SrgbHw,
-    /// `Rgba8Unorm` destination; the shader applies the transfer.
-    SrgbShader,
-}
-
 #[derive(Subcommand)]
 enum Sub {
     /// Render scene(s) and report correctness metrics vs the oracle.
@@ -239,10 +230,11 @@ enum Sub {
         native: Option<String>,
     },
     /// Time the presentation pass alone — one `Presenter::texture_timed`
-    /// call per frame into an offscreen sRGB texture, bracketed by
-    /// pass-boundary GPU timestamps (#96). Requires the `cherenkov`
-    /// feature. On the M1 and iPad this is the gamut-map cost evidence;
-    /// on a shared VM it is a sanity check only.
+    /// call per frame into an offscreen texture of the `--present`
+    /// kind's format, bracketed by pass-boundary GPU timestamps (#96).
+    /// Requires the `cherenkov` feature. On the M1 and iPad this is the
+    /// gamut-map and encode cost evidence; on a shared VM it is a
+    /// sanity check only.
     PresentCost {
         /// Destination size, `WxH` — the iPad-class 2752x2064 by default.
         #[arg(long, default_value = "2752x2064", value_name = "WxH")]
@@ -257,9 +249,10 @@ enum Sub {
         /// in-gamut.
         #[arg(long, value_enum, default_value = "oog")]
         pattern: PresentPattern,
-        /// Encode path timed: hardware sRGB transfer or the shader one.
-        #[arg(long, value_enum, default_value = "srgb-hw")]
-        encode: PresentEncode,
+        /// Presentation output kind timed — the same kinds as
+        /// `render --present` (#98 added the wide-gamut and HDR kinds).
+        #[arg(long, value_enum, default_value = "srgb-hw", alias = "encode")]
+        present: crate::PresentKind,
         /// Display headroom presented to (#97). Above 1 exercises the
         /// tone-map shoulder on the `oog` pattern's HDR channels.
         #[arg(long, default_value_t = 4.0)]
@@ -469,7 +462,7 @@ fn run(cli: Cli) -> Result<(), BenchError> {
             frames,
             warmup,
             pattern,
-            encode,
+            present,
             headroom,
             out,
         } => present_cost_cmd(
@@ -477,7 +470,7 @@ fn run(cli: Cli) -> Result<(), BenchError> {
             frames,
             warmup,
             pattern,
-            encode,
+            present,
             headroom,
             &out,
         ),
@@ -493,12 +486,12 @@ fn present_cost_cmd(
     frames: u32,
     warmup: u32,
     pattern: PresentPattern,
-    encode: PresentEncode,
+    present: crate::PresentKind,
     headroom: f32,
     out: &Path,
 ) -> Result<(), BenchError> {
     let size = parse_native(Some(size))?.expect("size is required");
-    crate::present_cost::run(size, frames, warmup, pattern, encode, headroom, out)
+    crate::present_cost::run(size, frames, warmup, pattern, present, headroom, out)
 }
 
 #[cfg(not(feature = "cherenkov"))]
@@ -507,7 +500,7 @@ fn present_cost_cmd(
     _frames: u32,
     _warmup: u32,
     _pattern: PresentPattern,
-    _encode: PresentEncode,
+    _present: crate::PresentKind,
     _headroom: f32,
     _out: &Path,
 ) -> Result<(), BenchError> {
@@ -883,6 +876,64 @@ struct RenderOutput {
     heatmap: Vec<u8>,
 }
 
+/// The oracle's f64 image through the matching presentation function,
+/// quantized to the destination's storage and lifted back into the
+/// working space where both sides of the comparison live.
+fn present_reference(
+    kind: crate::PresentKind,
+    renderer: &Renderer,
+    scene: &Scene,
+    dir: &Path,
+) -> Result<cherenkov_oracle::F32Image, BenchError> {
+    use crate::PresentKind as K;
+    let image = renderer.render_image(scene, dir)?;
+    let headroom = scene.present_headroom;
+    let presented = match kind {
+        K::LinearP3 => cherenkov_oracle::present::present_linear_p3(headroom, &image),
+        K::SrgbHw | K::SrgbShader => cherenkov_oracle::present::present_srgb(headroom, &image),
+        K::DisplayP3Hw | K::DisplayP3Shader => {
+            cherenkov_oracle::present::present_display_p3(headroom, &image)
+        }
+        K::Scrgb => cherenkov_oracle::present::present_extended_srgb_linear(headroom, &image),
+        K::ExtendedSrgb => cherenkov_oracle::present::present_extended_srgb(headroom, &image),
+        K::ExtendedP3 => cherenkov_oracle::present::present_extended_display_p3(headroom, &image),
+        K::Pq => cherenkov_oracle::present::present_pq(headroom, &image),
+        K::Hlg => cherenkov_oracle::present::present_hlg(headroom, &image),
+    };
+    // The ideal presented image is what the destination stores: the
+    // unorm-8 kinds quantize the encoded channels so the metric measures
+    // the pass, not the format's floor.
+    let lift: fn([f64; 4]) -> [f64; 4] = match kind {
+        K::LinearP3 => |p| p,
+        K::SrgbHw | K::SrgbShader => cherenkov_oracle::present::presented_srgb_to_working,
+        K::DisplayP3Hw | K::DisplayP3Shader => {
+            cherenkov_oracle::present::presented_display_p3_to_working
+        }
+        K::Scrgb => |p| cherenkov_oracle::present::presented_extended_srgb_to_working(false, p),
+        K::ExtendedSrgb => {
+            |p| cherenkov_oracle::present::presented_extended_srgb_to_working(true, p)
+        }
+        K::ExtendedP3 => cherenkov_oracle::present::presented_extended_p3_to_working,
+        K::Pq => cherenkov_oracle::present::presented_pq_to_working,
+        K::Hlg => cherenkov_oracle::present::presented_hlg_to_working,
+    };
+    let unorm8 = matches!(
+        kind,
+        K::SrgbHw | K::SrgbShader | K::DisplayP3Hw | K::DisplayP3Shader
+    );
+    let stored = if unorm8 {
+        cherenkov_oracle::present::quantize_unorm8(&presented)
+    } else {
+        presented
+    };
+    let working = cherenkov_oracle::Image {
+        width: stored.width,
+        height: stored.height,
+        pixels: stored.pixels.iter().map(|&p| lift(p)).collect(),
+    };
+    Ok(cherenkov_oracle::F32Image::from_f64(&working))
+}
+
 fn render_scene(
     engine: &mut dyn Engine,
     dir: &Path,
@@ -892,43 +943,9 @@ fn render_scene(
     let scene = Scene::load(dir)?;
     let blobs = convert::load_blobs(&scene, dir)?;
     let renderer = Renderer::new(scene.width as usize, scene.height as usize);
-    // With `--present` the reference is the oracle's `f64` image through
-    // the matching presentation function — quantized to the destination's
-    // unorm-8 storage for the sRGB kinds — lifted back into the working
-    // space where the output was encoded.
     let reference = match present {
         None => renderer.render(&scene, dir)?,
-        Some(kind) => {
-            let image = renderer.render_image(&scene, dir)?;
-            let headroom = scene.present_headroom;
-            let presented = match kind {
-                crate::PresentKind::LinearP3 => {
-                    cherenkov_oracle::present::present_linear_p3(headroom, &image)
-                }
-                crate::PresentKind::SrgbHw | crate::PresentKind::SrgbShader => {
-                    cherenkov_oracle::present::present_srgb(headroom, &image)
-                }
-            };
-            let working = match kind {
-                crate::PresentKind::LinearP3 => presented,
-                crate::PresentKind::SrgbHw | crate::PresentKind::SrgbShader => {
-                    // The ideal presented image is what the u8 destination
-                    // stores: quantize the encoded channels so the metric
-                    // measures the pass, not the format's floor.
-                    let quantized = cherenkov_oracle::present::quantize_unorm8(&presented);
-                    cherenkov_oracle::Image {
-                        width: quantized.width,
-                        height: quantized.height,
-                        pixels: quantized
-                            .pixels
-                            .iter()
-                            .map(|&p| cherenkov_oracle::present::presented_srgb_to_working(p))
-                            .collect(),
-                    }
-                }
-            };
-            cherenkov_oracle::F32Image::from_f64(&working)
-        }
+        Some(kind) => present_reference(kind, &renderer, &scene, dir)?,
     };
     let input = EncodeInput {
         scene: &scene,

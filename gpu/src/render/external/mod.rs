@@ -24,9 +24,6 @@ pub const KIND_NV12: u32 = 1;
 /// Params kind byte: 16-bit padded two-plane 4:2:0 (P010 semantics).
 pub const KIND_P010: u32 = 2;
 
-/// `Params::info.w` bit: swap the R and B samples of an RGB plane
-/// (`Bgra8Unorm`).
-const FLAG_BGR: u32 = 1 << 0;
 /// `Params::info.w` bit: strip the low six padding bits of a P010 code
 /// before normalization.
 const FLAG_SHIFT6: u32 = 1 << 1;
@@ -161,12 +158,13 @@ fn rgb_to_xyz(primaries: Primaries) -> [[f32; 3]; 3] {
     out
 }
 
-/// The absolute-to-white-relative scale of a transfer: PQ decodes to nits,
-/// HLG's OOTF yields scene-linear scaled to `hlg_peak` nits; relative
-/// transfers already reach 1.0 at reference white.
+/// The absolute-to-white-relative scale of a transfer: PQ decodes to a
+/// fraction of 10000 nits and HLG's OOTF yields scene-linear scaled to
+/// `hlg_peak` nits, so both carry an absolute level; relative transfers
+/// already reach 1.0 at reference white.
 fn value_scale(color: &crate::interop::FrameColor) -> f32 {
     match color.transfer {
-        Transfer::Pq => 1.0 / color.reference_white,
+        Transfer::Pq => 10_000.0 / color.reference_white,
         Transfer::Hlg => color.hlg_peak / color.reference_white,
         _ => 1.0,
     }
@@ -188,17 +186,12 @@ fn plane_contract(frame: &ExternalFrame) -> (u32, u32, u32, wgpu::Extent3d, wgpu
             (kind, 0, shift, y.size(), uv.size())
         }
         FramePlanes::Rgb { plane, alpha } => {
-            let bgr = if plane.format() == wgpu::TextureFormat::Bgra8Unorm {
-                FLAG_BGR
-            } else {
-                0
-            };
             let alpha = match alpha {
                 RgbAlpha::Opaque => 0,
                 RgbAlpha::Straight => 1,
                 RgbAlpha::Premultiplied => 2,
             };
-            (KIND_RGB, alpha, bgr, plane.size(), plane.size())
+            (KIND_RGB, alpha, 0, plane.size(), plane.size())
         }
         #[cfg(all(unix, not(target_vendor = "apple")))]
         FramePlanes::Native(frame) => {

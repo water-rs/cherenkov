@@ -158,6 +158,8 @@ pub struct WindowTarget {
     size: (u32, u32),
     transparent: bool,
     refresh: cherenkov::RefreshRange,
+    required_color_space: Option<wgpu::SurfaceColorSpace>,
+    probe: Option<std::sync::mpsc::Sender<interop::DisplayProbe>>,
 }
 
 impl WindowTarget {
@@ -169,6 +171,8 @@ impl WindowTarget {
             size,
             transparent: false,
             refresh: cherenkov::DEFAULT_REFRESH,
+            required_color_space: None,
+            probe: None,
         }
     }
 
@@ -180,6 +184,30 @@ impl WindowTarget {
     pub const fn transparent(mut self, transparent: bool) -> Self {
         self.transparent = transparent;
         self
+    }
+
+    /// Requires the swapchain's colour space (#98). Without it the engine
+    /// negotiates the surface's best advertised pair — an extended or HDR
+    /// space where offered, otherwise a reported SDR selection. With it,
+    /// surface creation fails with [`SurfaceError::UnsupportedTarget`]
+    /// when no format is advertised for the space.
+    ///
+    /// [`SurfaceError::UnsupportedTarget`]: cherenkov::SurfaceError::UnsupportedTarget
+    #[must_use]
+    pub const fn require_color_space(mut self, color_space: wgpu::SurfaceColorSpace) -> Self {
+        self.required_color_space = Some(color_space);
+        self
+    }
+
+    /// Registers a channel that receives the surface's
+    /// [`interop::DisplayProbe`] at creation. The host samples the probe
+    /// on the main thread — required on Apple — and feeds the reported
+    /// headroom back through
+    /// [`Surface::display`](cherenkov::Surface::display).
+    pub fn output_probe(&mut self) -> std::sync::mpsc::Receiver<interop::DisplayProbe> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        self.probe = Some(sender);
+        receiver
     }
 
     /// Sets the refresh range for backend animation and presentation retries.

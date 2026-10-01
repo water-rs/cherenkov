@@ -420,6 +420,7 @@ dependencies = [
  "futures-util",
  "gloo-timers",
  "half",
+ "js-sys",
  "kurbo",
  "libc",
  "libm",
@@ -436,6 +437,7 @@ dependencies = [
  "skrifa 0.44.0",
  "thiserror 2.0.21",
  "tracing",
+ "wasm-bindgen",
  "wasm-bindgen-test",
  "wgpu 30.0.1",
 ]

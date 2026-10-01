@@ -1,0 +1,262 @@
+{
+  "width": 256,
+  "height": 256,
+  "working_space": "linear-display-p3",
+  "clear": {
+    "space": "srgb",
+    "components": [
+      0.95,
+      0.95,
+      0.95,
+      1.0
+    ]
+  },
+  "present_headroom": 4.0,
+  "features": [
+    {
+      "feature": "fill"
+    },
+    {
+      "feature": "linear-gradient"
+    },
+    {
+      "feature": "clip"
+    },
+    {
+      "feature": "hdr-color"
+    },
+    {
+      "feature": "wide-gamut"
+    },
+    {
+      "feature": "interpolation-space",
+      "value": "linear-p3"
+    },
+    {
+      "feature": "backdrop"
+    },
+    {
+      "feature": "backdrop-blur"
+    }
+  ],
+  "backdrop_groups": [
+    {
+      "id": 1,
+      "filters": [
+        {
+          "filter": "gaussian-blur",
+          "value": {
+            "sigma": 6.0
+          }
+        }
+      ]
+    }
+  ],
+  "root": {
+    "transform": [
+      1.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0
+    ],
+    "opacity": 1.0,
+    "blend": "normal",
+    "items": [
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rect": {
+                "x0": 0.0,
+                "y0": 0.0,
+                "x1": 256.0,
+                "y1": 256.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "linear": {
+                "start": {
+                  "x": 0.0,
+                  "y": 0.0
+                },
+                "end": {
+                  "x": 256.0,
+                  "y": 256.0
+                },
+                "stops": [
+                  {
+                    "offset": 0.0,
+                    "color": {
+                      "space": "linear-p3",
+                      "components": [
+                        0.05,
+                        0.1,
+                        0.3,
+                        1.0
+                      ]
+                    }
+                  },
+                  {
+                    "offset": 1.0,
+                    "color": {
+                      "space": "linear-p3",
+                      "components": [
+                        0.45,
+                        0.12,
+                        0.05,
+                        1.0
+                      ]
+                    }
+                  }
+                ],
+                "extend": "pad",
+                "interpolation": "linear-p3"
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "circle": {
+                "center": {
+                  "x": 96.0,
+                  "y": 96.0
+                },
+                "radius": 48.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "linear-p3",
+                "components": [
+                  4.0,
+                  1.0,
+                  0.5,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "draw": {
+          "fill": {
+            "shape": {
+              "rect": {
+                "x0": 140.0,
+                "y0": 120.0,
+                "x1": 376.0,
+                "y1": 310.0
+              }
+            },
+            "rule": "non-zero",
+            "paint": {
+              "solid": {
+                "space": "rec2020",
+                "components": [
+                  0.9,
+                  0.15,
+                  0.6,
+                  1.0
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "layer": {
+          "transform": [
+            1.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0
+          ],
+          "clip": {
+            "rounded-rect": {
+              "rect": {
+                "x0": 40.0,
+                "y0": 40.0,
+                "x1": 216.0,
+                "y1": 216.0
+              },
+              "radii": {
+                "top_left": 28.0,
+                "top_right": 28.0,
+                "bottom_right": 28.0,
+                "bottom_left": 28.0
+              }
+            }
+          },
+          "opacity": 1.0,
+          "blend": "normal",
+          "backdrop": 1,
+          "items": [
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rect": {
+                      "x0": 48.0,
+                      "y0": 52.0,
+                      "x1": 256.0,
+                      "y1": 128.0
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "solid": {
+                      "space": "linear-p3",
+                      "components": [
+                        4.0,
+                        4.0,
+                        4.0,
+                        0.5
+                      ]
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "draw": {
+                "fill": {
+                  "shape": {
+                    "rect": {
+                      "x0": 42.0,
+                      "y0": 42.0,
+                      "x1": 214.0,
+                      "y1": 214.0
+                    }
+                  },
+                  "rule": "non-zero",
+                  "paint": {
+                    "solid": {
+                      "space": "srgb",
+                      "components": [
+                        1.0,
+                        1.0,
+                        1.0,
+                        0.1
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

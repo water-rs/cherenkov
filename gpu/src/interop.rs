@@ -1,7 +1,10 @@
 //! Device sharing and presentation of the engine's retained working-space output.
 
 pub use crate::render::filter::EffectBox;
-pub use crate::render::present::{OutputAlpha, OutputColor, Presenter, TextureOutput};
+pub use crate::render::present::{
+    DestinationPrimaries, DisplayProbe, OutputAlpha, OutputColor, OutputSelection, Presenter,
+    SelectionReason, TextureOutput, TransferEncoding,
+};
 pub use crate::render::shaders::{ShaderDelivery, delivery as shader_delivery};
 use std::future::Future;
 use std::sync::Arc;
@@ -767,5 +770,260 @@ pub mod metal {
                 wgpu::wgt::TextureUses::RESOURCE,
             )
         }
+    }
+}
+
+/// Browser interop: importing foreign `GPUTexture`s onto the shared device.
+///
+/// A producer on the owning JS thread — a video element, a web view, another
+/// wgpu or dawn client — holds a `GPUTexture` it wants sampled as an
+/// [`ExternalFrame`](super::ExternalFrame) RGB plane without a copy.
+/// [`import_texture`] wraps the handle through
+/// `wgpu::Device::create_texture_from_webgpu_handle`, validates the provider
+/// contract by reflection, and ties the producer's lease to the wrapper's
+/// retirement so it is returned only after retained and submitted uses have
+/// finished.
+///
+/// Everything here stays on the JS thread that owns the objects: the engine's
+/// local executor runs the future, the wrapper's drop callback runs on the
+/// same thread, and nothing is boxed behind an unsafe `Send`.
+#[cfg(target_arch = "wasm32")]
+pub mod web {
+    use super::{InvalidFrame, wgpu};
+    use wasm_bindgen::JsCast;
+    use wgpu::webgpu;
+
+    /// A foreign `GPUTexture` offered for retained, zero-copy import.
+    ///
+    /// `texture` is the producer's `GPUTexture` handle — a
+    /// `web_sys::GpuTexture` from the producer's own `web-sys` dependency
+    /// wraps the same JS object as `wgpu::webgpu::GpuTexture`; convert with
+    /// `wasm_bindgen::JsCast::unchecked_into`. `device` is the `GPUDevice`
+    /// that created it, supplied as the identity token for the owning-device
+    /// check. `release` is the producer's lease hook, run exactly once when
+    /// the engine is done with the texture.
+    ///
+    /// The provider contract: `texture` must be a live, single-sample 2D
+    /// `GPUTexture` with one mip level, `TEXTURE_BINDING` usage and a format
+    /// the RGB plane role accepts (`rgba8unorm`, `bgra8unorm` or
+    /// `rgba16float`), created on `device`, with contents immutable and
+    /// lifetime guaranteed through every retained and in-flight use —
+    /// including submissions already on the queue, which the WebGPU
+    /// implementation keeps alive while they execute.
+    ///
+    /// Sources that cannot meet that contract are rejected, never copied: a
+    /// `GPUExternalTexture`, or a producer that cannot promise immutable
+    /// storage for the lease period. Transient handles such as a context's
+    /// current canvas texture cannot be detected — they satisfy every
+    /// reflected check — so they are excluded by the contract and must not
+    /// be offered.
+    pub struct WebTexture {
+        /// The producer's `GPUTexture` handle.
+        pub texture: webgpu::GpuTexture,
+        /// The `GPUDevice` that created `texture`.
+        pub device: webgpu::GpuDevice,
+        /// The producer's release hook; see [`WebTextureLease`].
+        pub release: WebTextureLease,
+    }
+
+    /// The producer's ownership handoff for one imported texture.
+    ///
+    /// The hook always runs exactly once after [`import_texture`] consumes
+    /// the lease: immediately on rejection, or when the returned
+    /// `wgpu::Texture`'s last clone is dropped — engine slot replacement,
+    /// detach, surface or engine teardown. It is the producer's single
+    /// disposal point; typical bodies destroy the texture or return it to a
+    /// pool. While the lease is outstanding the producer must keep the
+    /// texture alive and immutable.
+    pub struct WebTextureLease(Box<dyn FnOnce() + 'static>);
+
+    impl WebTextureLease {
+        /// A lease released by `release`.
+        pub fn new(release: impl FnOnce() + 'static) -> Self {
+            Self(Box::new(release))
+        }
+        /// The hook installed as the wgpu wrapper's drop callback.
+        fn into_callback(self) -> webgpu::DropCallback {
+            self.0
+        }
+        /// Rejection: the hook runs now rather than at retirement.
+        fn fire(self) {
+            (self.0)();
+        }
+    }
+
+    /// Why a [`WebTexture`] was rejected.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+    pub enum InvalidWebTexture {
+        /// `texture` is not a `GPUTexture` — a `GPUExternalTexture`, an
+        /// ordinary `GPUTextureView`, or any other handle.
+        #[error("the handle is not a GPUTexture")]
+        NotATexture,
+        /// `device` is not the `GPUDevice` the engine's `wgpu::Device` wraps.
+        #[error("the texture's device token is not the shared GPUDevice")]
+        DeviceMismatch,
+        /// The engine's `wgpu::Device` is not backed by WebGPU.
+        #[error("the engine device is not a WebGPU device")]
+        NotWebGpu,
+        /// The texture violates the shared plane contract (format,
+        /// geometry, dimensions or usage).
+        #[error(transparent)]
+        Contract(#[from] InvalidFrame),
+        /// A submission referencing the texture failed validation: the
+        /// texture was destroyed, belongs to another device than its token
+        /// claims, or is otherwise unusable for retained sampling.
+        #[error("the texture cannot be used in a submission on this device")]
+        Unusable,
+    }
+
+    /// A reflected `GPUTexture` attribute.
+    fn attr(texture: &webgpu::GpuTexture, name: &str) -> wasm_bindgen::JsValue {
+        js_sys::Reflect::get(texture.as_ref(), &name.into()).unwrap_or_default()
+    }
+
+    /// The reflected provider contract, checked before any wrap:
+    /// `(format, size, usage)` for the wrapper's descriptor. The device
+    /// token must identify the `GPUDevice` that created the texture —
+    /// a wrong-token lie is caught by the submission probe, since the
+    /// token is the only device identity JavaScript exposes.
+    fn contract(
+        gpu_device: Option<&webgpu::GpuDevice>,
+        texture: &webgpu::GpuTexture,
+        token: &webgpu::GpuDevice,
+    ) -> Result<(wgpu::TextureFormat, wgpu::Extent3d, u32), InvalidWebTexture> {
+        let gpu_device = gpu_device.ok_or(InvalidWebTexture::NotWebGpu)?;
+        if !texture.has_type::<webgpu::GpuTexture>() {
+            return Err(InvalidWebTexture::NotATexture);
+        }
+        if !js_sys::Object::is(gpu_device.as_ref(), token.as_ref()) {
+            return Err(InvalidWebTexture::DeviceMismatch);
+        }
+        let format = match attr(texture, "format").as_string().as_deref() {
+            Some("rgba8unorm") => wgpu::TextureFormat::Rgba8Unorm,
+            Some("bgra8unorm") => wgpu::TextureFormat::Bgra8Unorm,
+            Some("rgba16float") => wgpu::TextureFormat::Rgba16Float,
+            _ => return Err(InvalidFrame::PlaneFormat.into()),
+        };
+        let size = wgpu::Extent3d {
+            width: texture.width(),
+            height: texture.height(),
+            depth_or_array_layers: 1,
+        };
+        if attr(texture, "dimension").as_string().as_deref() != Some("2d")
+            || texture.depth_or_array_layers() != 1
+            || texture.mip_level_count() != 1
+            || texture.sample_count() != 1
+        {
+            return Err(InvalidFrame::PlaneGeometry.into());
+        }
+        if size.width == 0 || size.height == 0 {
+            return Err(InvalidFrame::PlaneDimensions.into());
+        }
+        let usage = texture.usage();
+        if usage & wgpu::TextureUsages::TEXTURE_BINDING.bits() == 0 {
+            return Err(InvalidFrame::PlaneUsage.into());
+        }
+        Ok((format, size, usage))
+    }
+
+    /// Wraps a foreign `GPUTexture` on the engine's device for use as an
+    /// [`ExternalFrame`](super::ExternalFrame) RGB plane.
+    ///
+    /// The handle is wrapped once, in place, through
+    /// `Device::create_texture_from_webgpu_handle`: no pixels upload, no
+    /// copy runs and no conversion texture is allocated. Cloning the
+    /// returned texture shares the one wrapper — and the one lease — across
+    /// layer attachments; the lease's release hook runs when the last clone
+    /// is dropped, after every retained and submitted use has finished.
+    ///
+    /// The provider contract is validated by reflection (format, size,
+    /// usage, mip and sample count, owning device token) and by a
+    /// submission probe: an empty pass bound to the wrapper inside a
+    /// validation error scope is the only place a destroyed or cross-device
+    /// `GPUTexture` provably errors, since JavaScript exposes no liveness
+    /// flag and creation-time calls accept destroyed textures. A rejection
+    /// releases the lease before returning.
+    ///
+    /// `queue` must be the engine's submission queue, so the probe orders
+    /// behind the producer's pending work on the same device.
+    ///
+    /// # Errors
+    /// [`InvalidWebTexture`] when the provider contract fails or the texture
+    /// proves unusable in a submission; the lease's release hook has already
+    /// run by the time the error is returned.
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
+    pub async fn import_texture(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        source: WebTexture,
+    ) -> Result<wgpu::Texture, InvalidWebTexture> {
+        let WebTexture {
+            texture,
+            device: token,
+            release,
+        } = source;
+        let (format, size, usage) = match contract(device.as_webgpu(), &texture, &token) {
+            Ok(reflected) => reflected,
+            Err(error) => {
+                release.fire();
+                return Err(error);
+            }
+        };
+        let wrapped = device.create_texture_from_webgpu_handle(
+            texture,
+            &wgpu::TextureDescriptor {
+                label: Some("external frame plane"),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::from_bits_retain(usage),
+                view_formats: &[],
+            },
+            Some(release.into_callback()),
+        );
+        let probe_error = {
+            let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("external frame probe"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                }],
+            });
+            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("external frame probe"),
+                layout: &layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(
+                        &wrapped.create_view(&wgpu::TextureViewDescriptor::default()),
+                    ),
+                }],
+            });
+            let mut encoder =
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+                pass.set_bind_group(0, &group, &[]);
+            }
+            queue.submit([encoder.finish()]);
+            scope.pop().await
+        };
+        if probe_error.is_some() {
+            drop(wrapped);
+            return Err(InvalidWebTexture::Unusable);
+        }
+        Ok(wrapped)
     }
 }

@@ -114,7 +114,8 @@ pub trait Renderer: 'static {
   ```rust
   pub struct Frame<'a> { pub id: FrameId, pub time: FrameTime, pub surfaces: &'a [SurfaceFrame<'a>] }
   pub struct SurfaceFrame<'a> { pub id: SurfaceId, pub size: (u32, u32), pub display: Display,
-                                pub clear: WorkingColor, pub changed: bool, pub tree: &'a SurfaceTree }
+                                pub clear: WorkingColor, pub changed: bool, pub present_pending: bool,
+                                pub display_moved: bool, pub tree: &'a SurfaceTree }
   impl SurfaceTree { pub fn root(&self) -> LayerId; pub fn layer(&self, id: LayerId) -> &LayerNode; }
   pub struct LayerNode { /* sampled for this frame: */ pub transform: Affine, pub opacity: f32,
                          pub scroll_offset: Vec2, pub clip: Option<ShapeData>, pub blend: BlendMode,
@@ -230,7 +231,8 @@ let panel = engine.surface(Bands::new(size, OffscreenFormat::LinearF16, |band| d
 
 - **System-compositor parents.** Targets that expose one (`CALayer`, `SurfaceControl`, a DirectComposition visual, a Wayland subsurface) let the engine build **planes**. Most layers are composited inside the engine onto one plane. Eligible layers are promoted automatically to their own system layers: video frames, custom GPU content and large stable layers. A layer is not promoted when it is under a backdrop, uses a non-default blend or has a clip the system cannot express. Hardware overlay budgets also limit promotion.
 - **Many small surfaces are first-class.** A native backend embeds one surface per self-drawn component, and a list may hold dozens. All surfaces share the engine's pipelines, atlases and caches. Creating and dropping one is cheap. All dirty surfaces render in one submission per frame.
-- **Display properties.** Headroom and scale belong to the display, so the host sets them when they change: `surface.display(Display { headroom, scale })`. Presentation reads `headroom` every frame — a headroom change takes effect on the next frame and never re-lowers or re-records content.
+- **Display properties.** Headroom and scale belong to the display, so the host sets them when they change: `surface.display(Display { headroom, scale })`. Presentation reads `headroom` every frame — a headroom change takes effect on the next frame and never re-lowers or re-records content. A move to another display is announced separately as `surface.display_moved()` — a move between numerically identical displays is invisible in `Display`'s values — and it rides the next frame as `SurfaceFrame::display_moved` so a presenting backend re-enumerates the surface's capabilities where a headroom-only update never does (#98).
+- **Window output is negotiated, never defaulted.** A window surface selects its swapchain format and colour space from the surface's advertised format/colour-space pairs through wgpu 30's surface colour-space API — an extended-range pair where offered, a wide-gamut SDR pair, else tone-mapped sRGB — and reports the choice and its reason in `OutputSelection`; a silent sRGB fallback does not exist (#98). `WindowTarget::require_color_space` pins a required `wgpu::SurfaceColorSpace`: a surface that cannot advertise it fails creation with `UnsupportedTarget` rather than substituting. `WindowTarget::output_probe` hands the host a `DisplayProbe` — sampled on the main thread on Apple — whose `tone_map_headroom` feeds `Display::headroom` for live EDR and whose `selection()` answers what a hypothetical move would negotiate. The current negotiation is readable at `WindowSurface::selection`.
 
 ## Frame driving
 
@@ -525,6 +527,48 @@ tx[&sparks].content(GpuContentHandle::new(Particles::new()));
 - **The engine does YUV conversion and tone mapping** for external frames when it composites them itself.
 - **Custom GPU content composites like any other layer:** it can be clipped, filtered, animated and used as a backdrop source.
 - **The map records `Content`, not `GpuContent`.** Each tile is a frozen `Picture` and the camera is the layer transform, so pinch-zoom and fling run in the engine. Tessellation is refreshed at the new zoom level once the gesture settles.
+
+### Importing a foreign texture
+
+Each backend wraps a foreign texture once, in place, into a `wgpu::Texture`
+ready for `ExternalFrame::rgb` (or a YUV role it accepts): no pixel upload,
+no copy, no conversion texture.
+
+```rust
+// Metal (apple): an MTLTexture — typically IOSurface- or CVPixelBuffer-
+// backed — wraps through wgpu-hal; the caller keeps ownership and lifetime.
+let plane = unsafe {
+    interop::metal::import_texture(&device, mtl_texture, format)
+};
+
+// WebGPU (wasm32): a foreign GPUTexture wraps through
+// Device::create_texture_from_webgpu_handle after a reflected contract
+// check and a submission probe.
+let plane = interop::web::import_texture(&device, &queue, interop::web::WebTexture {
+    texture: gpu_texture,   // the producer's GPUTexture handle
+    device: gpu_device,     // the GPUDevice that created it (identity token)
+    release: interop::web::WebTextureLease::new(move || pool.retire(id)),
+}).await?;
+```
+
+- **`interop::metal::import_texture` is `unsafe`.** The `MTLTexture` must be
+  live on the same `MTLDevice` the engine wraps (or its peer group), `format`
+  must be byte-compatible with its pixel format, and the texture must stay
+  alive and unwritten — except by the producer — for as long as a frame
+  referencing it can be in flight.
+- **`interop::web::import_texture` validates the provider contract** by
+  reflection — an actual `GPUTexture` (a `GPUExternalTexture` is
+  `InvalidWebTexture::NotATexture`), the owning-device token
+  (`DeviceMismatch`), `rgba8unorm`/`bgra8unorm`/`rgba16float`, single-sample
+  2D, one mip, `TEXTURE_BINDING` (`Contract(InvalidFrame)`) — and by a
+  submission probe that catches destroyed or cross-device textures
+  (`Unusable`). The lease's release hook runs exactly once: at rejection,
+  or when the wrapper's last clone is dropped — slot replacement, detach,
+  surface or engine teardown.
+- **A transient handle cannot be detected.** A context's current canvas
+  texture satisfies every check but is recycled by the browser; it is
+  excluded by the provider contract — immutable contents and guaranteed
+  lifetime through retained and in-flight use — and must not be offered.
 
 ## Damage (invisible)
 

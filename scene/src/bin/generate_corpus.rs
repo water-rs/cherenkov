@@ -2714,6 +2714,142 @@ fn run() -> Result<(), SceneError> {
         );
     }
 
+    // ---- #98 presentation corpus ------------------------------------------
+    // The content every `render --present` encoding (P3, scRGB, extended
+    // sRGB/P3, PQ, HLG) must carry: neutral values 0/0.18/1/2/4/8, P3
+    // colours outside sRGB, negative extended components, transparent
+    // coloured edges, and a glass highlight above SDR white. The headroom
+    // sequence 4→2→1→4 is display state, not scene content — cherenkov's
+    // `headroom_updates_present_without_regenerating_content` test covers
+    // it. Declared headroom 4 exercises the HDR tone-map branch.
+    corpus.scene_headroom("present-neutrals", 196, 44, white, 4.0, |l| {
+        for (i, v) in [0.0f32, 0.18, 1.0, 2.0, 4.0, 8.0].into_iter().enumerate() {
+            let x = 4.0 + 32.0 * f64::from(u32::try_from(i).unwrap());
+            l.fill(Shape::rect(x, 4.0, 28.0, 36.0), solid(hdr(v, v, v)));
+        }
+    });
+
+    corpus.scene_headroom("present-p3-outside-srgb", 100, 100, white, 4.0, |l| {
+        for (i, swatch) in [
+            p3(1.0, 0.0, 0.0),
+            p3(0.0, 1.0, 0.0),
+            p3(0.0, 0.0, 1.0),
+            p3(0.0, 1.0, 0.4),
+            p3(1.0, 0.0, 0.6),
+            p3(1.0, 0.6, 0.0),
+            p3(0.0, 0.9, 0.9),
+            p3(0.6, 0.0, 1.0),
+            p3(0.2, 1.0, 0.2),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let x = 4.0 + 32.0 * f64::from(u32::try_from(i % 3).unwrap());
+            let y = 4.0 + 32.0 * f64::from(u32::try_from(i / 3).unwrap());
+            l.fill(Shape::rect(x, y, 28.0, 28.0), solid(swatch));
+        }
+    });
+
+    corpus.scene_headroom("present-extended-negatives", 100, 68, white, 4.0, |l| {
+        for (i, swatch) in [
+            Color::new(ColorSpace::LinearP3, [-0.3, 0.7, 0.4, 1.0]),
+            Color::new(ColorSpace::LinearP3, [0.1, -0.15, 0.3, 1.0]),
+            Color::new(ColorSpace::LinearP3, [1.2, -0.05, 0.5, 1.0]),
+            Color::new(ColorSpace::LinearP3, [-0.2, -0.2, 1.0, 1.0]),
+            Color::new(ColorSpace::LinearP3, [0.5, 0.5, -0.1, 1.0]),
+            Color::new(ColorSpace::LinearP3, [-0.05, 2.0, -0.05, 1.0]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let x = 4.0 + 32.0 * f64::from(u32::try_from(i % 3).unwrap());
+            let y = 4.0 + 32.0 * f64::from(u32::try_from(i / 3).unwrap());
+            l.fill(Shape::rect(x, y, 28.0, 28.0), solid(swatch));
+        }
+    });
+
+    // Fractional-alpha wide-gamut fills: the anti-aliased edges are the
+    // transparent coloured edges the premultiply/encode order must carry.
+    corpus.scene_headroom(
+        "present-transparent-edges",
+        96,
+        96,
+        srgb(0.06, 0.06, 0.09),
+        4.0,
+        |l| {
+            l.fill(
+                Shape::circle(30.0, 30.0, 22.0),
+                solid(Color::new(ColorSpace::LinearP3, [1.0, 0.1, 0.3, 0.5])),
+            );
+            l.fill(
+                Shape::circle(66.0, 30.0, 22.0),
+                solid(Color::new(ColorSpace::LinearP3, [0.0, 1.0, 0.5, 0.25])),
+            );
+            l.fill(
+                Shape::rounded_rect(12.0, 56.0, 52.0, 90.0, 8.0),
+                solid(Color::new(ColorSpace::LinearP3, [0.2, 0.4, 1.0, 0.75])),
+            );
+            l.layer(|m| {
+                m.transform(Affine::rotate_about(0.4, Point::new(76.0, 72.0)));
+                m.fill(
+                    Shape::rect(60.0, 56.0, 92.0, 88.0),
+                    solid(Color::new(ColorSpace::LinearP3, [2.0, 1.4, 0.4, 0.6])),
+                );
+            });
+        },
+    );
+
+    // "Glass": a blurred backdrop panel over HDR content whose specular
+    // highlight sits above SDR white — the transparency edge case for
+    // every encoded output.
+    let mut glass = Scene::builder(256, 256).clear(white).present_headroom(4.0);
+    glass.backdrop_group(1, vec![BackdropFilter::GaussianBlur { sigma: 6.0 }]);
+    corpus.scene_from(
+        "present-glass-highlights",
+        glass,
+        |l| {
+            l.fill(
+                Shape::rect(0.0, 0.0, 256.0, 256.0),
+                Paint::Linear(LinearGradient {
+                    start: Point::new(0.0, 0.0),
+                    end: Point::new(256.0, 256.0),
+                    stops: vec![
+                        GradientStop {
+                            offset: 0.0,
+                            color: p3(0.05, 0.10, 0.30),
+                        },
+                        GradientStop {
+                            offset: 1.0,
+                            color: p3(0.45, 0.12, 0.05),
+                        },
+                    ],
+                    extend: Extend::Pad,
+                    interpolation: ColorSpace::LinearP3,
+                }),
+            );
+            l.fill(Shape::circle(96.0, 96.0, 48.0), solid(hdr(4.0, 1.0, 0.5)));
+            l.fill(
+                Shape::rect(140.0, 120.0, 236.0, 190.0),
+                solid(Color::new(ColorSpace::Rec2020, [0.9, 0.15, 0.6, 1.0])),
+            );
+            l.layer(|m| {
+                let clip = Shape::RoundedRect(RoundedRect::new(40.0, 40.0, 216.0, 216.0, 28.0));
+                m.clip(clip);
+                m.backdrop(1);
+                // The specular strip: translucent white at 4x SDR white.
+                m.fill(
+                    Shape::rect(48.0, 52.0, 208.0, 76.0),
+                    solid(Color::new(ColorSpace::LinearP3, [4.0, 4.0, 4.0, 0.5])),
+                );
+                m.fill(
+                    Shape::rect(42.0, 42.0, 172.0, 172.0),
+                    solid(srgba(1.0, 1.0, 1.0, 0.1)),
+                );
+            });
+        },
+        Vec::new(),
+    );
+
     // Blend modes over P3 and HDR content, same geometry as `blend-*`.
     for mode in BlendMode::ALL {
         let mname = serde_json::to_value(mode)

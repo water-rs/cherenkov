@@ -166,12 +166,19 @@ jobs:
       - name: Bench adapter tests (cherenkov, cherenkov-cpu)
         run: cargo nextest run --locked -p cherenkov-bench --features cherenkov,cherenkov-cpu --no-tests=pass
       - run: cargo build --locked --release -p cherenkov-bench --features vello-cpu,skia
+      # The oracle reference depends only on the scene; build it once for
+      # both passes below (#218).
+      - name: Render the corpus reference
+        run: |
+          ./target/release/cherenkov-bench reference \
+            --corpus scenes/corpus --out-dir out/reference
       - name: Render the corpus on CPU adapters
         run: |
           set -euo pipefail
           for engine in vello-cpu skia-cpu; do
             ./target/release/cherenkov-bench render --engine "$engine" \
-              --corpus scenes/corpus --out-dir "out/$engine"
+              --corpus scenes/corpus --out-dir "out/$engine" \
+              --reference out/reference
           done
           python3 - <<'PY'
           import glob, json, sys

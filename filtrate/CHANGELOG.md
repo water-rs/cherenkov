@@ -42,6 +42,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `FilterImage` and `LutImage` move to the crate root.
 - **Breaking:** `Vignette` is a spatial filter with a zero footprint, since
   it depends on the pixel's position.
+- `EffectSetupError::InputNotFilterable` says the effect samples its input
+  with a filtering sampler instead of naming the first stage, since a
+  `ShaderEffect` raises it too.
 - **Breaking:** `#[derive(Filter)]` takes `color` with `linear = <bool>` and
   an optional `cpu = <path>`, or `spatial` with `footprint = <f32>` or
   `footprint_fn = <path>` and an optional `shape`; both accept `space` and
@@ -58,6 +61,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Executor::footprint` bounds a spatial chain's footprint over its running
   animations, through `AnimationTrack::magnitude_bound` and
   `Interpolator::bounds`.
+- `ShaderEffect` runs an application-supplied WGSL fragment shader over an
+  effect's input (a terminal's custom shader, a scanline or CRT pass). Its
+  prelude declares `input_texture`, `input_sampler`, `uniforms` (output and
+  input resolution, time, time delta, frame, parameter count, parameters) and
+  `effect_param(i)`. `ShaderEffect::new` parses and validates the module at
+  construction and returns a `ShaderEffectError` (`Parse`, `Validation`,
+  `MissingEntryPoint`) with diagnostics in the application's own line
+  numbers. Parameters are constant (`param`) or reactive (`watch_param`,
+  which returns the subscription's `WatchGuard` to the caller), up to
+  `SHADER_EFFECT_MAX_PARAMS`; `animated()` keeps the host drawing. The effect
+  is `Send` and records into the host's shared encoder.
 
 ## [0.2.1](https://github.com/water-rs/filtrate/compare/v0.2.0...v0.2.1) - 2026-09-13
 

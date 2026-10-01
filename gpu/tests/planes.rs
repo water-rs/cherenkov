@@ -309,6 +309,28 @@ mod macos {
             .collect()
     }
 
+    /// Drives the main run loop until `done`, or fails once `deadline`
+    /// passes.
+    fn drive(deadline: Instant, done: &dyn Fn() -> bool, what: &dyn Fn() -> String) {
+        // SAFETY: the mode is an immutable static.
+        let mode = unsafe { kCFRunLoopDefaultMode };
+        while !done() {
+            assert!(Instant::now() < deadline, "{}", what());
+            CFRunLoop::run_in_mode(mode, 0.005, true);
+        }
+    }
+
+    /// Drives the main run loop until `flag` is set — the completion
+    /// signal a queued block, like a display layer's attach, leaves
+    /// behind.
+    fn settle_flag(flag: &AtomicBool, what: &str) {
+        drive(
+            Instant::now() + Duration::from_secs(10),
+            &|| flag.load(Ordering::Acquire),
+            &|| what.into(),
+        );
+    }
+
     /// Commits this thread's implicit transaction, then drives the main run
     /// loop until every display layer has its first frame ready and has laid
     /// the frame out.
@@ -319,16 +341,9 @@ mod macos {
     fn settle(layer: &CALayer) {
         CATransaction::flush();
         let deadline = Instant::now() + Duration::from_secs(10);
-        // SAFETY: the mode is an immutable static.
-        let mode = unsafe { kCFRunLoopDefaultMode };
-        let drive = |done: &dyn Fn() -> bool, what: &dyn Fn() -> String| {
-            while !done() {
-                assert!(Instant::now() < deadline, "{}", what());
-                CFRunLoop::run_in_mode(mode, 0.005, true);
-            }
-        };
         for display in displays(layer) {
             drive(
+                deadline,
                 // SAFETY: the display layer is read on the main thread.
                 &|| unsafe { display.isReadyForDisplay() },
                 &|| {
@@ -343,7 +358,7 @@ mod macos {
         let drained = Arc::new(AtomicBool::new(false));
         let mark = Arc::clone(&drained);
         DispatchQueue::main().exec_async(move || mark.store(true, Ordering::Release));
-        drive(&|| drained.load(Ordering::Acquire), &|| {
+        drive(deadline, &|| drained.load(Ordering::Acquire), &|| {
             "the main queue never drained".into()
         });
         CATransaction::flush();
@@ -526,6 +541,9 @@ mod macos {
         window: Surface<Gpu>,
         system: SystemCompositor,
         view: Retained<NSView>,
+        /// Set by the engine's wake callback: an attach landing on the
+        /// main queue asks for the frame that promotes its candidate.
+        woke: Arc<AtomicBool>,
     }
 
     impl Fixture {
@@ -557,12 +575,16 @@ mod macos {
                     headroom: 1.0,
                 })
                 .expect("the display");
+            let woke = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&woke);
+            engine.set_waker(move || flag.store(true, Ordering::Release));
             Self {
                 metal,
                 engine,
                 window,
                 system,
                 view,
+                woke,
             }
         }
 
@@ -582,11 +604,21 @@ mod macos {
         fn render(&self) {
             self.engine.render(FrameTime::now()).expect("rendered");
             settle(&self.host());
-            // A layer promotes only once its display layer has been born
-            // on the main queue: the frame that first names its
-            // candidate composites it in-engine while the attach drains,
-            // and the next frame promotes it — the frames a window keeps
-            // producing.
+        }
+
+        /// The frames a window produces while a candidate's attach lands:
+        /// the first render composites the candidate in-engine —
+        /// asserted, the pending contract — the attach block's
+        /// completion wake is both the drain's done signal and the
+        /// redraw request, and the second render promotes it.
+        fn promote(&self) {
+            self.woke.store(false, Ordering::Relaxed);
+            self.engine.render(FrameTime::now()).expect("rendered");
+            assert!(
+                displays(&self.root()).is_empty(),
+                "the pending candidate stays engine-composited"
+            );
+            settle_flag(&self.woke, "the queued attach never completed");
             self.engine.render(FrameTime::now()).expect("rendered");
             settle(&self.host());
         }
@@ -597,6 +629,18 @@ mod macos {
     /// bar painted above the video. The layers live as long as the handles.
     #[must_use = "dropping the handles removes the layers"]
     fn scene(engine: &Engine<Gpu>, surface: &Surface<Gpu>, frame: ExternalFrame) -> [Layer; 4] {
+        scene_bar(engine, surface, frame, 0.5)
+    }
+
+    /// `scene` with the control bar's alpha: `bar_alpha` 1.0 makes it
+    /// opaque — the composite then has no translucency for the platform
+    /// to resolve differently.
+    fn scene_bar(
+        engine: &Engine<Gpu>,
+        surface: &Surface<Gpu>,
+        frame: ExternalFrame,
+        bar_alpha: f32,
+    ) -> [Layer; 4] {
         let below = surface.layer();
         let holder = surface.layer();
         let player = surface.layer();
@@ -610,7 +654,7 @@ mod macos {
         let bar = surface.record(|c| {
             c.fill(
                 Rect::new(8.0, 44.0, 88.0, 58.0),
-                WorkingColor::new([0.5, 0.5, 0.5, 0.5]),
+                WorkingColor::new([0.5, 0.5, 0.5, bar_alpha]),
             );
         });
         let video = engine.external_frame(frame);
@@ -648,7 +692,7 @@ mod macos {
             &fixture.window,
             nv12(&fixture.metal, &buffer, FrameColor::BT709_VIDEO),
         );
-        fixture.render();
+        fixture.promote();
 
         let root = fixture.root();
         assert!(root.isGeometryFlipped(), "engine space is y-down");
@@ -719,7 +763,7 @@ mod macos {
                 &fixture.window,
                 nv12(&fixture.metal, &buffer, color),
             );
-            fixture.render();
+            fixture.promote();
             // The renderer records the buffer it displayed when it draws.
             let _ = fixture.system.composite();
             let [display] = &displays(&fixture.root())[..] else {
@@ -835,31 +879,57 @@ mod macos {
             &opaque.window,
             bgra(&opaque, RgbAlpha::Opaque),
         );
-        opaque.render();
+        opaque.promote();
         assert_eq!(displays(&opaque.root()).len(), 1, "promoted");
     }
 
     /// The system compositor's result for the promoted stack matches the
     /// engine's own composition of the same tree within a perceptual
     /// tolerance: FLIP mean at most 0.05 and no local error above 0.25.
+    ///
+    /// The frame is opaque BGRA declared sRGB — the platform and the
+    /// engine produce identical pixels from it, so the comparison
+    /// measures promotion (order, geometry, blending), not the
+    /// platform's YCbCr decoder, whose studio-range expansion differs
+    /// from the engine's on this target.
     fn promoted_composition_matches_engine_composition() {
         let fixture = Fixture::new();
-        let buffer = nv12_buffer(VIDEO);
+        let buffer = surface_buffer(VIDEO.0, VIDEO.1, kCVPixelFormatType_32BGRA);
+        fill(&buffer, 1, |_, row| {
+            for (x, px) in row[..VIDEO.0 * 4]
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .enumerate()
+            {
+                *px = [
+                    u8::try_from(40 + x * 3).expect("blue"),
+                    96,
+                    u8::try_from(30 + x * 4).expect("red"),
+                    255,
+                ];
+            }
+        });
+        let bgra = |metal: &Metal| {
+            ExternalFrame::rgb(
+                plane_texture(
+                    metal,
+                    &buffer,
+                    0,
+                    (MTLPixelFormat::BGRA8Unorm, wgpu::TextureFormat::Bgra8Unorm),
+                ),
+                RgbAlpha::Opaque,
+                FrameColor::SRGB,
+            )
+            .expect("a valid BGRA frame")
+        };
         let offscreen = fixture
             .engine
             .surface(Offscreen::new(SIZE, OffscreenFormat::LinearF16))
             .expect("offscreen");
-        let _engine_scene = scene(
-            &fixture.engine,
-            &offscreen,
-            nv12(&fixture.metal, &buffer, FrameColor::BT709_VIDEO),
-        );
-        let _window_scene = scene(
-            &fixture.engine,
-            &fixture.window,
-            nv12(&fixture.metal, &buffer, FrameColor::BT709_VIDEO),
-        );
-        fixture.render();
+        let _engine_scene = scene_bar(&fixture.engine, &offscreen, bgra(&fixture.metal), 1.0);
+        let _window_scene = scene_bar(&fixture.engine, &fixture.window, bgra(&fixture.metal), 1.0);
+        fixture.promote();
         assert_eq!(displays(&fixture.root()).len(), 1, "promoted");
         let engine = offscreen.readback().expect("engine composition");
         let system = fixture.system.composite();

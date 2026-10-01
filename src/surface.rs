@@ -12,7 +12,7 @@ use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
 use std::ops::{Index, IndexMut};
 use std::rc::Rc;
-#[cfg(not(target_arch = "wasm32"))]
+use std::sync::Arc;
 use std::sync::mpsc::SyncSender as Sender;
 
 use kurbo::{Affine, Vec2};
@@ -84,7 +84,7 @@ pub struct Shared<B: Backend> {
     /// them all.
     bindings: FxHashMap<(u64, PropKind), Box<dyn Any>>,
     /// The engine wake-up, fired when an op is queued outside a frame.
-    waker: Rc<Waker>,
+    waker: Arc<Waker>,
     /// The last display properties announced to the render thread.
     display: Cell<Display>,
     /// Set by installed contents' `LiveState`s the moment an animated
@@ -109,7 +109,7 @@ impl<B: Backend> std::fmt::Debug for Shared<B> {
 }
 
 impl<B: Backend> Shared<B> {
-    fn new(id: SurfaceId, waker: Rc<Waker>) -> Self {
+    fn new(id: SurfaceId, waker: Arc<Waker>) -> Self {
         Self {
             id,
             pending: Vec::new(),
@@ -209,7 +209,7 @@ impl<B: Backend> Shared<B> {
         F: Fn(LayerId, T, Option<Animation>) -> LayerOp + 'static,
     {
         let weak = Rc::downgrade(shared);
-        let waker = Rc::clone(&shared.borrow().waker);
+        let waker = Arc::clone(&shared.borrow().waker);
         let guard = subscribe.start(crate::record::Watch::binding(move |context: Context<T>| {
             let animation = context.metadata().try_get::<Animation>();
             let target = context.into_value();
@@ -901,7 +901,12 @@ impl<B: Backend> std::fmt::Debug for Surface<B> {
 
 impl<B: Backend> Surface<B> {
     /// Builds the UI-thread handle once `CreateSurface` succeeded.
-    pub fn new(id: SurfaceId, info: SurfaceInfo, tx: Sender<Message<B>>, waker: Rc<Waker>) -> Self {
+    pub fn new(
+        id: SurfaceId,
+        info: SurfaceInfo,
+        tx: Sender<Message<B>>,
+        waker: Arc<Waker>,
+    ) -> Self {
         let shared = Rc::new(RefCell::new(Shared::new(id, waker)));
         let owner: Rc<dyn LayerOwner> = Rc::clone(&shared) as Rc<dyn LayerOwner>;
         Self {
@@ -1108,7 +1113,7 @@ impl<B: Backend> Surface<B> {
                     EditOp::Content(LayerContent::Content(content)) => {
                         // A fresh `Content` replaces the previous one whole
                         // (its first `take_change` is a `Replace`).
-                        let waker = Rc::clone(&shared.waker);
+                        let waker = Arc::clone(&shared.waker);
                         let slot = shared.contents.entry(*id).or_default();
                         if let Some(previous) = slot.content.replace(content) {
                             slot.spare.live = previous.retire().live;

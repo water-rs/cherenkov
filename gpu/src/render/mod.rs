@@ -599,6 +599,10 @@ pub struct GpuRenderer {
     /// frame's lowered batch — kept between renders so a plane prepare
     /// allocates nothing steady-state.
     ready_sets: Vec<FxHashSet<LayerId>>,
+    /// The host wake-up a plane's main-queue attach fires when it lands,
+    /// pulling the frame that promotes the born candidate — the same
+    /// `waker.wake` an external frame or an invalidation uses.
+    plane_waker: Option<cherenkov::MainWaker>,
     /// How the fixed modules reach this device (`shaders.rs`): SPIR-V,
     /// metallib, or WGSL — decided once at init by the adapter backend.
     shader_delivery: shaders::ShaderDelivery,
@@ -1956,6 +1960,7 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             plan_scratch: planes::PlanScratch::default(),
             candidates: FxHashMap::default(),
             ready_sets: Vec::new(),
+            plane_waker: None,
             shader_delivery,
             shaders: paint::Registry::default(),
             backdrop_shaders: FxHashMap::default(),
@@ -2262,6 +2267,7 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
         plan_scratch: planes::PlanScratch::default(),
         candidates: FxHashMap::default(),
         ready_sets: Vec::new(),
+        plane_waker: None,
         shader_delivery,
         shaders: paint::Registry::default(),
         backdrop_shaders: FxHashMap::default(),
@@ -2850,6 +2856,10 @@ impl Renderer for GpuRenderer {
         }
     }
 
+    fn set_plane_waker(&mut self, waker: cherenkov::MainWaker) {
+        self.plane_waker = Some(waker);
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "rebuilds every surface's scratch, bindings and buffers in pressure order"
@@ -3416,7 +3426,7 @@ impl GpuRenderer {
         // A candidate whose display layer was born since the surface's
         // last plan can now promote: `prepare` notices the completed
         // attach and `wants_plan` says the surface must re-plan.
-        for sf in frame.surfaces.iter() {
+        for sf in frame.surfaces {
             if dirty.iter().any(|seen| seen.id == sf.id) {
                 continue;
             }
@@ -3429,10 +3439,7 @@ impl GpuRenderer {
             let Some(system) = self.planes.get_mut(&sf.id) else {
                 continue;
             };
-            planes::SystemPlanes::groom(
-                system,
-                plane_candidates(surface, &mut self.candidates),
-            );
+            planes::SystemPlanes::groom(system, plane_candidates(surface, &mut self.candidates));
             if planes::SystemPlanes::wants_plan(system) {
                 dirty.push(sf);
             }
@@ -3582,7 +3589,7 @@ impl GpuRenderer {
         // A candidate whose display layer was born since the surface's
         // last plan can now promote: `prepare` notices the completed
         // attach and `wants_plan` says the surface must re-plan.
-        for sf in frame.surfaces.iter() {
+        for sf in frame.surfaces {
             if dirty.iter().any(|seen| seen.id == sf.id) {
                 continue;
             }
@@ -3595,10 +3602,7 @@ impl GpuRenderer {
             let Some(system) = self.planes.get_mut(&sf.id) else {
                 continue;
             };
-            planes::SystemPlanes::groom(
-                system,
-                plane_candidates(surface, &mut self.candidates),
-            );
+            planes::SystemPlanes::groom(system, plane_candidates(surface, &mut self.candidates));
             if planes::SystemPlanes::wants_plan(system) {
                 dirty.push(sf);
             }
@@ -4127,6 +4131,7 @@ impl GpuRenderer {
             window.transparent,
             window.required_color_space,
             window.probe,
+            self.plane_waker.clone(),
         )?;
         self.planes.insert(id, system);
         self.presenter
@@ -4669,8 +4674,8 @@ impl GpuRenderer {
                 .iter()
                 .map(|surf| surf.backdrop_info(&mut self.filters))
                 .collect();
+            self.ready_planes(frames, pending);
             let mut results: Vec<Result<Lowered, RenderError>> = if pending.len() > 1 {
-                self.ready_planes(frames, pending);
                 let (atlas, images, bitmaps) = (&self.atlas, &self.images, &self.bitmaps);
                 // `FontData`'s COLR cache is a `RefCell` — !Sync — so
                 // each worker moves in its own snapshot built here.
@@ -4712,7 +4717,6 @@ impl GpuRenderer {
                         .collect()
                 })
             } else {
-                self.ready_planes(frames, pending);
                 pending
                     .iter_mut()
                     .zip(frames)
@@ -4883,23 +4887,20 @@ impl GpuRenderer {
     /// a candidate it does not report keeps compositing in-engine this
     /// frame.
     fn ready_planes(&mut self, frames: &[&SurfaceFrame<'_>], pending: &[SurfaceState]) {
-        let mut i = 0;
-        for (sf, surf) in frames.iter().zip(pending.iter()) {
-            if self.ready_sets.len() == i {
-                self.ready_sets.push(FxHashSet::default());
+        let (ready_sets, planes, candidates) =
+            (&mut self.ready_sets, &mut self.planes, &mut self.candidates);
+        for (i, (sf, surf)) in frames.iter().zip(pending.iter()).enumerate() {
+            if ready_sets.len() == i {
+                ready_sets.push(FxHashSet::default());
             }
-            let candidates = plane_candidates(surf, &mut self.candidates);
-            match self.planes.get_mut(&sf.id) {
-                Some(system) => {
-                    planes::SystemPlanes::prepare(system, candidates, &mut self.ready_sets[i])
-                }
-                None => {
-                    let ready = &mut self.ready_sets[i];
-                    ready.clear();
-                    ready.extend(candidates.keys().copied());
-                }
+            let candidates = plane_candidates(surf, candidates);
+            if let Some(system) = planes.get_mut(&sf.id) {
+                planes::SystemPlanes::prepare(system, candidates, &mut ready_sets[i]);
+            } else {
+                let ready = &mut ready_sets[i];
+                ready.clear();
+                ready.extend(candidates.keys().copied());
             }
-            i += 1;
         }
     }
 

@@ -33,7 +33,6 @@ use std::sync::{Arc, Mutex};
 use kurbo::{Affine, Rect, Vec2};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use rustc_hash::{FxHashMap, FxHashSet};
 use objc2_av_foundation::{
     AVLayerVideoGravityResize, AVQueuedSampleBufferRendering, AVQueuedSampleBufferRenderingStatus,
     AVSampleBufferDisplayLayer, AVSampleBufferVideoRenderer,
@@ -71,6 +70,7 @@ use objc2_quartz_core::{
     CACornerMask, CALayer, CAMetalLayer, CATransaction, kCACornerCurveCircular,
     kCACornerCurveContinuous,
 };
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use cherenkov::{ContinuousRect, LayerId, RenderError, ShapeData, SurfaceError};
 
@@ -232,6 +232,10 @@ pub struct LayerPlanes {
     /// rejects stays in `offered` — it does not re-wake every frame.
     offered: FxHashSet<LayerId>,
     woke: bool,
+    /// The host wake-up an attach completion fires to pull the frame
+    /// that promotes the born candidate — the same `waker.wake` an
+    /// external frame or an invalidation uses to wake the render loop.
+    waker: Option<cherenkov::MainWaker>,
     /// Set when parts or planes were added or removed, so the root's
     /// sublayer order is rebuilt.
     restack: bool,
@@ -284,6 +288,7 @@ unsafe impl Send for DisplayLink {}
 struct DisplayAttach {
     parent: Retained<CALayer>,
     link: Arc<Mutex<DisplayLink>>,
+    waker: Option<cherenkov::MainWaker>,
 }
 
 // SAFETY: the parent is touched only on the main queue, inside an
@@ -351,6 +356,15 @@ impl DisplayAttach {
         }
         link.display = Some(display);
         link.renderer = Some(renderer);
+        drop(link);
+        // The attach is the event that makes this candidate promotable:
+        // an external frame or an invalidation wakes the host for the
+        // frame that shows it, and this does the same — the next render
+        // promotes the now-born candidate instead of compositing it
+        // in-engine forever on a static scene.
+        if let Some(waker) = &self.waker {
+            waker.wake();
+        }
     }
 }
 
@@ -711,6 +725,7 @@ impl LayerPlanes {
         transparent: bool,
         required: Option<wgpu::SurfaceColorSpace>,
         probe: Option<std::sync::mpsc::Sender<crate::render::present::DisplayProbe>>,
+        waker: Option<cherenkov::MainWaker>,
     ) -> Result<Self, SurfaceError> {
         let _tx = Transaction::begin();
         let Parent {
@@ -743,6 +758,7 @@ impl LayerPlanes {
             staging: CALayer::new(),
             offered: FxHashSet::default(),
             woke: false,
+            waker,
             restack: true,
         };
         planes.geometry();
@@ -833,11 +849,7 @@ impl LayerPlanes {
     /// [`SystemPlanes::prepare`], or taken over from the plane it
     /// replaces — under the chain's inner level inside this transaction,
     /// which is safe from any thread.
-    fn plane_layers(
-        &self,
-        placement: &Placement,
-        link: Arc<Mutex<DisplayLink>>,
-    ) -> PlaneLayers {
+    fn plane_layers(&self, placement: &Placement, link: Arc<Mutex<DisplayLink>>) -> PlaneLayers {
         let top = anchored();
         top.setAffineTransform(cg_affine(Affine::scale(1.0 / self.scale)));
         let mut outer: Retained<CALayer> = top.clone();
@@ -1127,7 +1139,6 @@ impl SystemPlanes for LayerPlanes {
         Ok(presented)
     }
 
-
     fn groom(&mut self, candidates: &FxHashMap<LayerId, (u32, u32)>) {
         // A candidate that left the eligible set before its attach ran is
         // dead: the queued block sees `dead` and changes nothing.
@@ -1146,6 +1157,7 @@ impl SystemPlanes for LayerPlanes {
             DisplayAttach {
                 parent: self.staging.clone(),
                 link: Arc::clone(&link),
+                waker: self.waker.clone(),
             }
             .run();
             self.pending.insert(layer, link);
@@ -1154,9 +1166,8 @@ impl SystemPlanes for LayerPlanes {
         self.woke = false;
         for &layer in candidates.keys() {
             if self.born(layer) {
-                if !self.offered.contains(&layer) {
+                if self.offered.insert(layer) {
                     self.woke = true;
-                    self.offered.insert(layer);
                 }
             } else {
                 self.offered.remove(&layer);
@@ -1175,12 +1186,7 @@ impl SystemPlanes for LayerPlanes {
     ) {
         self.groom(candidates);
         ready.clear();
-        ready.extend(
-            candidates
-                .keys()
-                .copied()
-                .filter(|layer| self.born(*layer)),
-        );
+        ready.extend(candidates.keys().copied().filter(|layer| self.born(*layer)));
     }
 
     /// Hands each promoted layer's new frame to its display layer: the

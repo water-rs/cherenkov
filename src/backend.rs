@@ -213,6 +213,12 @@ pub trait Renderer: 'static {
         surface: SurfaceId,
     ) -> impl core::future::Future<Output = Result<Readback, RenderError>>;
 
+    /// The host wake-up a render-side completion fires to pull the next
+    /// frame: a promoted plane's attach landing on the main queue is its
+    /// only producer. The default does nothing — backends with no
+    /// main-queue completion never need it.
+    fn set_plane_waker(&mut self, _waker: crate::MainWaker) {}
+
     /// The backend's current memory usage.
     fn memory(&self) -> MemoryUsage;
 

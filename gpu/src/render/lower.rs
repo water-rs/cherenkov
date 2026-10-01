@@ -2575,8 +2575,8 @@ impl<'a> Lowering<'a> {
                 let b = boxed.bounds.inflate(margin, margin);
                 inst.bounds = [f32_f64(b.x0), f32_f64(b.y0), f32_f64(b.x1), f32_f64(b.y1)];
                 inst.shape = boxed.shape;
-                // `in.local` is the frame's pixel coordinate: the luma
-                // sample position verbatim.
+                // The box is centred on the frame: the fragment stage adds
+                // half the frame size to `in.local` for its pixel coordinate.
                 self.set_image(Some(ImageSource::External(id)));
                 self.push_shaped(inst, transform, boxed.bounds, margin);
                 // The external draw is its own range: following siblings

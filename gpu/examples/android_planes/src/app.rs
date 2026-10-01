@@ -34,15 +34,21 @@ pub extern "Rust" fn android_main(app: AndroidApp) {
     logcat::line(&format!("scenario={} starting", scenario.name()));
 
     let mut run: Option<Run> = None;
+    let mut wait_log = Instant::now();
     loop {
         let mut terminated = false;
         let mut resized = false;
         let mut destroyed = false;
-        app.poll_events(Some(Duration::ZERO), |event| match event {
-            PollEvent::Main(MainEvent::Destroy) => destroyed = true,
-            PollEvent::Main(MainEvent::TerminateWindow { .. }) => terminated = true,
-            PollEvent::Main(MainEvent::WindowResized { .. }) => resized = true,
-            _ => {}
+        app.poll_events(Some(Duration::ZERO), |event| {
+            if let PollEvent::Main(main) = &event {
+                logcat::line(&format!("event {main:?}"));
+            }
+            match event {
+                PollEvent::Main(MainEvent::Destroy) => destroyed = true,
+                PollEvent::Main(MainEvent::TerminateWindow { .. }) => terminated = true,
+                PollEvent::Main(MainEvent::WindowResized { .. }) => resized = true,
+                _ => {}
+            }
         });
         if destroyed {
             break;
@@ -52,9 +58,20 @@ pub extern "Rust" fn android_main(app: AndroidApp) {
             continue;
         }
         let Some(window) = app.native_window() else {
+            if wait_log.elapsed() >= Duration::from_secs(1) {
+                wait_log = Instant::now();
+                logcat::line("waiting for native_window");
+            }
             std::thread::sleep(Duration::from_millis(50));
             continue;
         };
+        if run.is_none() {
+            logcat::line(&format!(
+                "native_window {}x{}; building the pipeline",
+                window.width(),
+                window.height()
+            ));
+        }
         let run = run.get_or_insert_with(|| Run::new(&window, scenario, &decisions));
         if resized {
             run.resize(&window);
@@ -129,6 +146,11 @@ struct Run {
     scenario: Scenario,
     next_log: Instant,
     last_render_error: Option<String>,
+    /// `false` until the first frame renders — a crash before then is a
+    /// device/import problem, not a presentation one.
+    logged_first_frame: bool,
+    /// `LayerId`s whose first settled verdict was already logged.
+    logged_verdicts: Vec<u64>,
     _font: Font,
 }
 
@@ -141,6 +163,7 @@ impl Run {
     /// Brings the whole pipeline up: shared Vulkan device, engine, the
     /// surface-control surface and the scenario's layers and producers.
     fn new(window: &NativeWindow, scenario: Scenario, decisions: &Arc<Decisions>) -> Self {
+        logcat::line("creating the shared GPU device");
         let shared = SharedDevice::create(&GpuConfig::default()).expect("shared GPU device");
         let vk = vulkan::Device::new(&shared).expect("vulkan import context");
         let engine = Engine::<Gpu>::new(GpuConfig {
@@ -148,6 +171,7 @@ impl Run {
             ..GpuConfig::default()
         })
         .expect("engine");
+        logcat::line("engine up");
 
         let size = (
             window.width().cast_unsigned(),
@@ -155,9 +179,11 @@ impl Run {
         );
         let parent = unsafe { SurfaceControl::from_window(window.ptr(), c"cherenkov harness") }
             .expect("surface control from window");
+        logcat::line("SurfaceControl \"cherenkov harness\" created");
         let surface = engine
             .surface(SurfaceControlTarget::new(parent, size))
             .expect("surface-control surface");
+        logcat::line(&format!("surface target {}x{} created", size.0, size.1));
         surface.clear_color(WorkingColor::new([0.01, 0.012, 0.018, 1.0]));
 
         let font_data = std::fs::read(FONT).expect("Roboto is present on Android");
@@ -169,7 +195,7 @@ impl Run {
         let specs = scenario.videos();
         let layers = scenario.build(&surface, controls);
         assert_eq!(specs.len(), layers.len(), "videos and layers pair");
-        let videos = specs
+        let videos: Vec<Video> = specs
             .into_iter()
             .zip(layers)
             .map(|(spec, layer)| Video {
@@ -177,6 +203,7 @@ impl Run {
                 producer: Pool::new(&vk, spec).expect("producer pool"),
             })
             .collect();
+        logcat::line(&format!("{} video layer(s) built", videos.len()));
 
         Self {
             engine,
@@ -186,6 +213,8 @@ impl Run {
             scenario,
             next_log: Instant::now(),
             last_render_error: None,
+            logged_first_frame: false,
+            logged_verdicts: Vec::new(),
             _font: font,
         }
     }
@@ -220,13 +249,32 @@ impl Run {
             }
         });
         match self.engine.render(FrameTime::now()) {
-            Ok(_) => self.last_render_error = None,
+            Ok(_) => {
+                self.last_render_error = None;
+                if !self.logged_first_frame {
+                    self.logged_first_frame = true;
+                    logcat::line("first engine frame rendered");
+                }
+            }
             Err(e) => {
                 let error = e.to_string();
                 if self.last_render_error.as_deref() != Some(error.as_str()) {
                     logcat::error(&format!("render: {error}"));
                     self.last_render_error = Some(error);
                 }
+            }
+        }
+        for video in &self.videos {
+            let layer = video.layer.id().raw();
+            if self.logged_verdicts.contains(&layer) {
+                continue;
+            }
+            let decision = self.decisions.decision(layer);
+            if decision != "unseen" && decision != "pending" {
+                self.logged_verdicts.push(layer);
+                logcat::line(&format!(
+                    "verdict layer=LayerId({layer}) decision={decision}"
+                ));
             }
         }
         let now = Instant::now();

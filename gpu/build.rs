@@ -221,6 +221,12 @@ fn main() {
     let wasm = env::var("CARGO_CFG_TARGET_ARCH").unwrap() == "wasm32";
     let apple = apple_target();
     let spirv = emits_spirv();
+    // The crate reads the same condition as the `cherenkov_spirv` cfg, so
+    // `build.rs` is the single place that decides it.
+    println!("cargo::rustc-check-cfg=cfg(cherenkov_spirv)");
+    if spirv {
+        println!("cargo::rustc-cfg=cherenkov_spirv");
+    }
     for spec in &specs {
         compile(&out_dir, spec, apple.as_ref(), wasm, spirv);
     }

@@ -43,7 +43,7 @@ pub const fn inside(winding: i32, rule: FillRule) -> bool {
     }
 }
 
-fn is_left(x0: f64, y0: f64, x1: f64, y1: f64, px: f64, py: f64) -> f64 {
+pub(crate) fn is_left(x0: f64, y0: f64, x1: f64, y1: f64, px: f64, py: f64) -> f64 {
     (px - x0).mul_add(-(y1 - y0), (x1 - x0) * (py - y0))
 }
 

@@ -27,6 +27,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use rustc_hash::{FxHashMap, FxHashSet};
+use wgpu::util::DeviceExt;
 
 use crate::{
     CreationPhase, CreationPoint, GpuConfig, GpuInfo, GpuTarget, ScratchFormat, TimestampSupport,
@@ -55,6 +56,67 @@ enum Bound {
     External,
     /// The projective composite, source-over or replace.
     Projective(bool),
+}
+
+#[derive(Clone, Copy)]
+enum CoveragePhase {
+    Opaque = 0,
+    Partial = 1,
+}
+
+#[derive(Clone, Copy)]
+enum CoveragePass {
+    Painter(bool),
+    Coverage(CoveragePhase),
+}
+
+impl CoveragePass {
+    const fn topology(self) -> wgpu::PrimitiveTopology {
+        match self {
+            Self::Painter(_) | Self::Coverage(CoveragePhase::Partial) => {
+                wgpu::PrimitiveTopology::TriangleList
+            }
+            Self::Coverage(CoveragePhase::Opaque) => wgpu::PrimitiveTopology::TriangleStrip,
+        }
+    }
+
+    const fn vertex(self) -> &'static str {
+        match self {
+            Self::Painter(_) => "vs_main",
+            Self::Coverage(CoveragePhase::Opaque) => "vs_opaque",
+            Self::Coverage(CoveragePhase::Partial) => "vs_partial",
+        }
+    }
+
+    const fn fragment(self) -> &'static str {
+        match self {
+            Self::Painter(_) => "fs_main",
+            Self::Coverage(CoveragePhase::Opaque) => "fs_opaque",
+            Self::Coverage(CoveragePhase::Partial) => "fs_partial",
+        }
+    }
+
+    const fn blend(self) -> Option<wgpu::BlendState> {
+        match self {
+            Self::Painter(false) | Self::Coverage(CoveragePhase::Partial) => {
+                Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING)
+            }
+            Self::Painter(true) | Self::Coverage(CoveragePhase::Opaque) => None,
+        }
+    }
+
+    fn depth(self) -> Option<wgpu::DepthStencilState> {
+        match self {
+            Self::Painter(_) => None,
+            Self::Coverage(phase) => Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(matches!(phase, CoveragePhase::Opaque)),
+                depth_compare: Some(wgpu::CompareFunction::Greater),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+        }
+    }
 }
 
 /// The surface target format: premultiplied linear Display P3.
@@ -135,6 +197,20 @@ struct ScratchTarget {
     height: u32,
 }
 
+/// Resident bytes of a transient depth texture. Metal exposes its actual
+/// backing allocation; memoryless attachments have no persistent backing.
+fn coverage_depth_bytes(texture: &wgpu::Texture) -> u64 {
+    #[cfg(target_vendor = "apple")]
+    {
+        use objc2_metal::MTLResource;
+        // SAFETY: the native texture is only inspected while its guard lives.
+        if let Some(native) = unsafe { texture.as_hal::<wgpu::hal::api::Metal>() } {
+            return native.raw_handle().allocatedSize() as u64;
+        }
+    }
+    u64::from(texture.width()) * u64::from(texture.height()) * 4
+}
+
 /// A GPU-resident image registered with the engine.
 pub struct GpuImage {
     /// The texture holding premultiplied linear-P3 f16 texels.
@@ -169,6 +245,8 @@ struct SurfaceState {
     /// Scratch textures, one per isolation depth, sized to the largest
     /// region seen so far.
     scratch: Vec<ScratchTarget>,
+    /// Transient depth for opaque regions; cleared and discarded in one pass.
+    coverage_depth: Option<ScratchTarget>,
     /// Backdrop copies for blend composites: index 0 matches the surface
     /// format, index 1 the scratch format.
     backdrop: [Option<ScratchTarget>; 2],
@@ -350,6 +428,10 @@ impl SurfaceState {
             })
             .sum::<u64>();
         surface_bytes
+            + self
+                .coverage_depth
+                .as_ref()
+                .map_or(0, |depth| coverage_depth_bytes(&depth.texture))
             + scratch_bytes
             + backdrop_bytes
             + shader_bytes
@@ -488,6 +570,10 @@ pub struct GpuRenderer {
     /// pipelines are built once (#170). A `None` cell is created at first
     /// use — preparation is measured on the frame that needs it (#170 B3).
     pipelines: [[[Option<wgpu::RenderPipeline>; 3]; 2]; 2],
+    /// `[opaque, partial]` coverage pipelines, same cell policy as the
+    /// core set: built at init under `core_pipelines_eager()` (always,
+    /// on wasm), else created at the first coverage pass (#170 B3, #49).
+    coverage_pipelines: [Option<wgpu::RenderPipeline>; 2],
     /// The pipeline layout every core and backdrop pipeline shares.
     pipeline_layout: wgpu::PipelineLayout,
     /// The configured pipeline cache, opened once for the whole set.
@@ -503,6 +589,8 @@ pub struct GpuRenderer {
     globals: wgpu::Buffer,
     instances: wgpu::Buffer,
     stops: wgpu::Buffer,
+    /// `{0, 1, 2, 2, 1, 3}` — see `quad_index_buffer`.
+    quad_indices: wgpu::Buffer,
     bind0: wgpu::BindGroup,
     /// The atlas generation `bind0` was built against.
     bound_atlas: u64,
@@ -1314,48 +1402,34 @@ fn create_pipeline(
     cache: Option<&wgpu::PipelineCache>,
     module: &wgpu::ShaderModule,
     format: wgpu::TextureFormat,
-    replace: bool,
+    mode: CoveragePass,
 ) -> Result<wgpu::RenderPipeline, EngineError> {
     let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
-    // Source-over premultiplied compositing, or `Replace` writing the
-    // shader's already-composited result verbatim.
-    let component = wgpu::BlendComponent {
-        src_factor: wgpu::BlendFactor::One,
-        dst_factor: if replace {
-            wgpu::BlendFactor::Zero
-        } else {
-            wgpu::BlendFactor::OneMinusSrcAlpha
-        },
-        operation: wgpu::BlendOperation::Add,
-    };
     let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("cherenkov"),
         layout: Some(layout),
         vertex: wgpu::VertexState {
             module,
-            entry_point: Some("vs_main"),
+            entry_point: Some(mode.vertex()),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             buffers: &[],
         },
         fragment: Some(wgpu::FragmentState {
             module,
-            entry_point: Some("fs_main"),
+            entry_point: Some(mode.fragment()),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format,
-                blend: Some(wgpu::BlendState {
-                    color: component,
-                    alpha: component,
-                }),
+                blend: mode.blend(),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
         }),
         primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleList,
+            topology: mode.topology(),
             cull_mode: None,
             ..wgpu::PrimitiveState::default()
         },
-        depth_stencil: None,
+        depth_stencil: mode.depth(),
         multisample: wgpu::MultisampleState::default(),
         multiview_mask: None,
         cache,
@@ -1379,48 +1453,34 @@ async fn create_pipeline(
     cache: Option<&wgpu::PipelineCache>,
     module: &wgpu::ShaderModule,
     format: wgpu::TextureFormat,
-    replace: bool,
+    mode: CoveragePass,
 ) -> Result<wgpu::RenderPipeline, EngineError> {
     let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
-    // Source-over premultiplied compositing, or `Replace` writing the
-    // shader's already-composited result verbatim.
-    let component = wgpu::BlendComponent {
-        src_factor: wgpu::BlendFactor::One,
-        dst_factor: if replace {
-            wgpu::BlendFactor::Zero
-        } else {
-            wgpu::BlendFactor::OneMinusSrcAlpha
-        },
-        operation: wgpu::BlendOperation::Add,
-    };
     let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("cherenkov"),
         layout: Some(layout),
         vertex: wgpu::VertexState {
             module,
-            entry_point: Some("vs_main"),
+            entry_point: Some(mode.vertex()),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             buffers: &[],
         },
         fragment: Some(wgpu::FragmentState {
             module,
-            entry_point: Some("fs_main"),
+            entry_point: Some(mode.fragment()),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format,
-                blend: Some(wgpu::BlendState {
-                    color: component,
-                    alpha: component,
-                }),
+                blend: mode.blend(),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
         }),
         primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleList,
+            topology: mode.topology(),
             cull_mode: None,
             ..wgpu::PrimitiveState::default()
         },
-        depth_stencil: None,
+        depth_stencil: mode.depth(),
         multisample: wgpu::MultisampleState::default(),
         multiview_mask: None,
         cache,
@@ -1443,14 +1503,14 @@ struct PipelineFactory<'a> {
 }
 
 impl PipelineFactory<'_> {
-    /// Creates the `(format, replace, variant)` core pipeline on demand:
-    /// the shader module is built and released around the call — modules
-    /// are not retained once pipelines exist (#170).
+    /// Creates the `(format, mode, variant)` core or coverage pipeline
+    /// on demand: the shader module is built and released around the
+    /// call — modules are not retained once pipelines exist (#170).
     #[cfg(not(target_arch = "wasm32"))]
     fn create(
         &self,
         format: wgpu::TextureFormat,
-        replace: bool,
+        mode: CoveragePass,
         variant: ShaderVariant,
     ) -> Result<wgpu::RenderPipeline, RenderError> {
         let module = self
@@ -1463,7 +1523,7 @@ impl PipelineFactory<'_> {
             self.cache,
             &module,
             format,
-            replace,
+            mode,
         )
         .map_err(|error| RenderError::Render(format!("core pipeline: {error}")))
     }
@@ -1474,7 +1534,7 @@ impl PipelineFactory<'_> {
     fn create(
         &self,
         format: wgpu::TextureFormat,
-        replace: bool,
+        mode: CoveragePass,
         variant: ShaderVariant,
     ) -> Result<wgpu::RenderPipeline, RenderError> {
         let _ = (
@@ -1484,7 +1544,7 @@ impl PipelineFactory<'_> {
             self.cache,
             self.delivery,
             format,
-            replace,
+            mode,
             variant,
         );
         Err(RenderError::Render(
@@ -1508,9 +1568,28 @@ fn core_pipeline<'m>(
     let cell = &mut pipelines[usize::from(format != TARGET_FORMAT)][usize::from(replace)]
         [variant_index(variant)];
     if cell.is_none() {
-        *cell = Some(factory.create(format, replace, variant)?);
+        *cell = Some(factory.create(format, CoveragePass::Painter(replace), variant)?);
     }
     Ok(cell.as_ref().expect("core pipeline ready"))
+}
+
+/// The `[opaque, partial]` coverage pipeline for the surface target —
+/// the same cell policy as `core_pipeline`: an empty cell is created at
+/// the first coverage pass that needs it (#170 B3, #49).
+fn coverage_pipeline<'m>(
+    pipelines: &'m mut [Option<wgpu::RenderPipeline>; 2],
+    factory: &PipelineFactory<'_>,
+    phase: CoveragePhase,
+) -> Result<&'m wgpu::RenderPipeline, RenderError> {
+    let cell = &mut pipelines[phase as usize];
+    if cell.is_none() {
+        *cell = Some(factory.create(
+            TARGET_FORMAT,
+            CoveragePass::Coverage(phase),
+            ShaderVariant::Simple,
+        )?);
+    }
+    Ok(cell.as_ref().expect("coverage pipeline ready"))
 }
 
 /// One instanced-quad pipeline from `external.wgsl` for `format`:
@@ -1598,6 +1677,17 @@ pub fn texel_bytes(format: wgpu::TextureFormat) -> u64 {
     u64::from(format.block_copy_size(None).unwrap_or(0))
 }
 
+/// `{0, 1, 2, 2, 1, 3}`: the coverage partial pass's indexed draw replays
+/// the painter path's ordered triangles while the vertex shader runs once
+/// per corner.
+fn quad_index_buffer(device: &wgpu::Device) -> wgpu::Buffer {
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("quad indices"),
+        contents: bytemuck::cast_slice(&[0u16, 1, 2, 2, 1, 3]),
+        usage: wgpu::BufferUsages::INDEX,
+    })
+}
+
 /// Creates GPU state on the shared engine render thread.
 ///
 /// # Errors
@@ -1640,11 +1730,13 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
         let mut pipelines = std::array::from_fn(|_| {
             std::array::from_fn(|_| std::array::from_fn(|_| None::<wgpu::RenderPipeline>))
         });
+        let mut coverage_pipelines = [None, None];
         // The closed core set, deduplicated by format slot: when surface
         // and scratch share `Rgba16Float` every cell lands in slot 0 and
         // the later iteration's `is_none` skips its duplicates (#170).
         // CoreDemand leaves the cells empty — `core_pipeline` fills each
-        // at the first draw that needs it (#170 B3).
+        // at the first draw that needs it (#170 B3). The coverage pair
+        // follows the same policy via `coverage_pipeline`.
         if let Some(modules) = &modules {
             for format in [TARGET_FORMAT, scratch_format] {
                 let slot = usize::from(format != TARGET_FORMAT);
@@ -1659,11 +1751,25 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
                                 pipeline_cache.as_ref(),
                                 &modules[variant],
                                 format,
-                                replace,
+                                CoveragePass::Painter(replace),
                             )?);
                         }
                     }
                 }
+            }
+            for (cell, phase) in coverage_pipelines
+                .iter_mut()
+                .zip([CoveragePhase::Opaque, CoveragePhase::Partial])
+            {
+                *cell = Some(create_pipeline(
+                    &device,
+                    &config,
+                    &pipeline_layout,
+                    pipeline_cache.as_ref(),
+                    &modules[0],
+                    TARGET_FORMAT,
+                    CoveragePass::Coverage(phase),
+                )?);
             }
         }
         fire_probe(
@@ -1691,6 +1797,7 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let quad_indices = quad_index_buffer(&device);
         diag::create(&device, "globals", globals.size());
         diag::create(&device, "instances", instances.size());
         diag::create(&device, "stops", stops.size());
@@ -1799,6 +1906,7 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             device,
             queue,
             pipelines,
+            coverage_pipelines,
             pipeline_layout,
             pipeline_cache,
             scratch_format,
@@ -1807,6 +1915,7 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             globals,
             instances,
             stops,
+            quad_indices,
             bind0,
             dummy_view,
             dummy_uint_view,
@@ -1917,7 +2026,9 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
     });
     // The closed core set, deduplicated by format slot: when surface and
     // scratch share `Rgba16Float` every cell lands in slot 0 and the
-    // later iteration's `is_none` skips its duplicates (#170).
+    // later iteration's `is_none` skips its duplicates (#170). wasm
+    // always prepares eagerly — async creation cannot run inside the
+    // synchronous encode loop, so the cells are never empty.
     for format in [TARGET_FORMAT, scratch_format] {
         let slot = usize::from(format != TARGET_FORMAT);
         for replace in [false, true] {
@@ -1932,7 +2043,7 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
                             pipeline_cache.as_ref(),
                             &modules[variant],
                             format,
-                            replace,
+                            CoveragePass::Painter(replace),
                         )
                         .await?,
                     );
@@ -1940,6 +2051,30 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
             }
         }
     }
+    let coverage_pipelines = <[_; 2]>::from(
+        futures_util::future::try_join(
+            create_pipeline(
+                &device,
+                &config,
+                &pipeline_layout,
+                pipeline_cache.as_ref(),
+                &modules[0],
+                TARGET_FORMAT,
+                CoveragePass::Coverage(CoveragePhase::Opaque),
+            ),
+            create_pipeline(
+                &device,
+                &config,
+                &pipeline_layout,
+                pipeline_cache.as_ref(),
+                &modules[0],
+                TARGET_FORMAT,
+                CoveragePass::Coverage(CoveragePhase::Partial),
+            ),
+        )
+        .await?,
+    )
+    .map(Some);
     fire_probe(
         &config,
         CreationPhase::CorePipelines,
@@ -1965,6 +2100,7 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
+    let quad_indices = quad_index_buffer(&device);
     diag::create(&device, "globals", globals.size());
     diag::create(&device, "instances", instances.size());
     diag::create(&device, "stops", stops.size());
@@ -2064,6 +2200,7 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
         device,
         queue,
         pipelines,
+        coverage_pipelines,
         pipeline_layout,
         pipeline_cache,
         scratch_format,
@@ -2072,6 +2209,7 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
         globals,
         instances,
         stops,
+        quad_indices,
         bind0,
         dummy_view,
         dummy_uint_view,
@@ -2211,6 +2349,7 @@ impl Renderer for GpuRenderer {
                 target,
                 view,
                 scratch: Vec::new(),
+                coverage_depth: None,
                 backdrop: [None, None],
                 backdrop_groups: FxHashMap::default(),
                 layers: FxHashMap::default(),
@@ -2302,6 +2441,18 @@ impl Renderer for GpuRenderer {
         state.size = size;
         state.target = target;
         state.view = view;
+        if let Some(depth) = state.coverage_depth.take() {
+            diag::retire(
+                &self.device,
+                diag::RetireArgs {
+                    label: "coverage depth",
+                    class: diag::Class::Target,
+                    bytes: coverage_depth_bytes(&depth.texture),
+                    used_in_latest_submit: true,
+                    reason: "resize",
+                },
+            );
+        }
         state.scratch.clear();
         state.backdrop = [None, None];
         state.binds1.clear();
@@ -2618,6 +2769,12 @@ impl Renderer for GpuRenderer {
                 ("isolation scratch", scratch_bytes),
                 ("blend backdrop", backdrop_bytes),
                 ("backdrop capture", capture_bytes),
+                (
+                    "coverage depth",
+                    surf.coverage_depth
+                        .as_ref()
+                        .map_or(0, |depth| coverage_depth_bytes(&depth.texture)),
+                ),
             ] {
                 if bytes > 0 {
                     diag::retire(
@@ -2633,6 +2790,7 @@ impl Renderer for GpuRenderer {
                 }
             }
             surf.scratch.clear();
+            surf.coverage_depth = None;
             surf.backdrop = [None, None];
             for state in surf.backdrop_groups.values_mut() {
                 state.captures.clear();
@@ -3510,7 +3668,7 @@ impl GpuRenderer {
                 self.pipeline_cache.as_ref(),
                 &module,
                 format,
-                false,
+                CoveragePass::Painter(false),
             )
             .map_err(|e| ResourceError::Shader(e.to_string()))
         };
@@ -3567,7 +3725,7 @@ impl GpuRenderer {
                         self.pipeline_cache.as_ref(),
                         &module,
                         format,
-                        false,
+                        CoveragePass::Painter(false),
                     )
                     .await
                     .map_err(|e| ResourceError::Shader(e.to_string())),
@@ -4661,7 +4819,7 @@ impl GpuRenderer {
     ) {
         let mut hint = None;
         for inst in instances {
-            if inst.kind == instance::KIND_GLYPH
+            if matches!(inst.kind, instance::KIND_GLYPH | instance::KIND_REGION)
                 && let Some(slot) = atlas.shelf_at_hint(inst.uv[0], inst.uv[1], &mut hint)
             {
                 f(slot);
@@ -5539,6 +5697,49 @@ impl GpuRenderer {
         };
         let mask_gen = self.atlas.mask_texture_generation();
         for (i, pass) in surf.frame.passes.iter().enumerate() {
+            let coverage_order = matches!(pass.target, Target::Surface)
+                && !pass.ranges.is_empty()
+                && pass.ranges.iter().all(|range| {
+                    range.pipeline == PipelineKind::SrcOver
+                        && range.variant == ShaderVariant::Simple
+                        && range.source.is_none()
+                        && range.image.is_none()
+                        && range.mask.is_none()
+                });
+            if coverage_order
+                && surf
+                    .coverage_depth
+                    .as_ref()
+                    .is_none_or(|depth| (depth.width, depth.height) != surf.size)
+            {
+                let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("coverage depth"),
+                    size: wgpu::Extent3d {
+                        width: surf.size.0,
+                        height: surf.size.1,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Depth32Float,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TRANSIENT_ATTACHMENT,
+                    view_formats: &[],
+                });
+                let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+                tracing::debug!(
+                    nominal_bytes = u64::from(surf.size.0) * u64::from(surf.size.1) * 4,
+                    resident_bytes = coverage_depth_bytes(&texture),
+                    "transient coverage depth allocated"
+                );
+                surf.coverage_depth = Some(ScratchTarget {
+                    texture,
+                    view,
+                    width: surf.size.0,
+                    height: surf.size.1,
+                });
+            }
             let (view, texture) = match pass.target {
                 Target::Surface => (&surf.view, &surf.target),
                 Target::Scratch(i) => (&surf.scratch[i].view, &surf.scratch[i].texture),
@@ -5746,7 +5947,20 @@ impl GpuRenderer {
                     },
                     depth_slice: None,
                 })],
-                depth_stencil_attachment: None,
+                depth_stencil_attachment: coverage_order.then(|| {
+                    wgpu::RenderPassDepthStencilAttachment {
+                        view: &surf
+                            .coverage_depth
+                            .as_ref()
+                            .expect("coverage depth allocated")
+                            .view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(0.0),
+                            store: wgpu::StoreOp::Discard,
+                        }),
+                        stencil_ops: None,
+                    }
+                }),
                 timestamp_writes,
                 occlusion_query_set: None,
                 multiview_mask: None,
@@ -5762,13 +5976,53 @@ impl GpuRenderer {
             let target_view = view.clone();
             #[cfg(all(unix, not(target_vendor = "apple")))]
             let target_size = (texture.width(), texture.height());
-            render_pass.set_pipeline(core_pipeline(
-                &mut self.pipelines,
-                &factory,
-                target_format,
-                false,
-                ShaderVariant::Simple,
-            )?);
+            if coverage_order {
+                render_pass.set_pipeline(coverage_pipeline(
+                    &mut self.coverage_pipelines,
+                    &factory,
+                    CoveragePhase::Opaque,
+                )?);
+                render_pass.set_bind_group(0, &self.bind0, &[pass_index * 256]);
+                let bind = surf
+                    .binds1
+                    .entry((None, false, None, None))
+                    .or_insert_with(|| {
+                        stats.bind_groups_created += 1;
+                        make_bind1(
+                            &self.device,
+                            &self.layout1,
+                            &self.dummy_view,
+                            None,
+                            None,
+                            None,
+                            None,
+                        )
+                    });
+                render_pass.set_bind_group(1, &*bind, &[]);
+                for range in &pass.ranges {
+                    render_pass.draw(
+                        0..8,
+                        (inst_base + range.instances.start)..(inst_base + range.instances.end),
+                    );
+                    stats.draws += 1;
+                }
+                render_pass.set_pipeline(coverage_pipeline(
+                    &mut self.coverage_pipelines,
+                    &factory,
+                    CoveragePhase::Partial,
+                )?);
+                render_pass
+                    .set_index_buffer(self.quad_indices.slice(..), wgpu::IndexFormat::Uint16);
+                stats.pipeline_switches += 2;
+            } else {
+                render_pass.set_pipeline(core_pipeline(
+                    &mut self.pipelines,
+                    &factory,
+                    target_format,
+                    false,
+                    ShaderVariant::Simple,
+                )?);
+            }
             // Region-targeted passes cover only their region; the surface
             // pass the whole target. `in.device` stays in true device
             // space via the per-pass Globals origin.
@@ -6113,10 +6367,21 @@ impl GpuRenderer {
                     }
                 };
                 render_pass.set_bind_group(1, bind, &[]);
-                render_pass.draw(
-                    0..6,
-                    (inst_base + range.instances.start)..(inst_base + range.instances.end),
-                );
+                if coverage_order {
+                    // Four vertex shader runs per quad, but the indices
+                    // submit the painter path's exact ordered triangles —
+                    // required for bit-identical rasterization.
+                    render_pass.draw_indexed(
+                        0..6,
+                        0,
+                        (inst_base + range.instances.start)..(inst_base + range.instances.end),
+                    );
+                } else {
+                    render_pass.draw(
+                        0..6,
+                        (inst_base + range.instances.start)..(inst_base + range.instances.end),
+                    );
+                }
                 ri += 1;
             }
             drop(render_pass);

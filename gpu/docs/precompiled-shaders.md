@@ -68,7 +68,16 @@ which wgpu-hal advertises unconditionally there.
   target. Missing tools fail the build with an install hint.
 - Apple targets additionally run `xcrun -sdk <macosx|iphoneos|iphonesimulator>
   metal`/`metallib`, so building for Apple requires an Apple host — an
-  explicit error otherwise.
+  explicit error otherwise. The Metal compiler's `-std` matches naga's
+  emitted language version. It must not inherit the build SDK's newest
+  language version: a newer SDK can otherwise produce libraries that
+  supported older operating systems reject at load time. Metal 1.x/2.x use
+  the platform-specific `macos-metal` or `ios-metal` dialect; Metal 3 and
+  newer use the unified `metal` dialect. Both shader tools receive the
+  deployment target reported by `rustc --print deployment-target` for the
+  Cargo target, so the metallib has the same OS floor as the Rust binary.
+  Explicit `MACOSX_DEPLOYMENT_TARGET` and `IPHONEOS_DEPLOYMENT_TARGET`
+  settings participate in that resolution and invalidate the build script.
 - wasm32 targets skip the toolchain entirely (nothing embeds the artifacts);
   the WGSL is still parsed and validated.
 

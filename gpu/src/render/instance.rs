@@ -14,6 +14,9 @@ pub const KIND_SHADOW: u32 = 3;
 pub const KIND_GLYPH: u32 = 4;
 /// A device-space run of fully covered columns from a path strip.
 pub const KIND_SPAN: u32 = 5;
+/// An atlas cell with an explicit full-coverage horizontal interval.
+/// Solid paint leaves `meta[2]` available for its two u16 column offsets.
+pub const KIND_REGION: u32 = 6;
 
 /// A single colour.
 pub const PAINT_SOLID: u32 = 0;
@@ -158,7 +161,7 @@ pub struct Instance {
     /// Local-to-device affine: `[a, b, c, d, e, f, 0, 0]`.
     pub affine: [f32; 8],
     /// Quad rectangle `(x0, y0, x1, y1)`, local space except `KIND_GLYPH`
-    /// and `KIND_SPAN`, where it is the device-space atlas cell rectangle.
+    /// `KIND_SPAN` and `KIND_REGION`, where it is a device-space rectangle.
     pub bounds: [f32; 4],
     /// The shape being drawn.
     pub shape: Shape,
@@ -189,6 +192,7 @@ pub struct Instance {
     /// composite: `blend_code<<16 | flags<<24` (the low 16 bits are free
     /// there). For `PAINT_BACKDROP`: `effect_kind | stop_count<<8 |
     /// flags<<24`.
+    /// For `KIND_REGION`, `first_stop` holds the full-column interval instead.
     pub meta: [u32; 4],
 }
 

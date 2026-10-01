@@ -161,6 +161,9 @@ pub struct PathCell {
     pub y: u16,
     /// Shelf the cell lives on, for [`Atlas::begin_commit`] touches.
     pub slot: u32,
+    /// Full columns inside this cell: `start | end << 16`, relative to x0.
+    /// Zero means that the entire cell needs sampled coverage.
+    pub interior: u32,
 }
 
 /// What a cached path draw replays: full-coverage spans and atlas cells,
@@ -205,6 +208,7 @@ impl PathEmit {
                     x: c.x,
                     y: c.y,
                     slot: c.slot,
+                    interior: c.interior,
                 })
                 .collect(),
             slots: self.slots.clone(),
@@ -613,8 +617,9 @@ impl Atlas {
 
     /// Caches a path emission.
     pub fn insert_path(&mut self, key: u64, emit: PathEmit) {
-        self.cpu_bytes += (emit.spans.len() * 16 + emit.cells.len() * 24 + emit.slots.len() * 4)
-            as u64
+        self.cpu_bytes += (emit.spans.len() * 16
+            + emit.cells.len() * size_of::<PathCell>()
+            + emit.slots.len() * 4) as u64
             + LIVE_ENTRY_BYTES;
         self.paths.insert(key, emit);
     }
@@ -1616,7 +1621,7 @@ impl Atlas {
                     if let Some(emit) = self.paths.remove(&hk) {
                         self.slot_dead.push(emit.slots.clone());
                         bytes += (emit.spans.len() * 16
-                            + emit.cells.len() * 24
+                            + emit.cells.len() * size_of::<PathCell>()
                             + emit.slots.len() * 4) as u64
                             + LIVE_ENTRY_BYTES;
                     }

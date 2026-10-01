@@ -51,6 +51,13 @@ struct Spec {
     merge_pair: Option<(u32, u32)>,
 }
 
+/// Apple shader tools and the deployment target resolved by rustc.
+struct AppleTarget {
+    sdk: &'static str,
+    deployment_variable: &'static str,
+    deployment_version: String,
+}
+
 /// Passthrough shaders carry no naga runtime checks: the source is
 /// controlled and validated here at build time.
 const UNCHECKED: naga::proc::BoundsCheckPolicies = naga::proc::BoundsCheckPolicies {
@@ -210,14 +217,14 @@ fn main() {
     // SPIR-V and MSL emission needs (spirv-tools, `xcrun`) is not required
     // for them; the WGSL is still parsed and validated here.
     let wasm = env::var("CARGO_CFG_TARGET_ARCH").unwrap() == "wasm32";
-    let sdk = apple_sdk();
+    let apple = apple_target();
     for spec in &specs {
-        compile(&out_dir, spec, sdk, wasm);
+        compile(&out_dir, spec, apple.as_ref(), wasm);
     }
 }
 
 /// Parses, validates and compiles one module.
-fn compile(out_dir: &Path, spec: &Spec, sdk: Option<&'static str>, wasm: bool) {
+fn compile(out_dir: &Path, spec: &Spec, apple: Option<&AppleTarget>, wasm: bool) {
     let module = naga::front::wgsl::parse_str(&spec.source).unwrap_or_else(|e| {
         panic!(
             "{}: WGSL parse failed:\n{}",
@@ -233,7 +240,7 @@ fn compile(out_dir: &Path, spec: &Spec, sdk: Option<&'static str>, wasm: bool) {
     }
     write_spirv(out_dir, spec, &module, &info);
     if spec.metal {
-        write_metal(out_dir, spec, &module, sdk);
+        write_metal(out_dir, spec, &module, apple);
     }
 }
 
@@ -654,7 +661,7 @@ fn merge_sampled_pair(words: &mut Vec<u32>, binding_tex: u32, binding_smp: u32, 
     *words = out;
 }
 
-fn write_metal(out_dir: &Path, spec: &Spec, module: &naga::Module, sdk: Option<&'static str>) {
+fn write_metal(out_dir: &Path, spec: &Spec, module: &naga::Module, apple: Option<&AppleTarget>) {
     let module = pin_runtime_arrays(module);
     let info = Validator::new(ValidationFlags::all(), Capabilities::empty())
         .validate(&module)
@@ -709,13 +716,30 @@ fn write_metal(out_dir: &Path, spec: &Spec, module: &naga::Module, sdk: Option<&
     let metal = out_dir.join(format!("{}.metal", spec.name));
     std::fs::write(&metal, &source).unwrap();
 
-    if let Some(sdk) = sdk {
+    if let Some(apple) = apple {
+        let sdk = apple.sdk;
         let air = out_dir.join(format!("{}.air", spec.name));
         let metallib = out_dir.join(format!("{}.metallib", spec.name));
+        // Metal 3 unified the platform-specific language dialects.
+        let dialect = if options.lang_version >= (3, 0) {
+            "metal"
+        } else if sdk == "macosx" {
+            "macos-metal"
+        } else {
+            "ios-metal"
+        };
         run(
             Command::new("xcrun")
+                .env(apple.deployment_variable, &apple.deployment_version)
                 .args(["-sdk", sdk, "metal", "-c", "-o"])
                 .arg(&air)
+                // Match the language naga emitted instead of inheriting
+                // the build SDK's newest version, which older supported
+                // operating systems cannot load.
+                .arg(format!(
+                    "-std={dialect}{}.{}",
+                    options.lang_version.0, options.lang_version.1
+                ))
                 .arg(&metal),
             &spec.name,
             "xcrun metal is required to build cherenkov-gpu for Apple \
@@ -723,6 +747,7 @@ fn write_metal(out_dir: &Path, spec: &Spec, module: &naga::Module, sdk: Option<&
         );
         run(
             Command::new("xcrun")
+                .env(apple.deployment_variable, &apple.deployment_version)
                 .args(["-sdk", sdk, "metallib", "-o"])
                 .arg(&metallib)
                 .arg(&air),
@@ -805,16 +830,16 @@ fn resource_map(spec: &Spec, module: &naga::Module) -> msl::EntryPointResourceMa
     map
 }
 
-/// The Metal SDK for an Apple target, or `None` for other targets. A
+/// The Metal tool configuration for an Apple target, or `None` for other targets. A
 /// non-Apple host cannot produce a `.metallib`, so building for Apple there
 /// is an explicit error — never a silent WGSL fallback.
-fn apple_sdk() -> Option<&'static str> {
+fn apple_target() -> Option<AppleTarget> {
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
     let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
-    let sdk = match target_os.as_str() {
-        "macos" => "macosx",
-        "ios" if target_env == "sim" => "iphonesimulator",
-        "ios" => "iphoneos",
+    let (sdk, deployment_variable) = match target_os.as_str() {
+        "macos" => ("macosx", "MACOSX_DEPLOYMENT_TARGET"),
+        "ios" if target_env == "sim" => ("iphonesimulator", "IPHONEOS_DEPLOYMENT_TARGET"),
+        "ios" => ("iphoneos", "IPHONEOS_DEPLOYMENT_TARGET"),
         "tvos" | "watchos" | "visionos" => panic!(
             "cherenkov-gpu precompiles Metal shaders for Apple targets (issue \
              #57): no Metal SDK mapping exists for target-os {target_os}"
@@ -829,7 +854,27 @@ fn apple_sdk() -> Option<&'static str> {
          building for {target} needs an Apple host, but the host is {host}. \
          Build for Apple targets on macOS."
     );
-    Some(sdk)
+    println!("cargo::rerun-if-env-changed={deployment_variable}");
+    let output = Command::new(env::var_os("RUSTC").expect("Cargo provides RUSTC"))
+        .args(["--print", "deployment-target", "--target", &target])
+        .output()
+        .expect("rustc must report the Apple deployment target");
+    assert!(
+        output.status.success(),
+        "rustc could not resolve the deployment target for {target}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let resolved = String::from_utf8(output.stdout).expect("rustc deployment target is UTF-8");
+    let deployment_version = resolved
+        .trim()
+        .strip_prefix(&format!("{deployment_variable}="))
+        .expect("rustc reports the target platform's deployment variable")
+        .to_owned();
+    Some(AppleTarget {
+        sdk,
+        deployment_variable,
+        deployment_version,
+    })
 }
 
 /// Runs `command`, failing the build with `hint` when the tool is missing

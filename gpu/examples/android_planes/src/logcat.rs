@@ -22,6 +22,11 @@ pub fn line(line: &str) {
     write(INFO, TAG, line);
 }
 
+/// Writes `line` under `cherenkov` at INFO.
+pub fn info(line: &str) {
+    write(INFO, ENGINE_TAG, line);
+}
+
 /// Writes `line` under `cherenkov` at WARN.
 pub fn warn(line: &str) {
     write(WARN, ENGINE_TAG, line);

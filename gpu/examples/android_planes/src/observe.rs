@@ -8,15 +8,12 @@
 //! every planned frame.
 
 use std::collections::HashMap;
-use std::fmt::Debug;
-use std::io::Write;
+use std::fmt::{Debug, Write as _};
 use std::sync::{Arc, Mutex};
 
 use tracing::field::{Field, Visit};
-use tracing::{Event, Level, Subscriber};
+use tracing::{Event, Level, Metadata, Subscriber};
 use tracing_subscriber::Layer;
-use tracing_subscriber::filter::filter_fn;
-use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::{Context, SubscriberExt};
 use tracing_subscriber::util::SubscriberInitExt;
 
@@ -53,7 +50,7 @@ impl Decisions {
     }
 }
 
-/// Installs the global subscriber — the capture layer plus a fmt layer
+/// Installs the global subscriber — the capture layer plus a layer
 /// mirroring the engine's INFO+ messages into logcat — and returns the
 /// shared decision record.
 #[must_use]
@@ -62,15 +59,9 @@ pub fn install() -> Arc<Decisions> {
     let capture = Capture {
         decisions: Arc::clone(&decisions),
     };
-    let engine_log = tracing_subscriber::fmt::layer()
-        .with_ansi(false)
-        .with_writer(Logcat)
-        .with_filter(filter_fn(|meta| {
-            meta.target().starts_with("cherenkov") && *meta.level() <= Level::INFO
-        }));
     tracing_subscriber::registry()
         .with(capture)
-        .with(engine_log)
+        .with(Forward)
         .init();
     decisions
 }
@@ -120,6 +111,10 @@ struct Fields {
     layer: Option<u64>,
     reason: Option<String>,
     decision: Option<String>,
+    /// The event's `message` field, unquoted.
+    message: String,
+    /// Every other field's `key=debug` pair, in record order.
+    other: Vec<(String, String)>,
 }
 
 impl Visit for Fields {
@@ -129,38 +124,56 @@ impl Visit for Fields {
             "layer" => self.layer = parse_layer_id(&rendered),
             "reason" => self.reason = Some(rendered),
             "decision" => self.decision = Some(rendered),
-            _ => {}
+            "message" => self.message = unquote(&rendered),
+            name => self.other.push((name.to_owned(), rendered)),
         }
     }
 
     fn record_str(&mut self, field: &Field, value: &str) {
-        if field.name() == "decision" {
-            self.decision = Some(value.to_owned());
+        match field.name() {
+            "decision" => self.decision = Some(value.to_owned()),
+            "message" => value.clone_into(&mut self.message),
+            name => self.other.push((name.to_owned(), format!("{value:?}"))),
         }
     }
 }
 
-/// Writes fmt output into logcat under the `cherenkov` tag.
-struct Logcat;
-
-impl MakeWriter<'_> for Logcat {
-    type Writer = LogcatWriter;
-
-    fn make_writer(&self) -> Self::Writer {
-        LogcatWriter
-    }
+/// `"text"` → `text`; values without quotes pass through.
+fn unquote(debug: &str) -> String {
+    debug
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .unwrap_or(debug)
+        .to_owned()
 }
 
-struct LogcatWriter;
+/// Forwards `cherenkov*` engine events at INFO and above into logcat
+/// under the `cherenkov` tag, one line per event at the event's own
+/// level.
+///
+/// A `Layer::on_event` writes directly rather than going through a
+/// `fmt::Layer` and its `MakeWriter`: that path produced no output on
+/// device while this `on_event` channel (which `Capture` also uses) does.
+struct Forward;
 
-impl Write for LogcatWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let text = String::from_utf8_lossy(buf);
-        logcat::warn(text.trim_end());
-        Ok(buf.len())
+impl<S: Subscriber> Layer<S> for Forward {
+    fn enabled(&self, meta: &Metadata<'_>, _ctx: Context<'_, S>) -> bool {
+        meta.target().starts_with("cherenkov") && *meta.level() <= Level::INFO
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
+    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+        let mut fields = Fields::default();
+        event.record(&mut fields);
+        let mut text = String::new();
+        for (name, value) in &fields.other {
+            let _ = write!(text, "{name}={value} ");
+        }
+        text.push_str(&fields.message);
+        let line = format!("{}: {text}", event.metadata().target());
+        match *event.metadata().level() {
+            Level::ERROR => logcat::error(&line),
+            Level::WARN => logcat::warn(&line),
+            _ => logcat::info(&line),
+        }
     }
 }

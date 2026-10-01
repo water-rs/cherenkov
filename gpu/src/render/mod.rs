@@ -59,50 +59,58 @@ enum Bound {
 }
 
 #[derive(Clone, Copy)]
+enum CoveragePhase {
+    Opaque = 0,
+    Partial = 1,
+}
+
+#[derive(Clone, Copy)]
 enum CoveragePass {
     Painter(bool),
-    Opaque,
-    Partial,
+    Coverage(CoveragePhase),
 }
 
 impl CoveragePass {
     const fn topology(self) -> wgpu::PrimitiveTopology {
         match self {
-            Self::Painter(_) | Self::Partial => wgpu::PrimitiveTopology::TriangleList,
-            Self::Opaque => wgpu::PrimitiveTopology::TriangleStrip,
+            Self::Painter(_) | Self::Coverage(CoveragePhase::Partial) => {
+                wgpu::PrimitiveTopology::TriangleList
+            }
+            Self::Coverage(CoveragePhase::Opaque) => wgpu::PrimitiveTopology::TriangleStrip,
         }
     }
+
     const fn vertex(self) -> &'static str {
         match self {
             Self::Painter(_) => "vs_main",
-            Self::Opaque => "vs_opaque",
-            Self::Partial => "vs_partial",
+            Self::Coverage(CoveragePhase::Opaque) => "vs_opaque",
+            Self::Coverage(CoveragePhase::Partial) => "vs_partial",
         }
     }
 
     const fn fragment(self) -> &'static str {
         match self {
             Self::Painter(_) => "fs_main",
-            Self::Opaque => "fs_opaque",
-            Self::Partial => "fs_partial",
+            Self::Coverage(CoveragePhase::Opaque) => "fs_opaque",
+            Self::Coverage(CoveragePhase::Partial) => "fs_partial",
         }
     }
 
     const fn blend(self) -> Option<wgpu::BlendState> {
         match self {
-            Self::Painter(false) | Self::Partial => {
+            Self::Painter(false) | Self::Coverage(CoveragePhase::Partial) => {
                 Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING)
             }
-            Self::Painter(true) | Self::Opaque => None,
+            Self::Painter(true) | Self::Coverage(CoveragePhase::Opaque) => None,
         }
     }
 
     fn depth(self) -> Option<wgpu::DepthStencilState> {
         match self {
             Self::Painter(_) => None,
-            Self::Opaque | Self::Partial => Some(wgpu::DepthStencilState {
+            Self::Coverage(phase) => Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: Some(matches!(self, Self::Opaque)),
+                depth_write_enabled: Some(matches!(phase, CoveragePhase::Opaque)),
                 depth_compare: Some(wgpu::CompareFunction::Greater),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
@@ -1571,16 +1579,15 @@ fn core_pipeline<'m>(
 fn coverage_pipeline<'m>(
     pipelines: &'m mut [Option<wgpu::RenderPipeline>; 2],
     factory: &PipelineFactory<'_>,
-    mode: CoveragePass,
+    phase: CoveragePhase,
 ) -> Result<&'m wgpu::RenderPipeline, RenderError> {
-    let index = match mode {
-        CoveragePass::Opaque => 0,
-        CoveragePass::Partial => 1,
-        CoveragePass::Painter(_) => unreachable!("not a coverage phase"),
-    };
-    let cell = &mut pipelines[index];
+    let cell = &mut pipelines[phase as usize];
     if cell.is_none() {
-        *cell = Some(factory.create(TARGET_FORMAT, mode, ShaderVariant::Simple)?);
+        *cell = Some(factory.create(
+            TARGET_FORMAT,
+            CoveragePass::Coverage(phase),
+            ShaderVariant::Simple,
+        )?);
     }
     Ok(cell.as_ref().expect("coverage pipeline ready"))
 }
@@ -1750,9 +1757,9 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
                     }
                 }
             }
-            for (cell, mode) in coverage_pipelines
+            for (cell, phase) in coverage_pipelines
                 .iter_mut()
-                .zip([CoveragePass::Opaque, CoveragePass::Partial])
+                .zip([CoveragePhase::Opaque, CoveragePhase::Partial])
             {
                 *cell = Some(create_pipeline(
                     &device,
@@ -1761,7 +1768,7 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
                     pipeline_cache.as_ref(),
                     &modules[0],
                     TARGET_FORMAT,
-                    mode,
+                    CoveragePass::Coverage(phase),
                 )?);
             }
         }
@@ -2053,7 +2060,7 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
                 pipeline_cache.as_ref(),
                 &modules[0],
                 TARGET_FORMAT,
-                CoveragePass::Opaque,
+                CoveragePass::Coverage(CoveragePhase::Opaque),
             ),
             create_pipeline(
                 &device,
@@ -2062,7 +2069,7 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
                 pipeline_cache.as_ref(),
                 &modules[0],
                 TARGET_FORMAT,
-                CoveragePass::Partial,
+                CoveragePass::Coverage(CoveragePhase::Partial),
             ),
         )
         .await?,
@@ -5973,7 +5980,7 @@ impl GpuRenderer {
                 render_pass.set_pipeline(coverage_pipeline(
                     &mut self.coverage_pipelines,
                     &factory,
-                    CoveragePass::Opaque,
+                    CoveragePhase::Opaque,
                 )?);
                 render_pass.set_bind_group(0, &self.bind0, &[pass_index * 256]);
                 let bind = surf
@@ -6002,7 +6009,7 @@ impl GpuRenderer {
                 render_pass.set_pipeline(coverage_pipeline(
                     &mut self.coverage_pipelines,
                     &factory,
-                    CoveragePass::Partial,
+                    CoveragePhase::Partial,
                 )?);
                 render_pass
                     .set_index_buffer(self.quad_indices.slice(..), wgpu::IndexFormat::Uint16);

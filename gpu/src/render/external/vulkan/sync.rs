@@ -448,9 +448,13 @@ impl Generation {
                 if self.shared.vk.external_semaphore_fd.is_none() {
                     return Err(NativeError::Unsupported("OPAQUE_FD semaphore import"));
                 }
+                // The imported handle type must be declared exportable at
+                // creation (VUID-VkImportSemaphoreFdInfoKHR-handleType-01133).
+                let mut export = vk::ExportSemaphoreCreateInfo::default()
+                    .handle_types(vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_FD);
+                let info = vk::SemaphoreCreateInfo::default().push_next(&mut export);
                 let semaphore =
-                    unsafe { dev.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }
-                        .map_err(NativeError::from)?;
+                    unsafe { dev.create_semaphore(&info, None) }.map_err(NativeError::from)?;
                 let info = vk::ImportSemaphoreFdInfoKHR::default()
                     .semaphore(semaphore)
                     .flags(vk::SemaphoreImportFlags::TEMPORARY)
@@ -484,9 +488,11 @@ impl Generation {
                 if self.shared.vk.external_semaphore_fd.is_none() {
                     return Err(NativeError::Unsupported("SYNC_FD semaphore import"));
                 }
+                let mut export = vk::ExportSemaphoreCreateInfo::default()
+                    .handle_types(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+                let info = vk::SemaphoreCreateInfo::default().push_next(&mut export);
                 let semaphore =
-                    unsafe { dev.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }
-                        .map_err(NativeError::from)?;
+                    unsafe { dev.create_semaphore(&info, None) }.map_err(NativeError::from)?;
                 let info = vk::ImportSemaphoreFdInfoKHR::default()
                     .semaphore(semaphore)
                     .flags(vk::SemaphoreImportFlags::TEMPORARY)

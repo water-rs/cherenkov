@@ -225,40 +225,25 @@ unsafe fn luma_row8(base: *mut u8, row: usize, frame: u64, luma: [u8; 4]) {
     }
 }
 
-/// Writes one luma row (u16 P010 codes) of `frame` at `row` into `base`.
-///
-/// # Safety
-/// `base` has room for `WIDTH` u16s.
-unsafe fn luma_row10(base: *mut u16, row: usize, frame: u64, luma: [u16; 4]) {
+/// The strip's luma row: `CELL`-wide cells, bit i of `frame` at cell i.
+fn strip_row10(frame: u64) -> Vec<u16> {
     let width = WIDTH as usize;
-    let strip = row >= (HEIGHT - STRIP) as usize;
-    if strip {
-        let mut x = 0usize;
-        while x < width {
-            let bit = frame >> ((x / CELL as usize) % 64) & 1;
-            let cell = (CELL as usize).min(width - x);
-            unsafe {
-                std::slice::from_raw_parts_mut(base.add(x), cell).fill(if bit == 1 {
-                    940 << 6
-                } else {
-                    80 << 6
-                });
-            };
-            x += cell;
-        }
-        return;
+    let mut row = vec![0u16; width];
+    let mut x = 0usize;
+    while x < width {
+        let bit = frame >> ((x / CELL as usize) % 64) & 1;
+        let cell = (CELL as usize).min(width - x);
+        row[x..x + cell].fill(if bit == 1 { 940 << 6 } else { 80 << 6 });
+        x += cell;
     }
-    let top = row < (HEIGHT / 2) as usize;
-    let (left, right) = if top {
-        (luma[0], luma[1])
-    } else {
-        (luma[2], luma[3])
-    };
-    unsafe {
-        std::slice::from_raw_parts_mut(base, width / 2).fill(left);
-        std::slice::from_raw_parts_mut(base.add(width / 2), width / 2).fill(right);
-        let bar = bar_x(frame);
-        std::slice::from_raw_parts_mut(base.add(bar), BAR as usize).fill(940 << 6);
+    row
+}
+
+/// `pair` interleaved over `dst` — one P010 (Cb, Cr) run.
+fn interleave10(dst: &mut [u16], pair: (u16, u16)) {
+    let (samples, _) = dst.as_chunks_mut::<2>();
+    for sample in samples {
+        *sample = [pair.0, pair.1];
     }
 }
 
@@ -353,40 +338,54 @@ pub unsafe fn fill_p010(base: *mut u8, stride: usize, frame: u64) {
         let (_, cb, cr) = code2020(rgb);
         (cb, cr)
     });
+    let width = WIDTH as usize;
+    // The frame is a handful of row patterns repeated hundreds of times:
+    // build each once, then copy one row at a time into the mapped
+    // buffer and patch the moving bar's run — memcpy instead of
+    // per-sample writes.
+    let (mut y_top, mut y_bot) = (vec![luma[0]; width], vec![luma[2]; width]);
+    y_top[width / 2..].fill(luma[1]);
+    y_bot[width / 2..].fill(luma[3]);
+    let y_strip = strip_row10(frame);
+    let (mut uv_top, mut uv_bot) = (vec![0u16; CW * 2], vec![0u16; CW * 2]);
+    interleave10(&mut uv_top[..CW], chroma[0]);
+    interleave10(&mut uv_top[CW..], chroma[1]);
+    interleave10(&mut uv_bot[..CW], chroma[2]);
+    interleave10(&mut uv_bot[CW..], chroma[3]);
+    let bar = bar_x(frame);
+    let bar_cols = (bar / 2)..(bar / 2 + (BAR / 2) as usize);
     unsafe {
         let y_base = base.cast::<u16>();
         for row in 0..HEIGHT as usize {
-            luma_row10(y_base.add(row * stride), row, frame, luma);
+            let dst = std::slice::from_raw_parts_mut(y_base.add(row * stride), width);
+            let (src, patch_bar) = if row >= (HEIGHT - STRIP) as usize {
+                (y_strip.as_slice(), false)
+            } else if row < (HEIGHT / 2) as usize {
+                (y_top.as_slice(), true)
+            } else {
+                (y_bot.as_slice(), true)
+            };
+            dst.copy_from_slice(src);
+            if patch_bar {
+                dst[bar..bar + BAR as usize].fill(940 << 6);
+            }
         }
         // The interleaved chroma plane follows the luma plane.
         let uv_base = base.add(stride * 2 * HEIGHT as usize).cast::<u16>();
         for row in 0..CH {
             let luma_row = row * 2;
-            let strip = luma_row >= (HEIGHT - STRIP) as usize;
-            let dst = uv_base.add(row * stride);
-            if strip {
+            let dst = std::slice::from_raw_parts_mut(uv_base.add(row * stride), CW * 2);
+            if luma_row >= (HEIGHT - STRIP) as usize {
                 // Both codes equal — one flat run.
-                std::slice::from_raw_parts_mut(dst, CW * 2).fill(512 << 6);
+                dst.fill(512 << 6);
                 continue;
             }
-            let top = luma_row < (HEIGHT / 2) as usize;
-            let (l, r) = if top {
-                (chroma[0], chroma[1])
+            dst.copy_from_slice(if luma_row < (HEIGHT / 2) as usize {
+                uv_top.as_slice()
             } else {
-                (chroma[2], chroma[3])
-            };
-            for col in 0..CW / 2 {
-                *dst.add(col * 2) = l.0;
-                *dst.add(col * 2 + 1) = l.1;
-            }
-            for col in CW / 2..CW {
-                *dst.add(col * 2) = r.0;
-                *dst.add(col * 2 + 1) = r.1;
-            }
-            let bar = bar_x(frame) / 2;
-            let bar_cols = bar..bar + (BAR / 2) as usize;
-            std::slice::from_raw_parts_mut(dst.add(bar_cols.start * 2), bar_cols.len() * 2)
-                .fill(512 << 6);
+                uv_bot.as_slice()
+            });
+            dst[bar_cols.start * 2..bar_cols.end * 2].fill(512 << 6);
         }
     }
 }

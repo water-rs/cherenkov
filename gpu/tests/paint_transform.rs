@@ -1,21 +1,25 @@
 //! Independent paint coordinates on the gpu backend.
+use cherenkov::{__engine_test as split_test, __engine_wait as wait};
 #[path = "../../tests/support/paint_transform.rs"]
 mod common;
 
-#[test]
+split_test! {
 fn live_paint_transforms_preserve_geometry_and_retained_output() {
-    common::retained::<cherenkov_gpu::Gpu>(cherenkov_gpu::GpuConfig::default());
+    wait!(common::retained::<cherenkov_gpu::Gpu>(cherenkov_gpu::GpuConfig::default()));
 }
-#[test]
+}
+split_test! {
 fn nested_paint_transforms_compose_and_sample_analytically() {
-    common::composition::<cherenkov_gpu::Gpu>(cherenkov_gpu::GpuConfig::default());
+    wait!(common::composition::<cherenkov_gpu::Gpu>(cherenkov_gpu::GpuConfig::default()));
 }
-#[test]
+}
+split_test! {
 fn singular_and_non_finite_paint_transforms_fail() {
-    common::invalid::<cherenkov_gpu::Gpu>(cherenkov_gpu::GpuConfig::default());
+    wait!(common::invalid::<cherenkov_gpu::Gpu>(cherenkov_gpu::GpuConfig::default()));
+}
 }
 
-#[test]
+split_test! {
 fn shader_paint_transform_changes_sampling_without_moving_geometry()
 -> Result<(), Box<dyn std::error::Error>> {
     use cherenkov::kurbo::{Affine, Rect};
@@ -23,9 +27,9 @@ fn shader_paint_transform_changes_sampling_without_moving_geometry()
         Draw, Engine, FrameTime, Offscreen, OffscreenFormat, Paint, ShaderPaint, ShaderSource,
     };
     use cherenkov_gpu::{Gpu, GpuConfig};
-    let engine = Engine::<Gpu>::new(GpuConfig::default())?;
+    let engine = wait!(Engine::<Gpu>::new(GpuConfig::default()))?;
     let shader = engine.shader(ShaderSource::wgsl(include_str!("shaders/paint.wgsl")))?;
-    let surface = engine.surface(Offscreen::new((32, 32), OffscreenFormat::LinearF16))?;
+    let surface = wait!(engine.surface(Offscreen::new((32, 32), OffscreenFormat::LinearF16)))?;
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|c| {
             c.fill(
@@ -38,8 +42,8 @@ fn shader_paint_transform_changes_sampling_without_moving_geometry()
             );
         }));
     });
-    engine.render(FrameTime::now())?;
-    let pixels = surface.readback()?.pixels;
+    wait!(engine.render(FrameTime::now()))?;
+    let pixels = wait!(surface.readback())?.pixels;
     let sample = pixels[18 * 32 + 18];
     assert!(
         (sample[1] - 0.40625).abs() < 0.002,
@@ -56,8 +60,9 @@ fn shader_paint_transform_changes_sampling_without_moving_geometry()
     );
     Ok(())
 }
+}
 
-#[test]
+split_test! {
 fn image_paint_transform_composes_before_pattern_transform() {
     use cherenkov::kurbo::{Affine, Rect};
     use cherenkov::{
@@ -65,7 +70,7 @@ fn image_paint_transform_composes_before_pattern_transform() {
         Paint, Rgba8, Sampling,
     };
     let engine =
-        Engine::<cherenkov_gpu::Gpu>::new(cherenkov_gpu::GpuConfig::default()).expect("GPU");
+        wait!(Engine::<cherenkov_gpu::Gpu>::new(cherenkov_gpu::GpuConfig::default())).expect("GPU");
     let image = engine
         .image(
             ImageData::<Rgba8>::new(
@@ -78,11 +83,11 @@ fn image_paint_transform_composes_before_pattern_transform() {
             .expect("image data"),
         )
         .expect("image");
-    let wrapped = engine
-        .surface(Offscreen::new((32, 32), OffscreenFormat::LinearF16))
+    let wrapped = wait!(engine
+        .surface(Offscreen::new((32, 32), OffscreenFormat::LinearF16)))
         .expect("surface");
-    let combined = engine
-        .surface(Offscreen::new((32, 32), OffscreenFormat::LinearF16))
+    let combined = wait!(engine
+        .surface(Offscreen::new((32, 32), OffscreenFormat::LinearF16)))
         .expect("surface");
     let pattern = Affine::translate((2.0, 3.0)) * Affine::scale_non_uniform(5.0, 7.0);
     let paint_map = Affine::new([-1.0, 0.25, 0.5, 1.0, 28.0, -3.0]);
@@ -108,15 +113,17 @@ fn image_paint_transform_composes_before_pattern_transform() {
             combined.record(|c| c.fill(Rect::new(1.0, 1.0, 31.0, 31.0), make(paint_map * pattern))),
         );
     });
-    engine.render(FrameTime::now()).expect("render");
-    let actual = wrapped.readback().expect("wrapped");
-    let expected = combined.readback().expect("combined");
+    wait!(engine.render(FrameTime::now())).expect("render");
+    let actual = wait!(wrapped.readback()).expect("wrapped");
+    let expected = wait!(combined.readback()).expect("combined");
     for (a, b) in actual.pixels.iter().zip(expected.pixels) {
         assert_eq!(a.map(f32::to_bits), b.map(f32::to_bits));
     }
 }
+}
 
-#[test]
+split_test! {
 fn explicit_identity_mapping_preserves_pixels_exactly() {
-    common::identity::<cherenkov_gpu::Gpu>(cherenkov_gpu::GpuConfig::default());
+    wait!(common::identity::<cherenkov_gpu::Gpu>(cherenkov_gpu::GpuConfig::default()));
+}
 }

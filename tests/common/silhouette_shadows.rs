@@ -1,4 +1,5 @@
 //! Retained shadows, viewport contributors and clipping after convolution.
+use cherenkov::{__engine_fn as split_fn, __engine_wait as wait};
 use cherenkov::{
     Backend, Draw, Engine, FrameTime, Offscreen, OffscreenFormat, Shadow, WorkingColor,
 };
@@ -15,13 +16,14 @@ fn silhouette() -> BezPath {
     p
 }
 
+split_fn! {
 pub fn retained_and_padded<B: Backend>(config: B::Config) {
-    let engine = Engine::<B>::new(config).expect("backend");
-    let actual = engine
-        .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))
+    let engine = wait!(Engine::<B>::new(config)).expect("backend");
+    let actual = wait!(engine
+        .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16)))
         .expect("surface");
-    let reference = engine
-        .surface(Offscreen::new((128, 128), OffscreenFormat::LinearF16))
+    let reference = wait!(engine
+        .surface(Offscreen::new((128, 128), OffscreenFormat::LinearF16)))
         .expect("reference");
     let color = WorkingColor::new([0.2, 0.5, 1.0, 0.75]);
     let shadow = nami::Binding::container(Shadow::new(3.0, color));
@@ -33,13 +35,13 @@ pub fn retained_and_padded<B: Backend>(config: B::Config) {
             });
         }));
     });
-    engine.render(FrameTime::now()).expect("initial");
+    wait!(engine.render(FrameTime::now())).expect("initial");
     for spread in [2.0, -2.0, 0.0] {
         let spec = Shadow::new(3.0, color).spread(spread);
         shadow.set(spec);
-        engine.render(FrameTime::now()).expect("live shadow");
+        wait!(engine.render(FrameTime::now())).expect("live shadow");
         assert_eq!(engine.stats().commands_lowered, 1);
-        let pixels = actual.readback().expect("pixels").pixels;
+        let pixels = wait!(actual.readback()).expect("pixels").pixels;
         reference.update(|tx| {
             tx[reference.root()].content(reference.record(|r| {
                 r.transform(Affine::translate((32.0, 32.0)), |r| {
@@ -50,8 +52,8 @@ pub fn retained_and_padded<B: Backend>(config: B::Config) {
                 });
             }));
         });
-        engine.render(FrameTime::now()).expect("padded reference");
-        let expected = reference.readback().expect("reference pixels").pixels;
+        wait!(engine.render(FrameTime::now())).expect("padded reference");
+        let expected = wait!(reference.readback()).expect("reference pixels").pixels;
         for y in 0..64 {
             for x in 0..64 {
                 let a = pixels[y * 64 + x];
@@ -71,11 +73,13 @@ pub fn retained_and_padded<B: Backend>(config: B::Config) {
                 }
             }
         }
-        engine.render(FrameTime::now()).expect("idle");
+        wait!(engine.render(FrameTime::now())).expect("idle");
         assert_eq!(engine.stats().commands_lowered, 0);
     }
 }
+}
 
+split_fn! {
 /// Invalid placements and parameters are errors, not empty silhouettes.
 pub fn invalid<B: Backend>(mut config: impl FnMut() -> B::Config) {
     for (transform, spec) in [
@@ -90,9 +94,9 @@ pub fn invalid<B: Backend>(mut config: impl FnMut() -> B::Config) {
             Shadow::new(3.0, WorkingColor::BLACK).offset((f64::NAN, 0.0)),
         ),
     ] {
-        let engine = Engine::<B>::new(config()).expect("engine");
-        let surface = engine
-            .surface(Offscreen::new((16, 16), OffscreenFormat::LinearF16))
+        let engine = wait!(Engine::<B>::new(config())).expect("engine");
+        let surface = wait!(engine
+            .surface(Offscreen::new((16, 16), OffscreenFormat::LinearF16)))
             .expect("surface");
         surface.update(|tx| {
             tx[surface.root()].content(surface.record(|r| {
@@ -102,8 +106,9 @@ pub fn invalid<B: Backend>(mut config: impl FnMut() -> B::Config) {
             }));
         });
         assert!(
-            engine.render(FrameTime::now()).is_err(),
+            wait!(engine.render(FrameTime::now())).is_err(),
             "invalid silhouette input must fail"
         );
     }
+}
 }

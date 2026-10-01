@@ -4,6 +4,10 @@
 //! shader-encode sRGB path and compared to the oracle's map quantized to
 //! unorm-8. In-gamut pixels must match the pre-#96 clamp result exactly.
 
+use cherenkov::{
+    __engine_block as block, __engine_fn as split_fn, __engine_test as split_test,
+    __engine_wait as wait,
+};
 use cherenkov_gpu::interop::{
     OutputAlpha, OutputColor, Presenter, TextureOutput, shader_delivery, wgpu,
 };
@@ -18,20 +22,22 @@ const P3_TO_LINEAR_SRGB: [[f64; 3]; 3] = [
     [-0.019_637_55, -0.078_636_05, 1.098_273_6],
 ];
 
+split_fn! {
 fn shared_device()
 -> Result<(wgpu::Instance, wgpu::Adapter, wgpu::Device, wgpu::Queue), Box<dyn std::error::Error>> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter =
-        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?;
+        block!(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?;
     let required_features = match adapter.get_info().backend {
         wgpu::Backend::Vulkan | wgpu::Backend::Metal => wgpu::Features::PASSTHROUGH_SHADERS,
         _ => wgpu::Features::empty(),
     };
-    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+    let (device, queue) = block!(adapter.request_device(&wgpu::DeviceDescriptor {
         required_features,
         ..wgpu::DeviceDescriptor::default()
     }))?;
     Ok((instance, adapter, device, queue))
+}
 }
 
 /// The oracle's expected stored byte for one opaque working-space pixel:
@@ -65,8 +71,7 @@ fn expected_bytes(headroom: f64, p3: [f64; 3]) -> [u8; 4] {
     [b[0], b[1], b[2], 255]
 }
 
-#[test]
-#[expect(clippy::too_many_lines, reason = "linear setup-render-assert sequence")]
+split_test! {
 fn present_gamut_map_matches_oracle() -> Result<(), Box<dyn std::error::Error>> {
     // Opaque premultiplied = straight pixels.
     let pixels: [[f32; 4]; 12] = [
@@ -89,7 +94,7 @@ fn present_gamut_map_matches_oracle() -> Result<(), Box<dyn std::error::Error>> 
     let ulp: [[f32; 4]; 1] = [[-7e-18, -3e-17, 1.0, 1.0]];
     let pixels: Vec<[f32; 4]> = pixels.iter().copied().chain(ulp).collect();
     let (w, h) = (u32::try_from(pixels.len()).unwrap(), 1);
-    let (_instance, adapter, device, queue) = shared_device()?;
+    let (_instance, adapter, device, queue) = wait!(shared_device())?;
 
     let source = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("gamut source"),
@@ -222,4 +227,5 @@ fn present_gamut_map_matches_oracle() -> Result<(), Box<dyn std::error::Error>> 
         }
     }
     Ok(())
+}
 }

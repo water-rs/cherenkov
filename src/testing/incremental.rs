@@ -241,12 +241,17 @@ where
 
 fn register_font<R: Renderer>(renderer: &mut R) -> FontId {
     let font = FontId::new(1);
+    // The scene tree is generated, not committed: read it at call time so
+    // the `testing` feature compiles for consumers pinned by git, and only
+    // `equivalence` needs the generated fonts.
+    let data = std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scenes/fonts/NotoSans.ttf"),
+    )
+    .expect("scenes/fonts/NotoSans.ttf is generated; run `python3 scenes/tools/generate.py` first");
     renderer.add_font(
         font,
         R::prepare_font(FontData {
-            data: include_bytes!("../../scenes/fonts/NotoSans.ttf")
-                .as_slice()
-                .into(),
+            data: data.into(),
             index: 0,
         })
         .expect("prepare font"),

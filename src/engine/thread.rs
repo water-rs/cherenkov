@@ -39,6 +39,21 @@ enum Presentation {
     },
 }
 
+/// What the commits since the last render changed. Ordered, so an
+/// install raises `Clean` to `Installs` and anything else forces `Other`
+/// — `changed` is `commits != Clean`, and the frame's `plane_frames` is
+/// `plane_frames` only when `commits == Installs` (#90).
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum Commits {
+    /// Nothing committed.
+    Clean,
+    /// Only external-frame installs — `plane_frames` names their layers.
+    Installs,
+    /// A layer op, a clear, a resize, a display scale change or an image
+    /// replacement landed too.
+    Other,
+}
+
 /// One surface's render-thread state.
 struct SurfaceState {
     tree: SurfaceTree,
@@ -46,13 +61,13 @@ struct SurfaceState {
     display: Display,
     clear: WorkingColor,
     /// Whether a property op, a content op or an animation step touched the
-    /// surface since the last render.
-    changed: bool,
-    /// The layers whose external frame was installed since the last render,
-    /// when those installs are the surface's only change: `Some` collects
-    /// them, and `None` records that something else — a layer op, a clear,
-    /// a resize, a display scale change — changed too (#90).
-    plane_frames: Option<FxHashSet<LayerId>>,
+    /// surface since the last render — and whether only installs did.
+    commits: Commits,
+    /// The layers whose external frame was installed since the last
+    /// render. The set lives for the surface's life: a render clears it
+    /// rather than reallocating it, so a steady stream of plane-only
+    /// frames allocates nothing (#90).
+    plane_frames: FxHashSet<LayerId>,
     /// Whether the surface presents, and whether a present is pending (#98).
     presentation: Presentation,
     /// Whether the host announced the surface moved to another display
@@ -192,7 +207,10 @@ impl<B: Backend> Resources<B> {
             return;
         }
         for (resource, pending) in &mut self.pending {
-            for (surface, state) in surfaces.iter().filter(|(_, state)| state.changed) {
+            for (surface, state) in surfaces
+                .iter()
+                .filter(|(_, state)| state.commits != Commits::Clean)
+            {
                 if draws(renderer, *surface, state, *resource) {
                     pending.surfaces.insert(*surface);
                 } else {
@@ -238,7 +256,10 @@ impl<B: Backend> Resources<B> {
         if self.rejections.is_empty() {
             return Ok(());
         }
-        for (surface, state) in surfaces.iter().filter(|(_, state)| state.changed) {
+        for (surface, state) in surfaces
+            .iter()
+            .filter(|(_, state)| state.commits != Commits::Clean)
+        {
             for (resource, rejection) in &self.rejections {
                 if draws(renderer, *surface, state, *resource) {
                     return Err(RenderError::Rejected {
@@ -397,8 +418,8 @@ fn create_surface<B: Backend>(
             size: info.size,
             display: Display::default(),
             clear: WorkingColor::TRANSPARENT,
-            changed: true,
-            plane_frames: None,
+            commits: Commits::Other,
+            plane_frames: FxHashSet::default(),
             presentation: if info.presents {
                 Presentation::Presenting { pending: false }
             } else {
@@ -420,8 +441,7 @@ fn resize_surface<B: Backend>(
     renderer.resize_surface(id, size);
     if let Some(state) = surfaces.get_mut(&id) {
         state.size = size;
-        state.changed = true;
-        state.plane_frames = None;
+        state.commits = Commits::Other;
     } else {
         tracing::trace!(surface = id.raw(), "resize of unknown surface");
     }
@@ -452,9 +472,8 @@ fn set_display(surfaces: &mut FxHashMap<SurfaceId, SurfaceState>, id: SurfaceId,
             // re-presents without touching it (#98). Only a presenting
             // surface can be pending a present.
             let scale_changed = state.display.scale.to_bits() != display.scale.to_bits();
-            state.changed |= scale_changed;
             if scale_changed {
-                state.plane_frames = None;
+                state.commits = Commits::Other;
             }
             state.mark_present();
             state.display = display;
@@ -519,8 +538,7 @@ fn replace_image<B: Backend>(
     }
     for (surface, state) in surfaces {
         if renderer.samples(*surface, resource) {
-            state.changed = true;
-            state.plane_frames = None;
+            state.commits = Commits::Other;
         }
     }
 }
@@ -541,21 +559,19 @@ fn commit<B: Backend>(
     } = changes;
     if let Some(clear) = clear.take() {
         state.clear = clear;
-        state.changed = true;
-        state.plane_frames = None;
+        state.commits = Commits::Other;
     }
     state.content_animating = *animating;
     for op in ops.drain(..) {
-        state.changed = true;
         match op {
             Op::Layer(LayerOp::Remove(layer)) => {
-                state.plane_frames = None;
+                state.commits = Commits::Other;
                 for removed in state.tree.remove(layer) {
                     renderer.remove_layer(surface, removed);
                 }
             }
             Op::Layer(LayerOp::Content(layer, content)) => {
-                state.plane_frames = None;
+                state.commits = Commits::Other;
                 state.tree.apply(LayerOp::Content(layer, None));
                 state.tree.note_content(layer, content.as_ref());
                 if let Some(mut old) = renderer.set_content(surface, layer, content)
@@ -565,21 +581,20 @@ fn commit<B: Backend>(
                 }
             }
             Op::Layer(op) => {
-                state.plane_frames = None;
+                state.commits = Commits::Other;
                 state.tree.apply(op);
             }
             Op::Install(install) => {
-                state.plane_frames = None;
+                state.commits = Commits::Other;
                 install(&mut *renderer);
             }
             Op::ExternalFrame { layer, install } => {
-                // A frame swap is a change like any other — `changed`
-                // stays set — but it is also recorded apart, so a backend
-                // with planes can tell a plane-only frame (#90).
+                // A frame swap is a change like any other — `commits`
+                // still rises from `Clean` — but it is recorded apart, so
+                // a backend with planes can tell a plane-only frame (#90).
                 install(&mut *renderer);
-                if let Some(frames) = &mut state.plane_frames {
-                    frames.insert(layer);
-                }
+                state.commits = state.commits.max(Commits::Installs);
+                state.plane_frames.insert(layer);
             }
         }
     }
@@ -627,7 +642,7 @@ fn render<B: Backend>(
     let mut rate = None;
     for (id, state) in &mut *surfaces {
         let sampling = state.tree.sample(time, state.display);
-        let changed = state.changed || sampling.stepped;
+        let changed = state.commits != Commits::Clean || sampling.stepped;
         // Operand animations run on the UI thread and are springs or
         // curves only: they always need the fast class.
         let running = if state.content_animating {
@@ -648,13 +663,10 @@ fn render<B: Backend>(
             changed,
             // A stepped animation changed the sampled tree: the frame is
             // never plane-only, however it was committed.
-            plane_frames: if sampling.stepped {
+            plane_frames: if sampling.stepped || state.commits != Commits::Installs {
                 None
             } else {
-                state
-                    .plane_frames
-                    .as_ref()
-                    .filter(|frames| !frames.is_empty())
+                Some(&state.plane_frames).filter(|frames| !frames.is_empty())
             },
             present_pending: state.present_pending(),
             display_moved: state.display_moved,
@@ -671,8 +683,8 @@ fn render<B: Backend>(
         &mut stats,
     )?;
     for state in surfaces.values_mut() {
-        state.changed = false;
-        state.plane_frames = Some(FxHashSet::default());
+        state.commits = Commits::Clean;
+        state.plane_frames.clear();
         state.display_moved = false;
         state.presented();
     }
@@ -707,7 +719,7 @@ async fn render_local<B: Backend>(
     let mut rate = None;
     for (id, state) in &mut *surfaces {
         let sampling = state.tree.sample(time, state.display);
-        let changed = state.changed || sampling.stepped;
+        let changed = state.commits != Commits::Clean || sampling.stepped;
         // Operand animations run on the UI thread and are springs or
         // curves only: they always need the fast class.
         let running = if state.content_animating {
@@ -728,13 +740,10 @@ async fn render_local<B: Backend>(
             changed,
             // A stepped animation changed the sampled tree: the frame is
             // never plane-only, however it was committed.
-            plane_frames: if sampling.stepped {
+            plane_frames: if sampling.stepped || state.commits != Commits::Installs {
                 None
             } else {
-                state
-                    .plane_frames
-                    .as_ref()
-                    .filter(|frames| !frames.is_empty())
+                Some(&state.plane_frames).filter(|frames| !frames.is_empty())
             },
             present_pending: state.present_pending(),
             display_moved: state.display_moved,
@@ -753,8 +762,8 @@ async fn render_local<B: Backend>(
         )
         .await?;
     for state in surfaces.values_mut() {
-        state.changed = false;
-        state.plane_frames = Some(FxHashSet::default());
+        state.commits = Commits::Clean;
+        state.plane_frames.clear();
         state.display_moved = false;
         state.presented();
     }
@@ -773,7 +782,7 @@ async fn render_local<B: Backend>(
 
 #[cfg(all(test, feature = "testing", not(target_arch = "wasm32")))]
 mod tests {
-    use super::{Presentation, SurfaceState, commit};
+    use super::{Commits, Presentation, SurfaceState, commit};
     use crate::WorkingColor;
     use crate::backend::{Backend, Display};
     use crate::display_list::{Command, DisplayList, Picture};
@@ -799,8 +808,8 @@ mod tests {
             size: (1, 1),
             display: Display::default(),
             clear: WorkingColor::TRANSPARENT,
-            changed: false,
-            plane_frames: Some(rustc_hash::FxHashSet::default()),
+            commits: Commits::Clean,
+            plane_frames: rustc_hash::FxHashSet::default(),
             presentation: Presentation::Retained,
             display_moved: false,
             content_animating: false,

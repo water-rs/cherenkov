@@ -11,6 +11,36 @@ use cherenkov_gpu::{Gpu, GpuConfig};
 const CLEAR: WorkingColor = WorkingColor::new([0.0, 0.0, 0.0, 1.0]);
 const RED: WorkingColor = WorkingColor::new([1.0, 0.0, 0.0, 1.0]);
 
+split_test! {
+/// Two integer translations admitted before atlas commit share the entire
+/// coverage layout, not just the eventual cell addresses.
+fn pending_paths_reuse_their_coverage_layout() -> Result<(), Box<dyn std::error::Error>> {
+    use cherenkov::kurbo::{Affine, Shape as _};
+    let engine = wait!(Engine::<Gpu>::new(GpuConfig::default()))?;
+    let surface = wait!(engine.surface(Offscreen::new((128, 80), OffscreenFormat::LinearF16)))?;
+    surface.clear_color(CLEAR);
+    let path = Circle::new((400.0, 450.0), 400.0).to_path(0.01);
+    surface.update(|tx| {
+        tx[surface.root()].content(surface.record(|c| {
+            for x in [12.0, 77.0] {
+                c.transform(Affine::new([0.052, 0.0, 0.0, -0.052, x, 58.8]), |c| {
+                    c.fill(path.clone(), RED);
+                });
+            }
+        }));
+    });
+    wait!(engine.render(cherenkov::FrameTime::now()))?;
+    assert_eq!(engine.stats().paths_rasterized, 1);
+    let pixels = wait!(surface.readback())?;
+    for y in 0..80 {
+        for x in 0..63 {
+            assert_eq!(px(&pixels, x, y), px(&pixels, x + 65, y), "translated pixel {x},{y}");
+        }
+    }
+    Ok(())
+}
+}
+
 /// A self-intersecting 5-point star over a 64×64 surface, centred.
 fn star() -> BezPath {
     let mut path = BezPath::new();

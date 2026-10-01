@@ -949,6 +949,9 @@ pub struct Lowering<'a> {
     mask_pending: Option<u32>,
     /// Atlas writes and cache updates to commit, in lowering order.
     pub(crate) pending: Vec<PendingRaster>,
+    /// Path identities admitted during this lowering, before atlas commit.
+    /// A second use must replay the admitted layout as well as its texels.
+    pending_paths: FxHashMap<u64, u32>,
     pub commands_lowered: u32,
     pub layers_composed: u32,
     /// Backdrop groups planned before lowering.
@@ -1011,6 +1014,7 @@ impl<'a> Lowering<'a> {
             emission_patches: Vec::new(),
             mask_patches: Vec::new(),
             pending: Vec::new(),
+            pending_paths: FxHashMap::default(),
             commands_lowered: 0,
             layers_composed: 0,
             backdrops: FxHashMap::default(),
@@ -3460,6 +3464,18 @@ impl<'a> Lowering<'a> {
             self.replay(emit, None, pl.offset, paint, shader_data.as_ref());
             return Ok(());
         }
+        if let Some(&pending) = self
+            .pending_paths
+            .get(&pl.key)
+            .or_else(|| self.pending_paths.get(&pl.key_exact()))
+        {
+            let PendingRaster::Path { emit, .. } = &self.pending[pending as usize] else {
+                unreachable!("pending path identity addresses a path");
+            };
+            let emit = emit.clone();
+            self.replay(&emit, Some(pending), pl.offset, paint, shader_data.as_ref());
+            return Ok(());
+        }
         let (stored, pending) = 'stored: {
             let device =
                 pl.raster * shader_path.unwrap_or_else(|| make.take().expect("path factory")());
@@ -3493,6 +3509,7 @@ impl<'a> Lowering<'a> {
                 emit: stored.clone(),
                 cells,
             });
+            self.pending_paths.insert(key, pending);
             (stored, Some(pending))
         };
         self.replay(&stored, pending, pl.offset, paint, shader_data.as_ref());

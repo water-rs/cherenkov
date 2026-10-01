@@ -281,9 +281,11 @@ fn a_cone_gradient_matches_the_oracle() {
     }
 }
 
-/// Dropping the last `Font` clone frees the renderer's font state: the
-/// atlas's glyph cells are purged and a later frame referencing the id
-/// fails fast instead of silently keeping the font alive.
+/// Dropping the last `Font` clone frees the renderer's font state once no
+/// installed content draws the font (#199): until then frames that
+/// consult it still draw; afterwards the atlas's glyph cells are purged and
+/// content installed later that names the id fails fast instead of silently
+/// keeping the font alive.
 #[test]
 fn dropping_a_font_frees_its_renderer_state() -> Result<(), Box<dyn std::error::Error>> {
     let Some(engine) = engine(GpuConfig::default()) else {
@@ -293,24 +295,39 @@ fn dropping_a_font_frees_its_renderer_state() -> Result<(), Box<dyn std::error::
     let font_id = font.id();
     let surface = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
     let runs = text_runs(font_id, 8, 24.0);
-    surface.update(|tx| {
-        tx[surface.root()].content(surface.record(|c| {
-            c.glyphs(runs[0].clone(), WorkingColor::WHITE);
-        }));
-    });
+    let text = |surface: &cherenkov::Surface<Gpu>| {
+        surface.update(|tx| {
+            tx[surface.root()].content(surface.record(|c| {
+                c.glyphs(runs[0].clone(), WorkingColor::WHITE);
+            }));
+        });
+    };
+    text(&surface);
     engine.render(cherenkov::FrameTime::now())?;
     assert!(engine.memory().cpu > Bytes(0), "glyph cells cached");
     drop(font);
     // Dirty the surface so the next frame re-lowers and consults the font.
     surface.clear_color(WorkingColor::new([0.0, 0.0, 0.0, 1.0]));
+    engine.render(cherenkov::FrameTime::now())?;
+    assert!(
+        engine.memory().cpu > Bytes(0),
+        "the installed content still draws the font"
+    );
+    surface.update(|tx| {
+        tx[surface.root()].content(surface.record(|c| {
+            c.fill(Rect::new(0.0, 0.0, 64.0, 64.0), WorkingColor::WHITE);
+        }));
+    });
+    engine.render(cherenkov::FrameTime::now())?;
+    assert_eq!(engine.memory().cpu, Bytes(0), "font cells released");
+    text(&surface);
     assert!(
         matches!(
             engine.render(cherenkov::FrameTime::now()),
             Err(RenderError::Font(_))
         ),
-        "render after the last Font clone dropped"
+        "content installed after the font was freed"
     );
-    assert_eq!(engine.memory().cpu, Bytes(0), "font cells released");
     Ok(())
 }
 

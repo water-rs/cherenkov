@@ -2,7 +2,10 @@
 #![cfg(target_arch = "wasm32")]
 
 use cherenkov::kurbo::Rect;
-use cherenkov::{Draw, Engine, FrameTime, Next, Offscreen, OffscreenFormat, WorkingColor};
+use cherenkov::{
+    Draw, Engine, FontSource, FrameTime, Glyph, GlyphRun, GlyphStyle, ImageData, Next, Offscreen,
+    OffscreenFormat, Rgba8, Sampling, ShaderPaint, ShaderSource, WorkingColor,
+};
 use cherenkov_gpu::{
     Gpu, GpuConfig,
     interop::{GpuContent, GpuContentBox, SharedDevice, wgpu},
@@ -157,17 +160,15 @@ async fn local_producers_share_device_and_preserve_wakes_during_await() {
     clippy::future_not_send,
     reason = "the browser engine is single-threaded and its futures run on the page's event loop"
 )]
-async fn shader_validation_yields_and_returns_errors() {
+async fn shader_validation_returns_errors_before_queueing() {
     let engine = Engine::<Gpu>::new(GpuConfig::default())
         .await
         .expect("engine");
     assert!(matches!(
-        engine
-            .shader(cherenkov::ShaderSource::wgsl("invalid shader"))
-            .await,
+        engine.shader(ShaderSource::wgsl("invalid shader")),
         Err(cherenkov::ResourceError::Shader(_))
     ));
-    let shader = engine.shader(cherenkov::ShaderSource::wgsl("@fragment fn main() -> @location(0) vec4<f32> { return vec4<f32>(0.0, 0.0, 1.0, 1.0); }")).await.expect("shader");
+    let shader = engine.shader(ShaderSource::wgsl(BLUE)).expect("shader");
     let surface = engine
         .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))
         .await
@@ -176,7 +177,7 @@ async fn shader_validation_yields_and_returns_errors() {
         tx[surface.root()].content(surface.record(|r| {
             r.fill(
                 Rect::new(0., 0., 8., 8.),
-                cherenkov::ShaderPaint {
+                ShaderPaint {
                     shader: shader.id(),
                     uniforms: vec![],
                 },
@@ -192,6 +193,88 @@ async fn shader_validation_yields_and_returns_errors() {
     );
     let pixels = surface.readback().await.expect("pixels").pixels;
     assert!((pixels[4 * 8 + 4][2] - 1.).abs() < 0.001);
+}
+
+/// A shader paint filling its shape with opaque blue.
+const BLUE: &str =
+    "@fragment fn main() -> @location(0) vec4<f32> { return vec4<f32>(0.0, 0.0, 1.0, 1.0); }";
+
+/// A font, an image and a shader registered and drawn in the same frame,
+/// with no await between registration and recording: the synchronous pass
+/// a scene builder runs.
+#[wasm_bindgen_test(async)]
+#[expect(
+    clippy::future_not_send,
+    reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+)]
+async fn resources_registered_while_recording_draw_in_the_same_frame() {
+    let engine = Engine::<Gpu>::new(GpuConfig::default())
+        .await
+        .expect("engine");
+    let surface = engine
+        .surface(Offscreen::new((48, 16), OffscreenFormat::LinearF16))
+        .await
+        .expect("surface");
+    let font = engine
+        .font(FontSource::bytes(
+            include_bytes!("../../scenes/fonts/NotoSans.ttf").as_slice(),
+        ))
+        .expect("font");
+    let image = engine
+        .image(ImageData::<Rgba8>::new(1, 1, vec![255; 4]).expect("image data"))
+        .expect("image");
+    let shader = engine.shader(ShaderSource::wgsl(BLUE)).expect("shader");
+    surface.update(|tx| {
+        tx[surface.root()].record(|c| {
+            c.glyphs(
+                GlyphRun {
+                    font: font.id(),
+                    size: 14.0,
+                    coords: Vec::new().into(),
+                    glyphs: vec![Glyph {
+                        id: 36,
+                        x: 2.0,
+                        y: 13.0,
+                        transform: None,
+                    }]
+                    .into(),
+                    style: GlyphStyle::Fill,
+                },
+                WorkingColor::WHITE,
+            );
+            c.image(image.id(), Rect::new(16., 0., 32., 16.), Sampling::Nearest);
+            c.fill(
+                Rect::new(32., 0., 48., 16.),
+                ShaderPaint {
+                    shader: shader.id(),
+                    uniforms: vec![],
+                },
+            );
+        });
+    });
+    assert_eq!(
+        engine.render(FrameTime::now()).await.expect("frame"),
+        Next::Idle
+    );
+    let pixels = surface.readback().await.expect("pixels").pixels;
+    let at = |x: usize, y: usize| pixels[y * 48 + x];
+    assert!(
+        (0..16).any(|y| (0..16).any(|x| at(x, y)[3] > 0.5)),
+        "the glyph covers its cell"
+    );
+    for channel in at(24, 8) {
+        assert!((channel - 1.).abs() < 0.001, "white image {:?}", at(24, 8));
+    }
+    assert!(
+        (at(40, 8)[2] - 1.).abs() < 0.001,
+        "blue shader {:?}",
+        at(40, 8)
+    );
+    assert!(
+        (at(40, 8)[3] - 1.).abs() < 0.001,
+        "opaque shader {:?}",
+        at(40, 8)
+    );
 }
 
 struct YieldingEffect {

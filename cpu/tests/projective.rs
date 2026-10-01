@@ -1,4 +1,7 @@
 //! Projective layers on the cpu backend.
+
+#![cfg(not(target_arch = "wasm32"))]
+
 #[path = "../../tests/common/projective.rs"]
 mod common;
 
@@ -62,6 +65,20 @@ fn limits_are_explicit_errors() {
 #[test]
 fn backdrop_spaces_are_checked() {
     common::backdrop_spaces_are_checked::<cherenkov_cpu::Raster>(
+        cherenkov_cpu::RasterConfig::default,
+    );
+}
+
+#[test]
+fn image_replacement_reaches_local_images() {
+    common::image_replacement_reaches_local_images::<cherenkov_cpu::Raster>(
+        cherenkov_cpu::RasterConfig::default,
+    );
+}
+
+#[test]
+fn released_resources_leave_no_local_image() {
+    common::released_resources_leave_no_local_image::<cherenkov_cpu::Raster>(
         cherenkov_cpu::RasterConfig::default,
     );
 }

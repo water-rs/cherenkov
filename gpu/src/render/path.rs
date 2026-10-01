@@ -254,6 +254,8 @@ pub fn emit(coverage: &Coverage) -> Result<(PathEmit, Vec<CellTexels>), RenderEr
             ],
             x: 0,
             y: 0,
+            // Filled by `Atlas::place_path` on the render thread.
+            slot: 0,
         });
         Ok(())
     };

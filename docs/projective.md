@@ -213,7 +213,9 @@ A completed local image and its mips are keyed without the outer pose:
   backdrop dependence);
 - the density bucket;
 - the local-to-texel grid and size;
-- the renderer's image epoch.
+- the renderer's image-replacement count. A replacement is the one change
+  to what an image read that arrives without a tree edit, on either
+  upload path, in place or reallocated.
 
 Changing the matrix, tilt, depth, opacity or blend moves only the sample.
 A warm matrix-only frame realizes nothing (`FrameStats::projective_realized
@@ -224,6 +226,19 @@ current frame did not compose. Under memory pressure, the GPU backend
 drops the images no surface composed last frame, and under `Critical` it
 drops all of them. The CPU backend drops them all under `Critical`, like
 its other caches. All image bytes count in `Engine::memory()`.
+
+Retention respects deferred release (#199). A local image holds its own
+pixels, never a handle, so it keeps no resource alive, and it does not
+count as installed content when a release asks which surfaces draw a
+resource. Adding or removing a resource does not affect a current image:
+a removal only runs once no installed content draws the resource, so no
+current image read it. Every image that did read it is one no frame can
+compose again, because its layer's content stamp moved on. Before a
+surface's frame plans its projective layers, it drops every such image,
+and every image whose layer is gone or affine, so none outlives the
+frame that carries out the release. Releasing a shader also drops, at
+once, the GPU images that sampled it, so no retained image names a
+released resource.
 
 Glyph, path and clip coverage caches key on the raster transform and the
 raster size they were produced for. A local image's raster is therefore a

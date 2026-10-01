@@ -18,6 +18,7 @@ use crate::glyph::FontId;
 use crate::image::{ImageUpload, Rgba8, Rgba16F};
 use crate::message::{ContentOp, FontData, LayerId, SurfaceId};
 use crate::paint::{ImageId, ShaderId};
+use crate::resource::ResourceId;
 use crate::{Offscreen, Picture, Pressure, Uploads};
 
 /// A render-thread event [`Null`] reports.
@@ -97,8 +98,6 @@ pub struct NullConfig {
 pub enum NullReject {
     /// `create_surface` returns [`SurfaceError::UnsupportedTarget`].
     Surface,
-    /// `add_font` returns [`ResourceError::Font`].
-    Font,
     /// `add_image` returns [`ResourceError::Image`].
     Image,
     /// `add_shader` returns [`ResourceError::Shader`].
@@ -108,9 +107,12 @@ pub enum NullReject {
 /// `Null`'s provenance: nothing to report.
 pub type NullInfo = ();
 
-/// The `Null` render-thread state. Registration and removal events are
-/// reported only for committed transitions — a `remove_*` for an id the
-/// backend never added is a no-op, as in a real backend.
+/// The `Null` render-thread state, with strict removal.
+///
+/// A `remove_*` or `destroy_surface` for an id the backend does not hold
+/// panics on the render thread, so a spurious removal fails the test that
+/// caused it instead of passing as a no-op. So does a render while
+/// installed content draws a resource the backend already removed.
 pub struct NullRenderer {
     events: Sender<Event>,
     reject: HashSet<NullReject>,
@@ -119,6 +121,8 @@ pub struct NullRenderer {
     images: HashSet<ImageId>,
     shaders: HashSet<ShaderId>,
     pictures: FxHashMap<(SurfaceId, LayerId), Picture>,
+    /// Every resource removed so far; ids are never reused.
+    removed: HashSet<ResourceId>,
 }
 
 impl NullRenderer {
@@ -131,6 +135,22 @@ impl NullRenderer {
             images: HashSet::new(),
             shaders: HashSet::new(),
             pictures: FxHashMap::default(),
+            removed: HashSet::new(),
+        }
+    }
+
+    /// Panics when a surface's installed content draws a removed resource:
+    /// the render loop frees a resource only once no installed content
+    /// draws it.
+    fn assert_draws_no_removed(&self, frame: &Frame<'_>) {
+        for surface in frame.surfaces {
+            for resource in &self.removed {
+                assert!(
+                    !self.samples(surface.id, *resource),
+                    "surface {} draws {resource} after its removal",
+                    surface.id.raw()
+                );
+            }
         }
     }
 }
@@ -147,17 +167,16 @@ impl Backend for Null {
     }
 
     #[cfg(target_arch = "wasm32")]
-    #[expect(
-        clippy::unused_async_trait_impl,
-        reason = "the wasm32 `Backend::init` is async because real backends await the browser; the null backend answers synchronously"
-    )]
-    async fn init(config: NullConfig) -> Result<(NullRenderer, NullInfo), EngineError> {
-        Ok((NullRenderer::new(config), ()))
+    fn init(
+        config: NullConfig,
+    ) -> impl core::future::Future<Output = Result<(NullRenderer, NullInfo), EngineError>> {
+        core::future::ready(Ok((NullRenderer::new(config), ())))
     }
 }
 
 impl Renderer for NullRenderer {
     type Target = Offscreen;
+    type Font = FontData;
 
     fn create_surface(
         &mut self,
@@ -184,25 +203,33 @@ impl Renderer for NullRenderer {
     }
 
     fn destroy_surface(&mut self, id: SurfaceId) {
+        assert!(
+            self.surfaces.remove(&id),
+            "destruction of unknown surface {}",
+            id.raw()
+        );
         self.pictures.retain(|(surface, _), _| *surface != id);
-        if self.surfaces.remove(&id) {
-            let _ = self.events.send(Event::DestroySurface(id));
-        }
+        let _ = self.events.send(Event::DestroySurface(id));
     }
 
-    fn add_font(&mut self, id: FontId, _font: FontData) -> Result<(), ResourceError> {
-        if self.reject.contains(&NullReject::Font) {
-            return Err(ResourceError::Font("injected rejection".into()));
-        }
+    /// `Null` draws no glyphs, so any data is a font.
+    fn prepare_font(font: FontData) -> Result<FontData, ResourceError> {
+        Ok(font)
+    }
+
+    fn add_font(&mut self, id: FontId, _font: FontData) {
         self.fonts.insert(id);
         let _ = self.events.send(Event::AddFont(id));
-        Ok(())
     }
 
     fn remove_font(&mut self, id: FontId) {
-        if self.fonts.remove(&id) {
-            let _ = self.events.send(Event::RemoveFont(id));
-        }
+        assert!(
+            self.fonts.remove(&id),
+            "removal of unregistered font {}",
+            id.raw()
+        );
+        self.removed.insert(ResourceId::Font(id));
+        let _ = self.events.send(Event::RemoveFont(id));
     }
 
     fn add_image(&mut self, id: ImageId, _image: ImageUpload) -> Result<(), ResourceError> {
@@ -226,16 +253,20 @@ impl Renderer for NullRenderer {
         Ok(())
     }
 
-    fn samples_image(&self, surface: SurfaceId, id: ImageId) -> bool {
+    fn samples(&self, surface: SurfaceId, resource: ResourceId) -> bool {
         self.pictures.iter().any(|((owner, _), picture)| {
-            *owner == surface && picture.display_list().references_image(id)
+            *owner == surface && picture.display_list().references(resource)
         })
     }
 
     fn remove_image(&mut self, id: ImageId) {
-        if self.images.remove(&id) {
-            let _ = self.events.send(Event::RemoveImage(id));
-        }
+        assert!(
+            self.images.remove(&id),
+            "removal of unregistered image {}",
+            id.raw()
+        );
+        self.removed.insert(ResourceId::Image(id));
+        let _ = self.events.send(Event::RemoveImage(id));
     }
 
     fn set_content(
@@ -273,6 +304,7 @@ impl Renderer for NullRenderer {
         frame: &Frame<'_>,
         _stats: &mut crate::FrameStats,
     ) -> Result<Redraw, RenderError> {
+        self.assert_draws_no_removed(frame);
         for surface in frame.surfaces {
             let layers = surface
                 .tree
@@ -295,15 +327,12 @@ impl Renderer for NullRenderer {
     }
 
     #[cfg(target_arch = "wasm32")]
-    #[expect(
-        clippy::unused_async_trait_impl,
-        reason = "the wasm32 `Renderer::render` is async because real backends await the browser; the null backend answers synchronously"
-    )]
-    async fn render(
+    fn render(
         &mut self,
         frame: &Frame<'_>,
         _stats: &mut crate::FrameStats,
-    ) -> Result<Redraw, RenderError> {
+    ) -> impl core::future::Future<Output = Result<Redraw, RenderError>> {
+        self.assert_draws_no_removed(frame);
         for surface in frame.surfaces {
             let layers = surface
                 .tree
@@ -322,7 +351,7 @@ impl Renderer for NullRenderer {
                 layers,
             }));
         }
-        Ok(Redraw::None)
+        core::future::ready(Ok(Redraw::None))
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -336,17 +365,16 @@ impl Renderer for NullRenderer {
     }
 
     #[cfg(target_arch = "wasm32")]
-    #[expect(
-        clippy::unused_async_trait_impl,
-        reason = "the wasm32 `Renderer::readback` is async because real backends await the browser; the null backend answers synchronously"
-    )]
-    async fn readback(&mut self, surface: SurfaceId) -> Result<Readback, RenderError> {
+    fn readback(
+        &mut self,
+        surface: SurfaceId,
+    ) -> impl core::future::Future<Output = Result<Readback, RenderError>> {
         let _ = surface;
-        Ok(Readback {
+        core::future::ready(Ok(Readback {
             width: 0,
             height: 0,
             pixels: Vec::new(),
-        })
+        }))
     }
 
     fn memory(&self) -> MemoryUsage {
@@ -357,6 +385,11 @@ impl Renderer for NullRenderer {
 }
 
 impl ShaderPaint for Null {
+    /// `Null` compiles nothing, so any source is valid.
+    fn validate_shader(_source: &ShaderSource) -> Result<(), ResourceError> {
+        Ok(())
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     fn add_shader(
         r: &mut NullRenderer,
@@ -372,27 +405,27 @@ impl ShaderPaint for Null {
     }
 
     #[cfg(target_arch = "wasm32")]
-    #[expect(
-        clippy::unused_async_trait_impl,
-        reason = "the wasm32 `ShaderPaint::add_shader` is async because real backends await the browser; the null backend answers synchronously"
-    )]
-    async fn add_shader(
+    fn add_shader(
         r: &mut NullRenderer,
         id: ShaderId,
         _source: ShaderSource,
-    ) -> Result<(), ResourceError> {
+    ) -> impl core::future::Future<Output = Result<(), ResourceError>> {
         if r.reject.contains(&NullReject::Shader) {
-            return Err(ResourceError::Shader("injected rejection".into()));
+            return core::future::ready(Err(ResourceError::Shader("injected rejection".into())));
         }
         r.shaders.insert(id);
         let _ = r.events.send(Event::AddShader(id));
-        Ok(())
+        core::future::ready(Ok(()))
     }
 
     fn remove_shader(r: &mut NullRenderer, id: ShaderId) {
-        if r.shaders.remove(&id) {
-            let _ = r.events.send(Event::RemoveShader(id));
-        }
+        assert!(
+            r.shaders.remove(&id),
+            "removal of unregistered shader {}",
+            id.raw()
+        );
+        r.removed.insert(ResourceId::Shader(id));
+        let _ = r.events.send(Event::RemoveShader(id));
     }
 }
 
@@ -904,6 +937,75 @@ use $crate::Instant;
             }
 
             #[test]
+            fn a_recorded_operand_animates_between_paints() {
+                let Some(engine) = engine() else { return };
+                let surface = surface(&engine);
+                let layer = surface.layer();
+                let red = WorkingColor::new([1.0, 0.0, 0.0, 1.0]);
+                let green = WorkingColor::new([0.0, 1.0, 0.0, 1.0]);
+                let blue = WorkingColor::new([0.0, 0.0, 1.0, 1.0]);
+                let animated = ::nami::binding(red);
+                let snapped = ::nami::binding(red);
+                let content = surface.record(|c| {
+                    c.fill(
+                        Rect::new(8.0, 8.0, 24.0, 56.0),
+                        animated.clone().with(Animation::from(Curve::linear(
+                            Duration::from_millis(400),
+                        ))),
+                    );
+                    c.fill(Rect::new(64.0, 8.0, 80.0, 56.0), snapped.clone());
+                });
+                surface.update(|tx| {
+                    tx[surface.root()].push(&layer);
+                    tx[&layer].content(content);
+                });
+                let t0 = Instant::now();
+                render_at(&engine, t0);
+
+                // The commit frame samples at dt = 0 — the animated operand
+                // still shows `from` while the plain change snaps.
+                animated.set(green);
+                snapped.set(blue);
+                let next = render_at(&engine, t0 + TICK);
+                let rb = surface.readback().expect("readback");
+                let start = rb.pixels[(16 * rb.width + 16) as usize];
+                assert!(start[0] > 0.95, "the operand starts at {start:?}");
+                let snapped_px = rb.pixels[(16 * rb.width + 72) as usize];
+                assert!(
+                    snapped_px[2] > 0.95,
+                    "the un-animated change snapped: {snapped_px:?}"
+                );
+                assert!(matches!(next, Next::At { .. }), "{next:?}");
+
+                // Mid-flight the colour is strictly between the endpoints,
+                // and only the animated command re-lowers per frame.
+                let next = render_at(&engine, t0 + TICK * 25);
+                assert_eq!(
+                    engine.stats().commands_lowered,
+                    1,
+                    "a running operand animation re-lowers only its own command"
+                );
+                let rb = surface.readback().expect("readback");
+                let mid = rb.pixels[(16 * rb.width + 16) as usize];
+                assert!(mid[0] < 0.95 && mid[1] > 0.05, "mid-flight {mid:?}");
+                assert!(matches!(next, Next::At { .. }), "{next:?}");
+
+                // Retargeting mid-flight keeps animating from the sampled
+                // position: the colour lands on the new target and idles.
+                animated.set(blue);
+                let mut t = t0 + TICK * 25;
+                for _ in 0..2000 {
+                    if render_at(&engine, t) == Next::Idle {
+                        break;
+                    }
+                    t += TICK;
+                }
+                let rb = surface.readback().expect("readback");
+                let end = rb.pixels[(16 * rb.width + 16) as usize];
+                assert!(end[2] > 0.95 && end[0] < 0.05, "settled at {end:?}");
+            }
+
+            #[test]
             fn next_schedules_the_frame_rate() {
                 let Some(engine) = engine() else { return };
                 let surface = surface(&engine);
@@ -1130,8 +1232,9 @@ mod tests {
 
     /// `Image::replace` reaches the renderer with the new dimensions, marks
     /// changed only the surface whose content draws the image and wakes the
-    /// host once; replacing an image nothing draws marks nothing and does
-    /// not wake. The last drop after a replacement still removes the image.
+    /// host once between two renders; replacing an image nothing draws
+    /// marks nothing. After the last drop the image is removed once the
+    /// content stops drawing it.
     #[test]
     fn image_replacement_redraws_and_still_releases() {
         use std::cell::Cell;
@@ -1187,18 +1290,14 @@ mod tests {
         image
             .replace(ImageData::<Rgba8>::new(2, 3, vec![0u8; 24]).expect("image data"))
             .expect("replace");
-        assert_eq!(
-            wakes.get(),
-            1,
-            "a replacement of a drawn image wakes the host once"
-        );
+        assert_eq!(wakes.get(), 1, "a replacement wakes the host");
         unused
             .replace(ImageData::<Rgba8>::new(2, 2, vec![0u8; 16]).expect("image data"))
             .expect("replace");
         assert_eq!(
             wakes.get(),
             1,
-            "a replacement nothing draws does not wake the host"
+            "the host is woken at most once between two renders"
         );
         engine.render(FrameTime::now()).expect("render");
         let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
@@ -1227,6 +1326,10 @@ mod tests {
 
         let id = image.id();
         drop(image);
+        drawing.update(|tx| {
+            tx[&image_layer]
+                .record(|c| c.fill(kurbo::Rect::new(0., 0., 8., 8.), WorkingColor::WHITE));
+        });
         engine.render(FrameTime::now()).expect("render");
         let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert!(
@@ -1318,11 +1421,10 @@ mod tests {
         );
     }
 
-    /// A completed registration releases its backend resource when the
-    /// handle drops — the only cancellation window a synchronous engine
-    /// has. The async executor's windows are covered by `wasm_tests`.
+    /// A registration releases its backend resource when the handle drops,
+    /// including a handle dropped before the backend ran its registration.
     #[test]
-    fn completed_registrations_release_on_drop() {
+    fn registrations_release_on_drop() {
         let (engine, rx) = engine();
         let font = engine.font(FontSource::bytes(vec![0u8; 8])).expect("font");
         let image = engine
@@ -1347,37 +1449,325 @@ mod tests {
     /// ever existed to release.
     #[test]
     fn rejected_registrations_enqueue_no_removal() {
-        let reject = HashSet::from([
-            NullReject::Surface,
-            NullReject::Font,
-            NullReject::Image,
-            NullReject::Shader,
-        ]);
+        let reject = HashSet::from([NullReject::Surface, NullReject::Image, NullReject::Shader]);
         let (engine, rx) = engine_rejecting(reject);
-        assert!(
-            engine.font(FontSource::bytes(vec![0u8; 8])).is_err(),
-            "font"
-        );
-        assert!(
-            engine
-                .image(ImageData::<Rgba8>::new(1, 1, vec![0u8; 4]).expect("image data"))
-                .is_err(),
-            "image"
-        );
-        assert!(
-            engine
-                .shader(ShaderSource::wgsl("@fragment fn f() { }"))
-                .is_err(),
-            "shader"
-        );
+        let image = engine
+            .image(ImageData::<Rgba8>::new(1, 1, vec![0u8; 4]).expect("image data"))
+            .expect("the image is queued");
+        let shader = engine
+            .shader(ShaderSource::wgsl("@fragment fn f() { }"))
+            .expect("the shader is queued");
         assert!(
             engine
                 .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))
                 .is_err(),
             "surface"
         );
-        let _ = engine.memory();
+        drop(image);
+        drop(shader);
+        // The render is applied after both releases, and fails when a
+        // strict `Null` removal of the never-added resources panicked the
+        // render thread.
+        engine
+            .render(FrameTime::now())
+            .expect("no removal reached the backend");
         balance::assert_balanced(&rx);
+    }
+
+    /// An upload the backend rejects after its handle was returned fails
+    /// every render that draws it, naming the resource and the backend's
+    /// reason; renders that do not draw it succeed.
+    #[test]
+    fn a_backend_rejected_upload_fails_the_render_that_draws_it() {
+        use crate::{Draw as _, RenderError, ResourceId, Sampling, ShaderPaint};
+
+        let (engine, _rx) =
+            engine_rejecting(HashSet::from([NullReject::Image, NullReject::Shader]));
+        let image = engine
+            .image(ImageData::<Rgba8>::new(1, 1, vec![0u8; 4]).expect("image data"))
+            .expect("the image is queued");
+        let shader = engine
+            .shader(ShaderSource::wgsl("@fragment fn f() { }"))
+            .expect("the shader is queued");
+        let surface = engine
+            .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))
+            .expect("surface");
+        let rect = kurbo::Rect::new(0., 0., 8., 8.);
+        engine
+            .render(FrameTime::now())
+            .expect("a render drawing neither resource succeeds");
+
+        let assert_rejected =
+            |expected: ResourceId, reason: &str| match engine.render(FrameTime::now()) {
+                Err(RenderError::Rejected {
+                    resource,
+                    reason: actual,
+                }) => {
+                    assert_eq!(resource, expected);
+                    assert_eq!(actual.to_string(), reason);
+                }
+                other => panic!("{expected} drawn: {other:?}"),
+            };
+        surface.update(|tx| {
+            tx[surface.root()].record(|c| c.image(image.id(), rect, Sampling::Nearest));
+        });
+        assert_rejected(ResourceId::Image(image.id()), "image: injected rejection");
+        assert_rejected(ResourceId::Image(image.id()), "image: injected rejection");
+        // A replacement of a rejected image registers it anew; the backend
+        // rejects that too.
+        image
+            .replace(ImageData::<Rgba8>::new(2, 2, vec![0u8; 16]).expect("image data"))
+            .expect("the replacement is queued");
+        assert_rejected(ResourceId::Image(image.id()), "image: injected rejection");
+
+        surface.update(|tx| {
+            tx[surface.root()].record(|c| {
+                c.fill(
+                    rect,
+                    ShaderPaint {
+                        shader: shader.id(),
+                        uniforms: vec![],
+                    },
+                );
+            });
+        });
+        assert_rejected(
+            ResourceId::Shader(shader.id()),
+            "shader: injected rejection",
+        );
+
+        surface.update(|tx| {
+            tx[surface.root()].record(|c| c.fill(rect, crate::WorkingColor::WHITE));
+        });
+        engine
+            .render(FrameTime::now())
+            .expect("content that no longer draws a rejected resource renders");
+    }
+
+    /// The position of the first event matching `f`.
+    fn position(events: &[Event], f: impl Fn(&Event) -> bool) -> Option<usize> {
+        events.iter().position(f)
+    }
+
+    /// A one-glyph run in `font`.
+    fn one_glyph(font: FontId) -> crate::glyph::GlyphRun {
+        use crate::glyph::{Glyph, GlyphRun, GlyphStyle};
+        GlyphRun {
+            font,
+            size: 8.0,
+            coords: std::sync::Arc::new([]),
+            glyphs: std::sync::Arc::new([Glyph {
+                id: 1,
+                x: 0.0,
+                y: 8.0,
+                transform: None,
+            }]),
+            style: GlyphStyle::Fill,
+        }
+    }
+
+    /// A released resource that installed content still draws stays
+    /// registered, and the render before the content changes draws it
+    /// (`Null` panics on a frame drawing a removed resource). The commit
+    /// that stops drawing it frees it before that commit's frame, and a
+    /// layer removal frees what only that layer drew (#199).
+    #[test]
+    fn a_release_waits_for_installed_content() {
+        use crate::{Draw as _, Sampling, ShaderPaint, WorkingColor};
+
+        let (engine, rx) = engine();
+        let surface = engine
+            .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))
+            .expect("surface");
+        let font = engine.font(FontSource::bytes(vec![0u8; 8])).expect("font");
+        let image = engine
+            .image(ImageData::<Rgba8>::new(1, 1, vec![0u8; 4]).expect("image data"))
+            .expect("image");
+        let shader = engine
+            .shader(ShaderSource::wgsl("@fragment fn f() { }"))
+            .expect("shader");
+        let (font_id, image_id, shader_id) = (font.id(), image.id(), shader.id());
+        let rect = kurbo::Rect::new(0., 0., 8., 8.);
+        let text = surface.layer();
+        surface.update(|tx| {
+            tx[surface.root()].push(&text);
+            tx[surface.root()].record(|c| {
+                c.image(image.id(), rect, Sampling::Nearest);
+                c.fill(
+                    rect,
+                    ShaderPaint {
+                        shader: shader.id(),
+                        uniforms: vec![],
+                    },
+                );
+            });
+            tx[&text].record(|c| c.glyphs(one_glyph(font.id()), WorkingColor::WHITE));
+        });
+        engine.render(FrameTime::now()).expect("render");
+        drop(font);
+        drop(image);
+        drop(shader);
+        engine
+            .render(FrameTime::now())
+            .expect("the installed content still draws the released resources");
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                Event::RemoveFont(_) | Event::RemoveImage(_) | Event::RemoveShader(_)
+            )),
+            "a resource installed content draws was removed: {events:?}"
+        );
+
+        surface.update(|tx| {
+            tx[surface.root()].record(|c| c.fill(rect, WorkingColor::WHITE));
+        });
+        engine.render(FrameTime::now()).expect("render");
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let installed = position(&events, |e| matches!(e, Event::SetContent(..)))
+            .expect("the new content was installed");
+        let frame = position(&events, |e| matches!(e, Event::Frame(_))).expect("frame");
+        for (removal, name) in [
+            (
+                position(
+                    &events,
+                    |e| matches!(e, Event::RemoveImage(id) if *id == image_id),
+                ),
+                "image",
+            ),
+            (
+                position(
+                    &events,
+                    |e| matches!(e, Event::RemoveShader(id) if *id == shader_id),
+                ),
+                "shader",
+            ),
+        ] {
+            let removal = removal.unwrap_or_else(|| panic!("no {name} removal in {events:?}"));
+            assert!(
+                installed < removal && removal < frame,
+                "the {name} is removed between installing the content that stopped drawing it and that frame: {events:?}"
+            );
+        }
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::RemoveFont(_))),
+            "the font the text layer still draws was removed: {events:?}"
+        );
+
+        drop(text);
+        engine.render(FrameTime::now()).expect("render");
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let removed = position(&events, |e| matches!(e, Event::RemoveLayer(..)))
+            .expect("the text layer was removed");
+        let freed = position(
+            &events,
+            |e| matches!(e, Event::RemoveFont(id) if *id == font_id),
+        )
+        .unwrap_or_else(|| panic!("no font removal in {events:?}"));
+        let frame = position(&events, |e| matches!(e, Event::Frame(_))).expect("frame");
+        assert!(
+            removed < freed && freed < frame,
+            "the font is removed with the layer that drew it, before the frame: {events:?}"
+        );
+    }
+
+    /// Content installed after the handle dropped that names a pending
+    /// resource keeps it alive: a kept recording on a second surface still
+    /// draws the image after the first surface stops drawing it, and the
+    /// removal lands only once the second surface stops too (#199).
+    #[test]
+    fn a_kept_recording_keeps_a_pending_resource_alive() {
+        use crate::{Draw as _, Sampling, WorkingColor};
+
+        let (engine, rx) = engine();
+        let first = engine
+            .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))
+            .expect("surface");
+        let second = engine
+            .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))
+            .expect("surface");
+        let image = engine
+            .image(ImageData::<Rgba8>::new(1, 1, vec![0u8; 4]).expect("image data"))
+            .expect("image");
+        let rect = kurbo::Rect::new(0., 0., 8., 8.);
+        first.update(|tx| {
+            tx[first.root()].record(|c| c.image(image.id(), rect, Sampling::Nearest));
+        });
+        let kept = second.record(|c| c.image(image.id(), rect, Sampling::Nearest));
+        engine.render(FrameTime::now()).expect("render");
+        drop(image);
+        engine.render(FrameTime::now()).expect("render");
+        second.update(|tx| {
+            tx[second.root()].content(kept);
+        });
+        engine.render(FrameTime::now()).expect("render");
+        first.update(|tx| {
+            tx[first.root()].record(|c| c.fill(rect, WorkingColor::WHITE));
+        });
+        engine
+            .render(FrameTime::now())
+            .expect("the second surface still draws the image");
+        let removed = |events: &[Event]| events.iter().any(|e| matches!(e, Event::RemoveImage(_)));
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            !removed(&events),
+            "the image was removed while the second surface draws it: {events:?}"
+        );
+
+        second.update(|tx| {
+            tx[second.root()].record(|c| c.fill(rect, WorkingColor::WHITE));
+        });
+        engine.render(FrameTime::now()).expect("render");
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            removed(&events),
+            "no image removal once no surface draws it: {events:?}"
+        );
+    }
+
+    /// Dropping the only surface whose installed content draws a released
+    /// resource carries out its pending release (#199).
+    #[test]
+    fn pending_releases_run_when_the_surface_drops() {
+        use crate::{Draw as _, Sampling};
+
+        let (engine, rx) = engine();
+        let surface = engine
+            .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))
+            .expect("surface");
+        let image = engine
+            .image(ImageData::<Rgba8>::new(1, 1, vec![0u8; 4]).expect("image data"))
+            .expect("image");
+        surface.update(|tx| {
+            tx[surface.root()].record(|c| {
+                c.image(
+                    image.id(),
+                    kurbo::Rect::new(0., 0., 8., 8.),
+                    Sampling::Nearest,
+                );
+            });
+        });
+        engine.render(FrameTime::now()).expect("render");
+        drop(image);
+        engine.render(FrameTime::now()).expect("render");
+        drop(surface);
+        engine.render(FrameTime::now()).expect("render");
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let destroyed = position(&events, |e| matches!(e, Event::DestroySurface(_)))
+            .unwrap_or_else(|| panic!("no surface destruction in {events:?}"));
+        let freed = position(&events, |e| matches!(e, Event::RemoveImage(_)))
+            .unwrap_or_else(|| panic!("no image removal in {events:?}"));
+        assert!(
+            destroyed < freed,
+            "the image outlives the surface that drew it: {events:?}"
+        );
+        let (mut commits, mut releases) = balance::transitions(&events);
+        commits.sort();
+        releases.sort();
+        assert_eq!(
+            commits, releases,
+            "unbalanced registration events: {events:?}"
+        );
     }
 
     #[test]
@@ -1431,10 +1821,12 @@ mod tests {
 /// Retained-lowering equivalence checks for first-party backends.
 pub mod incremental;
 
-/// The async executor's registration windows (#150): a registration
-/// future owns the backend id from the moment the request is enqueued, so
-/// dropping it at any point still releases what the backend committed.
-/// Run under the Node `wasm-bindgen-test-runner` (or a browser):
+/// The browser executor's registration lifetimes (#150). Resource
+/// registration is synchronous and queued in order, so its handle owns the
+/// id from the start; surface creation is a future that owns its id from
+/// the moment the request is enqueued, so dropping it at any point still
+/// destroys what the backend committed. Run under the Node
+/// `wasm-bindgen-test-runner` (or a browser):
 ///
 /// ```console
 /// CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
@@ -1443,6 +1835,7 @@ pub mod incremental;
 /// ```
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
+    use std::collections::HashSet;
     use std::fmt::Debug;
     use std::future::Future;
     use std::pin::Pin;
@@ -1455,11 +1848,12 @@ mod wasm_tests {
     use super::{Event, Null, NullConfig, NullReject};
     use crate::image::ImageData;
     use crate::resource::FontSource;
-    use crate::{Engine, Offscreen, OffscreenFormat, Rgba8, ShaderSource};
+    use crate::{
+        Draw as _, Engine, FrameTime, Offscreen, OffscreenFormat, RenderError, ResourceId, Rgba8,
+        Sampling, ShaderPaint, ShaderSource, WorkingColor,
+    };
 
-    async fn engine(
-        reject: std::collections::HashSet<NullReject>,
-    ) -> (Engine<Null>, Receiver<Event>) {
+    async fn engine(reject: HashSet<NullReject>) -> (Engine<Null>, Receiver<Event>) {
         let (tx, rx) = std::sync::mpsc::channel();
         let engine = Engine::<Null>::new(NullConfig { events: tx, reject })
             .await
@@ -1467,108 +1861,110 @@ mod wasm_tests {
         (engine, rx)
     }
 
-    /// Runs the registration future until it has enqueued its request and
-    /// is parked on the reply.
-    fn enqueued<F: Future>(registration: Pin<&mut F>) {
+    /// Runs the creation future until it has enqueued its request and is
+    /// parked on the reply.
+    fn enqueued<F: Future>(creation: Pin<&mut F>) {
         assert!(
-            registration
+            creation
                 .poll(&mut Context::from_waker(Waker::noop()))
                 .is_pending(),
-            "registration returned before its reply await"
+            "creation returned before its reply await"
         );
     }
 
     /// Everything enqueued before this call has been applied: the
     /// `Memory` reply lands after them in the serial executor.
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
     async fn flush(engine: &Engine<Null>) {
         let _ = engine.memory().await;
     }
 
     /// Window (a): dropped after enqueue, before the backend ran.
-    async fn drop_after_enqueue<F, O, E>(engine: &Engine<Null>, register: F)
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
+    async fn drop_after_enqueue<F, O, E>(engine: &Engine<Null>, create: F)
     where
         F: Future<Output = Result<O, E>>,
         E: Debug,
     {
-        let mut registration = Box::pin(register);
-        enqueued(registration.as_mut());
-        drop(registration);
+        let mut creation = Box::pin(create);
+        enqueued(creation.as_mut());
+        drop(creation);
         flush(engine).await;
     }
 
     /// Window (b): dropped after the backend committed, before the reply
     /// was adopted. The first `flush` returns once the commit is done.
-    async fn drop_after_commit<F, O, E>(engine: &Engine<Null>, register: F)
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
+    async fn drop_after_commit<F, O, E>(engine: &Engine<Null>, create: F)
     where
         F: Future<Output = Result<O, E>>,
         E: Debug,
     {
-        let mut registration = Box::pin(register);
-        enqueued(registration.as_mut());
+        let mut creation = Box::pin(create);
+        enqueued(creation.as_mut());
         flush(engine).await;
-        drop(registration);
+        drop(creation);
         flush(engine).await;
     }
 
     /// Window (c): the reply was adopted and the handle dropped.
-    async fn drop_after_reply<F, O, E>(engine: &Engine<Null>, register: F)
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
+    async fn drop_after_reply<F, O, E>(engine: &Engine<Null>, create: F)
     where
         F: Future<Output = Result<O, E>>,
         E: Debug,
     {
-        drop(register.await.expect("registration"));
+        drop(create.await.expect("creation"));
         flush(engine).await;
     }
 
-    /// Every window, for one registration kind.
-    async fn all_windows<O, E>(
-        engine: &Engine<Null>,
-        register: impl for<'a> Fn(&'a Engine<Null>) -> Pin<Box<dyn Future<Output = Result<O, E>> + 'a>>,
-    ) where
-        E: Debug,
-    {
-        drop_after_enqueue(engine, register(engine)).await;
-        drop_after_commit(engine, register(engine)).await;
-        drop_after_reply(engine, register(engine)).await;
-    }
-
     #[wasm_bindgen_test]
-    async fn dropped_font_registration_still_releases_it() {
-        let (engine, rx) = engine(Default::default()).await;
-        all_windows(&engine, |engine| {
-            Box::pin(engine.font(FontSource::bytes(vec![0u8; 8])))
-        })
-        .await;
-        balance::assert_balanced(&rx);
-    }
-
-    #[wasm_bindgen_test]
-    async fn dropped_image_registration_still_releases_it() {
-        let (engine, rx) = engine(Default::default()).await;
-        all_windows(&engine, |engine| {
-            Box::pin(engine.image(ImageData::<Rgba8>::new(1, 1, vec![0u8; 4]).expect("image data")))
-        })
-        .await;
-        balance::assert_balanced(&rx);
-    }
-
-    #[wasm_bindgen_test]
-    async fn dropped_shader_registration_still_releases_it() {
-        let (engine, rx) = engine(Default::default()).await;
-        all_windows(&engine, |engine| {
-            Box::pin(engine.shader(ShaderSource::wgsl("@fragment fn f() { }")))
-        })
-        .await;
-        balance::assert_balanced(&rx);
-    }
-
-    #[wasm_bindgen_test]
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
     async fn dropped_surface_creation_still_destroys_it() {
-        let (engine, rx) = engine(Default::default()).await;
-        all_windows(&engine, |engine| {
-            Box::pin(engine.surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16)))
-        })
-        .await;
+        let (engine, rx) = engine(HashSet::default()).await;
+        let create = || engine.surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16));
+        drop_after_enqueue(&engine, create()).await;
+        drop_after_commit(&engine, create()).await;
+        drop_after_reply(&engine, create()).await;
+        balance::assert_balanced(&rx);
+    }
+
+    /// A registration releases its backend resource when the handle
+    /// drops, including a handle dropped before the executor ran its
+    /// registration.
+    #[wasm_bindgen_test]
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
+    async fn registrations_release_on_drop() {
+        let (engine, rx) = engine(HashSet::default()).await;
+        let font = engine.font(FontSource::bytes(vec![0u8; 8])).expect("font");
+        let image = engine
+            .image(ImageData::<Rgba8>::new(1, 1, vec![0u8; 4]).expect("image data"))
+            .expect("image");
+        let shader = engine
+            .shader(ShaderSource::wgsl("@fragment fn f() { }"))
+            .expect("shader");
+        drop(font);
+        drop(image);
+        drop(shader);
+        flush(&engine).await;
         balance::assert_balanced(&rx);
     }
 
@@ -1576,32 +1972,19 @@ mod wasm_tests {
     /// resource never existed — whether the caller awaited the error or
     /// dropped the future on the way.
     #[wasm_bindgen_test]
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
     async fn rejected_registrations_enqueue_no_removal() {
-        let reject = std::collections::HashSet::from([
-            NullReject::Surface,
-            NullReject::Font,
-            NullReject::Image,
-            NullReject::Shader,
-        ]);
+        let reject = HashSet::from([NullReject::Surface, NullReject::Image, NullReject::Shader]);
         let (engine, rx) = engine(reject).await;
-        assert!(
-            engine.font(FontSource::bytes(vec![0u8; 8])).await.is_err(),
-            "font"
-        );
-        assert!(
-            engine
-                .image(ImageData::<Rgba8>::new(1, 1, vec![0u8; 4]).expect("image data"))
-                .await
-                .is_err(),
-            "image"
-        );
-        assert!(
-            engine
-                .shader(ShaderSource::wgsl("@fragment fn f() { }"))
-                .await
-                .is_err(),
-            "shader"
-        );
+        let image = engine
+            .image(ImageData::<Rgba8>::new(1, 1, vec![0u8; 4]).expect("image data"))
+            .expect("the image is queued");
+        let shader = engine
+            .shader(ShaderSource::wgsl("@fragment fn f() { }"))
+            .expect("the shader is queued");
         assert!(
             engine
                 .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))
@@ -1609,14 +1992,197 @@ mod wasm_tests {
                 .is_err(),
             "surface"
         );
-        // Dropped before the rejected reply: the enqueued removal finds
-        // no committed resource and reports nothing.
+        drop(image);
+        drop(shader);
+        // Dropped before the rejected reply: the enqueued destruction finds
+        // no committed surface and reports nothing.
         drop_after_enqueue(
             &engine,
-            engine.image(ImageData::<Rgba8>::new(1, 1, vec![0u8; 4]).expect("image data")),
+            engine.surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16)),
         )
         .await;
         flush(&engine).await;
         balance::assert_balanced(&rx);
+    }
+
+    /// An upload the backend rejects after its handle was returned fails
+    /// the render that draws it, naming the resource and the backend's
+    /// reason. Registration and recording happen with no await between.
+    #[wasm_bindgen_test]
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
+    async fn a_backend_rejected_upload_fails_the_render_that_draws_it() {
+        let reject = HashSet::from([NullReject::Image, NullReject::Shader]);
+        let (engine, _rx) = engine(reject).await;
+        let surface = engine
+            .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))
+            .await
+            .expect("surface");
+        let rect = kurbo::Rect::new(0., 0., 8., 8.);
+        let image = engine
+            .image(ImageData::<Rgba8>::new(1, 1, vec![0u8; 4]).expect("image data"))
+            .expect("the image is queued");
+        surface.update(|tx| {
+            tx[surface.root()].record(|c| c.image(image.id(), rect, Sampling::Nearest));
+        });
+        match engine.render(FrameTime::now()).await {
+            Err(RenderError::Rejected { resource, reason }) => {
+                assert_eq!(resource, ResourceId::Image(image.id()));
+                assert_eq!(reason.to_string(), "image: injected rejection");
+            }
+            other => panic!("rejected image drawn: {other:?}"),
+        }
+        let shader = engine
+            .shader(ShaderSource::wgsl("@fragment fn f() { }"))
+            .expect("the shader is queued");
+        surface.update(|tx| {
+            tx[surface.root()].record(|c| {
+                c.fill(
+                    rect,
+                    ShaderPaint {
+                        shader: shader.id(),
+                        uniforms: vec![],
+                    },
+                );
+            });
+        });
+        match engine.render(FrameTime::now()).await {
+            Err(RenderError::Rejected { resource, reason }) => {
+                assert_eq!(resource, ResourceId::Shader(shader.id()));
+                assert_eq!(reason.to_string(), "shader: injected rejection");
+            }
+            other => panic!("rejected shader drawn: {other:?}"),
+        }
+    }
+
+    /// Dropping the only surface whose installed content draws a released
+    /// resource carries out its pending release, after the surface is
+    /// destroyed (#199).
+    #[wasm_bindgen_test]
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
+    async fn pending_releases_run_when_the_surface_drops() {
+        let (engine, rx) = engine(HashSet::default()).await;
+        let surface = engine
+            .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))
+            .await
+            .expect("surface");
+        let image = engine
+            .image(ImageData::<Rgba8>::new(1, 1, vec![0u8; 4]).expect("image data"))
+            .expect("image");
+        surface.update(|tx| {
+            tx[surface.root()].record(|c| {
+                c.image(
+                    image.id(),
+                    kurbo::Rect::new(0., 0., 8., 8.),
+                    Sampling::Nearest,
+                );
+            });
+        });
+        engine.render(FrameTime::now()).await.expect("render");
+        drop(image);
+        engine.render(FrameTime::now()).await.expect("render");
+        drop(surface);
+        engine.render(FrameTime::now()).await.expect("render");
+        let events: Vec<Event> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let destroyed = events
+            .iter()
+            .position(|e| matches!(e, Event::DestroySurface(_)))
+            .unwrap_or_else(|| panic!("no surface destruction in {events:?}"));
+        let freed = events
+            .iter()
+            .position(|e| matches!(e, Event::RemoveImage(_)))
+            .unwrap_or_else(|| panic!("no image removal in {events:?}"));
+        assert!(
+            destroyed < freed,
+            "the image outlives the surface that drew it: {events:?}"
+        );
+        let (mut commits, mut releases) = balance::transitions(&events);
+        commits.sort();
+        releases.sort();
+        assert_eq!(
+            commits, releases,
+            "unbalanced registration events: {events:?}"
+        );
+    }
+
+    /// A released resource that installed content still draws stays
+    /// registered: the render that still draws it succeeds (`Null` panics
+    /// on a frame drawing a removed resource). The release is carried out
+    /// when the content stops drawing it, or when the only surface drawing
+    /// it drops (#199).
+    #[wasm_bindgen_test]
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
+    async fn a_release_waits_for_installed_content() {
+        let (engine, rx) = engine(HashSet::default()).await;
+        let surface = engine
+            .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))
+            .await
+            .expect("surface");
+        let other = engine
+            .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))
+            .await
+            .expect("surface");
+        let rect = kurbo::Rect::new(0., 0., 8., 8.);
+        let image = engine
+            .image(ImageData::<Rgba8>::new(1, 1, vec![0u8; 4]).expect("image data"))
+            .expect("image");
+        let shader = engine
+            .shader(ShaderSource::wgsl("@fragment fn f() { }"))
+            .expect("shader");
+        surface.update(|tx| {
+            tx[surface.root()].record(|c| c.image(image.id(), rect, Sampling::Nearest));
+        });
+        other.update(|tx| {
+            tx[other.root()].record(|c| {
+                c.fill(
+                    rect,
+                    ShaderPaint {
+                        shader: shader.id(),
+                        uniforms: vec![],
+                    },
+                );
+            });
+        });
+        engine.render(FrameTime::now()).await.expect("render");
+        drop(image);
+        drop(shader);
+        engine
+            .render(FrameTime::now())
+            .await
+            .expect("the installed content still draws the released resources");
+        let removals = || {
+            let events: Vec<Event> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+            (
+                events.iter().any(|e| matches!(e, Event::RemoveImage(_))),
+                events.iter().any(|e| matches!(e, Event::RemoveShader(_))),
+            )
+        };
+        assert_eq!(removals(), (false, false), "nothing is freed while drawn");
+
+        surface.update(|tx| {
+            tx[surface.root()].record(|c| c.fill(rect, WorkingColor::WHITE));
+        });
+        engine.render(FrameTime::now()).await.expect("render");
+        assert_eq!(
+            removals(),
+            (true, false),
+            "the image is freed with the content that drew it"
+        );
+
+        drop(other);
+        flush(&engine).await;
+        assert_eq!(
+            removals(),
+            (false, true),
+            "the shader is freed with the surface that drew it"
+        );
     }
 }

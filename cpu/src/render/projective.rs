@@ -198,26 +198,35 @@ pub struct Key {
     size: (u32, u32),
     /// [`cherenkov::SurfaceTree::content_stamp`] of the layer.
     stamp: u64,
-    /// The renderer's registered-image epoch.
-    images: u64,
+    /// The renderer's image-replacement count.
+    replacements: u64,
 }
 
 impl Key {
-    /// The key of `layout` at content stamp `stamp` and image epoch
-    /// `images`.
+    /// The key of `layout` at content stamp `stamp` after `replacements`
+    /// image replacements.
     #[must_use]
     pub const fn new(
         layout: &cherenkov::lowering::projective::LocalImage,
         stamp: u64,
-        images: u64,
+        replacements: u64,
     ) -> Self {
         Self {
             density: layout.density,
             local_to_texel: layout.local_to_texel.as_coeffs(),
             size: layout.size,
             stamp,
-            images,
+            replacements,
         }
+    }
+
+    /// Whether the image was realized from the layer's content at
+    /// `stamp` after `replacements` image replacements. Stamps and the
+    /// count only grow, so an image that is not current can never be
+    /// composed again.
+    #[must_use]
+    pub const fn is_current(&self, stamp: u64, replacements: u64) -> bool {
+        self.stamp == stamp && self.replacements == replacements
     }
 }
 

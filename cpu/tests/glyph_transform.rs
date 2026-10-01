@@ -1,6 +1,7 @@
 //! Per-glyph transforms (#69): translation folding, outline coverage and
 //! validation errors.
 
+#![cfg(not(target_arch = "wasm32"))]
 use cherenkov::kurbo::{Affine, Stroke};
 use cherenkov::{
     Draw, Engine, FontSource, FrameTime, Glyph, GlyphRun, GlyphStyle, Offscreen, OffscreenFormat,

@@ -4123,6 +4123,116 @@ fn run() -> Result<(), SceneError> {
         });
     });
 
+    // A card body whose fill springs coral → teal (Spring 0.5/1.0): the
+    // animated operand is the fill's paint inside the recorded content,
+    // not a layer property.
+    corpus.scene("anim-paint-spring", 256, 256, srgb(0.94, 0.95, 0.98), |l| {
+        l.layer(|card| {
+            let rect = RoundedRect::from_rect(
+                Rect::new(32.0, 96.0, 224.0, 208.0),
+                RoundedRectRadii::new(16.0, 16.0, 16.0, 16.0),
+            );
+            card.shadow(
+                Shape::RoundedRect(rect),
+                8.0,
+                [0.0, 6.0],
+                srgba(0.0, 0.0, 0.0, 0.25),
+            );
+            let body = card.item_count();
+            card.fill(Shape::RoundedRect(rect), solid(srgb(0.35, 0.55, 0.62)));
+            card.motion(Motion::Paint {
+                item: body,
+                from: Box::new(solid(srgb(0.92, 0.35, 0.30))),
+                animation: MotionAnimation::Spring {
+                    response: 0.5,
+                    damping: 1.0,
+                },
+            });
+            card.fill(
+                Shape::RoundedRect(RoundedRect::from_rect(
+                    Rect::new(48.0, 120.0, 208.0, 140.0),
+                    RoundedRectRadii::new(6.0, 6.0, 6.0, 6.0),
+                )),
+                solid(srgba(1.0, 1.0, 1.0, 0.85)),
+            );
+            card.fill(
+                Shape::RoundedRect(RoundedRect::from_rect(
+                    Rect::new(48.0, 152.0, 168.0, 164.0),
+                    RoundedRectRadii::new(4.0, 4.0, 4.0, 4.0),
+                )),
+                solid(srgba(1.0, 1.0, 1.0, 0.55)),
+            );
+        });
+    });
+
+    // A panel gradient whose geometry and stop colours ease on a 400 ms
+    // ease-in-out curve: gradient lanes animate inside the recorded
+    // content.
+    corpus.scene("anim-paint-curve", 256, 256, srgb(0.92, 0.94, 0.96), |l| {
+        l.layer(|panel| {
+            let shape = Shape::RoundedRect(RoundedRect::from_rect(
+                Rect::new(24.0, 64.0, 232.0, 200.0),
+                RoundedRectRadii::new(12.0, 12.0, 12.0, 12.0),
+            ));
+            let item = panel.item_count();
+            panel.fill(
+                shape,
+                Paint::Linear(LinearGradient {
+                    start: Point::new(24.0, 64.0),
+                    end: Point::new(232.0, 200.0),
+                    stops: vec![
+                        GradientStop {
+                            offset: 0.0,
+                            color: srgb(0.22, 0.5, 0.6),
+                        },
+                        GradientStop {
+                            offset: 1.0,
+                            color: srgb(0.8, 0.86, 0.9),
+                        },
+                    ],
+                    extend: Extend::Pad,
+                    interpolation: ColorSpace::Srgb,
+                }),
+            );
+            panel.motion(Motion::Paint {
+                item,
+                from: Box::new(Paint::Linear(LinearGradient {
+                    start: Point::new(24.0, 24.0),
+                    end: Point::new(24.0, 200.0),
+                    stops: vec![
+                        GradientStop {
+                            offset: 0.0,
+                            color: srgb(0.9, 0.4, 0.4),
+                        },
+                        GradientStop {
+                            offset: 1.0,
+                            color: srgb(0.55, 0.35, 0.7),
+                        },
+                    ],
+                    extend: Extend::Pad,
+                    interpolation: ColorSpace::Srgb,
+                })),
+                animation: MotionAnimation::Curve {
+                    duration_ms: 400,
+                    x1: 0.42,
+                    y1: 0.0,
+                    x2: 0.58,
+                    y2: 1.0,
+                },
+            });
+            for i in 0u8..4 {
+                let y = 88.0 + f64::from(i) * 28.0;
+                panel.fill(
+                    Shape::RoundedRect(RoundedRect::from_rect(
+                        Rect::new(44.0, y, 44.0 + 150.0 - 22.0 * f64::from(i), y + 12.0),
+                        RoundedRectRadii::new(4.0, 4.0, 4.0, 4.0),
+                    )),
+                    solid(srgba(1.0, 1.0, 1.0, 0.75)),
+                );
+            }
+        });
+    });
+
     // A clipped list scrolled to a static offset: rows 3.. are visible.
     corpus.scene("scroll-static", 256, 192, srgb(0.97, 0.97, 0.98), |l| {
         l.layer(|list| {

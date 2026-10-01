@@ -7,7 +7,10 @@
 //! carry the feature name string the benchmark harness maps back to a scene
 //! feature.
 
+use std::sync::Arc;
+
 use crate::frame::OffscreenFormat;
+use crate::resource::ResourceId;
 
 /// Engine initialization or engine-wide failure.
 #[derive(Debug, thiserror::Error)]
@@ -138,5 +141,17 @@ pub enum RenderError {
         layer: crate::LayerId,
         /// What limit was exceeded, with the required size.
         reason: String,
+    },
+    /// A draw names a resource the backend rejected after its handle was
+    /// returned: its registration, or an image's latest replacement.
+    /// Every render that draws the resource fails this way until the
+    /// resource is replaced successfully, or its last handle has dropped
+    /// and no installed content draws it any more.
+    #[error("{resource} was rejected by the backend: {reason}")]
+    Rejected {
+        /// The rejected resource.
+        resource: ResourceId,
+        /// The backend's reason.
+        reason: Arc<ResourceError>,
     },
 }

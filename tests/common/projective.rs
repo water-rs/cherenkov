@@ -5,8 +5,9 @@ use std::time::{Duration, Instant};
 
 use cherenkov::kurbo::{Affine, Circle, Rect, Vec2};
 use cherenkov::{
-    Backdrop, BlendMode, Draw, Engine, FrameTime, Layer, Offscreen, OffscreenFormat, Picture,
-    Projective, ProjectiveLayers, RenderError, Surface, WorkingColor,
+    Backdrop, BlendMode, Draw, Engine, FrameTime, ImageData, Layer, Offscreen, OffscreenFormat,
+    Picture, Projective, ProjectiveLayers, RenderError, Rgba8, Sampling, Surface, Uploads,
+    WorkingColor,
 };
 
 const SIZE: (u32, u32) = (64, 64);
@@ -280,6 +281,95 @@ pub fn limits_are_explicit_errors<B: ProjectiveLayers>(config: impl Fn() -> B::C
             other => panic!("{what}: expected ProjectiveUnsupported, got {other:?}"),
         }
     }
+}
+
+/// Every byte the engine holds, on the device and on the host.
+fn resident<B: ProjectiveLayers>(engine: &Engine<B>) -> u64 {
+    let memory = engine.memory();
+    memory.gpu.0 + memory.cpu.0
+}
+
+/// A 2 × 2 image of one colour.
+fn solid(rgba: [u8; 4]) -> ImageData<Rgba8> {
+    ImageData::new(2, 2, rgba.repeat(4)).expect("a 2 × 2 image")
+}
+
+/// A local image that sampled a replaced image is realized again: the
+/// replacement changes its pixels without a tree edit, and a replacement
+/// of the same size is uploaded in place.
+pub fn image_replacement_reaches_local_images<B: ProjectiveLayers + Uploads<Rgba8>>(
+    config: impl Fn() -> B::Config,
+) {
+    let (red, green) = ([230, 20, 20, 255], [20, 200, 40, 255]);
+    let draw = |scene: &Scene<B>, image: cherenkov::ImageId| {
+        scene.edit(|e| {
+            e.record(|c| c.image(image, CLIP, Sampling::Nearest))
+                .projection(Projective::IDENTITY);
+        });
+    };
+    let mut replaced = Scene::<B>::new(config(), |_| {});
+    let image = replaced.engine.image(solid(red)).expect("image");
+    draw(&replaced, image.id());
+    let before = replaced.render().expect("red");
+    image.replace(solid(green)).expect("replace");
+    let after = replaced.render().expect("green");
+    assert_eq!(replaced.engine.stats().projective_realized, 1);
+    assert_ne!(after, before, "the local image kept the replaced pixels");
+
+    let mut fresh = Scene::<B>::new(config(), |_| {});
+    let image = fresh.engine.image(solid(green)).expect("image");
+    draw(&fresh, image.id());
+    assert_eq!(fresh.render().expect("fresh green"), after);
+}
+
+/// Releasing a resource leaves no local image that read it behind: once
+/// the layer's content stops drawing the image and the image's last handle
+/// drops, the render that carries out the release (#199) also frees the
+/// retained local image, even though the layer is not realized again. An
+/// affine twin running the same steps accounts for everything else the
+/// release frees.
+pub fn released_resources_leave_no_local_image<B: ProjectiveLayers + Uploads<Rgba8>>(
+    config: impl Fn() -> B::Config,
+) {
+    let freed = |projective: bool| {
+        let mut scene = Scene::<B>::new(config(), |e| {
+            if projective {
+                e.projection(Projective::IDENTITY);
+            }
+        });
+        let image = scene
+            .engine
+            .image(solid([230, 20, 20, 255]))
+            .expect("image");
+        let id = image.id();
+        scene.edit(|e| {
+            e.record(|c| c.image(id, CLIP, Sampling::Nearest));
+        });
+        scene.render().expect("drawn");
+        assert_eq!(
+            scene.engine.stats().projective_realized,
+            u32::from(projective)
+        );
+        let drawn = resident(&scene.engine);
+        // The layer moves off the surface, so nothing realizes it again.
+        scene.edit(|e| {
+            e.content(Picture::record(|_| {}))
+                .transform(Affine::translate((1_000.0, 1_000.0)));
+        });
+        drop(image);
+        scene.render().expect("released");
+        assert_eq!(scene.engine.stats().projective_realized, 0);
+        drawn - resident(&scene.engine)
+    };
+    let local: u64 = cherenkov::lowering::projective::mip_levels((32, 32))
+        .iter()
+        .map(|&(w, h)| 8 * u64::from(w) * u64::from(h))
+        .sum();
+    assert_eq!(
+        freed(true) - freed(false),
+        local,
+        "the local image that read the released image is freed with it"
+    );
 }
 
 /// A projective layer cannot be a backdrop member, and one backdrop group

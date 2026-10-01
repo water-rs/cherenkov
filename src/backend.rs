@@ -28,6 +28,7 @@ use crate::glyph::FontId;
 use crate::image::ImageUpload;
 use crate::message::{ContentOp, FontData, LayerId, SurfaceId};
 use crate::paint::ImageId;
+use crate::resource::ResourceId;
 use crate::tree::SurfaceTree;
 
 /// The render-thread contract. Implemented by a zero-sized marker type
@@ -65,6 +66,9 @@ pub trait Backend: Sized + 'static {
 pub trait Renderer: 'static {
     /// A surface target.
     type Target;
+    /// A font [`Renderer::prepare_font`] validated, ready for
+    /// [`Renderer::add_font`].
+    type Font: RenderTransfer + 'static;
 
     /// Creates the render-side state for surface `id`.
     ///
@@ -82,16 +86,22 @@ pub trait Renderer: 'static {
     /// Destroys a surface's render-side state.
     fn destroy_surface(&mut self, id: SurfaceId);
 
-    /// Registers a font.
+    /// Validates font data on the caller thread, before anything is
+    /// queued, and prepares it for [`Renderer::add_font`]. Every check a
+    /// font needs runs here, so registration cannot fail later.
     ///
     /// # Errors
     /// [`ResourceError`] when the data cannot be used.
-    fn add_font(&mut self, id: FontId, font: FontData) -> Result<(), ResourceError>;
+    fn prepare_font(font: FontData) -> Result<Self::Font, ResourceError>;
 
-    /// Unregisters a font.
+    /// Registers a font [`Renderer::prepare_font`] validated.
+    fn add_font(&mut self, id: FontId, font: Self::Font);
+
+    /// Unregisters a font no installed content draws any more.
     fn remove_font(&mut self, id: FontId);
 
-    /// Registers an image.
+    /// Registers an image. A rejection fails every later render that
+    /// draws the image with [`RenderError::Rejected`].
     ///
     /// # Errors
     /// [`ResourceError`] when the upload cannot be used.
@@ -102,18 +112,25 @@ pub trait Renderer: 'static {
     /// on. Same dimensions reuse the backing storage; different dimensions
     /// reallocate it and refresh every cache that referenced the old one.
     /// After a replacement the render loop marks changed exactly the
-    /// surfaces for which [`Renderer::samples_image`] answers true.
+    /// surfaces for which [`Renderer::samples`] answers true.
     ///
     /// # Errors
     /// [`ResourceError`] when the upload cannot be used; the image keeps
-    /// its previous pixels.
+    /// its previous pixels, and renders that draw it fail with
+    /// [`RenderError::Rejected`] until a replacement succeeds.
     fn replace_image(&mut self, id: ImageId, image: ImageUpload) -> Result<(), ResourceError>;
 
     /// Whether any layer content on `surface`, with its slot updates
-    /// applied and nested pictures included, samples image `id`.
-    fn samples_image(&self, surface: SurfaceId, id: ImageId) -> bool;
+    /// applied and nested pictures included, samples `resource`: a font,
+    /// an image or a shader. Content never names a backdrop shader; the
+    /// render loop finds those in the layer tree.
+    ///
+    /// The render loop frees a released resource only once this answers
+    /// false for every surface, so content installed on a surface never
+    /// names a resource its `remove_*` already ran for.
+    fn samples(&self, surface: SurfaceId, resource: ResourceId) -> bool;
 
-    /// Unregisters an image.
+    /// Unregisters an image no installed content draws any more.
     fn remove_image(&mut self, id: ImageId);
 
     /// Replaces or updates a layer's content, or clears it. Returns the

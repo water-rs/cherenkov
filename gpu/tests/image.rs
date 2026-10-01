@@ -268,3 +268,106 @@ fn an_f16_image_keeps_hdr_and_wide_gamut() -> Result<(), Box<dyn std::error::Err
     close_px(px(6, 0), linear_srgb_to_p3_premul([8.0, 0.0, 0.0, 0.5]));
     Ok(())
 }
+
+/// An image larger than the device's texture limit is a rejection only the
+/// backend can detect: registration returns the handle, and the render
+/// that draws the image fails naming it and the backend's reason.
+#[test]
+fn an_image_beyond_the_texture_limit_fails_the_render_that_draws_it()
+-> Result<(), Box<dyn std::error::Error>> {
+    let shared = match cherenkov_gpu::interop::SharedDevice::create(&GpuConfig::default()) {
+        Ok(shared) => shared,
+        Err(EngineError::Backend(_)) => return Ok(()),
+        Err(e) => panic!("device creation failed: {e}"),
+    };
+    let width = shared.device.limits().max_texture_dimension_2d + 1;
+    let engine = Engine::<Gpu>::new(GpuConfig {
+        device: Some(shared),
+        ..GpuConfig::default()
+    })?;
+    let surface = engine.surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))?;
+    let image = engine.image(ImageData::<Rgba8>::new(
+        width,
+        1,
+        vec![255; width as usize * 4],
+    )?)?;
+    surface.update(|tx| {
+        tx[surface.root()].record(|c| {
+            c.image(image.id(), Rect::new(0.0, 0.0, 8.0, 8.0), Sampling::Nearest);
+        });
+    });
+    match engine.render(cherenkov::FrameTime::now()) {
+        Err(cherenkov::RenderError::Rejected { resource, reason }) => {
+            assert_eq!(resource, cherenkov::ResourceId::Image(image.id()));
+            assert!(
+                matches!(*reason, cherenkov::ResourceError::Image(_)),
+                "{reason}"
+            );
+        }
+        other => panic!("an oversized image was drawn: {other:?}"),
+    }
+    Ok(())
+}
+
+/// An image whose last handle drops between recording the content that
+/// replaces it and installing that content still draws correctly in a
+/// render issued before the install; the render after the install draws
+/// the new content and frees the image (#199).
+#[test]
+fn an_image_released_before_its_replacement_is_installed_still_draws()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(engine) = engine() else {
+        return Ok(());
+    };
+    let image = two_by_two(&engine);
+    let surface = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
+    let pictured = surface.layer();
+    let marker = surface.layer();
+    surface.update(|tx| {
+        tx[surface.root()].push(&pictured);
+        tx[surface.root()].push(&marker);
+        tx[&pictured].record(|c| {
+            c.image(image.id(), Rect::new(0., 0., 64., 64.), Sampling::Nearest);
+        });
+        tx[&marker].record(|c| {
+            c.fill(
+                Rect::new(60., 60., 64., 64.),
+                cherenkov::WorkingColor::BLACK,
+            );
+        });
+    });
+    let assert_image = || -> Result<(), Box<dyn std::error::Error>> {
+        let rb = surface.readback()?;
+        let px = |x: u32, y: u32| rb.pixels[(y * rb.width + x) as usize];
+        close_px(px(16, 16), premul_p3([255, 0, 0, 255]));
+        close_px(px(48, 16), premul_p3([0, 255, 0, 255]));
+        close_px(px(16, 48), premul_p3([0, 0, 255, 255]));
+        close_px(px(48, 48), premul_p3([255, 255, 255, 128]));
+        Ok(())
+    };
+    engine.render(cherenkov::FrameTime::now())?;
+    assert_image()?;
+
+    let replacement = surface.record(|c| {
+        c.fill(Rect::new(0., 0., 64., 64.), cherenkov::WorkingColor::WHITE);
+    });
+    drop(image);
+    // A property change elsewhere redraws the surface while the installed
+    // content still draws the released image.
+    surface.update(|tx| {
+        tx[&marker].opacity(0.5f32);
+    });
+    engine.render(cherenkov::FrameTime::now())?;
+    assert_image()?;
+
+    surface.update(|tx| {
+        tx[&pictured].content(replacement);
+    });
+    engine.render(cherenkov::FrameTime::now())?;
+    let rb = surface.readback()?;
+    close_px(
+        rb.pixels[(16 * rb.width + 16) as usize],
+        [1.0, 1.0, 1.0, 1.0],
+    );
+    Ok(())
+}

@@ -87,6 +87,10 @@ pub struct Shared<B: Backend> {
     waker: Rc<Waker>,
     /// The last display properties announced to the render thread.
     display: Cell<Display>,
+    /// Set by installed contents' `LiveState`s the moment an animated
+    /// operand arrives, so [`Shared::take_changes`] skips per-content
+    /// sampling probes on surfaces that never saw one.
+    animated: Rc<Cell<bool>>,
 }
 
 #[derive(Default)]
@@ -120,6 +124,7 @@ impl<B: Backend> Shared<B> {
             bindings: FxHashMap::default(),
             waker,
             display: Cell::new(Display::default()),
+            animated: Rc::new(Cell::new(false)),
         }
     }
 
@@ -129,14 +134,29 @@ impl<B: Backend> Shared<B> {
         self.waker.wake();
     }
 
-    /// Drains pending ops and live content changes into a change set.
-    /// Returns `None` when nothing changed.
-    pub fn take_changes(&mut self) -> Option<ChangeSet<B>> {
+    /// Samples running operand animations at `time`, then drains pending
+    /// ops and live content changes into a change set. Returns `None` when
+    /// nothing changed.
+    pub fn take_changes(&mut self, time: crate::Instant) -> Option<ChangeSet<B>> {
         let mut ops = std::mem::take(&mut self.spare_ops);
         let recycled = std::mem::take(&mut self.spare_recycled);
         ops.append(&mut self.pending);
+        let mut animating = false;
+        // `animated` is poked by a content's `LiveState` the moment an
+        // animated operand arrives, so a surface that never saw one
+        // skips the per-content sampling probes entirely.
+        let sampling = self.animated.get();
         for (id, slot) in &mut self.contents {
-            if let Some(change) = slot.content.as_mut().and_then(Content::take_change) {
+            let Some(content) = slot.content.as_mut() else {
+                continue;
+            };
+            // The sample queues the operands' per-frame values, so
+            // `take_change` emits them like signal updates. The cell read
+            // keeps a static content at a field probe, not a call.
+            if sampling && content.live.needs_sample.get() && content.sample(time) {
+                animating = true;
+            }
+            if let Some(change) = content.take_change() {
                 ops.push(Op::Layer(LayerOp::Content(
                     *id,
                     Some(match change {
@@ -147,11 +167,17 @@ impl<B: Backend> Shared<B> {
             }
         }
         let clear = self.clear.take();
+        if sampling && !animating {
+            // Nothing sampled this pass: the flag stays down until an
+            // `animate` pokes it up again.
+            self.animated.set(false);
+        }
         if clear.is_some() || !ops.is_empty() || !recycled.is_empty() {
             Some(ChangeSet {
                 clear,
                 ops,
                 recycled,
+                animating,
             })
         } else {
             self.spare_ops = ops;
@@ -994,6 +1020,9 @@ impl<B: Backend> Surface<B> {
         // changes) come first.
         let pending = std::mem::take(&mut shared.pending);
         let mut ops = pending;
+        // Cloned once per transaction: installed contents attach the
+        // sampling flag to their `LiveState`s.
+        let animated = Rc::clone(&shared.animated);
         for (id, edit) in &mut tx.edits {
             for op in edit.ops.drain(..) {
                 match op {
@@ -1039,7 +1068,7 @@ impl<B: Backend> Surface<B> {
                             slot.spare.live = previous.retire().live;
                         }
                         let stored = slot.content.as_mut().expect("just inserted");
-                        stored.attach_waker(&waker);
+                        stored.attach_waker(&waker, &animated);
                         if let Some(change) = stored.take_change() {
                             let content_op = match change {
                                 ContentChange::Replace(list) => ContentOp::Replace(list),
@@ -1185,7 +1214,7 @@ impl<B: Backdrop> Surface<B> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use std::collections::HashSet;
     use std::sync::mpsc;

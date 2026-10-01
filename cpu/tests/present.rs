@@ -3,6 +3,7 @@
 //! in-gamut pixels exactly (the pre-#96 clamp contract) and stay within
 //! one unorm-8 step elsewhere — same algorithm, `f32` against `f64`.
 
+#![cfg(not(target_arch = "wasm32"))]
 use cherenkov_cpu::{present_linear_p3, present_srgb8};
 use cherenkov_oracle::Image;
 use cherenkov_oracle::present::{

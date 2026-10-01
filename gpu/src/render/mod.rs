@@ -33,10 +33,10 @@ use bitmap::BitmapKey;
 use cherenkov::{
     ContentOp, EngineError, FontData as EngineFontData, FontId, Frame, FrameId, FrameStats,
     FrameTiming, ImageId, ImageUpload, LayerId, MemoryUsage, PassTiming, Pressure, Readback,
-    Redraw, RenderError, Renderer, ResourceError, SurfaceError, SurfaceFrame, SurfaceId,
-    SurfaceInfo,
+    Redraw, RenderError, Renderer, ResourceError, ResourceId, SurfaceError, SurfaceFrame,
+    SurfaceId, SurfaceInfo,
 };
-use glyph::{Atlas, FontData, PendingRaster};
+use glyph::{Atlas, FontData, PendingRaster, PreparedFont};
 use lower::{
     BackdropGroupInfo, ContentData, Frame as LoweredFrame, GlyphContext, Lowered, Lowering,
     PipelineKind, ShaderVariant, Source, Target,
@@ -386,6 +386,47 @@ fn projective_entry_mut(
         .expect("a composed local image is retained")
 }
 
+/// Drops the retained local images of `surf` that `dead` selects and
+/// forgets them as composed.
+fn retire_projective(
+    surf: &mut SurfaceState,
+    device: &wgpu::Device,
+    reason: &'static str,
+    dead: impl Fn(LayerId, &projective::Entry) -> bool,
+) {
+    let mut bytes = 0;
+    let mut composed = false;
+    for (layer, entries) in &mut surf.projective {
+        entries.retain(|entry| {
+            if !dead(*layer, entry) {
+                return true;
+            }
+            bytes += entry.bytes();
+            let key = projective::LocalKey {
+                layer: *layer,
+                bucket: entry.bucket,
+            };
+            let before = surf.composed.len();
+            surf.composed.retain(|k| *k != key);
+            composed |= surf.composed.len() != before;
+            false
+        });
+    }
+    surf.projective.retain(|_, entries| !entries.is_empty());
+    if bytes > 0 {
+        diag::retire(
+            device,
+            diag::RetireArgs {
+                label: "projective image",
+                class: diag::Class::Target,
+                bytes,
+                used_in_latest_submit: composed,
+                reason,
+            },
+        );
+    }
+}
+
 /// The group-1 bind group key: `(source, backdrop-needed,
 /// image, mask texture)`.
 type Bind1Key = (
@@ -461,6 +502,8 @@ pub struct GpuRenderer {
     commit_writes: Vec<glyph::CellWrite>,
     /// Per-surface pending origins, rebuilt in place each apply.
     pending_origins: Vec<PendingOrigin>,
+    /// Replay-pin slots, reused across evicting commits (#119).
+    commit_touches: Vec<u32>,
     /// A dummy 1×1 view for unused group-1 slots.
     dummy_view: wgpu::TextureView,
     /// A dummy 1×1 `u32` view for unused external-frame plane slots.
@@ -479,6 +522,11 @@ pub struct GpuRenderer {
     /// Bumped on every `images` insert/remove — every cached group-1
     /// bind group samples an image view, so an image change rebuilds them.
     images_gen: u64,
+    /// Bumped on every image replacement: the one change to what a
+    /// current local image read that arrives without a tree edit. Adding
+    /// an image changes nothing drawn, and a removal only runs once no
+    /// installed content draws the image (#199), so neither counts.
+    image_replacements: u64,
     timestamps: bool,
     query_set: Option<wgpu::QuerySet>,
     /// First query of the active frame's independent range.
@@ -543,13 +591,13 @@ enum Commit {
     Done,
     /// Grow the atlas once to this edge and re-lower.
     Grow(u32),
-    /// Clear the atlas and re-lower; the next plan verdict is final.
-    Recycle,
 }
 
 enum PendingOrigin {
-    /// Cell origins: one for a glyph, one per cell for a path emission.
-    Cells(Vec<(u32, u32)>),
+    /// Cell origins — one for a glyph, one per cell for a path
+    /// emission — and the shelves the admission's cells live on, so
+    /// patched emissions can reference the bands (#119).
+    Cells(Vec<(u32, u32)>, Vec<u32>),
     /// A clip mask's cell origin.
     Mask([f32; 2]),
     /// A COLR cache insert; no instance patch.
@@ -1401,11 +1449,13 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             atlas,
             commit_writes: Vec::new(),
             pending_origins: Vec::new(),
+            commit_touches: Vec::new(),
             surfaces: FxHashMap::default(),
             fonts: FxHashMap::default(),
             images: FxHashMap::default(),
             bitmaps: FxHashMap::default(),
             images_gen: 0,
+            image_replacements: 0,
             timestamps,
             query_set,
             query_base: 0,
@@ -1619,11 +1669,13 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
         atlas,
         commit_writes: Vec::new(),
         pending_origins: Vec::new(),
+        commit_touches: Vec::new(),
         surfaces: FxHashMap::default(),
         fonts: FxHashMap::default(),
         images: FxHashMap::default(),
         bitmaps: FxHashMap::default(),
         images_gen: 0,
+        image_replacements: 0,
         timestamps,
         query_set,
         query_base: 0,
@@ -1659,27 +1711,20 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
     ))
 }
 
-/// Validates font data and detects native colour-glyph formats.
-///
-/// `COLR` fonts render through the colour-glyph lowering; supported sbix and
-/// CBDT/CBLC glyphs are decoded as images at realization.
-fn validate_font(
-    data: &[u8],
-    index: u32,
-) -> Result<(bool, Option<Arc<bitmap::BitmapFont>>), ResourceError> {
-    use skrifa::raw::TableProvider as _;
-    let font = skrifa::FontRef::from_index(data, index)
-        .map_err(|e| ResourceError::Font(format!("{e}")))?;
-    if font.data_for_tag(skrifa::Tag::new(b"SVG ")).is_some() {
-        return Err(ResourceError::Unsupported(names::COLOR_FONT));
+/// Rejects an image the device cannot hold as one texture.
+fn check_image_size(image: &ImageUpload, max: u32) -> Result<(), ResourceError> {
+    if image.width > max || image.height > max {
+        return Err(ResourceError::Image(format!(
+            "{}x{} exceeds the maximum texture size {max}",
+            image.width, image.height
+        )));
     }
-    let has_colr = font.colr().is_ok();
-    let bitmap = bitmap::BitmapFont::detect(data, index)?.map(Arc::new);
-    Ok((has_colr, bitmap))
+    Ok(())
 }
 
 impl Renderer for GpuRenderer {
     type Target = GpuTarget;
+    type Font = PreparedFont;
     fn create_surface(
         &mut self,
         id: SurfaceId,
@@ -1907,20 +1952,29 @@ impl Renderer for GpuRenderer {
         self.update_filter_activity();
     }
 
-    fn add_font(&mut self, id: FontId, font: EngineFontData) -> Result<(), ResourceError> {
-        let (has_colr, bitmap) = validate_font(&font.data, font.index)?;
-        self.fonts.insert(
-            id.raw(),
-            FontData {
-                data: font.data,
-                index: font.index,
-                has_colr,
-                has_bitmap: bitmap.is_some(),
-                bitmap,
-                colr: std::cell::RefCell::new(FxHashMap::default()),
-            },
-        );
-        Ok(())
+    /// Validates font data and detects native colour-glyph formats.
+    ///
+    /// `COLR` fonts render through the colour-glyph lowering; supported
+    /// sbix and CBDT/CBLC glyphs are decoded as images at realization.
+    fn prepare_font(font: EngineFontData) -> Result<PreparedFont, ResourceError> {
+        use skrifa::raw::TableProvider as _;
+        let parsed = skrifa::FontRef::from_index(&font.data, font.index)
+            .map_err(|e| ResourceError::Font(format!("{e}")))?;
+        if parsed.data_for_tag(skrifa::Tag::new(b"SVG ")).is_some() {
+            return Err(ResourceError::Unsupported(names::COLOR_FONT));
+        }
+        let has_colr = parsed.colr().is_ok();
+        let bitmap = bitmap::BitmapFont::detect(&font.data, font.index)?.map(Arc::new);
+        Ok(PreparedFont {
+            data: font.data,
+            index: font.index,
+            has_colr,
+            bitmap,
+        })
+    }
+
+    fn add_font(&mut self, id: FontId, font: PreparedFont) {
+        self.fonts.insert(id.raw(), font.into());
     }
 
     fn remove_font(&mut self, id: FontId) {
@@ -1992,6 +2046,7 @@ impl Renderer for GpuRenderer {
     }
 
     fn add_image(&mut self, id: ImageId, image: ImageUpload) -> Result<(), ResourceError> {
+        check_image_size(&image, self.max_texture)?;
         let data = image_texels_f16(&image)?;
         let image = upload_image(
             &self.device,
@@ -2006,12 +2061,16 @@ impl Renderer for GpuRenderer {
 
     fn replace_image(&mut self, id: ImageId, image: ImageUpload) -> Result<(), ResourceError> {
         let _diag_guard = diag::Guard::scope(self.diag.as_ref());
+        check_image_size(&image, self.max_texture)?;
         let data = image_texels_f16(&image)?;
         let size = (image.width, image.height);
         let current = self
             .images
             .get(&id.raw())
             .expect("replace targets a registered image");
+        // Local images that sampled the previous pixels are no longer
+        // current, whichever path the upload takes.
+        self.image_replacements += 1;
         if (current.width, current.height) == size {
             // The copy is queued ahead of the next submission, after every
             // frame already submitted, so no frame samples a partly
@@ -2059,12 +2118,12 @@ impl Renderer for GpuRenderer {
         Ok(())
     }
 
-    fn samples_image(&self, surface: SurfaceId, id: ImageId) -> bool {
+    fn samples(&self, surface: SurfaceId, resource: ResourceId) -> bool {
         self.surfaces.get(&surface).is_some_and(|state| {
             state
                 .layers
                 .values()
-                .any(|content| content.references_image(id))
+                .any(|content| content.references(resource))
         })
     }
 
@@ -2651,10 +2710,8 @@ impl GpuRenderer {
         // an earlier one before it is encoded.
         // Take the states out so the lowering workers own them.
         let t_lower = Instant::now();
-        let inputs: Vec<projective::Inputs> = dirty
-            .iter()
-            .map(|sf| self.projective_inputs(sf.id))
-            .collect();
+        let inputs: Vec<projective::Inputs> =
+            dirty.iter().map(|sf| self.projective_inputs(sf)).collect();
         let mut pending: Vec<SurfaceState> = dirty
             .iter()
             .map(|id| {
@@ -2784,10 +2841,8 @@ impl GpuRenderer {
         // an earlier one before it is encoded.
         // Take the states out so the lowering workers own them.
         let t_lower = Instant::now();
-        let inputs: Vec<projective::Inputs> = dirty
-            .iter()
-            .map(|sf| self.projective_inputs(sf.id))
-            .collect();
+        let inputs: Vec<projective::Inputs> =
+            dirty.iter().map(|sf| self.projective_inputs(sf)).collect();
         let mut pending: Vec<SurfaceState> = dirty
             .iter()
             .map(|id| {
@@ -2964,6 +3019,19 @@ impl GpuRenderer {
             }
         }
     }
+    /// Validates a user shader paint on the caller thread.
+    pub(crate) fn validate_shader(source: &cherenkov::ShaderSource) -> Result<(), ResourceError> {
+        paint::validate(source)
+    }
+
+    /// Validates a backdrop effect shader on the caller thread: the stock
+    /// module with the user's `backdrop_effect` parses and validates.
+    pub(crate) fn validate_backdrop_shader(
+        source: &cherenkov::BackdropShaderSource,
+    ) -> Result<(), ResourceError> {
+        shaders::validate_wgsl(&backdrop_effect_text(&source.source)).map(drop)
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn add_shader(
         &mut self,
@@ -3099,6 +3167,14 @@ impl GpuRenderer {
                 .shader_textures
                 .retain(|key, _| key.shader != id.raw());
             surface.binds1.clear();
+            // A retained local image never names a released shader. The
+            // release runs once no installed content draws the shader, so
+            // an image that sampled it is one no frame composes again.
+            retire_projective(surface, &self.device, "shader released", |_, entry| {
+                entry.deps.images.iter().any(|image| {
+                    matches!(image, lower::ImageSource::Shader(key) if key.shader == id.raw())
+                })
+            });
         }
     }
     fn render_shaders(&mut self, id: SurfaceId, elapsed: f32) -> Result<(), RenderError> {
@@ -3380,15 +3456,33 @@ impl GpuRenderer {
         self.config.budget.gpu.0.saturating_sub(others)
     }
 
-    /// What surface `id`'s lowering needs to plan and reuse local images.
-    fn projective_inputs(&self, id: SurfaceId) -> projective::Inputs {
-        let surf = &self.surfaces[&id];
+    /// What surface `sf`'s lowering needs to plan and reuse local images.
+    /// First drops every retained image no frame can compose again: its
+    /// layer is gone or affine, its content stamp moved on, or an image
+    /// was replaced since. A resource released under #199's deferred
+    /// release is drawn by no installed content, so every image that read
+    /// it is among these: none outlives the frame of its release.
+    fn projective_inputs(&mut self, sf: &SurfaceFrame<'_>) -> projective::Inputs {
+        let replacements = self.image_replacements;
+        let tree = sf.tree;
+        retire_projective(
+            self.surfaces.get_mut(&sf.id).expect("registered surface"),
+            &self.device,
+            "projective content changed",
+            |layer, entry| {
+                tree.projective_pose(layer).is_none()
+                    || !entry
+                        .key
+                        .is_some_and(|key| key.is_current(tree.content_stamp(layer), replacements))
+            },
+        );
+        let surf = &self.surfaces[&sf.id];
         projective::Inputs {
             limits: cherenkov::lowering::projective::Limits {
                 max_dimension: self.max_texture,
                 max_bytes: self.projective_available(),
             },
-            images: self.images_gen,
+            replacements,
             interop: surf.interop,
             stale: surf.stale_projective(&self.filters, &self.shaders),
         }
@@ -3577,7 +3671,6 @@ impl GpuRenderer {
         frames: &[&SurfaceFrame<'_>],
         inputs: &[projective::Inputs],
     ) -> Vec<Result<Lowered, RenderError>> {
-        let mut cleared = false;
         let mut grew = false;
         loop {
             let group_maps: Vec<FxHashMap<u64, BackdropGroupInfo>> = pending
@@ -3650,7 +3743,7 @@ impl GpuRenderer {
             // before any placement or upload happens, so a failed
             // placement never enqueues uploads into an atlas the same
             // preparation abandons.
-            match self.commit_rasters(pending, &mut results, cleared, grew) {
+            match self.commit_rasters(pending, &mut results, grew) {
                 Commit::Done => break results,
                 Commit::Grow(size) => {
                     self.atlas.grow_to(&self.device, size);
@@ -3661,15 +3754,9 @@ impl GpuRenderer {
                         "atlas grown"
                     );
                 }
-                Commit::Recycle => {
-                    self.atlas.clear();
-                    cleared = true;
-                    tracing::debug!(size = self.atlas.size(), "atlas cleared");
-                }
             }
-            // Growing or clearing emptied the atlas: every hit any
-            // lowering took is now a miss, so lower the whole batch
-            // again.
+            // Growing emptied the atlas: every hit any lowering took is
+            // now a miss, so lower the whole batch again.
             diag::event(
                 &self.device,
                 diag::EventKind::Phase {
@@ -3686,7 +3773,6 @@ impl GpuRenderer {
         frames: &[&SurfaceFrame<'_>],
         inputs: &[projective::Inputs],
     ) -> Vec<Result<Lowered, RenderError>> {
-        let mut cleared = false;
         let mut grew = false;
         loop {
             let group_maps: Vec<FxHashMap<u64, BackdropGroupInfo>> = pending
@@ -3717,7 +3803,7 @@ impl GpuRenderer {
             // before any placement or upload happens, so a failed
             // placement never enqueues uploads into an atlas the same
             // preparation abandons.
-            match self.commit_rasters(pending, &mut results, cleared, grew) {
+            match self.commit_rasters(pending, &mut results, grew) {
                 Commit::Done => break results,
                 Commit::Grow(size) => {
                     self.atlas.grow_to(&self.device, size);
@@ -3728,15 +3814,9 @@ impl GpuRenderer {
                         "atlas grown"
                     );
                 }
-                Commit::Recycle => {
-                    self.atlas.clear();
-                    cleared = true;
-                    tracing::debug!(size = self.atlas.size(), "atlas cleared");
-                }
             }
-            // Growing or clearing emptied the atlas: every hit any
-            // lowering took is now a miss, so lower the whole batch
-            // again.
+            // Growing emptied the atlas: every hit any lowering took is
+            // now a miss, so lower the whole batch again.
             diag::event(
                 &self.device,
                 diag::EventKind::Phase {
@@ -3746,6 +3826,9 @@ impl GpuRenderer {
         }
     }
 
+    // `#[inline(never)]` keeps a symbol for the Callgrind gate's root lookup
+    // (`bench/scripts/ir_gate.py`).
+    #[inline(never)]
     fn lower_content(
         surf: &mut SurfaceState,
         frame: &SurfaceFrame<'_>,
@@ -3761,6 +3844,7 @@ impl GpuRenderer {
         let result = {
             let glyphs = GlyphContext {
                 atlas: resources.atlas,
+                live_stamp: resources.atlas.live_stamp(),
                 fonts: resources.fonts,
                 images: resources.images,
                 bitmaps: resources.bitmaps,
@@ -3791,6 +3875,7 @@ impl GpuRenderer {
             lowered.glyphs = lowering.glyphs_rasterized();
             lowered.paths = lowering.paths_rasterized();
             lowered.cell_patches = std::mem::take(&mut lowering.cell_patches);
+            lowered.emission_patches = std::mem::take(&mut lowering.emission_patches);
             lowered.mask_patches = std::mem::take(&mut lowering.mask_patches);
             lowered.pending = std::mem::take(&mut lowering.pending);
             result
@@ -3830,7 +3915,8 @@ impl GpuRenderer {
                 layer: plan.layer,
                 bucket: projective::bucket(image.density),
             };
-            let cache = projective::Key::new(&image, tree.content_stamp(plan.layer), inputs.images);
+            let cache =
+                projective::Key::new(&image, tree.content_stamp(plan.layer), inputs.replacements);
             let current = !inputs.stale.contains(&key)
                 && retained.get(&plan.layer).is_some_and(|entries| {
                     entries
@@ -3907,16 +3993,23 @@ impl GpuRenderer {
     }
 
     /// Commits every surface's pending rasters transactionally
-    /// (#169 A3). First [`Atlas::plan`] dry-runs all placements
-    /// against shelf metadata alone; only a `Fits` verdict — or the
-    /// last attempt after recycling — commits for real. The upload
-    /// then batches the committed cells into one `write_texture` per
-    /// newly allocated shelf region.
+    /// (#169 A3). The shelves this lowering's hits live on are marked
+    /// first so no placement can evict them; [`Atlas::plan`] then
+    /// dry-runs all placements against shelf metadata alone; only a
+    /// `Fits` verdict — or the last attempt after a grow — commits for
+    /// real. When even an emptied atlas cannot hold the batch the
+    /// commit runs evicting instead of clearing: cold shelves are
+    /// reclaimed in place, so surviving entries — and the retained
+    /// emissions referencing them — stay valid (#119). The upload
+    /// batches the committed cells into one `write_texture` per newly
+    /// allocated shelf region.
+    // `never` so Callgrind can attribute the commit path's inclusive
+    // cost — the one-per-frame call boundary is free evidence (#119).
+    #[inline(never)]
     fn commit_rasters(
         &mut self,
         pending: &mut [SurfaceState],
         results: &mut [Result<Lowered, RenderError>],
-        cleared: bool,
         grew: bool,
     ) -> Commit {
         let rasters: Vec<&glyph::PendingRaster> = results
@@ -3924,41 +4017,185 @@ impl GpuRenderer {
             .filter_map(|r| r.as_ref().ok())
             .flat_map(|l| l.pending.iter())
             .collect();
-        match self.atlas.plan(&rasters) {
-            glyph::AtlasPlan::Fits => {}
-            glyph::AtlasPlan::Grow(size) if !grew => return Commit::Grow(size),
-            glyph::AtlasPlan::Grow(_) | glyph::AtlasPlan::Recycle => {
-                if !cleared {
-                    return Commit::Recycle;
+        let n_cells: usize = rasters.iter().map(|r| r.cell_count()).sum();
+        // A frame whose batch places strictly needs no replay pins and
+        // no eviction, so no emission scan and no touch decoding runs —
+        // the commit's work scales with what changed, not what stays
+        // retained (#119).
+        let mut touches_len = 0usize;
+        let plan_dbg = if self.atlas.fits_strict(&rasters) {
+            self.atlas.begin_commit(&[]);
+            "fits"
+        } else {
+            let mut touches = std::mem::take(&mut self.commit_touches);
+            touches.clear();
+            touches_len = self.replay_pins(pending, &mut touches);
+            self.atlas.begin_commit(&touches);
+            touches.clear();
+            self.commit_touches = touches;
+            match self.atlas.plan(&rasters) {
+                glyph::AtlasPlan::Fits | glyph::AtlasPlan::FitsEviction => "fits-eviction",
+                glyph::AtlasPlan::Grow(size) if !grew => {
+                    // The grow discards the atlas and re-lowers, so
+                    // every retained emission is dead anyway — but the
+                    // pending cells recorded this round index a raster
+                    // list that never applied, and must not survive
+                    // into the retry's hits (#119).
+                    for surf in pending.iter_mut() {
+                        Self::discard_surface(surf);
+                    }
+                    return Commit::Grow(size);
                 }
-                // Final attempt on the emptied atlas: commit the
-                // fitting prefix and exhaust the first surface whose
-                // raster does not place.
+                glyph::AtlasPlan::Grow(_) | glyph::AtlasPlan::Recycle => {
+                    // Bounded in-place eviction makes room instead of a
+                    // wholesale clear: the commit below reclaims shelves
+                    // nothing touched until the batch places or nothing
+                    // untouchable remains, then exhausts the first surface
+                    // whose raster still does not fit (#119).
+                    "exhaust-candidate"
+                }
             }
+        };
+        if plan_dbg != "fits" {
+            self.atlas.enable_evicting();
         }
-        let bounds = self.atlas.shelf_bounds();
         let mut writes = std::mem::take(&mut self.commit_writes);
         writes.clear();
-        for (surf, result) in pending.iter_mut().zip(results.iter_mut()) {
-            let Ok(lowered) = result else {
-                continue;
-            };
-            match self.apply_pending(surf, lowered, &mut writes) {
-                Ok(()) => {}
-                Err(RenderError::AtlasFull) => {
-                    *result = Err(RenderError::AtlasExhausted);
-                    break;
+        let mut failed = None;
+        for (i, (surf, result)) in pending.iter_mut().zip(results.iter_mut()).enumerate() {
+            match result {
+                // A failed lowering leaves whatever retained mutations
+                // its leaves already made — pending cells indexing a
+                // raster list that never applies. Those emissions must
+                // not survive to hit next frame (#119).
+                Err(_) => Self::discard_surface(surf),
+                Ok(lowered) => match self.apply_pending(surf, lowered, &mut writes) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        *result = Err(match e {
+                            RenderError::AtlasFull => RenderError::AtlasExhausted,
+                            other => other,
+                        });
+                        failed = Some(i);
+                        break;
+                    }
+                },
+            }
+        }
+        // An apply that stopped midway leaves the pending cells of
+        // every unapplied surface pointing at rasters that never
+        // landed — drop their retained emissions wholesale so the
+        // next frame re-lowers rather than composes unplaced cells
+        // (#119).
+        if let Some(i) = failed {
+            Self::discard_unapplied(&mut pending[i..], &mut results[i..]);
+        }
+        let evicted = self.atlas.take_evicted();
+        tracing::debug!(
+            evictions = evicted.len(),
+            evicted_bytes = evicted.iter().map(|e| e.0).sum::<u64>(),
+            plan = ?plan_dbg,
+            pending_cells = n_cells,
+            touches = touches_len,
+            occupancy = ?self.atlas.occupancy(),
+            "atlas commit"
+        );
+        for (bytes, used_in_latest_submit) in evicted {
+            diag::retire(
+                &self.device,
+                diag::RetireArgs {
+                    label: "glyph atlas",
+                    class: diag::Class::Atlas,
+                    bytes,
+                    used_in_latest_submit,
+                    reason: "atlas evict",
+                },
+            );
+        }
+        self.atlas
+            .upload_committed(&self.device, &self.queue, &writes);
+        self.commit_writes = writes;
+        Commit::Done
+    }
+
+    /// The shelf slots the commit must pin: the shelves each new
+    /// emission's glyph instances sample plus the clip masks bound
+    /// through `uv[2..3]` — all recovered from stored UVs, so the
+    /// lowering records no slot list (#119).
+    fn replay_pins(&self, pending: &mut [SurfaceState], touches: &mut Vec<u32>) -> usize {
+        for surf in pending.iter_mut() {
+            for content in surf.layers.values_mut() {
+                let (_, emissions) = content.retained.prepared();
+                for emission in emissions.iter().filter_map(|e| e.data.as_ref()) {
+                    Self::for_each_glyph_shelf(
+                        &self.atlas,
+                        &content.storage.instances[emission.instances.clone()],
+                        |slot| touches.push(slot),
+                    );
                 }
-                Err(e) => {
-                    *result = Err(e);
-                    break;
+            }
+            // Clip masks bound through `uv[2..3]` pin the same way: the
+            // frame's masked instances recover their shelf from the
+            // stored atlas coordinates (#119).
+            for inst in &surf.frame.instances {
+                let flags = inst.meta[3] >> 24;
+                if flags & instance::FLAG_HAS_MASK != 0
+                    && flags & instance::FLAG_MASK_TEXTURE == 0
+                    && let Some(slot) = self.atlas.shelf_at(inst.uv[2], inst.uv[3])
+                {
+                    touches.push(slot);
                 }
             }
         }
-        self.atlas
-            .upload_committed(&self.device, &self.queue, &bounds, &writes);
-        self.commit_writes = writes;
-        Commit::Done
+        // Pins stay frame-scoped: only the shelves this frame's
+        // emissions and masks sample are marked. Bands a retained
+        // emission sampled in an earlier frame are deliberately left
+        // unpinned: evicting them is what keeps the atlas bounded, and
+        // the emission's stale check re-lowers it if it displays again
+        // (#119).
+        touches.len()
+    }
+
+    /// The shelves `instances`' glyph quads sample, recovered from their
+    /// stored UVs — the leaf records no per-cell slot at emit time, so
+    /// the commit derives them here instead (#119).
+    fn for_each_glyph_shelf(
+        atlas: &Atlas,
+        instances: &[lower::RetainedInstance],
+        mut f: impl FnMut(u32),
+    ) {
+        let mut hint = None;
+        for inst in instances {
+            if inst.kind == instance::KIND_GLYPH
+                && let Some(slot) = atlas.shelf_at_hint(inst.uv[0], inst.uv[1], &mut hint)
+            {
+                f(slot);
+            }
+        }
+    }
+
+    /// Drops one surface's retained emissions: unapplied pending cells
+    /// index a raster list that never landed, so nothing they recorded
+    /// may hit next frame (#119).
+    fn discard_surface(surf: &mut SurfaceState) {
+        for content in surf.layers.values_mut() {
+            content.invalidate();
+        }
+    }
+
+    /// [`Self::discard_surface`] for every surface at `from` onward and
+    /// marks the still-`Ok` results [`RenderError::AtlasExhausted`]
+    /// (#119).
+    fn discard_unapplied(
+        pending: &mut [SurfaceState],
+        results: &mut [Result<Lowered, RenderError>],
+    ) {
+        for (surf, result) in pending.iter_mut().zip(results.iter_mut()) {
+            Self::discard_surface(surf);
+            if result.is_ok() {
+                *result = Err(RenderError::AtlasExhausted);
+            }
+        }
     }
 
     #[expect(
@@ -3978,24 +4215,74 @@ impl GpuRenderer {
             origins.push(self.apply_raster(raster, writes)?);
         }
         let cell_origin = |p: u32, c: u32| {
-            let PendingOrigin::Cells(cells) = &origins[p as usize] else {
+            let PendingOrigin::Cells(cells, _) = &origins[p as usize] else {
                 unreachable!("cell patch must reference cell raster");
             };
             let (x, y) = cells[c as usize];
             [x as f32, y as f32]
         };
-        for (inst, p, c) in lowered.cell_patches.drain(..) {
-            let [x, y] = cell_origin(p, c);
-            surf.frame.instances[inst as usize].uv[..2].copy_from_slice(&[x, y]);
-        }
         for content in surf.layers.values_mut() {
             let (_, emissions) = content.retained.prepared();
             for emission in emissions.iter_mut().filter_map(|e| e.data.as_mut()) {
-                for (inst, p, c) in emission.pending_cells.drain(..) {
-                    content.storage.instances[emission.instances.start + inst as usize].uv[..2]
-                        .copy_from_slice(&cell_origin(p, c));
+                // The emission's atlas references are the shelves it
+                // touched while lowering plus the bands its deferred
+                // rasters resolved to — recorded as `(slot, band epoch)`
+                // pairs contiguous at the storage tail. Duplicates are
+                // harmless (epoch checks are idempotent and pin marks
+                // dedupe themselves), so the fold writes directly — no
+                // per-emission set allocation (#119).
+                // Deferred `refs` resolve here: the frame's touched
+                // slots and each placed cell's bands join as one
+                // contiguous `(slot, epoch)` extent at the storage
+                // tail (#119).
+                if emission.refs & lower::DEFERRED_REFS != 0 || !emission.pending_cells_empty() {
+                    let first = content.storage.refs.len();
+                    for i in emission.pending_cells() {
+                        let (inst, p, c) = lowered.emission_patches[i];
+                        let local = inst - emission.cell_inst_base();
+                        content.storage.instances[emission.instances.start + local as usize].uv
+                            [..2]
+                            .copy_from_slice(&cell_origin(p, c));
+                        if let PendingOrigin::Cells(_, bands) = &origins[p as usize] {
+                            content.storage.refs.extend(
+                                bands
+                                    .iter()
+                                    .map(|&slot| (slot, self.atlas.shelf_epoch(slot))),
+                            );
+                        }
+                    }
+                    // Glyph cells record no slot at emit time: the shelf
+                    // each stored UV samples is recovered here instead
+                    // (#119).
+                    Self::for_each_glyph_shelf(
+                        &self.atlas,
+                        &content.storage.instances[emission.instances.clone()],
+                        |slot| {
+                            content
+                                .storage
+                                .refs
+                                .push((slot, self.atlas.shelf_epoch(slot)));
+                        },
+                    );
+                    emission.clear_pending_cells();
+                    emission.refs =
+                        lower::Emission::pack_refs(first, content.storage.refs.len() - first);
+                }
+                // Restamp only when every reference survived this
+                // commit's evictions; a stale emission must keep an
+                // older stamp so its next hit check walks the refs
+                // and re-lowers (#119).
+                let live = content.storage.refs[emission.refs_range()]
+                    .iter()
+                    .all(|&(s, ep)| self.atlas.shelf_epoch(s) == ep);
+                if live {
+                    emission.live_stamp = self.atlas.live_stamp();
                 }
             }
+        }
+        for (inst, p, c) in lowered.cell_patches.drain(..) {
+            let [x, y] = cell_origin(p, c);
+            surf.frame.instances[inst as usize].uv[..2].copy_from_slice(&[x, y]);
         }
         for (inst, p) in lowered.mask_patches.drain(..) {
             let PendingOrigin::Mask(origin) = &origins[p as usize] else {
@@ -4025,7 +4312,12 @@ impl GpuRenderer {
                 let out = self
                     .atlas
                     .place_glyph(key, left, top, w, h, texels, writes)
-                    .map(|(x, y)| PendingOrigin::Cells(vec![(x, y)]))
+                    .map(|(x, y)| {
+                        PendingOrigin::Cells(
+                            vec![(x, y)],
+                            vec![self.atlas.get(&key).expect("just stored").slot],
+                        )
+                    })
                     .ok_or(RenderError::AtlasFull)?;
                 if !hit && w == 0 {
                     diag::atlas_cell(&self.device, (0, 0, 0, 0));
@@ -4038,6 +4330,9 @@ impl GpuRenderer {
                     .ok_or(RenderError::AtlasFull)?;
                 Ok(PendingOrigin::Cells(
                     self.atlas.path_origins(key).expect("just stored"),
+                    self.atlas
+                        .emit_slot_arena(self.atlas.path(key).expect("just stored").slots.clone())
+                        .to_vec(),
                 ))
             }
             PendingRaster::Mask {
@@ -5022,9 +5317,23 @@ impl GpuRenderer {
                             }),
                             backdrop,
                             range.image.as_ref().and_then(|source| match source {
-                                lower::ImageSource::Registered(id) => {
-                                    self.images.get(id).map(|image| &image.view)
-                                }
+                                // Lowering resolved this range against a
+                                // registered image, and the render loop frees
+                                // an image only once no installed content
+                                // draws it (#199): a range naming a missing
+                                // image is an engine defect, never drawn
+                                // with a substitute.
+                                lower::ImageSource::Registered(id) => Some(
+                                    &self
+                                        .images
+                                        .get(id)
+                                        .unwrap_or_else(|| {
+                                            panic!(
+                                                "a lowered range samples image {id}, which is not registered"
+                                            )
+                                        })
+                                        .view,
+                                ),
                                 lower::ImageSource::Bitmap(key) => {
                                     self.bitmaps.get(key).map(|bitmap| &bitmap.image.view)
                                 }

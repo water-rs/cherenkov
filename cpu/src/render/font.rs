@@ -19,6 +19,18 @@ pub struct ColrKey {
     pub coords: Box<[i16]>,
 }
 
+/// A font validated on the caller thread by `Renderer::prepare_font`:
+/// everything registration needs, so `add_font` cannot fail.
+pub struct PreparedFont {
+    /// The shared front-end font record.
+    pub data: FontData,
+    /// Whether the font carries `COLR`.
+    pub has_colr: bool,
+    /// The font's validated bitmap strikes, when it carries sbix or
+    /// CBDT/CBLC.
+    pub bitmap: Option<Arc<super::bitmap::BitmapFont>>,
+}
+
 /// A registered font: file bytes and collection index, whether it carries
 /// `COLR`, and the colour-glyph node trees built so far.
 pub struct Font {

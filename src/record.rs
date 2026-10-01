@@ -2,7 +2,8 @@
 //! commit sends to the render thread.
 
 use std::any::Any;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::mem::{needs_drop, size_of};
 use std::rc::{Rc, Weak};
 
@@ -10,7 +11,9 @@ use kurbo::{Affine, Rect, Stroke};
 use nami_core::Signal;
 use serde::{Deserialize, Serialize};
 
-use crate::display_list::{Command, DisplayList, Operand, Picture, SlotUpdate};
+use crate::Instant;
+use crate::animation::{AnimLanes, Animation, OperandTrack};
+use crate::display_list::{Command, DisplayList, Operand, Picture, Slot, SlotUpdate};
 use crate::glyph::GlyphRun;
 use crate::paint::{ImageId, Paint, Sampling};
 use crate::shape::Shape;
@@ -228,10 +231,18 @@ impl<T> Watch<T> {
                 convert,
             } => {
                 if let Some(state) = state.upgrade() {
-                    state.push(SlotUpdate {
-                        command: *command,
-                        value: convert(context.into_value()),
-                    });
+                    // The `Context` metadata carries the animation a bound
+                    // signal was set under, exactly like a layer property's
+                    // binding op does.
+                    let animation = context.metadata().try_get::<Animation>();
+                    let value = convert(context.into_value());
+                    match animation {
+                        Some(animation) => state.animate(*command, value, animation),
+                        None => state.snap(SlotUpdate {
+                            command: *command,
+                            value,
+                        }),
+                    }
                 }
             }
             Destination::Binding(callback) => callback(context),
@@ -324,8 +335,35 @@ impl<T: 'static, S: Signal<Output = T>> From<S> for Live<T> {
 #[derive(Default)]
 pub struct LiveState {
     pending: RefCell<Vec<SlotUpdate>>,
+    /// Queued animated changes and running tracks. `None` until the
+    /// first animated change, so a static `LiveState` costs one
+    /// `Option` to build and drop, not a `HashMap`.
+    anim: Cell<Option<Box<AnimState>>>,
+    /// Set while queued animates or running tracks make
+    /// [`LiveState::sample`] worth its borrows. `pub(crate)` so the
+    /// surface drain can probe it as a plain cell read — `sample` is a
+    /// real call on every static content otherwise.
+    pub(crate) needs_sample: Cell<bool>,
+    /// The installing surface's "a content may be sampling" flag,
+    /// poked by [`LiveState::animate`] so a fully static surface can
+    /// skip per-content probes. Detached when the content retires.
+    surface_animated: RefCell<Option<Rc<Cell<bool>>>>,
     guards: RefCell<Vec<Box<dyn Any>>>,
     waker: RefCell<Weak<crate::engine::Waker>>,
+}
+
+/// A change carrying an `Animation`, queued until the next
+/// [`LiveState::sample`] resolves the operand it animates from.
+type Animate = (u32, Operand, Animation);
+
+/// The animated-operand machinery of a [`LiveState`], present only
+/// while a change is queued or a track runs.
+#[derive(Default)]
+struct AnimState {
+    /// Animated changes not yet sampled into tracks.
+    animates: Vec<Animate>,
+    /// A running animation per operand slot.
+    tracks: HashMap<Slot, OperandTrack>,
 }
 
 impl LiveState {
@@ -337,10 +375,153 @@ impl LiveState {
             None => pending.push(update),
         }
         drop(pending);
+        self.wake();
+    }
+
+    fn wake(&self) {
         let waker = self.waker.borrow().upgrade();
         if let Some(waker) = waker {
             waker.wake();
         }
+    }
+
+    /// A change whose `Context` carried an `Animation`: queued for the
+    /// next [`Content::sample`], which starts or retargets the slot's
+    /// track from the operand's then-current value.
+    ///
+    /// # Panics
+    /// Panics on a `Decay` animation, the same invariant `scroll_offset`'s
+    /// siblings hold.
+    fn animate(&self, command: u32, target: Operand, animation: Animation) {
+        assert!(
+            !matches!(animation, Animation::Decay(_)),
+            "Decay is only legal on scroll_offset"
+        );
+        let mut anim = self.anim.take().unwrap_or_default();
+        anim.animates.push((command, target, animation));
+        self.anim.set(Some(anim));
+        self.needs_sample.set(true);
+        if let Some(flag) = self.surface_animated.borrow().as_ref() {
+            flag.set(true);
+        }
+        self.wake();
+    }
+
+    /// A change without an `Animation`: the value snaps and any track or
+    /// queued animate on the slot drops.
+    fn snap(&self, update: SlotUpdate) {
+        let slot = update.slot();
+        if let Some(mut anim) = self.anim.take() {
+            anim.tracks.remove(&slot);
+            anim.animates.retain(|(command, target, _)| {
+                *command != slot.command || target.kind() != slot.operand
+            });
+            let needed = !anim.tracks.is_empty() || !anim.animates.is_empty();
+            if needed {
+                self.anim.set(Some(anim));
+            }
+            self.needs_sample.set(needed);
+        }
+        self.push(update);
+    }
+
+    /// Starts or retargets tracks for the queued animated changes, then
+    /// samples every running operand track at `time`, queuing the operand
+    /// updates the next [`Content::take_change`] drains. An animate's
+    /// start operand is the slot's latest queued update, or `list`'s
+    /// recorded operand when none arrived. Returns `true` while tracks
+    /// still run.
+    fn sample(&self, time: Instant, list: &DisplayList) -> bool {
+        if !self.needs_sample.get() {
+            return false;
+        }
+        let Some(mut anim) = self.anim.take() else {
+            self.needs_sample.set(false);
+            return false;
+        };
+        let animates = std::mem::take(&mut anim.animates);
+        if !animates.is_empty() {
+            let mut pending = self.pending.borrow_mut();
+            for (command, target, animation) in animates {
+                let slot = Slot {
+                    command,
+                    operand: target.kind(),
+                };
+                // A running track retargets, keeping the last sampled
+                // position and velocity when the new target keeps the lane
+                // layout.
+                if anim
+                    .tracks
+                    .get_mut(&slot)
+                    .is_some_and(|track| track.retarget(target.clone(), animation))
+                {
+                    continue;
+                }
+                let from = pending
+                    .iter()
+                    .find(|queued| queued.slot() == slot)
+                    .map_or_else(
+                        || list.operand(command, slot.operand),
+                        |queued| Some(queued.value.clone()),
+                    );
+                match from.and_then(|from| from.anim_lanes(&target)) {
+                    Some(from) => {
+                        anim.tracks
+                            .insert(slot, OperandTrack::new(from, target, animation));
+                    }
+                    // Endpoints sharing no lane decomposition snap the
+                    // change like an un-animated one.
+                    None => match pending.iter_mut().find(|queued| queued.slot() == slot) {
+                        Some(queued) => queued.value = target,
+                        None => pending.push(SlotUpdate {
+                            command,
+                            value: target,
+                        }),
+                    },
+                }
+            }
+            drop(pending);
+        }
+        if anim.tracks.is_empty() {
+            self.needs_sample.set(false);
+            return false;
+        }
+        let mut pending = self.pending.borrow_mut();
+        let mut animating = false;
+        anim.tracks.retain(|slot, track| {
+            let (value, running) = track.sample(time);
+            animating |= running;
+            match pending.iter_mut().find(|queued| queued.slot() == *slot) {
+                Some(queued) => queued.value = value,
+                None => pending.push(SlotUpdate {
+                    command: slot.command,
+                    value,
+                }),
+            }
+            running
+        });
+        let running = !anim.tracks.is_empty();
+        if running {
+            self.anim.set(Some(anim));
+        }
+        self.needs_sample.set(running);
+        animating
+    }
+
+    /// Attaches the owning surface's sampling flag: `animate` pokes it
+    /// once set, and a state that already needs sampling sets it
+    /// immediately so nothing queues behind an install.
+    fn attach_animated(&self, flag: &Rc<Cell<bool>>) {
+        if self.needs_sample.get() {
+            flag.set(true);
+        }
+        *self.surface_animated.borrow_mut() = Some(Rc::clone(flag));
+    }
+
+    /// Detaches the surface's sampling flag when the content retires
+    /// into a spare, whose next install may live on another surface.
+    fn detach_animated(&self) {
+        *self.surface_animated.borrow_mut() = None;
     }
 }
 
@@ -437,9 +618,11 @@ impl Draw for Recorder {
         paint: impl Into<Live<P>>,
     ) {
         let (shape, paint) = (shape.into(), paint.into());
+        let shape_data = shape.value.into_data();
+        let paint_data: Paint = paint.value.into();
         let command = self.list.push(Command::Fill {
-            shape: shape.value.into_data(),
-            paint: paint.value.into(),
+            shape: shape_data,
+            paint: paint_data,
         });
         self.subscribe(shape.subscribe, command, |shape: S| {
             Operand::Shape(shape.into_data())
@@ -454,10 +637,12 @@ impl Draw for Recorder {
         paint: impl Into<Live<P>>,
     ) {
         let (shape, stroke, paint) = (shape.into(), stroke.into(), paint.into());
+        let shape_data = shape.value.into_data();
+        let paint_data: Paint = paint.value.into();
         let command = self.list.push(Command::Stroke {
-            shape: shape.value.into_data(),
+            shape: shape_data,
             stroke: stroke.value,
-            paint: paint.value.into(),
+            paint: paint_data,
         });
         self.subscribe(shape.subscribe, command, |shape: S| {
             Operand::Shape(shape.into_data())
@@ -468,8 +653,9 @@ impl Draw for Recorder {
 
     fn shadow<S: Shape>(&mut self, shape: impl Into<Live<S>>, shadow: impl Into<Live<Shadow>>) {
         let (shape, shadow) = (shape.into(), shadow.into());
+        let shape_data = shape.value.into_data();
         let command = self.list.push(Command::Shadow {
-            shape: shape.value.into_data(),
+            shape: shape_data,
             shadow: shadow.value,
         });
         self.subscribe(shape.subscribe, command, |shape: S| {
@@ -490,9 +676,10 @@ impl Draw for Recorder {
     ) {
         let run = run.into();
         let paint = paint.into();
+        let paint_data: Paint = paint.value.into();
         let command = self.list.push(Command::Glyphs {
             run: run.value,
-            paint: paint.value.into(),
+            paint: paint_data,
         });
         self.subscribe(run.subscribe, command, Operand::Run);
         self.subscribe(paint.subscribe, command, paint_operand::<P>);
@@ -519,8 +706,9 @@ impl Draw for Recorder {
 
     fn clip<S: Shape>(&mut self, shape: impl Into<Live<S>>, body: impl FnOnce(&mut Self)) {
         let shape = shape.into();
+        let shape_data = shape.value.into_data();
         let begin = self.list.push(Command::BeginClip {
-            shape: shape.value.into_data(),
+            shape: shape_data,
             end: 0,
         });
         self.subscribe(shape.subscribe, begin, |shape: S| {
@@ -562,7 +750,7 @@ impl Draw for Recorder {
 /// the render thread is the owned [`ContentChange`].
 pub struct Content {
     picture: Picture,
-    live: Rc<LiveState>,
+    pub(crate) live: Rc<LiveState>,
     sent: bool,
 }
 
@@ -621,6 +809,14 @@ impl Content {
 
     pub(crate) fn retire(self) -> ContentSpare {
         let Self { picture, live, .. } = self;
+        // Watchers only exist while the content carried signals; a
+        // signal-free recording never attached the sampling flag, and
+        // its sampling state needs no reset.
+        if !live.guards.borrow().is_empty() {
+            live.detach_animated();
+            live.anim.set(None);
+            live.needs_sample.set(false);
+        }
         live.guards.borrow_mut().clear();
         live.pending.borrow_mut().clear();
         *live.waker.borrow_mut() = Weak::new();
@@ -650,11 +846,13 @@ impl Content {
         }
     }
 
-    /// Connect installed live operands to the owning surface's host callback.
-    pub(crate) fn attach_waker(&self, waker: &Rc<crate::engine::Waker>) {
+    /// Connect installed live operands to the owning surface's host callback
+    /// and sampling flag.
+    pub(crate) fn attach_waker(&self, waker: &Rc<crate::engine::Waker>, flag: &Rc<Cell<bool>>) {
         // Constant recordings need no callback or weak-count traffic.
         if !self.live.guards.borrow().is_empty() {
             *self.live.waker.borrow_mut() = Rc::downgrade(waker);
+            self.live.attach_animated(flag);
         }
     }
 
@@ -681,6 +879,14 @@ impl Content {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.picture.display_list().is_empty()
+    }
+
+    /// Samples every running operand animation at `time`, queueing the
+    /// operand updates [`take_change`](Self::take_change) drains. Returns
+    /// `true` while animations still run — the surface needs another frame
+    /// to keep them moving.
+    pub(crate) fn sample(&self, time: Instant) -> bool {
+        self.live.sample(time, self.picture.display_list())
     }
 
     /// The change to send at the next commit, if any. The first call sends the
@@ -733,6 +939,7 @@ mod tests {
     use super::*;
     use crate::color::{Color, Srgb};
     use crate::shape::ShapeData;
+    use crate::{Curve, WorkingColor};
 
     fn red() -> Color<Srgb> {
         Color::new([1., 0., 0., 1.])
@@ -936,6 +1143,143 @@ mod tests {
         assert_eq!(
             updates[0].value,
             Operand::Shape(ShapeData::Circle(Circle::new((0., 0.), 3.)))
+        );
+    }
+
+    #[test]
+    fn an_animated_operand_steps_into_take_change() {
+        let colour = binding(WorkingColor::new([1., 0., 0., 1.]));
+        let mut content = Content::record(|c| {
+            c.fill(
+                Rect::new(0., 0., 10., 10.),
+                colour.clone().with(Animation::from(Curve::linear(
+                    std::time::Duration::from_millis(400),
+                ))),
+            );
+        });
+        let Some(ContentChange::Replace(_)) = content.take_change() else {
+            panic!("the first commit sends the whole list");
+        };
+
+        // The change itself queues nothing: the first sample emits the
+        // start value, so the commit frame still shows `from`.
+        colour.set(WorkingColor::new([0., 1., 0., 1.]));
+        assert_eq!(content.take_change(), None, "the change defers to sampling");
+        let start = Instant::now();
+        assert!(content.sample(start), "the track is running");
+        let Some(ContentChange::Update(updates)) = content.take_change() else {
+            panic!("the first sample sends an update");
+        };
+        assert_eq!(
+            updates[0].value,
+            Operand::Paint(Paint::Solid(WorkingColor::new([1., 0., 0., 1.])))
+        );
+
+        // Half-way the sampled paint is the endpoints' midpoint.
+        assert!(content.sample(start + std::time::Duration::from_millis(200)));
+        let Some(ContentChange::Update(updates)) = content.take_change() else {
+            panic!("a mid-flight sample sends an update");
+        };
+        let Operand::Paint(Paint::Solid(mid)) = &updates[0].value else {
+            panic!("the fill's paint operand");
+        };
+        assert!((mid.components[1] - 0.5).abs() < 0.01, "mid {mid:?}");
+
+        // The settling sample reports the target exactly and stops running.
+        assert!(!content.sample(start + std::time::Duration::from_millis(400)));
+        let Some(ContentChange::Update(updates)) = content.take_change() else {
+            panic!("the settling sample sends an update");
+        };
+        assert_eq!(
+            updates[0].value,
+            Operand::Paint(Paint::Solid(WorkingColor::new([0., 1., 0., 1.])))
+        );
+        assert_eq!(
+            content.take_change(),
+            None,
+            "a settled track queues nothing"
+        );
+    }
+
+    #[test]
+    fn a_retargeted_operand_animates_from_its_sampled_position() {
+        let colour = binding(WorkingColor::new([1., 0., 0., 1.]));
+        let mut content = Content::record(|c| {
+            c.fill(
+                Rect::new(0., 0., 10., 10.),
+                colour.clone().with(Animation::from(Curve::linear(
+                    std::time::Duration::from_millis(400),
+                ))),
+            );
+        });
+        let _ = content.take_change();
+        let start = Instant::now();
+
+        colour.set(WorkingColor::new([0., 1., 0., 1.]));
+        assert!(content.sample(start + std::time::Duration::from_millis(200)));
+        let Some(ContentChange::Update(updates)) = content.take_change() else {
+            panic!("the mid-flight sample sends an update");
+        };
+        let Operand::Paint(Paint::Solid(mid)) = updates[0].value.clone() else {
+            panic!("the fill's paint operand");
+        };
+
+        // The retarget's first sample still holds the position it left at.
+        colour.set(WorkingColor::new([0., 0., 1., 1.]));
+        assert!(content.sample(start + std::time::Duration::from_millis(208)));
+        let Some(ContentChange::Update(updates)) = content.take_change() else {
+            panic!("the retarget's first sample sends an update");
+        };
+        assert_eq!(
+            updates[0].value,
+            Operand::Paint(Paint::Solid(mid)),
+            "the retarget starts where the previous track was"
+        );
+
+        // It settles on the new target, not the interrupted one.
+        let mut t = start + std::time::Duration::from_millis(208);
+        while content.sample(t) {
+            t += std::time::Duration::from_millis(16);
+        }
+        let Some(ContentChange::Update(updates)) = content.take_change() else {
+            panic!("the settling sample sends an update");
+        };
+        assert_eq!(
+            updates[0].value,
+            Operand::Paint(Paint::Solid(WorkingColor::new([0., 0., 1., 1.])))
+        );
+    }
+
+    #[test]
+    fn an_animated_change_without_shared_lanes_snaps() {
+        let paint = binding(Paint::Solid(WorkingColor::new([1., 0., 0., 1.])));
+        let mut content = Content::record(|c| {
+            c.fill(
+                Rect::new(0., 0., 10., 10.),
+                paint.clone().with(Animation::from(Curve::linear(
+                    std::time::Duration::from_millis(400),
+                ))),
+            );
+        });
+        let _ = content.take_change();
+
+        // A Solid fill cannot interpolate into a gradient: the change lands
+        // like an un-animated one instead of inventing lanes.
+        let gradient = Paint::Linear(
+            crate::paint::LinearGradient::new((0., 0.), (10., 0.))
+                .stop(0., WorkingColor::new([1., 0., 0., 1.]))
+                .stop(1., WorkingColor::new([0., 0., 1., 1.])),
+        );
+        paint.set(gradient.clone());
+        // The snap resolves when the engine samples, like a frame does.
+        let _ = content.sample(Instant::now());
+        let Some(ContentChange::Update(updates)) = content.take_change() else {
+            panic!("the snap sends an update");
+        };
+        assert_eq!(updates[0].value, Operand::Paint(gradient));
+        assert!(
+            !content.sample(Instant::now()),
+            "a snapped change starts no track"
         );
     }
 

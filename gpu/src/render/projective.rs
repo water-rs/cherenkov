@@ -111,21 +111,30 @@ pub struct Key {
     pub size: (u32, u32),
     /// [`cherenkov::SurfaceTree::content_stamp`] of the layer.
     stamp: u64,
-    /// The renderer's registered-image generation.
-    images: u64,
+    /// The renderer's image-replacement count.
+    replacements: u64,
 }
 
 impl Key {
-    /// The key of `image` at content stamp `stamp` and image generation
-    /// `images`.
+    /// The key of `image` at content stamp `stamp` after `replacements`
+    /// image replacements.
     #[must_use]
-    pub const fn new(image: &LocalImage, stamp: u64, images: u64) -> Self {
+    pub const fn new(image: &LocalImage, stamp: u64, replacements: u64) -> Self {
         Self {
             local_to_texel: image.local_to_texel.as_coeffs(),
             size: image.size,
             stamp,
-            images,
+            replacements,
         }
+    }
+
+    /// Whether the image was realized from the layer's content at
+    /// `stamp` after `replacements` image replacements. Stamps and the
+    /// count only grow, so an image that is not current can never be
+    /// composed again.
+    #[must_use]
+    pub const fn is_current(&self, stamp: u64, replacements: u64) -> bool {
+        self.stamp == stamp && self.replacements == replacements
     }
 }
 
@@ -193,8 +202,8 @@ pub struct Realize {
 pub struct Inputs {
     /// The admitted image dimension and bytes.
     pub limits: Limits,
-    /// The renderer's registered-image generation.
-    pub images: u64,
+    /// The renderer's image-replacement count.
+    pub replacements: u64,
     /// The surface's interop generation.
     pub interop: u64,
     /// Retained images whose renderer-side inputs changed since they were

@@ -172,7 +172,9 @@ impl LayerBuilder<'_> {
     }
 
     /// Set the layer's one-time motion.
-    pub const fn motion(&mut self, motion: Motion) -> &mut Self {
+    // Not `const`: `Motion::Paint` holds gradient stop `Vec`s, so
+    // `Option<Motion>` drops.
+    pub fn motion(&mut self, motion: Motion) -> &mut Self {
         self.layer.motion = Some(motion);
         self
     }

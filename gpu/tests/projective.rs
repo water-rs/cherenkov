@@ -61,3 +61,17 @@ fn limits_are_explicit_errors() {
 fn backdrop_spaces_are_checked() {
     common::backdrop_spaces_are_checked::<cherenkov_gpu::Gpu>(cherenkov_gpu::GpuConfig::default);
 }
+
+#[test]
+fn image_replacement_reaches_local_images() {
+    common::image_replacement_reaches_local_images::<cherenkov_gpu::Gpu>(
+        cherenkov_gpu::GpuConfig::default,
+    );
+}
+
+#[test]
+fn released_resources_leave_no_local_image() {
+    common::released_resources_leave_no_local_image::<cherenkov_gpu::Gpu>(
+        cherenkov_gpu::GpuConfig::default,
+    );
+}

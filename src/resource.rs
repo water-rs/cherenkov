@@ -1,6 +1,8 @@
 //! Resource handles: [`Font`], [`Image`], [`Shader`] and [`Filter`] are
-//! `Clone` over an `Rc`; the last drop queues the `remove_*` op on the
-//! render thread. An [`Image`] also queues in-place pixel replacements.
+//! `Clone` over an `Rc`; the last drop queues the release on the render
+//! thread. A font, image, shader or backdrop shader is freed there once no
+//! surface's installed content draws it. An [`Image`] also queues in-place
+//! pixel replacements.
 
 use std::path::Path;
 use std::rc::Rc;
@@ -10,7 +12,7 @@ use crate::ShaderId;
 use crate::error::ResourceError;
 use crate::glyph::FontId;
 use crate::image::{Format, ImageData, ImageUpload};
-use crate::message::BackdropId;
+use crate::message::{BackdropId, BackdropShaderId};
 use crate::paint::ImageId;
 use crate::style::FilterId;
 
@@ -59,19 +61,42 @@ impl FontSource {
     }
 }
 
-/// Queues a replacement of an image's pixels on the render thread and
-/// answers with the backend's result.
-#[cfg(not(target_arch = "wasm32"))]
+/// Queues a replacement of an image's pixels, ordered with every other
+/// message the engine sends.
 pub type ReplaceImage = Rc<dyn Fn(ImageId, ImageUpload) -> Result<(), ResourceError>>;
-/// Queues a replacement of an image's pixels on the local executor and
-/// resolves with the backend's result.
-#[cfg(target_arch = "wasm32")]
-pub type ReplaceImage = Rc<
-    dyn Fn(
-        ImageId,
-        ImageUpload,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ResourceError>>>>,
->;
+
+/// A registered resource that installed content or a layer can draw.
+///
+/// The render loop frees a released resource only once no surface draws
+/// it, and a [`RenderError::Rejected`] names the resource the backend
+/// rejected after its handle was returned. That is never a font: every
+/// check a font needs runs before [`Engine::font`](crate::Engine::font)
+/// returns.
+///
+/// [`RenderError::Rejected`]: crate::RenderError::Rejected
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ResourceId {
+    /// A font from [`Engine::font`](crate::Engine::font).
+    Font(FontId),
+    /// An image from [`Engine::image`](crate::Engine::image).
+    Image(ImageId),
+    /// A shader from [`Engine::shader`](crate::Engine::shader).
+    Shader(ShaderId),
+    /// A backdrop effect shader from
+    /// [`Engine::backdrop_shader`](crate::Engine::backdrop_shader).
+    BackdropShader(BackdropShaderId),
+}
+
+impl std::fmt::Display for ResourceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Font(id) => write!(f, "font {}", id.raw()),
+            Self::Image(id) => write!(f, "image {}", id.raw()),
+            Self::Shader(id) => write!(f, "shader {}", id.raw()),
+            Self::BackdropShader(id) => write!(f, "backdrop shader {}", id.raw()),
+        }
+    }
+}
 
 /// The shared state of a resource handle: the last `Rc` drop runs
 /// `on_drop`, which queues the resource's `remove_*` op. `ops` carries the
@@ -115,7 +140,7 @@ fn handle_with<I, O>(id: I, ops: O, on_drop: impl FnOnce() + 'static) -> Rc<Inne
 }
 
 /// A font registered with an engine. Dropping the last clone unregisters
-/// the font.
+/// the font once no installed content draws it.
 #[derive(Debug)]
 pub struct Font {
     inner: Rc<Inner<FontId>>,
@@ -144,8 +169,9 @@ impl Font {
 }
 
 /// An image registered with an engine, typed by its storage [`Format`].
+///
 /// [`Image::replace`] swaps its pixels behind the same id. Dropping the last
-/// clone unregisters the image.
+/// clone unregisters the image once no installed content draws it.
 #[derive(Debug)]
 pub struct Image<F: Format> {
     inner: Rc<Inner<ImageId, ReplaceImage>>,
@@ -179,59 +205,33 @@ impl<F: Format> Image<F> {
         self.inner.id
     }
 
-    /// Replaces the image's pixels in place, blocking until the render
-    /// thread has applied the replacement.
+    /// Replaces the image's pixels in place. The replacement is queued
+    /// and applied in order with every render: it does not wait for the
+    /// backend.
     ///
     /// The id is unchanged, so every recording that names this image draws
-    /// the new pixels from the next frame on, without re-recording. The
-    /// replacement is ordered with frames on the render thread, so no frame
-    /// samples a partly written image. The same dimensions reuse the
+    /// the new pixels from the next frame on, without re-recording. No
+    /// frame samples a partly written image. The same dimensions reuse the
     /// backing storage; different dimensions reallocate it behind the same
     /// id. The next render redraws the surfaces whose content draws this
-    /// image, and the engine's waker fires when there is at least one.
+    /// image, and the engine's waker fires to request that render.
     ///
-    /// `image` is validated by [`ImageData::new`]; the backend may still
-    /// reject it, as it may in [`Engine::image`](crate::Engine::image).
+    /// `image` is validated by [`ImageData::new`]. A rejection only the
+    /// backend can detect keeps the previous pixels and fails every render
+    /// that draws the image with [`RenderError::Rejected`], until a later
+    /// replacement succeeds, as for [`Engine::image`](crate::Engine::image).
     ///
     /// # Errors
-    /// [`ResourceError::Image`] when the backend rejects the data (the image
-    /// keeps its previous pixels), [`ResourceError::Lost`] when the render
-    /// thread is gone.
-    #[cfg(not(target_arch = "wasm32"))]
+    /// [`ResourceError::Lost`] when the render thread is gone.
+    ///
+    /// [`RenderError::Rejected`]: crate::RenderError::Rejected
     pub fn replace(&self, image: ImageData<F>) -> Result<(), ResourceError> {
         (self.inner.ops)(self.inner.id, image.into_upload())
-    }
-
-    /// Replaces the image's pixels in place, resolving once the local
-    /// executor has applied the replacement.
-    ///
-    /// The id is unchanged, so every recording that names this image draws
-    /// the new pixels from the next frame on, without re-recording. The
-    /// replacement is ordered with frames on the executor, so no frame
-    /// samples a partly written image. The same dimensions reuse the
-    /// backing storage; different dimensions reallocate it behind the same
-    /// id. The next render redraws the surfaces whose content draws this
-    /// image, and the engine's waker fires when there is at least one.
-    ///
-    /// `image` is validated by [`ImageData::new`]; the backend may still
-    /// reject it, as it may in [`Engine::image`](crate::Engine::image).
-    ///
-    /// # Errors
-    /// [`ResourceError::Image`] when the backend rejects the data (the image
-    /// keeps its previous pixels), [`ResourceError::Lost`] when the executor
-    /// is gone.
-    #[cfg(target_arch = "wasm32")]
-    #[expect(
-        clippy::future_not_send,
-        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
-    )]
-    pub async fn replace(&self, image: ImageData<F>) -> Result<(), ResourceError> {
-        (self.inner.ops)(self.inner.id, image.into_upload()).await
     }
 }
 
 /// A shader registered with an engine. Dropping the last clone unregisters
-/// the shader.
+/// the shader once no installed content draws it.
 #[derive(Debug)]
 pub struct Shader {
     inner: Rc<Inner<ShaderId>>,
@@ -358,8 +358,7 @@ impl BackdropSample {
 /// A backdrop effect shader registered with an engine.
 ///
 /// Made by [`Engine::backdrop_shader`](crate::Engine::backdrop_shader).
-/// Dropping the last clone unregisters it; a member still sampling it
-/// makes the frame fail.
+/// Dropping the last clone unregisters it once no layer samples it.
 #[derive(Debug)]
 pub struct BackdropShader {
     inner: Rc<Inner<crate::message::BackdropShaderId>>,

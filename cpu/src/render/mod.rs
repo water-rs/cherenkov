@@ -25,7 +25,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use cherenkov::{
     BackdropId, ContentOp, EngineError, FontData, FontId, Frame, FrameStats, ImageId, ImageUpload,
     LayerId, MemoryUsage, Pressure, Readback, Redraw, RenderError, Renderer, ResourceError,
-    SurfaceError, SurfaceId, SurfaceInfo,
+    ResourceId, SurfaceError, SurfaceId, SurfaceInfo,
 };
 use lower::{ContentData, Item, Lowering};
 
@@ -105,9 +105,11 @@ pub struct RasterRenderer {
     glyph_cache: glyph::GlyphCache,
     /// Decoded colour-font bitmaps, bounded by `Budget::cpu`.
     bitmap_cache: bitmap::BitmapCache,
-    /// Bumped whenever registered image pixels change: projective images
-    /// realized before sample stale pixels.
-    image_epoch: u64,
+    /// Bumped on every image replacement: the one change to what a
+    /// current projective image read that arrives without a tree edit.
+    /// A removal only runs once no installed content draws the image
+    /// (#199), so it does not count.
+    image_replacements: u64,
     /// Counts rendered frames; the projective cache's recency clock.
     frame_count: u64,
 }
@@ -140,7 +142,7 @@ pub fn init(config: RasterConfig) -> Result<(RasterRenderer, RasterInfo), Engine
                     image_budget: config.budget.cpu.0,
                     glyph_cache: glyph::GlyphCache::new(config.budget.cpu.0),
                     bitmap_cache: bitmap::BitmapCache::new(config.budget.cpu.0),
-                    image_epoch: 0,
+                    image_replacements: 0,
                     frame_count: 0,
                 },
                 info,
@@ -163,21 +165,9 @@ fn cpu_model() -> Option<String> {
     None
 }
 
-/// Validates font data and detects colour-glyph sources.
-fn validate_font(
-    data: &[u8],
-    index: u32,
-) -> Result<(bool, Option<Arc<bitmap::BitmapFont>>), ResourceError> {
-    use skrifa::raw::TableProvider as _;
-    let font = skrifa::FontRef::from_index(data, index)
-        .map_err(|e| ResourceError::Font(format!("{e}")))?;
-    let has_colr = font.colr().is_ok();
-    let bitmap = bitmap::BitmapFont::detect(data, index)?.map(Arc::new);
-    Ok((has_colr, bitmap))
-}
-
 impl Renderer for RasterRenderer {
     type Target = RasterTarget;
+    type Font = font::PreparedFont;
 
     fn create_surface(
         &mut self,
@@ -264,10 +254,23 @@ impl Renderer for RasterRenderer {
         self.surfaces.remove(&id);
     }
 
-    fn add_font(&mut self, id: FontId, font: FontData) -> Result<(), ResourceError> {
-        let (has_colr, bitmap) = validate_font(&font.data, font.index)?;
-        let has_bitmap = bitmap.is_some();
-        if let Some(bitmap) = bitmap {
+    /// Validates font data and detects colour-glyph sources.
+    fn prepare_font(font: FontData) -> Result<font::PreparedFont, ResourceError> {
+        use skrifa::raw::TableProvider as _;
+        let parsed = skrifa::FontRef::from_index(&font.data, font.index)
+            .map_err(|e| ResourceError::Font(format!("{e}")))?;
+        let has_colr = parsed.colr().is_ok();
+        let bitmap = bitmap::BitmapFont::detect(&font.data, font.index)?.map(Arc::new);
+        Ok(font::PreparedFont {
+            data: font,
+            has_colr,
+            bitmap,
+        })
+    }
+
+    fn add_font(&mut self, id: FontId, font: font::PreparedFont) {
+        let has_bitmap = font.bitmap.is_some();
+        if let Some(bitmap) = font.bitmap {
             self.bitmap_fonts.insert(id.raw(), bitmap);
         } else {
             self.bitmap_fonts.remove(&id.raw());
@@ -275,13 +278,12 @@ impl Renderer for RasterRenderer {
         self.fonts.insert(
             id.raw(),
             font::Font {
-                data: font,
-                has_colr,
+                data: font.data,
+                has_colr: font.has_colr,
                 has_bitmap,
                 colr: FxHashMap::default(),
             },
         );
-        Ok(())
     }
 
     fn remove_font(&mut self, id: FontId) {
@@ -331,7 +333,7 @@ impl Renderer for RasterRenderer {
         };
         // Retained paint operands share the pixels and lowering resolved
         // the dimensions: content sampling the image is lowered again.
-        self.image_epoch += 1;
+        self.image_replacements += 1;
         for surface in self.surfaces.values_mut() {
             for content in surface.layers.values_mut() {
                 let _ = content.invalidate_image(id);
@@ -345,25 +347,34 @@ impl Renderer for RasterRenderer {
             *slot = resized;
             self.refresh_cache_budgets();
         } else {
+            // Discarding the content above released every retained operand
+            // sharing the pixels. An operand that survived is an engine
+            // defect; it is reported as this replacement's rejection, which
+            // keeps the previous pixels and fails the renders that draw the
+            // image, instead of panicking the render thread.
             Arc::get_mut(slot)
-                .expect("discarded content released every operand sharing the image")
+                .ok_or_else(|| {
+                    ResourceError::Image(format!(
+                        "image {} is still shared by retained paint operands after its content was discarded",
+                        id.raw()
+                    ))
+                })?
                 .overwrite(&image);
         }
         Ok(())
     }
 
-    fn samples_image(&self, surface: SurfaceId, id: ImageId) -> bool {
+    fn samples(&self, surface: SurfaceId, resource: ResourceId) -> bool {
         self.surfaces.get(&surface).is_some_and(|state| {
             state
                 .layers
                 .values()
-                .any(|content| content.references_image(id))
+                .any(|content| content.references(resource))
         })
     }
 
     fn remove_image(&mut self, id: ImageId) {
         self.images.remove(&id.raw());
-        self.image_epoch += 1;
         self.refresh_cache_budgets();
         for surface in self.surfaces.values_mut() {
             for content in surface.layers.values_mut() {
@@ -417,12 +428,12 @@ impl Renderer for RasterRenderer {
     }
 
     #[cfg(target_arch = "wasm32")]
-    async fn render(
+    fn render(
         &mut self,
         frame: &Frame<'_>,
         stats: &mut FrameStats,
-    ) -> Result<Redraw, RenderError> {
-        self.render_frame(frame, stats)
+    ) -> impl core::future::Future<Output = Result<Redraw, RenderError>> {
+        core::future::ready(self.render_frame(frame, stats))
     }
 
     /// Materializes a surface's output buffer into `Readback` pixels.
@@ -450,24 +461,27 @@ impl Renderer for RasterRenderer {
     }
 
     #[cfg(target_arch = "wasm32")]
-    async fn readback(&mut self, surface: SurfaceId) -> Result<Readback, RenderError> {
+    fn readback(
+        &mut self,
+        surface: SurfaceId,
+    ) -> impl core::future::Future<Output = Result<Readback, RenderError>> {
         let Some(state) = self.surfaces.get(&surface) else {
-            return Err(RenderError::Readback("unknown surface".into()));
+            return core::future::ready(Err(RenderError::Readback("unknown surface".into())));
         };
         let pixels = match &state.output {
             Output::F32(fb) => fb.clone(),
             Output::F16(fb) => fb.iter().map(|px| px.map(half::f16::to_f32)).collect(),
             Output::Stream { .. } => {
-                return Err(RenderError::Readback(
+                return core::future::ready(Err(RenderError::Readback(
                     "band-streaming surfaces are not readable".into(),
-                ));
+                )));
             }
         };
-        Ok(Readback {
+        core::future::ready(Ok(Readback {
             width: state.size.0,
             height: state.size.1,
             pixels,
-        })
+        }))
     }
 
     /// Memory usage across output targets, band working buffers, retained
@@ -755,7 +769,8 @@ impl RasterRenderer {
 
     /// Realizes every visible projective layer's local image, innermost
     /// first, reusing a retained image whose content stamp, density,
-    /// layout and image epoch match and whose filters are not animating.
+    /// layout and image-replacement count match and whose filters are not
+    /// animating.
     /// Returns the images placed directly in the surface, and the filters
     /// and groups the local images use.
     fn realize_projective(
@@ -772,6 +787,8 @@ impl RasterRenderer {
             max_dimension: MAX_SURFACE,
             max_bytes: self.image_budget,
         };
+        self.retire_projective(sf);
+        let replacements = self.image_replacements;
         let plans = cherenkov::lowering::projective::plan(sf.tree, size, limits)?;
         let mut placed: FxHashMap<Option<LayerId>, FxHashMap<LayerId, projective::Placed>> =
             FxHashMap::default();
@@ -780,7 +797,7 @@ impl RasterRenderer {
             let Some(layout) = plan.image else { continue };
             let nested = placed.remove(&Some(plan.layer)).unwrap_or_default();
             let key =
-                projective::Key::new(&layout, sf.tree.content_stamp(plan.layer), self.image_epoch);
+                projective::Key::new(&layout, sf.tree.content_stamp(plan.layer), replacements);
             let filters = &self.filters;
             let hit = self.surfaces.get_mut(&sf.id).and_then(|surf| {
                 surf.projective.get_mut(&plan.layer).and_then(|entries| {
@@ -860,6 +877,26 @@ impl RasterRenderer {
             );
         }
         Ok((placed.remove(&None).unwrap_or_default(), used))
+    }
+
+    /// Drops every retained image of surface `sf` no frame can compose
+    /// again: its layer is gone or affine, its content stamp moved on, or
+    /// an image was replaced since. A resource released under #199's
+    /// deferred release is drawn by no installed content, so every image
+    /// that read it is among these: none outlives the frame of its release.
+    fn retire_projective(&mut self, sf: &cherenkov::SurfaceFrame<'_>) {
+        let (tree, replacements) = (sf.tree, self.image_replacements);
+        if let Some(surf) = self.surfaces.get_mut(&sf.id) {
+            for (layer, entries) in &mut surf.projective {
+                entries.retain(|entry| {
+                    tree.projective_pose(*layer).is_some()
+                        && entry
+                            .key
+                            .is_current(tree.content_stamp(*layer), replacements)
+                });
+            }
+            surf.projective.retain(|_, entries| !entries.is_empty());
+        }
     }
 
     /// Bytes of every retained projective image.

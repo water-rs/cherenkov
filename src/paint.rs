@@ -5,7 +5,9 @@ use std::sync::Arc;
 use kurbo::{Affine, Point};
 use serde::{Deserialize, Serialize};
 
+use crate::animation::AnimLanes;
 use crate::color::{Color, ColorSpace, DynColor, WorkingColor};
+use crate::resource::ResourceId;
 
 /// What fills a shape or a glyph.
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -61,6 +63,200 @@ impl Paint {
     }
 }
 
+fn color_lanes(color: &WorkingColor, lanes: &mut Vec<f64>) {
+    lanes.extend(color.components.iter().map(|&c| f64::from(c)));
+}
+
+fn stop_lanes(stops: &[ColorStop], lanes: &mut Vec<f64>) {
+    for stop in stops {
+        lanes.push(f64::from(stop.offset));
+        color_lanes(&stop.color, lanes);
+    }
+}
+
+const fn lane_point(lanes: &[f64]) -> Point {
+    Point::new(lanes[0], lanes[1])
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "f64 lanes quantize to f32 colour components"
+)]
+const fn lane_color(lanes: &[f64]) -> WorkingColor {
+    WorkingColor::new([
+        lanes[0] as f32,
+        lanes[1] as f32,
+        lanes[2] as f32,
+        lanes[3] as f32,
+    ])
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "f64 lanes quantize to f32 stop offsets"
+)]
+fn lane_stops(lanes: &[f64]) -> Vec<ColorStop> {
+    lanes
+        .as_chunks::<5>()
+        .0
+        .iter()
+        .map(|stop| ColorStop {
+            offset: stop[0] as f32,
+            color: lane_color(&stop[1..]),
+        })
+        .collect()
+}
+
+impl AnimLanes for Paint {
+    fn anim_lanes(&self, target: &Self) -> Option<Box<[f64]>> {
+        let mut lanes = Vec::new();
+        match (self, target) {
+            (Self::Solid(from), Self::Solid(_)) => color_lanes(from, &mut lanes),
+            (Self::Linear(from), Self::Linear(to))
+                if from.stops.len() == to.stops.len()
+                    && from.extend == to.extend
+                    && from.interpolation == to.interpolation =>
+            {
+                lanes.extend([from.start.x, from.start.y, from.end.x, from.end.y]);
+                stop_lanes(&from.stops, &mut lanes);
+            }
+            (Self::Radial(from), Self::Radial(to))
+                if from.stops.len() == to.stops.len()
+                    && from.extend == to.extend
+                    && from.interpolation == to.interpolation =>
+            {
+                lanes.extend([
+                    from.start_center.x,
+                    from.start_center.y,
+                    from.start_radius,
+                    from.end_center.x,
+                    from.end_center.y,
+                    from.end_radius,
+                ]);
+                stop_lanes(&from.stops, &mut lanes);
+            }
+            (Self::Sweep(from), Self::Sweep(to))
+                if from.stops.len() == to.stops.len()
+                    && from.extend == to.extend
+                    && from.interpolation == to.interpolation =>
+            {
+                lanes.extend([
+                    from.center.x,
+                    from.center.y,
+                    from.start_angle,
+                    from.end_angle,
+                ]);
+                stop_lanes(&from.stops, &mut lanes);
+            }
+            (Self::Mesh(from), Self::Mesh(to))
+                if from.columns == to.columns
+                    && from.rows == to.rows
+                    && from.interpolation == to.interpolation =>
+            {
+                for point in &from.points {
+                    lanes.extend([point.x, point.y]);
+                }
+                for color in &from.colors {
+                    color_lanes(color, &mut lanes);
+                }
+            }
+            (Self::Image(from), Self::Image(to))
+                if from.image == to.image
+                    && from.extend_x == to.extend_x
+                    && from.extend_y == to.extend_y
+                    && from.sampling == to.sampling =>
+            {
+                lanes.extend(from.transform.as_coeffs());
+            }
+            (Self::Shader(from), Self::Shader(to))
+                if from.shader == to.shader && from.uniforms.len() == to.uniforms.len() =>
+            {
+                lanes.extend(from.uniforms.iter().map(|&u| f64::from(u)));
+            }
+            (Self::Transformed(from), Self::Transformed(to)) => {
+                // The six transform lanes come first so `with_lanes` splits
+                // without re-deriving the inner layout.
+                lanes.extend(from.transform.as_coeffs());
+                lanes.extend_from_slice(&from.paint.anim_lanes(&to.paint)?);
+            }
+            _ => return None,
+        }
+        Some(lanes.into_boxed_slice())
+    }
+
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "f64 lanes quantize to f32 paint fields"
+    )]
+    fn with_lanes(&self, lanes: &[f64]) -> Self {
+        match self {
+            Self::Solid(_) => Self::Solid(lane_color(lanes)),
+            Self::Linear(gradient) => Self::Linear(LinearGradient {
+                start: lane_point(&lanes[0..]),
+                end: lane_point(&lanes[2..]),
+                stops: lane_stops(&lanes[4..]),
+                ..gradient.clone()
+            }),
+            Self::Radial(gradient) => Self::Radial(RadialGradient {
+                start_center: lane_point(&lanes[0..]),
+                start_radius: lanes[2],
+                end_center: lane_point(&lanes[3..]),
+                end_radius: lanes[5],
+                stops: lane_stops(&lanes[6..]),
+                ..gradient.clone()
+            }),
+            Self::Sweep(gradient) => Self::Sweep(SweepGradient {
+                center: lane_point(&lanes[0..]),
+                start_angle: lanes[2],
+                end_angle: lanes[3],
+                stops: lane_stops(&lanes[4..]),
+                ..gradient.clone()
+            }),
+            Self::Mesh(mesh) => {
+                let mut mesh = mesh.clone();
+                let point_lanes = 2 * mesh.points.len();
+                for (point, lanes) in mesh
+                    .points
+                    .iter_mut()
+                    .zip(lanes[..point_lanes].as_chunks::<2>().0.iter())
+                {
+                    point.x = lanes[0];
+                    point.y = lanes[1];
+                }
+                for (color, lanes) in mesh
+                    .colors
+                    .iter_mut()
+                    .zip(lanes[point_lanes..].as_chunks::<4>().0.iter())
+                {
+                    color.components = [
+                        lanes[0] as f32,
+                        lanes[1] as f32,
+                        lanes[2] as f32,
+                        lanes[3] as f32,
+                    ];
+                }
+                Self::Mesh(mesh)
+            }
+            Self::Image(pattern) => Self::Image(ImagePattern {
+                transform: Affine::new([
+                    lanes[0], lanes[1], lanes[2], lanes[3], lanes[4], lanes[5],
+                ]),
+                ..pattern.clone()
+            }),
+            Self::Shader(shader) => Self::Shader(ShaderPaint {
+                uniforms: lanes.iter().map(|&u| u as f32).collect(),
+                ..shader.clone()
+            }),
+            Self::Transformed(paint) => Self::Transformed(TransformedPaint {
+                transform: Affine::new([
+                    lanes[0], lanes[1], lanes[2], lanes[3], lanes[4], lanes[5],
+                ]),
+                paint: Arc::new(paint.paint.with_lanes(&lanes[6..])),
+            }),
+        }
+    }
+}
+
 /// A paint with its own coordinate system.
 ///
 /// `transform` maps the underlying paint's coordinates into shape space.
@@ -110,17 +306,14 @@ impl Paint {
         Self::Transformed(TransformedPaint::new(self, transform))
     }
 
-    /// Whether this paint samples image `id`.
-    pub(crate) fn references_image(&self, id: ImageId) -> bool {
-        match self {
-            Self::Image(pattern) => pattern.image == id,
-            Self::Transformed(transformed) => transformed.paint.references_image(id),
-            Self::Solid(_)
-            | Self::Linear(_)
-            | Self::Radial(_)
-            | Self::Sweep(_)
-            | Self::Mesh(_)
-            | Self::Shader(_) => false,
+    /// Whether this paint samples `resource`: its image pattern's image or
+    /// its shader paint's shader.
+    pub(crate) fn references(&self, resource: ResourceId) -> bool {
+        match (self, resource) {
+            (Self::Image(pattern), ResourceId::Image(id)) => pattern.image == id,
+            (Self::Shader(shader), ResourceId::Shader(id)) => shader.shader == id,
+            (Self::Transformed(transformed), _) => transformed.paint.references(resource),
+            _ => false,
         }
     }
 }

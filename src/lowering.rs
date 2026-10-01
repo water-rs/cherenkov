@@ -403,10 +403,10 @@ impl<O: Operation, E> Content<O, E> {
     }
 
     /// Whether the current source commands, slot updates applied and nested
-    /// pictures included, sample image `id`.
+    /// pictures included, sample `resource`.
     #[must_use]
-    pub fn references_image(&self, id: crate::ImageId) -> bool {
-        self.list.display_list().references_image(id)
+    pub fn references(&self, resource: crate::ResourceId) -> bool {
+        self.list.display_list().references(resource)
     }
 
     /// Discard compiled resource references after image `id`'s pixels were
@@ -417,7 +417,8 @@ impl<O: Operation, E> Content<O, E> {
     /// the updates have since replaced, and those may still reference `id`.
     /// Returns whether anything was discarded.
     pub fn invalidate_image(&mut self, id: crate::ImageId) -> bool {
-        let stale = self.lowered.is_some() && (!self.dirty.is_empty() || self.references_image(id));
+        let stale = self.lowered.is_some()
+            && (!self.dirty.is_empty() || self.references(crate::ResourceId::Image(id)));
         if stale {
             self.invalidate();
         }

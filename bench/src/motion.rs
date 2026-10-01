@@ -150,6 +150,9 @@ impl LayerMotion {
                     rubber_band: *bounds,
                 },
             },
+            // Never passed in: `prep_layer` routes a `Motion::Paint` into
+            // the content run's bindings instead of `from_scene`.
+            Motion::Paint { .. } => unreachable!("a paint motion is a content binding"),
         }
     }
 
@@ -208,7 +211,7 @@ impl LayerMotion {
 }
 
 /// The scene `MotionAnimation` → the front-end `Animation`.
-fn motion_animation(animation: MotionAnimation) -> Animation {
+pub(crate) fn motion_animation(animation: MotionAnimation) -> Animation {
     match animation {
         MotionAnimation::Spring { response, damping } => {
             Animation::from(Spring { response, damping })

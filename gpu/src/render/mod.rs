@@ -835,7 +835,7 @@ fn create_device(
         required_features: required,
         required_limits: limits,
         experimental_features: wgpu::ExperimentalFeatures::disabled(),
-        memory_hints: memory_hints(),
+        memory_hints: memory_hints(info.backend),
         trace: wgpu::Trace::Off,
     }))
     .map_err(|e| EngineError::Backend(format!("{e}")))?;
@@ -892,7 +892,7 @@ fn create_vulkan_device(
         } else {
             None
         };
-    let hints = memory_hints();
+    let hints = memory_hints(wgpu::Backend::Vulkan);
     let opened = unsafe { hal_adapter.open_with_callback(features, limits, &hints, callback) }
         .map_err(|e| EngineError::Backend(format!("vulkan device creation: {e}")))?;
     drop(hal_adapter);
@@ -977,7 +977,7 @@ async fn create_device(
         backends: config.backends,
         ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
-    fire_probe(&config, CreationPhase::Instance, None, None)?;
+    fire_probe(config, CreationPhase::Instance, None, None)?;
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: config.power_preference,
@@ -996,7 +996,7 @@ async fn create_device(
             "adapter cannot render the working-space format".into(),
         ));
     }
-    fire_probe(&config, CreationPhase::Adapter, Some(&adapter), None)?;
+    fire_probe(config, CreationPhase::Adapter, Some(&adapter), None)?;
     let supported = adapter.features();
     let info = adapter.get_info();
     tracing::info!(
@@ -1032,17 +1032,12 @@ async fn create_device(
             // where `Limits::default` asks for 16.
             required_limits: wgpu::Limits::default().or_worse_values_from(&adapter.limits()),
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
-            memory_hints: memory_hints(),
+            memory_hints: memory_hints(info.backend),
             trace: wgpu::Trace::Off,
         })
         .await
         .map_err(|e| EngineError::Backend(format!("{e}")))?;
-    fire_probe(
-        &config,
-        CreationPhase::Device,
-        Some(&adapter),
-        Some(&device),
-    )?;
+    fire_probe(config, CreationPhase::Device, Some(&adapter), Some(&device))?;
     tracing::info!(features = ?device.features(), "device");
     Ok((instance, adapter, device, queue))
 }
@@ -1232,17 +1227,36 @@ const fn core_pipelines_eager() -> bool {
     true
 }
 
-/// The device allocator's suballocation block range — #170's measured
-/// choice. wgpu's `Performance` default reserves a 64 MiB block at the
-/// first allocation (~0.5 MiB of it used), which is the bulk of the
-/// ~74 MiB idle reservation on Mali-G715. 4–16 MiB blocks measure 10.4
-/// MiB idle on the Pixel 9 Pro and the lowest steady reservation of the
-/// policies tried (report-170.md); the cap keeps a large scene's growth
-/// inside a bounded number of blocks (map: five blocks for 53 MiB).
-const fn memory_hints() -> wgpu::MemoryHints {
+/// Allocator policy for the backend a device is opened on (#170).
+///
+/// `Manual { 4 MiB..16 MiB }` was measured only on Vulkan (Mali-G715,
+/// Pixel 9 Pro): 10.4 MiB idle, where `Performance`'s 64 MiB first block
+/// is most of the ~74 MiB idle reservation. The 16 MiB cap bounds a large
+/// scene (map: five blocks for 53 MiB). Vulkan reads the hint in
+/// `AllocationSizes::from_memory_hints`
+/// (`wgpu-hal/src/vulkan/adapter.rs:2951`, rev `4b35d8bc`).
+///
+/// Every other class keeps [`wgpu::MemoryHints::Performance`], the
+/// default (`wgpu-types/src/device.rs:59`). At that revision Metal
+/// (`wgpu-hal/src/metal/adapter.rs:72`) and GLES
+/// (`wgpu-hal/src/gles/adapter.rs:1083`) take `_memory_hints` and never
+/// read it. The WebGPU backend never reads it: `request_device`
+/// (`wgpu/src/backend/webgpu.rs:1772`) copies limits, features, and the
+/// label, and that module has no `memory_hints` use. DX12 does read the
+/// hint (`wgpu-hal/src/dx12/adapter.rs:1062`, through `device.rs:64` into
+/// `AllocationSizes::from_memory_hints` at `suballocation.rs:78`) but that
+/// class is unmeasured, so it stays on the default.
+const fn memory_hints(backend: wgpu::Backend) -> wgpu::MemoryHints {
     const MIB: u64 = 1024 * 1024;
-    wgpu::MemoryHints::Manual {
-        suballocated_device_memory_block_size: 4 * MIB..16 * MIB,
+    match backend {
+        wgpu::Backend::Vulkan => wgpu::MemoryHints::Manual {
+            suballocated_device_memory_block_size: 4 * MIB..16 * MIB,
+        },
+        wgpu::Backend::Noop
+        | wgpu::Backend::Metal
+        | wgpu::Backend::Dx12
+        | wgpu::Backend::Gl
+        | wgpu::Backend::BrowserWebGpu => wgpu::MemoryHints::Performance,
     }
 }
 

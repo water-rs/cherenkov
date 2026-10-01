@@ -174,9 +174,9 @@ fn sweep() -> String {
             for i in 0..200 {
                 let t = f64::from(i) / 199.0 * 1.6;
                 samples.push(linear_p3_to_linear_srgb([
-                    g0 + t * (corner[0] - g0),
-                    g0 + t * (corner[1] - g0),
-                    g0 + t * (corner[2] - g0),
+                    t.mul_add(corner[0] - g0, g0),
+                    t.mul_add(corner[1] - g0, g0),
+                    t.mul_add(corner[2] - g0, g0),
                 ]));
             }
         }

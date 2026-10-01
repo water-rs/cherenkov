@@ -40,7 +40,7 @@ pub fn tone(x: f64, headroom: f64) -> f64 {
     }
     let d = (headroom - 1.0).max(0.0);
     let t = x - 1.0;
-    1.0 + d * (1.0 - d / t.mul_add(1.0, d))
+    d.mul_add(1.0 - d / t.mul_add(1.0, d), 1.0)
 }
 
 /// One pixel's tone map: scale every channel by the shoulder's value at

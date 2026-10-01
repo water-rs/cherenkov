@@ -1165,7 +1165,6 @@ CH7(T=349894)[S1M_VDD_MIF], 21091363
     }
 
     #[test]
-    #[expect(clippy::float_cmp, reason = "exact fixture-derived sums")]
     fn diff_report_integrates() {
         let before = odpm::Snapshot {
             rails: BTreeMap::from([("CPU".into(), 1_000_000u64), ("GPU".into(), 500_000)]),
@@ -1273,7 +1272,6 @@ CH7(T=349894)[S1M_VDD_MIF], 21091363
 ";
 
     #[test]
-    #[expect(clippy::float_cmp, reason = "exact fixture-derived sums")]
     fn powermetrics_parses_nul_separated_samples() {
         let mut stream = SAMPLE_PLIST.as_bytes().to_vec();
         stream.push(0);
@@ -1305,7 +1303,6 @@ CH7(T=349894)[S1M_VDD_MIF], 21091363
     }
 
     #[test]
-    #[expect(clippy::float_cmp, reason = "exact fixture-derived sums")]
     fn powermetrics_intel_package_joules_maps_to_cpu() {
         let plist = "\
 <?xml version=\"1.0\"?>
@@ -1345,7 +1342,6 @@ CH7(T=349894)[S1M_VDD_MIF], 21091363
     }
 
     #[test]
-    #[expect(clippy::float_cmp, reason = "window-edge fractions are exact halves")]
     fn attribute_scales_boundary_samples_by_overlap() {
         // Samples cover [0,20] and [20,40]; the window is [10,30]:
         // half of each interval falls inside.
@@ -1363,7 +1359,6 @@ CH7(T=349894)[S1M_VDD_MIF], 21091363
     }
 
     #[test]
-    #[expect(clippy::float_cmp, reason = "exact fixture-derived sums")]
     fn attribute_drops_samples_outside_the_window() {
         let samples = [
             pm_sample(0, 20, 4.0, Some(8.0)),

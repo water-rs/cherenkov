@@ -263,7 +263,12 @@ fn colour_prefix_folds_into_every_sample() {
     let source = |uv: [f32; 2]| [uv[0], uv[1], 0.5, 0.75];
     let brightened = move |uv: [f32; 2]| {
         let [r, g, b, a] = source(uv);
-        [r + amount * a, g + amount * a, b + amount * a, a]
+        [
+            a.mul_add(amount, r),
+            a.mul_add(amount, g),
+            a.mul_add(amount, b),
+            a,
+        ]
     };
     let values = HashMap::from([
         ((0, "amount"), Value::Float(amount)),
@@ -384,7 +389,12 @@ fn a_colour_prefix_folds_into_a_size_dependent_stage() {
     let source = |uv: [f32; 2]| [uv[0], uv[1], 0.5, 0.75];
     let brightened = move |uv: [f32; 2]| {
         let [r, g, b, a] = source(uv);
-        [r + amount * a, g + amount * a, b + amount * a, a]
+        [
+            a.mul_add(amount, r),
+            a.mul_add(amount, g),
+            a.mul_add(amount, b),
+            a,
+        ]
     };
     let values = HashMap::from([
         ((0, "amount"), Value::Float(amount)),
@@ -928,7 +938,12 @@ fn a_colour_prefix_folds_through_a_library_sampler() {
     let source = |uv: [f32; 2]| [uv[0], uv[1], 0.5, 0.75];
     let brightened = move |uv: [f32; 2]| {
         let [r, g, b, a] = source(uv);
-        [r + amount * a, g + amount * a, b + amount * a, a]
+        [
+            a.mul_add(amount, r),
+            a.mul_add(amount, g),
+            a.mul_add(amount, b),
+            a,
+        ]
     };
     let values = HashMap::from([((0, "amount"), Value::Float(amount))]);
 
@@ -1140,7 +1155,12 @@ fn folded_matches_plain(
     let source = |uv: [f32; 2]| [uv[0], uv[1], 0.5, 0.75];
     let brightened = move |uv: [f32; 2]| {
         let [r, g, b, a] = source(uv);
-        [r + amount * a, g + amount * a, b + amount * a, a]
+        [
+            a.mul_add(amount, r),
+            a.mul_add(amount, g),
+            a.mul_add(amount, b),
+            a,
+        ]
     };
     let values = HashMap::from([((0, "amount"), Value::Float(amount))]);
     for uv in [[0.5, 0.5], [0.2, 0.7]] {

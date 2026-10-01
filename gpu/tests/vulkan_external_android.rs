@@ -64,52 +64,6 @@ fn raw(shared: &SharedDevice) -> (ash::Device, vk::Queue, u32) {
     (device, queue, hal.queue_family_index())
 }
 
-/// Records `record` on a one-shot buffer and waits for it — the producer
-/// side may wait on the host; the engine path never does.
-fn run_once(
-    dev: &ash::Device,
-    queue: vk::Queue,
-    family: u32,
-    record: impl FnOnce(vk::CommandBuffer),
-) {
-    let pool = unsafe {
-        dev.create_command_pool(
-            &vk::CommandPoolCreateInfo::default()
-                .queue_family_index(family)
-                .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
-            None,
-        )
-    }
-    .expect("command pool");
-    let cb = unsafe {
-        dev.allocate_command_buffers(
-            &vk::CommandBufferAllocateInfo::default()
-                .command_pool(pool)
-                .level(vk::CommandBufferLevel::PRIMARY)
-                .command_buffer_count(1),
-        )
-    }
-    .expect("command buffer")[0];
-    unsafe {
-        dev.begin_command_buffer(
-            cb,
-            &vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-        )
-        .expect("begin");
-        record(cb);
-        dev.end_command_buffer(cb).expect("end");
-        dev.queue_submit(
-            queue,
-            &[vk::SubmitInfo::default().command_buffers(&[cb])],
-            vk::Fence::null(),
-        )
-        .expect("submit");
-        dev.queue_wait_idle(queue).expect("producer wait");
-        dev.destroy_command_pool(pool, None);
-    }
-}
-
 /// Allocates an `AHardwareBuffer`; the returned pointer is owned by the
 /// caller (one acquire reference).
 fn alloc_ahb(
@@ -251,32 +205,49 @@ fn make_ahb_nv12(
     buffer
 }
 
+/// The work the producer fence submits — freed after its fence signals.
+struct ProducerWork {
+    /// The pool the delay buffer ran from.
+    pool: vk::CommandPool,
+    /// The fill destination.
+    buffer: vk::Buffer,
+    /// Its device-local backing.
+    memory: vk::DeviceMemory,
+    /// Execution-completion fence for the producer submit.
+    fence: vk::Fence,
+}
+
 /// A producer sync chain: a binary semaphore whose `SYNC_FD` export is
-/// the frame's fence payload. `delay_ms` > 0 inserts a host-signalled
-/// timeline semaphore ahead of the binary signal, so the fence completes
-/// only once the delayed host signal lands — all on the GPU.
+/// the frame's fence payload. `fire` submits real GPU work — a long run
+/// of buffer fills — that signals `binary` when it retires, then exports
+/// the pending signal as a sync_file.
 ///
-/// The spec requires the semaphore to have a *pending* signal — a signal
-/// submitted to a queue — before `SYNC_FD` export transplants it into the
-/// fence; exporting a never-submitted semaphore is invalid use and the
-/// Mali driver answers `ERROR_OUT_OF_HOST_MEMORY`. `fire` therefore
-/// submits first and exports after.
+/// A sync_file fence can only stand for a signal the driver has handed
+/// to the kernel: a submission held back in the driver behind an
+/// unsignalled wait has no kernel fence yet, and Mali answers its export
+/// with `ERROR_OUT_OF_HOST_MEMORY` — the earlier timeline-waited design
+/// hit exactly that. Real producers (SurfaceFlinger, camera) export fds
+/// of work already executing on the GPU, which is what `fire` does.
 struct ProducerFence {
     /// The sync-file fd the frame waits on, filled by `fire`.
     fd: Mutex<Option<OwnedFd>>,
-    /// The host-signalled timeline semaphore delaying the producer
-    /// (kept alive until `fire`).
+    /// The timeline semaphore used as the frame's release payload.
     timeline: vk::Semaphore,
     /// The binary semaphore the producer submit signals.
     binary: vk::Semaphore,
+    /// The producer submit's objects, freed at drop.
+    work: Mutex<Option<ProducerWork>>,
     /// The `VK_KHR_external_semaphore_fd` device-level functions.
     loader: ash::khr::external_semaphore_fd::Device,
-    /// The device that owns both semaphores.
+    /// The device that owns the semaphores.
     dev: ash::Device,
+    /// Instance + physical device for the memory-type query.
+    instance: ash::Instance,
+    physical: vk::PhysicalDevice,
 }
 
 impl ProducerFence {
-    /// Arms the fence; `fire(delay_ms)` completes it.
+    /// Arms the fence; `fire` completes it.
     fn new(device: &vulkan::Device) -> Self {
         let dev = device.shared.vk.device.clone();
         let loader = device
@@ -300,8 +271,11 @@ impl ProducerFence {
             fd: Mutex::new(None),
             timeline,
             binary,
+            work: Mutex::new(None),
             loader,
             dev,
+            instance: device.shared.instance.clone(),
+            physical: device.shared.physical_device,
         }
     }
 
@@ -312,31 +286,47 @@ impl ProducerFence {
         unsafe { OwnedFd::from_raw_fd(libc::dup(fd.as_raw_fd())) }
     }
 
-    /// Schedules the producer's signal: a submit that waits on the
-    /// host-signalled timeline and then signals the binary payload —
-    /// the fence completes `delay_ms` from now, entirely on the GPU.
-    /// The `SYNC_FD` export runs after the submit so the semaphore has a
-    /// pending signal, as the spec requires.
-    fn fire(&self, queue: vk::Queue, family: u32, delay_ms: u64) {
-        let dev = self.dev.clone();
-        let timeline = self.timeline;
-        let binary = self.binary;
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(delay_ms));
-            unsafe {
-                dev.signal_semaphore(
-                    &vk::SemaphoreSignalInfo::default()
-                        .semaphore(timeline)
-                        .value(1),
-                )
-                .expect("host timeline signal");
-            }
-        });
-        let dev = self.dev.clone();
-        let timeline = self.timeline;
-        run_once(&self.dev, queue, family, |_| {});
-        // The signalling submit must run AFTER the timeline signal is
-        // scheduled but is itself a GPU wait on it.
+    /// Submits the producer's delay — `FILLS` 32 MiB fills, real work
+    /// handed to the kernel at submit — with `binary` signalled when the
+    /// command buffer retires, then exports the pending signal as
+    /// `SYNC_FD`. The fence stays unsignalled until the fills finish,
+    /// entirely on the GPU.
+    fn fire(&self, queue: vk::Queue, family: u32, fills: u32) {
+        let dev = &self.dev;
+        const FILL_BYTES: u64 = 32 * 1024 * 1024;
+        let buffer = unsafe {
+            dev.create_buffer(
+                &vk::BufferCreateInfo::default()
+                    .size(FILL_BYTES)
+                    .usage(vk::BufferUsageFlags::TRANSFER_DST)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                None,
+            )
+        }
+        .expect("delay buffer");
+        let requirements = unsafe { dev.get_buffer_memory_requirements(buffer) };
+        let properties = unsafe {
+            self.instance
+                .get_physical_device_memory_properties(self.physical)
+        };
+        let memory_type = (0..properties.memory_type_count)
+            .find(|&index| {
+                requirements.memory_type_bits & (1 << index) != 0
+                    && properties.memory_types[index as usize]
+                        .property_flags
+                        .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+            })
+            .expect("device-local memory type");
+        let memory = unsafe {
+            dev.allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(requirements.size)
+                    .memory_type_index(memory_type),
+                None,
+            )
+            .expect("delay memory")
+        };
+        unsafe { dev.bind_buffer_memory(buffer, memory, 0) }.expect("bind delay memory");
         let pool = unsafe {
             dev.create_command_pool(
                 &vk::CommandPoolCreateInfo::default().queue_family_index(family),
@@ -353,52 +343,65 @@ impl ProducerFence {
             )
         }
         .expect("cb")[0];
+        let fence = unsafe { dev.create_fence(&vk::FenceCreateInfo::default(), None) }
+            .expect("producer fence");
         unsafe {
             dev.begin_command_buffer(cb, &vk::CommandBufferBeginInfo::default())
                 .expect("begin");
+            for _ in 0..fills {
+                dev.cmd_fill_buffer(cb, buffer, 0, FILL_BYTES, 0xa5);
+            }
             dev.end_command_buffer(cb).expect("end");
-            let mut timeline_info =
-                vk::TimelineSemaphoreSubmitInfo::default().wait_semaphore_values(&[1]);
             dev.queue_submit(
                 queue,
                 &[vk::SubmitInfo::default()
-                    .wait_semaphores(&[timeline])
-                    .wait_dst_stage_mask(&[vk::PipelineStageFlags::ALL_COMMANDS])
-                    .signal_semaphores(&[binary])
-                    .command_buffers(&[cb])
-                    .push_next(&mut timeline_info)],
-                vk::Fence::null(),
+                    .signal_semaphores(&[self.binary])
+                    .command_buffers(&[cb])],
+                fence,
             )
             .expect("producer submit");
-            dev.destroy_command_pool(pool, None);
-            // The signal is pending now: the SYNC_FD export transplants it
-            // into the returned fence.
+            // The signal is pending on the GPU now: the SYNC_FD export
+            // transplants it into the returned fence.
             let fd = self
                 .loader
                 .get_semaphore_fd(
                     &vk::SemaphoreGetFdInfoKHR::default()
-                        .semaphore(binary)
+                        .semaphore(self.binary)
                         .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD),
                 )
                 .expect("sync-fd export");
             *self.fd.lock().expect("fence fd") = Some(OwnedFd::from_raw_fd(fd));
         }
+        *self.work.lock().expect("producer work") = Some(ProducerWork {
+            pool,
+            buffer,
+            memory,
+            fence,
+        });
     }
 }
 
 impl Drop for ProducerFence {
     fn drop(&mut self) {
+        if let Some(work) = self.work.lock().expect("producer work").take() {
+            unsafe {
+                // The delay must retire before its objects are destroyed;
+                // a host-side fence wait is the producer's own wait.
+                let _ = self
+                    .dev
+                    .wait_for_fences(&[work.fence], true, 30_000_000_000);
+                self.dev.destroy_fence(work.fence, None);
+                self.dev.destroy_command_pool(work.pool, None);
+                self.dev.destroy_buffer(work.buffer, None);
+                self.dev.free_memory(work.memory, None);
+            }
+        }
         unsafe {
             self.dev.destroy_semaphore(self.timeline, None);
             self.dev.destroy_semaphore(self.binary, None);
         }
     }
 }
-
-/// A sendable ash device handle for the signal thread.
-#[expect(dead_code)]
-struct SendDevice(ash::Device);
-unsafe impl Send for SendDevice {}
 
 /// Presents `texture` into a fresh destination and returns its f32
 /// pixels (the same helper pattern as `host_contracts`).
@@ -426,9 +429,32 @@ fn read_pixels(
     Ok(destination.readback()?.pixels)
 }
 
-/// The count of open fds in this process.
-fn fd_count() -> usize {
-    std::fs::read_dir("/proc/self/fd").map_or(0, std::iter::Iterator::count)
+/// Every open fd in this process, sorted, as `NUMBER -> TARGET`.
+fn fd_list() -> Vec<String> {
+    let mut list = std::fs::read_dir("/proc/self/fd")
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| {
+                    let target = std::fs::read_link(entry.path())
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|_| "<unreadable>".to_string());
+                    format!("{} -> {target}", entry.file_name().to_string_lossy())
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    list.sort_unstable();
+    list
+}
+
+/// The entries in `now` not present in `was`, labelled `label`.
+fn fd_report(label: &str, was: &[String], now: &[String]) {
+    let extra: Vec<&String> = now.iter().filter(|fd| !was.contains(fd)).collect();
+    eprintln!("fds {label}: {}", extra.len());
+    for fd in extra {
+        eprintln!("  {fd}");
+    }
 }
 
 #[test]
@@ -532,10 +558,10 @@ fn producer_fence_and_delayed_signal_stay_on_gpu() {
     let (dev, queue, family) = raw(&shared);
     let _ = dev;
     let fence = ProducerFence::new(&device);
-    // The fence completes 200 ms from now — fired before the import so
-    // the SYNC_FD export finds a pending signal, but the fence itself is
-    // still unsigned when the engine consumes it below.
-    fence.fire(queue, family, 200);
+    // The fence completes only when 512 32-MiB fills retire on the GPU —
+    // submitted before the import so the SYNC_FD export finds a pending
+    // kernel-side signal, but still unsigned when the engine consumes it.
+    fence.fire(queue, family, 512);
     let buffer = make_ahb_rgb(16, 16, [0x20, 0x90, 0x30, 0xff]);
     let frame = device
         .import(FrameSource::Ahb(Box::new(vulkan::Ahb {
@@ -852,7 +878,7 @@ fn cancellation_and_teardown() {
 #[test]
 fn report_counts_and_timings() {
     let (shared, device) = setup();
-    let before = fd_count();
+    let before = fd_list();
     let import_start = Instant::now();
     let buffer = make_ahb_rgb(16, 16, [0x44, 0x44, 0x44, 0xff]);
     let frame = device
@@ -892,7 +918,7 @@ fn report_counts_and_timings() {
         warm.push(t.elapsed().as_secs_f64() * 1e3);
     }
     warm.sort_by(f64::total_cmp);
-    let after = fd_count();
+    let after = fd_list();
     eprintln!("== #166 Pixel report ==");
     eprintln!("import: {import_us}us  bytes: {imported}");
     eprintln!("first render (cold): {cold_ms:.2}ms");
@@ -901,10 +927,30 @@ fn report_counts_and_timings() {
         warm[warm.len() / 2],
         warm[warm.len() - 1]
     );
-    eprintln!("fds: before={before} after={after}");
+    eprintln!("fds: before={} after={}", before.len(), after.len());
+    fd_report("opened by import + renders", &before, &after);
     eprintln!("memory: {:?}", engine.memory());
     drop(engine);
-    let released = fd_count();
-    eprintln!("fds after teardown: {released}");
-    assert!(released <= before + 1, "leaked fds: {before} -> {released}");
+    let dropped = fd_list();
+    eprintln!("fds after drop(engine): {}", dropped.len());
+    fd_report("surviving engine teardown", &before, &dropped);
+    // The test's own references go next: the producer's AHB acquire, the
+    // surface handle's retained frame content, and the import device —
+    // dropping the shared device's last reference runs vkDestroyDevice,
+    // which closes any driver-held fd (gralloc import, syncobj, heap).
+    unsafe { ndk_sys::AHardwareBuffer_release(buffer) };
+    drop(surface);
+    drop(device);
+    let released = fd_list();
+    eprintln!("fds after full teardown: {}", released.len());
+    fd_report("after full teardown", &before, &released);
+    assert_eq!(
+        released.len(),
+        before.len(),
+        "leaked fds: {:?}",
+        released
+            .iter()
+            .filter(|fd| !before.contains(fd))
+            .collect::<Vec<_>>()
+    );
 }

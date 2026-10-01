@@ -41,10 +41,9 @@ jobs:
             libxkbcommon-dev mesa-vulkan-drivers libvulkan1 spirv-tools \
             libfontconfig1-dev
       # cherenkov-gpu's build script optimizes precompiled SPIR-V with
-      # spirv-opt and checks it with spirv-val (issue #57).
-      - name: Install SPIRV-Tools
-        if: runner.os == 'macOS'
-        run: brew install spirv-tools
+      # spirv-opt and checks it with spirv-val (issue #57). SPIR-V is
+      # emitted only on non-Apple, non-wasm targets (issue #241), so only
+      # Linux and Windows need spirv-tools.
       - name: Install SPIRV-Tools
         if: runner.os == 'Windows'
         id: msys2
@@ -250,9 +249,8 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      # cherenkov-gpu's build script optimizes precompiled SPIR-V with
-      # spirv-opt and checks it with spirv-val (issue #57).
-      - run: brew install spirv-tools
+      # cherenkov-gpu emits no SPIR-V on Apple targets (issue #241), so
+      # this leg needs no spirv-tools.
       - uses: actions/cache@v4
         with:
           path: scenes/fonts/_full

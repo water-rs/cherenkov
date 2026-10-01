@@ -1035,6 +1035,15 @@ impl Compositor for LayerPlanes {
     }
 
     fn shows(frame: &ExternalFrame) -> bool {
+        // The platform must decode the frame the way the engine would:
+        // an `ITU_R_709_2` frame is decoded with the inverse OETF while
+        // the engine applies BT.1886 γ2.4, and no colour tag reproduces
+        // γ2.4 (a `GammaLevel` tag is ignored by the decode path —
+        // measured levels 1.0/2.2/2.4 producing identical output), so a
+        // promoted BT.709 plane would land darker than engine output.
+        if frame.color.transfer == Transfer::Bt709 {
+            return false;
+        }
         frame_surface(frame).is_some()
     }
 }

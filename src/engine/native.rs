@@ -83,12 +83,6 @@ impl<B: Backend> Engine<B> {
     /// # Errors
     /// [`EngineError`] when the backend fails to initialize or the render
     /// thread cannot start.
-    #[expect(
-        clippy::arc_with_non_send_sync,
-        reason = "`Waker` holds a host callback invoked on the engine or main \
-            thread, so it is not `Send`; `Arc` owns the hand-off to the \
-            render thread's `MainWaker`, which calls `wake` on main only"
-    )]
     pub fn new(config: B::Config) -> Result<Self, EngineError> {
         let (tx, rx) = std::sync::mpsc::sync_channel::<Message<B>>(64);
         let (init_tx, init_rx) = std::sync::mpsc::channel();
@@ -215,12 +209,15 @@ impl<B: Backend> Engine<B> {
     /// bound signal firing) are queued, not sent. When the display link is
     /// paused after `Next::Idle`, the host must learn that a frame is
     /// needed: the engine calls `f` at most once between two
-    /// [`Engine::render`]s, the first time something is queued.
+    /// [`Engine::render`]s, the first time something is queued. `f` may
+    /// run on the engine's thread or on the main thread — a completion
+    /// queued there by the render thread fires it — so it must be
+    /// [`Send`].
     ///
     /// # Panics
     /// When the callback slot is poisoned by a panic inside a previous
     /// `f` running under the lock.
-    pub fn set_waker(&self, f: impl Fn() + 'static) {
+    pub fn set_waker(&self, f: impl Fn() + Send + 'static) {
         *self.waker.callback.lock().expect("waker poisoned") = Some(Box::new(f));
     }
 

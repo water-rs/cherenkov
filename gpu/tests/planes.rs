@@ -62,11 +62,9 @@ mod macos {
         CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferGetHeightOfPlane,
         CVPixelBufferGetIOSurface, CVPixelBufferGetWidthOfPlane, CVPixelBufferLockBaseAddress,
         CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress, kCVImageBufferChromaLocation_Left,
-        kCVImageBufferChromaLocationTopFieldKey, kCVImageBufferColorPrimaries_ITU_R_709_2,
-        kCVImageBufferColorPrimaries_ITU_R_2020, kCVImageBufferColorPrimariesKey,
-        kCVImageBufferTransferFunction_ITU_R_709_2,
-        kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ, kCVImageBufferTransferFunctionKey,
-        kCVImageBufferYCbCrMatrix_ITU_R_709_2, kCVImageBufferYCbCrMatrix_ITU_R_2020,
+        kCVImageBufferChromaLocationTopFieldKey, kCVImageBufferColorPrimaries_ITU_R_2020,
+        kCVImageBufferColorPrimariesKey, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ,
+        kCVImageBufferTransferFunctionKey, kCVImageBufferYCbCrMatrix_ITU_R_2020,
         kCVImageBufferYCbCrMatrixKey, kCVPixelBufferIOSurfacePropertiesKey,
         kCVPixelBufferMetalCompatibilityKey, kCVPixelFormatType_32BGRA,
         kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, kCVReturnSuccess,
@@ -117,6 +115,14 @@ mod macos {
             case(
                 "promoted_composition_matches_engine_composition",
                 promoted_composition_matches_engine_composition,
+            ),
+            case(
+                "a_bt709_frame_stays_in_the_engine_and_matches",
+                a_bt709_frame_stays_in_the_engine_and_matches,
+            ),
+            case(
+                "a_translucent_layer_above_stays_in_the_engine_and_matches",
+                a_translucent_layer_above_stays_in_the_engine_and_matches,
             ),
         ]
     }
@@ -347,10 +353,15 @@ mod macos {
                 // SAFETY: the display layer is read on the main thread.
                 &|| unsafe { display.isReadyForDisplay() },
                 &|| {
+                    // SAFETY: as above.
+                    let r = unsafe { display.sampleBufferRenderer() };
                     format!(
-                        "the display layer never became ready: {:?}",
-                        // SAFETY: as above.
-                        unsafe { display.sampleBufferRenderer().status() }
+                        "the display layer never became ready: {:?} error={:?} \
+                        bounds={:?} hidden={:?}",
+                        unsafe { r.status() },
+                        unsafe { r.error() },
+                        display.bounds(),
+                        display.isHidden(),
                     )
                 },
             );
@@ -687,10 +698,11 @@ mod macos {
     fn the_realized_tree_puts_the_plane_between_its_parts() {
         let fixture = Fixture::new();
         let buffer = nv12_buffer(VIDEO);
-        let _scene = scene(
+        let _scene = scene_bar(
             &fixture.engine,
             &fixture.window,
-            nv12(&fixture.metal, &buffer, FrameColor::BT709_VIDEO),
+            nv12(&fixture.metal, &buffer, FrameColor::BT2020_PQ),
+            1.0,
         );
         fixture.promote();
 
@@ -740,28 +752,21 @@ mod macos {
     fn a_promoted_frame_shows_its_own_surface_and_declared_colour() {
         // SAFETY: CoreVideo's constants are immutable statics.
         let cases = unsafe {
-            [
-                (
-                    FrameColor::BT709_VIDEO,
-                    kCVImageBufferColorPrimaries_ITU_R_709_2,
-                    kCVImageBufferTransferFunction_ITU_R_709_2,
-                    kCVImageBufferYCbCrMatrix_ITU_R_709_2,
-                ),
-                (
-                    FrameColor::BT2020_PQ,
-                    kCVImageBufferColorPrimaries_ITU_R_2020,
-                    kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ,
-                    kCVImageBufferYCbCrMatrix_ITU_R_2020,
-                ),
-            ]
+            [(
+                FrameColor::BT2020_PQ,
+                kCVImageBufferColorPrimaries_ITU_R_2020,
+                kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ,
+                kCVImageBufferYCbCrMatrix_ITU_R_2020,
+            )]
         };
         for (color, primaries, transfer, matrix) in cases {
             let fixture = Fixture::new();
             let buffer = nv12_buffer(VIDEO);
-            let _scene = scene(
+            let _scene = scene_bar(
                 &fixture.engine,
                 &fixture.window,
                 nv12(&fixture.metal, &buffer, color),
+                1.0,
             );
             fixture.promote();
             // The renderer records the buffer it displayed when it draws.
@@ -794,7 +799,7 @@ mod macos {
     /// Renders `frame` in the scene and asserts the engine composed it
     /// itself: one part, no plane.
     fn stays_in_the_engine(fixture: &Fixture, frame: ExternalFrame) {
-        let _scene = scene(&fixture.engine, &fixture.window, frame);
+        let _scene = scene_bar(&fixture.engine, &fixture.window, frame, 1.0);
         fixture.render();
         let stack = stack(fixture);
         assert_eq!(stack.len(), 1, "one part");
@@ -874,10 +879,11 @@ mod macos {
         let straight = Fixture::new();
         stays_in_the_engine(&straight, bgra(&straight, RgbAlpha::Straight));
         let opaque = Fixture::new();
-        let _scene = scene(
+        let _scene = scene_bar(
             &opaque.engine,
             &opaque.window,
             bgra(&opaque, RgbAlpha::Opaque),
+            1.0,
         );
         opaque.promote();
         assert_eq!(displays(&opaque.root()).len(), 1, "promoted");
@@ -943,6 +949,94 @@ mod macos {
         assert!(
             metrics.flip_mean <= 0.05 && metrics.max_local_error <= 0.25,
             "promoted vs engine composition: {metrics:?}"
+        );
+    }
+
+    /// The pixels a window and an offscreen engine surface produce from
+    /// the same scene, compared the way
+    /// `promoted_composition_matches_engine_composition` does.
+    fn engine_parity(fixture: &Fixture, offscreen: &Surface<Gpu>, what: &str) {
+        let engine = offscreen.readback().expect("engine composition");
+        let system = fixture.system.composite();
+        let image = |pixels: Vec<[f32; 4]>| cherenkov_oracle::F32Image {
+            width: SIZE.0,
+            height: SIZE.1,
+            pixels,
+        };
+        let (metrics, _) =
+            cherenkov_oracle::metrics::compare(&image(engine.pixels), &image(system));
+        assert!(
+            metrics.flip_mean <= 0.05 && metrics.max_local_error <= 0.25,
+            "{what} vs engine composition: {metrics:?}"
+        );
+    }
+
+    /// The platform decodes `ITU_R_709_2` with the inverse OETF while the
+    /// engine applies BT.1886 gamma 2.4 and no colour tag reproduces
+    /// gamma 2.4, so `shows` keeps a BT.709 frame in the engine: no plane,
+    /// and the window shows the engine's own composition.
+    fn a_bt709_frame_stays_in_the_engine_and_matches() {
+        let fixture = Fixture::new();
+        let buffer = nv12_buffer(VIDEO);
+        let offscreen = fixture
+            .engine
+            .surface(Offscreen::new(SIZE, OffscreenFormat::LinearF16))
+            .expect("offscreen");
+        let _engine_scene = scene_bar(
+            &fixture.engine,
+            &offscreen,
+            nv12(&fixture.metal, &buffer, FrameColor::BT709_VIDEO),
+            1.0,
+        );
+        let _window_scene = scene_bar(
+            &fixture.engine,
+            &fixture.window,
+            nv12(&fixture.metal, &buffer, FrameColor::BT709_VIDEO),
+            1.0,
+        );
+        fixture.render();
+        assert!(
+            displays(&fixture.root()).is_empty(),
+            "the plan keeps BT.709 in the engine"
+        );
+        engine_parity(&fixture, &offscreen, "engine-composited BT.709");
+    }
+
+    /// A layer painted above a plane that is not known to be opaque is
+    /// blended by the platform in its own space, not the engine's linear
+    /// blend, so the plan keeps the video in the engine: no plane, and
+    /// the window shows the engine's own composition.
+    fn a_translucent_layer_above_stays_in_the_engine_and_matches() {
+        let fixture = Fixture::new();
+        let buffer = surface_buffer(VIDEO.0, VIDEO.1, kCVPixelFormatType_32BGRA);
+        let bgra = |metal: &Metal| {
+            ExternalFrame::rgb(
+                plane_texture(
+                    metal,
+                    &buffer,
+                    0,
+                    (MTLPixelFormat::BGRA8Unorm, wgpu::TextureFormat::Bgra8Unorm),
+                ),
+                RgbAlpha::Opaque,
+                FrameColor::SRGB,
+            )
+            .expect("a valid BGRA frame")
+        };
+        let offscreen = fixture
+            .engine
+            .surface(Offscreen::new(SIZE, OffscreenFormat::LinearF16))
+            .expect("offscreen");
+        let _engine_scene = scene(&fixture.engine, &offscreen, bgra(&fixture.metal));
+        let _window_scene = scene(&fixture.engine, &fixture.window, bgra(&fixture.metal));
+        fixture.render();
+        assert!(
+            displays(&fixture.root()).is_empty(),
+            "the plan keeps a video under a translucent layer in the engine"
+        );
+        engine_parity(
+            &fixture,
+            &offscreen,
+            "engine-composited video under a translucent layer",
         );
     }
 }

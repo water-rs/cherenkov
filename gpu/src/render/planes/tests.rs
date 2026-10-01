@@ -167,16 +167,22 @@ fn a_surface_level_blend_above_keeps_the_layer_in_the_engine() {
     let mut tree = scene();
     tree.apply(LayerOp::Blend(BELOW, BlendMode::Multiply));
     assert!(verdict(&tree).is_ok());
-    // Inside an isolated layer above, the blend stays in its offscreen.
+    // Inside an isolated layer above, the blend stays in its offscreen —
+    // the blended child is what isolates `ABOVE` — while `ABOVE` itself
+    // composites over the plane, so it must stay known-opaque.
     let mut tree = scene();
     tree.apply(LayerOp::Create(LayerId::new(9)));
     tree.apply(LayerOp::Push {
         parent: ABOVE,
         child: LayerId::new(9),
     });
-    tree.apply(LayerOp::Opacity(ABOVE, prop(0.5)));
     tree.apply(LayerOp::Blend(LayerId::new(9), BlendMode::Multiply));
     assert!(verdict(&tree).is_ok());
+    // A layer above that is not known to be opaque — here, one below
+    // full opacity — makes the platform composite over the plane in its
+    // own space, which the engine cannot reproduce.
+    tree.apply(LayerOp::Opacity(ABOVE, prop(0.5)));
+    assert_eq!(verdict(&tree), Err(Ineligible::TranslucentAbove(ABOVE)));
 }
 
 #[test]

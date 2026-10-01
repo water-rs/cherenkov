@@ -1411,8 +1411,8 @@ mod tests {
     /// content stops drawing it.
     #[test]
     fn image_replacement_redraws_and_still_releases() {
-        use std::cell::Cell;
-        use std::rc::Rc;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
 
         use crate::{Draw as _, Sampling, WorkingColor};
 
@@ -1456,20 +1456,26 @@ mod tests {
             "nothing changed since the first render: {settled:?}"
         );
 
-        let wakes = Rc::new(Cell::new(0u32));
+        let wakes = Arc::new(AtomicU32::new(0));
         engine.set_waker({
-            let wakes = Rc::clone(&wakes);
-            move || wakes.set(wakes.get() + 1)
+            let wakes = Arc::clone(&wakes);
+            move || {
+                wakes.fetch_add(1, Ordering::Relaxed);
+            }
         });
         image
             .replace(ImageData::<Rgba8>::new(2, 3, vec![0u8; 24]).expect("image data"))
             .expect("replace");
-        assert_eq!(wakes.get(), 1, "a replacement wakes the host");
+        assert_eq!(
+            wakes.load(Ordering::Relaxed),
+            1,
+            "a replacement wakes the host"
+        );
         unused
             .replace(ImageData::<Rgba8>::new(2, 2, vec![0u8; 16]).expect("image data"))
             .expect("replace");
         assert_eq!(
-            wakes.get(),
+            wakes.load(Ordering::Relaxed),
             1,
             "the host is woken at most once between two renders"
         );
@@ -1615,8 +1621,8 @@ mod tests {
     #[test]
     fn live_recorded_operands_wake_the_idle_owner_and_disconnect_on_drop() {
         use crate::{Draw, WorkingColor};
-        use std::cell::Cell;
-        use std::rc::Rc;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
         let (engine, _events) = engine();
         let surface = engine
             .surface(crate::Offscreen::new(
@@ -1633,25 +1639,31 @@ mod tests {
             );
         });
         engine.render(FrameTime::now()).unwrap();
-        let count = Rc::new(Cell::new(0));
+        let count = Arc::new(AtomicU32::new(0));
         let wakes = count.clone();
-        engine.set_waker(move || wakes.set(wakes.get() + 1));
+        engine.set_waker(move || {
+            wakes.fetch_add(1, Ordering::Relaxed);
+        });
         color.set(WorkingColor::BLACK);
         color.set(WorkingColor::WHITE);
         assert_eq!(
-            count.get(),
+            count.load(Ordering::Relaxed),
             1,
             "live updates coalesce without host transactions"
         );
         engine.render(FrameTime::now()).unwrap();
         color.set(WorkingColor::BLACK);
-        assert_eq!(count.get(), 2, "render re-arms host notification");
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            2,
+            "render re-arms host notification"
+        );
         drop(layer);
         engine.render(FrameTime::now()).unwrap();
-        let before = count.get();
+        let before = count.load(Ordering::Relaxed);
         color.set(WorkingColor::WHITE);
         assert_eq!(
-            count.get(),
+            count.load(Ordering::Relaxed),
             before,
             "removed content cannot wake the engine"
         );
@@ -2009,8 +2021,8 @@ mod tests {
     #[test]
     fn retired_live_content_does_not_update_or_wake() {
         use crate::{Draw, WorkingColor};
-        use std::cell::Cell;
-        use std::rc::Rc;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
 
         let (engine, rx) = engine();
         let surface = engine
@@ -2029,9 +2041,11 @@ mod tests {
         engine.render(FrameTime::now()).unwrap();
         let _ = frames(&rx);
 
-        let count = Rc::new(Cell::new(0));
-        let wakes = Rc::clone(&count);
-        engine.set_waker(move || wakes.set(wakes.get() + 1));
+        let count = Arc::new(AtomicU32::new(0));
+        let wakes = Arc::clone(&count);
+        engine.set_waker(move || {
+            wakes.fetch_add(1, Ordering::Relaxed);
+        });
         surface.update(|tx| {
             tx[&layer].record(|r| {
                 r.fill(kurbo::Rect::new(0., 0., 8., 8.), WorkingColor::BLACK);
@@ -2040,10 +2054,10 @@ mod tests {
         engine.render(FrameTime::now()).unwrap();
         let _ = frames(&rx);
 
-        let before = count.get();
+        let before = count.load(Ordering::Relaxed);
         color.set(WorkingColor::BLACK);
         assert_eq!(
-            count.get(),
+            count.load(Ordering::Relaxed),
             before,
             "retired content cannot wake the engine"
         );

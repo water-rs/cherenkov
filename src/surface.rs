@@ -1139,6 +1139,7 @@ impl<B: Backend> Surface<B> {
                         shared.contents.remove(id);
                         let surface = self.id;
                         let layer = *id;
+                        ops.push(Op::Installed(layer));
                         ops.push(Op::Install(Box::new(move |r| {
                             install(r, surface, layer);
                         })));

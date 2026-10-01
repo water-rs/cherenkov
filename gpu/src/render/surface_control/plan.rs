@@ -153,6 +153,15 @@ pub fn dataspace(color: &FrameColor, encoding: Encoding) -> Result<Dataspace, In
             (standard, if float { Range::Extended } else { Range::Full })
         }
     };
+    // Per the NDK ADataSpace documentation, each transfer function is a
+    // pixel transform applied by the compositor: `Smpte170M` is
+    // "transfer characteristic SMPTE 170M" — the same OETF family the
+    // engine approximates with BT.1886 γ2.4 — `St2084` the SMPTE ST 2084
+    // perceptual quantizer, `Hlg` hybrid log-gamma, `Srgb` the sRGB
+    // transfer function and `Linear` a no-op. Which of these decodes
+    // SurfaceFlinger performs exactly matching the engine's decode is a
+    // platform claim that needs device evidence before `shows` can
+    // refuse one; none is excluded yet.
     let transfer = match color.transfer {
         Transfer::Linear => TransferFn::Linear,
         Transfer::Srgb => TransferFn::Srgb,

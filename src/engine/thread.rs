@@ -584,6 +584,10 @@ fn commit<B: Backend>(
                 state.commits = Commits::Other;
                 state.tree.apply(op);
             }
+            Op::Installed(layer) => {
+                state.commits = Commits::Other;
+                state.tree.note_installed(layer);
+            }
             Op::Install(install) => {
                 state.commits = Commits::Other;
                 install(&mut *renderer);
@@ -593,6 +597,7 @@ fn commit<B: Backend>(
                 // still rises from `Clean` — but it is recorded apart, so
                 // a backend with planes can tell a plane-only frame (#90).
                 install(&mut *renderer);
+                state.tree.note_installed(layer);
                 state.commits = state.commits.max(Commits::Installs);
                 state.plane_frames.insert(layer);
             }

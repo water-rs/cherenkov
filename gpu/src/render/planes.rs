@@ -19,7 +19,7 @@
 //! A platform implements [`SystemPlanes`] and realizes the ordered stack of
 //! engine parts and promoted planes a [`Composition`] describes.
 
-use kurbo::{Affine, Vec2};
+use kurbo::{Affine, Rect, Vec2};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use cherenkov::{BlendMode, Display, LayerId, RenderError, ShapeData, SurfaceTree};
@@ -72,6 +72,12 @@ pub enum Ineligible {
     /// surface, which would need the layer's pixels.
     #[error("layer {0:?} painted above it blends with a non-default mode")]
     BlendAbove(LayerId),
+    /// A layer painted above it, intersecting its bounds, is not known to
+    /// be opaque: the system compositor blends the part above a plane in
+    /// its own space, which does not reproduce the engine's linear blend,
+    /// so the pixels would differ wherever the above layer has coverage.
+    #[error("layer {0:?} painted above it is not known to be opaque")]
+    TranslucentAbove(LayerId),
     /// The layer samples a backdrop.
     #[error("it samples a backdrop")]
     Backdrop,
@@ -206,6 +212,18 @@ struct Visit {
     ancestors: Vec<usize>,
 }
 
+/// A visit's device-space footprint: the content-space transform
+/// (ancestor transforms and scrolls applied), the intersection of every
+/// clip on the path mapped to device space — `None` when no level clips,
+/// meaning the layer can paint anywhere on the surface — and whether the
+/// layer composites at the surface at all (inside an isolating ancestor
+/// it lands only in that ancestor's offscreen).
+struct VisitDevice {
+    space: Affine,
+    bounds: Option<Rect>,
+    surface: bool,
+}
+
 /// Reusable workspace for a plan walk: the paint order (each visit's
 /// ancestor chain keeps the buffer it had last call — `pool` holds the
 /// ones `order` gave back), the traversal stack, and the backdrop/blend
@@ -218,6 +236,7 @@ pub struct PlanScratch {
     stack: Vec<(LayerId, usize)>,
     backdrop_above: Vec<Option<LayerId>>,
     blend_above: Vec<Option<LayerId>>,
+    device: Vec<VisitDevice>,
 }
 
 /// Every layer in paint order: a layer's content, then its children —
@@ -248,6 +267,51 @@ fn paint_order<'a>(
         }
     }
     order
+}
+
+/// Every visit's content-space transform and device-space clip bounds —
+/// the footprint a "layer above" check intersects a candidate's rect
+/// against.
+fn devices(tree: &SurfaceTree, order: &[Visit], device: &mut Vec<VisitDevice>) {
+    device.clear();
+    for visit in order {
+        let surface = visit
+            .ancestors
+            .iter()
+            .all(|&a| !isolates(tree, order[a].id));
+        let mut space = Affine::IDENTITY;
+        let mut bounds = None;
+        for id in visit
+            .ancestors
+            .iter()
+            .map(|&a| order[a].id)
+            .chain([visit.id])
+        {
+            let level = tree.layer(id);
+            let own = space * level.transform;
+            if let Some(clip) = &level.clip {
+                let clipped = own.transform_rect_bbox(clip.bounds());
+                bounds = Some(bounds.map_or(clipped, |outer: Rect| outer.intersect(clipped)));
+            }
+            space = own * Affine::translate(-level.scroll_offset);
+        }
+        device.push(VisitDevice {
+            space,
+            bounds,
+            surface,
+        });
+    }
+}
+
+/// Whether the layer's painted output is not provably opaque: its own
+/// opacity below one, recorded content that may paint translucency,
+/// installed content whose alpha is the producer's, or a filter.
+fn translucent(tree: &SurfaceTree, id: LayerId) -> bool {
+    let node = tree.layer(id);
+    node.opacity < 1.0
+        || node.content_translucent()
+        || node.filter.is_some()
+        || node.blend != BlendMode::Normal
 }
 
 /// The first layer at or after each index that samples a backdrop or
@@ -290,11 +354,20 @@ fn verdicts<'a, C: Compositor>(
     candidates: &'a FxHashMap<LayerId, (u32, u32)>,
     backdrop_above: &'a [Option<LayerId>],
     blend_above: &'a [Option<LayerId>],
+    device: &'a [VisitDevice],
 ) -> impl Iterator<Item = (usize, Result<(), Ineligible>)> + 'a {
     let mut promoted = 0;
     order.iter().enumerate().filter_map(move |(i, visit)| {
         candidates.get(&visit.id)?;
-        let verdict = judge::<C>(tree, order, i, backdrop_above[i + 1], blend_above[i + 1]);
+        let verdict = judge::<C>(
+            tree,
+            order,
+            i,
+            candidates[&visit.id],
+            backdrop_above[i + 1],
+            blend_above[i + 1],
+            device,
+        );
         Some((
             i,
             match verdict {
@@ -330,12 +403,15 @@ pub fn plan<C: Compositor>(
         stack,
         backdrop_above,
         blend_above,
+        device,
     } = &mut scratch;
     let order = paint_order(tree, order, pool, stack);
     suffixes(tree, order, backdrop_above, blend_above);
+    devices(tree, order, device);
     let mut plan = Plan::default();
     let mut last = None;
-    for (i, verdict) in verdicts::<C>(tree, order, candidates, backdrop_above, blend_above) {
+    for (i, verdict) in verdicts::<C>(tree, order, candidates, backdrop_above, blend_above, device)
+    {
         match verdict {
             Ok(()) => {
                 last = Some(i);
@@ -395,13 +471,16 @@ fn same_plan<C: Compositor>(
         stack,
         backdrop_above,
         blend_above,
+        device,
     } = scratch;
     let order = paint_order(tree, order, pool, stack);
     suffixes(tree, order, backdrop_above, blend_above);
+    devices(tree, order, device);
     let mut planes = committed.planes.iter();
     let mut rejected = committed.rejected.iter();
     let mut last = None;
-    for (i, verdict) in verdicts::<C>(tree, order, candidates, backdrop_above, blend_above) {
+    for (i, verdict) in verdicts::<C>(tree, order, candidates, backdrop_above, blend_above, device)
+    {
         match verdict {
             Ok(()) => {
                 let Some(placed) = planes.next() else {
@@ -430,8 +509,10 @@ fn judge<C: Compositor>(
     tree: &SurfaceTree,
     order: &[Visit],
     i: usize,
+    size: (u32, u32),
     backdrop_above: Option<LayerId>,
     blend_above: Option<LayerId>,
+    device: &[VisitDevice],
 ) -> Result<(), Ineligible> {
     let visit = &order[i];
     let node = tree.layer(visit.id);
@@ -490,6 +571,20 @@ fn judge<C: Compositor>(
             }
         }
         space = own * Affine::translate(-level.scroll_offset);
+    }
+    let rect = device[i].space.transform_rect_bbox(Rect::new(
+        0.0,
+        0.0,
+        f64::from(size.0),
+        f64::from(size.1),
+    ));
+    for j in i + 1..order.len() {
+        if device[j].surface
+            && translucent(tree, order[j].id)
+            && device[j].bounds.is_none_or(|bounds| bounds.overlaps(rect))
+        {
+            return Err(Ineligible::TranslucentAbove(order[j].id));
+        }
     }
     Ok(())
 }

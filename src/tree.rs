@@ -65,6 +65,12 @@ pub struct LayerNode {
     /// Content updates conservatively retain this until replacement; extra
     /// pass-through isolation is output-equivalent.
     content_blends: bool,
+    /// Content updates conservatively retain this until replacement: the
+    /// recorded commands may paint a pixel of alpha below one, so the
+    /// layer's output is not known to be opaque. Installed content —
+    /// a `GpuContent` or external frame the engine does not record —
+    /// counts as translucent, its alpha unknowable.
+    content_translucent: bool,
     parent: Option<LayerId>,
     transform_track: Option<Track<Affine>>,
     components: Option<Box<components::Components>>,
@@ -119,6 +125,7 @@ impl LayerNode {
             children: Vec::new(),
             blending_children: 0,
             content_blends: false,
+            content_translucent: false,
             parent: None,
             transform_track: None,
             components: None,
@@ -144,6 +151,14 @@ impl LayerNode {
     #[must_use]
     pub const fn blends_within(&self) -> bool {
         self.blending_children > 0 || self.content_blends
+    }
+
+    /// Whether the layer's recorded or installed content may paint a pixel
+    /// of alpha below one — `false` only while the layer has no content or
+    /// every command it draws is provably opaque.
+    #[must_use]
+    pub const fn content_translucent(&self) -> bool {
+        self.content_translucent
     }
 
     /// Whether an engine-driven track moved this layer this frame: a
@@ -424,23 +439,50 @@ impl SurfaceTree {
             .unwrap_or_else(|| panic!("layer {} is not in the tree", id.raw()))
     }
 
-    /// Records whether the layer's content contains a non-`Normal` group.
+    /// Records whether the layer's content contains a non-`Normal` group
+    /// or may paint a pixel of alpha below one.
     pub(crate) fn note_content(&mut self, id: LayerId, content: Option<&ContentOp>) {
         let node = self.node_mut(id);
         match content {
             Some(ContentOp::Replace(picture) | ContentOp::Picture(picture)) => {
-                node.content_blends = crate::lowering::blends_within(
-                    picture.display_list(),
-                    0..picture.display_list().len(),
-                );
+                let list = picture.display_list();
+                node.content_blends = crate::lowering::blends_within(list, 0..list.len());
+                node.content_translucent = crate::lowering::translucent_within(list, 0..list.len());
             }
             Some(ContentOp::Update(updates)) => {
                 node.content_blends |= updates.iter().any(|SlotUpdate { value, .. }| {
                     matches!(value, Operand::Group(group) if group.blend != BlendMode::Normal)
                 });
+                node.content_translucent |=
+                    updates.iter().any(|SlotUpdate { value, .. }| match value {
+                        Operand::Paint(paint) => !paint.is_opaque(),
+                        Operand::Group(group) => {
+                            group.opacity < 1.0
+                                || group.blend != BlendMode::Normal
+                                || group.filter.is_some()
+                        }
+                        Operand::Shadow(_) | Operand::Run(_) => true,
+                        Operand::Shape(_)
+                        | Operand::Stroke(_)
+                        | Operand::Transform(_)
+                        | Operand::Rect(_) => false,
+                    });
             }
-            None => node.content_blends = false,
+            None => {
+                node.content_blends = false;
+                node.content_translucent = false;
+            }
         }
+    }
+
+    /// Records installed render-side content (`Op::Install`,
+    /// `Op::ExternalFrame`) replacing what the layer drew: no recorded
+    /// groups remain, but the installed pixels' alpha is the producer's
+    /// to declare, so the layer is not known to be opaque.
+    pub(crate) fn note_installed(&mut self, id: LayerId) {
+        let node = self.node_mut(id);
+        node.content_blends = false;
+        node.content_translucent = true;
     }
 
     /// Every layer in the tree. Order is unspecified.

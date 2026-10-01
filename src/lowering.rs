@@ -304,6 +304,40 @@ fn walk<C: Compiler>(
     Ok(())
 }
 
+/// Whether any command in `range` may paint a pixel of alpha below
+/// one: a paint that is not opaque everywhere, an image or a shadow whose
+/// alpha is not statically known, glyph runs (coverage is partial by
+/// nature), or a group drawn below full opacity or behind a filter.
+/// Nested pictures count. Opaque fills and strokes count as opaque —
+/// their antialiased edges sit inside the perceptual tolerance a
+/// compositor is verified against.
+pub(crate) fn translucent_within(list: &DisplayList, range: Range<usize>) -> bool {
+    for command in &list.commands()[range] {
+        match command {
+            Command::Fill { paint, .. } | Command::Stroke { paint, .. } => {
+                if !paint.is_opaque() {
+                    return true;
+                }
+            }
+            Command::Glyphs { .. } | Command::Image { .. } | Command::Shadow { .. } => {
+                return true;
+            }
+            Command::BeginGroup { group, .. } => {
+                if group.opacity < 1.0 || group.filter.is_some() {
+                    return true;
+                }
+            }
+            Command::Picture { picture, .. }
+                if translucent_within(picture.display_list(), 0..picture.display_list().len()) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Whether any command in `range` opens a group with a non-`Normal` blend.
 /// Nested pictures count: their contents are walked the same way. Glyphs
 /// need no scan — a colour glyph's expansion is itself wrapped in the

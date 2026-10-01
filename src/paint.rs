@@ -46,6 +46,31 @@ impl Clone for Paint {
 }
 
 impl Paint {
+    /// Whether every pixel this paint produces is fully opaque: solid
+    /// and gradient paints are opaque when every stop is, an image or
+    /// shader's alpha is not statically known, and a transformed paint
+    /// is as opaque as its inner paint.
+    pub(crate) fn is_opaque(&self) -> bool {
+        match self {
+            Self::Solid(color) => color.components[3] >= 1.0,
+            Self::Linear(gradient) => gradient
+                .stops
+                .iter()
+                .all(|stop| stop.color.components[3] >= 1.0),
+            Self::Radial(gradient) => gradient
+                .stops
+                .iter()
+                .all(|stop| stop.color.components[3] >= 1.0),
+            Self::Sweep(gradient) => gradient
+                .stops
+                .iter()
+                .all(|stop| stop.color.components[3] >= 1.0),
+            Self::Mesh(mesh) => mesh.colors.iter().all(|color| color.components[3] >= 1.0),
+            Self::Transformed(transformed) => transformed.paint.is_opaque(),
+            Self::Image(_) | Self::Shader(_) => false,
+        }
+    }
+
     // Keep owned gradient/mesh/shader cloning out of each inlined solid
     // recording site. The result and resource ownership remain identical.
     #[inline(never)]

@@ -16,9 +16,18 @@ use std::sync::{Arc, Mutex};
 /// `wake` may run on the engine's thread or on the main thread — a
 /// completion queued there by the render thread (a promoted plane's
 /// attach) fires it — so the interior is guarded and the callback a
-/// host registers must tolerate either.
+/// host registers must be `Send`.
+/// The callback a host registers with `set_waker`: `Send` where a wake
+/// may be fired by a completion another thread queued on the main queue
+/// (a promoted plane's attach), a plain `Fn()` on the single-threaded
+/// wasm engine.
+#[cfg(not(target_family = "wasm"))]
+type Wake = dyn Fn() + Send;
+#[cfg(target_family = "wasm")]
+type Wake = dyn Fn();
+
 pub struct Waker {
-    callback: Mutex<Option<Box<dyn Fn()>>>,
+    callback: Mutex<Option<Box<Wake>>>,
     armed: AtomicBool,
 }
 
@@ -60,14 +69,6 @@ impl Waker {
 /// block the main queue executes does.
 #[derive(Clone)]
 pub struct MainWaker(Arc<Waker>);
-#[expect(
-    clippy::non_send_fields_in_send_ty,
-    reason = "`wake` is invoked only on the main thread, where the engine's \
-        own wake path runs, and `Waker`'s interior is guarded (`Mutex`, \
-        `AtomicBool`); `Arc` owns the cross-thread hand-off"
-)]
-// SAFETY: as the expect reason states.
-unsafe impl Send for MainWaker {}
 
 impl MainWaker {
     /// Wraps the engine's waker. Called on the engine's thread.

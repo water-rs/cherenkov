@@ -238,6 +238,9 @@ pub enum Op<B: Backend> {
     Layer(LayerOp),
     /// An opaque render-side operation, applied in order.
     Install(ResOp<B>),
+    /// A render-side install replaced `layer`'s recorded content, so its
+    /// painted output is the producer's and not known to be opaque.
+    Installed(LayerId),
     /// An external frame's install on `layer`
     /// ([`ExternalFrames`](crate::ExternalFrames)): applied in order like
     /// [`Install`](Self::Install), but named so the frame can report which

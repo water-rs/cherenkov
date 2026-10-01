@@ -204,9 +204,15 @@ fn lame_corner(q: vec2<f32>, r: vec2<f32>, n: f32) -> vec4<f32> {
     return vec4<f32>(d, normal, 1.0 / max(kappa, 1e-6));
 }
 
-// Signed distance from `p` to the rounded box `s`. Exact for straight edges
-// and circular corners; second-order for elliptical and Lamé corners.
-fn sdf(s: Shape, p: vec2<f32>) -> f32 {
+// Distance and differential geometry evaluated at the same local point.
+// In particular, a Lamé corner needs only one Newton projection.
+struct DistanceSample {
+    distance: f32,
+    gradient: vec4<f32>,
+}
+
+fn sdf_sample(s: Shape, p: vec2<f32>) -> DistanceSample {
+    let sgn = select(vec2<f32>(-1.0), vec2<f32>(1.0), p >= vec2<f32>(0.0));
     let right = p.x > 0.0;
     let bottom = p.y > 0.0;
     let r = select(
@@ -218,20 +224,31 @@ fn sdf(s: Shape, p: vec2<f32>) -> f32 {
     let ry = rx * s.aspect;
     let a = abs(p) - s.half;
     if rx <= 0.0 || ry <= 0.0 {
-        return length(max(a, vec2<f32>(0.0))) + min(max(a.x, a.y), 0.0);
+        let d = length(max(a, vec2<f32>(0.0))) + min(max(a.x, a.y), 0.0);
+        var g: vec4<f32>;
+        if a.x > 0.0 && a.y > 0.0 {
+            g = vec4<f32>(a / length(a), 0.0, 1.0);
+        } else {
+            g = vec4<f32>(select(vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), a.x > a.y), 0.0, 0.0);
+        }
+        return DistanceSample(d, vec4<f32>(sgn * g.xy, g.zw));
     }
     let q = a + vec2<f32>(rx, ry);
     if q.x > 0.0 && q.y > 0.0 {
-        let n = s.exponent;
-        if abs(n - 2.0) < 1e-4 && abs(s.aspect - 1.0) < 1e-4 {
+        if abs(s.exponent - 2.0) < 1e-4 && abs(s.aspect - 1.0) < 1e-4 {
             let u = q / vec2<f32>(rx, ry);
-            let g = length(u);
-            let grad = length(u / vec2<f32>(rx, ry)) / max(g, 1e-6);
-            return (g - 1.0) / max(grad, 1e-6);
+            let len = length(u);
+            let grad = length(u / vec2<f32>(rx, ry)) / max(len, 1e-6);
+            let d = (len - 1.0) / max(grad, 1e-6);
+            let v = q / vec2<f32>(rx * rx, ry * ry);
+            let normal = v / max(length(v), 1e-12);
+            return DistanceSample(d, vec4<f32>(sgn * normal, rx, 0.0));
         }
-        return lame_corner(q, vec2<f32>(rx, ry), n).x;
+        let l = lame_corner(q, vec2<f32>(rx, ry), s.exponent);
+        return DistanceSample(l.x, vec4<f32>(sgn * l.yz, l.w, 0.0));
     }
-    return max(a.x, a.y);
+    let g = select(vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), a.x > a.y);
+    return DistanceSample(max(a.x, a.y), vec4<f32>(sgn * g, 0.0, 0.0));
 }
 
 // Device-space gradient of a signed distance, for the local -> device
@@ -253,50 +270,6 @@ fn device_grad_scale(m: array<vec4<f32>, 2>) -> f32 {
     let d = m[0].w;
     let det = a * d - b * c;
     return abs(select(1.0 / det, 0.0, abs(det) < 1e-12));
-}
-
-// Local-space gradient of the signed distance to `s` at `p`, closed form.
-// Derivative builtins are not used: they are unreliable in the
-// helper lanes along the quad's triangle seam.
-fn sdf_grad(s: Shape, p: vec2<f32>) -> vec4<f32> {
-    // Closed form for every shape: the unit gradient of the box distance,
-    // mirrored back out of the abs() fold. z = local boundary radius of
-    // curvature on a circular, elliptical or Lamé arc, 0.0 on straight
-    // edges; w = 1.0 only where the distance is not a half-plane (the
-    // sharp-corner exterior wedge).
-    let sgn = select(vec2<f32>(-1.0), vec2<f32>(1.0), p >= vec2<f32>(0.0));
-    let right = p.x > 0.0;
-    let bottom = p.y > 0.0;
-    let r = select(
-        select(s.radii.x, s.radii.w, bottom),
-        select(s.radii.y, s.radii.z, bottom),
-        right,
-    );
-    let rx = max(r, 0.0);
-    let ry = rx * s.aspect;
-    let a = abs(p) - s.half;
-    var g: vec4<f32>;
-    if rx <= 0.0 || ry <= 0.0 {
-        if a.x > 0.0 && a.y > 0.0 {
-            g = vec4<f32>(a / length(a), 0.0, 1.0);
-        } else {
-            g = vec4<f32>(select(vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), a.x > a.y), 0.0, 0.0);
-        }
-    } else {
-        let q = a + vec2<f32>(rx, ry);
-        if q.x > 0.0 && q.y > 0.0 {
-            if abs(s.exponent - 2.0) < 1e-4 && abs(s.aspect - 1.0) < 1e-4 {
-                let v = q / vec2<f32>(rx * rx, ry * ry);
-                g = vec4<f32>(v / max(length(v), 1e-12), rx, 0.0);
-            } else {
-                let l = lame_corner(q, vec2<f32>(rx, ry), s.exponent);
-                g = vec4<f32>(l.yz, l.w, 0.0);
-            }
-        } else {
-            g = vec4<f32>(select(vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), a.x > a.y), 0.0, 0.0);
-        }
-    }
-    return vec4<f32>(sgn * g.xy, g.zw);
 }
 
 // Area coverage of the axis-aligned half-plane `d <= 0` where `d`
@@ -411,9 +384,10 @@ fn corner_coverage(a: vec2<f32>, v1: vec2<f32>, v2: vec2<f32>, scale: f32) -> f3
 
 // Coverage of the shape `s` at local point `p`, `m` mapping local to device.
 fn shape_coverage(s: Shape, p: vec2<f32>, m: array<vec4<f32>, 2>) -> f32 {
-    let g = sdf_grad(s, p);
+    let sample = sdf_sample(s, p);
+    let g = sample.gradient;
     // A sharp corner inside this pixel: the exact area inside both
-    // half-planes. `a`, `sgn`, and the quadrant radius mirror `sdf_grad`;
+    // half-planes. `a`, `sgn`, and the quadrant radius mirror `sdf_sample`;
     // the strict `<` keeps a corner exactly on a pixel boundary on the
     // old path.
     let sgn = select(vec2<f32>(-1.0), vec2<f32>(1.0), p >= vec2<f32>(0.0));
@@ -438,7 +412,7 @@ fn shape_coverage(s: Shape, p: vec2<f32>, m: array<vec4<f32>, 2>) -> f32 {
         }
     }
     return coverage_dir(
-        sdf(s, p),
+        sample.distance,
         device_grad_vec(m, g.xy),
         device_grad_scale(m),
         g.w > 0.0,
@@ -456,10 +430,11 @@ fn clip_mask_coverage(in: VsOut) -> f32 {
     if (flags & FLAG_HAS_CLIP) != 0u {
         // `clip_inv` maps device to clip-local: J^-T is its transpose.
         let pc = apply(instances[i].clip_inv, in.pixel);
-        let g = sdf_grad(instances[i].clip, pc);
+        let sample = sdf_sample(instances[i].clip, pc);
+        let g = sample.gradient;
         let ci = instances[i].clip_inv;
         let dg = vec2<f32>(ci[0].x * g.x + ci[0].y * g.y, ci[0].z * g.x + ci[0].w * g.y);
-        cov = coverage_dir(sdf(instances[i].clip, pc), dg, 1.0, g.w > 0.0, g.z);
+        cov = coverage_dir(sample.distance, dg, 1.0, g.w > 0.0, g.z);
     }
     if (flags & FLAG_HAS_MASK) != 0u {
         // Mask texel for this device pixel; texels outside the cell

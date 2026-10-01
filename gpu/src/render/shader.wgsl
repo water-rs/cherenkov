@@ -453,11 +453,12 @@ fn paint_backdrop(i: u32, pixel: vec2<f32>) -> vec4<f32> {
     // distance and unit outward normal in device space, the same
     // J^-T math the clip coverage block uses.
     let pc = apply(inst.clip_inv, pixel);
-    let g = sdf_grad(inst.clip, pc);
+    let sample = sdf_sample(inst.clip, pc);
+    let g = sample.gradient;
     let ci = inst.clip_inv;
     let dg = vec2<f32>(ci[0].x * g.x + ci[0].y * g.y, ci[0].z * g.x + ci[0].w * g.y);
     let len = max(length(dg), 1e-6);
-    let d = sdf(inst.clip, pc) / len;
+    let d = sample.distance / len;
     let n = dg / len;
     if kind == EFFECT_REFRACTION {
         // stops[first].color.xy = (depth, strength).
@@ -549,8 +550,9 @@ fn fs_full(in: VsOut) -> vec4<f32> {
             }
         }
         case KIND_STROKE_DIST: {
-            let d = sdf(s, in.local);
-            let g = sdf_grad(s, in.local);
+            let sample = sdf_sample(s, in.local);
+            let d = sample.distance;
+            let g = sample.gradient;
             let v = device_grad_vec(m, g.xy);
             let scale = device_grad_scale(m);
             let ramp = g.w > 0.0;

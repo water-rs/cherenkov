@@ -342,15 +342,15 @@ pub struct MaskBinding<'a> {
 /// binds, which is the lease the producer's planes retire on.
 pub struct Slot {
     /// The frame as installed; its `wait` is consumed by the Apple submit
-    /// loop, and holding it is the lease that keeps the planes resident.
-    #[cfg_attr(
-        not(target_vendor = "apple"),
-        expect(
-            dead_code,
-            reason = "frame.wait is read only by the Apple Metal submit loop"
-        )
-    )]
+    /// loop or a plane, and holding it is the lease that keeps the planes
+    /// resident.
     pub frame: ExternalFrame,
+    /// The surface's install count when this frame was installed: a plane
+    /// showing the layer hands the system a new buffer when it changes.
+    pub generation: u64,
+    /// Whether the surface's system compositor can show the frame itself,
+    /// which makes the layer a promotion candidate.
+    pub on_plane: bool,
     /// The emitted quad's size in layer-local space: the luma or RGB plane
     /// dimensions.
     pub size: (u32, u32),
@@ -381,7 +381,13 @@ impl Slot {
     pub const GPU_BYTES: u64 = std::mem::size_of::<Params>() as u64;
 
     /// Creates the views and the params buffer for a frame.
-    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, frame: ExternalFrame) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        frame: ExternalFrame,
+        generation: u64,
+        on_plane: bool,
+    ) -> Self {
         #[cfg(all(unix, not(target_vendor = "apple")))]
         let mut native = None;
         let (y, uv, rgb, size) = match &frame.planes {
@@ -426,6 +432,8 @@ impl Slot {
         queue.write_buffer(&buffer, 0, bytemuck::bytes_of(&params(&frame)));
         Self {
             frame,
+            generation,
+            on_plane,
             size,
             #[cfg(all(unix, not(target_vendor = "apple")))]
             native,

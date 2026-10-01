@@ -29,8 +29,10 @@ use crate::render::path;
 /// The target a pass draws into.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Target {
-    /// The surface's render texture.
-    Surface,
+    /// The surface's render texture for engine part `n`: the whole surface
+    /// is part 0, and every layer promoted to a system plane starts the
+    /// next part above it (`render::planes`).
+    Part(u32),
     /// Scratch texture at this isolation depth index.
     Scratch(usize),
     /// A backdrop group's capture texture for this region index.
@@ -115,7 +117,7 @@ pub struct Pass {
     /// group, or a capture of one.
     pub space: cherenkov::BlendSpace,
     /// Device-space `(x, y, w, h)` of the target this pass covers: the
-    /// whole surface for [`Target::Surface`], the tight union bbox of its
+    /// whole surface for [`Target::Part`], the tight union bbox of its
     /// content for [`Target::Scratch`].
     pub region: [u32; 4],
     /// When set, the target's region is copied into the backdrop texture
@@ -134,7 +136,7 @@ pub struct Capture {
     pub group: u64,
     /// The capture's index in the group's region list.
     pub region: u32,
-    /// The nearest semantic isolation's target: [`Target::Surface`] or a
+    /// The nearest semantic isolation's target: [`Target::Part`] or a
     /// [`Target::Scratch`] whose region is guaranteed the full surface.
     pub copy_from: Target,
 }
@@ -949,6 +951,11 @@ pub struct Lowering<'a> {
     /// The storage space of the enclosing level, innermost last; the
     /// surface renders in `Linear` (the implicit base).
     space_stack: Vec<cherenkov::BlendSpace>,
+    /// The engine part surface-level passes draw into.
+    part: u32,
+    /// The layers promoted to system planes this frame: their content is
+    /// not drawn, and each starts the next part.
+    promoted: Vec<LayerId>,
     /// The storage space of each scratch target by depth index: a
     /// semantic isolate's declared space, a clip-only level's parent
     /// space, or the opening level's for shadow and capture scopes.
@@ -985,7 +992,9 @@ impl<'a> Lowering<'a> {
             backdrop_filters: FxHashMap::default(),
             capture_isolation: false,
             clip_scratches: Vec::new(),
-            semantic_target: Target::Surface,
+            semantic_target: Target::Part(0),
+            part: 0,
+            promoted: Vec::new(),
             space_stack: Vec::new(),
             scratch_space: Vec::new(),
             capture_space: FxHashMap::default(),
@@ -1159,6 +1168,9 @@ impl<'a> Lowering<'a> {
         Ok(())
     }
 
+    /// Lowers `tree` into the frame. Each layer in `promoted` (paint order)
+    /// is left to its system plane: its content is not drawn, and the
+    /// layers painted after it draw into the next engine part.
     pub fn run(
         &mut self,
         tree: &SurfaceTree,
@@ -1166,7 +1178,9 @@ impl<'a> Lowering<'a> {
         clear: WorkingColor,
         glyphs: &GlyphContext<'_>,
         groups: &FxHashMap<u64, BackdropGroupInfo>,
+        promoted: Vec<LayerId>,
     ) -> Result<(), RenderError> {
+        self.promoted = promoted;
         for content in caches.values_mut() {
             self.commands_lowered += content.retained.prepare(&mut super::prepared::Lowerer {
                 fonts: glyphs.fonts,
@@ -1180,7 +1194,7 @@ impl<'a> Lowering<'a> {
             .collect();
         self.plan_backdrops(tree, groups)?;
         let [r, g, b, a] = clear.components;
-        self.begin_pass(Target::Surface, Some([r * a, g * a, b * a, a]));
+        self.begin_pass(Target::Part(0), Some([r * a, g * a, b * a, a]));
         self.layer(tree.root(), tree, caches, glyphs)?;
         self.finish_pass();
         Ok(())
@@ -1222,7 +1236,7 @@ impl<'a> Lowering<'a> {
     /// the space recorded when their level or group opened.
     fn target_space(&self, target: Target) -> cherenkov::BlendSpace {
         match target {
-            Target::Surface => cherenkov::BlendSpace::Linear,
+            Target::Part(_) => cherenkov::BlendSpace::Linear,
             Target::Scratch(k) => self
                 .scratch_space
                 .get(k)
@@ -1234,6 +1248,32 @@ impl<'a> Lowering<'a> {
                 .copied()
                 .unwrap_or(cherenkov::BlendSpace::Linear),
         }
+    }
+
+    /// The target of the level currently being drawn into: the current
+    /// engine part, or the innermost isolation's scratch.
+    const fn level_target(&self) -> Target {
+        if self.depth == 0 {
+            Target::Part(self.part)
+        } else {
+            Target::Scratch(self.depth - 1)
+        }
+    }
+
+    /// Ends the current engine part at a promoted layer's paint position and
+    /// starts the next one, transparent, for everything painted above it.
+    ///
+    /// # Panics
+    /// When lowering is inside an isolation: eligibility keeps every
+    /// promoted layer at the surface level, so this is an engine defect.
+    fn next_part(&mut self) {
+        assert!(
+            self.depth == 0 && matches!(self.semantic_target, Target::Part(_)),
+            "a promoted layer must composite at the surface level"
+        );
+        self.part += 1;
+        self.semantic_target = Target::Part(self.part);
+        self.begin_pass(Target::Part(self.part), Some([0.0; 4]));
     }
 
     /// The storage space of the level currently being drawn into.
@@ -1284,7 +1324,7 @@ impl<'a> Lowering<'a> {
         self.end_segment_at(end);
         if let Some(open) = self.frame.open.take() {
             let region = match open.target {
-                Target::Surface => [0, 0, self.width as u32, self.height as u32],
+                Target::Part(_) => [0, 0, self.width as u32, self.height as u32],
                 // Scratch regions are tightened in `isolate` once the
                 // pass's instance bboxes are known.
                 Target::Scratch(_) => [0, 0, 0, 0],
@@ -1501,11 +1541,7 @@ impl<'a> Lowering<'a> {
         self.capture_isolation = saved_capture || inner_capture;
         self.semantic_target = saved_target;
         self.clip_scratches = saved_scratches;
-        let outer_target = if self.depth == 0 {
-            Target::Surface
-        } else {
-            Target::Scratch(self.depth - 1)
-        };
+        let outer_target = self.level_target();
         let region = if let Some(filter) = filter {
             self.frame
                 .filters
@@ -1644,14 +1680,7 @@ impl<'a> Lowering<'a> {
         ));
         (self.transform, self.width, self.height, self.clip) = saved;
         self.depth -= 1;
-        self.begin_pass(
-            if self.depth == 0 {
-                Target::Surface
-            } else {
-                Target::Scratch(self.depth - 1)
-            },
-            None,
-        );
+        self.begin_pass(self.level_target(), None);
         let mut instance = self.base(KIND_SPAN, affine(Affine::IDENTITY));
         instance.bounds = [0.0, 0.0, self.width, self.height];
         instance.meta[1] = PAINT_TEXTURE;
@@ -1779,11 +1808,7 @@ impl<'a> Lowering<'a> {
     fn emit_capture(&mut self, gid: u64) {
         let regions = self.backdrops[&gid].regions.clone();
         let copy_from = self.semantic_target;
-        let current = if self.depth == 0 {
-            Target::Surface
-        } else {
-            Target::Scratch(self.depth - 1)
-        };
+        let current = self.level_target();
         // The capture texture stores the semantic target's space: the
         // copies and the clip-only composites over it all stay in it.
         self.capture_space.insert(gid, self.target_space(copy_from));
@@ -2295,7 +2320,9 @@ impl<'a> Lowering<'a> {
                 self.push_shaped(inst, transform, boxed.bounds, margin);
             }
         }
-        if let Some(slot) = glyphs.external.get(&id) {
+        if self.promoted.contains(&id) {
+            self.next_part();
+        } else if let Some(slot) = glyphs.external.get(&id) {
             self.frame.external.push(id);
             let bounds = Rect::new(0.0, 0.0, f64::from(slot.size.0), f64::from(slot.size.1));
             if let Some(boxed) = box_shape(&ShapeData::Rect(bounds))? {
@@ -3682,7 +3709,10 @@ fn push_effect_stops(stops: &mut Vec<Stop>, effect: &cherenkov::BackdropEffect) 
     }
 }
 
-fn axis_aligned(transform: Affine) -> bool {
+/// Whether `transform` keeps axis-aligned rectangles axis-aligned (a
+/// scale, translation, or quarter turn): a rect clip under it stays a
+/// device-aligned rectangle.
+pub(super) fn axis_aligned(transform: Affine) -> bool {
     let [c0, c1, c2, c3, _, _] = transform.as_coeffs();
     (c1 == 0.0 && c2 == 0.0) || (c0 == 0.0 && c3 == 0.0)
 }
@@ -4012,7 +4042,7 @@ mod tests {
         let bitmaps = FxHashMap::default();
         let mut frame = Frame::default();
         let mut lowering = Lowering::new(&mut frame, (64, 64));
-        lowering.begin_pass(Target::Surface, None);
+        lowering.begin_pass(Target::Part(0), None);
         let glyphs = GlyphContext {
             atlas: &atlas,
             live_stamp: atlas.live_stamp(),
@@ -4063,11 +4093,11 @@ mod tests {
         draw(&mut lowering, &prefix, &glyphs).expect("suffix");
         lowering.finish_pass();
         assert_eq!(frame.passes.len(), 3);
-        assert_eq!(frame.passes[0].target, Target::Surface);
+        assert_eq!(frame.passes[0].target, Target::Part(0));
         assert_eq!(frame.passes[0].ranges[0].instances, 0..1);
         assert_eq!(frame.passes[1].target, Target::Scratch(0));
         assert_eq!(frame.passes[1].ranges[0].instances, 1..3);
-        assert_eq!(frame.passes[2].target, Target::Surface);
+        assert_eq!(frame.passes[2].target, Target::Part(0));
         assert_eq!(frame.passes[2].ranges[0].instances, 3..4);
         assert_eq!(frame.passes[2].ranges[1].instances, 4..5);
         let composite = frame
@@ -4112,7 +4142,7 @@ mod tests {
         };
         let mut frame = Frame::default();
         let mut lowering = Lowering::new(&mut frame, (64, 64));
-        lowering.begin_pass(Target::Surface, None);
+        lowering.begin_pass(Target::Part(0), None);
         lowering
             .isolate(
                 None,
@@ -4190,7 +4220,7 @@ mod tests {
         };
         let mut frame = Frame::default();
         let mut lowering = Lowering::new(&mut frame, (64, 64));
-        lowering.begin_pass(Target::Surface, None);
+        lowering.begin_pass(Target::Part(0), None);
         lowering
             .isolate(
                 Some(clip),
@@ -4509,5 +4539,77 @@ mod tests {
         let merged = cluster(&rects, 60);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].bbox, [0, 0, 30, 10]);
+    }
+
+    /// A promoted layer ends the engine part it sits in: layers painted
+    /// before it draw into part 0, layers after it into a transparent part
+    /// 1, and its own content is left to its plane.
+    #[test]
+    fn a_promoted_layer_splits_the_surface_into_parts() {
+        use cherenkov::testing::LayerOp;
+        use cherenkov::{Draw as _, Picture, SurfaceTree};
+        let Some((device, _queue)) = device_and_queue() else {
+            return;
+        };
+        let atlas = Atlas::new(&device, u64::MAX);
+        let (below, video, above) = (LayerId::new(1), LayerId::new(2), LayerId::new(3));
+        let mut tree = SurfaceTree::new();
+        for id in [below, video, above] {
+            tree.apply(LayerOp::Create(id));
+            tree.apply(LayerOp::Push {
+                parent: tree.root(),
+                child: id,
+            });
+        }
+        let rect = |x: f64| {
+            ContentData::new(Picture::record(|c| {
+                c.fill(Rect::new(x, 0.0, x + 8.0, 8.0), WorkingColor::WHITE);
+            }))
+        };
+        let lower = |promoted: Vec<LayerId>| {
+            let mut caches: FxHashMap<LayerId, ContentData> =
+                [(below, rect(0.0)), (above, rect(16.0))]
+                    .into_iter()
+                    .collect();
+            let fonts = FxHashMap::default();
+            let images = FxHashMap::default();
+            let bitmaps = FxHashMap::default();
+            let glyphs = GlyphContext {
+                atlas: &atlas,
+                live_stamp: atlas.live_stamp(),
+                fonts: &fonts,
+                images: &images,
+                bitmaps: &bitmaps,
+                content: &FxHashMap::default(),
+                external: &FxHashMap::default(),
+            };
+            let mut frame = Frame::default();
+            Lowering::new(&mut frame, (32, 32))
+                .run(
+                    &tree,
+                    &mut caches,
+                    WorkingColor::BLACK,
+                    &glyphs,
+                    &FxHashMap::default(),
+                    promoted,
+                )
+                .expect("lowered");
+            frame
+                .passes
+                .iter()
+                .map(|p| (p.target, p.clear, p.ranges.len()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            lower(Vec::new()),
+            [(Target::Part(0), Some([0.0, 0.0, 0.0, 1.0]), 1)]
+        );
+        assert_eq!(
+            lower(vec![video]),
+            [
+                (Target::Part(0), Some([0.0, 0.0, 0.0, 1.0]), 1),
+                (Target::Part(1), Some([0.0; 4]), 1),
+            ]
+        );
     }
 }

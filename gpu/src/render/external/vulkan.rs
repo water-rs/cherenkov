@@ -713,7 +713,7 @@ impl Native {
     pub fn new(shared: Arc<Shared>) -> Result<Self, NativeError> {
         let dev = &shared.vk.device;
         let code = {
-            let mut cursor = std::io::Cursor::new(crate::render::shaders::EXTERNAL_NATIVE);
+            let mut cursor = std::io::Cursor::new(crate::render::shaders::spirv::EXTERNAL_NATIVE);
             ash::util::read_spv(&mut cursor).expect("external_native.spv")
         };
         let module = unsafe {

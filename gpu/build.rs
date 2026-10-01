@@ -4,7 +4,8 @@
 //!
 //! - `<name>.spv` — naga SPIR-V run through the `spirv-opt -O` recipe minus
 //!   `simplify-instructions` (it reassociates floating-point math, breaking
-//!   bit-identical output) and validated by `spirv-val` against `vulkan1.0`;
+//!   bit-identical output) and validated by `spirv-val` against `vulkan1.0`,
+//!   on the non-Apple, non-wasm targets only (issue #241);
 //! - `<name>.metal` — naga MSL at wgpu-hal's argument slots;
 //! - `<name>.metallib` — the `.metal` compiled by `xcrun metal`/`metallib`,
 //!   on Apple targets only.
@@ -213,18 +214,41 @@ fn main() {
         merge_pair: None,
     });
 
-    // wasm builds embed no passthrough artifacts, so the toolchain the
-    // SPIR-V and MSL emission needs (spirv-tools, `xcrun`) is not required
-    // for them; the WGSL is still parsed and validated here.
+    // wasm builds embed no passthrough artifacts, and Apple builds embed
+    // no `.spv` (issue #241), so the toolchains emission needs — spirv-tools
+    // and `xcrun` — are each required only on the targets that consume
+    // their artifacts; the WGSL is still parsed and validated here.
     let wasm = env::var("CARGO_CFG_TARGET_ARCH").unwrap() == "wasm32";
     let apple = apple_target();
+    let spirv = emits_spirv();
+    // The crate reads the same condition as the `cherenkov_spirv` cfg, so
+    // `build.rs` is the single place that decides it.
+    println!("cargo::rustc-check-cfg=cfg(cherenkov_spirv)");
+    if spirv {
+        println!("cargo::rustc-cfg=cherenkov_spirv");
+    }
     for spec in &specs {
-        compile(&out_dir, spec, apple.as_ref(), wasm);
+        compile(&out_dir, spec, apple.as_ref(), wasm, spirv);
     }
 }
 
+/// Whether the `.spv` artifacts are emitted — and spirv-tools is required.
+///
+/// SPIR-V is the passthrough format of wgpu's Vulkan backend only, and
+/// wgpu compiles that backend on exactly the non-Apple, non-wasm targets
+/// (`windows`, `linux`, `android`, `freebsd`, `netbsd` in its
+/// `wgpu-core-deps-windows-linux-android` manifest entry): Apple targets
+/// get `.metallib`s and wgpu has no Vulkan backend for them unless the
+/// non-default `vulkan-portability` feature is on (issue #241). This
+/// crate's `wgpu` dependency is default-features, so `.spv` bytes are
+/// unreachable on Apple and wasm and must not demand spirv-tools there.
+fn emits_spirv() -> bool {
+    env::var("CARGO_CFG_TARGET_ARCH").unwrap() != "wasm32"
+        && env::var("CARGO_CFG_TARGET_VENDOR").unwrap() != "apple"
+}
+
 /// Parses, validates and compiles one module.
-fn compile(out_dir: &Path, spec: &Spec, apple: Option<&AppleTarget>, wasm: bool) {
+fn compile(out_dir: &Path, spec: &Spec, apple: Option<&AppleTarget>, wasm: bool, spirv: bool) {
     let module = naga::front::wgsl::parse_str(&spec.source).unwrap_or_else(|e| {
         panic!(
             "{}: WGSL parse failed:\n{}",
@@ -238,7 +262,9 @@ fn compile(out_dir: &Path, spec: &Spec, apple: Option<&AppleTarget>, wasm: bool)
     if wasm {
         return;
     }
-    write_spirv(out_dir, spec, &module, &info);
+    if spirv {
+        write_spirv(out_dir, spec, &module, &info);
+    }
     if spec.metal {
         write_metal(out_dir, spec, &module, apple);
     }

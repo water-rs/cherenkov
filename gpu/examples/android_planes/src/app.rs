@@ -34,6 +34,7 @@ pub extern "Rust" fn android_main(app: AndroidApp) {
     logcat::line(&format!("scenario={} starting", scenario.name()));
 
     let mut run: Option<Run> = None;
+    let mut inset_top: Option<i32> = None;
     let mut wait_log = Instant::now();
     loop {
         let mut terminated = false;
@@ -75,6 +76,11 @@ pub extern "Rust" fn android_main(app: AndroidApp) {
         let run = run.get_or_insert_with(|| Run::new(&window, scenario, &decisions));
         if resized {
             run.resize(&window);
+        }
+        let top = app.content_rect().top;
+        if inset_top != Some(top) {
+            inset_top = Some(top);
+            run.inset(top);
         }
         run.frame();
         std::thread::sleep(Duration::from_millis(8));
@@ -150,9 +156,12 @@ struct Run {
     logged_first_frame: bool,
     /// `LayerId`s whose first settled verdict was already logged.
     logged_verdicts: Vec<u64>,
-    /// Parent and controls layer handles: keeps their layers alive for
-    /// the run (dropping a live layer queues its `Remove`).
+    /// Parent layer handles: keeps their layers alive for the run
+    /// (dropping a live layer queues its `Remove`).
     _rest: Vec<Layer>,
+    /// The engine-composited controls layer, kept alive and moved with
+    /// the window's top inset.
+    controls: Layer,
     _font: Font,
 }
 
@@ -192,10 +201,10 @@ impl Run {
         let font = engine
             .font(cherenkov::FontSource::bytes(font_data.clone()))
             .expect("font registration");
-        let controls = controls_content(font.id(), &font_data, scenario);
+        let panel = controls_content(font.id(), &font_data, scenario);
 
         let specs = scenario.videos();
-        let (layers, rest) = scenario.build(&surface, controls);
+        let (layers, rest, controls) = scenario.build(&surface, panel);
         assert_eq!(specs.len(), layers.len(), "videos and layers pair");
         let videos: Vec<Video> = specs
             .into_iter()
@@ -217,8 +226,17 @@ impl Run {
             logged_first_frame: false,
             logged_verdicts: Vec::new(),
             _rest: rest,
+            controls,
             _font: font,
         }
+    }
+
+    /// Moves the controls layer inside the window's top inset (the
+    /// status bar) — the surface spans the whole window, inset or not.
+    fn inset(&self, top: i32) {
+        self.surface.update(|tx| {
+            tx[&self.controls].transform(Affine::translate((0.0, f64::from(top))));
+        });
     }
 
     /// The window resized: resize the surface (the plane parts reallocate

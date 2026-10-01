@@ -137,15 +137,15 @@ impl Scenario {
     }
 
     /// Builds the scenario's layer tree under `surface`'s root. Returns
-    /// `(videos, rest)`: the video layers in `videos()` order plus every
-    /// other live layer (parent layers and `controls`, on top of
+    /// `(videos, rest, controls)`: the video layers in `videos()` order,
+    /// the parent layers, and the `controls` layer (pushed on top of
     /// everything). The caller keeps all of them — a dropped handle
     /// queues its `Remove` ahead of the ops that attach it.
     pub fn build(
         self,
         surface: &Surface<Gpu>,
         controls: cherenkov::Content,
-    ) -> (Vec<Layer>, Vec<Layer>) {
+    ) -> (Vec<Layer>, Vec<Layer>, Layer) {
         let w = f64::from(surface.size().0);
         let h = f64::from(surface.size().1);
         let root = surface.root();
@@ -235,7 +235,6 @@ impl Scenario {
             tx[&overlay_controls].content(controls);
             tx[root].push(&overlay_controls);
         });
-        rest.push(overlay_controls);
-        (videos, rest)
+        (videos, rest, overlay_controls)
     }
 }

@@ -46,7 +46,7 @@ fn every_scenario_tree_commits_and_renders() {
         let scenario = Scenario::parse(name);
         let surface = surface(&engine);
         // Keep both handles alive for the renders, as `Run` does.
-        let (_videos, _controls) = scenario.build(&surface, controls());
+        let (_videos, _rest, _controls) = scenario.build(&surface, controls());
         engine
             .render(FrameTime::now())
             .unwrap_or_else(|e| panic!("scenario {name}: first frame failed: {e}"));

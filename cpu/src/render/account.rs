@@ -27,6 +27,8 @@ pub struct Categories {
     pub colr: u64,
     /// Decoded bitmap glyph images.
     pub bitmaps: u64,
+    /// Projective layers' retained local images and mip chains.
+    pub projective: u64,
 }
 
 impl Categories {
@@ -39,6 +41,7 @@ impl Categories {
             + self.glyphs
             + self.colr
             + self.bitmaps
+            + self.projective
     }
 }
 
@@ -103,6 +106,11 @@ fn item_bytes(item: &Item) -> u64 {
         | Item::PopIsolate { clip, .. }
         | Item::PopFilter { clip, .. }
         | Item::Sample { clip, .. } => clip.as_deref().map_or(0, clip_bytes),
+        // The image itself is counted by the projective image cache.
+        Item::Project(item) => {
+            size_of::<super::lower::ProjectItem>() as u64
+                + item.clip.as_deref().map_or(0, clip_bytes)
+        }
         Item::PushIsolate { .. } | Item::PushFilter { .. } | Item::Capture(_) => 0,
     }
 }

@@ -591,6 +591,8 @@ mod tests {
             again: false,
             sequence: None,
             setup: None,
+            #[cfg(target_arch = "wasm32")]
+            setup_pending_frame: false,
             io: Vec::new(),
         }
     }

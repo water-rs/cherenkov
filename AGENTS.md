@@ -13,6 +13,15 @@ contract; the per-decision log is issue #2.
   metrics and PNG bytes across every change that is not meant to change pixels.
   A change that intends to change pixels (for example #71) must be no worse
   than dev against the oracle on every scene, and better overall.
+- **The scene tree is generated, not committed.** `scenes/corpus`,
+  `scenes/perf` and `scenes/fonts` are produced by
+  `uv run --python 3.12 --with-requirements scenes/fonts/tools/requirements.txt python scenes/tools/generate.py`
+  and checked out clean per machine. Nothing under them is edited by hand:
+  a scene change lands in `generate-corpus` (or the font tools), never
+  in the output, and the generated tree is the same bytes on every host.
+  The upstream font inputs under `scenes/fonts/_full/` are fetched by
+  the same command from the pinned, sha256-verified list in
+  `scenes/fonts/tools/fetch-fonts.py`.
 - **Every new capability gets corpus scenes** on each backend that claims it.
 - **Wide gamut and HDR are part of correctness.** The working space is
   extended linear Display P3, and every feature family is tested with P3-only

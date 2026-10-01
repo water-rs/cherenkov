@@ -22,9 +22,11 @@ use crate::render::glyph::{self, Atlas, FontData, MaskCell, PathEmit, PendingRas
 use crate::render::instance::{
     FLAG_BLEND_SRC, FLAG_HAS_CLIP, FLAG_HAS_INNER, FLAG_HAS_MASK, FLAG_MASK_TEXTURE, FLAG_TEX_SRGB,
     Globals, Instance, KIND_FILL, KIND_GLYPH, KIND_SHADOW, KIND_SPAN, KIND_STROKE_DIST,
-    KIND_STROKE_OFFSET, PAINT_IMAGE, PAINT_SOLID, PAINT_TEXTURE, Shape, Stop, affine, blend_code,
+    KIND_STROKE_OFFSET, PAINT_IMAGE, PAINT_PROJECTIVE, PAINT_SOLID, PAINT_TEXTURE, Shape, Stop,
+    affine, blend_code,
 };
 use crate::render::path;
+use crate::render::projective::{LocalKey, Placement};
 
 /// The target a pass draws into.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,6 +39,8 @@ pub enum Target {
     Scratch(usize),
     /// A backdrop group's capture texture for this region index.
     Backdrop { group: u64, region: u32 },
+    /// A projective layer's local image, base level (#84).
+    Projected(LocalKey),
 }
 
 /// The texture a draw range samples at bind group 1.
@@ -46,6 +50,8 @@ pub enum Source {
     Scratch(usize),
     /// A backdrop group's capture texture for this region index.
     Backdrop { group: u64, region: u32 },
+    /// A projective layer's local image with its mips (#84).
+    Projected(LocalKey),
 }
 
 /// The blend pipeline a draw range uses.
@@ -59,6 +65,9 @@ pub enum PipelineKind {
     Replace,
     /// A registered backdrop effect shader's pipeline (its raw id).
     Effect(u64),
+    /// The projective composite (#84): source-over, or `replace` for a
+    /// blended composite that reads the backdrop copy itself.
+    Projective { replace: bool },
 }
 
 /// The specialised fragment pipeline a range draws with.
@@ -155,6 +164,9 @@ pub struct Frame {
     pub external: Vec<LayerId>,
     pub filters: Vec<(usize, FilterKey)>,
     pub shadows: Vec<(usize, super::shadow::Parameters)>,
+    /// Local images whose mip chains build after the pass at the index:
+    /// the last pass of their realization.
+    pub mips: Vec<(usize, LocalKey)>,
     open: Option<OpenPass>,
 }
 
@@ -227,6 +239,7 @@ impl Frame {
         self.passes.remove(i);
         shift(&mut self.shadows, i);
         shift(&mut self.filters, i);
+        shift(&mut self.mips, i);
     }
 }
 
@@ -240,6 +253,7 @@ impl Frame {
         self.external.clear();
         self.filters.clear();
         self.shadows.clear();
+        self.mips.clear();
         self.open = None;
     }
 }
@@ -765,6 +779,10 @@ pub struct Lowered {
     pub emission_patches: Vec<(u32, u32, u32)>,
     /// `uv.zw` patches: `(instance, pending index)`.
     pub mask_patches: Vec<(u32, u32)>,
+    /// Local images this frame renders (#84), innermost first.
+    pub realize: Vec<super::projective::Realize>,
+    /// Local images this frame composes, cached or realized.
+    pub composed: Vec<LocalKey>,
 }
 
 /// What the renderer knows about one backdrop group this frame.
@@ -963,6 +981,20 @@ pub struct Lowering<'a> {
     /// Each backdrop capture texture's storage space (the semantic
     /// target it copies), by group id.
     capture_space: FxHashMap<u64, cherenkov::BlendSpace>,
+    /// The projective layer whose local image this walk renders, with the
+    /// transform replacing its placement (layer space to texels); `None`
+    /// when the walk renders the surface from the tree root.
+    local: Option<(LayerId, Affine)>,
+    /// The target the walk's root draws into.
+    root_target: Target,
+    /// Projective layers composed into this walk's raster, by layer.
+    projected: FxHashMap<LayerId, Placement>,
+    /// Projective composites emitted so far: speculative opacity
+    /// pass-through never folds across one.
+    projective_draws: u32,
+    /// The surface size: a local walk lowers onto its image's size, the
+    /// surface walk onto this.
+    surface: (u32, u32),
 }
 
 impl<'a> Lowering<'a> {
@@ -998,6 +1030,11 @@ impl<'a> Lowering<'a> {
             space_stack: Vec::new(),
             scratch_space: Vec::new(),
             capture_space: FxHashMap::default(),
+            local: None,
+            root_target: Target::Part(0),
+            projected: FxHashMap::default(),
+            projective_draws: 0,
+            surface: size,
         }
     }
 
@@ -1044,7 +1081,7 @@ impl<'a> Lowering<'a> {
         tree: &SurfaceTree,
         groups: &FxHashMap<u64, BackdropGroupInfo>,
     ) -> Result<(), RenderError> {
-        self.plan_layer(tree.root(), tree, groups, Affine::IDENTITY)?;
+        self.plan_layer(self.start(tree), tree, groups, Affine::IDENTITY)?;
         let (w, h) = (f64::from(self.width), f64::from(self.height));
         // A member's aproned rect in integer pixels, `None` when it is
         // empty or clipped fully off the surface.
@@ -1122,7 +1159,8 @@ impl<'a> Lowering<'a> {
 
     /// One layer of the planning walk, mirroring `layer`'s transform
     /// math: the clip sits in `parent * node.transform` space, children in
-    /// `parent * node.content_transform()` space.
+    /// `parent * node.content_transform()` space. A projective layer's
+    /// members plan in its own local walk.
     fn plan_layer(
         &mut self,
         id: LayerId,
@@ -1130,7 +1168,11 @@ impl<'a> Lowering<'a> {
         groups: &FxHashMap<u64, BackdropGroupInfo>,
         parent: Affine,
     ) -> Result<(), RenderError> {
+        if self.projects(id, tree) {
+            return Ok(());
+        }
         let node = tree.layer(id);
+        let (transform, children) = self.placement(id, node, parent);
         if let Some(sample) = &node.backdrop {
             let g = sample.group().raw();
             if !groups.contains_key(&g) {
@@ -1143,7 +1185,7 @@ impl<'a> Lowering<'a> {
                 .clip
                 .as_ref()
                 .ok_or(RenderError::Unsupported(names::BACKDROP_UNCLIPPED))?;
-            let member = clip_device_bounds(parent * node.transform, clip)?;
+            let member = clip_device_bounds(transform, clip)?;
             let reach = sample.effect().map(effect_reach).transpose()?;
             // The capture region covers every member's reach; the member's
             // own bounds stay uninflated for its composite and size input.
@@ -1163,24 +1205,20 @@ impl<'a> Lowering<'a> {
             plan.members.insert(id, (member, 0));
         }
         for child in &node.children {
-            self.plan_layer(*child, tree, groups, parent * node.content_transform())?;
+            self.plan_layer(*child, tree, groups, children)?;
         }
         Ok(())
     }
 
-    /// Lowers `tree` into the frame. Each layer in `promoted` (paint order)
-    /// is left to its system plane: its content is not drawn, and the
-    /// layers painted after it draw into the next engine part.
-    pub fn run(
+    /// Prepares every layer's retained content once for the frame's walks.
+    ///
+    /// # Errors
+    /// A [`RenderError`] for content the lowering cannot prepare.
+    pub fn prepare(
         &mut self,
-        tree: &SurfaceTree,
         caches: &mut FxHashMap<LayerId, ContentData>,
-        clear: WorkingColor,
         glyphs: &GlyphContext<'_>,
-        groups: &FxHashMap<u64, BackdropGroupInfo>,
-        promoted: Vec<LayerId>,
     ) -> Result<(), RenderError> {
-        self.promoted = promoted;
         for content in caches.values_mut() {
             self.commands_lowered += content.retained.prepare(&mut super::prepared::Lowerer {
                 fonts: glyphs.fonts,
@@ -1188,16 +1226,152 @@ impl<'a> Lowering<'a> {
                 pending: &mut self.pending,
             })?;
         }
+        Ok(())
+    }
+
+    /// Lowers a surface's sampled tree and its clear colour into the
+    /// frame, placing the projective layers composed into the surface
+    /// from `projected`. Each layer in `promoted` (paint order) is left to
+    /// its system plane: its content is not drawn, and the layers painted
+    /// after it draw into the next engine part.
+    ///
+    /// # Errors
+    /// A [`RenderError`] for content or state the lowering cannot render.
+    #[expect(clippy::too_many_arguments, reason = "one surface walk's inputs")]
+    pub fn run(
+        &mut self,
+        tree: &SurfaceTree,
+        caches: &mut FxHashMap<LayerId, ContentData>,
+        clear: WorkingColor,
+        glyphs: &GlyphContext<'_>,
+        groups: &FxHashMap<u64, BackdropGroupInfo>,
+        projected: FxHashMap<LayerId, Placement>,
+        promoted: Vec<LayerId>,
+    ) -> Result<(), RenderError> {
+        let [r, g, b, a] = clear.components;
+        self.raster(self.surface);
+        self.walk(
+            tree,
+            caches,
+            glyphs,
+            groups,
+            (None, Target::Part(0), Some([r * a, g * a, b * a, a])),
+            projected,
+            promoted,
+        )
+    }
+
+    /// Lowers projective layer `layer`'s local image into `target`: its
+    /// subtree under `local_to_texel` (layer space to texels) on a raster
+    /// of `size` texels cleared to transparent, with its content, clip and
+    /// filter but not its opacity or blend, which apply when the image
+    /// composes. Nested projective layers compose from `projected`.
+    ///
+    /// # Errors
+    /// A [`RenderError`] for content or state the lowering cannot render.
+    #[expect(clippy::too_many_arguments, reason = "one local walk's inputs")]
+    pub fn run_local(
+        &mut self,
+        tree: &SurfaceTree,
+        caches: &mut FxHashMap<LayerId, ContentData>,
+        glyphs: &GlyphContext<'_>,
+        groups: &FxHashMap<u64, BackdropGroupInfo>,
+        (layer, local_to_texel, target): (LayerId, Affine, LocalKey),
+        size: (u32, u32),
+        projected: FxHashMap<LayerId, Placement>,
+    ) -> Result<(), RenderError> {
+        self.raster(size);
+        self.walk(
+            tree,
+            caches,
+            glyphs,
+            groups,
+            (
+                Some((layer, local_to_texel)),
+                Target::Projected(target),
+                Some([0.0; 4]),
+            ),
+            projected,
+            // Promotion splits surface-level passes; a local image has none.
+            Vec::new(),
+        )
+    }
+
+    /// Sets the raster the next walk lowers onto.
+    #[expect(clippy::cast_precision_loss, reason = "raster sizes fit f32")]
+    const fn raster(&mut self, size: (u32, u32)) {
+        self.width = size.0 as f32;
+        self.height = size.1 as f32;
+    }
+
+    /// One walk from the start layer into `root_target`.
+    #[expect(clippy::too_many_arguments, reason = "one walk's inputs")]
+    fn walk(
+        &mut self,
+        tree: &SurfaceTree,
+        caches: &mut FxHashMap<LayerId, ContentData>,
+        glyphs: &GlyphContext<'_>,
+        groups: &FxHashMap<u64, BackdropGroupInfo>,
+        (local, root_target, clear): (Option<(LayerId, Affine)>, Target, Option<[f32; 4]>),
+        projected: FxHashMap<LayerId, Placement>,
+        promoted: Vec<LayerId>,
+    ) -> Result<(), RenderError> {
+        self.local = local;
+        self.root_target = root_target;
+        self.semantic_target = root_target;
+        self.projected = projected;
+        self.promoted = promoted;
+        self.part = 0;
+        self.transform = Affine::IDENTITY;
+        self.animating = false;
+        self.set_clip(None);
+        self.backdrops.clear();
         self.backdrop_filters = groups
             .iter()
             .filter_map(|(g, info)| info.filter.map(|key| (*g, key)))
             .collect();
         self.plan_backdrops(tree, groups)?;
-        let [r, g, b, a] = clear.components;
-        self.begin_pass(Target::Part(0), Some([r * a, g * a, b * a, a]));
-        self.layer(tree.root(), tree, caches, glyphs)?;
+        self.begin_pass(root_target, clear);
+        self.layer(self.start(tree), tree, caches, glyphs)?;
         self.finish_pass();
         Ok(())
+    }
+
+    /// The frame lowered so far.
+    pub const fn frame(&self) -> &Frame {
+        self.frame
+    }
+
+    /// Builds `key`'s mip chain after pass `pass`, its realization's last.
+    pub fn push_mips(&mut self, pass: usize, key: LocalKey) {
+        self.frame.mips.push((pass, key));
+    }
+
+    /// The layer the walk starts at.
+    fn start(&self, tree: &SurfaceTree) -> LayerId {
+        self.local.map_or_else(|| tree.root(), |(id, _)| id)
+    }
+
+    /// Whether `id` composes by projection into this walk's raster:
+    /// projective, and not the layer whose local image the walk renders.
+    fn projects(&self, id: LayerId, tree: &SurfaceTree) -> bool {
+        self.local.is_none_or(|(root, _)| root != id) && tree.projective_pose(id).is_some()
+    }
+
+    /// `(transform, content transform)` of `node` under `parent`: the
+    /// local root renders under its texel transform, never its pose.
+    fn placement(
+        &self,
+        id: LayerId,
+        node: &cherenkov::LayerNode,
+        parent: Affine,
+    ) -> (Affine, Affine) {
+        match self.local {
+            Some((root, local)) if root == id => {
+                (local, local * Affine::translate(-node.scroll_offset))
+            }
+            _ => (parent * node.transform, parent * node.content_transform()),
+        }
     }
 
     /// Ends the open draw range at the current source boundary.
@@ -1236,7 +1410,9 @@ impl<'a> Lowering<'a> {
     /// the space recorded when their level or group opened.
     fn target_space(&self, target: Target) -> cherenkov::BlendSpace {
         match target {
-            Target::Part(_) => cherenkov::BlendSpace::Linear,
+            // A local image stores its layer's linear isolation; a part is
+            // the surface's own working space.
+            Target::Part(_) | Target::Projected(_) => cherenkov::BlendSpace::Linear,
             Target::Scratch(k) => self
                 .scratch_space
                 .get(k)
@@ -1250,11 +1426,15 @@ impl<'a> Lowering<'a> {
         }
     }
 
-    /// The target of the level currently being drawn into: the current
-    /// engine part, or the innermost isolation's scratch.
-    const fn level_target(&self) -> Target {
+    /// The target of the level currently being drawn into: the walk's
+    /// current engine part or its projective root, or the innermost
+    /// isolation's scratch.
+    const fn current_target(&self) -> Target {
         if self.depth == 0 {
-            Target::Part(self.part)
+            match self.root_target {
+                Target::Part(_) => Target::Part(self.part),
+                target => target,
+            }
         } else {
             Target::Scratch(self.depth - 1)
         }
@@ -1264,8 +1444,9 @@ impl<'a> Lowering<'a> {
     /// starts the next one, transparent, for everything painted above it.
     ///
     /// # Panics
-    /// When lowering is inside an isolation: eligibility keeps every
-    /// promoted layer at the surface level, so this is an engine defect.
+    /// When lowering is inside an isolation or a projective local image:
+    /// eligibility keeps every promoted layer at the surface level, so this
+    /// is an engine defect.
     fn next_part(&mut self) {
         assert!(
             self.depth == 0 && matches!(self.semantic_target, Target::Part(_)),
@@ -1324,7 +1505,9 @@ impl<'a> Lowering<'a> {
         self.end_segment_at(end);
         if let Some(open) = self.frame.open.take() {
             let region = match open.target {
-                Target::Part(_) => [0, 0, self.width as u32, self.height as u32],
+                Target::Part(_) | Target::Projected(_) => {
+                    [0, 0, self.width as u32, self.height as u32]
+                }
                 // Scratch regions are tightened in `isolate` once the
                 // pass's instance bboxes are known.
                 Target::Scratch(_) => [0, 0, 0, 0],
@@ -1541,7 +1724,7 @@ impl<'a> Lowering<'a> {
         self.capture_isolation = saved_capture || inner_capture;
         self.semantic_target = saved_target;
         self.clip_scratches = saved_scratches;
-        let outer_target = self.level_target();
+        let outer_target = self.current_target();
         let region = if let Some(filter) = filter {
             self.frame
                 .filters
@@ -1680,7 +1863,7 @@ impl<'a> Lowering<'a> {
         ));
         (self.transform, self.width, self.height, self.clip) = saved;
         self.depth -= 1;
-        self.begin_pass(self.level_target(), None);
+        self.begin_pass(self.current_target(), None);
         let mut instance = self.base(KIND_SPAN, affine(Affine::IDENTITY));
         instance.bounds = [0.0, 0.0, self.width, self.height];
         instance.meta[1] = PAINT_TEXTURE;
@@ -1712,15 +1895,19 @@ impl<'a> Lowering<'a> {
         let clip = self.clip;
         let transform = self.transform;
         let capture = self.capture_isolation;
+        let draws = self.projective_draws;
         let result = body(self, glyphs);
+        // A projective composite never takes the pass-through: the layer
+        // above it isolates for real.
+        let folds = result.is_ok() && self.projective_draws == draws;
         let new = &self.frame.instances[snap.instances..];
-        if result.is_ok() && self.frame.passes.len() == snap.passes && bboxes_disjoint(new) {
+        if folds && self.frame.passes.len() == snap.passes && bboxes_disjoint(new) {
             for inst in &mut self.frame.instances[snap.instances..] {
                 inst.params[1] *= opacity;
             }
             return Ok(true);
         }
-        if result.is_ok()
+        if folds
             && inner_unclipped
             && clip.is_none()
             && self.frame.passes.len() == snap.passes
@@ -1736,6 +1923,7 @@ impl<'a> Lowering<'a> {
         self.set_clip(clip);
         self.transform = transform;
         self.capture_isolation = capture;
+        self.projective_draws = draws;
         result?;
         Ok(false)
     }
@@ -1808,7 +1996,7 @@ impl<'a> Lowering<'a> {
     fn emit_capture(&mut self, gid: u64) {
         let regions = self.backdrops[&gid].regions.clone();
         let copy_from = self.semantic_target;
-        let current = self.level_target();
+        let current = self.current_target();
         // The capture texture stores the semantic target's space: the
         // copies and the clip-only composites over it all stay in it.
         self.capture_space.insert(gid, self.target_space(copy_from));
@@ -2185,21 +2373,34 @@ impl<'a> Lowering<'a> {
         glyphs: &GlyphContext<'_>,
     ) -> Result<(), RenderError> {
         let node = tree.layer(id);
+        if self.projects(id, tree) {
+            return self.projected_layer(id, node, glyphs);
+        }
+        let local_root = self.local.is_some_and(|(root, _)| root == id);
+        // A local root's opacity and blend apply when its image composes.
+        let (opacity, blend) = if local_root {
+            (1.0, cherenkov::BlendMode::Normal)
+        } else {
+            (node.opacity, node.blend)
+        };
         let backdrop = node.backdrop.clone();
         let saved = self.transform;
         let saved_animating = self.animating;
-        self.animating |= node.animating();
-        self.transform = saved * node.transform;
-        let mut content_space = saved * node.content_transform();
+        if !local_root {
+            self.animating |= node.animating();
+        }
+        let (transform, mut content_space) = self.placement(id, node, saved);
+        self.transform = transform;
         if self.animating {
             self.transform = cherenkov::snap_animating(self.transform);
             content_space = cherenkov::snap_animating(content_space);
         }
         let isolates = node.filter.is_some()
-            || node.opacity < 1.0
-            || node.blend != cherenkov::BlendMode::Normal
-            // The root already renders into the surface target.
-            || (id != tree.root() && node.blends_within());
+            || opacity < 1.0
+            || blend != cherenkov::BlendMode::Normal
+            // The root already renders into the surface target, and a
+            // local root into its image.
+            || (id != self.start(tree) && node.blends_within());
         if let Some(sample) = &backdrop {
             let gid = sample.group().raw();
             let plan = &self.backdrops[&gid];
@@ -2207,7 +2408,7 @@ impl<'a> Lowering<'a> {
                 self.emit_capture(gid);
             }
         }
-        let result = if isolates && node.filter.is_none() && !is_destructive(node.blend) {
+        let result = if isolates && node.filter.is_none() && !is_destructive(blend) {
             // The member's sample draws to the current target under the
             // member clip, before and outside the layer's own isolation,
             // unaffected by the layer's opacity or blend.
@@ -2226,8 +2427,8 @@ impl<'a> Lowering<'a> {
             self.isolate(
                 None,
                 None,
-                node.opacity,
-                node.blend,
+                opacity,
+                blend,
                 // Layers declare no space; their isolation composites
                 // in the enclosing level's linear storage.
                 cherenkov::BlendSpace::Linear,
@@ -2256,8 +2457,8 @@ impl<'a> Lowering<'a> {
                         s.isolate(
                             inner,
                             node.filter,
-                            node.opacity,
-                            node.blend,
+                            opacity,
+                            blend,
                             cherenkov::BlendSpace::Linear,
                             |s, glyphs| s.layer_items(id, node, tree, caches, glyphs),
                             glyphs,
@@ -2272,6 +2473,92 @@ impl<'a> Lowering<'a> {
         self.transform = saved;
         self.animating = saved_animating;
         result
+    }
+
+    /// A projective layer composes its completed local image with one
+    /// quad: the image already carries the layer's content, clip and
+    /// filter, so the sample draws under the ancestor clip only, and the
+    /// layer's opacity and blend apply once. A destructive blend keeps its
+    /// operator domain: the ancestor clip intersected with the projected
+    /// layer clip, never the image's alpha.
+    fn projected_layer(
+        &mut self,
+        id: LayerId,
+        node: &cherenkov::LayerNode,
+        glyphs: &GlyphContext<'_>,
+    ) -> Result<(), RenderError> {
+        let Some(placement) = self.projected.get(&id).copied() else {
+            // No area this frame: behind the viewer, edge-on or off the
+            // raster.
+            return Ok(());
+        };
+        self.projective_draws += 1;
+        if !is_destructive(node.blend) {
+            self.emit_projected(&placement, node.opacity, node.blend);
+            return Ok(());
+        }
+        let clip = node
+            .clip
+            .as_ref()
+            .expect("a planned projective layer has a clip");
+        let viewport =
+            Rect::new(0.0, 0.0, f64::from(self.width), f64::from(self.height)).inflate(1.0, 1.0);
+        let Some((outline, rule)) = cherenkov::lowering::projective::project_clip(
+            &placement.to_parent,
+            clip,
+            path::FLATTEN / placement.density,
+            viewport,
+        ) else {
+            // A clip without area bounds the operator to nothing.
+            return Ok(());
+        };
+        let saved = std::mem::replace(&mut self.transform, Affine::IDENTITY);
+        let result = self.with_path_clip(
+            outline.elements(),
+            rule,
+            |s, _| {
+                s.emit_projected(&placement, node.opacity, node.blend);
+                Ok(())
+            },
+            glyphs,
+        );
+        self.transform = saved;
+        result
+    }
+
+    /// The projective composite quad over `placement`'s region under the
+    /// current clip. A blended composite first opens a pass whose backdrop
+    /// copy of the region it reads, and writes its result verbatim.
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        reason = "regions fit the f32 raster space and stop counts fit u32"
+    )]
+    fn emit_projected(&mut self, placement: &Placement, opacity: f32, blend: cherenkov::BlendMode) {
+        let [x0, y0, x1, y1] = placement.bounds;
+        let code = blend_code(blend);
+        if code != 0 {
+            self.begin_pass(self.current_target(), None);
+            if let Some(open) = &mut self.frame.open {
+                open.backdrop_copy = Some([x0, y0, x1 - x0, y1 - y0]);
+            }
+        }
+        let mut inst = self.base(KIND_SPAN, affine(Affine::IDENTITY));
+        inst.bounds = [x0 as f32, y0 as f32, x1 as f32, y1 as f32];
+        inst.meta[1] = PAINT_PROJECTIVE;
+        inst.params[1] = opacity;
+        // The homography's evaluation origin and the backdrop's texel
+        // origin.
+        inst.grad[0] = x0 as f32;
+        inst.grad[1] = y0 as f32;
+        inst.meta[2] = self.frame.stops.len() as u32;
+        self.frame.stops.extend(placement.record());
+        inst.meta[3] |= code << 16;
+        self.set_pipeline(PipelineKind::Projective { replace: code != 0 });
+        self.set_source(Some(Source::Projected(placement.key)));
+        self.push_instance(&inst);
+        self.set_source(None);
+        self.set_pipeline(PipelineKind::SrcOver);
     }
 
     /// Content first, then children — the engine's layer ordering.
@@ -4591,6 +4878,7 @@ mod tests {
                     WorkingColor::BLACK,
                     &glyphs,
                     &FxHashMap::default(),
+                    FxHashMap::default(),
                     promoted,
                 )
                 .expect("lowered");

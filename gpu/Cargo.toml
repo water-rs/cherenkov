@@ -50,13 +50,28 @@ objc2-app-kit = { version = "0.3", default-features = false, features = ["std", 
 [target.'cfg(all(target_vendor = "apple", not(target_os = "macos")))'.dependencies]
 objc2-ui-kit = { version = "0.3", default-features = false, features = ["std", "objc2-quartz-core", "UIResponder", "UIView"] }
 
+# Vulkan external frames: dmabuf/AHardwareBuffer import, YCbCr conversion
+# and semaphore synchronisation below wgpu (#166).
+[target.'cfg(all(unix, not(target_vendor = "apple")))'.dependencies]
+ash = "0.38"
+libc = "0.2"
+
+[target.'cfg(target_os = "android")'.dependencies]
+ndk = { version = "0.9", default-features = false, features = ["api-level-30"] }
+ndk-sys = "0.6"
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 futures-channel = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 gloo-timers = { version = "0.3", features = ["futures"] }
+wasm-bindgen = "0.2"
+js-sys = "0.3"
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = "0.3"
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+half = "2"
 
 [build-dependencies]
 # The WGSL engine shaders are compiled once at build time (issue #57), at
@@ -71,6 +86,11 @@ objc2-core-graphics = { version = "0.3", default-features = false, features = ["
 objc2-quartz-core = { version = "0.3", default-features = false, features = ["std", "objc2-core-video", "CARenderer"] }
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFRunLoop", "CFDate"] }
 objc2-av-foundation = { version = "0.3", default-features = false, features = ["std", "objc2-core-video"] }
+
+[target.'cfg(all(unix, not(target_vendor = "apple")))'.dev-dependencies]
+# Raw Vulkan access for external-frame import tests on lavapipe (#166).
+ash = "0.38"
+libc = "0.2"
 
 [dev-dependencies]
 cherenkov-oracle = { path = "../oracle" }

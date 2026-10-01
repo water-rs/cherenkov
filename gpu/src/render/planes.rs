@@ -187,13 +187,15 @@ impl Plan {
 }
 
 /// Whether a layer composites its subtree through an offscreen: the rule the
-/// lowering applies (`Lowering::layer`). The root renders into the surface
-/// target and never isolates for blended children.
+/// lowering applies (`Lowering::layer`). A projective layer's subtree renders
+/// into its local image — the same offscreen isolation — and the root renders
+/// into the surface target and never isolates for blended children.
 fn isolates(tree: &SurfaceTree, id: LayerId) -> bool {
     let node = tree.layer(id);
     node.filter.is_some()
         || node.opacity < 1.0
         || node.blend != BlendMode::Normal
+        || tree.projective_pose(id).is_some()
         || (id != tree.root() && node.blends_within())
 }
 
@@ -309,7 +311,10 @@ fn judge<C: Compositor>(
         .chain([visit.id])
     {
         let level = tree.layer(id);
-        if !C::expresses_transform(level.transform) {
+        // A projective level's placement is its pose, not `transform` —
+        // a plane's affine levels cannot carry it. An isolating ancestor
+        // was already named `Isolated`, so this can only be the candidate.
+        if tree.projective_pose(id).is_some() || !C::expresses_transform(level.transform) {
             return Err(Ineligible::Transform(id));
         }
         let own = space * level.transform;
@@ -469,6 +474,10 @@ pub trait SystemPlanes: Compositor {
 
     /// The surface was resized to `size` device pixels.
     fn resize(&mut self, size: (u32, u32));
+
+    /// A display move or a scale change re-runs every part's output
+    /// negotiation — each part's [`WindowSurface::reselect`].
+    fn reselect(&mut self, adapter: &wgpu::Adapter, device: &wgpu::Device);
 }
 
 #[cfg(target_vendor = "apple")]
@@ -507,6 +516,9 @@ impl SystemPlanes for NoPlanes {
         unreachable!("no `NoPlanes` value exists")
     }
     fn resize(&mut self, _: (u32, u32)) {
+        unreachable!("no `NoPlanes` value exists")
+    }
+    fn reselect(&mut self, _: &wgpu::Adapter, _: &wgpu::Device) {
         unreachable!("no `NoPlanes` value exists")
     }
 }

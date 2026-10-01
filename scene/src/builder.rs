@@ -159,6 +159,12 @@ impl LayerBuilder<'_> {
         self
     }
 
+    /// Make the layer projective (see [`crate::Projection`]).
+    pub fn projection(&mut self, projection: crate::Projection) -> &mut Self {
+        self.layer.projection = Some(Box::new(projection));
+        self
+    }
+
     /// Adds a per-frame live item (see [`Layer::live`]).
     pub fn live(&mut self, live: crate::Live) -> &mut Self {
         self.layer.live.push(live);

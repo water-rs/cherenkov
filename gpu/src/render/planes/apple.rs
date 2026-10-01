@@ -204,6 +204,12 @@ pub struct LayerPlanes {
     _window: Box<dyn wgpu::WindowHandle>,
     root: Retained<CALayer>,
     transparent: bool,
+    /// The swapchain's required colour space (#98): every part negotiates
+    /// under it.
+    required: Option<wgpu::SurfaceColorSpace>,
+    /// The host's display-probe channel: the first part's swapchain
+    /// delivers it; every part is on the same window's display.
+    probe: Option<std::sync::mpsc::Sender<crate::render::present::DisplayProbe>>,
     size: (u32, u32),
     scale: f64,
     parts: Vec<PartLayer>,
@@ -567,6 +573,10 @@ impl LayerPlanes {
     /// # Errors
     /// [`SurfaceError::UnsupportedTarget`] when the adapter cannot present
     /// to a metal layer.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the window's full negotiation input: device triple, parent,                   size, transparency, required space and the probe channel"
+    )]
     pub fn new(
         instance: &wgpu::Instance,
         adapter: &wgpu::Adapter,
@@ -574,6 +584,8 @@ impl LayerPlanes {
         parent: Parent,
         size: (u32, u32),
         transparent: bool,
+        required: Option<wgpu::SurfaceColorSpace>,
+        probe: Option<std::sync::mpsc::Sender<crate::render::present::DisplayProbe>>,
     ) -> Result<Self, SurfaceError> {
         let _tx = Transaction::begin();
         let Parent {
@@ -596,6 +608,8 @@ impl LayerPlanes {
             _window: window,
             root,
             transparent,
+            required,
+            probe,
             size,
             scale,
             parts: Vec::new(),
@@ -644,6 +658,8 @@ impl LayerPlanes {
             &layer,
             self.size,
             transparent,
+            self.required,
+            self.probe.take(),
         )?;
         self.parts.push(PartLayer { layer, surface });
         self.restack = true;
@@ -942,6 +958,13 @@ impl SystemPlanes for LayerPlanes {
         let _tx = Transaction::begin();
         for part in &mut self.parts {
             part.surface.resize(&self.device, size);
+        }
+    }
+
+    fn reselect(&mut self, adapter: &wgpu::Adapter, device: &wgpu::Device) {
+        let _tx = Transaction::begin();
+        for part in &mut self.parts {
+            part.surface.reselect(adapter, device);
         }
     }
 }

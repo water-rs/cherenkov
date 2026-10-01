@@ -227,6 +227,9 @@ def build():
     cmap[0xE600] = "cross"
 
     fb = FontBuilder(UPEM, isTTF=True)
+    # Pin the head timestamps so the output is reproducible byte-for-byte.
+    fb.font["head"].created = 3873408498
+    fb.font["head"].modified = 3873408498
     fb.setupGlyphOrder(order)
     fb.setupCharacterMap(cmap)
     fb.setupGlyf(glyphs)

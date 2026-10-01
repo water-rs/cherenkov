@@ -115,7 +115,8 @@ pub trait Renderer: 'static {
   ```rust
   pub struct Frame<'a> { pub id: FrameId, pub time: FrameTime, pub surfaces: &'a [SurfaceFrame<'a>] }
   pub struct SurfaceFrame<'a> { pub id: SurfaceId, pub size: (u32, u32), pub display: Display,
-                                pub clear: WorkingColor, pub changed: bool, pub tree: &'a SurfaceTree }
+                                pub clear: WorkingColor, pub changed: bool, pub present_pending: bool,
+                                pub display_moved: bool, pub tree: &'a SurfaceTree }
   impl SurfaceTree { pub fn root(&self) -> LayerId; pub fn layer(&self, id: LayerId) -> &LayerNode; }
   pub struct LayerNode { /* sampled for this frame: */ pub transform: Affine, pub opacity: f32,
                          pub scroll_offset: Vec2, pub clip: Option<ShapeData>, pub blend: BlendMode,
@@ -152,6 +153,7 @@ pub trait Renderer: 'static {
       fn add_filtered_backdrop_group(r: &mut Self::Renderer, surface: SurfaceId, id: BackdropId, filter: F);
   }
   pub trait HdrOutput: Backend {}
+  pub trait ProjectiveLayers: Backend {}      // `projection`, `tilt`, `depth` (docs/projective.md)
   pub trait Planes: Backend {}
   ```
 
@@ -234,7 +236,8 @@ let panel = engine.surface(Bands::new(size, OffscreenFormat::LinearF16, |band| d
   - **Parts.** A promoted layer splits the engine's composition: layers painted before it draw into the part below, layers painted after it — its own children included — into a transparent part above, so controls stay above the video. Each part is a full-surface texture presented through its own system layer.
   - **Apple.** A `WindowTarget` captures the view's backing layer on the main thread (`WindowTarget::new` panics elsewhere on Apple). The engine owns a layer tree under it: one `CAMetalLayer` per part (`presentsWithTransaction`), and per plane one nested layer per tree level (transform, clip as `masksToBounds` with `cornerRadius`/`maskedCorners`/`cornerCurve`, scroll as the bounds origin) around an `AVSampleBufferDisplayLayer` fed a `CVPixelBuffer` over the frame's own `IOSurface`, with the frame's primaries, transfer, matrix and chroma siting as attachments. Every frame's geometry and part presentation commits in one `CATransaction`; frames are handed to their display layers after it commits, each enqueue in its own transaction. A producer sync (`FrameSync::Metal`) hands the frame over from an `MTLSharedEvent` listener, never a CPU wait. A display layer fed off the main thread fits its video into its bounds only in a main-thread layout, so a plane whose frame size changes, its first frame included, queues that layout on the main queue after the hand-off commits; until the main run loop turns once, the new frame shows at the previous fit. The budget is two planes. A surface with planes is composited by the system and is not readable.
 - **Many small surfaces are first-class.** A native backend embeds one surface per self-drawn component, and a list may hold dozens. All surfaces share the engine's pipelines, atlases and caches. Creating and dropping one is cheap. All dirty surfaces render in one submission per frame.
-- **Display properties.** Headroom and scale belong to the display, so the host sets them when they change: `surface.display(Display { headroom, scale })`. Presentation reads `headroom` every frame — a headroom change takes effect on the next frame and never re-lowers or re-records content.
+- **Display properties.** Headroom and scale belong to the display, so the host sets them when they change: `surface.display(Display { headroom, scale })`. Presentation reads `headroom` every frame — a headroom change takes effect on the next frame and never re-lowers or re-records content. A move to another display is announced separately as `surface.display_moved()` — a move between numerically identical displays is invisible in `Display`'s values — and it rides the next frame as `SurfaceFrame::display_moved` so a presenting backend re-enumerates the surface's capabilities where a headroom-only update never does (#98).
+- **Window output is negotiated, never defaulted.** A window surface selects its swapchain format and colour space from the surface's advertised format/colour-space pairs through wgpu 30's surface colour-space API — an extended-range pair where offered, a wide-gamut SDR pair, else tone-mapped sRGB — and reports the choice and its reason in `OutputSelection`; a silent sRGB fallback does not exist (#98). `WindowTarget::require_color_space` pins a required `wgpu::SurfaceColorSpace`: a surface that cannot advertise it fails creation with `UnsupportedTarget` rather than substituting. `WindowTarget::output_probe` hands the host a `DisplayProbe` — sampled on the main thread on Apple — whose `tone_map_headroom` feeds `Display::headroom` for live EDR and whose `selection()` answers what a hypothetical move would negotiate. The current negotiation is readable at `WindowSurface::selection`.
 
 ## Frame driving
 
@@ -296,7 +299,7 @@ surface.update_animated(Spring::smooth(), |tx| {
 
 - **Sampling.** A track holds the start value, the target, the animation and the time it started. `Spring` is the closed-form damped oscillator per lane (`Affine` has six lanes, `Vec2` two, `f32` one), from the start value with the start velocity; it settles when every lane is within `1e-3` of the target and slower than `1e-3` per second. `Curve` is `start + (target − start) · y(x⁻¹(t / duration))`, clamped to the endpoints. A layer track's sampling never touches recorded content: the backend draws the same fragments under a new `transform`, `opacity` or `scroll_offset`. An operand track lives in the content's `LiveState`, samples its operand's lanes the same way at frame time, and emits the frame's value as a slot update, so only the commands referencing the animated operand re-lower.
 - **Retargeting.** A new value for a property with a running track starts a new track from the value *and velocity* the old track had at the last sampled frame, so a spring retargeted mid-flight is continuous in position and velocity, and a curve restarts from its current value. A change without an animation snaps and drops the track.
-- **Animatable properties** are `transform`, `opacity` and `scroll_offset`. `.animation(...)` on any other property, or `Decay` on anything but `scroll_offset`, is an invariant violation and panics.
+- **Animatable properties** are `transform`, `opacity`, `scroll_offset`, the #77 components, and the projective `tilt` and `depth`. `.animation(...)` on any other property, or `Decay` on anything but `scroll_offset`, is an invariant violation and panics.
 - **Out-of-process handoff.** On promoted layers, `transform` and `opacity` animations are handed to Core Animation (Apple) or DirectComposition (Windows) whenever the curve maps exactly: springs map to `CASpringAnimation`, and Bézier curves map to `CAMediaTimingFunction`. Everything else, and everything on Android, is engine-driven.
 
 ## Scrolling
@@ -530,6 +533,48 @@ tx[&sparks].content(GpuContentHandle::new(Particles::new()));
 - **Custom GPU content composites like any other layer:** it can be clipped, filtered, animated and used as a backdrop source.
 - **The map records `Content`, not `GpuContent`.** Each tile is a frozen `Picture` and the camera is the layer transform, so pinch-zoom and fling run in the engine. Tessellation is refreshed at the new zoom level once the gesture settles.
 
+### Importing a foreign texture
+
+Each backend wraps a foreign texture once, in place, into a `wgpu::Texture`
+ready for `ExternalFrame::rgb` (or a YUV role it accepts): no pixel upload,
+no copy, no conversion texture.
+
+```rust
+// Metal (apple): an MTLTexture — typically IOSurface- or CVPixelBuffer-
+// backed — wraps through wgpu-hal; the caller keeps ownership and lifetime.
+let plane = unsafe {
+    interop::metal::import_texture(&device, mtl_texture, format)
+};
+
+// WebGPU (wasm32): a foreign GPUTexture wraps through
+// Device::create_texture_from_webgpu_handle after a reflected contract
+// check and a submission probe.
+let plane = interop::web::import_texture(&device, &queue, interop::web::WebTexture {
+    texture: gpu_texture,   // the producer's GPUTexture handle
+    device: gpu_device,     // the GPUDevice that created it (identity token)
+    release: interop::web::WebTextureLease::new(move || pool.retire(id)),
+}).await?;
+```
+
+- **`interop::metal::import_texture` is `unsafe`.** The `MTLTexture` must be
+  live on the same `MTLDevice` the engine wraps (or its peer group), `format`
+  must be byte-compatible with its pixel format, and the texture must stay
+  alive and unwritten — except by the producer — for as long as a frame
+  referencing it can be in flight.
+- **`interop::web::import_texture` validates the provider contract** by
+  reflection — an actual `GPUTexture` (a `GPUExternalTexture` is
+  `InvalidWebTexture::NotATexture`), the owning-device token
+  (`DeviceMismatch`), `rgba8unorm`/`bgra8unorm`/`rgba16float`, single-sample
+  2D, one mip, `TEXTURE_BINDING` (`Contract(InvalidFrame)`) — and by a
+  submission probe that catches destroyed or cross-device textures
+  (`Unusable`). The lease's release hook runs exactly once: at rejection,
+  or when the wrapper's last clone is dropped — slot replacement, detach,
+  surface or engine teardown.
+- **A transient handle cannot be detected.** A context's current canvas
+  texture satisfies every check but is recycled by the browser; it is
+  excluded by the provider contract — immutable contents and guaranteed
+  lifetime through retained and in-flight use — and must not be offered.
+
 ## Damage (invisible)
 
 - **Damage is computed from the change set,** at three levels:
@@ -689,6 +734,43 @@ matrix operand: components can bind directly to signals without a host tree
 walk or re-encoding. Backend lowering sees only the sampled affine matrix.
 Layers using only the existing matrix allocate no component storage.
 
+### Projective layers (#84)
+
+`Projective` is a checked 4×4 `f64` homogeneous transform on column
+vectors, with positive Z toward the viewer. On backends with the
+`ProjectiveLayers` capability (`Gpu`, `Raster`), `LayerEdit` gains four
+methods:
+
+- `projection(Live<Projective>)`: the base matrix; never animated;
+- `tilt(Live<Vec2>)`: X/Y rotation in radians;
+- `depth(Live<f64>)`: Z translation;
+- `clear_projection()`.
+
+The complete pose composes #77's order around them:
+
+```text
+transform · T(translation + pivot) · projection · T(0, 0, depth)
+  · Rz(rotation) · Ry(tilt.y) · Rx(tilt.x) · skew · scale · T(−pivot)
+```
+
+Tilt and depth are component tracks with unwrapped angles and
+velocity-preserving retargeting. The raw matrix is replaced, never
+interpolated. A projective layer is a flattening boundary. Its subtree
+renders into a clip-bounded, layer-local RGBA16F image at a conservative
+power-of-two density, with a full area-average mip chain. The image is
+projected with a bounded 16-tap anisotropic trilinear filter when the
+layer composes into its parent, where opacity and blend apply once.
+Clipping happens in homogeneous coordinates against `W > 0` and the
+viewport, before division.
+
+Local images are retained without the outer pose, so a matrix-only frame
+realizes nothing. Invalid poses are `RenderError::ProjectivePose`, and
+images beyond the dimension or byte limits are
+`RenderError::ProjectiveUnsupported`. An unclipped layer, a projective
+backdrop member, or a backdrop group spanning composition spaces is
+`RenderError::Unsupported`. The full contract is
+[`docs/projective.md`](projective.md).
+
 ### Mesh colour interpolation (#79)
 
 `MeshGradient::interpolation(MeshColorInterpolation)` selects `Linear` (the
@@ -725,3 +807,70 @@ changing a live shadow patches its command, while unrelated commands are reused.
 Existing analytic rounded-box shadows keep their established arithmetic. General
 captures include a six-sigma halo and are bounded by backend address/texture limits;
 an unrepresentable capture is an error, never an alternate rendering path.
+
+### Vulkan external frames (#166)
+
+`interop::vulkan` imports producer frames — a dmabuf or an Android
+`AHardwareBuffer` — as NV12/P010 plane pairs or single RGB planes on the
+engine's shared `VkDevice` and queue, zero-copy, synchronised on the GPU.
+
+- **`Device::new(&SharedDevice)`** opens the native context for the engine's
+  device and reports `Caps` — the capability record every fd, modifier,
+  conversion and foreign-family claim is checked against. Missing
+  capabilities are `NativeError::Unsupported`, never an emulation.
+- **`Device::import(FrameSource)`** takes a `DmaBuf`/`Ahb` descriptor with
+  `Wait` and `ReleaseSync` contracts and returns a `Frame`.
+- **`Wait::{OpaqueFd, SyncFd, Timeline}`** names the producer fence. fd
+  payloads are consumed into a binary semaphore at first use: the engine
+  takes ownership of the fd (`vkImportSemaphoreFdKHR` takes it on success
+  for every handle type), and the consumer waits on the GPU. A timeline
+  payload carries the host's semaphore and wait point unchanged.
+- **`ReleaseSync::{FenceFd, Timeline}`** names what the engine signals when
+  the last retained owner retires. `FenceFd` exports a `SYNC_FD` once the
+  release submission is accepted — `Frame::release_fd` hands the fence to
+  the producer; before that it is `Unready`, after the frame is already
+  taken it is `Invalid`.
+- **`Frame::{size, repr, imported_bytes, lease, unlease, release_fd}`** is
+  the #165 retained-frame contract unchanged: the engine holds the frame
+  while any layer attachment references it.
+
+Wrap-time state (recorded for #2): `create_texture_from_hal` describes the
+wrapped image as `TextureUses::RESOURCE`, which maps to
+`SHADER_READ_ONLY_OPTIMAL`, while the driver's actual layout at wrap time is
+the producer's (`UNDEFINED`/`GENERAL`). No `TextureUses` combination maps to
+`GENERAL` without also adding storage or copy usage the image does not have,
+so naming the layout honestly would lie about the usage instead. The
+natively recorded acquire barrier lands the real `SHADER_READ_ONLY_OPTIMAL`
+transition before the first wgpu use in the same submission, so the tracked
+state is never observed wrong — the discrepancy is documented rather than
+hidden behind invented usage bits.
+
+`Caps::queue_family_foreign` is true on Android even when
+`VK_EXT_queue_family_foreign` is not enabled: `VK_QUEUE_FAMILY_FOREIGN_EXT`
+is defined by the platform's `AHardwareBuffer` contract itself and is usable
+there without the extension. Elsewhere it reports the enabled extension.
+
+Public surface kept for the standalone Android device-test binary (recorded
+here per the review on L4): `Native` and `Native::new`, `Native::staged`,
+`stage_acquire`/`cancel_staged`, `Generation` with `state()`/`lease_count()`,
+`State`, `PendingAcquire`/`PendingWait`, and `Frame::generation`. Everything
+else on the encode path — `Release`, `Lease`, `Views`, `submit_waits`,
+`mark_submitted`, `drain_releases`, `create_pool`, the framebuffer/set
+caches and `KIND_*` — is `pub(crate)`; the lavapipe suite moved into the
+crate for that reason.
+
+Threading decisions (recorded for #2, L5/L6):
+
+- The renderer itself still takes no locks. The mutexes on `Shared`,
+  `Generation` and `Native` cover producer/host-thread import racing the
+  render thread, staged acquire/replace on one engine, and the
+  `submit_lock` that serializes a staged queue wait into exactly one
+  `vkQueueSubmit`. `unsafe impl Send/Sync` on `Native` covers lease
+  pointers that travel only to the submission-completion callback, never
+  to another worker.
+- Two engines sharing one `SharedDevice` can interleave staged waits —
+  `submit_lock` is per renderer, which is the documented shape of the
+  retained-frame model (one engine per `SharedDevice`).
+- `Ahb` is `!Send` (a raw `AHardwareBuffer` pointer): an
+  `FrameSource::Ahb` descriptor is created and imported on the producer or
+  host thread, while the resulting `Frame` stays `Send`.

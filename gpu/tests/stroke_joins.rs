@@ -4,6 +4,7 @@
 //! continuous-rect stroke draws.
 
 use cherenkov::kurbo::{Line, Rect, Shape as _};
+use cherenkov::{__engine_fn as split_fn, __engine_test as split_test, __engine_wait as wait};
 use cherenkov::{ContinuousRect, Draw, WorkingColor};
 use cherenkov::{Engine, EngineError, Offscreen, OffscreenFormat};
 use cherenkov_gpu::{Gpu, GpuConfig};
@@ -13,15 +14,16 @@ const RED: WorkingColor = WorkingColor::new([1.0, 0.0, 0.0, 1.0]);
 
 const RECT: Rect = Rect::new(16.0, 16.0, 48.0, 48.0);
 
+split_fn! {
 fn render(
     draw: impl FnOnce(&mut cherenkov::Recorder),
 ) -> Result<Option<cherenkov::Readback>, Box<dyn std::error::Error>> {
-    let engine = match Engine::<Gpu>::new(GpuConfig::default()) {
+    let engine = match wait!(Engine::<Gpu>::new(GpuConfig::default())) {
         Ok(engine) => engine,
         Err(EngineError::Backend(_)) => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-    let surface = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
+    let surface = wait!(engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16)))?;
     surface.clear_color(CLEAR);
     let layer = surface.layer();
     surface.update(|tx| {
@@ -30,8 +32,9 @@ fn render(
     surface.update(|tx| {
         tx[&layer].content(surface.record(draw));
     });
-    engine.render(cherenkov::FrameTime::now())?;
-    Ok(Some(surface.readback()?))
+    wait!(engine.render(cherenkov::FrameTime::now()))?;
+    Ok(Some(wait!(surface.readback())?))
+}
 }
 
 fn px(readback: &cherenkov::Readback, x: u32, y: u32) -> [f32; 4] {
@@ -50,14 +53,14 @@ const fn style(join: kurbo::Join, miter_limit: f64) -> kurbo::Stroke {
         .with_miter_limit(miter_limit)
 }
 
-#[test]
+split_test! {
 fn a_bevel_rect_stroke_matches_its_path_form() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(analytic) = render(stroke(style(kurbo::Join::Bevel, 4.0)))? else {
+    let Some(analytic) = wait!(render(stroke(style(kurbo::Join::Bevel, 4.0))))? else {
         return Ok(());
     };
-    let Some(path_form) = render(|c| {
+    let Some(path_form) = wait!(render(|c| {
         c.stroke(RECT.to_path(0.1), style(kurbo::Join::Bevel, 4.0), RED);
-    })?
+    }))?
     else {
         return Ok(());
     };
@@ -67,13 +70,14 @@ fn a_bevel_rect_stroke_matches_its_path_form() -> Result<(), Box<dyn std::error:
     );
     Ok(())
 }
+}
 
-#[test]
+split_test! {
 fn a_miter_limit_below_root_two_bevels() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(mitered) = render(stroke(style(kurbo::Join::Miter, 1.0)))? else {
+    let Some(mitered) = wait!(render(stroke(style(kurbo::Join::Miter, 1.0))))? else {
         return Ok(());
     };
-    let Some(bevelled) = render(stroke(style(kurbo::Join::Bevel, 4.0)))? else {
+    let Some(bevelled) = wait!(render(stroke(style(kurbo::Join::Bevel, 4.0))))? else {
         return Ok(());
     };
     assert_eq!(
@@ -82,14 +86,15 @@ fn a_miter_limit_below_root_two_bevels() -> Result<(), Box<dyn std::error::Error
     );
     Ok(())
 }
+}
 
-#[test]
+split_test! {
 fn a_miter_limit_at_root_two_stays_analytic() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(at_limit) = render(stroke(style(kurbo::Join::Miter, std::f64::consts::SQRT_2)))?
+    let Some(at_limit) = wait!(render(stroke(style(kurbo::Join::Miter, std::f64::consts::SQRT_2))))?
     else {
         return Ok(());
     };
-    let Some(high_limit) = render(stroke(style(kurbo::Join::Miter, 4.0)))? else {
+    let Some(high_limit) = wait!(render(stroke(style(kurbo::Join::Miter, 4.0))))? else {
         return Ok(());
     };
     assert_eq!(
@@ -99,22 +104,23 @@ fn a_miter_limit_at_root_two_stays_analytic() -> Result<(), Box<dyn std::error::
     // Inside the outer sharp corner the miter is drawn; a bevel cuts it.
     let [r, ..] = px(&at_limit, 13, 13);
     assert!(r > 0.5, "miter corner: {r}");
-    let Some(bevelled) = render(stroke(style(kurbo::Join::Bevel, 4.0)))? else {
+    let Some(bevelled) = wait!(render(stroke(style(kurbo::Join::Bevel, 4.0))))? else {
         return Ok(());
     };
     let [r, ..] = px(&bevelled, 13, 13);
     assert!(r < 0.05, "bevel corner: {r}");
     Ok(())
 }
+}
 
-#[test]
+split_test! {
 fn a_line_with_unequal_caps_renders() -> Result<(), Box<dyn std::error::Error>> {
     let style = kurbo::Stroke::new(8.0)
         .with_start_cap(kurbo::Cap::Butt)
         .with_end_cap(kurbo::Cap::Square);
-    let Some(readback) = render(|c| {
+    let Some(readback) = wait!(render(|c| {
         c.stroke(Line::new((16.0, 32.0), (48.0, 32.0)), style, RED);
-    })?
+    }))?
     else {
         return Ok(());
     };
@@ -126,17 +132,19 @@ fn a_line_with_unequal_caps_renders() -> Result<(), Box<dyn std::error::Error>> 
     assert!(r < 0.05, "butt end: {r}");
     Ok(())
 }
+}
 
-#[test]
+split_test! {
 fn a_bevel_continuous_rect_stroke_renders() -> Result<(), Box<dyn std::error::Error>> {
     let continuous = ContinuousRect::new(RECT, 0.0).with_smoothing(0.6);
-    let Some(readback) = render(move |c| {
+    let Some(readback) = wait!(render(move |c| {
         c.stroke(continuous, style(kurbo::Join::Bevel, 4.0), RED);
-    })?
+    }))?
     else {
         return Ok(());
     };
     let [r, ..] = px(&readback, 32, 16);
     assert!(r > 0.5, "edge midpoint: {r}");
     Ok(())
+}
 }

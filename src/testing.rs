@@ -12,7 +12,7 @@ use rustc_hash::FxHashMap;
 
 use kurbo::{Affine, Vec2};
 
-use crate::backend::{Backend, Frame, Redraw, Renderer, SurfaceInfo};
+use crate::backend::{Backend, Display, Frame, Redraw, Renderer, SurfaceInfo};
 use crate::capability::{ShaderPaint, ShaderSource};
 use crate::config::MemoryUsage;
 use crate::error::{EngineError, RenderError, ResourceError, SurfaceError};
@@ -63,6 +63,15 @@ pub struct FrameRecord {
     pub surface: SurfaceId,
     /// The frame's `changed` flag for this surface.
     pub changed: bool,
+    /// The frame's `present_pending` flag for this surface: a display
+    /// change re-presents without touching content (#98).
+    pub present_pending: bool,
+    /// The frame's `display_moved` flag for this surface: the host's
+    /// display-move announcement, which re-enumerates output
+    /// negotiation (#98).
+    pub display_moved: bool,
+    /// The display state the frame presented with.
+    pub display: Display,
     /// Every layer's sampled state.
     pub layers: Vec<LayerSample>,
 }
@@ -80,6 +89,27 @@ pub struct LayerSample {
     pub scroll_offset: Vec2,
     /// The layer's children, in paint order.
     pub children: Vec<LayerId>,
+}
+
+/// A surface target for the [`Null`] backend.
+///
+/// An [`Offscreen`] buffer or a window-like presenting target, so
+/// presentation semantics — a `Display` update marking `present_pending`
+/// — are testable without a real window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NullTarget {
+    /// An offscreen buffer; `Display` updates never mark presentation.
+    Offscreen(Offscreen),
+    /// A window-like target: it reports presenting, so `Display` updates
+    /// mark `SurfaceFrame::present_pending` exactly as a real swapchain
+    /// target does.
+    Window(Offscreen),
+}
+
+impl From<Offscreen> for NullTarget {
+    fn from(target: Offscreen) -> Self {
+        Self::Offscreen(target)
+    }
 }
 
 /// A backend that draws nothing and reports every call. The `Config`
@@ -161,7 +191,7 @@ impl NullRenderer {
 impl Backend for Null {
     type Config = NullConfig;
     type Info = NullInfo;
-    type Target = Offscreen;
+    type Target = NullTarget;
     type Renderer = NullRenderer;
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -178,14 +208,18 @@ impl Backend for Null {
 }
 
 impl Renderer for NullRenderer {
-    type Target = Offscreen;
+    type Target = NullTarget;
     type Font = FontData;
 
     fn create_surface(
         &mut self,
         id: SurfaceId,
-        target: Offscreen,
+        target: NullTarget,
     ) -> Result<SurfaceInfo, SurfaceError> {
+        let (target, presents) = match &target {
+            NullTarget::Offscreen(target) => (target, false),
+            NullTarget::Window(target) => (target, true),
+        };
         if target.size.0 == 0 || target.size.1 == 0 {
             return Err(SurfaceError::ZeroSize);
         }
@@ -198,6 +232,7 @@ impl Renderer for NullRenderer {
             max_dimension: u32::MAX,
             size: target.size,
             readable: true,
+            presents,
         })
     }
 
@@ -323,6 +358,9 @@ impl Renderer for NullRenderer {
             let _ = self.events.send(Event::Frame(FrameRecord {
                 surface: surface.id,
                 changed: surface.changed,
+                present_pending: surface.present_pending,
+                display_moved: surface.display_moved,
+                display: surface.display,
                 layers,
             }));
         }
@@ -351,6 +389,9 @@ impl Renderer for NullRenderer {
             let _ = self.events.send(Event::Frame(FrameRecord {
                 surface: surface.id,
                 changed: surface.changed,
+                present_pending: surface.present_pending,
+                display_moved: surface.display_moved,
+                display: surface.display,
                 layers,
             }));
         }
@@ -435,6 +476,85 @@ impl ShaderPaint for Null {
 impl Uploads<Rgba8> for Null {}
 impl Uploads<Rgba16F> for Null {}
 
+/// Evaluates the expression directly on native targets and `.await`s it
+/// on wasm32 — `Engine` calls are synchronous on one and futures on the
+/// other, the same `cfg(target_arch = "wasm32")` split the library
+/// itself makes. Exported so `behaviour_suite!` expansions and shared
+/// backend test files write each call site once.
+#[cfg(feature = "testing")]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __engine_wait {
+    ($e:expr) => {{
+        #[cfg(target_arch = "wasm32")]
+        let v = $e.await;
+        #[cfg(not(target_arch = "wasm32"))]
+        let v = $e;
+        v
+    }};
+}
+
+/// As [`__engine_wait`], but for futures that are async on every target
+/// (raw `wgpu` adapter/device requests): `pollster::block_on` on native
+/// targets, `.await` on wasm32.
+#[cfg(feature = "testing")]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __engine_block {
+    ($e:expr) => {{
+        #[cfg(target_arch = "wasm32")]
+        let v = $e.await;
+        #[cfg(not(target_arch = "wasm32"))]
+        let v = ::pollster::block_on($e);
+        v
+    }};
+}
+
+/// Declares the function synchronous on native targets and `async` on
+/// wasm32, for test helpers that make `Engine` calls; call sites read
+/// `$crate::__engine_wait!(name(..))`.
+#[cfg(feature = "testing")]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __engine_fn {
+    ($(#[$m:meta])* $vis:vis fn $name:ident $($rest:tt)*) => {
+        $(#[$m])*
+        #[cfg(not(target_arch = "wasm32"))]
+        $vis fn $name $($rest)*
+
+        $(#[$m])*
+        #[cfg(target_arch = "wasm32")]
+        #[allow(
+            clippy::future_not_send,
+            reason = "the macro emits both Send and non-Send futures, and the wasm32 harness runs on the single-threaded page event loop"
+        )]
+        $vis async fn $name $($rest)*
+    };
+}
+
+/// As `__engine_fn`, but marks the function a test: `#[test]` on
+/// native targets and `#[wasm_bindgen_test]` on wasm32.
+#[cfg(feature = "testing")]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __engine_test {
+    ($(#[$m:meta])* fn $name:ident $($rest:tt)*) => {
+        $(#[$m])*
+        #[cfg(not(target_arch = "wasm32"))]
+        #[test]
+        fn $name $($rest)*
+
+        $(#[$m])*
+        #[cfg(target_arch = "wasm32")]
+        #[allow(
+            clippy::future_not_send,
+            reason = "the macro emits both Send and non-Send futures, and the wasm32 harness runs on the single-threaded page event loop"
+        )]
+        #[::wasm_bindgen_test::wasm_bindgen_test]
+        async fn $name $($rest)*
+    };
+}
+
 /// Expands to one cross-backend behaviour suite.
 ///
 /// The suite emits `#[test]` functions exercising the shared front end end
@@ -472,39 +592,42 @@ use $crate::Instant;
             /// The backend under test.
             type B = $backend;
             const TICK: Duration = Duration::from_nanos(1_000_000_000 / 120);
-            fn engine() -> Option<Engine<B>> {
-                Engine::<B>::new($config()).ok()
+            $crate::__engine_fn! {
+fn engine() -> Option<Engine<B>> {
+                $crate::__engine_wait!(Engine::<B>::new($config())).ok()
+            }
             }
 
             /// The last `Image` clone's drop queues `remove_image`, which
             /// the backend frees on the next render.
-            #[test]
-            fn the_last_image_drop_frees_its_memory() {
-                let Some(engine) = engine() else { return };
-                let _surface = engine
-                    .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))
+            $crate::__engine_test! {
+fn the_last_image_drop_frees_its_memory() {
+                let Some(engine) = $crate::__engine_wait!(engine()) else { return };
+                let _surface = $crate::__engine_wait!(engine
+                    .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16)))
                     .expect("surface");
                 // A first render settles one-off allocations so the
                 // baseline is stable.
-                engine.render(FrameTime::at(Instant::now())).expect("render");
-                let before = engine.memory().gpu.0 + engine.memory().cpu.0;
+                $crate::__engine_wait!(engine.render(FrameTime::at(Instant::now()))).expect("render");
+                let before = $crate::__engine_wait!(engine.memory()).gpu.0 + $crate::__engine_wait!(engine.memory()).cpu.0;
                 let data = vec![255u8; 64 * 64 * 4];
                 let image = engine
                     .image(ImageData::<Rgba8>::new(64, 64, data).expect("image data"))
                     .expect("image");
                 let clone = image.clone();
-                engine
-                    .render(FrameTime::at(Instant::now() + TICK))
+                $crate::__engine_wait!(engine
+                    .render(FrameTime::at(Instant::now() + TICK)))
                     .expect("render");
-                let with_image = engine.memory().gpu.0 + engine.memory().cpu.0;
+                let with_image = $crate::__engine_wait!(engine.memory()).gpu.0 + $crate::__engine_wait!(engine.memory()).cpu.0;
                 assert!(with_image > before, "memory {with_image} <= {before}");
                 drop(image);
                 drop(clone);
-                engine
-                    .render(FrameTime::at(Instant::now() + TICK * 2))
+                $crate::__engine_wait!(engine
+                    .render(FrameTime::at(Instant::now() + TICK * 2)))
                     .expect("render");
-                let after = engine.memory().gpu.0 + engine.memory().cpu.0;
+                let after = $crate::__engine_wait!(engine.memory()).gpu.0 + $crate::__engine_wait!(engine.memory()).cpu.0;
                 assert!(after < with_image, "memory {after} >= {with_image}");
+            }
             }
 
             /// A `width` × `height` image of one opaque texel.
@@ -523,12 +646,13 @@ use $crate::Instant;
             /// one and renders frame B without re-recording. Then drops
             /// the drawing layer and the last image handle: the replaced
             /// image is still removed and its memory freed.
-            fn replace_redraws_the_recorded_image(width: u32, height: u32) {
+            $crate::__engine_fn! {
+fn replace_redraws_the_recorded_image(width: u32, height: u32) {
                 const RED: [u8; 4] = [255, 0, 0, 255];
                 const BLUE: [u8; 4] = [0, 0, 255, 255];
-                let Some(engine) = engine() else { return };
-                let surface = engine
-                    .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))
+                let Some(engine) = $crate::__engine_wait!(engine()) else { return };
+                let surface = $crate::__engine_wait!(engine
+                    .surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16)))
                     .expect("surface");
                 let t0 = Instant::now();
                 let image = engine.image(solid(16, 16, RED)).expect("image");
@@ -540,34 +664,37 @@ use $crate::Instant;
                     tx[surface.root()].push(&layer);
                     tx[&layer].content(content);
                 });
-                engine.render(FrameTime::at(t0)).expect("render");
-                let a = centre(&surface.readback().expect("readback"));
+                $crate::__engine_wait!(engine.render(FrameTime::at(t0))).expect("render");
+                let a = centre(&$crate::__engine_wait!(surface.readback()).expect("readback"));
                 assert!(a[0] > 0.5 && a[2] < 0.1, "frame A {a:?} is not the red image");
 
                 image.replace(solid(width, height, BLUE)).expect("replace");
-                engine.render(FrameTime::at(t0 + TICK)).expect("render");
-                let b = centre(&surface.readback().expect("readback"));
+                $crate::__engine_wait!(engine.render(FrameTime::at(t0 + TICK))).expect("render");
+                let b = centre(&$crate::__engine_wait!(surface.readback()).expect("readback"));
                 assert!(b[2] > 0.5 && b[0] < 0.1, "frame B {b:?} is not the blue replacement");
 
                 drop(layer);
-                engine.render(FrameTime::at(t0 + TICK * 2)).expect("render");
-                let with_image = engine.memory().gpu.0 + engine.memory().cpu.0;
+                $crate::__engine_wait!(engine.render(FrameTime::at(t0 + TICK * 2))).expect("render");
+                let with_image = $crate::__engine_wait!(engine.memory()).gpu.0 + $crate::__engine_wait!(engine.memory()).cpu.0;
                 drop(image);
-                engine.render(FrameTime::at(t0 + TICK * 3)).expect("render");
-                let after = engine.memory().gpu.0 + engine.memory().cpu.0;
+                $crate::__engine_wait!(engine.render(FrameTime::at(t0 + TICK * 3))).expect("render");
+                let after = $crate::__engine_wait!(engine.memory()).gpu.0 + $crate::__engine_wait!(engine.memory()).cpu.0;
                 assert!(after < with_image, "memory {after} >= {with_image}");
+            }
             }
 
             /// A same-size replacement reuses the storage behind the id.
-            #[test]
-            fn a_same_size_replacement_redraws_the_recorded_image() {
-                replace_redraws_the_recorded_image(16, 16);
+            $crate::__engine_test! {
+fn a_same_size_replacement_redraws_the_recorded_image() {
+                $crate::__engine_wait!(replace_redraws_the_recorded_image(16, 16));
+            }
             }
 
             /// A resized replacement reallocates behind the same id.
-            #[test]
-            fn a_resized_replacement_redraws_the_recorded_image() {
-                replace_redraws_the_recorded_image(8, 32);
+            $crate::__engine_test! {
+fn a_resized_replacement_redraws_the_recorded_image() {
+                $crate::__engine_wait!(replace_redraws_the_recorded_image(8, 32));
+            }
             }
         }
     };
@@ -596,16 +723,20 @@ use $crate::Instant;
 
             /// A new engine, or `None` when the backend cannot init here
             /// (a GPU backend without an adapter skips its tests).
-            fn engine() -> Option<Engine<B>> {
-                Engine::<B>::new($config()).ok()
+            $crate::__engine_fn! {
+fn engine() -> Option<Engine<B>> {
+                $crate::__engine_wait!(Engine::<B>::new($config())).ok()
+            }
             }
 
             /// A 256×64 `Offscreen` surface — wide enough that a scrolled
             /// or translated square stays in view.
-            fn surface(engine: &Engine<B>) -> Surface<B> {
-                engine
-                    .surface(Offscreen::new((256, 64), OffscreenFormat::LinearF16))
+            $crate::__engine_fn! {
+fn surface(engine: &Engine<B>) -> Surface<B> {
+                $crate::__engine_wait!(engine
+                    .surface(Offscreen::new((256, 64), OffscreenFormat::LinearF16)))
                     .expect("surface")
+            }
             }
 
             /// A child layer of `parent` holding an opaque square at
@@ -652,39 +783,40 @@ use $crate::Instant;
             }
 
             /// Renders at `t` and returns the `Next`.
-            fn render_at(engine: &Engine<B>, t: Instant) -> Next {
-                engine.render(FrameTime::at(t)).expect("render")
+            $crate::__engine_fn! {
+fn render_at(engine: &Engine<B>, t: Instant) -> Next {
+                $crate::__engine_wait!(engine.render(FrameTime::at(t))).expect("render")
+            }
             }
 
             /// Renders frames at `t`, `t + TICK`, … until `Next::Idle`
             /// (cap 2000 frames) and returns the last sampled position.
-            fn settle(engine: &Engine<B>, surface: &Surface<B>, t0: Instant) -> (f64, f64) {
+            $crate::__engine_fn! {
+fn settle(engine: &Engine<B>, surface: &Surface<B>, t0: Instant) -> (f64, f64) {
                 let mut t = t0;
                 for _ in 0..2000 {
-                    if render_at(engine, t) == Next::Idle {
+                    if $crate::__engine_wait!(render_at(engine, t)) == Next::Idle {
                         break;
                     }
                     t += TICK;
                 }
-                square_center(&surface.readback().expect("readback")).expect("a drawn square")
+                square_center(&$crate::__engine_wait!(surface.readback()).expect("readback")).expect("a drawn square")
+            }
             }
 
-            #[test]
-            fn layer_tree_edits_change_what_is_drawn() {
-                let Some(engine) = engine() else { return };
-                let surface = surface(&engine);
+            $crate::__engine_test! {
+fn layer_tree_edits_change_what_is_drawn() {
+                let Some(engine) = $crate::__engine_wait!(engine()) else { return };
+                let surface = $crate::__engine_wait!(surface(&engine));
                 let window_a = Rect::new(4.0, 24.0, 20.0, 44.0);
                 let window_b = Rect::new(64.0, 24.0, 80.0, 44.0);
                 let t0 = Instant::now();
                 let mut frame = 0u64;
-                let mut render = |engine: &Engine<B>| {
-                    frame += 1;
-                    render_at(engine, t0 + TICK * frame as u32)
-                };
 
                 let a = square(&surface, &surface.root(), Rect::new(8.0, 28.0, 16.0, 40.0));
-                render(&engine);
-                let rb = surface.readback().expect("readback");
+                frame += 1;
+                $crate::__engine_wait!(render_at(&engine, t0 + TICK * frame as u32));
+                let rb = $crate::__engine_wait!(surface.readback()).expect("readback");
                 assert!(square_center_in(&rb, window_a).is_some(), "a not drawn");
                 assert!(square_center_in(&rb, window_b).is_none(), "b drawn early");
 
@@ -695,8 +827,9 @@ use $crate::Instant;
                     tx[surface.root()].insert(0, &b);
                     tx[&b].content(content);
                 });
-                render(&engine);
-                let rb = surface.readback().expect("readback");
+                frame += 1;
+                $crate::__engine_wait!(render_at(&engine, t0 + TICK * frame as u32));
+                let rb = $crate::__engine_wait!(surface.readback()).expect("readback");
                 assert!(square_center_in(&rb, window_a).is_some(), "a missing");
                 assert!(square_center_in(&rb, window_b).is_some(), "b missing");
 
@@ -704,8 +837,9 @@ use $crate::Instant;
                 surface.update(|tx| {
                     tx[surface.root()].remove(&a);
                 });
-                render(&engine);
-                let rb = surface.readback().expect("readback");
+                frame += 1;
+                $crate::__engine_wait!(render_at(&engine, t0 + TICK * frame as u32));
+                let rb = $crate::__engine_wait!(surface.readback()).expect("readback");
                 assert!(square_center_in(&rb, window_a).is_none(), "a still drawn");
                 assert!(square_center_in(&rb, window_b).is_some(), "b missing");
 
@@ -714,16 +848,18 @@ use $crate::Instant;
                     tx[surface.root()].push(&a);
                 });
                 drop(b);
-                render(&engine);
-                let rb = surface.readback().expect("readback");
+                frame += 1;
+                $crate::__engine_wait!(render_at(&engine, t0 + TICK * frame as u32));
+                let rb = $crate::__engine_wait!(surface.readback()).expect("readback");
                 assert!(square_center_in(&rb, window_a).is_some(), "a missing");
                 assert!(square_center_in(&rb, window_b).is_none(), "b still drawn");
             }
+            }
 
-            #[test]
-            fn a_transform_spring_settles_at_its_target() {
-                let Some(engine) = engine() else { return };
-                let surface = surface(&engine);
+            $crate::__engine_test! {
+fn a_transform_spring_settles_at_its_target() {
+                let Some(engine) = $crate::__engine_wait!(engine()) else { return };
+                let surface = $crate::__engine_wait!(surface(&engine));
                 // Square centre starts at (32, 32); the spring targets
                 // translate(16, 0) → (48, 32).
                 let layer = square(&surface, &surface.root(), Rect::new(24.0, 24.0, 40.0, 40.0));
@@ -740,24 +876,25 @@ use $crate::Instant;
                     },
                 );
                 let t0 = Instant::now();
-                render_at(&engine, t0);
+                $crate::__engine_wait!(render_at(&engine, t0));
                 let (x0, y0) =
-                    square_center(&surface.readback().expect("readback")).expect("square");
+                    square_center(&$crate::__engine_wait!(surface.readback()).expect("readback")).expect("square");
                 assert!((x0 - 32.0).abs() < 0.5 && (y0 - 32.0).abs() < 0.5, "start {x0},{y0}");
 
-                render_at(&engine, t0 + TICK * 6);
+                $crate::__engine_wait!(render_at(&engine, t0 + TICK * 6));
                 let (x1, _) =
-                    square_center(&surface.readback().expect("readback")).expect("square");
+                    square_center(&$crate::__engine_wait!(surface.readback()).expect("readback")).expect("square");
                 assert!(x1 > x0 + 0.5 && x1 < 48.0, "mid {x1}");
 
-                let (x2, y2) = settle(&engine, &surface, t0 + TICK * 6);
+                let (x2, y2) = $crate::__engine_wait!(settle(&engine, &surface, t0 + TICK * 6));
                 assert!((x2 - 48.0).abs() < 0.5 && (y2 - 32.0).abs() < 0.5, "end {x2},{y2}");
             }
+            }
 
-            #[test]
-            fn a_curve_hits_its_endpoints_exactly() {
-                let Some(engine) = engine() else { return };
-                let surface = surface(&engine);
+            $crate::__engine_test! {
+fn a_curve_hits_its_endpoints_exactly() {
+                let Some(engine) = $crate::__engine_wait!(engine()) else { return };
+                let surface = $crate::__engine_wait!(surface(&engine));
                 let layer = square(&surface, &surface.root(), Rect::new(24.0, 24.0, 40.0, 40.0));
                 surface.update(|tx| {
                     tx[&layer].transform(Affine::IDENTITY);
@@ -769,23 +906,24 @@ use $crate::Instant;
                     },
                 );
                 let t0 = Instant::now();
-                render_at(&engine, t0);
+                $crate::__engine_wait!(render_at(&engine, t0));
                 let (x0, _) =
-                    square_center(&surface.readback().expect("readback")).expect("square");
+                    square_center(&$crate::__engine_wait!(surface.readback()).expect("readback")).expect("square");
                 assert!((x0 - 32.0).abs() < 0.5, "start {x0}");
 
                 // At and past the duration the value is exactly the target.
-                let next = render_at(&engine, t0 + Duration::from_millis(200));
+                let next = $crate::__engine_wait!(render_at(&engine, t0 + Duration::from_millis(200)));
                 assert_eq!(next, Next::Idle, "{next:?}");
                 let (x1, _) =
-                    square_center(&surface.readback().expect("readback")).expect("square");
+                    square_center(&$crate::__engine_wait!(surface.readback()).expect("readback")).expect("square");
                 assert!((x1 - 48.0).abs() < 0.01, "end {x1}");
             }
+            }
 
-            #[test]
-            fn a_retargeted_spring_keeps_its_velocity() {
-                let Some(engine) = engine() else { return };
-                let surface = surface(&engine);
+            $crate::__engine_test! {
+fn a_retargeted_spring_keeps_its_velocity() {
+                let Some(engine) = $crate::__engine_wait!(engine()) else { return };
+                let surface = $crate::__engine_wait!(surface(&engine));
                 let layer = square(&surface, &surface.root(), Rect::new(8.0, 24.0, 24.0, 40.0));
                 // A linear curve runs at constant velocity — the
                 // pre-retarget samples give v exactly, so the post-retarget
@@ -805,12 +943,12 @@ use $crate::Instant;
                 // Mid-flight at t1: measure the incoming velocity from the
                 // two samples just before it.
                 let t1 = t0 + TICK * 8;
-                render_at(&engine, t1 - TICK);
+                $crate::__engine_wait!(render_at(&engine, t1 - TICK));
                 let (c0, _) =
-                    square_center(&surface.readback().expect("readback")).expect("square");
-                render_at(&engine, t1);
+                    square_center(&$crate::__engine_wait!(surface.readback()).expect("readback")).expect("square");
+                $crate::__engine_wait!(render_at(&engine, t1));
                 let (c1, _) =
-                    square_center(&surface.readback().expect("readback")).expect("square");
+                    square_center(&$crate::__engine_wait!(surface.readback()).expect("readback")).expect("square");
                 let dt = TICK.as_secs_f64();
                 let v = (c1 - c0) / dt;
                 assert!(v > 30.0, "not mid-flight: v={v}");
@@ -832,12 +970,12 @@ use $crate::Instant;
                 });
                 // The commit frame samples the new track at dt = 0; the
                 // step after it must equal the incoming velocity · dt.
-                render_at(&engine, t1 + TICK);
+                $crate::__engine_wait!(render_at(&engine, t1 + TICK));
                 let (c2, _) =
-                    square_center(&surface.readback().expect("readback")).expect("square");
-                render_at(&engine, t1 + TICK * 2);
+                    square_center(&$crate::__engine_wait!(surface.readback()).expect("readback")).expect("square");
+                $crate::__engine_wait!(render_at(&engine, t1 + TICK * 2));
                 let (c3, _) =
-                    square_center(&surface.readback().expect("readback")).expect("square");
+                    square_center(&$crate::__engine_wait!(surface.readback()).expect("readback")).expect("square");
                 // The square's centre at the target: 16 + 160.
                 let target = 176.0;
                 let omega = std::f64::consts::TAU / 4.0;
@@ -857,11 +995,12 @@ use $crate::Instant;
                     v * dt
                 );
             }
+            }
 
-            #[test]
-            fn a_scroll_decay_covers_velocity_over_deceleration() {
-                let Some(engine) = engine() else { return };
-                let surface = surface(&engine);
+            $crate::__engine_test! {
+fn a_scroll_decay_covers_velocity_over_deceleration() {
+                let Some(engine) = $crate::__engine_wait!(engine()) else { return };
+                let surface = $crate::__engine_wait!(surface(&engine));
                 // Square centre (200, 32); a (600, 0)/k=4 decay covers
                 // 150 px of scroll, moving the square 150 px left.
                 let layer = square(&surface, &surface.root(), Rect::new(192.0, 24.0, 208.0, 40.0));
@@ -878,15 +1017,16 @@ use $crate::Instant;
                         });
                 });
                 let t0 = Instant::now();
-                let (x2, y2) = settle(&engine, &surface, t0);
+                let (x2, y2) = $crate::__engine_wait!(settle(&engine, &surface, t0));
                 // Pixel-snapped: 150 ± 1.
                 assert!((x2 - 50.0).abs() < 1.0 && (y2 - 32.0).abs() < 1.0, "end {x2},{y2}");
             }
+            }
 
-            #[test]
-            fn a_rubber_band_returns_to_the_bound_edge() {
-                let Some(engine) = engine() else { return };
-                let surface = surface(&engine);
+            $crate::__engine_test! {
+fn a_rubber_band_returns_to_the_bound_edge() {
+                let Some(engine) = $crate::__engine_wait!(engine()) else { return };
+                let surface = $crate::__engine_wait!(surface(&engine));
                 let layer = square(&surface, &surface.root(), Rect::new(192.0, 24.0, 208.0, 40.0));
                 // Bounds x ∈ [0, 100]: the decay overshoots to 150 and the
                 // rubber band pulls it back to 100.
@@ -897,29 +1037,30 @@ use $crate::Instant;
                         .animation(Decay::new(Vec2::new(600.0, 0.0)).rubber_band(bounds));
                 });
                 let t0 = Instant::now();
-                let (x2, y2) = settle(&engine, &surface, t0);
+                let (x2, y2) = $crate::__engine_wait!(settle(&engine, &surface, t0));
                 assert!((x2 - 100.0).abs() < 1.0 && (y2 - 32.0).abs() < 1.0, "end {x2},{y2}");
             }
+            }
 
-            #[test]
-            fn a_bound_signal_updates_opacity_without_a_transaction() {
-                let Some(engine) = engine() else { return };
-                let surface = surface(&engine);
+            $crate::__engine_test! {
+fn a_bound_signal_updates_opacity_without_a_transaction() {
+                let Some(engine) = $crate::__engine_wait!(engine()) else { return };
+                let surface = $crate::__engine_wait!(surface(&engine));
                 let layer = square(&surface, &surface.root(), Rect::new(24.0, 24.0, 40.0, 40.0));
                 let opacity = ::nami::binding(1.0f32);
                 surface.update(|tx| {
                     tx[&layer].opacity(opacity.clone());
                 });
                 let t0 = Instant::now();
-                render_at(&engine, t0);
-                let rb = surface.readback().expect("readback");
+                $crate::__engine_wait!(render_at(&engine, t0));
+                let rb = $crate::__engine_wait!(surface.readback()).expect("readback");
                 assert!((alpha_at(&rb, 32, 32) - 1.0).abs() < 0.05);
 
                 // A plain signal change snaps the opacity.
                 opacity.set(0.4f32);
-                let next = render_at(&engine, t0 + TICK);
+                let next = $crate::__engine_wait!(render_at(&engine, t0 + TICK));
                 assert_eq!(next, Next::Idle, "{next:?}");
-                let rb = surface.readback().expect("readback");
+                let rb = $crate::__engine_wait!(surface.readback()).expect("readback");
                 assert!((alpha_at(&rb, 32, 32) - 0.4).abs() < 0.05, "alpha");
 
                 // `with(Animation)` metadata animates the change: a sample
@@ -931,18 +1072,19 @@ use $crate::Instant;
                 });
                 opacity.set(0.0f32);
                 // The commit frame samples at dt = 0 → still 0.4.
-                render_at(&engine, t0 + TICK * 3);
-                let next = render_at(&engine, t0 + TICK * 8);
-                let rb = surface.readback().expect("readback");
+                $crate::__engine_wait!(render_at(&engine, t0 + TICK * 3));
+                let next = $crate::__engine_wait!(render_at(&engine, t0 + TICK * 8));
+                let rb = $crate::__engine_wait!(surface.readback()).expect("readback");
                 let a = alpha_at(&rb, 32, 32);
                 assert!(a > 0.02 && a < 0.39, "interpolated alpha {a}");
                 assert!(matches!(next, Next::At { .. }), "{next:?}");
             }
+            }
 
-            #[test]
-            fn a_recorded_operand_animates_between_paints() {
-                let Some(engine) = engine() else { return };
-                let surface = surface(&engine);
+            $crate::__engine_test! {
+fn a_recorded_operand_animates_between_paints() {
+                let Some(engine) = $crate::__engine_wait!(engine()) else { return };
+                let surface = $crate::__engine_wait!(surface(&engine));
                 let layer = surface.layer();
                 let red = WorkingColor::new([1.0, 0.0, 0.0, 1.0]);
                 let green = WorkingColor::new([0.0, 1.0, 0.0, 1.0]);
@@ -963,14 +1105,14 @@ use $crate::Instant;
                     tx[&layer].content(content);
                 });
                 let t0 = Instant::now();
-                render_at(&engine, t0);
+                $crate::__engine_wait!(render_at(&engine, t0));
 
                 // The commit frame samples at dt = 0 — the animated operand
                 // still shows `from` while the plain change snaps.
                 animated.set(green);
                 snapped.set(blue);
-                let next = render_at(&engine, t0 + TICK);
-                let rb = surface.readback().expect("readback");
+                let next = $crate::__engine_wait!(render_at(&engine, t0 + TICK));
+                let rb = $crate::__engine_wait!(surface.readback()).expect("readback");
                 let start = rb.pixels[(16 * rb.width + 16) as usize];
                 assert!(start[0] > 0.95, "the operand starts at {start:?}");
                 let snapped_px = rb.pixels[(16 * rb.width + 72) as usize];
@@ -982,13 +1124,13 @@ use $crate::Instant;
 
                 // Mid-flight the colour is strictly between the endpoints,
                 // and only the animated command re-lowers per frame.
-                let next = render_at(&engine, t0 + TICK * 25);
+                let next = $crate::__engine_wait!(render_at(&engine, t0 + TICK * 25));
                 assert_eq!(
                     engine.stats().commands_lowered,
                     1,
                     "a running operand animation re-lowers only its own command"
                 );
-                let rb = surface.readback().expect("readback");
+                let rb = $crate::__engine_wait!(surface.readback()).expect("readback");
                 let mid = rb.pixels[(16 * rb.width + 16) as usize];
                 assert!(mid[0] < 0.95 && mid[1] > 0.05, "mid-flight {mid:?}");
                 assert!(matches!(next, Next::At { .. }), "{next:?}");
@@ -998,20 +1140,21 @@ use $crate::Instant;
                 animated.set(blue);
                 let mut t = t0 + TICK * 25;
                 for _ in 0..2000 {
-                    if render_at(&engine, t) == Next::Idle {
+                    if $crate::__engine_wait!(render_at(&engine, t)) == Next::Idle {
                         break;
                     }
                     t += TICK;
                 }
-                let rb = surface.readback().expect("readback");
+                let rb = $crate::__engine_wait!(surface.readback()).expect("readback");
                 let end = rb.pixels[(16 * rb.width + 16) as usize];
                 assert!(end[2] > 0.95 && end[0] < 0.05, "settled at {end:?}");
             }
+            }
 
-            #[test]
-            fn next_schedules_the_frame_rate() {
-                let Some(engine) = engine() else { return };
-                let surface = surface(&engine);
+            $crate::__engine_test! {
+fn next_schedules_the_frame_rate() {
+                let Some(engine) = $crate::__engine_wait!(engine()) else { return };
+                let surface = $crate::__engine_wait!(surface(&engine));
                 let layer = square(&surface, &surface.root(), Rect::new(8.0, 24.0, 24.0, 40.0));
                 surface.update_animated(
                     Spring {
@@ -1024,7 +1167,7 @@ use $crate::Instant;
                 );
                 let t0 = Instant::now();
                 // A running spring wants the fast class.
-                match render_at(&engine, t0 + TICK) {
+                match $crate::__engine_wait!(render_at(&engine, t0 + TICK)) {
                     Next::At { rate, .. } => {
                         assert!(*rate.start() <= 60 && *rate.end() >= 120, "rate {rate:?}");
                     }
@@ -1044,7 +1187,7 @@ use $crate::Instant;
                 // Wait for the spring to settle; the decay outlives it
                 // only briefly, so check the class on the first sample.
                 let t2 = t0 + TICK * 200;
-                let next = render_at(&engine, t2);
+                let next = $crate::__engine_wait!(render_at(&engine, t2));
                 match next {
                     Next::At { rate, .. } => {
                         assert!(*rate.end() <= 60, "rate {rate:?}");
@@ -1052,8 +1195,9 @@ use $crate::Instant;
                     Next::Idle => {}
                 }
                 // Everything comes to rest eventually.
-                let _ = settle(&engine, &surface, t2);
-                assert_eq!(render_at(&engine, t2 + TICK * 400), Next::Idle);
+                let _ = $crate::__engine_wait!(settle(&engine, &surface, t2));
+                assert_eq!($crate::__engine_wait!(render_at(&engine, t2 + TICK * 400)), Next::Idle);
+            }
             }
 
         }
@@ -1818,6 +1962,185 @@ mod tests {
         engine.render(FrameTime::now()).unwrap();
         let record = frames(&rx).pop().expect("frame");
         assert!(!record.changed, "retired content cannot queue updates");
+    }
+
+    /// A `Surface::display` update on a surface that does not present
+    /// never marks `present_pending`, while a window-like target in the
+    /// same engine does: headroom and pending-present state belong only
+    /// to surfaces that present (#98). Before the confinement, a display
+    /// update on an `Offscreen` surface left `present_pending` set,
+    /// which a presenting backend consumed as an unhandled case.
+    #[test]
+    fn display_updates_mark_present_only_on_presenting_surfaces() {
+        use crate::Display;
+
+        let (engine, rx) = engine();
+        let offscreen = engine
+            .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))
+            .expect("offscreen surface");
+        let window = engine
+            .surface(NullTarget::Window(Offscreen::new(
+                (8, 8),
+                OffscreenFormat::LinearF16,
+            )))
+            .expect("window-like surface");
+        engine.render(FrameTime::now()).expect("render");
+        let _ = frames(&rx);
+
+        offscreen
+            .display(Display {
+                scale: 1.0,
+                headroom: 4.0,
+            })
+            .expect("display");
+        window
+            .display(Display {
+                scale: 1.0,
+                headroom: 4.0,
+            })
+            .expect("display");
+        engine.render(FrameTime::now()).expect("render");
+        let records = frames(&rx);
+        let offscreen_record = records
+            .iter()
+            .find(|record| record.surface == offscreen.id())
+            .expect("offscreen frame record");
+        let window_record = records
+            .iter()
+            .find(|record| record.surface == window.id())
+            .expect("window frame record");
+        assert!(
+            !offscreen_record.present_pending,
+            "a non-presenting surface cannot be pending a present"
+        );
+        assert!(
+            window_record.present_pending,
+            "a presenting surface is pending after a headroom update"
+        );
+        // The display value itself lands on both: only the pending
+        // present is confined.
+        assert_eq!(
+            offscreen_record.display.headroom.to_bits(),
+            4.0f32.to_bits()
+        );
+        assert_eq!(window_record.display.headroom.to_bits(), 4.0f32.to_bits());
+    }
+
+    /// A headroom-only `Surface::display` sequence (4 → 2 → 1 → 4, the
+    /// corpus's headroom sequence) marks `present_pending` on every frame
+    /// — never `changed`, so no scene re-generation or local-cache work —
+    /// and reaches the backend with the new headroom. A scale change
+    /// still marks `changed` (#98 C4).
+    #[test]
+    fn headroom_updates_present_without_regenerating_content() {
+        use crate::{Display, Draw, WorkingColor};
+
+        let (engine, rx) = engine();
+        let surface = engine
+            .surface(NullTarget::Window(Offscreen::new(
+                (8, 8),
+                OffscreenFormat::LinearF16,
+            )))
+            .expect("surface");
+        let layer = surface.layer();
+        let content =
+            surface.record(|c| c.fill(kurbo::Rect::new(0., 0., 8., 8.), WorkingColor::WHITE));
+        surface.update(|tx| {
+            tx[surface.root()].push(&layer);
+            tx[&layer].content(content);
+        });
+        engine.render(FrameTime::now()).expect("render");
+        let _ = frames(&rx);
+
+        for headroom in [4.0f32, 2.0, 1.0, 4.0] {
+            surface
+                .display(Display {
+                    scale: 1.0,
+                    headroom,
+                })
+                .expect("display");
+            engine.render(FrameTime::now()).expect("render");
+            let record = frames(&rx).pop().expect("frame record");
+            assert!(
+                !record.changed,
+                "a headroom-only update must not mark changed at headroom {headroom}"
+            );
+            assert!(
+                record.present_pending,
+                "a headroom update must mark presentation pending at headroom {headroom}"
+            );
+            assert_eq!(
+                record.display.headroom.to_bits(),
+                headroom.to_bits(),
+                "the frame must carry the new headroom"
+            );
+            let stats = engine.stats();
+            assert_eq!(
+                stats.commands_lowered, 0,
+                "a headroom-only update regenerates no scene content"
+            );
+        }
+
+        surface
+            .display(Display {
+                scale: 2.0,
+                headroom: 4.0,
+            })
+            .expect("display");
+        engine.render(FrameTime::now()).expect("render");
+        let record = frames(&rx).pop().expect("frame record");
+        assert!(
+            record.changed && record.present_pending,
+            "a scale change is content, not presentation-only"
+        );
+    }
+
+    /// `Surface::display_moved` rides to the frame as `display_moved`
+    /// and marks a present on a presenting surface; a headroom-only
+    /// `display` update never sets it, and the flag is consumed by one
+    /// frame (#98).
+    #[test]
+    fn display_moves_reach_the_frame_once() {
+        use crate::Display;
+
+        let (engine, rx) = engine();
+        let surface = engine
+            .surface(NullTarget::Window(Offscreen::new(
+                (8, 8),
+                OffscreenFormat::LinearF16,
+            )))
+            .expect("surface");
+        engine.render(FrameTime::now()).expect("render");
+        let _ = frames(&rx);
+
+        surface.display_moved().expect("display move");
+        engine.render(FrameTime::now()).expect("render");
+        let record = frames(&rx).pop().expect("frame record");
+        assert!(
+            record.display_moved && record.present_pending,
+            "a display move re-enumerates and presents"
+        );
+
+        engine.render(FrameTime::now()).expect("render");
+        let record = frames(&rx).pop().expect("frame record");
+        assert!(
+            !record.display_moved,
+            "the move flag is consumed by one frame"
+        );
+
+        surface
+            .display(Display {
+                scale: 1.0,
+                headroom: 3.0,
+            })
+            .expect("display");
+        engine.render(FrameTime::now()).expect("render");
+        let record = frames(&rx).pop().expect("frame record");
+        assert!(
+            !record.display_moved,
+            "a headroom-only update never moves the display"
+        );
+        assert!(record.present_pending);
     }
 }
 

@@ -1,6 +1,7 @@
 //! Native bitmap colour-font rendering and cache behavior.
 
 use cherenkov::kurbo::{Affine, Rect};
+use cherenkov::{__engine_fn as split_fn, __engine_test as split_test, __engine_wait as wait};
 use cherenkov::{
     Draw, Engine, EngineError, Extend, FontId, FontSource, FrameTime, Glyph, GlyphRun, GlyphStyle,
     ImageColorSpace, ImageData, ImageId, ImagePattern, Offscreen, OffscreenFormat, Paint, Rgba8,
@@ -21,12 +22,14 @@ const SBIX_PATH: &str = concat!(
 );
 const OUTLINE_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../scenes/fonts/NotoSans.ttf");
 
+split_fn! {
 fn engine() -> Option<Engine<Gpu>> {
-    match Engine::<Gpu>::new(GpuConfig::default()) {
+    match wait!(Engine::<Gpu>::new(GpuConfig::default())) {
         Ok(engine) => Some(engine),
         Err(EngineError::Backend(_)) => None,
         Err(error) => panic!("GPU initialization failed: {error}"),
     }
+}
 }
 
 fn glyph_id(bytes: &[u8], character: char) -> u32 {
@@ -63,14 +66,15 @@ fn glyph_mut(run: &mut GlyphRun) -> &mut Glyph {
         .expect("one-glyph run")
 }
 
+split_fn! {
 fn unregistered_image_error(bytes: &[u8], character: char) -> Option<String> {
-    let engine = engine()?;
+    let engine = wait!(engine())?;
     let font = engine
         .font(FontSource::bytes(bytes.to_vec()))
         .expect("register font");
     let run = glyph_run(font.id(), glyph_id(bytes, character), 48.0);
-    let surface = engine
-        .surface(Offscreen::new((160, 120), OffscreenFormat::LinearF16))
+    let surface = wait!(engine
+        .surface(Offscreen::new((160, 120), OffscreenFormat::LinearF16)))
         .expect("surface");
     surface.update(|tx| {
         tx[surface.root()].content(surface.record(|c| {
@@ -86,11 +90,12 @@ fn unregistered_image_error(bytes: &[u8], character: char) -> Option<String> {
             );
         }));
     });
-    match engine.render(FrameTime::now()) {
+    match wait!(engine.render(FrameTime::now())) {
         Err(cherenkov::RenderError::Image(message)) => Some(message),
         Err(error) => panic!("expected unregistered-image error, got {error}"),
         Ok(_) => panic!("unregistered-image paint unexpectedly rendered"),
     }
+}
 }
 
 fn image_source(
@@ -163,6 +168,7 @@ fn image_source(
     )
 }
 
+split_fn! {
 #[expect(
     clippy::too_many_arguments,
     reason = "one helper checks equivalence across font, strike, size, and transforms"
@@ -183,11 +189,11 @@ fn equivalent(
     let mut run = glyph_run(font.id(), gid, size);
     glyph_mut(&mut run).transform = glyph_transform;
     let placement = Affine::translate((24.0, 112.0)) * glyph_transform.unwrap_or(Affine::IDENTITY);
-    let actual = engine
-        .surface(Offscreen::new((320, 220), OffscreenFormat::LinearF16))
+    let actual = wait!(engine
+        .surface(Offscreen::new((320, 220), OffscreenFormat::LinearF16)))
         .expect("actual surface");
-    let reference = engine
-        .surface(Offscreen::new((320, 220), OffscreenFormat::LinearF16))
+    let reference = wait!(engine
+        .surface(Offscreen::new((320, 220), OffscreenFormat::LinearF16)))
         .expect("reference surface");
     actual.update(|tx| {
         tx[actual.root()].content(actual.record(|c| {
@@ -205,9 +211,9 @@ fn equivalent(
             });
         }));
     });
-    engine.render(FrameTime::now()).expect("render");
-    let actual_pixels = actual.readback().expect("actual readback").pixels;
-    let reference_pixels = reference.readback().expect("reference readback").pixels;
+    wait!(engine.render(FrameTime::now())).expect("render");
+    let actual_pixels = wait!(actual.readback()).expect("actual readback").pixels;
+    let reference_pixels = wait!(reference.readback()).expect("reference readback").pixels;
     assert!(actual_pixels.iter().any(|pixel| pixel[3] > 0.0));
     assert_eq!(
         actual_pixels
@@ -220,14 +226,11 @@ fn equivalent(
             .collect::<Vec<_>>()
     );
 }
+}
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "covers ambient and per-glyph bitmap transform cases"
-)]
-#[test]
+split_test! {
 fn cbdt_and_sbix_glyphs_match_image_draws() {
-    let Some(engine) = engine() else {
+    let Some(engine) = wait!(engine()) else {
         return;
     };
     let cbdt = std::fs::read(CBDT_PATH).expect("CBDT fixture");
@@ -238,7 +241,7 @@ fn cbdt_and_sbix_glyphs_match_image_draws() {
     let ambient_cbdt = Affine::translate((24.0, 12.0))
         * Affine::rotate(0.22)
         * Affine::scale_non_uniform(1.2, 0.9);
-    equivalent(
+    wait!(equivalent(
         &engine,
         &cbdt_font,
         &cbdt,
@@ -248,8 +251,8 @@ fn cbdt_and_sbix_glyphs_match_image_draws() {
         48.0,
         Affine::IDENTITY,
         None,
-    );
-    equivalent(
+    ));
+    wait!(equivalent(
         &engine,
         &cbdt_font,
         &cbdt,
@@ -259,10 +262,10 @@ fn cbdt_and_sbix_glyphs_match_image_draws() {
         48.0,
         ambient_cbdt,
         None,
-    );
+    ));
     let transformed =
         Affine::rotate(0.22) * Affine::skew(0.18, -0.12) * Affine::scale_non_uniform(1.2, 0.9);
-    equivalent(
+    wait!(equivalent(
         &engine,
         &cbdt_font,
         &cbdt,
@@ -272,14 +275,14 @@ fn cbdt_and_sbix_glyphs_match_image_draws() {
         48.0,
         Affine::IDENTITY,
         Some(transformed),
-    );
+    ));
 
     let sbix = std::fs::read(SBIX_PATH).expect("sbix fixture");
     let sbix_id = glyph_id(&sbix, '😀');
     let sbix_font = engine
         .font(FontSource::bytes(sbix.clone()))
         .expect("register sbix font");
-    equivalent(
+    wait!(equivalent(
         &engine,
         &sbix_font,
         &sbix,
@@ -289,8 +292,8 @@ fn cbdt_and_sbix_glyphs_match_image_draws() {
         20.0,
         Affine::IDENTITY,
         None,
-    );
-    equivalent(
+    ));
+    wait!(equivalent(
         &engine,
         &sbix_font,
         &sbix,
@@ -300,8 +303,8 @@ fn cbdt_and_sbix_glyphs_match_image_draws() {
         48.0,
         Affine::IDENTITY,
         None,
-    );
-    equivalent(
+    ));
+    wait!(equivalent(
         &engine,
         &sbix_font,
         &sbix,
@@ -311,8 +314,8 @@ fn cbdt_and_sbix_glyphs_match_image_draws() {
         20.0,
         Affine::scale(2.0),
         None,
-    );
-    equivalent(
+    ));
+    wait!(equivalent(
         &engine,
         &sbix_font,
         &sbix,
@@ -322,8 +325,8 @@ fn cbdt_and_sbix_glyphs_match_image_draws() {
         20.0,
         Affine::IDENTITY,
         Some(Affine::scale(2.0)),
-    );
-    equivalent(
+    ));
+    wait!(equivalent(
         &engine,
         &sbix_font,
         &sbix,
@@ -333,8 +336,8 @@ fn cbdt_and_sbix_glyphs_match_image_draws() {
         48.0,
         Affine::IDENTITY,
         Some(transformed),
-    );
-    equivalent(
+    ));
+    wait!(equivalent(
         &engine,
         &sbix_font,
         &sbix,
@@ -344,12 +347,13 @@ fn cbdt_and_sbix_glyphs_match_image_draws() {
         20.0,
         Affine::scale(1.5),
         Some(Affine::scale_non_uniform(1.2, 0.9)),
-    );
+    ));
+}
 }
 
-#[test]
+split_test! {
 fn bitmap_cache_reuses_transformed_glyphs_and_uses_font_identity() {
-    let Some(engine) = engine() else {
+    let Some(engine) = wait!(engine()) else {
         return;
     };
     let bytes = std::fs::read(CBDT_PATH).expect("CBDT fixture");
@@ -366,8 +370,8 @@ fn bitmap_cache_reuses_transformed_glyphs_and_uses_font_identity() {
     glyph_mut(&mut second_run).transform = Some(transform);
     let first = nami::Binding::container(first_run);
     let second = nami::Binding::container(second_run);
-    let surface = engine
-        .surface(Offscreen::new((240, 160), OffscreenFormat::LinearF16))
+    let surface = wait!(engine
+        .surface(Offscreen::new((240, 160), OffscreenFormat::LinearF16)))
         .expect("surface");
     let content = surface.record(|c| {
         c.glyphs(first.clone(), WorkingColor::WHITE);
@@ -376,16 +380,16 @@ fn bitmap_cache_reuses_transformed_glyphs_and_uses_font_identity() {
     surface.update(|tx| {
         tx[surface.root()].content(content);
     });
-    engine.render(FrameTime::now()).expect("initial frame");
+    wait!(engine.render(FrameTime::now())).expect("initial frame");
     assert_eq!(engine.stats().glyphs_rasterized, 2);
-    engine.render(FrameTime::now()).expect("identical frame");
+    wait!(engine.render(FrameTime::now())).expect("identical frame");
     assert_eq!(engine.stats().glyphs_rasterized, 0);
 
     let mut changed = glyph_run(first_font.id(), large, 48.0);
     glyph_mut(&mut changed).x = 100.0;
     glyph_mut(&mut changed).transform = Some(transform);
     first.set(changed);
-    engine.render(FrameTime::now()).expect("dirty glyph");
+    wait!(engine.render(FrameTime::now())).expect("dirty glyph");
     assert_eq!(engine.stats().glyphs_rasterized, 1);
 
     let only_second = surface.record(|c| {
@@ -395,21 +399,22 @@ fn bitmap_cache_reuses_transformed_glyphs_and_uses_font_identity() {
         tx[surface.root()].content(only_second);
     });
     drop(first_font);
-    engine.render(FrameTime::now()).expect("font removal");
+    wait!(engine.render(FrameTime::now())).expect("font removal");
     assert_eq!(engine.stats().glyphs_rasterized, 0);
     assert!(
-        surface
-            .readback()
+        wait!(surface
+            .readback())
             .expect("readback")
             .pixels
             .iter()
             .any(|pixel| pixel[3] > 0.0)
     );
 }
+}
 
-#[test]
+split_test! {
 fn bitmap_cache_reuses_unchanged_glyphs_and_uses_font_identity() {
-    let Some(engine) = engine() else {
+    let Some(engine) = wait!(engine()) else {
         return;
     };
     let bytes = std::fs::read(CBDT_PATH).expect("CBDT fixture");
@@ -421,8 +426,8 @@ fn bitmap_cache_reuses_unchanged_glyphs_and_uses_font_identity() {
     let second_font = engine.font(FontSource::bytes(bytes)).expect("second font");
     let first = nami::Binding::container(glyph_run(first_font.id(), small, 48.0));
     let second = nami::Binding::container(glyph_run(second_font.id(), small, 48.0));
-    let surface = engine
-        .surface(Offscreen::new((240, 160), OffscreenFormat::LinearF16))
+    let surface = wait!(engine
+        .surface(Offscreen::new((240, 160), OffscreenFormat::LinearF16)))
         .expect("surface");
     let content = surface.record(|c| {
         c.glyphs(first.clone(), WorkingColor::WHITE);
@@ -431,15 +436,15 @@ fn bitmap_cache_reuses_unchanged_glyphs_and_uses_font_identity() {
     surface.update(|tx| {
         tx[surface.root()].content(content);
     });
-    engine.render(FrameTime::now()).expect("initial frame");
+    wait!(engine.render(FrameTime::now())).expect("initial frame");
     assert_eq!(engine.stats().glyphs_rasterized, 2);
-    engine.render(FrameTime::now()).expect("identical frame");
+    wait!(engine.render(FrameTime::now())).expect("identical frame");
     assert_eq!(engine.stats().glyphs_rasterized, 0);
 
     let mut changed = glyph_run(first_font.id(), large, 48.0);
     glyph_mut(&mut changed).x = 100.0;
     first.set(changed);
-    engine.render(FrameTime::now()).expect("dirty glyph");
+    wait!(engine.render(FrameTime::now())).expect("dirty glyph");
     assert_eq!(engine.stats().glyphs_rasterized, 1);
 
     let only_second = surface.record(|c| {
@@ -449,29 +454,30 @@ fn bitmap_cache_reuses_unchanged_glyphs_and_uses_font_identity() {
         tx[surface.root()].content(only_second);
     });
     drop(first_font);
-    engine.render(FrameTime::now()).expect("font removal");
+    wait!(engine.render(FrameTime::now())).expect("font removal");
     assert_eq!(engine.stats().glyphs_rasterized, 0);
     assert!(
-        surface
-            .readback()
+        wait!(surface
+            .readback())
             .expect("readback")
             .pixels
             .iter()
             .any(|pixel| pixel[3] > 0.0)
     );
 }
+}
 
-#[test]
+split_test! {
 fn missing_notdef_is_empty_and_bitmap_transforms_validate_and_strokes_are_unsupported() {
-    let Some(engine) = engine() else {
+    let Some(engine) = wait!(engine()) else {
         return;
     };
     let bytes = std::fs::read(CBDT_PATH).expect("CBDT fixture");
     let font = engine
         .font(FontSource::bytes(bytes))
         .expect("register font");
-    let surface = engine
-        .surface(Offscreen::new((160, 120), OffscreenFormat::LinearF16))
+    let surface = wait!(engine
+        .surface(Offscreen::new((160, 120), OffscreenFormat::LinearF16)))
         .expect("surface");
     let mut missing = glyph_run(font.id(), 0, 48.0);
     surface.update(|tx| {
@@ -479,13 +485,13 @@ fn missing_notdef_is_empty_and_bitmap_transforms_validate_and_strokes_are_unsupp
             c.glyphs(missing.clone(), WorkingColor::WHITE);
         }));
     });
-    engine
-        .render(FrameTime::now())
+    wait!(engine
+        .render(FrameTime::now()))
         .expect("missing glyph frame");
     assert_eq!(engine.stats().glyphs_rasterized, 0);
     assert!(
-        surface
-            .readback()
+        wait!(surface
+            .readback())
             .expect("readback")
             .pixels
             .iter()
@@ -500,7 +506,7 @@ fn missing_notdef_is_empty_and_bitmap_transforms_validate_and_strokes_are_unsupp
         }));
     });
     assert!(matches!(
-        engine.render(FrameTime::now()),
+        wait!(engine.render(FrameTime::now())),
         Err(cherenkov::RenderError::Render(message))
             if message == "glyph transform must be finite and invertible"
     ));
@@ -513,31 +519,34 @@ fn missing_notdef_is_empty_and_bitmap_transforms_validate_and_strokes_are_unsupp
         }));
     });
     assert!(matches!(
-        engine.render(FrameTime::now()),
+        wait!(engine.render(FrameTime::now())),
         Err(cherenkov::RenderError::Unsupported("glyph-stroke"))
     ));
 }
+}
 
-#[test]
+split_test! {
 fn bitmap_runs_validate_image_paints_like_outline_runs() {
     let cbdt = std::fs::read(CBDT_PATH).expect("CBDT fixture");
     let outline = std::fs::read(OUTLINE_PATH).expect("outline fixture");
-    let Some(bitmap_error) = unregistered_image_error(&cbdt, '😀') else {
+    let Some(bitmap_error) = wait!(unregistered_image_error(&cbdt, '😀')) else {
         return;
     };
-    let Some(outline_error) = unregistered_image_error(&outline, 'A') else {
+    let Some(outline_error) = wait!(unregistered_image_error(&outline, 'A')) else {
         return;
     };
     assert_eq!(bitmap_error, outline_error);
 }
+}
 
+split_fn! {
 fn render_static_bitmap(
     engine: &Engine<Gpu>,
     font: FontId,
     glyph: u32,
     transform: Affine,
 ) -> Result<Vec<[f32; 4]>, Box<dyn std::error::Error>> {
-    let surface = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
+    let surface = wait!(engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16)))?;
     surface.clear_color(WorkingColor::BLACK);
     let layer = surface.layer();
     surface.update(|tx| {
@@ -551,29 +560,31 @@ fn render_static_bitmap(
             .transform(transform)
             .content(surface.record(|c| c.glyphs(run, WorkingColor::WHITE)));
     });
-    engine.render(FrameTime::now())?;
-    Ok(surface.readback()?.pixels)
+    wait!(engine.render(FrameTime::now()))?;
+    Ok(wait!(surface.readback())?.pixels)
+}
 }
 
 fn bitmap_pixel_bits(pixels: &[[f32; 4]]) -> Vec<[u32; 4]> {
     pixels.iter().map(|pixel| pixel.map(f32::to_bits)).collect()
 }
 
+split_test! {
 /// Animated bitmap placement follows the layer's quarter-pixel snap and
 /// returns to exact placement when the animation settles.
-#[test]
 fn an_animating_layer_places_bitmap_glyphs_on_the_quarter_pixel_grid()
 -> Result<(), Box<dyn std::error::Error>> {
     use nami::SignalExt as _;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
+use cherenkov::Instant;
 
-    let Some(engine) = engine() else {
+    let Some(engine) = wait!(engine()) else {
         return Ok(());
     };
     let bytes = std::fs::read(SBIX_PATH)?;
     let glyph = glyph_id(&bytes, '😀');
     let font = engine.font(FontSource::bytes(bytes))?;
-    let surface = engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16))?;
+    let surface = wait!(engine.surface(Offscreen::new((64, 64), OffscreenFormat::LinearF16)))?;
     surface.clear_color(WorkingColor::BLACK);
     let layer = surface.layer();
     surface.update(|tx| {
@@ -594,27 +605,27 @@ fn an_animating_layer_places_bitmap_glyphs_on_the_quarter_pixel_grid()
 
     let start = Instant::now();
     translate.set(Affine::translate((1.2, 0.0)));
-    engine.render(FrameTime::at(start))?;
-    let at_start = surface.readback()?.pixels;
+    wait!(engine.render(FrameTime::at(start)))?;
+    let at_start = wait!(surface.readback())?.pixels;
     assert!(matches!(
-        engine.render(FrameTime::at(start + Duration::from_millis(250)))?,
+        wait!(engine.render(FrameTime::at(start + Duration::from_millis(250))))?,
         cherenkov::Next::At { .. }
     ));
-    let quarter = surface.readback()?.pixels;
+    let quarter = wait!(surface.readback())?.pixels;
     assert_eq!(
-        engine.render(FrameTime::at(start + Duration::from_secs(2)))?,
+        wait!(engine.render(FrameTime::at(start + Duration::from_secs(2))))?,
         cherenkov::Next::Idle
     );
-    let settled = surface.readback()?.pixels;
+    let settled = wait!(surface.readback())?.pixels;
 
-    let identity = render_static_bitmap(&engine, font.id(), glyph, Affine::IDENTITY)?;
+    let identity = wait!(render_static_bitmap(&engine, font.id(), glyph, Affine::IDENTITY))?;
     let quarter_static =
-        render_static_bitmap(&engine, font.id(), glyph, Affine::translate((0.25, 0.0)))?;
-    let off_grid = render_static_bitmap(&engine, font.id(), glyph, Affine::translate((0.3, 0.0)))?;
+        wait!(render_static_bitmap(&engine, font.id(), glyph, Affine::translate((0.25, 0.0))))?;
+    let off_grid = wait!(render_static_bitmap(&engine, font.id(), glyph, Affine::translate((0.3, 0.0))))?;
     let settled_static =
-        render_static_bitmap(&engine, font.id(), glyph, Affine::translate((1.2, 0.0)))?;
+        wait!(render_static_bitmap(&engine, font.id(), glyph, Affine::translate((1.2, 0.0))))?;
     let off_settled =
-        render_static_bitmap(&engine, font.id(), glyph, Affine::translate((1.25, 0.0)))?;
+        wait!(render_static_bitmap(&engine, font.id(), glyph, Affine::translate((1.25, 0.0))))?;
     assert_eq!(bitmap_pixel_bits(&at_start), bitmap_pixel_bits(&identity));
     assert_eq!(
         bitmap_pixel_bits(&quarter),
@@ -627,4 +638,5 @@ fn an_animating_layer_places_bitmap_glyphs_on_the_quarter_pixel_grid()
     );
     assert_ne!(bitmap_pixel_bits(&settled), bitmap_pixel_bits(&off_settled));
     Ok(())
+}
 }

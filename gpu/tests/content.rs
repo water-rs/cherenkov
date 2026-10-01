@@ -1,6 +1,7 @@
 //! Custom content lifetime, clipping, and external redraw behavior.
 
 use cherenkov::kurbo::{Affine, Rect};
+use cherenkov::{__engine_test as split_test, __engine_wait as wait};
 use cherenkov::{Engine, FrameTime, Next, Offscreen, OffscreenFormat};
 use cherenkov_gpu::{
     Gpu, GpuConfig,
@@ -26,6 +27,13 @@ impl Drop for Producer {
 }
 
 impl GpuContent for Producer {
+    #[cfg_attr(
+        target_arch = "wasm32",
+        expect(
+            clippy::future_not_send,
+            reason = "the wasm32 harness runs on the single-threaded page event loop"
+        )
+    )]
     async fn setup(&mut self, _: &wgpu::Context<'_>) {
         self.setups.fetch_add(1, Ordering::Relaxed);
     }
@@ -53,10 +61,10 @@ impl GpuContent for Producer {
     }
 }
 
-#[test]
+split_test! {
 fn content_is_retained_clipped_and_wakes_an_idle_host() -> Result<(), Box<dyn std::error::Error>> {
-    let engine = Engine::<Gpu>::new(GpuConfig::default())?;
-    let surface = engine.surface(Offscreen::new((16, 16), OffscreenFormat::LinearF16))?;
+    let engine = wait!(Engine::<Gpu>::new(GpuConfig::default()))?;
+    let surface = wait!(engine.surface(Offscreen::new((16, 16), OffscreenFormat::LinearF16)))?;
     let layer = surface.layer();
     let setups = Arc::new(AtomicUsize::new(0));
     let frames = Arc::new(AtomicUsize::new(0));
@@ -85,16 +93,16 @@ fn content_is_retained_clipped_and_wakes_an_idle_host() -> Result<(), Box<dyn st
             .opacity(0.5_f32)
             .content(engine.gpu_content((8, 8), content));
     });
-    assert_eq!(engine.render(FrameTime::now())?, Next::Idle);
+    assert_eq!(wait!(engine.render(FrameTime::now()))?, Next::Idle);
     assert_eq!(setups.load(Ordering::Relaxed), 1);
     assert_eq!(frames.load(Ordering::Relaxed), 1);
-    let pixels = surface.readback()?.pixels;
+    let pixels = wait!(surface.readback())?.pixels;
     assert!((pixels[5 * 16 + 5][0] - 0.5).abs() < 0.001);
     assert!(
         pixels[5 * 16 + 9][3].abs() < 0.001,
         "layer clip applies to GPU content"
     );
-    engine.render(FrameTime::now())?;
+    wait!(engine.render(FrameTime::now()))?;
     assert_eq!(
         frames.load(Ordering::Relaxed),
         1,
@@ -108,23 +116,23 @@ fn content_is_retained_clipped_and_wakes_an_idle_host() -> Result<(), Box<dyn st
         1,
         "requests coalesce until consumed"
     );
-    assert_eq!(engine.render(FrameTime::now())?, Next::Idle);
+    assert_eq!(wait!(engine.render(FrameTime::now()))?, Next::Idle);
     assert_eq!(frames.load(Ordering::Relaxed), 2);
     assert_eq!(setups.load(Ordering::Relaxed), 1);
-    let pixels = surface.readback()?.pixels;
+    let pixels = wait!(surface.readback())?.pixels;
     assert!((pixels[5 * 16 + 5][1] - 0.5).abs() < 0.001);
     send.send(wgpu::Color::BLUE)?;
     surface.update(|tx| {
         tx[&layer].gpu_content_size((4, 4));
     });
-    engine.render(FrameTime::now())?;
+    wait!(engine.render(FrameTime::now()))?;
     assert_eq!(setups.load(Ordering::Relaxed), 1, "resize preserves setup");
     assert_eq!(frames.load(Ordering::Relaxed), 3);
-    assert!((surface.readback()?.pixels[5 * 16 + 5][2] - 0.5).abs() < 0.001);
+    assert!((wait!(surface.readback())?.pixels[5 * 16 + 5][2] - 0.5).abs() < 0.001);
     surface.update(|tx| {
         tx[surface.root()].remove(&layer);
     });
-    assert_eq!(engine.render(FrameTime::now())?, Next::Idle);
+    assert_eq!(wait!(engine.render(FrameTime::now()))?, Next::Idle);
     let before = wakes.load(Ordering::Relaxed);
     send.send(wgpu::Color::RED)?;
     redraw.request_redraw();
@@ -133,7 +141,7 @@ fn content_is_retained_clipped_and_wakes_an_idle_host() -> Result<(), Box<dyn st
         before,
         "detached content does not wake host"
     );
-    assert_eq!(engine.render(FrameTime::now())?, Next::Idle);
+    assert_eq!(wait!(engine.render(FrameTime::now()))?, Next::Idle);
     assert_eq!(
         frames.load(Ordering::Relaxed),
         3,
@@ -142,16 +150,17 @@ fn content_is_retained_clipped_and_wakes_an_idle_host() -> Result<(), Box<dyn st
     surface.update(|tx| {
         tx[surface.root()].push(&layer);
     });
-    assert_eq!(engine.render(FrameTime::now())?, Next::Idle);
+    assert_eq!(wait!(engine.render(FrameTime::now()))?, Next::Idle);
     assert_eq!(
         frames.load(Ordering::Relaxed),
         4,
         "reattach consumes the pending update"
     );
     drop(layer);
-    engine.render(FrameTime::now())?;
+    wait!(engine.render(FrameTime::now()))?;
     assert_eq!(drops.load(Ordering::Relaxed), 1);
     Ok(())
+}
 }
 
 struct TimeSample {
@@ -168,6 +177,13 @@ struct TimedProducer {
 }
 
 impl GpuContent for TimedProducer {
+    #[cfg_attr(
+        target_arch = "wasm32",
+        expect(
+            clippy::future_not_send,
+            reason = "the wasm32 harness runs on the single-threaded page event loop"
+        )
+    )]
     async fn setup(&mut self, context: &wgpu::Context<'_>) {
         self.adapter
             .send(context.adapter.get_info().name)
@@ -190,13 +206,14 @@ impl GpuContent for TimedProducer {
     }
 }
 
-#[test]
+split_test! {
 fn producer_samples_engine_time_and_keeps_setup_across_display_changes()
 -> Result<(), Box<dyn std::error::Error>> {
-    use std::time::{Duration, Instant};
-    let engine = Engine::<Gpu>::new(GpuConfig::default())?;
+    use std::time::Duration;
+use cherenkov::Instant;
+    let engine = wait!(Engine::<Gpu>::new(GpuConfig::default()))?;
     let surface =
-        engine.surface(Offscreen::new((16, 16), OffscreenFormat::LinearF16).rate(30..=120))?;
+        wait!(engine.surface(Offscreen::new((16, 16), OffscreenFormat::LinearF16).rate(30..=120)))?;
     let (adapter, adapters) = mpsc::channel();
     let (samples, times) = mpsc::channel();
     surface.update(|tx| {
@@ -213,7 +230,7 @@ fn producer_samples_engine_time_and_keeps_setup_across_display_changes()
         ));
     });
     let start = Instant::now();
-    let Next::At { rate, .. } = engine.render(FrameTime::at(start))? else {
+    let Next::At { rate, .. } = wait!(engine.render(FrameTime::at(start)))? else {
         panic!("producer requests another frame");
     };
     assert_eq!(rate, 30..=120);
@@ -223,7 +240,7 @@ fn producer_samples_engine_time_and_keeps_setup_across_display_changes()
     assert_eq!(first.delta, Duration::ZERO);
     assert_eq!(first.size, (8, 8));
     assert_eq!(
-        engine.render(FrameTime::at(start + Duration::from_millis(250)))?,
+        wait!(engine.render(FrameTime::at(start + Duration::from_millis(250))))?,
         Next::Idle
     );
     let second = times.try_recv()?;
@@ -233,7 +250,7 @@ fn producer_samples_engine_time_and_keeps_setup_across_display_changes()
         scale: 2.0,
         ..cherenkov::Display::default()
     })?;
-    engine.render(FrameTime::at(start + Duration::from_millis(500)))?;
+    wait!(engine.render(FrameTime::at(start + Duration::from_millis(500))))?;
     let third = times.try_recv()?;
     assert_eq!(third.elapsed, Duration::from_millis(500));
     assert_eq!(third.delta, Duration::from_millis(250));
@@ -241,16 +258,17 @@ fn producer_samples_engine_time_and_keeps_setup_across_display_changes()
     surface.update(|tx| {
         tx[surface.root()].gpu_content_size((4, 4));
     });
-    engine.render(FrameTime::at(start + Duration::from_millis(750)))?;
+    wait!(engine.render(FrameTime::at(start + Duration::from_millis(750))))?;
     let resized = times.try_recv()?;
     assert_eq!(resized.size, (4, 4));
     assert_eq!(resized.elapsed, Duration::from_millis(750));
     assert_eq!(resized.delta, Duration::from_millis(250));
     assert!(adapters.try_recv().is_err(), "setup is not repeated");
     assert_eq!(
-        engine.render(FrameTime::at(start + Duration::from_secs(1)))?,
+        wait!(engine.render(FrameTime::at(start + Duration::from_secs(1))))?,
         Next::Idle
     );
     assert!(times.try_recv().is_err(), "idle retains producer output");
     Ok(())
+}
 }

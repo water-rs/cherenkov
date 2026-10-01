@@ -5,6 +5,9 @@
 //! `scenes/corpus/<name>/` as a `scene.json` plus a `resources/` directory of
 //! BLAKE3-addressed blobs (fonts, images).
 
+#[path = "generate_corpus/authored.rs"]
+mod authored;
+
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::ExitCode;
@@ -18,8 +21,8 @@ use cherenkov_scene::{
     BackdropEffectSpec, BackdropFilter, BlendMode, Color, ColorSpace, Draw, Extend, FillRule,
     FilterBlend, Glyph, GlyphRun, GradientStop, ImageColorSpace, ImageEncoding, ImagePaint,
     LayerBuilder, LayerFilter, LinearGradient, Live, Motion, MotionAnimation, NormalizedCoord,
-    Paint, RadialGradient, ResourceHash, Sampling, Scene, SceneBuilder, SceneError, Shape,
-    StrokeStyle, SweepGradient,
+    Paint, Projection, RadialGradient, ResourceHash, Sampling, Scene, SceneBuilder, SceneError,
+    Shape, StrokeStyle, SweepGradient,
 };
 use fontique::FontWeight;
 use parley::{
@@ -28,6 +31,19 @@ use parley::{
 };
 use read_fonts::types::F2Dot14;
 use skrifa::MetadataProvider;
+
+/// `kurbo::Affine::rotate` evaluated with `libm` so the sine/cosine
+/// coefficients cannot drift one ulp between host libms.
+fn rotate(th: f64) -> Affine {
+    let (s, c) = libm::sincos(th);
+    Affine::new([c, s, -s, c, 0.0, 0.0])
+}
+
+/// `kurbo::Affine::rotate_about` over [`rotate`].
+fn rotate_about(th: f64, center: impl Into<Point>) -> Affine {
+    let center = center.into().to_vec2();
+    Affine::translate(center) * rotate(th) * Affine::translate(-center)
+}
 
 /// Padding around text scenes so ascenders/descenders stay inside.
 const TEXT_PAD: f32 = 12.0;
@@ -497,7 +513,7 @@ fn p3_png(width: u32, height: u32) -> Vec<u8> {
                 let enc = if c <= 0.003_130_8 {
                     c * 12.92
                 } else {
-                    1.055 * c.powf(1.0 / 2.4) - 0.055
+                    1.055 * libm::powf(c, 1.0 / 2.4) - 0.055
                 };
                 #[expect(
                     clippy::cast_possible_truncation,
@@ -718,7 +734,7 @@ fn star_path(cx: f64, cy: f64, r0: f64, r1: f64) -> BezPath {
     for i in 0..10 {
         let angle = f64::from(i) * std::f64::consts::TAU / 10.0 - std::f64::consts::FRAC_PI_2;
         let r = if i % 2 == 0 { r1 } else { r0 };
-        let pt = (cx + r * angle.cos(), cy + r * angle.sin());
+        let pt = (cx + r * libm::cos(angle), cy + r * libm::sin(angle));
         if i == 0 {
             p.move_to(pt);
         } else {
@@ -841,7 +857,13 @@ fn write_corpus(out: &Path, corpus: &Corpus) -> Result<(), SceneError> {
     std::fs::create_dir_all(out)?;
     for entry in &corpus.entries {
         let dir = out.join(&entry.name);
-        entry.scene.save(&dir)?;
+        match &entry.body {
+            EntryBody::Scene(scene) => scene.save(&dir)?,
+            EntryBody::Json(text) => {
+                std::fs::create_dir_all(&dir)?;
+                std::fs::write(dir.join("scene.json"), text)?;
+            }
+        }
         for blob in &entry.blobs {
             Scene::store_resource(&dir, blob)?;
         }
@@ -852,8 +874,16 @@ fn write_corpus(out: &Path, corpus: &Corpus) -> Result<(), SceneError> {
 /// One emitted scene plus the blobs its `resources/` needs.
 struct Entry {
     name: String,
-    scene: Scene,
+    body: EntryBody,
     blobs: Vec<Vec<u8>>,
+}
+
+/// How an entry's `scene.json` is produced: the typed builder, or text
+/// laid out byte-for-byte the way the hand-committed scenes were written
+/// (see `authored`).
+enum EntryBody {
+    Scene(Box<Scene>),
+    Json(String),
 }
 
 struct Corpus {
@@ -894,8 +924,18 @@ impl Corpus {
         let scene = builder.build();
         self.entries.push(Entry {
             name: name.into(),
-            scene,
+            body: EntryBody::Scene(Box::new(scene)),
             blobs: Vec::new(),
+        });
+    }
+
+    /// Queue a scene whose `scene.json` is already rendered text (the
+    /// hand-authored scenes in `authored`).
+    fn push_json(&mut self, name: &str, text: String, blobs: Vec<Vec<u8>>) {
+        self.entries.push(Entry {
+            name: name.to_string(),
+            body: EntryBody::Json(text),
+            blobs,
         });
     }
 
@@ -942,10 +982,567 @@ impl Corpus {
         let scene = builder.build();
         self.entries.push(Entry {
             name: name.into(),
-            scene,
+            body: EntryBody::Scene(Box::new(scene)),
             blobs,
         });
     }
+}
+
+/// The colours of one projective card variant (SDR, P3-only or HDR).
+struct CardColors {
+    face: Color,
+    ink: Color,
+    accent: Color,
+    line: Color,
+}
+
+/// Text on a projective card: Latin, CJK and Arabic lines, shaped once.
+struct CardText {
+    runs: Vec<GlyphRun>,
+    blobs: Vec<Vec<u8>>,
+}
+
+impl CardText {
+    fn new(ctx: &mut TextContext, ink: &Paint) -> Self {
+        let lines = [
+            ("NotoSans.ttf", corpus::LATIN, 13.0, 0.0),
+            ("NotoSansSC.ttf", corpus::CJK, 16.0, 36.0),
+            ("NotoSansArabic.ttf", corpus::ARABIC, 16.0, 60.0),
+        ];
+        let mut runs = Vec::new();
+        for (file, text, size, dy) in lines {
+            for run in ctx.shape(file, text, size, FontWeight::NORMAL, ink) {
+                runs.push(offset_run(&run, 0.0, dy));
+            }
+        }
+        let blobs = font_blobs(ctx, &[&runs]);
+        Self { runs, blobs }
+    }
+}
+
+/// A 256×128 local card at the origin, clipped to a rounded rect: a face,
+/// text in three scripts, one-pixel strokes, a rounded badge and an image.
+fn projective_card(l: &mut LayerBuilder, text: &CardText, image: ResourceHash, c: &CardColors) {
+    l.clip(Shape::rounded_rect(0.0, 0.0, 256.0, 128.0, 14.0));
+    l.fill(Shape::rect(0.0, 0.0, 256.0, 128.0), solid(c.face));
+    for run in &text.runs {
+        l.glyphs(offset_run(run, 4.0, 2.0));
+    }
+    for i in 0..6 {
+        let y = 0.5_f64.mul_add(1.0, f64::from(i).mul_add(5.0, 96.0));
+        l.stroke(
+            Shape::Line(Line::new((12.0, y), (150.0, y))),
+            StrokeStyle {
+                width: 1.0,
+                ..StrokeStyle::default()
+            },
+            solid(c.line),
+        );
+    }
+    l.fill(
+        Shape::rounded_rect(168.0, 88.0, 72.0, 28.0, 10.0),
+        solid(c.accent),
+    );
+    l.image(
+        image,
+        Rect::new(196.0, 14.0, 244.0, 62.0),
+        Sampling::Bilinear,
+    );
+}
+
+/// A perspective card placed with its local origin at `(x, y)` and tilted
+/// about its centre.
+fn card_projection(tilt: Vec2, distance: f64) -> Projection {
+    Projection {
+        matrix: Projection::perspective(distance),
+        tilt,
+        pivot: Vec2::new(128.0, 64.0),
+        ..Projection::default()
+    }
+}
+
+/// A `size`×`size` one-texel checkerboard of `a` and `b`.
+fn fine_checker_png(size: u8, a: [u8; 4], b: [u8; 4]) -> Vec<u8> {
+    let mut px = Vec::with_capacity(usize::from(size) * usize::from(size) * 4);
+    for y in 0..size {
+        for x in 0..size {
+            px.extend_from_slice(if (x + y) % 2 == 0 { &a } else { &b });
+        }
+    }
+    encode_png_rgba(u32::from(size), u32::from(size), &px)
+}
+
+/// The two-stop linear gradient from `a` at `start` to `b` at `end`.
+fn linear2(start: Point, end: Point, a: Color, b: Color) -> Paint {
+    Paint::Linear(LinearGradient {
+        start,
+        end,
+        stops: vec![
+            GradientStop {
+                offset: 0.0,
+                color: a,
+            },
+            GradientStop {
+                offset: 1.0,
+                color: b,
+            },
+        ],
+        extend: Extend::Pad,
+        interpolation: ColorSpace::LinearP3,
+    })
+}
+
+/// Projective layers (#84): cards rotated in depth with text, thin paths,
+/// rounded geometry and an image; flips; the horizon; nesting; blends;
+/// backdrops; and minification.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one scene family per block, in the corpus's usual style"
+)]
+fn projective_scenes(corpus: &mut Corpus, ctx: &mut TextContext) {
+    use std::f64::consts::{PI, TAU};
+    let sdr = CardColors {
+        face: srgb(0.97, 0.96, 0.92),
+        ink: srgb(0.1, 0.1, 0.14),
+        accent: srgb(0.85, 0.3, 0.2),
+        line: srgb(0.2, 0.35, 0.8),
+    };
+    let wide = CardColors {
+        face: p3(0.95, 0.97, 0.9),
+        ink: p3(0.05, 0.3, 0.05),
+        accent: p3(0.0, 0.85, 0.2),
+        line: p3(0.9, 0.0, 0.3),
+    };
+    let bright = CardColors {
+        face: srgb(0.9, 0.9, 0.95),
+        ink: srgb(0.05, 0.05, 0.1),
+        accent: hdr(4.0, 1.2, 0.3),
+        line: hdr(0.5, 1.5, 6.0),
+    };
+    let checker = checker_png();
+    let backdrop = srgb(0.86, 0.88, 0.92);
+    let texts = [
+        CardText::new(ctx, &solid(sdr.ink)),
+        CardText::new(ctx, &solid(wide.ink)),
+        CardText::new(ctx, &solid(bright.ink)),
+    ];
+    let with_image = |text: &CardText| {
+        let mut blobs = text.blobs.clone();
+        blobs.push(checker.clone());
+        blobs
+    };
+
+    // Tilt about the vertical axis through the card centre, perspective
+    // at 480 units.
+    for degrees in [0_u32, 30, 60, 80, 89] {
+        let tilt = Vec2::new(0.0, f64::from(degrees).to_radians());
+        corpus.scene_with_blobs(
+            format!("projective-card-{degrees:02}"),
+            320,
+            192,
+            backdrop,
+            |l| {
+                l.layer(|card| {
+                    card.transform(Affine::translate((32.0, 32.0)));
+                    card.projection(card_projection(tilt, 480.0));
+                    projective_card(card, &texts[0], ResourceHash::of(&checker), &sdr);
+                });
+            },
+            with_image(&texts[0]),
+        );
+    }
+    for (suffix, colors, text) in [("p3", &wide, &texts[1]), ("hdr", &bright, &texts[2])] {
+        corpus.scene_with_blobs(
+            format!("projective-card-60-{suffix}"),
+            320,
+            192,
+            backdrop,
+            |l| {
+                l.layer(|card| {
+                    card.transform(Affine::translate((32.0, 32.0)));
+                    card.projection(card_projection(Vec2::new(0.35, 60_f64.to_radians()), 480.0));
+                    projective_card(card, text, ResourceHash::of(&checker), colors);
+                });
+            },
+            with_image(text),
+        );
+    }
+
+    // A full turn about a non-central pivot on a spring, pushed back in
+    // depth: the settled frame shows the front face again.
+    corpus.scene_with_blobs(
+        "projective-flip",
+        320,
+        192,
+        backdrop,
+        |l| {
+            l.layer(|card| {
+                card.transform(Affine::translate((32.0, 32.0)));
+                card.projection(Projection {
+                    matrix: Projection::perspective(420.0),
+                    tilt: Vec2::new(0.0, TAU),
+                    depth: -40.0,
+                    pivot: Vec2::new(64.0, 64.0),
+                });
+                card.motion(Motion::Tilt {
+                    from: Vec2::ZERO,
+                    animation: MotionAnimation::Spring {
+                        response: 0.4,
+                        damping: 0.8,
+                    },
+                });
+                projective_card(card, &texts[0], ResourceHash::of(&checker), &sdr);
+            });
+        },
+        with_image(&texts[0]),
+    );
+    // A curve-timed tilt that crosses density buckets, settling showing the
+    // back face (turned half way, both sides are drawn).
+    corpus.scene_with_blobs(
+        "projective-flip-back",
+        320,
+        192,
+        backdrop,
+        |l| {
+            l.layer(|card| {
+                card.transform(Affine::translate((32.0, 32.0)));
+                card.projection(Projection {
+                    matrix: Projection::perspective(300.0),
+                    tilt: Vec2::new(0.2, PI - 0.3),
+                    depth: 30.0,
+                    pivot: Vec2::new(128.0, 64.0),
+                });
+                card.motion(Motion::Tilt {
+                    from: Vec2::new(0.0, 0.0),
+                    animation: MotionAnimation::Curve {
+                        duration_ms: 250,
+                        x1: 0.25,
+                        y1: 0.1,
+                        x2: 0.25,
+                        y2: 1.0,
+                    },
+                });
+                projective_card(card, &texts[0], ResourceHash::of(&checker), &sdr);
+            });
+        },
+        with_image(&texts[0]),
+    );
+
+    // The horizon: a tall plane leaning back under a close camera. Its far
+    // part recedes toward the horizon line and its near part crosses
+    // W = 0 (`y > 328`) and passes behind the viewer, where it contributes
+    // nothing. The rescaled variant multiplies the matrix by a positive
+    // factor and must render identically.
+    let floor = |l: &mut LayerBuilder| {
+        let extent = Rect::new(0.0, -600.0, 320.0, 520.0);
+        l.clip(Shape::Rect(extent));
+        l.fill(
+            Shape::Rect(extent),
+            linear2(
+                Point::new(0.0, -600.0),
+                Point::new(0.0, 520.0),
+                srgb(0.2, 0.3, 0.7),
+                srgb(0.95, 0.8, 0.3),
+            ),
+        );
+        for i in 0..11 {
+            let x = f64::from(i) * 32.0;
+            l.stroke(
+                Shape::Line(Line::new((x, -600.0), (x, 520.0))),
+                StrokeStyle {
+                    width: 2.0,
+                    ..StrokeStyle::default()
+                },
+                solid(srgb(0.1, 0.1, 0.1)),
+            );
+        }
+        for i in 0..35 {
+            let y = f64::from(i).mul_add(32.0, -600.0);
+            l.fill(
+                Shape::rect(0.0, y, 320.0, 3.0),
+                solid(srgb(0.95, 0.95, 0.95)),
+            );
+        }
+    };
+    for (name, scale) in [
+        ("projective-horizon", 1.0),
+        ("projective-horizon-rescaled", 4.0),
+    ] {
+        corpus.scene(name, 320, 192, backdrop, |l| {
+            l.layer(|plane| {
+                plane.transform(Affine::translate((0.0, -8.0)));
+                plane.projection(Projection {
+                    matrix: Projection::perspective(160.0).map(|row| row.map(|v| v * scale)),
+                    tilt: Vec2::new(1.25, 0.0),
+                    pivot: Vec2::new(160.0, 160.0),
+                    ..Projection::default()
+                });
+                floor(plane);
+            });
+        });
+    }
+    // Behind the viewer: every visible W is negative, nothing is drawn.
+    corpus.scene("projective-horizon-behind", 128, 96, backdrop, |l| {
+        l.layer(|plane| {
+            plane.projection(Projection {
+                matrix: Projection::perspective(100.0),
+                depth: 150.0,
+                ..Projection::default()
+            });
+            floor(plane);
+        });
+    });
+    // An edge exactly on W = 0: W = 1 − (y − 32)/128 vanishes at y = 160,
+    // the clip's bottom edge.
+    corpus.scene("projective-horizon-edge", 256, 256, backdrop, |l| {
+        l.layer(|plane| {
+            let mut matrix = Projection::identity();
+            matrix[3][1] = -1.0 / 128.0;
+            plane.projection(Projection {
+                matrix,
+                pivot: Vec2::new(128.0, 32.0),
+                ..Projection::default()
+            });
+            plane.clip(Shape::rect(96.0, 32.0, 64.0, 128.0));
+            plane.fill(
+                Shape::rect(96.0, 32.0, 64.0, 128.0),
+                linear2(
+                    Point::new(0.0, 32.0),
+                    Point::new(0.0, 160.0),
+                    srgb(0.9, 0.2, 0.2),
+                    srgb(0.2, 0.2, 0.9),
+                ),
+            );
+            for i in 0..8 {
+                let y = f64::from(i).mul_add(16.0, 34.0);
+                plane.fill(Shape::rect(96.0, y, 64.0, 4.0), solid(srgb(1.0, 1.0, 1.0)));
+            }
+        });
+    });
+
+    // Nesting flattens at each projective layer: the child's tilt is baked
+    // into the parent's local image, its opacity composites there, and the
+    // parent's blur runs over the flattened child before the parent tilts.
+    corpus.scene_with_blobs(
+        "projective-nested",
+        320,
+        224,
+        backdrop,
+        |l| {
+            l.layer(|parent| {
+                parent.transform(Affine::translate((32.0, 24.0)));
+                parent.projection(Projection {
+                    matrix: Projection::perspective(500.0),
+                    tilt: Vec2::new(0.5, 0.0),
+                    pivot: Vec2::new(128.0, 88.0),
+                    ..Projection::default()
+                });
+                parent.clip(Shape::rounded_rect(0.0, 0.0, 256.0, 176.0, 12.0));
+                parent.fill(
+                    Shape::rect(0.0, 0.0, 256.0, 176.0),
+                    solid(srgb(0.3, 0.32, 0.4)),
+                );
+                parent.layer(|child| {
+                    child.transform(Affine::translate((24.0, 40.0)) * Affine::scale(0.75));
+                    child.opacity(0.75);
+                    child.projection(card_projection(Vec2::new(0.0, 0.9), 360.0));
+                    projective_card(child, &texts[0], ResourceHash::of(&checker), &sdr);
+                });
+            });
+        },
+        with_image(&texts[0]),
+    );
+    corpus.scene_with_blobs(
+        "projective-nested-filter",
+        320,
+        224,
+        backdrop,
+        |l| {
+            l.layer(|parent| {
+                parent.transform(Affine::translate((32.0, 24.0)));
+                parent.filter(LayerFilter::GaussianBlur { sigma: 1.5 });
+                parent.projection(Projection {
+                    matrix: Projection::perspective(500.0),
+                    tilt: Vec2::new(-0.4, 0.3),
+                    pivot: Vec2::new(128.0, 88.0),
+                    ..Projection::default()
+                });
+                parent.clip(Shape::rect(0.0, 0.0, 256.0, 176.0));
+                parent.fill(
+                    Shape::rect(0.0, 0.0, 256.0, 176.0),
+                    solid(srgb(0.25, 0.5, 0.45)),
+                );
+                parent.layer(|child| {
+                    child.transform(Affine::translate((24.0, 40.0)) * Affine::scale(0.75));
+                    child.projection(card_projection(Vec2::new(0.6, 0.0), 300.0));
+                    projective_card(child, &texts[0], ResourceHash::of(&checker), &sdr);
+                });
+            });
+        },
+        with_image(&texts[0]),
+    );
+
+    // Blends: translucent overlapping children flatten first, then the
+    // layer multiplies onto the gradient behind it; a destructive `src`
+    // blend clears its whole projected clip, including where its content
+    // is transparent.
+    let blend_ground = |l: &mut LayerBuilder, a: Color, b: Color| {
+        l.fill(
+            Shape::rect(0.0, 0.0, 256.0, 192.0),
+            linear2(Point::new(0.0, 0.0), Point::new(256.0, 192.0), a, b),
+        );
+    };
+    for (name, mode, colors) in [
+        (
+            "projective-blend-multiply",
+            BlendMode::Multiply,
+            [srgba(0.9, 0.2, 0.2, 0.6), srgba(0.2, 0.3, 0.9, 0.6)],
+        ),
+        (
+            "projective-blend-multiply-p3",
+            BlendMode::Multiply,
+            [p3(0.0, 0.9, 0.1), p3(0.95, 0.0, 0.5)],
+        ),
+        (
+            "projective-blend-src",
+            BlendMode::Src,
+            [srgba(0.9, 0.6, 0.1, 0.8), srgba(0.1, 0.6, 0.9, 0.5)],
+        ),
+    ] {
+        corpus.scene(name, 256, 192, backdrop, |l| {
+            blend_ground(l, srgb(0.95, 0.9, 0.3), srgb(0.3, 0.8, 0.9));
+            l.layer(|layer| {
+                layer.transform(Affine::translate((48.0, 32.0)));
+                layer.blend(mode);
+                layer.projection(Projection {
+                    matrix: Projection::perspective(300.0),
+                    tilt: Vec2::new(0.45, -0.6),
+                    pivot: Vec2::new(80.0, 64.0),
+                    ..Projection::default()
+                });
+                layer.clip(Shape::rounded_rect(0.0, 0.0, 160.0, 128.0, 16.0));
+                layer.layer(|a| {
+                    a.fill(Shape::circle(60.0, 60.0, 44.0), solid(colors[0]));
+                });
+                layer.layer(|b| {
+                    b.fill(
+                        Shape::rounded_rect(70.0, 40.0, 70.0, 60.0, 8.0),
+                        solid(colors[1]),
+                    );
+                });
+            });
+        });
+    }
+
+    // Backdrops: a group captured inside a projected card samples the
+    // card's local image; a group outside samples the surface, the
+    // projected card included.
+    corpus.scene_setup("projective-backdrop-inside", 256, 192, backdrop, |b| {
+        b.backdrop_group(1, vec![BackdropFilter::GaussianBlur { sigma: 3.0 }]);
+        let l = &mut b.root();
+        l.layer(|card| {
+            card.transform(Affine::translate((24.0, 24.0)));
+            card.projection(Projection {
+                matrix: Projection::perspective(360.0),
+                tilt: Vec2::new(0.0, 0.7),
+                pivot: Vec2::new(104.0, 72.0),
+                ..Projection::default()
+            });
+            card.clip(Shape::rect(0.0, 0.0, 208.0, 144.0));
+            backdrop_background(card);
+            card.layer(|m| {
+                m.clip(Shape::rounded_rect(32.0, 32.0, 144.0, 80.0, 16.0));
+                m.backdrop(1);
+                m.fill(
+                    Shape::rect(32.0, 32.0, 144.0, 80.0),
+                    solid(srgba(1.0, 1.0, 1.0, 0.3)),
+                );
+            });
+        });
+    });
+    corpus.scene_setup("projective-backdrop-outside-hdr", 256, 192, backdrop, |b| {
+        b.backdrop_group(1, vec![BackdropFilter::GaussianBlur { sigma: 4.0 }]);
+        let l = &mut b.root();
+        l.layer(|card| {
+            card.transform(Affine::translate((24.0, 24.0)));
+            card.projection(Projection {
+                matrix: Projection::perspective(360.0),
+                tilt: Vec2::new(0.6, 0.0),
+                pivot: Vec2::new(104.0, 72.0),
+                ..Projection::default()
+            });
+            card.clip(Shape::rect(0.0, 0.0, 208.0, 144.0));
+            stripes(
+                card,
+                hdr(3.0, 0.8, 0.2),
+                p3(0.0, 0.7, 0.9),
+                [hdr(0.4, 2.5, 0.6), p3(0.9, 0.0, 0.4), srgb(0.9, 0.9, 0.2)],
+            );
+        });
+        l.layer(|m| {
+            m.clip(Shape::rounded_rect(64.0, 96.0, 128.0, 72.0, 20.0));
+            m.backdrop(1);
+            m.fill(
+                Shape::rect(64.0, 96.0, 128.0, 72.0),
+                solid(srgba(1.0, 1.0, 1.0, 0.2)),
+            );
+        });
+    });
+
+    // Minification at high anisotropy: a one-texel checkerboard, one-pixel
+    // strokes and small text on a plane seen at a grazing angle.
+    let fine = fine_checker_png(64, [250, 250, 250, 255], [20, 20, 30, 255]);
+    let small = ctx.shape(
+        "NotoSans.ttf",
+        corpus::LATIN,
+        9.0,
+        FontWeight::NORMAL,
+        &solid(sdr.ink),
+    );
+    let mut blobs = font_blobs(ctx, &[&small]);
+    blobs.push(fine.clone());
+    corpus.scene_with_blobs(
+        "projective-minification",
+        256,
+        192,
+        backdrop,
+        |l| {
+            l.layer(|plane| {
+                plane.transform(Affine::translate((0.0, 40.0)));
+                plane.projection(Projection {
+                    matrix: Projection::perspective(260.0),
+                    tilt: Vec2::new(1.35, 0.25),
+                    pivot: Vec2::new(128.0, 64.0),
+                    ..Projection::default()
+                });
+                plane.clip(Shape::rect(0.0, 0.0, 256.0, 128.0));
+                plane.fill(
+                    Shape::rect(0.0, 0.0, 256.0, 128.0),
+                    solid(srgb(1.0, 1.0, 1.0)),
+                );
+                plane.image(
+                    ResourceHash::of(&fine),
+                    Rect::new(0.0, 0.0, 64.0, 64.0),
+                    Sampling::Nearest,
+                );
+                for i in 0..24 {
+                    let x = f64::from(i).mul_add(8.0, 68.5);
+                    plane.stroke(
+                        Shape::Line(Line::new((x, 0.0), (x, 128.0))),
+                        StrokeStyle {
+                            width: 1.0,
+                            ..StrokeStyle::default()
+                        },
+                        solid(srgb(0.1, 0.2, 0.6)),
+                    );
+                }
+                for run in &small {
+                    plane.glyphs(offset_run(run, 0.0, 70.0));
+                }
+            });
+        },
+        blobs,
+    );
 }
 
 fn main() -> ExitCode {
@@ -1019,7 +1616,7 @@ fn map_body(l: &mut LayerBuilder, pw: f64, ph: f64) {
                 for vi in 0..sides {
                     #[expect(clippy::cast_precision_loss, reason = "vertex index is below 8")]
                     let angle = (vi as f64) * std::f64::consts::TAU / (sides as f64);
-                    let pt = (x + radius * angle.cos(), y + radius * angle.sin());
+                    let pt = (x + radius * libm::cos(angle), y + radius * libm::sin(angle));
                     if vi == 0 {
                         path.move_to(pt);
                     } else {
@@ -1056,6 +1653,235 @@ fn map_body(l: &mut LayerBuilder, pw: f64, ph: f64) {
                     solid(color),
                 );
             }
+        }
+    }
+}
+
+/// The dense city-map frame of #211: a 1600×1200 Positron-style view —
+/// water along the west edge, parkland, a street grid crossed by
+/// diagonal avenues, building footprints and street labels — whose live
+/// coverage exceeds one atlas page.
+///
+/// Deterministic: the `Rng` stream is seeded, so the scene is identical
+/// on every run. Element and segment counts stay bounded because the
+/// oracle is O(segments × pixels); the wide diagonal avenues carry the
+/// coverage past the 4096² cap with few segments.
+#[expect(
+    clippy::suboptimal_flops,
+    reason = "the suggested mul_add rewrites alter serialized float bytes; corpus scenes are pinned"
+)]
+#[expect(clippy::too_many_lines, reason = "the scene is a flat element list")]
+fn dense_map_body(l: &mut LayerBuilder, labels: &[Vec<GlyphRun>]) {
+    const W: f64 = 1600.0;
+    const H: f64 = 1200.0;
+    let mut rng = Rng(0x9D15_5EED_5EED_5EED);
+
+    let water = srgb(0.76, 0.86, 0.91);
+    let park_fill = srgb(0.76, 0.87, 0.70);
+    let facade = srgb(0.83, 0.81, 0.77);
+    let facade_line = srgb(0.66, 0.64, 0.60);
+    let road = srgb(0.99, 0.99, 0.98);
+    let alley = srgb(0.88, 0.88, 0.85);
+
+    let round = StrokeStyle {
+        start_cap: kurbo::Cap::Round,
+        end_cap: kurbo::Cap::Round,
+        ..StrokeStyle::default()
+    };
+
+    // Water: the west river, a wavy filled strip.
+    let mut river = BezPath::new();
+    river.move_to((0.0, 0.0));
+    for i in 0..=12u32 {
+        let y = f64::from(i) * (H / 12.0);
+        river.line_to((160.0 + rng.f64() * 80.0, y));
+    }
+    river.line_to((0.0, H));
+    river.close_path();
+    l.fill(Shape::Path { path: river }, solid(water));
+
+    // Parkland: an irregular green polygon mid-north.
+    let mut park = BezPath::new();
+    let park_corners = [
+        (620.0, 70.0),
+        (1140.0, 90.0),
+        (1160.0, 260.0),
+        (1100.0, 430.0),
+        (640.0, 410.0),
+        (600.0, 240.0),
+    ];
+    for (i, (px, py)) in park_corners.iter().enumerate() {
+        let (jx, jy) = (rng.f64() * 16.0 - 8.0, rng.f64() * 16.0 - 8.0);
+        if i == 0 {
+            park.move_to((px + jx, py + jy));
+        } else {
+            park.line_to((px + jx, py + jy));
+        }
+    }
+    park.close_path();
+    l.fill(Shape::Path { path: park }, solid(park_fill));
+
+    // Streets: horizontal lines with slight jitter, light carriageways.
+    for s in 0..15u32 {
+        let y = 130.0 + f64::from(s) * 70.0 + rng.f64() * 10.0;
+        let mut street = BezPath::new();
+        street.move_to((190.0, y));
+        for k in 1..4u32 {
+            street.line_to((190.0 + f64::from(k) * 460.0, y + rng.f64() * 12.0 - 6.0));
+        }
+        l.stroke(
+            Shape::Path { path: street },
+            StrokeStyle {
+                width: 2.5 + rng.f64() * 3.0,
+                ..round.clone()
+            },
+            solid(road),
+        );
+    }
+
+    // Avenues: verticals, wider than the streets.
+    for a in 0..12u32 {
+        let x = 230.0 + f64::from(a) * 112.0 + rng.f64() * 12.0;
+        let mut ave = BezPath::new();
+        ave.move_to((x, 20.0));
+        for k in 1..4u32 {
+            ave.line_to((x + rng.f64() * 16.0 - 8.0, 20.0 + f64::from(k) * 390.0));
+        }
+        l.stroke(
+            Shape::Path { path: ave },
+            StrokeStyle {
+                width: 5.0 + rng.f64() * 5.0,
+                ..round.clone()
+            },
+            solid(road),
+        );
+    }
+
+    // Diagonal avenues, in both directions.
+    for d in 0..8u32 {
+        let x0 = 200.0 + f64::from(d) * 160.0 + rng.f64() * 30.0;
+        let (w_run, rise) = (650.0 + rng.f64() * 350.0, 1050.0 + rng.f64() * 120.0);
+        let mut ave = BezPath::new();
+        ave.move_to((x0, H));
+        ave.line_to((x0 + w_run * 0.55, H - rise * 0.45 + rng.f64() * 40.0 - 20.0));
+        ave.line_to((x0 + w_run, H - rise));
+        l.stroke(
+            Shape::Path { path: ave },
+            StrokeStyle {
+                width: 8.0 + rng.f64() * 6.0,
+                ..round.clone()
+            },
+            solid(road),
+        );
+    }
+    for d in 0..4u32 {
+        let x0 = 260.0 + f64::from(d) * 280.0 + rng.f64() * 40.0;
+        let (w_run, rise) = (550.0 + rng.f64() * 300.0, 980.0 + rng.f64() * 140.0);
+        let mut ave = BezPath::new();
+        ave.move_to((x0 + w_run, H));
+        ave.line_to((x0 + w_run * 0.45, H - rise * 0.5 + rng.f64() * 40.0 - 20.0));
+        ave.line_to((x0, H - rise));
+        l.stroke(
+            Shape::Path { path: ave },
+            StrokeStyle {
+                width: 6.0 + rng.f64() * 5.0,
+                ..round.clone()
+            },
+            solid(road),
+        );
+    }
+
+    // Boulevards: long wide strokes sweeping across the frame at shallow
+    // angles, like the arterials a dense map style layers under the
+    // street grid. Their coverage is what pushes the frame past one
+    // atlas page: each strip cell spans hundreds of columns.
+    for _ in 0..32u32 {
+        let x0 = rng.f64() * W * 0.4;
+        let y0 = 80.0 + rng.f64() * (H - 160.0);
+        let run_x = 1200.0 + rng.f64() * 420.0;
+        let rise = run_x * (0.24 + rng.f64() * 0.24) * if rng.below(2) == 0 { 1.0 } else { -1.0 };
+        let mut exp = BezPath::new();
+        exp.move_to((x0 - rng.f64() * 300.0, y0));
+        exp.line_to((x0 + run_x * 0.5, y0 + rise * 0.5 + rng.f64() * 40.0 - 20.0));
+        exp.line_to((x0 + run_x, y0 + rise));
+        l.stroke(
+            Shape::Path { path: exp },
+            StrokeStyle {
+                width: 14.0 + rng.f64() * 10.0,
+                ..round.clone()
+            },
+            solid(road),
+        );
+    }
+
+    // Side streets: short connecting strokes inside the grid.
+    for _ in 0..120u32 {
+        let x = 250.0 + rng.f64() * 1260.0;
+        let y = 140.0 + rng.f64() * 1000.0;
+        let mut a = BezPath::new();
+        a.move_to((x, y));
+        a.line_to((x + rng.f64() * 400.0 - 200.0, y + rng.f64() * 200.0 - 100.0));
+        l.stroke(
+            Shape::Path { path: a },
+            StrokeStyle {
+                width: 2.5 + rng.f64() * 4.0,
+                ..round.clone()
+            },
+            solid(alley),
+        );
+    }
+
+    // Buildings: filled polygon footprints with thin stroked outlines,
+    // packed into the blocks the streets and avenues leave.
+    for s in 0..14u32 {
+        let by = 138.0 + f64::from(s) * 72.0;
+        for a in 0..10u32 {
+            let bx = 238.0 + f64::from(a) * 130.0;
+            for _ in 0..=rng.below(2) {
+                let bw = 8.0 + rng.f64() * 30.0;
+                let bh = 6.0 + rng.f64() * 20.0;
+                let bx0 = bx + rng.f64() * 40.0;
+                let by0 = by + rng.f64() * 18.0;
+                if bx0 + bw > 1520.0 || by0 + bh > 1140.0 {
+                    continue;
+                }
+                let sides = 4 + rng.below(3);
+                let mut b = BezPath::new();
+                for v in 0..sides {
+                    let px =
+                        bx0 + if v == 1 || v == 2 { bw } else { 0.0 } + (rng.f64() * 4.0 - 2.0);
+                    let py = by0 + if v < 2 { 0.0 } else { bh } + (rng.f64() * 4.0 - 2.0);
+                    if v == 0 {
+                        b.move_to((px, py));
+                    } else {
+                        b.line_to((px, py));
+                    }
+                }
+                b.close_path();
+                let shape = Shape::Path { path: b };
+                l.fill(shape.clone(), solid(facade));
+                l.stroke(
+                    shape,
+                    StrokeStyle {
+                        width: 0.8,
+                        ..round.clone()
+                    },
+                    solid(facade_line),
+                );
+            }
+        }
+    }
+
+    // Street and place labels, the text a map frame carries.
+    for (i, runs) in labels.iter().enumerate() {
+        let lx = (f64::from(u32::try_from(i).expect("labels fit u32")) * 137.0) % 1180.0
+            + 240.0
+            + rng.f64() * 60.0;
+        let ly = (f64::from(u32::try_from(i).expect("labels fit u32")) * 211.0) % 960.0
+            + 140.0
+            + rng.f64() * 40.0;
+        for run in runs {
+            l.glyphs(offset_run(run, lx, ly));
         }
     }
 }
@@ -1298,7 +2124,7 @@ fn run() -> Result<(), SceneError> {
             l.layer(|a| {
                 a.transform(
                     Affine::translate((64.0, 64.0))
-                        * Affine::rotate(std::f64::consts::FRAC_PI_6)
+                        * rotate(std::f64::consts::FRAC_PI_6)
                         * Affine::translate((-64.0, -64.0)),
                 );
                 a.fill(Shape::rect(48.25, 48.5, 80.25, 80.5), solid(c4));
@@ -1334,7 +2160,7 @@ fn run() -> Result<(), SceneError> {
         l.layer(|a| {
             a.transform(
                 Affine::translate((64.3, 63.8))
-                    * Affine::rotate(0.3)
+                    * rotate(0.3)
                     * Affine::scale(0.85)
                     * Affine::translate((-64.0, -64.0)),
             );
@@ -1737,7 +2563,7 @@ fn run() -> Result<(), SceneError> {
 
     corpus.scene("clip-transform", 128, 128, white, |l| {
         l.layer(|a| {
-            a.transform(Affine::rotate(0.4) * Affine::translate((-20.0, -10.0)));
+            a.transform(rotate(0.4) * Affine::translate((-20.0, -10.0)));
             a.clip(Shape::rounded_rect(16.0, 16.0, 96.0, 96.0, 12.0));
             a.fill(
                 Shape::rect(0.0, 0.0, 160.0, 160.0),
@@ -1784,7 +2610,7 @@ fn run() -> Result<(), SceneError> {
         let c = Point::new(160.0, 160.0);
         for i in 0..5 {
             let angle = f64::from(i).mul_add(144.0, -90.0).to_radians();
-            let p = c + Vec2::new(angle.cos() * 240.0, angle.sin() * 240.0);
+            let p = c + Vec2::new(libm::cos(angle) * 240.0, libm::sin(angle) * 240.0);
             if i == 0 {
                 star.move_to(p);
             } else {
@@ -1854,7 +2680,7 @@ fn run() -> Result<(), SceneError> {
         l.layer(|a| {
             a.transform(
                 Affine::translate((160.0, 160.0))
-                    * Affine::rotate(0.3)
+                    * rotate(0.3)
                     * Affine::scale(1.4)
                     * Affine::translate((-160.0, -160.0)),
             );
@@ -1953,7 +2779,7 @@ fn run() -> Result<(), SceneError> {
 
     corpus.scene("transform-rotate", 128, 128, white, |l| {
         l.layer(|a| {
-            a.transform(Affine::rotate_about(0.6, Point::new(64.0, 64.0)));
+            a.transform(rotate_about(0.6, Point::new(64.0, 64.0)));
             a.fill(
                 Shape::rounded_rect(24.0, 40.0, 80.0, 48.0, 10.0),
                 solid(srgb(0.5, 0.2, 0.6)),
@@ -2714,6 +3540,142 @@ fn run() -> Result<(), SceneError> {
         );
     }
 
+    // ---- #98 presentation corpus ------------------------------------------
+    // The content every `render --present` encoding (P3, scRGB, extended
+    // sRGB/P3, PQ, HLG) must carry: neutral values 0/0.18/1/2/4/8, P3
+    // colours outside sRGB, negative extended components, transparent
+    // coloured edges, and a glass highlight above SDR white. The headroom
+    // sequence 4→2→1→4 is display state, not scene content — cherenkov's
+    // `headroom_updates_present_without_regenerating_content` test covers
+    // it. Declared headroom 4 exercises the HDR tone-map branch.
+    corpus.scene_headroom("present-neutrals", 196, 44, white, 4.0, |l| {
+        for (i, v) in [0.0f32, 0.18, 1.0, 2.0, 4.0, 8.0].into_iter().enumerate() {
+            let x = 4.0 + 32.0 * f64::from(u32::try_from(i).unwrap());
+            l.fill(Shape::rect(x, 4.0, 28.0, 36.0), solid(hdr(v, v, v)));
+        }
+    });
+
+    corpus.scene_headroom("present-p3-outside-srgb", 100, 100, white, 4.0, |l| {
+        for (i, swatch) in [
+            p3(1.0, 0.0, 0.0),
+            p3(0.0, 1.0, 0.0),
+            p3(0.0, 0.0, 1.0),
+            p3(0.0, 1.0, 0.4),
+            p3(1.0, 0.0, 0.6),
+            p3(1.0, 0.6, 0.0),
+            p3(0.0, 0.9, 0.9),
+            p3(0.6, 0.0, 1.0),
+            p3(0.2, 1.0, 0.2),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let x = 4.0 + 32.0 * f64::from(u32::try_from(i % 3).unwrap());
+            let y = 4.0 + 32.0 * f64::from(u32::try_from(i / 3).unwrap());
+            l.fill(Shape::rect(x, y, 28.0, 28.0), solid(swatch));
+        }
+    });
+
+    corpus.scene_headroom("present-extended-negatives", 100, 68, white, 4.0, |l| {
+        for (i, swatch) in [
+            Color::new(ColorSpace::LinearP3, [-0.3, 0.7, 0.4, 1.0]),
+            Color::new(ColorSpace::LinearP3, [0.1, -0.15, 0.3, 1.0]),
+            Color::new(ColorSpace::LinearP3, [1.2, -0.05, 0.5, 1.0]),
+            Color::new(ColorSpace::LinearP3, [-0.2, -0.2, 1.0, 1.0]),
+            Color::new(ColorSpace::LinearP3, [0.5, 0.5, -0.1, 1.0]),
+            Color::new(ColorSpace::LinearP3, [-0.05, 2.0, -0.05, 1.0]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let x = 4.0 + 32.0 * f64::from(u32::try_from(i % 3).unwrap());
+            let y = 4.0 + 32.0 * f64::from(u32::try_from(i / 3).unwrap());
+            l.fill(Shape::rect(x, y, 28.0, 28.0), solid(swatch));
+        }
+    });
+
+    // Fractional-alpha wide-gamut fills: the anti-aliased edges are the
+    // transparent coloured edges the premultiply/encode order must carry.
+    corpus.scene_headroom(
+        "present-transparent-edges",
+        96,
+        96,
+        srgb(0.06, 0.06, 0.09),
+        4.0,
+        |l| {
+            l.fill(
+                Shape::circle(30.0, 30.0, 22.0),
+                solid(Color::new(ColorSpace::LinearP3, [1.0, 0.1, 0.3, 0.5])),
+            );
+            l.fill(
+                Shape::circle(66.0, 30.0, 22.0),
+                solid(Color::new(ColorSpace::LinearP3, [0.0, 1.0, 0.5, 0.25])),
+            );
+            l.fill(
+                Shape::rounded_rect(12.0, 56.0, 52.0, 90.0, 8.0),
+                solid(Color::new(ColorSpace::LinearP3, [0.2, 0.4, 1.0, 0.75])),
+            );
+            l.layer(|m| {
+                m.transform(rotate_about(0.4, Point::new(76.0, 72.0)));
+                m.fill(
+                    Shape::rect(60.0, 56.0, 92.0, 88.0),
+                    solid(Color::new(ColorSpace::LinearP3, [2.0, 1.4, 0.4, 0.6])),
+                );
+            });
+        },
+    );
+
+    // "Glass": a blurred backdrop panel over HDR content whose specular
+    // highlight sits above SDR white — the transparency edge case for
+    // every encoded output.
+    let mut glass = Scene::builder(256, 256).clear(white).present_headroom(4.0);
+    glass.backdrop_group(1, vec![BackdropFilter::GaussianBlur { sigma: 6.0 }]);
+    corpus.scene_from(
+        "present-glass-highlights",
+        glass,
+        |l| {
+            l.fill(
+                Shape::rect(0.0, 0.0, 256.0, 256.0),
+                Paint::Linear(LinearGradient {
+                    start: Point::new(0.0, 0.0),
+                    end: Point::new(256.0, 256.0),
+                    stops: vec![
+                        GradientStop {
+                            offset: 0.0,
+                            color: p3(0.05, 0.10, 0.30),
+                        },
+                        GradientStop {
+                            offset: 1.0,
+                            color: p3(0.45, 0.12, 0.05),
+                        },
+                    ],
+                    extend: Extend::Pad,
+                    interpolation: ColorSpace::LinearP3,
+                }),
+            );
+            l.fill(Shape::circle(96.0, 96.0, 48.0), solid(hdr(4.0, 1.0, 0.5)));
+            l.fill(
+                Shape::rect(140.0, 120.0, 236.0, 190.0),
+                solid(Color::new(ColorSpace::Rec2020, [0.9, 0.15, 0.6, 1.0])),
+            );
+            l.layer(|m| {
+                let clip = Shape::RoundedRect(RoundedRect::new(40.0, 40.0, 216.0, 216.0, 28.0));
+                m.clip(clip);
+                m.backdrop(1);
+                // The specular strip: translucent white at 4x SDR white.
+                m.fill(
+                    Shape::rect(48.0, 52.0, 208.0, 76.0),
+                    solid(Color::new(ColorSpace::LinearP3, [4.0, 4.0, 4.0, 0.5])),
+                );
+                m.fill(
+                    Shape::rect(42.0, 42.0, 172.0, 172.0),
+                    solid(srgba(1.0, 1.0, 1.0, 0.1)),
+                );
+            });
+        },
+        Vec::new(),
+    );
+
     // Blend modes over P3 and HDR content, same geometry as `blend-*`.
     for mode in BlendMode::ALL {
         let mname = serde_json::to_value(mode)
@@ -3158,7 +4120,7 @@ fn run() -> Result<(), SceneError> {
                 l.layer(|a| {
                     a.transform(
                         Affine::translate((70.0, 95.0))
-                            * Affine::rotate(-0.35)
+                            * rotate(-0.35)
                             * Affine::skew(0.3, 0.0)
                             * Affine::scale_non_uniform(1.2, 0.8),
                     );
@@ -3299,7 +4261,7 @@ fn run() -> Result<(), SceneError> {
                 l.layer(|rotated| {
                     rotated.transform(
                         Affine::translate((40.0, 30.0))
-                            * Affine::rotate(15_f64.to_radians())
+                            * rotate(15_f64.to_radians())
                             * Affine::scale_non_uniform(1.2, 0.8),
                     );
                     for run in &first {
@@ -3319,20 +4281,20 @@ fn run() -> Result<(), SceneError> {
 
     {
         let sbix_transforms = [
-            Affine::rotate(20_f64.to_radians()),
+            rotate(20_f64.to_radians()),
             Affine::skew(0.35, 0.0),
             Affine::skew(0.0, -0.25),
             Affine::scale_non_uniform(1.4, 0.8),
-            Affine::rotate((-15_f64).to_radians())
+            rotate((-15_f64).to_radians())
                 * Affine::skew(0.2, -0.12)
                 * Affine::scale_non_uniform(0.8, 1.25),
         ];
         let cbdt_transforms = [
-            Affine::rotate((-20_f64).to_radians()),
+            rotate((-20_f64).to_radians()),
             Affine::skew(-0.25, 0.15),
             Affine::scale_non_uniform(0.7, 1.3),
-            Affine::rotate(45_f64.to_radians()),
-            Affine::rotate(12_f64.to_radians())
+            rotate(45_f64.to_radians()),
+            rotate(12_f64.to_radians())
                 * Affine::skew(0.18, 0.08)
                 * Affine::scale_non_uniform(1.15, 0.9),
         ];
@@ -4022,8 +4984,8 @@ fn run() -> Result<(), SceneError> {
                     let x = 80.0 + f64::from(i) * (920.0 / 1999.0);
                     let t = f64::from(i) * 0.01;
                     let y = 750.0
-                        - 320.0 * (0.5 + 0.3 * t.sin() + 0.2 * (3.1 * t).cos())
-                        - 40.0 * (t * 17.3).sin();
+                        - 320.0 * (0.5 + 0.3 * libm::sin(t) + 0.2 * libm::cos(3.1 * t))
+                        - 40.0 * libm::sin(t * 17.3);
                     if i == 0 {
                         line.move_to((x, y));
                     } else {
@@ -4044,7 +5006,7 @@ fn run() -> Result<(), SceneError> {
                 // Bar chart: 44 bars.
                 let bw = (920.0 - 40.0 * 8.0) / 44.0;
                 for i in 0u8..44 {
-                    let h = 120.0 + 380.0 * (f64::from(i) * 0.37).sin().mul_add(0.5, 0.5);
+                    let h = 120.0 + 380.0 * libm::sin(f64::from(i) * 0.37).mul_add(0.5, 0.5);
                     let x = 90.0 + f64::from(i) * (bw + 8.0);
                     l.fill(
                         Shape::Rect(Rect::new(x, 2050.0 - h, x + bw, 2050.0)),
@@ -4430,7 +5392,7 @@ fn run() -> Result<(), SceneError> {
         l.layer(|m| {
             m.transform(
                 Affine::translate(Vec2::new(128.0, 128.0))
-                    * Affine::rotate(17.0f64.to_radians())
+                    * rotate(17.0f64.to_radians())
                     * Affine::scale(1.2),
             );
             m.clip(Shape::rect(-44.0, -44.0, 88.0, 88.0));
@@ -4843,6 +5805,50 @@ fn run() -> Result<(), SceneError> {
         // Far corner: stays a separate region.
         member(l, [440.0, 428.0, 508.0, 508.0], None);
     });
+
+    // The #211 dense city map: a 1600×1200 frame whose live coverage
+    // exceeds one atlas page. Its output is generated — never committed.
+    {
+        const LABELS: &[&str] = &[
+            "1 AV",
+            "2 AV",
+            "LEXINGTON AV",
+            "PARK AV",
+            "5 AV",
+            "6 AV",
+            "7 AV",
+            "BROADWAY",
+            "W 14 ST",
+            "W 23 ST",
+            "W 34 ST",
+            "W 42 ST",
+            "W 57 ST",
+            "W 72 ST",
+            "HOUSTON ST",
+            "CANAL ST",
+        ];
+        let shaped: Vec<Vec<GlyphRun>> = LABELS
+            .iter()
+            .map(|t| ctx.shape("NotoSans.ttf", t, 12.0, FontWeight::NORMAL, &solid(dark)))
+            .collect();
+        let blobs = font_blobs(&ctx, &shaped.iter().map(Vec::as_slice).collect::<Vec<_>>());
+        corpus.scene_with_blobs(
+            "dense-map",
+            1600,
+            1200,
+            srgb(0.93, 0.94, 0.92),
+            |l| dense_map_body(l, &shaped),
+            blobs,
+        );
+    }
+
+    // ---- Scenes committed before the generator covered them ----------
+
+    authored::add(&mut corpus, &mut ctx)?;
+
+    // ---- Projective layers (#84) -------------------------------------------
+
+    projective_scenes(&mut corpus, &mut ctx);
 
     // ---- Write out ---------------------------------------------------------
 

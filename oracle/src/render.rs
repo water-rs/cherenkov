@@ -76,6 +76,10 @@ pub enum RenderError {
     /// A backdrop-group violation: an undeclared group id or a member
     /// layer without a clip.
     Backdrop(String),
+    /// A projective layer the model rejects: an invalid pose, a layer
+    /// without a clip, a projective backdrop member, a backdrop group
+    /// spanning composition spaces, or no finite density bound.
+    Projective(String),
 }
 
 impl std::fmt::Display for RenderError {
@@ -84,6 +88,7 @@ impl std::fmt::Display for RenderError {
             Self::Glyphs(e) => write!(f, "glyph error: {e}"),
             Self::Resource(e) => write!(f, "resource error: {e}"),
             Self::Backdrop(e) => write!(f, "backdrop error: {e}"),
+            Self::Projective(e) => write!(f, "projective error: {e}"),
         }
     }
 }
@@ -235,6 +240,13 @@ fn flattened(chain: &[Level]) -> Canvas {
 struct Backdrops<'a> {
     groups: &'a [BackdropGroup],
     captures: HashMap<u32, (BlendSpace, Canvas)>,
+    /// The composition space being painted: 0 for the surface, a fresh
+    /// number for each projective layer's local image.
+    space: usize,
+    /// The last composition space number handed out.
+    spaces: usize,
+    /// The composition space each group's first member was found in.
+    member_space: HashMap<u32, usize>,
 }
 
 impl Backdrops<'_> {
@@ -251,6 +263,7 @@ pub struct Renderer {
     width: usize,
     height: usize,
     scene_rect: Rect,
+    reconstruction: crate::projective::Reconstruction,
 }
 
 impl Renderer {
@@ -265,7 +278,20 @@ impl Renderer {
             width,
             height,
             scene_rect: Rect::new(0.0, 0.0, width as f64, height as f64),
+            reconstruction: crate::projective::Reconstruction::Model,
         }
+    }
+
+    /// The renderer reconstructing projective layers with `reconstruction`
+    /// (the specified model by default; see
+    /// [`crate::projective::Reconstruction`]).
+    #[must_use]
+    pub const fn with_reconstruction(
+        mut self,
+        reconstruction: crate::projective::Reconstruction,
+    ) -> Self {
+        self.reconstruction = reconstruction;
+        self
     }
 
     /// Render `scene` into a premultiplied linear-P3 `f32` image.
@@ -312,6 +338,9 @@ impl Renderer {
         let mut backdrops = Backdrops {
             groups: &scene.backdrop_groups,
             captures: HashMap::new(),
+            space: 0,
+            spaces: 0,
+            member_space: HashMap::new(),
         };
         let root_tf = scene.root.transform
             * Affine::translate((-scene.root.scroll_offset.x, -scene.root.scroll_offset.y));
@@ -352,6 +381,19 @@ impl Renderer {
                 }
                 Item::Layer(child) => {
                     if let Some(gid) = child.backdrop {
+                        // One capture per group: its members share one
+                        // composition space.
+                        let space = backdrops.space;
+                        if *backdrops.member_space.entry(gid).or_insert(space) != space {
+                            return Err(RenderError::Projective(
+                                "projective-backdrop-cross-space".into(),
+                            ));
+                        }
+                        if child.projection.is_some() {
+                            return Err(RenderError::Projective(
+                                "projective-backdrop-member".into(),
+                            ));
+                        }
                         // The group's one capture point is this position in
                         // painter order: what has been painted so far into
                         // the member's compositing canvas — the nearest
@@ -400,6 +442,9 @@ impl Renderer {
         resources: &mut Resources,
         backdrops: &mut Backdrops<'_>,
     ) -> Result<(), RenderError> {
+        if child.projection.is_some() {
+            return self.render_projective(child, parent_tf, clips, chain, resources, backdrops);
+        }
         let tf = parent_tf * child.transform;
         let mut child_clips = clips.to_vec();
         if let Some(clip) = &child.clip {
@@ -512,6 +557,174 @@ impl Renderer {
             };
         }
         Ok(())
+    }
+
+    /// A projective child (see [`crate::projective`]): its content, clip,
+    /// filter and children render into a fresh local image — a semantic
+    /// isolation of its own composition space — which is mipmapped and
+    /// reconstructed at every parent pixel. The ancestor clips' exact
+    /// coverage and the layer's opacity scale the sample, and the blend
+    /// mode composites it. A destructive operator's domain is the
+    /// projected layer clip geometrically intersected with the ancestor
+    /// clips.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "pixel indices are far below 2^53"
+    )]
+    fn render_projective(
+        &self,
+        child: &Layer,
+        parent_tf: Affine,
+        clips: &[Vec<Segment>],
+        chain: &mut [Level],
+        resources: &mut Resources,
+        backdrops: &mut Backdrops<'_>,
+    ) -> Result<(), RenderError> {
+        use crate::projective::{
+            Mipmapped, Reconstruction, domain, place, pose, project_edges, to_raster,
+        };
+        let projection = child.projection.as_ref().expect("callers check projection");
+        let clip = child
+            .clip
+            .as_ref()
+            .ok_or_else(|| RenderError::Projective("projective-unclipped".into()))?;
+        let pose = pose(projection, child.transform).map_err(RenderError::Projective)?;
+        let homography = to_raster(&pose, parent_tf);
+        let Some(placement) = place(
+            &homography,
+            domain(clip),
+            (self.width, self.height),
+            self.reconstruction.refine(),
+        )
+        .map_err(RenderError::Projective)?
+        else {
+            return Ok(());
+        };
+        let image = Mipmapped::new(
+            self.render_local(child, clip, &placement, resources, backdrops)?,
+            placement.width,
+            placement.height,
+        );
+        let ancestors = (!clips.is_empty()).then(|| {
+            self.shape_coverage(
+                &Shape::Rect(self.scene_rect),
+                FillRule::NonZero,
+                Affine::IDENTITY,
+                clips,
+            )
+        });
+        let domain = Self::is_destructive(child.blend).then(|| {
+            let outline = crate::path::shape_polylines(clip, placement.local_to_texel);
+            let mut segs = project_edges(&placement.forward, &outline, (self.width, self.height));
+            for c in clips {
+                segs = intersect_edges(&segs, FillRule::NonZero, c);
+            }
+            let mut cov = Coverage::new(self.width, self.height);
+            for &s in &segs {
+                cov.add_line(s.0, s.1, s.2, s.3);
+            }
+            cov.finish(FillRule::NonZero)
+        });
+        let dst_space = chain.last().map_or(BlendSpace::Linear, |l| l.space);
+        let mode = child.blend;
+        for (i, dst) in top(chain).pixels.iter_mut().enumerate() {
+            let at = [(i % self.width) as f64 + 0.5, (i / self.width) as f64 + 0.5];
+            let inside = ancestors.as_ref().map_or(1.0, |cov| cov[i]);
+            let sample = match self.reconstruction {
+                Reconstruction::Model => image.sample(&placement.inverse, at),
+                Reconstruction::Supersampled { grid, .. } => {
+                    image.box_sample(&placement.inverse, [at[0] - 0.5, at[1] - 0.5], grid)
+                }
+            };
+            let src = sample.map(|v| v * child.opacity * inside);
+            *dst = if mode == BlendMode::Normal && dst_space == BlendSpace::Linear {
+                src_over(*dst, src)
+            } else {
+                let blended = composite_pixel(
+                    mode,
+                    BlendSpace::Linear,
+                    dst_space,
+                    BlendSpace::Linear,
+                    *dst,
+                    src,
+                );
+                match domain.as_ref().map(|cov| cov[i]) {
+                    Some(c) if c >= 1.0 => blended,
+                    Some(c) if c <= 0.0 => *dst,
+                    Some(c) => std::array::from_fn(|ch| c.mul_add(blended[ch] - dst[ch], dst[ch])),
+                    None => blended,
+                }
+            };
+        }
+        Ok(())
+    }
+
+    /// A projective layer's completed local image: its content and
+    /// children under its clip in texel space, then its filter, masked
+    /// by the clip. The image is its own semantic level and composition
+    /// space.
+    fn render_local(
+        &self,
+        child: &Layer,
+        clip: &Shape,
+        placement: &crate::projective::Placement,
+        resources: &mut Resources,
+        backdrops: &mut Backdrops<'_>,
+    ) -> Result<Vec<[f64; 4]>, RenderError> {
+        let (width, height) = (placement.width, placement.height);
+        let local = Self::new(width, height).with_reconstruction(self.reconstruction);
+        let mut local_chain = vec![Level {
+            canvas: Canvas::new(width, height, [0.0; 4]),
+            opacity: 1.0,
+            blend: BlendMode::Normal,
+            space: BlendSpace::Linear,
+            semantic: true,
+        }];
+        let local_clips = vec![shape_edges(clip, placement.local_to_texel)];
+        let content_tf = placement.local_to_texel
+            * Affine::translate((-child.scroll_offset.x, -child.scroll_offset.y));
+        let outer = backdrops.space;
+        backdrops.spaces += 1;
+        backdrops.space = backdrops.spaces;
+        local.render_items(
+            &child.items,
+            content_tf,
+            &local_clips,
+            &mut local_chain,
+            resources,
+            backdrops,
+        )?;
+        backdrops.space = outer;
+        let Level {
+            canvas: mut sub, ..
+        } = local_chain.pop().expect("the local root is pushed");
+        if let Some(filter) = child.filter.as_deref() {
+            if self.reconstruction != crate::projective::Reconstruction::Model {
+                // Filter parameters are in local raster pixels, which the
+                // refinement would shrink: a different image, not a finer
+                // reconstruction of the same one.
+                return Err(RenderError::Projective(
+                    "the quality reference does not refine a filtered projective layer".into(),
+                ));
+            }
+            let texels = match filter {
+                LayerFilter::BlendImage { image, .. } => {
+                    Some(resources.texels(*image).map_err(RenderError::Resource)?)
+                }
+                _ => None,
+            };
+            crate::filter::apply(filter, texels, &mut sub.pixels, width, height);
+            let mask = local.shape_coverage(
+                &Shape::Rect(local.scene_rect),
+                FillRule::NonZero,
+                Affine::IDENTITY,
+                &local_clips,
+            );
+            for (px, m) in sub.pixels.iter_mut().zip(mask) {
+                *px = px.map(|v| v * m);
+            }
+        }
+        Ok(sub.pixels)
     }
 
     /// A display-list group: members composite with each other in the

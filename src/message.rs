@@ -182,6 +182,14 @@ pub enum LayerOp {
     Skew(LayerId, Prop<Vec2>),
     /// Sets the local pivot for rotation, skew and scale; initially zero.
     Pivot(LayerId, Prop<Vec2>),
+    /// Sets the projection base of a projective layer; never animated.
+    Projection(LayerId, crate::Projective),
+    /// Sets the X/Y depth-rotation angles in radians; initially zero.
+    Tilt(LayerId, Prop<Vec2>),
+    /// Sets the translation along Z; initially zero.
+    Depth(LayerId, Prop<f64>),
+    /// Removes projection, tilt and depth; the layer is affine again.
+    ClearProjection(LayerId),
     /// Set the opacity.
     Opacity(LayerId, Prop<f32>),
     /// Set the scroll offset.
@@ -297,6 +305,12 @@ pub enum Message<B: Backend> {
         id: SurfaceId,
         /// The new display properties.
         display: Display,
+    },
+    /// Announce the surface moved to another display: the next frame
+    /// carries `display_moved` and re-runs output negotiation (#98).
+    DisplayMoved {
+        /// The surface id.
+        id: SurfaceId,
     },
     /// An opaque render-thread operation that cannot fail: font, filter
     /// and effect registration and removal, capability hooks.

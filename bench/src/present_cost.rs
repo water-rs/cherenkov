@@ -1,4 +1,5 @@
-//! `present-cost`: present-pass GPU time for the sRGB gamut-map candidates (#96).
+//! `present-cost`: present-pass GPU time for the sRGB gamut-map candidates
+//! (#96) and the #98 wide-gamut/HDR output kinds.
 //!
 //! One [`Presenter::texture_timed`] pass per frame bracketed by
 //! pass-boundary timestamps. Runs on any `TIMESTAMP_QUERY` adapter — the
@@ -14,12 +15,14 @@ use std::path::Path;
 
 use cherenkov_gpu::GpuConfig;
 use cherenkov_gpu::interop::{
-    OutputAlpha, OutputColor, Presenter, SharedDevice, TextureOutput, shader_delivery, wgpu,
+    OutputAlpha, Presenter, SharedDevice, TextureOutput, shader_delivery, wgpu,
 };
 
 use crate::BenchError;
+use crate::PresentKind;
 
-use crate::cli::{PresentEncode, PresentPattern};
+use crate::cherenkov_ad::{present_color, present_format};
+use crate::cli::PresentPattern;
 
 /// One `present-cost` report: what ran and the per-frame pass times.
 #[derive(serde::Serialize)]
@@ -32,7 +35,7 @@ struct CostReport {
     width: u32,
     height: u32,
     pattern: &'static str,
-    encode: &'static str,
+    present: &'static str,
     /// The display headroom presented to (#97).
     headroom: f32,
     warmup_frames: u32,
@@ -129,7 +132,7 @@ pub(crate) fn run(
     frames: u32,
     warmup: u32,
     pattern: PresentPattern,
-    encode: PresentEncode,
+    present: PresentKind,
     headroom: f32,
     out: &Path,
 ) -> Result<(), BenchError> {
@@ -171,10 +174,7 @@ pub(crate) fn run(
     });
     fill_pattern(queue, &source, width, height, pattern);
     let source_view = source.create_view(&wgpu::TextureViewDescriptor::default());
-    let format = match encode {
-        PresentEncode::SrgbHw => wgpu::TextureFormat::Rgba8UnormSrgb,
-        PresentEncode::SrgbShader => wgpu::TextureFormat::Rgba8Unorm,
-    };
+    let format = present_format(present);
     let destination = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("present-cost destination"),
         size: wgpu::Extent3d {
@@ -210,7 +210,7 @@ pub(crate) fn run(
     let adapter_info = shared.adapter.get_info();
     let output = || TextureOutput {
         texture: &destination,
-        color: OutputColor::Srgb,
+        color: present_color(present),
         alpha: OutputAlpha::Premultiplied,
         headroom,
     };
@@ -284,10 +284,7 @@ pub(crate) fn run(
             PresentPattern::Oog => "oog",
             PresentPattern::Mixed => "mixed",
         },
-        encode: match encode {
-            PresentEncode::SrgbHw => "srgb-hw",
-            PresentEncode::SrgbShader => "srgb-shader",
-        },
+        present: present.name(),
         headroom,
         warmup_frames: warmup,
         measured_frames: frames,

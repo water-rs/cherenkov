@@ -38,6 +38,7 @@
 //! documented in `sk_font`.
 
 use std::collections::BTreeSet;
+use std::time::Instant;
 
 use cherenkov_oracle::{F32Image, color as oc};
 use cherenkov_scene::{
@@ -931,10 +932,15 @@ impl Engine for SkiaCpu {
     }
 
     fn submit(&mut self, _frame: u64, readback: bool) -> Result<Submit, BenchError> {
+        let render_at = Instant::now();
         let prepared = self
             .prepared
             .as_mut()
             .ok_or_else(|| BenchError::Engine("skia-cpu: submit before prepare".into()))?;
+        // Rasterization happened inside `encode`'s canvas calls on the
+        // raster surface; the submit itself only snapshots and reads.
+        let render_seconds = render_at.elapsed().as_secs_f64();
+        let readback_at = Instant::now();
         let image = if readback {
             Some(read_surface(
                 &mut prepared.surface,
@@ -949,6 +955,8 @@ impl Engine for SkiaCpu {
             image,
             gpu: Vec::new(),
             phases: None,
+            render_seconds: Some(render_seconds),
+            readback_seconds: readback.then(|| readback_at.elapsed().as_secs_f64()),
         })
     }
 
@@ -1319,6 +1327,7 @@ impl Engine for SkiaVk {
                 .map_err(|e| BenchError::Gpu(format!("vulkan drain: {e}")))?;
             self.vk_stamp(self.vk_ts.as_ref().expect("checked").bufs[0], 0, true)?;
         }
+        let render_at = Instant::now();
         self.dctx.flush_submit_and_sync_cpu();
         let gpu_seconds = if no_ts {
             None
@@ -1330,6 +1339,8 @@ impl Engine for SkiaVk {
                 .map_err(|e| BenchError::Gpu(format!("vulkan drain: {e}")))?;
             self.vk_read_seconds()?
         };
+        let render_seconds = render_at.elapsed().as_secs_f64();
+        let readback_at = Instant::now();
         let image = if readback {
             Some(read_surface(
                 &mut self.prepared.as_mut().expect("checked").surface,
@@ -1344,6 +1355,8 @@ impl Engine for SkiaVk {
             image,
             gpu: GpuSample::whole_frame(frame, gpu_seconds),
             phases: None,
+            render_seconds: Some(render_seconds),
+            readback_seconds: readback.then(|| readback_at.elapsed().as_secs_f64()),
         })
     }
 
@@ -1386,6 +1399,7 @@ mod graphite_metal {
 
     use std::collections::BTreeSet;
     use std::ffi::c_void;
+    use std::time::Instant;
 
     use objc2::rc::Retained;
     use objc2::runtime::ProtocolObject;
@@ -1622,6 +1636,7 @@ mod graphite_metal {
             // measured frame — a synchronous probe, not a pipelined
             // frame rate.
             self.drain()?;
+            let render_at = Instant::now();
             let start = self
                 .queue
                 .commandBuffer()
@@ -1651,6 +1666,8 @@ mod graphite_metal {
             // [start.GPUEndTime, end.GPUStartTime] brackets it exactly.
             let (s, e) = (start.GPUEndTime(), end.GPUStartTime());
             let gpu_seconds = (s > 0.0 && e > s).then_some(e - s);
+            let render_seconds = render_at.elapsed().as_secs_f64();
+            let readback_at = Instant::now();
             let image = if readback {
                 Some(self.read_target()?)
             } else {
@@ -1660,6 +1677,8 @@ mod graphite_metal {
                 image,
                 gpu: GpuSample::whole_frame(frame, gpu_seconds),
                 phases: None,
+                render_seconds: Some(render_seconds),
+                readback_seconds: readback.then(|| readback_at.elapsed().as_secs_f64()),
             })
         }
 

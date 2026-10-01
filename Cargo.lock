@@ -336,7 +336,7 @@ dependencies = [
  "rustc-hash 2.1.3",
  "serde",
  "serde_json",
- "thiserror",
+ "thiserror 2.0.21",
  "tracing",
  "wasm-bindgen-futures",
  "wasm-bindgen-test",
@@ -374,7 +374,7 @@ dependencies = [
  "skia-safe",
  "skrifa 0.44.0",
  "sysinfo",
- "thiserror",
+ "thiserror 2.0.21",
  "tracing",
  "tracing-subscriber",
  "vello",
@@ -401,7 +401,7 @@ dependencies = [
  "rayon",
  "rustc-hash 2.1.3",
  "skrifa 0.44.0",
- "thiserror",
+ "thiserror 2.0.21",
  "tracing",
 ]
 
@@ -409,41 +409,35 @@ dependencies = [
 name = "cherenkov-gpu"
 version = "0.0.0"
 dependencies = [
- "block2",
+ "ash",
  "bytemuck",
  "cherenkov",
  "cherenkov-oracle",
  "cherenkov-scene",
- "dispatch2",
  "filtrate",
  "filtrate-core",
  "futures-channel",
  "futures-util",
  "gloo-timers",
  "half",
+ "js-sys",
  "kurbo",
+ "libc",
  "libm",
- "libtest-mimic",
  "naga 30.0.1",
  "nami",
+ "ndk",
+ "ndk-sys",
  "objc2",
- "objc2-app-kit",
- "objc2-av-foundation",
- "objc2-core-foundation",
- "objc2-core-graphics",
- "objc2-core-media",
- "objc2-core-video",
- "objc2-foundation",
  "objc2-io-surface",
  "objc2-metal",
- "objc2-quartz-core",
- "objc2-ui-kit",
  "png",
  "pollster 0.4.0",
  "rustc-hash 2.1.3",
  "skrifa 0.44.0",
- "thiserror",
+ "thiserror 2.0.21",
  "tracing",
+ "wasm-bindgen",
  "wasm-bindgen-test",
  "wgpu 30.0.1",
 ]
@@ -461,7 +455,7 @@ dependencies = [
  "serde",
  "serde_json",
  "skrifa 0.44.0",
- "thiserror",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -472,6 +466,7 @@ dependencies = [
  "fontique",
  "half",
  "kurbo",
+ "libm",
  "parley",
  "png",
  "read-fonts 0.44.0",
@@ -479,7 +474,7 @@ dependencies = [
  "serde_json",
  "skera",
  "skrifa 0.44.0",
- "thiserror",
+ "thiserror 2.0.21",
  "tracing",
  "tracing-subscriber",
 ]
@@ -491,7 +486,7 @@ dependencies = [
  "cherenkov-shader",
  "half",
  "naga 30.0.1",
- "thiserror",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -806,12 +801,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "escape8259"
-version = "0.5.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5692dd7b5a1978a5aeb0ce83b7655c58ca8efdcb79d21036ea249da95afec2c6"
-
-[[package]]
 name = "euclid"
 version = "0.22.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -886,7 +875,7 @@ dependencies = [
  "half",
  "image",
  "pollster 1.0.1",
- "thiserror",
+ "thiserror 2.0.21",
  "tracing",
  "web-time",
  "wgpu 30.0.1",
@@ -1109,7 +1098,7 @@ dependencies = [
  "hashbrown 0.16.1",
  "log",
  "presser",
- "thiserror",
+ "thiserror 2.0.21",
  "windows",
 ]
 
@@ -1596,18 +1585,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
-name = "libtest-mimic"
-version = "0.8.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "14e6ba06f0ade6e504aff834d7c34298e5155c6baca353cc6a4aaff2f9fd7f33"
-dependencies = [
- "anstream",
- "anstyle",
- "clap",
- "escape8259",
-]
-
-[[package]]
 name = "linebender_resource_handle"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1770,7 +1747,7 @@ dependencies = [
  "once_cell",
  "rustc-hash 1.1.0",
  "spirv",
- "thiserror",
+ "thiserror 2.0.21",
  "unicode-ident",
 ]
 
@@ -1796,7 +1773,7 @@ dependencies = [
  "once_cell",
  "rustc-hash 1.1.0",
  "spirv",
- "thiserror",
+ "thiserror 2.0.21",
  "unicode-ident",
 ]
 
@@ -1809,7 +1786,7 @@ dependencies = [
  "hashbrown 0.17.1",
  "indexmap",
  "rustc-hash 1.1.0",
- "thiserror",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1832,6 +1809,20 @@ version = "0.3.3"
 source = "git+https://github.com/water-rs/nami?rev=6908aac816de14ee5aff23bfffd7d2b109d08fea#6908aac816de14ee5aff23bfffd7d2b109d08fea"
 dependencies = [
  "kurbo",
+]
+
+[[package]]
+name = "ndk"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3f42e7bbe13d351b6bead8286a43aac9534b82bd3cc43e47037f012ebfd62d4"
+dependencies = [
+ "bitflags",
+ "jni-sys 0.3.1",
+ "log",
+ "ndk-sys",
+ "num_enum",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -1894,59 +1885,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "num_enum"
+version = "0.7.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d0bca838442ec211fa11de3a8b0e0e8f3a4522575b5c4c06ed722e005036f26"
+dependencies = [
+ "num_enum_derive",
+ "rustversion",
+]
+
+[[package]]
+name = "num_enum_derive"
+version = "0.7.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "680998035259dcfcafe653688bf2aa6d3e2dc05e98be6ab46afb089dc84f1df8"
+dependencies = [
+ "proc-macro-crate",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "objc2"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a12a8ed07aefc768292f076dc3ac8c48f3781c8f2d5851dd3d98950e8c5a89f"
 dependencies = [
  "objc2-encode",
-]
-
-[[package]]
-name = "objc2-app-kit"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d49e936b501e5c5bf01fda3a9452ff86dc3ea98ad5f283e1455153142d97518c"
-dependencies = [
- "bitflags",
- "objc2",
- "objc2-foundation",
- "objc2-quartz-core",
-]
-
-[[package]]
-name = "objc2-av-foundation"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "478ae33fcac9df0a18db8302387c666b8ef08a3e2d62b510ca4fc278a384b6c0"
-dependencies = [
- "objc2",
- "objc2-core-media",
- "objc2-core-video",
- "objc2-foundation",
- "objc2-quartz-core",
-]
-
-[[package]]
-name = "objc2-core-audio"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e1eebcea8b0dbff5f7c8504f3107c68fc061a3eb44932051c8cf8a68d969c3b2"
-dependencies = [
- "dispatch2",
- "objc2",
- "objc2-core-audio-types",
- "objc2-core-foundation",
-]
-
-[[package]]
-name = "objc2-core-audio-types"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a89f2ec274a0cf4a32642b2991e8b351a404d290da87bb6a9a9d8632490bd1c"
-dependencies = [
- "bitflags",
- "objc2",
 ]
 
 [[package]]
@@ -1966,26 +1932,10 @@ version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e022c9d066895efa1345f8e33e584b9f958da2fd4cd116792e15e07e4720a807"
 dependencies = [
- "bitflags",
  "dispatch2",
  "objc2",
  "objc2-core-foundation",
  "objc2-io-surface",
-]
-
-[[package]]
-name = "objc2-core-media"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "05ec576860167a15dd9fce7fbee7512beb4e31f532159d3482d1f9c6caedf31d"
-dependencies = [
- "bitflags",
- "dispatch2",
- "objc2",
- "objc2-core-audio",
- "objc2-core-audio-types",
- "objc2-core-foundation",
- "objc2-core-video",
 ]
 
 [[package]]
@@ -1996,19 +1946,6 @@ checksum = "0cde0dfb48d25d2b4862161a4d5fcc0e3c24367869ad306b0c9ec0073bfed92d"
 dependencies = [
  "bitflags",
  "objc2-core-foundation",
-]
-
-[[package]]
-name = "objc2-core-video"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d425caf1df73233f29fd8a5c3e5edbc30d2d4307870f802d18f00d83dc5141a6"
-dependencies = [
- "bitflags",
- "objc2",
- "objc2-core-foundation",
- "objc2-core-graphics",
- "objc2-io-surface",
 ]
 
 [[package]]
@@ -2076,21 +2013,8 @@ dependencies = [
  "objc2",
  "objc2-core-foundation",
  "objc2-core-graphics",
- "objc2-core-video",
  "objc2-foundation",
  "objc2-metal",
-]
-
-[[package]]
-name = "objc2-ui-kit"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d87d638e33c06f577498cbcc50491496a3ed4246998a7fbba7ccb98b1e7eab22"
-dependencies = [
- "bitflags",
- "objc2",
- "objc2-foundation",
- "objc2-quartz-core",
 ]
 
 [[package]]
@@ -2668,7 +2592,7 @@ checksum = "1793356c03f41587b77c8358124ecf2af32ee681df7305096099e368a4f5cec6"
 dependencies = [
  "hashbrown 0.17.1",
  "skrifa 0.47.0",
- "thiserror",
+ "thiserror 2.0.21",
  "write-fonts",
 ]
 
@@ -2876,11 +2800,31 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
+version = "1.0.69"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52"
+dependencies = [
+ "thiserror-impl 1.0.69",
+]
+
+[[package]]
+name = "thiserror"
 version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09e52cb86a36cede5cb101bf8908837b3e4c6e5e59fe7fd85c23fb56200d189e"
 dependencies = [
- "thiserror-impl",
+ "thiserror-impl 2.0.21",
+]
+
+[[package]]
+name = "thiserror-impl"
+version = "1.0.69"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -3125,7 +3069,7 @@ dependencies = [
  "png",
  "skrifa 0.44.0",
  "static_assertions",
- "thiserror",
+ "thiserror 2.0.21",
  "vello_encoding",
  "vello_shaders",
  "wgpu 29.0.4",
@@ -3144,7 +3088,7 @@ dependencies = [
  "peniko",
  "png",
  "smallvec",
- "thiserror",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -3181,7 +3125,7 @@ dependencies = [
  "glifo",
  "hashbrown 0.17.1",
  "log",
- "thiserror",
+ "thiserror 2.0.21",
  "vello_common",
  "vello_sparse_shaders",
  "wgpu 29.0.4",
@@ -3195,7 +3139,7 @@ dependencies = [
  "bytemuck",
  "log",
  "naga 29.0.4",
- "thiserror",
+ "thiserror 2.0.21",
  "vello_encoding",
 ]
 
@@ -3364,7 +3308,7 @@ dependencies = [
  "half",
  "itertools 0.14.0",
  "num-traits",
- "thiserror",
+ "thiserror 2.0.21",
  "wesl-macros",
  "wgsl-parse",
  "wgsl-types",
@@ -3466,7 +3410,7 @@ dependencies = [
  "raw-window-handle",
  "rustc-hash 1.1.0",
  "smallvec",
- "thiserror",
+ "thiserror 2.0.21",
  "wgpu-core-deps-apple 29.0.4",
  "wgpu-core-deps-emscripten 29.0.4",
  "wgpu-core-deps-windows-linux-android 29.0.4",
@@ -3500,7 +3444,7 @@ dependencies = [
  "raw-window-handle",
  "rustc-hash 1.1.0",
  "smallvec",
- "thiserror",
+ "thiserror 2.0.21",
  "wgpu-core-deps-apple 30.0.1",
  "wgpu-core-deps-emscripten 30.0.1",
  "wgpu-core-deps-wasm",
@@ -3616,7 +3560,7 @@ dependencies = [
  "raw-window-metal",
  "renderdoc-sys",
  "smallvec",
- "thiserror",
+ "thiserror 2.0.21",
  "wasm-bindgen",
  "wayland-sys",
  "web-sys",
@@ -3672,7 +3616,7 @@ dependencies = [
  "renderdoc-sys",
  "smallvec",
  "static_assertions",
- "thiserror",
+ "thiserror 2.0.21",
  "wasm-bindgen",
  "wayland-sys",
  "web-sys",
@@ -3710,7 +3654,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "948e23cc220c021611e4de4072b20365192e861cde1f2d17437c1cdd7651bbc0"
 dependencies = [
  "parking_lot",
- "thiserror",
+ "thiserror 2.0.21",
  "wgpu 29.0.4",
 ]
 
@@ -3757,7 +3701,7 @@ dependencies = [
  "lalrpop-util",
  "lexical",
  "logos",
- "thiserror",
+ "thiserror 2.0.21",
  "wgsl-types",
 ]
 

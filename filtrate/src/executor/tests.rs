@@ -18,8 +18,9 @@ use crate::{
     AnimatedCallback, AnimatedTarget, AuxSource, ColorFilter, ColorStage, CpuFilter, CpuImage,
     CpuKernel, Effect, EffectContext, EffectFrameTiming, EffectInput, EffectOutput,
     EffectRenderError, EffectSetupError, Filter, FilterExt, FilterParam, Footprint, ImageVisitor,
-    Interpolator, OperatingSpace, ParamArray, ParamSource, Placed, ShapeInput, ShapeTextures,
-    SpatialFilter, SpatialStage, StageCollector, WatchGuard, WorkingSpace, filters, kind,
+    Interpolator, OperatingSpace, ParamArray, ParamSource, Placed, ShaderEffect, ShapeInput,
+    ShapeTextures, SpatialFilter, SpatialStage, StageCollector, WatchGuard, WorkingSpace, filters,
+    kind,
 };
 
 // ============================================================================
@@ -2157,7 +2158,7 @@ fn gpu_params_rewrite_buffers_across_frames() {
         .expect("executor set up")
         .passes
         .iter()
-        .map(|pass| pass.params.len())
+        .map(|pass| pass.params.buffer_count())
         .sum();
     assert_eq!(buffers, 1, "changing params must reuse the stale buffer");
 }
@@ -2354,6 +2355,37 @@ fn gpu_export_filter_gallery_images() {
             mode: BlendMode::Overlay,
         }
     );
+
+    // An application-supplied post-process shader: scanlines whose strength
+    // is its first parameter, plus a slight edge vignette.
+    let mut scanlines = ShaderEffect::new(
+        "@fragment
+        fn main(in: VertexOutput) -> @location(0) vec4<f32> {
+            let color = textureSample(input_texture, input_sampler, in.uv);
+            let row = u32(in.position.y);
+            let line = select(1.0, 0.0, (row / 2u) % 2u == 1u);
+            let centered = in.uv - vec2<f32>(0.5);
+            let vignette = 1.0 - dot(centered, centered);
+            let shade = mix(1.0, line, effect_param(0u)) * vignette;
+            return vec4<f32>(color.rgb * shade, color.a);
+        }",
+    )
+    .expect("the gallery scanline shader is valid WGSL")
+    .param(0.6);
+    setup_shader_effect(&gpu, &mut scanlines, FORMAT);
+    let input_texture = upload(&gpu, size, &input);
+    let result = render_shader_effect(
+        &gpu,
+        &mut scanlines,
+        &input_texture,
+        size,
+        EffectFrameTiming::new(Duration::ZERO, Duration::ZERO, 0),
+    );
+    write_png(
+        &output_dir.join("shader_effect_scanlines.png"),
+        size,
+        &result,
+    );
 }
 
 /// Two encodes of one effect at different sizes in a single encoder must
@@ -2534,5 +2566,252 @@ fn gpu_intermediates_evicted_when_size_unused() {
     assert!(
         frame4.1 == frame5.1 && frame5.1 == frame6.1,
         "size B encoded every frame must keep its intermediates"
+    );
+}
+
+// ============================================================================
+// ShaderEffect
+// ============================================================================
+
+fn setup_shader_effect(
+    gpu: &TestGpu,
+    effect: &mut ShaderEffect,
+    input_format: wgpu::TextureFormat,
+) {
+    let ctx = EffectContext {
+        device: &gpu.device,
+        queue: &gpu.queue,
+        input_format,
+        output_format: FORMAT,
+    };
+    pollster::block_on(effect.setup(&ctx)).expect("shader effect setup should succeed");
+}
+
+/// Encodes one frame of `effect` at `timing` into a fresh RGBA8 output of
+/// `size` and reads it back.
+fn render_shader_effect(
+    gpu: &TestGpu,
+    effect: &mut ShaderEffect,
+    input: &wgpu::Texture,
+    size: (u32, u32),
+    timing: EffectFrameTiming,
+) -> Vec<u8> {
+    let output = texture(
+        gpu,
+        size,
+        wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+    );
+    effect
+        .render(
+            &EffectInput {
+                timing,
+                ..frame_input(gpu, input, size, Duration::ZERO, ShapeTextures::default())
+            },
+            &frame_output(gpu, &output, size),
+        )
+        .expect("shader effect render should succeed");
+    readback_rgba8_image(gpu, &output, size)
+}
+
+/// A user shader samples the input, reads the frame time from the host's
+/// timeline, and reads a reactive parameter at the value its latest change
+/// delivered — and, being animated, asks for the next frame.
+#[test]
+fn gpu_shader_effect_reads_input_time_and_params() {
+    let gpu = create_test_device();
+    let size = (4, 4);
+    let input = upload(&gpu, size, &[10, 20, 200, 255].repeat(16));
+    let strength = ScriptedParam::constant(0.25);
+    let strength_callback = strength.callback.clone();
+    let (mut effect, _subscription) = ShaderEffect::new(
+        "@fragment
+        fn main(in: VertexOutput) -> @location(0) vec4<f32> {
+            let source = textureSample(input_texture, input_sampler, in.uv);
+            return vec4<f32>(effect_param(0u), fract(uniforms.time), source.b, 1.0);
+        }",
+    )
+    .expect("the test shader is valid WGSL")
+    .animated()
+    .watch_param(&strength);
+    setup_shader_effect(&gpu, &mut effect, FORMAT);
+
+    ScriptedParam::fire(
+        &strength_callback,
+        AnimatedTarget {
+            value: 0.75,
+            interpolator: None,
+        },
+    );
+    assert!(effect.redraw_hint(), "a parameter change wants a frame");
+
+    let output = texture(
+        &gpu,
+        size,
+        wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+    );
+    let needs_redraw = effect
+        .render(
+            &EffectInput {
+                timing: EffectFrameTiming::new(
+                    Duration::from_millis(1500),
+                    Duration::from_millis(16),
+                    90,
+                ),
+                ..frame_input(&gpu, &input, size, Duration::ZERO, ShapeTextures::default())
+            },
+            &frame_output(&gpu, &output, size),
+        )
+        .expect("shader effect render should succeed");
+    assert!(needs_redraw, "an animated shader asks for the next frame");
+
+    let pixels = readback_rgba8_image(&gpu, &output, size);
+    for &[red, green, blue, alpha] in pixels.as_chunks::<4>().0 {
+        assert!(red.abs_diff(191) <= 1, "param 0.75 -> red {red}");
+        assert!(green.abs_diff(128) <= 1, "time 1.5 s -> green {green}");
+        assert_eq!(blue, 200, "the input's blue channel passes through");
+        assert_eq!(alpha, 255);
+    }
+}
+
+/// Two encodes of one shader effect at different sizes in one encoder keep
+/// their own uniforms: a queue write into a single buffer would land before
+/// the submit and give both passes the second encode's resolution. On the
+/// next frame, with new uniform values, both encodes reuse their bind
+/// groups.
+#[test]
+fn gpu_shader_effect_two_sizes_one_encoder() {
+    let gpu = create_test_device();
+    let mut effect = ShaderEffect::new(
+        "@fragment
+        fn main(in: VertexOutput) -> @location(0) vec4<f32> {
+            return vec4<f32>(uniforms.resolution / 255.0, fract(uniforms.time), 1.0);
+        }",
+    )
+    .expect("the test shader is valid WGSL");
+    setup_shader_effect(&gpu, &mut effect, FORMAT);
+
+    let sizes = [(8, 8), (16, 4)];
+    // The host keeps one input view per size across frames.
+    let inputs = sizes.map(|size| {
+        let texture = upload(&gpu, size, &test_pixels(size.0 * size.1));
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        (texture, view)
+    });
+    let outputs = sizes.map(|size| {
+        texture(
+            &gpu,
+            size,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        )
+    });
+    let mut frame = |sequence: u64, time: Duration, blue: u8| {
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("two-size shader effect encode"),
+            });
+        for ((size, (texture, view)), output) in sizes.iter().zip(&inputs).zip(&outputs) {
+            effect
+                .encode_render(
+                    &EffectInput {
+                        view: view.clone(),
+                        timing: EffectFrameTiming::new(time, Duration::ZERO, sequence),
+                        ..frame_input(
+                            &gpu,
+                            texture,
+                            *size,
+                            Duration::ZERO,
+                            ShapeTextures::default(),
+                        )
+                    },
+                    &frame_output(&gpu, output, *size),
+                    &mut encoder,
+                )
+                .expect("encode should succeed");
+        }
+        gpu.queue.submit([encoder.finish()]);
+        for (size, output) in sizes.iter().zip(&outputs) {
+            let pixels = readback_rgba8_image(&gpu, output, *size);
+            let width = u8::try_from(size.0).expect("test width fits u8");
+            let height = u8::try_from(size.1).expect("test height fits u8");
+            assert_rgba8_close(
+                &pixels,
+                &[width, height, blue, 255].repeat(pixels.len() / 4),
+                1,
+                "each encode reads its own uniforms",
+            );
+        }
+        effect.cached_bind_groups()
+    };
+    let first = frame(1, Duration::ZERO, 0);
+    let second = frame(2, Duration::from_millis(500), 128);
+    assert_eq!(first.len(), 2, "one bind group per encode");
+    assert_eq!(second, first, "the next frame reuses both bind groups");
+}
+
+/// A shader that reads `input_sampler` needs a filterable input; one that
+/// only loads texels runs on any float input.
+#[test]
+fn gpu_shader_effect_sampling_requires_a_filterable_input() {
+    let gpu = create_test_device();
+    let unfilterable = wgpu::TextureFormat::Rgba32Float;
+    assert!(
+        !super::filterable(unfilterable, gpu.device.features()),
+        "the test device does not filter Rgba32Float"
+    );
+
+    let mut sampling = ShaderEffect::new(
+        "@fragment
+        fn main(in: VertexOutput) -> @location(0) vec4<f32> {
+            return textureSample(input_texture, input_sampler, in.uv);
+        }",
+    )
+    .expect("the sampling shader is valid WGSL");
+    let ctx = EffectContext {
+        device: &gpu.device,
+        queue: &gpu.queue,
+        input_format: unfilterable,
+        output_format: FORMAT,
+    };
+    assert_eq!(
+        pollster::block_on(sampling.setup(&ctx)),
+        Err(EffectSetupError::InputNotFilterable {
+            format: unfilterable
+        })
+    );
+
+    let mut loading = ShaderEffect::new(
+        "@fragment
+        fn main(in: VertexOutput) -> @location(0) vec4<f32> {
+            return textureLoad(input_texture, vec2<i32>(in.position.xy), 0);
+        }",
+    )
+    .expect("the loading shader is valid WGSL");
+    setup_shader_effect(&gpu, &mut loading, unfilterable);
+    let size = (2, 2);
+    let input = upload_f32(&gpu, size, &[[0.25, 0.5, 0.75, 1.0]; 4]);
+    let output = texture(
+        &gpu,
+        size,
+        wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+    );
+    loading
+        .render(
+            &frame_input_format(
+                &gpu,
+                &input,
+                size,
+                Duration::ZERO,
+                ShapeTextures::default(),
+                unfilterable,
+            ),
+            &frame_output(&gpu, &output, size),
+        )
+        .expect("a texel-loading shader renders an unfilterable input");
+    assert_rgba8_close(
+        &readback_rgba8_image(&gpu, &output, size),
+        &[64, 128, 191, 255].repeat(4),
+        1,
+        "loaded texels",
     );
 }

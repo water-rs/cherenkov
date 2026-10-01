@@ -313,6 +313,21 @@ impl ShapeData {
     pub fn of(shape: &(impl Shape + ?Sized)) -> Self {
         shape.semantic().into()
     }
+
+    /// The smallest rectangle containing the shape's area.
+    #[must_use]
+    pub fn bounds(&self) -> Rect {
+        use kurbo::Shape as _;
+        match self {
+            Self::Rect(rect) => *rect,
+            Self::RoundedRect(rounded) => rounded.bounding_box(),
+            Self::Continuous(continuous) => continuous.rect,
+            Self::Circle(circle) => circle.bounding_box(),
+            Self::Ellipse(ellipse) => ellipse.bounding_box(),
+            Self::Line(line) => line.bounding_box(),
+            Self::Path { elements, .. } => (&elements[..]).bounding_box(),
+        }
+    }
 }
 
 fn push_point(lanes: &mut Vec<f64>, point: Point) {

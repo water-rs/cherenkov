@@ -521,11 +521,10 @@ macro_rules! __engine_fn {
 
         $(#[$m])*
         #[cfg(target_arch = "wasm32")]
-        #[expect(
+        #[allow(
             clippy::future_not_send,
-            reason = "the wasm32 harness runs on the single-threaded page event loop"
+            reason = "the macro emits both Send and non-Send futures, and the wasm32 harness runs on the single-threaded page event loop"
         )]
-        #[allow(unfulfilled_lint_expectations)]
         $vis async fn $name $($rest)*
     };
 }
@@ -544,11 +543,10 @@ macro_rules! __engine_test {
 
         $(#[$m])*
         #[cfg(target_arch = "wasm32")]
-        #[expect(
+        #[allow(
             clippy::future_not_send,
-            reason = "the wasm32 harness runs on the single-threaded page event loop"
+            reason = "the macro emits both Send and non-Send futures, and the wasm32 harness runs on the single-threaded page event loop"
         )]
-        #[allow(unfulfilled_lint_expectations)]
         #[::wasm_bindgen_test::wasm_bindgen_test]
         async fn $name $($rest)*
     };

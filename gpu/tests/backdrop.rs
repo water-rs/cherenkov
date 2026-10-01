@@ -695,7 +695,7 @@ split_test! {
 #[expect(clippy::float_cmp, reason = "regions must be byte-identical")]
 fn far_members_take_two_regions() -> Result<(), Box<dyn std::error::Error>> {
     split_fn! {
-#[expect(clippy::type_complexity, reason = "test helper")]
+#[cfg_attr(not(target_arch = "wasm32"), expect(clippy::type_complexity, reason = "test helper"))]
     fn render_bars(
         two_groups: bool,
     ) -> Result<

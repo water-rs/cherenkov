@@ -58,6 +58,86 @@ pub struct GpuInfo {
     pub timestamps: TimestampSupport,
 }
 
+/// One engine-creation boundary a [`CreationProbe`] observes — the phases
+/// of issue #170's creation ledger, in the order `init` reaches them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CreationPhase {
+    /// `wgpu::Instance` created.
+    Instance,
+    /// Adapter selected for the working format.
+    Adapter,
+    /// Logical device and queue opened.
+    Device,
+    /// Engine bind group layouts created.
+    Layouts,
+    /// The fixed engine shader modules created.
+    ShaderModules,
+    /// The closed core pipeline set created.
+    CorePipelines,
+    /// Frame-wide buffers (globals, instances, stops) created.
+    Buffers,
+    /// Coverage atlas storage created.
+    Atlas,
+    /// The group-0 bind group and dummy views bound.
+    BindGroups,
+    /// Timestamp query resources created; absent when timestamps are off.
+    Timestamps,
+    /// The silhouette-blur pipeline created.
+    ShadowBlur,
+    /// The Vulkan external-frame context created.
+    ExternalNative,
+    /// The renderer is fully constructed.
+    Complete,
+}
+
+/// The boundary a [`CreationProbe`] observes.
+pub struct CreationPoint<'a> {
+    /// The phase that just completed.
+    pub phase: CreationPhase,
+    /// The adapter once selected.
+    pub adapter: Option<&'a wgpu::Adapter>,
+    /// The device once opened; allocator accounting is available from
+    /// this phase on.
+    pub device: Option<&'a wgpu::Device>,
+}
+
+/// A synchronous observer of engine creation (issue #170).
+///
+/// `cherenkov-bench creation` installs one through
+/// [`GpuConfig::creation_probe`] to snapshot process and driver memory at
+/// each phase boundary. The observer runs on the thread performing the
+/// phase — the engine's render thread for `init` — and returning `true`
+/// aborts creation just past it with [`EngineError::Backend`], the
+/// ledger's one-factor ablation handle.
+///
+/// Diagnostics only, like [`GpuConfig::alloc_diag`].
+#[derive(Clone)]
+pub struct CreationProbe {
+    observe: std::sync::Arc<dyn for<'a> Fn(&CreationPoint<'a>) -> bool + Send + Sync>,
+}
+
+impl CreationProbe {
+    /// An observer called at every phase boundary; `true` aborts creation.
+    pub fn new(
+        observe: impl for<'a> Fn(&CreationPoint<'a>) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            observe: std::sync::Arc::new(observe),
+        }
+    }
+
+    /// Runs the observer; `true` asks the caller to abort creation.
+    pub(crate) fn fire(&self, point: &CreationPoint<'_>) -> bool {
+        (self.observe)(point)
+    }
+}
+
+impl std::fmt::Debug for CreationProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreationProbe").finish_non_exhaustive()
+    }
+}
+
 /// Where the adapter lets the renderer sample GPU timestamps.
 ///
 /// The renderer samples only at pass boundaries, the one position every
@@ -120,6 +200,9 @@ pub struct GpuConfig {
     /// this sink. Diagnostics only; the per-event allocator snapshot is
     /// deliberately expensive, so keep it out of timed runs.
     pub alloc_diag: Option<diag::Sink>,
+    /// When set, creation reports each [`CreationPhase`] boundary to the
+    /// observer — issue #170's creation ledger. Diagnostics only.
+    pub creation_probe: Option<CreationProbe>,
 }
 
 impl Default for GpuConfig {
@@ -135,6 +218,7 @@ impl Default for GpuConfig {
             pipeline_cache: None,
             scratch_format: ScratchFormat::default(),
             alloc_diag: None,
+            creation_probe: None,
         }
     }
 }

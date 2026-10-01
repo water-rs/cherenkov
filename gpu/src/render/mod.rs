@@ -27,7 +27,10 @@ use std::time::Duration;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::{GpuConfig, GpuInfo, GpuTarget, ScratchFormat, TimestampSupport, names};
+use crate::{
+    CreationPhase, CreationPoint, GpuConfig, GpuInfo, GpuTarget, ScratchFormat, TimestampSupport,
+    names,
+};
 use bitmap::BitmapKey;
 use cherenkov::{
     ContentOp, EngineError, FontData as EngineFontData, FontId, Frame, FrameId, FrameStats,
@@ -565,6 +568,30 @@ fn grow_buffer(
     new
 }
 
+/// Reports `phase` to the configured [`GpuConfig::creation_probe`]; the
+/// probe returning `true` aborts creation — the #170 ledger's ablation
+/// stop.
+fn fire_probe(
+    config: &GpuConfig,
+    phase: CreationPhase,
+    adapter: Option<&wgpu::Adapter>,
+    device: Option<&wgpu::Device>,
+) -> Result<(), EngineError> {
+    let Some(probe) = &config.creation_probe else {
+        return Ok(());
+    };
+    if probe.fire(&CreationPoint {
+        phase,
+        adapter,
+        device,
+    }) {
+        return Err(EngineError::Backend(format!(
+            "creation probe stopped after {phase:?}"
+        )));
+    }
+    Ok(())
+}
+
 /// Creates an adapter plus device. Fails when no adapter allows the target
 /// format's required usages.
 #[cfg(not(target_arch = "wasm32"))]
@@ -583,6 +610,7 @@ fn create_device(
         backends: config.backends,
         ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
+    fire_probe(config, CreationPhase::Instance, None, None)?;
     let adapters = pollster::block_on(instance.enumerate_adapters(config.backends));
     let adapter = adapters
         .into_iter()
@@ -592,6 +620,7 @@ fn create_device(
                 .contains(TARGET_USAGES)
         })
         .ok_or_else(|| EngineError::Backend("no adapter".into()))?;
+    fire_probe(config, CreationPhase::Adapter, Some(&adapter), None)?;
     let supported = adapter.features();
     let info = adapter.get_info();
     tracing::info!(
@@ -634,13 +663,10 @@ fn create_device(
     // `request_device` unchanged.
     #[cfg(all(unix, not(target_vendor = "apple")))]
     if info.backend == wgpu::Backend::Vulkan {
-        match create_vulkan_device(&adapter, required, &limits) {
-            Ok((device, queue)) => {
-                tracing::info!(features = ?device.features(), "device");
-                return Ok((instance, adapter, device, queue));
-            }
-            Err(err) => return Err(err),
-        }
+        let (device, queue) = create_vulkan_device(&adapter, required, &limits)?;
+        fire_probe(config, CreationPhase::Device, Some(&adapter), Some(&device))?;
+        tracing::info!(features = ?device.features(), "device");
+        return Ok((instance, adapter, device, queue));
     }
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("cherenkov-gpu"),
@@ -651,6 +677,7 @@ fn create_device(
         trace: wgpu::Trace::Off,
     }))
     .map_err(|e| EngineError::Backend(format!("{e}")))?;
+    fire_probe(config, CreationPhase::Device, Some(&adapter), Some(&device))?;
     tracing::info!(features = ?device.features(), "device");
     Ok((instance, adapter, device, queue))
 }
@@ -789,6 +816,7 @@ async fn create_device(
         backends: config.backends,
         ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
+    fire_probe(&config, CreationPhase::Instance, None, None)?;
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: config.power_preference,
@@ -807,6 +835,7 @@ async fn create_device(
             "adapter cannot render the working-space format".into(),
         ));
     }
+    fire_probe(&config, CreationPhase::Adapter, Some(&adapter), None)?;
     let supported = adapter.features();
     let info = adapter.get_info();
     tracing::info!(
@@ -847,6 +876,12 @@ async fn create_device(
         })
         .await
         .map_err(|e| EngineError::Backend(format!("{e}")))?;
+    fire_probe(
+        &config,
+        CreationPhase::Device,
+        Some(&adapter),
+        Some(&device),
+    )?;
     tracing::info!(features = ?device.features(), "device");
     Ok((instance, adapter, device, queue))
 }
@@ -1304,6 +1339,12 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             TimestampSupport::Unsupported
         };
         let (layout0, layout1) = create_layouts(&device);
+        fire_probe(
+            &config,
+            CreationPhase::Layouts,
+            Some(&adapter),
+            Some(&device),
+        )?;
         let scratch_format = scratch_wgpu(config.scratch_format);
         // Three specialised fragment shaders from one source file, compiled
         // at build time: the prepended `VARIANT` constant makes fs_main a
@@ -1311,6 +1352,12 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
         // and Metal these are the embedded passthrough binaries (#57).
         let shader_delivery = shaders::delivery(info.backend, &device)?;
         let modules = [0usize, 1, 2].map(|v| shader_delivery.engine_module(&device, v));
+        fire_probe(
+            &config,
+            CreationPhase::ShaderModules,
+            Some(&adapter),
+            Some(&device),
+        )?;
         let pipelines = |format: wgpu::TextureFormat, replace: bool| {
             Ok::<_, EngineError>([
                 create_pipeline(
@@ -1352,6 +1399,12 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
                 pipelines(scratch_format, true)?,
             ],
         ];
+        fire_probe(
+            &config,
+            CreationPhase::CorePipelines,
+            Some(&adapter),
+            Some(&device),
+        )?;
         let globals = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("globals"),
             // One 256-byte stride slot: a single pass's Globals entry.
@@ -1374,7 +1427,14 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
         diag::create(&device, "globals", globals.size());
         diag::create(&device, "instances", instances.size());
         diag::create(&device, "stops", stops.size());
+        fire_probe(
+            &config,
+            CreationPhase::Buffers,
+            Some(&adapter),
+            Some(&device),
+        )?;
         let atlas = Atlas::new(&device, config.budget.gpu.0);
+        fire_probe(&config, CreationPhase::Atlas, Some(&adapter), Some(&device))?;
         let bind0 = make_bind0(&device, &layout0, &globals, &instances, &stops, &atlas);
         let (_, dummy_view) = create_target(
             &device,
@@ -1392,6 +1452,12 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             wgpu::TextureFormat::R8Uint,
         );
         diag::create(&device, "dummy uint source", 1);
+        fire_probe(
+            &config,
+            CreationPhase::BindGroups,
+            Some(&adapter),
+            Some(&device),
+        )?;
         let timestamps =
             config.timestamps && device.features().contains(wgpu::Features::TIMESTAMP_QUERY);
         let (query_set, query_buffer) = if timestamps {
@@ -1415,6 +1481,12 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             diag::create(&device, "frame timestamps", 0);
             diag::create(&device, "timestamp resolve", buffer.size());
         }
+        fire_probe(
+            &config,
+            CreationPhase::Timestamps,
+            Some(&adapter),
+            Some(&device),
+        )?;
         // Two queries per frame, reserving 64 independent frame ranges.
         let query_capacity = if query_set.is_some() { 2 } else { 0 };
         let query_pool = query_set.as_ref().map_or_else(Vec::new, |set| {
@@ -1422,6 +1494,13 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
                 .map(|slot| (set.clone(), slot * 2, 2))
                 .collect()
         });
+        let shadow_blur = shadow::Blur::new(&device, scratch_format);
+        fire_probe(
+            &config,
+            CreationPhase::ShadowBlur,
+            Some(&adapter),
+            Some(&device),
+        )?;
         #[cfg(all(unix, not(target_vendor = "apple")))]
         let native = {
             let shared_device = crate::interop::SharedDevice {
@@ -1440,6 +1519,18 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
                 }
             }
         };
+        fire_probe(
+            &config,
+            CreationPhase::ExternalNative,
+            Some(&adapter),
+            Some(&device),
+        )?;
+        fire_probe(
+            &config,
+            CreationPhase::Complete,
+            Some(&adapter),
+            Some(&device),
+        )?;
         let renderer = GpuRenderer {
             instance,
             adapter,
@@ -1448,7 +1539,7 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             shaders: paint::Registry::default(),
             backdrop_shaders: FxHashMap::default(),
             filters: filter::Registry::new(config.redraw.clone()),
-            shadow_blur: shadow::Blur::new(&device, scratch_format),
+            shadow_blur,
             last_frame: None,
             origin: None,
             max_texture: device.limits().max_texture_dimension_2d,
@@ -1537,6 +1628,12 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
         TimestampSupport::Unsupported
     };
     let (layout0, layout1) = create_layouts(&device);
+    fire_probe(
+        &config,
+        CreationPhase::Layouts,
+        Some(&adapter),
+        Some(&device),
+    )?;
     let scratch_format = scratch_wgpu(config.scratch_format);
     // Three specialised fragment shaders from one source file: the
     // prepended `VARIANT` constant makes fs_main a constant-folded
@@ -1547,6 +1644,12 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
     if let Some(error) = shader_scope.pop().await {
         return Err(EngineError::Backend(error.to_string()));
     }
+    fire_probe(
+        &config,
+        CreationPhase::ShaderModules,
+        Some(&adapter),
+        Some(&device),
+    )?;
     let pipelines = async |format: wgpu::TextureFormat, replace: bool| {
         Ok::<_, EngineError>([
             create_pipeline(
@@ -1591,6 +1694,12 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
             pipelines(scratch_format, true).await?,
         ],
     ];
+    fire_probe(
+        &config,
+        CreationPhase::CorePipelines,
+        Some(&adapter),
+        Some(&device),
+    )?;
     let globals = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("globals"),
         // One 256-byte stride slot: a single pass's Globals entry.
@@ -1613,7 +1722,14 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
     diag::create(&device, "globals", globals.size());
     diag::create(&device, "instances", instances.size());
     diag::create(&device, "stops", stops.size());
+    fire_probe(
+        &config,
+        CreationPhase::Buffers,
+        Some(&adapter),
+        Some(&device),
+    )?;
     let atlas = Atlas::new(&device, config.budget.gpu.0);
+    fire_probe(&config, CreationPhase::Atlas, Some(&adapter), Some(&device))?;
     let bind0 = make_bind0(&device, &layout0, &globals, &instances, &stops, &atlas);
     let (_, dummy_view) = create_target(
         &device,
@@ -1631,6 +1747,12 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
         wgpu::TextureFormat::R8Uint,
     );
     diag::create(&device, "dummy uint source", 1);
+    fire_probe(
+        &config,
+        CreationPhase::BindGroups,
+        Some(&adapter),
+        Some(&device),
+    )?;
     let timestamps =
         config.timestamps && device.features().contains(wgpu::Features::TIMESTAMP_QUERY);
     let (query_set, query_buffer) = if timestamps {
@@ -1654,6 +1776,12 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
         diag::create(&device, "frame timestamps", 0);
         diag::create(&device, "timestamp resolve", buffer.size());
     }
+    fire_probe(
+        &config,
+        CreationPhase::Timestamps,
+        Some(&adapter),
+        Some(&device),
+    )?;
     // Two queries per frame, reserving 64 independent frame ranges.
     let query_capacity = if query_set.is_some() { 2 } else { 0 };
     let query_pool = query_set.as_ref().map_or_else(Vec::new, |set| {
@@ -1661,6 +1789,19 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
             .map(|slot| (set.clone(), slot * 2, 2))
             .collect()
     });
+    let shadow_blur = shadow::Blur::new(&device, scratch_format);
+    fire_probe(
+        &config,
+        CreationPhase::ShadowBlur,
+        Some(&adapter),
+        Some(&device),
+    )?;
+    fire_probe(
+        &config,
+        CreationPhase::Complete,
+        Some(&adapter),
+        Some(&device),
+    )?;
     let renderer = GpuRenderer {
         instance,
         adapter,
@@ -1669,7 +1810,7 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
         shaders: paint::Registry::default(),
         backdrop_shaders: FxHashMap::default(),
         filters: filter::Registry::new(config.redraw.clone()),
-        shadow_blur: shadow::Blur::new(&device, scratch_format),
+        shadow_blur,
         last_frame: None,
         origin: None,
         max_texture: device.limits().max_texture_dimension_2d,

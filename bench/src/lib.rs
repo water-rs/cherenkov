@@ -38,6 +38,8 @@ pub mod cherenkov_cpu_ad;
 pub mod cli;
 pub mod conditions;
 pub mod convert;
+#[cfg(feature = "cherenkov")]
+pub mod creation;
 pub mod energy;
 pub mod gamut_sweep;
 pub mod memory;

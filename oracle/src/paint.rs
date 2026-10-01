@@ -106,10 +106,10 @@ fn eval_stops(stops: &[GradientStop], t: f64, interpolation: ColorSpace) -> [f64
             let ca = to_space(&a.color, interpolation);
             let cb = to_space(&b.color, interpolation);
             let mixed = [
-                ca[0] + f * (cb[0] - ca[0]),
-                ca[1] + f * (cb[1] - ca[1]),
-                ca[2] + f * (cb[2] - ca[2]),
-                ca[3] + f * (cb[3] - ca[3]),
+                f.mul_add(cb[0] - ca[0], ca[0]),
+                f.mul_add(cb[1] - ca[1], ca[1]),
+                f.mul_add(cb[2] - ca[2], ca[2]),
+                f.mul_add(cb[3] - ca[3], ca[3]),
             ];
             return from_space(mixed, interpolation);
         }
@@ -281,9 +281,9 @@ pub fn sample_image(img: &crate::image::Image, u: f64, v: f64, sampling: Samplin
             let (c00, c10, c01, c11) = (at(x0, y0), at(x1, y0), at(x0, y1), at(x1, y1));
             let mut out = [0.0; 4];
             for i in 0..4 {
-                let top = c00[i] + tx * (c10[i] - c00[i]);
-                let bot = c01[i] + tx * (c11[i] - c01[i]);
-                out[i] = top + ty * (bot - top);
+                let top = tx.mul_add(c10[i] - c00[i], c00[i]);
+                let bot = tx.mul_add(c11[i] - c01[i], c01[i]);
+                out[i] = ty.mul_add(bot - top, top);
             }
             out
         }

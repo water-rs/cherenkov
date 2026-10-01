@@ -241,12 +241,17 @@ where
 
 fn register_font<R: Renderer>(renderer: &mut R) -> FontId {
     let font = FontId::new(1);
+    // The scene tree is generated, not committed: read it at call time so
+    // the `testing` feature compiles for consumers pinned by git, and only
+    // `equivalence` needs the generated fonts.
+    let data = std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scenes/fonts/NotoSans.ttf"),
+    )
+    .expect("scenes/fonts/NotoSans.ttf is generated; run `python3 scenes/tools/generate.py` first");
     renderer.add_font(
         font,
         R::prepare_font(FontData {
-            data: include_bytes!("../../scenes/fonts/NotoSans.ttf")
-                .as_slice()
-                .into(),
+            data: data.into(),
             index: 0,
         })
         .expect("prepare font"),
@@ -450,15 +455,15 @@ fn updates(list: &crate::DisplayList, frame: u32) -> Vec<SlotUpdate> {
                         Operand::Shape(ShapeData::Rect(Rect::new(
                             12.,
                             15.,
-                            20. + value * 50.,
-                            28. + value * 35.,
+                            value.mul_add(50., 20.),
+                            value.mul_add(35., 28.),
                         )))
                     }
                 }
-                Command::Stroke { .. } => Operand::Stroke(Stroke::new(0.5 + value * 3.)),
+                Command::Stroke { .. } => Operand::Stroke(Stroke::new(value.mul_add(3., 0.5))),
                 Command::Glyphs { run: old, .. } => Operand::Run(run(old.font, frame % 6, value)),
                 Command::Shadow { .. } => Operand::Shadow(Shadow::new(
-                    1. + value * 3.,
+                    value.mul_add(3., 1.),
                     WorkingColor::new([0.1, 0.2, 0.3, 0.5]),
                 )),
                 Command::Picture { .. } | Command::BeginTransform { .. } => {
@@ -484,8 +489,8 @@ fn update_properties(tree: &mut SurfaceTree, layer: LayerId, step: u32) {
             Prop {
                 target: Affine::translate((random(step, 9) * 8., random(step, 10) * 8.))
                     * Affine::scale_non_uniform(
-                        0.8 + random(step, 11) * 0.4,
-                        0.8 + random(step, 12) * 0.4,
+                        random(step, 11).mul_add(0.4, 0.8),
+                        random(step, 12).mul_add(0.4, 0.8),
                     ),
                 animation: Some(Animation::Curve(Curve::linear(Duration::from_millis(40)))),
             },

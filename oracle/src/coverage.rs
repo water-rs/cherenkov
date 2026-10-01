@@ -16,8 +16,9 @@
 //! flattened path up to `f64` rounding.
 
 use cherenkov_scene::FillRule;
+use rayon::prelude::*;
 
-use crate::clip::{Segment, inside, winding};
+use crate::clip::{Segment, inside, is_left};
 
 /// Tolerance for flattening cubic/quadratic curves into line segments, in
 /// pixels. The shape→polyline pipeline splits it evenly between the
@@ -26,6 +27,16 @@ pub const FLATTEN_TOLERANCE: f64 = 1e-4;
 
 /// Matching tolerance for geometric predicates, in pixels.
 const EPS: f64 = 1e-9;
+
+/// Sub-row bands per pixel row in the scanline-crossing index built by
+/// `Coverage::finish`: segment `i` joins band `b` of a row only when its
+/// y range overlaps the band's, so `winding_at`/`seed_winding` scan only
+/// segments that can cross a scanline inside the band.
+const SUB: usize = 64;
+#[expect(clippy::cast_precision_loss, reason = "a small constant")]
+const SUB_F: f64 = SUB as f64;
+#[expect(clippy::cast_possible_wrap, reason = "a small constant")]
+const SUB_I: isize = SUB as isize;
 
 /// The part of segment `(sx0,sy0)-(sx1,sy1)` inside the rectangle
 /// `[x0,x1]×[y0,y1]`, clipped parametrically (Liang–Barsky).
@@ -78,11 +89,29 @@ fn clip_to_rect(s: Segment, x0: f64, y0: f64, x1: f64, y1: f64) -> Option<Segmen
 /// number there satisfies `rule`. The winding is seeded by
 /// [`seed_winding`] of the full boundary at the strip's left edge and
 /// updated by each crossing's direction (`+1` upward, `−1` downward).
-fn pixel_area(segs: &[Segment], x0: f64, y0: f64, rule: FillRule) -> f64 {
+fn pixel_area(
+    segs: &[Segment],
+    cand: &[u32],
+    subs: &[Vec<u32>],
+    x0: f64,
+    y0: f64,
+    rule: FillRule,
+) -> f64 {
+    /// Sub-bucket of `subs` that can contain a segment crossing a
+    /// scanline at `y` inside this pixel's row.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "callers pass y inside the pixel row, so the band index is in [0, SUB)"
+    )]
+    fn sub_of(y: f64, y0: f64) -> usize {
+        ((y - y0) * SUB_F).floor() as usize
+    }
     let (x1, y1) = (x0 + 1.0, y0 + 1.0);
     let mut inside_segs = Vec::new();
     let mut crit_ys = vec![y0, y1];
-    for &s in segs {
+    for &i in cand {
+        let s = segs[i as usize];
         // Cheap reject before exact clipping.
         if s.0.max(s.2) < x0 - EPS
             || s.0.min(s.2) > x1 + EPS
@@ -123,7 +152,8 @@ fn pixel_area(segs: &[Segment], x0: f64, y0: f64, rule: FillRule) -> f64 {
     }
     if inside_segs.is_empty() {
         // Uniformly covered or empty: decide by the centre's winding.
-        return f64::from(inside(winding(segs, x0 + 0.5, y0 + 0.5), rule));
+        let w = winding_at(segs, &subs[sub_of(y0 + 0.5, y0)], x0 + 0.5, y0 + 0.5);
+        return f64::from(inside(w, rule));
     }
     crit_ys.sort_by(f64::total_cmp);
     crit_ys.dedup_by(|a, b| (*a - *b).abs() < EPS);
@@ -155,7 +185,7 @@ fn pixel_area(segs: &[Segment], x0: f64, y0: f64, rule: FillRule) -> f64 {
         xs.sort_by(|a, b| a.0.total_cmp(&b.0));
         // Wind from the pixel's left edge; crossings strictly right of it
         // are already counted by `seed_winding`.
-        let mut wind = seed_winding(segs, x0, ymid);
+        let mut wind = seed_winding(segs, &subs[sub_of(ymid, y0)], x0, ymid);
         let mut xprev = x0;
         let mut i = 0;
         while i < xs.len() {
@@ -180,14 +210,34 @@ fn pixel_area(segs: &[Segment], x0: f64, y0: f64, rule: FillRule) -> f64 {
     area.clamp(0.0, 1.0)
 }
 
+/// [`crate::clip::winding`] restricted to the candidate segment indices,
+/// in their original order. A segment whose y range does not intersect
+/// the candidate row can only contribute zero to `winding`, so the row
+/// bucket reproduces the full-list result exactly.
+fn winding_at(edges: &[Segment], cand: &[u32], px: f64, py: f64) -> i32 {
+    let mut w = 0;
+    for &i in cand {
+        let (x0, y0, x1, y1) = edges[i as usize];
+        if y0 <= py {
+            if y1 > py && is_left(x0, y0, x1, y1, px, py) > 0.0 {
+                w += 1;
+            }
+        } else if y1 <= py && is_left(x0, y0, x1, y1, px, py) < 0.0 {
+            w -= 1;
+        }
+    }
+    w
+}
+
 /// Winding number at `(px, py)` from the edges whose crossing of the
 /// horizontal line through `py` lies more than `EPS` right of `px` — the
 /// same classification `pixel_area` applies to strip crossings, so an
 /// edge hugging the pixel's left border is either seeded or crossed,
 /// never seeded and then dropped.
-fn seed_winding(edges: &[Segment], px: f64, py: f64) -> i32 {
+fn seed_winding(edges: &[Segment], cand: &[u32], px: f64, py: f64) -> i32 {
     let mut w = 0;
-    for &(x0, y0, x1, y1) in edges {
+    for &i in cand {
+        let (x0, y0, x1, y1) = edges[i as usize];
         let dir = if y0 <= py && y1 > py {
             1
         } else if y1 <= py && y0 > py {
@@ -246,18 +296,93 @@ impl Coverage {
     }
 
     /// Compute the exact covered area of every pixel under `rule`.
+    ///
+    /// Two indexes bound every per-pixel scan to the pixels a segment
+    /// can actually cover instead of the whole row's candidate list.
+    /// `cells` buckets segments by the pixels their bounding box (padded
+    /// by `EPS`) intersects — a superset of what the cheap reject and
+    /// exact clip in `pixel_area` admit. `subs` splits each row into
+    /// `SUB` sub-row bands and buckets segments by the bands their
+    /// y range covers — a superset of the segments that can cross a
+    /// scanline inside the band, which is all `winding_at` and
+    /// `seed_winding` consult. Both lists preserve segment order, and
+    /// every per-segment check is unchanged, so results are
+    /// bit-identical.
+    ///
+    /// # Panics
+    ///
+    /// Panics if more than `u32::MAX` segments were accumulated.
     #[must_use]
     #[expect(
         clippy::cast_precision_loss,
-        reason = "pixel indices are far below 2^53"
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "pixel indices are far below 2^53; row indices are clamped to bounds"
     )]
     pub fn finish(&self, rule: FillRule) -> Vec<f64> {
-        let mut out = vec![0.0; self.width * self.height];
-        for y in 0..self.height {
-            for x in 0..self.width {
-                out[y * self.width + x] = pixel_area(&self.segs, x as f64, y as f64, rule);
+        // `rows[r]` lists, in original order, the segments whose y range
+        // overlaps `[r - EPS, r + 1 + EPS]` — a superset of the segments
+        // that can contribute to any computation in the row.
+        let (w, h) = (self.width, self.height);
+        let mut out = vec![0.0; w * h];
+        if h == 0 || w == 0 {
+            return out;
+        }
+        let mut cells: Vec<Vec<u32>> = (0..w * h).map(|_| Vec::new()).collect();
+        let mut subs: Vec<Vec<u32>> = (0..h * SUB).map(|_| Vec::new()).collect();
+        for (i, &s) in self.segs.iter().enumerate() {
+            let (xmin, xmax) = (s.0.min(s.2), s.0.max(s.2));
+            let (ymin, ymax) = (s.1.min(s.3), s.1.max(s.3));
+            if !ymin.is_finite() || !ymax.is_finite() {
+                continue;
+            }
+            let i = u32::try_from(i).expect("under 2^32 segments");
+            // Cells whose padded bounding box intersects the segment's:
+            // the exact x/y reject needs `xmax >= x - EPS`,
+            // `xmin <= x + 1 + EPS` and the same in y. A non-finite x
+            // bound admits the segment to every cell in its rows, the
+            // same coverage it had in the unindexed scan.
+            let (cx0, cx1) = if xmin.is_finite() && xmax.is_finite() {
+                (
+                    ((xmin - 1.0 - EPS).floor().max(0.0) as usize).min(w - 1),
+                    ((xmax + EPS).floor().max(0.0) as usize).min(w - 1),
+                )
+            } else {
+                (0, w - 1)
+            };
+            let cy0 = ((ymin - 1.0 - EPS).floor().max(0.0) as usize).min(h - 1);
+            let cy1 = ((ymax + EPS).floor().max(0.0) as usize).min(h - 1);
+            for cy in cy0..=cy1 {
+                for cx in cx0..=cx1 {
+                    cells[cy * w + cx].push(i);
+                }
+            }
+            // Rows the segment can contribute a scanline crossing to,
+            // then the sub-row bands its y range overlaps: a segment
+            // crosses a scanline in band `b` only if `ymin < b_end` and
+            // `ymax > b_start`, so `b0 = floor((ymin - r) * SUB)` and
+            // `b1 = ceil((ymax - r) * SUB) - 1`, clamped to the row.
+            let r0 = ((ymin - 1.0 - EPS).ceil().max(0.0) as usize).min(h - 1);
+            let r1 = ((ymax + EPS).floor() as usize).min(h - 1);
+            for r in r0..=r1 {
+                let b0 = (((ymin - r as f64) * SUB_F).floor() as isize).clamp(0, SUB_I - 1);
+                let b1 = (((ymax - r as f64) * SUB_F).ceil() as isize - 1).clamp(0, SUB_I - 1);
+                for b in b0..=b1 {
+                    subs[r * SUB + b as usize].push(i);
+                }
             }
         }
+        out.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+            let row_subs = &subs[y * SUB..(y + 1) * SUB];
+            let row_has_subs = row_subs.iter().any(|v| !v.is_empty());
+            for (x, px) in row.iter_mut().enumerate() {
+                let cand = &cells[y * w + x];
+                if cand.is_empty() && !row_has_subs {
+                    continue;
+                }
+                *px = pixel_area(&self.segs, cand, row_subs, x as f64, y as f64, rule);
+            }
+        });
         out
     }
 }

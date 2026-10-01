@@ -692,7 +692,6 @@ fn a_shaders_reach_grows_the_capture_region() -> Result<(), Box<dyn std::error::
 split_test! {
 /// Two members far enough apart take two capture regions; the pixels
 /// inside each are identical to one single-member group each (#117).
-#[expect(clippy::float_cmp, reason = "regions must be byte-identical")]
 fn far_members_take_two_regions() -> Result<(), Box<dyn std::error::Error>> {
     split_fn! {
 #[cfg_attr(not(target_arch = "wasm32"), expect(clippy::type_complexity, reason = "test helper"))]

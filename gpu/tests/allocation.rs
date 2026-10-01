@@ -112,13 +112,13 @@ fn atlas_growth_retries_and_commits() -> Result<(), Box<dyn std::error::Error>> 
         tx[surface.root()].content(surface.record(|r| {
             for i in 0..144u32 {
                 let mut path = BezPath::new();
-                let cx = 26.0 + f64::from(i % 12) * 42.0;
-                let cy = 26.0 + f64::from(i / 12) * 42.0;
+                let cx = f64::from(i % 12).mul_add(42.0, 26.0);
+                let cy = f64::from(i / 12).mul_add(42.0, 26.0);
                 for point in 0..5u32 {
                     let angle = f64::from(point)
                         .mul_add(144.0 + f64::from(i), -90.0)
                         .to_radians();
-                    let radius = 34.0 + f64::from(i % 8) * 2.0;
+                    let radius = f64::from(i % 8).mul_add(2.0, 34.0);
                     let p = Point::new(
                         angle.cos().mul_add(radius, cx),
                         angle.sin().mul_add(radius, cy),

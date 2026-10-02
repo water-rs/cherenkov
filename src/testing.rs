@@ -1288,7 +1288,10 @@ mod tests {
     use super::*;
     use crate::image::ImageData;
     use crate::resource::FontSource;
-    use crate::{Decay, Engine, FrameTime, Next, OffscreenFormat, ShaderSource, Spring};
+    use crate::{
+        Decay, Engine, FrameTime, Image, Layer, Next, OffscreenFormat, ShaderSource, Spring,
+        Surface,
+    };
 
     fn engine() -> (Engine<Null>, std::sync::mpsc::Receiver<Event>) {
         engine_rejecting(HashSet::new())
@@ -1404,16 +1407,23 @@ mod tests {
         );
     }
 
-    /// `Image::replace` reaches the renderer with the new dimensions, marks
-    /// changed only the surface whose content draws the image and wakes the
-    /// host once between two renders; replacing an image nothing draws
-    /// marks nothing. After the last drop the image is removed once the
-    /// content stops drawing it.
-    #[test]
-    fn image_replacement_redraws_and_still_releases() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicU32, Ordering};
+    /// Two surfaces — `drawing` draws `image`, `other` a fill — plus an
+    /// `unused` image nothing draws, already settled: the last two rendered
+    /// frames changed nothing and the event probe is drained.
+    struct ImageScene {
+        engine: Engine<Null>,
+        rx: std::sync::mpsc::Receiver<Event>,
+        drawing: Surface<Null>,
+        other: Surface<Null>,
+        image: Image<Rgba8>,
+        unused: Image<Rgba8>,
+        image_layer: Layer,
+        /// Held only for its lifetime: dropping the layer queues a remove
+        /// on `other` and fires the waker.
+        fill_layer: Layer,
+    }
 
+    fn image_replacement_scene() -> ImageScene {
         use crate::{Draw as _, Sampling, WorkingColor};
 
         let (engine, rx) = engine();
@@ -1455,6 +1465,40 @@ mod tests {
             settled.iter().rev().take(2).all(|record| !record.changed),
             "nothing changed since the first render: {settled:?}"
         );
+        ImageScene {
+            engine,
+            rx,
+            drawing,
+            other,
+            image,
+            unused,
+            image_layer,
+            fill_layer,
+        }
+    }
+
+    /// `Image::replace` reaches the renderer with the new dimensions, marks
+    /// changed only the surface whose content draws the image and wakes the
+    /// host once between two renders; replacing an image nothing draws
+    /// marks nothing. After the last drop the image is removed once the
+    /// content stops drawing it.
+    #[test]
+    fn image_replacement_redraws_and_still_releases() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        use crate::{Draw as _, WorkingColor};
+
+        let ImageScene {
+            engine,
+            rx,
+            drawing,
+            other,
+            image,
+            unused,
+            image_layer,
+            fill_layer: _fill_layer,
+        } = image_replacement_scene();
 
         let wakes = Arc::new(AtomicU32::new(0));
         engine.set_waker({

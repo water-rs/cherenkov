@@ -277,5 +277,9 @@ impl Pool {
         self.device
             .queue
             .on_submitted_work_done(move || completed.store(serial, Ordering::Release));
+        // A plane-only refresh submits nothing to the queue — without a
+        // poll the completion callbacks sit un-driven and the serial
+        // gate never opens.
+        let _ = self.device.device.poll(wgpu::PollType::Poll);
     }
 }

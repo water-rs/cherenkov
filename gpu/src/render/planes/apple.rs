@@ -1527,6 +1527,7 @@ impl SystemPlanes for LayerPlanes {
     }
 
     fn refresh<'a>(&mut self, frames: impl Iterator<Item = Plane<'a>>) -> Result<(), RenderError> {
+        let mut changed = Vec::new();
         for plane in frames {
             let previous = self
                 .placements
@@ -1544,7 +1545,6 @@ impl SystemPlanes for LayerPlanes {
         if !changed.is_empty() {
             self.scene.run(move |scene, _| {
                 let _tx = Transaction::begin();
-        let mut changed = Vec::new();
                 for placement in changed {
                     let layers = scene
                         .planes

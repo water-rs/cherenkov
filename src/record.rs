@@ -6,7 +6,6 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::mem::{needs_drop, size_of};
 use std::rc::{Rc, Weak};
-use std::sync::Arc;
 
 use kurbo::{Affine, Rect, Stroke};
 use nami_core::Signal;
@@ -350,7 +349,16 @@ pub struct LiveState {
     /// skip per-content probes. Detached when the content retires.
     surface_animated: RefCell<Option<Rc<Cell<bool>>>>,
     guards: RefCell<Vec<Box<dyn Any>>>,
-    waker: RefCell<std::sync::Weak<crate::engine::Waker>>,
+    /// The surface the content is installed on. Detached when the content
+    /// retires.
+    owner: RefCell<Option<Weak<dyn LiveOwner>>>,
+}
+
+/// The surface a content is installed on, as its live operands reach it.
+pub trait LiveOwner {
+    /// A live operand changed: a visible surface wakes the host for the
+    /// frame that samples it, and a hidden one applies it at once.
+    fn changed(&self);
 }
 
 /// A change carrying an `Animation`, queued until the next
@@ -380,9 +388,9 @@ impl LiveState {
     }
 
     fn wake(&self) {
-        let waker = self.waker.borrow().upgrade();
-        if let Some(waker) = waker {
-            waker.wake();
+        let owner = self.owner.borrow().as_ref().and_then(Weak::upgrade);
+        if let Some(owner) = owner {
+            owner.changed();
         }
     }
 
@@ -820,7 +828,7 @@ impl Content {
         }
         live.guards.borrow_mut().clear();
         live.pending.borrow_mut().clear();
-        *live.waker.borrow_mut() = std::sync::Weak::new();
+        *live.owner.borrow_mut() = None;
         drop(picture);
         ContentSpare {
             picture: None,
@@ -847,12 +855,12 @@ impl Content {
         }
     }
 
-    /// Connect installed live operands to the owning surface's host callback
-    /// and sampling flag.
-    pub(crate) fn attach_waker(&self, waker: &Arc<crate::engine::Waker>, flag: &Rc<Cell<bool>>) {
-        // Constant recordings need no callback or weak-count traffic.
+    /// Connect installed live operands to the owning surface and its
+    /// sampling flag.
+    pub(crate) fn attach_owner(&self, owner: Weak<dyn LiveOwner>, flag: &Rc<Cell<bool>>) {
+        // Constant recordings need no owner or weak-count traffic.
         if !self.live.guards.borrow().is_empty() {
-            *self.live.waker.borrow_mut() = Arc::downgrade(waker);
+            *self.live.owner.borrow_mut() = Some(owner);
             self.live.attach_animated(flag);
         }
     }

@@ -9,7 +9,9 @@ use std::{
     },
 };
 
-use cherenkov::{BackdropId, FilterId, FrameId, FrameTime, RenderError, SurfaceId};
+use cherenkov::{
+    BackdropId, FilterId, FrameId, FrameTime, RenderError, SurfaceId, SurfaceVisibility, WakeGate,
+};
 use filtrate_core::{
     AnimatedTarget, AnimationTrack, CpuFilter, CpuFilterError, CpuImage, Footprint, ParamArray,
     SignalVisitor, WatchGuard, WorkingSpace,
@@ -77,7 +79,8 @@ struct Entry {
     events: Receiver<(usize, AnimatedTarget)>,
     pending_events: VecDeque<(usize, AnimatedTarget)>,
     dirty: Arc<AtomicBool>,
-    active: Arc<AtomicBool>,
+    /// Open while a visible surface's last frame ran the entry.
+    gate: Arc<WakeGate>,
     _guards: Vec<WatchGuard>,
     sequence: Option<FrameId>,
     params: Arc<[f32]>,
@@ -116,7 +119,7 @@ impl Entry {
 struct WatcherInstaller<'a> {
     events: Sender<(usize, AnimatedTarget)>,
     dirty: Arc<AtomicBool>,
-    active: Arc<AtomicBool>,
+    gate: Arc<WakeGate>,
     redraw: Option<RedrawCallback>,
     guards: &'a mut Vec<WatchGuard>,
 }
@@ -125,7 +128,7 @@ impl SignalVisitor for WatcherInstaller<'_> {
     fn visit<P: filtrate_core::FilterParam + ?Sized>(&mut self, index: usize, param: &P) {
         let events = self.events.clone();
         let dirty = Arc::clone(&self.dirty);
-        let active = Arc::clone(&self.active);
+        let gate = Arc::clone(&self.gate);
         let redraw = self.redraw.clone();
         self.guards
             .push(param.watch_animated(Box::new(move |target| {
@@ -133,7 +136,7 @@ impl SignalVisitor for WatcherInstaller<'_> {
                     return;
                 }
                 dirty.store(true, Ordering::Release);
-                if active.load(Ordering::Acquire)
+                if gate.is_open()
                     && let Some(redraw) = &redraw
                 {
                     redraw.wake();
@@ -171,12 +174,12 @@ impl Registry {
         let initial: Arc<[f32]> = initial.into();
         let (event_sender, events) = channel();
         let dirty = Arc::new(AtomicBool::new(false));
-        let active = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new(WakeGate::default());
         let mut guards = Vec::with_capacity(F::Params::LEN);
         filter.visit_signals(&mut WatcherInstaller {
             events: event_sender,
             dirty: Arc::clone(&dirty),
-            active: Arc::clone(&active),
+            gate: Arc::clone(&gate),
             redraw: self.redraw.clone(),
             guards: &mut guards,
         });
@@ -186,7 +189,7 @@ impl Registry {
             events,
             pending_events: VecDeque::new(),
             dirty,
-            active,
+            gate,
             _guards: guards,
             sequence: None,
             params: initial,
@@ -218,7 +221,7 @@ impl Registry {
             .insert((surface.raw(), id.raw()), None)
             .flatten()
         {
-            entry.active.store(false, Ordering::Release);
+            entry.gate.close();
         }
     }
 
@@ -233,20 +236,20 @@ impl Registry {
             .insert((surface.raw(), id.raw()), Some(entry))
             .flatten()
         {
-            old.active.store(false, Ordering::Release);
+            old.gate.close();
         }
     }
 
     /// Unregisters a backdrop group.
     pub fn remove_backdrop_group(&mut self, surface: SurfaceId, id: BackdropId) {
         if let Some(entry) = self.backdrops.remove(&(surface.raw(), id.raw())).flatten() {
-            entry.active.store(false, Ordering::Release);
+            entry.gate.close();
         }
     }
 
     pub fn remove(&mut self, id: FilterId) {
         if let Some(entry) = self.entries.remove(&id.raw()) {
-            entry.active.store(false, Ordering::Release);
+            entry.gate.close();
         }
     }
 
@@ -328,16 +331,26 @@ impl Registry {
             .is_some_and(|group| group.as_ref().is_some_and(Entry::wants_redraw))
     }
 
-    /// Marks filters and backdrop chains not sampled this frame inactive.
-    pub(super) fn set_active(&self, used: &FxHashSet<u64>, used_groups: &FxHashSet<(u64, u64)>) {
+    /// Sets each filter's and backdrop chain's wake gate to the surfaces
+    /// whose last frames ran it; an entry no frame ran wakes nothing.
+    pub(super) fn set_surfaces(
+        &self,
+        uses: &FxHashMap<u64, Vec<SurfaceVisibility>>,
+        groups: &FxHashMap<(u64, u64), SurfaceVisibility>,
+    ) {
         for (id, entry) in &self.entries {
-            entry.active.store(used.contains(id), Ordering::Release);
+            entry
+                .gate
+                .set(uses.get(id).map(Vec::as_slice).unwrap_or_default());
         }
         for (key, group) in &self.backdrops {
             if let Some(entry) = group {
-                entry
-                    .active
-                    .store(used_groups.contains(key), Ordering::Release);
+                entry.gate.set(
+                    groups
+                        .get(key)
+                        .map(std::slice::from_ref)
+                        .unwrap_or_default(),
+                );
             }
         }
     }
@@ -380,7 +393,7 @@ impl Drop for Registry {
             .values()
             .chain(self.backdrops.values().flatten())
         {
-            entry.active.store(false, Ordering::Release);
+            entry.gate.close();
         }
     }
 }

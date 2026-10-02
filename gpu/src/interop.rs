@@ -93,7 +93,7 @@ impl GpuContentBox {
             content: Box::new(content),
             redraw: RedrawHandle {
                 dirty: Arc::new(AtomicBool::new(true)),
-                active: Arc::new(AtomicBool::new(false)),
+                gate: Arc::new(cherenkov::WakeGate::default()),
                 wake: Arc::new(wake),
             },
         }
@@ -110,7 +110,8 @@ impl GpuContentBox {
 #[derive(Clone)]
 pub struct RedrawHandle {
     pub(crate) dirty: Arc<AtomicBool>,
-    pub(crate) active: Arc<AtomicBool>,
+    /// Open while the content is composed on a visible surface.
+    pub(crate) gate: Arc<cherenkov::WakeGate>,
     wake: Arc<dyn Fn() + Send + Sync>,
 }
 
@@ -124,10 +125,11 @@ impl std::fmt::Debug for RedrawHandle {
 
 impl RedrawHandle {
     /// Marks the producer's output stale. Requests coalesce until consumed.
-    /// Detached or removed content retains the request without waking the host;
-    /// reattachment draws its latest state.
+    /// Detached or removed content, and content on a surface the host has
+    /// announced hidden, retains the request without waking the host; the
+    /// frame that draws it again draws its latest state.
     pub fn request_redraw(&self) {
-        if !self.dirty.swap(true, Ordering::AcqRel) && self.active.load(Ordering::Acquire) {
+        if !self.dirty.swap(true, Ordering::AcqRel) && self.gate.is_open() {
             (self.wake)();
         }
     }

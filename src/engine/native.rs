@@ -1,7 +1,7 @@
 //! The engine: owns the render thread and every resource's identity.
 //! `!Send`, lives on the UI thread.
 
-use super::{Waker, thread};
+use super::{SurfaceWaker, Waker, thread};
 
 use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
@@ -97,29 +97,13 @@ impl<B: Backend> Engine<B> {
             .map_err(|_| EngineError::Thread("render thread died during init".into()))??;
         let post_tx = tx.clone();
         let waker = Arc::new(Waker::new());
-        {
-            let waker = crate::engine::CompletionWaker::new(&waker);
-            // A promoted plane's attach lands on the main queue; the
-            // block wakes the host through this handle for the frame
-            // that promotes it. Backends with no main-queue completion
-            // ignore it.
-            tx.send(Message::Resource(Box::new(move |r: &mut B::Renderer| {
-                r.set_plane_waker(waker);
-            })))
-            .map_err(|_| {
-                EngineError::Thread("render thread died installing the plane waker".into())
-            })?;
-        }
         let replace_image = {
             let tx = tx.clone();
-            let waker = Arc::clone(&waker);
+            // The render loop wakes the host through every visible surface
+            // that draws the image, once it knows which surfaces do.
             Rc::new(move |id, image| {
                 tx.send(Message::ReplaceImage { id, image })
-                    .map_err(|_| ResourceError::Lost)?;
-                // A host paused after `Next::Idle` needs a frame to show
-                // the new pixels.
-                waker.wake();
-                Ok(())
+                    .map_err(|_| ResourceError::Lost)
             }) as ReplaceImage
         };
         Ok(Self {
@@ -212,9 +196,13 @@ impl<B: Backend> Engine<B> {
     /// bound signal firing) are queued, not sent. When the display link is
     /// paused after `Next::Idle`, the host must learn that a frame is
     /// needed: the engine calls `f` at most once between two
-    /// [`Engine::render`]s, the first time something is queued. `f` may
-    /// run on the engine's thread or on the main thread — a completion
-    /// queued there by the render thread fires it — so it must be
+    /// [`Engine::render`]s, the first time something is queued on a
+    /// visible surface, and once when a surface becomes visible (see
+    /// [`Surface::visibility`]). A hidden surface never calls it. `f` may
+    /// run on the engine's thread, on the render thread — an image
+    /// replacement wakes the host from there once it knows a visible
+    /// surface draws the image — or on the main thread, where a
+    /// completion the render thread queued fires it, so it must be
     /// [`Send`] and [`Sync`].
     ///
     /// # Panics
@@ -294,16 +282,18 @@ impl<B: Backend> Engine<B> {
     /// [`SurfaceError::Lost`] when the render thread is gone.
     pub fn surface(&self, target: impl Into<B::Target>) -> Result<Surface<B>, SurfaceError> {
         let id = SurfaceId::new(Self::alloc(&self.next_surface));
+        let waker = Arc::new(SurfaceWaker::new(Arc::clone(&self.waker)));
         let (reply, rx) = std::sync::mpsc::channel();
         self.tx
             .send(Message::CreateSurface {
                 id,
                 target: target.into(),
+                waker: Arc::clone(&waker),
                 reply,
             })
             .map_err(|_| SurfaceError::Lost)?;
         let info = rx.recv().map_err(|_| SurfaceError::Lost)??;
-        let surface = Surface::new(id, info, self.tx.clone(), Arc::clone(&self.waker));
+        let surface = Surface::new(id, info, self.tx.clone(), waker);
         self.surfaces
             .borrow_mut()
             .push(Rc::downgrade(&surface.shared));
@@ -318,29 +308,25 @@ impl<B: Backend> Engine<B> {
         surfaces.len()
     }
 
-    /// Renders every dirty surface for the frame at `time`, blocking until
-    /// the render thread has applied the queued commits, sampled the
-    /// animations and rendered.
+    /// Renders every dirty visible surface for the frame at `time`,
+    /// blocking until the render thread has applied the queued commits,
+    /// sampled the animations and rendered. A hidden surface is neither
+    /// sampled nor drawn; its changes were applied as it made them.
     ///
     /// # Errors
-    /// [`RenderError`] fails this call; a surface that failed to render is
-    /// left in its previous state.
+    /// [`RenderError::Hidden`] when every surface is hidden, before
+    /// anything is drained. Any other [`RenderError`] fails this call; a
+    /// surface that failed to render is left in its previous state.
     pub fn render(&self, time: FrameTime) -> Result<Next, RenderError> {
+        if super::all_hidden(&self.surfaces.borrow()) {
+            return Err(RenderError::Hidden);
+        }
         let Some(reply_sender) = self.render_reply.borrow_mut().take() else {
             return Err(RenderError::Thread);
         };
         let mut commits = std::mem::take(&mut *self.commits.borrow_mut());
         commits.clear();
-        self.surfaces.borrow_mut().retain(|weak| {
-            let Some(shared) = weak.upgrade() else {
-                return false;
-            };
-            let mut shared_mut = shared.borrow_mut();
-            if let Some(changes) = shared_mut.take_changes(time.0) {
-                commits.push((shared_mut.id, changes));
-            }
-            true
-        });
+        super::drain_visible(&mut self.surfaces.borrow_mut(), time, &mut commits);
         if let Err(error) = self.tx.send(Message::Render {
             time,
             commits,

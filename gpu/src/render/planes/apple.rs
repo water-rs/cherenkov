@@ -302,7 +302,7 @@ struct ReadinessIvars {
     scene: Weak<MainThreadBound<RefCell<LayerScene>>>,
     layer: LayerId,
     ready: Weak<AtomicBool>,
-    waker: Option<cherenkov::CompletionWaker>,
+    waker: cherenkov::CompletionWaker,
 }
 
 objc2::define_class!(
@@ -336,9 +336,7 @@ objc2::define_class!(
                 if let Some(flag) = ready.upgrade() {
                     flag.store(is_ready, Ordering::Release);
                 }
-                if let Some(waker) = &waker {
-                    waker.wake();
-                }
+                waker.wake();
             });
         }
     }
@@ -351,7 +349,7 @@ impl ReadinessObserver {
         scene: &MainOwned<LayerScene>,
         layer: LayerId,
         ready: Weak<AtomicBool>,
-        waker: Option<cherenkov::CompletionWaker>,
+        waker: cherenkov::CompletionWaker,
     ) -> Retained<Self> {
         let this = Self::alloc().set_ivars(ReadinessIvars {
             scene: scene.downgrade(),
@@ -392,7 +390,7 @@ pub struct LayerPlanes {
     candidates: FxHashMap<LayerId, Arc<AtomicBool>>,
     offered: FxHashSet<LayerId>,
     woke: bool,
-    waker: Option<cherenkov::CompletionWaker>,
+    waker: cherenkov::CompletionWaker,
 }
 
 /// An origin-anchored layer: its position is its superlayer point for its
@@ -819,7 +817,7 @@ impl LayerScene {
         layer: LayerId,
         scene: &MainOwned<Self>,
         ready: Weak<AtomicBool>,
-        waker: Option<cherenkov::CompletionWaker>,
+        waker: cherenkov::CompletionWaker,
     ) {
         // SAFETY: creation and every subsequent use are on main.
         let display = unsafe { AVSampleBufferDisplayLayer::new() };
@@ -1022,7 +1020,7 @@ impl LayerPlanes {
         transparent: bool,
         required: Option<wgpu::SurfaceColorSpace>,
         probe: Option<mpsc::Sender<crate::render::present::DisplayProbe>>,
-        waker: Option<cherenkov::CompletionWaker>,
+        waker: cherenkov::CompletionWaker,
     ) -> Self {
         let mut result = Self {
             scene: parent.scene,
@@ -1069,9 +1067,7 @@ impl LayerPlanes {
                 scene.root.removeFromSuperlayer();
                 return;
             }
-            if let Some(waker) = waker {
-                waker.wake();
-            }
+            waker.wake();
         });
     }
 
@@ -1251,9 +1247,7 @@ impl SystemPlanes for LayerPlanes {
                     // still be false — readiness lands through the
                     // layer's own notification — but the queued work
                     // is done.
-                    if let Some(waker) = waker {
-                        waker.wake();
-                    }
+                    waker.wake();
                 }
             });
             slot.insert(ready);

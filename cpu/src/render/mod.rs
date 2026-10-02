@@ -643,7 +643,7 @@ impl RasterRenderer {
         stats: &mut FrameStats,
     ) -> Result<(), RenderError> {
         let profile = tracing::enabled!(target: "cherenkov_cpu::profile", tracing::Level::DEBUG);
-        let start = profile.then(cherenkov::Instant::now);
+        let start = cherenkov::Instant::now();
         let id = sf.id;
         let size = match self.surfaces.get(&id) {
             Some(surf) => surf.size,
@@ -664,7 +664,7 @@ impl RasterRenderer {
             surf.filters = used.filters.into_iter().collect();
             surf.groups = used.groups.into_iter().collect();
         }
-        let resolved_at = start.map(|_| cherenkov::Instant::now());
+        let resolved_at = cherenkov::Instant::now();
         let Some(surf) = self.surfaces.get_mut(&id) else {
             return Ok(());
         };
@@ -693,11 +693,14 @@ impl RasterRenderer {
             )?,
         };
         surf.backdrop_capture_peak = peak.load(std::sync::atomic::Ordering::Relaxed);
-        if let (Some(start), Some(lowered), Some(resolved)) = (start, lowered_at, resolved_at) {
+        let shaded_at = cherenkov::Instant::now();
+        stats.phases.lower_seconds += resolved_at.duration_since(start).as_secs_f64();
+        stats.phases.encode_seconds += shaded_at.duration_since(resolved_at).as_secs_f64();
+        if let (true, Some(lowered_at)) = (profile, lowered_at) {
             tracing::debug!(target: "cherenkov_cpu::profile",
-                lower_ns = lowered.duration_since(start).as_nanos(),
-                glyph_ns = resolved.duration_since(lowered).as_nanos(),
-                shade_ns = resolved.elapsed().as_nanos(),
+                lower_ns = lowered_at.duration_since(start).as_nanos(),
+                glyph_ns = resolved_at.duration_since(lowered_at).as_nanos(),
+                shade_ns = shaded_at.duration_since(resolved_at).as_nanos(),
                 items = items.len(), glyphs = glyph_reqs, "raster phases");
         }
         stats.draws += draws;

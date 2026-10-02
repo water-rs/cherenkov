@@ -60,9 +60,9 @@ final class PlanesViewController: UIViewController {
     /// Observe real thermal recovery before creating the engine. The deadline
     /// only aborts a failed cool-down; it never starts a measurement.
     private func readyToStart() -> Bool {
-        if ProcessInfo.processInfo.thermalState.rawValue >= ProcessInfo.ThermalState.serious.rawValue {
+        if ProcessInfo.processInfo.thermalState != .nominal {
             if coolingDeadline == nil {
-                NSLog("Waiting for thermal recovery before starting the harness")
+                NSLog("Waiting for nominal thermal state before starting the harness")
                 let deadline = DispatchWorkItem {
                     NSLog("Thermal recovery timed out after fifteen minutes")
                     exit(EXIT_FAILURE)

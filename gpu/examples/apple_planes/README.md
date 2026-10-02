@@ -25,7 +25,8 @@ time. Memory includes engine GPU/CPU bytes, current process physical
 footprint, and lifetime peak footprint. Serious or critical thermal state
 invalidates the run. The host sets screen brightness to its minimum.
 Before creating the engine, the host waits for a thermal-state notification
-when the phone is serious or critical. A fifteen-minute cooling deadline
+until the phone is nominal: starting at fair can exhaust the thermal
+headroom during the window. A fifteen-minute cooling deadline
 fails the run; it never starts a measurement without thermal recovery.
 
 ## Build on the Mac mini

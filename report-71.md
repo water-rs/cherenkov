@@ -1,121 +1,97 @@
 # CPU sparse coverage (#71)
 
-## Result
+## Checkpoint: October 2, 2026
 
-The worktree contains a reviewed exact sparse coverage compiler and routes
-general clip realization through it. The full draw/shading rasterizer port was
-measured and reverted because it regressed frame time. The issue acceptance
-target is therefore not met by this worktree: no valid old/new Pixel A/B exists,
-the full 398-scene corpus gate did not complete, and GPU identity was not run.
+Acceptance is not met. Work stopped at the mandatory disk floor:
+`python3 ~/.cache/cutover/avail.py` returned `59673504386` bytes
+(59.67 GB available, including purgeable space). The baseline Cargo build
+was interrupted and its process exited. No task-owned jobs remain running.
 
-## Design
+## Rebase and verification
 
-The compiler uses an f64 event sweep per device row. It splits at edge endpoints
-and crossings, resolves each operand's winding rule before integration, and
-stores positive coverage as flat row offsets plus constant or sampled spans.
-Horizontal edges remain connectivity events. This fixes the geometric error in
-the old clip path, which multiplied already-integrated masks.
+Branch: `perf/71-cpu-sparse-coverage`.
+Baseline: `2cae0517`, fetched from `origin/dev`.
+Tested candidate: `deae2648` (the report update changes documentation only).
 
-The historical shadow implementation was not reused: it clips the caster before
-blur, while the current oracle clips the post-convolution silhouette. No shared
-front end or GPU code was changed.
+The three inherited commits rebased to:
 
-## Changes
+- `0ac3d76b`: exact sparse clip coverage compiler.
+- `886f018a`: CPU render phase reporting.
+- `deae2648`: inherited measurement report.
 
-- `cpu/src/render/coverage.rs`: exact sparse compiler and unit tests.
-- `cpu/src/render/lower.rs`: general clip realization calls the sparse compiler,
-  then expands the result to the existing dense clip representation so current
-  compositing semantics remain unchanged.
-- `cpu/src/render/mod.rs`, `bench/src/cherenkov_cpu_ad.rs`,
-  `bench/README.md`: lower and encode phase reporting.
-- `cpu/src/render/raster.rs`: `Edge` equality for compiler tests.
+The phase-reporting conflict in `cpu/src/render/mod.rs` was resolved against
+dev's projective-layer implementation: `lower_items` already resolves glyphs
+and returns their count and the optional lowering timestamp. Phase reporting
+uses that result without resolving glyphs a second time. Lowering includes
+projective realization and glyph resolution; encode covers band shading.
 
-Lowering/front-end changes: only `cpu/src/render/lower.rs` clip realization;
-there are no changes under the shared front end (`src/`).
+| Command | Result |
+| --- | --- |
+| `gh issue view 71 -R water-rs/cherenkov` | Read the specification and acceptance criteria before other work. |
+| `git fetch origin dev` / `git rebase origin/dev` | Successfully rebased onto `2cae0517`. |
+| `cargo test --locked -p cherenkov-cpu --all-targets` | PASS: 118 tests across 20 test executables; zero failures. |
+| `cargo clippy --locked -p cherenkov-cpu --all-targets -- -D warnings` | PASS: `Finished dev profile`. |
+| `rustfmt --edition 2024 cpu/src/render/mod.rs` | PASS: no changes; status checked before and after. |
+| `uv run --python 3.12 --with-requirements scenes/fonts/tools/requirements.txt python scenes/tools/generate.py` | PASS: `corpus written count=420`; `perf set written count=9`. |
+| `cargo build --locked --release -p cherenkov-bench --features cherenkov,cherenkov-cpu --bin cherenkov-bench` | PASS: `Finished release profile [optimized]`. |
+| `target/release/cherenkov-bench reference --corpus scenes/corpus --out-dir out/71/rebased/reference` | PASS: `reference pass totals scenes=420 threads=12`; exit 0. |
+| Same release build in the baseline worktree | Interrupted at the disk floor; not a passing build. |
+| `git diff --check` | PASS. |
 
-## Correctness
+The regenerated corpus contains the inherited 398 scenes plus 22 scenes added
+on dev. All 420 reference files exist; there are no missing scenes or temporary
+reference files. The reference run completed at 12:06:14 EDT on October 2.
+This is oracle generation, not the CPU quality or GPU identity gate.
 
-The following passed after the final revert of the measured draw experiment:
+## Source findings
 
-```text
-cargo test -p cherenkov-cpu --all-targets: PASS
-cargo clippy -p cherenkov-cpu --all-targets -- -D warnings: PASS
-git diff --check: PASS
-```
+- `bench/src/cli.rs:890`: `reference_cmd` already uses scoped workers,
+  `available_parallelism`, and an atomic scene queue. This implementation is
+  present in both `f2209fb4` and `2cae0517` (from `6cab84fd`). The inherited
+  report's serial-path diagnosis was not reproduced. The rebuilt executable
+  completed the canonical command on 12 threads; no replacement script or
+  source change was needed for parallel reference generation.
+- `cpu/src/render/lower.rs:1042`: general clips still rasterize each shape
+  separately, expand sparse coverage to a full-surface dense mask, and multiply
+  it by the existing clip. Although `coverage::rasterize` accepts geometric
+  intersections, nested clips do not yet use that capability.
+- `cpu/src/render/raster.rs:1287`: draw shading still deposits into `Accum`,
+  walks pixel coverage, evaluates paint, and composites each pixel scalarly.
+- `bench/src/cherenkov_cpu_ad.rs:1438`: static benchmark scenes re-record their
+  contents each frame. A profiling investigation of the full sparse port must
+  include compilation cost on that path, not only retained-frame shading.
 
-The cached-reference sample render reused four references from the interrupted
-run. Their metrics were unchanged from the earlier pass:
+These are source observations, not a completed profile of the reverted port.
+The inherited full draw/shading experiment remains reverted. Its historical
+new-only Pixel timings do not establish an old/new comparison.
 
-| Scene | FLIP mean | FLIP max | max local error |
-| --- | ---: | ---: | ---: |
-| anim-curve-slide | 0.0032196 | 0.0185372 | 0.0034519 |
-| anim-paint-curve | 0.0026781 | 0.0184113 | 0.0034323 |
-| anim-paint-spring | 0.0033652 | 0.0304809 | 0.0062576 |
-| anim-spring-card | 0.0031777 | 0.0305410 | 0.0062576 |
+## Measurements and device
 
-The full corpus has 398 generated scenes. The canonical reference command was
-started, but it runs serially in this checkout: the first five scenes consumed
-71 seconds. It was stopped before completion rather than extrapolating an
-incomplete cache. GPU corpus identity was not run; GPU sources were untouched.
+No new frame-time, instruction-count, or memory comparison was completed.
+There are no accepted p50/p99 or old/new memory numbers for this checkpoint.
 
-## Pixel measurements
+The read-only probe through `~/.local/bin/pixel-adb` acquired the device lock
+and returned `Pixel 9 Pro`, battery `temperature: 277` (27.7 degrees C), and
+`mHalInteractiveModeEnabled=false`. No benchmark was launched on the device.
+The Mac ran correctness tests and oracle generation only, not performance
+measurements.
 
-Device protocol: Pixel 9 Pro, screen off, CPU 7 for one worker and CPUs 4–7 for
-four workers, 30 measured frames after five warmups. Every run was preceded by
-`dumpsys battery` and `dumpsys thermalservice`; observed battery temperature was
-28.5–37.1 °C and thermal status was 0.
+## Resume point
 
-The prior new-only measurements (before the draw experiment) were:
+After available disk capacity is restored to at least 60 GB, the next action
+is to finish the baseline release build in
+`../cherenkov-wt-71-baseline` (branch `verify/71-cpu-baseline`, commit
+`2cae0517`). Its generated scene inputs are copies of this task's regenerated
+inputs. Both worktrees retain their build caches.
 
-| Scene | 1-thread round | submit p50/p99 (s) | encode p50/p99 (s) |
-| --- | --- | ---: | ---: |
-| map | 1 | 0.05692 / 0.05771 | 0.0451 / 0.0456 |
-| map | 2 | 0.05705 / 0.05820 | 0.0452 / 0.0459 |
-| map | 3 | 0.05797 / 0.05901 | 0.0459 / 0.0470 |
-| chart | 1 | 0.03585 / 0.03633 | 0.02068 / 0.02097 |
-| chart | 2 | 0.03613 / 0.03679 | 0.02080 / 0.02109 |
-| chart | 3 | 0.03615 / 0.03677 | 0.02073 / 0.02121 |
-| text-page | 1 | 0.02026 / 0.02198 | 0.01975 / 0.02137 |
-| text-page | 2 | 0.02023 / 0.02144 | 0.01972 / 0.02084 |
-| text-page | 3 | 0.02015 / 0.02169 | 0.01965 / 0.02108 |
-| ui-list | 1 | 0.04941 / 0.05089 | 0.04806 / 0.04955 |
-| ui-list | 2 | 0.05110 / 0.05522 | 0.04977 / 0.05385 |
-| ui-list | 3 | 0.05074 / 0.05356 | 0.04939 / 0.05224 |
-| effects | 1 | 0.11045 / 0.11200 | 0.11003 / 0.11159 |
-| effects | 2 | 0.11135 / 0.11327 | 0.11094 / 0.11287 |
-| effects | 3 | 0.11111 / 0.11269 | 0.11070 / 0.11227 |
+Then render baseline and candidate CPU and Metal corpora against the completed
+`out/71/rebased/reference` cache. Compare CPU FLIP mean and maximum local error
+per scene, require improvement overall, and compare GPU metrics and PNG bytes
+for identity. After those checks, profile and complete sparse draw coverage,
+geometric clipping, and SIMD shading while preserving bounded band memory.
+Measure dev versus the resulting candidate on the locked, screen-off Pixel in
+interleaved A/B/A/B rounds, with one worker on CPU 7 and eight workers on CPUs
+0-7; report shade/frame p50/p99 and memory, stopping above 45 degrees C.
 
-Four-worker new-only runs were slower on map, chart, and effects; they are not
-claimed as scaling evidence. No old/dev executable was available, so these are
-not A/B comparisons.
-
-The attempted full draw integration was measured once on map after rebuilding:
-submit p50 was 0.1069–0.1090 s and encode p50 was 0.0659–0.0679 s across three
-rounds. The prior path was restored immediately after this regression was
-observed.
-
-## Gate lines
-
-```text
-SCENE_GENERATION: PASS — 398 corpus scenes and 9 perf scenes generated.
-CPU_UNIT_AND_INTEGRATION: PASS.
-CLIPPY: PASS — cherenkov-cpu all targets, -D warnings.
-ANDROID_RELEASE_BUILD: PASS — aarch64-linux-android with NDK linker.
-CPU_CORPUS: INCOMPLETE — representative cached-reference sample passed; full cache run stopped after 5/398 scenes.
-GPU_CORPUS_IDENTITY: NOT RUN.
-PIXEL_ABAB: NOT RUN — no baseline executable.
-CALLGRIND_IR: RESERVED FOR THE EXTERNAL LINUX GATE.
-```
-
-## Commits
-
-No commits were created. The work remains uncommitted for review because the
-measured draw path regressed and the acceptance gates are incomplete.
-
-## Plan reconciliation
-
-The plan of record's exact geometric intersection design agrees with the
-compiler implementation. Its shadow clipping assumption conflicts with the
-current oracle semantics; the current post-convolution clip behavior was kept.
-Measured Pixel data overrides the plan's expected speedup for the attempted
-full draw port.
+Local logs and generated references are under `out/71/rebased/`, ignored by
+Git. No branch was pushed and no PR was opened.

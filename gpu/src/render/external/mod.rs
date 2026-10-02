@@ -177,22 +177,20 @@ fn hlg_gamma(peak_nits: f32) -> f32 {
 
 /// Plane kind, alpha mode, flags and sampled sizes for one frame.
 fn plane_contract(frame: &ExternalFrame) -> (u32, u32, u32, wgpu::Extent3d, wgpu::Extent3d) {
+    let alpha = match frame.alpha() {
+        RgbAlpha::Opaque => 0,
+        RgbAlpha::Straight => 1,
+        RgbAlpha::Premultiplied => 2,
+    };
     match &frame.planes {
         FramePlanes::Yuv { y, uv } => {
             let (kind, shift) = match y.format() {
                 wgpu::TextureFormat::R8Uint => (KIND_NV12, 0),
                 _ => (KIND_P010, FLAG_SHIFT6),
             };
-            (kind, 0, shift, y.size(), uv.size())
+            (kind, alpha, shift, y.size(), uv.size())
         }
-        FramePlanes::Rgb { plane, alpha } => {
-            let alpha = match alpha {
-                RgbAlpha::Opaque => 0,
-                RgbAlpha::Straight => 1,
-                RgbAlpha::Premultiplied => 2,
-            };
-            (KIND_RGB, alpha, 0, plane.size(), plane.size())
-        }
+        FramePlanes::Rgb { plane, .. } => (KIND_RGB, alpha, 0, plane.size(), plane.size()),
         #[cfg(all(unix, not(target_vendor = "apple")))]
         FramePlanes::Native(frame) => {
             let size = wgpu::Extent3d {
@@ -209,20 +207,15 @@ fn plane_contract(frame: &ExternalFrame) -> (u32, u32, u32, wgpu::Extent3d, wgpu
                 vulkan::Repr::Rgb { .. } => {
                     // A `Bgra8Unorm` plane already presents RGBA-ordered
                     // samples to textureLoad — no swizzle flag.
-                    let alpha = match frame.generation.alpha {
-                        RgbAlpha::Opaque => 0,
-                        RgbAlpha::Straight => 1,
-                        RgbAlpha::Premultiplied => 2,
-                    };
                     (KIND_RGB, alpha, 0, size, size)
                 }
                 vulkan::Repr::Planes { kind } => {
                     let shift = if kind == KIND_P010 { FLAG_SHIFT6 } else { 0 };
-                    (kind, 0, shift, size, chroma)
+                    (kind, alpha, shift, size, chroma)
                 }
                 // The sampler conversion yields encoded `R'G'B'`; the
                 // shader decodes it like an opaque RGB plane.
-                vulkan::Repr::ExternalFormat { .. } => (KIND_RGB, 0, 0, size, size),
+                vulkan::Repr::ExternalFormat { .. } => (KIND_RGB, alpha, 0, size, size),
             }
         }
     }
@@ -332,15 +325,15 @@ pub struct MaskBinding<'a> {
 /// binds, which is the lease the producer's planes retire on.
 pub struct Slot {
     /// The frame as installed; its `wait` is consumed by the Apple submit
-    /// loop, and holding it is the lease that keeps the planes resident.
-    #[cfg_attr(
-        not(target_vendor = "apple"),
-        expect(
-            dead_code,
-            reason = "frame.wait is read only by the Apple Metal submit loop"
-        )
-    )]
+    /// loop or a plane, and holding it is the lease that keeps the planes
+    /// resident.
     pub frame: ExternalFrame,
+    /// The surface's install count when this frame was installed: a plane
+    /// showing the layer hands the system a new buffer when it changes.
+    pub generation: u64,
+    /// Whether the surface's system compositor can show the frame itself,
+    /// which makes the layer a promotion candidate.
+    pub on_plane: bool,
     /// The emitted quad's size in layer-local space: the luma or RGB plane
     /// dimensions.
     pub size: (u32, u32),
@@ -371,7 +364,13 @@ impl Slot {
     pub const GPU_BYTES: u64 = std::mem::size_of::<Params>() as u64;
 
     /// Creates the views and the params buffer for a frame.
-    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, frame: ExternalFrame) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        frame: ExternalFrame,
+        generation: u64,
+        on_plane: bool,
+    ) -> Self {
         #[cfg(all(unix, not(target_vendor = "apple")))]
         let mut native = None;
         let (y, uv, rgb, size) = match &frame.planes {
@@ -416,6 +415,8 @@ impl Slot {
         queue.write_buffer(&buffer, 0, bytemuck::bytes_of(&params(&frame)));
         Self {
             frame,
+            generation,
+            on_plane,
             size,
             #[cfg(all(unix, not(target_vendor = "apple")))]
             native,

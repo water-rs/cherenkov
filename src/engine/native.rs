@@ -6,6 +6,7 @@ use super::{Waker, thread};
 use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender};
 
 use crate::ShaderId;
@@ -64,7 +65,7 @@ pub struct Engine<B: Backend> {
     post: Rc<dyn Fn(Message<B>)>,
     /// The `Message::ReplaceImage` sender every image handle shares.
     replace_image: ReplaceImage,
-    waker: Rc<Waker>,
+    waker: Arc<Waker>,
     // `!Send`: the engine lives on the UI thread.
     _not_send: PhantomData<Rc<()>>,
 }
@@ -95,10 +96,23 @@ impl<B: Backend> Engine<B> {
             .recv()
             .map_err(|_| EngineError::Thread("render thread died during init".into()))??;
         let post_tx = tx.clone();
-        let waker = Rc::new(Waker::new());
+        let waker = Arc::new(Waker::new());
+        {
+            let waker = crate::engine::CompletionWaker::new(&waker);
+            // A promoted plane's attach lands on the main queue; the
+            // block wakes the host through this handle for the frame
+            // that promotes it. Backends with no main-queue completion
+            // ignore it.
+            tx.send(Message::Resource(Box::new(move |r: &mut B::Renderer| {
+                r.set_plane_waker(waker);
+            })))
+            .map_err(|_| {
+                EngineError::Thread("render thread died installing the plane waker".into())
+            })?;
+        }
         let replace_image = {
             let tx = tx.clone();
-            let waker = Rc::clone(&waker);
+            let waker = Arc::clone(&waker);
             Rc::new(move |id, image| {
                 tx.send(Message::ReplaceImage { id, image })
                     .map_err(|_| ResourceError::Lost)?;
@@ -198,9 +212,16 @@ impl<B: Backend> Engine<B> {
     /// bound signal firing) are queued, not sent. When the display link is
     /// paused after `Next::Idle`, the host must learn that a frame is
     /// needed: the engine calls `f` at most once between two
-    /// [`Engine::render`]s, the first time something is queued.
-    pub fn set_waker(&self, f: impl Fn() + 'static) {
-        *self.waker.callback.borrow_mut() = Some(Box::new(f));
+    /// [`Engine::render`]s, the first time something is queued. `f` may
+    /// run on the engine's thread or on the main thread — a completion
+    /// queued there by the render thread fires it — so it must be
+    /// [`Send`] and [`Sync`].
+    ///
+    /// # Panics
+    /// When the callback slot is poisoned by a panic inside a previous
+    /// `f` running under the lock.
+    pub fn set_waker(&self, f: impl Fn() + Send + Sync + 'static) {
+        *self.waker.callback.lock().expect("waker poisoned") = Some(Arc::new(f));
     }
 
     fn alloc(cell: &Cell<u64>) -> u64 {
@@ -282,7 +303,7 @@ impl<B: Backend> Engine<B> {
             })
             .map_err(|_| SurfaceError::Lost)?;
         let info = rx.recv().map_err(|_| SurfaceError::Lost)??;
-        let surface = Surface::new(id, info, self.tx.clone(), Rc::clone(&self.waker));
+        let surface = Surface::new(id, info, self.tx.clone(), Arc::clone(&self.waker));
         self.surfaces
             .borrow_mut()
             .push(Rc::downgrade(&surface.shared));

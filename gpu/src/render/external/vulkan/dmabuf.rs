@@ -618,7 +618,11 @@ fn finish(
                 producer_family: desc.producer_family,
                 aspects,
                 lease,
+                plane_fences: Vec::new(),
             })),
+            #[cfg(target_os = "android")]
+            plane: None,
+            plane_fences: std::sync::Mutex::new(Vec::new()),
         }),
     })
 }

@@ -7,6 +7,7 @@ use crate::local::Sender;
 use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::ShaderId;
 use crate::backend::{Backend, Renderer};
@@ -53,7 +54,7 @@ pub struct Engine<B: Backend> {
     post: Rc<dyn Fn(Message<B>)>,
     /// The `Message::ReplaceImage` sender every image handle shares.
     replace_image: ReplaceImage,
-    waker: Rc<Waker>,
+    waker: Arc<Waker>,
     // `!Send`: the engine lives on the UI thread.
     _not_send: PhantomData<Rc<()>>,
 }
@@ -99,13 +100,19 @@ impl<B: Backend> Engine<B> {
     /// # Errors
     /// [`EngineError`] when the backend fails to initialize or the render
     /// thread cannot start.
+    #[expect(
+        clippy::arc_with_non_send_sync,
+        reason = "everything here is single-threaded; `Arc` matches the \
+            shared surface/record field types, and the callback never \
+            leaves this thread"
+    )]
     pub async fn new(config: B::Config) -> Result<Self, EngineError> {
         let (tx, info) = thread::local::<B>(config).await?;
         let post_tx = tx.clone();
-        let waker = Rc::new(Waker::new());
+        let waker = Arc::new(Waker::new());
         let replace_image = {
             let tx = tx.clone();
-            let waker = Rc::clone(&waker);
+            let waker = Arc::clone(&waker);
             Rc::new(move |id, image| {
                 tx.send(Message::ReplaceImage { id, image })
                     .map_err(|_| ResourceError::Lost)?;
@@ -203,8 +210,11 @@ impl<B: Backend> Engine<B> {
     /// paused after `Next::Idle`, the host must learn that a frame is
     /// needed: the engine calls `f` at most once between two
     /// [`Engine::render`]s, the first time something is queued.
+    ///
+    /// # Panics
+    /// Panics if the engine's callback slot is poisoned by a prior panic.
     pub fn set_waker(&self, f: impl Fn() + 'static) {
-        *self.waker.callback.borrow_mut() = Some(Box::new(f));
+        *self.waker.callback.lock().expect("waker poisoned") = Some(Arc::new(f));
     }
 
     fn alloc(cell: &Cell<u64>) -> u64 {
@@ -302,7 +312,7 @@ impl<B: Backend> Engine<B> {
         match rx.recv().await {
             Ok(Ok(info)) => {
                 registration.disarm();
-                let surface = Surface::new(id, info, self.tx.clone(), Rc::clone(&self.waker));
+                let surface = Surface::new(id, info, self.tx.clone(), Arc::clone(&self.waker));
                 self.surfaces
                     .borrow_mut()
                     .push(Rc::downgrade(&surface.shared));

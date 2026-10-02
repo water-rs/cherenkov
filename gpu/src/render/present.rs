@@ -463,6 +463,7 @@ impl WindowSurface {
     /// [`SurfaceError::UnsupportedTarget`] when wgpu cannot create or the
     /// adapter cannot present to the window — including a required colour
     /// space the surface does not advertise.
+    #[cfg(not(target_vendor = "apple"))]
     #[expect(
         clippy::too_many_arguments,
         reason = "the swapchain's full negotiation input: device triple, window,                   size, transparency, required space and the probe channel"
@@ -482,6 +483,54 @@ impl WindowSurface {
                 .create_surface(wgpu::SurfaceTarget::Window(handle))
                 .map_err(|e| SurfaceError::UnsupportedTarget(format!("window surface: {e}")))?,
         );
+        Self::configure(surface, adapter, device, size, transparent, required, probe)
+    }
+
+    /// Creates and configures the swapchain of a metal layer the engine
+    /// owns (a plane surface's part).
+    ///
+    /// # Errors
+    /// [`SurfaceError::UnsupportedTarget`] when wgpu cannot create or the
+    /// adapter cannot present to the layer — including a required colour
+    /// space the surface does not advertise.
+    #[cfg(target_vendor = "apple")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the swapchain's full negotiation input: device triple, layer,                   size, transparency, required space and the probe channel"
+    )]
+    pub fn from_layer(
+        instance: &wgpu::Instance,
+        adapter: &wgpu::Adapter,
+        device: &wgpu::Device,
+        layer: &objc2_quartz_core::CAMetalLayer,
+        size: (u32, u32),
+        transparent: bool,
+        required: Option<wgpu::SurfaceColorSpace>,
+        probe: Option<std::sync::mpsc::Sender<DisplayProbe>>,
+    ) -> Result<Self, SurfaceError> {
+        // SAFETY: the layer is a live `CAMetalLayer`; the surface retains it.
+        let surface = SharedSurface::new(
+            unsafe {
+                instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::CoreAnimationLayer(
+                    std::ptr::from_ref(layer).cast_mut().cast(),
+                ))
+            }
+            .map_err(|e| SurfaceError::UnsupportedTarget(format!("metal layer surface: {e}")))?,
+        );
+        Self::configure(surface, adapter, device, size, transparent, required, probe)
+    }
+
+    /// Configures `surface` at `size`: output selection, the swapchain and
+    /// the host's display probe.
+    fn configure(
+        surface: SharedSurface,
+        adapter: &wgpu::Adapter,
+        device: &wgpu::Device,
+        size: (u32, u32),
+        transparent: bool,
+        required: Option<wgpu::SurfaceColorSpace>,
+        probe: Option<std::sync::mpsc::Sender<DisplayProbe>>,
+    ) -> Result<Self, SurfaceError> {
         let backend = adapter.get_info().backend;
         let caps = surface.get_capabilities(adapter);
         let mut selection = select_output(&caps, backend, transparent, required)?;
@@ -632,13 +681,7 @@ impl Presenter {
             min_filter: wgpu::FilterMode::Nearest,
             ..wgpu::SamplerDescriptor::default()
         });
-        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("present uniform"),
-            size: 16,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        crate::diag::create(device, "present uniform", 16);
+        let uniform = Self::uniform(device);
         Self {
             module,
             layout,
@@ -697,13 +740,40 @@ impl Presenter {
         source: &wgpu::TextureView,
         headroom: f32,
     ) -> Result<bool, RenderError> {
-        let Some(frame) = window.acquire(device)? else {
+        let Some(frame) = self.prepare(device, queue, window, source, headroom)? else {
             return Ok(false);
+        };
+        queue.present(frame);
+        Ok(true)
+    }
+
+    /// Encodes into an owned drawable, which the compositor presents in
+    /// the same main-thread transaction as its plane hierarchy.
+    ///
+    /// # Errors
+    /// Returns a render error when the window cannot acquire or configure
+    /// its drawable.
+    pub fn prepare(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        window: &WindowSurface,
+        source: &wgpu::TextureView,
+        headroom: f32,
+    ) -> Result<Option<wgpu::SurfaceTexture>, RenderError> {
+        let Some(frame) = window.acquire(device)? else {
+            return Ok(None);
         };
         let alpha = match window.config.alpha_mode {
             wgpu::CompositeAlphaMode::PreMultiplied | wgpu::CompositeAlphaMode::Inherit => {
                 OutputAlpha::Premultiplied
             }
+            // Core Animation composites a non-opaque layer's contents as
+            // premultiplied; wgpu's Metal backend offers exactly that mode,
+            // under the name `PostMultiplied`.
+            #[cfg(target_vendor = "apple")]
+            wgpu::CompositeAlphaMode::PostMultiplied => OutputAlpha::Premultiplied,
+            #[cfg(not(target_vendor = "apple"))]
             wgpu::CompositeAlphaMode::PostMultiplied => OutputAlpha::Straight,
             wgpu::CompositeAlphaMode::Auto | wgpu::CompositeAlphaMode::Opaque => {
                 OutputAlpha::Opaque
@@ -720,8 +790,7 @@ impl Presenter {
                 headroom: window.selection.effective_headroom(headroom),
             },
         );
-        queue.present(frame);
-        Ok(true)
+        Ok(Some(frame))
     }
 
     /// Composites an engine texture into a native texture on the same device.
@@ -757,16 +826,41 @@ impl Presenter {
         output: TextureOutput<'_>,
         timestamps: Option<wgpu::RenderPassTimestampWrites<'_>>,
     ) {
-        let TextureOutput {
-            texture: target,
-            color,
-            alpha,
-            headroom,
-        } = output;
-        let format = target.format();
+        queue.write_buffer(&self.uniform, 0, &Self::uniform_bytes(&output));
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("present"),
+        });
+        let uniform = self.uniform.clone();
+        self.encode(device, &mut encoder, source, output, &uniform, timestamps);
+        queue.submit([encoder.finish()]);
+        crate::diag::submit(device, queue, "present");
+    }
+
+    /// A 16-byte uniform buffer for [`Self::encode`], written with
+    /// [`Self::uniform_bytes`] before the submission that reads it. Several
+    /// blits in one submission each need their own.
+    #[must_use]
+    pub(crate) fn uniform(device: &wgpu::Device) -> wgpu::Buffer {
+        crate::diag::create(device, "present uniform", 16);
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("present uniform"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+    }
+
+    /// The uniform contents a blit into `output` reads: `{ encode, alpha,
+    /// headroom, pad }`, see `Present` in `present.wgsl`.
+    ///
+    /// # Panics
+    /// If linear Display P3 output is requested for an sRGB texture format.
+    #[must_use]
+    pub(crate) fn uniform_bytes(output: &TextureOutput<'_>) -> [u8; 16] {
+        let format = output.texture.format();
         assert!(
             !matches!(
-                color,
+                output.color,
                 OutputColor::LinearDisplayP3
                     | OutputColor::ExtendedSrgbLinear
                     | OutputColor::ExtendedSrgb
@@ -774,11 +868,10 @@ impl Presenter {
             ) || !format.is_srgb(),
             "extended output requires a non-sRGB texture format"
         );
-        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
         // The `present.wgsl` `encode` codes: 0/1 sRGB SDR (hw/sw),
         // 2 linear P3, 3/4 Display P3 SDR (sw/hw), 5 scRGB linear,
         // 6 extended sRGB, 7 extended P3, 8 PQ, 9 HLG.
-        let encode: u32 = match color {
+        let encode: u32 = match output.color {
             OutputColor::Srgb => u32::from(!format.is_srgb()),
             OutputColor::LinearDisplayP3 => 2,
             OutputColor::DisplayP3 => 3 + u32::from(format.is_srgb()),
@@ -788,14 +881,14 @@ impl Presenter {
             OutputColor::Bt2100Pq => 8,
             OutputColor::Bt2100Hlg => 9,
         };
-        let alpha: u32 = match alpha {
+        let alpha: u32 = match output.alpha {
             OutputAlpha::Opaque => 0,
             OutputAlpha::Premultiplied => 1,
             OutputAlpha::Straight => 2,
         };
         // The effective headroom: the display's, clamped to what this
         // destination's transfer encodes (#98).
-        let ceiling = match color {
+        let ceiling = match output.color {
             OutputColor::Srgb | OutputColor::DisplayP3 => 1.0,
             OutputColor::Bt2100Pq => PQ_HEADROOM,
             OutputColor::Bt2100Hlg => HLG_HEADROOM,
@@ -804,18 +897,32 @@ impl Presenter {
             | OutputColor::ExtendedSrgb
             | OutputColor::ExtendedDisplayP3 => f32::MAX,
         };
-        let headroom = headroom.max(0.0).min(ceiling);
-        queue.write_buffer(
-            &self.uniform,
-            0,
-            &[
-                encode.to_ne_bytes(),
-                alpha.to_ne_bytes(),
-                headroom.to_bits().to_ne_bytes(),
-                [0; 4],
-            ]
-            .concat(),
-        );
+        let headroom = output.headroom.max(0.0).min(ceiling);
+        let mut bytes = [0; 16];
+        bytes[0..4].copy_from_slice(&encode.to_ne_bytes());
+        bytes[4..8].copy_from_slice(&alpha.to_ne_bytes());
+        bytes[8..12].copy_from_slice(&headroom.to_bits().to_ne_bytes());
+        bytes
+    }
+
+    /// Records the blit of `source` into `output.texture` into `encoder`,
+    /// reading `uniform`, whose contents the caller wrote with
+    /// [`Self::uniform_bytes`] for this output.
+    ///
+    /// # Panics
+    /// If the textures violate wgpu's attachment and sampling requirements.
+    pub(crate) fn encode(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        source: &wgpu::TextureView,
+        output: TextureOutput<'_>,
+        uniform: &wgpu::Buffer,
+        timestamps: Option<wgpu::RenderPassTimestampWrites<'_>>,
+    ) {
+        let target = output.texture;
+        let format = target.format();
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
         let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("present"),
             layout: &self.layout,
@@ -830,36 +937,29 @@ impl Presenter {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: self.uniform.as_entire_binding(),
+                    resource: uniform.as_entire_binding(),
                 },
             ],
         });
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("present"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: timestamps,
+            occlusion_query_set: None,
+            multiview_mask: None,
         });
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("present"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: timestamps,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(self.pipeline(device, format));
-            pass.set_bind_group(0, &bind, &[]);
-            pass.draw(0..3, 0..1);
-        }
-        queue.submit([encoder.finish()]);
-        crate::diag::submit(device, queue, "present");
+        pass.set_pipeline(self.pipeline(device, format));
+        pass.set_bind_group(0, &bind, &[]);
+        pass.draw(0..3, 0..1);
     }
 }
 

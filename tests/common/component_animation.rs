@@ -8,8 +8,8 @@ use cherenkov::{
     WorkingColor, snap_animating,
 };
 use nami::SignalExt as _;
-use std::cell::Cell;
-use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 split_fn! {
@@ -100,12 +100,14 @@ pub fn component_animation<B: Backend>(config: B::Config) {
             }
         }
     }
-    let wakes = Rc::new(Cell::new(0));
+    let wakes = Arc::new(AtomicUsize::new(0));
     let count = wakes.clone();
-    engine.set_waker(move || count.set(count.get() + 1));
+    engine.set_waker(move || {
+        count.fetch_add(1, Ordering::Relaxed);
+    });
     angle.set(0.);
     assert_eq!(
-        wakes.get(),
+        wakes.load(Ordering::Relaxed),
         1,
         "a signal wakes an idle engine without a transaction"
     );
@@ -119,16 +121,16 @@ split_fn! {
 fn signal_drops_with_the_layer<B: Backend>(
     engine: &Engine<B>,
     angle: &nami::Binding<f64>,
-    wakes: &Cell<usize>,
+    wakes: &AtomicUsize,
     start: Instant,
 ) {
     wait!(engine
         .render(FrameTime::at(start + Duration::from_secs(2))))
         .expect("remove bound layer");
-    let before = wakes.get();
+    let before = wakes.load(Ordering::Relaxed);
     angle.set(1.);
     assert_eq!(
-        wakes.get(),
+        wakes.load(Ordering::Relaxed),
         before,
         "dropping layer disconnects component bindings"
     );

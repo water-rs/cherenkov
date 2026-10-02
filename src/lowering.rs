@@ -304,6 +304,35 @@ fn walk<C: Compiler>(
     Ok(())
 }
 
+/// Whether recorded content can produce partial coverage. Even an opaque
+/// paint has fractional alpha at antialiased geometry and clip edges; paint
+/// alpha alone never proves an overlaid engine part safe for promotion.
+pub(crate) fn translucent_within(list: &DisplayList, range: Range<usize>) -> bool {
+    for command in &list.commands()[range] {
+        match command {
+            Command::Fill { .. }
+            | Command::Stroke { .. }
+            | Command::Glyphs { .. }
+            | Command::Image { .. }
+            | Command::Shadow { .. } => {
+                return true;
+            }
+            Command::BeginGroup { group, .. } => {
+                if group.opacity < 1.0 || group.filter.is_some() {
+                    return true;
+                }
+            }
+            Command::Picture { picture, .. }
+                if translucent_within(picture.display_list(), 0..picture.display_list().len()) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Whether any command in `range` opens a group with a non-`Normal` blend.
 /// Nested pictures count: their contents are walked the same way. Glyphs
 /// need no scan — a colour glyph's expansion is itself wrapped in the

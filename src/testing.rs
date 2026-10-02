@@ -2,6 +2,9 @@
 //! call as an [`Event`] on a channel, so tests and the cross-backend
 //! behaviour suite can assert what the front end committed.
 
+/// The committed layer op a [`SurfaceTree`](crate::SurfaceTree) applies, for
+/// tests that build a sampled tree without an engine.
+pub use crate::message::LayerOp;
 use std::collections::HashSet;
 use std::sync::mpsc::Sender;
 
@@ -47,6 +50,8 @@ pub enum Event {
     RemoveShader(ShaderId),
     /// `set_content` ran.
     SetContent(SurfaceId, LayerId),
+    /// `set_external_frame` ran.
+    ExternalFrame(SurfaceId, LayerId),
     /// `remove_layer` ran.
     RemoveLayer(SurfaceId, LayerId),
     /// One rendered surface, in `frame.surfaces` order.
@@ -60,6 +65,10 @@ pub struct FrameRecord {
     pub surface: SurfaceId,
     /// The frame's `changed` flag for this surface.
     pub changed: bool,
+    /// The frame's `plane_frames` for this surface — the layers that got
+    /// a new external frame when those installs were the only change
+    /// (#90), by layer id.
+    pub plane_frames: Option<Vec<LayerId>>,
     /// The frame's `present_pending` flag for this surface: a display
     /// change re-presents without touching content (#98).
     pub present_pending: bool,
@@ -355,6 +364,11 @@ impl Renderer for NullRenderer {
             let _ = self.events.send(Event::Frame(FrameRecord {
                 surface: surface.id,
                 changed: surface.changed,
+                plane_frames: surface.plane_frames.map(|frames| {
+                    let mut frames: Vec<_> = frames.iter().copied().collect();
+                    frames.sort_by_key(|layer| layer.raw());
+                    frames
+                }),
                 present_pending: surface.present_pending,
                 display_moved: surface.display_moved,
                 display: surface.display,
@@ -386,6 +400,11 @@ impl Renderer for NullRenderer {
             let _ = self.events.send(Event::Frame(FrameRecord {
                 surface: surface.id,
                 changed: surface.changed,
+                plane_frames: surface.plane_frames.map(|frames| {
+                    let mut frames: Vec<_> = frames.iter().copied().collect();
+                    frames.sort_by_key(|layer| layer.raw());
+                    frames
+                }),
                 present_pending: surface.present_pending,
                 display_moved: surface.display_moved,
                 display: surface.display,
@@ -472,6 +491,21 @@ impl ShaderPaint for Null {
 
 impl Uploads<Rgba8> for Null {}
 impl Uploads<Rgba16F> for Null {}
+
+/// `Null` retains no frame: the install is reported and the `()` frame
+/// drops. `external_frame`/`content` still exercise the render loop's
+/// plane-eligible change tracking (#90).
+impl crate::ExternalFrames for Null {
+    type Frame = ();
+
+    fn frame_opaque(_frame: &()) -> bool {
+        false
+    }
+
+    fn set_external_frame(r: &mut NullRenderer, surface: SurfaceId, layer: LayerId, _frame: ()) {
+        let _ = r.events.send(Event::ExternalFrame(surface, layer));
+    }
+}
 
 /// Evaluates the expression directly on native targets and `.await`s it
 /// on wasm32 — `Engine` calls are synchronous on one and futures on the
@@ -1258,7 +1292,10 @@ mod tests {
     use super::*;
     use crate::image::ImageData;
     use crate::resource::FontSource;
-    use crate::{Decay, Engine, FrameTime, Next, OffscreenFormat, ShaderSource, Spring};
+    use crate::{
+        Decay, Engine, FrameTime, Image, Layer, Next, OffscreenFormat, ShaderSource, Spring,
+        Surface,
+    };
 
     fn engine() -> (Engine<Null>, std::sync::mpsc::Receiver<Event>) {
         engine_rejecting(HashSet::new())
@@ -1374,16 +1411,23 @@ mod tests {
         );
     }
 
-    /// `Image::replace` reaches the renderer with the new dimensions, marks
-    /// changed only the surface whose content draws the image and wakes the
-    /// host once between two renders; replacing an image nothing draws
-    /// marks nothing. After the last drop the image is removed once the
-    /// content stops drawing it.
-    #[test]
-    fn image_replacement_redraws_and_still_releases() {
-        use std::cell::Cell;
-        use std::rc::Rc;
+    /// Two surfaces — `drawing` draws `image`, `other` a fill — plus an
+    /// `unused` image nothing draws, already settled: the last two rendered
+    /// frames changed nothing and the event probe is drained.
+    struct ImageScene {
+        engine: Engine<Null>,
+        rx: std::sync::mpsc::Receiver<Event>,
+        drawing: Surface<Null>,
+        other: Surface<Null>,
+        image: Image<Rgba8>,
+        unused: Image<Rgba8>,
+        image_layer: Layer,
+        /// Held only for its lifetime: dropping the layer queues a remove
+        /// on `other` and fires the waker.
+        fill_layer: Layer,
+    }
 
+    fn image_replacement_scene() -> ImageScene {
         use crate::{Draw as _, Sampling, WorkingColor};
 
         let (engine, rx) = engine();
@@ -1425,23 +1469,63 @@ mod tests {
             settled.iter().rev().take(2).all(|record| !record.changed),
             "nothing changed since the first render: {settled:?}"
         );
+        ImageScene {
+            engine,
+            rx,
+            drawing,
+            other,
+            image,
+            unused,
+            image_layer,
+            fill_layer,
+        }
+    }
 
-        let wakes = Rc::new(Cell::new(0u32));
+    /// `Image::replace` reaches the renderer with the new dimensions, marks
+    /// changed only the surface whose content draws the image and wakes the
+    /// host once between two renders; replacing an image nothing draws
+    /// marks nothing. After the last drop the image is removed once the
+    /// content stops drawing it.
+    #[test]
+    fn image_replacement_redraws_and_still_releases() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        use crate::{Draw as _, WorkingColor};
+
+        let ImageScene {
+            engine,
+            rx,
+            drawing,
+            other,
+            image,
+            unused,
+            image_layer,
+            fill_layer: _fill_layer,
+        } = image_replacement_scene();
+
+        let wakes = Arc::new(AtomicU32::new(0));
         engine.set_waker({
-            let wakes = Rc::clone(&wakes);
-            move || wakes.set(wakes.get() + 1)
+            let wakes = Arc::clone(&wakes);
+            move || {
+                wakes.fetch_add(1, Ordering::Relaxed);
+            }
         });
         image
             .replace(ImageData::<Rgba8>::new(2, 3, vec![0u8; 24]).expect("image data"))
             .expect("replace");
-        assert_eq!(wakes.get(), 1, "a replacement wakes the host");
+        assert_eq!(
+            wakes.load(Ordering::Relaxed),
+            1,
+            "a replacement wakes the host"
+        );
         unused
             .replace(ImageData::<Rgba8>::new(2, 2, vec![0u8; 16]).expect("image data"))
             .expect("replace");
         assert_eq!(
-            wakes.get(),
+            wakes.load(Ordering::Relaxed),
             1,
-            "the host is woken at most once between two renders"
+            "at most one wake before a render"
         );
         engine.render(FrameTime::now()).expect("render");
         let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
@@ -1484,6 +1568,68 @@ mod tests {
         );
     }
 
+    /// A commit that only installs external frames reports the installed
+    /// layers in the frame's `plane_frames`; a commit that changes anything
+    /// else — a layer op, a content op — reports `None` (#90).
+    #[test]
+    fn external_frame_only_commits_fill_plane_frames() {
+        let (engine, rx) = engine();
+        let surface = engine
+            .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))
+            .expect("surface");
+        let video = surface.layer();
+        let above = surface.layer();
+        // Creating and pushing the layers is an ordinary change, so the
+        // frame that also installs the first frame is not plane-only.
+        surface.update(|tx| {
+            tx[surface.root()].push(&video);
+            tx[surface.root()].push(&above);
+            tx[&video].content(engine.external_frame(()));
+        });
+        engine.render(FrameTime::now()).expect("render");
+        let record = frames(&rx).pop().expect("a frame record");
+        assert!(record.changed);
+        assert_eq!(
+            record.plane_frames, None,
+            "a commit with layer ops is not plane-only"
+        );
+
+        // A new frame on the layer alone is the frame's only change.
+        surface.update(|tx| {
+            tx[&video].content(engine.external_frame(()));
+        });
+        engine.render(FrameTime::now()).expect("render");
+        let record = frames(&rx).pop().expect("a frame record");
+        assert!(record.changed);
+        assert_eq!(record.plane_frames, Some(vec![video.id()]));
+
+        // Two layers' new frames commute to one set.
+        surface.update(|tx| {
+            tx[&video].content(engine.external_frame(()));
+            tx[&above].content(engine.external_frame(()));
+        });
+        engine.render(FrameTime::now()).expect("render");
+        let record = frames(&rx).pop().expect("a frame record");
+        assert!(record.changed);
+        assert_eq!(record.plane_frames, Some(vec![video.id(), above.id()]));
+
+        // A frame installed alongside a layer op is an ordinary change.
+        surface.update(|tx| {
+            tx[&video].content(engine.external_frame(()));
+            tx[&above].opacity(0.5f32);
+        });
+        engine.render(FrameTime::now()).expect("render");
+        let record = frames(&rx).pop().expect("a frame record");
+        assert!(record.changed);
+        assert_eq!(record.plane_frames, None);
+
+        // An untouched surface records neither.
+        engine.render(FrameTime::now()).expect("render");
+        let record = frames(&rx).pop().expect("a frame record");
+        assert!(!record.changed);
+        assert_eq!(record.plane_frames, None);
+    }
+
     #[test]
     fn update_animated_fills_the_default() {
         let (engine, rx) = engine();
@@ -1523,8 +1669,8 @@ mod tests {
     #[test]
     fn live_recorded_operands_wake_the_idle_owner_and_disconnect_on_drop() {
         use crate::{Draw, WorkingColor};
-        use std::cell::Cell;
-        use std::rc::Rc;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
         let (engine, _events) = engine();
         let surface = engine
             .surface(crate::Offscreen::new(
@@ -1541,25 +1687,31 @@ mod tests {
             );
         });
         engine.render(FrameTime::now()).unwrap();
-        let count = Rc::new(Cell::new(0));
+        let count = Arc::new(AtomicU32::new(0));
         let wakes = count.clone();
-        engine.set_waker(move || wakes.set(wakes.get() + 1));
+        engine.set_waker(move || {
+            wakes.fetch_add(1, Ordering::Relaxed);
+        });
         color.set(WorkingColor::BLACK);
         color.set(WorkingColor::WHITE);
         assert_eq!(
-            count.get(),
+            count.load(Ordering::Relaxed),
             1,
             "live updates coalesce without host transactions"
         );
         engine.render(FrameTime::now()).unwrap();
         color.set(WorkingColor::BLACK);
-        assert_eq!(count.get(), 2, "render re-arms host notification");
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            2,
+            "render re-arms host notification"
+        );
         drop(layer);
         engine.render(FrameTime::now()).unwrap();
-        let before = count.get();
+        let before = count.load(Ordering::Relaxed);
         color.set(WorkingColor::WHITE);
         assert_eq!(
-            count.get(),
+            count.load(Ordering::Relaxed),
             before,
             "removed content cannot wake the engine"
         );
@@ -1917,8 +2069,8 @@ mod tests {
     #[test]
     fn retired_live_content_does_not_update_or_wake() {
         use crate::{Draw, WorkingColor};
-        use std::cell::Cell;
-        use std::rc::Rc;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
 
         let (engine, rx) = engine();
         let surface = engine
@@ -1937,9 +2089,11 @@ mod tests {
         engine.render(FrameTime::now()).unwrap();
         let _ = frames(&rx);
 
-        let count = Rc::new(Cell::new(0));
-        let wakes = Rc::clone(&count);
-        engine.set_waker(move || wakes.set(wakes.get() + 1));
+        let count = Arc::new(AtomicU32::new(0));
+        let wakes = Arc::clone(&count);
+        engine.set_waker(move || {
+            wakes.fetch_add(1, Ordering::Relaxed);
+        });
         surface.update(|tx| {
             tx[&layer].record(|r| {
                 r.fill(kurbo::Rect::new(0., 0., 8., 8.), WorkingColor::BLACK);
@@ -1948,10 +2102,10 @@ mod tests {
         engine.render(FrameTime::now()).unwrap();
         let _ = frames(&rx);
 
-        let before = count.get();
+        let before = count.load(Ordering::Relaxed);
         color.set(WorkingColor::BLACK);
         assert_eq!(
-            count.get(),
+            count.load(Ordering::Relaxed),
             before,
             "retired content cannot wake the engine"
         );

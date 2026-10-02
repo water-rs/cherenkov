@@ -6,6 +6,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::mem::{needs_drop, size_of};
 use std::rc::{Rc, Weak};
+use std::sync::Arc;
 
 use kurbo::{Affine, Rect, Stroke};
 use nami_core::Signal;
@@ -349,7 +350,7 @@ pub struct LiveState {
     /// skip per-content probes. Detached when the content retires.
     surface_animated: RefCell<Option<Rc<Cell<bool>>>>,
     guards: RefCell<Vec<Box<dyn Any>>>,
-    waker: RefCell<Weak<crate::engine::Waker>>,
+    waker: RefCell<std::sync::Weak<crate::engine::Waker>>,
 }
 
 /// A change carrying an `Animation`, queued until the next
@@ -819,7 +820,7 @@ impl Content {
         }
         live.guards.borrow_mut().clear();
         live.pending.borrow_mut().clear();
-        *live.waker.borrow_mut() = Weak::new();
+        *live.waker.borrow_mut() = std::sync::Weak::new();
         drop(picture);
         ContentSpare {
             picture: None,
@@ -848,10 +849,10 @@ impl Content {
 
     /// Connect installed live operands to the owning surface's host callback
     /// and sampling flag.
-    pub(crate) fn attach_waker(&self, waker: &Rc<crate::engine::Waker>, flag: &Rc<Cell<bool>>) {
+    pub(crate) fn attach_waker(&self, waker: &Arc<crate::engine::Waker>, flag: &Rc<Cell<bool>>) {
         // Constant recordings need no callback or weak-count traffic.
         if !self.live.guards.borrow().is_empty() {
-            *self.live.waker.borrow_mut() = Rc::downgrade(waker);
+            *self.live.waker.borrow_mut() = Arc::downgrade(waker);
             self.live.attach_animated(flag);
         }
     }

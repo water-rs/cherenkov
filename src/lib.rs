@@ -70,6 +70,7 @@ pub use crate::config::{Budget, Bytes, MemoryUsage, Pressure};
 pub use crate::display_list::{
     Command, Dirty, DisplayList, Operand, OperandKind, Picture, ScopeError, Slot, SlotUpdate,
 };
+pub use crate::engine::CompletionWaker;
 pub use crate::engine::Engine;
 pub use crate::error::{EngineError, RenderError, ResourceError, SurfaceError};
 pub use crate::frame::{
@@ -100,7 +101,8 @@ pub use crate::shape::{
 };
 pub use crate::style::{BlendMode, BlendSpace, FilterId, Group, Shadow};
 pub use crate::surface::{
-    ExternalFrameHandle, GpuContentHandle, Layer, LayerContent, LayerEdit, Surface, Transaction,
+    ExternalFrameHandle, ExternalFrameInstall, GpuContentHandle, Layer, LayerContent, LayerEdit,
+    Surface, Transaction,
 };
 pub use crate::tree::{LayerNode, SurfaceTree, snap_animating};
 pub use kurbo::Stroke;

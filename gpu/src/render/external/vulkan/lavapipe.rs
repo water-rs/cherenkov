@@ -433,7 +433,11 @@ fn nv12_generation(
             aspects: vk::ImageAspectFlags::COLOR,
             lease: vulkan::sync::Lease::None,
             fence_fd: None,
+            plane_fences: vec![],
         })),
+        #[cfg(target_os = "android")]
+        plane: None,
+        plane_fences: std::sync::Mutex::new(vec![]),
     })
 }
 
@@ -733,7 +737,11 @@ fn rgb_generation(
             aspects: vk::ImageAspectFlags::COLOR,
             lease: vulkan::sync::Lease::None,
             fence_fd: None,
+            plane_fences: vec![],
         })),
+        #[cfg(target_os = "android")]
+        plane: None,
+        plane_fences: std::sync::Mutex::new(vec![]),
     })
 }
 

@@ -65,6 +65,12 @@ pub struct LayerNode {
     /// Content updates conservatively retain this until replacement; extra
     /// pass-through isolation is output-equivalent.
     content_blends: bool,
+    /// Content updates conservatively retain this until replacement: the
+    /// recorded commands may paint a pixel of alpha below one, so the
+    /// layer's output is not known to be opaque. Installed content —
+    /// a `GpuContent` or external frame the engine does not record —
+    /// counts by the alpha contract the producer declared at install.
+    content_translucent: bool,
     parent: Option<LayerId>,
     transform_track: Option<Track<Affine>>,
     components: Option<Box<components::Components>>,
@@ -119,6 +125,7 @@ impl LayerNode {
             children: Vec::new(),
             blending_children: 0,
             content_blends: false,
+            content_translucent: false,
             parent: None,
             transform_track: None,
             components: None,
@@ -144,6 +151,14 @@ impl LayerNode {
     #[must_use]
     pub const fn blends_within(&self) -> bool {
         self.blending_children > 0 || self.content_blends
+    }
+
+    /// Whether the layer's recorded or installed content may paint a pixel
+    /// of alpha below one — `false` only while the layer has no content or
+    /// every command it draws is provably opaque.
+    #[must_use]
+    pub const fn content_translucent(&self) -> bool {
+        self.content_translucent
     }
 
     /// Whether an engine-driven track moved this layer this frame: a
@@ -424,23 +439,50 @@ impl SurfaceTree {
             .unwrap_or_else(|| panic!("layer {} is not in the tree", id.raw()))
     }
 
-    /// Records whether the layer's content contains a non-`Normal` group.
+    /// Records whether the layer's content contains a non-`Normal` group
+    /// or may paint a pixel of alpha below one.
     pub(crate) fn note_content(&mut self, id: LayerId, content: Option<&ContentOp>) {
         let node = self.node_mut(id);
         match content {
             Some(ContentOp::Replace(picture) | ContentOp::Picture(picture)) => {
-                node.content_blends = crate::lowering::blends_within(
-                    picture.display_list(),
-                    0..picture.display_list().len(),
-                );
+                let list = picture.display_list();
+                node.content_blends = crate::lowering::blends_within(list, 0..list.len());
+                node.content_translucent = crate::lowering::translucent_within(list, 0..list.len());
             }
             Some(ContentOp::Update(updates)) => {
                 node.content_blends |= updates.iter().any(|SlotUpdate { value, .. }| {
                     matches!(value, Operand::Group(group) if group.blend != BlendMode::Normal)
                 });
+                node.content_translucent |=
+                    updates.iter().any(|SlotUpdate { value, .. }| match value {
+                        Operand::Paint(_) | Operand::Shadow(_) | Operand::Run(_) => true,
+                        Operand::Group(group) => {
+                            group.opacity < 1.0
+                                || group.blend != BlendMode::Normal
+                                || group.filter.is_some()
+                        }
+                        Operand::Shape(_)
+                        | Operand::Stroke(_)
+                        | Operand::Transform(_)
+                        | Operand::Rect(_) => false,
+                    });
             }
-            None => node.content_blends = false,
+            None => {
+                node.content_blends = false;
+                node.content_translucent = false;
+            }
         }
+    }
+
+    /// Records installed render-side content (`Op::Install`,
+    /// `Op::ExternalFrame`) replacing what the layer drew: no recorded
+    /// groups remain, and the installed pixels' alpha is the producer's
+    /// to declare — `opaque` is that declaration, `false` where the
+    /// producer declares none, so the layer is not known to be opaque.
+    pub(crate) fn note_installed(&mut self, id: LayerId, opaque: bool) {
+        let node = self.node_mut(id);
+        node.content_blends = false;
+        node.content_translucent = !opaque;
     }
 
     /// Every layer in the tree. Order is unspecified.
@@ -1001,6 +1043,30 @@ mod hierarchy_tests {
 
         tree.remove(second_child);
         assert!(!tree.layer(first_parent).blends_within());
+    }
+
+    /// An installed frame's declared alpha decides `content_translucent`:
+    /// an opaque frame keeps the layer's coverage provable — a second
+    /// opaque video above a promoted one does not block it (#90) — while
+    /// a producer that declares no opacity leaves the layer translucent.
+    #[test]
+    fn note_installed_counts_the_frames_declared_opacity() {
+        let mut tree = tree();
+        tree.note_installed(LayerId::new(1), true);
+        assert!(!tree.layer(LayerId::new(1)).content_translucent());
+        tree.note_installed(LayerId::new(2), false);
+        assert!(tree.layer(LayerId::new(2)).content_translucent());
+        // Recorded content replaces the install: its own analysis takes over.
+        let picture = Picture::record(|c| {
+            c.fill(
+                Rect::new(0., 0., 8., 8.),
+                WorkingColor::new([0.5, 0.5, 0.5, 0.5]),
+            );
+        });
+        tree.note_content(LayerId::new(1), Some(&ContentOp::Picture(picture)));
+        assert!(tree.layer(LayerId::new(1)).content_translucent());
+        tree.note_content(LayerId::new(2), None);
+        assert!(!tree.layer(LayerId::new(2)).content_translucent());
     }
 
     #[test]

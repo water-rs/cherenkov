@@ -12,6 +12,7 @@ use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
 use std::ops::{Index, IndexMut};
 use std::rc::Rc;
+use std::sync::Arc;
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::mpsc::SyncSender as Sender;
 
@@ -84,7 +85,7 @@ pub struct Shared<B: Backend> {
     /// them all.
     bindings: FxHashMap<(u64, PropKind), Box<dyn Any>>,
     /// The engine wake-up, fired when an op is queued outside a frame.
-    waker: Rc<Waker>,
+    waker: Arc<Waker>,
     /// The last display properties announced to the render thread.
     display: Cell<Display>,
     /// Set by installed contents' `LiveState`s the moment an animated
@@ -109,7 +110,7 @@ impl<B: Backend> std::fmt::Debug for Shared<B> {
 }
 
 impl<B: Backend> Shared<B> {
-    fn new(id: SurfaceId, waker: Rc<Waker>) -> Self {
+    fn new(id: SurfaceId, waker: Arc<Waker>) -> Self {
         Self {
             id,
             pending: Vec::new(),
@@ -209,7 +210,7 @@ impl<B: Backend> Shared<B> {
         F: Fn(LayerId, T, Option<Animation>) -> LayerOp + 'static,
     {
         let weak = Rc::downgrade(shared);
-        let waker = Rc::clone(&shared.borrow().waker);
+        let waker = Arc::clone(&shared.borrow().waker);
         let guard = subscribe.start(crate::record::Watch::binding(move |context: Context<T>| {
             let animation = context.metadata().try_get::<Animation>();
             let target = context.into_value();
@@ -306,6 +307,11 @@ pub enum LayerContent<B: Backend> {
     /// closure learns the surface and layer it is installed on when the
     /// edit is applied in `update`.
     Install(InstallOp<B>),
+    /// An external frame's install — opaque like [`Install`](Self::Install),
+    /// but lowered to [`Op::ExternalFrame`] so the render loop can tell a
+    /// plane-eligible frame swap from any other change. The payload is
+    /// constructible only inside the crate (#90).
+    ExternalFrame(ExternalFrameInstall<B>),
     /// Nothing.
     None,
 }
@@ -352,9 +358,36 @@ pub struct ExternalFrameHandle<B: ExternalFrames> {
 impl<B: ExternalFrames> From<ExternalFrameHandle<B>> for LayerContent<B> {
     fn from(handle: ExternalFrameHandle<B>) -> Self {
         let frame = handle.frame;
-        Self::Install(Box::new(move |r, surface, layer| {
-            B::set_external_frame(r, surface, layer, frame);
-        }))
+        let opaque = B::frame_opaque(&frame);
+        Self::ExternalFrame(ExternalFrameInstall::new(
+            Box::new(move |r, surface, layer| {
+                B::set_external_frame(r, surface, layer, frame);
+            }),
+            opaque,
+        ))
+    }
+}
+
+/// An external frame's install.
+///
+/// Only [`Engine::external_frame`]'s handle produces one, so a commit
+/// records a layer in `plane_frames` only for a real frame swap — an
+/// arbitrary renderer mutation wrapped in [`LayerContent::Install`]
+/// still takes the full path (#90).
+pub struct ExternalFrameInstall<B: Backend> {
+    op: InstallOp<B>,
+    /// Whether the frame's declared alpha contract is fully opaque.
+    opaque: bool,
+}
+
+impl<B: Backend> ExternalFrameInstall<B> {
+    pub(crate) fn new(op: InstallOp<B>, opaque: bool) -> Self {
+        Self { op, opaque }
+    }
+
+    /// Runs the install on the render thread.
+    pub(crate) fn install(self, renderer: &mut B::Renderer, surface: SurfaceId, layer: LayerId) {
+        (self.op)(renderer, surface, layer);
     }
 }
 
@@ -875,7 +908,12 @@ impl<B: Backend> std::fmt::Debug for Surface<B> {
 
 impl<B: Backend> Surface<B> {
     /// Builds the UI-thread handle once `CreateSurface` succeeded.
-    pub fn new(id: SurfaceId, info: SurfaceInfo, tx: Sender<Message<B>>, waker: Rc<Waker>) -> Self {
+    pub fn new(
+        id: SurfaceId,
+        info: SurfaceInfo,
+        tx: Sender<Message<B>>,
+        waker: Arc<Waker>,
+    ) -> Self {
         let shared = Rc::new(RefCell::new(Shared::new(id, waker)));
         let owner: Rc<dyn LayerOwner> = Rc::clone(&shared) as Rc<dyn LayerOwner>;
         Self {
@@ -1082,7 +1120,7 @@ impl<B: Backend> Surface<B> {
                     EditOp::Content(LayerContent::Content(content)) => {
                         // A fresh `Content` replaces the previous one whole
                         // (its first `take_change` is a `Replace`).
-                        let waker = Rc::clone(&shared.waker);
+                        let waker = Arc::clone(&shared.waker);
                         let slot = shared.contents.entry(*id).or_default();
                         if let Some(previous) = slot.content.replace(content) {
                             slot.spare.live = previous.retire().live;
@@ -1108,9 +1146,22 @@ impl<B: Backend> Surface<B> {
                         shared.contents.remove(id);
                         let surface = self.id;
                         let layer = *id;
+                        ops.push(Op::Installed(layer));
                         ops.push(Op::Install(Box::new(move |r| {
                             install(r, surface, layer);
                         })));
+                    }
+                    EditOp::Content(LayerContent::ExternalFrame(install)) => {
+                        shared.contents.remove(id);
+                        let surface = self.id;
+                        let layer = *id;
+                        ops.push(Op::ExternalFrame {
+                            layer,
+                            opaque: install.opaque,
+                            install: Box::new(move |r| {
+                                install.install(r, surface, layer);
+                            }),
+                        });
                     }
                     EditOp::Content(LayerContent::None) => {
                         shared.contents.remove(id);

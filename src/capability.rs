@@ -99,6 +99,10 @@ pub trait GpuContent: Backend {
 pub trait ExternalFrames: Backend {
     /// The frame payload type.
     type Frame: crate::RenderTransfer + 'static;
+    /// Whether `frame`'s declared alpha contract is fully opaque — only
+    /// then does a planes-capable backend know the layer's coverage
+    /// without compositing it (#90).
+    fn frame_opaque(frame: &Self::Frame) -> bool;
     /// Attaches an external frame to a layer.
     fn set_external_frame(
         r: &mut Self::Renderer,

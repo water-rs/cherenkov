@@ -27,8 +27,8 @@ use cherenkov::{Draw, Engine, FrameTime, Layer, Next, Surface, WorkingColor};
 use cherenkov_gpu::{
     Gpu, GpuConfig,
     interop::{
-        ExternalFrame, FrameColor, OutputAlpha, OutputColor, Presenter, RgbAlpha, SharedDevice,
-        TextureOutput, TextureTarget,
+        ExternalFrame, FrameColor, HdrMetadata, OutputAlpha, OutputColor, Presenter, RgbAlpha,
+        SharedDevice, TextureOutput, TextureTarget,
         vulkan::{self, FrameSource},
         wgpu,
     },
@@ -531,6 +531,7 @@ fn ahb_rgb_import_decodes_known_pixels() {
             release: None,
             color: FrameColor::SRGB,
             alpha: RgbAlpha::Opaque,
+            hdr: HdrMetadata::default(),
         })))
         .expect("RGB AHB import");
     eprintln!(
@@ -575,6 +576,7 @@ fn ahb_yuv_external_format_decodes_neutral() {
             release: None,
             color: FrameColor::BT709_VIDEO,
             alpha: RgbAlpha::Opaque,
+            hdr: HdrMetadata::default(),
         })))
         .expect("NV12 AHB import");
     eprintln!(
@@ -633,6 +635,7 @@ fn ahb_on(
             release,
             color: FrameColor::SRGB,
             alpha: RgbAlpha::Opaque,
+            hdr: HdrMetadata::default(),
         })))
         .expect("AHB import");
     let handle = engine.external_frame(ExternalFrame::native(frame).expect("external"));
@@ -765,6 +768,7 @@ fn two_layers_replace_retire_and_release_fence() {
             release: Some(vulkan::ReleaseSync::FenceFd),
             color: FrameColor::SRGB,
             alpha: RgbAlpha::Opaque,
+            hdr: HdrMetadata::default(),
         })))
         .expect("AHB import");
     let engine = Engine::<Gpu>::new(GpuConfig {
@@ -827,6 +831,7 @@ fn native_op_survives_engine_buffer_and_atlas_regrowth() {
             release: None,
             color: FrameColor::SRGB,
             alpha: RgbAlpha::Opaque,
+            hdr: HdrMetadata::default(),
         })))
         .expect("AHB import");
     let engine = Engine::<Gpu>::new(GpuConfig {
@@ -922,6 +927,7 @@ fn next_generation_after_release() {
             release: None,
             color: FrameColor::SRGB,
             alpha: RgbAlpha::Opaque,
+            hdr: HdrMetadata::default(),
         })))
         .expect("gen1");
     let buffer2 = make_ahb_rgb(16, 16, [0x30, 0xa0, 0x30, 0xff]);
@@ -932,6 +938,7 @@ fn next_generation_after_release() {
             release: None,
             color: FrameColor::SRGB,
             alpha: RgbAlpha::Opaque,
+            hdr: HdrMetadata::default(),
         })))
         .expect("gen2");
     assert!(!std::sync::Arc::ptr_eq(
@@ -972,6 +979,7 @@ fn cancellation_and_teardown() {
             release: None,
             color: FrameColor::SRGB,
             alpha: RgbAlpha::Opaque,
+            hdr: HdrMetadata::default(),
         })))
         .expect("AHB import");
     let generation = frame.generation.clone();
@@ -1043,6 +1051,7 @@ fn report_counts_and_timings() {
             release: None,
             color: FrameColor::SRGB,
             alpha: RgbAlpha::Opaque,
+            hdr: HdrMetadata::default(),
         })))
         .expect("AHB import");
     let import_us = import_start.elapsed().as_micros();

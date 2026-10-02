@@ -2429,6 +2429,7 @@ fn plane_candidates<'a>(
             planes::Candidate {
                 size: domain.size,
                 raster: domain.raster(),
+                source: planes::Source::Recorded,
             },
         ))
     }));

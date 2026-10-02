@@ -297,6 +297,26 @@ fn the_budget_goes_to_the_first_candidates_in_paint_order() {
     assert_eq!(plan.parts(), 3);
 }
 
+#[test]
+fn video_receives_the_budget_before_earlier_recorded_layers() {
+    let tree = scene();
+    let mut recorded = Candidate::from(SIZE);
+    recorded.source = Source::Recorded;
+    let candidates: FxHashMap<_, _> = [
+        (BELOW, recorded),
+        (VIDEO, SIZE.into()),
+        (ABOVE, SIZE.into()),
+    ]
+    .into_iter()
+    .collect();
+    let plan = plan::<Test>(&tree, &candidates, &all_ready(&candidates));
+    assert_eq!(
+        plan.planes.iter().map(|p| p.layer).collect::<Vec<_>>(),
+        [VIDEO, ABOVE]
+    );
+    assert_eq!(plan.rejected, [(BELOW, Ineligible::Budget(Test::BUDGET))]);
+}
+
 /// The path carries each level's sampled properties, so the content lands
 /// where the engine would draw it.
 #[test]

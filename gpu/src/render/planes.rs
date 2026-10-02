@@ -41,6 +41,14 @@ pub struct Candidate {
     pub size: (u32, u32),
     /// Buffer texels to layer content coordinates.
     pub raster: Affine,
+    /// External frames receive the budget before recorded captures.
+    pub source: Source,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Source {
+    Frame,
+    Recorded,
 }
 
 impl From<(u32, u32)> for Candidate {
@@ -48,6 +56,7 @@ impl From<(u32, u32)> for Candidate {
         Self {
             size,
             raster: Affine::IDENTITY,
+            source: Source::Frame,
         }
     }
 }
@@ -394,42 +403,47 @@ fn verdicts<'a, C: Compositor>(
     blend_above: &'a [Option<LayerId>],
     device: &'a [VisitDevice],
 ) -> impl Iterator<Item = (usize, Result<(), Ineligible>)> + 'a {
+    let mut verdicts: Vec<_> = order
+        .iter()
+        .enumerate()
+        .filter_map(move |(i, visit)| {
+            let &size = candidates.get(&visit.id)?;
+            if !ready.contains(&visit.id) {
+                return None;
+            }
+            let verdict = judge::<C>(
+                tree,
+                order,
+                i,
+                size,
+                backdrop_above[i + 1],
+                blend_above[i + 1],
+                device,
+            );
+            Some((i, verdict))
+        })
+        .collect();
     let mut promoted = 0;
-    order.iter().enumerate().filter_map(move |(i, visit)| {
-        let &size = candidates.get(&visit.id)?;
-        if !ready.contains(&visit.id) {
-            return None;
-        }
-        let verdict = judge::<C>(
-            tree,
-            order,
-            i,
-            size,
-            backdrop_above[i + 1],
-            blend_above[i + 1],
-            device,
-        );
-        Some((
-            i,
-            match verdict {
-                Ok(()) if promoted >= C::BUDGET => Err(Ineligible::Budget(C::BUDGET)),
-                Ok(()) => {
+    for source in [Source::Frame, Source::Recorded] {
+        for (i, verdict) in &mut verdicts {
+            if candidates[&order[*i].id].source == source && verdict.is_ok() {
+                if promoted < C::BUDGET {
                     promoted += 1;
-                    Ok(())
+                } else {
+                    *verdict = Err(Ineligible::Budget(C::BUDGET));
                 }
-                Err(cause) => Err(cause),
-            },
-        ))
-    })
+            }
+        }
+    }
+    verdicts.into_iter()
 }
 
 /// Decides which of `candidates` (layer to content size) the platform
 /// reports `ready` are promoted this frame on a surface realized by
 /// compositor `C`.
 ///
-/// Offered candidates are judged in paint order and the budget goes to
-/// the first eligible ones, so the decision depends only on the tree and
-/// the offered set.
+/// Eligible external frames receive the budget before recorded captures;
+/// ties within each class use paint order. Output remains in paint order.
 #[must_use]
 pub fn plan<C: Compositor>(
     tree: &SurfaceTree,

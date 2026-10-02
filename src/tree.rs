@@ -207,6 +207,31 @@ impl LayerNode {
         self.content_translucent
     }
 
+    fn classify_rate(&self, display: Display, components_running: bool) -> Option<RefreshRange> {
+        if components_running {
+            return Some(RATE_FAST);
+        }
+        let mut rate = None;
+        for fast in [
+            self.transform_track
+                .as_ref()
+                .map(|t| t.is_fast(display.scale)),
+            self.opacity_track
+                .as_ref()
+                .map(|t| t.is_fast(display.scale)),
+            self.scroll_track.as_ref().map(|t| t.is_fast(display.scale)),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if fast {
+                return Some(RATE_FAST);
+            }
+            rate = Some(RATE_SLOW);
+        }
+        rate
+    }
+
     /// Whether an engine-driven track moved this layer this frame: a
     /// running transform, component or scroll track. False on the frame
     /// a track settles.
@@ -804,7 +829,6 @@ impl SurfaceTree {
         let mut slow = false;
         for node in self.nodes.values_mut() {
             let mut node_fast = false;
-            let mut node_slow = false;
             // Opacity is outer and scroll inner: any running track steps.
             let mut outer_changed = node.opacity_track.is_some();
             let inner_changed = node.scroll_track.is_some();
@@ -881,34 +905,9 @@ impl SurfaceTree {
                 }
             }
             node.restamp(&mut self.clock, outer_changed, inner_changed);
-            // Rate classification of the tracks that remain.
-            for running_track in [
-                node.transform_track
-                    .as_ref()
-                    .map(|t| t.is_fast(display.scale)),
-                node.opacity_track
-                    .as_ref()
-                    .map(|t| t.is_fast(display.scale)),
-                node.scroll_track.as_ref().map(|t| t.is_fast(display.scale)),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                if running_track {
-                    node_fast = true;
-                } else {
-                    node_slow = true;
-                }
-            }
-            node.animation_rate = if node_fast {
-                Some(RATE_FAST)
-            } else if node_slow {
-                Some(RATE_SLOW)
-            } else {
-                None
-            };
-            fast |= node_fast;
-            slow |= node_slow;
+            node.animation_rate = node.classify_rate(display, node_fast);
+            fast |= node.animation_rate == Some(RATE_FAST);
+            slow |= node.animation_rate == Some(RATE_SLOW);
         }
         let (projective_step, projective_running) = self.sample_projective(time);
         stepped |= projective_step;

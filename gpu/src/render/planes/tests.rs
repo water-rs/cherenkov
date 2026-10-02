@@ -4,7 +4,9 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use cherenkov::testing::LayerOp;
 use cherenkov::{BlendMode, FilterId, LayerId, Prop, ShapeData, SurfaceTree};
 
-use super::{Compositor, Ineligible, Level, Plan, PlanScratch, frames_only, plan};
+use super::{
+    Candidate, Compositor, Ineligible, Level, Plan, PlanScratch, Source, frames_only, plan,
+};
 use crate::render::lower::axis_aligned;
 
 /// A compositor that carries axis-aligned transforms and rect or

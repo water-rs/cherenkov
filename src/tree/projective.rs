@@ -20,10 +20,6 @@ pub(super) struct State {
 }
 
 impl State {
-    pub(super) const fn animating(&self) -> bool {
-        self.tilt_track.is_some() || self.depth_track.is_some()
-    }
-
     pub(super) const fn new() -> Self {
         Self {
             base: Projective::IDENTITY,

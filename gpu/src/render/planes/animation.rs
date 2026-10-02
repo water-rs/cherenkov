@@ -158,7 +158,10 @@ pub fn safe_path(
     layer: LayerId,
     planes: impl Iterator<Item = LayerId>,
 ) -> bool {
-    let fades = tree.layer(layer).animations().is_some_and(|tracks| tracks.opacity.is_some());
+    let fades = tree
+        .layer(layer)
+        .animations()
+        .is_some_and(|tracks| tracks.opacity.is_some());
     if (super::translucent(tree, layer) || fades)
         && planes.take_while(|&id| id != layer).next().is_some()
     {
@@ -239,13 +242,19 @@ mod tests {
         let moving = LayerId::new(2);
         for layer in [below, moving] {
             tree.apply(LayerOp::Create(layer));
-            tree.apply(LayerOp::Push { parent: tree.root(), child: layer });
+            tree.apply(LayerOp::Push {
+                parent: tree.root(),
+                child: layer,
+            });
         }
         assert!(safe_path(&tree, moving, [below, moving].into_iter()));
-        tree.apply(LayerOp::Opacity(moving, Prop {
-            target: 0.5,
-            animation: Some(Curve::linear(Duration::from_secs(1)).into()),
-        }));
+        tree.apply(LayerOp::Opacity(
+            moving,
+            Prop {
+                target: 0.5,
+                animation: Some(Curve::linear(Duration::from_secs(1)).into()),
+            },
+        ));
         tree.sample(Instant::now(), Display::default());
         assert_eq!(tree.layer(moving).opacity, 1.0);
         assert!(!safe_path(&tree, moving, [below, moving].into_iter()));

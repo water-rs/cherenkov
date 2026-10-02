@@ -12,7 +12,7 @@ fallback):
 
 | Backend | Loaded as | Artifact |
 |---|---|---|
-| Vulkan | SPIR-V passthrough | `<name>.spv`: naga emission as-is. A `spirv-opt -O` step ran here until issue #124 measured it a net loss on Mali-G715 — ~0.7 s faster pipeline creation but ~2x slower GPU time on the effects scene — so the driver's own compiler does the optimizing |
+| Vulkan | SPIR-V passthrough | `<name>.spv`: naga emission as-is. A `spirv-opt -O` step ran here until issue #124 measured it on the Pixel 9 Pro (Mali-G715): ~0.64 s faster cold pipeline creation, but the effects scene's GPU time ~78% slower at p50 and ~2.7x at p99 — so the driver's own compiler does the optimizing |
 | Metal | `.metallib` passthrough | `<name>.metallib`: naga MSL at wgpu-hal's argument slots, compiled by `xcrun -sdk <sdk> metal` + `metallib` during the build |
 | WebGPU (wasm32) | WGSL | The original source, via `create_shader_module_trusted` with unchecked runtime checks |
 | DX12, GL, BrowserWebGpu native | WGSL | Same trusted-WGSL path; wgpu 29 passthrough has no GLSL producer and this build produces no DXIL/HLSL — WGSL is the declared delivery for those backends |

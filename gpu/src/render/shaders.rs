@@ -309,7 +309,8 @@ const MIP: Fixed = Fixed {
 /// selected backend, not a runtime fallback.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ShaderDelivery {
-    /// Optimized SPIR-V through `create_shader_module_passthrough`.
+    /// naga's SPIR-V emission as-is, through
+    /// `create_shader_module_passthrough`.
     ///
     /// Exists only where `build.rs` emits `.spv` artifacts — the
     /// `cherenkov_spirv` targets (issue #241): on Apple and wasm there is

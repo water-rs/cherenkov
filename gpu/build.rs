@@ -4,8 +4,8 @@
 //!
 //! - `<name>.spv` — naga SPIR-V as emitted, on the non-Apple, non-wasm
 //!   targets only (issue #241). spirv-opt ran here until #124 measured it
-//!   a net loss on Mali-G715: it cut pipeline creation by ~0.7 s but made
-//!   the effects scene's GPU time ~2x slower;
+//!   on the Pixel 9 Pro (Mali-G715): ~0.64 s faster cold pipeline creation
+//!   but the effects scene's GPU time ~78% slower at p50 and ~2.7x at p99;
 //! - `<name>.metal` — naga MSL at wgpu-hal's argument slots;
 //! - `<name>.metallib` — the `.metal` compiled by `xcrun metal`/`metallib`,
 //!   on Apple targets only.

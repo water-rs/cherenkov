@@ -24,10 +24,7 @@ vello-cpu = ["dep:vello_cpu", "dep:vello_common"]
 # binaries.
 skia = ["dep:skia-safe", "dep:ash", "dep:skia-bindings", "skia-safe/vulkan", "skia-safe/ganesh"]
 skia-metal = ["dep:skia-safe", "dep:objc2", "dep:objc2-metal", "dep:skia-bindings", "skia-safe/metal", "skia-safe/graphite"]
-cherenkov = ["dep:cherenkov", "dep:cherenkov-gpu", "dep:wgpu", "dep:ash", "dep:half", "dep:filtrate",
-    # `external-cost`'s Apple producer (`CVPixelBuffer`/`IOSurface`).
-    "dep:objc2", "dep:objc2-metal", "dep:objc2-core-video", "dep:objc2-io-surface",
-    "dep:objc2-core-foundation"]
+cherenkov = ["dep:cherenkov", "dep:cherenkov-gpu", "dep:wgpu", "dep:ash", "dep:half", "dep:filtrate"]
 cherenkov-cpu = ["dep:cherenkov", "dep:cherenkov-cpu", "dep:filtrate"]
 
 [dependencies]
@@ -65,15 +62,7 @@ objc2-metal = { version = "0.3.2", optional = true, default-features = false, fe
     # `external-cost`'s IOSurface plane textures (#168).
     "MTLTexture", "MTLPixelFormat", "MTLResource", "MTLAllocation", "objc2-io-surface",
 ] }
-# `external-cost`'s `CVPixelBuffer` producer (Apple).
-objc2-core-video = { version = "0.3", optional = true, default-features = false, features = [
-    "std", "objc2-io-surface", "CVBase", "CVBuffer", "CVImageBuffer",
-    "CVPixelBuffer", "CVPixelBufferIOSurface", "CVReturn",
-] }
-objc2-io-surface = { version = "0.3", optional = true }
-objc2-core-foundation = { version = "0.3", optional = true, default-features = false, features = [
-    "std", "CFBase", "CFString", "CFNumber", "CFDictionary",
-] }
+
 wgpu = { version = "30.0.1", optional = true }
 # The `vello-classic`/`vello-hybrid` baselines stay on wgpu 29: the pinned
 # lexoliu/vello forks require `wgpu ^29`. Both majors link into the bench;
@@ -112,3 +101,20 @@ path = "src/bin.rs"
 name = "cherenkov-import-frame"
 path = "src/bin/import_frame.rs"
 required-features = ["cherenkov"]
+# `external-cost`'s `CVPixelBuffer`/`IOSurface` producer (#168).
+[target.'cfg(target_vendor = "apple")'.dependencies]
+objc2 = { version = "0.6.3", default-features = false }
+objc2-metal = { version = "0.3.2", default-features = false, features = [
+    "MTLDevice", "MTLCommandQueue", "MTLCommandBuffer",
+    # `CFTimeInterval` for `MTLCommandBuffer::GPUStartTime`/`GPUEndTime`.
+    "objc2-core-foundation",
+    "MTLTexture", "MTLPixelFormat", "MTLResource", "MTLAllocation", "objc2-io-surface",
+] }
+objc2-core-video = { version = "0.3", default-features = false, features = [
+    "std", "objc2-io-surface", "CVBase", "CVBuffer", "CVImageBuffer",
+    "CVPixelBuffer", "CVPixelBufferIOSurface", "CVReturn",
+] }
+objc2-io-surface = "0.3"
+objc2-core-foundation = { version = "0.3", default-features = false, features = [
+    "std", "CFBase", "CFString", "CFNumber", "CFDictionary",
+] }

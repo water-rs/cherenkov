@@ -330,7 +330,9 @@ impl Producer {
                 hdr: HdrMetadata::default(),
             })))
             .map_err(|e| BenchError::Engine(format!("external-cost: AHB import failed: {e}")))?;
-        Ok(ExternalFrame::native(native))
+        ExternalFrame::native(native).map_err(|e| {
+            BenchError::Engine(format!("external-cost: invalid native frame: {e:?}"))
+        })
     }
 }
 

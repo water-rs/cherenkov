@@ -111,6 +111,10 @@ pub enum ExternalTransfer {
 
 /// The `external-cost` options, assembled by [`run`] for
 /// `crate::external_cost::run` (#168).
+#[cfg_attr(
+    not(feature = "cherenkov"),
+    allow(dead_code)
+)]
 pub(crate) struct ExternalCostArgs {
     /// `e`/`c` — the measured path.
     pub(crate) path: ExternalPath,

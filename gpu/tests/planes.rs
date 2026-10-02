@@ -1270,6 +1270,28 @@ mod macos {
                 .is_none()
         );
         assert_eq!(node.position(), CGPoint::new(0., 0.));
+        // A new video frame and a full present-only compose must leave
+        // the compositor-owned affine/position pair intact.
+        let replacement =
+            fixture
+                .engine
+                .external_frame(bgra(&fixture.metal, &buffer, FrameColor::SRGB));
+        fixture.window.update(|tx| {
+            tx[&video].content(replacement);
+        });
+        fixture.render();
+        assert_eq!(node.position(), CGPoint::new(24., 16.));
+        assert_eq!(node.affineTransform().tx, 0.0);
+        fixture
+            .window
+            .display(Display {
+                scale: SCALE,
+                headroom: 2.0,
+            })
+            .expect("headroom-only compose");
+        fixture.render();
+        assert_eq!(node.position(), CGPoint::new(24., 16.));
+        assert_eq!(node.affineTransform().tx, 0.0);
         assert_eq!(node.affineTransform().tx, 8.);
         drop(video);
         fixture.render();

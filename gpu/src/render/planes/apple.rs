@@ -403,6 +403,9 @@ pub struct LayerPlanes {
     owned_animations: Vec<LayerId>,
     static_candidates: FxHashSet<LayerId>,
     buffers: FxHashMap<LayerId, raster::Buffer>,
+    placements: Vec<Placement>,
+    motions: Vec<super::animation::Motion>,
+    motion_tree_changed: bool,
 }
 
 /// An origin-anchored layer: its position is its superlayer point for its
@@ -763,9 +766,11 @@ fn shape(placement: &Placement) -> Vec<(LayerId, bool)> {
 }
 
 /// Applies a level's sampled properties to its layers.
-fn place(level: &Level, layers: &LevelLayers) {
-    layers.node.setPosition(CGPoint::new(0.0, 0.0));
-    layers.node.setAffineTransform(cg_affine(level.transform));
+fn place(level: &Level, layers: &LevelLayers, owns_position: bool) {
+    if !owns_position {
+        layers.node.setPosition(CGPoint::new(0.0, 0.0));
+        layers.node.setAffineTransform(cg_affine(level.transform));
+    }
     if let (Some(clip), Some(layer)) = (&level.clip, &layers.clip) {
         LayerClip::of(clip)
             .expect("eligibility admits only clips a layer expresses")
@@ -938,7 +943,13 @@ impl LayerScene {
                 .top
                 .setAffineTransform(cg_affine(Affine::scale(1.0 / scale)));
             for (level, layers) in placement.path.iter().zip(&built.levels) {
-                place(level, layers);
+                place(
+                    level,
+                    layers,
+                    self.motions
+                        .get(&level.layer)
+                        .is_some_and(|motion| motion.position.is_some()),
+                );
             }
             let display = self.display(placement.layer);
             display.setBounds(CGRect::new(
@@ -946,7 +957,13 @@ impl LayerScene {
                 CGSize::new(f64::from(placement.size.0), f64::from(placement.size.1)),
             ));
             display.setAffineTransform(cg_affine(placement.raster));
-            display.setOpacity(placement.opacity);
+            if self
+                .motions
+                .get(&placement.layer)
+                .is_none_or(|motion| motion.opacity.is_none())
+            {
+                display.setOpacity(placement.opacity);
+            }
             display.setName(None);
             self.planes.push(built);
         }
@@ -1088,6 +1105,9 @@ impl LayerPlanes {
             owned_animations: Vec::new(),
             static_candidates: FxHashSet::default(),
             buffers: FxHashMap::default(),
+            placements: Vec::new(),
+            motions: Vec::new(),
+            motion_tree_changed: false,
         };
         result.request_parts(1, probe);
         result
@@ -1218,14 +1238,19 @@ impl SystemPlanes for LayerPlanes {
             .planes
             .iter()
             .filter_map(|plane| super::animation::motion(tree, plane.layer))
-            .filter(|motion| super::animation::safe_path(tree, motion.layer, plan.planes.iter().map(|p| p.layer)))
+            .filter(|motion| {
+                super::animation::safe_path(tree, motion.layer, plan.planes.iter().map(|p| p.layer))
+            })
             .collect();
-        if motions.is_empty() && self.owned_animations.is_empty() {
-            return;
-        }
         self.owned_animations.clear();
         self.owned_animations
             .extend(motions.iter().map(|motion| motion.layer));
+        if motions == self.motions && !self.motion_tree_changed {
+            return;
+        }
+        self.motion_tree_changed = false;
+        self.motions.clone_from(&motions);
+        let placements = self.placements.clone();
         self.scene.run(move |scene, _| {
             let _tx = Transaction::begin();
             for plane in &scene.planes {
@@ -1233,6 +1258,20 @@ impl SystemPlanes for LayerPlanes {
                 let display = scene.display(plane.layer);
                 let next = motions.iter().find(|motion| motion.layer == plane.layer);
                 let previous = scene.motions.get(&plane.layer);
+                let placement = placements
+                    .iter()
+                    .find(|p| p.layer == plane.layer)
+                    .expect("committed placement");
+                if next.is_none_or(|motion| motion.position.is_none()) {
+                    place(
+                        placement.path.last().expect("leaf level"),
+                        plane.levels.last().expect("leaf layers"),
+                        false,
+                    );
+                }
+                if next.is_none_or(|motion| motion.opacity.is_none()) {
+                    display.setOpacity(placement.opacity);
+                }
                 if let Some(motion) = next {
                     if let Some(position) = motion.position {
                         let [a, b, c, d] = motion.linear;
@@ -1348,6 +1387,8 @@ impl SystemPlanes for LayerPlanes {
             .collect();
         let size = c.size;
         let scale = c.display.scale;
+        self.placements.clone_from(&placements);
+        self.motion_tree_changed = true;
         let queue = c.queue.clone();
         self.scene.run(move |scene, _| {
             let _tx = Transaction::begin();
@@ -1487,22 +1528,48 @@ impl SystemPlanes for LayerPlanes {
 
     fn refresh<'a>(&mut self, frames: impl Iterator<Item = Plane<'a>>) -> Result<(), RenderError> {
         for plane in frames {
-            let placement = plane.placement.clone();
-            self.scene.run(move |scene, _| {
-                let _tx = Transaction::begin();
-                let layers = scene
-                    .planes
-                    .iter()
-                    .find(|plane| plane.layer == placement.layer)
-                    .expect("refresh names a committed plane");
-                for (level, layers) in placement.path.iter().zip(&layers.levels) {
-                    place(level, layers);
-                }
-                scene.display(placement.layer).setOpacity(placement.opacity);
-            });
+            let previous = self
+                .placements
+                .iter_mut()
+                .find(|p| p.layer == plane.placement.layer)
+                .expect("refresh names a committed plane");
+            if previous != plane.placement {
+                previous.clone_from(plane.placement);
+                changed.push(plane.placement.clone());
+            }
             if let Some(update) = Update::from_plane(&plane) {
                 self.enqueue(update);
             }
+        }
+        if !changed.is_empty() {
+            self.scene.run(move |scene, _| {
+                let _tx = Transaction::begin();
+        let mut changed = Vec::new();
+                for placement in changed {
+                    let layers = scene
+                        .planes
+                        .iter()
+                        .find(|plane| plane.layer == placement.layer)
+                        .expect("refresh names a committed plane");
+                    for (level, layers) in placement.path.iter().zip(&layers.levels) {
+                        place(
+                            level,
+                            layers,
+                            scene
+                                .motions
+                                .get(&level.layer)
+                                .is_some_and(|motion| motion.position.is_some()),
+                        );
+                    }
+                    if scene
+                        .motions
+                        .get(&placement.layer)
+                        .is_none_or(|motion| motion.opacity.is_none())
+                    {
+                        scene.display(placement.layer).setOpacity(placement.opacity);
+                    }
+                }
+            });
         }
         Ok(())
     }

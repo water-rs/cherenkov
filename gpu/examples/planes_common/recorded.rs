@@ -24,6 +24,9 @@ pub struct Spec {
 impl Spec {
     /// `static:side:count:lifetime:plane|engine` or `animated:...`.
     /// Invalid matrix points fail before the device starts drawing.
+    ///
+    /// # Panics
+    /// If a recognized scenario has missing, nonnumeric or invalid fields.
     #[must_use]
     pub fn parse(name: &str) -> Option<Self> {
         let mut fields = name.split(':');
@@ -76,6 +79,9 @@ pub struct Scene {
 
 impl Scene {
     /// Build opaque tiles plus a separate engine-composited progress indicator.
+    ///
+    /// # Panics
+    /// If the requested tiles do not fit the surface at their native size.
     #[must_use]
     pub fn new(surface: &Surface<Gpu>, spec: Spec) -> Self {
         let (width, height) = surface.size();
@@ -154,6 +160,9 @@ impl Scene {
 
     /// Advance the controlled workload. Native animation starts after the
     /// observation frames and runs through a full settled measurement window.
+    ///
+    /// # Panics
+    /// If the layer count exceeds the harness's u32 index range.
     pub fn tick(&mut self, surface: &Surface<Gpu>) {
         self.frames += 1;
         if self.spec.lifetime != 0 && self.frames.is_multiple_of(self.spec.lifetime) {

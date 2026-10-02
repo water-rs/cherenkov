@@ -10,7 +10,7 @@ The shared engine owns recording, live operands, layer transactions, animation s
 
 ## Window and texture presentation
 
-`WindowTarget` owns its window handle. The engine retains readable premultiplied linear Display P3 output in `Rgba16Float`, then converts it for the swapchain. A timed-out or occluded acquisition schedules a retry using that retained output. A transparent window requires a known premultiplied or straight compositor convention; unknown inherited alpha is insufficient.
+`WindowTarget` owns its window handle. The engine retains readable premultiplied linear Display P3 output in `Rgba16Float`, then converts it for the swapchain. A timed-out or occluded acquisition schedules a retry using that retained output. A transparent window requires a known premultiplied or straight compositor convention; unknown inherited alpha is insufficient. `WindowTarget::display_sync` chooses display-synchronized presentation (the default) or unsynchronized presentation for latency measurement and benchmarks; a surface that cannot present as asked is an error, never a substitute mode.
 
 `GpuConfig::device` accepts a `SharedDevice`. Its instance, adapter, device and queue must belong to one creation chain. The device's enabled features and limits apply, and timestamps remain opt-in through `GpuConfig::timestamps`.
 

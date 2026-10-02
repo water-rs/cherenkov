@@ -4121,8 +4121,7 @@ impl GpuRenderer {
             &self.device,
             window.parent,
             size,
-            window.transparent,
-            window.required_color_space,
+            window.output,
             window.probe,
             self.plane_waker.clone(),
         );
@@ -4147,8 +4146,7 @@ impl GpuRenderer {
             &self.device,
             window.handle,
             size,
-            window.transparent,
-            window.required_color_space,
+            window.output,
             window.probe,
         )?;
         self.presenter
@@ -4584,11 +4582,14 @@ impl GpuRenderer {
                 sf.display_moved || sf.display.scale.to_bits() != surface.display.scale.to_bits();
             surface.display = sf.display;
             if renegotiate && let Some(window) = &mut surface.window {
-                window.reselect(&self.adapter, &self.device);
+                window
+                    .reselect(&self.adapter, &self.device)
+                    .map_err(|error| RenderError::Render(error.to_string()))?;
                 surface.present_pending = true;
             }
             if renegotiate && let Some(system) = self.planes.get_mut(&sf.id) {
-                planes::SystemPlanes::reselect(system, &self.adapter, &self.device);
+                planes::SystemPlanes::reselect(system, &self.adapter, &self.device)
+                    .map_err(|error| RenderError::Render(error.to_string()))?;
                 surface.present_pending = true;
             }
             if surface.present_pending {

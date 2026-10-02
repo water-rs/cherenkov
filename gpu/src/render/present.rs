@@ -11,6 +11,8 @@ use rustc_hash::FxHashMap;
 
 use cherenkov::{RenderError, SurfaceError};
 
+use crate::DisplaySync;
+
 use super::{bindings, layout_entries, shaders::ShaderDelivery};
 
 /// SDR white in nits — the BT.2408 reference white the absolute and
@@ -86,6 +88,10 @@ pub struct OutputSelection {
     pub transfer: TransferEncoding,
     /// The composite alpha mode the swapchain is configured with.
     pub alpha_mode: wgpu::CompositeAlphaMode,
+    /// The present mode the swapchain is configured with: what the host's
+    /// [`DisplaySync`](crate::DisplaySync) resolved to on this surface
+    /// (#214).
+    pub present_mode: wgpu::PresentMode,
     /// The display's reported tone-map headroom when the selection was
     /// made (`Surface::display_hdr_info`). `None` where the query is
     /// unavailable — on Metal it answers only from the main thread, so
@@ -265,19 +271,58 @@ const fn space_characteristics(
     }
 }
 
-/// Selects the swapchain's (format, colour space) pair from the surface's
-/// advertised capabilities — output negotiation, not a fallback (#98).
+/// What a host asked of a window's swapchain — the `WindowTarget`
+/// options output negotiation runs against.
+#[derive(Clone, Copy, Debug)]
+pub struct OutputRequest {
+    /// `WindowTarget::transparent`: a composite alpha mode the compositor
+    /// sees through.
+    pub transparent: bool,
+    /// `WindowTarget::require_color_space`: the required colour space, or
+    /// `None` to negotiate the best advertised pair.
+    pub color_space: Option<wgpu::SurfaceColorSpace>,
+    /// `WindowTarget::display_sync`: how presentation is paced against
+    /// the display.
+    pub sync: DisplaySync,
+}
+
+/// The present mode `sync` resolves to on a surface advertising `caps`:
+/// the first of its candidates the surface offers (#214).
+fn select_present_mode(
+    caps: &wgpu::SurfaceCapabilities,
+    sync: DisplaySync,
+) -> Result<wgpu::PresentMode, SurfaceError> {
+    let candidates: &[wgpu::PresentMode] = match sync {
+        DisplaySync::Synchronized => &[wgpu::PresentMode::Fifo],
+        DisplaySync::Unsynchronized => &[wgpu::PresentMode::Mailbox, wgpu::PresentMode::Immediate],
+    };
+    candidates
+        .iter()
+        .copied()
+        .find(|mode| caps.present_modes.contains(mode))
+        .ok_or_else(|| {
+            SurfaceError::UnsupportedTarget(format!(
+                "{sync:?} presentation needs one of the present modes {candidates:?}, the surface offers {:?}",
+                caps.present_modes
+            ))
+        })
+}
+
+/// Selects the swapchain's (format, colour space) pair and present mode
+/// from the surface's advertised capabilities — output negotiation, not a
+/// fallback (#98, #214).
 ///
-/// `required` is the host's explicit colour-space requirement
-/// (`WindowTarget::require_color_space`); when it cannot be met the
-/// surface is `Unsupported`, never silently substituted.
+/// `request.color_space` is the host's explicit colour-space requirement
+/// (`WindowTarget::require_color_space`) and `request.sync` its pacing
+/// (`WindowTarget::display_sync`); when either cannot be met the surface
+/// is `Unsupported`, never silently substituted.
 pub fn select_output(
     caps: &wgpu::SurfaceCapabilities,
     backend: wgpu::Backend,
-    transparent: bool,
-    required: Option<wgpu::SurfaceColorSpace>,
+    request: OutputRequest,
 ) -> Result<OutputSelection, SurfaceError> {
-    let alpha_mode = if transparent {
+    let present_mode = select_present_mode(caps, request.sync)?;
+    let alpha_mode = if request.transparent {
         [
             wgpu::CompositeAlphaMode::PreMultiplied,
             wgpu::CompositeAlphaMode::PostMultiplied,
@@ -298,7 +343,7 @@ pub fn select_output(
             .first()
             .expect("a configurable surface reports at least one alpha mode")
     };
-    let (format, color_space, reason) = match required {
+    let (format, color_space, reason) = match request.color_space {
         Some(wgpu::SurfaceColorSpace::Auto) | None => {
             let mut selected = None;
             for want in preferred_candidates(backend) {
@@ -366,6 +411,7 @@ pub fn select_output(
         primaries,
         transfer,
         alpha_mode,
+        present_mode,
         reported_headroom: None,
         tone_map_ceiling,
         reference_white_nits: REFERENCE_WHITE_NITS,
@@ -396,8 +442,7 @@ pub struct DisplayProbe {
     surface: SharedSurface,
     adapter: wgpu::Adapter,
     backend: wgpu::Backend,
-    transparent: bool,
-    required: Option<wgpu::SurfaceColorSpace>,
+    request: OutputRequest,
 }
 
 impl DisplayProbe {
@@ -427,7 +472,7 @@ impl DisplayProbe {
     /// selected.
     pub fn selection(&self) -> Result<OutputSelection, SurfaceError> {
         let caps = self.surface.get_capabilities(&self.adapter);
-        select_output(&caps, self.backend, self.transparent, self.required)
+        select_output(&caps, self.backend, self.request)
     }
 }
 
@@ -446,11 +491,10 @@ pub struct WindowSurface {
     /// The negotiated output — changes only when a re-selection finds a
     /// different advertised pair (#98).
     selection: OutputSelection,
-    /// The backend and host requirement the selection was made under,
-    /// kept for re-selection on display changes.
+    /// The backend and host request the selection was made under, kept
+    /// for re-selection on display changes.
     backend: wgpu::Backend,
-    transparent: bool,
-    required: Option<wgpu::SurfaceColorSpace>,
+    request: OutputRequest,
 }
 
 impl WindowSurface {
@@ -462,20 +506,16 @@ impl WindowSurface {
     /// # Errors
     /// [`SurfaceError::UnsupportedTarget`] when wgpu cannot create or the
     /// adapter cannot present to the window — including a required colour
-    /// space the surface does not advertise.
+    /// space the surface does not advertise and pacing it cannot present
+    /// with.
     #[cfg(not(target_vendor = "apple"))]
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the swapchain's full negotiation input: device triple, window,                   size, transparency, required space and the probe channel"
-    )]
     pub fn new(
         instance: &wgpu::Instance,
         adapter: &wgpu::Adapter,
         device: &wgpu::Device,
         handle: Box<dyn wgpu::WindowHandle>,
         size: (u32, u32),
-        transparent: bool,
-        required: Option<wgpu::SurfaceColorSpace>,
+        request: OutputRequest,
         probe: Option<std::sync::mpsc::Sender<DisplayProbe>>,
     ) -> Result<Self, SurfaceError> {
         let surface = SharedSurface::new(
@@ -483,7 +523,7 @@ impl WindowSurface {
                 .create_surface(wgpu::SurfaceTarget::Window(handle))
                 .map_err(|e| SurfaceError::UnsupportedTarget(format!("window surface: {e}")))?,
         );
-        Self::configure(surface, adapter, device, size, transparent, required, probe)
+        Self::configure(surface, adapter, device, size, request, probe)
     }
 
     /// Creates and configures the swapchain of a metal layer the engine
@@ -492,20 +532,16 @@ impl WindowSurface {
     /// # Errors
     /// [`SurfaceError::UnsupportedTarget`] when wgpu cannot create or the
     /// adapter cannot present to the layer — including a required colour
-    /// space the surface does not advertise.
+    /// space the surface does not advertise and pacing it cannot present
+    /// with.
     #[cfg(target_vendor = "apple")]
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the swapchain's full negotiation input: device triple, layer,                   size, transparency, required space and the probe channel"
-    )]
     pub fn from_layer(
         instance: &wgpu::Instance,
         adapter: &wgpu::Adapter,
         device: &wgpu::Device,
         layer: &objc2_quartz_core::CAMetalLayer,
         size: (u32, u32),
-        transparent: bool,
-        required: Option<wgpu::SurfaceColorSpace>,
+        request: OutputRequest,
         probe: Option<std::sync::mpsc::Sender<DisplayProbe>>,
     ) -> Result<Self, SurfaceError> {
         // SAFETY: the layer is a live `CAMetalLayer`; the surface retains it.
@@ -517,7 +553,7 @@ impl WindowSurface {
             }
             .map_err(|e| SurfaceError::UnsupportedTarget(format!("metal layer surface: {e}")))?,
         );
-        Self::configure(surface, adapter, device, size, transparent, required, probe)
+        Self::configure(surface, adapter, device, size, request, probe)
     }
 
     /// Configures `surface` at `size`: output selection, the swapchain and
@@ -527,13 +563,12 @@ impl WindowSurface {
         adapter: &wgpu::Adapter,
         device: &wgpu::Device,
         size: (u32, u32),
-        transparent: bool,
-        required: Option<wgpu::SurfaceColorSpace>,
+        request: OutputRequest,
         probe: Option<std::sync::mpsc::Sender<DisplayProbe>>,
     ) -> Result<Self, SurfaceError> {
         let backend = adapter.get_info().backend;
         let caps = surface.get_capabilities(adapter);
-        let mut selection = select_output(&caps, backend, transparent, required)?;
+        let mut selection = select_output(&caps, backend, request)?;
         // `display_hdr_info` answers only on the main thread on Apple;
         // there the host's probe reports instead (#98).
         if backend != wgpu::Backend::Metal {
@@ -545,7 +580,7 @@ impl WindowSurface {
             format: selection.format,
             width: size.0.max(1),
             height: size.1.max(1),
-            present_mode: wgpu::PresentMode::AutoVsync,
+            present_mode: selection.present_mode,
             desired_maximum_frame_latency: 2,
             alpha_mode: selection.alpha_mode,
             view_formats: Vec::new(),
@@ -554,6 +589,7 @@ impl WindowSurface {
         tracing::debug!(
             format = ?selection.format,
             color_space = ?selection.color_space,
+            present_mode = ?selection.present_mode,
             reason = ?selection.reason,
             reported_headroom = selection.reported_headroom,
             "swapchain output selected"
@@ -563,8 +599,7 @@ impl WindowSurface {
                 surface: SharedSurface::clone(&surface),
                 adapter: adapter.clone(),
                 backend,
-                transparent,
-                required,
+                request,
             });
         }
         Ok(Self {
@@ -572,8 +607,7 @@ impl WindowSurface {
             config,
             selection,
             backend,
-            transparent,
-            required,
+            request,
         })
     }
 
@@ -593,13 +627,19 @@ impl WindowSurface {
 
     /// Re-runs output negotiation — on a display change the advertised
     /// capabilities may have moved. Reconfigures only when the selected
-    /// format/colour-space/alpha tuple actually changes (#98).
-    pub fn reselect(&mut self, adapter: &wgpu::Adapter, device: &wgpu::Device) {
+    /// format/colour-space/alpha/present-mode tuple actually changes (#98).
+    ///
+    /// # Errors
+    /// [`SurfaceError::UnsupportedTarget`] when the surface no longer
+    /// advertises anything the host's request can be met with; the
+    /// swapchain is left as it was, never reconfigured to a substitute.
+    pub fn reselect(
+        &mut self,
+        adapter: &wgpu::Adapter,
+        device: &wgpu::Device,
+    ) -> Result<(), SurfaceError> {
         let caps = self.surface.get_capabilities(adapter);
-        let Ok(mut selection) = select_output(&caps, self.backend, self.transparent, self.required)
-        else {
-            return;
-        };
+        let mut selection = select_output(&caps, self.backend, self.request)?;
         if self.backend != wgpu::Backend::Metal {
             selection.reported_headroom =
                 self.surface.display_hdr_info(adapter).tone_map_headroom();
@@ -607,21 +647,25 @@ impl WindowSurface {
         if selection.format == self.selection.format
             && selection.color_space == self.selection.color_space
             && selection.alpha_mode == self.selection.alpha_mode
+            && selection.present_mode == self.selection.present_mode
         {
             self.selection = selection;
-            return;
+            return Ok(());
         }
         tracing::debug!(
             format = ?selection.format,
             color_space = ?selection.color_space,
+            present_mode = ?selection.present_mode,
             reason = ?selection.reason,
             "swapchain output reselected"
         );
         self.config.format = selection.format;
         self.config.color_space = selection.color_space;
         self.config.alpha_mode = selection.alpha_mode;
+        self.config.present_mode = selection.present_mode;
         self.surface.configure(device, &self.config);
         self.selection = selection;
+        Ok(())
     }
 
     /// Acquires the next swapchain image, reconfiguring once when the
@@ -1028,8 +1072,19 @@ mod tests {
     };
 
     use super::{
-        DestinationPrimaries, OutputColor, SelectionReason, TransferEncoding, select_output,
+        DestinationPrimaries, OutputColor, OutputRequest, SelectionReason, TransferEncoding,
+        select_output,
     };
+    use crate::DisplaySync;
+
+    /// A display-synchronized request.
+    const fn request(transparent: bool, color_space: Option<Cs>) -> OutputRequest {
+        OutputRequest {
+            transparent,
+            color_space,
+            sync: DisplaySync::Synchronized,
+        }
+    }
 
     /// A synthetic surface: `fc` is the (format, colour spaces) list, in
     /// surface preference order; `auto` is what `formats` reports (the
@@ -1071,7 +1126,7 @@ mod tests {
             &[F::Bgra8UnormSrgb, F::Rgba16Float],
             opaque(),
         );
-        let sel = select_output(&caps, Backend::Metal, false, None).unwrap();
+        let sel = select_output(&caps, Backend::Metal, request(false, None)).unwrap();
         assert_eq!(sel.format, F::Rgba16Float);
         assert_eq!(sel.color_space, Cs::ExtendedDisplayP3);
         assert_eq!(sel.primaries, DestinationPrimaries::DisplayP3);
@@ -1093,7 +1148,7 @@ mod tests {
             &[F::Bgra8UnormSrgb],
             opaque(),
         );
-        let sel = select_output(&caps, Backend::Metal, false, None).unwrap();
+        let sel = select_output(&caps, Backend::Metal, request(false, None)).unwrap();
         assert_eq!(
             (sel.format, sel.color_space),
             (F::Rgba16Float, Cs::ExtendedSrgbLinear)
@@ -1112,7 +1167,7 @@ mod tests {
             &[F::Bgra8UnormSrgb],
             opaque(),
         );
-        let sel = select_output(&caps, Backend::Vulkan, false, None).unwrap();
+        let sel = select_output(&caps, Backend::Vulkan, request(false, None)).unwrap();
         assert_eq!(
             (sel.format, sel.color_space),
             (F::Rgba16Float, Cs::Bt2100Pq)
@@ -1135,7 +1190,7 @@ mod tests {
             &[F::Bgra8UnormSrgb, F::Rgba16Float],
             opaque(),
         );
-        let sel = select_output(&caps, Backend::Vulkan, false, None).unwrap();
+        let sel = select_output(&caps, Backend::Vulkan, request(false, None)).unwrap();
         assert_eq!(
             (sel.format, sel.color_space),
             (F::Rgba16Float, Cs::ExtendedSrgbLinear)
@@ -1153,7 +1208,7 @@ mod tests {
             &[F::Bgra8UnormSrgb, F::Rgba16Float, F::Rgb10a2Unorm],
             opaque(),
         );
-        let sel = select_output(&caps, Backend::Dx12, false, None).unwrap();
+        let sel = select_output(&caps, Backend::Dx12, request(false, None)).unwrap();
         assert_eq!(
             (sel.format, sel.color_space),
             (F::Rgb10a2Unorm, Cs::Bt2100Pq)
@@ -1169,7 +1224,7 @@ mod tests {
             &[F::Bgra8Unorm],
             opaque(),
         );
-        let sel = select_output(&caps, Backend::Metal, false, None).unwrap();
+        let sel = select_output(&caps, Backend::Metal, request(false, None)).unwrap();
         assert_eq!(sel.color_space, Cs::DisplayP3);
         assert_eq!(sel.reason, SelectionReason::WideGamutSdr);
         assert_eq!(sel.primaries, DestinationPrimaries::DisplayP3);
@@ -1185,7 +1240,7 @@ mod tests {
             opaque(),
         );
         for backend in [Backend::Metal, Backend::Vulkan, Backend::Dx12] {
-            let sel = select_output(&caps, backend, false, None).unwrap();
+            let sel = select_output(&caps, backend, request(false, None)).unwrap();
             assert_eq!(sel.color_space, Cs::Srgb);
             assert_eq!(sel.reason, SelectionReason::Sdr, "{backend:?}");
         }
@@ -1196,7 +1251,7 @@ mod tests {
         // A backend that reports formats but no format_capabilities:
         // the historical formats.first() + Auto configuration.
         let caps = surface(&[], &[F::Bgra8UnormSrgb], opaque());
-        let sel = select_output(&caps, Backend::Metal, false, None).unwrap();
+        let sel = select_output(&caps, Backend::Metal, request(false, None)).unwrap();
         assert_eq!((sel.format, sel.color_space), (F::Bgra8UnormSrgb, Cs::Auto));
         assert_eq!(sel.reason, SelectionReason::Sdr);
     }
@@ -1205,7 +1260,7 @@ mod tests {
     fn an_empty_surface_is_unsupported() {
         let caps = surface(&[], &[], opaque());
         assert!(matches!(
-            select_output(&caps, Backend::Metal, false, None),
+            select_output(&caps, Backend::Metal, request(false, None)),
             Err(cherenkov::SurfaceError::UnsupportedTarget(_))
         ));
     }
@@ -1223,7 +1278,8 @@ mod tests {
             &[F::Bgra8UnormSrgb, F::Rgba16Float],
             opaque(),
         );
-        let sel = select_output(&caps, Backend::Metal, false, Some(Cs::Bt2100Hlg)).unwrap();
+        let sel =
+            select_output(&caps, Backend::Metal, request(false, Some(Cs::Bt2100Hlg))).unwrap();
         assert_eq!(
             (sel.format, sel.color_space),
             (F::Rgba16Float, Cs::Bt2100Hlg)
@@ -1243,7 +1299,7 @@ mod tests {
         for space in [Cs::Bt2100Pq, Cs::Bt2100Hlg, Cs::ExtendedDisplayP3] {
             assert!(
                 matches!(
-                    select_output(&caps, Backend::Metal, false, Some(space)),
+                    select_output(&caps, Backend::Metal, request(false, Some(space))),
                     Err(cherenkov::SurfaceError::UnsupportedTarget(_))
                 ),
                 "{space:?} must not be silently substituted"
@@ -1263,7 +1319,8 @@ mod tests {
             &[F::Bgra8Unorm],
             opaque(),
         );
-        let sel = select_output(&caps, Backend::Metal, false, Some(Cs::DisplayP3)).unwrap();
+        let sel =
+            select_output(&caps, Backend::Metal, request(false, Some(Cs::DisplayP3))).unwrap();
         assert_eq!(sel.format, F::Bgra8Unorm);
     }
 
@@ -1277,7 +1334,7 @@ mod tests {
             &[F::Bgra8UnormSrgb, F::Rgba16Float],
             opaque(),
         );
-        let sel = select_output(&caps, Backend::Metal, false, None).unwrap();
+        let sel = select_output(&caps, Backend::Metal, request(false, None)).unwrap();
         assert_eq!(sel.effective_headroom(4.0).to_bits(), 4.0f32.to_bits());
         assert_eq!(sel.effective_headroom(0.0).to_bits(), 0.0f32.to_bits());
 
@@ -1286,7 +1343,7 @@ mod tests {
             &[F::Bgra8UnormSrgb],
             opaque(),
         );
-        let sdr = select_output(&sdr_caps, Backend::Metal, false, None).unwrap();
+        let sdr = select_output(&sdr_caps, Backend::Metal, request(false, None)).unwrap();
         assert_eq!(sdr.effective_headroom(8.0).to_bits(), 1.0f32.to_bits());
 
         let pq_caps = surface(
@@ -1297,7 +1354,7 @@ mod tests {
             &[F::Bgra8UnormSrgb, F::Rgba16Float],
             opaque(),
         );
-        let pq = select_output(&pq_caps, Backend::Vulkan, false, None).unwrap();
+        let pq = select_output(&pq_caps, Backend::Vulkan, request(false, None)).unwrap();
         assert!((pq.effective_headroom(1e6) - 10000.0 / 203.0).abs() < 1e-3);
         assert_eq!(pq.effective_headroom(2.0).to_bits(), 2.0f32.to_bits());
     }
@@ -1312,7 +1369,7 @@ mod tests {
             &[F::Rgba16Float],
             opaque(),
         );
-        let sel = select_output(&caps, Backend::Metal, false, None).unwrap();
+        let sel = select_output(&caps, Backend::Metal, request(false, None)).unwrap();
         assert!(sel.reported_headroom.is_none());
     }
 
@@ -1329,7 +1386,7 @@ mod tests {
                 CompositeAlphaMode::PreMultiplied,
             ],
         );
-        let sel = select_output(&premul, Backend::Metal, true, None).unwrap();
+        let sel = select_output(&premul, Backend::Metal, request(true, None)).unwrap();
         assert_eq!(sel.alpha_mode, CompositeAlphaMode::PreMultiplied);
 
         let postmul = surface(
@@ -1340,7 +1397,7 @@ mod tests {
                 CompositeAlphaMode::PostMultiplied,
             ],
         );
-        let sel = select_output(&postmul, Backend::Metal, true, None).unwrap();
+        let sel = select_output(&postmul, Backend::Metal, request(true, None)).unwrap();
         assert_eq!(sel.alpha_mode, CompositeAlphaMode::PostMultiplied);
 
         let opaque_only = surface(
@@ -1349,7 +1406,7 @@ mod tests {
             vec![CompositeAlphaMode::Opaque],
         );
         assert!(matches!(
-            select_output(&opaque_only, Backend::Metal, true, None),
+            select_output(&opaque_only, Backend::Metal, request(true, None)),
             Err(cherenkov::SurfaceError::UnsupportedTarget(_))
         ));
     }
@@ -1364,7 +1421,7 @@ mod tests {
                 CompositeAlphaMode::Opaque,
             ],
         );
-        let sel = select_output(&caps, Backend::Metal, false, None).unwrap();
+        let sel = select_output(&caps, Backend::Metal, request(false, None)).unwrap();
         assert_eq!(sel.alpha_mode, CompositeAlphaMode::Opaque);
     }
 
@@ -1377,8 +1434,80 @@ mod tests {
             &[],
             opaque(),
         );
-        let sel = select_output(&caps, Backend::Metal, false, None).unwrap();
+        let sel = select_output(&caps, Backend::Metal, request(false, None)).unwrap();
         assert_eq!(sel.transfer, TransferEncoding::ExtendedSrgb);
         assert!(matches!(sel.output_color(), OutputColor::ExtendedDisplayP3));
+    }
+
+    /// An sRGB surface presenting with `modes`.
+    fn presenting(modes: &[wgpu::PresentMode]) -> SurfaceCapabilities {
+        SurfaceCapabilities {
+            present_modes: modes.to_vec(),
+            ..surface(
+                &[(F::Bgra8UnormSrgb, Spaces::SRGB)],
+                &[F::Bgra8UnormSrgb],
+                opaque(),
+            )
+        }
+    }
+
+    fn sync_request(sync: DisplaySync) -> OutputRequest {
+        OutputRequest {
+            sync,
+            ..request(false, None)
+        }
+    }
+
+    #[test]
+    fn display_sync_resolves_to_an_advertised_present_mode() {
+        use wgpu::PresentMode as M;
+        let every = presenting(&[M::Immediate, M::FifoRelaxed, M::Mailbox, M::Fifo]);
+        let sync = select_output(
+            &every,
+            Backend::Vulkan,
+            sync_request(DisplaySync::Synchronized),
+        )
+        .unwrap();
+        assert_eq!(
+            sync.present_mode,
+            M::Fifo,
+            "relaxed FIFO tears a late frame"
+        );
+        let unsync = select_output(
+            &every,
+            Backend::Vulkan,
+            sync_request(DisplaySync::Unsynchronized),
+        )
+        .unwrap();
+        assert_eq!(unsync.present_mode, M::Mailbox, "mailbox where offered");
+        // What wgpu's Metal backend advertises on macOS.
+        let mac = presenting(&[M::Fifo, M::Immediate]);
+        let unsync = select_output(
+            &mac,
+            Backend::Metal,
+            sync_request(DisplaySync::Unsynchronized),
+        )
+        .unwrap();
+        assert_eq!(unsync.present_mode, M::Immediate, "immediate otherwise");
+    }
+
+    #[test]
+    fn unsynchronized_presentation_without_mailbox_or_immediate_is_unsupported() {
+        use wgpu::PresentMode as M;
+        // A FIFO-only surface (Metal on iOS, WebGPU), and one whose only
+        // other mode still waits for the display when frames keep up.
+        for modes in [&[M::Fifo][..], &[M::Fifo, M::FifoRelaxed]] {
+            assert!(
+                matches!(
+                    select_output(
+                        &presenting(modes),
+                        Backend::Metal,
+                        sync_request(DisplaySync::Unsynchronized),
+                    ),
+                    Err(cherenkov::SurfaceError::UnsupportedTarget(_))
+                ),
+                "{modes:?} must not be substituted for unsynchronized presentation"
+            );
+        }
     }
 }

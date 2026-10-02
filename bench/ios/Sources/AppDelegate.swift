@@ -1,24 +1,34 @@
+import OSLog
 import UIKit
+
+private let logger = Logger(subsystem: "dev.cherenkov", category: "bench")
 
 @main
 final class AppDelegate: UIResponder, UIApplicationDelegate {
-    func application(
-        _: UIApplication,
-        didFinishLaunchingWithOptions _: [UIApplication.LaunchOptionsKey: Any]? = nil
-    ) -> Bool {
-        true
-    }
+    /// The status view the scene's window hosts; the runner drives it.
+    let status = StatusViewController()
+    private var originalBrightness: CGFloat = UIScreen.main.brightness
 
     func application(
-        _: UIApplication,
-        configurationForConnecting connectingSceneSession: UISceneSession,
-        options _: UIScene.ConnectionOptions
-    ) -> UISceneConfiguration {
-        let configuration = UISceneConfiguration(
-            name: "Default Configuration",
-            sessionRole: connectingSceneSession.role
-        )
-        configuration.delegateClass = SceneDelegate.self
-        return configuration
+        _ application: UIApplication,
+        didFinishLaunchingWithOptions _: [UIApplication.LaunchOptionsKey: Any]? = nil
+    ) -> Bool {
+        application.isIdleTimerDisabled = true
+        originalBrightness = UIScreen.main.brightness
+        UIScreen.main.brightness = 0
+        logger.info("launch: idle timer disabled, brightness -> 0")
+
+        let status = status
+        Thread.detachNewThread { [weak self] in
+            let code = BenchRunner(delegate: status).runAll()
+            DispatchQueue.main.async {
+                application.isIdleTimerDisabled = false
+                if let brightness = self?.originalBrightness {
+                    UIScreen.main.brightness = brightness
+                }
+            }
+            logger.info("all runs done; exit code \(code)")
+        }
+        return true
     }
 }

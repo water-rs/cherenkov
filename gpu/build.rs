@@ -2,10 +2,10 @@
 //! validates and translates them once at build time instead of wgpu doing it
 //! per pipeline at runtime. Each module produces
 //!
-//! - `<name>.spv` — naga SPIR-V run through the `spirv-opt -O` recipe minus
-//!   `simplify-instructions` (it reassociates floating-point math, breaking
-//!   bit-identical output) and validated by `spirv-val` against `vulkan1.0`,
-//!   on the non-Apple, non-wasm targets only (issue #241);
+//! - `<name>.spv` — naga SPIR-V as emitted, on the non-Apple, non-wasm
+//!   targets only (issue #241). spirv-opt ran here until #124 measured it
+//!   on the Pixel 9 Pro (Mali-G715): ~0.64 s faster cold pipeline creation
+//!   but the effects scene's GPU time ~78% slower at p50 and ~2.7x at p99;
 //! - `<name>.metal` — naga MSL at wgpu-hal's argument slots;
 //! - `<name>.metallib` — the `.metal` compiled by `xcrun metal`/`metallib`,
 //!   on Apple targets only.
@@ -67,53 +67,6 @@ const UNCHECKED: naga::proc::BoundsCheckPolicies = naga::proc::BoundsCheckPolici
     image_load: naga::proc::BoundsCheckPolicy::Unchecked,
     binding_array: naga::proc::BoundsCheckPolicy::Unchecked,
 };
-
-/// The `spirv-opt -O` pass recipe (spirv-tools 2022.2) minus
-/// `simplify-instructions`, which reassociates floating-point math and so
-/// broke bit-identical corpus rendering. See `write_spirv`.
-const SPIRV_OPT_PASSES: &[&str] = &[
-    "--wrap-opkill",
-    "--eliminate-dead-branches",
-    "--merge-return",
-    "--inline-entry-points-exhaustive",
-    "--eliminate-dead-functions",
-    "--eliminate-dead-code-aggressive",
-    "--private-to-local",
-    "--eliminate-local-single-block",
-    "--eliminate-local-single-store",
-    "--eliminate-dead-code-aggressive",
-    "--scalar-replacement=100",
-    "--convert-local-access-chains",
-    "--eliminate-local-single-block",
-    "--eliminate-local-single-store",
-    "--eliminate-dead-code-aggressive",
-    "--ssa-rewrite",
-    "--eliminate-dead-code-aggressive",
-    "--ccp",
-    "--eliminate-dead-code-aggressive",
-    "--loop-unroll",
-    "--eliminate-dead-branches",
-    "--redundancy-elimination",
-    "--combine-access-chains",
-    "--scalar-replacement=100",
-    "--convert-local-access-chains",
-    "--eliminate-local-single-block",
-    "--eliminate-local-single-store",
-    "--eliminate-dead-code-aggressive",
-    "--ssa-rewrite",
-    "--eliminate-dead-code-aggressive",
-    "--vector-dce",
-    "--eliminate-dead-inserts",
-    "--eliminate-dead-branches",
-    "--if-conversion",
-    "--copy-propagate-arrays",
-    "--reduce-load-size",
-    "--eliminate-dead-code-aggressive",
-    "--merge-blocks",
-    "--redundancy-elimination",
-    "--eliminate-dead-branches",
-    "--merge-blocks",
-];
 
 fn main() {
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
@@ -215,9 +168,9 @@ fn main() {
     });
 
     // wasm builds embed no passthrough artifacts, and Apple builds embed
-    // no `.spv` (issue #241), so the toolchains emission needs — spirv-tools
-    // and `xcrun` — are each required only on the targets that consume
-    // their artifacts; the WGSL is still parsed and validated here.
+    // no `.spv` (issue #241), so `xcrun` is required only on the targets
+    // that consume its artifacts; the WGSL is still parsed and validated
+    // here.
     let wasm = env::var("CARGO_CFG_TARGET_ARCH").unwrap() == "wasm32";
     let apple = apple_target();
     let spirv = emits_spirv();
@@ -232,7 +185,7 @@ fn main() {
     }
 }
 
-/// Whether the `.spv` artifacts are emitted — and spirv-tools is required.
+/// Whether the `.spv` artifacts are emitted.
 ///
 /// SPIR-V is the passthrough format of wgpu's Vulkan backend only, and
 /// wgpu compiles that backend on exactly the non-Apple, non-wasm targets
@@ -241,7 +194,7 @@ fn main() {
 /// get `.metallib`s and wgpu has no Vulkan backend for them unless the
 /// non-default `vulkan-portability` feature is on (issue #241). This
 /// crate's `wgpu` dependency is default-features, so `.spv` bytes are
-/// unreachable on Apple and wasm and must not demand spirv-tools there.
+/// unreachable on Apple and wasm.
 fn emits_spirv() -> bool {
     env::var("CARGO_CFG_TARGET_ARCH").unwrap() != "wasm32"
         && env::var("CARGO_CFG_TARGET_VENDOR").unwrap() != "apple"
@@ -321,36 +274,9 @@ fn write_spirv(out_dir: &Path, spec: &Spec, module: &naga::Module, info: &naga::
         merge_sampled_pair(&mut words, texture, sampler, &spec.name);
     }
     let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
-    let unoptimized = out_dir.join(format!("{}.unopt.spv", spec.name));
-    std::fs::write(&unoptimized, bytes).unwrap();
-    let optimized = out_dir.join(format!("{}.spv", spec.name));
-    // `spirv-opt -O` minus `simplify-instructions`: that pass reassociates
-    // floating-point math (`C * (1/x)` → `C/x`, `(2*z)*k` → `z*(k/2)`),
-    // which is IEEE-valid but not bit-identical and broke the corpus oracle
-    // (issue #57). The pinned recipe is `spirv-opt -O` as of spirv-tools
-    // 2022.2, expanded, with the offending pass dropped; keeping the pass
-    // list explicit also makes the result independent of the installed
-    // spirv-tools version's idea of `-O`.
-    run(
-        Command::new("spirv-opt")
-            .args(SPIRV_OPT_PASSES)
-            .arg(&unoptimized)
-            .arg("-o")
-            .arg(&optimized),
-        &spec.name,
-        "spirv-opt (from the spirv-tools package) is required to build \
-         cherenkov-gpu: engine shaders are precompiled (issue #57). Install \
-         it, e.g. `apt-get install spirv-tools` or `brew install spirv-tools`.",
-    );
-    run(
-        Command::new("spirv-val")
-            .arg("--target-env")
-            .arg("vulkan1.0")
-            .arg(&optimized),
-        &spec.name,
-        "spirv-val (from the spirv-tools package) is required to build \
-         cherenkov-gpu: engine shaders are precompiled (issue #57).",
-    );
+    // naga's emission ships as-is: spirv-opt was measured a net loss on the
+    // device (issue #124) and the driver's compiler optimizes itself.
+    std::fs::write(out_dir.join(format!("{}.spv", spec.name)), bytes).unwrap();
 }
 
 /// Emits the Metal source and, on Apple targets, the compiled library.

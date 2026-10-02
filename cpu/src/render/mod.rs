@@ -25,7 +25,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use cherenkov::{
     BackdropId, ContentOp, EngineError, FontData, FontId, Frame, FrameStats, ImageId, ImageUpload,
     LayerId, MemoryUsage, Pressure, Readback, Redraw, RenderError, Renderer, ResourceError,
-    ResourceId, SurfaceError, SurfaceId, SurfaceInfo,
+    ResourceId, SurfaceError, SurfaceId, SurfaceInfo, SurfaceVisibility, Visibility,
 };
 use lower::{ContentData, Item, Lowering};
 
@@ -70,6 +70,13 @@ struct SurfaceState {
     /// Projective layers' realized local images, by layer, one per
     /// density bucket.
     projective: FxHashMap<LayerId, Vec<projective::Entry>>,
+    /// The host's announced visibility as the render loop applied it. A
+    /// hidden surface is in no frame, and its filters ask for no redraw.
+    visibility: Visibility,
+    /// The host's announced visibility as it flips on the UI thread: the
+    /// wake gates of the surface's filters read it, so they stop waking the
+    /// moment the host hides the surface.
+    announced: SurfaceVisibility,
 }
 
 impl SurfaceState {
@@ -173,6 +180,9 @@ impl Renderer for RasterRenderer {
         &mut self,
         id: SurfaceId,
         target: RasterTarget,
+        // The raster backend has no completion that lands after a render;
+        // its filters' wakes are gated on the surface's visibility.
+        waker: cherenkov::CompletionWaker,
     ) -> Result<SurfaceInfo, SurfaceError> {
         let (size, output, readable, refresh) = match target {
             RasterTarget::Offscreen(offscreen) => {
@@ -221,6 +231,8 @@ impl Renderer for RasterRenderer {
                 groups: Vec::new(),
                 backdrop_capture_peak: 0,
                 projective: FxHashMap::default(),
+                visibility: Visibility::Visible,
+                announced: waker.visibility(),
             },
         );
         Ok(SurfaceInfo {
@@ -254,6 +266,16 @@ impl Renderer for RasterRenderer {
 
     fn destroy_surface(&mut self, id: SurfaceId) {
         self.surfaces.remove(&id);
+    }
+
+    fn set_visibility(&mut self, id: SurfaceId, visibility: Visibility) {
+        // The filters' wakes already follow the announced visibility
+        // through their gates; this decides what counts in `Redraw` and
+        // what each frame housekeeps.
+        self.surfaces
+            .get_mut(&id)
+            .expect("visibility of a created surface")
+            .visibility = visibility;
     }
 
     /// Validates font data and detects colour-glyph sources.
@@ -578,27 +600,14 @@ impl RasterRenderer {
                 self.render_surface(sf, frame.id, stats)?;
             }
         }
-        let used: FxHashSet<u64> = self
-            .surfaces
-            .values()
-            .flat_map(|surface| surface.filters.iter().copied())
-            .collect();
-        let used_groups: FxHashSet<(u64, u64)> = self
-            .surfaces
-            .iter()
-            .flat_map(|(surface, state)| {
-                state
-                    .groups
-                    .iter()
-                    .map(move |group| (surface.raw(), *group))
-            })
-            .collect();
+        let (used, used_groups) = self.filter_uses();
         self.evict_projective();
-        self.filters.set_active(&used, &used_groups);
+        self.gate_filters();
         self.filters.finish_frame(&used, &used_groups);
         let rate = self
             .surfaces
             .iter()
+            .filter(|(_, surface)| surface.visibility == Visibility::Visible)
             .filter(|(id, surface)| {
                 surface
                     .filters
@@ -620,6 +629,49 @@ impl RasterRenderer {
                 ))
             });
         Ok(rate.map_or(Redraw::None, |rate| Redraw::Wanted { rate }))
+    }
+
+    /// Gates every filter's and backdrop chain's wakes on the surfaces whose
+    /// last frames ran it.
+    fn gate_filters(&self) {
+        let mut uses: FxHashMap<u64, Vec<SurfaceVisibility>> = FxHashMap::default();
+        let mut groups = FxHashMap::default();
+        for (surface, state) in &self.surfaces {
+            for filter in &state.filters {
+                let surfaces = uses.entry(*filter).or_default();
+                // Listed surface by surface: one entry per surface.
+                if surfaces.last() != Some(&state.announced) {
+                    surfaces.push(state.announced.clone());
+                }
+            }
+            for group in &state.groups {
+                groups.insert((surface.raw(), *group), state.announced.clone());
+            }
+        }
+        self.filters.set_surfaces(&uses, &groups);
+    }
+
+    /// The filters and backdrop groups the visible surfaces' last frames
+    /// ran: the entries housekept per frame. A hidden surface's are left
+    /// alone until it is shown, when the front end redraws it whole.
+    fn filter_uses(&self) -> (FxHashSet<u64>, FxHashSet<(u64, u64)>) {
+        let visible = || {
+            self.surfaces
+                .iter()
+                .filter(|(_, state)| state.visibility == Visibility::Visible)
+        };
+        let used = visible()
+            .flat_map(|(_, state)| state.filters.iter().copied())
+            .collect();
+        let used_groups = visible()
+            .flat_map(|(surface, state)| {
+                state
+                    .groups
+                    .iter()
+                    .map(move |group| (surface.raw(), *group))
+            })
+            .collect();
+        (used, used_groups)
     }
 
     fn refresh_cache_budgets(&mut self) {

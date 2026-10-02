@@ -797,9 +797,7 @@ fn finish_frame<B: Backend>(
         } else if owned.is_empty() {
             state.sampled_rate.take()
         } else {
-            state
-                .tree
-                .animation_rate(state.display, |layer| owned.contains(&layer))
+            state.tree.animation_rate(|layer| owned.contains(&layer))
         };
         match running {
             Some(r) if r == crate::tree::RATE_FAST => rate = Some(crate::tree::RATE_FAST),

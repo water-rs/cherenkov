@@ -113,5 +113,5 @@ pub use crate::surface::{
     Surface, Transaction,
 };
 pub use crate::text::TextLayout;
-pub use crate::tree::{LayerNode, SurfaceTree, snap_animating};
+pub use crate::tree::{LayerAnimations, LayerNode, SurfaceTree, snap_animating};
 pub use kurbo::Stroke;

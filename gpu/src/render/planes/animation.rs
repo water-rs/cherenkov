@@ -122,17 +122,15 @@ fn translation(track: AnimationTrack<Affine>) -> Option<[Scalar; 2]> {
 /// track or nonlinear component never disappears from frame scheduling.
 pub fn motion(tree: &SurfaceTree, layer: LayerId) -> Option<Motion> {
     let node = tree.layer(layer);
-    if !node.children.is_empty()
-        || !node.describable_animations()
-        || tree.projective_pose(layer).is_some()
-    {
+    if !node.children.is_empty() {
         return None;
     }
-    let position = match node.transform_animation() {
+    let tracks = node.animations()?;
+    let position = match tracks.transform {
         Some(track) => Some(translation(track)?),
         None => None,
     };
-    let opacity = node.opacity_animation().map(|track| Scalar {
+    let opacity = tracks.opacity.map(|track| Scalar {
         from: f64::from(track.from),
         velocity: track.velocity[0],
         target: f64::from(track.target),
@@ -155,7 +153,17 @@ pub fn motion(tree: &SurfaceTree, layer: LayerId) -> Option<Motion> {
 /// sampled non-overlap proof is insufficient for an animation that moves
 /// without another engine frame, so reject translucent content anywhere
 /// later in paint order, including isolated descendants.
-pub fn safe_path(tree: &SurfaceTree, layer: LayerId) -> bool {
+pub fn safe_path(
+    tree: &SurfaceTree,
+    layer: LayerId,
+    planes: impl Iterator<Item = LayerId>,
+) -> bool {
+    let fades = tree.layer(layer).animations().is_some_and(|tracks| tracks.opacity.is_some());
+    if (super::translucent(tree, layer) || fades)
+        && planes.take_while(|&id| id != layer).next().is_some()
+    {
+        return false;
+    }
     let mut pending = vec![tree.root()];
     let mut after = false;
     while let Some(id) = pending.pop() {
@@ -221,6 +229,25 @@ mod tests {
                 animation: None,
             },
         ));
-        assert!(!safe_path(&tree, plane));
+        assert!(!safe_path(&tree, plane, [plane].into_iter()));
+    }
+
+    #[test]
+    fn a_fading_plane_cannot_move_above_an_earlier_plane() {
+        let mut tree = SurfaceTree::new();
+        let below = LayerId::new(1);
+        let moving = LayerId::new(2);
+        for layer in [below, moving] {
+            tree.apply(LayerOp::Create(layer));
+            tree.apply(LayerOp::Push { parent: tree.root(), child: layer });
+        }
+        assert!(safe_path(&tree, moving, [below, moving].into_iter()));
+        tree.apply(LayerOp::Opacity(moving, Prop {
+            target: 0.5,
+            animation: Some(Curve::linear(Duration::from_secs(1)).into()),
+        }));
+        tree.sample(Instant::now(), Display::default());
+        assert_eq!(tree.layer(moving).opacity, 1.0);
+        assert!(!safe_path(&tree, moving, [below, moving].into_iter()));
     }
 }

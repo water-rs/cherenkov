@@ -1218,7 +1218,7 @@ impl SystemPlanes for LayerPlanes {
             .planes
             .iter()
             .filter_map(|plane| super::animation::motion(tree, plane.layer))
-            .filter(|motion| super::animation::safe_path(tree, motion.layer))
+            .filter(|motion| super::animation::safe_path(tree, motion.layer, plan.planes.iter().map(|p| p.layer)))
             .collect();
         if motions.is_empty() && self.owned_animations.is_empty() {
             return;

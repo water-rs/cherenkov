@@ -177,22 +177,20 @@ fn hlg_gamma(peak_nits: f32) -> f32 {
 
 /// Plane kind, alpha mode, flags and sampled sizes for one frame.
 fn plane_contract(frame: &ExternalFrame) -> (u32, u32, u32, wgpu::Extent3d, wgpu::Extent3d) {
+    let alpha = match frame.alpha() {
+        RgbAlpha::Opaque => 0,
+        RgbAlpha::Straight => 1,
+        RgbAlpha::Premultiplied => 2,
+    };
     match &frame.planes {
         FramePlanes::Yuv { y, uv } => {
             let (kind, shift) = match y.format() {
                 wgpu::TextureFormat::R8Uint => (KIND_NV12, 0),
                 _ => (KIND_P010, FLAG_SHIFT6),
             };
-            (kind, 0, shift, y.size(), uv.size())
+            (kind, alpha, shift, y.size(), uv.size())
         }
-        FramePlanes::Rgb { plane, alpha } => {
-            let alpha = match alpha {
-                RgbAlpha::Opaque => 0,
-                RgbAlpha::Straight => 1,
-                RgbAlpha::Premultiplied => 2,
-            };
-            (KIND_RGB, alpha, 0, plane.size(), plane.size())
-        }
+        FramePlanes::Rgb { plane, .. } => (KIND_RGB, alpha, 0, plane.size(), plane.size()),
         #[cfg(all(unix, not(target_vendor = "apple")))]
         FramePlanes::Native(frame) => {
             let size = wgpu::Extent3d {
@@ -209,20 +207,15 @@ fn plane_contract(frame: &ExternalFrame) -> (u32, u32, u32, wgpu::Extent3d, wgpu
                 vulkan::Repr::Rgb { .. } => {
                     // A `Bgra8Unorm` plane already presents RGBA-ordered
                     // samples to textureLoad — no swizzle flag.
-                    let alpha = match frame.generation.alpha {
-                        RgbAlpha::Opaque => 0,
-                        RgbAlpha::Straight => 1,
-                        RgbAlpha::Premultiplied => 2,
-                    };
                     (KIND_RGB, alpha, 0, size, size)
                 }
                 vulkan::Repr::Planes { kind } => {
                     let shift = if kind == KIND_P010 { FLAG_SHIFT6 } else { 0 };
-                    (kind, 0, shift, size, chroma)
+                    (kind, alpha, shift, size, chroma)
                 }
                 // The sampler conversion yields encoded `R'G'B'`; the
                 // shader decodes it like an opaque RGB plane.
-                vulkan::Repr::ExternalFormat { .. } => (KIND_RGB, 0, 0, size, size),
+                vulkan::Repr::ExternalFormat { .. } => (KIND_RGB, alpha, 0, size, size),
             }
         }
     }

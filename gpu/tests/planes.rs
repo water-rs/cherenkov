@@ -354,6 +354,17 @@ mod macos {
         }
     }
 
+    /// `drive` without the assert: `false` when the deadline passed —
+    /// the caller reads that as the signal's absence, not a failure.
+    fn drive_until(deadline: Instant, done: &dyn Fn() -> bool) -> bool {
+        // SAFETY: the mode is an immutable static.
+        let mode = unsafe { kCFRunLoopDefaultMode };
+        while !done() && Instant::now() < deadline {
+            CFRunLoop::run_in_mode(mode, 0.005, true);
+        }
+        done()
+    }
+
     /// Drives the main run loop until `flag` is set — the completion
     /// signal a queued block, like a display layer's attach, leaves
     /// behind.
@@ -676,10 +687,11 @@ mod macos {
         /// The frames a window produces while a candidate is attached and
         /// promoted: the first render composites it in-engine —
         /// asserted, the pending contract — the attach block's completion
-        /// wake is the drain's done signal, the probe's `readyForDisplay`
-        /// flip is the platform's own report, and its change notification
-        /// bounces the flag back through a second wake that promotes the
-        /// candidate on the next render.
+        /// wake is the drain's done signal, and the probe's own
+        /// `readyForDisplay` is the platform's report. `false` means the
+        /// platform never reported it; once it does, promotion is owed —
+        /// a ready probe left in the engine is a planner rejection of an
+        /// eligible scene, which fails here rather than skipping.
         fn promote(&self) -> bool {
             drain_main();
             self.woke.store(false, Ordering::Relaxed);
@@ -697,17 +709,16 @@ mod macos {
                 &|| !probes(&self.host()).is_empty(),
                 &|| "the queued attach never parked a probe".into(),
             );
-            // Readiness is the platform's asynchronous signal: drive the
-            // run loop until the probe itself reports it, failing out
-            // loud if this host never makes a display ready.
-            drive(
-                Instant::now() + Duration::from_secs(10),
-                &|| {
-                    let probes = probes(&self.host());
-                    !probes.is_empty() && probes.iter().all(|d| unsafe { d.isReadyForDisplay() })
-                },
-                &|| "the probe never became ready for display".into(),
-            );
+            // `readyForDisplay` flips on the platform's clock, or not at
+            // all on a host that cannot show the probe — the deadline
+            // reads that absence as `false`, never as a failure.
+            let ready = drive_until(Instant::now() + Duration::from_secs(10), &|| {
+                let probes = probes(&self.host());
+                !probes.is_empty() && probes.iter().all(|d| unsafe { d.isReadyForDisplay() })
+            });
+            if !ready {
+                return false;
+            }
             self.woke.store(false, Ordering::Relaxed);
             // The notification's bounce re-reads the flag on main and
             // wakes the loop — post-attach, that is the only wake still
@@ -722,16 +733,13 @@ mod macos {
                 self.engine.render(FrameTime::now()).expect("rendered");
                 drain_main();
             }
-            drain_main();
+            assert!(
+                !displays(&self.root()).is_empty(),
+                "the platform reported the probe ready but the plan \
+                rejected an eligible candidate"
+            );
             settle(&self.host());
-            let available = !displays(&self.root()).is_empty();
-            if !available {
-                assert!(
-                    displays(&self.root()).is_empty(),
-                    "an unavailable display layer must not be promoted"
-                );
-            }
-            available
+            true
         }
     }
 
@@ -800,13 +808,26 @@ mod macos {
     fn the_realized_tree_puts_the_plane_between_its_parts() {
         let fixture = Fixture::new();
         let buffer = bgra_buffer();
-        let _scene = scene_bar(
+        let offscreen = fixture
+            .engine
+            .surface(Offscreen::new(SIZE, OffscreenFormat::LinearF16))
+            .expect("offscreen");
+        let _engine_scene = scene_bar(
+            &fixture.engine,
+            &offscreen,
+            bgra(&fixture.metal, &buffer, FrameColor::SRGB),
+            1.0,
+        );
+        let _window_scene = scene_bar(
             &fixture.engine,
             &fixture.window,
             bgra(&fixture.metal, &buffer, FrameColor::SRGB),
             1.0,
         );
         if !fixture.promote() {
+            // The platform never reported the probe ready: the window
+            // then shows the engine's own composition, still verified.
+            engine_parity(&fixture, &offscreen, "engine-composited frame");
             return;
         }
 
@@ -854,13 +875,26 @@ mod macos {
     fn a_promoted_frame_shows_its_own_surface_and_declared_colour() {
         let fixture = Fixture::new();
         let buffer = bgra_buffer();
-        let _scene = scene_bar(
+        let offscreen = fixture
+            .engine
+            .surface(Offscreen::new(SIZE, OffscreenFormat::LinearF16))
+            .expect("offscreen");
+        let _engine_scene = scene_bar(
+            &fixture.engine,
+            &offscreen,
+            bgra(&fixture.metal, &buffer, FrameColor::SRGB),
+            1.0,
+        );
+        let _window_scene = scene_bar(
             &fixture.engine,
             &fixture.window,
             bgra(&fixture.metal, &buffer, FrameColor::SRGB),
             1.0,
         );
         if !fixture.promote() {
+            // The platform never reported the probe ready: the window
+            // then shows the engine's own composition, still verified.
+            engine_parity(&fixture, &offscreen, "engine-composited frame");
             return;
         }
         let _ = fixture.system.composite();
@@ -999,7 +1033,17 @@ mod macos {
         let straight = Fixture::new();
         stays_in_the_engine(&straight, bgra(&straight, RgbAlpha::Straight));
         let opaque = Fixture::new();
-        let _scene = scene_bar(
+        let offscreen = opaque
+            .engine
+            .surface(Offscreen::new(SIZE, OffscreenFormat::LinearF16))
+            .expect("offscreen");
+        let _engine_scene = scene_bar(
+            &opaque.engine,
+            &offscreen,
+            bgra(&opaque, RgbAlpha::Opaque),
+            1.0,
+        );
+        let _window_scene = scene_bar(
             &opaque.engine,
             &opaque.window,
             bgra(&opaque, RgbAlpha::Opaque),
@@ -1007,6 +1051,10 @@ mod macos {
         );
         if opaque.promote() {
             assert_eq!(displays(&opaque.root()).len(), 1, "promoted");
+        } else {
+            // The platform never reported the probe ready: the window
+            // then shows the engine's own composition, still verified.
+            engine_parity(&opaque, &offscreen, "engine-composited opaque frame");
         }
     }
 
@@ -1056,10 +1104,11 @@ mod macos {
             .expect("offscreen");
         let _engine_scene = scene_bar(&fixture.engine, &offscreen, bgra(&fixture.metal), 1.0);
         let _window_scene = scene_bar(&fixture.engine, &fixture.window, bgra(&fixture.metal), 1.0);
-        if !fixture.promote() {
-            return;
+        if fixture.promote() {
+            assert_eq!(displays(&fixture.root()).len(), 1, "promoted");
         }
-        assert_eq!(displays(&fixture.root()).len(), 1, "promoted");
+        // The parity holds either way: a host that never reports the
+        // probe ready shows the engine's own composition in the window.
         let engine = offscreen.readback().expect("engine composition");
         let system = fixture.system.composite();
         let image = |pixels: Vec<[f32; 4]>| cherenkov_oracle::F32Image {

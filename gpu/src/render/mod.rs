@@ -2449,7 +2449,11 @@ impl Renderer for GpuRenderer {
             }
             GpuTarget::Window(window) => {
                 let refresh = window.refresh.clone();
-                (self.open_window(id, window, size), None, refresh, true)
+                #[cfg(target_vendor = "apple")]
+                let surface = self.open_window(id, window, size);
+                #[cfg(not(target_vendor = "apple"))]
+                let surface = self.open_window(id, window, size)?;
+                (surface, None, refresh, true)
             }
         };
         let promotes = self.planes.contains_key(&id);

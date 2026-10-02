@@ -22,7 +22,7 @@
 use kurbo::{Affine, Rect, Vec2};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use cherenkov::{BlendMode, Display, LayerId, RenderError, ShapeData, SurfaceTree};
+use cherenkov::{BlendMode, Display, LayerId, RenderError, ShapeData, SurfaceError, SurfaceTree};
 
 use crate::interop::ExternalFrame;
 use crate::render::lower::axis_aligned;
@@ -184,11 +184,23 @@ pub struct Plan {
 }
 
 impl Plan {
-    /// The number of engine parts: one below each plane, plus the trailing
-    /// part.
+    /// The promoted layers a new engine part opens after: every plane but
+    /// the last, which opens one only when `trailing` content follows it.
+    /// Lowering emits a `Part` pass for each of these and no more, and
+    /// `parts()` counts this same boundary set.
+    pub fn opens_part(&self) -> impl Iterator<Item = LayerId> + '_ {
+        let last_needs_none = usize::from(!self.trailing);
+        self.planes
+            .iter()
+            .take(self.planes.len().saturating_sub(last_needs_none))
+            .map(|p| p.layer)
+    }
+
+    /// The number of engine parts: part 0 plus one opened after each
+    /// plane [`opens_part`](Self::opens_part) reports.
     #[must_use]
     pub fn parts(&self) -> usize {
-        self.planes.len() + usize::from(self.trailing || self.planes.is_empty())
+        self.opens_part().count() + 1
     }
 }
 
@@ -830,7 +842,15 @@ pub trait SystemPlanes: Compositor {
 
     /// A display move or a scale change re-runs every part's output
     /// negotiation — each part's [`WindowSurface::reselect`].
-    fn reselect(&mut self, adapter: &wgpu::Adapter, device: &wgpu::Device);
+    ///
+    /// # Errors
+    /// A part's [`WindowSurface::reselect`] error: the surface no longer
+    /// advertises what the host's request needs.
+    fn reselect(
+        &mut self,
+        adapter: &wgpu::Adapter,
+        device: &wgpu::Device,
+    ) -> Result<(), SurfaceError>;
 }
 
 #[cfg(target_vendor = "apple")]
@@ -877,7 +897,7 @@ impl SystemPlanes for NoPlanes {
     fn resize(&mut self, _: (u32, u32)) {
         unreachable!("no `NoPlanes` value exists")
     }
-    fn reselect(&mut self, _: &wgpu::Adapter, _: &wgpu::Device) {
+    fn reselect(&mut self, _: &wgpu::Adapter, _: &wgpu::Device) -> Result<(), SurfaceError> {
         unreachable!("no `NoPlanes` value exists")
     }
 }

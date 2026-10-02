@@ -2,7 +2,7 @@
 
 #![cfg(not(target_arch = "wasm32"))]
 use std::sync::{
-    Arc,
+    Arc, Barrier,
     atomic::{AtomicUsize, Ordering},
     mpsc,
 };
@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 
 use cherenkov::kurbo::Rect;
 use cherenkov::{
-    BlendMode, Draw, Engine, FrameTime, Group, Next, Offscreen, OffscreenFormat, WorkingColor,
+    BlendMode, Draw, Engine, FrameTime, Group, Next, Offscreen, OffscreenFormat, Visibility,
+    WorkingColor,
 };
 use cherenkov_cpu::{BandPixels, Bands, Raster, RasterConfig, RedrawCallback};
 use filtrate::{
@@ -477,6 +478,127 @@ fn animated_parameters_rerender_and_request_frames() {
     );
     let settled = surface.readback().expect("settled readback").pixels[2 * 4 + 2];
     assert!((settled[0] - 0.9).abs() < 1.0e-6);
+}
+
+/// A filter parameter whose watcher installation parks the render thread:
+/// it meets the test at `parked`, then waits at `release`, so a message
+/// queued in between is not applied until the test releases it.
+struct ParkingParam {
+    parked: Arc<Barrier>,
+    release: Arc<Barrier>,
+}
+
+impl FilterParam for ParkingParam {
+    fn snapshot(&self) -> f32 {
+        0.0
+    }
+
+    fn watch_animated(&self, _callback: AnimatedCallback) -> WatchGuard {
+        self.parked.wait();
+        self.release.wait();
+        WatchGuard::new(())
+    }
+}
+
+/// A hidden surface's filters wake no host and ask for no frame. The wakes
+/// stop the moment the host hides the surface, before the render thread
+/// has applied the change; showing the surface draws the parameter's
+/// latest value, and the filter wakes the host again (#204).
+#[test]
+fn hidden_surface_filters_wake_nothing_and_ask_no_frame() {
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let wake_count = Arc::clone(&wakes);
+    let engine = Engine::<Raster>::new(RasterConfig {
+        redraw: Some(RedrawCallback::new(move || {
+            wake_count.fetch_add(1, Ordering::Relaxed);
+        })),
+        ..RasterConfig::default()
+    })
+    .expect("engine");
+    let hidden = engine
+        .surface(Offscreen::new((4, 4), OffscreenFormat::LinearF32))
+        .expect("surface");
+    let visible = engine
+        .surface(Offscreen::new((4, 4), OffscreenFormat::LinearF32))
+        .expect("other surface");
+    let (parameter, installed) = ScriptedParam::new(0.0);
+    let mut callback = None;
+    let filter = engine.filter(filters::Brightness(parameter));
+    let fill = |r: &mut cherenkov::Recorder| {
+        r.fill(
+            Rect::new(0.0, 0.0, 4.0, 4.0),
+            WorkingColor::new([0.1, 0.1, 0.1, 1.0]),
+        );
+    };
+    hidden.update(|tx| {
+        tx[hidden.root()]
+            .filter(&filter)
+            .content(hidden.record(fill));
+    });
+    visible.update(|tx| {
+        tx[visible.root()].content(visible.record(fill));
+    });
+    let start = Instant::now();
+    assert_eq!(
+        engine.render(FrameTime::at(start)).expect("initial frame"),
+        Next::Idle
+    );
+
+    let parked = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let _parking = engine.filter(filters::Brightness(ParkingParam {
+        parked: Arc::clone(&parked),
+        release: Arc::clone(&release),
+    }));
+    parked.wait();
+    hidden.visibility(Visibility::Hidden).expect("hide");
+    fire(&installed, &mut callback, 0.2, None);
+    let woke = wakes.load(Ordering::Relaxed);
+    // Released before asserting, so a failure does not leave the render
+    // thread parked under the engine's drop.
+    release.wait();
+    assert_eq!(
+        woke, 0,
+        "a hidden surface's filter woke the host before the render thread applied the hide"
+    );
+    fire(
+        &installed,
+        &mut callback,
+        0.8,
+        Some(Box::new(LinearRamp(Duration::from_millis(100)))),
+    );
+    assert_eq!(
+        wakes.load(Ordering::Relaxed),
+        0,
+        "a hidden surface's filter woke the host"
+    );
+    assert_eq!(
+        engine
+            .render(FrameTime::at(start + Duration::from_millis(10)))
+            .expect("visible frame"),
+        Next::Idle,
+        "a hidden surface's animating filter asks for no frame"
+    );
+
+    hidden.visibility(Visibility::Visible).expect("show");
+    assert_eq!(
+        engine
+            .render(FrameTime::at(start + Duration::from_millis(500)))
+            .expect("shown frame"),
+        Next::Idle,
+        "the filter's animation is sampled at the frame time, past its end"
+    );
+    let shown = hidden.readback().expect("shown readback").pixels[2 * 4 + 2];
+    assert!(
+        (shown[0] - 0.9).abs() < 1.0e-6,
+        "the shown frame draws the parameter's latest value: {shown:?}"
+    );
+    fire(&installed, &mut callback, 0.4, None);
+    assert_eq!(
+        wakes.load(Ordering::Relaxed),
+        1,
+        "a shown surface's filter wakes the host again"
+    );
 }
 
 struct GpuOnlyImage;

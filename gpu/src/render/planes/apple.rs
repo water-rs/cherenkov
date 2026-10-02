@@ -93,7 +93,7 @@ use crate::interop::{
     ChromaOffset, ExternalFrame, FramePlanes, FrameSync, Primaries, RgbAlpha, Transfer, YuvMatrix,
     YuvRange,
 };
-use crate::render::present::WindowSurface;
+use crate::render::present::{OutputRequest, WindowSurface};
 
 /// Main-thread storage with asynchronous destruction. Every reference, including
 /// the last one, is released on main; `MainThreadBound::drop` can never dispatch
@@ -302,7 +302,7 @@ struct ReadinessIvars {
     scene: Weak<MainThreadBound<RefCell<LayerScene>>>,
     layer: LayerId,
     ready: Weak<AtomicBool>,
-    waker: Option<cherenkov::CompletionWaker>,
+    waker: cherenkov::CompletionWaker,
 }
 
 objc2::define_class!(
@@ -336,9 +336,7 @@ objc2::define_class!(
                 if let Some(flag) = ready.upgrade() {
                     flag.store(is_ready, Ordering::Release);
                 }
-                if let Some(waker) = &waker {
-                    waker.wake();
-                }
+                waker.wake();
             });
         }
     }
@@ -351,7 +349,7 @@ impl ReadinessObserver {
         scene: &MainOwned<LayerScene>,
         layer: LayerId,
         ready: Weak<AtomicBool>,
-        waker: Option<cherenkov::CompletionWaker>,
+        waker: cherenkov::CompletionWaker,
     ) -> Retained<Self> {
         let this = Self::alloc().set_ivars(ReadinessIvars {
             scene: scene.downgrade(),
@@ -370,8 +368,7 @@ struct Configuration {
     adapter: wgpu::Adapter,
     device: wgpu::Device,
     size: (u32, u32),
-    transparent: bool,
-    required: Option<wgpu::SurfaceColorSpace>,
+    output: OutputRequest,
 }
 
 /// The reply's stamp is the config generation the request was issued
@@ -392,7 +389,7 @@ pub struct LayerPlanes {
     candidates: FxHashMap<LayerId, Arc<AtomicBool>>,
     offered: FxHashSet<LayerId>,
     woke: bool,
-    waker: Option<cherenkov::CompletionWaker>,
+    waker: cherenkov::CompletionWaker,
 }
 
 /// An origin-anchored layer: its position is its superlayer point for its
@@ -785,8 +782,11 @@ impl LayerScene {
                 &config.device,
                 &layer,
                 config.size,
-                config.transparent || !self.parts.is_empty(),
-                config.required,
+                // Parts above the first composite over it.
+                OutputRequest {
+                    transparent: config.output.transparent || !self.parts.is_empty(),
+                    ..config.output
+                },
                 probe.take(),
             )?;
             self.parts.push(layer);
@@ -819,7 +819,7 @@ impl LayerScene {
         layer: LayerId,
         scene: &MainOwned<Self>,
         ready: Weak<AtomicBool>,
-        waker: Option<cherenkov::CompletionWaker>,
+        waker: cherenkov::CompletionWaker,
     ) {
         // SAFETY: creation and every subsequent use are on main.
         let display = unsafe { AVSampleBufferDisplayLayer::new() };
@@ -1011,7 +1011,8 @@ impl LayerPlanes {
     /// Surface negotiation errors are delivered by the completion to compose.
     #[expect(
         clippy::too_many_arguments,
-        reason = "the existing surface negotiation inputs"
+        reason = "the surface negotiation inputs: device triple, parent layer, size, \
+                  output request, probe channel and the completion waker"
     )]
     pub fn new(
         instance: &wgpu::Instance,
@@ -1019,10 +1020,9 @@ impl LayerPlanes {
         device: &wgpu::Device,
         parent: Parent,
         size: (u32, u32),
-        transparent: bool,
-        required: Option<wgpu::SurfaceColorSpace>,
+        output: OutputRequest,
         probe: Option<mpsc::Sender<crate::render::present::DisplayProbe>>,
-        waker: Option<cherenkov::CompletionWaker>,
+        waker: cherenkov::CompletionWaker,
     ) -> Self {
         let mut result = Self {
             scene: parent.scene,
@@ -1031,8 +1031,7 @@ impl LayerPlanes {
                 adapter: adapter.clone(),
                 device: device.clone(),
                 size,
-                transparent,
-                required,
+                output,
             },
             config_generation: 0,
             parts: Vec::new(),
@@ -1069,9 +1068,7 @@ impl LayerPlanes {
                 scene.root.removeFromSuperlayer();
                 return;
             }
-            if let Some(waker) = waker {
-                waker.wake();
-            }
+            waker.wake();
         });
     }
 
@@ -1087,7 +1084,8 @@ impl LayerPlanes {
                         // configure the arriving parts to the config now
                         // current, not the one the request captured.
                         for part in &mut parts {
-                            part.reselect(&self.config.adapter, &self.config.device);
+                            part.reselect(&self.config.adapter, &self.config.device)
+                                .map_err(|error| RenderError::Render(error.to_string()))?;
                             part.resize(&self.config.device, self.config.size);
                         }
                     }
@@ -1251,9 +1249,7 @@ impl SystemPlanes for LayerPlanes {
                     // still be false — readiness lands through the
                     // layer's own notification — but the queued work
                     // is done.
-                    if let Some(waker) = waker {
-                        waker.wake();
-                    }
+                    waker.wake();
                 }
             });
             slot.insert(ready);
@@ -1314,13 +1310,18 @@ impl SystemPlanes for LayerPlanes {
         }
     }
 
-    fn reselect(&mut self, adapter: &wgpu::Adapter, device: &wgpu::Device) {
+    fn reselect(
+        &mut self,
+        adapter: &wgpu::Adapter,
+        device: &wgpu::Device,
+    ) -> Result<(), SurfaceError> {
         self.config.adapter = adapter.clone();
         self.config.device = device.clone();
         self.config_generation += 1;
         for part in &mut self.parts {
-            part.reselect(adapter, device);
+            part.reselect(adapter, device)?;
         }
+        Ok(())
     }
 }
 

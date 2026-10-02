@@ -16,23 +16,24 @@ use std::sync::Arc;
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::mpsc::SyncSender as Sender;
 
-use kurbo::{Affine, Vec2};
+use kurbo::{Affine, Size, Vec2};
 use nami_core::watcher::Context;
 use rustc_hash::FxHashMap;
 
 use crate::animation::Animation;
-use crate::backend::{Backend, Display, SurfaceInfo};
+use crate::backend::{Backend, Display, SurfaceInfo, Visibility};
 use crate::capability::{
     Backdrop, BackdropChain, BackdropRuns, ExternalFrames, GpuContent, ProjectiveLayers,
 };
-use crate::engine::Waker;
+use crate::engine::SurfaceWaker;
 use crate::error::{RenderError, SurfaceError};
 use crate::frame::Readback;
 use crate::message::{
     BackdropId, ChangeSet, ContentOp, LayerId, LayerOp, Message, Op, Prop, SurfaceId,
 };
-use crate::record::{Content, ContentSpare, Live};
+use crate::record::{Content, ContentSpare, Live, LiveOwner};
 use crate::shape::{Shape, ShapeData};
+use crate::size::LayoutSize;
 use crate::style::{BlendMode, FilterId};
 use crate::{ContentChange, Picture, WorkingColor};
 
@@ -52,13 +53,16 @@ enum PropKind {
     Opacity,
     ScrollOffset,
     Clip,
+    LayoutSize,
 }
 
 /// State shared between a [`Surface`], its [`Layer`] handles and the
 /// engine.
 ///
-/// Everything here is queued, not sent: [`Engine::render`](crate::Engine::render)
-/// drains `pending` into the single per-frame [`Message::Render`].
+/// While the surface is visible everything here is queued, not sent:
+/// [`Engine::render`](crate::Engine::render) drains `pending` into the
+/// single per-frame [`Message::Render`]. While it is hidden every change is
+/// sent as it is made, in a [`Message::Apply`].
 pub struct Shared<B: Backend> {
     /// The surface's identifier on the render thread.
     pub id: SurfaceId,
@@ -74,6 +78,8 @@ pub struct Shared<B: Backend> {
     edit_ops: Vec<Vec<EditOp<B>>>,
     /// Content and reusable storage per layer.
     contents: FxHashMap<LayerId, ContentSlot>,
+    /// Each layer's layout size, created when first set or recorded for.
+    sizes: FxHashMap<LayerId, LayoutSize>,
     /// Pending clear colour.
     clear: Option<WorkingColor>,
     /// Layer id allocator (0 is the root).
@@ -84,8 +90,12 @@ pub struct Shared<B: Backend> {
     /// property replaces its previous subscription; dropping a layer drops
     /// them all.
     bindings: FxHashMap<(u64, PropKind), Box<dyn Any>>,
-    /// The engine wake-up, fired when an op is queued outside a frame.
-    waker: Arc<Waker>,
+    /// The surface's host wake-up, fired when an op is queued outside a
+    /// frame; silent while the surface is hidden.
+    waker: Arc<SurfaceWaker>,
+    /// The render loop, which a hidden surface's changes are sent to as
+    /// they are made.
+    tx: Sender<Message<B>>,
     /// The last display properties announced to the render thread.
     display: Cell<Display>,
     /// Set by installed contents' `LiveState`s the moment an animated
@@ -110,7 +120,7 @@ impl<B: Backend> std::fmt::Debug for Shared<B> {
 }
 
 impl<B: Backend> Shared<B> {
-    fn new(id: SurfaceId, waker: Arc<Waker>) -> Self {
+    fn new(id: SurfaceId, waker: Arc<SurfaceWaker>, tx: Sender<Message<B>>) -> Self {
         Self {
             id,
             pending: Vec::new(),
@@ -119,34 +129,86 @@ impl<B: Backend> Shared<B> {
             edit_buffer: Vec::new(),
             edit_ops: Vec::new(),
             contents: FxHashMap::default(),
+            sizes: FxHashMap::default(),
             clear: None,
             next_layer: Cell::new(1),
             next_backdrop: Cell::new(1),
             bindings: FxHashMap::default(),
             waker,
+            tx,
             display: Cell::new(Display::default()),
             animated: Rc::new(Cell::new(false)),
         }
     }
 
-    /// Queues an op and pokes the waker.
+    /// `layer`'s layout size.
+    fn layout_size(&mut self, layer: LayerId) -> LayoutSize {
+        self.sizes
+            .entry(layer)
+            .or_insert_with(LayoutSize::new)
+            .clone()
+    }
+
+    /// Queues an op outside a frame.
     fn push(&mut self, op: Op<B>) {
         self.pending.push(op);
-        self.waker.wake();
+        self.queued();
+    }
+
+    /// Something was queued outside a frame. A visible surface wakes the
+    /// host for the frame that applies it; a hidden one sends it to the
+    /// render loop at once.
+    fn queued(&mut self) {
+        match self.visibility() {
+            Visibility::Visible => self.waker.wake(),
+            Visibility::Hidden => self.apply_hidden(),
+        }
+    }
+
+    /// Sends everything queued to the render loop, which applies it without
+    /// sampling or drawing the surface. A hidden surface's changes are so
+    /// applied as they are made, in order with every message sent after
+    /// them: a resource release sees the content they install, and nothing
+    /// accumulates while the surface stays hidden. Animations are not
+    /// sampled; a content's animated operands wait for the frame that
+    /// shows the surface.
+    fn apply_hidden(&mut self) {
+        if let Some(changes) = self.drain(None) {
+            // A lost render thread fails the host's next render; there is
+            // nothing left to apply the change to.
+            let _ = self.tx.send(Message::Apply {
+                id: self.id,
+                changes,
+            });
+        }
+    }
+
+    /// The visibility the host last announced. A hidden surface's changes
+    /// are applied as they are made, and it is not sampled.
+    pub(crate) fn visibility(&self) -> Visibility {
+        self.waker.visibility()
     }
 
     /// Samples running operand animations at `time`, then drains pending
     /// ops and live content changes into a change set. Returns `None` when
     /// nothing changed.
     pub fn take_changes(&mut self, time: crate::Instant) -> Option<ChangeSet<B>> {
+        self.drain(Some(time))
+    }
+
+    /// Drains pending ops and live content changes into a change set,
+    /// sampling running operand animations first when a frame `time` is
+    /// given. Returns `None` when nothing changed.
+    fn drain(&mut self, time: Option<crate::Instant>) -> Option<ChangeSet<B>> {
         let mut ops = std::mem::take(&mut self.spare_ops);
         let recycled = std::mem::take(&mut self.spare_recycled);
         ops.append(&mut self.pending);
         let mut animating = false;
         // `animated` is poked by a content's `LiveState` the moment an
         // animated operand arrives, so a surface that never saw one
-        // skips the per-content sampling probes entirely.
-        let sampling = self.animated.get();
+        // skips the per-content sampling probes entirely. Without a frame
+        // time nothing is sampled, and the flag stays as it is.
+        let sampling = time.filter(|_| self.animated.get());
         for (id, slot) in &mut self.contents {
             let Some(content) = slot.content.as_mut() else {
                 continue;
@@ -154,7 +216,10 @@ impl<B: Backend> Shared<B> {
             // The sample queues the operands' per-frame values, so
             // `take_change` emits them like signal updates. The cell read
             // keeps a static content at a field probe, not a call.
-            if sampling && content.live.needs_sample.get() && content.sample(time) {
+            if let Some(time) = sampling
+                && content.live.needs_sample.get()
+                && content.sample(time)
+            {
                 animating = true;
             }
             if let Some(change) = content.take_change() {
@@ -168,7 +233,7 @@ impl<B: Backend> Shared<B> {
             }
         }
         let clear = self.clear.take();
-        if sampling && !animating {
+        if sampling.is_some() && !animating {
             // Nothing sampled this pass: the flag stays down until an
             // `animate` pokes it up again.
             self.animated.set(false);
@@ -210,16 +275,13 @@ impl<B: Backend> Shared<B> {
         F: Fn(LayerId, T, Option<Animation>) -> LayerOp + 'static,
     {
         let weak = Rc::downgrade(shared);
-        let waker = Arc::clone(&shared.borrow().waker);
         let guard = subscribe.start(crate::record::Watch::binding(move |context: Context<T>| {
             let animation = context.metadata().try_get::<Animation>();
             let target = context.into_value();
             if let Some(shared) = weak.upgrade() {
                 shared
                     .borrow_mut()
-                    .pending
                     .push(Op::Layer(op(layer, target, animation)));
-                waker.wake();
             }
         }));
         let mut shared_mut = shared.borrow_mut();
@@ -246,6 +308,12 @@ pub trait LayerOwner {
     fn remove(&self, id: LayerId);
 }
 
+impl<B: Backend> LiveOwner for RefCell<Shared<B>> {
+    fn changed(&self) {
+        self.borrow_mut().queued();
+    }
+}
+
 impl<B: Backend> LayerOwner for RefCell<Shared<B>> {
     fn allocate(&self) -> LayerId {
         let mut shared = self.borrow_mut();
@@ -259,6 +327,7 @@ impl<B: Backend> LayerOwner for RefCell<Shared<B>> {
         let mut shared = self.borrow_mut();
         shared.bindings.retain(|(layer, _), _| *layer != id.raw());
         shared.contents.remove(&id);
+        shared.sizes.remove(&id);
         shared.push(Op::Layer(LayerOp::Remove(id)));
     }
 }
@@ -758,14 +827,53 @@ impl<B: Backend> LayerEdit<B> {
     }
 
     /// Records content, reusing picture storage returned by the render thread.
+    /// The recording reads this layer's [`layout_size`](Self::layout_size).
     pub fn record(&mut self, body: impl FnOnce(&mut crate::Recorder)) -> &mut Self {
-        let spare = {
+        let (spare, size) = {
             let mut shared = self.shared.borrow_mut();
-            std::mem::take(&mut shared.contents.entry(self.layer).or_default().spare)
+            let spare = std::mem::take(&mut shared.contents.entry(self.layer).or_default().spare);
+            (spare, shared.layout_size(self.layer))
         };
         self.ops.push(EditOp::Content(LayerContent::Content(
-            Content::record_reusing(spare, body),
+            Content::record_reusing(spare, size, body),
         )));
+        self
+    }
+
+    /// Sets the size the host lays the layer out at: a constant, or a
+    /// signal (the host's layout result) that keeps it updated with no
+    /// further transactions. Recordings for the layer read it as the
+    /// [`LayoutSize`] signal [`Recorder::layout_size`](crate::Recorder::layout_size)
+    /// returns, so geometry bound to it follows a resize without
+    /// re-recording.
+    ///
+    /// The size changes when this is called, so a recording later in the
+    /// same transaction already reads it. Recorded operands that depend on
+    /// it animate under the transaction's animation
+    /// ([`Surface::update_animated`]) or a bound change's `Animation`
+    /// metadata, like any animated operand; it is not a render-thread
+    /// property, so [`animation`](Self::animation) does not apply to it.
+    pub fn layout_size(&mut self, size: impl Into<Live<Size>>) -> &mut Self {
+        let live = size.into();
+        let target = self.shared.borrow_mut().layout_size(self.layer);
+        target.set(&LayoutSize::change(live.value, self.default_animation));
+        let guard = live
+            .subscribe
+            .start(crate::record::Watch::binding(move |change| {
+                target.set(&change);
+            }));
+        let key = (self.layer.raw(), PropKind::LayoutSize);
+        {
+            let mut shared = self.shared.borrow_mut();
+            match guard {
+                Some(guard) => {
+                    shared.bindings.insert(key, guard);
+                }
+                None => {
+                    shared.bindings.remove(&key);
+                }
+            }
+        }
         self
     }
 
@@ -908,13 +1016,14 @@ impl<B: Backend> std::fmt::Debug for Surface<B> {
 
 impl<B: Backend> Surface<B> {
     /// Builds the UI-thread handle once `CreateSurface` succeeded.
+    #[must_use]
     pub fn new(
         id: SurfaceId,
         info: SurfaceInfo,
         tx: Sender<Message<B>>,
-        waker: Arc<Waker>,
+        waker: Arc<SurfaceWaker>,
     ) -> Self {
-        let shared = Rc::new(RefCell::new(Shared::new(id, waker)));
+        let shared = Rc::new(RefCell::new(Shared::new(id, waker, tx.clone())));
         let owner: Rc<dyn LayerOwner> = Rc::clone(&shared) as Rc<dyn LayerOwner>;
         Self {
             shared,
@@ -1016,22 +1125,95 @@ impl<B: Backend> Surface<B> {
             .map_err(|_| SurfaceError::Lost)
     }
 
+    /// Announces whether the user can see the surface, from the platform's
+    /// visibility signal (window occlusion or minimization, the app moving
+    /// to the background, the view leaving its window, the document's
+    /// visibility state). Surfaces start [`Visible`](Visibility::Visible);
+    /// announcing the current visibility again does nothing.
+    ///
+    /// While the surface is hidden:
+    /// - Nothing on it asks for a frame. Animation tracks, live operands,
+    ///   bound signals, transactions, image replacements it draws, custom
+    ///   GPU content, filters and external-frame installs wake no host,
+    ///   and [`Engine::render`](crate::Engine::render) neither samples nor
+    ///   draws it, nor counts it in its [`Next`](crate::Next).
+    /// - Its changes are still accepted and applied. Transactions, layer
+    ///   creates and drops, bound signals and live operands are sent to the
+    ///   render thread as they are made, which applies them without
+    ///   sampling or drawing the surface — the changes queued before the
+    ///   surface hid included. Content installed while hidden therefore
+    ///   counts for resource releases like any other installed content,
+    ///   and nothing accumulates on the UI thread however long the surface
+    ///   stays hidden.
+    /// - A host renders only while a surface is visible: rendering while
+    ///   every surface of the engine is hidden fails with
+    ///   [`RenderError::Hidden`].
+    ///
+    /// Becoming visible asks the host for exactly one frame, even if it
+    /// dropped a frame it had been asked for while the surface was hidden.
+    /// That frame redraws the surface whole from its current state and
+    /// presents it. It samples every animation at its own time, so a track
+    /// that ran on while the surface was hidden shows where it is now, with
+    /// no replay of the frames it missed; a track committed while it was
+    /// hidden starts on that frame, like any other.
+    ///
+    /// Every wake on the surface's behalf stops the moment this returns,
+    /// whichever thread it starts on: the surface's own, and those of the
+    /// backend's producers and filters, which read the announced
+    /// visibility when they fire rather than waiting for the render thread
+    /// to apply the change.
+    ///
+    /// # Errors
+    /// [`SurfaceError::Lost`] when the render thread is gone.
+    pub fn visibility(&self, visibility: Visibility) -> Result<(), SurfaceError> {
+        let waker = Arc::clone(&self.shared.borrow().waker);
+        if waker.visibility() == visibility {
+            return Ok(());
+        }
+        let message = Message::Visibility {
+            id: self.id,
+            visibility,
+        };
+        match visibility {
+            Visibility::Hidden => {
+                waker.hide();
+                self.tx.send(message).map_err(|_| SurfaceError::Lost)?;
+                // What was queued for the next frame is applied now, like
+                // every later change.
+                self.shared.borrow_mut().apply_hidden();
+            }
+            Visibility::Visible => {
+                // The render loop learns first, so the frame the wake asks
+                // for lists the surface.
+                self.tx.send(message).map_err(|_| SurfaceError::Lost)?;
+                waker.show();
+            }
+        }
+        Ok(())
+    }
+
     /// The clear colour, queued into the pending change set. Defaults to
     /// transparent.
     pub fn clear_color(&self, color: WorkingColor) {
         let mut shared = self.shared.borrow_mut();
         shared.clear = Some(color);
-        shared.waker.wake();
+        shared.queued();
     }
 
-    /// Records live content for this surface.
+    /// Records live content for this surface. The recording reads the root
+    /// layer's [`layout_size`](LayerEdit::layout_size); content for another
+    /// layer that reads its size is recorded with
+    /// [`LayerEdit::record`].
     #[must_use]
     pub fn record(&self, body: impl FnOnce(&mut crate::Recorder)) -> Content {
-        Content::record(body)
+        let size = self.shared.borrow_mut().layout_size(self.root.id);
+        Content::record(size, body)
     }
 
     /// Queues a transaction's edits into the surface's change set. Nothing
     /// is sent; [`Engine::render`](crate::Engine::render) drains the queue.
+    /// A hidden surface sends the edits at once instead (see
+    /// [`Surface::visibility`]).
     ///
     /// # Panics
     /// Panics if `body` panics; the transaction is then dropped unapplied.
@@ -1079,7 +1261,7 @@ impl<B: Backend> Surface<B> {
         let pending = std::mem::take(&mut shared.pending);
         let mut ops = pending;
         // Cloned once per transaction: installed contents attach the
-        // sampling flag to their `LiveState`s.
+        // surface and its sampling flag to their `LiveState`s.
         let animated = Rc::clone(&shared.animated);
         for (id, edit) in &mut tx.edits {
             for op in edit.ops.drain(..) {
@@ -1120,13 +1302,13 @@ impl<B: Backend> Surface<B> {
                     EditOp::Content(LayerContent::Content(content)) => {
                         // A fresh `Content` replaces the previous one whole
                         // (its first `take_change` is a `Replace`).
-                        let waker = Arc::clone(&shared.waker);
                         let slot = shared.contents.entry(*id).or_default();
                         if let Some(previous) = slot.content.replace(content) {
                             slot.spare.live = previous.retire().live;
                         }
                         let stored = slot.content.as_mut().expect("just inserted");
-                        stored.attach_waker(&waker, &animated);
+                        let owner: Rc<dyn LiveOwner> = Rc::clone(&self.shared) as Rc<dyn LiveOwner>;
+                        stored.attach_owner(Rc::downgrade(&owner), &animated);
                         if let Some(change) = stored.take_change() {
                             let content_op = match change {
                                 ContentChange::Replace(list) => ContentOp::Replace(list),
@@ -1187,7 +1369,7 @@ impl<B: Backend> Surface<B> {
         }
         shared.edit_buffer = tx.edits;
         shared.edit_ops = tx.edit_ops;
-        shared.waker.wake();
+        shared.queued();
     }
 
     /// The pixels of the surface after the last
@@ -1289,9 +1471,18 @@ impl<B: Backdrop> Surface<B> {
 mod tests {
     use std::collections::HashSet;
     use std::sync::mpsc;
+    use std::time::Duration;
 
+    use kurbo::{Rect, Size};
+    use nami::{SignalExt, binding};
+    use nami_core::Signal;
+
+    use crate::message::{ContentOp, LayerOp, Op};
     use crate::testing::{Null, NullConfig};
-    use crate::{Engine, FrameTime, Offscreen, OffscreenFormat};
+    use crate::{
+        Command, Curve, Draw, Engine, FrameTime, Offscreen, OffscreenFormat, Operand, ShapeData,
+        WorkingColor,
+    };
 
     #[test]
     fn layer_record_reuses_picture_storage_every_other_frame() {
@@ -1332,5 +1523,154 @@ mod tests {
         assert_eq!(pointers[3], pointers[5]);
         assert_eq!(pointers[4], pointers[6]);
         assert_ne!(pointers[0], pointers[1]);
+    }
+
+    /// The fills of `layer`'s content changes in a drained change set:
+    /// whether it was a replacement, and every rectangle it carries.
+    fn content_rects(
+        surface: &crate::Surface<Null>,
+        layer: crate::LayerId,
+        time: crate::Instant,
+    ) -> Vec<(bool, Rect)> {
+        let Some(changes) = surface.shared.borrow_mut().take_changes(time) else {
+            return Vec::new();
+        };
+        let mut rects = Vec::new();
+        for op in changes.ops {
+            match op {
+                Op::Layer(LayerOp::Content(id, Some(ContentOp::Replace(picture))))
+                    if id == layer =>
+                {
+                    for command in picture.display_list().commands() {
+                        if let Command::Fill {
+                            shape: ShapeData::Rect(rect),
+                            ..
+                        } = command
+                        {
+                            rects.push((true, *rect));
+                        }
+                    }
+                }
+                Op::Layer(LayerOp::Content(id, Some(ContentOp::Update(updates))))
+                    if id == layer =>
+                {
+                    for update in updates {
+                        if let Operand::Shape(ShapeData::Rect(rect)) = update.value {
+                            rects.push((false, rect));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        rects
+    }
+
+    fn surface(engine: &Engine<Null>) -> crate::Surface<Null> {
+        engine
+            .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))
+            .expect("surface")
+    }
+
+    fn engine() -> Engine<Null> {
+        let (events, _receiver) = mpsc::channel();
+        Engine::<Null>::new(NullConfig {
+            events,
+            reject: HashSet::new(),
+        })
+        .expect("init")
+    }
+
+    #[test]
+    fn a_layout_size_reaches_bound_geometry_without_rerecording() {
+        let engine = engine();
+        let surface = surface(&engine);
+        let layer = surface.layer();
+        let records = std::cell::Cell::new(0);
+        surface.update(|tx| {
+            tx[surface.root()].push(&layer);
+            tx[&layer].layout_size(Size::new(10.0, 20.0)).record(|c| {
+                records.set(records.get() + 1);
+                let size = c.layout_size();
+                assert_eq!(
+                    size.snapshot(),
+                    Size::new(10.0, 20.0),
+                    "set before recording"
+                );
+                c.fill(size.map(Size::to_rect), WorkingColor::WHITE);
+            });
+        });
+        let now = crate::Instant::now();
+        assert_eq!(
+            content_rects(&surface, layer.id(), now),
+            [(true, Rect::new(0.0, 0.0, 10.0, 20.0))]
+        );
+
+        // A constant resize updates the bound fill in place.
+        surface.update(|tx| {
+            tx[&layer].layout_size(Size::new(30.0, 40.0));
+        });
+        assert_eq!(
+            content_rects(&surface, layer.id(), now),
+            [(false, Rect::new(0.0, 0.0, 30.0, 40.0))]
+        );
+
+        // A bound host signal keeps it updated with no transaction.
+        let host = binding(Size::new(5.0, 6.0));
+        surface.update(|tx| {
+            tx[&layer].layout_size(host.clone());
+        });
+        assert_eq!(
+            content_rects(&surface, layer.id(), now),
+            [(false, Rect::new(0.0, 0.0, 5.0, 6.0))]
+        );
+        host.set(Size::new(7.0, 8.0));
+        assert_eq!(
+            content_rects(&surface, layer.id(), now),
+            [(false, Rect::new(0.0, 0.0, 7.0, 8.0))]
+        );
+
+        // Setting the same size again changes nothing.
+        surface.update(|tx| {
+            tx[&layer].layout_size(Size::new(7.0, 8.0));
+        });
+        assert_eq!(content_rects(&surface, layer.id(), now), Vec::new());
+        assert_eq!(records.get(), 1, "no resize re-recorded the content");
+    }
+
+    #[test]
+    fn an_animated_resize_animates_the_bound_operands() {
+        let engine = engine();
+        let surface = surface(&engine);
+        surface.update(|tx| {
+            tx[surface.root()].layout_size(Size::new(10.0, 10.0));
+        });
+        let content = surface.record(|c| {
+            c.fill(c.layout_size().map(Size::to_rect), WorkingColor::WHITE);
+        });
+        surface.update(|tx| {
+            tx[surface.root()].content(content);
+        });
+        let start = crate::Instant::now();
+        let root = surface.root().id();
+        let _ = content_rects(&surface, root, start);
+
+        surface.update_animated(Curve::linear(Duration::from_millis(400)), |tx| {
+            tx[surface.root()].layout_size(Size::new(30.0, 10.0));
+        });
+        assert_eq!(
+            content_rects(&surface, root, start),
+            [(false, Rect::new(0.0, 0.0, 10.0, 10.0))],
+            "the first sample holds the start"
+        );
+        let mid = content_rects(&surface, root, start + Duration::from_millis(200));
+        let [(false, rect)] = mid.as_slice() else {
+            panic!("a mid-flight update: {mid:?}");
+        };
+        assert!((rect.width() - 20.0).abs() < 0.01, "half-way: {rect:?}");
+        assert_eq!(
+            content_rects(&surface, root, start + Duration::from_millis(400)),
+            [(false, Rect::new(0.0, 0.0, 30.0, 10.0))]
+        );
     }
 }

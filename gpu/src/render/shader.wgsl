@@ -349,7 +349,7 @@ fn paint_mesh(first: u32, count: u32, point: vec2<f32>, smooth_color: bool) -> v
     return vec4<f32>(0.0);
 }
 
-fn paint(i: u32, meta_: vec4<u32>, color: vec4<f32>, local: vec2<f32>, pixel: vec2<f32>) -> vec4<f32> {
+fn paint(i: u32, meta_: vec4<u32>, color: vec4<f32>, local: vec2<f32>, device: vec2<f32>) -> vec4<f32> {
     let kind = meta_.y & 0xffffu;
     var point = local;
     if (meta_.y & 0x10000u) != 0u {
@@ -364,7 +364,7 @@ fn paint(i: u32, meta_: vec4<u32>, color: vec4<f32>, local: vec2<f32>, pixel: ve
         }
         case PAINT_TEXTURE: {
             // `grad.xy` carries the source region's device-space origin.
-            return textureLoad(source, vec2<i32>(floor(pixel - instances[i].grad.xy)), 0);
+            return textureLoad(source, vec2<i32>(floor(device - instances[i].grad.xy)), 0);
         }
         case PAINT_MESH: {
             return paint_mesh(meta_.z, meta_.w & 0x00ffffffu, point, (meta_.y & 0x20000u) != 0u);
@@ -517,7 +517,7 @@ fn fs_simple(in: VsOut, classified: bool) -> vec4<f32> {
     var cov: f32;
     switch in.meta_.x {
         case KIND_GLYPH: {
-            let texel = vec2<i32>(floor(in.pixel - in.cell.xy)) + vec2<i32>(in.cell.zw);
+            let texel = vec2<i32>(floor(in.device - in.cell.xy)) + vec2<i32>(in.cell.zw);
             cov = textureLoad(atlas, texel, 0).r;
         }
         case KIND_SPAN: {
@@ -687,7 +687,7 @@ fn fs_full(in: VsOut) -> vec4<f32> {
             }
         }
         case KIND_GLYPH: {
-            let texel = vec2<i32>(floor(in.pixel - in.cell.xy)) + vec2<i32>(in.cell.zw);
+            let texel = vec2<i32>(floor(in.device - in.cell.xy)) + vec2<i32>(in.cell.zw);
             cov = textureLoad(atlas, texel, 0).r;
         }
         case KIND_SPAN: {
@@ -712,7 +712,7 @@ fn fs_full(in: VsOut) -> vec4<f32> {
     if in.meta_.y == PAINT_TEXTURE {
         let mode = (in.meta_.w >> 16u) & 0xffu;
         let tspace = select(SPACE_LINEAR, SPACE_SRGB, (flags & FLAG_TEX_SRGB) != 0u);
-        let coord = vec2<i32>(floor(in.pixel - instances[i].grad.xy));
+        let coord = vec2<i32>(floor(in.device - instances[i].grad.xy));
         if mode == 0u && (flags & FLAG_BLEND_SRC) == 0u {
             return move_space(read_composite_source(coord), tspace, globals.space) * cov;
         }
@@ -730,7 +730,7 @@ fn fs_full(in: VsOut) -> vec4<f32> {
         // The bound capture stores its own space (FLAG_TEX_SRGB): the
         // effect evaluates on it and the result lands in globals.space.
         let tspace = select(SPACE_LINEAR, SPACE_SRGB, (flags & FLAG_TEX_SRGB) != 0u);
-        return move_space(paint_backdrop(i, in.pixel) * cov, tspace, globals.space);
+        return move_space(paint_backdrop(i, in.device) * cov, tspace, globals.space);
     }
-    return move_space(paint(i, in.meta_, in.color, in.local, in.pixel) * cov, SPACE_LINEAR, globals.space);
+    return move_space(paint(i, in.meta_, in.color, in.local, in.device) * cov, SPACE_LINEAR, globals.space);
 }

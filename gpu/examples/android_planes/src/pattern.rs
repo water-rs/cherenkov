@@ -15,9 +15,12 @@ pub const WIDTH: u32 = 1920;
 /// Height of every video frame.
 pub const HEIGHT: u32 = 1080;
 
-const BAR: u32 = 24;
-const STRIP: u32 = 40;
-const CELL: u32 = 24;
+/// The sweep bar's width in pixels.
+pub const BAR: u32 = 24;
+/// The binary frame-counter strip's height in pixels.
+pub const STRIP: u32 = 40;
+/// A counter cell's width in pixels — one bit of the frame index.
+pub const CELL: u32 = 24;
 
 /// Chroma samples per row: one (Cb, Cr) pair per 2x2 luma block.
 const CW: usize = (WIDTH / 2) as usize;
@@ -237,6 +240,80 @@ fn strip_row10(frame: u64) -> Vec<u16> {
         x += cell;
     }
     row
+}
+
+/// The pattern's colours as sRGB-encoded `BGRA` bytes packed in a u32
+/// (little-endian: B in the low byte), for RGB-plane producers such as
+/// Apple's `32BGRA` `IOSurface` path.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::suboptimal_flops,
+    reason = "clamped sRGB codes; the textbook encode order stays readable"
+)]
+fn bgra8(rgb: (f64, f64, f64)) -> u32 {
+    let enc = |v: f64| -> u32 {
+        let s = if v <= 0.003_130_8 {
+            v * 12.92
+        } else {
+            1.055 * v.powf(1.0 / 2.4) - 0.055
+        };
+        u32::from((s * 255.0).clamp(0.0, 255.0).round() as u8)
+    };
+    let (r, g, b) = rgb;
+    enc(b) | enc(g) << 8 | enc(r) << 16 | 0xFF00_0000
+}
+
+/// Writes frame `frame` into a `32BGRA` buffer mapped at `base`.
+///
+/// The same quadrants, sweep bar and counter strip the YUV fills
+/// produce, in sRGB so an sRGB-declared frame decodes to the same
+/// picture. `row_bytes` is the buffer's byte stride (`bytesPerRow`),
+/// which the write honours exactly; a row occupies `4 * WIDTH` bytes
+/// of it.
+///
+/// # Safety
+/// `base` is a writable mapping of at least `HEIGHT` rows of
+/// `row_bytes`, aligned to 4 bytes (any `IOSurface` or `CVPixelBuffer`
+/// base is).
+#[expect(
+    clippy::cast_ptr_alignment,
+    reason = "a CVPixelBuffer base is 64-byte aligned; BGRA rows are 4-byte aligned"
+)]
+pub unsafe fn fill_bgra(base: *mut u8, row_bytes: usize, frame: u64) {
+    let width = WIDTH as usize;
+    let quadrants = QUADRANTS.map(bgra8);
+    let (mut top, mut bottom) = (vec![quadrants[0]; width], vec![quadrants[2]; width]);
+    top[width / 2..].fill(quadrants[1]);
+    bottom[width / 2..].fill(quadrants[3]);
+    let mut strip = vec![0u32; width];
+    let (lit, dark) = (bgra8((1.0, 1.0, 1.0)), bgra8((0.08, 0.08, 0.08)));
+    let mut x = 0usize;
+    while x < width {
+        let bit = frame >> ((x / CELL as usize) % 64) & 1;
+        let cell = (CELL as usize).min(width - x);
+        strip[x..x + cell].fill(if bit == 1 { lit } else { dark });
+        x += cell;
+    }
+    let bar = bar_x(frame);
+    for row in 0..HEIGHT as usize {
+        // SAFETY: the caller guarantees `row_bytes` per row; a row needs
+        // `4 * WIDTH` of it.
+        let dst = unsafe {
+            std::slice::from_raw_parts_mut(base.add(row * row_bytes).cast::<u32>(), width)
+        };
+        let (src, patch_bar) = if row >= (HEIGHT - STRIP) as usize {
+            (strip.as_slice(), false)
+        } else if row < (HEIGHT / 2) as usize {
+            (top.as_slice(), true)
+        } else {
+            (bottom.as_slice(), true)
+        };
+        dst.copy_from_slice(src);
+        if patch_bar {
+            dst[bar..bar + BAR as usize].fill(lit);
+        }
+    }
 }
 
 /// `pair` interleaved over `dst` — one P010 (Cb, Cr) run.

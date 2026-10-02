@@ -37,6 +37,8 @@ pub struct Spec {
 /// One launch-time scenario, from the intent's `scenario` string extra.
 #[derive(Clone, Copy, Debug)]
 pub enum Scenario {
+    /// Recorded pixels and property tracks for the measured policy matrix.
+    Recorded(crate::recorded::Spec),
     /// SDR NV12, promoted.
     Overlay,
     /// P010 BT.2020 PQ with HDR metadata, promoted.
@@ -63,6 +65,9 @@ impl Scenario {
     /// Parses the `scenario` intent extra; unknown values run `overlay`.
     #[must_use]
     pub fn parse(name: &str) -> Self {
+        if let Some(spec) = crate::recorded::Spec::parse(name) {
+            return Self::Recorded(spec);
+        }
         match name {
             "hdr" => Self::Hdr,
             "clipped" => Self::Clipped,
@@ -80,6 +85,13 @@ impl Scenario {
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
+            Self::Recorded(spec) => {
+                if spec.animated {
+                    "animated"
+                } else {
+                    "static"
+                }
+            }
             Self::Overlay => "overlay",
             Self::Hdr => "hdr",
             Self::Clipped => "clipped",
@@ -104,6 +116,7 @@ impl Scenario {
             hdr: HdrMetadata::default(),
         };
         match self {
+            Self::Recorded(_) => Vec::new(),
             Self::Overlay | Self::Rotated | Self::Rounded | Self::Clipped | Self::Quarter => {
                 vec![nv12(true)]
             }
@@ -158,6 +171,7 @@ impl Scenario {
         let mut rest = Vec::new();
         surface.update(|tx| {
             match self {
+                Self::Recorded(_) => unreachable!("recorded scenarios use recorded::Scene"),
                 Self::Overlay | Self::Hdr | Self::NoOverlay | Self::InEngine => {
                     let video = surface.layer();
                     let scale = ((w - 80.0) / 1920.0).min((h - 320.0) / 1080.0);

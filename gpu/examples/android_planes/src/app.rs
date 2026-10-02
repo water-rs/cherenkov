@@ -162,6 +162,7 @@ fn intent_extras(app: &AndroidApp) -> Result<(Option<String>, bool), String> {
 
 /// One scenario's running state.
 struct Run {
+    recorded: Option<crate::recorded::Scene>,
     engine: Engine<Gpu>,
     surface: Surface<Gpu>,
     videos: Vec<Video>,
@@ -226,7 +227,17 @@ impl Run {
         let panel = controls_content(font.id(), &font_data, scenario);
 
         let specs = scenario.videos();
-        let (layers, rest, controls) = scenario.build(&surface, panel);
+        let (layers, rest, controls, recorded) = if let Scenario::Recorded(spec) = scenario {
+            (
+                Vec::new(),
+                Vec::new(),
+                surface.layer(),
+                Some(crate::recorded::Scene::new(&surface, spec)),
+            )
+        } else {
+            let (layers, rest, controls) = scenario.build(&surface, panel);
+            (layers, rest, controls, None)
+        };
         assert_eq!(specs.len(), layers.len(), "videos and layers pair");
         let videos: Vec<Video> = specs
             .into_iter()
@@ -239,6 +250,7 @@ impl Run {
         logcat::line(&format!("{} video layer(s) built", videos.len()));
 
         Self {
+            recorded,
             engine,
             surface,
             videos,
@@ -279,6 +291,9 @@ impl Run {
     /// Produces one video generation per layer, renders and emits the
     /// per-second heartbeat.
     fn frame(&mut self) {
+        if let Some(scene) = &mut self.recorded {
+            scene.tick(&self.surface);
+        }
         self.surface.update(|tx| {
             for video in &mut self.videos {
                 let Some(frame) = video.producer.produce() else {
@@ -324,6 +339,25 @@ impl Run {
         let now = Instant::now();
         if now >= self.next_log {
             self.next_log = now + Duration::from_secs(1);
+            if let Some(scene) = &self.recorded {
+                let memory = self.engine.memory();
+                for layer in &scene.layers {
+                    logcat::line(&format!(
+                        "scenario={} side={} count={} lifetime={} engine={} frame={} layer=LayerId({}) decision={} gpu_bytes={} cpu_bytes={} passes={}",
+                        self.scenario.name(),
+                        scene.spec.side,
+                        scene.spec.count,
+                        scene.spec.lifetime,
+                        scene.spec.engine,
+                        scene.frames,
+                        layer.id().raw(),
+                        self.decisions.decision(layer.id().raw()),
+                        memory.gpu.0,
+                        memory.cpu.0,
+                        self.engine.stats().passes
+                    ));
+                }
+            }
             for video in &self.videos {
                 let layer = video.layer.id().raw();
                 logcat::line(&format!(

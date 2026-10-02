@@ -342,24 +342,31 @@ fn suffixes(
     }
 }
 
-/// Each candidate's verdict in paint order as its `order` index —
-/// `Err(Budget)` once `C::BUDGET` promotions are taken.
+/// Each offered candidate's verdict in paint order as its `order`
+/// index — `Err(Budget)` once `C::BUDGET` promotions are taken. The
+/// offered set is `candidates` intersected with `ready`: a candidate
+/// whose realization is still pending is absent from the verdicts
+/// entirely, not rejected.
 fn verdicts<'a, C: Compositor>(
     tree: &'a SurfaceTree,
     order: &'a [Visit],
     candidates: &'a FxHashMap<LayerId, (u32, u32)>,
+    ready: &'a FxHashSet<LayerId>,
     backdrop_above: &'a [Option<LayerId>],
     blend_above: &'a [Option<LayerId>],
     device: &'a [VisitDevice],
 ) -> impl Iterator<Item = (usize, Result<(), Ineligible>)> + 'a {
     let mut promoted = 0;
     order.iter().enumerate().filter_map(move |(i, visit)| {
-        candidates.get(&visit.id)?;
+        let &size = candidates.get(&visit.id)?;
+        if !ready.contains(&visit.id) {
+            return None;
+        }
         let verdict = judge::<C>(
             tree,
             order,
             i,
-            candidates[&visit.id],
+            size,
             backdrop_above[i + 1],
             blend_above[i + 1],
             device,
@@ -378,16 +385,18 @@ fn verdicts<'a, C: Compositor>(
     })
 }
 
-/// Decides which of `candidates` (layer to content size) are promoted this
-/// frame on a surface realized by compositor `C`.
+/// Decides which of `candidates` (layer to content size) the platform
+/// reports `ready` are promoted this frame on a surface realized by
+/// compositor `C`.
 ///
-/// Candidates are judged in paint order and the budget goes to the first
-/// eligible ones, so the decision depends only on the tree and the
-/// candidate set.
+/// Offered candidates are judged in paint order and the budget goes to
+/// the first eligible ones, so the decision depends only on the tree and
+/// the offered set.
 #[must_use]
 pub fn plan<C: Compositor>(
     tree: &SurfaceTree,
     candidates: &FxHashMap<LayerId, (u32, u32)>,
+    ready: &FxHashSet<LayerId>,
 ) -> Plan {
     if candidates.is_empty() {
         return Plan::default();
@@ -406,8 +415,15 @@ pub fn plan<C: Compositor>(
     devices(tree, order, device);
     let mut plan = Plan::default();
     let mut last = None;
-    for (i, verdict) in verdicts::<C>(tree, order, candidates, backdrop_above, blend_above, device)
-    {
+    for (i, verdict) in verdicts::<C>(
+        tree,
+        order,
+        candidates,
+        ready,
+        backdrop_above,
+        blend_above,
+        device,
+    ) {
         match verdict {
             Ok(()) => {
                 last = Some(i);
@@ -451,11 +467,13 @@ fn placement_eq(
 }
 
 /// Whether `committed` is the plan the same verdicts would produce over
-/// `tree` and `candidates` — checked without materialising it (#90).
+/// `tree` and the `ready` subset of `candidates` — checked without
+/// materialising it (#90).
 fn same_plan<C: Compositor>(
     committed: &Plan,
     tree: &SurfaceTree,
     candidates: &FxHashMap<LayerId, (u32, u32)>,
+    ready: &FxHashSet<LayerId>,
     scratch: &mut PlanScratch,
 ) -> bool {
     if candidates.is_empty() {
@@ -475,8 +493,15 @@ fn same_plan<C: Compositor>(
     let mut planes = committed.planes.iter();
     let mut rejected = committed.rejected.iter();
     let mut last = None;
-    for (i, verdict) in verdicts::<C>(tree, order, candidates, backdrop_above, blend_above, device)
-    {
+    for (i, verdict) in verdicts::<C>(
+        tree,
+        order,
+        candidates,
+        ready,
+        backdrop_above,
+        blend_above,
+        device,
+    ) {
         match verdict {
             Ok(()) => {
                 let Some(placed) = planes.next() else {
@@ -615,16 +640,20 @@ fn placement(tree: &SurfaceTree, order: &[Visit], i: usize, size: (u32, u32)) ->
 /// Whether a frame whose only committed change is new external frames on
 /// `layers` can present through the planes alone: every changed layer is
 /// promoted by the surface's committed `plan`, and the verdicts the
-/// frame's tree and fresh `candidates` produce are the committed ones — a
-/// new frame's different size, or a new frame no plane can show, changes
-/// the candidate set and fails the check, keeping those layers on the
-/// full path like any other change (#90). `scratch` reuses the walk's
-/// buffers across calls, so a steady stream allocates nothing.
+/// frame's tree and the `ready` subset of the fresh `candidates` produce
+/// are the committed ones — the plan saw the same readiness filter, so
+/// a candidate still pending realization neither fails the check nor
+/// reaches a plane, and a newly ready candidate changes the verdicts and
+/// keeps the full path. A new frame's different size, or a new frame no
+/// plane can show, changes the candidate set and fails the check like any
+/// other change (#90). `scratch` reuses the walk's buffers across calls,
+/// so a steady stream allocates nothing.
 #[must_use]
 pub fn frames_only<C: Compositor>(
     plan: &Plan,
     tree: &SurfaceTree,
     candidates: &FxHashMap<LayerId, (u32, u32)>,
+    ready: &FxHashSet<LayerId>,
     layers: &FxHashSet<LayerId>,
     scratch: &mut PlanScratch,
 ) -> bool {
@@ -632,7 +661,7 @@ pub fn frames_only<C: Compositor>(
         && layers
             .iter()
             .all(|layer| plan.planes.iter().any(|plane| plane.layer == *layer))
-        && same_plan::<C>(plan, tree, candidates, scratch)
+        && same_plan::<C>(plan, tree, candidates, ready, scratch)
 }
 
 /// The content a plane shows.

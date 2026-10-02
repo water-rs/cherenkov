@@ -601,6 +601,9 @@ pub struct GpuRenderer {
     /// frame's lowered batch — kept between renders so a plane prepare
     /// allocates nothing steady-state.
     ready_sets: Vec<FxHashSet<LayerId>>,
+    /// The ready-candidate set `plane_only_frames` fills with the
+    /// surface's current readiness — the filter the committed plan saw.
+    ready: FxHashSet<LayerId>,
     /// The host wake-up a plane's main-queue attach fires when it lands,
     /// pulling the frame that promotes the born candidate — the same
     /// `waker.wake` an external frame or an invalidation uses.
@@ -1963,6 +1966,7 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             candidates: FxHashMap::default(),
             candidate_frames: FxHashMap::default(),
             ready_sets: Vec::new(),
+            ready: FxHashSet::default(),
             plane_waker: None,
             shader_delivery,
             shaders: paint::Registry::default(),
@@ -2271,6 +2275,7 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
         candidates: FxHashMap::default(),
         candidate_frames: FxHashMap::default(),
         ready_sets: Vec::new(),
+        ready: FxHashSet::default(),
         plane_waker: None,
         shader_delivery,
         shaders: paint::Registry::default(),
@@ -4852,10 +4857,20 @@ impl GpuRenderer {
         if !surface.promotes || surface.present_pending || self.wants_redraw(surface) {
             return false;
         }
+        let Some(system) = self.planes.get_mut(&sf.id) else {
+            return false;
+        };
+        // The committed plan judged only the candidates the platform
+        // reported ready; the check must see the same offered set — a
+        // pending candidate is no plan change, a newly ready one is.
+        let candidates = plane_candidates(surface, &mut self.candidates);
+        let installed = plane_frames(surface, &mut self.candidate_frames);
+        planes::SystemPlanes::prepare(system, candidates, installed, &mut self.ready);
         planes::frames_only::<planes::Platform>(
             &surface.plan,
             sf.tree,
-            plane_candidates(surface, &mut self.candidates),
+            &self.candidates,
+            &self.ready,
             frames,
             &mut self.plan_scratch,
         )
@@ -4930,8 +4945,7 @@ impl GpuRenderer {
         let mut candidates = FxHashMap::default();
         surf.plan = if surf.promotes {
             plane_candidates(surf, &mut candidates);
-            candidates.retain(|layer, _| ready.contains(layer));
-            planes::plan::<planes::Platform>(frame.tree, &candidates)
+            planes::plan::<planes::Platform>(frame.tree, &candidates, ready)
         } else {
             planes::Plan::default()
         };

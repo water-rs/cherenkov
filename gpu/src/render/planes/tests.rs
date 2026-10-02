@@ -60,8 +60,14 @@ fn video() -> FxHashMap<LayerId, (u32, u32)> {
     std::iter::once((VIDEO, SIZE)).collect()
 }
 
+/// The ready set when every candidate's realization is complete.
+fn all_ready(candidates: &FxHashMap<LayerId, (u32, u32)>) -> FxHashSet<LayerId> {
+    candidates.keys().copied().collect()
+}
+
 fn verdict(tree: &SurfaceTree) -> Result<Plan, Ineligible> {
-    let plan = plan::<Test>(tree, &video());
+    let candidates = video();
+    let plan = plan::<Test>(tree, &candidates, &all_ready(&candidates));
     match plan.rejected.as_slice() {
         [] => Ok(plan),
         [(layer, cause)] => {
@@ -94,10 +100,11 @@ fn an_eligible_external_frame_is_promoted_between_two_parts() {
 /// without one stays in the engine.
 #[test]
 fn only_candidates_are_promoted() {
-    let none = plan::<Test>(&scene(), &FxHashMap::default());
+    let none = plan::<Test>(&scene(), &FxHashMap::default(), &FxHashSet::default());
     assert_eq!(none.planes, []);
     assert_eq!(none.parts(), 1);
-    let video = plan::<Test>(&scene(), &video());
+    let candidates = video();
+    let video = plan::<Test>(&scene(), &candidates, &all_ready(&candidates));
     assert_eq!(
         video.planes.iter().map(|p| p.layer).collect::<Vec<_>>(),
         [VIDEO],
@@ -243,10 +250,10 @@ fn nested_shaped_clips_are_not_promoted() {
 #[test]
 fn the_budget_goes_to_the_first_candidates_in_paint_order() {
     let tree = scene();
-    let candidates = [(BELOW, SIZE), (VIDEO, SIZE), (ABOVE, SIZE)]
+    let candidates: FxHashMap<_, _> = [(BELOW, SIZE), (VIDEO, SIZE), (ABOVE, SIZE)]
         .into_iter()
         .collect();
-    let plan = plan::<Test>(&tree, &candidates);
+    let plan = plan::<Test>(&tree, &candidates, &all_ready(&candidates));
     assert_eq!(
         plan.planes.iter().map(|p| p.layer).collect::<Vec<_>>(),
         [BELOW, VIDEO]
@@ -295,11 +302,13 @@ fn a_plane_only_frame_presents_through_the_planes_alone() {
     let candidates = video();
     let committed = verdict(&tree).expect("eligible");
     let mut scratch = PlanScratch::default();
+    let ready = all_ready(&candidates);
     let video_only: FxHashSet<LayerId> = std::iter::once(VIDEO).collect();
     assert!(frames_only::<Test>(
         &committed,
         &tree,
         &candidates,
+        &ready,
         &video_only,
         &mut scratch
     ));
@@ -309,6 +318,7 @@ fn a_plane_only_frame_presents_through_the_planes_alone() {
         &committed,
         &tree,
         &candidates,
+        &ready,
         &video_only,
         &mut scratch
     ));
@@ -320,6 +330,7 @@ fn a_plane_only_frame_presents_through_the_planes_alone() {
         &committed,
         &tree,
         &candidates,
+        &ready,
         &in_engine,
         &mut scratch
     ));
@@ -328,6 +339,7 @@ fn a_plane_only_frame_presents_through_the_planes_alone() {
         &committed,
         &tree,
         &candidates,
+        &ready,
         &mixed,
         &mut scratch
     ));
@@ -339,11 +351,15 @@ fn a_plane_only_frame_presents_through_the_planes_alone() {
         PARENT,
         prop(Affine::translate((8.0, 0.0))),
     ));
-    assert_ne!(plan::<Test>(&moved, &candidates), committed);
+    assert_ne!(
+        plan::<Test>(&moved, &candidates, &all_ready(&candidates)),
+        committed
+    );
     assert!(!frames_only::<Test>(
         &committed,
         &moved,
         &candidates,
+        &ready,
         &video_only,
         &mut scratch
     ));
@@ -354,6 +370,7 @@ fn a_plane_only_frame_presents_through_the_planes_alone() {
         &committed,
         &tree,
         &resized,
+        &all_ready(&resized),
         &video_only,
         &mut scratch
     ));
@@ -366,6 +383,7 @@ fn a_plane_only_frame_presents_through_the_planes_alone() {
         &committed,
         &tree,
         &two,
+        &all_ready(&two),
         &mixed,
         &mut scratch
     ));
@@ -375,7 +393,47 @@ fn a_plane_only_frame_presents_through_the_planes_alone() {
         &committed,
         &tree,
         &candidates,
+        &ready,
         &FxHashSet::default(),
+        &mut scratch
+    ));
+}
+
+/// A candidate whose realization is still pending is absent from the
+/// committed plan's verdicts — pendingness is not a plan change, so it
+/// never blocks the plane-only path; its readiness does (#90).
+#[test]
+fn a_pending_candidate_does_not_block_a_plane_only_frame() {
+    let tree = scene();
+    // `BELOW` gained a plane-capable frame but its realization is still
+    // pending: a candidate, not yet ready.
+    let mut candidates = video();
+    candidates.insert(BELOW, SIZE);
+    let just_video: FxHashSet<LayerId> = std::iter::once(VIDEO).collect();
+    let committed = plan::<Test>(&tree, &candidates, &just_video);
+    assert_eq!(committed.planes.len(), 1);
+    assert_eq!(committed.rejected, []);
+
+    let mut scratch = PlanScratch::default();
+    let video_only: FxHashSet<LayerId> = std::iter::once(VIDEO).collect();
+    assert!(frames_only::<Test>(
+        &committed,
+        &tree,
+        &candidates,
+        &just_video,
+        &video_only,
+        &mut scratch
+    ));
+
+    // Once `BELOW`'s plane is ready the verdicts change — the frame
+    // takes the full path and re-plans.
+    let both: FxHashSet<LayerId> = [VIDEO, BELOW].into_iter().collect();
+    assert!(!frames_only::<Test>(
+        &committed,
+        &tree,
+        &candidates,
+        &both,
+        &video_only,
         &mut scratch
     ));
 }

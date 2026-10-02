@@ -871,7 +871,11 @@ mod tests {
     }
 
     fn decide(tree: &SurfaceTree, size: (u32, u32)) -> planes::Plan {
-        planes::plan::<Android>(tree, &std::iter::once((VIDEO, size)).collect())
+        planes::plan::<Android>(
+            tree,
+            &std::iter::once((VIDEO, size)).collect(),
+            &std::iter::once(VIDEO).collect(),
+        )
     }
 
     /// A video scaled into a scrolled, clipped parent lands where the

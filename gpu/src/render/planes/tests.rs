@@ -455,6 +455,25 @@ fn a_plane_only_frame_presents_through_the_planes_alone() {
     ));
 }
 
+#[test]
+fn replacing_a_capture_with_a_frame_rebuilds_the_native_stack() {
+    let tree = scene();
+    let mut candidates = video();
+    candidates.get_mut(&VIDEO).expect("candidate").source = Source::Recorded;
+    let ready = all_ready(&candidates);
+    let committed = plan::<Test>(&tree, &candidates, &ready);
+    candidates.get_mut(&VIDEO).expect("candidate").source = Source::Frame;
+    let updates = std::iter::once(VIDEO).collect();
+    assert!(!frames_only::<Test>(
+        &committed,
+        &tree,
+        &candidates,
+        &ready,
+        &updates,
+        &mut PlanScratch::default()
+    ));
+}
+
 /// A candidate whose realization is still pending is absent from the
 /// committed plan's verdicts — pendingness is not a plan change, so it
 /// never blocks the plane-only path; its readiness does (#90).

@@ -178,6 +178,8 @@ impl Level {
 pub struct Placement {
     /// The promoted layer.
     pub layer: LayerId,
+    /// The native buffer realization committed for this content.
+    pub source: Source,
     /// The content rectangle `(0, 0, w, h)` in the layer's content space.
     pub size: (u32, u32),
     /// Buffer texels to the layer's content space.
@@ -499,7 +501,8 @@ fn placement_eq(
     placed: &Placement,
 ) -> bool {
     let visit = &order[i];
-    (placed.layer, placed.size, placed.raster) == (visit.id, size.size, size.raster)
+    (placed.layer, placed.size, placed.raster, placed.source)
+        == (visit.id, size.size, size.raster, size.source)
         && placed.opacity == tree.layer(visit.id).opacity
         && placed.path.len() == visit.ancestors.len() + 1
         && visit
@@ -688,6 +691,7 @@ fn placement(tree: &SurfaceTree, order: &[Visit], i: usize, size: Candidate) -> 
         .collect();
     Placement {
         layer: visit.id,
+        source: size.source,
         size: size.size,
         raster: size.raster,
         opacity: tree.layer(visit.id).opacity,

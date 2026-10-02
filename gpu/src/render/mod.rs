@@ -5097,11 +5097,9 @@ impl GpuRenderer {
         let next = planes::plan::<planes::Platform>(sf.tree, &self.candidates, &self.ready);
         if next.trailing != surface.plan.trailing
             || next.planes.len() != surface.plan.planes.len()
-            || !next
-                .planes
-                .iter()
-                .zip(&surface.plan.planes)
-                .all(|(a, b)| (a.layer, a.size, a.raster) == (b.layer, b.size, b.raster))
+            || !next.planes.iter().zip(&surface.plan.planes).all(|(a, b)| {
+                (a.layer, a.size, a.raster, a.source) == (b.layer, b.size, b.raster, b.source)
+            })
         {
             return false;
         }

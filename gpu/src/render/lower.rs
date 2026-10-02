@@ -4944,6 +4944,7 @@ mod tests {
                 .iter()
                 .map(|&layer| crate::render::planes::Placement {
                     raster: Affine::IDENTITY,
+                    source: crate::render::planes::Source::Frame,
                     layer,
                     size: (8, 8),
                     opacity: 1.0,

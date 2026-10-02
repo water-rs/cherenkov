@@ -94,3 +94,7 @@ path = "src/bin.rs"
 name = "cherenkov-import-frame"
 path = "src/bin/import_frame.rs"
 required-features = ["cherenkov"]
+
+[[example]]
+name = "gamut_gpu_sweep"
+required-features = ["cherenkov"]

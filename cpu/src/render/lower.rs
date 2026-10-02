@@ -523,12 +523,10 @@ fn boundary_edges(path: BezPath, tol: f64) -> Vec<Edge> {
 }
 
 /// Flattens `path` (already in device space) into directed edges for
-/// coverage rasterization: horizontal edges carry no area and drop out.
+/// coverage rasterization. Horizontal edges connect fractional-row groups
+/// in the exact compiler even though they contribute no signed area.
 fn flatten_edges(path: BezPath, tol: f64) -> Vec<Edge> {
-    let mut edges = boundary_edges(path, tol);
-    #[expect(clippy::float_cmp, reason = "horizontal edges carry no area")]
-    edges.retain(|e| e.y0 != e.y1);
-    edges
+    boundary_edges(path, tol)
 }
 
 /// Resolves overlapping windings: `Some` swaps in boundary edges whose
@@ -1894,8 +1892,24 @@ mod tests {
     use super::boundary_edges;
     use cherenkov::kurbo::{RoundedRect, Shape as _};
 
-    /// SDF edges keep horizontal segments: coverage drops them as
-    /// area-free, but distance effects measure to the real boundary.
+    #[test]
+    fn fractional_clip_intersection_preserves_horizontal_connectivity() {
+        use super::{FLATTEN_TOL, Operand, Rect, flatten_edges, rasterize};
+        let operands = [
+            Rect::new(0.0, 0.25, 3.0, 1.0),
+            Rect::new(1.0, 0.0, 2.0, 0.75),
+        ]
+        .map(|rect| Operand {
+            edges: flatten_edges(rect.to_path(FLATTEN_TOL), FLATTEN_TOL).into(),
+            rule: cherenkov::FillRule::NonZero,
+        });
+        let coverage = rasterize(&operands, 3, 1);
+        assert_eq!(coverage.at(1, 0).to_bits(), 0.5_f32.to_bits());
+        assert_eq!(coverage.at(0, 0).to_bits(), 0.0_f32.to_bits());
+        assert_eq!(coverage.at(2, 0).to_bits(), 0.0_f32.to_bits());
+    }
+
+    /// Distance effects measure every segment of the real boundary.
     #[test]
     fn boundary_edges_include_horizontals() {
         let path = RoundedRect::new(0.0, 0.0, 100.0, 80.0, 12.0).to_path(0.02);

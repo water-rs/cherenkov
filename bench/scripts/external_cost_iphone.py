@@ -2,15 +2,16 @@
 """iPhone 16 Pro driver for `cherenkov-bench external-cost` (#168).
 
 Runs on the Mac mini where the phone is attached, through devicectl.
-Takes the device lock `/tmp/device-locks/<udid>.lock` with fcntl.flock
-for each run only and releases it between runs — other jobs share the
-phone.
+Several jobs share the phone and the same bundle id, so the device lock
+(`fcntl.flock`) is held for a run's whole cycle — uninstall, install,
+push args, launch (always `--terminate-existing`: the app never exits,
+so a plain launch would reuse a stale instance), wait for done, pull —
+and released after the pull.
 
-iOS carries the same matrix minus `--energy` (the meter is ODPM/powermetrics
-only) and `--cpu` (affinity is Linux/Android only).
+iOS carries the same matrix minus `--energy` (the meter is ODPM/
+powermetrics only) and `--cpu` (affinity is Linux/Android only).
 
-Per run: one bench-args.json entry, one app launch, one pull of
-`Documents/out`. Raw reports land in `--out-dir` (never in git).
+Raw reports land in `--out-dir`, never in git.
 """
 
 import argparse
@@ -60,43 +61,10 @@ def devicectl(*args):
     return r.stdout
 
 
-def install(app):
-    devicectl("device", "install", "app", "--device", UDID, app)
-
-
-def push_args(out_dir, args):
-    path = out_dir / "bench-args.json"
-    path.write_text(json.dumps([args]))
-    devicectl(
-        "device", "copy", "to", "--device", UDID,
-        "--domain-type", "appDataContainer",
-        "--domain-identifier", BUNDLE,
-        "--source", str(path), "--destination", "Documents/bench-args.json",
-    )
-    # Read back: a stale args file is the silent wrong-suite failure.
-    back = out_dir / "args-readback.json"
-    devicectl(
-        "device", "copy", "from", "--device", UDID,
-        "--domain-type", "appDataContainer",
-        "--domain-identifier", BUNDLE,
-        "--source", "Documents/bench-args.json",
-        "--destination", str(back),
-    )
-    if back.read_text() != path.read_text():
-        raise RuntimeError("bench-args.json readback mismatch")
-
-
-def launch():
-    devicectl(
-        "device", "process", "launch",
-        "--terminate-existing", "--device", UDID, BUNDLE,
-    )
-
-
 def wait_done(dest, launched_at, want_args):
     """Copy Documents/out when a fresh done.json exists; retry to the
-    timeout. Freshness is proven by run-0.log's first tracing timestamp
-    at/after the launch instant and by the recorded args matching."""
+    timeout. Freshness is proven by the recorded args matching and by
+    run-0.log's first tracing timestamp at/after the launch instant."""
     deadline = time.time() + 300
     while time.time() < deadline:
         r = run([
@@ -123,22 +91,72 @@ def wait_done(dest, launched_at, want_args):
     raise RuntimeError(f"timeout waiting for done.json in {dest}")
 
 
+def verify(report_path, size, transfer, path):
+    """The pulled report must come from this build's `external-cost`
+    run — fields only that subcommand writes, at the right cell."""
+    r = json.loads(pathlib.Path(report_path).read_text())
+    want_path = {"e": "external", "c": "copy-convert"}[path]
+    want_layout = {"sdr": "nv12", "pq": "p010"}[transfer]
+    assert r["path"] == want_path, r["path"]
+    assert r["layout"] == want_layout, r["layout"]
+    assert r["transfer"] == f"bt{'709-sdr' if transfer == 'sdr' else '2020-pq'}"
+    assert (r["width"], r["height"]) == (
+        {"1080p": (1920, 1080), "4k": (3840, 2160)}[size]
+    )
+    assert r["samples"], "no per-frame samples"
+    return r
+
+
 def one_run(app, path, size, transfer, rep, out_dir):
-    name = f"ext-{size}-{transfer}-{path}-{rep}"
+    name = f"{size}-{transfer}-{path}-{rep}"
+    remote = f"Documents/out/ext-{name}.json"
     args = [
         "external-cost", "--path", path, "--size", size,
         "--transfer", transfer, "--frames", str(FRAMES),
         "--warmup", str(WARMUP), "--rate", str(RATE),
-        "--out", f"Documents/out/{name}.json",
+        "--out", remote,
     ]
+    dest = out_dir / f"run-{name}"
     with Lock():
         print(f"[{size}/{transfer} rep{rep}] path {path} — lock held", flush=True)
-        push_args(out_dir, args)
+        # Another job may have installed its own dev.cherenkov.bench —
+        # uninstall first so install() provably lands this binary.
+        devicectl("device", "uninstall", "app", "--device", UDID, BUNDLE)
+        devicectl("device", "install", "app", "--device", UDID, app)
+
+        args_file = out_dir / "bench-args.json"
+        args_file.write_text(json.dumps([args]))
+        devicectl(
+            "device", "copy", "to", "--device", UDID,
+            "--domain-type", "appDataContainer",
+            "--domain-identifier", BUNDLE,
+            "--source", str(args_file),
+            "--destination", "Documents/bench-args.json",
+        )
+        # Read back: a stale args file is the silent wrong-suite failure.
+        back = out_dir / "args-readback.json"
+        devicectl(
+            "device", "copy", "from", "--device", UDID,
+            "--domain-type", "appDataContainer",
+            "--domain-identifier", BUNDLE,
+            "--source", "Documents/bench-args.json",
+            "--destination", str(back),
+        )
+        if back.read_text() != args_file.read_text():
+            raise RuntimeError("bench-args.json readback mismatch")
+
         launched_at = time.strftime("%Y-%m-%dT%H:%M:%S.", time.gmtime())
-        launch()
-        dest = out_dir / name
+        devicectl(
+            "device", "process", "launch",
+            "--terminate-existing", "--device", UDID, BUNDLE,
+        )
         wait_done(dest, launched_at, args)
-    print(f"    done — lock released", flush=True)
+    report = verify(dest / f"ext-{name}.json", size, transfer, path)
+    print(
+        f"    done — lock released; gpu p50 {report['composite_seconds'][0]*1e3:.2f} ms",
+        flush=True,
+    )
+    return report
 
 
 def main():
@@ -149,15 +167,20 @@ def main():
     out_dir = pathlib.Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    with Lock():
-        install(args.app)
-        print("installed", flush=True)
-
+    results = []
     for size, transfer in CELLS:
         for order in ORDERS:
             for rep, path in enumerate(order):
-                one_run(args.app, path, size, transfer, rep, out_dir)
+                r = one_run(args.app, path, size, transfer, rep, out_dir)
+                results.append({"cell": f"{size}/{transfer}", "path": path,
+                                "order": "abab" if order == ORDERS[0] else "baba",
+                                "rep": rep, "report": name_of(r)})
+    (out_dir / "summary.json").write_text(json.dumps(results, indent=2))
     print("matrix complete")
+
+
+def name_of(r):
+    return r["path"]
 
 
 if __name__ == "__main__":

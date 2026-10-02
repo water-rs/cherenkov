@@ -21,4 +21,5 @@ targets:
         #   (for a simulator build, target aarch64-apple-ios-sim instead)
         "LIBRARY_SEARCH_PATHS[sdk=iphoneos*]": $(inherited) $(PROJECT_DIR)/../../target/aarch64-apple-ios/release
         "LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]": $(inherited) $(PROJECT_DIR)/../../target/aarch64-apple-ios-sim/release
-        OTHER_LDFLAGS: $(inherited) -lcherenkov_bench -lc++
+        # AVFoundation/CoreMedia for cherenkov_gpu's system-plane code.
+        OTHER_LDFLAGS: $(inherited) -lcherenkov_bench -lc++ -framework AVFoundation -framework CoreMedia

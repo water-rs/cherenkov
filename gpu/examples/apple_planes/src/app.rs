@@ -140,7 +140,10 @@ fn launch_args() -> (Scenario, bool) {
     let mut i = 1; // argv[0] is the executable
     while i < arguments.count() {
         let arg = arguments.objectAtIndex(i).to_string();
-        if arg == "--paused" {
+        if arg == "--" {
+            // `devicectl process launch … -- args` passes the literal
+            // separator through to the process's argv.
+        } else if arg == "--paused" {
             paused = true;
         } else if arg == "--scenario" {
             i += 1;

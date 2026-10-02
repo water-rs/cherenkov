@@ -609,6 +609,12 @@ invalidates just their device instances, gradient stops and coverage. Dirty
 realizations reuse their vector storage. A changed operation count, glyph
 count or scope structure rebuilds the affected layer's layout.
 
+`lowering::Content::current()` returns the prepared operations together with
+their source display list only while the content is clean and prepared.
+Backends use this borrowed view to inspect static capture bounds without
+compiling recorded commands a second time. Pending content changes return
+`None`; callers must not inspect stale operations.
+
 Layer transforms, scrolling, clips and opacity are read from the sampled tree
 while composing retained operations. They do not resolve content again.
 Device placement changes regenerate the coverage that depends on that

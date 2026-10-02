@@ -70,9 +70,8 @@ pub use crate::config::{Budget, Bytes, MemoryUsage, Pressure};
 pub use crate::display_list::{
     Command, Dirty, DisplayList, Operand, OperandKind, Picture, ScopeError, Slot, SlotUpdate,
 };
+pub use crate::engine::CompletionWaker;
 pub use crate::engine::Engine;
-#[doc(hidden)]
-pub use crate::engine::MainWaker;
 pub use crate::error::{EngineError, RenderError, ResourceError, SurfaceError};
 pub use crate::frame::{
     DEFAULT_REFRESH, FrameId, FrameStats, FrameTime, FrameTiming, Next, Offscreen, OffscreenFormat,

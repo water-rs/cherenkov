@@ -98,14 +98,17 @@ impl<B: Backend> Engine<B> {
         let post_tx = tx.clone();
         let waker = Arc::new(Waker::new());
         {
-            let waker = crate::engine::MainWaker::new(&waker);
+            let waker = crate::engine::CompletionWaker::new(&waker);
             // A promoted plane's attach lands on the main queue; the
             // block wakes the host through this handle for the frame
             // that promotes it. Backends with no main-queue completion
             // ignore it.
-            let _ = tx.send(Message::Resource(Box::new(move |r: &mut B::Renderer| {
+            tx.send(Message::Resource(Box::new(move |r: &mut B::Renderer| {
                 r.set_plane_waker(waker);
-            })));
+            })))
+            .map_err(|_| {
+                EngineError::Thread("render thread died installing the plane waker".into())
+            })?;
         }
         let replace_image = {
             let tx = tx.clone();

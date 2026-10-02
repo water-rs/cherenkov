@@ -13,6 +13,7 @@ use std::marker::PhantomData;
 use std::ops::{Index, IndexMut};
 use std::rc::Rc;
 use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::mpsc::SyncSender as Sender;
 
 use kurbo::{Affine, Vec2};

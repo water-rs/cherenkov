@@ -602,7 +602,7 @@ pub struct GpuRenderer {
     /// The host wake-up a plane's main-queue attach fires when it lands,
     /// pulling the frame that promotes the born candidate — the same
     /// `waker.wake` an external frame or an invalidation uses.
-    plane_waker: Option<cherenkov::MainWaker>,
+    plane_waker: Option<cherenkov::CompletionWaker>,
     /// How the fixed modules reach this device (`shaders.rs`): SPIR-V,
     /// metallib, or WGSL — decided once at init by the adapter backend.
     shader_delivery: shaders::ShaderDelivery,
@@ -2856,7 +2856,7 @@ impl Renderer for GpuRenderer {
         }
     }
 
-    fn set_plane_waker(&mut self, waker: cherenkov::MainWaker) {
+    fn set_plane_waker(&mut self, waker: cherenkov::CompletionWaker) {
         self.plane_waker = Some(waker);
     }
 
@@ -3423,27 +3423,7 @@ impl GpuRenderer {
             .iter()
             .filter(|sf| sf.changed || self.wants_redraw(&self.surfaces[&sf.id]))
             .collect();
-        // A candidate whose display layer was born since the surface's
-        // last plan can now promote: `prepare` notices the completed
-        // attach and `wants_plan` says the surface must re-plan.
-        for sf in frame.surfaces {
-            if dirty.iter().any(|seen| seen.id == sf.id) {
-                continue;
-            }
-            let Some(surface) = self.surfaces.get(&sf.id) else {
-                continue;
-            };
-            if !surface.promotes {
-                continue;
-            }
-            let Some(system) = self.planes.get_mut(&sf.id) else {
-                continue;
-            };
-            planes::SystemPlanes::groom(system, plane_candidates(surface, &mut self.candidates));
-            if planes::SystemPlanes::wants_plan(system) {
-                dirty.push(sf);
-            }
-        }
+        self.include_ready_planes(frame, &mut dirty);
         // A surface whose only change is new external frames on layers
         // its committed plan promotes presents them through the planes
         // alone — no lowering, no draws, no part blit (#90). Any other
@@ -3586,27 +3566,7 @@ impl GpuRenderer {
             .iter()
             .filter(|sf| sf.changed || self.wants_redraw(&self.surfaces[&sf.id]))
             .collect();
-        // A candidate whose display layer was born since the surface's
-        // last plan can now promote: `prepare` notices the completed
-        // attach and `wants_plan` says the surface must re-plan.
-        for sf in frame.surfaces {
-            if dirty.iter().any(|seen| seen.id == sf.id) {
-                continue;
-            }
-            let Some(surface) = self.surfaces.get(&sf.id) else {
-                continue;
-            };
-            if !surface.promotes {
-                continue;
-            }
-            let Some(system) = self.planes.get_mut(&sf.id) else {
-                continue;
-            };
-            planes::SystemPlanes::groom(system, plane_candidates(surface, &mut self.candidates));
-            if planes::SystemPlanes::wants_plan(system) {
-                dirty.push(sf);
-            }
-        }
+        self.include_ready_planes(frame, &mut dirty);
         // A surface whose only change is new external frames on layers
         // its committed plan promotes presents them through the planes
         // alone — no lowering, no draws, no part blit (#90). Any other
@@ -4879,7 +4839,31 @@ impl GpuRenderer {
         )
     }
 
-    #[inline(never)]
+    fn include_ready_planes<'a>(
+        &mut self,
+        frame: &Frame<'a>,
+        dirty: &mut Vec<&'a SurfaceFrame<'a>>,
+    ) {
+        for sf in frame.surfaces {
+            if dirty.iter().any(|seen| seen.id == sf.id) {
+                continue;
+            }
+            let Some(surface) = self.surfaces.get(&sf.id) else {
+                continue;
+            };
+            if !surface.promotes {
+                continue;
+            }
+            let Some(system) = self.planes.get_mut(&sf.id) else {
+                continue;
+            };
+            planes::SystemPlanes::groom(system, plane_candidates(surface, &mut self.candidates));
+            if planes::SystemPlanes::wants_plan(system) {
+                dirty.push(sf);
+            }
+        }
+    }
+
     /// Per-surface the candidates whose plane can show a frame now,
     /// filled into `self.ready_sets` (kept between renders, so the sets
     /// allocate nothing steady-state): `SystemPlanes::prepare` queues
@@ -4904,6 +4888,7 @@ impl GpuRenderer {
         }
     }
 
+    #[inline(never)]
     fn lower_content(
         surf: &mut SurfaceState,
         frame: &SurfaceFrame<'_>,

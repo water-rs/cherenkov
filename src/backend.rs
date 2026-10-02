@@ -217,7 +217,7 @@ pub trait Renderer: 'static {
     /// frame: a promoted plane's attach landing on the main queue is its
     /// only producer. The default does nothing — backends with no
     /// main-queue completion never need it.
-    fn set_plane_waker(&mut self, _waker: crate::MainWaker) {}
+    fn set_plane_waker(&mut self, _waker: crate::CompletionWaker) {}
 
     /// The backend's current memory usage.
     fn memory(&self) -> MemoryUsage;

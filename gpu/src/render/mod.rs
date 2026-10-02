@@ -4706,7 +4706,7 @@ impl GpuRenderer {
                 surface.present_pending = true;
             }
             if surface.present_pending {
-                surface.present_pending = !match self.planes.get_mut(&sf.id) {
+                let presentation = match self.planes.get_mut(&sf.id) {
                     Some(system) => {
                         // The frame's own `plane_frames` carries the
                         // update set — admitted by this render's
@@ -4720,7 +4720,7 @@ impl GpuRenderer {
                                 system,
                                 plane_stack(surface, sf.plane_frames),
                             )?;
-                            true
+                            planes::Presentation::Presented
                         } else {
                             let parts: Vec<_> = (0..surface.plan.parts())
                                 .map(|n| planes::Part {
@@ -4745,18 +4745,27 @@ impl GpuRenderer {
                             )?
                         }
                     }
-                    None => presenter.present(
-                        &self.device,
-                        &self.queue,
-                        surface.window.as_ref().expect("pending window"),
-                        &surface.view,
-                        sf.display.headroom,
-                    )?,
-                };
-                if surface.present_pending {
-                    if let Some(system) = self.planes.get_mut(&sf.id) {
-                        planes::SystemPlanes::withdraw_animations(system);
+                    None => {
+                        if presenter.present(
+                            &self.device,
+                            &self.queue,
+                            surface.window.as_ref().expect("pending window"),
+                            &surface.view,
+                            sf.display.headroom,
+                        )? {
+                            planes::Presentation::Presented
+                        } else {
+                            planes::Presentation::Retry
+                        }
                     }
+                };
+                surface.present_pending = presentation != planes::Presentation::Presented;
+                if surface.present_pending
+                    && let Some(system) = self.planes.get_mut(&sf.id)
+                {
+                    planes::SystemPlanes::withdraw_animations(system);
+                }
+                if presentation == planes::Presentation::Retry {
                     redraw = Some(redraw.map_or_else(
                         || surface.refresh.clone(),
                         |rate| {

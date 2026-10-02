@@ -1009,8 +1009,17 @@ impl SystemPlanes for Planes {
             .sum()
     }
 
-    fn compose(&mut self, composition: Composition<'_>) -> Result<bool, RenderError> {
-        self.present(composition)
+    fn compose(
+        &mut self,
+        composition: Composition<'_>,
+    ) -> Result<crate::render::planes::Presentation, RenderError> {
+        self.present(composition).map(|shown| {
+            if shown {
+                crate::render::planes::Presentation::Presented
+            } else {
+                crate::render::planes::Presentation::Retry
+            }
+        })
     }
 
     fn refresh<'a>(

@@ -1317,7 +1317,7 @@ impl SystemPlanes for LayerPlanes {
         self.owned_animations.clear();
     }
 
-    fn compose(&mut self, c: Composition<'_>) -> Result<bool, RenderError> {
+    fn compose(&mut self, c: Composition<'_>) -> Result<super::Presentation, RenderError> {
         // The immutable IOSurface is published only after the GPU has
         // finished its presentation conversion. Until then the committed
         // scene and all of its old buffers stay visible together.
@@ -1363,12 +1363,12 @@ impl SystemPlanes for LayerPlanes {
             contents.push((layer, raster::Contents(buffer.surface.clone())));
         }
         if !ready {
-            return Ok(false);
+            return Ok(super::Presentation::Pending);
         }
         self.collect_parts()?;
         self.request_parts(c.parts.len(), None);
         if self.parts.len() < c.parts.len() {
-            return Ok(false);
+            return Ok(super::Presentation::Pending);
         }
         let mut frames = Vec::with_capacity(c.parts.len());
         for (part, target) in c.parts.iter().zip(&self.parts) {
@@ -1376,7 +1376,7 @@ impl SystemPlanes for LayerPlanes {
                 c.presenter
                     .prepare(c.device, c.queue, target, part.view, c.display.headroom)?
             else {
-                return Ok(false);
+                return Ok(super::Presentation::Retry);
             };
             frames.push(frame);
         }
@@ -1405,7 +1405,7 @@ impl SystemPlanes for LayerPlanes {
                 self.enqueue(update);
             }
         }
-        Ok(true)
+        Ok(super::Presentation::Presented)
     }
 
     fn groom_with_frames(

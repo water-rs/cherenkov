@@ -808,6 +808,17 @@ pub struct Composition<'a> {
     pub planes: &'a [Plane<'a>],
 }
 
+/// Whether presentation finished or which event must resume it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Presentation {
+    Presented,
+    /// Drawable availability requires another display frame.
+    Retry,
+    /// A queued operation will wake the surface when it completes.
+    #[cfg(target_vendor = "apple")]
+    Pending,
+}
+
 /// A platform's realization of a surface's planes under the host's
 /// system-compositor parent.
 ///
@@ -831,14 +842,13 @@ pub trait SystemPlanes: Compositor {
     /// Withdraws scheduling ownership when this frame could not present.
     fn withdraw_animations(&mut self) {}
 
-    /// Realizes `composition`. Returns false when a part's drawable was not
-    /// available (the window is occluded or the acquire timed out): nothing
-    /// changed on screen, and the engine composes again on the next frame.
+    /// Realizes `composition`, distinguishing display-paced acquisition
+    /// from asynchronous work that supplies its own completion wake.
     ///
     /// # Errors
     /// A [`RenderError`] naming the cause when the system rejects a plane
     /// or a part cannot be presented.
-    fn compose(&mut self, composition: Composition<'_>) -> Result<bool, RenderError>;
+    fn compose(&mut self, composition: Composition<'_>) -> Result<Presentation, RenderError>;
 
     /// Presents only the promoted planes' new frames: `frames` carries
     /// every promoted layer whose frame changed this frame, inside the
@@ -951,7 +961,7 @@ impl Compositor for NoPlanes {
 
 #[cfg(not(any(target_vendor = "apple", target_os = "android")))]
 impl SystemPlanes for NoPlanes {
-    fn compose(&mut self, _: Composition<'_>) -> Result<bool, RenderError> {
+    fn compose(&mut self, _: Composition<'_>) -> Result<Presentation, RenderError> {
         unreachable!("no `NoPlanes` value exists")
     }
     fn refresh<'a>(&mut self, _: impl Iterator<Item = Plane<'a>>) -> Result<(), RenderError> {

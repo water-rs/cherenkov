@@ -115,7 +115,7 @@ const SPACE_SRGB: u32 = 1u;
 struct VsOut {
     @builtin(position) position: vec4<f32>,
     @location(0) local: vec2<f32>,
-    @location(1) pixel: vec2<f32>,
+    @location(1) device: vec2<f32>,
     @location(2) @interpolate(flat) instance: u32,
     @location(3) @interpolate(flat) meta_: vec4<u32>,
     @location(4) @interpolate(flat) color: vec4<f32>,
@@ -164,13 +164,13 @@ fn instance_vertex(vi: u32, ii: u32, inst: Instance) -> VsOut {
     let p = vec2<f32>(mix(inst.bounds.x, inst.bounds.z, sx), mix(inst.bounds.y, inst.bounds.w, sy));
     var out: VsOut;
     if inst.meta_.x >= KIND_GLYPH {
-        out.pixel = p;
+        out.device = p;
         out.local = apply_inverse(inst.affine, p);
     } else {
         out.local = p;
-        out.pixel = apply(inst.affine, p);
+        out.device = apply(inst.affine, p);
     }
-    let ndc = (out.pixel - globals.origin) / globals.size * 2.0 - 1.0;
+    let ndc = (out.device - globals.origin) / globals.size * 2.0 - 1.0;
     out.position = vec4<f32>(ndc.x, -ndc.y, 0.0, 1.0);
     out.instance = ii;
     // Hoist the constants every fragment reads into flat varyings so the
@@ -454,7 +454,7 @@ fn shape_coverage(s: Shape, p: vec2<f32>, m: array<vec4<f32>, 2>) -> f32 {
     );
 }
 
-// Coverage of the instance's clip shape and mask at `in.pixel`: the
+// Coverage of the instance's clip shape and mask at `in.device`: the
 // geometric clip SDF times the atlas-or-texture mask texel, matching
 // fs_full's own evaluation verbatim.
 fn clip_mask_coverage(in: VsOut) -> f32 {
@@ -463,7 +463,7 @@ fn clip_mask_coverage(in: VsOut) -> f32 {
     var cov = 1.0;
     if (flags & FLAG_HAS_CLIP) != 0u {
         // `clip_inv` maps device to clip-local: J^-T is its transpose.
-        let pc = apply(instances[i].clip_inv, in.pixel);
+        let pc = apply(instances[i].clip_inv, in.device);
         let sample = sdf_sample(instances[i].clip, pc);
         let g = sample.gradient;
         let ci = instances[i].clip_inv;
@@ -473,7 +473,7 @@ fn clip_mask_coverage(in: VsOut) -> f32 {
     if (flags & FLAG_HAS_MASK) != 0u {
         // Mask texel for this device pixel; texels outside the cell
         // contribute zero coverage.
-        let mp = floor(in.pixel) - in.params.zw;
+        let mp = floor(in.device) - in.params.zw;
         let msize = vec2<f32>(instances[i].clip.aspect, instances[i].clip.exponent);
         let inside = all(mp >= vec2<f32>(0.0)) && all(mp < msize);
         var m: f32;

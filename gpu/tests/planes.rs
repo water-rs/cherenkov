@@ -700,53 +700,60 @@ mod macos {
             );
             // `readyForDisplay` posts its change notification, whose
             // handler re-reads the flag on main and wakes the loop. A
-            // renderer that cannot show the probe reports it through a
-            // failed status — the platform's concrete "never ready" — so
-            // a deadline is only ever a test failure, never the answer.
+            // renderer that fails asynchronously reports it through a
+            // failed status — the concrete "cannot show" (a synchronous
+            // rejection already panics in `show`); the deadline is only
+            // ever a test failure, never the answer.
             loop {
                 if self.probe_failed() {
                     return false;
                 }
+                // Clear `woke` before the render: a bounce landing while
+                // the waker was disarmed has still stored the flag this
+                // render's `prepare` reads, and a bounce landing on the
+                // armed waker leaves the callback's flag — no signal
+                // from the notification is lost either way.
+                self.woke.store(false, Ordering::Relaxed);
                 drain_main();
                 self.engine.render(FrameTime::now()).expect("rendered");
                 drain_main();
                 if !displays(&self.root()).is_empty() {
                     break;
                 }
-                self.woke.store(false, Ordering::Relaxed);
-                // Wait on the platform's own signals: the notification's
-                // wake, the probe reporting ready (a flag can land while
-                // the waker was disarmed — the coalesced wake fires once
-                // per render), or the renderer's failure.
                 drive(
                     Instant::now() + Duration::from_secs(10),
-                    &|| {
-                        self.woke.load(Ordering::Acquire)
-                            || self.probe_failed()
-                            || probes(&self.host())
-                                .iter()
-                                .all(|d| unsafe { d.isReadyForDisplay() })
-                    },
-                    &|| {
-                        if probes(&self.host())
-                            .iter()
-                            .all(|d| unsafe { d.isReadyForDisplay() })
-                        {
-                            "the probe reported ready but the plan kept \
-                            the frame in the engine"
-                                .into()
-                        } else {
-                            "the readiness signal never arrived".into()
-                        }
-                    },
+                    &|| self.woke.load(Ordering::Acquire) || self.probe_failed(),
+                    &|| "the readiness signal never arrived".into(),
+                );
+                if self.probe_failed() {
+                    return false;
+                }
+                // The wake means the flag was just re-evaluated; the
+                // render reading it must promote — anything less with a
+                // ready probe is a planner rejection of an eligible
+                // scene; a not-ready probe's wake was a down-flip and
+                // the loop waits for the next evaluation.
+                drain_main();
+                self.engine.render(FrameTime::now()).expect("rendered");
+                drain_main();
+                if !displays(&self.root()).is_empty() {
+                    break;
+                }
+                assert!(
+                    !probes(&self.host())
+                        .iter()
+                        .all(|d| unsafe { d.isReadyForDisplay() }),
+                    "the probe reported ready but the plan kept the frame \
+                    in the engine"
                 );
             }
             settle(&self.host());
             true
         }
 
-        /// Whether a parked probe's renderer reports it cannot show the
-        /// sample — the platform's concrete "never ready".
+        /// Whether a parked probe's renderer failed asynchronously —
+        /// the platform's "cannot show this"; a synchronous rejection at
+        /// the enqueue is instead a `show` panic.
         fn probe_failed(&self) -> bool {
             probes(&self.host()).iter().any(|d| unsafe {
                 d.sampleBufferRenderer().status()
@@ -1124,8 +1131,9 @@ mod macos {
     }
 
     /// The pixels a window and an offscreen engine surface produce from
-    /// the same scene, compared the way
-    /// `promoted_composition_matches_engine_composition` does.
+    /// the same scene, compared within the perceptual tolerance used for
+    /// promoted-vs-engine checks: FLIP mean at most 0.05 and no local
+    /// error above 0.25.
     fn engine_parity(fixture: &Fixture, offscreen: &Surface<Gpu>, what: &str) {
         let engine = offscreen.readback().expect("engine composition");
         let system = fixture.system.composite();

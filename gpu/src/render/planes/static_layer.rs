@@ -71,6 +71,16 @@ impl Observation {
         }
     }
 
+    /// Invalidate pixels while retaining the observed content lifetime.
+    pub fn change(&mut self, stamp: u64, resources: (u64, u64)) {
+        self.quiet_required = self.quiet_required.max(self.quiet_frames.saturating_add(1));
+        self.stamp = stamp;
+        self.resources = resources;
+        self.quiet_frames = 0;
+        self.domain = None;
+        self.capture = None;
+    }
+
     /// True only on entry to a new stable interval: bounds are computed once.
     pub fn observe(&mut self, stamp: u64, resources: (u64, u64), density: f64) -> bool {
         let content_changed = self.stamp != stamp || self.resources != resources;
@@ -78,7 +88,7 @@ impl Observation {
             self.quiet_frames = self.quiet_frames.saturating_add(1);
         } else {
             if content_changed {
-                self.quiet_required = self.quiet_required.max(self.quiet_frames.saturating_add(1));
+                self.change(stamp, resources);
             }
             self.stamp = stamp;
             self.resources = resources;
@@ -289,6 +299,9 @@ pub fn domain(
     density: f64,
     max: u32,
 ) -> Result<Option<Domain>, RenderError> {
+    if !density.is_finite() || density <= 0.0 {
+        return Ok(None);
+    }
     let Some(bounds) = bounds(ops, list, fonts)? else {
         return Ok(None);
     };
@@ -302,8 +315,12 @@ pub fn domain(
     if !bounds.is_finite() || bounds.width() > f64::from(max) || bounds.height() > f64::from(max) {
         return Ok(None);
     }
+    let origin = bounds.origin().to_vec2() / density;
+    if !origin.is_finite() {
+        return Ok(None);
+    }
     Ok(Some(Domain {
-        origin: bounds.origin().to_vec2() / density,
+        origin,
         density,
         size: (bounds.width() as u32, bounds.height() as u32),
     }))
@@ -312,6 +329,44 @@ pub fn domain(
 #[cfg(test)]
 mod tests {
     use super::Observation;
+
+    #[test]
+    fn capture_domain_rejects_invalid_density_and_origin() {
+        let picture = cherenkov::Picture::record(|_| {});
+        let ops = [super::Op::Shadow {
+            local: kurbo::Affine::IDENTITY,
+            ambient: kurbo::Affine::IDENTITY,
+            shape: crate::render::instance::Shape::rect([16., 16.]),
+            bounds: kurbo::Rect::new(0., 0., 32., 32.),
+            sigma_eff: 0.,
+            color: [1.; 4],
+        }];
+        for density in [0., -1., f64::NAN, f64::INFINITY, f64::MIN_POSITIVE / 16.] {
+            assert_eq!(
+                super::domain(
+                    &ops,
+                    picture.display_list(),
+                    &Default::default(),
+                    density,
+                    4096
+                )
+                .unwrap(),
+                None,
+                "density {density}"
+            );
+        }
+        let domain = super::domain(
+            &ops,
+            picture.display_list(),
+            &Default::default(),
+            1.25,
+            4096,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(domain.density, 1.25);
+        assert!(domain.raster().is_finite());
+    }
 
     #[test]
     fn periodic_content_must_outlast_its_previous_lifetime() {

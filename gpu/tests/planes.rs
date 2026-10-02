@@ -52,7 +52,7 @@ mod macos {
     use objc2::runtime::{AnyObject, NSObjectProtocol as _, ProtocolObject};
     use objc2::{MainThreadMarker, MainThreadOnly as _};
     use objc2_app_kit::NSView;
-    use objc2_av_foundation::AVSampleBufferDisplayLayer;
+    use objc2_av_foundation::{AVQueuedSampleBufferRenderingStatus, AVSampleBufferDisplayLayer};
     use objc2_core_foundation::{
         CFDictionary, CFRetained, CFRunLoop, CFString, CFType, CGAffineTransform, CGPoint, CGRect,
         CGSize, kCFRunLoopDefaultMode,
@@ -352,17 +352,6 @@ mod macos {
             assert!(Instant::now() < deadline, "{}", what());
             CFRunLoop::run_in_mode(mode, 0.005, true);
         }
-    }
-
-    /// `drive` without the assert: `false` when the deadline passed —
-    /// the caller reads that as the signal's absence, not a failure.
-    fn drive_until(deadline: Instant, done: &dyn Fn() -> bool) -> bool {
-        // SAFETY: the mode is an immutable static.
-        let mode = unsafe { kCFRunLoopDefaultMode };
-        while !done() && Instant::now() < deadline {
-            CFRunLoop::run_in_mode(mode, 0.005, true);
-        }
-        done()
     }
 
     /// Drives the main run loop until `flag` is set — the completion
@@ -709,37 +698,59 @@ mod macos {
                 &|| !probes(&self.host()).is_empty(),
                 &|| "the queued attach never parked a probe".into(),
             );
-            // `readyForDisplay` flips on the platform's clock, or not at
-            // all on a host that cannot show the probe — the deadline
-            // reads that absence as `false`, never as a failure.
-            let ready = drive_until(Instant::now() + Duration::from_secs(10), &|| {
-                let probes = probes(&self.host());
-                !probes.is_empty() && probes.iter().all(|d| unsafe { d.isReadyForDisplay() })
-            });
-            if !ready {
-                return false;
-            }
-            self.woke.store(false, Ordering::Relaxed);
-            // The notification's bounce re-reads the flag on main and
-            // wakes the loop — post-attach, that is the only wake still
-            // owed. A drain lands it if it is already queued; if the
-            // render still cannot promote, the wake is still in flight.
-            drain_main();
-            self.engine.render(FrameTime::now()).expect("rendered");
-            drain_main();
-            if displays(&self.root()).is_empty() {
-                settle_flag(&self.woke, "the readiness wake never landed");
+            // `readyForDisplay` posts its change notification, whose
+            // handler re-reads the flag on main and wakes the loop. A
+            // renderer that cannot show the probe reports it through a
+            // failed status — the platform's concrete "never ready" — so
+            // a deadline is only ever a test failure, never the answer.
+            loop {
+                if self.probe_failed() {
+                    return false;
+                }
                 drain_main();
                 self.engine.render(FrameTime::now()).expect("rendered");
                 drain_main();
+                if !displays(&self.root()).is_empty() {
+                    break;
+                }
+                self.woke.store(false, Ordering::Relaxed);
+                // Wait on the platform's own signals: the notification's
+                // wake, the probe reporting ready (a flag can land while
+                // the waker was disarmed — the coalesced wake fires once
+                // per render), or the renderer's failure.
+                drive(
+                    Instant::now() + Duration::from_secs(10),
+                    &|| {
+                        self.woke.load(Ordering::Acquire)
+                            || self.probe_failed()
+                            || probes(&self.host())
+                                .iter()
+                                .all(|d| unsafe { d.isReadyForDisplay() })
+                    },
+                    &|| {
+                        if probes(&self.host())
+                            .iter()
+                            .all(|d| unsafe { d.isReadyForDisplay() })
+                        {
+                            "the probe reported ready but the plan kept \
+                            the frame in the engine"
+                                .into()
+                        } else {
+                            "the readiness signal never arrived".into()
+                        }
+                    },
+                );
             }
-            assert!(
-                !displays(&self.root()).is_empty(),
-                "the platform reported the probe ready but the plan \
-                rejected an eligible candidate"
-            );
             settle(&self.host());
             true
+        }
+
+        /// Whether a parked probe's renderer reports it cannot show the
+        /// sample — the platform's concrete "never ready".
+        fn probe_failed(&self) -> bool {
+            probes(&self.host()).iter().any(|d| unsafe {
+                d.sampleBufferRenderer().status()
+            } == AVQueuedSampleBufferRenderingStatus::Failed)
         }
     }
 
@@ -1109,19 +1120,7 @@ mod macos {
         }
         // The parity holds either way: a host that never reports the
         // probe ready shows the engine's own composition in the window.
-        let engine = offscreen.readback().expect("engine composition");
-        let system = fixture.system.composite();
-        let image = |pixels: Vec<[f32; 4]>| cherenkov_oracle::F32Image {
-            width: SIZE.0,
-            height: SIZE.1,
-            pixels,
-        };
-        let (metrics, _) =
-            cherenkov_oracle::metrics::compare(&image(engine.pixels), &image(system));
-        assert!(
-            metrics.flip_mean <= 0.05 && metrics.max_local_error <= 0.25,
-            "promoted vs engine composition: {metrics:?}"
-        );
+        engine_parity(&fixture, &offscreen, "promoted");
     }
 
     /// The pixels a window and an offscreen engine surface produce from

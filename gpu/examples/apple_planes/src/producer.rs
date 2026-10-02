@@ -28,20 +28,11 @@ use objc2_core_video::{
     CVPixelBufferUnlockBaseAddress, kCVPixelBufferIOSurfacePropertiesKey,
     kCVPixelBufferMetalCompatibilityKey, kCVPixelFormatType_32BGRA, kCVReturnSuccess,
 };
-use objc2_io_surface::IOSurfaceRef;
 use objc2_metal::{MTLDevice, MTLPixelFormat, MTLTextureDescriptor, MTLTextureUsage};
 
 use crate::app::die;
 use crate::log;
 use crate::pattern::{self, HEIGHT, WIDTH};
-
-#[link(name = "IOSurface", kind = "framework")]
-unsafe extern "C" {
-    /// Whether the surface is in use by any process in the system —
-    /// the render server showing it on screen counts. The only
-    /// supported "is it still displayed" check.
-    fn IOSurfaceIsInUse(buffer: *const IOSurfaceRef) -> bool;
-}
 
 /// Four buffers cover the engine's plus the compositor's read latency
 /// with slack; a deeper stall simply pauses the video.
@@ -255,25 +246,21 @@ impl Pool {
     }
 
     /// Frees slots whose readers finished: `produced - generation`
-    /// past [`RETIRE_MARGIN`] (compositor release), the render serial
-    /// that first presented the next generation completed on the GPU
-    /// (engine release), and `IOSurfaceIsInUse` says no process still
-    /// maps the surface — a lagging render server can never have its
-    /// on-screen surface rewritten under it.
+    /// past [`RETIRE_MARGIN`] (compositor release — the display layer
+    /// drops a sample as soon as a newer one shows, so a surface two
+    /// generations back is never on screen) and the render serial that
+    /// first presented the next generation completed on the GPU
+    /// (engine release). `IOSurfaceIsInUse` cannot stand in for the
+    /// margin: a buffer's own retention of its surface counts toward
+    /// the system-wide use count, so a kept pool buffer never reports
+    /// unused.
     fn drain(&mut self) {
         let completed = self.completed.load(Ordering::Acquire);
         for slot in &mut self.slots {
             let Some(flight) = &slot.flight else {
                 continue;
             };
-            // SAFETY: the pixel buffer's own surface. A buffer without
-            // one violates the pool's own contract — the buffers are
-            // IOSurface-backed by construction.
-            let surface = CVPixelBufferGetIOSurface(Some(&slot.buffer))
-                .unwrap_or_else(|| die("a pool buffer has no IOSurface"));
-            let in_use = unsafe { IOSurfaceIsInUse(&raw const *surface) };
-            if !in_use
-                && self.produced >= flight.generation + RETIRE_MARGIN
+            if self.produced >= flight.generation + RETIRE_MARGIN
                 && completed >= flight.retire_serial
             {
                 slot.flight = None;

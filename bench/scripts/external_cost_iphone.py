@@ -84,23 +84,34 @@ def devicectl(*args):
     return result.stdout
 
 
-def copy_from(source, dest):
-    """Copy `source` from the app container into a fresh directory.
+def device_copy_from(source, dest):
+    """Copy `source` out of the app container.
 
-    devicectl copies the contents of a Documents path without the
-    Documents/ wrapper, so a directory source lands its children in
-    `dest`. Returns False when the source is not there yet.
+    The destination must not already exist: a file source lands as that
+    file, and a directory source lands as its contents, without a
+    Documents/ wrapper. Copying a file onto an existing directory fails.
     """
     if dest.exists():
-        shutil.rmtree(dest)
-    dest.mkdir(parents=True)
-    result = run([
+        if dest.is_dir():
+            shutil.rmtree(dest)
+        else:
+            dest.unlink()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    return run([
         "xcrun", "devicectl", "device", "copy", "from",
         "--device", UDID, "--domain-type", "appDataContainer",
         "--domain-identifier", BUNDLE,
         "--source", source, "--destination", str(dest),
     ])
-    return result.returncode == 0
+
+
+def fetched(source, dest):
+    """The file `device_copy_from` just wrote, wherever devicectl put it."""
+    if dest.is_file():
+        return dest
+    if dest.is_dir():
+        return find_named(dest, pathlib.Path(source).name)
+    return None
 
 
 def find_named(root, name):
@@ -195,23 +206,24 @@ def exe_sha256(app):
     return digest
 
 
-def wait_file(source, name, timeout, predicate):
-    """Poll `source` until `name` appears and `predicate` accepts it."""
+def wait_file(source, dest, timeout, predicate):
+    """Poll `source` until it copies to `dest` and `predicate` accepts it."""
     deadline = time.monotonic() + timeout
-    scratch = pathlib.Path("/tmp/external-cost-iphone/.pull-{}".format(name))
     last = None
     while time.monotonic() < deadline:
-        if copy_from(source, scratch):
-            found = find_named(scratch, name)
-            if found is not None:
-                try:
-                    if predicate(found):
-                        return found.read_bytes()
-                except (OSError, json.JSONDecodeError, KeyError, IndexError, AssertionError) as exc:
-                    last = exc
+        result = device_copy_from(source, dest)
+        found = fetched(source, dest)
+        if found is not None:
+            try:
+                if predicate(found):
+                    return found.read_bytes()
+            except (OSError, json.JSONDecodeError, KeyError, IndexError, AssertionError) as exc:
+                last = exc
+        else:
+            last = (result.stderr or result.stdout or "").strip()
         time.sleep(2)
     raise RuntimeError(
-        "timeout waiting for {} ({})".format(name, last)
+        "timeout waiting for {} ({})".format(source, last)
     )
 
 
@@ -273,15 +285,19 @@ def cycle(app, path, size, transfer, rep, order_name, run_id, out_dir, identity)
         "--source", str(args_file),
         "--destination", "Documents/bench-args.json",
     )
-    back_dir = out_dir / ".args-back"
-    if not copy_from("Documents/bench-args.json", back_dir):
-        raise RuntimeError("bench-args.json readback copy failed")
-    back = find_named(back_dir, "bench-args.json")
+    back_path = out_dir / "args-readback.json"
+    back_result = device_copy_from("Documents/bench-args.json", back_path)
+    back = fetched("Documents/bench-args.json", back_path)
     if back is None or json.loads(back.read_text()) != [args]:
-        raise RuntimeError("bench-args.json readback mismatch")
+        raise RuntimeError(
+            "bench-args.json readback failed: {}".format(
+                (back_result.stderr or back_result.stdout or "").strip()
+            )
+        )
 
-    stale = out_dir / ".thermal-stale"
-    if copy_from("Documents/thermal.json", stale) and find_named(stale, "thermal.json"):
+    stale_path = out_dir / "thermal-stale.json"
+    device_copy_from("Documents/thermal.json", stale_path)
+    if fetched("Documents/thermal.json", stale_path) is not None:
         raise RuntimeError("stale thermal.json survived uninstall")
 
     launched_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -292,7 +308,7 @@ def cycle(app, path, size, transfer, rep, order_name, run_id, out_dir, identity)
 
     thermal_bytes = wait_file(
         "Documents/thermal.json",
-        "thermal.json",
+        out_dir / "thermal.json",
         60,
         lambda path: "state" in json.loads(path.read_text()),
     )
@@ -301,7 +317,7 @@ def cycle(app, path, size, transfer, rep, order_name, run_id, out_dir, identity)
     if thermal not in OK_THERMAL:
         wait_file(
             "Documents/out/done.json",
-            "done.json",
+            out_dir / "done-hot.json",
             45,
             lambda path: json.loads(path.read_text()).get("thermal") == thermal,
         )
@@ -318,7 +334,8 @@ def cycle(app, path, size, transfer, rep, order_name, run_id, out_dir, identity)
     deadline = time.monotonic() + 300
     pulled = None
     while time.monotonic() < deadline:
-        if copy_from("Documents/out", scratch):
+        result = device_copy_from("Documents/out", scratch)
+        if result.returncode == 0 or scratch.exists():
             done = find_named(scratch, "done.json")
             log = find_named(scratch, "run-0.log")
             report_file = find_named(scratch, "ext-{}-{}.json".format(name, run_id))
@@ -442,12 +459,22 @@ def main():
     parser.add_argument("--app", default=os.path.expanduser(DEFAULT_APP))
     parser.add_argument("--out-dir", default="/tmp/external-cost-iphone")
     parser.add_argument("--head", default="unknown")
+    parser.add_argument(
+        "--lock-waited",
+        type=float,
+        default=0.0,
+        help="seconds already spent blocked on the device lock",
+    )
     args = parser.parse_args()
+    global lock_waited
+    lock_waited = args.lock_waited
     out_dir = pathlib.Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     identity = {"cdhash": cdhash(args.app), "exe_sha256": exe_sha256(args.app)}
     print(
-        "binary {} {}".format(identity["cdhash"], identity["exe_sha256"][:16]),
+        "binary {} {} lock_waited {:.1f}s".format(
+            identity["cdhash"], identity["exe_sha256"][:16], lock_waited
+        ),
         flush=True,
     )
     status_path = out_dir / "status.json"

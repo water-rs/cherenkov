@@ -338,6 +338,11 @@ pub struct CapacityResult {
     /// The upstream API the engine lacks, when known (see
     /// [`UnsupportedReport::missing_api`]).
     pub missing_api: Option<&'static str>,
+    /// The probe error that stopped the sweep mid-run, when one did.
+    /// `max_k` is then the largest `k` sustained before the failure, and
+    /// `p99_seconds_next` the over-budget or failed level.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub error: Option<String>,
     /// The largest probed `k` within the frame budget. `0` means even
     /// `k = 1` exceeded it.
     pub max_k: u32,

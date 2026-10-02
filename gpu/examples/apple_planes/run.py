@@ -40,6 +40,13 @@ def measure(args):
     signal.signal(signal.SIGALRM, lock_timeout)
     order = ["plane", "engine"] * 6 + ["engine", "plane", "engine", "plane"]
     for index, mode in enumerate(order):
+        result_path = args.out / f"{index:02d}-{mode}.json"
+        if index < args.start_index:
+            if not result_path.is_file():
+                raise RuntimeError(f"missing completed window: {result_path}")
+            continue
+        if result_path.exists():
+            raise RuntimeError(f"refusing to overwrite completed window: {result_path}")
         identity = str(uuid.uuid4())
         print(now(), "waiting for lock", index, mode, flush=True)
         with LOCK.open("a+") as lock:
@@ -72,7 +79,6 @@ def measure(args):
                     "--run-id",
                     identity,
                 )
-                result_path = args.out / f"{index:02d}-{mode}.json"
                 command(
                     log,
                     "device",
@@ -112,6 +118,7 @@ def main():
     parser.add_argument("--app", type=pathlib.Path, required=True)
     parser.add_argument("--out", type=pathlib.Path, required=True)
     parser.add_argument("--completion-fifo", type=pathlib.Path, required=True)
+    parser.add_argument("--start-index", type=int, choices=range(16), default=0)
     args = parser.parse_args()
     result = {"time": now(), "exit_code": 1}
     try:

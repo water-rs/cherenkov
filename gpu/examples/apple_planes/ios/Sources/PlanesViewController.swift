@@ -23,6 +23,7 @@ final class PlanesViewController: UIViewController {
     private var link: CADisplayLink?
     private var started = false
     private var lastSize = CGSize.zero
+    private var coolingDeadline: DispatchWorkItem?
 
     override func loadView() {
         view = PlanesView()
@@ -34,6 +35,7 @@ final class PlanesViewController: UIViewController {
         guard let window = view.window, size.width > 0, size.height > 0 else { return }
         let scale = window.screen.nativeScale
         if !started {
+            guard readyToStart() else { return }
             started = true
             lastSize = size
             cherenkov_planes_start(
@@ -55,6 +57,32 @@ final class PlanesViewController: UIViewController {
         }
     }
 
+    /// Observe real thermal recovery before creating the engine. The deadline
+    /// only aborts a failed cool-down; it never starts a measurement.
+    private func readyToStart() -> Bool {
+        if ProcessInfo.processInfo.thermalState.rawValue >= ProcessInfo.ThermalState.serious.rawValue {
+            if coolingDeadline == nil {
+                NSLog("Waiting for thermal recovery before starting the harness")
+                let deadline = DispatchWorkItem {
+                    NSLog("Thermal recovery timed out after fifteen minutes")
+                    exit(EXIT_FAILURE)
+                }
+                coolingDeadline = deadline
+                DispatchQueue.main.asyncAfter(deadline: .now() + 900, execute: deadline)
+            }
+            return false
+        }
+        coolingDeadline?.cancel()
+        coolingDeadline = nil
+        return true
+    }
+
+    @objc private func thermalChanged() {
+        DispatchQueue.main.async {
+            if !self.started { self.view.setNeedsLayout() }
+        }
+    }
+
     @objc private func step() {
         link?.isPaused = cherenkov_planes_tick()
         if cherenkov_planes_finished() {
@@ -67,6 +95,12 @@ final class PlanesViewController: UIViewController {
 
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(thermalChanged),
+            name: ProcessInfo.thermalStateDidChangeNotification,
+            object: nil
+        )
         NotificationCenter.default.addObserver(self, selector: #selector(resume), name: Notification.Name("CherenkovPlanesWake"), object: nil)
         NotificationCenter.default.addObserver(
             self,

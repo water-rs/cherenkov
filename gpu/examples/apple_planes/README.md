@@ -24,6 +24,9 @@ call. Callback cadence is reported separately; neither is GPU execution
 time. Memory includes engine GPU/CPU bytes, current process physical
 footprint, and lifetime peak footprint. Serious or critical thermal state
 invalidates the run. The host sets screen brightness to its minimum.
+Before creating the engine, the host waits for a thermal-state notification
+when the phone is serious or critical. A fifteen-minute cooling deadline
+fails the run; it never starts a measurement without thermal recovery.
 
 ## Build on the Mac mini
 
@@ -68,3 +71,7 @@ nohup python3 gpu/examples/apple_planes/run.py \
 Wait with `cat /tmp/cherenkov-apple-measurement/done`. The FIFO receives one
 completion record and closes; `results/completion.json` preserves the same
 record. Keep result JSON, logs and measurement reports outside git.
+After diagnosing an interrupted run, `--start-index N` resumes at its first
+unfinished window without changing the order. Every preceding result must
+exist, and completed results are never overwritten. Preserve the failed
+attempt's log and completion record before resuming in the same directory.

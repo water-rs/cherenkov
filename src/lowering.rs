@@ -304,22 +304,17 @@ fn walk<C: Compiler>(
     Ok(())
 }
 
-/// Whether any command in `range` may paint a pixel of alpha below
-/// one: a paint that is not opaque everywhere, an image or a shadow whose
-/// alpha is not statically known, glyph runs (coverage is partial by
-/// nature), or a group drawn below full opacity or behind a filter.
-/// Nested pictures count. Opaque fills and strokes count as opaque —
-/// their antialiased edges sit inside the perceptual tolerance a
-/// compositor is verified against.
+/// Whether recorded content can produce partial coverage. Even an opaque
+/// paint has fractional alpha at antialiased geometry and clip edges; paint
+/// alpha alone never proves an overlaid engine part safe for promotion.
 pub(crate) fn translucent_within(list: &DisplayList, range: Range<usize>) -> bool {
     for command in &list.commands()[range] {
         match command {
-            Command::Fill { paint, .. } | Command::Stroke { paint, .. } => {
-                if !paint.is_opaque() {
-                    return true;
-                }
-            }
-            Command::Glyphs { .. } | Command::Image { .. } | Command::Shadow { .. } => {
+            Command::Fill { .. }
+            | Command::Stroke { .. }
+            | Command::Glyphs { .. }
+            | Command::Image { .. }
+            | Command::Shadow { .. } => {
                 return true;
             }
             Command::BeginGroup { group, .. } => {

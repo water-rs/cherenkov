@@ -221,7 +221,6 @@ struct Visit {
 struct VisitDevice {
     space: Affine,
     bounds: Option<Rect>,
-    surface: bool,
 }
 
 /// Reusable workspace for a plan walk: the paint order (each visit's
@@ -275,12 +274,9 @@ fn paint_order<'a>(
 fn devices(tree: &SurfaceTree, order: &[Visit], device: &mut Vec<VisitDevice>) {
     device.clear();
     for visit in order {
-        let surface = visit
-            .ancestors
-            .iter()
-            .all(|&a| !isolates(tree, order[a].id));
         let mut space = Affine::IDENTITY;
         let mut bounds = None;
+        let mut projective = false;
         for id in visit
             .ancestors
             .iter()
@@ -288,6 +284,7 @@ fn devices(tree: &SurfaceTree, order: &[Visit], device: &mut Vec<VisitDevice>) {
             .chain([visit.id])
         {
             let level = tree.layer(id);
+            projective |= tree.projective_pose(id).is_some();
             let own = space * level.transform;
             if let Some(clip) = &level.clip {
                 let clipped = own.transform_rect_bbox(clip.bounds());
@@ -295,10 +292,12 @@ fn devices(tree: &SurfaceTree, order: &[Visit], device: &mut Vec<VisitDevice>) {
             }
             space = own * Affine::translate(-level.scroll_offset);
         }
+        // A pose replaces the affine transform. Without projecting its
+        // full clipped footprint, no finite affine bound is a safe proof
+        // of non-overlap, including for descendants of the posed layer.
         device.push(VisitDevice {
             space,
-            bounds,
-            surface,
+            bounds: if projective { None } else { bounds },
         });
     }
 }
@@ -579,8 +578,10 @@ fn judge<C: Compositor>(
         f64::from(size.1),
     ));
     for j in i + 1..order.len() {
-        if device[j].surface
-            && translucent(tree, order[j].id)
+        // Children of an isolated layer still contribute alpha to its
+        // output. Inspect them too, rather than treating isolation as
+        // proof that the group will composite opaquely over the video.
+        if translucent(tree, order[j].id)
             && device[j].bounds.is_none_or(|bounds| bounds.overlaps(rect))
         {
             return Err(Ineligible::TranslucentAbove(order[j].id));
@@ -755,6 +756,18 @@ pub trait SystemPlanes: Compositor {
         let _ = candidates;
     }
 
+    /// Queues realization with the installed frames available for a
+    /// platform readiness probe. The default keeps synchronous platforms'
+    /// behavior unchanged.
+    fn groom_with_frames(
+        &mut self,
+        candidates: &FxHashMap<LayerId, (u32, u32)>,
+        frames: &FxHashMap<LayerId, (ExternalFrame, u64)>,
+    ) {
+        let _ = frames;
+        self.groom(candidates);
+    }
+
     /// Whether the last [`SystemPlanes::groom`] found a newly ready
     /// candidate the plan has not been offered: the renderer re-lowers
     /// the surface so the plan can promote it. `false` for synchronous
@@ -773,9 +786,10 @@ pub trait SystemPlanes: Compositor {
     fn prepare(
         &mut self,
         candidates: &FxHashMap<LayerId, (u32, u32)>,
+        frames: &FxHashMap<LayerId, (ExternalFrame, u64)>,
         ready: &mut FxHashSet<LayerId>,
     ) {
-        self.groom(candidates);
+        self.groom_with_frames(candidates, frames);
         ready.clear();
         ready.extend(candidates.keys().copied());
     }

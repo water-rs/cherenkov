@@ -455,13 +455,12 @@ impl SurfaceTree {
                 });
                 node.content_translucent |=
                     updates.iter().any(|SlotUpdate { value, .. }| match value {
-                        Operand::Paint(paint) => !paint.is_opaque(),
+                        Operand::Paint(_) | Operand::Shadow(_) | Operand::Run(_) => true,
                         Operand::Group(group) => {
                             group.opacity < 1.0
                                 || group.blend != BlendMode::Normal
                                 || group.filter.is_some()
                         }
-                        Operand::Shadow(_) | Operand::Run(_) => true,
                         Operand::Shape(_)
                         | Operand::Stroke(_)
                         | Operand::Transform(_)

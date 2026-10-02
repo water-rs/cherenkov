@@ -1068,6 +1068,13 @@ mod front {
             /// The member ops.
             ops: Vec<Self>,
         },
+        /// A text layer's source — a `c.text` draw of the parley layout.
+        Text {
+            /// The layout, its fonts registered.
+            layout: cherenkov::TextLayout,
+            /// Where the layout's top-left corner lands.
+            origin: kurbo::Point,
+        },
     }
 
     /// The front-end blend mode matching a scene mode one-for-one by name.
@@ -1341,6 +1348,45 @@ mod front {
                     cherenkov_scene::BlendSpace::SrgbEncoded => cherenkov::BlendSpace::SrgbEncoded,
                 }),
             ops,
+        })
+    }
+
+    /// A text layer's source → an [`Op::Text`]: the source shaped with
+    /// parley, its paints lowered like any draw's, and each run's font
+    /// resolved to the engine font registered for its blob.
+    ///
+    /// # Errors
+    /// [`BenchError`] on a missing blob, an unregistered font or image, an
+    /// unsupported paint, or a layout the engine's text adapter rejects.
+    pub fn text_op(
+        source: &cherenkov_scene::TextSource,
+        fonts: &HashMap<(ResourceHash, u32), cherenkov::Font>,
+        images: &HashMap<(ResourceHash, cherenkov_scene::ImageEncoding), cherenkov::ImageId>,
+        blobs: &Blobs,
+        front: &Front,
+    ) -> Result<Op, BenchError> {
+        let cherenkov_scene::ShapedText { layout, resources } = source.shape(
+            |hash| blobs.get(hash).map(Vec::as_slice),
+            |paint| front_paint(paint, images, front),
+        )?;
+        let fonts_of = |data: &cherenkov::parley::FontData| {
+            resources
+                .resource(data)
+                .and_then(|hash| fonts.get(&(hash, data.index)))
+                .cloned()
+                .ok_or_else(|| {
+                    cherenkov::ResourceError::Font(format!(
+                        "no registered font for blob {} index {}",
+                        data.data.id(),
+                        data.index
+                    ))
+                })
+        };
+        let layout = cherenkov::TextLayout::new(layout, fonts_of)
+            .map_err(|e| BenchError::Engine(format!("{}: text layout: {e}", front.engine)))?;
+        Ok(Op::Text {
+            layout,
+            origin: source.origin,
         })
     }
 

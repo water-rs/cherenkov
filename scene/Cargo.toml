@@ -15,7 +15,8 @@ default = []
 # Tooling for authoring the corpus: text shaping with parley and font
 # subsetting with skera. Only needed by the corpus binaries.
 generator = [
-    "dep:parley",
+    "text",
+    "parley/system",
     "dep:fontique",
     "dep:skera",
     "dep:skrifa",
@@ -26,6 +27,10 @@ generator = [
     "dep:tracing-subscriber",
 ]
 
+# Shapes a text layer's source with parley (`TextSource::shape`): the
+# corpus generator and the Cherenkov adapters.
+text = ["dep:parley"]
+
 [dependencies]
 kurbo = { version = "0.13", features = ["serde"] }
 libm = "0.2"
@@ -33,7 +38,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 blake3 = "1"
 thiserror = "2"
-parley = { version = "0.11", optional = true }
+parley = { version = "0.11", optional = true, default-features = false, features = ["std"] }
 fontique = { version = "0.11", optional = true }
 skera = { version = "0.7", optional = true }
 skrifa = { version = "0.44", optional = true }

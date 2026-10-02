@@ -20,6 +20,7 @@ mod error;
 mod layer;
 mod scene;
 mod shape;
+mod text;
 
 #[cfg(feature = "generator")]
 #[doc(hidden)]
@@ -41,6 +42,9 @@ pub use layer::{
 };
 pub use scene::{Feature, Scene, WorkingSpace};
 pub use shape::{ContinuousRect, Shape};
+#[cfg(feature = "text")]
+pub use text::{FontResources, ShapedText};
+pub use text::{TextDecoration, TextSource, TextSpan};
 
 /// A BLAKE3 content hash naming a blob in a scene's `resources/` directory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

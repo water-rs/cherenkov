@@ -29,8 +29,8 @@ impl Domain {
 /// presentation buffer until content changes or promotion ends.
 pub struct Capture {
     pub domain: Domain,
-    pub texture: wgpu::Texture,
-    pub view: wgpu::TextureView,
+    /// Released after native publication; the capture generation remains.
+    pub source: Option<(wgpu::Texture, wgpu::TextureView)>,
     pub generation: u64,
     pub dirty: bool,
 }
@@ -48,8 +48,11 @@ pub struct Observation {
 
 impl Capture {
     pub fn bytes(&self) -> u64 {
-        u64::from(self.domain.size.0) * u64::from(self.domain.size.1)
-            * crate::render::texel_bytes(crate::render::TARGET_FORMAT)
+        self.source.as_ref().map_or(0, |_| {
+            u64::from(self.domain.size.0)
+                * u64::from(self.domain.size.1)
+                * crate::render::texel_bytes(crate::render::TARGET_FORMAT)
+        })
     }
 }
 
@@ -270,3 +273,4 @@ pub fn domain(
         size: (bounds.width() as u32, bounds.height() as u32),
     }))
 }
+

@@ -733,8 +733,8 @@ pub fn frames_only<C: Compositor>(
 pub enum PlaneContent<'a> {
     /// An immutable capture of a recorded layer in linear Display P3.
     Raster {
-        /// Captured pixels; only a new generation changes them.
-        view: &'a wgpu::TextureView,
+        /// Pixels for a new native capture; absent after publication.
+        view: Option<&'a wgpu::TextureView>,
         /// The capture's content version.
         generation: u64,
     },

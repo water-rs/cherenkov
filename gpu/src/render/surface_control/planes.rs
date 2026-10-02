@@ -55,7 +55,7 @@ struct Promotion<'a> {
 enum Entry<'a> {
     /// Engine-composited content: premultiplied linear Display P3.
     Engine {
-        view: &'a wgpu::TextureView,
+        view: Option<&'a wgpu::TextureView>,
         size: (u32, u32),
         raster: Option<(LayerId, u64)>,
         properties: Properties,
@@ -165,7 +165,7 @@ fn stack<'a>(composition: &Composition<'a>) -> Result<Vec<Entry<'a>>, RenderErro
         let plane = match slot {
             Slot::Part(n) => {
                 entries.push(Entry::Engine {
-                    view: composition.parts[n].view,
+                    view: Some(composition.parts[n].view),
                     size: composition.size,
                     raster: None,
                     properties: Properties {
@@ -186,7 +186,7 @@ fn stack<'a>(composition: &Composition<'a>) -> Result<Vec<Entry<'a>>, RenderErro
             PlaneContent::Frame { frame, generation } => (frame, generation),
             PlaneContent::Raster { view, generation } => {
                 entries.push(Entry::Engine {
-                    view,
+                    view: *view,
                     size: plane.placement.size,
                     raster: Some((layer, *generation)),
                     properties: Properties {
@@ -413,8 +413,8 @@ impl Planes {
     /// system compositor releases them.
     fn resize_parts(&mut self, size: (u32, u32)) {
         self.size = size;
-        for part in &mut self.parts {
-            part.raster = None;
+        // Immutable captures keep their own local extent across resizes.
+        for part in self.parts.iter_mut().filter(|part| part.raster.is_none()) {
             for buffer in part.buffers.drain(..) {
                 if matches!(buffer.state, State::Shown) {
                     self.retiring.push(buffer);
@@ -437,6 +437,10 @@ impl Planes {
             } else if let Some(at) = self.retiring.iter().position(|b| b.id == buffer) {
                 self.retiring.swap_remove(at);
             }
+        }
+        for part in self.parts.iter_mut().filter(|part| part.raster.is_some()) {
+            part.buffers
+                .retain(|buffer| matches!(buffer.state, State::Shown));
         }
     }
 
@@ -512,6 +516,25 @@ impl Planes {
                 headroom: display.headroom,
                 format: buffer::FORMAT,
             });
+        }
+        // Immutable captures follow layer identity, not their current slot
+        // among engine parts. Their engine source is released on publication.
+        for (index, raster) in stack
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Engine { raster, .. } => Some(raster),
+                Entry::Frame(_) => None,
+            })
+            .enumerate()
+        {
+            if let Some((layer, _)) = raster
+                && let Some(old) = self
+                    .parts
+                    .iter()
+                    .position(|part| part.raster.is_some_and(|(id, _)| id == *layer))
+            {
+                self.parts.swap(index, old);
+            }
         }
         let mut chosen = Vec::with_capacity(engine_parts);
         for (part, entry) in stack
@@ -635,7 +658,7 @@ impl Planes {
             presenter.encode(
                 device,
                 &mut blits,
-                source,
+                source.expect("a new native buffer has engine pixels"),
                 output,
                 &self.parts[part].uniform,
                 None,

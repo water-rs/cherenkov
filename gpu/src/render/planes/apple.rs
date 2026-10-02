@@ -1347,7 +1347,7 @@ impl SystemPlanes for LayerPlanes {
                 c.presenter.texture(
                     c.device,
                     c.queue,
-                    view,
+                    view.expect("a new native capture has engine pixels"),
                     crate::interop::TextureOutput {
                         texture: &buffer.texture,
                         color: crate::interop::OutputColor::LinearDisplayP3,

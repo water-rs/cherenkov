@@ -2397,7 +2397,7 @@ fn plane_stack<'a>(
                         .as_ref()
                         .expect("promoted pixels are captured");
                     planes::PlaneContent::Raster {
-                        view: &capture.view,
+                        view: capture.source.as_ref().map(|(_, view)| view),
                         generation: capture.generation,
                     }
                 },
@@ -3532,9 +3532,7 @@ impl GpuRenderer {
         self.drain_timestamps();
         self.plane_only.clear();
         for sf in frame.surfaces {
-            if sf.changed {
-                self.observe_static(sf)?;
-            }
+            self.observe_static(sf)?;
         }
         let mut dirty: Vec<_> = frame
             .surfaces
@@ -3681,9 +3679,7 @@ impl GpuRenderer {
         self.flush_native_releases();
         self.plane_only.clear();
         for sf in frame.surfaces {
-            if sf.changed {
-                self.observe_static(sf)?;
-            }
+            self.observe_static(sf)?;
         }
         let mut dirty: Vec<_> = frame
             .surfaces
@@ -4760,6 +4756,15 @@ impl GpuRenderer {
                     }
                 };
                 surface.present_pending = presentation != planes::Presentation::Presented;
+                if presentation == planes::Presentation::Presented {
+                    for capture in surface
+                        .static_layers
+                        .values_mut()
+                        .filter_map(|entry| entry.capture.as_mut())
+                    {
+                        capture.source = None;
+                    }
+                }
                 if surface.present_pending
                     && let Some(system) = self.planes.get_mut(&sf.id)
                 {
@@ -4980,6 +4985,17 @@ impl GpuRenderer {
         if !surf.promotes {
             return Ok(());
         }
+        let output_changed = sf.display.headroom.to_bits() != surf.display.headroom.to_bits()
+            || sf.display.scale.to_bits() != surf.display.scale.to_bits();
+        if output_changed && !surf.static_layers.is_empty() {
+            for entry in surf.static_layers.values_mut() {
+                entry.capture = None;
+            }
+            surf.plan_dirty = true;
+        }
+        if !sf.changed && !output_changed {
+            return Ok(());
+        }
         let resources = (self.images_gen, self.image_replacements);
         surf.static_layers
             .retain(|layer, _| surf.layers.contains_key(layer));
@@ -5004,9 +5020,9 @@ impl GpuRenderer {
             };
             let stamp = sf.tree.content_stamp(layer);
             // The transformed unit circle's major radius is the largest
-            // singular value. Density buckets keep the texel grid stable.
+            // singular value. Capture at the actual device density.
             let radii = kurbo::Ellipse::from_affine(space).radii();
-            let density = radii.x.max(radii.y).max(1.0).log2().ceil().exp2();
+            let density = radii.x.max(radii.y);
             let entry =
                 surf.static_layers
                     .entry(layer)
@@ -5814,8 +5830,7 @@ impl GpuRenderer {
                 );
                 entry.capture = Some(planes::static_layer::Capture {
                     domain,
-                    texture,
-                    view,
+                    source: Some((texture, view)),
                     generation: self.frame_count,
                     dirty: true,
                 });
@@ -6522,7 +6537,11 @@ impl GpuRenderer {
                         .capture
                         .as_ref()
                         .expect("capture allocated before encode");
-                    (&capture.view, &capture.texture)
+                    let (texture, view) = capture
+                        .source
+                        .as_ref()
+                        .expect("capture source allocated before encode");
+                    (view, texture)
                 }
                 Target::Part(n) => surf.part(n),
                 Target::Scratch(i) => (&surf.scratch[i].view, &surf.scratch[i].texture),
@@ -6544,7 +6563,10 @@ impl GpuRenderer {
                             .capture
                             .as_ref()
                             .expect("allocated capture")
-                            .texture,
+                            .source
+                            .as_ref()
+                            .expect("capture source allocated before encode")
+                            .0,
                         0,
                         0,
                     ),

@@ -361,6 +361,7 @@ const fn inside(winding: i32, rule: FillRule) -> bool {
 #[derive(Default)]
 struct RowScratch {
     bounds: Vec<f64>,
+    starts: Vec<usize>,
     order: Vec<usize>,
     winding: Vec<i32>,
     delta: Vec<(usize, f64)>,
@@ -432,14 +433,29 @@ impl RowScratch {
         }
         self.bounds.sort_unstable_by(f64::total_cmp);
         self.bounds.dedup();
+        self.starts.clear();
+        self.starts.extend(0..lines.len());
+        self.starts
+            .sort_unstable_by(|&a, &b| lines[a].top.total_cmp(&lines[b].top));
+        let mut next = 0;
+        self.order.clear();
         for index in 1..self.bounds.len() {
             let top = self.bounds[index - 1];
             let bottom = self.bounds[index];
             let middle = top.midpoint(bottom);
-            self.order.clear();
-            self.order.extend((0..lines.len()).filter(|&crossing| {
-                lines[crossing].top <= middle && lines[crossing].bottom > middle
-            }));
+            self.order
+                .retain(|&crossing| lines[crossing].bottom > middle);
+            while next < self.starts.len() && lines[self.starts[next]].top <= middle {
+                let crossing = self.starts[next];
+                if lines[crossing].bottom > middle {
+                    self.order.push(crossing);
+                }
+                next += 1;
+            }
+            // Preserve the original boundary order at coincident crossings.
+            // The active set changes only at endpoints; scanning every edge
+            // at every strip made a finely flattened curve quadratic.
+            self.order.sort_unstable();
             self.order.sort_unstable_by(|&first, &second| {
                 lines[first].at(middle).total_cmp(&lines[second].at(middle))
             });

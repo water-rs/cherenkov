@@ -92,6 +92,10 @@ mod macos {
                 static_pixels_are_captured_once_and_match_engine_composition,
             ),
             case(
+                "critical_trim_then_present_only_demotes_static_planes",
+                || static_pixels(true),
+            ),
+            case(
                 "promoted_translation_is_owned_by_core_animation",
                 promoted_translation_is_owned_by_core_animation,
             ),
@@ -1138,6 +1142,10 @@ mod macos {
     }
 
     fn static_pixels_are_captured_once_and_match_engine_composition() {
+        static_pixels(false);
+    }
+
+    fn static_pixels(trim: bool) {
         let fixture = Fixture::new();
         let offscreen = fixture
             .engine
@@ -1185,6 +1193,27 @@ mod macos {
             });
         }
         engine_parity(&fixture, &offscreen, "static IOSurface");
+        if trim {
+            fixture.engine.trim(cherenkov::Pressure::Critical);
+            fixture
+                .window
+                .display(Display {
+                    scale: SCALE,
+                    headroom: 2.0,
+                })
+                .expect("headroom-only update");
+            fixture.render();
+            assert_eq!(stack(&fixture).len(), 1, "trim demotes before presentation");
+            assert!(
+                fixture.engine.stats().passes > 0,
+                "trim reconstructs engine pixels"
+            );
+            engine_parity(&fixture, &offscreen, "trim then present only");
+            fixture.window.display_moved().expect("display move");
+            fixture.render();
+            assert_eq!(stack(&fixture).len(), 1);
+            return;
+        }
         fixture
             .window
             .update_animated(cherenkov::Curve::linear(Duration::from_secs(2)), |tx| {

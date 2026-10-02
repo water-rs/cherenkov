@@ -245,6 +245,8 @@ struct SurfaceState {
     promotes: bool,
     /// This frame's promotion decision; empty unless `promotes`.
     plan: planes::Plan,
+    /// A discarded plan must be lowered again before any presentation.
+    plan_dirty: bool,
     /// Tree version of the retained engine parts, excluding plane poses.
     plane_stamp: u64,
     /// Resource version of those parts.
@@ -2542,6 +2544,7 @@ impl Renderer for GpuRenderer {
                 plane_clear: cherenkov::WorkingColor::TRANSPARENT,
                 plane_size: (0, 0),
                 static_layers: FxHashMap::default(),
+                plan_dirty: false,
                 parts: Vec::new(),
                 frames_installed: 0,
                 textures,
@@ -3083,6 +3086,8 @@ impl Renderer for GpuRenderer {
                 content.trim();
             }
             surf.static_layers.clear();
+            surf.plan = planes::Plan::default();
+            surf.plan_dirty = surf.promotes;
             surf.frame.instances.shrink_to_fit();
             surf.frame.stops.shrink_to_fit();
             surf.frame.passes.shrink_to_fit();
@@ -5039,6 +5044,9 @@ impl GpuRenderer {
         let Some(surface) = self.surfaces.get(&sf.id) else {
             return false;
         };
+        if surface.plan_dirty {
+            return false;
+        }
         if !surface.promotes || surface.present_pending || self.wants_redraw(surface) {
             return false;
         }
@@ -5115,7 +5123,7 @@ impl GpuRenderer {
             let candidates = plane_candidates(surface, &mut self.candidates);
             let frames = plane_frames(surface, &mut self.candidate_frames);
             planes::SystemPlanes::groom_with_frames(system, candidates, frames);
-            if planes::SystemPlanes::wants_plan(system) {
+            if surface.plan_dirty || planes::SystemPlanes::wants_plan(system) {
                 dirty.push(sf);
             }
         }
@@ -5160,6 +5168,7 @@ impl GpuRenderer {
         ready: &FxHashSet<LayerId>,
     ) -> Result<Lowered, RenderError> {
         surf.frame.reset();
+        surf.plan_dirty = false;
         let mut candidates = FxHashMap::default();
         surf.plan = if surf.promotes {
             plane_candidates(surf, &mut candidates);

@@ -1492,8 +1492,12 @@ impl SystemPlanes for LayerPlanes {
                 generation,
             });
         }
+        let previous = self.offered.len();
         self.offered.retain(|layer| candidates.contains_key(layer));
-        self.woke = false;
+        self.woke = previous != self.offered.len();
+        for &layer in &self.static_candidates {
+            self.woke |= self.offered.insert(layer);
+        }
         for (&layer, ready) in &self.candidates {
             if ready.load(Ordering::Acquire) {
                 self.woke |= self.offered.insert(layer);

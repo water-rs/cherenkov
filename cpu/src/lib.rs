@@ -74,7 +74,7 @@ impl std::fmt::Debug for RedrawCallback {
 pub struct RasterInfo {
     /// Number of rayon worker threads.
     pub threads: usize,
-    /// The composite kernel in use (`"scalar"` in this slice).
+    /// The composite kernel in use.
     pub simd: &'static str,
     /// Host CPU model name, best effort.
     pub cpu: Option<String>,

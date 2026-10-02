@@ -130,7 +130,7 @@ pub fn init(config: RasterConfig) -> Result<(RasterRenderer, RasterInfo), Engine
         .map(|pool| {
             let info = RasterInfo {
                 threads: pool.current_num_threads(),
-                simd: "scalar",
+                simd: "wide::f32x4",
                 cpu: cpu_model(),
             };
             (

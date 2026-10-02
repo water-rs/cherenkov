@@ -1298,7 +1298,7 @@ impl Cherenkov {
                     }
                 }
                 .to_string(),
-                precision: "f32 exact-area coverage bands; f32 band scratch, output-format framebuffer",
+                precision: "f64 geometric coverage; f32 SIMD shading and band scratch, output-format framebuffer",
                 route: "cpu-raster (rayon bands)",
                 color_note: "premultiplied linear Display P3 end to end; HDR channels unclamped",
                 encode_scope: "records `cherenkov::Content` calls (fill/stroke/shadow/glyphs) \
@@ -1606,7 +1606,13 @@ impl Engine for Cherenkov {
             driver_info: None,
             vendor: None,
             device: None,
-            target_format: Some("f32 RGBA framebuffer".to_string()),
+            target_format: Some(
+                match Self::readback_format() {
+                    OffscreenFormat::LinearF16 => "f16 RGBA framebuffer",
+                    OffscreenFormat::LinearF32 => "f32 RGBA framebuffer",
+                }
+                .to_string(),
+            ),
             cpu: info.cpu.clone().or_else(crate::cpu_model),
             thermal_celsius: crate::thermal_celsius(),
         }

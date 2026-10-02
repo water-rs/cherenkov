@@ -580,10 +580,14 @@ fn vs_opaque(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -
         let ndc = (apply(inst.affine, p) - globals.origin) / globals.size * 2.0 - 1.0;
         out.position = vec4<f32>(ndc.x, -ndc.y, 0.0, 1.0);
     }
-    // Each index selects a distinct positive f32 depth starting at 0.125.
-    // Even the largest u32 storage binding holds fewer than 2^24 of our
-    // 272-byte instances, keeping every depth below 0.5 and in range.
-    out.position.z = bitcast<f32>(0x3e000000u + ii);
+    // Each index selects a distinct positive f32 depth starting at 0.125,
+    // spaced eight ulps apart. GL's clip z runs [-1, 1]: naga remaps it as
+    // z*2 - w in f32, where |z| near 0.75 quantises to 2^-24 — the index
+    // spacing must exceed that quantum (here: 4 of them, landing on grid)
+    // or neighbouring indices collapse and the replay's depth test fails.
+    // Depths stay below 0.5 for 2^21 instances (below 1.0 for ~3.1M);
+    // render/mod.rs's MAX_PASS_INSTANCES enforces the bound.
+    out.position.z = bitcast<f32>(0x3e000000u + ii * 8u);
     if inst.color.a * inst.params.y != 1.0
         || (inst.meta_.x != KIND_SPAN && inst.meta_.x != KIND_FILL && inst.meta_.x != KIND_REGION)
         || any(inst.bounds.xy >= inst.bounds.zw) {
@@ -595,7 +599,7 @@ fn vs_opaque(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -
 @vertex
 fn vs_partial(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VsOut {
     var out = quad_vertex(array<u32, 4>(0u, 1u, 2u, 5u)[vi], ii);
-    out.position.z = bitcast<f32>(0x3e000000u + ii);
+    out.position.z = bitcast<f32>(0x3e000000u + ii * 8u);
     let inst = instances[ii];
     let s = inst.shape;
     if inst.meta_.x == KIND_FILL && s.exponent == 2.0 && all(s.radii == vec4<f32>(s.half.x)) {

@@ -745,7 +745,7 @@ impl Native {
         let fs = vk::ShaderStageFlags::FRAGMENT;
         let vf = vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT;
 
-        // set0 mirrors `ENGINE_GROUP0`: a dynamic 24-byte Globals uniform,
+        // set0 mirrors `ENGINE_GROUP0`: a dynamic Globals uniform,
         // the instances and stops storage buffers, and the atlas texture.
         let set0 = make_layout(
             &[
@@ -1416,7 +1416,7 @@ impl Native {
             vk::DescriptorBufferInfo {
                 buffer: globals,
                 offset: 0,
-                range: 24,
+                range: std::mem::size_of::<crate::render::instance::Globals>() as u64,
             },
             vk::DescriptorBufferInfo {
                 buffer: instances,

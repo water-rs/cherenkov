@@ -28,6 +28,9 @@ use crate::interop::ExternalFrame;
 use crate::render::lower::axis_aligned;
 use crate::render::present::Presenter;
 
+#[cfg(target_vendor = "apple")]
+mod animation;
+
 /// What a platform's system compositor can express, which bounds promotion.
 pub trait Compositor {
     /// The most layers promoted on one surface. Every promoted layer adds
@@ -756,6 +759,18 @@ pub struct Composition<'a> {
 /// frame with the whole stack; the realization makes the system tree match
 /// it, atomically where the platform allows, and presents the parts.
 pub trait SystemPlanes: Compositor {
+    /// Hands supported tracks to the committed native layer tree. Called
+    /// only after a successful presentation of `plan`.
+    fn animate(&mut self, _tree: &SurfaceTree, _plan: &Plan) {}
+
+    /// Layers whose complete property animation is compositor-owned.
+    fn owned_animations(&self) -> &[LayerId] {
+        &[]
+    }
+
+    /// Withdraws scheduling ownership when this frame could not present.
+    fn withdraw_animations(&mut self) {}
+
     /// Realizes `composition`. Returns false when a part's drawable was not
     /// available (the window is occluded or the acquire timed out): nothing
     /// changed on screen, and the engine composes again on the next frame.

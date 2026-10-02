@@ -245,6 +245,13 @@ struct SurfaceState {
     promotes: bool,
     /// This frame's promotion decision; empty unless `promotes`.
     plan: planes::Plan,
+    /// Tree version of the retained engine parts, excluding plane poses.
+    plane_stamp: u64,
+    /// Resource version of those parts.
+    plane_resources: (u64, u64, u64),
+    /// Surface-level dependencies absent from the layer tree's stamps.
+    plane_clear: cherenkov::WorkingColor,
+    plane_size: (u32, u32),
     /// Engine parts above the first (`target` is part 0): one per promoted
     /// plane with layers painted above it, at the surface size.
     parts: Vec<(wgpu::Texture, wgpu::TextureView)>,
@@ -2489,6 +2496,10 @@ impl Renderer for GpuRenderer {
                 window,
                 promotes,
                 plan: planes::Plan::default(),
+                plane_stamp: 0,
+                plane_resources: (0, 0, 0),
+                plane_clear: cherenkov::WorkingColor::TRANSPARENT,
+                plane_size: (0, 0),
                 parts: Vec::new(),
                 frames_installed: 0,
                 textures,
@@ -3087,6 +3098,12 @@ impl Renderer for GpuRenderer {
         diag::set_phase("render");
     }
 
+    fn owned_animations(&self, surface: SurfaceId) -> &[LayerId] {
+        self.planes
+            .get(&surface)
+            .map_or(&[], |planes| planes::SystemPlanes::owned_animations(planes))
+    }
+
     fn memory(&self) -> MemoryUsage {
         let gpu = self.instances.size()
             + self.uploads.gpu_bytes()
@@ -3505,7 +3522,8 @@ impl GpuRenderer {
             .collect();
         diag::set_phase("lower");
         let results = self.lower_all(&mut pending, &dirty, &inputs);
-        for (id, surf) in dirty.iter().zip(pending) {
+        for (id, mut surf) in dirty.iter().zip(pending) {
+            surf.plane_resources = (self.images_gen, self.image_replacements, surf.interop);
             self.surfaces.insert(id.id, surf);
         }
         let mut inst_base = 0u32;
@@ -3648,7 +3666,8 @@ impl GpuRenderer {
             .collect();
         diag::set_phase("lower");
         let results = self.lower_all(&mut pending, &dirty, &inputs);
-        for (id, surf) in dirty.iter().zip(pending) {
+        for (id, mut surf) in dirty.iter().zip(pending) {
+            surf.plane_resources = (self.images_gen, self.image_replacements, surf.interop);
             self.surfaces.insert(id.id, surf);
         }
         let mut inst_base = 0u32;
@@ -4597,15 +4616,14 @@ impl GpuRenderer {
                         // The frame's own `plane_frames` carries the
                         // update set — admitted by this render's
                         // `plane_only`, so it cannot be a stale frame's.
-                        let updates = sf.plane_frames.filter(|_| self.plane_only.contains(&sf.id));
-                        if let Some(updates) = updates {
+                        if self.plane_only.contains(&sf.id) {
                             // The frame's only change is new frames on
                             // these promoted layers: present them
                             // alone, leaving every part's shown buffer
                             // in place (#90).
                             planes::SystemPlanes::refresh(
                                 system,
-                                plane_stack(surface, Some(updates)),
+                                plane_stack(surface, sf.plane_frames),
                             )?;
                             true
                         } else {
@@ -4641,6 +4659,9 @@ impl GpuRenderer {
                     )?,
                 };
                 if surface.present_pending {
+                    if let Some(system) = self.planes.get_mut(&sf.id) {
+                        planes::SystemPlanes::withdraw_animations(system);
+                    }
                     redraw = Some(redraw.map_or_else(
                         || surface.refresh.clone(),
                         |rate| {
@@ -4649,6 +4670,11 @@ impl GpuRenderer {
                         },
                     ));
                 }
+            }
+            if !surface.present_pending
+                && let Some(system) = self.planes.get_mut(&sf.id)
+            {
+                planes::SystemPlanes::animate(system, sf.tree, &surface.plan);
             }
         }
         Ok(redraw.map_or(Redraw::None, |rate| Redraw::Wanted { rate }))
@@ -4854,9 +4880,6 @@ impl GpuRenderer {
         if sf.present_pending || sf.display_moved {
             return false;
         }
-        let Some(frames) = sf.plane_frames else {
-            return false;
-        };
         let Some(surface) = self.surfaces.get(&sf.id) else {
             return false;
         };
@@ -4872,14 +4895,47 @@ impl GpuRenderer {
         let candidates = plane_candidates(surface, &mut self.candidates);
         let installed = plane_frames(surface, &mut self.candidate_frames);
         planes::SystemPlanes::prepare(system, candidates, installed, &mut self.ready);
-        planes::frames_only::<planes::Platform>(
-            &surface.plan,
-            sf.tree,
-            &self.candidates,
-            &self.ready,
-            frames,
-            &mut self.plan_scratch,
-        )
+        if let Some(frames) = sf.plane_frames {
+            return planes::frames_only::<planes::Platform>(
+                &surface.plan,
+                sf.tree,
+                &self.candidates,
+                &self.ready,
+                frames,
+                &mut self.plan_scratch,
+            );
+        }
+        if surface.plan.planes.is_empty()
+            || (surface.plane_clear, surface.plane_size) != (sf.clear, sf.size)
+            || surface.display.scale.to_bits() != sf.display.scale.to_bits()
+            || surface.plan.planes.iter().any(|plane| {
+                !self.candidates.contains_key(&plane.layer)
+                    || !sf.tree.layer(plane.layer).children.is_empty()
+            })
+            || surface.plane_resources
+                != (self.images_gen, self.image_replacements, surface.interop)
+            || sf.tree.composition_stamp(|layer| {
+                surface.plan.planes.iter().any(|plane| plane.layer == layer)
+            }) != surface.plane_stamp
+        {
+            return false;
+        }
+        let next = planes::plan::<planes::Platform>(sf.tree, &self.candidates, &self.ready);
+        if next.trailing != surface.plan.trailing
+            || next.planes.len() != surface.plan.planes.len()
+            || !next
+                .planes
+                .iter()
+                .zip(&surface.plan.planes)
+                .all(|(a, b)| (a.layer, a.size) == (b.layer, b.size))
+        {
+            return false;
+        }
+        self.surfaces
+            .get_mut(&sf.id)
+            .expect("registered surface")
+            .plan = next;
+        true
     }
 
     fn include_ready_planes<'a>(
@@ -4963,6 +5019,11 @@ impl GpuRenderer {
                 tracing::debug!(target: "cherenkov::planes", layer = ?layer, decision = ?why, "plane decision");
             }
         }
+        surf.plane_stamp = frame
+            .tree
+            .composition_stamp(|layer| surf.plan.planes.iter().any(|plane| plane.layer == layer));
+        surf.plane_clear = frame.clear;
+        surf.plane_size = frame.size;
         let promoted = surf.plan.planes.iter().map(|p| p.layer).collect();
         // Lowering borrows `layers` immutably while mutating `frame`;
         // taking the map out keeps the two borrows disjoint.
@@ -4995,7 +5056,7 @@ impl GpuRenderer {
                     &glyphs,
                     groups,
                     placed,
-                    promoted,
+                    (promoted, surf.plan.trailing),
                 )
             });
             lowered.commands = lowering.commands_lowered;

@@ -95,6 +95,8 @@ use crate::interop::{
 };
 use crate::render::present::WindowSurface;
 
+mod animation;
+
 /// Main-thread storage with asynchronous destruction. Every reference, including
 /// the last one, is released on main; `MainThreadBound::drop` can never dispatch
 /// synchronously from the render thread.
@@ -193,6 +195,7 @@ impl Parent {
                     planes: Vec::new(),
                     displays: FxHashMap::default(),
                     retired: Vec::new(),
+                    motions: FxHashMap::default(),
                 },
                 mtm,
             ),
@@ -278,6 +281,7 @@ struct LayerScene {
     /// once but detached from the hierarchy only inside the next `place`'s
     /// transaction, so the removal never commits a frame on its own.
     retired: Vec<DisplayLayer>,
+    motions: FxHashMap<LayerId, super::animation::Motion>,
 }
 
 impl Drop for LayerScene {
@@ -393,6 +397,7 @@ pub struct LayerPlanes {
     offered: FxHashSet<LayerId>,
     woke: bool,
     waker: Option<cherenkov::CompletionWaker>,
+    owned_animations: Vec<LayerId>,
 }
 
 /// An origin-anchored layer: its position is its superlayer point for its
@@ -754,6 +759,7 @@ fn shape(placement: &Placement) -> Vec<(LayerId, bool)> {
 
 /// Applies a level's sampled properties to its layers.
 fn place(level: &Level, layers: &LevelLayers) {
+    layers.node.setPosition(CGPoint::new(0.0, 0.0));
     layers.node.setAffineTransform(cg_affine(level.transform));
     if let (Some(clip), Some(layer)) = (&level.clip, &layers.clip) {
         LayerClip::of(clip)
@@ -903,10 +909,17 @@ impl LayerScene {
         // slot 0 never consumes or replaces A's display.
         let mut old = std::mem::take(&mut self.planes);
         for placement in placements {
-            let built = old
+            let reusable = old
                 .iter()
-                .position(|p| p.layer == placement.layer && p.shape == shape(placement))
-                .map_or_else(|| self.plane_layers(placement, scale), |i| old.remove(i));
+                .position(|p| p.layer == placement.layer && p.shape == shape(placement));
+            let built = if let Some(index) = reusable {
+                old.remove(index)
+            } else {
+                // A new native path has no animations, even if its engine
+                // track is unchanged. Reinstall the original timed track.
+                self.motions.remove(&placement.layer);
+                self.plane_layers(placement, scale)
+            };
             built
                 .top
                 .setAffineTransform(cg_affine(Affine::scale(1.0 / scale)));
@@ -1042,6 +1055,7 @@ impl LayerPlanes {
             offered: FxHashSet::default(),
             woke: false,
             waker,
+            owned_animations: Vec::new(),
         };
         result.request_parts(1, probe);
         result
@@ -1165,6 +1179,71 @@ impl Compositor for LayerPlanes {
 }
 
 impl SystemPlanes for LayerPlanes {
+    fn animate(&mut self, tree: &cherenkov::SurfaceTree, plan: &super::Plan) {
+        let motions: Vec<_> = plan
+            .planes
+            .iter()
+            .filter_map(|plane| super::animation::motion(tree, plane.layer))
+            .filter(|motion| super::animation::safe_path(tree, motion.layer))
+            .collect();
+        if motions.is_empty() && self.owned_animations.is_empty() {
+            return;
+        }
+        self.owned_animations.clear();
+        self.owned_animations
+            .extend(motions.iter().map(|motion| motion.layer));
+        self.scene.run(move |scene, _| {
+            let _tx = Transaction::begin();
+            for plane in &scene.planes {
+                let node = &plane.levels.last().expect("a plane has a layer path").node;
+                let display = &scene.displays[&plane.layer].display;
+                let next = motions.iter().find(|motion| motion.layer == plane.layer);
+                let previous = scene.motions.get(&plane.layer);
+                if let Some(motion) = next {
+                    if let Some(position) = motion.position {
+                        let [a, b, c, d] = motion.linear;
+                        node.setAffineTransform(cg_affine(Affine::new([a, b, c, d, 0., 0.])));
+                        node.setPosition(CGPoint::new(position[0].target, position[1].target));
+                    }
+                    if let Some(opacity) = motion.opacity {
+                        #[expect(
+                            clippy::cast_possible_truncation,
+                            reason = "opacity is an f32 property"
+                        )]
+                        display.setOpacity(opacity.target as f32);
+                    }
+                }
+                if previous == next {
+                    continue;
+                }
+                animation::remove(node, "position.x");
+                animation::remove(node, "position.y");
+                animation::remove(display, "opacity");
+                if let Some(motion) = next {
+                    if let Some(position) = motion.position {
+                        animation::install(node, position[0], "position.x");
+                        animation::install(node, position[1], "position.y");
+                    }
+                    if let Some(opacity) = motion.opacity {
+                        animation::install(display, opacity, "opacity");
+                    }
+                }
+            }
+            scene.motions.clear();
+            scene
+                .motions
+                .extend(motions.into_iter().map(|motion| (motion.layer, motion)));
+        });
+    }
+
+    fn owned_animations(&self) -> &[LayerId] {
+        &self.owned_animations
+    }
+
+    fn withdraw_animations(&mut self) {
+        self.owned_animations.clear();
+    }
+
     fn compose(&mut self, c: Composition<'_>) -> Result<bool, RenderError> {
         self.collect_parts()?;
         self.request_parts(c.parts.len(), None);
@@ -1301,6 +1380,21 @@ impl SystemPlanes for LayerPlanes {
 
     fn refresh<'a>(&mut self, frames: impl Iterator<Item = Plane<'a>>) -> Result<(), RenderError> {
         for plane in frames {
+            let placement = plane.placement.clone();
+            self.scene.run(move |scene, _| {
+                let _tx = Transaction::begin();
+                let layers = scene
+                    .planes
+                    .iter()
+                    .find(|plane| plane.layer == placement.layer)
+                    .expect("refresh names a committed plane");
+                for (level, layers) in placement.path.iter().zip(&layers.levels) {
+                    place(level, layers);
+                }
+                scene.displays[&placement.layer]
+                    .display
+                    .setOpacity(placement.opacity);
+            });
             self.enqueue(Update::from_plane(&plane));
         }
         Ok(())

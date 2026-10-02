@@ -88,6 +88,10 @@ mod macos {
         };
         vec![
             case(
+                "promoted_translation_is_owned_by_core_animation",
+                promoted_translation_is_owned_by_core_animation,
+            ),
+            case(
                 "the_realized_tree_puts_the_plane_between_its_parts",
                 the_realized_tree_puts_the_plane_between_its_parts,
             ),
@@ -1076,15 +1080,66 @@ mod macos {
         }
     }
 
+    /// A native translation owns scheduling and cancels on a snap.
+    fn promoted_translation_is_owned_by_core_animation() {
+        let fixture = Fixture::new();
+        let buffer = bgra_buffer();
+        let video = fixture.window.layer();
+        let frame = fixture
+            .engine
+            .external_frame(bgra(&fixture.metal, &buffer, FrameColor::SRGB));
+        fixture.window.update(|tx| {
+            tx[fixture.window.root()].push(&video);
+            tx[&video].content(frame);
+        });
+        assert!(
+            fixture.promote(),
+            "the compositor must accept the BGRA plane"
+        );
+        fixture
+            .window
+            .update_animated(cherenkov::Curve::linear(Duration::from_secs(2)), |tx| {
+                tx[&video].transform(Affine::translate((24., 16.)));
+            });
+        let next = fixture
+            .engine
+            .render(FrameTime::now())
+            .expect("handoff frame");
+        assert_eq!(next, cherenkov::Next::Idle);
+        assert_eq!(
+            fixture.engine.stats().passes,
+            0,
+            "a plane pose needs no engine pass"
+        );
+        drain_main();
+        let display = displays(&fixture.root()).pop().expect("promoted display");
+        let scroll = display.superlayer().expect("scroll layer");
+        let node = scroll.superlayer().expect("transform layer");
+        // SAFETY: the layer and its animation are confined to main.
+        assert!(
+            unsafe { node.animationForKey(&objc2_foundation::NSString::from_str("position.x")) }
+                .is_some()
+        );
+        assert_eq!(node.position(), CGPoint::new(24., 16.));
+        fixture.window.update(|tx| {
+            tx[&video].transform(Affine::translate((8., 4.)));
+        });
+        fixture.render();
+        // SAFETY: the layer and its animation are confined to main.
+        assert!(
+            unsafe { node.animationForKey(&objc2_foundation::NSString::from_str("position.x")) }
+                .is_none()
+        );
+        assert_eq!(node.position(), CGPoint::new(0., 0.));
+        assert_eq!(node.affineTransform().tx, 8.);
+        drop(video);
+        fixture.render();
+        assert!(displays(&fixture.root()).is_empty());
+    }
+
     /// The system compositor's result for the promoted stack matches the
-    /// engine's own composition of the same tree within a perceptual
-    /// tolerance: FLIP mean at most 0.05 and no local error above 0.25.
-    ///
-    /// The frame is opaque BGRA declared sRGB — the platform and the
-    /// engine produce identical pixels from it, so the comparison
-    /// measures promotion (order, geometry, blending), not the
-    /// platform's YCbCr decoder, whose studio-range expansion differs
-    /// from the engine's on this target.
+    /// engine's own composition within FLIP mean 0.05 and maximum 0.25.
+    /// The opaque BGRA/sRGB frame isolates geometry and blending from YUV decoding.
     fn promoted_composition_matches_engine_composition() {
         let fixture = Fixture::new();
         let buffer = surface_buffer(VIDEO.0, VIDEO.1, kCVPixelFormatType_32BGRA);

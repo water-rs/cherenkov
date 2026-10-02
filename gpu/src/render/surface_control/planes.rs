@@ -770,8 +770,8 @@ impl Planes {
                     "layer {layer:?}'s frame changed while no plane shows it"
                 )));
             };
-            // The committed plan pins the placement, z-order and alpha;
-            // only the new frame's contract can move a property. `shown`
+            // Admission preserves stack membership and z-order; poses and
+            // opacity can change without replacing the buffer. `shown`
             // is `None` only when a previous present failed mid-
             // transaction — report it rather than touch the surface
             // control with half its properties.
@@ -787,6 +787,9 @@ impl Planes {
                 Some(native.clone())
             };
             properties.opaque = contract.opaque;
+            properties.placement =
+                plan::promoted(update.placement, self.size).map_err(|e| cannot_show(layer, &e))?;
+            properties.alpha = update.placement.opacity;
             properties.dataspace = contract.dataspace;
             properties.hdr = contract.hdr;
             self.ops.clear();

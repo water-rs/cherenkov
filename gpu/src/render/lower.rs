@@ -999,6 +999,8 @@ pub struct Lowering<'a> {
     /// The layers promoted to system planes this frame: their content is
     /// not drawn, and each starts the next part.
     promoted: Vec<LayerId>,
+    /// Whether content follows the last plane in paint order.
+    trailing: bool,
     /// The storage space of each scratch target by depth index: a
     /// semantic isolate's declared space, a clip-only level's parent
     /// space, or the opening level's for shadow and capture scopes.
@@ -1053,6 +1055,7 @@ impl<'a> Lowering<'a> {
             semantic_target: Target::Part(0),
             part: 0,
             promoted: Vec::new(),
+            trailing: true,
             space_stack: Vec::new(),
             scratch_space: Vec::new(),
             capture_space: FxHashMap::default(),
@@ -1272,8 +1275,9 @@ impl<'a> Lowering<'a> {
         glyphs: &GlyphContext<'_>,
         groups: &FxHashMap<u64, BackdropGroupInfo>,
         projected: FxHashMap<LayerId, Placement>,
-        promoted: Vec<LayerId>,
+        (promoted, trailing): (Vec<LayerId>, bool),
     ) -> Result<(), RenderError> {
+        self.trailing = trailing;
         let [r, g, b, a] = clear.components;
         self.raster(self.surface);
         self.walk(
@@ -1480,7 +1484,11 @@ impl<'a> Lowering<'a> {
         );
         self.part += 1;
         self.semantic_target = Target::Part(self.part);
-        self.begin_pass(Target::Part(self.part), Some([0.0; 4]));
+        if (self.part as usize) < self.promoted.len() || self.trailing {
+            self.begin_pass(Target::Part(self.part), Some([0.0; 4]));
+        } else {
+            self.finish_pass();
+        }
     }
 
     /// The storage space of the level currently being drawn into.
@@ -4937,7 +4945,7 @@ mod tests {
                     &glyphs,
                     &FxHashMap::default(),
                     FxHashMap::default(),
-                    promoted,
+                    (promoted, true),
                 )
                 .expect("lowered");
             frame

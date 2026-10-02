@@ -122,7 +122,7 @@ fn projected(i: u32, pixel: vec2<f32>) -> vec4<f32> {
 @fragment
 fn fs_projective(in: VsOut) -> @location(0) vec4<f32> {
     let i = in.instance;
-    let sample = projected(i, in.pixel);
+    let sample = projected(i, in.device);
     let inside = clamp(clip_mask_coverage(in), 0.0, 1.0);
     let mode = (in.meta_.w >> 16u) & 0xffu;
     if mode == 0u {
@@ -130,7 +130,7 @@ fn fs_projective(in: VsOut) -> @location(0) vec4<f32> {
     }
     // A blended composite reads the target's prior contents from the
     // backdrop copy of the region and writes the result verbatim.
-    let cb = textureLoad(backdrop, vec2<i32>(floor(in.pixel - instances[i].grad.xy)), 0);
+    let cb = textureLoad(backdrop, vec2<i32>(floor(in.device - instances[i].grad.xy)), 0);
     if blend_is_destructive(mode) {
         // The operator applies over its whole domain: a transparent
         // source still replaces the destination there.

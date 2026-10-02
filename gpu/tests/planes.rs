@@ -303,15 +303,39 @@ mod macos {
         unsafe { layer.sublayers() }.map_or_else(Vec::new, |a| a.to_vec())
     }
 
-    /// Every display layer under `layer`.
-    fn displays(layer: &CALayer) -> Vec<Retained<AVSampleBufferDisplayLayer>> {
+    /// Whether `display` is a candidate's probe — parked beside the
+    /// engine root at zero bounds while its readiness is reported —
+    /// rather than a promoted plane. `attach` names it
+    /// `cherenkov-pending`; `place` clears the name on promotion.
+    fn probing(display: &AVSampleBufferDisplayLayer) -> bool {
+        display
+            .name()
+            .is_some_and(|name| *name == *objc2_foundation::ns_string!("cherenkov-pending"))
+    }
+
+    /// The display layers under `layer` matching `keep`.
+    fn displays_matching(
+        layer: &CALayer,
+        keep: &dyn Fn(&AVSampleBufferDisplayLayer) -> bool,
+    ) -> Vec<Retained<AVSampleBufferDisplayLayer>> {
         sublayers(layer)
             .into_iter()
             .flat_map(|l| match l.downcast::<AVSampleBufferDisplayLayer>() {
-                Ok(display) => vec![display],
-                Err(l) => displays(&l),
+                Ok(display) => {
+                    if keep(&display) {
+                        vec![display]
+                    } else {
+                        Vec::new()
+                    }
+                }
+                Err(l) => displays_matching(&l, keep),
             })
             .collect()
+    }
+
+    /// Every promoted display layer under `layer`.
+    fn displays(layer: &CALayer) -> Vec<Retained<AVSampleBufferDisplayLayer>> {
+        displays_matching(layer, &|display| !probing(display))
     }
 
     /// Drives the main run loop until `done`, or fails once `deadline`
@@ -612,9 +636,17 @@ mod macos {
             self.view.layer().expect("a layer-backed view")
         }
 
-        /// The engine's root layer under the host.
+        /// The engine's root layer under the host — selected by its name:
+        /// a candidate's pending display layer attaches beside it.
         fn root(&self) -> Retained<CALayer> {
-            let layers = sublayers(&self.host());
+            let layers: Vec<_> = sublayers(&self.host())
+                .into_iter()
+                .filter(|layer| {
+                    layer
+                        .name()
+                        .is_some_and(|name| *name == *objc2_foundation::ns_string!("cherenkov"))
+                })
+                .collect();
             let [root] = &layers[..] else {
                 panic!("one engine root under the host, found {}", layers.len());
             };
@@ -636,11 +668,15 @@ mod macos {
             self.render();
         }
 
-        /// The frames a window produces while a candidate's attach lands:
-        /// the first render composites the candidate in-engine —
+        /// The frames a window produces while a candidate is attached and
+        /// promoted: the first render composites it in-engine —
         /// asserted, the pending contract — the attach block's
-        /// completion wake is both the drain's done signal and the
-        /// redraw request, and the second render promotes it.
+        /// completion wake is the drain's done signal, and once the
+        /// platform reports the probe ready and its notification has
+        /// bounced the flag back, a render promotes it. The loop turns
+        /// the run loop and re-renders until that lands, bounded so a
+        /// host that never makes a display ready keeps the engine path
+        /// and reports `false`.
         fn promote(&self) -> bool {
             drain_main();
             self.woke.store(false, Ordering::Relaxed);
@@ -650,8 +686,14 @@ mod macos {
                 "the pending candidate stays engine-composited"
             );
             settle_flag(&self.woke, "the queued attach never completed");
-            drain_main();
-            self.engine.render(FrameTime::now()).expect("rendered");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            // SAFETY: the mode is an immutable static.
+            let mode = unsafe { kCFRunLoopDefaultMode };
+            while displays(&self.root()).is_empty() && Instant::now() < deadline {
+                CFRunLoop::run_in_mode(mode, 0.005, true);
+                drain_main();
+                self.engine.render(FrameTime::now()).expect("rendered");
+            }
             drain_main();
             settle(&self.host());
             let available = !displays(&self.root()).is_empty();

@@ -3,12 +3,13 @@
 //!
 //! ```text
 //! host layer (the view's)
-//! └─ root                       the surface, in points
-//!    ├─ part 0: CAMetalLayer    engine content below the first plane
-//!    ├─ plane 0                 pixel space: scale(1 / display scale)
-//!    │  └─ level … level        one node per tree layer on the path:
-//!    │     └─ display layer       transform → clip → scroll
-//!    ├─ part 1: CAMetalLayer    engine content above plane 0
+//! ├─ pending displays            candidates proving `readyForDisplay`
+//! └─ root                        the surface, in points
+//!    ├─ part 0: CAMetalLayer     engine content below the first plane
+//!    ├─ plane 0                  pixel space: scale(1 / display scale)
+//!    │  └─ level … level         one node per tree layer on the path:
+//!    │     └─ display layer        transform → clip → scroll
+//!    ├─ part 1: CAMetalLayer     engine content above plane 0
 //!    └─ …
 //! ```
 //!
@@ -22,6 +23,15 @@
 //! exists only on `CAMetalLayer`). It is also the only layer `FairPlay`
 //! decrypts into, so protected frames (#212) reuse this realization.
 //!
+//! A candidate's display layer is created pending — beside `root` at zero
+//! bounds, invisible but inside the committed layer hierarchy — because
+//! the platform reports `readyForDisplay` only for a layer the render
+//! server can see holding a committed frame. Promotion waits for that
+//! readiness: the property is not key-value observable, so the display
+//! posts `AVSampleBufferDisplayLayerReadyForDisplayDidChangeNotification`,
+//! whose handler re-reads it on main and wakes the render loop. A demotion
+//! detaches its display inside the next `place` transaction.
+//!
 //! Engine parts present through `CAMetalLayer`s with
 //! `presentsWithTransaction`, and every geometry change, part presentation
 //! and frame hand-off of one frame commits in one `CATransaction`, so parts
@@ -29,18 +39,17 @@
 
 use std::cell::RefCell;
 use std::ptr::NonNull;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
+use std::sync::{Arc, Weak, mpsc};
 
 use dispatch2::{DispatchQueue, MainThreadBound};
 use kurbo::{Affine, Rect, Vec2};
-use objc2::MainThreadMarker;
 use objc2::rc::Retained;
-use objc2::runtime::ProtocolObject;
+use objc2::runtime::{AnyObject, ProtocolObject};
+use objc2::{AnyThread, DefinedClass, MainThreadMarker};
 use objc2_av_foundation::{
     AVLayerVideoGravityResize, AVQueuedSampleBufferRendering, AVQueuedSampleBufferRenderingStatus,
-    AVSampleBufferDisplayLayer,
+    AVSampleBufferDisplayLayer, AVSampleBufferDisplayLayerReadyForDisplayDidChangeNotification,
 };
 use objc2_core_foundation::{
     CFBoolean, CFMutableDictionary, CFRetained, CFString, CGAffineTransform, CGPoint, CGRect,
@@ -68,7 +77,7 @@ use objc2_core_video::{
     kCVPixelFormatType_420YpCbCr10BiPlanarFullRange,
     kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange, kCVReturnSuccess,
 };
-use objc2_foundation::NSArray;
+use objc2_foundation::{NSArray, NSNotification, NSNotificationCenter, NSObject, NSObjectProtocol};
 use objc2_io_surface::IOSurfaceRef;
 use objc2_metal::{MTLSharedEvent, MTLSharedEventListener, MTLTexture};
 use objc2_quartz_core::{
@@ -113,6 +122,12 @@ impl<T> MainOwned<T> {
                 mtm,
             );
         });
+    }
+
+    /// A weak handle to the same storage, for a callback the scene itself
+    /// retains — an observer must not keep its owner alive.
+    fn downgrade(&self) -> Weak<MainThreadBound<RefCell<T>>> {
+        Arc::downgrade(self.0.as_ref().expect("live main owner"))
     }
 }
 
@@ -172,10 +187,12 @@ impl Parent {
             scene: MainOwned::new(
                 LayerScene {
                     _window: handle,
+                    host: layer,
                     root,
                     parts: Vec::new(),
                     planes: Vec::new(),
                     displays: FxHashMap::default(),
+                    retired: Vec::new(),
                 },
                 mtm,
             ),
@@ -204,6 +221,26 @@ impl Drop for Transaction {
 struct DisplayLayer {
     display: Retained<AVSampleBufferDisplayLayer>,
     generation: Option<u64>,
+    /// The registration for the layer's readiness signal.
+    /// `readyForDisplay` is not key-value observable — the layer posts
+    /// `AVSampleBufferDisplayLayerReadyForDisplayDidChangeNotification`
+    /// on every change — so the flag the render thread reads is set from
+    /// the notification, never latched from a sample.
+    observer: Retained<ReadinessObserver>,
+}
+
+impl Drop for DisplayLayer {
+    fn drop(&mut self) {
+        // SAFETY: the registration is this display's own; the scene that
+        // owns it releases it on main.
+        unsafe {
+            NSNotificationCenter::defaultCenter().removeObserver_name_object(
+                AsRef::<AnyObject>::as_ref(&*self.observer),
+                Some(AVSampleBufferDisplayLayerReadyForDisplayDidChangeNotification),
+                Some(AsRef::<AnyObject>::as_ref(&*self.display)),
+            );
+        }
+    }
 }
 
 struct PlaneLayers {
@@ -229,16 +266,101 @@ impl LevelLayers {
 /// is confined to this main-thread scene.
 struct LayerScene {
     _window: Box<dyn wgpu::WindowHandle>,
+    /// The host layer `root` sits under. Candidates' pending displays
+    /// attach beside `root`: inside the committed hierarchy, which
+    /// `readyForDisplay` requires, and outside the part/plane stack.
+    host: Retained<CALayer>,
     root: Retained<CALayer>,
     parts: Vec<Retained<CAMetalLayer>>,
     planes: Vec<PlaneLayers>,
     displays: FxHashMap<LayerId, DisplayLayer>,
+    /// Displays of demoted candidates, logically gone from `displays` at
+    /// once but detached from the hierarchy only inside the next `place`'s
+    /// transaction, so the removal never commits a frame on its own.
+    retired: Vec<DisplayLayer>,
 }
 
 impl Drop for LayerScene {
     fn drop(&mut self) {
         let _tx = Transaction::begin();
+        // Pending and retired displays are `host` sublayers of their own.
+        for display in self.displays.values().chain(&self.retired) {
+            display.display.removeFromSuperlayer();
+        }
         self.root.removeFromSuperlayer();
+    }
+}
+
+/// One display's readiness notification target. `NSNotificationCenter`'s
+/// selector registration needs an Objective-C object; the notification is
+/// posted on whatever thread the render server reports on, so the handler
+/// bounces the re-evaluation of `readyForDisplay` back through the
+/// scene's main queue.
+struct ReadinessIvars {
+    /// Weak: the scene retains the observer through `DisplayLayer`; a
+    /// strong handle here would keep the whole scene alive.
+    scene: Weak<MainThreadBound<RefCell<LayerScene>>>,
+    layer: LayerId,
+    ready: Weak<AtomicBool>,
+    waker: Option<cherenkov::CompletionWaker>,
+}
+
+objc2::define_class!(
+    // SAFETY: `NSObject` has no subclassing requirements, and the class
+    // implements no Drop — its ivars release on dealloc.
+    #[unsafe(super(NSObject))]
+    #[name = "CherenkovReadinessObserver"]
+    #[ivars = ReadinessIvars]
+    struct ReadinessObserver;
+
+    impl ReadinessObserver {
+        #[unsafe(method(readyForDisplayDidChange:))]
+        fn ready_for_display_did_change(&self, _note: &NSNotification) {
+            let ivars = self.ivars();
+            let Some(scene) = ivars.scene.upgrade() else {
+                return;
+            };
+            let layer = ivars.layer;
+            let ready = ivars.ready.clone();
+            let waker = ivars.waker.clone();
+            DispatchQueue::main().exec_async(move || {
+                let mtm = MainThreadMarker::new().expect("the main dispatch queue");
+                let scene = scene.get(mtm).borrow();
+                // A demotion that already landed makes this a dead signal.
+                let Some(display) = scene.displays.get(&layer) else {
+                    return;
+                };
+                // SAFETY: the layer's properties are read on main.
+                let is_ready = unsafe { display.display.isReadyForDisplay() };
+                drop(scene);
+                if let Some(flag) = ready.upgrade() {
+                    flag.store(is_ready, Ordering::Release);
+                }
+                if let Some(waker) = &waker {
+                    waker.wake();
+                }
+            });
+        }
+    }
+
+    unsafe impl NSObjectProtocol for ReadinessObserver {}
+);
+
+impl ReadinessObserver {
+    fn new(
+        scene: &MainOwned<LayerScene>,
+        layer: LayerId,
+        ready: Weak<AtomicBool>,
+        waker: Option<cherenkov::CompletionWaker>,
+    ) -> Retained<Self> {
+        let this = Self::alloc().set_ivars(ReadinessIvars {
+            scene: scene.downgrade(),
+            layer,
+            ready,
+            waker,
+        });
+        // SAFETY: the class is an NSObject subclass; `init` is NSObject's.
+        unsafe { objc2::msg_send![super(this), init] }
     }
 }
 
@@ -673,14 +795,51 @@ impl LayerScene {
         Ok(parts)
     }
 
-    fn attach(&mut self, layer: LayerId) {
+    /// Parks `display` beside `root` under the host: inside the committed
+    /// layer hierarchy at zero bounds — invisible, which is the state the
+    /// platform requires before it reports `readyForDisplay` — and marked
+    /// with the pending name the hierarchy's consumers can tell a probe
+    /// from a promoted plane by.
+    fn park(&self, display: &AVSampleBufferDisplayLayer) {
+        display.setName(Some(&objc2_foundation::NSString::from_str(
+            "cherenkov-pending",
+        )));
+        display.setBounds(CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(0.0, 0.0)));
+        display.setPosition(CGPoint::new(0.0, 0.0));
+        if display.superlayer().as_deref() != Some(&*self.host) {
+            self.host.addSublayer(display);
+        }
+    }
+
+    /// Creates `layer`'s display layer, parks it beside `root`, and
+    /// registers for the readiness notification that re-evaluates the flag
+    /// `ready` on every change, waking the render loop each time.
+    fn attach(
+        &mut self,
+        layer: LayerId,
+        scene: &MainOwned<Self>,
+        ready: Weak<AtomicBool>,
+        waker: Option<cherenkov::CompletionWaker>,
+    ) {
         // SAFETY: creation and every subsequent use are on main.
         let display = unsafe { AVSampleBufferDisplayLayer::new() };
         display.setAnchorPoint(CGPoint::new(0.0, 0.0));
-        display.setPosition(CGPoint::new(0.0, 0.0));
         unsafe {
             display.setVideoGravity(AVLayerVideoGravityResize.expect("video gravity"));
             display.setPreventsDisplaySleepDuringVideoPlayback(false);
+        }
+        self.park(&display);
+        let observer = ReadinessObserver::new(scene, layer, ready, waker);
+        // SAFETY: the immutable name selects this layer's own readiness
+        // notification; the selector is the observer's and the object
+        // filter is the layer it watches.
+        unsafe {
+            NSNotificationCenter::defaultCenter().addObserver_selector_name_object(
+                AsRef::<AnyObject>::as_ref(&*observer),
+                objc2::sel!(readyForDisplayDidChange:),
+                Some(AVSampleBufferDisplayLayerReadyForDisplayDidChangeNotification),
+                Some(AsRef::<AnyObject>::as_ref(&*display)),
+            );
         }
         assert!(
             self.displays
@@ -689,6 +848,7 @@ impl LayerScene {
                     DisplayLayer {
                         display,
                         generation: None,
+                        observer,
                     }
                 )
                 .is_none(),
@@ -733,6 +893,12 @@ impl LayerScene {
             CGSize::new(f64::from(size.0) / scale, f64::from(size.1) / scale),
         );
         self.root.setBounds(bounds);
+        // A demoted candidate's display detaches here, inside this
+        // transaction, so its removal never commits ahead of the rebuild
+        // that shows the layers below.
+        for retired in self.retired.drain(..) {
+            retired.display.removeFromSuperlayer();
+        }
         // Identity, not position, determines reuse. Moving B from slot 1 to
         // slot 0 never consumes or replaces A's display.
         let mut old = std::mem::take(&mut self.planes);
@@ -753,10 +919,19 @@ impl LayerScene {
                 CGSize::new(f64::from(placement.size.0), f64::from(placement.size.1)),
             ));
             display.setOpacity(placement.opacity);
+            display.setName(None);
             self.planes.push(built);
         }
         for plane in old {
             plane.top.removeFromSuperlayer();
+        }
+        // A candidate outside the plan — still probing, or demoted when
+        // its readiness was lost — parks its display beside the root so
+        // the probe keeps the hierarchy state the signal requires.
+        for (id, display) in &self.displays {
+            if !self.planes.iter().any(|plane| plane.layer == *id) {
+                self.park(&display.display);
+            }
         }
         let mut order: Vec<&CALayer> = Vec::new();
         for i in 0..parts {
@@ -775,13 +950,27 @@ impl LayerScene {
         unsafe { self.root.setSublayers(Some(&NSArray::from_slice(&order))) };
     }
 
+    /// Hands `frame` to `layer`'s display layer.
+    ///
+    /// # Panics
+    /// The failures here are admission-contract violations, not runtime
+    /// conditions: `layer` must name an attached display, `frame` must be
+    /// one [`Compositor::shows`] admitted — its planes are one
+    /// `IOSurface` a `CVPixelBuffer` and `CMSampleBuffer` always wrap —
+    /// and the system's sample renderer must accept that sample. A
+    /// broken contract cannot be recovered inside this dispatched block,
+    /// and a silently dropped frame is the failure this refuses to hide.
     fn show(&mut self, layer: LayerId, frame: &ExternalFrame, generation: u64) {
-        let shown = self.displays.get_mut(&layer).expect("a ready display");
+        let shown = self
+            .displays
+            .get_mut(&layer)
+            .expect("show is called only for an attached candidate");
         if shown.generation == Some(generation) {
             return;
         }
-        let buffer = pixel_buffer(frame).expect("an admitted frame has a pixel buffer");
-        let sample = sample_buffer(&buffer).expect("a valid video sample");
+        let buffer = pixel_buffer(frame).expect("an admitted frame's planes are one IOSurface");
+        let sample =
+            sample_buffer(&buffer).expect("an IOSurface pixel buffer is a valid video sample");
         // SAFETY: the layer and its renderer are accessed only on main.
         let renderer = unsafe { shown.display.sampleBufferRenderer() };
         unsafe { renderer.enqueueSampleBuffer(&sample) };
@@ -1028,7 +1217,11 @@ impl SystemPlanes for LayerPlanes {
             self.candidates.remove(&id);
             self.scene.run(move |scene, _| {
                 if let Some(display) = scene.displays.remove(&id) {
-                    display.display.removeFromSuperlayer();
+                    // The candidate is logically gone now — a queued
+                    // `show` finds no display — but the detach is visual
+                    // state and commits only inside the next `place`'s
+                    // transaction.
+                    scene.retired.push(display);
                 }
             });
         }
@@ -1041,18 +1234,27 @@ impl SystemPlanes for LayerPlanes {
                 let ready = Arc::new(AtomicBool::new(false));
                 let live = Arc::downgrade(&ready);
                 let waker = self.waker.clone();
+                let owner = self.scene.clone();
                 self.scene.run(move |scene, _| {
-                    if let Some(ready) = live.upgrade() {
-                        scene.attach(layer);
+                    if let Some(flag) = live.upgrade() {
+                        let _tx = Transaction::begin();
+                        // Attach, then feed the probe frame: the platform
+                        // reports `readyForDisplay` only for a layer in
+                        // the hierarchy that has content committed. The
+                        // flag is refreshed by the layer's readiness
+                        // notification from then on; the read after `show`
+                        // covers a transition that completed before the
+                        // registration returned.
+                        scene.attach(layer, &owner, Arc::downgrade(&flag), waker.clone());
                         scene.show(layer, &frame, generation);
                         let display = &scene.displays[&layer].display;
-                        // The attach is not enough: a headless window
-                        // server can create the layer but never make it
-                        // ready for display. Promotion waits for this
-                        // platform signal and keeps the engine path when
-                        // it is false.
-                        let is_ready = unsafe { display.isReadyForDisplay() };
-                        ready.store(is_ready, Ordering::Release);
+                        // SAFETY: the property is read on main, where the
+                        // layer lives.
+                        flag.store(unsafe { display.isReadyForDisplay() }, Ordering::Release);
+                        // The attach's completion signal: the flag may
+                        // still be false — readiness lands through the
+                        // layer's own notification — but the queued work
+                        // is done.
                         if let Some(waker) = waker {
                             waker.wake();
                         }
@@ -1064,8 +1266,12 @@ impl SystemPlanes for LayerPlanes {
         self.offered.retain(|layer| candidates.contains_key(layer));
         self.woke = false;
         for (&layer, ready) in &self.candidates {
-            if ready.load(Ordering::Acquire) && self.offered.insert(layer) {
-                self.woke = true;
+            if ready.load(Ordering::Acquire) {
+                self.woke |= self.offered.insert(layer);
+            } else {
+                // A layer the plan was offered that lost readiness needs
+                // the same re-plan a newly ready one does.
+                self.woke |= self.offered.remove(&layer);
             }
         }
     }

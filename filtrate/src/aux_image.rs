@@ -16,11 +16,15 @@ use filtrate_core::{AuxData, AuxFormat, AuxImage};
 /// stage binds one through [`AuxSource::Texture`](filtrate_core::AuxSource::Texture),
 /// which rejects CPU images, or through `AuxSource::Image`, which accepts
 /// either.
+///
+/// Available with the `gpu` feature.
+#[cfg(feature = "gpu")]
 #[derive(Clone, Debug)]
 pub struct TextureImage {
     texture: wgpu::Texture,
 }
 
+#[cfg(feature = "gpu")]
 impl TextureImage {
     /// Wraps a texture the caller already uploaded.
     ///
@@ -38,6 +42,7 @@ impl TextureImage {
     }
 }
 
+#[cfg(feature = "gpu")]
 impl AuxImage for TextureImage {
     fn width(&self) -> u32 {
         self.texture.width()
@@ -60,9 +65,9 @@ impl AuxImage for TextureImage {
 ///
 /// CPU images are uploaded once, at their native precision: RGBA8, RGBA16F
 /// or RGBA32F texels exactly as given — a float map keeps its precision
-/// ([`FilterImage::from_rgba16f`], [`FilterImage::from_rgba32f`]). A GPU
-/// texture binds in place, also at its native format
-/// ([`FilterImage::from_texture`]).
+/// ([`FilterImage::from_rgba16f`], [`FilterImage::from_rgba32f`]). With the
+/// `gpu` feature a texture binds in place, also at its native format
+/// (`FilterImage::from_texture`).
 #[derive(Clone, Debug)]
 pub struct FilterImage(Source);
 
@@ -81,6 +86,7 @@ enum Source {
         texels: Arc<[u8]>,
     },
     /// A texture bound in place.
+    #[cfg(feature = "gpu")]
     Texture(TextureImage),
 }
 
@@ -132,6 +138,9 @@ impl FilterImage {
 
     /// Wraps a texture the caller already uploaded — bound in place at its
     /// native format.
+    ///
+    /// Available with the `gpu` feature.
+    #[cfg(feature = "gpu")]
     #[must_use]
     pub const fn from_texture(texture: TextureImage) -> Self {
         Self(Source::Texture(texture))
@@ -182,6 +191,7 @@ impl AuxImage for FilterImage {
     fn width(&self) -> u32 {
         match &self.0 {
             Source::Cpu { width, .. } => *width,
+            #[cfg(feature = "gpu")]
             Source::Texture(texture) => texture.texture.width(),
         }
     }
@@ -189,6 +199,7 @@ impl AuxImage for FilterImage {
     fn height(&self) -> u32 {
         match &self.0 {
             Source::Cpu { height, .. } => *height,
+            #[cfg(feature = "gpu")]
             Source::Texture(texture) => texture.texture.height(),
         }
     }
@@ -199,6 +210,7 @@ impl AuxImage for FilterImage {
                 format: *format,
                 bytes: texels.as_ref(),
             }),
+            #[cfg(feature = "gpu")]
             Source::Texture(_) => None,
         }
     }
@@ -206,6 +218,7 @@ impl AuxImage for FilterImage {
     fn as_any(&self) -> Option<&dyn core::any::Any> {
         match &self.0 {
             Source::Cpu { .. } => None,
+            #[cfg(feature = "gpu")]
             Source::Texture(texture) => Some(texture),
         }
     }

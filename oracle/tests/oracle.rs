@@ -267,6 +267,18 @@ fn decode_png_all_colour_types() {
     assert_eq!((w, h), (2, 1));
     assert_eq!(px, rgba(&[0, 0, 0, 255, 255, 255, 255, 255]));
 
+    // Grey 16-bit (big-endian, stripped to 8-bit).
+    let png = encode_png(
+        png::ColorType::Grayscale,
+        png::BitDepth::Sixteen,
+        1,
+        1,
+        &[0x80, 0x00],
+        None,
+    );
+    let (_, _, px) = decode_png_rgba8(&png).expect("grey16");
+    assert_eq!(px, rgba(&[128, 128, 128, 255]));
+
     // Grey + alpha 8-bit.
     let png = encode_png(
         png::ColorType::GrayscaleAlpha,
@@ -277,6 +289,18 @@ fn decode_png_all_colour_types() {
         None,
     );
     let (_, _, px) = decode_png_rgba8(&png).expect("greyalpha8");
+    assert_eq!(px, rgba(&[128, 128, 128, 64]));
+
+    // Grey + alpha 16-bit.
+    let png = encode_png(
+        png::ColorType::GrayscaleAlpha,
+        png::BitDepth::Sixteen,
+        1,
+        1,
+        &[0x80, 0x00, 0x40, 0x00],
+        None,
+    );
+    let (_, _, px) = decode_png_rgba8(&png).expect("greyalpha16");
     assert_eq!(px, rgba(&[128, 128, 128, 64]));
 
     // RGB 8-bit.
@@ -302,6 +326,30 @@ fn decode_png_all_colour_types() {
     );
     let (_, _, px) = decode_png_rgba8(&png).expect("rgb16");
     assert_eq!(px, rgba(&[255, 0, 128, 255]));
+
+    // RGBA 8-bit.
+    let png = encode_png(
+        png::ColorType::Rgba,
+        png::BitDepth::Eight,
+        1,
+        1,
+        &[10, 20, 30, 40],
+        None,
+    );
+    let (_, _, px) = decode_png_rgba8(&png).expect("rgba8");
+    assert_eq!(px, rgba(&[10, 20, 30, 40]));
+
+    // RGBA 16-bit (big-endian, stripped to 8-bit).
+    let png = encode_png(
+        png::ColorType::Rgba,
+        png::BitDepth::Sixteen,
+        1,
+        1,
+        &[0xff, 0xff, 0, 0, 0x80, 0x00, 0x40, 0x00],
+        None,
+    );
+    let (_, _, px) = decode_png_rgba8(&png).expect("rgba16");
+    assert_eq!(px, rgba(&[255, 0, 128, 64]));
 
     // Indexed palette.
     let png = encode_png(

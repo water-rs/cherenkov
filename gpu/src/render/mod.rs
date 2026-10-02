@@ -41,7 +41,7 @@ use cherenkov::{
     ContentOp, EngineError, FontData as EngineFontData, FontId, Frame, FrameId, FrameStats,
     FrameTiming, ImageId, ImageUpload, LayerId, MemoryUsage, PassTiming, Pressure, Readback,
     Redraw, RenderError, Renderer, ResourceError, ResourceId, SurfaceError, SurfaceFrame,
-    SurfaceId, SurfaceInfo,
+    SurfaceId, SurfaceInfo, Visibility,
 };
 use glyph::{Atlas, FontData, PendingRaster, PreparedFont};
 use lower::{
@@ -303,6 +303,14 @@ struct SurfaceState {
     /// Bumped whenever GPU content or an external frame is installed or
     /// resized: local images that sampled one are then stale.
     interop: u64,
+    /// The host's announced visibility as the render loop applied it. A
+    /// hidden surface is in no frame, and its producers and filters want
+    /// no redraw.
+    visibility: Visibility,
+    /// The host's announced visibility as it flips on the UI thread: the
+    /// wake gates of the surface's producers and filters read it, so they
+    /// stop waking the moment the host hides the surface.
+    announced: cherenkov::SurfaceVisibility,
 }
 
 /// A registered backdrop group: its optional capture filter and the
@@ -610,10 +618,6 @@ pub struct GpuRenderer {
     /// The ready-candidate set `plane_only_frames` fills with the
     /// surface's current readiness — the filter the committed plan saw.
     ready: FxHashSet<LayerId>,
-    /// The host wake-up a plane's main-queue attach fires when it lands,
-    /// pulling the frame that promotes the born candidate — the same
-    /// `waker.wake` an external frame or an invalidation uses.
-    plane_waker: Option<cherenkov::CompletionWaker>,
     /// How the fixed modules reach this device (`shaders.rs`): SPIR-V,
     /// metallib, or WGSL — decided once at init by the adapter backend.
     shader_delivery: shaders::ShaderDelivery,
@@ -1973,7 +1977,6 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             candidate_frames: FxHashMap::default(),
             ready_sets: Vec::new(),
             ready: FxHashSet::default(),
-            plane_waker: None,
             shader_delivery,
             shaders: paint::Registry::default(),
             backdrop_shaders: FxHashMap::default(),
@@ -2282,7 +2285,6 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
         candidate_frames: FxHashMap::default(),
         ready_sets: Vec::new(),
         ready: FxHashSet::default(),
-        plane_waker: None,
         shader_delivery,
         shaders: paint::Registry::default(),
         backdrop_shaders: FxHashMap::default(),
@@ -2431,9 +2433,15 @@ impl Renderer for GpuRenderer {
         &mut self,
         id: SurfaceId,
         target: GpuTarget,
+        waker: cherenkov::CompletionWaker,
     ) -> Result<SurfaceInfo, SurfaceError> {
         let _diag_guard = diag::Guard::scope(self.diag.as_ref());
         diag::set_surface(Some(id.raw()));
+        let announced = waker.visibility();
+        // Only Apple windows complete work after a render: a promoted
+        // plane's attach on the main queue.
+        #[cfg(not(target_vendor = "apple"))]
+        drop(waker);
         let size = match &target {
             GpuTarget::Offscreen(offscreen) => offscreen.size,
             GpuTarget::Window(window) => window.size,
@@ -2461,7 +2469,7 @@ impl Renderer for GpuRenderer {
             GpuTarget::Window(window) => {
                 let refresh = window.refresh.clone();
                 #[cfg(target_vendor = "apple")]
-                let surface = self.open_window(id, window, size);
+                let surface = self.open_window(id, window, size, waker);
                 #[cfg(not(target_vendor = "apple"))]
                 let surface = self.open_window(id, window, size)?;
                 (surface, None, refresh, true)
@@ -2517,6 +2525,8 @@ impl Renderer for GpuRenderer {
                 realized: Vec::new(),
                 composed: Vec::new(),
                 interop: 0,
+                visibility: Visibility::Visible,
+                announced,
             },
         );
         diag::set_surface(None);
@@ -2528,6 +2538,17 @@ impl Renderer for GpuRenderer {
             readable: !promotes,
             presents,
         })
+    }
+
+    fn set_visibility(&mut self, id: SurfaceId, visibility: Visibility) {
+        let surface = self
+            .surfaces
+            .get_mut(&id)
+            .expect("visibility of a created surface");
+        // The producers' and filters' wakes already follow the announced
+        // visibility through their gates; this decides what a frame lists
+        // and what counts in `Redraw`.
+        surface.visibility = visibility;
     }
 
     fn resize_surface(&mut self, id: SurfaceId, size: (u32, u32)) {
@@ -2887,10 +2908,6 @@ impl Renderer for GpuRenderer {
                 content.invalidate();
             }
         }
-    }
-
-    fn set_plane_waker(&mut self, waker: cherenkov::CompletionWaker) {
-        self.plane_waker = Some(waker);
     }
 
     #[expect(
@@ -3732,23 +3749,29 @@ impl GpuRenderer {
 
     fn update_filter_activity(&self) {
         // A retained local image keeps the filters its realization ran
-        // active: an animating one must make it stale.
-        let active = self
-            .surfaces
-            .values()
-            .flat_map(|surface| {
-                surface.frame.filters.iter().map(|(_, id)| *id).chain(
-                    surface.composed.iter().flat_map(|key| {
-                        projective_entry(&surface.projective, *key)
-                            .deps
-                            .filters
-                            .iter()
-                            .copied()
-                    }),
-                )
-            })
-            .collect();
-        self.filters.set_active(&active);
+        // active: an animating one must make it stale. Each filter's gate
+        // holds the surfaces that run it, so a hidden surface's filters
+        // wake no host; the frame that shows it runs them.
+        let mut uses: FxHashMap<filter::FilterKey, Vec<cherenkov::SurfaceVisibility>> =
+            FxHashMap::default();
+        for surface in self.surfaces.values() {
+            for key in surface.frame.filters.iter().map(|(_, id)| *id).chain(
+                surface.composed.iter().flat_map(|key| {
+                    projective_entry(&surface.projective, *key)
+                        .deps
+                        .filters
+                        .iter()
+                        .copied()
+                }),
+            ) {
+                let surfaces = uses.entry(key).or_default();
+                // Listed surface by surface: one entry per surface.
+                if surfaces.last() != Some(&surface.announced) {
+                    surfaces.push(surface.announced.clone());
+                }
+            }
+        }
+        self.filters.set_surfaces(&uses);
     }
     pub fn add_filter(&mut self, id: cherenkov::FilterId, source: Box<dyn filter::Source>) {
         self.filters.add(filter::FilterKey::Layer(id.raw()), source);
@@ -4081,7 +4104,11 @@ impl GpuRenderer {
             Redraw::None => None,
             Redraw::Wanted { rate } => Some(rate),
         };
-        for surface in self.surfaces.values() {
+        for surface in self
+            .surfaces
+            .values()
+            .filter(|surface| surface.visibility == Visibility::Visible)
+        {
             if surface
                 .frame
                 .filters
@@ -4107,13 +4134,16 @@ impl GpuRenderer {
 
     /// Opens a window target. Apple windows expose the view's layer: the
     /// engine builds its planes under it and presents its parts there, so
-    /// no single swapchain exists.
+    /// no single swapchain exists. A plane's main-queue attach wakes the
+    /// host through the surface's `waker` when it lands, pulling the frame
+    /// that promotes the born candidate.
     #[cfg(target_vendor = "apple")]
     fn open_window(
         &mut self,
         id: SurfaceId,
         window: crate::WindowTarget,
         size: (u32, u32),
+        waker: cherenkov::CompletionWaker,
     ) -> Option<present::WindowSurface> {
         let system = planes::apple::LayerPlanes::new(
             &self.instance,
@@ -4121,10 +4151,9 @@ impl GpuRenderer {
             &self.device,
             window.parent,
             size,
-            window.transparent,
-            window.required_color_space,
+            window.output,
             window.probe,
-            self.plane_waker.clone(),
+            waker,
         );
         self.planes.insert(id, system);
         self.presenter
@@ -4147,8 +4176,7 @@ impl GpuRenderer {
             &self.device,
             window.handle,
             size,
-            window.transparent,
-            window.required_color_space,
+            window.output,
             window.probe,
         )?;
         self.presenter
@@ -4168,9 +4196,10 @@ impl GpuRenderer {
         state.layers.remove(&layer);
         state.external.remove(&layer);
         state.interop += 1;
-        state
-            .content
-            .insert(layer, gpu_content::Slot::new(content, size));
+        state.content.insert(
+            layer,
+            gpu_content::Slot::new(content, size, state.announced.clone()),
+        );
         diag::bind_groups_dropped(&self.device, state.binds1.len() as u64, "content change");
         state.binds1.clear();
     }
@@ -4584,11 +4613,14 @@ impl GpuRenderer {
                 sf.display_moved || sf.display.scale.to_bits() != surface.display.scale.to_bits();
             surface.display = sf.display;
             if renegotiate && let Some(window) = &mut surface.window {
-                window.reselect(&self.adapter, &self.device);
+                window
+                    .reselect(&self.adapter, &self.device)
+                    .map_err(|error| RenderError::Render(error.to_string()))?;
                 surface.present_pending = true;
             }
             if renegotiate && let Some(system) = self.planes.get_mut(&sf.id) {
-                planes::SystemPlanes::reselect(system, &self.adapter, &self.device);
+                planes::SystemPlanes::reselect(system, &self.adapter, &self.device)
+                    .map_err(|error| RenderError::Render(error.to_string()))?;
                 surface.present_pending = true;
             }
             if surface.present_pending {
@@ -4963,7 +4995,6 @@ impl GpuRenderer {
                 tracing::debug!(target: "cherenkov::planes", layer = ?layer, decision = ?why, "plane decision");
             }
         }
-        let promoted = surf.plan.planes.iter().map(|p| p.layer).collect();
         // Lowering borrows `layers` immutably while mutating `frame`;
         // taking the map out keeps the two borrows disjoint.
         let mut layers = std::mem::take(&mut surf.layers);
@@ -4995,7 +5026,7 @@ impl GpuRenderer {
                     &glyphs,
                     groups,
                     placed,
-                    promoted,
+                    &surf.plan,
                 )
             });
             lowered.commands = lowering.commands_lowered;

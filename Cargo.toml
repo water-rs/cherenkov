@@ -12,6 +12,7 @@ publish = false
 testing = []
 
 [dependencies]
+arc-swap = "1"
 web-time = "1"
 color = { version = "0.3.3", features = ["serde"] }
 filtrate-core = { path = "filtrate/core" }
@@ -50,7 +51,7 @@ members = [
     "oracle",
     "bench",
 ]
-exclude = ["gpu/examples/android_planes"]
+exclude = ["gpu/examples/android_planes", "gpu/examples/apple_planes"]
 
 [workspace.package]
 edition = "2024"

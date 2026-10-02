@@ -5,9 +5,9 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
-use cherenkov::RenderError;
+use cherenkov::{RenderError, SurfaceVisibility, WakeGate};
 use filtrate::{
     Effect, EffectContext, EffectFrameTiming, EffectInput, EffectOutput, ShapeTextures,
 };
@@ -178,7 +178,8 @@ impl<E: Effect> Runnable for E {
 struct Entry {
     effect: Box<dyn Runnable>,
     dirty: Arc<AtomicBool>,
-    active: Arc<AtomicBool>,
+    /// Open while a visible surface's frame runs the filter.
+    gate: Arc<WakeGate>,
     again: bool,
     sequence: Option<u64>,
     setup: Option<Result<(), String>>,
@@ -333,12 +334,11 @@ impl Registry {
     pub fn add(&mut self, id: FilterKey, source: Box<dyn Source>) {
         let mut effect = source.build();
         let dirty = Arc::new(AtomicBool::new(false));
-        let active = Arc::new(AtomicBool::new(false));
-        let (request, attached, host) =
-            (Arc::clone(&dirty), Arc::clone(&active), self.host.clone());
+        let gate = Arc::new(WakeGate::default());
+        let (request, open, host) = (Arc::clone(&dirty), Arc::clone(&gate), self.host.clone());
         effect.set_redraw(Arc::new(move || {
             if !request.swap(true, Ordering::AcqRel)
-                && attached.load(Ordering::Acquire)
+                && open.is_open()
                 && let Some(host) = &host
             {
                 host.wake();
@@ -349,7 +349,7 @@ impl Registry {
             Entry {
                 effect,
                 dirty,
-                active,
+                gate,
                 again: false,
                 sequence: None,
                 setup: None,
@@ -366,7 +366,7 @@ impl Registry {
         let Some(entry) = self.entries.remove(&id) else {
             return 0;
         };
-        entry.active.store(false, Ordering::Release);
+        entry.gate.close();
         entry
             .io
             .iter()
@@ -379,9 +379,13 @@ impl Registry {
             .sum()
     }
 
-    pub fn set_active(&self, uses: &FxHashSet<FilterKey>) {
+    /// Sets each filter's wake gate to the surfaces whose frames run it;
+    /// a filter no frame runs wakes nothing.
+    pub fn set_surfaces(&self, uses: &FxHashMap<FilterKey, Vec<SurfaceVisibility>>) {
         for (id, entry) in &self.entries {
-            entry.active.store(uses.contains(id), Ordering::Release);
+            entry
+                .gate
+                .set(uses.get(id).map(Vec::as_slice).unwrap_or_default());
         }
     }
 
@@ -525,7 +529,7 @@ impl Registry {
 impl Drop for Registry {
     fn drop(&mut self) {
         for entry in self.entries.values() {
-            entry.active.store(false, Ordering::Release);
+            entry.gate.close();
         }
     }
 }
@@ -587,7 +591,7 @@ mod tests {
         Entry {
             effect: Box::new(filtrate::Executor::new(GaussianBlur(2.0_f32))),
             dirty: Arc::new(AtomicBool::new(false)),
-            active: Arc::new(AtomicBool::new(false)),
+            gate: Arc::new(WakeGate::default()),
             again: false,
             sequence: None,
             setup: None,

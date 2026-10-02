@@ -61,7 +61,9 @@ pub use crate::animation::{
 pub use crate::backdrop::{
     BackdropEffect, BackdropShaderEffect, BackdropShaderSource, ColorMatrix, Refraction, Rim,
 };
-pub use crate::backend::{Backend, Display, Frame, Redraw, Renderer, SurfaceFrame, SurfaceInfo};
+pub use crate::backend::{
+    Backend, Display, Frame, Redraw, Renderer, SurfaceFrame, SurfaceInfo, Visibility,
+};
 pub use crate::capability::{
     Backdrop, BackdropChain, BackdropRuns, BackdropShaders, Effects, ExternalFrames, Filters,
     GpuContent, HdrOutput, Planes, ProjectiveLayers, Runs, ShaderPaint as ShaderPaintCapability,
@@ -75,8 +77,8 @@ pub use crate::config::{Budget, Bytes, MemoryUsage, Pressure};
 pub use crate::display_list::{
     Command, Dirty, DisplayList, Operand, OperandKind, Picture, ScopeError, Slot, SlotUpdate,
 };
-pub use crate::engine::CompletionWaker;
 pub use crate::engine::Engine;
+pub use crate::engine::{CompletionWaker, SurfaceVisibility, WakeGate};
 pub use crate::error::{EngineError, RenderError, ResourceError, SurfaceError};
 pub use crate::frame::{
     DEFAULT_REFRESH, FrameId, FrameStats, FrameTime, FrameTiming, Next, Offscreen, OffscreenFormat,

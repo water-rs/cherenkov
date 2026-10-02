@@ -885,10 +885,11 @@ impl SystemPlanes for Planes {
         self.resize_parts(size);
     }
 
-    fn reselect(&mut self, _: &wgpu::Adapter, _: &wgpu::Device) {
+    fn reselect(&mut self, _: &wgpu::Adapter, _: &wgpu::Device) -> Result<(), SurfaceError> {
         // Engine parts are RGBA8 `AHardwareBuffer`s in the sRGB dataspace.
         // That contract is not a swapchain negotiation, and a frame's
         // headroom is read when the part is presented.
+        Ok(())
     }
 }
 

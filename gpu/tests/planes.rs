@@ -123,6 +123,14 @@ mod macos {
                 "a_translucent_layer_above_stays_in_the_engine_and_matches",
                 a_translucent_layer_above_stays_in_the_engine_and_matches,
             ),
+            case(
+                "a_promoted_layer_painted_last_composes",
+                a_promoted_layer_painted_last_composes,
+            ),
+            case(
+                "two_promoted_layers_with_the_last_painted_last_compose",
+                two_promoted_layers_with_the_last_painted_last_compose,
+            ),
         ]
     }
 
@@ -1217,5 +1225,87 @@ mod macos {
             &offscreen,
             "engine-composited video under a translucent layer",
         );
+    }
+
+    /// One scaled video layer under the root and nothing else — the
+    /// `apple_planes` `overlay` tree: the promoted layer is the last
+    /// painted, so `Plan::trailing` is false and the surface has one
+    /// part. The composite stack is the part, then the plane.
+    fn a_promoted_layer_painted_last_composes() {
+        let fixture = Fixture::new();
+        let buffer = bgra_buffer();
+        let frame = bgra(&fixture.metal, &buffer, FrameColor::SRGB);
+        let video = fixture.engine.external_frame(frame);
+        let layer = fixture.window.layer();
+        fixture.window.update(|tx| {
+            tx[fixture.window.root()].push(&layer);
+            tx[&layer]
+                .transform(Affine::scale(
+                    f64::from(SIZE.0) / f64::from(u32::try_from(VIDEO.0).expect("fits")),
+                ))
+                .content(video);
+        });
+        assert!(
+            fixture.promote(),
+            "the platform never reported the candidate ready"
+        );
+        // part 0, then the plane nested in its path's levels.
+        let stack = stack(&fixture);
+        let [part, plane] = &stack[..] else {
+            panic!("one part under the plane, found {} layers", stack.len());
+        };
+        assert!(is::<CAMetalLayer>(part));
+        assert!(!is::<CAMetalLayer>(plane));
+        assert_eq!(displays(&fixture.root()).len(), 1, "one promoted plane");
+    }
+
+    /// Two video layers promoted together with the second painted last:
+    /// the empty part between them still exists (the planes need a layer
+    /// between them in the stack), and no part opens after the last one.
+    /// The composite stack is part, plane, part, plane.
+    fn two_promoted_layers_with_the_last_painted_last_compose() {
+        let fixture = Fixture::new();
+        let layer = |x: f64| {
+            let buffer = bgra_buffer();
+            let frame = bgra(&fixture.metal, &buffer, FrameColor::SRGB);
+            let video = fixture.engine.external_frame(frame);
+            let layer = fixture.window.layer();
+            fixture.window.update(|tx| {
+                tx[fixture.window.root()].push(&layer);
+                tx[&layer]
+                    .transform(
+                        Affine::translate((x, 0.0))
+                            * Affine::scale(
+                                f64::from(SIZE.0 / 2)
+                                    / f64::from(u32::try_from(VIDEO.0).expect("fits")),
+                            ),
+                    )
+                    .content(video);
+            });
+            layer
+        };
+        let _first = layer(0.0);
+        let _second = layer(f64::from(SIZE.0 / 2));
+        assert!(
+            fixture.promote(),
+            "the platform never reported a candidate ready"
+        );
+        // Each candidate promotes on its own readiness round.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while displays(&fixture.root()).len() < 2 {
+            assert!(Instant::now() < deadline, "the second plane never showed");
+            drain_main();
+            fixture.engine.render(FrameTime::now()).expect("rendered");
+            drain_main();
+        }
+        // part 0, plane, the separator part, plane — the planes nest in
+        // their paths' levels.
+        let stack = stack(&fixture);
+        let [first, plane_a, second, plane_b] = &stack[..] else {
+            panic!("part, plane, part, plane — found {} layers", stack.len());
+        };
+        assert!(is::<CAMetalLayer>(first));
+        assert!(is::<CAMetalLayer>(second));
+        assert!(!is::<CAMetalLayer>(plane_a) && !is::<CAMetalLayer>(plane_b));
     }
 }

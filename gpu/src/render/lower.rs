@@ -997,8 +997,11 @@ pub struct Lowering<'a> {
     /// The engine part surface-level passes draw into.
     part: u32,
     /// The layers promoted to system planes this frame: their content is
-    /// not drawn, and each starts the next part.
+    /// not drawn.
     promoted: Vec<LayerId>,
+    /// The subset of `promoted` a new engine part opens after — the
+    /// plan's `opens_part`, so the walk emits exactly `parts()` passes.
+    opens: Vec<LayerId>,
     /// The storage space of each scratch target by depth index: a
     /// semantic isolate's declared space, a clip-only level's parent
     /// space, or the opening level's for shadow and capture scopes.
@@ -1053,6 +1056,7 @@ impl<'a> Lowering<'a> {
             semantic_target: Target::Part(0),
             part: 0,
             promoted: Vec::new(),
+            opens: Vec::new(),
             space_stack: Vec::new(),
             scratch_space: Vec::new(),
             capture_space: FxHashMap::default(),
@@ -1257,9 +1261,9 @@ impl<'a> Lowering<'a> {
 
     /// Lowers a surface's sampled tree and its clear colour into the
     /// frame, placing the projective layers composed into the surface
-    /// from `projected`. Each layer in `promoted` (paint order) is left to
-    /// its system plane: its content is not drawn, and the layers painted
-    /// after it draw into the next engine part.
+    /// from `projected`. Each layer `plan` promotes (paint order) is left
+    /// to its system plane: its content is not drawn, and a promoted layer
+    /// the plan opens a part after ends the current engine part.
     ///
     /// # Errors
     /// A [`RenderError`] for content or state the lowering cannot render.
@@ -1272,7 +1276,7 @@ impl<'a> Lowering<'a> {
         glyphs: &GlyphContext<'_>,
         groups: &FxHashMap<u64, BackdropGroupInfo>,
         projected: FxHashMap<LayerId, Placement>,
-        promoted: Vec<LayerId>,
+        plan: &super::planes::Plan,
     ) -> Result<(), RenderError> {
         let [r, g, b, a] = clear.components;
         self.raster(self.surface);
@@ -1283,7 +1287,7 @@ impl<'a> Lowering<'a> {
             groups,
             (None, Target::Part(0), Some([r * a, g * a, b * a, a])),
             projected,
-            promoted,
+            plan,
         )
     }
 
@@ -1319,7 +1323,7 @@ impl<'a> Lowering<'a> {
             ),
             projected,
             // Promotion splits surface-level passes; a local image has none.
-            Vec::new(),
+            &super::planes::Plan::default(),
         )
     }
 
@@ -1340,13 +1344,14 @@ impl<'a> Lowering<'a> {
         groups: &FxHashMap<u64, BackdropGroupInfo>,
         (local, root_target, clear): (Option<(LayerId, Affine)>, Target, Option<[f32; 4]>),
         projected: FxHashMap<LayerId, Placement>,
-        promoted: Vec<LayerId>,
+        plan: &super::planes::Plan,
     ) -> Result<(), RenderError> {
         self.local = local;
         self.root_target = root_target;
         self.semantic_target = root_target;
         self.projected = projected;
-        self.promoted = promoted;
+        self.promoted = plan.planes.iter().map(|p| p.layer).collect();
+        self.opens = plan.opens_part().collect();
         self.part = 0;
         self.transform = Affine::IDENTITY;
         self.animating = false;
@@ -2629,7 +2634,11 @@ impl<'a> Lowering<'a> {
             }
         }
         if self.promoted.contains(&id) {
-            self.next_part();
+            // A plane the plan puts a part after ends the current part —
+            // nothing painted above it leaves no part to open into.
+            if self.opens.contains(&id) {
+                self.next_part();
+            }
         } else if let Some(slot) = glyphs.external.get(&id) {
             self.frame.external.push(id);
             let bounds = Rect::new(0.0, 0.0, f64::from(slot.size.0), f64::from(slot.size.1));
@@ -4884,9 +4893,28 @@ mod tests {
         assert_eq!(merged[0].bbox, [0, 0, 30, 10]);
     }
 
-    /// A promoted layer ends the engine part it sits in: layers painted
-    /// before it draw into part 0, layers after it into a transparent part
-    /// 1, and its own content is left to its plane.
+    /// A plan of `promoted` paint-order layers and `trailing` — the
+    /// placement internals the walk reads are only the layer ids.
+    fn plan(promoted: &[LayerId], trailing: bool) -> crate::render::planes::Plan {
+        crate::render::planes::Plan {
+            planes: promoted
+                .iter()
+                .map(|&layer| crate::render::planes::Placement {
+                    layer,
+                    size: (8, 8),
+                    opacity: 1.0,
+                    path: Vec::new(),
+                })
+                .collect(),
+            rejected: Vec::new(),
+            trailing,
+        }
+    }
+
+    /// A promoted layer the plan opens a part after ends the engine part
+    /// it sits in: layers painted before it draw into part 0, layers
+    /// after it into a transparent part 1, and its own content is left
+    /// to its plane.
     #[test]
     fn a_promoted_layer_splits_the_surface_into_parts() {
         use cherenkov::testing::LayerOp;
@@ -4909,7 +4937,7 @@ mod tests {
                 c.fill(Rect::new(x, 0.0, x + 8.0, 8.0), WorkingColor::WHITE);
             }))
         };
-        let lower = |promoted: Vec<LayerId>| {
+        let lower = |plan: &crate::render::planes::Plan| {
             let mut caches: FxHashMap<LayerId, ContentData> =
                 [(below, rect(0.0)), (above, rect(16.0))]
                     .into_iter()
@@ -4937,7 +4965,7 @@ mod tests {
                     &glyphs,
                     &FxHashMap::default(),
                     FxHashMap::default(),
-                    promoted,
+                    plan,
                 )
                 .expect("lowered");
             frame
@@ -4947,11 +4975,26 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(
-            lower(Vec::new()),
+            lower(&plan(&[], false)),
             [(Target::Part(0), Some([0.0, 0.0, 0.0, 1.0]), 1)]
         );
         assert_eq!(
-            lower(vec![video]),
+            lower(&plan(&[video], true)),
+            [
+                (Target::Part(0), Some([0.0, 0.0, 0.0, 1.0]), 1),
+                (Target::Part(1), Some([0.0; 4]), 1),
+            ]
+        );
+        // Nothing painted after the promoted layer opens no part: the
+        // plan counts one, so the walk must emit one.
+        assert_eq!(
+            lower(&plan(&[above], false)),
+            [(Target::Part(0), Some([0.0, 0.0, 0.0, 1.0]), 1)]
+        );
+        // Two promoted layers with the second painted last: the
+        // separator part between them still opens, nothing after it.
+        assert_eq!(
+            lower(&plan(&[video, above], false)),
             [
                 (Target::Part(0), Some([0.0, 0.0, 0.0, 1.0]), 1),
                 (Target::Part(1), Some([0.0; 4]), 1),

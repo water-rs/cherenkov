@@ -4963,7 +4963,6 @@ impl GpuRenderer {
                 tracing::debug!(target: "cherenkov::planes", layer = ?layer, decision = ?why, "plane decision");
             }
         }
-        let promoted = surf.plan.planes.iter().map(|p| p.layer).collect();
         // Lowering borrows `layers` immutably while mutating `frame`;
         // taking the map out keeps the two borrows disjoint.
         let mut layers = std::mem::take(&mut surf.layers);
@@ -4995,7 +4994,7 @@ impl GpuRenderer {
                     &glyphs,
                     groups,
                     placed,
-                    promoted,
+                    &surf.plan,
                 )
             });
             lowered.commands = lowering.commands_lowered;

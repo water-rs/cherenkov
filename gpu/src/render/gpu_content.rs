@@ -4,13 +4,15 @@ use crate::interop::{
     GpuContentBox,
     wgpu::{Context, Frame},
 };
-use cherenkov::Instant;
-use cherenkov::RenderError;
+use cherenkov::{Instant, RenderError, SurfaceVisibility};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 pub struct Slot {
     content: GpuContentBox,
+    /// The visibility of the surface the content is installed on: its
+    /// producer's wakes are gated on it.
+    surface: SurfaceVisibility,
     pub size: (u32, u32),
     pub image: Option<super::GpuImage>,
     initialized: bool,
@@ -27,9 +29,10 @@ impl Drop for Slot {
 }
 
 impl Slot {
-    pub const fn new(content: GpuContentBox, size: (u32, u32)) -> Self {
+    pub const fn new(content: GpuContentBox, size: (u32, u32), surface: SurfaceVisibility) -> Self {
         Self {
             content,
+            surface,
             size,
             image: None,
             initialized: false,
@@ -40,8 +43,18 @@ impl Slot {
         }
     }
 
+    /// Whether the content is composed on its surface: only then may its
+    /// producer's requests wake the host, and only while the surface is
+    /// visible.
     pub fn set_active(&self, active: bool) {
-        self.content.redraw.active.store(active, Ordering::Release);
+        if active {
+            self.content
+                .redraw
+                .gate
+                .set(std::slice::from_ref(&self.surface));
+        } else {
+            self.content.redraw.gate.close();
+        }
     }
 
     pub fn resize(&mut self, size: (u32, u32)) {

@@ -12,7 +12,7 @@ use rustc_hash::FxHashMap;
 
 use kurbo::{Affine, Vec2};
 
-use crate::backend::{Backend, Display, Frame, Redraw, Renderer, SurfaceInfo};
+use crate::backend::{Backend, Display, Frame, Redraw, Renderer, SurfaceInfo, Visibility};
 use crate::capability::{ShaderPaint, ShaderSource};
 use crate::config::MemoryUsage;
 use crate::error::{EngineError, RenderError, ResourceError, SurfaceError};
@@ -54,6 +54,8 @@ pub enum Event {
     ExternalFrame(SurfaceId, LayerId),
     /// `remove_layer` ran.
     RemoveLayer(SurfaceId, LayerId),
+    /// `set_visibility` ran.
+    Visibility(SurfaceId, Visibility),
     /// One rendered surface, in `frame.surfaces` order.
     Frame(FrameRecord),
 }
@@ -156,6 +158,8 @@ pub struct NullRenderer {
     events: Sender<Event>,
     reject: HashSet<NullReject>,
     surfaces: HashSet<SurfaceId>,
+    /// The surfaces the host announced hidden.
+    hidden: HashSet<SurfaceId>,
     fonts: HashSet<FontId>,
     images: HashSet<ImageId>,
     shaders: HashSet<ShaderId>,
@@ -170,6 +174,7 @@ impl NullRenderer {
             events: config.events,
             reject: config.reject,
             surfaces: HashSet::new(),
+            hidden: HashSet::new(),
             fonts: HashSet::new(),
             images: HashSet::new(),
             shaders: HashSet::new(),
@@ -178,11 +183,17 @@ impl NullRenderer {
         }
     }
 
-    /// Panics when a surface's installed content draws a removed resource:
-    /// the render loop frees a resource only once no installed content
-    /// draws it.
-    fn assert_draws_no_removed(&self, frame: &Frame<'_>) {
+    /// Panics when a frame lists a hidden surface, or when a surface's
+    /// installed content draws a removed resource: the render loop leaves
+    /// hidden surfaces out of every frame, and frees a resource only once
+    /// no installed content draws it.
+    fn assert_frame_contract(&self, frame: &Frame<'_>) {
         for surface in frame.surfaces {
+            assert!(
+                !self.hidden.contains(&surface.id),
+                "frame lists hidden surface {}",
+                surface.id.raw()
+            );
             for resource in &self.removed {
                 assert!(
                     !self.samples(surface.id, *resource),
@@ -221,6 +232,7 @@ impl Renderer for NullRenderer {
         &mut self,
         id: SurfaceId,
         target: NullTarget,
+        _waker: crate::CompletionWaker,
     ) -> Result<SurfaceInfo, SurfaceError> {
         let (target, presents) = match &target {
             NullTarget::Offscreen(target) => (target, false),
@@ -246,6 +258,19 @@ impl Renderer for NullRenderer {
         let _ = self.events.send(Event::ResizeSurface(id, size));
     }
 
+    fn set_visibility(&mut self, id: SurfaceId, visibility: Visibility) {
+        let changed = match visibility {
+            Visibility::Hidden => self.hidden.insert(id),
+            Visibility::Visible => self.hidden.remove(&id),
+        };
+        assert!(
+            changed,
+            "surface {} announced {visibility:?} twice",
+            id.raw()
+        );
+        let _ = self.events.send(Event::Visibility(id, visibility));
+    }
+
     fn destroy_surface(&mut self, id: SurfaceId) {
         assert!(
             self.surfaces.remove(&id),
@@ -253,6 +278,7 @@ impl Renderer for NullRenderer {
             id.raw()
         );
         self.pictures.retain(|(surface, _), _| *surface != id);
+        self.hidden.remove(&id);
         let _ = self.events.send(Event::DestroySurface(id));
     }
 
@@ -348,7 +374,7 @@ impl Renderer for NullRenderer {
         frame: &Frame<'_>,
         _stats: &mut crate::FrameStats,
     ) -> Result<Redraw, RenderError> {
-        self.assert_draws_no_removed(frame);
+        self.assert_frame_contract(frame);
         for surface in frame.surfaces {
             let layers = surface
                 .tree
@@ -384,7 +410,7 @@ impl Renderer for NullRenderer {
         frame: &Frame<'_>,
         _stats: &mut crate::FrameStats,
     ) -> impl core::future::Future<Output = Result<Redraw, RenderError>> {
-        self.assert_draws_no_removed(frame);
+        self.assert_frame_contract(frame);
         for surface in frame.surfaces {
             let layers = surface
                 .tree
@@ -1514,6 +1540,9 @@ mod tests {
         image
             .replace(ImageData::<Rgba8>::new(2, 3, vec![0u8; 24]).expect("image data"))
             .expect("replace");
+        // The render loop wakes the host once it applied the replacement;
+        // the reply lands only after every earlier message was applied.
+        let _ = engine.memory();
         assert_eq!(
             wakes.load(Ordering::Relaxed),
             1,
@@ -1522,6 +1551,7 @@ mod tests {
         unused
             .replace(ImageData::<Rgba8>::new(2, 2, vec![0u8; 16]).expect("image data"))
             .expect("replace");
+        let _ = engine.memory();
         assert_eq!(
             wakes.load(Ordering::Relaxed),
             1,
@@ -1644,6 +1674,406 @@ mod tests {
         let next = engine.render(FrameTime::now()).expect("render");
         assert!(matches!(next, Next::At { .. }), "{next:?}");
         let _ = frames(&rx);
+    }
+
+    /// Installs a host wake callback that counts its calls.
+    fn counting_waker(engine: &Engine<Null>) -> std::sync::Arc<std::sync::atomic::AtomicU32> {
+        let wakes = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        engine.set_waker({
+            let wakes = std::sync::Arc::clone(&wakes);
+            move || {
+                wakes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        wakes
+    }
+
+    /// A window-like surface with a running transform animation, a bound
+    /// opacity and a live content that fills with a bound colour and draws
+    /// an image, rendered twice so the host is idle and armed.
+    struct HiddenScene {
+        engine: Engine<Null>,
+        rx: std::sync::mpsc::Receiver<Event>,
+        surface: Surface<Null>,
+        image: Image<Rgba8>,
+        moving: Layer,
+        drawing: Layer,
+        opacity: nami::Binding<f32>,
+        color: nami::Binding<crate::WorkingColor>,
+        /// Where `moving` animates to, over 400 ms from `t0`.
+        target: Affine,
+        t0: Instant,
+        wakes: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    fn hidden_scene() -> HiddenScene {
+        use crate::{Curve, Draw as _, Sampling, WorkingColor};
+
+        let (engine, rx) = engine();
+        let surface = engine
+            .surface(NullTarget::Window(Offscreen::new(
+                (16, 16),
+                OffscreenFormat::LinearF16,
+            )))
+            .expect("surface");
+        let image = engine
+            .image(ImageData::<Rgba8>::new(1, 1, vec![0u8; 4]).expect("image data"))
+            .expect("image");
+        let moving = surface.layer();
+        let drawing = surface.layer();
+        let opacity = nami::binding(1.0f32);
+        let color = nami::binding(WorkingColor::WHITE);
+        let content = surface.record(|c| {
+            c.fill(kurbo::Rect::new(0., 0., 8., 8.), color.clone());
+            c.image(
+                image.id(),
+                kurbo::Rect::new(8., 8., 16., 16.),
+                Sampling::Nearest,
+            );
+        });
+        surface.update(|tx| {
+            tx[surface.root()].push(&moving).push(&drawing);
+            tx[&drawing].opacity(opacity.clone()).content(content);
+        });
+        let t0 = Instant::now();
+        engine.render(FrameTime::at(t0)).expect("render");
+        let target = Affine::translate((40.0, 0.0));
+        surface.update(|tx| {
+            tx[&moving]
+                .transform(target)
+                .animation(Curve::linear(Duration::from_millis(400)));
+        });
+        let next = engine
+            .render(FrameTime::at(t0 + Duration::from_millis(8)))
+            .expect("render");
+        assert!(
+            matches!(next, Next::At { .. }),
+            "the animation runs: {next:?}"
+        );
+        let _ = frames(&rx);
+        let wakes = counting_waker(&engine);
+        HiddenScene {
+            engine,
+            rx,
+            surface,
+            image,
+            moving,
+            drawing,
+            opacity,
+            color,
+            target,
+            t0,
+            wakes,
+        }
+    }
+
+    /// The only frame record among `events`.
+    fn single_frame(events: &[Event]) -> &FrameRecord {
+        let records: Vec<&FrameRecord> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Frame(record) => Some(record),
+                _ => None,
+            })
+            .collect();
+        let [record] = records.as_slice() else {
+            panic!("one frame: {events:?}");
+        };
+        record
+    }
+
+    /// A hidden surface asks for no frame. With an animation running, a
+    /// bound signal, a live operand, a transaction, a new layer and an
+    /// image replacement it draws wake no host; their changes reach the
+    /// renderer as they are made, and nothing is drawn. Rendering while it
+    /// is the engine's only surface is an error. Showing it wakes the host
+    /// exactly once, and the next frame draws every change made while it
+    /// was hidden, samples the animation at that frame's time and
+    /// presents.
+    #[test]
+    fn hidden_surface_schedules_no_frames() {
+        use std::sync::atomic::Ordering;
+
+        use crate::{Draw as _, Visibility, WorkingColor};
+
+        let HiddenScene {
+            engine,
+            rx,
+            surface,
+            image,
+            moving,
+            drawing,
+            opacity,
+            color,
+            target,
+            t0,
+            wakes,
+        } = hidden_scene();
+        surface.visibility(Visibility::Hidden).expect("hide");
+        surface
+            .visibility(Visibility::Hidden)
+            .expect("announcing the same visibility again");
+        opacity.set(0.25);
+        color.set(WorkingColor::BLACK);
+        let added = surface.layer();
+        surface.update(|tx| {
+            tx[surface.root()].push(&added);
+            tx[&added].record(|c| c.fill(kurbo::Rect::new(0., 0., 4., 4.), WorkingColor::WHITE));
+        });
+        image
+            .replace(ImageData::<Rgba8>::new(2, 2, vec![0u8; 16]).expect("image data"))
+            .expect("replace");
+        // The reply lands only after every earlier message was applied, so
+        // a wake the render loop would fire has fired.
+        let _ = engine.memory();
+        assert_eq!(
+            wakes.load(Ordering::Relaxed),
+            0,
+            "a hidden surface woke the host"
+        );
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            matches!(
+                events.as_slice(),
+                [
+                    Event::Visibility(id, Visibility::Hidden),
+                    Event::SetContent(operand, drawn),
+                    Event::SetContent(transaction, installed),
+                    Event::ReplaceImage(replaced, (2, 2)),
+                ] if *id == surface.id()
+                    && *operand == surface.id()
+                    && *drawn == drawing.id()
+                    && *transaction == surface.id()
+                    && *installed == added.id()
+                    && *replaced == image.id()
+            ),
+            "a hidden surface's changes reach the renderer as they are made, undrawn: {events:?}"
+        );
+        assert!(
+            matches!(
+                engine.render(FrameTime::at(t0 + Duration::from_millis(16))),
+                Err(RenderError::Hidden)
+            ),
+            "rendering while every surface is hidden is an error"
+        );
+
+        surface.visibility(Visibility::Visible).expect("show");
+        assert_eq!(
+            wakes.load(Ordering::Relaxed),
+            1,
+            "showing the surface asks for exactly one frame"
+        );
+        surface
+            .visibility(Visibility::Visible)
+            .expect("announcing the same visibility again");
+        assert_eq!(wakes.load(Ordering::Relaxed), 1, "no second wake");
+        let next = engine
+            .render(FrameTime::at(t0 + Duration::from_secs(10)))
+            .expect("render");
+        assert_eq!(
+            next,
+            Next::Idle,
+            "the animation is sampled at the frame time, past its end"
+        );
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let record = single_frame(&events);
+        assert!(record.changed, "the shown surface redraws");
+        assert!(record.present_pending, "the shown surface presents");
+        assert_eq!(layer(record, moving.id()).transform, target, "no catch-up");
+        assert!(
+            (layer(record, drawing.id()).opacity - 0.25).abs() < f32::EPSILON,
+            "the bound opacity changed while hidden"
+        );
+        assert_eq!(
+            layer(record, surface.root().id()).children,
+            [moving.id(), drawing.id(), added.id()],
+            "the layer added while hidden"
+        );
+    }
+
+    /// A host asked for a frame, then saw the surface hide and dropped the
+    /// request: showing the surface still wakes it, though no render
+    /// re-armed the waker in between.
+    #[test]
+    fn showing_wakes_a_host_that_dropped_its_request() {
+        use std::sync::atomic::Ordering;
+
+        use crate::Visibility;
+
+        let scene = hidden_scene();
+        scene.opacity.set(0.5);
+        assert_eq!(
+            scene.wakes.load(Ordering::Relaxed),
+            1,
+            "a visible change wakes"
+        );
+        scene.surface.visibility(Visibility::Hidden).expect("hide");
+        scene.surface.visibility(Visibility::Visible).expect("show");
+        assert_eq!(
+            scene.wakes.load(Ordering::Relaxed),
+            2,
+            "showing wakes a host that dropped its request"
+        );
+        let _ = frames(&scene.rx);
+    }
+
+    /// A hidden surface is left out of the frames a visible surface still
+    /// renders: it is not drawn, its running animation does not keep the
+    /// engine at `Next::At`, and its changes wake nothing while the
+    /// visible surface's do.
+    #[test]
+    fn hidden_surface_is_left_out_of_other_surfaces_frames() {
+        use std::sync::atomic::Ordering;
+
+        use crate::{Visibility, WorkingColor};
+
+        let (engine, rx) = engine();
+        let hidden = engine
+            .surface(Offscreen::new((16, 16), OffscreenFormat::LinearF16))
+            .expect("surface");
+        let visible = engine
+            .surface(Offscreen::new((16, 16), OffscreenFormat::LinearF16))
+            .expect("surface");
+        let spinning = hidden.layer();
+        hidden.update_animated(Spring::smooth(), |tx| {
+            tx[hidden.root()].push(&spinning);
+            tx[&spinning].rotation(std::f64::consts::TAU);
+        });
+        let t0 = Instant::now();
+        let next = engine.render(FrameTime::at(t0)).expect("render");
+        assert!(matches!(next, Next::At { .. }), "the spring runs: {next:?}");
+        hidden.visibility(Visibility::Hidden).expect("hide");
+        let _ = frames(&rx);
+
+        let wakes = counting_waker(&engine);
+        hidden.clear_color(WorkingColor::BLACK);
+        assert_eq!(wakes.load(Ordering::Relaxed), 0, "the hidden surface woke");
+        visible.clear_color(WorkingColor::WHITE);
+        assert_eq!(
+            wakes.load(Ordering::Relaxed),
+            1,
+            "the visible surface wakes"
+        );
+        let next = engine
+            .render(FrameTime::at(t0 + Duration::from_millis(8)))
+            .expect("render");
+        assert_eq!(
+            next,
+            Next::Idle,
+            "a hidden surface's animation asks for no frame"
+        );
+        let records = frames(&rx);
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.surface)
+                .collect::<Vec<_>>(),
+            [visible.id()],
+            "only the visible surface is in the frame"
+        );
+        assert!(records[0].changed);
+    }
+
+    /// A hidden surface applies its changes on the render thread as they
+    /// are made, in order with every release, and samples nothing until it
+    /// is shown. Content committed while hidden that draws an image keeps
+    /// the image alive after its last handle drops; content that stops
+    /// drawing it frees it while the surface is still hidden; an animation
+    /// committed while hidden starts on the frame that shows the surface,
+    /// and that frame draws what was committed (#204).
+    #[test]
+    fn hidden_changes_apply_in_order_with_releases() {
+        use crate::{Curve, Draw as _, Sampling, Visibility, WorkingColor};
+
+        let installed = |events: &[Event], surface: SurfaceId, layer: LayerId| {
+            events.iter().any(
+                |event| matches!(event, Event::SetContent(s, l) if *s == surface && *l == layer),
+            )
+        };
+        let removed = |events: &[Event], image: ImageId| {
+            events
+                .iter()
+                .any(|event| matches!(event, Event::RemoveImage(id) if *id == image))
+        };
+        let (engine, rx) = engine();
+        let surface = engine
+            .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))
+            .expect("surface");
+        let layer_handle = surface.layer();
+        surface.update(|tx| {
+            tx[surface.root()].push(&layer_handle);
+        });
+        engine.render(FrameTime::now()).expect("render");
+        let image = engine
+            .image(ImageData::<Rgba8>::new(1, 1, vec![0u8; 4]).expect("image data"))
+            .expect("image");
+        let image_id = image.id();
+        let rect = kurbo::Rect::new(0., 0., 8., 8.);
+        let _ = std::iter::from_fn(|| rx.try_recv().ok()).count();
+
+        surface.visibility(Visibility::Hidden).expect("hide");
+        surface.update(|tx| {
+            tx[&layer_handle].record(|c| c.image(image.id(), rect, Sampling::Nearest));
+        });
+        drop(image);
+        // The reply lands only after every earlier message was applied.
+        let _ = engine.memory();
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            installed(&events, surface.id(), layer_handle.id()),
+            "content committed while hidden is installed as it is committed: {events:?}"
+        );
+        assert!(
+            !removed(&events, image_id),
+            "the image content committed while hidden draws was removed: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(event, Event::Frame(_))),
+            "a hidden surface is not drawn: {events:?}"
+        );
+
+        surface.update(|tx| {
+            tx[&layer_handle].record(|c| c.fill(rect, WorkingColor::WHITE));
+        });
+        let _ = engine.memory();
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            removed(&events, image_id),
+            "content that stops drawing the image frees it while hidden: {events:?}"
+        );
+
+        surface.update_animated(Curve::linear(Duration::from_millis(400)), |tx| {
+            tx[&layer_handle].opacity(0.0f32);
+        });
+        let shown = Instant::now() + Duration::from_secs(10);
+        surface.visibility(Visibility::Visible).expect("show");
+        let next = engine
+            .render(FrameTime::at(shown))
+            .expect("the shown frame draws what was committed while hidden");
+        assert!(
+            matches!(next, Next::At { .. }),
+            "the animation committed while hidden runs: {next:?}"
+        );
+        let records = frames(&rx);
+        let [record] = records.as_slice() else {
+            panic!("one frame: {records:?}");
+        };
+        assert!(
+            (layer(record, layer_handle.id()).opacity - 1.0).abs() < f32::EPSILON,
+            "an animation committed while hidden starts on the frame that shows the surface"
+        );
+        engine
+            .render(FrameTime::at(shown + Duration::from_millis(200)))
+            .expect("render");
+        let records = frames(&rx);
+        let [record] = records.as_slice() else {
+            panic!("one frame: {records:?}");
+        };
+        let opacity = layer(record, layer_handle.id()).opacity;
+        assert!(
+            (opacity - 0.5).abs() < 1.0e-3,
+            "the animation runs from the frame that showed the surface: {opacity}"
+        );
     }
 
     #[test]
@@ -2419,6 +2849,80 @@ mod wasm_tests {
         drop_after_commit(&engine, create()).await;
         drop_after_reply(&engine, create()).await;
         balance::assert_balanced(&rx);
+    }
+
+    /// The browser executor shares the hidden-surface contract: a hidden
+    /// surface's transaction wakes no host and is applied as it is made,
+    /// undrawn, rendering while it is the only surface fails with
+    /// `Hidden`, showing it wakes the host exactly once, and the next frame
+    /// draws what was committed while it was hidden.
+    #[wasm_bindgen_test]
+    #[expect(
+        clippy::future_not_send,
+        reason = "the browser engine is single-threaded and its futures run on the page's event loop"
+    )]
+    async fn hidden_surface_schedules_no_frames() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        use crate::{Next, Visibility};
+
+        let (engine, rx) = engine(HashSet::default()).await;
+        let surface = engine
+            .surface(Offscreen::new((8, 8), OffscreenFormat::LinearF16))
+            .await
+            .expect("surface");
+        let layer = surface.layer();
+        surface.update(|tx| {
+            tx[surface.root()].push(&layer);
+        });
+        engine.render(FrameTime::now()).await.expect("render");
+        let _: Vec<Event> = rx.try_iter().collect();
+
+        let wakes = Rc::new(Cell::new(0u32));
+        engine.set_waker({
+            let wakes = Rc::clone(&wakes);
+            move || wakes.set(wakes.get() + 1)
+        });
+        surface.visibility(Visibility::Hidden).expect("hide");
+        surface.update(|tx| {
+            tx[&layer].record(|c| c.fill(kurbo::Rect::new(0., 0., 8., 8.), WorkingColor::WHITE));
+        });
+        flush(&engine).await;
+        assert_eq!(wakes.get(), 0, "a hidden surface woke the host");
+        assert!(
+            matches!(
+                engine.render(FrameTime::now()).await,
+                Err(RenderError::Hidden)
+            ),
+            "rendering while every surface is hidden is an error"
+        );
+        let events: Vec<Event> = rx.try_iter().collect();
+        assert!(
+            matches!(
+                events.as_slice(),
+                [
+                    Event::Visibility(id, Visibility::Hidden),
+                    Event::SetContent(set, layer_id),
+                ] if *id == surface.id() && *set == surface.id() && *layer_id == layer.id()
+            ),
+            "the hidden surface's transaction is applied as it is made, undrawn: {events:?}"
+        );
+
+        surface.visibility(Visibility::Visible).expect("show");
+        assert_eq!(wakes.get(), 1, "showing the surface asks for one frame");
+        assert_eq!(
+            engine.render(FrameTime::now()).await.expect("render"),
+            Next::Idle
+        );
+        let events: Vec<Event> = rx.try_iter().collect();
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Event::Frame(record) if record.surface == surface.id() && record.changed
+            )),
+            "the shown surface redraws: {events:?}"
+        );
     }
 
     /// A registration releases its backend resource when the handle

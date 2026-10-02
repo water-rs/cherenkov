@@ -1,5 +1,5 @@
 use crate::{
-    BackdropFilter, BackdropGroup, BlendMode, Color, Draw, FillRule, GlyphRun, Item, Layer,
+    BackdropFilter, BackdropGroup, BlendMode, Color, Draw, FillRule, GlyphRun, Group, Item, Layer,
     LayerFilter, Motion, Paint, ResourceHash, Sampling, Scene, Shape, StrokeStyle,
 };
 use kurbo::{Affine, Rect, Vec2};
@@ -171,6 +171,13 @@ impl LayerBuilder<'_> {
         self
     }
 
+    /// Make the layer a text layer laid out from `source`; its items must
+    /// be the text's lowering (see [`Layer::text`]).
+    pub fn text(&mut self, source: crate::TextSource) -> &mut Self {
+        self.layer.text = Some(Box::new(source));
+        self
+    }
+
     /// Set the layer's one-time motion.
     // Not `const`: `Motion::Paint` holds gradient stop `Vec`s, so
     // `Option<Motion>` drops.
@@ -261,6 +268,12 @@ impl LayerBuilder<'_> {
     /// Push a raw draw command.
     pub fn push(&mut self, draw: Draw) -> &mut Self {
         self.layer.items.push(Item::Draw(draw));
+        self
+    }
+
+    /// Push an [`Item::Group`].
+    pub fn group(&mut self, group: Group) -> &mut Self {
+        self.layer.items.push(Item::Group(group));
         self
     }
 }

@@ -22,7 +22,7 @@
 use kurbo::{Affine, Rect, Vec2};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use cherenkov::{BlendMode, Display, LayerId, RenderError, ShapeData, SurfaceTree};
+use cherenkov::{BlendMode, Display, LayerId, RenderError, ShapeData, SurfaceError, SurfaceTree};
 
 use crate::interop::ExternalFrame;
 use crate::render::lower::axis_aligned;
@@ -891,7 +891,15 @@ pub trait SystemPlanes: Compositor {
 
     /// A display move or a scale change re-runs every part's output
     /// negotiation — each part's [`WindowSurface::reselect`].
-    fn reselect(&mut self, adapter: &wgpu::Adapter, device: &wgpu::Device);
+    ///
+    /// # Errors
+    /// A part's [`WindowSurface::reselect`] error: the surface no longer
+    /// advertises what the host's request needs.
+    fn reselect(
+        &mut self,
+        adapter: &wgpu::Adapter,
+        device: &wgpu::Device,
+    ) -> Result<(), SurfaceError>;
 }
 
 #[cfg(target_vendor = "apple")]
@@ -938,7 +946,7 @@ impl SystemPlanes for NoPlanes {
     fn resize(&mut self, _: (u32, u32)) {
         unreachable!("no `NoPlanes` value exists")
     }
-    fn reselect(&mut self, _: &wgpu::Adapter, _: &wgpu::Device) {
+    fn reselect(&mut self, _: &wgpu::Adapter, _: &wgpu::Device) -> Result<(), SurfaceError> {
         unreachable!("no `NoPlanes` value exists")
     }
 }

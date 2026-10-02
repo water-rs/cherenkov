@@ -9,9 +9,12 @@ use std::time::Duration;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::backend::{Backend, Display, Frame, Redraw, Renderer, SurfaceFrame, SurfaceInfo};
+use crate::backend::{
+    Backend, Display, Frame, Redraw, Renderer, SurfaceFrame, SurfaceInfo, Visibility,
+};
+use crate::engine::{CompletionWaker, SurfaceWaker};
 use crate::error::{EngineError, RenderError, ResourceError, SurfaceError};
-use crate::frame::{FrameId, FrameStats, Next};
+use crate::frame::{FrameId, FrameStats, Next, RefreshRange};
 use crate::image::ImageUpload;
 use crate::message::{
     BackdropShaderId, ChangeSet, LayerId, LayerOp, Message, Op, ResOp, SurfaceId,
@@ -78,7 +81,13 @@ struct SurfaceState {
     /// sample at the fast rate class.
     content_animating: bool,
     /// Track cadence before the backend accepts this frame's handoffs.
-    sampled_rate: Option<crate::RefreshRange>,
+    sampled_rate: Option<RefreshRange>,
+    /// Whether the host announced the surface hidden. A hidden surface is
+    /// left out of every frame: its tree is not sampled, it is not drawn,
+    /// and its per-frame state waits for the frame that shows it.
+    visibility: Visibility,
+    /// The surface's host wake-up, shared with its UI-thread handle.
+    waker: Arc<SurfaceWaker>,
 }
 
 impl SurfaceState {
@@ -258,10 +267,11 @@ impl<B: Backend> Resources<B> {
         if self.rejections.is_empty() {
             return Ok(());
         }
-        for (surface, state) in surfaces
-            .iter()
-            .filter(|(_, state)| state.commits != Commits::Clean)
-        {
+        // A hidden surface is not drawn: it fails no frame until the one
+        // that shows it, when its changes are still pending.
+        for (surface, state) in surfaces.iter().filter(|(_, state)| {
+            state.commits != Commits::Clean && state.visibility == Visibility::Visible
+        }) {
             for (resource, rejection) in &self.rejections {
                 if draws(renderer, *surface, state, *resource) {
                     return Err(RenderError::Rejected {
@@ -338,12 +348,18 @@ pub fn run<B: Backend>(
     let mut next_frame = 0u64;
     while let Ok(message) = rx.recv() {
         match message {
-            Message::CreateSurface { id, target, reply } => {
+            Message::CreateSurface {
+                id,
+                target,
+                waker,
+                reply,
+            } => {
                 let _ = reply.send(create_surface::<B>(
                     &mut renderer,
                     &mut surfaces,
                     id,
                     target,
+                    waker,
                 ));
             }
             Message::ResizeSurface { id, size } => {
@@ -354,6 +370,9 @@ pub fn run<B: Backend>(
             }
             Message::Display { id, display } => set_display(&mut surfaces, id, display),
             Message::DisplayMoved { id } => set_display_moved(&mut surfaces, id),
+            Message::Visibility { id, visibility } => {
+                set_visibility::<B>(&mut renderer, &mut surfaces, id, visibility);
+            }
             Message::Resource(op) => op(&mut renderer),
             Message::Register { resource, op } => {
                 resources.register(resource, op(&mut renderer));
@@ -363,6 +382,15 @@ pub fn run<B: Backend>(
             }
             Message::ReplaceImage { id, image } => {
                 replace_image::<B>(&mut renderer, &mut surfaces, &mut resources, id, image);
+            }
+            Message::Apply { id, mut changes } => {
+                apply_hidden::<B>(
+                    &mut renderer,
+                    &mut surfaces,
+                    &mut resources,
+                    id,
+                    &mut changes,
+                );
             }
             Message::Render {
                 time,
@@ -411,8 +439,9 @@ fn create_surface<B: Backend>(
     surfaces: &mut FxHashMap<SurfaceId, SurfaceState>,
     id: SurfaceId,
     target: B::Target,
+    waker: Arc<SurfaceWaker>,
 ) -> Result<SurfaceInfo, SurfaceError> {
-    let info = renderer.create_surface(id, target)?;
+    let info = renderer.create_surface(id, target, CompletionWaker::new(&waker))?;
     surfaces.insert(
         id,
         SurfaceState {
@@ -430,6 +459,8 @@ fn create_surface<B: Backend>(
             display_moved: false,
             content_animating: false,
             sampled_rate: None,
+            visibility: Visibility::Visible,
+            waker,
         },
     );
     Ok(info)
@@ -486,6 +517,29 @@ fn set_display(surfaces: &mut FxHashMap<SurfaceId, SurfaceState>, id: SurfaceId,
     }
 }
 
+/// The host announced surface `id`'s visibility, which differs from the
+/// previous one. The surface's frame state survives while it is hidden; the
+/// frame that shows it again redraws it whole from the current state —
+/// whatever the backend let lapse while it was hidden (a producer, a
+/// filter's parameters, a dropped drawable) is current again — and
+/// presents it.
+fn set_visibility<B: Backend>(
+    renderer: &mut B::Renderer,
+    surfaces: &mut FxHashMap<SurfaceId, SurfaceState>,
+    id: SurfaceId,
+    visibility: Visibility,
+) {
+    let state = surfaces
+        .get_mut(&id)
+        .expect("visibility announced through a live surface handle");
+    state.visibility = visibility;
+    if visibility == Visibility::Visible {
+        state.commits = Commits::Other;
+        state.mark_present();
+    }
+    renderer.set_visibility(id, visibility);
+}
+
 fn set_display_moved(surfaces: &mut FxHashMap<SurfaceId, SurfaceState>, id: SurfaceId) {
     if let Some(state) = surfaces.get_mut(&id) {
         // A move re-enumerates output negotiation, where a headroom-only
@@ -499,10 +553,12 @@ fn set_display_moved(surfaces: &mut FxHashMap<SurfaceId, SurfaceState>, id: Surf
 }
 
 /// Replaces image `id`'s pixels and marks changed only the surfaces whose
-/// content samples the image; the next render redraws those with the new
-/// pixels and leaves every other surface's skip intact. An image whose
-/// registration was rejected is registered with the new pixels instead. A
-/// rejection is recorded, and the marked surfaces then fail their render.
+/// content samples the image, waking the host through each of them — a
+/// hidden one wakes nothing; the next render redraws the visible ones with
+/// the new pixels and leaves every other surface's skip intact. An image
+/// whose registration was rejected is registered with the new pixels
+/// instead. A rejection is recorded, and the marked surfaces then fail
+/// their render.
 fn replace_image<B: Backend>(
     renderer: &mut B::Renderer,
     surfaces: &mut FxHashMap<SurfaceId, SurfaceState>,
@@ -542,6 +598,7 @@ fn replace_image<B: Backend>(
     for (surface, state) in surfaces {
         if renderer.samples(*surface, resource) {
             state.commits = Commits::Other;
+            state.waker.wake();
         }
     }
 }
@@ -613,6 +670,32 @@ fn commit<B: Backend>(
     }
 }
 
+/// Applies hidden surface `id`'s changes, sent as they were made: the tree
+/// and the installed content follow them, nothing is sampled or drawn, and
+/// the pending releases they settle are carried out. The surface stays
+/// changed, so the frame that shows it redraws it whole and checks it for
+/// rejected resources.
+fn apply_hidden<B: Backend>(
+    renderer: &mut B::Renderer,
+    surfaces: &mut FxHashMap<SurfaceId, SurfaceState>,
+    resources: &mut Resources<B>,
+    id: SurfaceId,
+    changes: &mut ChangeSet<B>,
+) {
+    let Some(state) = surfaces.get_mut(&id) else {
+        // A layer or binding that outlived its surface may still send.
+        tracing::trace!(surface = id.raw(), "changes for unknown surface");
+        return;
+    };
+    debug_assert_eq!(
+        state.visibility,
+        Visibility::Hidden,
+        "only a hidden surface sends its changes as it makes them"
+    );
+    commit(renderer, state, id, changes);
+    resources.settle(renderer, surfaces);
+}
+
 /// Applies every surface's commit, then carries out the pending releases
 /// no installed content draws any more, before the frame can draw them.
 ///
@@ -639,17 +722,17 @@ fn apply_commits<B: Backend>(
     resources.check(renderer, surfaces)
 }
 
-/// One frame: apply every commit, sample, render, answer.
-#[cfg(not(target_arch = "wasm32"))]
-fn render<B: Backend>(
-    renderer: &mut B::Renderer,
+/// Samples compositor-owned tracks before a commit can retarget them.
+/// Hidden surfaces keep their state until they become visible again.
+fn sample_owned<B: Backend>(
+    renderer: &B::Renderer,
     surfaces: &mut FxHashMap<SurfaceId, SurfaceState>,
-    resources: &mut Resources<B>,
-    id: FrameId,
     time: crate::Instant,
-    commits: &mut [(SurfaceId, ChangeSet<B>)],
-) -> Result<(Next, FrameStats), RenderError> {
-    for (id, state) in &mut *surfaces {
+) {
+    for (id, state) in surfaces
+        .iter_mut()
+        .filter(|(_, state)| state.visibility == Visibility::Visible)
+    {
         let owned = renderer.owned_animations(*id);
         if !owned.is_empty() {
             state
@@ -657,9 +740,19 @@ fn render<B: Backend>(
                 .sample_owned(time, |layer| owned.contains(&layer));
         }
     }
-    apply_commits(renderer, surfaces, resources, commits)?;
+}
+
+/// Samples and lists visible surfaces, retaining their cadence until the
+/// backend has accepted or withdrawn this frame's animation handoffs.
+fn sample_frames(
+    surfaces: &mut FxHashMap<SurfaceId, SurfaceState>,
+    time: crate::Instant,
+) -> Vec<SurfaceFrame<'_>> {
     let mut frames: Vec<SurfaceFrame<'_>> = Vec::with_capacity(surfaces.len());
-    for (id, state) in &mut *surfaces {
+    for (id, state) in surfaces
+        .iter_mut()
+        .filter(|(_, state)| state.visibility == Visibility::Visible)
+    {
         let sampling = state.tree.sample(time, state.display);
         let changed = state.commits != Commits::Clean || sampling.stepped;
         state.sampled_rate = sampling.rate;
@@ -681,17 +774,23 @@ fn render<B: Backend>(
             tree: &state.tree,
         });
     }
-    let mut stats = FrameStats::default();
-    let redraw = renderer.render(
-        &Frame {
-            id,
-            time: crate::frame::FrameTime(time),
-            surfaces: &frames,
-        },
-        &mut stats,
-    )?;
+    frames
+}
+
+/// Consumes the per-frame state of every surface the frame listed, and
+/// answers when the next frame is needed: the animations' refresh class
+/// combined with the backend's.
+fn finish_frame<B: Backend>(
+    renderer: &B::Renderer,
+    surfaces: &mut FxHashMap<SurfaceId, SurfaceState>,
+    time: crate::Instant,
+    redraw: Redraw,
+) -> Next {
     let mut rate = None;
-    for (id, state) in &mut *surfaces {
+    for (id, state) in surfaces
+        .iter_mut()
+        .filter(|(_, state)| state.visibility == Visibility::Visible)
+    {
         let owned = renderer.owned_animations(*id);
         let running = if state.content_animating {
             Some(crate::tree::RATE_FAST)
@@ -712,18 +811,45 @@ fn render<B: Backend>(
         state.display_moved = false;
         state.presented();
     }
-    if let Redraw::Wanted { rate: backend_rate } = redraw {
-        rate = Some(rate.map_or_else(
+    let rate = match redraw {
+        Redraw::None => rate,
+        Redraw::Wanted { rate: backend_rate } => Some(rate.map_or_else(
             || backend_rate.clone(),
             |r| (*r.start()).min(*backend_rate.start())..=(*r.end()).max(*backend_rate.end()),
-        ));
-    }
-    let next = rate.map_or(Next::Idle, |rate| Next::At {
+        )),
+    };
+    rate.map_or(Next::Idle, |rate| Next::At {
         time: time + Duration::from_secs_f64(1.0 / f64::from(*rate.end())),
         rate,
-    });
-    Ok((next, stats))
+    })
 }
+
+/// One frame: apply every commit, sample, render, answer.
+#[cfg(not(target_arch = "wasm32"))]
+fn render<B: Backend>(
+    renderer: &mut B::Renderer,
+    surfaces: &mut FxHashMap<SurfaceId, SurfaceState>,
+    resources: &mut Resources<B>,
+    id: FrameId,
+    time: crate::Instant,
+    commits: &mut [(SurfaceId, ChangeSet<B>)],
+) -> Result<(Next, FrameStats), RenderError> {
+    sample_owned::<B>(renderer, surfaces, time);
+    apply_commits(renderer, surfaces, resources, commits)?;
+    let frames = sample_frames(surfaces, time);
+    let mut stats = FrameStats::default();
+    let redraw = renderer.render(
+        &Frame {
+            id,
+            time: crate::frame::FrameTime(time),
+            surfaces: &frames,
+        },
+        &mut stats,
+    )?;
+    drop(frames);
+    Ok((finish_frame::<B>(renderer, surfaces, time, redraw), stats))
+}
+
 #[cfg(target_arch = "wasm32")]
 #[expect(
     clippy::future_not_send,
@@ -737,38 +863,9 @@ async fn render_local<B: Backend>(
     time: crate::Instant,
     commits: &mut [(SurfaceId, ChangeSet<B>)],
 ) -> Result<(Next, FrameStats), RenderError> {
-    for (id, state) in &mut *surfaces {
-        let owned = renderer.owned_animations(*id);
-        if !owned.is_empty() {
-            state
-                .tree
-                .sample_owned(time, |layer| owned.contains(&layer));
-        }
-    }
+    sample_owned::<B>(renderer, surfaces, time);
     apply_commits(renderer, surfaces, resources, commits)?;
-    let mut frames: Vec<SurfaceFrame<'_>> = Vec::with_capacity(surfaces.len());
-    for (id, state) in &mut *surfaces {
-        let sampling = state.tree.sample(time, state.display);
-        let changed = state.commits != Commits::Clean || sampling.stepped;
-        state.sampled_rate = sampling.rate;
-        frames.push(SurfaceFrame {
-            id: *id,
-            size: state.size,
-            display: state.display,
-            clear: state.clear,
-            changed,
-            // A stepped animation changed the sampled tree: the frame is
-            // never plane-only, however it was committed.
-            plane_frames: if sampling.stepped || state.commits != Commits::Installs {
-                None
-            } else {
-                Some(&state.plane_frames).filter(|frames| !frames.is_empty())
-            },
-            present_pending: state.present_pending(),
-            display_moved: state.display_moved,
-            tree: &state.tree,
-        });
-    }
+    let frames = sample_frames(surfaces, time);
     let mut stats = FrameStats::default();
     let redraw = renderer
         .render(
@@ -780,47 +877,18 @@ async fn render_local<B: Backend>(
             &mut stats,
         )
         .await?;
-    let mut rate = None;
-    for (id, state) in &mut *surfaces {
-        let owned = renderer.owned_animations(*id);
-        let running = if state.content_animating {
-            Some(crate::tree::RATE_FAST)
-        } else if owned.is_empty() {
-            state.sampled_rate.take()
-        } else {
-            state
-                .tree
-                .animation_rate(state.display, |layer| owned.contains(&layer))
-        };
-        match running {
-            Some(r) if r == crate::tree::RATE_FAST => rate = Some(crate::tree::RATE_FAST),
-            Some(r) => rate = rate.or(Some(r)),
-            None => {}
-        }
-        state.commits = Commits::Clean;
-        state.plane_frames.clear();
-        state.display_moved = false;
-        state.presented();
-    }
-    if let Redraw::Wanted { rate: backend_rate } = redraw {
-        rate = Some(rate.map_or_else(
-            || backend_rate.clone(),
-            |r| (*r.start()).min(*backend_rate.start())..=(*r.end()).max(*backend_rate.end()),
-        ));
-    }
-    let next = rate.map_or(Next::Idle, |rate| Next::At {
-        time: time + Duration::from_secs_f64(1.0 / f64::from(*rate.end())),
-        rate,
-    });
-    Ok((next, stats))
+    drop(frames);
+    Ok((finish_frame::<B>(renderer, surfaces, time, redraw), stats))
 }
 
 #[cfg(all(test, feature = "testing", not(target_arch = "wasm32")))]
 mod tests {
     use super::{Commits, Presentation, SurfaceState, commit};
     use crate::WorkingColor;
+    use crate::backend::Visibility;
     use crate::backend::{Backend, Display};
     use crate::display_list::{Command, DisplayList, Picture};
+    use crate::engine::{SurfaceWaker, Waker};
     use crate::message::{ChangeSet, ContentOp, LayerId, LayerOp, Op, SurfaceId};
     use crate::testing::{Null, NullConfig};
     use crate::tree::SurfaceTree;
@@ -849,6 +917,8 @@ mod tests {
             display_moved: false,
             content_animating: false,
             sampled_rate: None,
+            visibility: Visibility::Visible,
+            waker: std::sync::Arc::new(SurfaceWaker::new(std::sync::Arc::new(Waker::new()))),
         };
 
         let mut first = ChangeSet::<Null> {
@@ -924,8 +994,13 @@ impl<B: Backend> LocalState<B> {
             next_frame,
         } = self;
         match message {
-            Message::CreateSurface { id, target, reply } => {
-                let _ = reply.send(create_surface::<B>(renderer, surfaces, id, target));
+            Message::CreateSurface {
+                id,
+                target,
+                waker,
+                reply,
+            } => {
+                let _ = reply.send(create_surface::<B>(renderer, surfaces, id, target, waker));
             }
             Message::ResizeSurface { id, size } => {
                 resize_surface::<B>(renderer, surfaces, id, size);
@@ -935,6 +1010,9 @@ impl<B: Backend> LocalState<B> {
             }
             Message::Display { id, display } => set_display(surfaces, id, display),
             Message::DisplayMoved { id } => set_display_moved(surfaces, id),
+            Message::Visibility { id, visibility } => {
+                set_visibility::<B>(renderer, surfaces, id, visibility);
+            }
             Message::Resource(op) => op(renderer),
             Message::Register { resource, op } => {
                 let result = op(renderer).await;
@@ -945,6 +1023,9 @@ impl<B: Backend> LocalState<B> {
             }
             Message::ReplaceImage { id, image } => {
                 replace_image::<B>(renderer, surfaces, resources, id, image);
+            }
+            Message::Apply { id, mut changes } => {
+                apply_hidden::<B>(renderer, surfaces, resources, id, &mut changes);
             }
             Message::Render {
                 time,

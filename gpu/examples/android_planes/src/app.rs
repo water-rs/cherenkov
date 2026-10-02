@@ -224,7 +224,7 @@ impl Run {
         let font = engine
             .font(cherenkov::FontSource::bytes(font_data.clone()))
             .expect("font registration");
-        let panel = controls_content(font.id(), &font_data, scenario);
+        let panel = controls_content(&surface, font.id(), &font_data, scenario);
 
         let specs = scenario.videos();
         let (layers, rest, controls, recorded) = if let Scenario::Recorded(spec) = scenario {
@@ -378,9 +378,14 @@ impl Run {
 
 /// The engine-composited controls drawn above the video: a translucent
 /// panel and the scenario label.
-fn controls_content(font: cherenkov::FontId, data: &[u8], scenario: Scenario) -> Content {
+fn controls_content(
+    surface: &cherenkov::Surface<Gpu>,
+    font: cherenkov::FontId,
+    data: &[u8],
+    scenario: Scenario,
+) -> Content {
     let label = format!("cherenkov planes \u{2014} {}", scenario.name());
-    Content::record(|c| {
+    surface.record(|c| {
         c.fill(
             Rect::new(24.0, 24.0, 660.0, 140.0),
             Color::<Srgb>::new([0.07, 0.09, 0.14, 0.72]),

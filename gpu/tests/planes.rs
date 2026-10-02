@@ -45,7 +45,7 @@ mod macos {
     use cherenkov_gpu::interop::{
         ExternalFrame, FrameColor, RgbAlpha, SharedDevice, YuvRange, metal::import_texture, wgpu,
     };
-    use cherenkov_gpu::{Gpu, GpuConfig, WindowTarget};
+    use cherenkov_gpu::{DisplaySync, Gpu, GpuConfig, WindowTarget};
     use dispatch2::DispatchQueue;
     use libtest_mimic::Trial;
     use objc2::rc::Retained;
@@ -138,6 +138,10 @@ mod macos {
             case(
                 "two_promoted_layers_with_the_last_painted_last_compose",
                 two_promoted_layers_with_the_last_painted_last_compose,
+            ),
+            case(
+                "every_part_presents_with_the_requested_display_sync",
+                every_part_presents_with_the_requested_display_sync,
             ),
         ]
     }
@@ -610,6 +614,11 @@ mod macos {
 
     impl Fixture {
         fn new() -> Self {
+            Self::with(|target| target)
+        }
+
+        /// The fixture over the window target `configure` returns.
+        fn with(configure: impl FnOnce(WindowTarget) -> WindowTarget) -> Self {
             let mtm = MainThreadMarker::new().expect("the cases run on the main thread");
             let metal = metal();
             let engine = Engine::<Gpu>::new(GpuConfig {
@@ -629,10 +638,10 @@ mod macos {
             host.setContentsScale(SCALE);
             let system = SystemCompositor::attach(&metal, &host);
             let window = engine
-                .surface(WindowTarget::new(
+                .surface(configure(WindowTarget::new(
                     View(dispatch2::MainThreadBound::new(view.clone(), mtm)),
                     SIZE,
-                ))
+                )))
                 .expect("a window surface");
             window
                 .display(Display {
@@ -834,6 +843,42 @@ mod macos {
     /// order.
     fn stack(fixture: &Fixture) -> Vec<Retained<CALayer>> {
         sublayers(&fixture.root())
+    }
+
+    /// Every part's metal layer is configured with the present mode the
+    /// window's `DisplaySync` resolves to on this Mac — the first part and
+    /// the parts a promoted plane splits off above it. wgpu's Metal
+    /// backend advertises FIFO and immediate on macOS and realizes them
+    /// as the layer's `displaySyncEnabled` (#214).
+    fn every_part_presents_with_the_requested_display_sync() {
+        for (sync, display_sync) in [
+            (DisplaySync::Synchronized, true),
+            (DisplaySync::Unsynchronized, false),
+        ] {
+            let fixture = Fixture::with(|target| target.display_sync(sync));
+            let buffer = bgra_buffer();
+            let _scene = scene_bar(
+                &fixture.engine,
+                &fixture.window,
+                bgra(&fixture.metal, &buffer, FrameColor::SRGB),
+                1.0,
+            );
+            // Two parts when the platform promotes the frame, one when it
+            // keeps it in the engine; either way every part is checked.
+            let parts_expected = if fixture.promote() { 2 } else { 1 };
+            let parts: Vec<_> = stack(&fixture)
+                .into_iter()
+                .filter_map(|layer| layer.downcast::<CAMetalLayer>().ok())
+                .collect();
+            assert_eq!(parts.len(), parts_expected, "{sync:?}: the window's parts");
+            for part in parts {
+                assert_eq!(
+                    part.displaySyncEnabled(),
+                    display_sync,
+                    "{sync:?}: a part's display sync"
+                );
+            }
+        }
     }
 
     /// The plane sits between the part painted below it and the part

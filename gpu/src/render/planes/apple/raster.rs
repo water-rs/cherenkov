@@ -136,13 +136,11 @@ impl Buffer {
         })
     }
 
-    pub fn completed(&self, queue: &wgpu::Queue, waker: Option<cherenkov::CompletionWaker>) {
+    pub fn completed(&self, queue: &wgpu::Queue, waker: cherenkov::CompletionWaker) {
         let ready = Arc::clone(&self.ready);
         queue.on_submitted_work_done(move || {
             ready.store(true, Ordering::Release);
-            if let Some(waker) = waker {
-                waker.wake();
-            }
+            waker.wake();
         });
     }
 

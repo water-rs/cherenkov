@@ -300,6 +300,8 @@ pub enum Message<B: Backend> {
         id: SurfaceId,
         /// What it renders into.
         target: B::Target,
+        /// The surface's host wake-up, shared with its UI-thread handle.
+        waker: Arc<crate::engine::SurfaceWaker>,
         /// Result of the creation.
         reply: Sender<Result<SurfaceInfo, SurfaceError>>,
     },
@@ -321,6 +323,14 @@ pub enum Message<B: Backend> {
         id: SurfaceId,
         /// The new display properties.
         display: Display,
+    },
+    /// Announce whether the user can see the surface. A hidden surface is
+    /// left out of every frame; becoming visible marks it for presentation.
+    Visibility {
+        /// The surface id.
+        id: SurfaceId,
+        /// The new visibility; always differs from the previous one.
+        visibility: crate::backend::Visibility,
     },
     /// Announce the surface moved to another display: the next frame
     /// carries `display_moved` and re-runs output negotiation (#98).
@@ -358,6 +368,15 @@ pub enum Message<B: Backend> {
         id: ImageId,
         /// The new pixels.
         image: ImageUpload,
+    },
+    /// Apply a hidden surface's changes, sent as they are made: no frame is
+    /// rendered and nothing is sampled, and the releases waiting on the
+    /// surface's installed content are settled.
+    Apply {
+        /// The hidden surface.
+        id: SurfaceId,
+        /// Its changes since the last ones it sent.
+        changes: ChangeSet<B>,
     },
     /// Render every dirty surface for the frame at `time`, applying every
     /// surface's queued change set first.

@@ -1230,37 +1230,45 @@ impl SystemPlanes for LayerPlanes {
             let Some((frame, generation)) = frames.get(&layer).cloned() else {
                 continue;
             };
-            self.candidates.entry(layer).or_insert_with(|| {
-                let ready = Arc::new(AtomicBool::new(false));
-                let live = Arc::downgrade(&ready);
-                let waker = self.waker.clone();
-                let owner = self.scene.clone();
-                self.scene.run(move |scene, _| {
-                    if let Some(flag) = live.upgrade() {
-                        let _tx = Transaction::begin();
-                        // Attach, then feed the probe frame: the platform
-                        // reports `readyForDisplay` only for a layer in
-                        // the hierarchy that has content committed. The
-                        // flag is refreshed by the layer's readiness
-                        // notification from then on; the read after `show`
-                        // covers a transition that completed before the
-                        // registration returned.
-                        scene.attach(layer, &owner, Arc::downgrade(&flag), waker.clone());
-                        scene.show(layer, &frame, generation);
-                        let display = &scene.displays[&layer].display;
-                        // SAFETY: the property is read on main, where the
-                        // layer lives.
-                        flag.store(unsafe { display.isReadyForDisplay() }, Ordering::Release);
-                        // The attach's completion signal: the flag may
-                        // still be false — readiness lands through the
-                        // layer's own notification — but the queued work
-                        // is done.
-                        if let Some(waker) = waker {
-                            waker.wake();
-                        }
+            let std::collections::hash_map::Entry::Vacant(slot) = self.candidates.entry(layer)
+            else {
+                continue;
+            };
+            let ready = Arc::new(AtomicBool::new(false));
+            let live = Arc::downgrade(&ready);
+            let waker = self.waker.clone();
+            let owner = self.scene.clone();
+            self.scene.run(move |scene, _| {
+                if let Some(flag) = live.upgrade() {
+                    let _tx = Transaction::begin();
+                    // Attach in the hierarchy: the platform reports
+                    // `readyForDisplay` only for a layer the render
+                    // server can see. The flag is refreshed by the
+                    // layer's readiness notification from then on; this
+                    // read covers a transition that completed before the
+                    // registration returned.
+                    scene.attach(layer, &owner, Arc::downgrade(&flag), waker.clone());
+                    let display = &scene.displays[&layer].display;
+                    // SAFETY: the property is read on main, where the
+                    // layer lives.
+                    flag.store(unsafe { display.isReadyForDisplay() }, Ordering::Release);
+                    // The attach's completion signal: the flag may
+                    // still be false — readiness lands through the
+                    // layer's own notification — but the queued work
+                    // is done.
+                    if let Some(waker) = waker {
+                        waker.wake();
                     }
-                });
-                ready
+                }
+            });
+            slot.insert(ready);
+            // The probe's sample goes through `enqueue`'s producer-sync
+            // gate like a promoted plane's: readiness read from a surface
+            // whose producer has not signalled would not be the frame's.
+            self.enqueue(Update {
+                layer,
+                frame,
+                generation,
             });
         }
         self.offered.retain(|layer| candidates.contains_key(layer));

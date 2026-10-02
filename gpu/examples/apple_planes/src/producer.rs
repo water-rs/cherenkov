@@ -270,6 +270,10 @@ impl Pool {
 
     /// After an `Engine::render`: records that a new render serial was
     /// submitted and registers the GPU completion marker for it.
+    ///
+    /// # Panics
+    /// When the shared device is lost while driving completion
+    /// callbacks.
     pub fn rendered(&mut self) {
         self.submitted += 1;
         let serial = self.submitted;
@@ -277,9 +281,13 @@ impl Pool {
         self.device
             .queue
             .on_submitted_work_done(move || completed.store(serial, Ordering::Release));
-        // A plane-only refresh submits nothing to the queue — without a
-        // poll the completion callbacks sit un-driven and the serial
-        // gate never opens.
-        let _ = self.device.device.poll(wgpu::PollType::Poll);
+        // A plane-only refresh submits nothing to the queue, so the pool
+        // drives its own `on_submitted_work_done` callbacks with a poll;
+        // an engine-side release signal will replace the margin and the
+        // serial (water-rs/cherenkov#254).
+        self.device
+            .device
+            .poll(wgpu::PollType::Poll)
+            .expect("the shared device was lost while driving completion callbacks");
     }
 }

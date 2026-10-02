@@ -1659,33 +1659,60 @@ impl Band<'_> {
     }
 }
 
-/// Rasterizes a full-surface coverage mask of `edges` under `rule`,
-/// parallel over bands.
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "band origins are small integers"
-)]
-pub fn coverage_mask(edges: &[Edge], rule: FillRule, w: usize, h: usize) -> Vec<f32> {
+/// Capture a silhouette's exact coverage for convolution, parallel over bands.
+pub fn coverage_mask(operand: &Operand, w: usize, h: usize) -> Vec<f32> {
     let mut mask = vec![0.0; w * h];
-    mask.par_chunks_mut(BAND_H * w)
-        .enumerate()
-        .for_each(|(band, slice)| {
+    mask.par_chunks_mut(BAND_H * w).enumerate().for_each_init(
+        Compiler::default,
+        |compiler, (band, slice)| {
             let y0 = band * BAND_H;
             let bh = slice.len() / w;
-            let mut acc = Accum::new(w, bh);
-            for e in edges {
-                let ey0 = e.y0 - y0 as f32;
-                let ey1 = e.y1 - y0 as f32;
-                if ey0.max(ey1) < 0.0 || ey0.min(ey1) >= bh as f32 {
-                    continue;
+            let coverage = compiler.compile(std::slice::from_ref(operand), w, y0..y0 + bh);
+            for (y, row) in slice.chunks_exact_mut(w).enumerate() {
+                for span in coverage.row(y0 + y) {
+                    let pixels = &mut row[span.x as usize..(span.x + span.len) as usize];
+                    match span.kind {
+                        super::coverage::SpanKind::Constant(alpha) => pixels.fill(alpha),
+                        super::coverage::SpanKind::Samples(_) => {
+                            pixels.copy_from_slice(coverage.samples(span));
+                        }
+                    }
                 }
-                acc.draw_line(e.x0, ey0, e.x1, ey1);
             }
-            for y in 0..bh {
-                acc.coverage_row(y, rule, 0, w, |x, cov| {
-                    slice[y * w + x] = cov;
-                });
-            }
-        });
+        },
+    );
     mask
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Edge, FillRule, Operand, coverage_mask};
+
+    #[test]
+    fn silhouette_resolves_winding_before_integrating_pixel_area() {
+        let corners = [
+            (0.25, 0.25),
+            (0.75, 0.25),
+            (0.75, 0.75),
+            (0.25, 0.75),
+            (0.25, 0.25),
+        ];
+        let contour: Vec<_> = corners
+            .windows(2)
+            .map(|pair| Edge {
+                x0: pair[0].0,
+                y0: pair[0].1,
+                x1: pair[1].0,
+                y1: pair[1].1,
+            })
+            .collect();
+        let doubled = [contour.as_slice(), contour.as_slice()].concat();
+        let mut operand = Operand {
+            edges: doubled.into(),
+            rule: FillRule::NonZero,
+        };
+        assert_eq!(coverage_mask(&operand, 1, 1), [0.25]);
+        operand.rule = FillRule::EvenOdd;
+        assert_eq!(coverage_mask(&operand, 1, 1), [0.0]);
+    }
 }

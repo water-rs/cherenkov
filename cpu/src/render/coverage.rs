@@ -1,6 +1,7 @@
 //! Sparse pixel areas of geometric intersections. Each operand's winding is
 //! resolved before integration; only the final area is rounded to f32.
 
+use std::ops::Range;
 use std::sync::Arc;
 
 use cherenkov::FillRule;
@@ -11,7 +12,7 @@ use super::raster::Edge;
 #[derive(Clone, Debug, PartialEq)]
 pub struct Operand {
     /// Directed polygon edges.
-    pub edges: Arc<[Edge]>,
+    pub edges: Arc<[Edge<f64>]>,
     /// The operand's own interior predicate.
     pub rule: FillRule,
 }
@@ -73,14 +74,21 @@ impl Coverage {
         }
     }
 
-    #[cfg(test)]
-    fn samples(&self, span: &Span) -> &[f32] {
+    /// Sampled areas for this span; constants have no sample allocation.
+    pub fn samples(&self, span: &Span) -> &[f32] {
         match span.kind {
             SpanKind::Constant(_) => &[],
             SpanKind::Samples(offset) => {
                 &self.samples[offset as usize..(offset + span.len) as usize]
             }
         }
+    }
+
+    /// Heap bytes retained by the sparse field.
+    pub const fn bytes(&self) -> usize {
+        self.row_offsets.capacity() * size_of::<u32>()
+            + self.spans.capacity() * size_of::<Span>()
+            + self.samples.capacity() * size_of::<f32>()
     }
 
     fn push(&mut self, x0: usize, x1: usize, alpha: f32, row_start: usize) {
@@ -147,8 +155,16 @@ struct Line {
     clippy::float_cmp,
     reason = "surface-clamped row indices; horizontal edges require exact classification"
 )]
-fn row_lines(operands: &[Operand], top: usize, bottom: usize) -> (Vec<usize>, Vec<Line>) {
-    let mut offsets = vec![0; bottom - top + 1];
+fn row_lines(
+    operands: &[Operand],
+    top: usize,
+    bottom: usize,
+    offsets: &mut Vec<usize>,
+    lines: &mut Vec<Line>,
+    cursors: &mut Vec<usize>,
+) {
+    offsets.clear();
+    offsets.resize(bottom - top + 1, 0);
     for shape in operands {
         for edge in &*shape.edges {
             let first = (edge.y0.min(edge.y1).floor() as usize).clamp(top, bottom);
@@ -161,16 +177,13 @@ fn row_lines(operands: &[Operand], top: usize, bottom: usize) -> (Vec<usize>, Ve
     for row in 1..offsets.len() {
         offsets[row] += offsets[row - 1];
     }
-    let mut lines = vec![Line::default(); offsets[bottom - top]];
-    let mut cursors = offsets.clone();
+    lines.clear();
+    lines.resize(offsets[bottom - top], Line::default());
+    cursors.clear();
+    cursors.extend_from_slice(offsets);
     for (operand, shape) in operands.iter().enumerate() {
         for edge in &*shape.edges {
-            let (x0, y0, x1, y1) = (
-                f64::from(edge.x0),
-                f64::from(edge.y0),
-                f64::from(edge.x1),
-                f64::from(edge.y1),
-            );
+            let (x0, y0, x1, y1) = (edge.x0, edge.y0, edge.x1, edge.y1);
             let lo = y0.min(y1);
             let hi = y0.max(y1);
             let line = Line {
@@ -210,73 +223,116 @@ fn row_lines(operands: &[Operand], top: usize, bottom: usize) -> (Vec<usize>, Ve
             }
         }
     }
-    (offsets, lines)
 }
 
-/// Compile the exact area of the intersection of all operands.
-#[expect(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "surface-clamped row coordinates fit exactly in f64"
-)]
-pub fn rasterize(operands: &[Operand], w: usize, h: usize) -> Coverage {
-    if operands.is_empty() || w == 0 || h == 0 {
-        return Coverage::default();
-    }
-    let mut top = 0;
-    let mut bottom = h;
-    for operand in operands {
-        let lo = operand
-            .edges
-            .iter()
-            .map(|e| e.y0.min(e.y1))
-            .fold(f32::INFINITY, f32::min);
-        let hi = operand
-            .edges
-            .iter()
-            .map(|e| e.y0.max(e.y1))
-            .fold(f32::NEG_INFINITY, f32::max);
-        top = top.max((lo.floor() as usize).min(h));
-        bottom = bottom.min((hi.ceil() as usize).min(h));
-    }
-    if top >= bottom {
-        return Coverage::default();
-    }
-    let (offsets, mut lines) = row_lines(operands, top, bottom);
-    let rules: Vec<_> = operands.iter().map(|operand| operand.rule).collect();
-    let mut baseline = vec![0; operands.len()];
-    let mut scratch = RowScratch::default();
-    let mut result = Coverage {
-        top,
-        edge_count: operands[0].edges.len(),
-        row_offsets: vec![0],
-        ..Coverage::default()
-    };
-    for row in 0..bottom - top {
-        let lines = &mut lines[offsets[row]..offsets[row + 1]];
-        lines.sort_unstable_by(|a, b| a.left.total_cmp(&b.left));
-        baseline.fill(0);
-        let mut first = 0;
-        while first < lines.len() {
-            let mut end = first + 1;
-            let mut right = lines[first].right;
-            while end < lines.len() && lines[end].left <= right {
-                right = right.max(lines[end].right);
-                end += 1;
-            }
-            scratch.group(&lines[first..end], &baseline, &rules, w);
-            let middle = (top + row) as f64 + 0.5;
-            for line in &lines[first..end] {
-                if line.top <= middle && line.bottom > middle {
-                    baseline[line.operand] += line.dir;
-                }
-            }
-            first = end;
+/// Single-owner compiler scratch, reused across draws and bands. Only the
+/// requested rows are materialized, including when a target streams bands.
+#[derive(Default)]
+pub struct Compiler {
+    offsets: Vec<usize>,
+    cursors: Vec<usize>,
+    lines: Vec<Line>,
+    rules: Vec<FillRule>,
+    baseline: Vec<i32>,
+    scratch: RowScratch,
+    result: Coverage,
+}
+
+impl Compiler {
+    /// Compile the geometric intersection into this compiler's sparse storage.
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "surface-clamped row coordinates fit exactly in f64"
+    )]
+    pub fn compile(&mut self, operands: &[Operand], w: usize, rows: Range<usize>) -> &Coverage {
+        self.result.row_offsets.clear();
+        self.result.row_offsets.push(0);
+        self.result.spans.clear();
+        self.result.samples.clear();
+        self.result.edge_count = operands.first().map_or(0, |operand| operand.edges.len());
+        if operands.is_empty() || w == 0 || rows.is_empty() {
+            return &self.result;
         }
-        scratch.finish(&mut result, w);
+        let mut top = rows.start;
+        let mut bottom = rows.end;
+        for operand in operands {
+            let lo = operand
+                .edges
+                .iter()
+                .map(|e| e.y0.min(e.y1))
+                .fold(f64::INFINITY, f64::min);
+            let hi = operand
+                .edges
+                .iter()
+                .map(|e| e.y0.max(e.y1))
+                .fold(f64::NEG_INFINITY, f64::max);
+            top = top.max(lo.floor() as usize);
+            bottom = bottom.min(hi.ceil() as usize);
+        }
+        self.result.top = top;
+        if top >= bottom {
+            return &self.result;
+        }
+        row_lines(
+            operands,
+            top,
+            bottom,
+            &mut self.offsets,
+            &mut self.lines,
+            &mut self.cursors,
+        );
+        self.rules.clear();
+        self.rules
+            .extend(operands.iter().map(|operand| operand.rule));
+        self.baseline.resize(operands.len(), 0);
+        for row in 0..bottom - top {
+            let lines = &mut self.lines[self.offsets[row]..self.offsets[row + 1]];
+            lines.sort_unstable_by(|a, b| a.left.total_cmp(&b.left));
+            self.baseline.fill(0);
+            let mut first = 0;
+            while first < lines.len() {
+                let mut end = first + 1;
+                let mut right = lines[first].right;
+                // Groups share a pixel whenever their rounded x envelopes
+                // touch. Between groups the entire pixel is an interior or
+                // exterior, known from winding without numerical integration.
+                while end < lines.len()
+                    && lines[end].left.floor().clamp(0.0, w as f64)
+                        <= right.ceil().clamp(0.0, w as f64)
+                {
+                    right = right.max(lines[end].right);
+                    end += 1;
+                }
+                self.scratch
+                    .group(&lines[first..end], &self.baseline, &self.rules, w);
+                let middle = (top + row) as f64 + 0.5;
+                for line in &lines[first..end] {
+                    if line.top <= middle && line.bottom > middle {
+                        self.baseline[line.operand] += line.dir;
+                    }
+                }
+                self.scratch.interiors.push((
+                    right.ceil().clamp(0.0, w as f64) as usize,
+                    self.baseline
+                        .iter()
+                        .zip(&self.rules)
+                        .all(|(&wind, &rule)| inside(wind, rule)),
+                ));
+                first = end;
+            }
+            self.scratch.finish(&mut self.result, w);
+        }
+        &self.result
     }
-    result
+}
+
+/// Compile a retained clip field; draw compilation requests only band rows.
+pub fn rasterize(operands: &[Operand], w: usize, h: usize) -> Coverage {
+    let mut compiler = Compiler::default();
+    compiler.compile(operands, w, 0..h);
+    compiler.result
 }
 
 impl Line {
@@ -308,6 +364,9 @@ struct RowScratch {
     order: Vec<usize>,
     winding: Vec<i32>,
     delta: Vec<(usize, f64)>,
+    /// At each group's right pixel boundary, winding determines the exact
+    /// full-row area. This prevents integration residue from filling gaps.
+    interiors: Vec<(usize, bool)>,
 }
 
 impl RowScratch {
@@ -418,12 +477,21 @@ impl RowScratch {
         let mut area = 0.0_f64;
         let mut previous = 0;
         let mut i = 0;
-        while i < self.delta.len() {
-            let x = self.delta[i].0;
+        let mut interior = 0;
+        while i < self.delta.len() || interior < self.interiors.len() {
+            let x = self
+                .delta
+                .get(i)
+                .map_or(w, |event| event.0)
+                .min(self.interiors.get(interior).map_or(w, |event| event.0));
             result.push(previous, x, area.clamp(0.0, 1.0) as f32, row_start);
             while i < self.delta.len() && self.delta[i].0 == x {
                 area += self.delta[i].1;
                 i += 1;
+            }
+            while interior < self.interiors.len() && self.interiors[interior].0 == x {
+                area = f64::from(self.interiors[interior].1);
+                interior += 1;
             }
             previous = x;
         }
@@ -432,15 +500,15 @@ impl RowScratch {
             .row_offsets
             .push(u32::try_from(result.spans.len()).expect("span index"));
         self.delta.clear();
+        self.interiors.clear();
     }
 }
 
 #[cfg(test)]
-#[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
 
-    fn polygon(points: &[(f32, f32)], rule: FillRule) -> Operand {
+    fn polygon(points: &[(f64, f64)], rule: FillRule) -> Operand {
         Operand {
             edges: points
                 .iter()
@@ -567,5 +635,47 @@ mod tests {
         }
         assert_eq!(coverage.samples(&coverage.spans[0]), [0.25, 0.5, 0.125]);
         assert_eq!(coverage.samples(&coverage.spans[2]), [0.5, 0.75]);
+    }
+
+    #[test]
+    fn disjoint_fractional_contours_leave_exactly_empty_gaps() {
+        let triangle = polygon(&[(1.2, 0.1), (7.1, 3.3), (1.8, 2.7)], FillRule::NonZero);
+        let shifted = triangle.edges.iter().map(|edge| Edge {
+            x0: edge.x0 + 16.0,
+            x1: edge.x1 + 16.0,
+            ..*edge
+        });
+        let shape = Operand {
+            edges: triangle.edges.iter().copied().chain(shifted).collect(),
+            rule: FillRule::NonZero,
+        };
+        let coverage = rasterize(&[shape], 32, 4);
+        for y in 0..4 {
+            for x in (8..17).chain(24..32) {
+                assert_eq!(coverage.at(x, y).to_bits(), 0.0_f32.to_bits(), "({x}, {y})");
+            }
+        }
+    }
+
+    #[test]
+    fn band_compilation_matches_full_field_and_reuses_bounded_storage() {
+        let operands = [polygon(
+            &[(-0.25, 0.25), (10.75, 65.75), (31.5, 64.75), (20.25, 0.125)],
+            FillRule::EvenOdd,
+        )];
+        let full = rasterize(&operands, 32, 80);
+        let mut compiler = Compiler::default();
+        for start in (0..80).step_by(16) {
+            let band = compiler.compile(&operands, 32, start..start + 16);
+            for y in start..start + 16 {
+                for x in 0..32 {
+                    assert_eq!(band.at(x, y).to_bits(), full.at(x, y).to_bits());
+                }
+            }
+            assert!(compiler.offsets.len() <= 17);
+            assert!(compiler.lines.len() <= 16 * operands[0].edges.len());
+        }
+        let empty = compiler.compile(&operands, 32, 128..144);
+        assert_eq!(empty.row(128), []);
     }
 }

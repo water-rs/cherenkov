@@ -63,7 +63,10 @@ impl Lowering<'_, '_> {
         let placement = Affine::translate((px as f64, py as f64))
             * self.transform
             * Affine::translate(shadow.offset);
-        let edges = flatten_edges(placement * path, FLATTEN_TOL);
+        let edges: Vec<_> = flatten_edges(placement * path, FLATTEN_TOL)
+            .into_iter()
+            .map(crate::render::raster::Edge::to_f32)
+            .collect();
         let mut coverage = coverage_mask(&edges, rule, width, height);
         if shadow.spread != 0.0 {
             let taps = spread_taps([ma, mb, mc, md], shadow.spread, f64::from(i32::MAX))?;

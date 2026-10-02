@@ -1,15 +1,9 @@
-//! The banded exact-area coverage rasterizer.
+//! Banded exact geometric intersections and sparse-span shading.
 //!
-//! A port of the accumulation rasterizer from font-rs (`raster.rs`), also
-//! used by `cherenkov-gpu` for glyph masks: every flattened directed edge
-//! deposits a signed area into a `(width + 2) * band_h` accumulator whose
-//! column 0 guards everything left of the canvas and whose last column
-//! guards everything right of it, then each row is prefix-summed and the
-//! fill rule turns the winding-weighted area into coverage.
-//!
-//! The accumulator is exact for polygons that do not self-overlap inside a
-//! pixel — the oracle's `pixel_area` is exact even then; this is the known
-//! difference this backend documents.
+//! Each worker reuses a coverage compiler across draws. Winding predicates
+//! and nested clips resolve before area integration; only nonempty spans
+//! reach the paint and source-over kernels. Glyph opacity masks retain the
+//! accumulator used by the glyph cache.
 
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
@@ -17,6 +11,7 @@ use std::ops::Range;
 
 use cherenkov::FillRule;
 
+use super::coverage::{Compiler, Operand};
 use crate::render::lower::{
     ClipMask, ClipRef, FrameFilter, IRect, Item, SampleEffect, SdfEffect, SdfKind,
 };
@@ -37,8 +32,8 @@ pub const BAND_H: usize = 16;
 /// The transient pixel bound is `workers × (band + Σ filter windows at the
 /// deepest nesting)`, where each filter window is `w × (bh + 2·apron)`.
 pub struct Scratch {
-    /// `(w + 2) * band_rows` coverage cells, reused across bands.
-    coverage: Vec<f32>,
+    /// Sparse band compilation storage, reused across draws and filter windows.
+    coverage: Compiler,
     /// Isolation-stack colour buffers currently in use.
     stack: Vec<Plane>,
     buffers: Buffers,
@@ -48,7 +43,6 @@ pub struct Scratch {
 
 struct Buffers {
     free: Vec<Vec<[f32; 4]>>,
-    coverage: Vec<Vec<f32>>,
     /// Live colour-buffer bytes and their peak for the current band.
     meter: Meter,
 }
@@ -134,11 +128,10 @@ impl Scratch {
     /// An empty working set; buffers grow to band size on first use.
     pub fn new() -> Self {
         Self {
-            coverage: Vec::new(),
+            coverage: Compiler::default(),
             stack: Vec::new(),
             buffers: Buffers {
                 free: Vec::new(),
-                coverage: Vec::new(),
                 meter: Meter::default(),
             },
             captures: Captures::default(),
@@ -161,33 +154,38 @@ impl Buffers {
         self.meter.give(buf.len());
         self.free.push(buf);
     }
-
-    fn take_coverage(&mut self, len: usize) -> Vec<f32> {
-        let mut buf = self.coverage.pop().unwrap_or_default();
-        buf.clear();
-        buf.resize(len, 0.0);
-        buf
-    }
-
-    fn give_coverage(&mut self, buf: Vec<f32>) {
-        self.coverage.push(buf);
-    }
 }
 
 /// Sample count of the shadow y-quadrature (the GPU uses the same).
 const SHADOW_N: usize = 16;
 
 /// A directed edge in device space.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Edge {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Edge<T = f32> {
     /// Start point.
-    pub x0: f32,
+    pub x0: T,
     /// Start point.
-    pub y0: f32,
+    pub y0: T,
     /// End point.
-    pub x1: f32,
+    pub x1: T,
     /// End point.
-    pub y1: f32,
+    pub y1: T,
+}
+
+impl Edge<f64> {
+    /// Boundary coordinates for f32 distance and opacity-field consumers.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "distance fields and cached opacity masks operate at f32 precision"
+    )]
+    pub const fn to_f32(self) -> Edge {
+        Edge {
+            x0: self.x0 as f32,
+            y0: self.y0 as f32,
+            x1: self.x1 as f32,
+            y1: self.y1 as f32,
+        }
+    }
 }
 
 /// A signed-area accumulation buffer over a band of `h` rows.
@@ -226,23 +224,6 @@ impl Accum {
             a,
             cmin: 0,
             cmax: w + 1,
-        }
-    }
-
-    /// Releases the cell buffer for pooling.
-    pub fn into_buffer(self) -> Vec<f32> {
-        self.a
-    }
-
-    pub fn set_window(&mut self, x0: usize, x1: usize) {
-        self.cmin = x0;
-        self.cmax = (x1 + 1).min(self.w + 1);
-    }
-
-    pub fn clear_range(&mut self, y_lo: usize, y_hi: usize) {
-        for y in y_lo..y_hi.min(self.h) {
-            let row = y * (self.w + 2);
-            self.a[row + self.cmin..=row + self.cmax].fill(0.0);
         }
     }
 
@@ -402,7 +383,7 @@ fn corner_inset(r: f32, dy: f32) -> f32 {
     clippy::cast_sign_loss,
     reason = "clip rect edges are clamped non-negative before indexing"
 )]
-fn clip_cov(clip: Option<&ClipRef>, w: usize, px: usize, py: usize) -> f32 {
+fn clip_cov(clip: Option<&ClipRef>, px: usize, py: usize) -> f32 {
     match clip.map(std::convert::AsRef::as_ref) {
         None => 1.0,
         Some(ClipMask::Rect(r)) => f32::from(
@@ -411,7 +392,7 @@ fn clip_cov(clip: Option<&ClipRef>, w: usize, px: usize, py: usize) -> f32 {
                 && py >= (r.y0.max(0) as usize)
                 && py < (r.y1.max(0) as usize),
         ),
-        Some(ClipMask::Cover(mask)) => mask[py * w + px],
+        Some(ClipMask::Geometry { coverage, .. }) => coverage.at(px, py),
     }
 }
 
@@ -600,9 +581,9 @@ fn stats(items: &[Item]) -> (u32, u32) {
         if matches!(item, Item::Silhouette { .. } | Item::Project(_)) {
             draws += 1;
         }
-        if let Item::Draw { edges: e, .. } = item {
+        if let Item::Draw { operands, .. } = item {
             draws += 1;
-            edges += u32::try_from(e.len()).unwrap_or(u32::MAX);
+            edges += u32::try_from(operands[0].edges.len()).unwrap_or(u32::MAX);
         }
     }
     (draws, edges)
@@ -673,7 +654,6 @@ fn shade(
             i += 1;
         }
     }
-    let coverage = std::mem::take(&mut scratch.coverage);
     let result = if let Some(&(last, ..)) = captures.last() {
         shade_windowed(
             items,
@@ -683,11 +663,10 @@ fn shade(
             surface,
             h,
             (&captures, last),
-            coverage,
             scratch,
         )
     } else {
-        shade_plain(items, slice, w, surface, h, coverage, scratch)
+        shade_plain(items, slice, w, surface, h, scratch)
     };
     for plane in scratch.stack.drain(..) {
         scratch.buffers.give_color(plane.buf);
@@ -710,22 +689,20 @@ fn shade_plain(
     w: usize,
     surface: (usize, usize),
     h: usize,
-    coverage: Vec<f32>,
     scratch: &mut Scratch,
 ) -> Result<(), cherenkov::RenderError> {
-    let (y0, y1) = surface;
-    let mut acc = Accum::with_buffer(w, y1 - y0, coverage);
+    let (y0, _) = surface;
     let mut band = Band {
         fb: slice,
         w,
         y0,
         space: cherenkov::BlendSpace::Linear,
     };
-    let result = run(
+    run(
         items,
         0..items.len(),
         &mut band,
-        &mut acc,
+        &mut scratch.coverage,
         &mut scratch.stack,
         &mut scratch.buffers,
         &mut FrameCtx {
@@ -733,9 +710,7 @@ fn shade_plain(
             h,
             captures: &mut scratch.captures,
         },
-    );
-    scratch.coverage = acc.into_buffer();
-    result
+    )
 }
 
 /// The band's pass with top-level captures: `run` over an expanded
@@ -757,7 +732,6 @@ fn shade_windowed(
     surface: (usize, usize),
     h: usize,
     (captures, last): (&[(usize, usize, usize)], usize),
-    coverage: Vec<f32>,
     scratch: &mut Scratch,
 ) -> Result<(), cherenkov::RenderError> {
     let (y0, y1) = surface;
@@ -775,7 +749,6 @@ fn shade_windowed(
     let rows = win1 - win0;
     let mut window = scratch.buffers.take_color(w * rows);
     window.fill(clear);
-    let mut acc = Accum::with_buffer(w, rows, coverage);
     let mut band = Band {
         fb: &mut window,
         w,
@@ -786,7 +759,7 @@ fn shade_windowed(
         items,
         0..last + 1,
         &mut band,
-        &mut acc,
+        &mut scratch.coverage,
         &mut scratch.stack,
         &mut scratch.buffers,
         &mut FrameCtx {
@@ -809,22 +782,18 @@ fn shade_windowed(
         }
     }
     scratch.buffers.give_color(window);
-    if let Err(error) = first_pass {
-        scratch.coverage = acc.into_buffer();
-        return Err(error);
-    }
-    let mut acc = Accum::with_buffer(w, bh, acc.into_buffer());
+    first_pass?;
     let mut band = Band {
         fb: slice,
         w,
         y0,
         space: cherenkov::BlendSpace::Linear,
     };
-    let result = run(
+    run(
         items,
         last + 1..items.len(),
         &mut band,
-        &mut acc,
+        &mut scratch.coverage,
         &mut scratch.stack,
         &mut scratch.buffers,
         &mut FrameCtx {
@@ -832,9 +801,7 @@ fn shade_windowed(
             h,
             captures: &mut scratch.captures,
         },
-    );
-    scratch.coverage = acc.into_buffer();
-    result
+    )
 }
 
 /// Rasterizes the whole surface's items into `fb`, parallel over bands.
@@ -984,7 +951,7 @@ fn run(
     items: &[Item],
     range: Range<usize>,
     band: &mut Band<'_>,
-    acc: &mut Accum,
+    acc: &mut Compiler,
     stack: &mut Vec<Plane>,
     buffers: &mut Buffers,
     ctx: &mut FrameCtx<'_>,
@@ -995,13 +962,11 @@ fn run(
     while i < range.end {
         match &items[i] {
             Item::Draw {
-                edges,
+                operands,
                 bbox,
-                rule,
                 paint,
-                clip,
             } => {
-                band.draw(acc, stack, edges, *bbox, *rule, paint, clip.as_ref());
+                band.draw(acc, stack, operands, *bbox, paint);
             }
             Item::PushIsolate { space } => stack.push(Plane {
                 buf: buffers.take_color(slice_len(band.w, bh)),
@@ -1049,7 +1014,6 @@ fn run(
                 let top = band.y0.saturating_sub(*apron);
                 let bottom = y1.saturating_add(*apron).min(h);
                 let mut window = buffers.take_color(band.w * (bottom - top));
-                let coverage = buffers.take_coverage((band.w + 2) * (bottom - top));
                 let nested_result = {
                     let mut filter_band = Band {
                         fb: &mut window,
@@ -1057,13 +1021,12 @@ fn run(
                         y0: top,
                         space: *space,
                     };
-                    let mut filter_acc = Accum::with_buffer(band.w, bottom - top, coverage);
                     let mut filter_stack = Vec::new();
                     let result = run(
                         items,
                         i + 1..scope_end,
                         &mut filter_band,
-                        &mut filter_acc,
+                        acc,
                         &mut filter_stack,
                         buffers,
                         ctx,
@@ -1071,7 +1034,6 @@ fn run(
                     for plane in filter_stack {
                         buffers.give_color(plane.buf);
                     }
-                    buffers.give_coverage(filter_acc.into_buffer());
                     result
                 };
                 if let Err(error) = nested_result {
@@ -1285,20 +1247,13 @@ struct Band<'a> {
 
 impl Band<'_> {
     /// Rasterizes one draw item into the top isolation buffer.
-    #[expect(
-        clippy::cast_precision_loss,
-        clippy::too_many_arguments,
-        reason = "pixel indices and band offsets are far below 2^24"
-    )]
     fn draw(
         &mut self,
-        acc: &mut Accum,
+        acc: &mut Compiler,
         stack: &mut Vec<Plane>,
-        edges: &[Edge],
+        operands: &[Operand],
         bbox: crate::render::lower::IRect,
-        rule: FillRule,
         paint: &PaintData,
-        clip: Option<&ClipRef>,
     ) {
         let bh = self.fb.len() / self.w;
         // Band-intersect the device-space bounding box.
@@ -1315,36 +1270,15 @@ impl Band<'_> {
         if y_lo >= y_hi {
             return;
         }
-        let (x_lo, x_hi) = (
-            usize::try_from(bbox.x0).unwrap_or(0).min(self.w),
-            usize::try_from(bbox.x1).unwrap_or(0).min(self.w),
-        );
-        // Only the item's bbox columns participate: clear and deposit
-        // inside the guard window `x_lo .. x_hi + 1`.
-        acc.set_window(x_lo, x_hi);
-        acc.clear_range(y_lo, y_hi);
-        for e in edges {
-            // Only edges crossing the band deposit anything.
-            let ey0 = e.y0 - self.y0 as f32;
-            let ey1 = e.y1 - self.y0 as f32;
-            if ey0.max(ey1) < 0.0 || ey0.min(ey1) >= bh as f32 {
-                continue;
-            }
-            acc.draw_line(e.x0, ey0, e.x1, ey1);
-        }
+        let coverage = acc.compile(operands, self.w, self.y0 + y_lo..self.y0 + y_hi);
+        let (dst, space) = top(self.fb, self.space, stack.as_mut_slice());
         for y in y_lo..y_hi {
             let py = self.y0 + y;
-            acc.coverage_row(y, rule, x_lo, x_hi, |x, cov| {
-                let cc = clip_cov(clip, self.w, x, py);
-                if cc <= 0.0 {
-                    return;
-                }
-                let src = paint
-                    .eval(x as f32 + 0.5, py as f32 + 0.5)
-                    .map(|v| v * cov * cc);
-                let (dst, space) = top(&mut *self.fb, self.space, stack.as_mut_slice());
-                dst[y * self.w + x] = src_over(dst[y * self.w + x], member(src, space));
-            });
+            for span in coverage.row(py) {
+                let x = span.x as usize;
+                let pixels = &mut dst[y * self.w + x..y * self.w + x + span.len as usize];
+                super::span::shade(pixels, paint, (x, py), space, span, coverage);
+            }
         }
     }
 
@@ -1401,7 +1335,7 @@ impl Band<'_> {
                 usize::try_from(r.x1).unwrap_or(0).clamp(x_lo, x_hi),
                 None,
             ),
-            Some(ClipMask::Cover(mask)) => (x_lo, x_hi, Some(mask.as_slice())),
+            Some(ClipMask::Geometry { coverage, .. }) => (x_lo, x_hi, Some(coverage)),
             None => (x_lo, x_hi, None),
         };
         if cx_lo >= cx_hi && clip_mask.is_none() {
@@ -1480,7 +1414,7 @@ impl Band<'_> {
                     if cov <= 0.0 {
                         continue;
                     }
-                    let cc = clip_mask.map_or(1.0, |m| m[py_i * self.w + x]);
+                    let cc = clip_mask.map_or(1.0, |m| m.at(x, py_i));
                     if cc <= 0.0 {
                         continue;
                     }
@@ -1512,7 +1446,7 @@ impl Band<'_> {
                     if cov <= 0.0 {
                         continue;
                     }
-                    let cc = clip_mask.map_or(1.0, |m| m[py_i * self.w + x]);
+                    let cc = clip_mask.map_or(1.0, |m| m.at(x, py_i));
                     if cc <= 0.0 {
                         continue;
                     }
@@ -1522,7 +1456,7 @@ impl Band<'_> {
             };
             edge(&mut *dst, cx_lo, x_in_lo);
             for x in x_in_lo..x_in_hi {
-                let cc = clip_mask.map_or(1.0, |m| m[py_i * self.w + x]);
+                let cc = clip_mask.map_or(1.0, |m| m.at(x, py_i));
                 if cc <= 0.0 {
                     continue;
                 }
@@ -1571,7 +1505,7 @@ impl Band<'_> {
             let row = (py - self.y0) * self.w;
             let crow = (py - capture.y0) * capture.w;
             for px in x_lo..x_hi {
-                let cc = clip_cov(clip, self.w, px, py);
+                let cc = clip_cov(clip, px, py);
                 if cc <= 0.0 {
                     continue;
                 }
@@ -1629,7 +1563,7 @@ impl Band<'_> {
             let py = self.y0 + y;
             let row = usize::try_from(py as i32 - my0).unwrap_or(0) * mask.w as usize;
             for x in x_lo..x_hi {
-                let cc = clip_cov(clip, self.w, x, py);
+                let cc = clip_cov(clip, x, py);
                 if cc <= 0.0 {
                     continue;
                 }
@@ -1665,7 +1599,7 @@ impl Band<'_> {
             for px in x0..x1 {
                 let here = q;
                 q = [q[0] + step[0], q[1] + step[1], q[2] + step[2]];
-                let cc = clip_cov(item.clip.as_ref(), self.w, px, py);
+                let cc = clip_cov(item.clip.as_ref(), px, py);
                 if cc <= 0.0 {
                     continue;
                 }
@@ -1695,7 +1629,7 @@ impl Band<'_> {
         for (i, &src) in scratch.iter().enumerate() {
             let px = i % self.w;
             let py = self.y0 + i / self.w;
-            let cc = clip_cov(clip, self.w, px, py);
+            let cc = clip_cov(clip, px, py);
             if blend.0 == cherenkov::BlendMode::Normal && src_space == dst_space {
                 let s = src.map(|v| v * opacity * cc);
                 dst[i] = src_over(dst[i], s);

@@ -17,6 +17,73 @@ fn engine() -> Engine<Raster> {
 const RED: WorkingColor = WorkingColor::new([1., 0., 0., 1.]);
 
 #[test]
+fn fractional_clips_intersect_draw_geometry_before_integrating() {
+    let engine = engine();
+    for y in [0.0, 15.0, 16.0] {
+        let pixels = render_f32(&engine, 8, 32, |c| {
+            c.clip(Rect::new(0.0, y + 0.25, 8.0, y + 1.0), |c| {
+                c.clip(Rect::new(0.0, y, 8.0, y + 0.75), |c| {
+                    c.fill(Rect::new(0.0, y + 0.5, 8.0, y + 1.0), RED);
+                });
+            });
+        });
+        let occupied: Vec<_> = pixels.iter().filter(|pixel| pixel[3] > 0.0).collect();
+        assert_eq!(occupied.len(), 8);
+        for pixel in occupied {
+            assert_eq!(
+                pixel.map(f32::to_bits),
+                [0.25_f32, 0.0, 0.0, 0.25].map(f32::to_bits)
+            );
+        }
+    }
+}
+
+#[test]
+fn streamed_sparse_clips_match_offscreen_across_bands_and_simd_tails() {
+    use cherenkov_cpu::{BandPixels, Bands};
+    let engine = engine();
+    let draw = |c: &mut cherenkov::Recorder| {
+        c.fill(
+            Rect::new(0.0, 0.0, 11.0, 35.0),
+            WorkingColor::new([2.0, -0.125, 0.5, 1.0]),
+        );
+        c.clip(Rect::new(0.25, 0.25, 10.75, 34.75), |c| {
+            c.clip(Rect::new(0.0, 0.5, 11.0, 34.5), |c| {
+                c.fill(
+                    Rect::new(0.5, 0.0, 10.5, 35.0),
+                    WorkingColor::new([0.25, 2.0, 0.75, 0.5]),
+                );
+            });
+        });
+    };
+    let expected = render_f32(&engine, 11, 35, draw);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let surface = engine
+        .surface(Bands::new(
+            (11, 35),
+            OffscreenFormat::LinearF32,
+            move |band| {
+                let BandPixels::F32(pixels) = band.pixels else {
+                    panic!("f32 target")
+                };
+                assert!(pixels.len() <= 11 * 16);
+                sender.send((band.y, pixels.to_vec())).expect("receiver");
+            },
+        ))
+        .expect("streaming surface");
+    surface.update(|tx| {
+        tx[surface.root()].content(surface.record(draw));
+    });
+    engine.render(FrameTime::now()).expect("streaming render");
+    let mut actual = Vec::new();
+    for (y, pixels) in receiver.try_iter() {
+        assert_eq!(y as usize * 11, actual.len());
+        actual.extend(pixels);
+    }
+    assert_eq!(actual, expected);
+}
+
+#[test]
 fn a_half_edge_rect_has_exact_coverage() {
     let engine = engine();
     let surface = engine

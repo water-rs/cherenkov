@@ -93,11 +93,13 @@ pub fn emission_bytes(emission: &Emission) -> u64 {
 fn item_bytes(item: &Item) -> u64 {
     match item {
         Item::Draw {
-            edges, paint, clip, ..
+            operands, paint, ..
         } => {
-            (edges.len() * size_of::<super::raster::Edge>()) as u64
+            // Clip boundaries belong to the placement clip counted by
+            // DeviceData::heap_bytes; the draw retains references to them.
+            size_of_val(&**operands) as u64
+                + size_of_val(&*operands[0].edges) as u64
                 + paint_data_bytes(paint)
-                + clip.as_deref().map_or(0, clip_bytes)
         }
         Item::Glyph { paint, clip, .. } | Item::Silhouette { paint, clip, .. } => {
             paint_data_bytes(paint) + clip.as_deref().map_or(0, clip_bytes)

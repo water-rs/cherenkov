@@ -20,6 +20,7 @@ mod prepared;
 pub mod present;
 mod projective;
 mod raster;
+mod span;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 

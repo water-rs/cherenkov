@@ -2,6 +2,8 @@
 //! sampled at the pixel centre mapped by the item's inverse transform into
 //! content space, then premultiplied.
 
+mod batch;
+
 use cherenkov::kurbo::Affine;
 use cherenkov::{ColorStop, Extend, Interpolation, Paint};
 use rustc_hash::FxHashMap;

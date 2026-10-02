@@ -16,6 +16,7 @@ default = []
 # subsetting with skera. Only needed by the corpus binaries.
 generator = [
     "dep:parley",
+    "parley/complex-scripts",
     "dep:fontique",
     "dep:skera",
     "dep:skrifa",

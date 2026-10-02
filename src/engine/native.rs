@@ -215,13 +215,13 @@ impl<B: Backend> Engine<B> {
     /// [`Engine::render`]s, the first time something is queued. `f` may
     /// run on the engine's thread or on the main thread — a completion
     /// queued there by the render thread fires it — so it must be
-    /// [`Send`].
+    /// [`Send`] and [`Sync`].
     ///
     /// # Panics
     /// When the callback slot is poisoned by a panic inside a previous
     /// `f` running under the lock.
-    pub fn set_waker(&self, f: impl Fn() + Send + 'static) {
-        *self.waker.callback.lock().expect("waker poisoned") = Some(Box::new(f));
+    pub fn set_waker(&self, f: impl Fn() + Send + Sync + 'static) {
+        *self.waker.callback.lock().expect("waker poisoned") = Some(Arc::new(f));
     }
 
     fn alloc(cell: &Cell<u64>) -> u64 {

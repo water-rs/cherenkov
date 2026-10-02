@@ -214,7 +214,7 @@ impl<B: Backend> Engine<B> {
     /// # Panics
     /// Panics if the engine's callback slot is poisoned by a prior panic.
     pub fn set_waker(&self, f: impl Fn() + 'static) {
-        *self.waker.callback.lock().expect("waker poisoned") = Some(Box::new(f));
+        *self.waker.callback.lock().expect("waker poisoned") = Some(Arc::new(f));
     }
 
     fn alloc(cell: &Cell<u64>) -> u64 {

@@ -11,15 +11,17 @@ pub use native::Engine;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 /// The callback is transferable on native targets and local on wasm32.
+/// Native it may run on any thread while the engine holds it, so it is
+/// shared: `Send` to cross threads, `Sync` to be shared across them.
 #[cfg(not(target_arch = "wasm32"))]
-type Wake = dyn Fn() + Send;
+type Wake = dyn Fn() + Send + Sync;
 #[cfg(target_arch = "wasm32")]
 type Wake = dyn Fn();
 
 /// The host wake-up, coalesced between engine renders.
 /// Native callbacks may run on any thread; the callback slot is synchronized.
 pub struct Waker {
-    callback: Mutex<Option<Box<Wake>>>,
+    callback: Mutex<Option<Arc<Wake>>>,
     armed: AtomicBool,
 }
 
@@ -37,16 +39,13 @@ impl Waker {
         if !self.armed.swap(false, Ordering::Relaxed) {
             return;
         }
-        // Out from under the lock: the callback may itself touch the
-        // engine, and a `set_waker` it makes wins over re-arming this
+        // Cloned under the lock, called outside it: the callback may
+        // itself touch the engine — a `set_waker` it makes replaces the
+        // slot — and a panicking callback must not lose the installed
         // one.
-        let callback = self.callback.lock().expect("waker poisoned").take();
+        let callback = self.callback.lock().expect("waker poisoned").clone();
         let Some(callback) = callback else { return };
         callback();
-        let mut slot = self.callback.lock().expect("waker poisoned");
-        if slot.is_none() {
-            *slot = Some(callback);
-        }
     }
 
     pub(super) fn arm(&self) {

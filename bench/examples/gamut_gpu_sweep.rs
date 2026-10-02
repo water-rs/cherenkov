@@ -145,11 +145,12 @@ fn hue_diff_deg(a: [f64; 3], b: [f64; 3]) -> f64 {
     d.min(360.0 - d)
 }
 
-fn stats(values: &mut Vec<f64>) -> (f64, f64, f64, f64) {
+fn stats(values: &mut [f64]) -> (f64, f64, f64, f64) {
     values.sort_by(f64::total_cmp);
     let n = values.len();
+    let n_f64 = f64::from(u32::try_from(n).expect("sweep samples fit u32"));
     (
-        values.iter().sum::<f64>() / n as f64,
+        values.iter().sum::<f64>() / n_f64,
         values[n / 2],
         values[(n * 99 / 100).min(n - 1)],
         values[n - 1],
@@ -169,11 +170,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .map(|&p3| mat3_mul(&P3_TO_LINEAR_SRGB, tone_map(1.0, p3)))
         .collect();
-    let out_of_gamut: Vec<usize> = srgb_inputs
+    let out_of_gamut = srgb_inputs
         .iter()
-        .enumerate()
-        .filter_map(|(i, s)| (!s.iter().all(|&c| (0.0..=1.0).contains(&c))).then_some(i))
-        .collect();
+        .filter(|s| !s.iter().all(|&c| (0.0..=1.0).contains(&c)))
+        .count();
 
     // Pack every sample into one wide Rgba16Float source (opaque alpha).
     let width = 1024u32;
@@ -291,8 +291,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut de_adaptive = Vec::new();
     let mut de_f64_adaptive_css = Vec::new();
     let mut hue = Vec::new();
-    let mut hue_css_f64 = Vec::new();
-    let mut hue_adaptive_f64 = Vec::new();
+    let mut hues_css = Vec::new();
+    let mut hues_adaptive = Vec::new();
     let mut lsb_css = 0u32;
     let mut lsb_adaptive = 0u32;
     let mut in_gamut_exact = true;
@@ -323,11 +323,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             linear_srgb_to_oklab(adaptive),
             linear_srgb_to_oklab(css),
         ));
-        hue_css_f64.push(hue_diff_deg(
+        hues_css.push(hue_diff_deg(
             linear_srgb_to_oklab(css),
             linear_srgb_to_oklab(srgb),
         ));
-        hue_adaptive_f64.push(hue_diff_deg(
+        hues_adaptive.push(hue_diff_deg(
             linear_srgb_to_oklab(adaptive),
             linear_srgb_to_oklab(srgb),
         ));
@@ -342,25 +342,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     drop(bytes);
     buffer.unmap();
 
-    let (m1, p501, p991, max1) = stats(&mut de_css);
-    let (m2, p502, p992, max2) = stats(&mut de_adaptive);
-    let (_, hp50, hp99, hmax) = stats(&mut hue);
-    let (_, hc50, hc99, hcmax) = stats(&mut hue_css_f64);
-    let (_, ha50, ha99, hamax) = stats(&mut hue_adaptive_f64);
-    let (m3, p503, p993, max3) = stats(&mut de_f64_adaptive_css);
-    let n = out_of_gamut.len();
-    println!("gpu gamut sweep: {n} out-of-gamut samples through present.wgsl");
+    let (de_css_mean, de_css_p50, de_css_p99, de_css_max) = stats(&mut de_css);
+    let (de_adp_mean, de_adp_p50, de_adp_p99, de_adp_max) = stats(&mut de_adaptive);
+    let (_, hue_p50, hue_p99, hue_max) = stats(&mut hue);
+    let (_, hue_css_p50, hue_css_p99, hue_css_max) = stats(&mut hues_css);
+    let (_, hue_adp_p50, hue_adp_p99, hue_adp_max) = stats(&mut hues_adaptive);
+    let (f64_mean, f64_p50, f64_p99, f64_max) = stats(&mut de_f64_adaptive_css);
+    println!("gpu gamut sweep: {out_of_gamut} out-of-gamut samples through present.wgsl");
     println!(
-        "  ΔE_OK vs CSS reference:      mean {m1:.5}  p50 {p501:.5}  p99 {p991:.5}  max {max1:.5}"
+        "  ΔE_OK vs CSS reference:      mean {de_css_mean:.5}  p50 {de_css_p50:.5}  p99 {de_css_p99:.5}  max {de_css_max:.5}"
     );
     println!(
-        "  ΔE_OK vs adaptive reference: mean {m2:.5}  p50 {p502:.5}  p99 {p992:.5}  max {max2:.5}"
+        "  ΔE_OK vs adaptive reference: mean {de_adp_mean:.5}  p50 {de_adp_p50:.5}  p99 {de_adp_p99:.5}  max {de_adp_max:.5}"
     );
-    println!("  hue° vs input:               p50 {hp50:.4}  p99 {hp99:.4}  max {hmax:.4}");
-    println!("  hue° vs input, f64 CSS map:      p50 {hc50:.4}  p99 {hc99:.4}  max {hcmax:.4}");
-    println!("  hue° vs input, f64 adaptive map: p50 {ha50:.4}  p99 {ha99:.4}  max {hamax:.4}");
+    println!("  hue° vs input:               p50 {hue_p50:.4}  p99 {hue_p99:.4}  max {hue_max:.4}");
     println!(
-        "  ΔE_OK f64 adaptive vs f64 CSS on this domain: mean {m3:.5}  p50 {p503:.5}  p99 {p993:.5}  max {max3:.5}"
+        "  hue° vs input, f64 CSS map:      p50 {hue_css_p50:.4}  p99 {hue_css_p99:.4}  max {hue_css_max:.4}"
+    );
+    println!(
+        "  hue° vs input, f64 adaptive map: p50 {hue_adp_p50:.4}  p99 {hue_adp_p99:.4}  max {hue_adp_max:.4}"
+    );
+    println!(
+        "  ΔE_OK f64 adaptive vs f64 CSS on this domain: mean {f64_mean:.5}  p50 {f64_p50:.5}  p99 {f64_p99:.5}  max {f64_max:.5}"
     );
     println!("  max |gpu - reference| in unorm8 LSB: css {lsb_css}  adaptive {lsb_adaptive}");
     println!("  in-gamut pixels within 0.01 ΔE of input: {in_gamut_exact}");

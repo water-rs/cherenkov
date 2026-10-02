@@ -9,7 +9,7 @@
 //!
 //! - [`Picture::record`] records constants on any thread into an immutable,
 //!   shareable [`Picture`].
-//! - [`Content::record`] records on the UI thread and accepts nami signals
+//! - [`Surface::record`] records on the UI thread and accepts nami signals
 //!   anywhere a value is accepted. A signal's later changes become
 //!   [`SlotUpdate`]s that regenerate only the commands referencing it.
 //! - [`Engine::render`] drains every surface's queued change set into one
@@ -37,8 +37,10 @@ mod projective;
 mod record;
 mod resource;
 mod shape;
+mod size;
 mod style;
 mod surface;
+mod text;
 mod tree;
 
 #[cfg(any(test, feature = "testing"))]
@@ -46,6 +48,9 @@ pub mod testing;
 
 pub use crate::backend::RenderTransfer;
 pub use kurbo;
+/// The shaping library [`TextLayout`] wraps, at the version the engine
+/// lowers.
+pub use parley;
 /// Monotonic presentation clock: std on native, browser performance clock on wasm.
 pub use web_time::Instant;
 
@@ -99,10 +104,12 @@ pub use crate::resource::{
 pub use crate::shape::{
     ContinuousRect, EvenOdd, FillRule, PATH_TOLERANCE, PathRef, Semantic, Shape, ShapeData,
 };
+pub use crate::size::LayoutSize;
 pub use crate::style::{BlendMode, BlendSpace, FilterId, Group, Shadow};
 pub use crate::surface::{
     ExternalFrameHandle, ExternalFrameInstall, GpuContentHandle, Layer, LayerContent, LayerEdit,
     Surface, Transaction,
 };
+pub use crate::text::TextLayout;
 pub use crate::tree::{LayerNode, SurfaceTree, snap_animating};
 pub use kurbo::Stroke;

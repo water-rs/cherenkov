@@ -1241,6 +1241,25 @@ mod macos {
                 .is_some()
         );
         assert_eq!(node.position(), CGPoint::new(24., 16.));
+        fixture
+            .window
+            .visibility(cherenkov::Visibility::Hidden)
+            .expect("hide animated plane");
+        assert!(matches!(
+            fixture.engine.render(FrameTime::now()),
+            Err(cherenkov::RenderError::Hidden)
+        ));
+        fixture
+            .window
+            .visibility(cherenkov::Visibility::Visible)
+            .expect("show animated plane");
+        assert_eq!(
+            fixture
+                .engine
+                .render(FrameTime::now())
+                .expect("shown frame"),
+            cherenkov::Next::Idle
+        );
         fixture.window.update(|tx| {
             tx[&video].transform(Affine::translate((8., 4.)));
         });

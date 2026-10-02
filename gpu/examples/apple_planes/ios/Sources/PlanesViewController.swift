@@ -1,0 +1,85 @@
+import QuartzCore
+import UIKit
+
+/// The view the engine presents into. Its backing layer is a
+/// `CAMetalLayer` so the layer hierarchy it hosts — the engine's metal
+/// parts and the video's `AVSampleBufferDisplayLayer` plane — sits on
+/// the same kind the window server composits natively.
+final class PlanesView: UIView {
+    override class var layerClass: AnyClass { CAMetalLayer.self }
+}
+
+/// Owns the display link and forwards each tick into the Rust harness.
+/// Production, presentation and the per-second heartbeat all happen in
+/// Rust; this class only paces them at the panel's refresh rate.
+final class PlanesViewController: UIViewController {
+    private var link: CADisplayLink?
+    private var started = false
+    private var lastSize = CGSize.zero
+
+    override func loadView() {
+        view = PlanesView()
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        let size = view.bounds.size
+        guard view.window != nil, size.width > 0, size.height > 0 else { return }
+        let scale = view.window?.screen.nativeScale ?? UIScreen.main.nativeScale
+        if !started {
+            started = true
+            lastSize = size
+            cherenkov_planes_start(
+                UnsafeRawPointer(Unmanaged.passUnretained(view).toOpaque()),
+                Double(size.width),
+                Double(size.height),
+                Double(scale)
+            )
+            let link = CADisplayLink(target: self, selector: #selector(step))
+            link.add(to: .main, forMode: .common)
+            self.link = link
+        } else if size != lastSize {
+            lastSize = size
+            cherenkov_planes_resize(
+                Double(size.width),
+                Double(size.height),
+                Double(scale)
+            )
+        }
+    }
+
+    @objc private func step() {
+        cherenkov_planes_tick()
+    }
+
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(pause),
+            name: UIApplication.willResignActiveNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(resume),
+            name: UIApplication.didBecomeActiveNotification,
+            object: nil
+        )
+    }
+
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        NotificationCenter.default.removeObserver(self)
+    }
+
+    /// Backgrounded apps may not touch the GPU — stop the link while
+    /// the app is inactive.
+    @objc private func pause() {
+        link?.isPaused = true
+    }
+
+    @objc private func resume() {
+        link?.isPaused = false
+    }
+}

@@ -307,10 +307,7 @@ fn devices(tree: &SurfaceTree, order: &[Visit], device: &mut Vec<VisitDevice>) {
 /// installed content whose alpha is the producer's, or a filter.
 fn translucent(tree: &SurfaceTree, id: LayerId) -> bool {
     let node = tree.layer(id);
-    node.opacity < 1.0
-        || node.content_translucent()
-        || node.filter.is_some()
-        || node.blend != BlendMode::Normal
+    node.opacity < 1.0 || node.content_translucent() || node.filter.is_some()
 }
 
 /// The first layer at or after each index that samples a backdrop or

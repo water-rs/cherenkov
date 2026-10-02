@@ -81,6 +81,10 @@ jobs:
       - if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      # `filtrate` with `default-features = false` must stay buildable with no
+      # wgpu stack in its normal dependency graph; one leg covers it.
+      - if: runner.os == 'Linux'
+        run: cargo clippy --locked -p filtrate --no-default-features --all-targets -- -D warnings
       # The corpus generator sits behind `generator`, which `--all-targets`
       # alone does not reach; lint it too (its output is pinned byte-identical).
       # Its font stack links the system fontconfig, and the generator is

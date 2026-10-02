@@ -34,33 +34,46 @@ undocumented_unsafe_blocks = "warn"
 multiple_crate_versions = "allow"
 
 [features]
-default = []
+default = ["gpu"]
+# Everything that touches a GPU: the wgpu `Executor`, the `Effect` runtime
+# trait and `ShaderEffect`, `TextureImage` and texture-backed `FilterImage`s.
+# With `gpu` off the crate carries no wgpu stack: the built-in filter
+# definitions, their WGSL stage sources and the CPU kernels stay available,
+# so a consumer can name and describe filters without a GPU.
+gpu = [
+    "dep:cherenkov-shader",
+    "dep:thiserror",
+    "dep:tracing",
+    "dep:web-time",
+    "dep:wgpu",
+]
 # WebGL2 backend support for wasm targets: turns on wgpu's `webgl` backend.
 # Every executor pass is a fragment pass, so WebGL2's lack of compute shaders
 # and storage textures does not matter. Enabling this feature for a non-wasm
 # target is a compile error — native and WebGPU devices run the same code
 # without it.
-webgl = ["wgpu/webgl"]
+webgl = ["gpu", "wgpu/webgl"]
 
 [dependencies]
 bytemuck = "1"
-cherenkov-shader = { version = "0.0.0", path = "../shader" }
+# The shared shader composer; only the GPU executor composes stages.
+cherenkov-shader = { version = "0.0.0", path = "../shader", optional = true }
 filtrate-core = { version = "0.2.0", path = "core" }
-# f16 aux images; no_std-capable, already in the tree through naga.
+# f16 aux images and CPU-kernel texels; no_std-capable.
 half = { version = "2.5", default-features = false }
 filtrate-derive = { version = "0.1.0", path = "derive" }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
-thiserror = "2.0.19"
-tracing = "0.1.44"
+thiserror = { version = "2.0.19", optional = true }
+tracing = { version = "0.1.44", optional = true }
 # Portable SIMD for the CPU kernels.
 wide = "1.7"
 # `naga-ir`: pass modules reach wgpu as composed naga IR, never as text.
-wgpu = { version = "30.0.1", features = ["naga-ir"] }
+wgpu = { version = "30.0.1", features = ["naga-ir"], optional = true }
 
 # `std::time::Instant::now` panics on wasm32-unknown-unknown; web-time backs it
 # with `performance.now()` there and delegates to std everywhere else.
 [target.'cfg(target_family = "wasm")'.dependencies]
-web-time = "1"
+web-time = { version = "1", optional = true }
 
 [dev-dependencies]
 # The evaluator runs snippets on the CPU to cross-check the CPU kernels and
@@ -76,3 +89,4 @@ harness = false
 [[bench]]
 name = "gpu_runtime"
 harness = false
+required-features = ["gpu"]

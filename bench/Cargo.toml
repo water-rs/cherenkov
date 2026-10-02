@@ -24,7 +24,10 @@ vello-cpu = ["dep:vello_cpu", "dep:vello_common"]
 # binaries.
 skia = ["dep:skia-safe", "dep:ash", "dep:skia-bindings", "skia-safe/vulkan", "skia-safe/ganesh"]
 skia-metal = ["dep:skia-safe", "dep:objc2", "dep:objc2-metal", "dep:skia-bindings", "skia-safe/metal", "skia-safe/graphite"]
-cherenkov = ["dep:cherenkov", "dep:cherenkov-gpu", "dep:wgpu", "dep:ash", "dep:half", "dep:filtrate"]
+cherenkov = ["dep:cherenkov", "dep:cherenkov-gpu", "dep:wgpu", "dep:ash", "dep:half", "dep:filtrate",
+    # `external-cost`'s Apple producer (`CVPixelBuffer`/`IOSurface`).
+    "dep:objc2", "dep:objc2-metal", "dep:objc2-core-video", "dep:objc2-io-surface",
+    "dep:objc2-core-foundation"]
 cherenkov-cpu = ["dep:cherenkov", "dep:cherenkov-cpu", "dep:filtrate"]
 
 [dependencies]
@@ -59,6 +62,17 @@ objc2-metal = { version = "0.3.2", optional = true, default-features = false, fe
     "MTLDevice", "MTLCommandQueue", "MTLCommandBuffer",
     # `CFTimeInterval` for `MTLCommandBuffer::GPUStartTime`/`GPUEndTime`.
     "objc2-core-foundation",
+    # `external-cost`'s IOSurface plane textures (#168).
+    "MTLTexture", "MTLPixelFormat", "MTLResource", "MTLAllocation", "objc2-io-surface",
+] }
+# `external-cost`'s `CVPixelBuffer` producer (Apple).
+objc2-core-video = { version = "0.3", optional = true, default-features = false, features = [
+    "std", "objc2-io-surface", "CVBase", "CVBuffer", "CVImageBuffer",
+    "CVPixelBuffer", "CVPixelBufferIOSurface", "CVReturn",
+] }
+objc2-io-surface = { version = "0.3", optional = true }
+objc2-core-foundation = { version = "0.3", optional = true, default-features = false, features = [
+    "std", "CFBase", "CFString", "CFNumber", "CFDictionary",
 ] }
 wgpu = { version = "30.0.1", optional = true }
 # The `vello-classic`/`vello-hybrid` baselines stay on wgpu 29: the pinned
@@ -80,6 +94,10 @@ sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 # stop `powermetrics` for `measure --energy`.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# `AHardwareBuffer` producer for `external-cost` (#168).
+[target.'cfg(target_os = "android")'.dependencies]
+ndk-sys = "0.6"
 
 # `staticlib` for hosts that cannot run a command-line binary — the iOS
 # bench app (`bench/ios`) links `cherenkov_bench_run` out of the .a.

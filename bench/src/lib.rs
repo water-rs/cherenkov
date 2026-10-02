@@ -41,6 +41,8 @@ pub mod convert;
 #[cfg(feature = "cherenkov")]
 pub mod creation;
 pub mod energy;
+#[cfg(feature = "cherenkov")]
+pub mod external_cost;
 pub mod gamut_sweep;
 pub mod memory;
 #[cfg(any(feature = "cherenkov", feature = "cherenkov-cpu"))]

@@ -122,6 +122,36 @@ fn ext_hlg(rgb: vec3<f32>) -> vec3<f32> {
     return rgb * pow(max(ys, 0.0), params.site.z - 1.0);
 }
 
+// The YUV plane decode at frame pixel `px` (pixel centres are at
+// `k + 0.5`): luma at the pixel's own coordinate, chroma at the
+// siting-offset subsampled coordinate — chroma texel j centres at frame
+// position 2j + 0.5 + s, so texel space is `p / 2 + 0.25 - s / 2`. This
+// is the decode the bench's copy-and-convert shader calls too (#168):
+// `cherenkov-bench` concatenates this file verbatim into its conversion
+// module, so both paths run one implementation.
+fn ext_frame_yuv(px: vec2<f32>) -> vec4<f32> {
+    let y4 = ext_texel_u32(ext_y, px, params.dims.xy);
+    let c4 = ext_texel_u32(ext_uv,
+        px * 0.5 + vec2<f32>(0.25) - params.site.xy * 0.5,
+        params.dims.zw);
+    // P010 keeps the 10-bit code in the high bits of a 16-bit
+    // word: the read value is the code times 64, and `norm`
+    // expects the code.
+    var shift = 1.0;
+    if (params.info.w & EXT_FLAG_SHIFT6) != 0u {
+        shift = 64.0;
+    }
+    let yn = f32(y4.x) / shift * params.norm.x + params.norm.y;
+    let cbn = f32(c4.x) / shift * params.norm.z + params.norm.w;
+    let crn = f32(c4.y) / shift * params.norm.z + params.norm.w;
+    let encoded = mat3x3<f32>(params.yuv0.xyz, params.yuv1.xyz,
+                              params.yuv2.xyz) * vec3<f32>(yn, cbn, crn);
+    let lin = ext_decode(encoded, params.info.y);
+    let rgb = mat3x3<f32>(params.prim0.xyz, params.prim1.xyz,
+                          params.prim2.xyz) * ext_hlg(lin);
+    return vec4<f32>(rgb, 1.0);
+}
+
 @fragment
 fn fs_external(in: VsOut) -> @location(0) vec4<f32> {
     var cov: f32;
@@ -144,30 +174,7 @@ fn fs_external(in: VsOut) -> @location(0) vec4<f32> {
     var color: vec4<f32>;
     switch params.info.x {
         case KIND_EXT_NV12, KIND_EXT_P010: {
-            // Luma at the pixel's frame coordinate; chroma at the siting-
-            // offset subsampled coordinate: chroma texel j centres at
-            // frame position 2j + 0.5 + s, so texel space is
-            // `p / 2 + 0.25 - s / 2`.
-            let y4 = ext_texel_u32(ext_y, px, params.dims.xy);
-            let c4 = ext_texel_u32(ext_uv,
-                px * 0.5 + vec2<f32>(0.25) - params.site.xy * 0.5,
-                params.dims.zw);
-            // P010 keeps the 10-bit code in the high bits of a 16-bit
-            // word: the read value is the code times 64, and `norm`
-            // expects the code.
-            var shift = 1.0;
-            if (params.info.w & EXT_FLAG_SHIFT6) != 0u {
-                shift = 64.0;
-            }
-            let yn = f32(y4.x) / shift * params.norm.x + params.norm.y;
-            let cbn = f32(c4.x) / shift * params.norm.z + params.norm.w;
-            let crn = f32(c4.y) / shift * params.norm.z + params.norm.w;
-            let encoded = mat3x3<f32>(params.yuv0.xyz, params.yuv1.xyz,
-                                      params.yuv2.xyz) * vec3<f32>(yn, cbn, crn);
-            let lin = ext_decode(encoded, params.info.y);
-            let rgb = mat3x3<f32>(params.prim0.xyz, params.prim1.xyz,
-                                  params.prim2.xyz) * ext_hlg(lin);
-            color = vec4<f32>(rgb, 1.0);
+            color = ext_frame_yuv(px);
         }
         default: {
             // KIND_EXT_RGB.

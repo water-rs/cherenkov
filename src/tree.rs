@@ -1138,15 +1138,32 @@ mod hierarchy_tests {
     fn ownership_filter_keeps_the_sampled_slow_rate() {
         let mut tree = SurfaceTree::new();
         let root = tree.root();
-        tree.apply(LayerOp::ScrollOffset(
-            root,
+        let owned = LayerId::new(1);
+        let slow = LayerId::new(2);
+        for child in [owned, slow] {
+            tree.apply(LayerOp::Create(child));
+            tree.apply(LayerOp::Push {
+                parent: root,
+                child,
+            });
+        }
+        tree.apply(LayerOp::Opacity(
+            slow,
             Prop {
-                target: Vec2::ZERO,
-                animation: Some(Decay::new(Vec2::new(0., 10.)).into()),
+                target: 0.5,
+                animation: Some(Decay::new(Vec2::new(10., 0.)).into()),
+            },
+        ));
+        tree.apply(LayerOp::Transform(
+            owned,
+            Prop {
+                target: Affine::translate((100., 0.)),
+                animation: Some(crate::Curve::linear(std::time::Duration::from_secs(1)).into()),
             },
         ));
         let sampled = tree.sample(Instant::now(), Display::default());
-        assert_eq!(sampled.rate, Some(RATE_SLOW));
+        assert_eq!(sampled.rate, Some(RATE_FAST));
+        assert_eq!(tree.animation_rate(|layer| layer == owned), Some(RATE_SLOW));
         assert_eq!(tree.animation_rate(|_| false), sampled.rate);
         assert_eq!(tree.animation_rate(|_| true), None);
     }

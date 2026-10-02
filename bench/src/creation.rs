@@ -1,6 +1,7 @@
 //! `cherenkov-bench creation` — the issue-#170 B1 creation ledger.
 //!
-//! One [`MemorySnapshot`] per engine-creation boundary: the empty
+//! One [`MemorySnapshot`] and a wall-clock `elapsed_ms` timestamp per
+//! engine-creation boundary: the empty
 //! process, then every [`CreationPhase`] the engine reports (instance,
 //! adapter, device, layouts, modules, each pipeline family, buffers,
 //! atlas, bind groups, timestamp resources), then the bench-side phases —
@@ -14,6 +15,7 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use cherenkov::kurbo::Rect;
 use cherenkov::{Draw as _, Engine, FrameTime, Offscreen, OffscreenFormat, WorkingColor};
@@ -36,8 +38,28 @@ struct Row {
     /// (`process`, `engine`, `surface`, `first_submission`,
     /// `first_complete`, `teardown_device`, `teardown`).
     phase: String,
+    /// Wall-clock milliseconds from the cycle's `process` baseline to
+    /// this boundary; a phase's duration is the difference between its
+    /// row and the previous row's.
+    elapsed_ms: f64,
     /// Engine, allocator and process memory at the boundary.
     #[serde(flatten)]
+    snapshot: MemorySnapshot,
+}
+
+/// `duration` in fractional milliseconds for [`Row::elapsed_ms`].
+fn millis(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1e3
+}
+
+/// One engine-side boundary the [`cherenkov_gpu::CreationProbe`] collects
+/// before the `Engine` exists, folded into [`Row`]s once creation returns.
+struct ProbeRow {
+    /// The phase that completed.
+    phase: CreationPhase,
+    /// Wall-clock milliseconds from the cycle's `process` baseline.
+    elapsed_ms: f64,
+    /// Memory snapshot at the boundary.
     snapshot: MemorySnapshot,
 }
 
@@ -140,10 +162,11 @@ pub fn parse_phase(name: &str) -> Option<CreationPhase> {
 
 /// One engine create → first frame → drop segment of the ledger.
 /// `shared` and `engine` are owned by the caller; the surface is local so
-/// it releases before them.
+/// it releases before them. `start` is the cycle's `process` baseline.
 fn measure_cycle(
     rows: &mut Vec<Row>,
     cycle: u32,
+    start: Instant,
     shared: &SharedDevice,
     engine: &Engine<Gpu>,
 ) -> Result<crate::DeviceInfo, BenchError> {
@@ -161,6 +184,7 @@ fn measure_cycle(
         rows.push(Row {
             cycle,
             phase: phase.to_string(),
+            elapsed_ms: millis(start.elapsed()),
             snapshot: snapshot(
                 Some(&shared.adapter),
                 Some(&shared.device),
@@ -196,21 +220,23 @@ fn measure_cycle(
 /// from a real failure.
 fn create(
     stop_after: Option<CreationPhase>,
-    collected: &Arc<Mutex<Vec<(CreationPhase, MemorySnapshot)>>>,
+    start: Instant,
+    collected: &Arc<Mutex<Vec<ProbeRow>>>,
     aborted: &Arc<AtomicBool>,
 ) -> Result<(SharedDevice, Engine<Gpu>), cherenkov::EngineError> {
     let probe = cherenkov_gpu::CreationProbe::new({
         let collected = Arc::clone(collected);
         let aborted = Arc::clone(aborted);
         move |point| {
-            collected.lock().expect("creation rows").push((
-                point.phase,
-                snapshot(
+            collected.lock().expect("creation rows").push(ProbeRow {
+                phase: point.phase,
+                elapsed_ms: millis(start.elapsed()),
+                snapshot: snapshot(
                     point.adapter,
                     point.device,
                     Reading::unavailable("engine not yet constructed"),
                 ),
-            ));
+            });
             if Some(point.phase) == stop_after {
                 aborted.store(true, Ordering::Release);
                 return true;
@@ -252,27 +278,31 @@ pub fn run(cycles: u32, stop_after: Option<CreationPhase>, out: &Path) -> Result
     let mut cycle = 0;
     while cycle < cycles {
         // The empty-harness baseline: no GPU state exists in the process.
+        // `start` is the instant every row's `elapsed_ms` counts from.
+        let start = Instant::now();
         rows.push(Row {
             cycle,
             phase: "process".to_string(),
+            elapsed_ms: millis(start.elapsed()),
             snapshot: snapshot(
                 None,
                 None,
                 Reading::unavailable("engine not yet constructed"),
             ),
         });
-        let collected = Arc::new(Mutex::new(Vec::<(CreationPhase, MemorySnapshot)>::new()));
+        let collected = Arc::new(Mutex::new(Vec::<ProbeRow>::new()));
         let aborted = Arc::new(AtomicBool::new(false));
-        let made = create(stop_after, &collected, &aborted);
+        let made = create(stop_after, start, &collected, &aborted);
         rows.extend(
             collected
                 .lock()
                 .expect("creation rows")
                 .drain(..)
-                .map(|(phase, snapshot)| Row {
+                .map(|probe| Row {
                     cycle,
-                    phase: phase_name(phase).to_string(),
-                    snapshot,
+                    phase: phase_name(probe.phase).to_string(),
+                    elapsed_ms: probe.elapsed_ms,
+                    snapshot: probe.snapshot,
                 }),
         );
         let (shared, engine) = match made {
@@ -285,7 +315,7 @@ pub fn run(cycles: u32, stop_after: Option<CreationPhase>, out: &Path) -> Result
                 return Err(BenchError::Gpu(format!("cherenkov engine: {error}")));
             }
         };
-        device_info = measure_cycle(&mut rows, cycle, &shared, &engine)?;
+        device_info = measure_cycle(&mut rows, cycle, start, &shared, &engine)?;
         drop(engine);
         // The renderer is gone; the shared device still lets the
         // allocator report what survived the engine's drop.
@@ -293,6 +323,7 @@ pub fn run(cycles: u32, stop_after: Option<CreationPhase>, out: &Path) -> Result
         rows.push(Row {
             cycle,
             phase: "teardown_device".to_string(),
+            elapsed_ms: millis(start.elapsed()),
             snapshot: snapshot(
                 Some(&shared.adapter),
                 Some(&shared.device),
@@ -303,6 +334,7 @@ pub fn run(cycles: u32, stop_after: Option<CreationPhase>, out: &Path) -> Result
         rows.push(Row {
             cycle,
             phase: "teardown".to_string(),
+            elapsed_ms: millis(start.elapsed()),
             snapshot: snapshot(None, None, Reading::unavailable("engine dropped")),
         });
         cycle += 1;

@@ -43,7 +43,7 @@ pub struct Observation {
     pub domain: Option<Domain>,
     pub density: f64,
     pub quiet_frames: u64,
-    /// Admission must outlast every previously observed content lifetime.
+    /// Admission must outlast recently observed periodic content changes.
     pub quiet_required: u64,
     pub capture: Option<Capture>,
 }
@@ -73,7 +73,14 @@ impl Observation {
 
     /// Invalidate pixels while retaining the observed content lifetime.
     pub fn change(&mut self, stamp: u64, resources: (u64, u64)) {
-        self.quiet_required = self.quiet_required.max(self.quiet_frames.saturating_add(1));
+        // A lifetime longer than two admission intervals is evidence that
+        // the previous churn ended. Forget that backoff; otherwise track
+        // the recent period rather than taking a maximum over all history.
+        self.quiet_required = if self.quiet_frames > self.quiet_required.saturating_mul(2) {
+            2
+        } else {
+            self.quiet_frames.saturating_add(1).max(2)
+        };
         self.stamp = stamp;
         self.resources = resources;
         self.quiet_frames = 0;
@@ -329,6 +336,23 @@ pub fn domain(
 #[cfg(test)]
 mod tests {
     use super::Observation;
+
+    #[test]
+    fn long_static_lifetime_does_not_delay_readmission() {
+        for resources_changed in [false, true] {
+            let mut entry = Observation::new(1, (0, 0));
+            for _ in 0..1000 {
+                entry.observe(1, (0, 0), 1.);
+            }
+            let (stamp, resources) = if resources_changed {
+                (1, (1, 0))
+            } else {
+                (2, (0, 0))
+            };
+            assert!(!entry.observe(stamp, resources, 1.));
+            assert!(entry.observe(stamp, resources, 1.));
+        }
+    }
 
     #[test]
     fn capture_domain_rejects_invalid_density_and_origin() {

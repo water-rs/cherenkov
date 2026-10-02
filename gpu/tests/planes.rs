@@ -338,6 +338,11 @@ mod macos {
         displays_matching(layer, &|display| !probing(display))
     }
 
+    /// Every probing display layer under `layer`.
+    fn probes(layer: &CALayer) -> Vec<Retained<AVSampleBufferDisplayLayer>> {
+        displays_matching(layer, &probing)
+    }
+
     /// Drives the main run loop until `done`, or fails once `deadline`
     /// passes.
     fn drive(deadline: Instant, done: &dyn Fn() -> bool, what: &dyn Fn() -> String) {
@@ -670,13 +675,11 @@ mod macos {
 
         /// The frames a window produces while a candidate is attached and
         /// promoted: the first render composites it in-engine —
-        /// asserted, the pending contract — the attach block's
-        /// completion wake is the drain's done signal, and once the
-        /// platform reports the probe ready and its notification has
-        /// bounced the flag back, a render promotes it. The loop turns
-        /// the run loop and re-renders until that lands, bounded so a
-        /// host that never makes a display ready keeps the engine path
-        /// and reports `false`.
+        /// asserted, the pending contract — the attach block's completion
+        /// wake is the drain's done signal, the probe's `readyForDisplay`
+        /// flip is the platform's own report, and its change notification
+        /// bounces the flag back through a second wake that promotes the
+        /// candidate on the next render.
         fn promote(&self) -> bool {
             drain_main();
             self.woke.store(false, Ordering::Relaxed);
@@ -685,14 +688,39 @@ mod macos {
                 displays(&self.root()).is_empty(),
                 "the pending candidate stays engine-composited"
             );
+            // The parts reply queued ahead of the attach can claim the
+            // first wake: attach is done once its probe sits beside the
+            // root — the hierarchy state `readyForDisplay` requires.
             settle_flag(&self.woke, "the queued attach never completed");
-            let deadline = Instant::now() + Duration::from_secs(10);
-            // SAFETY: the mode is an immutable static.
-            let mode = unsafe { kCFRunLoopDefaultMode };
-            while displays(&self.root()).is_empty() && Instant::now() < deadline {
-                CFRunLoop::run_in_mode(mode, 0.005, true);
+            drive(
+                Instant::now() + Duration::from_secs(10),
+                &|| !probes(&self.host()).is_empty(),
+                &|| "the queued attach never parked a probe".into(),
+            );
+            // Readiness is the platform's asynchronous signal: drive the
+            // run loop until the probe itself reports it, failing out
+            // loud if this host never makes a display ready.
+            drive(
+                Instant::now() + Duration::from_secs(10),
+                &|| {
+                    let probes = probes(&self.host());
+                    !probes.is_empty() && probes.iter().all(|d| unsafe { d.isReadyForDisplay() })
+                },
+                &|| "the probe never became ready for display".into(),
+            );
+            self.woke.store(false, Ordering::Relaxed);
+            // The notification's bounce re-reads the flag on main and
+            // wakes the loop — post-attach, that is the only wake still
+            // owed. A drain lands it if it is already queued; if the
+            // render still cannot promote, the wake is still in flight.
+            drain_main();
+            self.engine.render(FrameTime::now()).expect("rendered");
+            drain_main();
+            if displays(&self.root()).is_empty() {
+                settle_flag(&self.woke, "the readiness wake never landed");
                 drain_main();
                 self.engine.render(FrameTime::now()).expect("rendered");
+                drain_main();
             }
             drain_main();
             settle(&self.host());

@@ -20,13 +20,6 @@
 	<string>1</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
-	<!-- Documents/ is reachable from Files.app, Finder file sharing and
-	     devicectl appDataContainer copies — that is how bench-args.json,
-	     scenes/ and out/ get on and off the device. -->
-	<key>UIFileSharingEnabled</key>
-	<true/>
-	<key>LSSupportsOpeningDocumentsInPlace</key>
-	<true/>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UIApplicationSceneManifest</key>

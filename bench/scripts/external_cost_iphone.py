@@ -3,24 +3,41 @@
 
 Runs on the Mac mini where the phone is attached, through devicectl.
 Several jobs share the phone and the same bundle id, so the device lock
-(`fcntl.flock`) is held for a run's whole cycle — uninstall, install,
+(`fcntl.flock`) is held for one run's whole cycle — uninstall, install,
 push args, launch (always `--terminate-existing`: the app never exits,
 so a plain launch would reuse a stale instance), wait for done, pull —
-and released after the pull.
+and released after the pull. Time blocked on the lock accumulates; past
+15 minutes the driver stops with whatever it has already pulled.
+
+Before the measurement the host writes `Documents/thermal.json` from
+`ProcessInfo.thermalState` and does not run the bench unless the state
+is nominal or fair. A serious or critical reading ends that launch, the
+lock is released, and the driver waits outside the lock until the next
+probe. iOS has no host-side thermal query, so the probe is that launch.
 
 iOS carries the same matrix minus `--energy` (the meter is ODPM/
 powermetrics only) and `--cpu` (affinity is Linux/Android only).
+
+A pull is accepted only when `done.json`'s args are this launch's
+(they carry the run id), the log contains that id, and the report is
+the `external-cost` cell this binary was installed to measure.
 
 Raw reports land in `--out-dir`, never in git.
 """
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import pathlib
+import shutil
 import subprocess
+import sys
+import threading
 import time
+import traceback
+import uuid
 
 UDID = "00008140-001845681E98801C"
 LOCK = "/tmp/device-locks/00008140-001845681E98801C.lock"
@@ -35,152 +52,444 @@ ORDERS = [("e", "c", "e", "c"), ("c", "e", "c", "e")]
 FRAMES = 240
 WARMUP = 30
 RATE = 120
+LOCK_BUDGET_S = 15 * 60
+COOL_LIMIT_S = 300
+COOL_GAP_S = 15
+OK_THERMAL = ("nominal", "fair")
+
+# Seconds spent blocked in flock across the process.
+lock_waited = 0.0
 
 
-def run(cmd):
-    return subprocess.run(cmd, capture_output=True, text=True)
+class LockBudget(Exception):
+    """Cumulative time blocked on the device lock passed 15 minutes."""
 
 
-class Lock:
-    """fcntl.flock over the iPhone's device-lock file."""
+class ThermalTimeout(Exception):
+    """The phone stayed above fair for the cool-down limit."""
 
-    def __enter__(self):
-        self.f = open(LOCK, "w")
-        fcntl.flock(self.f, fcntl.LOCK_EX)
-        return self
 
-    def __exit__(self, *exc):
-        fcntl.flock(self.f, fcntl.LOCK_UN)
-        self.f.close()
+def run(cmd, timeout=180):
+    return subprocess.run(
+        cmd, capture_output=True, text=True, timeout=timeout, check=False
+    )
 
 
 def devicectl(*args):
-    r = run(["xcrun", "devicectl", *args])
-    if r.returncode != 0:
-        raise RuntimeError(f"devicectl {args}: {r.stderr or r.stdout}")
-    return r.stdout
+    result = run(["xcrun", "devicectl", *args])
+    if result.returncode != 0:
+        raise RuntimeError(
+            "devicectl {} failed: {}".format(args, result.stderr or result.stdout)
+        )
+    return result.stdout
 
 
-def wait_done(dest, launched_at, want_args):
-    """Copy Documents/out when a fresh done.json exists; retry to the
-    timeout. Freshness is proven by the recorded args matching and by
-    run-0.log's first tracing timestamp at/after the launch instant."""
-    deadline = time.time() + 300
-    while time.time() < deadline:
-        r = run([
-            "xcrun", "devicectl", "device", "copy", "from",
-            "--device", UDID, "--domain-type", "appDataContainer",
-            "--domain-identifier", BUNDLE,
-            "--source", "Documents/out", "--destination", str(dest),
-        ])
-        done = dest / "done.json"
-        log = dest / "run-0.log"
-        if r.returncode == 0 and done.exists() and log.exists():
+def copy_from(source, dest):
+    """Copy `source` from the app container into a fresh directory.
+
+    devicectl copies the contents of a Documents path without the
+    Documents/ wrapper, so a directory source lands its children in
+    `dest`. Returns False when the source is not there yet.
+    """
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.mkdir(parents=True)
+    result = run([
+        "xcrun", "devicectl", "device", "copy", "from",
+        "--device", UDID, "--domain-type", "appDataContainer",
+        "--domain-identifier", BUNDLE,
+        "--source", source, "--destination", str(dest),
+    ])
+    return result.returncode == 0
+
+
+def find_named(root, name):
+    direct = root / name
+    if direct.is_file():
+        return direct
+    matches = [path for path in root.rglob(name) if path.is_file()]
+    if not matches:
+        return None
+    return min(matches, key=lambda path: len(path.parts))
+
+
+def uninstall():
+    result = run([
+        "xcrun", "devicectl", "device", "uninstall", "app",
+        "--device", UDID, BUNDLE,
+    ])
+    if result.returncode == 0:
+        return
+    blob = (result.stderr or "") + (result.stdout or "")
+    lowered = blob.lower()
+    if "not installed" in lowered or "could not find" in lowered or "not found" in lowered:
+        return
+    raise RuntimeError("devicectl uninstall failed: {}".format(blob))
+
+
+class Lock:
+    """Exclusive flock. The blocked time counts toward the 15-minute budget."""
+
+    def __enter__(self):
+        global lock_waited
+        self.held = False
+        self.f = open(LOCK, "a+")
+        remaining = LOCK_BUDGET_S - lock_waited
+        if remaining <= 0:
+            self.f.close()
+            raise LockBudget(
+                "lock wait already {:.0f}s".format(lock_waited)
+            )
+        started = time.monotonic()
+        acquired = threading.Event()
+
+        def grab():
             try:
-                d = json.loads(done.read_text())
-                fresh_args = d["results"][0]["args"] == want_args
-                fresh_ts = (
-                    log.read_text(errors="replace").splitlines()[0][:27]
-                    >= launched_at
-                )
-                if fresh_args and fresh_ts:
-                    return
-            except (OSError, KeyError, IndexError, json.JSONDecodeError):
-                pass
-        time.sleep(4)
-    raise RuntimeError(f"timeout waiting for done.json in {dest}")
+                fcntl.flock(self.f, fcntl.LOCK_EX)
+            except OSError:
+                return
+            acquired.set()
+
+        threading.Thread(target=grab, daemon=True).start()
+        ok = acquired.wait(remaining)
+        waited = time.monotonic() - started
+        lock_waited += waited
+        if not ok:
+            raise LockBudget(
+                "lock wait {:.0f}s exceeds 15 min".format(lock_waited)
+            )
+        if lock_waited > LOCK_BUDGET_S:
+            fcntl.flock(self.f, fcntl.LOCK_UN)
+            self.f.close()
+            raise LockBudget(
+                "lock wait {:.0f}s exceeds 15 min".format(lock_waited)
+            )
+        self.held = True
+        print(
+            "lock acquired after {:.1f}s (cumulative {:.1f}s)".format(
+                waited, lock_waited
+            ),
+            flush=True,
+        )
+        return self
+
+    def __exit__(self, *exc):
+        if self.held:
+            fcntl.flock(self.f, fcntl.LOCK_UN)
+            self.f.close()
+            self.held = False
+
+
+def cdhash(app):
+    result = run(["codesign", "-dvvv", app])
+    blob = result.stderr + result.stdout
+    for line in blob.splitlines():
+        if line.startswith("CDHash="):
+            return line.split("=", 1)[1].strip()
+    raise RuntimeError("codesign reported no CDHash for {}".format(app))
+
+
+def exe_sha256(app):
+    path = pathlib.Path(app) / "CherenkovBench"
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    return digest
+
+
+def wait_file(source, name, timeout, predicate):
+    """Poll `source` until `name` appears and `predicate` accepts it."""
+    deadline = time.monotonic() + timeout
+    scratch = pathlib.Path("/tmp/external-cost-iphone/.pull-{}".format(name))
+    last = None
+    while time.monotonic() < deadline:
+        if copy_from(source, scratch):
+            found = find_named(scratch, name)
+            if found is not None:
+                try:
+                    if predicate(found):
+                        return found.read_bytes()
+                except (OSError, json.JSONDecodeError, KeyError, IndexError, AssertionError) as exc:
+                    last = exc
+        time.sleep(2)
+    raise RuntimeError(
+        "timeout waiting for {} ({})".format(name, last)
+    )
 
 
 def verify(report_path, size, transfer, path):
-    """The pulled report must come from this build's `external-cost`
-    run — fields only that subcommand writes, at the right cell."""
-    r = json.loads(pathlib.Path(report_path).read_text())
+    """The pulled report is this build's `external-cost` cell."""
+    report = json.loads(pathlib.Path(report_path).read_text())
     want_path = {"e": "external", "c": "copy-convert"}[path]
     want_layout = {"sdr": "nv12", "pq": "p010"}[transfer]
-    assert r["path"] == want_path, r["path"]
-    assert r["layout"] == want_layout, r["layout"]
-    assert r["transfer"] == f"bt{'709-sdr' if transfer == 'sdr' else '2020-pq'}"
-    assert (r["width"], r["height"]) == (
-        {"1080p": (1920, 1080), "4k": (3840, 2160)}[size]
+    assert report["path"] == want_path, report["path"]
+    assert report["layout"] == want_layout, report["layout"]
+    assert report["transfer"] == "bt{}-{}".format(
+        "709" if transfer == "sdr" else "2020",
+        "sdr" if transfer == "sdr" else "pq",
+    ), report["transfer"]
+    assert (report["width"], report["height"]) == {
+        "1080p": (1920, 1080),
+        "4k": (3840, 2160),
+    }[size]
+    assert report["measured_frames"] == FRAMES
+    assert len(report["samples"]) == FRAMES, len(report["samples"])
+    assert report["total_seconds"], "no per-frame gpu total"
+    assert any(sample["gpu_seconds"] is not None for sample in report["samples"]), (
+        "no gpu timestamps"
     )
-    assert r["samples"], "no per-frame samples"
-    return r
+    if path == "c":
+        assert any(
+            sample["handoff_seconds"] is not None for sample in report["samples"]
+        ), "path c recorded no handoff stamps"
+    assert str(report["backend"]).lower() == "metal", report["backend"]
+    assert "apple" in report["adapter"].lower(), report["adapter"]
+    return report
 
 
-def one_run(app, path, size, transfer, rep, out_dir):
-    name = f"{size}-{transfer}-{path}-{rep}"
-    remote = f"Documents/out/ext-{name}.json"
+def cycle(app, path, size, transfer, rep, order_name, run_id, out_dir, identity):
+    """One locked cycle. Returns ("ok", row) or ("hot", state)."""
+    name = "{}-{}-{}-{}".format(size, transfer, path, rep)
+    remote = "Documents/out/ext-{}-{}.json".format(name, run_id)
     args = [
         "external-cost", "--path", path, "--size", size,
         "--transfer", transfer, "--frames", str(FRAMES),
         "--warmup", str(WARMUP), "--rate", str(RATE),
         "--out", remote,
     ]
-    dest = out_dir / f"run-{name}"
-    with Lock():
-        print(f"[{size}/{transfer} rep{rep}] path {path} — lock held", flush=True)
-        # Another job may have installed its own dev.cherenkov.bench —
-        # uninstall first so install() provably lands this binary.
-        devicectl("device", "uninstall", "app", "--device", UDID, BUNDLE)
-        devicectl("device", "install", "app", "--device", UDID, app)
-
-        args_file = out_dir / "bench-args.json"
-        args_file.write_text(json.dumps([args]))
-        devicectl(
-            "device", "copy", "to", "--device", UDID,
-            "--domain-type", "appDataContainer",
-            "--domain-identifier", BUNDLE,
-            "--source", str(args_file),
-            "--destination", "Documents/bench-args.json",
-        )
-        # Read back: a stale args file is the silent wrong-suite failure.
-        back = out_dir / "args-readback.json"
-        devicectl(
-            "device", "copy", "from", "--device", UDID,
-            "--domain-type", "appDataContainer",
-            "--domain-identifier", BUNDLE,
-            "--source", "Documents/bench-args.json",
-            "--destination", str(back),
-        )
-        if back.read_text() != args_file.read_text():
-            raise RuntimeError("bench-args.json readback mismatch")
-
-        launched_at = time.strftime("%Y-%m-%dT%H:%M:%S.", time.gmtime())
-        devicectl(
-            "device", "process", "launch",
-            "--terminate-existing", "--device", UDID, BUNDLE,
-        )
-        wait_done(dest, launched_at, args)
-    report = verify(dest / f"ext-{name}.json", size, transfer, path)
     print(
-        f"    done — lock released; gpu p50 {report['composite_seconds'][0]*1e3:.2f} ms",
+        "[{}/{} {} rep{}] path {} run {} — installing".format(
+            size, transfer, order_name, rep, path, run_id
+        ),
         flush=True,
     )
-    return report
+    uninstall()
+    devicectl("device", "install", "app", "--device", UDID, app)
+
+    args_file = out_dir / "bench-args.json"
+    args_file.write_text(json.dumps([args]))
+    devicectl(
+        "device", "copy", "to", "--device", UDID,
+        "--domain-type", "appDataContainer",
+        "--domain-identifier", BUNDLE,
+        "--source", str(args_file),
+        "--destination", "Documents/bench-args.json",
+    )
+    back_dir = out_dir / ".args-back"
+    if not copy_from("Documents/bench-args.json", back_dir):
+        raise RuntimeError("bench-args.json readback copy failed")
+    back = find_named(back_dir, "bench-args.json")
+    if back is None or json.loads(back.read_text()) != [args]:
+        raise RuntimeError("bench-args.json readback mismatch")
+
+    stale = out_dir / ".thermal-stale"
+    if copy_from("Documents/thermal.json", stale) and find_named(stale, "thermal.json"):
+        raise RuntimeError("stale thermal.json survived uninstall")
+
+    launched_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    devicectl(
+        "device", "process", "launch",
+        "--terminate-existing", "--device", UDID, BUNDLE,
+    )
+
+    thermal_bytes = wait_file(
+        "Documents/thermal.json",
+        "thermal.json",
+        60,
+        lambda path: "state" in json.loads(path.read_text()),
+    )
+    thermal = json.loads(thermal_bytes.decode())["state"]
+    print("    thermal {}".format(thermal), flush=True)
+    if thermal not in OK_THERMAL:
+        wait_file(
+            "Documents/out/done.json",
+            "done.json",
+            45,
+            lambda path: json.loads(path.read_text()).get("thermal") == thermal,
+        )
+        uninstall()
+        return ("hot", thermal)
+
+    def done_ok(path):
+        done = json.loads(path.read_text())
+        row = done["results"][0]
+        return row["args"] == args and row["exit_code"] == 0
+
+    run_dir = out_dir / "run-{}-{}".format(name, run_id)
+    scratch = out_dir / ".out-pull"
+    deadline = time.monotonic() + 300
+    pulled = None
+    while time.monotonic() < deadline:
+        if copy_from("Documents/out", scratch):
+            done = find_named(scratch, "done.json")
+            log = find_named(scratch, "run-0.log")
+            report_file = find_named(scratch, "ext-{}-{}.json".format(name, run_id))
+            if (
+                done is not None
+                and log is not None
+                and report_file is not None
+                and done_ok(done)
+                and run_id in log.read_text(errors="replace")
+            ):
+                if run_dir.exists():
+                    shutil.rmtree(run_dir)
+                shutil.copytree(scratch, run_dir)
+                pulled = run_dir
+                break
+        time.sleep(2)
+    if pulled is None:
+        names = []
+        if scratch.exists():
+            names = sorted(
+                item.name for item in scratch.rglob("*") if item.is_file()
+            )
+        raise RuntimeError(
+            "timeout waiting for done.json run {}; pulled {}".format(run_id, names)
+        )
+
+    report_path = find_named(pulled, "ext-{}-{}.json".format(name, run_id))
+    report = verify(report_path, size, transfer, path)
+    accept = {
+        "run_id": run_id,
+        "launched_at_utc": launched_at,
+        "thermal": thermal,
+        "cdhash": identity["cdhash"],
+        "exe_sha256": identity["exe_sha256"],
+        "args": args,
+        "adapter": report["adapter"],
+        "backend": report["backend"],
+    }
+    (pulled / "accept.json").write_text(json.dumps(accept, indent=2))
+    gpu = report["total_seconds"]
+    print(
+        "    accepted {} thermal {} gpu p50 {:.2f} ms".format(
+            run_id, thermal, gpu[0] * 1e3
+        ),
+        flush=True,
+    )
+    return ("ok", {
+        "cell": "{}/{}".format(size, transfer),
+        "path": path,
+        "order": order_name,
+        "rep": rep,
+        "run_id": run_id,
+        "thermal": thermal,
+        "dir": run_dir.name,
+        "gpu_p50_s": gpu[0],
+        "gpu_p99_s": gpu[2],
+    })
+
+
+def one_run(app, path, size, transfer, rep, order_name, out_dir, identity):
+    """Thermal-gated run. Retries once on an operational failure."""
+    last = None
+    for attempt in (1, 2):
+        run_id = uuid.uuid4().hex[:12]
+        cool_start = None
+        try:
+            while True:
+                with Lock():
+                    kind, payload = cycle(
+                        app, path, size, transfer, rep, order_name,
+                        run_id, out_dir, identity,
+                    )
+                if kind == "ok":
+                    return payload
+                if cool_start is None:
+                    cool_start = time.monotonic()
+                elapsed = time.monotonic() - cool_start
+                if elapsed > COOL_LIMIT_S:
+                    raise ThermalTimeout(
+                        "thermal stayed {} for {:.0f}s".format(payload, elapsed)
+                    )
+                print(
+                    "    thermal {}; cooling {:.0f}s outside the lock".format(
+                        payload, elapsed
+                    ),
+                    flush=True,
+                )
+                time.sleep(COOL_GAP_S)
+        except (LockBudget, ThermalTimeout):
+            raise
+        except Exception as exc:
+            last = exc
+            print(
+                "    attempt {} failed: {}".format(attempt, exc),
+                flush=True,
+            )
+    raise last
+
+
+def write_status(path, payload):
+    payload["lock_wait_s"] = round(lock_waited, 1)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, indent=2))
+    tmp.replace(path)
+
+
+def signal_done(out_dir, state):
+    fifo = out_dir / "done.fifo"
+    try:
+        fd = os.open(str(fifo), os.O_WRONLY | os.O_NONBLOCK)
+    except OSError:
+        return
+    try:
+        os.write(fd, (state + "\n").encode())
+    finally:
+        os.close(fd)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--app", default=os.path.expanduser(DEFAULT_APP))
     parser.add_argument("--out-dir", default="/tmp/external-cost-iphone")
+    parser.add_argument("--head", default="unknown")
     args = parser.parse_args()
     out_dir = pathlib.Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-
+    identity = {"cdhash": cdhash(args.app), "exe_sha256": exe_sha256(args.app)}
+    print(
+        "binary {} {}".format(identity["cdhash"], identity["exe_sha256"][:16]),
+        flush=True,
+    )
+    status_path = out_dir / "status.json"
     results = []
-    for size, transfer in CELLS:
-        for order in ORDERS:
-            for rep, path in enumerate(order):
-                r = one_run(args.app, path, size, transfer, rep, out_dir)
-                results.append({"cell": f"{size}/{transfer}", "path": path,
-                                "order": "abab" if order == ORDERS[0] else "baba",
-                                "rep": rep, "report": name_of(r)})
-    (out_dir / "summary.json").write_text(json.dumps(results, indent=2))
-    print("matrix complete")
-
-
-def name_of(r):
-    return r["path"]
+    status = {
+        "state": "running",
+        "reason": "",
+        "head": args.head,
+        "cdhash": identity["cdhash"],
+        "exe_sha256": identity["exe_sha256"],
+        "results": results,
+    }
+    write_status(status_path, status)
+    code = 0
+    try:
+        for size, transfer in CELLS:
+            for order in ORDERS:
+                order_name = "abab" if order == ORDERS[0] else "baba"
+                for rep, path in enumerate(order):
+                    row = one_run(
+                        args.app, path, size, transfer, rep,
+                        order_name, out_dir, identity,
+                    )
+                    results.append(row)
+                    status["results"] = results
+                    write_status(status_path, status)
+        status["state"] = "complete"
+    except LockBudget as exc:
+        code = 2
+        status["state"] = "stopped"
+        status["reason"] = str(exc)
+        print("stopped: {}".format(exc), flush=True)
+    except Exception as exc:
+        code = 1
+        status["state"] = "failed"
+        status["reason"] = str(exc)
+        traceback.print_exc()
+    status["results"] = results
+    write_status(status_path, status)
+    signal_done(out_dir, status["state"])
+    print("matrix {}".format(status["state"]), flush=True)
+    sys.exit(code)
 
 
 if __name__ == "__main__":

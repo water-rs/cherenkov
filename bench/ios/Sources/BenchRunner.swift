@@ -33,10 +33,52 @@ struct BenchRunner {
         self.delegate = delegate
     }
 
+    /// `ProcessInfo.thermalState` as the words the device gate uses.
+    static func thermalStateWord() -> String {
+        switch ProcessInfo.processInfo.thermalState {
+        case .nominal:
+            return "nominal"
+        case .fair:
+            return "fair"
+        case .serious:
+            return "serious"
+        case .critical:
+            return "critical"
+        @unknown default:
+            return "unknown"
+        }
+    }
+
     /// The overall exit code: the first non-zero run's, else 0.
     func runAll() -> Int32 {
         let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        // Outside `out`: the reset below deletes `out`, and the driver
+        // reads this before the measurement exists.
+        let thermal = Self.thermalStateWord()
+        let thermalURL = documents.appendingPathComponent("thermal.json")
+        guard Self.writeJSON(["state": thermal], to: thermalURL) else {
+            logger.error("cannot write \(thermalURL.path, privacy: .public)")
+            return 1
+        }
+        logger.info("thermal \(thermal, privacy: .public)")
         let outDir = documents.appendingPathComponent("out", isDirectory: true)
+        if thermal != "nominal" && thermal != "fair" {
+            do {
+                if FileManager.default.fileExists(atPath: outDir.path) {
+                    try FileManager.default.removeItem(at: outDir)
+                }
+                try FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
+            } catch {
+                logger.error("cannot reset \(outDir.path, privacy: .public): \(error)")
+                return 1
+            }
+            _ = Self.writeDone(
+                ["error": "thermal \(thermal)", "thermal": thermal, "results": [Any]()],
+                to: outDir
+            )
+            report { $0.benchRunner(self, didFailWithError: "thermal \(thermal)") }
+            return 1
+        }
         // `out` holds this launch's results only: a `done.json` left by an
         // earlier launch would read as this one having finished.
         do {
@@ -139,19 +181,27 @@ struct BenchRunner {
     }
 
     @discardableResult
-    static func writeDone(_ object: [String: Any], to outDir: URL) -> Bool {
-        let url = outDir.appendingPathComponent("done.json")
+    static func writeJSON(_ object: [String: Any], to url: URL) -> Bool {
         do {
             let data = try JSONSerialization.data(
                 withJSONObject: object,
                 options: [.prettyPrinted, .sortedKeys]
             )
             try data.write(to: url, options: .atomic)
-            logger.info("wrote \(url.path, privacy: .public)")
             return true
         } catch {
             logger.error("cannot write \(url.path, privacy: .public): \(error)")
             return false
         }
+    }
+
+    @discardableResult
+    static func writeDone(_ object: [String: Any], to outDir: URL) -> Bool {
+        let url = outDir.appendingPathComponent("done.json")
+        let ok = writeJSON(object, to: url)
+        if ok {
+            logger.info("wrote \(url.path, privacy: .public)")
+        }
+        return ok
     }
 }

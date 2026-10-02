@@ -694,6 +694,30 @@ impl ExternalFrame {
         })
     }
 
+    /// The frame's alpha contract: `Rgb` planes declare theirs; YUV
+    /// planes and an opaque sampler conversion decode to full opacity.
+    #[must_use]
+    #[cfg_attr(
+        not(all(unix, not(target_vendor = "apple"))),
+        expect(
+            clippy::missing_const_for_fn,
+            reason = "the Native arm reads through an Arc, which cannot be const"
+        )
+    )]
+    pub fn alpha(&self) -> RgbAlpha {
+        match &self.planes {
+            FramePlanes::Yuv { .. } => RgbAlpha::Opaque,
+            FramePlanes::Rgb { alpha, .. } => *alpha,
+            #[cfg(all(unix, not(target_vendor = "apple")))]
+            FramePlanes::Native(frame) => match frame.repr() {
+                vulkan::Repr::Rgb { .. } => frame.generation.alpha,
+                vulkan::Repr::Planes { .. } | vulkan::Repr::ExternalFormat { .. } => {
+                    RgbAlpha::Opaque
+                }
+            },
+        }
+    }
+
     /// A frame imported natively on the engine's Vulkan device.
     ///
     /// `frame` must come from a [`vulkan::Device`] created over the same

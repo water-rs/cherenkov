@@ -69,7 +69,7 @@ pub struct LayerNode {
     /// recorded commands may paint a pixel of alpha below one, so the
     /// layer's output is not known to be opaque. Installed content —
     /// a `GpuContent` or external frame the engine does not record —
-    /// counts as translucent, its alpha unknowable.
+    /// counts by the alpha contract the producer declared at install.
     content_translucent: bool,
     parent: Option<LayerId>,
     transform_track: Option<Track<Affine>>,
@@ -476,12 +476,13 @@ impl SurfaceTree {
 
     /// Records installed render-side content (`Op::Install`,
     /// `Op::ExternalFrame`) replacing what the layer drew: no recorded
-    /// groups remain, but the installed pixels' alpha is the producer's
-    /// to declare, so the layer is not known to be opaque.
-    pub(crate) fn note_installed(&mut self, id: LayerId) {
+    /// groups remain, and the installed pixels' alpha is the producer's
+    /// to declare — `opaque` is that declaration, `false` where the
+    /// producer declares none, so the layer is not known to be opaque.
+    pub(crate) fn note_installed(&mut self, id: LayerId, opaque: bool) {
         let node = self.node_mut(id);
         node.content_blends = false;
-        node.content_translucent = true;
+        node.content_translucent = !opaque;
     }
 
     /// Every layer in the tree. Order is unspecified.
@@ -1042,6 +1043,30 @@ mod hierarchy_tests {
 
         tree.remove(second_child);
         assert!(!tree.layer(first_parent).blends_within());
+    }
+
+    /// An installed frame's declared alpha decides `content_translucent`:
+    /// an opaque frame keeps the layer's coverage provable — a second
+    /// opaque video above a promoted one does not block it (#90) — while
+    /// a producer that declares no opacity leaves the layer translucent.
+    #[test]
+    fn note_installed_counts_the_frames_declared_opacity() {
+        let mut tree = tree();
+        tree.note_installed(LayerId::new(1), true);
+        assert!(!tree.layer(LayerId::new(1)).content_translucent());
+        tree.note_installed(LayerId::new(2), false);
+        assert!(tree.layer(LayerId::new(2)).content_translucent());
+        // Recorded content replaces the install: its own analysis takes over.
+        let picture = Picture::record(|c| {
+            c.fill(
+                Rect::new(0., 0., 8., 8.),
+                WorkingColor::new([0.5, 0.5, 0.5, 0.5]),
+            );
+        });
+        tree.note_content(LayerId::new(1), Some(&ContentOp::Picture(picture)));
+        assert!(tree.layer(LayerId::new(1)).content_translucent());
+        tree.note_content(LayerId::new(2), None);
+        assert!(!tree.layer(LayerId::new(2)).content_translucent());
     }
 
     #[test]

@@ -498,6 +498,10 @@ impl Uploads<Rgba16F> for Null {}
 impl crate::ExternalFrames for Null {
     type Frame = ();
 
+    fn frame_opaque(_frame: &()) -> bool {
+        false
+    }
+
     fn set_external_frame(r: &mut NullRenderer, surface: SurfaceId, layer: LayerId, _frame: ()) {
         let _ = r.events.send(Event::ExternalFrame(surface, layer));
     }

@@ -586,18 +586,23 @@ fn commit<B: Backend>(
             }
             Op::Installed(layer) => {
                 state.commits = Commits::Other;
-                state.tree.note_installed(layer);
+                // An arbitrary install declares no alpha contract.
+                state.tree.note_installed(layer, false);
             }
             Op::Install(install) => {
                 state.commits = Commits::Other;
                 install(&mut *renderer);
             }
-            Op::ExternalFrame { layer, install } => {
+            Op::ExternalFrame {
+                layer,
+                opaque,
+                install,
+            } => {
                 // A frame swap is a change like any other — `commits`
                 // still rises from `Clean` — but it is recorded apart, so
                 // a backend with planes can tell a plane-only frame (#90).
                 install(&mut *renderer);
-                state.tree.note_installed(layer);
+                state.tree.note_installed(layer, opaque);
                 state.commits = state.commits.max(Commits::Installs);
                 state.plane_frames.insert(layer);
             }

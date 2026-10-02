@@ -249,6 +249,8 @@ pub enum Op<B: Backend> {
     ExternalFrame {
         /// The layer the frame attaches to.
         layer: LayerId,
+        /// Whether the frame's declared alpha contract is fully opaque.
+        opaque: bool,
         /// The install, applied in order.
         install: ResOp<B>,
     },

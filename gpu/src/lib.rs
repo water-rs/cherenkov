@@ -435,6 +435,9 @@ impl cherenkov::GpuContent for Gpu {
 // `render::external.wgsl`.
 impl cherenkov::ExternalFrames for Gpu {
     type Frame = interop::ExternalFrame;
+    fn frame_opaque(frame: &Self::Frame) -> bool {
+        frame.alpha() == interop::RgbAlpha::Opaque
+    }
     fn set_external_frame(
         r: &mut Self::Renderer,
         surface: cherenkov::SurfaceId,

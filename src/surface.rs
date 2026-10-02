@@ -358,11 +358,13 @@ pub struct ExternalFrameHandle<B: ExternalFrames> {
 impl<B: ExternalFrames> From<ExternalFrameHandle<B>> for LayerContent<B> {
     fn from(handle: ExternalFrameHandle<B>) -> Self {
         let frame = handle.frame;
-        Self::ExternalFrame(ExternalFrameInstall::new(Box::new(
-            move |r, surface, layer| {
+        let opaque = B::frame_opaque(&frame);
+        Self::ExternalFrame(ExternalFrameInstall::new(
+            Box::new(move |r, surface, layer| {
                 B::set_external_frame(r, surface, layer, frame);
-            },
-        )))
+            }),
+            opaque,
+        ))
     }
 }
 
@@ -372,16 +374,20 @@ impl<B: ExternalFrames> From<ExternalFrameHandle<B>> for LayerContent<B> {
 /// records a layer in `plane_frames` only for a real frame swap — an
 /// arbitrary renderer mutation wrapped in [`LayerContent::Install`]
 /// still takes the full path (#90).
-pub struct ExternalFrameInstall<B: Backend>(InstallOp<B>);
+pub struct ExternalFrameInstall<B: Backend> {
+    op: InstallOp<B>,
+    /// Whether the frame's declared alpha contract is fully opaque.
+    opaque: bool,
+}
 
 impl<B: Backend> ExternalFrameInstall<B> {
-    pub(crate) fn new(install: InstallOp<B>) -> Self {
-        Self(install)
+    pub(crate) fn new(op: InstallOp<B>, opaque: bool) -> Self {
+        Self { op, opaque }
     }
 
     /// Runs the install on the render thread.
     pub(crate) fn install(self, renderer: &mut B::Renderer, surface: SurfaceId, layer: LayerId) {
-        (self.0)(renderer, surface, layer);
+        (self.op)(renderer, surface, layer);
     }
 }
 
@@ -1151,6 +1157,7 @@ impl<B: Backend> Surface<B> {
                         let layer = *id;
                         ops.push(Op::ExternalFrame {
                             layer,
+                            opaque: install.opaque,
                             install: Box::new(move |r| {
                                 install.install(r, surface, layer);
                             }),

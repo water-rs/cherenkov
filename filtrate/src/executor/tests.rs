@@ -230,8 +230,12 @@ fn assert_composes<F: Filter>(name: &str, filter: &F) -> Plan {
             panic!("{name} does not compose (filterable={filterable}): {error}")
         });
         for (index, pass) in plan.passes.iter().enumerate() {
-            entry::pass_module(&plan.module, plan.capabilities, index, pass)
-                .unwrap_or_else(|error| panic!("{name} (filterable={filterable}): {error}"));
+            for resized in [false, true] {
+                entry::pass_module(&plan.module, plan.capabilities, index, pass, resized)
+                    .unwrap_or_else(|error| {
+                        panic!("{name} (filterable={filterable}, resized={resized}): {error}")
+                    });
+            }
         }
     }
     Plan::new(filter, true, true, false)
@@ -1138,13 +1142,13 @@ fn frame_output_format<'a>(
     }
 }
 
-fn setup<F: Filter>(gpu: &TestGpu, executor: &mut Executor<F>) {
+fn setup<E: Effect>(gpu: &TestGpu, executor: &mut E) {
     setup_format(gpu, executor, FORMAT, FORMAT);
 }
 
-fn setup_format<F: Filter>(
+fn setup_format<E: Effect>(
     gpu: &TestGpu,
-    executor: &mut Executor<F>,
+    executor: &mut E,
     input_format: wgpu::TextureFormat,
     output_format: wgpu::TextureFormat,
 ) {
@@ -1159,9 +1163,9 @@ fn setup_format<F: Filter>(
 
 /// `setup_format` forcing every format unfilterable — the manual-bilinear
 /// plan on a device that could filter.
-fn setup_unfilterable<F: Filter>(
+fn setup_unfilterable<F: Filter, S: Fn(u32, u32) -> (u32, u32) + 'static>(
     gpu: &TestGpu,
-    executor: &mut Executor<F>,
+    executor: &mut Executor<F, S>,
     input_format: wgpu::TextureFormat,
     output_format: wgpu::TextureFormat,
 ) {
@@ -1745,8 +1749,199 @@ fn gpu_mismatched_sizes_fail_the_frame() {
         ),
         Err(EffectRenderError::SizeMismatch {
             input: (6, 4),
+            expected: (6, 4),
             output: (11, 7),
         })
+    );
+}
+
+#[test]
+fn output_size_defaults_and_chain_policy() {
+    let executor = Executor::new(filters::Brightness(0.0_f32));
+    assert_eq!(executor.output_size(6, 4), (6, 4));
+    let executor = executor
+        .with_output_size(|width, height| (width * 2, height * 3))
+        .then(filters::Contrast(1.0_f32));
+    assert_eq!(executor.output_size(6, 4), (12, 12));
+}
+
+#[test]
+#[should_panic(expected = "effect declared a zero output dimension")]
+fn output_size_rejects_zero_dimensions() {
+    Executor::new(filters::Brightness(0.0_f32))
+        .with_output_size(|_, height| (0, height))
+        .output_size(6, 4);
+}
+
+#[test]
+fn gpu_declared_output_size_maps_the_whole_input() {
+    let gpu = create_test_device();
+    let mut executor = Executor::new(filters::Brightness(0.0_f32))
+        .with_output_size(|width, height| (width * 2, height * 3));
+    setup(&gpu, &mut executor);
+    let pixels = [
+        255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+    ];
+    let input = upload(&gpu, (2, 2), &pixels);
+    let size = executor.output_size(2, 2);
+    let target = texture(
+        &gpu,
+        size,
+        wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+    );
+    executor
+        .render(
+            &frame_input(
+                &gpu,
+                &input,
+                (2, 2),
+                Duration::ZERO,
+                ShapeTextures::default(),
+            ),
+            &frame_output(&gpu, &target, size),
+        )
+        .expect("declared output size renders");
+    let actual = readback_rgba8_image(&gpu, &target, size);
+    let mut expected = Vec::new();
+    for y in 0..6 {
+        for x in 0..4 {
+            let start = ((y / 3) * 2 + x / 2) * 4;
+            expected.extend_from_slice(&pixels[start..start + 4]);
+        }
+    }
+    assert_eq!(
+        actual, expected,
+        "every output pixel maps into the captured input"
+    );
+    let wrong = texture(&gpu, (2, 2), wgpu::TextureUsages::RENDER_ATTACHMENT);
+    assert_eq!(
+        executor.render(
+            &frame_input(
+                &gpu,
+                &input,
+                (2, 2),
+                Duration::ZERO,
+                ShapeTextures::default()
+            ),
+            &frame_output(&gpu, &wrong, (2, 2)),
+        ),
+        Err(EffectRenderError::SizeMismatch {
+            input: (2, 2),
+            expected: size,
+            output: (2, 2),
+        })
+    );
+}
+
+#[test]
+fn gpu_declared_output_size_preserves_spatial_sampling() {
+    let gpu = create_test_device();
+    let input = upload(
+        &gpu,
+        (4, 1),
+        &[
+            255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+        ],
+    );
+    for filterable in [true, false] {
+        let mut executor = Executor::new(filters::Brightness(0.0_f32).then(SampleHalf))
+            .with_output_size(|width, height| (width / 2, height));
+        if filterable {
+            setup(&gpu, &mut executor);
+        } else {
+            setup_unfilterable(&gpu, &mut executor, FORMAT, FORMAT);
+        }
+        let size = executor.output_size(4, 1);
+        let target = texture(
+            &gpu,
+            size,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        executor
+            .render(
+                &frame_input(
+                    &gpu,
+                    &input,
+                    (4, 1),
+                    Duration::ZERO,
+                    ShapeTextures::default(),
+                ),
+                &frame_output(&gpu, &target, size),
+            )
+            .expect("resized spatial pass renders");
+        // SampleHalf reads the left half at output pixel centres: exactly the
+        // first two input texel centres after the output's 2:1 downscale.
+        assert_eq!(
+            readback_rgba8_image(&gpu, &target, size),
+            [255, 0, 0, 255, 0, 255, 0, 255]
+        );
+    }
+}
+
+#[test]
+fn gpu_reactive_output_sizes_keep_each_encodes_uniforms() {
+    use std::{cell::Cell, rc::Rc};
+    let gpu = create_test_device();
+    let size = Rc::new(Cell::new((4, 2)));
+    let policy = Rc::clone(&size);
+    // Spatial passes materialize at input resolution. A final colour pass
+    // resizes that result, preserving each encode's uniforms before submit.
+    let mut executor = Executor::new(filters::GaussianBlur(0.0_f32))
+        .with_output_size(move |_, _| policy.get())
+        .then(filters::Brightness(0.0_f32));
+    setup(&gpu, &mut executor);
+    let pixels = [255, 0, 0, 255, 0, 255, 0, 255];
+    let input = upload(&gpu, (2, 1), &pixels);
+    let mut encoder = gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+    let targets: Vec<_> = [(4, 2), (1, 1), (2, 1)]
+        .into_iter()
+        .map(|dimensions| {
+            size.set(dimensions);
+            let declared = executor.output_size(2, 1);
+            assert_eq!(declared, dimensions);
+            let target = texture(
+                &gpu,
+                declared,
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            );
+            executor
+                .encode_render(
+                    &frame_input(
+                        &gpu,
+                        &input,
+                        (2, 1),
+                        Duration::ZERO,
+                        ShapeTextures::default(),
+                    ),
+                    &frame_output(&gpu, &target, declared),
+                    &mut encoder,
+                )
+                .expect("each declared size encodes");
+            (target, dimensions)
+        })
+        .collect();
+    gpu.queue.submit([encoder.finish()]);
+    for (target, dimensions) in targets {
+        let actual = readback_rgba8_image(&gpu, &target, dimensions);
+        let mut expected = Vec::new();
+        for _ in 0..dimensions.1 {
+            for x in 0..dimensions.0 {
+                let index = usize::try_from((2 * x + 1) / dimensions.0).expect("source index");
+                expected.extend_from_slice(&pixels[index * 4..index * 4 + 4]);
+            }
+        }
+        assert_rgba8_close(&actual, &expected, 1, "declared size with shared encoder");
+    }
+    assert!(
+        executor
+            .gpu
+            .as_ref()
+            .expect("set up")
+            .intermediates
+            .iter()
+            .all(|slots| slots.size == (2, 1))
     );
 }
 

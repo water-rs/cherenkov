@@ -105,6 +105,11 @@ pub enum RenderError {
     /// The render thread failed or stopped.
     #[error("render thread stopped")]
     Thread,
+    /// Every surface of the engine is [`Hidden`](crate::Visibility::Hidden):
+    /// there is nothing a frame may draw, and a host renders only while a
+    /// surface is visible.
+    #[error("every surface is hidden")]
+    Hidden,
     /// The surface's pixels cannot be read back (window surfaces).
     #[error("the surface is not readable")]
     NotReadable,

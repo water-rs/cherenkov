@@ -21,17 +21,17 @@ use nami_core::watcher::Context;
 use rustc_hash::FxHashMap;
 
 use crate::animation::Animation;
-use crate::backend::{Backend, Display, SurfaceInfo};
+use crate::backend::{Backend, Display, SurfaceInfo, Visibility};
 use crate::capability::{
     Backdrop, BackdropChain, BackdropRuns, ExternalFrames, GpuContent, ProjectiveLayers,
 };
-use crate::engine::Waker;
+use crate::engine::SurfaceWaker;
 use crate::error::{RenderError, SurfaceError};
 use crate::frame::Readback;
 use crate::message::{
     BackdropId, ChangeSet, ContentOp, LayerId, LayerOp, Message, Op, Prop, SurfaceId,
 };
-use crate::record::{Content, ContentSpare, Live};
+use crate::record::{Content, ContentSpare, Live, LiveOwner};
 use crate::shape::{Shape, ShapeData};
 use crate::style::{BlendMode, FilterId};
 use crate::{ContentChange, Picture, WorkingColor};
@@ -57,8 +57,10 @@ enum PropKind {
 /// State shared between a [`Surface`], its [`Layer`] handles and the
 /// engine.
 ///
-/// Everything here is queued, not sent: [`Engine::render`](crate::Engine::render)
-/// drains `pending` into the single per-frame [`Message::Render`].
+/// While the surface is visible everything here is queued, not sent:
+/// [`Engine::render`](crate::Engine::render) drains `pending` into the
+/// single per-frame [`Message::Render`]. While it is hidden every change is
+/// sent as it is made, in a [`Message::Apply`].
 pub struct Shared<B: Backend> {
     /// The surface's identifier on the render thread.
     pub id: SurfaceId,
@@ -84,8 +86,12 @@ pub struct Shared<B: Backend> {
     /// property replaces its previous subscription; dropping a layer drops
     /// them all.
     bindings: FxHashMap<(u64, PropKind), Box<dyn Any>>,
-    /// The engine wake-up, fired when an op is queued outside a frame.
-    waker: Arc<Waker>,
+    /// The surface's host wake-up, fired when an op is queued outside a
+    /// frame; silent while the surface is hidden.
+    waker: Arc<SurfaceWaker>,
+    /// The render loop, which a hidden surface's changes are sent to as
+    /// they are made.
+    tx: Sender<Message<B>>,
     /// The last display properties announced to the render thread.
     display: Cell<Display>,
     /// Set by installed contents' `LiveState`s the moment an animated
@@ -110,7 +116,7 @@ impl<B: Backend> std::fmt::Debug for Shared<B> {
 }
 
 impl<B: Backend> Shared<B> {
-    fn new(id: SurfaceId, waker: Arc<Waker>) -> Self {
+    fn new(id: SurfaceId, waker: Arc<SurfaceWaker>, tx: Sender<Message<B>>) -> Self {
         Self {
             id,
             pending: Vec::new(),
@@ -124,29 +130,72 @@ impl<B: Backend> Shared<B> {
             next_backdrop: Cell::new(1),
             bindings: FxHashMap::default(),
             waker,
+            tx,
             display: Cell::new(Display::default()),
             animated: Rc::new(Cell::new(false)),
         }
     }
 
-    /// Queues an op and pokes the waker.
+    /// Queues an op outside a frame.
     fn push(&mut self, op: Op<B>) {
         self.pending.push(op);
-        self.waker.wake();
+        self.queued();
+    }
+
+    /// Something was queued outside a frame. A visible surface wakes the
+    /// host for the frame that applies it; a hidden one sends it to the
+    /// render loop at once.
+    fn queued(&mut self) {
+        match self.visibility() {
+            Visibility::Visible => self.waker.wake(),
+            Visibility::Hidden => self.apply_hidden(),
+        }
+    }
+
+    /// Sends everything queued to the render loop, which applies it without
+    /// sampling or drawing the surface. A hidden surface's changes are so
+    /// applied as they are made, in order with every message sent after
+    /// them: a resource release sees the content they install, and nothing
+    /// accumulates while the surface stays hidden. Animations are not
+    /// sampled; a content's animated operands wait for the frame that
+    /// shows the surface.
+    fn apply_hidden(&mut self) {
+        if let Some(changes) = self.drain(None) {
+            // A lost render thread fails the host's next render; there is
+            // nothing left to apply the change to.
+            let _ = self.tx.send(Message::Apply {
+                id: self.id,
+                changes,
+            });
+        }
+    }
+
+    /// The visibility the host last announced. A hidden surface's changes
+    /// are applied as they are made, and it is not sampled.
+    pub(crate) fn visibility(&self) -> Visibility {
+        self.waker.visibility()
     }
 
     /// Samples running operand animations at `time`, then drains pending
     /// ops and live content changes into a change set. Returns `None` when
     /// nothing changed.
     pub fn take_changes(&mut self, time: crate::Instant) -> Option<ChangeSet<B>> {
+        self.drain(Some(time))
+    }
+
+    /// Drains pending ops and live content changes into a change set,
+    /// sampling running operand animations first when a frame `time` is
+    /// given. Returns `None` when nothing changed.
+    fn drain(&mut self, time: Option<crate::Instant>) -> Option<ChangeSet<B>> {
         let mut ops = std::mem::take(&mut self.spare_ops);
         let recycled = std::mem::take(&mut self.spare_recycled);
         ops.append(&mut self.pending);
         let mut animating = false;
         // `animated` is poked by a content's `LiveState` the moment an
         // animated operand arrives, so a surface that never saw one
-        // skips the per-content sampling probes entirely.
-        let sampling = self.animated.get();
+        // skips the per-content sampling probes entirely. Without a frame
+        // time nothing is sampled, and the flag stays as it is.
+        let sampling = time.filter(|_| self.animated.get());
         for (id, slot) in &mut self.contents {
             let Some(content) = slot.content.as_mut() else {
                 continue;
@@ -154,7 +203,10 @@ impl<B: Backend> Shared<B> {
             // The sample queues the operands' per-frame values, so
             // `take_change` emits them like signal updates. The cell read
             // keeps a static content at a field probe, not a call.
-            if sampling && content.live.needs_sample.get() && content.sample(time) {
+            if let Some(time) = sampling
+                && content.live.needs_sample.get()
+                && content.sample(time)
+            {
                 animating = true;
             }
             if let Some(change) = content.take_change() {
@@ -168,7 +220,7 @@ impl<B: Backend> Shared<B> {
             }
         }
         let clear = self.clear.take();
-        if sampling && !animating {
+        if sampling.is_some() && !animating {
             // Nothing sampled this pass: the flag stays down until an
             // `animate` pokes it up again.
             self.animated.set(false);
@@ -210,16 +262,13 @@ impl<B: Backend> Shared<B> {
         F: Fn(LayerId, T, Option<Animation>) -> LayerOp + 'static,
     {
         let weak = Rc::downgrade(shared);
-        let waker = Arc::clone(&shared.borrow().waker);
         let guard = subscribe.start(crate::record::Watch::binding(move |context: Context<T>| {
             let animation = context.metadata().try_get::<Animation>();
             let target = context.into_value();
             if let Some(shared) = weak.upgrade() {
                 shared
                     .borrow_mut()
-                    .pending
                     .push(Op::Layer(op(layer, target, animation)));
-                waker.wake();
             }
         }));
         let mut shared_mut = shared.borrow_mut();
@@ -244,6 +293,12 @@ pub trait LayerOwner {
     fn allocate(&self) -> LayerId;
     /// Queues a `Remove` and drops the layer's bindings and contents.
     fn remove(&self, id: LayerId);
+}
+
+impl<B: Backend> LiveOwner for RefCell<Shared<B>> {
+    fn changed(&self) {
+        self.borrow_mut().queued();
+    }
 }
 
 impl<B: Backend> LayerOwner for RefCell<Shared<B>> {
@@ -908,13 +963,14 @@ impl<B: Backend> std::fmt::Debug for Surface<B> {
 
 impl<B: Backend> Surface<B> {
     /// Builds the UI-thread handle once `CreateSurface` succeeded.
+    #[must_use]
     pub fn new(
         id: SurfaceId,
         info: SurfaceInfo,
         tx: Sender<Message<B>>,
-        waker: Arc<Waker>,
+        waker: Arc<SurfaceWaker>,
     ) -> Self {
-        let shared = Rc::new(RefCell::new(Shared::new(id, waker)));
+        let shared = Rc::new(RefCell::new(Shared::new(id, waker, tx.clone())));
         let owner: Rc<dyn LayerOwner> = Rc::clone(&shared) as Rc<dyn LayerOwner>;
         Self {
             shared,
@@ -1016,12 +1072,79 @@ impl<B: Backend> Surface<B> {
             .map_err(|_| SurfaceError::Lost)
     }
 
+    /// Announces whether the user can see the surface, from the platform's
+    /// visibility signal (window occlusion or minimization, the app moving
+    /// to the background, the view leaving its window, the document's
+    /// visibility state). Surfaces start [`Visible`](Visibility::Visible);
+    /// announcing the current visibility again does nothing.
+    ///
+    /// While the surface is hidden:
+    /// - Nothing on it asks for a frame. Animation tracks, live operands,
+    ///   bound signals, transactions, image replacements it draws, custom
+    ///   GPU content, filters and external-frame installs wake no host,
+    ///   and [`Engine::render`](crate::Engine::render) neither samples nor
+    ///   draws it, nor counts it in its [`Next`](crate::Next).
+    /// - Its changes are still accepted and applied. Transactions, layer
+    ///   creates and drops, bound signals and live operands are sent to the
+    ///   render thread as they are made, which applies them without
+    ///   sampling or drawing the surface — the changes queued before the
+    ///   surface hid included. Content installed while hidden therefore
+    ///   counts for resource releases like any other installed content,
+    ///   and nothing accumulates on the UI thread however long the surface
+    ///   stays hidden.
+    /// - A host renders only while a surface is visible: rendering while
+    ///   every surface of the engine is hidden fails with
+    ///   [`RenderError::Hidden`].
+    ///
+    /// Becoming visible asks the host for exactly one frame, even if it
+    /// dropped a frame it had been asked for while the surface was hidden.
+    /// That frame redraws the surface whole from its current state and
+    /// presents it. It samples every animation at its own time, so a track
+    /// that ran on while the surface was hidden shows where it is now, with
+    /// no replay of the frames it missed; a track committed while it was
+    /// hidden starts on that frame, like any other.
+    ///
+    /// Every wake on the surface's behalf stops the moment this returns,
+    /// whichever thread it starts on: the surface's own, and those of the
+    /// backend's producers and filters, which read the announced
+    /// visibility when they fire rather than waiting for the render thread
+    /// to apply the change.
+    ///
+    /// # Errors
+    /// [`SurfaceError::Lost`] when the render thread is gone.
+    pub fn visibility(&self, visibility: Visibility) -> Result<(), SurfaceError> {
+        let waker = Arc::clone(&self.shared.borrow().waker);
+        if waker.visibility() == visibility {
+            return Ok(());
+        }
+        let message = Message::Visibility {
+            id: self.id,
+            visibility,
+        };
+        match visibility {
+            Visibility::Hidden => {
+                waker.hide();
+                self.tx.send(message).map_err(|_| SurfaceError::Lost)?;
+                // What was queued for the next frame is applied now, like
+                // every later change.
+                self.shared.borrow_mut().apply_hidden();
+            }
+            Visibility::Visible => {
+                // The render loop learns first, so the frame the wake asks
+                // for lists the surface.
+                self.tx.send(message).map_err(|_| SurfaceError::Lost)?;
+                waker.show();
+            }
+        }
+        Ok(())
+    }
+
     /// The clear colour, queued into the pending change set. Defaults to
     /// transparent.
     pub fn clear_color(&self, color: WorkingColor) {
         let mut shared = self.shared.borrow_mut();
         shared.clear = Some(color);
-        shared.waker.wake();
+        shared.queued();
     }
 
     /// Records live content for this surface.
@@ -1032,6 +1155,8 @@ impl<B: Backend> Surface<B> {
 
     /// Queues a transaction's edits into the surface's change set. Nothing
     /// is sent; [`Engine::render`](crate::Engine::render) drains the queue.
+    /// A hidden surface sends the edits at once instead (see
+    /// [`Surface::visibility`]).
     ///
     /// # Panics
     /// Panics if `body` panics; the transaction is then dropped unapplied.
@@ -1079,7 +1204,7 @@ impl<B: Backend> Surface<B> {
         let pending = std::mem::take(&mut shared.pending);
         let mut ops = pending;
         // Cloned once per transaction: installed contents attach the
-        // sampling flag to their `LiveState`s.
+        // surface and its sampling flag to their `LiveState`s.
         let animated = Rc::clone(&shared.animated);
         for (id, edit) in &mut tx.edits {
             for op in edit.ops.drain(..) {
@@ -1120,13 +1245,13 @@ impl<B: Backend> Surface<B> {
                     EditOp::Content(LayerContent::Content(content)) => {
                         // A fresh `Content` replaces the previous one whole
                         // (its first `take_change` is a `Replace`).
-                        let waker = Arc::clone(&shared.waker);
                         let slot = shared.contents.entry(*id).or_default();
                         if let Some(previous) = slot.content.replace(content) {
                             slot.spare.live = previous.retire().live;
                         }
                         let stored = slot.content.as_mut().expect("just inserted");
-                        stored.attach_waker(&waker, &animated);
+                        let owner: Rc<dyn LiveOwner> = Rc::clone(&self.shared) as Rc<dyn LiveOwner>;
+                        stored.attach_owner(Rc::downgrade(&owner), &animated);
                         if let Some(change) = stored.take_change() {
                             let content_op = match change {
                                 ContentChange::Replace(list) => ContentOp::Replace(list),
@@ -1187,7 +1312,7 @@ impl<B: Backend> Surface<B> {
         }
         shared.edit_buffer = tx.edits;
         shared.edit_ops = tx.edit_ops;
-        shared.waker.wake();
+        shared.queued();
     }
 
     /// The pixels of the surface after the last

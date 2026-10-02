@@ -1004,7 +1004,6 @@ impl SystemPlanes for Planes {
         self.parts
             .iter()
             .flat_map(|part| &part.buffers)
-            .chain(&self.retiring)
             .map(|buffer| buffer.bytes)
             .sum()
     }
@@ -1026,6 +1025,7 @@ impl SystemPlanes for Planes {
 
     fn reselect(&mut self, _: &wgpu::Adapter, _: &wgpu::Device) -> Result<(), SurfaceError> {
         // Engine parts are RGBA8 `AHardwareBuffer`s in the sRGB dataspace.
+            .filter(|part| part.raster.is_some())
         // That contract is not a swapchain negotiation, and a frame's
         // headroom is read when the part is presented.
         Ok(())

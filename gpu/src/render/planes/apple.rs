@@ -1243,15 +1243,10 @@ impl SystemPlanes for LayerPlanes {
                     let _tx = Transaction::begin();
                     // Attach in the hierarchy: the platform reports
                     // `readyForDisplay` only for a layer the render
-                    // server can see. The flag is refreshed by the
-                    // layer's readiness notification from then on; this
-                    // read covers a transition that completed before the
-                    // registration returned.
+                    // server can see. The flag stays false until the
+                    // gated sample lands and the layer's readiness
+                    // notification refreshes it.
                     scene.attach(layer, &owner, Arc::downgrade(&flag), waker.clone());
-                    let display = &scene.displays[&layer].display;
-                    // SAFETY: the property is read on main, where the
-                    // layer lives.
-                    flag.store(unsafe { display.isReadyForDisplay() }, Ordering::Release);
                     // The attach's completion signal: the flag may
                     // still be false — readiness lands through the
                     // layer's own notification — but the queued work

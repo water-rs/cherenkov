@@ -252,13 +252,18 @@ struct Configuration {
     required: Option<wgpu::SurfaceColorSpace>,
 }
 
-type PartReply = mpsc::Receiver<Result<Vec<WindowSurface>, SurfaceError>>;
+/// The reply's stamp is the config generation the request was issued
+/// under: a resize or re-selection between request and reply leaves the
+/// arriving parts configured stale, which `collect_parts` repairs.
+type PartReply = mpsc::Receiver<(u64, Result<Vec<WindowSurface>, SurfaceError>)>;
 
 /// Render-side ownership consists exclusively of wgpu handles, messages and
 /// completion flags. It never borrows main-thread state or waits for main.
 pub struct LayerPlanes {
     scene: MainOwned<LayerScene>,
     config: Configuration,
+    /// Bumped by `resize` and `reselect`; part requests carry it.
+    config_generation: u64,
     parts: Vec<WindowSurface>,
     replies: Vec<PartReply>,
     requested_parts: usize,
@@ -840,6 +845,7 @@ impl LayerPlanes {
                 transparent,
                 required,
             },
+            config_generation: 0,
             parts: Vec::new(),
             replies: Vec::new(),
             requested_parts: 0,
@@ -864,10 +870,11 @@ impl LayerPlanes {
         self.replies.push(receive);
         self.requested_parts = count;
         let config = self.config.clone();
+        let generation = self.config_generation;
         let waker = self.waker.clone();
         self.scene.run(move |scene, _| {
             let result = scene.add_parts(&config, count, probe);
-            if send.send(result).is_err() {
+            if send.send((generation, result)).is_err() {
                 // Cancellation: the render owner was destroyed while this
                 // command was queued. Its scene release is queued behind us.
                 scene.root.removeFromSuperlayer();
@@ -883,9 +890,19 @@ impl LayerPlanes {
         let mut consumed = 0;
         for reply in &self.replies {
             match reply.try_recv() {
-                Ok(result) => {
-                    self.parts
-                        .extend(result.map_err(|error| RenderError::Render(error.to_string()))?);
+                Ok((generation, result)) => {
+                    let mut parts =
+                        result.map_err(|error| RenderError::Render(error.to_string()))?;
+                    if generation != self.config_generation {
+                        // The request raced a resize or a re-selection:
+                        // configure the arriving parts to the config now
+                        // current, not the one the request captured.
+                        for part in &mut parts {
+                            part.reselect(&self.config.adapter, &self.config.device);
+                            part.resize(&self.config.device, self.config.size);
+                        }
+                    }
+                    self.parts.extend(parts);
                     consumed += 1;
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
@@ -1082,6 +1099,7 @@ impl SystemPlanes for LayerPlanes {
 
     fn resize(&mut self, size: (u32, u32)) {
         self.config.size = size;
+        self.config_generation += 1;
         for part in &mut self.parts {
             part.resize(&self.config.device, size);
         }
@@ -1090,6 +1108,7 @@ impl SystemPlanes for LayerPlanes {
     fn reselect(&mut self, adapter: &wgpu::Adapter, device: &wgpu::Device) {
         self.config.adapter = adapter.clone();
         self.config.device = device.clone();
+        self.config_generation += 1;
         for part in &mut self.parts {
             part.reselect(adapter, device);
         }

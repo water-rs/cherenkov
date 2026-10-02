@@ -23,6 +23,12 @@ A pull is accepted only when `done.json`'s args are this launch's
 the `external-cost` cell this binary was installed to measure.
 
 Raw reports land in `--out-dir`, never in git.
+
+SIGTERM and SIGHUP end the run through one exit path: status.json
+records ``matrix stopped: <signal>`` and the log prints that line.
+A driver launched under nohup, which ignores SIGHUP, becomes its own
+session before the handler is installed, so the launching shell's
+hangup is not delivered and an explicit ``kill -HUP`` still is.
 """
 
 import argparse
@@ -32,6 +38,7 @@ import json
 import os
 import pathlib
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -67,6 +74,14 @@ class LockBudget(Exception):
 
 class ThermalTimeout(Exception):
     """The phone stayed above fair for the cool-down limit."""
+
+
+class Stopped(Exception):
+    """SIGTERM or SIGHUP. The process records the stop and exits."""
+
+    def __init__(self, signame):
+        super().__init__(signame)
+        self.signame = signame
 
 
 def run(cmd, timeout=180):
@@ -424,7 +439,7 @@ def one_run(app, path, size, transfer, rep, order_name, out_dir, identity):
                     flush=True,
                 )
                 time.sleep(COOL_GAP_S)
-        except (LockBudget, ThermalTimeout):
+        except (LockBudget, ThermalTimeout, Stopped):
             raise
         except Exception as exc:
             last = exc
@@ -454,6 +469,43 @@ def signal_done(out_dir, state):
         os.close(fd)
 
 
+def install_stop_signals():
+    """Raise Stopped on SIGTERM and SIGHUP.
+
+    nohup sets SIGHUP to ignore so an ssh hangup does not kill a
+    detached driver. Leave that process group first — an explicit
+    ``kill -HUP`` is still delivered to the pid — then install the
+    handler. A foreground run, whose SIGHUP is not ignored, keeps its
+    session and records the hangup.
+    """
+    if (
+        signal.getsignal(signal.SIGHUP) == signal.SIG_IGN
+        and os.getpid() != os.getsid(0)
+    ):
+        try:
+            os.setsid()
+        except OSError:
+            pass
+
+    names = {signal.SIGTERM: "SIGTERM", signal.SIGHUP: "SIGHUP"}
+
+    def handle(signum, _frame):
+        raise Stopped(names[signum])
+
+    signal.signal(signal.SIGTERM, handle)
+    signal.signal(signal.SIGHUP, handle)
+
+
+def finish(out_dir, status_path, status, code, line):
+    """Write status.json, wake a fifo waiter, print the matrix line, exit."""
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    write_status(status_path, status)
+    signal_done(out_dir, status["state"])
+    print(line, flush=True)
+    sys.exit(code)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--app", default=os.path.expanduser(DEFAULT_APP))
@@ -470,26 +522,30 @@ def main():
     lock_waited = args.lock_waited
     out_dir = pathlib.Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    identity = {"cdhash": cdhash(args.app), "exe_sha256": exe_sha256(args.app)}
-    print(
-        "binary {} {} lock_waited {:.1f}s".format(
-            identity["cdhash"], identity["exe_sha256"][:16], lock_waited
-        ),
-        flush=True,
-    )
     status_path = out_dir / "status.json"
     results = []
     status = {
         "state": "running",
         "reason": "",
         "head": args.head,
-        "cdhash": identity["cdhash"],
-        "exe_sha256": identity["exe_sha256"],
+        "cdhash": "",
+        "exe_sha256": "",
         "results": results,
     }
     write_status(status_path, status)
+    install_stop_signals()
     code = 0
+    line = "matrix complete"
     try:
+        identity = {"cdhash": cdhash(args.app), "exe_sha256": exe_sha256(args.app)}
+        status["cdhash"] = identity["cdhash"]
+        status["exe_sha256"] = identity["exe_sha256"]
+        print(
+            "binary {} {} lock_waited {:.1f}s".format(
+                identity["cdhash"], identity["exe_sha256"][:16], lock_waited
+            ),
+            flush=True,
+        )
         for size, transfer in CELLS:
             for order in ORDERS:
                 order_name = "abab" if order == ORDERS[0] else "baba"
@@ -502,21 +558,25 @@ def main():
                     status["results"] = results
                     write_status(status_path, status)
         status["state"] = "complete"
+    except Stopped as exc:
+        code = 2
+        status["state"] = "stopped"
+        status["reason"] = "matrix stopped: {}".format(exc.signame)
+        line = status["reason"]
     except LockBudget as exc:
         code = 2
         status["state"] = "stopped"
         status["reason"] = str(exc)
         print("stopped: {}".format(exc), flush=True)
+        line = "matrix stopped"
     except Exception as exc:
         code = 1
         status["state"] = "failed"
         status["reason"] = str(exc)
         traceback.print_exc()
+        line = "matrix failed"
     status["results"] = results
-    write_status(status_path, status)
-    signal_done(out_dir, status["state"])
-    print("matrix {}".format(status["state"]), flush=True)
-    sys.exit(code)
+    finish(out_dir, status_path, status, code, line)
 
 
 if __name__ == "__main__":

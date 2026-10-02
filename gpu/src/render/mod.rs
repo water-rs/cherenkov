@@ -31,6 +31,7 @@ use std::time::Duration;
 use rustc_hash::{FxHashMap, FxHashSet};
 use wgpu::util::DeviceExt;
 
+use crate::interop::ExternalFrame;
 use crate::{
     CreationPhase, CreationPoint, GpuConfig, GpuInfo, GpuTarget, ScratchFormat, TimestampSupport,
     names,
@@ -595,6 +596,7 @@ pub struct GpuRenderer {
     plan_scratch: planes::PlanScratch,
     /// The candidate map each promotion check or plan fills and reuses.
     candidates: FxHashMap<LayerId, (u32, u32)>,
+    candidate_frames: FxHashMap<LayerId, (ExternalFrame, u64)>,
     /// The per-surface ready-candidate sets `ready_planes` fills for the
     /// frame's lowered batch — kept between renders so a plane prepare
     /// allocates nothing steady-state.
@@ -1959,6 +1961,7 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             plane_only: Vec::new(),
             plan_scratch: planes::PlanScratch::default(),
             candidates: FxHashMap::default(),
+            candidate_frames: FxHashMap::default(),
             ready_sets: Vec::new(),
             plane_waker: None,
             shader_delivery,
@@ -2266,6 +2269,7 @@ pub async fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineErr
         plane_only: Vec::new(),
         plan_scratch: planes::PlanScratch::default(),
         candidates: FxHashMap::default(),
+        candidate_frames: FxHashMap::default(),
         ready_sets: Vec::new(),
         plane_waker: None,
         shader_delivery,
@@ -2384,6 +2388,20 @@ fn plane_candidates<'a>(
     candidates
 }
 
+fn plane_frames<'a>(
+    surf: &SurfaceState,
+    frames: &'a mut FxHashMap<LayerId, (ExternalFrame, u64)>,
+) -> &'a FxHashMap<LayerId, (ExternalFrame, u64)> {
+    frames.clear();
+    frames.extend(
+        surf.external
+            .iter()
+            .filter(|(_, slot)| slot.on_plane)
+            .map(|(layer, slot)| (*layer, (slot.frame.clone(), slot.generation))),
+    );
+    frames
+}
+
 /// Rejects an image the device cannot hold as one texture.
 fn check_image_size(image: &ImageUpload, max: u32) -> Result<(), ResourceError> {
     if image.width > max || image.height > max {
@@ -2431,7 +2449,7 @@ impl Renderer for GpuRenderer {
             }
             GpuTarget::Window(window) => {
                 let refresh = window.refresh.clone();
-                (self.open_window(id, window, size)?, None, refresh, true)
+                (self.open_window(id, window, size), None, refresh, true)
             }
         };
         let promotes = self.planes.contains_key(&id);
@@ -4081,7 +4099,7 @@ impl GpuRenderer {
         id: SurfaceId,
         window: crate::WindowTarget,
         size: (u32, u32),
-    ) -> Result<Option<present::WindowSurface>, SurfaceError> {
+    ) -> Option<present::WindowSurface> {
         let system = planes::apple::LayerPlanes::new(
             &self.instance,
             &self.adapter,
@@ -4092,11 +4110,11 @@ impl GpuRenderer {
             window.required_color_space,
             window.probe,
             self.plane_waker.clone(),
-        )?;
+        );
         self.planes.insert(id, system);
         self.presenter
             .get_or_insert_with(|| present::Presenter::new(&self.device, self.shader_delivery));
-        Ok(None)
+        None
     }
 
     /// Opens a window target: one swapchain the surface's target is blitted
@@ -4857,7 +4875,9 @@ impl GpuRenderer {
             let Some(system) = self.planes.get_mut(&sf.id) else {
                 continue;
             };
-            planes::SystemPlanes::groom(system, plane_candidates(surface, &mut self.candidates));
+            let candidates = plane_candidates(surface, &mut self.candidates);
+            let frames = plane_frames(surface, &mut self.candidate_frames);
+            planes::SystemPlanes::groom_with_frames(system, candidates, frames);
             if planes::SystemPlanes::wants_plan(system) {
                 dirty.push(sf);
             }
@@ -4871,15 +4891,20 @@ impl GpuRenderer {
     /// a candidate it does not report keeps compositing in-engine this
     /// frame.
     fn ready_planes(&mut self, frames: &[&SurfaceFrame<'_>], pending: &[SurfaceState]) {
-        let (ready_sets, planes, candidates) =
-            (&mut self.ready_sets, &mut self.planes, &mut self.candidates);
+        let (ready_sets, planes, candidates, candidate_frames) = (
+            &mut self.ready_sets,
+            &mut self.planes,
+            &mut self.candidates,
+            &mut self.candidate_frames,
+        );
         for (i, (sf, surf)) in frames.iter().zip(pending.iter()).enumerate() {
             if ready_sets.len() == i {
                 ready_sets.push(FxHashSet::default());
             }
             let candidates = plane_candidates(surf, candidates);
+            let frames = plane_frames(surf, candidate_frames);
             if let Some(system) = planes.get_mut(&sf.id) {
-                planes::SystemPlanes::prepare(system, candidates, &mut ready_sets[i]);
+                planes::SystemPlanes::prepare(system, candidates, frames, &mut ready_sets[i]);
             } else {
                 let ready = &mut ready_sets[i];
                 ready.clear();

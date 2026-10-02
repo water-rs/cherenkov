@@ -740,8 +740,29 @@ impl Presenter {
         source: &wgpu::TextureView,
         headroom: f32,
     ) -> Result<bool, RenderError> {
-        let Some(frame) = window.acquire(device)? else {
+        let Some(frame) = self.prepare(device, queue, window, source, headroom)? else {
             return Ok(false);
+        };
+        queue.present(frame);
+        Ok(true)
+    }
+
+    /// Encodes into an owned drawable, which the compositor presents in
+    /// the same main-thread transaction as its plane hierarchy.
+    ///
+    /// # Errors
+    /// Returns a render error when the window cannot acquire or configure
+    /// its drawable.
+    pub fn prepare(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        window: &WindowSurface,
+        source: &wgpu::TextureView,
+        headroom: f32,
+    ) -> Result<Option<wgpu::SurfaceTexture>, RenderError> {
+        let Some(frame) = window.acquire(device)? else {
+            return Ok(None);
         };
         let alpha = match window.config.alpha_mode {
             wgpu::CompositeAlphaMode::PreMultiplied | wgpu::CompositeAlphaMode::Inherit => {
@@ -769,8 +790,7 @@ impl Presenter {
                 headroom: window.selection.effective_headroom(headroom),
             },
         );
-        queue.present(frame);
-        Ok(true)
+        Ok(Some(frame))
     }
 
     /// Composites an engine texture into a native texture on the same device.

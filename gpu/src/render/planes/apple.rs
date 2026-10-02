@@ -27,15 +27,20 @@
 //! and frame hand-off of one frame commits in one `CATransaction`, so parts
 //! and planes change on screen together.
 
+use std::cell::RefCell;
 use std::ptr::NonNull;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 
+use dispatch2::{DispatchQueue, MainThreadBound};
 use kurbo::{Affine, Rect, Vec2};
+use objc2::MainThreadMarker;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_av_foundation::{
     AVLayerVideoGravityResize, AVQueuedSampleBufferRendering, AVQueuedSampleBufferRenderingStatus,
-    AVSampleBufferDisplayLayer, AVSampleBufferVideoRenderer,
+    AVSampleBufferDisplayLayer,
 };
 use objc2_core_foundation::{
     CFBoolean, CFMutableDictionary, CFRetained, CFString, CGAffineTransform, CGPoint, CGRect,
@@ -81,66 +86,103 @@ use crate::interop::{
 };
 use crate::render::present::WindowSurface;
 
-/// The backing layer of the host window's view: the system-compositor
-/// parent the engine builds its planes under.
-pub struct Parent {
-    layer: Retained<CALayer>,
-    /// The host window, kept alive for the surface's lifetime.
-    window: Box<dyn wgpu::WindowHandle>,
+/// Main-thread storage with asynchronous destruction. Every reference, including
+/// the last one, is released on main; `MainThreadBound::drop` can never dispatch
+/// synchronously from the render thread.
+struct MainOwned<T: 'static>(Option<Arc<MainThreadBound<RefCell<T>>>>);
+
+impl<T> MainOwned<T> {
+    fn new(value: T, mtm: MainThreadMarker) -> Self {
+        Self(Some(Arc::new(MainThreadBound::new(
+            RefCell::new(value),
+            mtm,
+        ))))
+    }
+
+    fn run(&self, f: impl FnOnce(&mut T, MainThreadMarker) + Send + 'static) {
+        let owned = self.clone();
+        DispatchQueue::main().exec_async(move || {
+            let mtm = MainThreadMarker::new().expect("the main dispatch queue");
+            f(
+                &mut owned
+                    .0
+                    .as_ref()
+                    .expect("live main owner")
+                    .get(mtm)
+                    .borrow_mut(),
+                mtm,
+            );
+        });
+    }
 }
 
-// SAFETY: Core Animation layers may be modified from any thread inside an
-// explicit `CATransaction`. The render thread is the only thread that
-// touches the parent after capture, and only inside explicit transactions.
-#[expect(
-    clippy::non_send_fields_in_send_ty,
-    reason = "the layer is used on the render thread only, inside explicit transactions"
-)]
-unsafe impl Send for Parent {}
+impl<T> Clone for MainOwned<T> {
+    fn clone(&self) -> Self {
+        Self(Some(Arc::clone(self.0.as_ref().expect("live main owner"))))
+    }
+}
 
-impl Parent {
-    /// Captures the backing layer of the view behind `handle`, making an
-    /// `AppKit` view layer-backed first.
-    ///
-    /// # Panics
-    /// Off the main thread (a view is main-thread state), when the handle is
-    /// unavailable, or when it is not an `AppKit` or `UIKit` view.
-    pub fn capture(handle: Box<dyn wgpu::WindowHandle>) -> Self {
-        use wgpu::rwh::{HasWindowHandle as _, RawWindowHandle};
-        let _main = objc2::MainThreadMarker::new().expect(
-            "WindowTarget::new must run on the main thread on Apple platforms: the view's layer is main-thread state",
-        );
-        let raw = handle
-            .window_handle()
-            .expect("the window handle is available")
-            .as_raw();
-        let layer = match raw {
-            #[cfg(target_os = "macos")]
-            RawWindowHandle::AppKit(view) => {
-                // SAFETY: an AppKit window handle names a live `NSView`, and
-                // this is the main thread.
-                let view: &objc2_app_kit::NSView = unsafe { view.ns_view.cast().as_ref() };
-                view.setWantsLayer(true);
-                view.layer().expect("a layer-backed view has a layer")
-            }
-            #[cfg(not(target_os = "macos"))]
-            RawWindowHandle::UiKit(view) => {
-                // SAFETY: a UIKit window handle names a live `UIView`, and
-                // this is the main thread.
-                let view: &objc2_ui_kit::UIView = unsafe { view.ui_view.cast().as_ref() };
-                view.layer()
-            }
-            other => panic!("an Apple window handle is an AppKit or UIKit view, not {other:?}"),
-        };
-        Self {
-            layer,
-            window: handle,
+impl<T> Drop for MainOwned<T> {
+    fn drop(&mut self) {
+        let value = self.0.take().expect("one release per main owner");
+        if MainThreadMarker::new().is_some() {
+            drop(value);
+        } else {
+            DispatchQueue::main().exec_async(move || drop(value));
         }
     }
 }
 
-/// Commits a `CATransaction` with implicit animations disabled when
-/// dropped, on every exit path.
+/// Captured on main. The window and all Objective-C objects remain there.
+pub struct Parent {
+    scene: MainOwned<LayerScene>,
+}
+
+impl Parent {
+    /// Captures the view's layer on main.
+    ///
+    /// # Panics
+    /// Off main, or if the handle does not name a live Apple view.
+    pub fn capture(handle: Box<dyn wgpu::WindowHandle>) -> Self {
+        use wgpu::rwh::{HasWindowHandle as _, RawWindowHandle};
+        let mtm = MainThreadMarker::new().expect("WindowTarget::new must run on main");
+        let layer = match handle.window_handle().expect("window handle").as_raw() {
+            #[cfg(target_os = "macos")]
+            RawWindowHandle::AppKit(view) => {
+                // SAFETY: the window handle guarantees a live view; we are on main.
+                let view: &objc2_app_kit::NSView = unsafe { view.ns_view.cast().as_ref() };
+                view.setWantsLayer(true);
+                view.layer().expect("layer-backed view")
+            }
+            #[cfg(not(target_os = "macos"))]
+            RawWindowHandle::UiKit(view) => {
+                // SAFETY: the window handle guarantees a live view; we are on main.
+                let view: &objc2_ui_kit::UIView = unsafe { view.ui_view.cast().as_ref() };
+                view.layer()
+            }
+            other => panic!("expected an Apple view, found {other:?}"),
+        };
+        let _tx = Transaction::begin();
+        let root = anchored();
+        root.setName(Some(&objc2_foundation::NSString::from_str("cherenkov")));
+        #[cfg(target_os = "macos")]
+        root.setGeometryFlipped(!layer.contentsAreFlipped());
+        layer.addSublayer(&root);
+        Self {
+            scene: MainOwned::new(
+                LayerScene {
+                    _window: handle,
+                    root,
+                    parts: Vec::new(),
+                    planes: Vec::new(),
+                    displays: FxHashMap::default(),
+                },
+                mtm,
+            ),
+        }
+    }
+}
+
 struct Transaction;
 
 impl Transaction {
@@ -157,34 +199,20 @@ impl Drop for Transaction {
     }
 }
 
-/// One engine part: the metal layer and the swapchain the presenter draws
-/// into.
-struct PartLayer {
-    layer: Retained<CAMetalLayer>,
-    surface: WindowSurface,
+/// A display is always fully constructed. Pending state contains only a
+/// completion flag, never a partially initialized Objective-C object.
+struct DisplayLayer {
+    display: Retained<AVSampleBufferDisplayLayer>,
+    generation: Option<u64>,
 }
 
-/// One promoted plane's layers.
 struct PlaneLayers {
-    /// The promoted tree layer.
     layer: LayerId,
-    /// The tree layers on the path and whether each has a clip: the shape
-    /// the nested layers were built for.
     shape: Vec<(LayerId, bool)>,
-    /// The pixel-space root of the plane.
     top: Retained<CALayer>,
     levels: Vec<LevelLayers>,
-    /// The display layer and renderer once the main queue has created
-    /// them, and what they owe the plane until then.
-    link: Arc<Mutex<DisplayLink>>,
-    /// The generation of the frame last handed to the display layer.
-    generation: Option<u64>,
-    /// The size of the frame last handed to the display layer.
-    shown: Option<(u32, u32)>,
 }
 
-/// The layers mirroring one tree layer: its transform, its optional clip,
-/// and its scroll offset, outermost first.
 struct LevelLayers {
     node: Retained<CALayer>,
     clip: Option<Retained<CALayer>>,
@@ -192,53 +220,52 @@ struct LevelLayers {
 }
 
 impl LevelLayers {
-    /// The layer the next level (or the display layer) nests in.
     fn inner(&self) -> &CALayer {
         &self.scroll
     }
 }
 
-/// A surface's planes on Core Animation.
-pub struct LayerPlanes {
+/// All Core Animation access, including hierarchy changes and destruction,
+/// is confined to this main-thread scene.
+struct LayerScene {
+    _window: Box<dyn wgpu::WindowHandle>,
+    root: Retained<CALayer>,
+    parts: Vec<Retained<CAMetalLayer>>,
+    planes: Vec<PlaneLayers>,
+    displays: FxHashMap<LayerId, DisplayLayer>,
+}
+
+impl Drop for LayerScene {
+    fn drop(&mut self) {
+        let _tx = Transaction::begin();
+        self.root.removeFromSuperlayer();
+    }
+}
+
+#[derive(Clone)]
+struct Configuration {
     instance: wgpu::Instance,
     adapter: wgpu::Adapter,
     device: wgpu::Device,
-    /// Keeps the host window alive for the surface's lifetime.
-    _window: Box<dyn wgpu::WindowHandle>,
-    root: Retained<CALayer>,
-    transparent: bool,
-    /// The swapchain's required colour space (#98): every part negotiates
-    /// under it.
-    required: Option<wgpu::SurfaceColorSpace>,
-    /// The host's display-probe channel: the first part's swapchain
-    /// delivers it; every part is on the same window's display.
-    probe: Option<std::sync::mpsc::Sender<crate::render::present::DisplayProbe>>,
     size: (u32, u32),
-    scale: f64,
-    parts: Vec<PartLayer>,
-    planes: Vec<PlaneLayers>,
-    /// Candidates whose display layer is being born on the main queue:
-    /// a layer promotes only once its link's `display` exists, so until
-    /// the queued attach runs it keeps compositing in-engine. Entries
-    /// are consumed by `compose`'s `plane_layers` at promotion.
-    pending: FxHashMap<LayerId, Arc<Mutex<DisplayLink>>>,
-    /// Detached layer the pending displays attach to while they are
-    /// born: never added to the tree, so a candidate's not-yet-promoted
-    /// layer composites nothing.
-    staging: Retained<CALayer>,
-    /// Candidates the last `prepare` reported ready: a candidate newly
-    /// ready since then sets `woke`, which `wants_plan` answers once so
-    /// the surface re-plans and promotes it. A candidate the plan then
-    /// rejects stays in `offered` — it does not re-wake every frame.
+    transparent: bool,
+    required: Option<wgpu::SurfaceColorSpace>,
+}
+
+type PartReply = mpsc::Receiver<Result<Vec<WindowSurface>, SurfaceError>>;
+
+/// Render-side ownership consists exclusively of wgpu handles, messages and
+/// completion flags. It never borrows main-thread state or waits for main.
+pub struct LayerPlanes {
+    scene: MainOwned<LayerScene>,
+    config: Configuration,
+    parts: Vec<WindowSurface>,
+    replies: Vec<PartReply>,
+    requested_parts: usize,
+    candidates: FxHashMap<LayerId, Arc<AtomicBool>>,
     offered: FxHashSet<LayerId>,
     woke: bool,
-    /// The host wake-up an attach completion fires to pull the frame
-    /// that promotes the born candidate — the same `waker.wake` an
-    /// external frame or an invalidation uses to wake the render loop.
-    waker: Option<cherenkov::MainWaker>,
-    /// Set when parts or planes were added or removed, so the root's
-    /// sublayer order is rebuilt.
-    restack: bool,
+    waker: Option<cherenkov::CompletionWaker>,
 }
 
 /// An origin-anchored layer: its position is its superlayer point for its
@@ -249,123 +276,6 @@ fn anchored() -> Retained<CALayer> {
     layer.setPosition(CGPoint::new(0.0, 0.0));
     layer.setBounds(CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(0.0, 0.0)));
     layer
-}
-
-/// What the display layer's deferred creation owes its plane.
-///
-/// An `AVSampleBufferDisplayLayer` binds its video queue on the thread
-/// it is created on; created off the main thread that binding can
-/// complete only after the first `enqueueSampleBuffer`, which the queue
-/// then drops without an error. Plane construction runs on the render
-/// thread, so the layer is born on the main queue, where the binding is
-/// up before the first enqueue — asynchronously, since the render
-/// thread may not wait on the UI thread's run loop. Until the link is
-/// up the layer's geometry and newest frame are held here and applied
-/// at attach; the renderer afterwards serves `show()` directly. `dead`
-/// retires a queued attach when the layer is demoted or the surface
-/// torn down before the block ran.
-#[derive(Default)]
-struct DisplayLink {
-    display: Option<Retained<AVSampleBufferDisplayLayer>>,
-    renderer: Option<Retained<AVSampleBufferVideoRenderer>>,
-    bounds: Option<CGRect>,
-    opacity: Option<f32>,
-    sample: Option<CFRetained<CMSampleBuffer>>,
-    dead: bool,
-}
-
-// SAFETY: the objects are touched only under the mutex: the render
-// thread fills the geometry and sample slots, the main queue fills the
-// layer and renderer and drains the sample.
-#[expect(
-    clippy::non_send_fields_in_send_ty,
-    reason = "every field is touched only while the mutex is held"
-)]
-unsafe impl Send for DisplayLink {}
-
-/// Creates a plane's display layer on the main queue and attaches it,
-/// draining the geometry and frame the render thread left in `link`.
-struct DisplayAttach {
-    parent: Retained<CALayer>,
-    link: Arc<Mutex<DisplayLink>>,
-    waker: Option<cherenkov::MainWaker>,
-}
-
-// SAFETY: the parent is touched only on the main queue, inside an
-// explicit transaction, where layer mutation is safe; the link is
-// mutex-guarded.
-#[expect(
-    clippy::non_send_fields_in_send_ty,
-    reason = "the layer is touched only on the main queue"
-)]
-unsafe impl Send for DisplayAttach {}
-
-impl DisplayAttach {
-    /// Runs `attach` on the main queue. A display layer created off the
-    /// main thread silently drops its first enqueue — measured on
-    /// paravirtual Metal, 1/30 frames landed when the layer was created
-    /// on a background thread vs 30/30 when created on main — so the
-    /// render thread queues the create+attach rather than waiting on
-    /// the UI thread's run loop, which it must never block on.
-    fn run(self) {
-        if objc2::MainThreadMarker::new().is_some() {
-            self.attach();
-        } else {
-            dispatch2::DispatchQueue::main().exec_async(move || self.attach());
-        }
-    }
-
-    fn attach(self) {
-        let mut link = self.link.lock().expect("link poisoned");
-        if link.dead {
-            // The layer was demoted or the surface torn down while this
-            // block was queued: change nothing.
-            return;
-        }
-        // SAFETY: a new display layer, owned by the plane's tree.
-        let display = unsafe { AVSampleBufferDisplayLayer::new() };
-        display.setAnchorPoint(CGPoint::new(0.0, 0.0));
-        display.setPosition(CGPoint::new(0.0, 0.0));
-        unsafe {
-            display.setVideoGravity(AVLayerVideoGravityResize.expect("AVLayerVideoGravityResize"));
-            // Display sleep is the player's policy, not the compositor's.
-            display.setPreventsDisplaySleepDuringVideoPlayback(false);
-        }
-        {
-            let _tx = Transaction::begin();
-            if let Some(bounds) = link.bounds {
-                display.setBounds(bounds);
-            }
-            if let Some(opacity) = link.opacity {
-                display.setOpacity(opacity);
-            }
-            self.parent.addSublayer(&display);
-        }
-        // The commit above attached the layer; a display layer lays out
-        // its video sublayer correctly only on the main thread (the
-        // `MainLayout` race), and this block is already there.
-        display.setNeedsLayout();
-        display.layoutIfNeeded();
-        // SAFETY: the display layer's own renderer.
-        let renderer = unsafe { display.sampleBufferRenderer() };
-        if let Some(sample) = link.sample.take() {
-            // SAFETY: a display layer's renderer is fed from an
-            // arbitrary queue (its `requestMediaDataWhenReady`
-            // contract).
-            unsafe { renderer.enqueueSampleBuffer(&sample) };
-        }
-        link.display = Some(display);
-        link.renderer = Some(renderer);
-        drop(link);
-        // The attach is the event that makes this candidate promotable:
-        // an external frame or an invalidation wakes the host for the
-        // frame that shows it, and this does the same — the next render
-        // promotes the now-born candidate instead of compositing it
-        // in-engine forever on a static scene.
-        if let Some(waker) = &self.waker {
-            waker.wake();
-        }
-    }
 }
 
 const fn cg_affine(t: Affine) -> CGAffineTransform {
@@ -706,295 +616,6 @@ fn sample_buffer(buffer: &CVPixelBuffer) -> Result<CFRetained<CMSampleBuffer>, R
     Ok(sample)
 }
 
-impl LayerPlanes {
-    /// Builds the surface's root layer under `parent` and its first part.
-    ///
-    /// # Errors
-    /// [`SurfaceError::UnsupportedTarget`] when the adapter cannot present
-    /// to a metal layer.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the window's full negotiation input: device triple, parent,                   size, transparency, required space and the probe channel"
-    )]
-    pub fn new(
-        instance: &wgpu::Instance,
-        adapter: &wgpu::Adapter,
-        device: &wgpu::Device,
-        parent: Parent,
-        size: (u32, u32),
-        transparent: bool,
-        required: Option<wgpu::SurfaceColorSpace>,
-        probe: Option<std::sync::mpsc::Sender<crate::render::present::DisplayProbe>>,
-        waker: Option<cherenkov::MainWaker>,
-    ) -> Result<Self, SurfaceError> {
-        let _tx = Transaction::begin();
-        let Parent {
-            layer: host,
-            window,
-        } = parent;
-        let root = anchored();
-        // SAFETY: the name is an immutable literal.
-        root.setName(Some(&objc2_foundation::NSString::from_str("cherenkov")));
-        // Engine geometry is y-down. AppKit layers are y-up unless the view
-        // is flipped; UIKit layers are y-down.
-        #[cfg(target_os = "macos")]
-        root.setGeometryFlipped(!host.contentsAreFlipped());
-        host.addSublayer(&root);
-        let scale = host.contentsScale();
-        let mut planes = Self {
-            instance: instance.clone(),
-            adapter: adapter.clone(),
-            device: device.clone(),
-            _window: window,
-            root,
-            transparent,
-            required,
-            probe,
-            size,
-            scale,
-            parts: Vec::new(),
-            planes: Vec::new(),
-            pending: FxHashMap::default(),
-            staging: CALayer::new(),
-            offered: FxHashSet::default(),
-            woke: false,
-            waker,
-            restack: true,
-        };
-        planes.geometry();
-        planes.push_part()?;
-        planes.stack();
-        Ok(planes)
-    }
-
-    /// Sizes the root to the surface in points.
-    fn geometry(&self) {
-        let points = CGRect::new(
-            CGPoint::new(0.0, 0.0),
-            CGSize::new(
-                f64::from(self.size.0) / self.scale,
-                f64::from(self.size.1) / self.scale,
-            ),
-        );
-        self.root.setBounds(points);
-        for part in &self.parts {
-            part.layer.setFrame(points);
-            part.layer.setContentsScale(self.scale);
-        }
-        for plane in &self.planes {
-            plane
-                .top
-                .setAffineTransform(cg_affine(Affine::scale(1.0 / self.scale)));
-        }
-    }
-
-    fn push_part(&mut self) -> Result<(), SurfaceError> {
-        let layer = CAMetalLayer::new();
-        layer.setPresentsWithTransaction(true);
-        layer.setAnchorPoint(CGPoint::new(0.0, 0.0));
-        layer.setFrame(self.root.bounds());
-        layer.setContentsScale(self.scale);
-        // Parts above the first always show what lies beneath them.
-        let transparent = self.transparent || !self.parts.is_empty();
-        let surface = WindowSurface::from_layer(
-            &self.instance,
-            &self.adapter,
-            &self.device,
-            &layer,
-            self.size,
-            transparent,
-            self.required,
-            self.probe.take(),
-        )?;
-        self.parts.push(PartLayer { layer, surface });
-        self.restack = true;
-        Ok(())
-    }
-
-    /// Orders the root's sublayers: part 0, plane 0, part 1, …
-    fn stack(&mut self) {
-        if !self.restack {
-            return;
-        }
-        let mut order: Vec<&CALayer> = Vec::new();
-        for (i, part) in self.parts.iter().enumerate() {
-            order.push(&part.layer);
-            if let Some(plane) = self.planes.get(i) {
-                order.push(&plane.top);
-            }
-        }
-        for plane in self.planes.iter().skip(self.parts.len()) {
-            order.push(&plane.top);
-        }
-        let array = NSArray::from_slice(&order);
-        // SAFETY: every element is a `CALayer` this tree owns.
-        unsafe { self.root.setSublayers(Some(&array)) };
-        self.restack = false;
-    }
-
-    /// Builds the layers for `placement`.
-    /// `layer` can show a frame now: a committed plane already shows it,
-    /// or its pending link's display exists — the queued main-queue
-    /// attach has run.
-    fn born(&self, layer: LayerId) -> bool {
-        self.planes.iter().any(|plane| plane.layer == layer)
-            || self
-                .pending
-                .get(&layer)
-                .is_some_and(|link| link.lock().expect("link poisoned").display.is_some())
-    }
-
-    /// Builds the plane's level chain for `placement` and reparents the
-    /// display layer `link` carries — born and staged under `root` by
-    /// [`SystemPlanes::prepare`], or taken over from the plane it
-    /// replaces — under the chain's inner level inside this transaction,
-    /// which is safe from any thread.
-    fn plane_layers(&self, placement: &Placement, link: Arc<Mutex<DisplayLink>>) -> PlaneLayers {
-        let top = anchored();
-        top.setAffineTransform(cg_affine(Affine::scale(1.0 / self.scale)));
-        let mut outer: Retained<CALayer> = top.clone();
-        let mut levels = Vec::with_capacity(placement.path.len());
-        for level in &placement.path {
-            let node = anchored();
-            outer.addSublayer(&node);
-            let clip = level.clip.as_ref().map(|_| {
-                let clip = anchored();
-                node.addSublayer(&clip);
-                clip
-            });
-            let scroll = anchored();
-            clip.as_deref().unwrap_or(&node).addSublayer(&scroll);
-            outer = scroll.clone();
-            levels.push(LevelLayers { node, clip, scroll });
-        }
-        if let Some(display) = &link.lock().expect("link poisoned").display {
-            levels
-                .last()
-                .map_or(&*top, LevelLayers::inner)
-                .addSublayer(display);
-        }
-        PlaneLayers {
-            layer: placement.layer,
-            shape: shape(placement),
-            top,
-            levels,
-            link,
-            generation: None,
-            shown: None,
-        }
-    }
-
-    /// Hands `frame` to `plane`'s display layer: at once, or when the
-    /// producer's GPU signals the frame's event, never waiting on the CPU.
-    /// `resized` when its size differs from the frame shown before, the first
-    /// frame included: the display layer then needs its main-thread layout
-    /// (`MainLayout`).
-    ///
-    /// Called after the composition's transaction has committed: each enqueue
-    /// commits its own transaction, and the layout is queued only after it.
-    fn show(plane: &PlaneLayers, frame: &ExternalFrame, resized: bool) -> Result<(), RenderError> {
-        let buffer = pixel_buffer(frame)?;
-        let sample = sample_buffer(&buffer)?;
-        let mut link = plane.link.lock().expect("link poisoned");
-        let Some(renderer) = link.renderer.clone() else {
-            // The layer is still being born on the main queue; the
-            // attach hands it the latest frame.
-            link.sample = Some(sample);
-            return Ok(());
-        };
-        drop(link);
-        let layout = if resized {
-            plane
-                .link
-                .lock()
-                .expect("link poisoned")
-                .display
-                .clone()
-                .map(MainLayout)
-        } else {
-            None
-        };
-        let enqueue_renderer = renderer.clone();
-        let enqueue = move || {
-            {
-                let _tx = Transaction::begin();
-                // SAFETY: a display layer's renderer is fed from an arbitrary
-                // queue (its `requestMediaDataWhenReady` contract); the
-                // sample buffer stays retained here.
-                unsafe { enqueue_renderer.enqueueSampleBuffer(&sample) };
-            }
-            if let Some(layout) = layout {
-                layout.queue();
-            }
-        };
-        match &frame.wait {
-            None => enqueue(),
-            Some(FrameSync::Metal { event, value }) => {
-                let enqueue = std::cell::Cell::new(Some(enqueue));
-                let block = block2::RcBlock::new(
-                    move |_: NonNull<ProtocolObject<dyn MTLSharedEvent>>, _: u64| {
-                        if let Some(enqueue) = enqueue.take() {
-                            enqueue();
-                        }
-                    },
-                );
-                unsafe {
-                    event.notifyListener_atValue_block(
-                        &MTLSharedEventListener::sharedListener(),
-                        *value,
-                        block2::RcBlock::as_ptr(&block),
-                    );
-                }
-            }
-        }
-        // SAFETY: reading the renderer's status.
-        if unsafe { renderer.status() } == AVQueuedSampleBufferRenderingStatus::Failed {
-            let reason = unsafe { renderer.error() }.map_or_else(
-                || "no error reported".to_owned(),
-                |e| e.localizedDescription().to_string(),
-            );
-            return Err(RenderError::Render(format!(
-                "the system compositor rejected layer {:?}'s plane: {reason}",
-                plane.layer
-            )));
-        }
-        Ok(())
-    }
-}
-
-/// A display layer whose layout runs on the main queue.
-///
-/// A display layer derives the transform that fits its video into its bounds
-/// from the size of the frames it is fed, in a layout pass that is correct
-/// only on the main thread. Fed from the render thread, it queues a layout
-/// of its own on the main queue when the transaction holding the change
-/// commits, and that one keeps the transform computed before the first
-/// frame, offsetting the video by half its size. A layout queued after that
-/// commit runs after it and recomputes the transform; until it runs (one main
-/// run-loop turn) the frame shows at the stale transform.
-struct MainLayout(Retained<AVSampleBufferDisplayLayer>);
-
-// SAFETY: the layer is only retained and released off the main thread; it is
-// laid out on the main queue, where layer layout belongs.
-#[expect(
-    clippy::non_send_fields_in_send_ty,
-    reason = "the display layer is touched only on the main queue"
-)]
-unsafe impl Send for MainLayout {}
-
-impl MainLayout {
-    fn queue(self) {
-        // A method call moves the whole wrapper into the closure; a field
-        // pattern would capture only the layer.
-        dispatch2::DispatchQueue::main().exec_async(move || self.lay_out());
-    }
-
-    fn lay_out(self) {
-        self.0.setNeedsLayout();
-        self.0.layoutIfNeeded();
-    }
-}
-
 /// The nested-layer shape a placement needs.
 fn shape(placement: &Placement) -> Vec<(LayerId, bool)> {
     placement
@@ -1018,15 +639,306 @@ fn place(level: &Level, layers: &LevelLayers) {
         .setBounds(CGRect::new(CGPoint::new(x, y), CGSize::new(0.0, 0.0)));
 }
 
+impl LayerScene {
+    fn add_parts(
+        &mut self,
+        config: &Configuration,
+        count: usize,
+        mut probe: Option<mpsc::Sender<crate::render::present::DisplayProbe>>,
+    ) -> Result<Vec<WindowSurface>, SurfaceError> {
+        let mut parts = Vec::new();
+        let _tx = Transaction::begin();
+        while self.parts.len() < count {
+            let layer = CAMetalLayer::new();
+            layer.setPresentsWithTransaction(true);
+            layer.setAnchorPoint(CGPoint::new(0.0, 0.0));
+            let surface = WindowSurface::from_layer(
+                &config.instance,
+                &config.adapter,
+                &config.device,
+                &layer,
+                config.size,
+                config.transparent || !self.parts.is_empty(),
+                config.required,
+                probe.take(),
+            )?;
+            self.parts.push(layer);
+            parts.push(surface);
+        }
+        Ok(parts)
+    }
+
+    fn attach(&mut self, layer: LayerId) {
+        // SAFETY: creation and every subsequent use are on main.
+        let display = unsafe { AVSampleBufferDisplayLayer::new() };
+        display.setAnchorPoint(CGPoint::new(0.0, 0.0));
+        display.setPosition(CGPoint::new(0.0, 0.0));
+        unsafe {
+            display.setVideoGravity(AVLayerVideoGravityResize.expect("video gravity"));
+            display.setPreventsDisplaySleepDuringVideoPlayback(false);
+        }
+        assert!(
+            self.displays
+                .insert(
+                    layer,
+                    DisplayLayer {
+                        display,
+                        generation: None,
+                    }
+                )
+                .is_none(),
+            "each candidate has one display"
+        );
+    }
+
+    fn plane_layers(&self, placement: &Placement, scale: f64) -> PlaneLayers {
+        let top = anchored();
+        top.setAffineTransform(cg_affine(Affine::scale(1.0 / scale)));
+        let mut outer = top.clone();
+        let mut levels = Vec::with_capacity(placement.path.len());
+        for level in &placement.path {
+            let node = anchored();
+            outer.addSublayer(&node);
+            let clip = level.clip.as_ref().map(|_| {
+                let clip = anchored();
+                node.addSublayer(&clip);
+                clip
+            });
+            let scroll = anchored();
+            clip.as_deref().unwrap_or(&node).addSublayer(&scroll);
+            outer = scroll.clone();
+            levels.push(LevelLayers { node, clip, scroll });
+        }
+        let display = &self.displays[&placement.layer].display;
+        levels
+            .last()
+            .map_or(&*top, LevelLayers::inner)
+            .addSublayer(display);
+        PlaneLayers {
+            layer: placement.layer,
+            shape: shape(placement),
+            top,
+            levels,
+        }
+    }
+
+    fn place(&mut self, placements: &[Placement], size: (u32, u32), scale: f64, parts: usize) {
+        let bounds = CGRect::new(
+            CGPoint::new(0.0, 0.0),
+            CGSize::new(f64::from(size.0) / scale, f64::from(size.1) / scale),
+        );
+        self.root.setBounds(bounds);
+        // Identity, not position, determines reuse. Moving B from slot 1 to
+        // slot 0 never consumes or replaces A's display.
+        let mut old = std::mem::take(&mut self.planes);
+        for placement in placements {
+            let built = old
+                .iter()
+                .position(|p| p.layer == placement.layer && p.shape == shape(placement))
+                .map_or_else(|| self.plane_layers(placement, scale), |i| old.remove(i));
+            built
+                .top
+                .setAffineTransform(cg_affine(Affine::scale(1.0 / scale)));
+            for (level, layers) in placement.path.iter().zip(&built.levels) {
+                place(level, layers);
+            }
+            let display = &self.displays[&placement.layer].display;
+            display.setBounds(CGRect::new(
+                CGPoint::new(0.0, 0.0),
+                CGSize::new(f64::from(placement.size.0), f64::from(placement.size.1)),
+            ));
+            display.setOpacity(placement.opacity);
+            self.planes.push(built);
+        }
+        for plane in old {
+            plane.top.removeFromSuperlayer();
+        }
+        let mut order: Vec<&CALayer> = Vec::new();
+        for i in 0..parts {
+            let part = &self.parts[i];
+            part.setFrame(bounds);
+            part.setContentsScale(scale);
+            order.push(part);
+            if let Some(plane) = self.planes.get(i) {
+                order.push(&plane.top);
+            }
+        }
+        for plane in self.planes.iter().skip(parts) {
+            order.push(&plane.top);
+        }
+        // SAFETY: all elements are layers retained by this main-thread scene.
+        unsafe { self.root.setSublayers(Some(&NSArray::from_slice(&order))) };
+    }
+
+    fn show(&mut self, layer: LayerId, frame: &ExternalFrame, generation: u64) {
+        let shown = self.displays.get_mut(&layer).expect("a ready display");
+        if shown.generation == Some(generation) {
+            return;
+        }
+        let buffer = pixel_buffer(frame).expect("an admitted frame has a pixel buffer");
+        let sample = sample_buffer(&buffer).expect("a valid video sample");
+        // SAFETY: the layer and its renderer are accessed only on main.
+        let renderer = unsafe { shown.display.sampleBufferRenderer() };
+        unsafe { renderer.enqueueSampleBuffer(&sample) };
+        assert_ne!(
+            unsafe { renderer.status() },
+            AVQueuedSampleBufferRenderingStatus::Failed,
+            "system compositor rejected the frame: {:?}",
+            unsafe { renderer.error() }
+        );
+        shown.display.setNeedsLayout();
+        shown.display.layoutIfNeeded();
+        shown.generation = Some(generation);
+    }
+}
+
+/// Owned frame messages preserve textures until their producer's completion.
+struct Update {
+    layer: LayerId,
+    frame: ExternalFrame,
+    generation: u64,
+}
+
+impl Update {
+    fn from_plane(plane: &Plane<'_>) -> Self {
+        let PlaneContent::Frame { frame, generation } = &plane.content;
+        Self {
+            layer: plane.placement.layer,
+            frame: (*frame).clone(),
+            generation: *generation,
+        }
+    }
+}
+
+impl LayerPlanes {
+    /// Opens a main-owned compositor without waiting for the main queue.
+    ///
+    /// # Errors
+    /// Surface negotiation errors are delivered by the completion to compose.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the existing surface negotiation inputs"
+    )]
+    pub fn new(
+        instance: &wgpu::Instance,
+        adapter: &wgpu::Adapter,
+        device: &wgpu::Device,
+        parent: Parent,
+        size: (u32, u32),
+        transparent: bool,
+        required: Option<wgpu::SurfaceColorSpace>,
+        probe: Option<mpsc::Sender<crate::render::present::DisplayProbe>>,
+        waker: Option<cherenkov::CompletionWaker>,
+    ) -> Self {
+        let mut result = Self {
+            scene: parent.scene,
+            config: Configuration {
+                instance: instance.clone(),
+                adapter: adapter.clone(),
+                device: device.clone(),
+                size,
+                transparent,
+                required,
+            },
+            parts: Vec::new(),
+            replies: Vec::new(),
+            requested_parts: 0,
+            candidates: FxHashMap::default(),
+            offered: FxHashSet::default(),
+            woke: false,
+            waker,
+        };
+        result.request_parts(1, probe);
+        result
+    }
+
+    fn request_parts(
+        &mut self,
+        count: usize,
+        probe: Option<mpsc::Sender<crate::render::present::DisplayProbe>>,
+    ) {
+        if count <= self.requested_parts {
+            return;
+        }
+        let (send, receive) = mpsc::channel();
+        self.replies.push(receive);
+        self.requested_parts = count;
+        let config = self.config.clone();
+        let waker = self.waker.clone();
+        self.scene.run(move |scene, _| {
+            let result = scene.add_parts(&config, count, probe);
+            if send.send(result).is_err() {
+                // Cancellation: the render owner was destroyed while this
+                // command was queued. Its scene release is queued behind us.
+                scene.root.removeFromSuperlayer();
+                return;
+            }
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        });
+    }
+
+    fn collect_parts(&mut self) -> Result<(), RenderError> {
+        let mut consumed = 0;
+        for reply in &self.replies {
+            match reply.try_recv() {
+                Ok(result) => {
+                    self.parts
+                        .extend(result.map_err(|error| RenderError::Render(error.to_string()))?);
+                    consumed += 1;
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    panic!("main part creation lost its reply")
+                }
+            }
+        }
+        self.replies.drain(..consumed);
+        Ok(())
+    }
+
+    fn enqueue(&self, update: Update) {
+        let scene = self.scene.clone();
+        let wait = update.frame.wait.clone();
+        let enqueue = move || {
+            scene.run(move |scene, _| {
+                // Removal is a valid cancellation of an in-flight producer.
+                if scene.displays.contains_key(&update.layer) {
+                    let _tx = Transaction::begin();
+                    scene.show(update.layer, &update.frame, update.generation);
+                }
+            });
+        };
+        match &wait {
+            None => enqueue(),
+            Some(FrameSync::Metal { event, value }) => {
+                let event = event.clone();
+                let value = *value;
+                let enqueue = std::cell::Cell::new(Some(enqueue));
+                let block = block2::RcBlock::new(
+                    move |_: NonNull<ProtocolObject<dyn MTLSharedEvent>>, _: u64| {
+                        enqueue.take().expect("one producer completion")();
+                    },
+                );
+                // SAFETY: the event retains the block until it fires. The
+                // callback only submits owned Send messages to main.
+                unsafe {
+                    event.notifyListener_atValue_block(
+                        &MTLSharedEventListener::sharedListener(),
+                        value,
+                        block2::RcBlock::as_ptr(&block),
+                    );
+                }
+            }
+        }
+    }
+}
+
 impl Compositor for LayerPlanes {
-    /// Two planes: a main video and one picture-in-picture. Each plane adds
-    /// a full-surface engine part and swapchain above it, and planes beyond
-    /// what the display pipes scan out are composited by the system on the
-    /// GPU anyway, which removes the energy win the promotion is for.
     const BUDGET: usize = 2;
 
     fn expresses_transform(transform: Affine) -> bool {
-        // A layer carries any affine matrix; only a finite one is valid.
         transform.as_coeffs().iter().all(|c| c.is_finite())
     }
 
@@ -1035,151 +947,108 @@ impl Compositor for LayerPlanes {
     }
 
     fn shows(frame: &ExternalFrame) -> bool {
-        // The platform must decode the frame the way the engine would:
-        // an `ITU_R_709_2` frame is decoded with the inverse OETF while
-        // the engine applies BT.1886 γ2.4, and no colour tag reproduces
-        // γ2.4 (a `GammaLevel` tag is ignored by the decode path —
-        // measured levels 1.0/2.2/2.4 producing identical output), so a
-        // promoted BT.709 plane would land darker than engine output.
-        if frame.color.transfer == Transfer::Bt709 {
-            return false;
-        }
-        frame_surface(frame).is_some()
+        // The proven class is opaque BGRA8/sRGB. YUV range expansion,
+        // BT.1886, and HDR tone mapping differ from the engine; they remain
+        // engine-composited until their platform parity is established.
+        matches!(&frame.planes, FramePlanes::Rgb { plane, .. }
+            if plane.format() == wgpu::TextureFormat::Bgra8Unorm)
+            && frame.color.transfer == Transfer::Srgb
+            && frame.color.primaries == Primaries::Bt709
+            && frame_surface(frame).is_some()
     }
 }
 
 impl SystemPlanes for LayerPlanes {
-    #[expect(
-        clippy::float_cmp,
-        reason = "any change of the display scale re-lays out the tree"
-    )]
     fn compose(&mut self, c: Composition<'_>) -> Result<bool, RenderError> {
-        // Frames are shown after this commits (`show`).
-        let tx = Transaction::begin();
-        if c.display.scale != self.scale || c.size != self.size {
-            self.scale = c.display.scale;
-            self.size = c.size;
-            self.geometry();
+        self.collect_parts()?;
+        self.request_parts(c.parts.len(), None);
+        if self.parts.len() < c.parts.len() {
+            return Ok(false);
         }
-        while self.parts.len() < c.parts.len() {
-            self.push_part()
-                .map_err(|e| RenderError::Render(format!("an engine part's metal layer: {e}")))?;
-        }
-        if self.parts.len() > c.parts.len() {
-            for part in self.parts.drain(c.parts.len()..) {
-                part.layer.removeFromSuperlayer();
-            }
-            self.restack = true;
-        }
-        for (i, plane) in c.planes.iter().enumerate() {
-            let fits = self.planes.get(i).is_some_and(|built| {
-                built.layer == plane.placement.layer && built.shape == shape(plane.placement)
-            });
-            if !fits {
-                // A re-placed plane keeps its born display layer; a new
-                // one takes over the link `prepare` staged for its
-                // candidate — its display is attached by definition,
-                // since `prepare` admits only born layers.
-                let link = self
-                    .planes
-                    .get(i)
-                    .filter(|old| old.layer == plane.placement.layer)
-                    .map(|old| Arc::clone(&old.link))
-                    .or_else(|| self.pending.remove(&plane.placement.layer))
-                    .expect("a promoted candidate's display layer is born");
-                let built = self.plane_layers(plane.placement, link);
-                if i < self.planes.len() {
-                    let old = std::mem::replace(&mut self.planes[i], built);
-                    old.top.removeFromSuperlayer();
-                } else {
-                    self.planes.push(built);
-                }
-                self.restack = true;
-            }
-        }
-        if self.planes.len() > c.planes.len() {
-            for plane in self.planes.drain(c.planes.len()..) {
-                plane.top.removeFromSuperlayer();
-            }
-            self.restack = true;
-        }
-        self.stack();
-        for (plane, built) in c.planes.iter().zip(&mut self.planes) {
-            for (level, layers) in plane.placement.path.iter().zip(&built.levels) {
-                place(level, layers);
-            }
-            let (w, h) = plane.placement.size;
-            let bounds = CGRect::new(
-                CGPoint::new(0.0, 0.0),
-                CGSize::new(f64::from(w), f64::from(h)),
-            );
-            let mut link = built.link.lock().expect("link poisoned");
-            link.bounds = Some(bounds);
-            link.opacity = Some(plane.placement.opacity);
-            if let Some(display) = &link.display {
-                display.setBounds(bounds);
-                display.setOpacity(plane.placement.opacity);
-            }
-            drop(link);
-        }
-        let mut presented = true;
+        let mut frames = Vec::with_capacity(c.parts.len());
         for (part, target) in c.parts.iter().zip(&self.parts) {
-            presented &= c.presenter.present(
-                c.device,
-                c.queue,
-                &target.surface,
-                part.view,
-                c.display.headroom,
-            )?;
+            let Some(frame) =
+                c.presenter
+                    .prepare(c.device, c.queue, target, part.view, c.display.headroom)?
+            else {
+                return Ok(false);
+            };
+            frames.push(frame);
         }
-        drop(tx);
-        for (plane, built) in c.planes.iter().zip(&mut self.planes) {
-            match plane.content {
-                PlaneContent::Frame { frame, generation } => {
-                    if built.generation != Some(generation) {
-                        let resized = built.shown != Some(plane.placement.size);
-                        Self::show(built, frame, resized)?;
-                        built.generation = Some(generation);
-                        built.shown = Some(plane.placement.size);
-                    }
-                }
+        let placements: Vec<_> = c
+            .planes
+            .iter()
+            .map(|plane| plane.placement.clone())
+            .collect();
+        let size = c.size;
+        let scale = c.display.scale;
+        let queue = c.queue.clone();
+        self.scene.run(move |scene, _| {
+            let _tx = Transaction::begin();
+            scene.place(&placements, size, scale, frames.len());
+            for frame in frames {
+                queue.present(frame);
             }
+        });
+        for plane in c.planes {
+            self.enqueue(Update::from_plane(plane));
         }
-        Ok(presented)
+        Ok(true)
     }
 
-    fn groom(&mut self, candidates: &FxHashMap<LayerId, (u32, u32)>) {
-        // A candidate that left the eligible set before its attach ran is
-        // dead: the queued block sees `dead` and changes nothing.
-        self.pending.retain(|layer, link| {
-            let keep = candidates.contains_key(layer);
-            if !keep {
-                link.lock().expect("link poisoned").dead = true;
-            }
-            keep
-        });
+    fn groom_with_frames(
+        &mut self,
+        candidates: &FxHashMap<LayerId, (u32, u32)>,
+        frames: &FxHashMap<LayerId, (ExternalFrame, u64)>,
+    ) {
+        let removed: Vec<_> = self
+            .candidates
+            .keys()
+            .filter(|id| !candidates.contains_key(id))
+            .copied()
+            .collect();
+        for id in removed {
+            self.candidates.remove(&id);
+            self.scene.run(move |scene, _| {
+                if let Some(display) = scene.displays.remove(&id) {
+                    display.display.removeFromSuperlayer();
+                }
+            });
+        }
+        self.request_parts(candidates.len().min(Self::BUDGET) + 1, None);
         for &layer in candidates.keys() {
-            if self.born(layer) || self.pending.contains_key(&layer) {
+            let Some((frame, generation)) = frames.get(&layer).cloned() else {
                 continue;
-            }
-            let link = Arc::new(Mutex::new(DisplayLink::default()));
-            DisplayAttach {
-                parent: self.staging.clone(),
-                link: Arc::clone(&link),
-                waker: self.waker.clone(),
-            }
-            .run();
-            self.pending.insert(layer, link);
+            };
+            self.candidates.entry(layer).or_insert_with(|| {
+                let ready = Arc::new(AtomicBool::new(false));
+                let live = Arc::downgrade(&ready);
+                let waker = self.waker.clone();
+                self.scene.run(move |scene, _| {
+                    if let Some(ready) = live.upgrade() {
+                        scene.attach(layer);
+                        scene.show(layer, &frame, generation);
+                        let display = &scene.displays[&layer].display;
+                        // The attach is not enough: a headless window
+                        // server can create the layer but never make it
+                        // ready for display. Promotion waits for this
+                        // platform signal and keeps the engine path when
+                        // it is false.
+                        let is_ready = unsafe { display.isReadyForDisplay() };
+                        ready.store(is_ready, Ordering::Release);
+                        if let Some(waker) = waker {
+                            waker.wake();
+                        }
+                    }
+                });
+                ready
+            });
         }
         self.offered.retain(|layer| candidates.contains_key(layer));
         self.woke = false;
-        for &layer in candidates.keys() {
-            if self.born(layer) {
-                if self.offered.insert(layer) {
-                    self.woke = true;
-                }
-            } else {
-                self.offered.remove(&layer);
+        for (&layer, ready) in &self.candidates {
+            if ready.load(Ordering::Acquire) && self.offered.insert(layer) {
+                self.woke = true;
             }
         }
     }
@@ -1191,73 +1060,39 @@ impl SystemPlanes for LayerPlanes {
     fn prepare(
         &mut self,
         candidates: &FxHashMap<LayerId, (u32, u32)>,
+        frames: &FxHashMap<LayerId, (ExternalFrame, u64)>,
         ready: &mut FxHashSet<LayerId>,
     ) {
-        self.groom(candidates);
+        self.groom_with_frames(candidates, frames);
         ready.clear();
-        ready.extend(candidates.keys().copied().filter(|layer| self.born(*layer)));
+        ready.extend(
+            self.candidates
+                .iter()
+                .filter(|(_, flag)| flag.load(Ordering::Acquire))
+                .map(|(&layer, _)| layer),
+        );
     }
 
-    /// Hands each promoted layer's new frame to its display layer: the
-    /// layer tree and geometry are the ones `compose` built for the
-    /// committed plan, and the parts' layers keep their shown buffers —
-    /// nothing here presents or reconfigures them (#90).
-    ///
-    /// # Errors
-    /// A [`RenderError`] naming the cause when the system rejects a plane
-    /// or a refresh names a layer no plane shows.
     fn refresh<'a>(&mut self, frames: impl Iterator<Item = Plane<'a>>) -> Result<(), RenderError> {
-        for update in frames {
-            match update.content {
-                PlaneContent::Frame { frame, generation } => {
-                    let Some(built) = self
-                        .planes
-                        .iter_mut()
-                        .find(|plane| plane.layer == update.placement.layer)
-                    else {
-                        return Err(RenderError::Render(format!(
-                            "layer {:?}'s frame changed while no plane shows it",
-                            update.placement.layer
-                        )));
-                    };
-                    if built.generation != Some(generation) {
-                        let resized = built.shown != Some(update.placement.size);
-                        Self::show(built, frame, resized)?;
-                        built.generation = Some(generation);
-                        built.shown = Some(update.placement.size);
-                    }
-                }
-            }
+        for plane in frames {
+            self.enqueue(Update::from_plane(&plane));
         }
         Ok(())
     }
 
     fn resize(&mut self, size: (u32, u32)) {
-        // Reconfiguring a part changes its layer: the render thread has no
-        // run loop to commit an implicit transaction.
-        let _tx = Transaction::begin();
+        self.config.size = size;
         for part in &mut self.parts {
-            part.surface.resize(&self.device, size);
+            part.resize(&self.config.device, size);
         }
     }
 
     fn reselect(&mut self, adapter: &wgpu::Adapter, device: &wgpu::Device) {
-        let _tx = Transaction::begin();
+        self.config.adapter = adapter.clone();
+        self.config.device = device.clone();
         for part in &mut self.parts {
-            part.surface.reselect(adapter, device);
+            part.reselect(adapter, device);
         }
-    }
-}
-
-impl Drop for LayerPlanes {
-    fn drop(&mut self) {
-        // A queued attach that has not run sees `dead` and changes
-        // nothing beyond releasing its link.
-        for (_, link) in self.pending.drain() {
-            link.lock().expect("link poisoned").dead = true;
-        }
-        let _tx = Transaction::begin();
-        self.root.removeFromSuperlayer();
     }
 }
 

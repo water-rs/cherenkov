@@ -286,7 +286,7 @@ pub fn shader_module(device: &wgpu::Device, label: &str, source: &str) -> wgpu::
 ///
 /// A new frame wakes the surface through the same coalesced waker as
 /// recorded content; the engine never polls the producer.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ExternalFrame {
     /// The textures the fragment stage samples.
     pub planes: FramePlanes,
@@ -297,7 +297,7 @@ pub struct ExternalFrame {
 }
 
 /// The planes an [`ExternalFrame`] samples.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum FramePlanes {
     /// Two-plane 4:2:0 YUV: one luma plane and one interleaved chroma plane.
     ///
@@ -563,7 +563,7 @@ pub struct ContentLight {
 /// samples the frame's planes; it never waits on the CPU. A producer
 /// signalling later work simply installs the next frame with its own sync.
 #[non_exhaustive]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum FrameSync {
     /// A Metal shared event and the value it must reach.
     ///

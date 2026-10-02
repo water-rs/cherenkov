@@ -63,6 +63,7 @@ pub struct CompletionWaker(Arc<Waker>);
 
 impl CompletionWaker {
     /// Wraps the engine's waker. Called on the engine's thread.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn new(waker: &Arc<Waker>) -> Self {
         Self(Arc::clone(waker))
     }

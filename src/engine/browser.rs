@@ -210,6 +210,9 @@ impl<B: Backend> Engine<B> {
     /// paused after `Next::Idle`, the host must learn that a frame is
     /// needed: the engine calls `f` at most once between two
     /// [`Engine::render`]s, the first time something is queued.
+    ///
+    /// # Panics
+    /// Panics if the engine's callback slot is poisoned by a prior panic.
     pub fn set_waker(&self, f: impl Fn() + 'static) {
         *self.waker.callback.lock().expect("waker poisoned") = Some(Box::new(f));
     }

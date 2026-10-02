@@ -12,7 +12,7 @@ fallback):
 
 | Backend | Loaded as | Artifact |
 |---|---|---|
-| Vulkan | SPIR-V passthrough | `<name>.spv`: naga emission run through the `spirv-opt -O` recipe minus `simplify-instructions`, validated by `spirv-val --target-env vulkan1.0` |
+| Vulkan | SPIR-V passthrough | `<name>.spv`: naga emission as-is. A `spirv-opt -O` step ran here until issue #124 measured it a net loss on Mali-G715 — ~0.7 s faster pipeline creation but ~2x slower GPU time on the effects scene — so the driver's own compiler does the optimizing |
 | Metal | `.metallib` passthrough | `<name>.metallib`: naga MSL at wgpu-hal's argument slots, compiled by `xcrun -sdk <sdk> metal` + `metallib` during the build |
 | WebGPU (wasm32) | WGSL | The original source, via `create_shader_module_trusted` with unchecked runtime checks |
 | DX12, GL, BrowserWebGpu native | WGSL | Same trusted-WGSL path; wgpu 29 passthrough has no GLSL producer and this build produces no DXIL/HLSL — WGSL is the declared delivery for those backends |
@@ -63,10 +63,7 @@ which wgpu-hal advertises unconditionally there.
 
 ## Build requirements
 
-- `spirv-opt` and `spirv-val` (the `spirv-tools` package: apt, brew, or MSYS2
-  `mingw-w64-ucrt-x86_64-spirv-tools`) on the build host for every non-wasm
-  target. Missing tools fail the build with an install hint.
-- Apple targets additionally run `xcrun -sdk <macosx|iphoneos|iphonesimulator>
+- Apple targets run `xcrun -sdk <macosx|iphoneos|iphonesimulator>
   metal`/`metallib`, so building for Apple requires an Apple host — an
   explicit error otherwise. The Metal compiler's `-std` matches naga's
   emitted language version. It must not inherit the build SDK's newest
@@ -90,7 +87,6 @@ reading the emitted MSL signatures and slot assignments against wgpu-hal 29's
 ```sh
 git clone https://github.com/water-rs/cherenkov && cd cherenkov
 rustup default stable
-brew install spirv-tools   # build-time shader optimizer/validator
 
 # 1. Build for macOS — compiles .metal -> .air -> .metallib via xcrun.
 cargo build -p cherenkov-gpu

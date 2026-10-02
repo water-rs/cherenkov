@@ -10,7 +10,7 @@
 //!
 //! Delivery by backend:
 //!
-//! - **Vulkan** gets `spirv-opt -O` SPIR-V. The `.spv` artifacts exist
+//! - **Vulkan** gets naga's SPIR-V emission. The `.spv` artifacts exist
 //!   only on the non-Apple, non-wasm targets where wgpu compiles its
 //!   Vulkan backend (issue #241), so SPIR-V is embedded there only.
 //! - **Metal** gets a `.metallib` compiled by `xcrun` during the build.
@@ -27,7 +27,7 @@ use cherenkov::{EngineError, ResourceError};
 struct Fixed {
     /// WGSL source — the fallback text and the input `build.rs` compiled.
     wgsl: &'static str,
-    /// `spirv-opt -O` output, as little-endian SPIR-V bytes. The field
+    /// naga's SPIR-V emission as little-endian bytes. The field
     /// exists only where the artifacts do — [`spirv`]'s targets (issue
     /// #241) — so no build carries a dummy empty slice.
     #[cfg(cherenkov_spirv)]
@@ -178,12 +178,12 @@ pub fn validate_wgsl(text: &str) -> Result<naga::Module, ResourceError> {
 ///
 /// wgpu compiles its Vulkan backend on exactly the non-Apple, non-wasm
 /// targets (issue #241): Apple builds load `.metallib`s and wasm keeps
-/// WGSL, so neither produces nor embeds these bytes and `build.rs` never
-/// calls spirv-tools there. `build.rs` emits the `cherenkov_spirv` cfg on
+/// WGSL, so neither produces nor embeds these bytes. `build.rs` emits the
+/// `cherenkov_spirv` cfg on
 /// exactly those targets, so the condition lives in one place (issue #241).
 #[cfg(cherenkov_spirv)]
 pub mod spirv {
-    /// `spirv-opt -O` output for the three `VARIANT` specializations of
+    /// naga SPIR-V for the three `VARIANT` specializations of
     /// `shader.wgsl`.
     pub const ENGINE: [&[u8]; 3] = [
         include_bytes!(concat!(env!("OUT_DIR"), "/engine0.spv")),
@@ -416,7 +416,7 @@ impl ShaderDelivery {
             }
             #[cfg(cherenkov_spirv)]
             Self::Spirv => {
-                // SAFETY: `fixed.spirv` is naga+spirv-opt output embedded
+                // SAFETY: `fixed.spirv` is naga output embedded
                 // at build time — trusted SPIR-V matching the pipeline
                 // layout.
                 unsafe {

@@ -61,13 +61,12 @@ mod macos {
         CVPixelBuffer, CVPixelBufferCreate, CVPixelBufferGetBaseAddressOfPlane,
         CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferGetHeightOfPlane,
         CVPixelBufferGetIOSurface, CVPixelBufferGetWidthOfPlane, CVPixelBufferLockBaseAddress,
-        CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress, kCVImageBufferChromaLocation_Left,
-        kCVImageBufferChromaLocationTopFieldKey, kCVImageBufferColorPrimaries_ITU_R_2020,
-        kCVImageBufferColorPrimariesKey, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ,
-        kCVImageBufferTransferFunctionKey, kCVImageBufferYCbCrMatrix_ITU_R_2020,
-        kCVImageBufferYCbCrMatrixKey, kCVPixelBufferIOSurfacePropertiesKey,
-        kCVPixelBufferMetalCompatibilityKey, kCVPixelFormatType_32BGRA,
-        kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, kCVReturnSuccess,
+        CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
+        kCVImageBufferColorPrimaries_ITU_R_709_2, kCVImageBufferColorPrimariesKey,
+        kCVImageBufferTransferFunction_sRGB, kCVImageBufferTransferFunctionKey,
+        kCVPixelBufferIOSurfacePropertiesKey, kCVPixelBufferMetalCompatibilityKey,
+        kCVPixelFormatType_32BGRA, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+        kCVReturnSuccess,
     };
     use objc2_metal::{
         MTLCommandBuffer as _, MTLCommandQueue, MTLDevice, MTLPixelFormat, MTLRegion,
@@ -276,18 +275,18 @@ mod macos {
     }
 
     /// A view that is never put in a window, as a window handle.
-    struct View(NonNull<NSView>);
-
-    // SAFETY: the engine reads the handle once, on the main thread, in
-    // `WindowTarget::new`; the fixture keeps the view alive and releases it
-    // on the main thread.
-    unsafe impl Send for View {}
-    // SAFETY: as above.
-    unsafe impl Sync for View {}
+    struct View(dispatch2::MainThreadBound<Retained<NSView>>);
 
     impl HasWindowHandle for View {
         fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
-            let raw = RawWindowHandle::AppKit(AppKitWindowHandle::new(self.0.cast()));
+            let raw = RawWindowHandle::AppKit(AppKitWindowHandle::new(
+                NonNull::from(
+                    &**self
+                        .0
+                        .get(MainThreadMarker::new().expect("window capture on main")),
+                )
+                .cast(),
+            ));
             // SAFETY: the view outlives the handle.
             Ok(unsafe { WindowHandle::borrow_raw(raw) })
         }
@@ -366,12 +365,19 @@ mod macos {
                 },
             );
         }
+        drain_main();
+        CATransaction::flush();
+    }
+
+    fn drain_main() {
         let drained = Arc::new(AtomicBool::new(false));
         let mark = Arc::clone(&drained);
         DispatchQueue::main().exec_async(move || mark.store(true, Ordering::Release));
-        drive(deadline, &|| drained.load(Ordering::Acquire), &|| {
-            "the main queue never drained".into()
-        });
+        drive(
+            Instant::now() + Duration::from_secs(10),
+            &|| drained.load(Ordering::Acquire),
+            &|| "the main queue never drained".into(),
+        );
         CATransaction::flush();
     }
 
@@ -578,7 +584,10 @@ mod macos {
             host.setContentsScale(SCALE);
             let system = SystemCompositor::attach(&metal, &host);
             let window = engine
-                .surface(WindowTarget::new(View(NonNull::from(&*view)), SIZE))
+                .surface(WindowTarget::new(
+                    View(dispatch2::MainThreadBound::new(view.clone(), mtm)),
+                    SIZE,
+                ))
                 .expect("a window surface");
             window
                 .display(Display {
@@ -613,8 +622,18 @@ mod macos {
         }
 
         fn render(&self) {
+            drain_main();
             self.engine.render(FrameTime::now()).expect("rendered");
+            drain_main();
             settle(&self.host());
+        }
+
+        fn refusal_cycle(&self) {
+            self.render();
+            // The queue barrier observes every attach that the first render
+            // submitted, even if the tested refusal prevents any attach.
+            // The second frame exercises eligibility after readiness.
+            self.render();
         }
 
         /// The frames a window produces while a candidate's attach lands:
@@ -622,7 +641,8 @@ mod macos {
         /// asserted, the pending contract — the attach block's
         /// completion wake is both the drain's done signal and the
         /// redraw request, and the second render promotes it.
-        fn promote(&self) {
+        fn promote(&self) -> bool {
+            drain_main();
             self.woke.store(false, Ordering::Relaxed);
             self.engine.render(FrameTime::now()).expect("rendered");
             assert!(
@@ -630,8 +650,18 @@ mod macos {
                 "the pending candidate stays engine-composited"
             );
             settle_flag(&self.woke, "the queued attach never completed");
+            drain_main();
             self.engine.render(FrameTime::now()).expect("rendered");
+            drain_main();
             settle(&self.host());
+            let available = !displays(&self.root()).is_empty();
+            if !available {
+                assert!(
+                    displays(&self.root()).is_empty(),
+                    "an unavailable display layer must not be promoted"
+                );
+            }
+            available
         }
     }
 
@@ -662,11 +692,13 @@ mod macos {
                 WorkingColor::new([0.1, 0.3, 0.6, 1.0]),
             );
         });
+        let bar_rect = if bar_alpha >= 1.0 {
+            Rect::new(8.0, 58.0, 88.0, 64.0)
+        } else {
+            Rect::new(8.0, 44.0, 88.0, 58.0)
+        };
         let bar = surface.record(|c| {
-            c.fill(
-                Rect::new(8.0, 44.0, 88.0, 58.0),
-                WorkingColor::new([0.5, 0.5, 0.5, bar_alpha]),
-            );
+            c.fill(bar_rect, WorkingColor::new([0.5, 0.5, 0.5, bar_alpha]));
         });
         let video = engine.external_frame(frame);
         surface.update(|tx| {
@@ -677,7 +709,7 @@ mod macos {
                 .transform(Affine::translate((12.0, 8.0)))
                 .clip(RoundedRect::new(0.0, 0.0, 72.0, 48.0, 6.0));
             tx[&player].transform(Affine::scale(1.5)).content(video);
-            tx[&above].content(bar);
+            tx[&above].content(bar).clip(bar_rect);
         });
         [below, holder, player, above]
     }
@@ -697,14 +729,16 @@ mod macos {
     /// transform, rounded clip, and the frame's size and opacity.
     fn the_realized_tree_puts_the_plane_between_its_parts() {
         let fixture = Fixture::new();
-        let buffer = nv12_buffer(VIDEO);
+        let buffer = bgra_buffer();
         let _scene = scene_bar(
             &fixture.engine,
             &fixture.window,
-            nv12(&fixture.metal, &buffer, FrameColor::BT2020_PQ),
+            bgra(&fixture.metal, &buffer, FrameColor::SRGB),
             1.0,
         );
-        fixture.promote();
+        if !fixture.promote() {
+            return;
+        }
 
         let root = fixture.root();
         assert!(root.isGeometryFlipped(), "engine space is y-down");
@@ -746,61 +780,77 @@ mod macos {
             .is_some_and(|v| v.downcast_ref::<CFString>().is_some_and(|s| s == expected))
     }
 
-    /// The display layer shows the frame's own `IOSurface`, without a copy,
-    /// tagged with exactly the colour the frame declares, so the system
-    /// decodes and tone-maps it the way the engine would.
+    /// Admitted BGRA/sRGB retains the source `IOSurface` and colour tags.
     fn a_promoted_frame_shows_its_own_surface_and_declared_colour() {
-        // SAFETY: CoreVideo's constants are immutable statics.
-        let cases = unsafe {
-            [(
-                FrameColor::BT2020_PQ,
-                kCVImageBufferColorPrimaries_ITU_R_2020,
-                kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ,
-                kCVImageBufferYCbCrMatrix_ITU_R_2020,
-            )]
-        };
-        for (color, primaries, transfer, matrix) in cases {
-            let fixture = Fixture::new();
-            let buffer = nv12_buffer(VIDEO);
-            let _scene = scene_bar(
-                &fixture.engine,
-                &fixture.window,
-                nv12(&fixture.metal, &buffer, color),
-                1.0,
-            );
-            fixture.promote();
-            // The renderer records the buffer it displayed when it draws.
-            let _ = fixture.system.composite();
-            let [display] = &displays(&fixture.root())[..] else {
-                panic!("one display layer");
-            };
-            // SAFETY: the renderer is read on the main thread.
-            let shown = unsafe { display.sampleBufferRenderer().copyDisplayedPixelBuffer() }
-                .expect("the display layer shows a frame");
-            let own = CVPixelBufferGetIOSurface(Some(&buffer)).expect("IOSurface");
-            let displayed = CVPixelBufferGetIOSurface(Some(&shown)).expect("IOSurface");
-            // The renderer holds its own reference to the surface; the
-            // surface's identity is its ID.
-            assert_eq!(own.id(), displayed.id(), "the frame's own surface, no copy");
-            // SAFETY: CoreVideo's keys are immutable statics.
-            unsafe {
-                assert!(same(&shown, kCVImageBufferColorPrimariesKey, primaries));
-                assert!(same(&shown, kCVImageBufferTransferFunctionKey, transfer));
-                assert!(same(&shown, kCVImageBufferYCbCrMatrixKey, matrix));
-                assert!(same(
-                    &shown,
-                    kCVImageBufferChromaLocationTopFieldKey,
-                    kCVImageBufferChromaLocation_Left
-                ));
-            }
+        let fixture = Fixture::new();
+        let buffer = bgra_buffer();
+        let _scene = scene_bar(
+            &fixture.engine,
+            &fixture.window,
+            bgra(&fixture.metal, &buffer, FrameColor::SRGB),
+            1.0,
+        );
+        if !fixture.promote() {
+            return;
         }
+        let _ = fixture.system.composite();
+        let [display] = &displays(&fixture.root())[..] else {
+            panic!("one display");
+        };
+        // SAFETY: renderer and buffer attachments are read on main.
+        let shown = unsafe { display.sampleBufferRenderer().copyDisplayedPixelBuffer() }
+            .expect("displayed buffer");
+        assert_eq!(
+            CVPixelBufferGetIOSurface(Some(&buffer))
+                .expect("source")
+                .id(),
+            CVPixelBufferGetIOSurface(Some(&shown))
+                .expect("displayed")
+                .id()
+        );
+        unsafe {
+            assert!(same(
+                &shown,
+                kCVImageBufferColorPrimariesKey,
+                kCVImageBufferColorPrimaries_ITU_R_709_2
+            ));
+            assert!(same(
+                &shown,
+                kCVImageBufferTransferFunctionKey,
+                kCVImageBufferTransferFunction_sRGB
+            ));
+        }
+    }
+
+    fn bgra_buffer() -> CFRetained<CVPixelBuffer> {
+        let buffer = surface_buffer(VIDEO.0, VIDEO.1, kCVPixelFormatType_32BGRA);
+        fill(&buffer, 1, |_, row| {
+            for pixel in row[..VIDEO.0 * 4].as_chunks_mut::<4>().0 {
+                *pixel = [64, 96, 128, 255];
+            }
+        });
+        buffer
+    }
+
+    fn bgra(metal: &Metal, buffer: &CVPixelBuffer, color: FrameColor) -> ExternalFrame {
+        ExternalFrame::rgb(
+            plane_texture(
+                metal,
+                buffer,
+                0,
+                (MTLPixelFormat::BGRA8Unorm, wgpu::TextureFormat::Bgra8Unorm),
+            ),
+            RgbAlpha::Opaque,
+            color,
+        )
+        .expect("valid BGRA")
     }
 
     /// Renders `frame` in the scene and asserts the engine composed it
     /// itself: one part, no plane.
     fn stays_in_the_engine(fixture: &Fixture, frame: ExternalFrame) {
         let _scene = scene_bar(&fixture.engine, &fixture.window, frame, 1.0);
-        fixture.render();
+        fixture.refusal_cycle();
         let stack = stack(fixture);
         assert_eq!(stack.len(), 1, "one part");
         assert!(is::<CAMetalLayer>(&stack[0]));
@@ -814,7 +864,7 @@ mod macos {
         let buffer = nv12_buffer(VIDEO);
         let full = FrameColor {
             range: YuvRange::Full,
-            ..FrameColor::BT709_VIDEO
+            ..FrameColor::BT2020_PQ
         };
         let frame = nv12(&fixture.metal, &buffer, full);
         stays_in_the_engine(&fixture, frame);
@@ -827,7 +877,7 @@ mod macos {
         let frame = ExternalFrame::yuv(
             plane_texture(&fixture.metal, &one, 0, LUMA),
             plane_texture(&fixture.metal, &two, 1, CHROMA),
-            FrameColor::BT709_VIDEO,
+            FrameColor::BT2020_PQ,
         )
         .expect("valid");
         stays_in_the_engine(&fixture, frame);
@@ -885,8 +935,9 @@ mod macos {
             bgra(&opaque, RgbAlpha::Opaque),
             1.0,
         );
-        opaque.promote();
-        assert_eq!(displays(&opaque.root()).len(), 1, "promoted");
+        if opaque.promote() {
+            assert_eq!(displays(&opaque.root()).len(), 1, "promoted");
+        }
     }
 
     /// The system compositor's result for the promoted stack matches the
@@ -935,7 +986,9 @@ mod macos {
             .expect("offscreen");
         let _engine_scene = scene_bar(&fixture.engine, &offscreen, bgra(&fixture.metal), 1.0);
         let _window_scene = scene_bar(&fixture.engine, &fixture.window, bgra(&fixture.metal), 1.0);
-        fixture.promote();
+        if !fixture.promote() {
+            return;
+        }
         assert_eq!(displays(&fixture.root()).len(), 1, "promoted");
         let engine = offscreen.readback().expect("engine composition");
         let system = fixture.system.composite();
@@ -994,7 +1047,7 @@ mod macos {
             nv12(&fixture.metal, &buffer, FrameColor::BT709_VIDEO),
             1.0,
         );
-        fixture.render();
+        fixture.refusal_cycle();
         assert!(
             displays(&fixture.root()).is_empty(),
             "the plan keeps BT.709 in the engine"

@@ -64,6 +64,12 @@ enum CoveragePhase {
     Partial = 1,
 }
 
+/// The instance-index bound a coverage-order pass may assign: `shader.wgsl`
+/// derives each depth as `bitcast<f32>(0x3e000000u + ii * 8u)`, injective —
+/// and below 0.5 — only while `ii` is under this bound. The lowering fails
+/// rather than alias two instances to one depth.
+pub const MAX_PASS_INSTANCES: usize = 1 << 21;
+
 #[derive(Clone, Copy)]
 enum CoveragePass {
     Painter(bool),

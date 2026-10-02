@@ -6,6 +6,7 @@ use std::ops::Range;
 
 use rustc_hash::FxHashMap;
 
+use super::MAX_PASS_INSTANCES;
 use super::prepared::{ClipShape, Op, Outline, PaintData, ResolvedPaint, box_shape};
 use cherenkov::kurbo::{self, Affine, BezPath, PathEl, Point, Rect, Vec2};
 use cherenkov::{FillRule, GlyphRun, ShapeData, WorkingColor};
@@ -308,6 +309,22 @@ impl ClipMask {
 #[expect(clippy::cast_possible_truncation)]
 const fn f32_f64(v: f64) -> f32 {
     v as f32
+}
+
+/// `count` stays a valid coverage-order index: `shader.wgsl` derives each
+/// instance's depth as `bitcast<f32>(0x3e000000u + ii * 8u)`, injective only
+/// below `MAX_PASS_INSTANCES` — fail fast rather than alias two depths.
+fn check_instance_bound(count: usize) {
+    assert!(
+        count <= MAX_PASS_INSTANCES,
+        "a coverage-order pass emits at most MAX_PASS_INSTANCES ({MAX_PASS_INSTANCES}) instances"
+    );
+}
+
+#[expect(clippy::cast_possible_truncation, reason = "bounded above")]
+fn instance_index(count: usize) -> u32 {
+    check_instance_bound(count);
+    count as u32
 }
 
 fn aa_margin(transform: Affine) -> f64 {
@@ -1447,8 +1464,7 @@ impl<'a> Lowering<'a> {
             backdrop_copy: None,
             capture: None,
             ranges: Vec::new(),
-            #[expect(clippy::cast_possible_truncation)]
-            seg_start: self.frame.instances.len() as u32,
+            seg_start: instance_index(self.frame.instances.len()),
         });
         // A masked clip can span passes; the new pass binds its texture.
         self.set_mask(self.mask_key);
@@ -1591,16 +1607,12 @@ impl<'a> Lowering<'a> {
     /// Emits `inst` into the current draw range, segmenting on its
     /// specialised fragment variant. Under a pending clip mask the
     /// instance's `uv.zw` is patched after the mask is stored.
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "a surface emits far fewer than u32::MAX instances"
-    )]
     fn push_instance(&mut self, inst: &Instance) {
         self.set_variant(variant_of(inst));
+        let index = instance_index(self.frame.instances.len());
         self.frame.instances.push(*inst);
         if let Some(pending) = self.mask_pending {
-            self.mask_patches
-                .push((self.frame.instances.len() as u32 - 1, pending));
+            self.mask_patches.push((index, pending));
         }
     }
 
@@ -2872,8 +2884,7 @@ impl<'a> Lowering<'a> {
             .stops
             .extend_from_slice(&storage.stops[emission.stops.clone()]);
         self.set_image(emission.image.clone());
-        let instance_base =
-            u32::try_from(self.frame.instances.len()).expect("instance count fits u32");
+        let instance_base = instance_index(self.frame.instances.len());
         let retained = &storage.instances[emission.instances.clone()];
         if let Some(first) = retained.first() {
             // A realized leaf shares paint and clip fields. Its varying
@@ -2882,6 +2893,7 @@ impl<'a> Lowering<'a> {
             Self::apply_clip(&mut template, clip);
             self.set_variant(variant_of(&template));
             let first = self.frame.instances.len();
+            check_instance_bound(first + retained.len());
             self.frame
                 .instances
                 .resize(first + retained.len(), template);
@@ -3614,6 +3626,7 @@ impl<'a> Lowering<'a> {
         }
         self.set_variant(variant_of(template));
         let first = self.frame.instances.len();
+        check_instance_bound(first + quads.len());
         self.frame.instances.resize(first + quads.len(), *template);
         for (inst, (rect, uv, interior)) in self.frame.instances[first..].iter_mut().zip(quads) {
             inst.bounds = [
@@ -3835,11 +3848,7 @@ impl<'a> Lowering<'a> {
             inst.uv = [f32::from(entry.x), f32::from(entry.y), 0.0, 0.0];
             self.push_instance(&inst);
             if let Some(pending) = pending {
-                let patch = (
-                    u32::try_from(self.frame.instances.len() - 1).expect("instance count fits u32"),
-                    pending,
-                    0,
-                );
+                let patch = (instance_index(self.frame.instances.len() - 1), pending, 0);
                 self.emission_patches.push(patch);
                 self.cell_patches.push(patch);
             }
@@ -3903,11 +3912,7 @@ impl<'a> Lowering<'a> {
             inst.uv = [f32::from(entry.x), f32::from(entry.y), 0.0, 0.0];
             self.push_instance(&inst);
             if let Some(pending) = pending {
-                let patch = (
-                    u32::try_from(self.frame.instances.len() - 1).expect("instance count fits u32"),
-                    pending,
-                    0,
-                );
+                let patch = (instance_index(self.frame.instances.len() - 1), pending, 0);
                 self.emission_patches.push(patch);
                 self.cell_patches.push(patch);
             }

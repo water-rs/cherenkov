@@ -1,10 +1,11 @@
 //! Wrapping a pass's segment into a fragment entry point, on the IR.
 //!
-//! A pass draws one full-screen triangle into a target of its input's size.
+//! A pass draws one full-screen triangle into its target.
 //! Its fragment entry point reads the input at the fragment's pixel — a texel
 //! load for a colour segment, a normalized coordinate for a spatial one —
 //! gathers the segment's other arguments from bindings, and returns the
-//! segment's result.
+//! segment's result. A resized final pass first maps the pixel centre into
+//! input coordinates; an ordinary pass retains its exact pixel coordinates.
 
 extern crate alloc;
 
@@ -41,6 +42,11 @@ pub(super) mod binding {
     pub const AUX: u32 = 5;
 }
 
+/// The output scale follows this pass's auxiliary texture bindings.
+pub(super) fn scale_binding(pass: &PassPlan) -> u32 {
+    binding::AUX + u32::try_from(pass.aux.len()).expect("auxiliary bindings fit u32")
+}
+
 /// The name of every pass's fragment entry point.
 pub(super) const ENTRY_POINT: &str = "main";
 
@@ -51,6 +57,7 @@ pub(super) fn pass_module(
     capabilities: Capabilities,
     index: usize,
     pass: &PassPlan,
+    resizes_output: bool,
 ) -> Result<Module, EffectSetupError> {
     let mut module = composed.clone();
     let segment = module
@@ -81,13 +88,6 @@ pub(super) fn pass_module(
             },
         },
     );
-    let position_type = insert_type(
-        &mut module,
-        TypeInner::Vector {
-            size: VectorSize::Quad,
-            scalar: cherenkov_shader::naga::Scalar::F32,
-        },
-    );
     let input = global(
         &mut module,
         "input",
@@ -97,22 +97,13 @@ pub(super) fn pass_module(
     );
 
     let mut builder = FunctionBuilder::new("fragment");
-    let position = builder.bound_argument(
-        "position",
-        position_type,
-        Binding::BuiltIn(BuiltIn::Position { invariant: false }),
-    );
-    let pixel = builder.expression(Expression::Swizzle {
-        size: VectorSize::Bi,
-        vector: position,
-        pattern: [
-            SwizzleComponent::X,
-            SwizzleComponent::Y,
-            SwizzleComponent::X,
-            SwizzleComponent::X,
-        ],
-    });
+    let pixel = fragment_pixel(&mut module, &mut builder);
     let input_expression = builder.expression(Expression::GlobalVariable(input));
+    let pixel = if resizes_output {
+        scaled_pixel(&mut module, &mut builder, pass, pixel)
+    } else {
+        pixel
+    };
 
     let mut inputs = Inputs {
         builder: &mut builder,
@@ -157,6 +148,60 @@ pub(super) fn pass_module(
         message: error.to_string(),
     })?;
     Ok(module)
+}
+
+fn fragment_pixel(module: &mut Module, builder: &mut FunctionBuilder) -> Handle<Expression> {
+    let position_type = insert_type(
+        module,
+        TypeInner::Vector {
+            size: VectorSize::Quad,
+            scalar: cherenkov_shader::naga::Scalar::F32,
+        },
+    );
+    let position = builder.bound_argument(
+        "position",
+        position_type,
+        Binding::BuiltIn(BuiltIn::Position { invariant: false }),
+    );
+    builder.expression(Expression::Swizzle {
+        size: VectorSize::Bi,
+        vector: position,
+        pattern: [
+            SwizzleComponent::X,
+            SwizzleComponent::Y,
+            SwizzleComponent::X,
+            SwizzleComponent::X,
+        ],
+    })
+}
+
+fn scaled_pixel(
+    module: &mut Module,
+    builder: &mut FunctionBuilder,
+    pass: &PassPlan,
+    pixel: Handle<Expression>,
+) -> Handle<Expression> {
+    let vector = insert_type(
+        module,
+        TypeInner::Vector {
+            size: VectorSize::Bi,
+            scalar: cherenkov_shader::naga::Scalar::F32,
+        },
+    );
+    let scale = global(
+        module,
+        "output_scale",
+        scale_binding(pass),
+        vector,
+        AddressSpace::Uniform,
+    );
+    let pointer = builder.expression(Expression::GlobalVariable(scale));
+    let scale = builder.expression(Expression::Load { pointer });
+    builder.expression(Expression::Binary {
+        op: BinaryOperator::Multiply,
+        left: pixel,
+        right: scale,
+    })
 }
 
 /// Builds the expressions a pass's segment arguments read.

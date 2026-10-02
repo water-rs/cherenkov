@@ -117,13 +117,15 @@ pub enum EffectRenderError {
         /// Output format the pipeline was compiled for.
         setup_output: wgpu::TextureFormat,
     },
-    /// The input and output textures differ in size.
+    /// The output texture does not have the effect's declared size.
     #[error(
-        "input is {input:?} but output is {output:?}; the executor maps a texture to a texture of the same size"
+        "input is {input:?} and the effect declares output {expected:?}, but output is {output:?}"
     )]
     SizeMismatch {
         /// The input's width and height.
         input: (u32, u32),
+        /// The size declared by [`Effect::output_size`].
+        expected: (u32, u32),
         /// The output's width and height.
         output: (u32, u32),
     },
@@ -351,6 +353,17 @@ impl fmt::Debug for EffectOutput<'_> {
 /// while animation is in progress, `Ok(false)` for a completed frame, and
 /// `Err(...)` for an explicit render failure.
 pub trait Effect: 'static {
+    /// Declares the output's pixel dimensions for an input of this size.
+    ///
+    /// Hosts query this before allocating their output texture, including
+    /// after reactive state changes. The declaration must stay stable between
+    /// that query and encoding the frame, and both dimensions must be nonzero.
+    /// It controls texture resolution, not the layout of the captured view.
+    /// The default preserves the input dimensions.
+    fn output_size(&self, input_width: u32, input_height: u32) -> (u32, u32) {
+        (input_width, input_height)
+    }
+
     /// Installs the host callback used when external effect state becomes dirty.
     ///
     /// Effects without externally driven state can keep the default no-op

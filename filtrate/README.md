@@ -65,7 +65,27 @@ values.
 composition: one full-screen fragment pass per piece, every spatial stage
 materialized, no colour prefix folded into a spatial stage's samples.
 Intermediates are `Rgba16Float`, so every materialization point rounds to
-f16 and extended values survive. The output has the input's size.
+f16 and extended values survive. Output matches input by default.
+
+An effect declares its output dimensions through
+`Effect::output_size(input_width, input_height)`. The host queries that method
+before allocating the output texture, including after reactive size changes.
+`Executor` can declare fixed, scaled or state-dependent dimensions:
+
+```rust
+use filtrate::{Effect, Executor, filters::Brightness};
+
+let effect = Executor::new(Brightness(0.1_f32))
+    .with_output_size(|width, height| (width * 2, height * 2));
+assert_eq!(effect.output_size(320, 180), (640, 360));
+```
+
+The final pass maps output pixel centres into input coordinates; colour
+passes use nearest texels and spatial passes retain their declared sampling.
+Intermediates keep the input resolution. The executor rejects a supplied
+output whose dimensions differ from its declaration. A sizing callback may
+read reactive state; the host owns the subscription that schedules a frame
+when that state changes. Texture sizing does not change view layout.
 
 ## WebGL (wasm)
 

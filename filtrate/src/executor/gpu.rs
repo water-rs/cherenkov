@@ -22,6 +22,46 @@ use crate::{
 /// materialization point rounds the same way and extended values survive.
 pub(super) const INTERMEDIATE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
+/// Choices the composer uses when planning the reference passes.
+pub(super) struct PlanOptions {
+    pub input_filterable: bool,
+    pub intermediate_filterable: bool,
+    pub fold: bool,
+}
+
+/// This encode's uniform buffers, already selected for its frame sequence.
+#[derive(Clone, Copy)]
+struct PassUniforms<'a> {
+    params: Option<&'a wgpu::Buffer>,
+    output_scale: Option<&'a wgpu::Buffer>,
+}
+
+impl PlanOptions {
+    fn compose<F: Filter>(
+        &self,
+        filter: &F,
+        ctx: &EffectContext<'_>,
+    ) -> Result<Plan, EffectSetupError> {
+        let plan = Plan::new(
+            filter,
+            self.input_filterable,
+            self.intermediate_filterable,
+            self.fold,
+        )?;
+        for (index, pass) in plan.passes.iter().enumerate() {
+            let (format, filterable) = if index == 0 {
+                (ctx.input_format, self.input_filterable)
+            } else {
+                (INTERMEDIATE_FORMAT, self.intermediate_filterable)
+            };
+            if pass.sampler == Some(SamplerFilter::Filtered) && !filterable {
+                return Err(EffectSetupError::InputNotFilterable { format });
+            }
+        }
+        Ok(plan)
+    }
+}
+
 /// The full-screen triangle every pass draws.
 const VERTEX_SHADER: &str = include_str!("../shaders/fullscreen.wgsl");
 
@@ -34,6 +74,7 @@ pub(super) struct GpuPass {
     /// The segment's uniform buffers, one per distinct block an encode of
     /// the current frame bound (see [`UniformBuffers`]).
     pub(super) params: UniformBuffers,
+    output_scale: Option<UniformBuffers>,
     uses_space: bool,
 }
 
@@ -107,14 +148,18 @@ impl Gpu {
     pub(super) async fn new<F: Filter>(
         filter: &F,
         ctx: &EffectContext<'_>,
+        resizes_output: bool,
     ) -> Result<Self, EffectSetupError> {
         let features = ctx.device.features();
         Self::with_options(
             filter,
             ctx,
-            filterable(ctx.input_format, features),
-            filterable(INTERMEDIATE_FORMAT, features),
-            false,
+            PlanOptions {
+                input_filterable: filterable(ctx.input_format, features),
+                intermediate_filterable: filterable(INTERMEDIATE_FORMAT, features),
+                fold: false,
+            },
+            resizes_output,
         )
         .await
     }
@@ -128,23 +173,10 @@ impl Gpu {
     pub(super) async fn with_options<F: Filter>(
         filter: &F,
         ctx: &EffectContext<'_>,
-        input_filterable: bool,
-        intermediate_filterable: bool,
-        fold: bool,
+        options: PlanOptions,
+        resizes_output: bool,
     ) -> Result<Self, EffectSetupError> {
-        let plan = Plan::new(filter, input_filterable, intermediate_filterable, fold)?;
-        for (index, pass) in plan.passes.iter().enumerate() {
-            let (format, format_filterable) = if index == 0 {
-                (ctx.input_format, input_filterable)
-            } else {
-                (INTERMEDIATE_FORMAT, intermediate_filterable)
-            };
-            // A filtered sampler bound here means the stage samples `input`
-            // in a way the manual bilinear cannot reproduce.
-            if pass.sampler == Some(SamplerFilter::Filtered) && !format_filterable {
-                return Err(EffectSetupError::InputNotFilterable { format });
-            }
-        }
+        let plan = options.compose(filter, ctx)?;
         // Slots first: a single-pass chain never materializes an
         // intermediate and must not probe for one.
         let (slot_of, slot_count) = assign_slots(&plan.passes);
@@ -161,13 +193,31 @@ impl Gpu {
         let last = plan.passes.len() - 1;
         let mut passes = Vec::with_capacity(plan.passes.len());
         for (index, pass) in plan.passes.into_iter().enumerate() {
-            let module = entry::pass_module(&plan.module, plan.capabilities, index, &pass)?;
+            let resizes_output = resizes_output && index == last;
+            let module = entry::pass_module(
+                &plan.module,
+                plan.capabilities,
+                index,
+                &pass,
+                resizes_output,
+            )?;
             let format = if index == last {
                 ctx.output_format
             } else {
                 INTERMEDIATE_FORMAT
             };
-            passes.push(GpuPass::new(ctx.device, &vertex, module, pass, index, format).await?);
+            passes.push(
+                GpuPass::new(
+                    ctx.device,
+                    &vertex,
+                    module,
+                    pass,
+                    index,
+                    format,
+                    resizes_output,
+                )
+                .await?,
+            );
         }
 
         let space = ctx.device.create_buffer(&wgpu::BufferDescriptor {
@@ -247,12 +297,6 @@ impl Gpu {
             });
         }
         let size = (input.width, input.height);
-        if size != (output.width, output.height) {
-            return Err(EffectRenderError::SizeMismatch {
-                input: size,
-                output: (output.width, output.height),
-            });
-        }
         for pass in &self.passes {
             if let Some(shape) = pass.plan.shape {
                 shape_view(input, shape)?;
@@ -295,11 +339,35 @@ impl Gpu {
         let slot_of = &self.slot_of;
         let last = self.passes.len() - 1;
         for (index, pass) in self.passes.iter_mut().enumerate() {
+            let output_scale = pass.output_scale.as_mut().map(|buffers| {
+                buffers.select(
+                    input.device,
+                    input.queue,
+                    scale_words(size, (output.width, output.height)),
+                    sequence,
+                )
+            });
             let params = pass
                 .params_index(input.device, input.queue, values, size, sequence)
                 .map(|index| pass.params.buffer(index));
 
-            let bind_group = pass.bind_group(index, input, &self.shared, slots, slot_of, params)?;
+            let output_scale = output_scale.map(|index| {
+                pass.output_scale
+                    .as_ref()
+                    .expect("a resized pass owns scale buffers")
+                    .buffer(index)
+            });
+            let bind_group = pass.bind_group(
+                index,
+                input,
+                &self.shared,
+                slots,
+                slot_of,
+                PassUniforms {
+                    params,
+                    output_scale,
+                },
+            )?;
 
             let target = if index == last {
                 &output.view
@@ -330,6 +398,17 @@ impl Gpu {
     }
 }
 
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "GPU texture dimensions fit f32 exactly"
+)]
+fn scale_words(input: (u32, u32), output: (u32, u32)) -> Vec<u32> {
+    alloc::vec![
+        (input.0 as f32 / output.0 as f32).to_bits(),
+        (input.1 as f32 / output.1 as f32).to_bits(),
+    ]
+}
+
 impl GpuPass {
     #[cfg_attr(
         target_arch = "wasm32",
@@ -345,11 +424,12 @@ impl GpuPass {
         plan: PassPlan,
         index: usize,
         format: wgpu::TextureFormat,
+        resizes_output: bool,
     ) -> Result<Self, EffectSetupError> {
         let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("filtrate pass layout"),
-            entries: &layout_entries(&plan),
+            entries: &layout_entries(&plan, resizes_output),
         });
         let fragment = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("filtrate pass"),
@@ -403,6 +483,7 @@ impl GpuPass {
             pipeline,
             layout,
             params: UniformBuffers::new("filtrate pass parameters"),
+            output_scale: resizes_output.then(|| UniformBuffers::new("filtrate output scale")),
             uses_space,
         })
     }
@@ -416,12 +497,18 @@ impl GpuPass {
         shared: &Shared,
         slots: &[wgpu::TextureView],
         slot_of: &[usize],
-        params: Option<&wgpu::Buffer>,
+        uniforms: PassUniforms<'_>,
     ) -> Result<wgpu::BindGroup, EffectRenderError> {
         let mut entries = alloc::vec![wgpu::BindGroupEntry {
             binding: binding::INPUT,
             resource: wgpu::BindingResource::TextureView(input_view(index, input, slots, slot_of)),
         }];
+        if let Some(buffer) = uniforms.output_scale {
+            entries.push(wgpu::BindGroupEntry {
+                binding: entry::scale_binding(&self.plan),
+                resource: buffer.as_entire_binding(),
+            });
+        }
         if let Some(filter) = self.plan.sampler {
             entries.push(wgpu::BindGroupEntry {
                 binding: binding::SAMPLER,
@@ -431,7 +518,7 @@ impl GpuPass {
                 }),
             });
         }
-        if let Some(buffer) = params {
+        if let Some(buffer) = uniforms.params {
             entries.push(wgpu::BindGroupEntry {
                 binding: binding::PARAMS,
                 resource: buffer.as_entire_binding(),
@@ -501,7 +588,7 @@ impl GpuPass {
 }
 
 /// The bind group layout a pass's segment needs.
-fn layout_entries(plan: &PassPlan) -> Vec<wgpu::BindGroupLayoutEntry> {
+fn layout_entries(plan: &PassPlan, resizes_output: bool) -> Vec<wgpu::BindGroupLayoutEntry> {
     let entry = |binding, ty| wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::FRAGMENT,
@@ -520,6 +607,9 @@ fn layout_entries(plan: &PassPlan) -> Vec<wgpu::BindGroupLayoutEntry> {
     };
     let filtering = plan.sampler == Some(SamplerFilter::Filtered);
     let mut entries = alloc::vec![entry(binding::INPUT, texture(filtering))];
+    if resizes_output {
+        entries.push(entry(entry::scale_binding(plan), uniform));
+    }
     for arg in &plan.segment.args {
         match *arg {
             SegmentArg::InputSampler => entries.push(entry(

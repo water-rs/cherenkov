@@ -35,24 +35,29 @@ use animation::ParamAnimator;
 use gpu::Gpu;
 pub use gpu::{filterable, sampler};
 
-/// Runs a [`Filter`] on wgpu textures: texture in, texture of the same size
-/// out.
+/// Runs a [`Filter`] on caller-owned wgpu textures.
+///
+/// Output matches input unless [`Self::with_output_size`] declares otherwise.
+/// Hosts allocate their output using [`Effect::output_size`]; the executor
+/// allocates its intermediate textures and validates the supplied output.
 ///
 /// Parameters that are reactive ([`FilterParam`](crate::FilterParam)
 /// signals) are watched; a change carrying an interpolator animates, and
 /// [`Effect::encode_render`] reports whether another frame is needed.
-pub struct Executor<F: Filter> {
+pub struct Executor<F: Filter, S = fn(u32, u32) -> (u32, u32)> {
     filter: F,
+    output_size: S,
+    resizes_output: bool,
     /// Parameter watcher subscriptions, dropped before the animator whose
     /// channel they feed.
-    _watcher_guards: Vec<WatchGuard>,
+    watcher_guards: Vec<WatchGuard>,
     animator: ParamAnimator,
     gpu: Option<Gpu>,
     /// Sticky setup error: once set, rendering fails fast.
     setup_error: Option<EffectSetupError>,
 }
 
-impl<F: Filter> fmt::Debug for Executor<F> {
+impl<F: Filter, S> fmt::Debug for Executor<F, S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Executor")
             .field("animator", &self.animator)
@@ -72,8 +77,37 @@ impl<F: Filter> Executor<F> {
             ParamAnimator::new(targets, |installer| filter.visit_signals(installer));
         Self {
             filter,
-            _watcher_guards: watcher_guards,
+            output_size: |width, height| (width, height),
+            resizes_output: false,
+            watcher_guards,
             animator,
+            gpu: None,
+            setup_error: None,
+        }
+    }
+}
+
+impl<F: Filter, S: Fn(u32, u32) -> (u32, u32) + 'static> Executor<F, S> {
+    /// Declares the final output size as a function of the input dimensions.
+    ///
+    /// The callback can read reactive state and is queried for each frame.
+    /// Both returned dimensions must be nonzero. Intermediate passes keep the
+    /// input resolution; the final pass maps output pixel centres into input
+    /// coordinates. Colour-only passes use nearest texels, and spatial passes
+    /// retain their declared sampling contract.
+    ///
+    /// Set this before setup: changing the policy invalidates GPU pipelines.
+    #[must_use]
+    pub fn with_output_size<T: Fn(u32, u32) -> (u32, u32) + 'static>(
+        self,
+        output_size: T,
+    ) -> Executor<F, T> {
+        Executor {
+            filter: self.filter,
+            output_size,
+            resizes_output: true,
+            watcher_guards: self.watcher_guards,
+            animator: self.animator,
             gpu: None,
             setup_error: None,
         }
@@ -88,12 +122,21 @@ impl<F: Filter> Executor<F> {
     /// An executor for this executor's filter followed by `filter`, keeping
     /// the installed redraw callback. The new executor needs its own setup.
     #[must_use]
-    pub fn then<G: Filter>(self, filter: G) -> Executor<Chain<F, G>> {
+    pub fn then<G: Filter>(self, filter: G) -> Executor<Chain<F, G>, S> {
         let redraw_callback = self.animator.redraw_callback();
         let next = Executor::new(Chain {
             first: self.filter,
             second: filter,
         });
+        let next = Executor {
+            output_size: self.output_size,
+            resizes_output: self.resizes_output,
+            filter: next.filter,
+            watcher_guards: next.watcher_guards,
+            animator: next.animator,
+            gpu: next.gpu,
+            setup_error: next.setup_error,
+        };
         if let Some(callback) = redraw_callback {
             next.animator.install_redraw_callback(callback);
         }
@@ -141,7 +184,19 @@ impl<F: Filter> Executor<F> {
         &mut self,
         ctx: &EffectContext<'_>,
     ) -> EffectSetupResult {
-        self.attach(Gpu::with_options(&self.filter, ctx, false, false, false).await)
+        self.attach(
+            Gpu::with_options(
+                &self.filter,
+                ctx,
+                gpu::PlanOptions {
+                    input_filterable: false,
+                    intermediate_filterable: false,
+                    fold: false,
+                },
+                self.resizes_output,
+            )
+            .await,
+        )
     }
 
     /// `setup` picking the composer's folded alternative wherever offered —
@@ -157,9 +212,12 @@ impl<F: Filter> Executor<F> {
             Gpu::with_options(
                 &self.filter,
                 ctx,
-                gpu::filterable(ctx.input_format, features),
-                gpu::filterable(gpu::INTERMEDIATE_FORMAT, features),
-                true,
+                gpu::PlanOptions {
+                    input_filterable: gpu::filterable(ctx.input_format, features),
+                    intermediate_filterable: gpu::filterable(gpu::INTERMEDIATE_FORMAT, features),
+                    fold: true,
+                },
+                self.resizes_output,
             )
             .await,
         )
@@ -185,7 +243,16 @@ impl<F: Filter> Executor<F> {
     }
 }
 
-impl<F: Filter> Effect for Executor<F> {
+impl<F: Filter, S: Fn(u32, u32) -> (u32, u32) + 'static> Effect for Executor<F, S> {
+    fn output_size(&self, input_width: u32, input_height: u32) -> (u32, u32) {
+        let size = (self.output_size)(input_width, input_height);
+        assert!(
+            size.0 > 0 && size.1 > 0,
+            "effect declared a zero output dimension: {size:?}"
+        );
+        size
+    }
+
     fn set_redraw_callback(&mut self, callback: EffectRedrawCallback) {
         self.animator.install_redraw_callback(callback);
     }
@@ -195,7 +262,7 @@ impl<F: Filter> Effect for Executor<F> {
         reason = "the executor owns device-bound pipelines and is set up on the GPU host thread"
     )]
     async fn setup(&mut self, ctx: &EffectContext<'_>) -> EffectSetupResult {
-        self.attach(Gpu::new(&self.filter, ctx).await)
+        self.attach(Gpu::new(&self.filter, ctx, self.resizes_output).await)
     }
 
     fn encode_render(
@@ -206,6 +273,14 @@ impl<F: Filter> Effect for Executor<F> {
     ) -> EffectRenderResult {
         if let Some(error) = &self.setup_error {
             return Err(EffectRenderError::SetupFailed(error.clone()));
+        }
+        let expected = self.output_size(input.width, input.height);
+        if expected != (output.width, output.height) {
+            return Err(EffectRenderError::SizeMismatch {
+                input: (input.width, input.height),
+                expected,
+                output: (output.width, output.height),
+            });
         }
         let gpu = self.gpu.as_mut().ok_or(EffectRenderError::NotSetUp)?;
         let needs_redraw = self.animator.update(input.timing.delta());

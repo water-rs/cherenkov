@@ -43,6 +43,8 @@ pub struct Observation {
     pub domain: Option<Domain>,
     pub density: f64,
     pub quiet_frames: u64,
+    /// Admission must outlast every previously observed content lifetime.
+    pub quiet_required: u64,
     pub capture: Option<Capture>,
 }
 
@@ -53,6 +55,39 @@ impl Capture {
                 * u64::from(self.domain.size.1)
                 * crate::render::texel_bytes(crate::render::TARGET_FORMAT)
         })
+    }
+}
+
+impl Observation {
+    pub const fn new(stamp: u64, resources: (u64, u64)) -> Self {
+        Self {
+            stamp,
+            resources,
+            domain: None,
+            density: 0.0,
+            quiet_frames: 0,
+            quiet_required: 2,
+            capture: None,
+        }
+    }
+
+    /// True only on entry to a new stable interval: bounds are computed once.
+    pub fn observe(&mut self, stamp: u64, resources: (u64, u64), density: f64) -> bool {
+        let content_changed = self.stamp != stamp || self.resources != resources;
+        if !content_changed && self.density.to_bits() == density.to_bits() {
+            self.quiet_frames = self.quiet_frames.saturating_add(1);
+        } else {
+            if content_changed {
+                self.quiet_required = self.quiet_required.max(self.quiet_frames.saturating_add(1));
+            }
+            self.stamp = stamp;
+            self.resources = resources;
+            self.quiet_frames = 1;
+            self.capture = None;
+            self.density = density;
+            self.domain = None;
+        }
+        self.quiet_frames == self.quiet_required
     }
 }
 
@@ -274,3 +309,23 @@ pub fn domain(
     }))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::Observation;
+
+    #[test]
+    fn periodic_content_must_outlast_its_previous_lifetime() {
+        let mut entry = Observation::new(1, (0, 0));
+        assert!(!entry.observe(1, (0, 0), 1.25));
+        assert!(entry.observe(1, (0, 0), 1.25));
+        assert!(!entry.observe(1, (0, 0), 1.25));
+        for stamp in 2..5 {
+            for _ in 0..3 {
+                assert!(!entry.observe(stamp, (0, 0), 1.25));
+            }
+        }
+        assert!(entry.observe(4, (0, 0), 1.25));
+        assert!(!entry.observe(4, (0, 0), 1.25));
+        assert_eq!(entry.density, 1.25);
+    }
+}

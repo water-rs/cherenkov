@@ -256,6 +256,7 @@ struct SurfaceState {
     plane_size: (u32, u32),
     /// Source observations and immutable captures for recorded planes.
     static_layers: FxHashMap<LayerId, planes::static_layer::Observation>,
+    static_walk: Vec<(LayerId, kurbo::Affine)>,
     /// Engine parts above the first (`target` is part 0): one per promoted
     /// plane with layers painted above it, at the surface size.
     parts: Vec<(wgpu::Texture, wgpu::TextureView)>,
@@ -2426,7 +2427,7 @@ fn plane_candidates<'a>(
     );
     candidates.extend(surf.static_layers.iter().filter_map(|(&layer, entry)| {
         let domain = entry.domain?;
-        (entry.quiet_frames >= 2).then_some((
+        (entry.quiet_frames >= entry.quiet_required).then_some((
             layer,
             planes::Candidate {
                 size: domain.size,
@@ -2544,6 +2545,7 @@ impl Renderer for GpuRenderer {
                 plane_clear: cherenkov::WorkingColor::TRANSPARENT,
                 plane_size: (0, 0),
                 static_layers: FxHashMap::default(),
+                static_walk: Vec::new(),
                 plan_dirty: false,
                 parts: Vec::new(),
                 frames_installed: 0,
@@ -4999,14 +5001,17 @@ impl GpuRenderer {
         let resources = (self.images_gen, self.image_replacements);
         surf.static_layers
             .retain(|layer, _| surf.layers.contains_key(layer));
-        let mut pending = vec![(sf.tree.root(), kurbo::Affine::IDENTITY)];
-        while let Some((layer, parent)) = pending.pop() {
+        surf.static_walk.clear();
+        surf.static_walk
+            .push((sf.tree.root(), kurbo::Affine::IDENTITY));
+        while let Some((layer, parent)) = surf.static_walk.pop() {
             let node = sf.tree.layer(layer);
             if sf.tree.projective_pose(layer).is_some() {
                 continue;
             }
             let space = parent * node.content_transform();
-            pending.extend(node.children.iter().map(|&child| (child, space)));
+            surf.static_walk
+                .extend(node.children.iter().map(|&child| (child, space)));
             if !node.children.is_empty() {
                 surf.static_layers.remove(&layer);
                 continue;
@@ -5023,28 +5028,11 @@ impl GpuRenderer {
             // singular value. Capture at the actual device density.
             let radii = kurbo::Ellipse::from_affine(space).radii();
             let density = radii.x.max(radii.y);
-            let entry =
-                surf.static_layers
-                    .entry(layer)
-                    .or_insert(planes::static_layer::Observation {
-                        stamp,
-                        resources,
-                        domain: None,
-                        density: 0.0,
-                        quiet_frames: 0,
-                        capture: None,
-                    });
-            if entry.stamp == stamp
-                && entry.resources == resources
-                && entry.density.to_bits() == density.to_bits()
-            {
-                entry.quiet_frames = entry.quiet_frames.saturating_add(1);
-            } else {
-                entry.stamp = stamp;
-                entry.resources = resources;
-                entry.quiet_frames = 1;
-                entry.capture = None;
-                entry.density = density;
+            let entry = surf
+                .static_layers
+                .entry(layer)
+                .or_insert_with(|| planes::static_layer::Observation::new(stamp, resources));
+            if entry.observe(stamp, resources, density) {
                 entry.domain = planes::static_layer::domain(
                     ops,
                     source,

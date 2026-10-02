@@ -187,11 +187,23 @@ pub struct Plan {
 }
 
 impl Plan {
-    /// The number of engine parts: one below each plane, plus the trailing
-    /// part.
+    /// The promoted layers a new engine part opens after: every plane but
+    /// the last, which opens one only when `trailing` content follows it.
+    /// Lowering emits a `Part` pass for each of these and no more, and
+    /// `parts()` counts this same boundary set.
+    pub fn opens_part(&self) -> impl Iterator<Item = LayerId> + '_ {
+        let last_needs_none = usize::from(!self.trailing);
+        self.planes
+            .iter()
+            .take(self.planes.len().saturating_sub(last_needs_none))
+            .map(|p| p.layer)
+    }
+
+    /// The number of engine parts: part 0 plus one opened after each
+    /// plane [`opens_part`](Self::opens_part) reports.
     #[must_use]
     pub fn parts(&self) -> usize {
-        self.planes.len() + usize::from(self.trailing || self.planes.is_empty())
+        self.opens_part().count() + 1
     }
 }
 

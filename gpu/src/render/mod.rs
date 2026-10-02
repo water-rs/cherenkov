@@ -5024,7 +5024,6 @@ impl GpuRenderer {
             .composition_stamp(|layer| surf.plan.planes.iter().any(|plane| plane.layer == layer));
         surf.plane_clear = frame.clear;
         surf.plane_size = frame.size;
-        let promoted = surf.plan.planes.iter().map(|p| p.layer).collect();
         // Lowering borrows `layers` immutably while mutating `frame`;
         // taking the map out keeps the two borrows disjoint.
         let mut layers = std::mem::take(&mut surf.layers);
@@ -5056,7 +5055,7 @@ impl GpuRenderer {
                     &glyphs,
                     groups,
                     placed,
-                    (promoted, surf.plan.trailing),
+                    &surf.plan,
                 )
             });
             lowered.commands = lowering.commands_lowered;

@@ -1782,6 +1782,8 @@ struct Sweep {
     probes: Vec<CapacityProbe>,
     /// The feature that stopped the sweep before its first probe.
     unsupported: Option<(cherenkov_scene::Feature, Option<&'static str>)>,
+    /// The probe error that stopped the sweep mid-run, if any.
+    error: Option<String>,
     /// Prepare, warmup-frame and post-window snapshots across every
     /// probe, in run order.
     memory_samples: Vec<MemorySnapshot>,
@@ -1973,7 +1975,22 @@ fn sweep_scene(
                         "unsupported"
                     );
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    // A probe error is the engine's own cap on this scene
+                    // (e.g. the bounded glyph atlas exhausting): it bounds
+                    // the sweep like an over-budget probe would, ending it
+                    // at the largest `k` already sustained. It must not
+                    // abort the interleaved sweep for the other engines.
+                    tracing::warn!(
+                        scene = %dir.display(),
+                        engine = engine.info().name,
+                        k,
+                        error = %e,
+                        "probe failed; sweep ends at the last sustained k"
+                    );
+                    sweep.error = Some(e.to_string());
+                    sweep.done = true;
+                }
             }
         }
         if !active {
@@ -1994,6 +2011,7 @@ fn sweep_scene(
                 info: engine.info().clone(),
                 unsupported,
                 missing_api,
+                error: sweep.error.clone(),
                 max_k: sweep.lo,
                 p99_seconds: sweep
                     .probes

@@ -1,40 +1,24 @@
-import OSLog
 import UIKit
-
-private let logger = Logger(subsystem: "dev.cherenkov", category: "bench")
 
 @main
 final class AppDelegate: UIResponder, UIApplicationDelegate {
-    var window: UIWindow?
-    private var originalBrightness: CGFloat = UIScreen.main.brightness
-
     func application(
-        _ application: UIApplication,
+        _: UIApplication,
         didFinishLaunchingWithOptions _: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
-        // A real window keeps the app in the foreground — iOS forbids
-        // GPU work in the background, so the run must stay foregrounded.
-        let window = UIWindow(frame: UIScreen.main.bounds)
-        let status = StatusViewController()
-        window.rootViewController = status
-        window.makeKeyAndVisible()
-        self.window = window
+        true
+    }
 
-        application.isIdleTimerDisabled = true
-        originalBrightness = UIScreen.main.brightness
-        UIScreen.main.brightness = 0
-        logger.info("launch: idle timer disabled, brightness -> 0")
-
-        Thread.detachNewThread { [weak self] in
-            let code = BenchRunner(delegate: status).runAll()
-            DispatchQueue.main.async {
-                application.isIdleTimerDisabled = false
-                if let brightness = self?.originalBrightness {
-                    UIScreen.main.brightness = brightness
-                }
-            }
-            logger.info("all runs done; exit code \(code)")
-        }
-        return true
+    func application(
+        _: UIApplication,
+        configurationForConnecting connectingSceneSession: UISceneSession,
+        options _: UIScene.ConnectionOptions
+    ) -> UISceneConfiguration {
+        let configuration = UISceneConfiguration(
+            name: "Default Configuration",
+            sessionRole: connectingSceneSession.role
+        )
+        configuration.delegateClass = SceneDelegate.self
+        return configuration
     }
 }

@@ -315,7 +315,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             linear_srgb_to_oklab(got),
             linear_srgb_to_oklab(adaptive),
         ));
-        hue.push(hue_diff_deg(linear_srgb_to_oklab(got), linear_srgb_to_oklab(srgb)));
+        hue.push(hue_diff_deg(
+            linear_srgb_to_oklab(got),
+            linear_srgb_to_oklab(srgb),
+        ));
         de_f64_adaptive_css.push(delta_e_ok(
             linear_srgb_to_oklab(adaptive),
             linear_srgb_to_oklab(css),
@@ -359,9 +362,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "  ΔE_OK f64 adaptive vs f64 CSS on this domain: mean {m3:.5}  p50 {p503:.5}  p99 {p993:.5}  max {max3:.5}"
     );
-    println!(
-        "  max |gpu - reference| in unorm8 LSB: css {lsb_css}  adaptive {lsb_adaptive}"
-    );
+    println!("  max |gpu - reference| in unorm8 LSB: css {lsb_css}  adaptive {lsb_adaptive}");
     println!("  in-gamut pixels within 0.01 ΔE of input: {in_gamut_exact}");
     Ok(())
 }

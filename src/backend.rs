@@ -219,6 +219,16 @@ pub trait Renderer: 'static {
     /// main-queue completion never need it.
     fn set_plane_waker(&mut self, _waker: crate::CompletionWaker) {}
 
+    /// Layers whose last successful render handed every running property
+    /// track to the system compositor. The backend must withdraw
+    /// ownership on demotion, an unsupported track, or failed presentation.
+    /// Owned tracks remain in the tree for sampling and retargeting, but do
+    /// not request display-link frames. Recorded operand animations are
+    /// independent and always remain engine-driven.
+    fn owned_animations(&self, _surface: SurfaceId) -> &[LayerId] {
+        &[]
+    }
+
     /// The backend's current memory usage.
     fn memory(&self) -> MemoryUsage;
 

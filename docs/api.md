@@ -705,6 +705,39 @@ between, shader validation before queueing, asynchronous filter setup, host wake
 render is awaiting browser work, and incremental lowering matching full
 lowering pixel-for-pixel.
 
+### Compositor-owned property tracks (#90)
+
+`AnimationTrack<T: Animatable>` exposes a running property's original `from`,
+lane `velocity`, `target`, `animation`, and presentation-clock `start`.
+`LayerNode::transform_animation()` and `opacity_animation()` return these
+immutable descriptions. A sole translation component can be represented as
+an affine translation track; nonlinear component combinations cannot.
+`describable_animations()` confirms that no other moving property would be
+lost by handing off those descriptions.
+
+`Renderer::owned_animations(surface) -> &[LayerId]` reports layers whose
+**complete** running property animation was accepted by the last successful
+presentation. Its default is empty. Owned tracks remain in the canonical
+tree and are sampled before commits, so retargeting after an idle interval
+preserves the current position and velocity. They do not request engine
+frames. Recorded operand animations and every unowned property retain their
+normal scheduling. Demotion, an unsupported track, or failed presentation
+withdraws ownership.
+
+On Apple, eligible leaf planes hand translation and opacity curves and
+springs to Core Animation. The native track keeps the original presentation
+clock and spring velocity. Matrix animation with changing linear coefficients,
+scroll decay, and nonlinear component combinations continue to require engine
+frames: Core Animation's decomposed matrix interpolation is not the engine's
+coefficient interpolation. A handoff also requires eligibility throughout the
+motion; sampled non-overlap with translucent content above is insufficient.
+
+`SurfaceTree::composition_stamp(promoted)` versions the engine-composited
+pixels while excluding only promoted layers' outer property stamps. Content,
+clips, ordering, resource generations, surface size, clear colour and display
+state remain dependencies of retained engine parts. Property-only plane
+updates can consequently retain those parts on both native platforms.
+
 ### Component transform animation (#77)
 
 Layer edits gain `translation(Live<Vec2>)`, `rotation(Live<f64>)`,

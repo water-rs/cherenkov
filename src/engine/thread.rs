@@ -77,6 +77,8 @@ struct SurfaceState {
     /// on the UI thread. The tracks live there; they need the next frame's
     /// sample at the fast rate class.
     content_animating: bool,
+    /// Track cadence before the backend accepts this frame's handoffs.
+    sampled_rate: Option<crate::RefreshRange>,
 }
 
 impl SurfaceState {
@@ -427,6 +429,7 @@ fn create_surface<B: Backend>(
             },
             display_moved: false,
             content_animating: false,
+            sampled_rate: None,
         },
     );
     Ok(info)
@@ -646,25 +649,20 @@ fn render<B: Backend>(
     time: crate::Instant,
     commits: &mut [(SurfaceId, ChangeSet<B>)],
 ) -> Result<(Next, FrameStats), RenderError> {
+    for (id, state) in &mut *surfaces {
+        let owned = renderer.owned_animations(*id);
+        if !owned.is_empty() {
+            state
+                .tree
+                .sample_owned(time, |layer| owned.contains(&layer));
+        }
+    }
     apply_commits(renderer, surfaces, resources, commits)?;
     let mut frames: Vec<SurfaceFrame<'_>> = Vec::with_capacity(surfaces.len());
-    // The fast class wins when any surface needs it.
-    let mut rate = None;
     for (id, state) in &mut *surfaces {
         let sampling = state.tree.sample(time, state.display);
         let changed = state.commits != Commits::Clean || sampling.stepped;
-        // Operand animations run on the UI thread and are springs or
-        // curves only: they always need the fast class.
-        let running = if state.content_animating {
-            Some(crate::tree::RATE_FAST)
-        } else {
-            sampling.rate
-        };
-        match running {
-            Some(r) if r == crate::tree::RATE_FAST => rate = Some(crate::tree::RATE_FAST),
-            Some(r) => rate = rate.or(Some(r)),
-            None => {}
-        }
+        state.sampled_rate = sampling.rate;
         frames.push(SurfaceFrame {
             id: *id,
             size: state.size,
@@ -692,7 +690,23 @@ fn render<B: Backend>(
         },
         &mut stats,
     )?;
-    for state in surfaces.values_mut() {
+    let mut rate = None;
+    for (id, state) in &mut *surfaces {
+        let owned = renderer.owned_animations(*id);
+        let running = if state.content_animating {
+            Some(crate::tree::RATE_FAST)
+        } else if owned.is_empty() {
+            state.sampled_rate.take()
+        } else {
+            state
+                .tree
+                .animation_rate(state.display, |layer| owned.contains(&layer))
+        };
+        match running {
+            Some(r) if r == crate::tree::RATE_FAST => rate = Some(crate::tree::RATE_FAST),
+            Some(r) => rate = rate.or(Some(r)),
+            None => {}
+        }
         state.commits = Commits::Clean;
         state.plane_frames.clear();
         state.display_moved = false;
@@ -723,25 +737,20 @@ async fn render_local<B: Backend>(
     time: crate::Instant,
     commits: &mut [(SurfaceId, ChangeSet<B>)],
 ) -> Result<(Next, FrameStats), RenderError> {
+    for (id, state) in &mut *surfaces {
+        let owned = renderer.owned_animations(*id);
+        if !owned.is_empty() {
+            state
+                .tree
+                .sample_owned(time, |layer| owned.contains(&layer));
+        }
+    }
     apply_commits(renderer, surfaces, resources, commits)?;
     let mut frames: Vec<SurfaceFrame<'_>> = Vec::with_capacity(surfaces.len());
-    // The fast class wins when any surface needs it.
-    let mut rate = None;
     for (id, state) in &mut *surfaces {
         let sampling = state.tree.sample(time, state.display);
         let changed = state.commits != Commits::Clean || sampling.stepped;
-        // Operand animations run on the UI thread and are springs or
-        // curves only: they always need the fast class.
-        let running = if state.content_animating {
-            Some(crate::tree::RATE_FAST)
-        } else {
-            sampling.rate
-        };
-        match running {
-            Some(r) if r == crate::tree::RATE_FAST => rate = Some(crate::tree::RATE_FAST),
-            Some(r) => rate = rate.or(Some(r)),
-            None => {}
-        }
+        state.sampled_rate = sampling.rate;
         frames.push(SurfaceFrame {
             id: *id,
             size: state.size,
@@ -771,7 +780,23 @@ async fn render_local<B: Backend>(
             &mut stats,
         )
         .await?;
-    for state in surfaces.values_mut() {
+    let mut rate = None;
+    for (id, state) in &mut *surfaces {
+        let owned = renderer.owned_animations(*id);
+        let running = if state.content_animating {
+            Some(crate::tree::RATE_FAST)
+        } else if owned.is_empty() {
+            state.sampled_rate.take()
+        } else {
+            state
+                .tree
+                .animation_rate(state.display, |layer| owned.contains(&layer))
+        };
+        match running {
+            Some(r) if r == crate::tree::RATE_FAST => rate = Some(crate::tree::RATE_FAST),
+            Some(r) => rate = rate.or(Some(r)),
+            None => {}
+        }
         state.commits = Commits::Clean;
         state.plane_frames.clear();
         state.display_moved = false;
@@ -823,6 +848,7 @@ mod tests {
             presentation: Presentation::Retained,
             display_moved: false,
             content_animating: false,
+            sampled_rate: None,
         };
 
         let mut first = ChangeSet::<Null> {

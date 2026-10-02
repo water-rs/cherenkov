@@ -50,8 +50,8 @@ pub use kurbo;
 pub use web_time::Instant;
 
 pub use crate::animation::{
-    Animatable, Animation, Curve, Decay, Lanes, Spring, curve_value, decay_step, settled,
-    spring_step,
+    Animatable, Animation, AnimationTrack, Curve, Decay, Lanes, Spring, curve_value, decay_step,
+    settled, spring_step,
 };
 pub use crate::backdrop::{
     BackdropEffect, BackdropShaderEffect, BackdropShaderSource, ColorMatrix, Refraction, Rim,

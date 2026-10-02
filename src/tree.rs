@@ -100,6 +100,34 @@ impl std::fmt::Debug for LayerNode {
 }
 
 impl LayerNode {
+    /// The affine track, including its original start and velocity.
+    /// Component transforms are returned only when their sole moving
+    /// component is translation, which is affine-linear in the same lanes.
+    #[must_use]
+    pub fn transform_animation(&self) -> Option<crate::AnimationTrack<Affine>> {
+        match &self.components {
+            None => self.transform_track.as_ref()?.description(),
+            Some(components) if self.transform_track.is_none() => {
+                components.translation_animation()
+            }
+            Some(_) => None,
+        }
+    }
+
+    /// The opacity track, including its original start and velocity.
+    #[must_use]
+    pub fn opacity_animation(&self) -> Option<crate::AnimationTrack<f32>> {
+        self.opacity_track.as_ref()?.description()
+    }
+
+    /// Whether every running property track has an affine/opacity
+    /// description. Scroll, projective and nonlinear component tracks need
+    /// their own compositor primitive and cannot use this handoff.
+    #[must_use]
+    pub fn describable_animations(&self) -> bool {
+        self.scroll_track.is_none() && (!self.animating() || self.transform_animation().is_some())
+    }
+
     /// Records a sampled change: `outer` for how the layer composes,
     /// `inner` for what it draws in its own space.
     const fn restamp(&mut self, clock: &mut u64, outer: bool, inner: bool) {
@@ -194,6 +222,16 @@ struct Track<T: Animatable> {
 }
 
 impl<T: Animatable> Track<T> {
+    fn description(&self) -> Option<crate::AnimationTrack<T>> {
+        Some(crate::AnimationTrack {
+            from: T::from_lanes(self.from),
+            velocity: self.velocity,
+            target: self.target,
+            animation: self.animation,
+            start: self.start?,
+        })
+    }
+
     fn new(from: T::Lanes, velocity: T::Lanes, target: T, animation: Animation) -> Self {
         debug_assert!(
             !matches!(animation, Animation::Decay(_)) || T::Lanes::N == 2,
@@ -275,6 +313,65 @@ impl Default for SurfaceTree {
 }
 
 impl SurfaceTree {
+    /// Refreshes compositor-owned motion before a new transaction retargets
+    /// it. Without engine frames, `last` otherwise describes the handoff
+    /// frame rather than the position and velocity currently on screen.
+    pub(crate) fn sample_owned(&mut self, time: Instant, owns: impl Fn(LayerId) -> bool) {
+        for (&raw, node) in &mut self.nodes {
+            if !owns(LayerId::new(raw)) {
+                continue;
+            }
+            if let Some(track) = &mut node.transform_track {
+                let (position, _, _) = track.sample(time);
+                node.transform = Affine::from_lanes(position);
+            }
+            if let Some(components) = &mut node.components {
+                components.sample(time);
+                node.transform = components.matrix();
+                // Component sampling clears settled tracks. The ordinary
+                // sampler can no longer observe that final movement, so
+                // preserve its dependency change before a possible demotion.
+                node.restamp(&mut self.clock, true, false);
+            }
+            if let Some(track) = &mut node.opacity_track {
+                let (position, _, _) = track.sample(time);
+                node.opacity = f32::from_lanes(position);
+            }
+        }
+    }
+
+    /// Rate required by tracks the backend has not accepted. Called after
+    /// presentation so a handoff suppresses the very next frame, and a
+    /// demotion resumes scheduling immediately.
+    pub(crate) fn animation_rate(
+        &self,
+        display: Display,
+        owns: impl Fn(LayerId) -> bool,
+    ) -> Option<RefreshRange> {
+        let mut running = false;
+        for (&raw, node) in &self.nodes {
+            if owns(LayerId::new(raw)) {
+                continue;
+            }
+            if node.transform_track.is_some()
+                || node.opacity_track.is_some()
+                || node.components.as_ref().is_some_and(|c| c.animating())
+            {
+                return Some(RATE_FAST);
+            }
+            if let Some(track) = &node.scroll_track {
+                if track.is_fast(display.scale) {
+                    return Some(RATE_FAST);
+                }
+                running = true;
+            }
+        }
+        if self.projective.values().any(projective::State::animating) {
+            return Some(RATE_FAST);
+        }
+        running.then_some(RATE_SLOW)
+    }
+
     /// An empty tree holding only its root layer (`LayerId(0)`).
     #[must_use]
     pub fn new() -> Self {
@@ -319,6 +416,24 @@ impl SurfaceTree {
         let node = self.layer(id);
         node.children.iter().fold(node.inner_stamp, |stamp, child| {
             stamp.max(self.subtree_stamp(*child))
+        })
+    }
+
+    /// Version of the pixels composited by the engine, excluding only the
+    /// outer properties of layers whose pixels belong to system planes.
+    /// Content, clips, child order and every unpromoted property remain
+    /// dependencies. Backends separately validate plane eligibility and
+    /// resource changes before reusing the engine parts.
+    #[must_use]
+    pub fn composition_stamp(&self, promoted: impl Fn(LayerId) -> bool) -> u64 {
+        self.nodes.iter().fold(0, |stamp, (&raw, node)| {
+            stamp
+                .max(node.inner_stamp)
+                .max(if promoted(LayerId::new(raw)) {
+                    0
+                } else {
+                    node.outer_stamp
+                })
         })
     }
 
@@ -1170,5 +1285,66 @@ mod hierarchy_tests {
 
         tree.note_content(layer, None);
         assert!(!tree.layer(layer).blends_within());
+    }
+
+    #[test]
+    fn owned_motion_retargets_at_the_current_presentation_time() {
+        let mut tree = SurfaceTree::new();
+        let layer = tree.root();
+        let start = Instant::now();
+        tree.apply(LayerOp::Opacity(
+            layer,
+            Prop {
+                target: 0.0,
+                animation: Some(Curve::linear(Duration::from_secs(2)).into()),
+            },
+        ));
+        tree.sample(start, Display::default());
+        assert_eq!(tree.animation_rate(Display::default(), |_| true), None);
+        assert_eq!(
+            tree.animation_rate(Display::default(), |_| false),
+            Some(RATE_FAST)
+        );
+        tree.sample_owned(start + Duration::from_secs(1), |_| true);
+        tree.apply(LayerOp::Opacity(
+            layer,
+            Prop {
+                target: 0.8,
+                animation: Some(crate::Spring::smooth().into()),
+            },
+        ));
+        tree.sample(start + Duration::from_secs(1), Display::default());
+        let track = tree
+            .layer(layer)
+            .opacity_animation()
+            .expect("running spring");
+        assert!((track.from - 0.5).abs() < 1e-6);
+        assert!((track.velocity[0] + 0.5).abs() < 1e-6);
+        assert_eq!(track.start, start + Duration::from_secs(1));
+    }
+
+    #[test]
+    fn plane_composition_version_excludes_only_the_promoted_outer_state() {
+        let mut tree = SurfaceTree::new();
+        let layer = LayerId::new(1);
+        tree.apply(LayerOp::Create(layer));
+        tree.apply(LayerOp::Push {
+            parent: tree.root(),
+            child: layer,
+        });
+        let stamp = tree.composition_stamp(|id| id == layer);
+        tree.apply(LayerOp::Transform(
+            layer,
+            Prop {
+                target: Affine::translate((37., -12.)),
+                animation: None,
+            },
+        ));
+        assert_eq!(stamp, tree.composition_stamp(|id| id == layer));
+        tree.apply(LayerOp::Clip(
+            layer,
+            Some(crate::ShapeData::Rect(Rect::new(0., 0., 20., 20.))),
+        ));
+        assert_ne!(stamp, tree.composition_stamp(|id| id == layer));
     }
 }

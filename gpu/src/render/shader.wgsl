@@ -507,7 +507,12 @@ fn fs_simple(in: VsOut, classified: bool) -> vec4<f32> {
     var cov: f32;
     switch in.meta_.x {
         case KIND_GLYPH: {
-            let texel = vec2<i32>(floor(in.pixel - in.cell.xy)) + vec2<i32>(in.cell.zw);
+            var texel: vec2<i32>;
+            if classified {
+                texel = vec2<i32>(floor(in.local));
+            } else {
+                texel = vec2<i32>(floor(in.pixel - in.cell.xy)) + vec2<i32>(in.cell.zw);
+            }
             cov = textureLoad(atlas, texel, 0).r;
         }
         case KIND_SPAN: {
@@ -541,8 +546,24 @@ fn opaque_span(inst: Instance) -> bool {
     return inst.meta_.x == KIND_SPAN && inst.color.a * inst.params.y == 1.0;
 }
 
+struct OpaqueOut {
+    @builtin(position) position: vec4<f32>,
+    @location(0) @interpolate(flat) color: vec3<f32>,
+}
+
+// Coverage replay needs only the original local/atlas coordinate, the
+// instance identity, and the conservative ellipse bounds. Pull the uniform
+// primitive fields in the fragment stage instead of duplicating them in
+// every vertex's rasterizer payload.
+struct PartialOut {
+    @builtin(position) position: vec4<f32>,
+    @location(0) local: vec2<f32>,
+    @location(1) @interpolate(flat) instance: u32,
+    @location(2) @interpolate(flat) coverage: vec2<f32>,
+}
+
 @vertex
-fn vs_opaque(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VsOut {
+fn vs_opaque(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> OpaqueOut {
     var inst = instances[ii];
     var ellipse = false;
     var ellipse_half = vec2<f32>(0.0);
@@ -593,11 +614,11 @@ fn vs_opaque(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -
         || any(inst.bounds.xy >= inst.bounds.zw) {
         out.position = vec4<f32>(0.0, 0.0, 0.0, 1.0);
     }
-    return out;
+    return OpaqueOut(out.position, out.color.rgb);
 }
 
 @vertex
-fn vs_partial(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VsOut {
+fn vs_partial(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> PartialOut {
     var out = quad_vertex(array<u32, 4>(0u, 1u, 2u, 5u)[vi], ii);
     out.position.z = bitcast<f32>(0x3e000000u + ii * 8u);
     let inst = instances[ii];
@@ -613,17 +634,30 @@ fn vs_partial(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) 
     if opaque_span(instances[ii]) {
         out.position = vec4<f32>(0.0, 0.0, 0.0, 1.0);
     }
-    return out;
+    let local = select(out.local, out.pixel - out.cell.xy + out.cell.zw, out.meta_.x == KIND_GLYPH);
+    return PartialOut(out.position, local, ii, out.affine1.zw);
 }
 
 @fragment
-fn fs_opaque(in: VsOut) -> @location(0) vec4<f32> {
-    return move_space(vec4<f32>(in.color.rgb, 1.0), SPACE_LINEAR, globals.space);
+fn fs_opaque(in: OpaqueOut) -> @location(0) vec4<f32> {
+    return move_space(vec4<f32>(in.color, 1.0), SPACE_LINEAR, globals.space);
 }
 
 @fragment
-fn fs_partial(in: VsOut) -> @location(0) vec4<f32> {
-    return fs_simple(in, true);
+fn fs_partial(in: PartialOut) -> @location(0) vec4<f32> {
+    let inst = instances[in.instance];
+    var data: VsOut;
+    data.local = in.local;
+    data.meta_.x = select(inst.meta_.x, KIND_GLYPH, inst.meta_.x == KIND_REGION);
+    data.color = inst.color;
+    data.params.y = inst.params.y;
+    if data.meta_.x != KIND_GLYPH && data.meta_.x != KIND_SPAN {
+        data.shape_a = vec4<f32>(inst.shape.half, inst.shape.aspect, inst.shape.exponent);
+        data.shape_radii = inst.shape.radii;
+        data.affine0 = inst.affine[0];
+    }
+    data.affine1 = vec4<f32>(0.0, 0.0, in.coverage);
+    return fs_simple(data, true);
 }
 
 // The shadow kernel plus the same opacity/solid-colour tail.

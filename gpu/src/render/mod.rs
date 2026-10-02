@@ -3,6 +3,7 @@
 mod bindings;
 mod bitmap;
 mod colr;
+#[cfg(target_vendor = "apple")]
 mod composite;
 pub mod diag;
 pub mod external;
@@ -280,7 +281,9 @@ struct SurfaceState {
     shader_textures: FxHashMap<std::sync::Arc<paint::Key>, paint::Texture>,
     frame: LoweredFrame,
     /// Image lifetimes and attachment assignment, before physical allocation.
+    #[cfg(target_vendor = "apple")]
     composition: composite::plan::ExecutionPlan,
+    #[cfg(target_vendor = "apple")]
     composition_cache: composite::cache::Cache,
     #[cfg(target_vendor = "apple")]
     tile_targets: composite::metal::Attachments,
@@ -2540,7 +2543,9 @@ impl Renderer for GpuRenderer {
                 external: FxHashMap::default(),
                 shader_textures: FxHashMap::default(),
                 frame: LoweredFrame::default(),
+                #[cfg(target_vendor = "apple")]
                 composition: composite::plan::ExecutionPlan::default(),
+                #[cfg(target_vendor = "apple")]
                 composition_cache: composite::cache::Cache::default(),
                 #[cfg(target_vendor = "apple")]
                 tile_targets: composite::metal::Attachments::default(),
@@ -2997,10 +3002,12 @@ impl Renderer for GpuRenderer {
                 }
             }
             surf.scratch.clear();
-            surf.composition = composite::plan::ExecutionPlan::default();
-            surf.composition_cache = composite::cache::Cache::default();
             #[cfg(target_vendor = "apple")]
-            surf.tile_targets.clear();
+            {
+                surf.composition = composite::plan::ExecutionPlan::default();
+                surf.composition_cache = composite::cache::Cache::default();
+                surf.tile_targets.clear();
+            }
             surf.coverage_depth = None;
             surf.backdrop = [None, None];
             for state in surf.backdrop_groups.values_mut() {
@@ -3172,21 +3179,20 @@ impl Renderer for GpuRenderer {
             .flat_map(|g| &g.captures)
             .map(|c| format_name(c.texture.format()))
             .next();
+        let cpu = self.atlas.cpu_bytes();
+        #[cfg(target_vendor = "apple")]
+        let cpu = cpu
+            + self
+                .surfaces
+                .values()
+                .map(|surface| surface.composition.bytes() + surface.composition_cache.bytes())
+                .sum::<u64>();
         MemoryUsage {
             gpu: cherenkov::Bytes(
                 gpu + self.filters.gpu_bytes()
                     + self.shadow_blur.as_ref().map_or(0, shadow::Blur::gpu_bytes),
             ),
-            cpu: cherenkov::Bytes(
-                self.atlas.cpu_bytes()
-                    + self
-                        .surfaces
-                        .values()
-                        .map(|surface| {
-                            surface.composition.bytes() + surface.composition_cache.bytes()
-                        })
-                        .sum::<u64>(),
-            ),
+            cpu: cherenkov::Bytes(cpu),
             backdrop_captures: cherenkov::Bytes(captures),
             backdrop_capture_format: capture_format,
         }
@@ -5676,20 +5682,22 @@ impl GpuRenderer {
             );
             surf.parts.truncate(parts);
         }
-        let tile_slots = if cfg!(target_vendor = "apple")
-            && self.shader_delivery == shaders::ShaderDelivery::Metallib
-            && self.scratch_format == TARGET_FORMAT
+        #[cfg(target_vendor = "apple")]
         {
-            2
-        } else {
-            0
-        };
-        surf.composition_cache.update(
-            &mut surf.composition,
-            &surf.frame,
-            self.scratch_format,
-            tile_slots,
-        );
+            let tile_slots = if self.shader_delivery == shaders::ShaderDelivery::Metallib
+                && self.scratch_format == TARGET_FORMAT
+            {
+                2
+            } else {
+                0
+            };
+            surf.composition_cache.update(
+                &mut surf.composition,
+                &surf.frame,
+                self.scratch_format,
+                tile_slots,
+            );
+        }
         let max_scratch = surf
             .frame
             .passes
@@ -5702,10 +5710,13 @@ impl GpuRenderer {
             .unwrap_or(0);
         // The largest region each isolation depth must hold this frame.
         let mut region_max = vec![(0u32, 0u32); max_scratch];
-        for (index, pass) in surf.frame.passes.iter().enumerate() {
-            if let Target::Scratch(i) = pass.target
-                && surf.composition.materialized_pass(index)
-            {
+        let passes = surf.frame.passes.iter();
+        #[cfg(target_vendor = "apple")]
+        let passes = passes
+            .enumerate()
+            .filter_map(|(index, pass)| surf.composition.materialized_pass(index).then_some(pass));
+        for pass in passes {
+            if let Target::Scratch(i) = pass.target {
                 region_max[i].0 = region_max[i].0.max(pass.region[2]);
                 region_max[i].1 = region_max[i].1.max(pass.region[3]);
             }
@@ -5930,10 +5941,13 @@ impl GpuRenderer {
         // Backdrop textures for blend composites, sized like the scratch
         // pool to the largest region copied this frame.
         let mut backdrop_max = [(0u32, 0u32); 2];
-        for (index, pass) in surf.frame.passes.iter().enumerate() {
-            if let Some(r) = pass.backdrop_copy
-                && !surf.composition.contains_native_pass(index)
-            {
+        let passes = surf.frame.passes.iter();
+        #[cfg(target_vendor = "apple")]
+        let passes = passes.enumerate().filter_map(|(index, pass)| {
+            (!surf.composition.contains_native_pass(index)).then_some(pass)
+        });
+        for pass in passes {
+            if let Some(r) = pass.backdrop_copy {
                 let slot = match pass.target {
                     Target::Part(_) | Target::Projected(_) => 0,
                     Target::Scratch(_) => 1,
@@ -6157,15 +6171,21 @@ impl GpuRenderer {
             }
             let mut entry = [0u8; 256];
             for surf in &surfaces {
-                for (index, pass) in surf.frame.passes.iter().enumerate() {
-                    let mut g = lower::globals(
+                let globals = surf.frame.passes.iter().map(|pass| {
+                    lower::globals(
                         [pass.region[2] as f32, pass.region[3] as f32],
                         [pass.region[0] as f32, pass.region[1] as f32],
                         pass.space,
-                    );
+                    )
+                });
+                #[cfg(target_vendor = "apple")]
+                let globals = globals.enumerate().map(|(index, mut g)| {
                     if let Some(origin) = surf.composition.attachment_origin(index) {
                         g.attachment_origin = origin.map(|value| value as f32);
                     }
+                    g
+                });
+                for g in globals {
                     let g = bytemuck::bytes_of(&g);
                     entry[..g.len()].copy_from_slice(g);
                     put(&entry);

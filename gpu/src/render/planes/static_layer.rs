@@ -48,7 +48,8 @@ pub struct Observation {
 
 impl Capture {
     pub fn bytes(&self) -> u64 {
-        u64::from(self.domain.size.0) * u64::from(self.domain.size.1) * 8
+        u64::from(self.domain.size.0) * u64::from(self.domain.size.1)
+            * crate::render::texel_bytes(crate::render::TARGET_FORMAT)
     }
 }
 

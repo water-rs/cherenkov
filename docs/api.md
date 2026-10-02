@@ -747,11 +747,14 @@ lowering pixel-for-pixel.
 
 `AnimationTrack<T: Animatable>` exposes a running property's original `from`,
 lane `velocity`, `target`, `animation`, and presentation-clock `start`.
-`LayerNode::transform_animation()` and `opacity_animation()` return these
-immutable descriptions. A sole translation component can be represented as
-an affine translation track; nonlinear component combinations cannot.
-`describable_animations()` confirms that no other moving property would be
-lost by handing off those descriptions.
+`LayerNode::animations() -> Option<LayerAnimations>` returns both descriptions
+together, as `transform: Option<AnimationTrack<Affine>>` and
+`opacity: Option<AnimationTrack<f32>>`. `None` means that at least one track
+cannot be described completely, including an unsampled track, scrolling,
+nonlinear component motion, or a projective layer. `Some` with both fields
+empty means that no property is moving. A sole translation component can be
+represented as an affine translation track. The backend then decides whether
+its native animation primitive can express the described tracks exactly.
 
 `Renderer::owned_animations(surface) -> &[LayerId]` reports layers whose
 **complete** running property animation was accepted by the last successful
@@ -769,12 +772,22 @@ scroll decay, and nonlinear component combinations continue to require engine
 frames: Core Animation's decomposed matrix interpolation is not the engine's
 coefficient interpolation. A handoff also requires eligibility throughout the
 motion; sampled non-overlap with translucent content above is insufficient.
+A translucent or fading moving layer cannot take ownership above an earlier
+plane. Installed native motion retains its position and linear transform
+through placement updates; unchanged placements cause no native transaction.
 
 `SurfaceTree::composition_stamp(promoted)` versions the engine-composited
 pixels while excluding only promoted layers' outer property stamps. Content,
 clips, ordering, resource generations, surface size, clear colour and display
 state remain dependencies of retained engine parts. Property-only plane
 updates can consequently retain those parts on both native platforms.
+
+`lowering::Content::current() -> Option<(&[O], &DisplayList)>` lends the
+prepared operations together with the source they index. Dirty or unprepared
+content returns `None`, so static-capture admission cannot inspect obsolete
+operations or compile content twice. Immutable captures keep only their
+native presentation buffer after publication. Output changes recapture from
+the retained source; they do not keep a second engine texture alive.
 
 ### Component transform animation (#77)
 

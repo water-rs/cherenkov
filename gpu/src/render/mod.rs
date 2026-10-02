@@ -4972,14 +4972,9 @@ impl GpuRenderer {
                 .any(|key| self.shaders.animated(key))
     }
 
-    /// The layers whose new frames `sf`'s surface can present through its
-    /// planes alone: `Some` when the surface promotes, the frame's only
-    /// committed change is those installs, no present is pending on
-    /// either side — a deferred or failed compose is still owed — no
-    /// display moved, nothing else wants a redraw, and the plan they
-    /// would produce is the committed one (`planes::frames_only`).
-    /// `false` sends the frame down the full render path like any other
-    /// change (#90).
+    /// Observe content lifetimes without outlining glyphs until admission.
+    /// Periodic changes must outlive their previous quiet interval before
+    /// another capture is admitted.
     fn observe_static(&mut self, sf: &SurfaceFrame<'_>) -> Result<(), RenderError> {
         let surf = self.surfaces.get_mut(&sf.id).expect("registered surface");
         if !surf.promotes {
@@ -5046,6 +5041,8 @@ impl GpuRenderer {
         Ok(())
     }
 
+    /// Admit external-frame or promoted-pose updates only when the native
+    /// stack and all engine-composited content stay unchanged.
     fn plane_only_frames(&mut self, sf: &SurfaceFrame<'_>) -> bool {
         if sf.present_pending || sf.display_moved {
             return false;

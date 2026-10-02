@@ -56,12 +56,12 @@ fn scene() -> SurfaceTree {
     tree
 }
 
-fn video() -> FxHashMap<LayerId, (u32, u32)> {
-    std::iter::once((VIDEO, SIZE)).collect()
+fn video() -> FxHashMap<LayerId, super::Candidate> {
+    std::iter::once((VIDEO, SIZE.into())).collect()
 }
 
 /// The ready set when every candidate's realization is complete.
-fn all_ready(candidates: &FxHashMap<LayerId, (u32, u32)>) -> FxHashSet<LayerId> {
+fn all_ready(candidates: &FxHashMap<LayerId, super::Candidate>) -> FxHashSet<LayerId> {
     candidates.keys().copied().collect()
 }
 
@@ -217,7 +217,7 @@ fn a_translucent_layer_beyond_the_clip_does_not_block_promotion() {
         ABOVE,
         Some(ShapeData::Rect(Rect::new(8.0, 58.0, 88.0, 64.0))),
     ));
-    let candidates: FxHashMap<_, _> = std::iter::once((VIDEO, (48, 32))).collect();
+    let candidates: FxHashMap<_, _> = std::iter::once((VIDEO, (48, 32).into())).collect();
     let plan = plan::<Test>(&tree, &candidates, &all_ready(&candidates));
     assert_eq!(plan.planes.len(), 1, "{:?}", plan.rejected);
 }
@@ -280,9 +280,13 @@ fn nested_shaped_clips_are_not_promoted() {
 #[test]
 fn the_budget_goes_to_the_first_candidates_in_paint_order() {
     let tree = scene();
-    let candidates: FxHashMap<_, _> = [(BELOW, SIZE), (VIDEO, SIZE), (ABOVE, SIZE)]
-        .into_iter()
-        .collect();
+    let candidates: FxHashMap<_, _> = [
+        (BELOW, SIZE.into()),
+        (VIDEO, SIZE.into()),
+        (ABOVE, SIZE.into()),
+    ]
+    .into_iter()
+    .collect();
     let plan = plan::<Test>(&tree, &candidates, &all_ready(&candidates));
     assert_eq!(
         plan.planes.iter().map(|p| p.layer).collect::<Vec<_>>(),
@@ -395,7 +399,7 @@ fn a_plane_only_frame_presents_through_the_planes_alone() {
     ));
 
     // A differently sized frame on the same layer changes its placement.
-    let resized: FxHashMap<_, _> = std::iter::once((VIDEO, (640, 360))).collect();
+    let resized: FxHashMap<_, _> = std::iter::once((VIDEO, (640, 360).into())).collect();
     assert!(!frames_only::<Test>(
         &committed,
         &tree,
@@ -408,7 +412,7 @@ fn a_plane_only_frame_presents_through_the_planes_alone() {
     // A first frame on another layer makes it a candidate, which changes
     // the plan — here by adding a second promotion.
     let mut two = video();
-    two.insert(BELOW, SIZE);
+    two.insert(BELOW, SIZE.into());
     assert!(!frames_only::<Test>(
         &committed,
         &tree,
@@ -438,7 +442,7 @@ fn a_pending_candidate_does_not_block_a_plane_only_frame() {
     // `BELOW` gained a plane-capable frame but its realization is still
     // pending: a candidate, not yet ready.
     let mut candidates = video();
-    candidates.insert(BELOW, SIZE);
+    candidates.insert(BELOW, SIZE.into());
     let just_video: FxHashSet<LayerId> = std::iter::once(VIDEO).collect();
     let committed = plan::<Test>(&tree, &candidates, &just_video);
     assert_eq!(committed.planes.len(), 1);

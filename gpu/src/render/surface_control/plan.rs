@@ -873,7 +873,7 @@ mod tests {
     fn decide(tree: &SurfaceTree, size: (u32, u32)) -> planes::Plan {
         planes::plan::<Android>(
             tree,
-            &std::iter::once((VIDEO, size)).collect(),
+            &std::iter::once((VIDEO, size.into())).collect(),
             &std::iter::once(VIDEO).collect(),
         )
     }

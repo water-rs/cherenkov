@@ -31,6 +31,27 @@ use crate::render::present::Presenter;
 #[cfg(target_vendor = "apple")]
 mod animation;
 
+pub mod static_layer;
+
+/// A plane buffer's extent and texel-to-content transform. External frames
+/// use identity; recorded layers have a local raster origin and density.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Candidate {
+    /// Raster extent.
+    pub size: (u32, u32),
+    /// Buffer texels to layer content coordinates.
+    pub raster: Affine,
+}
+
+impl From<(u32, u32)> for Candidate {
+    fn from(size: (u32, u32)) -> Self {
+        Self {
+            size,
+            raster: Affine::IDENTITY,
+        }
+    }
+}
+
 /// What a platform's system compositor can express, which bounds promotion.
 pub trait Compositor {
     /// The most layers promoted on one surface. Every promoted layer adds
@@ -150,6 +171,8 @@ pub struct Placement {
     pub layer: LayerId,
     /// The content rectangle `(0, 0, w, h)` in the layer's content space.
     pub size: (u32, u32),
+    /// Buffer texels to the layer's content space.
+    pub raster: Affine,
     /// The layer's opacity; every ancestor is opaque by eligibility.
     pub opacity: f32,
     /// The root first, the promoted layer last.
@@ -170,7 +193,7 @@ impl Placement {
     pub fn content_to_device(&self) -> Affine {
         self.path.iter().fold(Affine::IDENTITY, |acc, level| {
             acc * level.content_transform()
-        })
+        }) * self.raster
     }
 }
 
@@ -365,7 +388,7 @@ fn suffixes(
 fn verdicts<'a, C: Compositor>(
     tree: &'a SurfaceTree,
     order: &'a [Visit],
-    candidates: &'a FxHashMap<LayerId, (u32, u32)>,
+    candidates: &'a FxHashMap<LayerId, Candidate>,
     ready: &'a FxHashSet<LayerId>,
     backdrop_above: &'a [Option<LayerId>],
     blend_above: &'a [Option<LayerId>],
@@ -410,7 +433,7 @@ fn verdicts<'a, C: Compositor>(
 #[must_use]
 pub fn plan<C: Compositor>(
     tree: &SurfaceTree,
-    candidates: &FxHashMap<LayerId, (u32, u32)>,
+    candidates: &FxHashMap<LayerId, Candidate>,
     ready: &FxHashSet<LayerId>,
 ) -> Plan {
     if candidates.is_empty() {
@@ -458,12 +481,11 @@ fn placement_eq(
     tree: &SurfaceTree,
     order: &[Visit],
     i: usize,
-    size: (u32, u32),
+    size: Candidate,
     placed: &Placement,
 ) -> bool {
     let visit = &order[i];
-    placed.layer == visit.id
-        && placed.size == size
+    (placed.layer, placed.size, placed.raster) == (visit.id, size.size, size.raster)
         && placed.opacity == tree.layer(visit.id).opacity
         && placed.path.len() == visit.ancestors.len() + 1
         && visit
@@ -487,7 +509,7 @@ fn placement_eq(
 fn same_plan<C: Compositor>(
     committed: &Plan,
     tree: &SurfaceTree,
-    candidates: &FxHashMap<LayerId, (u32, u32)>,
+    candidates: &FxHashMap<LayerId, Candidate>,
     ready: &FxHashSet<LayerId>,
     scratch: &mut PlanScratch,
 ) -> bool {
@@ -545,7 +567,7 @@ fn judge<C: Compositor>(
     tree: &SurfaceTree,
     order: &[Visit],
     i: usize,
-    size: (u32, u32),
+    size: Candidate,
     backdrop_above: Option<LayerId>,
     blend_above: Option<LayerId>,
     device: &[VisitDevice],
@@ -610,11 +632,11 @@ fn judge<C: Compositor>(
     }
     // The plane shows the frame inside the path's clips only: content a
     // clip cuts away cannot overlap a layer above.
-    let rect = device[i].space.transform_rect_bbox(Rect::new(
+    let rect = (device[i].space * size.raster).transform_rect_bbox(Rect::new(
         0.0,
         0.0,
-        f64::from(size.0),
-        f64::from(size.1),
+        f64::from(size.size.0),
+        f64::from(size.size.1),
     ));
     let rect = device[i]
         .bounds
@@ -632,7 +654,7 @@ fn judge<C: Compositor>(
     Ok(())
 }
 
-fn placement(tree: &SurfaceTree, order: &[Visit], i: usize, size: (u32, u32)) -> Placement {
+fn placement(tree: &SurfaceTree, order: &[Visit], i: usize, size: Candidate) -> Placement {
     let visit = &order[i];
     let path = visit
         .ancestors
@@ -651,7 +673,8 @@ fn placement(tree: &SurfaceTree, order: &[Visit], i: usize, size: (u32, u32)) ->
         .collect();
     Placement {
         layer: visit.id,
-        size,
+        size: size.size,
+        raster: size.raster,
         opacity: tree.layer(visit.id).opacity,
         path,
     }
@@ -672,7 +695,7 @@ fn placement(tree: &SurfaceTree, order: &[Visit], i: usize, size: (u32, u32)) ->
 pub fn frames_only<C: Compositor>(
     plan: &Plan,
     tree: &SurfaceTree,
-    candidates: &FxHashMap<LayerId, (u32, u32)>,
+    candidates: &FxHashMap<LayerId, Candidate>,
     ready: &FxHashSet<LayerId>,
     layers: &FxHashSet<LayerId>,
     scratch: &mut PlanScratch,
@@ -694,6 +717,13 @@ pub fn frames_only<C: Compositor>(
     )
 )]
 pub enum PlaneContent<'a> {
+    /// An immutable capture of a recorded layer in linear Display P3.
+    Raster {
+        /// Captured pixels; only a new generation changes them.
+        view: &'a wgpu::TextureView,
+        /// The capture's content version.
+        generation: u64,
+    },
     /// A retained external frame, handed to the system compositor instead of
     /// being sampled by the engine.
     Frame {
@@ -771,6 +801,10 @@ pub struct Composition<'a> {
 /// frame with the whole stack; the realization makes the system tree match
 /// it, atomically where the platform allows, and presents the parts.
 pub trait SystemPlanes: Compositor {
+    /// Native immutable capture allocations, excluding the engine's source.
+    fn captured_bytes(&self) -> u64 {
+        0
+    }
     /// Hands supported tracks to the committed native layer tree. Called
     /// only after a successful presentation of `plan`.
     fn animate(&mut self, _tree: &SurfaceTree, _plan: &Plan) {}
@@ -810,7 +844,7 @@ pub trait SystemPlanes: Compositor {
     /// render admission for every promotion-capable surface, dirty or
     /// not, so a deferred realization that completes between renders is
     /// seen on the next one.
-    fn groom(&mut self, candidates: &FxHashMap<LayerId, (u32, u32)>) {
+    fn groom(&mut self, candidates: &FxHashMap<LayerId, Candidate>) {
         let _ = candidates;
     }
 
@@ -819,7 +853,7 @@ pub trait SystemPlanes: Compositor {
     /// behavior unchanged.
     fn groom_with_frames(
         &mut self,
-        candidates: &FxHashMap<LayerId, (u32, u32)>,
+        candidates: &FxHashMap<LayerId, Candidate>,
         frames: &FxHashMap<LayerId, (ExternalFrame, u64)>,
     ) {
         let _ = frames;
@@ -843,7 +877,7 @@ pub trait SystemPlanes: Compositor {
     /// synchronous realizations.
     fn prepare(
         &mut self,
-        candidates: &FxHashMap<LayerId, (u32, u32)>,
+        candidates: &FxHashMap<LayerId, Candidate>,
         frames: &FxHashMap<LayerId, (ExternalFrame, u64)>,
         ready: &mut FxHashSet<LayerId>,
     ) {

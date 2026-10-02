@@ -42,6 +42,8 @@ pub enum Target {
     Backdrop { group: u64, region: u32 },
     /// A projective layer's local image, base level (#84).
     Projected(LocalKey),
+    /// A recorded layer captured for the system compositor.
+    Plane(LayerId),
 }
 
 /// The texture a draw range samples at bind group 1.
@@ -1327,6 +1329,32 @@ impl<'a> Lowering<'a> {
         )
     }
 
+    /// Captures a leaf's recorded pixels before its outer properties apply.
+    pub fn run_plane(
+        &mut self,
+        tree: &SurfaceTree,
+        caches: &mut FxHashMap<LayerId, ContentData>,
+        glyphs: &GlyphContext<'_>,
+        groups: &FxHashMap<u64, BackdropGroupInfo>,
+        layer: LayerId,
+        domain: super::planes::static_layer::Domain,
+    ) -> Result<(), RenderError> {
+        self.raster(domain.size);
+        self.walk(
+            tree,
+            caches,
+            glyphs,
+            groups,
+            (
+                Some((layer, domain.raster().inverse())),
+                Target::Plane(layer),
+                Some([0.0; 4]),
+            ),
+            FxHashMap::default(),
+            &super::planes::Plan::default(),
+        )
+    }
+
     /// Sets the raster the next walk lowers onto.
     #[expect(clippy::cast_precision_loss, reason = "raster sizes fit f32")]
     const fn raster(&mut self, size: (u32, u32)) {
@@ -1398,9 +1426,14 @@ impl<'a> Lowering<'a> {
         parent: Affine,
     ) -> (Affine, Affine) {
         match self.local {
-            Some((root, local)) if root == id => {
-                (local, local * Affine::translate(-node.scroll_offset))
-            }
+            Some((root, local)) if root == id => (
+                local,
+                if matches!(self.root_target, Target::Plane(_)) {
+                    local
+                } else {
+                    local * Affine::translate(-node.scroll_offset)
+                },
+            ),
             _ => (parent * node.transform, parent * node.content_transform()),
         }
     }
@@ -1443,7 +1476,9 @@ impl<'a> Lowering<'a> {
         match target {
             // A local image stores its layer's linear isolation; a part is
             // the surface's own working space.
-            Target::Part(_) | Target::Projected(_) => cherenkov::BlendSpace::Linear,
+            Target::Part(_) | Target::Projected(_) | Target::Plane(_) => {
+                cherenkov::BlendSpace::Linear
+            }
             Target::Scratch(k) => self
                 .scratch_space
                 .get(k)
@@ -1535,7 +1570,7 @@ impl<'a> Lowering<'a> {
         self.end_segment_at(end);
         if let Some(open) = self.frame.open.take() {
             let region = match open.target {
-                Target::Part(_) | Target::Projected(_) => {
+                Target::Part(_) | Target::Projected(_) | Target::Plane(_) => {
                     [0, 0, self.width as u32, self.height as u32]
                 }
                 // Scratch regions are tightened in `isolate` once the
@@ -2403,6 +2438,11 @@ impl<'a> Lowering<'a> {
             return self.projected_layer(id, node, glyphs);
         }
         let local_root = self.local.is_some_and(|(root, _)| root == id);
+        let clip = if local_root && matches!(self.root_target, Target::Plane(_)) {
+            None
+        } else {
+            node.clip.as_ref()
+        };
         // A local root's opacity and blend apply when its image composes.
         let (opacity, blend) = if local_root {
             (1.0, cherenkov::BlendMode::Normal)
@@ -2440,7 +2480,7 @@ impl<'a> Lowering<'a> {
             // unaffected by the layer's opacity or blend.
             if let Some(sample) = &backdrop {
                 self.with_clip(
-                    node.clip.as_ref(),
+                    clip,
                     |s, _glyphs| {
                         s.transform = content_space;
                         s.emit_backdrop_sample(sample.group().raw(), id, sample.effect())
@@ -2460,7 +2500,7 @@ impl<'a> Lowering<'a> {
                 cherenkov::BlendSpace::Linear,
                 |s, glyphs| {
                     s.with_clip(
-                        node.clip.as_ref(),
+                        clip,
                         |s, glyphs| {
                             s.transform = content_space;
                             s.layer_items(id, node, tree, caches, glyphs)
@@ -2472,7 +2512,7 @@ impl<'a> Lowering<'a> {
             )
         } else {
             self.with_clip(
-                node.clip.as_ref(),
+                clip,
                 |s, glyphs| {
                     s.transform = content_space;
                     if let Some(sample) = &backdrop {
@@ -2596,6 +2636,15 @@ impl<'a> Lowering<'a> {
         caches: &mut FxHashMap<LayerId, ContentData>,
         glyphs: &GlyphContext<'_>,
     ) -> Result<(), RenderError> {
+        if self.promoted.contains(&id) {
+            if self.opens.contains(&id) {
+                self.next_part();
+            }
+            for &child in &node.children {
+                self.layer(child, tree, caches, glyphs)?;
+            }
+            return Ok(());
+        }
         if let Some(content) = caches.get_mut(&id) {
             let (ops, emissions, source) = content.retained.prepared_source();
             content.storage.compact(emissions);
@@ -2633,13 +2682,7 @@ impl<'a> Lowering<'a> {
                 self.push_shaped(inst, transform, boxed.bounds, margin);
             }
         }
-        if self.promoted.contains(&id) {
-            // A plane the plan puts a part after ends the current part —
-            // nothing painted above it leaves no part to open into.
-            if self.opens.contains(&id) {
-                self.next_part();
-            }
-        } else if let Some(slot) = glyphs.external.get(&id) {
+        if let Some(slot) = glyphs.external.get(&id) {
             self.frame.external.push(id);
             let bounds = Rect::new(0.0, 0.0, f64::from(slot.size.0), f64::from(slot.size.1));
             if let Some(boxed) = box_shape(&ShapeData::Rect(bounds))? {
@@ -4900,6 +4943,7 @@ mod tests {
             planes: promoted
                 .iter()
                 .map(|&layer| crate::render::planes::Placement {
+                    raster: Affine::IDENTITY,
                     layer,
                     size: (8, 8),
                     opacity: 1.0,
@@ -4993,11 +5037,13 @@ mod tests {
         );
         // Two promoted layers with the second painted last: the
         // separator part between them still opens, nothing after it.
+        // Recorded pixels on the second plane are captured separately,
+        // so the separator has no engine draws.
         assert_eq!(
             lower(&plan(&[video, above], false)),
             [
                 (Target::Part(0), Some([0.0, 0.0, 0.0, 1.0]), 1),
-                (Target::Part(1), Some([0.0; 4]), 1),
+                (Target::Part(1), Some([0.0; 4]), 0),
             ]
         );
     }

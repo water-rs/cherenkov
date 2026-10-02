@@ -96,6 +96,7 @@ use crate::interop::{
 use crate::render::present::WindowSurface;
 
 mod animation;
+mod raster;
 
 /// Main-thread storage with asynchronous destruction. Every reference, including
 /// the last one, is released on main; `MainThreadBound::drop` can never dispatch
@@ -196,6 +197,8 @@ impl Parent {
                     displays: FxHashMap::default(),
                     retired: Vec::new(),
                     motions: FxHashMap::default(),
+                    rasters: FxHashMap::default(),
+                    retired_rasters: Vec::new(),
                 },
                 mtm,
             ),
@@ -248,6 +251,7 @@ impl Drop for DisplayLayer {
 
 struct PlaneLayers {
     layer: LayerId,
+    raster: bool,
     shape: Vec<(LayerId, bool)>,
     top: Retained<CALayer>,
     levels: Vec<LevelLayers>,
@@ -282,6 +286,8 @@ struct LayerScene {
     /// transaction, so the removal never commits a frame on its own.
     retired: Vec<DisplayLayer>,
     motions: FxHashMap<LayerId, super::animation::Motion>,
+    rasters: FxHashMap<LayerId, Retained<CALayer>>,
+    retired_rasters: Vec<Retained<CALayer>>,
 }
 
 impl Drop for LayerScene {
@@ -398,6 +404,8 @@ pub struct LayerPlanes {
     woke: bool,
     waker: Option<cherenkov::CompletionWaker>,
     owned_animations: Vec<LayerId>,
+    static_candidates: FxHashSet<LayerId>,
+    buffers: FxHashMap<LayerId, raster::Buffer>,
 }
 
 /// An origin-anchored layer: its position is its superlayer point for its
@@ -880,13 +888,14 @@ impl LayerScene {
             outer = scroll.clone();
             levels.push(LevelLayers { node, clip, scroll });
         }
-        let display = &self.displays[&placement.layer].display;
+        let display = self.display(placement.layer);
         levels
             .last()
             .map_or(&*top, LevelLayers::inner)
             .addSublayer(display);
         PlaneLayers {
             layer: placement.layer,
+            raster: self.rasters.contains_key(&placement.layer),
             shape: shape(placement),
             top,
             levels,
@@ -905,13 +914,18 @@ impl LayerScene {
         for retired in self.retired.drain(..) {
             retired.display.removeFromSuperlayer();
         }
+        for retired in self.retired_rasters.drain(..) {
+            retired.removeFromSuperlayer();
+        }
         // Identity, not position, determines reuse. Moving B from slot 1 to
         // slot 0 never consumes or replaces A's display.
         let mut old = std::mem::take(&mut self.planes);
         for placement in placements {
-            let reusable = old
-                .iter()
-                .position(|p| p.layer == placement.layer && p.shape == shape(placement));
+            let reusable = old.iter().position(|p| {
+                p.layer == placement.layer
+                    && p.shape == shape(placement)
+                    && p.raster == self.rasters.contains_key(&placement.layer)
+            });
             let built = if let Some(index) = reusable {
                 old.remove(index)
             } else {
@@ -926,17 +940,25 @@ impl LayerScene {
             for (level, layers) in placement.path.iter().zip(&built.levels) {
                 place(level, layers);
             }
-            let display = &self.displays[&placement.layer].display;
+            let display = self.display(placement.layer);
             display.setBounds(CGRect::new(
                 CGPoint::new(0.0, 0.0),
                 CGSize::new(f64::from(placement.size.0), f64::from(placement.size.1)),
             ));
+            display.setAffineTransform(cg_affine(placement.raster));
             display.setOpacity(placement.opacity);
             display.setName(None);
             self.planes.push(built);
         }
         for plane in old {
             plane.top.removeFromSuperlayer();
+        }
+        for (&layer, raster) in &self.rasters {
+            if !placements.iter().any(|placement| placement.layer == layer) {
+                // SAFETY: main-thread CALayer; removing the last native
+                // reference releases a demoted capture's IOSurface.
+                unsafe { raster.setContents(None) };
+            }
         }
         // A candidate outside the plan — still probing, or demoted when
         // its readiness was lost — parks its display beside the root so
@@ -961,6 +983,13 @@ impl LayerScene {
         }
         // SAFETY: all elements are layers retained by this main-thread scene.
         unsafe { self.root.setSublayers(Some(&NSArray::from_slice(&order))) };
+    }
+
+    fn display(&self, layer: LayerId) -> &CALayer {
+        match self.rasters.get(&layer) {
+            Some(raster) => raster,
+            None => &self.displays[&layer].display,
+        }
     }
 
     /// Hands `frame` to `layer`'s display layer.
@@ -1007,13 +1036,15 @@ struct Update {
 }
 
 impl Update {
-    fn from_plane(plane: &Plane<'_>) -> Self {
-        let PlaneContent::Frame { frame, generation } = &plane.content;
-        Self {
+    fn from_plane(plane: &Plane<'_>) -> Option<Self> {
+        let PlaneContent::Frame { frame, generation } = &plane.content else {
+            return None;
+        };
+        Some(Self {
             layer: plane.placement.layer,
             frame: (*frame).clone(),
             generation: *generation,
-        }
+        })
     }
 }
 
@@ -1056,6 +1087,8 @@ impl LayerPlanes {
             woke: false,
             waker,
             owned_animations: Vec::new(),
+            static_candidates: FxHashSet::default(),
+            buffers: FxHashMap::default(),
         };
         result.request_parts(1, probe);
         result
@@ -1179,6 +1212,9 @@ impl Compositor for LayerPlanes {
 }
 
 impl SystemPlanes for LayerPlanes {
+    fn captured_bytes(&self) -> u64 {
+        self.buffers.values().map(raster::Buffer::bytes).sum()
+    }
     fn animate(&mut self, tree: &cherenkov::SurfaceTree, plan: &super::Plan) {
         let motions: Vec<_> = plan
             .planes
@@ -1196,7 +1232,7 @@ impl SystemPlanes for LayerPlanes {
             let _tx = Transaction::begin();
             for plane in &scene.planes {
                 let node = &plane.levels.last().expect("a plane has a layer path").node;
-                let display = &scene.displays[&plane.layer].display;
+                let display = scene.display(plane.layer);
                 let next = motions.iter().find(|motion| motion.layer == plane.layer);
                 let previous = scene.motions.get(&plane.layer);
                 if let Some(motion) = next {
@@ -1245,6 +1281,53 @@ impl SystemPlanes for LayerPlanes {
     }
 
     fn compose(&mut self, c: Composition<'_>) -> Result<bool, RenderError> {
+        // The immutable IOSurface is published only after the GPU has
+        // finished its presentation conversion. Until then the committed
+        // scene and all of its old buffers stay visible together.
+        let mut ready = true;
+        let mut contents = Vec::new();
+        self.buffers.retain(|layer, _| {
+            c.planes.iter().any(|plane| {
+                plane.placement.layer == *layer
+                    && matches!(plane.content, PlaneContent::Raster { .. })
+            })
+        });
+        for plane in c.planes {
+            let PlaneContent::Raster { view, generation } = &plane.content else {
+                continue;
+            };
+            let layer = plane.placement.layer;
+            if self.buffers.get(&layer).is_none_or(|buffer| {
+                buffer.generation != *generation
+                    || buffer.headroom.to_bits() != c.display.headroom.to_bits()
+            }) {
+                let buffer = raster::Buffer::new(
+                    c.device,
+                    plane.placement.size,
+                    *generation,
+                    c.display.headroom,
+                )?;
+                c.presenter.texture(
+                    c.device,
+                    c.queue,
+                    view,
+                    crate::interop::TextureOutput {
+                        texture: &buffer.texture,
+                        color: crate::interop::OutputColor::LinearDisplayP3,
+                        alpha: crate::interop::OutputAlpha::Premultiplied,
+                        headroom: c.display.headroom,
+                    },
+                );
+                buffer.completed(c.queue, self.waker.clone());
+                self.buffers.insert(layer, buffer);
+            }
+            let buffer = &self.buffers[&layer];
+            ready &= buffer.ready.load(Ordering::Acquire);
+            contents.push((layer, raster::Contents(buffer.surface.clone())));
+        }
+        if !ready {
+            return Ok(false);
+        }
         self.collect_parts()?;
         self.request_parts(c.parts.len(), None);
         if self.parts.len() < c.parts.len() {
@@ -1270,26 +1353,31 @@ impl SystemPlanes for LayerPlanes {
         let queue = c.queue.clone();
         self.scene.run(move |scene, _| {
             let _tx = Transaction::begin();
+            for (layer, contents) in contents {
+                contents.set(scene.display(layer));
+            }
             scene.place(&placements, size, scale, frames.len());
             for frame in frames {
                 queue.present(frame);
             }
         });
         for plane in c.planes {
-            self.enqueue(Update::from_plane(plane));
+            if let Some(update) = Update::from_plane(plane) {
+                self.enqueue(update);
+            }
         }
         Ok(true)
     }
 
     fn groom_with_frames(
         &mut self,
-        candidates: &FxHashMap<LayerId, (u32, u32)>,
+        candidates: &FxHashMap<LayerId, super::Candidate>,
         frames: &FxHashMap<LayerId, (ExternalFrame, u64)>,
     ) {
         let removed: Vec<_> = self
             .candidates
             .keys()
-            .filter(|id| !candidates.contains_key(id))
+            .filter(|id| !candidates.contains_key(id) || !frames.contains_key(id))
             .copied()
             .collect();
         for id in removed {
@@ -1303,6 +1391,28 @@ impl SystemPlanes for LayerPlanes {
                     scene.retired.push(display);
                 }
             });
+        }
+        let removed: Vec<_> = self
+            .static_candidates
+            .iter()
+            .filter(|id| !candidates.contains_key(id) || frames.contains_key(id))
+            .copied()
+            .collect();
+        for id in removed {
+            self.static_candidates.remove(&id);
+            self.buffers.remove(&id);
+            self.scene.run(move |scene, _| {
+                if let Some(layer) = scene.rasters.remove(&id) {
+                    scene.retired_rasters.push(layer);
+                }
+            });
+        }
+        for &id in candidates.keys().filter(|id| !frames.contains_key(id)) {
+            if self.static_candidates.insert(id) {
+                self.scene.run(move |scene, _| {
+                    scene.rasters.insert(id, anchored());
+                });
+            }
         }
         self.request_parts(candidates.len().min(Self::BUDGET) + 1, None);
         for &layer in candidates.keys() {
@@ -1364,7 +1474,7 @@ impl SystemPlanes for LayerPlanes {
 
     fn prepare(
         &mut self,
-        candidates: &FxHashMap<LayerId, (u32, u32)>,
+        candidates: &FxHashMap<LayerId, super::Candidate>,
         frames: &FxHashMap<LayerId, (ExternalFrame, u64)>,
         ready: &mut FxHashSet<LayerId>,
     ) {
@@ -1376,6 +1486,7 @@ impl SystemPlanes for LayerPlanes {
                 .filter(|(_, flag)| flag.load(Ordering::Acquire))
                 .map(|(&layer, _)| layer),
         );
+        ready.extend(self.static_candidates.iter().copied());
     }
 
     fn refresh<'a>(&mut self, frames: impl Iterator<Item = Plane<'a>>) -> Result<(), RenderError> {
@@ -1391,11 +1502,11 @@ impl SystemPlanes for LayerPlanes {
                 for (level, layers) in placement.path.iter().zip(&layers.levels) {
                     place(level, layers);
                 }
-                scene.displays[&placement.layer]
-                    .display
-                    .setOpacity(placement.opacity);
+                scene.display(placement.layer).setOpacity(placement.opacity);
             });
-            self.enqueue(Update::from_plane(&plane));
+            if let Some(update) = Update::from_plane(&plane) {
+                self.enqueue(update);
+            }
         }
         Ok(())
     }

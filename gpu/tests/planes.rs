@@ -88,6 +88,10 @@ mod macos {
         };
         vec![
             case(
+                "static_pixels_are_captured_once_and_match_engine_composition",
+                static_pixels_are_captured_once_and_match_engine_composition,
+            ),
+            case(
                 "promoted_translation_is_owned_by_core_animation",
                 promoted_translation_is_owned_by_core_animation,
             ),
@@ -1088,6 +1092,69 @@ mod macos {
         }
     }
 
+    fn static_pixels_are_captured_once_and_match_engine_composition() {
+        let fixture = Fixture::new();
+        let offscreen = fixture
+            .engine
+            .surface(Offscreen::new(SIZE, OffscreenFormat::LinearF16))
+            .expect("offscreen");
+        let build = |surface: &Surface<Gpu>| {
+            surface.clear_color(WorkingColor::BLACK);
+            let layer = surface.layer();
+            let pixels = surface.record(|c| {
+                c.fill(
+                    Rect::new(8., 6., 80., 54.),
+                    WorkingColor::new([0.08, 0.6, 0.2, 1.]),
+                );
+                c.fill(
+                    Rect::new(16., 12., 40., 36.),
+                    WorkingColor::new([0.7, 0.1, 0.3, 1.]),
+                );
+            });
+            surface.update(|tx| {
+                tx[surface.root()].push(&layer);
+                tx[&layer].content(pixels);
+            });
+            layer
+        };
+        let layer = build(&fixture.window);
+        let reference = build(&offscreen);
+        fixture.render();
+        for x in [1., 2.] {
+            for (surface, layer) in [(&fixture.window, &layer), (&offscreen, &reference)] {
+                surface.update(|tx| {
+                    tx[layer].transform(Affine::translate((x, 0.)));
+                });
+            }
+            fixture.render();
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while stack(&fixture).len() != 2 {
+            fixture.woke.store(false, Ordering::Relaxed);
+            fixture.render();
+            if stack(&fixture).len() == 2 {
+                break;
+            }
+            drive(deadline, &|| fixture.woke.load(Ordering::Acquire), &|| {
+                "static plane completion never arrived".into()
+            });
+        }
+        engine_parity(&fixture, &offscreen, "static IOSurface");
+        fixture
+            .window
+            .update_animated(cherenkov::Curve::linear(Duration::from_secs(2)), |tx| {
+                tx[&layer].transform(Affine::translate((12., 0.)));
+            });
+        assert_eq!(
+            fixture.engine.render(FrameTime::now()).expect("handoff"),
+            cherenkov::Next::Idle
+        );
+        assert_eq!(fixture.engine.stats().passes, 0);
+        drop(layer);
+        fixture.render();
+        assert_eq!(stack(&fixture).len(), 1);
+    }
+
     /// A native translation owns scheduling and cancels on a snap.
     fn promoted_translation_is_owned_by_core_animation() {
         let fixture = Fixture::new();
@@ -1142,7 +1209,7 @@ mod macos {
         assert_eq!(node.affineTransform().tx, 8.);
         drop(video);
         fixture.render();
-        assert!(displays(&fixture.root()).is_empty());
+        assert_eq!(displays(&fixture.root()).len(), 0);
     }
 
     /// The system compositor's result for the promoted stack matches the

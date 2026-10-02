@@ -54,7 +54,12 @@ struct Promotion<'a> {
 /// One entry of a surface's plane stack, bottom to top.
 enum Entry<'a> {
     /// Engine-composited content: premultiplied linear Display P3.
-    Engine(&'a wgpu::TextureView),
+    Engine {
+        view: &'a wgpu::TextureView,
+        size: (u32, u32),
+        raster: Option<(LayerId, u64)>,
+        properties: Properties,
+    },
     /// A frame shown on its own plane.
     Frame(Promotion<'a>),
 }
@@ -159,13 +164,51 @@ fn stack<'a>(composition: &Composition<'a>) -> Result<Vec<Entry<'a>>, RenderErro
     for slot in plan::stack_order(composition.parts.len(), composition.planes.len()) {
         let plane = match slot {
             Slot::Part(n) => {
-                entries.push(Entry::Engine(composition.parts[n].view));
+                entries.push(Entry::Engine {
+                    view: composition.parts[n].view,
+                    size: composition.size,
+                    raster: None,
+                    properties: Properties {
+                        z: 0,
+                        placement: full(composition.size),
+                        alpha: 1.0,
+                        opaque: false,
+                        dataspace: Dataspace::SRGB,
+                        hdr: HdrMetadata::default(),
+                    },
+                });
                 continue;
             }
             Slot::Plane(n) => &composition.planes[n],
         };
         let layer = plane.placement.layer;
-        let PlaneContent::Frame { frame, generation } = &plane.content;
+        let (frame, generation) = match &plane.content {
+            PlaneContent::Frame { frame, generation } => (frame, generation),
+            PlaneContent::Raster { view, generation } => {
+                entries.push(Entry::Engine {
+                    view,
+                    size: plane.placement.size,
+                    raster: Some((layer, *generation)),
+                    properties: Properties {
+                        z: 0,
+                        placement: plan::promoted(plane.placement, composition.size)
+                            .map_err(|e| cannot_show(layer, &e))?,
+                        alpha: plane.placement.opacity,
+                        opaque: false,
+                        dataspace: plan::dataspace(
+                            &crate::interop::FrameColor::LINEAR_P3,
+                            Encoding::Rgb {
+                                float: true,
+                                alpha: crate::interop::RgbAlpha::Premultiplied,
+                            },
+                        )
+                        .map_err(|e| cannot_show(layer, &e))?,
+                        hdr: HdrMetadata::default(),
+                    },
+                });
+                continue;
+            }
+        };
         let FramePlanes::Native(native) = &frame.planes else {
             return Err(cannot_show(layer, &Ineligible::NotABuffer));
         };
@@ -251,6 +294,10 @@ struct Part {
     current: Option<u64>,
     uniform: wgpu::Buffer,
     shown: Option<Properties>,
+    size: (u32, u32),
+    raster: Option<(LayerId, u64)>,
+    headroom: f32,
+    format: wgpu::TextureFormat,
 }
 
 /// One promoted frame's surface control.
@@ -294,6 +341,7 @@ pub struct Planes {
     /// `refresh`'s validated updates, staged while its transaction is
     /// built and drained once it is — the buffer is reused across calls.
     updates: Vec<Update>,
+    raster_updates: Vec<(usize, Properties)>,
     /// Buffers of removed parts and previous sizes, dropped once released.
     retiring: Vec<Buffer>,
     next_buffer: u64,
@@ -351,6 +399,7 @@ impl Planes {
             parts: Vec::new(),
             promoted: FxHashMap::default(),
             updates: Vec::new(),
+            raster_updates: Vec::new(),
             retiring: Vec::new(),
             next_buffer: 0,
             signal,
@@ -365,6 +414,7 @@ impl Planes {
     fn resize_parts(&mut self, size: (u32, u32)) {
         self.size = size;
         for part in &mut self.parts {
+            part.raster = None;
             for buffer in part.buffers.drain(..) {
                 if matches!(buffer.state, State::Shown) {
                     self.retiring.push(buffer);
@@ -406,7 +456,12 @@ impl Planes {
         }
         let id = self.next_buffer;
         self.next_buffer += 1;
-        let buffer = buffer::allocate(&self.shared, self.size, id)?;
+        let this = &self.parts[part];
+        let buffer = if this.format == buffer::FORMAT {
+            buffer::allocate(&self.shared, this.size, id)?
+        } else {
+            buffer::allocate_format(&self.shared, this.size, id, this.format)?
+        };
         let buffers = &mut self.parts[part].buffers;
         buffers.push(buffer);
         Ok(Some(buffers.len() - 1))
@@ -439,7 +494,7 @@ impl Planes {
         self.collect_releases();
         let engine_parts = stack
             .iter()
-            .filter(|entry| matches!(entry, Entry::Engine(_)))
+            .filter(|entry| matches!(entry, Entry::Engine { .. }))
             .count();
         while self.parts.len() < engine_parts {
             let surface = self
@@ -452,13 +507,48 @@ impl Planes {
                 current: None,
                 uniform: Presenter::uniform(device),
                 shown: None,
+                size: self.size,
+                raster: None,
+                headroom: display.headroom,
+                format: buffer::FORMAT,
             });
         }
         let mut chosen = Vec::with_capacity(engine_parts);
-        for part in 0..engine_parts {
-            match self.free_buffer(part).map_err(native)? {
-                Some(at) => chosen.push(at),
-                None => return Ok(false),
+        for (part, entry) in stack
+            .iter()
+            .filter(|entry| matches!(entry, Entry::Engine { .. }))
+            .enumerate()
+        {
+            let Entry::Engine { size, raster, .. } = entry else {
+                unreachable!("filtered engine entries");
+            };
+            let format = if raster.is_some() {
+                wgpu::TextureFormat::Rgba16Float
+            } else {
+                buffer::FORMAT
+            };
+            let this = &mut self.parts[part];
+            if this.size != *size || this.format != format {
+                for buffer in this.buffers.drain(..) {
+                    if matches!(buffer.state, State::Shown) {
+                        self.retiring.push(buffer);
+                    }
+                }
+                this.size = *size;
+                this.format = format;
+                this.raster = None;
+            }
+            if raster.is_some()
+                && this.raster == *raster
+                && this.current.is_some()
+                && this.headroom.to_bits() == display.headroom.to_bits()
+            {
+                chosen.push(None);
+            } else {
+                match self.free_buffer(part).map_err(native)? {
+                    Some(at) => chosen.push(Some(at)),
+                    None => return Ok(false),
+                }
             }
         }
         // Parts the plan no longer splits off leave in this frame's
@@ -485,10 +575,13 @@ impl Planes {
         let images: Vec<vk::Image> = chosen
             .iter()
             .enumerate()
-            .map(|(part, &at)| self.parts[part].buffers[at].image)
+            .filter_map(|(part, &at)| at.map(|at| self.parts[part].buffers[at].image))
             .collect();
         let mut waits = Vec::new();
         for (part, &at) in chosen.iter().enumerate() {
+            let Some(at) = at else {
+                continue;
+            };
             if let State::Free(fence) = &mut self.parts[part].buffers[at].state
                 && let Some(fence) = fence.take()
             {
@@ -512,14 +605,21 @@ impl Planes {
             label: Some("plane present"),
         });
         let mut sources = stack.iter().filter_map(|entry| match entry {
-            Entry::Engine(view) => Some(*view),
+            Entry::Engine { view, raster, .. } => Some((*view, raster)),
             Entry::Frame(_) => None,
         });
         for (part, &at) in chosen.iter().enumerate() {
-            let source = sources.next().expect("one source per part");
+            let (source, raster) = sources.next().expect("one source per part");
+            let Some(at) = at else {
+                continue;
+            };
             let output = TextureOutput {
                 texture: &self.parts[part].buffers[at].texture,
-                color: OutputColor::Srgb,
+                color: if raster.is_some() {
+                    OutputColor::LinearDisplayP3
+                } else {
+                    OutputColor::Srgb
+                },
                 alpha: if part == 0 && !self.transparent {
                     OutputAlpha::Opaque
                 } else {
@@ -593,32 +693,32 @@ impl Planes {
         for (index, entry) in stack.iter().enumerate() {
             let z = plan::z_order(index);
             match entry {
-                Entry::Engine(_) => {
-                    let at = chosen[part];
+                Entry::Engine {
+                    raster, properties, ..
+                } => {
                     let this = &mut self.parts[part];
-                    let buffer = &mut this.buffers[at];
-                    buffer.state = State::Shown;
-                    unsafe {
-                        transaction.set_buffer(
-                            &this.surface,
-                            buffer.ahb.0,
-                            Some(dup_fence(&acquire_fence)?),
-                        );
-                    }
-                    if let Some(previous) = this.current.replace(buffer.id) {
-                        pending.push(Pending {
-                            surface: this.surface.as_ptr(),
-                            what: Replaced::Buffer(previous),
-                            removed: None,
-                        });
+                    if let Some(at) = chosen[part] {
+                        let buffer = &mut this.buffers[at];
+                        buffer.state = State::Shown;
+                        unsafe {
+                            transaction.set_buffer(
+                                &this.surface,
+                                buffer.ahb.0,
+                                Some(dup_fence(&acquire_fence)?),
+                            );
+                        }
+                        if let Some(previous) = this.current.replace(buffer.id) {
+                            pending.push(Pending {
+                                surface: this.surface.as_ptr(),
+                                what: Replaced::Buffer(previous),
+                                removed: None,
+                            });
+                        }
                     }
                     let properties = Properties {
                         z,
-                        placement: full(self.size),
-                        alpha: 1.0,
-                        opaque: part == 0 && !self.transparent,
-                        dataspace: Dataspace::SRGB,
-                        hdr: HdrMetadata::default(),
+                        opaque: raster.is_none() && part == 0 && !self.transparent,
+                        ..*properties
                     };
                     self.ops.clear();
                     plan::diff(this.shown.as_ref(), &properties, &mut self.ops);
@@ -626,6 +726,8 @@ impl Planes {
                         transaction.set(&this.surface, op);
                     }
                     this.shown = Some(properties);
+                    this.raster = *raster;
+                    this.headroom = display.headroom;
                     part += 1;
                 }
                 Entry::Frame(promotion) => {
@@ -757,10 +859,32 @@ impl Planes {
         // leaves `promoted` describing the last applied transaction and
         // drops no staged release.
         self.updates.clear();
+        self.raster_updates.clear();
         let mut transaction = Transaction::new();
         for update in frames {
             let layer = update.placement.layer;
-            let PlaneContent::Frame { frame, generation } = &update.content;
+            let (frame, generation) = match &update.content {
+                PlaneContent::Frame { frame, generation } => (frame, generation),
+                PlaneContent::Raster { generation, .. } => {
+                    let (index, part) = self
+                        .parts
+                        .iter()
+                        .enumerate()
+                        .find(|(_, part)| part.raster == Some((layer, *generation)))
+                        .expect("refresh names a committed raster generation");
+                    let mut properties = part.shown.expect("committed raster properties");
+                    properties.placement = plan::promoted(update.placement, self.size)
+                        .map_err(|e| cannot_show(layer, &e))?;
+                    properties.alpha = update.placement.opacity;
+                    self.ops.clear();
+                    plan::diff(part.shown.as_ref(), &properties, &mut self.ops);
+                    for &op in &self.ops {
+                        transaction.set(&part.surface, op);
+                    }
+                    self.raster_updates.push((index, properties));
+                    continue;
+                }
+            };
             let FramePlanes::Native(native) = &frame.planes else {
                 return Err(cannot_show(layer, &Ineligible::NotABuffer));
             };
@@ -822,6 +946,9 @@ impl Planes {
             }
             plane.shown = Some(update.properties);
         }
+        for (index, properties) in self.raster_updates.drain(..) {
+            self.parts[index].shown = Some(properties);
+        }
         Self::apply(transaction, &self.release, pending);
         Ok(())
     }
@@ -873,6 +1000,15 @@ impl Compositor for Planes {
 }
 
 impl SystemPlanes for Planes {
+    fn captured_bytes(&self) -> u64 {
+        self.parts
+            .iter()
+            .flat_map(|part| &part.buffers)
+            .chain(&self.retiring)
+            .map(|buffer| buffer.bytes)
+            .sum()
+    }
+
     fn compose(&mut self, composition: Composition<'_>) -> Result<bool, RenderError> {
         self.present(composition)
     }

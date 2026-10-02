@@ -252,6 +252,8 @@ struct SurfaceState {
     /// Surface-level dependencies absent from the layer tree's stamps.
     plane_clear: cherenkov::WorkingColor,
     plane_size: (u32, u32),
+    /// Source observations and immutable captures for recorded planes.
+    static_layers: FxHashMap<LayerId, planes::static_layer::Observation>,
     /// Engine parts above the first (`target` is part 0): one per promoted
     /// plane with layers painted above it, at the surface size.
     parts: Vec<(wgpu::Texture, wgpu::TextureView)>,
@@ -475,6 +477,12 @@ impl SurfaceState {
             + shader_bytes
             + self.projective_bytes()
             + self
+                .static_layers
+                .values()
+                .filter_map(|entry| entry.capture.as_ref())
+                .map(planes::static_layer::Capture::bytes)
+                .sum::<u64>()
+            + self
                 .content
                 .values()
                 .filter_map(|slot| slot.image.as_ref())
@@ -608,7 +616,7 @@ pub struct GpuRenderer {
     /// check allocates nothing steady-state.
     plan_scratch: planes::PlanScratch,
     /// The candidate map each promotion check or plan fills and reuses.
-    candidates: FxHashMap<LayerId, (u32, u32)>,
+    candidates: FxHashMap<LayerId, planes::Candidate>,
     candidate_frames: FxHashMap<LayerId, (ExternalFrame, u64)>,
     /// The per-surface ready-candidate sets `ready_planes` fills for the
     /// frame's lowered batch — kept between renders so a plane prepare
@@ -2378,14 +2386,23 @@ fn plane_stack<'a>(
         .iter()
         .filter(move |placement| updates.is_none_or(|updates| updates.contains(&placement.layer)))
         .map(|placement| {
-            let slot = &surface.external[&placement.layer];
-            planes::Plane {
-                placement,
-                content: planes::PlaneContent::Frame {
+            let content = surface.external.get(&placement.layer).map_or_else(
+                || {
+                    let capture = surface.static_layers[&placement.layer]
+                        .capture
+                        .as_ref()
+                        .expect("promoted pixels are captured");
+                    planes::PlaneContent::Raster {
+                        view: &capture.view,
+                        generation: capture.generation,
+                    }
+                },
+                |slot| planes::PlaneContent::Frame {
                     frame: &slot.frame,
                     generation: slot.generation,
                 },
-            }
+            );
+            planes::Plane { placement, content }
         })
 }
 
@@ -2394,15 +2411,25 @@ fn plane_stack<'a>(
 /// into `candidates`, which keeps its allocation between fills (#90).
 fn plane_candidates<'a>(
     surf: &SurfaceState,
-    candidates: &'a mut FxHashMap<LayerId, (u32, u32)>,
-) -> &'a FxHashMap<LayerId, (u32, u32)> {
+    candidates: &'a mut FxHashMap<LayerId, planes::Candidate>,
+) -> &'a FxHashMap<LayerId, planes::Candidate> {
     candidates.clear();
     candidates.extend(
         surf.external
             .iter()
             .filter(|(_, slot)| slot.on_plane)
-            .map(|(layer, slot)| (*layer, slot.size)),
+            .map(|(layer, slot)| (*layer, slot.size.into())),
     );
+    candidates.extend(surf.static_layers.iter().filter_map(|(&layer, entry)| {
+        let domain = entry.domain?;
+        (entry.quiet_frames >= 2).then_some((
+            layer,
+            planes::Candidate {
+                size: domain.size,
+                raster: domain.raster(),
+            },
+        ))
+    }));
     candidates
 }
 
@@ -2500,6 +2527,7 @@ impl Renderer for GpuRenderer {
                 plane_resources: (0, 0, 0),
                 plane_clear: cherenkov::WorkingColor::TRANSPARENT,
                 plane_size: (0, 0),
+                static_layers: FxHashMap::default(),
                 parts: Vec::new(),
                 frames_installed: 0,
                 textures,
@@ -2769,6 +2797,7 @@ impl Renderer for GpuRenderer {
         let _diag_guard = diag::Guard::scope(self.diag.as_ref());
         if let Some(state) = self.surfaces.get_mut(&surface) {
             state.layers.remove(&layer);
+            state.static_layers.remove(&layer);
             state.external.remove(&layer);
             state.projective.remove(&layer);
             state.composed.retain(|key| key.layer != layer);
@@ -3030,6 +3059,7 @@ impl Renderer for GpuRenderer {
             for content in surf.layers.values_mut() {
                 content.trim();
             }
+            surf.static_layers.clear();
             surf.frame.instances.shrink_to_fit();
             surf.frame.stops.shrink_to_fit();
             surf.frame.passes.shrink_to_fit();
@@ -3106,6 +3136,11 @@ impl Renderer for GpuRenderer {
 
     fn memory(&self) -> MemoryUsage {
         let gpu = self.instances.size()
+            + self
+                .planes
+                .values()
+                .map(planes::SystemPlanes::captured_bytes)
+                .sum::<u64>()
             + self.uploads.gpu_bytes()
             + self.stops.size()
             + self.globals.size()
@@ -3468,6 +3503,11 @@ impl GpuRenderer {
         self.frame_count += 1;
         self.drain_timestamps();
         self.plane_only.clear();
+        for sf in frame.surfaces {
+            if sf.changed {
+                self.observe_static(sf)?;
+            }
+        }
         let mut dirty: Vec<_> = frame
             .surfaces
             .iter()
@@ -3612,6 +3652,11 @@ impl GpuRenderer {
         #[cfg(all(unix, not(target_vendor = "apple")))]
         self.flush_native_releases();
         self.plane_only.clear();
+        for sf in frame.surfaces {
+            if sf.changed {
+                self.observe_static(sf)?;
+            }
+        }
         let mut dirty: Vec<_> = frame
             .surfaces
             .iter()
@@ -4519,6 +4564,13 @@ impl GpuRenderer {
         for key in &surf.composed {
             projective_entry_mut(&mut surf.projective, *key).last_used = frame;
         }
+        for capture in surf
+            .static_layers
+            .values_mut()
+            .filter_map(|entry| entry.capture.as_mut())
+        {
+            capture.dirty = false;
+        }
     }
 
     /// Evicts least-recently-used local images until the retained set fits
@@ -4876,6 +4928,72 @@ impl GpuRenderer {
     /// would produce is the committed one (`planes::frames_only`).
     /// `false` sends the frame down the full render path like any other
     /// change (#90).
+    fn observe_static(&mut self, sf: &SurfaceFrame<'_>) -> Result<(), RenderError> {
+        let surf = self.surfaces.get_mut(&sf.id).expect("registered surface");
+        if !surf.promotes {
+            return Ok(());
+        }
+        let resources = (self.images_gen, self.image_replacements);
+        surf.static_layers
+            .retain(|layer, _| surf.layers.contains_key(layer));
+        let mut pending = vec![(sf.tree.root(), kurbo::Affine::IDENTITY)];
+        while let Some((layer, parent)) = pending.pop() {
+            let node = sf.tree.layer(layer);
+            if sf.tree.projective_pose(layer).is_some() {
+                continue;
+            }
+            let space = parent * node.content_transform();
+            pending.extend(node.children.iter().map(|&child| (child, space)));
+            if !node.children.is_empty() {
+                surf.static_layers.remove(&layer);
+                continue;
+            }
+            let Some(content) = surf.layers.get(&layer) else {
+                continue;
+            };
+            let Some((ops, source)) = content.retained.current() else {
+                surf.static_layers.remove(&layer);
+                continue;
+            };
+            let stamp = sf.tree.content_stamp(layer);
+            // The transformed unit circle's major radius is the largest
+            // singular value. Density buckets keep the texel grid stable.
+            let radii = kurbo::Ellipse::from_affine(space).radii();
+            let density = radii.x.max(radii.y).max(1.0).log2().ceil().exp2();
+            let entry =
+                surf.static_layers
+                    .entry(layer)
+                    .or_insert(planes::static_layer::Observation {
+                        stamp,
+                        resources,
+                        domain: None,
+                        density: 0.0,
+                        quiet_frames: 0,
+                        capture: None,
+                    });
+            if entry.stamp == stamp
+                && entry.resources == resources
+                && entry.density.to_bits() == density.to_bits()
+            {
+                entry.quiet_frames = entry.quiet_frames.saturating_add(1);
+            } else {
+                entry.stamp = stamp;
+                entry.resources = resources;
+                entry.quiet_frames = 1;
+                entry.capture = None;
+                entry.density = density;
+                entry.domain = planes::static_layer::domain(
+                    ops,
+                    source,
+                    &self.fonts,
+                    density,
+                    self.max_texture,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     fn plane_only_frames(&mut self, sf: &SurfaceFrame<'_>) -> bool {
         if sf.present_pending || sf.display_moved {
             return false;
@@ -4927,7 +5045,7 @@ impl GpuRenderer {
                 .planes
                 .iter()
                 .zip(&surface.plan.planes)
-                .all(|(a, b)| (a.layer, a.size) == (b.layer, b.size))
+                .all(|(a, b)| (a.layer, a.size, a.raster) == (b.layer, b.size, b.raster))
         {
             return false;
         }
@@ -5040,6 +5158,20 @@ impl GpuRenderer {
             };
             let mut lowering = Lowering::new(&mut surf.frame, surf.size);
             let result = lowering.prepare(&mut layers, &glyphs).and_then(|()| {
+                for placement in &surf.plan.planes {
+                    if let Some(entry) = surf.static_layers.get(&placement.layer)
+                        && entry.capture.as_ref().is_none_or(|capture| capture.dirty)
+                    {
+                        lowering.run_plane(
+                            frame.tree,
+                            &mut layers,
+                            &glyphs,
+                            groups,
+                            placement.layer,
+                            entry.domain.expect("a static candidate has a domain"),
+                        )?;
+                    }
+                }
                 let placed = Self::lower_projective(
                     &mut lowering,
                     frame,
@@ -5613,6 +5745,29 @@ impl GpuRenderer {
         let Some(surf) = self.surfaces.get_mut(&id) else {
             return Ok(());
         };
+        for (&layer, entry) in &mut surf.static_layers {
+            if !surf.plan.planes.iter().any(|plane| plane.layer == layer) {
+                entry.capture = None;
+                continue;
+            }
+            if entry.capture.is_none() {
+                let domain = entry.domain.expect("a static candidate has a domain");
+                let (texture, view) = create_target(
+                    &self.device,
+                    "static plane capture",
+                    domain.size,
+                    TARGET_USAGES,
+                    TARGET_FORMAT,
+                );
+                entry.capture = Some(planes::static_layer::Capture {
+                    domain,
+                    texture,
+                    view,
+                    generation: self.frame_count,
+                    dirty: true,
+                });
+            }
+        }
         // One engine texture per part above the first, as the plan split
         // the surface.
         let parts = surf.plan.parts() - 1;
@@ -5647,7 +5802,10 @@ impl GpuRenderer {
             .iter()
             .filter_map(|p| match p.target {
                 Target::Scratch(i) => Some(i + 1),
-                Target::Part(_) | Target::Backdrop { .. } | Target::Projected(_) => None,
+                Target::Part(_)
+                | Target::Backdrop { .. }
+                | Target::Projected(_)
+                | Target::Plane(_) => None,
             })
             .max()
             .unwrap_or(0);
@@ -5730,7 +5888,7 @@ impl GpuRenderer {
             };
             let (w, h) = (pass.region[2], pass.region[3]);
             let format = match capture.copy_from {
-                Target::Part(_) | Target::Projected(_) => TARGET_FORMAT,
+                Target::Part(_) | Target::Projected(_) | Target::Plane(_) => TARGET_FORMAT,
                 Target::Scratch(_) => self.scratch_format,
                 Target::Backdrop { .. } => {
                     return Err(RenderError::Render(format!(
@@ -5852,7 +6010,7 @@ impl GpuRenderer {
         for pass in &surf.frame.passes {
             if let Some(r) = pass.backdrop_copy {
                 let slot = match pass.target {
-                    Target::Part(_) | Target::Projected(_) => 0,
+                    Target::Part(_) | Target::Projected(_) | Target::Plane(_) => 0,
                     Target::Scratch(_) => 1,
                     Target::Backdrop { .. } => {
                         return Err(RenderError::Render(
@@ -6306,6 +6464,13 @@ impl GpuRenderer {
                 });
             }
             let (view, texture) = match pass.target {
+                Target::Plane(layer) => {
+                    let capture = surf.static_layers[&layer]
+                        .capture
+                        .as_ref()
+                        .expect("capture allocated before encode");
+                    (&capture.view, &capture.texture)
+                }
                 Target::Part(n) => surf.part(n),
                 Target::Scratch(i) => (&surf.scratch[i].view, &surf.scratch[i].texture),
                 Target::Backdrop { group, region } => {
@@ -6321,6 +6486,15 @@ impl GpuRenderer {
             // its `copy_from` target into the group's capture texture.
             if let Some(capture) = pass.capture {
                 let (src, sx, sy) = match capture.copy_from {
+                    Target::Plane(layer) => (
+                        &surf.static_layers[&layer]
+                            .capture
+                            .as_ref()
+                            .expect("allocated capture")
+                            .texture,
+                        0,
+                        0,
+                    ),
                     Target::Part(n) => (surf.part(n).1, 0, 0),
                     Target::Projected(key) => {
                         (&projective_entry(&surf.projective, key).texture, 0, 0)
@@ -6361,7 +6535,7 @@ impl GpuRenderer {
             // the copy must complete before the pass starts.
             if let Some([bx, by, bw, bh]) = pass.backdrop_copy {
                 let slot = match pass.target {
-                    Target::Part(_) | Target::Projected(_) => 0,
+                    Target::Part(_) | Target::Projected(_) | Target::Plane(_) => 0,
                     Target::Scratch(_) => 1,
                     Target::Backdrop { .. } => {
                         return Err(RenderError::Render(
@@ -6437,6 +6611,7 @@ impl GpuRenderer {
             if self.timestamps {
                 self.pass_meta.push(PassMeta {
                     name: match pass.target {
+                        Target::Plane(layer) => format!("plane{}", layer.raw()),
                         Target::Part(0) => "surface".to_string(),
                         Target::Part(n) => format!("part{n}"),
                         Target::Scratch(i) => format!("scratch{i}"),
@@ -6611,7 +6786,7 @@ impl GpuRenderer {
             // pipeline; an engine range after one must rebind its pipeline.
             let mut pipeline = Bound::Engine(PipelineKind::SrcOver, ShaderVariant::Simple);
             let backdrop_slot = scratch_backdrop.then_some(match pass.target {
-                Target::Part(_) | Target::Projected(_) => 0,
+                Target::Part(_) | Target::Projected(_) | Target::Plane(_) => 0,
                 Target::Scratch(_) | Target::Backdrop { .. } => 1,
             });
             let mut ri = 0usize;
@@ -6975,7 +7150,7 @@ impl GpuRenderer {
                     Target::Backdrop { group, region } => {
                         &surf.backdrop_groups[&group].captures[region as usize]
                     }
-                    Target::Part(_) | Target::Projected(_) => {
+                    Target::Part(_) | Target::Projected(_) | Target::Plane(_) => {
                         return Err(RenderError::Render(format!(
                             "filter {filter:?} registered on a surface pass"
                         )));
@@ -7851,7 +8026,7 @@ impl GpuRenderer {
                         [region as usize]
                         .texture
                         .format(),
-                    Target::Part(_) | Target::Projected(_) => TARGET_FORMAT,
+                    Target::Part(_) | Target::Projected(_) | Target::Plane(_) => TARGET_FORMAT,
                 };
                 (*id, format)
             })

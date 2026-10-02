@@ -283,6 +283,7 @@ pub struct PlanScratch {
     backdrop_above: Vec<Option<LayerId>>,
     blend_above: Vec<Option<LayerId>>,
     device: Vec<VisitDevice>,
+    decisions: Vec<(usize, Result<(), Ineligible>)>,
 }
 
 /// Every layer in paint order: a layer's content, then its children —
@@ -399,33 +400,31 @@ fn verdicts<'a, C: Compositor>(
     order: &'a [Visit],
     candidates: &'a FxHashMap<LayerId, Candidate>,
     ready: &'a FxHashSet<LayerId>,
-    backdrop_above: &'a [Option<LayerId>],
-    blend_above: &'a [Option<LayerId>],
+    above: (&'a [Option<LayerId>], &'a [Option<LayerId>]),
     device: &'a [VisitDevice],
+    decisions: &'a mut Vec<(usize, Result<(), Ineligible>)>,
 ) -> impl Iterator<Item = (usize, Result<(), Ineligible>)> + 'a {
-    let mut verdicts: Vec<_> = order
-        .iter()
-        .enumerate()
-        .filter_map(move |(i, visit)| {
-            let &size = candidates.get(&visit.id)?;
-            if !ready.contains(&visit.id) {
-                return None;
-            }
-            let verdict = judge::<C>(
-                tree,
-                order,
-                i,
-                size,
-                backdrop_above[i + 1],
-                blend_above[i + 1],
-                device,
-            );
-            Some((i, verdict))
-        })
-        .collect();
+    let (backdrop_above, blend_above) = above;
+    decisions.clear();
+    decisions.extend(order.iter().enumerate().filter_map(move |(i, visit)| {
+        let &size = candidates.get(&visit.id)?;
+        if !ready.contains(&visit.id) {
+            return None;
+        }
+        let verdict = judge::<C>(
+            tree,
+            order,
+            i,
+            size,
+            backdrop_above[i + 1],
+            blend_above[i + 1],
+            device,
+        );
+        Some((i, verdict))
+    }));
     let mut promoted = 0;
     for source in [Source::Frame, Source::Recorded] {
-        for (i, verdict) in &mut verdicts {
+        for (i, verdict) in decisions.iter_mut() {
             if candidates[&order[*i].id].source == source && verdict.is_ok() {
                 if promoted < C::BUDGET {
                     promoted += 1;
@@ -435,7 +434,7 @@ fn verdicts<'a, C: Compositor>(
             }
         }
     }
-    verdicts.into_iter()
+    decisions.drain(..)
 }
 
 /// Decides which of `candidates` (layer to content size) the platform
@@ -461,6 +460,7 @@ pub fn plan<C: Compositor>(
         backdrop_above,
         blend_above,
         device,
+        decisions,
     } = &mut scratch;
     let order = paint_order(tree, order, pool, stack);
     suffixes(tree, order, backdrop_above, blend_above);
@@ -472,9 +472,9 @@ pub fn plan<C: Compositor>(
         order,
         candidates,
         ready,
-        backdrop_above,
-        blend_above,
+        (backdrop_above, blend_above),
         device,
+        decisions,
     ) {
         match verdict {
             Ok(()) => {
@@ -537,6 +537,7 @@ fn same_plan<C: Compositor>(
         backdrop_above,
         blend_above,
         device,
+        decisions,
     } = scratch;
     let order = paint_order(tree, order, pool, stack);
     suffixes(tree, order, backdrop_above, blend_above);
@@ -549,9 +550,9 @@ fn same_plan<C: Compositor>(
         order,
         candidates,
         ready,
-        backdrop_above,
-        blend_above,
+        (backdrop_above, blend_above),
         device,
+        decisions,
     ) {
         match verdict {
             Ok(()) => {

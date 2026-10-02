@@ -192,6 +192,36 @@ fn a_surface_level_blend_above_keeps_the_layer_in_the_engine() {
     assert_eq!(verdict(&tree), Err(Ineligible::TranslucentAbove(ABOVE)));
 }
 
+/// The `scene_bar` geometry (#90): the holder's clip ends the video at
+/// y = 56 while its content runs past it, and a translucent bar sits at
+/// y 58–64 — over the clipped-away part of the footprint only. The clip,
+/// not the content rect, decides the overlap.
+#[test]
+fn a_translucent_layer_beyond_the_clip_does_not_block_promotion() {
+    let mut tree = scene();
+    tree.apply(LayerOp::Transform(
+        PARENT,
+        prop(Affine::translate((12.0, 8.0))),
+    ));
+    tree.apply(LayerOp::Clip(
+        PARENT,
+        Some(ShapeData::RoundedRect(RoundedRect::new(
+            0.0, 0.0, 72.0, 48.0, 6.0,
+        ))),
+    ));
+    // Scaled 2×, the 48×32 video's content covers (12, 8)–(108, 72); the
+    // holder's clip leaves only (12, 8)–(84, 56) on the plane.
+    tree.apply(LayerOp::Transform(VIDEO, prop(Affine::scale(2.0))));
+    tree.apply(LayerOp::Opacity(ABOVE, prop(0.5)));
+    tree.apply(LayerOp::Clip(
+        ABOVE,
+        Some(ShapeData::Rect(Rect::new(8.0, 58.0, 88.0, 64.0))),
+    ));
+    let candidates: FxHashMap<_, _> = std::iter::once((VIDEO, (48, 32))).collect();
+    let plan = plan::<Test>(&tree, &candidates, &all_ready(&candidates));
+    assert_eq!(plan.planes.len(), 1, "{:?}", plan.rejected);
+}
+
 #[test]
 fn a_group_opacity_is_not_promoted_but_a_leaf_opacity_is() {
     let mut tree = scene();

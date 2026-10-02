@@ -593,12 +593,17 @@ fn judge<C: Compositor>(
         }
         space = own * Affine::translate(-level.scroll_offset);
     }
+    // The plane shows the frame inside the path's clips only: content a
+    // clip cuts away cannot overlap a layer above.
     let rect = device[i].space.transform_rect_bbox(Rect::new(
         0.0,
         0.0,
         f64::from(size.0),
         f64::from(size.1),
     ));
+    let rect = device[i]
+        .bounds
+        .map_or(rect, |bounds| bounds.intersect(rect));
     for j in i + 1..order.len() {
         // Children of an isolated layer still contribute alpha to its
         // output. Inspect them too, rather than treating isolation as

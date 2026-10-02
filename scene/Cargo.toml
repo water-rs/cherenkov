@@ -17,6 +17,7 @@ default = []
 generator = [
     "text",
     "parley/system",
+    "parley/complex-scripts",
     "dep:fontique",
     "dep:skera",
     "dep:skrifa",

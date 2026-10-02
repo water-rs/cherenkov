@@ -3,6 +3,8 @@
 mod bindings;
 mod bitmap;
 mod colr;
+#[cfg(target_vendor = "apple")]
+mod composite;
 pub mod diag;
 pub mod external;
 pub mod filter;
@@ -264,7 +266,7 @@ struct SurfaceState {
     view: wgpu::TextureView,
     /// Scratch textures, one per isolation depth, sized to the largest
     /// region seen so far.
-    scratch: Vec<ScratchTarget>,
+    scratch: FxHashMap<usize, ScratchTarget>,
     /// Transient depth for opaque regions; cleared and discarded in one pass.
     coverage_depth: Option<ScratchTarget>,
     /// Backdrop copies for blend composites: index 0 matches the surface
@@ -278,6 +280,13 @@ struct SurfaceState {
     external: FxHashMap<LayerId, external::Slot>,
     shader_textures: FxHashMap<std::sync::Arc<paint::Key>, paint::Texture>,
     frame: LoweredFrame,
+    /// Image lifetimes and attachment assignment, before physical allocation.
+    #[cfg(target_vendor = "apple")]
+    composition: composite::plan::ExecutionPlan,
+    #[cfg(target_vendor = "apple")]
+    composition_cache: composite::cache::Cache,
+    #[cfg(target_vendor = "apple")]
+    tile_targets: composite::metal::Attachments,
     /// This frame's offsets into the shared buffers: instances and globals
     /// (256-byte slots) are laid out surface by surface so one upload covers
     /// every dirty surface.
@@ -444,7 +453,7 @@ impl SurfaceState {
         };
         let scratch_bytes: u64 = self
             .scratch
-            .iter()
+            .values()
             .map(|s| u64::from(s.width) * u64::from(s.height) * scratch_texel)
             .sum();
         let backdrop_bytes: u64 = self
@@ -643,6 +652,8 @@ pub struct GpuRenderer {
     coverage_pipelines: [Option<wgpu::RenderPipeline>; 2],
     /// The pipeline layout every core and backdrop pipeline shares.
     pipeline_layout: wgpu::PipelineLayout,
+    #[cfg(target_vendor = "apple")]
+    tile_executor: composite::metal::Executor,
     /// The configured pipeline cache, opened once for the whole set.
     pipeline_cache: Option<wgpu::PipelineCache>,
     /// Registered backdrop effect shaders, by raw id — one `SrcOver`
@@ -1253,6 +1264,36 @@ fn create_layouts(device: &wgpu::Device) -> (wgpu::BindGroupLayout, wgpu::BindGr
     (layout0, layout1)
 }
 
+/// Resolves the image the canonical draw recorded.
+fn image_view<'a>(
+    source: &lower::ImageSource,
+    images: &'a FxHashMap<u64, GpuImage>,
+    bitmaps: &'a FxHashMap<BitmapKey, GpuBitmap>,
+    shaders: &'a FxHashMap<std::sync::Arc<paint::Key>, paint::Texture>,
+    content: &'a FxHashMap<LayerId, gpu_content::Slot>,
+) -> &'a wgpu::TextureView {
+    match source {
+        lower::ImageSource::Registered(id) => {
+            &images
+                .get(id)
+                .unwrap_or_else(|| panic!("a lowered range samples unregistered image {id}"))
+                .view
+        }
+        lower::ImageSource::Bitmap(key) => &bitmaps.get(key).expect("prepared bitmap").image.view,
+        lower::ImageSource::Shader(key) => &shaders[key].image.view,
+        lower::ImageSource::Content(layer) => {
+            &content[layer]
+                .image
+                .as_ref()
+                .expect("rendered content")
+                .view
+        }
+        lower::ImageSource::External(_) => {
+            unreachable!("external ranges bind the external pipeline")
+        }
+    }
+}
+
 /// Builds a group-1 bind group; `None` binds the dummy view.
 fn make_bind1(
     device: &wgpu::Device,
@@ -1302,12 +1343,12 @@ fn make_bind0(
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
-                // One 24-byte Globals window; the dynamic offset selects
+                // One Globals window; the dynamic offset selects
                 // the pass's slot inside the buffer.
                 resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                     buffer: globals,
                     offset: 0,
-                    size: wgpu::BufferSize::new(24),
+                    size: wgpu::BufferSize::new(std::mem::size_of::<instance::Globals>() as u64),
                 }),
             },
             wgpu::BindGroupEntry {
@@ -1990,6 +2031,8 @@ pub fn init(config: GpuConfig) -> Result<(GpuRenderer, GpuInfo), EngineError> {
             pipelines,
             coverage_pipelines,
             pipeline_layout,
+            #[cfg(target_vendor = "apple")]
+            tile_executor: composite::metal::Executor::default(),
             pipeline_cache,
             scratch_format,
             layout0,
@@ -2442,23 +2485,7 @@ impl Renderer for GpuRenderer {
         // plane's attach on the main queue.
         #[cfg(not(target_vendor = "apple"))]
         drop(waker);
-        let size = match &target {
-            GpuTarget::Offscreen(offscreen) => offscreen.size,
-            GpuTarget::Window(window) => window.size,
-            GpuTarget::Texture(texture) => texture.size,
-            #[cfg(target_os = "android")]
-            GpuTarget::SurfaceControl(target) => target.size(),
-        };
-        if size.0 == 0 || size.1 == 0 {
-            return Err(SurfaceError::ZeroSize);
-        }
-        if size.0 > self.max_texture || size.1 > self.max_texture {
-            return Err(SurfaceError::TooLarge {
-                width: size.0,
-                height: size.1,
-                max: self.max_texture,
-            });
-        }
+        let size = self.target_size(&target)?;
         let (window, textures, refresh, presents) = match target {
             GpuTarget::Offscreen(offscreen) => (None, None, offscreen.refresh, false),
             GpuTarget::Texture(texture) => (None, Some(texture.textures), texture.refresh, false),
@@ -2507,7 +2534,7 @@ impl Renderer for GpuRenderer {
                 scratch_format: self.scratch_format,
                 target,
                 view,
-                scratch: Vec::new(),
+                scratch: FxHashMap::default(),
                 coverage_depth: None,
                 backdrop: [None, None],
                 backdrop_groups: FxHashMap::default(),
@@ -2516,6 +2543,12 @@ impl Renderer for GpuRenderer {
                 external: FxHashMap::default(),
                 shader_textures: FxHashMap::default(),
                 frame: LoweredFrame::default(),
+                #[cfg(target_vendor = "apple")]
+                composition: composite::plan::ExecutionPlan::default(),
+                #[cfg(target_vendor = "apple")]
+                composition_cache: composite::cache::Cache::default(),
+                #[cfg(target_vendor = "apple")]
+                tile_targets: composite::metal::Attachments::default(),
                 inst_base: 0,
                 globals_base: 0,
                 bind_gen: 0,
@@ -2577,7 +2610,7 @@ impl Renderer for GpuRenderer {
         }
         let scratch_bytes: u64 = state
             .scratch
-            .iter()
+            .values()
             .map(|s| u64::from(s.width) * u64::from(s.height) * texel_bytes(s.texture.format()))
             .sum();
         let backdrop_bytes: u64 = state
@@ -2629,6 +2662,8 @@ impl Renderer for GpuRenderer {
         }
         state.coverage_depth = None;
         state.scratch.clear();
+        #[cfg(target_vendor = "apple")]
+        state.tile_targets.clear();
         state.backdrop = [None, None];
         state.binds1.clear();
         state.bind_gen += 1;
@@ -2654,7 +2689,7 @@ impl Renderer for GpuRenderer {
                 * (1 + state.parts.len() as u64);
             let scratch_bytes: u64 = state
                 .scratch
-                .iter()
+                .values()
                 .map(|s| u64::from(s.width) * u64::from(s.height) * texel_bytes(s.texture.format()))
                 .sum();
             let backdrop_bytes: u64 = state
@@ -2923,7 +2958,7 @@ impl Renderer for GpuRenderer {
         for surf in self.surfaces.values_mut() {
             let scratch_bytes: u64 = surf
                 .scratch
-                .iter()
+                .values()
                 .map(|s| u64::from(s.width) * u64::from(s.height) * texel_bytes(s.texture.format()))
                 .sum();
             let backdrop_bytes: u64 = surf
@@ -2967,6 +3002,12 @@ impl Renderer for GpuRenderer {
                 }
             }
             surf.scratch.clear();
+            #[cfg(target_vendor = "apple")]
+            {
+                surf.composition = composite::plan::ExecutionPlan::default();
+                surf.composition_cache = composite::cache::Cache::default();
+                surf.tile_targets.clear();
+            }
             surf.coverage_depth = None;
             surf.backdrop = [None, None];
             for state in surf.backdrop_groups.values_mut() {
@@ -3138,12 +3179,20 @@ impl Renderer for GpuRenderer {
             .flat_map(|g| &g.captures)
             .map(|c| format_name(c.texture.format()))
             .next();
+        let cpu = self.atlas.cpu_bytes();
+        #[cfg(target_vendor = "apple")]
+        let cpu = cpu
+            + self
+                .surfaces
+                .values()
+                .map(|surface| surface.composition.bytes() + surface.composition_cache.bytes())
+                .sum::<u64>();
         MemoryUsage {
             gpu: cherenkov::Bytes(
                 gpu + self.filters.gpu_bytes()
                     + self.shadow_blur.as_ref().map_or(0, shadow::Blur::gpu_bytes),
             ),
-            cpu: cherenkov::Bytes(self.atlas.cpu_bytes()),
+            cpu: cherenkov::Bytes(cpu),
             backdrop_captures: cherenkov::Bytes(captures),
             backdrop_capture_format: capture_format,
         }
@@ -3420,6 +3469,27 @@ impl Renderer for GpuRenderer {
 }
 
 impl GpuRenderer {
+    const fn target_size(&self, target: &GpuTarget) -> Result<(u32, u32), SurfaceError> {
+        let size = match target {
+            GpuTarget::Offscreen(offscreen) => offscreen.size,
+            GpuTarget::Window(window) => window.size,
+            GpuTarget::Texture(texture) => texture.size,
+            #[cfg(target_os = "android")]
+            GpuTarget::SurfaceControl(target) => target.size(),
+        };
+        if size.0 == 0 || size.1 == 0 {
+            return Err(SurfaceError::ZeroSize);
+        }
+        if size.0 > self.max_texture || size.1 > self.max_texture {
+            return Err(SurfaceError::TooLarge {
+                width: size.0,
+                height: size.1,
+                max: self.max_texture,
+            });
+        }
+        Ok(size)
+    }
+
     /// Realizes surface `id` under a `SurfaceControlTarget`'s parent and
     /// returns its refresh range.
     #[cfg(target_os = "android")]
@@ -5612,6 +5682,22 @@ impl GpuRenderer {
             );
             surf.parts.truncate(parts);
         }
+        #[cfg(target_vendor = "apple")]
+        {
+            let tile_slots = if self.shader_delivery == shaders::ShaderDelivery::Metallib
+                && self.scratch_format == TARGET_FORMAT
+            {
+                2
+            } else {
+                0
+            };
+            surf.composition_cache.update(
+                &mut surf.composition,
+                &surf.frame,
+                self.scratch_format,
+                tile_slots,
+            );
+        }
         let max_scratch = surf
             .frame
             .passes
@@ -5624,21 +5710,60 @@ impl GpuRenderer {
             .unwrap_or(0);
         // The largest region each isolation depth must hold this frame.
         let mut region_max = vec![(0u32, 0u32); max_scratch];
-        for pass in &surf.frame.passes {
+        let passes = surf.frame.passes.iter();
+        #[cfg(target_vendor = "apple")]
+        let passes = passes
+            .enumerate()
+            .filter_map(|(index, pass)| surf.composition.materialized_pass(index).then_some(pass));
+        for pass in passes {
             if let Target::Scratch(i) = pass.target {
                 region_max[i].0 = region_max[i].0.max(pass.region[2]);
                 region_max[i].1 = region_max[i].1.max(pass.region[3]);
             }
         }
         // Grow each scratch to its needed size; never shrink.
+        let mut retired_depths = Vec::new();
+        surf.scratch.retain(|depth, texture| {
+            let keep = region_max.get(*depth).is_some_and(|size| *size != (0, 0));
+            if !keep {
+                diag::retire(
+                    &self.device,
+                    diag::RetireArgs {
+                        label: "isolation scratch",
+                        class: diag::Class::Target,
+                        bytes: u64::from(texture.width)
+                            * u64::from(texture.height)
+                            * texel_bytes(texture.texture.format()),
+                        used_in_latest_submit: true,
+                        reason: "tile lifetime",
+                    },
+                );
+                retired_depths.push(*depth);
+            }
+            keep
+        });
+        if !retired_depths.is_empty() {
+            surf.bind_gen += 1;
+            retire_binds1(
+                surf,
+                &self.device,
+                self.images_gen,
+                self.atlas.mask_texture_generation(),
+                "tile lifetime",
+                |key| matches!(key.0, Some(Source::Scratch(i)) if retired_depths.contains(&i)),
+            );
+        }
         for (i, &(w, h)) in region_max.iter().enumerate() {
+            if w == 0 || h == 0 {
+                continue;
+            }
             let (nw, nh) = (
-                w.max(surf.scratch.get(i).map_or(0, |s| s.width)),
-                h.max(surf.scratch.get(i).map_or(0, |s| s.height)),
+                w.max(surf.scratch.get(&i).map_or(0, |s| s.width)),
+                h.max(surf.scratch.get(&i).map_or(0, |s| s.height)),
             );
             if surf
                 .scratch
-                .get(i)
+                .get(&i)
                 .is_some_and(|s| s.width >= w && s.height >= h)
             {
                 continue;
@@ -5650,7 +5775,7 @@ impl GpuRenderer {
                     "isolation capture exceeds device texture extent".into(),
                 ));
             }
-            let old_scratch = surf.scratch.get(i).map_or(0, |s| {
+            let old_scratch = surf.scratch.get(&i).map_or(0, |s| {
                 u64::from(s.width) * u64::from(s.height) * texel_bytes(s.texture.format())
             });
             let (texture, view) = create_target(
@@ -5675,11 +5800,7 @@ impl GpuRenderer {
                 0,
                 true,
             );
-            if i < surf.scratch.len() {
-                surf.scratch[i] = target;
-            } else {
-                surf.scratch.push(target);
-            }
+            surf.scratch.insert(i, target);
             surf.bind_gen += 1;
             // #169 A4: unsubmitted group-1 bind groups referencing the
             // replaced view keep its predecessor alive — drop them now.
@@ -5820,7 +5941,12 @@ impl GpuRenderer {
         // Backdrop textures for blend composites, sized like the scratch
         // pool to the largest region copied this frame.
         let mut backdrop_max = [(0u32, 0u32); 2];
-        for pass in &surf.frame.passes {
+        let passes = surf.frame.passes.iter();
+        #[cfg(target_vendor = "apple")]
+        let passes = passes.enumerate().filter_map(|(index, pass)| {
+            (!surf.composition.contains_native_pass(index)).then_some(pass)
+        });
+        for pass in passes {
             if let Some(r) = pass.backdrop_copy {
                 let slot = match pass.target {
                     Target::Part(_) | Target::Projected(_) => 0,
@@ -6045,12 +6171,21 @@ impl GpuRenderer {
             }
             let mut entry = [0u8; 256];
             for surf in &surfaces {
-                for pass in &surf.frame.passes {
-                    let g = lower::globals(
+                let globals = surf.frame.passes.iter().map(|pass| {
+                    lower::globals(
                         [pass.region[2] as f32, pass.region[3] as f32],
                         [pass.region[0] as f32, pass.region[1] as f32],
                         pass.space,
-                    );
+                    )
+                });
+                #[cfg(target_vendor = "apple")]
+                let globals = globals.enumerate().map(|(index, mut g)| {
+                    if let Some(origin) = surf.composition.attachment_origin(index) {
+                        g.attachment_origin = origin.map(|value| value as f32);
+                    }
+                    g
+                });
+                for g in globals {
                     let g = bytemuck::bytes_of(&g);
                     entry[..g.len()].copy_from_slice(g);
                     put(&entry);
@@ -6232,7 +6367,50 @@ impl GpuRenderer {
             delivery: self.shader_delivery,
         };
         let mask_gen = self.atlas.mask_texture_generation();
-        for (i, pass) in surf.frame.passes.iter().enumerate() {
+        let mut i = 0;
+        while i < surf.frame.passes.len() {
+            #[cfg(target_vendor = "apple")]
+            if let Some(epoch) = surf.composition.epoch_at(i) {
+                let end = epoch.passes.end;
+                let pass_index = self.frame_pass_count;
+                self.frame_pass_count += 1;
+                if self.timestamps {
+                    self.pass_meta.push(PassMeta {
+                        name: "tile composition".into(),
+                        width: epoch.region[2],
+                        height: epoch.region[3],
+                        format: "rgba16float",
+                    });
+                }
+                composite::metal::encode(
+                    &mut self.tile_executor,
+                    &composite::metal::Resources {
+                        device: &self.device,
+                        layout: &self.pipeline_layout,
+                        layout1: &self.layout1,
+                        dummy: &self.dummy_view,
+                        bind0: &self.bind0,
+                        images: &self.images,
+                        bitmaps: &self.bitmaps,
+                        atlas: &self.atlas,
+                    },
+                    surf,
+                    i,
+                    &mut encoder,
+                    self.query_set
+                        .as_ref()
+                        .map(|query_set| wgpu::RenderPassTimestampWrites {
+                            query_set,
+                            beginning_of_pass_write_index: Some(self.query_base + 2 * pass_index),
+                            end_of_pass_write_index: Some(self.query_base + 2 * pass_index + 1),
+                        }),
+                    stats,
+                );
+                stats.passes += 1;
+                i = end;
+                continue;
+            }
+            let pass = &surf.frame.passes[i];
             let coverage_order = matches!(pass.target, Target::Part(_))
                 && !pass.ranges.is_empty()
                 && pass.ranges.iter().all(|range| {
@@ -6278,7 +6456,7 @@ impl GpuRenderer {
             }
             let (view, texture) = match pass.target {
                 Target::Part(n) => surf.part(n),
-                Target::Scratch(i) => (&surf.scratch[i].view, &surf.scratch[i].texture),
+                Target::Scratch(i) => (&surf.scratch[&i].view, &surf.scratch[&i].texture),
                 Target::Backdrop { group, region } => {
                     let capture = &surf.backdrop_groups[&group].captures[region as usize];
                     (&capture.view, &capture.texture)
@@ -6296,7 +6474,7 @@ impl GpuRenderer {
                     Target::Projected(key) => {
                         (&projective_entry(&surf.projective, key).texture, 0, 0)
                     }
-                    Target::Scratch(k) => (&surf.scratch[k].texture, 0, 0),
+                    Target::Scratch(k) => (&surf.scratch[&k].texture, 0, 0),
                     Target::Backdrop { group, region } => {
                         let capture = &surf.backdrop_groups[&group].captures[region as usize];
                         (&capture.texture, 0, 0)
@@ -6368,11 +6546,11 @@ impl GpuRenderer {
                 );
             }
             let load = match pass.clear {
-                Some([r, g, b, a]) => wgpu::LoadOp::Clear(wgpu::Color {
-                    r: f64::from(r),
-                    g: f64::from(g),
-                    b: f64::from(b),
-                    a: f64::from(a),
+                Some([red, green, blue, alpha]) => wgpu::LoadOp::Clear(wgpu::Color {
+                    r: f64::from(red),
+                    g: f64::from(green),
+                    b: f64::from(blue),
+                    a: f64::from(alpha),
                 }),
                 None => wgpu::LoadOp::Load,
             };
@@ -6519,7 +6697,11 @@ impl GpuRenderer {
                     &factory,
                     CoveragePhase::Opaque,
                 )?);
-                render_pass.set_bind_group(0, &self.bind0, &[pass_index * 256]);
+                render_pass.set_bind_group(
+                    0,
+                    &self.bind0,
+                    &[(surf.globals_base + u32::try_from(i).unwrap()) * 256],
+                );
                 let bind = surf
                     .binds1
                     .entry((None, false, None, None))
@@ -6576,7 +6758,7 @@ impl GpuRenderer {
             }
             // The uniform slot written for this pass above (256-byte
             // stride), which matches `surf.frame.passes` ordering.
-            let offset = pass_index * 256;
+            let offset = (surf.globals_base + u32::try_from(i).unwrap()) * 256;
             render_pass.set_bind_group(0, &self.bind0, &[offset]);
             // External ranges bind a slot's group-1 over the external
             // pipeline; an engine range after one must rebind its pipeline.
@@ -6851,7 +7033,7 @@ impl GpuRenderer {
                             &self.layout1,
                             &self.dummy_view,
                             range.source.map(|s| match s {
-                                Source::Scratch(i) => &surf.scratch[i].view,
+                                Source::Scratch(i) => &surf.scratch[&i].view,
                                 Source::Backdrop { group, region } => {
                                     &surf.backdrop_groups[&group].captures[region as usize].view
                                 }
@@ -6860,40 +7042,14 @@ impl GpuRenderer {
                                 }
                             }),
                             backdrop,
-                            range.image.as_ref().and_then(|source| match source {
-                                // Lowering resolved this range against a
-                                // registered image, and the render loop frees
-                                // an image only once no installed content
-                                // draws it (#199): a range naming a missing
-                                // image is an engine defect, never drawn
-                                // with a substitute.
-                                lower::ImageSource::Registered(id) => Some(
-                                    &self
-                                        .images
-                                        .get(id)
-                                        .unwrap_or_else(|| {
-                                            panic!(
-                                                "a lowered range samples image {id}, which is not registered"
-                                            )
-                                        })
-                                        .view,
-                                ),
-                                lower::ImageSource::Bitmap(key) => {
-                                    self.bitmaps.get(key).map(|bitmap| &bitmap.image.view)
-                                }
-                                lower::ImageSource::Shader(key) => {
-                                    Some(&surf.shader_textures[key].image.view)
-                                }
-                                lower::ImageSource::Content(layer) => Some(
-                                    &surf.content[layer]
-                                        .image
-                                        .as_ref()
-                                        .expect("rendered content")
-                                        .view,
-                                ),
-                                lower::ImageSource::External(_) => {
-                                    unreachable!("external ranges draw with the external pipeline")
-                                }
+                            range.image.as_ref().map(|image| {
+                                image_view(
+                                    image,
+                                    &self.images,
+                                    &self.bitmaps,
+                                    &surf.shader_textures,
+                                    &surf.content,
+                                )
                             }),
                             range.mask.map(|k| {
                                 self.atlas
@@ -6933,7 +7089,7 @@ impl GpuRenderer {
                     .apply(
                         &self.device,
                         &mut encoder,
-                        &surf.scratch[depth],
+                        &surf.scratch[&depth],
                         (pass.region[2], pass.region[3]),
                         *parameters,
                     )?;
@@ -6942,7 +7098,7 @@ impl GpuRenderer {
             }
             if let Some((_, filter)) = surf.frame.filters.iter().find(|(pass, _)| *pass == i) {
                 let capture = match pass.target {
-                    Target::Scratch(depth) => &surf.scratch[depth],
+                    Target::Scratch(depth) => &surf.scratch[&depth],
                     Target::Backdrop { group, region } => {
                         &surf.backdrop_groups[&group].captures[region as usize]
                     }
@@ -6975,7 +7131,11 @@ impl GpuRenderer {
                 entry.build_mips(&mut encoder, pipes);
                 stats.passes += u32::try_from(entry.mips.len()).unwrap_or(u32::MAX);
             }
+            stats.passes += 1;
+            i += 1;
         }
+        #[cfg(target_vendor = "apple")]
+        surf.tile_targets.finish_frame();
         // Producer sync: each external frame's `wait` event becomes a
         // raw Metal command buffer committed ahead of the frame's, so the
         // GPU blocks in-queue — no CPU wait and no copy. Commit order on
@@ -7116,7 +7276,6 @@ impl GpuRenderer {
             ?submission,
             "surface submitted"
         );
-        stats.passes += u32::try_from(surf.frame.passes.len()).unwrap_or(u32::MAX);
         stats.instances += u32::try_from(surf.frame.instances.len()).unwrap_or(u32::MAX);
         Ok(())
     }
@@ -7817,7 +7976,7 @@ impl GpuRenderer {
             .iter()
             .map(|(pass, id)| {
                 let format = match surface.frame.passes[*pass].target {
-                    Target::Scratch(depth) => surface.scratch[depth].texture.format(),
+                    Target::Scratch(depth) => surface.scratch[&depth].texture.format(),
                     Target::Backdrop { group, region } => surface.backdrop_groups[&group].captures
                         [region as usize]
                         .texture

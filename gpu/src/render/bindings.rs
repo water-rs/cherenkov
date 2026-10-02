@@ -117,8 +117,8 @@ impl Entry {
 /// Group 0 of the engine pipelines (`shader.wgsl`): the per-pass globals
 /// window, the instance and gradient-stop buffers, and the glyph atlas.
 pub const ENGINE_GROUP0: &[Entry] = &[
-    // One 24-byte Globals window; the dynamic offset selects the pass's slot.
-    Entry::uniform(0, VERTEX | FRAGMENT, true, 24),
+    // One 32-byte Globals window; the dynamic offset selects the pass's slot.
+    Entry::uniform(0, VERTEX | FRAGMENT, true, 32),
     Entry::storage_read(1, VERTEX | FRAGMENT),
     Entry::storage_read(2, FRAGMENT),
     Entry::texture(3),

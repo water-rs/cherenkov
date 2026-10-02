@@ -99,14 +99,17 @@ struct Globals {
     // SPACE_LINEAR or SPACE_SRGB.
     space: u32,
     pad0: u32,
+    attachment_origin: vec2<f32>,
 }
 
 const SPACE_LINEAR: u32 = 0u;
 const SPACE_SRGB: u32 = 1u;
 
 @group(0) @binding(0) var<uniform> globals: Globals;
-@group(0) @binding(1) var<storage, read> instances: array<Instance>;
-@group(0) @binding(2) var<storage, read> stops: array<Stop>;
+alias InstanceBuffer = array<Instance>;
+alias StopBuffer = array<Stop>;
+@group(0) @binding(1) var<storage, read> instances: InstanceBuffer;
+@group(0) @binding(2) var<storage, read> stops: StopBuffer;
 @group(0) @binding(3) var atlas: texture_2d<f32>;
 
 // A clip mask too large for the atlas, on its own R8Unorm texture. Both

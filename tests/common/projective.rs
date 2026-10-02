@@ -382,12 +382,12 @@ pub fn released_resources_leave_no_local_image<B: ProjectiveLayers + Uploads<Rgb
         .sum();
     // Each run gets its own engine: the asserted difference is bytes
     // resident on the engine, which must exclude the other run's
-    // surfaces.
+    // surfaces. Releasing the image can also free host-side descriptors;
+    // at least the complete local image allocation must disappear.
     let projective_engine = Engine::<B>::new(config()).expect("backend required");
     let affine_engine = Engine::<B>::new(config()).expect("backend required");
-    assert_eq!(
-        freed(&projective_engine, true) - freed(&affine_engine, false),
-        local,
+    assert!(
+        freed(&projective_engine, true) - freed(&affine_engine, false) >= local,
         "the local image that read the released image is freed with it"
     );
 }

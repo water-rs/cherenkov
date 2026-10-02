@@ -26,8 +26,11 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
                 if let brightness = self?.originalBrightness {
                     UIScreen.main.brightness = brightness
                 }
+                logger.info("all runs done; exit code \(code)")
+                if CommandLine.arguments.contains("--exit-after-run") {
+                    exit(code)
+                }
             }
-            logger.info("all runs done; exit code \(code)")
         }
         return true
     }

@@ -3,7 +3,7 @@
 
 struct TileInput {
     metal::float2 local [[user(loc0), center_perspective]];
-    metal::float2 pixel [[user(loc1), center_perspective]];
+    metal::float2 device_ [[user(loc1), center_perspective]];
     uint instance [[user(loc2), flat]];
     metal::uint4 meta [[user(loc3), flat]];
     metal::float4 color [[user(loc4), flat]];
@@ -21,7 +21,7 @@ VsOut tile_input(TileInput v, metal::float4 position, constant Globals& globals)
     result.local = v.local;
     // Translating a viewport changes interpolant rounding at clip edges.
     // Device coordinates are pixel centres in the physical attachment grid.
-    result.pixel = position.xy + globals.attachment_origin;
+    result.device_ = position.xy + globals.attachment_origin;
     result.instance = v.instance;
     result.meta = v.meta;
     result.color = v.color;

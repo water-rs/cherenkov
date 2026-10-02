@@ -2482,23 +2482,7 @@ impl Renderer for GpuRenderer {
         // plane's attach on the main queue.
         #[cfg(not(target_vendor = "apple"))]
         drop(waker);
-        let size = match &target {
-            GpuTarget::Offscreen(offscreen) => offscreen.size,
-            GpuTarget::Window(window) => window.size,
-            GpuTarget::Texture(texture) => texture.size,
-            #[cfg(target_os = "android")]
-            GpuTarget::SurfaceControl(target) => target.size(),
-        };
-        if size.0 == 0 || size.1 == 0 {
-            return Err(SurfaceError::ZeroSize);
-        }
-        if size.0 > self.max_texture || size.1 > self.max_texture {
-            return Err(SurfaceError::TooLarge {
-                width: size.0,
-                height: size.1,
-                max: self.max_texture,
-            });
-        }
+        let size = self.target_size(&target)?;
         let (window, textures, refresh, presents) = match target {
             GpuTarget::Offscreen(offscreen) => (None, None, offscreen.refresh, false),
             GpuTarget::Texture(texture) => (None, Some(texture.textures), texture.refresh, false),
@@ -3479,6 +3463,27 @@ impl Renderer for GpuRenderer {
 }
 
 impl GpuRenderer {
+    const fn target_size(&self, target: &GpuTarget) -> Result<(u32, u32), SurfaceError> {
+        let size = match target {
+            GpuTarget::Offscreen(offscreen) => offscreen.size,
+            GpuTarget::Window(window) => window.size,
+            GpuTarget::Texture(texture) => texture.size,
+            #[cfg(target_os = "android")]
+            GpuTarget::SurfaceControl(target) => target.size(),
+        };
+        if size.0 == 0 || size.1 == 0 {
+            return Err(SurfaceError::ZeroSize);
+        }
+        if size.0 > self.max_texture || size.1 > self.max_texture {
+            return Err(SurfaceError::TooLarge {
+                width: size.0,
+                height: size.1,
+                max: self.max_texture,
+            });
+        }
+        Ok(size)
+    }
+
     /// Realizes surface `id` under a `SurfaceControlTarget`'s parent and
     /// returns its refresh range.
     #[cfg(target_os = "android")]

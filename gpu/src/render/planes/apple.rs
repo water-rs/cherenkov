@@ -1355,7 +1355,7 @@ impl SystemPlanes for LayerPlanes {
                         headroom: c.display.headroom,
                     },
                 );
-                buffer.completed(c.queue, self.waker.clone());
+                buffer.completed(c.queue, self.waker.clone())?;
                 self.buffers.insert(layer, buffer);
             }
             let buffer = &self.buffers[&layer];

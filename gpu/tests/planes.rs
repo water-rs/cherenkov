@@ -1145,6 +1145,30 @@ mod macos {
         static_pixels(false);
     }
 
+    fn static_headroom_completion(fixture: &Fixture) {
+        fixture.woke.store(false, Ordering::Release);
+        fixture
+            .window
+            .display(Display {
+                scale: SCALE,
+                headroom: 2.0,
+            })
+            .expect("new output headroom");
+        assert_eq!(
+            fixture.engine.render(FrameTime::now()).expect("recapture"),
+            cherenkov::Next::Idle
+        );
+        // No render, readback, queue submission or device poll while waiting:
+        // the conversion itself must wake an otherwise idle engine.
+        drive(
+            Instant::now() + Duration::from_secs(10),
+            &|| fixture.woke.load(Ordering::Acquire),
+            &|| "capture conversion failed to wake the idle engine".into(),
+        );
+        fixture.render();
+        assert_eq!(stack(fixture).len(), 2);
+    }
+
     fn static_pixels(trim: bool) {
         let fixture = Fixture::new();
         let offscreen = fixture
@@ -1214,6 +1238,7 @@ mod macos {
             assert_eq!(stack(&fixture).len(), 1);
             return;
         }
+        static_headroom_completion(&fixture);
         fixture
             .window
             .update_animated(cherenkov::Curve::linear(Duration::from_secs(2)), |tx| {

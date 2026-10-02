@@ -34,6 +34,9 @@ pub enum SceneError {
     /// projective layer.
     #[error("invalid projection: {0}")]
     InvalidProjection(&'static str),
+    /// A text layer's source or items are malformed.
+    #[error("invalid text layer: {0}")]
+    InvalidText(&'static str),
     /// The `features` set stored in `scene.json` does not match the features
     /// recomputed from the layer tree.
     #[error("stored features {declared:?} do not match recomputed {computed:?}")]

@@ -6,7 +6,7 @@ committed; this produces all of it:
 
     1. fetch   ``scenes/fonts/_full/``   pinned upstream files, hash-verified
     2. fonts   ``scenes/fonts/``         OFL subsets and the licence
-    3. tools   ``scenes/fonts/*.ttf``    the authored test fonts
+    3. tools   ``scenes/fonts/*.ttf``    the authored and derived test fonts
     4. corpus  ``scenes/corpus/``        scene.json + resources per scene
     5. perf    ``scenes/perf/``          the five perf scenes
 
@@ -44,6 +44,7 @@ def main() -> int:
         "build_colr_test_font.py",
         "build_winding_test_font.py",
         "make_sbix_font.py",
+        "build_static_test_font.py",
     ):
         run([sys.executable, str(TOOLS / tool)])
     # The writer does not clean stale scenes; regenerate from scratch.

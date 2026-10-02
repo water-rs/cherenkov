@@ -7,6 +7,8 @@
 
 #[path = "generate_corpus/authored.rs"]
 mod authored;
+#[path = "generate_corpus/text_layout.rs"]
+mod text_layout;
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -200,6 +202,8 @@ struct TextContext {
     families: BTreeMap<&'static str, String>,
     /// Every registered font blob, keyed by its content hash.
     blobs: BTreeMap<ResourceHash, Vec<u8>>,
+    /// Content hash per font file name.
+    hashes: BTreeMap<&'static str, ResourceHash>,
 }
 
 impl TextContext {
@@ -207,6 +211,7 @@ impl TextContext {
         let mut fcx = FontContext::new();
         let mut families = BTreeMap::new();
         let mut blobs = BTreeMap::new();
+        let mut hashes = BTreeMap::new();
         for spec in corpus::FONTS {
             let path = fonts_dir.join(spec.subset_file);
             let bytes = std::fs::read(&path)?;
@@ -223,6 +228,7 @@ impl TextContext {
                 .family_name(family_id)
                 .unwrap_or_else(|| panic!("font {} has no family name", spec.subset_file));
             families.insert(spec.subset_file, name.to_string());
+            hashes.insert(spec.subset_file, hash);
             blobs.insert(hash, bytes);
         }
         for file in corpus::TEST_FONTS {
@@ -239,6 +245,7 @@ impl TextContext {
                 .family_name(*family_id)
                 .unwrap_or_else(|| panic!("font {file} has no family name"));
             families.insert(*file, name.to_string());
+            hashes.insert(*file, hash);
             blobs.insert(hash, bytes);
         }
         for file in corpus::BITMAP_FONTS {
@@ -257,6 +264,7 @@ impl TextContext {
                 .family_name(family_id)
                 .unwrap_or_else(|| panic!("font {file} has no family name"));
             families.insert(file, name.to_string());
+            hashes.insert(file, hash);
             blobs.insert(hash, bytes);
         }
         Ok(Self {
@@ -264,6 +272,7 @@ impl TextContext {
             lcx: LayoutContext::new(),
             families,
             blobs,
+            hashes,
         })
     }
 
@@ -4204,6 +4213,9 @@ fn run() -> Result<(), SceneError> {
             blobs,
         );
     }
+
+    // Parley layouts recorded through the engine's text adapter (#26).
+    text_layout::scenes(&mut corpus, &ctx);
 
     // ---- COLR test-font scenes ----------------------------------------------
     //

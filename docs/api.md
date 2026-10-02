@@ -280,7 +280,8 @@ surface.update(|tx| {
 drop(card);                                      // removed at the next commit
 ```
 
-- **Properties:** `transform`, `opacity`, `clip`, `blend`, `filter`, `backdrop`, `scroll_offset`, `content`, and child order (`push`, `insert`, `remove`). Each property accepts a constant or a nami signal. A bound signal keeps updating the layer with no further transactions. The subscription is owned by the layer and released when the layer drops.
+- **Properties:** `transform`, `opacity`, `clip`, `blend`, `filter`, `backdrop`, `scroll_offset`, `layout_size`, `content`, and child order (`push`, `insert`, `remove`). Each property accepts a constant or a nami signal. A bound signal keeps updating the layer with no further transactions. The subscription is owned by the layer and released when the layer drops.
+- **Layout size.** `tx[&layer].layout_size(size)` is the size the host lays the layer out at, in its content coordinates (`Size::ZERO` until set); the host drives it from layout with a constant or a signal. It is UI-thread state that recordings read, not a render-thread property: it changes when the call is made, so a recording later in the same transaction already sees it, and `.animation(...)` does not apply to it. See Recording.
 - **Binding.** `transform`, `opacity`, `scroll_offset` and `clip` take `impl Into<Live<T>>`, the same target the `Recorder` uses: any `Signal<Output = T>`, and constants are signals. Binding a property replaces that property's previous subscription. A change fires on the UI thread, is queued as the same owned op a transaction would produce, reaches the render thread with the next frame, and calls the waker. If the change's nami `Context` metadata carries an `Animation`, the op carries it too and the render thread interpolates; otherwise the value snaps. A transaction that sets the property again also replaces the binding.
 - **Stable identity.** The layer handle is the identity. Content versions are internal: setting `content` bumps the version, and caching keys on (layer, version).
 - **Content kinds:** recorded `Content`, a shared `Picture`, `ExternalFrame` (video, web views), `GpuContent` (custom GPU pipelines).
@@ -341,6 +342,19 @@ let content: Content = surface.record(|c: &mut Recorder| { /* … */ });
 ```
 
 - **Layer recording.** `tx[&layer].record(...)` replaces the content and reuses its retired recording storage once the render thread releases it.
+- **Layout size (#26).** A live recording is made for a layer and reads that layer's layout size as a signal, `c.layout_size()` (`LayoutSize: Signal<Output = Size>`): `tx[&layer].record` reads `layer`'s, `surface.record` the root layer's. Size-dependent geometry binds to it like any other value, so a host resize updates only the commands that reference it, without re-recording; a resize set under an animation (the transaction's, or a bound change's `Animation` metadata) animates those operands. A component never carries its own size binding: the host drives the layer's.
+
+  ```rust
+  surface.update(|tx| {
+      tx[&chart].layout_size(layout.clone())                // the host's layout result signal
+          .record(|c| {
+              let size = c.layout_size();
+              c.fill(size.clone().map(|s| s.to_rect()), background);
+              c.stroke(size.map(|s| axis(s)), Stroke::new(1.0), ink);
+          });
+  });
+  ```
+- Recording always goes through a surface: there is no free-standing live recorder, so every recording has a layer's size to read. `Picture::record` stays free-standing because it holds no signals.
 
 Both implement one drawing trait. A generic associated type decides what a parameter accepts:
 
@@ -353,7 +367,7 @@ pub trait Draw {
     fn stroke<S: Shape>(&mut self, shape: impl Into<Self::Value<S>>, style: impl Into<Self::Value<Stroke>>,
                         paint: impl Into<Self::Value<Paint>>);
     fn shadow<S: Shape>(&mut self, shape: impl Into<Self::Value<S>>, shadow: impl Into<Self::Value<Shadow>>);
-    fn text(&mut self, layout: &TextLayout, origin: Point);
+    fn text(&mut self, layout: &TextLayout, origin: Point); // records constants: a new layout is a new recording
     fn glyphs(&mut self, run: impl Into<Self::Value<GlyphRun>>, paint: impl Into<Self::Value<Paint>>);
     fn image<F: Format>(&mut self, image: &Image<F>, dst: impl Into<Self::Value<Rect>>, sampling: Sampling);
     fn picture(&mut self, picture: &Picture, transform: impl Into<Self::Value<Affine>>);
@@ -446,6 +460,7 @@ DynColor::from_css(parsed)                         // colour space known only at
 Shaping stays outside the engine: parley, which covers complex scripts (Arabic, Indic, Thai, Hebrew and so on). The engine is responsible for everything between shaped glyphs and pixels, for every script:
 
 ```rust
+let layout: TextLayout = TextLayout::new(parley_layout, |font: &parley::FontData| fonts.get(engine, font))?;
 c.text(&layout, origin);          // parley adapter: TextLayout wraps parley::Layout<Paint>
 c.glyphs(&GlyphRun {
     font, size: 17.0, coords: variation_coords.into(),
@@ -454,6 +469,12 @@ c.glyphs(&GlyphRun {
 }, paint);                        // paint is a separate parameter, so it can be bound to a signal
 ```
 
+- **The parley adapter (#26).** `TextLayout::new(layout, font)` takes a shaped `parley::Layout<Paint>` (the engine re-exports the `parley` it lowers as `cherenkov::parley`; parley's unset brush is `Paint::default()`, opaque black) and lowers it once:
+  - Every parley glyph run becomes one `GlyphRun` (font size, normalized coords, positioned glyphs) filled with the style's brush. `font` is called once per distinct font data (blob and collection index) in the layout and returns the engine `Font` it draws with; hosts cache it across layouts, since the engine keys glyph caches on the font id. `FontSource::from(&parley::FontData)` builds the registration (it copies the bytes once, like `FontSource::mapped`). The `TextLayout` keeps those `Font`s alive.
+  - A synthetic oblique (fontique's `skew`) becomes each glyph's transform, `skew(−tan θ, 0)` about the glyph origin. A synthetic bold (fontique's `embolden`, for a weight heavier than any face or `wght` axis of the font offers) draws the run filled and then stroked with a mitred outline whose width is 1/24 of the em at 9 px and below, 1/32 at 36 px and above, and linear in between, so each outline grows by half that width on every side. The pair sits in an isolated group unless the brush is an opaque colour, so a translucent, gradient or image brush covers the overlap once; with an opaque colour the two composite to the same pixels without the group.
+  - Underlines and strikethroughs become rectangle fills: the top edge at `baseline − offset` and the thickness from the decoration, or the run's font metrics where the style leaves them unset, across the run's advance, filled with the decoration's brush. A decoration continuing into the next run of the line with the same brush, offset and thickness is one rectangle, so a style change inside an underline leaves no seam.
+  - Each line draws its underlines, then its glyphs, then its strikethroughs. Inline boxes draw nothing: their content is the host's.
+  - `c.text(&layout, origin)` records those primitives as constants with the layout's top-left at `origin` (glyph positions add in f64 and round once to f32), through the same `glyphs`, `fill` and `group` commands as hand-built content, so both backends draw them on the existing glyph, stroked-glyph and rectangle paths. `layout.layout()` returns the parley layout for metrics and hit testing.
 - `GlyphRun.glyphs` and `GlyphRun.coords` are `Arc` slices; cloning a run shares both.
 - **Large scripts.** CJK text can touch thousands of distinct glyphs per screen.
   - The glyph atlas is budgeted and evicts least-recently-used pages.
@@ -467,7 +488,7 @@ c.glyphs(&GlyphRun {
 - **Variable fonts** take normalized coordinates on the run.
 - **Glyph realization is an experimental axis** (coverage atlas, direct curve evaluation, the path route, or distance fields for validated sizes), decided by the device farm. The CPU exact-area glyph rasterizer is both the correctness reference and the CPU backends' route. COLRv1 glyphs are a paint graph: every realization handles their transforms, gradients and compositing, and cached colour glyphs key on palette and foreground.
 - **Per-glyph transforms** apply about the glyph origin, between the font scale and the glyph position. A pure translation folds into the glyph position and keeps the atlas path; any other transform is realized as outline coverage (the path route) filled with the run paint, never the atlas. A non-finite or non-invertible transform is a render error.
-- **Test coverage.** The correctness corpus (#3) includes Latin, CJK (horizontal and vertical), Arabic, Hebrew, Devanagari, Thai, emoji ZWJ sequences and COLRv1 glyphs.
+- **Test coverage.** The correctness corpus (#3) includes Latin, CJK (horizontal and vertical), Arabic, Hebrew, Devanagari, Thai, emoji ZWJ sequences and COLRv1 glyphs. The `text-layout-*` scenes carry a parley input (brushes, gradients, decorations, a synthetic oblique, a synthetic bold under opaque, translucent and gradient brushes, wrapping, bidirectional text over a font stack) that the Cherenkov adapters record through `Draw::text`; their items are the generator's reference lowering of the same layout, which the oracle draws, in sRGB, P3-only and HDR inks.
 
 ## Effects and filters
 

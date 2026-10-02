@@ -45,6 +45,17 @@ impl Clone for Paint {
     }
 }
 
+/// Opaque black, the brush parley gives text whose style sets none (it
+/// needs a default to stand in for an unset brush; [`TextLayout`]
+/// lowers whatever the style resolves to).
+///
+/// [`TextLayout`]: crate::TextLayout
+impl Default for Paint {
+    fn default() -> Self {
+        Self::Solid(WorkingColor::BLACK)
+    }
+}
+
 impl Paint {
     // Keep owned gradient/mesh/shader cloning out of each inlined solid
     // recording site. The result and resource ownership remain identical.

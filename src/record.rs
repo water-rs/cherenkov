@@ -7,17 +7,19 @@ use std::collections::HashMap;
 use std::mem::{needs_drop, size_of};
 use std::rc::{Rc, Weak};
 
-use kurbo::{Affine, Rect, Stroke};
+use kurbo::{Affine, Point, Rect, Stroke};
 use nami_core::Signal;
 use serde::{Deserialize, Serialize};
 
 use crate::Instant;
 use crate::animation::{AnimLanes, Animation, OperandTrack};
 use crate::display_list::{Command, DisplayList, Operand, Picture, Slot, SlotUpdate};
-use crate::glyph::GlyphRun;
+use crate::glyph::{GlyphRun, GlyphStyle};
 use crate::paint::{ImageId, Paint, Sampling};
-use crate::shape::Shape;
+use crate::shape::{Shape, ShapeData};
+use crate::size::LayoutSize;
 use crate::style::{Group, Shadow};
+use crate::text::{TextCommand, TextLayout, place_run};
 
 /// The drawing verbs, shared by [`StaticRecorder`] and [`Recorder`].
 ///
@@ -54,6 +56,12 @@ pub trait Draw {
         shape: impl Into<Self::Value<S>>,
         shadow: impl Into<Self::Value<Shadow>>,
     );
+
+    /// Draws a shaped parley layout with its origin at `origin`: the
+    /// layout's glyph runs and decoration rectangles, recorded as the
+    /// [`glyphs`](Draw::glyphs) and [`fill`](Draw::fill) commands
+    /// [`TextLayout`] lowers to. A new layout is a new recording.
+    fn text(&mut self, layout: &TextLayout, origin: Point);
 
     /// Draws a glyph run.
     fn glyphs<P: Into<Paint> + 'static>(
@@ -146,6 +154,10 @@ impl Draw for StaticRecorder {
         });
     }
 
+    fn text(&mut self, layout: &TextLayout, origin: Point) {
+        record_text(&mut self.list, layout, origin);
+    }
+
     fn glyphs<P: Into<Paint> + 'static>(
         &mut self,
         run: impl Into<Fixed<GlyphRun>>,
@@ -197,6 +209,55 @@ impl Draw for StaticRecorder {
         });
         body(self);
         self.list.end(begin);
+    }
+}
+
+/// Records `layout`'s lowered primitives at `origin`. They are constants:
+/// a layout is not a signal, so nothing subscribes.
+fn record_text(list: &mut DisplayList, layout: &TextLayout, origin: Point) {
+    for command in layout.commands() {
+        match command {
+            TextCommand::Glyphs(run, paint) => {
+                list.push(Command::Glyphs {
+                    run: place_run(run, origin),
+                    paint: paint.clone(),
+                });
+            }
+            TextCommand::Bold(run, stroke, paint) => {
+                let fill = place_run(run, origin);
+                let outline = GlyphRun {
+                    style: GlyphStyle::Stroke(stroke.clone()),
+                    ..fill.clone()
+                };
+                // With one opaque colour, the fill and then the stroke
+                // composite to exactly what the isolated pair does; any
+                // other paint would blend twice where the two overlap.
+                let isolate = !matches!(paint, Paint::Solid(color) if color.components[3] >= 1.0);
+                let begin = isolate.then(|| {
+                    list.push(Command::BeginGroup {
+                        group: Group::new(),
+                        end: 0,
+                    })
+                });
+                list.push(Command::Glyphs {
+                    run: fill,
+                    paint: paint.clone(),
+                });
+                list.push(Command::Glyphs {
+                    run: outline,
+                    paint: paint.clone(),
+                });
+                if let Some(begin) = begin {
+                    list.end(begin);
+                }
+            }
+            TextCommand::Fill(rect, paint) => {
+                list.push(Command::Fill {
+                    shape: ShapeData::Rect(*rect + origin.to_vec2()),
+                    paint: paint.clone(),
+                });
+            }
+        }
     }
 }
 
@@ -540,6 +601,7 @@ pub struct Recorder {
     list: DisplayList,
     live: Rc<LiveState>,
     picture: Option<Picture>,
+    size: LayoutSize,
 }
 
 impl std::fmt::Debug for Recorder {
@@ -550,29 +612,20 @@ impl std::fmt::Debug for Recorder {
     }
 }
 
-impl Default for Recorder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Recorder {
-    /// Starts a recording with live subscriptions. [`Self::finish`] transfers
-    /// those subscriptions to the resulting [`Content`].
+    /// The size the host lays the recorded layer out at, as a signal:
+    /// geometry derived from it (`c.layout_size().map(…)`) updates when the
+    /// host resizes the layer, without re-recording. See [`LayoutSize`].
     #[must_use]
-    pub fn new() -> Self {
-        Self {
-            list: DisplayList::default(),
-            live: Rc::default(),
-            picture: None,
-        }
+    pub fn layout_size(&self) -> LayoutSize {
+        self.size.clone()
     }
 
     /// Finishes a recording without freezing its live operands. Subsequent
     /// signal changes remain incremental updates when the content is installed.
     #[must_use]
     #[inline]
-    pub fn finish(mut self) -> Content {
+    pub(crate) fn finish(mut self) -> Content {
         self.list.trim_spare();
         let picture = match self.picture.take() {
             Some(mut picture) => {
@@ -671,6 +724,10 @@ impl Draw for Recorder {
             Operand::Shape(shape.into_data())
         });
         self.subscribe(shadow.subscribe, command, Operand::Shadow);
+    }
+
+    fn text(&mut self, layout: &TextLayout, origin: Point) {
+        record_text(&mut self.list, layout, origin);
     }
 
     #[expect(
@@ -779,14 +836,14 @@ impl std::fmt::Debug for Content {
 }
 
 impl Content {
-    /// Records content.
-    #[must_use]
-    pub fn record(body: impl FnOnce(&mut Recorder)) -> Self {
-        Self::record_with_capacity(0, body)
+    /// Records content for a layer laid out at `size`.
+    pub(crate) fn record(size: LayoutSize, body: impl FnOnce(&mut Recorder)) -> Self {
+        Self::record_with_capacity(0, size, body)
     }
 
     pub(crate) fn record_reusing(
         mut spare: ContentSpare,
+        size: LayoutSize,
         body: impl FnOnce(&mut Recorder),
     ) -> Self {
         let (picture, list) = spare.picture.take().map_or_else(
@@ -811,6 +868,7 @@ impl Content {
             list,
             live,
             picture,
+            size,
         };
         body(&mut recorder);
         recorder.finish()
@@ -837,14 +895,18 @@ impl Content {
     }
 
     /// Like [`record`](Self::record), reserving room for `capacity` commands —
-    /// pass the previous recording's [`len`](Self::len) when re-recording the
+    /// the previous recording's [`len`](Self::len) when re-recording the
     /// same content.
-    #[must_use]
-    pub fn record_with_capacity(capacity: usize, body: impl FnOnce(&mut Recorder)) -> Self {
+    pub(crate) fn record_with_capacity(
+        capacity: usize,
+        size: LayoutSize,
+        body: impl FnOnce(&mut Recorder),
+    ) -> Self {
         let mut recorder = Recorder {
             list: DisplayList::with_capacity(capacity),
             live: Rc::default(),
             picture: None,
+            size,
         };
         body(&mut recorder);
         recorder.list.trim_spare();
@@ -957,7 +1019,12 @@ mod tests {
     #[test]
     fn explicit_recording_keeps_live_operands_until_frozen() {
         let radius = binding::<f64>(1.0);
-        let mut recorder = Recorder::new();
+        let mut recorder = Recorder {
+            list: DisplayList::default(),
+            live: Rc::default(),
+            picture: None,
+            size: LayoutSize::new(),
+        };
         recorder.fill(radius.map(|r| Circle::new((0.0, 0.0), r)), red());
         let mut content = recorder.finish();
         let Some(ContentChange::Replace(original)) = content.take_change() else {
@@ -993,7 +1060,12 @@ mod tests {
             elements,
             rule: crate::FillRule::EvenOdd,
         };
-        let mut recorder = Recorder::default();
+        let mut recorder = Recorder {
+            list: DisplayList::default(),
+            live: Rc::default(),
+            picture: None,
+            size: LayoutSize::new(),
+        };
         recorder.fill(Fixed(shape), red());
         let picture = recorder.finish().into_picture();
         let Command::Fill {
@@ -1009,10 +1081,10 @@ mod tests {
 
     #[test]
     fn shared_retired_picture_falls_back_to_fresh_storage() {
-        let mut content = Content::record(|_| {});
+        let mut content = Content::record(LayoutSize::new(), |_| {});
         let pointer = std::ptr::from_ref(content.picture.display_list());
         let held = content.take_change();
-        let reused = Content::record_reusing(content.retire(), |_| {});
+        let reused = Content::record_reusing(content.retire(), LayoutSize::new(), |_| {});
         assert_ne!(std::ptr::from_ref(reused.picture.display_list()), pointer);
         drop(held);
     }
@@ -1034,7 +1106,7 @@ mod tests {
         };
         let glyphs = run.glyphs.as_ptr();
         let coords = run.coords.as_ptr();
-        let content = Content::record(|c| c.glyphs(Fixed(run), red()));
+        let content = Content::record(LayoutSize::new(), |c| c.glyphs(Fixed(run), red()));
         let Command::Glyphs { run, .. } = &content.picture.display_list().commands()[0] else {
             panic!("the recorded glyph run");
         };
@@ -1061,7 +1133,9 @@ mod tests {
         }
 
         let calls = Rc::new(std::cell::Cell::new(0));
-        let content = Content::record(|c| c.fill(Observed(Rc::clone(&calls)), red()));
+        let content = Content::record(LayoutSize::new(), |c| {
+            c.fill(Observed(Rc::clone(&calls)), red());
+        });
         assert_eq!(calls.get(), 1);
         assert_eq!(content.len(), 1);
     }
@@ -1069,7 +1143,7 @@ mod tests {
     #[test]
     fn a_signal_change_regenerates_only_the_commands_that_reference_it() {
         let radius = binding::<f64>(8.);
-        let mut content = Content::record(|c| {
+        let mut content = Content::record(LayoutSize::new(), |c| {
             c.fill(Rect::new(0., 0., 10., 10.), red());
             c.fill(radius.map(|r| Circle::new((50., 50.), r)), red());
             c.fill(Rect::new(20., 20., 30., 30.), red());
@@ -1097,13 +1171,13 @@ mod tests {
 
     #[test]
     fn a_capacity_hint_records_the_same_list() {
-        let first = Content::record_with_capacity(0, |c| {
+        let first = Content::record_with_capacity(0, LayoutSize::new(), |c| {
             for i in 0..4 {
                 c.fill(Rect::new(f64::from(i), 0., 10., 10.), red());
             }
         });
         assert_eq!(first.len(), 4);
-        let second = Content::record_with_capacity(first.len(), |c| {
+        let second = Content::record_with_capacity(first.len(), LayoutSize::new(), |c| {
             for i in 0..4 {
                 c.fill(Rect::new(f64::from(i), 0., 10., 10.), red());
             }
@@ -1114,7 +1188,7 @@ mod tests {
     #[test]
     fn a_scope_change_regenerates_the_whole_scope() {
         let offset = binding::<f64>(0.);
-        let mut content = Content::record(|c| {
+        let mut content = Content::record(LayoutSize::new(), |c| {
             c.fill(Rect::new(0., 0., 1., 1.), red());
             c.transform(offset.map(|x| Affine::translate((x, 0.))), |c| {
                 c.fill(Rect::new(0., 0., 1., 1.), red());
@@ -1139,7 +1213,7 @@ mod tests {
     #[test]
     fn repeated_changes_before_a_commit_send_one_update() {
         let radius = binding::<f64>(1.);
-        let mut content = Content::record(|c| {
+        let mut content = Content::record(LayoutSize::new(), |c| {
             c.fill(radius.map(|r| Circle::new((0., 0.), r)), red());
         });
         let _ = content.take_change();
@@ -1158,7 +1232,7 @@ mod tests {
     #[test]
     fn an_animated_operand_steps_into_take_change() {
         let colour = binding(WorkingColor::new([1., 0., 0., 1.]));
-        let mut content = Content::record(|c| {
+        let mut content = Content::record(LayoutSize::new(), |c| {
             c.fill(
                 Rect::new(0., 0., 10., 10.),
                 colour.clone().with(Animation::from(Curve::linear(
@@ -1213,7 +1287,7 @@ mod tests {
     #[test]
     fn a_retargeted_operand_animates_from_its_sampled_position() {
         let colour = binding(WorkingColor::new([1., 0., 0., 1.]));
-        let mut content = Content::record(|c| {
+        let mut content = Content::record(LayoutSize::new(), |c| {
             c.fill(
                 Rect::new(0., 0., 10., 10.),
                 colour.clone().with(Animation::from(Curve::linear(
@@ -1262,7 +1336,7 @@ mod tests {
     #[test]
     fn an_animated_change_without_shared_lanes_snaps() {
         let paint = binding(Paint::Solid(WorkingColor::new([1., 0., 0., 1.])));
-        let mut content = Content::record(|c| {
+        let mut content = Content::record(LayoutSize::new(), |c| {
             c.fill(
                 Rect::new(0., 0., 10., 10.),
                 paint.clone().with(Animation::from(Curve::linear(
@@ -1295,7 +1369,7 @@ mod tests {
     #[test]
     fn dropping_content_releases_its_subscriptions() {
         let radius = binding::<f64>(1.);
-        let content = Content::record(|c| {
+        let content = Content::record(LayoutSize::new(), |c| {
             c.fill(radius.map(|r| Circle::new((0., 0.), r)), red());
         });
         drop(content);
@@ -1329,7 +1403,7 @@ mod tests {
 
     #[test]
     fn change_sets_round_trip_through_serde() {
-        let mut content = Content::record(|c| {
+        let mut content = Content::record(LayoutSize::new(), |c| {
             c.stroke(
                 Rect::new(0., 0., 1., 1.),
                 Stroke::new(2.),

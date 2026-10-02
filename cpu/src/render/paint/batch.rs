@@ -50,7 +50,7 @@ fn gradient(
     let mut last = first;
     let mut fractions = [0.0; 4];
     for (lane, value) in values.to_array().into_iter().enumerate() {
-        let Some(value) = value.is_finite().then(|| extend_t(value, extend)).flatten() else {
+        let Some(value) = extend_t(value, extend) else {
             continue;
         };
         let Some(stop) = stops.first() else { continue };
@@ -60,7 +60,9 @@ fn gradient(
             continue;
         }
         let end = stops.last().expect("nonempty gradient");
-        if value >= end.offset {
+        // The scalar stop evaluator selects the final stop when a repeating
+        // or reflecting parameter overflows and its reduction produces NaN.
+        if value >= end.offset || value.is_nan() {
             first[lane] = end.color;
             last[lane] = end.color;
             continue;
@@ -235,12 +237,9 @@ impl PaintData {
                 interpolation,
             } => {
                 let (x, y) = apply(*inv, x, y);
-                gradient(
-                    stops,
-                    radial(x, y, *centres, *radii),
-                    *extend,
-                    *interpolation,
-                )
+                let parameter = radial(x, y, *centres, *radii);
+                gradient(stops, parameter, *extend, *interpolation)
+                    .map(|channel| parameter.is_finite().select(channel, f32x4::ZERO))
             }
             Self::Sweep {
                 inv,
@@ -291,6 +290,29 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn vector_gradient_extensions_match_scalar_after_parameter_overflow() {
+        let stops = Arc::from([
+            Stop {
+                offset: 0.0,
+                color: [1.0, 0.0, 0.0, 1.0],
+            },
+            Stop {
+                offset: 1.0,
+                color: [0.0, 1.0, 0.0, 1.0],
+            },
+        ]);
+        for extend in [Extend::Pad, Extend::None, Extend::Repeat, Extend::Reflect] {
+            compare(&PaintData::Linear {
+                inv: [f32::MAX, 0.0, 0.0, 1.0, 0.0, 0.0],
+                end_points: [0.0, 0.0, 1.0, 0.0],
+                stops: Arc::clone(&stops),
+                extend,
+                interpolation: Interpolation::Working,
+            });
         }
     }
 

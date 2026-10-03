@@ -32,6 +32,7 @@ workspace = true
 # (water-rs/nami#27), and the wgpu fork carries the v30 Metal colour-space
 # fix (gfx-rs/wgpu#10175) that surface negotiation on Apple needs.
 [patch.crates-io]
+nami = { git = "https://github.com/water-rs/nami", rev = "6908aac816de14ee5aff23bfffd7d2b109d08fea" }
 nami-core = { git = "https://github.com/water-rs/nami", rev = "6908aac816de14ee5aff23bfffd7d2b109d08fea" }
 naga = { git = "https://github.com/water-rs/wgpu", rev = "4b35d8bc968f6968b3cbae65b6e2e2ee132aa038" }
 naga-types = { git = "https://github.com/water-rs/wgpu", rev = "4b35d8bc968f6968b3cbae65b6e2e2ee132aa038" }
@@ -47,6 +48,9 @@ wgpu-types = { git = "https://github.com/water-rs/wgpu", rev = "4b35d8bc968f6968
 [dependencies]
 cherenkov = { path = "../../.." }
 cherenkov-gpu = { path = "../.." }
+cherenkov-bench = { path = "../../../bench" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std", "fmt"] }
 

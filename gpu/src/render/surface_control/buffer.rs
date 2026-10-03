@@ -56,6 +56,8 @@ pub struct Buffer {
     pub image: vk::Image,
     /// The colour attachment the presenter blits into.
     pub texture: wgpu::Texture,
+    /// Imported allocation size, including the allocator's row and page padding.
+    pub bytes: u64,
     /// Its round-trip state.
     pub state: State,
 }
@@ -70,7 +72,22 @@ pub const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 /// [`NativeError`] when the system cannot allocate the buffer or the device
 /// cannot import it.
 pub fn allocate(shared: &Arc<Shared>, size: (u32, u32), id: u64) -> Result<Buffer, NativeError> {
+    allocate_format(shared, size, id, FORMAT)
+}
+
+/// Allocates the negotiated attachment format, including extended linear P3.
+pub fn allocate_format(
+    shared: &Arc<Shared>,
+    size: (u32, u32),
+    id: u64,
+    format: wgpu::TextureFormat,
+) -> Result<Buffer, NativeError> {
     use ndk_sys::{AHardwareBuffer_Format as Format, AHardwareBuffer_UsageFlags as Usage};
+    let native_format = match format {
+        wgpu::TextureFormat::Rgba8Unorm => Format::AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM,
+        wgpu::TextureFormat::Rgba16Float => Format::AHARDWAREBUFFER_FORMAT_R16G16B16A16_FLOAT,
+        _ => unreachable!("plane attachment format"),
+    };
     let Some(loader) = shared.vk.ahb.as_ref() else {
         return Err(NativeError::Unsupported(
             "VK_ANDROID_external_memory_android_hardware_buffer is not enabled",
@@ -80,7 +97,7 @@ pub fn allocate(shared: &Arc<Shared>, size: (u32, u32), id: u64) -> Result<Buffe
         width: size.0,
         height: size.1,
         layers: 1,
-        format: Format::AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM.0,
+        format: native_format.0,
         usage: Usage::AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER.0
             | Usage::AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE.0
             | Usage::AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY.0,
@@ -93,24 +110,21 @@ pub fn allocate(shared: &Arc<Shared>, size: (u32, u32), id: u64) -> Result<Buffe
         return Err(NativeError::Invalid("AHardwareBuffer_allocate failed"));
     }
     let ahb = Ahb(NonNull::new(raw).expect("a successful allocation returns a buffer"));
-    let (image, memory) = match import(shared, loader, ahb, size) {
+    let (image, memory, bytes) = match import(shared, loader, ahb, size, format) {
         Ok(imported) => imported,
         Err(err) => {
             unsafe { ndk_sys::AHardwareBuffer_release(raw) };
             return Err(err);
         }
     };
-    let texture = wrap(shared, ahb, image, memory, size);
-    crate::diag::create(
-        &shared.wgpu,
-        "plane buffer",
-        u64::from(size.0) * u64::from(size.1) * 4,
-    );
+    let texture = wrap(shared, ahb, image, memory, size, format);
+    crate::diag::create(&shared.wgpu, "plane buffer", bytes);
     Ok(Buffer {
         id,
         ahb,
         image,
         texture,
+        bytes,
         state: State::Free(None),
     })
 }
@@ -121,7 +135,8 @@ fn import(
     loader: &ash::android::external_memory_android_hardware_buffer::Device,
     ahb: Ahb,
     size: (u32, u32),
-) -> Result<(vk::Image, vk::DeviceMemory), NativeError> {
+    format: wgpu::TextureFormat,
+) -> Result<(vk::Image, vk::DeviceMemory, u64), NativeError> {
     let raw = ahb.as_ptr();
     let mut props = vk::AndroidHardwareBufferPropertiesANDROID::default();
     unsafe { loader.get_android_hardware_buffer_properties(raw.cast_const().cast(), &mut props) }?;
@@ -130,7 +145,11 @@ fn import(
         .handle_types(vk::ExternalMemoryHandleTypeFlags::ANDROID_HARDWARE_BUFFER_ANDROID);
     let create = vk::ImageCreateInfo::default()
         .image_type(vk::ImageType::TYPE_2D)
-        .format(vk::Format::R8G8B8A8_UNORM)
+        .format(if format == FORMAT {
+            vk::Format::R8G8B8A8_UNORM
+        } else {
+            vk::Format::R16G16B16A16_SFLOAT
+        })
         .extent(vk::Extent3D {
             width: size.0,
             height: size.1,
@@ -172,7 +191,7 @@ fn import(
             )
     };
     match bound {
-        Ok(memory) => Ok((image, memory)),
+        Ok(memory) => Ok((image, memory, props.allocation_size)),
         Err(err) => {
             unsafe { dev.destroy_image(image, None) };
             Err(err)
@@ -188,6 +207,7 @@ fn wrap(
     image: vk::Image,
     memory: vk::DeviceMemory,
     size: (u32, u32),
+    format: wgpu::TextureFormat,
 ) -> wgpu::Texture {
     let owner = shared.vk.device.clone();
     let drop_callback: wgpu::hal::DropCallback = Box::new(move || unsafe {
@@ -213,7 +233,7 @@ fn wrap(
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: FORMAT,
+                format,
                 usage: wgpu::wgt::TextureUses::COLOR_TARGET,
                 memory_flags: wgpu::hal::MemoryFlags::empty(),
                 view_formats: Vec::new(),
@@ -234,7 +254,7 @@ fn wrap(
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
-                    format: FORMAT,
+                    format,
                     usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
                     view_formats: &[],
                 },

@@ -80,6 +80,8 @@ struct SurfaceState {
     /// on the UI thread. The tracks live there; they need the next frame's
     /// sample at the fast rate class.
     content_animating: bool,
+    /// Track cadence before the backend accepts this frame's handoffs.
+    sampled_rate: Option<RefreshRange>,
     /// Whether the host announced the surface hidden. A hidden surface is
     /// left out of every frame: its tree is not sampled, it is not drawn,
     /// and its per-frame state waits for the frame that shows it.
@@ -456,6 +458,7 @@ fn create_surface<B: Backend>(
             },
             display_moved: false,
             content_animating: false,
+            sampled_rate: None,
             visibility: Visibility::Visible,
             waker,
         },
@@ -719,35 +722,40 @@ fn apply_commits<B: Backend>(
     resources.check(renderer, surfaces)
 }
 
-/// Samples every visible surface's tree at `time` and lists the surface for
-/// the frame. Returns the frame's surfaces and the refresh class the
-/// running animations need — the fast class wins when any surface needs
-/// it. A hidden surface is neither sampled nor listed, so its animations
-/// ask for no frame.
+/// Samples compositor-owned tracks before a commit can retarget them.
+/// Hidden surfaces keep their state until they become visible again.
+fn sample_owned<B: Backend>(
+    renderer: &B::Renderer,
+    surfaces: &mut FxHashMap<SurfaceId, SurfaceState>,
+    time: crate::Instant,
+) {
+    for (id, state) in surfaces
+        .iter_mut()
+        .filter(|(_, state)| state.visibility == Visibility::Visible)
+    {
+        let owned = renderer.owned_animations(*id);
+        if !owned.is_empty() {
+            state
+                .tree
+                .sample_owned(time, |layer| owned.contains(&layer));
+        }
+    }
+}
+
+/// Samples and lists visible surfaces, retaining their cadence until the
+/// backend has accepted or withdrawn this frame's animation handoffs.
 fn sample_frames(
     surfaces: &mut FxHashMap<SurfaceId, SurfaceState>,
     time: crate::Instant,
-) -> (Vec<SurfaceFrame<'_>>, Option<RefreshRange>) {
+) -> Vec<SurfaceFrame<'_>> {
     let mut frames: Vec<SurfaceFrame<'_>> = Vec::with_capacity(surfaces.len());
-    let mut rate = None;
     for (id, state) in surfaces
         .iter_mut()
         .filter(|(_, state)| state.visibility == Visibility::Visible)
     {
         let sampling = state.tree.sample(time, state.display);
         let changed = state.commits != Commits::Clean || sampling.stepped;
-        // Operand animations run on the UI thread and are springs or
-        // curves only: they always need the fast class.
-        let running = if state.content_animating {
-            Some(crate::tree::RATE_FAST)
-        } else {
-            sampling.rate
-        };
-        match running {
-            Some(r) if r == crate::tree::RATE_FAST => rate = Some(crate::tree::RATE_FAST),
-            Some(r) => rate = rate.or(Some(r)),
-            None => {}
-        }
+        state.sampled_rate = sampling.rate;
         frames.push(SurfaceFrame {
             id: *id,
             size: state.size,
@@ -766,22 +774,36 @@ fn sample_frames(
             tree: &state.tree,
         });
     }
-    (frames, rate)
+    frames
 }
 
 /// Consumes the per-frame state of every surface the frame listed, and
 /// answers when the next frame is needed: the animations' refresh class
 /// combined with the backend's.
-fn finish_frame(
+fn finish_frame<B: Backend>(
+    renderer: &B::Renderer,
     surfaces: &mut FxHashMap<SurfaceId, SurfaceState>,
     time: crate::Instant,
-    rate: Option<RefreshRange>,
     redraw: Redraw,
 ) -> Next {
-    for state in surfaces
-        .values_mut()
-        .filter(|state| state.visibility == Visibility::Visible)
+    let mut rate = None;
+    for (id, state) in surfaces
+        .iter_mut()
+        .filter(|(_, state)| state.visibility == Visibility::Visible)
     {
+        let owned = renderer.owned_animations(*id);
+        let running = if state.content_animating {
+            Some(crate::tree::RATE_FAST)
+        } else if owned.is_empty() {
+            state.sampled_rate.take()
+        } else {
+            state.tree.animation_rate(|layer| owned.contains(&layer))
+        };
+        match running {
+            Some(r) if r == crate::tree::RATE_FAST => rate = Some(crate::tree::RATE_FAST),
+            Some(r) => rate = rate.or(Some(r)),
+            None => {}
+        }
         state.commits = Commits::Clean;
         state.plane_frames.clear();
         state.display_moved = false;
@@ -810,8 +832,9 @@ fn render<B: Backend>(
     time: crate::Instant,
     commits: &mut [(SurfaceId, ChangeSet<B>)],
 ) -> Result<(Next, FrameStats), RenderError> {
+    sample_owned::<B>(renderer, surfaces, time);
     apply_commits(renderer, surfaces, resources, commits)?;
-    let (frames, rate) = sample_frames(surfaces, time);
+    let frames = sample_frames(surfaces, time);
     let mut stats = FrameStats::default();
     let redraw = renderer.render(
         &Frame {
@@ -822,7 +845,7 @@ fn render<B: Backend>(
         &mut stats,
     )?;
     drop(frames);
-    Ok((finish_frame(surfaces, time, rate, redraw), stats))
+    Ok((finish_frame::<B>(renderer, surfaces, time, redraw), stats))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -838,8 +861,9 @@ async fn render_local<B: Backend>(
     time: crate::Instant,
     commits: &mut [(SurfaceId, ChangeSet<B>)],
 ) -> Result<(Next, FrameStats), RenderError> {
+    sample_owned::<B>(renderer, surfaces, time);
     apply_commits(renderer, surfaces, resources, commits)?;
-    let (frames, rate) = sample_frames(surfaces, time);
+    let frames = sample_frames(surfaces, time);
     let mut stats = FrameStats::default();
     let redraw = renderer
         .render(
@@ -852,7 +876,7 @@ async fn render_local<B: Backend>(
         )
         .await?;
     drop(frames);
-    Ok((finish_frame(surfaces, time, rate, redraw), stats))
+    Ok((finish_frame::<B>(renderer, surfaces, time, redraw), stats))
 }
 
 #[cfg(all(test, feature = "testing", not(target_arch = "wasm32")))]
@@ -890,6 +914,7 @@ mod tests {
             presentation: Presentation::Retained,
             display_moved: false,
             content_animating: false,
+            sampled_rate: None,
             visibility: Visibility::Visible,
             waker: std::sync::Arc::new(SurfaceWaker::new(std::sync::Arc::new(Waker::new()))),
         };

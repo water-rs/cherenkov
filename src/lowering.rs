@@ -440,6 +440,19 @@ impl<O: Operation, E> Content<O, E> {
         self.list.display_list().references(resource)
     }
 
+    /// Current prepared operations and the source they index. Dirty or
+    /// unprepared content has no current operations. Backends can inspect
+    /// stable content without compiling it a second time.
+    #[must_use]
+    pub fn current(&self) -> Option<(&[O], &DisplayList)> {
+        if self.rebuild || !self.dirty.is_empty() {
+            return None;
+        }
+        self.lowered
+            .as_ref()
+            .map(|lowered| (lowered.ops.as_slice(), self.list.display_list()))
+    }
+
     /// Discard compiled resource references after image `id`'s pixels were
     /// replaced behind the same id. Lowering resolves an image's dimensions,
     /// and on some backends its storage, into the retained operations, so

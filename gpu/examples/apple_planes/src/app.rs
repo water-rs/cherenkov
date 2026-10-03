@@ -85,12 +85,26 @@ pub extern "C" fn cherenkov_planes_start(
 ///
 /// Called from the host's `CADisplayLink` callback on the main thread.
 #[unsafe(no_mangle)]
-pub extern "C" fn cherenkov_planes_tick() {
+pub extern "C" fn cherenkov_planes_tick() -> bool {
+    RUN.with(|cell| cell.borrow_mut().as_mut().is_some_and(Run::tick))
+}
+
+/// True after the device report is persisted; the host can terminate the run.
+#[cfg(target_os = "ios")]
+#[unsafe(no_mangle)]
+pub extern "C" fn cherenkov_planes_finished() -> bool {
     RUN.with(|cell| {
-        if let Some(run) = cell.borrow_mut().as_mut() {
-            run.tick();
-        }
-    });
+        cell.borrow().as_ref().is_some_and(|run| {
+            run.measurement
+                .as_ref()
+                .is_some_and(|measurement| measurement.finished)
+        })
+    })
+}
+
+#[cfg(target_os = "ios")]
+unsafe extern "C" {
+    fn cherenkov_planes_wake();
 }
 
 /// The host calls this from `applicationWillResignActive` and
@@ -133,16 +147,23 @@ pub extern "C" fn cherenkov_planes_resize(width: f64, height: f64, scale: f64) {
 /// `--scenario=<name>`; required, one of the [`scenario::NAMES`]) and
 /// `--paused` (the producer stops after the first frame for the
 /// idle-video measurement).
-fn launch_args() -> (Scenario, bool) {
+fn launch_args() -> (Scenario, bool, Option<String>) {
     let arguments = NSProcessInfo::processInfo().arguments();
     let mut scenario = None;
     let mut paused = false;
+    let mut measure = false;
+    let mut run_id = None;
     let mut i = 1; // argv[0] is the executable
     while i < arguments.count() {
         let arg = arguments.objectAtIndex(i).to_string();
         if arg == "--" {
             // `devicectl process launch … -- args` passes the literal
             // separator through to the process's argv.
+        } else if arg == "--measure" {
+            measure = true;
+        } else if arg == "--run-id" {
+            i += 1;
+            run_id = Some(arguments.objectAtIndex(i).to_string());
         } else if arg == "--paused" {
             paused = true;
         } else if arg == "--scenario" {
@@ -163,7 +184,11 @@ fn launch_args() -> (Scenario, bool) {
         fail(&format!("--scenario is required ({})", scenario::NAMES));
     };
     match Scenario::parse(&name) {
-        Ok(scenario) => (scenario, paused),
+        Ok(scenario) => (
+            scenario,
+            paused,
+            measure.then(|| run_id.expect("--measure needs --run-id")),
+        ),
         Err(e) => fail(&e),
     }
 }
@@ -285,9 +310,12 @@ impl HasDisplayHandle for View {
 
 /// One scenario's running state.
 struct Run {
+    #[cfg(target_os = "ios")]
+    measurement: Option<crate::measurement::Measurement>,
     engine: Engine<Gpu>,
     surface: Surface<Gpu>,
-    video: Video,
+    video: Option<Video>,
+    recorded: Option<crate::recorded::Scene>,
     /// Display-probe channel: the probe arrives on the main queue after
     /// the surface's first part is created.
     probe: std::sync::mpsc::Receiver<cherenkov_gpu::interop::DisplayProbe>,
@@ -343,7 +371,13 @@ impl Run {
         let decisions = observe::install();
         // The arguments gate the dim: a rejected launch never touches
         // the owner's brightness.
-        let (scenario, paused) = launch_args();
+        let (scenario, paused, measure) = launch_args();
+        if measure.is_some() {
+            assert!(
+                matches!(scenario, Scenario::Recorded(spec) if !spec.animated),
+                "the counter window measures continuously ticking recorded content"
+            );
+        }
         dim();
         log::line(&format!(
             "scenario={} starting paused={paused}",
@@ -356,6 +390,8 @@ impl Run {
             ..GpuConfig::default()
         })
         .expect("engine");
+        #[cfg(target_os = "ios")]
+        engine.set_waker(|| unsafe { cherenkov_planes_wake() });
         log::line("engine up");
         let mut target = WindowTarget::new(
             View {
@@ -374,14 +410,17 @@ impl Run {
             .expect("display announcement");
         surface.clear_color(WorkingColor::new([0.01, 0.012, 0.018, 1.0]));
         let built = scenario.build(&surface);
-        let video = Video {
-            layer: built.video,
+        let video = built.video.map(|layer| Video {
+            layer,
             producer: Pool::new(&shared, paused),
-        };
+        });
         Self {
+            #[cfg(target_os = "ios")]
+            measurement: measure.map(crate::measurement::Measurement::new),
             engine,
             surface,
             video,
+            recorded: built.recorded,
             probe,
             headroom: 1.0,
             probe_pending: true,
@@ -406,7 +445,9 @@ impl Run {
         }
         let surface = &self.surface;
         let scenario = self.scenario;
-        surface.update(|tx| scenario.relayout(&mut tx[&self.video.layer], size));
+        if let Some(video) = &self.video {
+            surface.update(|tx| scenario.relayout(&mut tx[&video.layer], size));
+        }
         let _ = self.surface.display(Display {
             scale,
             headroom: self.headroom,
@@ -414,7 +455,7 @@ impl Run {
     }
 
     /// One display-link frame.
-    fn tick(&mut self) {
+    fn tick(&mut self) -> bool {
         // A display-probe reply rides the main queue between frames:
         // once the surface's parts exist, announce the live headroom.
         if self.probe_pending
@@ -429,6 +470,13 @@ impl Run {
             log::line(&format!("display headroom {}", self.headroom));
         }
         let (thermal_name, hot) = thermal();
+        #[cfg(target_os = "ios")]
+        if let Some(measurement) = &mut self.measurement {
+            assert!(!hot, "thermal state invalidated the measurement window");
+            measurement.begin_frame();
+        }
+        #[cfg(target_os = "ios")]
+        let frame_start = Instant::now();
         if hot && !self.cooling {
             self.cooling = true;
             log::error("thermal state serious — pausing production to let the device cool");
@@ -437,22 +485,31 @@ impl Run {
             log::line("thermal state recovered — resuming production");
         }
         if !self.cooling
-            && let Some(frame) = self.video.producer.produce()
+            && let Some(video) = &mut self.video
+            && let Some(frame) = video.producer.produce()
         {
             let handle = self.engine.external_frame(frame);
             let surface = &self.surface;
             surface.update(|tx| {
-                tx[&self.video.layer].content(handle);
+                tx[&video.layer].content(handle);
             });
             self.presented += 1;
         }
-        match self.engine.render(FrameTime::now()) {
-            Ok(_) => {
-                self.video.producer.rendered();
+        if !self.cooling
+            && let Some(scene) = &mut self.recorded
+        {
+            scene.tick(&self.surface);
+        }
+        let idle = match self.engine.render(FrameTime::now()) {
+            Ok(next) => {
+                if let Some(video) = &mut self.video {
+                    video.producer.rendered();
+                }
                 if !self.logged.first_frame {
                     self.logged.first_frame = true;
                     log::line("first engine frame rendered");
                 }
+                next == cherenkov::Next::Idle
             }
             Err(e) => {
                 // A dead render thread leaves the harness logging a
@@ -460,9 +517,11 @@ impl Run {
                 // instead of looking alive.
                 die(&format!("render failed: {e}"));
             }
-        }
-        if !self.logged.verdict {
-            let layer = self.video.layer.id().raw();
+        };
+        if !self.logged.verdict
+            && let Some(video) = &self.video
+        {
+            let layer = video.layer.id().raw();
             let decision = self.decisions.decision(layer);
             if decision != "unseen" {
                 self.logged.verdict = true;
@@ -472,20 +531,63 @@ impl Run {
             }
         }
         let now = Instant::now();
-        if now >= self.next_log {
+        #[cfg(target_os = "ios")]
+        if let Some(measurement) = &mut self.measurement {
+            let scene = self.recorded.as_ref().expect("recorded measurement");
+            measurement.end_frame(
+                frame_start,
+                now,
+                scene.spec,
+                self.decisions.decision(scene.layers[0].id().raw()),
+                || self.engine.memory(),
+            );
+        }
+        let pause = idle
+            && self.recorded.as_ref().is_some_and(|scene| {
+                scene.spec.animated && scene.frames >= 4 && scene.spec.lifetime == 0
+            });
+        self.heartbeat(now, pause, thermal_name);
+        pause
+    }
+
+    fn heartbeat(&mut self, now: Instant, pause: bool, thermal_name: &str) {
+        if now >= self.next_log || pause {
             self.next_log = now + Duration::from_secs(1);
-            let layer = self.video.layer.id().raw();
-            log::line(&format!(
-                "scenario={} frame={} layer=LayerId({}) decision={} fill={}ms import={}ms stalls={} thermal={}",
-                self.scenario.name(),
-                self.presented,
-                layer,
-                self.decisions.decision(layer),
-                self.video.producer.fill_ms,
-                self.video.producer.import_ms,
-                self.video.producer.stalls,
-                thermal_name,
-            ));
+            if let Some(scene) = &self.recorded {
+                let memory = self.engine.memory();
+                for layer in &scene.layers {
+                    log::line(&format!(
+                        "scenario={} side={} count={} lifetime={} engine={} frame={} layer=LayerId({}) decision={} gpu_bytes={} cpu_bytes={} passes={} idle={} thermal={}",
+                        self.scenario.name(),
+                        scene.spec.side,
+                        scene.spec.count,
+                        scene.spec.lifetime,
+                        scene.spec.engine,
+                        scene.frames,
+                        layer.id().raw(),
+                        self.decisions.decision(layer.id().raw()),
+                        memory.gpu.0,
+                        memory.cpu.0,
+                        self.engine.stats().passes,
+                        pause,
+                        thermal_name
+                    ));
+                }
+            }
+            if let Some(video) = &self.video {
+                let layer = video.layer.id().raw();
+                log::line(&format!(
+                    "scenario={} frame={} layer=LayerId({}) decision={} fill={}ms import={}ms stalls={} thermal={}",
+                    self.scenario.name(),
+                    self.presented,
+                    layer,
+                    self.decisions.decision(layer),
+                    video.producer.fill_ms,
+                    video.producer.import_ms,
+                    video.producer.stalls,
+                    thermal_name,
+                ));
+            }
             self.presented = 0;
         }
     }

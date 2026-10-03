@@ -55,8 +55,8 @@ pub use parley;
 pub use web_time::Instant;
 
 pub use crate::animation::{
-    Animatable, Animation, Curve, Decay, Lanes, Spring, curve_value, decay_step, settled,
-    spring_step,
+    Animatable, Animation, AnimationTrack, Curve, Decay, Lanes, Spring, curve_value, decay_step,
+    settled, spring_step,
 };
 pub use crate::backdrop::{
     BackdropEffect, BackdropShaderEffect, BackdropShaderSource, ColorMatrix, Refraction, Rim,
@@ -113,5 +113,5 @@ pub use crate::surface::{
     Surface, Transaction,
 };
 pub use crate::text::TextLayout;
-pub use crate::tree::{LayerNode, SurfaceTree, snap_animating};
+pub use crate::tree::{LayerAnimations, LayerNode, SurfaceTree, snap_animating};
 pub use kurbo::Stroke;

@@ -37,9 +37,13 @@
 //! until the device cools.
 
 mod log;
+#[cfg(target_os = "ios")]
+mod measurement;
 pub mod observe;
 #[path = "../../android_planes/src/pattern.rs"]
 pub mod pattern;
+#[path = "../../planes_common/recorded.rs"]
+pub mod recorded;
 pub mod scenario;
 
 #[cfg(target_vendor = "apple")]

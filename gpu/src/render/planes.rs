@@ -28,6 +28,39 @@ use crate::interop::ExternalFrame;
 use crate::render::lower::axis_aligned;
 use crate::render::present::Presenter;
 
+#[cfg(target_vendor = "apple")]
+mod animation;
+
+pub mod static_layer;
+
+/// A plane buffer's extent and texel-to-content transform. External frames
+/// use identity; recorded layers have a local raster origin and density.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Candidate {
+    /// Raster extent.
+    pub size: (u32, u32),
+    /// Buffer texels to layer content coordinates.
+    pub raster: Affine,
+    /// External frames receive the budget before recorded captures.
+    pub source: Source,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Source {
+    Frame,
+    Recorded,
+}
+
+impl From<(u32, u32)> for Candidate {
+    fn from(size: (u32, u32)) -> Self {
+        Self {
+            size,
+            raster: Affine::IDENTITY,
+            source: Source::Frame,
+        }
+    }
+}
+
 /// What a platform's system compositor can express, which bounds promotion.
 pub trait Compositor {
     /// The most layers promoted on one surface. Every promoted layer adds
@@ -145,8 +178,12 @@ impl Level {
 pub struct Placement {
     /// The promoted layer.
     pub layer: LayerId,
+    /// The native buffer realization committed for this content.
+    pub source: Source,
     /// The content rectangle `(0, 0, w, h)` in the layer's content space.
     pub size: (u32, u32),
+    /// Buffer texels to the layer's content space.
+    pub raster: Affine,
     /// The layer's opacity; every ancestor is opaque by eligibility.
     pub opacity: f32,
     /// The root first, the promoted layer last.
@@ -167,7 +204,7 @@ impl Placement {
     pub fn content_to_device(&self) -> Affine {
         self.path.iter().fold(Affine::IDENTITY, |acc, level| {
             acc * level.content_transform()
-        })
+        }) * self.raster
     }
 }
 
@@ -248,6 +285,7 @@ pub struct PlanScratch {
     backdrop_above: Vec<Option<LayerId>>,
     blend_above: Vec<Option<LayerId>>,
     device: Vec<VisitDevice>,
+    decisions: Vec<(usize, Result<(), Ineligible>)>,
 }
 
 /// Every layer in paint order: a layer's content, then its children —
@@ -362,14 +400,15 @@ fn suffixes(
 fn verdicts<'a, C: Compositor>(
     tree: &'a SurfaceTree,
     order: &'a [Visit],
-    candidates: &'a FxHashMap<LayerId, (u32, u32)>,
+    candidates: &'a FxHashMap<LayerId, Candidate>,
     ready: &'a FxHashSet<LayerId>,
-    backdrop_above: &'a [Option<LayerId>],
-    blend_above: &'a [Option<LayerId>],
+    above: (&'a [Option<LayerId>], &'a [Option<LayerId>]),
     device: &'a [VisitDevice],
+    decisions: &'a mut Vec<(usize, Result<(), Ineligible>)>,
 ) -> impl Iterator<Item = (usize, Result<(), Ineligible>)> + 'a {
-    let mut promoted = 0;
-    order.iter().enumerate().filter_map(move |(i, visit)| {
+    let (backdrop_above, blend_above) = above;
+    decisions.clear();
+    decisions.extend(order.iter().enumerate().filter_map(move |(i, visit)| {
         let &size = candidates.get(&visit.id)?;
         if !ready.contains(&visit.id) {
             return None;
@@ -383,37 +422,60 @@ fn verdicts<'a, C: Compositor>(
             blend_above[i + 1],
             device,
         );
-        Some((
-            i,
-            match verdict {
-                Ok(()) if promoted >= C::BUDGET => Err(Ineligible::Budget(C::BUDGET)),
-                Ok(()) => {
+        Some((i, verdict))
+    }));
+    let mut promoted = 0;
+    for source in [Source::Frame, Source::Recorded] {
+        for (i, verdict) in decisions.iter_mut() {
+            if candidates[&order[*i].id].source == source && verdict.is_ok() {
+                if promoted < C::BUDGET {
                     promoted += 1;
-                    Ok(())
+                } else {
+                    *verdict = Err(Ineligible::Budget(C::BUDGET));
                 }
-                Err(cause) => Err(cause),
-            },
-        ))
-    })
+            }
+        }
+    }
+    decisions.drain(..)
 }
 
 /// Decides which of `candidates` (layer to content size) the platform
 /// reports `ready` are promoted this frame on a surface realized by
 /// compositor `C`.
 ///
-/// Offered candidates are judged in paint order and the budget goes to
-/// the first eligible ones, so the decision depends only on the tree and
-/// the offered set.
+/// Eligible external frames receive the budget before recorded captures;
+/// ties within each class use paint order. Output remains in paint order.
 #[must_use]
 pub fn plan<C: Compositor>(
     tree: &SurfaceTree,
-    candidates: &FxHashMap<LayerId, (u32, u32)>,
+    candidates: &FxHashMap<LayerId, Candidate>,
     ready: &FxHashSet<LayerId>,
 ) -> Plan {
+    let mut result = Plan::default();
+    plan_with::<C>(
+        tree,
+        candidates,
+        ready,
+        &mut PlanScratch::default(),
+        &mut result,
+    );
+    result
+}
+
+/// Rebuild a plan while retaining its workspace and placement-path buffers.
+pub fn plan_with<C: Compositor>(
+    tree: &SurfaceTree,
+    candidates: &FxHashMap<LayerId, Candidate>,
+    ready: &FxHashSet<LayerId>,
+    scratch: &mut PlanScratch,
+    plan: &mut Plan,
+) {
+    plan.rejected.clear();
     if candidates.is_empty() {
-        return Plan::default();
+        plan.planes.clear();
+        plan.trailing = false;
+        return;
     }
-    let mut scratch = PlanScratch::default();
     let PlanScratch {
         order,
         pool,
@@ -421,32 +483,44 @@ pub fn plan<C: Compositor>(
         backdrop_above,
         blend_above,
         device,
-    } = &mut scratch;
+        decisions,
+    } = scratch;
     let order = paint_order(tree, order, pool, stack);
     suffixes(tree, order, backdrop_above, blend_above);
     devices(tree, order, device);
-    let mut plan = Plan::default();
+    let mut promoted = 0;
     let mut last = None;
     for (i, verdict) in verdicts::<C>(
         tree,
         order,
         candidates,
         ready,
-        backdrop_above,
-        blend_above,
+        (backdrop_above, blend_above),
         device,
+        decisions,
     ) {
         match verdict {
             Ok(()) => {
                 last = Some(i);
-                plan.planes
-                    .push(placement(tree, order, i, candidates[&order[i].id]));
+                let size = candidates[&order[i].id];
+                if promoted == plan.planes.len() {
+                    plan.planes.push(Placement {
+                        layer: order[i].id,
+                        source: size.source,
+                        size: size.size,
+                        raster: size.raster,
+                        opacity: 1.0,
+                        path: Vec::new(),
+                    });
+                }
+                placement(tree, order, i, size, &mut plan.planes[promoted]);
+                promoted += 1;
             }
             Err(cause) => plan.rejected.push((order[i].id, cause)),
         }
     }
+    plan.planes.truncate(promoted);
     plan.trailing = last.is_some_and(|i| i + 1 < order.len());
-    plan
 }
 
 /// Whether `order[i]`'s placement for content `size` is `placed` — the
@@ -455,12 +529,12 @@ fn placement_eq(
     tree: &SurfaceTree,
     order: &[Visit],
     i: usize,
-    size: (u32, u32),
+    size: Candidate,
     placed: &Placement,
 ) -> bool {
     let visit = &order[i];
-    placed.layer == visit.id
-        && placed.size == size
+    (placed.layer, placed.size, placed.raster, placed.source)
+        == (visit.id, size.size, size.raster, size.source)
         && placed.opacity == tree.layer(visit.id).opacity
         && placed.path.len() == visit.ancestors.len() + 1
         && visit
@@ -484,7 +558,7 @@ fn placement_eq(
 fn same_plan<C: Compositor>(
     committed: &Plan,
     tree: &SurfaceTree,
-    candidates: &FxHashMap<LayerId, (u32, u32)>,
+    candidates: &FxHashMap<LayerId, Candidate>,
     ready: &FxHashSet<LayerId>,
     scratch: &mut PlanScratch,
 ) -> bool {
@@ -498,6 +572,7 @@ fn same_plan<C: Compositor>(
         backdrop_above,
         blend_above,
         device,
+        decisions,
     } = scratch;
     let order = paint_order(tree, order, pool, stack);
     suffixes(tree, order, backdrop_above, blend_above);
@@ -510,9 +585,9 @@ fn same_plan<C: Compositor>(
         order,
         candidates,
         ready,
-        backdrop_above,
-        blend_above,
+        (backdrop_above, blend_above),
         device,
+        decisions,
     ) {
         match verdict {
             Ok(()) => {
@@ -542,7 +617,7 @@ fn judge<C: Compositor>(
     tree: &SurfaceTree,
     order: &[Visit],
     i: usize,
-    size: (u32, u32),
+    size: Candidate,
     backdrop_above: Option<LayerId>,
     blend_above: Option<LayerId>,
     device: &[VisitDevice],
@@ -607,11 +682,11 @@ fn judge<C: Compositor>(
     }
     // The plane shows the frame inside the path's clips only: content a
     // clip cuts away cannot overlap a layer above.
-    let rect = device[i].space.transform_rect_bbox(Rect::new(
+    let rect = (device[i].space * size.raster).transform_rect_bbox(Rect::new(
         0.0,
         0.0,
-        f64::from(size.0),
-        f64::from(size.1),
+        f64::from(size.size.0),
+        f64::from(size.size.1),
     ));
     let rect = device[i]
         .bounds
@@ -629,29 +704,36 @@ fn judge<C: Compositor>(
     Ok(())
 }
 
-fn placement(tree: &SurfaceTree, order: &[Visit], i: usize, size: (u32, u32)) -> Placement {
+fn placement(
+    tree: &SurfaceTree,
+    order: &[Visit],
+    i: usize,
+    size: Candidate,
+    placed: &mut Placement,
+) {
     let visit = &order[i];
-    let path = visit
-        .ancestors
-        .iter()
-        .map(|&a| order[a].id)
-        .chain([visit.id])
-        .map(|id| {
-            let node = tree.layer(id);
-            Level {
-                layer: id,
-                transform: node.transform,
-                clip: node.clip.clone(),
-                scroll: node.scroll_offset,
-            }
-        })
-        .collect();
-    Placement {
-        layer: visit.id,
-        size,
-        opacity: tree.layer(visit.id).opacity,
-        path,
-    }
+    placed.path.clear();
+    placed.path.extend(
+        visit
+            .ancestors
+            .iter()
+            .map(|&a| order[a].id)
+            .chain([visit.id])
+            .map(|id| {
+                let node = tree.layer(id);
+                Level {
+                    layer: id,
+                    transform: node.transform,
+                    clip: node.clip.clone(),
+                    scroll: node.scroll_offset,
+                }
+            }),
+    );
+    placed.layer = visit.id;
+    placed.source = size.source;
+    placed.size = size.size;
+    placed.raster = size.raster;
+    placed.opacity = tree.layer(visit.id).opacity;
 }
 
 /// Whether a frame whose only committed change is new external frames on
@@ -669,7 +751,7 @@ fn placement(tree: &SurfaceTree, order: &[Visit], i: usize, size: (u32, u32)) ->
 pub fn frames_only<C: Compositor>(
     plan: &Plan,
     tree: &SurfaceTree,
-    candidates: &FxHashMap<LayerId, (u32, u32)>,
+    candidates: &FxHashMap<LayerId, Candidate>,
     ready: &FxHashSet<LayerId>,
     layers: &FxHashSet<LayerId>,
     scratch: &mut PlanScratch,
@@ -691,6 +773,13 @@ pub fn frames_only<C: Compositor>(
     )
 )]
 pub enum PlaneContent<'a> {
+    /// An immutable capture of a recorded layer in linear Display P3.
+    Raster {
+        /// Pixels for a new native capture; absent after publication.
+        view: Option<&'a wgpu::TextureView>,
+        /// The capture's content version.
+        generation: u64,
+    },
     /// A retained external frame, handed to the system compositor instead of
     /// being sampled by the engine.
     Frame {
@@ -761,6 +850,17 @@ pub struct Composition<'a> {
     pub planes: &'a [Plane<'a>],
 }
 
+/// Whether presentation finished or which event must resume it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Presentation {
+    Presented,
+    /// Drawable availability requires another display frame.
+    Retry,
+    /// A queued operation will wake the surface when it completes.
+    #[cfg(target_vendor = "apple")]
+    Pending,
+}
+
 /// A platform's realization of a surface's planes under the host's
 /// system-compositor parent.
 ///
@@ -768,14 +868,29 @@ pub struct Composition<'a> {
 /// frame with the whole stack; the realization makes the system tree match
 /// it, atomically where the platform allows, and presents the parts.
 pub trait SystemPlanes: Compositor {
-    /// Realizes `composition`. Returns false when a part's drawable was not
-    /// available (the window is occluded or the acquire timed out): nothing
-    /// changed on screen, and the engine composes again on the next frame.
+    /// Native immutable capture allocations, excluding the engine's source.
+    fn captured_bytes(&self) -> u64 {
+        0
+    }
+    /// Hands supported tracks to the committed native layer tree. Called
+    /// only after a successful presentation of `plan`.
+    fn animate(&mut self, _tree: &SurfaceTree, _plan: &Plan) {}
+
+    /// Layers whose complete property animation is compositor-owned.
+    fn owned_animations(&self) -> &[LayerId] {
+        &[]
+    }
+
+    /// Withdraws scheduling ownership when this frame could not present.
+    fn withdraw_animations(&mut self) {}
+
+    /// Realizes `composition`, distinguishing display-paced acquisition
+    /// from asynchronous work that supplies its own completion wake.
     ///
     /// # Errors
     /// A [`RenderError`] naming the cause when the system rejects a plane
     /// or a part cannot be presented.
-    fn compose(&mut self, composition: Composition<'_>) -> Result<bool, RenderError>;
+    fn compose(&mut self, composition: Composition<'_>) -> Result<Presentation, RenderError>;
 
     /// Presents only the promoted planes' new frames: `frames` carries
     /// every promoted layer whose frame changed this frame, inside the
@@ -795,7 +910,7 @@ pub trait SystemPlanes: Compositor {
     /// render admission for every promotion-capable surface, dirty or
     /// not, so a deferred realization that completes between renders is
     /// seen on the next one.
-    fn groom(&mut self, candidates: &FxHashMap<LayerId, (u32, u32)>) {
+    fn groom(&mut self, candidates: &FxHashMap<LayerId, Candidate>) {
         let _ = candidates;
     }
 
@@ -804,7 +919,7 @@ pub trait SystemPlanes: Compositor {
     /// behavior unchanged.
     fn groom_with_frames(
         &mut self,
-        candidates: &FxHashMap<LayerId, (u32, u32)>,
+        candidates: &FxHashMap<LayerId, Candidate>,
         frames: &FxHashMap<LayerId, (ExternalFrame, u64)>,
     ) {
         let _ = frames;
@@ -828,7 +943,7 @@ pub trait SystemPlanes: Compositor {
     /// synchronous realizations.
     fn prepare(
         &mut self,
-        candidates: &FxHashMap<LayerId, (u32, u32)>,
+        candidates: &FxHashMap<LayerId, Candidate>,
         frames: &FxHashMap<LayerId, (ExternalFrame, u64)>,
         ready: &mut FxHashSet<LayerId>,
     ) {
@@ -888,7 +1003,7 @@ impl Compositor for NoPlanes {
 
 #[cfg(not(any(target_vendor = "apple", target_os = "android")))]
 impl SystemPlanes for NoPlanes {
-    fn compose(&mut self, _: Composition<'_>) -> Result<bool, RenderError> {
+    fn compose(&mut self, _: Composition<'_>) -> Result<Presentation, RenderError> {
         unreachable!("no `NoPlanes` value exists")
     }
     fn refresh<'a>(&mut self, _: impl Iterator<Item = Plane<'a>>) -> Result<(), RenderError> {

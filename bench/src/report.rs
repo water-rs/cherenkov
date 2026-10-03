@@ -169,9 +169,12 @@ pub struct RailEnergy {
 /// `/sys/bus/iio/devices/iio:device*/` sampled once before the first
 /// measured frame and once after the last; on macOS it is the
 /// `powermetrics` CPU/GPU/ANE package energy over the same window.
+/// On iOS it is the calling process's `ri_energy_nj` delta, excluding
+/// display and compositor-server energy.
 #[derive(Clone, Debug, Serialize)]
 pub struct EnergyReport {
-    /// Meter source: `odpm` or `powermetrics`.
+    /// Meter source: `odpm`, `powermetrics` or `proc_pid_rusage_v6`.
+    /// The iOS source covers only the measured process.
     pub source: &'static str,
     /// Seconds the energy window covered.
     pub window_seconds: f64,

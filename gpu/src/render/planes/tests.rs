@@ -1,10 +1,73 @@
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
+
 use kurbo::{Affine, Rect, RoundedRect, Vec2};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use cherenkov::testing::LayerOp;
 use cherenkov::{BlendMode, FilterId, LayerId, Prop, ShapeData, SurfaceTree};
 
-use super::{Compositor, Ineligible, Level, Plan, PlanScratch, frames_only, plan};
+mod alloc_counter {
+    use std::cell::Cell;
+
+    thread_local! {
+        pub(super) static TRACKING: Cell<bool> = const { Cell::new(false) };
+        pub(super) static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+        pub(super) static REALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+    }
+}
+
+use alloc_counter::{ALLOCATIONS, REALLOCATIONS, TRACKING};
+
+struct ThreadAllocator;
+
+#[global_allocator]
+static ALLOCATOR: ThreadAllocator = ThreadAllocator;
+
+unsafe impl GlobalAlloc for ThreadAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let pointer = unsafe { System.alloc(layout) };
+        if TRACKING.try_with(Cell::get).unwrap_or(false) {
+            let _ = ALLOCATIONS.try_with(|count| count.set(count.get() + 1));
+        }
+        pointer
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        let pointer = unsafe { System.alloc_zeroed(layout) };
+        if TRACKING.try_with(Cell::get).unwrap_or(false) {
+            let _ = ALLOCATIONS.try_with(|count| count.set(count.get() + 1));
+        }
+        pointer
+    }
+
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(pointer, layout) };
+    }
+
+    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+        let pointer = unsafe { System.realloc(pointer, layout, size) };
+        if TRACKING.try_with(Cell::get).unwrap_or(false) {
+            let _ = REALLOCATIONS.try_with(|count| count.set(count.get() + 1));
+        }
+        pointer
+    }
+}
+
+fn start_tracking() {
+    ALLOCATIONS.with(|count| count.set(0));
+    REALLOCATIONS.with(|count| count.set(0));
+    TRACKING.with(|tracking| tracking.set(true));
+}
+
+fn stop_tracking() -> (usize, usize) {
+    TRACKING.with(|tracking| tracking.set(false));
+    (ALLOCATIONS.with(Cell::get), REALLOCATIONS.with(Cell::get))
+}
+
+use super::{
+    Candidate, Compositor, Ineligible, Level, Plan, PlanScratch, Source, frames_only, plan,
+};
 use crate::render::lower::axis_aligned;
 
 /// A compositor that carries axis-aligned transforms and rect or
@@ -31,6 +94,64 @@ const BELOW: LayerId = LayerId::new(3);
 const PARENT: LayerId = LayerId::new(4);
 const SIZE: (u32, u32) = (320, 180);
 
+#[test]
+fn pose_plans_reuse_workspace_and_placement_paths() {
+    let mut tree = scene();
+    let candidates = video();
+    let ready = candidates.keys().copied().collect();
+    let mut scratch = PlanScratch::default();
+    let mut output = Plan::default();
+    for _ in 0..3 {
+        super::plan_with::<Test>(&tree, &candidates, &ready, &mut scratch, &mut output);
+    }
+    let buffers = (
+        std::ptr::from_ref(&scratch.order[0]),
+        scratch.decisions.as_ptr(),
+        output.planes.as_ptr(),
+        output.planes[0].path.as_ptr(),
+    );
+    for x in 0..10 {
+        tree.apply(LayerOp::Transform(
+            VIDEO,
+            prop(Affine::translate((f64::from(x), 0.))),
+        ));
+        super::plan_with::<Test>(&tree, &candidates, &ready, &mut scratch, &mut output);
+        assert_eq!(output, plan::<Test>(&tree, &candidates, &ready));
+        assert_eq!(
+            buffers,
+            (
+                std::ptr::from_ref(&scratch.order[0]),
+                scratch.decisions.as_ptr(),
+                output.planes.as_ptr(),
+                output.planes[0].path.as_ptr()
+            )
+        );
+    }
+}
+
+#[test]
+fn steady_pose_plan_allocates_nothing() {
+    let mut tree = scene();
+    let candidates = video();
+    let ready = candidates.keys().copied().collect();
+    let mut scratch = PlanScratch::default();
+    let mut output = Plan::default();
+    for _ in 0..4 {
+        super::plan_with::<Test>(&tree, &candidates, &ready, &mut scratch, &mut output);
+    }
+    for x in 0..8 {
+        tree.apply(LayerOp::Transform(
+            VIDEO,
+            prop(Affine::translate((f64::from(x), 0.))),
+        ));
+        start_tracking();
+        super::plan_with::<Test>(&tree, &candidates, &ready, &mut scratch, &mut output);
+        let counts = stop_tracking();
+        assert_eq!(counts, (0, 0), "pose {x}");
+    }
+    assert_eq!(output, plan::<Test>(&tree, &candidates, &ready));
+}
+
 const fn prop<T>(target: T) -> Prop<T> {
     Prop {
         target,
@@ -56,12 +177,12 @@ fn scene() -> SurfaceTree {
     tree
 }
 
-fn video() -> FxHashMap<LayerId, (u32, u32)> {
-    std::iter::once((VIDEO, SIZE)).collect()
+fn video() -> FxHashMap<LayerId, super::Candidate> {
+    std::iter::once((VIDEO, SIZE.into())).collect()
 }
 
 /// The ready set when every candidate's realization is complete.
-fn all_ready(candidates: &FxHashMap<LayerId, (u32, u32)>) -> FxHashSet<LayerId> {
+fn all_ready(candidates: &FxHashMap<LayerId, super::Candidate>) -> FxHashSet<LayerId> {
     candidates.keys().copied().collect()
 }
 
@@ -217,7 +338,7 @@ fn a_translucent_layer_beyond_the_clip_does_not_block_promotion() {
         ABOVE,
         Some(ShapeData::Rect(Rect::new(8.0, 58.0, 88.0, 64.0))),
     ));
-    let candidates: FxHashMap<_, _> = std::iter::once((VIDEO, (48, 32))).collect();
+    let candidates: FxHashMap<_, _> = std::iter::once((VIDEO, (48, 32).into())).collect();
     let plan = plan::<Test>(&tree, &candidates, &all_ready(&candidates));
     assert_eq!(plan.planes.len(), 1, "{:?}", plan.rejected);
 }
@@ -280,9 +401,13 @@ fn nested_shaped_clips_are_not_promoted() {
 #[test]
 fn the_budget_goes_to_the_first_candidates_in_paint_order() {
     let tree = scene();
-    let candidates: FxHashMap<_, _> = [(BELOW, SIZE), (VIDEO, SIZE), (ABOVE, SIZE)]
-        .into_iter()
-        .collect();
+    let candidates: FxHashMap<_, _> = [
+        (BELOW, SIZE.into()),
+        (VIDEO, SIZE.into()),
+        (ABOVE, SIZE.into()),
+    ]
+    .into_iter()
+    .collect();
     let plan = plan::<Test>(&tree, &candidates, &all_ready(&candidates));
     assert_eq!(
         plan.planes.iter().map(|p| p.layer).collect::<Vec<_>>(),
@@ -291,6 +416,26 @@ fn the_budget_goes_to_the_first_candidates_in_paint_order() {
     assert_eq!(plan.rejected, [(ABOVE, Ineligible::Budget(Test::BUDGET))]);
     assert!(plan.trailing);
     assert_eq!(plan.parts(), 3);
+}
+
+#[test]
+fn video_receives_the_budget_before_earlier_recorded_layers() {
+    let tree = scene();
+    let mut recorded = Candidate::from(SIZE);
+    recorded.source = Source::Recorded;
+    let candidates: FxHashMap<_, _> = [
+        (BELOW, recorded),
+        (VIDEO, SIZE.into()),
+        (ABOVE, SIZE.into()),
+    ]
+    .into_iter()
+    .collect();
+    let plan = plan::<Test>(&tree, &candidates, &all_ready(&candidates));
+    assert_eq!(
+        plan.planes.iter().map(|p| p.layer).collect::<Vec<_>>(),
+        [VIDEO, ABOVE]
+    );
+    assert_eq!(plan.rejected, [(BELOW, Ineligible::Budget(Test::BUDGET))]);
 }
 
 /// The path carries each level's sampled properties, so the content lands
@@ -395,7 +540,7 @@ fn a_plane_only_frame_presents_through_the_planes_alone() {
     ));
 
     // A differently sized frame on the same layer changes its placement.
-    let resized: FxHashMap<_, _> = std::iter::once((VIDEO, (640, 360))).collect();
+    let resized: FxHashMap<_, _> = std::iter::once((VIDEO, (640, 360).into())).collect();
     assert!(!frames_only::<Test>(
         &committed,
         &tree,
@@ -408,7 +553,7 @@ fn a_plane_only_frame_presents_through_the_planes_alone() {
     // A first frame on another layer makes it a candidate, which changes
     // the plan — here by adding a second promotion.
     let mut two = video();
-    two.insert(BELOW, SIZE);
+    two.insert(BELOW, SIZE.into());
     assert!(!frames_only::<Test>(
         &committed,
         &tree,
@@ -429,6 +574,25 @@ fn a_plane_only_frame_presents_through_the_planes_alone() {
     ));
 }
 
+#[test]
+fn replacing_a_capture_with_a_frame_rebuilds_the_native_stack() {
+    let tree = scene();
+    let mut candidates = video();
+    candidates.get_mut(&VIDEO).expect("candidate").source = Source::Recorded;
+    let ready = all_ready(&candidates);
+    let committed = plan::<Test>(&tree, &candidates, &ready);
+    candidates.get_mut(&VIDEO).expect("candidate").source = Source::Frame;
+    let updates = std::iter::once(VIDEO).collect();
+    assert!(!frames_only::<Test>(
+        &committed,
+        &tree,
+        &candidates,
+        &ready,
+        &updates,
+        &mut PlanScratch::default()
+    ));
+}
+
 /// A candidate whose realization is still pending is absent from the
 /// committed plan's verdicts — pendingness is not a plan change, so it
 /// never blocks the plane-only path; its readiness does (#90).
@@ -438,7 +602,7 @@ fn a_pending_candidate_does_not_block_a_plane_only_frame() {
     // `BELOW` gained a plane-capable frame but its realization is still
     // pending: a candidate, not yet ready.
     let mut candidates = video();
-    candidates.insert(BELOW, SIZE);
+    candidates.insert(BELOW, SIZE.into());
     let just_video: FxHashSet<LayerId> = std::iter::once(VIDEO).collect();
     let committed = plan::<Test>(&tree, &candidates, &just_video);
     assert_eq!(committed.planes.len(), 1);

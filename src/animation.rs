@@ -144,6 +144,23 @@ pub trait Animatable: Copy + Send + 'static {
     fn from_lanes(lanes: Self::Lanes) -> Self;
 }
 
+/// An immutable description of a running property animation. Backends use
+/// the original presentation-clock start, rather than restarting a curve
+/// when a layer becomes eligible for compositor ownership.
+#[derive(Clone, Copy)]
+pub struct AnimationTrack<T: Animatable> {
+    /// Value at the start, before any interpolation.
+    pub from: T,
+    /// Initial velocity in property units per second, independently per lane.
+    pub velocity: T::Lanes,
+    /// Final property value.
+    pub target: T,
+    /// The curve or physical spring.
+    pub animation: Animation,
+    /// The first presentation time at which the track was sampled.
+    pub start: Instant,
+}
+
 impl Animatable for f64 {
     type Lanes = [Self; 1];
     fn into_lanes(self) -> Self::Lanes {

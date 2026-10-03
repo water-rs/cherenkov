@@ -8,7 +8,9 @@
 // the main thread; a rejected launch aborts the process with a message
 // in os_log.
 void cherenkov_planes_start(const void *view, double width, double height, double scale);
-void cherenkov_planes_tick(void);
+#include <stdbool.h>
+bool cherenkov_planes_tick(void);
+bool cherenkov_planes_finished(void);
 void cherenkov_planes_resize(double width, double height, double scale);
 
 // The run dims the panel to its minimum for the measurement and hands

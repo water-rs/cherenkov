@@ -8,29 +8,39 @@ e,c,e,c then the reversed control c,e,c,e — so drift cancels. The
 battery/thermal gate is checked before every measured window, with the
 screen off the whole time (the bench draws offscreen).
 
+A run is accepted only when the remote report exists, pulls cleanly
+and `verify` matches the cell. The remote path is removed before the
+run, so a previous report cannot be pulled. Success is that file, not
+a substring of the bench's stdout.
+
 Raw reports land in `--out-dir` (default /tmp/external-cost-pixel),
 never in git.
 """
 
 import argparse
 import datetime
+import hashlib
 import json
 import pathlib
 import re
 import subprocess
 import time
+import uuid
+
+from external_cost_matrix import (
+    CELLS,
+    FRAMES,
+    ORDERS,
+    RATE,
+    WARMUP,
+    args_for,
+    order_name,
+    verify,
+)
 
 BENCH = "/data/local/tmp/cherenkov-bench"
-CELLS = [("1080p", "sdr"), ("1080p", "pq"), ("4k", "sdr"), ("4k", "pq")]
-# ABAB, then the reversed BABA control.
-ORDERS = [("e", "c", "e", "c"), ("c", "e", "c", "e")]
 # The X4 prime core: `measure`'s documented pin for the Pixel.
 CPU = "7"
-# 240 frames at 120 Hz is a 2 s window — the ODPM energy counters tick
-# at a coarse cadence and a sub-second window can read zero.
-FRAMES = 240
-WARMUP = 30
-RATE = 120.0
 
 
 def adb(*args):
@@ -42,7 +52,7 @@ def adb(*args):
         check=False,
     )
     if result.returncode:
-        raise RuntimeError(f"adb {args}: {result.stdout}")
+        raise RuntimeError("adb {}: {}".format(args, result.stdout))
     return result.stdout
 
 
@@ -78,7 +88,9 @@ def cooled():
         if cool_enough(sample):
             return sample
         print(
-            f"screen-off cooling: battery={sample['battery_c']} C, status={sample['status']}",
+            "screen-off cooling: battery={} C, status={}".format(
+                sample["battery_c"], sample["status"]
+            ),
             flush=True,
         )
         time.sleep(5)
@@ -87,49 +99,73 @@ def cooled():
 
 def push(binary):
     subprocess.run(["adb", "push", binary, BENCH], check=True, capture_output=True)
-    shell(f"chmod 755 {BENCH}")
+    shell("chmod 755 {}".format(BENCH))
 
 
-def run(path, size, transfer, rep, out_dir):
-    remote = f"/data/local/tmp/ext-{size}-{transfer}-{path}-{rep}.json"
-    cmd = (
-        f"su -c '{BENCH} external-cost --path {path} --size {size} "
-        f"--transfer {transfer} --frames {FRAMES} --warmup {WARMUP} "
-        f"--rate {RATE} --energy --cpu {CPU} --out {remote}'"
+def remote_exists(path):
+    result = subprocess.run(
+        ["adb", "shell", "test", "-f", path],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
     )
-    print(f"[{size}/{transfer} rep{rep}] path {path} ...", flush=True)
+    return result.returncode == 0
+
+
+def run_cell(path, size, transfer, rep, out_dir, run_id):
+    remote = "/data/local/tmp/ext-{}.json".format(run_id)
+    shell("rm -f {}".format(remote))
+    args = args_for(path, size, transfer, remote) + ["--energy", "--cpu", CPU]
+    cmd = "su -c '{} {}'".format(BENCH, " ".join(args))
+    print(
+        "[{}/{} rep{}] path {} run {} ...".format(size, transfer, rep, path, run_id),
+        flush=True,
+    )
     out = shell(cmd)
-    if "external-cost" not in out:
-        raise RuntimeError(f"bench failed: {out}")
-    local = out_dir / f"{size}-{transfer}-{path}-{rep}.json"
-    subprocess.run(["adb", "pull", remote, str(local)], check=True, capture_output=True)
-    shell(f"rm {remote}")
-    return json.loads(local.read_text())
+    if not remote_exists(remote):
+        raise RuntimeError("bench produced no report: {}".format(out))
+    local = out_dir / "{}-{}-{}-{}.json".format(size, transfer, path, rep)
+    subprocess.run(
+        ["adb", "pull", remote, str(local)], check=True, capture_output=True
+    )
+    shell("rm -f {}".format(remote))
+    report = json.loads(local.read_text())
+    return verify(report, size, transfer, path)
+
+
+def milliseconds(report, key, index):
+    """`report[key][index]` in milliseconds, or None when the series is absent."""
+    series = report.get(key)
+    if not isinstance(series, list) or len(series) <= index or series[index] is None:
+        return None
+    return series[index] * 1e3
 
 
 def summarize(report):
-    p = lambda key: (report.get(key) or [None, None, None])
-    composite = p("composite_seconds")
-    total = p("total_seconds")
     energy = report.get("energy") or {}
     memory = report.get("memory") or {}
     steady = (memory.get("steady") or {}).get("process") or {}
     gpu = (((memory.get("steady") or {}).get("engine") or {}).get("value") or {})
+    pacing = report.get("pacing") or {}
+    conditions = report.get("conditions") or {}
     return {
-        "gpu_ms_p50": (composite[0] or 0.0) * 1e3,
-        "gpu_ms_p99": (composite[2] or 0.0) * 1e3,
-        "total_ms_p50": (total[0] or 0.0) * 1e3,
-        "total_ms_p99": (total[2] or 0.0) * 1e3,
-        "encode_ms_p50": report["encode_seconds"][0] * 1e3,
-        "encode_ms_p99": report["encode_seconds"][2] * 1e3,
-        "submit_ms_p50": report["submit_seconds"][0] * 1e3,
-        "handoff_ms_p50": (report.get("handoff_seconds") or [None])[0],
+        "gpu_ms_p50": milliseconds(report, "composite_seconds", 0),
+        "gpu_ms_p99": milliseconds(report, "composite_seconds", 2),
+        "total_ms_p50": milliseconds(report, "total_seconds", 0),
+        "total_ms_p99": milliseconds(report, "total_seconds", 2),
+        "encode_ms_p50": milliseconds(report, "encode_seconds", 0),
+        "encode_ms_p99": milliseconds(report, "encode_seconds", 2),
+        "submit_ms_p50": milliseconds(report, "submit_seconds", 0),
+        "handoff_ms_p50": milliseconds(report, "handoff_seconds", 0),
         "joules_per_frame": energy.get("joules_per_frame"),
         "watts": energy.get("watts"),
         "steady_rss_bytes": steady.get("rss_bytes"),
         "steady_gpu_bytes": gpu.get("gpu_bytes"),
-        "missed": (report.get("pacing") or {}).get("missed_deadlines"),
-        "thermal": (report.get("conditions") or {}).get("thermal_status"),
+        "missed": pacing.get("missed_deadlines"),
+        "thermal": conditions.get("thermal_status"),
+        "dropped_frames": report.get("dropped_frames"),
+        "bench_gpu_bytes": report.get("bench_gpu_bytes"),
+        "import_form": report.get("import_form"),
     }
 
 
@@ -141,23 +177,35 @@ def main():
     args = parser.parse_args()
     out_dir = pathlib.Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    binary = pathlib.Path(args.binary)
+    binary_sha256 = hashlib.sha256(binary.read_bytes()).hexdigest()
+    matrix_id = uuid.uuid4().hex[:12]
 
-    push(args.binary)
+    push(str(binary))
     shell("input keyevent KEYCODE_SLEEP")
 
     results = []
+    git_sha = None
     initial = cooled()
-    print(f"initial thermal: {initial}", flush=True)
+    print("initial thermal: {}".format(initial), flush=True)
     for size, transfer in CELLS:
         for order in ORDERS:
             for rep, path in enumerate(order[: args.runs]):
                 sample = cooled()
-                report = run(path, size, transfer, rep, out_dir)
+                run_id = uuid.uuid4().hex[:12]
+                report = run_cell(path, size, transfer, rep, out_dir, run_id)
+                if git_sha is None:
+                    git_sha = report["git_sha"]
+                elif report["git_sha"] != git_sha:
+                    raise RuntimeError(
+                        "git_sha changed from {} to {}".format(git_sha, report["git_sha"])
+                    )
                 row = {
-                    "cell": f"{size}/{transfer}",
+                    "cell": "{}/{}".format(size, transfer),
                     "path": path,
-                    "order": "abab" if order == ORDERS[0] else "baba",
+                    "order": order_name(order),
                     "rep": rep,
+                    "run_id": run_id,
                     "battery_c": sample["battery_c"],
                     "status": sample["status"],
                     **summarize(report),
@@ -166,12 +214,18 @@ def main():
                 print(json.dumps(row), flush=True)
     summary = {
         "device": "pixel9pro",
-        "binary": args.binary,
+        "run_id": matrix_id,
+        "binary": str(binary),
+        "binary_sha256": binary_sha256,
+        "git_sha": git_sha,
+        "frames": FRAMES,
+        "warmup": WARMUP,
+        "rate": RATE,
         "finished": datetime.datetime.now(datetime.UTC).isoformat(),
         "results": results,
     }
-    (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
-    print(f"summary -> {out_dir / 'summary.json'}")
+    (out_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+    print("summary -> {}".format(out_dir / "summary.json"))
 
 
 if __name__ == "__main__":

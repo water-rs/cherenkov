@@ -5,12 +5,12 @@ private let logger = Logger(subsystem: "dev.cherenkov", category: "bench")
 
 /// One finished run: its arguments and exit code, as recorded in
 /// `done.json`, with the device thermal state bracketing the run
-/// (`ProcessInfo.thermalState`: 0 nominal, 1 fair, 2 serious, 3 critical).
+/// (`nominal`, `fair`, `serious`, `critical`, or `unknown`).
 struct BenchRunResult {
     let args: [String]
     let exitCode: Int32
-    let thermalBefore: Int
-    let thermalAfter: Int
+    let thermalBefore: String
+    let thermalAfter: String
 }
 
 /// Receives bench progress on the main thread.
@@ -28,6 +28,10 @@ protocol BenchRunnerDelegate: AnyObject {
 /// Runs every argument list in `Documents/bench-args.json` through
 /// `cherenkov_bench_run`, in order, and records each run's exit code in
 /// `Documents/out/done.json`.
+///
+/// `bench-args.json` is `{"run_id": "...", "runs": [[...]]}`. That
+/// `run_id` is written to `Documents/thermal.json` before `out` is
+/// reset, and to `done.json` when the launch finishes.
 struct BenchRunner {
     /// Receives progress on the main thread.
     let delegate: BenchRunnerDelegate?
@@ -54,32 +58,42 @@ struct BenchRunner {
 
     /// The overall exit code: the first non-zero run's, else 0.
     func runAll() -> Int32 {
-        // Identifies this launch's out/ so a driver can tell a done.json
-        // left by a previous launch from this one's.
-        let runId = UUID().uuidString
         let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let outDir = documents.appendingPathComponent("out", isDirectory: true)
+        let argsURL = documents.appendingPathComponent("bench-args.json")
+        // Parsed before thermal.json: the run id has to be the one the
+        // host wrote, and a missing file must not invent one.
+        guard let benchArgs = Self.loadBenchArgs(from: argsURL) else {
+            if case let .failure(message) = Self.resetOut(outDir) {
+                report { $0.benchRunner(self, didFailWithError: message) }
+                return 1
+            }
+            _ = Self.writeDone(["error": "bench-args.json missing or invalid"], to: outDir)
+            report { $0.benchRunner(self, didFailWithError: "bench-args.json missing or invalid") }
+            return 1
+        }
+        let runId = benchArgs.runId
+        let argLists = benchArgs.runs
         // Outside `out`: the reset below deletes `out`, and the driver
         // reads this before the measurement exists.
         let thermal = Self.thermalStateWord()
         let thermalURL = documents.appendingPathComponent("thermal.json")
-        guard Self.writeJSON(["state": thermal], to: thermalURL) else {
+        guard Self.writeJSON(["state": thermal, "run_id": runId], to: thermalURL) else {
             logger.error("cannot write \(thermalURL.path, privacy: .public)")
             return 1
         }
-        logger.info("thermal \(thermal, privacy: .public)")
-        let outDir = documents.appendingPathComponent("out", isDirectory: true)
+        logger.info("thermal \(thermal, privacy: .public) run \(runId, privacy: .public)")
         if thermal != "nominal" && thermal != "fair" {
-            do {
-                if FileManager.default.fileExists(atPath: outDir.path) {
-                    try FileManager.default.removeItem(at: outDir)
-                }
-                try FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
-            } catch {
-                logger.error("cannot reset \(outDir.path, privacy: .public): \(error)")
+            if case .failure = Self.resetOut(outDir) {
                 return 1
             }
             _ = Self.writeDone(
-                ["error": "thermal \(thermal)", "thermal": thermal, "results": [Any]()],
+                [
+                    "error": "thermal \(thermal)",
+                    "thermal": thermal,
+                    "run_id": runId,
+                    "results": [Any](),
+                ],
                 to: outDir
             )
             report { $0.benchRunner(self, didFailWithError: "thermal \(thermal)") }
@@ -87,28 +101,19 @@ struct BenchRunner {
         }
         // `out` holds this launch's results only: a `done.json` left by an
         // earlier launch would read as this one having finished.
-        do {
-            if FileManager.default.fileExists(atPath: outDir.path) {
-                try FileManager.default.removeItem(at: outDir)
-            }
-            try FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
-        } catch {
-            logger.error("cannot reset \(outDir.path, privacy: .public): \(error)")
-            report { $0.benchRunner(self, didFailWithError: "cannot reset \(outDir.path): \(error.localizedDescription)") }
+        if case let .failure(message) = Self.resetOut(outDir) {
+            report { $0.benchRunner(self, didFailWithError: message) }
             return 1
         }
         // An iOS app launches with cwd `/`; the bench's relative
         // `Documents/...` paths only resolve from the app's home.
         guard FileManager.default.changeCurrentDirectoryPath(NSHomeDirectory()) else {
             logger.error("cannot chdir to \(NSHomeDirectory(), privacy: .public)")
-            _ = Self.writeDone(["error": "cannot chdir to app home"], to: outDir)
+            _ = Self.writeDone(
+                ["error": "cannot chdir to app home", "run_id": runId],
+                to: outDir
+            )
             report { $0.benchRunner(self, didFailWithError: "cannot chdir to app home") }
-            return 1
-        }
-        guard let argLists = Self.loadArgLists(from: documents.appendingPathComponent("bench-args.json"))
-        else {
-            _ = Self.writeDone(["error": "bench-args.json missing or invalid"], to: outDir)
-            report { $0.benchRunner(self, didFailWithError: "bench-args.json missing or invalid") }
             return 1
         }
         var results: [BenchRunResult] = []
@@ -117,9 +122,9 @@ struct BenchRunner {
             logger.info("run \(index): \(args.joined(separator: " "), privacy: .public)")
             report { $0.benchRunner(self, didStartRun: index, of: argLists.count, args: args) }
             let logURL = outDir.appendingPathComponent("run-\(index).log")
-            let thermalBefore = ProcessInfo.processInfo.thermalState.rawValue
+            let thermalBefore = Self.thermalStateWord()
             let code = Self.invoke(args, logTo: logURL)
-            let thermalAfter = ProcessInfo.processInfo.thermalState.rawValue
+            let thermalAfter = Self.thermalStateWord()
             logger.info("run \(index): exit \(code), thermal \(thermalBefore)->\(thermalAfter)")
             results.append(BenchRunResult(
                 args: args,
@@ -190,14 +195,51 @@ struct BenchRunner {
         return code
     }
 
-    static func loadArgLists(from url: URL) -> [[String]]? {
+    /// `bench-args.json`: the host's run id and the argument lists.
+    struct BenchArgs {
+        let runId: String
+        let runs: [[String]]
+    }
+
+    /// Empties `Documents/out` so a previous launch's `done.json` cannot
+    /// be read as this one.
+    static func resetOut(_ outDir: URL) -> Result<Void, String> {
+        do {
+            if FileManager.default.fileExists(atPath: outDir.path) {
+                try FileManager.default.removeItem(at: outDir)
+            }
+            try FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
+            return .success(())
+        } catch {
+            let message = "cannot reset \(outDir.path): \(error.localizedDescription)"
+            logger.error("\(message, privacy: .public)")
+            return .failure(message)
+        }
+    }
+
+    /// Parses `{"run_id": "...", "runs": [[String]]}`. An empty run id or
+    /// an empty `runs` array is invalid: the host always names the launch.
+    static func loadBenchArgs(from url: URL) -> BenchArgs? {
         guard let data = try? Data(contentsOf: url),
-              let lists = try? JSONSerialization.jsonObject(with: data) as? [[String]]
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let runId = object["run_id"] as? String,
+              !runId.isEmpty,
+              let rawRuns = object["runs"] as? [Any],
+              !rawRuns.isEmpty
         else {
-            logger.error("\(url.lastPathComponent, privacy: .public) missing or not an array of argument lists")
+            logger.error("\(url.lastPathComponent, privacy: .public) missing or not {run_id, runs}")
             return nil
         }
-        return lists
+        var runs: [[String]] = []
+        runs.reserveCapacity(rawRuns.count)
+        for item in rawRuns {
+            guard let args = item as? [String] else {
+                logger.error("\(url.lastPathComponent, privacy: .public) runs must be arrays of strings")
+                return nil
+            }
+            runs.append(args)
+        }
+        return BenchArgs(runId: runId, runs: runs)
     }
 
     @discardableResult

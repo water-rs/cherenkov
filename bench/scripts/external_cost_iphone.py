@@ -6,8 +6,12 @@ Several jobs share the phone and the same bundle id, so the device lock
 (`fcntl.flock`) is held for one run's whole cycle — uninstall, install,
 push args, launch (always `--terminate-existing`: the app never exits,
 so a plain launch would reuse a stale instance), wait for done, pull —
-and released after the pull. Time blocked on the lock accumulates; past
-15 minutes the driver stops with whatever it has already pulled.
+and released after the pull. An exception after launch terminates
+that process and uninstalls before the lock drops. A successful pull
+leaves the app installed for the next cycle, which uninstalls before
+it installs again; the hot thermal path uninstalls before it returns.
+Time blocked on the lock accumulates; past 15 minutes the driver stops
+with whatever it has already pulled.
 
 Before the measurement the host writes `Documents/thermal.json` from
 `ProcessInfo.thermalState` and does not run the bench unless the state
@@ -18,9 +22,11 @@ probe. iOS has no host-side thermal query, so the probe is that launch.
 iOS carries the same matrix minus `--energy` (the meter is ODPM/
 powermetrics only) and `--cpu` (affinity is Linux/Android only).
 
-A pull is accepted only when `done.json`'s args are this launch's
-(they carry the run id), the log contains that id, and the report is
-the `external-cost` cell this binary was installed to measure.
+A pull is accepted only when `done.json`'s `run_id` is the one this
+launch wrote into `bench-args.json`, its thermal words are nominal or
+fair, and the report is the `external-cost` cell this binary was
+installed to measure. The git SHA comes from the report
+(`CHERENKOV_GIT_SHA` in the binary), not from a `--head` argument.
 
 Raw reports land in `--out-dir`, never in git.
 
@@ -32,6 +38,7 @@ hangup is not delivered and an explicit ``kill -HUP`` still is.
 """
 
 import argparse
+import errno
 import fcntl
 import hashlib
 import json
@@ -46,23 +53,31 @@ import time
 import traceback
 import uuid
 
-UDID = "00008140-001845681E98801C"
-LOCK = "/tmp/device-locks/00008140-001845681E98801C.lock"
-BUNDLE = "dev.cherenkov.bench"
-DEFAULT_APP = (
-    "~/Coding/water-rs/cherenkov-wt-168/bench/ios/build/Build/Products/"
-    "Release-iphoneos/CherenkovBench.app"
+from external_cost_matrix import (
+    CELLS,
+    OK_THERMAL,
+    ORDERS,
+    args_for,
+    order_name,
+    verify as verify_report,
 )
 
-CELLS = [("1080p", "sdr"), ("1080p", "pq"), ("4k", "sdr"), ("4k", "pq")]
-ORDERS = [("e", "c", "e", "c"), ("c", "e", "c", "e")]
-FRAMES = 240
-WARMUP = 30
-RATE = 120
+UDID = "00008140-001845681E98801C"
+LOCK = "/tmp/device-locks/{}.lock".format(UDID)
+BUNDLE = "dev.cherenkov.bench"
+DEFAULT_APP = (
+    pathlib.Path(__file__).resolve().parent.parent
+    / "ios"
+    / "build"
+    / "Build"
+    / "Products"
+    / "Release-iphoneos"
+    / "CherenkovBench.app"
+)
+
 LOCK_BUDGET_S = 15 * 60
 COOL_LIMIT_S = 300
 COOL_GAP_S = 15
-OK_THERMAL = ("nominal", "fair")
 
 # Seconds spent blocked in flock across the process.
 lock_waited = 0.0
@@ -243,171 +258,248 @@ def wait_file(source, dest, timeout, predicate):
 
 
 def verify(report_path, size, transfer, path):
-    """The pulled report is this build's `external-cost` cell."""
-    report = json.loads(pathlib.Path(report_path).read_text())
-    want_path = {"e": "external", "c": "copy-convert"}[path]
-    want_layout = {"sdr": "nv12", "pq": "p010"}[transfer]
-    assert report["path"] == want_path, report["path"]
-    assert report["layout"] == want_layout, report["layout"]
-    assert report["transfer"] == "bt{}-{}".format(
-        "709" if transfer == "sdr" else "2020",
-        "sdr" if transfer == "sdr" else "pq",
-    ), report["transfer"]
-    assert (report["width"], report["height"]) == {
-        "1080p": (1920, 1080),
-        "4k": (3840, 2160),
-    }[size]
-    assert report["measured_frames"] == FRAMES
-    assert len(report["samples"]) == FRAMES, len(report["samples"])
-    assert report["total_seconds"], "no per-frame gpu total"
-    assert any(sample["gpu_seconds"] is not None for sample in report["samples"]), (
-        "no gpu timestamps"
+    """The pulled report is this build's `external-cost` cell, on Metal."""
+    report = verify_report(
+        json.loads(pathlib.Path(report_path).read_text()), size, transfer, path
     )
-    if path == "c":
-        assert any(
-            sample["handoff_seconds"] is not None for sample in report["samples"]
-        ), "path c recorded no handoff stamps"
-    assert str(report["backend"]).lower() == "metal", report["backend"]
-    assert "apple" in report["adapter"].lower(), report["adapter"]
+    if str(report["backend"]).lower() != "metal":
+        raise AssertionError(report["backend"])
+    if "apple" not in report["adapter"].lower():
+        raise AssertionError(report["adapter"])
+    if path == "e" and report["import_form"] != "planes":
+        raise AssertionError(report["import_form"])
     return report
 
 
-def cycle(app, path, size, transfer, rep, order_name, run_id, out_dir, identity):
-    """One locked cycle. Returns ("ok", row) or ("hot", state)."""
-    name = "{}-{}-{}-{}".format(size, transfer, path, rep)
-    remote = "Documents/out/ext-{}-{}.json".format(name, run_id)
-    args = [
-        "external-cost", "--path", path, "--size", size,
-        "--transfer", transfer, "--frames", str(FRAMES),
-        "--warmup", str(WARMUP), "--rate", str(RATE),
-        "--out", remote,
-    ]
-    print(
-        "[{}/{} {} rep{}] path {} run {} — installing".format(
-            size, transfer, order_name, rep, path, run_id
-        ),
-        flush=True,
-    )
-    uninstall()
-    devicectl("device", "install", "app", "--device", UDID, app)
+def process_identifier(obj):
+    """`processIdentifier` anywhere in a devicectl launch JSON document."""
+    if isinstance(obj, dict):
+        if "processIdentifier" in obj:
+            return int(obj["processIdentifier"])
+        for value in obj.values():
+            found = process_identifier(value)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for value in obj:
+            found = process_identifier(value)
+            if found is not None:
+                return found
+    return None
 
-    args_file = out_dir / "bench-args.json"
-    args_file.write_text(json.dumps([args]))
-    devicectl(
-        "device", "copy", "to", "--device", UDID,
-        "--domain-type", "appDataContainer",
-        "--domain-identifier", BUNDLE,
-        "--source", str(args_file),
-        "--destination", "Documents/bench-args.json",
-    )
-    back_path = out_dir / "args-readback.json"
-    back_result = device_copy_from("Documents/bench-args.json", back_path)
-    back = fetched("Documents/bench-args.json", back_path)
-    if back is None or json.loads(back.read_text()) != [args]:
-        raise RuntimeError(
-            "bench-args.json readback failed: {}".format(
-                (back_result.stderr or back_result.stdout or "").strip()
+
+def stop_launched(pid):
+    """SIGKILL the launch, then uninstall. Both stay inside the lock."""
+    if pid is not None:
+        result = run([
+            "xcrun", "devicectl", "device", "process", "terminate",
+            "--device", UDID, "--pid", str(pid), "--kill",
+        ], timeout=60)
+        if result.returncode != 0:
+            print(
+                "terminate pid {} failed: {}".format(
+                    pid, (result.stderr or result.stdout or "").strip()
+                ),
+                flush=True,
             )
-        )
+    try:
+        uninstall()
+    except Exception as exc:
+        print("uninstall during cleanup failed: {}".format(exc), flush=True)
 
-    stale_path = out_dir / "thermal-stale.json"
-    device_copy_from("Documents/thermal.json", stale_path)
-    if fetched("Documents/thermal.json", stale_path) is not None:
-        raise RuntimeError("stale thermal.json survived uninstall")
 
-    launched_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    devicectl(
-        "device", "process", "launch",
-        "--terminate-existing", "--device", UDID, BUNDLE,
-    )
+def snapshot_app(src, out_dir):
+    """Copy the .app into `out_dir` and return that copy."""
+    dest = out_dir / "CherenkovBench.app"
+    if dest.exists():
+        shutil.rmtree(dest)
+    shutil.copytree(src, dest)
+    return dest
 
-    thermal_bytes = wait_file(
-        "Documents/thermal.json",
-        out_dir / "thermal.json",
-        60,
-        lambda path: "state" in json.loads(path.read_text()),
-    )
-    thermal = json.loads(thermal_bytes.decode())["state"]
-    print("    thermal {}".format(thermal), flush=True)
-    if thermal not in OK_THERMAL:
-        wait_file(
-            "Documents/out/done.json",
-            out_dir / "done-hot.json",
-            45,
-            lambda path: json.loads(path.read_text()).get("thermal") == thermal,
+
+def cycle(app, path, size, transfer, rep, order_name, run_id, out_dir, identity):
+    """One locked cycle. Returns ("ok", row) or ("hot", state).
+
+    ``bench-args.json`` carries this launch's ``run_id``. The report
+    file is ``ext-{size}-{transfer}-{path}-{rep}.json`` with no run id
+    in the name. Cleanup runs only when an exception is in flight, so
+    a normal return is not torn down while the pull is still in use.
+    """
+    pid = None
+    try:
+        name = "{}-{}-{}-{}".format(size, transfer, path, rep)
+        remote_name = "ext-{}.json".format(name)
+        remote = "Documents/out/{}".format(remote_name)
+        args = args_for(path, size, transfer, remote)
+        payload = {"run_id": run_id, "runs": [args]}
+        print(
+            "[{}/{} {} rep{}] path {} run {} — installing".format(
+                size, transfer, order_name, rep, path, run_id
+            ),
+            flush=True,
         )
         uninstall()
-        return ("hot", thermal)
+        devicectl("device", "install", "app", "--device", UDID, str(app))
 
-    def done_ok(path):
-        done = json.loads(path.read_text())
-        row = done["results"][0]
-        return row["args"] == args and row["exit_code"] == 0
-
-    run_dir = out_dir / "run-{}-{}".format(name, run_id)
-    scratch = out_dir / ".out-pull"
-    deadline = time.monotonic() + 300
-    pulled = None
-    while time.monotonic() < deadline:
-        result = device_copy_from("Documents/out", scratch)
-        if result.returncode == 0 or scratch.exists():
-            done = find_named(scratch, "done.json")
-            log = find_named(scratch, "run-0.log")
-            report_file = find_named(scratch, "ext-{}-{}.json".format(name, run_id))
-            if (
-                done is not None
-                and log is not None
-                and report_file is not None
-                and done_ok(done)
-                and run_id in log.read_text(errors="replace")
-            ):
-                if run_dir.exists():
-                    shutil.rmtree(run_dir)
-                shutil.copytree(scratch, run_dir)
-                pulled = run_dir
-                break
-        time.sleep(2)
-    if pulled is None:
-        names = []
-        if scratch.exists():
-            names = sorted(
-                item.name for item in scratch.rglob("*") if item.is_file()
-            )
-        raise RuntimeError(
-            "timeout waiting for done.json run {}; pulled {}".format(run_id, names)
+        args_file = out_dir / "bench-args.json"
+        args_file.write_text(json.dumps(payload))
+        devicectl(
+            "device", "copy", "to", "--device", UDID,
+            "--domain-type", "appDataContainer",
+            "--domain-identifier", BUNDLE,
+            "--source", str(args_file),
+            "--destination", "Documents/bench-args.json",
         )
+        back_path = out_dir / "args-readback.json"
+        back_result = device_copy_from("Documents/bench-args.json", back_path)
+        back = fetched("Documents/bench-args.json", back_path)
+        if back is None or json.loads(back.read_text()) != payload:
+            raise RuntimeError(
+                "bench-args.json readback failed: {}".format(
+                    (back_result.stderr or back_result.stdout or "").strip()
+                )
+            )
 
-    report_path = find_named(pulled, "ext-{}-{}.json".format(name, run_id))
-    report = verify(report_path, size, transfer, path)
-    accept = {
-        "run_id": run_id,
-        "launched_at_utc": launched_at,
-        "thermal": thermal,
-        "cdhash": identity["cdhash"],
-        "exe_sha256": identity["exe_sha256"],
-        "args": args,
-        "adapter": report["adapter"],
-        "backend": report["backend"],
-    }
-    (pulled / "accept.json").write_text(json.dumps(accept, indent=2))
-    gpu = report["total_seconds"]
-    print(
-        "    accepted {} thermal {} gpu p50 {:.2f} ms".format(
-            run_id, thermal, gpu[0] * 1e3
-        ),
-        flush=True,
-    )
-    return ("ok", {
-        "cell": "{}/{}".format(size, transfer),
-        "path": path,
-        "order": order_name,
-        "rep": rep,
-        "run_id": run_id,
-        "thermal": thermal,
-        "dir": run_dir.name,
-        "gpu_p50_s": gpu[0],
-        "gpu_p99_s": gpu[2],
-    })
+        stale_path = out_dir / "thermal-stale.json"
+        device_copy_from("Documents/thermal.json", stale_path)
+        if fetched("Documents/thermal.json", stale_path) is not None:
+            raise RuntimeError("stale thermal.json survived uninstall")
+
+        launched_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        launch_json = out_dir / "launch-{}.json".format(run_id)
+        devicectl(
+            "device", "process", "launch",
+            "--terminate-existing", "--device", UDID,
+            "--json-output", str(launch_json),
+            BUNDLE,
+        )
+        pid = process_identifier(json.loads(launch_json.read_text()))
+        if pid is None:
+            raise RuntimeError("launch json has no processIdentifier")
+
+        def this_thermal(path):
+            doc = json.loads(path.read_text())
+            return doc.get("run_id") == run_id and isinstance(doc.get("state"), str)
+
+        thermal_bytes = wait_file(
+            "Documents/thermal.json",
+            out_dir / "thermal.json",
+            60,
+            this_thermal,
+        )
+        thermal = json.loads(thermal_bytes.decode())["state"]
+        print("    thermal {}".format(thermal), flush=True)
+        if thermal not in OK_THERMAL:
+            def hot_done(path):
+                doc = json.loads(path.read_text())
+                return doc.get("run_id") == run_id and doc.get("thermal") == thermal
+
+            wait_file(
+                "Documents/out/done.json",
+                out_dir / "done-hot.json",
+                45,
+                hot_done,
+            )
+            uninstall()
+            return ("hot", thermal)
+
+        run_dir = out_dir / "run-{}-{}".format(name, run_id)
+        scratch = out_dir / ".out-pull"
+        deadline = time.monotonic() + 300
+        pulled = None
+        names = []
+        while time.monotonic() < deadline:
+            result = device_copy_from("Documents/out", scratch)
+            done = find_named(scratch, "done.json") if scratch.exists() else None
+            log = find_named(scratch, "run-0.log") if scratch.exists() else None
+            report_file = find_named(scratch, remote_name) if scratch.exists() else None
+            if done is not None:
+                try:
+                    doc = json.loads(done.read_text())
+                except json.JSONDecodeError:
+                    doc = None
+                results = doc.get("results") if isinstance(doc, dict) else None
+                if (
+                    isinstance(doc, dict)
+                    and doc.get("run_id") == run_id
+                    and isinstance(results, list)
+                    and results
+                ):
+                    row = results[0]
+                    before = row.get("thermal_before")
+                    after = row.get("thermal_after")
+                    if (
+                        row.get("args") != args
+                        or row.get("exit_code") != 0
+                        or before not in OK_THERMAL
+                        or after not in OK_THERMAL
+                    ):
+                        raise RuntimeError(
+                            "done.json rejected: exit {} thermal {} -> {}".format(
+                                row.get("exit_code"), before, after
+                            )
+                        )
+                    if log is None or report_file is None:
+                        names = sorted(
+                            item.name for item in scratch.rglob("*") if item.is_file()
+                        )
+                    else:
+                        if run_dir.exists():
+                            shutil.rmtree(run_dir)
+                        shutil.copytree(scratch, run_dir)
+                        pulled = (run_dir, before, after)
+                        break
+            if scratch.exists():
+                names = sorted(
+                    item.name for item in scratch.rglob("*") if item.is_file()
+                )
+            elif result.returncode != 0:
+                names = [(result.stderr or result.stdout or "").strip()]
+            time.sleep(2)
+        if pulled is None:
+            raise RuntimeError(
+                "timeout waiting for done.json run {}; pulled {}".format(run_id, names)
+            )
+
+        run_dir, thermal_before, thermal_after = pulled
+        report_path = find_named(run_dir, remote_name)
+        report = verify(report_path, size, transfer, path)
+        accept = {
+            "run_id": run_id,
+            "launched_at_utc": launched_at,
+            "thermal_before": thermal_before,
+            "thermal_after": thermal_after,
+            "git_sha": report["git_sha"],
+            "cdhash": identity["cdhash"],
+            "exe_sha256": identity["exe_sha256"],
+            "args": args,
+            "adapter": report["adapter"],
+            "backend": report["backend"],
+        }
+        (run_dir / "accept.json").write_text(json.dumps(accept, indent=2) + "\n")
+        gpu = report["total_seconds"]
+        print(
+            "    accepted {} thermal {} -> {} gpu p50 {:.2f} ms".format(
+                run_id, thermal_before, thermal_after, gpu[0] * 1e3
+            ),
+            flush=True,
+        )
+        return ("ok", {
+            "cell": "{}/{}".format(size, transfer),
+            "path": path,
+            "order": order_name,
+            "rep": rep,
+            "run_id": run_id,
+            "thermal_before": thermal_before,
+            "thermal_after": thermal_after,
+            "git_sha": report["git_sha"],
+            "dir": run_dir.name,
+            "gpu_p50_s": gpu[0],
+            "gpu_p99_s": gpu[2],
+        })
+    finally:
+        if sys.exc_info()[0] is not None:
+            stop_launched(pid)
 
 
 def one_run(app, path, size, transfer, rep, order_name, out_dir, identity):
@@ -476,21 +568,30 @@ def install_stop_signals():
     detached driver. Leave that process group first — an explicit
     ``kill -HUP`` is still delivered to the pid — then install the
     handler. A foreground run, whose SIGHUP is not ignored, keeps its
-    session and records the hangup.
+    session and records the hangup. ``setsid`` failing with EPERM is
+    the only case that leaves SIGHUP ignored; any other OSError is
+    raised.
     """
+    names = {signal.SIGTERM: "SIGTERM", signal.SIGHUP: "SIGHUP"}
+
+    def handle(signum, _frame):
+        raise Stopped(names[signum])
+
     if (
         signal.getsignal(signal.SIGHUP) == signal.SIG_IGN
         and os.getpid() != os.getsid(0)
     ):
         try:
             os.setsid()
-        except OSError:
-            pass
-
-    names = {signal.SIGTERM: "SIGTERM", signal.SIGHUP: "SIGHUP"}
-
-    def handle(signum, _frame):
-        raise Stopped(names[signum])
+        except OSError as exc:
+            if exc.errno != errno.EPERM:
+                raise
+            print(
+                "setsid failed with EPERM; leaving SIGHUP ignored",
+                flush=True,
+            )
+            signal.signal(signal.SIGTERM, handle)
+            return
 
     signal.signal(signal.SIGTERM, handle)
     signal.signal(signal.SIGHUP, handle)
@@ -510,7 +611,6 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--app", default=os.path.expanduser(DEFAULT_APP))
     parser.add_argument("--out-dir", default="/tmp/external-cost-iphone")
-    parser.add_argument("--head", default="unknown")
     parser.add_argument(
         "--lock-waited",
         type=float,
@@ -527,7 +627,7 @@ def main():
     status = {
         "state": "running",
         "reason": "",
-        "head": args.head,
+        "git_sha": "",
         "cdhash": "",
         "exe_sha256": "",
         "results": results,
@@ -537,7 +637,8 @@ def main():
     code = 0
     line = "matrix complete"
     try:
-        identity = {"cdhash": cdhash(args.app), "exe_sha256": exe_sha256(args.app)}
+        app = snapshot_app(pathlib.Path(args.app).expanduser(), out_dir)
+        identity = {"cdhash": cdhash(app), "exe_sha256": exe_sha256(app)}
         status["cdhash"] = identity["cdhash"]
         status["exe_sha256"] = identity["exe_sha256"]
         print(
@@ -548,12 +649,21 @@ def main():
         )
         for size, transfer in CELLS:
             for order in ORDERS:
-                order_name = "abab" if order == ORDERS[0] else "baba"
                 for rep, path in enumerate(order):
                     row = one_run(
-                        args.app, path, size, transfer, rep,
-                        order_name, out_dir, identity,
+                        app, path, size, transfer, rep,
+                        order_name(order), out_dir, identity,
                     )
+                    sha = row["git_sha"]
+                    if status["git_sha"] == "":
+                        status["git_sha"] = sha
+                        print("git {}".format(sha), flush=True)
+                    elif status["git_sha"] != sha:
+                        raise RuntimeError(
+                            "git_sha changed from {} to {}".format(
+                                status["git_sha"], sha
+                            )
+                        )
                     results.append(row)
                     status["results"] = results
                     write_status(status_path, status)

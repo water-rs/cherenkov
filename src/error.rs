@@ -80,7 +80,8 @@ pub enum ResourceError {
 /// Rendering or readback failure.
 #[derive(Debug, thiserror::Error)]
 pub enum RenderError {
-    /// The GPU did not complete within the backend's configured deadline.
+    /// The GPU made no progress for a whole wait window — or, on wasm32,
+    /// did not complete within the configured deadline.
     #[error("the GPU did not finish {what} within {timeout:?}")]
     Timeout {
         /// The operation waiting for completion.

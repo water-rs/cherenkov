@@ -197,8 +197,9 @@ pub trait Renderer: 'static {
     /// may have nothing outstanding.
     ///
     /// # Errors
-    /// [`RenderError::Timeout`] when the GPU does not finish in time,
-    /// [`RenderError::Readback`] when the timing buffers cannot be read.
+    /// [`RenderError::Timeout`] when the GPU makes no progress for a
+    /// wait window, and [`RenderError::Readback`] when the timing buffers
+    /// cannot be read.
     #[cfg(not(target_arch = "wasm32"))]
     fn finish_timings(&mut self) -> Result<Vec<FrameTiming>, RenderError> {
         Ok(Vec::new())

@@ -251,36 +251,11 @@ impl Ramps {
     }
 }
 
-const DECODE_LEN: usize = cherenkov_gpu::bench::DECODE_WGSL.len();
-const CONVERT_TAIL: &[u8] = include_bytes!("external_convert.wgsl");
-
-/// Bytes of [`cherenkov_gpu::bench::DECODE_WGSL`] followed by
-/// `external_convert.wgsl`. A const array of this size is rejected, and
-/// `concat!` cannot take the decode const, so the join is a static.
-static CONVERT_BYTES: [u8; DECODE_LEN + CONVERT_TAIL.len()] = {
-    let head = cherenkov_gpu::bench::DECODE_WGSL.as_bytes();
-    let mut out = [0u8; DECODE_LEN + CONVERT_TAIL.len()];
-    let mut i = 0;
-    while i < head.len() {
-        out[i] = head[i];
-        i += 1;
-    }
-    let mut j = 0;
-    while j < CONVERT_TAIL.len() {
-        out[head.len() + j] = CONVERT_TAIL[j];
-        j += 1;
-    }
-    out
-};
-
-/// [`cherenkov_gpu::bench::DECODE_WGSL`] followed by this crate's
-/// fullscreen convert pass (`external_convert.wgsl`), which calls
-/// `ext_frame_yuv`. Path `c` runs that integer-plane decode over the
-/// copied planes. Path `e` on Apple does too; an Android
-/// external-format import does not.
-fn convert_wgsl() -> &'static str {
-    std::str::from_utf8(&CONVERT_BYTES).expect("external-cost convert shader is utf-8")
-}
+/// This crate's fullscreen convert pass, which calls `ext_frame_yuv`
+/// from [`cherenkov_gpu::bench::DECODE_WGSL`]. Path `c` runs that
+/// integer-plane decode over the copied planes. Path `e` on Apple does
+/// too; an Android external-format import does not.
+const CONVERT_WGSL: &str = include_str!("external_convert.wgsl");
 
 /// Queries per set: the largest multiple of 3 that fits in one set.
 const fn query_span() -> u32 {
@@ -405,7 +380,11 @@ impl GpuContent for Convert {
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("external-cost convert"),
-                source: wgpu::ShaderSource::Wgsl(convert_wgsl().into()),
+                source: wgpu::ShaderSource::Wgsl(
+                    [cherenkov_gpu::bench::DECODE_WGSL, CONVERT_WGSL]
+                        .concat()
+                        .into(),
+                ),
             });
         let pipeline = ctx
             .device

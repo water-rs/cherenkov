@@ -1,6 +1,6 @@
 [package]
 name = "cherenkov-shader"
-version = "0.0.0"
+version = "0.0.1"
 description = "Shader composer on naga IR, shared by Cherenkov and filtrate"
 edition.workspace = true
 license.workspace = true

@@ -1,6 +1,7 @@
 //! Immutable, colour-tagged `IOSurface`s for recorded layer pixels.
 
 use cherenkov::RenderError;
+use objc2::rc::autoreleasepool;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2_core_foundation::{CFDictionary, CFRetained, CFString, CFType};
 use objc2_core_video::{
@@ -146,24 +147,26 @@ impl Buffer {
         // poll. This surface can now be idle: a native queue completion
         // must wake it without another engine frame. The empty command
         // buffer follows the conversion on the very same Metal queue.
-        // SAFETY: no resource or queue state is modified outside wgpu;
-        // the marker only observes completion of preceding submissions.
-        let metal = unsafe { queue.as_hal::<wgpu::hal::metal::Api>() }.expect("Metal queue");
-        let marker = metal.as_raw().commandBuffer().ok_or_else(|| {
-            RenderError::Render("Metal refused a capture completion marker".into())
-        })?;
-        let ready = Arc::clone(&self.ready);
-        let block = block2::RcBlock::new(
-            move |_: std::ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
-                ready.store(true, Ordering::Release);
-                waker.wake();
-            },
-        );
-        // SAFETY: Metal retains the callback until completion. Its captured
-        // state is thread safe and it never accesses a native layer.
-        unsafe { marker.addCompletedHandler(block2::RcBlock::as_ptr(&block)) };
-        marker.commit();
-        Ok(())
+        autoreleasepool(|_| {
+            // SAFETY: no resource or queue state is modified outside wgpu;
+            // the marker only observes completion of preceding submissions.
+            let metal = unsafe { queue.as_hal::<wgpu::hal::metal::Api>() }.expect("Metal queue");
+            let marker = metal.as_raw().commandBuffer().ok_or_else(|| {
+                RenderError::Render("Metal refused a capture completion marker".into())
+            })?;
+            let ready = Arc::clone(&self.ready);
+            let block = block2::RcBlock::new(
+                move |_: std::ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+                    ready.store(true, Ordering::Release);
+                    waker.wake();
+                },
+            );
+            // SAFETY: Metal retains the callback until completion. Its captured
+            // state is thread safe and it never accesses a native layer.
+            unsafe { marker.addCompletedHandler(block2::RcBlock::as_ptr(&block)) };
+            marker.commit();
+            Ok(())
+        })
     }
 
     pub fn bytes(&self) -> u64 {

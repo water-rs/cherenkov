@@ -337,7 +337,7 @@ name = "cherenkov"
 version = "0.0.0"
 dependencies = [
  "arc-swap",
- "color",
+ "cherenkov-record",
  "filtrate-core",
  "kurbo",
  "libm",
@@ -484,6 +484,20 @@ dependencies = [
  "serde_json",
  "skrifa 0.44.0",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "cherenkov-record"
+version = "0.0.0"
+dependencies = [
+ "color",
+ "kurbo",
+ "nami",
+ "nami-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "web-time",
 ]
 
 [[package]]

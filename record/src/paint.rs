@@ -3,14 +3,14 @@
 use std::sync::Arc;
 
 use kurbo::{Affine, Point};
-use serde::{Deserialize, Serialize};
 
 use crate::animation::AnimLanes;
 use crate::color::{Color, ColorSpace, DynColor, WorkingColor};
 use crate::resource::ResourceId;
 
 /// What fills a shape or a glyph.
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Paint {
     /// A single colour.
     Solid(WorkingColor),
@@ -46,10 +46,8 @@ impl Clone for Paint {
 }
 
 /// Opaque black, the brush parley gives text whose style sets none (it
-/// needs a default to stand in for an unset brush; [`TextLayout`]
+/// needs a default to stand in for an unset brush; a text-layout adapter
 /// lowers whatever the style resolves to).
-///
-/// [`TextLayout`]: crate::TextLayout
 impl Default for Paint {
     fn default() -> Self {
         Self::Solid(WorkingColor::BLACK)
@@ -277,11 +275,12 @@ impl AnimLanes for Paint {
 /// texel-to-paint transform. Shader paints transform their sampling coordinates
 /// relative to their ordinary, untransformed shape-bounds domain.
 ///
-/// A non-finite or non-invertible transform fails rendering with
-/// [`crate::RenderError::Render`], including for solid paints. Reflections are
+/// A non-finite or non-invertible transform fails rendering, including for
+/// solid paints. Reflections are
 /// valid. The shared paint keeps stops and mesh data shared when a live signal
 /// updates only `transform`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TransformedPaint {
     /// Immutable paint, shared across transform updates.
     pub paint: Arc<Paint>,
@@ -330,7 +329,8 @@ impl Paint {
 }
 
 /// One colour stop of a gradient.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ColorStop {
     /// Position along the gradient, from 0 to 1.
     pub offset: f32,
@@ -339,7 +339,8 @@ pub struct ColorStop {
 }
 
 /// How a gradient or pattern continues outside its defined range.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Extend {
     /// The edge colour continues.
     #[default]
@@ -353,7 +354,8 @@ pub enum Extend {
 }
 
 /// The space in which gradient stops are interpolated.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Interpolation {
     /// The linear working space.
     #[default]
@@ -399,7 +401,8 @@ macro_rules! gradient_builders {
 }
 
 /// A gradient along the line from `start` to `end`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct LinearGradient {
     /// Where offset 0 lies.
     pub start: Point,
@@ -428,7 +431,8 @@ impl LinearGradient {
 }
 
 /// A gradient between two circles.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RadialGradient {
     /// Centre of the circle at offset 0.
     pub start_center: Point,
@@ -475,7 +479,8 @@ impl RadialGradient {
 }
 
 /// A gradient around a centre, from `start_angle` to `end_angle` (radians).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SweepGradient {
     /// The centre.
     pub center: Point,
@@ -512,8 +517,12 @@ gradient_builders!(SweepGradient, Sweep);
 
 /// The weights used to interpolate mesh vertex colours in premultiplied
 /// linear Display P3. Geometry and patch ownership are unchanged.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "kebab-case")
+)]
 pub enum MeshColorInterpolation {
     /// Bilinear colour weights, matching the existing mesh contract.
     #[default]
@@ -524,6 +533,7 @@ pub enum MeshColorInterpolation {
 }
 
 impl MeshColorInterpolation {
+    #[cfg(feature = "serde")]
     #[allow(
         clippy::trivially_copy_pass_by_ref,
         reason = "serde skip_serializing_if requires a borrowed value"
@@ -535,13 +545,16 @@ impl MeshColorInterpolation {
 
 /// A mesh gradient's fields before its grid is validated: the form it
 /// deserializes from, so that captured scenes cannot bypass the invariants.
-#[derive(Deserialize)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize))]
 struct MeshGradientData {
     columns: u32,
     rows: u32,
     points: Vec<Point>,
     colors: Vec<WorkingColor>,
-    #[serde(default, skip_serializing_if = "MeshColorInterpolation::is_linear")]
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "MeshColorInterpolation::is_linear")
+    )]
     interpolation: MeshColorInterpolation,
 }
 
@@ -612,14 +625,21 @@ impl TryFrom<MeshGradientData> for MeshGradient {
 
 /// A mesh gradient: a grid of `columns` × `rows` patches whose corner points
 /// carry colours, interpolated across each patch.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(try_from = "MeshGradientData")]
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(try_from = "MeshGradientData")
+)]
 pub struct MeshGradient {
     columns: u32,
     rows: u32,
     points: Vec<Point>,
     colors: Vec<WorkingColor>,
-    #[serde(default, skip_serializing_if = "MeshColorInterpolation::is_linear")]
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "MeshColorInterpolation::is_linear")
+    )]
     interpolation: MeshColorInterpolation,
 }
 
@@ -687,8 +707,9 @@ impl From<MeshGradient> for Paint {
     }
 }
 
-/// An image registered with the engine.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// An image registered with the render target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ImageId(u64);
 
 impl ImageId {
@@ -706,7 +727,8 @@ impl ImageId {
 }
 
 /// How an image is sampled.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Sampling {
     /// Nearest texel.
     Nearest,
@@ -716,7 +738,8 @@ pub enum Sampling {
 }
 
 /// An image used as a paint.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ImagePattern {
     /// The image.
     pub image: ImageId,
@@ -736,8 +759,9 @@ impl From<ImagePattern> for Paint {
     }
 }
 
-/// A user shader registered with the engine.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// A user shader registered with the render target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ShaderId(u64);
 
 impl ShaderId {
@@ -755,7 +779,8 @@ impl ShaderId {
 }
 
 /// A user shader used as a paint, with its uniform values.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ShaderPaint {
     /// The shader.
     pub shader: ShaderId,
@@ -814,7 +839,7 @@ mod mesh_overflow_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "serde"))]
 mod mesh_interpolation_tests {
     use super::*;
     #[test]

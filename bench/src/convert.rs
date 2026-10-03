@@ -1068,7 +1068,7 @@ mod front {
             /// The member ops.
             ops: Vec<Self>,
         },
-        /// A text layer's source — a `c.text` draw of the parley layout.
+        /// A text layer's source — a `draw_text` draw of the parley layout.
         Text {
             /// The layout, its fonts registered.
             layout: cherenkov::TextLayout,

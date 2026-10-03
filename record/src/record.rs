@@ -7,19 +7,17 @@ use std::collections::HashMap;
 use std::mem::{needs_drop, size_of};
 use std::rc::{Rc, Weak};
 
-use kurbo::{Affine, Point, Rect, Stroke};
+use kurbo::{Affine, Rect, Stroke};
 use nami_core::Signal;
-use serde::{Deserialize, Serialize};
 
 use crate::Instant;
 use crate::animation::{AnimLanes, Animation, OperandTrack};
 use crate::display_list::{Command, DisplayList, Operand, Picture, Slot, SlotUpdate};
-use crate::glyph::{GlyphRun, GlyphStyle};
+use crate::glyph::GlyphRun;
 use crate::paint::{ImageId, Paint, Sampling};
-use crate::shape::{Shape, ShapeData};
+use crate::shape::Shape;
 use crate::size::LayoutSize;
 use crate::style::{Group, Shadow};
-use crate::text::{TextCommand, TextLayout, place_run};
 
 /// The drawing verbs, shared by [`StaticRecorder`] and [`Recorder`].
 ///
@@ -56,12 +54,6 @@ pub trait Draw {
         shape: impl Into<Self::Value<S>>,
         shadow: impl Into<Self::Value<Shadow>>,
     );
-
-    /// Draws a shaped parley layout with its origin at `origin`: the
-    /// layout's glyph runs and decoration rectangles, recorded as the
-    /// [`glyphs`](Draw::glyphs) and [`fill`](Draw::fill) commands
-    /// [`TextLayout`] lowers to. A new layout is a new recording.
-    fn text(&mut self, layout: &TextLayout, origin: Point);
 
     /// Draws a glyph run.
     fn glyphs<P: Into<Paint> + 'static>(
@@ -154,10 +146,6 @@ impl Draw for StaticRecorder {
         });
     }
 
-    fn text(&mut self, layout: &TextLayout, origin: Point) {
-        record_text(&mut self.list, layout, origin);
-    }
-
     fn glyphs<P: Into<Paint> + 'static>(
         &mut self,
         run: impl Into<Fixed<GlyphRun>>,
@@ -212,55 +200,6 @@ impl Draw for StaticRecorder {
     }
 }
 
-/// Records `layout`'s lowered primitives at `origin`. They are constants:
-/// a layout is not a signal, so nothing subscribes.
-fn record_text(list: &mut DisplayList, layout: &TextLayout, origin: Point) {
-    for command in layout.commands() {
-        match command {
-            TextCommand::Glyphs(run, paint) => {
-                list.push(Command::Glyphs {
-                    run: place_run(run, origin),
-                    paint: paint.clone(),
-                });
-            }
-            TextCommand::Bold(run, stroke, paint) => {
-                let fill = place_run(run, origin);
-                let outline = GlyphRun {
-                    style: GlyphStyle::Stroke(stroke.clone()),
-                    ..fill.clone()
-                };
-                // With one opaque colour, the fill and then the stroke
-                // composite to exactly what the isolated pair does; any
-                // other paint would blend twice where the two overlap.
-                let isolate = !matches!(paint, Paint::Solid(color) if color.components[3] >= 1.0);
-                let begin = isolate.then(|| {
-                    list.push(Command::BeginGroup {
-                        group: Group::new(),
-                        end: 0,
-                    })
-                });
-                list.push(Command::Glyphs {
-                    run: fill,
-                    paint: paint.clone(),
-                });
-                list.push(Command::Glyphs {
-                    run: outline,
-                    paint: paint.clone(),
-                });
-                if let Some(begin) = begin {
-                    list.end(begin);
-                }
-            }
-            TextCommand::Fill(rect, paint) => {
-                list.push(Command::Fill {
-                    shape: ShapeData::Rect(*rect + origin.to_vec2()),
-                    paint: paint.clone(),
-                });
-            }
-        }
-    }
-}
-
 /// A signal consumer. Recorded slots keep their concrete callback state inline;
 /// property bindings additionally receive animation metadata.
 #[doc(hidden)]
@@ -278,7 +217,8 @@ enum Destination<T> {
 }
 
 impl<T> Watch<T> {
-    pub(crate) fn binding(callback: impl Fn(nami_core::watcher::Context<T>) + 'static) -> Self {
+    // Engine seam: layer property bindings notify through this.
+    pub fn binding(callback: impl Fn(nami_core::watcher::Context<T>) + 'static) -> Self {
         Self {
             destination: Destination::Binding(Box::new(callback)),
         }
@@ -345,7 +285,9 @@ impl<T> Subscribe<T> {
         reason = "expose the concrete subscription to the recorder's call site"
     )]
     #[inline(always)]
-    pub(crate) fn start(self, watch: Watch<T>) -> Option<Box<dyn Any>> {
+    // Engine seam: layer property bindings start their watches through this.
+    #[must_use]
+    pub fn start(self, watch: Watch<T>) -> Option<Box<dyn Any>> {
         self.0.and_then(|subscription| subscription.start(watch))
     }
 }
@@ -401,10 +343,11 @@ pub struct LiveState {
     /// `Option` to build and drop, not a `HashMap`.
     anim: Cell<Option<Box<AnimState>>>,
     /// Set while queued animates or running tracks make
-    /// [`LiveState::sample`] worth its borrows. `pub(crate)` so the
-    /// surface drain can probe it as a plain cell read — `sample` is a
-    /// real call on every static content otherwise.
-    pub(crate) needs_sample: Cell<bool>,
+    /// [`LiveState::sample`] worth its borrows.
+    // Engine seam: the surface drain probes it as a plain cell read —
+    // `sample` is a real call on every static content otherwise.
+    #[doc(hidden)]
+    pub needs_sample: Cell<bool>,
     /// The installing surface's "a content may be sampling" flag,
     /// poked by [`LiveState::animate`] so a fully static surface can
     /// skip per-content probes. Detached when the content retires.
@@ -726,10 +669,6 @@ impl Draw for Recorder {
         self.subscribe(shadow.subscribe, command, Operand::Shadow);
     }
 
-    fn text(&mut self, layout: &TextLayout, origin: Point) {
-        record_text(&mut self.list, layout, origin);
-    }
-
     #[expect(
         clippy::inline_always,
         reason = "expose constant signal subscriptions to call-site dead code elimination"
@@ -816,14 +755,22 @@ impl Draw for Recorder {
 /// the render thread is the owned [`ContentChange`].
 pub struct Content {
     picture: Picture,
-    pub(crate) live: Rc<LiveState>,
+    // Engine seam: the installing surface samples through it and probes
+    // `needs_sample` per frame.
+    #[doc(hidden)]
+    pub live: Rc<LiveState>,
     sent: bool,
 }
 
+/// Spare storage a retired [`Content`] leaves for the next recording.
+// Engine seam: the surface's content slots recycle through it.
 #[derive(Default)]
+#[doc(hidden)]
 pub struct ContentSpare {
-    pub(crate) picture: Option<Picture>,
-    pub(crate) live: Option<Rc<LiveState>>,
+    /// The recycled picture storage.
+    pub picture: Option<Picture>,
+    /// The recycled live state.
+    pub live: Option<Rc<LiveState>>,
 }
 
 impl std::fmt::Debug for Content {
@@ -837,11 +784,15 @@ impl std::fmt::Debug for Content {
 
 impl Content {
     /// Records content for a layer laid out at `size`.
-    pub(crate) fn record(size: LayoutSize, body: impl FnOnce(&mut Recorder)) -> Self {
+    // Engine seam: the installing surface records through this.
+    #[doc(hidden)]
+    pub fn record(size: LayoutSize, body: impl FnOnce(&mut Recorder)) -> Self {
         Self::record_with_capacity(0, size, body)
     }
 
-    pub(crate) fn record_reusing(
+    // Engine seam: the surface reuses a replaced content's storage.
+    #[doc(hidden)]
+    pub fn record_reusing(
         mut spare: ContentSpare,
         size: LayoutSize,
         body: impl FnOnce(&mut Recorder),
@@ -874,7 +825,10 @@ impl Content {
         recorder.finish()
     }
 
-    pub(crate) fn retire(self) -> ContentSpare {
+    // Engine seam: a replaced content leaves its spare to the surface.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn retire(self) -> ContentSpare {
         let Self { picture, live, .. } = self;
         // Watchers only exist while the content carried signals; a
         // signal-free recording never attached the sampling flag, and
@@ -919,7 +873,9 @@ impl Content {
 
     /// Connect installed live operands to the owning surface and its
     /// sampling flag.
-    pub(crate) fn attach_owner(&self, owner: Weak<dyn LiveOwner>, flag: &Rc<Cell<bool>>) {
+    // Engine seam: the surface attaches itself on install.
+    #[doc(hidden)]
+    pub fn attach_owner(&self, owner: Weak<dyn LiveOwner>, flag: &Rc<Cell<bool>>) {
         // Constant recordings need no owner or weak-count traffic.
         if !self.live.guards.borrow().is_empty() {
             *self.live.owner.borrow_mut() = Some(owner);
@@ -956,7 +912,10 @@ impl Content {
     /// operand updates [`take_change`](Self::take_change) drains. Returns
     /// `true` while animations still run — the surface needs another frame
     /// to keep them moving.
-    pub(crate) fn sample(&self, time: Instant) -> bool {
+    // Engine seam: the surface drain samples before each commit.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn sample(&self, time: Instant) -> bool {
         self.live.sample(time, self.picture.display_list())
     }
 
@@ -990,8 +949,9 @@ impl Content {
     }
 }
 
-/// What a commit sends to the render thread for one content.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// What a commit sends to the render target for one content.
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ContentChange {
     /// The whole display list, shared by reference when the content is first
     /// committed.
@@ -1402,6 +1362,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "serde")]
     fn change_sets_round_trip_through_serde() {
         let mut content = Content::record(LayoutSize::new(), |c| {
             c.stroke(

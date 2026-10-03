@@ -12,9 +12,8 @@ use crate::animation::Animation;
 
 /// The size a layer is laid out at, in the layer's content coordinates.
 ///
-/// Every layer has one; the host drives it from layout with
-/// [`LayerEdit::layout_size`](crate::LayerEdit::layout_size), and a
-/// recording made for the layer reads it from
+/// Every layer has one; the host drives it from layout through the
+/// target's layer edit, and a recording made for the layer reads it from
 /// [`Recorder::layout_size`](crate::Recorder::layout_size). It is a signal,
 /// so size-dependent geometry binds to it like any other value: a resize
 /// updates only the commands that reference it, without re-recording. A
@@ -41,7 +40,10 @@ impl std::fmt::Debug for LayoutSize {
 
 impl LayoutSize {
     /// A layer's size before its host sets one.
-    pub(crate) fn new() -> Self {
+    // Engine seam: the installing surface creates it per layer.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn new() -> Self {
         Self {
             inner: Rc::new(Inner {
                 value: Cell::new(Size::ZERO),
@@ -53,7 +55,9 @@ impl LayoutSize {
     /// Sets the size, notifying bound recordings when it changed. The
     /// context's metadata travels with the change, so an [`Animation`] in
     /// it animates the bound operands.
-    pub(crate) fn set(&self, change: &Context<Size>) {
+    // Engine seam: the layer's layout_size edit calls this.
+    #[doc(hidden)]
+    pub fn set(&self, change: &Context<Size>) {
         if *change.value() == self.inner.value.get() {
             return;
         }
@@ -62,7 +66,10 @@ impl LayoutSize {
     }
 
     /// The change a transaction makes: `size` under `animation`, if any.
-    pub(crate) fn change(size: Size, animation: Option<Animation>) -> Context<Size> {
+    // Engine seam: the layer's layout_size edit builds it.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn change(size: Size, animation: Option<Animation>) -> Context<Size> {
         let context = Context::new(size, Metadata::new());
         match animation {
             Some(animation) => context.with(animation),

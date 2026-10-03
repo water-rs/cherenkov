@@ -1991,6 +1991,6 @@ fn record_op(c: &mut cherenkov::Recorder, op: &Op) {
                 record_op(c, op);
             }
         }),
-        Op::Text { layout, origin } => c.text(layout, *origin),
+        Op::Text { layout, origin } => cherenkov::draw_text(c, layout, *origin),
     }
 }

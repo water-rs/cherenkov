@@ -1,11 +1,11 @@
 //! Glyph runs. Shaping happens outside the engine; a run is positioned glyphs.
 
 use kurbo::{Affine, Stroke};
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-/// A font registered with the engine.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// A font registered with the render target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct FontId(u64);
 
 impl FontId {
@@ -23,7 +23,8 @@ impl FontId {
 }
 
 /// One positioned glyph.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Glyph {
     /// Glyph index in the font.
     pub id: u32,
@@ -37,7 +38,8 @@ pub struct Glyph {
 }
 
 /// How glyphs are drawn.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum GlyphStyle {
     /// Filled outlines.
     #[default]
@@ -47,7 +49,8 @@ pub enum GlyphStyle {
 }
 
 /// A run of glyphs sharing a font, size and variation.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct GlyphRun {
     /// The font.
     pub font: FontId,
@@ -90,6 +93,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "serde")]
     fn serde_round_trips_shared_slices() {
         let run = run();
         let encoded = serde_json::to_string(&run).expect("serialize glyph run");

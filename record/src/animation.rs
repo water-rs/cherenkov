@@ -1,11 +1,9 @@
 //! Animation: the value a nami `Context` metadata may carry, and the
-//! per-lane math the layer tree's tracks evaluate.
+//! per-lane math an animating target's tracks evaluate.
 //!
-//! Tracks animate [`transform`](crate::LayerEdit::transform),
-//! [`opacity`](crate::LayerEdit::opacity) and
-//! [`scroll_offset`](crate::LayerEdit::scroll_offset). Each animatable
-//! property decomposes into lanes: an [`Affine`] has six, a [`Vec2`] two
-//! and an `f32` one.
+//! Tracks animate layer properties — a transform, an opacity, a scroll
+//! offset — and recorded operands. Each animatable property decomposes
+//! into lanes: an [`Affine`] has six, a [`Vec2`] two and an `f32` one.
 
 use std::time::Duration;
 
@@ -142,6 +140,23 @@ pub trait Animatable: Copy + Send + 'static {
     fn into_lanes(self) -> Self::Lanes;
     /// Recomposes from lanes.
     fn from_lanes(lanes: Self::Lanes) -> Self;
+}
+
+/// An immutable description of a running property animation. Backends use
+/// the original presentation-clock start, rather than restarting a curve
+/// when a layer becomes eligible for compositor ownership.
+#[derive(Clone, Copy)]
+pub struct AnimationTrack<T: Animatable> {
+    /// Value at the start, before any interpolation.
+    pub from: T,
+    /// Initial velocity in property units per second, independently per lane.
+    pub velocity: T::Lanes,
+    /// Final property value.
+    pub target: T,
+    /// The curve or physical spring.
+    pub animation: Animation,
+    /// The first presentation time at which the track was sampled.
+    pub start: Instant,
 }
 
 impl Animatable for f64 {
@@ -586,6 +601,7 @@ pub trait AnimLanes: Sized {
     ///
     /// `lanes` must come from an [`AnimLanes::anim_lanes`] call against the
     /// same layout: implementations index it unchecked.
+    #[must_use]
     fn with_lanes(&self, lanes: &[f64]) -> Self;
 }
 
@@ -638,10 +654,11 @@ impl AnimLanes for Stroke {
     }
 }
 
-/// One running animation on a recorded operand, the operand counterpart
-/// of the layer tree's `Track` on the render side. The endpoints are kept
-/// as lanes; the displayed operand rebuilds from the target's layout each
-/// frame.
+/// One running animation on a recorded operand.
+///
+/// The operand counterpart of a layer property's render-side track. The
+/// endpoints are kept as lanes; the displayed operand rebuilds from the
+/// target's layout each frame.
 pub struct OperandTrack {
     /// The lanes the track started from (its retarget snapshot).
     from: Box<[f64]>,

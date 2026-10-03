@@ -122,6 +122,14 @@ pub struct Layer {
     /// others render frame 0.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub live: Vec<Live>,
+    /// The parley input of a text layer, whose `items` are the text's
+    /// lowering: only `glyphs` items, rectangle `fill`s, and plain
+    /// [`Group`]s isolating the glyph runs of a synthetic bold. Only
+    /// the cherenkov adapters honour `text`, recording it through the
+    /// engine's parley adapter; the oracle and the other renderers draw
+    /// the items. See [`crate::TextSource`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<Box<crate::TextSource>>,
 }
 
 /// A layer's projective pose. With column vectors, the layer's
@@ -408,6 +416,7 @@ impl Default for Layer {
             motion: None,
             items: Vec::new(),
             live: Vec::new(),
+            text: None,
         }
     }
 }

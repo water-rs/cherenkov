@@ -9,36 +9,33 @@
 //!
 //! - [`Picture::record`] records constants on any thread into an immutable,
 //!   shareable [`Picture`].
-//! - [`Content::record`] records on the UI thread and accepts nami signals
+//! - [`Surface::record`] records on the UI thread and accepts nami signals
 //!   anywhere a value is accepted. A signal's later changes become
 //!   [`SlotUpdate`]s that regenerate only the commands referencing it.
 //! - [`Engine::render`] drains every surface's queued change set into one
 //!   commit per frame, samples the animations at the frame time and renders
 //!   on the render thread.
 
-mod animation;
+// The recording layer is `cherenkov-record`; these imports keep its
+// modules at their old `crate::*` paths so engine code is unchanged.
+use cherenkov_record::{animation, color, display_list, glyph, paint, record, shape, size, style};
+
 mod backdrop;
 mod backend;
 mod capability;
-mod color;
 mod config;
-mod display_list;
 mod engine;
 mod error;
 mod frame;
-mod glyph;
 mod image;
 #[cfg(target_arch = "wasm32")]
 mod local;
 pub mod lowering;
 mod message;
-mod paint;
 mod projective;
-mod record;
 mod resource;
-mod shape;
-mod style;
 mod surface;
+mod text;
 mod tree;
 
 #[cfg(any(test, feature = "testing"))]
@@ -46,17 +43,22 @@ pub mod testing;
 
 pub use crate::backend::RenderTransfer;
 pub use kurbo;
+/// The shaping library [`TextLayout`] wraps, at the version the engine
+/// lowers.
+pub use parley;
 /// Monotonic presentation clock: std on native, browser performance clock on wasm.
 pub use web_time::Instant;
 
 pub use crate::animation::{
-    Animatable, Animation, Curve, Decay, Lanes, Spring, curve_value, decay_step, settled,
-    spring_step,
+    Animatable, Animation, AnimationTrack, Curve, Decay, Lanes, Spring, curve_value, decay_step,
+    settled, spring_step,
 };
 pub use crate::backdrop::{
     BackdropEffect, BackdropShaderEffect, BackdropShaderSource, ColorMatrix, Refraction, Rim,
 };
-pub use crate::backend::{Backend, Display, Frame, Redraw, Renderer, SurfaceFrame, SurfaceInfo};
+pub use crate::backend::{
+    Backend, Display, Frame, Redraw, Renderer, SurfaceFrame, SurfaceInfo, Visibility,
+};
 pub use crate::capability::{
     Backdrop, BackdropChain, BackdropRuns, BackdropShaders, Effects, ExternalFrames, Filters,
     GpuContent, HdrOutput, Planes, ProjectiveLayers, Runs, ShaderPaint as ShaderPaintCapability,
@@ -68,10 +70,11 @@ pub use crate::color::{
 };
 pub use crate::config::{Budget, Bytes, MemoryUsage, Pressure};
 pub use crate::display_list::{
-    Command, Dirty, DisplayList, Operand, OperandKind, Picture, ScopeError, Slot, SlotUpdate,
+    Command, Dirty, DisplayList, DisplayListView, Operand, OperandKind, OperandRef, Operands,
+    Picture, ScopeError, Slot, SlotUpdate,
 };
-pub use crate::engine::CompletionWaker;
 pub use crate::engine::Engine;
+pub use crate::engine::{CompletionWaker, SurfaceVisibility, WakeGate};
 pub use crate::error::{EngineError, RenderError, ResourceError, SurfaceError};
 pub use crate::frame::{
     DEFAULT_REFRESH, FrameId, FrameStats, FrameTime, FrameTiming, Next, Offscreen, OffscreenFormat,
@@ -82,9 +85,7 @@ pub use crate::image::{
     Astc4x4, Bc7, Etc2Rgba, Format, ImageColorSpace, ImageData, ImageFormat, ImageUpload, Rgba8,
     Rgba16F,
 };
-pub use crate::message::{
-    BackdropId, BackdropShaderId, ContentOp, FontData, LayerId, Prop, SurfaceId,
-};
+pub use crate::message::{BackdropId, ContentOp, FontData, LayerId, Prop, SurfaceId};
 pub use crate::paint::{
     ColorStop, Extend, ImageId, ImagePattern, Interpolation, LinearGradient,
     MeshColorInterpolation, MeshGradient, MeshGradientError, Paint, RadialGradient, Sampling,
@@ -93,16 +94,19 @@ pub use crate::paint::{
 pub use crate::projective::{Projective, ProjectiveError};
 pub use crate::record::{Content, ContentChange, Draw, Fixed, Live, Recorder, StaticRecorder};
 pub use crate::resource::{
-    BackdropGroup, BackdropSample, BackdropShader, Filter, Font, FontSource, Image, ResourceId,
-    Shader,
+    BackdropGroup, BackdropSample, BackdropShader, Filter, Font, FontSource, Image, Shader,
 };
 pub use crate::shape::{
     ContinuousRect, EvenOdd, FillRule, PATH_TOLERANCE, PathRef, Semantic, Shape, ShapeData,
 };
+pub use crate::size::LayoutSize;
 pub use crate::style::{BlendMode, BlendSpace, FilterId, Group, Shadow};
 pub use crate::surface::{
     ExternalFrameHandle, ExternalFrameInstall, GpuContentHandle, Layer, LayerContent, LayerEdit,
     Surface, Transaction,
 };
-pub use crate::tree::{LayerNode, SurfaceTree, snap_animating};
+pub use crate::text::{TextLayout, draw_text};
+pub use crate::tree::{LayerAnimations, LayerNode, SurfaceTree, snap_animating};
+pub use cherenkov_record::BackdropShaderId;
+pub use cherenkov_record::ResourceId;
 pub use kurbo::Stroke;

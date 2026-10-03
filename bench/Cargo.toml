@@ -24,8 +24,15 @@ vello-cpu = ["dep:vello_cpu", "dep:vello_common"]
 # binaries.
 skia = ["dep:skia-safe", "dep:ash", "dep:skia-bindings", "skia-safe/vulkan", "skia-safe/ganesh"]
 skia-metal = ["dep:skia-safe", "dep:objc2", "dep:objc2-metal", "dep:skia-bindings", "skia-safe/metal", "skia-safe/graphite"]
-cherenkov = ["dep:cherenkov", "dep:cherenkov-gpu", "dep:wgpu", "dep:ash", "dep:half", "dep:filtrate"]
-cherenkov-cpu = ["dep:cherenkov", "dep:cherenkov-cpu", "dep:filtrate"]
+# The platform-buffer producers `external-cost` uses are target-gated
+# below; their `dep:` entries resolve only on the matching target.
+cherenkov = [
+    "dep:cherenkov", "dep:cherenkov-gpu", "cherenkov-gpu/bench", "dep:wgpu", "dep:ash",
+    "dep:half", "dep:filtrate", "cherenkov-scene/text",
+    "dep:objc2", "dep:objc2-metal", "dep:objc2-core-video",
+    "dep:objc2-io-surface", "dep:objc2-core-foundation", "dep:ndk-sys",
+]
+cherenkov-cpu = ["dep:cherenkov", "dep:cherenkov-cpu", "dep:filtrate", "cherenkov-scene/text"]
 
 [dependencies]
 cherenkov = { path = "..", optional = true }
@@ -54,12 +61,7 @@ skia-safe = { version = "0.153", optional = true }
 # `no-compile` unifies onto skia-safe's transitive skia-bindings.
 skia-bindings = { version = "0.153", optional = true, default-features = false, features = ["no-compile"] }
 ash = { version = "0.38", optional = true }
-objc2 = { version = "0.6.3", optional = true, default-features = false }
-objc2-metal = { version = "0.3.2", optional = true, default-features = false, features = [
-    "MTLDevice", "MTLCommandQueue", "MTLCommandBuffer",
-    # `CFTimeInterval` for `MTLCommandBuffer::GPUStartTime`/`GPUEndTime`.
-    "objc2-core-foundation",
-] }
+
 wgpu = { version = "30.0.1", optional = true }
 # The `vello-classic`/`vello-hybrid` baselines stay on wgpu 29: the pinned
 # lexoliu/vello forks require `wgpu ^29`. Both majors link into the bench;
@@ -81,6 +83,30 @@ sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# `AHardwareBuffer` producer for `external-cost` (#168).
+[target.'cfg(target_os = "android")'.dependencies]
+ndk-sys = { version = "0.6", optional = true }
+
+# `external-cost`'s `CVPixelBuffer`/`IOSurface` producer (#168) and
+# skia-metal's Metal handle plumbing.
+[target.'cfg(target_vendor = "apple")'.dependencies]
+objc2 = { version = "0.6.3", optional = true, default-features = false }
+objc2-metal = { version = "0.3.2", optional = true, default-features = false, features = [
+    "MTLDevice", "MTLCommandQueue", "MTLCommandBuffer",
+    # `CFTimeInterval` for `MTLCommandBuffer::GPUStartTime`/`GPUEndTime`.
+    "objc2-core-foundation",
+    # `external-cost`'s IOSurface plane textures (#168).
+    "MTLTexture", "MTLPixelFormat", "MTLResource", "MTLAllocation", "objc2-io-surface",
+] }
+objc2-core-video = { version = "0.3", optional = true, default-features = false, features = [
+    "std", "objc2-io-surface", "CVBase", "CVBuffer", "CVImageBuffer",
+    "CVPixelBuffer", "CVPixelBufferIOSurface", "CVReturn",
+] }
+objc2-io-surface = { version = "0.3", optional = true }
+objc2-core-foundation = { version = "0.3", optional = true, default-features = false, features = [
+    "std", "CFBase", "CFString", "CFNumber", "CFDictionary",
+] }
+
 # `staticlib` for hosts that cannot run a command-line binary — the iOS
 # bench app (`bench/ios`) links `cherenkov_bench_run` out of the .a.
 [lib]
@@ -93,4 +119,8 @@ path = "src/bin.rs"
 [[bin]]
 name = "cherenkov-import-frame"
 path = "src/bin/import_frame.rs"
+required-features = ["cherenkov"]
+
+[[example]]
+name = "gamut_gpu_sweep"
 required-features = ["cherenkov"]

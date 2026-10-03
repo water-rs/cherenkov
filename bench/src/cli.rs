@@ -75,6 +75,65 @@ pub(crate) enum PresentPattern {
     Mixed,
 }
 
+/// `external-cost --path` choices (#168): `e` is external-frame import,
+/// `c` is copy-and-convert.
+///
+/// See [`crate::external_cost`].
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub enum ExternalPath {
+    /// Cherenkov external-frame import + composite.
+    #[value(name = "e")]
+    External,
+    /// Copy the planes + convert in a `GpuContent` pass.
+    #[value(name = "c")]
+    Copy,
+}
+
+/// `external-cost --size` choices.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub enum ExternalSize {
+    /// 1920x1080.
+    #[value(name = "1080p")]
+    P1080,
+    /// 3840x2160.
+    #[value(name = "4k")]
+    P4k,
+}
+
+/// `external-cost --transfer` choices.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub enum ExternalTransfer {
+    /// BT.709 video-range 8-bit (NV12).
+    Sdr,
+    /// BT.2020 PQ video-range 10-bit (P010).
+    Pq,
+}
+
+/// The `external-cost` options, assembled by [`run`] for
+/// `crate::external_cost::run` (#168). Absent without the `cherenkov`
+/// feature: the stub command never reads it.
+#[cfg(feature = "cherenkov")]
+pub(crate) struct ExternalCostArgs {
+    /// `e`/`c` — the measured path.
+    pub(crate) path: ExternalPath,
+    /// Frame size.
+    pub(crate) size: ExternalSize,
+    /// Color transfer/layout.
+    pub(crate) transfer: ExternalTransfer,
+    /// Measured frames.
+    pub(crate) frames: u32,
+    /// Warmup frames.
+    pub(crate) warmup: u32,
+    /// Pacing rate in Hz. The CLI always supplies one (`default_value_t`).
+    pub(crate) rate: f64,
+    /// Measure energy.
+    pub(crate) energy: bool,
+    /// Pinned CPUs.
+    pub(crate) cpu: Option<Vec<u32>>,
+    /// Report JSON path.
+    pub(crate) out: PathBuf,
+}
+
 #[derive(Subcommand)]
 enum Sub {
     /// Render scene(s) and report correctness metrics vs the oracle.
@@ -285,6 +344,43 @@ enum Sub {
         /// tone-map shoulder on the `oog` pattern's HDR channels.
         #[arg(long, default_value_t = 4.0)]
         headroom: f32,
+        /// Report JSON path.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Measure the external-frame hand-off (#168): path `e` composites
+    /// a produced platform video buffer in place; path `c` copies its
+    /// planes into engine textures and converts on the GPU — the
+    /// video-gpu model. Requires the `cherenkov` feature and a platform
+    /// buffer API (Apple or Android).
+    ExternalCost {
+        /// `e` external-frame import, `c` copy-and-convert.
+        #[arg(long, value_enum)]
+        path: ExternalPath,
+        /// Frame size.
+        #[arg(long, value_enum)]
+        size: ExternalSize,
+        /// SDR BT.709 (NV12) or HDR BT.2020 PQ (P010).
+        #[arg(long, value_enum)]
+        transfer: ExternalTransfer,
+        /// Measured frames (after warmup).
+        #[arg(long, default_value_t = 60)]
+        frames: u32,
+        /// Warmup frames discarded before measuring.
+        #[arg(long, default_value_t = 30)]
+        warmup: u32,
+        /// Pace the measured frames to this rate in Hz — the 120 Hz
+        /// pacing `measure` and `present-cost` share.
+        #[arg(long, value_name = "HZ", default_value_t = 120.0)]
+        rate: f64,
+        /// Measure energy over the measured window (see
+        /// `measure --energy`).
+        #[arg(long)]
+        energy: bool,
+        /// Pin the run to these CPUs (see `measure --cpu`); Linux and
+        /// Android only.
+        #[arg(long, value_name = "LIST")]
+        cpu: Option<String>,
         /// Report JSON path.
         #[arg(long)]
         out: PathBuf,
@@ -542,6 +638,27 @@ fn run(cli: Cli) -> Result<(), BenchError> {
             headroom,
             &out,
         ),
+        Sub::ExternalCost {
+            path,
+            size,
+            transfer,
+            frames,
+            warmup,
+            rate,
+            energy,
+            cpu,
+            out,
+        } => external_cost_cmd(
+            path,
+            size,
+            transfer,
+            frames,
+            warmup,
+            rate,
+            energy,
+            cpu.as_deref(),
+            &out,
+        ),
         Sub::GamutSweep { out } => crate::gamut_sweep::run(out.as_deref()),
         Sub::ToneSweep { out } => crate::tone_sweep::run(out.as_deref()),
         Sub::Creation {
@@ -601,6 +718,57 @@ fn present_cost_cmd(
 ) -> Result<(), BenchError> {
     Err(BenchError::Engine(
         "present-cost needs the `cherenkov` adapter feature".into(),
+    ))
+}
+
+/// `external-cost` needs the GPU adapter and platform interop (#168).
+#[cfg(feature = "cherenkov")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the stub below takes the same fields; ExternalCostArgs exists only with this feature"
+)]
+fn external_cost_cmd(
+    path: ExternalPath,
+    size: ExternalSize,
+    transfer: ExternalTransfer,
+    frames: u32,
+    warmup: u32,
+    rate: f64,
+    energy: bool,
+    cpu: Option<&str>,
+    out: &Path,
+) -> Result<(), BenchError> {
+    crate::external_cost::run(&ExternalCostArgs {
+        path,
+        size,
+        transfer,
+        frames,
+        warmup,
+        rate,
+        energy,
+        cpu: cpu.map(affinity::parse_cpu_list).transpose()?,
+        out: out.to_path_buf(),
+    })
+}
+
+#[cfg(not(feature = "cherenkov"))]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "matches the cherenkov command; ExternalCostArgs is not built without that feature"
+)]
+fn external_cost_cmd(
+    _path: ExternalPath,
+    _size: ExternalSize,
+    _transfer: ExternalTransfer,
+    _frames: u32,
+    _warmup: u32,
+    _rate: f64,
+    _energy: bool,
+    _cpu: Option<&str>,
+    _out: &Path,
+) -> Result<(), BenchError> {
+    Err(BenchError::Engine(
+        "external-cost needs the `cherenkov` adapter feature".into(),
     ))
 }
 
@@ -1782,6 +1950,8 @@ struct Sweep {
     probes: Vec<CapacityProbe>,
     /// The feature that stopped the sweep before its first probe.
     unsupported: Option<(cherenkov_scene::Feature, Option<&'static str>)>,
+    /// The probe error that stopped the sweep mid-run, if any.
+    error: Option<String>,
     /// Prepare, warmup-frame and post-window snapshots across every
     /// probe, in run order.
     memory_samples: Vec<MemorySnapshot>,
@@ -1973,7 +2143,22 @@ fn sweep_scene(
                         "unsupported"
                     );
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    // A probe error is the engine's own cap on this scene
+                    // (e.g. the bounded glyph atlas exhausting): it bounds
+                    // the sweep like an over-budget probe would, ending it
+                    // at the largest `k` already sustained. It must not
+                    // abort the interleaved sweep for the other engines.
+                    tracing::warn!(
+                        scene = %dir.display(),
+                        engine = engine.info().name,
+                        k,
+                        error = %e,
+                        "probe failed; sweep ends at the last sustained k"
+                    );
+                    sweep.error = Some(e.to_string());
+                    sweep.done = true;
+                }
             }
         }
         if !active {
@@ -1994,6 +2179,7 @@ fn sweep_scene(
                 info: engine.info().clone(),
                 unsupported,
                 missing_api,
+                error: sweep.error.clone(),
                 max_k: sweep.lo,
                 p99_seconds: sweep
                     .probes

@@ -169,9 +169,12 @@ pub struct RailEnergy {
 /// `/sys/bus/iio/devices/iio:device*/` sampled once before the first
 /// measured frame and once after the last; on macOS it is the
 /// `powermetrics` CPU/GPU/ANE package energy over the same window.
+/// On iOS it is the calling process's `ri_energy_nj` delta, excluding
+/// display and compositor-server energy.
 #[derive(Clone, Debug, Serialize)]
 pub struct EnergyReport {
-    /// Meter source: `odpm` or `powermetrics`.
+    /// Meter source: `odpm`, `powermetrics` or `proc_pid_rusage_v6`.
+    /// The iOS source covers only the measured process.
     pub source: &'static str,
     /// Seconds the energy window covered.
     pub window_seconds: f64,
@@ -338,6 +341,11 @@ pub struct CapacityResult {
     /// The upstream API the engine lacks, when known (see
     /// [`UnsupportedReport::missing_api`]).
     pub missing_api: Option<&'static str>,
+    /// The probe error that stopped the sweep mid-run, when one did.
+    /// `max_k` is then the largest `k` sustained before the failure, and
+    /// `p99_seconds_next` the over-budget or failed level.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub error: Option<String>,
     /// The largest probed `k` within the frame budget. `0` means even
     /// `k = 1` exceeded it.
     pub max_k: u32,

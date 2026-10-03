@@ -7,7 +7,6 @@ use std::sync::Arc;
 use kurbo::{BezPath, Circle, Ellipse, Line, PathEl, Point, Rect, RoundedRect, RoundedRectRadii};
 use nami_core::Signal;
 use nami_core::watcher::Context;
-use serde::{Deserialize, Serialize};
 
 /// Tolerance, in the shape's own units, for converting curves that have no
 /// exact Bézier form (such as arcs) into path elements.
@@ -64,7 +63,8 @@ pub struct PathRef<'a> {
 }
 
 /// How the interior of a self-intersecting path is decided.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum FillRule {
     /// A point is inside when the winding number is non-zero.
     #[default]
@@ -117,7 +117,8 @@ impl<T: kurbo::Shape + 'static> Shape for T {
 /// A rectangle with continuous corners: each corner blends into the straight
 /// edges along a superellipse instead of meeting them at a circular arc's
 /// tangent point.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ContinuousRect {
     /// The rectangle.
     pub rect: Rect,
@@ -284,7 +285,8 @@ impl<S: Shape> Shape for EvenOdd<S> {
 }
 
 /// A shape in the display list: an owned [`Semantic`].
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ShapeData {
     /// An axis-aligned rectangle.
     Rect(Rect),

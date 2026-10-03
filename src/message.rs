@@ -106,24 +106,10 @@ impl BackdropId {
     }
 }
 
-/// Identifier of a backdrop effect shader, allocated by
-/// [`Engine::backdrop_shader`](crate::Engine::backdrop_shader).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct BackdropShaderId(u64);
-
-impl BackdropShaderId {
-    /// Creates an identifier from a raw value.
-    #[must_use]
-    pub const fn new(raw: u64) -> Self {
-        Self(raw)
-    }
-
-    /// The raw value.
-    #[must_use]
-    pub const fn raw(self) -> u64 {
-        self.0
-    }
-}
+// `BackdropShaderId` lives in `cherenkov-record` with the other plain
+// resource ids; re-exported so `crate::message::BackdropShaderId` still
+// resolves.
+pub use cherenkov_record::BackdropShaderId;
 
 /// A font crossing to the render thread.
 #[derive(Clone)]
@@ -300,6 +286,8 @@ pub enum Message<B: Backend> {
         id: SurfaceId,
         /// What it renders into.
         target: B::Target,
+        /// The surface's host wake-up, shared with its UI-thread handle.
+        waker: Arc<crate::engine::SurfaceWaker>,
         /// Result of the creation.
         reply: Sender<Result<SurfaceInfo, SurfaceError>>,
     },
@@ -321,6 +309,14 @@ pub enum Message<B: Backend> {
         id: SurfaceId,
         /// The new display properties.
         display: Display,
+    },
+    /// Announce whether the user can see the surface. A hidden surface is
+    /// left out of every frame; becoming visible marks it for presentation.
+    Visibility {
+        /// The surface id.
+        id: SurfaceId,
+        /// The new visibility; always differs from the previous one.
+        visibility: crate::backend::Visibility,
     },
     /// Announce the surface moved to another display: the next frame
     /// carries `display_moved` and re-runs output negotiation (#98).
@@ -358,6 +354,15 @@ pub enum Message<B: Backend> {
         id: ImageId,
         /// The new pixels.
         image: ImageUpload,
+    },
+    /// Apply a hidden surface's changes, sent as they are made: no frame is
+    /// rendered and nothing is sampled, and the releases waiting on the
+    /// surface's installed content are settled.
+    Apply {
+        /// The hidden surface.
+        id: SurfaceId,
+        /// Its changes since the last ones it sent.
+        changes: ChangeSet<B>,
     },
     /// Render every dirty surface for the frame at `time`, applying every
     /// surface's queued change set first.

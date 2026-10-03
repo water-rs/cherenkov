@@ -342,6 +342,64 @@ fn cbdt_and_sbix_glyphs_match_image_draws() {
     );
 }
 
+/// The generated sbix fixture carries a strike PNG in every colour type
+/// and bit depth the decoder accepts; each strike draws identically to
+/// its decoded image.
+#[test]
+fn sbix_strikes_cover_every_png_colour_type() {
+    let engine = engine();
+    let sbix = std::fs::read(SBIX_PATH).expect("sbix fixture");
+    let sbix_font = engine
+        .font(FontSource::bytes(sbix.clone()))
+        .expect("register sbix font");
+    let font = skrifa::FontRef::from_index(&sbix, 0).expect("font");
+    let strikes = BitmapStrikes::with_format(&font, BitmapFormat::Sbix).expect("bitmap strikes");
+    let mut covered = std::collections::BTreeSet::new();
+    for (ppem, size) in [(32.0_f32, 20.0_f32), (96.0_f32, 48.0_f32)] {
+        let strike = strikes
+            .iter()
+            .find(|strike| strike.ppem().to_bits() == ppem.to_bits())
+            .expect("selected strike");
+        for character in ['☕', '⚠', '⚡', '❤', '😀'] {
+            let gid = glyph_id(&sbix, character);
+            let glyph = strike.get(skrifa::GlyphId::new(gid)).expect("bitmap glyph");
+            let BitmapData::Png(png_bytes) = &glyph.data else {
+                panic!("fixture uses PNG payloads");
+            };
+            let decoder = png::Decoder::new(std::io::Cursor::new(png_bytes));
+            let reader = decoder.read_info().expect("PNG");
+            let info = reader.info();
+            covered.insert((info.color_type as u8, info.bit_depth as u8));
+            equivalent(
+                &engine,
+                &sbix_font,
+                &sbix,
+                BitmapFormat::Sbix,
+                gid,
+                ppem,
+                size,
+                Affine::IDENTITY,
+                None,
+            );
+        }
+    }
+    assert_eq!(
+        covered,
+        [
+            (6, 8),
+            (6, 16),
+            (2, 8),
+            (2, 16),
+            (0, 8),
+            (0, 16),
+            (4, 8),
+            (4, 16),
+        ]
+        .into_iter()
+        .collect()
+    );
+}
+
 #[test]
 fn bitmap_cache_reuses_transformed_glyphs_and_uses_font_identity() {
     let engine = engine();

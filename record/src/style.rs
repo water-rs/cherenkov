@@ -1,12 +1,12 @@
 //! Shadows and group styles.
 
 use kurbo::Vec2;
-use serde::{Deserialize, Serialize};
 
 use crate::color::WorkingColor;
 
 /// A shadow cast by a shape.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Shadow {
     /// Standard deviation of the Gaussian blur, in the shape's units.
     pub sigma: f64,
@@ -47,7 +47,8 @@ impl Shadow {
 }
 
 /// How a group's content blends with what lies beneath it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum BlendMode {
     /// Source over.
     #[default]
@@ -109,7 +110,8 @@ pub enum BlendMode {
 }
 
 /// The space in which a group blends.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum BlendSpace {
     /// The linear working space.
     #[default]
@@ -118,8 +120,9 @@ pub enum BlendSpace {
     SrgbEncoded,
 }
 
-/// A filter chain registered with the engine.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// A filter chain registered with the render target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct FilterId(u64);
 
 impl FilterId {
@@ -137,7 +140,8 @@ impl FilterId {
 }
 
 /// The isolation of a group: its opacity, how it blends and its filter.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Group {
     /// Opacity applied to the composited group.
     pub opacity: f32,

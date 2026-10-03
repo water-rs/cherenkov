@@ -610,6 +610,7 @@ fn node_to_item(node: Node, place: Affine, scene_rect: Rect) -> Item {
             projection: None,
             motion: None,
             live: Vec::new(),
+            text: None,
             items: children
                 .into_iter()
                 .map(|n| node_to_item(n, place, scene_rect))
@@ -1088,6 +1089,7 @@ pub fn items_for_glyph_run(
                         sampling: Sampling::Bilinear,
                     })],
                     live: Vec::new(),
+                    text: None,
                 }));
             }
         } else {

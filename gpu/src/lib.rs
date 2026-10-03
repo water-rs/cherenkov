@@ -22,6 +22,8 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+#[cfg(feature = "bench")]
+pub mod bench;
 pub mod interop;
 mod names;
 mod render;
@@ -258,9 +260,8 @@ pub struct WindowTarget {
     #[cfg(target_vendor = "apple")]
     parent: render::planes::apple::Parent,
     size: (u32, u32),
-    transparent: bool,
     refresh: cherenkov::RefreshRange,
-    required_color_space: Option<wgpu::SurfaceColorSpace>,
+    output: render::present::OutputRequest,
     probe: Option<std::sync::mpsc::Sender<interop::DisplayProbe>>,
 }
 
@@ -279,9 +280,12 @@ impl WindowTarget {
             #[cfg(target_vendor = "apple")]
             parent: render::planes::apple::Parent::capture(Box::new(handle)),
             size,
-            transparent: false,
             refresh: cherenkov::DEFAULT_REFRESH,
-            required_color_space: None,
+            output: render::present::OutputRequest {
+                transparent: false,
+                color_space: None,
+                sync: DisplaySync::Synchronized,
+            },
             probe: None,
         }
     }
@@ -292,20 +296,39 @@ impl WindowTarget {
     /// every pixel with no alpha.
     #[must_use]
     pub const fn transparent(mut self, transparent: bool) -> Self {
-        self.transparent = transparent;
+        self.output.transparent = transparent;
         self
     }
 
     /// Requires the swapchain's colour space (#98). Without it the engine
     /// negotiates the surface's best advertised pair — an extended or HDR
     /// space where offered, otherwise a reported SDR selection. With it,
-    /// surface creation fails with [`SurfaceError::UnsupportedTarget`]
-    /// when no format is advertised for the space.
+    /// the surface fails with [`SurfaceError::UnsupportedTarget`] when no
+    /// format is advertised for the space: at creation, or on Apple, where
+    /// the engine creates its layers on the main queue, as the first
+    /// render's [`RenderError::Render`].
     ///
     /// [`SurfaceError::UnsupportedTarget`]: cherenkov::SurfaceError::UnsupportedTarget
+    /// [`RenderError::Render`]: cherenkov::RenderError::Render
     #[must_use]
     pub const fn require_color_space(mut self, color_space: wgpu::SurfaceColorSpace) -> Self {
-        self.required_color_space = Some(color_space);
+        self.output.color_space = Some(color_space);
+        self
+    }
+
+    /// Chooses how presentation is paced against the display (#214).
+    /// The default is [`DisplaySync::Synchronized`], which every surface
+    /// supports. A surface that cannot present as requested fails with
+    /// [`SurfaceError::UnsupportedTarget`] — at creation, or on Apple as
+    /// the first render's [`RenderError::Render`] — and never substitutes
+    /// another mode. The present mode the request resolved to is reported
+    /// as [`OutputSelection::present_mode`](interop::OutputSelection::present_mode).
+    ///
+    /// [`SurfaceError::UnsupportedTarget`]: cherenkov::SurfaceError::UnsupportedTarget
+    /// [`RenderError::Render`]: cherenkov::RenderError::Render
+    #[must_use]
+    pub const fn display_sync(mut self, sync: DisplaySync) -> Self {
+        self.output.sync = sync;
         self
     }
 
@@ -339,6 +362,24 @@ impl WindowTarget {
     pub const fn size(&self) -> (u32, u32) {
         self.size
     }
+}
+
+/// How a window's presentation is paced against the display's refresh —
+/// [`WindowTarget::display_sync`] (#214).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum DisplaySync {
+    /// Every frame waits for the display's vertical blank and is shown
+    /// whole, in order: presentation paces the producer and nothing
+    /// tears (FIFO). Every surface supports it.
+    #[default]
+    Synchronized,
+    /// Presentation never waits for the display: mailbox, where the
+    /// newest frame replaces a queued one and is shown whole at the next
+    /// vertical blank, where the surface supports it; otherwise
+    /// immediate, where a frame is shown at once and may tear. For
+    /// input-latency measurement and benchmarks. A surface that supports
+    /// neither cannot satisfy the request.
+    Unsynchronized,
 }
 
 impl core::fmt::Debug for WindowTarget {

@@ -88,12 +88,15 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use cherenkov::{ContinuousRect, LayerId, RenderError, ShapeData, SurfaceError};
 
-use super::{Composition, Compositor, Level, Placement, Plane, PlaneContent, SystemPlanes};
+use super::{Composition, Compositor, Level, Placement, Plane, PlaneContent, Source, SystemPlanes};
 use crate::interop::{
     ChromaOffset, ExternalFrame, FramePlanes, FrameSync, Primaries, RgbAlpha, Transfer, YuvMatrix,
     YuvRange,
 };
-use crate::render::present::WindowSurface;
+use crate::render::present::{OutputRequest, WindowSurface};
+
+mod animation;
+mod raster;
 
 /// Main-thread storage with asynchronous destruction. Every reference, including
 /// the last one, is released on main; `MainThreadBound::drop` can never dispatch
@@ -193,6 +196,9 @@ impl Parent {
                     planes: Vec::new(),
                     displays: FxHashMap::default(),
                     retired: Vec::new(),
+                    motions: FxHashMap::default(),
+                    rasters: FxHashMap::default(),
+                    retired_rasters: Vec::new(),
                 },
                 mtm,
             ),
@@ -245,6 +251,7 @@ impl Drop for DisplayLayer {
 
 struct PlaneLayers {
     layer: LayerId,
+    raster: bool,
     shape: Vec<(LayerId, bool)>,
     top: Retained<CALayer>,
     levels: Vec<LevelLayers>,
@@ -278,6 +285,9 @@ struct LayerScene {
     /// once but detached from the hierarchy only inside the next `place`'s
     /// transaction, so the removal never commits a frame on its own.
     retired: Vec<DisplayLayer>,
+    motions: FxHashMap<LayerId, super::animation::Motion>,
+    rasters: FxHashMap<LayerId, Retained<CALayer>>,
+    retired_rasters: Vec<Retained<CALayer>>,
 }
 
 impl Drop for LayerScene {
@@ -302,7 +312,7 @@ struct ReadinessIvars {
     scene: Weak<MainThreadBound<RefCell<LayerScene>>>,
     layer: LayerId,
     ready: Weak<AtomicBool>,
-    waker: Option<cherenkov::CompletionWaker>,
+    waker: cherenkov::CompletionWaker,
 }
 
 objc2::define_class!(
@@ -336,9 +346,7 @@ objc2::define_class!(
                 if let Some(flag) = ready.upgrade() {
                     flag.store(is_ready, Ordering::Release);
                 }
-                if let Some(waker) = &waker {
-                    waker.wake();
-                }
+                waker.wake();
             });
         }
     }
@@ -351,7 +359,7 @@ impl ReadinessObserver {
         scene: &MainOwned<LayerScene>,
         layer: LayerId,
         ready: Weak<AtomicBool>,
-        waker: Option<cherenkov::CompletionWaker>,
+        waker: cherenkov::CompletionWaker,
     ) -> Retained<Self> {
         let this = Self::alloc().set_ivars(ReadinessIvars {
             scene: scene.downgrade(),
@@ -370,8 +378,7 @@ struct Configuration {
     adapter: wgpu::Adapter,
     device: wgpu::Device,
     size: (u32, u32),
-    transparent: bool,
-    required: Option<wgpu::SurfaceColorSpace>,
+    output: OutputRequest,
 }
 
 /// The reply's stamp is the config generation the request was issued
@@ -392,7 +399,41 @@ pub struct LayerPlanes {
     candidates: FxHashMap<LayerId, Arc<AtomicBool>>,
     offered: FxHashSet<LayerId>,
     woke: bool,
-    waker: Option<cherenkov::CompletionWaker>,
+    waker: cherenkov::CompletionWaker,
+    owned_animations: Vec<LayerId>,
+    static_candidates: FxHashSet<LayerId>,
+    buffers: FxHashMap<LayerId, raster::Buffer>,
+    placements: Vec<Placement>,
+    motion: MotionState,
+}
+
+/// Tracks installed on the native nodes, and whether those nodes were rebuilt
+/// since the last installation. A present that reuses the nodes leaves the
+/// flag clear: equal descriptors then need no animation transaction.
+#[derive(Default)]
+struct MotionState {
+    tracks: Vec<super::animation::Motion>,
+    tree_changed: bool,
+}
+
+impl MotionState {
+    fn owns(&self, layer: LayerId) -> bool {
+        self.tracks.iter().any(|track| track.layer == layer)
+    }
+
+    const fn placed(&mut self, tree_changed: bool) {
+        self.tree_changed |= tree_changed;
+    }
+
+    fn update(&mut self, tracks: &[super::animation::Motion]) -> bool {
+        if tracks == self.tracks && !self.tree_changed {
+            return false;
+        }
+        self.tree_changed = false;
+        self.tracks.clear();
+        self.tracks.extend_from_slice(tracks);
+        true
+    }
 }
 
 /// An origin-anchored layer: its position is its superlayer point for its
@@ -752,9 +793,29 @@ fn shape(placement: &Placement) -> Vec<(LayerId, bool)> {
         .collect()
 }
 
+/// Whether `place` keeps the native nodes it built for `built`. Reuse is the
+/// leaf, the path shape [`shape`] records, and the raster class stored when
+/// that plane was built. A recorded placement is that class: groom inserts a
+/// raster layer exactly for a recorded candidate.
+fn reuses_native_nodes(built: &Placement, next: &Placement, rasters: &FxHashSet<LayerId>) -> bool {
+    built.layer == next.layer
+        && (built.source == Source::Recorded) == rasters.contains(&next.layer)
+        && built.path.len() == next.path.len()
+        && built
+            .path
+            .iter()
+            .zip(&next.path)
+            .all(|(level, next_level)| {
+                level.layer == next_level.layer && level.clip.is_some() == next_level.clip.is_some()
+            })
+}
+
 /// Applies a level's sampled properties to its layers.
-fn place(level: &Level, layers: &LevelLayers) {
-    layers.node.setAffineTransform(cg_affine(level.transform));
+fn place(level: &Level, layers: &LevelLayers, owns_position: bool) {
+    if !owns_position {
+        layers.node.setPosition(CGPoint::new(0.0, 0.0));
+        layers.node.setAffineTransform(cg_affine(level.transform));
+    }
     if let (Some(clip), Some(layer)) = (&level.clip, &layers.clip) {
         LayerClip::of(clip)
             .expect("eligibility admits only clips a layer expresses")
@@ -785,8 +846,11 @@ impl LayerScene {
                 &config.device,
                 &layer,
                 config.size,
-                config.transparent || !self.parts.is_empty(),
-                config.required,
+                // Parts above the first composite over it.
+                OutputRequest {
+                    transparent: config.output.transparent || !self.parts.is_empty(),
+                    ..config.output
+                },
                 probe.take(),
             )?;
             self.parts.push(layer);
@@ -819,7 +883,7 @@ impl LayerScene {
         layer: LayerId,
         scene: &MainOwned<Self>,
         ready: Weak<AtomicBool>,
-        waker: Option<cherenkov::CompletionWaker>,
+        waker: cherenkov::CompletionWaker,
     ) {
         // SAFETY: creation and every subsequent use are on main.
         let display = unsafe { AVSampleBufferDisplayLayer::new() };
@@ -874,13 +938,14 @@ impl LayerScene {
             outer = scroll.clone();
             levels.push(LevelLayers { node, clip, scroll });
         }
-        let display = &self.displays[&placement.layer].display;
+        let display = self.display(placement.layer);
         levels
             .last()
             .map_or(&*top, LevelLayers::inner)
             .addSublayer(display);
         PlaneLayers {
             layer: placement.layer,
+            raster: self.rasters.contains_key(&placement.layer),
             shape: shape(placement),
             top,
             levels,
@@ -899,31 +964,63 @@ impl LayerScene {
         for retired in self.retired.drain(..) {
             retired.display.removeFromSuperlayer();
         }
+        for retired in self.retired_rasters.drain(..) {
+            retired.removeFromSuperlayer();
+        }
         // Identity, not position, determines reuse. Moving B from slot 1 to
         // slot 0 never consumes or replaces A's display.
         let mut old = std::mem::take(&mut self.planes);
         for placement in placements {
-            let built = old
-                .iter()
-                .position(|p| p.layer == placement.layer && p.shape == shape(placement))
-                .map_or_else(|| self.plane_layers(placement, scale), |i| old.remove(i));
+            let reusable = old.iter().position(|p| {
+                p.layer == placement.layer
+                    && p.shape == shape(placement)
+                    && p.raster == self.rasters.contains_key(&placement.layer)
+            });
+            let built = if let Some(index) = reusable {
+                old.remove(index)
+            } else {
+                // A new native path has no animations, even if its engine
+                // track is unchanged. Reinstall the original timed track.
+                self.motions.remove(&placement.layer);
+                self.plane_layers(placement, scale)
+            };
             built
                 .top
                 .setAffineTransform(cg_affine(Affine::scale(1.0 / scale)));
             for (level, layers) in placement.path.iter().zip(&built.levels) {
-                place(level, layers);
+                place(
+                    level,
+                    layers,
+                    self.motions
+                        .get(&level.layer)
+                        .is_some_and(|motion| motion.position.is_some()),
+                );
             }
-            let display = &self.displays[&placement.layer].display;
+            let display = self.display(placement.layer);
             display.setBounds(CGRect::new(
                 CGPoint::new(0.0, 0.0),
                 CGSize::new(f64::from(placement.size.0), f64::from(placement.size.1)),
             ));
-            display.setOpacity(placement.opacity);
+            display.setAffineTransform(cg_affine(placement.raster));
+            if self
+                .motions
+                .get(&placement.layer)
+                .is_none_or(|motion| motion.opacity.is_none())
+            {
+                display.setOpacity(placement.opacity);
+            }
             display.setName(None);
             self.planes.push(built);
         }
         for plane in old {
             plane.top.removeFromSuperlayer();
+        }
+        for (&layer, raster) in &self.rasters {
+            if !placements.iter().any(|placement| placement.layer == layer) {
+                // SAFETY: main-thread CALayer; removing the last native
+                // reference releases a demoted capture's IOSurface.
+                unsafe { raster.setContents(None) };
+            }
         }
         // A candidate outside the plan — still probing, or demoted when
         // its readiness was lost — parks its display beside the root so
@@ -948,6 +1045,13 @@ impl LayerScene {
         }
         // SAFETY: all elements are layers retained by this main-thread scene.
         unsafe { self.root.setSublayers(Some(&NSArray::from_slice(&order))) };
+    }
+
+    fn display(&self, layer: LayerId) -> &CALayer {
+        match self.rasters.get(&layer) {
+            Some(raster) => raster,
+            None => &self.displays[&layer].display,
+        }
     }
 
     /// Hands `frame` to `layer`'s display layer.
@@ -994,13 +1098,15 @@ struct Update {
 }
 
 impl Update {
-    fn from_plane(plane: &Plane<'_>) -> Self {
-        let PlaneContent::Frame { frame, generation } = &plane.content;
-        Self {
+    fn from_plane(plane: &Plane<'_>) -> Option<Self> {
+        let PlaneContent::Frame { frame, generation } = &plane.content else {
+            return None;
+        };
+        Some(Self {
             layer: plane.placement.layer,
             frame: (*frame).clone(),
             generation: *generation,
-        }
+        })
     }
 }
 
@@ -1011,7 +1117,8 @@ impl LayerPlanes {
     /// Surface negotiation errors are delivered by the completion to compose.
     #[expect(
         clippy::too_many_arguments,
-        reason = "the existing surface negotiation inputs"
+        reason = "the surface negotiation inputs: device triple, parent layer, size, \
+                  output request, probe channel and the completion waker"
     )]
     pub fn new(
         instance: &wgpu::Instance,
@@ -1019,10 +1126,9 @@ impl LayerPlanes {
         device: &wgpu::Device,
         parent: Parent,
         size: (u32, u32),
-        transparent: bool,
-        required: Option<wgpu::SurfaceColorSpace>,
+        output: OutputRequest,
         probe: Option<mpsc::Sender<crate::render::present::DisplayProbe>>,
-        waker: Option<cherenkov::CompletionWaker>,
+        waker: cherenkov::CompletionWaker,
     ) -> Self {
         let mut result = Self {
             scene: parent.scene,
@@ -1031,8 +1137,7 @@ impl LayerPlanes {
                 adapter: adapter.clone(),
                 device: device.clone(),
                 size,
-                transparent,
-                required,
+                output,
             },
             config_generation: 0,
             parts: Vec::new(),
@@ -1042,6 +1147,11 @@ impl LayerPlanes {
             offered: FxHashSet::default(),
             woke: false,
             waker,
+            owned_animations: Vec::new(),
+            static_candidates: FxHashSet::default(),
+            buffers: FxHashMap::default(),
+            placements: Vec::new(),
+            motion: MotionState::default(),
         };
         result.request_parts(1, probe);
         result
@@ -1069,9 +1179,7 @@ impl LayerPlanes {
                 scene.root.removeFromSuperlayer();
                 return;
             }
-            if let Some(waker) = waker {
-                waker.wake();
-            }
+            waker.wake();
         });
     }
 
@@ -1087,7 +1195,8 @@ impl LayerPlanes {
                         // configure the arriving parts to the config now
                         // current, not the one the request captured.
                         for part in &mut parts {
-                            part.reselect(&self.config.adapter, &self.config.device);
+                            part.reselect(&self.config.adapter, &self.config.device)
+                                .map_err(|error| RenderError::Render(error.to_string()))?;
                             part.resize(&self.config.device, self.config.size);
                         }
                     }
@@ -1165,11 +1274,143 @@ impl Compositor for LayerPlanes {
 }
 
 impl SystemPlanes for LayerPlanes {
-    fn compose(&mut self, c: Composition<'_>) -> Result<bool, RenderError> {
+    fn captured_bytes(&self) -> u64 {
+        self.buffers.values().map(raster::Buffer::bytes).sum()
+    }
+    fn animate(&mut self, tree: &cherenkov::SurfaceTree, plan: &super::Plan) {
+        let motions: Vec<_> = plan
+            .planes
+            .iter()
+            .filter_map(|plane| super::animation::motion(tree, plane.layer))
+            .filter(|motion| {
+                super::animation::safe_path(tree, motion.layer, plan.planes.iter().map(|p| p.layer))
+            })
+            .collect();
+        self.owned_animations.clear();
+        self.owned_animations
+            .extend(motions.iter().map(|motion| motion.layer));
+        if !self.motion.update(&motions) {
+            return;
+        }
+        let placements = self.placements.clone();
+        self.scene.run(move |scene, _| {
+            let _tx = Transaction::begin();
+            for plane in &scene.planes {
+                let node = &plane.levels.last().expect("a plane has a layer path").node;
+                let display = scene.display(plane.layer);
+                let next = motions.iter().find(|motion| motion.layer == plane.layer);
+                let previous = scene.motions.get(&plane.layer);
+                let placement = placements
+                    .iter()
+                    .find(|p| p.layer == plane.layer)
+                    .expect("committed placement");
+                if next.is_none_or(|motion| motion.position.is_none()) {
+                    place(
+                        placement.path.last().expect("leaf level"),
+                        plane.levels.last().expect("leaf layers"),
+                        false,
+                    );
+                }
+                if next.is_none_or(|motion| motion.opacity.is_none()) {
+                    display.setOpacity(placement.opacity);
+                }
+                if let Some(motion) = next {
+                    if let Some(position) = motion.position {
+                        let [a, b, c, d] = motion.linear;
+                        node.setAffineTransform(cg_affine(Affine::new([a, b, c, d, 0., 0.])));
+                        node.setPosition(CGPoint::new(position[0].target, position[1].target));
+                    }
+                    if let Some(opacity) = motion.opacity {
+                        #[expect(
+                            clippy::cast_possible_truncation,
+                            reason = "opacity is an f32 property"
+                        )]
+                        display.setOpacity(opacity.target as f32);
+                    }
+                }
+                if previous == next {
+                    continue;
+                }
+                animation::remove(node, "position.x");
+                animation::remove(node, "position.y");
+                animation::remove(display, "opacity");
+                if let Some(motion) = next {
+                    if let Some(position) = motion.position {
+                        animation::install(node, position[0], "position.x");
+                        animation::install(node, position[1], "position.y");
+                    }
+                    if let Some(opacity) = motion.opacity {
+                        animation::install(display, opacity, "opacity");
+                    }
+                }
+            }
+            scene.motions.clear();
+            scene
+                .motions
+                .extend(motions.into_iter().map(|motion| (motion.layer, motion)));
+        });
+    }
+
+    fn owned_animations(&self) -> &[LayerId] {
+        &self.owned_animations
+    }
+
+    fn withdraw_animations(&mut self) {
+        self.owned_animations.clear();
+    }
+
+    fn compose(&mut self, c: Composition<'_>) -> Result<super::Presentation, RenderError> {
+        // The immutable IOSurface is published only after the GPU has
+        // finished its presentation conversion. Until then the committed
+        // scene and all of its old buffers stay visible together.
+        let mut ready = true;
+        let mut contents = Vec::new();
+        self.buffers.retain(|layer, _| {
+            c.planes.iter().any(|plane| {
+                plane.placement.layer == *layer
+                    && matches!(plane.content, PlaneContent::Raster { .. })
+            })
+        });
+        for plane in c.planes {
+            let PlaneContent::Raster { view, generation } = &plane.content else {
+                continue;
+            };
+            let layer = plane.placement.layer;
+            if self.buffers.get(&layer).is_none_or(|buffer| {
+                buffer.generation != *generation
+                    || buffer.headroom.to_bits() != c.display.headroom.to_bits()
+            }) {
+                let buffer = raster::Buffer::new(
+                    c.device,
+                    plane.placement.size,
+                    *generation,
+                    c.display.headroom,
+                )?;
+                buffer.completing(c.queue, self.waker.clone());
+                c.presenter.texture(
+                    c.device,
+                    c.queue,
+                    view.expect("a new native capture has engine pixels"),
+                    crate::interop::TextureOutput {
+                        texture: &buffer.texture,
+                        color: crate::interop::OutputColor::LinearDisplayP3,
+                        alpha: crate::interop::OutputAlpha::Premultiplied,
+                        headroom: c.display.headroom,
+                    },
+                );
+                self.buffers.insert(layer, buffer);
+            }
+            let buffer = &self.buffers[&layer];
+            ready &= buffer.ready.load(Ordering::Acquire);
+            contents.push((layer, raster::Contents(buffer.surface.clone())));
+        }
+        if !ready {
+            return Ok(super::Presentation::Pending);
+        }
         self.collect_parts()?;
         self.request_parts(c.parts.len(), None);
         if self.parts.len() < c.parts.len() {
-            return Ok(false);
+            return Ok(super::Presentation::Pending);
         }
         let mut frames = Vec::with_capacity(c.parts.len());
         for (part, target) in c.parts.iter().zip(&self.parts) {
@@ -1177,7 +1418,7 @@ impl SystemPlanes for LayerPlanes {
                 c.presenter
                     .prepare(c.device, c.queue, target, part.view, c.display.headroom)?
             else {
-                return Ok(false);
+                return Ok(super::Presentation::Retry);
             };
             frames.push(frame);
         }
@@ -1188,29 +1429,43 @@ impl SystemPlanes for LayerPlanes {
             .collect();
         let size = c.size;
         let scale = c.display.scale;
+        let tree_changed = placements.iter().any(|placement| {
+            self.motion.owns(placement.layer)
+                && !self
+                    .placements
+                    .iter()
+                    .any(|built| reuses_native_nodes(built, placement, &self.static_candidates))
+        });
+        self.placements.clone_from(&placements);
+        self.motion.placed(tree_changed);
         let queue = c.queue.clone();
         self.scene.run(move |scene, _| {
             let _tx = Transaction::begin();
+            for (layer, contents) in contents {
+                contents.set(scene.display(layer));
+            }
             scene.place(&placements, size, scale, frames.len());
             for frame in frames {
                 queue.present(frame);
             }
         });
         for plane in c.planes {
-            self.enqueue(Update::from_plane(plane));
+            if let Some(update) = Update::from_plane(plane) {
+                self.enqueue(update);
+            }
         }
-        Ok(true)
+        Ok(super::Presentation::Presented)
     }
 
     fn groom_with_frames(
         &mut self,
-        candidates: &FxHashMap<LayerId, (u32, u32)>,
+        candidates: &FxHashMap<LayerId, super::Candidate>,
         frames: &FxHashMap<LayerId, (ExternalFrame, u64)>,
     ) {
         let removed: Vec<_> = self
             .candidates
             .keys()
-            .filter(|id| !candidates.contains_key(id))
+            .filter(|id| !candidates.contains_key(id) || !frames.contains_key(id))
             .copied()
             .collect();
         for id in removed {
@@ -1224,6 +1479,28 @@ impl SystemPlanes for LayerPlanes {
                     scene.retired.push(display);
                 }
             });
+        }
+        let removed: Vec<_> = self
+            .static_candidates
+            .iter()
+            .filter(|id| !candidates.contains_key(id) || frames.contains_key(id))
+            .copied()
+            .collect();
+        for id in removed {
+            self.static_candidates.remove(&id);
+            self.buffers.remove(&id);
+            self.scene.run(move |scene, _| {
+                if let Some(layer) = scene.rasters.remove(&id) {
+                    scene.retired_rasters.push(layer);
+                }
+            });
+        }
+        for &id in candidates.keys().filter(|id| !frames.contains_key(id)) {
+            if self.static_candidates.insert(id) {
+                self.scene.run(move |scene, _| {
+                    scene.rasters.insert(id, anchored());
+                });
+            }
         }
         self.request_parts(candidates.len().min(Self::BUDGET) + 1, None);
         for &layer in candidates.keys() {
@@ -1251,9 +1528,7 @@ impl SystemPlanes for LayerPlanes {
                     // still be false — readiness lands through the
                     // layer's own notification — but the queued work
                     // is done.
-                    if let Some(waker) = waker {
-                        waker.wake();
-                    }
+                    waker.wake();
                 }
             });
             slot.insert(ready);
@@ -1266,8 +1541,12 @@ impl SystemPlanes for LayerPlanes {
                 generation,
             });
         }
+        let previous = self.offered.len();
         self.offered.retain(|layer| candidates.contains_key(layer));
-        self.woke = false;
+        self.woke = previous != self.offered.len();
+        for &layer in &self.static_candidates {
+            self.woke |= self.offered.insert(layer);
+        }
         for (&layer, ready) in &self.candidates {
             if ready.load(Ordering::Acquire) {
                 self.woke |= self.offered.insert(layer);
@@ -1285,7 +1564,7 @@ impl SystemPlanes for LayerPlanes {
 
     fn prepare(
         &mut self,
-        candidates: &FxHashMap<LayerId, (u32, u32)>,
+        candidates: &FxHashMap<LayerId, super::Candidate>,
         frames: &FxHashMap<LayerId, (ExternalFrame, u64)>,
         ready: &mut FxHashSet<LayerId>,
     ) {
@@ -1297,11 +1576,53 @@ impl SystemPlanes for LayerPlanes {
                 .filter(|(_, flag)| flag.load(Ordering::Acquire))
                 .map(|(&layer, _)| layer),
         );
+        ready.extend(self.static_candidates.iter().copied());
     }
 
     fn refresh<'a>(&mut self, frames: impl Iterator<Item = Plane<'a>>) -> Result<(), RenderError> {
+        let mut changed = Vec::new();
         for plane in frames {
-            self.enqueue(Update::from_plane(&plane));
+            let previous = self
+                .placements
+                .iter_mut()
+                .find(|p| p.layer == plane.placement.layer)
+                .expect("refresh names a committed plane");
+            if previous != plane.placement {
+                previous.clone_from(plane.placement);
+                changed.push(plane.placement.clone());
+            }
+            if let Some(update) = Update::from_plane(&plane) {
+                self.enqueue(update);
+            }
+        }
+        if !changed.is_empty() {
+            self.scene.run(move |scene, _| {
+                let _tx = Transaction::begin();
+                for placement in changed {
+                    let layers = scene
+                        .planes
+                        .iter()
+                        .find(|plane| plane.layer == placement.layer)
+                        .expect("refresh names a committed plane");
+                    for (level, layers) in placement.path.iter().zip(&layers.levels) {
+                        place(
+                            level,
+                            layers,
+                            scene
+                                .motions
+                                .get(&level.layer)
+                                .is_some_and(|motion| motion.position.is_some()),
+                        );
+                    }
+                    if scene
+                        .motions
+                        .get(&placement.layer)
+                        .is_none_or(|motion| motion.opacity.is_none())
+                    {
+                        scene.display(placement.layer).setOpacity(placement.opacity);
+                    }
+                }
+            });
         }
         Ok(())
     }
@@ -1314,13 +1635,18 @@ impl SystemPlanes for LayerPlanes {
         }
     }
 
-    fn reselect(&mut self, adapter: &wgpu::Adapter, device: &wgpu::Device) {
+    fn reselect(
+        &mut self,
+        adapter: &wgpu::Adapter,
+        device: &wgpu::Device,
+    ) -> Result<(), SurfaceError> {
         self.config.adapter = adapter.clone();
         self.config.device = device.clone();
         self.config_generation += 1;
         for part in &mut self.parts {
-            part.reselect(adapter, device);
+            part.reselect(adapter, device)?;
         }
+        Ok(())
     }
 }
 

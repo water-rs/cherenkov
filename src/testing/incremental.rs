@@ -44,7 +44,11 @@ where
     let mut size = (96, 96);
     for id in ids {
         renderer
-            .create_surface(id, Offscreen::new(size, OffscreenFormat::LinearF16).into())
+            .create_surface(
+                id,
+                Offscreen::new(size, OffscreenFormat::LinearF16).into(),
+                unhosted_waker(),
+            )
             .expect("surface");
         let _ = renderer.set_content(
             id,
@@ -156,7 +160,11 @@ where
     let mut size = (96, 96);
     for id in ids {
         renderer
-            .create_surface(id, Offscreen::new(size, OffscreenFormat::LinearF16).into())
+            .create_surface(
+                id,
+                Offscreen::new(size, OffscreenFormat::LinearF16).into(),
+                unhosted_waker(),
+            )
             .expect("surface");
         let _ = renderer.set_content(
             id,
@@ -668,4 +676,20 @@ async fn assert_patch_counts<R: Renderer>(
         u32::try_from(list.len()).unwrap(),
         "a glyph-count change must rebuild only its layer"
     );
+}
+
+/// A surface wake-up with no host behind it: the harness drives the
+/// renderer directly and renders on its own schedule.
+#[cfg_attr(
+    target_arch = "wasm32",
+    expect(
+        clippy::arc_with_non_send_sync,
+        reason = "the browser engine's waker is single-threaded; `Arc` matches the native type"
+    )
+)]
+fn unhosted_waker() -> crate::CompletionWaker {
+    let engine = std::sync::Arc::new(crate::engine::Waker::new());
+    crate::CompletionWaker::new(&std::sync::Arc::new(crate::engine::SurfaceWaker::new(
+        engine,
+    )))
 }

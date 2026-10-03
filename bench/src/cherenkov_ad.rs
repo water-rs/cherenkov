@@ -30,7 +30,9 @@ use cherenkov_scene::{
 use filtrate::{FilterExt, FilterImage, filters};
 use kurbo::{Affine, BezPath, Circle, Ellipse, Line, Rect, RoundedRect, Vec2};
 
-use crate::convert::{self, Blobs, Op, ShapeKind, engine_blend, group_op, op, shape_kind, working};
+use crate::convert::{
+    self, Blobs, Op, ShapeKind, engine_blend, group_op, op, shape_kind, text_op, working,
+};
 use crate::memory::{AdapterMemory, EngineBytes, Reading, wgpu_allocator, wgpu_vk_memory_budget};
 use crate::motion::{Clock, LayerMotion, LayerProjection, motion_animation};
 use crate::timing::Timings;
@@ -123,7 +125,7 @@ fn shape_op(op: &Op) -> Option<LiveShape> {
         Op::Stroke { shape, .. } | Op::Shadow { shape, .. } => {
             Some(LiveShape::of(shape, cherenkov::FillRule::NonZero))
         }
-        Op::Glyphs { .. } | Op::Image { .. } | Op::Group { .. } => None,
+        Op::Glyphs { .. } | Op::Image { .. } | Op::Group { .. } | Op::Text { .. } => None,
     }
 }
 
@@ -133,7 +135,7 @@ fn paint_op(op: &Op) -> Option<cherenkov::Paint> {
         Op::Fill { paint, .. } | Op::Stroke { paint, .. } | Op::Glyphs { paint, .. } => {
             Some(paint.clone())
         }
-        Op::Shadow { .. } | Op::Image { .. } | Op::Group { .. } => None,
+        Op::Shadow { .. } | Op::Image { .. } | Op::Group { .. } | Op::Text { .. } => None,
     }
 }
 
@@ -355,6 +357,7 @@ fn record_live(c: &mut cherenkov::Recorder, op: &Op, bindings: &LiveBindings) {
                 record_op(c, op);
             }
         }),
+        Op::Text { .. } => unreachable!("a text layer carries no live items"),
     }
 }
 
@@ -381,7 +384,7 @@ fn record_motion(c: &mut cherenkov::Recorder, op: &Op, motion: &PaintMotion) {
             );
         }
         Op::Glyphs { run, .. } => c.glyphs(nami::constant(run.clone()), paint),
-        Op::Image { .. } | Op::Shadow { .. } | Op::Group { .. } => {
+        Op::Image { .. } | Op::Shadow { .. } | Op::Group { .. } | Op::Text { .. } => {
             unreachable!("a paint motion only ever binds a paint operand")
         }
     }
@@ -1247,6 +1250,14 @@ fn prep_layer(
             .map(LayerProjection::from_scene)
             .transpose()?,
     };
+    // A text layer records its source through the engine's parley
+    // adapter; its items are the reference lowering the oracle draws.
+    if let Some(text) = &layer.text {
+        prep.own
+            .ops
+            .push(text_op(text, fonts, images, blobs, &FRONT)?);
+        return Ok(prep);
+    }
     if own {
         for (index, item) in layer.items.iter().enumerate() {
             match item {
@@ -1980,5 +1991,6 @@ fn record_op(c: &mut cherenkov::Recorder, op: &Op) {
                 record_op(c, op);
             }
         }),
+        Op::Text { layout, origin } => cherenkov::draw_text(c, layout, *origin),
     }
 }

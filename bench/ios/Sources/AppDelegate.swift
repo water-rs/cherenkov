@@ -5,26 +5,20 @@ private let logger = Logger(subsystem: "dev.cherenkov", category: "bench")
 
 @main
 final class AppDelegate: UIResponder, UIApplicationDelegate {
-    var window: UIWindow?
+    /// The status view the scene's window hosts; the runner drives it.
+    let status = StatusViewController()
     private var originalBrightness: CGFloat = UIScreen.main.brightness
 
     func application(
         _ application: UIApplication,
         didFinishLaunchingWithOptions _: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
-        // A real window keeps the app in the foreground — iOS forbids
-        // GPU work in the background, so the run must stay foregrounded.
-        let window = UIWindow(frame: UIScreen.main.bounds)
-        let status = StatusViewController()
-        window.rootViewController = status
-        window.makeKeyAndVisible()
-        self.window = window
-
         application.isIdleTimerDisabled = true
         originalBrightness = UIScreen.main.brightness
         UIScreen.main.brightness = 0
         logger.info("launch: idle timer disabled, brightness -> 0")
 
+        let status = status
         Thread.detachNewThread { [weak self] in
             let code = BenchRunner(delegate: status).runAll()
             DispatchQueue.main.async {
@@ -32,8 +26,11 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
                 if let brightness = self?.originalBrightness {
                     UIScreen.main.brightness = brightness
                 }
+                logger.info("all runs done; exit code \(code)")
+                if CommandLine.arguments.contains("--exit-after-run") {
+                    exit(code)
+                }
             }
-            logger.info("all runs done; exit code \(code)")
         }
         return true
     }

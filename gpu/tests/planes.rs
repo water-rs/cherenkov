@@ -45,7 +45,7 @@ mod macos {
     use cherenkov_gpu::interop::{
         ExternalFrame, FrameColor, RgbAlpha, SharedDevice, YuvRange, metal::import_texture, wgpu,
     };
-    use cherenkov_gpu::{Gpu, GpuConfig, WindowTarget};
+    use cherenkov_gpu::{DisplaySync, Gpu, GpuConfig, WindowTarget};
     use dispatch2::DispatchQueue;
     use libtest_mimic::Trial;
     use objc2::rc::Retained;
@@ -88,6 +88,22 @@ mod macos {
         };
         vec![
             case(
+                "periodic_replacements_preserve_static_readmission_history",
+                periodic_replacements_preserve_static_readmission_history,
+            ),
+            case(
+                "static_pixels_are_captured_once_and_match_engine_composition",
+                static_pixels_are_captured_once_and_match_engine_composition,
+            ),
+            case(
+                "critical_trim_then_present_only_demotes_static_planes",
+                || static_pixels(true),
+            ),
+            case(
+                "promoted_translation_is_owned_by_core_animation",
+                promoted_translation_is_owned_by_core_animation,
+            ),
+            case(
                 "the_realized_tree_puts_the_plane_between_its_parts",
                 the_realized_tree_puts_the_plane_between_its_parts,
             ),
@@ -122,6 +138,18 @@ mod macos {
             case(
                 "a_translucent_layer_above_stays_in_the_engine_and_matches",
                 a_translucent_layer_above_stays_in_the_engine_and_matches,
+            ),
+            case(
+                "a_promoted_layer_painted_last_composes",
+                a_promoted_layer_painted_last_composes,
+            ),
+            case(
+                "two_promoted_layers_with_the_last_painted_last_compose",
+                two_promoted_layers_with_the_last_painted_last_compose,
+            ),
+            case(
+                "every_part_presents_with_the_requested_display_sync",
+                every_part_presents_with_the_requested_display_sync,
             ),
         ]
     }
@@ -594,6 +622,11 @@ mod macos {
 
     impl Fixture {
         fn new() -> Self {
+            Self::with(|target| target)
+        }
+
+        /// The fixture over the window target `configure` returns.
+        fn with(configure: impl FnOnce(WindowTarget) -> WindowTarget) -> Self {
             let mtm = MainThreadMarker::new().expect("the cases run on the main thread");
             let metal = metal();
             let engine = Engine::<Gpu>::new(GpuConfig {
@@ -613,10 +646,10 @@ mod macos {
             host.setContentsScale(SCALE);
             let system = SystemCompositor::attach(&metal, &host);
             let window = engine
-                .surface(WindowTarget::new(
+                .surface(configure(WindowTarget::new(
                     View(dispatch2::MainThreadBound::new(view.clone(), mtm)),
                     SIZE,
-                ))
+                )))
                 .expect("a window surface");
             window
                 .display(Display {
@@ -818,6 +851,42 @@ mod macos {
     /// order.
     fn stack(fixture: &Fixture) -> Vec<Retained<CALayer>> {
         sublayers(&fixture.root())
+    }
+
+    /// Every part's metal layer is configured with the present mode the
+    /// window's `DisplaySync` resolves to on this Mac — the first part and
+    /// the parts a promoted plane splits off above it. wgpu's Metal
+    /// backend advertises FIFO and immediate on macOS and realizes them
+    /// as the layer's `displaySyncEnabled` (#214).
+    fn every_part_presents_with_the_requested_display_sync() {
+        for (sync, display_sync) in [
+            (DisplaySync::Synchronized, true),
+            (DisplaySync::Unsynchronized, false),
+        ] {
+            let fixture = Fixture::with(|target| target.display_sync(sync));
+            let buffer = bgra_buffer();
+            let _scene = scene_bar(
+                &fixture.engine,
+                &fixture.window,
+                bgra(&fixture.metal, &buffer, FrameColor::SRGB),
+                1.0,
+            );
+            // Two parts when the platform promotes the frame, one when it
+            // keeps it in the engine; either way every part is checked.
+            let parts_expected = if fixture.promote() { 2 } else { 1 };
+            let parts: Vec<_> = stack(&fixture)
+                .into_iter()
+                .filter_map(|layer| layer.downcast::<CAMetalLayer>().ok())
+                .collect();
+            assert_eq!(parts.len(), parts_expected, "{sync:?}: the window's parts");
+            for part in parts {
+                assert_eq!(
+                    part.displaySyncEnabled(),
+                    display_sync,
+                    "{sync:?}: a part's display sync"
+                );
+            }
+        }
     }
 
     /// The plane sits between the part painted below it and the part
@@ -1076,15 +1145,250 @@ mod macos {
         }
     }
 
+    fn periodic_replacements_preserve_static_readmission_history() {
+        let fixture = Fixture::new();
+        let layer = fixture.window.layer();
+        fixture.window.update(|tx| {
+            tx[fixture.window.root()].push(&layer);
+        });
+        for cycle in 0..4 {
+            let pixels = fixture.window.record(|c| {
+                c.fill(Rect::new(8., 6., 80., 54.), WorkingColor::WHITE);
+            });
+            fixture.window.update(|tx| {
+                tx[&layer].content(pixels);
+            });
+            fixture.render();
+            for offset in 1..=2 {
+                fixture.window.update(|tx| {
+                    tx[&layer].transform(Affine::translate((f64::from(cycle * 3 + offset), 0.)));
+                });
+                fixture.render();
+                if cycle > 0 {
+                    assert_eq!(
+                        fixture.engine.stats().passes,
+                        1,
+                        "a periodic edit must stay in one engine pass, without a capture pass"
+                    );
+                }
+            }
+        }
+    }
+
+    fn static_pixels_are_captured_once_and_match_engine_composition() {
+        static_pixels(false);
+    }
+
+    fn static_headroom_completion(fixture: &Fixture) {
+        fixture.woke.store(false, Ordering::Release);
+        fixture
+            .window
+            .display(Display {
+                scale: SCALE,
+                headroom: 2.0,
+            })
+            .expect("new output headroom");
+        assert_eq!(
+            fixture.engine.render(FrameTime::now()).expect("recapture"),
+            cherenkov::Next::Idle
+        );
+        // No render, readback, queue submission or device poll while waiting:
+        // the conversion itself must wake an otherwise idle engine.
+        drive(
+            Instant::now() + Duration::from_secs(10),
+            &|| fixture.woke.load(Ordering::Acquire),
+            &|| "capture conversion failed to wake the idle engine".into(),
+        );
+        fixture.render();
+        assert_eq!(stack(fixture).len(), 2);
+    }
+
+    fn static_pixels(trim: bool) {
+        let fixture = Fixture::new();
+        let offscreen = fixture
+            .engine
+            .surface(Offscreen::new(SIZE, OffscreenFormat::LinearF16))
+            .expect("offscreen");
+        let build = |surface: &Surface<Gpu>| {
+            surface.clear_color(WorkingColor::BLACK);
+            let layer = surface.layer();
+            let pixels = surface.record(|c| {
+                c.fill(
+                    Rect::new(8., 6., 80., 54.),
+                    WorkingColor::new([0.08, 0.6, 0.2, 1.]),
+                );
+                c.fill(
+                    Rect::new(16., 12., 40., 36.),
+                    WorkingColor::new([0.7, 0.1, 0.3, 1.]),
+                );
+            });
+            surface.update(|tx| {
+                tx[surface.root()].push(&layer);
+                tx[&layer].content(pixels);
+            });
+            layer
+        };
+        let layer = build(&fixture.window);
+        let reference = build(&offscreen);
+        fixture.render();
+        for x in [1., 2.] {
+            for (surface, layer) in [(&fixture.window, &layer), (&offscreen, &reference)] {
+                surface.update(|tx| {
+                    tx[layer].transform(Affine::translate((x, 0.)));
+                });
+            }
+            fixture.render();
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while stack(&fixture).len() != 2 {
+            fixture.woke.store(false, Ordering::Relaxed);
+            fixture.render();
+            if stack(&fixture).len() == 2 {
+                break;
+            }
+            drive(deadline, &|| fixture.woke.load(Ordering::Acquire), &|| {
+                "static plane completion never arrived".into()
+            });
+        }
+        engine_parity(&fixture, &offscreen, "static IOSurface");
+        if trim {
+            fixture.engine.trim(cherenkov::Pressure::Critical);
+            fixture
+                .window
+                .display(Display {
+                    scale: SCALE,
+                    headroom: 2.0,
+                })
+                .expect("headroom-only update");
+            fixture.render();
+            assert_eq!(stack(&fixture).len(), 1, "trim demotes before presentation");
+            assert!(
+                fixture.engine.stats().passes > 0,
+                "trim reconstructs engine pixels"
+            );
+            engine_parity(&fixture, &offscreen, "trim then present only");
+            fixture.window.display_moved().expect("display move");
+            fixture.render();
+            assert_eq!(stack(&fixture).len(), 1);
+            return;
+        }
+        static_headroom_completion(&fixture);
+        fixture
+            .window
+            .update_animated(cherenkov::Curve::linear(Duration::from_secs(2)), |tx| {
+                tx[&layer].transform(Affine::translate((12., 0.)));
+            });
+        assert_eq!(
+            fixture.engine.render(FrameTime::now()).expect("handoff"),
+            cherenkov::Next::Idle
+        );
+        assert_eq!(fixture.engine.stats().passes, 0);
+        drop(layer);
+        fixture.render();
+        assert_eq!(stack(&fixture).len(), 1);
+    }
+
+    /// A native translation owns scheduling and cancels on a snap.
+    fn promoted_translation_is_owned_by_core_animation() {
+        let fixture = Fixture::new();
+        let buffer = bgra_buffer();
+        let video = fixture.window.layer();
+        let frame = fixture
+            .engine
+            .external_frame(bgra(&fixture.metal, &buffer, FrameColor::SRGB));
+        fixture.window.update(|tx| {
+            tx[fixture.window.root()].push(&video);
+            tx[&video].content(frame);
+        });
+        assert!(
+            fixture.promote(),
+            "the compositor must accept the BGRA plane"
+        );
+        fixture
+            .window
+            .update_animated(cherenkov::Curve::linear(Duration::from_secs(2)), |tx| {
+                tx[&video].transform(Affine::translate((24., 16.)));
+            });
+        let next = fixture
+            .engine
+            .render(FrameTime::now())
+            .expect("handoff frame");
+        assert_eq!(next, cherenkov::Next::Idle);
+        assert_eq!(
+            fixture.engine.stats().passes,
+            0,
+            "a plane pose needs no engine pass"
+        );
+        drain_main();
+        let display = displays(&fixture.root()).pop().expect("promoted display");
+        let scroll = display.superlayer().expect("scroll layer");
+        let node = scroll.superlayer().expect("transform layer");
+        // SAFETY: the layer and its animation are confined to main.
+        assert!(
+            unsafe { node.animationForKey(&objc2_foundation::NSString::from_str("position.x")) }
+                .is_some()
+        );
+        assert_eq!(node.position(), CGPoint::new(24., 16.));
+        // A new video frame and a full present-only compose must leave
+        // the compositor-owned affine/position pair intact.
+        let replacement =
+            fixture
+                .engine
+                .external_frame(bgra(&fixture.metal, &buffer, FrameColor::SRGB));
+        fixture.window.update(|tx| {
+            tx[&video].content(replacement);
+        });
+        fixture.render();
+        assert_eq!(node.position(), CGPoint::new(24., 16.));
+        assert_eq!(node.affineTransform().tx, 0.0);
+        fixture
+            .window
+            .display(Display {
+                scale: SCALE,
+                headroom: 2.0,
+            })
+            .expect("headroom-only compose");
+        fixture.render();
+        assert_eq!(node.position(), CGPoint::new(24., 16.));
+        assert_eq!(node.affineTransform().tx, 0.0);
+        fixture
+            .window
+            .visibility(cherenkov::Visibility::Hidden)
+            .expect("hide animated plane");
+        assert!(matches!(
+            fixture.engine.render(FrameTime::now()),
+            Err(cherenkov::RenderError::Hidden)
+        ));
+        fixture
+            .window
+            .visibility(cherenkov::Visibility::Visible)
+            .expect("show animated plane");
+        assert_eq!(
+            fixture
+                .engine
+                .render(FrameTime::now())
+                .expect("shown frame"),
+            cherenkov::Next::Idle
+        );
+        fixture.window.update(|tx| {
+            tx[&video].transform(Affine::translate((8., 4.)));
+        });
+        fixture.render();
+        // SAFETY: the layer and its animation are confined to main.
+        assert!(
+            unsafe { node.animationForKey(&objc2_foundation::NSString::from_str("position.x")) }
+                .is_none()
+        );
+        assert_eq!(node.position(), CGPoint::new(0., 0.));
+        assert_eq!(node.affineTransform().tx, 8.);
+        drop(video);
+        fixture.render();
+        assert_eq!(displays(&fixture.root()).len(), 0);
+    }
+
     /// The system compositor's result for the promoted stack matches the
-    /// engine's own composition of the same tree within a perceptual
-    /// tolerance: FLIP mean at most 0.05 and no local error above 0.25.
-    ///
-    /// The frame is opaque BGRA declared sRGB — the platform and the
-    /// engine produce identical pixels from it, so the comparison
-    /// measures promotion (order, geometry, blending), not the
-    /// platform's YCbCr decoder, whose studio-range expansion differs
-    /// from the engine's on this target.
+    /// engine's own composition within FLIP mean 0.05 and maximum 0.25.
+    /// The opaque BGRA/sRGB frame isolates geometry and blending from YUV decoding.
     fn promoted_composition_matches_engine_composition() {
         let fixture = Fixture::new();
         let buffer = surface_buffer(VIDEO.0, VIDEO.1, kCVPixelFormatType_32BGRA);
@@ -1217,5 +1521,87 @@ mod macos {
             &offscreen,
             "engine-composited video under a translucent layer",
         );
+    }
+
+    /// One scaled video layer under the root and nothing else — the
+    /// `apple_planes` `overlay` tree: the promoted layer is the last
+    /// painted, so `Plan::trailing` is false and the surface has one
+    /// part. The composite stack is the part, then the plane.
+    fn a_promoted_layer_painted_last_composes() {
+        let fixture = Fixture::new();
+        let buffer = bgra_buffer();
+        let frame = bgra(&fixture.metal, &buffer, FrameColor::SRGB);
+        let video = fixture.engine.external_frame(frame);
+        let layer = fixture.window.layer();
+        fixture.window.update(|tx| {
+            tx[fixture.window.root()].push(&layer);
+            tx[&layer]
+                .transform(Affine::scale(
+                    f64::from(SIZE.0) / f64::from(u32::try_from(VIDEO.0).expect("fits")),
+                ))
+                .content(video);
+        });
+        assert!(
+            fixture.promote(),
+            "the platform never reported the candidate ready"
+        );
+        // part 0, then the plane nested in its path's levels.
+        let stack = stack(&fixture);
+        let [part, plane] = &stack[..] else {
+            panic!("one part under the plane, found {} layers", stack.len());
+        };
+        assert!(is::<CAMetalLayer>(part));
+        assert!(!is::<CAMetalLayer>(plane));
+        assert_eq!(displays(&fixture.root()).len(), 1, "one promoted plane");
+    }
+
+    /// Two video layers promoted together with the second painted last:
+    /// the empty part between them still exists (the planes need a layer
+    /// between them in the stack), and no part opens after the last one.
+    /// The composite stack is part, plane, part, plane.
+    fn two_promoted_layers_with_the_last_painted_last_compose() {
+        let fixture = Fixture::new();
+        let layer = |x: f64| {
+            let buffer = bgra_buffer();
+            let frame = bgra(&fixture.metal, &buffer, FrameColor::SRGB);
+            let video = fixture.engine.external_frame(frame);
+            let layer = fixture.window.layer();
+            fixture.window.update(|tx| {
+                tx[fixture.window.root()].push(&layer);
+                tx[&layer]
+                    .transform(
+                        Affine::translate((x, 0.0))
+                            * Affine::scale(
+                                f64::from(SIZE.0 / 2)
+                                    / f64::from(u32::try_from(VIDEO.0).expect("fits")),
+                            ),
+                    )
+                    .content(video);
+            });
+            layer
+        };
+        let _first = layer(0.0);
+        let _second = layer(f64::from(SIZE.0 / 2));
+        assert!(
+            fixture.promote(),
+            "the platform never reported a candidate ready"
+        );
+        // Each candidate promotes on its own readiness round.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while displays(&fixture.root()).len() < 2 {
+            assert!(Instant::now() < deadline, "the second plane never showed");
+            drain_main();
+            fixture.engine.render(FrameTime::now()).expect("rendered");
+            drain_main();
+        }
+        // part 0, plane, the separator part, plane — the planes nest in
+        // their paths' levels.
+        let stack = stack(&fixture);
+        let [first, plane_a, second, plane_b] = &stack[..] else {
+            panic!("part, plane, part, plane — found {} layers", stack.len());
+        };
+        assert!(is::<CAMetalLayer>(first));
+        assert!(is::<CAMetalLayer>(second));
+        assert!(!is::<CAMetalLayer>(plane_a) && !is::<CAMetalLayer>(plane_b));
     }
 }

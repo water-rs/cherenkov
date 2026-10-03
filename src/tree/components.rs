@@ -18,6 +18,32 @@ pub(super) struct Components {
 }
 
 impl Components {
+    pub(super) fn translation_animation(&self) -> Option<crate::AnimationTrack<Affine>> {
+        if self.rotation_track.is_some()
+            || self.scale_track.is_some()
+            || self.skew_track.is_some()
+            || self.pivot_track.is_some()
+        {
+            return None;
+        }
+        let track = self.translation_track.as_ref()?.description()?;
+        let matrix = self.matrix();
+        let map = |translation: Vec2| {
+            let delta = translation - self.translation;
+            Affine::translate(self.base * delta.to_point() - self.base * kurbo::Point::ORIGIN)
+                * matrix
+        };
+        let velocity = self.base * Vec2::from_lanes(track.velocity).to_point()
+            - self.base * kurbo::Point::ORIGIN;
+        Some(crate::AnimationTrack {
+            from: map(track.from),
+            velocity: [0., 0., 0., 0., velocity.x, velocity.y],
+            target: map(track.target),
+            animation: track.animation,
+            start: track.start,
+        })
+    }
+
     const fn new(base: Affine) -> Self {
         Self {
             base,

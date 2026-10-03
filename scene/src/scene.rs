@@ -221,7 +221,84 @@ impl Scene {
         }
         scene.validate_backdrops()?;
         scene.validate_projections()?;
+        scene.validate_text()?;
         Ok(scene)
+    }
+
+    /// A text layer's source must name fonts and character-boundary
+    /// ranges, and its items must be a text lowering: glyph runs, non-zero
+    /// rectangle fills and plain groups of glyph runs, with no live items
+    /// or paint motion.
+    fn validate_text(&self) -> Result<(), SceneError> {
+        fn source(text: &crate::TextSource) -> Result<(), SceneError> {
+            if text.fonts.is_empty() {
+                return Err(SceneError::InvalidText("the font stack is empty"));
+            }
+            for span in &text.spans {
+                let [start, end] = span.range;
+                if start > end
+                    || !text.text.is_char_boundary(start)
+                    || !text.text.is_char_boundary(end)
+                {
+                    return Err(SceneError::InvalidText(
+                        "a span range is not a character-boundary range of the text",
+                    ));
+                }
+            }
+            Ok(())
+        }
+        /// A group a synthetic bold isolates its glyph runs in: opaque,
+        /// normally blended, in linear space.
+        #[expect(
+            clippy::float_cmp,
+            reason = "only the exact default opacity leaves the group plain"
+        )]
+        fn plain_glyph_group(group: &crate::Group) -> bool {
+            group.opacity == 1.0
+                && group.blend == crate::BlendMode::Normal
+                && group.blend_space == crate::BlendSpace::Linear
+                && group
+                    .items
+                    .iter()
+                    .all(|item| matches!(item, crate::GroupItem::Draw(Draw::Glyphs(_))))
+        }
+        fn walk(layer: &Layer) -> Result<(), SceneError> {
+            if let Some(text) = &layer.text {
+                source(text)?;
+                if !layer.live.is_empty()
+                    || matches!(layer.motion, Some(crate::Motion::Paint { .. }))
+                {
+                    return Err(SceneError::InvalidText(
+                        "a text layer's items are not live or animated",
+                    ));
+                }
+                let lowered = layer.items.iter().all(|item| match item {
+                    Item::Draw(
+                        Draw::Glyphs(_)
+                        | Draw::Fill {
+                            shape: crate::Shape::Rect(_),
+                            rule: crate::FillRule::NonZero,
+                            ..
+                        },
+                    ) => true,
+                    Item::Group(group) => plain_glyph_group(group),
+                    Item::Draw(_) | Item::Layer(_) => false,
+                });
+                if !lowered {
+                    return Err(SceneError::InvalidText(
+                        "a text layer's items are its glyph runs, decoration rectangles \
+                         and plain groups of glyph runs",
+                    ));
+                }
+            }
+            for item in &layer.items {
+                if let Item::Layer(l) = item {
+                    walk(l)?;
+                }
+            }
+            Ok(())
+        }
+        walk(&self.root)
     }
 
     /// The scene root is never projective (it is the surface), a tilt
@@ -402,6 +479,9 @@ fn collect_group_resource_refs(group: &crate::Group, out: &mut Vec<ResourceHash>
 fn collect_resource_refs(layer: &Layer, out: &mut Vec<ResourceHash>) {
     if let Some(crate::LayerFilter::BlendImage { image, .. }) = layer.filter.as_deref() {
         out.push(*image);
+    }
+    if let Some(text) = &layer.text {
+        out.extend(&text.fonts);
     }
     for item in &layer.items {
         match item {

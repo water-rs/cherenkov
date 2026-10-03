@@ -12,7 +12,7 @@ fallback):
 
 | Backend | Loaded as | Artifact |
 |---|---|---|
-| Vulkan | SPIR-V passthrough | `<name>.spv`: naga emission run through the `spirv-opt -O` recipe minus `simplify-instructions`, validated by `spirv-val --target-env vulkan1.0` |
+| Vulkan | SPIR-V passthrough | `<name>.spv`: naga emission as-is. A `spirv-opt -O` step ran here until issue #124 measured it on the Pixel 9 Pro (Mali-G715): ~0.64 s faster cold pipeline creation, but the effects scene's GPU time ~78% slower at p50 and ~2.7x at p99 — so the driver's own compiler does the optimizing |
 | Metal | `.metallib` passthrough | `<name>.metallib`: naga MSL at wgpu-hal's argument slots, compiled by `xcrun -sdk <sdk> metal` + `metallib` during the build |
 | WebGPU (wasm32) | WGSL | The original source, via `create_shader_module_trusted` with unchecked runtime checks |
 | DX12, GL, BrowserWebGpu native | WGSL | Same trusted-WGSL path; wgpu 29 passthrough has no GLSL producer and this build produces no DXIL/HLSL — WGSL is the declared delivery for those backends |
@@ -63,10 +63,7 @@ which wgpu-hal advertises unconditionally there.
 
 ## Build requirements
 
-- `spirv-opt` and `spirv-val` (the `spirv-tools` package: apt, brew, or MSYS2
-  `mingw-w64-ucrt-x86_64-spirv-tools`) on the build host for every non-wasm
-  target. Missing tools fail the build with an install hint.
-- Apple targets additionally run `xcrun -sdk <macosx|iphoneos|iphonesimulator>
+- Apple targets run `xcrun -sdk <macosx|iphoneos|iphonesimulator>
   metal`/`metallib`, so building for Apple requires an Apple host — an
   explicit error otherwise. The Metal compiler's `-std` matches naga's
   emitted language version. It must not inherit the build SDK's newest
@@ -78,6 +75,8 @@ which wgpu-hal advertises unconditionally there.
   Cargo target, so the metallib has the same OS floor as the Rust binary.
   Explicit `MACOSX_DEPLOYMENT_TARGET` and `IPHONEOS_DEPLOYMENT_TARGET`
   settings participate in that resolution and invalidate the build script.
+  The workspace defaults both to 26.0, matching the native Apple contract
+  in `docs/api.md` and both iOS host manifests.
 - wasm32 targets skip the toolchain entirely (nothing embeds the artifacts);
   the WGSL is still parsed and validated.
 
@@ -90,7 +89,6 @@ reading the emitted MSL signatures and slot assignments against wgpu-hal 29's
 ```sh
 git clone https://github.com/water-rs/cherenkov && cd cherenkov
 rustup default stable
-brew install spirv-tools   # build-time shader optimizer/validator
 
 # 1. Build for macOS — compiles .metal -> .air -> .metallib via xcrun.
 cargo build -p cherenkov-gpu

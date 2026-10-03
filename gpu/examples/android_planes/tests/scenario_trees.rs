@@ -10,8 +10,8 @@ use cherenkov_gpu::{Gpu, GpuConfig};
 
 use android_planes::scenario::Scenario;
 
-fn controls() -> Content {
-    Content::record(|c| {
+fn controls(surface: &cherenkov::Surface<Gpu>) -> Content {
+    surface.record(|c| {
         c.fill(
             Rect::new(24.0, 24.0, 660.0, 140.0),
             Color::<Srgb>::new([0.07, 0.09, 0.14, 0.72]),
@@ -46,7 +46,7 @@ fn every_scenario_tree_commits_and_renders() {
         let scenario = Scenario::parse(name);
         let surface = surface(&engine);
         // Keep both handles alive for the renders, as `Run` does.
-        let (_videos, _rest, _controls) = scenario.build(&surface, controls());
+        let (_videos, _rest, _controls) = scenario.build(&surface, controls(&surface));
         engine
             .render(FrameTime::now())
             .unwrap_or_else(|e| panic!("scenario {name}: first frame failed: {e}"));

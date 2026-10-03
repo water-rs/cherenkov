@@ -72,7 +72,15 @@ pub trait Renderer: 'static {
     /// [`Renderer::add_font`].
     type Font: RenderTransfer + 'static;
 
-    /// Creates the render-side state for surface `id`.
+    /// Creates the render-side state for surface `id`. `waker` is the
+    /// surface's host wake-up for render-side completions that land after
+    /// a render (a promoted plane's attach on the main queue); it wakes
+    /// nothing while the surface is hidden. A source the backend drives on
+    /// its own that wakes the host through another callback (a GPU
+    /// producer, a filter) gates that wake with a
+    /// [`WakeGate`](crate::WakeGate) over the
+    /// [`visibility`](crate::CompletionWaker::visibility) of the surfaces
+    /// it draws into.
     ///
     /// # Errors
     /// [`SurfaceError`] when the target cannot be drawn.
@@ -80,10 +88,24 @@ pub trait Renderer: 'static {
         &mut self,
         id: SurfaceId,
         target: Self::Target,
+        waker: crate::CompletionWaker,
     ) -> Result<SurfaceInfo, SurfaceError>;
 
     /// Resizes a surface's target.
     fn resize_surface(&mut self, id: SurfaceId, size: (u32, u32));
+
+    /// The host announced surface `id`'s [`Visibility`]; called only when
+    /// it changes.
+    ///
+    /// While a surface is hidden the render loop leaves it out of every
+    /// [`Frame`], and [`Redraw`] counts only visible surfaces: custom GPU
+    /// content and filters on a hidden surface want no redraw. Their host
+    /// wakes stop earlier, through their [`WakeGate`](crate::WakeGate),
+    /// the moment the host hides the surface. Content ops, installs and
+    /// resource changes still arrive while it is hidden. When it becomes
+    /// visible again the next frame lists it, and a producer or filter
+    /// that asked for a redraw while it was hidden is drawn then.
+    fn set_visibility(&mut self, id: SurfaceId, visibility: Visibility);
 
     /// Destroys a surface's render-side state.
     fn destroy_surface(&mut self, id: SurfaceId);
@@ -213,11 +235,15 @@ pub trait Renderer: 'static {
         surface: SurfaceId,
     ) -> impl core::future::Future<Output = Result<Readback, RenderError>>;
 
-    /// The host wake-up a render-side completion fires to pull the next
-    /// frame: a promoted plane's attach landing on the main queue is its
-    /// only producer. The default does nothing — backends with no
-    /// main-queue completion never need it.
-    fn set_plane_waker(&mut self, _waker: crate::CompletionWaker) {}
+    /// Layers whose last successful render handed every running property
+    /// track to the system compositor. The backend must withdraw
+    /// ownership on demotion, an unsupported track, or failed presentation.
+    /// Owned tracks remain in the tree for sampling and retargeting, but do
+    /// not request display-link frames. Recorded operand animations are
+    /// independent and always remain engine-driven.
+    fn owned_animations(&self, _surface: SurfaceId) -> &[LayerId] {
+        &[]
+    }
 
     /// The backend's current memory usage.
     fn memory(&self) -> MemoryUsage;
@@ -301,6 +327,23 @@ pub struct SurfaceFrame<'a> {
     pub display_moved: bool,
     /// The sampled layer tree.
     pub tree: &'a SurfaceTree,
+}
+
+/// Whether the user can see a surface's output.
+///
+/// The host announces it with
+/// [`Surface::visibility`](crate::Surface::visibility) from the platform's
+/// visibility signal: a minimized or fully occluded window, a backgrounded
+/// app, a view detached from its window or a hidden document is
+/// [`Hidden`](Self::Hidden).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Visibility {
+    /// The surface is drawn and presented as usual.
+    #[default]
+    Visible,
+    /// The surface is neither drawn nor presented, and nothing on it asks
+    /// for a frame; its state changes are still accepted.
+    Hidden,
 }
 
 /// The properties of the display a surface presents on. Headroom and scale

@@ -1,6 +1,6 @@
 android:
   manifest:
-    package: cool.lexo.cherenkov_planes
+    package: cool.lexo.cherenkov_planes_static
     sdk:
       min_sdk_version: 30
       target_sdk_version: 33

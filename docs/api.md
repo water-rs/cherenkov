@@ -21,7 +21,8 @@ Sections marked **Proposal** are not yet agreed; everything else records a decis
 
 | Crate | Directory | Contents |
 |---|---|---|
-| `cherenkov` | `src/` | Front end: API types, recording, engine, surfaces, layer tree, transactions, resource handles, animation, scrolling, the render-thread loop and the `Backend` contract, CPU geometry. No GPU dependency. |
+| `cherenkov` | `src/` | Front end: engine, surfaces, layer tree, transactions, resource handles, scrolling, the render-thread loop and the `Backend` contract, CPU geometry. No GPU dependency. |
+| `cherenkov-record` | `record/` | The recording layer: the `Draw` verbs, `Recorder`/`StaticRecorder`, `DisplayList`/`Picture`, live operands and operand animation, and the paint, shape, style and glyph vocabulary — no engine, GPU or text layout. `cherenkov` depends on it and re-exports it; another render target takes it alone. |
 | `cherenkov-gpu` | `gpu/` | GPU backend `Gpu` and the wgpu, Apple, Android, Windows and Wayland interop. |
 | `cherenkov-cpu` | `cpu/` | CPU backends `Raster` (desktop/server: full framebuffer, multi-threaded, SIMD) and `Banded<P>` (microcontroller: banded output, panel pixel formats, flash-resident assets). |
 | `cherenkov-shader` | `shader/` | The shared shader composer on naga IR, used by the engine and by filtrate. |
@@ -43,7 +44,7 @@ Targets beyond the current rows: `Gpu` is meant to accept every image format and
 
 The table is the target; a backend slice implements the rows it has code for, and the compiler rejects the rest.
 
-Recorded content (`Picture`, `Content`) is backend-independent. Components such as math, chart, svg and map never name a backend. Only the host names one.
+Recorded content (`Picture`, `Content`) is backend-independent. Components such as math, chart, svg and map never name a backend. Only the host names one. A render target that is not a Cherenkov backend reads a `DisplayList` through `DisplayList::view`: the commands in order and, per command, the live operand slots with their current values; `DisplayList::apply` then moves a slot to a `SlotUpdate`'s value.
 
 On the native Android backend, the host picks `Gpu` or `Raster` once at process start by querying Vulkan capabilities: the floor is `VK_EXT_rasterization_order_attachment_access` or `VK_KHR_dynamic_rendering_local_read`, plus f16. These two are different synchronization architectures. Ordered attachment access orders overlapping fragments implicitly; local read needs explicit by-region dependencies between overlapping work. They are not interchangeable implementations of the same design. Apple needs no selection: every iOS 26 device and every Apple silicon Mac running macOS 26 meets the floor. macOS 26 also still runs on some Intel Macs, which are outside the floor.
 
@@ -74,8 +75,12 @@ pub trait Backend: Sized + 'static {
 pub trait Renderer: 'static {
     type Target;
     type Font: RenderTransfer + 'static;                 // a font validated by `prepare_font`
-    fn create_surface(&mut self, id: SurfaceId, target: Self::Target) -> Result<SurfaceInfo, SurfaceError>;
+    /// `waker` wakes the host for the surface's render-side completions; it is silent while the surface is hidden,
+    /// and its `visibility()` gates the wakes of the backend's own sources on the surface (`WakeGate`).
+    fn create_surface(&mut self, id: SurfaceId, target: Self::Target, waker: CompletionWaker) -> Result<SurfaceInfo, SurfaceError>;
     fn resize_surface(&mut self, id: SurfaceId, size: (u32, u32));
+    /// Called when the host's announced visibility changes (see Visibility).
+    fn set_visibility(&mut self, id: SurfaceId, visibility: Visibility);
     fn destroy_surface(&mut self, id: SurfaceId);
 
     /// Runs on the caller thread, before anything is queued: every check a font needs.
@@ -179,7 +184,7 @@ let usage: MemoryUsage = engine.memory();
 - `Engine` is `!Send` and lives on the UI thread. It spawns and owns the render thread; dropping it sends `Shutdown` and joins the thread.
 - `engine.info()` is the backend's provenance (`B::Info`); `engine.stats()` the last frame's `FrameStats`.
 - **Frame timing.** The render loop numbers every render with a `FrameId` (`Frame::id`), and a backend that draws reports it in `FrameStats::frame`. Every GPU timing is a `FrameTiming` tagged with the frame it measures; the render thread retains them and returns them only from `engine.finish_timings()`, oldest first. They accumulate until that call, which waits for frames still on the GPU; use it at the end of a measured window, never on the frame path. Timestamps (off by default in `GpuConfig`) are for tooling that calls `finish_timings()` at the end of its window.
-- **Waking the host.** Changes made outside a frame (a `surface.update`, a layer drop, a bound signal firing) are queued, not sent. When the display link is paused after `Next::Idle`, the host must learn that a frame is needed: `engine.set_waker(|| link.request_now())` registers a UI-thread callback that the engine calls at most once between two `render`s, the first time something is queued. No callback means the host renders on its own schedule.
+- **Waking the host.** Changes made outside a frame (a `surface.update`, a layer drop, a bound signal firing) are queued, not sent. When the display link is paused after `Next::Idle`, the host must learn that a frame is needed: `engine.set_waker(|| link.request_now())` registers a callback that the engine calls at most once between two `render`s, the first time something is queued on a visible surface, and once when a surface becomes visible (see Visibility). Every wake goes through the surface the change belongs to, so a hidden surface wakes nothing. An image replacement wakes from the render loop, once it knows a visible surface draws the image. No callback means the host renders on its own schedule.
 
 ## Resources
 
@@ -213,7 +218,7 @@ let shader: Shader = engine.shader(ShaderSource::wgsl(fragment))?;  // validated
   - A rejected resource's record lives until the release is carried out, so a surface that still draws it keeps failing with `RenderError::Rejected`; a rejected registration's removal is skipped because the backend never committed it.
   - The bookkeeping lives in the render loop shared by the native render thread and the browser executor, so both targets behave identically.
 - **`Image<F>`.** `F` is the storage format: `Rgba8`, `Rgba16F`, `Astc4x4`, `Etc2Rgba`, `Bc7`, and panel formats for `Banded`. Only uncompressed formats have `update(region, pixels)`. Compressed formats are uploaded as-is, and compression is an explicit step (`engine.compress::<Astc4x4>(image)`), never implicit.
-- **Replacing pixels.** `image.replace(data)` swaps an image's pixels behind the same `ImageId`, for content whose picture changes over time: animated images, decoder-backed frames, a reactive image view. Every recording that names the id keeps drawing it and shows the new pixels on the next frame, without re-recording. The replacement is a fire-and-forget `Message::ReplaceImage`, ordered with frames on the render thread, so no frame samples a partly written image, and it fires the engine's waker so a paused host renders the new pixels. It follows the registration model: `ResourceError::Lost` when the render thread is gone is its only error, and a rejection only the backend can detect leaves the previous pixels in place and fails the renders that draw the image with `RenderError::Rejected` until a later replacement succeeds. Replacing an image whose registration was rejected registers it anew. The render loop then asks the backend which surfaces' content samples the image (`Renderer::samples`, answered from the retained display lists with slot updates applied and nested pictures included) and marks only those changed, so every other surface keeps its skip. An animated image replaced at 30–60 Hz therefore redraws the surfaces that show it and nothing else.
+- **Replacing pixels.** `image.replace(data)` swaps an image's pixels behind the same `ImageId`, for content whose picture changes over time: animated images, decoder-backed frames, a reactive image view. Every recording that names the id keeps drawing it and shows the new pixels on the next frame, without re-recording. The replacement is a fire-and-forget `Message::ReplaceImage`, ordered with frames on the render thread, so no frame samples a partly written image, and the render loop wakes the host through each visible surface that draws the image, so a paused host renders the new pixels. It follows the registration model: `ResourceError::Lost` when the render thread is gone is its only error, and a rejection only the backend can detect leaves the previous pixels in place and fails the renders that draw the image with `RenderError::Rejected` until a later replacement succeeds. Replacing an image whose registration was rejected registers it anew. The render loop then asks the backend which surfaces' content samples the image (`Renderer::samples`, answered from the retained display lists with slot updates applied and nested pictures included) and marks only those changed, so every other surface keeps its skip. An animated image replaced at 30–60 Hz therefore redraws the surfaces that show it and nothing else.
   - The same dimensions reuse the backing storage: `queue.write_texture` into the existing texture on the GPU backend, which leaves every bind group valid; an in-place decode on the CPU backend, once the retained paint operands that shared the pixels are discarded.
   - Different dimensions reallocate the storage behind the same id. The GPU backend retires the bind groups that bound the old texture view. Both backends lower again the retained content that samples the image, because lowering resolves the image's dimensions into its paints.
   - Dropping the last handle after a replacement releases the image as before.
@@ -236,9 +241,16 @@ let panel = engine.surface(Bands::new(size, OffscreenFormat::LinearF16, |band| d
   - **Parts.** A promoted layer splits the engine's composition: layers painted before it draw into the part below, layers painted after it — its own children included — into a transparent part above, so controls stay above the video. Each part is a full-surface texture presented through its own system layer.
   - **Apple.** A `WindowTarget` captures the view's backing layer on the main thread (`WindowTarget::new` panics elsewhere on Apple). The engine owns a layer tree under it: one `CAMetalLayer` per part (`presentsWithTransaction`), and per plane one nested layer per tree level (transform, clip as `masksToBounds` with `cornerRadius`/`maskedCorners`/`cornerCurve`, scroll as the bounds origin) around an `AVSampleBufferDisplayLayer` fed a `CVPixelBuffer` over the frame's own `IOSurface`, with the frame's primaries, transfer, matrix and chroma siting as attachments. Every frame's geometry and part presentation commits in one `CATransaction`; frames are handed to their display layers after it commits, each enqueue in its own transaction. A producer sync (`FrameSync::Metal`) hands the frame over from an `MTLSharedEvent` listener, never a CPU wait. A display layer fed off the main thread fits its video into its bounds only in a main-thread layout, so a plane whose frame size changes, its first frame included, queues that layout on the main queue after the hand-off commits; until the main run loop turns once, the new frame shows at the previous fit. The budget is two planes. A surface with planes is composited by the system and is not readable.
   - **Android.** A `SurfaceControlTarget` realizes the surface as child surface controls (API 29) of an engine container under the host's parent, whose space is the surface's device pixels. The engine's composited parts present on `AHardwareBuffer`s it renders into (RGBA8, sRGB dataspace, three per part), and a promoted external frame's own buffer goes on a plane of its own with its acquire fence, the dataspace its `FrameColor` maps to and the `HdrMetadata` it was imported with — never through a GPU copy. One transaction per frame sets every part's buffer, every plane's buffer and every changed property (geometry and crop through `setGeometry`, z-order, visibility, alpha), so a plane and the content around it never tear. A plane's release fence is merged into the frame's `FenceFd` release payload, so the producer reuses a buffer only once the system compositor let go of it too. On Android a frame is shown on a plane when its buffer is an `AHardwareBuffer` allocated with `COMPOSER_OVERLAY` usage, its acquire is a sync fence (or none) and its release a fence (or none), its colour contract is one dataspace exactly (BT.709 or BT.2020 with the matching matrix, PQ and HLG at the 203-nit reference white), and its alpha is opaque or premultiplied. Its path must carry only transforms that are axis-aligned up to mirrors and quarter turns and only rectangular clips; destination and crop round to whole pixels. One layer per surface is promoted, so a surface stays at three system layers: the part below, the plane and the part above.
+- **Visibility.** The host announces whether the user can see a surface with `surface.visibility(Visibility::Hidden | Visibility::Visible)` from the platform's public signal (window occlusion or minimization, the app in the background, the view detached from its window, `document.visibilityState`); surfaces start visible and a repeated announcement does nothing. It is one setter rather than a `hide`/`show` pair because the host forwards a platform state, and a state is a value (the same shape as `surface.display`).
+  - **While hidden** nothing on the surface asks for a frame: its animation tracks and live operands are not sampled, bound signals, transactions, image replacements it draws, custom GPU content, filters and external-frame installs wake no host, the render loop leaves it out of every `Frame` and out of `Next`, and its backend sources do not count in `Redraw`. Every wake on the surface's behalf stops the moment the call returns, whichever thread it starts on. The engine's own wakes go through the surface's waker; a source the backend drives on its own (a GPU producer's or a filter's redraw request) fires through a `WakeGate` that holds the `SurfaceVisibility` of each surface it draws into (from `CompletionWaker::visibility`) and is open only while one of them is visible. The render loop updates a gate's surfaces from its frames, so the membership may lag a frame, but each flag flips on the UI thread when the host announces the change and is read when the wake fires. `Renderer::set_visibility` reaches the backend in order with every other message and decides what counts in `Redraw`.
+  - **State keeps flowing.** Changes are accepted and applied while hidden. A hidden surface sends every change to the render loop as it is made (`Message::Apply`) — transactions, layer creates and drops, bound signals and live operands, and whatever was queued for the next frame when the surface hid — and the render loop applies it to the layer tree and the installed content without sampling an animation or drawing. Resource releases see that content in order: content installed while hidden keeps a released resource alive exactly as visible content does, and content that stops drawing it frees it while the surface is still hidden. Nothing accumulates on the UI thread however long the surface stays hidden. Resizes, display changes and resource operations are applied as usual.
+  - **Becoming visible** asks the host for exactly one frame, even when the host dropped a frame it was asked for while the surface was hidden. That frame redraws the surface whole from the current state and presents it. Every animation is sampled at that frame's time: a track that ran on while hidden shows where it is now, with no replay of the missed frames, and a track committed while hidden starts on that frame, like any other.
+  - **Rendering while every surface of the engine is hidden** is `RenderError::Hidden`, never a silent no-op: a host renders only while a surface is visible. With some surface visible, `render` draws the visible ones and leaves the hidden ones untouched.
+  - Native and wasm32 share this in the common render loop and the per-surface waker.
 - **Many small surfaces are first-class.** A native backend embeds one surface per self-drawn component, and a list may hold dozens. All surfaces share the engine's pipelines, atlases and caches. Creating and dropping one is cheap. All dirty surfaces render in one submission per frame.
 - **Display properties.** Headroom and scale belong to the display, so the host sets them when they change: `surface.display(Display { headroom, scale })`. Presentation reads `headroom` every frame — a headroom change takes effect on the next frame and never re-lowers or re-records content. A move to another display is announced separately as `surface.display_moved()` — a move between numerically identical displays is invisible in `Display`'s values — and it rides the next frame as `SurfaceFrame::display_moved` so a presenting backend re-enumerates the surface's capabilities where a headroom-only update never does (#98).
 - **Window output is negotiated, never defaulted.** A window surface selects its swapchain format and colour space from the surface's advertised format/colour-space pairs through wgpu 30's surface colour-space API — an extended-range pair where offered, a wide-gamut SDR pair, else tone-mapped sRGB — and reports the choice and its reason in `OutputSelection`; a silent sRGB fallback does not exist (#98). `WindowTarget::require_color_space` pins a required `wgpu::SurfaceColorSpace`: a surface that cannot advertise it fails creation with `UnsupportedTarget` rather than substituting. `WindowTarget::output_probe` hands the host a `DisplayProbe` — sampled on the main thread on Apple — whose `tone_map_headroom` feeds `Display::headroom` for live EDR and whose `selection()` answers what a hypothetical move would negotiate. The current negotiation is readable at `WindowSurface::selection`.
+- **Window presentation pacing is the host's choice, never substituted.** `WindowTarget::display_sync(DisplaySync)` states whether presentation waits for the display (#214). `DisplaySync::Synchronized`, the default, is FIFO: every frame waits for vertical blank and is shown whole, so nothing tears; every surface supports it, and relaxed FIFO, which tears a late frame, is never chosen for it. `DisplaySync::Unsynchronized`, for input-latency measurement and benchmarks, never waits for the display: mailbox where the surface advertises it (the newest frame replaces a queued one and is shown whole at the next vertical blank), otherwise immediate (shown at once, may tear). A surface that advertises neither — Metal on iOS, WebGPU — fails with `UnsupportedTarget` rather than presenting synchronized. The resolved mode is reported as `OutputSelection::present_mode`, and a display move that re-runs negotiation re-resolves it; a surface that no longer advertises what the request needs is a render error, never a reconfiguration to a substitute. On macOS the engine's parts realize immediate presentation as `CAMetalLayer.displaySyncEnabled = false`; they still present inside the frame's `CATransaction`. On Apple, where the engine creates its layers on the main queue, an unsatisfiable `require_color_space` or `display_sync` request arrives as the first render's error instead of at surface creation.
 
 ## Frame driving
 
@@ -251,7 +263,7 @@ match engine.render(FrameTime::at(target_presentation_time))? {
 }
 ```
 
-- `Next::At` is returned while any animation track is unsettled, or a backend source (custom GPU content, an animated shader paint) asked for a redraw. `time` is the frame time plus one interval at the top of `rate`; `rate` is `60..=120` while a spring, curve or fast decay runs and `30..=60` while only a decay slower than one device pixel per frame at 60 Hz remains. A curve that ends before the next frame is sampled at its endpoint on that frame and then settles.
+- `Next::At` is returned while any animation track of a visible surface is unsettled, or a backend source (custom GPU content, an animated shader paint) on a visible surface asked for a redraw. `time` is the frame time plus one interval at the top of `rate`; `rate` is `60..=120` while a spring, curve or fast decay runs and `30..=60` while only a decay slower than one device pixel per frame at 60 Hz remains. A curve that ends before the next frame is sampled at its endpoint on that frame and then settles.
 - Animation tracks start on the first frame that samples them, so a transaction committed between frames starts at the next presentation time, never at wall-clock commit time.
 
 ## Layer tree
@@ -269,7 +281,8 @@ surface.update(|tx| {
 drop(card);                                      // removed at the next commit
 ```
 
-- **Properties:** `transform`, `opacity`, `clip`, `blend`, `filter`, `backdrop`, `scroll_offset`, `content`, and child order (`push`, `insert`, `remove`). Each property accepts a constant or a nami signal. A bound signal keeps updating the layer with no further transactions. The subscription is owned by the layer and released when the layer drops.
+- **Properties:** `transform`, `opacity`, `clip`, `blend`, `filter`, `backdrop`, `scroll_offset`, `layout_size`, `content`, and child order (`push`, `insert`, `remove`). Each property accepts a constant or a nami signal. A bound signal keeps updating the layer with no further transactions. The subscription is owned by the layer and released when the layer drops.
+- **Layout size.** `tx[&layer].layout_size(size)` is the size the host lays the layer out at, in its content coordinates (`Size::ZERO` until set); the host drives it from layout with a constant or a signal. It is UI-thread state that recordings read, not a render-thread property: it changes when the call is made, so a recording later in the same transaction already sees it, and `.animation(...)` does not apply to it. See Recording.
 - **Binding.** `transform`, `opacity`, `scroll_offset` and `clip` take `impl Into<Live<T>>`, the same target the `Recorder` uses: any `Signal<Output = T>`, and constants are signals. Binding a property replaces that property's previous subscription. A change fires on the UI thread, is queued as the same owned op a transaction would produce, reaches the render thread with the next frame, and calls the waker. If the change's nami `Context` metadata carries an `Animation`, the op carries it too and the render thread interpolates; otherwise the value snaps. A transaction that sets the property again also replaces the binding.
 - **Stable identity.** The layer handle is the identity. Content versions are internal: setting `content` bumps the version, and caching keys on (layer, version).
 - **Content kinds:** recorded `Content`, a shared `Picture`, `ExternalFrame` (video, web views), `GpuContent` (custom GPU pipelines).
@@ -330,6 +343,19 @@ let content: Content = surface.record(|c: &mut Recorder| { /* … */ });
 ```
 
 - **Layer recording.** `tx[&layer].record(...)` replaces the content and reuses its retired recording storage once the render thread releases it.
+- **Layout size (#26).** A live recording is made for a layer and reads that layer's layout size as a signal, `c.layout_size()` (`LayoutSize: Signal<Output = Size>`): `tx[&layer].record` reads `layer`'s, `surface.record` the root layer's. Size-dependent geometry binds to it like any other value, so a host resize updates only the commands that reference it, without re-recording; a resize set under an animation (the transaction's, or a bound change's `Animation` metadata) animates those operands. A component never carries its own size binding: the host drives the layer's.
+
+  ```rust
+  surface.update(|tx| {
+      tx[&chart].layout_size(layout.clone())                // the host's layout result signal
+          .record(|c| {
+              let size = c.layout_size();
+              c.fill(size.clone().map(|s| s.to_rect()), background);
+              c.stroke(size.map(|s| axis(s)), Stroke::new(1.0), ink);
+          });
+  });
+  ```
+- Recording always goes through a surface: there is no free-standing live recorder, so every recording has a layer's size to read. `Picture::record` stays free-standing because it holds no signals.
 
 Both implement one drawing trait. A generic associated type decides what a parameter accepts:
 
@@ -342,7 +368,6 @@ pub trait Draw {
     fn stroke<S: Shape>(&mut self, shape: impl Into<Self::Value<S>>, style: impl Into<Self::Value<Stroke>>,
                         paint: impl Into<Self::Value<Paint>>);
     fn shadow<S: Shape>(&mut self, shape: impl Into<Self::Value<S>>, shadow: impl Into<Self::Value<Shadow>>);
-    fn text(&mut self, layout: &TextLayout, origin: Point);
     fn glyphs(&mut self, run: impl Into<Self::Value<GlyphRun>>, paint: impl Into<Self::Value<Paint>>);
     fn image<F: Format>(&mut self, image: &Image<F>, dst: impl Into<Self::Value<Rect>>, sampling: Sampling);
     fn picture(&mut self, picture: &Picture, transform: impl Into<Self::Value<Affine>>);
@@ -425,7 +450,7 @@ DynColor::from_css(parsed)                         // colour space known only at
 
 - **Typed colour spaces.** `Color<CS>` converts to the working space (linear Display P3) through a matrix that is constant-folded when monomorphised. HDR is extended values above 1.0, relative to SDR white.
 - **The display supplies headroom.** Effects may read it. Output tone-maps to the display's headroom (#97): presentation scales each pixel by the extended-Reinhard/EDR shoulder evaluated at its largest channel — a per-pixel scalar, so saturated highlights keep their hue. Values in `[0, 1]` pass through; values above `1` compress smoothly towards `H` (an SDR display is `H = 1`, so highlights roll off instead of clipping). The tone map runs before the #96 gamut map. An sRGB destination's ceiling is `1` regardless of `headroom`; an extended `LinearDisplayP3` destination rolls off to the host's headroom and keeps values above 1 extended. The same curve runs in the f64 oracle (`oracle/src/tone.rs`), `present.wgsl`, and the CPU backend's `present_srgb8`.
-- **sRGB output gamut-maps, never channel-clips (#96).** Linear P3 components outside `[0, 1]` go through Ottosson's analytic OKLab clip — the hue slice's cusp triangle with one Halley refinement, projecting towards the lightness axis at adaptively-chosen lightness (`ok_color.h`'s `gamut_clip_adaptive_L0_L_cusp`) — so out-of-gamut colours keep their hue and gradients stay continuous across the boundary. It was chosen over the CSS Color 4 chroma binary search (the ΔE_OK/JND spec map, which served as the measurement reference): on the boundary sweep the analytic clip held its mean ΔE_OK to the spec map at 0.0104 (p99 0.072, max 0.177 at HDR lightness the spec maps to an end colour) with hue preserved to a 7.5° maximum, while its fixed per-pixel cost measured ~3× cheaper in the present pass on lavapipe (28.5 vs 92 ms per 2752×2064 frame; the channel-clip baseline is ~15 ms — software-rasterizer sanity numbers only). The map also carries the spec's local-MINDE rule: where the plain clip is already within one ΔE_OK JND of the colour, the clip's bytes are kept — so in-gamut colours and P3↔sRGB round-trip ULP noise pass through bit-for-bit, yielding exactly the bytes the old convert-and-clamp produced. The same algorithm runs in the f64 oracle (`oracle/src/gamut.rs`), in `present.wgsl`, and in the CPU backend's `present_srgb8`.
+- **sRGB output gamut-maps, never channel-clips (#96).** Linear P3 components outside `[0, 1]` go through Ottosson's analytic OKLab clip — the hue slice's cusp triangle with one Halley refinement, projecting towards the lightness axis at adaptively-chosen lightness (`ok_color.h`'s `gamut_clip_adaptive_L0_L_cusp`) — so out-of-gamut colours keep their hue and gradients stay continuous across the boundary. It was chosen over the CSS Color 4 chroma binary search (the ΔE_OK/JND spec map, which served as the measurement reference): on the boundary sweep the analytic clip held its mean ΔE_OK to the spec map at 0.0104 (p99 0.072, max 0.177 at HDR lightness the spec maps to an end colour) with hue preserved to a 7.5° maximum, while its fixed per-pixel cost measured ~3× cheaper in the present pass on lavapipe (28.5 vs 92 ms per 2752×2064 frame) — a ratio real devices confirm (#158, `docs/validation-158.md`: 2–3× slower present-pass p50 on an iPhone 16 Pro and an Apple M1 across interleaved rounds). The map also carries the spec's local-MINDE rule: where the plain clip is already within one ΔE_OK JND of the colour, the clip's bytes are kept — so in-gamut colours and P3↔sRGB round-trip ULP noise pass through bit-for-bit, yielding exactly the bytes the old convert-and-clamp produced. The same algorithm runs in the f64 oracle (`oracle/src/gamut.rs`), in `present.wgsl`, and in the CPU backend's `present_srgb8`.
 - **Blending space** is linear by default. Groups can opt into sRGB-encoded blending for web compatibility (`Group::blend_space(BlendSpace::SrgbEncoded)`, #81). An encoded group's members composite with each other **in the encoded space**, and the group composites onto its backdrop in that space: the space belongs to the isolation level, so member `src_over` and the pop's blend are both encoded. (The alternative — encoding only the group-onto-backdrop composite while members stay linear, one isolation per translucent element — measured ~20× slower per frame on Metal on the overlapping-translucent corpus scene, so member-space compositing is the only semantics.) A non-semantic group (opacity 1, `normal` blend, no filter) declared in a non-linear space still isolates; a transparent clip scope declared linear composites in its parent's space.
 - **Group and tree-layer isolation.** A group or tree layer composites through its own offscreen when it blends, has opacity below one, carries a filter, or has a blended descendant: a group, or for a layer a child layer or a group in its content. A blending child isolates its own layer in turn, so a layer checks direct children only. The root layer renders into the surface target and needs no offscreen. Every other group or layer composes in place with identical results.
 - **WaterUI unification.** WaterUI's `ResolvedColor` becomes Cherenkov's colour type, with headroom folded into extended values.
@@ -435,7 +460,8 @@ DynColor::from_css(parsed)                         // colour space known only at
 Shaping stays outside the engine: parley, which covers complex scripts (Arabic, Indic, Thai, Hebrew and so on). The engine is responsible for everything between shaped glyphs and pixels, for every script:
 
 ```rust
-c.text(&layout, origin);          // parley adapter: TextLayout wraps parley::Layout<Paint>
+let layout: TextLayout = TextLayout::new(parley_layout, |font: &parley::FontData| fonts.get(engine, font))?;
+draw_text(&mut c, &layout, origin); // parley adapter: TextLayout wraps parley::Layout<Paint>
 c.glyphs(&GlyphRun {
     font, size: 17.0, coords: variation_coords.into(),
     glyphs: glyphs.into(),        // id, position, and an optional per-glyph transform (vertical CJK)
@@ -443,6 +469,12 @@ c.glyphs(&GlyphRun {
 }, paint);                        // paint is a separate parameter, so it can be bound to a signal
 ```
 
+- **The parley adapter (#26).** `TextLayout::new(layout, font)` takes a shaped `parley::Layout<Paint>` (the engine re-exports the `parley` it lowers as `cherenkov::parley`; parley's unset brush is `Paint::default()`, opaque black) and lowers it once:
+  - Every parley glyph run becomes one `GlyphRun` (font size, normalized coords, positioned glyphs) filled with the style's brush. `font` is called once per distinct font data (blob and collection index) in the layout and returns the engine `Font` it draws with; hosts cache it across layouts, since the engine keys glyph caches on the font id. `FontSource::from(&parley::FontData)` builds the registration (it copies the bytes once, like `FontSource::mapped`). The `TextLayout` keeps those `Font`s alive.
+  - A synthetic oblique (fontique's `skew`) becomes each glyph's transform, `skew(−tan θ, 0)` about the glyph origin. A synthetic bold (fontique's `embolden`, for a weight heavier than any face or `wght` axis of the font offers) draws the run filled and then stroked with a mitred outline whose width is 1/24 of the em at 9 px and below, 1/32 at 36 px and above, and linear in between, so each outline grows by half that width on every side. The pair sits in an isolated group unless the brush is an opaque colour, so a translucent, gradient or image brush covers the overlap once; with an opaque colour the two composite to the same pixels without the group.
+  - Underlines and strikethroughs become rectangle fills: the top edge at `baseline − offset` and the thickness from the decoration, or the run's font metrics where the style leaves them unset, across the run's advance, filled with the decoration's brush. A decoration continuing into the next run of the line with the same brush, offset and thickness is one rectangle, so a style change inside an underline leaves no seam.
+  - Each line draws its underlines, then its glyphs, then its strikethroughs. Inline boxes draw nothing: their content is the host's.
+  - `draw_text(&mut c, &layout, origin)` records those primitives as constants with the layout's top-left at `origin` (glyph positions add in f64 and round once to f32), through the same `glyphs`, `fill` and `group` commands as hand-built content, so both backends draw them on the existing glyph, stroked-glyph and rectangle paths. `layout.layout()` returns the parley layout for metrics and hit testing.
 - `GlyphRun.glyphs` and `GlyphRun.coords` are `Arc` slices; cloning a run shares both.
 - **Large scripts.** CJK text can touch thousands of distinct glyphs per screen.
   - The glyph atlas is budgeted and evicts least-recently-used pages.
@@ -456,7 +488,7 @@ c.glyphs(&GlyphRun {
 - **Variable fonts** take normalized coordinates on the run.
 - **Glyph realization is an experimental axis** (coverage atlas, direct curve evaluation, the path route, or distance fields for validated sizes), decided by the device farm. The CPU exact-area glyph rasterizer is both the correctness reference and the CPU backends' route. COLRv1 glyphs are a paint graph: every realization handles their transforms, gradients and compositing, and cached colour glyphs key on palette and foreground.
 - **Per-glyph transforms** apply about the glyph origin, between the font scale and the glyph position. A pure translation folds into the glyph position and keeps the atlas path; any other transform is realized as outline coverage (the path route) filled with the run paint, never the atlas. A non-finite or non-invertible transform is a render error.
-- **Test coverage.** The correctness corpus (#3) includes Latin, CJK (horizontal and vertical), Arabic, Hebrew, Devanagari, Thai, emoji ZWJ sequences and COLRv1 glyphs.
+- **Test coverage.** The correctness corpus (#3) includes Latin, CJK (horizontal and vertical), Arabic, Hebrew, Devanagari, Thai, emoji ZWJ sequences and COLRv1 glyphs. The `text-layout-*` scenes carry a parley input (brushes, gradients, decorations, a synthetic oblique, a synthetic bold under opaque, translucent and gradient brushes, wrapping, bidirectional text over a font stack) that the Cherenkov adapters record through `draw_text`; their items are the generator's reference lowering of the same layout, which the oracle draws, in sRGB, P3-only and HDR inks.
 
 ## Effects and filters
 
@@ -609,6 +641,12 @@ invalidates just their device instances, gradient stops and coverage. Dirty
 realizations reuse their vector storage. A changed operation count, glyph
 count or scope structure rebuilds the affected layer's layout.
 
+`lowering::Content::current()` returns the prepared operations together with
+their source display list only while the content is clean and prepared.
+Backends use this borrowed view to inspect static capture bounds without
+compiling recorded commands a second time. Pending content changes return
+`None`; callers must not inspect stale operations.
+
 Layer transforms, scrolling, clips and opacity are read from the sampled tree
 while composing retained operations. They do not resolve content again.
 Device placement changes regenerate the coverage that depends on that
@@ -704,6 +742,52 @@ a font, an image and a shader registered and drawn in one frame with no await
 between, shader validation before queueing, asynchronous filter setup, host wakes requested while a
 render is awaiting browser work, and incremental lowering matching full
 lowering pixel-for-pixel.
+
+### Compositor-owned property tracks (#90)
+
+`AnimationTrack<T: Animatable>` exposes a running property's original `from`,
+lane `velocity`, `target`, `animation`, and presentation-clock `start`.
+`LayerNode::animations() -> Option<LayerAnimations>` returns both descriptions
+together, as `transform: Option<AnimationTrack<Affine>>` and
+`opacity: Option<AnimationTrack<f32>>`. `None` means that at least one track
+cannot be described completely, including an unsampled track, scrolling,
+nonlinear component motion, or a projective layer. `Some` with both fields
+empty means that no property is moving. A sole translation component can be
+represented as an affine translation track. The backend then decides whether
+its native animation primitive can express the described tracks exactly.
+
+`Renderer::owned_animations(surface) -> &[LayerId]` reports layers whose
+**complete** running property animation was accepted by the last successful
+presentation. Its default is empty. Owned tracks remain in the canonical
+tree and are sampled before commits, so retargeting after an idle interval
+preserves the current position and velocity. They do not request engine
+frames. Recorded operand animations and every unowned property retain their
+normal scheduling. Demotion, an unsupported track, or failed presentation
+withdraws ownership.
+
+On Apple, eligible leaf planes hand translation and opacity curves and
+springs to Core Animation. The native track keeps the original presentation
+clock and spring velocity. Matrix animation with changing linear coefficients,
+scroll decay, and nonlinear component combinations continue to require engine
+frames: Core Animation's decomposed matrix interpolation is not the engine's
+coefficient interpolation. A handoff also requires eligibility throughout the
+motion; sampled non-overlap with translucent content above is insufficient.
+A translucent or fading moving layer cannot take ownership above an earlier
+plane. Installed native motion retains its position and linear transform
+through placement updates; unchanged placements cause no native transaction.
+
+`SurfaceTree::composition_stamp(promoted)` versions the engine-composited
+pixels while excluding only promoted layers' outer property stamps. Content,
+clips, ordering, resource generations, surface size, clear colour and display
+state remain dependencies of retained engine parts. Property-only plane
+updates can consequently retain those parts on both native platforms.
+
+`lowering::Content::current() -> Option<(&[O], &DisplayList)>` lends the
+prepared operations together with the source they index. Dirty or unprepared
+content returns `None`, so static-capture admission cannot inspect obsolete
+operations or compile content twice. Immutable captures keep only their
+native presentation buffer after publication. Output changes recapture from
+the retained source; they do not keep a second engine texture alive.
 
 ### Component transform animation (#77)
 

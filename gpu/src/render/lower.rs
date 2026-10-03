@@ -42,6 +42,8 @@ pub enum Target {
     Backdrop { group: u64, region: u32 },
     /// A projective layer's local image, base level (#84).
     Projected(LocalKey),
+    /// A recorded layer captured for the system compositor.
+    Plane(LayerId),
 }
 
 /// The texture a draw range samples at bind group 1.
@@ -997,8 +999,11 @@ pub struct Lowering<'a> {
     /// The engine part surface-level passes draw into.
     part: u32,
     /// The layers promoted to system planes this frame: their content is
-    /// not drawn, and each starts the next part.
+    /// not drawn.
     promoted: Vec<LayerId>,
+    /// The subset of `promoted` a new engine part opens after — the
+    /// plan's `opens_part`, so the walk emits exactly `parts()` passes.
+    opens: Vec<LayerId>,
     /// The storage space of each scratch target by depth index: a
     /// semantic isolate's declared space, a clip-only level's parent
     /// space, or the opening level's for shadow and capture scopes.
@@ -1053,6 +1058,7 @@ impl<'a> Lowering<'a> {
             semantic_target: Target::Part(0),
             part: 0,
             promoted: Vec::new(),
+            opens: Vec::new(),
             space_stack: Vec::new(),
             scratch_space: Vec::new(),
             capture_space: FxHashMap::default(),
@@ -1257,9 +1263,9 @@ impl<'a> Lowering<'a> {
 
     /// Lowers a surface's sampled tree and its clear colour into the
     /// frame, placing the projective layers composed into the surface
-    /// from `projected`. Each layer in `promoted` (paint order) is left to
-    /// its system plane: its content is not drawn, and the layers painted
-    /// after it draw into the next engine part.
+    /// from `projected`. Each layer `plan` promotes (paint order) is left
+    /// to its system plane: its content is not drawn, and a promoted layer
+    /// the plan opens a part after ends the current engine part.
     ///
     /// # Errors
     /// A [`RenderError`] for content or state the lowering cannot render.
@@ -1272,7 +1278,7 @@ impl<'a> Lowering<'a> {
         glyphs: &GlyphContext<'_>,
         groups: &FxHashMap<u64, BackdropGroupInfo>,
         projected: FxHashMap<LayerId, Placement>,
-        promoted: Vec<LayerId>,
+        plan: &super::planes::Plan,
     ) -> Result<(), RenderError> {
         let [r, g, b, a] = clear.components;
         self.raster(self.surface);
@@ -1283,7 +1289,7 @@ impl<'a> Lowering<'a> {
             groups,
             (None, Target::Part(0), Some([r * a, g * a, b * a, a])),
             projected,
-            promoted,
+            plan,
         )
     }
 
@@ -1319,7 +1325,33 @@ impl<'a> Lowering<'a> {
             ),
             projected,
             // Promotion splits surface-level passes; a local image has none.
-            Vec::new(),
+            &super::planes::Plan::default(),
+        )
+    }
+
+    /// Captures a leaf's recorded pixels before its outer properties apply.
+    pub fn run_plane(
+        &mut self,
+        tree: &SurfaceTree,
+        caches: &mut FxHashMap<LayerId, ContentData>,
+        glyphs: &GlyphContext<'_>,
+        groups: &FxHashMap<u64, BackdropGroupInfo>,
+        layer: LayerId,
+        domain: super::planes::static_layer::Domain,
+    ) -> Result<(), RenderError> {
+        self.raster(domain.size);
+        self.walk(
+            tree,
+            caches,
+            glyphs,
+            groups,
+            (
+                Some((layer, domain.raster().inverse())),
+                Target::Plane(layer),
+                Some([0.0; 4]),
+            ),
+            FxHashMap::default(),
+            &super::planes::Plan::default(),
         )
     }
 
@@ -1340,13 +1372,14 @@ impl<'a> Lowering<'a> {
         groups: &FxHashMap<u64, BackdropGroupInfo>,
         (local, root_target, clear): (Option<(LayerId, Affine)>, Target, Option<[f32; 4]>),
         projected: FxHashMap<LayerId, Placement>,
-        promoted: Vec<LayerId>,
+        plan: &super::planes::Plan,
     ) -> Result<(), RenderError> {
         self.local = local;
         self.root_target = root_target;
         self.semantic_target = root_target;
         self.projected = projected;
-        self.promoted = promoted;
+        self.promoted = plan.planes.iter().map(|p| p.layer).collect();
+        self.opens = plan.opens_part().collect();
         self.part = 0;
         self.transform = Affine::IDENTITY;
         self.animating = false;
@@ -1393,9 +1426,14 @@ impl<'a> Lowering<'a> {
         parent: Affine,
     ) -> (Affine, Affine) {
         match self.local {
-            Some((root, local)) if root == id => {
-                (local, local * Affine::translate(-node.scroll_offset))
-            }
+            Some((root, local)) if root == id => (
+                local,
+                if matches!(self.root_target, Target::Plane(_)) {
+                    local
+                } else {
+                    local * Affine::translate(-node.scroll_offset)
+                },
+            ),
             _ => (parent * node.transform, parent * node.content_transform()),
         }
     }
@@ -1438,7 +1476,9 @@ impl<'a> Lowering<'a> {
         match target {
             // A local image stores its layer's linear isolation; a part is
             // the surface's own working space.
-            Target::Part(_) | Target::Projected(_) => cherenkov::BlendSpace::Linear,
+            Target::Part(_) | Target::Projected(_) | Target::Plane(_) => {
+                cherenkov::BlendSpace::Linear
+            }
             Target::Scratch(k) => self
                 .scratch_space
                 .get(k)
@@ -1530,7 +1570,7 @@ impl<'a> Lowering<'a> {
         self.end_segment_at(end);
         if let Some(open) = self.frame.open.take() {
             let region = match open.target {
-                Target::Part(_) | Target::Projected(_) => {
+                Target::Part(_) | Target::Projected(_) | Target::Plane(_) => {
                     [0, 0, self.width as u32, self.height as u32]
                 }
                 // Scratch regions are tightened in `isolate` once the
@@ -2398,6 +2438,11 @@ impl<'a> Lowering<'a> {
             return self.projected_layer(id, node, glyphs);
         }
         let local_root = self.local.is_some_and(|(root, _)| root == id);
+        let clip = if local_root && matches!(self.root_target, Target::Plane(_)) {
+            None
+        } else {
+            node.clip.as_ref()
+        };
         // A local root's opacity and blend apply when its image composes.
         let (opacity, blend) = if local_root {
             (1.0, cherenkov::BlendMode::Normal)
@@ -2435,7 +2480,7 @@ impl<'a> Lowering<'a> {
             // unaffected by the layer's opacity or blend.
             if let Some(sample) = &backdrop {
                 self.with_clip(
-                    node.clip.as_ref(),
+                    clip,
                     |s, _glyphs| {
                         s.transform = content_space;
                         s.emit_backdrop_sample(sample.group().raw(), id, sample.effect())
@@ -2455,7 +2500,7 @@ impl<'a> Lowering<'a> {
                 cherenkov::BlendSpace::Linear,
                 |s, glyphs| {
                     s.with_clip(
-                        node.clip.as_ref(),
+                        clip,
                         |s, glyphs| {
                             s.transform = content_space;
                             s.layer_items(id, node, tree, caches, glyphs)
@@ -2467,7 +2512,7 @@ impl<'a> Lowering<'a> {
             )
         } else {
             self.with_clip(
-                node.clip.as_ref(),
+                clip,
                 |s, glyphs| {
                     s.transform = content_space;
                     if let Some(sample) = &backdrop {
@@ -2591,6 +2636,15 @@ impl<'a> Lowering<'a> {
         caches: &mut FxHashMap<LayerId, ContentData>,
         glyphs: &GlyphContext<'_>,
     ) -> Result<(), RenderError> {
+        if self.promoted.contains(&id) {
+            if self.opens.contains(&id) {
+                self.next_part();
+            }
+            for &child in &node.children {
+                self.layer(child, tree, caches, glyphs)?;
+            }
+            return Ok(());
+        }
         if let Some(content) = caches.get_mut(&id) {
             let (ops, emissions, source) = content.retained.prepared_source();
             content.storage.compact(emissions);
@@ -2628,9 +2682,7 @@ impl<'a> Lowering<'a> {
                 self.push_shaped(inst, transform, boxed.bounds, margin);
             }
         }
-        if self.promoted.contains(&id) {
-            self.next_part();
-        } else if let Some(slot) = glyphs.external.get(&id) {
+        if let Some(slot) = glyphs.external.get(&id) {
             self.frame.external.push(id);
             let bounds = Rect::new(0.0, 0.0, f64::from(slot.size.0), f64::from(slot.size.1));
             if let Some(boxed) = box_shape(&ShapeData::Rect(bounds))? {
@@ -4117,6 +4169,7 @@ fn device_rect(t: Affine, r: Rect) -> Rect {
 /// premultiplied pixels are stored in.
 pub const fn globals(size: [f32; 2], origin: [f32; 2], space: cherenkov::BlendSpace) -> Globals {
     Globals {
+        attachment_origin: origin,
         size,
         origin,
         space: match space {
@@ -4884,9 +4937,30 @@ mod tests {
         assert_eq!(merged[0].bbox, [0, 0, 30, 10]);
     }
 
-    /// A promoted layer ends the engine part it sits in: layers painted
-    /// before it draw into part 0, layers after it into a transparent part
-    /// 1, and its own content is left to its plane.
+    /// A plan of `promoted` paint-order layers and `trailing` — the
+    /// placement internals the walk reads are only the layer ids.
+    fn plan(promoted: &[LayerId], trailing: bool) -> crate::render::planes::Plan {
+        crate::render::planes::Plan {
+            planes: promoted
+                .iter()
+                .map(|&layer| crate::render::planes::Placement {
+                    raster: Affine::IDENTITY,
+                    source: crate::render::planes::Source::Frame,
+                    layer,
+                    size: (8, 8),
+                    opacity: 1.0,
+                    path: Vec::new(),
+                })
+                .collect(),
+            rejected: Vec::new(),
+            trailing,
+        }
+    }
+
+    /// A promoted layer the plan opens a part after ends the engine part
+    /// it sits in: layers painted before it draw into part 0, layers
+    /// after it into a transparent part 1, and its own content is left
+    /// to its plane.
     #[test]
     fn a_promoted_layer_splits_the_surface_into_parts() {
         use cherenkov::testing::LayerOp;
@@ -4909,7 +4983,7 @@ mod tests {
                 c.fill(Rect::new(x, 0.0, x + 8.0, 8.0), WorkingColor::WHITE);
             }))
         };
-        let lower = |promoted: Vec<LayerId>| {
+        let lower = |plan: &crate::render::planes::Plan| {
             let mut caches: FxHashMap<LayerId, ContentData> =
                 [(below, rect(0.0)), (above, rect(16.0))]
                     .into_iter()
@@ -4937,7 +5011,7 @@ mod tests {
                     &glyphs,
                     &FxHashMap::default(),
                     FxHashMap::default(),
-                    promoted,
+                    plan,
                 )
                 .expect("lowered");
             frame
@@ -4947,14 +5021,31 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(
-            lower(Vec::new()),
+            lower(&plan(&[], false)),
             [(Target::Part(0), Some([0.0, 0.0, 0.0, 1.0]), 1)]
         );
         assert_eq!(
-            lower(vec![video]),
+            lower(&plan(&[video], true)),
             [
                 (Target::Part(0), Some([0.0, 0.0, 0.0, 1.0]), 1),
                 (Target::Part(1), Some([0.0; 4]), 1),
+            ]
+        );
+        // Nothing painted after the promoted layer opens no part: the
+        // plan counts one, so the walk must emit one.
+        assert_eq!(
+            lower(&plan(&[above], false)),
+            [(Target::Part(0), Some([0.0, 0.0, 0.0, 1.0]), 1)]
+        );
+        // Two promoted layers with the second painted last: the
+        // separator part between them still opens, nothing after it.
+        // Recorded pixels on the second plane are captured separately,
+        // so the separator has no engine draws.
+        assert_eq!(
+            lower(&plan(&[video, above], false)),
+            [
+                (Target::Part(0), Some([0.0, 0.0, 0.0, 1.0]), 1),
+                (Target::Part(1), Some([0.0; 4]), 0),
             ]
         );
     }

@@ -30,6 +30,15 @@ pub const RATE_FAST: RefreshRange = 60..=120;
 /// at 60 Hz remain.
 pub const RATE_SLOW: RefreshRange = 30..=60;
 
+/// Complete affine and opacity tracks available for compositor handoff.
+#[derive(Clone)]
+pub struct LayerAnimations {
+    /// The affine motion, when running.
+    pub transform: Option<crate::AnimationTrack<Affine>>,
+    /// The opacity motion, when running.
+    pub opacity: Option<crate::AnimationTrack<f32>>,
+}
+
 /// A surface's layer tree on the render thread.
 pub struct SurfaceTree {
     nodes: FxHashMap<u64, LayerNode>,
@@ -76,6 +85,8 @@ pub struct LayerNode {
     components: Option<Box<components::Components>>,
     opacity_track: Option<Track<f32>>,
     scroll_track: Option<Track<Vec2>>,
+    projective: bool,
+    animation_rate: Option<RefreshRange>,
     /// The stamp of the last change to what this layer draws in its own
     /// space: clip, scroll offset, filter, backdrop, content, children.
     inner_stamp: u64,
@@ -100,6 +111,39 @@ impl std::fmt::Debug for LayerNode {
 }
 
 impl LayerNode {
+    /// The affine track, including its original start and velocity.
+    /// Component transforms are returned only when their sole moving
+    /// component is translation, which is affine-linear in the same lanes.
+    #[must_use]
+    fn transform_animation(&self) -> Option<crate::AnimationTrack<Affine>> {
+        match &self.components {
+            None => self.transform_track.as_ref()?.description(),
+            Some(components) if self.transform_track.is_none() => {
+                components.translation_animation()
+            }
+            Some(_) => None,
+        }
+    }
+
+    /// Describes all running tracks together. Returns `None` for scroll,
+    /// projective or nonlinear component motion, or an unsampled track.
+    /// An empty description means that no property is moving.
+    #[must_use]
+    pub fn animations(&self) -> Option<LayerAnimations> {
+        if self.projective || self.scroll_track.is_some() {
+            return None;
+        }
+        let transform = self.transform_animation();
+        if self.animating() && transform.is_none() {
+            return None;
+        }
+        let opacity = match &self.opacity_track {
+            Some(track) => Some(track.description()?),
+            None => None,
+        };
+        Some(LayerAnimations { transform, opacity })
+    }
+
     /// Records a sampled change: `outer` for how the layer composes,
     /// `inner` for what it draws in its own space.
     const fn restamp(&mut self, clock: &mut u64, outer: bool, inner: bool) {
@@ -131,6 +175,8 @@ impl LayerNode {
             components: None,
             opacity_track: None,
             scroll_track: None,
+            projective: false,
+            animation_rate: None,
             inner_stamp: 0,
             outer_stamp: 0,
         }
@@ -159,6 +205,31 @@ impl LayerNode {
     #[must_use]
     pub const fn content_translucent(&self) -> bool {
         self.content_translucent
+    }
+
+    fn classify_rate(&self, display: Display, components_running: bool) -> Option<RefreshRange> {
+        if components_running {
+            return Some(RATE_FAST);
+        }
+        let mut rate = None;
+        for fast in [
+            self.transform_track
+                .as_ref()
+                .map(|t| t.is_fast(display.scale)),
+            self.opacity_track
+                .as_ref()
+                .map(|t| t.is_fast(display.scale)),
+            self.scroll_track.as_ref().map(|t| t.is_fast(display.scale)),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if fast {
+                return Some(RATE_FAST);
+            }
+            rate = Some(RATE_SLOW);
+        }
+        rate
     }
 
     /// Whether an engine-driven track moved this layer this frame: a
@@ -194,6 +265,16 @@ struct Track<T: Animatable> {
 }
 
 impl<T: Animatable> Track<T> {
+    fn description(&self) -> Option<crate::AnimationTrack<T>> {
+        Some(crate::AnimationTrack {
+            from: T::from_lanes(self.from),
+            velocity: self.velocity,
+            target: self.target,
+            animation: self.animation,
+            start: self.start?,
+        })
+    }
+
     fn new(from: T::Lanes, velocity: T::Lanes, target: T, animation: Animation) -> Self {
         debug_assert!(
             !matches!(animation, Animation::Decay(_)) || T::Lanes::N == 2,
@@ -275,6 +356,50 @@ impl Default for SurfaceTree {
 }
 
 impl SurfaceTree {
+    /// Refreshes compositor-owned motion before a new transaction retargets
+    /// it. Without engine frames, `last` otherwise describes the handoff
+    /// frame rather than the position and velocity currently on screen.
+    pub(crate) fn sample_owned(&mut self, time: Instant, owns: impl Fn(LayerId) -> bool) {
+        for (&raw, node) in &mut self.nodes {
+            if !owns(LayerId::new(raw)) {
+                continue;
+            }
+            if let Some(track) = &mut node.transform_track {
+                let (position, _, _) = track.sample(time);
+                node.transform = Affine::from_lanes(position);
+            }
+            if let Some(components) = &mut node.components {
+                components.sample(time);
+                node.transform = components.matrix();
+                // Component sampling clears settled tracks. The ordinary
+                // sampler can no longer observe that final movement, so
+                // preserve its dependency change before a possible demotion.
+                node.restamp(&mut self.clock, true, false);
+            }
+            if let Some(track) = &mut node.opacity_track {
+                let (position, _, _) = track.sample(time);
+                node.opacity = f32::from_lanes(position);
+            }
+        }
+    }
+
+    /// Rate required by tracks the backend has not accepted. Called after
+    /// presentation so a handoff suppresses the very next frame, and a
+    /// demotion resumes scheduling immediately.
+    pub(crate) fn animation_rate(&self, owns: impl Fn(LayerId) -> bool) -> Option<RefreshRange> {
+        let mut running = false;
+        for (&raw, node) in &self.nodes {
+            if owns(LayerId::new(raw)) {
+                continue;
+            }
+            if node.animation_rate == Some(RATE_FAST) {
+                return Some(RATE_FAST);
+            }
+            running |= node.animation_rate.is_some();
+        }
+        running.then_some(RATE_SLOW)
+    }
+
     /// An empty tree holding only its root layer (`LayerId(0)`).
     #[must_use]
     pub fn new() -> Self {
@@ -322,6 +447,24 @@ impl SurfaceTree {
         })
     }
 
+    /// Version of the pixels composited by the engine, excluding only the
+    /// outer properties of layers whose pixels belong to system planes.
+    /// Content, clips, child order and every unpromoted property remain
+    /// dependencies. Backends separately validate plane eligibility and
+    /// resource changes before reusing the engine parts.
+    #[must_use]
+    pub fn composition_stamp(&self, promoted: impl Fn(LayerId) -> bool) -> u64 {
+        self.nodes.iter().fold(0, |stamp, (&raw, node)| {
+            stamp
+                .max(node.inner_stamp)
+                .max(if promoted(LayerId::new(raw)) {
+                    0
+                } else {
+                    node.outer_stamp
+                })
+        })
+    }
+
     fn subtree_stamp(&self, id: LayerId) -> u64 {
         let node = self.layer(id);
         node.children
@@ -348,6 +491,7 @@ impl SurfaceTree {
             "layer {} is not in the tree",
             id.raw()
         );
+        self.node_mut(id).projective = true;
         self.projective
             .entry(id.raw())
             .or_insert_with(projective::State::new)
@@ -385,6 +529,7 @@ impl SurfaceTree {
                     id.raw()
                 );
                 self.projective.remove(&id.raw());
+                self.node_mut(id).projective = false;
             }
             _ => unreachable!("only projective ops reach apply_projective"),
         }
@@ -408,6 +553,9 @@ impl SurfaceTree {
                 node.outer_stamp = self.clock;
             }
             state.refresh(node);
+            if run {
+                node.animation_rate = Some(RATE_FAST);
+            }
         }
         (stepped, running)
     }
@@ -680,6 +828,7 @@ impl SurfaceTree {
         let mut fast = false;
         let mut slow = false;
         for node in self.nodes.values_mut() {
+            let mut node_fast = false;
             // Opacity is outer and scroll inner: any running track steps.
             let mut outer_changed = node.opacity_track.is_some();
             let inner_changed = node.scroll_track.is_some();
@@ -705,7 +854,7 @@ impl SurfaceTree {
             if let Some(components) = &mut node.components {
                 let (component_step, running) = components.sample(time);
                 stepped |= component_step;
-                fast |= running;
+                node_fast |= running;
                 if transform_changed || component_step {
                     node.transform = components.matrix();
                 }
@@ -756,25 +905,9 @@ impl SurfaceTree {
                 }
             }
             node.restamp(&mut self.clock, outer_changed, inner_changed);
-            // Rate classification of the tracks that remain.
-            for running_track in [
-                node.transform_track
-                    .as_ref()
-                    .map(|t| t.is_fast(display.scale)),
-                node.opacity_track
-                    .as_ref()
-                    .map(|t| t.is_fast(display.scale)),
-                node.scroll_track.as_ref().map(|t| t.is_fast(display.scale)),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                if running_track {
-                    fast = true;
-                } else {
-                    slow = true;
-                }
-            }
+            node.animation_rate = node.classify_rate(display, node_fast);
+            fast |= node.animation_rate == Some(RATE_FAST);
+            slow |= node.animation_rate == Some(RATE_SLOW);
         }
         let (projective_step, projective_running) = self.sample_projective(time);
         stepped |= projective_step;
@@ -974,6 +1107,69 @@ mod hierarchy_tests {
     }
 
     #[test]
+    fn animation_description_rejects_incomplete_and_projective_tracks() {
+        let mut tree = SurfaceTree::new();
+        let root = tree.root();
+        tree.apply(LayerOp::Opacity(
+            root,
+            Prop {
+                target: 0.5,
+                animation: Some(Curve::linear(Duration::from_secs(1)).into()),
+            },
+        ));
+        assert!(tree.layer(root).animations().is_none());
+        tree.sample(Instant::now(), Display::default());
+        let tracks = tree.layer(root).animations().expect("sampled opacity");
+        assert!(tracks.transform.is_none());
+        assert!(tracks.opacity.is_some());
+        tree.apply(LayerOp::Depth(
+            root,
+            Prop {
+                target: 2.0,
+                animation: None,
+            },
+        ));
+        assert!(tree.layer(root).animations().is_none());
+        tree.apply(LayerOp::ClearProjection(root));
+        assert!(tree.layer(root).animations().is_some());
+    }
+
+    #[test]
+    fn ownership_filter_keeps_the_sampled_slow_rate() {
+        let mut tree = SurfaceTree::new();
+        let root = tree.root();
+        let owned = LayerId::new(1);
+        let slow = LayerId::new(2);
+        for child in [owned, slow] {
+            tree.apply(LayerOp::Create(child));
+            tree.apply(LayerOp::Push {
+                parent: root,
+                child,
+            });
+        }
+        // Decay is the only slow class, and it is legal only on scroll offset.
+        tree.apply(LayerOp::ScrollOffset(
+            slow,
+            Prop {
+                target: Vec2::ZERO,
+                animation: Some(Decay::new(Vec2::new(0., 10.)).into()),
+            },
+        ));
+        tree.apply(LayerOp::Transform(
+            owned,
+            Prop {
+                target: Affine::translate((100., 0.)),
+                animation: Some(crate::Curve::linear(std::time::Duration::from_secs(1)).into()),
+            },
+        ));
+        let sampled = tree.sample(Instant::now(), Display::default());
+        assert_eq!(sampled.rate, Some(RATE_FAST));
+        assert_eq!(tree.animation_rate(|layer| layer == owned), Some(RATE_SLOW));
+        assert_eq!(tree.animation_rate(|_| false), sampled.rate);
+        assert_eq!(tree.animation_rate(|_| true), None);
+    }
+
+    #[test]
     fn detach_and_remove_preserve_parent_links() {
         let mut tree = tree();
         tree.apply(LayerOp::Push {
@@ -1170,5 +1366,65 @@ mod hierarchy_tests {
 
         tree.note_content(layer, None);
         assert!(!tree.layer(layer).blends_within());
+    }
+
+    #[test]
+    fn owned_motion_retargets_at_the_current_presentation_time() {
+        let mut tree = SurfaceTree::new();
+        let layer = tree.root();
+        let start = Instant::now();
+        tree.apply(LayerOp::Opacity(
+            layer,
+            Prop {
+                target: 0.0,
+                animation: Some(Curve::linear(Duration::from_secs(2)).into()),
+            },
+        ));
+        tree.sample(start, Display::default());
+        assert_eq!(tree.animation_rate(|_| true), None);
+        assert_eq!(tree.animation_rate(|_| false), Some(RATE_FAST));
+        tree.sample_owned(start + Duration::from_secs(1), |_| true);
+        tree.apply(LayerOp::Opacity(
+            layer,
+            Prop {
+                target: 0.8,
+                animation: Some(crate::Spring::smooth().into()),
+            },
+        ));
+        tree.sample(start + Duration::from_secs(1), Display::default());
+        let track = tree
+            .layer(layer)
+            .animations()
+            .expect("describable tracks")
+            .opacity
+            .expect("running spring");
+        assert!((track.from - 0.5).abs() < 1e-6);
+        assert!((track.velocity[0] + 0.5).abs() < 1e-6);
+        assert_eq!(track.start, start + Duration::from_secs(1));
+    }
+
+    #[test]
+    fn plane_composition_version_excludes_only_the_promoted_outer_state() {
+        let mut tree = SurfaceTree::new();
+        let layer = LayerId::new(1);
+        tree.apply(LayerOp::Create(layer));
+        tree.apply(LayerOp::Push {
+            parent: tree.root(),
+            child: layer,
+        });
+        let stamp = tree.composition_stamp(|id| id == layer);
+        tree.apply(LayerOp::Transform(
+            layer,
+            Prop {
+                target: Affine::translate((37., -12.)),
+                animation: None,
+            },
+        ));
+        assert_eq!(stamp, tree.composition_stamp(|id| id == layer));
+        tree.apply(LayerOp::Clip(
+            layer,
+            Some(crate::ShapeData::Rect(Rect::new(0., 0., 20., 20.))),
+        ));
+        assert_ne!(stamp, tree.composition_stamp(|id| id == layer));
     }
 }

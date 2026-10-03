@@ -3,7 +3,6 @@
 use color::{AlphaColor, ColorSpaceTag, DynamicColor};
 use nami_core::Signal;
 use nami_core::watcher::Context;
-use serde::{Deserialize, Serialize};
 
 pub use color::{ColorSpace, DisplayP3, LinearSrgb, Rec2020, Srgb};
 
@@ -55,7 +54,8 @@ impl ColorSpace for LinearDisplayP3 {
 
 /// A colour in the working space: linear Display P3, straight alpha, extended
 /// range.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct WorkingColor {
     /// Red, green, blue in linear Display P3, then alpha.
     pub components: [f32; 4],

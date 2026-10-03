@@ -2,6 +2,8 @@
 //! system-compositor planes (issue #90).
 
 pub mod pattern;
+#[path = "../../planes_common/recorded.rs"]
+pub mod recorded;
 pub mod scenario;
 
 #[cfg(target_os = "android")]

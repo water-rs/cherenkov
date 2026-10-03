@@ -26,6 +26,7 @@
 
 #[path = "src/render/bindings.rs"]
 mod bindings;
+mod deployment;
 
 use std::env;
 use std::num::NonZeroU32;
@@ -896,6 +897,7 @@ fn apple_target() -> Option<AppleTarget> {
         .strip_prefix(&format!("{deployment_variable}="))
         .expect("rustc reports the target platform's deployment variable")
         .to_owned();
+    deployment::require_floor(&deployment_version);
     Some(AppleTarget {
         sdk,
         deployment_variable,

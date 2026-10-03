@@ -7,6 +7,10 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[features]
+# Harness-only YUV decode uniform and shader. Not part of `interop`.
+bench = []
+
 [dependencies]
 filtrate = { path = "../filtrate" }
 filtrate-core = { path = "../filtrate/core" }

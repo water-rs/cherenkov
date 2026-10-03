@@ -22,6 +22,8 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+#[cfg(feature = "bench")]
+pub mod bench;
 pub mod interop;
 mod names;
 mod render;

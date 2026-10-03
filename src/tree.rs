@@ -1147,11 +1147,12 @@ mod hierarchy_tests {
                 child,
             });
         }
-        tree.apply(LayerOp::Opacity(
+        // Decay is the only slow class, and it is legal only on scroll offset.
+        tree.apply(LayerOp::ScrollOffset(
             slow,
             Prop {
-                target: 0.5,
-                animation: Some(Decay::new(Vec2::new(10., 0.)).into()),
+                target: Vec2::ZERO,
+                animation: Some(Decay::new(Vec2::new(0., 10.)).into()),
             },
         ));
         tree.apply(LayerOp::Transform(

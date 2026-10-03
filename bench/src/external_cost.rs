@@ -14,11 +14,12 @@
 //!
 //! Path `c` copies the planes on the CPU into a staging buffer, then
 //! one GPU submission does `copy_buffer_to_texture` of both planes and
-//! a [`GpuContent`] draw. The draw's shader is `shared.wgsl` +
-//! `external.wgsl` + `external_convert.wgsl`, and its uniform is
-//! [`yuv_frame_params`] — the same bake the engine writes for an
-//! installed YUV frame. `external_convert.wgsl` is the bench's
-//! fullscreen caller of `ext_frame_yuv`.
+//! a [`GpuContent`] draw. The draw's shader is
+//! [`DECODE_WGSL`](cherenkov_gpu::bench::DECODE_WGSL) plus
+//! `external_convert.wgsl`, and its uniform is [`yuv_frame_params`] —
+//! the same bake the engine writes for an installed YUV frame.
+//! `external_convert.wgsl` is the bench's fullscreen caller of
+//! `ext_frame_yuv`.
 //!
 //! Timing: the engine's own GPU timestamps cover the composite
 //! submission. Path `c`'s handoff is only the GPU work inside that one
@@ -32,9 +33,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cherenkov::{Engine, FrameTime, Offscreen, OffscreenFormat};
+use cherenkov_gpu::bench::{YuvFrameParams, YuvLayout, yuv_frame_params};
 use cherenkov_gpu::interop::{
-    ExternalFrame, FrameColor, GpuContent, GpuContentBox, SharedDevice, Transfer, YuvFrameParams,
-    YuvLayout, wgpu, yuv_frame_params,
+    ExternalFrame, FrameColor, GpuContent, GpuContentBox, SharedDevice, Transfer, wgpu,
 };
 use cherenkov_gpu::{Gpu, GpuConfig};
 
@@ -250,16 +251,36 @@ impl Ramps {
     }
 }
 
-/// `external.wgsl` verbatim — the `shared.wgsl` prelude it needs
-/// included — followed by the bench's fullscreen convert pass
-/// (`external_convert.wgsl`), which calls `ext_frame_yuv`. Path `c`
-/// runs that integer-plane decode over the copied planes. Path `e` on
-/// Apple does too; an Android external-format import does not.
-const CONVERT_WGSL: &str = concat!(
-    include_str!("../../gpu/src/render/shared.wgsl"),
-    include_str!("../../gpu/src/render/external.wgsl"),
-    include_str!("external_convert.wgsl")
-);
+const DECODE_LEN: usize = cherenkov_gpu::bench::DECODE_WGSL.len();
+const CONVERT_TAIL: &[u8] = include_bytes!("external_convert.wgsl");
+
+/// Bytes of [`cherenkov_gpu::bench::DECODE_WGSL`] followed by
+/// `external_convert.wgsl`. A const array of this size is rejected, and
+/// `concat!` cannot take the decode const, so the join is a static.
+static CONVERT_BYTES: [u8; DECODE_LEN + CONVERT_TAIL.len()] = {
+    let head = cherenkov_gpu::bench::DECODE_WGSL.as_bytes();
+    let mut out = [0u8; DECODE_LEN + CONVERT_TAIL.len()];
+    let mut i = 0;
+    while i < head.len() {
+        out[i] = head[i];
+        i += 1;
+    }
+    let mut j = 0;
+    while j < CONVERT_TAIL.len() {
+        out[head.len() + j] = CONVERT_TAIL[j];
+        j += 1;
+    }
+    out
+};
+
+/// [`cherenkov_gpu::bench::DECODE_WGSL`] followed by this crate's
+/// fullscreen convert pass (`external_convert.wgsl`), which calls
+/// `ext_frame_yuv`. Path `c` runs that integer-plane decode over the
+/// copied planes. Path `e` on Apple does too; an Android
+/// external-format import does not.
+fn convert_wgsl() -> &'static str {
+    std::str::from_utf8(&CONVERT_BYTES).expect("external-cost convert shader is utf-8")
+}
 
 /// Queries per set: the largest multiple of 3 that fits in one set.
 const fn query_span() -> u32 {
@@ -384,7 +405,7 @@ impl GpuContent for Convert {
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("external-cost convert"),
-                source: wgpu::ShaderSource::Wgsl(CONVERT_WGSL.into()),
+                source: wgpu::ShaderSource::Wgsl(convert_wgsl().into()),
             });
         let pipeline = ctx
             .device

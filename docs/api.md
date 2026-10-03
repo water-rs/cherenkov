@@ -563,7 +563,6 @@ tx[&sparks].content(GpuContentHandle::new(Particles::new()));
 ```
 
 - **The engine does YUV conversion and tone mapping** for external frames when it composites them itself.
-- **`interop::yuv_frame_params` bakes that YUV decode.** The input is the frame colour, the biplanar layout (`YuvLayout::Nv12` or `P010`) and the luma size; the result is the 192-byte `ExtParams` uniform `external.wgsl` reads. The retained YUV path calls it, and so does a host shader that runs `ext_frame_yuv` over copied planes. An Android YUV `AHardwareBuffer` that imports as an external format does not: the driver's YCbCr sampler decodes it.
 - **Custom GPU content composites like any other layer:** it can be clipped, filtered, animated and used as a backdrop source.
 - **The map records `Content`, not `GpuContent`.** Each tile is a frozen `Picture` and the camera is the layer transform, so pinch-zoom and fling run in the engine. Tessellation is refreshed at the new zoom level once the gesture settles.
 

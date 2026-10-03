@@ -290,9 +290,8 @@ pub enum YuvLayout {
 /// `color` is the frame's decode, `layout` its plane packing and `size`
 /// the luma plane in pixels. Chroma is half the luma on each axis
 /// (rounded up) and the frame is opaque: that is the whole input the
-/// uniform needs. The engine's retained YUV path and a host that runs
-/// the same `ext_frame_yuv` decode both call this, so the uniform
-/// cannot drift.
+/// uniform needs. The retained YUV path calls this. The `bench` feature
+/// re-exports it so the harness bakes the same uniform.
 #[must_use]
 pub fn yuv_frame_params(
     color: &crate::interop::FrameColor,

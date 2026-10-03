@@ -110,11 +110,9 @@ pub enum ExternalTransfer {
 }
 
 /// The `external-cost` options, assembled by [`run`] for
-/// `crate::external_cost::run` (#168).
-#[cfg_attr(
-    not(feature = "cherenkov"),
-    allow(dead_code)
-)]
+/// `crate::external_cost::run` (#168). Absent without the `cherenkov`
+/// feature: the stub command never reads it.
+#[cfg(feature = "cherenkov")]
 pub(crate) struct ExternalCostArgs {
     /// `e`/`c` — the measured path.
     pub(crate) path: ExternalPath,
@@ -126,8 +124,8 @@ pub(crate) struct ExternalCostArgs {
     pub(crate) frames: u32,
     /// Warmup frames.
     pub(crate) warmup: u32,
-    /// Pacing rate in Hz.
-    pub(crate) rate: Option<f64>,
+    /// Pacing rate in Hz. The CLI always supplies one (`default_value_t`).
+    pub(crate) rate: f64,
     /// Measure energy.
     pub(crate) energy: bool,
     /// Pinned CPUs.
@@ -650,17 +648,17 @@ fn run(cli: Cli) -> Result<(), BenchError> {
             energy,
             cpu,
             out,
-        } => external_cost_cmd(&ExternalCostArgs {
+        } => external_cost_cmd(
             path,
             size,
             transfer,
             frames,
             warmup,
-            rate: Some(rate),
+            rate,
             energy,
-            cpu: cpu.as_deref().map(affinity::parse_cpu_list).transpose()?,
-            out,
-        }),
+            cpu.as_deref(),
+            &out,
+        ),
         Sub::GamutSweep { out } => crate::gamut_sweep::run(out.as_deref()),
         Sub::ToneSweep { out } => crate::tone_sweep::run(out.as_deref()),
         Sub::Creation {
@@ -725,12 +723,50 @@ fn present_cost_cmd(
 
 /// `external-cost` needs the GPU adapter and platform interop (#168).
 #[cfg(feature = "cherenkov")]
-fn external_cost_cmd(args: &ExternalCostArgs) -> Result<(), BenchError> {
-    crate::external_cost::run(args)
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the stub below takes the same fields; ExternalCostArgs exists only with this feature"
+)]
+fn external_cost_cmd(
+    path: ExternalPath,
+    size: ExternalSize,
+    transfer: ExternalTransfer,
+    frames: u32,
+    warmup: u32,
+    rate: f64,
+    energy: bool,
+    cpu: Option<&str>,
+    out: &Path,
+) -> Result<(), BenchError> {
+    crate::external_cost::run(&ExternalCostArgs {
+        path,
+        size,
+        transfer,
+        frames,
+        warmup,
+        rate,
+        energy,
+        cpu: cpu.map(affinity::parse_cpu_list).transpose()?,
+        out: out.to_path_buf(),
+    })
 }
 
 #[cfg(not(feature = "cherenkov"))]
-fn external_cost_cmd(_args: &ExternalCostArgs) -> Result<(), BenchError> {
+#[expect(
+    clippy::too_many_arguments,
+    reason = "matches the cherenkov command; ExternalCostArgs is not built without that feature"
+)]
+fn external_cost_cmd(
+    _path: ExternalPath,
+    _size: ExternalSize,
+    _transfer: ExternalTransfer,
+    _frames: u32,
+    _warmup: u32,
+    _rate: f64,
+    _energy: bool,
+    _cpu: Option<&str>,
+    _out: &Path,
+) -> Result<(), BenchError> {
     Err(BenchError::Engine(
         "external-cost needs the `cherenkov` adapter feature".into(),
     ))

@@ -2,7 +2,9 @@
 //! per frame — the Android video-decode output model, the same buffer
 //! kind `gpu/tests/vulkan_external_android.rs` imports.
 
-use super::{BenchError, ExternalFrame, FrameColor, RING, Ramps, SharedDevice, Spec, wgpu};
+use super::{
+    BenchError, ExternalFrame, FrameColor, RING, Ramps, SharedDevice, SlotDone, Spec, wgpu,
+};
 
 use cherenkov_gpu::interop::{HdrMetadata, RgbAlpha, vulkan};
 
@@ -11,8 +13,30 @@ pub struct Producer {
     buffers: Vec<std::ptr::NonNull<ndk_sys::AHardwareBuffer>>,
     /// The engine's native Vulkan device — per-frame AHB import.
     vulkan: vulkan::Device,
+    device: wgpu::Device,
     ramps: Ramps,
     spec: Spec,
+    /// Armed after the submit that samples slot `f % RING`.
+    done: SlotDone,
+}
+
+/// Unlocks an `AHardwareBuffer` if the body panics before the explicit
+/// unlock.
+struct AhbLock {
+    buffer: *mut ndk_sys::AHardwareBuffer,
+    armed: bool,
+}
+
+impl Drop for AhbLock {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // SAFETY: `buffer` is the AHB `with_planes` locked. This is the
+        // matching unlock, and it runs only when the body panics before
+        // the explicit unlock. The fence out-pointer is unused.
+        unsafe { ndk_sys::AHardwareBuffer_unlock(self.buffer, std::ptr::null_mut()) };
+    }
 }
 
 /// One allocated `AHardwareBuffer` of `spec`'s format — the usage set
@@ -37,7 +61,7 @@ fn alloc_ahb(spec: &Spec) -> Result<std::ptr::NonNull<ndk_sys::AHardwareBuffer>,
         rfu0: 0,
         rfu1: 0,
     };
-    // SAFETY: `desc` is fully initialized.
+    // SAFETY: `desc` is fully initialized and outlives the call.
     if unsafe { ndk_sys::AHardwareBuffer_isSupported(&raw const desc) } == 0 {
         return Err(BenchError::Engine(format!(
             "external-cost: AHB format {format:#x} unsupported at {}x{}",
@@ -45,7 +69,8 @@ fn alloc_ahb(spec: &Spec) -> Result<std::ptr::NonNull<ndk_sys::AHardwareBuffer>,
         )));
     }
     let mut buffer = std::ptr::null_mut();
-    // SAFETY: `buffer` receives the allocated buffer on success.
+    // SAFETY: `buffer` receives the allocated buffer on success, and
+    // `desc` is fully initialized.
     if unsafe { ndk_sys::AHardwareBuffer_allocate(&raw const desc, &raw mut buffer) } != 0
         || buffer.is_null()
     {
@@ -56,12 +81,12 @@ fn alloc_ahb(spec: &Spec) -> Result<std::ptr::NonNull<ndk_sys::AHardwareBuffer>,
     Ok(std::ptr::NonNull::new(buffer).expect("non-null after check"))
 }
 
-/// The locked planes of `buffer` — `body` runs under one lock.
-fn planes(
+/// Locks `buffer`'s planes, runs `body`, unlocks, and checks both results.
+fn with_planes<R>(
     buffer: *mut ndk_sys::AHardwareBuffer,
     write: bool,
-    body: impl Fn(&ndk_sys::AHardwareBuffer_Planes),
-) {
+    body: impl FnOnce(&ndk_sys::AHardwareBuffer_Planes) -> Result<R, BenchError>,
+) -> Result<R, BenchError> {
     let usage = if write {
         ndk_sys::AHardwareBuffer_UsageFlags::AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN.0
     } else {
@@ -75,7 +100,8 @@ fn planes(
             rowStride: 0,
         }; 4],
     };
-    // SAFETY: `planes` is fully initialized and `buffer` is live.
+    // SAFETY: `planes` is fully initialized and `buffer` is a live AHB
+    // this ring allocated. The unlock below pairs with this lock.
     let rc = unsafe {
         ndk_sys::AHardwareBuffer_lockPlanes(
             buffer,
@@ -85,20 +111,55 @@ fn planes(
             &raw mut planes,
         )
     };
-    assert_eq!(rc, 0, "external-cost: AHardwareBuffer_lockPlanes");
-    body(&planes);
-    // SAFETY: locked above.
-    let _ = unsafe { ndk_sys::AHardwareBuffer_unlock(buffer, std::ptr::null_mut()) };
+    if rc != 0 {
+        return Err(BenchError::Engine(format!(
+            "external-cost: AHardwareBuffer_lockPlanes failed ({rc})"
+        )));
+    }
+    let mut guard = AhbLock {
+        buffer,
+        armed: true,
+    };
+    let result = body(&planes);
+    guard.armed = false;
+    // SAFETY: paired with the successful lock above. `body` has copied
+    // or written the plane bytes and no longer holds their pointers.
+    let unlock = unsafe { ndk_sys::AHardwareBuffer_unlock(buffer, std::ptr::null_mut()) };
+    if unlock != 0 {
+        return Err(BenchError::Engine(format!(
+            "external-cost: AHardwareBuffer_unlock failed ({unlock})"
+        )));
+    }
+    result
 }
 
-/// SAFETY invariants of the helpers below: every `data` pointer comes
-/// from a live locked plane, `rowStride`/`pixelStride` describe its
-/// layout, and the slice never crosses the plane's `rows * rowStride`.
+/// # Safety
+/// `plane.data` is a live locked plane, `row * rowStride + len` stays
+/// inside it, and `len <= rowStride`.
 unsafe fn plane_row<'a>(
     plane: &ndk_sys::AHardwareBuffer_Plane,
     row: usize,
     len: usize,
+) -> &'a [u8] {
+    // SAFETY: the caller holds the lock and promised `row * rowStride + len`
+    // is inside the plane.
+    unsafe {
+        std::slice::from_raw_parts(
+            plane.data.cast::<u8>().add(row * plane.rowStride as usize),
+            len,
+        )
+    }
+}
+
+/// # Safety
+/// Same as [`plane_row`], and the caller is the only writer of that row.
+unsafe fn plane_row_mut<'a>(
+    plane: &ndk_sys::AHardwareBuffer_Plane,
+    row: usize,
+    len: usize,
 ) -> &'a mut [u8] {
+    // SAFETY: the caller holds the write lock and promised the range
+    // stays inside the plane.
     unsafe {
         std::slice::from_raw_parts_mut(
             plane.data.cast::<u8>().add(row * plane.rowStride as usize),
@@ -107,49 +168,58 @@ unsafe fn plane_row<'a>(
     }
 }
 
-/// The packed interleaved `(cb, cr)` rows of a locked semi-planar or
-/// tri-planar chroma buffer — `width / 2` pairs of `bytes` each.
-///
-/// Semi-planar AHBs expose the pair in plane 1 (`pixelStride == 2`
-/// codes on plane 1, possibly split as pixelStride-2 planes 1/2
-/// pointing at cb/cr of the same interleaved row). Tri-planar
-/// (`pixelStride == 1`) is de-interleaved per pixel.
-fn chroma_pairs(
+/// Cb-first interleaved chroma: plane 2's base is one code past plane 1's,
+/// and plane 1's pixel stride is one `(cb, cr)` pair.
+fn require_cb_first(
     planes: &ndk_sys::AHardwareBuffer_Planes,
     spec: &Spec,
-    row: usize,
-    dst: &mut [u8],
 ) -> Result<(), BenchError> {
     let bytes = spec.code_bytes();
     let pair = 2 * bytes;
-    let cols = spec.width.div_ceil(2) as usize;
-    let p1 = planes.planes[1];
-    if p1.pixelStride as usize == pair
-        || (planes.planeCount == 3 && p1.pixelStride as usize == pair)
-    {
-        // Interleaved UV in plane 1.
-        let len = cols * pair;
-        // SAFETY: plane 1 row `row` holds `cols` packed pairs.
-        dst[..len].copy_from_slice(unsafe { plane_row(&p1, row, len) });
-        return Ok(());
+    if planes.planeCount < 3 {
+        return Err(BenchError::Engine(format!(
+            "external-cost: AHB has {} planes; chroma must be Cb-first interleaved",
+            planes.planeCount
+        )));
     }
-    if planes.planeCount == 3 && p1.pixelStride as usize == bytes {
-        // Separate Cb/Cr planes.
-        let p2 = planes.planes[2];
-        let cb_row = unsafe { plane_row(&p1, row, p1.rowStride as usize) };
-        let cr_row = unsafe { plane_row(&p2, row, p2.rowStride as usize) };
-        for col in 0..cols {
-            dst[col * pair..col * pair + bytes]
-                .copy_from_slice(&cb_row[col * bytes..col * bytes + bytes]);
-            dst[col * pair + bytes..col * pair + pair]
-                .copy_from_slice(&cr_row[col * bytes..col * bytes + bytes]);
-        }
-        return Ok(());
+    let luma = &planes.planes[0];
+    let p1 = &planes.planes[1];
+    let p2 = &planes.planes[2];
+    let luma_tight = spec.width as usize * bytes;
+    let chroma_tight = spec.width.div_ceil(2) as usize * pair;
+    let cb_first = p1.pixelStride as usize == pair
+        && !p1.data.is_null()
+        && p2.data.cast::<u8>() == p1.data.cast::<u8>().wrapping_add(bytes);
+    if !cb_first {
+        return Err(BenchError::Engine(format!(
+            "external-cost: chroma is not Cb-first interleaved (planes {}, pixelStride {})",
+            planes.planeCount, p1.pixelStride
+        )));
     }
-    Err(BenchError::Engine(format!(
-        "external-cost: unhandled AHB chroma layout (planes {}, pixelStride {})",
-        planes.planeCount, p1.pixelStride
-    )))
+    if luma.data.is_null() || (luma.rowStride as usize) < luma_tight {
+        return Err(BenchError::Engine(format!(
+            "external-cost: luma rowStride {} is shorter than {luma_tight}",
+            luma.rowStride
+        )));
+    }
+    if (p1.rowStride as usize) < chroma_tight {
+        return Err(BenchError::Engine(format!(
+            "external-cost: chroma rowStride {} is shorter than {chroma_tight}",
+            p1.rowStride
+        )));
+    }
+    Ok(())
+}
+
+/// How an imported frame was bound. Path `e` records this; an
+/// external-format import is the driver's YCbCr sampler, not
+/// `ext_frame_yuv`.
+fn import_form(frame: &vulkan::Frame) -> &'static str {
+    match frame.repr() {
+        vulkan::Repr::ExternalFormat { .. } => "external-format",
+        vulkan::Repr::Planes { .. } => "planes",
+        vulkan::Repr::Rgb { .. } => "rgb",
+    }
 }
 
 impl Producer {
@@ -163,161 +233,90 @@ impl Producer {
         Ok(Self {
             buffers,
             vulkan,
+            device: shared.device.clone(),
             ramps: Ramps::new(spec),
             spec: *spec,
+            done: SlotDone::new(),
         })
     }
 
-    /// Writes frame `frame`'s gradient into buffer `frame % RING`.
-    pub fn fill(&self, frame: u32) {
+    /// Writes frame `frame`'s gradient into buffer `frame % RING`,
+    /// after the submit that last sampled that slot has completed.
+    pub fn fill(&mut self, frame: u32) -> Result<(), BenchError> {
+        self.done.wait(frame, &self.device)?;
         let buffer = self.buffers[frame as usize % RING].as_ptr();
         let (ramps, spec) = (&self.ramps, &self.spec);
-        planes(buffer, true, |planes| {
-            assert!(planes.planeCount >= 2, "external-cost: 1-plane AHB");
-            let luma = planes.planes[0];
+        with_planes(buffer, true, |planes| {
+            require_cb_first(planes, spec)?;
+            let luma = &planes.planes[0];
+            let chroma = &planes.planes[1];
+            let luma_tight = spec.width as usize * spec.code_bytes();
+            let chroma_tight = spec.width.div_ceil(2) as usize * 2 * spec.code_bytes();
             for row in 0..spec.height as usize {
-                let dst = unsafe { plane_row(&luma, row, spec.width as usize * spec.code_bytes()) };
+                // SAFETY: `require_cb_first` checked the luma stride, the
+                // buffer is write-locked, and `row < height`.
+                let dst = unsafe { plane_row_mut(luma, row, luma_tight) };
                 ramps.luma_row(frame, u32::try_from(row).expect("row fits u32"), dst);
             }
-            let pair = 2 * spec.code_bytes();
-            let mut row_buf = vec![0u8; spec.width as usize * spec.code_bytes()];
             for row in 0..spec.height.div_ceil(2) as usize {
-                ramps.chroma_row(
-                    frame,
-                    u32::try_from(row).expect("row fits u32"),
-                    &mut row_buf,
-                );
-                let p1 = planes.planes[1];
-                if p1.pixelStride as usize == pair {
-                    let dst =
-                        unsafe { plane_row(&p1, row, spec.width.div_ceil(2) as usize * pair) };
-                    dst.copy_from_slice(&row_buf[..dst.len()]);
-                } else if planes.planeCount == 3 && p1.pixelStride as usize == spec.code_bytes() {
-                    let p2 = planes.planes[2];
-                    for col in 0..spec.width.div_ceil(2) as usize {
-                        let bytes = spec.code_bytes();
-                        let cb = unsafe {
-                            p1.data
-                                .cast::<u8>()
-                                .add(row * p1.rowStride as usize + col * p1.pixelStride as usize)
-                        };
-                        let cr = unsafe {
-                            p2.data
-                                .cast::<u8>()
-                                .add(row * p2.rowStride as usize + col * p2.pixelStride as usize)
-                        };
-                        unsafe {
-                            cb.copy_from(row_buf[col * pair..].as_ptr(), bytes);
-                            cr.copy_from(row_buf[col * pair + bytes..].as_ptr(), bytes);
-                        }
-                    }
-                } else {
-                    panic!(
-                        "external-cost: unhandled AHB chroma layout (planes {}, pixelStride {})",
-                        planes.planeCount, p1.pixelStride
-                    );
-                }
+                // SAFETY: chroma plane 1 is the Cb-first interleaved row
+                // `require_cb_first` accepted, write-locked, `row` in range.
+                let dst = unsafe { plane_row_mut(chroma, row, chroma_tight) };
+                ramps.chroma_row(frame, u32::try_from(row).expect("row fits u32"), dst);
             }
-        });
+            Ok(())
+        })
     }
 
-    /// Path `c`: copies the filled buffer's planes into `y`/`uv` —
-    /// the semi-planar rows copy straight through `write_texture`;
-    /// a tri-planar AHB is interleaved into `scratch` first, which is
-    /// the same total bytes moved.
-    pub fn upload(&self, frame: u32, queue: &wgpu::Queue, y: &wgpu::Texture, uv: &wgpu::Texture) {
+    /// Copies the filled buffer's planes into `dst`. The chroma source
+    /// is the Cb-first interleaved row; plane 2 is the Cr byte of that
+    /// same row and is not read separately.
+    pub fn copy_planes(
+        &self,
+        frame: u32,
+        dst: &mut wgpu::BufferViewMut,
+        luma_stride: usize,
+        chroma_offset: usize,
+        chroma_stride: usize,
+    ) -> Result<(), BenchError> {
         let buffer = self.buffers[frame as usize % RING].as_ptr();
         let spec = self.spec;
-        planes(buffer, false, |planes| {
-            let luma = planes.planes[0];
-            // SAFETY: the locked luma plane is `rowStride * height`.
-            let y_data = unsafe {
-                std::slice::from_raw_parts(
-                    luma.data.cast::<u8>(),
-                    luma.rowStride as usize * spec.height as usize,
-                )
-            };
-            queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: y,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                y_data,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(luma.rowStride),
-                    rows_per_image: Some(spec.height),
-                },
-                wgpu::Extent3d {
-                    width: spec.width,
-                    height: spec.height,
-                    depth_or_array_layers: 1,
-                },
-            );
-            let pair = 2 * spec.code_bytes();
-            let cols = spec.width.div_ceil(2) as usize;
-            let rows = spec.height.div_ceil(2) as usize;
-            let p1 = planes.planes[1];
-            if p1.pixelStride as usize == pair {
-                // Interleaved UV plane: write it strided.
-                let uv_data = unsafe {
-                    std::slice::from_raw_parts(p1.data.cast::<u8>(), p1.rowStride as usize * rows)
-                };
-                queue.write_texture(
-                    wgpu::TexelCopyTextureInfo {
-                        texture: uv,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    uv_data,
-                    wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(p1.rowStride),
-                        rows_per_image: Some(spec.height.div_ceil(2)),
-                    },
-                    wgpu::Extent3d {
-                        width: u32::try_from(cols).expect("cols fit u32"),
-                        height: spec.height.div_ceil(2),
-                        depth_or_array_layers: 1,
-                    },
-                );
-            } else {
-                // Tri-planar: interleave row by row.
-                let mut uv_data = vec![0u8; cols * pair * rows];
-                for row in 0..rows {
-                    chroma_pairs(planes, &spec, row, &mut uv_data[row * cols * pair..])
-                        .expect("chroma layout checked at fill");
-                }
-                queue.write_texture(
-                    wgpu::TexelCopyTextureInfo {
-                        texture: uv,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    &uv_data,
-                    wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(u32::try_from(cols * pair).expect("row bytes fit u32")),
-                        rows_per_image: Some(spec.height.div_ceil(2)),
-                    },
-                    wgpu::Extent3d {
-                        width: u32::try_from(cols).expect("cols fit u32"),
-                        height: spec.height.div_ceil(2),
-                        depth_or_array_layers: 1,
-                    },
-                );
+        with_planes(buffer, false, |planes| {
+            require_cb_first(planes, &spec)?;
+            let luma = &planes.planes[0];
+            let chroma = &planes.planes[1];
+            let luma_tight = spec.width as usize * spec.code_bytes();
+            let chroma_tight = spec.width.div_ceil(2) as usize * 2 * spec.code_bytes();
+            let luma_rows = spec.height as usize;
+            let chroma_rows = spec.height.div_ceil(2) as usize;
+            let need = chroma_offset + chroma_rows * chroma_stride;
+            if dst.len() < need {
+                return Err(BenchError::Engine(format!(
+                    "external-cost: staging buffer is {} bytes, chroma needs {need}",
+                    dst.len()
+                )));
             }
-        });
+            for row in 0..luma_rows {
+                // SAFETY: read-locked luma plane, stride checked, row in range.
+                let src = unsafe { plane_row(luma, row, luma_tight) };
+                super::write_tight(dst, row * luma_stride, src);
+            }
+            for row in 0..chroma_rows {
+                // SAFETY: read-locked interleaved chroma plane, stride checked.
+                let src = unsafe { plane_row(chroma, row, chroma_tight) };
+                super::write_tight(dst, chroma_offset + row * chroma_stride, src);
+            }
+            Ok(())
+        })
     }
 
     /// Path `e`: the filled buffer imported as a Vulkan-native
-    /// [`ExternalFrame`] — `gpu/tests/vulkan_external_android.rs`'s
-    /// `FrameSource::Ahb` path.
-    pub fn external(&self, frame: u32, color: FrameColor) -> Result<ExternalFrame, BenchError> {
+    /// [`ExternalFrame`]. The second value is the import form.
+    pub fn external(
+        &self,
+        frame: u32,
+        color: FrameColor,
+    ) -> Result<(ExternalFrame, &'static str), BenchError> {
         let buffer = self.buffers[frame as usize % RING];
         let native = self
             .vulkan
@@ -330,16 +329,24 @@ impl Producer {
                 hdr: HdrMetadata::default(),
             })))
             .map_err(|e| BenchError::Engine(format!("external-cost: AHB import failed: {e}")))?;
-        ExternalFrame::native(native).map_err(|e| {
+        let form = import_form(&native);
+        let frame = ExternalFrame::native(native).map_err(|e| {
             BenchError::Engine(format!("external-cost: invalid native frame: {e:?}"))
-        })
+        })?;
+        Ok((frame, form))
+    }
+
+    /// Arms the completion wait for the submit that just sampled `frame`.
+    pub fn retire(&mut self, frame: u32, queue: &wgpu::Queue) {
+        self.done.arm(frame, queue);
     }
 }
 
 impl Drop for Producer {
     fn drop(&mut self) {
         for buffer in self.buffers.drain(..) {
-            // SAFETY: each buffer was allocated once and released once.
+            // SAFETY: each buffer was allocated once in `alloc_ahb` and
+            // is released once here. No lock is held.
             unsafe { ndk_sys::AHardwareBuffer_release(buffer.as_ptr()) };
         }
     }

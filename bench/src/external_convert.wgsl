@@ -1,10 +1,12 @@
 // Copy-and-convert tail (#168): `external-cost --path c` draws the
-// producer frame's copied planes through the engine's own YUV decode —
-// this file is concatenated after `shared.wgsl` and `external.wgsl`, so
-// `ext_frame_yuv`, `ExtParams` and the `ext_y`/`ext_uv`/`params` bindings
-// are the same source the external-frame path composites with. The draw
-// is the GpuContent's one fullscreen triangle; the output is the
-// working-space premultiplied pixel the producer attachment expects.
+// producer frame's copied planes through `ext_frame_yuv`. This file is
+// concatenated after `shared.wgsl` and `external.wgsl`, so the uniform
+// and the `ext_y` / `ext_uv` bindings are that integer-plane decode.
+// Path `e` on Apple runs the same decode. An Android YUV buffer that
+// imports as an external format does not: the driver's YCbCr sampler
+// decodes it, and this shader never sees the frame. The draw is the
+// GpuContent's one fullscreen triangle; the output is the working-space
+// premultiplied pixel the producer attachment expects.
 //
 // Mirrors water-rs/video-gpu's `render_surface` draw
 // (src/runtime_player.rs): plane textures in, converted colour out.

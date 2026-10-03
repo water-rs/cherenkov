@@ -125,10 +125,7 @@ fn ext_hlg(rgb: vec3<f32>) -> vec3<f32> {
 // The YUV plane decode at frame pixel `px` (pixel centres are at
 // `k + 0.5`): luma at the pixel's own coordinate, chroma at the
 // siting-offset subsampled coordinate — chroma texel j centres at frame
-// position 2j + 0.5 + s, so texel space is `p / 2 + 0.25 - s / 2`. This
-// is the decode the bench's copy-and-convert shader calls too (#168):
-// `cherenkov-bench` concatenates this file verbatim into its conversion
-// module, so both paths run one implementation.
+// position 2j + 0.5 + s, so texel space is `p / 2 + 0.25 - s / 2`.
 fn ext_frame_yuv(px: vec2<f32>) -> vec4<f32> {
     let y4 = ext_texel_u32(ext_y, px, params.dims.xy);
     let c4 = ext_texel_u32(ext_uv,

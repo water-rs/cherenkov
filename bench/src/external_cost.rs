@@ -4,19 +4,30 @@
 //!
 //! Both paths share one producer: a ring of platform video buffers —
 //! `CVPixelBuffer` on Apple, `AHardwareBuffer` on Android — filled on the
-//! CPU with a drifting gradient once per frame. Path `e` wraps the
-//! buffer's planes and installs them as a retained [`ExternalFrame`] the
-//! engine samples in place. Path `c` copies the planes into engine-side
-//! textures with `Queue::write_texture` and converts them in a
-//! [`GpuContent`] draw — the engine's own YUV decode, reached by
-//! concatenating `gpu/src/render/external.wgsl` into the bench's shader —
-//! mirroring water-rs/video-gpu's copy-then-shader composite
-//! (`src/runtime_player.rs` `upload_frame_texture` + `render_surface`).
+//! CPU with a drifting gradient once per frame. Path `e` installs that
+//! buffer as a retained [`ExternalFrame`]. On Apple the planes are
+//! integer textures and the engine runs `ext_frame_yuv`. On Android a
+//! YUV `AHardwareBuffer` may import as an external format instead, and
+//! then the driver's YCbCr sampler decodes it — that frame never enters
+//! `ext_frame_yuv`. The report's `import_form` records which one
+//! happened.
+//!
+//! Path `c` copies the planes on the CPU into a staging buffer, then
+//! one GPU submission does `copy_buffer_to_texture` of both planes and
+//! a [`GpuContent`] draw. The draw's shader is `shared.wgsl` +
+//! `external.wgsl` + `external_convert.wgsl`, and its uniform is
+//! [`yuv_frame_params`] — the same bake the engine writes for an
+//! installed YUV frame. `external_convert.wgsl` is the bench's
+//! fullscreen caller of `ext_frame_yuv`.
 //!
 //! Timing: the engine's own GPU timestamps cover the composite
-//! submission; path `c` additionally brackets its upload+convert window
-//! with pass-boundary stamps (the `wgpu_ctx::stamp` scheme).
+//! submission. Path `c`'s handoff is only the GPU work inside that one
+//! submission — a marker-pass end stamp, the two copies, then the
+//! convert pass — multiplied by the queue's timestamp period. A missing
+//! stamp drops the frame from the percentiles and increments
+//! `dropped_frames`; it is never stored as zero.
 
+use std::cell::Cell;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -40,9 +51,30 @@ use crate::{BenchError, DeviceInfo, PhaseSample, affinity, conditions, energy};
 /// Producer ring depth — a decode queue cycles a few buffers ahead.
 const RING: usize = 3;
 
+/// How long a slot wait or a staging map may block.
+const COMPLETION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The offscreen target every run and the correctness pair render.
+const TARGET: OffscreenFormat = OffscreenFormat::LinearF16;
+
 /// Codes of ramp drift in the generated pattern: the window the
-/// frame/row offset slides over.
+/// frame/row offset slides over. Only the platform producers read it.
+#[cfg(any(target_vendor = "apple", target_os = "android"))]
 const SHIFT: usize = 256;
+
+/// wgpu name of an [`OffscreenFormat`], the string `DeviceInfo` records.
+const fn target_format_name(format: OffscreenFormat) -> &'static str {
+    match format {
+        OffscreenFormat::LinearF16 => "Rgba16Float",
+        OffscreenFormat::LinearF32 => "Rgba32Float",
+    }
+}
+
+/// `bytes_per_row` alignment `copy_buffer_to_texture` requires.
+const fn aligned_pitch(tight: u32) -> u32 {
+    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    tight.div_ceil(align) * align
+}
 
 /// What one run measures.
 #[derive(Clone, Copy)]
@@ -100,6 +132,40 @@ impl Spec {
     }
 }
 
+/// Tight plane rows and the 256-byte pitches the staging copy uses.
+#[derive(Clone, Copy)]
+struct PlaneLayout {
+    width: u32,
+    height: u32,
+    luma_stride: u32,
+    /// Byte offset of the chroma plane in a staging buffer. A multiple
+    /// of [`wgpu::COPY_BYTES_PER_ROW_ALIGNMENT`].
+    luma_bytes: u64,
+    chroma_stride: u32,
+    chroma_height: u32,
+}
+
+impl PlaneLayout {
+    fn new(spec: &Spec) -> Self {
+        let code = u32::try_from(spec.code_bytes()).expect("code bytes fit u32");
+        let luma_stride = aligned_pitch(spec.width * code);
+        let chroma_stride = aligned_pitch(spec.width.div_ceil(2) * 2 * code);
+        let chroma_height = spec.height.div_ceil(2);
+        Self {
+            width: spec.width,
+            height: spec.height,
+            luma_stride,
+            luma_bytes: u64::from(luma_stride) * u64::from(spec.height),
+            chroma_stride,
+            chroma_height,
+        }
+    }
+
+    fn staging_size(self) -> u64 {
+        self.luma_bytes + u64::from(self.chroma_stride) * u64::from(self.chroma_height)
+    }
+}
+
 /// The spec's decode uniform — [`yuv_frame_params`], the same bake the
 /// engine writes for an installed YUV frame.
 fn frame_params(spec: &Spec) -> YuvFrameParams {
@@ -114,6 +180,7 @@ fn frame_params(spec: &Spec) -> YuvFrameParams {
 /// The synthetic frame pattern: a luma ramp and an interleaved chroma
 /// ramp that drift by `frame` and `row` — valid video-range codes,
 /// non-constant, identical for both paths.
+#[cfg(any(target_vendor = "apple", target_os = "android"))]
 struct Ramps {
     /// `(w + SHIFT)` luma codes of `bytes` each.
     luma: Vec<u8>,
@@ -125,6 +192,7 @@ struct Ramps {
     width: usize,
 }
 
+#[cfg(any(target_vendor = "apple", target_os = "android"))]
 impl Ramps {
     /// Video-range code ramps: luma sweeps `16..=235` (8-bit) or
     /// `64..=940` (10-bit `<<6`) left to right; the chroma pair steps
@@ -171,9 +239,10 @@ impl Ramps {
     }
 
     /// Writes the `row`'th chroma row of `frame` into `dst`
-    /// (`width * bytes` long — `width / 2` interleaved pairs).
+    /// (`width * bytes` long — `width / 2` interleaved pairs, which is
+    /// the same byte count as a luma row when the width is even).
     fn chroma_row(&self, frame: u32, row: u32, dst: &mut [u8]) {
-        let row_bytes = self.width * self.bytes;
+        let row_bytes = (self.width / 2) * self.bytes * 2;
         let pair = self.bytes * 2;
         let off =
             (row.wrapping_mul(5).wrapping_add(frame.wrapping_mul(13)) as usize % SHIFT) * pair;
@@ -183,29 +252,76 @@ impl Ramps {
 
 /// `external.wgsl` verbatim — the `shared.wgsl` prelude it needs
 /// included — followed by the bench's fullscreen convert pass
-/// (`external_convert.wgsl`), which calls `ext_frame_yuv`. Path `c` runs
-/// the identical decode the engine's external-frame path does, over the
-/// copied planes.
+/// (`external_convert.wgsl`), which calls `ext_frame_yuv`. Path `c`
+/// runs that integer-plane decode over the copied planes. Path `e` on
+/// Apple does too; an Android external-format import does not.
 const CONVERT_WGSL: &str = concat!(
     include_str!("../../gpu/src/render/shared.wgsl"),
     include_str!("../../gpu/src/render/external.wgsl"),
     include_str!("external_convert.wgsl")
 );
 
+/// Queries per set: the largest multiple of 3 that fits in one set.
+const fn query_span() -> u32 {
+    (wgpu::QUERY_SET_MAX_QUERIES / 3) * 3
+}
+
+/// `(chunk, index)` of frame `frame`'s three stamps.
+fn locate(frame: u32, span: u32) -> (usize, u32) {
+    let q = frame * 3;
+    (
+        usize::try_from(q / span).expect("query chunk fits usize"),
+        q % span,
+    )
+}
+
+/// One timestamp-query allocation. A long run exceeds
+/// [`wgpu::QUERY_SET_MAX_QUERIES`], so the stamps are split into chunks.
+struct QueryChunk {
+    set: Arc<wgpu::QuerySet>,
+    count: u32,
+}
+
+fn query_chunks(device: &wgpu::Device, query_count: u32) -> Vec<QueryChunk> {
+    let span = query_span();
+    let mut left = query_count;
+    let mut chunks = Vec::new();
+    while left > 0 {
+        let count = left.min(span);
+        let set = Arc::new(device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("external-cost handoff stamps"),
+            ty: wgpu::QueryType::Timestamp,
+            count,
+        }));
+        chunks.push(QueryChunk { set, count });
+        left -= count;
+    }
+    chunks
+}
+
 /// The `GpuContent` producer of path `c`: one fullscreen triangle
 /// sampling the copied planes through the engine's decode into the
 /// layer's working-space attachment.
 struct Convert {
-    /// Copied-plane views (`R8Uint`/`Rg8Uint` or `R16Uint`/`Rg16Uint`).
-    y: wgpu::TextureView,
-    uv: wgpu::TextureView,
+    y: wgpu::Texture,
+    uv: wgpu::Texture,
+    y_view: wgpu::TextureView,
+    uv_view: wgpu::TextureView,
     /// The baked `ExtParams` uniform — `external.wgsl`'s group-1
     /// binding 4.
     params: wgpu::Buffer,
-    /// Pass-boundary stamps: `3f + 1`/`3f + 2` around the convert pass;
-    /// the host stamps `3f` ahead of the plane uploads.
-    queries: Arc<wgpu::QuerySet>,
-    /// Producer-side frame counter (render calls).
+    /// Ring of `MAP_WRITE | COPY_SRC` plane buffers. Slot `f % RING`
+    /// holds the planes `stage()` wrote for this render's own counter.
+    staging: [wgpu::Buffer; RING],
+    layout: PlaneLayout,
+    /// One entry per query chunk, in order.
+    queries: Vec<Arc<wgpu::QuerySet>>,
+    query_span: u32,
+    /// The 1×1 renderable the marker pass clears.
+    marker: wgpu::TextureView,
+    /// Render calls. Independent of the pattern frame `composite_frame`
+    /// asks the producer to draw: this counter starts at 0, so a
+    /// one-frame composite writes stamps 0, 1 and 2 into a set of 3.
     frame: u32,
     /// Built on the render thread in `setup`.
     live: Option<Live>,
@@ -303,11 +419,11 @@ impl GpuContent for Convert {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&self.y),
+                    resource: wgpu::BindingResource::TextureView(&self.y_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&self.uv),
+                    resource: wgpu::BindingResource::TextureView(&self.uv_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
@@ -323,11 +439,81 @@ impl GpuContent for Convert {
         let Live { pipeline, bind } = self.live.as_ref().expect("setup ran before render");
         let f = self.frame;
         self.frame += 1;
+        let (chunk, base) = locate(f, self.query_span);
+        let queries = &self.queries[chunk];
+        let staging = &self.staging[f as usize % RING];
+        let layout = self.layout;
+        // One submission. The marker's end stamp, the two plane copies
+        // and the convert pass share an encoder, so the interval is GPU
+        // work only. Draining the queue before a separate marker would
+        // still time the CPU gap (`write_texture`, lowering) and would
+        // let a tiled GPU run that marker beside frame f−1.
         let mut encoder = frame
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("external-cost convert"),
             });
+        {
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("external-cost stamp"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.marker,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Discard,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: Some(wgpu::RenderPassTimestampWrites {
+                    query_set: queries,
+                    beginning_of_pass_write_index: None,
+                    end_of_pass_write_index: Some(base),
+                }),
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+        }
+        let copy = |encoder: &mut wgpu::CommandEncoder, offset, stride, rows, texture, width| {
+            encoder.copy_buffer_to_texture(
+                wgpu::TexelCopyBufferInfo {
+                    buffer: staging,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset,
+                        bytes_per_row: Some(stride),
+                        rows_per_image: Some(rows),
+                    },
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width,
+                    height: rows,
+                    depth_or_array_layers: 1,
+                },
+            );
+        };
+        copy(
+            &mut encoder,
+            0,
+            layout.luma_stride,
+            layout.height,
+            &self.y,
+            layout.width,
+        );
+        copy(
+            &mut encoder,
+            layout.luma_bytes,
+            layout.chroma_stride,
+            layout.chroma_height,
+            &self.uv,
+            layout.width.div_ceil(2),
+        );
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("external-cost convert"),
@@ -342,9 +528,9 @@ impl GpuContent for Convert {
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes: Some(wgpu::RenderPassTimestampWrites {
-                    query_set: &self.queries,
-                    beginning_of_pass_write_index: Some(3 * f + 1),
-                    end_of_pass_write_index: Some(3 * f + 2),
+                    query_set: queries,
+                    beginning_of_pass_write_index: Some(base + 1),
+                    end_of_pass_write_index: Some(base + 2),
                 }),
                 occlusion_query_set: None,
                 multiview_mask: None,
@@ -360,28 +546,37 @@ impl GpuContent for Convert {
     }
 }
 
-/// Path `c`'s host-side state: the copy targets, the bench's stamp
-/// resources and the resolution buffers.
+/// Path `c`'s host-side state: the copy targets, the staging ring and
+/// the stamp resolution buffers.
 struct CopyPath {
-    /// Luma copy target.
     y: wgpu::Texture,
-    /// Interleaved-chroma copy target.
     uv: wgpu::Texture,
-    /// `3f` opens the upload window (end-stamp of a marker pass
-    /// submitted just before the `write_texture` calls), `3f + 1`/`3f +
-    /// 2` bracket the convert pass.
-    queries: Arc<wgpu::QuerySet>,
-    /// The 1×1 renderable the marker passes clear.
+    /// 1×1 clear target. Four bytes, counted in [`Self::gpu_bytes`].
+    marker_tex: wgpu::Texture,
     marker: wgpu::TextureView,
-    /// Query resolve target and its map staging.
+    staging: [wgpu::Buffer; RING],
+    layout: PlaneLayout,
+    chunks: Vec<QueryChunk>,
+    query_span: u32,
+    /// Reused across chunks. Large enough for the biggest chunk.
     resolve: wgpu::Buffer,
-    staging: wgpu::Buffer,
+    readback: wgpu::Buffer,
+    params: wgpu::Buffer,
+    /// Staging slot of the next [`Self::stage`]. Starts at 0, as
+    /// [`Convert::frame`] does, and both advance once per frame.
+    cursor: Cell<u32>,
 }
 
 impl CopyPath {
-    fn new(shared: &SharedDevice, spec: &Spec, query_count: u32) -> Self {
+    fn new(shared: &SharedDevice, spec: &Spec, query_count: u32) -> Result<Self, BenchError> {
         let device = &shared.device;
+        if !device.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+            return Err(BenchError::Gpu(
+                "external-cost --path c needs TIMESTAMP_QUERY for the handoff stamps".into(),
+            ));
+        }
         let (y_format, uv_format) = spec.formats();
+        let layout = PlaneLayout::new(spec);
         let plane_texture = |name, width, height, format| {
             device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(name),
@@ -410,90 +605,165 @@ impl CopyPath {
             spec.height.div_ceil(2),
             uv_format,
         );
-        let marker = device
-            .create_texture(&wgpu::TextureDescriptor {
-                label: Some("external-cost stamp marker"),
-                size: wgpu::Extent3d {
-                    width: 1,
-                    height: 1,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                view_formats: &[],
+        let marker_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("external-cost stamp marker"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let marker = marker_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let staging = std::array::from_fn(|_| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("external-cost plane staging"),
+                size: layout.staging_size(),
+                usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
             })
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        let queries = Arc::new(device.create_query_set(&wgpu::QuerySetDescriptor {
-            label: Some("external-cost handoff stamps"),
-            ty: wgpu::QueryType::Timestamp,
-            count: query_count,
-        }));
+        });
+        let chunks = query_chunks(device, query_count);
+        let resolve_queries = chunks.iter().map(|chunk| chunk.count).max().unwrap_or(0);
         let resolve = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("external-cost stamp resolve"),
-            size: u64::from(query_count) * 8,
+            size: u64::from(resolve_queries) * 8,
             usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        let staging = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("external-cost stamp staging"),
-            size: u64::from(query_count) * 8,
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("external-cost stamp readback"),
+            size: u64::from(resolve_queries) * 8,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        Self {
+        let params = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("external-cost convert params"),
+            size: std::mem::size_of::<YuvFrameParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        shared
+            .queue
+            .write_buffer(&params, 0, bytemuck::bytes_of(&frame_params(spec)));
+        Ok(Self {
             y,
             uv,
-            queries,
+            marker_tex,
             marker,
-            resolve,
             staging,
+            layout,
+            chunks,
+            query_span: query_span(),
+            resolve,
+            readback,
+            params,
+            cursor: Cell::new(0),
+        })
+    }
+
+    /// The [`Convert`] installed once for the run. Its frame counter
+    /// starts at 0, matching [`Self::cursor`].
+    fn converter(&self) -> Convert {
+        Convert {
+            y: self.y.clone(),
+            uv: self.uv.clone(),
+            y_view: self.y.create_view(&wgpu::TextureViewDescriptor::default()),
+            uv_view: self.uv.create_view(&wgpu::TextureViewDescriptor::default()),
+            params: self.params.clone(),
+            staging: self.staging.clone(),
+            layout: self.layout,
+            queries: self
+                .chunks
+                .iter()
+                .map(|chunk| Arc::clone(&chunk.set))
+                .collect(),
+            query_span: self.query_span,
+            marker: self.marker.clone(),
+            frame: 0,
+            live: None,
         }
     }
 
-    /// Stamps `3 * frame`, then copies the produced buffer's planes
-    /// into the engine-side textures. The serial queue puts the
-    /// `write_texture` flush after the stamp and before the convert
-    /// pass's begin timestamp.
-    fn upload(&self, producer: &platform::Producer, shared: &SharedDevice, frame: u32) {
-        let mut encoder = shared
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("external-cost stamp"),
+    /// Copies pattern `pattern` into staging slot `cursor % RING`.
+    ///
+    /// The buffer is `MAP_WRITE`: the bytes the GPU copies are the ones
+    /// written here, not a `write_buffer` that would itself be an
+    /// unmeasured upload. Padding past each tight row is zero.
+    fn stage(
+        &self,
+        producer: &platform::Producer,
+        pattern: u32,
+        shared: &SharedDevice,
+    ) -> Result<(), BenchError> {
+        let slot = self.cursor.get() as usize % RING;
+        let buf = &self.staging[slot];
+        let (tx, rx) = std::sync::mpsc::channel();
+        buf.slice(..)
+            .map_async(wgpu::MapMode::Write, move |result| {
+                let _ = tx.send(result);
             });
-        {
-            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("external-cost stamp"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.marker,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Discard,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: Some(wgpu::RenderPassTimestampWrites {
-                    query_set: &self.queries,
-                    beginning_of_pass_write_index: None,
-                    end_of_pass_write_index: Some(3 * frame),
-                }),
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
+        let start = Instant::now();
+        loop {
+            // `Poll`, not `Wait`: a wait with no submission index blocks
+            // on the newest submit, which is frame f−1, and that would
+            // fold the previous frame's GPU time into this map.
+            shared
+                .device
+                .poll(wgpu::PollType::Poll)
+                .map_err(|e| BenchError::Gpu(format!("external-cost staging map poll: {e}")))?;
+            match rx.try_recv() {
+                Ok(Ok(())) => break,
+                Ok(Err(e)) => {
+                    return Err(BenchError::Gpu(format!("external-cost staging map: {e}")));
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    if start.elapsed() >= COMPLETION_TIMEOUT {
+                        return Err(BenchError::Gpu(
+                            "external-cost staging map timed out".into(),
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    return Err(BenchError::Gpu(
+                        "external-cost staging map callback dropped".into(),
+                    ));
+                }
+            }
         }
-        shared.queue.submit([encoder.finish()]);
-        producer.upload(frame, &shared.queue, &self.y, &self.uv);
+        let copied = (|| {
+            let mut view = buf
+                .slice(..)
+                .get_mapped_range_mut()
+                .map_err(|e| BenchError::Gpu(format!("external-cost staging range: {e}")))?;
+            // Mapped memory is write-only. Zero the padding, then the
+            // producer copies each tight row through the same view.
+            view.slice(..).fill(0);
+            producer.copy_planes(
+                pattern,
+                &mut view,
+                self.layout.luma_stride as usize,
+                usize::try_from(self.layout.luma_bytes).expect("chroma offset fits usize"),
+                self.layout.chroma_stride as usize,
+            )
+        })();
+        buf.unmap();
+        copied?;
+        self.cursor.set(self.cursor.get() + 1);
+        Ok(())
     }
 
-    /// Resolves the stamp set and returns per-frame `(handoff, convert)`
-    /// seconds for the measured window (`warmup..`).
+    /// Resolves every chunk and returns per measured frame
+    /// `(handoff, convert)` seconds. `None` where `b <= a`.
     #[expect(
         clippy::cast_precision_loss,
-        reason = "GPU timestamp nanoseconds fit f64 precision"
+        reason = "a tick delta of one timed frame fits the f64 mantissa"
     )]
     fn read_stamps(
         &self,
@@ -501,52 +771,90 @@ impl CopyPath {
         warmup: u32,
         frames: u32,
     ) -> Result<Vec<StampPair>, BenchError> {
-        let count = 3 * (warmup + frames);
-        let mut encoder = shared
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("external-cost stamp resolve"),
-            });
-        encoder.resolve_query_set(&self.queries, 0..count, &self.resolve, 0);
-        encoder.copy_buffer_to_buffer(&self.resolve, 0, &self.staging, 0, u64::from(count) * 8);
-        let submission = shared.queue.submit([encoder.finish()]);
-        let (send, recv) = std::sync::mpsc::channel();
-        self.staging
-            .slice(..)
-            .map_async(wgpu::MapMode::Read, move |result| {
-                let _ = send.send(result);
-            });
-        shared
-            .device
-            .poll(wgpu::PollType::Wait {
-                submission_index: Some(submission),
-                timeout: Some(Duration::from_secs(30)),
-            })
-            .map_err(|e| BenchError::Gpu(format!("external-cost stamp wait: {e}")))?;
-        recv.recv()
-            .map_err(|e| BenchError::Gpu(format!("external-cost stamp readback: {e}")))?
-            .map_err(|e| BenchError::Gpu(format!("external-cost stamp map: {e}")))?;
-        let ticks: Vec<u64> = {
-            let data = self
-                .staging
-                .slice(..)
-                .get_mapped_range()
-                .map_err(|e| BenchError::Gpu(format!("external-cost stamp range: {e}")))?;
-            data.as_chunks::<8>()
-                .0
-                .iter()
-                .map(|b| u64::from_le_bytes(*b))
-                .collect()
-        };
-        self.staging.unmap();
+        let mut ticks = Vec::new();
+        for chunk in &self.chunks {
+            let count = chunk.count;
+            let mut encoder =
+                shared
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("external-cost stamp resolve"),
+                    });
+            encoder.resolve_query_set(&chunk.set, 0..count, &self.resolve, 0);
+            encoder.copy_buffer_to_buffer(
+                &self.resolve,
+                0,
+                &self.readback,
+                0,
+                u64::from(count) * 8,
+            );
+            let submission = shared.queue.submit([encoder.finish()]);
+            let (send, recv) = std::sync::mpsc::channel();
+            self.readback.slice(..u64::from(count) * 8).map_async(
+                wgpu::MapMode::Read,
+                move |result| {
+                    let _ = send.send(result);
+                },
+            );
+            shared
+                .device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: Some(submission),
+                    timeout: Some(COMPLETION_TIMEOUT),
+                })
+                .map_err(|e| BenchError::Gpu(format!("external-cost stamp wait: {e}")))?;
+            recv.recv()
+                .map_err(|e| BenchError::Gpu(format!("external-cost stamp readback: {e}")))?
+                .map_err(|e| BenchError::Gpu(format!("external-cost stamp map: {e}")))?;
+            {
+                let data = self
+                    .readback
+                    .slice(..u64::from(count) * 8)
+                    .get_mapped_range()
+                    .map_err(|e| BenchError::Gpu(format!("external-cost stamp range: {e}")))?;
+                ticks.extend(
+                    data.as_chunks::<8>()
+                        .0
+                        .iter()
+                        .map(|bytes| u64::from_le_bytes(*bytes)),
+                );
+            }
+            self.readback.unmap();
+        }
+        let scale = f64::from(shared.queue.get_timestamp_period()) * 1.0e-9;
+        let seconds = |a: u64, b: u64| (b > a).then_some((b - a) as f64 * scale);
         Ok((0..frames)
             .map(|i| {
                 let f = (warmup + i) as usize;
                 let (open, begin, end) = (ticks[3 * f], ticks[3 * f + 1], ticks[3 * f + 2]);
-                let ns = |a: u64, b: u64| (b > a).then(|| (b - a) as f64 / 1.0e9);
-                (ns(open, end), ns(begin, end))
+                (seconds(open, end), seconds(begin, end))
             })
             .collect())
+    }
+
+    /// Path `c`'s own GPU bytes: copy textures, the staging ring, the
+    /// uniform, the query resolve and readback, and the 1×1 marker.
+    fn gpu_bytes(&self, spec: &Spec) -> u64 {
+        let code = u64::try_from(spec.code_bytes()).expect("code bytes fit u64");
+        let y = self.y.size();
+        let uv = self.uv.size();
+        let marker = self.marker_tex.size();
+        let y_bytes =
+            u64::from(y.width) * u64::from(y.height) * u64::from(y.depth_or_array_layers) * code;
+        let uv_bytes = u64::from(uv.width)
+            * u64::from(uv.height)
+            * u64::from(uv.depth_or_array_layers)
+            * code
+            * 2;
+        let marker_bytes = u64::from(marker.width)
+            * u64::from(marker.height)
+            * u64::from(marker.depth_or_array_layers)
+            * 4;
+        let buffers = self.staging.iter().map(wgpu::Buffer::size).sum::<u64>()
+            + self.params.size()
+            + self.resolve.size()
+            + self.readback.size();
+        y_bytes + uv_bytes + marker_bytes + buffers
     }
 }
 
@@ -556,17 +864,16 @@ type StampPair = (Option<f64>, Option<f64>);
 /// Per-frame sample of the report.
 #[derive(Clone, serde::Serialize)]
 struct CostSample {
-    /// Host-side seconds: the producer fill plus path `e`'s
-    /// import+install or path `c`'s stamp+plane upload.
+    /// Host-side seconds: the producer fill plus, on path `c`, the
+    /// staging-buffer map and plane copy.
     encode_seconds: f64,
     /// `Engine::render` wall seconds.
     submit_seconds: f64,
-    /// Engine composite GPU seconds (the engine's timestamp queries
-    /// resolved after completion); `null` where the adapter wrote none.
+    /// Engine composite GPU seconds. `null` where the adapter wrote none.
     gpu_seconds: Option<f64>,
-    /// Path `c` only: GPU seconds from the pre-upload stamp to the
-    /// convert pass's end — the plane copies, the conversion, and the
-    /// scheduling gap between those submissions.
+    /// Path `c` only: GPU seconds from the marker's end stamp to the
+    /// convert pass's end — the plane copies and the conversion, in
+    /// one submission. `null` when a stamp is missing.
     handoff_seconds: Option<f64>,
     /// Path `c` only: GPU seconds of the convert pass alone.
     convert_seconds: Option<f64>,
@@ -591,18 +898,20 @@ struct CostReport {
     height: u32,
     warmup_frames: u32,
     measured_frames: u32,
-    /// One sample per measured frame.
+    /// Measured frames whose required GPU stamps were missing. Excluded
+    /// from the GPU percentiles, never written as zero.
+    dropped_frames: u32,
+    /// One sample per measured frame, including dropped ones.
     samples: Vec<CostSample>,
-    /// `gpu_seconds` percentiles `[p50, p90, p99]` — the engine's own
-    /// submission: the whole GPU cost of path `e`, path `c`'s composite
-    /// of the converted image.
+    /// `gpu_seconds` percentiles `[p50, p90, p99]`.
     composite_seconds: Option<[f64; 3]>,
     /// Path `c`'s `handoff_seconds` percentiles.
     handoff_seconds: Option<[f64; 3]>,
     /// Path `c`'s `convert_seconds` percentiles.
     convert_seconds: Option<[f64; 3]>,
     /// The whole per-frame GPU cost: `gpu_seconds` for path `e`,
-    /// `composite + handoff` for path `c`.
+    /// `composite + handoff` for path `c`. Frames in `dropped_frames`
+    /// are absent.
     total_seconds: Option<[f64; 3]>,
     /// Host-side per-frame work percentiles.
     encode_seconds: [f64; 3],
@@ -612,6 +921,14 @@ struct CostReport {
     conditions: Conditions,
     memory: MemoryReport,
     device: DeviceInfo,
+    /// Path `e`'s import binding (`planes`, `external-format`, `rgb`).
+    /// `null` on path `c`, which does not import.
+    import_form: Option<&'static str>,
+    /// Path `c`'s own GPU resources. See [`CopyPath::gpu_bytes`].
+    /// Zero on path `e`.
+    bench_gpu_bytes: u64,
+    /// `git rev-parse HEAD` at the bench build.
+    git_sha: &'static str,
     note: &'static str,
 }
 
@@ -664,6 +981,16 @@ fn memory_snapshot(
     )
 }
 
+/// The offscreen target, one format for the run and the report.
+const fn offscreen(spec: &Spec) -> Offscreen {
+    Offscreen::new((spec.width, spec.height), TARGET)
+}
+
+/// Nearest-rank percentiles, or an error when the series is empty.
+fn required_percentiles(name: &str, samples: &[f64]) -> Result<[f64; 3], BenchError> {
+    percentiles(samples).ok_or_else(|| BenchError::Gpu(format!("external-cost {name}: no samples")))
+}
+
 /// How far past a pacing deadline a frame may start before it counts as
 /// missed — `measure`'s tolerance.
 const PACING_TOLERANCE: Duration = Duration::from_millis(1);
@@ -690,6 +1017,11 @@ pub(crate) fn run(args: &ExternalCostArgs) -> Result<(), BenchError> {
     } = args;
     let (frames, warmup, rate, measure_energy, out) =
         (*frames, *warmup, *rate, *measure_energy, out.as_path());
+    if frames == 0 {
+        return Err(BenchError::Gpu(
+            "external-cost: --frames must be at least 1".into(),
+        ));
+    }
     let spec = Spec::new(*size, *transfer);
     let path = *path;
     if measure_energy {
@@ -699,25 +1031,20 @@ pub(crate) fn run(args: &ExternalCostArgs) -> Result<(), BenchError> {
         affinity::pin_current_thread(cpus)?;
     }
     let (engine, shared) = engine_and_device()?;
-    let timestamps = shared
-        .device
-        .features()
-        .contains(wgpu::Features::TIMESTAMP_QUERY);
     let adapter = shared.adapter.get_info();
     let idle = memory_snapshot(&engine, &shared, SampleDetail::Full);
-    let producer = platform::Producer::new(&spec, &shared)?;
+    let mut producer = platform::Producer::new(&spec, &shared)?;
     let surface = engine
-        .surface(Offscreen::new(
-            (spec.width, spec.height),
-            OffscreenFormat::LinearF16,
-        ))
+        .surface(offscreen(&spec))
         .map_err(|e| BenchError::Gpu(format!("external-cost surface: {e}")))?;
     let layer = surface.layer();
-    let total = warmup + frames;
+    let total = warmup
+        .checked_add(frames)
+        .ok_or_else(|| BenchError::Gpu("external-cost: frame count overflows".into()))?;
+    let query_count = total
+        .checked_mul(3)
+        .ok_or_else(|| BenchError::Gpu("external-cost: query count overflows".into()))?;
 
-    // Path setup: `e` installs a fresh external frame per produced
-    // buffer; `c` installs the convert GpuContent once and uploads the
-    // planes per frame.
     let copy = match path {
         ExternalPath::External => {
             surface.update(|tx| {
@@ -726,32 +1053,10 @@ pub(crate) fn run(args: &ExternalCostArgs) -> Result<(), BenchError> {
             None
         }
         ExternalPath::Copy => {
-            if !timestamps {
-                return Err(BenchError::Gpu(
-                    "external-cost --path c needs TIMESTAMP_QUERY for the handoff stamps".into(),
-                ));
-            }
-            let copy = CopyPath::new(&shared, &spec, 3 * total);
-            let params_buffer = shared.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("external-cost convert params"),
-                size: std::mem::size_of::<YuvFrameParams>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            shared
-                .queue
-                .write_buffer(&params_buffer, 0, bytemuck::bytes_of(&frame_params(&spec)));
-            let content = Convert {
-                y: copy.y.create_view(&wgpu::TextureViewDescriptor::default()),
-                uv: copy.uv.create_view(&wgpu::TextureViewDescriptor::default()),
-                params: params_buffer,
-                queries: Arc::clone(&copy.queries),
-                frame: 0,
-                live: None,
-            };
+            let copy = CopyPath::new(&shared, &spec, query_count)?;
             let handle = engine.gpu_content(
                 (spec.width, spec.height),
-                GpuContentBox::new(content, || {}),
+                GpuContentBox::new(copy.converter(), || {}),
             );
             surface.update(|tx| {
                 tx[surface.root()].push(&layer);
@@ -760,17 +1065,19 @@ pub(crate) fn run(args: &ExternalCostArgs) -> Result<(), BenchError> {
             Some(copy)
         }
     };
+    let bench_gpu_bytes = copy.as_ref().map_or(0, |copy| copy.gpu_bytes(&spec));
 
     let preparation = memory_snapshot(&engine, &shared, SampleDetail::Full);
     let mut warmup_snapshots = Vec::with_capacity(warmup as usize);
     let mut samples: Vec<CostSample> = Vec::with_capacity(frames as usize);
     let mut timings = Timings::default();
     let mut clock = Clock::new();
-    let period = rate.map(|hz| Duration::from_secs_f64(1.0 / hz));
-    let window_hint = period.map_or(Duration::from_secs(1), |p| p * total);
+    let period = Duration::from_secs_f64(1.0 / rate);
+    let window_hint = period * total;
     let mut meter = None;
     let mut start = Instant::now();
     let mut missed_deadlines = 0u32;
+    let mut import_form = None;
 
     for frame in 0..total {
         if frame == warmup {
@@ -780,7 +1087,6 @@ pub(crate) fn run(args: &ExternalCostArgs) -> Result<(), BenchError> {
             start = Instant::now();
         }
         if frame >= warmup
-            && let Some(period) = period
             && let Some(deadline) = period
                 .checked_mul(frame - warmup)
                 .and_then(|d| start.checked_add(d))
@@ -796,10 +1102,19 @@ pub(crate) fn run(args: &ExternalCostArgs) -> Result<(), BenchError> {
             }
         }
         let t0 = Instant::now();
-        producer.fill(frame);
+        producer.fill(frame)?;
         match path {
             ExternalPath::External => {
-                let external = producer.external(frame, spec.color)?;
+                let (external, form) = producer.external(frame, spec.color)?;
+                if let Some(prev) = import_form {
+                    if prev != form {
+                        return Err(BenchError::Engine(format!(
+                            "external-cost import form changed from {prev} to {form}"
+                        )));
+                    }
+                } else {
+                    import_form = Some(form);
+                }
                 let handle = engine.external_frame(external);
                 surface.update(|tx| {
                     tx[&layer].content(handle);
@@ -808,11 +1123,12 @@ pub(crate) fn run(args: &ExternalCostArgs) -> Result<(), BenchError> {
             ExternalPath::Copy => {
                 copy.as_ref()
                     .expect("path c has copy state")
-                    .upload(&producer, &shared, frame);
+                    .stage(&producer, frame, &shared)?;
             }
         }
         let t1 = Instant::now();
         timings.render_frame(&engine, &mut clock, u64::from(frame), false, render_error)?;
+        producer.retire(frame, &shared.queue);
         clock.advance();
         let stats = engine.stats();
         let t2 = Instant::now();
@@ -851,8 +1167,6 @@ pub(crate) fn run(args: &ExternalCostArgs) -> Result<(), BenchError> {
     engine.trim(cherenkov::Pressure::Critical);
     let post_retire = memory_snapshot(&engine, &shared, SampleDetail::Full);
 
-    // Engine-side GPU timings resolve after completion: each rendered
-    // frame's composite submission lands in `gpu_seconds`.
     for timing in timings.samples(engine.finish_timings().map_err(render_error)?) {
         let Some(index) = timing.frame.checked_sub(u64::from(warmup)) else {
             continue;
@@ -861,8 +1175,6 @@ pub(crate) fn run(args: &ExternalCostArgs) -> Result<(), BenchError> {
             timing.gpu_seconds;
     }
 
-    // Resolve the path-c stamps: per global frame f, `3f` is the
-    // pre-upload stamp and `3f+1`/`3f+2` bracket the convert pass.
     if let Some(copy) = &copy {
         for (sample, (handoff, convert)) in samples
             .iter_mut()
@@ -873,18 +1185,37 @@ pub(crate) fn run(args: &ExternalCostArgs) -> Result<(), BenchError> {
         }
     }
 
-    let composited: Vec<f64> = samples.iter().filter_map(|s| s.gpu_seconds).collect();
-    let handoff: Vec<f64> = samples.iter().filter_map(|s| s.handoff_seconds).collect();
-    let convert: Vec<f64> = samples.iter().filter_map(|s| s.convert_seconds).collect();
-    let totals: Vec<f64> = samples
-        .iter()
-        .map(|s| s.gpu_seconds.unwrap_or(0.0) + s.handoff_seconds.unwrap_or(0.0))
-        .collect();
+    let mut dropped_frames = 0u32;
+    let mut composited = Vec::new();
+    let mut handoff = Vec::new();
+    let mut convert = Vec::new();
+    let mut totals = Vec::new();
+    for sample in &samples {
+        if let Some(gpu) = sample.gpu_seconds {
+            composited.push(gpu);
+        }
+        if let Some(stamp) = sample.handoff_seconds {
+            handoff.push(stamp);
+        }
+        if let Some(stamp) = sample.convert_seconds {
+            convert.push(stamp);
+        }
+        match (
+            path,
+            sample.gpu_seconds,
+            sample.handoff_seconds,
+            sample.convert_seconds,
+        ) {
+            (ExternalPath::External, Some(gpu), _, _) => totals.push(gpu),
+            (ExternalPath::Copy, Some(gpu), Some(stamp), Some(_)) => totals.push(gpu + stamp),
+            _ => dropped_frames += 1,
+        }
+    }
     let encode: Vec<f64> = samples.iter().map(|s| s.encode_seconds).collect();
     let submit: Vec<f64> = samples.iter().map(|s| s.submit_seconds).collect();
     let window_seconds = end.duration_since(start).as_secs_f64();
-    let pacing = period.map(|period| Pacing {
-        requested_hz: 1.0 / period.as_secs_f64(),
+    let pacing = Some(Pacing {
+        requested_hz: rate,
         achieved_hz: f64::from(frames) / window_seconds,
         missed_deadlines,
         window_seconds,
@@ -905,13 +1236,14 @@ pub(crate) fn run(args: &ExternalCostArgs) -> Result<(), BenchError> {
         height: spec.height,
         warmup_frames: warmup,
         measured_frames: frames,
+        dropped_frames,
         samples,
         composite_seconds: percentiles(&composited),
         handoff_seconds: percentiles(&handoff),
         convert_seconds: percentiles(&convert),
         total_seconds: percentiles(&totals),
-        encode_seconds: percentiles(&encode).unwrap_or([0.0; 3]),
-        submit_seconds: percentiles(&submit).unwrap_or([0.0; 3]),
+        encode_seconds: required_percentiles("encode_seconds", &encode)?,
+        submit_seconds: required_percentiles("submit_seconds", &submit)?,
         pacing,
         conditions: conditions::collect(
             energy_outcome
@@ -936,12 +1268,19 @@ pub(crate) fn run(args: &ExternalCostArgs) -> Result<(), BenchError> {
             driver_info: Some(adapter.driver_info),
             vendor: Some(adapter.vendor),
             device: Some(adapter.device),
-            target_format: Some("Rgba16Float".to_string()),
+            target_format: Some(target_format_name(TARGET).to_string()),
             cpu: crate::cpu_model(),
             thermal_celsius: crate::thermal_celsius(),
         },
-        note: "gpu_seconds = the engine's composite submission; path c adds a \
-               marker-stamp window over the plane upload and the convert pass",
+        import_form,
+        bench_gpu_bytes,
+        git_sha: env!("CHERENKOV_GIT_SHA"),
+        note: "path c times plane copies and the convert pass in one submission \
+               (marker end stamp, copy_buffer_to_texture, convert pass). \
+               handoff_seconds is that GPU interval; convert_seconds is the pass; \
+               gpu_seconds is the engine composite. A missing stamp is a dropped \
+               frame, not a zero. bench_gpu_bytes counts path c's copy textures, \
+               staging buffers, uniform, query resolve and readback, and the marker.",
     };
     let file = std::fs::File::create(out)
         .map_err(|e| BenchError::Gpu(format!("write {}: {e}", out.display())))?;
@@ -955,6 +1294,9 @@ pub(crate) fn run(args: &ExternalCostArgs) -> Result<(), BenchError> {
 /// returns the composited working-space pixels — the E-vs-C pair the
 /// correctness test (`tests/external_cost.rs`) compares.
 ///
+/// The pattern frame and the stamp slot are separate. `frame` selects
+/// the gradient; the convert pass writes stamps 0, 1 and 2.
+///
 /// # Errors
 /// Device, producer, engine and readback failures.
 pub fn composite_frame(
@@ -965,19 +1307,16 @@ pub fn composite_frame(
 ) -> Result<Vec<[f32; 4]>, BenchError> {
     let spec = Spec::new(size, transfer);
     let (engine, shared) = engine_and_device()?;
-    let producer = platform::Producer::new(&spec, &shared)?;
+    let mut producer = platform::Producer::new(&spec, &shared)?;
     let surface = engine
-        .surface(Offscreen::new(
-            (spec.width, spec.height),
-            OffscreenFormat::LinearF16,
-        ))
+        .surface(offscreen(&spec))
         .map_err(|e| BenchError::Gpu(format!("external-cost surface: {e}")))?;
     let layer = surface.layer();
 
-    producer.fill(frame);
+    producer.fill(frame)?;
     match path {
         ExternalPath::External => {
-            let external = producer.external(frame, spec.color)?;
+            let (external, _) = producer.external(frame, spec.color)?;
             let handle = engine.external_frame(external);
             surface.update(|tx| {
                 tx[surface.root()].push(&layer);
@@ -985,38 +1324,96 @@ pub fn composite_frame(
             });
         }
         ExternalPath::Copy => {
-            let copy = CopyPath::new(&shared, &spec, 3);
-            let params_buffer = shared.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("external-cost convert params"),
-                size: std::mem::size_of::<YuvFrameParams>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            shared
-                .queue
-                .write_buffer(&params_buffer, 0, bytemuck::bytes_of(&frame_params(&spec)));
-            let content = Convert {
-                y: copy.y.create_view(&wgpu::TextureViewDescriptor::default()),
-                uv: copy.uv.create_view(&wgpu::TextureViewDescriptor::default()),
-                params: params_buffer,
-                queries: copy.queries.clone(),
-                frame: 0,
-                live: None,
-            };
+            let copy = CopyPath::new(&shared, &spec, 3)?;
             let handle = engine.gpu_content(
                 (spec.width, spec.height),
-                GpuContentBox::new(content, || {}),
+                GpuContentBox::new(copy.converter(), || {}),
             );
             surface.update(|tx| {
                 tx[surface.root()].push(&layer);
                 tx[&layer].content(handle);
             });
-            copy.upload(&producer, &shared, frame);
+            copy.stage(&producer, frame, &shared)?;
         }
     }
     engine.render(FrameTime::now()).map_err(render_error)?;
+    producer.retire(frame, &shared.queue);
     let rb = surface.readback().map_err(render_error)?;
     Ok(rb.pixels)
+}
+
+/// Writes `src` at `start` in a mapped staging buffer.
+///
+/// [`wgpu::BufferViewMut`] does not dereference to `&mut [u8]`: the
+/// mapping may be write-combining memory.
+#[cfg(any(target_vendor = "apple", target_os = "android"))]
+fn write_tight(dst: &mut wgpu::BufferViewMut, start: usize, src: &[u8]) {
+    dst.slice(start..start + src.len()).copy_from_slice(src);
+}
+
+/// Completion of the submission that last used each ring slot.
+///
+/// `recv` alone would deadlock: the callback runs on a thread that is
+/// polling the device. [`SlotDone::wait`] polls without waiting for the
+/// newest submission, so frame f−1 can stay in flight while slot
+/// `f % RING` is reused.
+#[cfg(any(target_vendor = "apple", target_os = "android"))]
+struct SlotDone {
+    slots: [Option<std::sync::mpsc::Receiver<()>>; RING],
+    used: [bool; RING],
+}
+
+#[cfg(any(target_vendor = "apple", target_os = "android"))]
+impl SlotDone {
+    fn new() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| None),
+            used: [false; RING],
+        }
+    }
+
+    fn wait(&mut self, frame: u32, device: &wgpu::Device) -> Result<(), BenchError> {
+        let slot = frame as usize % RING;
+        if !self.used[slot] {
+            self.used[slot] = true;
+            return Ok(());
+        }
+        let rx = self.slots[slot].take().ok_or_else(|| {
+            BenchError::Gpu(format!(
+                "external-cost: frame {frame} reuses slot {slot} with no completion armed"
+            ))
+        })?;
+        let start = Instant::now();
+        loop {
+            device
+                .poll(wgpu::PollType::Poll)
+                .map_err(|e| BenchError::Gpu(format!("external-cost completion poll: {e}")))?;
+            match rx.try_recv() {
+                Ok(()) => return Ok(()),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    if start.elapsed() >= COMPLETION_TIMEOUT {
+                        return Err(BenchError::Gpu(format!(
+                            "external-cost: frame {frame} slot {slot} still in flight after 30s"
+                        )));
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    return Err(BenchError::Gpu(format!(
+                        "external-cost: frame {frame} slot {slot} completion dropped"
+                    )));
+                }
+            }
+        }
+    }
+
+    fn arm(&mut self, frame: u32, queue: &wgpu::Queue) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        queue.on_submitted_work_done(move || {
+            let _ = tx.send(());
+        });
+        self.slots[frame as usize % RING] = Some(rx);
+    }
 }
 
 /// `CVPixelBuffer` producer — the Apple video-decode output model.
@@ -1046,19 +1443,24 @@ mod platform {
         }
 
         /// Unreachable — [`Producer::new`] always fails.
-        pub fn fill(&self, _frame: u32) {
-            unreachable!("Producer::new failed")
+        #[expect(
+            clippy::needless_pass_by_ref_mut,
+            reason = "matches the platform producer, which fills through &mut self"
+        )]
+        pub fn fill(&mut self, _frame: u32) -> Result<(), BenchError> {
+            unreachable!("Producer::new failed ({self:p})")
         }
 
         /// Unreachable — [`Producer::new`] always fails.
-        pub fn upload(
+        pub fn copy_planes(
             &self,
             _frame: u32,
-            _queue: &wgpu::Queue,
-            _y: &wgpu::Texture,
-            _uv: &wgpu::Texture,
-        ) {
-            unreachable!("Producer::new failed")
+            _dst: &mut wgpu::BufferViewMut,
+            _luma_stride: usize,
+            _chroma_offset: usize,
+            _chroma_stride: usize,
+        ) -> Result<(), BenchError> {
+            unreachable!("Producer::new failed ({self:p})")
         }
 
         /// Unreachable — [`Producer::new`] always fails.
@@ -1066,8 +1468,17 @@ mod platform {
             &self,
             _frame: u32,
             _color: FrameColor,
-        ) -> Result<ExternalFrame, BenchError> {
-            unreachable!("Producer::new failed")
+        ) -> Result<(ExternalFrame, &'static str), BenchError> {
+            unreachable!("Producer::new failed ({self:p})")
+        }
+
+        /// Unreachable — [`Producer::new`] always fails.
+        #[expect(
+            clippy::needless_pass_by_ref_mut,
+            reason = "matches the platform producer, which arms the slot through &mut self"
+        )]
+        pub fn retire(&mut self, _frame: u32, _queue: &wgpu::Queue) {
+            unreachable!("Producer::new failed ({self:p})")
         }
     }
 }

@@ -18,27 +18,28 @@ const fn pixels(image: Vec<[f32; 4]>) -> F32Image {
     }
 }
 
-#[test]
-fn external_matches_copy_convert() {
-    let external = external_cost::composite_frame(
-        ExternalPath::External,
-        ExternalSize::P1080,
-        ExternalTransfer::Sdr,
-        0,
-    )
-    .expect("path e composites one frame");
-    let copied = external_cost::composite_frame(
-        ExternalPath::Copy,
-        ExternalSize::P1080,
-        ExternalTransfer::Sdr,
-        0,
-    )
-    .expect("path c composites one frame");
+fn assert_paths_match(transfer: ExternalTransfer) {
+    let external =
+        external_cost::composite_frame(ExternalPath::External, ExternalSize::P1080, transfer, 0)
+            .expect("path e composites one frame");
+    let copied =
+        external_cost::composite_frame(ExternalPath::Copy, ExternalSize::P1080, transfer, 0)
+            .expect("path c composites one frame");
     let (metrics, _map) = cherenkov_oracle::metrics::compare(&pixels(external), &pixels(copied));
     assert!(
         metrics.flip_mean <= 0.05 && metrics.max_local_error <= 0.25,
-        "path e vs path c: flip_mean {} max_local_error {}",
+        "path e vs path c ({transfer:?}): flip_mean {} max_local_error {}",
         metrics.flip_mean,
         metrics.max_local_error
     );
+}
+
+#[test]
+fn external_matches_copy_convert() {
+    assert_paths_match(ExternalTransfer::Sdr);
+}
+
+#[test]
+fn external_matches_copy_convert_pq() {
+    assert_paths_match(ExternalTransfer::Pq);
 }

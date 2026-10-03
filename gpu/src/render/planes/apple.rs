@@ -88,7 +88,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use cherenkov::{ContinuousRect, LayerId, RenderError, ShapeData, SurfaceError};
 
-use super::{Composition, Compositor, Level, Placement, Plane, PlaneContent, SystemPlanes};
+use super::{Composition, Compositor, Level, Placement, Plane, PlaneContent, Source, SystemPlanes};
 use crate::interop::{
     ChromaOffset, ExternalFrame, FramePlanes, FrameSync, Primaries, RgbAlpha, Transfer, YuvMatrix,
     YuvRange,
@@ -404,8 +404,36 @@ pub struct LayerPlanes {
     static_candidates: FxHashSet<LayerId>,
     buffers: FxHashMap<LayerId, raster::Buffer>,
     placements: Vec<Placement>,
-    motions: Vec<super::animation::Motion>,
-    motion_tree_changed: bool,
+    motion: MotionState,
+}
+
+/// Tracks installed on the native nodes, and whether those nodes were rebuilt
+/// since the last installation. A present that reuses the nodes leaves the
+/// flag clear: equal descriptors then need no animation transaction.
+#[derive(Default)]
+struct MotionState {
+    tracks: Vec<super::animation::Motion>,
+    tree_changed: bool,
+}
+
+impl MotionState {
+    fn owns(&self, layer: LayerId) -> bool {
+        self.tracks.iter().any(|track| track.layer == layer)
+    }
+
+    fn placed(&mut self, tree_changed: bool) {
+        self.tree_changed |= tree_changed;
+    }
+
+    fn update(&mut self, tracks: &[super::animation::Motion]) -> bool {
+        if tracks == self.tracks && !self.tree_changed {
+            return false;
+        }
+        self.tree_changed = false;
+        self.tracks.clear();
+        self.tracks.extend_from_slice(tracks);
+        true
+    }
 }
 
 /// An origin-anchored layer: its position is its superlayer point for its
@@ -765,6 +793,23 @@ fn shape(placement: &Placement) -> Vec<(LayerId, bool)> {
         .collect()
 }
 
+/// Whether `place` keeps the native nodes it built for `built`. Reuse is the
+/// leaf, the path shape [`shape`] records, and the raster class stored when
+/// that plane was built. A recorded placement is that class: groom inserts a
+/// raster layer exactly for a recorded candidate.
+fn reuses_native_nodes(built: &Placement, next: &Placement, rasters: &FxHashSet<LayerId>) -> bool {
+    built.layer == next.layer
+        && (built.source == Source::Recorded) == rasters.contains(&next.layer)
+        && built.path.len() == next.path.len()
+        && built
+            .path
+            .iter()
+            .zip(&next.path)
+            .all(|(level, next_level)| {
+                level.layer == next_level.layer && level.clip.is_some() == next_level.clip.is_some()
+            })
+}
+
 /// Applies a level's sampled properties to its layers.
 fn place(level: &Level, layers: &LevelLayers, owns_position: bool) {
     if !owns_position {
@@ -1106,8 +1151,7 @@ impl LayerPlanes {
             static_candidates: FxHashSet::default(),
             buffers: FxHashMap::default(),
             placements: Vec::new(),
-            motions: Vec::new(),
-            motion_tree_changed: false,
+            motion: MotionState::default(),
         };
         result.request_parts(1, probe);
         result
@@ -1245,11 +1289,9 @@ impl SystemPlanes for LayerPlanes {
         self.owned_animations.clear();
         self.owned_animations
             .extend(motions.iter().map(|motion| motion.layer));
-        if motions == self.motions && !self.motion_tree_changed {
+        if !self.motion.update(&motions) {
             return;
         }
-        self.motion_tree_changed = false;
-        self.motions.clone_from(&motions);
         let placements = self.placements.clone();
         self.scene.run(move |scene, _| {
             let _tx = Transaction::begin();
@@ -1387,8 +1429,15 @@ impl SystemPlanes for LayerPlanes {
             .collect();
         let size = c.size;
         let scale = c.display.scale;
+        let tree_changed = placements.iter().any(|placement| {
+            self.motion.owns(placement.layer)
+                && !self
+                    .placements
+                    .iter()
+                    .any(|built| reuses_native_nodes(built, placement, &self.static_candidates))
+        });
         self.placements.clone_from(&placements);
-        self.motion_tree_changed = true;
+        self.motion.placed(tree_changed);
         let queue = c.queue.clone();
         self.scene.run(move |scene, _| {
             let _tx = Transaction::begin();

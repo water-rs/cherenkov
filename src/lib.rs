@@ -70,7 +70,8 @@ pub use crate::color::{
 };
 pub use crate::config::{Budget, Bytes, MemoryUsage, Pressure};
 pub use crate::display_list::{
-    Command, Dirty, DisplayList, Operand, OperandKind, Picture, ScopeError, Slot, SlotUpdate,
+    Command, Dirty, DisplayList, DisplayListView, Operand, OperandKind, OperandRef, Operands,
+    Picture, ScopeError, Slot, SlotUpdate,
 };
 pub use crate::engine::Engine;
 pub use crate::engine::{CompletionWaker, SurfaceVisibility, WakeGate};

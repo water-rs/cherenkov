@@ -411,6 +411,15 @@ impl DisplayList {
         &self.commands
     }
 
+    /// A read-only view of the list, as a render target lowers it: the
+    /// commands in order and, for each command, the operand slots a
+    /// [`SlotUpdate`] can address with the values currently recorded. See
+    /// [`DisplayListView`].
+    #[must_use]
+    pub const fn view(&self) -> DisplayListView<'_> {
+        DisplayListView { list: self }
+    }
+
     /// Heap bytes held by the command buffer, including each command's own
     /// allocations as reported by `nested`.
     pub fn heap_bytes(&self, mut nested: impl FnMut(&Command) -> u64) -> u64 {
@@ -592,6 +601,189 @@ impl DisplayList {
     }
 }
 
+/// A read-only view of a [`DisplayList`], as another render target lowers
+/// it: the commands in order and the live operands each [`Slot`]
+/// addresses.
+///
+/// The view borrows the list — no recorded storage is cloned. A target
+/// installs the list by lowering [`commands`](Self::commands); a later
+/// [`SlotUpdate`] applies through [`DisplayList::apply`], and a view taken
+/// afterwards reads the new value.
+pub struct DisplayListView<'a> {
+    list: &'a DisplayList,
+}
+
+impl<'a> DisplayListView<'a> {
+    /// The commands, in order.
+    #[must_use]
+    pub fn commands(&self) -> &'a [Command] {
+        self.list.commands()
+    }
+
+    /// Number of commands.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.list.len()
+    }
+
+    /// Whether the list has no commands.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.list.is_empty()
+    }
+
+    /// The live operands of command `index`: every slot a [`SlotUpdate`]
+    /// can address on it, in the command's operand order, each paired with
+    /// the value currently recorded. Empty when `index` is out of range.
+    #[must_use]
+    pub fn operands(&self, index: u32) -> Operands<'a> {
+        Operands {
+            command: self.list.commands.get(index as usize),
+            index,
+            next: 0,
+        }
+    }
+
+    /// The value `slot` currently addresses; `None` when the slot's
+    /// command does not exist or has no such operand.
+    #[must_use]
+    pub fn get(&self, slot: Slot) -> Option<OperandRef<'a>> {
+        self.operands(slot.command)
+            .find_map(|(s, value)| (s == slot).then_some(value))
+    }
+}
+
+/// A command's operand, borrowed: the value one [`Slot`] currently
+/// addresses.
+///
+/// The borrowed form of [`Operand`], read through a [`DisplayListView`]:
+/// no recorded storage is cloned.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum OperandRef<'a> {
+    /// A shape.
+    Shape(&'a ShapeData),
+    /// A paint.
+    Paint(&'a Paint),
+    /// A stroke style.
+    Stroke(&'a Stroke),
+    /// A shadow.
+    Shadow(&'a Shadow),
+    /// A transform.
+    Transform(&'a Affine),
+    /// A group style.
+    Group(&'a Group),
+    /// A rectangle.
+    Rect(&'a Rect),
+    /// A glyph run.
+    Run(&'a GlyphRun),
+}
+
+impl OperandRef<'_> {
+    /// Which operand this value is.
+    #[must_use]
+    pub const fn kind(&self) -> OperandKind {
+        match self {
+            Self::Shape(_) => OperandKind::Shape,
+            Self::Paint(_) => OperandKind::Paint,
+            Self::Stroke(_) => OperandKind::Stroke,
+            Self::Shadow(_) => OperandKind::Shadow,
+            Self::Transform(_) => OperandKind::Transform,
+            Self::Group(_) => OperandKind::Group,
+            Self::Rect(_) => OperandKind::Rect,
+            Self::Run(_) => OperandKind::Run,
+        }
+    }
+}
+
+impl From<OperandRef<'_>> for Operand {
+    fn from(value: OperandRef<'_>) -> Self {
+        match value {
+            OperandRef::Shape(shape) => Self::Shape(shape.clone()),
+            OperandRef::Paint(paint) => Self::Paint(paint.clone()),
+            OperandRef::Stroke(stroke) => Self::Stroke(stroke.clone()),
+            OperandRef::Shadow(shadow) => Self::Shadow(*shadow),
+            OperandRef::Transform(transform) => Self::Transform(*transform),
+            OperandRef::Group(group) => Self::Group(*group),
+            OperandRef::Rect(rect) => Self::Rect(*rect),
+            OperandRef::Run(run) => Self::Run(run.clone()),
+        }
+    }
+}
+
+/// The operand count a command exposes, in [`Operands`] order.
+const fn operand_count(command: &Command) -> u8 {
+    match command {
+        Command::Fill { .. } | Command::Shadow { .. } | Command::Glyphs { .. } => 2,
+        Command::Stroke { .. } => 3,
+        Command::Image { .. }
+        | Command::Picture { .. }
+        | Command::BeginClip { .. }
+        | Command::BeginTransform { .. }
+        | Command::BeginGroup { .. } => 1,
+        Command::End => 0,
+    }
+}
+
+/// The live operands of one command, yielded by
+/// [`DisplayListView::operands`]: every [`Slot`] the command exposes —
+/// the operand kinds [`DisplayList::apply`] accepts for it — each with
+/// the value currently recorded.
+pub struct Operands<'a> {
+    command: Option<&'a Command>,
+    index: u32,
+    next: u8,
+}
+
+impl<'a> Iterator for Operands<'a> {
+    type Item = (Slot, OperandRef<'a>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (kind, value) = match (self.command?, self.next) {
+            (
+                Command::Fill { shape, .. }
+                | Command::Stroke { shape, .. }
+                | Command::Shadow { shape, .. }
+                | Command::BeginClip { shape, .. },
+                0,
+            ) => (OperandKind::Shape, OperandRef::Shape(shape)),
+            (Command::Fill { paint, .. } | Command::Glyphs { paint, .. }, 1)
+            | (Command::Stroke { paint, .. }, 2) => (OperandKind::Paint, OperandRef::Paint(paint)),
+            (Command::Stroke { stroke, .. }, 1) => {
+                (OperandKind::Stroke, OperandRef::Stroke(stroke))
+            }
+            (Command::Shadow { shadow, .. }, 1) => {
+                (OperandKind::Shadow, OperandRef::Shadow(shadow))
+            }
+            (Command::Glyphs { run, .. }, 0) => (OperandKind::Run, OperandRef::Run(run)),
+            (Command::Image { dst, .. }, 0) => (OperandKind::Rect, OperandRef::Rect(dst)),
+            (Command::Picture { transform, .. } | Command::BeginTransform { transform, .. }, 0) => {
+                (OperandKind::Transform, OperandRef::Transform(transform))
+            }
+            (Command::BeginGroup { group, .. }, 0) => {
+                (OperandKind::Group, OperandRef::Group(group))
+            }
+            _ => return None,
+        };
+        self.next += 1;
+        Some((
+            Slot {
+                command: self.index,
+                operand: kind,
+            },
+            value,
+        ))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.command.map_or(0, |command| {
+            usize::from(operand_count(command)) - usize::from(self.next)
+        });
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for Operands<'_> {}
+
 /// Immutable recorded content, shared by reference: cloning is cheap, and a
 /// picture can be sent to and shared between threads.
 #[derive(Clone, Debug, PartialEq)]
@@ -650,7 +842,9 @@ mod tests {
     #[cfg(feature = "serde")]
     use serde_json::json;
 
-    use super::{Command, Dirty, DisplayList, Operand, Picture, SlotUpdate};
+    use super::{
+        Command, Dirty, DisplayList, Operand, OperandKind, OperandRef, Picture, Slot, SlotUpdate,
+    };
     use crate::glyph::{FontId, Glyph, GlyphRun, GlyphStyle};
     use crate::paint::Paint;
 
@@ -694,6 +888,128 @@ mod tests {
             panic!("not a glyph run");
         };
         assert_eq!(got.glyphs[0].id, 2);
+    }
+
+    fn viewed_list() -> DisplayList {
+        use crate::shape::ShapeData;
+        use crate::style::Group;
+        use kurbo::{Affine, Rect};
+
+        let mut list = DisplayList::default();
+        let begin = list.push(Command::BeginTransform {
+            transform: Affine::translate((2., 3.)),
+            end: 0,
+        });
+        list.push(Command::Fill {
+            shape: ShapeData::Rect(Rect::new(0., 0., 1., 1.)),
+            paint: Paint::Solid(crate::color::WorkingColor::WHITE),
+        });
+        list.push(Command::Glyphs {
+            run: run(1),
+            paint: Paint::Solid(crate::color::WorkingColor::BLACK),
+        });
+        list.push(Command::BeginGroup {
+            group: Group::new().opacity(0.5),
+            end: 0,
+        });
+        let clip = list.push(Command::BeginClip {
+            shape: ShapeData::Rect(Rect::new(0., 0., 4., 4.)),
+            end: 0,
+        });
+        list.end(clip);
+        list.end(begin);
+        list
+    }
+
+    #[test]
+    fn the_view_lists_each_commands_live_operands_with_current_values() {
+        use crate::shape::ShapeData;
+        use kurbo::{Affine, Rect};
+
+        let list = viewed_list();
+        let view = list.view();
+        assert_eq!(view.commands().len(), 7);
+        assert_eq!(view.len(), 7);
+        assert!(!view.is_empty());
+
+        // A fill's live operands: its shape and its paint.
+        let operands: Vec<_> = view.operands(1).collect();
+        assert_eq!(operands.len(), 2);
+        assert_eq!(
+            operands[0].0,
+            Slot {
+                command: 1,
+                operand: OperandKind::Shape,
+            }
+        );
+        assert_eq!(
+            operands[0].1,
+            OperandRef::Shape(&ShapeData::Rect(Rect::new(0., 0., 1., 1.)))
+        );
+        assert_eq!(operands[0].1.kind(), operands[0].0.operand);
+        assert_eq!(
+            operands[1].0,
+            Slot {
+                command: 1,
+                operand: OperandKind::Paint,
+            }
+        );
+
+        // A transform scope's only live operand is its transform.
+        let operands: Vec<_> = view.operands(0).collect();
+        assert_eq!(
+            operands,
+            [(
+                Slot {
+                    command: 0,
+                    operand: OperandKind::Transform,
+                },
+                OperandRef::Transform(&Affine::translate((2., 3.))),
+            )]
+        );
+
+        // `End` exposes no operand, and neither does a missing command.
+        assert_eq!(view.operands(5).count(), 0);
+        assert_eq!(view.operands(10).count(), 0);
+    }
+
+    #[test]
+    fn the_view_resolves_slots_and_reads_applied_updates() {
+        use crate::style::Group;
+
+        let mut list = viewed_list();
+        // `get` resolves a slot to the recorded value, and misses a slot
+        // the command does not expose.
+        assert_eq!(
+            list.view().get(Slot {
+                command: 3,
+                operand: OperandKind::Group,
+            }),
+            Some(OperandRef::Group(&Group::new().opacity(0.5)))
+        );
+        assert!(
+            list.view()
+                .get(Slot {
+                    command: 3,
+                    operand: OperandKind::Paint,
+                })
+                .is_none()
+        );
+
+        // An applied update reads through a later view.
+        list.apply([SlotUpdate {
+            command: 1,
+            value: Operand::Paint(Paint::Solid(crate::color::WorkingColor::BLACK)),
+        }]);
+        assert_eq!(
+            list.view().get(Slot {
+                command: 1,
+                operand: OperandKind::Paint,
+            }),
+            Some(OperandRef::Paint(&Paint::Solid(
+                crate::color::WorkingColor::BLACK
+            )))
+        );
     }
 
     #[test]

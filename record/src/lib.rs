@@ -4,8 +4,9 @@
 //! glyph types the commands carry.
 //!
 //! Nothing here knows an engine, a surface, a GPU or a shaper: a render
-//! target that draws recorded content another way lowers a
-//! [`DisplayList`]'s commands and applies [`SlotUpdate`]s as they arrive.
+//! target that draws recorded content another way consumes a
+//! [`DisplayList`] through its [`view`](DisplayList::view) and applies
+//! [`SlotUpdate`]s as they arrive.
 //!
 //! - [`Picture::record`] records constants on any thread into an
 //!   immutable, shareable [`Picture`].
@@ -41,7 +42,8 @@ pub use crate::color::{
     WorkingColor,
 };
 pub use crate::display_list::{
-    Command, Dirty, DisplayList, Operand, OperandKind, Picture, ScopeError, Slot, SlotUpdate,
+    Command, Dirty, DisplayList, DisplayListView, Operand, OperandKind, OperandRef, Operands,
+    Picture, ScopeError, Slot, SlotUpdate,
 };
 pub use crate::glyph::{FontId, Glyph, GlyphRun, GlyphStyle};
 pub use crate::paint::{

@@ -88,6 +88,10 @@ mod macos {
         };
         vec![
             case(
+                "periodic_replacements_preserve_static_readmission_history",
+                periodic_replacements_preserve_static_readmission_history,
+            ),
+            case(
                 "static_pixels_are_captured_once_and_match_engine_composition",
                 static_pixels_are_captured_once_and_match_engine_composition,
             ),
@@ -1138,6 +1142,36 @@ mod macos {
             // The platform never reported the probe ready: the window
             // then shows the engine's own composition, still verified.
             engine_parity(&opaque, &offscreen, "engine-composited opaque frame");
+        }
+    }
+
+    fn periodic_replacements_preserve_static_readmission_history() {
+        let fixture = Fixture::new();
+        let layer = fixture.window.layer();
+        fixture.window.update(|tx| {
+            tx[fixture.window.root()].push(&layer);
+        });
+        for cycle in 0..4 {
+            let pixels = fixture.window.record(|c| {
+                c.fill(Rect::new(8., 6., 80., 54.), WorkingColor::WHITE);
+            });
+            fixture.window.update(|tx| {
+                tx[&layer].content(pixels);
+            });
+            fixture.render();
+            for offset in 1..=2 {
+                fixture.window.update(|tx| {
+                    tx[&layer].transform(Affine::translate((f64::from(cycle * 3 + offset), 0.)));
+                });
+                fixture.render();
+                if cycle > 0 {
+                    assert_eq!(
+                        fixture.engine.stats().passes,
+                        1,
+                        "a periodic edit must stay in one engine pass, without a capture pass"
+                    );
+                }
+            }
         }
     }
 

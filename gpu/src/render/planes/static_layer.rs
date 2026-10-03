@@ -35,6 +35,11 @@ pub struct Capture {
     pub dirty: bool,
 }
 
+/// The longest readmission wait. A recent period raises the wait up to this
+/// many frames; a longer quiet interval is a finished lifetime and resets
+/// the wait to the initial two frames instead of becoming the next one.
+const QUIET_LIMIT: u64 = 8;
+
 /// Content observations are separate from pixel allocations: ineligible
 /// candidates consume no plane memory.
 pub struct Observation {
@@ -43,7 +48,7 @@ pub struct Observation {
     pub domain: Option<Domain>,
     pub density: f64,
     pub quiet_frames: u64,
-    /// Admission must outlast recently observed periodic content changes.
+    /// Admission must outlast a recent content period, and is at most eight frames.
     pub quiet_required: u64,
     pub capture: Option<Capture>,
 }
@@ -79,7 +84,7 @@ impl Observation {
         self.quiet_required = if self.quiet_frames > self.quiet_required.saturating_mul(2) {
             2
         } else {
-            self.quiet_frames.saturating_add(1).max(2)
+            self.quiet_frames.saturating_add(1).max(2).min(QUIET_LIMIT)
         };
         self.stamp = stamp;
         self.resources = resources;
@@ -336,6 +341,28 @@ pub fn domain(
 #[cfg(test)]
 mod tests {
     use super::Observation;
+
+    #[test]
+    fn quiet_required_stays_bounded_after_a_long_interval() {
+        let mut entry = Observation::new(1, (0, 0));
+        let mut stamp = 1u64;
+        for _ in 0..48 {
+            let ceiling = entry.quiet_required.saturating_mul(2);
+            while entry.quiet_frames < ceiling {
+                entry.observe(stamp, (0, 0), 1.);
+            }
+            stamp += 1;
+            entry.observe(stamp, (0, 0), 1.);
+            assert!(entry.quiet_required <= super::QUIET_LIMIT);
+        }
+        assert_eq!(entry.quiet_required, super::QUIET_LIMIT);
+        for _ in 0..10_000 {
+            entry.observe(stamp, (0, 0), 1.);
+        }
+        stamp += 1;
+        entry.observe(stamp, (0, 0), 1.);
+        assert_eq!(entry.quiet_required, 2);
+    }
 
     #[test]
     fn long_static_lifetime_does_not_delay_readmission() {
